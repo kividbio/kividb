@@ -135,9 +135,15 @@ const TAG_TIMESERIES_V2: u8 = 14;
 const TAG_TIMESERIES_V3: u8 = 15;
 /// New tag so older builds reject quantized sets instead of misreading them.
 const TAG_VECTORSET_V2: u8 = 16;
+/// `TAG_TIMESERIES_V2` followed by whether the series is a compaction of
+/// another (a byte, 0 or 1), that series if it is, then its `IGNORE`
+/// settings: the time difference (u64) and the value difference (f64 bits).
+/// Written only when either setting is not 0, so other series stay readable
+/// by 1.2, which refuses this one ("unknown type tag 17").
+const TAG_TIMESERIES_V4: u8 = 17;
 
 /// Whether `byte` is a value's type tag: what follows the empty key as 1.2.0
-/// wrote it ([`read_image`]).
+/// wrote it ([`read_image`]). 1.2.0's tags only: no later one follows it.
 fn is_tag(byte: u8) -> bool {
     (TAG_STRING..=TAG_TIMESERIES_V3).contains(&byte)
 }
@@ -742,14 +748,18 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
             let links = !IN_DUMP.get();
             let rules: &[crate::types::CompactionRule] = if links { &inner.rules } else { &[] };
             let source = if links { inner.source.as_ref() } else { None };
+            let has_ignore = inner.ignore_max_time_diff != 0 || inner.ignore_max_val_diff != 0.0;
             // The duplicate policy and the compaction rules were not saved at
             // all: after a restart (or on a replica, after a full sync) every
             // series was back on the default policy and no longer fed its
             // compactions — silently.
             let extended = !rules.is_empty()
                 || inner.duplicate_policy != crate::types::DuplicatePolicy::Last
-                || source.is_some();
-            w.write_all(&[if source.is_some() {
+                || source.is_some()
+                || has_ignore;
+            w.write_all(&[if has_ignore {
+                TAG_TIMESERIES_V4
+            } else if source.is_some() {
                 TAG_TIMESERIES_V3
             } else if extended {
                 TAG_TIMESERIES_V2
@@ -782,8 +792,15 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
                     w.write_all(&rule.align_timestamp.to_le_bytes())?;
                 }
             }
+            if has_ignore {
+                w.write_all(&[u8::from(source.is_some())])?;
+            }
             if let Some(source) = source {
                 write_bytes(w, &crate::key_bytes::bytes_of(source))?;
+            }
+            if has_ignore {
+                w.write_all(&inner.ignore_max_time_diff.to_le_bytes())?;
+                w.write_all(&inner.ignore_max_val_diff.to_bits().to_le_bytes())?;
             }
         }
 
@@ -2389,7 +2406,7 @@ fn read_image(
                     }
                     KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(val)))
                 }
-                TAG_TIMESERIES | TAG_TIMESERIES_V2 | TAG_TIMESERIES_V3 => {
+                TAG_TIMESERIES | TAG_TIMESERIES_V2 | TAG_TIMESERIES_V3 | TAG_TIMESERIES_V4 => {
                     let mut count_buf = [0u8; 4];
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
@@ -2450,9 +2467,33 @@ fn read_image(
                                 align_timestamp,
                             });
                         }
-                        if tag[0] == TAG_TIMESERIES_V3 {
+                        // V4 says whether a source follows; the empty key
+                        // is a source too.
+                        let has_source = match tag[0] {
+                            TAG_TIMESERIES_V3 => true,
+                            TAG_TIMESERIES_V4 => {
+                                let mut flag = [0u8];
+                                r.read_exact(&mut flag)?;
+                                match flag[0] {
+                                    0 => false,
+                                    1 => true,
+                                    _ => return Err(bad("source flag")),
+                                }
+                            }
+                            _ => false,
+                        };
+                        if has_source {
                             ts.source =
                                 Some(crate::key_bytes::text_of(&read_bytes(&mut r)?).into_owned());
+                        }
+                        if tag[0] == TAG_TIMESERIES_V4 {
+                            ts.ignore_max_time_diff = read_u64_le(&mut r)?;
+                            let val_diff = f64::from_bits(read_u64_le(&mut r)?);
+                            // As `IGNORE` takes it: not NaN, not below 0.
+                            if val_diff.is_nan() || val_diff < 0.0 {
+                                return Err(bad("IGNORE value difference"));
+                            }
+                            ts.ignore_max_val_diff = val_diff;
                         }
                     }
                     KiviDBValue::TimeSeries(Arc::new(parking_lot::RwLock::new(ts)))
@@ -6485,6 +6526,71 @@ mod dump_payload_tests {
                 assert_eq!(ts.source.as_deref(), Some("lp:s"));
             }
             _ => panic!("expected a time series"),
+        }
+    }
+
+    #[test]
+    fn dump_restore_round_trip_preserves_ignore_settings() {
+        let mut ts = TsInner::new();
+        ts.samples.insert(100, 1.5);
+        ts.last_ts = Some(100);
+        ts.ignore_max_time_diff = 500;
+        ts.ignore_max_val_diff = 0.25;
+        let series = KiviDBValue::TimeSeries(Arc::new(parking_lot::RwLock::new(ts)));
+        let payload = dump_payload(&series).unwrap();
+        match restore_payload(&payload).unwrap() {
+            KiviDBValue::TimeSeries(arc) => {
+                let got = arc.read();
+                assert_eq!(got.ignore_max_time_diff, 500);
+                assert_eq!(got.ignore_max_val_diff, 0.25);
+                assert_eq!(got.samples.get(&100), Some(&1.5));
+            }
+            _ => panic!("expected a time series"),
+        }
+        let loaded = load_snapshot_from(&image(&series)[..]).unwrap();
+        match loaded.dbs[0].values().next().unwrap() {
+            KiviDBValue::TimeSeries(arc) => {
+                let got = arc.read();
+                assert_eq!(got.ignore_max_time_diff, 500);
+                assert_eq!(got.ignore_max_val_diff, 0.25);
+            }
+            _ => panic!("expected a time series"),
+        }
+    }
+
+    /// A series with links and `IGNORE` settings keeps all of them through
+    /// a snapshot, its source the empty key too; one with neither a source
+    /// nor rules keeps its settings. A value difference `IGNORE` refuses
+    /// (NaN, below 0) is refused in an image as well.
+    #[test]
+    fn a_snapshot_keeps_ignore_settings_beside_the_links() {
+        for source in [Some("lp:s"), Some(""), None] {
+            let series = linked_series();
+            if let KiviDBValue::TimeSeries(arc) = &series {
+                let mut ts = arc.write();
+                ts.source = source.map(str::to_string);
+                ts.ignore_max_time_diff = 7;
+                ts.ignore_max_val_diff = 0.5;
+            }
+            let bytes = image(&series);
+            let loaded = load_snapshot_from(&bytes[..]).unwrap();
+            let Some(KiviDBValue::TimeSeries(arc)) = loaded.dbs[0].values().next() else {
+                panic!("expected a time series");
+            };
+            let got = arc.read();
+            assert_eq!(got.source.as_deref(), source);
+            assert_eq!(got.rules.len(), 1);
+            assert_eq!(got.ignore_max_time_diff, 7);
+            assert_eq!(got.ignore_max_val_diff, 0.5);
+            assert_eq!(got.samples.get(&1), Some(&2.5));
+        }
+        for bad in [f64::NAN, -1.0] {
+            let mut ts = TsInner::new();
+            ts.samples.insert(1, 1.0);
+            ts.ignore_max_time_diff = 1;
+            ts.ignore_max_val_diff = bad;
+            let series = KiviDBValue::TimeSeries(Arc::new(parking_lot::RwLock::new(ts)));
+            assert!(load_snapshot_from(&image(&series)[..]).is_err(), "{bad}");
         }
     }
 

@@ -555,6 +555,27 @@ pub struct CompactionRule {
 /// differs per process, #612).
 pub type Labels = indexmap::IndexMap<String, String, ahash::RandomState>;
 
+/// The outcome of adding a sample to a time series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddResult {
+    /// The sample was inserted or upserted with this timestamp.
+    Added(u64),
+    /// The sample was suppressed by the IGNORE filter; holds the series' last timestamp.
+    Ignored(u64),
+}
+
+impl AddResult {
+    pub fn timestamp(&self) -> u64 {
+        match *self {
+            AddResult::Added(ts) | AddResult::Ignored(ts) => ts,
+        }
+    }
+
+    pub fn is_ignored(&self) -> bool {
+        matches!(self, AddResult::Ignored(_))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TsInner {
     /// All samples: timestamp_ms → value.
@@ -584,6 +605,12 @@ pub struct TsInner {
     /// in `TS.INFO`, and where `LATEST` finds the bucket still open (#128).
     /// By name: `key_bytes::text_of` of its key.
     pub source: Option<String>,
+
+    /// Maximum time difference in milliseconds for the IGNORE filter.
+    pub ignore_max_time_diff: u64,
+
+    /// Maximum absolute value difference for the IGNORE filter.
+    pub ignore_max_val_diff: f64,
 }
 
 impl TsInner {
@@ -597,17 +624,42 @@ impl TsInner {
             rules: Vec::new(),
             last_ts: None,
             source: None,
+            ignore_max_time_diff: 0,
+            ignore_max_val_diff: 0.0,
+        }
+    }
+
+    /// Checks whether an incoming sample should be ignored (suppressed) by the IGNORE filter.
+    /// Returns `Some(max_timestamp)` if ignored, or `None` if it should be added.
+    pub fn should_ignore(&self, ts: u64, value: f64, policy: &DuplicatePolicy) -> Option<u64> {
+        if self.source.is_some() || *policy != DuplicatePolicy::Last {
+            return None;
+        }
+        if self.ignore_max_time_diff == 0 && self.ignore_max_val_diff == 0.0 {
+            return None;
+        }
+        let (&max_ts, &max_val) = self.samples.iter().next_back()?;
+        if ts >= max_ts
+            && (ts - max_ts) <= self.ignore_max_time_diff
+            && (value - max_val).abs() <= self.ignore_max_val_diff
+        {
+            Some(max_ts)
+        } else {
+            None
         }
     }
 
     /// Add a sample, respecting duplicate policy and retention.
     /// Returns the timestamp actually stored, or an error string.
-    pub fn add_sample(&mut self, ts: u64, value: f64) -> Result<u64, &'static str> {
+    pub fn add_sample(&mut self, ts: u64, value: f64) -> Result<AddResult, &'static str> {
         // Refused before anything changes: the trim below is a change too.
         if self.duplicate_policy == DuplicatePolicy::Block && self.samples.contains_key(&ts) {
             return Err(BLOCKED_DUPLICATE);
         }
         let policy = self.duplicate_policy.clone();
+        if let Some(existing_ts) = self.should_ignore(ts, value, &policy) {
+            return Ok(AddResult::Ignored(existing_ts));
+        }
         self.add_sample_as(ts, value, &policy)
     }
 
@@ -619,7 +671,7 @@ impl TsInner {
         ts: u64,
         value: f64,
         policy: &DuplicatePolicy,
-    ) -> Result<u64, &'static str> {
+    ) -> Result<AddResult, &'static str> {
         // Refused before anything changes: the trim below is a change too.
         if *policy == DuplicatePolicy::Block && self.samples.contains_key(&ts) {
             return Err(BLOCKED_DUPLICATE);
@@ -667,7 +719,7 @@ impl TsInner {
         if self.last_ts.map(|l| ts > l).unwrap_or(true) {
             self.last_ts = Some(ts);
         }
-        Ok(ts)
+        Ok(AddResult::Added(ts))
     }
 
     /// Current wall-clock time in milliseconds.

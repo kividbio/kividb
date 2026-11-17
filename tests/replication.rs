@@ -3441,3 +3441,160 @@ fn test_a_redis_payload_that_does_not_read_is_a_broken_link_not_a_refusal() {
     thread::sleep(Duration::from_secs(2));
     assert_eq!(repl_info(&mut c, "replica_last_sync_refusal"), None);
 }
+
+#[test]
+fn test_ts_ignore_does_not_propagate_or_advance_repl_offset() {
+    let master_port = free_port();
+    let replica_port = free_port();
+    start_server(master_port);
+    start_server(replica_port);
+    let _shutdown = ShutdownServers(vec![master_port, replica_port]);
+
+    let mut master = Conn::connect(master_port);
+    let mut replica = Conn::connect(replica_port);
+
+    assert!(
+        replica
+            .cmds(&["REPLICAOF", "127.0.0.1", &master_port.to_string()])
+            .is_ok()
+    );
+
+    // Initial setup on master
+    assert_eq!(
+        master
+            .cmds(&["TS.CREATE", "ts:ignore", "IGNORE", "1000", "1.0"])
+            .as_str(),
+        "OK"
+    );
+    assert_eq!(
+        master
+            .cmds(&["TS.ADD", "ts:ignore", "1000", "10.0"])
+            .as_int(),
+        1000
+    );
+
+    // Wait for replica to catch up with initial setup
+    wait_until(
+        "replica to sync initial series",
+        Duration::from_secs(5),
+        || {
+            let res = replica.cmds(&["TS.GET", "ts:ignore"]);
+            matches!(&res, RespValue::Array(arr) if arr.len() == 2 && arr[0].as_int() == 1000)
+        },
+    );
+
+    let offset_before: u64 = repl_info(&mut master, "master_repl_offset")
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Ignored TS.ADD: delta_t = 500 <= 1000, delta_v = 0.5 <= 1.0 -> ignored!
+    assert_eq!(
+        master
+            .cmds(&["TS.ADD", "ts:ignore", "1500", "10.5"])
+            .as_int(),
+        1000
+    );
+
+    let offset_after_add: u64 = repl_info(&mut master, "master_repl_offset")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        offset_before, offset_after_add,
+        "master_repl_offset must not move on ignored TS.ADD"
+    );
+
+    // Ignored TS.MADD: all samples ignored -> must not move offset
+    let madd_res = master.cmds(&["TS.MADD", "ts:ignore", "1600", "10.6"]);
+    assert_eq!(madd_res.as_array()[0].as_int(), 1000);
+
+    let offset_after_madd: u64 = repl_info(&mut master, "master_repl_offset")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        offset_before, offset_after_madd,
+        "master_repl_offset must not move on ignored TS.MADD"
+    );
+
+    // Give replica a moment and ensure replica value is unchanged (timestamp 1000, value 10)
+    thread::sleep(Duration::from_millis(100));
+    let rep_get = replica.cmds(&["TS.GET", "ts:ignore"]);
+    assert_eq!(rep_get.as_array()[0].as_int(), 1000);
+    assert_eq!(rep_get.as_array()[1].as_str(), "10");
+}
+
+/// A sample `IGNORE` leaves out marks its command as having changed nothing,
+/// on the thread that ran it, and the mark stayed set after it: every later
+/// write that thread ran, of any kind, was then taken as having changed
+/// nothing, and was sent to no replica and no AOF. One worker thread, so
+/// every command here runs on the thread that ran the ignored samples: a
+/// `SET` after them, in `MULTI`/`EXEC` after them and in a script after
+/// them, and a `TS.MADD` with one sample left out and one added, all reach
+/// the replica.
+#[test]
+fn test_ts_ignore_does_not_hold_back_the_writes_after_it() {
+    let master = spawn_server_with(Config::default(), 1, IoModel::Tokio);
+    let replica = spawn_server_with(replica_of(master), 1, IoModel::Tokio);
+    let mut m = Conn::connect(master);
+    let mut r = Conn::connect(replica);
+    wait_until("the replica online", Duration::from_secs(10), || {
+        repl_info(&mut m, "slave0").is_some_and(|s| s.contains("state=online"))
+    });
+    assert!(m.cmds(&["TS.CREATE", "s", "IGNORE", "1000", "1.0"]).is_ok());
+    assert!(m.cmds(&["TS.CREATE", "t"]).is_ok());
+    assert_eq!(m.cmds(&["TS.ADD", "s", "1000", "10"]).as_int(), 1000);
+
+    for i in 0..10 {
+        // Left out, from a client.
+        assert_eq!(m.cmds(&["TS.ADD", "s", "1500", "10.5"]).as_int(), 1000);
+        assert!(m.cmds(&["SET", &format!("after-add-{i}"), "v"]).is_ok());
+        let all_ignored = m.cmds(&["TS.MADD", "s", "1600", "10.6"]);
+        assert_eq!(all_ignored.as_array()[0].as_int(), 1000);
+        assert!(m.cmds(&["SET", &format!("after-madd-{i}"), "v"]).is_ok());
+        // Left out inside `MULTI`/`EXEC`, then a write in the same `EXEC`.
+        assert!(m.cmds(&["MULTI"]).is_ok());
+        m.cmds(&["TS.ADD", "s", "1700", "10.7"]);
+        m.cmds(&["SET", &format!("in-exec-{i}"), "v"]);
+        let exec = m.cmds(&["EXEC"]);
+        assert_eq!(exec.as_array()[0].as_int(), 1000);
+    }
+    // One sample left out, one added: the added one is sent.
+    let mixed = m.cmds(&["TS.MADD", "s", "1800", "10.8", "t", "5", "1"]);
+    assert_eq!(mixed.as_array()[0].as_int(), 1000);
+    assert_eq!(mixed.as_array()[1].as_int(), 5);
+    #[cfg(feature = "lua")]
+    {
+        let script = "redis.call('TS.ADD', 's', 1900, 10.9) \
+                      return redis.call('SET', 'after-script', 'v')";
+        assert!(m.cmds(&["EVAL", script, "0"]).is_ok());
+    }
+    assert!(m.cmds(&["SET", "last", "v"]).is_ok());
+
+    wait_until(
+        "the last write on the replica",
+        Duration::from_secs(10),
+        || r.cmds(&["EXISTS", "last"]).as_int() == 1,
+    );
+    let mut expected: Vec<String> = (0..10)
+        .flat_map(|i| {
+            [
+                format!("after-add-{i}"),
+                format!("after-madd-{i}"),
+                format!("in-exec-{i}"),
+            ]
+        })
+        .collect();
+    if cfg!(feature = "lua") {
+        expected.push("after-script".to_string());
+    }
+    for key in &expected {
+        assert_eq!(r.cmds(&["EXISTS", key]).as_int(), 1, "{key} on the replica");
+    }
+    // The series are as on the master: one sample in `s`, `t`'s added.
+    let s = r.cmds(&["TS.RANGE", "s", "-", "+"]);
+    assert_eq!(s.as_array().len(), 1, "{s:?}");
+    let t = r.cmds(&["TS.GET", "t"]);
+    assert_eq!(t.as_array()[0].as_int(), 5);
+}

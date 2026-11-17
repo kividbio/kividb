@@ -9,6 +9,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrading
 
+- **Upgrade replicas before their master for time series `IGNORE`.** A 1.2
+  replica passes `IGNORE` over, and cannot read a snapshot or `DUMP` holding
+  a series that has it (tag 17).
 - **A script whose `KEYS` carry several hash tags is held to them (#871).**
   With `lua-parallel-scripts yes` (the default), such a script now runs
   beside other commands, and a key it touches that carries none of its
@@ -63,6 +66,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`TS.CREATE`, `TS.ALTER`, and `TS.ADD` support `IGNORE maxTimeDiff maxValDiff` (#841).**
+  Suppresses duplicate or near-duplicate samples whose timestamp and value
+  deltas are within the specified thresholds when the duplicate policy is `LAST`.
+  Ignored samples are not stored, do not replicate or log to AOF, and reply with
+  the series' last timestamp.
 - **`INFO stats` says how scripts were run (#871).** With
   `lua-parallel-scripts yes`, a script runs beside other commands only when
   its `KEYS` share a hash tag and it has been seen to be quick; any other
