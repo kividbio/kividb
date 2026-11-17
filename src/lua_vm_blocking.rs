@@ -70,6 +70,12 @@ pub(crate) struct ClientExecEnv {
     pub tracking_table: crate::tracking::TrackingTable,
     pub peer_addr: String,
     pub client_id: u64,
+    /// The connection's `CLIENT NO-TOUCH` flag when this env was made: a
+    /// script's own commands take it as their client's flag (`Ctx::no_touch`).
+    /// A copy, not a borrow: the env outlives the loop local, the flag
+    /// cannot be set from inside a script anyway, and the loop remakes the
+    /// env when the flag changes (#566).
+    pub no_touch: bool,
     pub authenticated_user: String,
 }
 
@@ -134,6 +140,7 @@ impl ClientExecEnv {
             skip_write_side_effects: false,
             peer_addr: &self.peer_addr,
             monitor_registry: &self.monitor_registry,
+            no_touch: self.no_touch,
             authenticated_user: &self.authenticated_user,
             tracking_table: &self.tracking_table,
             blocking: None,
@@ -171,6 +178,7 @@ impl ClientExecEnv {
         tracking_table: &crate::tracking::TrackingTable,
         peer_addr: &str,
         client_id: u64,
+        no_touch: bool,
         authenticated_user: &str,
     ) -> Self {
         Self {
@@ -198,6 +206,7 @@ impl ClientExecEnv {
             tracking_table: tracking_table.clone(),
             peer_addr: peer_addr.to_string(),
             client_id,
+            no_touch,
             authenticated_user: authenticated_user.to_string(),
         }
     }

@@ -2366,6 +2366,7 @@ impl ReplicationApplyEnv {
             client_registry: &self.client_registry,
             // Applying a replicated write locally, not replying to a real client.
             resp: 2,
+            no_touch: false,
             acl_store: &self.acl_store,
             acl_log: &self.acl_log,
             slowlog: &self.slowlog,
@@ -2425,6 +2426,7 @@ pub(crate) fn run_as_client(
         client_id: 1,
         client_registry: &env.client_registry,
         resp: 2,
+        no_touch: false,
         acl_store: &env.acl_store,
         acl_log: &env.acl_log,
         slowlog: &env.slowlog,

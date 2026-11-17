@@ -1787,8 +1787,18 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     };
 
     // Under an eviction policy that goes by use, the command's own lookups
-    // write it (see `eviction`): one atomic load when there is none.
-    let (access, used_after) = if crate::eviction::recording() {
+    // write it (see `eviction`): one atomic load when there is none. A
+    // `CLIENT NO-TOUCH` client's reads record no use of their keys: no
+    // scope, and nothing written after them either. Its writes count as
+    // uses — a key one makes is born used, not at the start of time — a
+    // script that may write counts its declared keys the same, and `TOUCH`
+    // still touches, as in Redis (#566).
+    let (access, used_after) = if crate::eviction::recording()
+        && !(ctx.no_touch
+            && !writes_operation
+            && name != "TOUCH"
+            && (!is_script(name) || name.ends_with("_RO")))
+    {
         let (scope, after) = access_scope(name, started, &ctx.cmd);
         (Some(scope), after)
     } else {
@@ -3399,6 +3409,7 @@ mod replica_loading_gate_tests {
             client_id: 0,
             client_registry: &client_registry,
             resp: 2,
+            no_touch: false,
             acl_store: &acl_store,
             acl_log: &acl_log,
             slowlog: &slowlog,

@@ -542,6 +542,12 @@ pub struct ClientInfo {
     pub activity: Arc<Activity>,
     pub query_buffer: Arc<QueryBufferMetrics>,
     pub no_evict: bool,
+    /// `CLIENT NO-TOUCH`: this client's reads record no use of the keys
+    /// they find (`T` in `CLIENT LIST`). This is the flag `CLIENT NO-TOUCH`
+    /// and `RESET` write; the connection's loop keeps a copy of its own
+    /// the command dispatcher reads (`Ctx::no_touch`), synced back after
+    /// the commands that can change it (#566).
+    pub no_touch: bool,
     /// Waiting in a blocking command: `b` in `CLIENT LIST`.
     pub blocked: bool,
     /// True iff the client has issued ASKING for the next command.
@@ -617,6 +623,7 @@ impl ClientInfo {
             activity: Arc::new(activity),
             query_buffer: Arc::default(),
             no_evict: false,
+            no_touch: false,
             blocked: false,
             asking: false,
             readonly: false,
@@ -683,6 +690,9 @@ impl ClientInfo {
         }
         if self.no_evict {
             flags.push('e');
+        }
+        if self.no_touch {
+            flags.push('T');
         }
         if flags.is_empty() {
             flags.push('N');
@@ -1180,6 +1190,7 @@ impl ClientRegistryInner {
                 activity: Arc::clone(&c.activity),
                 query_buffer: Arc::clone(&c.query_buffer),
                 no_evict: c.no_evict,
+                no_touch: c.no_touch,
                 blocked: c.blocked,
                 asking: c.asking,
                 readonly: c.readonly,
@@ -1222,6 +1233,7 @@ impl ClientRegistryInner {
             activity: Arc::clone(&c.activity),
             query_buffer: Arc::clone(&c.query_buffer),
             no_evict: c.no_evict,
+            no_touch: c.no_touch,
             blocked: c.blocked,
             asking: c.asking,
             readonly: c.readonly,
@@ -1263,6 +1275,17 @@ impl ClientRegistryInner {
     #[inline]
     pub fn get_resp(&self, id: u64) -> u8 {
         self.clients.read().get(&id).map(|c| c.resp).unwrap_or(2)
+    }
+
+    /// The `NO-TOUCH` flag. A connection's loop keeps its own copy for the
+    /// command dispatcher; it reads this back only after a command that
+    /// can have changed it — `CLIENT` or `EXEC` — has run (#566).
+    pub fn get_no_touch(&self, id: u64) -> bool {
+        self.clients
+            .read()
+            .get(&id)
+            .map(|c| c.no_touch)
+            .unwrap_or(false)
     }
 
     /// Hot-path accessor for the cluster routing layer. Returns just the

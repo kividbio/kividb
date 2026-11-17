@@ -113,6 +113,15 @@ pub struct Ctx<'a> {
     /// traffic at full core count. `client_registry` still holds the value too
     /// (kept in sync by the caller) for introspection commands like CLIENT INFO.
     pub resp: u8,
+    /// This connection's `CLIENT NO-TOUCH` flag, copied in per command for
+    /// the same reason `resp` is passed in rather than read from
+    /// `client_registry`: it is looked at on every command whose use of its
+    /// keys is being recorded. The connection's loop owns it; `CLIENT
+    /// NO-TOUCH` writes the `client_registry` copy (`T` in `CLIENT LIST`
+    /// and `CLIENT INFO`), which the loop reads back when a `CLIENT` or
+    /// `EXEC` command has run. `false` where there is no connection — the
+    /// replica applier, tests (#566).
+    pub no_touch: bool,
     pub acl_store: &'a crate::acl::AclStore,
     pub acl_log: &'a crate::acl::SharedAclLog,
     pub slowlog: &'a crate::slowlog::SharedSlowLog,

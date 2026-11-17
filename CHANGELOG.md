@@ -578,6 +578,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   writes before it waits; if that write fails, the client is closed at
   once, and what it pipelined after the blocking command is not run.
 
+- **`CLIENT NO-TOUCH` now keeps the client's reads from counting as a
+  use of the keys they find (#566).** The command was accepted and
+  answered `OK`, but the flag was never kept: a `NO-TOUCH` client's `GET`
+  still marked its key as used, under `key-access-tracking` as under an
+  LRU, LFU or LRM `maxmemory-policy`. The flag now lives in the
+  connection, copied into each command's `Ctx` — a byte the dispatcher
+  reads only while key use is being recorded — and that client's reads
+  open no access scope and write nothing after, so nothing marks the keys
+  they find. Its writes still count as uses, so a key it makes is born
+  used rather than at the start of time, and `TOUCH` still touches, as
+  in Redis; `CLIENT LIST` and `CLIENT INFO` show the `T` flag, and
+  `RESET` puts the connection back.
+
 - **A replica of 1.2.0 no longer writes a `TS.INCRBY` its own AOF replay
   refuses (#611).** A 1.2.0 master sends a time above `i64::MAX` as the
   negative number it replied, and the replica's re-log kept that tail next

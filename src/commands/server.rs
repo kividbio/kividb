@@ -6018,9 +6018,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(resp_simple("OK"))
                 }
 
-                // Accepted: what a client has touched is not kept per client.
+                // CLIENT NO-TOUCH ON|OFF: this client's commands record no
+                // use of the keys they find. The registry keeps the flag —
+                // what CLIENT LIST and CLIENT INFO show — and the
+                // connection's loop reads it back for the command
+                // dispatcher; RESET puts it back (#566).
                 "NO-TOUCH" => match cmd.get(2).and_then(|word| on_or_off(word)) {
-                    Some(_) if cmd.len() == 3 => Some(resp_simple("OK")),
+                    Some(on) if cmd.len() == 3 => {
+                        ctx.client_registry.update(ctx.client_id, |info| {
+                            info.no_touch = on;
+                        });
+                        Some(resp_simple("OK"))
+                    }
                     _ => Some(resp_error("ERR syntax error")),
                 },
 

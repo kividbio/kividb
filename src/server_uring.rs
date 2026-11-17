@@ -730,12 +730,16 @@ fn needs_slow_path(cmd0: &[u8]) -> bool {
     // a: AUTH
     if !matches!(
         first,
-        b's' | b'p' | b'm' | b'd' | b'w' | b'u' | b'e' | b'a' | b'h' | b'r'
+        b's' | b'p' | b'm' | b'd' | b'w' | b'u' | b'e' | b'a' | b'h' | b'r' | b'c'
     ) {
         return false;
     }
-    // Second filter: byte-wise case-insensitive comparison (no UTF-8 validation).
-    ascii_eq_ignore_case(cmd0, b"SUBSCRIBE")
+    // Second filter: byte-wise case-insensitive comparison (no UTF-8
+    // validation). CLIENT first: none of the rest starts with `c`, so a
+    // `c` command runs just this one compare, and every other command in
+    // the set runs only the one extra.
+    ascii_eq_ignore_case(cmd0, b"CLIENT")
+        || ascii_eq_ignore_case(cmd0, b"SUBSCRIBE")
         || ascii_eq_ignore_case(cmd0, b"PSUBSCRIBE")
         || ascii_eq_ignore_case(cmd0, b"SSUBSCRIBE")
         // See the matching note in server.rs: RESP3 clients handle the
@@ -1086,6 +1090,10 @@ pub async fn handle_client(
     // per-command null-encoding check doesn't hit the shared client_registry lock
     // on every single command across every worker thread.
     let mut resp_version: u8 = 2;
+    // `CLIENT NO-TOUCH` on this connection, the same way: copied into each
+    // command's `Ctx::no_touch`, and read back from `client_registry` only
+    // after a `CLIENT` or `EXEC` — the commands that can change it (#566).
+    let mut no_touch = false;
 
     enum ConnectionHandoff {
         Replica {
@@ -1427,12 +1435,12 @@ pub async fn handle_client(
                     // Made once for the connection and kept: it is two dozen shared
                     // handles, each counted up to copy and down to drop, and a script
                     // needs none of them copied to run on this thread. Made again if
-                    // the connection has become another user since.
+                    // the connection has become another user, or flagged
+                    // itself `CLIENT NO-TOUCH`, since (#566).
                     let user_now = authenticated_user.as_deref().unwrap_or("default");
-                    if lua_env
-                        .as_ref()
-                        .is_some_and(|env| env.authenticated_user != user_now)
-                    {
+                    if lua_env.as_ref().is_some_and(|env| {
+                        env.authenticated_user != user_now || env.no_touch != no_touch
+                    }) {
                         lua_env = None;
                     }
                     let env = &*lua_env.get_or_insert_with(|| {
@@ -1461,6 +1469,7 @@ pub async fn handle_client(
                             &tracking_table,
                             &peer_addr,
                             client_id,
+                            no_touch,
                             authenticated_user.as_deref().unwrap_or("default"),
                         )
                     });
@@ -1512,6 +1521,7 @@ pub async fn handle_client(
                         client_id,
                         client_registry: &client_registry,
                         resp: resp_version,
+                        no_touch,
                         acl_store: &acl_store,
                         acl_log: &acl_log,
                         slowlog: &slowlog,
@@ -1607,6 +1617,7 @@ pub async fn handle_client(
                     client_id,
                     client_registry: &client_registry,
                     resp: resp_version,
+                    no_touch,
                     acl_store: &acl_store,
                     acl_log: &acl_log,
                     slowlog: &slowlog,
@@ -1991,6 +2002,7 @@ pub async fn handle_client(
                     dirty_flag.store(false, std::sync::atomic::Ordering::Release);
                     selected_db = 0;
                     resp_version = 2;
+                    no_touch = false;
                     subscriptions = None;
                     if client_registry
                         .get(client_id)
@@ -2005,6 +2017,7 @@ pub async fn handle_client(
                     crate::commands::hash_import::forget_client(client_id);
                     client_registry.update(client_id, |info| {
                         info.no_evict = false;
+                        info.no_touch = false;
                         info.resp = 2;
                         info.name = String::new();
                         info.tracking = false;
@@ -2297,7 +2310,8 @@ pub async fn handle_client(
                             } else {
                                 // Each SET is a use, and a modification, of its
                                 // key, as the same SET is outside a transaction
-                                // (it went unrecorded here).
+                                // (it went unrecorded here) — a `NO-TOUCH`
+                                // client's too: writes count as uses (#566).
                                 let _access = crate::eviction::recording().then(|| {
                                     crate::store::AccessScope::open(crate::eviction::write_stamp(
                                         std::time::Instant::now(),
@@ -2354,6 +2368,7 @@ pub async fn handle_client(
                                         client_id,
                                         client_registry: &client_registry,
                                         resp: resp_version,
+                                        no_touch,
                                         acl_store: &acl_store,
                                         acl_log: &acl_log,
                                         slowlog: &slowlog,
@@ -2521,6 +2536,7 @@ pub async fn handle_client(
                                         client_id,
                                         client_registry: &client_registry,
                                         resp: resp_version,
+                                        no_touch,
                                         acl_store: &acl_store,
                                         acl_log: &acl_log,
                                         slowlog: &slowlog,
@@ -2566,6 +2582,7 @@ pub async fn handle_client(
                                         client_id,
                                         client_registry: &client_registry,
                                         resp: resp_version,
+                                        no_touch,
                                         acl_store: &acl_store,
                                         acl_log: &acl_log,
                                         slowlog: &slowlog,
@@ -2601,6 +2618,11 @@ pub async fn handle_client(
                                 }
 
                                 exec_out.extend_from_slice(&resp);
+                                // A queued `CLIENT NO-TOUCH` takes hold with
+                                // the command after it (#566).
+                                if queued_name == "CLIENT" {
+                                    no_touch = client_registry.get_no_touch(client_id);
+                                }
                             }
 
                             watch_registry.as_ref().unwatch_all(
@@ -2831,12 +2853,12 @@ pub async fn handle_client(
                             // Made once for the connection and kept: it is two dozen shared
                             // handles, each counted up to copy and down to drop, and a script
                             // needs none of them copied to run on this thread. Made again if
-                            // the connection has become another user since.
+                            // the connection has become another user, or
+                            // flagged itself `CLIENT NO-TOUCH`, since (#566).
                             let user_now = authenticated_user.as_deref().unwrap_or("default");
-                            if lua_env
-                                .as_ref()
-                                .is_some_and(|env| env.authenticated_user != user_now)
-                            {
+                            if lua_env.as_ref().is_some_and(|env| {
+                                env.authenticated_user != user_now || env.no_touch != no_touch
+                            }) {
                                 lua_env = None;
                             }
                             let env = &*lua_env.get_or_insert_with(|| {
@@ -2865,6 +2887,7 @@ pub async fn handle_client(
                                     &tracking_table,
                                     &peer_addr,
                                     client_id,
+                                    no_touch,
                                     authenticated_user.as_deref().unwrap_or("default"),
                                 )
                             });
@@ -2898,6 +2921,7 @@ pub async fn handle_client(
                                 client_id,
                                 client_registry: &client_registry,
                                 resp: resp_version,
+                                no_touch,
                                 acl_store: &acl_store,
                                 acl_log: &acl_log,
                                 slowlog: &slowlog,
@@ -2941,6 +2965,7 @@ pub async fn handle_client(
                             client_id,
                             client_registry: &client_registry,
                             resp: resp_version,
+                            no_touch,
                             acl_store: &acl_store,
                             acl_log: &acl_log,
                             slowlog: &slowlog,
@@ -3026,6 +3051,12 @@ pub async fn handle_client(
                     &client_registry,
                     client_id,
                 );
+            }
+            // `CLIENT NO-TOUCH` writes the flag in the registry; the loop's
+            // copy — what each command's `Ctx` carries — is read back only
+            // after the commands that can change it (#566).
+            if matches!(cmd_name.as_str(), "CLIENT" | "EXEC") {
+                no_touch = client_registry.get_no_touch(client_id);
             }
             out_buf.extend_from_slice(&response);
             parse_offset += consumed;
