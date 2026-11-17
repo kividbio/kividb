@@ -1006,6 +1006,43 @@ mod tests {
         );
     }
 
+    /// A record of 1.2.0 ends `TIMESTAMP <time>` with the time as it was
+    /// replied: one above `i64::MAX` as a negative number. Re-logged by a
+    /// replica (its AOF, and its own replicas), the `TIMESTAMP` is found
+    /// and given the `u64` the series holds too — left as the negative, the
+    /// record's own replay refused it (#611).
+    #[test]
+    fn ts_incrby_feed_relogs_a_1_2_0_time_as_the_u64_it_kept() {
+        let max = u64::MAX.to_string();
+        let c = cmd(&["TS.INCRBY", "a", "1", "TIMESTAMP", "-1"]);
+        assert_eq!(
+            ts_incrby_feed(&refs(&c), b":-1\r\n"),
+            vec![cmd(&[
+                "TS.INCRBY",
+                "a",
+                "1",
+                "timestamp",
+                &max,
+                "TIMESTAMP",
+                &max
+            ])]
+        );
+        let c = cmd(&["TS.DECRBY", "a", "2", "TIMESTAMP", "-616"]);
+        let at_616 = (-616_i64 as u64).to_string();
+        assert_eq!(
+            ts_incrby_feed(&refs(&c), b":-616\r\n"),
+            vec![cmd(&[
+                "TS.DECRBY",
+                "a",
+                "2",
+                "timestamp",
+                &at_616,
+                "TIMESTAMP",
+                &at_616
+            ])]
+        );
+    }
+
     #[test]
     fn ts_madd_feed_leaves_out_refused_samples() {
         let c = cmd(&["TS.MADD", "a", "*", "1", "b", "*", "2", "c", "5", "3"]);

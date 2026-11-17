@@ -236,7 +236,7 @@ Set values are unordered collections of unique byte strings, reported as type `s
 | `HINCRBY` | `HINCRBY key field increment` | Increment an integer field; initialises to 0 if absent |
 | `HINCRBYFLOAT` | `HINCRBYFLOAT key field increment` | Increment a float field; initialises to 0 if absent |
 | `HSETNX` | `HSETNX key field value` | Set a field only if it does not already exist; returns 1 if set |
-| `HRANDFIELD` | `HRANDFIELD key [count [WITHVALUES]]` | Return random field(s); negative count allows repeats |
+| `HRANDFIELD` | `HRANDFIELD key [count [WITHVALUES]]` | Return random field(s); negative count allows repeats; a count of the size or more returns all fields, in `HGETALL` order. Reads the fields it picks: O(count) |
 | `HSCAN` | `HSCAN key cursor [MATCH pattern] [COUNT count] [NOVALUES]` | Incrementally iterate fields and values; `NOVALUES` returns field names only. Cursors are stable positions, as for `SCAN` |
 | `HEXPIRE` | `HEXPIRE key seconds [NX \| XX \| GT \| LT] FIELDS numfields field [field ...]` | Set per-field TTLs in seconds; per-field returns: `-2`=no such field, `0`=condition not met, `1`=TTL set, `2`=field deleted (past time) |
 | `HPEXPIRE` | `HPEXPIRE key milliseconds [NX \| XX \| GT \| LT] FIELDS numfields field [field ...]` | Same as `HEXPIRE` but TTL in milliseconds |
@@ -518,7 +518,7 @@ Sorted set commands operate on sets of unique strings ordered by a floating-poin
 | `BZPOPMAX` | `BZPOPMAX key [key ...] timeout` | Blocking ZPOPMAX; blocks until a member is available |
 | `ZMPOP` | `ZMPOP numkeys key [key ...] MIN\|MAX [COUNT count]` | Pop from first non-empty sorted set |
 | `BZMPOP` | `BZMPOP timeout numkeys key [key ...] MIN\|MAX [COUNT count]` | Blocking ZMPOP |
-| `ZRANDMEMBER` | `ZRANDMEMBER key [count [WITHSCORES]]` | Return random members; positive count = distinct, negative = with repetition |
+| `ZRANDMEMBER` | `ZRANDMEMBER key [count [WITHSCORES]]` | Return random members; positive count = distinct, negative = with repetition; a count of the size or more returns all members, highest score first. Walks the member table up to the last member it picks (no index by position yet), so it costs more the bigger the set |
 | `ZSCAN` | `ZSCAN key cursor [MATCH pattern] [COUNT count] [NOSCORES]` | Cursor-based iteration over members and scores; `NOSCORES` returns members only. Cursors are stable positions, as for `SCAN` |
 | `ZDIFF` | `ZDIFF numkeys key [key ...] [WITHSCORES]` | Return members in first set not in subsequent sets |
 | `ZDIFFSTORE` | `ZDIFFSTORE destination numkeys key [key ...]` | Store ZDIFF result |
@@ -1069,7 +1069,7 @@ in force when `EXEC` runs them.
 - Nesting `MULTI` inside an active transaction returns `ERR MULTI calls can not be nested`
 - `WATCH` inside an active `MULTI` returns an error
 - A write dirties a `WATCH` on any of the keys it names — both keys of `RENAME`, every key of `MSET` — as do `FLUSHDB`, `FLUSHALL`, `SWAPDB` and writes made from scripts
-- In cluster mode a command is routed when it is queued: one for another node's slot is answered with `-MOVED` there and then and the transaction is aborted (`EXEC` replies `-EXECABORT`). At `EXEC` the queued commands are routed again and must all address one slot (`-CROSSSLOT` otherwise). A transaction therefore never runs in part
+- In cluster mode a command is routed when it is queued: one for another node's slot is answered with `-MOVED` there and then and the transaction is aborted (`EXEC` replies `-EXECABORT`). At `EXEC` the whole queue is routed again, once, as one command, with its keys as they are before any of it runs: they must all be in one slot (`-CROSSSLOT` otherwise), and a slot that has moved or is moving answers the `EXEC` itself with `-MOVED`, `-ASK` or `-TRYAGAIN`, and nothing in it runs. Its commands are not routed again as they run, so a transaction never runs in part
 - `EXEC` does not isolate its commands from other clients' reads — see [`docs/EXEC_ATOMICITY.md`](docs/EXEC_ATOMICITY.md)
 
 ---
@@ -1456,7 +1456,9 @@ cluster master that came back without its dataset waits for its replica
 (see below). On a replica it reports
 `master_link_status` — `up` only when the replica is synced and receiving —
 `master_last_io_seconds_ago`, `master_link_down_since_seconds` while the link
-is down, `master_sync_in_progress`, `slave_repl_offset`, and the guard's state
+is down, `master_sync_in_progress`, `slave_repl_offset`, `master_replid` (the
+id of the stream the offset counts in; all zeros before a master has answered
+a PSYNC), and the guard's state
 (`replica_full_sync_guard`, `replica_full_syncs_refused`,
 `replica_last_sync_refusal`).
 

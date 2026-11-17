@@ -1480,6 +1480,67 @@ fn writes_during_an_aof_rewrite_evict_nothing_that_fits() {
     c.snapshot_let_go(limit);
 }
 
+/// #848. A snapshot encodes every value that is not a string into buffers
+/// as it captures the dataset, with writes held. Those bytes are in
+/// `used_memory` from the first element encoded, and were counted as not
+/// to be evicted for only once the capture was done: for as long as it
+/// took, `used_memory - mem_not_counted_for_evict` (what `maxmemory` is
+/// measured against, and what monitoring and autoscalers read) was high by
+/// the size of the encoded collections. Here the capture is held once it
+/// has laid everything out (`snapshot-captured`), with a list of about
+/// 36 MB in the dataset: the two numbers have moved together, and once the
+/// snapshot is written nothing is left uncounted.
+#[test]
+fn what_a_capture_lays_out_is_not_counted_as_it_is_made() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let server = Server::start_in_env(dir, &[], &[("KIVIDB_TEST_FAILPOINTS", "snapshot-captured")]);
+    let mut c = server.conn();
+    let element = "e".repeat(100);
+    for batch in 1..=300 {
+        let mut args = vec!["RPUSH", "big"];
+        args.extend(std::iter::repeat_n(element.as_str(), 1000));
+        assert_eq!(c.cmd(&args).i(), batch * 1000);
+    }
+    assert_eq!(c.not_counted(), 0);
+    let before = c.used_memory() - c.not_counted();
+
+    assert_eq!(c.cmd(&["BGSAVE"]).s(), "Background saving started");
+    let held = server.dir.join("failpoint.snapshot-captured.1");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !held.exists() {
+        assert!(Instant::now() < deadline, "no capture reached {held:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let used = c.used_memory();
+    let not_counted = c.not_counted();
+    let counted = used - not_counted;
+    // What the capture holds is in `used_memory` and in the other number.
+    assert!(
+        not_counted > 30 * MB,
+        "the capture holds about 36 MB of the list: {not_counted} bytes are not counted"
+    );
+    // What is counted is what it was: the list, once, and no more than a
+    // little besides. Before, it read the encoded list over.
+    assert!(
+        counted < before + 4 * MB,
+        "counted {counted} bytes during the capture, {before} before; {used} used, \
+         {not_counted} not counted"
+    );
+    std::fs::remove_file(held).unwrap();
+    c.wait_for("persistence", "rdb_bgsave_in_progress", "0");
+    assert_eq!(c.info("persistence", "rdb_last_bgsave_status"), "ok");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while c.not_counted() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "{} bytes are still not counted",
+            c.not_counted()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(c.cmd(&["LLEN", "big"]).i(), 300_000);
+}
+
 /// Memory that evicting keys does not give back, here what a snapshot
 /// holds counted as it was before #284 (`snapshot-held-counted`), with the
 /// snapshot's keys the only ones to evict (`volatile-lru`, and only they
@@ -1783,7 +1844,7 @@ fn volatile_writes_while_the_last_volatile_key_is_being_freed_are_refused() {
 
 /// `UNLINK` hands a big collection to the background to free. A client
 /// that builds one big list after another and unlinks each, while the
-/// background frees fall behind (`lazyfree-slowly`), does not let writes
+/// background frees fall behind (`lazyfree-held`: none is freed), does not let writes
 /// past the limit: once nothing is left to evict, they are refused with
 /// OOM, the list being built too, and memory use stays within a few
 /// megabytes of the limit however many lists wait to be freed.
@@ -1793,7 +1854,7 @@ fn writes_are_refused_while_unlinked_lists_wait_to_be_freed() {
     let server = Server::start_in_env(
         dir,
         &["--maxmemory-policy", "allkeys-lru"],
-        &[("KIVIDB_TEST_FAILPOINTS", "lazyfree-slowly")],
+        &[("KIVIDB_TEST_FAILPOINTS", "lazyfree-held")],
     );
     let mut c = server.conn();
     let value = big_value('k');
@@ -1802,16 +1863,26 @@ fn writes_are_refused_while_unlinked_lists_wait_to_be_freed() {
     }
     let limit = c.limit_to(4 * MB);
     let mut builder = server.conn();
+    // Lists are built until something has been refused: the background
+    // frees are held (`lazyfree-held`), so every unlinked list waits to be
+    // freed and stays counted. A fixed number of lists against frees that
+    // were only slow depended on the builder outrunning them.
+    let refusal_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = std::sync::Arc::clone(&refusal_seen);
     let built = std::thread::spawn(move || {
         let element = "e".repeat(100);
         let mut refused = 0;
-        for i in 0..30 {
+        for i in 0..300 {
+            if seen.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
             let key = format!("tmp{i}");
             let mut push = vec!["RPUSH", key.as_str()];
             push.extend(std::iter::repeat_n(element.as_str(), 2000));
             for _ in 0..15 {
                 if builder.cmd(&push).is_err() {
                     refused += 1;
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
             builder.cmd(&["UNLINK", &key]);
@@ -1825,6 +1896,7 @@ fn writes_are_refused_while_unlinked_lists_wait_to_be_freed() {
     while !built.is_finished() {
         if writer.cmd(&["SET", &format!("w{n}"), &value]).is_err() {
             refused += 1;
+            refusal_seen.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         n += 1;
         peak = peak.max(c.counted());
@@ -1834,7 +1906,7 @@ fn writes_are_refused_while_unlinked_lists_wait_to_be_freed() {
         refused + refused_builds > 0,
         "nothing was refused: {n} writes"
     );
-    // 30 lists of 3 MB were built and unlinked: over the limit by no more
+    // Lists of 3 MB were built and unlinked: over the limit by no more
     // than a list being built and what was queued to be freed before the
     // limit was reached.
     assert!(

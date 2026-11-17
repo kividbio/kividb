@@ -37,10 +37,13 @@ fn worker() -> &'static Sender<Job> {
             .name("kividb-lazyfree".into())
             .spawn(move || {
                 for (what, objects) in rx {
-                    if crate::aof::injected("lazyfree-slowly") {
-                        // For a test: frees that fall behind.
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                    }
+                    // For a test: frees that fall behind. Each one waits
+                    // for its `failpoint.lazyfree-held.<n>` file to be
+                    // removed, so that what is handed over piles up for
+                    // as long as the test likes, however fast the machine
+                    // builds what is handed over (a fixed delay for each
+                    // free was outrun only when the machine was quick).
+                    crate::aof::failpoint("lazyfree-held");
                     drop(what);
                     done(objects);
                 }

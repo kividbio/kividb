@@ -1192,10 +1192,13 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
             // What a running Redis cannot be told either.
             "daemonize" | "databases" | "pidfile" | "logfile" | "log-format" | "unixsocket"
             | "supervised" | "io-threads" | "tcp-backlog" | "set-proc-title" | "appendfilename"
-            | "appenddirname" | "aclfile" => {
-                let unchanged = config_rows(ctx)
-                    .iter()
-                    .any(|(name, current)| *name == param && current == value);
+            | "appenddirname" | "aclfile" | "dbfilename" => {
+                // `dump.rdb` is accepted as the configuration file accepts
+                // it: the snapshot is `dump.kdb` either way (#846).
+                let unchanged = (param == "dbfilename" && value == "dump.rdb")
+                    || config_rows(ctx)
+                        .iter()
+                        .any(|(name, current)| *name == param && current == value);
                 if unchanged {
                     Some(resp_simple("OK"))
                 } else {
@@ -2174,6 +2177,13 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
                 .map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         ),
+        // The file a save writes and a start reads, in `dir`: what is
+        // always used, whatever the configuration file or `--dbfilename`
+        // said (#846).
+        ("dbfilename", crate::aof::SNAPSHOT_PATH.to_string()),
+        // The file the append-only log is written to, in `dir`: always this
+        // one, whatever the configuration file said (#855).
+        ("appendfilename", crate::aof::AOF_PATH.to_string()),
         ("aclfile", ctx.config.aclfile.clone()),
         (
             "slowlog-log-slower-than",
@@ -4853,6 +4863,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         if sync_ip { 1 } else { 0 }
                     ));
                     out.push_str(&format!("slave_repl_offset:{offset}\r\n"));
+                    // The id of the stream `slave_repl_offset` counts in, as
+                    // Redis reports it on a replica: all zeros until a master
+                    // has answered a PSYNC.
+                    let replid = ctx
+                        .repl_state
+                        .resync_point
+                        .lock()
+                        .as_ref()
+                        .map_or_else(|| "0".repeat(40), |p| p.repl_id.clone());
+                    out.push_str(&format!("master_replid:{replid}\r\n"));
                     if let Some(down_for) = ctx.repl_state.master_link_down_since_seconds() {
                         out.push_str(&format!("master_link_down_since_seconds:{down_for}\r\n"));
                     }
