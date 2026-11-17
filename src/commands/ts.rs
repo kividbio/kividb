@@ -403,9 +403,9 @@ fn record_of_1_2_0(ctx: &Ctx, cmd: &[&[u8]]) -> Option<TsOptions> {
 }
 
 /// Whether the `TS.INCRBY` or `TS.DECRBY` `cmd` was applied as 1.2.0's
-/// record: for the replication feed, which then sends it on (a replica to
-/// its AOF, and to its own replicas) as 1.2.0 wrote it, so that it is read
-/// again as it was here. Sent in 1.2.1's form, behind the mark, it was read
+/// record: for the replication feed, which then logs it (a replica to its
+/// AOF, and so to a backup taken from it) as 1.2.0 wrote it, so that it is
+/// read again as it was here. Sent in 1.2.1's form, behind the mark, it was read
 /// with its options, which 1.2.0 passed over.
 pub(crate) fn applied_as_1_2_0(ctx: &Ctx, cmd: &[&[u8]]) -> bool {
     record_of_1_2_0(ctx, cmd).is_some()
