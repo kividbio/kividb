@@ -953,7 +953,7 @@ pub(crate) fn effective_resp_for_reply(ctx: &Ctx<'_>) -> u8 {
             return r;
         }
     }
-    ctx.resp
+    ctx.resp & crate::commands::ctx::RESP_VERSION
 }
 
 /// Negotiated wire protocol for the **connected client** (ignores `redis.setresp`).
@@ -1068,6 +1068,24 @@ fn is_script(name: &str) -> bool {
         name,
         "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" | "FCALL" | "FCALL_RO"
     )
+}
+
+/// Whether a `CLIENT NO-TOUCH` client's command `name` records no use of
+/// its keys: a read does not; `TOUCH`, a write and a script that may write
+/// do (#566). A `SORT` without `STORE` is a read here, as it is in Redis,
+/// though it counts as a write elsewhere. Out of line and cold: only such
+/// a client's commands, under a policy that records uses, ask, and the test
+/// on the way here is one byte.
+#[cold]
+#[inline(never)]
+fn no_touch_skips(name: &str, cmd: &[&[u8]], writes_operation: bool) -> bool {
+    let reads = !writes_operation
+        || (name == "SORT"
+            && !cmd
+                .iter()
+                .skip(2)
+                .any(|arg| arg.eq_ignore_ascii_case(b"STORE")));
+    reads && name != "TOUCH" && (!is_script(name) || name.ends_with("_RO"))
 }
 
 /// What the lookups of the command `name`, started at `now`, write to the
@@ -1787,8 +1805,16 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     };
 
     // Under an eviction policy that goes by use, the command's own lookups
-    // write it (see `eviction`): one atomic load when there is none.
-    let (access, used_after) = if crate::eviction::recording() {
+    // write it (see `eviction`): one atomic load when there is none. A
+    // `CLIENT NO-TOUCH` client's reads record no use of their keys: no
+    // scope, and nothing written after them either. Its writes count as
+    // uses — a key one makes is born used, not at the start of time — a
+    // script that may write counts its declared keys the same, and `TOUCH`
+    // still touches, as in Redis (#566).
+    let (access, used_after) = if crate::eviction::recording()
+        && !(ctx.resp & crate::commands::ctx::RESP_NO_TOUCH != 0
+            && no_touch_skips(name, &ctx.cmd, writes_operation))
+    {
         let (scope, after) = access_scope(name, started, &ctx.cmd);
         (Some(scope), after)
     } else {
@@ -1857,7 +1883,8 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // Command handlers hardcode RESP2's legacy null encoding (`$-1`/`*-1`); rewrite it to the
     // RESP3 null type (`_`) here, once, for RESP3 connections — see `resp3_normalize_null`.
     // `ctx.resp` is per-connection local state, not a client_registry lookup — see Ctx::resp.
-    let result = if ctx.resp == 3 {
+    // The protocol is 2 or 3: bit 0 says RESP3, whatever `RESP_NO_TOUCH` is.
+    let result = if ctx.resp & 1 != 0 {
         crate::resp::write::resp3_normalize_null(result)
     } else {
         result

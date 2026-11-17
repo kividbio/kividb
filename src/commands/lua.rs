@@ -3068,6 +3068,7 @@ impl ReplyProtocol {
                         // which outlives the script and the conversion of
                         // its reply.
                         unsafe { &*(se.ctx_addr as *const Ctx<'_>) }.resp
+                            & crate::commands::ctx::RESP_VERSION
                     };
                     Self {
                         client,

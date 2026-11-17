@@ -271,6 +271,12 @@ other files:
 - `OBJECT IDLETIME` is `0` unless a `maxmemory-policy` that uses it is set,
   or `key-access-tracking yes` is (Redis always keeps it; the setting costs
   about 50 instructions a command, 1 to 1.5% of a pipelined `GET` or `SET`).
+- `CLIENT NO-TOUCH`: the client's reads leave a key's idle time and LFU
+  count alone, and `TOUCH` still touches, as in Redis. Its writes count as
+  uses of their keys, and so do the keys a script declares when the client
+  runs one that may write (`EVAL`, `EVALSHA`, `FCALL`); in Redis a
+  `NO-TOUCH` client's write to a key that is already there, or its script,
+  leaves the key's use alone, and only a key it creates is marked used.
 - `client-output-buffer-limit`'s replica hard limit is
   `repl-replica-max-backlog-bytes` (0: no limit, which lifts
   `repl-replica-sync-max-backlog-bytes` too); during a full sync a replica
