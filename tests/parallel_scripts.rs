@@ -1067,6 +1067,13 @@ fn a_script_of_two_tags_runs_beside_others_and_holds_both() {
     let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", COUNTS_ALL]) else {
         panic!("SCRIPT LOAD did not answer with a digest")
     };
+    // The probes' scripts are a copy under another digest: the slow run
+    // makes its own digest one that is offloaded from then on, and the
+    // probes must not be sent to the pool for that.
+    let probe_script = format!("{COUNTS_ALL} -- the probes");
+    let V::Str(probe_sha) = c.cmd(&["SCRIPT", "LOAD", &probe_script]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
     for key in ["{a}:k", "{b}:k", "{c}:k"] {
         assert!(c.cmd(&["SET", key, "before"]).ok());
     }
@@ -1098,11 +1105,11 @@ fn a_script_of_two_tags_runs_beside_others_and_holds_both() {
                 V::Int(1)
             );
             assert_eq!(
-                c.cmd(&["EVALSHA", &sha, "1", "{c}:k", "1", "before"]),
+                c.cmd(&["EVALSHA", &probe_sha, "1", "{c}:k", "1", "before"]),
                 V::Int(1)
             );
             assert_eq!(
-                c.cmd(&["EVALSHA", &sha, "1", "{b}:k2", "1", "before"]),
+                c.cmd(&["EVALSHA", &probe_sha, "1", "{b}:k2", "1", "before"]),
                 V::Int(1)
             );
         }
@@ -1145,7 +1152,7 @@ fn a_script_of_two_tags_runs_beside_others_and_holds_both() {
             assert!(done.iter().all(|(r, _)| *r == reply), "{done:?}");
             (reply, done.iter().map(|(_, at)| *at).min().unwrap())
         };
-        let other_script = several(words(&["EVALSHA", &sha, "1", "{c}:k", "1", "other"]));
+        let other_script = several(words(&["EVALSHA", &probe_sha, "1", "{c}:k", "1", "other"]));
         let other_read = several(words(&["GET", "{c}:still"]));
         let untagged = several(words(&["SET", "plain", "v"]));
         let other_script = earliest(other_script);
@@ -1161,7 +1168,7 @@ fn a_script_of_two_tags_runs_beside_others_and_holds_both() {
         let both = probe(words(&["MGET", "{b}:k", "{a}:k"]));
         // On another key of its second tag, so that the reads above find what
         // the slow script wrote whichever of them goes first after it.
-        let script_on_second = probe(words(&["EVALSHA", &sha, "1", "{b}:k2", "1", "later"]));
+        let script_on_second = probe(words(&["EVALSHA", &probe_sha, "1", "{b}:k2", "1", "later"]));
 
         let (slow_reply, slow_done) = slow.join().unwrap();
         let first_tag = first_tag.join().unwrap();
@@ -1169,16 +1176,10 @@ fn a_script_of_two_tags_runs_beside_others_and_holds_both() {
         let both = both.join().unwrap();
         let script_on_second = script_on_second.join().unwrap();
         let pooled = script_counts(&mut c)["scripts_offloaded_to_pool"] - pooled_before;
-        // And the waiting commands were sent well before it ended.
-        let late = sent + Duration::from_millis(200) > slow_done;
-        if (pooled > 0 || late) && attempt < 5 {
+        if pooled > 0 && attempt < 5 {
             continue;
         }
         assert_eq!(pooled, 0, "a script went to the pool in every attempt");
-        assert!(
-            !late,
-            "the waiting commands were sent too late in every attempt"
-        );
 
         assert_eq!(slow_reply, V::Int(steps as i64));
         assert!(
@@ -1205,6 +1206,16 @@ fn a_script_of_two_tags_runs_beside_others_and_holds_both() {
         assert!(
             done + margin < slow_done,
             "a key with no tag waited: {done:?} of {slow_done:?}"
+        );
+
+        // And the commands that must wait were sent well before it ended.
+        let late = sent + Duration::from_millis(200) > slow_done;
+        if late && attempt < 5 {
+            continue;
+        }
+        assert!(
+            !late,
+            "the waiting commands were sent too late in every attempt"
         );
 
         // Either of its tags: not before the script was done, and with what
