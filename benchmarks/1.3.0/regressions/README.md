@@ -34,6 +34,7 @@ and why.
 | `15-brpop-many-keys` | #758 | jobs/s delivered to 1,000 and 4,000 workers each in `BRPOP` over 270 queues (and 1,000 over one queue, a guard) while 200 `LPUSH`es go out every 0.1 s; PING p99/max beside it; jobs lost (exactly 0) and clients left blocked after the workers go (0) |
 | `16-random-sample` | #839 | `ZRANDMEMBER` / `HRANDFIELD` of a sorted set / hash of 100, 10,000 and 1,000,000 members, with no count, 1, 10, -1, -10, `WITHSCORES` / `WITHVALUES`: microseconds a call (mean of 150-3,000 calls, median of 3 rounds) and the replies checked (length, distinct for a positive count) |
 | `17-set-memory` | #297 (step 1) | `used_memory` per set member, 1,000,000 members in sets of 10, 100, 1,000 and 100,000: 14-byte strings (`membr:<i>`) and integers (`0`..`n-1`); `OBJECT ENCODING` of each size recorded exactly; the tables (1,000 and 100,000) as guard rows |
+| `19-hash-memory` | collection storage step 2 | `used_memory` per hash field, 1,000,000 fields in hashes of 10, 100, 1,000 and 100,000: 14-byte fields (`field:<i>`) with 32-byte values, plain and with one field TTL a hash; `OBJECT ENCODING` of each size recorded exactly (`listpack`, `listpackex`, `hashtable`); the tables (1,000 and 100,000) as guard rows |
 | `20-envoy-ratelimit` | #849 | envoyproxy/ratelimit's pipelined `INCRBY` + `EXPIRE` pair on one key (memtier_benchmark, `--pipeline 2 --transaction`, 100,000 keys) at 200 and 500 connections: ops/s against Redis, p99 shown beside it, and keys left without a TTL (must be 0); on Linux the server and the client are pinned to separate halves of the CPUs |
 
 ## Running it
@@ -861,6 +862,29 @@ The 1,000 and 100,000 rows are guards: sets past the block's and the array's
 limits are tables, as in v1.2.2, and must not grow. Instructions per command
 are not measured here (the suite has no callgrind harness); #297's PR has
 them from `scripts/perf`-style runs.
+
+## Recorded run, suite 19
+
+Recorded 2026-11-17 on an Azure Standard_D4s_v5 (Xeon Platinum 8370C),
+`--only 19 --record`; the candidate is commit `c7e0b47e` (small hashes in one
+block), `cargo build --release`. Runs: `pr-packed-hashes-d4s_v5` (recorded)
+and `pr-packed-hashes-d4s_v5-rerun` (the noise check: every gate passed; the
+figures agree to 0.2 B). A run takes 84 s.
+
+Bytes of `used_memory` a field, 1,000,000 fields of 14 bytes with 32-byte
+values in hashes of each size (`OBJECT ENCODING` of the candidate's hashes
+in brackets; Redis's are the same):
+
+| fields a hash | v1.2.2 plain | candidate plain | Redis 8.10.2 plain | v1.2.2 one TTL | candidate one TTL | Redis 8.10.2 one TTL |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 162.4 | 71.4 (listpack) | 56.8 | 192.2 | 101.2 (listpackex) | 72.1 |
+| 100 | 129.2 | 55.8 (listpack) | 51.8 | 131.5 | 58.1 (listpackex) | 62.3 |
+| 1,000 | 166.6 | 166.6 (hashtable) | 70.4 | 166.9 | 166.9 (hashtable) | 70.4 |
+| 100,000 | 128.8 | 128.8 (hashtable) | 76.8 | 128.9 | 128.9 (hashtable) | 76.8 |
+
+The 1,000 and 100,000 rows are guards: hashes past the block's limits are
+tables, as in v1.2.2, and must not grow. Instructions per command are not
+measured here; the PR has them from callgrind runs of the same builds.
 
 ## Suite 20, measured off the gate VM
 

@@ -627,7 +627,7 @@ mod tests {
     fn hash_with(fields: &[(&str, Option<Duration>)]) -> KiviDBValue {
         let mut inner = HashInner::new();
         for (name, ttl) in fields {
-            inner.fields.insert(name.to_string(), Arc::from(&b"v"[..]));
+            inner.fields.insert_bytes(name, b"v");
             if let Some(ttl) = ttl {
                 inner
                     .expiries
@@ -640,7 +640,7 @@ mod tests {
     fn fields_of(store: &Store, key: &str) -> Option<Vec<String>> {
         match crate::store::get_shard(&store[0], key).read().get(key) {
             Some(ValueRef::HashEx(hash)) => {
-                let mut names: Vec<String> = hash.read().fields.keys().cloned().collect();
+                let mut names: Vec<String> = hash.read().fields.keys().map(str::to_owned).collect();
                 names.sort();
                 Some(names)
             }
@@ -683,7 +683,7 @@ mod tests {
         ];
         let mut inner = HashInner::new();
         for (name, value) in &fields {
-            inner.fields.insert(name.clone(), Arc::clone(value));
+            inner.fields.insert(name, value);
         }
         inner.expiries.insert("n".into(), field_now() + 1);
         crate::store::get_shard(&store[0], key).write().insert(
@@ -745,10 +745,7 @@ mod tests {
                     // HSET k n 3.
                     *beside.borrow_mut() = Some(write_beside(KEY, move || {
                         let three: Arc<[u8]> = Arc::from(&b"3"[..]);
-                        hash_at(&store, KEY)
-                            .write()
-                            .fields
-                            .insert("n".into(), Arc::clone(&three));
+                        hash_at(&store, KEY).write().fields.insert("n", &three);
                         def.postings
                             .write_fields(KEY, &[("n".into(), three)], false, None);
                     }));
@@ -1199,12 +1196,12 @@ mod propagation_tests {
                     .read()
                     .fields
                     .iter()
-                    .map(|(f, v)| (f.clone(), String::from_utf8_lossy(v).into_owned()))
+                    .map(|(f, v)| (f.to_owned(), String::from_utf8_lossy(&v).into_owned()))
                     .collect(),
                 ValueRef::Hash(hash) => hash
                     .read()
                     .iter()
-                    .map(|(f, v)| (f.clone(), String::from_utf8_lossy(v).into_owned()))
+                    .map(|(f, v)| (f.to_owned(), String::from_utf8_lossy(&v).into_owned()))
                     .collect(),
                 _ => return Some(Vec::new()),
             };
