@@ -16,6 +16,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checkpoint with a Bloom filter in it cannot be read by an earlier release.
   Delete the filters (or move them off with `DUMP`, which Redis restores)
   before going back.
+- **A sample time of `-0` is refused.** `TS.ADD`, `TS.MADD`, `TS.INCRBY`
+  and `TS.DECRBY` answer an error for it, as RedisTimeSeries and 1.2.0 do.
 - **A 1.2.x replica warns once for each idempotent duplicate.** A master
   now propagates an `XADD … IDMP` that was a duplicate (#655), and a
   replica of an earlier release refuses it ("equal or smaller than the
@@ -431,6 +433,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   read as the same 64 bits on replay, in an applied command as in a
   `TS.ADD` or `TS.MADD`, so the re-logged record — and any such record an
   earlier 1.2.1 already wrote — replays at the time 1.2.0 kept.
+
+- **`TS.ADD` and `TS.INCRBY` send the time they replied with to replicas
+  and the AOF.** `TS.ADD` sends the time of the sample it added as the
+  number it replied, as `TS.MADD`, `TS.INCRBY` and `TS.DECRBY` do, in place
+  of the time as the client wrote it (`+5`, `007`): the plain number every
+  version reads. A time of `-0` is refused by every command that takes a
+  sample's time, as RedisTimeSeries and 1.2.0 refuse it. And a
+  `TS.INCRBY` or `TS.DECRBY` record written by 1.2.0, which a replica
+  applies as 1.2.0 read it, is logged again as 1.2.0 wrote it: the
+  replica's AOF, and a backup taken from it, read it as the replica did.
 
 - **A replica continued by a dataset digest keeps the new stream's id as
   its resync point (#402).** A master killed and started again from its
