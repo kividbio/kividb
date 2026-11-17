@@ -1153,40 +1153,48 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             if name == "SELECT" && ctx.cmd.get(1).is_some_and(|db| *db != &b"0"[..]) {
                 return resp_error("ERR SELECT is not allowed in cluster mode");
             }
-            // Pull asking flag from client registry.
-            let asking_flag = ctx.client_registry.get_asking(ctx.client_id);
-            // Before the keys are looked for: anything that moves them from
-            // here after this, the write sees in the gate.
-            routed = crate::cluster::routing::Routed::now(asking_flag);
-            // has_key_locally: bind to the store/db combination via closure.
-            let store_for_check = ctx.store;
-            let db = *ctx.selected_db;
-            let has_key_locally = |key: &[u8]| -> bool {
-                let shard = crate::store::get_shard(&store_for_check[db], key);
-                crate::read_lock!(shard).contains_key(key)
-            };
-            let registry = ctx.client_registry;
-            let client_id = ctx.client_id;
-            let decision = route_named(
-                name,
-                ctx.cmd.as_slice(),
-                ctx.cluster,
-                asking_flag,
-                || registry.get_readonly(client_id),
-                has_key_locally,
-            );
-            // ASKING is single-shot: clear after this command regardless of
-            // outcome. A command `EXEC` runs leaves it to the end of the
-            // transaction (`routing::transaction_ended`), as in Redis (#698).
-            if asking_flag && !crate::command_gate::alone_on_this_thread() {
-                ctx.client_registry.update(ctx.client_id, |info| {
-                    info.asking = false;
-                });
+            // A command `EXEC` runs was routed with the rest of its queue, once,
+            // before any of it ran (`routing::exec_refusal`), and leaves
+            // `ASKING` to the end of the transaction (`routing::transaction_ended`).
+            // Routed again here, it was judged on the keys the commands before
+            // it had made or deleted, and refused half way through (#339).
+            // Scripts' commands do not come here; a command of the client's
+            // takes the gate alone only after this.
+            if !crate::command_gate::alone_on_this_thread() {
+                // Pull asking flag from client registry.
+                let asking_flag = ctx.client_registry.get_asking(ctx.client_id);
+                // Before the keys are looked for: anything that moves them from
+                // here after this, the write sees in the gate.
+                routed = crate::cluster::routing::Routed::now(asking_flag);
+                // has_key_locally: bind to the store/db combination via closure.
+                let store_for_check = ctx.store;
+                let db = *ctx.selected_db;
+                let has_key_locally = |key: &[u8]| -> bool {
+                    let shard = crate::store::get_shard(&store_for_check[db], key);
+                    crate::read_lock!(shard).contains_key(key)
+                };
+                let registry = ctx.client_registry;
+                let client_id = ctx.client_id;
+                let decision = route_named(
+                    name,
+                    ctx.cmd.as_slice(),
+                    ctx.cluster,
+                    asking_flag,
+                    || registry.get_readonly(client_id),
+                    has_key_locally,
+                );
+                // ASKING is single-shot: clear after this command regardless of
+                // outcome.
+                if asking_flag {
+                    ctx.client_registry.update(ctx.client_id, |info| {
+                        info.asking = false;
+                    });
+                }
+                if let Some(refusal) = decision.refusal() {
+                    return refusal;
+                }
+                crate::cluster::routing::stall_for_test(name, ctx.cmd.as_slice());
             }
-            if let Some(refusal) = decision.refusal() {
-                return refusal;
-            }
-            crate::cluster::routing::stall_for_test(name, ctx.cmd.as_slice());
         }
     }
 

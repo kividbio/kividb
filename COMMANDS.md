@@ -1069,7 +1069,7 @@ in force when `EXEC` runs them.
 - Nesting `MULTI` inside an active transaction returns `ERR MULTI calls can not be nested`
 - `WATCH` inside an active `MULTI` returns an error
 - A write dirties a `WATCH` on any of the keys it names — both keys of `RENAME`, every key of `MSET` — as do `FLUSHDB`, `FLUSHALL`, `SWAPDB` and writes made from scripts
-- In cluster mode a command is routed when it is queued: one for another node's slot is answered with `-MOVED` there and then and the transaction is aborted (`EXEC` replies `-EXECABORT`). At `EXEC` the queued commands are routed again and must all address one slot (`-CROSSSLOT` otherwise). A transaction therefore never runs in part
+- In cluster mode a command is routed when it is queued: one for another node's slot is answered with `-MOVED` there and then and the transaction is aborted (`EXEC` replies `-EXECABORT`). At `EXEC` the whole queue is routed again, once, as one command, with its keys as they are before any of it runs: they must all be in one slot (`-CROSSSLOT` otherwise), and a slot that has moved or is moving answers the `EXEC` itself with `-MOVED`, `-ASK` or `-TRYAGAIN`, and nothing in it runs. Its commands are not routed again as they run, so a transaction never runs in part
 - `EXEC` does not isolate its commands from other clients' reads — see [`docs/EXEC_ATOMICITY.md`](docs/EXEC_ATOMICITY.md)
 
 ---
