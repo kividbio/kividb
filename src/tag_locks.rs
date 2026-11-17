@@ -131,6 +131,50 @@ pub fn script_tag<'a>(cmd: &[&'a [u8]]) -> Option<&'a [u8]> {
         .then_some(tag)
 }
 
+/// What a script command's `KEYS` are, as far as running under a tag goes:
+/// for `INFO`'s counts of the scripts that ran alone, and why
+/// (`stats::scripts`). Asked only of a script that runs alone.
+#[cfg(feature = "lua")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptKeys {
+    /// None, or a count of them that is not one.
+    None,
+    /// At least one has no hash tag.
+    Untagged,
+    /// All have one, and not all the same.
+    SeveralTags,
+    /// All share one.
+    OneTag,
+}
+
+/// See [`ScriptKeys`]. `cmd` is a script command with its arguments.
+#[cfg(feature = "lua")]
+pub fn script_keys(cmd: &[&[u8]]) -> ScriptKeys {
+    let keys = std::str::from_utf8(cmd.get(2).copied().unwrap_or_default())
+        .ok()
+        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(|n| cmd.get(3..3usize.checked_add(n)?));
+    let Some((first, rest)) = keys.and_then(|keys| keys.split_first()) else {
+        return ScriptKeys::None;
+    };
+    let mut tags = std::iter::once(first).chain(rest).map(|key| tag_of(key));
+    let Some(Some(tag)) = tags.next() else {
+        return ScriptKeys::Untagged;
+    };
+    let mut several = false;
+    for other in tags {
+        match other {
+            None => return ScriptKeys::Untagged,
+            Some(other) => several |= other != tag,
+        }
+    }
+    if several {
+        ScriptKeys::SeveralTags
+    } else {
+        ScriptKeys::OneTag
+    }
+}
+
 /// Say that the script this thread runs next may run under its tag. Asked
 /// for by the caller that knows the script to be a quick one; taken by the
 /// command path, once.
@@ -448,6 +492,38 @@ mod tests {
         assert_eq!(tag(&[b"FCALL", b"f", b"1", b"{q}:a"]), None);
         assert_eq!(tag(&[b"EVALSHA", b"abc", b"5", b"{q}:a"]), None);
         assert_eq!(tag(&[b"EVALSHA", b"abc", b"x", b"{q}:a"]), None);
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn a_scripts_keys_are_told_apart_for_the_counters() {
+        let kind = |cmd: &[&[u8]]| script_keys(cmd);
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"2", b"{q}:a", b"x:{q}:b"]),
+            ScriptKeys::OneTag
+        );
+        assert_eq!(kind(&[b"EVALSHA", b"abc", b"0"]), ScriptKeys::None);
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"3", b"{q}:a"]),
+            ScriptKeys::None
+        );
+        assert_eq!(kind(&[b"EVALSHA", b"abc", b"x"]), ScriptKeys::None);
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"2", b"{q}:a", b"b"]),
+            ScriptKeys::Untagged
+        );
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"2", b"a", b"{q}:b"]),
+            ScriptKeys::Untagged
+        );
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"3", b"{q}:a", b"{r}:b", b"c"]),
+            ScriptKeys::Untagged
+        );
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"2", b"{q}:a", b"{r}:b"]),
+            ScriptKeys::SeveralTags
+        );
     }
 
     #[test]

@@ -43,8 +43,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   In a cluster of more than one master, `FT.HYBRID` is now refused, where
   1.2.x answered from the one node's slots without saying so.
+- **nodes.conf keeps each node's shard id (#563)**, after its address and
+  hostname as Redis writes it: `ip:port@cport,<hostname>,shard-id=<id>`.
+  An earlier release reading the file takes `<hostname>,shard-id=<id>` for
+  the hostname, until each peer's next heartbeat says its own again; a
+  cluster's shard ids converge on each master's as its nodes are upgraded.
+  After a rollback with `cluster-preferred-endpoint-type hostname`, a peer
+  that is down at that moment is handed out under that name in `MOVED` and
+  `CLUSTER SLOTS` until it comes back.
 
 ### Added
+
+- **`INFO stats` says how scripts were run (#871).** With
+  `lua-parallel-scripts yes`, a script runs beside other commands only when
+  its `KEYS` share a hash tag and it has been seen to be quick; any other
+  runs alone, and holds up every other command while it does. Nothing
+  showed which: a benchmark could run every script alone without anyone
+  seeing it but in `top -H`. `scripts_run_beside_others` and
+  `scripts_run_alone_*` now count each script run by how it ran and why
+  (parallel scripts off, inside a transaction, a function, no keys, a key
+  without a tag, keys of several tags, not yet seen to be quick), and
+  `scripts_handed_to_runner` and `scripts_offloaded_to_pool` count where
+  the ones run alone ran. They are counted only where a script's way of
+  running is decided: nothing is added to other commands, and a build
+  without Lua has none of them. `CONFIG RESETSTAT` resets them. See
+  docs/SCRIPTS.md.
 
 - **Redis-style command-line directives: `kividb --appendonly yes --save 900 1
   --maxmemory 256mb ...` (#390).** Every directive a config file or `CONFIG
@@ -374,6 +397,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stop at the query's `TIMEOUT` (#670).
 
 ### Fixed
+
+- **A shard keeps its id across a failover (#563).** `CLUSTER MYSHARDID`
+  answered the master's node id, so a shard's id changed when a replica
+  took over. Each node now has a shard id of its own, as in Redis: random
+  when it is first known, its master's while it is a replica, kept when a
+  replica is promoted, and new after `CLUSTER RESET HARD`. Nodes say their
+  own in their heartbeats (a token older nodes skip), and nodes.conf keeps
+  it, saved as soon as a node learns a new one. In `CLUSTER SHARDS` a
+  failed master without slots is shown in the entry of its shard's master,
+  the replica that took over from it; every master that owns slots still
+  has an entry of its own.
 
 - **A pipeline sent before its replies are read no longer hangs its
   connection (#865).** A client that sends a whole pipeline and only then

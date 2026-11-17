@@ -62,6 +62,12 @@ pub struct ClusterNode {
     /// balancer that maps ports); 0 if it announces none. Nodes reach each
     /// other at `client_port` regardless (#110).
     pub announced_client_port: u16,
+    /// The shard the node is in, as Redis's `shard_id` (`CLUSTER MYSHARDID`):
+    /// random when the node is first known, its master's while it is a
+    /// replica, and kept by a replica that is promoted, so that a shard keeps
+    /// its id across a failover (#563). The node says its own in its
+    /// heartbeats; `ClusterState::take_shard_id` takes it in.
+    pub shard_id: NodeId,
 }
 
 impl ClusterNode {
@@ -80,6 +86,7 @@ impl ClusterNode {
             fail_since_ms: 0,
             hostname: String::new(),
             announced_client_port: 0,
+            shard_id: generate_node_id(),
         }
     }
 
