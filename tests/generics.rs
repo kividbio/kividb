@@ -950,6 +950,92 @@ fn test_scan_returns_every_lasting_key_while_the_keyspace_grows_and_shrinks() {
     c.cmds(&["SELECT", "0"]);
 }
 
+/// The same guarantee with the pages Argo CD asks for (`COUNT 10000`, a
+/// pattern nothing matches but the lasting keys), while another client
+/// writes and deletes all the time, not only between calls: a page that
+/// takes the rest of a shard in one pass (#884) must still see every key
+/// there all along, as the shards' tables grow under it.
+#[test]
+fn test_scan_with_a_large_count_returns_every_lasting_key_under_concurrent_writes() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["SELECT", "10"]);
+    c.cmds(&["FLUSHDB"]);
+
+    const LASTING: usize = 2000;
+    mset(&mut c, (0..LASTING).map(|i| format!("lasting:{i}")));
+    mset(&mut c, (0..4000).map(|i| format!("doomed:{i}")));
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let writer = {
+        let stop = stop.clone();
+        let progress = progress.clone();
+        thread::spawn(move || {
+            let mut other = Conn::connect(port);
+            other.cmds(&["SELECT", "10"]);
+            let mut added = 0usize;
+            let mut deleted = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                mset(&mut other, (added..added + 500).map(|i| format!("new:{i}")));
+                added += 500;
+                progress.store(added, std::sync::atomic::Ordering::Relaxed);
+                if deleted < 4000 {
+                    let mut args = vec!["DEL".to_string()];
+                    args.extend((deleted..deleted + 100).map(|i| format!("doomed:{i}")));
+                    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                    other.cmds(&refs);
+                    deleted += 100;
+                }
+            }
+            added
+        })
+    };
+
+    // Scans go on until the tables have grown several times over.
+    let grown = 4 * (LASTING + 4000);
+    let mut scans = 0;
+    while scans < 30 || progress.load(std::sync::atomic::Ordering::Relaxed) < grown {
+        assert!(scans < 100_000, "the writer made no progress");
+        scans += 1;
+        let mut found = std::collections::HashSet::new();
+        let mut cursor = "0".to_string();
+        let mut calls = 0;
+        loop {
+            calls += 1;
+            assert!(calls <= 100_000, "SCAN never came back to cursor 0");
+            let r = c.cmds(&["SCAN", &cursor, "MATCH", "lasting:*", "COUNT", "10000"]);
+            let parts = r.as_array();
+            cursor = parts[0].as_str().to_string();
+            for item in parts[1].as_array() {
+                let key = item.as_str().to_string();
+                assert!(key.starts_with("lasting:"), "MATCH let {key} through");
+                found.insert(key);
+            }
+            if cursor == "0" {
+                break;
+            }
+        }
+        let missing: Vec<String> = (0..LASTING)
+            .map(|i| format!("lasting:{i}"))
+            .filter(|k| !found.contains(k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "scan {scans} missed {} keys: {:?}",
+            missing.len(),
+            &missing[..missing.len().min(10)]
+        );
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let added = writer.join().expect("the writer");
+    assert!(added >= grown, "only {added} keys added");
+
+    c.cmds(&["FLUSHDB"]);
+    c.cmds(&["SELECT", "0"]);
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // SERVER COMMANDS
 // ═════════════════════════════════════════════════════════════════════════════

@@ -1055,6 +1055,18 @@ impl Slot {
     pub(super) fn prefetch_header(self) {
         prefetch((self.0 & ADDRESS) as *const u8, 1);
     }
+
+    /// Ask for the lines the entry's header and the start of its key are
+    /// in: the key starts at most 28 bytes in (a time to live and a long
+    /// key's length before it), so the line 32 bytes in is the next one
+    /// only when the key may start there. What a walk that matches keys
+    /// reads of each entry (`ShardMap::scan`).
+    #[inline(always)]
+    pub(super) fn prefetch_key(self) {
+        let at = (self.0 & ADDRESS) as *const u8;
+        prefetch(at, 1);
+        prefetch(at.wrapping_add(32), 1);
+    }
 }
 
 /// Ask for `lines` cache lines from `at`. A hint: nothing is read.

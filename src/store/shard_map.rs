@@ -304,6 +304,12 @@ fn used(entry: Entry, hash: u64, map: u64) {
 /// in the table, whatever the table does to make room or give it back.
 pub const SCAN_POSITIONS: u64 = 4096;
 
+/// How many entries a `SCAN` of a shard asks for before it visits them
+/// ([`ShardMap::scan`]): enough for the first to have arrived when the
+/// last is asked for, few enough that what is asked for is not pushed out
+/// again before it is read.
+const SCAN_BATCH: usize = 16;
+
 /// One shard's keys and values: a table of [`Slot`]s, each the address of
 /// an entry holding a key and its value (`entry`).
 pub struct ShardMap {
@@ -1386,50 +1392,109 @@ impl ShardMap {
     }
 
     /// One page of a `SCAN` of this shard: each entry at a position from
-    /// `from` on (see [`SCAN_POSITIONS`]), up to the position that brings
-    /// the page to `want` entries, given to `visit`. A position is never
-    /// split between two pages. Returns the position to go on from: zero
-    /// when no entry is at a position past the page.
+    /// `from` on (see [`SCAN_POSITIONS`]) up to the end of the page, given
+    /// to `visit`. The page spans as many positions as hold `want` entries
+    /// on average: a page holds about `want`, a few more or fewer. A
+    /// position is never split between two pages. Returns the position to
+    /// go on from: zero when no entry is at a position past the page.
     ///
     /// A key's position is the fragment of its hash its slot keeps, so the
-    /// pages are found from the slots alone: two passes over the table
-    /// that touch only the entries of the page. It used to hash every key
-    /// of the shard, visiting each entry, for every page (#751).
+    /// pages are found from the slots alone, touching only the entries of
+    /// the page. It used to hash every key of the shard, visiting each
+    /// entry, for every page (#751).
     ///
-    /// While the table grows, both tables are counted and walked: a key
-    /// still in the one it grows from is at its position as much as one
-    /// already moved, and a move between pages keeps the slot, fragment
-    /// and all, so a key moved mid-scan keeps its position too.
+    /// While the table grows, both tables are walked: a key still in the
+    /// one it grows from is at its position as much as one already moved,
+    /// and a move between pages keeps the slot, fragment and all, so a key
+    /// moved mid-scan keeps its position too.
+    ///
+    /// One pass over the slots (#884). Positions are fragments of the keys'
+    /// hashes, spread evenly whatever the keys are, so the span that holds
+    /// `want` entries is told by the shard's length alone. Pages of exactly
+    /// `want` (or more) took a count of each of the 4,096 positions first:
+    /// a second pass over the slots, and a count cleared and summed for
+    /// every page, which cost more than the walk itself for shards of a few
+    /// thousand keys. `COUNT` is a hint in Redis too.
     pub fn scan(&self, from: u64, want: usize, mut visit: impl FnMut(EntryView<'_>)) -> u64 {
         const POSITIONS: usize = SCAN_POSITIONS as usize;
         let Ok(from) = usize::try_from(from) else {
             return 0;
         };
-        if from >= POSITIONS || self.is_empty() {
+        let len = self.len();
+        if from >= POSITIONS || len == 0 {
             return 0;
         }
-        let mut at = [0u32; POSITIONS];
-        for slot in self.slots() {
-            at[slot.scan_position() & (POSITIONS - 1)] += 1;
+        let span = if want >= len {
+            POSITIONS
+        } else {
+            want.max(1).saturating_mul(POSITIONS).div_ceil(len)
+        };
+        let end = from.saturating_add(span).min(POSITIONS);
+        if self.visit_positions(from, end, &mut visit) {
+            end as u64
+        } else {
+            0
         }
-        let mut taken = 0usize;
-        let mut end = from;
-        while end < POSITIONS && taken < want.max(1) {
-            taken += at[end] as usize;
-            end += 1;
-        }
-        let next = (end..POSITIONS).find(|&p| at[p] != 0).unwrap_or(0);
-        if taken > 0 {
-            for slot in self.slots() {
-                if (from..end).contains(&slot.scan_position()) {
-                    visit(EntryView {
-                        entry: slot.entry(),
-                        _map: std::marker::PhantomData,
-                    });
+    }
+
+    /// Each entry at a position in `from..end`, given to `visit`; and
+    /// whether any entry is at a position from `end` on.
+    ///
+    /// Each entry is somewhere else in memory, and the slot alone says
+    /// whether it is in the page: visited one after the other as the walk
+    /// found them, the misses on the entries' first lines were most of a
+    /// page's time, with the shard locked for reading throughout (#884).
+    /// So the walk over the slots asks for the lines an entry's header and
+    /// key are in as it finds the entry, and puts it in a batch, and the
+    /// entries of a full batch are visited together, by then on their way.
+    /// The walk itself is a plain loop over each table, with nothing but
+    /// the slot's position to look at: `next` on the two tables chained
+    /// cost more a slot.
+    #[inline(always)]
+    fn visit_positions(
+        &self,
+        from: usize,
+        end: usize,
+        visit: &mut impl FnMut(EntryView<'_>),
+    ) -> bool {
+        let mut batch: [Option<Slot>; SCAN_BATCH] = [None; SCAN_BATCH];
+        let mut held = 0usize;
+        let mut later = false;
+        for table in [&self.table, &self.old] {
+            for &slot in table.iter() {
+                let position = slot.scan_position();
+                if position >= end {
+                    later = true;
+                    continue;
+                }
+                if position < from {
+                    continue;
+                }
+                slot.prefetch_key();
+                batch[held % SCAN_BATCH] = Some(slot);
+                held += 1;
+                if held == SCAN_BATCH {
+                    Self::visit_batch(&batch, visit);
+                    held = 0;
                 }
             }
         }
-        next as u64
+        Self::visit_batch(&batch[..held], visit);
+        later
+    }
+
+    /// The entries of a batch of [`visit_positions`], to `visit`: out of
+    /// line, so that `visit` is called from one place and inlined there.
+    ///
+    /// [`visit_positions`]: ShardMap::visit_positions
+    #[inline(never)]
+    fn visit_batch(batch: &[Option<Slot>], visit: &mut impl FnMut(EntryView<'_>)) {
+        for slot in batch.iter().flatten() {
+            visit(EntryView {
+                entry: slot.entry(),
+                _map: std::marker::PhantomData,
+            });
+        }
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
@@ -2063,7 +2128,9 @@ mod tests {
         loop {
             let mut n = 0;
             from = map.scan(from, 1000, |_| n += 1);
-            assert!((1000..1100).contains(&n) || from == 0, "a page of {n}");
+            // About as many as asked: the positions' span is told from the
+            // shard's length, and the keys spread evenly over them.
+            assert!((800..1200).contains(&n) || from == 0, "a page of {n}");
             pages += 1;
             if from == 0 {
                 break;
@@ -2923,6 +2990,47 @@ mod tests {
             assert_eq!(seen.get(format!("g{i}").as_bytes()), Some(&1), "g{i}");
         }
         assert!(seen.values().all(|&times| times == 1));
+    }
+
+    /// A page that may take the rest of the shard (`want` at least its
+    /// length) takes it (#884): every key at a position from `from` on,
+    /// exactly the ones smaller pages from there give, in both tables of a
+    /// growth, and the scan of the shard ends.
+    #[test]
+    fn a_page_as_large_as_the_shard_takes_the_rest_of_it() {
+        let (mut map, n) = growing();
+        map.insert(String::from("new:0"), s("v"));
+        assert!(map.is_growing());
+        let all = map.len();
+        for from in [0u64, 1, 700, 2048, SCAN_POSITIONS - 1] {
+            let mut whole = Vec::new();
+            assert_eq!(map.scan(from, all, |e| whole.push(e.key().to_vec())), 0);
+            let mut paged = Vec::new();
+            let mut at = from;
+            loop {
+                at = map.scan(at, 7, |e| paged.push(e.key().to_vec()));
+                if at == 0 {
+                    break;
+                }
+            }
+            whole.sort();
+            paged.sort();
+            assert_eq!(whole, paged, "from {from}");
+            if from == 0 {
+                assert_eq!(whole.len(), all);
+            }
+        }
+        // A first page of a few, then the rest at once: every key once.
+        let mut seen = std::collections::HashMap::new();
+        let mut note = |e: EntryView<'_>| *seen.entry(e.key().to_vec()).or_insert(0) += 1;
+        let next = map.scan(0, 10, &mut note);
+        assert_ne!(next, 0);
+        map.step_growth(GROWTH_STEP);
+        map.insert(String::from("new:1"), s("v"));
+        assert_eq!(map.scan(next, usize::MAX, &mut note), 0);
+        for i in 0..n {
+            assert_eq!(seen.get(format!("g{i}").as_bytes()), Some(&1), "g{i}");
+        }
     }
 
     /// A full table of keys `g0`, `g1`, ... with their numbers as values,
