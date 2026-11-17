@@ -233,7 +233,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (64), and their `hash-max-ziplist-*` names, now take effect, from the
     configuration file or `CONFIG SET`; `0` entries turns blocks off. They
     go no higher than 512 and 64, and `CONFIG GET` reports the value kept.
-    A lowered limit applies to a hash at its next write, as in Redis.
+    A lowered limit applies to a hash at its next write that sets a field
+    (`HSET` and the like); `HDEL` and field expiry never move a hash, as in
+    Redis.
   - Commands cost no more than on a table for a hash of 8 fields
     (`HGET`, `HEXISTS`, `HMGET` within 0.3 % of 1.2's instructions) and fewer
     for writes: `HSET` of a value again 3 % fewer, `HDEL` 9 %, `HINCRBY`

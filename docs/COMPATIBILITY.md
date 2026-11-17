@@ -152,6 +152,12 @@ other files:
 - A hash whose fields and values pass 65,535 bytes together is a
   `hashtable` even when it is within both limits (at most 511 fields of 64
   bytes with 64-byte values fit one block); Redis's listpack holds more.
+- The 64-byte and 65,535-byte limits count a field as it is stored, after
+  the bytes of a field that is not UTF-8 are escaped as text: a binary
+  field Redis keeps in a `listpack` can make a `hashtable` here.
+- A lowered limit applies to a hash at its next write that sets a field
+  (`HSET` and the like); `HDEL` and field expiry never move a hash, as in
+  Redis.
 - `HGETALL`, `HKEYS`, `HVALS`, `HSCAN` and `HRANDFIELD` give a hash's fields
   in the order they were first set, field TTLs or not. Redis keeps a
   `listpackex` in the order of its deadlines, the fields with one first,
