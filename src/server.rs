@@ -177,7 +177,7 @@ async fn park_blocking<S, R>(
 ) -> Result<(), Vec<u8>>
 where
     S: AsyncWrite + Unpin + Send,
-    R: tokio::io::AsyncRead + Unpin,
+    R: tokio::io::AsyncRead + Unpin + Send,
 {
     // No wait: a write that got past a `CLIENT PAUSE` before it was set
     // (`blocking::hold_for_pause`). Read again, and held by the pause check.
@@ -195,9 +195,16 @@ where
     // Flush replies to anything pipelined ahead of this command before we go to
     // sleep. Without this a client sending `SET a 1` and `BLPOP k 0` in one
     // packet would not see the `+OK` until the BLPOP finally returned.
-    if write_tcp_batch(writer, combined).await.is_err() {
-        // Socket is gone. Don't park on a dead connection — return nothing and
-        // let the batch write at the end of the loop tear it down.
+    let flushed = {
+        let flush = std::pin::pin!(write_tcp_batch(writer, combined));
+        read_while_writing(flush, waiter.reader, waiter.carried, waiter.activity).await
+    };
+    if flushed.is_err() {
+        // Socket is gone, or the client sent past `client-query-buffer-limit`
+        // while it was written. Don't park: the client has gone, and what was
+        // left to write to it goes with it.
+        combined.clear();
+        waiter.interrupted.gone = true;
         return Err(Vec::new());
     }
     if let Some(subs) = subscriptions {
@@ -391,6 +398,49 @@ fn until_gone<'a, R: tokio::io::AsyncRead + Unpin + Send>(
                     _ => return,
                 },
                 _ = &mut *kill_rx => return,
+            }
+        }
+    })
+}
+
+/// `write`, a batch of replies being written, with what the client sends
+/// meanwhile read into `carried`, to be run after it (#865). A client that
+/// sends a whole pipeline before it reads a reply (redis-py's pipeline does)
+/// is still sending when its first replies fill the socket: if the
+/// connection stopped reading until they were written, each side would wait
+/// for the other for good. Past `client-query-buffer-limit`, an error, which
+/// closes the client.
+///
+/// Boxed, so that it is polled out of line, as `until_gone` is: the
+/// connection's own write goes here only once it has not finished at once.
+fn read_while_writing<'a, R: tokio::io::AsyncRead + Unpin + Send>(
+    mut write: std::pin::Pin<
+        &'a mut (dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a),
+    >,
+    reader: &'a mut R,
+    carried: &'a mut Vec<u8>,
+    activity: &'a crate::client_registry::Activity,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut temp = [0u8; 4096];
+        let mut reading = true;
+        loop {
+            tokio::select! {
+                written = &mut write => return written,
+                read = reader.read(&mut temp), if reading => match read {
+                    Ok(n) if n > 0 => {
+                        crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                        crate::stats::record_read();
+                        carried.extend_from_slice(&temp[..n]);
+                        activity.touch();
+                        if carried_too_much(carried) {
+                            return Err(std::io::Error::other("client-query-buffer-limit"));
+                        }
+                    }
+                    // The client's end, or an error: the next read after the
+                    // write sees it again.
+                    _ => reading = false,
+                },
             }
         }
     })
@@ -2754,10 +2804,24 @@ where
             activity.set_reply_output(combined.len());
         }
         let written = match write_within {
-            None => write_tcp_batch(&writer, &mut combined).await,
+            // Polled once here, where nearly every write finishes: the
+            // client is read meanwhile only if it does not.
+            None => {
+                let mut write = std::pin::pin!(write_tcp_batch(&writer, &mut combined));
+                match std::future::poll_fn(|cx| std::task::Poll::Ready(write.as_mut().poll(cx)))
+                    .await
+                {
+                    std::task::Poll::Ready(written) => written,
+                    std::task::Poll::Pending => {
+                        read_while_writing(write, &mut reader, &mut carried, &activity).await
+                    }
+                }
+            }
             Some((time, class)) => {
                 let waiting = combined.len() as u64;
-                match tokio::time::timeout(time, write_tcp_batch(&writer, &mut combined)).await {
+                let write = std::pin::pin!(write_tcp_batch(&writer, &mut combined));
+                let write = read_while_writing(write, &mut reader, &mut carried, &activity);
+                match tokio::time::timeout(time, write).await {
                     Ok(written) => written,
                     Err(_) => {
                         crate::output_limits::note_disconnect(client_id, class, waiting);

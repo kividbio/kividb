@@ -4,8 +4,10 @@
 // the configuration file and `CONFIG REWRITE`, and each class's limits
 // enforced as Redis 8.10 enforces them: a subscriber dropped at the pub/sub
 // hard limit and kept with `pubsub 0 0 0`, the soft limit and its seconds,
-// and a normal client's replies held to the `normal` class. Each test runs a
-// real `kividb`, on both I/O models where the connection loops differ.
+// and a normal client's replies held to the `normal` class; and a pipeline
+// sent before any reply is read, which the server reads while its replies
+// wait (#865). Each test runs a real `kividb`, on both I/O models where the
+// connection loops differ.
 //
 // The messages here are large (up to 64 MB), so the tests take turns: one
 // runs at a time, and each lets its payloads go before the next.
@@ -152,7 +154,10 @@ impl Conn {
 
     /// Whether the server closed the connection, read to the end.
     fn closed_within(&mut self, time: Duration) -> bool {
-        self.writer.set_read_timeout(Some(time)).unwrap();
+        // macOS refuses to set a timeout on a socket the server has reset.
+        if self.writer.set_read_timeout(Some(time)).is_err() {
+            return true;
+        }
         let mut sink = vec![0u8; 1 << 20];
         loop {
             match self.reader.read(&mut sink) {
@@ -690,6 +695,108 @@ fn a_normal_client_over_the_soft_limit_too_long_is_disconnected() {
         );
         server.config_set("normal 0 0 0");
     }
+}
+
+// ── Pipelines sent before reading (#865) ──────────────────────────────────────
+
+/// `GET big` `gets` times, then `sets` `SET`s of small values: sent whole
+/// before any reply is read, as redis-py sends a pipeline.
+fn gets_then_sets(gets: usize, sets: usize) -> Vec<u8> {
+    let mut pipeline = b"*2\r\n$3\r\nGET\r\n$3\r\nbig\r\n".repeat(gets);
+    for i in 0..sets {
+        let key = format!("key:{i:08}");
+        pipeline.extend_from_slice(
+            format!("*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n$1\r\nv\r\n", key.len()).as_bytes(),
+        );
+    }
+    pipeline
+}
+
+/// A client that sends its whole pipeline before it reads a reply is
+/// answered in full: while the replies to the first commands wait to be
+/// written, the server reads the rest. It stopped reading until they were
+/// written, and the client, still sending, never read them.
+#[test]
+fn a_pipeline_sent_before_reading_is_answered() {
+    let _turn = serial();
+    // The io_uring loop does not read ahead yet.
+    let server = Server::start("tokio");
+    let value = "v".repeat(MB);
+    assert!(server.conn().cmd(&["SET", "big", &value]).ok());
+    let mut pipeline = b"*2\r\n$3\r\nGET\r\n$3\r\nbig\r\n".repeat(10);
+    let set = format!("*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n${MB}\r\n{value}\r\n");
+    pipeline.extend_from_slice(set.repeat(16).as_bytes());
+
+    let mut c = server.conn();
+    c.writer
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    c.writer
+        .write_all(&pipeline)
+        .expect("the server stopped reading");
+    for _ in 0..10 {
+        assert_eq!(c.read(), Some(V::Bulk(value.clone().into_bytes())));
+    }
+    for _ in 0..16 {
+        assert!(c.read().unwrap().ok());
+    }
+}
+
+/// What the server reads ahead counts against `client-query-buffer-limit`:
+/// past it, the client is closed, as Redis closes one whose query buffer
+/// reaches the limit.
+#[test]
+fn reading_ahead_past_the_query_buffer_limit_closes_the_client() {
+    let _turn = serial();
+    let server = Server::start("tokio");
+    assert!(server.conn().cmd(&["SET", "big", &"v".repeat(MB)]).ok());
+    let limit = server
+        .conn()
+        .cmd(&["CONFIG", "SET", "client-query-buffer-limit", "1mb"]);
+    assert!(limit.ok(), "{limit:?}");
+
+    // About 10 MB of replies the client does not read, while it sends about
+    // 6 MB of commands.
+    let mut c = server.conn();
+    c.writer
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let _ = c.writer.write_all(&gets_then_sets(10, 200_000));
+    assert!(
+        c.closed_within(Duration::from_secs(10)),
+        "the client was not closed"
+    );
+    assert_eq!(server.conn().cmd(&["PING"]), V::Str("PONG".into()));
+}
+
+/// The replies still count against `client-output-buffer-limit` while the
+/// server reads ahead: a client over the soft limit for longer than its
+/// seconds is closed, whatever it goes on sending.
+#[test]
+fn reading_ahead_a_client_over_the_soft_limit_too_long_is_disconnected() {
+    let _turn = serial();
+    let server = Server::start("tokio");
+    let big = "b".repeat(24 * MB);
+    assert!(server.conn().cmd(&["SET", "big", &big]).ok());
+    drop(big);
+    server.config_set("normal 0 1mb 1");
+
+    let mut c = server.conn();
+    c.writer
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let _ = c.writer.write_all(&gets_then_sets(1, 200_000));
+    // Not read for longer than the soft limit's second.
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(
+        c.closed_within(Duration::from_secs(10)),
+        "the client was not closed"
+    );
+    assert_eq!(
+        server.info_field("client_output_buffer_limit_disconnections"),
+        "1"
+    );
+    server.config_set("normal 0 0 0");
 }
 
 // ── Replicas ──────────────────────────────────────────────────────────────────
