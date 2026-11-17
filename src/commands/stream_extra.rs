@@ -246,7 +246,7 @@ pub(super) fn strict_integer(raw: &[u8]) -> Option<i64> {
 /// A pending entry whose `delivered_at` is below this was released by
 /// `XNACK`, not delivered at that time: no real time in milliseconds is
 /// this small.
-pub(super) const NACKED_BELOW: u64 = 1 << 40;
+pub(crate) const NACKED_BELOW: u64 = 1 << 40;
 
 /// The `delivered_at` an entry `XNACK` releases is given: the next of an
 /// increasing count, so that released entries are claimed in the order they

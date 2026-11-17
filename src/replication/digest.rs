@@ -87,8 +87,24 @@ fn stream_digest(h: &mut Xxh3, stream: &crate::types::StreamInner) {
         g.update(&(group.pel.len() as u64).to_le_bytes());
         for (id, pending) in group.pel.iter() {
             id_digest(&mut g, id);
-            bytes_digest(&mut g, pending.consumer().as_bytes());
-            g.update(&pending.delivered_at.to_le_bytes());
+            bytes_digest(&mut g, pending.shown_consumer());
+            // An entry `XNACK` released is no one's; one a consumer named
+            // "" holds is that consumer's (#833). The mark is added for the
+            // second only, so every other digest is what it was.
+            if pending.consumer().is_some_and(|c| c.as_bytes().is_empty()) {
+                g.update(&[1]);
+            }
+            // The delivery time as it is shown: 0 for an entry `XNACK`
+            // released. Its own mark (see `stream_extra::nack_time`) is
+            // from a counter of this process, so a replica or an AOF replay
+            // that applies the `XNACK` gives the entry another, and the
+            // digests of the same dataset differed (#856).
+            let delivered_at = if pending.is_released() {
+                0
+            } else {
+                pending.delivered_at
+            };
+            g.update(&delivered_at.to_le_bytes());
             g.update(&pending.delivery_count.to_le_bytes());
         }
         let consumers = group
@@ -450,6 +466,77 @@ mod tests {
         // A pending entry's delivery time is part of it, as is each group.
         assert_ne!(a, hex("c", make(&forward, 1_000, 501)));
         assert_ne!(a, hex("d", make(&forward[..19], 1_000, 500)));
+    }
+
+    /// An entry `XNACK` released is shown with a delivery time of 0, and is
+    /// the same entry whatever internal mark its node gave it (#856): a
+    /// replica applying the `XNACK`, or an AOF replay, marks it from its own
+    /// counter. Whose it is, and when a consumer's was delivered, still count.
+    #[test]
+    fn a_released_entrys_digest_does_not_hold_its_nodes_mark() {
+        use crate::types::{ConsumerGroup, StreamId, StreamInner};
+        use std::sync::Arc;
+        let store = crate::store::new_store(1);
+        let make = |release: &dyn Fn(&mut ConsumerGroup)| {
+            let mut s = StreamInner::new();
+            for ms in 1..=3u64 {
+                s.entries
+                    .push_tail(StreamId::new(ms, 0), &[(&b"f"[..], &b"v"[..])]);
+            }
+            s.last_id = StreamId::new(3, 0);
+            s.entries_added = 3;
+            let mut g = ConsumerGroup {
+                name: "g".into(),
+                last_id: StreamId::new(3, 0),
+                entries_read: 3,
+                pel: Default::default(),
+                consumers: Default::default(),
+                active: Default::default(),
+            };
+            g.pel
+                .insert(StreamId::new(3, 0), b"c", 1_700_000_000_000, 1);
+            release(&mut g);
+            s.groups.insert("g".into(), g);
+            KiviDBValue::Stream(Arc::new(parking_lot::RwLock::new(s)))
+        };
+        let hex = |k: &str, v: KiviDBValue| {
+            let shard = crate::store::get_shard(&store[0], k);
+            crate::write_lock!(shard).insert(k, v);
+            let map = crate::read_lock!(shard);
+            value_hex(map.get(k).unwrap())
+        };
+        let released = |mark: u64| {
+            move |g: &mut ConsumerGroup| {
+                g.pel.insert_released(StreamId::new(1, 0), mark, 1);
+                g.pel.insert_released(StreamId::new(2, 0), mark + 1, 2);
+            }
+        };
+        // The same dataset, released with marks of two counters.
+        let a = hex("a", make(&released(1)));
+        assert_eq!(a, hex("b", make(&released(7_000))));
+        // What a Redis RDB gives (0) is the same too.
+        assert_eq!(a, hex("c", make(&released(0))));
+        // One consumer's own is not: its owner, its time, its count count.
+        assert_ne!(
+            a,
+            hex(
+                "d",
+                make(&|g: &mut ConsumerGroup| {
+                    g.pel.insert(StreamId::new(1, 0), b"c", 0, 1);
+                    g.pel.insert_released(StreamId::new(2, 0), 1, 2);
+                })
+            )
+        );
+        assert_ne!(
+            a,
+            hex(
+                "e",
+                make(&|g: &mut ConsumerGroup| {
+                    g.pel.insert_released(StreamId::new(1, 0), 1, 2);
+                    g.pel.insert_released(StreamId::new(2, 0), 2, 2);
+                })
+            )
+        );
     }
 
     /// A HyperLogLog's cached count is each node's own: two that differ only

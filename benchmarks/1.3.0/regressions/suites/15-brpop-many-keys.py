@@ -21,7 +21,7 @@ Metrics:
 
   jobs_per_s       jobs the workers received during the MEASURE window / MEASURE
   ping_p99_ms      the probe's p99 PING during the window (shown, not gated)
-  ping_max_ms      its worst PING: max(1.5x recorded, Redis + 10 ms), the
+  ping_max_ms      its worst PING: max(1.5x recorded, Redis + 10 ms) (c1000: 2x), the
                    suites' WORST_PING (`jitter()`: scheduling, not CPU speed,
                    so never host-scaled); v1.2.2's was 1-7 s
   lost             jobs pushed - jobs received - jobs still in the queues, once
@@ -51,7 +51,7 @@ import time
 import multiprocessing as mp
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from suite import (Suite, Config, KEEP_IMPROVEMENT, THROUGHPUT, WORST_PING, bound, info, jitter, vs_redis, scaled)  # noqa: E402
+from suite import (Suite, Config, KEEP_IMPROVEMENT, THROUGHPUT, WORST_PING, bound, info, jitter, rel, vs_redis, scaled)  # noqa: E402
 from probe import Probe  # noqa: E402
 
 WARMUP = 8.0
@@ -211,7 +211,11 @@ def run(ctx):
     gate = jitter(gate)
     ctx.emit("jobs_per_s", in_window / (t1 - t0), "jobs/s", "higher", gate=gate)
     ctx.emit("ping_p99_ms", p99, "ms", "lower", gate=jitter(info()))
-    ctx.emit("ping_max_ms", pr.worst(t0, t1), "ms", "lower", gate=jitter(WORST_PING))
+    # c1000's worst PING of a healthy build spread 32-44 ms over five runs
+    # (Redis's 40-49 ms), so 1.5x one recorded run failed healthy runs: it is
+    # judged at 2x the median of five, or Redis + 10 ms. v1.2.2's is 1.1-1.5 s.
+    worst = jitter(rel(100, redis_plus=10)) if ctx.config.name == "c1000" else jitter(WORST_PING)
+    ctx.emit("ping_max_ms", pr.worst(t0, t1), "ms", "lower", gate=worst)
     ctx.emit("lost", lost, "jobs", "lower", gate=bound(eq=0))
     ctx.emit("blocked_after", blocked, "clients", "lower", gate=bound(eq=0))
 
