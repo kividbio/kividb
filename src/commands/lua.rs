@@ -6280,8 +6280,7 @@ mod reply_writer_tests {
             .unwrap_or_else(|e| panic!("{src}: {e}"));
         let mut fast = false;
         for protocol in PROTOCOLS {
-            let old =
-                lua_to_resp_inner(lua, value.clone(), 0, protocol).map_err(|e| e.to_string());
+            let old = lua_to_resp_inner(lua, value.clone(), 0, protocol).map_err(|e| e.to_string());
             let new = reply_to_resp(lua, value.clone(), protocol).map_err(|e| e.to_string());
             assert_eq!(
                 new, old,

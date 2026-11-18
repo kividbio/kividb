@@ -1435,7 +1435,13 @@ mod tests {
             let mixed: String = name
                 .chars()
                 .enumerate()
-                .map(|(i, c)| if i % 2 == 0 { c.to_ascii_lowercase() } else { c })
+                .map(|(i, c)| {
+                    if i % 2 == 0 {
+                        c.to_ascii_lowercase()
+                    } else {
+                        c
+                    }
+                })
                 .collect();
             vec![name.to_string(), name.to_ascii_lowercase(), mixed]
         };
@@ -1451,7 +1457,13 @@ mod tests {
             vec!["EX", "x"],
             vec!["EX", "10", "PX", "20"],
         ];
-        let conditions = [vec![], vec!["NX"], vec!["XX"], vec!["IFEQ", "v"], vec!["IFNE", "EX"]];
+        let conditions = [
+            vec![],
+            vec!["NX"],
+            vec!["XX"],
+            vec!["IFEQ", "v"],
+            vec!["IFNE", "EX"],
+        ];
         for name in names("SET") {
             for time in &times {
                 for condition in &conditions {
@@ -1474,7 +1486,13 @@ mod tests {
                 commands.push(vec![name.clone(), "k".into(), ttl.into(), "v".into()]);
             }
             commands.push(vec![name.clone(), "k".into(), "10".into()]);
-            commands.push(vec![name.clone(), "k".into(), "10".into(), "v".into(), "extra".into()]);
+            commands.push(vec![
+                name.clone(),
+                "k".into(),
+                "10".into(),
+                "v".into(),
+                "extra".into(),
+            ]);
             commands.push(vec![name.clone()]);
         }
         for family in ["EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT"] {
@@ -1489,14 +1507,16 @@ mod tests {
                 commands.push(vec![name.clone()]);
             }
         }
-        let replies: [&[u8]; 6] = [b":0
-", b":1
-", b"+OK
-", b"$-1
-", b"$1
-v
-", b"-ERR x
-"];
+        let replies: [&[u8]; 6] = [
+            b":0
+", b":1
+", b"+OK
+", b"$-1
+", b"$1
+v
+", b"-ERR x
+",
+        ];
         with_ctx(|ctx| {
             for c in &commands {
                 let parts: Vec<&[u8]> = c.iter().map(|s| s.as_bytes()).collect();
