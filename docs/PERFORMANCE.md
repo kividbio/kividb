@@ -228,6 +228,93 @@ the first and last datasets again (snapshot size, save and load time against
 1.2.2 and Redis, with the default and with `yes`) and fails a build that
 loses it.
 
+## Script call cost
+
+What one short script call costs the server ([#901](https://github.com/kividbio/kividb/issues/901)),
+measured in November 2026 on one Azure `Standard_D8s_v5`: the server on 2 CPUs
+(`taskset`), the `lua,tls` build of each tree made by rustc 1.100.0 with the release
+profile (fat LTO, one codegen unit), Redis 8.10.2 with its defaults, and a Go client (64
+connections, one command at a time, go-redis) on the other 6 CPUs, 10 s after 3 s of
+warm-up. CPU per call is the server's user + system time over the calls it counted. The
+scripts:
+
+- **Tyk**: Tyk 5.16's sliding-log rate limiter: `ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`,
+  `EXPIRE` on one of 5,000 keys of about 144 members, a 3-element reply.
+- **lock**: `SET lock token PX 30000`, then the compare-and-delete release of
+  [#880](https://github.com/kividbio/kividb/issues/880); both commands are in the row.
+- **return 1**: `return 1`, no keys.
+- **centrifuge history / add**: centrifuge v0.40.1's `broker_history_list.lua` (2 keys) and
+  `broker_history_add_list.lua` (3 keys, a `PUBLISH`), on one channel, as suite 25 runs them.
+- **BullMQ add / move**: bullmq 5.81.5 from Node 22: `queue.add` of 1.8 KB jobs, 50 at a time
+  (`addStandardJob`), then a worker of concurrency 50 (`moveToFinished`, fetching the next
+  job), 100,000 jobs. The Node client, not the server, is the limit here, so CPU per job is
+  shown.
+
+One worker (`--threads 1`, Redis being single-threaded anyway), CPU per call:
+
+| script | 1.2.2 | master before | 1.3.0 | Redis 8.10.2 |
+|---|---:|---:|---:|---:|
+| Tyk | 15.6 µs | 16.1 µs | **12.8 µs** | 13.8 µs |
+| lock (`SET` + script) | 15.3 µs | 16.2 µs | 15.1 µs | 13.7 µs |
+| return 1 | 7.5 µs | 7.9 µs | 7.1 µs | 6.2 µs |
+| centrifuge history | 14.2 µs | 14.3 µs | **10.0 µs** | 11.1 µs |
+| centrifuge add | 14.9 µs | 15.5 µs | **12.4 µs** | 13.0 µs |
+
+Two workers (`--threads 2`), calls a second (both CPUs are busy, so CPU per call would be
+two CPUs over the rate, and is not shown; untagged scripts run one at a time,
+[#880](https://github.com/kividbio/kividb/issues/880)):
+
+| script | 1.2.2 | master before | 1.3.0 | Redis 8.10.2 |
+|---|---:|---:|---:|---:|
+| Tyk | 62.3k | 60.7k | **91.8k** | 72.6k |
+| Tyk, key under a hash tag | 83.3k | 78.0k | **99.3k** | 69.5k |
+| lock | 59.4k | 71.4k | **85.8k** | 72.8k |
+| return 1 | 155.8k | 159.7k | **187.3k** | 161.3k |
+| centrifuge history | 72.7k | 74.3k | **111.2k** | 89.5k |
+| centrifuge add | 59.8k | 58.6k | **90.1k** | 77.1k |
+| BullMQ add, CPU per job | 25.9 µs | 24.8 µs | **22.8 µs** | 24.0 µs |
+| BullMQ move, CPU per job | 50.6 µs | 47.9 µs | **38.2 µs** | 42.0 µs |
+
+Instructions per call, the whole server under callgrind (`--threads 1`, 20,000 calls
+pipelined, `CMP=plain`; Redis measured as the difference of two whole runs):
+
+| script | 1.2.2 | master before | 1.3.0 | Redis 8.10.2 |
+|---|---:|---:|---:|---:|
+| Tyk | 63,200 | 64,044 | **45,002** | 55,560 |
+| Tyk, hash tag | 66,735 | 67,184 | **48,143** | 56,342 |
+| lock (`SET` + script) | 31,928 | 31,864 | **25,320** | 35,723 |
+| return 1 | 13,446 | 13,586 | **9,571** | 11,579 |
+| return 1, hash tag | 15,729 | 15,660 | **11,621** | 13,840 |
+| centrifuge history | 60,555 | 59,935 | **35,206** | 59,949 |
+| centrifuge add | 75,064 | 75,268 | **54,032** | 77,539 |
+
+What changed: a script's reply is written as RESP from Lua's stack into one buffer (it was
+built value by value through mlua, with seven field lookups for every table), and a short
+array is told from `{ok=...}`, `{err=...}` and the RESP3 shapes by walking it; a global
+such as `redis` is found by a table lookup rather than a Lua call; `EVAL`, `EVALSHA` and
+`FCALL` go straight to the script handler instead of past every command module; each
+command a script calls is classified as a write once instead of five times, and its
+replication feed is built only when an AOF, a replica, the backlog or a tap reads it;
+`KEYS` and `ARGV` of up to 4 KB are left for the next script to replace instead of being
+swapped out after every call; one argument list for each `EVAL` and each `redis.call`; the
+digest lookups use ahash; and a script handed to the script-runner thread takes its
+connection's environment by reference count instead of copying it. Replies, errors,
+replication and the AOF are as before.
+
+Left: `return 1` and the lock row still cost 13-15 % more than Redis on one worker, in the
+path around the call (the connection loop and the script command's way to the VM) rather
+than in the script: the call's own time (`usec_per_call`) is 0.42 µs against Redis's 0.67 for
+`return 1`, and 6.1 against 7.4 µs for Tyk's. The count hook
+behind `SCRIPT KILL` and `lua-time-limit` makes Lua 5.4 trace every instruction, 3-4 % of a
+call. And an untagged script that meets another one running is handed to the script-runner
+thread and back: with two workers busy, Tyk's script cost 9.2 µs of CPU on the runner and
+11.8 µs on the workers a call, against 12.8 µs on one worker that runs it itself; that is
+how scripts are scheduled, [#880](https://github.com/kividbio/kividb/issues/880).
+
+Suite `30-script-call-cost` of
+[the regression suite](../benchmarks/1.3.0/regressions/README.md) measures the Tyk, lock
+and `return 1` rows again (with and without a hash tag) against 1.2.2 and Redis.
+
 ## Worker threads
 
 How many workers to start on a CPU allowance ([#873](https://github.com/kividbio/kividb/issues/873)),
