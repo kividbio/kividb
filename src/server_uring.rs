@@ -97,6 +97,7 @@ pub async fn handle_replica_connection_uring(
                 let repl_state = Arc::clone(&repl_state);
                 let hub_tx = hub_tx.clone();
                 move || {
+                    crate::cpus::release_this_thread();
                     crate::replication::begin_full_sync(
                         &store,
                         &index_store,

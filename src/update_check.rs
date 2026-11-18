@@ -79,6 +79,7 @@ pub fn start(config: &crate::config::Config) -> Option<Pending> {
     std::thread::Builder::new()
         .name("update-check".into())
         .spawn(move || {
+            crate::cpus::release_this_thread();
             let _ = tx.send(check(&url));
         })
         .ok()?;

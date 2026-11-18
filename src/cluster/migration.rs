@@ -1473,6 +1473,7 @@ fn start_dropping(
     let spawned = std::thread::Builder::new()
         .name("kividb-lost-slots".into())
         .spawn(move || {
+            crate::cpus::release_this_thread();
             let deleted = delete_keys(
                 &store,
                 &repl_state,
@@ -1822,7 +1823,10 @@ pub fn start_source(env: Env, task_id: &str, dest: NodeId, ranges: Ranges) -> Re
     let thread_env = env.clone();
     let spawned = std::thread::Builder::new()
         .name("kividb-slot-migrate".into())
-        .spawn(move || run_source(thread_env, id));
+        .spawn(move || {
+            crate::cpus::release_this_thread();
+            run_source(thread_env, id)
+        });
     if let Err(e) = spawned {
         env.registry()
             .finish(task_id, TaskState::Failed, Some(e.to_string()));
@@ -2384,7 +2388,10 @@ pub fn start_import(env: Env, ranges: Ranges) -> Result<String, String> {
     let thread_env = env.clone();
     let spawned = std::thread::Builder::new()
         .name("kividb-slot-import".into())
-        .spawn(move || run_import(thread_env, task_id));
+        .spawn(move || {
+            crate::cpus::release_this_thread();
+            run_import(thread_env, task_id)
+        });
     if let Err(e) = spawned {
         env.registry()
             .finish(&id, TaskState::Failed, Some(e.to_string()));

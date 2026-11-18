@@ -101,7 +101,10 @@ pub fn start() {
         STARTED.call_once(|| {
             let started = std::thread::Builder::new()
                 .name("kividb-give-back".into())
-                .spawn(run);
+                .spawn(|| {
+                    crate::cpus::release_this_thread();
+                    run()
+                });
             if let Err(e) = started {
                 crate::log_warn!("could not start the thread that gives memory back: {e}");
             }

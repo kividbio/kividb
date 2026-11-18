@@ -714,6 +714,7 @@ impl ClusterState {
         let spawned = std::thread::Builder::new()
             .name("kividb-nodes-conf".into())
             .spawn(move || {
+                crate::cpus::release_this_thread();
                 while rx.recv().is_ok() {
                     let Some(state) = state.upgrade() else {
                         return;

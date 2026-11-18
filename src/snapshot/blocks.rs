@@ -260,6 +260,7 @@ fn pool() -> Option<&'static Pool> {
             let spawned = std::thread::Builder::new()
                 .name("kdb-compress".into())
                 .spawn(move || {
+                    crate::cpus::release_this_thread();
                     let mut cctx = compressor();
                     loop {
                         let job = match rx.lock() {

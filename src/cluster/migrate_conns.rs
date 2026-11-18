@@ -203,6 +203,7 @@ fn sweep_in_the_background() {
     let started = std::thread::Builder::new()
         .name("migrate-conns".into())
         .spawn(|| {
+            crate::cpus::release_this_thread();
             let mut empty_since: Option<Instant> = None;
             loop {
                 std::thread::sleep(Duration::from_secs(1));

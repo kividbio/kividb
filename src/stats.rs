@@ -445,6 +445,7 @@ pub fn reset_rdb_changes() {
 /// peak every 100 ms — safe from any startup path.
 pub fn spawn_instantaneous_ops_sampler() {
     std::thread::spawn(|| {
+        crate::cpus::release_this_thread();
         let (mut last_in, mut last_out) = (0u64, 0u64);
         let mut tick = 0u64;
         loop {

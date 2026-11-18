@@ -107,6 +107,12 @@ pub struct Config {
     #[arg(long, default_value_t = 0)]
     pub threads: usize,
 
+    /// Bind each io_uring worker to a CPU of its own: off, or auto (worker
+    /// N on the N-th CPU the process may use, when the workers are as many
+    /// as those CPUs). See docs/CONFIGURATION.md.
+    #[arg(long, default_value = "off", value_enum)]
+    pub worker_cpu_affinity: crate::cpus::WorkerCpuAffinity,
+
     /// Enable append-only file persistence
     #[arg(long, default_value_t = false)]
     pub aof: bool,
@@ -648,6 +654,7 @@ impl Default for Config {
             port: 6380,
             bind: "0.0.0.0".into(),
             threads: 0,
+            worker_cpu_affinity: crate::cpus::WorkerCpuAffinity::Off,
             aof: false,
             aof_preamble: true,
             lua_parallel_scripts: true,
@@ -791,6 +798,7 @@ impl Config {
             port: 0,
             bind: String::new(),
             threads: 1,
+            worker_cpu_affinity: crate::cpus::WorkerCpuAffinity::Off,
             aof: false,
             aof_preamble: true,
             lua_parallel_scripts: true,
@@ -1609,6 +1617,15 @@ impl Config {
                 }
             }
             "threads" => set!(threads, number(key, one()?)?),
+            "worker-cpu-affinity" => {
+                let value = one()?;
+                let Some(mode) = crate::cpus::WorkerCpuAffinity::parse(value) else {
+                    return Err(format!(
+                        "invalid value '{value}' for 'worker-cpu-affinity': expected off or auto"
+                    ));
+                };
+                set!(worker_cpu_affinity, mode)
+            }
             "dir" => set!(dir, one()?.to_string()),
             "aof" | "appendonly" => set!(aof, yes_no(key, one()?)?),
             "aof-preamble" | "aof-use-rdb-preamble" => set!(aof_preamble, yes_no(key, one()?)?),

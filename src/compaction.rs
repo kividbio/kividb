@@ -236,6 +236,7 @@ pub fn spawn(store: Store) {
     std::thread::Builder::new()
         .name("kividb-defrag".into())
         .spawn(move || {
+            crate::cpus::release_this_thread();
             let mut streak = Streak::new();
             let mut wait = TICK;
             loop {

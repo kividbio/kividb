@@ -365,7 +365,10 @@ fn start(ctx: &Ctx) -> Vec<u8> {
     let tap = NEXT_TAP.fetch_add(1, Ordering::Relaxed);
     let spawned = std::thread::Builder::new()
         .name("kividb-backup".into())
-        .spawn(move || run_backup(handles, seq, dir, tap));
+        .spawn(move || {
+            crate::cpus::release_this_thread();
+            run_backup(handles, seq, dir, tap)
+        });
     if let Err(e) = spawned {
         fail(seq, format!("could not start the backup thread: {e}"));
         return resp_error(&format!("ERR could not start the backup: {e}"));
@@ -432,6 +435,7 @@ fn remove_after(seq: u64, wait: std::time::Duration) {
     let _ = std::thread::Builder::new()
         .name("kividb-backup-ttl".into())
         .spawn(move || {
+            crate::cpus::release_this_thread();
             std::thread::sleep(wait);
             let mut backup = BACKUP.lock();
             if backup.seq == seq && backup.phase == Phase::Sealed {

@@ -1169,6 +1169,7 @@ fn keep_the_runtime_listening() {
     {
         let remote = handle.clone();
         handle.spawn_blocking(move || {
+            crate::cpus::release_this_thread();
             remote.spawn(async {});
         });
     }

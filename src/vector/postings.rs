@@ -1596,6 +1596,7 @@ fn tidy(shared: &SharedPostings) {
     let started = std::thread::Builder::new()
         .name("kividb-postings".into())
         .spawn(move || {
+            crate::cpus::release_this_thread();
             let mut spare: Option<Vec<u32>> = None;
             loop {
                 let wanted = worker.lock.read().spare_wanted();

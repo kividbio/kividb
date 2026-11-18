@@ -723,6 +723,7 @@ pub fn spawn_active_expire_task(
         // hash fields' times.
         let latency = (part == 0).then(|| latency.clone());
         std::thread::spawn(move || {
+            crate::cpus::release_this_thread();
             let mut cursor = ExpireCursor::part(part, parts);
             let target = crate::expiry::of(&store);
             // Every 100 ms, as Redis's `hz 10`; straight after a cycle that

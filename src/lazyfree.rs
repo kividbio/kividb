@@ -36,6 +36,7 @@ fn worker() -> &'static Sender<Job> {
         let started = std::thread::Builder::new()
             .name("kividb-lazyfree".into())
             .spawn(move || {
+                crate::cpus::release_this_thread();
                 for (what, objects) in rx {
                     // For a test: frees that fall behind. Each one waits
                     // for its `failpoint.lazyfree-held.<n>` file to be

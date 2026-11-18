@@ -693,7 +693,10 @@ pub(crate) fn start(cluster: &Arc<ClusterState>, repl_state: &crate::replication
     let weak = Arc::downgrade(cluster);
     let spawned = std::thread::Builder::new()
         .name("kividb-import-cleanup".into())
-        .spawn(move || run(&weak));
+        .spawn(move || {
+            crate::cpus::release_this_thread();
+            run(&weak)
+        });
     if let Err(e) = spawned {
         log_error!(
             "Cluster: could not start the thread that deletes what an unfinished import into \

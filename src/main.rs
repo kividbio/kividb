@@ -728,6 +728,9 @@ fn start_configured_replication(
 
 fn run_tokio(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std::error::Error>> {
     let threads = config.resolve_threads();
+    if let Some(line) = crate::cpus::not_pinned_here(config.worker_cpu_affinity, true) {
+        log_info!("Worker CPUs    : {line}");
+    }
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
         .thread_keep_alive(commands::helpers::RUNTIME_THREAD_KEEP_ALIVE)
@@ -1245,8 +1248,26 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         })
         .unzip();
     let inboxes = Arc::new(inboxes);
+    // `worker-cpu-affinity auto`: each worker on a CPU of its own, when they
+    // are as many as the CPUs this process may use (src/cpus.rs).
+    let pinned = {
+        let pinning = crate::cpus::pinning(
+            config.worker_cpu_affinity,
+            threads,
+            crate::cpus::allowed_cpu_ids().as_deref(),
+            crate::cpus::detect().quota,
+        );
+        if config.worker_cpu_affinity != crate::cpus::WorkerCpuAffinity::Off {
+            log_info!("Worker CPUs    : {}", pinning.describe());
+        }
+        match pinning {
+            crate::cpus::Pinning::Pin(cpus) => Some(Arc::new(cpus)),
+            crate::cpus::Pinning::Not(_) => None,
+        }
+    };
     let handles: Vec<_> = (0..threads)
         .map(|worker| {
+            let pinned = pinned.clone();
             let loads = Arc::clone(&loads);
             let inboxes = Arc::clone(&inboxes);
             let mut inbox = inbox_ends[worker].take().expect("one inbox a worker");
@@ -1274,6 +1295,14 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             let monitor_registry = Arc::clone(&monitor_registry);
             let tracking_table = Arc::clone(&tracking_table);
             std::thread::spawn(move || {
+                if let Some(cpus) = &pinned
+                    && let Err(e) = crate::cpus::pin_this_thread(cpus[worker], cpus)
+                {
+                    log_warn!(
+                        "Worker CPUs    : worker {worker} could not be bound to CPU {}: {e}",
+                        cpus[worker]
+                    );
+                }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     tokio_uring::start(async move {
                         // Port 0: none, until `CONFIG SET port` opens one.

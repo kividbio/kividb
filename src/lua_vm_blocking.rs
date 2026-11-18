@@ -368,6 +368,7 @@ fn runner() -> &'static Runner {
         let handle = std::thread::Builder::new()
             .name("script-runner".into())
             .spawn(move || {
+                crate::cpus::release_this_thread();
                 let runner = ready_rx.recv().expect("the script runner is given itself");
                 runner.run();
             })
@@ -508,6 +509,7 @@ pub(crate) async fn run_lua_vm_blocking(
         crate::stats::scripts::offloaded_to_pool();
     }
     let (resp, sel_out, elapsed_us, ran_us) = tokio::task::spawn_blocking(move || {
+        crate::cpus::release_this_thread();
         let t0 = std::time::Instant::now();
         let (r, db) = env.run_execute(owned, sel, aof_enabled, client_resp);
         let elapsed_us = t0.elapsed().as_micros() as u64;

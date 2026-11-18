@@ -12,6 +12,208 @@
 //! needs a CPU of its own: the AOF writer, the replication hub, expiry and a
 //! background save run beside the workers, and a worker fewer than the CPUs
 //! was not consistently better with any of them running.
+//!
+//! `worker-cpu-affinity auto` (off by default) also binds each io_uring
+//! worker to a CPU of its own, when the workers are exactly as many as the
+//! CPUs the process may use ([`pinning`]). An io_uring worker serves its
+//! connections alone: when the scheduler puts two workers on one CPU, which
+//! it does at times once a third busy thread (the replication hub feeding a
+//! kept backlog) shares their CPUs, every connection of one waits out the
+//! other's time slice: a rate limiter's p99 went to 4-5 ms on two CPUs
+//! that it otherwise kept at 0.2 ms (#894).
+
+/// `worker-cpu-affinity`: whether each io_uring worker is bound to a CPU of
+/// its own. See [`pinning`].
+#[derive(clap::ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorkerCpuAffinity {
+    /// The workers run wherever the scheduler puts them.
+    #[default]
+    Off,
+    /// Worker N on the N-th CPU the process may use, when they are as many.
+    Auto,
+}
+
+impl WorkerCpuAffinity {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "off" | "no" => Some(Self::Off),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+}
+
+/// What [`pinning`] decided.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pinning {
+    /// Worker N on CPU `cpus[N]`.
+    Pin(Vec<usize>),
+    /// Not pinned, and why (for the startup line).
+    Not(String),
+}
+
+impl Pinning {
+    /// The startup line's value: `worker 0 on CPU 0, worker 1 on CPU 2 (...)`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn describe(&self) -> String {
+        match self {
+            Pinning::Pin(cpus) => format!(
+                "each worker on a CPU of its own: {} (worker-cpu-affinity auto)",
+                cpus.iter()
+                    .enumerate()
+                    .map(|(worker, cpu)| format!("worker {worker} on CPU {cpu}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Pinning::Not(why) => format!("not pinned: {why}"),
+        }
+    }
+}
+
+/// Whether to bind the `workers` io_uring workers to CPUs, given the CPUs
+/// the process may use (`allowed`, its affinity mask, which on Linux is
+/// already cut down to its cgroup's cpuset) and the cgroup CPU quota.
+///
+/// Only when the workers are exactly as many as the allowed CPUs: each then
+/// has one, and no CPU is left over that a pinned worker could not use. Not
+/// when a CPU quota is what limits the process (Docker's `--cpus`, a
+/// Kubernetes CPU limit): the quota is time on any CPU, not CPUs of its own,
+/// and a bound worker could not move off a CPU another container is busy on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn pinning(
+    mode: WorkerCpuAffinity,
+    workers: usize,
+    allowed: Option<&[usize]>,
+    quota: Option<f64>,
+) -> Pinning {
+    if mode == WorkerCpuAffinity::Off {
+        return Pinning::Not("worker-cpu-affinity off".to_string());
+    }
+    let Some(allowed) = allowed.filter(|cpus| !cpus.is_empty()) else {
+        return Pinning::Not("the CPUs this process may use could not be read".to_string());
+    };
+    if let Some(quota) = quota.filter(|q| q.is_finite() && *q > 0.0)
+        && quota < allowed.len() as f64
+    {
+        return Pinning::Not(format!(
+            "a cgroup CPU quota of {} CPUs limits this process, not CPUs of its own",
+            trim(quota)
+        ));
+    }
+    if workers != allowed.len() {
+        return Pinning::Not(format!(
+            "{workers} workers on {} CPUs: pinned only when they are as many",
+            allowed.len()
+        ));
+    }
+    Pinning::Pin(allowed.to_vec())
+}
+
+/// What `worker-cpu-affinity auto` does on an I/O model or system that
+/// cannot pin: the startup line.
+pub fn not_pinned_here(mode: WorkerCpuAffinity, tokio: bool) -> Option<String> {
+    if mode == WorkerCpuAffinity::Off {
+        return None;
+    }
+    Some(if cfg!(not(target_os = "linux")) {
+        // macOS has no call that binds a thread to a CPU (only affinity
+        // tags, a hint); FreeBSD's cpuset_setaffinity is not used.
+        format!(
+            "not pinned: worker-cpu-affinity works on Linux only, not on {}",
+            std::env::consts::OS
+        )
+    } else if tokio {
+        "not pinned: the tokio I/O model's workers take each other's connections, \
+         so none waits on one held up; worker-cpu-affinity is for io_uring"
+            .to_string()
+    } else {
+        return None;
+    })
+}
+
+/// The ids of the CPUs this process may run on, lowest first.
+#[cfg(target_os = "linux")]
+pub fn allowed_cpu_ids() -> Option<Vec<usize>> {
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `set` is a valid cpu_set_t of the size passed.
+    let ok =
+        unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+    if ok != 0 {
+        return None;
+    }
+    let ids: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
+        // SAFETY: `cpu` is below CPU_SETSIZE.
+        .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+        .collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// The CPUs the process could use before any worker was pinned, once one
+/// has been: what a thread a pinned worker starts goes back to.
+#[cfg(target_os = "linux")]
+static ALLOWED: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+
+/// Set once a worker has been pinned: [`release_this_thread`] has work.
+static PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// This thread has run on the process's CPUs since it started, or has
+    /// been given them back: nothing for [`release_this_thread`] to do.
+    static FREE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(target_os = "linux")]
+fn set_affinity(cpus: &[usize]) -> std::io::Result<()> {
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for &cpu in cpus {
+        // SAFETY: every id came from `allowed_cpu_ids`, below CPU_SETSIZE.
+        unsafe { libc::CPU_SET(cpu, &mut set) };
+    }
+    // SAFETY: `set` is a valid cpu_set_t of the size passed; 0 is this thread.
+    let ok = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+    if ok == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Bind the calling thread (a worker) to `cpu` of `allowed`.
+///
+/// A thread starts on the CPUs of the thread that starts it, so whatever a
+/// pinned worker starts — the blocking pool of its runtime (a full sync's
+/// dump, a script, `BGSAVE`), a helper started on first use (snapshot
+/// compression, lazy free, pub/sub, vector postings) — would be held to the
+/// worker's one CPU. Each such thread calls [`release_this_thread`] first.
+#[cfg(target_os = "linux")]
+pub fn pin_this_thread(cpu: usize, allowed: &[usize]) -> std::io::Result<()> {
+    let _ = ALLOWED.set(allowed.to_vec());
+    PINNED.store(true, std::sync::atomic::Ordering::Relaxed);
+    FREE.with(|free| free.set(false));
+    set_affinity(&[cpu])
+}
+
+/// Give the calling thread back every CPU the process may use, if a worker
+/// that started it was pinned. Called first by every helper thread and
+/// blocking task; one relaxed load when nothing is pinned.
+#[inline]
+pub fn release_this_thread() {
+    if !PINNED.load(std::sync::atomic::Ordering::Relaxed) || FREE.with(|free| free.get()) {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(allowed) = ALLOWED.get() {
+        let _ = set_affinity(allowed);
+    }
+    FREE.with(|free| free.set(true));
+}
 
 /// What the operating system says the process may run on.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -233,5 +435,116 @@ mod tests {
         assert_eq!(parse_cpu_max("150000 100000"), Some(1.5));
         assert_eq!(parse_cpu_max("max 100000\n"), None);
         assert_eq!(parse_cpu_max(""), None);
+    }
+
+    use WorkerCpuAffinity::{Auto, Off};
+
+    fn pin(workers: usize, allowed: &[usize], quota: Option<f64>) -> Pinning {
+        pinning(Auto, workers, Some(allowed), quota)
+    }
+
+    #[test]
+    fn worker_cpu_affinity_parses() {
+        assert_eq!(WorkerCpuAffinity::parse("auto"), Some(Auto));
+        assert_eq!(WorkerCpuAffinity::parse("AUTO"), Some(Auto));
+        assert_eq!(WorkerCpuAffinity::parse("off"), Some(Off));
+        assert_eq!(WorkerCpuAffinity::parse("no"), Some(Off));
+        assert_eq!(WorkerCpuAffinity::parse("yes"), None);
+        assert_eq!(WorkerCpuAffinity::parse("0-3"), None);
+        assert_eq!(WorkerCpuAffinity::default(), Off);
+        assert_eq!(Auto.name(), "auto");
+        assert_eq!(Off.name(), "off");
+    }
+
+    #[test]
+    fn off_never_pins() {
+        assert!(matches!(
+            pinning(Off, 2, Some(&[0, 2]), None),
+            Pinning::Not(_)
+        ));
+    }
+
+    #[test]
+    fn auto_pins_worker_n_to_the_nth_allowed_cpu_when_as_many() {
+        // taskset -c 0,2 --threads 2; a cpuset 4-7 with auto threads.
+        assert_eq!(pin(2, &[0, 2], None), Pinning::Pin(vec![0, 2]));
+        assert_eq!(pin(4, &[4, 5, 6, 7], None), Pinning::Pin(vec![4, 5, 6, 7]));
+        assert_eq!(pin(1, &[3], None), Pinning::Pin(vec![3]));
+        // A quota of at least the CPUs allowed limits nothing.
+        assert_eq!(pin(2, &[0, 1], Some(2.0)), Pinning::Pin(vec![0, 1]));
+        assert_eq!(pin(2, &[0, 1], Some(8.0)), Pinning::Pin(vec![0, 1]));
+    }
+
+    #[test]
+    fn auto_does_not_pin_more_or_fewer_workers_than_cpus() {
+        let Pinning::Not(why) = pin(2, &[0, 1, 2, 3], None) else {
+            panic!("pinned 2 workers on 4 CPUs")
+        };
+        assert_eq!(
+            why,
+            "2 workers on 4 CPUs: pinned only when they are as many"
+        );
+        assert!(matches!(pin(8, &[0, 1, 2, 3], None), Pinning::Not(_)));
+    }
+
+    #[test]
+    fn auto_does_not_pin_under_a_cpu_quota() {
+        // docker run --cpus 2 on an 8-CPU host: auto threads gives 2 workers,
+        // and the 8 CPUs are shared time, not CPUs of their own.
+        let Pinning::Not(why) = pin(2, &[0, 1, 2, 3, 4, 5, 6, 7], Some(2.0)) else {
+            panic!("pinned under a quota")
+        };
+        assert_eq!(
+            why,
+            "a cgroup CPU quota of 2 CPUs limits this process, not CPUs of its own"
+        );
+        assert!(matches!(pin(4, &[0, 1, 2, 3], Some(3.5)), Pinning::Not(_)));
+    }
+
+    #[test]
+    fn auto_without_a_readable_mask_does_not_pin() {
+        assert!(matches!(pinning(Auto, 2, None, None), Pinning::Not(_)));
+        assert!(matches!(pinning(Auto, 2, Some(&[]), None), Pinning::Not(_)));
+    }
+
+    #[test]
+    fn the_startup_line_says_what_was_pinned() {
+        assert_eq!(
+            Pinning::Pin(vec![0, 2]).describe(),
+            "each worker on a CPU of its own: worker 0 on CPU 0, worker 1 on CPU 2 \
+             (worker-cpu-affinity auto)"
+        );
+        assert_eq!(
+            pinning(Off, 2, Some(&[0, 2]), None).describe(),
+            "not pinned: worker-cpu-affinity off"
+        );
+        assert_eq!(not_pinned_here(Off, true), None);
+        #[cfg(target_os = "linux")]
+        {
+            assert!(not_pinned_here(Auto, true).unwrap().contains("tokio"));
+            assert_eq!(not_pinned_here(Auto, false), None);
+        }
+    }
+
+    /// A helper thread a pinned worker starts gets every allowed CPU back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_thread_a_pinned_thread_starts_is_released() {
+        let allowed = allowed_cpu_ids().expect("the mask");
+        std::thread::spawn(move || {
+            pin_this_thread(allowed[0], &allowed).unwrap();
+            assert_eq!(allowed_cpu_ids().unwrap(), vec![allowed[0]]);
+            let inner = allowed.clone();
+            std::thread::spawn(move || {
+                // Inherited: held to the worker's CPU until released.
+                assert_eq!(allowed_cpu_ids().unwrap(), vec![inner[0]]);
+                release_this_thread();
+                assert_eq!(allowed_cpu_ids().unwrap(), inner);
+            })
+            .join()
+            .unwrap();
+        })
+        .join()
+        .unwrap();
     }
 }

@@ -417,6 +417,7 @@ fn watch_soft_limit(shared: std::sync::Weak<Shared>) {
     let _ = std::thread::Builder::new()
         .name("kividb-pubsub-limit".into())
         .spawn(move || {
+            crate::cpus::release_this_thread();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 let Some(shared) = shared.upgrade() else {

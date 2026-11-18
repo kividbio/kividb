@@ -105,6 +105,7 @@ pub(crate) fn spawn_bus_watchdog() {
     let spawned = std::thread::Builder::new()
         .name("kividb-bus-watch".into())
         .spawn(|| {
+            crate::cpus::release_this_thread();
             let mut stalled = false;
             loop {
                 std::thread::sleep(Duration::from_secs(1));
@@ -756,7 +757,11 @@ pub(crate) async fn answer_mfstart(
     // Let writes that were already in the gate finish and queue. One that is
     // past the pause check but not yet in the gate waits for the failover
     // there, and is redirected (`pause::HANDOFF`).
-    let _ = tokio::task::spawn_blocking(|| drop(crate::write_gate::cut())).await;
+    let _ = tokio::task::spawn_blocking(|| {
+        crate::cpus::release_this_thread();
+        drop(crate::write_gate::cut())
+    })
+    .await;
     let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
     if starter
         .hub_tx
