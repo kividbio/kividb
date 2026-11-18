@@ -1046,6 +1046,7 @@ pub fn wait_for_keys(
         // It never stood in line (`may_park` above).
         ParkOutcome::CannotWait => {
             crate::stats::record_miss();
+            TOOK_NOTHING.with(|took| took.set(true));
             empty()
         }
     }

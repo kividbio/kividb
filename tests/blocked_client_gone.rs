@@ -1798,3 +1798,88 @@ fn an_unblock_as_the_client_is_woken_is_not_lost() {
         }
     }
 }
+
+/// A `BLPOP` inside `MULTI`, which cannot wait, on an empty key that a
+/// client is blocked on, takes nothing and wakes nobody: the blocked client
+/// stays listed, and `CLIENT UNBLOCK` reaches it. The test build holds every
+/// wait, on `KIVIDB_TEST_PARK_DELAY_MS`: a client woken for nothing would be
+/// off the list for that long.
+#[test]
+fn a_pop_in_multi_that_finds_nothing_wakes_nobody() {
+    for &io in io_models() {
+        let server = Server::start_with_env(io, 4, &[], &[("KIVIDB_TEST_PARK_DELAY_MS", "500")]);
+        let mut ctl = server.conn();
+        let mut c = server.conn();
+        let id = client_id(&mut c);
+        c.send(&["BLPOP", "k", "0"]);
+        wait_blocked(&mut ctl, 1);
+        assert_eq!(ctl.cmd(&["MULTI"]), s("OK"));
+        assert_eq!(ctl.cmd(&["BLPOP", "k", "0"]), s("QUEUED"));
+        assert_eq!(ctl.cmd(&["EXEC"]), V::Arr(vec![V::Nil]), "{io}");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            ctl.cmd(&["CLIENT", "UNBLOCK", &id, "TIMEOUT"]),
+            V::Int(1),
+            "{io}: the blocked client was not listed as blocked"
+        );
+        assert_eq!(c.read(), V::Nil, "{io}");
+    }
+}
+
+/// A client woken by a push and unblocked before it looks leaves the
+/// element to the client behind it: `ERROR` takes nothing and passes the
+/// turn on, `TIMEOUT` either takes it or passes it on. Either way the
+/// element goes to exactly one of them. The test build holds a woken
+/// client, on `KIVIDB_TEST_WOKEN_DELAY_MS`, before it is taken off the list.
+#[test]
+fn a_client_unblocked_as_a_push_wakes_it_leaves_the_element_to_the_next() {
+    for &io in io_models() {
+        for how in ["ERROR", "TIMEOUT"] {
+            let server =
+                Server::start_with_env(io, 4, &[], &[("KIVIDB_TEST_WOKEN_DELAY_MS", "500")]);
+            let mut ctl = server.conn();
+            let mut first = server.conn();
+            let first_id = client_id(&mut first);
+            first.send(&["BLPOP", "k", "0"]);
+            wait_blocked(&mut ctl, 1);
+            let mut second = server.conn();
+            let second_id = client_id(&mut second);
+            second.send(&["BLPOP", "k", "0"]);
+            wait_blocked(&mut ctl, 2);
+            // The reply waits a tenth of a second at most for the woken
+            // client to look; it is held for half a second.
+            assert_eq!(ctl.cmd(&["LPUSH", "k", "x"]), V::Int(1), "{io} {how}");
+            assert_eq!(
+                ctl.cmd(&["CLIENT", "UNBLOCK", &first_id, how]),
+                V::Int(1),
+                "{io} {how}"
+            );
+            let first_got = first.read();
+            let started = Instant::now();
+            match (how, first_got) {
+                ("ERROR", V::Err(e)) if e.starts_with("UNBLOCKED") => {
+                    assert_eq!(second.read(), strs(&["k", "x"]), "{io} {how}");
+                }
+                ("TIMEOUT", V::Nil) => {
+                    assert_eq!(second.read(), strs(&["k", "x"]), "{io} {how}");
+                }
+                ("TIMEOUT", got) if got == strs(&["k", "x"]) => {
+                    // Taken by the first: the second is still waiting.
+                    assert_eq!(
+                        ctl.cmd(&["CLIENT", "UNBLOCK", &second_id, "TIMEOUT"]),
+                        V::Int(1),
+                        "{io} {how}"
+                    );
+                    assert_eq!(second.read(), V::Nil, "{io} {how}");
+                }
+                (_, got) => panic!("{io} {how}: {got:?}"),
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "{io} {how}: the element waited {:?}",
+                started.elapsed()
+            );
+            assert_eq!(ctl.cmd(&["LLEN", "k"]), V::Int(0), "{io} {how}");
+        }
+    }
+}
