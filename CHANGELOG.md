@@ -262,7 +262,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **Pub/sub fan-out delivers about 25 % more messages a second, ahead of
+- **Pub/sub fan-out delivers 18-29 % more messages a second, ahead of
   Redis (#851).** socket.io's Redis adapter publishes every broadcast with
   `PUBLISH socket.io#/#<room>#` to servers that each `PSUBSCRIBE
   socket.io#/#*`, a shape in which 1.2.2 was about 10 % slower than Redis
@@ -273,35 +273,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   server's threads mostly waited on each other. A message is now framed
   once for each channel or pattern it goes through, and that frame is
   shared by all of their subscribers (a RESP3 subscriber's push differs
-  only in its first byte); `PUBLISH` no longer copies the payload first;
-  a subscriber keeps its buffers from one batch to the next while messages
-  keep coming, and lets large ones go when it waits; and its writer lets
-  the thread's other connections run once before it writes, so that what
-  they publish meanwhile goes out in the same write, as Redis writes to a
-  subscriber once a turn of its event loop. One Azure D4s_v5, the server on
-  2 vCPUs and the clients on the other 2, 16 subscribers, 200-byte
-  messages, io_uring, medians of three, master before / after / Redis
-  8.10.2 / 1.2.2:
-  - the issue's memtier run (48 publisher connections): 96,744 / 112,305 /
-    112,677 / 93,484 publishes a second, 1.34M / 1.64M / 1.59M / 1.29M
-    messages delivered; with 200 connections 112,202 / 136,307 / 120,382 /
-    116,733 publishes, 1.65M / 2.13M / 1.77M / 1.75M delivered;
-  - 48 connections publishing as fast as they are answered: 1.37M / 1.74M /
-    1.38M / 1.26M delivered a second (RESP3: 1.33M / 1.73M / 1.37M /
-    1.27M);
+  only in its first byte), with a payload of 4 KB or more copied once,
+  before the subscription table is locked, and shared by the frames;
+  a subscriber keeps its buffers (at most 4 KB of frames and 32 messages)
+  from one batch to the next while messages keep coming, counts them in its
+  `tot-mem`, and gives them back once it has been idle for a second; and
+  its writer lets the thread's other connections run once before it
+  writes, so that what they publish meanwhile goes out in the same write,
+  as Redis writes to a subscriber once a turn of its event loop. One Azure
+  D4s_v5, the server on 2 vCPUs and the clients on the other 2, 16
+  subscribers, 200-byte messages, medians of three, master before / after
+  / Redis 8.10.2:
+  - the issue's memtier run (48 publisher connections): 102,512 / 124,186
+    / 108,666 publishes a second, 1.43M / 1.85M / 1.53M messages
+    delivered;
+  - 48 connections publishing as fast as they are answered, `PSUBSCRIBE`:
+    1.47M / 1.79M / 1.28M delivered a second; plain `SUBSCRIBE` of one
+    channel: 1.54M / 1.82M / 1.34M;
   - at a fixed 70,000 publishes a second (1.12M deliveries), p99 from
-    publish to receipt 1.06 / 0.71 / 0.78 / 0.93 ms (RESP3 0.98 / 0.68 /
-    0.68 / 0.95);
-  - plain channels (`SUBSCRIBE`, one channel) 1.44M / 1.79M / 1.46M /
-    1.34M delivered a second, p99 at 70,000 publishes 0.81 / 0.69 / 0.71 /
-    0.84 ms; shard channels (`SSUBSCRIBE`/`SPUBLISH`) 1.43M / 1.76M /
-    1.45M / 1.32M.
+    publish to receipt 0.88 / 0.69 / 0.81 ms (`PSUBSCRIBE`), 0.79 / 0.70 /
+    0.83 ms (`SUBSCRIBE`);
+  - on the Tokio loop (no Redis column): the memtier run 1.10M / 2.01M
+    delivered a second, 48 `PSUBSCRIBE` publishers 1.04M / 1.83M.
 
-  On the Tokio loop the same runs deliver 1.5-1.8x what they did (0.98M to
-  1.75M with 48 connections). What a subscriber is sent, in what order, and
-  what counts against `client-output-buffer-limit pubsub` are unchanged.
+  1.2.2 in an earlier run of the same harness delivered 1.29M (memtier),
+  1.26M (`PSUBSCRIBE`) and 1.34M (`SUBSCRIBE`) a second there.
   `benchmarks/1.3.0/regressions/suites/23-pubsub-pattern-fanout.py`
-  re-measures it.
+  re-measures it on a shared, unpinned VM with `--threads 2`: there the
+  pattern row is ahead of 1.2.2 and Redis (1.47M against 1.31M and 1.37M a
+  second) and the plain-channel row level with both (1.47M against 1.51M
+  and 1.43M). What a subscriber is sent, in what order, and what counts
+  against `client-output-buffer-limit pubsub` are unchanged.
 
 - **`SSCAN`, `ZSCAN` and `HSCAN` of a large collection are faster, and a
   call no longer copies the collection (#624, #770 in part).** A page was

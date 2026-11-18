@@ -842,13 +842,13 @@ pub struct Outbox {
 /// What a subscriber keeps of its buffers once its queue is empty: a
 /// burst's batch of thousands of messages is not held on to by every
 /// subscriber that had one.
-const KEEP_DELIVERIES: usize = 64;
-const KEEP_FRAME_BYTES: usize = 16 << 10;
+const KEEP_DELIVERIES: usize = 32;
+const KEEP_FRAME_BYTES: usize = 4 << 10;
 /// A subscriber idle this long gives back what it kept: a server with many
 /// quiet subscribers holds nothing for them, as before #851. Only armed when
-/// it keeps more than [`KEEP_IDLE_BYTES`], so that a quiet subscriber that
-/// never had a large batch never sets a timer, and a busy one never waits on
-/// one.
+/// it keeps more than [`KEEP_IDLE_BYTES`] (less is given back at once), so
+/// that a subscriber that keeps next to nothing never sets a timer,
+/// and a busy one, which finds its queue never empty, never waits on one.
 const IDLE_RELEASE: std::time::Duration = std::time::Duration::from_secs(1);
 const KEEP_IDLE_BYTES: usize = 256;
 
@@ -926,7 +926,12 @@ impl Outbox {
         if self.frames.capacity() > KEEP_FRAME_BYTES {
             self.frames = Vec::new();
         }
-        self.me.note_kept(self.kept());
+        if self.kept() <= KEEP_IDLE_BYTES {
+            // Too little to be worth a timer: none is kept.
+            self.release();
+        } else {
+            self.me.note_kept(self.kept());
+        }
     }
 
     /// Idle: let go of everything kept.
@@ -1189,20 +1194,21 @@ mod tests {
         let (mut subs, mut outbox) = subscriber(&hub, 1);
         subs.handle(&[b"SUBSCRIBE", b"c"], 2);
         subs.flushed();
-        hub.publish("c", vec![b'x'; 15 << 10]);
+        hub.publish("c", vec![b'x'; 2 << 10]);
         {
             let mut batch = outbox.next().await.unwrap();
             let out = batch.encode(2);
             batch.written(out);
         }
-        assert!(outbox.kept() > 15 << 10);
+        assert!(outbox.kept() > 2 << 10);
         // Not yet idle for long: kept, within the small limits.
         let waited = tokio::time::timeout(IDLE_RELEASE / 2, outbox.next())
             .await
             .is_err();
         assert!(waited);
         let kept = outbox.kept();
-        assert!(kept > KEEP_IDLE_BYTES && kept <= KEEP_FRAME_BYTES + 64 * 64);
+        let most = KEEP_FRAME_BYTES + KEEP_DELIVERIES * std::mem::size_of::<Delivery>();
+        assert!(kept > KEEP_IDLE_BYTES && kept <= most);
         // Idle past IDLE_RELEASE: nothing kept.
         let waited = tokio::time::timeout(IDLE_RELEASE * 3, outbox.next())
             .await
