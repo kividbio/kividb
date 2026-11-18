@@ -4439,35 +4439,37 @@ pub fn is_write_command(name: &str) -> bool {
                 | "TS.ALTER"
                 | "VSETATTR"
         ),
-        9 => matches!(
-            name,
-            "BF.INSERT"
-                | "CMS.MERGE"
-                | "FT.CREATE"
-                | "HEXPIREAT"
-                | "JSON.MSET"
-                | "PEXPIREAT"
-                | "RPOPLPUSH"
-                | "TS.CREATE"
-                | "TS.DECRBY"
-                | "TS.INCRBY"
-        ),
-        10 => matches!(
-            name,
-            "ARDELRANGE"
-                | "BF.RESERVE"
-                | "BRPOPLPUSH"
-                | "CMS.INCRBY"
-                | "FT.DICTADD"
-                | "FT.DICTDEL"
-                | "HPEXPIREAT"
-                | "JSON.CLEAR"
-                | "JSON.MERGE"
-                | "SDIFFSTORE"
-                | "XAUTOCLAIM"
-                | "XREADGROUP"
-                | "ZDIFFSTORE"
-        ),
+        9 => {
+            matches!(
+                name,
+                "BF.INSERT"
+                    | "FT.CREATE"
+                    | "HEXPIREAT"
+                    | "JSON.MSET"
+                    | "PEXPIREAT"
+                    | "RPOPLPUSH"
+                    | "TS.CREATE"
+                    | "TS.DECRBY"
+                    | "TS.INCRBY"
+            ) || (matches!(name.as_bytes()[0], b'C') && matches!(name, "CMS.MERGE"))
+        }
+        10 => {
+            matches!(
+                name,
+                "ARDELRANGE"
+                    | "BF.RESERVE"
+                    | "BRPOPLPUSH"
+                    | "FT.DICTADD"
+                    | "FT.DICTDEL"
+                    | "HPEXPIREAT"
+                    | "JSON.CLEAR"
+                    | "JSON.MERGE"
+                    | "SDIFFSTORE"
+                    | "XAUTOCLAIM"
+                    | "XREADGROUP"
+                    | "ZDIFFSTORE"
+            ) || (matches!(name.as_bytes()[0], b'C') && matches!(name, "CMS.INCRBY"))
+        }
         11 => matches!(
             name,
             "FT.ALIASADD"
@@ -4488,19 +4490,23 @@ pub fn is_write_command(name: &str) -> bool {
             name,
             "BF.LOADCHUNK" | "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
         ),
-        13 => matches!(name, "CMS.INITBYDIM" | "TS.CREATERULE" | "TS.DELETERULE"),
-        14 => matches!(
-            name,
-            "CMS.INITBYPROB"
-                | "FT.ALIASUPDATE"
-                | "GEOSEARCHSTORE"
-                | "JSON.ARRAPPEND"
-                | "JSON.ARRINSERT"
-                | "JSON.NUMINCRBY"
-                | "JSON.NUMMULTBY"
-                | "JSON.STRAPPEND"
-                | "ZREMRANGEBYLEX"
-        ),
+        13 => {
+            matches!(name, "TS.CREATERULE" | "TS.DELETERULE")
+                || (matches!(name.as_bytes()[0], b'C') && matches!(name, "CMS.INITBYDIM"))
+        }
+        14 => {
+            matches!(
+                name,
+                "FT.ALIASUPDATE"
+                    | "GEOSEARCHSTORE"
+                    | "JSON.ARRAPPEND"
+                    | "JSON.ARRINSERT"
+                    | "JSON.NUMINCRBY"
+                    | "JSON.NUMMULTBY"
+                    | "JSON.STRAPPEND"
+                    | "ZREMRANGEBYLEX"
+            ) || (matches!(name.as_bytes()[0], b'C') && matches!(name, "CMS.INITBYPROB"))
+        }
         15 => name == "ZREMRANGEBYRANK",
         16 => name == "ZREMRANGEBYSCORE",
         _ => false,
