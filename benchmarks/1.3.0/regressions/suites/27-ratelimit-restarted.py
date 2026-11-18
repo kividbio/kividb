@@ -20,8 +20,8 @@ threads on CPUs 0 and 2 (one hyper-thread of each core), the checks on 1, the
 background load on 3:
 
   checks      65 connections, each a closed loop of checks with 2 ms of the
-              limiter's own time after each (about 21,600 checks a second
-              on one hyper-thread, whatever the server)
+              limiter's own time after each (about 31,000 checks a second
+              when the server keeps up)
   background  100 connections sending `INCRBY` + `EXPIRE` pairs, paced to
               BG_RATES commands a second in all
 
@@ -36,14 +36,11 @@ Metrics, for each background rate (median of 3 rounds of 10 s):
 
 Gates: checks a second 10 % and at most 1.05x worse than Redis this session;
 the p99 is scheduling on a shared VM (jitter): 100 % or 0.5 ms, and with
-background load, 60 % of the gain over v1.2.2 kept. On D8s_v5 restricted to
-these four CPUs (rustc 1.99.1 builds): p99 at 0 and 50,000, master 0.3-3.4
-and 0.9-3.5 ms, the change 0.31-0.33 and 0.45-0.48 ms, Redis 0.25 and
-0.66-0.70 ms.
-
-The 100,000 rows are shown, not gated (UNGATED): the clients share the
-server's cores, and there Redis, master and the change all had a p99 of
-3.4-6 ms; they measure the clients.
+background load, 60 % of the gain over v1.2.2 kept. Recorded on a D4s_v5
+(rustc 1.100.0 builds), checks a second and p99, v1.2.2 / the change /
+Redis: 31.0k 0.30 ms / 31.2k 0.22 ms / 31.2k 0.52 ms at 0; 30.6k 1.56 ms /
+31.6k 0.15 ms / 31.9k 0.08 ms at 50,000; 27.8k 6.1 ms / 31.4k 0.19 ms /
+31.8k 0.12 ms at 100,000.
 """
 import os
 import re
@@ -52,13 +49,12 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from suite import (Suite, Config, THROUGHPUT, KEEP_IMPROVEMENT, rel, vs_redis, jitter, info, median)  # noqa: E402
+from suite import (Suite, Config, THROUGHPUT, KEEP_IMPROVEMENT, rel, vs_redis, jitter, median)  # noqa: E402
 from nodes import Nodes  # noqa: E402
 
 S = Suite("27-ratelimit-restarted", [Config("t2", threads=2, self_hosted=True)])
 KEYS = 100_000
 BG_RATES = (0, 50_000, 100_000)
-UNGATED = (100_000,)
 ROUNDS = 3
 SECONDS = 10
 THINK_US = 2000
@@ -154,14 +150,11 @@ def run(ctx):
                 bgs.append(bg)
             rounds[rate] = {"checks": fgs, "background": bgs}
             k = "bg%dk" % (rate // 1000)
-            open_894 = rate in UNGATED
             ctx.emit("checks_per_s_" + k, median([f["ops"] for f in fgs]), "checks/s", "higher",
-                     gate=info() if open_894 else [THROUGHPUT, vs_redis(1.05)],
-                     samples=[f["ops"] for f in fgs])
+                     gate=[THROUGHPUT, vs_redis(1.05)], samples=[f["ops"] for f in fgs])
             p99 = [f["p99_us"] / 1e3 for f in fgs]
             gates = [rel(100, abs=0.5)] + ([KEEP_IMPROVEMENT] if rate else [])
-            ctx.emit("p99_ms_" + k, median(p99), "ms", "lower",
-                     gate=info() if open_894 else jitter(gates), samples=p99)
+            ctx.emit("p99_ms_" + k, median(p99), "ms", "lower", gate=jitter(gates), samples=p99)
         ctx.raw["rounds"] = rounds
 
 
