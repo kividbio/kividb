@@ -3095,27 +3095,37 @@ fn json_to_lua(
 }
 
 fn lua_value_to_resp(lua: &Lua, val: LuaValue) -> LuaResult<Vec<u8>> {
-    let protocol = ReplyProtocol::current();
+    reply_to_resp(lua, val, ReplyProtocol::current())
+}
+
+/// [`lua_value_to_resp`] for `protocol`.
+fn reply_to_resp(lua: &Lua, val: LuaValue, protocol: ReplyProtocol) -> LuaResult<Vec<u8>> {
     // A table, which is what most scripts return, is written where it lies,
     // on Lua's stack, into one buffer (#901). What `write_reply` does not
     // write itself it leaves, and the whole reply is written as before.
-    if let LuaValue::Table(table) = &val {
-        // Room for a short reply, which most are, without growing.
-        let mut out = Vec::with_capacity(128);
-        let mut written = false;
-        // SAFETY: `write_reply` keeps to the stack it is given and raises no
-        // Lua error (see there); the closure leaves the stack empty.
-        let ran = unsafe {
-            lua.exec_raw::<()>(table, |state| {
-                written = write_reply(state, 1, &mut out, 0, protocol);
-                mlua::ffi::lua_settop(state, 0);
-            })
-        };
-        if ran.is_ok() && written {
-            return Ok(out);
-        }
+    if let LuaValue::Table(table) = &val
+        && let Some(out) = fast_table_reply(lua, table, protocol)
+    {
+        return Ok(out);
     }
     lua_to_resp_inner(lua, val, 0, protocol)
+}
+
+/// What `write_reply` writes for `table`, or `None` for a reply it leaves
+/// to `lua_to_resp_inner`.
+fn fast_table_reply(lua: &Lua, table: &LuaTable, protocol: ReplyProtocol) -> Option<Vec<u8>> {
+    // Room for a short reply, which most are, without growing.
+    let mut out = Vec::with_capacity(128);
+    let mut written = false;
+    // SAFETY: `write_reply` keeps to the stack it is given and raises no
+    // Lua error (see there); the closure leaves the stack empty.
+    let ran = unsafe {
+        lua.exec_raw::<()>(table, |state| {
+            written = write_reply(state, 1, &mut out, 0, protocol);
+            mlua::ffi::lua_settop(state, 0);
+        })
+    };
+    (ran.is_ok() && written).then_some(out)
 }
 
 /// How deep `write_reply` goes before it leaves a reply to
@@ -6224,5 +6234,202 @@ mod resp_parse_key_tests {
             let err = parse_resp_value(&lua, buf, 0).unwrap_err().to_string();
             assert!(err.contains("must not be nil"), "{err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod reply_writer_tests {
+    use super::*;
+
+    const PROTOCOLS: [ReplyProtocol; 4] = [
+        ReplyProtocol {
+            client: 2,
+            script: 2,
+        },
+        ReplyProtocol {
+            client: 3,
+            script: 2,
+        },
+        ReplyProtocol {
+            client: 2,
+            script: 3,
+        },
+        ReplyProtocol {
+            client: 3,
+            script: 3,
+        },
+    ];
+
+    /// The reply `src` evaluates to, written by the path scripts take and by
+    /// the one before #901 (`lua_to_resp_inner` alone), for every protocol:
+    /// the same bytes, or the same error. Where `write_reply` writes the
+    /// reply itself, that is checked as well. True if it did.
+    fn same_reply(lua: &Lua, src: &str) -> bool {
+        let value: LuaValue = lua
+            .load(src)
+            .eval()
+            .unwrap_or_else(|e| panic!("{src}: {e}"));
+        let mut fast = false;
+        for protocol in PROTOCOLS {
+            let old =
+                lua_to_resp_inner(lua, value.clone(), 0, protocol).map_err(|e| e.to_string());
+            let new = reply_to_resp(lua, value.clone(), protocol).map_err(|e| e.to_string());
+            assert_eq!(
+                new, old,
+                "{src} (client {}, script {})",
+                protocol.client, protocol.script
+            );
+            if let LuaValue::Table(table) = &value
+                && let Some(out) = fast_table_reply(lua, table, protocol)
+            {
+                assert_eq!(Ok(out), old, "{src}: write_reply");
+                fast = true;
+            }
+        }
+        fast
+    }
+
+    #[test]
+    fn write_reply_writes_what_the_old_path_writes() {
+        let lua = new_lua_vm();
+        let fast = [
+            "return {}",
+            "return {1, 2, 3}",
+            "return {1, nil, 3}",
+            "return {nil, 2}",
+            "return {'a', 'b', {'c', {'d'}}}",
+            "return {ok = 'fine'}",
+            "return {ok = 'a\\r\\nb\\nc'}",
+            "return {ok = ''}",
+            "return {err = 'ERR bad'}",
+            "return {err = 'no prefix'}",
+            "return {err = '\\255\\254'}",
+            "return {ok = 5, 1}",
+            "return {ok = 5}",
+            "return {err = 5}",
+            "return {x = 1, 2}",
+            "return {'a\\0b', '', 'x'}",
+            "return {math.mininteger, math.maxinteger, -1, 0}",
+            "return {3.0, 3.7, -2.5, 0/0, 1/0, -1/0, -0.0, 2^63, -2^63, 1e300}",
+            "return {true, false, true}",
+            "return {1, {2, {3, {4, {5}}}}}",
+        ];
+        for src in fast {
+            assert!(same_reply(&lua, src), "{src}: write_reply did not write it");
+        }
+        let other = [
+            "return nil",
+            "return true",
+            "return false",
+            "return 1",
+            "return 1.5",
+            "return 'x\\0y'",
+            "return ''",
+            "return {1, {err = 'ERR nested'}}",
+            "return {{ok = 'nested'}, 2}",
+            "return {1, set = {}}",
+            "return {set = {a = true}}",
+            "return {map = {a = 1}}",
+            "return {map = {}}",
+            "return {double = 1.5}",
+            "return {double = 3}",
+            "return {double = 'x'}",
+            "return {big_number = '12345678901234567890'}",
+            "return {big_number = 5}",
+            "return {verbatim_string = {format = 'txt', string = 'hi'}}",
+            "return {verbatim_string = {format = 1, string = 'hi'}}",
+            "return {map = 1, 7}",
+            "return {set = 'x', 8}",
+            "return {ok = 'both', err = 'both'}",
+            "return function() end",
+            "return {function() end, coroutine.create(function() end)}",
+            "local t = {} t[1] = t return t",
+            "local t = {} t[1] = {t} return t",
+            "local t = {} local c = t for i = 1, 33 do c[1] = {} c = c[1] end return t",
+            "local t = {} local c = t for i = 1, 65 do c[1] = {} c = c[1] end return t",
+            "local t = {} local c = t for i = 1, 33 do c[1] = i c[2] = {} c = c[2] end return t",
+            "local t = {} local c = t for i = 1, 65 do c[1] = i c[2] = {} c = c[2] end return t",
+            "local t = {} local c = t for i = 1, 9000 do c[1] = {} c = c[1] end return t",
+        ];
+        for src in other {
+            same_reply(&lua, src);
+        }
+    }
+
+    /// Random nested values from a fixed seed: what a script returns, of
+    /// every shape the writer knows and some it leaves.
+    struct Gen(u64);
+
+    impl Gen {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+
+        fn pick<'a>(&mut self, from: &[&'a str]) -> &'a str {
+            from[self.next() as usize % from.len()]
+        }
+
+        fn value(&mut self, depth: u32) -> String {
+            const SCALARS: [&str; 16] = [
+                "nil",
+                "true",
+                "false",
+                "0",
+                "-1",
+                "42",
+                "3.0",
+                "2.5",
+                "0/0",
+                "1/0",
+                "math.mininteger",
+                "'s'",
+                "''",
+                "'a\\0b'",
+                "'ERR x'",
+                "'\\r\\n'",
+            ];
+            let kind = if depth >= 4 { 0 } else { self.next() % 6 };
+            match kind {
+                0 | 1 => self.pick(&SCALARS).to_string(),
+                2 | 3 => {
+                    let n = self.next() % 6;
+                    let items: Vec<String> = (0..n).map(|_| self.value(depth + 1)).collect();
+                    format!("{{{}}}", items.join(", "))
+                }
+                4 => {
+                    let inner = self.value(depth + 1);
+                    match self.next() % 10 {
+                        0 => format!("{{ok = {}}}", self.pick(&["'fine'", "5", "'a\\nb'"])),
+                        1 => format!("{{err = {}}}", self.pick(&["'ERR e'", "'plain'", "7"])),
+                        2 => format!("{{double = {}}}", self.pick(&["1.5", "2", "'x'"])),
+                        3 => format!("{{set = {{a = true}}, {inner}}}"),
+                        4 => format!("{{map = {{k = {inner}}}}}"),
+                        5 => format!("{{big_number = '{}'}}", self.next()),
+                        6 => format!("{{x = 1, {inner}}}"),
+                        7 => format!("{{[2] = {inner}}}"),
+                        8 => format!("{{[1] = {{[1] = {inner}}}}}"),
+                        _ => format!("{{{inner}, nil, {inner}}}"),
+                    }
+                }
+                _ => format!("{{{}}}", self.value(depth + 1)),
+            }
+        }
+    }
+
+    #[test]
+    fn write_reply_writes_what_the_old_path_writes_for_random_values() {
+        let lua = new_lua_vm();
+        let mut generator = Gen(901);
+        let mut fast = 0;
+        for _ in 0..400 {
+            let src = format!("return {}", generator.value(0));
+            fast += usize::from(same_reply(&lua, &src));
+        }
+        // A good part of them is written the new way.
+        assert!(fast > 100, "{fast}");
     }
 }
