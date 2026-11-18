@@ -139,6 +139,11 @@ pub(crate) fn effects_take() -> Vec<Vec<Vec<u8>>> {
 ///
 /// `resp` is the reply the command just produced; the rewrites read the effect
 /// out of it (which members were popped, which ID was assigned).
+///
+/// Not inlined: a write's side effects call it only when the stream is
+/// read, and made a two-line wrapper (#901) it was inlined into them,
+/// which cost every `SET` 8 instructions more whether or not it ran.
+#[inline(never)]
 pub fn commands_for_propagation(
     ctx: &Ctx<'_>,
     name: &str,
