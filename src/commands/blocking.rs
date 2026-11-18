@@ -206,6 +206,21 @@ pub fn test_park_delay() -> Option<Duration> {
     })
 }
 
+/// In the test build, `KIVIDB_TEST_WOKEN_DELAY_MS`: a client woken in its
+/// wait is held this long before it is taken off the list of blocked
+/// clients, so that a test can `CLIENT UNBLOCK` it in between.
+#[cfg(debug_assertions)]
+pub fn test_woken_delay() -> Option<Duration> {
+    static DELAY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let ms: u64 = std::env::var("KIVIDB_TEST_WOKEN_DELAY_MS")
+            .ok()?
+            .parse()
+            .ok()?;
+        Some(Duration::from_millis(ms))
+    })
+}
+
 /// How a wait ended, when it was not by what was waited for or by its
 /// timeout. Kept by the connection loop across the dispatch that resumes
 /// the command, which is where the command tidies up after itself.
@@ -816,6 +831,20 @@ pub fn hold_for_pause(ctx: &mut crate::commands::ctx::Ctx) -> Vec<u8> {
     crate::pause::HELD_IN_GATE.to_vec()
 }
 
+thread_local! {
+    /// Set by [`wait_for_keys`] when it ends taking nothing, for the
+    /// command's `settle_written_keys` on the same thread to ask
+    /// ([`took_nothing`]).
+    static TOOK_NOTHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the blocking pop this thread has just run ended taking nothing:
+/// its time ran out, `CLIENT UNBLOCK` ended it, or its client had gone.
+/// Asked once, after the command, by `settle_written_keys`.
+pub fn took_nothing() -> bool {
+    TOOK_NOTHING.with(|took| took.replace(false))
+}
+
 /// Run a command that waits until one of `keys` has something for it.
 ///
 /// `attempt` is the command's non-blocking form: `Some(reply)` once it has
@@ -857,6 +886,7 @@ pub fn wait_for_keys(
     mut attempt: impl FnMut(&mut crate::commands::ctx::Ctx, &[Vec<u8>]) -> Option<Vec<u8>>,
     empty: impl Fn() -> Vec<u8>,
 ) -> Vec<u8> {
+    TOOK_NOTHING.with(|took| took.set(false));
     let gone = client_gone(ctx);
     let resumed = take_resume(ctx);
     let (deadline, ticket) = match take_state(ctx) {
@@ -871,6 +901,7 @@ pub fn wait_for_keys(
         // nothing, and the turn to the client behind, which may have been
         // this one's.
         leave_lines(ctx, keys, &ticket);
+        TOOK_NOTHING.with(|took| took.set(true));
         return empty();
     }
     let timed_out = matches!(resumed, Some(None));
@@ -969,6 +1000,7 @@ pub fn wait_for_keys(
         (None, Some(remaining)) if !timed_out => Err(remaining),
         (None, _) => {
             crate::stats::record_miss();
+            TOOK_NOTHING.with(|took| took.set(true));
             // A wait that ran out is answered with a null array. A caller
             // that cannot wait (`MULTI`, a script, the replica applier) whose
             // tiny timeout passed while it looked never waited: it gets the

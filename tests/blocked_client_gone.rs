@@ -1702,3 +1702,98 @@ fn a_client_that_sends_past_replies_it_never_reads_is_held_to_the_limit() {
         let _ = sending.join();
     }
 }
+
+/// The id `CLIENT ID` gives `c`, as `CLIENT UNBLOCK` takes it.
+fn client_id(c: &mut Conn) -> String {
+    let V::Int(id) = c.cmd(&["CLIENT", "ID"]) else {
+        panic!("CLIENT ID is a number");
+    };
+    id.to_string()
+}
+
+/// A client whose blocking pop ends with nothing — `CLIENT UNBLOCK`, here,
+/// or its timeout — wakes nobody behind it: it took nothing, and there is
+/// nothing for them to look at. It used to wake the client next in line,
+/// which left its wait only to find nothing and wait again, and was not
+/// listed as blocked meanwhile: a `CLIENT UNBLOCK` for it then was answered
+/// 0, and it stayed blocked. Redis's unit/pause unblocks two `BLPOP`s on
+/// one key one after the other. The test build holds every wait, on
+/// `KIVIDB_TEST_PARK_DELAY_MS`, before its client is listed: a client woken
+/// for nothing is off the list for that long.
+#[test]
+fn a_pop_that_ends_with_nothing_wakes_nobody_behind_it() {
+    for &io in io_models() {
+        for how in ["TIMEOUT", "ERROR"] {
+            let server =
+                Server::start_with_env(io, 4, &[], &[("KIVIDB_TEST_PARK_DELAY_MS", "500")]);
+            let mut ctl = server.conn();
+            let mut first = server.conn();
+            let first_id = client_id(&mut first);
+            first.send(&["BLPOP", "k", "0"]);
+            wait_blocked(&mut ctl, 1);
+            let mut second = server.conn();
+            let second_id = client_id(&mut second);
+            second.send(&["BLPOP", "k", "0"]);
+            wait_blocked(&mut ctl, 2);
+            assert_eq!(
+                ctl.cmd(&["CLIENT", "UNBLOCK", &first_id, how]),
+                V::Int(1),
+                "{io} {how}"
+            );
+            // Written once the dispatch that ended it is over, wake-ups and
+            // all. A client woken then would be in the half second's hold
+            // for the next tenth of a second at least.
+            match (how, first.read()) {
+                ("TIMEOUT", V::Nil) => {}
+                ("ERROR", V::Err(e)) if e.starts_with("UNBLOCKED") => {}
+                (_, reply) => panic!("{io} {how}: {reply:?}"),
+            }
+            thread::sleep(Duration::from_millis(100));
+            assert_eq!(
+                ctl.cmd(&["CLIENT", "UNBLOCK", &second_id, "TIMEOUT"]),
+                V::Int(1),
+                "{io} {how}: the client behind was not listed as blocked"
+            );
+            assert_eq!(second.read(), V::Nil, "{io} {how}");
+        }
+    }
+}
+
+/// A `CLIENT UNBLOCK` that lands as the client's wait ends otherwise — woken
+/// by a push that someone else's pop then took — is answered 1, and is done:
+/// the client is answered as it says, not left to find nothing and wait
+/// again for ever. The test build holds a woken client, on
+/// `KIVIDB_TEST_WOKEN_DELAY_MS`, before it is taken off the list.
+#[test]
+fn an_unblock_as_the_client_is_woken_is_not_lost() {
+    for &io in io_models() {
+        for how in ["TIMEOUT", "ERROR"] {
+            let server =
+                Server::start_with_env(io, 4, &[], &[("KIVIDB_TEST_WOKEN_DELAY_MS", "500")]);
+            let mut ctl = server.conn();
+            let mut c = server.conn();
+            let id = client_id(&mut c);
+            c.send(&["BLPOP", "k", "0"]);
+            wait_blocked(&mut ctl, 1);
+            // Pushed and popped in one go: the client is woken for an
+            // element that is gone by the time it looks. The reply waits
+            // for it to look, a tenth of a second at most: it is held for
+            // half a second, and is still waiting when the unblock lands.
+            assert_eq!(ctl.cmd(&["MULTI"]), s("OK"));
+            assert_eq!(ctl.cmd(&["LPUSH", "k", "x"]), s("QUEUED"));
+            assert_eq!(ctl.cmd(&["LPOP", "k"]), s("QUEUED"));
+            assert_eq!(ctl.cmd(&["EXEC"]), V::Arr(vec![V::Int(1), s("x")]), "{io}");
+            assert_eq!(
+                ctl.cmd(&["CLIENT", "UNBLOCK", &id, how]),
+                V::Int(1),
+                "{io} {how}"
+            );
+            match (how, c.read()) {
+                ("TIMEOUT", V::Nil) => {}
+                ("ERROR", V::Err(e)) if e.starts_with("UNBLOCKED") => {}
+                (_, reply) => panic!("{io} {how}: {reply:?}"),
+            }
+            wait_blocked(&mut ctl, 0);
+        }
+    }
+}

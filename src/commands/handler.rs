@@ -2957,6 +2957,15 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
     // is no client a later read waits for (#42). What it pushes (`BLMOVE`'s
     // destination) its handler wakes, and that is waited for.
     let quiet = waiters && pops_blocking(name);
+    // One that took nothing — its time ran out, or `CLIENT UNBLOCK` ended
+    // it — left its keys as they were. Woken by it, the client at the head
+    // of the line would leave its wait only to find nothing and wait again,
+    // and not be listed as blocked meanwhile: a `CLIENT UNBLOCK` sent for
+    // it then was answered 0, and it stayed blocked.
+    // `XREADGROUP` waits otherwise, and is not told.
+    if quiet && crate::commands::blocking::took_nothing() && name != "XREADGROUP" {
+        return;
+    }
     for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
         let key = ctx.cmd[pos];
         if may_be_empty && drop_if_empty(ctx, db, key) {

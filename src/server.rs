@@ -255,6 +255,7 @@ where
     waiter
         .client_registry
         .set_blocked(waiter.client_id, Some(unblock_tx), wait.has_timeout());
+    let mut unblockable = true;
     let delivery = if crate::commands::blocking::ended_by_role_change(
         park_epoch,
         refused_on_replica,
@@ -269,7 +270,6 @@ where
         let waiting = wait.wait();
         tokio::pin!(waiting);
         let mut temp = [0u8; 4096];
-        let mut unblockable = true;
         loop {
             tokio::select! {
                 delivery = &mut waiting => {
@@ -290,6 +290,12 @@ where
                     ) {
                         waiter.interrupted.gone = true;
                         break None;
+                    }
+                    #[cfg(debug_assertions)]
+                    if delivery.is_some()
+                        && let Some(delay) = crate::commands::blocking::test_woken_delay()
+                    {
+                        tokio::time::sleep(delay).await;
                     }
                     break delivery;
                 }
@@ -329,6 +335,7 @@ where
                             how == crate::commands::blocking::Unblock::Error;
                         waiter.interrupted.role_changed =
                             how == crate::commands::blocking::Unblock::RoleChange;
+                        unblockable = false;
                         break None;
                     }
                     Err(_) => unblockable = false,
@@ -339,6 +346,25 @@ where
     waiter
         .client_registry
         .set_blocked(waiter.client_id, None, false);
+    // A `CLIENT UNBLOCK` that took the client off the list just as its
+    // wait ended otherwise, woken say, was answered 1: it is done as it
+    // said. Taken as a wake-up, it was lost, and a client woken for
+    // nothing waited again for ever. It is sent under the list's lock
+    // (`ClientRegistry::unblock`), so by now it is in the channel.
+    let unblocked = if unblockable {
+        unblock_rx.try_recv().ok()
+    } else {
+        None
+    };
+    let delivery = match unblocked {
+        Some(how) => {
+            waiter.interrupted.unblocked_with_error =
+                how == crate::commands::blocking::Unblock::Error;
+            waiter.interrupted.role_changed = how == crate::commands::blocking::Unblock::RoleChange;
+            None
+        }
+        None => delivery,
+    };
     slot.hold_count(counted);
     // Woken, or unblocked otherwise, at the moment this node became a
     // replica: ended as the sweep ends it.
