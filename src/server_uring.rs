@@ -404,9 +404,11 @@ async fn park_blocking_uring(
         let (res, mut returned) = read_while_writing(
             write,
             watch,
-            carried,
-            carried_from,
-            held_elsewhere,
+            crate::server::ReadAhead {
+                carried,
+                carried_from,
+                held_elsewhere,
+            },
             activity,
             limit,
         )
@@ -688,9 +690,7 @@ async fn read_while_writing(
         &mut dyn std::future::Future<Output = tokio_uring::BufResult<(), Vec<u8>>>,
     >,
     watch: &PeerWatch,
-    carried: &mut Vec<u8>,
-    carried_from: usize,
-    held_elsewhere: usize,
+    read_ahead: crate::server::ReadAhead<'_>,
     activity: &crate::client_registry::Activity,
     mut limit: crate::server::HardLimit,
 ) -> tokio_uring::BufResult<(), Vec<u8>> {
@@ -699,14 +699,18 @@ async fn read_while_writing(
         tokio::select! {
             biased;
             written = &mut write => return written,
-            read = watch.read_into(carried), if reading => match read {
+            read = watch.read_into(read_ahead.carried), if reading => match read {
                 Ok(n) if n > 0 => {
                     crate::stats::TOTAL_NET_INPUT_BYTES
                         .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                     crate::stats::record_read();
                     activity.touch();
                     activity.note_read(n);
-                    if crate::server::carried_too_much(held_elsewhere, carried, carried_from)
+                    if crate::server::carried_too_much(
+                        read_ahead.held_elsewhere,
+                        read_ahead.carried,
+                        read_ahead.carried_from,
+                    )
                         || limit.over_after(n)
                     {
                         // SAFETY: the connection's descriptor, open while it runs.
@@ -3331,9 +3335,11 @@ pub async fn handle_client(
                                     Box::pin(read_while_writing(
                                         write,
                                         &peer_watch,
-                                        &mut carried,
-                                        carried_from,
-                                        parse_buf.len() - parse_start,
+                                        crate::server::ReadAhead {
+                                            carried: &mut carried,
+                                            carried_from,
+                                            held_elsewhere: parse_buf.len() - parse_start,
+                                        },
                                         &activity,
                                         limit,
                                     ))
@@ -3361,9 +3367,11 @@ pub async fn handle_client(
                     Box::pin(read_while_writing(
                         write,
                         &peer_watch,
-                        &mut carried,
-                        carried_from,
-                        parse_buf.len() - parse_start,
+                        crate::server::ReadAhead {
+                            carried: &mut carried,
+                            carried_from,
+                            held_elsewhere: parse_buf.len() - parse_start,
+                        },
                         &activity,
                         limit,
                     ))
@@ -3381,9 +3389,11 @@ pub async fn handle_client(
                     let write = Box::pin(read_while_writing(
                         write,
                         &peer_watch,
-                        &mut carried,
-                        carried_from,
-                        parse_buf.len() - parse_start,
+                        crate::server::ReadAhead {
+                            carried: &mut carried,
+                            carried_from,
+                            held_elsewhere: parse_buf.len() - parse_start,
+                        },
                         &activity,
                         limit,
                     ));

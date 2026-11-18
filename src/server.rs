@@ -214,9 +214,11 @@ where
                 read_while_writing(
                     flush,
                     waiter.reader,
-                    waiter.carried,
-                    waiter.carried_from,
-                    waiter.held_elsewhere,
+                    ReadAhead {
+                        carried: waiter.carried,
+                        carried_from: waiter.carried_from,
+                        held_elsewhere: waiter.held_elsewhere,
+                    },
                     waiter.kill_rx,
                     waiter.activity,
                     limit,
@@ -278,9 +280,11 @@ where
                     // picked — so the socket is looked at now.
                     if gone_by_now(
                         waiter.reader,
-                        waiter.carried,
-                        waiter.carried_from,
-                        waiter.held_elsewhere,
+                        ReadAhead {
+                            carried: waiter.carried,
+                            carried_from: waiter.carried_from,
+                            held_elsewhere: waiter.held_elsewhere,
+                        },
                         waiter.activity,
                         waiter.socket_fd,
                     ) {
@@ -367,6 +371,17 @@ where
     Ok(())
 }
 
+/// What a wait, or a write that keeps reading, holds of a client's input:
+/// `carried`, what has been read ahead for the parser; `carried_from`, the
+/// prefix of it already moved on into `buffer`; and `held_elsewhere`, the
+/// unread bytes `buffer` holds besides — what `carried_too_much` binds
+/// together (#869).
+pub(crate) struct ReadAhead<'a> {
+    pub(crate) carried: &'a mut Vec<u8>,
+    pub(crate) carried_from: usize,
+    pub(crate) held_elsewhere: usize,
+}
+
 /// Whether the client has gone, as far as its socket says now, without
 /// waiting for anything: asked of the kernel where there is a socket to ask
 /// (`socket_fd`), which knows before the runtime's reactor has taken the
@@ -374,9 +389,7 @@ where
 /// into `carried`, as the wait reads it, up to its end if that has arrived.
 fn gone_by_now<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
-    carried: &mut Vec<u8>,
-    carried_from: usize,
-    held_elsewhere: usize,
+    read_ahead: ReadAhead<'_>,
     activity: &crate::client_registry::Activity,
     socket_fd: Option<i32>,
 ) -> bool {
@@ -395,9 +408,13 @@ fn gone_by_now<R: tokio::io::AsyncRead + Unpin>(
                 let n = read.filled().len();
                 crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                 crate::stats::record_read();
-                carried.extend_from_slice(read.filled());
+                read_ahead.carried.extend_from_slice(read.filled());
                 activity.touch();
-                if carried_too_much(held_elsewhere, carried, carried_from) {
+                if carried_too_much(
+                    read_ahead.held_elsewhere,
+                    read_ahead.carried,
+                    read_ahead.carried_from,
+                ) {
                     return true;
                 }
             }
@@ -418,9 +435,7 @@ fn gone_by_now<R: tokio::io::AsyncRead + Unpin>(
 /// compiled as it was without it.
 fn until_gone<'a, R: tokio::io::AsyncRead + Unpin + Send>(
     reader: &'a mut R,
-    carried: &'a mut Vec<u8>,
-    carried_from: usize,
-    held_elsewhere: usize,
+    read_ahead: ReadAhead<'a>,
     kill_rx: &'a mut crate::client_registry::KillRx,
     activity: &'a crate::client_registry::Activity,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
@@ -432,9 +447,13 @@ fn until_gone<'a, R: tokio::io::AsyncRead + Unpin + Send>(
                     Ok(n) if n > 0 => {
                         crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                         crate::stats::record_read();
-                        carried.extend_from_slice(&temp[..n]);
+                        read_ahead.carried.extend_from_slice(&temp[..n]);
                         activity.touch();
-                        if carried_too_much(held_elsewhere, carried, carried_from) {
+                        if carried_too_much(
+                            read_ahead.held_elsewhere,
+                            read_ahead.carried,
+                            read_ahead.carried_from,
+                        ) {
                             return;
                         }
                     }
@@ -461,9 +480,7 @@ fn read_while_writing<'a, R: tokio::io::AsyncRead + Unpin + Send>(
         &'a mut (dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a),
     >,
     reader: &'a mut R,
-    carried: &'a mut Vec<u8>,
-    carried_from: usize,
-    held_elsewhere: usize,
+    read_ahead: ReadAhead<'a>,
     kill_rx: &'a mut crate::client_registry::KillRx,
     activity: &'a crate::client_registry::Activity,
     mut limit: HardLimit,
@@ -478,10 +495,14 @@ fn read_while_writing<'a, R: tokio::io::AsyncRead + Unpin + Send>(
                     Ok(n) if n > 0 => {
                         crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                         crate::stats::record_read();
-                        carried.extend_from_slice(&temp[..n]);
+                        read_ahead.carried.extend_from_slice(&temp[..n]);
                         activity.touch();
                         activity.note_read(n);
-                        if carried_too_much(held_elsewhere, carried, carried_from) {
+                        if carried_too_much(
+                            read_ahead.held_elsewhere,
+                            read_ahead.carried,
+                            read_ahead.carried_from,
+                        ) {
                             return Err(std::io::Error::other("client-query-buffer-limit"));
                         }
                         if limit.over_after(n) {
@@ -1247,9 +1268,11 @@ where
                     || {
                         until_gone(
                             &mut reader,
-                            &mut carried,
-                            carried_from,
-                            buffer_len - read_start,
+                            ReadAhead {
+                                carried: &mut carried,
+                                carried_from,
+                                held_elsewhere: buffer_len - read_start,
+                            },
                             &mut kill_rx,
                             &activity,
                         )
@@ -1262,9 +1285,11 @@ where
                         if blocking_slot.resuming()
                             && gone_by_now(
                                 &mut reader,
-                                &mut carried,
-                                carried_from,
-                                buffer_len - read_start,
+                                ReadAhead {
+                                    carried: &mut carried,
+                                    carried_from,
+                                    held_elsewhere: buffer_len - read_start,
+                                },
                                 &activity,
                                 socket_fd,
                             ) =>
@@ -2681,9 +2706,11 @@ where
                             } => Some(reply),
                             () = until_gone(
                                 &mut reader,
-                                &mut carried,
-                                carried_from,
-                                buffer_len - read_start,
+                                ReadAhead {
+                                    carried: &mut carried,
+                                    carried_from,
+                                    held_elsewhere: buffer_len - read_start,
+                                },
                                 &mut kill_rx,
                                 &activity,
                             ) => None,
@@ -2741,9 +2768,11 @@ where
                                 ) => Some(reply),
                                 () = until_gone(
                                     &mut reader,
-                                    &mut carried,
-                                    carried_from,
-                                    buffer_len - read_start,
+                                    ReadAhead {
+                                        carried: &mut carried,
+                                        carried_from,
+                                        held_elsewhere: buffer_len - read_start,
+                                    },
                                     &mut kill_rx,
                                     &activity,
                                 ) => None,
@@ -3142,9 +3171,11 @@ where
                         read_while_writing(
                             write,
                             &mut reader,
-                            &mut carried,
-                            carried_from,
-                            buffer.len() - read_start,
+                            ReadAhead {
+                                carried: &mut carried,
+                                carried_from,
+                                held_elsewhere: buffer.len() - read_start,
+                            },
                             &mut kill_rx,
                             &activity,
                             limit,
@@ -3164,9 +3195,11 @@ where
                 let write = read_while_writing(
                     write,
                     &mut reader,
-                    &mut carried,
-                    carried_from,
-                    buffer.len() - read_start,
+                    ReadAhead {
+                        carried: &mut carried,
+                        carried_from,
+                        held_elsewhere: buffer.len() - read_start,
+                    },
                     &mut kill_rx,
                     &activity,
                     limit,
