@@ -2064,6 +2064,10 @@ impl Config {
                                 | "hash-max-ziplist-entries"
                                 | "hash-max-listpack-value"
                                 | "hash-max-ziplist-value"
+                                | "zset-max-listpack-entries"
+                                | "zset-max-ziplist-entries"
+                                | "zset-max-listpack-value"
+                                | "zset-max-ziplist-value"
                                 | "rdbchecksum"
                                 | "rdbcompression"
                         ) || crate::commands::server::remembered_config(key).is_none() => {}
@@ -2424,7 +2428,7 @@ mod config_file_tests {
         #[cfg(not(feature = "lua"))]
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         let (_, warnings) = load(
-            "maxclients 10000\nlatency-tracking yes\nzset-max-listpack-entries 128\n\
+            "maxclients 10000\nlatency-tracking yes\nlist-compress-depth 0\n\
              proto-max-bulk-len 512mb\nlatency-monitor-threshold 0\nacllog-max-len 128\n",
         )
         .unwrap();
@@ -2433,9 +2437,13 @@ mod config_file_tests {
         // #232), and acllog-max-len, which the ACL log goes by.
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
-            warnings[0].contains("'zset-max-listpack-entries'"),
+            warnings[0].contains("'list-compress-depth'"),
             "{warnings:?}"
         );
+        // The sorted sets' limits are in effect: no warning.
+        let (_, warnings) =
+            load("zset-max-listpack-entries 128\nzset-max-ziplist-value 64\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
         let err = load("maxclients 0\n").unwrap_err();
         assert!(err.contains("maxclients"), "{err}");
         let err = load("array-slice-size 300\n").unwrap_err();

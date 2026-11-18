@@ -1253,8 +1253,7 @@ pub fn parse_mpop(
     use crate::resp::write::resp_error;
     let num_keys =
         cmd.get(at)
-            .and_then(|raw| std::str::from_utf8(raw).ok())
-            .and_then(|s| s.parse::<i64>().ok())
+            .and_then(|raw| crate::member_set::canonical_i64(raw))
             .filter(|n| *n > 0)
             .ok_or_else(|| resp_error("ERR numkeys should be greater than 0"))? as usize;
     let which = at + 1 + num_keys;
@@ -1270,9 +1269,7 @@ pub fn parse_mpop(
     };
     let count = match &cmd[which + 1..] {
         [] => 1,
-        [option, n] if option.eq_ignore_ascii_case(b"COUNT") => std::str::from_utf8(n)
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
+        [option, n] if option.eq_ignore_ascii_case(b"COUNT") => crate::member_set::canonical_i64(n)
             .filter(|n| *n > 0)
             .ok_or_else(|| resp_error("ERR count should be greater than 0"))?
             as usize,

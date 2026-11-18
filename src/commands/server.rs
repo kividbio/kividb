@@ -377,6 +377,15 @@ fn function_without_lua(ctx: &Ctx) -> Vec<u8> {
     resp_error(NO_LUA)
 }
 
+/// A limit of how much one block of a small collection holds set past
+/// what a block can hold: taken as the most it can, and said once, at the
+/// set (from `CONFIG SET`, the config file or the command line).
+fn warn_clamped(param: &str, asked: usize, kept: usize) {
+    if asked > kept {
+        log_warn!("{param} {asked} is more than one block holds: {kept} is used (the maximum)");
+    }
+}
+
 /// A setting's own name, for one Redis also takes under an older one.
 fn config_name(name: &str) -> &str {
     match name {
@@ -1362,6 +1371,7 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                             }
                             _ => crate::member_set::set_packed_value(limit),
                         };
+                        warn_clamped(&param, limit, kept);
                         REMEMBERED_CONFIG
                             .lock()
                             .insert(param.clone(), kept.to_string());
@@ -1395,10 +1405,51 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                         } else {
                             crate::hash_fields::set_packed_value(limit)
                         };
+                        warn_clamped(&param, limit, kept);
                         let names = if entries {
                             ["hash-max-listpack-entries", "hash-max-ziplist-entries"]
                         } else {
                             ["hash-max-listpack-value", "hash-max-ziplist-value"]
+                        };
+                        let mut remembered = REMEMBERED_CONFIG.lock();
+                        for name in names {
+                            remembered.insert(name.to_string(), kept.to_string());
+                        }
+                        Some(resp_simple("OK"))
+                    }
+                    Some(_) => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                         '{param}') - argument must be between 0 and \
+                         9223372036854775807 inclusive",
+                    ))),
+                    None => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                         '{param}') - argument couldn't be parsed into an integer",
+                    ))),
+                }
+            }
+            // The most members, and the longest member, a sorted set keeps
+            // in one block: no more than a block holds, and `CONFIG GET`
+            // says what was kept, under the name and its older `ziplist`
+            // one alike, as Redis has them as one setting.
+            "zset-max-listpack-entries"
+            | "zset-max-ziplist-entries"
+            | "zset-max-listpack-value"
+            | "zset-max-ziplist-value" => {
+                match crate::member_set::canonical_i64(value.as_bytes()) {
+                    Some(limit) if limit >= 0 => {
+                        let limit = limit as usize;
+                        let entries = param.ends_with("-entries");
+                        let kept = if entries {
+                            crate::sorted_set::set_packed_entries(limit)
+                        } else {
+                            crate::sorted_set::set_packed_value(limit)
+                        };
+                        warn_clamped(&param, limit, kept);
+                        let names = if entries {
+                            ["zset-max-listpack-entries", "zset-max-ziplist-entries"]
+                        } else {
+                            ["zset-max-listpack-value", "zset-max-ziplist-value"]
                         };
                         let mut remembered = REMEMBERED_CONFIG.lock();
                         for name in names {
@@ -2082,10 +2133,6 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             ("list-max-listpack-size", "-2"),
             ("list-max-ziplist-size", "-2"),
             ("list-compress-depth", "0"),
-            ("zset-max-listpack-entries", "128"),
-            ("zset-max-listpack-value", "64"),
-            ("zset-max-ziplist-entries", "128"),
-            ("zset-max-ziplist-value", "64"),
             ("hll-sparse-max-bytes", "3000"),
             ("proto-max-bulk-len", "536870912"),
             ("client-query-buffer-limit", "1073741824"),
@@ -2142,6 +2189,22 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             (
                 "hash-max-ziplist-value".to_string(),
                 crate::hash_fields::DEFAULT_PACKED_VALUE.to_string(),
+            ),
+            (
+                "zset-max-listpack-entries".to_string(),
+                crate::sorted_set::DEFAULT_PACKED_ENTRIES.to_string(),
+            ),
+            (
+                "zset-max-ziplist-entries".to_string(),
+                crate::sorted_set::DEFAULT_PACKED_ENTRIES.to_string(),
+            ),
+            (
+                "zset-max-listpack-value".to_string(),
+                crate::sorted_set::DEFAULT_PACKED_VALUE.to_string(),
+            ),
+            (
+                "zset-max-ziplist-value".to_string(),
+                crate::sorted_set::DEFAULT_PACKED_VALUE.to_string(),
             ),
         ])
         .collect(),

@@ -139,7 +139,8 @@ pub fn effort(value: &KiviDBValue) -> u64 {
         // Redis counts an intset or a listpack.
         KiviDBValue::Set(set) => set.read().free_effort(),
         KiviDBValue::VectorSet(set) => set.read().entries.len(),
-        KiviDBValue::SortedSet(zset) => zset.read().len(),
+        // A block of entries (#297) is one allocation.
+        KiviDBValue::SortedSet(zset) => zset.read().free_effort(),
         KiviDBValue::Stream(stream) => {
             let stream = stream.read();
             // A stream loaded from disk has not recorded its nodes: take them

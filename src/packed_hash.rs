@@ -29,7 +29,7 @@
 //! past [`MAX_ENTRIES`], and bytes past what a `u16` offset reaches:
 //! whoever holds it then moves to a table.
 
-use crate::packed_set::{fingerprint, same};
+use crate::packed_set::{fingerprint, same, scan_fingerprints};
 
 /// The most fields a packed hash holds.
 pub const MAX_ENTRIES: usize = 512;
@@ -193,95 +193,18 @@ impl PackedHash {
         self.find(field).is_some()
     }
 
-    /// The scan, as a packed set's: the fingerprints take `cap` bytes, a
-    /// multiple of eight, and the offsets follow them, so a whole vector
-    /// (or word) is always there to be read; the places past the fields
-    /// are masked off. Up to sixteen fields, one vector; past that, sixty-four
-    /// fingerprints a step, four vectors' marks in one word.
+    /// The scan, as a packed set's ([`scan_fingerprints`]): the
+    /// fingerprints take `cap` bytes, a multiple of eight, and the offsets
+    /// follow them, at least `5 * cap + 2` bytes in all, so a vector from 0
+    /// is always there, and 64 bytes from any `i < n` once there are more
+    /// than 16 fields (a capacity of 32 or more).
     #[inline(always)]
     fn find_by(&self, field: &[u8], f: u8) -> Option<usize> {
         let n = self.len();
         let cap = self.cap as usize;
         debug_assert!(n <= cap && cap.is_multiple_of(8));
         let start = Self::head(cap);
-        #[cfg(target_arch = "x86_64")]
-        {
-            use std::arch::x86_64::{
-                __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
-            };
-            // The block is at least `5 * cap + 2` bytes (fingerprints and
-            // offsets): 16 bytes from 0 are in it for any capacity (8 or
-            // more), and 64 from any `i < n <= cap` once the capacity is 32
-            // or more, as it is for more than 16 fields.
-            let base = self.buf.as_ptr();
-            // SAFETY: SSE2 is part of x86-64; each load is within the
-            // block (asserted below for each case), and an unaligned load
-            // is what `loadu` is for.
-            let needle = unsafe { _mm_set1_epi8(f as i8) };
-            let marks_at = |i: usize| unsafe {
-                let chunk = _mm_loadu_si128(base.add(i).cast::<__m128i>());
-                _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, needle)) as u32
-            };
-            if n <= 16 {
-                assert!(self.buf.len() >= 16);
-                // Past the fields, nothing: no branch, `1 << 16` fits.
-                let mut marks = marks_at(0) & (1u32 << n).wrapping_sub(1);
-                while marks != 0 {
-                    let at = marks.trailing_zeros() as usize;
-                    if self.is_at(at, start, field) {
-                        return Some(at);
-                    }
-                    marks &= marks - 1;
-                }
-                return None;
-            }
-            assert!(self.buf.len() >= cap + 64);
-            let mut i = 0;
-            while i < n {
-                let mut marks = marks_at(i) as u64
-                    | (marks_at(i + 16) as u64) << 16
-                    | (marks_at(i + 32) as u64) << 32
-                    | (marks_at(i + 48) as u64) << 48;
-                if n - i < 64 {
-                    marks &= (1u64 << (n - i)) - 1;
-                }
-                while marks != 0 {
-                    let at = i + marks.trailing_zeros() as usize;
-                    if self.is_at(at, start, field) {
-                        return Some(at);
-                    }
-                    marks &= marks - 1;
-                }
-                i += 64;
-            }
-            None
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            const LOW: u64 = 0x0101_0101_0101_0101;
-            const HIGH: u64 = 0x8080_8080_8080_8080;
-            let pattern = LOW.wrapping_mul(f as u64);
-            let mut i = 0;
-            while i < n {
-                // A byte of `word` is zero where a fingerprint equals `f`.
-                // The test below marks every zero byte, and may mark a byte
-                // above one that is not: the full comparison settles it.
-                let word = u64::from_le_bytes(self.buf[i..i + 8].try_into().unwrap()) ^ pattern;
-                let mut marks = word.wrapping_sub(LOW) & !word & HIGH;
-                if n - i < 8 {
-                    marks &= (1u64 << ((n - i) * 8)) - 1;
-                }
-                while marks != 0 {
-                    let at = i + (marks.trailing_zeros() as usize >> 3);
-                    if self.is_at(at, start, field) {
-                        return Some(at);
-                    }
-                    marks &= marks - 1;
-                }
-                i += 8;
-            }
-            None
-        }
+        scan_fingerprints(&self.buf, n, f, |at| self.is_at(at, start, field))
     }
 
     /// Whether field `at` is `field`: the length first, from the field's
