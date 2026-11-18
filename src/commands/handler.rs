@@ -3383,8 +3383,7 @@ mod replica_loading_gate_tests {
     fn run_as_slave(repl_state: &Arc<ReplState>, cmd: Vec<Vec<u8>>, apply_stream: bool) -> Vec<u8> {
         let store = crate::store::new_store(1);
         let lastsave = Arc::new(RwLock::new(0i64));
-        let (hub_tx, mut hub_rx) =
-            crate::replication::HubTx::channel();
+        let (hub_tx, mut hub_rx) = crate::replication::HubTx::channel();
         tokio::spawn(async move { while hub_rx.recv().await.is_some() {} });
 
         let config = Arc::new(Config::default_replica());

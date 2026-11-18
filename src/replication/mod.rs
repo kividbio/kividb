@@ -2785,6 +2785,7 @@ pub struct HubTx {
 }
 
 /// [`HubTx`] that does not keep the hub alive.
+#[derive(Debug)]
 pub struct WeakHubTx {
     tx: mpsc::WeakUnboundedSender<HubMsg>,
     writes: std::sync::Weak<WriteRuns>,
@@ -2927,6 +2928,142 @@ impl HubRx {
     }
 }
 
+#[cfg(test)]
+mod write_run_tests {
+    use super::{HubMsg, HubTx};
+
+    /// What the hub's end is handed, in order: each run as its bytes,
+    /// each other message as the number a `Deregister` carries.
+    #[derive(Debug, PartialEq)]
+    enum Got {
+        Writes(Vec<u8>),
+        Message(u64),
+    }
+
+    fn take_all(rx: &mut super::HubRx) -> Vec<Got> {
+        let mut got = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            got.push(match msg {
+                HubMsg::Propagate(bytes) => Got::Writes(bytes.to_vec()),
+                HubMsg::Deregister(n) => Got::Message(n),
+                _ => panic!("not sent"),
+            });
+        }
+        got
+    }
+
+    /// Writes in a row are one run; a message between them ends it, and
+    /// is handed over between the writes before it and those after.
+    #[test]
+    fn a_message_comes_between_the_writes_it_was_sent_between() {
+        let (tx, mut rx) = HubTx::channel();
+        super::propagate(&tx, b"a".to_vec());
+        super::propagate(&tx, b"b".to_vec());
+        tx.send(HubMsg::Deregister(1)).unwrap();
+        tx.send(HubMsg::Deregister(2)).unwrap();
+        super::propagate(&tx, b"c".to_vec());
+        tx.send(HubMsg::Deregister(3)).unwrap();
+        assert_eq!(
+            take_all(&mut rx),
+            [
+                Got::Writes(b"ab".to_vec()),
+                Got::Message(1),
+                Got::Message(2),
+                Got::Writes(b"c".to_vec()),
+                Got::Message(3),
+            ]
+        );
+        // A run taken is closed: the next write opens another.
+        super::propagate(&tx, b"d".to_vec());
+        super::propagate(&tx, b"e".to_vec());
+        assert_eq!(take_all(&mut rx), [Got::Writes(b"de".to_vec())]);
+        super::propagate(&tx, b"f".to_vec());
+        assert_eq!(take_all(&mut rx), [Got::Writes(b"f".to_vec())]);
+    }
+
+    /// Threads appending writes and sending messages at once: each thread's
+    /// writes and messages are handed over in the order it made them, each
+    /// once. That is what keeps the stream in the order writes took effect:
+    /// two writes to one key are appended one after the other, holding the
+    /// key's order (`write_order`), as they were sent before.
+    #[test]
+    fn each_thread_is_handed_over_in_its_own_order_whatever_the_others_do() {
+        const THREADS: u64 = 4;
+        const EACH: u64 = 20_000;
+        let (tx, mut rx) = HubTx::channel();
+        let threads: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    for i in 0..EACH {
+                        if i % 97 == 0 {
+                            tx.send(HubMsg::Deregister((t << 32) | i)).unwrap();
+                        } else {
+                            super::propagate(&tx, format!("{t}:{i};").into_bytes());
+                        }
+                    }
+                })
+            })
+            .collect();
+        let mut next = [0u64; THREADS as usize];
+        let mut seen = |t: u64, i: u64| {
+            assert_eq!(next[t as usize], i, "thread {t} out of order");
+            next[t as usize] += 1;
+        };
+        let mut done = false;
+        while !done {
+            done = threads.iter().all(|t| t.is_finished());
+            for got in take_all(&mut rx) {
+                match got {
+                    Got::Message(n) => seen(n >> 32, n & 0xffff_ffff),
+                    Got::Writes(bytes) => {
+                        let text = String::from_utf8(bytes).unwrap();
+                        for write in text.split_terminator(';') {
+                            let (t, i) = write.split_once(':').unwrap();
+                            seen(t.parse().unwrap(), i.parse().unwrap());
+                        }
+                    }
+                }
+            }
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        for got in take_all(&mut rx) {
+            panic!("left over: {got:?}");
+        }
+        assert_eq!(next, [EACH; THREADS as usize]);
+    }
+
+    /// The memory kept for runs once they are taken is bounded.
+    #[test]
+    fn emptied_runs_are_kept_only_up_to_a_bound() {
+        let (tx, mut rx) = HubTx::channel();
+        for _ in 0..10 {
+            super::propagate(&tx, vec![0u8; super::SPARE_RUN_CAPACITY * 2]);
+            tx.send(HubMsg::Deregister(0)).unwrap();
+            super::propagate(&tx, vec![0u8; 100]);
+            tx.send(HubMsg::Deregister(0)).unwrap();
+        }
+        // Taken by the hub, which gives them back.
+        while let Ok(msg) = rx.rx.try_recv() {
+            if let HubMsg::Writes = msg {
+                let run = rx.writes.take().unwrap();
+                rx.writes.give_back(run);
+            }
+        }
+        let queue = tx.writes.queue.lock();
+        assert!(queue.runs.is_empty());
+        assert!(queue.spare.len() <= super::SPARE_RUNS);
+        assert!(
+            queue
+                .spare
+                .iter()
+                .all(|run| run.is_empty() && run.capacity() <= super::SPARE_RUN_CAPACITY)
+        );
+    }
+}
+
 /// Spawn the replication hub task. Returns the sender used to
 /// register replicas and to propagate write commands.
 ///
@@ -2950,7 +3087,13 @@ impl HubRx {
 /// them for replicas already attached. The master logs how far each
 /// replica's queue went during its sync.
 pub fn start_hub(state: Arc<ReplState>) -> HubTx {
-    let (hub_tx, HubRx { rx: mut hub_rx, writes }) = HubTx::channel();
+    let (
+        hub_tx,
+        HubRx {
+            rx: mut hub_rx,
+            writes,
+        },
+    ) = HubTx::channel();
     let _ = state.hub.set(hub_tx.downgrade());
     // For the heartbeat, which the hub sends to itself. Weak, so that the hub
     // still ends when every real sender is gone.
@@ -5748,6 +5891,13 @@ mod replication_invariants_tests {
         assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 0);
     }
 
+    /// A write as a payload of its own, as one alone in its run of writes
+    /// is: for the tests that count what each payload holds in a replica's
+    /// queue.
+    fn write_alone(hub: &super::HubTx, write: Vec<u8>) {
+        hub.send(HubMsg::Propagate(Arc::from(write))).unwrap();
+    }
+
     async fn barrier(hub: &super::HubTx) {
         let (done, wait) = tokio::sync::oneshot::channel();
         hub.send(HubMsg::Barrier(done)).unwrap();
@@ -5793,7 +5943,7 @@ mod replication_invariants_tests {
 
         // 500 bytes while it loads: over the streaming limit, under the sync's.
         for _ in 0..10 {
-            propagate(&hub, vec![0u8; 50]);
+            write_alone(&hub, vec![0u8; 50]);
         }
         barrier(&hub).await;
         assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
@@ -5813,12 +5963,12 @@ mod replication_invariants_tests {
         assert_eq!((pending.bytes(), pending.held()), (0, 0));
         // The next write finds it streaming (its queue is a quarter of the
         // streaming limit or less)...
-        propagate(&hub, vec![0u8; 20]);
+        write_alone(&hub, vec![0u8; 20]);
         barrier(&hub).await;
         assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
         // ...and from then on the streaming limit holds.
         for _ in 0..3 {
-            propagate(&hub, vec![0u8; 50]);
+            write_alone(&hub, vec![0u8; 50]);
         }
         await_connected(&state, 0).await;
     }
@@ -5854,7 +6004,7 @@ mod replication_invariants_tests {
         let mut rx = register_syncing(&hub, 9010, &pending);
         await_connected(&state, 1).await;
         for _ in 0..20 {
-            propagate(&hub, vec![0u8; 50]);
+            write_alone(&hub, vec![0u8; 50]);
         }
         barrier(&hub).await;
         // Loaded; 200 of the 1000 bytes left to drain.
@@ -5870,25 +6020,25 @@ mod replication_invariants_tests {
         // Streaming again from this write (220 bytes, under a quarter of
         // 1000), over the soft limit from the next, and for longer than its
         // seconds: still there.
-        propagate(&hub, vec![0u8; 20]);
-        propagate(&hub, vec![0u8; 20]);
+        write_alone(&hub, vec![0u8; 20]);
+        write_alone(&hub, vec![0u8; 20]);
         barrier(&hub).await;
         tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
-        propagate(&hub, vec![0u8; 20]);
+        write_alone(&hub, vec![0u8; 20]);
         barrier(&hub).await;
         assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
 
         // Drained once: from now on, over the soft limit for longer than its
         // seconds and it is dropped.
         drain(&mut rx, &pending);
-        propagate(&hub, vec![0u8; 20]);
+        write_alone(&hub, vec![0u8; 20]);
         for _ in 0..3 {
-            propagate(&hub, vec![0u8; 50]);
+            write_alone(&hub, vec![0u8; 50]);
         }
         barrier(&hub).await;
         assert_eq!(state.connected_replicas.load(Ordering::Relaxed), 1);
         tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
-        propagate(&hub, vec![0u8; 50]);
+        write_alone(&hub, vec![0u8; 50]);
         await_connected(&state, 0).await;
         assert!(pending.abandoned());
     }
@@ -6007,7 +6157,7 @@ mod replication_invariants_tests {
         let rx = QueueRx::new(register_syncing(&hub, 9007, &pending), Arc::clone(&pending));
         await_connected(&state, 1).await;
         for _ in 0..21 {
-            propagate(&hub, vec![0u8; 50]);
+            write_alone(&hub, vec![0u8; 50]);
         }
         await_connected(&state, 0).await;
         assert!(pending.abandoned());

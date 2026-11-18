@@ -2204,8 +2204,7 @@ impl ReplicationApplyEnv {
     /// own AOF, and their client-visible side effects go to the server's real
     /// hubs (see [`ReplicaStarter`]).
     fn new(starter: &ReplicaStarter) -> Self {
-        let (discard_hub_tx, mut hub_rx) =
-            crate::replication::HubTx::channel();
+        let (discard_hub_tx, mut hub_rx) = crate::replication::HubTx::channel();
         tokio::spawn(async move { while hub_rx.recv().await.is_some() {} });
         let mut env = Self::with_hub(
             discard_hub_tx,
@@ -2227,8 +2226,7 @@ impl ReplicationApplyEnv {
     /// entirely outside) the runtime that `new` needs for its drain task, so it
     /// keeps the receiver instead of spawning a consumer for it.
     pub(crate) fn new_inert() -> Self {
-        let (discard_hub_tx, hub_rx) =
-            crate::replication::HubTx::channel();
+        let (discard_hub_tx, hub_rx) = crate::replication::HubTx::channel();
         Self::with_hub(
             discard_hub_tx,
             Some(hub_rx),

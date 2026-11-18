@@ -1087,8 +1087,6 @@ mod propagation_tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use tokio::sync::mpsc;
-
     use crate::replication::replica_client::{ReplicationApplyEnv, run_as_client};
     use crate::replication::{HubMsg, HubTx, ReplState};
     use crate::store::{self, Store, ValueRef};

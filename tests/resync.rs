@@ -3860,3 +3860,256 @@ fn a_released_entry_and_a_delivered_one_digest_apart() {
     );
     assert_ne!(digest_of(&mut c, "b"), before);
 }
+
+// ── The stream under a mixed load from every worker (#894) ───────────────────
+
+const MIXED_KEYS: usize = 48;
+const MIXED_COUNTERS: usize = 8;
+
+/// One writer of [`mixed_writes_reach_replicas_as_they_took_effect`]: a
+/// connection that sends, 32 at a time, writes drawn by `seed` over keys
+/// every writer shares: `SET`, `INCR`, `APPEND`, `LPUSH`, `DEL`, `EXPIRE`
+/// (far enough out that nothing expires in the test), transactions, and,
+/// with `scripts`, scripts of keys with a hash tag and without. `cnt:<n>`
+/// keys are only ever incremented: what it returns is how many increments
+/// of each were answered.
+fn mixed_writer(
+    port: u16,
+    seed: u64,
+    scripts: bool,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<Vec<u64>> {
+    use rand::{Rng, SeedableRng};
+    const SCRIPT: &str = "redis.call('APPEND', KEYS[1], ARGV[1]) \
+                          redis.call('LPUSH', KEYS[2], ARGV[1]) \
+                          return redis.call('INCR', KEYS[3])";
+    std::thread::spawn(move || {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut c = Conn::connect(port);
+        let mut acked = vec![0u64; MIXED_COUNTERS];
+        let mut n = 0u64;
+        while !stop.load(Ordering::Relaxed) {
+            // Each command, and the counter its answer adds to, if any.
+            let mut batch: Vec<(Vec<String>, Option<usize>)> = Vec::new();
+            for _ in 0..32 {
+                n += 1;
+                let item = format!("{seed}-{n}");
+                let k = rng.gen_range(0..MIXED_KEYS);
+                let any = match rng.gen_range(0..4) {
+                    0 => format!("s:{k}"),
+                    1 => format!("l:{k}"),
+                    2 => format!("n:{k}"),
+                    _ => format!("{{t{}}}:s", k % 4),
+                };
+                let mut one = |args: &[&str], counter: Option<usize>| {
+                    batch.push((args.iter().map(|a| a.to_string()).collect(), counter));
+                };
+                match rng.gen_range(0..100) {
+                    0..=19 => one(&["SET", &format!("s:{k}"), &item], None),
+                    20..=34 => one(&["INCR", &format!("n:{k}")], None),
+                    35..=49 => one(&["APPEND", &format!("s:{k}"), &item], None),
+                    50..=64 => one(&["LPUSH", &format!("l:{k}"), &item], None),
+                    65..=69 => one(&["DEL", &any], None),
+                    70..=74 => {
+                        let secs = (100_000 + rng.gen_range(0..100_000)).to_string();
+                        one(&["EXPIRE", &any, &secs], None)
+                    }
+                    75..=84 => {
+                        let counter = rng.gen_range(0..MIXED_COUNTERS);
+                        one(&["INCR", &format!("cnt:{counter}")], Some(counter))
+                    }
+                    85..=92 => {
+                        // A transaction: its increment of a counter counts
+                        // once its EXEC is answered with the results.
+                        let counter = rng.gen_range(0..MIXED_COUNTERS);
+                        let other = rng.gen_range(0..MIXED_KEYS);
+                        one(&["MULTI"], None);
+                        one(&["APPEND", &format!("s:{k}"), &item], None);
+                        one(&["LPUSH", &format!("l:{other}"), &item], None);
+                        one(&["INCR", &format!("cnt:{counter}")], None);
+                        one(&["EXEC"], Some(counter));
+                    }
+                    _ if scripts => {
+                        let tag = if rng.gen_bool(0.5) {
+                            format!("{{t{}}}:", k % 4)
+                        } else {
+                            String::new()
+                        };
+                        let (s, l, i) = (
+                            format!("{tag}s:{k}"),
+                            format!("{tag}l:{k}"),
+                            format!("{tag}n:{k}"),
+                        );
+                        one(&["EVAL", SCRIPT, "3", &s, &l, &i, &item], None)
+                    }
+                    _ => one(&["SET", &format!("s:{k}"), &item], None),
+                }
+            }
+            let mut buf = Vec::new();
+            for (args, _) in &batch {
+                buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+                for a in args {
+                    buf.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
+                }
+            }
+            if c.writer.write_all(&buf).is_err() {
+                break;
+            }
+            for (_, counter) in &batch {
+                match c.read() {
+                    V::Int(_) => {
+                        if let Some(counter) = counter {
+                            acked[*counter] += 1;
+                        }
+                    }
+                    V::Arr(results) => {
+                        if let Some(counter) = counter {
+                            assert!(
+                                matches!(results.last(), Some(V::Int(_))),
+                                "a transaction's INCR failed: {results:?}"
+                            );
+                            acked[*counter] += 1;
+                        }
+                    }
+                    // A key of one kind written as another (an APPEND to
+                    // a key a script made a list, say): an answer like any
+                    // other, and no write.
+                    V::Err(e) => assert!(e.starts_with("WRONGTYPE"), "{e}"),
+                    V::Str(_) | V::Nil => {}
+                }
+            }
+        }
+        acked
+    })
+}
+
+/// Every key the master has, with its value digest, type and expiry time,
+/// the same on the replica, which has no key more; and each `cnt:<n>` at
+/// exactly the increments answered, on both.
+fn assert_same_keys(master: &mut Conn, replica: &mut Conn, acked: &[u64], what: &str) {
+    assert_same_dataset(master, replica);
+    let mut keys: Vec<String> = master
+        .cmd(&["KEYS", "*"])
+        .arr()
+        .iter()
+        .map(|k| k.s().to_string())
+        .collect();
+    keys.sort();
+    for key in &keys {
+        for probe in [
+            &["DEBUG", "DIGEST-VALUE", key][..],
+            &["PEXPIRETIME", key],
+            &["TYPE", key],
+        ] {
+            assert_eq!(master.cmd(probe), replica.cmd(probe), "{what}: {probe:?}");
+        }
+    }
+    for (n, count) in acked.iter().enumerate() {
+        let key = format!("cnt:{n}");
+        for (side, c) in [("master", &mut *master), ("replica", &mut *replica)] {
+            let held = match c.cmd(&["GET", &key]) {
+                V::Nil => 0,
+                v => v.s().parse::<u64>().unwrap(),
+            };
+            assert_eq!(held, *count, "{what}: {key} on the {side}");
+        }
+    }
+}
+
+/// Clients on every worker writing overlapping keys at full speed, in
+/// commands, transactions and scripts: the stream a replica reads must be
+/// the order the writes took effect in, whatever moment it attaches at.
+/// Each round: a replica whose link is cut and continued (a partial resync)
+/// at a random moment of the load, and another attached (a full sync) or
+/// let go of at another; and every fifth, with the writers stopped, the
+/// master shut down and started again, and its replica continued. After
+/// each, every key the same on the master and its replicas, and the
+/// counters at the increments answered. Draws are seeded by the round; how
+/// they fall against the server's threads is not. `KIVIDB_TEST_ROUNDS` sets
+/// the rounds (#894: 100 on a D8s_v5).
+fn mixed_writes_reach_replicas_as_they_took_effect(model: &str) {
+    use rand::{Rng, SeedableRng};
+    let io = ["--io-model", model];
+    let mut master = Server::start(&[&io[..], &["--repl-backlog-size", "268435456"]].concat());
+    let scripts = !matches!(master.conn().cmd(&["EVAL", "return 1", "0"]), V::Err(_));
+    let relay = Relay::to(master.port);
+    let relayed = relay.port.to_string();
+    let follower = Server::start(&[&io[..], &["--replicaof", "127.0.0.1", &relayed]].concat());
+    let mut f = follower.conn();
+    wait_link_up(&mut f);
+    let mut late: Option<Server> = None;
+    let mut acked = vec![0u64; MIXED_COUNTERS];
+    for round in 0..rounds(4) {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x894 + round as u64);
+        let stop = Arc::new(AtomicBool::new(false));
+        let writers: Vec<_> = (0..6u64)
+            .map(|w| {
+                let seed = ((round as u64) << 8) | w;
+                mixed_writer(master.port, seed, scripts, Arc::clone(&stop))
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(rng.gen_range(20..200)));
+        relay.cut();
+        std::thread::sleep(Duration::from_millis(rng.gen_range(0..100)));
+        relay.restore();
+        std::thread::sleep(Duration::from_millis(rng.gen_range(0..200)));
+        match late.take() {
+            Some(gone) => drop(gone),
+            None => {
+                let port = master.port.to_string();
+                late = Some(Server::start(
+                    &[&io[..], &["--replicaof", "127.0.0.1", &port]].concat(),
+                ));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(rng.gen_range(50..300)));
+        stop.store(true, Ordering::Relaxed);
+        for w in writers {
+            for (total, n) in acked.iter_mut().zip(w.join().unwrap()) {
+                *total += n;
+            }
+        }
+        assert!(
+            acked.iter().sum::<u64>() > 0,
+            "round {round}: nothing answered"
+        );
+        let mut m = master.conn();
+        wait_link_up(&mut f);
+        assert_same_keys(&mut m, &mut f, &acked, &format!("round {round}, continued"));
+        if let Some(late) = &late {
+            let mut l = late.conn();
+            wait_link_up(&mut l);
+            assert_same_keys(&mut m, &mut l, &acked, &format!("round {round}, attached"));
+        }
+        if round % 5 == 4 {
+            drop(late.take());
+            drop(m);
+            master.shutdown();
+            if master.restart() {
+                relay.retarget(master.port);
+            }
+            relay.cut();
+            relay.restore();
+            wait_link_up(&mut f);
+            let mut m = master.conn();
+            assert_same_keys(&mut m, &mut f, &acked, &format!("round {round}, restarted"));
+        }
+    }
+    assert_eq!(
+        master.conn().stat("sync_partial_err"),
+        0,
+        "a continuation was refused:\n{}",
+        master.log()
+    );
+}
+
+#[test]
+fn mixed_writes_reach_replicas_as_they_took_effect_on_tokio() {
+    mixed_writes_reach_replicas_as_they_took_effect("tokio");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mixed_writes_reach_replicas_as_they_took_effect_on_io_uring() {
+    mixed_writes_reach_replicas_as_they_took_effect("uring");
+}

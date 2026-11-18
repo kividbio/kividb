@@ -503,8 +503,6 @@ mod propagation_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    use tokio::sync::mpsc;
-
     use crate::commands::helpers::{
         ExpireCursor, active_expire_cycle, delete_key_if_expired, expire_on_read, is_expired,
         now_ms,
