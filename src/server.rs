@@ -953,6 +953,12 @@ where
     // a blocking command's wait was cut short.
     let mut carried: Vec<u8> = Vec::new();
     let mut carried_from = 0usize;
+    // Bytes at `buffer`'s end not yet offered to the parser: `carried`'s
+    // vector is handed to `buffer` whole when it is replayed — the same
+    // bytes stay in the one allocation rather than being copied a chunk a
+    // turn into a second, doubling, one — and a read's worth is offered a
+    // turn, as a chunk moved a turn was (#865).
+    let mut unpresented = 0usize;
     let mut interrupted = crate::commands::blocking::Interrupted::default();
 
     // After a `SHUTDOWN` that failed: what follows it in the buffer is read
@@ -966,7 +972,7 @@ where
         // again — `buffer` would reserve a request's full length while
         // `carried` still holds it, and the client would keep the two (#869).
         let mut fed_from_carried = false;
-        if carried.is_empty() && !skip_read {
+        if unpresented == 0 && carried.is_empty() && !skip_read {
             // Redis reclaims private query buffers from its client cron, and the
             // maintenance step below is the equivalent. It can only do anything
             // when the buffer is private and has spare capacity to reclaim, so
@@ -1062,22 +1068,41 @@ where
             crate::stats::record_read();
             activity.note_read(n);
             buffer.extend_from_slice(&temp[..n]);
+        } else if unpresented > 0 {
+            // What `carried`'s vector was handed over as is offered on, a
+            // read's worth a turn.
+            fed_from_carried = true;
+            unpresented = unpresented.saturating_sub(temp.len());
         } else if !carried.is_empty() {
             // A read's worth a turn, as the socket would have given it: what
             // one turn runs, and so the replies the output limit looks at
             // after it, is no more than a read brings (#865).
             fed_from_carried = true;
-            let to = carried.len().min(carried_from + temp.len());
-            buffer.extend_from_slice(&carried[carried_from..to]);
-            carried_from = to;
-            if carried_from == carried.len() {
-                carried = Vec::new();
+            if read_start == buffer.len() {
+                // `carried`'s whole vector becomes the buffer when nothing
+                // of the buffer's is still to run: the read ahead is then
+                // replayed out of the allocation it was read into, rather
+                // than copied a chunk a turn into a second one that doubles
+                // its way up while `carried` still holds the same bytes.
+                std::mem::swap(&mut buffer, &mut carried);
+                read_start = carried_from;
+                carried.clear();
                 carried_from = 0;
-            } else if carried_from > carried.len() / 2 {
-                // What was moved out of `carried` is given back — capacity
-                // with it — in steps, rather than at the end (#869).
-                carried = carried.split_off(carried_from);
-                carried_from = 0;
+                unpresented = (buffer.len() - read_start).saturating_sub(temp.len());
+            } else {
+                let to = carried.len().min(carried_from + temp.len());
+                buffer.extend_from_slice(&carried[carried_from..to]);
+                carried_from = to;
+                if carried_from == carried.len() {
+                    carried = Vec::new();
+                    carried_from = 0;
+                } else if carried_from > carried.len() / 2 {
+                    // What was moved out of `carried` is given back —
+                    // capacity with it — in steps, rather than at the end
+                    // (#869).
+                    carried = carried.split_off(carried_from);
+                    carried_from = 0;
+                }
             }
         }
         query_buffer_peak = query_buffer_peak.max(buffer.len().saturating_sub(read_start));
@@ -1115,15 +1140,21 @@ where
         // `cmd` borrows `buffer` for the whole parse round: what it holds is
         // known only from here.
         let buffer_len = buffer.len();
+        // What was handed over from `carried` is offered a read's worth a
+        // turn: commands start only before `presented_end`, which a request
+        // that crosses it completes past — as one a read ends within did.
+        let presented_end = buffer.len() - unpresented;
         let was_private_query_buffer = private_query_buffer;
-        while let Some((consumed, cmd)) =
-            match progress.next_request(&mut buffer, parse_offset, authenticated_user.is_some()) {
-                Ok(request) => request,
-                Err(e) => {
-                    protocol_error = Some(e);
-                    None
+        while parse_offset < presented_end
+            && let Some((consumed, cmd)) =
+                match progress.next_request(&mut buffer, parse_offset, authenticated_user.is_some())
+                {
+                    Ok(request) => request,
+                    Err(e) => {
+                        protocol_error = Some(e);
+                        None
+                    }
                 }
-            }
         {
             private_query_buffer |= progress.take_private_query_buffer();
             if cmd.is_empty() {

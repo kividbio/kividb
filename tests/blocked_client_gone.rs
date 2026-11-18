@@ -1367,6 +1367,54 @@ fn what_a_waiting_client_holds_is_bounded_together() {
     }
 }
 
+/// What was read ahead is replayed out of the allocation it was read into:
+/// `carried`'s vector becomes the query buffer on release rather than the
+/// held bytes being copied a read a turn into a second, doubling, one.
+/// Parked again mid-replay, what the client then holds is about what it
+/// still has to run — with the copy, the moved part sat in a second vector
+/// on top of `carried`'s, and a client holding under a megabyte of requests
+/// showed close to two. (On io_uring a parked client is not read, so what
+/// was sent stays in the socket — there is no second allocation to show.)
+#[test]
+fn what_was_read_ahead_is_held_in_the_one_allocation() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        let name = format!("held-one-{io}");
+        let mut c = blocked_client(&server, &mut ctl, &name, &["BLPOP", "hold", "0"]);
+        let before = info_field(&mut ctl, "memory", "used_memory");
+
+        // Behind the `BLPOP`: a 300KB request, a `BLPOP` of another (still
+        // empty) list, and about 550KB more — under the limit as one
+        // `carried`, so the wait reads them all ahead on tokio (on io_uring
+        // they stay in the socket).
+        let mut queued = request(&["SET", "a", &"x".repeat(300 * 1024)]);
+        queued.extend_from_slice(&request(&["BLPOP", "hold2", "0"]));
+        queued.extend_from_slice(&request(&["PING"]).repeat(34 * 1024));
+        c.writer.write_all(&queued).unwrap();
+        thread::sleep(Duration::from_millis(300));
+
+        // Unblocked, the read ahead replays and `hold2` still being empty
+        // parks the client again with about half of it still to run. What
+        // it holds on top of the stored value is then the one vector the
+        // read ahead was read into — not a grown buffer's on top of a
+        // still-holding `carried`'s.
+        assert_eq!(ctl.cmd(&["RPUSH", "hold", "v"]), V::Int(1));
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            listed(&mut ctl, &name),
+            "{io}: the second BLPOP never parked"
+        );
+
+        let held = info_field(&mut ctl, "memory", "used_memory") - before;
+        assert!(
+            held < 1_650_000,
+            "{io}: a client holding under a megabyte showed {held} — its read ahead was copied into a second allocation"
+        );
+        drop(c);
+    }
+}
+
 /// What has already run is not held against a client that waits: a request
 /// that completed in the same read the blocking command arrived in leaves
 /// nothing to count, so the client stays — counted for what it still
