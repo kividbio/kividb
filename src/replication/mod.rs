@@ -4466,43 +4466,46 @@ pub fn is_write_command(name: &str) -> bool {
                 | "XREADGROUP"
                 | "ZDIFFSTORE"
         ),
-        11 => matches!(
-            name,
-            "FT.ALIASADD"
-                | "FT.ALIASDEL"
-                | "INCRBYFLOAT"
-                | "JSON.ARRPOP"
-                | "JSON.FORGET"
-                | "JSON.OBJDEL"
-                | "JSON.TOGGLE"
-                | "SINTERSTORE"
-                | "SUNIONSTORE"
-                | "TDIGEST.ADD"
-                | "XIDMPRECORD"
-                | "ZINTERSTORE"
-                | "ZRANGESTORE"
-                | "ZUNIONSTORE"
-        ),
+        11 => {
+            matches!(
+                name,
+                "FT.ALIASADD"
+                    | "FT.ALIASDEL"
+                    | "INCRBYFLOAT"
+                    | "JSON.ARRPOP"
+                    | "JSON.FORGET"
+                    | "JSON.OBJDEL"
+                    | "JSON.TOGGLE"
+                    | "SINTERSTORE"
+                    | "SUNIONSTORE"
+                    | "XIDMPRECORD"
+                    | "ZINTERSTORE"
+                    | "ZRANGESTORE"
+                    | "ZUNIONSTORE"
+            ) || (matches!(name.as_bytes()[0], b'T') && matches!(name, "TDIGEST.ADD"))
+        }
         12 => matches!(
             name,
             "BF.LOADCHUNK" | "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
         ),
-        13 => matches!(
-            name,
-            "TDIGEST.MERGE" | "TDIGEST.RESET" | "TS.CREATERULE" | "TS.DELETERULE"
-        ),
-        14 => matches!(
-            name,
-            "FT.ALIASUPDATE"
-                | "GEOSEARCHSTORE"
-                | "JSON.ARRAPPEND"
-                | "JSON.ARRINSERT"
-                | "JSON.NUMINCRBY"
-                | "JSON.NUMMULTBY"
-                | "JSON.STRAPPEND"
-                | "TDIGEST.CREATE"
-                | "ZREMRANGEBYLEX"
-        ),
+        13 => {
+            matches!(name, "TS.CREATERULE" | "TS.DELETERULE")
+                || (matches!(name.as_bytes()[0], b'T')
+                    && matches!(name, "TDIGEST.MERGE" | "TDIGEST.RESET"))
+        }
+        14 => {
+            matches!(
+                name,
+                "FT.ALIASUPDATE"
+                    | "GEOSEARCHSTORE"
+                    | "JSON.ARRAPPEND"
+                    | "JSON.ARRINSERT"
+                    | "JSON.NUMINCRBY"
+                    | "JSON.NUMMULTBY"
+                    | "JSON.STRAPPEND"
+                    | "ZREMRANGEBYLEX"
+            ) || (matches!(name.as_bytes()[0], b'T') && matches!(name, "TDIGEST.CREATE"))
+        }
         15 => name == "ZREMRANGEBYRANK",
         16 => name == "ZREMRANGEBYSCORE",
         _ => false,
