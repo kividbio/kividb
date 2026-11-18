@@ -3050,7 +3050,176 @@ fn json_to_lua(
 }
 
 fn lua_value_to_resp(lua: &Lua, val: LuaValue) -> LuaResult<Vec<u8>> {
-    lua_to_resp_inner(lua, val, 0, ReplyProtocol::current())
+    let protocol = ReplyProtocol::current();
+    // A table, which is what most scripts return, is written where it lies,
+    // on Lua's stack, into one buffer (#901). What `write_reply` does not
+    // write itself it leaves, and the whole reply is written as before.
+    if let LuaValue::Table(table) = &val {
+        let mut out = Vec::new();
+        let mut written = false;
+        // SAFETY: `write_reply` keeps to the stack it is given and raises no
+        // Lua error (see there); the closure leaves the stack empty.
+        let ran = unsafe {
+            lua.exec_raw::<()>(table, |state| {
+                written = write_reply(state, 1, &mut out, 0, protocol);
+                mlua::ffi::lua_settop(state, 0);
+            })
+        };
+        if ran.is_ok() && written {
+            return Ok(out);
+        }
+    }
+    lua_to_resp_inner(lua, val, 0, protocol)
+}
+
+/// How deep `write_reply` goes before it leaves a reply to
+/// `lua_to_resp_inner`, which knows the limits a deeper one runs into
+/// (`LUA_SCRIPT_RESP_ENCODE_MAX_DEPTH`, the chains of one-element tables).
+const FAST_REPLY_MAX_DEPTH: u32 = 32;
+
+/// Write the value at `idx` of Lua's stack as `lua_to_resp_inner` writes it,
+/// for the shapes nearly every script returns: nil, booleans, numbers,
+/// strings, `{ok = ...}`, `{err = ...}` (as the whole reply) and arrays of
+/// those. False, with what was written to be thrown away, for anything else:
+/// a table with `double`, `big_number`, `verbatim_string`, `set` or `map`,
+/// an error inside an array, a reply deeper than [`FAST_REPLY_MAX_DEPTH`].
+///
+/// Nothing here raises a Lua error, so nothing here can be jumped over: the
+/// table lookups are raw, the keys are C strings Lua keeps cached, and no
+/// value is converted in place (`lua_tolstring` only of strings).
+unsafe fn write_reply(
+    state: *mut mlua::ffi::lua_State,
+    idx: std::ffi::c_int,
+    out: &mut Vec<u8>,
+    depth: u32,
+    protocol: ReplyProtocol,
+) -> bool {
+    use crate::resp::write::push_decimal;
+    use mlua::ffi;
+    let null = |out: &mut Vec<u8>| {
+        out.extend_from_slice(if protocol.client >= 3 {
+            b"_\r\n"
+        } else {
+            b"$-1\r\n"
+        })
+    };
+    let integer = |out: &mut Vec<u8>, n: i64| {
+        out.push(b':');
+        if n < 0 {
+            out.push(b'-');
+        }
+        push_decimal(out, n.unsigned_abs());
+        out.extend_from_slice(b"\r\n");
+    };
+    unsafe {
+        match ffi::lua_type(state, idx) {
+            ffi::LUA_TBOOLEAN => {
+                let b = ffi::lua_toboolean(state, idx) != 0;
+                if protocol.script >= 3 {
+                    if protocol.client >= 3 {
+                        out.extend_from_slice(if b { b"#t\r\n" } else { b"#f\r\n" });
+                    } else {
+                        integer(out, i64::from(b));
+                    }
+                } else if b {
+                    integer(out, 1);
+                } else {
+                    null(out);
+                }
+            }
+            ffi::LUA_TNUMBER => {
+                if ffi::lua_isinteger(state, idx) != 0 {
+                    integer(out, ffi::lua_tointeger(state, idx));
+                } else {
+                    integer(out, lua_number_reply(ffi::lua_tonumber(state, idx)));
+                }
+            }
+            ffi::LUA_TSTRING => {
+                let mut len = 0usize;
+                let ptr = ffi::lua_tolstring(state, idx, &mut len);
+                crate::resp::write::push_header(out, b'$', len);
+                out.extend_from_slice(std::slice::from_raw_parts(ptr.cast::<u8>(), len));
+                out.extend_from_slice(b"\r\n");
+            }
+            ffi::LUA_TTABLE => {
+                if depth >= FAST_REPLY_MAX_DEPTH || ffi::lua_checkstack(state, 3) == 0 {
+                    return false;
+                }
+                // `{ok = ...}`: a status, one line.
+                ffi::lua_pushstring(state, c"ok".as_ptr());
+                if ffi::lua_rawget(state, idx) == ffi::LUA_TSTRING {
+                    let mut len = 0usize;
+                    let ptr = ffi::lua_tolstring(state, -1, &mut len);
+                    let start = out.len();
+                    out.push(b'+');
+                    out.extend_from_slice(std::slice::from_raw_parts(ptr.cast::<u8>(), len));
+                    ffi::lua_pop(state, 1);
+                    for byte in &mut out[start + 1..] {
+                        if matches!(*byte, b'\r' | b'\n') {
+                            *byte = b' ';
+                        }
+                    }
+                    out.extend_from_slice(b"\r\n");
+                    return true;
+                }
+                ffi::lua_pop(state, 1);
+                // `{err = ...}`, as the whole reply only: an error reply is
+                // counted (`INFO errorstats`) as it is written, and one
+                // inside an array would be counted again if the rest of the
+                // array were then left to `lua_to_resp_inner`.
+                ffi::lua_pushstring(state, c"err".as_ptr());
+                if ffi::lua_rawget(state, idx) == ffi::LUA_TSTRING {
+                    if depth > 0 {
+                        ffi::lua_pop(state, 1);
+                        return false;
+                    }
+                    let mut len = 0usize;
+                    let ptr = ffi::lua_tolstring(state, -1, &mut len);
+                    let text =
+                        String::from_utf8_lossy(std::slice::from_raw_parts(ptr.cast::<u8>(), len))
+                            .into_owned();
+                    ffi::lua_pop(state, 1);
+                    out.extend_from_slice(&resp_error(&text));
+                    return true;
+                }
+                ffi::lua_pop(state, 1);
+                for key in [
+                    c"double",
+                    c"big_number",
+                    c"verbatim_string",
+                    c"set",
+                    c"map",
+                ] {
+                    ffi::lua_pushstring(state, key.as_ptr());
+                    let kind = ffi::lua_rawget(state, idx);
+                    ffi::lua_pop(state, 1);
+                    if kind != ffi::LUA_TNIL {
+                        return false;
+                    }
+                }
+                // An array: up to the first nil.
+                let mut count: ffi::lua_Integer = 0;
+                while ffi::lua_rawgeti(state, idx, count + 1) != ffi::LUA_TNIL {
+                    ffi::lua_pop(state, 1);
+                    count += 1;
+                }
+                ffi::lua_pop(state, 1);
+                crate::resp::write::push_header(out, b'*', count as usize);
+                for at in 1..=count {
+                    ffi::lua_rawgeti(state, idx, at);
+                    let item = ffi::lua_gettop(state);
+                    let written = write_reply(state, item, out, depth + 1, protocol);
+                    ffi::lua_pop(state, 1);
+                    if !written {
+                        return false;
+                    }
+                }
+            }
+            // Nil; and functions, coroutines and userdata: a null, as in Redis.
+            _ => null(out),
+        }
+    }
+    true
 }
 
 /// The protocols a script's reply is written in, as Redis's
