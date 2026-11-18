@@ -2280,7 +2280,8 @@ end
     lua.globals().set("__kividb_compat51", compat51).unwrap();
 
     // `string.format` with Lua 5.1's integer conversions, as Redis's
-    // scripts have them (#747): see [`super::lua_format`].
+    // scripts have them (#747): a patched copy of the library's own
+    // `str_format` (#771), see [`super::lua_format`].
     // SAFETY: the state has the `string` library, and the closure leaves
     // the stack as it found it.
     unsafe {
