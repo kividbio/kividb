@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/pr1_commands.rs
 //
 // Integration tests for all PR1 commands:
@@ -2489,6 +2490,10 @@ fn cluster_commands_refuse_when_cluster_support_is_disabled() {
         &["CLUSTER", "GETKEYSINSLOT", "0", "1"],
         &["CLUSTER", "ORPHANSLOTS"],
         &["CLUSTER", "DROPORPHANS"],
+        // The replies a client would read as "a cluster" (#899).
+        &["CLUSTER", "NODES"],
+        &["CLUSTER", "SLOTS"],
+        &["CLUSTER", "SHARDS"],
         &["READONLY"],
         &["READWRITE"],
         &["ASKING"],
@@ -2500,8 +2505,13 @@ fn cluster_commands_refuse_when_cluster_support_is_disabled() {
             "{cmd:?}"
         );
     }
-    // KEYSLOT still answers.
+    // KEYSLOT still answers, and INFO reports `cluster_enabled:0`.
     assert_eq!(c.cmds(&["CLUSTER", "KEYSLOT", "foo"]).as_int(), 12182);
+    let info = c.cmds(&["CLUSTER", "INFO"]);
+    assert!(
+        String::from_utf8_lossy(info.as_bytes()).contains("cluster_enabled:0"),
+        "{info:?}"
+    );
 }
 
 // Without Lua, every script command says which build has it: BullMQ and

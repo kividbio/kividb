@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // A function library on a replica, in a test binary of its own.
 //
 // The function libraries are process-global, and every in-process server
@@ -8,7 +9,6 @@
 // before this test's FUNCTION LOAD and loaded after it, took the library
 // away again, and the replica never had it (timed out after 10s waiting for
 // the replica to have the library). Here nothing else syncs.
-
 #![cfg(feature = "lua")]
 
 use kividb::config::{Config, IoModel};

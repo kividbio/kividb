@@ -51,6 +51,21 @@ where numbers leave a script behave as Redis's do:
   as `5`; **`cmsgpack.pack`** writes a number with an integer value as an
   integer, and a float that a 32-bit float holds exactly as one.
 
+- **The Lua 5.1 library functions are there (since 1.3.0):** `table.getn`,
+  `table.setn` (which raises `'setn' is obsolete`, as it does in Redis),
+  `table.maxn`, `table.foreach`, `table.foreachi`, `math.mod` (C's `fmod`),
+  `string.gfind` (`string.gmatch`) and `gcinfo()`. They are in `EVAL`,
+  `EVALSHA`, `EVAL_RO` and function libraries. Scripts written for Redis
+  2.x and 3.x use them, as hibiken/asynq's do (`table.getn(ids)`). A result
+  with an integer value is an integer, as in Redis (`'n=' .. table.maxn(t)`
+  is `n=3`). Where they differ from Redis: the error of a bad argument names
+  the function (called through `pcall`, Redis names it `'?'`),
+  `string.gfind` treats empty matches as Lua 5.4's `string.gmatch` does
+  (`'%a*'` over `'abc'` matches once here, twice on Redis), and `gcinfo()`
+  counts the memory of the Lua 5.4 VM. They are made the first time a script
+  names one (`type(table.getn)` is `function` at once), so `pairs(table)`,
+  `pairs(math)` and `pairs(string)` do not list them before that.
+
 What is still Lua 5.4, with the way to write it so that it works on both:
 
 | On KiviDB (Lua 5.4) | On Redis (Lua 5.1) | Works on both |
@@ -60,7 +75,7 @@ What is still Lua 5.4, with the way to write it so that it works on both:
 | `string.rep`, `string.sub`, `string.char` and other functions that take a position or a count fail on a number with a fraction | cut it toward zero | `math.floor(n)` |
 | `//`, `&`, `\|`, `~`, `<<`, `>>`, `goto` and `<const>` are accepted, and `goto` is a keyword | syntax errors | leave them out of scripts that must also run on Redis |
 | `unpack` and `table.unpack` are both there, as are `table.pack`, `math.tointeger`, `string.pack` and `utf8` | `unpack` only | `unpack` |
-| `load` takes source text; `gcinfo`, `table.getn`, `table.maxn`, `math.mod` and `string.gfind` are not there | `load` takes a function; the others are there | `#t` for `table.getn(t)`, `math.fmod` for `math.mod`, `collectgarbage('count')` for `gcinfo()` |
+| `load` takes source text | `load` takes a function | |
 | `string.format('%s', 10 / 2)` is `"5.0"` | `"5"` | `string.format('%d', n)` for a number you want written without a fraction |
 | `string.format('%q', 1.5)` writes the float in hexadecimal (`0x1.8p+0`) | `"1.5"` | `string.format('%q', tostring(x))`, or `%s` |
 | `%05s`, `%#s` and `%+s` (flags other than `-` on `%s`) are errors | taken | leave the flag out |

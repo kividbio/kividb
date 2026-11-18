@@ -776,9 +776,18 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     #[cfg(not(feature = "lua"))]
     let skip_mem = false;
 
+    // Whether the command writes, judged by its name and arguments, which it
+    // does not change: asked once here, it was asked five times a command
+    // (#901). A command that writes only with some arguments (GEORADIUS ...
+    // STORE, MIGRATE, ...) counts as a write (`command_mutates_for_replication`).
+    let inner_write = replication::command_mutates_for_replication(name2, ctx.cmd.as_slice());
+    // A `SELECT` is an inner write but changes no data (`writes_the_dataset`).
+    #[cfg_attr(not(feature = "lua"), allow(unused_variables))]
+    let writes_data = inner_write && replication::writes_the_dataset(name2, ctx.cmd.as_slice());
+
     if !repl_is_slave
         && check_memory_limit()
-        && replication::command_mutates_for_replication(name2, ctx.cmd.as_slice())
+        && inner_write
         && !crate::eviction::allowed_when_out_of_memory(name2)
         && !skip_mem
     {
@@ -832,7 +841,7 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     let started = std::time::Instant::now();
     // A write takes the keys it names that are past their time as gone,
     // and they go first, as from a client (`expire_named_keys_first`).
-    if replication::command_mutates_for_replication(name2, ctx.cmd.as_slice()) {
+    if inner_write {
         expire_named_keys_first(ctx, name2, None);
     }
     // What the command records of its effects is read below whether or not
@@ -847,16 +856,12 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // A command that writes only with some arguments (GEORADIUS ... STORE,
     // MIGRATE, ...) must count as a write here too, or a key it emptied is
     // not swept, a client blocked on a key it wrote is not woken, and a
-    // client tracking that key is not told. Judged by the arguments, as the
-    // propagation below judges it (`command_mutates_for_replication`).
-    let inner_write = replication::command_mutates_for_replication(name2, ctx.cmd.as_slice());
-    // A `SELECT` is an inner write but changes no data (`writes_the_dataset`):
-    // a script that has only selected a database can still be killed (#424).
+    // client tracking that key is not told (`inner_write`, judged by the
+    // arguments, as the propagation below judges it). A `SELECT` changes no
+    // data: a script that has only selected a database can still be killed
+    // (#424).
     #[cfg(feature = "lua")]
-    if !result.starts_with(b"-")
-        && inner_write
-        && replication::writes_the_dataset(name2, ctx.cmd.as_slice())
-    {
+    if !result.starts_with(b"-") && writes_data {
         crate::commands::lua::script_note_successful_write();
     }
 
@@ -889,23 +894,33 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         // Not a `SELECT`: a write carries the one it needs, from the database
         // it ran in, and a script that only selected one sent nothing in
         // Redis, whose offset it must not move (#705).
-        && replication::writes_the_dataset(name2, ctx.cmd.as_slice())
+        && writes_data
     {
-        let feeds = replication::script_feed::commands_for_propagation(
-            ctx,
-            name2,
-            ctx.cmd.as_slice(),
-            &result,
-        );
         // Same guard as `apply_write_side_effects`. `record_rdb_change` still runs
         // per feed regardless — it tracks dirty-key count for RDB save, which is
         // independent of whether anything consumes the replication stream.
-        let observed = replication::write_is_observed(ctx);
-        for parts in feeds {
-            if observed {
+        // With nothing to read them, the feeds are only counted, not built.
+        if replication::write_is_observed(ctx) {
+            let feeds = replication::script_feed::commands_for_propagation(
+                ctx,
+                name2,
+                ctx.cmd.as_slice(),
+                &result,
+            );
+            for parts in feeds {
                 replication::replicate_one_write(ctx, &parts);
+                crate::stats::record_rdb_change();
             }
-            crate::stats::record_rdb_change();
+        } else {
+            let feeds = replication::script_feed::propagation_count(
+                ctx,
+                name2,
+                ctx.cmd.as_slice(),
+                &result,
+            );
+            for _ in 0..feeds {
+                crate::stats::record_rdb_change();
+            }
         }
         // A write made from a script dirties a WATCH like any other write,
         // on the keys it changed.
@@ -953,7 +968,7 @@ pub(crate) fn effective_resp_for_reply(ctx: &Ctx<'_>) -> u8 {
             return r;
         }
     }
-    ctx.resp
+    ctx.resp & crate::commands::ctx::RESP_VERSION
 }
 
 /// Negotiated wire protocol for the **connected client** (ignores `redis.setresp`).
@@ -1070,6 +1085,24 @@ fn is_script(name: &str) -> bool {
     )
 }
 
+/// Whether a `CLIENT NO-TOUCH` client's command `name` records no use of
+/// its keys: a read does not; `TOUCH`, a write and a script that may write
+/// do (#566). A `SORT` without `STORE` is a read here, as it is in Redis,
+/// though it counts as a write elsewhere. Out of line and cold: only such
+/// a client's commands, under a policy that records uses, ask, and the test
+/// on the way here is one byte.
+#[cold]
+#[inline(never)]
+fn no_touch_skips(name: &str, cmd: &[&[u8]], writes_operation: bool) -> bool {
+    let reads = !writes_operation
+        || (name == "SORT"
+            && !cmd
+                .iter()
+                .skip(2)
+                .any(|arg| arg.eq_ignore_ascii_case(b"STORE")));
+    reads && name != "TOUCH" && (!is_script(name) || name.ends_with("_RO"))
+}
+
 /// What the lookups of the command `name`, started at `now`, write to the
 /// keys they find: see `store::AccessScope`. And whether the keys have their
 /// use written after the command, by `eviction::used`: a script's declared
@@ -1181,6 +1214,239 @@ fn routed_again_in_gate(
     .refusal()
 }
 
+// The parts of `run_command` that a plain command on a standalone master
+// never runs are functions of their own, `#[cold]` and never inlined: the
+// function that every command runs stays small, and what is added to one of
+// them does not change how the compiler lays out the rest (#867). Each is
+// called behind the cheap check (an atomic load, a flag) that it used to
+// sit behind, in the same order.
+
+/// Cluster routing of a command as it arrives, on a node with cluster mode
+/// on (and not the replica's applier): the refusal (`-MOVED`, `-ASK`, ...),
+/// or `None` to run it here, with `routed` set when it was routed.
+#[cold]
+#[inline(never)]
+fn route_on_arrival(
+    ctx: &mut Ctx,
+    name: &str,
+    routed: &mut crate::cluster::routing::Routed,
+) -> Option<Vec<u8>> {
+    use crate::cluster::routing::route_named;
+    // A cluster node has one keyspace. Letting SELECT move a
+    // connection to another database would put keys where no slot
+    // accounting, migration or replication check ever looks.
+    if name == "SELECT" && ctx.cmd.get(1).is_some_and(|db| *db != &b"0"[..]) {
+        return Some(resp_error("ERR SELECT is not allowed in cluster mode"));
+    }
+    // A command `EXEC` runs was routed with the rest of its queue, once,
+    // before any of it ran (`routing::exec_refusal`), and leaves
+    // `ASKING` to the end of the transaction (`routing::transaction_ended`).
+    // Routed again here, it was judged on the keys the commands before
+    // it had made or deleted, and refused half way through (#339).
+    // Scripts' commands do not come here; a command of the client's
+    // takes the gate alone only after this.
+    if !crate::command_gate::alone_on_this_thread() {
+        // Pull asking flag from client registry.
+        let asking_flag = ctx.client_registry.get_asking(ctx.client_id);
+        // Before the keys are looked for: anything that moves them from
+        // here after this, the write sees in the gate.
+        *routed = crate::cluster::routing::Routed::now(asking_flag);
+        // has_key_locally: bind to the store/db combination via closure.
+        let store_for_check = ctx.store;
+        let db = *ctx.selected_db;
+        let has_key_locally = |key: &[u8]| -> bool {
+            let shard = crate::store::get_shard(&store_for_check[db], key);
+            crate::read_lock!(shard).contains_key(key)
+        };
+        let registry = ctx.client_registry;
+        let client_id = ctx.client_id;
+        let decision = route_named(
+            name,
+            ctx.cmd.as_slice(),
+            ctx.cluster,
+            asking_flag,
+            || registry.get_readonly(client_id),
+            has_key_locally,
+        );
+        // ASKING is single-shot: clear after this command regardless of
+        // outcome.
+        if asking_flag {
+            ctx.client_registry.update(ctx.client_id, |info| {
+                info.asking = false;
+            });
+        }
+        if let Some(refusal) = decision.refusal() {
+            return Some(refusal);
+        }
+        crate::cluster::routing::stall_for_test(name, ctx.cmd.as_slice());
+    }
+    None
+}
+
+/// On a replica, for a client: whether `name` is a write it refuses.
+#[cold]
+#[inline(never)]
+fn denied_on_readonly_replica(ctx: &Ctx, name: &str) -> bool {
+    replication::is_denied_on_readonly_replica(name, &ctx.cmd)
+}
+
+/// With `min-replicas-to-write` set, for a client: whether the command is
+/// refused for too few good replicas.
+#[cold]
+#[inline(never)]
+fn refused_without_replicas(ctx: &Ctx, name: &str) -> bool {
+    !matches!(
+        name,
+        "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" | "FCALL" | "FCALL_RO"
+    ) && !crate::command_gate::alone_on_this_thread()
+        && replication::refused_without_replicas(name, &ctx.cmd)
+        && ctx.repl_state.lacks_good_replicas()
+}
+
+/// While the dataset is loading, for a client: whether `name` waits for it.
+#[cold]
+#[inline(never)]
+fn refused_while_loading(name: &str) -> bool {
+    !replication::slave_command_allowed_during_loading(name)
+}
+
+/// With a restricted user connected: the refusal of the command if its user
+/// may not run it, or touch its keys or channels.
+#[cold]
+#[inline(never)]
+fn acl_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
+    // The command, every key it names (`keyspec` knows where they are)
+    // and every channel, under the user's rules or one of its selectors.
+    let denied = ctx
+        .acl_store
+        .read()
+        .get(ctx.authenticated_user)
+        .and_then(|user| crate::acl::check_permission(user, name, ctx.cmd.as_slice()).err())?;
+    // As in Redis, a command there is no such command as is refused
+    // for that, before the user's rules (and the ACL log). The
+    // wrong number of arguments was refused above.
+    if !crate::commands::server::is_command(name) {
+        return Some(unknown_command(&ctx.cmd));
+    }
+    ctx.acl_log.record(
+        denied.reason(),
+        denied.object(),
+        ctx.authenticated_user,
+        &crate::acl::log_client_info(ctx.client_registry, ctx.client_id, ctx.peer_addr),
+    );
+    Some(resp_error(&denied.message(ctx.authenticated_user)))
+}
+
+/// For a client's write in the write gate, `write_gate`, when a handoff, a
+/// `MIGRATE`, a move of its keys or a `CLIENT PAUSE` may have come since it
+/// was routed as `routed` (`pause::writes_must_check`): see `run_command`.
+/// The reply to give instead of running it, or `None` to run it, in the
+/// gate again and routed again if it had to wait.
+#[cold]
+#[inline(never)]
+fn checked_in_gate(
+    ctx: &mut Ctx,
+    name: &str,
+    routed: &mut crate::cluster::routing::Routed,
+    write_gate: &mut Option<crate::write_gate::WriteGuard>,
+) -> Option<Vec<u8>> {
+    loop {
+        // Not for `SCRIPT LOAD` or `SCRIPT FLUSH`: they change the script
+        // cache, not the dataset, and are sent to nobody (#705), so a
+        // handoff misses nothing of them.
+        // The pause does not hold them (#518), and they used to wait the
+        // handoff out here instead, asleep on their worker thread, with
+        // every other connection of that thread (#528).
+        let handoff = crate::pause::handoff() && name != "SCRIPT";
+        if !handoff
+            && crate::pause::write_held_in_gate(ctx.cmd.as_slice())
+            && !crate::commands::blocking::client_gone(ctx)
+        {
+            *write_gate = None;
+            // `ASKING` was used up when it was routed; the dispatch that
+            // runs it is routed as this one was.
+            if routed.asking() {
+                ctx.client_registry
+                    .update(ctx.client_id, |info| info.asking = true);
+            }
+            return Some(crate::commands::blocking::hold_for_pause(ctx));
+        }
+        if !handoff
+            && !(crate::pause::keys_moving()
+                && crate::key_moves::names_a_moving_key(*ctx.selected_db, name, ctx.cmd.as_slice()))
+        {
+            return routed_again_in_gate(ctx, name, *routed);
+        }
+        *write_gate = None;
+        if handoff {
+            crate::pause::wait_out_handoff();
+        } else {
+            crate::key_moves::wait_until_moved(*ctx.selected_db, name, ctx.cmd.as_slice());
+        }
+        // Before its keys are looked for below, as before its first routing.
+        *routed = crate::cluster::routing::Routed::now(false);
+        if ctx.cluster.enabled {
+            let store = ctx.store;
+            let db = *ctx.selected_db;
+            let decision = crate::cluster::routing::route_named(
+                name,
+                ctx.cmd.as_slice(),
+                ctx.cluster,
+                false,
+                || false,
+                // After a handoff, whoever owns the slot; after a move, also
+                // whether the key is still here.
+                |key| {
+                    handoff
+                        || crate::read_lock!(crate::store::get_shard(&store[db], key))
+                            .contains_key(key)
+                },
+            );
+            if let Some(refusal) = decision.refusal() {
+                return Some(refusal);
+            }
+        }
+        if ctx.repl_state.is_slave() && replication::is_denied_on_readonly_replica(name, &ctx.cmd) {
+            return Some(resp_error(
+                "READONLY You can't write against a read only replica.",
+            ));
+        }
+        *write_gate = Some(crate::write_gate::enter());
+        // The caller's loop condition, of which only this can change.
+        if !crate::pause::writes_must_check(routed.at()) {
+            return None;
+        }
+    }
+}
+
+/// Over `maxmemory`: room made for the command, by eviction in the order of
+/// writes if `in_order`, or its `OOM` refusal if it `needs_room` and none
+/// could be made. See `run_command`.
+#[cold]
+#[inline(never)]
+fn make_room_or_refuse(ctx: &mut Ctx, in_order: bool, needs_room: bool) -> Option<Vec<u8>> {
+    // The keys it deletes are writes too, to be cut between and ordered
+    // like any other; it orders them itself, so this comes before the
+    // command takes the order of its own keys.
+    let _evicting = crate::write_gate::enter();
+    let limit = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
+    if limit != 0 && !crate::eviction::make_room(ctx, limit, in_order) && needs_room {
+        log_throttled!(
+            60,
+            crate::loglevel::WARN,
+            "maxmemory ({} bytes) reached and nothing more can be evicted under \
+             maxmemory-policy {}: write commands are refused with OOM. Raise maxmemory, \
+             use an evicting policy such as allkeys-lru, or delete data",
+            crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed),
+            crate::eviction::policy().name()
+        );
+        return Some(crate::tracking::with_what_came_before(resp_error(
+            "OOM command not allowed when used memory > 'maxmemory'.",
+        )));
+    }
+    None
+}
+
 /// [`execute_command`], once the command's name is known; it started at
 /// `started`.
 fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8> {
@@ -1207,61 +1473,14 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // When it was routed, for a write to compare inside the write gate:
     // its keys may have left meanwhile (#331).
     let mut routed = crate::cluster::routing::Routed::default();
+    // Standalone-mode fast path: skip every cluster-related check entirely.
+    // A single branch here keeps the asking-flag lookup and the closure
+    // setup off the standalone hot path.
+    if ctx.cluster.enabled
+        && !ctx.bypass_cluster_check
+        && let Some(refusal) = route_on_arrival(ctx, name, &mut routed)
     {
-        use crate::cluster::routing::route_named;
-        // Standalone-mode fast path: skip every cluster-related check entirely.
-        // A single branch here keeps the asking-flag lookup and the closure
-        // setup off the standalone hot path.
-        if ctx.cluster.enabled && !ctx.bypass_cluster_check {
-            // A cluster node has one keyspace. Letting SELECT move a
-            // connection to another database would put keys where no slot
-            // accounting, migration or replication check ever looks.
-            if name == "SELECT" && ctx.cmd.get(1).is_some_and(|db| *db != &b"0"[..]) {
-                return resp_error("ERR SELECT is not allowed in cluster mode");
-            }
-            // A command `EXEC` runs was routed with the rest of its queue, once,
-            // before any of it ran (`routing::exec_refusal`), and leaves
-            // `ASKING` to the end of the transaction (`routing::transaction_ended`).
-            // Routed again here, it was judged on the keys the commands before
-            // it had made or deleted, and refused half way through (#339).
-            // Scripts' commands do not come here; a command of the client's
-            // takes the gate alone only after this.
-            if !crate::command_gate::alone_on_this_thread() {
-                // Pull asking flag from client registry.
-                let asking_flag = ctx.client_registry.get_asking(ctx.client_id);
-                // Before the keys are looked for: anything that moves them from
-                // here after this, the write sees in the gate.
-                routed = crate::cluster::routing::Routed::now(asking_flag);
-                // has_key_locally: bind to the store/db combination via closure.
-                let store_for_check = ctx.store;
-                let db = *ctx.selected_db;
-                let has_key_locally = |key: &[u8]| -> bool {
-                    let shard = crate::store::get_shard(&store_for_check[db], key);
-                    crate::read_lock!(shard).contains_key(key)
-                };
-                let registry = ctx.client_registry;
-                let client_id = ctx.client_id;
-                let decision = route_named(
-                    name,
-                    ctx.cmd.as_slice(),
-                    ctx.cluster,
-                    asking_flag,
-                    || registry.get_readonly(client_id),
-                    has_key_locally,
-                );
-                // ASKING is single-shot: clear after this command regardless of
-                // outcome.
-                if asking_flag {
-                    ctx.client_registry.update(ctx.client_id, |info| {
-                        info.asking = false;
-                    });
-                }
-                if let Some(refusal) = decision.refusal() {
-                    return refusal;
-                }
-                crate::cluster::routing::stall_for_test(name, ctx.cmd.as_slice());
-            }
-        }
+        return refusal;
     }
 
     #[cfg(feature = "lua")]
@@ -1270,10 +1489,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     }
 
     // Masters skip `is_write_command` entirely here — hot path for standalone read benchmarks.
-    if repl_is_slave
-        && !ctx.apply_replication
-        && replication::is_denied_on_readonly_replica(name, &ctx.cmd)
-    {
+    if repl_is_slave && !ctx.apply_replication && denied_on_readonly_replica(ctx, name) {
         return resp_error("READONLY You can't write against a read only replica.");
     }
     // Too few good replicas: a write is refused, as Redis refuses it. Not
@@ -1283,30 +1499,22 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // (`lua::script_min_replicas_gate`). One relaxed load when it is off.
     if !ctx.apply_replication
         && ctx.repl_state.min_replicas_to_write.load(Ordering::Relaxed) != 0
-        && !matches!(
-            name,
-            "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" | "FCALL" | "FCALL_RO"
-        )
-        && !crate::command_gate::alone_on_this_thread()
-        && replication::refused_without_replicas(name, &ctx.cmd)
-        && ctx.repl_state.lacks_good_replicas()
+        && refused_without_replicas(ctx, name)
     {
         return resp_error(replication::NOREPLICAS);
     }
-    let loading_replica = repl_is_slave
-        && !ctx.apply_replication
-        && ctx
-            .repl_state
-            .slave_sync_in_progress
-            .load(Ordering::Relaxed);
     // `LOADING` is for clients. A command arriving from the master's stream
     // (or from AOF replay) has to be applied regardless: refusing it does not
     // make the master retry, it just drops the write, and the replica quietly
     // diverges for as long as the index rebuild takes.
-    let loading_snapshot =
-        !ctx.apply_replication && crate::vector::SNAPSHOT_INDEX_REBUILD.load(Ordering::Relaxed);
-    if (loading_replica || loading_snapshot)
-        && !replication::slave_command_allowed_during_loading(name)
+    if !ctx.apply_replication
+        && ((repl_is_slave
+            && ctx
+                .repl_state
+                .slave_sync_in_progress
+                .load(Ordering::Relaxed))
+            || crate::vector::SNAPSHOT_INDEX_REBUILD.load(Ordering::Relaxed))
+        && refused_while_loading(name)
     {
         return resp_error("LOADING KiviDB is loading the dataset into memory");
     }
@@ -1318,32 +1526,17 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // counters above already only go non-zero when *some* connected user
     // (including a restricted "default") actually needs checking, so gating
     // on username here would just silently un-enforce that one username.
-    if crate::acl::RESTRICTED_CMD_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) > 0
-        || crate::acl::RESTRICTED_KEY_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) > 0
+    if (crate::acl::RESTRICTED_CMD_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) > 0
+        || crate::acl::RESTRICTED_KEY_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) > 0)
+        && let Some(refusal) = acl_refusal(ctx, name)
     {
-        // The command, every key it names (`keyspec` knows where they are)
-        // and every channel, under the user's rules or one of its selectors.
-        let denied = ctx
-            .acl_store
-            .read()
-            .get(ctx.authenticated_user)
-            .and_then(|user| crate::acl::check_permission(user, name, ctx.cmd.as_slice()).err());
-        if let Some(denied) = denied {
-            // As in Redis, a command there is no such command as is refused
-            // for that, before the user's rules (and the ACL log). The
-            // wrong number of arguments was refused above.
-            if !crate::commands::server::is_command(name) {
-                return unknown_command(&ctx.cmd);
-            }
-            ctx.acl_log.record(
-                denied.reason(),
-                denied.object(),
-                ctx.authenticated_user,
-                &crate::acl::log_client_info(ctx.client_registry, ctx.client_id, ctx.peer_addr),
-            );
-            return resp_error(&denied.message(ctx.authenticated_user));
-        }
+        return refusal;
     }
+
+    // With NOOP=1, `scripts/perf/build.sh` adds a never-taken branch after
+    // the next line, to show that a line added to this function moves no
+    // instructions on the command path (`scripts/perf/stability.sh`, #867).
+    // perf/stability.sh: no-op line
 
     // Over `maxmemory`, a write that could add to what is in use has room
     // made for it — below, once the gates are held — or is refused.
@@ -1511,92 +1704,19 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // gates, and is held there like any write that comes during the pause
     // (`pause::pause_clients`). Not a dispatch that resumes a command whose
     // client has gone, which writes nothing.
-    while gated && !nested && !ctx.apply_replication && crate::pause::writes_must_check(routed.at())
+    if gated
+        && !nested
+        && !ctx.apply_replication
+        && crate::pause::writes_must_check(routed.at())
+        && let Some(reply) = checked_in_gate(ctx, name, &mut routed, &mut _write_gate)
     {
-        // Not for `SCRIPT LOAD` or `SCRIPT FLUSH`: they change the script
-        // cache, not the dataset, and are sent to nobody (#705), so a
-        // handoff misses nothing of them.
-        // The pause does not hold them (#518), and they used to wait the
-        // handoff out here instead, asleep on their worker thread, with
-        // every other connection of that thread (#528).
-        let handoff = crate::pause::handoff() && name != "SCRIPT";
-        if !handoff
-            && crate::pause::write_held_in_gate(ctx.cmd.as_slice())
-            && !crate::commands::blocking::client_gone(ctx)
-        {
-            drop(_write_gate);
-            // `ASKING` was used up when it was routed; the dispatch that
-            // runs it is routed as this one was.
-            if routed.asking() {
-                ctx.client_registry
-                    .update(ctx.client_id, |info| info.asking = true);
-            }
-            return crate::commands::blocking::hold_for_pause(ctx);
-        }
-        if !handoff
-            && !(crate::pause::keys_moving()
-                && crate::key_moves::names_a_moving_key(*ctx.selected_db, name, ctx.cmd.as_slice()))
-        {
-            if let Some(refusal) = routed_again_in_gate(ctx, name, routed) {
-                return refusal;
-            }
-            break;
-        }
-        _write_gate = None;
-        if handoff {
-            crate::pause::wait_out_handoff();
-        } else {
-            crate::key_moves::wait_until_moved(*ctx.selected_db, name, ctx.cmd.as_slice());
-        }
-        // Before its keys are looked for below, as before its first routing.
-        routed = crate::cluster::routing::Routed::now(false);
-        if ctx.cluster.enabled {
-            let store = ctx.store;
-            let db = *ctx.selected_db;
-            let decision = crate::cluster::routing::route_named(
-                name,
-                ctx.cmd.as_slice(),
-                ctx.cluster,
-                false,
-                || false,
-                // After a handoff, whoever owns the slot; after a move, also
-                // whether the key is still here.
-                |key| {
-                    handoff
-                        || crate::read_lock!(crate::store::get_shard(&store[db], key))
-                            .contains_key(key)
-                },
-            );
-            if let Some(refusal) = decision.refusal() {
-                return refusal;
-            }
-        }
-        if ctx.repl_state.is_slave() && replication::is_denied_on_readonly_replica(name, &ctx.cmd) {
-            return resp_error("READONLY You can't write against a read only replica.");
-        }
-        _write_gate = Some(crate::write_gate::enter());
+        return reply;
     }
 
     if over_limit {
-        // The keys it deletes are writes too, to be cut between and ordered
-        // like any other; it orders them itself, so this comes before the
-        // command takes the order of its own keys.
-        let _evicting = crate::write_gate::enter();
-        let limit = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
         let in_order = ordered || (!gated && !ctx.apply_replication);
-        if limit != 0 && !crate::eviction::make_room(ctx, limit, in_order) && needs_room {
-            log_throttled!(
-                60,
-                crate::loglevel::WARN,
-                "maxmemory ({} bytes) reached and nothing more can be evicted under \
-                 maxmemory-policy {}: write commands are refused with OOM. Raise maxmemory, \
-                 use an evicting policy such as allkeys-lru, or delete data",
-                crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed),
-                crate::eviction::policy().name()
-            );
-            return crate::tracking::with_what_came_before(resp_error(
-                "OOM command not allowed when used memory > 'maxmemory'.",
-            ));
+        if let Some(refusal) = make_room_or_refuse(ctx, in_order, needs_room) {
+            return refusal;
         }
     }
 
@@ -1618,8 +1738,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         && !crate::command_gate::alone_on_this_thread()
         && !crate::tag_locks::in_script()
     {
-        let keys = crate::keyspec::key_positions(name, &ctx.cmd);
-        crate::tag_locks::lock_keys(keys.iter().map(|pos| ctx.cmd[pos]))
+        lock_tags_of_named_keys(ctx, name)
     } else {
         None
     };
@@ -1660,20 +1779,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         // write stream, as every other write is.
         Some(order_of_pairs_shared(ctx))
     } else if keys_ordered {
-        let keys = named.insert(crate::keyspec::key_positions(name, &ctx.cmd));
-        let here = *ctx.selected_db;
-        match database_written_too(ctx, name) {
-            // The key's record is ordered where it goes as well: see
-            // `write_order::lock_keys_in`.
-            Some(there) if there != here => Some(crate::write_order::lock_keys_in(
-                keys.iter()
-                    .flat_map(|pos| [(here, ctx.cmd[pos]), (there, ctx.cmd[pos])]),
-            )),
-            _ => Some(crate::write_order::lock_keys(
-                here,
-                keys.iter().map(|pos| ctx.cmd[pos]),
-            )),
-        }
+        Some(order_of_named_keys(ctx, name, &mut named))
     } else {
         None
     };
@@ -1695,143 +1801,87 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // script calls then follows the script, as it happened — and a command
     // that blocks is shown once, when it arrives, not again when it resumes.
     // The administrative commands are not shown, as in Redis.
-    if crate::monitor::MONITOR_COUNT.load(std::sync::atomic::Ordering::Relaxed) > 0
-        && !crate::commands::blocking::resuming(ctx)
-        && !crate::commands::server::is_admin_command(name)
-    {
-        crate::monitor::feed(
-            ctx.monitor_registry,
-            &ctx.cmd,
-            *ctx.selected_db,
-            ctx.peer_addr,
-        );
+    if crate::monitor::MONITOR_COUNT.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        feed_monitors(ctx, name);
     }
 
-    // `notify-keyspace-events n`: which of the keys the command names are
-    // not there now, to see afterwards which of them it created.
-    let announce_new = writes_operation
-        && crate::keyspace_events::KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed)
-            & crate::keyspace_events::KS_NEW
-            != 0;
-    let exists = |ctx: &Ctx, key: &[u8]| {
-        crate::read_lock!(crate::store::get_shard(&ctx.store[*ctx.selected_db], key))
-            .contains_key(key)
-    };
-    let absent: Vec<usize> = if announce_new {
-        crate::keyspec::key_positions(name, &ctx.cmd)
-            .iter()
-            .filter(|pos| !exists(ctx, ctx.cmd[*pos]))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    // `notify-keyspace-events m`: the keys a read looks for and does not
-    // find. It never fired (#160). `EXISTS` and `TYPE` only ask, as in Redis.
-    let missed: Vec<usize> = if !writes_operation
-        && crate::keyspace_events::KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed)
-            & crate::keyspace_events::KS_KEY_MISS
-            != 0
-        && !matches!(name, "EXISTS" | "TYPE" | "TOUCH" | "OBJECT")
+    // `notify-keyspace-events` `n`, `m`, `o` and `c`: what they need to know
+    // of the keys before the command runs (see `KeyspaceWatch`). With none
+    // of them on, which is the default, this is one load and a branch, and
+    // one pointer kept across the command.
+    let keyspace_watch = if crate::keyspace_events::KS_FLAGS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        & KeyspaceWatch::FLAGS
+        != 0
     {
-        crate::keyspec::key_positions(name, &ctx.cmd)
-            .iter()
-            .filter(|pos| !exists(ctx, ctx.cmd[*pos]))
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    // `notify-keyspace-events o` / `c` (see `replace_watch_begin`). With
-    // neither on, which is the default, this is a load and a branch on a
-    // write and nothing on a read: building and dropping an empty watch on
-    // every command cost 16 instructions a command (measured, #66).
-    let replacing = if writes_operation
-        && crate::keyspace_events::KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed)
-            & (crate::keyspace_events::KS_OVERWRITTEN | crate::keyspace_events::KS_TYPE_CHANGED)
-            != 0
-    {
-        replace_watch_begin(ctx, name)
+        KeyspaceWatch::begin(ctx, name, writes_operation)
     } else {
         None
     };
 
     // Under an eviction policy that goes by use, the command's own lookups
-    // write it (see `eviction`): one atomic load when there is none.
-    let (access, used_after) = if crate::eviction::recording() {
+    // write it (see `eviction`): one atomic load when there is none. A
+    // `CLIENT NO-TOUCH` client's reads record no use of their keys: no
+    // scope, and nothing written after them either. Its writes count as
+    // uses — a key one makes is born used, not at the start of time — a
+    // script that may write counts its declared keys the same, and `TOUCH`
+    // still touches, as in Redis (#566).
+    let (access, used_after) = if crate::eviction::recording()
+        && !(ctx.resp & crate::commands::ctx::RESP_NO_TOUCH != 0
+            && no_touch_skips(name, &ctx.cmd, writes_operation))
+    {
         let (scope, after) = access_scope(name, started, &ctx.cmd);
         (Some(scope), after)
     } else {
         (None, false)
     };
-    let result = dispatch_command_handlers(ctx, name)
-        .or_else(|| lua::handle(ctx, name))
-        .unwrap_or_else(|| unknown_command(&ctx.cmd));
-    // A command refused for what it was given (a syntax error, say) can be
-    // refused before it looks its keys up; those keys are used all the
-    // same, as they were when the use was written after every command. Only
-    // on an error: a key it did look up is not counted again.
-    if access.is_some() && result.first() == Some(&b'-') {
-        used_on_error(ctx, name);
-    }
-    // Under LFU, a key the command names more than once is counted as many
-    // times as it is named, as when its use was written after the command,
-    // a lookup for each place it is named. Its own lookups count up to that
-    // many; these make up the rest.
-    if access.as_ref().is_some_and(|scope| scope.is_counting())
-        && let Some(named) = crate::store::AccessScope::named_more_than_once()
-    {
-        let db = *ctx.selected_db;
-        for (key, times) in named {
-            let map = crate::read_lock!(crate::store::get_shard_of_bytes(&ctx.store[db], &key));
-            for _ in 0..times {
-                map.use_key(&key);
-            }
+    // A script command is none of the handlers': each was asked, and every
+    // one of them said no, before it got to `lua::handle` (#901: 1,400
+    // instructions an `EVALSHA`). With Lua it goes there at once.
+    #[cfg(feature = "lua")]
+    let script = matches!(
+        name,
+        "EVALSHA" | "EVAL" | "EVALSHA_RO" | "EVAL_RO" | "FCALL" | "FCALL_RO"
+    );
+    #[cfg(not(feature = "lua"))]
+    let script = false;
+    let dispatched = if script {
+        None
+    } else {
+        dispatch_command_handlers(ctx, name)
+    };
+    let result = match dispatched {
+        Some(result) => result,
+        None => not_dispatched(ctx, name),
+    };
+    if let Some(scope) = access {
+        // A command refused for what it was given (a syntax error, say) can be
+        // refused before it looks its keys up; those keys are used all the
+        // same, as they were when the use was written after every command. Only
+        // on an error: a key it did look up is not counted again.
+        if result.first() == Some(&b'-') {
+            used_on_error(ctx, name);
         }
-    }
-    drop(access);
-
-    if let Some(watch) = replacing {
-        replace_watch_end(ctx, watch);
-    }
-
-    for pos in absent {
-        let key = ctx.cmd[pos];
-        if exists(ctx, key) {
-            crate::keyspace_events::notify(
-                ctx.pubsub,
-                *ctx.selected_db,
-                crate::keyspace_events::KS_NEW,
-                "new",
-                key,
-            );
+        // Under LFU, a key the command names more than once is counted as many
+        // times as it is named, as when its use was written after the command,
+        // a lookup for each place it is named. Its own lookups count up to that
+        // many; these make up the rest.
+        if scope.is_counting()
+            && let Some(named) = crate::store::AccessScope::named_more_than_once()
+        {
+            use_keys_named_more_than_once(ctx, named);
         }
+        drop(scope);
     }
-    for pos in missed {
-        crate::keyspace_events::notify(
-            ctx.pubsub,
-            *ctx.selected_db,
-            crate::keyspace_events::KS_KEY_MISS,
-            "keymiss",
-            ctx.cmd[pos],
-        );
+
+    if let Some(watch) = keyspace_watch {
+        watch.end(ctx);
     }
     // The events of the commands that announce none of their own (#160).
     if writes_operation
         && crate::keyspace_events::KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed) != 0
-        && !result.starts_with(b"-")
-        && !crate::commands::blocking::parked(ctx)
     {
-        for event in crate::keyspace_events::command_events(name, &ctx.cmd, &result) {
-            if let Some(key) = ctx.cmd.get(event.key) {
-                crate::keyspace_events::notify(
-                    ctx.pubsub,
-                    event.db.unwrap_or(*ctx.selected_db),
-                    event.class,
-                    &event.event,
-                    key,
-                );
-            }
-        }
+        announce_command_events(ctx, name, &result);
     }
 
     // A parked command has not done its work yet — there is nothing to
@@ -1855,10 +1905,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // commands that only ask about a key: Redis does not count those as a
     // use of it either.
     if used_after {
-        let wrote = writes_operation && !result.starts_with(b"-");
-        for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
-            crate::eviction::used(ctx.store, *ctx.selected_db, ctx.cmd[pos], wrote);
-        }
+        use_named_keys(ctx, name, writes_operation && !result.starts_with(b"-"));
     }
 
     write_side_effects(ctx, name, &result, writes_operation);
@@ -1866,12 +1913,258 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // Command handlers hardcode RESP2's legacy null encoding (`$-1`/`*-1`); rewrite it to the
     // RESP3 null type (`_`) here, once, for RESP3 connections — see `resp3_normalize_null`.
     // `ctx.resp` is per-connection local state, not a client_registry lookup — see Ctx::resp.
-    let result = if ctx.resp == 3 {
+    // The protocol is 2 or 3: bit 0 says RESP3, whatever `RESP_NO_TOUCH` is.
+    let result = if ctx.resp & 1 != 0 {
         crate::resp::write::resp3_normalize_null(result)
     } else {
         result
     };
     crate::tracking::with_what_came_before(result)
+}
+
+/// The command to the clients in `MONITOR`, unless it is resuming or is an
+/// administrative one. See `run_command`.
+#[cold]
+#[inline(never)]
+fn feed_monitors(ctx: &Ctx, name: &str) {
+    if !crate::commands::blocking::resuming(ctx) && !crate::commands::server::is_admin_command(name)
+    {
+        crate::monitor::feed(
+            ctx.monitor_registry,
+            &ctx.cmd,
+            *ctx.selected_db,
+            ctx.peer_addr,
+        );
+    }
+}
+
+/// With scripts locked by hash tag (`tag_locks`), for a client's command:
+/// the locks of the tags of the keys it names. Out of line: only with
+/// `tag_locks` on does a command come here. A command none of whose keys
+/// has a `{` takes nothing, and is told so without the general list of its
+/// keys (`tag_locks::named_keys`, #889).
+#[inline(never)]
+fn lock_tags_of_named_keys(ctx: &Ctx, name: &str) -> Option<crate::tag_locks::KeysGuard> {
+    crate::tag_locks::lock_named_keys(name, &ctx.cmd)
+}
+
+/// The order of the keys a write names (see `write_order`), and where it
+/// writes to another database, of the same keys there; the keys it names
+/// are left in `named`. Out of line: the generic lockers are large, and a
+/// `SET` or an `INCR` takes its key's order shared instead.
+#[inline(never)]
+fn order_of_named_keys(
+    ctx: &Ctx,
+    name: &str,
+    named: &mut Option<crate::keyspec::Keys>,
+) -> crate::write_order::OrderGuard {
+    let keys = named.insert(crate::keyspec::key_positions(name, &ctx.cmd));
+    let here = *ctx.selected_db;
+    match database_written_too(ctx, name) {
+        // The key's record is ordered where it goes as well: see
+        // `write_order::lock_keys_in`.
+        Some(there) if there != here => crate::write_order::lock_keys_in(
+            keys.iter()
+                .flat_map(|pos| [(here, ctx.cmd[pos]), (there, ctx.cmd[pos])]),
+        ),
+        _ => crate::write_order::lock_keys(here, keys.iter().map(|pos| ctx.cmd[pos])),
+    }
+}
+
+/// Whether `key` is in the selected database.
+fn key_exists(ctx: &Ctx, key: &[u8]) -> bool {
+    crate::read_lock!(crate::store::get_shard(&ctx.store[*ctx.selected_db], key)).contains_key(key)
+}
+
+/// What `notify-keyspace-events` needs to know of the keys before a command
+/// runs, to announce afterwards what it did to them. Built only when one
+/// of those classes is on: off, it costs `run_command` a load and a branch,
+/// and one value kept across the command instead of three (#867). Nothing
+/// is allocated for it beyond what the vectors hold, and nothing at all
+/// when there is nothing to watch.
+struct KeyspaceWatch {
+    /// `n`: the places of the keys a write names that are not there now,
+    /// to see afterwards which of them it created.
+    absent: Vec<usize>,
+    /// `m`: the places of the keys a read looks for and does not find.
+    missed: Vec<usize>,
+    /// `o` / `c` (see `replace_watch_begin`).
+    replacing: Option<ReplaceWatch>,
+}
+
+impl KeyspaceWatch {
+    /// The classes of events that need a watch.
+    const FLAGS: u32 = crate::keyspace_events::KS_NEW
+        | crate::keyspace_events::KS_KEY_MISS
+        | crate::keyspace_events::KS_OVERWRITTEN
+        | crate::keyspace_events::KS_TYPE_CHANGED;
+
+    /// The watch of the command `name`, if any of those classes is on and
+    /// there is something to watch. Inline, as is `end`: with `m` on every
+    /// read comes here, with `o` or `c` every write, and out of line (cold
+    /// or not) the calls and the moves of the watch cost a read that
+    /// missed 70 instructions and a write 50 more than the same code inline
+    /// in `run_command`. Behind the one test of the flags in `run_command`,
+    /// they cost a command nothing while the events are off.
+    #[inline(always)]
+    fn begin(ctx: &Ctx, name: &str, writes_operation: bool) -> Option<KeyspaceWatch> {
+        let flags = || crate::keyspace_events::KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed);
+        if !writes_operation {
+            // A read has only `m` to watch. It never fired (#160). `EXISTS`
+            // and `TYPE` only ask, as in Redis.
+            if flags() & crate::keyspace_events::KS_KEY_MISS == 0
+                || matches!(name, "EXISTS" | "TYPE" | "TOUCH" | "OBJECT")
+            {
+                return None;
+            }
+            let missed = named_keys_absent(ctx, name);
+            if missed.is_empty() {
+                return None;
+            }
+            return Some(KeyspaceWatch {
+                absent: Vec::new(),
+                missed,
+                replacing: None,
+            });
+        }
+        let absent = if flags() & crate::keyspace_events::KS_NEW != 0 {
+            named_keys_absent(ctx, name)
+        } else {
+            Vec::new()
+        };
+        let replacing = if flags()
+            & (crate::keyspace_events::KS_OVERWRITTEN | crate::keyspace_events::KS_TYPE_CHANGED)
+            != 0
+        {
+            replace_watch_begin(ctx, name)
+        } else {
+            None
+        };
+        if absent.is_empty() && replacing.is_none() {
+            return None;
+        }
+        Some(KeyspaceWatch {
+            absent,
+            missed: Vec::new(),
+            replacing,
+        })
+    }
+
+    /// After the command: `overwritten` / `type_changed`, `new`, `keymiss`.
+    #[inline(always)]
+    fn end(self, ctx: &Ctx) {
+        let KeyspaceWatch {
+            absent,
+            missed,
+            replacing,
+        } = self;
+        if let Some(watch) = replacing {
+            replace_watch_end(ctx, watch);
+        }
+        if !absent.is_empty() {
+            announce_new_keys(ctx, absent);
+        }
+        if !missed.is_empty() {
+            announce_missed_keys(ctx, missed);
+        }
+    }
+}
+
+/// The places of the keys the command names that are not there now: for
+/// `notify-keyspace-events` `n` and `m`. See `KeyspaceWatch`. Inline,
+/// as the code it replaces was.
+#[inline(always)]
+fn named_keys_absent(ctx: &Ctx, name: &str) -> Vec<usize> {
+    crate::keyspec::key_positions(name, &ctx.cmd)
+        .iter()
+        .filter(|pos| !key_exists(ctx, ctx.cmd[*pos]))
+        .collect()
+}
+
+/// `new` for each key at the places `absent` (absent before the command)
+/// that is there now.
+#[inline]
+fn announce_new_keys(ctx: &Ctx, absent: Vec<usize>) {
+    for pos in absent {
+        let key = ctx.cmd[pos];
+        if key_exists(ctx, key) {
+            crate::keyspace_events::notify(
+                ctx.pubsub,
+                *ctx.selected_db,
+                crate::keyspace_events::KS_NEW,
+                "new",
+                key,
+            );
+        }
+    }
+}
+
+/// `keymiss` for each key at the places `missed`.
+#[inline]
+fn announce_missed_keys(ctx: &Ctx, missed: Vec<usize>) {
+    for pos in missed {
+        crate::keyspace_events::notify(
+            ctx.pubsub,
+            *ctx.selected_db,
+            crate::keyspace_events::KS_KEY_MISS,
+            "keymiss",
+            ctx.cmd[pos],
+        );
+    }
+}
+
+/// With keyspace events on, after a write: the events of the commands
+/// that announce none of their own (#160), unless it failed or parked.
+/// Inline, as it was: with any class of events on, every write comes here.
+#[inline(always)]
+fn announce_command_events(ctx: &Ctx, name: &str, result: &[u8]) {
+    if result.starts_with(b"-") || crate::commands::blocking::parked(ctx) {
+        return;
+    }
+    for event in crate::keyspace_events::command_events(name, &ctx.cmd, result) {
+        if let Some(key) = ctx.cmd.get(event.key) {
+            crate::keyspace_events::notify(
+                ctx.pubsub,
+                event.db.unwrap_or(*ctx.selected_db),
+                event.class,
+                &event.event,
+                key,
+            );
+        }
+    }
+}
+
+/// Under LFU: the keys the command named more than once (`named`, with how
+/// many times) used as many more times as its own lookups did not count.
+/// See `run_command`, which asks whether there are any.
+#[cold]
+#[inline(never)]
+fn use_keys_named_more_than_once(ctx: &Ctx, named: Vec<(Box<[u8]>, u8)>) {
+    let db = *ctx.selected_db;
+    for (key, times) in named {
+        let map = crate::read_lock!(crate::store::get_shard_of_bytes(&ctx.store[db], &key));
+        for _ in 0..times {
+            map.use_key(&key);
+        }
+    }
+}
+
+/// The use of each key the command names, written after it: a
+/// modification (`wrote`) under the LRM policies, a script's declared keys.
+/// Not cold: under an LRM policy every write comes here.
+#[inline(never)]
+fn use_named_keys(ctx: &Ctx, name: &str, wrote: bool) {
+    for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
+        crate::eviction::used(ctx.store, *ctx.selected_db, ctx.cmd[pos], wrote);
+    }
+}
+
+/// A command no handler of `dispatch_command_handlers` knows: a script's,
+/// or there is no such command. Out of line, but not cold: every `EVAL`,
+/// `EVALSHA` and `FCALL` comes this way.
+#[inline(never)]
+fn not_dispatched(ctx: &mut Ctx, name: &str) -> Vec<u8> {
+    lua::handle(ctx, name).unwrap_or_else(|| unknown_command(&ctx.cmd))
 }
 
 /// What an `XREADGROUP` that is about to wait has already changed: the
@@ -2694,6 +2987,15 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
     // is no client a later read waits for (#42). What it pushes (`BLMOVE`'s
     // destination) its handler wakes, and that is waited for.
     let quiet = waiters && pops_blocking(name);
+    // One that took nothing — its time ran out, or `CLIENT UNBLOCK` ended
+    // it — left its keys as they were. Woken by it, the client at the head
+    // of the line would leave its wait only to find nothing and wait again,
+    // and not be listed as blocked meanwhile: a `CLIENT UNBLOCK` sent for
+    // it then was answered 0, and it stayed blocked.
+    // `XREADGROUP` waits otherwise, and is not told.
+    if quiet && crate::commands::blocking::took_nothing() && name != "XREADGROUP" {
+        return;
+    }
     for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
         let key = ctx.cmd[pos];
         if may_be_empty && drop_if_empty(ctx, db, key) {

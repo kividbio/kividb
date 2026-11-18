@@ -127,10 +127,11 @@ return struct
 
 /// Scripts by SHA1. A source is shared with whoever runs it: scripts are a
 /// few kilobytes each, and one was copied whole for every call.
-static SCRIPT_STORE: OnceLock<RwLock<HashMap<String, Arc<str>>>> = OnceLock::new();
+static SCRIPT_STORE: OnceLock<RwLock<ahash::AHashMap<String, Arc<str>>>> = OnceLock::new();
 
-fn script_store() -> &'static RwLock<HashMap<String, Arc<str>>> {
-    SCRIPT_STORE.get_or_init(|| RwLock::new(HashMap::new()))
+fn script_store() -> &'static RwLock<ahash::AHashMap<String, Arc<str>>> {
+    // Looked up by every EVALSHA: ahash, not SipHash (#901).
+    SCRIPT_STORE.get_or_init(|| RwLock::new(ahash::AHashMap::new()))
 }
 
 /// How many scripts sent only with `EVAL` the cache keeps, as Redis 7.4:
@@ -143,7 +144,7 @@ const EVAL_SCRIPTS_MAX: usize = 500;
 #[derive(Default)]
 struct EvalScripts {
     by_use: std::collections::BTreeMap<u64, String>,
-    last_used: HashMap<String, u64>,
+    last_used: ahash::AHashMap<String, u64>,
     clock: u64,
 }
 
@@ -174,14 +175,20 @@ fn eval_script_added(sha: &str) {
 /// recently used.
 fn eval_script_used(sha: &str) {
     let mut scripts = EVAL_SCRIPTS.lock();
-    let Some(was) = scripts.last_used.get(sha).copied() else {
+    let scripts = &mut *scripts;
+    let Some(last_used) = scripts.last_used.get_mut(sha) else {
         return;
     };
     scripts.clock += 1;
     let now = scripts.clock;
-    scripts.by_use.remove(&was);
-    scripts.by_use.insert(now, sha.to_string());
-    scripts.last_used.insert(sha.to_string(), now);
+    // Moved to its new place, not made again: a script sent with `EVAL` each
+    // time (Appwrite's) made two copies of its digest a call (#901).
+    let was = std::mem::replace(last_used, now);
+    let name = scripts
+        .by_use
+        .remove(&was)
+        .unwrap_or_else(|| sha.to_string());
+    scripts.by_use.insert(now, name);
 }
 
 /// `SCRIPT LOAD` of a script: kept from now on, whatever `EVAL` sent.
@@ -824,6 +831,25 @@ thread_local! {
 /// Clears script evaluation context when leaving `EVAL` / `FCALL`.
 struct ClearScriptEval<'a> {
     lua: &'a Lua,
+    /// Whether the script's `KEYS` and `ARGV` are big enough to be worth
+    /// letting go of now ([`arguments_worth_releasing`]).
+    release_arguments: bool,
+}
+
+/// Arguments of more than this many bytes are let go of when their script
+/// ends; smaller ones stay in `KEYS` and `ARGV` until the next script
+/// replaces them, unseen by anyone (#901: replacing them after every script
+/// was a tenth of what `return 1` cost).
+const RELEASE_ARGUMENTS_BYTES: usize = 4096;
+
+fn arguments_worth_releasing<A: AsRef<[u8]>>(keys: &[A], argv: &[A]) -> bool {
+    keys.len() + argv.len() > 64
+        || keys
+            .iter()
+            .chain(argv)
+            .map(|a| a.as_ref().len())
+            .sum::<usize>()
+            > RELEASE_ARGUMENTS_BYTES
 }
 
 impl Drop for ClearScriptEval<'_> {
@@ -831,25 +857,44 @@ impl Drop for ClearScriptEval<'_> {
         SCRIPT_EVAL.with(|c| {
             *c.borrow_mut() = None;
         });
-        // The arguments are let go of. What stands in for them until the
-        // next script sets its own is one empty table kept with the VM: no
-        // script sees it, each being given new tables before it runs.
-        let empty = match self.lua.app_data_ref::<EmptyArguments>() {
-            Some(empty) => Some(empty.0.clone()),
-            None => self.lua.create_table().ok().inspect(|table| {
-                self.lua.set_app_data(EmptyArguments(table.clone()));
-            }),
-        };
-        if let Some(empty) = empty {
-            let globals = self.lua.globals();
-            let _ = globals.raw_set("KEYS", empty.clone());
-            let _ = globals.raw_set("ARGV", empty);
+        if !self.release_arguments {
+            return;
         }
+        // The arguments are let go of. What stands in for them until the
+        // next script sets its own is one empty table kept with the VM (in
+        // its registry): no script sees it, each being given new tables
+        // before it runs. On Lua's stack, in one protected call: through
+        // mlua's tables it was a twentieth of what a short script cost.
+        //
+        // SAFETY: the closure leaves the stack empty, and runs protected.
+        let _ = unsafe {
+            self.lua.exec_raw::<()>((), |state| {
+                use mlua::ffi;
+                ffi::lua_checkstack(state, 4);
+                ffi::lua_rawgeti(state, ffi::LUA_REGISTRYINDEX, ffi::LUA_RIDX_GLOBALS);
+                if ffi::lua_getfield(state, ffi::LUA_REGISTRYINDEX, NO_ARGUMENTS.as_ptr())
+                    != ffi::LUA_TTABLE
+                {
+                    ffi::lua_pop(state, 1);
+                    ffi::lua_createtable(state, 0, 0);
+                    ffi::lua_pushvalue(state, -1);
+                    ffi::lua_setfield(state, ffi::LUA_REGISTRYINDEX, NO_ARGUMENTS.as_ptr());
+                }
+                for name in [c"KEYS", c"ARGV"] {
+                    ffi::lua_pushstring(state, name.as_ptr());
+                    ffi::lua_pushvalue(state, -2);
+                    // Raw: past the `__newindex` that protects the globals.
+                    ffi::lua_rawset(state, -4);
+                }
+                ffi::lua_settop(state, 0);
+            })
+        };
     }
 }
 
-/// See [`ClearScriptEval`]'s `drop`.
-struct EmptyArguments(LuaTable);
+/// Where in a VM's registry the empty table stands in for `KEYS` and `ARGV`
+/// between scripts (see [`ClearScriptEval`]'s `drop`).
+const NO_ARGUMENTS: &std::ffi::CStr = c"__kividb_no_arguments";
 
 struct ScriptEval {
     /// Opaque `*mut Ctx` — stored as integer to avoid naming `Ctx`'s lifetime on this struct.
@@ -1168,7 +1213,7 @@ fn keep_the_runtime_listening() {
         && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
     {
         let remote = handle.clone();
-        handle.spawn_blocking(move || {
+        crate::cpus::spawn_blocking_on(&handle, move || {
             remote.spawn(async {});
         });
     }
@@ -2273,8 +2318,15 @@ end
     // Redis's scripting environment re-exports it as a global, so scripts can use either form.
     lua.load("unpack = table.unpack").exec().unwrap();
 
+    // Lua 5.1's `table.getn`, `math.mod`, `gcinfo` and the rest Redis keeps (#898),
+    // made when a script first names one. The globals' `__index` asks for
+    // `gcinfo` through `__kividb_compat51`, which the final setup below takes.
+    let compat51 = super::lua_compat51::prepare(&lua).unwrap();
+    lua.globals().set("__kividb_compat51", compat51).unwrap();
+
     // `string.format` with Lua 5.1's integer conversions, as Redis's
-    // scripts have them (#747): see [`super::lua_format`].
+    // scripts have them (#747): a patched copy of the library's own
+    // `str_format` (#771), see [`super::lua_format`].
     // SAFETY: the state has the `string` library, and the closure leaves
     // the stack as it found it.
     unsafe {
@@ -2304,6 +2356,10 @@ end
     // globals, and globals protection. Must run LAST.
     lua.load(
         r#"
+-- The function that makes the Lua 5.1 library functions (see lua_compat51.rs).
+local _compat51 = __kividb_compat51
+__kividb_compat51 = nil
+
 -- cjson state globals and the array metatable.
 local _guard = {}
 _guard.__is_cjson_array = true
@@ -2433,6 +2489,9 @@ local function env_index(t, k)
     local v = rawget(t, k)
     if v ~= nil then
         return v
+    end
+    if k == "gcinfo" then
+        return _compat51()
     end
     error("Script attempted to access nonexistent global variable '" .. k .. "'", 2)
 end
@@ -3036,7 +3095,215 @@ fn json_to_lua(
 }
 
 fn lua_value_to_resp(lua: &Lua, val: LuaValue) -> LuaResult<Vec<u8>> {
-    lua_to_resp_inner(lua, val, 0, ReplyProtocol::current())
+    reply_to_resp(lua, val, ReplyProtocol::current())
+}
+
+/// [`lua_value_to_resp`] for `protocol`.
+fn reply_to_resp(lua: &Lua, val: LuaValue, protocol: ReplyProtocol) -> LuaResult<Vec<u8>> {
+    // A table, which is what most scripts return, is written where it lies,
+    // on Lua's stack, into one buffer (#901). What `write_reply` does not
+    // write itself it leaves, and the whole reply is written as before.
+    if let LuaValue::Table(table) = &val
+        && let Some(out) = fast_table_reply(lua, table, protocol)
+    {
+        return Ok(out);
+    }
+    lua_to_resp_inner(lua, val, 0, protocol)
+}
+
+/// What `write_reply` writes for `table`, or `None` for a reply it leaves
+/// to `lua_to_resp_inner`.
+fn fast_table_reply(lua: &Lua, table: &LuaTable, protocol: ReplyProtocol) -> Option<Vec<u8>> {
+    // Room for a short reply, which most are, without growing.
+    let mut out = Vec::with_capacity(128);
+    let mut written = false;
+    // SAFETY: `write_reply` keeps to the stack it is given and raises no
+    // Lua error (see there); the closure leaves the stack empty.
+    let ran = unsafe {
+        lua.exec_raw::<()>(table, |state| {
+            written = write_reply(state, 1, &mut out, 0, protocol);
+            mlua::ffi::lua_settop(state, 0);
+        })
+    };
+    (ran.is_ok() && written).then_some(out)
+}
+
+/// How deep `write_reply` goes before it leaves a reply to
+/// `lua_to_resp_inner`, which knows the limits a deeper one runs into
+/// (`LUA_SCRIPT_RESP_ENCODE_MAX_DEPTH`, the chains of one-element tables).
+const FAST_REPLY_MAX_DEPTH: u32 = 32;
+
+/// Write the value at `idx` of Lua's stack as `lua_to_resp_inner` writes it,
+/// for the shapes nearly every script returns: nil, booleans, numbers,
+/// strings, `{ok = ...}`, `{err = ...}` (as the whole reply) and arrays of
+/// those. False, with what was written to be thrown away, for anything else:
+/// a table with `double`, `big_number`, `verbatim_string`, `set` or `map`,
+/// an error inside an array, a reply deeper than [`FAST_REPLY_MAX_DEPTH`].
+///
+/// Nothing here raises a Lua error, so nothing here can be jumped over: the
+/// table lookups are raw, the keys are C strings Lua keeps cached, and no
+/// value is converted in place (`lua_tolstring` only of strings).
+unsafe fn write_reply(
+    state: *mut mlua::ffi::lua_State,
+    idx: std::ffi::c_int,
+    out: &mut Vec<u8>,
+    depth: u32,
+    protocol: ReplyProtocol,
+) -> bool {
+    use crate::resp::write::push_decimal;
+    use mlua::ffi;
+    let null = |out: &mut Vec<u8>| {
+        out.extend_from_slice(if protocol.client >= 3 {
+            b"_\r\n"
+        } else {
+            b"$-1\r\n"
+        })
+    };
+    let integer = |out: &mut Vec<u8>, n: i64| {
+        out.push(b':');
+        if n < 0 {
+            out.push(b'-');
+        }
+        push_decimal(out, n.unsigned_abs());
+        out.extend_from_slice(b"\r\n");
+    };
+    unsafe {
+        match ffi::lua_type(state, idx) {
+            ffi::LUA_TBOOLEAN => {
+                let b = ffi::lua_toboolean(state, idx) != 0;
+                if protocol.script >= 3 {
+                    if protocol.client >= 3 {
+                        out.extend_from_slice(if b { b"#t\r\n" } else { b"#f\r\n" });
+                    } else {
+                        integer(out, i64::from(b));
+                    }
+                } else if b {
+                    integer(out, 1);
+                } else {
+                    null(out);
+                }
+            }
+            ffi::LUA_TNUMBER => {
+                if ffi::lua_isinteger(state, idx) != 0 {
+                    integer(out, ffi::lua_tointeger(state, idx));
+                } else {
+                    integer(out, lua_number_reply(ffi::lua_tonumber(state, idx)));
+                }
+            }
+            ffi::LUA_TSTRING => {
+                let mut len = 0usize;
+                let ptr = ffi::lua_tolstring(state, idx, &mut len);
+                crate::resp::write::push_header(out, b'$', len);
+                out.extend_from_slice(std::slice::from_raw_parts(ptr.cast::<u8>(), len));
+                out.extend_from_slice(b"\r\n");
+            }
+            ffi::LUA_TTABLE => {
+                if depth >= FAST_REPLY_MAX_DEPTH || ffi::lua_checkstack(state, 3) == 0 {
+                    return false;
+                }
+                // An array is written up to its first nil.
+                let mut count: ffi::lua_Integer = 0;
+                while ffi::lua_rawgeti(state, idx, count + 1) != ffi::LUA_TNIL {
+                    ffi::lua_pop(state, 1);
+                    count += 1;
+                }
+                ffi::lua_pop(state, 1);
+                // A short table holding nothing but those has none of the
+                // keys looked for below: walked, it is known to have no other
+                // key at all, which costs less than asking for seven.
+                if count > PLAIN_ARRAY_WALK || !holds_only(state, idx, count) {
+                    ffi::lua_pushstring(state, c"ok".as_ptr());
+                    if ffi::lua_rawget(state, idx) == ffi::LUA_TSTRING {
+                        let mut len = 0usize;
+                        let ptr = ffi::lua_tolstring(state, -1, &mut len);
+                        let start = out.len();
+                        out.push(b'+');
+                        out.extend_from_slice(std::slice::from_raw_parts(ptr.cast::<u8>(), len));
+                        ffi::lua_pop(state, 1);
+                        for byte in &mut out[start + 1..] {
+                            if matches!(*byte, b'\r' | b'\n') {
+                                *byte = b' ';
+                            }
+                        }
+                        out.extend_from_slice(b"\r\n");
+                        return true;
+                    }
+                    ffi::lua_pop(state, 1);
+                    // `{err = ...}`, as the whole reply only: an error reply is
+                    // counted (`INFO errorstats`) as it is written, and one
+                    // inside an array would be counted again if the rest of the
+                    // array were then left to `lua_to_resp_inner`.
+                    ffi::lua_pushstring(state, c"err".as_ptr());
+                    if ffi::lua_rawget(state, idx) == ffi::LUA_TSTRING {
+                        if depth > 0 {
+                            ffi::lua_pop(state, 1);
+                            return false;
+                        }
+                        let mut len = 0usize;
+                        let ptr = ffi::lua_tolstring(state, -1, &mut len);
+                        let text = String::from_utf8_lossy(std::slice::from_raw_parts(
+                            ptr.cast::<u8>(),
+                            len,
+                        ))
+                        .into_owned();
+                        ffi::lua_pop(state, 1);
+                        out.extend_from_slice(&resp_error(&text));
+                        return true;
+                    }
+                    ffi::lua_pop(state, 1);
+                    for key in [c"double", c"big_number", c"verbatim_string", c"set", c"map"] {
+                        ffi::lua_pushstring(state, key.as_ptr());
+                        let kind = ffi::lua_rawget(state, idx);
+                        ffi::lua_pop(state, 1);
+                        if kind != ffi::LUA_TNIL {
+                            return false;
+                        }
+                    }
+                }
+                crate::resp::write::push_header(out, b'*', count as usize);
+                for at in 1..=count {
+                    ffi::lua_rawgeti(state, idx, at);
+                    let item = ffi::lua_gettop(state);
+                    let written = write_reply(state, item, out, depth + 1, protocol);
+                    ffi::lua_pop(state, 1);
+                    if !written {
+                        return false;
+                    }
+                }
+            }
+            // Nil; and functions, coroutines and userdata: a null, as in Redis.
+            _ => null(out),
+        }
+    }
+    true
+}
+
+/// The longest array `write_reply` walks to see whether it holds anything
+/// else: past this, asking for the seven keys is the cheaper.
+const PLAIN_ARRAY_WALK: mlua::ffi::lua_Integer = 16;
+
+/// Whether the table at `idx` holds exactly `count` entries (which are then
+/// its keys 1 to `count`): walked with `lua_next`, which raises no error for
+/// keys it gave itself.
+unsafe fn holds_only(
+    state: *mut mlua::ffi::lua_State,
+    idx: std::ffi::c_int,
+    count: mlua::ffi::lua_Integer,
+) -> bool {
+    use mlua::ffi;
+    let mut entries: mlua::ffi::lua_Integer = 0;
+    unsafe {
+        ffi::lua_pushnil(state);
+        while ffi::lua_next(state, idx) != 0 {
+            ffi::lua_pop(state, 1);
+            entries += 1;
+            if entries > count {
+                ffi::lua_pop(state, 1);
+                return false;
+            }
+        }
+    }
+    entries == count
 }
 
 /// The protocols a script's reply is written in, as Redis's
@@ -3068,6 +3335,7 @@ impl ReplyProtocol {
                         // which outlives the script and the conversion of
                         // its reply.
                         unsafe { &*(se.ctx_addr as *const Ctx<'_>) }.resp
+                            & crate::commands::ctx::RESP_VERSION
                     };
                     Self {
                         client,
@@ -3520,19 +3788,19 @@ unsafe fn run_and_push(state: *mut mlua::ffi::lua_State) -> bool {
         ));
         return false;
     }
-    // A string is used where Lua has it; a number is written out.
-    enum Arg {
-        Lua(*const u8, usize),
-        Written(usize),
-    }
+    // A string is used where Lua has it; a number is written out, into
+    // `written`, and used where it was written: the bytes of each stay where
+    // they are as `written` grows (#901: one list of arguments, not two).
     let mut written: Vec<Vec<u8>> = Vec::new();
-    let mut args: Vec<Arg> = Vec::with_capacity(count as usize);
+    let mut cmd: Vec<&[u8]> = Vec::with_capacity(count as usize);
     for index in 1..=count {
         let bytes = match unsafe { ffi::lua_type(state, index) } {
             ffi::LUA_TSTRING => {
                 let mut len = 0usize;
                 let ptr = unsafe { ffi::lua_tolstring(state, index, &mut len) };
-                args.push(Arg::Lua(ptr.cast(), len));
+                // SAFETY: Lua keeps a string that is on its stack, and these
+                // stay on it until this function returns.
+                cmd.push(unsafe { std::slice::from_raw_parts(ptr.cast(), len) });
                 continue;
             }
             ffi::LUA_TNUMBER => {
@@ -3558,18 +3826,11 @@ unsafe fn run_and_push(state: *mut mlua::ffi::lua_State) -> bool {
                 return false;
             }
         };
+        // SAFETY: the bytes are on the heap, held by `written`, which keeps
+        // them, unchanged and in place, until this function returns.
+        cmd.push(unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) });
         written.push(bytes);
-        args.push(Arg::Written(written.len() - 1));
     }
-    let cmd: Vec<&[u8]> = args
-        .iter()
-        .map(|arg| match arg {
-            // SAFETY: Lua keeps a string that is on its stack, and these
-            // stay on it until this function returns.
-            Arg::Lua(ptr, len) => unsafe { std::slice::from_raw_parts(*ptr, *len) },
-            Arg::Written(at) => written[*at].as_slice(),
-        })
-        .collect();
 
     let ctx = unsafe { &mut *(addr as *mut Ctx<'_>) };
     let reply = execute_command_from_script(ctx, cmd, read_only);
@@ -3726,8 +3987,63 @@ fn install_redis_eval_handlers(lua: &Lua) -> Result<(), String> {
     redis_table
         .set("pcall", fast_pcall)
         .map_err(|e| e.to_string())?;
+    install_global_lookup(lua)?;
     lua.set_app_data(RedisHandlersInstalled);
     Ok(())
+}
+
+/// What a global missing from `_G` is, made a table (#901). The globals'
+/// `__index` is `env_index`, a Lua function, so every `redis.call(...)`
+/// began with a call of it to find `redis`. In its place goes a table that
+/// holds what `env_index` gives for `_G`, `redis`, `cjson`, `cmsgpack` and
+/// `bit`, and whose own `__index` hands any other name to `env_index` (by a
+/// tail call: its error names the script's line, as before).
+/// `getmetatable(_G).__index` still gives `env_index`: the table is not
+/// reachable from a script, which could otherwise change it with `rawset`.
+///
+/// Done once a VM, when it runs its first script, and not when it is made:
+/// what a new VM allocates moves what the functions VM holds after a run of
+/// `FUNCTION LOAD`s (`test_function_loads_are_collected`). Nothing a script
+/// sent has run in the VM before this.
+const GLOBAL_LOOKUP: &str = r#"
+local G, globals_mt, view_mt = ...
+local env_index = rawget(globals_mt, "__index")
+local lookup = { _G = G }
+for _, name in ipairs({ "redis", "cjson", "cmsgpack", "bit" }) do
+    lookup[name] = env_index(G, name)
+end
+setmetatable(lookup, {
+    __index = function(_, k)
+        return env_index(G, k)
+    end,
+    __newindex = rawget(globals_mt, "__newindex"),
+})
+rawset(globals_mt, "__index", lookup)
+rawset(view_mt, "__index", function(_, k)
+    if k == "__index" then
+        return env_index
+    end
+    return globals_mt[k]
+end)
+"#;
+
+fn install_global_lookup(lua: &Lua) -> Result<(), String> {
+    let globals = lua.globals();
+    let Some(globals_mt) = globals.metatable() else {
+        return Ok(());
+    };
+    // The view of the globals' metatable that `getmetatable(_G)` gives.
+    let getmetatable: LuaFunction = globals.raw_get("getmetatable").map_err(|e| e.to_string())?;
+    let view: LuaTable = getmetatable
+        .call(globals.clone())
+        .map_err(|e| e.to_string())?;
+    let Some(view_mt) = view.metatable() else {
+        return Ok(());
+    };
+    lua.load(GLOBAL_LOOKUP)
+        .set_name("=kividb_globals")
+        .call::<()>((globals, globals_mt, view_mt))
+        .map_err(|e| e.to_string())
 }
 
 fn set_global_keys_argv<A: AsRef<[u8]>>(lua: &Lua, keys: &[A], argv: &[A]) -> Result<(), String> {
@@ -3743,6 +4059,15 @@ fn set_global_keys_argv<A: AsRef<[u8]>>(lua: &Lua, keys: &[A], argv: &[A]) -> Re
             use mlua::ffi;
             ffi::lua_checkstack(state, 6);
             ffi::lua_rawgeti(state, ffi::LUA_REGISTRYINDEX, ffi::LUA_RIDX_GLOBALS);
+            // KEYS and ARGV are unset before the next call's are built: what
+            // runs while they are (a collection can) does not see the last
+            // call's. Both keys are in the table already, so this allocates
+            // nothing.
+            for name in [c"KEYS", c"ARGV"] {
+                ffi::lua_pushstring(state, name.as_ptr());
+                ffi::lua_pushnil(state);
+                ffi::lua_rawset(state, -3);
+            }
             for (name, items) in [(c"KEYS", keys), (c"ARGV", argv)] {
                 ffi::lua_pushstring(state, name.as_ptr());
                 ffi::lua_createtable(state, items.len() as std::ffi::c_int, 0);
@@ -3849,9 +4174,9 @@ fn eval(ctx: &mut Ctx, use_sha: bool, read_only: bool) -> Vec<u8> {
     // The arguments where they are, not copies: they are copied once, into
     // the Lua strings the script sees. (What they point at is the caller's
     // and outlives the script; `ctx.cmd` itself is swapped by each
-    // `redis.call`, which is why these are taken out of it first.)
-    let keys: Vec<&[u8]> = ctx.cmd[3..3 + numkeys].to_vec();
-    let argv: Vec<&[u8]> = ctx.cmd[3 + numkeys..].to_vec();
+    // `redis.call`, which is why these are taken out of it first.) One
+    // list, the keys first.
+    let args: Vec<&[u8]> = ctx.cmd[3..].to_vec();
 
     let ctx_ptr: *mut Ctx = ctx;
 
@@ -3859,7 +4184,7 @@ fn eval(ctx: &mut Ctx, use_sha: bool, read_only: bool) -> Vec<u8> {
     let client_id = ctx.client_id;
     count_script_commands(registry, client_id, || {
         match try_with_lua(Vm::Eval, |lua| {
-            eval_script(lua, ctx_ptr, &source, keys, argv, read_only)
+            eval_script(lua, ctx_ptr, &source, &args, numkeys, read_only)
         }) {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => script_error_to_resp(&e, &sha1_hex(&source)),
@@ -4498,11 +4823,12 @@ fn eval_script(
     lua: &Lua,
     ctx_ptr: *mut Ctx,
     source: &Arc<str>,
-    keys: Vec<&[u8]>,
-    argv: Vec<&[u8]>,
+    args: &[&[u8]],
+    numkeys: usize,
     read_only: bool,
 ) -> Result<Vec<u8>, String> {
     let ctx = unsafe { &mut *ctx_ptr };
+    let (keys, argv) = args.split_at(numkeys);
     let saved_db = *ctx.selected_db;
 
     let had_shebang = source.starts_with("#!");
@@ -4535,14 +4861,17 @@ fn eval_script(
         });
     });
 
-    let _clear_eval = ClearScriptEval { lua };
+    let _clear_eval = ClearScriptEval {
+        lua,
+        release_arguments: arguments_worth_releasing(keys, argv),
+    };
     // What the script writes goes to replicas between a `MULTI` and an
     // `EXEC`, and to the AOF as one piece, when it ends (#172).
     let _propagation =
         crate::replication::PropagationGroup::begin(ctx.repl_state, ctx.hub_tx, ctx.aof_tx);
 
     install_redis_eval_handlers(lua)?;
-    set_global_keys_argv(lua, &keys, &argv)?;
+    set_global_keys_argv(lua, keys, argv)?;
 
     install_eval_timeout_hook(lua)?;
     let _hook_guard = LuaHookGuard(lua);
@@ -4654,7 +4983,10 @@ fn eval_function_call(
         });
     });
 
-    let _clear_eval = ClearScriptEval { lua };
+    let _clear_eval = ClearScriptEval {
+        lua,
+        release_arguments: arguments_worth_releasing(&keys, &argv),
+    };
     // What the script writes goes to replicas between a `MULTI` and an
     // `EXEC`, and to the AOF as one piece, when it ends (#172).
     let _propagation =
@@ -5797,7 +6129,7 @@ mod lua_busy_allow_tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         for flusher in [true, false] {
             let done_tx = done_tx.clone();
-            std::thread::spawn(move || {
+            crate::cpus::spawn(move || {
                 for _ in 0..200_000 {
                     if flusher {
                         let _ = flush_functions(false);
@@ -5911,5 +6243,201 @@ mod resp_parse_key_tests {
             let err = parse_resp_value(&lua, buf, 0).unwrap_err().to_string();
             assert!(err.contains("must not be nil"), "{err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod reply_writer_tests {
+    use super::*;
+
+    const PROTOCOLS: [ReplyProtocol; 4] = [
+        ReplyProtocol {
+            client: 2,
+            script: 2,
+        },
+        ReplyProtocol {
+            client: 3,
+            script: 2,
+        },
+        ReplyProtocol {
+            client: 2,
+            script: 3,
+        },
+        ReplyProtocol {
+            client: 3,
+            script: 3,
+        },
+    ];
+
+    /// The reply `src` evaluates to, written by the path scripts take and by
+    /// the one before #901 (`lua_to_resp_inner` alone), for every protocol:
+    /// the same bytes, or the same error. Where `write_reply` writes the
+    /// reply itself, that is checked as well. True if it did.
+    fn same_reply(lua: &Lua, src: &str) -> bool {
+        let value: LuaValue = lua
+            .load(src)
+            .eval()
+            .unwrap_or_else(|e| panic!("{src}: {e}"));
+        let mut fast = false;
+        for protocol in PROTOCOLS {
+            let old = lua_to_resp_inner(lua, value.clone(), 0, protocol).map_err(|e| e.to_string());
+            let new = reply_to_resp(lua, value.clone(), protocol).map_err(|e| e.to_string());
+            assert_eq!(
+                new, old,
+                "{src} (client {}, script {})",
+                protocol.client, protocol.script
+            );
+            if let LuaValue::Table(table) = &value
+                && let Some(out) = fast_table_reply(lua, table, protocol)
+            {
+                assert_eq!(Ok(out), old, "{src}: write_reply");
+                fast = true;
+            }
+        }
+        fast
+    }
+
+    #[test]
+    fn write_reply_writes_what_the_old_path_writes() {
+        let lua = new_lua_vm();
+        let fast = [
+            "return {}",
+            "return {1, 2, 3}",
+            "return {1, nil, 3}",
+            "return {nil, 2}",
+            "return {'a', 'b', {'c', {'d'}}}",
+            "return {ok = 'fine'}",
+            "return {ok = 'a\\r\\nb\\nc'}",
+            "return {ok = ''}",
+            "return {err = 'ERR bad'}",
+            "return {err = 'no prefix'}",
+            "return {err = '\\255\\254'}",
+            "return {ok = 5, 1}",
+            "return {ok = 5}",
+            "return {err = 5}",
+            "return {x = 1, 2}",
+            "return {'a\\0b', '', 'x'}",
+            "return {math.mininteger, math.maxinteger, -1, 0}",
+            "return {3.0, 3.7, -2.5, 0/0, 1/0, -1/0, -0.0, 2^63, -2^63, 1e300}",
+            "return {true, false, true}",
+            "return {1, {2, {3, {4, {5}}}}}",
+        ];
+        for src in fast {
+            assert!(same_reply(&lua, src), "{src}: write_reply did not write it");
+        }
+        let other = [
+            "return nil",
+            "return true",
+            "return false",
+            "return 1",
+            "return 1.5",
+            "return 'x\\0y'",
+            "return ''",
+            "return {1, {err = 'ERR nested'}}",
+            "return {{ok = 'nested'}, 2}",
+            "return {1, set = {}}",
+            "return {set = {a = true}}",
+            "return {map = {a = 1}}",
+            "return {map = {}}",
+            "return {double = 1.5}",
+            "return {double = 3}",
+            "return {double = 'x'}",
+            "return {big_number = '12345678901234567890'}",
+            "return {big_number = 5}",
+            "return {verbatim_string = {format = 'txt', string = 'hi'}}",
+            "return {verbatim_string = {format = 1, string = 'hi'}}",
+            "return {map = 1, 7}",
+            "return {set = 'x', 8}",
+            "return {ok = 'both', err = 'both'}",
+            "return function() end",
+            "return {function() end, coroutine.create(function() end)}",
+            "local t = {} t[1] = t return t",
+            "local t = {} t[1] = {t} return t",
+            "local t = {} local c = t for i = 1, 33 do c[1] = {} c = c[1] end return t",
+            "local t = {} local c = t for i = 1, 65 do c[1] = {} c = c[1] end return t",
+            "local t = {} local c = t for i = 1, 33 do c[1] = i c[2] = {} c = c[2] end return t",
+            "local t = {} local c = t for i = 1, 65 do c[1] = i c[2] = {} c = c[2] end return t",
+            "local t = {} local c = t for i = 1, 9000 do c[1] = {} c = c[1] end return t",
+        ];
+        for src in other {
+            same_reply(&lua, src);
+        }
+    }
+
+    /// Random nested values from a fixed seed: what a script returns, of
+    /// every shape the writer knows and some it leaves.
+    struct Gen(u64);
+
+    impl Gen {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+
+        fn pick<'a>(&mut self, from: &[&'a str]) -> &'a str {
+            from[self.next() as usize % from.len()]
+        }
+
+        fn value(&mut self, depth: u32) -> String {
+            const SCALARS: [&str; 16] = [
+                "nil",
+                "true",
+                "false",
+                "0",
+                "-1",
+                "42",
+                "3.0",
+                "2.5",
+                "0/0",
+                "1/0",
+                "math.mininteger",
+                "'s'",
+                "''",
+                "'a\\0b'",
+                "'ERR x'",
+                "'\\r\\n'",
+            ];
+            let kind = if depth >= 4 { 0 } else { self.next() % 6 };
+            match kind {
+                0 | 1 => self.pick(&SCALARS).to_string(),
+                2 | 3 => {
+                    let n = self.next() % 6;
+                    let items: Vec<String> = (0..n).map(|_| self.value(depth + 1)).collect();
+                    format!("{{{}}}", items.join(", "))
+                }
+                4 => {
+                    let inner = self.value(depth + 1);
+                    match self.next() % 10 {
+                        0 => format!("{{ok = {}}}", self.pick(&["'fine'", "5", "'a\\nb'"])),
+                        1 => format!("{{err = {}}}", self.pick(&["'ERR e'", "'plain'", "7"])),
+                        2 => format!("{{double = {}}}", self.pick(&["1.5", "2", "'x'"])),
+                        3 => format!("{{set = {{a = true}}, {inner}}}"),
+                        4 => format!("{{map = {{k = {inner}}}}}"),
+                        5 => format!("{{big_number = '{}'}}", self.next()),
+                        6 => format!("{{x = 1, {inner}}}"),
+                        7 => format!("{{[2] = {inner}}}"),
+                        8 => format!("{{[1] = {{[1] = {inner}}}}}"),
+                        _ => format!("{{{inner}, nil, {inner}}}"),
+                    }
+                }
+                _ => format!("{{{}}}", self.value(depth + 1)),
+            }
+        }
+    }
+
+    #[test]
+    fn write_reply_writes_what_the_old_path_writes_for_random_values() {
+        let lua = new_lua_vm();
+        let mut generator = Gen(901);
+        let mut fast = 0;
+        for _ in 0..400 {
+            let src = format!("return {}", generator.value(0));
+            fast += usize::from(same_reply(&lua, &src));
+        }
+        // A good part of them is written the new way.
+        assert!(fast > 100, "{fast}");
     }
 }

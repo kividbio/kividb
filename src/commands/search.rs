@@ -2788,7 +2788,8 @@ fn coordinate(
         // it is dropped.
         let parts: Vec<&'static [u8]> = unsafe { std::mem::transmute(parts) };
         let saved_cmd = std::mem::replace(&mut ctx.cmd, parts);
-        let saved_resp = std::mem::replace(&mut ctx.resp, 2);
+        let saved_resp = ctx.resp;
+        ctx.resp = (saved_resp & crate::commands::ctx::RESP_NO_TOUCH) | 2;
         /// Clears `SHARD` however the search ends: left set by a panic, it
         /// would make every later search on this thread answer as a shard.
         struct NotAShard;

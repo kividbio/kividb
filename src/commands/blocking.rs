@@ -206,6 +206,21 @@ pub fn test_park_delay() -> Option<Duration> {
     })
 }
 
+/// In the test build, `KIVIDB_TEST_WOKEN_DELAY_MS`: a client woken in its
+/// wait is held this long before it is taken off the list of blocked
+/// clients, so that a test can `CLIENT UNBLOCK` it in between.
+#[cfg(debug_assertions)]
+pub fn test_woken_delay() -> Option<Duration> {
+    static DELAY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let ms: u64 = std::env::var("KIVIDB_TEST_WOKEN_DELAY_MS")
+            .ok()?
+            .parse()
+            .ok()?;
+        Some(Duration::from_millis(ms))
+    })
+}
+
 /// How a wait ended, when it was not by what was waited for or by its
 /// timeout. Kept by the connection loop across the dispatch that resumes
 /// the command, which is where the command tidies up after itself.
@@ -418,6 +433,35 @@ pub struct BlockingSlot {
     owner: u64,
     /// Whether the dispatch under way collects the clients it wakes.
     collecting: bool,
+    /// The client's count in `blocked_clients` from the end of its wait to
+    /// the end of the dispatch that resumes it. See [`BlockedCount`].
+    held_count: Option<BlockedCount>,
+}
+
+/// One client's place in `blocked_clients`, for as long as its blocking
+/// command is not done: from the moment it parks until the dispatch that
+/// resumes it has run and been counted in `INFO commandstats`. Counted off
+/// when this is dropped, so a reader that sees the client no longer blocked
+/// also sees the call (#896). A zero-sized token: the slot holds it between
+/// the end of the wait and the end of the resume dispatch.
+///
+/// `CLIENT LIST`'s `b` flag is not this: it clears at the end of the wait,
+/// while the count stays until the resumed command has been counted. The
+/// decrement is a release and `INFO` reads with acquire, so that on a
+/// weakly ordered CPU a reader that sees the count down also sees the call.
+pub struct BlockedCount;
+
+impl BlockedCount {
+    pub fn enter() -> Self {
+        crate::stats::BLOCKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
+        BlockedCount
+    }
+}
+
+impl Drop for BlockedCount {
+    fn drop(&mut self) {
+        crate::stats::BLOCKED_CLIENTS.fetch_sub(1, Ordering::Release);
+    }
 }
 
 impl Drop for BlockingSlot {
@@ -605,6 +649,30 @@ impl BlockingSlot {
     fn resume_over(&mut self) {
         self.ctl.state = None;
         self.ctl.resume = None;
+        // The call is counted by now: the client stops being blocked.
+        self.held_count = None;
+    }
+
+    /// Whether the slot still counts its client as blocked (see
+    /// [`BlockedCount`]).
+    pub fn holds_count(&self) -> bool {
+        self.held_count.is_some()
+    }
+
+    /// The count the last wait left, for a wait that follows it (a resumed
+    /// command that parks again) to go on with.
+    pub fn take_count(&mut self) -> Option<BlockedCount> {
+        self.held_count.take()
+    }
+
+    /// Keep the client counted as blocked until its resume dispatch is over.
+    pub fn hold_count(&mut self, count: Option<BlockedCount>) {
+        self.held_count = count;
+    }
+
+    /// The client is not going to be resumed: stop counting it.
+    pub fn release_count(&mut self) {
+        self.held_count = None;
     }
 
     /// Whether the dispatch just completed was a resume.
@@ -763,6 +831,20 @@ pub fn hold_for_pause(ctx: &mut crate::commands::ctx::Ctx) -> Vec<u8> {
     crate::pause::HELD_IN_GATE.to_vec()
 }
 
+thread_local! {
+    /// Set by [`wait_for_keys`] when it ends taking nothing, for the
+    /// command's `settle_written_keys` on the same thread to ask
+    /// ([`took_nothing`]).
+    static TOOK_NOTHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the blocking pop this thread has just run ended taking nothing:
+/// its time ran out, `CLIENT UNBLOCK` ended it, or its client had gone.
+/// Asked once, after the command, by `settle_written_keys`.
+pub fn took_nothing() -> bool {
+    TOOK_NOTHING.with(|took| took.replace(false))
+}
+
 /// Run a command that waits until one of `keys` has something for it.
 ///
 /// `attempt` is the command's non-blocking form: `Some(reply)` once it has
@@ -804,6 +886,7 @@ pub fn wait_for_keys(
     mut attempt: impl FnMut(&mut crate::commands::ctx::Ctx, &[Vec<u8>]) -> Option<Vec<u8>>,
     empty: impl Fn() -> Vec<u8>,
 ) -> Vec<u8> {
+    TOOK_NOTHING.with(|took| took.set(false));
     let gone = client_gone(ctx);
     let resumed = take_resume(ctx);
     let (deadline, ticket) = match take_state(ctx) {
@@ -818,6 +901,7 @@ pub fn wait_for_keys(
         // nothing, and the turn to the client behind, which may have been
         // this one's.
         leave_lines(ctx, keys, &ticket);
+        TOOK_NOTHING.with(|took| took.set(true));
         return empty();
     }
     let timed_out = matches!(resumed, Some(None));
@@ -916,6 +1000,7 @@ pub fn wait_for_keys(
         (None, Some(remaining)) if !timed_out => Err(remaining),
         (None, _) => {
             crate::stats::record_miss();
+            TOOK_NOTHING.with(|took| took.set(true));
             // A wait that ran out is answered with a null array. A caller
             // that cannot wait (`MULTI`, a script, the replica applier) whose
             // tiny timeout passed while it looked never waited: it gets the
@@ -961,6 +1046,7 @@ pub fn wait_for_keys(
         // It never stood in line (`may_park` above).
         ParkOutcome::CannotWait => {
             crate::stats::record_miss();
+            TOOK_NOTHING.with(|took| took.set(true));
             empty()
         }
     }
@@ -1116,18 +1202,10 @@ impl BlockingWait {
     /// receiver is raced in its own task and the first to fire wins. Keeping the
     /// mechanism identical is deliberate — the change being made here is *where*
     /// the wait happens, not how it resolves.
+    ///
+    /// Not counted in `blocked_clients` here: the connection loop holds a
+    /// [`BlockedCount`] across the wait and the resume dispatch.
     pub async fn wait(self) -> Delivery {
-        // Counted for as long as this future lives, and uncounted when it is
-        // dropped — which it is, without finishing, when the client goes
-        // away or is unblocked while it waits.
-        struct Counted;
-        impl Drop for Counted {
-            fn drop(&mut self) {
-                crate::stats::BLOCKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-        crate::stats::BLOCKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
-        let _counted = Counted;
         self.race().await
     }
 
@@ -1203,7 +1281,7 @@ mod tests {
     fn resolves_on_a_current_thread_runtime() {
         let (tx, rx) = oneshot::channel();
         let val: Value = Arc::from(b"hello".as_slice());
-        std::thread::spawn(move || {
+        crate::cpus::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             let _ = tx.send(val);
         });
@@ -1228,7 +1306,7 @@ mod tests {
         let (_tx1, rx1) = oneshot::channel();
         let (tx2, rx2) = oneshot::channel();
         let (_tx3, rx3) = oneshot::channel();
-        std::thread::spawn(move || {
+        crate::cpus::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             let _ = tx2.send(Arc::from(b"v".as_slice()) as Value);
         });

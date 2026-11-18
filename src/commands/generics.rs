@@ -34,13 +34,12 @@ pub(crate) fn scans_whole(value: ValueRef<'_>) -> bool {
         ValueRef::Set(set) => !set.read().is_table(),
         ValueRef::Hash(hash) => !hash.read().is_table(),
         ValueRef::HashEx(hash) => !hash.read().fields.is_table(),
+        ValueRef::SortedSet(zset) => zset.read().is_packed(),
         _ => matches!(encoding_of(value), "listpack" | "listpackex"),
     }
 }
 
 pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
-    // An entry of a compact structure is at most this long.
-    const SMALL: usize = 64;
     match value {
         ValueRef::String(bytes) => {
             let integer = bytes.len() <= 20
@@ -56,26 +55,12 @@ pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
                 "raw"
             }
         }
-        ValueRef::List(list) => {
-            let list = list.read();
-            // One node of a quicklist holds 8 kB.
-            if list.iter().map(|element| element.len() + 11).sum::<usize>() <= 8192 {
-                "listpack"
-            } else {
-                "quicklist"
-            }
-        }
+        // The form it is really kept in: one chunk, or more.
+        ValueRef::List(list) => list.read().encoding().name(),
         // The form it is really kept in (#297).
         ValueRef::Set(set) => set.read().encoding().name(),
-        ValueRef::SortedSet(zset) => {
-            let zset = zset.read();
-            if zset.members.len() <= 128 && zset.members.keys().all(|member| member.len() <= SMALL)
-            {
-                "listpack"
-            } else {
-                "skiplist"
-            }
-        }
+        // The form it is really kept in: a block, or a table and a tree.
+        ValueRef::SortedSet(zset) => zset.read().encoding().name(),
         // The form it is really kept in: a block, or a table. With a field
         // TTL a block is a `listpackex`, as Redis names it.
         ValueRef::Hash(hash) => match hash.read().encoding() {
@@ -1538,10 +1523,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let mut elements: Vec<Arc<[u8]>> = match map.get(key) {
                 None => vec![], // ← don't return, just give empty vec
-                Some(ValueRef::List(l)) => l.read().iter().cloned().collect(),
+                Some(ValueRef::List(l)) => l.read().iter().map(|e| e.to_shared()).collect(),
                 Some(ValueRef::Set(s)) => s.read().iter().map(|m| m.to_shared()).collect(),
                 Some(ValueRef::SortedSet(z)) => {
-                    z.read().by_score.keys().map(|(_, m)| m.clone()).collect()
+                    z.read().iter().map(|(m, _)| m.to_shared()).collect()
                 }
                 Some(_) => {
                     return Some(resp_error(
@@ -1707,9 +1692,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             // ── STORE → write result as List, return count ─────────────────────
             if let Some(ref dst) = store_dst {
-                let new_list: std::collections::VecDeque<Arc<[u8]>> = raw_output
+                let new_list: crate::types::ListValues = raw_output
                     .iter()
-                    .map(|v| Arc::from(v.as_deref().unwrap_or_default()))
+                    .map(|v| v.as_deref().unwrap_or_default())
                     .collect();
                 let count = new_list.len() as i64;
                 let db_idx = *ctx.selected_db;

@@ -151,14 +151,17 @@ fn kdb_list_basic() {
         Arc::from(b"gamma".as_slice()),
     ]
     .into();
-    let v = roundtrip_one("lst", KiviDBValue::List(Arc::new(RwLock::new(deque))));
+    let v = roundtrip_one(
+        "lst",
+        KiviDBValue::List(Arc::new(RwLock::new(deque.into_iter().collect()))),
+    );
     match v {
         KiviDBValue::List(l) => {
             let inner = l.read();
             assert_eq!(inner.len(), 3);
-            assert_eq!(inner[0].as_ref(), b"alpha");
-            assert_eq!(inner[1].as_ref(), b"beta");
-            assert_eq!(inner[2].as_ref(), b"gamma");
+            assert_eq!(&*inner.get(0).unwrap(), b"alpha");
+            assert_eq!(&*inner.get(1).unwrap(), b"beta");
+            assert_eq!(&*inner.get(2).unwrap(), b"gamma");
         }
         _ => panic!("wrong type"),
     }
@@ -171,13 +174,16 @@ fn kdb_list_order_preserved() {
         .map(|i| Arc::from(i.to_string().as_bytes()))
         .collect();
     let deque: VecDeque<Arc<[u8]>> = items.clone().into();
-    let v = roundtrip_one("ordered", KiviDBValue::List(Arc::new(RwLock::new(deque))));
+    let v = roundtrip_one(
+        "ordered",
+        KiviDBValue::List(Arc::new(RwLock::new(deque.into_iter().collect()))),
+    );
     match v {
         KiviDBValue::List(l) => {
             let inner = l.read();
             assert_eq!(inner.len(), 100);
             for (i, item) in inner.iter().enumerate() {
-                assert_eq!(item.as_ref(), i.to_string().as_bytes());
+                assert_eq!(&*item, i.to_string().as_bytes());
             }
         }
         _ => panic!("wrong type"),
@@ -188,7 +194,7 @@ fn kdb_list_order_preserved() {
 fn kdb_list_empty() {
     let v = roundtrip_one(
         "empty_list",
-        KiviDBValue::List(Arc::new(RwLock::new(VecDeque::new()))),
+        KiviDBValue::List(Arc::new(RwLock::new(Default::default()))),
     );
     match v {
         KiviDBValue::List(l) => assert!(l.read().is_empty()),
@@ -295,9 +301,9 @@ fn kdb_sorted_set_basic() {
         KiviDBValue::SortedSet(s) => {
             let inner = s.read();
             assert_eq!(inner.len(), 3);
-            assert_eq!(*inner.members.get(b"a".as_slice()).unwrap(), 1.0);
-            assert_eq!(*inner.members.get(b"b".as_slice()).unwrap(), 2.5);
-            assert_eq!(*inner.members.get(b"c".as_slice()).unwrap(), -1.0);
+            assert_eq!(inner.score(b"a").unwrap(), 1.0);
+            assert_eq!(inner.score(b"b").unwrap(), 2.5);
+            assert_eq!(inner.score(b"c").unwrap(), -1.0);
         }
         _ => panic!("wrong type"),
     }
@@ -314,7 +320,7 @@ fn kdb_sorted_set_score_precision() {
     match v {
         KiviDBValue::SortedSet(s) => {
             let inner = s.read();
-            let loaded_score = *inner.members.get(b"pi".as_slice()).unwrap();
+            let loaded_score = inner.score(b"pi").unwrap();
             assert_eq!(loaded_score.to_bits(), score.to_bits()); // exact bit equality
         }
         _ => panic!("wrong type"),
@@ -336,22 +342,10 @@ fn kdb_sorted_set_extreme_scores() {
     match v {
         KiviDBValue::SortedSet(s) => {
             let inner = s.read();
-            assert_eq!(
-                inner.members.get(b"min".as_slice()).unwrap().to_bits(),
-                f64::MIN.to_bits()
-            );
-            assert_eq!(
-                inner.members.get(b"max".as_slice()).unwrap().to_bits(),
-                f64::MAX.to_bits()
-            );
-            assert!(inner.members.get(b"inf".as_slice()).unwrap().is_infinite());
-            assert!(
-                inner
-                    .members
-                    .get(b"neg_inf".as_slice())
-                    .unwrap()
-                    .is_infinite()
-            );
+            assert_eq!(inner.score(b"min").unwrap().to_bits(), f64::MIN.to_bits());
+            assert_eq!(inner.score(b"max").unwrap().to_bits(), f64::MAX.to_bits());
+            assert!(inner.score(b"inf").unwrap().is_infinite());
+            assert!(inner.score(b"neg_inf").unwrap().is_infinite());
         }
         _ => panic!("wrong type"),
     }
@@ -371,8 +365,8 @@ fn kdb_sorted_set_score_order_preserved() {
     match v {
         KiviDBValue::SortedSet(s) => {
             let inner = s.read();
-            // by_score must be in ascending order after load
-            let scores: Vec<f64> = inner.by_score.keys().map(|(score, _)| score.0).collect();
+            // Scores must be in ascending order after load
+            let scores: Vec<f64> = inner.iter().map(|(_, score)| score).collect();
             assert_eq!(scores, vec![1.0, 2.0, 3.0]);
         }
         _ => panic!("wrong type"),
@@ -1218,7 +1212,12 @@ fn kdb_all_types_together() {
     map.insert(
         "list".to_string(),
         KiviDBValue::List(Arc::new(RwLock::new(
-            vec![Arc::from(b"a".as_slice()), Arc::from(b"b".as_slice())].into(),
+            vec![
+                Arc::<[u8]>::from(b"a".as_slice()),
+                Arc::from(b"b".as_slice()),
+            ]
+            .into_iter()
+            .collect(),
         ))),
     );
 
@@ -1531,9 +1530,9 @@ fn rdb_list_basic() {
         KiviDBValue::List(l) => {
             let inner = l.read();
             assert_eq!(inner.len(), 3);
-            assert_eq!(inner[0].as_ref(), b"alpha");
-            assert_eq!(inner[1].as_ref(), b"beta");
-            assert_eq!(inner[2].as_ref(), b"gamma");
+            assert_eq!(&*inner.get(0).unwrap(), b"alpha");
+            assert_eq!(&*inner.get(1).unwrap(), b"beta");
+            assert_eq!(&*inner.get(2).unwrap(), b"gamma");
         }
         _ => panic!("wrong type"),
     }
@@ -1598,8 +1597,8 @@ fn rdb_zset_v1_basic() {
         KiviDBValue::SortedSet(s) => {
             let inner = s.read();
             assert_eq!(inner.len(), 2);
-            assert!((inner.members.get(b"a".as_slice()).unwrap() - 1.5).abs() < 1e-10);
-            assert!((inner.members.get(b"b".as_slice()).unwrap() - 2.5).abs() < 1e-10);
+            assert!((inner.score(b"a").unwrap() - 1.5).abs() < 1e-10);
+            assert!((inner.score(b"b").unwrap() - 2.5).abs() < 1e-10);
         }
         _ => panic!("wrong type"),
     }
@@ -1629,8 +1628,8 @@ fn rdb_zset_v2_basic() {
     match &loaded[0]["zv2"] {
         KiviDBValue::SortedSet(s) => {
             let inner = s.read();
-            assert!((inner.members.get(b"x".as_slice()).unwrap() - 10.0).abs() < 1e-10);
-            assert!((inner.members.get(b"y".as_slice()).unwrap() - (-3.15)).abs() < 1e-10);
+            assert!((inner.score(b"x").unwrap() - 10.0).abs() < 1e-10);
+            assert!((inner.score(b"y").unwrap() - (-3.15)).abs() < 1e-10);
         }
         _ => panic!("wrong type"),
     }
@@ -1977,10 +1976,10 @@ fn rdb_files_written_by_redis_7_4_and_8_10_load() {
         match &db["z"] {
             KiviDBValue::SortedSet(z) => {
                 let z = z.read();
-                let score = |m: &[u8]| z.members.get(m).copied();
+                let score = |m: &[u8]| z.score(m);
                 assert_eq!(score(b"a"), Some(1.0), "Redis {label}");
                 assert_eq!(score(b"b"), Some(2.5), "Redis {label}");
-                assert_eq!(z.members.len(), 2, "Redis {label}");
+                assert_eq!(z.len(), 2, "Redis {label}");
             }
             _ => panic!("Redis {label} z: wrong type"),
         }

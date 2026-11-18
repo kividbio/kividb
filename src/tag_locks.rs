@@ -89,12 +89,13 @@ static STRIPE: [Stripe; STRIPES] = [const { Stripe(parking_lot::const_mutex(()))
 
 /// The hash tag of `key`: what is between the first `{` and the next `}`,
 /// if that is not empty. (As a cluster reads it, except that a key without
-/// one has none, where a cluster hashes the whole key.)
-#[inline]
+/// one has none, where a cluster hashes the whole key.) Always inline: a
+/// call of it cost a client's command on a tagged key more than its look.
+#[inline(always)]
 pub fn tag_of(key: &[u8]) -> Option<&[u8]> {
-    let open = memchr::memchr(b'{', key)?;
+    let open = position_of(b'{', key)?;
     let rest = &key[open + 1..];
-    let close = memchr::memchr(b'}', rest)?;
+    let close = position_of(b'}', rest)?;
     (close > 0).then(|| &rest[..close])
 }
 
@@ -515,6 +516,132 @@ pub fn lock_keys<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Option<KeysGuard> 
     })
 }
 
+/// Whether `key` may carry a hash tag: whether it has a `{` at all. One
+/// without has no tag ([`tag_of`]); one with may not either (`{}`, no `}`).
+/// Eight bytes at a time up to 32, which on the command path costs a short
+/// key less than a call of `memchr` (#889).
+#[inline]
+pub fn may_carry_tag(key: &[u8]) -> bool {
+    position_of(b'{', key).is_some()
+}
+
+/// Where `byte` is first in `hay`: eight bytes at a time up to 32, which
+/// costs a key of a few dozen bytes less than a call of `memchr` (#889);
+/// `memchr` past that.
+#[inline(always)]
+fn position_of(byte: u8, hay: &[u8]) -> Option<usize> {
+    const ONES: u64 = u64::from_ne_bytes([1; 8]);
+    const HIGHS: u64 = ONES << 7;
+    let pattern = ONES * byte as u64;
+    // The bytes of `word` that are `byte` are the zero bytes of `x`. The
+    // lowest bit this sets marks the first of them: it sets a bit that is
+    // not one only above a byte that is (where the subtraction borrowed).
+    let first = |word: &[u8]| {
+        let x = u64::from_le_bytes(word.try_into().unwrap()) ^ pattern;
+        let found = x.wrapping_sub(ONES) & !x & HIGHS;
+        (found != 0).then(|| found.trailing_zeros() as usize / 8)
+    };
+    let len = hay.len();
+    match len {
+        0..8 => hay.iter().position(|&each| each == byte),
+        8..=32 => {
+            let mut at = 0;
+            while at + 8 < len {
+                if let Some(within) = first(&hay[at..at + 8]) {
+                    return Some(at + within);
+                }
+                at += 8;
+            }
+            // The last eight, over bytes looked at already if need be: none
+            // of those was `byte`.
+            first(&hay[len - 8..]).map(|within| len - 8 + within)
+        }
+        _ => memchr::memchr(byte, hay),
+    }
+}
+
+/// Where [`lock_named_keys`] looks for the tags of the keys a client's
+/// command names.
+#[derive(Debug)]
+pub enum NamedKeys {
+    /// Every `step`-th argument from `from` to `last`: the first key that
+    /// may carry a tag, and those after it (`keyspec::regular_key_positions`).
+    Regular {
+        from: usize,
+        last: usize,
+        step: usize,
+    },
+    /// The keys `keyspec::key_positions` finds.
+    Other(crate::keyspec::Keys),
+}
+
+/// The keys of `cmd` (a command from a client, `name` upper case) that
+/// [`lock_keys`] has to look at: `None` when none can carry a tag, which is
+/// what `lock_keys` would find, and then nothing is taken. Most commands
+/// name their keys at regular places and most keys have no `{`, so this
+/// is a look for `{` in each key, without building the general list of
+/// positions (#889).
+#[inline]
+pub fn named_keys(name: &str, cmd: &[&[u8]]) -> Option<NamedKeys> {
+    // A key is an argument: a command of one argument (`GET k`, `INCR k`)
+    // names that one at most, whatever the command, and the table need not
+    // be asked when it has no `{`.
+    let one_argument = cmd.len() == 2;
+    if one_argument && !may_carry_tag(cmd[1]) {
+        return None;
+    }
+    let Some((first, last, step)) = crate::keyspec::regular_key_positions(name, cmd) else {
+        return Some(NamedKeys::Other(crate::keyspec::key_positions(name, cmd)));
+    };
+    // That one has a `{`: whether it is a key is all that is left to know.
+    if one_argument {
+        return (first <= last).then_some(NamedKeys::Regular {
+            from: first,
+            last,
+            step,
+        });
+    }
+    let mut at = first;
+    while at <= last {
+        if may_carry_tag(cmd[at]) {
+            return Some(NamedKeys::Regular {
+                from: at,
+                last,
+                step,
+            });
+        }
+        at += step;
+    }
+    None
+}
+
+/// [`lock_keys`] over the keys a client's command names: the lock of each
+/// tagged one, and `None`, with nothing taken or entered, when none has a
+/// tag. A key before the first that may carry a tag has none, and
+/// `lock_keys` would have passed it by.
+#[inline]
+pub fn lock_named_keys(name: &str, cmd: &[&[u8]]) -> Option<KeysGuard> {
+    let keys = named_keys(name, cmd)?;
+    lock_found_keys(keys, cmd)
+}
+
+/// The rest of [`lock_named_keys`], for a command with a key that may carry
+/// a tag. Out of line, so that the look for one stays small; one iterator
+/// for both kinds, the one `key_positions`' keys give, so that `lock_keys`
+/// is made once here.
+#[inline(never)]
+fn lock_found_keys(keys: NamedKeys, cmd: &[&[u8]]) -> Option<KeysGuard> {
+    let at = match &keys {
+        NamedKeys::Regular { from, last, step } => crate::keyspec::KeyIter::Range {
+            next: *from,
+            last: *last,
+            step: *step,
+        },
+        NamedKeys::Other(keys) => keys.iter(),
+    };
+    lock_keys(at.map(|at| cmd[at]))
+}
+
 /// What active expiry holds of the tags of a batch of keys: the locks it
 /// could take, and which it could not ([`try_lock_keys`]).
 pub struct TriedKeys {
@@ -779,7 +906,7 @@ mod tests {
                 .unwrap();
         });
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn({
+        let waiter = crate::cpus::spawn({
             let key = format!("{{{b}}}:k");
             move || {
                 let _held = lock_keys([key.as_bytes()].into_iter());
@@ -905,7 +1032,7 @@ mod tests {
         // The same tag waits until the script lets go.
         let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
+        let waiter = crate::cpus::spawn(move || {
             waiting_tx.send(()).unwrap();
             let _held = lock_keys([b"{busy-queue}:k".as_slice()].into_iter());
             done_tx.send(()).unwrap();
@@ -1055,5 +1182,225 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// `may_carry_tag` is a look for `{`, eight bytes at a time: every
+    /// length up to 40, every byte in every place, among fillers that a
+    /// borrow between bytes would trip over.
+    #[test]
+    fn a_key_may_carry_a_tag_when_it_has_a_brace() {
+        // `tag_of` as it was, with `memchr`.
+        let reference = |key: &[u8]| -> Option<Vec<u8>> {
+            let open = memchr::memchr(b'{', key)?;
+            let rest = &key[open + 1..];
+            let close = memchr::memchr(b'}', rest)?;
+            (close > 0).then(|| rest[..close].to_vec())
+        };
+        let check = |key: &[u8]| {
+            assert_eq!(may_carry_tag(key), key.contains(&b'{'), "{key:?}");
+            for byte in *b"{}" {
+                assert_eq!(
+                    position_of(byte, key),
+                    memchr::memchr(byte, key),
+                    "{byte} {key:?}"
+                );
+            }
+            assert_eq!(tag_of(key).map(<[u8]>::to_vec), reference(key), "{key:?}");
+            if tag_of(key).is_some() {
+                assert!(may_carry_tag(key), "{key:?}");
+            }
+        };
+        for len in 0..=40usize {
+            for filler in [b'a', 0x00, 0x7a, 0x7c, 0xfb, 0xff, 0x80, 0x01] {
+                let mut key = vec![filler; len];
+                check(&key);
+                for at in 0..len {
+                    let bytes: Vec<u8> = if filler == b'a' {
+                        (0..=255).collect()
+                    } else {
+                        vec![b'{', b'{' ^ 0x80, b'{' - 1, b'{' + 1, 0, 0xff, b'}']
+                    };
+                    for byte in bytes {
+                        key[at] = byte;
+                        check(&key);
+                    }
+                    key[at] = filler;
+                }
+            }
+        }
+        // Two braces in every pair of places: the first of two is found,
+        // and the tag between them.
+        for len in 0..=40usize {
+            for open in 0..len {
+                for other in 0..len {
+                    for second in *b"}{" {
+                        let mut key = vec![b'k'; len];
+                        key[open] = b'{';
+                        key[other] = second;
+                        check(&key);
+                    }
+                }
+            }
+        }
+        check(&[b'x'; 4096]);
+        let mut long = vec![b'x'; 4096];
+        long[4000] = b'{';
+        check(&long);
+    }
+
+    /// For every command of the key table, and some without keys: the
+    /// stripes `lock_named_keys` would take (through `named_keys`) are the
+    /// ones `lock_keys` takes over everything `key_positions` finds, with a
+    /// tagged or an untagged key, an empty tag, a `{` without its `}`,
+    /// binary keys and keys longer than a word in each place (#889).
+    #[test]
+    fn named_keys_find_the_stripes_key_positions_finds() {
+        use std::collections::BTreeSet;
+        let mut names = crate::keyspec::table_names();
+        names.extend(["PING", "MULTI", "EXEC", "EVALSHA", "FCALL", "SCAN", "X"]);
+        let keys: &[&[u8]] = &[
+            b"k",
+            b"{t}:k",
+            b"x:{u}",
+            b"{}",
+            b"{}k{v}",
+            b"{k",
+            b"k}",
+            b"{",
+            b"}{w}",
+            b"\xff{\x00}\x80",
+            b"\x00{t\x01}",
+            b"1234567{",
+            b"12345678{t}",
+            b"key:000000001234",
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa{long}",
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ];
+        // What the shapes with counts and options look for.
+        let words: &[&[u8]] = &[
+            b"0",
+            b"1",
+            b"2",
+            b"3",
+            b"-1",
+            b"STREAMS",
+            b"STORE",
+            b"STOREDIST",
+            b"KEYS",
+            b"SET",
+            b"USAGE",
+            b"HELP",
+            b"GROUP",
+            b"$",
+            b"",
+        ];
+        let stripes_of = |cmd: &[&[u8]], at: &mut dyn Iterator<Item = usize>| -> BTreeSet<usize> {
+            at.filter_map(|at| tag_of(cmd[at]).map(stripe_of)).collect()
+        };
+        let compare = |name: &str, cmd: &[&[u8]]| -> bool {
+            let general = stripes_of(cmd, &mut crate::keyspec::key_positions(name, cmd).iter());
+            let fast = match named_keys(name, cmd) {
+                None => BTreeSet::new(),
+                Some(NamedKeys::Regular { from, last, step }) => {
+                    stripes_of(cmd, &mut (from..=last).step_by(step))
+                }
+                Some(NamedKeys::Other(found)) => stripes_of(cmd, &mut found.iter()),
+            };
+            assert_eq!(fast, general, "{name} {cmd:?}");
+            named_keys(name, cmd).is_none()
+        };
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |below: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % below as u64) as usize
+        };
+        let (mut cases, mut passed_by) = (0usize, 0usize);
+        for name in &names {
+            // One key of each kind in each place, the rest plain keys or
+            // words.
+            for len in 2..=7 {
+                for filler in [&b"k"[..], b"2", b"STREAMS", b"STORE", b"KEYS"] {
+                    for at in 1..len {
+                        for key in keys {
+                            let mut cmd: Vec<&[u8]> = vec![filler; len];
+                            cmd[0] = name.as_bytes();
+                            cmd[at] = key;
+                            cases += 1;
+                            passed_by += compare(name, &cmd) as usize;
+                        }
+                    }
+                }
+            }
+            // Mixed at random.
+            for len in 1..=10 {
+                for _ in 0..40 {
+                    let mut cmd: Vec<&[u8]> = (0..len)
+                        .map(|_| {
+                            if next(2) == 0 {
+                                keys[next(keys.len())]
+                            } else {
+                                words[next(words.len())]
+                            }
+                        })
+                        .collect();
+                    cmd[0] = name.as_bytes();
+                    cases += 1;
+                    passed_by += compare(name, &cmd) as usize;
+                }
+            }
+        }
+        assert!(cases > 500_000, "{cases}");
+        assert!(passed_by > cases / 10, "{passed_by} of {cases}");
+    }
+
+    /// What `lock_named_keys` takes: the stripe of each tagged key and the
+    /// write gate, or nothing at all.
+    #[test]
+    fn a_command_takes_the_stripes_of_its_tagged_keys_and_nothing_else() {
+        let held = |tag: &str| STRIPE[stripe_of(tag.as_bytes())].0.is_locked();
+        let cmd = |parts: &[&str]| -> Vec<Vec<u8>> {
+            parts.iter().map(|part| part.as_bytes().to_vec()).collect()
+        };
+        let lock = |parts: &[Vec<u8>]| {
+            let args: Vec<&[u8]> = parts.iter().map(|part| part.as_slice()).collect();
+            let name = String::from_utf8(parts[0].clone()).unwrap();
+            lock_named_keys(&name, &args)
+        };
+        for untagged in [
+            cmd(&["GET", "plain"]),
+            cmd(&["SET", "plain", "{not-a-key}"]),
+            cmd(&["GET", "{}"]),
+            cmd(&["GET", "{open"]),
+            cmd(&["MGET", "a", "b", "c{"]),
+            cmd(&["MSET", "a", "{v}", "b", "{w}"]),
+            cmd(&["PING"]),
+            cmd(&["SORT", "plain", "BY", "{x}:*"]),
+        ] {
+            assert!(lock(&untagged).is_none(), "{untagged:?}");
+            assert!(!crate::write_gate::held_by_this_thread());
+        }
+        let guard = lock(&cmd(&["GET", "{nk889-a}:k"])).expect("a tagged key");
+        assert!(crate::write_gate::held_by_this_thread());
+        assert!(held("nk889-a"));
+        drop(guard);
+        assert!(!crate::write_gate::held_by_this_thread());
+        let guard = lock(&cmd(&[
+            "MSET",
+            "plain",
+            "1",
+            "{nk889-b}:k",
+            "2",
+            "x{nk889-c}",
+            "3",
+        ]))
+        .expect("tagged keys");
+        assert!(held("nk889-b") && held("nk889-c"));
+        drop(guard);
+        let guard = lock(&cmd(&["SORT", "plain", "STORE", "{nk889-d}:dst"])).expect("STORE");
+        assert!(held("nk889-d"));
+        drop(guard);
+        assert!(!crate::write_gate::held_by_this_thread());
     }
 }

@@ -85,7 +85,8 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--port` | `6380` | Port to listen on; `0` for none (TLS only, with `--tls-port`) |
 | `--bind` | `0.0.0.0` | Address to listen on. Setting it explicitly turns off [protected mode](#protected-mode) |
 | `--protected-mode <yes\|no>` | `yes` | See [Protected mode](#protected-mode) |
-| `--threads` | `0` (auto) | Worker threads; auto is the number of cores minus 2 (all cores below 4) |
+| `--threads` | `0` (auto) | Worker threads; auto is one per CPU the process may use (see [Worker threads](#worker-threads)) |
+| `--worker-cpu-affinity <off\|auto>` | `off` | `auto` binds each io_uring worker to a CPU of its own when they are as many as the process's CPUs (see [Worker CPU affinity](#worker-cpu-affinity)) |
 | `--databases` | `16` | Number of databases |
 | `--dir <path>` | start directory | Where `dump.kdb`, `appendonly.aof` and `nodes.conf` live |
 | `--aof` | off | Append-only file persistence |
@@ -120,7 +121,104 @@ open-file limit to `maxclients` plus what it keeps for itself (32 files, or on i
 warning. Cluster bus links, a replica's link to its master and files written while saving
 are not counted in that; leave room for them in a large cluster.
 
-Persistence (snapshots and the AOF) is described in [PERSISTENCE.md](PERSISTENCE.md).
+Small collections are kept in one block of memory up to Redis's limits, which are set as in
+Redis, in the file or with `CONFIG SET`, and reported by `CONFIG GET` and `OBJECT ENCODING`:
+`set-max-intset-entries` (512), `set-max-listpack-entries` (128) and `set-max-listpack-value`
+(64) for sets; `hash-max-listpack-entries` (512) and `hash-max-listpack-value` (64) for hashes;
+`zset-max-listpack-entries` (128) and `zset-max-listpack-value` (64) for sorted sets (a sorted
+set of up to that many members, none longer than that many bytes, is one block; past either it
+is a hash table and an ordered tree). The `*-max-ziplist-*` names of the hash and sorted-set
+settings are the same settings. A limit goes no higher than what one block holds (128 members
+of 64 bytes for sets and sorted sets, 512 fields for hashes): a larger value is taken as that
+maximum, `CONFIG GET` reports what was kept, and a warning naming the maximum is logged. `0`
+entries keeps new hashes and sorted sets out of blocks. A changed limit applies to a hash at
+its next write that sets a field, to a set or a sorted set at its next new member (a changed
+score never moves a sorted set); a collection never moves back to a block.
+[COMPATIBILITY.md](COMPATIBILITY.md) has the details for each type.
+
+Persistence (snapshots and the AOF) is described in [PERSISTENCE.md](PERSISTENCE.md),
+including `rdbcompression` (default `no`; `yes` writes snapshots compressed, which 1.2 cannot read) and the
+`kividb kdb-decompress <in> <out>` and `kividb kdb-compress <in> <out>` tools, which convert a
+snapshot between the compressed form and the plain one KiviDB 1.2 reads (refusing an input the
+server would not load, and an existing output unless `--force` is given).
+
+### Worker threads
+
+Commands run on the worker threads, every worker serving its own share of the connections.
+`--threads N` starts exactly `N`. `--threads 0`, the default, starts one per CPU the process
+may actually run on: the CPUs online, cut down to its affinity mask (`taskset`, a cpuset,
+Docker's `--cpuset-cpus`, the Kubernetes static CPU manager) and to its cgroup CPU quota
+(Docker's `--cpus`, a Kubernetes CPU limit; a fraction is rounded down, so `--cpus 1.5` is
+one worker), and never fewer than one. A container limited to 2 CPUs on a 64-CPU host starts 2.
+The startup banner says how the number was chosen:
+
+```
+  * CPUs           : 8 online, 2 available (a cgroup CPU quota of 2 CPUs)
+  * Worker threads : 2 (auto: one per available CPU)
+```
+
+The server's other threads (the AOF writer, the replication hub, expiry, a background save,
+the accept and timer threads) run beside the workers; none is given a CPU of its own.
+Measured with the server confined to 2 and 4 vCPUs, one worker per CPU was the fastest
+setting or within about 10% of it, with AOF or a replica too (during `BGSAVE` on 2 vCPUs a third worker served 22% more); a worker fewer
+cost up to 41% on 2 vCPUs, and more workers than the CPUs (or than the quota) multiplied the
+p99. [PERFORMANCE.md](PERFORMANCE.md#worker-threads) has the numbers.
+
+Set `--threads` yourself to keep CPUs for something else on the same machine, such as the
+application or a load generator, or to keep the count of an earlier release: up to 1.2 auto
+was the CPUs minus 2 (all of them below 4), which is `--threads 2` on 4 CPUs and
+`--threads 6` on 8. A Kubernetes pod with a CPU request but no CPU limit has no quota, so
+the server sees every CPU of the node: give it a limit, or `--threads`.
+
+### Worker CPU affinity
+
+`--worker-cpu-affinity auto` (or `worker-cpu-affinity auto` in the configuration file;
+`CONFIG GET` reports it, it is read only at startup) binds each io_uring worker to a CPU
+of its own: worker N to the N-th CPU the process may use. It does so only when the workers
+are exactly as many as those CPUs (the default `--threads 0` on a cpuset, or `--threads N`
+with `taskset` of N CPUs), and never when what limits the process is a cgroup CPU quota
+(Docker's `--cpus`, a Kubernetes CPU limit): a quota is time on any CPU, not CPUs of the
+server's own. The default is `off`: the workers run wherever the scheduler puts them.
+
+An io_uring worker serves its connections alone. When the scheduler puts two workers on one
+CPU, which it does at times when a third busy thread shares their CPUs (the replication hub
+while a replication backlog is kept, a background save), every connection of one waits out
+the other's time slice, and the p99 goes to milliseconds
+([#894](https://github.com/kividbio/kividb/issues/894)). Bound, each worker keeps its CPU.
+
+Turn it on when the server has its CPUs to itself: a Kubernetes pod under the static CPU
+manager policy (Guaranteed QoS, whole CPUs), a VM or host where the server is confined with
+`taskset` or a cpuset and nothing else runs on those CPUs. Leave it off when the server
+shares its CPUs with other busy processes: a bound worker cannot move to a CPU that is free
+while its own is busy. [PERFORMANCE.md](PERFORMANCE.md#worker-cpu-affinity) has both
+cases measured.
+
+The server says what it did, after the I/O model line, once every worker has tried its
+bind:
+
+```
+I/O model      : io_uring
+Worker CPUs    : pinned 2 of 2: worker 0 on CPU 0, worker 1 on CPU 2 (worker-cpu-affinity auto)
+```
+
+or that only some binds took (`pinned 1 of 2 (worker-cpu-affinity auto); refused: ...`, naming each refused bind and
+the error), or
+why it did not bind (`not pinned: 2 workers on 4 CPUs: pinned only when they are as many`).
+The server's other threads (the replication hub, the AOF writer, expiry, the script runner,
+a full sync's or a backup's work) are not bound: they run on any of the process's CPUs,
+which with `auto` in effect are the workers' CPUs, so they take turns with the workers as
+before; a thread a worker starts is given all of the process's CPUs back first. The tokio
+I/O model is not bound (its workers take each other's connections, so none waits behind one
+that is held up). Linux only: macOS has no call that binds a thread to a CPU, and on
+FreeBSD the setting is not implemented; there it is accepted and the server says it did
+nothing. The binds are made once, at startup: if the cpuset changes later, the kernel
+decides (verified on cgroup v2, Linux 7.0: a worker whose CPU is removed runs on the whole
+new set and goes back to its CPU when it returns; cgroup v1, not verified here, resets each
+thread to the new set), the startup line is not updated, and a thread started after the
+change is given the CPUs the process had at startup; a Kubernetes pod's exclusive CPUs
+under the static CPU manager do not change while its container runs. Redis's `server-cpulist` binds the server's threads to a list of CPUs together,
+not one each; KiviDB accepts it, as it accepts Redis's other settings, and does nothing
+with it.
 
 ## TLS
 

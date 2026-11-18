@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/output_buffer_limit.rs
 //
 // `client-output-buffer-limit` (#774): `CONFIG SET` and `CONFIG GET` of it,
@@ -6,7 +7,9 @@
 // hard limit and kept with `pubsub 0 0 0`, the soft limit and its seconds,
 // and a normal client's replies held to the `normal` class; and a pipeline
 // sent before any reply is read, which the server reads while its replies
-// wait (#865). Each test runs a real `kividb`, on both I/O models where the
+// wait (#865); and the limits looked at after each reply, so that a pipeline
+// is cut at the reply over the hard limit (#893). Each test runs a real
+// `kividb`, on both I/O models where the
 // connection loops differ.
 //
 // The messages here are large (up to 64 MB), so the tests take turns: one
@@ -86,13 +89,7 @@ impl Conn {
     }
 
     fn send(&mut self, args: &[&[u8]]) {
-        let mut buf = format!("*{}\r\n", args.len()).into_bytes();
-        for a in args {
-            buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
-            buf.extend_from_slice(a);
-            buf.extend_from_slice(b"\r\n");
-        }
-        self.writer.write_all(&buf).unwrap();
+        self.writer.write_all(&encode(args)).unwrap();
     }
 
     fn cmd(&mut self, args: &[&str]) -> V {
@@ -137,17 +134,21 @@ impl Conn {
                 data.truncate(len as usize);
                 V::Bulk(data)
             }
-            "*" => {
+            // RESP3's maps (a key and a value an item), sets and pushes are
+            // read as arrays.
+            "*" | "%" | "~" | ">" => {
                 let n: i64 = rest.parse().unwrap();
                 if n < 0 {
                     return Some(V::Nil);
                 }
+                let n = if kind == "%" { n * 2 } else { n };
                 let mut items = Vec::new();
                 for _ in 0..n {
                     items.push(self.read()?);
                 }
                 V::Arr(items)
             }
+            "_" => V::Nil,
             other => panic!("unexpected RESP type {other:?} in {line:?}"),
         })
     }
@@ -168,6 +169,17 @@ impl Conn {
             }
         }
     }
+}
+
+/// A request, as a client sends it.
+fn encode(args: &[&[u8]]) -> Vec<u8> {
+    let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+        buf.extend_from_slice(a);
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf
 }
 
 // ── The server ────────────────────────────────────────────────────────────────
@@ -894,6 +906,50 @@ fn what_was_read_ahead_runs_a_read_at_a_time() {
     }
 }
 
+/// Requests of many arguments, each larger than a read, pipelined: each
+/// arrives in many reads into a query buffer of its own, which is trimmed
+/// between them, and every one runs. A read of 32 KiB into a larger buffer
+/// left room the trim then took, which a check of the read did not allow
+/// for: a debug build panicked and dropped the client (#893).
+#[test]
+fn pipelined_requests_larger_than_a_read_all_run() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        // As tests/memory_usage_zset.rs loads sorted sets of 512 members,
+        // every score changed: two ZADDs of about 15 and 20 KB a key, 100
+        // keys in one write.
+        let scattered = |i: u64| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f64;
+        let zadd = |key: &str, scores: &dyn Fn(u64) -> f64| {
+            let mut args: Vec<Vec<u8>> = vec![b"ZADD".to_vec(), key.as_bytes().to_vec()];
+            for i in 0..512u64 {
+                args.push(scores(i).to_string().into_bytes());
+                args.push(format!("member-{i:09}").into_bytes());
+            }
+            let refs: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
+            encode(&refs)
+        };
+        let mut c = server.conn();
+        assert!(c.cmd(&["SELECT", "1"]).ok());
+        let mut pipeline = Vec::new();
+        for k in 0..100 {
+            let key = format!("warm:{k}");
+            pipeline.extend_from_slice(&zadd(&key, &|i| i as f64));
+            pipeline.extend_from_slice(&zadd(&key, &scattered));
+        }
+        c.writer
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        c.writer
+            .write_all(&pipeline)
+            .unwrap_or_else(|e| panic!("{io_model}: {e}"));
+        for k in 0..100 {
+            assert_eq!(c.read(), Some(V::Int(512)), "{io_model}: key {k}");
+            assert_eq!(c.read(), Some(V::Int(0)), "{io_model}: key {k} again");
+        }
+    }
+}
+
 /// A blocking command writes the replies to what came before it as it
 /// parks, and the server reads the client while that write waits too.
 #[test]
@@ -986,6 +1042,317 @@ fn a_client_killed_while_its_replies_wait_is_closed() {
         );
         let list = server.conn().cmd(&["CLIENT", "LIST"]).text();
         assert!(!list.contains(&format!("id={id} ")), "{io_model}: {list}");
+    }
+}
+
+// ── After each reply (#893) ───────────────────────────────────────────────────
+
+/// A 100 KB value: its reply is 102,411 bytes, so ten of them are under a
+/// hard limit of 1 MB and eleven over it.
+const BIG: usize = 100 * 1024;
+
+/// `GET big` and `INCR n`, `pairs` times: 43 bytes a pair, so that 80 pairs
+/// arrive in one read on either loop.
+fn gets_and_incrs(pairs: usize) -> Vec<u8> {
+    b"*2\r\n$3\r\nGET\r\n$3\r\nbig\r\n*2\r\n$4\r\nINCR\r\n$1\r\nn\r\n".repeat(pairs)
+}
+
+/// The server's `n` once `c` has been closed, or `None` if it was not.
+fn n_once_closed(server: &Server, c: &mut Conn) -> Option<i64> {
+    if !c.closed_within(Duration::from_secs(10)) {
+        return None;
+    }
+    match server.conn().cmd(&["GET", "n"]) {
+        V::Bulk(b) => Some(String::from_utf8(b).unwrap().parse().unwrap()),
+        V::Nil => Some(0),
+        other => panic!("GET n: {other:?}"),
+    }
+}
+
+/// The hard limit is looked at after each reply, not once for all the
+/// replies to what one read brought: a pipeline of 80 `GET big` and `INCR`
+/// pairs, read at once, is cut after the 11th `GET`, whose reply takes the
+/// replies past the limit, and the `INCR`s after it are not run. It ran all
+/// 80 and only then closed the client. With the limit off it is answered in
+/// full.
+#[test]
+fn the_hard_limit_cuts_a_pipeline_after_the_reply_over_it() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        assert!(server.conn().cmd(&["SET", "big", &"b".repeat(BIG)]).ok());
+        server.config_set("normal 1mb 0 0");
+        let mut c = server.conn();
+        c.writer.write_all(&gets_and_incrs(80)).unwrap();
+        assert_eq!(n_once_closed(&server, &mut c), Some(10), "{io_model}");
+        assert_eq!(
+            server.info_field("client_output_buffer_limit_disconnections"),
+            "1",
+            "{io_model}"
+        );
+
+        // 0 0 0: no limit, and every reply comes.
+        server.config_set("normal 0 0 0");
+        assert_eq!(server.conn().cmd(&["DEL", "n"]).i(), 1);
+        let mut c = server.conn();
+        c.writer.write_all(&gets_and_incrs(80)).unwrap();
+        for i in 1..=80 {
+            match c.read() {
+                Some(V::Bulk(b)) => assert_eq!(b.len(), BIG, "{io_model} {i}"),
+                other => panic!("{io_model} {i}: {other:?}"),
+            }
+            assert_eq!(c.read(), Some(V::Int(i)), "{io_model}");
+        }
+    }
+}
+
+/// A `CONFIG SET` of the limit holds the connections already open, the one
+/// that set it included, from their next command; and setting it back to
+/// 0 0 0 lets them be.
+#[test]
+fn a_limit_set_while_connected_holds_from_the_next_command() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        assert!(server.conn().cmd(&["SET", "big", &"b".repeat(BIG)]).ok());
+        let mut before = server.conn();
+        let mut setter = server.conn();
+        let mut unlimited = server.conn();
+        assert_eq!(before.cmd(&["GET", "big"]), V::Bulk(vec![b'b'; BIG]));
+        assert!(
+            setter
+                .cmd(&[
+                    "CONFIG",
+                    "SET",
+                    "client-output-buffer-limit",
+                    "normal 1mb 0 0"
+                ])
+                .ok()
+        );
+        before.writer.write_all(&gets_and_incrs(80)).unwrap();
+        assert_eq!(n_once_closed(&server, &mut before), Some(10), "{io_model}");
+
+        // The one that set it too.
+        assert_eq!(server.conn().cmd(&["DEL", "n"]).i(), 1);
+        setter.writer.write_all(&gets_and_incrs(80)).unwrap();
+        assert_eq!(n_once_closed(&server, &mut setter), Some(10), "{io_model}");
+
+        // Back to none: a connection that was open all along runs all 80.
+        server.config_set("normal 0 0 0");
+        assert_eq!(server.conn().cmd(&["DEL", "n"]).i(), 1);
+        unlimited.writer.write_all(&gets_and_incrs(80)).unwrap();
+        for i in 1..=80 {
+            assert!(matches!(unlimited.read(), Some(V::Bulk(_))), "{io_model}");
+            assert_eq!(unlimited.read(), Some(V::Int(i)), "{io_model}");
+        }
+    }
+}
+
+/// The soft limit does not cut a pipeline short: a client over it is closed
+/// only once it has been over it for longer than its seconds, as in Redis.
+/// All 80 pairs run, and then, not read, the client is closed.
+#[test]
+fn the_soft_limit_lets_a_pipeline_run_and_closes_after_its_seconds() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        assert!(server.conn().cmd(&["SET", "big", &"b".repeat(BIG)]).ok());
+        server.config_set("normal 0 1mb 1");
+        let mut c = server.conn();
+        c.writer.write_all(&gets_and_incrs(80)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while server.info_field("client_output_buffer_limit_disconnections") != "1" {
+            assert!(Instant::now() < deadline, "{io_model}: not closed");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(n_once_closed(&server, &mut c), Some(80), "{io_model}");
+        server.config_set("normal 0 0 0");
+    }
+}
+
+/// A RESP3 subscriber's replies are held to the `pubsub` class after each
+/// reply too, and not to `normal`'s.
+#[test]
+fn a_resp3_subscriber_is_held_to_the_pubsub_limit_after_each_reply() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        assert!(server.conn().cmd(&["SET", "big", &"b".repeat(BIG)]).ok());
+        let resp3_subscriber = || {
+            let mut c = server.conn();
+            assert!(matches!(c.cmd(&["HELLO", "3"]), V::Arr(_)));
+            match c.cmd(&["SUBSCRIBE", "ch"]) {
+                V::Arr(items) => assert_eq!(items[0], V::Bulk(b"subscribe".to_vec())),
+                other => panic!("{io_model}: {other:?}"),
+            }
+            c
+        };
+
+        server.config_set("normal 1mb 0 0 pubsub 0 0 0");
+        let mut c = resp3_subscriber();
+        c.writer.write_all(&gets_and_incrs(80)).unwrap();
+        for i in 1..=80 {
+            assert!(matches!(c.read(), Some(V::Bulk(_))), "{io_model}");
+            assert_eq!(c.read(), Some(V::Int(i)), "{io_model}");
+        }
+
+        server.config_set("normal 0 0 0 pubsub 1mb 0 0");
+        assert_eq!(server.conn().cmd(&["DEL", "n"]).i(), 1);
+        let mut c = resp3_subscriber();
+        c.writer.write_all(&gets_and_incrs(80)).unwrap();
+        assert_eq!(n_once_closed(&server, &mut c), Some(10), "{io_model}");
+        server.config_set("pubsub 32mb 8mb 60");
+    }
+}
+
+/// Closed between two commands, a client leaves nothing half done: a
+/// transaction runs whole or not at all, and what ran before the close is
+/// applied, in the AOF and on a replica.
+#[test]
+fn a_client_closed_mid_pipeline_leaves_nothing_half_done() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let server = Server::start_with_config(io_model, Some("appendonly yes\n"));
+        assert!(server.conn().cmd(&["SET", "big", &"b".repeat(BIG)]).ok());
+        server.config_set("normal 1mb 0 0");
+
+        // MULTI, 20 `GET big` and two INCRs, EXEC; then an INCR after it.
+        // EXEC's reply is over the limit: the transaction is applied whole,
+        // and what follows it is not run.
+        let mut pipeline = b"*1\r\n$5\r\nMULTI\r\n".to_vec();
+        pipeline.extend_from_slice(&b"*2\r\n$3\r\nGET\r\n$3\r\nbig\r\n".repeat(20));
+        pipeline.extend_from_slice(b"*2\r\n$4\r\nINCR\r\n$1\r\na\r\n");
+        pipeline.extend_from_slice(b"*2\r\n$4\r\nINCR\r\n$1\r\nb\r\n");
+        pipeline.extend_from_slice(b"*1\r\n$4\r\nEXEC\r\n");
+        pipeline.extend_from_slice(b"*2\r\n$4\r\nINCR\r\n$1\r\nc\r\n");
+        let mut c = server.conn();
+        c.writer.write_all(&pipeline).unwrap();
+        assert!(c.closed_within(Duration::from_secs(10)), "{io_model}");
+        let mut check = server.conn();
+        assert_eq!(
+            check.cmd(&["MGET", "a", "b", "c"]),
+            V::Arr(vec![V::Bulk(b"1".to_vec()), V::Bulk(b"1".to_vec()), V::Nil]),
+            "{io_model}"
+        );
+
+        // Cut in a pipeline of writes: the ten INCRs that ran are in the AOF,
+        // and are there after a restart.
+        let mut c = server.conn();
+        c.writer.write_all(&gets_and_incrs(80)).unwrap();
+        assert_eq!(n_once_closed(&server, &mut c), Some(10), "{io_model}");
+        let server = server.restart(io_model);
+        assert_eq!(
+            server.conn().cmd(&["MGET", "a", "b", "c", "n"]),
+            V::Arr(vec![
+                V::Bulk(b"1".to_vec()),
+                V::Bulk(b"1".to_vec()),
+                V::Nil,
+                V::Bulk(b"10".to_vec())
+            ]),
+            "{io_model}: after a restart from the AOF"
+        );
+    }
+}
+
+/// What ran before the close reaches a replica.
+#[cfg(target_os = "linux")]
+#[test]
+fn what_ran_before_the_close_reaches_a_replica() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let master = Server::start(io_model);
+        assert!(master.conn().cmd(&["SET", "big", &"b".repeat(BIG)]).ok());
+        let replica = Server::start_replica(&master);
+        master.config_set("normal 1mb 0 0");
+        let mut c = master.conn();
+        c.writer.write_all(&gets_and_incrs(80)).unwrap();
+        assert_eq!(n_once_closed(&master, &mut c), Some(10), "{io_model}");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if replica.conn().cmd(&["GET", "n"]) == V::Bulk(b"10".to_vec()) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{io_model}: not on the replica");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// A script is one command: one whose reply is over the limit runs whole,
+/// and the client is closed after it.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_over_the_limit_runs_whole() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        assert!(server.conn().cmd(&["SET", "big", &"b".repeat(BIG)]).ok());
+        server.config_set("normal 1mb 0 0");
+        let script = "local out = {} for i = 1, 20 do out[i] = redis.call('GET', 'big') \
+                      redis.call('INCR', 'n') end return out";
+        // Both in one write, so that both arrive in one read: on separate
+        // reads the second would run after the first's reply was written,
+        // with or without the check after each reply.
+        let mut c = server.conn();
+        c.writer
+            .write_all(&encode(&[b"EVAL", script.as_bytes(), b"0"]).repeat(2))
+            .unwrap();
+        // The first ran whole; the second, after it, not at all.
+        assert_eq!(n_once_closed(&server, &mut c), Some(20), "{io_model}");
+        // Nor is the server held up by it.
+        assert_eq!(server.conn().cmd(&["PING"]), V::Str("PONG".into()));
+    }
+}
+
+/// A reply `CLIENT REPLY OFF` or `SKIP` drops does not count against the
+/// limit, hard or soft, as in Redis: `LRANGE` of 1.1 MB, its reply dropped,
+/// then `INCR n`, in one read, keeps the client, which runs the `INCR`.
+#[test]
+fn a_reply_the_client_turned_off_does_not_count() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        let mut load = server.conn();
+        for chunk in 0..10 {
+            let mut args: Vec<Vec<u8>> = vec![b"RPUSH".to_vec(), b"l".to_vec()];
+            for i in 0..1000 {
+                args.push(format!("{:0>100}", chunk * 1000 + i).into_bytes());
+            }
+            let refs: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
+            load.send(&refs);
+            assert!(matches!(load.read(), Some(V::Int(_))));
+        }
+        let lrange: &[&[u8]] = &[b"LRANGE", b"l", b"0", b"-1"];
+        let incr: &[&[u8]] = &[b"INCR", b"n"];
+        for limit in ["normal 1mb 0 0", "normal 0 1mb 1"] {
+            server.config_set(limit);
+            for mode in ["OFF", "SKIP"] {
+                let mut c = server.conn();
+                let mut pipeline = encode(&[b"CLIENT", b"REPLY", mode.as_bytes()]);
+                pipeline.extend_from_slice(&encode(lrange));
+                pipeline.extend_from_slice(&encode(incr));
+                if mode == "OFF" {
+                    pipeline.extend_from_slice(&encode(&[b"CLIENT", b"REPLY", b"ON"]));
+                }
+                pipeline.extend_from_slice(&encode(&[b"PING"]));
+                c.writer.write_all(&pipeline).unwrap();
+                let what = format!("{io_model}, {limit}, {mode}");
+                if mode == "SKIP" {
+                    // SKIP drops the LRANGE's reply only.
+                    assert_eq!(c.read(), Some(V::Int(1)), "{what}");
+                } else {
+                    assert!(c.read().unwrap().ok(), "{what}: CLIENT REPLY ON");
+                }
+                assert_eq!(c.read(), Some(V::Str("PONG".into())), "{what}");
+                assert_eq!(server.conn().cmd(&["DEL", "n"]).i(), 1, "{what}");
+            }
+        }
+        assert_eq!(
+            server.info_field("client_output_buffer_limit_disconnections"),
+            "0",
+            "{io_model}"
+        );
+        server.config_set("normal 0 0 0");
     }
 }
 

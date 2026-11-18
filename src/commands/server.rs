@@ -1,4 +1,5 @@
 use crate::commands::ctx::Ctx;
+use crate::cpus::BuilderExt as _;
 use crate::loglevel::LOG_LEVEL;
 use crate::read_lock;
 use crate::resp::write::*;
@@ -375,6 +376,15 @@ fn function_without_lua(ctx: &Ctx) -> Vec<u8> {
         }
     }
     resp_error(NO_LUA)
+}
+
+/// A limit of how much one block of a small collection holds set past
+/// what a block can hold: taken as the most it can, and said once, at the
+/// set (from `CONFIG SET`, the config file or the command line).
+fn warn_clamped(param: &str, asked: usize, kept: usize) {
+    if asked > kept {
+        log_warn!("{param} {asked} is more than one block holds: {kept} is used (the maximum)");
+    }
 }
 
 /// A setting's own name, for one Redis also takes under an older one.
@@ -1362,6 +1372,7 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                             }
                             _ => crate::member_set::set_packed_value(limit),
                         };
+                        warn_clamped(&param, limit, kept);
                         REMEMBERED_CONFIG
                             .lock()
                             .insert(param.clone(), kept.to_string());
@@ -1395,10 +1406,51 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                         } else {
                             crate::hash_fields::set_packed_value(limit)
                         };
+                        warn_clamped(&param, limit, kept);
                         let names = if entries {
                             ["hash-max-listpack-entries", "hash-max-ziplist-entries"]
                         } else {
                             ["hash-max-listpack-value", "hash-max-ziplist-value"]
+                        };
+                        let mut remembered = REMEMBERED_CONFIG.lock();
+                        for name in names {
+                            remembered.insert(name.to_string(), kept.to_string());
+                        }
+                        Some(resp_simple("OK"))
+                    }
+                    Some(_) => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                         '{param}') - argument must be between 0 and \
+                         9223372036854775807 inclusive",
+                    ))),
+                    None => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                         '{param}') - argument couldn't be parsed into an integer",
+                    ))),
+                }
+            }
+            // The most members, and the longest member, a sorted set keeps
+            // in one block: no more than a block holds, and `CONFIG GET`
+            // says what was kept, under the name and its older `ziplist`
+            // one alike, as Redis has them as one setting.
+            "zset-max-listpack-entries"
+            | "zset-max-ziplist-entries"
+            | "zset-max-listpack-value"
+            | "zset-max-ziplist-value" => {
+                match crate::member_set::canonical_i64(value.as_bytes()) {
+                    Some(limit) if limit >= 0 => {
+                        let limit = limit as usize;
+                        let entries = param.ends_with("-entries");
+                        let kept = if entries {
+                            crate::sorted_set::set_packed_entries(limit)
+                        } else {
+                            crate::sorted_set::set_packed_value(limit)
+                        };
+                        warn_clamped(&param, limit, kept);
+                        let names = if entries {
+                            ["zset-max-listpack-entries", "zset-max-ziplist-entries"]
+                        } else {
+                            ["zset-max-listpack-value", "zset-max-ziplist-value"]
                         };
                         let mut remembered = REMEMBERED_CONFIG.lock();
                         for name in names {
@@ -1440,6 +1492,22 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             },
             // What the latency monitor records (#158): remembered too, for
             // `CONFIG GET`.
+            // Whether snapshots are written compressed (#879): `dump.kdb`,
+            // the AOF's base, a backup's base, and a full sync to a replica
+            // that reads them.
+            "rdbcompression" => match value.to_ascii_lowercase().as_str() {
+                yes_no @ ("yes" | "no") => {
+                    crate::snapshot::blocks::set_enabled(yes_no == "yes");
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), yes_no.to_string());
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'rdbcompression') - \
+                     argument must be 'yes' or 'no'",
+                )),
+            },
             // Whether a reply to a write waits for its AOF record (#147).
             "aof-ack-after-write" => match value.to_ascii_lowercase().as_str() {
                 "yes" | "no" => {
@@ -2038,7 +2106,7 @@ fn keysizes_count_aside(store: &crate::store::Store, count: KeysizesCounter) -> 
     let store = Arc::clone(store);
     std::thread::Builder::new()
         .name("keysizes".to_string())
-        .spawn(move || {
+        .spawn_released(move || {
             // Dropped last, after the count is kept.
             let _done = Done(keysizes_key(&store));
             let began = std::time::Instant::now();
@@ -2065,10 +2133,6 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             ("list-max-listpack-size", "-2"),
             ("list-max-ziplist-size", "-2"),
             ("list-compress-depth", "0"),
-            ("zset-max-listpack-entries", "128"),
-            ("zset-max-listpack-value", "64"),
-            ("zset-max-ziplist-entries", "128"),
-            ("zset-max-ziplist-value", "64"),
             ("hll-sparse-max-bytes", "3000"),
             ("proto-max-bulk-len", "536870912"),
             ("client-query-buffer-limit", "1073741824"),
@@ -2093,6 +2157,7 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             ("latency-monitor-threshold", "0"),
             ("ts-duplicate-policy", "last"),
             ("aof-ack-after-write", "yes"),
+            ("rdbcompression", "no"),
         ]
         .into_iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))
@@ -2124,6 +2189,22 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             (
                 "hash-max-ziplist-value".to_string(),
                 crate::hash_fields::DEFAULT_PACKED_VALUE.to_string(),
+            ),
+            (
+                "zset-max-listpack-entries".to_string(),
+                crate::sorted_set::DEFAULT_PACKED_ENTRIES.to_string(),
+            ),
+            (
+                "zset-max-ziplist-entries".to_string(),
+                crate::sorted_set::DEFAULT_PACKED_ENTRIES.to_string(),
+            ),
+            (
+                "zset-max-listpack-value".to_string(),
+                crate::sorted_set::DEFAULT_PACKED_VALUE.to_string(),
+            ),
+            (
+                "zset-max-ziplist-value".to_string(),
+                crate::sorted_set::DEFAULT_PACKED_VALUE.to_string(),
             ),
         ])
         .collect(),
@@ -2196,6 +2277,10 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         // As given with `--threads` (0: one per core), the value `CONFIG
         // REWRITE` keeps, not the count it resolved to on this machine.
         ("threads", ctx.config.threads.to_string()),
+        (
+            "worker-cpu-affinity",
+            ctx.config.worker_cpu_affinity.name().to_string(),
+        ),
         // The value in force, not the one the server started with.
         (
             "maxmemory",
@@ -4378,7 +4463,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             tokio::spawn(async move {
                 let started = std::time::Instant::now();
-                let snap = tokio::task::spawn_blocking(move || {
+                let snap = crate::cpus::spawn_blocking(move || {
                     crate::replication::save_dataset(&store, &index_store_snap, &repl_state)
                 })
                 .await;
@@ -5135,7 +5220,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if want("clients") {
                 let count = ctx.client_registry.connected_clients();
-                let blocked = crate::stats::BLOCKED_CLIENTS.load(Ordering::Relaxed);
+                let blocked = crate::stats::BLOCKED_CLIENTS.load(Ordering::Acquire);
                 let tracking = crate::tracking::tracking_client_count();
                 out.push_str("# Clients\r\n");
                 out.push_str(&format!("connected_clients:{count}\r\n"));
@@ -5201,6 +5286,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
                 ));
                 out.push_str("rdb_last_cow_size:0\r\n");
+                // The last snapshot written to disk (#879): the bytes of its
+                // image, and the bytes on disk, fewer with `rdbcompression
+                // yes`. 0 before the first.
+                let (raw_size, stored_size) = crate::snapshot::blocks::last_saved();
+                out.push_str(&format!("rdb_last_save_raw_size:{raw_size}\r\n"));
+                out.push_str(&format!("rdb_last_save_stored_size:{stored_size}\r\n"));
                 out.push_str(&format!(
                     "backup_in_progress:{}\r\n",
                     crate::commands::backup::in_progress() as u8
@@ -5875,6 +5966,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     });
                 }
                 if cmd[i].eq_ignore_ascii_case(b"capa")
+                    && cmd[i + 1]
+                        .eq_ignore_ascii_case(crate::replication::KDB_BLOCKS_CAPA.as_bytes())
+                {
+                    ctx.client_registry.update(ctx.client_id, |info| {
+                        info.replica_kdb_blocks = true;
+                    });
+                }
+                if cmd[i].eq_ignore_ascii_case(b"capa")
                     && cmd[i + 1].eq_ignore_ascii_case(b"vset-quant")
                 {
                     ctx.client_registry.update(ctx.client_id, |info| {
@@ -6018,9 +6117,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(resp_simple("OK"))
                 }
 
-                // Accepted: what a client has touched is not kept per client.
+                // CLIENT NO-TOUCH ON|OFF: this client's commands record no
+                // use of the keys they find. The registry keeps the flag —
+                // what CLIENT LIST and CLIENT INFO show — and the
+                // connection's loop reads it back for the command
+                // dispatcher; RESET puts it back (#566).
                 "NO-TOUCH" => match cmd.get(2).and_then(|word| on_or_off(word)) {
-                    Some(_) if cmd.len() == 3 => Some(resp_simple("OK")),
+                    Some(on) if cmd.len() == 3 => {
+                        ctx.client_registry.update(ctx.client_id, |info| {
+                            info.no_touch = on;
+                        });
+                        Some(resp_simple("OK"))
+                    }
                     _ => Some(resp_error("ERR syntax error")),
                 },
 
@@ -6508,7 +6616,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // HELLO is intercepted in the server loops before reaching here.
             // If it arrives here something went wrong — return a minimal response
             // rather than an error, so clients don't break.
-            let proto = ctx.resp as i64;
+            let proto = (ctx.resp & crate::commands::ctx::RESP_VERSION) as i64;
             let fields = vec![
                 resp_bulk_str("server"),
                 resp_bulk_str("redis"),

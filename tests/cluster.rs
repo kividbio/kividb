@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/cluster.rs
 //
 // Cluster mode, end to end: real `kividb` processes, each in its own working
@@ -8081,20 +8082,22 @@ fn a_second_failover_during_the_cleanup_carries_it_on() {
         || cut.replicas[q].is_master(),
     );
     let node = &cut.replicas[q];
-    // Held at its own first batch too, if it has any left: let go.
+    // Held at its own first batch too, if it has any left: let go, until
+    // the import is forgotten. Not only until the keys are gone: the
+    // failpoint comes after the batch's deletes, so a first batch that is
+    // also the last (what is left is one slot's keys, in one shard) is held
+    // there once they are gone, and the import is forgotten only once it
+    // is let go (#904).
     let again = node.dir.join("failpoint.import-cleanup-deleting.1");
     wait_until(
-        "what the import brought to be deleted",
+        "what the import brought to be deleted, and the import to be forgotten",
         Duration::from_secs(90),
         || {
             let _ = std::fs::remove_file(&again);
-            held_of(node, &cut.all_brought()).is_empty()
+            held_of(node, &cut.all_brought()).is_empty() && followed_file(node).is_none()
         },
     );
     assert_held_kept(&cut, node);
-    wait_until("it to forget the import", Duration::from_secs(30), || {
-        followed_file(node).is_none()
-    });
 }
 
 /// The promoted node restarts in the middle of its cleanup. It knows from
@@ -11540,4 +11543,190 @@ fn an_atomic_import_keeps_the_order_of_a_series_labels() {
     // Found by its labels there.
     let found = d.cmd(&["TS.QUERYINDEX", "alpha=v1"]);
     assert!(!found.array().is_empty(), "{found:?}");
+}
+
+/// Lists of every form a slot migration moves arrive whole and in order,
+/// in the form they make there: one chunk, many chunks, one made irregular
+/// by inserts in the middle, and one whose elements are kept apart (an
+/// element over 1,024 bytes).
+#[test]
+fn migrate_moves_lists_in_every_form() {
+    let (nodes, ranges) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let (src_id, dst_id) = (src.id(), dst.id());
+    let tag = key_in(ranges[0].0..=ranges[0].1, "lists");
+    let slot = slot_of(&tag).to_string();
+    let k = |name: &str| format!("{{{tag}}}:{name}");
+    let mut s = src.conn();
+
+    let elements =
+        |n: usize| -> Vec<String> { (0..n).map(|i| format!("element:{i:024}")).collect() };
+    let push = |s: &mut Conn, key: &str, items: &[String]| {
+        for batch in items.chunks(100) {
+            let mut all = vec!["RPUSH".to_string(), key.to_string()];
+            all.extend(batch.iter().cloned());
+            let refs: Vec<&str> = all.iter().map(String::as_str).collect();
+            s.cmd(&refs);
+        }
+    };
+    push(&mut s, &k("one"), &elements(10));
+    push(&mut s, &k("many"), &elements(1000));
+    push(&mut s, &k("irregular"), &elements(1000));
+    for j in [500, 100, 900] {
+        s.cmd(&[
+            "LINSERT",
+            &k("irregular"),
+            "BEFORE",
+            &format!("element:{j:024}"),
+            "inserted",
+        ]);
+    }
+    let mut plain = elements(50);
+    plain.push("L".repeat(2000));
+    plain.extend(elements(10));
+    push(&mut s, &k("plain"), &plain);
+    let want = [
+        ("one", "listpack"),
+        ("many", "quicklist"),
+        ("irregular", "quicklist"),
+        ("plain", "quicklist"),
+    ];
+    let mut before = Vec::new();
+    let mut contents = Vec::new();
+    for (name, form) in want {
+        assert_eq!(
+            s.cmd(&["OBJECT", "ENCODING", &k(name)]).text(),
+            form,
+            "{name}"
+        );
+        before.push(s.cmd(&["DEBUG", "DIGEST-VALUE", &k(name)]));
+        let all = s.cmd(&["LRANGE", &k(name), "0", "-1"]);
+        contents.push(all.array().iter().map(Resp::text).collect::<Vec<_>>());
+    }
+
+    assert!(
+        dst.conn()
+            .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src_id])
+            .is_ok()
+    );
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+    let port = dst.port.to_string();
+    let mut args: Vec<String> = ["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.extend(want.iter().map(|(n, _)| k(n)));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let reply = s.cmd(&refs);
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
+    for node in [dst, src] {
+        assert!(
+            node.conn()
+                .cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &dst_id])
+                .is_ok()
+        );
+    }
+
+    let mut d = dst.conn();
+    for (((name, form), digest), elements) in want.iter().zip(&before).zip(&contents) {
+        let key = k(name);
+        assert_eq!(d.cmd(&["OBJECT", "ENCODING", &key]).text(), *form, "{name}");
+        assert_eq!(d.cmd(&["DEBUG", "DIGEST-VALUE", &key]), *digest, "{name}");
+        let all = d.cmd(&["LRANGE", &key, "0", "-1"]);
+        let got: Vec<String> = all.array().iter().map(Resp::text).collect();
+        assert_eq!(&got, elements, "{name}: the elements in their order");
+    }
+}
+
+/// Sorted sets of every form a slot migration moves arrive whole, in order,
+/// scores bit for bit, in the form they make there: a block, one at the
+/// limit, a large set, one made large by a long member, and one made large
+/// and taken back under the limit (which arrives as a block, as Redis loads
+/// one).
+#[test]
+fn migrate_moves_sorted_sets_in_every_form() {
+    let (nodes, ranges) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let (src_id, dst_id) = (src.id(), dst.id());
+    let tag = key_in(ranges[0].0..=ranges[0].1, "zsets");
+    let slot = slot_of(&tag).to_string();
+    let k = |name: &str| format!("{{{tag}}}:{name}");
+    let mut s = src.conn();
+
+    let add = |s: &mut Conn, key: &str, n: usize, from: usize| {
+        let mut all = vec!["ZADD".to_string(), key.to_string()];
+        for i in from..from + n {
+            all.push(format!("{}", (i % 13) as f64 / 4.0 - 1.0));
+            all.push(format!("member:{i:08}"));
+        }
+        let refs: Vec<&str> = all.iter().map(String::as_str).collect();
+        s.cmd(&refs);
+    };
+    add(&mut s, &k("small"), 10, 0);
+    add(&mut s, &k("full"), 128, 0);
+    add(&mut s, &k("large"), 1000, 0);
+    add(&mut s, &k("long"), 10, 0);
+    s.cmd(&["ZADD", &k("long"), "3", &"L".repeat(65)]);
+    add(&mut s, &k("shrunk"), 200, 0);
+    s.cmd(&["ZREMRANGEBYRANK", &k("shrunk"), "0", "189"]);
+    let want = [
+        ("small", "listpack", "listpack"),
+        ("full", "listpack", "listpack"),
+        ("large", "skiplist", "skiplist"),
+        ("long", "skiplist", "skiplist"),
+        ("shrunk", "skiplist", "listpack"),
+    ];
+    let mut before = Vec::new();
+    let mut contents = Vec::new();
+    for (name, form, _) in want {
+        assert_eq!(
+            s.cmd(&["OBJECT", "ENCODING", &k(name)]).text(),
+            form,
+            "{name}"
+        );
+        before.push(s.cmd(&["DEBUG", "DIGEST-VALUE", &k(name)]));
+        let all = s.cmd(&["ZRANGE", &k(name), "0", "-1", "WITHSCORES"]);
+        contents.push(all.array().iter().map(Resp::text).collect::<Vec<_>>());
+    }
+
+    assert!(
+        dst.conn()
+            .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src_id])
+            .is_ok()
+    );
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+    let port = dst.port.to_string();
+    let mut args: Vec<String> = ["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.extend(want.iter().map(|(n, _, _)| k(n)));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let reply = s.cmd(&refs);
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+    assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
+    for node in [dst, src] {
+        assert!(
+            node.conn()
+                .cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &dst_id])
+                .is_ok()
+        );
+    }
+
+    let mut d = dst.conn();
+    for (((name, _, form), digest), members) in want.iter().zip(&before).zip(&contents) {
+        let key = k(name);
+        assert_eq!(d.cmd(&["OBJECT", "ENCODING", &key]).text(), *form, "{name}");
+        assert_eq!(d.cmd(&["DEBUG", "DIGEST-VALUE", &key]), *digest, "{name}");
+        let all = d.cmd(&["ZRANGE", &key, "0", "-1", "WITHSCORES"]);
+        let got: Vec<String> = all.array().iter().map(Resp::text).collect();
+        assert_eq!(&got, members, "{name}: the members in their order");
+    }
 }

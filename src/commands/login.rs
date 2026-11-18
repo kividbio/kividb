@@ -180,11 +180,12 @@ impl Login<'_> {
                 .update(self.client_id, |info| info.name = name);
         }
         if let Some(protocol) = protocol {
-            *resp_version = protocol;
+            // `CLIENT NO-TOUCH` rides in the same byte, and stays.
+            *resp_version = (*resp_version & crate::commands::ctx::RESP_NO_TOUCH) | protocol;
             self.client_registry
                 .update(self.client_id, |info| info.resp = protocol);
         }
-        let proto_reply = *resp_version as i64;
+        let proto_reply = (*resp_version & crate::commands::ctx::RESP_VERSION) as i64;
 
         // Build the response — RESP3 clients (e.g. modern redis-py, whose
         // default changed to protocol 3) expect the HELLO reply itself encoded

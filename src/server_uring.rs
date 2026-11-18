@@ -4,7 +4,7 @@ use crate::resp;
 use crate::store;
 use crate::vector;
 use crate::watch::WatchNotifier;
-use commands::ctx::Ctx;
+use commands::ctx::{Ctx, RESP_VERSION, with_no_touch};
 use parking_lot::RwLock;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -41,6 +41,8 @@ pub async fn handle_replica_connection_uring(
     vset_quant_announced: bool,
     // It sent `REPLCONF capa slot-imports`.
     slot_imports_announced: bool,
+    // It sent `REPLCONF capa kdb-blocks` (#879).
+    kdb_blocks_announced: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::sync::mpsc;
 
@@ -78,6 +80,7 @@ pub async fn handle_replica_connection_uring(
         tx: replica_tx,
         pending_bytes: Arc::clone(&pending_bytes),
         slot_imports: !legacy_sync && repl_state.sends_slot_imports_to(slot_imports_announced),
+        kdb_blocks: !legacy_sync && kdb_blocks_announced,
     };
     let full_sync = match crate::replication::request_continuation(
         &hub_tx,
@@ -89,7 +92,7 @@ pub async fn handle_replica_connection_uring(
     {
         Ok(()) => None,
         Err(registration) => {
-            match tokio::task::spawn_blocking({
+            match crate::cpus::spawn_blocking({
                 let store = Arc::clone(&store);
                 let repl_state = Arc::clone(&repl_state);
                 let hub_tx = hub_tx.clone();
@@ -370,6 +373,8 @@ async fn park_blocking_uring(
     watch: &PeerWatch,
     repl_state: &crate::replication::ReplState,
     carried: &mut Vec<u8>,
+    carried_from: usize,
+    held_elsewhere: usize,
     activity: &crate::client_registry::Activity,
     limit: crate::server::HardLimit,
 ) -> Result<(), Vec<u8>> {
@@ -383,6 +388,7 @@ async fn park_blocking_uring(
         // A resumed handler parked again — it forgot its resume check. Reply as
         // if the wait timed out rather than looping forever.
         slot.clear_resume();
+        slot.release_count();
         return Err(crate::resp::write::resp_null_array());
     }
 
@@ -398,7 +404,18 @@ async fn park_blocking_uring(
         // The client is read while it waits, as the connection's own write
         // reads it (#865).
         let write = std::pin::pin!(stream.write_all(payload));
-        let (res, mut returned) = read_while_writing(write, watch, carried, activity, limit).await;
+        let (res, mut returned) = read_while_writing(
+            write,
+            watch,
+            crate::server::ReadAhead {
+                carried,
+                carried_from,
+                held_elsewhere,
+            },
+            activity,
+            limit,
+        )
+        .await;
         drop(_w);
         returned.clear();
         *out_buf = returned;
@@ -406,6 +423,7 @@ async fn park_blocking_uring(
             // Socket is gone, or shut down for a limit — don't park on a dead
             // connection.
             interrupted.gone = true;
+            slot.release_count();
             return Err(Vec::new());
         }
     }
@@ -422,9 +440,13 @@ async fn park_blocking_uring(
         tokio::time::sleep(delay).await;
     }
     let (client_registry, client_id) = client;
+    // Counted as blocked until the dispatch that resumes it has been counted
+    // in `commandstats` (see `server::park_blocking`, #896).
+    let mut counted = slot.take_count();
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
     client_registry.set_blocked(client_id, Some(unblock_tx), wait.has_timeout());
     let fd = watch.fd;
+    let mut unblockable = true;
     let delivery = if crate::commands::blocking::ended_by_role_change(
         park_epoch,
         refused_on_replica,
@@ -435,6 +457,7 @@ async fn park_blocking_uring(
         interrupted.role_changed = true;
         None
     } else {
+        counted.get_or_insert_with(crate::commands::blocking::BlockedCount::enter);
         let waiting = wait.wait();
         tokio::pin!(waiting);
         // Whether the client is still there. A read cannot be raced against
@@ -443,7 +466,6 @@ async fn park_blocking_uring(
         // killed, which shuts the socket down) must not be left in line for
         // an element nobody will receive. See `PeerWatch`.
         let mut gone = watch.gone();
-        let mut unblockable = true;
         loop {
             tokio::select! {
                 delivery = &mut waiting => {
@@ -455,6 +477,12 @@ async fn park_blocking_uring(
                     if peer_has_gone(fd) {
                         interrupted.gone = true;
                         break None;
+                    }
+                    #[cfg(debug_assertions)]
+                    if delivery.is_some()
+                        && let Some(delay) = crate::commands::blocking::test_woken_delay()
+                    {
+                        tokio::time::sleep(delay).await;
                     }
                     break delivery;
                 }
@@ -468,6 +496,7 @@ async fn park_blocking_uring(
                             how == crate::commands::blocking::Unblock::Error;
                         interrupted.role_changed =
                             how == crate::commands::blocking::Unblock::RoleChange;
+                        unblockable = false;
                         break None;
                     }
                     Err(_) => unblockable = false,
@@ -476,6 +505,26 @@ async fn park_blocking_uring(
         }
     };
     client_registry.set_blocked(client_id, None, false);
+    // A `CLIENT UNBLOCK` that took the client off the list just as its
+    // wait ended otherwise, woken say, was answered 1: it is done as it
+    // said. Otherwise the client went on as woken, and one woken for
+    // nothing parked again and stayed blocked. It is sent under the
+    // list's lock (`ClientRegistry::unblock`), so by now it is in the
+    // channel.
+    let unblocked = if unblockable {
+        unblock_rx.try_recv().ok()
+    } else {
+        None
+    };
+    let delivery = match unblocked {
+        Some(how) => {
+            interrupted.unblocked_with_error = how == crate::commands::blocking::Unblock::Error;
+            interrupted.role_changed = how == crate::commands::blocking::Unblock::RoleChange;
+            None
+        }
+        None => delivery,
+    };
+    slot.hold_count(counted);
     // Woken, or unblocked otherwise, at the moment this node became a
     // replica: ended as the sweep ends it.
     if !interrupted.gone
@@ -670,7 +719,7 @@ async fn read_while_writing(
         &mut dyn std::future::Future<Output = tokio_uring::BufResult<(), Vec<u8>>>,
     >,
     watch: &PeerWatch,
-    carried: &mut Vec<u8>,
+    read_ahead: crate::server::ReadAhead<'_>,
     activity: &crate::client_registry::Activity,
     mut limit: crate::server::HardLimit,
 ) -> tokio_uring::BufResult<(), Vec<u8>> {
@@ -679,14 +728,20 @@ async fn read_while_writing(
         tokio::select! {
             biased;
             written = &mut write => return written,
-            read = watch.read_into(carried), if reading => match read {
+            read = watch.read_into(read_ahead.carried), if reading => match read {
                 Ok(n) if n > 0 => {
                     crate::stats::TOTAL_NET_INPUT_BYTES
                         .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                     crate::stats::record_read();
                     activity.touch();
                     activity.note_read(n);
-                    if crate::server::carried_too_much(carried) || limit.over_after(n) {
+                    if crate::server::carried_too_much(
+                        read_ahead.held_elsewhere,
+                        read_ahead.carried,
+                        read_ahead.carried_from,
+                    )
+                        || limit.over_after(n)
+                    {
                         // SAFETY: the connection's descriptor, open while it runs.
                         unsafe { libc::shutdown(watch.fd, libc::SHUT_RDWR) };
                         reading = false;
@@ -730,12 +785,16 @@ fn needs_slow_path(cmd0: &[u8]) -> bool {
     // a: AUTH
     if !matches!(
         first,
-        b's' | b'p' | b'm' | b'd' | b'w' | b'u' | b'e' | b'a' | b'h' | b'r'
+        b's' | b'p' | b'm' | b'd' | b'w' | b'u' | b'e' | b'a' | b'h' | b'r' | b'c'
     ) {
         return false;
     }
-    // Second filter: byte-wise case-insensitive comparison (no UTF-8 validation).
-    ascii_eq_ignore_case(cmd0, b"SUBSCRIBE")
+    // Second filter: byte-wise case-insensitive comparison (no UTF-8
+    // validation). CLIENT first: none of the rest starts with `c`, so a
+    // `c` command runs just this one compare, and every other command in
+    // the set runs only the one extra.
+    ascii_eq_ignore_case(cmd0, b"CLIENT")
+        || ascii_eq_ignore_case(cmd0, b"SUBSCRIBE")
         || ascii_eq_ignore_case(cmd0, b"PSUBSCRIBE")
         || ascii_eq_ignore_case(cmd0, b"SSUBSCRIBE")
         // See the matching note in server.rs: RESP3 clients handle the
@@ -822,7 +881,7 @@ fn open_subscriptions(
     let write_guard = Rc::clone(write_guard);
     let registry = std::sync::Arc::clone(client_registry);
     subs.forwarded_by(tokio_uring::spawn(async move {
-        while let Some(batch) = outbox.next().await {
+        while let Some(mut batch) = outbox.next().await {
             let _w = write_guard.lock().await;
             // With the guard held: see `Batch::encode`.
             let frames = batch.encode(registry.get_resp(client_id));
@@ -832,10 +891,11 @@ fn open_subscriptions(
             crate::stats::TOTAL_NET_OUTPUT_BYTES
                 .fetch_add(frames.len() as u64, std::sync::atomic::Ordering::Relaxed);
             crate::stats::record_write();
-            let (res, _) = stream.write_all(frames).await;
+            let (res, frames) = stream.write_all(frames).await;
             if res.is_err() {
                 break;
             }
+            batch.written(frames);
         }
     }));
     subs
@@ -1086,6 +1146,10 @@ pub async fn handle_client(
     // per-command null-encoding check doesn't hit the shared client_registry lock
     // on every single command across every worker thread.
     let mut resp_version: u8 = 2;
+    // Its top bit is `CLIENT NO-TOUCH` (`RESP_NO_TOUCH`): it goes into each
+    // command's `Ctx::resp` with the protocol at no cost of its own, and is
+    // read back from `client_registry` only after a `CLIENT` (#566). The
+    // protocol is `resp_version & RESP_VERSION`.
 
     enum ConnectionHandoff {
         Replica {
@@ -1115,6 +1179,12 @@ pub async fn handle_client(
     // has been parsed (see `read_while_writing`).
     let mut carried: Vec<u8> = Vec::new();
     let mut carried_from = 0usize;
+    // Bytes at `parse_buf`'s end not yet offered to the parser: `carried`'s
+    // vector is handed to `parse_buf` whole when it is replayed — the same
+    // bytes stay in the one allocation rather than being copied a chunk a
+    // turn into a second, doubling, one — and a read's worth is offered a
+    // turn, as a chunk moved a turn was (#865).
+    let mut unpresented = 0usize;
     loop {
         let was_private_at_read = private_query_buffer;
         // No `kill_rx` check here any more — the watcher task above shuts the
@@ -1135,6 +1205,12 @@ pub async fn handle_client(
         // that buffer until the next read opportunity; that is the accepted
         // io_uring tradeoff for not racing the read (Redis shrinks such buffers
         // from its client cron instead).
+        //
+        // Whether this turn's bytes were moved out of `carried`, already
+        // held, rather than read: what is already held is not reserved for
+        // again — `parse_buf` would reserve a request's full length while
+        // `carried` still holds it, and the client would keep the two (#869).
+        let mut fed_from_carried = false;
         let (unparsed, n) = if std::mem::take(&mut reparse) {
             // Only a `SHUTDOWN` that failed reparses, and its turn submitted
             // no read with its write.
@@ -1152,24 +1228,52 @@ pub async fn handle_client(
         } else if let Some(n) = early_got.take() {
             // The same, done while the write went on.
             (early_from, n)
+        } else if unpresented > 0 {
+            // What `carried`'s vector was handed over as is offered on, a
+            // read's worth a turn.
+            fed_from_carried = true;
+            unpresented = unpresented.saturating_sub(READ_BUFFER);
+            (parse_buf.len(), 0)
         } else if !carried.is_empty() {
             // What was read while replies waited, a read's worth a turn, as
             // a read would have brought it: what one turn runs, and so the
             // replies the output limit looks at after it, is no more than a
             // read brings (#865).
-            let unparsed = parse_buf.len();
-            let to = carried.len().min(carried_from + READ_BUFFER);
-            parse_buf.extend_from_slice(&carried[carried_from..to]);
-            let n = to - carried_from;
-            carried_from = to;
-            if carried_from == carried.len() {
+            fed_from_carried = true;
+            if parse_start == parse_buf.len() {
+                // `carried`'s whole vector becomes the parse buffer when
+                // nothing of the buffer's is still to run: the read ahead
+                // is then replayed out of the allocation it was read into,
+                // rather than copied a chunk a turn into a second one that
+                // doubles its way up while `carried` still holds the same
+                // bytes.
+                std::mem::swap(&mut parse_buf, &mut carried);
+                parse_start = carried_from;
+                // The buffer's own allocation is not kept in `carried`
+                // either: what the next wait reads grows its own.
                 carried = Vec::new();
                 carried_from = 0;
-            } else if carried_from > carried.len() / 2 {
-                carried.drain(0..carried_from);
-                carried_from = 0;
+                let remaining = parse_buf.len() - parse_start;
+                unpresented = remaining.saturating_sub(READ_BUFFER);
+                (parse_start, remaining)
+            } else {
+                let unparsed = parse_buf.len();
+                let to = carried.len().min(carried_from + READ_BUFFER);
+                parse_buf.extend_from_slice(&carried[carried_from..to]);
+                let n = to - carried_from;
+                carried_from = to;
+                if carried_from == carried.len() {
+                    carried = Vec::new();
+                    carried_from = 0;
+                } else if carried_from > carried.len() / 2 {
+                    // What was moved out of `carried` is given back —
+                    // capacity with it — in steps, rather than at the end
+                    // (#869).
+                    carried = carried.split_off(carried_from);
+                    carried_from = 0;
+                }
+                (unparsed, n)
             }
-            (unparsed, n)
         } else {
             if parse_buf.capacity().saturating_sub(parse_buf.len()) < READ_MIN {
                 parse_buf.reserve(READ_BUFFER);
@@ -1184,6 +1288,9 @@ pub async fn handle_client(
                 Err(_) => break,
             }
         };
+        // What was read ends the buffer. Checked here, before the trim below,
+        // which takes the consumed front off a private buffer (#893).
+        debug_assert_eq!(parse_buf.len(), unparsed + n);
         // Bytes arrived from the socket: the client is active, so its idle
         // clock restarts. Once per read, not once per command — a pipeline
         // that arrives together is one interaction. EOF and read errors
@@ -1228,7 +1335,6 @@ pub async fn handle_client(
         activity.note_read(n);
 
         query_buffer_peak = query_buffer_peak.max(parse_buf.len().saturating_sub(parse_start));
-        debug_assert_eq!(parse_buf.len(), unparsed + n);
         query_buffer.update(
             parse_buf.len().saturating_sub(parse_start) + carried.len() - carried_from,
             parse_buf.capacity().saturating_sub(parse_buf.len()),
@@ -1245,20 +1351,32 @@ pub async fn handle_client(
         // Outside the parse loop: a park in one turn hands its delivery to
         // the re-dispatch on the next turn.
         let mut blocking_slot = crate::commands::blocking::BlockingSlot::default();
-        // The next turn dispatches the command of this one again: a parked
-        // command resumed, or a write a pause sent back to be held. It is
-        // the same command: not recorded, settled or begun again.
-        let mut redispatch = false;
+        // What is due before the next command (`output_limits::REDISPATCH`,
+        // `WATCH`). REDISPATCH: the next turn dispatches the command of this
+        // one again: a parked command resumed, or a write a pause sent back
+        // to be held. It is the same command: not recorded, settled or begun
+        // again. WATCH: the replies have room to be over an output limit,
+        // and are looked at before each command (#893).
+        let mut due = crate::output_limits::due_at_turn_start(&out_buf, pubsub.limits());
+        // Closed for its output buffer between two commands of this turn.
+        let mut output_limit_closed = false;
 
         // What the client sent that no request can begin with, if it did.
         let mut protocol_error: Option<String> = None;
         // With what was read while replies waited and is still to run.
         let query_buffer_bytes = parse_buf.len() + carried.len() - carried_from;
         let query_buffer_free = parse_buf.capacity().saturating_sub(parse_buf.len());
+        // What was handed over from `carried` is offered a read's worth a
+        // turn: commands start only before `presented_end`, which a request
+        // that crosses it completes past — as one a read ends within did.
+        let presented_end = parse_buf.len() - unpresented;
         let was_private_query_buffer = private_query_buffer;
-        while let Some((consumed, cmd)) =
-            match progress.next_request(&mut parse_buf, parse_offset, authenticated_user.is_some())
-            {
+        while parse_offset < presented_end
+            && let Some((consumed, cmd)) = match progress.next_request(
+                &mut parse_buf,
+                parse_offset,
+                authenticated_user.is_some(),
+            ) {
                 Ok(request) => request,
                 Err(e) => {
                     protocol_error = Some(e);
@@ -1316,15 +1434,39 @@ pub async fn handle_client(
             // For `CLIENT LIST`'s `cmd=` and `db=`, and `tot-cmds`. Not again
             // for a blocked command dispatched once more with what it waited
             // for: it is one command.
-            if !redispatch && !blocking_slot.resuming() {
-                activity.record(&cmd, selected_db);
+            if due == 0 {
+                if !blocking_slot.resuming() {
+                    activity.record(&cmd, selected_db);
+                }
+            } else {
+                // `client-output-buffer-limit` after each reply: see the
+                // matching arm in `src/server.rs` (#893), which settles a
+                // dropped reply first.
+                if due & crate::output_limits::REDISPATCH == 0 {
+                    reply_gate.settle(&mut out_buf);
+                }
+                if due & crate::output_limits::WATCH != 0
+                    && reply_limit.closes_after_reply(
+                        pubsub.limits(),
+                        subscriptions.is_some(),
+                        out_buf.len(),
+                        client_id,
+                    )
+                {
+                    output_limit_closed = true;
+                    break;
+                }
+                if due & crate::output_limits::REDISPATCH == 0 && !blocking_slot.resuming() {
+                    activity.record(&cmd, selected_db);
+                }
             }
             if !aof_wait && crate::aof::acks_wait() && crate::aof::may_log(&cmd) {
                 aof_wait = true;
             }
             // The command before this one is over: its reply is settled, and
             // what it left to tell tracking clients follows it.
-            if std::mem::take(&mut redispatch) {
+            if due & crate::output_limits::REDISPATCH != 0 {
+                due &= !crate::output_limits::REDISPATCH;
                 // A `CLIENT REPLY SKIP` before it is for the dispatch that
                 // replies, not used up by the one that did not.
                 reply_gate.again(&out_buf);
@@ -1375,9 +1517,13 @@ pub async fn handle_client(
             {
                 let gated: std::pin::Pin<
                     Box<dyn std::future::Future<Output = Option<Option<crate::pause::Ran>>> + '_>,
-                > = Box::pin(crate::pause::gate(&cmd, &tx.queue, client_id, || {
-                    peer_watch.gone()
-                }));
+                > = Box::pin(crate::pause::gate(
+                    &cmd,
+                    &tx.queue,
+                    client_id,
+                    blocking_slot.holds_count(),
+                    || peer_watch.gone(),
+                ));
                 match gated.await {
                     // The gate may have kept a resume waiting after it was
                     // woken and looked at the socket — while the clients an
@@ -1416,7 +1562,7 @@ pub async fn handle_client(
             let slowlog_enabled = slowlog.threshold_us() < u64::MAX;
             // A RESP2 connection with subscriptions may run next to nothing:
             // that is decided on the slow path.
-            let subscriber_only = resp_version == 2 && subscriptions.is_some();
+            let subscriber_only = subscriptions.is_some() && resp_version & RESP_VERSION == 2;
             if authenticated_user.is_some()
                 && !tx.active
                 && !subscriber_only
@@ -1427,12 +1573,14 @@ pub async fn handle_client(
                     // Made once for the connection and kept: it is two dozen shared
                     // handles, each counted up to copy and down to drop, and a script
                     // needs none of them copied to run on this thread. Made again if
-                    // the connection has become another user since.
+                    // the connection has become another user, or flagged
+                    // itself `CLIENT NO-TOUCH`, since (#566).
                     let user_now = authenticated_user.as_deref().unwrap_or("default");
-                    if lua_env
-                        .as_ref()
-                        .is_some_and(|env| env.authenticated_user != user_now)
-                    {
+                    if lua_env.as_ref().is_some_and(|env| {
+                        env.authenticated_user != user_now
+                            || env.no_touch
+                                != (resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0)
+                    }) {
                         lua_env = None;
                     }
                     let env = &*lua_env.get_or_insert_with(|| {
@@ -1461,6 +1609,7 @@ pub async fn handle_client(
                             &tracking_table,
                             &peer_addr,
                             client_id,
+                            resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0,
                             authenticated_user.as_deref().unwrap_or("default"),
                         )
                     });
@@ -1469,14 +1618,14 @@ pub async fn handle_client(
                         &mut selected_db,
                         env,
                         aof_enabled,
-                        resp_version,
+                        resp_version & RESP_VERSION,
                     )
                     .await;
                     // A script that got past a `CLIENT PAUSE` before it was
                     // set, and did not run (`pause::HELD_IN_GATE`): read
                     // again, and held by the pause check.
                     if crate::pause::is_held(&response) {
-                        redispatch = true;
+                        due |= crate::output_limits::REDISPATCH;
                         continue;
                     }
                     if slowlog_enabled && elapsed_us >= slowlog.threshold_us() {
@@ -1486,7 +1635,12 @@ pub async fn handle_client(
                             .unwrap_or_default();
                         slowlog.record(&cmd, elapsed_us, &peer_addr, client_name);
                     }
-                    out_buf.extend_from_slice(&response);
+                    crate::output_limits::append_reply(
+                        &mut out_buf,
+                        &response,
+                        &mut due,
+                        pubsub.limits(),
+                    );
                     parse_offset += consumed;
                     continue;
                 }
@@ -1535,7 +1689,7 @@ pub async fn handle_client(
                         let limit = crate::server::HardLimit::new(
                             pubsub.limits(),
                             subscriptions.is_some(),
-                            out_buf.len() + carried.len() - carried_from,
+                            out_buf.len() + carried.len() - carried_from + unpresented,
                             client_id,
                         );
                         // Boxed, and so polled out of line: the wait is cold, and the
@@ -1552,6 +1706,8 @@ pub async fn handle_client(
                             &peer_watch,
                             &repl_state,
                             &mut carried,
+                            carried_from,
+                            parse_buf.len() - (parse_offset + consumed),
                             &activity,
                             limit,
                         ))
@@ -1560,7 +1716,7 @@ pub async fn handle_client(
                             // `parse_offset` deliberately not advanced: the same
                             // command is re-dispatched, now carrying the delivery.
                             Ok(()) => {
-                                redispatch = true;
+                                due |= crate::output_limits::REDISPATCH;
                                 continue;
                             }
                             Err(reply) => response = reply,
@@ -1582,7 +1738,12 @@ pub async fn handle_client(
                         quit_requested = true;
                         break;
                     }
-                    out_buf.extend_from_slice(&response);
+                    crate::output_limits::append_reply(
+                        &mut out_buf,
+                        &response,
+                        &mut due,
+                        pubsub.limits(),
+                    );
                     parse_offset += consumed;
                     continue;
                 }
@@ -1631,7 +1792,7 @@ pub async fn handle_client(
                     let limit = crate::server::HardLimit::new(
                         pubsub.limits(),
                         subscriptions.is_some(),
-                        out_buf.len() + carried.len() - carried_from,
+                        out_buf.len() + carried.len() - carried_from + unpresented,
                         client_id,
                     );
                     // Boxed, and so polled out of line: the wait is cold, and the
@@ -1648,6 +1809,8 @@ pub async fn handle_client(
                         &peer_watch,
                         &repl_state,
                         &mut carried,
+                        carried_from,
+                        parse_buf.len() - (parse_offset + consumed),
                         &activity,
                         limit,
                     ))
@@ -1655,7 +1818,7 @@ pub async fn handle_client(
                     {
                         // See the note at the non-slowlog site above.
                         Ok(()) => {
-                            redispatch = true;
+                            due |= crate::output_limits::REDISPATCH;
                             continue;
                         }
                         Err(reply) => response = reply,
@@ -1697,7 +1860,12 @@ pub async fn handle_client(
                         slowlog.record(&slow_cmd, elapsed_us, &peer_addr, client_name);
                     }
                 }
-                out_buf.extend_from_slice(&response);
+                crate::output_limits::append_reply(
+                    &mut out_buf,
+                    &response,
+                    &mut due,
+                    pubsub.limits(),
+                );
                 parse_offset += consumed;
                 continue;
             }
@@ -1767,7 +1935,12 @@ pub async fn handle_client(
                             client_id,
                         );
                     }
-                    out_buf.extend_from_slice(&reply);
+                    crate::output_limits::append_reply(
+                        &mut out_buf,
+                        &reply,
+                        &mut due,
+                        pubsub.limits(),
+                    );
                     parse_offset += consumed;
                     continue;
                 }
@@ -1783,25 +1956,31 @@ pub async fn handle_client(
                 if let Some(refusal) =
                     crate::pubsub::shard_subscribe_refusal(cmd_name.as_str(), &cmd, &cluster_state)
                 {
-                    out_buf.extend_from_slice(&refusal);
+                    crate::output_limits::append_reply(
+                        &mut out_buf,
+                        &refusal,
+                        &mut due,
+                        pubsub.limits(),
+                    );
                     parse_offset += consumed;
                     continue;
                 }
                 let subs = subscriptions.get_or_insert_with(|| {
                     open_subscriptions(&pubsub, &client_registry, client_id, &stream, &write_guard)
                 });
-                out_buf.extend_from_slice(&subs.handle(&cmd, resp_version));
+                let reply = subs.handle(&cmd, resp_version & RESP_VERSION);
+                crate::output_limits::append_reply(&mut out_buf, &reply, &mut due, pubsub.limits());
                 if subs.total() == 0 {
                     subscriptions = None;
                 }
                 parse_offset += consumed;
                 continue;
             }
-            if resp_version == 2
+            if resp_version & RESP_VERSION == 2
                 && subscriptions.is_some()
                 && let Some(reply) = crate::pubsub::resp2_subscriber_reply(cmd_name.as_str(), &cmd)
             {
-                out_buf.extend_from_slice(&reply);
+                crate::output_limits::append_reply(&mut out_buf, &reply, &mut due, pubsub.limits());
                 parse_offset += consumed;
                 continue;
             }
@@ -1831,7 +2010,7 @@ pub async fn handle_client(
                     &store,
                 )
             {
-                out_buf.extend_from_slice(&offer);
+                crate::output_limits::append_reply(&mut out_buf, &offer, &mut due, pubsub.limits());
                 parse_offset += consumed;
                 continue;
             }
@@ -1886,7 +2065,7 @@ pub async fn handle_client(
                         client_id,
                     );
                 }
-                out_buf.extend_from_slice(&reply);
+                crate::output_limits::append_reply(&mut out_buf, &reply, &mut due, pubsub.limits());
                 parse_offset += consumed;
                 continue;
             }
@@ -2005,6 +2184,7 @@ pub async fn handle_client(
                     crate::commands::hash_import::forget_client(client_id);
                     client_registry.update(client_id, |info| {
                         info.no_evict = false;
+                        info.no_touch = false;
                         info.resp = 2;
                         info.name = String::new();
                         info.tracking = false;
@@ -2138,7 +2318,7 @@ pub async fn handle_client(
                         if crate::pause::writes_must_check(routed.at())
                             && crate::pause::exec_held_in_gate(&tx.queue)
                         {
-                            redispatch = true;
+                            due |= crate::output_limits::REDISPATCH;
                             continue;
                         }
                         // One time for the whole transaction, as Redis's
@@ -2202,7 +2382,7 @@ pub async fn handle_client(
                             // which breaks WATCH-abort detection for RESP3 clients entirely.
                             if let Some(refusal) = refused {
                                 refusal
-                            } else if resp_version == 3 {
+                            } else if resp_version & RESP_VERSION == 3 {
                                 crate::resp::write::resp_null_resp3()
                             } else {
                                 crate::resp::write::resp_null_array()
@@ -2289,7 +2469,7 @@ pub async fn handle_client(
                                 );
                                 tx.reset();
                                 dirty_flag.store(false, AtomicOrdering::Release);
-                                if resp_version == 3 {
+                                if resp_version & RESP_VERSION == 3 {
                                     crate::resp::write::resp_null_resp3()
                                 } else {
                                     crate::resp::write::resp_null_array()
@@ -2297,7 +2477,8 @@ pub async fn handle_client(
                             } else {
                                 // Each SET is a use, and a modification, of its
                                 // key, as the same SET is outside a transaction
-                                // (it went unrecorded here).
+                                // (it went unrecorded here) — a `NO-TOUCH`
+                                // client's too: writes count as uses (#566).
                                 let _access = crate::eviction::recording().then(|| {
                                     crate::store::AccessScope::open(crate::eviction::write_stamp(
                                         std::time::Instant::now(),
@@ -2422,7 +2603,9 @@ pub async fn handle_client(
                                             &write_guard,
                                         )
                                     });
-                                    exec_out.extend_from_slice(&subs.handle(&args, resp_version));
+                                    exec_out.extend_from_slice(
+                                        &subs.handle(&args, resp_version & RESP_VERSION),
+                                    );
                                     if subs.total() == 0 {
                                         subscriptions = None;
                                     }
@@ -2601,6 +2784,14 @@ pub async fn handle_client(
                                 }
 
                                 exec_out.extend_from_slice(&resp);
+                                // A queued `CLIENT NO-TOUCH` takes hold with
+                                // the command after it (#566).
+                                if queued_name == "CLIENT" {
+                                    resp_version = with_no_touch(
+                                        resp_version,
+                                        client_registry.get_no_touch(client_id),
+                                    );
+                                }
                             }
 
                             watch_registry.as_ref().unwatch_all(
@@ -2649,7 +2840,12 @@ pub async fn handle_client(
                     );
                     // Counted here: the commands below are not.
                     crate::cmdstats::record("HELLO", &cmd, &reply, started.elapsed());
-                    out_buf.extend_from_slice(&reply);
+                    crate::output_limits::append_reply(
+                        &mut out_buf,
+                        &reply,
+                        &mut due,
+                        pubsub.limits(),
+                    );
                     parse_offset += consumed;
                     continue;
                 }
@@ -2727,7 +2923,12 @@ pub async fn handle_client(
                         waited_for = blocked_at.elapsed();
                         match waited {
                             Some(reply) if reply == crate::commands::blocking::ROLE_CHANGED => {
-                                out_buf.extend_from_slice(&reply);
+                                crate::output_limits::append_reply(
+                                    &mut out_buf,
+                                    &reply,
+                                    &mut due,
+                                    pubsub.limits(),
+                                );
                                 quit_requested = true;
                                 break;
                             }
@@ -2752,6 +2953,14 @@ pub async fn handle_client(
                             let _blocked = (wanted > 0).then(|| {
                                 client_registry.blocked_in(client_id, unblock_tx, timeout_ms > 0)
                             });
+                            // Counted in `blocked_clients` until the command
+                            // has been counted in `commandstats`, after this
+                            // arm (#896).
+                            if wanted > 0 {
+                                blocking_slot.hold_count(Some(
+                                    crate::commands::blocking::BlockedCount::enter(),
+                                ));
+                            }
                             let blocked_at = Instant::now();
                             let waited = unless_gone(
                                 crate::replication::wait_for_replicas(
@@ -2769,7 +2978,12 @@ pub async fn handle_client(
                                 Some(end) if end.close => {
                                     // This master became a replica: told so,
                                     // and closed, as Redis closes it.
-                                    out_buf.extend_from_slice(&end.reply);
+                                    crate::output_limits::append_reply(
+                                        &mut out_buf,
+                                        &end.reply,
+                                        &mut due,
+                                        pubsub.limits(),
+                                    );
                                     parse_offset += consumed;
                                     quit_requested = true;
                                     break;
@@ -2831,12 +3045,14 @@ pub async fn handle_client(
                             // Made once for the connection and kept: it is two dozen shared
                             // handles, each counted up to copy and down to drop, and a script
                             // needs none of them copied to run on this thread. Made again if
-                            // the connection has become another user since.
+                            // the connection has become another user, or
+                            // flagged itself `CLIENT NO-TOUCH`, since (#566).
                             let user_now = authenticated_user.as_deref().unwrap_or("default");
-                            if lua_env
-                                .as_ref()
-                                .is_some_and(|env| env.authenticated_user != user_now)
-                            {
+                            if lua_env.as_ref().is_some_and(|env| {
+                                env.authenticated_user != user_now
+                                    || env.no_touch
+                                        != (resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0)
+                            }) {
                                 lua_env = None;
                             }
                             let env = &*lua_env.get_or_insert_with(|| {
@@ -2865,6 +3081,7 @@ pub async fn handle_client(
                                     &tracking_table,
                                     &peer_addr,
                                     client_id,
+                                    resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0,
                                     authenticated_user.as_deref().unwrap_or("default"),
                                 )
                             });
@@ -2873,7 +3090,7 @@ pub async fn handle_client(
                                 &mut selected_db,
                                 env,
                                 aof_enabled,
-                                resp_version,
+                                resp_version & RESP_VERSION,
                             )
                             .await
                         } else {
@@ -2975,7 +3192,7 @@ pub async fn handle_client(
             // A write that got past a `CLIENT PAUSE` before it was set, and
             // went no further (`pause::HELD_IN_GATE`): read again, and held.
             if crate::pause::is_held(&response) {
-                redispatch = true;
+                due |= crate::output_limits::REDISPATCH;
                 continue;
             }
             // `SHUTDOWN` that goes ahead is answered with nothing, and the
@@ -3002,6 +3219,8 @@ pub async fn handle_client(
                     &response,
                     started.elapsed().saturating_sub(waited_for),
                 );
+                // A `WAIT` that was counted as blocked stops being, now it is.
+                blocking_slot.release_count();
             }
             // MONITOR sees a transaction as it ran: `MULTI`, the commands —
             // each shown as it was run — and then `EXEC`.
@@ -3027,7 +3246,15 @@ pub async fn handle_client(
                     client_id,
                 );
             }
-            out_buf.extend_from_slice(&response);
+            // `CLIENT NO-TOUCH` writes the flag in the registry; the loop's
+            // copy — what each command's `Ctx` carries — is read back only
+            // after the command that can change it (#566). A `CLIENT` queued
+            // in a transaction is read back as `EXEC` runs it, above, so an
+            // `EXEC` does not pay for a registry lookup here.
+            if cmd_name == "CLIENT" {
+                resp_version = with_no_touch(resp_version, client_registry.get_no_touch(client_id));
+            }
+            crate::output_limits::append_reply(&mut out_buf, &response, &mut due, pubsub.limits());
             parse_offset += consumed;
         }
         private_query_buffer |= progress.take_private_query_buffer();
@@ -3043,7 +3270,7 @@ pub async fn handle_client(
                 resp::parse::PRIVATE_QUERY_BUFFER_MIN_CAPACITY.saturating_sub(parse_buf.len()),
             );
         }
-        if reserve_hint > parse_buf.capacity() {
+        if reserve_hint > parse_buf.capacity() && !fed_from_carried {
             parse_buf.reserve(reserve_hint.saturating_sub(parse_buf.len()));
         }
         query_buffer_peak = query_buffer_peak.max(reserve_hint);
@@ -3067,6 +3294,10 @@ pub async fn handle_client(
             quit_requested = true;
         }
 
+        // A request that crosses `presented_end` completes past it — as one
+        // a read ends within did — so the turn can have run into the
+        // un-offered tail: no more of it is left than is unconsumed.
+        unpresented = unpresented.min(parse_buf.len() - parse_offset);
         parse_start = parse_offset;
         if parse_start == parse_buf.len() {
             parse_buf.clear();
@@ -3111,6 +3342,10 @@ pub async fn handle_client(
         // `client-output-buffer-limit` (#774): replies over the hard limit,
         // or over the soft limit for longer than its seconds, end the
         // connection unwritten, as Redis drops such a client and its output.
+        // Already closed for it, between two commands (#893).
+        if output_limit_closed {
+            break;
+        }
         let mut write_within = None;
         if pubsub.limits().may_exceed(out_buf.len()) {
             use crate::output_limits::{Class, Verdict};
@@ -3146,8 +3381,11 @@ pub async fn handle_client(
                 // first, the client is sending while its replies wait, and is
                 // read on while they are written. Not when this turn ends the
                 // connection or hands it on, nor while there is still read
-                // ahead to run.
-                None if carried.is_empty()
+                // ahead to run — whether still in `carried` or already handed
+                // to `parse_buf` but not yet offered, since what the early
+                // read would land is past the un-offered tail.
+                None if unpresented == 0
+                    && carried.is_empty()
                     && !quit_requested
                     && shutdown_wait.is_none()
                     && connection_handoff.is_none() =>
@@ -3179,7 +3417,11 @@ pub async fn handle_client(
                                     Box::pin(read_while_writing(
                                         write,
                                         &peer_watch,
-                                        &mut carried,
+                                        crate::server::ReadAhead {
+                                            carried: &mut carried,
+                                            carried_from,
+                                            held_elsewhere: parse_buf.len() - parse_start,
+                                        },
                                         &activity,
                                         limit,
                                     ))
@@ -3195,19 +3437,26 @@ pub async fn handle_client(
                 // Read ahead still to run, from a write that waited: the client
                 // is read while this one is written too. Not when this turn
                 // hands the connection on, whose bytes are the replication
-                // link's.
-                None if !carried.is_empty() && connection_handoff.is_none() => {
+                // link's. The read ahead is `carried`'s or, already handed to
+                // `parse_buf`, the tail not yet offered.
+                None if (!carried.is_empty() || unpresented > 0)
+                    && connection_handoff.is_none() =>
+                {
                     let limit = crate::server::HardLimit::new(
                         pubsub.limits(),
                         subscriptions.is_some(),
-                        waiting + carried.len() - carried_from,
+                        waiting + carried.len() - carried_from + unpresented,
                         client_id,
                     );
                     let write = std::pin::pin!(stream.write_all(spare_buf));
                     Box::pin(read_while_writing(
                         write,
                         &peer_watch,
-                        &mut carried,
+                        crate::server::ReadAhead {
+                            carried: &mut carried,
+                            carried_from,
+                            held_elsewhere: parse_buf.len() - parse_start,
+                        },
                         &activity,
                         limit,
                     ))
@@ -3218,14 +3467,18 @@ pub async fn handle_client(
                     let limit = crate::server::HardLimit::new(
                         pubsub.limits(),
                         subscriptions.is_some(),
-                        waiting + carried.len() - carried_from,
+                        waiting + carried.len() - carried_from + unpresented,
                         client_id,
                     );
                     let write = std::pin::pin!(stream.write_all(spare_buf));
                     let write = Box::pin(read_while_writing(
                         write,
                         &peer_watch,
-                        &mut carried,
+                        crate::server::ReadAhead {
+                            carried: &mut carried,
+                            carried_from,
+                            held_elsewhere: parse_buf.len() - parse_start,
+                        },
                         &activity,
                         limit,
                     ));
@@ -3300,6 +3553,9 @@ pub async fn handle_client(
                 let slot_imports_announced = client_registry
                     .get(client_id)
                     .is_some_and(|info| info.replica_slot_imports);
+                let kdb_blocks_announced = client_registry
+                    .get(client_id)
+                    .is_some_and(|info| info.replica_kdb_blocks);
                 // A replica's link from here: `flags=S`, `TYPE replica`, as
                 // Redis lists it (#595). `CLIENT KILL` shuts its socket, as
                 // any client's, which ends the link.
@@ -3318,6 +3574,7 @@ pub async fn handle_client(
                     psync,
                     vset_quant_announced,
                     slot_imports_announced,
+                    kdb_blocks_announced,
                 )
                 .await?;
 

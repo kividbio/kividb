@@ -1,4 +1,6 @@
+pub use crate::list_values::ListValues;
 pub use crate::shared_bytes::SharedBytes;
+pub use crate::sorted_set::{SortedSetInner, ZMember};
 use crate::vector::DistanceMetric;
 use ahash::AHashMap;
 use ordered_float::OrderedFloat;
@@ -204,91 +206,6 @@ impl StreamInner {
 }
 
 impl Default for StreamInner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// A member name stored as a cheaply-cloneable Arc'd byte slice.
-/// Using Arc<[u8]> means cloning the key between the BTreeMap and AHashMap
-/// costs only an atomic refcount increment, not a heap allocation.
-pub type ZMember = Arc<[u8]>;
-
-/// The inner data for a Sorted Set key.
-///
-/// Dual-representation for O(log N) score-ordered iteration AND O(1) member lookup:
-///
-///   members:  AHashMap<ZMember, f64>
-///             → "what is this member's score?" — O(1) average
-///
-///   by_score: BTreeMap<(OrderedFloat<f64>, ZMember), ()>
-///             → "give me all members with scores in [lo, hi]" — O(log N) seek + O(M) scan
-///
-/// The composite key (score, member) in by_score ensures that members with
-/// equal scores are ordered lexicographically — matching Redis semantics exactly.
-///
-/// INVARIANT: members and by_score are always in sync. Every write path must
-/// update both atomically (they live inside a single RwLock, so this is safe).
-#[derive(Clone)]
-pub struct SortedSetInner {
-    pub members: AHashMap<ZMember, f64>,
-    pub by_score: BTreeMap<(OrderedFloat<f64>, ZMember), ()>,
-}
-
-impl SortedSetInner {
-    pub fn new() -> Self {
-        Self {
-            members: AHashMap::new(),
-            by_score: BTreeMap::new(),
-        }
-    }
-
-    /// Insert or update a member. Returns true if the member is new.
-    /// This is the ONLY place both maps should be written — keeps the invariant.
-    ///
-    /// A score of -0 is kept as 0, as Redis keeps it in the listpack that
-    /// holds a sorted set of up to 128 members: `ZADD z -0 m` then
-    /// `ZSCORE z m` is `0` (#422).
-    pub fn insert(&mut self, member: ZMember, score: f64) -> bool {
-        // -0 + 0 is 0; any other score is itself.
-        let score = score + 0.0;
-        if let Some(&old_score) = self.members.get(&member) {
-            // Member exists — remove old position in the score index first
-            self.by_score
-                .remove(&(OrderedFloat(old_score), member.clone()));
-            self.members.insert(member.clone(), score);
-            self.by_score.insert((OrderedFloat(score), member), ());
-            false // not new
-        } else {
-            self.members.insert(member.clone(), score);
-            self.by_score.insert((OrderedFloat(score), member), ());
-            true // new member
-        }
-    }
-
-    /// Remove a member. Returns true if it existed.
-    pub fn remove(&mut self, member: &[u8]) -> bool {
-        // Retrieve the owned key directly, avoiding a linear scan of the member map.
-        match self.members.remove_entry(member) {
-            Some((arc_member, score)) => {
-                let indexed = self.by_score.remove(&(OrderedFloat(score), arc_member));
-                debug_assert!(indexed.is_some(), "member missing from by_score");
-                true
-            }
-            None => false,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.members.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.members.is_empty()
-    }
-}
-
-impl Default for SortedSetInner {
     fn default() -> Self {
         Self::new()
     }
@@ -1465,7 +1382,7 @@ impl ArrayInner {
 #[derive(Clone)]
 pub enum KiviDBValue {
     String(SharedBytes),
-    List(Arc<RwLock<VecDeque<Arc<[u8]>>>>),
+    List(Arc<RwLock<ListValues>>),
     Hash(Arc<RwLock<HashFields>>),
     Json(Arc<RwLock<serde_json::Value>>),
     Set(Arc<RwLock<crate::member_set::MemberSet>>),
@@ -1574,84 +1491,6 @@ impl KiviDBValue {
             KiviDBValue::Array(_) => "array",
             KiviDBValue::Sketch(sketch) => sketch.read().type_name(),
         }
-    }
-}
-
-#[cfg(test)]
-mod sorted_set_tests {
-    use super::*;
-
-    fn m(name: &[u8]) -> ZMember {
-        Arc::from(name)
-    }
-
-    /// `members` and `by_score` hold exactly the same (member, score) pairs.
-    /// (By value: after a score update the two keys can be different Arcs of
-    /// the same bytes, as `insert` keeps the old key in `members`.)
-    fn assert_in_sync(zs: &SortedSetInner) {
-        assert_eq!(zs.members.len(), zs.by_score.len());
-        for (score, member) in zs.by_score.keys() {
-            assert_eq!(zs.members.get(member.as_ref()), Some(&score.0));
-        }
-    }
-
-    fn order(zs: &SortedSetInner) -> Vec<(&[u8], f64)> {
-        zs.by_score.keys().map(|(s, m)| (m.as_ref(), s.0)).collect()
-    }
-
-    #[test]
-    fn remove_keeps_both_indexes_in_sync() {
-        let mut zs = SortedSetInner::new();
-        assert!(!zs.remove(b"a"), "empty set");
-        assert!(zs.insert(m(b"a"), 1.0));
-        assert!(zs.insert(m(b"b"), 2.0));
-        assert!(zs.insert(m(b"c"), 2.0)); // ties b: ordered by name
-        assert!(zs.insert(m(b"\xff\x00z"), 0.5)); // not UTF-8
-        assert_in_sync(&zs);
-
-        assert!(zs.remove(b"b"));
-        assert!(!zs.remove(b"b"), "already removed");
-        assert!(!zs.remove(b"missing"));
-        assert_in_sync(&zs);
-        assert_eq!(
-            order(&zs),
-            [(&b"\xff\x00z"[..], 0.5), (b"a", 1.0), (b"c", 2.0)]
-        );
-
-        assert!(zs.remove(b"\xff\x00z"));
-        assert_in_sync(&zs);
-        assert_eq!(order(&zs), [(&b"a"[..], 1.0), (b"c", 2.0)]);
-    }
-
-    #[test]
-    fn update_remove_and_reinsert_keep_both_indexes_in_sync() {
-        let mut zs = SortedSetInner::new();
-        zs.insert(m(b"a"), 1.0);
-        zs.insert(m(b"b"), 2.0);
-        assert!(!zs.insert(m(b"a"), 3.0), "score update is not new");
-        assert_in_sync(&zs);
-        assert_eq!(order(&zs), [(&b"b"[..], 2.0), (b"a", 3.0)]);
-
-        assert!(zs.remove(b"a"));
-        assert!(zs.insert(m(b"a"), -1.0), "reinsertion is new");
-        assert_in_sync(&zs);
-        assert_eq!(order(&zs), [(&b"a"[..], -1.0), (b"b", 2.0)]);
-
-        assert!(zs.remove(b"a"));
-        assert!(zs.remove(b"b"));
-        assert!(zs.is_empty());
-        assert!(zs.by_score.is_empty());
-    }
-
-    /// Removal drops the member's last reference: neither index keeps it.
-    #[test]
-    fn remove_releases_the_member() {
-        let mut zs = SortedSetInner::new();
-        let a = m(b"a");
-        zs.insert(Arc::clone(&a), 1.0);
-        assert_eq!(Arc::strong_count(&a), 3); // ours, members, by_score
-        assert!(zs.remove(b"a"));
-        assert_eq!(Arc::strong_count(&a), 1);
     }
 }
 
@@ -1779,7 +1618,7 @@ mod expiries_tests {
         let readers: Vec<_> = (0..4)
             .map(|_| {
                 let lock = std::sync::Arc::clone(&lock);
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     for _ in 0..1_000 {
                         let times = lock.read();
                         assert!(!times.has_due(now + 30_000));

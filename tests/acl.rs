@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/acl.rs
 //
 // Integration tests for the ACL subsystem (PR2):

@@ -463,7 +463,7 @@ mod tests {
             .map(|_| {
                 let in_flight = Arc::clone(&in_flight);
                 let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
                         let _guard = enter();
                         in_flight.fetch_add(1, Ordering::SeqCst);
@@ -510,7 +510,7 @@ mod tests {
         // And the gate is free again.
         let done = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&done);
-        let t = std::thread::spawn(move || {
+        let t = crate::cpus::spawn(move || {
             let _alone = enter_alone();
             flag.store(true, Ordering::SeqCst);
         });
@@ -527,7 +527,7 @@ mod tests {
     fn commands_do_not_wait_for_each_other() {
         for _ in 0..50 {
             let mine = enter();
-            let entered = std::thread::spawn(|| {
+            let entered = crate::cpus::spawn(|| {
                 let deadline = std::time::Instant::now() + Duration::from_millis(200);
                 enter_unless(Duration::from_millis(5), || {
                     std::time::Instant::now() > deadline
@@ -561,7 +561,7 @@ mod tests {
     fn a_wait_for_the_gate_can_be_given_up() {
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let holder = std::thread::spawn(move || {
+        let holder = crate::cpus::spawn(move || {
             let _alone = enter_alone();
             held_tx.send(()).unwrap();
             release_rx.recv().unwrap();
@@ -613,7 +613,7 @@ mod late_threads {
         // it. While the taker waits, threads that arrive are late.
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let holder = std::thread::spawn(move || {
+        let holder = crate::cpus::spawn(move || {
             let _command = enter();
             held_tx.send(()).unwrap();
             release_rx.recv().unwrap();
@@ -621,7 +621,7 @@ mod late_threads {
         held_rx.recv().unwrap();
 
         let (got_tx, got_rx) = std::sync::mpsc::channel();
-        let taker = std::thread::spawn(move || {
+        let taker = crate::cpus::spawn(move || {
             let _alone = enter_alone();
             got_tx.send(()).unwrap();
         });
@@ -632,7 +632,7 @@ mod late_threads {
         let crowd: Vec<_> = (0..6)
             .map(|_| {
                 let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
                         let _command = enter();
                         std::thread::yield_now();
@@ -666,10 +666,10 @@ mod late_threads {
             .map(|_| {
                 let in_flight = Arc::clone(&in_flight);
                 let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
                         let in_flight = Arc::clone(&in_flight);
-                        std::thread::spawn(move || {
+                        crate::cpus::spawn(move || {
                             for _ in 0..3 {
                                 let _command = enter();
                                 in_flight.fetch_add(1, Ordering::SeqCst);
