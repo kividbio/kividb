@@ -276,12 +276,12 @@ def expect_len(c, n, after):
 def errors_are_counted(c):
     """Refuse to measure on a server whose error counts do not move: send one
     error reply and see it counted (the error check of rate() relies on it)."""
-    import redis
     before = c.info("all")
     try:
         c.execute_command("EVALSHA", "0" * 40, 0)
-    except redis.ResponseError:
-        pass
+    except Exception as e:  # redis.ResponseError (not imported: the self-test runs without redis-py)
+        if type(e).__name__ != "ResponseError":
+            raise
     else:
         raise RuntimeError("EVALSHA of an unknown script did not fail")
     if errors_during(before, c.info("all")) < 1:
