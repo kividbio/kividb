@@ -2486,6 +2486,12 @@ pub fn psync_reply_keeps_vset_quant(reply: &str) -> bool {
         .any(|word| word == VSET_QUANT_CAPA)
 }
 
+/// The capability by which a replica says it reads a compressed snapshot
+/// (`snapshot::blocks`, #879): a master with `rdbcompression yes` sends it its
+/// full sync compressed. One that does not say it (KiviDB 1.2 and earlier,
+/// Redis) is sent the plain image, as before.
+pub const KDB_BLOCKS_CAPA: &str = "kdb-blocks";
+
 /// The capability by which a replica asks to be told of its master's atomic
 /// slot imports, and a master's `PSYNC` reply says it tells (#741).
 pub const SLOT_IMPORTS_CAPA: &str = "slot-imports";
@@ -3400,6 +3406,9 @@ pub struct ReplicaRegistration {
     /// It asked for [`SLOT_IMPORTS_MARKER`]s, and this node sends them
     /// ([`ReplState::sends_slot_imports_to`]).
     pub slot_imports: bool,
+    /// It said `REPLCONF capa kdb-blocks` ([`KDB_BLOCKS_CAPA`]): it reads a
+    /// compressed snapshot, and is sent one with `rdbcompression yes`.
+    pub kdb_blocks: bool,
 }
 
 /// Take the cut for a full resync: register the replica with the hub and
@@ -3430,6 +3439,10 @@ pub fn begin_full_sync(
     hub_tx: &HubTx,
     registration: ReplicaRegistration,
 ) -> std::io::Result<FullSync> {
+    // A replica of 1.2 or earlier does not read a compressed snapshot: it is
+    // sent the plain image (#879).
+    let announced = registration.kdb_blocks;
+    let compressed = announced && crate::snapshot::blocks::enabled();
     let started = std::time::Instant::now();
     let cut = crate::write_gate::cut();
 
@@ -3478,7 +3491,22 @@ pub fn begin_full_sync(
     drop(cut);
     let held = started.elapsed();
 
-    let (payload, not_counted) = frozen.into_image()?;
+    // Laid out, and compressed, with writes going on again.
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+    let (mut payload, not_counted) = frozen.into_image_as(compressed)?;
+    #[cfg(debug_assertions)]
+    crate::snapshot::blocks::test_damage_full_sync(&mut payload);
+    log_info!(
+        "Replication: full-sync payload of {} bytes, {}",
+        payload.len(),
+        if compressed {
+            "a compressed snapshot (the replica takes kdb-blocks)"
+        } else if announced {
+            "a plain snapshot (rdbcompression no)"
+        } else {
+            "a plain snapshot (the replica does not take kdb-blocks)"
+        }
+    );
     if held > std::time::Duration::from_millis(100) {
         log_info!(
             "Replication: Full-sync cut held writes for {} ms ({} byte payload)",
@@ -6088,6 +6116,7 @@ mod replication_invariants_tests {
                 tx,
                 pending_bytes: Arc::clone(&queue),
                 slot_imports: false,
+                kdb_blocks: false,
             },
             QueueRx::new(rx, queue),
         )

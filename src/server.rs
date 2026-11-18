@@ -93,21 +93,24 @@ fn socket_says_gone(_fd: Option<i32>) -> bool {
 /// closed, as Redis closes one whose query buffer reaches the limit.
 /// Otherwise a client that kept sending while it waited — in a blocking
 /// command, a pause, `WAIT` — would be read into memory without end.
-pub(crate) fn carried_too_much(carried: &[u8]) -> bool {
+/// `base` is what it already holds unread elsewhere — its `buffer` past
+/// what has run — and `from` the prefix of `carried` already moved on:
+/// the limit binds the two together, not each alone (#869).
+pub(crate) fn carried_too_much(base: usize, carried: &[u8], from: usize) -> bool {
+    let held = base + carried.len() - from;
     // Only past a megabyte, the least the limit can be set to, is the
     // setting looked up.
-    if carried.len() <= 1 << 20 {
+    if held <= 1 << 20 {
         return false;
     }
     let limit = crate::commands::server::remembered_config("client-query-buffer-limit")
         .and_then(|limit| limit.parse::<usize>().ok())
         .unwrap_or(1 << 30);
-    if carried.len() <= limit {
+    if held <= limit {
         return false;
     }
     log_warn!(
-        "Closing a client that sent {} bytes while it waited, past client-query-buffer-limit ({limit})",
-        carried.len()
+        "Closing a client that held {held} unread bytes, past client-query-buffer-limit ({limit})"
     );
     true
 }
@@ -211,7 +214,11 @@ where
                 read_while_writing(
                     flush,
                     waiter.reader,
-                    waiter.carried,
+                    ReadAhead {
+                        carried: waiter.carried,
+                        carried_from: waiter.carried_from,
+                        held_elsewhere: waiter.held_elsewhere,
+                    },
                     waiter.kill_rx,
                     waiter.activity,
                     limit,
@@ -273,7 +280,11 @@ where
                     // picked — so the socket is looked at now.
                     if gone_by_now(
                         waiter.reader,
-                        waiter.carried,
+                        ReadAhead {
+                            carried: waiter.carried,
+                            carried_from: waiter.carried_from,
+                            held_elsewhere: waiter.held_elsewhere,
+                        },
                         waiter.activity,
                         waiter.socket_fd,
                     ) {
@@ -294,7 +305,11 @@ where
                         // The client sent something while it was parked, so it
                         // is not idle: restart its idle clock.
                         waiter.activity.touch();
-                        if carried_too_much(waiter.carried) {
+                        if carried_too_much(
+                            waiter.held_elsewhere,
+                            waiter.carried,
+                            waiter.carried_from,
+                        ) {
                             waiter.interrupted.gone = true;
                             break None;
                         }
@@ -356,6 +371,17 @@ where
     Ok(())
 }
 
+/// What a wait, or a write that keeps reading, holds of a client's input:
+/// `carried`, what has been read ahead for the parser; `carried_from`, the
+/// prefix of it already moved on into `buffer`; and `held_elsewhere`, the
+/// unread bytes `buffer` holds besides — what `carried_too_much` binds
+/// together (#869).
+pub(crate) struct ReadAhead<'a> {
+    pub(crate) carried: &'a mut Vec<u8>,
+    pub(crate) carried_from: usize,
+    pub(crate) held_elsewhere: usize,
+}
+
 /// Whether the client has gone, as far as its socket says now, without
 /// waiting for anything: asked of the kernel where there is a socket to ask
 /// (`socket_fd`), which knows before the runtime's reactor has taken the
@@ -363,7 +389,7 @@ where
 /// into `carried`, as the wait reads it, up to its end if that has arrived.
 fn gone_by_now<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
-    carried: &mut Vec<u8>,
+    read_ahead: ReadAhead<'_>,
     activity: &crate::client_registry::Activity,
     socket_fd: Option<i32>,
 ) -> bool {
@@ -382,9 +408,13 @@ fn gone_by_now<R: tokio::io::AsyncRead + Unpin>(
                 let n = read.filled().len();
                 crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                 crate::stats::record_read();
-                carried.extend_from_slice(read.filled());
+                read_ahead.carried.extend_from_slice(read.filled());
                 activity.touch();
-                if carried_too_much(carried) {
+                if carried_too_much(
+                    read_ahead.held_elsewhere,
+                    read_ahead.carried,
+                    read_ahead.carried_from,
+                ) {
                     return true;
                 }
             }
@@ -405,7 +435,7 @@ fn gone_by_now<R: tokio::io::AsyncRead + Unpin>(
 /// compiled as it was without it.
 fn until_gone<'a, R: tokio::io::AsyncRead + Unpin + Send>(
     reader: &'a mut R,
-    carried: &'a mut Vec<u8>,
+    read_ahead: ReadAhead<'a>,
     kill_rx: &'a mut crate::client_registry::KillRx,
     activity: &'a crate::client_registry::Activity,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
@@ -417,9 +447,13 @@ fn until_gone<'a, R: tokio::io::AsyncRead + Unpin + Send>(
                     Ok(n) if n > 0 => {
                         crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                         crate::stats::record_read();
-                        carried.extend_from_slice(&temp[..n]);
+                        read_ahead.carried.extend_from_slice(&temp[..n]);
                         activity.touch();
-                        if carried_too_much(carried) {
+                        if carried_too_much(
+                            read_ahead.held_elsewhere,
+                            read_ahead.carried,
+                            read_ahead.carried_from,
+                        ) {
                             return;
                         }
                     }
@@ -446,7 +480,7 @@ fn read_while_writing<'a, R: tokio::io::AsyncRead + Unpin + Send>(
         &'a mut (dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a),
     >,
     reader: &'a mut R,
-    carried: &'a mut Vec<u8>,
+    read_ahead: ReadAhead<'a>,
     kill_rx: &'a mut crate::client_registry::KillRx,
     activity: &'a crate::client_registry::Activity,
     mut limit: HardLimit,
@@ -461,10 +495,14 @@ fn read_while_writing<'a, R: tokio::io::AsyncRead + Unpin + Send>(
                     Ok(n) if n > 0 => {
                         crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                         crate::stats::record_read();
-                        carried.extend_from_slice(&temp[..n]);
+                        read_ahead.carried.extend_from_slice(&temp[..n]);
                         activity.touch();
                         activity.note_read(n);
-                        if carried_too_much(carried) {
+                        if carried_too_much(
+                            read_ahead.held_elsewhere,
+                            read_ahead.carried,
+                            read_ahead.carried_from,
+                        ) {
                             return Err(std::io::Error::other("client-query-buffer-limit"));
                         }
                         if limit.over_after(n) {
@@ -536,6 +574,11 @@ struct Waiter<'a, R> {
     reader: &'a mut R,
     /// What the client sent while the command waited, to be parsed after it.
     carried: &'a mut Vec<u8>,
+    /// The prefix of `carried` already moved into `buffer` when the wait
+    /// began, and the unread bytes `buffer` holds: what the
+    /// query-buffer limit counts besides what the wait reads.
+    carried_from: usize,
+    held_elsewhere: usize,
     kill_rx: &'a mut crate::client_registry::KillRx,
     client_registry: &'a crate::client_registry::ClientRegistry,
     client_id: u64,
@@ -918,6 +961,11 @@ where
     loop {
         let was_private_at_read = private_query_buffer;
         let skip_read = std::mem::take(&mut reparse);
+        // Whether this turn's bytes were moved out of `carried`, already
+        // held, rather than read: what is already held is not reserved for
+        // again — `buffer` would reserve a request's full length while
+        // `carried` still holds it, and the client would keep the two (#869).
+        let mut fed_from_carried = false;
         if carried.is_empty() && !skip_read {
             // Redis reclaims private query buffers from its client cron, and the
             // maintenance step below is the equivalent. It can only do anything
@@ -1018,6 +1066,7 @@ where
             // A read's worth a turn, as the socket would have given it: what
             // one turn runs, and so the replies the output limit looks at
             // after it, is no more than a read brings (#865).
+            fed_from_carried = true;
             let to = carried.len().min(carried_from + temp.len());
             buffer.extend_from_slice(&carried[carried_from..to]);
             carried_from = to;
@@ -1025,7 +1074,9 @@ where
                 carried = Vec::new();
                 carried_from = 0;
             } else if carried_from > carried.len() / 2 {
-                carried.drain(0..carried_from);
+                // What was moved out of `carried` is given back — capacity
+                // with it — in steps, rather than at the end (#869).
+                carried = carried.split_off(carried_from);
                 carried_from = 0;
             }
         }
@@ -1061,6 +1112,9 @@ where
         // With what was read while the connection waited and is still to run.
         let query_buffer_bytes = buffer.len() + carried.len() - carried_from;
         let query_buffer_free = buffer.capacity().saturating_sub(buffer.len());
+        // `cmd` borrows `buffer` for the whole parse round: what it holds is
+        // known only from here.
+        let buffer_len = buffer.len();
         let was_private_query_buffer = private_query_buffer;
         while let Some((consumed, cmd)) =
             match progress.next_request(&mut buffer, parse_offset, authenticated_user.is_some()) {
@@ -1218,14 +1272,34 @@ where
                     &tx.queue,
                     client_id,
                     blocking_slot.holds_count(),
-                    || until_gone(&mut reader, &mut carried, &mut kill_rx, &activity),
+                    || {
+                        until_gone(
+                            &mut reader,
+                            ReadAhead {
+                                carried: &mut carried,
+                                carried_from,
+                                held_elsewhere: buffer_len - (parse_offset + consumed),
+                            },
+                            &mut kill_rx,
+                            &activity,
+                        )
+                    },
                 ));
                 match gated.await {
                     // See the matching arm in `server_uring`: the gate may
                     // have kept a woken resume waiting, and its client gone.
                     Some(ran)
                         if blocking_slot.resuming()
-                            && gone_by_now(&mut reader, &mut carried, &activity, socket_fd) =>
+                            && gone_by_now(
+                                &mut reader,
+                                ReadAhead {
+                                    carried: &mut carried,
+                                    carried_from,
+                                    held_elsewhere: buffer_len - (parse_offset + consumed),
+                                },
+                                &activity,
+                                socket_fd,
+                            ) =>
                     {
                         blocking_slot.make_gone();
                         interrupted.gone = true;
@@ -1396,6 +1470,8 @@ where
                             &mut Waiter {
                                 reader: &mut reader,
                                 carried: &mut carried,
+                                carried_from,
+                                held_elsewhere: buffer_len - (parse_offset + consumed),
                                 kill_rx: &mut kill_rx,
                                 client_registry: &client_registry,
                                 client_id,
@@ -1500,6 +1576,8 @@ where
                         &mut Waiter {
                             reader: &mut reader,
                             carried: &mut carried,
+                            carried_from,
+                            held_elsewhere: buffer_len - (parse_offset + consumed),
                             kill_rx: &mut kill_rx,
                             client_registry: &client_registry,
                             client_id,
@@ -2633,7 +2711,17 @@ where
                                     tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                                 }
                             } => Some(reply),
-                            () = until_gone(&mut reader, &mut carried, &mut kill_rx, &activity) => None,
+                            () = until_gone(
+                                &mut reader,
+                                ReadAhead {
+                                    carried: &mut carried,
+                                    carried_from,
+                                    held_elsewhere: buffer_len
+                                        - (parse_offset + consumed),
+                                },
+                                &mut kill_rx,
+                                &activity,
+                            ) => None,
                         };
                         waited_for = blocked_at.elapsed();
                         match waited {
@@ -2686,7 +2774,17 @@ where
                                     timeout_ms,
                                     unblock_rx,
                                 ) => Some(reply),
-                                () = until_gone(&mut reader, &mut carried, &mut kill_rx, &activity) => None,
+                                () = until_gone(
+                                    &mut reader,
+                                    ReadAhead {
+                                        carried: &mut carried,
+                                        carried_from,
+                                        held_elsewhere: buffer_len
+                                            - (parse_offset + consumed),
+                                    },
+                                    &mut kill_rx,
+                                    &activity,
+                                ) => None,
                             };
                             waited_for = blocked_at.elapsed();
                             match waited {
@@ -2984,7 +3082,7 @@ where
                 resp::parse::PRIVATE_QUERY_BUFFER_MIN_CAPACITY.saturating_sub(buffer.len()),
             );
         }
-        if reserve_hint > buffer.capacity() {
+        if reserve_hint > buffer.capacity() && !fed_from_carried {
             buffer.reserve(reserve_hint.saturating_sub(buffer.len()));
         }
         query_buffer_peak = query_buffer_peak.max(reserve_hint);
@@ -3082,7 +3180,11 @@ where
                         read_while_writing(
                             write,
                             &mut reader,
-                            &mut carried,
+                            ReadAhead {
+                                carried: &mut carried,
+                                carried_from,
+                                held_elsewhere: buffer.len() - read_start,
+                            },
                             &mut kill_rx,
                             &activity,
                             limit,
@@ -3102,7 +3204,11 @@ where
                 let write = read_while_writing(
                     write,
                     &mut reader,
-                    &mut carried,
+                    ReadAhead {
+                        carried: &mut carried,
+                        carried_from,
+                        held_elsewhere: buffer.len() - read_start,
+                    },
                     &mut kill_rx,
                     &activity,
                     limit,
@@ -3170,6 +3276,9 @@ where
                 let slot_imports_announced = client_registry
                     .get(client_id)
                     .is_some_and(|info| info.replica_slot_imports);
+                let kdb_blocks_announced = client_registry
+                    .get(client_id)
+                    .is_some_and(|info| info.replica_kdb_blocks);
                 // A replica's link from here: `flags=S`, `TYPE replica`, as
                 // Redis lists it (#595).
                 client_registry.update(client_id, |info| {
@@ -3202,6 +3311,7 @@ where
                     psync,
                     vset_quant_announced,
                     slot_imports_announced,
+                    kdb_blocks_announced,
                     kill_rx,
                 )
                 .await?;

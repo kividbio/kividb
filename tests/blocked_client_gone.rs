@@ -1226,3 +1226,295 @@ fn a_push_that_wakes_a_client_replies_after_its_pop_is_counted() {
         }
     }
 }
+
+/// A client that sends without reading while it waits is read ahead only so
+/// far: `client-query-buffer-limit` holds what it keeps once. Sends adding
+/// up under it are kept whole — it is still there — and it is closed once
+/// what it holds passes the limit, not before. (The io_uring loop does not
+/// read a client that waits: what it sends stays in the socket until it is
+/// unblocked, so it is kept whatever it sends.)
+#[test]
+fn a_client_that_sends_without_reading_is_held_to_the_limit_once() {
+    let limit = 1 << 20;
+    let chunk_len = 64 * 1024;
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        assert_eq!(
+            ctl.cmd(&["CONFIG", "SET", "client-query-buffer-limit", "1mb"]),
+            s("OK")
+        );
+        let name = format!("sender-{io}");
+        let c = blocked_client(&server, &mut ctl, &name, &["BLPOP", "hold", "0"]);
+        let read_before = info_field(&mut ctl, "stats", "total_net_input_bytes");
+
+        // `PING`s, 64KB at a time — what they say does not matter, only how
+        // many the client is allowed to keep while it never reads a reply.
+        // A write times out rather than block on a socket nobody reads.
+        let mut writer = c.writer.try_clone().unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let chunk: Vec<u8> = request(&["PING"])
+            .iter()
+            .copied()
+            .cycle()
+            .take(chunk_len)
+            .collect();
+        let sending = thread::spawn(move || while writer.write_all(&chunk).is_ok() {});
+
+        // The client is under the limit for as long as it is listed.
+        let left = leaves_within(&mut ctl, &name, Duration::from_secs(15));
+        // What the server took in from it — `total_net_input_bytes` has the
+        // control connection's chatter in it too, a few reads' worth.
+        let accepted =
+            (info_field(&mut ctl, "stats", "total_net_input_bytes") - read_before) as usize;
+        drop(c);
+        let _ = sending.join();
+
+        if io == "tokio" {
+            assert!(left, "{io}: a client holding past the limit was kept");
+            assert!(
+                accepted > limit,
+                "{io}: closed having accepted only {accepted} bytes, under the limit"
+            );
+            assert!(
+                accepted <= limit + 4 * chunk_len,
+                "{io}: held {accepted} bytes before it was closed, past the limit"
+            );
+        } else {
+            assert!(
+                !left && listed(&mut ctl, &name) && accepted <= 4 * chunk_len,
+                "{io}: a waiting client is not read, and stays (accepted {accepted})"
+            );
+        }
+    }
+}
+
+/// The two halves of what a waiting client holds are bounded together, and
+/// what has moved from one to the other is not counted twice: `carried`'s
+/// prefix already moved into `buffer` is discounted, and the limit binds
+/// `buffer`'s not-yet-run bytes with `carried`'s unmoved rest. A client
+/// that parks again mid-replay — on a second blocking command inside what
+/// it had sent, early enough that the moved prefix of `carried` is not yet
+/// drained out of the vector — keeps a large unmoved `carried`; counted
+/// once, it is kept until that truly passes the limit. (Counted as the
+/// whole vector, moved prefix included, it was over the limit already and
+/// the client was closed. The io_uring loop does not read a client that
+/// waits, so there the sends stay in the socket and it is kept either
+/// way.)
+#[test]
+fn what_a_waiting_client_holds_is_bounded_together() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        assert_eq!(
+            ctl.cmd(&["CONFIG", "SET", "client-query-buffer-limit", "1mb"]),
+            s("OK")
+        );
+        let name = format!("held-{io}");
+        let mut c = blocked_client(&server, &mut ctl, &name, &["BLPOP", "hold", "0"]);
+
+        // Behind the `BLPOP`: a 300KB request, a `BLPOP` of another (still
+        // empty) list, and about 550KB more — under the limit as one
+        // `carried`, so the wait reads them all ahead on tokio (on io_uring
+        // they stay in the socket).
+        let mut queued = request(&["SET", "a", &"x".repeat(300 * 1024)]);
+        queued.extend_from_slice(&request(&["BLPOP", "hold2", "0"]));
+        queued.extend_from_slice(&request(&["PING"]).repeat(34 * 1024));
+        c.writer.write_all(&queued).unwrap();
+        thread::sleep(Duration::from_millis(300));
+
+        // Unblocked, the read-ahead replays: the second `BLPOP` is reached
+        // with about 310KB moved out of 857KB — before the drain that cuts
+        // the vector at its halfway point — and `hold2` still being empty
+        // parks the client again, about 550KB still unmoved: under the
+        // limit counted once. A send on top that crosses the limit only
+        // with the moved part counted again, and the client is kept.
+        assert_eq!(ctl.cmd(&["RPUSH", "hold", "v"]), V::Int(1));
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            listed(&mut ctl, &name),
+            "{io}: the second BLPOP never parked"
+        );
+        c.writer
+            .write_all(&request(&["PING"]).repeat(20 * 1024))
+            .unwrap();
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            listed(&mut ctl, &name),
+            "{io}: what had moved on was counted twice, and the client closed"
+        );
+
+        if io == "tokio" {
+            // Enough more that unmoved plus the buffer's unread bytes pass
+            // the limit: the client is closed.
+            let mut writer = c.writer.try_clone().unwrap();
+            writer
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let chunk = request(&["PING"]).repeat(4 * 1024);
+            let flood = thread::spawn(move || while writer.write_all(&chunk).is_ok() {});
+            assert!(
+                leaves_within(&mut ctl, &name, Duration::from_secs(15)),
+                "{io}: kept while holding past the limit"
+            );
+            drop(c);
+            let _ = flood.join();
+        } else {
+            drop(c);
+        }
+    }
+}
+
+/// What has already run is not held against a client that waits: a request
+/// that completed in the same read the blocking command arrived in leaves
+/// nothing to count, so the client stays — counted for what it still
+/// holds, not for what it sent. (Counted with the run request's span, it
+/// was closed once it had sent 450KB more; Redis keeps it.)
+#[test]
+fn what_already_ran_is_not_counted_against_a_waiting_client() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        assert_eq!(
+            ctl.cmd(&["CONFIG", "SET", "client-query-buffer-limit", "1mb"]),
+            s("OK")
+        );
+        let mut c = server.conn();
+        assert_eq!(c.cmd(&["CLIENT", "SETNAME", "ran"]), s("OK"));
+
+        // A 700KB `SET` and the `BLPOP` after it in one write: the SET runs,
+        // the wait begins, and what the SET's bytes were is done with.
+        let filler = "x".repeat(700_000);
+        let mut first = request(&["SET", "filler", &filler]);
+        first.extend_from_slice(&request(&["BLPOP", "hold", "0"]));
+        c.writer.write_all(&first).unwrap();
+        wait_blocked(&mut ctl, 1);
+        assert_eq!(ctl.cmd(&["EXISTS", "filler"]), V::Int(1));
+
+        // 450KB more: past the limit only with the run request still
+        // counted — the client is kept.
+        c.writer
+            .write_all(&request(&["PING"]).repeat(28 * 1024))
+            .unwrap();
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            listed(&mut ctl, "ran"),
+            "{io}: closed for a request that already ran"
+        );
+
+        // Enough more that what it still holds is over the limit on its
+        // own: now the client is closed. (The io_uring loop does not read a
+        // waiting client, so there its sends stay in the socket.)
+        if io == "tokio" {
+            let mut writer = c.writer.try_clone().unwrap();
+            writer
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let chunk = request(&["PING"]).repeat(4 * 1024);
+            let flood = thread::spawn(move || while writer.write_all(&chunk).is_ok() {});
+            assert!(
+                leaves_within(&mut ctl, "ran", Duration::from_secs(15)),
+                "{io}: kept while holding past the limit"
+            );
+            drop(c);
+            let _ = flood.join();
+        }
+    }
+}
+
+/// What a client that sends while its replies wait to be written is held
+/// to: the parse buffer's unread part counts with `carried`, not `carried`
+/// alone. On io_uring the read the stalled write is raced with lands in
+/// the parse buffer itself — a request whose head has parsed reserves the
+/// buffer for its declared bulk, and that read fills it. Under a 1MB
+/// limit a client holding about 800KB of a still-incomplete request,
+/// split between the parse buffer and `carried`, is closed once it has
+/// sent 330KB more; counted on `carried` alone, as before, it was kept.
+/// (On the tokio loop the read ahead always lands in `carried`, so the
+/// same sends close it under either accounting.)
+#[test]
+fn what_a_stalled_write_reads_into_the_buffer_is_bounded_too() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        assert_eq!(
+            ctl.cmd(&["CONFIG", "SET", "client-query-buffer-limit", "1mb"]),
+            s("OK")
+        );
+        // A value whose `GET` answers with more than a socket holds: the
+        // client's replies stall on it, and what it sends meanwhile is
+        // read ahead.
+        assert_eq!(ctl.cmd(&["SET", "v", &"x".repeat(8 << 20)]), s("OK"));
+        let name = format!("stalled-{io}");
+        let mut c = server.conn();
+        assert_eq!(c.cmd(&["CLIENT", "SETNAME", &name]), s("OK"));
+
+        // `GET v`, then a `SET` declaring a 4MB bulk of which only its
+        // head and about 800KB of body are sent: the request is still
+        // incomplete. The write stalls and the read it is raced with pulls
+        // part of those 800KB into the parse buffer (on io_uring, where
+        // the buffer is sized for the declared bulk) or into `carried`;
+        // the rest follows into `carried` while the write waits.
+        let body = "y".repeat(4 << 20);
+        let full = request(&["SET", "k", &body]);
+        let mut first = request(&["GET", "v"]);
+        first.extend_from_slice(&full[..800 * 1024]);
+        c.writer.write_all(&first).unwrap();
+
+        // 330KB more: past the limit counted with the parse buffer's part
+        // — buffer and `carried` together hold everything sent after the
+        // `GET`, wherever each read landed — under it counted on `carried`
+        // alone on io_uring.
+        thread::sleep(Duration::from_millis(500));
+        c.writer.write_all(&vec![b'y'; 330 * 1024]).unwrap();
+
+        assert!(
+            leaves_within(&mut ctl, &name, Duration::from_secs(15)),
+            "{io}: a client holding past the limit was kept"
+        );
+        drop(c);
+    }
+}
+
+/// A client that keeps sending while it never reads a reply is read ahead
+/// while its replies wait to be written — `read_while_writing`, on either
+/// loop — and the same `client-query-buffer-limit` binds what it holds.
+#[test]
+fn a_client_that_sends_past_replies_it_never_reads_is_held_to_the_limit() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        assert_eq!(
+            ctl.cmd(&["CONFIG", "SET", "client-query-buffer-limit", "1mb"]),
+            s("OK")
+        );
+        assert_eq!(ctl.cmd(&["SET", "big", &"x".repeat(512 * 1024)]), s("OK"));
+        let mut c = server.conn();
+        assert_eq!(c.cmd(&["CLIENT", "SETNAME", "piler"]), s("OK"));
+
+        // `GET`s of a half-megabyte value — replies the client never reads,
+        // so its writes stall and the sends behind them are read ahead —
+        // then sends past the limit, in the same stream.
+        let mut writer = c.writer.try_clone().unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut bytes = request(&["GET", "big"]).repeat(10);
+        bytes.extend_from_slice(&request(&["SET", "pad", &"y".repeat(256 * 1024)]).repeat(5));
+        let ping_chunk = request(&["PING"]).repeat(64 * 1024);
+        let sending = thread::spawn(move || {
+            if writer.write_all(&bytes).is_err() {
+                return;
+            }
+            while writer.write_all(&ping_chunk).is_ok() {}
+        });
+        assert!(
+            leaves_within(&mut ctl, "piler", Duration::from_secs(20)),
+            "{io}: a client read ahead past the limit was kept"
+        );
+        drop(c);
+        let _ = sending.join();
+    }
+}

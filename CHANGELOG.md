@@ -9,6 +9,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrading
 
+- **Compressed snapshots are opt-in (#879): nothing changes on upgrade.**
+  `rdbcompression` defaults to `no`, and the snapshots 1.3 writes are the
+  plain ones 1.2 reads, so a rollback to 1.2.x keeps working. Before
+  turning on `rdbcompression yes`, know that KiviDB 1.2.2 and earlier
+  cannot read what it writes: `dump.kdb`, the AOF's base and a backup's
+  BASE start with `KIVIDBZ1`, which they refuse (`bad magic`) and do not
+  start on, changing nothing on disk. The way back: `CONFIG SET
+  rdbcompression no` and `SAVE` (or `BGREWRITEAOF` with the AOF on), or
+  convert a file with `kividb kdb-decompress dump.kdb dump-plain.kdb` (a
+  backup's BASE as well). Replication across versions keeps working either
+  way: a 1.3 master sends a 1.2.x replica the plain image. The default is
+  planned to become `yes` in a later release, once 1.3 is the oldest
+  version one can roll back to.
+
 - **A server on `--threads 0` (auto, the default) starts more worker
   threads (#873).** Auto is now one per CPU the process may use, where it
   was the CPUs minus 2: 4 workers on 4 CPUs (was 2), 8 on 8 (was 6), 32 on
@@ -74,6 +88,56 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CLUSTER SLOTS` until it comes back.
 
 ### Added
+
+- **Compressed snapshots, opt-in: `rdbcompression yes` (#879).**
+  `rdbcompression`, which was accepted and did nothing, is in effect; it
+  defaults to `no` in 1.3 (see Upgrading). With `yes` (config file, command
+  line or `CONFIG SET`), a snapshot is the same image as before cut into
+  blocks of 256 KiB, each compressed with zstd (level 1) on up to two
+  compression threads (the CPUs less one; started once, shared by every
+  save), never the serving threads, or stored as it is
+  when it does not shrink; each block carries a checksum, and the file an
+  end marker. A file cut short or damaged anywhere is refused whole, naming
+  the block, never loaded in part. It applies to `SAVE`, `BGSAVE`, the
+  snapshot at shutdown, the AOF's base, a backup's base, and a full sync to
+  a replica that says it reads it (`REPLCONF capa kdb-blocks`). `no` writes
+  the plain image, as 1.2 did. `INFO persistence` gains
+  `rdb_last_save_raw_size` and `rdb_last_save_stored_size`, and the save's
+  log line gives the ratio. `kividb kdb-decompress <in> <out>` and `kividb
+  kdb-compress <in> <out>` convert a file either way, with no shell needed;
+  each first reads its input through as the server would load it and
+  refuses (exit 1, no output) what the server would refuse, and replaces an
+  existing output only with `--force`.
+  Measured on one Standard_D4s_v5 (server on 2 CPUs, `--threads 2`; tmpfs):
+
+  | dataset | | 1.2.2 | `no` | `yes` | Redis 8.10.2 |
+  |---|---|---|---|---|---|
+  | 6M strings of 150 B (#879) | file | 1,007 MB | 1,007 MB | **32.7 MB** | 142.9 MB |
+  | | save, wall / CPU | 1.75 / 2.13 s | 1.84 / 2.13 s | 2.08 / 2.99 s | 6.1 / 6.1 s |
+  | | save to the VM's disk | 6.2 s | 6.3 s | **2.0 s** | 6.4 s |
+  | | load | 10.4 s | 10.5 s | 11.2 s | 6.0 s |
+  | | full sync / master memory during it | 10.7 s / +1,055 MB | 10.5 s / +1,055 MB | 10.9 s / **+99 MB** | 11.8 s |
+  | 6M text strings of 16-64 B | file | 359 MB | 359 MB | **131 MB** | 308 MB |
+  | | save, wall / CPU | 1.15 / 1.44 s | 1.20 / 1.53 s | 2.00 / 3.92 s | 5.2 / 5.2 s |
+  | | load | 8.8 s | 8.4 s | 8.7 s | 5.1 s |
+  | | full sync / master memory | 8.7 s / +406 MB | 8.7 s / +407 MB | 10.0 s / +192 MB | 9.1 s |
+  | 6M random strings of 16-64 B | file | 359 MB | 359 MB | 305 MB | 323 MB |
+  | | save, wall / CPU | 1.14 / 1.43 s | 1.21 / 1.57 s | 2.22 / 4.23 s | 5.0 / 4.9 s |
+  | | load | 8.5 s | 8.5 s | 9.0 s | 4.2 s |
+  | 1M hashes, 200k sets, zsets, lists | file | 490 MB | 490 MB | **206 MB** | 392 MB |
+  | | save, wall / CPU | 1.40 / 2.35 s | 1.31 / 2.23 s | 3.04 / 4.23 s | 3.2 / 3.1 s |
+  | | load | 6.1 s | 6.0 s | 6.9 s | 2.6 s |
+  | | full sync / master memory | 6.9 s / +980 MB | 6.4 s / +981 MB | 8.8 s / +712 MB | 5.0 s |
+
+  The save's peak memory is what it was (+73 MB for the strings, +490 MB
+  for the collections, the capture's), and so is the latency of writes
+  during a save (50 % writes, p99 2.1 ms on the issue's dataset either way,
+  within run-to-run noise). The full sync is timed on one machine, where the
+  link costs nothing: it is 1.4-2.4 s slower on the collections and text
+  there, and sends a third to a thirtieth of the bytes. Incompressible
+  blocks are stored as they are: the file is at most 0.01 % larger than the
+  plain image. Re-run with suite `24-snapshot-size` of
+  `benchmarks/1.3.0/regressions`.
 
 - **`TS.CREATE`, `TS.ALTER`, and `TS.ADD` support `IGNORE maxTimeDiff maxValDiff` (#841).**
   Suppresses duplicate or near-duplicate samples whose timestamp and value
@@ -298,7 +362,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   there. A server with no backlog (one
   started empty, as benchmarks start it) is unchanged: 31.7-31.8k checks a
   second at a p99 of 0.07-0.09 ms at every rate. Suite
-  `24-ratelimit-restarted` measures it.
+  `25-ratelimit-restarted` measures it.
 
 - **Pub/sub fan-out delivers 18-29 % more messages a second, ahead of
   Redis (#851).** socket.io's Redis adapter publishes every broadcast with
@@ -811,6 +875,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reach that limit. The same goes for the replies a blocking command
   writes before it waits; if that write fails, the client is closed at
   once, and what it pipelined after the blocking command is not run.
+
+- **What a waiting client has read ahead and its unparsed buffer are held
+  to `client-query-buffer-limit` together (#869).** What a client sent
+  while it waited — in a blocking command, held by a pause, in `WAIT`,
+  behind replies not yet written — was read ahead bounded by
+  `client-query-buffer-limit` on the read-ahead alone; the unread bytes
+  it already held in the parse buffer counted nowhere, so the two could
+  each reach the limit — about twice it, held — without the client being
+  closed. The bound is now the not-yet-run bytes the buffer holds plus
+  the read-ahead's unmoved part, and the read-ahead gives its consumed
+  prefix back — capacity with it — in steps as it is moved on, rather
+  than at the end. What is moved out of the read-ahead is not reserved
+  for again either: the buffer is not grown to a request's full length
+  while the read-ahead still holds it. The io_uring loop holds the same
+  bound.
 
 - **`CLIENT NO-TOUCH` now keeps the client's reads from counting as a
   use of the keys they find (#566).** The command was accepted and

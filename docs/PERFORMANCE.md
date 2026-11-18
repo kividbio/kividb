@@ -174,6 +174,33 @@ bytes keeps its elements apart, as 1.2 did, and takes what 1.2 took. Suite
 this table again (1M elements, 10 to 100,000 a list) and fails a build that
 loses it.
 
+## Snapshot size
+
+Since 1.3.0 a snapshot can be written compressed (`rdbcompression yes`,
+off by default in 1.3 so that a rollback to 1.2 works; see
+[PERSISTENCE.md](PERSISTENCE.md#compressed-snapshots)): the
+same image, in blocks of 256 KiB compressed with zstd level 1 off the
+serving threads. On an Azure `Standard_D4s_v5`, the server on 2 CPUs, the file
+on tmpfs (the save on the VM's disk in its own row):
+
+| dataset | 1.2.2 (and 1.3.0 by default) | 1.3.0, `rdbcompression yes` | Redis 8.10.2 |
+|---|---:|---:|---:|
+| 6M strings of 150 B ([#879](https://github.com/kividbio/kividb/issues/879)), file | 1,007 MB | 32.7 MB | 142.9 MB |
+| the same, `SAVE` to the VM's disk | 6.2 s | 2.0 s | 6.4 s |
+| the same, master memory during a full sync | +1,055 MB | +99 MB | |
+| 6M text strings of 16-64 B, file | 359 MB | 131 MB | 308 MB |
+| 6M random strings of 16-64 B, file | 359 MB | 305 MB | 323 MB |
+| 1M hashes and 600k sets, sorted sets and lists, file | 490 MB | 206 MB | 392 MB |
+
+Compressing costs CPU on the saving threads: a save to tmpfs of the text
+strings takes 2.0 s instead of 1.2 s, and loading takes up to 1.1 s more.
+`rdbcompression no`, the default, writes the plain image, as 1.2 did. Suite
+`24-snapshot-size` of
+[the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
+the first and last datasets again (snapshot size, save and load time against
+1.2.2 and Redis, with the default and with `yes`) and fails a build that
+loses it.
+
 ## Worker threads
 
 How many workers to start on a CPU allowance ([#873](https://github.com/kividbio/kividb/issues/873)),

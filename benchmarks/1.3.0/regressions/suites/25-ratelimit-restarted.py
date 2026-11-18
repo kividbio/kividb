@@ -49,7 +49,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import (Suite, Config, THROUGHPUT, KEEP_IMPROVEMENT, rel, vs_redis, jitter, info, median)  # noqa: E402
 from nodes import Nodes  # noqa: E402
 
-S = Suite("24-ratelimit-restarted", [Config("t2", threads=2, self_hosted=True)])
+S = Suite("25-ratelimit-restarted", [Config("t2", threads=2, self_hosted=True)])
 KEYS = 100_000
 BG_RATES = (0, 100_000, 200_000, 300_000)
 ROUNDS = 3
@@ -73,7 +73,7 @@ def cpus():
     """Server, checks and background CPUs: two separate cores for the server."""
     have = sorted(os.sched_getaffinity(0))
     if len(have) < 8:
-        raise RuntimeError("24-ratelimit-restarted needs 8 CPUs, this process may use %d" % len(have))
+        raise RuntimeError("25-ratelimit-restarted needs 8 CPUs, this process may use %d" % len(have))
     return have[0:3:2], have[4:6], have[6:8]
 
 
@@ -118,7 +118,7 @@ def restarted(ns, ctx):
     p.execute()
     c.save()
     first.stop()
-    node = ns.start(seed=first.dir)
+    node = ns.start(dir=first.dir)
     dbsize = node.client().dbsize()
     if dbsize != KEYS:
         raise RuntimeError("restarted with %d keys, not %d" % (dbsize, KEYS))

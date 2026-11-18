@@ -742,6 +742,9 @@ async fn run_replication_session(
     //
     // And the imports a cluster master has under way (`slot-imports`,
     // #741), unless a test has this node act as an earlier release.
+    //
+    // And that it reads a compressed snapshot (`kdb-blocks`, #879), which a
+    // master of 1.2 or earlier does not know, and passes over.
     let mut capas = vec![
         "REPLCONF",
         "capa",
@@ -750,6 +753,8 @@ async fn run_replication_session(
         "lost-data",
         "capa",
         "vset-quant",
+        "capa",
+        crate::replication::KDB_BLOCKS_CAPA,
     ];
     if !crate::replication::hides_slot_imports_capability() {
         capas.extend(["capa", crate::replication::SLOT_IMPORTS_CAPA]);
@@ -1126,7 +1131,13 @@ async fn run_replication_session(
             return Err(SessionError::Superseded);
         }
         let local_keys = count_keys(store);
-        let is_kdb = rdb_bytes.len() >= 8 && rdb_bytes[..8] == *crate::snapshot::KDB_MAGIC;
+        let is_kdb = crate::snapshot::blocks::is_kdb(&rdb_bytes);
+        if crate::snapshot::blocks::is_compressed(&rdb_bytes) {
+            log_info!(
+                "Replication: the master sent a compressed snapshot of {} bytes (kdb-blocks)",
+                rdb_bytes.len()
+            );
+        }
         let verified_keys =
             if local_keys > 0 && is_kdb && repl_state.flush_before_load.load(Ordering::Relaxed) {
                 Some(
@@ -1874,8 +1885,8 @@ fn payload_refusal(
 
 /// Parse a full-sync payload into fresh staging stores.
 ///
-/// The master sends a native KDB image (`KIVIDB01`); a Redis master sends an
-/// RDB. Either way a payload that does not parse is an error — the caller
+/// The master sends a native KDB image (`KIVIDB01`, or compressed to a
+/// replica that takes `kdb-blocks`); a Redis master sends an RDB. Either way a payload that does not parse is an error — the caller
 /// must not go on to replace the live dataset with whatever was read so far.
 fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync, SessionError> {
     let staging_store = store::new_store(databases);
@@ -1886,7 +1897,7 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
     let _hold = crate::expiry::hold();
     let _loading = crate::expiry::Loading::start();
 
-    let is_kividb = payload.len() >= 8 && payload[..8] == *crate::snapshot::KDB_MAGIC;
+    let is_kividb = crate::snapshot::blocks::is_kdb(payload);
     let (dbs, expiries, index_schemas, dictionaries, functions) = if is_kividb {
         let loaded = crate::snapshot::load_snapshot_bytes(payload).map_err(|e| {
             payload_refusal(e, |e| {
@@ -2507,6 +2518,8 @@ pub async fn handle_replica_connection<R, W>(
     vset_quant_announced: bool,
     // It sent `REPLCONF capa slot-imports`.
     slot_imports_announced: bool,
+    // It sent `REPLCONF capa kdb-blocks` (#879).
+    kdb_blocks_announced: bool,
     // The connection's `CLIENT KILL` signal: it ends the link (#595).
     mut kill_rx: crate::client_registry::KillRx,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -2614,6 +2627,7 @@ where
         tx: replica_tx,
         pending_bytes,
         slot_imports: !legacy_sync && repl_state.sends_slot_imports_to(slot_imports_announced),
+        kdb_blocks: !legacy_sync && kdb_blocks_announced,
     };
     let full_sync = match crate::replication::request_continuation(
         &hub_tx,
