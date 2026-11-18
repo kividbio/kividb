@@ -50,7 +50,7 @@
 // gate or stripe. A client's command that finds a script on one of its tags
 // takes those turns too, the same way, holding nothing else: its connection
 // waits for them off its thread, and the command is dispatched again holding
-// them (`try_lock_named_keys`, `command_turns`, #882).
+// them (`try_lock_found_keys`, `command_turns`, #882).
 //
 // Whoever takes a tag's lock holds the write gate (`write_gate`) first, a
 // read as a write does: the gate, then the tags' locks, then the keys'
@@ -633,7 +633,7 @@ pub fn lock_named_keys(name: &str, cmd: &[&[u8]]) -> Option<KeysGuard> {
 /// for both kinds, the one `key_positions`' keys give, so that `lock_keys`
 /// is made once here.
 #[inline(never)]
-fn lock_found_keys(keys: NamedKeys, cmd: &[&[u8]]) -> Option<KeysGuard> {
+pub fn lock_found_keys(keys: NamedKeys, cmd: &[&[u8]]) -> Option<KeysGuard> {
     let at = match &keys {
         NamedKeys::Regular { from, last, step } => crate::keyspec::KeyIter::Range {
             next: *from,
@@ -653,36 +653,28 @@ fn lock_found_keys(keys: NamedKeys, cmd: &[&[u8]]) -> Option<KeysGuard> {
 #[derive(Debug)]
 pub struct TagsBusy(Vec<usize>);
 
-/// How long [`try_lock_named_keys`] waits at a time on a tag's lock that a
+/// How long [`try_lock_found_keys`] waits at a time on a tag's lock that a
 /// client's command holds, before it looks again at whether a script has
 /// come for the tag meanwhile.
 #[cfg(feature = "lua")]
 const SPELL: Duration = Duration::from_micros(50);
 
-/// [`lock_named_keys`] for a command whose connection can wait for a script
-/// without its thread (#882): the lock of each tagged key it names, or
-/// [`TagsBusy`] — with nothing taken or entered — when a script holds one of
-/// them or has its turn for it. A lock a client's command holds is waited
-/// for here, as in [`lock_keys`]: a command holds it for a moment.
+/// [`lock_found_keys`] for a command whose connection can wait for a script
+/// without its thread (#882): the lock of each tagged key it names
+/// ([`named_keys`]), or [`TagsBusy`] — with nothing taken or entered —
+/// when a script holds one of them or has its turn for it. A lock a
+/// client's command holds is waited for here, as in [`lock_keys`]: a
+/// command holds it for a moment.
 ///
 /// All or none: a lock taken is let go of before it says busy, so the
 /// command holds no tag while its connection waits, and nothing waits for it
-/// meanwhile. Taken lowest first, as [`lock_keys`] takes them.
-#[cfg(feature = "lua")]
-#[inline]
-pub fn try_lock_named_keys(name: &str, cmd: &[&[u8]]) -> Result<Option<KeysGuard>, TagsBusy> {
-    let Some(keys) = named_keys(name, cmd) else {
-        return Ok(None);
-    };
-    try_lock_found_keys(keys, cmd)
-}
-
-/// The rest of [`try_lock_named_keys`]. The first look is what
-/// [`lock_keys`] does for one stripe, with `try_lock` for `lock`: what a
-/// command on a tag nobody holds costs is what it cost before.
+/// meanwhile. Taken lowest first, as [`lock_keys`] takes them. The first
+/// look is what [`lock_keys`] does for one stripe, with `try_lock` for
+/// `lock`: what a command on a tag nobody holds costs is what it cost
+/// before.
 #[cfg(feature = "lua")]
 #[inline(never)]
-fn try_lock_found_keys(keys: NamedKeys, cmd: &[&[u8]]) -> Result<Option<KeysGuard>, TagsBusy> {
+pub fn try_lock_found_keys(keys: NamedKeys, cmd: &[&[u8]]) -> Result<Option<KeysGuard>, TagsBusy> {
     let at = match &keys {
         NamedKeys::Regular { from, last, step } => crate::keyspec::KeyIter::Range {
             next: *from,
@@ -1546,7 +1538,17 @@ mod tests {
         assert!(!crate::write_gate::held_by_this_thread());
     }
 
-    /// #882: what `try_lock_named_keys` takes. A tag a script holds is busy,
+    /// `try_lock_found_keys` over the keys `named_keys` finds, as the command
+    /// path asks it.
+    #[cfg(feature = "lua")]
+    fn try_lock_named(name: &str, cmd: &[&[u8]]) -> Result<Option<KeysGuard>, TagsBusy> {
+        match named_keys(name, cmd) {
+            None => Ok(None),
+            Some(keys) => try_lock_found_keys(keys, cmd),
+        }
+    }
+
+    /// #882: what `try_lock_found_keys` takes. A tag a script holds is busy,
     /// and nothing at all is taken then — not the other tags the command
     /// names, nor the write gate; a tag nobody holds is taken; a key with no
     /// tag takes nothing. Once the script is done, all are taken.
@@ -1575,7 +1577,7 @@ mod tests {
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    let busy = try_lock_named_keys("MGET", &both).err().expect("busy");
+                    let busy = try_lock_named("MGET", &both).err().expect("busy");
                     let mut both_stripes = vec![
                         stripe_of(script_tag.as_bytes()),
                         stripe_of(other.as_bytes()),
@@ -1584,12 +1586,11 @@ mod tests {
                     assert_eq!(busy.0, both_stripes, "every stripe, lowest first");
                     assert!(!held(&other), "the free tag was kept");
                     assert!(!crate::write_gate::held_by_this_thread());
-                    let one =
-                        try_lock_named_keys("GET", &[b"GET", other_key.as_bytes()]).expect("free");
+                    let one = try_lock_named("GET", &[b"GET", other_key.as_bytes()]).expect("free");
                     assert!(one.is_some() && held(&other));
                     drop(one);
                     assert!(matches!(
-                        try_lock_named_keys("GET", &[b"GET", b"plain"]),
+                        try_lock_named("GET", &[b"GET", b"plain"]),
                         Ok(None)
                     ));
                 })
@@ -1598,7 +1599,7 @@ mod tests {
         });
         drop(script);
         drop(turn);
-        let all = try_lock_named_keys("MGET", &both).expect("all free");
+        let all = try_lock_named("MGET", &both).expect("all free");
         assert!(all.is_some() && held(&other) && held(script_tag));
     }
 
@@ -1611,7 +1612,7 @@ mod tests {
         let first = lock_keys([key].into_iter());
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
-            let taken = try_lock_named_keys("GET", &[b"GET", key]);
+            let taken = try_lock_named("GET", &[b"GET", key]);
             done_tx.send(matches!(taken, Ok(Some(_)))).unwrap();
         });
         assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());

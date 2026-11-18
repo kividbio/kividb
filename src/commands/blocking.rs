@@ -845,7 +845,7 @@ pub fn hold_for_pause(ctx: &mut crate::commands::ctx::Ctx) -> Vec<u8> {
 }
 
 /// The reply of a client's command that found a script holding one of its
-/// hash tags, or in line for it (`tag_locks::try_lock_named_keys`): it does
+/// hash tags, or in line for it (`tag_locks::try_lock_found_keys`): it does
 /// not run now. Its connection waits for the turns of those tags, asleep,
 /// while its thread serves its other connections, and dispatches it again
 /// holding them (#882). Only asked of a dispatch that can park

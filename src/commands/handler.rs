@@ -1963,19 +1963,35 @@ fn lock_tags_of_named_keys(
     ctx: &mut Ctx,
     name: &str,
 ) -> Result<Option<crate::tag_locks::KeysGuard>, crate::tag_locks::TagsBusy> {
+    // Nearly every command: none of its keys has a `{`, and nothing else
+    // is looked at.
+    let Some(keys) = crate::tag_locks::named_keys(name, &ctx.cmd) else {
+        return Ok(None);
+    };
+    lock_tags_found(ctx, keys)
+}
+
+/// [`lock_tags_of_named_keys`] for a command with a key that may carry a
+/// tag: waiting off the thread for a script on it if the dispatch can.
+#[cfg(feature = "lua")]
+#[inline(never)]
+fn lock_tags_found(
+    ctx: &mut Ctx,
+    keys: crate::tag_locks::NamedKeys,
+) -> Result<Option<crate::tag_locks::KeysGuard>, crate::tag_locks::TagsBusy> {
     let Some(slot) = ctx
         .blocking
         .as_deref_mut()
         .filter(|slot| slot.awaitable && !(slot.gone && slot.resume.is_some()))
     else {
-        return Ok(crate::tag_locks::lock_named_keys(name, &ctx.cmd));
+        return Ok(crate::tag_locks::lock_found_keys(keys, &ctx.cmd));
     };
     if let Some(turns) = slot.tag_turns.take() {
-        let held = crate::tag_locks::lock_named_keys(name, &ctx.cmd);
+        let held = crate::tag_locks::lock_found_keys(keys, &ctx.cmd);
         drop(turns);
         return Ok(held);
     }
-    crate::tag_locks::try_lock_named_keys(name, &ctx.cmd)
+    crate::tag_locks::try_lock_found_keys(keys, &ctx.cmd)
 }
 
 /// The order of the keys a write names (see `write_order`), and where it
