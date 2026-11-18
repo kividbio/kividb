@@ -4,7 +4,7 @@ use crate::resp;
 use crate::store;
 use crate::vector;
 use crate::watch::WatchNotifier;
-use commands::ctx::Ctx;
+use commands::ctx::{Ctx, RESP_VERSION, with_no_touch};
 use parking_lot::RwLock;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -369,6 +369,9 @@ async fn park_blocking_uring(
     interrupted: &mut crate::commands::blocking::Interrupted,
     watch: &PeerWatch,
     repl_state: &crate::replication::ReplState,
+    carried: &mut Vec<u8>,
+    activity: &crate::client_registry::Activity,
+    limit: crate::server::HardLimit,
 ) -> Result<(), Vec<u8>> {
     // No wait: a write that got past a `CLIENT PAUSE` before it was set
     // (`blocking::hold_for_pause`). Read again, and held by the pause check.
@@ -380,6 +383,7 @@ async fn park_blocking_uring(
         // A resumed handler parked again — it forgot its resume check. Reply as
         // if the wait timed out rather than looping forever.
         slot.clear_resume();
+        slot.release_count();
         return Err(crate::resp::write::resp_null_array());
     }
 
@@ -392,12 +396,18 @@ async fn park_blocking_uring(
             .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
         crate::stats::record_write();
         let _w = write_guard.lock().await;
-        let (res, mut returned) = stream.write_all(payload).await;
+        // The client is read while it waits, as the connection's own write
+        // reads it (#865).
+        let write = std::pin::pin!(stream.write_all(payload));
+        let (res, mut returned) = read_while_writing(write, watch, carried, activity, limit).await;
         drop(_w);
         returned.clear();
         *out_buf = returned;
         if res.is_err() {
-            // Socket is gone — don't park on a dead connection.
+            // Socket is gone, or shut down for a limit — don't park on a dead
+            // connection.
+            interrupted.gone = true;
+            slot.release_count();
             return Err(Vec::new());
         }
     }
@@ -414,6 +424,9 @@ async fn park_blocking_uring(
         tokio::time::sleep(delay).await;
     }
     let (client_registry, client_id) = client;
+    // Counted as blocked until the dispatch that resumes it has been counted
+    // in `commandstats` (see `server::park_blocking`, #896).
+    let mut counted = slot.take_count();
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
     client_registry.set_blocked(client_id, Some(unblock_tx), wait.has_timeout());
     let fd = watch.fd;
@@ -427,6 +440,7 @@ async fn park_blocking_uring(
         interrupted.role_changed = true;
         None
     } else {
+        counted.get_or_insert_with(crate::commands::blocking::BlockedCount::enter);
         let waiting = wait.wait();
         tokio::pin!(waiting);
         // Whether the client is still there. A read cannot be raced against
@@ -468,6 +482,7 @@ async fn park_blocking_uring(
         }
     };
     client_registry.set_blocked(client_id, None, false);
+    slot.hold_count(counted);
     // Woken, or unblocked otherwise, at the moment this node became a
     // replica: ended as the sweep ends it.
     if !interrupted.gone
@@ -561,18 +576,10 @@ impl PeerWatch {
     /// more instructions with fat LTO, in code that command never runs.
     fn gone(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
         Box::pin(async move {
-            // Registered for reading, which on Linux includes the peer's end
-            // of the stream (`EPOLLRDHUP`). What is already there — the end
-            // included — is reported at once, and so is anything that has
-            // arrived since an earlier wait: the socket is asked then.
-            let registered = self.registered.get_or_init(|| {
-                tokio::io::unix::AsyncFd::with_interest(
-                    Watched(self.fd),
-                    tokio::io::Interest::READABLE,
-                )
-                .ok()
-            });
-            if let Some(socket) = registered {
+            // What is already there — the end included — is reported at
+            // once, and so is anything that has arrived since an earlier
+            // wait: the socket is asked then.
+            if let Some(socket) = self.registered() {
                 loop {
                     let Ok(mut ready) = socket.readable().await else {
                         break;
@@ -593,6 +600,110 @@ impl PeerWatch {
                 }
             }
         })
+    }
+
+    /// The socket, registered for reading, which on Linux includes the
+    /// peer's end of the stream (`EPOLLRDHUP`); `None` with no reactor to
+    /// register it with. One registration, whichever of `gone` and
+    /// `read_into` asks first: the two are never waited on at once.
+    fn registered(&self) -> Option<&tokio::io::unix::AsyncFd<Watched>> {
+        self.registered
+            .get_or_init(|| {
+                tokio::io::unix::AsyncFd::with_interest(
+                    Watched(self.fd),
+                    tokio::io::Interest::READABLE,
+                )
+                .ok()
+            })
+            .as_ref()
+    }
+
+    /// Reads what the client has sent into `carried`, once there is some:
+    /// how much, and 0 at the client's end. For a connection whose replies
+    /// wait to be written ([`read_while_writing`]). With `recv` and not a
+    /// uring read, which could not be taken back once the write was done:
+    /// no uring read may be in flight while this reads, or the two would
+    /// take the client's bytes out of order.
+    async fn read_into(&self, carried: &mut Vec<u8>) -> std::io::Result<usize> {
+        loop {
+            match self.registered() {
+                Some(socket) => {
+                    let mut ready = socket.readable().await?;
+                    if let Ok(read) = ready.try_io(|_| recv_into(self.fd, carried)) {
+                        return read;
+                    }
+                }
+                // No reactor to ask: tried a hundred times a second.
+                None => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    match recv_into(self.fd, carried) {
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        read => return read,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One `recv` of what the client has sent, without waiting, into the room
+/// at the end of `carried`.
+fn recv_into(fd: std::os::fd::RawFd, carried: &mut Vec<u8>) -> std::io::Result<usize> {
+    if carried.capacity() - carried.len() < READ_MIN {
+        carried.reserve(READ_BUFFER);
+    }
+    let room = carried.spare_capacity_mut();
+    // SAFETY: `room` is `carried`'s, writable for its length; `recv` writes
+    // no more than that, on a descriptor the caller holds open.
+    let n = unsafe { libc::recv(fd, room.as_mut_ptr().cast(), room.len(), libc::MSG_DONTWAIT) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `recv` wrote the `n` bytes after `carried`'s length.
+    unsafe { carried.set_len(carried.len() + n as usize) };
+    Ok(n as usize)
+}
+
+/// `write`, a batch of replies being written, with what the client sends
+/// meanwhile read into `carried`, to be run after it (#865), as
+/// `server::read_while_writing` does on the tokio loop: a client that sends
+/// a whole pipeline before it reads a reply is still sending when its first
+/// replies fill the socket, and if the connection stopped reading until they
+/// were written, each side would wait for the other for good. Past
+/// `client-query-buffer-limit` or `limit`, the socket is shut down, which
+/// ends the write with an error, and the connection with it.
+async fn read_while_writing(
+    mut write: std::pin::Pin<
+        &mut dyn std::future::Future<Output = tokio_uring::BufResult<(), Vec<u8>>>,
+    >,
+    watch: &PeerWatch,
+    carried: &mut Vec<u8>,
+    activity: &crate::client_registry::Activity,
+    mut limit: crate::server::HardLimit,
+) -> tokio_uring::BufResult<(), Vec<u8>> {
+    let mut reading = true;
+    loop {
+        tokio::select! {
+            biased;
+            written = &mut write => return written,
+            read = watch.read_into(carried), if reading => match read {
+                Ok(n) if n > 0 => {
+                    crate::stats::TOTAL_NET_INPUT_BYTES
+                        .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                    crate::stats::record_read();
+                    activity.touch();
+                    activity.note_read(n);
+                    if crate::server::carried_too_much(carried) || limit.over_after(n) {
+                        // SAFETY: the connection's descriptor, open while it runs.
+                        unsafe { libc::shutdown(watch.fd, libc::SHUT_RDWR) };
+                        reading = false;
+                    }
+                }
+                // The client's end, or an error: the connection's next read
+                // sees it again.
+                _ => reading = false,
+            },
+        }
     }
 }
 
@@ -626,12 +737,16 @@ fn needs_slow_path(cmd0: &[u8]) -> bool {
     // a: AUTH
     if !matches!(
         first,
-        b's' | b'p' | b'm' | b'd' | b'w' | b'u' | b'e' | b'a' | b'h' | b'r'
+        b's' | b'p' | b'm' | b'd' | b'w' | b'u' | b'e' | b'a' | b'h' | b'r' | b'c'
     ) {
         return false;
     }
-    // Second filter: byte-wise case-insensitive comparison (no UTF-8 validation).
-    ascii_eq_ignore_case(cmd0, b"SUBSCRIBE")
+    // Second filter: byte-wise case-insensitive comparison (no UTF-8
+    // validation). CLIENT first: none of the rest starts with `c`, so a
+    // `c` command runs just this one compare, and every other command in
+    // the set runs only the one extra.
+    ascii_eq_ignore_case(cmd0, b"CLIENT")
+        || ascii_eq_ignore_case(cmd0, b"SUBSCRIBE")
         || ascii_eq_ignore_case(cmd0, b"PSUBSCRIBE")
         || ascii_eq_ignore_case(cmd0, b"SSUBSCRIBE")
         // See the matching note in server.rs: RESP3 clients handle the
@@ -982,6 +1097,10 @@ pub async fn handle_client(
     // per-command null-encoding check doesn't hit the shared client_registry lock
     // on every single command across every worker thread.
     let mut resp_version: u8 = 2;
+    // Its top bit is `CLIENT NO-TOUCH` (`RESP_NO_TOUCH`): it goes into each
+    // command's `Ctx::resp` with the protocol at no cost of its own, and is
+    // read back from `client_registry` only after a `CLIENT` (#566). The
+    // protocol is `resp_version & RESP_VERSION`.
 
     enum ConnectionHandoff {
         Replica {
@@ -999,15 +1118,29 @@ pub async fn handle_client(
     // After a `SHUTDOWN` that failed: what follows it in the buffer is read
     // before anything more is, and was not answered before it.
     let mut reparse = false;
+    // The read submitted with the last write (#865), reading into
+    // `parse_buf` from `early_from`; or how much it read, if it was done
+    // while the write went on. Its own handle on the socket, so that the
+    // stream itself can be handed on.
+    let reader = Rc::clone(&stream);
+    let mut early = std::pin::pin!(None);
+    let mut early_from = 0usize;
+    let mut early_got: Option<usize> = None;
+    // What was read while replies waited to be written, with how much of it
+    // has been parsed (see `read_while_writing`).
+    let mut carried: Vec<u8> = Vec::new();
+    let mut carried_from = 0usize;
     loop {
         let was_private_at_read = private_query_buffer;
         // No `kill_rx` check here any more — the watcher task above shuts the
         // socket down, so a kill surfaces as `Ok(0)` from the read below even
         // when the client is idle.
         //
-        // The read is never raced. tokio_uring cannot cancel an in-flight op,
-        // so a losing `select!` arm would leak the buffer it owns until the
-        // kernel completes it (see the note above). Reading straight into
+        // The read is never raced away. tokio_uring cannot cancel an in-flight
+        // op, so a losing `select!` arm would leak the buffer it owns until the
+        // kernel completes it (see the note above); the read submitted with a
+        // write is raced against it by reference only, and awaited here
+        // whichever finishes first. Reading straight into
         // `parse_buf` — the same zero-copy path an ordinary client uses — keeps
         // the buffer owned by this loop for exactly the duration of the read.
         // Query-buffer shrinking therefore happens *between* batches: right
@@ -1017,23 +1150,53 @@ pub async fn handle_client(
         // that buffer until the next read opportunity; that is the accepted
         // io_uring tradeoff for not racing the read (Redis shrinks such buffers
         // from its client cron instead).
-        if parse_buf.capacity().saturating_sub(parse_buf.len()) < READ_MIN {
-            parse_buf.reserve(READ_BUFFER);
-        }
-        let unparsed = parse_buf.len();
-        let n = if std::mem::take(&mut reparse) {
-            0
+        let (unparsed, n) = if std::mem::take(&mut reparse) {
+            // Only a `SHUTDOWN` that failed reparses, and its turn submitted
+            // no read with its write.
+            debug_assert!(early.is_none(), "a read in flight on a turn that reparses");
+            (parse_buf.len(), 0)
+        } else if let Some(read) = early.as_mut().as_pin_mut() {
+            // The read submitted with the last write.
+            let (res, buffer): (_, tokio_uring::buf::Slice<Vec<u8>>) = read.await;
+            early.set(None);
+            parse_buf = buffer.into_inner();
+            match res {
+                Ok(0) | Err(_) => break,
+                Ok(n) => (early_from, n),
+            }
+        } else if let Some(n) = early_got.take() {
+            // The same, done while the write went on.
+            (early_from, n)
+        } else if !carried.is_empty() {
+            // What was read while replies waited, a read's worth a turn, as
+            // a read would have brought it: what one turn runs, and so the
+            // replies the output limit looks at after it, is no more than a
+            // read brings (#865).
+            let unparsed = parse_buf.len();
+            let to = carried.len().min(carried_from + READ_BUFFER);
+            parse_buf.extend_from_slice(&carried[carried_from..to]);
+            let n = to - carried_from;
+            carried_from = to;
+            if carried_from == carried.len() {
+                carried = Vec::new();
+                carried_from = 0;
+            } else if carried_from > carried.len() / 2 {
+                carried.drain(0..carried_from);
+                carried_from = 0;
+            }
+            (unparsed, n)
         } else {
+            if parse_buf.capacity().saturating_sub(parse_buf.len()) < READ_MIN {
+                parse_buf.reserve(READ_BUFFER);
+            }
+            let unparsed = parse_buf.len();
             let (res, buffer) = stream.read(parse_buf.slice(unparsed..)).await;
             parse_buf = buffer.into_inner();
             match res {
                 Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
-                    // cleanup runs below via the break path
-                    let _ = e; // suppress unused warning if needed
-                    break;
-                }
+                Ok(n) => (unparsed, n),
+                // cleanup runs below via the break path
+                Err(_) => break,
             }
         };
         // Bytes arrived from the socket: the client is active, so its idle
@@ -1082,7 +1245,7 @@ pub async fn handle_client(
         query_buffer_peak = query_buffer_peak.max(parse_buf.len().saturating_sub(parse_start));
         debug_assert_eq!(parse_buf.len(), unparsed + n);
         query_buffer.update(
-            parse_buf.len().saturating_sub(parse_start),
+            parse_buf.len().saturating_sub(parse_start) + carried.len() - carried_from,
             parse_buf.capacity().saturating_sub(parse_buf.len()),
             private_query_buffer,
         );
@@ -1104,7 +1267,8 @@ pub async fn handle_client(
 
         // What the client sent that no request can begin with, if it did.
         let mut protocol_error: Option<String> = None;
-        let query_buffer_bytes = parse_buf.len();
+        // With what was read while replies waited and is still to run.
+        let query_buffer_bytes = parse_buf.len() + carried.len() - carried_from;
         let query_buffer_free = parse_buf.capacity().saturating_sub(parse_buf.len());
         let was_private_query_buffer = private_query_buffer;
         while let Some((consumed, cmd)) =
@@ -1226,9 +1390,13 @@ pub async fn handle_client(
             {
                 let gated: std::pin::Pin<
                     Box<dyn std::future::Future<Output = Option<Option<crate::pause::Ran>>> + '_>,
-                > = Box::pin(crate::pause::gate(&cmd, &tx.queue, client_id, || {
-                    peer_watch.gone()
-                }));
+                > = Box::pin(crate::pause::gate(
+                    &cmd,
+                    &tx.queue,
+                    client_id,
+                    blocking_slot.holds_count(),
+                    || peer_watch.gone(),
+                ));
                 match gated.await {
                     // The gate may have kept a resume waiting after it was
                     // woken and looked at the socket — while the clients an
@@ -1267,7 +1435,7 @@ pub async fn handle_client(
             let slowlog_enabled = slowlog.threshold_us() < u64::MAX;
             // A RESP2 connection with subscriptions may run next to nothing:
             // that is decided on the slow path.
-            let subscriber_only = resp_version == 2 && subscriptions.is_some();
+            let subscriber_only = subscriptions.is_some() && resp_version & RESP_VERSION == 2;
             if authenticated_user.is_some()
                 && !tx.active
                 && !subscriber_only
@@ -1278,12 +1446,14 @@ pub async fn handle_client(
                     // Made once for the connection and kept: it is two dozen shared
                     // handles, each counted up to copy and down to drop, and a script
                     // needs none of them copied to run on this thread. Made again if
-                    // the connection has become another user since.
+                    // the connection has become another user, or flagged
+                    // itself `CLIENT NO-TOUCH`, since (#566).
                     let user_now = authenticated_user.as_deref().unwrap_or("default");
-                    if lua_env
-                        .as_ref()
-                        .is_some_and(|env| env.authenticated_user != user_now)
-                    {
+                    if lua_env.as_ref().is_some_and(|env| {
+                        env.authenticated_user != user_now
+                            || env.no_touch
+                                != (resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0)
+                    }) {
                         lua_env = None;
                     }
                     let env = &*lua_env.get_or_insert_with(|| {
@@ -1312,6 +1482,7 @@ pub async fn handle_client(
                             &tracking_table,
                             &peer_addr,
                             client_id,
+                            resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0,
                             authenticated_user.as_deref().unwrap_or("default"),
                         )
                     });
@@ -1320,7 +1491,7 @@ pub async fn handle_client(
                         &mut selected_db,
                         env,
                         aof_enabled,
-                        resp_version,
+                        resp_version & RESP_VERSION,
                     )
                     .await;
                     // A script that got past a `CLIENT PAUSE` before it was
@@ -1382,6 +1553,13 @@ pub async fn handle_client(
                         if std::mem::take(&mut aof_wait) {
                             crate::aof::written(&aof_tx).await;
                         }
+                        debug_assert!(early.is_none(), "a read in flight while a command parks");
+                        let limit = crate::server::HardLimit::new(
+                            pubsub.limits(),
+                            subscriptions.is_some(),
+                            out_buf.len() + carried.len() - carried_from,
+                            client_id,
+                        );
                         // Boxed, and so polled out of line: the wait is cold, and the
                         // connection's own future stays the size it is without it.
                         match Box::pin(park_blocking_uring(
@@ -1395,6 +1573,9 @@ pub async fn handle_client(
                             &mut interrupted,
                             &peer_watch,
                             &repl_state,
+                            &mut carried,
+                            &activity,
+                            limit,
                         ))
                         .await
                         {
@@ -1468,6 +1649,13 @@ pub async fn handle_client(
                     if std::mem::take(&mut aof_wait) {
                         crate::aof::written(&aof_tx).await;
                     }
+                    debug_assert!(early.is_none(), "a read in flight while a command parks");
+                    let limit = crate::server::HardLimit::new(
+                        pubsub.limits(),
+                        subscriptions.is_some(),
+                        out_buf.len() + carried.len() - carried_from,
+                        client_id,
+                    );
                     // Boxed, and so polled out of line: the wait is cold, and the
                     // connection's own future stays the size it is without it.
                     match Box::pin(park_blocking_uring(
@@ -1481,6 +1669,9 @@ pub async fn handle_client(
                         &mut interrupted,
                         &peer_watch,
                         &repl_state,
+                        &mut carried,
+                        &activity,
+                        limit,
                     ))
                     .await
                     {
@@ -1621,14 +1812,14 @@ pub async fn handle_client(
                 let subs = subscriptions.get_or_insert_with(|| {
                     open_subscriptions(&pubsub, &client_registry, client_id, &stream, &write_guard)
                 });
-                out_buf.extend_from_slice(&subs.handle(&cmd, resp_version));
+                out_buf.extend_from_slice(&subs.handle(&cmd, resp_version & RESP_VERSION));
                 if subs.total() == 0 {
                     subscriptions = None;
                 }
                 parse_offset += consumed;
                 continue;
             }
-            if resp_version == 2
+            if resp_version & RESP_VERSION == 2
                 && subscriptions.is_some()
                 && let Some(reply) = crate::pubsub::resp2_subscriber_reply(cmd_name.as_str(), &cmd)
             {
@@ -1836,6 +2027,7 @@ pub async fn handle_client(
                     crate::commands::hash_import::forget_client(client_id);
                     client_registry.update(client_id, |info| {
                         info.no_evict = false;
+                        info.no_touch = false;
                         info.resp = 2;
                         info.name = String::new();
                         info.tracking = false;
@@ -2033,7 +2225,7 @@ pub async fn handle_client(
                             // which breaks WATCH-abort detection for RESP3 clients entirely.
                             if let Some(refusal) = refused {
                                 refusal
-                            } else if resp_version == 3 {
+                            } else if resp_version & RESP_VERSION == 3 {
                                 crate::resp::write::resp_null_resp3()
                             } else {
                                 crate::resp::write::resp_null_array()
@@ -2120,7 +2312,7 @@ pub async fn handle_client(
                                 );
                                 tx.reset();
                                 dirty_flag.store(false, AtomicOrdering::Release);
-                                if resp_version == 3 {
+                                if resp_version & RESP_VERSION == 3 {
                                     crate::resp::write::resp_null_resp3()
                                 } else {
                                     crate::resp::write::resp_null_array()
@@ -2128,7 +2320,8 @@ pub async fn handle_client(
                             } else {
                                 // Each SET is a use, and a modification, of its
                                 // key, as the same SET is outside a transaction
-                                // (it went unrecorded here).
+                                // (it went unrecorded here) — a `NO-TOUCH`
+                                // client's too: writes count as uses (#566).
                                 let _access = crate::eviction::recording().then(|| {
                                     crate::store::AccessScope::open(crate::eviction::write_stamp(
                                         std::time::Instant::now(),
@@ -2253,7 +2446,9 @@ pub async fn handle_client(
                                             &write_guard,
                                         )
                                     });
-                                    exec_out.extend_from_slice(&subs.handle(&args, resp_version));
+                                    exec_out.extend_from_slice(
+                                        &subs.handle(&args, resp_version & RESP_VERSION),
+                                    );
                                     if subs.total() == 0 {
                                         subscriptions = None;
                                     }
@@ -2432,6 +2627,14 @@ pub async fn handle_client(
                                 }
 
                                 exec_out.extend_from_slice(&resp);
+                                // A queued `CLIENT NO-TOUCH` takes hold with
+                                // the command after it (#566).
+                                if queued_name == "CLIENT" {
+                                    resp_version = with_no_touch(
+                                        resp_version,
+                                        client_registry.get_no_touch(client_id),
+                                    );
+                                }
                             }
 
                             watch_registry.as_ref().unwatch_all(
@@ -2583,6 +2786,14 @@ pub async fn handle_client(
                             let _blocked = (wanted > 0).then(|| {
                                 client_registry.blocked_in(client_id, unblock_tx, timeout_ms > 0)
                             });
+                            // Counted in `blocked_clients` until the command
+                            // has been counted in `commandstats`, after this
+                            // arm (#896).
+                            if wanted > 0 {
+                                blocking_slot.hold_count(Some(
+                                    crate::commands::blocking::BlockedCount::enter(),
+                                ));
+                            }
                             let blocked_at = Instant::now();
                             let waited = unless_gone(
                                 crate::replication::wait_for_replicas(
@@ -2662,12 +2873,14 @@ pub async fn handle_client(
                             // Made once for the connection and kept: it is two dozen shared
                             // handles, each counted up to copy and down to drop, and a script
                             // needs none of them copied to run on this thread. Made again if
-                            // the connection has become another user since.
+                            // the connection has become another user, or
+                            // flagged itself `CLIENT NO-TOUCH`, since (#566).
                             let user_now = authenticated_user.as_deref().unwrap_or("default");
-                            if lua_env
-                                .as_ref()
-                                .is_some_and(|env| env.authenticated_user != user_now)
-                            {
+                            if lua_env.as_ref().is_some_and(|env| {
+                                env.authenticated_user != user_now
+                                    || env.no_touch
+                                        != (resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0)
+                            }) {
                                 lua_env = None;
                             }
                             let env = &*lua_env.get_or_insert_with(|| {
@@ -2696,6 +2909,7 @@ pub async fn handle_client(
                                     &tracking_table,
                                     &peer_addr,
                                     client_id,
+                                    resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0,
                                     authenticated_user.as_deref().unwrap_or("default"),
                                 )
                             });
@@ -2704,7 +2918,7 @@ pub async fn handle_client(
                                 &mut selected_db,
                                 env,
                                 aof_enabled,
-                                resp_version,
+                                resp_version & RESP_VERSION,
                             )
                             .await
                         } else {
@@ -2833,6 +3047,8 @@ pub async fn handle_client(
                     &response,
                     started.elapsed().saturating_sub(waited_for),
                 );
+                // A `WAIT` that was counted as blocked stops being, now it is.
+                blocking_slot.release_count();
             }
             // MONITOR sees a transaction as it ran: `MULTI`, the commands —
             // each shown as it was run — and then `EXEC`.
@@ -2857,6 +3073,14 @@ pub async fn handle_client(
                     &client_registry,
                     client_id,
                 );
+            }
+            // `CLIENT NO-TOUCH` writes the flag in the registry; the loop's
+            // copy — what each command's `Ctx` carries — is read back only
+            // after the command that can change it (#566). A `CLIENT` queued
+            // in a transaction is read back as `EXEC` runs it, above, so an
+            // `EXEC` does not pay for a registry lookup here.
+            if cmd_name == "CLIENT" {
+                resp_version = with_no_touch(resp_version, client_registry.get_no_touch(client_id));
             }
             out_buf.extend_from_slice(&response);
             parse_offset += consumed;
@@ -2921,7 +3145,7 @@ pub async fn handle_client(
             parse_start = 0;
         }
         query_buffer.update(
-            parse_buf.len().saturating_sub(parse_start),
+            parse_buf.len().saturating_sub(parse_start) + carried.len() - carried_from,
             parse_buf.capacity().saturating_sub(parse_buf.len()),
             private_query_buffer,
         );
@@ -2969,14 +3193,101 @@ pub async fn handle_client(
                 activity.set_reply_output(spare_buf.len());
             }
             let _w = write_guard.lock().await;
+            debug_assert!(early.is_none(), "a read in flight before this turn's write");
+            let waiting = spare_buf.len();
             let (res, returned) = match write_within {
+                // The read the next turn makes, submitted before this write so
+                // that the two reach the kernel together (#865). If it finishes
+                // first, the client is sending while its replies wait, and is
+                // read on while they are written. Not when this turn ends the
+                // connection or hands it on, nor while there is still read
+                // ahead to run.
+                None if carried.is_empty()
+                    && !quit_requested
+                    && shutdown_wait.is_none()
+                    && connection_handoff.is_none() =>
+                {
+                    if parse_buf.capacity().saturating_sub(parse_buf.len()) < READ_MIN {
+                        parse_buf.reserve(READ_BUFFER);
+                    }
+                    early_from = parse_buf.len();
+                    early.set(Some(
+                        reader.read(std::mem::take(&mut parse_buf).slice(early_from..)),
+                    ));
+                    let mut write = std::pin::pin!(stream.write_all(spare_buf));
+                    let read = early.as_mut().as_pin_mut().expect("submitted above");
+                    tokio::select! {
+                        biased;
+                        written = &mut write => written,
+                        (got, buffer) = read => {
+                            early.set(None);
+                            parse_buf = buffer.into_inner();
+                            match got {
+                                Ok(n) if n > 0 => {
+                                    early_got = Some(n);
+                                    let limit = crate::server::HardLimit::new(
+                                        pubsub.limits(),
+                                        subscriptions.is_some(),
+                                        waiting + n,
+                                        client_id,
+                                    );
+                                    Box::pin(read_while_writing(
+                                        write,
+                                        &peer_watch,
+                                        &mut carried,
+                                        &activity,
+                                        limit,
+                                    ))
+                                    .await
+                                }
+                                // The client's end, or an error: the next
+                                // turn's read sees it again.
+                                _ => write.await,
+                            }
+                        }
+                    }
+                }
+                // Read ahead still to run, from a write that waited: the client
+                // is read while this one is written too. Not when this turn
+                // hands the connection on, whose bytes are the replication
+                // link's.
+                None if !carried.is_empty() && connection_handoff.is_none() => {
+                    let limit = crate::server::HardLimit::new(
+                        pubsub.limits(),
+                        subscriptions.is_some(),
+                        waiting + carried.len() - carried_from,
+                        client_id,
+                    );
+                    let write = std::pin::pin!(stream.write_all(spare_buf));
+                    Box::pin(read_while_writing(
+                        write,
+                        &peer_watch,
+                        &mut carried,
+                        &activity,
+                        limit,
+                    ))
+                    .await
+                }
                 None => stream.write_all(spare_buf).await,
                 Some((time, class)) => {
-                    let waiting = spare_buf.len() as u64;
-                    match tokio::time::timeout(time, stream.write_all(spare_buf)).await {
+                    let limit = crate::server::HardLimit::new(
+                        pubsub.limits(),
+                        subscriptions.is_some(),
+                        waiting + carried.len() - carried_from,
+                        client_id,
+                    );
+                    let write = std::pin::pin!(stream.write_all(spare_buf));
+                    let write = Box::pin(read_while_writing(
+                        write,
+                        &peer_watch,
+                        &mut carried,
+                        &activity,
+                        limit,
+                    ));
+                    match tokio::time::timeout(time, write).await {
                         Ok(written) => written,
                         Err(_) => {
-                            crate::output_limits::note_disconnect(client_id, class, waiting);
+                            crate::output_limits::note_disconnect(client_id, class, waiting as u64);
                             // The write still holds the socket open until
                             // it completes, which for a client that reads
                             // nothing is never: shut down, it ends at once.
@@ -2997,7 +3308,11 @@ pub async fn handle_client(
             if spare_buf.capacity() > BIG_BUFFER {
                 spare_buf = Vec::with_capacity(65536);
             }
-            res?;
+            // Out of the loop rather than returned from, so that what the
+            // connection holds after it is let go of too.
+            if res.is_err() {
+                break;
+            }
         }
         // The replies to SUBSCRIBE are out: messages may follow them.
         if let Some(subs) = &subscriptions {

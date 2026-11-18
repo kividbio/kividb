@@ -542,6 +542,12 @@ pub struct ClientInfo {
     pub activity: Arc<Activity>,
     pub query_buffer: Arc<QueryBufferMetrics>,
     pub no_evict: bool,
+    /// `CLIENT NO-TOUCH`: this client's reads record no use of the keys
+    /// they find (`T` in `CLIENT LIST`). This is the flag `CLIENT NO-TOUCH`
+    /// and `RESET` write; the connection's loop keeps a copy of its own
+    /// the command dispatcher reads (`Ctx::resp`'s `RESP_NO_TOUCH`), synced back after
+    /// the commands that can change it (#566).
+    pub no_touch: bool,
     /// Waiting in a blocking command: `b` in `CLIENT LIST`.
     pub blocked: bool,
     /// True iff the client has issued ASKING for the next command.
@@ -617,6 +623,7 @@ impl ClientInfo {
             activity: Arc::new(activity),
             query_buffer: Arc::default(),
             no_evict: false,
+            no_touch: false,
             blocked: false,
             asking: false,
             readonly: false,
@@ -683,6 +690,9 @@ impl ClientInfo {
         }
         if self.no_evict {
             flags.push('e');
+        }
+        if self.no_touch {
+            flags.push('T');
         }
         if flags.is_empty() {
             flags.push('N');
@@ -1051,7 +1061,7 @@ impl ClientRegistryInner {
     }
 
     /// Client `id` waits in a command that is no key's (`WAIT`): blocked,
-    /// counted in `blocked_clients`, and ended by `CLIENT UNBLOCK` through
+    /// listed as blocked, and ended by `CLIENT UNBLOCK` through
     /// `unblock`, until what this returns is dropped.
     pub fn blocked_in(
         &self,
@@ -1060,7 +1070,6 @@ impl ClientRegistryInner {
         with_timeout: bool,
     ) -> BlockedIn<'_> {
         self.set_blocked(id, Some(unblock), with_timeout);
-        crate::stats::BLOCKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
         BlockedIn { registry: self, id }
     }
 
@@ -1180,6 +1189,7 @@ impl ClientRegistryInner {
                 activity: Arc::clone(&c.activity),
                 query_buffer: Arc::clone(&c.query_buffer),
                 no_evict: c.no_evict,
+                no_touch: c.no_touch,
                 blocked: c.blocked,
                 asking: c.asking,
                 readonly: c.readonly,
@@ -1222,6 +1232,7 @@ impl ClientRegistryInner {
             activity: Arc::clone(&c.activity),
             query_buffer: Arc::clone(&c.query_buffer),
             no_evict: c.no_evict,
+            no_touch: c.no_touch,
             blocked: c.blocked,
             asking: c.asking,
             readonly: c.readonly,
@@ -1263,6 +1274,17 @@ impl ClientRegistryInner {
     #[inline]
     pub fn get_resp(&self, id: u64) -> u8 {
         self.clients.read().get(&id).map(|c| c.resp).unwrap_or(2)
+    }
+
+    /// The `NO-TOUCH` flag. A connection's loop keeps its own copy for the
+    /// command dispatcher; it reads this back only after a command that
+    /// can have changed it — `CLIENT` or `EXEC` — has run (#566).
+    pub fn get_no_touch(&self, id: u64) -> bool {
+        self.clients
+            .read()
+            .get(&id)
+            .map(|c| c.no_touch)
+            .unwrap_or(false)
     }
 
     /// Hot-path accessor for the cluster routing layer. Returns just the
@@ -1375,7 +1397,6 @@ pub struct BlockedIn<'a> {
 impl Drop for BlockedIn<'_> {
     fn drop(&mut self) {
         self.registry.set_blocked(self.id, None, false);
-        crate::stats::BLOCKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

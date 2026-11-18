@@ -203,6 +203,113 @@ macro_rules! tl_bump {
     }};
 }
 
+/// How scripts were run (`lua-parallel-scripts`, #871): beside other
+/// commands under their tags' locks, or alone, and why; and, of those, how
+/// many were handed to the script-runner thread or offloaded to the blocking
+/// pool. Counted where that is decided, and nowhere else: a command that is
+/// not a script counts nothing, and a build without Lua has none of this.
+/// `INFO stats`, from 0 again at `CONFIG RESETSTAT`.
+#[cfg(feature = "lua")]
+pub mod scripts {
+    use super::{PerThread, Slot};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Why a script ran alone: the first that applies, in this order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Alone {
+        /// `lua-parallel-scripts no`.
+        ParallelOff = 0,
+        /// Inside `MULTI`/`EXEC` (or another script): that holds the gate
+        /// alone already.
+        InTransaction,
+        /// A function (`FCALL`, `FCALL_RO`): functions always do.
+        Function,
+        /// No `KEYS`.
+        NoKeys,
+        /// A key of its `KEYS` has no hash tag.
+        NoTag,
+        /// Its `KEYS` all carry a tag, and it has not (or not yet) been seen
+        /// to be quick.
+        NotQuick,
+    }
+
+    const REASONS: usize = 6;
+    /// The `INFO` field of each [`Alone`], in its order.
+    const NAMES: [&str; REASONS] = [
+        "scripts_run_alone_parallel_off",
+        "scripts_run_alone_in_transaction",
+        "scripts_run_alone_function",
+        "scripts_run_alone_no_keys",
+        "scripts_run_alone_no_tag",
+        "scripts_run_alone_not_quick",
+    ];
+
+    /// Per thread: these run on every worker at once.
+    static BESIDE_OTHERS: PerThread = PerThread::new();
+    /// One at a time, by what they are: a shared count costs them nothing.
+    static ALONE: [AtomicU64; REASONS] = [const { AtomicU64::new(0) }; REASONS];
+    static HANDED_TO_RUNNER: AtomicU64 = AtomicU64::new(0);
+    static OFFLOADED_TO_POOL: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        static TL_BESIDE: std::sync::Arc<Slot> = BESIDE_OTHERS.register();
+    }
+
+    /// A script runs beside others, under its tags' locks.
+    #[inline]
+    pub fn ran_beside_others() {
+        TL_BESIDE.with(|mine| {
+            mine.0
+                .store(mine.0.load(Ordering::Relaxed) + 1, Ordering::Relaxed)
+        });
+    }
+
+    /// A script runs alone, for `why`.
+    pub fn ran_alone(why: Alone) {
+        ALONE[why as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A quick script is handed to the script-runner thread: another script
+    /// was running when it came.
+    pub fn handed_to_runner() {
+        HANDED_TO_RUNNER.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A script is run on the blocking pool: it has not been seen to be quick.
+    pub fn offloaded_to_pool() {
+        OFFLOADED_TO_POOL.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `CONFIG RESETSTAT`.
+    pub fn reset() {
+        BESIDE_OTHERS.reset();
+        for count in &ALONE {
+            count.store(0, Ordering::Relaxed);
+        }
+        HANDED_TO_RUNNER.store(0, Ordering::Relaxed);
+        OFFLOADED_TO_POOL.store(0, Ordering::Relaxed);
+    }
+
+    /// The lines of `INFO stats`.
+    pub fn info(out: &mut String) {
+        out.push_str(&format!(
+            "scripts_run_beside_others:{}\r\n",
+            BESIDE_OTHERS.total()
+        ));
+        for (name, count) in NAMES.iter().zip(&ALONE) {
+            out.push_str(&format!("{name}:{}\r\n", count.load(Ordering::Relaxed)));
+        }
+        out.push_str(&format!(
+            "scripts_handed_to_runner:{}\r\n",
+            HANDED_TO_RUNNER.load(Ordering::Relaxed)
+        ));
+        out.push_str(&format!(
+            "scripts_offloaded_to_pool:{}\r\n",
+            OFFLOADED_TO_POOL.load(Ordering::Relaxed)
+        ));
+    }
+}
+
 /// Stable for this process lifetime — used in INFO `run_id`.
 pub static RUN_ID: LazyLock<String> = LazyLock::new(|| {
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -15,17 +15,19 @@
 // share, and a script can be held to it. So, when this is switched on
 // (`lua-parallel-scripts`, on unless switched off, in a build with Lua):
 //
-// * A script whose `KEYS` all carry the same hash tag is held to that tag:
-//   a key outside it is refused, as a key in another slot is in a cluster.
-//   This is the one thing a script may do today that it may not do then,
-//   and it is so however the script comes to be run — the first time or the
-//   thousandth, inside a transaction or not — so that a script never works
-//   until the day it is run another way.
-// * Such a script, once it has been seen to be a quick one, takes its tag's
-//   lock, and the command gate only as any command does. Scripts on other
-//   tags run beside it. Until then, and inside a transaction, it takes the
-//   gate alone, as every script does today.
-// * Scripts with any other `KEYS` — none, untagged, of two tags — take the
+// * A script whose `KEYS` all carry a hash tag — one, or several different
+//   ones — is held to those tags: a key outside all of them is refused, as a
+//   key in another slot is in a cluster. This is the one thing a script may
+//   do today that it may not do then, and it is so however the script comes
+//   to be run — the first time or the thousandth, inside a transaction or
+//   not — so that a script never works until the day it is run another way.
+// * Such a script, once it has been seen to be a quick one, takes the lock
+//   of each of its tags, in the order of the table (as a client's command
+//   naming keys of several tags does, `lock_keys`), and the command gate
+//   only as any command does. Scripts on other tags run beside it. Until
+//   then, and inside a transaction, it takes the gate alone, as every
+//   script does today.
+// * Scripts with any other `KEYS` — none, or one without a tag — take the
 //   gate alone and may touch what they like, as before. So do functions.
 // * A command from a client takes the lock of every tagged key it names, so
 //   it finds a script's keys as they were before the script or as they are
@@ -37,7 +39,15 @@
 //
 // The locks are stripes: a fixed table indexed by a hash of the tag. Two
 // tags that land on one stripe wait for each other when they need not, and
-// nothing else.
+// nothing else; a script whose tags land on one stripe takes it once.
+//
+// Whoever holds more than one stripe took them in the order of the table,
+// lowest first, and takes no stripe while it holds a later one: a client's
+// command (`lock_keys`), a script (`lock_for_script`) and active expiry
+// (`try_lock_keys`, which waits a bounded time at most). So no two of them
+// wait for each other. A script's turns among the scripts of its tags
+// (`script_turn`) are taken the same way, lowest stripe first, before any
+// gate or stripe, and are taken by nothing else.
 //
 // Whoever takes a tag's lock holds the write gate (`write_gate`) first, a
 // read as a write does: the gate, then the tags' locks, then the keys'
@@ -79,12 +89,13 @@ static STRIPE: [Stripe; STRIPES] = [const { Stripe(parking_lot::const_mutex(()))
 
 /// The hash tag of `key`: what is between the first `{` and the next `}`,
 /// if that is not empty. (As a cluster reads it, except that a key without
-/// one has none, where a cluster hashes the whole key.)
-#[inline]
+/// one has none, where a cluster hashes the whole key.) Always inline: a
+/// call of it cost a client's command on a tagged key more than its look.
+#[inline(always)]
 pub fn tag_of(key: &[u8]) -> Option<&[u8]> {
-    let open = memchr::memchr(b'{', key)?;
+    let open = position_of(b'{', key)?;
     let rest = &key[open + 1..];
-    let close = memchr::memchr(b'}', rest)?;
+    let close = position_of(b'}', rest)?;
     (close > 0).then(|| &rest[..close])
 }
 
@@ -99,9 +110,65 @@ fn stripe_of(tag: &[u8]) -> usize {
     ((hash ^ (hash >> 32)) as usize) & (STRIPES - 1)
 }
 
+/// The tags the script on a thread is held to: their bytes end to end, and
+/// where each ends. The room is kept from one script to the next, so that
+/// holding a script to its tags allocates nothing once warm.
+struct HeldTags {
+    held: bool,
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+impl HeldTags {
+    const fn new() -> Self {
+        HeldTags {
+            held: false,
+            bytes: Vec::new(),
+            ends: Vec::new(),
+        }
+    }
+
+    fn set(&mut self, tags: &ScriptTags) {
+        self.bytes.clear();
+        self.ends.clear();
+        for tag in tags.as_slice() {
+            self.bytes.extend_from_slice(tag);
+            self.ends.push(self.bytes.len());
+        }
+        self.held = true;
+    }
+
+    /// Whether `tag` is one of them.
+    #[inline]
+    fn holds(&self, tag: &[u8]) -> bool {
+        if self.ends.len() == 1 {
+            return self.bytes == tag;
+        }
+        self.iter().any(|held| held == tag)
+    }
+
+    fn clear(&mut self) {
+        self.held = false;
+        // Not kept, the room of a script of a great many tags.
+        if self.bytes.capacity() > 64 * 1024 {
+            self.bytes = Vec::new();
+            self.ends = Vec::new();
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        let mut start = 0;
+        self.ends.iter().map(move |&end| {
+            let tag = &self.bytes[start..end];
+            start = end;
+            tag
+        })
+    }
+}
+
 thread_local! {
-    /// The tag the script this thread is running is held to.
-    static SCRIPT_TAG: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    /// The tags the script this thread is running is held to.
+    static SCRIPT_TAGS: RefCell<HeldTags> = const { RefCell::new(HeldTags::new()) };
     /// That script holds its tag's lock, and runs beside scripts of other
     /// threads — not the command gate alone.
     static BESIDE_OTHERS: Cell<bool> = const { Cell::new(false) };
@@ -110,10 +177,38 @@ thread_local! {
     static NEXT_SCRIPT_ALLOWED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The tag a script command's `KEYS` share: `cmd` is `EVAL`/`EVALSHA` (or the
-/// `_RO` forms) with its arguments. `None` if it has no keys, a key has no
-/// tag, or two differ.
-pub fn script_tag<'a>(cmd: &[&'a [u8]]) -> Option<&'a [u8]> {
+/// The hash tags of a script's `KEYS`, each once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptTags<'a> {
+    /// One, the usual case: nothing allocated.
+    One(&'a [u8]),
+    /// Several: the first key's, then the others in the order of their
+    /// bytes.
+    Several(Vec<&'a [u8]>),
+}
+
+impl<'a> ScriptTags<'a> {
+    pub fn as_slice(&self) -> &[&'a [u8]] {
+        match self {
+            ScriptTags::One(tag) => std::slice::from_ref(tag),
+            ScriptTags::Several(tags) => tags,
+        }
+    }
+
+    /// The stripes of the tags, each once, lowest first: the order every
+    /// holder of several takes them in.
+    fn stripes(&self) -> Vec<usize> {
+        let mut stripes: Vec<usize> = self.as_slice().iter().map(|tag| stripe_of(tag)).collect();
+        stripes.sort_unstable();
+        stripes.dedup();
+        stripes
+    }
+}
+
+/// The hash tags of a script command's `KEYS`: `cmd` is `EVAL`/`EVALSHA` (or
+/// the `_RO` forms) with its arguments. `None` if it has no keys or a key
+/// has no tag. Keys of one tag, the usual case, allocate nothing.
+pub fn script_tags<'a>(cmd: &[&'a [u8]]) -> Option<ScriptTags<'a>> {
     let name = cmd.first()?;
     if !(name.eq_ignore_ascii_case(b"EVAL")
         || name.eq_ignore_ascii_case(b"EVALSHA")
@@ -125,10 +220,55 @@ pub fn script_tag<'a>(cmd: &[&'a [u8]]) -> Option<&'a [u8]> {
     let numkeys: usize = std::str::from_utf8(cmd.get(2)?).ok()?.parse().ok()?;
     let keys = cmd.get(3..3usize.checked_add(numkeys)?)?;
     let (first, rest) = keys.split_first()?;
-    let tag = tag_of(first)?;
-    rest.iter()
-        .all(|key| tag_of(key) == Some(tag))
-        .then_some(tag)
+    let first = tag_of(first)?;
+    let mut others = Vec::new();
+    for key in rest {
+        let tag = tag_of(key)?;
+        if tag != first {
+            others.push(tag);
+        }
+    }
+    if others.is_empty() {
+        return Some(ScriptTags::One(first));
+    }
+    others.sort_unstable();
+    others.dedup();
+    others.insert(0, first);
+    Some(ScriptTags::Several(others))
+}
+
+/// What a script command's `KEYS` are, as far as running under a tag goes:
+/// for `INFO`'s counts of the scripts that ran alone, and why
+/// (`stats::scripts`). Asked only of a script that runs alone.
+#[cfg(feature = "lua")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptKeys {
+    /// None, or a count of them that is not one.
+    None,
+    /// At least one has no hash tag.
+    Untagged,
+    /// All have one.
+    Tagged,
+}
+
+/// See [`ScriptKeys`]. `cmd` is a script command with its arguments.
+#[cfg(feature = "lua")]
+pub fn script_keys(cmd: &[&[u8]]) -> ScriptKeys {
+    let keys = std::str::from_utf8(cmd.get(2).copied().unwrap_or_default())
+        .ok()
+        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(|n| cmd.get(3..3usize.checked_add(n)?));
+    let Some((first, rest)) = keys.and_then(|keys| keys.split_first()) else {
+        return ScriptKeys::None;
+    };
+    if std::iter::once(first)
+        .chain(rest)
+        .all(|key| tag_of(key).is_some())
+    {
+        ScriptKeys::Tagged
+    } else {
+        ScriptKeys::Untagged
+    }
 }
 
 /// Say that the script this thread runs next may run under its tag. Asked
@@ -145,116 +285,184 @@ pub fn take_next_script_allowed() -> bool {
 }
 
 /// Held by a tagged script for as long as it runs: the note that this
-/// thread's commands are that script's and keep to its tag, and — for a
-/// script running beside others — its tag's lock.
+/// thread's commands are that script's and keep to its tags, and — for a
+/// script running beside others — its tags' locks.
+///
+/// What it holds is let go of out of line ([`Drop`]): the guard is an
+/// `Option` in the way of every command (`handler::run_command`), and the
+/// code to let go of several stripes has no business there.
 pub struct ScriptGuard {
-    _stripe: Option<MutexGuard<'static, ()>>,
-    /// Entered before the stripe is taken, and let go of after it: a
-    /// read-only script (`EVAL_RO`) holds no write gate otherwise.
-    _gate: Option<crate::write_gate::WriteGuard>,
+    held: std::mem::ManuallyDrop<Held>,
     /// Whether this guard is the one that set the tag: a tagged script
     /// called by a tagged script leaves the outer one's in place.
     outermost: bool,
     _not_send: PhantomData<*const ()>,
 }
 
+/// What a [`ScriptGuard`] holds, let go of in this order.
+struct Held {
+    _stripes: Stripes,
+    /// Entered before the stripes are taken, and let go of after them: a
+    /// read-only script (`EVAL_RO`) holds no write gate otherwise.
+    _gate: Option<crate::write_gate::WriteGuard>,
+}
+
+/// The stripes a script holds: none (it runs alone), its one, or its
+/// several, taken lowest first.
+enum Stripes {
+    None,
+    One { _held: MutexGuard<'static, ()> },
+    Several { _held: Vec<MutexGuard<'static, ()>> },
+}
+
 impl Drop for ScriptGuard {
+    #[inline(never)]
     fn drop(&mut self) {
         if self.outermost {
-            SCRIPT_TAG.with(|tag| *tag.borrow_mut() = None);
+            SCRIPT_TAGS.with(|tags| tags.borrow_mut().clear());
             BESIDE_OTHERS.with(|beside| beside.set(false));
         }
+        // SAFETY: dropped here once; the field is not used again.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.held) }
     }
 }
 
 fn hold(
-    tag: &[u8],
-    stripe: Option<MutexGuard<'static, ()>>,
+    tags: &ScriptTags,
+    stripes: Stripes,
     gate: Option<crate::write_gate::WriteGuard>,
 ) -> ScriptGuard {
-    let outermost = SCRIPT_TAG.with(|held| {
+    let outermost = SCRIPT_TAGS.with(|held| {
         let mut held = held.borrow_mut();
-        if held.is_some() {
+        if held.held {
             false
         } else {
-            *held = Some(tag.to_vec());
+            held.set(tags);
             true
         }
     });
     if outermost {
-        BESIDE_OTHERS.with(|beside| beside.set(stripe.is_some()));
+        BESIDE_OTHERS.with(|beside| beside.set(gate.is_some()));
     }
     ScriptGuard {
-        _stripe: stripe,
-        _gate: gate,
+        held: std::mem::ManuallyDrop::new(Held {
+            _stripes: stripes,
+            _gate: gate,
+        }),
         outermost,
         _not_send: PhantomData,
     }
 }
 
-/// Take `tag`'s lock for a script that runs beside others.
+/// Take the lock of each of `tags` for a script that runs beside others,
+/// and hold it until the script is done: each stripe once, lowest first, as
+/// a client's command naming keys of several tags takes them
+/// ([`lock_keys`]), so that neither waits for the other in a cycle.
 ///
-/// The script has had its turn among the scripts of its tag already
+/// The script has had its turn among the scripts of its tags already
 /// ([`script_turn`]), so what this waits for, if anything, is a client's
-/// command on a key of the tag: a moment.
+/// command on a key of one of them: a moment.
 ///
 /// The write gate first, as for any tag's lock (see the top): a read-only
 /// script holds none otherwise, and one that finds a key past its time
 /// enters it to delete the key.
-pub fn lock_for_script(tag: &[u8]) -> ScriptGuard {
+pub fn lock_for_script(tags: &ScriptTags) -> ScriptGuard {
     let gate = crate::write_gate::enter();
-    hold(tag, Some(STRIPE[stripe_of(tag)].0.lock()), Some(gate))
+    let stripes = match tags {
+        ScriptTags::One(tag) => Stripes::One {
+            _held: STRIPE[stripe_of(tag)].0.lock(),
+        },
+        ScriptTags::Several(_) => Stripes::Several {
+            _held: tags
+                .stripes()
+                .into_iter()
+                .map(|stripe| STRIPE[stripe].0.lock())
+                .collect(),
+        },
+    };
+    hold(tags, stripes, Some(gate))
 }
 
 /// The turns of the scripts of each stripe: see [`script_turn`].
 static TURN: [tokio::sync::Mutex<()>; STRIPES] =
     [const { tokio::sync::Mutex::const_new(()) }; STRIPES];
 
-/// Wait for `tag`'s turn among scripts, and hold it while the script runs.
+/// A script's turns among the scripts of its tags: see [`script_turn`].
+pub enum ScriptTurn {
+    One {
+        _turn: tokio::sync::MutexGuard<'static, ()>,
+    },
+    Several {
+        _turns: Vec<tokio::sync::MutexGuard<'static, ()>>,
+    },
+}
+
+/// Wait for the turn of each of `tags` among scripts, and hold them while
+/// the script runs.
 ///
-/// A script waits for the scripts ahead of it on its tag here, asleep and
+/// A script waits for the scripts ahead of it on its tags here, asleep and
 /// in the order they came — not inside the command, on the lock, where the
 /// connection's thread would wait with it and every other connection of
-/// that thread behind it, most of them on tags nobody holds.
-pub async fn script_turn(tag: &[u8]) -> tokio::sync::MutexGuard<'static, ()> {
-    TURN[stripe_of(tag)].lock().await
+/// that thread behind it, most of them on tags nobody holds. Several are
+/// taken lowest stripe first, as the locks are: two scripts that share two
+/// tags never each hold the turn the other waits for.
+pub async fn script_turn(tags: &ScriptTags<'_>) -> ScriptTurn {
+    match tags {
+        ScriptTags::One(tag) => ScriptTurn::One {
+            _turn: TURN[stripe_of(tag)].lock().await,
+        },
+        ScriptTags::Several(_) => {
+            let mut turns = Vec::new();
+            for stripe in tags.stripes() {
+                turns.push(TURN[stripe].lock().await);
+            }
+            ScriptTurn::Several { _turns: turns }
+        }
+    }
 }
 
-/// Hold a script to `tag` without the lock: one that has the command gate
-/// alone, and so has nothing to be locked against.
-pub fn hold_script_to(tag: &[u8]) -> ScriptGuard {
-    hold(tag, None, None)
+/// Hold a script to `tags` without their locks: one that has the command
+/// gate alone, and so has nothing to be locked against.
+pub fn hold_script_to(tags: &ScriptTags) -> ScriptGuard {
+    hold(tags, Stripes::None, None)
 }
 
-/// Whether this thread is running a script that is held to a tag.
+/// Whether this thread is running a script that is held to its tags.
 #[inline]
 pub fn in_script() -> bool {
-    SCRIPT_TAG.with(|tag| tag.borrow().is_some())
+    SCRIPT_TAGS.with(|tags| tags.borrow().held)
 }
 
 /// Whether this thread is running a script beside the scripts of other
-/// threads, under its tag's lock.
+/// threads, under its tags' locks.
 #[inline]
 pub fn beside_others() -> bool {
     BESIDE_OTHERS.with(|beside| beside.get())
 }
 
 /// For a command the script on this thread calls: whether `key` is one the
-/// script may touch. True when no script is running under a tag here.
+/// script may touch, a key of one of its tags. True when no script is
+/// running under its tags here.
 pub fn script_may_touch(key: &[u8]) -> bool {
-    SCRIPT_TAG.with(|tag| match tag.borrow().as_deref() {
-        None => true,
-        Some(tag) => tag_of(key) == Some(tag),
+    SCRIPT_TAGS.with(|tags| {
+        let tags = tags.borrow();
+        !tags.held || tag_of(key).is_some_and(|tag| tags.holds(tag))
     })
 }
 
-/// The tag of the script on this thread, for a message.
-pub fn script_tag_for_message() -> String {
-    SCRIPT_TAG.with(|tag| {
-        tag.borrow()
-            .as_deref()
-            .map(|tag| String::from_utf8_lossy(tag).into_owned())
-            .unwrap_or_default()
+/// The tags of the script on this thread, for a message: `hash tag 'q'`,
+/// or `hash tags 'a', 'b'`.
+pub fn script_tags_for_message() -> String {
+    SCRIPT_TAGS.with(|tags| {
+        let tags = tags.borrow();
+        let quoted: Vec<String> = tags
+            .iter()
+            .map(|tag| format!("'{}'", String::from_utf8_lossy(tag)))
+            .collect();
+        match quoted.len() {
+            1 => format!("hash tag {}", quoted[0]),
+            _ => format!("hash tags {}", quoted.join(", ")),
+        }
     })
 }
 
@@ -306,6 +514,132 @@ pub fn lock_keys<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Option<KeysGuard> 
             .collect(),
         _gate: gate,
     })
+}
+
+/// Whether `key` may carry a hash tag: whether it has a `{` at all. One
+/// without has no tag ([`tag_of`]); one with may not either (`{}`, no `}`).
+/// Eight bytes at a time up to 32, which on the command path costs a short
+/// key less than a call of `memchr` (#889).
+#[inline]
+pub fn may_carry_tag(key: &[u8]) -> bool {
+    position_of(b'{', key).is_some()
+}
+
+/// Where `byte` is first in `hay`: eight bytes at a time up to 32, which
+/// costs a key of a few dozen bytes less than a call of `memchr` (#889);
+/// `memchr` past that.
+#[inline(always)]
+fn position_of(byte: u8, hay: &[u8]) -> Option<usize> {
+    const ONES: u64 = u64::from_ne_bytes([1; 8]);
+    const HIGHS: u64 = ONES << 7;
+    let pattern = ONES * byte as u64;
+    // The bytes of `word` that are `byte` are the zero bytes of `x`. The
+    // lowest bit this sets marks the first of them: it sets a bit that is
+    // not one only above a byte that is (where the subtraction borrowed).
+    let first = |word: &[u8]| {
+        let x = u64::from_le_bytes(word.try_into().unwrap()) ^ pattern;
+        let found = x.wrapping_sub(ONES) & !x & HIGHS;
+        (found != 0).then(|| found.trailing_zeros() as usize / 8)
+    };
+    let len = hay.len();
+    match len {
+        0..8 => hay.iter().position(|&each| each == byte),
+        8..=32 => {
+            let mut at = 0;
+            while at + 8 < len {
+                if let Some(within) = first(&hay[at..at + 8]) {
+                    return Some(at + within);
+                }
+                at += 8;
+            }
+            // The last eight, over bytes looked at already if need be: none
+            // of those was `byte`.
+            first(&hay[len - 8..]).map(|within| len - 8 + within)
+        }
+        _ => memchr::memchr(byte, hay),
+    }
+}
+
+/// Where [`lock_named_keys`] looks for the tags of the keys a client's
+/// command names.
+#[derive(Debug)]
+pub enum NamedKeys {
+    /// Every `step`-th argument from `from` to `last`: the first key that
+    /// may carry a tag, and those after it (`keyspec::regular_key_positions`).
+    Regular {
+        from: usize,
+        last: usize,
+        step: usize,
+    },
+    /// The keys `keyspec::key_positions` finds.
+    Other(crate::keyspec::Keys),
+}
+
+/// The keys of `cmd` (a command from a client, `name` upper case) that
+/// [`lock_keys`] has to look at: `None` when none can carry a tag, which is
+/// what `lock_keys` would find, and then nothing is taken. Most commands
+/// name their keys at regular places and most keys have no `{`, so this
+/// is a look for `{` in each key, without building the general list of
+/// positions (#889).
+#[inline]
+pub fn named_keys(name: &str, cmd: &[&[u8]]) -> Option<NamedKeys> {
+    // A key is an argument: a command of one argument (`GET k`, `INCR k`)
+    // names that one at most, whatever the command, and the table need not
+    // be asked when it has no `{`.
+    let one_argument = cmd.len() == 2;
+    if one_argument && !may_carry_tag(cmd[1]) {
+        return None;
+    }
+    let Some((first, last, step)) = crate::keyspec::regular_key_positions(name, cmd) else {
+        return Some(NamedKeys::Other(crate::keyspec::key_positions(name, cmd)));
+    };
+    // That one has a `{`: whether it is a key is all that is left to know.
+    if one_argument {
+        return (first <= last).then_some(NamedKeys::Regular {
+            from: first,
+            last,
+            step,
+        });
+    }
+    let mut at = first;
+    while at <= last {
+        if may_carry_tag(cmd[at]) {
+            return Some(NamedKeys::Regular {
+                from: at,
+                last,
+                step,
+            });
+        }
+        at += step;
+    }
+    None
+}
+
+/// [`lock_keys`] over the keys a client's command names: the lock of each
+/// tagged one, and `None`, with nothing taken or entered, when none has a
+/// tag. A key before the first that may carry a tag has none, and
+/// `lock_keys` would have passed it by.
+#[inline]
+pub fn lock_named_keys(name: &str, cmd: &[&[u8]]) -> Option<KeysGuard> {
+    let keys = named_keys(name, cmd)?;
+    lock_found_keys(keys, cmd)
+}
+
+/// The rest of [`lock_named_keys`], for a command with a key that may carry
+/// a tag. Out of line, so that the look for one stays small; one iterator
+/// for both kinds, the one `key_positions`' keys give, so that `lock_keys`
+/// is made once here.
+#[inline(never)]
+fn lock_found_keys(keys: NamedKeys, cmd: &[&[u8]]) -> Option<KeysGuard> {
+    let at = match &keys {
+        NamedKeys::Regular { from, last, step } => crate::keyspec::KeyIter::Range {
+            next: *from,
+            last: *last,
+            step: *step,
+        },
+        NamedKeys::Other(keys) => keys.iter(),
+    };
+    lock_keys(at.map(|at| cmd[at]))
 }
 
 /// What active expiry holds of the tags of a batch of keys: the locks it
@@ -431,29 +765,241 @@ mod tests {
     }
 
     #[test]
-    fn a_script_has_a_tag_when_all_its_keys_share_one() {
-        let tag = |cmd: &[&[u8]]| script_tag(cmd).map(|tag| tag.to_vec());
+    fn a_script_has_tags_when_all_its_keys_carry_one() {
+        let tags = |cmd: &[&[u8]]| {
+            script_tags(cmd).map(|tags| {
+                tags.as_slice()
+                    .iter()
+                    .map(|tag| tag.to_vec())
+                    .collect::<Vec<_>>()
+            })
+        };
         assert_eq!(
-            tag(&[b"EVALSHA", b"abc", b"2", b"{q}:a", b"x:{q}:b", b"arg"]),
-            Some(b"q".to_vec())
+            tags(&[b"EVALSHA", b"abc", b"2", b"{q}:a", b"x:{q}:b", b"arg"]),
+            Some(vec![b"q".to_vec()])
         );
         assert_eq!(
-            tag(&[b"eval", b"return 1", b"1", b"{q}:a"]),
-            Some(b"q".to_vec())
+            tags(&[b"eval", b"return 1", b"1", b"{q}:a"]),
+            Some(vec![b"q".to_vec()])
         );
-        // No keys, an untagged key, two tags, a function, a count that lies.
-        assert_eq!(tag(&[b"EVALSHA", b"abc", b"0", b"{q}:a"]), None);
-        assert_eq!(tag(&[b"EVALSHA", b"abc", b"2", b"{q}:a", b"b"]), None);
-        assert_eq!(tag(&[b"EVALSHA", b"abc", b"2", b"{q}:a", b"{r}:b"]), None);
-        assert_eq!(tag(&[b"FCALL", b"f", b"1", b"{q}:a"]), None);
-        assert_eq!(tag(&[b"EVALSHA", b"abc", b"5", b"{q}:a"]), None);
-        assert_eq!(tag(&[b"EVALSHA", b"abc", b"x", b"{q}:a"]), None);
+        // Several: each once, the first key's first.
+        assert_eq!(
+            tags(&[
+                b"EVALSHA", b"abc", b"5", b"{t}:a", b"{s}:b", b"{t}:c", b"{r}:d", b"{s}:e"
+            ]),
+            Some(vec![b"t".to_vec(), b"r".to_vec(), b"s".to_vec()])
+        );
+        assert!(
+            matches!(
+                script_tags(&[b"EVALSHA", b"abc", b"2", b"{q}:a", b"{q}:b"]),
+                Some(ScriptTags::One(_))
+            ),
+            "one tag allocates nothing"
+        );
+        // No keys, an untagged key, a function, a count that lies.
+        assert_eq!(tags(&[b"EVALSHA", b"abc", b"0", b"{q}:a"]), None);
+        assert_eq!(tags(&[b"EVALSHA", b"abc", b"2", b"{q}:a", b"b"]), None);
+        assert_eq!(tags(&[b"EVALSHA", b"abc", b"2", b"b", b"{q}:a"]), None);
+        assert_eq!(
+            tags(&[b"EVALSHA", b"abc", b"3", b"{q}:a", b"{r}:b", b"c"]),
+            None
+        );
+        assert_eq!(tags(&[b"FCALL", b"f", b"1", b"{q}:a"]), None);
+        assert_eq!(tags(&[b"EVALSHA", b"abc", b"5", b"{q}:a"]), None);
+        assert_eq!(tags(&[b"EVALSHA", b"abc", b"x", b"{q}:a"]), None);
+    }
+
+    #[test]
+    fn a_script_is_held_to_its_tags() {
+        let two = ScriptTags::Several(vec![b"t1", b"t2"]);
+        let guard = lock_for_script(&two);
+        assert!(in_script());
+        assert!(beside_others());
+        assert!(script_may_touch(b"{t1}:a"));
+        assert!(script_may_touch(b"x:{t2}:b"));
+        assert!(!script_may_touch(b"{t3}:c"));
+        assert!(!script_may_touch(b"plain"));
+        assert_eq!(script_tags_for_message(), "hash tags 't1', 't2'");
+        drop(guard);
+        assert!(!in_script());
+        assert!(!beside_others());
+        assert!(script_may_touch(b"{t3}:c"));
+        let alone = hold_script_to(&two);
+        assert!(in_script());
+        assert!(!beside_others());
+        assert!(!script_may_touch(b"{t3}:c"));
+        drop(alone);
+        let one = lock_for_script(&ScriptTags::One(b"t1"));
+        assert_eq!(script_tags_for_message(), "hash tag 't1'");
+        assert!(!script_may_touch(b"{t2}:b"));
+        drop(one);
+    }
+
+    /// Tags that land on one stripe are taken once: taken twice, the lock
+    /// would wait for itself.
+    #[test]
+    fn two_tags_on_one_stripe_are_one_lock() {
+        let mut same = None;
+        'found: for i in 0..100_000 {
+            for j in 0..i {
+                let (a, b) = (format!("x{i}"), format!("x{j}"));
+                if stripe_of(a.as_bytes()) == stripe_of(b.as_bytes()) {
+                    same = Some((a, b));
+                    break 'found;
+                }
+            }
+        }
+        let (a, b) = same.expect("two tags of one stripe");
+        let tags = ScriptTags::Several(vec![a.as_bytes(), b.as_bytes()]);
+        assert_eq!(tags.stripes().len(), 1);
+        let guard = lock_for_script(&tags);
+        assert!(script_may_touch(format!("{{{a}}}:k").as_bytes()));
+        assert!(script_may_touch(format!("{{{b}}}:k").as_bytes()));
+        drop(guard);
+    }
+
+    /// Scripts and client commands taking the same tags, named the other way
+    /// round, from several threads at once, many times: a deadlock would
+    /// hang the test. And while a script holds two tags, a command on
+    /// either waits, and one on neither does not.
+    #[test]
+    fn scripts_of_several_tags_and_commands_never_wait_for_each_other_in_a_cycle() {
+        let pick = |prefix: &str, avoid: &[usize]| {
+            (0..)
+                .map(|i| format!("{prefix}{i}"))
+                .find(|tag| !avoid.contains(&stripe_of(tag.as_bytes())))
+                .unwrap()
+        };
+        let a = pick("a", &[]);
+        let b = pick("b", &[stripe_of(a.as_bytes())]);
+        let c = pick("c", &[stripe_of(a.as_bytes()), stripe_of(b.as_bytes())]);
+        std::thread::scope(|scope| {
+            for flip in 0..4 {
+                let (a, b, c) = (&a, &b, &c);
+                scope.spawn(move || {
+                    for _ in 0..2000 {
+                        let (x, y) = if flip % 2 == 0 { (a, b) } else { (b, a) };
+                        if flip < 2 {
+                            let tags =
+                                ScriptTags::Several(vec![x.as_bytes(), y.as_bytes(), c.as_bytes()]);
+                            let _held = lock_for_script(&tags);
+                        } else {
+                            let keys = [
+                                format!("{{{y}}}:k"),
+                                format!("{{{c}}}:k"),
+                                format!("{{{x}}}:k"),
+                            ];
+                            let _held = lock_keys(keys.iter().map(|k| k.as_bytes()));
+                        }
+                    }
+                });
+            }
+        });
+
+        let tags = ScriptTags::Several(vec![a.as_bytes(), b.as_bytes()]);
+        let script = lock_for_script(&tags);
+        let neither = format!("{{{c}}}:k");
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| assert!(lock_keys([neither.as_bytes()].into_iter()).is_some()))
+                .join()
+                .unwrap();
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn({
+            let key = format!("{{{b}}}:k");
+            move || {
+                let _held = lock_keys([key.as_bytes()].into_iter());
+                done_tx.send(()).unwrap();
+            }
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a command on the script's second tag did not wait"
+        );
+        drop(script);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("it was let through when the script ended");
+        waiter.join().unwrap();
+    }
+
+    /// Turns of several tags are taken lowest stripe first: two scripts
+    /// sharing two tags, named the other way round, never each hold the
+    /// turn the other waits for.
+    #[test]
+    fn turns_of_several_tags_never_wait_for_each_other_in_a_cycle() {
+        let a = b"turn-a".as_slice();
+        let b = (0..)
+            .map(|i| format!("turn-b{i}"))
+            .find(|tag| stripe_of(tag.as_bytes()) != stripe_of(a))
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut tasks = Vec::new();
+            for flip in 0..8 {
+                let b = b.clone();
+                tasks.push(tokio::spawn(async move {
+                    for _ in 0..500 {
+                        let tags = if flip % 2 == 0 {
+                            ScriptTags::Several(vec![a, b.as_bytes()])
+                        } else {
+                            ScriptTags::Several(vec![b.as_bytes(), a])
+                        };
+                        let _turn = script_turn(&tags).await;
+                        tokio::task::yield_now().await;
+                    }
+                }));
+            }
+            for task in tasks {
+                tokio::time::timeout(Duration::from_secs(30), task)
+                    .await
+                    .expect("the turns deadlocked")
+                    .unwrap();
+            }
+        });
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn a_scripts_keys_are_told_apart_for_the_counters() {
+        let kind = |cmd: &[&[u8]]| script_keys(cmd);
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"2", b"{q}:a", b"x:{q}:b"]),
+            ScriptKeys::Tagged
+        );
+        assert_eq!(kind(&[b"EVALSHA", b"abc", b"0"]), ScriptKeys::None);
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"3", b"{q}:a"]),
+            ScriptKeys::None
+        );
+        assert_eq!(kind(&[b"EVALSHA", b"abc", b"x"]), ScriptKeys::None);
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"2", b"{q}:a", b"b"]),
+            ScriptKeys::Untagged
+        );
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"2", b"a", b"{q}:b"]),
+            ScriptKeys::Untagged
+        );
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"3", b"{q}:a", b"{r}:b", b"c"]),
+            ScriptKeys::Untagged
+        );
+        assert_eq!(
+            kind(&[b"EVALSHA", b"abc", b"2", b"{q}:a", b"{r}:b"]),
+            ScriptKeys::Tagged
+        );
     }
 
     #[test]
     fn a_script_is_held_to_its_tag() {
         assert!(script_may_touch(b"anything"), "no script here");
-        let guard = lock_for_script(b"q1");
+        let guard = lock_for_script(&ScriptTags::One(b"q1"));
         assert!(in_script());
         assert!(script_may_touch(b"{q1}:jobs"));
         assert!(script_may_touch(b"bull:{q1}:7"));
@@ -466,7 +1012,7 @@ mod tests {
 
     #[test]
     fn a_command_waits_for_the_script_on_its_tag_and_no_other() {
-        let script = lock_for_script(b"busy-queue");
+        let script = lock_for_script(&ScriptTags::One(b"busy-queue"));
         // Another tag, and no tag: neither waits. (A different stripe is
         // found by looking, so that the test does not depend on the hash.)
         let other = (0..)
@@ -514,7 +1060,7 @@ mod tests {
             .find(|tag| stripe_of(tag.as_bytes()) != stripe_of(b"held-tag"))
             .unwrap();
         let free_key = format!("{{{other}}}:k");
-        let held = lock_for_script(b"held-tag");
+        let held = lock_for_script(&ScriptTags::One(b"held-tag"));
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
@@ -542,7 +1088,7 @@ mod tests {
     /// for ever.
     #[test]
     fn a_busy_tag_is_waited_for_a_little_and_not_for_ever() {
-        let forever = lock_for_script(b"never-let-go");
+        let forever = lock_for_script(&ScriptTags::One(b"never-let-go"));
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
@@ -565,7 +1111,7 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 while !stop.load(Ordering::Relaxed) {
-                    let _held = lock_for_script(b"busy-queue-tag");
+                    let _held = lock_for_script(&ScriptTags::One(b"busy-queue-tag"));
                     std::thread::sleep(Duration::from_micros(300));
                 }
             });
@@ -596,11 +1142,11 @@ mod tests {
         assert!(!crate::write_gate::held_by_this_thread());
         assert!(lock_keys([b"untagged".as_slice()].into_iter()).is_none());
         assert!(!crate::write_gate::held_by_this_thread(), "no tag, no gate");
-        let script = lock_for_script(b"gated");
+        let script = lock_for_script(&ScriptTags::One(b"gated"));
         assert!(crate::write_gate::held_by_this_thread());
         drop(script);
         assert!(!crate::write_gate::held_by_this_thread());
-        let held = hold_script_to(b"gated");
+        let held = hold_script_to(&ScriptTags::One(b"gated"));
         assert!(
             !crate::write_gate::held_by_this_thread(),
             "no lock, no gate"
@@ -636,5 +1182,225 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// `may_carry_tag` is a look for `{`, eight bytes at a time: every
+    /// length up to 40, every byte in every place, among fillers that a
+    /// borrow between bytes would trip over.
+    #[test]
+    fn a_key_may_carry_a_tag_when_it_has_a_brace() {
+        // `tag_of` as it was, with `memchr`.
+        let reference = |key: &[u8]| -> Option<Vec<u8>> {
+            let open = memchr::memchr(b'{', key)?;
+            let rest = &key[open + 1..];
+            let close = memchr::memchr(b'}', rest)?;
+            (close > 0).then(|| rest[..close].to_vec())
+        };
+        let check = |key: &[u8]| {
+            assert_eq!(may_carry_tag(key), key.contains(&b'{'), "{key:?}");
+            for byte in *b"{}" {
+                assert_eq!(
+                    position_of(byte, key),
+                    memchr::memchr(byte, key),
+                    "{byte} {key:?}"
+                );
+            }
+            assert_eq!(tag_of(key).map(<[u8]>::to_vec), reference(key), "{key:?}");
+            if tag_of(key).is_some() {
+                assert!(may_carry_tag(key), "{key:?}");
+            }
+        };
+        for len in 0..=40usize {
+            for filler in [b'a', 0x00, 0x7a, 0x7c, 0xfb, 0xff, 0x80, 0x01] {
+                let mut key = vec![filler; len];
+                check(&key);
+                for at in 0..len {
+                    let bytes: Vec<u8> = if filler == b'a' {
+                        (0..=255).collect()
+                    } else {
+                        vec![b'{', b'{' ^ 0x80, b'{' - 1, b'{' + 1, 0, 0xff, b'}']
+                    };
+                    for byte in bytes {
+                        key[at] = byte;
+                        check(&key);
+                    }
+                    key[at] = filler;
+                }
+            }
+        }
+        // Two braces in every pair of places: the first of two is found,
+        // and the tag between them.
+        for len in 0..=40usize {
+            for open in 0..len {
+                for other in 0..len {
+                    for second in *b"}{" {
+                        let mut key = vec![b'k'; len];
+                        key[open] = b'{';
+                        key[other] = second;
+                        check(&key);
+                    }
+                }
+            }
+        }
+        check(&[b'x'; 4096]);
+        let mut long = vec![b'x'; 4096];
+        long[4000] = b'{';
+        check(&long);
+    }
+
+    /// For every command of the key table, and some without keys: the
+    /// stripes `lock_named_keys` would take (through `named_keys`) are the
+    /// ones `lock_keys` takes over everything `key_positions` finds, with a
+    /// tagged or an untagged key, an empty tag, a `{` without its `}`,
+    /// binary keys and keys longer than a word in each place (#889).
+    #[test]
+    fn named_keys_find_the_stripes_key_positions_finds() {
+        use std::collections::BTreeSet;
+        let mut names = crate::keyspec::table_names();
+        names.extend(["PING", "MULTI", "EXEC", "EVALSHA", "FCALL", "SCAN", "X"]);
+        let keys: &[&[u8]] = &[
+            b"k",
+            b"{t}:k",
+            b"x:{u}",
+            b"{}",
+            b"{}k{v}",
+            b"{k",
+            b"k}",
+            b"{",
+            b"}{w}",
+            b"\xff{\x00}\x80",
+            b"\x00{t\x01}",
+            b"1234567{",
+            b"12345678{t}",
+            b"key:000000001234",
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa{long}",
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ];
+        // What the shapes with counts and options look for.
+        let words: &[&[u8]] = &[
+            b"0",
+            b"1",
+            b"2",
+            b"3",
+            b"-1",
+            b"STREAMS",
+            b"STORE",
+            b"STOREDIST",
+            b"KEYS",
+            b"SET",
+            b"USAGE",
+            b"HELP",
+            b"GROUP",
+            b"$",
+            b"",
+        ];
+        let stripes_of = |cmd: &[&[u8]], at: &mut dyn Iterator<Item = usize>| -> BTreeSet<usize> {
+            at.filter_map(|at| tag_of(cmd[at]).map(stripe_of)).collect()
+        };
+        let compare = |name: &str, cmd: &[&[u8]]| -> bool {
+            let general = stripes_of(cmd, &mut crate::keyspec::key_positions(name, cmd).iter());
+            let fast = match named_keys(name, cmd) {
+                None => BTreeSet::new(),
+                Some(NamedKeys::Regular { from, last, step }) => {
+                    stripes_of(cmd, &mut (from..=last).step_by(step))
+                }
+                Some(NamedKeys::Other(found)) => stripes_of(cmd, &mut found.iter()),
+            };
+            assert_eq!(fast, general, "{name} {cmd:?}");
+            named_keys(name, cmd).is_none()
+        };
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |below: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % below as u64) as usize
+        };
+        let (mut cases, mut passed_by) = (0usize, 0usize);
+        for name in &names {
+            // One key of each kind in each place, the rest plain keys or
+            // words.
+            for len in 2..=7 {
+                for filler in [&b"k"[..], b"2", b"STREAMS", b"STORE", b"KEYS"] {
+                    for at in 1..len {
+                        for key in keys {
+                            let mut cmd: Vec<&[u8]> = vec![filler; len];
+                            cmd[0] = name.as_bytes();
+                            cmd[at] = key;
+                            cases += 1;
+                            passed_by += compare(name, &cmd) as usize;
+                        }
+                    }
+                }
+            }
+            // Mixed at random.
+            for len in 1..=10 {
+                for _ in 0..40 {
+                    let mut cmd: Vec<&[u8]> = (0..len)
+                        .map(|_| {
+                            if next(2) == 0 {
+                                keys[next(keys.len())]
+                            } else {
+                                words[next(words.len())]
+                            }
+                        })
+                        .collect();
+                    cmd[0] = name.as_bytes();
+                    cases += 1;
+                    passed_by += compare(name, &cmd) as usize;
+                }
+            }
+        }
+        assert!(cases > 500_000, "{cases}");
+        assert!(passed_by > cases / 10, "{passed_by} of {cases}");
+    }
+
+    /// What `lock_named_keys` takes: the stripe of each tagged key and the
+    /// write gate, or nothing at all.
+    #[test]
+    fn a_command_takes_the_stripes_of_its_tagged_keys_and_nothing_else() {
+        let held = |tag: &str| STRIPE[stripe_of(tag.as_bytes())].0.is_locked();
+        let cmd = |parts: &[&str]| -> Vec<Vec<u8>> {
+            parts.iter().map(|part| part.as_bytes().to_vec()).collect()
+        };
+        let lock = |parts: &[Vec<u8>]| {
+            let args: Vec<&[u8]> = parts.iter().map(|part| part.as_slice()).collect();
+            let name = String::from_utf8(parts[0].clone()).unwrap();
+            lock_named_keys(&name, &args)
+        };
+        for untagged in [
+            cmd(&["GET", "plain"]),
+            cmd(&["SET", "plain", "{not-a-key}"]),
+            cmd(&["GET", "{}"]),
+            cmd(&["GET", "{open"]),
+            cmd(&["MGET", "a", "b", "c{"]),
+            cmd(&["MSET", "a", "{v}", "b", "{w}"]),
+            cmd(&["PING"]),
+            cmd(&["SORT", "plain", "BY", "{x}:*"]),
+        ] {
+            assert!(lock(&untagged).is_none(), "{untagged:?}");
+            assert!(!crate::write_gate::held_by_this_thread());
+        }
+        let guard = lock(&cmd(&["GET", "{nk889-a}:k"])).expect("a tagged key");
+        assert!(crate::write_gate::held_by_this_thread());
+        assert!(held("nk889-a"));
+        drop(guard);
+        assert!(!crate::write_gate::held_by_this_thread());
+        let guard = lock(&cmd(&[
+            "MSET",
+            "plain",
+            "1",
+            "{nk889-b}:k",
+            "2",
+            "x{nk889-c}",
+            "3",
+        ]))
+        .expect("tagged keys");
+        assert!(held("nk889-b") && held("nk889-c"));
+        drop(guard);
+        let guard = lock(&cmd(&["SORT", "plain", "STORE", "{nk889-d}:dst"])).expect("STORE");
+        assert!(held("nk889-d"));
+        drop(guard);
+        assert!(!crate::write_gate::held_by_this_thread());
     }
 }

@@ -1,16 +1,16 @@
 name: Compatibility
 # Runs the framework harnesses in benchmarks/*-compat that have a ci.sh against KiviDB and against
-# Redis, and fails when a check passes on Redis and fails on KiviDB (#33). The contract a harness
+# Redis, and fails when a check passes on Redis and fails on KiviDB, when KiviDB stops passing a
+# check its harness lists as passing, or when a harness could not run (#33). The contract a harness
 # follows to take part, and how to add one, are in benchmarks/README.md.
 #
 # Actions minutes cost money, so: never on push or pull_request; one runner, the harnesses one after
 # another; a time limit on the job and on each harness. Both servers come from pinned images: Redis
-# by digest, KiviDB at the release tag (a release, the latest release on a schedule, or the image
-# given to a run by hand). No secrets: nothing here needs a model API key.
+# by digest, KiviDB at the release tag (a release, or the image given to a run by hand: the latest
+# release by default). No schedule: with every input pinned, a run repeats the last one; a run by
+# hand with a pre-release image covers what is new. No secrets: nothing here needs a model API key.
 
 on:
-  schedule:
-    - cron: "17 4 * * 1" # Mondays, 04:17 UTC
   release:
     types: [published] # release.yml publishes the release after its images are pushed
   workflow_dispatch:
@@ -71,6 +71,26 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: benchmarks/ci/run-harness.sh gptcache
+
+      - name: langchain
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/ci/run-harness.sh langchain
+
+      - name: langgraph
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/ci/run-harness.sh langgraph
+
+      - name: llamaindex
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/ci/run-harness.sh llamaindex
+
+      - name: mem0
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/ci/run-harness.sh mem0
 
       - name: Keep the results
         if: ${{ !cancelled() }}

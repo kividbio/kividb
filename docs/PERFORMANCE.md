@@ -9,6 +9,8 @@
 - [Bare metal](#bare-metal)
 - [The full suite, on Azure VMs](#the-full-suite-on-azure-vms)
 - [Memory of small sets](#memory-of-small-sets)
+- [Memory of small hashes](#memory-of-small-hashes)
+- [Worker threads](#worker-threads)
 - [Earlier runs](#earlier-runs)
 - [Independent reviews](#independent-reviews)
 
@@ -124,6 +126,92 @@ than 128 members (512 integers) are tables as before; making those smaller is
 the next step of #297. Suite `17-set-memory` of
 [the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
 this table again and fails a build that loses it.
+
+## Memory of small hashes
+
+Since 1.3.0 a small hash is kept in one block, its fields and values end to
+end (`listpack` in `OBJECT ENCODING`, `listpackex` once a field has a TTL: up
+to 512 fields, no field or value longer than 64 bytes), where 1.2 kept every
+hash as a table with two allocations per field. Bytes of `used_memory` a
+field, 3M fields in hashes of each size, 14-byte fields (`field:00000001`)
+with 32-byte values, on an Azure `Standard_D4s_v5`:
+
+| fields a hash | 1.2.2 | 1.3.0 | Redis 8.10.2 |
+|---:|---:|---:|---:|
+| 10 | 162.8 | 71.8 | 57.8 |
+| 100 | 129.2 | 55.8 | 51.7 |
+| 1,000 | 166.6 | 166.6 | 70.1 |
+| 100,000 | 128.8 | 128.8 | 76.8 |
+| 3,000,000 | 133.3 | 133.3 | 77.9 |
+
+As for sets, what is left over Redis at 10 fields is mostly the key's own
+entry and the hash's header. Hashes past the block's limits are tables as
+before. Suite `19-hash-memory` of
+[the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
+this again (with and without field TTLs) and fails a build that loses it.
+
+## Memory of lists
+
+Since 1.3.0 a list's elements lie end to end in chunks of up to 64, each
+element between two copies of its length, where 1.2 kept a slot, a shared
+header and an allocation of its own for every element. Bytes of
+`used_memory` an element, 3M elements of 32 bytes in lists of each size, on
+an Azure `Standard_D4s_v5`:
+
+| elements a list | 1.2.2 | 1.3.0 | Redis 8.10.2 |
+|---:|---:|---:|---:|
+| 10 | 76.0 | 48.8 | 45.0 |
+| 100 | 65.2 | 38.4 | 36.4 |
+| 1,000 | 64.1 | 36.7 | 34.6 |
+| 100,000 | 68.5 | 36.7 | 34.3 |
+| 3,000,000 | 69.8 | 36.7 | 34.3 |
+
+At 10 elements most of what is left over Redis is the key's own: its entry
+and the list's header. A list that has had an element longer than 1,024
+bytes keeps its elements apart, as 1.2 did, and takes what 1.2 took. Suite
+`21-list-memory` of
+[the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
+this table again (1M elements, 10 to 100,000 a list) and fails a build that
+loses it.
+
+## Worker threads
+
+How many workers to start on a CPU allowance ([#873](https://github.com/kividbio/kividb/issues/873)),
+measured on master `b2203cce` in November 2026 on one Azure `Standard_D8s_v5` (8 vCPUs, 4
+cores with two hyper-threads each): the server confined with `taskset`, memtier_benchmark
+2.6.1 with 4 threads on the other CPUs, 1M keys of 100 B and 500k of 2 KB, `GET`:`SET`
+9:1, three runs of 8 s, the median. "4 vCPUs" is the server on the two hyper-threads of 2
+cores, "4 cores" on one hyper-thread of each of the 4 cores with memtier on the siblings.
+Up to 1.2, auto started 2 workers on 4 vCPUs and 2 on 2.
+
+Unpipelined, 500 connections, ops/s and p99:
+
+| Server on | I/O model | 1 worker | 2 workers | 3 workers | 4 workers | 5 workers |
+|---|---|---:|---:|---:|---:|---:|
+| 2 vCPUs | io_uring | 131k, 4.32 ms | **222k, 2.43 ms** | 215k, 5.95 ms | | |
+| 4 vCPUs | io_uring | | 302k, 1.81 ms | 344k, 2.06 ms | 326k, 2.29 ms | 345k, 2.50 ms |
+| 4 cores | io_uring | | 239k, 2.51 ms | 336k, 1.83 ms | 326k, 2.30 ms | 360k, 2.58 ms |
+| 4 cores | tokio | | 210k, 12.93 ms | 344k, 3.71 ms | **376k, 1.96 ms** | 353k, 3.92 ms |
+
+- On 2 vCPUs the server is the limit: one worker served 24-41% less than two in every
+  workload (100 B and 2 KB, 48 and 500 connections, pipeline 1 and 16, a Rails cache mix of
+  `GET`, `MGET` of 10 and `SET PX`, with AOF, with a replica, during `BGSAVE`). A third
+  worker served 0-10% less (22% more during `BGSAVE`) and multiplied the p99 by 2 to 12
+  (by 1.1 during `BGSAVE`).
+- On 4 vCPUs the load generator, at about 340k unpipelined and 2.4M pipelined, is the
+  limit from 3 workers up, so 3, 4 and 5 workers are within about 10% of each other. 2 workers
+  served 2-22% less than 4 on io_uring, and 20-33% less on 4 cores; on tokio 23% less on 4 vCPUs and 37-46% less on 4 cores,
+  at 3.5 to 6.6 times the p99.
+- During back-to-back `BGSAVE`s of 4 GB, on 4 vCPUs, 3 workers had a lower p99 than 4
+  (3.0 against 5.5 ms on io_uring, at the same throughput), and with a replica 2.3 against
+  3.0 ms; on tokio with AOF it was the other way round (4.0 against 2.1 ms on 4 cores).
+  Neither is consistent enough to start a worker fewer when persistence is on.
+- With the server and memtier sharing all 8 vCPUs, 4 to 9 workers were within 9% of each
+  other.
+- A fractional quota: in a container with `--cpus 1.5`, two workers served 202k with a
+  p99 of 27.5 ms, one 119k at 4.7 ms; with `--cpus 2.5`, three workers 282k at 18.2 ms,
+  two 273k at 2.1 ms; and with `--cpus 2`, three workers 223k at 35.6 ms, two 270k at
+  2.0 ms. Auto rounds the quota down.
 
 ## Earlier runs
 

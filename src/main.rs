@@ -22,16 +22,20 @@ pub mod command_gate;
 mod commands;
 mod compaction;
 mod config;
+mod cpus;
+mod element;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
 mod give_back;
+mod hash_fields;
 pub mod key_bytes;
 pub mod key_moves;
 pub mod keyspace_events;
 pub mod keyspec;
 pub mod latency;
 pub mod lazyfree;
+mod list_values;
 pub mod listen;
 #[cfg(feature = "lua")]
 mod lua_vm_blocking;
@@ -40,6 +44,8 @@ pub mod memory_use;
 pub mod monitor;
 pub mod node_tls;
 pub mod output_limits;
+mod packed_hash;
+mod packed_list;
 mod packed_set;
 pub mod pause;
 mod ping;
@@ -96,9 +102,8 @@ fn print_banner(threads: usize, config: &Arc<Config>) {
     let version = env!("CARGO_PKG_VERSION");
 
     // get system info
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(0);
+    let cpus = cpus::detect();
+    let available = cpus::available(&cpus);
 
     let mem_gb = {
         // read from /proc/meminfo on linux, fallback on mac
@@ -177,7 +182,14 @@ fn print_banner(threads: usize, config: &Arc<Config>) {
     if mem_gb > 0 {
         println!("  * Memory         : {mem_gb}GiB available");
     }
-    println!("  * CPUs           : {cores} cores detected");
+    if available.threads == cpus.online {
+        println!("  * CPUs           : {} online", cpus.online);
+    } else {
+        println!(
+            "  * CPUs           : {} online, {} available ({})",
+            cpus.online, available.threads, available.reason
+        );
+    }
     if port == 0 {
         println!("  * Listening on   : no plaintext port (port 0): TLS only");
     } else {
@@ -203,7 +215,10 @@ fn print_banner(threads: usize, config: &Arc<Config>) {
         println!("  * Node ID        : (printed after cluster init)");
     }
 
-    println!("  * Worker threads : {threads}");
+    println!(
+        "  * Worker threads : {threads} ({})",
+        config.threads_reason()
+    );
     println!("  * AOF            : {aof_status}");
     // Name the source recovery will actually use. This line used to read
     // "KDB snapshot (SAVE / BGSAVE)" unconditionally, which was true even with

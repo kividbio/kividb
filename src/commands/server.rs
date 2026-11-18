@@ -1378,6 +1378,45 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                     ))),
                 }
             }
+            // The most fields, and the longest field or value, a hash keeps
+            // in one block: no more than a block holds, and `CONFIG GET`
+            // says what was kept, under the name and its older `ziplist`
+            // one alike, as Redis has them as one setting.
+            "hash-max-listpack-entries"
+            | "hash-max-ziplist-entries"
+            | "hash-max-listpack-value"
+            | "hash-max-ziplist-value" => {
+                match crate::member_set::canonical_i64(value.as_bytes()) {
+                    Some(limit) if limit >= 0 => {
+                        let limit = limit as usize;
+                        let entries = param.ends_with("-entries");
+                        let kept = if entries {
+                            crate::hash_fields::set_packed_entries(limit)
+                        } else {
+                            crate::hash_fields::set_packed_value(limit)
+                        };
+                        let names = if entries {
+                            ["hash-max-listpack-entries", "hash-max-ziplist-entries"]
+                        } else {
+                            ["hash-max-listpack-value", "hash-max-ziplist-value"]
+                        };
+                        let mut remembered = REMEMBERED_CONFIG.lock();
+                        for name in names {
+                            remembered.insert(name.to_string(), kept.to_string());
+                        }
+                        Some(resp_simple("OK"))
+                    }
+                    Some(_) => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                         '{param}') - argument must be between 0 and \
+                         9223372036854775807 inclusive",
+                    ))),
+                    None => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument \
+                         '{param}') - argument couldn't be parsed into an integer",
+                    ))),
+                }
+            }
             // When the AOF is synced (#513): under `always`, before each
             // reply to a write, as in Redis. `no` is taken as `everysec`.
             "appendfsync" => match value.to_ascii_lowercase().as_str() {
@@ -2023,10 +2062,6 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| {
     parking_lot::Mutex::new(
         [
-            ("hash-max-listpack-entries", "512"),
-            ("hash-max-listpack-value", "64"),
-            ("hash-max-ziplist-entries", "512"),
-            ("hash-max-ziplist-value", "64"),
             ("list-max-listpack-size", "-2"),
             ("list-max-ziplist-size", "-2"),
             ("list-compress-depth", "0"),
@@ -2073,6 +2108,22 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             (
                 "set-max-listpack-value".to_string(),
                 crate::member_set::DEFAULT_PACKED_VALUE.to_string(),
+            ),
+            (
+                "hash-max-listpack-entries".to_string(),
+                crate::hash_fields::DEFAULT_PACKED_ENTRIES.to_string(),
+            ),
+            (
+                "hash-max-ziplist-entries".to_string(),
+                crate::hash_fields::DEFAULT_PACKED_ENTRIES.to_string(),
+            ),
+            (
+                "hash-max-listpack-value".to_string(),
+                crate::hash_fields::DEFAULT_PACKED_VALUE.to_string(),
+            ),
+            (
+                "hash-max-ziplist-value".to_string(),
+                crate::hash_fields::DEFAULT_PACKED_VALUE.to_string(),
             ),
         ])
         .collect(),
@@ -4666,6 +4717,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "evicted_scripts:{}\r\n",
                     crate::stats::EVICTED_SCRIPTS.load(Ordering::Relaxed)
                 ));
+                // How scripts were run: beside others, or alone and why (#871).
+                #[cfg(feature = "lua")]
+                crate::stats::scripts::info(&mut out);
                 // Slowlog totals (Redis 8.8). Milliseconds to two places,
                 // as Redis writes them (`0.00`).
                 let (slow_count, slow_us_sum, slow_us_max) = ctx.slowlog.totals();
@@ -5081,7 +5135,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if want("clients") {
                 let count = ctx.client_registry.connected_clients();
-                let blocked = crate::stats::BLOCKED_CLIENTS.load(Ordering::Relaxed);
+                let blocked = crate::stats::BLOCKED_CLIENTS.load(Ordering::Acquire);
                 let tracking = crate::tracking::tracking_client_count();
                 out.push_str("# Clients\r\n");
                 out.push_str(&format!("connected_clients:{count}\r\n"));
@@ -5430,6 +5484,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::INSTANTANEOUS_OPS.store(0, Ordering::Relaxed);
                     crate::stats::LAST_SAMPLE_COMMANDS.store(0, Ordering::Relaxed);
                     crate::stats::reset_error_reply_stats();
+                    #[cfg(feature = "lua")]
+                    crate::stats::scripts::reset();
                     ctx.slowlog.reset_totals();
                     Some(resp_simple("OK"))
                 }
@@ -5962,9 +6018,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(resp_simple("OK"))
                 }
 
-                // Accepted: what a client has touched is not kept per client.
+                // CLIENT NO-TOUCH ON|OFF: this client's commands record no
+                // use of the keys they find. The registry keeps the flag —
+                // what CLIENT LIST and CLIENT INFO show — and the
+                // connection's loop reads it back for the command
+                // dispatcher; RESET puts it back (#566).
                 "NO-TOUCH" => match cmd.get(2).and_then(|word| on_or_off(word)) {
-                    Some(_) if cmd.len() == 3 => Some(resp_simple("OK")),
+                    Some(on) if cmd.len() == 3 => {
+                        ctx.client_registry.update(ctx.client_id, |info| {
+                            info.no_touch = on;
+                        });
+                        Some(resp_simple("OK"))
+                    }
                     _ => Some(resp_error("ERR syntax error")),
                 },
 
@@ -6452,7 +6517,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // HELLO is intercepted in the server loops before reaching here.
             // If it arrives here something went wrong — return a minimal response
             // rather than an error, so clients don't break.
-            let proto = ctx.resp as i64;
+            let proto = (ctx.resp & crate::commands::ctx::RESP_VERSION) as i64;
             let fields = vec![
                 resp_bulk_str("server"),
                 resp_bulk_str("redis"),

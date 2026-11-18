@@ -32,6 +32,8 @@ pub(crate) fn scans_whole(value: ValueRef<'_>) -> bool {
         // By the form it is kept in (#297), as Redis goes by its encoding:
         // an array or a block whole, a table a page at a time.
         ValueRef::Set(set) => !set.read().is_table(),
+        ValueRef::Hash(hash) => !hash.read().is_table(),
+        ValueRef::HashEx(hash) => !hash.read().fields.is_table(),
         _ => matches!(encoding_of(value), "listpack" | "listpackex"),
     }
 }
@@ -54,15 +56,8 @@ pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
                 "raw"
             }
         }
-        ValueRef::List(list) => {
-            let list = list.read();
-            // One node of a quicklist holds 8 kB.
-            if list.iter().map(|element| element.len() + 11).sum::<usize>() <= 8192 {
-                "listpack"
-            } else {
-                "quicklist"
-            }
-        }
+        // The form it is really kept in: one chunk, or more.
+        ValueRef::List(list) => list.read().encoding().name(),
         // The form it is really kept in (#297).
         ValueRef::Set(set) => set.read().encoding().name(),
         ValueRef::SortedSet(zset) => {
@@ -77,23 +72,16 @@ pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
                 "skiplist"
             }
         }
-        ValueRef::Hash(hash) => {
-            let hash = hash.read();
-            let small = hash.len() <= 512
-                && hash
-                    .iter()
-                    .all(|(field, value)| field.len() <= SMALL && value.len() <= SMALL);
-            if small { "listpack" } else { "hashtable" }
-        }
-        ValueRef::HashEx(hash) => {
-            let hash = hash.read();
-            let small = hash.fields.len() <= 512
-                && hash
-                    .fields
-                    .iter()
-                    .all(|(field, value)| field.len() <= SMALL && value.len() <= SMALL);
-            if small { "listpackex" } else { "hashtable" }
-        }
+        // The form it is really kept in: a block, or a table. With a field
+        // TTL a block is a `listpackex`, as Redis names it.
+        ValueRef::Hash(hash) => match hash.read().encoding() {
+            crate::hash_fields::Encoding::Listpack => "listpack",
+            crate::hash_fields::Encoding::Hashtable => "hashtable",
+        },
+        ValueRef::HashEx(hash) => match hash.read().fields.encoding() {
+            crate::hash_fields::Encoding::Listpack => "listpackex",
+            crate::hash_fields::Encoding::Hashtable => "hashtable",
+        },
         ValueRef::Stream(_) => "stream",
         ValueRef::Array(_) => "sliced-array",
         _ => "raw",
@@ -277,7 +265,7 @@ fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
             (Some(ValueRef::String(s)), None) => Some(s.to_vec()),
             (Some(ValueRef::Hash(h)), Some(field)) => {
                 let name = crate::key_bytes::text_of(field);
-                h.read().get(&*name).map(|v| v.to_vec())
+                h.read().get_bytes(&name).map(|v| v.to_vec())
             }
             // A field past its deadline is what a hash command makes of it
             // (#415): removed first where this node removes fields, its
@@ -288,7 +276,7 @@ fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
             (Some(ValueRef::HashEx(h)), Some(field)) => {
                 let name = crate::key_bytes::text_of(field);
                 let inner = h.read();
-                let value = inner.fields.get(&*name)?;
+                let value = inner.fields.get_bytes(&name)?;
                 if inner
                     .expiries
                     .get(&*name)
@@ -1546,7 +1534,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let mut elements: Vec<Arc<[u8]>> = match map.get(key) {
                 None => vec![], // ← don't return, just give empty vec
-                Some(ValueRef::List(l)) => l.read().iter().cloned().collect(),
+                Some(ValueRef::List(l)) => l.read().iter().map(|e| e.to_shared()).collect(),
                 Some(ValueRef::Set(s)) => s.read().iter().map(|m| m.to_shared()).collect(),
                 Some(ValueRef::SortedSet(z)) => {
                     z.read().iter().map(|(m, _)| m.to_shared()).collect()
@@ -1715,9 +1703,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             // ── STORE → write result as List, return count ─────────────────────
             if let Some(ref dst) = store_dst {
-                let new_list: std::collections::VecDeque<Arc<[u8]>> = raw_output
+                let new_list: crate::types::ListValues = raw_output
                     .iter()
-                    .map(|v| Arc::from(v.as_deref().unwrap_or_default()))
+                    .map(|v| v.as_deref().unwrap_or_default())
                     .collect();
                 let count = new_list.len() as i64;
                 let db_idx = *ctx.selected_db;

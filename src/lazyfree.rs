@@ -124,8 +124,11 @@ pub fn flush_counts() -> bool {
 pub fn effort(value: &KiviDBValue) -> u64 {
     let n = match value {
         KiviDBValue::String(_) => 1,
-        KiviDBValue::List(list) => list.read().len(),
-        KiviDBValue::Hash(hash) => hash.read().len(),
+        // A quicklist's nodes, as Redis counts them: chunks, or plain
+        // elements.
+        KiviDBValue::List(list) => list.read().free_effort(),
+        // A block of fields is one allocation, as Redis counts a listpack.
+        KiviDBValue::Hash(hash) => hash.read().free_effort(),
         KiviDBValue::Json(json) => match &*json.read() {
             serde_json::Value::Array(items) => items.len(),
             serde_json::Value::Object(fields) => fields.len(),
@@ -149,7 +152,7 @@ pub fn effort(value: &KiviDBValue) -> u64 {
             nodes + groups
         }
         KiviDBValue::TimeSeries(series) => series.read().samples.len(),
-        KiviDBValue::HashEx(hash) => hash.read().len(),
+        KiviDBValue::HashEx(hash) => hash.read().fields.free_effort(),
         KiviDBValue::Array(array) => array.read().count() as usize,
         KiviDBValue::Sketch(sketch) => sketch.read().free_effort() as usize,
     };

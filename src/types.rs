@@ -1,3 +1,4 @@
+pub use crate::list_values::ListValues;
 use crate::member_set::Member;
 pub use crate::shared_bytes::SharedBytes;
 use crate::vector::DistanceMetric;
@@ -347,10 +348,9 @@ impl SortedSetInner {
         count: usize,
         pages: usize,
     ) -> (impl ExactSizeIterator<Item = (Member<'_>, f64)>, u64) {
-        use crate::commands::helpers::{scan_page, scan_position};
+        use crate::commands::helpers::{prefetched, scan_page, scan_position};
         let (page, next_cursor) = scan_page(
-            self.members
-                .iter()
+            prefetched(self.members.iter(), |(member, _)| member.as_ptr())
                 .map(|(member, &score)| (scan_position(member), (member, score))),
             cursor,
             count,
@@ -726,6 +726,27 @@ pub struct CompactionRule {
 /// differs per process, #612).
 pub type Labels = indexmap::IndexMap<String, String, ahash::RandomState>;
 
+/// The outcome of adding a sample to a time series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddResult {
+    /// The sample was inserted or upserted with this timestamp.
+    Added(u64),
+    /// The sample was suppressed by the IGNORE filter; holds the series' last timestamp.
+    Ignored(u64),
+}
+
+impl AddResult {
+    pub fn timestamp(&self) -> u64 {
+        match *self {
+            AddResult::Added(ts) | AddResult::Ignored(ts) => ts,
+        }
+    }
+
+    pub fn is_ignored(&self) -> bool {
+        matches!(self, AddResult::Ignored(_))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TsInner {
     /// All samples: timestamp_ms → value.
@@ -755,6 +776,12 @@ pub struct TsInner {
     /// in `TS.INFO`, and where `LATEST` finds the bucket still open (#128).
     /// By name: `key_bytes::text_of` of its key.
     pub source: Option<String>,
+
+    /// Maximum time difference in milliseconds for the IGNORE filter.
+    pub ignore_max_time_diff: u64,
+
+    /// Maximum absolute value difference for the IGNORE filter.
+    pub ignore_max_val_diff: f64,
 }
 
 impl TsInner {
@@ -768,17 +795,42 @@ impl TsInner {
             rules: Vec::new(),
             last_ts: None,
             source: None,
+            ignore_max_time_diff: 0,
+            ignore_max_val_diff: 0.0,
+        }
+    }
+
+    /// Checks whether an incoming sample should be ignored (suppressed) by the IGNORE filter.
+    /// Returns `Some(max_timestamp)` if ignored, or `None` if it should be added.
+    pub fn should_ignore(&self, ts: u64, value: f64, policy: &DuplicatePolicy) -> Option<u64> {
+        if self.source.is_some() || *policy != DuplicatePolicy::Last {
+            return None;
+        }
+        if self.ignore_max_time_diff == 0 && self.ignore_max_val_diff == 0.0 {
+            return None;
+        }
+        let (&max_ts, &max_val) = self.samples.iter().next_back()?;
+        if ts >= max_ts
+            && (ts - max_ts) <= self.ignore_max_time_diff
+            && (value - max_val).abs() <= self.ignore_max_val_diff
+        {
+            Some(max_ts)
+        } else {
+            None
         }
     }
 
     /// Add a sample, respecting duplicate policy and retention.
     /// Returns the timestamp actually stored, or an error string.
-    pub fn add_sample(&mut self, ts: u64, value: f64) -> Result<u64, &'static str> {
+    pub fn add_sample(&mut self, ts: u64, value: f64) -> Result<AddResult, &'static str> {
         // Refused before anything changes: the trim below is a change too.
         if self.duplicate_policy == DuplicatePolicy::Block && self.samples.contains_key(&ts) {
             return Err(BLOCKED_DUPLICATE);
         }
         let policy = self.duplicate_policy.clone();
+        if let Some(existing_ts) = self.should_ignore(ts, value, &policy) {
+            return Ok(AddResult::Ignored(existing_ts));
+        }
         self.add_sample_as(ts, value, &policy)
     }
 
@@ -790,7 +842,7 @@ impl TsInner {
         ts: u64,
         value: f64,
         policy: &DuplicatePolicy,
-    ) -> Result<u64, &'static str> {
+    ) -> Result<AddResult, &'static str> {
         // Refused before anything changes: the trim below is a change too.
         if *policy == DuplicatePolicy::Block && self.samples.contains_key(&ts) {
             return Err(BLOCKED_DUPLICATE);
@@ -838,7 +890,7 @@ impl TsInner {
         if self.last_ts.map(|l| ts > l).unwrap_or(true) {
             self.last_ts = Some(ts);
         }
-        Ok(ts)
+        Ok(AddResult::Added(ts))
     }
 
     /// Current wall-clock time in milliseconds.
@@ -869,26 +921,7 @@ impl Default for TsInner {
 //
 // Expiry: `field_expiry::expire_due` is the one place a field past its
 //   deadline is removed, and its removal propagated.
-/// The fields of a hash, in the order they were first set — which is the
-/// order `HGETALL`, `HKEYS`, `HVALS` and `HSCAN` give them in. Redis keeps
-/// that order for a hash small enough for a listpack, and clients have come
-/// to rely on it (BullMQ's tests among them).
-pub type HashFields = indexmap::IndexMap<String, std::sync::Arc<[u8]>, ahash::RandomState>;
-
-/// Up to this many fields, removing one keeps the others in order, as in a
-/// Redis listpack (`hash-max-listpack-entries`). A larger hash is a hash
-/// table in Redis too, with no order to keep: there the last field takes the
-/// removed one's place, which costs nothing.
-pub const HASH_ORDERED_FIELDS: usize = 512;
-
-/// Remove `field` from `fields` (see `HASH_ORDERED_FIELDS`).
-pub fn hash_remove(fields: &mut HashFields, field: &str) -> Option<std::sync::Arc<[u8]>> {
-    if fields.len() <= HASH_ORDERED_FIELDS {
-        fields.shift_remove(field)
-    } else {
-        fields.swap_remove(field)
-    }
-}
+pub use crate::hash_fields::{HASH_ORDERED_FIELDS, HashFields};
 
 /// A hash field's deadline: milliseconds since the Unix epoch, by the wall
 /// clock, as Redis keeps it and as every file, payload and stream carries it.
@@ -1161,15 +1194,18 @@ impl HashInner {
     /// is shown of a hash whose due fields are left in place.
     #[cold]
     pub fn live_fields(&self, now: FieldDeadline) -> HashFields {
-        self.fields
-            .iter()
-            .filter(|(field, _)| {
-                self.expiries
-                    .get(*field)
-                    .is_none_or(|at| !field_due(*at, now))
-            })
-            .map(|(field, value)| (field.clone(), std::sync::Arc::clone(value)))
-            .collect()
+        // Room for them all: a table is made a table at once.
+        let mut live = HashFields::with_capacity(self.fields.len());
+        for (field, value) in self.fields.iter() {
+            if self
+                .expiries
+                .get(field)
+                .is_none_or(|at| !field_due(*at, now))
+            {
+                live.insert_bytes(field, &value);
+            }
+        }
+        live
     }
 
     /// The fields a reader is shown at `now`: those due left out, unless
@@ -1195,11 +1231,17 @@ impl HashInner {
                 .is_some_and(|at| field_due(*at, now))
     }
 
-    /// Remove a field's value AND its expiry entry. Returns the removed
-    /// value if the field existed.
-    pub fn evict_field(&mut self, field: &str) -> Option<std::sync::Arc<[u8]>> {
+    /// Remove a field's value AND its expiry entry. Whether the field
+    /// existed.
+    pub fn evict_field(&mut self, field: &str) -> bool {
         self.expiries.remove(field);
-        hash_remove(&mut self.fields, field)
+        self.fields.remove(field)
+    }
+
+    /// [`Self::evict_field`], handing the value to `f` on its way out.
+    pub fn take_field_with<R>(&mut self, field: &str, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        self.expiries.remove(field);
+        self.fields.take_with(field, f)
     }
 
     /// Remove every field past its deadline, telling no one. For tests: a
@@ -1594,7 +1636,7 @@ impl ArrayInner {
 #[derive(Clone)]
 pub enum KiviDBValue {
     String(SharedBytes),
-    List(Arc<RwLock<VecDeque<Arc<[u8]>>>>),
+    List(Arc<RwLock<ListValues>>),
     Hash(Arc<RwLock<HashFields>>),
     Json(Arc<RwLock<serde_json::Value>>),
     Set(Arc<RwLock<crate::member_set::MemberSet>>),

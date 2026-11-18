@@ -239,7 +239,8 @@ fn member_seconds_to_unix_ms(text: &[u8]) -> io::Result<Option<u64>> {
 /// `rdb_dialect::field_deadline`); `None` for no fields. A field named twice
 /// is a corrupt file.
 fn hash_with_ttls(fields: Vec<(Vec<u8>, Vec<u8>, Option<u64>)>) -> io::Result<Option<KiviDBValue>> {
-    let mut inner = crate::types::HashInner::new();
+    let mut inner =
+        crate::types::HashInner::from_fields(crate::types::HashFields::with_capacity(fields.len()));
     let mut names = std::collections::HashSet::with_capacity(fields.len());
     for (field, value, expires_at) in fields {
         let field = String::from_utf8_lossy(&field).into_owned();
@@ -249,7 +250,7 @@ fn hash_with_ttls(fields: Vec<(Vec<u8>, Vec<u8>, Option<u64>)>) -> io::Result<Op
         if let Some(at) = expires_at {
             inner.expiries.insert(field.clone(), field_deadline(at));
         }
-        inner.fields.insert(field, Arc::from(value.as_slice()));
+        inner.fields.insert_loaded(field, &value);
     }
     if inner.fields.is_empty() {
         return Ok(None);

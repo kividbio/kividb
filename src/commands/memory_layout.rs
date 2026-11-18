@@ -18,7 +18,6 @@
 //! what no other holds.
 
 use std::alloc::Layout;
-use std::sync::Arc;
 
 use crate::types::HashFields;
 
@@ -124,35 +123,9 @@ where
     (total as u128 * len as u128 / samples as u128) as usize
 }
 
-/// A hash's fields (`IndexMap`): its table of indexes, its vector of
-/// entries (hash, name, value), both with room for as many as it reports,
-/// and each name's and each value's block, sampled.
-///
-/// What it reports is the lesser room of the two. That is the vector's for
-/// a hash made with room for its fields (as a snapshot loads one) and both's
-/// for one that grew; but deleting fields can leave the table fewer free
-/// buckets (hashbrown keeps a deleted bucket marked until it is rebuilt),
-/// and then part of the vector's room is not seen and not counted.
+/// A hash's fields: see [`HashFields::layout_bytes`].
 pub fn hash_fields(fields: &HashFields, samples: usize) -> usize {
-    let capacity = fields.capacity();
-    let indexes = hash_table(
-        capacity,
-        std::mem::size_of::<usize>(),
-        std::mem::align_of::<usize>(),
-    );
-    let entries = capacity.saturating_mul(std::mem::size_of::<(usize, String, Arc<[u8]>)>());
-    let len = fields.len();
-    // The fields are in the order they were set. An `IndexMap` gets to its
-    // n-th entry at once, so the sample is spread over the hash rather than
-    // taken from its first fields only.
-    let bytes = |(name, value): (&String, &Arc<[u8]>)| name.capacity() + arc_slice(value.len());
-    let each = if samples >= len {
-        sampled(len, samples, || fields.iter().map(bytes))
-    } else {
-        let step = (len / samples.max(1)).max(1);
-        sampled(len, samples, || fields.iter().step_by(step).map(bytes))
-    };
-    indexes + entries + each
+    fields.layout_bytes(samples)
 }
 
 /// Keys a node of the standard library's `BTreeMap` has room for (its B is
@@ -204,6 +177,7 @@ mod tests {
     use super::*;
     use crate::member_set::MemberSet;
     use crate::memory_use::allocated_by_this_thread;
+    use std::sync::Arc;
 
     /// Runs `check` where this thread has an allocation counter of its own:
     /// here if it has, or else in a new process of this test binary running
@@ -310,10 +284,7 @@ mod tests {
                 let (hash, bytes) = allocated(|| {
                     let mut hash = HashFields::default();
                     for i in 0..fields {
-                        hash.insert(
-                            format!("field:{i}"),
-                            Arc::from(format!("value:{i}").as_bytes()),
-                        );
+                        hash.insert_bytes(&format!("field:{i}"), format!("value:{i}").as_bytes());
                     }
                     hash
                 });

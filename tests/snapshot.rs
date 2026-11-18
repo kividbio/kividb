@@ -151,14 +151,17 @@ fn kdb_list_basic() {
         Arc::from(b"gamma".as_slice()),
     ]
     .into();
-    let v = roundtrip_one("lst", KiviDBValue::List(Arc::new(RwLock::new(deque))));
+    let v = roundtrip_one(
+        "lst",
+        KiviDBValue::List(Arc::new(RwLock::new(deque.into_iter().collect()))),
+    );
     match v {
         KiviDBValue::List(l) => {
             let inner = l.read();
             assert_eq!(inner.len(), 3);
-            assert_eq!(inner[0].as_ref(), b"alpha");
-            assert_eq!(inner[1].as_ref(), b"beta");
-            assert_eq!(inner[2].as_ref(), b"gamma");
+            assert_eq!(&*inner.get(0).unwrap(), b"alpha");
+            assert_eq!(&*inner.get(1).unwrap(), b"beta");
+            assert_eq!(&*inner.get(2).unwrap(), b"gamma");
         }
         _ => panic!("wrong type"),
     }
@@ -171,13 +174,16 @@ fn kdb_list_order_preserved() {
         .map(|i| Arc::from(i.to_string().as_bytes()))
         .collect();
     let deque: VecDeque<Arc<[u8]>> = items.clone().into();
-    let v = roundtrip_one("ordered", KiviDBValue::List(Arc::new(RwLock::new(deque))));
+    let v = roundtrip_one(
+        "ordered",
+        KiviDBValue::List(Arc::new(RwLock::new(deque.into_iter().collect()))),
+    );
     match v {
         KiviDBValue::List(l) => {
             let inner = l.read();
             assert_eq!(inner.len(), 100);
             for (i, item) in inner.iter().enumerate() {
-                assert_eq!(item.as_ref(), i.to_string().as_bytes());
+                assert_eq!(&*item, i.to_string().as_bytes());
             }
         }
         _ => panic!("wrong type"),
@@ -188,7 +194,7 @@ fn kdb_list_order_preserved() {
 fn kdb_list_empty() {
     let v = roundtrip_one(
         "empty_list",
-        KiviDBValue::List(Arc::new(RwLock::new(VecDeque::new()))),
+        KiviDBValue::List(Arc::new(RwLock::new(Default::default()))),
     );
     match v {
         KiviDBValue::List(l) => assert!(l.read().is_empty()),
@@ -203,18 +209,18 @@ fn kdb_list_empty() {
 #[test]
 fn kdb_hash_basic() {
     let mut hmap = kividb::types::HashFields::default();
-    hmap.insert("name".to_string(), Arc::from(b"alice".as_slice()));
-    hmap.insert("age".to_string(), Arc::from(b"30".as_slice()));
-    hmap.insert("city".to_string(), Arc::from(b"london".as_slice()));
+    hmap.insert_bytes("name", b"alice");
+    hmap.insert_bytes("age", b"30");
+    hmap.insert_bytes("city", b"london");
 
     let v = roundtrip_one("h", KiviDBValue::Hash(Arc::new(RwLock::new(hmap))));
     match v {
         KiviDBValue::Hash(h) => {
             let inner = h.read();
             assert_eq!(inner.len(), 3);
-            assert_eq!(inner["name"].as_ref(), b"alice");
-            assert_eq!(inner["age"].as_ref(), b"30");
-            assert_eq!(inner["city"].as_ref(), b"london");
+            assert_eq!(&inner["name"], b"alice");
+            assert_eq!(&inner["age"], b"30");
+            assert_eq!(&inner["city"], b"london");
         }
         _ => panic!("wrong type"),
     }
@@ -224,10 +230,7 @@ fn kdb_hash_basic() {
 fn kdb_hash_many_fields() {
     let mut hmap = kividb::types::HashFields::default();
     for i in 0..500 {
-        hmap.insert(
-            format!("field:{i}"),
-            Arc::from(format!("val:{i}").as_bytes()),
-        );
+        hmap.insert_bytes(&format!("field:{i}"), format!("val:{i}").as_bytes());
     }
     let v = roundtrip_one("bigmap", KiviDBValue::Hash(Arc::new(RwLock::new(hmap))));
     match v {
@@ -237,7 +240,7 @@ fn kdb_hash_many_fields() {
             for i in 0..500 {
                 let key = format!("field:{i}");
                 let expected = format!("val:{i}");
-                assert_eq!(inner[&key].as_ref(), expected.as_bytes());
+                assert_eq!(&inner[key.as_str()], expected.as_bytes());
             }
         }
         _ => panic!("wrong type"),
@@ -1209,12 +1212,17 @@ fn kdb_all_types_together() {
     map.insert(
         "list".to_string(),
         KiviDBValue::List(Arc::new(RwLock::new(
-            vec![Arc::from(b"a".as_slice()), Arc::from(b"b".as_slice())].into(),
+            vec![
+                Arc::<[u8]>::from(b"a".as_slice()),
+                Arc::from(b"b".as_slice()),
+            ]
+            .into_iter()
+            .collect(),
         ))),
     );
 
     let mut hmap = kividb::types::HashFields::default();
-    hmap.insert("f".to_string(), Arc::from(b"v".as_slice()));
+    hmap.insert_bytes("f", b"v");
     map.insert(
         "hash".to_string(),
         KiviDBValue::Hash(Arc::new(RwLock::new(hmap))),
@@ -1493,8 +1501,8 @@ fn rdb_hash_basic() {
         KiviDBValue::Hash(h) => {
             let inner = h.read();
             assert_eq!(inner.len(), 2);
-            assert_eq!(inner["name"].as_ref(), b"alice");
-            assert_eq!(inner["age"].as_ref(), b"30");
+            assert_eq!(&inner["name"], b"alice");
+            assert_eq!(&inner["age"], b"30");
         }
         _ => panic!("wrong type"),
     }
@@ -1522,9 +1530,9 @@ fn rdb_list_basic() {
         KiviDBValue::List(l) => {
             let inner = l.read();
             assert_eq!(inner.len(), 3);
-            assert_eq!(inner[0].as_ref(), b"alpha");
-            assert_eq!(inner[1].as_ref(), b"beta");
-            assert_eq!(inner[2].as_ref(), b"gamma");
+            assert_eq!(&*inner.get(0).unwrap(), b"alpha");
+            assert_eq!(&*inner.get(1).unwrap(), b"beta");
+            assert_eq!(&*inner.get(2).unwrap(), b"gamma");
         }
         _ => panic!("wrong type"),
     }
@@ -1827,12 +1835,8 @@ fn kdb_hashex_basic_no_ttls() {
     use kividb::types::HashInner;
 
     let mut inner = HashInner::new();
-    inner
-        .fields
-        .insert("a".to_string(), Arc::from(b"1".as_slice()));
-    inner
-        .fields
-        .insert("b".to_string(), Arc::from(b"2".as_slice()));
+    inner.fields.insert_bytes("a", b"1");
+    inner.fields.insert_bytes("b", b"2");
 
     let v = roundtrip_one("hx", KiviDBValue::HashEx(Arc::new(RwLock::new(inner))));
     match v {
@@ -1840,8 +1844,8 @@ fn kdb_hashex_basic_no_ttls() {
             let read = h.read();
             assert_eq!(read.fields.len(), 2);
             assert_eq!(read.expiries.len(), 0);
-            assert_eq!(read.fields["a"].as_ref(), b"1");
-            assert_eq!(read.fields["b"].as_ref(), b"2");
+            assert_eq!(&read.fields["a"], b"1");
+            assert_eq!(&read.fields["b"], b"2");
         }
         _ => panic!("wrong variant after round-trip"),
     }
@@ -1852,12 +1856,8 @@ fn kdb_hashex_with_field_ttls() {
     use kividb::types::HashInner;
 
     let mut inner = HashInner::new();
-    inner
-        .fields
-        .insert("a".to_string(), Arc::from(b"1".as_slice()));
-    inner
-        .fields
-        .insert("b".to_string(), Arc::from(b"2".as_slice()));
+    inner.fields.insert_bytes("a", b"1");
+    inner.fields.insert_bytes("b", b"2");
     // Set field "a" to expire 5 minutes from now.
     let at = unix_ms_now() + 300_000;
     inner.expiries.insert("a".to_string(), at);
@@ -1883,9 +1883,7 @@ fn kdb_hashex_already_expired_ttl_is_dropped_on_load() {
     use kividb::types::HashInner;
 
     let mut inner = HashInner::new();
-    inner
-        .fields
-        .insert("a".to_string(), Arc::from(b"1".as_slice()));
+    inner.fields.insert_bytes("a", b"1");
     // An expiry ten seconds in the past.
     inner
         .expiries
@@ -1988,8 +1986,8 @@ fn rdb_files_written_by_redis_7_4_and_8_10_load() {
         match &db["h"] {
             KiviDBValue::Hash(h) => {
                 let h = h.read();
-                assert_eq!(h.get("f").map(|v| &v[..]), Some(&b"v"[..]), "Redis {label}");
-                assert_eq!(h.get("g").map(|v| &v[..]), Some(&b"7"[..]), "Redis {label}");
+                assert_eq!(h.get_bytes("f"), Some(&b"v"[..]), "Redis {label}");
+                assert_eq!(h.get_bytes("g"), Some(&b"7"[..]), "Redis {label}");
                 assert_eq!(h.len(), 2, "Redis {label}");
             }
             _ => panic!("Redis {label} h: wrong type"),
@@ -2046,7 +2044,7 @@ fn an_rdb_file_with_streams_json_and_field_ttls_from_redis_8_10_loads() {
         panic!("h2 is not a hash with field TTLs");
     };
     let h = h.read();
-    assert_eq!(h.fields.get("a").map(|v| &v[..]), Some(&b"b"[..]));
+    assert_eq!(h.fields.get_bytes("a"), Some(&b"b"[..]));
     assert!(h.expiries.contains_key("a"), "the field's TTL was lost");
 }
 

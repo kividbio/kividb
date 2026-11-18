@@ -3,18 +3,69 @@ use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{lazy_expire_key, lazy_expire_on_read, parse_utf8};
 use crate::commands::list_move;
 use crate::keyspace_events::{KS_LIST, notify};
+use crate::list_values::{ListValues, Popped};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
 use parking_lot::RwLock;
-use std::collections::VecDeque;
 use std::sync::Arc;
+
+/// An element taken off a list for a reply: shared bytes, copied into the
+/// reply once the list's lock is let go (an element of any length), or the
+/// reply already written (an element of a chunk, a kilobyte at most).
+pub(super) enum Taken {
+    Shared(Arc<[u8]>),
+    /// The element as a RESP bulk string.
+    Bulk(Vec<u8>),
+}
+
+impl Taken {
+    #[inline]
+    pub(super) fn of(popped: Popped<'_>) -> Taken {
+        match popped {
+            Popped::Shared(bytes) => Taken::Shared(bytes),
+            Popped::Bytes(bytes) => Taken::Bulk(resp_bulk(bytes)),
+        }
+    }
+
+    /// An element read where it is: shared bytes kept, bytes of a chunk
+    /// written as the reply.
+    #[inline]
+    pub(super) fn of_value(value: crate::list_values::Value<'_>) -> Taken {
+        match value {
+            crate::list_values::Value::Shared(bytes) => Taken::Shared(Arc::clone(bytes)),
+            crate::list_values::Value::Bytes(bytes) => Taken::Bulk(resp_bulk(bytes)),
+        }
+    }
+
+    /// The element as a RESP bulk string.
+    #[inline]
+    pub(super) fn into_bulk(self) -> Vec<u8> {
+        match self {
+            Taken::Shared(bytes) => resp_bulk(&bytes),
+            Taken::Bulk(bulk) => bulk,
+        }
+    }
+
+    /// The element's bytes.
+    #[inline]
+    pub(super) fn bytes(&self) -> &[u8] {
+        match self {
+            Taken::Shared(bytes) => bytes,
+            Taken::Bulk(bulk) => {
+                // `$<len>\r\n<bytes>\r\n`
+                let start = bulk.iter().position(|&b| b == b'\n').map_or(0, |p| p + 1);
+                &bulk[start..bulk.len() - 2]
+            }
+        }
+    }
+}
 
 /// Pop up to `count` elements from one end of the list at `key`. Nothing if
 /// there is no such key.
-fn pop_from(ctx: &Ctx, key: &[u8], left: bool, count: usize) -> Result<Vec<Arc<[u8]>>, Vec<u8>> {
+fn pop_from(ctx: &Ctx, key: &[u8], left: bool, count: usize) -> Result<Vec<Taken>, Vec<u8>> {
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
@@ -24,9 +75,9 @@ fn pop_from(ctx: &Ctx, key: &[u8], left: bool, count: usize) -> Result<Vec<Arc<[
             let mut popped = Vec::with_capacity(count.min(list.len()));
             while popped.len() < count {
                 let element = if left {
-                    list.pop_front()
+                    list.pop_front_with(Taken::of)
                 } else {
-                    list.pop_back()
+                    list.pop_back_with(Taken::of)
                 };
                 match element {
                     Some(element) => popped.push(element),
@@ -63,7 +114,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let list = match map.get(key) {
                 None => {
-                    let l = Arc::new(RwLock::new(VecDeque::new()));
+                    let l = Arc::new(RwLock::new(ListValues::new()));
                     map.insert(key, KiviDBValue::List(Arc::clone(&l)));
                     l
                 }
@@ -79,9 +130,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Every element goes into the list; a client blocked on the key
             // is woken afterwards and pops for itself (see
             // `blocking::wait_for_keys`).
-            for value in &cmd[2..] {
-                inner.push_front(Arc::from(*value));
-            }
+            inner.extend_front(&cmd[2..]);
             let len = inner.len();
             drop(inner);
             drop(map);
@@ -107,7 +156,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let list = match map.get(key) {
                 None => {
-                    let l = Arc::new(RwLock::new(VecDeque::new()));
+                    let l = Arc::new(RwLock::new(ListValues::new()));
                     map.insert(key, KiviDBValue::List(Arc::clone(&l)));
                     l
                 }
@@ -120,10 +169,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
 
             let mut inner = list.write();
-            inner.reserve(cmd.len() - 2);
-            for value in &cmd[2..] {
-                inner.push_back(Arc::from(*value));
-            }
+            inner.extend_back(&cmd[2..]);
             let len = inner.len();
             drop(inner);
             drop(map);
@@ -162,11 +208,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let mut inner = l.write();
                     match count {
                         // No count: original behaviour — return single bulk string or nil
-                        None => match inner.pop_front() {
+                        None => match inner.pop_front_with(Taken::of) {
                             Some(val) => {
                                 drop(inner);
                                 notify(ctx.pubsub, *ctx.selected_db, KS_LIST, "lpop", key);
-                                Some(resp_bulk(&val))
+                                Some(val.into_bulk())
                             }
                             None => Some(resp_null_bulk()),
                         },
@@ -174,8 +220,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         Some(n) => {
                             let mut items: Vec<Vec<u8>> = Vec::with_capacity(n.min(inner.len()));
                             for _ in 0..n {
-                                match inner.pop_front() {
-                                    Some(val) => items.push(resp_bulk(&val)),
+                                match inner.pop_front_with(|val| resp_bulk(&val)) {
+                                    Some(val) => items.push(val),
                                     None => break,
                                 }
                             }
@@ -226,19 +272,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(ValueRef::List(l)) => {
                     let mut inner = l.write();
                     match count {
-                        None => match inner.pop_back() {
+                        None => match inner.pop_back_with(Taken::of) {
                             Some(val) => {
                                 drop(inner);
                                 notify(ctx.pubsub, *ctx.selected_db, KS_LIST, "rpop", key);
-                                Some(resp_bulk(&val))
+                                Some(val.into_bulk())
                             }
                             None => Some(resp_null_bulk()),
                         },
                         Some(n) => {
                             let mut items: Vec<Vec<u8>> = Vec::with_capacity(n.min(inner.len()));
                             for _ in 0..n {
-                                match inner.pop_back() {
-                                    Some(val) => items.push(resp_bulk(&val)),
+                                match inner.pop_back_with(|val| resp_bulk(&val)) {
+                                    Some(val) => items.push(val),
                                     None => break,
                                 }
                             }
@@ -344,18 +390,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // Write directly into one pre-allocated buffer instead of
                     // collecting N separate Vec<u8> allocations and then
                     // concatenating them in resp_array. For LRANGE 100 this
-                    // cuts allocations from 101 down to 1.
-                    use crate::resp::write::write_bulk;
+                    // cuts allocations from 101 down to 1. Lengths are
+                    // written as digits, not through `write!` (about 200
+                    // instructions an element less).
+                    use crate::resp::write::push_header;
 
-                    // Array header: *count\r\n
                     let mut buf = Vec::with_capacity(16 + count * 24);
-                    buf.push(b'*');
-                    buf.extend_from_slice(count.to_string().as_bytes());
-                    buf.extend_from_slice(b"\r\n");
-
-                    for v in inner.iter().skip(start).take(count) {
-                        write_bulk(&mut buf, v);
-                    }
+                    push_header(&mut buf, b'*', count);
+                    inner.for_each_in(start, start + count, |v| {
+                        push_header(&mut buf, b'$', v.len());
+                        buf.extend_from_slice(v);
+                        buf.extend_from_slice(b"\r\n");
+                        true
+                    });
 
                     Some(buf)
                 }
@@ -416,10 +463,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
                     let stop = stop as usize;
 
-                    // drain from the back first, then the front
-                    // order matters here
-                    inner.drain(stop + 1..);
-                    inner.drain(..start);
+                    inner.retain_range(start, stop + 1);
                     drop(inner);
                     notify(ctx.pubsub, *ctx.selected_db, KS_LIST, "ltrim", key);
                     Some(resp_simple("OK"))
@@ -541,40 +585,33 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
                     let mut matches: Vec<Vec<u8>> = Vec::new();
 
+                    // A match at `idx`: skipped, or taken; `false` once
+                    // there are enough.
+                    let mut take = |idx: usize| -> bool {
+                        if skips_left > 0 {
+                            skips_left -= 1;
+                            return true;
+                        }
+                        matches.push(resp_integer(idx as i64));
+                        matches.len() < max_matches
+                    };
                     if rank >= 0 {
                         // Forward scan: indices 0..scan_len
-                        for idx in 0..scan_len {
-                            if inner[idx].as_ref() == *element {
-                                if skips_left > 0 {
-                                    skips_left -= 1;
-                                } else {
-                                    matches.push(resp_integer(idx as i64));
-                                    if matches.len() >= max_matches {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                        let mut idx = 0;
+                        inner.for_each_in(0, scan_len, |v| {
+                            let go_on = v != *element || take(idx);
+                            idx += 1;
+                            go_on
+                        });
                     } else {
-                        // Reverse scan: walk from tail, examine scan_len elements.
-                        // start is the first index to examine counting from the end.
-                        // Using saturating arithmetic — list_len and scan_len are both
-                        // already bounded so this won't underflow, but .saturating_sub
-                        // makes it explicit and panic-free.
+                        // Reverse scan: walk from tail, examine scan_len
+                        // elements; the index returned is the forward one.
                         let start = list_len.saturating_sub(scan_len);
-                        for idx in (start..list_len).rev() {
-                            if inner[idx].as_ref() == *element {
-                                if skips_left > 0 {
-                                    skips_left -= 1;
-                                } else {
-                                    // Index returned is always the real forward index
-                                    matches.push(resp_integer(idx as i64));
-                                    if matches.len() >= max_matches {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                        let mut idx = list_len;
+                        inner.for_each_in_rev(start, list_len, |v| {
+                            idx -= 1;
+                            v != *element || take(idx)
+                        });
                     }
 
                     crate::stats::record_hit();
@@ -626,7 +663,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     match inner.get(real_idx as usize) {
                         Some(v) => {
                             crate::stats::record_hit();
-                            Some(resp_bulk(v))
+                            Some(resp_bulk(&v))
                         }
                         None => {
                             crate::stats::record_miss();
@@ -663,9 +700,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let list = Arc::clone(l);
                     drop(map); // release shard lock before locking inner list
                     let mut inner = list.write();
-                    for val in cmd.iter().skip(2) {
-                        inner.push_front(Arc::from(*val));
-                    }
+                    inner.extend_front(&cmd[2..]);
                     crate::stats::record_hit();
                     let len = inner.len();
                     drop(inner);
@@ -698,9 +733,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let list = Arc::clone(l);
                     drop(map);
                     let mut inner = list.write();
-                    for val in cmd.iter().skip(2) {
-                        inner.push_back(Arc::from(*val));
-                    }
+                    inner.extend_back(&cmd[2..]);
                     let len = inner.len();
                     drop(inner);
                     ctx.wait_table.notify_signal(key);
@@ -736,7 +769,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     if real_idx < 0 || real_idx >= len {
                         return Some(resp_error("ERR index out of range"));
                     }
-                    inner[real_idx as usize] = Arc::from(cmd[3]);
+                    inner.set(real_idx as usize, cmd[3]);
                     drop(inner);
                     notify(ctx.pubsub, *ctx.selected_db, KS_LIST, "lset", key);
                     Some(resp_simple("OK"))
@@ -771,12 +804,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => Some(resp_integer(0)),
                 Some(ValueRef::List(l)) => {
                     let mut inner = l.write();
-                    let pos = inner.iter().position(|v| v.as_ref() == *pivot);
+                    let pos = inner.position(pivot);
                     match pos {
                         None => Some(resp_integer(-1)),
                         Some(i) => {
                             let insert_at = if direction == "BEFORE" { i } else { i + 1 };
-                            inner.insert(insert_at, Arc::from(*element));
+                            inner.insert(insert_at, element);
                             let len = inner.len();
                             drop(inner);
                             ctx.wait_table.notify_signal(key);
@@ -812,41 +845,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => Some(resp_integer(0)),
                 Some(ValueRef::List(l)) => {
                     let mut inner = l.write();
-                    let mut removed = 0i64;
-                    let limit = count.unsigned_abs() as usize;
-
-                    if count == 0 {
-                        // remove all occurrences
-                        inner.retain(|v| {
-                            if v.as_ref() == *element {
-                                removed += 1;
-                                false
-                            } else {
-                                true
-                            }
-                        });
-                    } else if count > 0 {
-                        // remove from head
-                        let mut i = 0;
-                        while i < inner.len() && (limit == 0 || removed < limit as i64) {
-                            if inner[i].as_ref() == *element {
-                                inner.remove(i);
-                                removed += 1;
-                            } else {
-                                i += 1;
-                            }
-                        }
-                    } else {
-                        // count < 0: remove from tail
-                        let mut i = inner.len();
-                        while i > 0 && (limit == 0 || removed < limit as i64) {
-                            i -= 1;
-                            if inner[i].as_ref() == *element {
-                                inner.remove(i);
-                                removed += 1;
-                            }
-                        }
-                    }
+                    let removed = inner.remove_matching(element, count) as i64;
                     if removed > 0 {
                         drop(inner);
                         notify(ctx.pubsub, *ctx.selected_db, KS_LIST, "lrem", key);
@@ -874,7 +873,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             Some(
                 match list_move::move_one(ctx, &src_key, &dst_key, from_left, to_left) {
-                    Ok(Some(element)) => resp_bulk(&element),
+                    Ok(Some(element)) => element.into_bulk(),
                     Ok(None) => resp_null_bulk(),
                     Err(e) => e,
                 },
@@ -893,7 +892,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let dst_key: Vec<u8> = cmd[2].to_vec();
             Some(
                 match list_move::move_one(ctx, &src_key, &dst_key, false, true) {
-                    Ok(Some(element)) => resp_bulk(&element),
+                    Ok(Some(element)) => element.into_bulk(),
                     Ok(None) => resp_null_bulk(),
                     Err(e) => e,
                 },
@@ -930,7 +929,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                     crate::stats::record_hit();
                                     return Some(resp_array(vec![
                                         resp_bulk(key),
-                                        resp_bulk(element.as_ref()),
+                                        element.into_bulk(),
                                     ]));
                                 }
                             }
@@ -962,7 +961,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         crate::stats::record_hit();
                         return Some(resp_array(vec![
                             resp_bulk(key),
-                            resp_array(popped.iter().map(|el| resp_bulk(el.as_ref())).collect()),
+                            resp_array(popped.into_iter().map(Taken::into_bulk).collect()),
                         ]));
                     }
                     Err(e) => return Some(e),
@@ -1005,7 +1004,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 |ctx, _| match list_move::move_one(ctx, &src, &dst, from_left, to_left) {
                     Ok(Some(element)) => {
                         crate::stats::record_hit();
-                        Some(resp_bulk(&element))
+                        Some(element.into_bulk())
                     }
                     Ok(None) => None,
                     // A destination of the wrong type is an error whenever
@@ -1050,9 +1049,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                 crate::stats::record_hit();
                                 return Some(resp_array(vec![
                                     resp_bulk(key),
-                                    resp_array(
-                                        popped.iter().map(|el| resp_bulk(el.as_ref())).collect(),
-                                    ),
+                                    resp_array(popped.into_iter().map(Taken::into_bulk).collect()),
                                 ]));
                             }
                             Err(e) => return Some(e),

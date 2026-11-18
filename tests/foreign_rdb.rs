@@ -99,7 +99,7 @@ fn a_valkey_9_hash_with_field_ttls_loads_with_them() {
         panic!("h is not a hash with field TTLs");
     };
     let h = h.read();
-    let mut fields: Vec<&str> = h.fields.keys().map(String::as_str).collect();
+    let mut fields: Vec<&str> = h.fields.keys().collect();
     fields.sort_unstable();
     assert_eq!(fields, ["a", "b", "gone"]);
     assert_eq!(&h.fields["a"][..], b"1");

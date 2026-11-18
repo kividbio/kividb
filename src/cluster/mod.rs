@@ -489,6 +489,7 @@ impl ClusterState {
                 fail_since_ms: 0,
                 hostname: String::new(),
                 announced_client_port: 0,
+                shard_id: generate_node_id(),
             },
         );
         Self::build(
@@ -945,6 +946,48 @@ impl ClusterState {
         };
         if changed {
             self.save_soon();
+        }
+    }
+
+    /// This node's shard id (`CLUSTER MYSHARDID`).
+    pub fn my_shard_id(&self) -> NodeId {
+        self.nodes
+            .read()
+            .get(&self.myself())
+            .map(|me| me.shard_id)
+            .unwrap_or_else(|| self.myself())
+    }
+
+    /// What a heartbeat from `sender` says of its shard, `said` (`None` from
+    /// a node of an earlier version), taken in as Redis's `updateShardId`
+    /// does (#563): a master's own word is its shard's, so its replicas take
+    /// it too, this node among them if it is one; a replica is in its
+    /// master's shard, whatever it says. Nothing else changes a shard id:
+    /// a replica that is promoted keeps the one it had, its master's, so the
+    /// shard keeps its id across a failover. The caller saves.
+    pub fn take_shard_id(&self, sender: NodeId, said: Option<NodeId>) {
+        let mut nodes = self.nodes.write();
+        let Some(master_id) = nodes.get(&sender).map(|n| n.master_id) else {
+            return;
+        };
+        match master_id {
+            Some(master) => {
+                if let Some(shard) = nodes.get(&master).map(|m| m.shard_id)
+                    && let Some(node) = nodes.get_mut(&sender)
+                {
+                    node.shard_id = shard;
+                }
+            }
+            None => {
+                let Some(shard) = said else {
+                    return;
+                };
+                for node in nodes.values_mut() {
+                    if node.id == sender || node.master_id == Some(sender) {
+                        node.shard_id = shard;
+                    }
+                }
+            }
         }
     }
 
@@ -1882,10 +1925,16 @@ impl ClusterState {
             else {
                 return;
             };
+            let shard = nodes.get(&new_master).map(|m| m.shard_id);
             if let Some(my_node) = nodes.get_mut(&me) {
                 my_node.flags.remove(NodeFlags::MASTER);
                 my_node.flags |= NodeFlags::REPLICA;
                 my_node.master_id = Some(new_master);
+                // Into the new master's shard. It is this node's own when the
+                // shard failed over away from it.
+                if let Some(shard) = shard {
+                    my_node.shard_id = shard;
+                }
             }
             addr
         };
@@ -2279,6 +2328,15 @@ impl ClusterState {
             me.flags.remove(NodeFlags::MASTER);
             me.flags |= NodeFlags::REPLICA;
             me.master_id = Some(master_id);
+        }
+        // Into its master's shard, as Redis's `clusterSetMaster` puts it.
+        {
+            let mut nodes = self.nodes.write();
+            if let Some(shard) = nodes.get(&master_id).map(|m| m.shard_id)
+                && let Some(me) = nodes.get_mut(&self.myself())
+            {
+                me.shard_id = shard;
+            }
         }
 
         Ok((master_ip, master_port))
@@ -3213,6 +3271,8 @@ impl ClusterState {
             if let Some(mut me) = nodes.remove(&*myself) {
                 me.id = new_id;
                 me.config_epoch = 0;
+                // A new shard too, as Redis's hard reset makes one.
+                me.shard_id = generate_node_id();
                 nodes.insert(new_id, me);
             }
             *myself = new_id;
@@ -3329,6 +3389,57 @@ mod tests {
 
     fn set_flag(cs: &ClusterState, id: NodeId, flag: NodeFlags) {
         cs.nodes.write().get_mut(&id).unwrap().flags |= flag;
+    }
+
+    fn shard_of(cs: &ClusterState, id: NodeId) -> NodeId {
+        cs.nodes.read()[&id].shard_id
+    }
+
+    /// A master's word on its shard id is its shard's: its replicas take it,
+    /// this node among them. A replica's is not taken: it is in its master's.
+    /// A node of an earlier version says none, and changes nothing (#563).
+    #[test]
+    fn a_shard_takes_its_masters_id() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let master = add_master(&cs, 0..=99);
+        let other = add_replica(&cs, master);
+        cs.set_replica_of(master).unwrap();
+        assert_eq!(
+            cs.my_shard_id(),
+            shard_of(&cs, master),
+            "REPLICATE takes it"
+        );
+
+        let said = generate_node_id();
+        cs.take_shard_id(master, Some(said));
+        assert_eq!(shard_of(&cs, master), said);
+        assert_eq!(shard_of(&cs, other), said);
+        assert_eq!(cs.my_shard_id(), said);
+
+        cs.take_shard_id(other, Some(generate_node_id()));
+        assert_eq!(
+            shard_of(&cs, other),
+            said,
+            "a replica's own word is not taken"
+        );
+        cs.take_shard_id(master, None);
+        assert_eq!(shard_of(&cs, master), said, "an earlier version's silence");
+    }
+
+    /// A replica that takes over keeps its shard id, its master's: the shard
+    /// has the same id after the failover. A hard reset makes a new one.
+    #[test]
+    fn a_shard_keeps_its_id_across_a_failover() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let master = add_master(&cs, 0..=99);
+        cs.set_replica_of(master).unwrap();
+        let shard = cs.my_shard_id();
+        cs.promote_self(master, 5);
+        assert_eq!(cs.my_shard_id(), shard);
+        assert_eq!(cs.my_master_id(), None);
+
+        cs.hard_reset();
+        assert_ne!(cs.my_shard_id(), shard);
     }
 
     /// A cluster as seen from a master that owns the first third of the slots,

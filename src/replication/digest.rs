@@ -156,14 +156,14 @@ fn value_digest(h: &mut Xxh3, value: crate::store::ValueRef<'_>) {
             h.update(b"l");
             for item in list.read().iter() {
                 h.update(&(item.len() as u64).to_le_bytes());
-                h.update(item);
+                h.update(&item);
             }
         }
         ValueRef::Hash(hash) => {
             h.update(b"h");
             let mut sum = 0u64;
             for (field, value) in hash.read().iter() {
-                sum = sum.wrapping_add(field_digest(field.as_bytes(), value, None));
+                sum = sum.wrapping_add(field_digest(field.as_bytes(), &value, None));
             }
             h.update(&sum.to_le_bytes());
         }
@@ -181,7 +181,7 @@ fn value_digest(h: &mut Xxh3, value: crate::store::ValueRef<'_>) {
             let mut sum = 0u64;
             for (field, value) in inner.fields.iter() {
                 let at = inner.expiries.get(field).copied();
-                sum = sum.wrapping_add(field_digest(field.as_bytes(), value, at));
+                sum = sum.wrapping_add(field_digest(field.as_bytes(), &value, at));
             }
             h.update(&sum.to_le_bytes());
         }
@@ -372,7 +372,7 @@ mod tests {
             for &i in &order {
                 inner
                     .fields
-                    .insert(format!("f{i}"), Arc::from(format!("v{i}").as_bytes()));
+                    .insert_bytes(&format!("f{i}"), format!("v{i}").as_bytes());
             }
             for &i in &order {
                 if let Some(&(_, at)) = ttls.iter().find(|(f, _)| *f == i) {

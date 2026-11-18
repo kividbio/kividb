@@ -2077,7 +2077,7 @@ enum SortKey {
 /// What SORTBY orders a document by: its field `source`, a number if the
 /// field is NUMERIC, folded to lower case unless the field is UNF.
 fn sort_key_of(fields: &Fields, source: &str, numeric: bool, unf: bool) -> Option<SortKey> {
-    let raw = std::str::from_utf8(fields.get(source)?).ok()?;
+    let raw = std::str::from_utf8(fields.get_bytes(source)?).ok()?;
     if numeric {
         raw.trim().parse::<f64>().ok().map(SortKey::Number)
     } else if unf {
@@ -2567,7 +2567,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                             Some(doc) => crate::vector::json_return_value(doc, stored)
                                 .map(|value| (name.clone(), shown(stored, &value))),
                             None => fields
-                                .get(stored)
+                                .get_bytes(stored)
                                 .map(|value| (name.clone(), shown(stored, value))),
                         }
                     })
@@ -2580,11 +2580,12 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 }
                 (None, None) => {
                     let mut out = extras();
-                    let mut stored: Vec<(&String, &Arc<[u8]>)> = fields.iter().collect();
+                    let mut stored: Vec<(&str, crate::hash_fields::Value<'_>)> =
+                        fields.iter().collect();
                     stored.sort_by(|a, b| a.0.cmp(b.0));
                     for (name, value) in stored {
                         if !hit.extras.iter().any(|(alias, _)| alias == name) {
-                            out.push((name.clone(), shown(name, value)));
+                            out.push((name.to_string(), shown(name, &value)));
                         }
                     }
                     out
@@ -2787,7 +2788,8 @@ fn coordinate(
         // it is dropped.
         let parts: Vec<&'static [u8]> = unsafe { std::mem::transmute(parts) };
         let saved_cmd = std::mem::replace(&mut ctx.cmd, parts);
-        let saved_resp = std::mem::replace(&mut ctx.resp, 2);
+        let saved_resp = ctx.resp;
+        ctx.resp = (saved_resp & crate::commands::ctx::RESP_NO_TOUCH) | 2;
         /// Clears `SHARD` however the search ends: left set by a panic, it
         /// would make every later search on this thread answer as a shard.
         struct NotAShard;
@@ -2964,7 +2966,7 @@ mod tests {
             ];
             let mut inner = HashInner::new();
             for (name, value) in &fields {
-                inner.fields.insert(name.clone(), Arc::clone(value));
+                inner.fields.insert(name, value);
             }
             if key == "d347:b" {
                 inner

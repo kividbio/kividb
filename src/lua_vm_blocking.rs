@@ -70,6 +70,12 @@ pub(crate) struct ClientExecEnv {
     pub tracking_table: crate::tracking::TrackingTable,
     pub peer_addr: String,
     pub client_id: u64,
+    /// The connection's `CLIENT NO-TOUCH` flag when this env was made: a
+    /// script's own commands take it as their client's flag (`Ctx::resp`'s `RESP_NO_TOUCH`).
+    /// A copy, not a borrow: the env outlives the loop local, the flag
+    /// cannot be set from inside a script anyway, and the loop remakes the
+    /// env when the flag changes (#566).
+    pub no_touch: bool,
     pub authenticated_user: String,
 }
 
@@ -121,8 +127,12 @@ impl ClientExecEnv {
             client_registry: &self.client_registry,
             // What the commands a script calls see: Redis runs scripts on
             // RESP2 until `redis.setresp`. The script's reply is written in
-            // `client_resp`.
-            resp: 2,
+            // `client_resp`. The connection's `CLIENT NO-TOUCH` rides along.
+            resp: if self.no_touch {
+                2 | crate::commands::ctx::RESP_NO_TOUCH
+            } else {
+                2
+            },
             acl_store: &self.acl_store,
             acl_log: &self.acl_log,
             slowlog: &self.slowlog,
@@ -171,6 +181,7 @@ impl ClientExecEnv {
         tracking_table: &crate::tracking::TrackingTable,
         peer_addr: &str,
         client_id: u64,
+        no_touch: bool,
         authenticated_user: &str,
     ) -> Self {
         Self {
@@ -198,6 +209,7 @@ impl ClientExecEnv {
             tracking_table: tracking_table.clone(),
             peer_addr: peer_addr.to_string(),
             client_id,
+            no_touch,
             authenticated_user: authenticated_user.to_string(),
         }
     }
@@ -433,17 +445,17 @@ pub(crate) async fn run_lua_vm_blocking(
     if let Some(key) = key
         && FAST_SCRIPTS.read().contains(&key)
     {
-        // A script that will run under its tag's lock (`tag_locks`) runs
+        // A script that will run under its tags' locks (`tag_locks`) runs
         // here and now, beside whatever scripts other threads are running:
         // it has no turn to wait for.
         if crate::tag_locks::enabled()
-            && let Some(tag) = crate::tag_locks::script_tag(cmd)
+            && let Some(tags) = crate::tag_locks::script_tags(cmd)
         {
-            // Its turn among the scripts of its tag is waited for here, by
+            // Its turn among the scripts of its tags is waited for here, by
             // the connection, and not inside the command: while another
             // thread's script runs, this thread serves its other
             // connections — which may be on tags nobody holds.
-            let _turn = crate::tag_locks::script_turn(tag).await;
+            let _turn = crate::tag_locks::script_turn(&tags).await;
             crate::tag_locks::allow_next_script();
             let (resp, sel_out, elapsed_us) = ran_quick(key, sel, || {
                 env.run_execute_borrowed(cmd.to_vec(), sel, aof_enabled, client_resp)
@@ -479,6 +491,7 @@ pub(crate) async fn run_lua_vm_blocking(
                     key,
                 };
                 let (reply, done) = tokio::sync::oneshot::channel();
+                crate::stats::scripts::handed_to_runner();
                 runner().submit(job, reply);
                 done.await
                     .unwrap_or_else(|_| (resp_error("ERR the script could not be run"), sel, 0))
@@ -490,6 +503,10 @@ pub(crate) async fn run_lua_vm_blocking(
 
     let owned = owned();
     let env = env.clone();
+    // Not `FUNCTION LOAD`, which always goes there and is not a script run.
+    if key.is_some() {
+        crate::stats::scripts::offloaded_to_pool();
+    }
     let (resp, sel_out, elapsed_us, ran_us) = tokio::task::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
         let (r, db) = env.run_execute(owned, sel, aof_enabled, client_resp);

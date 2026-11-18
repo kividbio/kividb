@@ -4,7 +4,7 @@ use crate::resp;
 use crate::store;
 use crate::vector;
 use crate::watch::WatchNotifier;
-use commands::ctx::Ctx;
+use commands::ctx::{Ctx, RESP_VERSION, with_no_touch};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -93,7 +93,7 @@ fn socket_says_gone(_fd: Option<i32>) -> bool {
 /// closed, as Redis closes one whose query buffer reaches the limit.
 /// Otherwise a client that kept sending while it waited — in a blocking
 /// command, a pause, `WAIT` — would be read into memory without end.
-fn carried_too_much(carried: &[u8]) -> bool {
+pub(crate) fn carried_too_much(carried: &[u8]) -> bool {
     // Only past a megabyte, the least the limit can be set to, is the
     // setting looked up.
     if carried.len() <= 1 << 20 {
@@ -124,11 +124,15 @@ fn needs_slow_path(cmd0: &[u8]) -> bool {
     let first = cmd0.first().copied().unwrap_or(0) | 0x20;
     if !matches!(
         first,
-        b's' | b'p' | b'm' | b'd' | b'w' | b'u' | b'e' | b'a' | b'h' | b'r'
+        b's' | b'p' | b'm' | b'd' | b'w' | b'u' | b'e' | b'a' | b'h' | b'r' | b'c'
     ) {
         return false;
     }
-    ascii_eq_ignore_case(cmd0, b"SUBSCRIBE")
+    // CLIENT first: none of the rest starts with `c`, so a `c` command
+    // runs just this one compare, and every other command in the set runs
+    // only the one extra.
+    ascii_eq_ignore_case(cmd0, b"CLIENT")
+        || ascii_eq_ignore_case(cmd0, b"SUBSCRIBE")
         || ascii_eq_ignore_case(cmd0, b"PSUBSCRIBE")
         || ascii_eq_ignore_case(cmd0, b"SSUBSCRIBE")
         // The UNSUBSCRIBE family only ever reached the RESP2 subscriber loop
@@ -190,6 +194,7 @@ where
         // A resumed handler parked again — it forgot its resume check. Reply
         // as if the wait timed out rather than looping forever.
         slot.clear_resume();
+        slot.release_count();
         return Err(crate::resp::write::resp_null_array());
     }
 
@@ -221,6 +226,7 @@ where
         // to write to it goes with it.
         combined.clear();
         waiter.interrupted.gone = true;
+        slot.release_count();
         return Err(Vec::new());
     }
     if let Some(subs) = subscriptions {
@@ -234,6 +240,10 @@ where
     if let Some(delay) = crate::commands::blocking::test_park_delay() {
         tokio::time::sleep(delay).await;
     }
+    // Counted as blocked until the dispatch that resumes it has been counted
+    // in `commandstats`: a resumed command that parks again goes on with
+    // the count it has (#896).
+    let mut counted = slot.take_count();
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
     waiter
         .client_registry
@@ -248,6 +258,7 @@ where
         waiter.interrupted.role_changed = true;
         None
     } else {
+        counted.get_or_insert_with(crate::commands::blocking::BlockedCount::enter);
         let waiting = wait.wait();
         tokio::pin!(waiting);
         let mut temp = [0u8; 4096];
@@ -313,6 +324,7 @@ where
     waiter
         .client_registry
         .set_blocked(waiter.client_id, None, false);
+    slot.hold_count(counted);
     // Woken, or unblocked otherwise, at the moment this node became a
     // replica: ended as the sweep ends it.
     if !waiter.interrupted.gone
@@ -455,13 +467,7 @@ fn read_while_writing<'a, R: tokio::io::AsyncRead + Unpin + Send>(
                         if carried_too_much(carried) {
                             return Err(std::io::Error::other("client-query-buffer-limit"));
                         }
-                        limit.owed += n;
-                        if limit.bytes != 0 && limit.owed as u64 >= limit.bytes {
-                            crate::output_limits::note_disconnect(
-                                limit.client_id,
-                                limit.class,
-                                limit.owed as u64,
-                            );
+                        if limit.over_after(n) {
                             return Err(std::io::Error::other("client-output-buffer-limit"));
                         }
                     }
@@ -475,12 +481,13 @@ fn read_while_writing<'a, R: tokio::io::AsyncRead + Unpin + Send>(
     })
 }
 
-/// The hard output limit [`read_while_writing`] holds a client to: Redis
-/// runs what it reads, so a client that sends and never reads has replies
-/// over that limit, and is closed, long before its query buffer reaches
+/// The hard output limit a connection reading ahead (`read_while_writing`
+/// here, and `server_uring`'s) holds a client to: Redis runs what it reads,
+/// so a client that sends and never reads has replies over that limit, and
+/// is closed, long before its query buffer reaches
 /// `client-query-buffer-limit`. Here what is read ahead is not run yet, and
 /// counts against the limit as it is read.
-struct HardLimit {
+pub(crate) struct HardLimit {
     class: crate::output_limits::Class,
     /// `client-output-buffer-limit`'s hard limit for `class`; 0 for none.
     bytes: u64,
@@ -491,7 +498,7 @@ struct HardLimit {
 }
 
 impl HardLimit {
-    fn new(
+    pub(crate) fn new(
         limits: &crate::output_limits::OutputLimits,
         subscribed: bool,
         owed: usize,
@@ -509,6 +516,17 @@ impl HardLimit {
             owed,
             client_id,
         }
+    }
+
+    /// Whether `n` more bytes read ahead take the client to the limit: it is
+    /// then counted as closed for it, and is to be closed.
+    pub(crate) fn over_after(&mut self, n: usize) -> bool {
+        self.owed += n;
+        if self.bytes == 0 || (self.owed as u64) < self.bytes {
+            return false;
+        }
+        crate::output_limits::note_disconnect(self.client_id, self.class, self.owed as u64);
+        true
     }
 }
 
@@ -867,6 +885,10 @@ where
     // per-command null-encoding check doesn't hit the shared client_registry lock
     // on every single command across every worker thread.
     let mut resp_version: u8 = 2;
+    // Its top bit is `CLIENT NO-TOUCH` (`RESP_NO_TOUCH`): it goes into each
+    // command's `Ctx::resp` with the protocol at no cost of its own, and is
+    // read back from `client_registry` only after a `CLIENT` (#566). The
+    // protocol is `resp_version & RESP_VERSION`.
 
     enum ConnectionHandoff {
         Replica {
@@ -1155,9 +1177,13 @@ where
                             + Send
                             + '_,
                     >,
-                > = Box::pin(crate::pause::gate(&cmd, &tx.queue, client_id, || {
-                    until_gone(&mut reader, &mut carried, &mut kill_rx, &activity)
-                }));
+                > = Box::pin(crate::pause::gate(
+                    &cmd,
+                    &tx.queue,
+                    client_id,
+                    blocking_slot.holds_count(),
+                    || until_gone(&mut reader, &mut carried, &mut kill_rx, &activity),
+                ));
                 match gated.await {
                     // See the matching arm in `server_uring`: the gate may
                     // have kept a woken resume waiting, and its client gone.
@@ -1193,7 +1219,7 @@ where
             let slowlog_enabled = slowlog.threshold_us() < u64::MAX;
             // A RESP2 connection with subscriptions may run next to nothing:
             // that is decided on the slow path.
-            let subscriber_only = resp_version == 2 && subscriptions.is_some();
+            let subscriber_only = subscriptions.is_some() && resp_version & RESP_VERSION == 2;
             if authenticated_user.is_some()
                 && !tx.active
                 && !subscriber_only
@@ -1204,12 +1230,14 @@ where
                     // Made once for the connection and kept: it is two dozen shared
                     // handles, each counted up to copy and down to drop, and a script
                     // needs none of them copied to run on this thread. Made again if
-                    // the connection has become another user since.
+                    // the connection has become another user, or flagged
+                    // itself `CLIENT NO-TOUCH`, since (#566).
                     let user_now = authenticated_user.as_deref().unwrap_or("default");
-                    if lua_env
-                        .as_ref()
-                        .is_some_and(|env| env.authenticated_user != user_now)
-                    {
+                    if lua_env.as_ref().is_some_and(|env| {
+                        env.authenticated_user != user_now
+                            || env.no_touch
+                                != (resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0)
+                    }) {
                         lua_env = None;
                     }
                     let env = &*lua_env.get_or_insert_with(|| {
@@ -1238,6 +1266,7 @@ where
                             &tracking_table,
                             &peer_addr,
                             client_id,
+                            resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0,
                             authenticated_user.as_deref().unwrap_or("default"),
                         )
                     });
@@ -1246,7 +1275,7 @@ where
                         &mut selected_db,
                         env,
                         crate::aof::AOF_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
-                        resp_version,
+                        resp_version & RESP_VERSION,
                     )
                     .await;
                     // A script that got past a `CLIENT PAUSE` before it was
@@ -1573,14 +1602,14 @@ where
                 let subs = subscriptions.get_or_insert_with(|| {
                     open_subscriptions(&pubsub, &client_registry, client_id, &writer)
                 });
-                combined.extend_from_slice(&subs.handle(&cmd, resp_version));
+                combined.extend_from_slice(&subs.handle(&cmd, resp_version & RESP_VERSION));
                 if subs.total() == 0 {
                     subscriptions = None;
                 }
                 parse_offset += consumed;
                 continue;
             }
-            if resp_version == 2
+            if resp_version & RESP_VERSION == 2
                 && subscriptions.is_some()
                 && let Some(reply) = crate::pubsub::resp2_subscriber_reply(cmd_name.as_str(), &cmd)
             {
@@ -1788,6 +1817,7 @@ where
                     crate::commands::hash_import::forget_client(client_id);
                     client_registry.update(client_id, |info| {
                         info.no_evict = false;
+                        info.no_touch = false;
                         info.resp = 2;
                         info.name = String::new();
                         info.tracking = false;
@@ -1985,7 +2015,7 @@ where
                             // which breaks WATCH-abort detection for RESP3 clients entirely.
                             if let Some(refusal) = refused {
                                 refusal
-                            } else if resp_version == 3 {
+                            } else if resp_version & RESP_VERSION == 3 {
                                 crate::resp::write::resp_null_resp3()
                             } else {
                                 crate::resp::write::resp_null_array()
@@ -2070,7 +2100,7 @@ where
                                 );
                                 tx.reset();
                                 dirty_flag.store(false, Ordering::Release);
-                                if resp_version == 3 {
+                                if resp_version & RESP_VERSION == 3 {
                                     crate::resp::write::resp_null_resp3()
                                 } else {
                                     crate::resp::write::resp_null_array()
@@ -2078,7 +2108,8 @@ where
                             } else {
                                 // Each SET is a use, and a modification, of its
                                 // key, as the same SET is outside a transaction
-                                // (it went unrecorded here).
+                                // (it went unrecorded here) — a `NO-TOUCH`
+                                // client's too: writes count as uses (#566).
                                 let _access = crate::eviction::recording().then(|| {
                                     crate::store::AccessScope::open(crate::eviction::write_stamp(
                                         std::time::Instant::now(),
@@ -2205,7 +2236,9 @@ where
                                             &writer,
                                         )
                                     });
-                                    exec_out.extend_from_slice(&subs.handle(&args, resp_version));
+                                    exec_out.extend_from_slice(
+                                        &subs.handle(&args, resp_version & RESP_VERSION),
+                                    );
                                     if subs.total() == 0 {
                                         subscriptions = None;
                                     }
@@ -2385,6 +2418,14 @@ where
                                 }
 
                                 exec_out.extend_from_slice(&resp);
+                                // A queued `CLIENT NO-TOUCH` takes hold with
+                                // the command after it (#566).
+                                if queued_name == "CLIENT" {
+                                    resp_version = with_no_touch(
+                                        resp_version,
+                                        client_registry.get_no_touch(client_id),
+                                    );
+                                }
                             }
 
                             watch_registry.as_ref().unwatch_all(
@@ -2535,6 +2576,14 @@ where
                             let _blocked = (wanted > 0).then(|| {
                                 client_registry.blocked_in(client_id, unblock_tx, timeout_ms > 0)
                             });
+                            // Counted in `blocked_clients` until the command
+                            // has been counted in `commandstats`, after this
+                            // arm (#896).
+                            if wanted > 0 {
+                                blocking_slot.hold_count(Some(
+                                    crate::commands::blocking::BlockedCount::enter(),
+                                ));
+                            }
                             let blocked_at = Instant::now();
                             let waited = tokio::select! {
                                 biased;
@@ -2611,12 +2660,14 @@ where
                             // Made once for the connection and kept: it is two dozen shared
                             // handles, each counted up to copy and down to drop, and a script
                             // needs none of them copied to run on this thread. Made again if
-                            // the connection has become another user since.
+                            // the connection has become another user, or
+                            // flagged itself `CLIENT NO-TOUCH`, since (#566).
                             let user_now = authenticated_user.as_deref().unwrap_or("default");
-                            if lua_env
-                                .as_ref()
-                                .is_some_and(|env| env.authenticated_user != user_now)
-                            {
+                            if lua_env.as_ref().is_some_and(|env| {
+                                env.authenticated_user != user_now
+                                    || env.no_touch
+                                        != (resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0)
+                            }) {
                                 lua_env = None;
                             }
                             let env = &*lua_env.get_or_insert_with(|| {
@@ -2645,6 +2696,7 @@ where
                                     &tracking_table,
                                     &peer_addr,
                                     client_id,
+                                    resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0,
                                     authenticated_user.as_deref().unwrap_or("default"),
                                 )
                             });
@@ -2653,7 +2705,7 @@ where
                                 &mut selected_db,
                                 env,
                                 crate::aof::AOF_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
-                                resp_version,
+                                resp_version & RESP_VERSION,
                             )
                             .await
                         } else {
@@ -2784,6 +2836,8 @@ where
                     &response,
                     started.elapsed().saturating_sub(waited_for),
                 );
+                // A `WAIT` that was counted as blocked stops being, now it is.
+                blocking_slot.release_count();
             }
             // MONITOR sees a transaction as it ran: `MULTI`, the commands —
             // each shown as it was run — and then `EXEC`.
@@ -2808,6 +2862,14 @@ where
                     &client_registry,
                     client_id,
                 );
+            }
+            // `CLIENT NO-TOUCH` writes the flag in the registry; the loop's
+            // copy — what each command's `Ctx` carries — is read back only
+            // after the command that can change it (#566). A `CLIENT` queued
+            // in a transaction is read back as `EXEC` runs it, above, so an
+            // `EXEC` does not pay for a registry lookup here.
+            if cmd_name == "CLIENT" {
+                resp_version = with_no_touch(resp_version, client_registry.get_no_touch(client_id));
             }
             combined.extend_from_slice(&response);
             parse_offset += consumed;
