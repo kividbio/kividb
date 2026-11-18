@@ -790,7 +790,7 @@ impl ClusterState {
             add();
         }
         self.joining.lock().retain(|n| n.id != id);
-        note_save_outcome(&saved.as_ref().map(|_| ()), &node_id_str(&id));
+        note_save_outcome(&saved.as_ref().map(|_| ()), node_id_str(&id));
         saved.is_ok()
     }
 
