@@ -13,11 +13,17 @@ every suite in the judged tree's suites/ with a passing run:
 - for those suites, a `run-all.sh --min-cpus-only` run (FULL=1, full scale,
   all engines) on a machine with at least N CPUs (Standard_D8s_v5 for 8).
 
-Every counted run needs verdict "ok", no failed gate, no failure, no
-configuration skipped for want of --candidate-full, no suite run below its
-min_cpus, and a candidate commit that is an ancestor of the judged commit
-with src/, Cargo.toml, Cargo.lock and rust-toolchain.toml unchanged since
-(the package version line aside).
+Every counted run is judged again from its raw.tar.gz against the judged
+tree's baseline.json with its compare.py (the committed summary.json is not
+trusted), and needs verdict "ok", no failed gate, no failure, no row without
+a recorded value ("new"), no configuration skipped for want of
+--candidate-full, no suite run below its min_cpus, no override
+(ALLOW_VM_CHANGE, REGRESS_ALLOW_RUSTC), the machine size each covered suite
+was recorded on, and a candidate commit that is an ancestor of the judged
+commit with src/, Cargo.toml, Cargo.lock and rust-toolchain.toml unchanged
+since (the package version line aside) and the suite directory unchanged
+apart from added results/ directories. A suite with no rows in baseline.json
+fails the gate outright.
 """
 import json
 import os
@@ -41,18 +47,55 @@ def suite_of(key):
     return key.split("/", 1)[0]
 
 
-def judge(env, summ, suites, code_reasons=lambda env: []):
+def unrecorded(suites, baseline):
+    """Suites of the tree with no metric in baseline.json: nothing of theirs
+    can be judged (every gate would say "new"), so they cannot count."""
+    have = {suite_of(k) for k in (baseline or {}).get("metrics", {})}
+    return sorted(s for s in suites if s not in have)
+
+
+def rejudge(compare, env, results, baseline):
+    """The run judged again from its own raw files (env.json, results.jsonl)
+    against the judged tree's baseline.json, with the judged tree's
+    compare.py: what the committed summary.json says is not trusted (it may
+    have been edited, or judged against a baseline loosened since)."""
+    smoke = str(env.get("scale", "1")) not in ("1", "1.0")
+    # No override is honoured here (ALLOW_VM_CHANGE, REGRESS_ALLOW_RUSTC):
+    # judge() refuses a run that used one.
+    saved = os.environ.pop("REGRESS_ALLOW_RUSTC", None)
+    try:
+        env_strict = dict(env, rustc_override=False)
+        problems = compare.validity_problems(env_strict, baseline, results, smoke, False)
+        rows, not_run, hf = compare.evaluate(results, baseline, smoke)
+    finally:
+        if saved is not None:
+            os.environ["REGRESS_ALLOW_RUSTC"] = saved
+    problems = problems + hf.get("problems", [])
+    failed = [r["key"] for r in rows if r["status"] == "FAIL"]
+    verdict = "INVALID" if problems else "SMOKE" if smoke else "REGRESSED" if failed else "ok"
+    return {"verdict": verdict, "rows": rows, "not_run": not_run, "problems": problems, "failed": failed}
+
+
+def judge(env, summ, suites, code_reasons=lambda env: [], baseline=None):
     """(reasons this run does not count, the suites it covers if it counts).
 
-    code_reasons(env) gives the candidate-commit reasons (git); the rest is
-    the run's own files."""
+    summ: the run as judged (by rejudge(): the committed summary.json is not
+    trusted). code_reasons(env) gives the candidate-commit reasons (git).
+    baseline: the judged tree's baseline.json, for each covered suite's
+    recorded machine size."""
     why = []
     if summ.get("verdict") != "ok":
         why.append("verdict is %r, not 'ok'" % summ.get("verdict"))
     if summ.get("failed") or summ.get("problems"):
-        why.append("summary lists failed gates or problems")
+        why.append("the run has failed gates or problems: %s" % "; ".join(
+            (summ.get("failed") or []) + (summ.get("problems") or []))[:600])
     if env.get("run_failed") or env.get("failures"):
         why.append("env.json records failures")
+    # Overrides change what a run is judged against; a release run uses none.
+    if env.get("rustc_override"):
+        why.append("run with REGRESS_ALLOW_RUSTC=1 (a candidate built by another rustc than v1.2.2's)")
+    if env.get("allow_vm_change"):
+        why.append("run with ALLOW_VM_CHANGE=1 (on another VM size than the recorded one)")
     skipped = env.get("skipped_configs") or []
     if skipped:
         why.append("configurations skipped (run-all.sh needs --candidate-full <lua,tls build> for them): %s"
@@ -93,6 +136,22 @@ def judge(env, summ, suites, code_reasons=lambda env: []):
         unexplained = sorted(set(suites) - ran - set(needs_more))
         if unexplained:
             why.append("suites not run: %s" % ", ".join(unexplained))
+    # Nothing judged is not a pass: a row with no recorded value ("new").
+    new = sorted(r["key"] for r in summ.get("rows") or [] if r.get("status") == "new" and suite_of(r["key"]) in covers)
+    if new:
+        why.append("rows with no recorded value, so not judged (%s): %s" % (
+            ", ".join(sorted({suite_of(k) for k in new})), ", ".join(new[:8]) + (" ..." if len(new) > 8 else "")))
+    # Each suite on the machine size its baseline was recorded on.
+    if baseline is not None:
+        wrong = {}
+        for k, m in baseline.get("metrics", {}).items():
+            s = suite_of(k)
+            vm = (m.get("recorded") or {}).get("vm")
+            if s in covers and vm and vm != env.get("vm"):
+                wrong.setdefault(s, vm)
+        if wrong:
+            why.append("run on %s, but recorded on another machine size: %s" % (
+                env.get("vm"), ", ".join("%s (%s)" % kv for kv in sorted(wrong.items()))))
     why += code_reasons(env)
     return why, (set() if why else covers & set(suites))
 
@@ -223,22 +282,64 @@ def main(argv):
         if changed:
             return ["code changed since the candidate commit %s: %s" % (
                 c[:12], ", ".join(changed[:6]) + (" ..." if len(changed) > 6 else ""))]
+        # The harness that measured it must be the one released: the suites,
+        # lib/ and baseline.json unchanged; only results/ may be added to.
+        harness = [n for n in git("diff", "--name-only", c, head, "--", base).stdout.split("\n")
+                   if n and not n.startswith(base + "/results/")]
+        if harness:
+            return ["the regression suite changed since the candidate commit %s (only results/ may be added "
+                    "to): %s" % (c[:12], ", ".join(harness[:6]) + (" ..." if len(harness) > 6 else ""))]
         return []
+
+    # The judged tree's own compare.py and baseline.json.
+    import importlib.util
+    import tarfile
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="regression-gate-")
+    src = show(head, base + "/lib/compare.py")
+    raw_baseline = show(head, base + "/baseline.json")
+    if src is None or raw_baseline is None:
+        error("%s/lib/compare.py or baseline.json is missing in %s" % (base, ref))
+        return 1
+    with open(os.path.join(tmp, "compare.py"), "w") as f:
+        f.write(src)
+    spec = importlib.util.spec_from_file_location("gate_compare", os.path.join(tmp, "compare.py"))
+    compare = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(compare)
+    baseline = json.loads(raw_baseline)
+
+    def raw_files(run):
+        """env.json and results.jsonl from the run's raw.tar.gz."""
+        p = subprocess.run(["git", "-C", repo, "show", "%s:%s/results/%s/raw.tar.gz" % (head, base, run)],
+                           capture_output=True)
+        if p.returncode != 0:
+            raise ValueError("raw.tar.gz is missing")
+        path = os.path.join(tmp, run + ".tar.gz")
+        with open(path, "wb") as f:
+            f.write(p.stdout)
+        with tarfile.open(path) as t:
+            env = json.load(t.extractfile("raw/env.json"))
+            lines = t.extractfile("raw/results.jsonl").read().decode()
+        rpath = os.path.join(tmp, run + ".results.jsonl")
+        with open(rpath, "w") as f:
+            f.write(lines)
+        return env, compare.load_results(rpath)
 
     judged, envs = {}, []
     for run in runs:
-        d = "%s/results/%s" % (base, run)
-        raw_env, raw_sum = show(head, d + "/env.json"), show(head, d + "/summary.json")
-        if raw_env is None or raw_sum is None:
-            judged[run] = (["env.json or summary.json is missing"], set())
-            continue
         try:
-            env, summ = json.loads(raw_env), json.loads(raw_sum)
-        except ValueError as e:
-            judged[run] = (["env.json or summary.json is not valid JSON (%s)" % e], set())
+            env, results = raw_files(run)
+        except (ValueError, KeyError, OSError, tarfile.TarError) as e:
+            judged[run] = (["cannot be judged again from its raw.tar.gz (%s)" % e], set())
             continue
         envs.append(env)
-        judged[run] = judge(env, summ, suites, code_reasons)
+        summ = rejudge(compare, env, results, baseline)
+        judged[run] = judge(env, summ, suites, code_reasons, baseline)
+    missing = unrecorded(suites, baseline)
+    if missing:
+        error("%s/baseline.json has no recorded values for: %s. A suite must be recorded (run-all.sh --record "
+              "on the machine it declares) before a release can count it." % (base, ", ".join(missing)))
+        return 1
     used, uncovered = coverage(suites, judged)
     if not uncovered:
         say("OK: %s together cover every suite (candidate commit matches the code being released)." % (

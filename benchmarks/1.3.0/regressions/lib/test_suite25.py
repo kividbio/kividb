@@ -91,6 +91,22 @@ class ErrorCheck(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             s25.rate(ctx, "evalsha", ["EVALSHA", "x"])
 
+    def test_a_server_that_does_not_count_errors_is_refused(self):
+        import redis
+
+        class Client:
+            def __init__(self, counts):
+                self.infos = [info(errors=0), info(errors=counts)]
+
+            def info(self, section=None):
+                return self.infos.pop(0)
+
+            def execute_command(self, *a):
+                raise redis.ResponseError("NOSCRIPT")
+        s25.errors_are_counted(Client(1))
+        with self.assertRaisesRegex(RuntimeError, "does not count error replies"):
+            s25.errors_are_counted(Client(0))
+
     def test_the_arguments_are_centrifuges(self):
         args = s25.add_args(100, 100)
         self.assertEqual(args[1:5], ["99", "100", "cf.client.ch", "2592000"])

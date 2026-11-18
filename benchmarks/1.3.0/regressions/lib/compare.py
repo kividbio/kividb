@@ -455,7 +455,10 @@ def validity_problems(env, baseline, results, smoke, allow_vm_change):
     probs += rustc_check(env)[0]
     want = os.environ.get("REGRESS_REDIS_SHA256") or pins.get("redis_sha256")
     got = engines.get("redis", {}).get("sha256")
-    if want and "redis" in selected and got != want:
+    # A Redis built on this machine from the pinned release tarball (CI) has
+    # its own binary hash: then the source's is the pin, the binary's is shown.
+    src_ok = bool(env.get("redis_source_sha256")) and env.get("redis_source_sha256") == pins.get("redis_source_sha256")
+    if want and "redis" in selected and got != want and not src_ok:
         probs.append("redis-server sha256 %s is not the pinned %s (set REGRESS_REDIS_SHA256=<sha> for a "
                      "deliberate Redis change)" % (got, want))
     # Everything that should have come out did: every recorded metric of every

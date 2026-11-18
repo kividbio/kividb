@@ -61,6 +61,26 @@ seconds and nothing is built or published.
    It needs bash and python3 and reads the repository through git. It prints
    why each committed run does not count, or `OK`.
 
+   It does not trust a run's `summary.json`: it judges each run again from
+   its `raw.tar.gz` (`env.json`, `results.jsonl`) with the tagged tree's
+   `lib/compare.py` and `baseline.json`, so an edited summary or a baseline
+   loosened after the run is seen. It refuses a run made with
+   `ALLOW_VM_CHANGE=1` or `REGRESS_ALLOW_RUSTC=1`, a run on another machine
+   size than a covered suite was recorded on, rows with no recorded value
+   (`new`), a suite of the tree with no rows in `baseline.json`, and any
+   change to `benchmarks/X.Y.0/regressions/` since the candidate commit other
+   than added `results/` directories.
+
+   **What it cannot check yet:** that the measured binary is the released
+   one. `env.json` records the candidate's SHA-256, but the gate runs in
+   `release.yml`'s first job (`verify-version`), before anything is built,
+   and the release builds its binaries afresh from the tag in containers
+   (Amazon Linux 2023), so there is no artifact to compare with at that
+   point, and the Actions run's binaries are built on the VM, not taken from
+   the release. The link is the candidate commit (ancestor of the tag, code
+   and harness unchanged since) and the rustc rule; comparing hashes would
+   need the release's build to be the one measured.
+
 The gate counts a run only when its verdict is `ok`, with no failed gate, at
 full scale (no `SCALE`, no `only`), with `FULL=1`, no metric "not run", all suites
 and all three engines, the `scale`, `only`, `engines_selected` and `full` keys

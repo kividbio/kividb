@@ -543,5 +543,71 @@ class MinCpus(unittest.TestCase):
         self.assertEqual((why, covers), (["code changed"], set()))
 
 
+class GateStrict(unittest.TestCase):
+    """What the release gate must not let through (second review of #921)."""
+
+    def baseline(self):
+        b, _ = build([("01-small/c", "x_rps", "req/s", "higher", 1.0, 100.0, 1.0, 100.0)])
+        b["metrics"]["01-small/c/x_rps"]["recorded"]["vm"] = "Standard_D4s_v5"
+        return b
+
+    def env(self, **kw):
+        e = small_env(needs_more_cpus={}, suite_min_cpus={}, suite_seconds={"01-small": 1},
+                      expected=[{"suite": "01-small", "config": "c", "engines": ["v1_2_2", "candidate"]}],
+                      engines_selected=["v1_2_2", "candidate", "redis"])
+        e.update(kw)
+        return e
+
+    def test_an_unrecorded_suite_is_refused(self):
+        self.assertEqual(regression_gate.unrecorded(["01-small", "26-new"], self.baseline()), ["26-new"])
+        self.assertEqual(regression_gate.unrecorded(["01-small"], self.baseline()), [])
+
+    def test_rows_that_are_new_are_refused(self):
+        summ = dict(OK_SUMMARY, rows=[{"key": "01-small/c/x_rps", "status": "new"}])
+        why, covers = regression_gate.judge(self.env(), summ, ["01-small"])
+        self.assertTrue(any("no recorded value" in w and "01-small/c/x_rps" in w for w in why), why)
+        self.assertEqual(covers, set())
+
+    def test_each_override_is_refused(self):
+        for key, text in (("rustc_override", "REGRESS_ALLOW_RUSTC"), ("allow_vm_change", "ALLOW_VM_CHANGE")):
+            why, covers = regression_gate.judge(self.env(**{key: True}), OK_SUMMARY, ["01-small"])
+            self.assertTrue(any(text in w for w in why), (key, why))
+            self.assertEqual(covers, set())
+
+    def test_a_run_on_another_machine_size_is_refused(self):
+        why, _ = regression_gate.judge(self.env(vm="Standard_D8s_v5"), OK_SUMMARY, ["01-small"], baseline=self.baseline())
+        self.assertTrue(any("recorded on another machine size: 01-small (Standard_D4s_v5)" in w for w in why), why)
+        why, covers = regression_gate.judge(self.env(), OK_SUMMARY, ["01-small"], baseline=self.baseline())
+        self.assertEqual((why, covers), ([], {"01-small"}))
+
+    def test_the_run_is_judged_again_not_trusted(self):
+        # A committed summary.json may say ok; the raw results decide.
+        b = self.baseline()
+        _, res = build([("01-small/c", "x_rps", "req/s", "higher", 1.0, 100.0, 1.0, 50.0)])
+        summ = regression_gate.rejudge(compare, self.env(), res, b)
+        self.assertEqual((summ["verdict"], summ["failed"]), ("REGRESSED", ["01-small/c/x_rps"]))
+        why, covers = regression_gate.judge(self.env(), summ, ["01-small"], baseline=b)
+        self.assertTrue(why)
+        self.assertEqual(covers, set())
+        _, res = build([("01-small/c", "x_rps", "req/s", "higher", 1.0, 100.0, 1.0, 100.0)])
+        self.assertEqual(regression_gate.rejudge(compare, self.env(), res, b)["verdict"], "ok")
+
+    def test_rejudging_ignores_the_rustc_override(self):
+        _, res = build([("01-small/c", "x_rps", "req/s", "higher", 1.0, 100.0, 1.0, 100.0)])
+        env = self.env(rustc_override=True, engines={"v1_2_2": {"rustc": "1.100.0"}, "candidate": {"rustc": "1.99.1"}})
+        summ = regression_gate.rejudge(compare, env, res, self.baseline())
+        self.assertEqual(summ["verdict"], "INVALID")
+        self.assertTrue(any("older than" in p for p in summ["problems"]), summ["problems"])
+
+    def test_a_redis_built_from_the_pinned_tarball_is_accepted(self):
+        b = self.baseline()
+        b["pins"] = {"redis_sha256": "image", "redis_source_sha256": "tarball"}
+        env = self.env(engines={"redis": {"sha256": "built-here"}})
+        probs = compare.validity_problems(dict(env, redis_source_sha256="tarball"), b, {"x": {}}, False, False)
+        self.assertFalse(any("redis-server" in p for p in probs), probs)
+        probs = compare.validity_problems(dict(env, redis_source_sha256="other"), b, {"x": {}}, False, False)
+        self.assertTrue(any("redis-server" in p for p in probs), probs)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -58,8 +58,15 @@ binary). publish_8x16_per_s is held to 1.08x FOR NOW: it is the row where
 master is behind v1.2.2 with both built by the same rustc (1.44-1.51M
 against 1.53-1.58M a second in #921, both workers at 100 % CPU, although a
 PUBLISH costs 3,525 instructions on master against 3,778 on v1.2.2 with one
-thread). A separate bisect of that gap against 1.2.2 is under way; tighten
-this row to 1.05x when it is fixed. Redis is shown, not gated.
+thread). The gap is tracked by the fix on branch
+perf/unpipelined-commands-vs-1-2-2; tighten this row to 1.05x in the PR that
+lands it. Redis is shown, not gated.
+
+Before its measured rounds each configuration checks that the error counts
+work on this server: a deliberate error reply (EVALSHA of an unknown script)
+must move them, or the suite fails rather than measure blind. (KiviDB 1.2.2,
+master and Redis 8.10.2 all report total_error_replies and per-command
+failed_calls; this guards against a server that does not.)
 """
 import os
 import socket
@@ -79,8 +86,8 @@ ROUNDS = 3
 WARMUP_S = 2.0
 WINDOW_S = 8.0
 CHANNELS = 1000
-# Temporary: see the docstring. Back to 1.05 once the 8-connection PUBLISH
-# gap against v1.2.2 is fixed.
+# Temporary: tracked by the fix on branch perf/unpipelined-commands-vs-1-2-2;
+# tighten to 1.05 in the PR that lands it.
 PUBLISH_8X16_MAX_X = 1.08
 
 HISTORY_LIST = """local list_key = KEYS[1]
@@ -266,8 +273,25 @@ def expect_len(c, n, after):
         raise RuntimeError("after %s the history list holds %d entries, not %d" % (after, got, n))
 
 
+def errors_are_counted(c):
+    """Refuse to measure on a server whose error counts do not move: send one
+    error reply and see it counted (the error check of rate() relies on it)."""
+    import redis
+    before = c.info("all")
+    try:
+        c.execute_command("EVALSHA", "0" * 40, 0)
+    except redis.ResponseError:
+        pass
+    else:
+        raise RuntimeError("EVALSHA of an unknown script did not fail")
+    if errors_during(before, c.info("all")) < 1:
+        raise RuntimeError("this server does not count error replies (total_error_replies, failed_calls): "
+                           "the suite's error check would see nothing")
+
+
 def run_scripts(ctx):
     c = ctx.client()
+    errors_are_counted(c)
     hist = c.script_load(HISTORY_LIST)
     add = c.script_load(HISTORY_ADD_LIST)
     bench = ["--threads", "2", "-c", "16", "-P", "1", "EVALSHA"]
@@ -290,6 +314,7 @@ def run_scripts(ctx):
 
 def run_publish(ctx):
     c = ctx.client()
+    errors_are_counted(c)
     socks = subscribers(ctx.port, 4)
     rows = {"publish_p16_per_s": [], "publish_8x16_per_s": []}
     channel = "pfx.client.channel__rand_int__"

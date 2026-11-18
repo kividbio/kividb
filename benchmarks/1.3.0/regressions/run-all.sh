@@ -152,7 +152,18 @@ vm_size() {
 # Assigned empty: under set -u an unassigned associative array is "unbound".
 declare -A SECS=() NEEDS_MORE=() BELOW_MIN=() SUITE_MIN=()
 SKIPPED=()
-NPROC=$(nproc)
+# The CPUs this run may use: the affinity count (nproc), capped by a cgroup
+# CPU quota (cpu.max "<quota> <period>", floored). env.json records this one.
+cpus_usable() {
+  local n q p
+  n=$(nproc)
+  if read -r q p < /sys/fs/cgroup/cpu.max 2>/dev/null && [ "$q" != max ] && [ "${p:-0}" -gt 0 ]; then
+    q=$((q / p)); [ "$q" -lt 1 ] && q=1; [ "$q" -lt "$n" ] && n=$q
+  fi
+  echo "$n"
+}
+NPROC=$(cpus_usable)
+export REGRESS_NPROC=$NPROC
 named_in_only() { # suite -> 0 if an --only entry names it
   local w
   for w in ${ONLY//,/ }; do suite_matches "$1" "$w" && return 0; done
@@ -304,7 +315,7 @@ except Exception:
 import redis
 env = {
     "label": label, "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"),
-    "vm": vm, "cpu": cpu, "nproc": os.cpu_count(), "calib_ms": calib, "kernel": platform.release(),
+    "vm": vm, "cpu": cpu, "nproc": int(os.environ.get("REGRESS_NPROC") or os.cpu_count()), "cpu_count": os.cpu_count(), "calib_ms": calib, "kernel": platform.release(),
     "glibc": platform.libc_ver()[1], "python": platform.python_version(), "redis_py": redis.__version__,
     "candidate_commit": commit, "candidate_allocator": alloc, "suite_seconds": json.loads(secs),
     "scale": scale, "full": full, "only": only, "engines_selected": engines.split(","),
@@ -315,6 +326,12 @@ env = {
                              ("v1_2_2_full", b122full), ("candidate_full", bcandfull)) if p},
     "skipped_configs": skipped.split(),
     "rustc_override": os.environ.get("REGRESS_ALLOW_RUSTC", "") not in ("", "0"),
+    # ALLOW_VM_CHANGE=1: judged on another VM size than the recorded one.
+    "allow_vm_change": os.environ.get("ALLOW_VM_CHANGE", "") not in ("", "0"),
+    # Redis built here from its release tarball: the tarball's checked SHA-256
+    # (lib/engines.sh), which is what is pinned for such a build.
+    "redis_source_sha256": (open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(bredis))), "SOURCE_SHA256")).read().strip()
+                            if os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(bredis))), "SOURCE_SHA256")) else None),
     # Suites that declare min_cpus: not run on this smaller machine
     # (needs_more_cpus), run below it because --only named them (not valid
     # for the gate), and what every declaring suite needs.

@@ -57,15 +57,15 @@ CAND_FULL_BIN=$HOME/cand/target-full/release/kividb
 HERE=$HOME/harness/$SUITE_DIR
 [ -x "$HERE/run-all.sh" ] || chmod +x "$HERE/run-all.sh"
 
-echo "=== redis 8.10.2 (built from its tag; the suite's pin names the build on our VM image)"
+echo "=== redis 8.10.2 (built from its release tarball, SHA-256 checked against the pin in lib/engines.sh)"
 export REGRESS_CACHE=$HOME/.cache/kividb-regress
 # shellcheck source=/dev/null
 source "$HERE/lib/engines.sh"
 REDIS_BIN=$(engines_resolve_redis "$REGRESS_CACHE/redis") || exit 1
 export REDIS_SERVER=$REDIS_BIN
-REGRESS_REDIS_SHA256=$(sha256sum "$REDIS_BIN" | cut -d' ' -f1)
-export REGRESS_REDIS_SHA256
-echo "redis-server: $REDIS_BIN sha256 $REGRESS_REDIS_SHA256"
+# Informational: a binary built here differs from the VM image's pinned one;
+# compare.py accepts it because its source tarball matched the pin.
+echo "redis-server: $REDIS_BIN sha256 $(sha256sum "$REDIS_BIN" | cut -d' ' -f1)"
 
 echo "=== suite"
 args=(--candidate "$CAND_BIN" --candidate-full "$CAND_FULL_BIN" --candidate-commit "$CAND_COMMIT" --label "$LABEL")

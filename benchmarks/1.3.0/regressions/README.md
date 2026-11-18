@@ -389,6 +389,22 @@ re-record that hides a regression defeats the suite.
 
 ## Adding a suite
 
+Checklist (the release gate refuses a tree that misses any of these):
+
+- [ ] The suite's number is free (directory and open PRs).
+- [ ] If its load generator is the limit on the `Standard_D4s_v5`, it declares
+      `S = Suite("NN-name", [...], min_cpus=8)`; its README text runs it with
+      `run-all.sh --min-cpus-only`, not `--only NN`.
+- [ ] Its baseline is recorded (`--record`) **on the machine it declares**: a
+      `Standard_D4s_v5` without `min_cpus`, a `Standard_D8s_v5` with
+      `min_cpus=8` (`--min-cpus-only --record`). A suite with no rows in
+      `baseline.json` fails the gate ("no recorded values"), and so does a
+      run whose rows say `new`.
+- [ ] Recorded with a candidate built by the release's rustc (or newer), and
+      without `ALLOW_VM_CHANGE`/`REGRESS_ALLOW_RUSTC`: the gate refuses runs
+      that used either.
+- [ ] Its row in the table above, its gates explained in its docstring.
+
 A suite is `suites/NN-name.py`. `run-all.sh` picks up every file named
 `[0-9][0-9]-*.py`, in order.
 
