@@ -26,7 +26,8 @@
 //! Beyond Redis: a filter is held to size limits (`bloom-max-filter-bytes`
 //! and those of `sketch::bloom`), and a command from a client that would
 //! allocate more than `maxmemory` leaves room for evicts first, under the
-//! policy, and is refused with `OOM` only if that is not enough. A command
+//! policy, before it takes its keys (`sketch::room`), and is refused with
+//! `OOM` only if that is not enough. A command
 //! from a master or the AOF is held to neither `maxmemory` nor
 //! `bloom-max-filter-bytes`, only to the fixed limits, so that a replica or
 //! a replay never drops what the master took.
@@ -378,27 +379,17 @@ fn shape_error(e: ShapeError) -> Vec<u8> {
 }
 
 /// The limits of a write, and room for it under `maxmemory`: for a command
-/// from a client, when there is a limit and what it would allocate
-/// (`bytes`, asked only then) does not fit, keys are evicted first as the
-/// policy allows, as Redis evicts before a command; `OOM` if that is not
-/// enough. Before any lock is taken, as eviction takes them. A command
-/// from a master or the AOF is held to neither `maxmemory` nor
-/// `bloom-max-filter-bytes` ([`Limits::structural`]), nor is a replica, as
-/// no write on one is.
+/// from a client, `OOM` if what it would allocate (`bytes`) does not fit.
+/// The room was made before the command took its keys' order, as Redis
+/// evicts before a command (`sketch::room`): nothing is evicted here.
+/// Before any lock is taken. A command from a master or the AOF is held to
+/// neither `maxmemory` nor `bloom-max-filter-bytes`
+/// ([`Limits::structural`]), nor is a replica, as no write on one is.
 fn limits(ctx: &mut Ctx, bytes: impl FnOnce(&Ctx) -> u64) -> Result<Limits, Vec<u8>> {
-    let from_client = !ctx.apply_replication && !ctx.repl_state.is_slave();
-    let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed) as u64;
-    if from_client && limit != 0 {
-        let bytes = bytes(ctx);
-        if !crate::sketch::room_for(bytes) {
-            let made = limit
-                .checked_sub(bytes)
-                .is_some_and(|room| crate::eviction::make_room(ctx, room as usize, true));
-            if !made {
-                return Err(resp_error(OOM));
-            }
-        }
+    if crate::sketch::room::check(ctx, bytes).is_err() {
+        return Err(resp_error(OOM));
     }
+    let from_client = !ctx.apply_replication && !ctx.repl_state.is_slave();
     Ok(if from_client {
         Limits::client()
     } else {
@@ -511,6 +502,7 @@ fn with_filter_mut<T>(
     missing: impl FnOnce() -> Vec<u8>,
     f: impl FnOnce(&mut BloomChain, bool) -> T,
 ) -> Result<T, Vec<u8>> {
+    debug_assert!(!crate::sketch::room::asking());
     crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let mut map = write_lock!(shard);
@@ -598,6 +590,7 @@ fn reserve(ctx: &mut Ctx) -> Vec<u8> {
         Ok(limits) => limits,
         Err(e) => return e,
     };
+    debug_assert!(!crate::sketch::room::asking());
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
     let mut map = write_lock!(shard);
@@ -1075,6 +1068,7 @@ fn loadchunk(ctx: &mut Ctx) -> Vec<u8> {
         Ok(limits) => limits,
         Err(e) => return e,
     };
+    debug_assert!(!crate::sketch::room::asking());
     crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let mut map = write_lock!(shard);

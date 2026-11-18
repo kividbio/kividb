@@ -223,8 +223,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without `EXPANSION`) goes to replicas and the AOF naming what it took,
   so a replica or a replay with other settings makes the same filter.
   `maxmemory` holds back clients, not a master or the AOF: a client's
-  command that would not fit evicts first under the policy, and gets `OOM`
-  only if that is not enough. `COPY` copies a filter (Redis refuses); a
+  command that would not fit evicts first under the policy, before it
+  takes its key, as every command does, and gets `OOM` only if that is not
+  enough (or if what was made was taken by another command meanwhile).
+  `COPY` copies a filter (Redis refuses); a
   copy, a snapshot and a `DUMP` share the filter's bytes until it is next
   written. As in Redis 8.10, no `BF.*` command sends a keyspace event but
   `new` for a key it made. `MODULE LIST` reports Redis 8's `bf` module,
