@@ -41,6 +41,8 @@ pub async fn handle_replica_connection_uring(
     vset_quant_announced: bool,
     // It sent `REPLCONF capa slot-imports`.
     slot_imports_announced: bool,
+    // It sent `REPLCONF capa kdb-blocks` (#879).
+    kdb_blocks_announced: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tokio::sync::mpsc;
 
@@ -78,6 +80,7 @@ pub async fn handle_replica_connection_uring(
         tx: replica_tx,
         pending_bytes: Arc::clone(&pending_bytes),
         slot_imports: !legacy_sync && repl_state.sends_slot_imports_to(slot_imports_announced),
+        kdb_blocks: !legacy_sync && kdb_blocks_announced,
     };
     let full_sync = match crate::replication::request_continuation(
         &hub_tx,
@@ -3432,6 +3435,9 @@ pub async fn handle_client(
                 let slot_imports_announced = client_registry
                     .get(client_id)
                     .is_some_and(|info| info.replica_slot_imports);
+                let kdb_blocks_announced = client_registry
+                    .get(client_id)
+                    .is_some_and(|info| info.replica_kdb_blocks);
                 // A replica's link from here: `flags=S`, `TYPE replica`, as
                 // Redis lists it (#595). `CLIENT KILL` shuts its socket, as
                 // any client's, which ends the link.
@@ -3450,6 +3456,7 @@ pub async fn handle_client(
                     psync,
                     vset_quant_announced,
                     slot_imports_announced,
+                    kdb_blocks_announced,
                 )
                 .await?;
 

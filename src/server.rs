@@ -3170,6 +3170,9 @@ where
                 let slot_imports_announced = client_registry
                     .get(client_id)
                     .is_some_and(|info| info.replica_slot_imports);
+                let kdb_blocks_announced = client_registry
+                    .get(client_id)
+                    .is_some_and(|info| info.replica_kdb_blocks);
                 // A replica's link from here: `flags=S`, `TYPE replica`, as
                 // Redis lists it (#595).
                 client_registry.update(client_id, |info| {
@@ -3202,6 +3205,7 @@ where
                     psync,
                     vset_quant_announced,
                     slot_imports_announced,
+                    kdb_blocks_announced,
                     kill_rx,
                 )
                 .await?;

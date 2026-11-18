@@ -238,9 +238,10 @@ fn run_backup(handles: Handles, seq: u64, dir: PathBuf, tap: u64) {
     // ── BASE ─────────────────────────────────────────────────────────────
     let base_path = dir.join(base_name(seq));
     // The image is not counted against `maxmemory` while it is written
-    // (#284).
+    // (#284). Compressed as `dump.kdb` is, with `rdbcompression yes` (#879).
+    let compressed = crate::snapshot::blocks::enabled();
     let written = frozen
-        .and_then(|frozen| frozen.into_image())
+        .and_then(|frozen| frozen.into_image_as(compressed))
         .and_then(|(image, _not_counted)| write_durably(&base_path, &image));
     if let Err(e) = written {
         close_tap(&handles.repl_state, tap);

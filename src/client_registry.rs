@@ -615,6 +615,9 @@ pub struct ClientInfo {
     pub replica_vset_quant: Option<bool>,
     /// It sent `REPLCONF capa slot-imports` (#741).
     pub replica_slot_imports: bool,
+    /// It sent `REPLCONF capa kdb-blocks`: it reads a compressed snapshot
+    /// (#879).
+    pub replica_kdb_blocks: bool,
     /// Channels, patterns and shard channels this client is subscribed to.
     pub subscriptions: [usize; 3],
 }
@@ -663,6 +666,7 @@ impl ClientInfo {
             replica_lost_data: 0,
             replica_vset_quant: None,
             replica_slot_imports: false,
+            replica_kdb_blocks: false,
             subscriptions: [0; 3],
         };
         (info, kill_rx)
@@ -1230,6 +1234,7 @@ impl ClientRegistryInner {
                 replica_lost_data: c.replica_lost_data,
                 replica_vset_quant: c.replica_vset_quant,
                 replica_slot_imports: c.replica_slot_imports,
+                replica_kdb_blocks: c.replica_kdb_blocks,
                 subscriptions: c.subscriptions,
             })
             .collect()
@@ -1273,6 +1278,7 @@ impl ClientRegistryInner {
             replica_lost_data: c.replica_lost_data,
             replica_vset_quant: c.replica_vset_quant,
             replica_slot_imports: c.replica_slot_imports,
+            replica_kdb_blocks: c.replica_kdb_blocks,
             subscriptions: c.subscriptions,
         })
     }

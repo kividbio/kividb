@@ -395,8 +395,13 @@ fn a_snapshot_never_holds_half_a_transaction() {
 /// nothing after — with no write counted twice and none half-applied.
 #[test]
 fn a_backup_taken_under_load_restores_to_the_seal_boundary() {
-    for aof in [false, true] {
-        let source = Server::start(if aof { &["--aof"] } else { &[] });
+    // And with the BASE written compressed (`rdbcompression yes`, #879).
+    for (aof, compression) in [(false, "no"), (true, "no"), (false, "yes"), (true, "yes")] {
+        let mut args = vec!["--rdbcompression", compression];
+        if aof {
+            args.push("--aof");
+        }
+        let source = Server::start(&args);
         let mut c = source.conn();
 
         for i in 0..500 {
@@ -468,6 +473,15 @@ fn a_backup_taken_under_load_restores_to_the_seal_boundary() {
             "{listed:?}"
         );
         let base_len = base.metadata().unwrap().len();
+        let magic: &[u8] = if compression == "yes" {
+            b"KIVIDBZ1"
+        } else {
+            b"KIVIDB01"
+        };
+        assert!(
+            std::fs::read(base).unwrap().starts_with(magic),
+            "{compression}"
+        );
 
         c.cmd(&["SET", "during", "window"]);
         c.cmd(&["DEL", "k:0"]);

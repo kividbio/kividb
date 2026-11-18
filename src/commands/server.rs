@@ -1440,6 +1440,22 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             },
             // What the latency monitor records (#158): remembered too, for
             // `CONFIG GET`.
+            // Whether snapshots are written compressed (#879): `dump.kdb`,
+            // the AOF's base, a backup's base, and a full sync to a replica
+            // that reads them.
+            "rdbcompression" => match value.to_ascii_lowercase().as_str() {
+                yes_no @ ("yes" | "no") => {
+                    crate::snapshot::blocks::set_enabled(yes_no == "yes");
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), yes_no.to_string());
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'rdbcompression') - \
+                     argument must be 'yes' or 'no'",
+                )),
+            },
             // Whether a reply to a write waits for its AOF record (#147).
             "aof-ack-after-write" => match value.to_ascii_lowercase().as_str() {
                 "yes" | "no" => {
@@ -2093,6 +2109,7 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             ("latency-monitor-threshold", "0"),
             ("ts-duplicate-policy", "last"),
             ("aof-ack-after-write", "yes"),
+            ("rdbcompression", "no"),
         ]
         .into_iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))
@@ -5201,6 +5218,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
                 ));
                 out.push_str("rdb_last_cow_size:0\r\n");
+                // The last snapshot written to disk (#879): the bytes of its
+                // image, and the bytes on disk, fewer with `rdbcompression
+                // yes`. 0 before the first.
+                let (raw_size, stored_size) = crate::snapshot::blocks::last_saved();
+                out.push_str(&format!("rdb_last_save_raw_size:{raw_size}\r\n"));
+                out.push_str(&format!("rdb_last_save_stored_size:{stored_size}\r\n"));
                 out.push_str(&format!(
                     "backup_in_progress:{}\r\n",
                     crate::commands::backup::in_progress() as u8
@@ -5872,6 +5895,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 {
                     ctx.client_registry.update(ctx.client_id, |info| {
                         info.replica_slot_imports = true;
+                    });
+                }
+                if cmd[i].eq_ignore_ascii_case(b"capa")
+                    && cmd[i + 1]
+                        .eq_ignore_ascii_case(crate::replication::KDB_BLOCKS_CAPA.as_bytes())
+                {
+                    ctx.client_registry.update(ctx.client_id, |info| {
+                        info.replica_kdb_blocks = true;
                     });
                 }
                 if cmd[i].eq_ignore_ascii_case(b"capa")
