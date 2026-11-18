@@ -166,6 +166,19 @@ pub fn encode_resp_command<A: AsRef<[u8]>>(cmd: &[A]) -> Vec<u8> {
     out
 }
 
+/// [`encode_resp_command`] appended to `out`: the same bytes.
+pub fn encode_resp_command_into<A: AsRef<[u8]>>(out: &mut Vec<u8>, cmd: &[A]) {
+    let size: usize = cmd.iter().map(|part| part.as_ref().len() + 16).sum();
+    out.reserve(size + 16);
+    push_header(out, b'*', cmd.len());
+    for part in cmd {
+        let part = part.as_ref();
+        push_header(out, b'$', part.len());
+        out.extend_from_slice(part);
+        out.extend_from_slice(b"\r\n");
+    }
+}
+
 pub fn resp_null_array() -> Vec<u8> {
     b"*-1\r\n".to_vec()
 }

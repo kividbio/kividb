@@ -3384,7 +3384,7 @@ mod replica_loading_gate_tests {
         let store = crate::store::new_store(1);
         let lastsave = Arc::new(RwLock::new(0i64));
         let (hub_tx, mut hub_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::replication::HubMsg>();
+            crate::replication::HubTx::channel();
         tokio::spawn(async move { while hub_rx.recv().await.is_some() {} });
 
         let config = Arc::new(Config::default_replica());

@@ -281,7 +281,7 @@ pub struct ReplState {
     /// The hub, for what is not a client's write: a replica's record of the
     /// stream it reads, and a promotion's restart of the backlog. Weak, so
     /// that the hub still ends when every real sender is gone.
-    hub: std::sync::OnceLock<mpsc::WeakUnboundedSender<HubMsg>>,
+    hub: std::sync::OnceLock<WeakHubTx>,
     /// Replica side, in a cluster: the node whose stream `resync_point` is
     /// a position in — the master this node followed when its dataset last
     /// became a copy of a master's. `None` when not known.
@@ -2245,6 +2245,9 @@ pub enum HubMsg {
         slot_imports: bool,
     },
     Propagate(ReplPayload),
+    /// The writes of the next run (see [`HubTx`]): take it, and they are
+    /// handled as one [`HubMsg::Propagate`].
+    Writes,
     /// Replica side: bytes of the master's stream this node has read and
     /// applied, ending at offset `end`. Kept in the backlog, not forwarded.
     Received {
@@ -2753,7 +2756,176 @@ pub fn next_replica_id() -> u64 {
     NEXT_REPLICA_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-pub type HubTx = mpsc::UnboundedSender<HubMsg>;
+/// The hub's inbox, as the rest of the server sends to it: its messages,
+/// and the writes for the stream.
+///
+/// Each write used to be a message of its own: copied into an `Arc` of its
+/// own, queued, and taken off the queue by the hub one at a time. With a
+/// backlog kept, a write paid about 11% of its time for that (#894): the
+/// send, the allocation and the copy, the free. Now a write is appended to
+/// the open *run* of writes, one buffer under one lock, and only the write
+/// that opens a run sends a message ([`HubMsg::Writes`]), which tells the
+/// hub to take that run. The hub takes a run as one piece, which holds
+/// every write appended to it before it was taken.
+///
+/// The order is the queue's as before, message for message. Every other
+/// message is sent under the same lock, and closes the open run first
+/// ([`HubTx::send`]): a write appended after it opens another run, whose
+/// [`HubMsg::Writes`] is queued after it. So a write the queue had ahead of
+/// a message, before, is in a run taken ahead of it now, and one it had
+/// behind is in a run taken behind it. Writes to one key are appended, as
+/// they were sent, holding the key's order (`write_order`), so they are in
+/// the stream in the order they took effect; a write never waits for
+/// another to be sent, and a run is taken as soon as the hub gets to its
+/// message, so no write waits for a later one either.
+#[derive(Clone)]
+pub struct HubTx {
+    tx: mpsc::UnboundedSender<HubMsg>,
+    writes: Arc<WriteRuns>,
+}
+
+/// [`HubTx`] that does not keep the hub alive.
+pub struct WeakHubTx {
+    tx: mpsc::WeakUnboundedSender<HubMsg>,
+    writes: std::sync::Weak<WriteRuns>,
+}
+
+/// The hub's end of the inbox: the messages, and the runs of writes they
+/// refer to.
+pub struct HubRx {
+    rx: mpsc::UnboundedReceiver<HubMsg>,
+    writes: Arc<WriteRuns>,
+}
+
+/// Writes on their way to the hub, in runs (see [`HubTx`]).
+#[derive(Default)]
+struct WriteRuns {
+    queue: parking_lot::Mutex<RunQueue>,
+}
+
+#[derive(Default)]
+struct RunQueue {
+    /// Not yet taken by the hub, oldest first. For each, one
+    /// [`HubMsg::Writes`] has been queued.
+    runs: std::collections::VecDeque<Vec<u8>>,
+    /// The last of `runs` takes the next write.
+    open: bool,
+    /// Runs the hub has emptied, kept to be filled again.
+    spare: Vec<Vec<u8>>,
+}
+
+/// How many emptied runs are kept, and how large each may be: the memory a
+/// hub holds on to when nothing is written.
+const SPARE_RUNS: usize = 2;
+const SPARE_RUN_CAPACITY: usize = 256 * 1024;
+
+impl HubTx {
+    /// An inbox, and its hub's end of it.
+    pub fn channel() -> (HubTx, HubRx) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let writes = Arc::new(WriteRuns::default());
+        (
+            HubTx {
+                tx,
+                writes: Arc::clone(&writes),
+            },
+            HubRx { rx, writes },
+        )
+    }
+
+    /// Queue `msg` behind every write appended before it, and ahead of
+    /// every write appended after it.
+    pub fn send(&self, msg: HubMsg) -> Result<(), mpsc::error::SendError<HubMsg>> {
+        let mut queue = self.writes.queue.lock();
+        queue.open = false;
+        self.tx.send(msg)
+    }
+
+    pub fn downgrade(&self) -> WeakHubTx {
+        WeakHubTx {
+            tx: self.tx.downgrade(),
+            writes: Arc::downgrade(&self.writes),
+        }
+    }
+
+    /// Append a write to the stream: what `write` puts at the end of the
+    /// buffer it is given, which holds the writes appended before it.
+    /// False, with nothing appended, once the hub has gone.
+    #[inline]
+    fn append(&self, write: impl FnOnce(&mut Vec<u8>)) -> bool {
+        let mut queue = self.writes.queue.lock();
+        if !queue.open {
+            // Queued before the run can be filled: the hub cannot take the
+            // run before this lock is let go of.
+            if self.tx.send(HubMsg::Writes).is_err() {
+                return false;
+            }
+            let run = queue.spare.pop().unwrap_or_default();
+            queue.runs.push_back(run);
+            queue.open = true;
+        }
+        write(queue.runs.back_mut().expect("an open run"));
+        true
+    }
+}
+
+impl WeakHubTx {
+    pub fn upgrade(&self) -> Option<HubTx> {
+        Some(HubTx {
+            tx: self.tx.upgrade()?,
+            writes: self.writes.upgrade()?,
+        })
+    }
+}
+
+impl WriteRuns {
+    /// The oldest run, for the [`HubMsg::Writes`] that opened it.
+    fn take(&self) -> Option<Vec<u8>> {
+        let mut queue = self.queue.lock();
+        let run = queue.runs.pop_front();
+        if queue.runs.is_empty() {
+            queue.open = false;
+        }
+        run
+    }
+
+    /// A run the hub is done with, to be filled again.
+    fn give_back(&self, mut run: Vec<u8>) {
+        if run.capacity() > SPARE_RUN_CAPACITY {
+            return;
+        }
+        run.clear();
+        let mut queue = self.queue.lock();
+        if queue.spare.len() < SPARE_RUNS {
+            queue.spare.push(run);
+        }
+    }
+}
+
+impl HubRx {
+    /// The next message, with a run of writes handed over as the
+    /// [`HubMsg::Propagate`] of all of them: for an inbox read by something
+    /// else than the hub (a test).
+    pub fn try_recv(&mut self) -> Result<HubMsg, mpsc::error::TryRecvError> {
+        self.rx.try_recv().map(|msg| self.writes_as_one(msg))
+    }
+
+    /// [`Self::try_recv`], waiting for the next message.
+    pub async fn recv(&mut self) -> Option<HubMsg> {
+        let msg = self.rx.recv().await?;
+        Some(self.writes_as_one(msg))
+    }
+
+    fn writes_as_one(&self, msg: HubMsg) -> HubMsg {
+        match msg {
+            HubMsg::Writes => {
+                let run = self.writes.take().unwrap_or_default();
+                HubMsg::Propagate(Arc::from(run.as_slice()))
+            }
+            other => other,
+        }
+    }
+}
 
 /// Spawn the replication hub task. Returns the sender used to
 /// register replicas and to propagate write commands.
@@ -2778,7 +2950,7 @@ pub type HubTx = mpsc::UnboundedSender<HubMsg>;
 /// them for replicas already attached. The master logs how far each
 /// replica's queue went during its sync.
 pub fn start_hub(state: Arc<ReplState>) -> HubTx {
-    let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubMsg>();
+    let (hub_tx, HubRx { rx: mut hub_rx, writes }) = HubTx::channel();
     let _ = state.hub.set(hub_tx.downgrade());
     // For the heartbeat, which the hub sends to itself. Weak, so that the hub
     // still ends when every real sender is gone.
@@ -2985,7 +3157,26 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     }
                 }
             };
+            // A run of writes (see `HubTx`): into the backlog at once with no
+            // replica attached, without the copy a payload to share is.
+            let msg = match msg {
+                HubMsg::Writes => {
+                    let Some(run) = writes.take() else {
+                        continue;
+                    };
+                    if socket_replicas.is_empty() && channel_replicas.is_empty() {
+                        backlog.push(&run, state.backlog_size.load(Ordering::Relaxed) as usize);
+                        writes.give_back(run);
+                        continue;
+                    }
+                    let payload: ReplPayload = Arc::from(run.as_slice());
+                    writes.give_back(run);
+                    HubMsg::Propagate(payload)
+                }
+                other => other,
+            };
             match msg {
+                HubMsg::Writes => unreachable!("a run is handed on as a Propagate"),
                 HubMsg::AckOffset { replica_id, offset } => {
                     // Only for a replica the hub still has. A replica let go
                     // of for its queue limit can still have an ACK on the
@@ -3903,10 +4094,45 @@ fn wait_for_replicas_until(state: &ReplState, hub_tx: &HubTx, deadline: std::tim
 /// Never drops commits: unbounded hub inbox; channel replicas accumulate backlog until drained.
 #[inline]
 pub fn propagate(hub_tx: &HubTx, raw: Vec<u8>) {
-    let payload: ReplPayload = Arc::from(raw.as_slice());
-    if hub_tx.send(HubMsg::Propagate(payload)).is_err() {
+    append_to_stream(hub_tx, &raw);
+}
+
+/// [`propagate`] of bytes the caller keeps.
+#[inline]
+fn append_to_stream(hub_tx: &HubTx, raw: &[u8]) {
+    if !hub_tx.append(|run| run.extend_from_slice(raw)) {
         log_warn!("Replication: Hub sender closed — replication cannot proceed");
     }
+}
+
+/// [`replicate_one_write`] of a write as most are: by a client of a master
+/// that only ever used database 0, with the stream there, not in a
+/// transaction or a script, for the hub alone (no AOF, no tap). Encoded
+/// straight into the hub's run of writes (see [`HubTx`]), as
+/// [`ReplState::encode_for_stream`] would have encoded it: no buffer of its
+/// own, no copy of it. False, having done nothing, for any other write.
+#[inline]
+fn straight_to_the_hub(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>]) -> bool {
+    let state = ctx.repl_state;
+    if *ctx.selected_db != 0
+        || state.several_databases.load(Ordering::Relaxed)
+        || state.repl_stream_last_db.load(Ordering::Relaxed) != 0
+        || in_group()
+    {
+        return false;
+    }
+    test_delay_of_a_bare_write(parts);
+    let mut len = 0;
+    if !ctx.hub_tx.append(|run| {
+        let at = run.len();
+        crate::resp::write::encode_resp_command_into(run, parts);
+        len = run.len() - at;
+    }) {
+        log_warn!("Replication: Hub sender closed — replication cannot proceed");
+        len = crate::resp::write::encode_resp_command(parts).len();
+    }
+    state.repl_offset.fetch_add(len as u64, Ordering::Relaxed);
+    true
 }
 
 /// One successful write: bump replication offset, fan out to replicas, optional AOF.
@@ -3955,8 +4181,6 @@ pub fn write_is_observed(ctx: &crate::commands::ctx::Ctx<'_>) -> bool {
 }
 
 pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>]) {
-    let payloads: Vec<Vec<u8>> = in_db_for_stream(ctx.repl_state, *ctx.selected_db, parts).0;
-
     // Two cases end at this node's own AOF and go no further:
     //
     // * `apply_replication` — a write handed to us by our master. It must not
@@ -3969,6 +4193,7 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
     let tapped = ctx.repl_state.stream_taps.load(Ordering::Relaxed) > 0;
     let local_aof_only = ctx.apply_replication || ctx.repl_state.is_slave();
     if local_aof_only {
+        let payloads = in_db_for_stream(ctx.repl_state, *ctx.selected_db, parts).0;
         // A replica has no replicas of its own to forward to, but a backup
         // being taken on it reads the same stream.
         if tapped {
@@ -3993,6 +4218,10 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
     if !has_replicas && !ctx.aof_enabled && !tapped {
         return;
     }
+    if has_replicas && !ctx.aof_enabled && !tapped && straight_to_the_hub(ctx, parts) {
+        return;
+    }
+    let payloads = in_db_for_stream(ctx.repl_state, *ctx.selected_db, parts).0;
     // One thread-local read, for a write that is not part of a transaction
     // or a script.
     let grouped = in_group();
@@ -4021,12 +4250,9 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
                 .repl_offset
                 .fetch_add(enc_len, Ordering::Relaxed);
             if has_replicas {
-                let hub_payload = if ctx.aof_enabled {
-                    raw_opt.as_ref().expect("just encoded").clone()
-                } else {
-                    raw_opt.take().expect("just encoded")
-                };
-                propagate(ctx.hub_tx, hub_payload);
+                // Copied into the hub's run of writes: the AOF's record can
+                // be this buffer itself.
+                append_to_stream(ctx.hub_tx, raw_opt.as_ref().expect("just encoded"));
             }
         }
         if ctx.aof_enabled {
@@ -4241,7 +4467,7 @@ pub fn replicate_from_background(
             repl_state.feed_taps(&payload);
         }
         if has_replicas {
-            propagate(hub_tx, payload.clone());
+            append_to_stream(hub_tx, &payload);
         }
         if aof {
             crate::aof::AOF_WRITTEN.fetch_add(payload.len() as u64, Ordering::Relaxed);
