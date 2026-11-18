@@ -65,8 +65,20 @@ pub async fn exchange(
     msg: &BusMessage,
     timeout: Duration,
 ) -> Result<Option<BusMessage>, String> {
+    exchange_waiting(state, addr, msg, timeout, timeout).await
+}
+
+/// [`exchange`], connecting within `timeout` and then waiting up to `wait`
+/// for the reply.
+pub async fn exchange_waiting(
+    state: &ClusterState,
+    addr: &str,
+    msg: &BusMessage,
+    timeout: Duration,
+    wait: Duration,
+) -> Result<Option<BusMessage>, String> {
     let mut sock = connect(state, addr, timeout).await?;
-    match round_trip(state, &mut sock, addr, msg, timeout).await {
+    match round_trip(state, &mut sock, addr, msg, wait).await {
         Answer::Reply(reply) => Ok(Some(*reply)),
         // Closed, or no reply in time.
         Answer::Closed | Answer::TimedOut => Ok(None),
@@ -205,6 +217,9 @@ pub(crate) fn peer_socket_addr(peer_ip: &str) -> std::net::SocketAddr {
         .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
 }
 
+/// How long a MEET waits for its reply.
+const MEET_REPLY_WAIT: Duration = Duration::from_secs(30);
+
 /// Send a MEET to the given peer, await its PONG, and incorporate the
 /// peer into our routing table. This is what CLUSTER MEET fires off.
 pub async fn send_meet(
@@ -230,15 +245,28 @@ pub async fn send_meet(
         }
     };
 
-    match exchange(&state, &addr, &meet, Duration::from_secs(5)).await? {
+    // The reply comes once the peer has saved this node as a member, which
+    // on a busy disk can take seconds (#808).
+    let reply = exchange_waiting(
+        &state,
+        &addr,
+        &meet,
+        Duration::from_secs(5),
+        MEET_REPLY_WAIT,
+    )
+    .await?;
+    match reply {
         Some(reply @ BusMessage::Pong { .. }) => {
             // The answer to our own MEET is the one message from an unknown
-            // node that is taken at its word.
-            crate::cluster::bus::listener::accept_meet_reply(
-                &state,
-                reply,
-                peer_socket_addr(&peer_ip),
-            );
+            // node that is taken at its word. Off the bus's thread: the node
+            // is saved before it is a member (#808).
+            let peer = peer_socket_addr(&peer_ip);
+            let accepting = Arc::clone(&state);
+            tokio::task::spawn_blocking(move || {
+                crate::cluster::bus::listener::accept_meet_reply(&accepting, reply, peer)
+            })
+            .await
+            .map_err(|e| format!("accepting the reply to MEET: {e}"))?;
             state.save_soon();
             Ok(())
         }

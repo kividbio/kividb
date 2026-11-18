@@ -104,6 +104,14 @@ async fn handle_bus_connection(
                                 .await
                                 .map(|m| encode(&m))
                         }
+                        // Answered once the sender is saved as a member, on a
+                        // thread that may wait on the disk (`admit_met_node`).
+                        meet @ BusMessage::Meet { .. } => {
+                            let state = Arc::clone(&state);
+                            tokio::task::spawn_blocking(move || process_message(&state, meet, peer))
+                                .await
+                                .unwrap_or(None)
+                        }
                         other => process_message(&state, other, peer),
                     };
                     buf.drain(0..consumed);
@@ -201,18 +209,30 @@ pub fn process_message(
             // FORGET ban, which exists to stop gossip undoing a removal, not
             // to stop the operator reversing it.
             state.forgotten.write().remove(&sender_id);
-            upsert_node(
-                state,
+            let ip = resolve_ip(sender_ip);
+            let mut node = ClusterNode::new(
                 sender_id,
-                resolve_ip(sender_ip),
+                ip.clone(),
                 sender_client_port,
                 sender_cluster_port,
-                sender_config_epoch,
-                NodeFlags::MASTER,
-                None,
-                true,
             );
-            // Save nodes.conf so the new peer survives restart.
+            node.flags = NodeFlags::MASTER;
+            node.config_epoch = sender_config_epoch;
+            // Saved, so that the new peer survives a restart, before it is
+            // a member, and before it is answered (#808).
+            state.admit_met_node(node, || {
+                upsert_node(
+                    state,
+                    sender_id,
+                    ip,
+                    sender_client_port,
+                    sender_cluster_port,
+                    sender_config_epoch,
+                    NodeFlags::MASTER,
+                    None,
+                    true,
+                )
+            });
             state.save_soon();
 
             // Reply with our own PONG so the peer learns OUR id.
@@ -399,7 +419,9 @@ pub fn process_message(
 }
 
 /// Accept the PONG that answers our own `MEET`: the one case where a message
-/// from a node we do not know yet is taken at its word.
+/// from a node we do not know yet is taken at its word. The node is saved
+/// before it is a member (`ClusterState::admit_met_node`): this blocks on
+/// the disk.
 pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: SocketAddr) {
     if let BusMessage::Pong {
         sender_id,
@@ -422,21 +444,36 @@ pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: Socke
         } else {
             sender_ip
         };
-        apply_heartbeat(
-            state,
+        let mut node = ClusterNode::new(
             sender_id,
-            ip,
+            ip.clone(),
             sender_client_port,
             sender_cluster_port,
-            sender_config_epoch,
-            sender_flags,
-            sender_master_id,
-            sender_hostname,
-            sender_announced_client_port,
-            sender_shard_id,
-            gossip,
-            &slot_claims,
         );
+        node.flags = sender_flags & (NodeFlags::MASTER | NodeFlags::REPLICA);
+        node.master_id = sender_master_id;
+        node.config_epoch = sender_config_epoch;
+        node.hostname = sender_hostname.clone();
+        if let Some(shard_id) = sender_shard_id {
+            node.shard_id = shard_id;
+        }
+        state.admit_met_node(node, || {
+            apply_heartbeat(
+                state,
+                sender_id,
+                ip,
+                sender_client_port,
+                sender_cluster_port,
+                sender_config_epoch,
+                sender_flags,
+                sender_master_id,
+                sender_hostname,
+                sender_announced_client_port,
+                sender_shard_id,
+                gossip,
+                &slot_claims,
+            )
+        });
     }
 }
 

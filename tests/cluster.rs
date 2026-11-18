@@ -1466,6 +1466,438 @@ fn a_cluster_restarted_whole_does_not_fail_anyone_over() {
     assert!(nodes[0].is_master() && !nodes[3].is_master());
 }
 
+// ── Membership across a restart of the whole cluster (#808) ─────────────────
+
+/// How a test stops a node: SIGKILL, or SIGTERM and its shutdown.
+#[derive(Clone, Copy, Debug)]
+enum Stop {
+    Kill,
+    /// SIGTERM; on Windows, which has none, a kill.
+    Term,
+}
+
+/// Stop every node in `nodes` at once, as `how` says, and wait for each to
+/// exit.
+fn stop_all(nodes: &mut [Node], how: Stop) {
+    let mut children: Vec<Child> = nodes.iter_mut().filter_map(|n| n.child.take()).collect();
+    for child in &mut children {
+        match how {
+            Stop::Kill => {
+                let _ = child.kill();
+            }
+            #[cfg(unix)]
+            Stop::Term => unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+            },
+            #[cfg(not(unix))]
+            Stop::Term => {
+                let _ = child.kill();
+            }
+        }
+    }
+    for mut child in children {
+        let _ = child.wait();
+    }
+}
+
+/// `node`'s row for `id` in its `CLUSTER NODES`, split on spaces.
+fn row_of(node: &Node, id: &str) -> Option<Vec<String>> {
+    node.conn()
+        .cmd(&["CLUSTER", "NODES"])
+        .text()
+        .lines()
+        .find(|l| l.starts_with(id))
+        .map(|l| l.split(' ').map(String::from).collect())
+}
+
+/// Whether `node`'s nodes.conf has a line for `id`.
+fn saved_in(node: &Node, id: &str) -> bool {
+    std::fs::read_to_string(node.dir.join("nodes.conf"))
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.starts_with(id))
+}
+
+/// Remove `id`'s line from `node`'s nodes.conf (the node stopped).
+fn unsave(node: &Node, id: &str) {
+    let conf = node.dir.join("nodes.conf");
+    let text: String = std::fs::read_to_string(&conf)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with(id))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&conf, text).unwrap();
+}
+
+/// Three masters with three quarters of the slots, and a fourth node, not
+/// yet met, with the last quarter: the cluster is whole only with it.
+/// Returns the four (the new node last) and the new node's slot range.
+fn three_masters_and_a_newcomer() -> (Vec<Node>, (u16, u16)) {
+    let nodes: Vec<Node> = (0..4).map(|_| Node::start(&[])).collect();
+    for (i, node) in nodes.iter().enumerate() {
+        let (start, end) = (i * 4096, i * 4096 + 4095);
+        let r = node.conn().cmd(&[
+            "CLUSTER",
+            "ADDSLOTSRANGE",
+            &start.to_string(),
+            &end.to_string(),
+        ]);
+        assert!(r.is_ok(), "ADDSLOTSRANGE: {r:?}");
+    }
+    for node in &nodes[1..3] {
+        let r = nodes[0]
+            .conn()
+            .cmd(&["CLUSTER", "MEET", "127.0.0.1", &node.port.to_string()]);
+        assert!(r.is_ok(), "MEET: {r:?}");
+    }
+    wait_until("the three masters to meet", Duration::from_secs(30), || {
+        nodes[..3]
+            .iter()
+            .all(|n| n.cluster_info("cluster_known_nodes") == "3")
+    });
+    (nodes, (12288, 16383))
+}
+
+/// Meet `nodes[3]` from `nodes[0]`, and return as soon as `nodes[0]` shows
+/// it as a member: from then on it has it in its nodes.conf, and so has the
+/// new node `nodes[0]` (#808).
+fn meet_the_newcomer(nodes: &[Node]) -> String {
+    let id = nodes[3].id();
+    let r = nodes[0]
+        .conn()
+        .cmd(&["CLUSTER", "MEET", "127.0.0.1", &nodes[3].port.to_string()]);
+    assert!(r.is_ok(), "MEET: {r:?}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        // A tight loop: the point is to stop the cluster at the first moment
+        // the new node is shown.
+        if row_of(&nodes[0], &id).is_some_and(|row| !row[2].contains("handshake")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node 0 never showed the new node"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(saved_in(&nodes[0], &id), "shown before it was saved");
+    assert!(
+        saved_in(&nodes[3], &nodes[0].id()),
+        "the new node shown before it saved the node that met it"
+    );
+    id
+}
+
+/// Every node in `nodes` knows the new node, the cluster is whole (so the
+/// new node's slots are served), and a key of them is written through it.
+fn assert_newcomer_kept(nodes: &[Node], id: &str, range: (u16, u16)) {
+    let all: Vec<&Node> = nodes.iter().collect();
+    wait_cluster_ok(&all, 4);
+    for node in nodes {
+        let row = row_of(node, id).unwrap_or_else(|| panic!("node {} forgot it", node.port));
+        assert!(row[2].contains("master"), "{row:?}");
+    }
+    let key = key_in(range.0..=range.1, "kept");
+    let moved = nodes[0].conn().cmd(&["SET", &key, "v"]);
+    assert!(
+        moved
+            .err()
+            .is_some_and(|e| e.starts_with("MOVED") && e.ends_with(&format!(":{}", nodes[3].port))),
+        "{moved:?}"
+    );
+    let mut c = nodes[3].conn();
+    assert!(cmd_when_serving(&mut c, &["SET", &key, "v"]).is_ok());
+}
+
+/// A node met just before the whole cluster stops — the moment the node
+/// that met it shows it, before the others have heard of it — is still a
+/// member when the cluster starts again, on every node, and serves its
+/// slots. Before, each node saved a new member on a thread of its own, some
+/// time after it learnt it: a cluster stopped meanwhile came back without
+/// it, and since a node that is not a member cannot join by sending
+/// heartbeats, never learnt it again (#808). Killed, and stopped cleanly.
+#[test]
+fn a_node_met_just_before_the_whole_cluster_stops_is_still_a_member() {
+    for how in [Stop::Kill, Stop::Term] {
+        let (mut nodes, range) = three_masters_and_a_newcomer();
+        let id = meet_the_newcomer(&nodes);
+        stop_all(&mut nodes, how);
+        // Started the other way round: the new node first, and the one that
+        // met it last.
+        for node in nodes.iter_mut().rev() {
+            node.spawn();
+        }
+        assert_newcomer_kept(&nodes, &id, range);
+    }
+}
+
+/// A member only one other node has in its nodes.conf — the cluster stopped
+/// before the others had saved it — is learnt again by them all from that
+/// one, by gossip, after a restart; the member, which has only that node in
+/// its own nodes.conf, learns the others the same way, from the address it
+/// has kept. Either can be the one: the node that met it, or another.
+#[test]
+fn a_member_one_node_remembers_is_learnt_again_by_all_after_a_restart() {
+    for keeper in [0, 2] {
+        let (mut nodes, range) = three_masters_and_a_newcomer();
+        let id = meet_the_newcomer(&nodes);
+        wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 4);
+        for node in &nodes[..3] {
+            wait_until("every master to save it", Duration::from_secs(15), || {
+                saved_in(node, &id)
+            });
+        }
+        wait_until(
+            "the new node to save every master",
+            Duration::from_secs(15),
+            || nodes[..3].iter().all(|n| saved_in(&nodes[3], &n.id())),
+        );
+        let ids: Vec<String> = nodes[..3].iter().map(Node::id).collect();
+        stop_all(&mut nodes, Stop::Kill);
+        // As if stopped before the others had saved it, and before it had
+        // saved them.
+        for (i, node) in nodes[..3].iter().enumerate() {
+            if i != keeper {
+                unsave(node, &id);
+            }
+        }
+        for (i, other) in ids.iter().enumerate() {
+            if i != keeper {
+                unsave(&nodes[3], other);
+            }
+        }
+        for node in nodes.iter_mut() {
+            node.spawn();
+        }
+        assert_newcomer_kept(&nodes, &id, range);
+    }
+}
+
+/// The rule that keeps a stranger out stands: a node no member has in its
+/// nodes.conf does not get back in by heartbeats, however well it knows the
+/// cluster (it has every member in its own nodes.conf, and was one). Only a
+/// `CLUSTER MEET` brings it back.
+#[test]
+fn a_node_no_member_remembers_needs_a_new_meet() {
+    let (mut nodes, range) = three_masters_and_a_newcomer();
+    let id = meet_the_newcomer(&nodes);
+    wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 4);
+    for node in &nodes[..3] {
+        wait_until("every master to save it", Duration::from_secs(15), || {
+            saved_in(node, &id)
+        });
+    }
+    stop_all(&mut nodes, Stop::Kill);
+    for node in &nodes[..3] {
+        unsave(node, &id);
+    }
+    for node in nodes.iter_mut() {
+        node.spawn();
+    }
+    // Several heartbeats, and gossip rounds, of it calling on them.
+    std::thread::sleep(Duration::from_millis(3 * NODE_TIMEOUT_MS));
+    for node in &nodes[..3] {
+        assert!(row_of(node, &id).is_none(), "node {} let it in", node.port);
+        assert_eq!(node.cluster_info("cluster_known_nodes"), "3");
+        assert_eq!(node.cluster_info("cluster_state"), "fail");
+    }
+    let r = nodes[0]
+        .conn()
+        .cmd(&["CLUSTER", "MEET", "127.0.0.1", &nodes[3].port.to_string()]);
+    assert!(r.is_ok(), "MEET: {r:?}");
+    assert_newcomer_kept(&nodes, &id, range);
+}
+
+/// nodes.conf is replaced whole or not at all: killed between writing the
+/// new one and putting it in place (the failpoint `nodes-conf-written`,
+/// reached once the new file is written and synced), the node starts again
+/// from the old one, which it finds complete, as the same node, with the
+/// slots it had; the change it never acknowledged is not there, and nor is
+/// the unfinished file.
+#[test]
+fn a_node_killed_while_saving_its_nodes_conf_starts_from_the_old_one() {
+    let mut node = Node::start(&[]);
+    let id = node.id();
+    assert!(
+        node.conn()
+            .cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "99"])
+            .is_ok()
+    );
+    let conf = node.dir.join("nodes.conf");
+    node.kill();
+    let before = std::fs::read_to_string(&conf).unwrap();
+
+    // Started with the failpoint, whose stops at startup are let go.
+    node.env.push((
+        "KIVIDB_TEST_FAILPOINTS".to_string(),
+        "nodes-conf-written".to_string(),
+    ));
+    let releasing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let releaser = {
+        let (dir, releasing) = (node.dir.clone(), std::sync::Arc::clone(&releasing));
+        std::thread::spawn(move || {
+            while releasing.load(std::sync::atomic::Ordering::Relaxed) {
+                for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with("failpoint.nodes-conf-written.") {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    node.spawn();
+    // Long enough for the saves of the start to be made.
+    std::thread::sleep(Duration::from_secs(2));
+    releasing.store(false, std::sync::atomic::Ordering::Relaxed);
+    releaser.join().unwrap();
+    let held = |dir: &std::path::Path| {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("failpoint.nodes-conf-written.")
+            })
+            .is_some()
+    };
+    assert!(!held(&node.dir), "a save of the start still held");
+    let saved = std::fs::read_to_string(&conf).unwrap();
+
+    let port = node.port;
+    let adding = std::thread::spawn(move || {
+        Conn::connect(port).try_cmd(&["CLUSTER", "ADDSLOTSRANGE", "100", "199"])
+    });
+    wait_until(
+        "the save to reach the failpoint",
+        Duration::from_secs(15),
+        || held(&node.dir),
+    );
+    // The new file is written, beside the old one, which is untouched.
+    let temps: Vec<String> = std::fs::read_dir(&node.dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("nodes.conf.tmp"))
+        .collect();
+    assert_eq!(temps.len(), 1, "{temps:?}");
+    let written = std::fs::read_to_string(node.dir.join(&temps[0])).unwrap();
+    assert!(written.contains(" 0-199\n"), "{written}");
+    assert_eq!(std::fs::read_to_string(&conf).unwrap(), saved);
+
+    node.kill();
+    // Never acknowledged.
+    assert!(adding.join().unwrap().is_err());
+    for entry in std::fs::read_dir(&node.dir).unwrap().flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("failpoint.")
+        {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    node.env.clear();
+    node.spawn();
+    assert_eq!(node.id(), id);
+    let row = node.my_row();
+    assert_eq!(row[8..], ["0-99".to_string()], "{row:?}");
+    let left: Vec<String> = std::fs::read_dir(&node.dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("nodes.conf.tmp"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+    assert!(
+        before
+            .lines()
+            .any(|l| l.starts_with(&id) && l.ends_with(" 0-99"))
+    );
+}
+
+/// A nodes.conf that was cut short — empty, or without its last line, the
+/// `vars` line every save ends with — is refused at startup, with the reason,
+/// and left as it is. Read as far as it went, it used to start the node with
+/// nodes and slots missing and its epochs back at 0; empty, as a new node,
+/// with a new id and none of its slots.
+#[test]
+fn a_nodes_conf_cut_short_is_refused_not_read_as_far_as_it_goes() {
+    let mut node = Node::start(&[]);
+    assert!(
+        node.conn()
+            .cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "99"])
+            .is_ok()
+    );
+    let conf = node.dir.join("nodes.conf");
+    node.kill();
+    let whole = std::fs::read_to_string(&conf).unwrap();
+    let vars = whole.find("vars ").expect("a vars line");
+    let cut_in_vars = whole[..vars + 20].to_string();
+    for cut in [String::new(), whole[..vars].to_string(), cut_in_vars] {
+        std::fs::write(&conf, &cut).unwrap();
+        let _ = std::fs::remove_file(node.dir.join("node.log"));
+        let why = node
+            .try_spawn()
+            .expect_err("started on a nodes.conf cut short");
+        assert!(
+            why.contains("is unreadable") && (why.contains("incomplete") || why.contains("empty")),
+            "{why}"
+        );
+        node.kill();
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), cut);
+    }
+    std::fs::write(&conf, &whole).unwrap();
+    node.spawn();
+    assert_eq!(node.my_row()[8..], ["0-99".to_string()]);
+}
+
+/// nodes.conf keeps its format: a file KiviDB 1.2 wrote (`KIVIDB_1_2_BIN`)
+/// loads in this release, as the same node with the same slots and peers,
+/// and one this release wrote loads in 1.2.
+#[test]
+#[ignore = "needs a 1.2 binary in KIVIDB_1_2_BIN"]
+fn nodes_conf_is_read_by_1_2_and_reads_its_files() {
+    let bin = std::env::var("KIVIDB_1_2_BIN").expect("KIVIDB_1_2_BIN");
+    let old = [("KIVIDB_TEST_NODE_BIN", bin.as_str())];
+    let (mut nodes, _) = form_cluster_with_env(2, &old);
+    let version = nodes[0].conn().cmd(&["INFO", "server"]).text();
+    assert!(version.contains("kividb_version:1.2."), "{version}");
+    let ids: Vec<String> = nodes.iter().map(Node::id).collect();
+    for node in &nodes {
+        wait_until("1.2 to save its peer", Duration::from_secs(15), || {
+            ids.iter().all(|id| saved_in(node, id))
+        });
+    }
+    let rows = |node: &Node| {
+        node.conn()
+            .cmd(&["CLUSTER", "NODES"])
+            .text()
+            .lines()
+            .count()
+    };
+    for env in [
+        Vec::new(),
+        old.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    ] {
+        stop_all(&mut nodes, Stop::Kill);
+        for node in nodes.iter_mut() {
+            node.env = env.clone();
+            node.spawn();
+        }
+        wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 2);
+        for (node, id) in nodes.iter().zip(&ids) {
+            assert_eq!(&node.id(), id);
+            assert_eq!(rows(node), 2);
+        }
+    }
+}
+
 /// `cluster-announce-hostname` and `cluster-preferred-endpoint-type`, as in
 /// Redis 7: every node learns every hostname, CLUSTER NODES, SLOTS and
 /// SHARDS show them, and with `hostname` preferred clients are redirected by

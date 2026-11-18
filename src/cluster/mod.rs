@@ -370,6 +370,13 @@ pub struct ClusterState {
     /// unchanged topology is not rewritten. See `persist::save_from_state`.
     pub(crate) save_lock: parking_lot::Mutex<()>,
     pub(crate) last_saved_fingerprint: AtomicU64,
+    /// Saves begun, and the newest of them in place: a save is synced
+    /// without `save_lock`, and is not put in place over a newer one.
+    pub(crate) saves_written: AtomicU64,
+    pub(crate) saves_in_place: AtomicU64,
+    /// Nodes being admitted after a `CLUSTER MEET`, saved with the members
+    /// until they are members: see [`Self::admit_met_node`].
+    pub(crate) joining: parking_lot::Mutex<Vec<ClusterNode>>,
     /// Bus traffic counters for `CLUSTER INFO`.
     pub stats_messages_sent: AtomicU64,
     pub stats_messages_received: AtomicU64,
@@ -441,6 +448,9 @@ impl ClusterState {
             preferred_endpoint: std::sync::atomic::AtomicU8::new(Endpoint::Ip as u8),
             save_lock: parking_lot::Mutex::new(()),
             last_saved_fingerprint: AtomicU64::new(0),
+            saves_written: AtomicU64::new(0),
+            saves_in_place: AtomicU64::new(0),
+            joining: parking_lot::Mutex::new(Vec::new()),
             stats_messages_sent: AtomicU64::new(0),
             stats_messages_received: AtomicU64::new(0),
             stats_bus_connects: AtomicU64::new(0),
@@ -515,6 +525,7 @@ impl ClusterState {
             Some(p) => p,
             None => return Ok(Self::new_enabled(None, node_timeout_ms)),
         };
+        persist::remove_leftover_temps(&path);
 
         match persist::load(&path)? {
             Some(loaded) => Ok(Self::build(
@@ -616,6 +627,7 @@ impl ClusterState {
         if !self.enabled {
             return;
         }
+        let _ = FOR_SHUTDOWN.set(std::sync::Arc::downgrade(self));
         let repl_state = std::sync::Arc::clone(&hooks.replica_starter.repl_state);
         let _ = self.hooks.set(hooks);
         let (asked, taker) = (
@@ -726,6 +738,32 @@ impl ClusterState {
         if spawned.is_ok() {
             let _ = self.background_save.set(tx);
         }
+    }
+
+    /// Make `node`, met by a `CLUSTER MEET` (this node sent it, or was sent
+    /// it), a member with `add`, once nodes.conf has it, synced: a node met
+    /// is shown as a member (in `CLUSTER NODES`, without `handshake`) only
+    /// once it is saved. Both ends of a MEET save the other before it is
+    /// shown, and the receiving end before it answers. A cluster stopped
+    /// whole (killed, even) from then on keeps the new node: a node that has
+    /// it in its nodes.conf tells the others of it again. The save used to
+    /// be made on a thread of its own, some time after; on a busy disk a
+    /// node stopped meanwhile came back without it, and when that was every
+    /// node that knew it, the cluster had forgotten it for good: a node that
+    /// is not a member cannot join by sending heartbeats (#808).
+    ///
+    /// Blocks on the disk: not to be called on the bus's thread.
+    pub fn admit_met_node(&self, node: ClusterNode, add: impl FnOnce()) {
+        let id = node.id;
+        self.joining.lock().push(node);
+        if let Err(e) = self.save_to_disk() {
+            log_warn!(
+                "Cluster: could not save the cluster config file with node {}: {e}",
+                node_id_str(&id)
+            );
+        }
+        add();
+        self.joining.lock().retain(|n| n.id != id);
     }
 
     /// Persist current state to disk, if a config path is configured.
@@ -3297,6 +3335,26 @@ pub(crate) const ELECTION_LIFETIME: std::time::Duration = std::time::Duration::f
 pub(crate) const FAILOVER_BEGAN: &str = "a failover of this node began during the migration \
      (CLUSTER FAILOVER on a replica of it, a vote for one, or a FAIL verdict)";
 const FAILOVER_BEGAN_RECENTLY: &str = "a failover of this node began";
+
+/// This process's cluster state, once its bus has started: see
+/// [`save_at_shutdown`].
+static FOR_SHUTDOWN: std::sync::OnceLock<std::sync::Weak<ClusterState>> =
+    std::sync::OnceLock::new();
+
+/// Save nodes.conf as the node knows the cluster now, at the start of a
+/// shutdown, and wait for it. Every change is saved as it is made, but on a
+/// thread of its own: one still being written when the process exited was
+/// lost with it, and a node that had just joined could be lost with it from
+/// every node of a cluster stopped together (#808). Nothing outside cluster
+/// mode, and nothing is written if nothing has changed since the last save.
+pub fn save_at_shutdown() {
+    let Some(state) = FOR_SHUTDOWN.get().and_then(std::sync::Weak::upgrade) else {
+        return;
+    };
+    if let Err(e) = state.save_to_disk() {
+        log_warn!("Cluster: could not save the cluster config file at shutdown: {e}");
+    }
+}
 
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};

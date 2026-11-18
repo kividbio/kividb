@@ -460,6 +460,54 @@ place, and its directory synced. An output that exists is not replaced
 --force <in> <out>`). The tools start no server and need no shell
 (`["kividb", "kdb-decompress", ...]`).
 
+## The cluster's nodes.conf
+
+In cluster mode a node keeps what it knows of the cluster in
+`cluster-config-file` (`nodes.conf` in `dir`): its own id, every member's id,
+address, hostname, role and shard, who owns which slots, and the epochs. The
+format is Redis's, one line a node and a last `vars` line.
+
+**When it is saved.** On every change of topology: a member learnt or
+forgotten, a role, an address, slots, an epoch, a vote. Changes a command
+makes (`ADDSLOTS`, `REPLICATE`, `FORGET`, `SAVECONFIG`, ...) are saved
+before the command is answered. Changes learnt from the bus are saved on a
+thread of their own as they are learnt, except a node met by `CLUSTER MEET`:
+both ends of the handshake save the other before they show it as a member,
+and the receiving end before it answers. So once the node you sent
+`CLUSTER MEET` to lists the new node in `CLUSTER NODES` without the
+`handshake` flag, both have it on disk. The other members learn it by
+gossip, within a few heartbeats, and save it then. A node also saves the
+file at the start of a shutdown.
+
+**A cluster stopped whole.** A member that at least one node has in its
+`nodes.conf` is a member again after the cluster restarts: that node tells
+the others of it by gossip, and the member, from the addresses in its own
+file, finds the rest. One that no node has (a node killed before it ever
+showed it) is not: a node that is not a member cannot join by sending
+heartbeats. It has to be met again with `CLUSTER MEET`, as in Redis. That
+rule keeps a process that can reach the bus port from making itself a
+member. A tool that adds nodes and then may restart the whole cluster
+(an operator, a script) should wait until the node it sent `CLUSTER MEET` to
+lists the new node without `handshake`; to have every member save it, wait
+until each one lists it, and send each `CLUSTER SAVECONFIG`.
+
+**How it is written.** To a temporary file beside it
+(`nodes.conf.tmp-<n>`), synced, renamed over it, and the directory synced:
+a crash at any moment leaves the old file or the new one, never part of
+one. Temporary files a crash left are removed at startup. The one
+exception is the takeover at the end of a slot migration's handover, which
+does not wait for the sync while client writes are paused: a power failure
+in the moment after it can leave the file incomplete.
+
+**A file cut short is refused.** A `nodes.conf` that does not end with its
+`vars` line, or is empty, stops the node at startup with
+`cluster config file 'nodes.conf' is unreadable: nodes.conf is incomplete
+...`, and the file is left as it is. Read as far as it went, it would leave
+members and slots out and the epochs at 0; empty, the node would start as a
+new one, with a new id and none of its slots. Restore the file from a
+backup; if there is none, remove it and add the node to the cluster again
+as a new one.
+
 ## When a write is acknowledged
 
 With the AOF on, the replies to a batch of commands that wrote are sent once

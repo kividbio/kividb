@@ -767,6 +767,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A node met just before the whole cluster stops is still a member after
+  it starts again (#808).** A node saved a new member to `nodes.conf` on a
+  thread of its own, some time after it learnt it, and the others learnt
+  it by gossip up to a heartbeat later. A cluster stopped meanwhile (a
+  restart of every node, a busy disk making the save slow) could come back
+  with no node that had it, and since a node that is not a member cannot
+  join by sending heartbeats, the cluster never learnt it again: it stayed
+  out of `CLUSTER NODES` and `SHARDS` until it was met again. Now both ends of a `CLUSTER MEET` save the other, synced, before
+  showing it as a member (the receiving end before it answers): once the
+  node that ran `CLUSTER MEET` lists the new node without `handshake`, a
+  cluster stopped whole, even killed, keeps it, and the nodes that had not
+  heard of it yet learn it again by gossip. A node also saves its
+  `nodes.conf` at the start of a shutdown (`SIGTERM`, `SHUTDOWN`), so that
+  a save still being written is not lost with the process. A node still
+  cannot join by heartbeats alone: one no member has in its `nodes.conf`
+  needs a new `CLUSTER MEET`, as in Redis. See
+  [PERSISTENCE.md](docs/PERSISTENCE.md#the-clusters-nodesconf).
+
+- **`nodes.conf` is synced before it replaces the old one, and a file cut
+  short is refused (#808).** A save writes a temporary file beside it
+  (`nodes.conf.tmp-<n>`), syncs it, renames it into place and syncs the
+  directory, so a crash at any moment leaves the old file or the new one;
+  temporary files a crash left are removed at startup. A `nodes.conf` that
+  does not end with its `vars` line, or is empty, is refused at startup
+  with the reason (`... is unreadable: nodes.conf is incomplete ...`) and
+  left as it is, where it was read as far as it went. The format is
+  unchanged: files 1.2 wrote load, and 1.2 loads the files this release
+  writes.
+
 - **Scripts have the Lua 5.1 library functions Redis keeps (#898).**
   `table.getn`, `table.setn`, `table.maxn`, `table.foreach`, `table.foreachi`,
   `math.mod`, `string.gfind` and the global `gcinfo` were missing (scripts run
