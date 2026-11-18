@@ -55,7 +55,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import (Suite, Config, THROUGHPUT, KEEP_IMPROVEMENT, rel, vs_redis, jitter, info, median)  # noqa: E402
 from nodes import Nodes  # noqa: E402
 
-S = Suite("26-ratelimit-restarted", [Config("t2", threads=2, self_hosted=True)])
+S = Suite("27-ratelimit-restarted", [Config("t2", threads=2, self_hosted=True)])
 KEYS = 100_000
 BG_RATES = (0, 50_000, 100_000)
 UNGATED = (100_000,)
@@ -82,7 +82,7 @@ def cpus():
     whose CPUs 0-1 and 2-3 are the two hyper-threads of a core)."""
     have = sorted(os.sched_getaffinity(0))
     if len(have) < 4:
-        raise RuntimeError("26-ratelimit-restarted needs 4 CPUs, this process may use %d" % len(have))
+        raise RuntimeError("27-ratelimit-restarted needs 4 CPUs, this process may use %d" % len(have))
     return [have[0], have[2]], [have[1]], [have[3]]
 
 

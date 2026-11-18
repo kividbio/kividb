@@ -368,7 +368,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   there. A server with no backlog (one
   started empty, as benchmarks start it) is unchanged: 31.7-31.8k checks a
   second at a p99 of 0.07-0.09 ms at every rate. Suite
-  `26-ratelimit-restarted` measures it.
+  `27-ratelimit-restarted` measures it.
 
 - **Pub/sub fan-out delivers 18-29 % more messages a second, ahead of
   Redis (#851).** socket.io's Redis adapter publishes every broadcast with
