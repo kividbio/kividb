@@ -149,7 +149,8 @@ vm_size() {
     curl -fs -m 2 http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo "${VM_SIZE:-unknown}"
 }
 
-declare -A SECS NEEDS_MORE BELOW_MIN SUITE_MIN
+# Assigned empty: under set -u an unassigned associative array is "unbound".
+declare -A SECS=() NEEDS_MORE=() BELOW_MIN=() SUITE_MIN=()
 SKIPPED=()
 NPROC=$(nproc)
 named_in_only() { # suite -> 0 if an --only entry names it
