@@ -19,6 +19,8 @@
 #   ALLOW_VM_CHANGE=1          compare/record on another VM size than recorded
 #   REGRESS_REDIS_SHA256=<sha> accept another redis-server than the pinned one
 #   SCALE=0.01                 smoke run: tiny datasets, gates not checked
+#   REGRESS_ALLOW_RUSTC=1      judge a candidate built by an older (or unreadable)
+#                              rustc than v1.2.2 (otherwise INVALID): a deliberate check
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 export REGRESS_LIB=$here/lib
@@ -37,7 +39,7 @@ while [ $# -gt 0 ]; do
     --engines) ENGINES=$2; shift 2 ;;
     --record) RECORD=--record; shift ;;
     --candidate-commit) CAND_COMMIT=$2; shift 2 ;;
-    -h | --help) sed -n '2,21p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,23p' "$0"; exit 0 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -264,6 +266,7 @@ env = {
                 for k, p in (("v1_2_2", b122), ("candidate", bcand), ("redis", bredis),
                              ("v1_2_2_full", b122full), ("candidate_full", bcandfull)) if p},
     "skipped_configs": skipped.split(),
+    "rustc_override": os.environ.get("REGRESS_ALLOW_RUSTC", "") not in ("", "0"),
 }
 env["run_failed"] = bool(env["failures"])
 json.dump(env, open(out, "w"), indent=1)

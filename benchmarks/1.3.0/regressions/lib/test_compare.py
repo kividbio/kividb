@@ -306,18 +306,116 @@ class Rules(unittest.TestCase):
         self.assertEqual(hf["counts"]["s/c"], 4)
         self.assertIsNotNone([r for r in rows if r["metric"] == "x_pct"][0]["host"])
 
-    def test_a_candidate_built_by_another_rustc_is_flagged(self):
-        env = {"engines": {"v1_2_2": {"rustc": "1.100.0"}, "candidate": {"rustc": "1.99.1"},
-                           "v1_2_2_full": {"rustc": "1.100.0"}, "candidate_full": {"rustc": "1.100.0"},
-                           "redis": {"rustc": None}}}
-        warns = compare.toolchain_warnings(env)
+
+
+def rustc_env(cand, cand_full="1.100.0", ref="1.100.0", **extra):
+    env = {"engines": {"v1_2_2": {"rustc": ref}, "candidate": {"rustc": cand},
+                       "v1_2_2_full": {"rustc": ref}, "candidate_full": {"rustc": cand_full},
+                       "redis": {"rustc": None}},
+           "engines_selected": ["v1_2_2", "candidate", "redis"]}
+    env.update(extra)
+    return env
+
+
+class Rustc(unittest.TestCase):
+    """#900: a candidate built by another rustc than v1.2.2's."""
+
+    def setUp(self):
+        self._saved = os.environ.pop(compare.RUSTC_OVERRIDE, None)
+
+    def tearDown(self):
+        os.environ.pop(compare.RUSTC_OVERRIDE, None)
+        if self._saved is not None:
+            os.environ[compare.RUSTC_OVERRIDE] = self._saved
+
+    def problems(self, env):
+        return compare.validity_problems(env, {"metrics": {}}, {"x": {}}, False, False)
+
+    def test_same_rustc_is_silent(self):
+        probs, warns = compare.rustc_check(rustc_env("1.100.0"))
+        self.assertEqual((probs, warns), ([], []))
+        self.assertFalse(any("rustc" in p for p in self.problems(rustc_env("1.100.0"))))
+
+    def test_an_older_rustc_is_invalid(self):
+        probs, _ = compare.rustc_check(rustc_env("1.99.1"))
+        self.assertEqual(len(probs), 1)
+        self.assertIn("candidate was built by rustc 1.99.1, older than v1_2_2's 1.100.0", probs[0])
+        self.assertTrue(any("older than" in p for p in self.problems(rustc_env("1.99.1"))))
+        # The full pair is judged the same way.
+        probs, _ = compare.rustc_check(rustc_env("1.100.0", cand_full="1.99.1"))
+        self.assertIn("candidate_full", probs[0])
+
+    def test_an_unknown_rustc_is_invalid(self):
+        probs, _ = compare.rustc_check(rustc_env(None))
+        self.assertEqual(len(probs), 1)
+        self.assertIn("candidate was built by rustc unknown", probs[0])
+        probs, _ = compare.rustc_check(rustc_env("garbage"))
+        self.assertEqual(len(probs), 1)
+
+    def test_a_newer_rustc_only_warns(self):
+        probs, warns = compare.rustc_check(rustc_env("1.101.0"))
+        self.assertEqual(probs, [])
         self.assertEqual(len(warns), 1)
-        self.assertIn("candidate was built by rustc 1.99.1", warns[0])
-        env["engines"]["candidate"]["rustc"] = "1.100.0"
-        self.assertEqual(compare.toolchain_warnings(env), [])
-        self.assertEqual(compare.toolchain_warnings({}), [])
-        del env["engines"]["candidate_full"]  # not given: nothing to compare
-        self.assertEqual(compare.toolchain_warnings(env), [])
+        self.assertIn("newer compiler", warns[0])
+        # Compared as numbers, not strings: 1.100 is newer than 1.99.
+        self.assertEqual(compare.rustc_check(rustc_env("1.100.0", ref="1.99.1"))[0], [])
+
+    def test_the_override_turns_invalid_into_a_warning(self):
+        os.environ[compare.RUSTC_OVERRIDE] = "1"
+        probs, warns = compare.rustc_check(rustc_env("1.99.1"))
+        self.assertEqual(probs, [])
+        self.assertTrue(warns and warns[0].startswith("WARN:"))
+        del os.environ[compare.RUSTC_OVERRIDE]
+        # Or recorded in env.json by run-all.sh.
+        probs, warns = compare.rustc_check(rustc_env(None, rustc_override=True))
+        self.assertEqual(probs, [])
+        self.assertEqual(len(warns), 1)
+
+    def test_no_candidate_or_no_full_pair_is_not_judged(self):
+        env = rustc_env("1.99.1", engines_selected=["v1_2_2", "redis"])
+        self.assertEqual(compare.rustc_check(env), ([], []))
+        env = rustc_env("1.100.0")
+        del env["engines"]["candidate_full"]  # --candidate-full not given
+        self.assertEqual(compare.rustc_check(env), ([], []))
+
+    def test_the_rustc_is_recorded(self):
+        b, res = build([("s/c", "x_rps", "req/s", "higher", 1.0, 1.0, 1.0, 1.0)])
+        env = rustc_env("1.100.0", cand_full="1.101.0")
+        compare.record(b, res, env, "lbl", False)
+        rec = b["metrics"]["s/c/x_rps"]["recorded"]
+        self.assertEqual((rec["rustc"], rec["rustc_full"]), ("1.100.0", "1.101.0"))
+        self.assertEqual(b["pins"].get("v1_2_2_full_sha256"), None)  # no sha in this env
+
+
+class SkippedAndNotRun(unittest.TestCase):
+    """A configuration skipped for want of --candidate-full, and recorded
+    metrics that did not run."""
+
+    def test_not_run_lists_recorded_metrics_without_results(self):
+        b, res = build([("s/a", "x_ms", "ms", "lower", 1.0, 1.0, 1.0, 1.0),
+                        ("s/lua", "y_rps", "req/s", "higher", 1.0, 1.0, 1.0, 1.0)])
+        del res["s/lua/y_rps"]
+        rows, not_run, _ = compare.evaluate(res, b)
+        self.assertEqual(not_run, ["s/lua/y_rps"])
+        self.assertEqual([r["key"] for r in rows], ["s/a/x_ms"])
+
+    def test_a_skipped_configuration_is_not_expected_and_is_shown(self):
+        import tempfile
+        b, res = build([("s/a", "x_ms", "ms", "lower", 1.0, 1.0, 1.0, 1.0),
+                        ("s/lua", "y_rps", "req/s", "higher", 1.0, 1.0, 1.0, 1.0)])
+        del res["s/lua/y_rps"]
+        env = {"expected": [{"suite": "s", "config": "a", "engines": ["v1_2_2", "candidate"]}],
+               "engines_selected": ["v1_2_2", "candidate"], "skipped_configs": ["s/lua"]}
+        # Not expected: missing values of the skipped configuration are not INVALID ...
+        self.assertEqual(compare.validity_problems(env, b, res, False, False), [])
+        rows, not_run, hf = compare.evaluate(res, b)
+        with tempfile.TemporaryDirectory() as d:
+            summ = compare.write_summary(d, rows, not_run, env, "lbl", [], False, hf, b)
+            md = open(os.path.join(d, "summary.md")).read()
+        # ... but it is named, and its metrics are "not run" (which the release gate refuses).
+        self.assertIn("skipped (need --candidate-full): s/lua", md)
+        self.assertEqual(summ["not_run"], ["s/lua/y_rps"])
+        self.assertEqual(summ["verdict"], "ok")
 
 
 if __name__ == "__main__":

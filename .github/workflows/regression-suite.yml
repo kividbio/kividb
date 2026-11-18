@@ -133,7 +133,8 @@ jobs:
   run:
     needs: create
     runs-on: ubuntu-latest
-    # Build (fat LTO on 4 vCPUs) + about 13 minutes of suites, 21 with `full`.
+    # Two builds (default and lua,tls; fat LTO on 4 vCPUs) + the suites
+    # (about 13 minutes, 21 with `full`, plus suite 25's scripts).
     timeout-minutes: 180
     env:
       HOST: ${{ needs.create.outputs.host }}

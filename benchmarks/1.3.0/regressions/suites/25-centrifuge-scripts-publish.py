@@ -16,22 +16,28 @@ slower than v1.2.2 on every script row and 28 % slower on Publish_ManyCh at
 PARALLELISM 16. It was not the code: v1.2.2 was the release binary, built by
 rustc 1.100.0, and master was built on the VM image by rustc 1.99.1. Built
 by the same rustc, master was level with or ahead of v1.2.2 on every row
-(the numbers are in the #900 PR). These rows keep it so, and env.json now
-records each binary's rustc (compare.py warns when the candidate's differs).
+(the numbers are in #921). These rows keep it so; env.json records each
+binary's rustc, and compare.py refuses a candidate built by an older one.
 
 The scripts are centrifuge v0.40.1's `broker_history_list.lua` and
-`broker_history_add_list.lua` (MIT, github.com/centrifugal/centrifuge), with
-the arguments its benchmarks pass.
+`broker_history_add_list.lua` (MIT, github.com/centrifugal/centrifuge), sent
+with the arguments its broker sends in BenchmarkRedisHistory_1Ch and
+BenchmarkRedisPublish_History_1Ch (lists, no idempotency key, no delta):
+the meta key's TTL is the node's default HistoryMetaTTL, 30 days
+(2,592,000 s), so both scripts EXPIRE it; the history read asks for every
+entry (right bound -1); a publish keeps 100 entries for 100 s.
 
 Configurations, one server each, KiviDB `--threads 2` (Redis: defaults):
 
   scripts   (lua: v1.2.2's full build and --candidate-full) 16 connections
             of redis-benchmark (--threads 2) call one script on one channel:
-              history_calls_per_s   EVALSHA broker_history_list.lua, 2 keys
-                                    (LRANGE of 4 entries, HMGET, EXPIRE)
+              history_calls_per_s   EVALSHA broker_history_list.lua, 2 keys:
+                                    HMGET meta, EXPIRE meta, LRANGE 0 -1 of
+                                    the 4 entries written first
               add_calls_per_s       EVALSHA broker_history_add_list.lua,
-                                    3 keys (HGET, HINCRBY, EXPIRE, LPUSH,
-                                    LTRIM, EXPIRE, PUBLISH)
+                                    3 keys: HGET meta, HINCRBY meta, EXPIRE
+                                    meta, LPUSH, LTRIM 0 99, EXPIRE list,
+                                    PUBLISH
   publish   4 idle subscribers on other channels; PUBLISH of a 16-byte
             message to one of 1,000 channels:
               publish_p16_per_s     one connection, pipeline 16
@@ -39,16 +45,21 @@ Configurations, one server each, KiviDB `--threads 2` (Redis: defaults):
 
 Every rate is calls a second counted by the server (INFO commandstats) over
 an 8 s window after 2 s of warm-up: the median of 3 rounds, a fresh
-redis-benchmark each round.
+redis-benchmark each round. redis-benchmark does not stop at an error reply
+(a NOSCRIPT or WRONGTYPE storm would count as throughput), so each round
+checks the server's own error counts: `total_error_replies` (INFO stats) and
+the `failed_calls` and `rejected_calls` of every command must not move, and
+after a publish round the history list holds exactly 100 entries (4 after a
+read round). Anything else fails the suite.
 
 Gates: 10 % against the recorded value, and at most 1.05x worse than v1.2.2
 measured in the same session (the rows spread 1-3 % between runs of one
-binary); 1.08x for publish_8x16_per_s. That row is the one where master is
-behind v1.2.2 with both built by the same rustc: 1.44-1.51M against
-1.53-1.58M a second on a D4s_v5 (both workers at 100 % CPU), although a
+binary). publish_8x16_per_s is held to 1.08x FOR NOW: it is the row where
+master is behind v1.2.2 with both built by the same rustc (1.44-1.51M
+against 1.53-1.58M a second in #921, both workers at 100 % CPU, although a
 PUBLISH costs 3,525 instructions on master against 3,778 on v1.2.2 with one
-thread (callgrind, CMP=plain). It is not a per-command cost and is not
-explained yet; the gate keeps it from growing. Redis is shown, not gated.
+thread). A separate bisect of that gap against 1.2.2 is under way; tighten
+this row to 1.05x when it is fixed. Redis is shown, not gated.
 """
 import os
 import socket
@@ -68,6 +79,9 @@ ROUNDS = 3
 WARMUP_S = 2.0
 WINDOW_S = 8.0
 CHANNELS = 1000
+# Temporary: see the docstring. Back to 1.05 once the 8-connection PUBLISH
+# gap against v1.2.2 is fixed.
+PUBLISH_8X16_MAX_X = 1.08
 
 HISTORY_LIST = """local list_key = KEYS[1]
 local meta_key = KEYS[2]
@@ -165,17 +179,54 @@ return { top_offset, current_epoch, "0" }
 """
 
 LIST_KEY, META_KEY = "cf.list.ch", "cf.list.meta.ch"
+# The idempotency result key: named, never touched (result_key_expire is '').
+RESULT_KEY = "cf.result.ch."
 PAYLOAD = '{"bench": true}'
+META_TTL = "2592000"   # centrifuge's default HistoryMetaTTL, 30 days
+EPOCH = "abcd"
+# BenchmarkRedisHistory_1Ch: 4 publishes with HistorySize 4, HistoryTTL 300 s.
+SEED_SIZE, SEED_TTL = 4, 300
+# BenchmarkRedisPublish_History_1Ch: HistorySize 100, HistoryTTL 100 s.
+HISTORY_SIZE, HISTORY_TTL = 100, 100
+
+
+def add_args(size, ttl, payload=PAYLOAD):
+    """broker_history_add_list.lua's ARGV as centrifuge's publish sends them
+    (no idempotency key: result_key_expire ''; no delta: use_delta '';
+    version '0' and version epoch '', which the list script ignores)."""
+    return [payload, str(size - 1), str(ttl), "cf.client.ch", META_TTL, EPOCH, "publish", "", "", "0", ""]
+
+
+def history_args():
+    """broker_history_list.lua's ARGV for History(ch, WithLimit(-1))."""
+    return ["1", "-1", META_TTL, EPOCH]
 
 
 def calls(c, command):
     return c.info("commandstats").get("cmdstat_" + command, {}).get("calls", 0)
 
 
+def error_counts(info_all):
+    """The server's error replies so far: total_error_replies, and the failed
+    and rejected calls of every command. From INFO (all sections, parsed)."""
+    errors = int(info_all.get("total_error_replies", 0) or 0)
+    for k, v in info_all.items():
+        if k.startswith("cmdstat_") and isinstance(v, dict):
+            errors += int(v.get("failed_calls", 0) or 0) + int(v.get("rejected_calls", 0) or 0)
+    return errors
+
+
+def errors_during(before, after):
+    """Error replies between two INFO snapshots; a round must have none."""
+    return error_counts(after) - error_counts(before)
+
+
 def rate(ctx, command, bench_args):
-    """Calls a second of `command` over the window, while redis-benchmark runs."""
+    """Calls a second of `command` over the window, while redis-benchmark runs.
+    Raises if the server sent any error reply during the round."""
     c = ctx.client()
     cmd = [redis_tool("redis-benchmark"), "-p", str(ctx.port), "-q", "-n", "1000000000"] + bench_args
+    before = c.info("all")
     rb = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     try:
         time.sleep(WARMUP_S)
@@ -190,8 +241,10 @@ def rate(ctx, command, bench_args):
         except subprocess.TimeoutExpired:
             rb.kill()
             _, err = rb.communicate()
-    if "ERR" in (err or "") or b <= a:
-        raise RuntimeError("redis-benchmark %s: %s calls; %s" % (" ".join(bench_args[:8]), b - a, (err or "")[-300:]))
+    errors = errors_during(before, c.info("all"))
+    if errors or b <= a:
+        raise RuntimeError("redis-benchmark %s: %d calls, %d error replies; %s" % (
+            " ".join(bench_args[:8]), b - a, errors, (err or "")[-300:]))
     return (b - a) / (t1 - t0)
 
 
@@ -207,24 +260,29 @@ def subscribers(port, n):
     return socks
 
 
+def expect_len(c, n, after):
+    got = c.llen(LIST_KEY)
+    if got != n:
+        raise RuntimeError("after %s the history list holds %d entries, not %d" % (after, got, n))
+
+
 def run_scripts(ctx):
     c = ctx.client()
     hist = c.script_load(HISTORY_LIST)
     add = c.script_load(HISTORY_ADD_LIST)
+    bench = ["--threads", "2", "-c", "16", "-P", "1", "EVALSHA"]
     rows = {"history_calls_per_s": [], "add_calls_per_s": []}
     for _ in range(ROUNDS):
         c.flushall()
-        # Four entries, as BenchmarkRedisHistory_1Ch publishes before it reads.
-        for _ in range(4):
-            c.evalsha(add, 3, LIST_KEY, META_KEY, "", "{}", 3, 300, "", 0, "abcd", "publish", "", 0)
-        rows["history_calls_per_s"].append(rate(ctx, "evalsha", [
-            "--threads", "2", "-c", "16", "-P", "1",
-            "EVALSHA", hist, "2", LIST_KEY, META_KEY, "1", "-1", "0", "abcd"]))
-        # A history of 100, as BenchmarkRedisPublish_History_1Ch keeps.
-        rows["add_calls_per_s"].append(rate(ctx, "evalsha", [
-            "--threads", "2", "-c", "16", "-P", "1",
-            "EVALSHA", add, "3", LIST_KEY, META_KEY, "", PAYLOAD, "99", "100", "cf.client.ch", "0", "abcd",
-            "publish", "", "0"]))
+        for _ in range(SEED_SIZE):
+            c.evalsha(add, 3, LIST_KEY, META_KEY, RESULT_KEY, *add_args(SEED_SIZE, SEED_TTL, "{}"))
+        expect_len(c, SEED_SIZE, "the seed")
+        rows["history_calls_per_s"].append(rate(ctx, "evalsha", bench + [
+            hist, "2", LIST_KEY, META_KEY] + history_args()))
+        expect_len(c, SEED_SIZE, "a read round")
+        rows["add_calls_per_s"].append(rate(ctx, "evalsha", bench + [
+            add, "3", LIST_KEY, META_KEY, RESULT_KEY] + add_args(HISTORY_SIZE, HISTORY_TTL)))
+        expect_len(c, HISTORY_SIZE, "a publish round")
     ctx.raw["samples"] = rows
     for metric, xs in rows.items():
         ctx.emit(metric, median(xs), "calls/s", "higher", gate=[THROUGHPUT, vs_v1_2_2(1.05)], samples=xs)
@@ -247,8 +305,7 @@ def run_publish(ctx):
             s.close()
     ctx.raw["samples"] = rows
     for metric, xs in rows.items():
-        # 8x16: master is 3-6 % under v1.2.2 here, built by the same rustc (see above).
-        limit = 1.08 if metric == "publish_8x16_per_s" else 1.05
+        limit = PUBLISH_8X16_MAX_X if metric == "publish_8x16_per_s" else 1.05
         ctx.emit(metric, median(xs), "calls/s", "higher", gate=[THROUGHPUT, vs_v1_2_2(limit)], samples=xs)
 
 

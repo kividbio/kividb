@@ -18,8 +18,9 @@
 #   - has summary.json verdict "ok" (not REGRESSED, INVALID or SMOKE), no failed
 #     gate and no failure in env.json;
 #   - is a FULL=1, full-scale run of every suite in suites/ and every engine
-#     (no SCALE, no --only, no --engines subset, no metric "not run"), and
-#     env.json has the scale, only, engines_selected and full keys;
+#     (no SCALE, no --only, no --engines subset, no metric "not run", no
+#     configuration skipped for want of --candidate-full), and env.json has
+#     the scale, only, engines_selected and full keys;
 #   - names a candidate commit that exists, is an ancestor of the commit being
 #     judged, and left src/, Cargo.toml, Cargo.lock and rust-toolchain.toml
 #     alone since (the package version line aside: the release bumps it after
@@ -154,8 +155,14 @@ def judge(run):
         why.append("verdict is %r, not 'ok'" % summ.get("verdict"))
     if summ.get("failed") or summ.get("problems"):
         why.append("summary lists failed gates or problems")
+    skipped = env.get("skipped_configs") or []
+    if skipped:
+        why.append("configurations skipped (run-all.sh needs --candidate-full <lua,tls build> for them): %s"
+                   % ", ".join(skipped))
     if summ.get("not_run"):
-        why.append("%d recorded metrics were not run (a run without FULL=1 or with --only)" % len(summ["not_run"]))
+        why.append("%d recorded metrics were not run (%s)" % (
+            len(summ["not_run"]),
+            "the skipped configurations above" if skipped else "a run without FULL=1 or with --only"))
     if env.get("run_failed") or env.get("failures"):
         why.append("env.json records failures")
     # Absent is a refusal, not a default: a run from an older run-all.sh

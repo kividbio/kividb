@@ -42,6 +42,13 @@ echo "=== build candidate ($CAND_COMMIT)"
 CAND_BIN=$HOME/cand/target/release/kividb
 [ -x "$CAND_BIN" ] || { echo "no $CAND_BIN"; exit 1; }
 "$CAND_BIN" --version | head -1
+# The lua,tls build too, for the configurations that need scripts (run-all.sh
+# --candidate-full; without it they are skipped and the release gate refuses
+# the run). Its own target dir: a features change would rebuild in place.
+(cd cand && cargo build --release --locked --features lua,tls --target-dir target-full) || exit 1
+CAND_FULL_BIN=$HOME/cand/target-full/release/kividb
+[ -x "$CAND_FULL_BIN" ] || { echo "no $CAND_FULL_BIN"; exit 1; }
+"$CAND_FULL_BIN" --version | head -1
 
 HERE=$HOME/harness/$SUITE_DIR
 [ -x "$HERE/run-all.sh" ] || chmod +x "$HERE/run-all.sh"
@@ -57,7 +64,7 @@ export REGRESS_REDIS_SHA256
 echo "redis-server: $REDIS_BIN sha256 $REGRESS_REDIS_SHA256"
 
 echo "=== suite"
-args=(--candidate "$CAND_BIN" --candidate-commit "$CAND_COMMIT" --label "$LABEL")
+args=(--candidate "$CAND_BIN" --candidate-full "$CAND_FULL_BIN" --candidate-commit "$CAND_COMMIT" --label "$LABEL")
 [ -n "${ONLY:-}" ] && args+=(--only "$ONLY")
 export FULL=${FULL:-0}
 "$HERE/run-all.sh" "${args[@]}"

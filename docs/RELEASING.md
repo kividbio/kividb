@@ -26,9 +26,10 @@ seconds and nothing is built or published.
    (`v1.3.0-rc4-d4s_v5`), and `only` stays empty. Tick `full` for the long
    configurations: leave it ticked (it is the default), the gate requires a FULL run. The workflow makes one
    `Standard_D4s_v5` (the size `baseline.json` was recorded on), builds the
-   candidate on it, runs `run-all.sh`, uploads `results/<label>/` as an
+   candidate on it (the default build and the `lua,tls` build that suite 25's
+   scripts need, as `--candidate-full`), runs `run-all.sh`, uploads `results/<label>/` as an
    artifact and deletes the machine whatever happens. It fails when
-   `run-all.sh` exits non-zero. It takes a release build on 4 vCPUs (fat LTO, several minutes) plus 13 to
+   `run-all.sh` exits non-zero. It takes two release builds on 4 vCPUs (fat LTO, several minutes each) plus 13 to
    21 minutes of measuring.
 3. Read `summary.md`. The verdict must be `ok`:
    - `REGRESSED`: a gate failed. Either fix the regression (and cut a new
@@ -80,7 +81,9 @@ tolerance), never to make a red run green:
 
 ```bash
 # on a Standard_D4s_v5 with the candidate built, from a clean tree
+cargo build --release --features lua,tls --target-dir target-full
 FULL=1 benchmarks/1.3.0/regressions/run-all.sh --candidate target/release/kividb \
+    --candidate-full target-full/release/kividb \
     --candidate-commit "$(git rev-parse --short HEAD)" --label <label> --record
 ```
 

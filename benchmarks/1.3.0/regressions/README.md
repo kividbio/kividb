@@ -39,8 +39,7 @@ and why.
 | `22-scan-large-count` | #884 | Argo CD's `SCAN <cursor> MATCH revoked-token\|* COUNT 10000` over 40,000 keys of 50 KB that it never matches (`--threads 4`): microseconds a call, client side and the server's own (`INFO commandstats`), calls and keys returned (exactly 0) for a full iteration, and the p99 of four `PING` probes while four other connections loop the same `SCAN` |
 | `23-pubsub-pattern-fanout` | #851 | socket.io's Redis adapter: 48 `redis-benchmark` connections `PUBLISH` 200-byte messages to `socket.io#/#room<n>#`, 16 subscribers `PSUBSCRIBE socket.io#/#*` (`pattern`) or `SUBSCRIBE` one channel (`channel`, the plain fan-out guard): messages delivered a second until every subscriber has all of them, messages lost (exactly 0), and the p99 of a probe's own messages from publish to receipt |
 | `24-snapshot-size` | #879 | `SAVE` of #879's dataset (`DEBUG POPULATE 6000000 k 150`) and of a collections mix (200,000 hashes of 10 fields, 50,000 each of sets, sorted sets and lists of 20), each twice: `-default` (the candidate as it starts, `rdbcompression no`) and `-yes` (the suite sets `CONFIG SET rdbcompression yes` on the candidate): the snapshot's size, the `SAVE` time (median of 3 after a warm-up) and the time a new server takes to load it (best of 2). Gates: `-yes` keeps 60 % of the size gain over v1.2.2 and #879's dataset within 1.5x of Redis's `dump.rdb`; `-default` within 1 % of v1.2.2's size; the save at most 2.5x v1.2.2's time, the load 1.5x |
-
-| `25-centrifuge-scripts-publish` | #900 | centrifuge v0.40.1's history scripts, whose 2-3 keys carry no hash tag (each runs alone, on the script-runner thread): `EVALSHA` of `broker_history_list.lua` and `broker_history_add_list.lua` from 16 connections (`scripts`, the `lua,tls` builds); `PUBLISH` to 1,000 channels nobody subscribes to, beside 4 idle subscribers, from 1 connection and from 8, pipeline 16 (`publish`): calls a second counted by the server. Gates: 10 % and at most 1.05x worse than v1.2.2 in the same session (1.08x for the 8-connection `PUBLISH`, where master is 3-6 % behind v1.2.2 for a reason not yet found, though each `PUBLISH` costs 7 % fewer instructions) |
+| `25-centrifuge-scripts-publish` | #900 | centrifuge v0.40.1's history scripts with the arguments its broker sends (30-day meta TTL), whose 2-3 keys carry no hash tag (each runs alone, on the script-runner thread): `EVALSHA` of `broker_history_list.lua` and `broker_history_add_list.lua` from 16 connections (`scripts`, the `lua,tls` builds); `PUBLISH` to 1,000 channels nobody subscribes to, beside 4 idle subscribers, from 1 connection and from 8, pipeline 16 (`publish`): calls a second counted by the server; a round with any error reply, or a history list of the wrong length, fails the suite. Gates: 10 % and at most 1.05x worse than v1.2.2 in the same session (for now 1.08x for the 8-connection `PUBLISH`, where master is behind v1.2.2 with matching compilers; to go back to 1.05x when that gap is fixed) |
 
 ## Running it
 
@@ -64,8 +63,18 @@ The release workflow builds with the stable Rust of the day (v1.2.2: rustc
 rows 10-13 % and its one-connection `PUBLISH` row 4-7 % slower than built by
 1.100.0, and v1.2.2 built by 1.99.1 was as slow; an earlier comparison of the
 two read that as a regression of master (#900). `env.json` records the rustc
-of every KiviDB binary (from its `.comment` section) and `summary.md` warns
-when the candidate's differs from v1.2.2's.
+of every KiviDB binary (from its `.comment` section), `baseline.json` records
+the candidate's with each value (`recorded.rustc`, `rustc_full`), and
+`compare.py` judges it against v1.2.2's (and the `full` pair's):
+
+- **older** than v1.2.2's, or **unknown** (no `rustc version` in the binary):
+  the run is `INVALID`, because its rows against v1.2.2 compare compilers;
+- **newer**: a `WARN` line only (`rust-toolchain.toml` says `stable`, so a
+  later release is normally built by a newer rustc);
+- `REGRESS_ALLOW_RUSTC=1` turns the `INVALID` cases into warnings, for a
+  deliberate check of the compiler's effect. Run that way in #921, the master
+  `lua,tls` build by rustc 1.99.1 was `REGRESSED` against v1.2.2's on suite 25's
+  script rows by 8-18 % (not kept as a result: it measures the compiler).
 
 | option | |
 |---|---|
@@ -265,8 +274,9 @@ users, not a ratio), `eq` counts, all memory gates, and `info`. `ratio` and
 `vs_redis` already compare within the session. If the global factor is under
 0.7 or over 1.4, the summary adds a `WARN` line (not a failure): the bounds were
 recorded on a faster or slower host. `--record` stores the CPU model in
-`recorded.cpu`. Re-run the self-test with `python lib/test_compare.py` after
-changing this logic.
+`recorded.cpu` (and the candidate's rustc in `recorded.rustc`). Re-run the
+self-tests with `python lib/test_compare.py` and `python lib/test_suite25.py`
+(suite 25's error check) after changing this logic.
 
 Why a few rows differ from the plan's defaults:
 
@@ -341,7 +351,10 @@ re-record that hides a regression defeats the suite.
 1. Once the release's scope is frozen and the final RC is cut (never on a
    build that may still change), run the whole suite with `FULL=1` against the
    RC on the VM size in `baseline.json` (`Standard_D4s_v5`):
-   `run-all.sh --candidate v1.3.0-rcN --label v1.3.0-rcN-d4s_v5`.
+   `run-all.sh --candidate v1.3.0-rcN --candidate-full v1.3.0-rcN --label v1.3.0-rcN-d4s_v5`
+   (`--candidate-full` takes the RC's `full` tarball, or a `lua,tls` build of
+   the same commit; without it suite 25's `scripts` is skipped and the release
+   gate refuses the run). The Actions workflow (below) builds both.
 2. Every gate must pass. A failure is either a regression to fix before the
    release, or an intended change that is explained in the release PR, after
    which the baseline is re-recorded.

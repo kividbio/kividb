@@ -15,7 +15,10 @@ Verdicts and exit status:
              (or lacks an engine's value), nothing ran, the VM size
              differs from the recorded one, or the v1.2.2 or
              redis-server binary is not the pinned one
-             (REGRESS_REDIS_SHA256=<sha> accepts a deliberate Redis change)
+             (REGRESS_REDIS_SHA256=<sha> accepts a deliberate Redis change),
+             or the candidate was built by an older rustc than v1.2.2,
+             or by one that cannot be read (REGRESS_ALLOW_RUSTC=1 accepts
+             a deliberate check; a newer rustc only warns)
   SMOKE      SCALE != 1: gates are not checked, only that every       exit 0
              metric came out
 
@@ -327,20 +330,60 @@ def host_warnings(hf):
     return []
 
 
-def toolchain_warnings(env):
-    """A candidate built by another Rust release than v1.2.2 was: the same code
-    built by rustc 1.99.1 ran script and PUBLISH rows 10-30 % slower than built
-    by 1.100.0 (#900), which a gate against v1.2.2 reads as a regression (or a
-    gain). Shown, not gated: build the candidate with the release's Rust."""
-    engines = env.get("engines", {}) if env else {}
-    out = []
+RUSTC_OVERRIDE = "REGRESS_ALLOW_RUSTC"
+
+
+def rustc_version(v):
+    """'1.100.0' (or '1.101.0-nightly') -> (1, 100, 0); None if unknown."""
+    if not v:
+        return None
+    parts = v.split("-", 1)[0].split(".")
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        return None
+
+
+def rustc_check(env, override=None):
+    """(problems, warnings) about the compilers of the candidate and of v1.2.2.
+
+    The same code built by rustc 1.99.1 ran script and PUBLISH rows 10-30 %
+    slower than built by 1.100.0, which v1.2.2's release binaries were built
+    by (#900): a gate against v1.2.2 then compares compilers, not code. A
+    candidate built by an OLDER rustc than v1.2.2, or by one that cannot be
+    read from the binary, makes the run INVALID; a newer one (the normal case:
+    rust-toolchain.toml says `stable`) only warns. REGRESS_ALLOW_RUSTC=1 turns
+    the INVALID cases into warnings, for a deliberate check of the compiler's
+    effect (results/pr900-rustc199-check)."""
+    if override is None:
+        override = os.environ.get(RUSTC_OVERRIDE, "") not in ("", "0") or bool((env or {}).get("rustc_override"))
+    engines = (env or {}).get("engines", {})
+    selected = (env or {}).get("engines_selected") or list(ENG)
+    probs, warns = [], []
+    if "candidate" not in selected or "v1_2_2" not in selected:
+        return probs, warns
     for ref, cand in (("v1_2_2", "candidate"), ("v1_2_2_full", "candidate_full")):
-        a = (engines.get(ref) or {}).get("rustc")
-        b = (engines.get(cand) or {}).get("rustc")
-        if a and b and a != b:
-            out.append("WARN: %s was built by rustc %s and %s by rustc %s: speed rows against v1.2.2 compare "
-                       "compilers as well as code (build the candidate with rustc %s)" % (cand, b, ref, a, a))
-    return out
+        if not engines.get(ref) or not engines.get(cand):
+            continue
+        a, b = engines[ref].get("rustc"), engines[cand].get("rustc")
+        va, vb = rustc_version(a), rustc_version(b)
+        if vb is None or va is None:
+            msg = "%s was built by rustc %s and %s by rustc %s: unknown, so its rows against v1.2.2 may " \
+                  "compare compilers as well as code" % (cand, b or "unknown", ref, a or "unknown")
+            (warns if override else probs).append(("WARN: " if override else "") + msg)
+        elif vb < va:
+            msg = "%s was built by rustc %s, older than %s's %s: its rows against v1.2.2 compare compilers " \
+                  "as well as code (build it with rustc %s or later, or set %s=1 for a deliberate check)" % (
+                      cand, b, ref, a, a, RUSTC_OVERRIDE)
+            (warns if override else probs).append(("WARN: " if override else "") + msg)
+        elif vb > va:
+            warns.append("WARN: %s was built by rustc %s and %s by rustc %s: a newer compiler may account for "
+                         "part of a difference against v1.2.2" % (cand, b, ref, a))
+    return probs, warns
+
+
+def toolchain_warnings(env):
+    return rustc_check(env)[1]
 
 
 def recorded_cpus(baseline):
@@ -370,6 +413,11 @@ def validity_problems(env, baseline, results, smoke, allow_vm_change):
     got = engines.get("v1_2_2", {}).get("sha256")
     if want and "v1_2_2" in selected and got != want:
         probs.append("v1.2.2 binary sha256 %s is not the pinned %s" % (got, want))
+    want = pins.get("v1_2_2_full_sha256")
+    got = engines.get("v1_2_2_full", {}).get("sha256")
+    if want and "v1_2_2" in selected and got and got != want:
+        probs.append("v1.2.2 full binary sha256 %s is not the pinned %s" % (got, want))
+    probs += rustc_check(env)[0]
     want = os.environ.get("REGRESS_REDIS_SHA256") or pins.get("redis_sha256")
     got = engines.get("redis", {}).get("sha256")
     if want and "redis" in selected and got != want:
@@ -507,6 +555,14 @@ def record(baseline, results, env, label, reset_gates):
             v = m["values"].get(e)
             rec[e] = v if v is not None else old_rec.get(e)
         rec.update({"vm": env.get("vm"), "cpu": env.get("cpu"), "date": date, "commit": env.get("candidate_commit"), "label": label})
+        # The compiler of the candidate that made these values (#900).
+        eng_env = env.get("engines", {})
+        rustc = (eng_env.get("candidate") or {}).get("rustc")
+        rustc_full = (eng_env.get("candidate_full") or {}).get("rustc")
+        if rustc:
+            rec["rustc"] = rustc
+        if rustc_full:
+            rec["rustc_full"] = rustc_full
         ms[key] = {
             "suite": m["suite"], "config": m["config"], "metric": m["metric"],
             "unit": m["unit"], "better": m["better"], "recorded": rec,
@@ -517,6 +573,8 @@ def record(baseline, results, env, label, reset_gates):
     eng = env.get("engines", {})
     if eng.get("v1_2_2", {}).get("sha256"):
         pins.setdefault("v1_2_2_sha256", eng["v1_2_2"]["sha256"])
+    if eng.get("v1_2_2_full", {}).get("sha256"):
+        pins.setdefault("v1_2_2_full_sha256", eng["v1_2_2_full"]["sha256"])
     if eng.get("redis", {}).get("sha256") and (os.environ.get("REGRESS_REDIS_SHA256") or "redis_sha256" not in pins):
         pins["redis_sha256"] = eng["redis"]["sha256"]
     return baseline
