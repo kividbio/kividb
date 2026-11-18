@@ -634,6 +634,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Scripts have the Lua 5.1 library functions Redis keeps (#898).**
+  `table.getn`, `table.setn`, `table.maxn`, `table.foreach`, `table.foreachi`,
+  `math.mod`, `string.gfind` and the global `gcinfo` were missing (scripts run
+  on Lua 5.4), so a script that used one failed with `attempt to call a nil
+  value`. hibiken/asynq's scripts end with `return table.getn(ids)`: with it
+  missing, its scheduled and retry tasks were never moved back to pending, and
+  38 of its `internal/rdb` tests failed. They are there in `EVAL`, `EVALSHA`,
+  `EVAL_RO` and function libraries, and do what Lua 5.1's do (`table.setn`
+  raises `'setn' is obsolete`, as in Redis); they are made once when the
+  script VM is, so a script that does not use them is no slower. A number
+  one returns that has an integer value is an integer, so `'n=' ..
+  table.maxn(t)` is `n=3`. See [SCRIPTS.md](docs/SCRIPTS.md).
 - **`CLUSTER SLOTS`, `SHARDS` and `NODES` refuse on a standalone, as in
   Redis (#899).** They answered with empty tables, so a client that asks
   a standalone for its slots — rueidis, the Go client behind Centrifugo

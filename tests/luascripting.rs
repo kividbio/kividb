@@ -2658,3 +2658,217 @@ fn the_implicit_arg_of_a_vararg_function_is_the_one_lua_5_1_makes() {
     let sha = c.cmds(&["SCRIPT", "LOAD", script]);
     assert_eq!(c.cmds(&["EVALSHA", sha.as_str(), "0"]), int(2));
 }
+
+/// The Lua 5.1 library functions Redis keeps and 5.4 dropped (#898).
+#[test]
+fn the_lua_51_library_functions_are_there() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let eval = |c: &mut Conn, script: &str| c.cmds(&["EVAL", script, "0"]);
+    let int = |n: i64| RespValue::Int(n);
+    let bulk = |s: &str| RespValue::Bulk(s.as_bytes().to_vec());
+
+    // getn is the length, with holes as `#` gives them, and `n` is not read.
+    assert_eq!(eval(&mut c, "return table.getn({1,2,3})"), int(3));
+    assert_eq!(eval(&mut c, "return table.getn({})"), int(0));
+    assert_eq!(eval(&mut c, "return table.getn({n=7, 'a', 'b'})"), int(2));
+    assert_eq!(eval(&mut c, "return table.getn({1, 2, nil, 4})"), int(4));
+    assert_eq!(
+        eval(
+            &mut c,
+            "return table.getn(setmetatable({1}, {__len = function() return 9 end}))"
+        ),
+        int(1)
+    );
+    assert!(
+        eval(&mut c, "return table.getn(nil)")
+            .as_error()
+            .contains("user_script:1: bad argument #1 to 'getn' (table expected, got nil)")
+    );
+
+    // setn is obsolete in Lua 5.1.
+    assert!(
+        eval(&mut c, "return table.setn({}, 3)")
+            .as_error()
+            .contains("'setn' is obsolete")
+    );
+
+    // maxn is the largest positive numeric key, whatever its type.
+    assert_eq!(eval(&mut c, "return table.maxn({})"), int(0));
+    assert_eq!(eval(&mut c, "return table.maxn({1,2,3})"), int(3));
+    assert_eq!(
+        eval(&mut c, "return table.maxn({[10]=1, [2]=1, x=5})"),
+        int(10)
+    );
+    assert_eq!(eval(&mut c, "return table.maxn({[-3]=1, [-1]=1})"), int(0));
+    assert_eq!(
+        eval(&mut c, "return tostring(table.maxn({[2.5]=1, [1]=1}))"),
+        bulk("2.5")
+    );
+    assert_eq!(
+        eval(&mut c, "return tostring(table.maxn({1,2,3}))"),
+        bulk("3")
+    );
+
+    // foreach and foreachi stop on the first value that is not nil.
+    assert_eq!(
+        eval(
+            &mut c,
+            "local n = 0 table.foreach({1,2,3}, function(k, v) n = n + v end) return n"
+        ),
+        int(6)
+    );
+    assert_eq!(
+        eval(
+            &mut c,
+            "return table.foreach({a=1}, function(k, v) return k .. v end)"
+        ),
+        bulk("a1")
+    );
+    assert_eq!(
+        eval(
+            &mut c,
+            "return table.foreach({1,2,3}, function(k, v) if v == 2 then return k end end)"
+        ),
+        int(2)
+    );
+    assert_eq!(
+        eval(
+            &mut c,
+            "return {table.foreach({1,2,3}, function(k, v) end)}"
+        ),
+        RespValue::Array(vec![])
+    );
+    assert_eq!(
+        eval(
+            &mut c,
+            "local seen = {} table.foreachi({5,6,7}, function(i, v) seen[#seen+1] = i .. ':' .. v end) \
+             return seen"
+        ),
+        RespValue::Array(vec![bulk("1:5"), bulk("2:6"), bulk("3:7")])
+    );
+    assert_eq!(
+        eval(
+            &mut c,
+            "return table.foreachi({5,6,7}, function(i, v) if i == 2 then return v end end)"
+        ),
+        int(6)
+    );
+    assert_eq!(
+        eval(
+            &mut c,
+            "local n = 0 table.foreachi({a=1, 1}, function() n = n + 1 end) return n"
+        ),
+        int(1)
+    );
+    assert!(
+        eval(&mut c, "return table.foreach({}, 1)")
+            .as_error()
+            .contains("bad argument #2 to 'foreach' (function expected, got number)")
+    );
+    assert!(
+        eval(&mut c, "return table.foreachi()")
+            .as_error()
+            .contains("bad argument #1 to 'foreachi' (table expected, got no value)")
+    );
+
+    // mod is C's fmod: the sign of the first, a zero divisor is nan.
+    assert_eq!(eval(&mut c, "return math.mod(7, 3)"), int(1));
+    assert_eq!(eval(&mut c, "return tostring(math.mod(-7, 3))"), bulk("-1"));
+    assert_eq!(eval(&mut c, "return tostring(math.mod(7, -3))"), bulk("1"));
+    assert_eq!(
+        eval(&mut c, "return tostring(math.mod(5.5, 2))"),
+        bulk("1.5")
+    );
+    assert_eq!(
+        eval(&mut c, "return tostring(math.mod(7, 0) ~= math.mod(7, 0))"),
+        bulk("true")
+    );
+    assert_eq!(eval(&mut c, "return math.mod('9', '4')"), int(1));
+    assert!(
+        eval(&mut c, "return math.mod()")
+            .as_error()
+            .contains("bad argument #2 to 'mod' (number expected, got no value)")
+    );
+    assert!(
+        eval(&mut c, "return math.mod('x', 1)")
+            .as_error()
+            .contains("bad argument #1 to 'mod' (number expected, got string)")
+    );
+
+    // gfind is gmatch.
+    assert_eq!(
+        eval(
+            &mut c,
+            "local out = {} for w in string.gfind('a bb ccc', '%a+') do out[#out+1] = w end return out"
+        ),
+        RespValue::Array(vec![bulk("a"), bulk("bb"), bulk("ccc")])
+    );
+    assert_eq!(
+        eval(&mut c, "return string.gfind == string.gmatch and 1 or 0"),
+        int(1)
+    );
+
+    // gcinfo is the kilobytes in use, a whole number.
+    assert_eq!(
+        eval(
+            &mut c,
+            "return (gcinfo() > 0 and math.type(gcinfo()) == 'integer') and 1 or 0"
+        ),
+        int(1)
+    );
+
+    // asynq's forwardCmd: the number of ids moved.
+    assert_eq!(
+        c.cmds(&["ZADD", "{q}:scheduled", "1", "a", "2", "b", "3", "c"]),
+        int(3)
+    );
+    assert_eq!(
+        c.cmds(&[
+            "EVAL",
+            "local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 100)\n\
+             for _, id in ipairs(ids) do redis.call('LPUSH', KEYS[2], id) \
+             redis.call('ZREM', KEYS[1], id) end\n\
+             return table.getn(ids)",
+            "2",
+            "{q}:scheduled",
+            "{q}:pending",
+            "2",
+        ]),
+        int(2)
+    );
+    assert_eq!(c.cmds(&["LLEN", "{q}:pending"]), int(2));
+}
+
+/// They are in every place a script runs.
+#[test]
+fn the_lua_51_library_functions_are_in_every_script_entry_point() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let int = |n: i64| RespValue::Int(n);
+    let script = "return table.getn({1,2,3}) + table.maxn({4}) + math.mod(7, 4) + gcinfo() * 0";
+
+    assert_eq!(c.cmds(&["EVAL", script, "0"]), int(7));
+    let sha = c.cmds(&["SCRIPT", "LOAD", script]);
+    assert_eq!(c.cmds(&["EVALSHA", sha.as_str(), "0"]), int(7));
+    assert_eq!(c.cmds(&["EVAL_RO", script, "0"]), int(7));
+    assert_eq!(c.cmds(&["EVALSHA_RO", sha.as_str(), "0"]), int(7));
+
+    c.cmds(&["FUNCTION", "FLUSH"]);
+    let load = c.cmds(&[
+        "FUNCTION",
+        "LOAD",
+        "#!lua name=compat51\n\
+         redis.register_function('n51', function(keys, args) return table.getn(args) end)\n\
+         redis.register_function{function_name='ro51', flags={'no-writes'}, \
+         callback=function(keys, args) return math.mod(tonumber(args[1]), 3) end}",
+    ]);
+    assert_eq!(load.as_str(), "compat51");
+    assert_eq!(c.cmds(&["FCALL", "n51", "0", "a", "b", "c"]), int(3));
+    assert_eq!(c.cmds(&["FCALL_RO", "ro51", "0", "10"]), int(1));
+    c.cmds(&["FUNCTION", "FLUSH"]);
+}

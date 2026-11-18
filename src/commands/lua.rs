@@ -2273,6 +2273,19 @@ end
     // Redis's scripting environment re-exports it as a global, so scripts can use either form.
     lua.load("unpack = table.unpack").exec().unwrap();
 
+    // Lua 5.1's `table.getn`, `math.mod`, `gcinfo` and the rest Redis keeps (#898).
+    // Kept without its debug information: the functions live as long as the VM.
+    let compat = lua
+        .load(super::lua_compat51::INSTALL)
+        .set_name("=lua51_compat")
+        .into_function()
+        .unwrap()
+        .dump(true);
+    lua.load(&compat[..])
+        .set_mode(mlua::ChunkMode::Binary)
+        .exec()
+        .unwrap();
+
     // `string.format` with Lua 5.1's integer conversions, as Redis's
     // scripts have them (#747): see [`super::lua_format`].
     // SAFETY: the state has the `string` library, and the closure leaves

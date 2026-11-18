@@ -38,6 +38,8 @@ mod lua;
 #[cfg(feature = "lua")]
 mod lua_arg;
 #[cfg(feature = "lua")]
+mod lua_compat51;
+#[cfg(feature = "lua")]
 mod lua_format;
 #[cfg(feature = "lua")]
 pub(crate) use lua::{
