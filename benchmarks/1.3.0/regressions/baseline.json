@@ -8987,14 +8987,17 @@
       "unit": "calls/s",
       "better": "higher",
       "recorded": {
-        "v1_2_2": 1530660.6595,
-        "candidate": 1441602.1705,
-        "redis": 1165981.9546,
+        "v1_2_2": 1574978.2764,
+        "candidate": 1554221.9533,
+        "redis": 1180752.205,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "07e2087e",
-        "label": "pr900-07e2087e-d4s_v5"
+        "commit": "ef936b83",
+        "label": "pr900-ef936b83-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
       },
       "gate": [
         {
@@ -9014,14 +9017,17 @@
       "unit": "calls/s",
       "better": "higher",
       "recorded": {
-        "v1_2_2": 357452.6002,
-        "candidate": 371077.9728,
-        "redis": 398884.7986,
+        "v1_2_2": 373829.7383,
+        "candidate": 382410.8265,
+        "redis": 405530.758,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "07e2087e",
-        "label": "pr900-07e2087e-d4s_v5"
+        "commit": "ef936b83",
+        "label": "pr900-ef936b83-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
       },
       "gate": [
         {
@@ -9041,14 +9047,17 @@
       "unit": "calls/s",
       "better": "higher",
       "recorded": {
-        "v1_2_2": 55422.2987,
-        "candidate": 54932.7158,
-        "redis": 65418.8525,
+        "v1_2_2": 50915.1837,
+        "candidate": 50280.2091,
+        "redis": 64761.8461,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "07e2087e",
-        "label": "pr900-07e2087e-d4s_v5"
+        "commit": "ef936b83",
+        "label": "pr900-ef936b83-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
       },
       "gate": [
         {
@@ -9068,14 +9077,17 @@
       "unit": "calls/s",
       "better": "higher",
       "recorded": {
-        "v1_2_2": 64581.2923,
-        "candidate": 65885.7183,
-        "redis": 76738.3538,
+        "v1_2_2": 59038.6696,
+        "candidate": 60043.587,
+        "redis": 75907.5678,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "07e2087e",
-        "label": "pr900-07e2087e-d4s_v5"
+        "commit": "ef936b83",
+        "label": "pr900-ef936b83-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
       },
       "gate": [
         {
