@@ -15,6 +15,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
 
+pub mod blocks;
 mod rdb_dialect;
 pub use rdb_dialect::is_rdb_header;
 mod rdb_extensions;
@@ -1895,6 +1896,9 @@ fn read_retrying_within<R: Read>(
         Ok((loaded, keys)) => return Ok((loaded, keys, reader)),
         // Read whole, and refused for its databases (#482).
         Err(e) if is_past_databases(&e) => return Err(e),
+        // A compressed snapshot, damaged or not read whole: no 1.2.0 wrote
+        // one, so there is no other way to read it (#879).
+        Err(e) if blocks::is_refusal(&e) => return Err(e),
         Err(e) if !is_layout(&e) => return Err(e),
         Err(e) => e,
     };
@@ -2194,12 +2198,53 @@ fn read_image(
     databases: usize,
 ) -> io::Result<(LoadedSnapshot, usize)> {
     let mut r = r;
-    let mut keys_read = 0usize;
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)?;
+    // A compressed snapshot (#879): the image in it, read as it is
+    // decompressed, a block at a time. It is loaded only if the container is
+    // whole, every block checked and its end read, with nothing after it.
+    if &magic == blocks::MAGIC {
+        let read = (|| {
+            let mut container = blocks::BlockReader::after_magic(&mut r)?;
+            let mut inner = [0u8; 8];
+            container.read_exact(&mut inner).map_err(|e| {
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "compressed snapshot: it holds no image",
+                    )
+                } else {
+                    e
+                }
+            })?;
+            if &inner != KDB_MAGIC {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compressed snapshot: what it holds is not a KDB image (bad magic)",
+                ));
+            }
+            let read = read_image_body(&mut container, keep, legacy, ends, databases)?;
+            container.finish()?;
+            Ok(read)
+        })();
+        return read.map_err(blocks::refusal);
+    }
     if &magic != KDB_MAGIC {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
     }
+    read_image_body(r, keep, legacy, ends, databases)
+}
+
+/// [`read_image`] of a plain image, after its magic.
+fn read_image_body(
+    r: impl Read,
+    keep: bool,
+    legacy: &[usize],
+    ends: &mut Vec<usize>,
+    databases: usize,
+) -> io::Result<(LoadedSnapshot, usize)> {
+    let mut r = r;
+    let mut keys_read = 0usize;
 
     let mut db_count_buf = [0u8; 4];
     r.read_exact(&mut db_count_buf)?;
@@ -5198,6 +5243,31 @@ impl Write for CapturedBuf {
     }
 }
 
+/// A writer that counts what goes through it: the size of a plain image
+/// as it is written (`INFO persistence`).
+struct CountingWriter<W: Write> {
+    out: W,
+    bytes: u64,
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let n = self.out.write(data)?;
+        self.bytes += n as u64;
+        Ok(n)
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        self.out.write_all(data)?;
+        self.bytes += data.len() as u64;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
+    }
+}
+
 /// What one thread of the capture took: a hold on each string's entry
 /// (its key, bytes and time to live, which do not change while held),
 /// everything else laid out but the probabilistic values, copies of those
@@ -5412,6 +5482,22 @@ impl FrozenDataset {
     /// against `maxmemory` while the second part lives: a full sync's or a
     /// backup's image, which deleting keys does not give back (#284).
     pub fn into_image(self) -> std::io::Result<(Vec<u8>, crate::memory_use::NotCounted)> {
+        self.into_image_as(false)
+    }
+
+    /// [`Self::into_image`], compressed if `compressed` is set (#879). A
+    /// compressed image is compressed as it is laid out: the image whole is
+    /// never in memory, only what it compresses to, counted as it grows.
+    pub fn into_image_as(
+        self,
+        compressed: bool,
+    ) -> std::io::Result<(Vec<u8>, crate::memory_use::NotCounted)> {
+        if compressed {
+            let mut writer = blocks::BlockWriter::new(CapturedBuf::default())?;
+            self.write_to(&mut writer)?;
+            let (_, _, out) = writer.finish()?;
+            return Ok(out.finish());
+        }
         let strings_bytes: usize = self
             .dbs
             .iter()
@@ -5453,12 +5539,44 @@ impl FrozenDataset {
     /// Write the image to `path`, made durable, under that name. The image is
     /// written as it is laid out, not gathered in memory first: for a dump of
     /// the whole dataset that would be the dataset over again.
+    ///
+    /// Compressed with `rdbcompression yes`, the default (#879): on threads of
+    /// its own (see [`blocks::BlockWriter`]), never the serving threads'.
     pub fn write_file(self, path: &str) -> std::io::Result<()> {
+        let started = std::time::Instant::now();
         let raw = PacedFile::new(File::create(path)?);
         let mut file = BufWriter::with_capacity(1 << 20, raw);
-        self.write_to(&mut file)?;
+        let compressed = blocks::enabled();
+        let (image, written) = if compressed {
+            let mut writer = blocks::BlockWriter::new(&mut file)?;
+            self.write_to(&mut writer)?;
+            let (image, written, _) = writer.finish()?;
+            (image, written)
+        } else {
+            let mut counted = CountingWriter {
+                out: &mut file,
+                bytes: 0,
+            };
+            self.write_to(&mut counted)?;
+            (counted.bytes, counted.bytes)
+        };
         file.flush()?;
-        file.get_ref().sync_all()
+        file.get_ref().sync_all()?;
+        blocks::record_saved(image, written);
+        if compressed {
+            log_info!(
+                "Snapshot written: {image} bytes of image in {written} bytes, compressed {:.2}x \
+                 (rdbcompression yes), in {} ms",
+                image as f64 / written.max(1) as f64,
+                started.elapsed().as_millis()
+            );
+        } else {
+            log_info!(
+                "Snapshot written: {image} bytes, not compressed (rdbcompression no), in {} ms",
+                started.elapsed().as_millis()
+            );
+        }
+        Ok(())
     }
 
     fn write_to(mut self, out: &mut impl Write) -> std::io::Result<()> {

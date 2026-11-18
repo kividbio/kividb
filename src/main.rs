@@ -294,6 +294,12 @@ fn is_uring_available() -> bool {
 
 // Entry point
 fn main() {
+    // `kividb kdb-decompress <in> <out>` and `kividb kdb-compress <in> <out>`
+    // (#879): tools, not a server. For images with no shell, as `--ping` is.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(code) = snapshot::blocks::subcommand(&args) {
+        std::process::exit(code);
+    }
     // An error that ends the server is logged like any other line, rather
     // than printed as a Rust `Debug` dump.
     if let Err(e) = run() {

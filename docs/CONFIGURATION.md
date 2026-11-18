@@ -120,7 +120,10 @@ open-file limit to `maxclients` plus what it keeps for itself (32 files, or on i
 warning. Cluster bus links, a replica's link to its master and files written while saving
 are not counted in that; leave room for them in a large cluster.
 
-Persistence (snapshots and the AOF) is described in [PERSISTENCE.md](PERSISTENCE.md).
+Persistence (snapshots and the AOF) is described in [PERSISTENCE.md](PERSISTENCE.md),
+including `rdbcompression` (default `yes`: snapshots are written compressed) and the
+`kividb kdb-decompress <in> <out>` and `kividb kdb-compress <in> <out>` tools, which convert a
+snapshot between the compressed form and the plain one KiviDB 1.2 reads.
 
 ### Worker threads
 

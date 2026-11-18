@@ -2052,6 +2052,8 @@ fn a_preload_file_that_is_not_a_whole_snapshot_is_fatal() {
     for i in 0..50 {
         c.cmd(&["SET", &format!("key:{i}"), &"v".repeat(100)]);
     }
+    // The plain image, which the test cuts where it means to (#879).
+    assert!(c.cmd(&["CONFIG", "SET", "rdbcompression", "no"]).ok());
     assert!(c.cmd(&["SAVE"]).ok());
     let kdb = std::fs::read(source.dir.join("dump.kdb")).unwrap();
     let rdb = fixture("redis-8.10.rdb");
@@ -2232,6 +2234,8 @@ fn the_empty_key_survives_a_save_and_a_restart() {
     let mut server = Server::start(&[]);
     let mut c = server.conn();
     write_empty_keys(&mut c);
+    // The plain image, which the test reads (#879).
+    assert!(c.cmd(&["CONFIG", "SET", "rdbcompression", "no"]).ok());
     assert!(c.cmd(&["SAVE"]).ok());
     drop(c);
     // Written under the stand-in length: the stand-in, the string tag, a

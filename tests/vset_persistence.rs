@@ -2220,7 +2220,8 @@ fn downgrade_to_1_2() {
         (&["Q8"][..], false, "int8"),
         (&["BIN"][..], false, "bin"),
     ] {
-        let mut server = Server::start(&[]);
+        // The plain image, which 1.2 reads (#879).
+        let mut server = Server::start(&["--rdbcompression", "no"]);
         let mut c = server.conn();
         assert_eq!(vadd(&mut c, "v", &[3.0, -4.0, 0.5], "a", opts), V::Int(1));
         c.cmd(&["VSETATTR", "v", "a", r#"{"n":1}"#]);

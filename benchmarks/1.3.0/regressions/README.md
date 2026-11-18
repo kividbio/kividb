@@ -37,6 +37,7 @@ and why.
 | `19-hash-memory` | collection storage step 2 | `used_memory` per hash field, 1,000,000 fields in hashes of 10, 100, 1,000 and 100,000: 14-byte fields (`field:<i>`) with 32-byte values, plain and with one field TTL a hash; `OBJECT ENCODING` of each size recorded exactly (`listpack`, `listpackex`, `hashtable`); the tables (1,000 and 100,000) as guard rows |
 | `21-list-memory` | #297 (step 3) | `used_memory` per list element, 1,000,000 32-byte elements in lists of 10, 100, 1,000 and 100,000, packed in chunks; the same made plain (an element over 1,024 bytes pushed and popped first) as guard rows; `OBJECT ENCODING` of each size recorded exactly |
 | `22-scan-large-count` | #884 | Argo CD's `SCAN <cursor> MATCH revoked-token\|* COUNT 10000` over 40,000 keys of 50 KB that it never matches (`--threads 4`): microseconds a call, client side and the server's own (`INFO commandstats`), calls and keys returned (exactly 0) for a full iteration, and the p99 of four `PING` probes while four other connections loop the same `SCAN` |
+| `23-snapshot-size` | #879 | `SAVE` of #879's dataset (`DEBUG POPULATE 6000000 k 150`) and of a collections mix (200,000 hashes of 10 fields, 50,000 each of sets, sorted sets and lists of 20): the snapshot's size on disk, the `SAVE` time (median of 3 after a warm-up) and the time a new server takes to load it (best of 2); the size gated against v1.2.2 (keep 60 % of the gain) and, for #879's dataset, within 1.5x of Redis's `dump.rdb`; the save at most 2.5x v1.2.2's time (it compresses), the load 1.5x |
 
 ## Running it
 

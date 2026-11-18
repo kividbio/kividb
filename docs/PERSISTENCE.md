@@ -22,6 +22,7 @@ top of it.
 | `dbfilename` | Always `dump.kdb` (`dump.rdb` is accepted). Any other name is refused. `CONFIG GET dbfilename` answers `dump.kdb`, and `CONFIG GET dir` the directory it is in, so a tool that runs `SAVE` finds the file. |
 | `appendfilename` | Always `appendonly.aof`, which `CONFIG GET appendfilename` answers. Any other name is refused. |
 | `auto-aof-rewrite-percentage`, `auto-aof-rewrite-min-size` | When the AOF has grown by this percentage (default 100) over its size after the last checkpoint, and is at least this size (default 64 MB), a checkpoint runs. Checked every 10 seconds. `0` turns it off. Both can be changed with `CONFIG SET`. |
+| `rdbcompression` | `yes` (the default): snapshots are written compressed (see [Compressed snapshots](#compressed-snapshots)). `no`: the plain image, which KiviDB 1.2 and earlier read. `CONFIG SET rdbcompression` works at runtime, from the next snapshot on. |
 | `hll-write-format` | `legacy` (the default) or `redis`. New HyperLogLog values use that format; existing values keep theirs. Per server, set in the config file or with `CONFIG SET`, and written by `CONFIG REWRITE`. See below before switching. |
 
 ## Checkpoints
@@ -312,6 +313,8 @@ only what happened next. Redis rewrites at this point for the same reason.
 | `aof_acks_before_write` | Replies to writes sent after waiting 5 s for their records to reach the file, without them: the disk fell more than 5 s behind. A process killed then can lose those writes. 0 on a disk that keeps up (see [When a write is acknowledged](#when-a-write-is-acknowledged)). |
 | `aof_superseded_files` | Logs kept aside in `dir` (`superseded.*`), which the server never removes (see [Logs kept aside](#logs-kept-aside)). |
 | `aof_superseded_bytes` | Their size in bytes. |
+| `rdb_last_save_raw_size` | The last snapshot written to disk (`dump.kdb`, by a save, a checkpoint or the shutdown): the bytes of its image. 0 before the first. |
+| `rdb_last_save_stored_size` | The bytes it took on disk: fewer than the image with `rdbcompression yes`, the same with `no`. |
 
 `rdb_last_bgsave_status` and `LASTSAVE` report snapshots, as in Redis.
 
@@ -375,6 +378,56 @@ is still written as before):
 An older release stops reading at the first section it does not know, so
 these come after everything it does. A snapshot written by this version
 cannot be read by an older one once it contains any of these.
+
+## Compressed snapshots
+
+With `rdbcompression yes`, the default, every snapshot is written
+compressed: `dump.kdb` (by `SAVE`, `BGSAVE`, a checkpoint of the AOF and the
+shutdown), the base of an online backup, and a full sync to a replica that
+reads it. The image is the plain one, byte for byte, cut into blocks of
+256 KiB, each compressed with zstd (level 1) or, if it does not shrink,
+stored as it is. Each block carries its length and a checksum (xxh3) of what
+it holds, and the file ends with a marker that gives the number of blocks
+and the length of the image. The file starts with `KIVIDBZ1`, the plain one
+with `KIVIDB01`.
+
+The blocks are compressed on up to two threads of the save's own, never on
+the threads that serve clients, and no more than a few blocks are in
+memory at once. The log line of each save gives the image's size, the
+size written and the ratio.
+
+Loading reads both forms, told apart by the first bytes, and a compressed
+one a block at a time. A compressed snapshot that is cut short anywhere,
+has no end marker, has a block whose checksum or length does not match, or
+has bytes after its end is refused as a whole, with the block named
+(`compressed snapshot: block 3 (at byte 524321) does not match its checksum:
+it is damaged`): it is never loaded in part. At startup that stops the
+server, and leaves its directory as it is, as for any snapshot that cannot be
+loaded.
+
+A full sync is compressed only for a replica that says it reads it (`REPLCONF
+capa kdb-blocks`, which this version's replicas send). A replica of 1.2 or
+earlier, or of Redis, is sent the plain image. A master with `rdbcompression
+no` sends the plain image to every replica.
+
+### Going back to 1.2
+
+KiviDB 1.2 and earlier refuse a compressed snapshot (`bad magic`) and do
+not start on it; nothing is changed on disk. To hand a snapshot to one:
+
+* `CONFIG SET rdbcompression no`, then `SAVE` (with the AOF on, this writes
+  the AOF's base plain too); or set `rdbcompression no` in the config file
+  before the last shutdown;
+* or convert the file, server running or not:
+
+```bash
+kividb kdb-decompress dump.kdb dump-plain.kdb   # what 1.2 reads
+kividb kdb-compress dump-plain.kdb dump.kdb     # and back
+```
+
+Both write through a temporary file beside the output, check every block on
+the way, and exit 1 on a damaged input, leaving the output as it was. They
+start no server, and need no shell (`["kividb", "kdb-decompress", ...]`).
 
 ## When a write is acknowledged
 

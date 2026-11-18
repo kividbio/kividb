@@ -92,6 +92,10 @@ serde = "1"
 ordered-float = "4"
 sha2 = "0.10"
 lzf = "0.3"
+# Compressed snapshots (#879): zstd at level 1, a block at a time, on the
+# threads that write a snapshot, never the serving threads. Bundles libzstd
+# (C, BSD-3-Clause), built with the platform's C compiler; no system library.
+zstd = { version = "0.13", default-features = false }
 bitflags = "2.6"
 either = "1"
 # ARGREP's `RE <pattern>` predicate (Redis 8.8 array commands). Linear-time
