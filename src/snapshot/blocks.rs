@@ -32,7 +32,8 @@
 //! cannot say it holds more than the block size, which is at most
 //! [`MAX_BLOCK_SIZE`].
 //!
-//! `rdbcompression yes` (the default) writes snapshots this way, `no` writes
+//! `rdbcompression yes` writes snapshots this way; `no`, the default in 1.3
+//! (1.2 cannot read the container, and a rollback must work), writes
 //! the plain image. Both are read, told apart by the magic.
 
 use std::collections::VecDeque;
@@ -67,7 +68,7 @@ const END_LEN: usize = 1 + 8 + 8 + 8;
 const MAX_HELPERS: usize = 2;
 
 /// `rdbcompression`: whether snapshots are written compressed.
-static COMPRESS: AtomicBool = AtomicBool::new(true);
+static COMPRESS: AtomicBool = AtomicBool::new(false);
 
 /// Whether snapshots are written compressed (`rdbcompression`).
 pub fn enabled() -> bool {

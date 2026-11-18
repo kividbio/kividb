@@ -173,12 +173,6 @@ fn spawn(bin: &Path, dir: &Path, port: u16, extra: &[String], env: &[(&str, &str
     if let Ok(model) = std::env::var("KIVIDB_TEST_IO_MODEL") {
         command.args(["--io-model", &model]);
     }
-    // This build writes the plain image, which the 1.2 binary these tests
-    // go back to reads (#879): a compressed one it refuses, by design. 1.2
-    // takes no `--rdbcompression`.
-    if bin == this_bin() {
-        command.args(["--rdbcompression", "no"]);
-    }
     command
         .args(extra)
         .envs(env.iter().copied())
@@ -2675,4 +2669,146 @@ fn snapshot_reload_then_delete_releases_memory() {
     c.cmd(&["DEL", "k"]);
     let want = loaded - 2000 * 768;
     released(&mut c, want, 256 * 1024, "DEL after load");
+}
+
+/// Every file of `dir` and what it holds, but the log and the lock, which a
+/// start that is refused may touch.
+fn data_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| {
+            let e = e.unwrap();
+            let name = e.file_name().to_string_lossy().into_owned();
+            (e.path().is_file() && name != "server.log" && name != "kividb.lock")
+                .then(|| (name, std::fs::read(e.path()).unwrap()))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// `kividb kdb-decompress --force <in> <out>`.
+fn decompress(input: &Path, output: &Path) {
+    let out = Command::new(this_bin())
+        .args(["kdb-decompress", "--force"])
+        .arg(input)
+        .arg(output)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// With compression turned on (`rdbcompression yes`, opt-in in 1.3, #879):
+/// 1.2 refuses what this build writes, a rewritten log's base and a
+/// backup's BASE, cleanly (`bad magic`, a non-zero exit, the files as they
+/// were); after `rdbcompression no` and a rewrite, or converted with
+/// `kividb kdb-decompress`, 1.2 loads them.
+#[test]
+#[ignore = "needs a 1.2 binary in KIVIDB_1_2_BIN"]
+fn compressed_snapshots_are_refused_by_1_2_and_handed_back_plain() {
+    let old = old_bin();
+    let compressed = ["--aof", "--rdbcompression", "yes"];
+    let mut server = Server::start(&compressed);
+    let mut c = server.conn();
+    assert_eq!(vadd(&mut c, "f", &V3, "a", &["NOQUANT"]), V::Int(1));
+    rewrite(&mut c);
+    assert_eq!(vadd(&mut c, "g", &V3, "a", &["NOQUANT"]), V::Int(1));
+    server.kill();
+    let dump = server.dir.join("dump.kdb");
+    assert!(std::fs::read(&dump).unwrap().starts_with(b"KIVIDBZ1"));
+
+    // Refused, cleanly.
+    let before = data_files(&server.dir);
+    let status = server
+        .try_restart_as(old.clone(), &["--aof"])
+        .unwrap_or_else(|| panic!("1.2 started on a compressed base:\n{}", server.log()));
+    assert!(!status.success());
+    assert!(server.log().contains("bad magic"), "{}", server.log());
+    assert!(data_files(&server.dir) == before, "1.2 changed the files");
+
+    // Back on this build: plain again, and a rewrite. 1.2 loads it.
+    server.restart_as(this_bin(), &compressed);
+    let mut c = server.conn();
+    assert!(!c.cmd(&["CONFIG", "SET", "rdbcompression", "no"]).is_err());
+    rewrite(&mut c);
+    server.kill();
+    assert!(std::fs::read(&dump).unwrap().starts_with(b"KIVIDB01"));
+    server.restart_as(old.clone(), &["--aof"]);
+    let mut c = server.conn();
+    for key in ["f", "g"] {
+        assert_eq!(
+            floats(&c.cmd(&["VEMB", key, "a"])),
+            [3.0, -4.0, 0.5],
+            "1.2: {key}"
+        );
+    }
+    server.kill();
+
+    // A compressed dump.kdb, converted with kdb-decompress: 1.2 loads it.
+    let mut server = Server::start(&["--rdbcompression", "yes"]);
+    let mut c = server.conn();
+    assert_eq!(vadd(&mut c, "h", &V3, "a", &["NOQUANT"]), V::Int(1));
+    assert!(!c.cmd(&["SAVE"]).is_err());
+    server.kill();
+    let dump = server.dir.join("dump.kdb");
+    assert!(std::fs::read(&dump).unwrap().starts_with(b"KIVIDBZ1"));
+    let plain = server.dir.join("plain.kdb");
+    decompress(&dump, &plain);
+    std::fs::rename(&plain, &dump).unwrap();
+    server.restart_as(old.clone(), &[]);
+    let mut c = server.conn();
+    assert_eq!(floats(&c.cmd(&["VEMB", "h", "a"])), [3.0, -4.0, 0.5]);
+
+    // A backup taken compressed: 1.2 refuses its BASE; converted, restores.
+    let source = Server::start(&["--rdbcompression", "yes"]);
+    let mut c = source.conn();
+    assert_eq!(vadd(&mut c, "base", &V3, "a", &["NOQUANT"]), V::Int(1));
+    assert!(!c.cmd(&["BACKUP", "START"]).is_err());
+    wait_until("the increment", 20, || {
+        backup_state(&mut c) == "incrementing"
+    });
+    assert_eq!(vadd(&mut c, "incr", &V3, "a", &["NOQUANT"]), V::Int(1));
+    assert!(!c.cmd(&["BACKUP", "SEAL"]).is_err());
+    let files: Vec<String> = c.cmd(&["BACKUP", "LIST"]).arr().iter().map(V::s).collect();
+    let base = PathBuf::from(files.iter().find(|f| f.ends_with(".base.kdb")).unwrap());
+    let manifest = files.iter().find(|f| f.ends_with(".manifest")).unwrap();
+    assert!(std::fs::read(&base).unwrap().starts_with(b"KIVIDBZ1"));
+    let preload = format!("aof:{manifest}");
+    let tmp = tempfile::tempdir().unwrap();
+    let args = vec!["--preload-file".to_string(), preload.clone()];
+    let mut child = spawn(&old, tmp.path(), common::free_port(), &args, &[]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("1.2 restored a compressed BASE");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(!status.success());
+    let said = std::fs::read_to_string(tmp.path().join("server.log")).unwrap();
+    assert!(said.contains("bad magic"), "{said}");
+    let plain = base.with_extension("plain");
+    decompress(&base, &plain);
+    std::fs::rename(&plain, &base).unwrap();
+    let on_old = Server::start_bin(
+        old,
+        tempfile::tempdir().unwrap(),
+        &["--preload-file", &preload],
+    );
+    let mut o = on_old.conn();
+    for key in ["base", "incr"] {
+        assert_eq!(
+            floats(&o.cmd(&["VEMB", key, "a"])),
+            [3.0, -4.0, 0.5],
+            "1.2: {key}"
+        );
+    }
 }

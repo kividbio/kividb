@@ -2109,7 +2109,7 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
             ("latency-monitor-threshold", "0"),
             ("ts-duplicate-policy", "last"),
             ("aof-ack-after-write", "yes"),
-            ("rdbcompression", "yes"),
+            ("rdbcompression", "no"),
         ]
         .into_iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))

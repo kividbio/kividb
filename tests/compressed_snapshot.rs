@@ -1,6 +1,6 @@
 // tests/compressed_snapshot.rs
 //
-// Compressed snapshots (#879). With `rdbcompression yes`, the default, a
+// Compressed snapshots (#879). With `rdbcompression yes` (opt-in in 1.3), a
 // snapshot is the plain KDB image (`KIVIDB01`), unchanged byte for byte, in
 // blocks compressed with zstd (`KIVIDBZ1`); with `no`, the plain image as
 // before. Both load; a damaged or partial compressed snapshot never does.
@@ -456,9 +456,10 @@ fn a_compressed_snapshot_holds_the_plain_image_and_loads_the_same() {
     let dir = tempfile::tempdir().unwrap();
     let server = start(dir.path(), &[]);
     let mut c = Conn::connect(server.port);
+    // Off by default in 1.3: a rollback to 1.2 must work.
     assert_eq!(
         c.cmd(&["CONFIG", "GET", "rdbcompression"]),
-        "rdbcompression\nyes"
+        "rdbcompression\nno"
     );
     populate(&mut c);
     let expected = key_dump(&mut c);
@@ -529,6 +530,33 @@ fn a_compressed_snapshot_holds_the_plain_image_and_loads_the_same() {
 /// file, and nothing else.
 #[test]
 fn rdbcompression_is_a_setting_in_effect() {
+    // The default: the plain image, which 1.2 reads.
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), &[]);
+    let mut c = Conn::connect(server.port);
+    c.ok(&["SET", "k", "v"]);
+    assert_eq!(c.cmd(&["SAVE"]), "OK");
+    assert!(
+        std::fs::read(dir.path().join("dump.kdb"))
+            .unwrap()
+            .starts_with(PLAIN)
+    );
+    drop(c);
+    drop(server);
+    // From the command line.
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), &["--rdbcompression", "yes"]);
+    let mut c = Conn::connect(server.port);
+    c.ok(&["SET", "k", "v"]);
+    assert_eq!(c.cmd(&["SAVE"]), "OK");
+    assert!(
+        std::fs::read(dir.path().join("dump.kdb"))
+            .unwrap()
+            .starts_with(COMPRESSED)
+    );
+    drop(c);
+    drop(server);
+    // From the config file, and CONFIG SET.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("kividb.conf"), "rdbcompression no\n").unwrap();
     let server = start(dir.path(), &[]);
@@ -708,7 +736,7 @@ fn a_damaged_compressed_dump_does_not_start_the_server() {
 #[test]
 fn the_aof_base_follows_rdbcompression_and_restarts_load_both() {
     let dir = tempfile::tempdir().unwrap();
-    let extra = ["--appendonly", "yes"];
+    let extra = ["--appendonly", "yes", "--rdbcompression", "yes"];
     let mut server = start(dir.path(), &extra);
     let mut c = Conn::connect(server.port);
     let mut written = 0;
@@ -768,7 +796,7 @@ fn the_aof_base_follows_rdbcompression_and_restarts_load_both() {
 #[test]
 fn a_full_sync_is_compressed_only_for_a_replica_that_takes_it() {
     let dir = tempfile::tempdir().unwrap();
-    let master = start(dir.path(), &[]);
+    let master = start(dir.path(), &["--rdbcompression", "yes"]);
     let mut c = Conn::connect(master.port);
     for i in 0..5000 {
         c.send(&["SET", &format!("key:{i}"), &format!("value {i} value {i}")]);
@@ -913,17 +941,24 @@ fn the_tools_refuse_what_the_server_would_not_load() {
         p
     };
     let refused = |tool: &str, input: &Path, says: &str| {
-        let out = t
-            .path()
-            .join(format!("out-{}", input.file_name().unwrap().to_string_lossy()));
+        let out = t.path().join(format!(
+            "out-{}",
+            input.file_name().unwrap().to_string_lossy()
+        ));
         let (ok, said) = run_tool(&[input, &out], tool);
         assert!(!ok, "{tool} {}: {said}", input.display());
         assert!(said.contains(says), "{tool} {}: {said}", input.display());
-        assert!(!out.exists(), "{tool} {}: an output was left", input.display());
         assert!(
-            std::fs::read_dir(t.path())
+            !out.exists(),
+            "{tool} {}: an output was left",
+            input.display()
+        );
+        assert!(
+            std::fs::read_dir(t.path()).unwrap().all(|e| !e
                 .unwrap()
-                .all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")),
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")),
             "a temporary file was left"
         );
     };
@@ -977,7 +1012,11 @@ fn the_tools_refuse_what_the_server_would_not_load() {
 
     // 1.2.0's empty key in a database before the last: it loads only read
     // the 1.2.0 way, which a compressed snapshot is not given. Refused.
-    refused("kdb-compress", &file("legacy.kdb", &dump_1_2_0(16, 7)), "1.2.0");
+    refused(
+        "kdb-compress",
+        &file("legacy.kdb", &dump_1_2_0(16, 7)),
+        "1.2.0",
+    );
     // In the last database it reads one way, and compresses.
     let last = file("last.kdb", &dump_1_2_0(1, 0));
     let out = t.path().join("last-z.kdb");
@@ -1004,7 +1043,16 @@ fn a_compressed_image_cut_inside_a_section_does_not_start_the_server() {
     let mut c = Conn::connect(server.port);
     c.ok(&["SET", "timed", "v", "EX", "100000"]);
     c.ok(&[
-        "FT.CREATE", "idx", "ON", "HASH", "PREFIX", "1", "doc:", "SCHEMA", "t", "TEXT",
+        "FT.CREATE",
+        "idx",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "doc:",
+        "SCHEMA",
+        "t",
+        "TEXT",
     ]);
     c.ok(&["HSET", "doc:1", "t", "hello"]);
     assert_eq!(c.cmd(&["SAVE"]), "OK");
@@ -1039,7 +1087,7 @@ fn a_save_completes_when_the_compression_threads_die() {
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("server.log");
     let (child, port) = start_verified(|port| {
-        kividb(dir.path(), port, &[])
+        kividb(dir.path(), port, &["--rdbcompression", "yes"])
             .env("KIVIDB_TEST_COMPRESS_THREADS_DIE", "1")
             .stderr(std::fs::File::create(&log).unwrap())
             .spawn()
@@ -1085,15 +1133,12 @@ fn a_replica_keeps_its_data_when_a_compressed_payload_is_damaged() {
     for mode in ["checksum", "truncate"] {
         let mdir = tempfile::tempdir().unwrap();
         let (child, mport) = start_verified(|port| {
-            kividb(mdir.path(), port, &[])
+            kividb(mdir.path(), port, &["--rdbcompression", "yes"])
                 .env("KIVIDB_TEST_DAMAGE_FULL_SYNC", mode)
                 .spawn()
                 .unwrap()
         });
-        let master = Server {
-            child,
-            port: mport,
-        };
+        let master = Server { child, port: mport };
         let mut m = Conn::connect(master.port);
         for i in 0..20_000 {
             m.send(&["SET", &format!("m:{i}"), &format!("master value {i}")]);
@@ -1109,10 +1154,7 @@ fn a_replica_keeps_its_data_when_a_compressed_payload_is_damaged() {
                 .spawn()
                 .unwrap()
         });
-        let replica = Server {
-            child,
-            port: rport,
-        };
+        let replica = Server { child, port: rport };
         let mut r = Conn::connect(replica.port);
         for i in 0..100 {
             r.ok(&["SET", &format!("mine:{i}"), "kept"]);

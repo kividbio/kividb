@@ -218,8 +218,7 @@ fn cut_sections() -> Vec<&'static str> {
 fn saved_dump() -> Vec<u8> {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
-    // The plain image, whose sections the tests cut (#879).
-    let _server = start(dir.path(), port, &["--rdbcompression", "no"]);
+    let _server = start(dir.path(), port, &[]);
     let mut c = Conn::connect(port);
     assert_eq!(c.cmd(&["SET", "timed", "v", "EX", "100000"]), "OK");
     let reply = c.cmd(&[

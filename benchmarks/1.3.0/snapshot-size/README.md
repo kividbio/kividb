@@ -1,6 +1,6 @@
 # Snapshot size (#879)
 
-What `rdbcompression yes` (compressed snapshots, the 1.3.0 default) changes:
+What `rdbcompression yes` (compressed snapshots, opt-in in 1.3.0) changes:
 the snapshot's size, the save's wall time, CPU and peak memory, the load, a
 full sync's time and the master's memory during it, and the latency of
 writes during a save. Against v1.2.2, master before the change, the change

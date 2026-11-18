@@ -8,8 +8,8 @@ Server on cores 0-1 (--threads 2), clients/replica on 2-3. One server at a time.
   bench.py redis <dataset> [--load] [--sync]           same for Redis 8.10.2 (loads via the generator)
 
 Variants: v122 | master | yes | no | yes-inline (binaries: $V122, $MASTER, $CANDIDATE,
-$INLINE, a build with MAX_HELPERS = 0 in src/snapshot/blocks.rs). `no` runs the
-candidate with `rdbcompression no`. Redis runs from the redis:8.10.2 image (Docker).
+$INLINE, a build with MAX_HELPERS = 0 in src/snapshot/blocks.rs). `yes` runs the
+candidate with `rdbcompression yes`; `no` as it starts (the 1.3 default). Redis runs from the redis:8.10.2 image (Docker).
 Results are appended as JSON lines to $OUT/results.jsonl (default: this directory).
 """
 import json
@@ -39,9 +39,9 @@ VARIANTS = {
     # name: (binary, extra config lines)
     "v122": (V122, ""),
     "master": (os.environ.get("MASTER", HOME + "/t-master/release/kividb"), ""),
-    "yes": (os.environ.get("CANDIDATE", HOME + "/t-feat/release/kividb"), ""),
-    "no": (os.environ.get("CANDIDATE", HOME + "/t-feat/release/kividb"), "rdbcompression no" + NL),
-    "yes-inline": (os.environ.get("INLINE", HOME + "/t-inline/release/kividb"), ""),
+    "yes": (os.environ.get("CANDIDATE", HOME + "/t-feat/release/kividb"), "rdbcompression yes" + NL),
+    "no": (os.environ.get("CANDIDATE", HOME + "/t-feat/release/kividb"), ""),
+    "yes-inline": (os.environ.get("INLINE", HOME + "/t-inline/release/kividb"), "rdbcompression yes" + NL),
 }
 
 DATASETS = {

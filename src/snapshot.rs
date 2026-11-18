@@ -5559,7 +5559,7 @@ impl FrozenDataset {
     /// written as it is laid out, not gathered in memory first: for a dump of
     /// the whole dataset that would be the dataset over again.
     ///
-    /// Compressed with `rdbcompression yes`, the default (#879): on this
+    /// Compressed with `rdbcompression yes` (#879; `no` is the default): on this
     /// thread and the compression threads (see [`blocks::BlockWriter`]),
     /// never the serving threads.
     pub fn write_file(self, path: &str) -> std::io::Result<()> {

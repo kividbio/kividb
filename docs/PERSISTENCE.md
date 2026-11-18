@@ -22,7 +22,7 @@ top of it.
 | `dbfilename` | Always `dump.kdb` (`dump.rdb` is accepted). Any other name is refused. `CONFIG GET dbfilename` answers `dump.kdb`, and `CONFIG GET dir` the directory it is in, so a tool that runs `SAVE` finds the file. |
 | `appendfilename` | Always `appendonly.aof`, which `CONFIG GET appendfilename` answers. Any other name is refused. |
 | `auto-aof-rewrite-percentage`, `auto-aof-rewrite-min-size` | When the AOF has grown by this percentage (default 100) over its size after the last checkpoint, and is at least this size (default 64 MB), a checkpoint runs. Checked every 10 seconds. `0` turns it off. Both can be changed with `CONFIG SET`. |
-| `rdbcompression` | `yes` (the default): snapshots are written compressed (see [Compressed snapshots](#compressed-snapshots)). `no`: the plain image, which KiviDB 1.2 and earlier read. `CONFIG SET rdbcompression` works at runtime, from the next snapshot on. |
+| `rdbcompression` | `no` (the default in 1.3): the plain image, which KiviDB 1.2 and earlier read. `yes`: snapshots are written compressed (see [Compressed snapshots](#compressed-snapshots)), which 1.2 cannot read. The default is planned to become `yes` in a later release. `CONFIG SET rdbcompression` works at runtime, from the next snapshot on. |
 | `hll-write-format` | `legacy` (the default) or `redis`. New HyperLogLog values use that format; existing values keep theirs. Per server, set in the config file or with `CONFIG SET`, and written by `CONFIG REWRITE`. See below before switching. |
 
 ## Checkpoints
@@ -381,7 +381,8 @@ cannot be read by an older one once it contains any of these.
 
 ## Compressed snapshots
 
-With `rdbcompression yes`, the default, every snapshot is written
+With `rdbcompression yes` (off by default in 1.3, so that a rollback to
+1.2 works), every snapshot is written
 compressed: `dump.kdb` (by `SAVE`, `BGSAVE`, a checkpoint of the AOF and the
 shutdown), the base of an online backup, and a full sync to a replica that
 reads it. The image is the plain one, byte for byte, cut into blocks of
@@ -413,8 +414,10 @@ no` sends the plain image to every replica.
 
 ### Going back to 1.2
 
-KiviDB 1.2 and earlier refuse a compressed snapshot (`bad magic`) and do
-not start on it; nothing is changed on disk. To hand a snapshot to one:
+With the default, `rdbcompression no`, there is nothing to do: 1.3 writes
+the plain snapshots 1.2 reads. After `rdbcompression yes`, KiviDB 1.2 and
+earlier refuse a compressed snapshot (`bad magic`) and do not start on it;
+nothing is changed on disk. To hand a snapshot to one:
 
 * `CONFIG SET rdbcompression no`, then `SAVE` (with the AOF on, this writes
   the AOF's base plain too); or set `rdbcompression no` in the config file
@@ -427,7 +430,7 @@ kividb kdb-compress dump-plain.kdb dump.kdb     # and back
 ```
 
 An online backup's BASE (`appendonly.aof.N.base.kdb`) is a snapshot like
-any other: taken by 1.3 with `rdbcompression yes`, the default, 1.2 cannot
+any other: taken by 1.3 with `rdbcompression yes`, 1.2 cannot
 restore it (`--preload-file aof:...` refuses it with `bad magic`). Convert
 the BASE with `kividb kdb-decompress` (and name the plain file in the
 manifest's place of the old one), or take the backup with `rdbcompression

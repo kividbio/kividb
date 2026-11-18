@@ -121,7 +121,7 @@ warning. Cluster bus links, a replica's link to its master and files written whi
 are not counted in that; leave room for them in a large cluster.
 
 Persistence (snapshots and the AOF) is described in [PERSISTENCE.md](PERSISTENCE.md),
-including `rdbcompression` (default `yes`: snapshots are written compressed) and the
+including `rdbcompression` (default `no`; `yes` writes snapshots compressed, which 1.2 cannot read) and the
 `kividb kdb-decompress <in> <out>` and `kividb kdb-compress <in> <out>` tools, which convert a
 snapshot between the compressed form and the plain one KiviDB 1.2 reads (refusing an input the
 server would not load, and an existing output unless `--force` is given).

@@ -9,19 +9,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrading
 
-- **Snapshots are written compressed (#879), and 1.2.x cannot read them.**
-  With `rdbcompression yes`, the default, `dump.kdb`, the AOF's base and a
-  backup's base start with `KIVIDBZ1`; KiviDB 1.2.2 and earlier refuse such
-  a file (`bad magic`) and do not start, changing nothing on disk. To go
-  back: `CONFIG SET rdbcompression no` and `SAVE` (or `rdbcompression no` in
-  the config file before the last shutdown), or convert the file with
-  `kividb kdb-decompress dump.kdb dump-plain.kdb`. A backup's BASE taken
-  by 1.3 with the default is compressed too: 1.2 cannot restore it until it
-  is converted the same way, or take the backup with `rdbcompression no`.
-  Every older snapshot
-  still loads. Replication across versions keeps working: a 1.3 master
-  sends a 1.2.x replica the plain image, and a 1.3 replica reads a 1.2.x
-  master's.
+- **Compressed snapshots are opt-in (#879): nothing changes on upgrade.**
+  `rdbcompression` defaults to `no`, and the snapshots 1.3 writes are the
+  plain ones 1.2 reads, so a rollback to 1.2.x keeps working. Before
+  turning on `rdbcompression yes`, know that KiviDB 1.2.2 and earlier
+  cannot read what it writes: `dump.kdb`, the AOF's base and a backup's
+  BASE start with `KIVIDBZ1`, which they refuse (`bad magic`) and do not
+  start on, changing nothing on disk. The way back: `CONFIG SET
+  rdbcompression no` and `SAVE` (or `BGREWRITEAOF` with the AOF on), or
+  convert a file with `kividb kdb-decompress dump.kdb dump-plain.kdb` (a
+  backup's BASE as well). Replication across versions keeps working either
+  way: a 1.3 master sends a 1.2.x replica the plain image. The default is
+  planned to become `yes` in a later release, once 1.3 is the oldest
+  version one can roll back to.
 
 - **A server on `--threads 0` (auto, the default) starts more worker
   threads (#873).** Auto is now one per CPU the process may use, where it
@@ -89,8 +89,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Compressed snapshots: `rdbcompression` is in effect (#879).** With
-  `yes`, the default, a snapshot is the same image as before cut into
+- **Compressed snapshots, opt-in: `rdbcompression yes` (#879).**
+  `rdbcompression`, which was accepted and did nothing, is in effect; it
+  defaults to `no` in 1.3 (see Upgrading). With `yes` (config file, command
+  line or `CONFIG SET`), a snapshot is the same image as before cut into
   blocks of 256 KiB, each compressed with zstd (level 1) on up to two
   compression threads (the CPUs less one; started once, shared by every
   save), never the serving threads, or stored as it is
@@ -323,13 +325,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dataset digest lets the replica continue without a full sync.
 
 ### Changed
-
-- **`dump.kdb` is a third to a thirtieth of its size (#879).** Snapshots
-  are written compressed by default (see Added); `rdbcompression`, which
-  was accepted and did nothing, now chooses. The issue's 6M keys of 150 B
-  save to 32.7 MB instead of 1,007 MB (Redis: 143 MB), in 2.0 s instead of
-  6.2 s on the VM's disk; a full sync to a replica of this version sends
-  that and holds +99 MB on the master instead of +1,055 MB.
 
 - **Pub/sub fan-out delivers 18-29 % more messages a second, ahead of
   Redis (#851).** socket.io's Redis adapter publishes every broadcast with

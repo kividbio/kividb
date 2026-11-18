@@ -57,8 +57,8 @@ Directives for machinery KiviDB doesn't have (`io-threads`, `hz`,
 are accepted with a warning and do nothing. `lazyfree-lazy-expire` and
 `lazyfree-lazy-user-del` are in effect: `lazyfree-lazy-user-del yes` makes
 `DEL` free a large value in the background, as `UNLINK` does.
-`rdbcompression` is in effect too: `yes` (the default) writes `dump.kdb`
-compressed (see [PERSISTENCE.md](PERSISTENCE.md#compressed-snapshots)).
+`rdbcompression` is in effect too: `yes` writes `dump.kdb` compressed
+(the default is `no`, which 1.2 reads) (see [PERSISTENCE.md](PERSISTENCE.md#compressed-snapshots)).
 
 The ones that behave differently:
 

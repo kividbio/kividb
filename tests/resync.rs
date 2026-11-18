@@ -1579,7 +1579,14 @@ fn concurrent_writes_to_one_key_are_replicated_in_the_order_they_were_applied() 
 /// and been read through.
 #[test]
 fn a_full_sync_cut_off_part_way_costs_the_replica_nothing() {
-    let master = Server::start(&[]);
+    // Plain, and compressed (`rdbcompression yes`, #879).
+    for compression in ["no", "yes"] {
+        full_sync_cut_off_part_way(compression);
+    }
+}
+
+fn full_sync_cut_off_part_way(compression: &str) {
+    let master = Server::start(&["--rdbcompression", compression]);
     let relay = Relay::to(master.port);
     let replica = Server::start(&[]);
     let (mut m, mut r) = (master.conn(), replica.conn());

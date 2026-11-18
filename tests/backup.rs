@@ -395,8 +395,13 @@ fn a_snapshot_never_holds_half_a_transaction() {
 /// nothing after — with no write counted twice and none half-applied.
 #[test]
 fn a_backup_taken_under_load_restores_to_the_seal_boundary() {
-    for aof in [false, true] {
-        let source = Server::start(if aof { &["--aof"] } else { &[] });
+    // And with the BASE written compressed (`rdbcompression yes`, #879).
+    for (aof, compression) in [(false, "no"), (true, "no"), (false, "yes"), (true, "yes")] {
+        let mut args = vec!["--rdbcompression", compression];
+        if aof {
+            args.push("--aof");
+        }
+        let source = Server::start(&args);
         let mut c = source.conn();
 
         for i in 0..500 {
@@ -468,6 +473,15 @@ fn a_backup_taken_under_load_restores_to_the_seal_boundary() {
             "{listed:?}"
         );
         let base_len = base.metadata().unwrap().len();
+        let magic: &[u8] = if compression == "yes" {
+            b"KIVIDBZ1"
+        } else {
+            b"KIVIDB01"
+        };
+        assert!(
+            std::fs::read(base).unwrap().starts_with(magic),
+            "{compression}"
+        );
 
         c.cmd(&["SET", "during", "window"]);
         c.cmd(&["DEL", "k:0"]);
@@ -2052,8 +2066,6 @@ fn a_preload_file_that_is_not_a_whole_snapshot_is_fatal() {
     for i in 0..50 {
         c.cmd(&["SET", &format!("key:{i}"), &"v".repeat(100)]);
     }
-    // The plain image, which the test cuts where it means to (#879).
-    assert!(c.cmd(&["CONFIG", "SET", "rdbcompression", "no"]).ok());
     assert!(c.cmd(&["SAVE"]).ok());
     let kdb = std::fs::read(source.dir.join("dump.kdb")).unwrap();
     let rdb = fixture("redis-8.10.rdb");
@@ -2234,8 +2246,6 @@ fn the_empty_key_survives_a_save_and_a_restart() {
     let mut server = Server::start(&[]);
     let mut c = server.conn();
     write_empty_keys(&mut c);
-    // The plain image, which the test reads (#879).
-    assert!(c.cmd(&["CONFIG", "SET", "rdbcompression", "no"]).ok());
     assert!(c.cmd(&["SAVE"]).ok());
     drop(c);
     // Written under the stand-in length: the stand-in, the string tag, a

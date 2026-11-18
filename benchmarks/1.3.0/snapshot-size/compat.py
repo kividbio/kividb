@@ -155,14 +155,14 @@ ok, got, _ = load_with(NEW, d)
 check("1.2.2 dump.kdb loads in this build", ok and got[:2] == want[:2] and got[2] > 0, (want[:2], got))
 
 # 2. this build with rdbcompression no: 1.2.2 loads it
-d, want = save_with(NEW, "t2", conf="rdbcompression no\n")
-check("rdbcompression no writes KIVIDB01", magic(d + "/dump.kdb") == b"KIVIDB01")
+d, want = save_with(NEW, "t2")
+check("the default (rdbcompression no) writes KIVIDB01", magic(d + "/dump.kdb") == b"KIVIDB01")
 ok, got, _ = load_with(V122, d)
-check("rdbcompression no dump loads in 1.2.2", ok and got[:2] == want[:2] and got[2] > 0, (want[:2], got))
+check("the default dump loads in 1.2.2", ok and got[:2] == want[:2] and got[2] > 0, (want[:2], got))
 
 # 3. the compressed file: 1.2.2 refuses with bad magic, exits non-zero, touches nothing
-d, want = save_with(NEW, "t3")
-check("default writes KIVIDBZ1", magic(d + "/dump.kdb") == b"KIVIDBZ1")
+d, want = save_with(NEW, "t3", conf="rdbcompression yes\n")
+check("rdbcompression yes writes KIVIDBZ1", magic(d + "/dump.kdb") == b"KIVIDBZ1")
 before = files(d)
 ok, got, rc = load_with(V122, d)
 with open(d + "/server.log") as f:
@@ -223,7 +223,7 @@ def repl(master_bin, replica_bin, name, master_conf=""):
     return synced and follow and same, full, up, mlog, rlog
 
 
-ok, full, up, mlog, rlog = repl(NEW, V122, "t5")
+ok, full, up, mlog, rlog = repl(NEW, V122, "t5", master_conf="rdbcompression yes\n")
 check("1.2.2 replica of this master: in sync, stream follows", ok)
 check("1.2.2 replica of this master: one full sync, link up after 15 s", full == 1 and up == "up", (full, up))
 check("1.2.2 replica of this master: sent plain", "a plain snapshot (the replica does not take kdb-blocks)" in mlog)
@@ -232,18 +232,18 @@ ok, full, up, mlog, rlog = repl(V122, NEW, "t6")
 check("this replica of a 1.2.2 master: in sync, stream follows", ok)
 check("this replica of a 1.2.2 master: one full sync, link up", full == 1 and up == "up", (full, up))
 
-ok, full, up, mlog, rlog = repl(NEW, NEW, "t7")
+ok, full, up, mlog, rlog = repl(NEW, NEW, "t7", master_conf="rdbcompression yes\n")
 check("this <-> this: in sync, stream follows", ok)
 check("this <-> this: one full sync, link up", full == 1 and up == "up", (full, up))
 check("this <-> this: master sent compressed", "a compressed snapshot (the replica takes kdb-blocks)" in mlog)
 check("this <-> this: replica got compressed", "the master sent a compressed snapshot" in rlog)
 
-ok, full, up, mlog, rlog = repl(NEW, NEW, "t8", master_conf="rdbcompression no\n")
-check("this <-> this, master rdbcompression no: in sync, plain", ok and "plain snapshot (rdbcompression no)" in mlog)
+ok, full, up, mlog, rlog = repl(NEW, NEW, "t8")
+check("this <-> this, master with the default: in sync, plain", ok and "plain snapshot (rdbcompression no)" in mlog)
 
 # 9. AOF directory: compressed base refused by 1.2.2; after rdbcompression no + rewrite, loaded
 d = fresh("t9")
-p = start(NEW, d, 7320, extra=("--appendonly", "yes"))
+p = start(NEW, d, 7320, extra=("--appendonly", "yes", "--rdbcompression", "yes"))
 assert ready(7320, p)
 c = cli(7320)
 populate(c)
@@ -256,7 +256,7 @@ base = [n for n in os.listdir(d) if n.endswith(".kdb")]
 check("AOF base written compressed", all(magic(d + "/" + n) == b"KIVIDBZ1" for n in base) and base, base)
 ok, got, rc = load_with(V122, d, port=7321)
 check("1.2.2 refuses the compressed AOF base", not ok and rc not in (0, None), rc)
-p = start(NEW, d, 7320, extra=("--appendonly", "yes"))
+p = start(NEW, d, 7320, extra=("--appendonly", "yes", "--rdbcompression", "yes"))
 assert ready(7320, p)
 c = cli(7320)
 check("this build restarts on compressed AOF base + log", digest(c)[:2] == want[:2])

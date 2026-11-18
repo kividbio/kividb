@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""#879: snapshots are written compressed (`rdbcompression yes`, the default).
+"""#879: snapshots written compressed, with `rdbcompression yes` (opt-in in 1.3).
+
+The suite SETS THE OPTION: in the `-yes` configurations the candidate is
+given `CONFIG SET rdbcompression yes` before it saves; in the `-default`
+ones it runs as it starts (`no` in 1.3: the plain image 1.2 reads). v1.2.2
+and Redis run the same in both (Redis compresses by default).
 
 Two datasets, each loaded into a fresh server of the engine (lib/nodes.py):
 
@@ -17,8 +22,9 @@ the time until it answers `PING` with every key loaded (best of 2).
 On v1.2.2 the issue's dataset writes 1,007 MB (7x Redis's 143 MB, #879);
 with compression it is about 33 MB.
 
-Gates: the snapshot size keeps 60 % of its gain over v1.2.2, and the issue's
-dataset is within 1.5x of Redis's `dump.rdb` (the issue's ask). The save
+Gates, `-yes`: the snapshot size keeps 60 % of its gain over v1.2.2, and
+the issue's dataset is within 1.5x of Redis's `dump.rdb` (the issue's ask).
+`-default`: the size within 1 % of v1.2.2's (the same image). The save
 does more work (it compresses) and writes less: at most 2.5x v1.2.2's time
 this session (the study measured up to 2.2x on tmpfs for the collections);
 the load decompresses: at most 1.5x v1.2.2's.
@@ -32,7 +38,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import Suite, Config, ratio, vs_redis, vs_v1_2_2, info, scaled, median  # noqa: E402
 from nodes import Nodes  # noqa: E402
 
-S = Suite("24-snapshot-size", [Config("issue", self_hosted=True), Config("coll", self_hosted=True)])
+S = Suite(
+    "24-snapshot-size",
+    [
+        Config(name, self_hosted=True)
+        for name in ("issue-default", "issue-yes", "coll-default", "coll-yes")
+    ],
+)
 
 
 def dump_path(node):
@@ -80,10 +92,13 @@ def load_coll(c):
 
 @S.run
 def run(ctx):
-    load = load_issue if ctx.config.name == "issue" else load_coll
+    dataset, setting = ctx.config.name.split("-")
+    load = load_issue if dataset == "issue" else load_coll
     with Nodes(ctx) as ns:
         first = ns.start()
         c = first.client()
+        if setting == "yes" and ctx.engine == "candidate":
+            c.config_set("rdbcompression", "yes")
         n = load(c)
         assert c.dbsize() == n, (c.dbsize(), n)
         saves = []
@@ -109,9 +124,12 @@ def run(ctx):
             assert got == n, (got, n)
             loads.append(ready)
             again.stop()
-        size_gates = [ratio()]
-        if ctx.config.name == "issue":
-            size_gates.append(vs_redis(1.5))
+        if setting == "yes":
+            size_gates = [ratio()]
+            if dataset == "issue":
+                size_gates.append(vs_redis(1.5))
+        else:
+            size_gates = [vs_v1_2_2(1.01)]
         ctx.emit("snapshot_mb", size / 1e6, "MB", "lower", gate=size_gates)
         ctx.emit("save_ms", median(saves), "ms", "lower", gate=[vs_v1_2_2(2.5)], samples=saves)
         ctx.emit("load_ms", min(loads), "ms", "lower", gate=[vs_v1_2_2(1.5)], samples=loads)
