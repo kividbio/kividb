@@ -360,8 +360,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pipeline 16 and from 1.30M to 1.50M at 100; `GET` is unchanged.
   At 200,000 the two io_uring workers are still at times put on one CPU by
   the scheduler, and connections wait out the other's time slice (0.17,
-  0.59 and 1.0 ms in three runs): `worker-cpu-affinity auto` binds each to
-  a CPU of its own. A server with no backlog (one started empty, as
+  0.59 and 1.0 ms in three runs); the opt-in `worker-cpu-affinity auto`
+  (#927) binds each to a CPU of its own. A server with no backlog (one started empty, as
   benchmarks start it) does none of this: 31.6-31.9k checks a second at a
   p99 of 0.06-0.10 ms at every rate. `WAIT` with no replica attached no
   longer waits for the replication thread (it has nothing to count): 62 us
