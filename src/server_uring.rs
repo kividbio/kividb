@@ -373,6 +373,8 @@ async fn park_blocking_uring(
     watch: &PeerWatch,
     repl_state: &crate::replication::ReplState,
     carried: &mut Vec<u8>,
+    carried_from: usize,
+    held_elsewhere: usize,
     activity: &crate::client_registry::Activity,
     limit: crate::server::HardLimit,
 ) -> Result<(), Vec<u8>> {
@@ -402,7 +404,18 @@ async fn park_blocking_uring(
         // The client is read while it waits, as the connection's own write
         // reads it (#865).
         let write = std::pin::pin!(stream.write_all(payload));
-        let (res, mut returned) = read_while_writing(write, watch, carried, activity, limit).await;
+        let (res, mut returned) = read_while_writing(
+            write,
+            watch,
+            crate::server::ReadAhead {
+                carried,
+                carried_from,
+                held_elsewhere,
+            },
+            activity,
+            limit,
+        )
+        .await;
         drop(_w);
         returned.clear();
         *out_buf = returned;
@@ -680,7 +693,7 @@ async fn read_while_writing(
         &mut dyn std::future::Future<Output = tokio_uring::BufResult<(), Vec<u8>>>,
     >,
     watch: &PeerWatch,
-    carried: &mut Vec<u8>,
+    read_ahead: crate::server::ReadAhead<'_>,
     activity: &crate::client_registry::Activity,
     mut limit: crate::server::HardLimit,
 ) -> tokio_uring::BufResult<(), Vec<u8>> {
@@ -689,14 +702,20 @@ async fn read_while_writing(
         tokio::select! {
             biased;
             written = &mut write => return written,
-            read = watch.read_into(carried), if reading => match read {
+            read = watch.read_into(read_ahead.carried), if reading => match read {
                 Ok(n) if n > 0 => {
                     crate::stats::TOTAL_NET_INPUT_BYTES
                         .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                     crate::stats::record_read();
                     activity.touch();
                     activity.note_read(n);
-                    if crate::server::carried_too_much(carried) || limit.over_after(n) {
+                    if crate::server::carried_too_much(
+                        read_ahead.held_elsewhere,
+                        read_ahead.carried,
+                        read_ahead.carried_from,
+                    )
+                        || limit.over_after(n)
+                    {
                         // SAFETY: the connection's descriptor, open while it runs.
                         unsafe { libc::shutdown(watch.fd, libc::SHUT_RDWR) };
                         reading = false;
@@ -1154,6 +1173,12 @@ pub async fn handle_client(
         // that buffer until the next read opportunity; that is the accepted
         // io_uring tradeoff for not racing the read (Redis shrinks such buffers
         // from its client cron instead).
+        //
+        // Whether this turn's bytes were moved out of `carried`, already
+        // held, rather than read: what is already held is not reserved for
+        // again — `parse_buf` would reserve a request's full length while
+        // `carried` still holds it, and the client would keep the two (#869).
+        let mut fed_from_carried = false;
         let (unparsed, n) = if std::mem::take(&mut reparse) {
             // Only a `SHUTDOWN` that failed reparses, and its turn submitted
             // no read with its write.
@@ -1176,6 +1201,7 @@ pub async fn handle_client(
             // a read would have brought it: what one turn runs, and so the
             // replies the output limit looks at after it, is no more than a
             // read brings (#865).
+            fed_from_carried = true;
             let unparsed = parse_buf.len();
             let to = carried.len().min(carried_from + READ_BUFFER);
             parse_buf.extend_from_slice(&carried[carried_from..to]);
@@ -1185,7 +1211,9 @@ pub async fn handle_client(
                 carried = Vec::new();
                 carried_from = 0;
             } else if carried_from > carried.len() / 2 {
-                carried.drain(0..carried_from);
+                // What was moved out of `carried` is given back — capacity
+                // with it — in steps, rather than at the end (#869).
+                carried = carried.split_off(carried_from);
                 carried_from = 0;
             }
             (unparsed, n)
@@ -1614,6 +1642,8 @@ pub async fn handle_client(
                             &peer_watch,
                             &repl_state,
                             &mut carried,
+                            carried_from,
+                            parse_buf.len() - (parse_offset + consumed),
                             &activity,
                             limit,
                         ))
@@ -1715,6 +1745,8 @@ pub async fn handle_client(
                         &peer_watch,
                         &repl_state,
                         &mut carried,
+                        carried_from,
+                        parse_buf.len() - (parse_offset + consumed),
                         &activity,
                         limit,
                     ))
@@ -3174,7 +3206,7 @@ pub async fn handle_client(
                 resp::parse::PRIVATE_QUERY_BUFFER_MIN_CAPACITY.saturating_sub(parse_buf.len()),
             );
         }
-        if reserve_hint > parse_buf.capacity() {
+        if reserve_hint > parse_buf.capacity() && !fed_from_carried {
             parse_buf.reserve(reserve_hint.saturating_sub(parse_buf.len()));
         }
         query_buffer_peak = query_buffer_peak.max(reserve_hint);
@@ -3314,7 +3346,11 @@ pub async fn handle_client(
                                     Box::pin(read_while_writing(
                                         write,
                                         &peer_watch,
-                                        &mut carried,
+                                        crate::server::ReadAhead {
+                                            carried: &mut carried,
+                                            carried_from,
+                                            held_elsewhere: parse_buf.len() - parse_start,
+                                        },
                                         &activity,
                                         limit,
                                     ))
@@ -3342,7 +3378,11 @@ pub async fn handle_client(
                     Box::pin(read_while_writing(
                         write,
                         &peer_watch,
-                        &mut carried,
+                        crate::server::ReadAhead {
+                            carried: &mut carried,
+                            carried_from,
+                            held_elsewhere: parse_buf.len() - parse_start,
+                        },
                         &activity,
                         limit,
                     ))
@@ -3360,7 +3400,11 @@ pub async fn handle_client(
                     let write = Box::pin(read_while_writing(
                         write,
                         &peer_watch,
-                        &mut carried,
+                        crate::server::ReadAhead {
+                            carried: &mut carried,
+                            carried_from,
+                            held_elsewhere: parse_buf.len() - parse_start,
+                        },
                         &activity,
                         limit,
                     ));
