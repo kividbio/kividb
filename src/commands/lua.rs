@@ -3077,7 +3077,8 @@ fn lua_value_to_resp(lua: &Lua, val: LuaValue) -> LuaResult<Vec<u8>> {
     // on Lua's stack, into one buffer (#901). What `write_reply` does not
     // write itself it leaves, and the whole reply is written as before.
     if let LuaValue::Table(table) = &val {
-        let mut out = Vec::new();
+        // Room for a short reply, which most are, without growing.
+        let mut out = Vec::with_capacity(128);
         let mut written = false;
         // SAFETY: `write_reply` keeps to the stack it is given and raises no
         // Lua error (see there); the closure leaves the stack empty.
@@ -3167,65 +3168,69 @@ unsafe fn write_reply(
                 if depth >= FAST_REPLY_MAX_DEPTH || ffi::lua_checkstack(state, 3) == 0 {
                     return false;
                 }
-                // `{ok = ...}`: a status, one line.
-                ffi::lua_pushstring(state, c"ok".as_ptr());
-                if ffi::lua_rawget(state, idx) == ffi::LUA_TSTRING {
-                    let mut len = 0usize;
-                    let ptr = ffi::lua_tolstring(state, -1, &mut len);
-                    let start = out.len();
-                    out.push(b'+');
-                    out.extend_from_slice(std::slice::from_raw_parts(ptr.cast::<u8>(), len));
-                    ffi::lua_pop(state, 1);
-                    for byte in &mut out[start + 1..] {
-                        if matches!(*byte, b'\r' | b'\n') {
-                            *byte = b' ';
-                        }
-                    }
-                    out.extend_from_slice(b"\r\n");
-                    return true;
-                }
-                ffi::lua_pop(state, 1);
-                // `{err = ...}`, as the whole reply only: an error reply is
-                // counted (`INFO errorstats`) as it is written, and one
-                // inside an array would be counted again if the rest of the
-                // array were then left to `lua_to_resp_inner`.
-                ffi::lua_pushstring(state, c"err".as_ptr());
-                if ffi::lua_rawget(state, idx) == ffi::LUA_TSTRING {
-                    if depth > 0 {
-                        ffi::lua_pop(state, 1);
-                        return false;
-                    }
-                    let mut len = 0usize;
-                    let ptr = ffi::lua_tolstring(state, -1, &mut len);
-                    let text =
-                        String::from_utf8_lossy(std::slice::from_raw_parts(ptr.cast::<u8>(), len))
-                            .into_owned();
-                    ffi::lua_pop(state, 1);
-                    out.extend_from_slice(&resp_error(&text));
-                    return true;
-                }
-                ffi::lua_pop(state, 1);
-                for key in [
-                    c"double",
-                    c"big_number",
-                    c"verbatim_string",
-                    c"set",
-                    c"map",
-                ] {
-                    ffi::lua_pushstring(state, key.as_ptr());
-                    let kind = ffi::lua_rawget(state, idx);
-                    ffi::lua_pop(state, 1);
-                    if kind != ffi::LUA_TNIL {
-                        return false;
-                    }
-                }
-                // An array: up to the first nil.
+                // An array is written up to its first nil.
                 let mut count: ffi::lua_Integer = 0;
                 while ffi::lua_rawgeti(state, idx, count + 1) != ffi::LUA_TNIL {
                     ffi::lua_pop(state, 1);
                     count += 1;
                 }
                 ffi::lua_pop(state, 1);
+                // A short table holding nothing but those has none of the
+                // keys looked for below: walked, it is known to have no other
+                // key at all, which costs less than asking for seven.
+                if count > PLAIN_ARRAY_WALK || !holds_only(state, idx, count) {
+                    ffi::lua_pushstring(state, c"ok".as_ptr());
+                    if ffi::lua_rawget(state, idx) == ffi::LUA_TSTRING {
+                        let mut len = 0usize;
+                        let ptr = ffi::lua_tolstring(state, -1, &mut len);
+                        let start = out.len();
+                        out.push(b'+');
+                        out.extend_from_slice(std::slice::from_raw_parts(ptr.cast::<u8>(), len));
+                        ffi::lua_pop(state, 1);
+                        for byte in &mut out[start + 1..] {
+                            if matches!(*byte, b'\r' | b'\n') {
+                                *byte = b' ';
+                            }
+                        }
+                        out.extend_from_slice(b"\r\n");
+                        return true;
+                    }
+                    ffi::lua_pop(state, 1);
+                    // `{err = ...}`, as the whole reply only: an error reply is
+                    // counted (`INFO errorstats`) as it is written, and one
+                    // inside an array would be counted again if the rest of the
+                    // array were then left to `lua_to_resp_inner`.
+                    ffi::lua_pushstring(state, c"err".as_ptr());
+                    if ffi::lua_rawget(state, idx) == ffi::LUA_TSTRING {
+                        if depth > 0 {
+                            ffi::lua_pop(state, 1);
+                            return false;
+                        }
+                        let mut len = 0usize;
+                        let ptr = ffi::lua_tolstring(state, -1, &mut len);
+                        let text =
+                            String::from_utf8_lossy(std::slice::from_raw_parts(ptr.cast::<u8>(), len))
+                                .into_owned();
+                        ffi::lua_pop(state, 1);
+                        out.extend_from_slice(&resp_error(&text));
+                        return true;
+                    }
+                    ffi::lua_pop(state, 1);
+                    for key in [
+                        c"double",
+                        c"big_number",
+                        c"verbatim_string",
+                        c"set",
+                        c"map",
+                    ] {
+                        ffi::lua_pushstring(state, key.as_ptr());
+                        let kind = ffi::lua_rawget(state, idx);
+                        ffi::lua_pop(state, 1);
+                        if kind != ffi::LUA_TNIL {
+                            return false;
+                        }
+                    }
+                }
                 crate::resp::write::push_header(out, b'*', count as usize);
                 for at in 1..=count {
                     ffi::lua_rawgeti(state, idx, at);
@@ -3242,6 +3247,34 @@ unsafe fn write_reply(
         }
     }
     true
+}
+
+/// The longest array `write_reply` walks to see whether it holds anything
+/// else: past this, asking for the seven keys is the cheaper.
+const PLAIN_ARRAY_WALK: mlua::ffi::lua_Integer = 16;
+
+/// Whether the table at `idx` holds exactly `count` entries (which are then
+/// its keys 1 to `count`): walked with `lua_next`, which raises no error for
+/// keys it gave itself.
+unsafe fn holds_only(
+    state: *mut mlua::ffi::lua_State,
+    idx: std::ffi::c_int,
+    count: mlua::ffi::lua_Integer,
+) -> bool {
+    use mlua::ffi;
+    let mut entries: mlua::ffi::lua_Integer = 0;
+    unsafe {
+        ffi::lua_pushnil(state);
+        while ffi::lua_next(state, idx) != 0 {
+            ffi::lua_pop(state, 1);
+            entries += 1;
+            if entries > count {
+                ffi::lua_pop(state, 1);
+                return false;
+            }
+        }
+    }
+    entries == count
 }
 
 /// The protocols a script's reply is written in, as Redis's
