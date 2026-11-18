@@ -1367,7 +1367,7 @@ mod tests {
         use std::sync::Arc;
         let store = crate::store::new_store(1);
         let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
-        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (hub_tx, _hub_rx) = crate::replication::HubTx::channel();
         let config = Arc::new(crate::config::Config::default());
         let started_at = std::time::Instant::now();
         let index_store = crate::vector::new_index_store();
