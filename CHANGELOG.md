@@ -262,6 +262,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`SSCAN`, `ZSCAN` and `HSCAN` of a large collection are faster, and a
+  call no longer copies the collection (#624, #770 in part).** A page was
+  found by collecting every element past the cursor into a vector as large
+  as the collection; it now keeps only about twice `COUNT` elements, and
+  the members of a set or sorted set are asked for from memory ahead of
+  being read. A full `MATCH` iteration with `COUNT 1000` of a 200,000-member
+  collection (one Azure D4s_v5, median of three rounds against 1.2.2's
+  release binary): `SSCAN` 1,083 ms (1.2.2: 1,427), `ZSCAN` 643 ms (1,121),
+  `HSCAN` 428 ms (480). Each call still reads the whole collection, so a
+  full iteration still costs more the larger the collection (#770).
+
 - **Auto worker threads: one per available CPU (#873).** `--threads 0`
   started the CPUs minus 2 (all of them below 4), so a 4-vCPU machine or
   container got 2 workers. Measured with the server confined to 4 vCPUs and

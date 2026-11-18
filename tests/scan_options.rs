@@ -377,3 +377,138 @@ fn good_options_still_scan() {
         "ERR:ERR wrong number of arguments for 'sscan' command"
     );
 }
+
+/// `['17',['a','b']]` as the cursor and the names (`NOSCORES`/`NOVALUES`).
+fn page(reply: &str) -> (String, Vec<String>) {
+    let rest = reply.strip_prefix("['").expect(reply);
+    let (cursor, rest) = rest.split_once("',[").expect(reply);
+    let inner = rest.strip_suffix("]]").expect(reply);
+    let names = if inner.is_empty() {
+        Vec::new()
+    } else {
+        inner
+            .split(',')
+            .map(|name| name.trim_matches('\'').to_string())
+            .collect()
+    };
+    (cursor.to_string(), names)
+}
+
+/// `kind key` with `names` (and a score or value for each), in one call.
+fn add(c: &mut Conn, kind: &str, key: &str, names: impl Iterator<Item = String>) {
+    let mut args: Vec<String> = vec![kind.into(), key.into()];
+    for name in names {
+        match kind {
+            "SADD" => args.push(name),
+            "HSET" => args.extend([name, "v".into()]),
+            _ => args.extend(["1".into(), name]),
+        }
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let reply = c.run(&args);
+    assert!(!reply.starts_with("ERR"), "{reply}");
+}
+
+fn remove(c: &mut Conn, kind: &str, key: &str, names: impl Iterator<Item = String>) {
+    let cmd = match kind {
+        "SADD" => "SREM",
+        "HSET" => "HDEL",
+        _ => "ZREM",
+    };
+    let mut args: Vec<String> = vec![cmd.into(), key.into()];
+    args.extend(names);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let reply = c.run(&args);
+    assert!(!reply.starts_with("ERR"), "{reply}");
+}
+
+/// The SCAN guarantee for SSCAN, HSCAN and ZSCAN: a member there from the
+/// first call to the last is returned, while another connection grows the
+/// collection twentyfold, shrinks it to the members that stay (a table
+/// shrinking, or the collection changing to its compact form), and grows it
+/// again, between pages; and no page is longer than COUNT asks for, or the
+/// floor of a 1,024th of the collection, plus the members at one position
+/// (no collision is likely among these). A page is found keeping only about
+/// twice COUNT elements (`helpers::scan_page`): growth and shrinking move
+/// the cut it makes.
+#[test]
+fn what_stays_is_returned_while_the_collection_grows_and_shrinks() {
+    let server = Server::start();
+    let mut c = Conn::connect(server.port);
+    let mut other = Conn::connect(server.port);
+    for (kind, scan, flag) in [
+        ("SADD", "SSCAN", None),
+        ("HSET", "HSCAN", Some("NOVALUES")),
+        ("ZADD", "ZSCAN", Some("NOSCORES")),
+    ] {
+        for (count, start) in [(7usize, 1_000usize), (100, 3_000), (1, 150)] {
+            let key = format!("{scan}-{count}");
+            let keep = || (0..40).map(|i| format!("keep:{i}"));
+            add(&mut other, kind, &key, keep());
+            add(
+                &mut other,
+                kind,
+                &key,
+                (0..start).map(|i| format!("first:{i}")),
+            );
+            let mut seen = std::collections::HashSet::new();
+            let mut cursor = "0".to_string();
+            let mut calls = 0;
+            loop {
+                let count_arg = count.to_string();
+                let mut args = vec![scan, key.as_str(), cursor.as_str(), "COUNT", &count_arg];
+                args.extend(flag);
+                let (next, names) = page(&c.run(&args));
+                // At most 23,040 members here: a floor of 22. (A collection
+                // in its compact form comes back whole, cursor 0.)
+                assert!(
+                    next == "0" || names.len() <= count.max(22) + 2,
+                    "{scan} COUNT {count}: a page of {}",
+                    names.len()
+                );
+                seen.extend(names);
+                calls += 1;
+                match calls {
+                    2 => add(
+                        &mut other,
+                        kind,
+                        &key,
+                        (0..20_000).map(|i| format!("grown:{i}")),
+                    ),
+                    4 => {
+                        remove(
+                            &mut other,
+                            kind,
+                            &key,
+                            (0..start).map(|i| format!("first:{i}")),
+                        );
+                        remove(
+                            &mut other,
+                            kind,
+                            &key,
+                            (0..20_000).map(|i| format!("grown:{i}")),
+                        );
+                    }
+                    6 => add(
+                        &mut other,
+                        kind,
+                        &key,
+                        (0..3_000).map(|i| format!("again:{i}")),
+                    ),
+                    _ => {}
+                }
+                if next == "0" {
+                    break;
+                }
+                assert!(calls < 100_000, "{scan} COUNT {count}: the scan ends");
+                cursor = next;
+            }
+            for name in keep() {
+                assert!(
+                    seen.contains(&name),
+                    "{scan} COUNT {count}: {name} was there throughout and not returned"
+                );
+            }
+        }
+    }
+}

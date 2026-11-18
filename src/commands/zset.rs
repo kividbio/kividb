@@ -1545,7 +1545,10 @@ fn zscan(ctx: &mut Ctx) -> Vec<u8> {
             // In the order of the members' positions: see
             // `helpers::scan_position`.
             let (page, next_cursor) = crate::commands::helpers::scan_page(
-                inner.members.iter().map(|(member, score)| {
+                crate::commands::helpers::prefetched(inner.members.iter(), |(member, _)| {
+                    member.as_ptr()
+                })
+                .map(|(member, score)| {
                     (
                         crate::commands::helpers::scan_position(member),
                         (member, *score),
