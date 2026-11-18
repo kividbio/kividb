@@ -39,6 +39,7 @@ and why.
 | `22-scan-large-count` | #884 | Argo CD's `SCAN <cursor> MATCH revoked-token\|* COUNT 10000` over 40,000 keys of 50 KB that it never matches (`--threads 4`): microseconds a call, client side and the server's own (`INFO commandstats`), calls and keys returned (exactly 0) for a full iteration, and the p99 of four `PING` probes while four other connections loop the same `SCAN` |
 | `23-pubsub-pattern-fanout` | #851 | socket.io's Redis adapter: 48 `redis-benchmark` connections `PUBLISH` 200-byte messages to `socket.io#/#room<n>#`, 16 subscribers `PSUBSCRIBE socket.io#/#*` (`pattern`) or `SUBSCRIBE` one channel (`channel`, the plain fan-out guard): messages delivered a second until every subscriber has all of them, messages lost (exactly 0), and the p99 of a probe's own messages from publish to receipt |
 | `24-snapshot-size` | #879 | `SAVE` of #879's dataset (`DEBUG POPULATE 6000000 k 150`) and of a collections mix (200,000 hashes of 10 fields, 50,000 each of sets, sorted sets and lists of 20), each twice: `-default` (the candidate as it starts, `rdbcompression no`) and `-yes` (the suite sets `CONFIG SET rdbcompression yes` on the candidate): the snapshot's size, the `SAVE` time (median of 3 after a warm-up) and the time a new server takes to load it (best of 2). Gates: `-yes` keeps 60 % of the size gain over v1.2.2 and #879's dataset within 1.5x of Redis's `dump.rdb`; `-default` within 1 % of v1.2.2's size; the save at most 2.5x v1.2.2's time, the load 1.5x |
+| `26-vector-sets-ann` | #627 | Vector sets on real embeddings (glove-100, and LAION image embeddings at 768 dimensions; 100,000 vectors, and 1,000,000 with `FULL=1`), `Q8` on every server, cosine: `VADD` a second (pipelined, 4 clients), `used_memory` and RSS a vector, then `VSIM ... COUNT 10 EF <ef>` at the first EF whose recall@10 against exact results is at least 0.95 (matched recall, not matched parameters): queries a second and p99 at 1, 16 and 100 connections. Redis 8.10.2 and Garnet (`$GARNET_SERVER`, `--enable-vector-set-preview`, a preview) measured the same way; Garnet's rows are `garnet_*`, shown. Gates: `VADD` at least 10x Redis, bytes a vector at most 0.8x, recall at least 0.95, q/s within 25 % of recorded |
 
 ## Running it
 
@@ -108,6 +109,15 @@ redis-server must match `pins.redis_sha256`
 elsewhere differs, so set `REGRESS_REDIS_SHA256` to use it). Suite 03 measures
 glibc malloc's give-back: a candidate that links mimalloc (a `lua` or `full`
 build) fails it on purpose.
+
+Suite 26 also uses h5py (pinned in `requirements.txt`), downloads its two
+datasets once into `$VSET_DATASETS` (default `$REGRESS_CACHE/datasets`:
+glove-100-angular from ann-benchmarks.com, 485 MB, and
+laion-img-emb-768-1M-cosine from redis/vector-db-benchmark's list, 3.1 GB,
+each SHA-256 checked), and needs `GARNET_SERVER`, the GarnetServer of
+Garnet's latest release (v2.2.13 when written; on .NET 10), or
+`GARNET_SERVER=none` to leave Garnet out. Its `FULL=1` configurations load
+1,000,000 vectors into Redis's HNSW graph: set `SUITE_TIMEOUT=7200`.
 
 Suites 05-13 also use `redis-benchmark` and `redis-cli` from the directory of
 the Redis binary, numpy (pinned in `requirements.txt`, for
@@ -910,6 +920,27 @@ pattern row against Redis's 1.35M and 0.9 ms. The channel row is a guard:
 the 4 Python readers are near their limit there, so it catches a loss, not
 a gain. #851's PR has the pinned measurements (server on 2 vCPUs, clients
 on the other 2, a Rust client), where the difference is larger.
+
+## Suite 26, measured off the gate VM
+
+Not a recording: the baseline is recorded on the benchmark VM. Measured
+2026-11-18 on an Apple M3 Pro (11 cores, macOS 26.3.1), client and server on
+the same machine. Candidate: master `d1a6712c`, `cargo build --release`
+(default threads); Redis 8.6.1 (Homebrew, not the 8.10.2 the suite pins);
+Garnet not run here (`GARNET_SERVER=none`). 100,000 vectors, 500 queries.
+
+| dataset | server | VADD/s | B/vector | EF | recall@10 | q/s 1 / 16 / 100 conns | p99 ms 1 / 16 / 100 |
+|---|---|---:|---:|---:|---:|---|---|
+| glove100 | KiviDB | 326,546 | 196 | 10 | 0.985 | 210 / 1,253 / 1,201 | 15.0 / 31.4 / 197 |
+| glove100 | Redis | 2,151 | 870 | 640 | 0.970 | 576 / 4,862 / 5,135 | 2.7 / 7.1 / 93.6 |
+| laion768 | KiviDB | 131,010 | 864 | 10 | 0.976 | 32 / 347 / 335 | 34.9 / 76.1 / 606 |
+| laion768 | Redis | 967 | 1,526 | 80 | 0.960 | 1,258 / 9,108 / 9,656 | 1.1 / 4.0 / 23.9 |
+
+KiviDB loads 135-150x faster and holds 0.23-0.57x the memory a vector (no
+graph); it searches 2.7-4x (glove100) and 15-40x (laion768) slower, as an
+exact scan does (#710). Redis needed EF 640 on glove-100 to reach 0.95
+(0.56 at EF 10), 80 on LAION. KiviDB's recall is below 1.0 because it
+scans the Q8 vectors, not the f32 ones the ground truth is computed from.
 
 ## Not covered
 
