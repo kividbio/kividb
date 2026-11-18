@@ -386,6 +386,15 @@ struct RangeParams<'a> {
     limit_count: usize, // usize::MAX means "no limit"
 }
 
+/// Copies of `members`, pushed one by one: `collect` left the walk out of line.
+fn copy_members<'a>(members: impl Iterator<Item = (Member<'a>, f64)>) -> Vec<(Vec<u8>, f64)> {
+    let mut copies = Vec::with_capacity(members.size_hint().0);
+    for (member, score) in members {
+        copies.push((member.to_vec(), score));
+    }
+    copies
+}
+
 /// Core range logic. Returns owned (member_bytes, score) pairs — no RESP encoding.
 /// All public range commands call this and format the output themselves.
 /// Returning Vec<(Vec<u8>, f64)> instead of Vec<u8> means:
@@ -483,7 +492,6 @@ fn zrange_pairs(inner: &SortedSetInner, p: &RangeParams) -> Vec<(Vec<u8>, f64)> 
 
         // Only the members asked for are copied. Every member of the set
         // used to be, for each call, and all but these thrown away.
-        let copy = |(member, score): (Member<'_>, f64)| (member.to_vec(), score);
         // The tree has no way straight to the hundredth member: it is
         // walked to it, from whichever end is nearer. `start` counts from
         // the end the answer begins at (the top, for REV); past half way,
@@ -495,19 +503,17 @@ fn zrange_pairs(inner: &SortedSetInner, p: &RangeParams) -> Vec<(Vec<u8>, f64)> 
         if p.rev == from_far_end {
             if p.rev {
                 // Counted from the top and far from it: near the bottom.
-                let mut found: Vec<(Vec<u8>, f64)> =
-                    inner.range_by_rank(first, last).map(copy).collect();
+                let mut found = copy_members(inner.range_by_rank(first, last));
                 found.reverse();
                 found
             } else {
-                inner.range_by_rank(start, stop).map(copy).collect()
+                copy_members(inner.range_by_rank(start, stop))
             }
         } else if p.rev {
-            inner.range_by_rank(first, last).rev().map(copy).collect()
+            copy_members(inner.range_by_rank(first, last).rev())
         } else {
             // Forward, but nearer the back: walk from the back and turn it.
-            let mut found: Vec<(Vec<u8>, f64)> =
-                inner.range_by_rank(start, stop).rev().map(copy).collect();
+            let mut found = copy_members(inner.range_by_rank(start, stop).rev());
             found.reverse();
             found
         }
