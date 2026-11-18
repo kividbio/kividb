@@ -1353,7 +1353,11 @@ pub async fn handle_client(
                 }
             } else {
                 // `client-output-buffer-limit` after each reply: see the
-                // matching arm in `src/server.rs` (#893).
+                // matching arm in `src/server.rs` (#893), which settles a
+                // dropped reply first.
+                if due & crate::output_limits::REDISPATCH == 0 {
+                    reply_gate.settle(&mut out_buf);
+                }
                 if due & crate::output_limits::WATCH != 0
                     && reply_limit.closes_after_reply(
                         pubsub.limits(),
@@ -1840,7 +1844,12 @@ pub async fn handle_client(
                             client_id,
                         );
                     }
-                    out_buf.extend_from_slice(&reply);
+                    crate::output_limits::append_reply(
+                        &mut out_buf,
+                        &reply,
+                        &mut due,
+                        pubsub.limits(),
+                    );
                     parse_offset += consumed;
                     continue;
                 }
@@ -1856,7 +1865,12 @@ pub async fn handle_client(
                 if let Some(refusal) =
                     crate::pubsub::shard_subscribe_refusal(cmd_name.as_str(), &cmd, &cluster_state)
                 {
-                    out_buf.extend_from_slice(&refusal);
+                    crate::output_limits::append_reply(
+                        &mut out_buf,
+                        &refusal,
+                        &mut due,
+                        pubsub.limits(),
+                    );
                     parse_offset += consumed;
                     continue;
                 }
@@ -1875,7 +1889,7 @@ pub async fn handle_client(
                 && subscriptions.is_some()
                 && let Some(reply) = crate::pubsub::resp2_subscriber_reply(cmd_name.as_str(), &cmd)
             {
-                out_buf.extend_from_slice(&reply);
+                crate::output_limits::append_reply(&mut out_buf, &reply, &mut due, pubsub.limits());
                 parse_offset += consumed;
                 continue;
             }
@@ -1905,7 +1919,7 @@ pub async fn handle_client(
                     &store,
                 )
             {
-                out_buf.extend_from_slice(&offer);
+                crate::output_limits::append_reply(&mut out_buf, &offer, &mut due, pubsub.limits());
                 parse_offset += consumed;
                 continue;
             }
@@ -1960,7 +1974,7 @@ pub async fn handle_client(
                         client_id,
                     );
                 }
-                out_buf.extend_from_slice(&reply);
+                crate::output_limits::append_reply(&mut out_buf, &reply, &mut due, pubsub.limits());
                 parse_offset += consumed;
                 continue;
             }
@@ -2735,7 +2749,12 @@ pub async fn handle_client(
                     );
                     // Counted here: the commands below are not.
                     crate::cmdstats::record("HELLO", &cmd, &reply, started.elapsed());
-                    out_buf.extend_from_slice(&reply);
+                    crate::output_limits::append_reply(
+                        &mut out_buf,
+                        &reply,
+                        &mut due,
+                        pubsub.limits(),
+                    );
                     parse_offset += consumed;
                     continue;
                 }
@@ -2813,7 +2832,12 @@ pub async fn handle_client(
                         waited_for = blocked_at.elapsed();
                         match waited {
                             Some(reply) if reply == crate::commands::blocking::ROLE_CHANGED => {
-                                out_buf.extend_from_slice(&reply);
+                                crate::output_limits::append_reply(
+                                    &mut out_buf,
+                                    &reply,
+                                    &mut due,
+                                    pubsub.limits(),
+                                );
                                 quit_requested = true;
                                 break;
                             }
@@ -2863,7 +2887,12 @@ pub async fn handle_client(
                                 Some(end) if end.close => {
                                     // This master became a replica: told so,
                                     // and closed, as Redis closes it.
-                                    out_buf.extend_from_slice(&end.reply);
+                                    crate::output_limits::append_reply(
+                                        &mut out_buf,
+                                        &end.reply,
+                                        &mut due,
+                                        pubsub.limits(),
+                                    );
                                     parse_offset += consumed;
                                     quit_requested = true;
                                     break;

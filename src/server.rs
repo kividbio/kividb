@@ -1131,7 +1131,12 @@ where
                 // it at the limit and one reply, and its replies are dropped.
                 // What ran before is applied, and logged and replicated as
                 // it ran; a transaction or a script is one command, and is
-                // never cut in two.
+                // never cut in two. A reply `CLIENT REPLY OFF` or `SKIP`
+                // drops is dropped first, and does not count; settling it
+                // here leaves nothing for the settle below to do.
+                if due & crate::output_limits::REDISPATCH == 0 {
+                    reply_gate.settle(&mut combined);
+                }
                 if due & crate::output_limits::WATCH != 0
                     && reply_limit.closes_after_reply(
                         pubsub.limits(),
@@ -1624,7 +1629,12 @@ where
                             client_id,
                         );
                     }
-                    combined.extend_from_slice(&reply);
+                    crate::output_limits::append_reply(
+                        &mut combined,
+                        &reply,
+                        &mut due,
+                        pubsub.limits(),
+                    );
                     parse_offset += consumed;
                     continue;
                 }
@@ -1640,7 +1650,12 @@ where
                 if let Some(refusal) =
                     crate::pubsub::shard_subscribe_refusal(cmd_name.as_str(), &cmd, &cluster_state)
                 {
-                    combined.extend_from_slice(&refusal);
+                    crate::output_limits::append_reply(
+                        &mut combined,
+                        &refusal,
+                        &mut due,
+                        pubsub.limits(),
+                    );
                     parse_offset += consumed;
                     continue;
                 }
@@ -1664,7 +1679,12 @@ where
                 && subscriptions.is_some()
                 && let Some(reply) = crate::pubsub::resp2_subscriber_reply(cmd_name.as_str(), &cmd)
             {
-                combined.extend_from_slice(&reply);
+                crate::output_limits::append_reply(
+                    &mut combined,
+                    &reply,
+                    &mut due,
+                    pubsub.limits(),
+                );
                 parse_offset += consumed;
                 continue;
             }
@@ -1694,7 +1714,12 @@ where
                     &store,
                 )
             {
-                combined.extend_from_slice(&offer);
+                crate::output_limits::append_reply(
+                    &mut combined,
+                    &offer,
+                    &mut due,
+                    pubsub.limits(),
+                );
                 parse_offset += consumed;
                 continue;
             }
@@ -1749,7 +1774,12 @@ where
                         client_id,
                     );
                 }
-                combined.extend_from_slice(&reply);
+                crate::output_limits::append_reply(
+                    &mut combined,
+                    &reply,
+                    &mut due,
+                    pubsub.limits(),
+                );
                 parse_offset += consumed;
                 continue;
             }
@@ -2525,7 +2555,12 @@ where
                     );
                     // Counted here: the commands below are not.
                     crate::cmdstats::record("HELLO", &cmd, &reply, started.elapsed());
-                    combined.extend_from_slice(&reply);
+                    crate::output_limits::append_reply(
+                        &mut combined,
+                        &reply,
+                        &mut due,
+                        pubsub.limits(),
+                    );
                     parse_offset += consumed;
                     continue;
                 }
@@ -2602,7 +2637,12 @@ where
                         waited_for = blocked_at.elapsed();
                         match waited {
                             Some(reply) if reply == crate::commands::blocking::ROLE_CHANGED => {
-                                combined.extend_from_slice(&reply);
+                                crate::output_limits::append_reply(
+                                    &mut combined,
+                                    &reply,
+                                    &mut due,
+                                    pubsub.limits(),
+                                );
                                 quit_requested = true;
                                 break;
                             }
@@ -2652,7 +2692,12 @@ where
                                 Some(end) if end.close => {
                                     // This master became a replica: told so,
                                     // and closed, as Redis closes it.
-                                    combined.extend_from_slice(&end.reply);
+                                    crate::output_limits::append_reply(
+                                        &mut combined,
+                                        &end.reply,
+                                        &mut due,
+                                        pubsub.limits(),
+                                    );
                                     parse_offset += consumed;
                                     quit_requested = true;
                                     break;

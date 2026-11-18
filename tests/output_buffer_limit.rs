@@ -88,13 +88,7 @@ impl Conn {
     }
 
     fn send(&mut self, args: &[&[u8]]) {
-        let mut buf = format!("*{}\r\n", args.len()).into_bytes();
-        for a in args {
-            buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
-            buf.extend_from_slice(a);
-            buf.extend_from_slice(b"\r\n");
-        }
-        self.writer.write_all(&buf).unwrap();
+        self.writer.write_all(&encode(args)).unwrap();
     }
 
     fn cmd(&mut self, args: &[&str]) -> V {
@@ -174,6 +168,17 @@ impl Conn {
             }
         }
     }
+}
+
+/// A request, as a client sends it.
+fn encode(args: &[&[u8]]) -> Vec<u8> {
+    let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+        buf.extend_from_slice(a);
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf
 }
 
 // ── The server ────────────────────────────────────────────────────────────────
@@ -1240,14 +1245,69 @@ fn a_script_over_the_limit_runs_whole() {
         server.config_set("normal 1mb 0 0");
         let script = "local out = {} for i = 1, 20 do out[i] = redis.call('GET', 'big') \
                       redis.call('INCR', 'n') end return out";
-        let call = |c: &mut Conn| c.send(&[b"EVAL", script.as_bytes(), b"0"]);
+        // Both in one write, so that both arrive in one read: on separate
+        // reads the second would run after the first's reply was written,
+        // with or without the check after each reply.
         let mut c = server.conn();
-        call(&mut c);
-        call(&mut c);
+        c.writer
+            .write_all(&encode(&[b"EVAL", script.as_bytes(), b"0"]).repeat(2))
+            .unwrap();
         // The first ran whole; the second, after it, not at all.
         assert_eq!(n_once_closed(&server, &mut c), Some(20), "{io_model}");
         // Nor is the server held up by it.
         assert_eq!(server.conn().cmd(&["PING"]), V::Str("PONG".into()));
+    }
+}
+
+/// A reply `CLIENT REPLY OFF` or `SKIP` drops does not count against the
+/// limit, hard or soft, as in Redis: `LRANGE` of 1.1 MB, its reply dropped,
+/// then `INCR n`, in one read, keeps the client, which runs the `INCR`.
+#[test]
+fn a_reply_the_client_turned_off_does_not_count() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        let mut load = server.conn();
+        for chunk in 0..10 {
+            let mut args: Vec<Vec<u8>> = vec![b"RPUSH".to_vec(), b"l".to_vec()];
+            for i in 0..1000 {
+                args.push(format!("{:0>100}", chunk * 1000 + i).into_bytes());
+            }
+            let refs: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
+            load.send(&refs);
+            assert!(matches!(load.read(), Some(V::Int(_))));
+        }
+        let lrange: &[&[u8]] = &[b"LRANGE", b"l", b"0", b"-1"];
+        let incr: &[&[u8]] = &[b"INCR", b"n"];
+        for limit in ["normal 1mb 0 0", "normal 0 1mb 1"] {
+            server.config_set(limit);
+            for mode in ["OFF", "SKIP"] {
+                let mut c = server.conn();
+                let mut pipeline = encode(&[b"CLIENT", b"REPLY", mode.as_bytes()]);
+                pipeline.extend_from_slice(&encode(lrange));
+                pipeline.extend_from_slice(&encode(incr));
+                if mode == "OFF" {
+                    pipeline.extend_from_slice(&encode(&[b"CLIENT", b"REPLY", b"ON"]));
+                }
+                pipeline.extend_from_slice(&encode(&[b"PING"]));
+                c.writer.write_all(&pipeline).unwrap();
+                let what = format!("{io_model}, {limit}, {mode}");
+                if mode == "SKIP" {
+                    // SKIP drops the LRANGE's reply only.
+                    assert_eq!(c.read(), Some(V::Int(1)), "{what}");
+                } else {
+                    assert!(c.read().unwrap().ok(), "{what}: CLIENT REPLY ON");
+                }
+                assert_eq!(c.read(), Some(V::Str("PONG".into())), "{what}");
+                assert_eq!(server.conn().cmd(&["DEL", "n"]).i(), 1, "{what}");
+            }
+        }
+        assert_eq!(
+            server.info_field("client_output_buffer_limit_disconnections"),
+            "0",
+            "{io_model}"
+        );
+        server.config_set("normal 0 0 0");
     }
 }
 
