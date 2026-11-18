@@ -645,15 +645,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     counts the chunks as allocated; eviction's estimate of what freeing a
     list gives back is their bytes, and lazy freeing's effort their number.
 
-- **Small sorted sets take a quarter to a sixth of the memory (#825,
-  #297).** A sorted set of up to 128 members of up to 64 bytes is kept in
+- **Small sorted sets take a quarter to a sixth of the memory (#297, part
+  of #825).** A sorted set of up to 128 members of up to 64 bytes is kept in
   one block, its entries in order by score and then by member, where it
   was a hash table and a tree that each held the member: 14-byte members
   with whole-number scores take 29.6 bytes a member at 10 members (118.8
   before; Redis 8.10.2 24.8) and 19.3 at 100 (116.4; Redis 21.0); with
   fractional scores 37.6 and 27.3 (Redis 28.0 and 26.2). Ten 8-byte
   members a key, as #297 measured it, take 274 bytes of RSS a key (1,249
-  before; Redis 186). Larger sorted sets are a table and a tree as before.
+  before; Redis 186). Sorted sets of more than 128 members (or with a
+  member longer than 64 bytes) are unchanged: still a table and a tree,
+  at the same size as before; #825's 800-member feeds among them.
   - A score that is an integer of up to 56 bits is kept in one to eight
     bytes (one up to 247), any other as the eight bytes of the float: read
     back, every score is the same float, bit for bit. A member is found by
@@ -673,8 +675,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `zset-max-listpack-entries` (default 128) and `zset-max-listpack-value`
     (64), and their `zset-max-ziplist-*` names, now take effect, from the
     configuration file or `CONFIG SET`; `0` entries turns blocks off. They
-    go no higher than 128 and 64, and `CONFIG GET` reports the value kept.
-    A lowered limit applies to a set at its next new member.
+    go no higher than 128 and 64, and `CONFIG GET` reports the value kept;
+    a larger value logs a warning naming the maximum (also for the set and
+    hash limits, which are clamped the same way). A lowered limit applies
+    to a set at its next new member. A set's buffer gives its room back as
+    members go (once more than half of it is spare), so one popped down
+    from 128 long members does not keep their bytes.
   - Commands cost fewer instructions on a block than on the table and tree
     for most of what a small sorted set is used for (8 and 100 members,
     pipelined, io_uring): `ZRANGE 0 9` 16-17 % fewer, `ZRANGE 0 -1` of 100
@@ -813,6 +819,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stop at the query's `TIMEOUT` (#670).
 
 ### Fixed
+
+- **Sorted-set commands read integers as Redis does.** `ZREMRANGEBYRANK
+  key x 5` took `x` as 0 and removed members; it now answers `ERR value is
+  not an integer or out of range`, before it looks at the key, as Redis
+  does. And `+1`, `01` and `-0`, which Redis refuses, were taken as numbers
+  by the indexes of `ZRANGE`/`ZREVRANGE`/`ZRANGESTORE`, the counts of
+  `ZPOPMIN`/`ZPOPMAX`/`ZRANDMEMBER`/`ZMPOP` (and `LMPOP`), `LIMIT` offsets
+  and counts, `ZINTERCARD`'s `LIMIT` and `numkeys`: each now gets Redis's
+  error.
 
 - **Scripts have the Lua 5.1 library functions Redis keeps (#898).**
   `table.getn`, `table.setn`, `table.maxn`, `table.foreach`, `table.foreachi`,

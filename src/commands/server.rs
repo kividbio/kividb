@@ -377,6 +377,15 @@ fn function_without_lua(ctx: &Ctx) -> Vec<u8> {
     resp_error(NO_LUA)
 }
 
+/// A limit of how much one block of a small collection holds set past
+/// what a block can hold: taken as the most it can, and said once, at the
+/// set (from `CONFIG SET`, the config file or the command line).
+fn warn_clamped(param: &str, asked: usize, kept: usize) {
+    if asked > kept {
+        log_warn!("{param} {asked} is more than one block holds: {kept} is used (the maximum)");
+    }
+}
+
 /// A setting's own name, for one Redis also takes under an older one.
 fn config_name(name: &str) -> &str {
     match name {
@@ -1362,6 +1371,7 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                             }
                             _ => crate::member_set::set_packed_value(limit),
                         };
+                        warn_clamped(&param, limit, kept);
                         REMEMBERED_CONFIG
                             .lock()
                             .insert(param.clone(), kept.to_string());
@@ -1395,6 +1405,7 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                         } else {
                             crate::hash_fields::set_packed_value(limit)
                         };
+                        warn_clamped(&param, limit, kept);
                         let names = if entries {
                             ["hash-max-listpack-entries", "hash-max-ziplist-entries"]
                         } else {
@@ -1434,6 +1445,7 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                         } else {
                             crate::sorted_set::set_packed_value(limit)
                         };
+                        warn_clamped(&param, limit, kept);
                         let names = if entries {
                             ["zset-max-listpack-entries", "zset-max-ziplist-entries"]
                         } else {

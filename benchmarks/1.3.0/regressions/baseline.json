@@ -8979,21 +8979,21 @@
         }
       ]
     },
-    "25-zset-memory/float/bytes_per_member_10": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/float/bytes_per_member_10": {
+      "suite": "31-zset-memory",
       "config": "float",
       "metric": "bytes_per_member_10",
       "unit": "B",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 118.7809,
-        "candidate": 37.5812,
-        "redis": 27.961,
+        "v1_2_2": 118.781,
+        "candidate": 37.581,
+        "redis": 27.9581,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9007,8 +9007,8 @@
         }
       ]
     },
-    "25-zset-memory/float/bytes_per_member_100": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/float/bytes_per_member_100": {
+      "suite": "31-zset-memory",
       "config": "float",
       "metric": "bytes_per_member_100",
       "unit": "B",
@@ -9016,12 +9016,12 @@
       "recorded": {
         "v1_2_2": 116.388,
         "candidate": 27.308,
-        "redis": 26.1656,
+        "redis": 26.1649,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9035,8 +9035,8 @@
         }
       ]
     },
-    "25-zset-memory/float/bytes_per_member_1000": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/float/bytes_per_member_1000": {
+      "suite": "31-zset-memory",
       "config": "float",
       "metric": "bytes_per_member_1000",
       "unit": "B",
@@ -9044,12 +9044,12 @@
       "recorded": {
         "v1_2_2": 132.4572,
         "candidate": 132.4892,
-        "redis": 68.4442,
+        "redis": 68.1974,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9059,8 +9059,8 @@
         }
       ]
     },
-    "25-zset-memory/float/bytes_per_member_128": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/float/bytes_per_member_128": {
+      "suite": "31-zset-memory",
       "config": "float",
       "metric": "bytes_per_member_128",
       "unit": "B",
@@ -9068,12 +9068,12 @@
       "recorded": {
         "v1_2_2": 131.7105,
         "candidate": 26.9605,
-        "redis": 24.4212,
+        "redis": 24.4211,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9087,8 +9087,8 @@
         }
       ]
     },
-    "25-zset-memory/float/bytes_per_member_129": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/float/bytes_per_member_129": {
+      "suite": "31-zset-memory",
       "config": "float",
       "metric": "bytes_per_member_129",
       "unit": "B",
@@ -9096,12 +9096,12 @@
       "recorded": {
         "v1_2_2": 130.9387,
         "candidate": 131.1867,
-        "redis": 78.3099,
+        "redis": 78.6926,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9111,8 +9111,8 @@
         }
       ]
     },
-    "25-zset-memory/float/encoding_10": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/float/encoding_10": {
+      "suite": "31-zset-memory",
       "config": "float",
       "metric": "encoding_10",
       "unit": "code",
@@ -9124,8 +9124,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9134,8 +9134,8 @@
         }
       ]
     },
-    "25-zset-memory/float/encoding_100": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/float/encoding_100": {
+      "suite": "31-zset-memory",
       "config": "float",
       "metric": "encoding_100",
       "unit": "code",
@@ -9147,8 +9147,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9157,8 +9157,8 @@
         }
       ]
     },
-    "25-zset-memory/float/encoding_1000": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/float/encoding_1000": {
+      "suite": "31-zset-memory",
       "config": "float",
       "metric": "encoding_1000",
       "unit": "code",
@@ -9170,8 +9170,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9180,8 +9180,8 @@
         }
       ]
     },
-    "25-zset-memory/float/encoding_128": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/float/encoding_128": {
+      "suite": "31-zset-memory",
       "config": "float",
       "metric": "encoding_128",
       "unit": "code",
@@ -9193,8 +9193,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9203,8 +9203,8 @@
         }
       ]
     },
-    "25-zset-memory/float/encoding_129": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/float/encoding_129": {
+      "suite": "31-zset-memory",
       "config": "float",
       "metric": "encoding_129",
       "unit": "code",
@@ -9216,8 +9216,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9226,21 +9226,21 @@
         }
       ]
     },
-    "25-zset-memory/float/load_1000_s": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/float/load_1000_s": {
+      "suite": "31-zset-memory",
       "config": "float",
       "metric": "load_1000_s",
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 4.0838,
-        "candidate": 4.0322,
-        "redis": 4.1831,
+        "v1_2_2": 1.994,
+        "candidate": 2.0049,
+        "redis": 2.1047,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9248,21 +9248,21 @@
         }
       ]
     },
-    "25-zset-memory/float/load_100_s": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/float/load_100_s": {
+      "suite": "31-zset-memory",
       "config": "float",
       "metric": "load_100_s",
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 3.9161,
-        "candidate": 3.825,
-        "redis": 5.9326,
+        "v1_2_2": 1.9482,
+        "candidate": 1.8739,
+        "redis": 3.62,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9270,21 +9270,21 @@
         }
       ]
     },
-    "25-zset-memory/float/load_10_s": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/float/load_10_s": {
+      "suite": "31-zset-memory",
       "config": "float",
       "metric": "load_10_s",
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 4.7838,
-        "candidate": 3.5895,
-        "redis": 4.3494,
+        "v1_2_2": 2.2805,
+        "candidate": 2.2373,
+        "redis": 2.4803,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9292,21 +9292,21 @@
         }
       ]
     },
-    "25-zset-memory/float/load_128_s": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/float/load_128_s": {
+      "suite": "31-zset-memory",
       "config": "float",
       "metric": "load_128_s",
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 3.3793,
-        "candidate": 3.597,
-        "redis": 6.9495,
+        "v1_2_2": 1.9615,
+        "candidate": 1.8558,
+        "redis": 4.0312,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9314,21 +9314,21 @@
         }
       ]
     },
-    "25-zset-memory/float/load_129_s": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/float/load_129_s": {
+      "suite": "31-zset-memory",
       "config": "float",
       "metric": "load_129_s",
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 3.5791,
-        "candidate": 3.3313,
-        "redis": 3.945,
+        "v1_2_2": 1.9406,
+        "candidate": 1.9745,
+        "redis": 1.9979,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9336,8 +9336,8 @@
         }
       ]
     },
-    "25-zset-memory/int/bytes_per_member_10": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/int/bytes_per_member_10": {
+      "suite": "31-zset-memory",
       "config": "int",
       "metric": "bytes_per_member_10",
       "unit": "B",
@@ -9345,12 +9345,12 @@
       "recorded": {
         "v1_2_2": 118.7812,
         "candidate": 29.5812,
-        "redis": 24.764,
+        "redis": 24.7605,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9364,8 +9364,8 @@
         }
       ]
     },
-    "25-zset-memory/int/bytes_per_member_100": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/int/bytes_per_member_100": {
+      "suite": "31-zset-memory",
       "config": "int",
       "metric": "bytes_per_member_100",
       "unit": "B",
@@ -9373,12 +9373,12 @@
       "recorded": {
         "v1_2_2": 116.388,
         "candidate": 19.308,
-        "redis": 21.0444,
+        "redis": 21.0455,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9392,8 +9392,8 @@
         }
       ]
     },
-    "25-zset-memory/int/bytes_per_member_1000": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/int/bytes_per_member_1000": {
+      "suite": "31-zset-memory",
       "config": "int",
       "metric": "bytes_per_member_1000",
       "unit": "B",
@@ -9401,12 +9401,12 @@
       "recorded": {
         "v1_2_2": 132.4572,
         "candidate": 132.4892,
-        "redis": 67.8167,
+        "redis": 68.1405,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9416,8 +9416,8 @@
         }
       ]
     },
-    "25-zset-memory/int/bytes_per_member_128": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/int/bytes_per_member_128": {
+      "suite": "31-zset-memory",
       "config": "int",
       "metric": "bytes_per_member_128",
       "unit": "B",
@@ -9425,12 +9425,12 @@
       "recorded": {
         "v1_2_2": 131.7105,
         "candidate": 18.9605,
-        "redis": 20.4211,
+        "redis": 20.4218,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9444,21 +9444,21 @@
         }
       ]
     },
-    "25-zset-memory/int/bytes_per_member_129": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/int/bytes_per_member_129": {
+      "suite": "31-zset-memory",
       "config": "int",
       "metric": "bytes_per_member_129",
       "unit": "B",
       "better": "lower",
       "recorded": {
         "v1_2_2": 130.9387,
-        "candidate": 131.1878,
-        "redis": 78.9376,
+        "candidate": 131.1867,
+        "redis": 79.0459,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9468,8 +9468,8 @@
         }
       ]
     },
-    "25-zset-memory/int/encoding_10": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/int/encoding_10": {
+      "suite": "31-zset-memory",
       "config": "int",
       "metric": "encoding_10",
       "unit": "code",
@@ -9481,8 +9481,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9491,8 +9491,8 @@
         }
       ]
     },
-    "25-zset-memory/int/encoding_100": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/int/encoding_100": {
+      "suite": "31-zset-memory",
       "config": "int",
       "metric": "encoding_100",
       "unit": "code",
@@ -9504,8 +9504,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9514,8 +9514,8 @@
         }
       ]
     },
-    "25-zset-memory/int/encoding_1000": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/int/encoding_1000": {
+      "suite": "31-zset-memory",
       "config": "int",
       "metric": "encoding_1000",
       "unit": "code",
@@ -9527,8 +9527,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9537,8 +9537,8 @@
         }
       ]
     },
-    "25-zset-memory/int/encoding_128": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/int/encoding_128": {
+      "suite": "31-zset-memory",
       "config": "int",
       "metric": "encoding_128",
       "unit": "code",
@@ -9550,8 +9550,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9560,8 +9560,8 @@
         }
       ]
     },
-    "25-zset-memory/int/encoding_129": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/int/encoding_129": {
+      "suite": "31-zset-memory",
       "config": "int",
       "metric": "encoding_129",
       "unit": "code",
@@ -9573,8 +9573,8 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9583,21 +9583,21 @@
         }
       ]
     },
-    "25-zset-memory/int/load_1000_s": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/int/load_1000_s": {
+      "suite": "31-zset-memory",
       "config": "int",
       "metric": "load_1000_s",
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 3.7032,
-        "candidate": 3.4437,
-        "redis": 3.7799,
+        "v1_2_2": 1.964,
+        "candidate": 1.9685,
+        "redis": 2.0766,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9605,21 +9605,21 @@
         }
       ]
     },
-    "25-zset-memory/int/load_100_s": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/int/load_100_s": {
+      "suite": "31-zset-memory",
       "config": "int",
       "metric": "load_100_s",
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 3.494,
-        "candidate": 3.7625,
-        "redis": 5.4926,
+        "v1_2_2": 1.913,
+        "candidate": 1.8385,
+        "redis": 3.1461,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9627,21 +9627,21 @@
         }
       ]
     },
-    "25-zset-memory/int/load_10_s": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/int/load_10_s": {
+      "suite": "31-zset-memory",
       "config": "int",
       "metric": "load_10_s",
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 4.4537,
-        "candidate": 3.9087,
-        "redis": 4.999,
+        "v1_2_2": 2.2612,
+        "candidate": 2.1568,
+        "redis": 2.456,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9649,21 +9649,21 @@
         }
       ]
     },
-    "25-zset-memory/int/load_128_s": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/int/load_128_s": {
+      "suite": "31-zset-memory",
       "config": "int",
       "metric": "load_128_s",
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 2.9786,
-        "candidate": 3.4592,
-        "redis": 5.7915,
+        "v1_2_2": 1.9082,
+        "candidate": 1.8162,
+        "redis": 3.4674,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {
@@ -9671,21 +9671,21 @@
         }
       ]
     },
-    "25-zset-memory/int/load_129_s": {
-      "suite": "25-zset-memory",
+    "31-zset-memory/int/load_129_s": {
+      "suite": "31-zset-memory",
       "config": "int",
       "metric": "load_129_s",
       "unit": "s",
       "better": "lower",
       "recorded": {
-        "v1_2_2": 3.8879,
-        "candidate": 3.9984,
-        "redis": 3.1705,
+        "v1_2_2": 1.9199,
+        "candidate": 1.9564,
+        "redis": 2.0339,
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-18",
-        "commit": "pr-packed-zsets",
-        "label": "pr-packed-zsets-d4s_v5"
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
       },
       "gate": [
         {

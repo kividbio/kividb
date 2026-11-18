@@ -1,52 +1,52 @@
-# Regression suite: pr-packed-zsets-d4s_v5
+# Regression suite: pr-packed-zsets-r2-d4s_v5
 
 Verdict: **ok**
 
 - Machine: Standard_D4s_v5, 4 vCPU, INTEL(R) XEON(R) PLATINUM 8573C, kernel 7.0.0-1017-azure, glibc 2.39
 - CPU: recorded on Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz; now INTEL(R) XEON(R) PLATINUM 8573C (a different model: speed gates are session-relative)
-- calibration (indicative only): 105.7 ms for a fixed sha256 loop, 4 cores
+- calibration (indicative only): 86.3 ms for a fixed sha256 loop, 4 cores
 - Client: Python 3.12.3, redis-py 5.2.1
 - v1_2_2: `kividb 1.2.2`, sha256 `38fc2cea40c131e041f4914527a98719e5d34dffdfe2abdc1f07ecb86aa6723e`
-- candidate: `kividb 1.2.1 (default build: no Lua, no TLS)`, sha256 `6996623da05521b0e1e5d73326fc74dc2630ab3640cf449a0d39da0311ddb02d`
+- candidate: `kividb 1.2.1 (default build: no Lua, no TLS)`, sha256 `0c97957bdf96c0bae533f60b06af36e3fe2f1723780c647dc96f8ac8955f71c8`
 - redis: `Redis server v=8.10.2 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=75a9b36b1f0aa00`, sha256 `b0cd304980112fa6cd8dced524fdd6b136fd8efb802f5cf9e81610051a11891c`
-- candidate commit: `pr-packed-zsets`
+- candidate commit: `pr-packed-zsets-r2`
 - date: 2026-11-18; FULL=0, SCALE=1
-- run time: 25-zset-memory 144s
+- run time: 31-zset-memory 86s
 
-## 25-zset-memory
+## 31-zset-memory
 
 | config | metric | unit | v1.2.2 | candidate | Redis | recorded | gate | result |
 |---|---|---|---:|---:|---:|---:|---|---|
 | float | bytes_per_member_10 | B | 118.8 | 37.58 | 27.96 | - | rel: rel 5%: nothing recorded<br>ratio: ratio: nothing recorded | new<br>new |
-| float | bytes_per_member_100 | B | 116.4 | 27.31 | 26.17 | - | rel: rel 5%: nothing recorded<br>ratio: ratio: nothing recorded | new<br>new |
-| float | bytes_per_member_1000 | B | 132.5 | 132.5 | 68.44 | - | rel: rel 5%: nothing recorded | new |
+| float | bytes_per_member_100 | B | 116.4 | 27.31 | 26.16 | - | rel: rel 5%: nothing recorded<br>ratio: ratio: nothing recorded | new<br>new |
+| float | bytes_per_member_1000 | B | 132.5 | 132.5 | 68.20 | - | rel: rel 5%: nothing recorded | new |
 | float | bytes_per_member_128 | B | 131.7 | 26.96 | 24.42 | - | rel: rel 5%: nothing recorded<br>ratio: ratio: nothing recorded | new<br>new |
-| float | bytes_per_member_129 | B | 130.9 | 131.2 | 78.31 | - | rel: rel 5%: nothing recorded | new |
+| float | bytes_per_member_129 | B | 130.9 | 131.2 | 78.69 | - | rel: rel 5%: nothing recorded | new |
 | float | encoding_10 | code | 2 | 2 | 2 | - | bound: eq: nothing recorded | new |
 | float | encoding_100 | code | 2 | 2 | 2 | - | bound: eq: nothing recorded | new |
 | float | encoding_1000 | code | 5 | 5 | 5 | - | bound: eq: nothing recorded | new |
 | float | encoding_128 | code | 2 | 2 | 2 | - | bound: eq: nothing recorded | new |
 | float | encoding_129 | code | 5 | 5 | 5 | - | bound: eq: nothing recorded | new |
-| float | load_1000_s | s | 4.08 | 4.03 | 4.18 | - | info | info |
-| float | load_100_s | s | 3.92 | 3.83 | 5.93 | - | info | info |
-| float | load_10_s | s | 4.78 | 3.59 | 4.35 | - | info | info |
-| float | load_128_s | s | 3.38 | 3.6 | 6.95 | - | info | info |
-| float | load_129_s | s | 3.58 | 3.33 | 3.94 | - | info | info |
+| float | load_1000_s | s | 1.99 | 2 | 2.1 | - | info | info |
+| float | load_100_s | s | 1.95 | 1.87 | 3.62 | - | info | info |
+| float | load_10_s | s | 2.28 | 2.24 | 2.48 | - | info | info |
+| float | load_128_s | s | 1.96 | 1.86 | 4.03 | - | info | info |
+| float | load_129_s | s | 1.94 | 1.97 | 2 | - | info | info |
 | int | bytes_per_member_10 | B | 118.8 | 29.58 | 24.76 | - | rel: rel 5%: nothing recorded<br>ratio: ratio: nothing recorded | new<br>new |
-| int | bytes_per_member_100 | B | 116.4 | 19.31 | 21.04 | - | rel: rel 5%: nothing recorded<br>ratio: ratio: nothing recorded | new<br>new |
-| int | bytes_per_member_1000 | B | 132.5 | 132.5 | 67.82 | - | rel: rel 5%: nothing recorded | new |
+| int | bytes_per_member_100 | B | 116.4 | 19.31 | 21.05 | - | rel: rel 5%: nothing recorded<br>ratio: ratio: nothing recorded | new<br>new |
+| int | bytes_per_member_1000 | B | 132.5 | 132.5 | 68.14 | - | rel: rel 5%: nothing recorded | new |
 | int | bytes_per_member_128 | B | 131.7 | 18.96 | 20.42 | - | rel: rel 5%: nothing recorded<br>ratio: ratio: nothing recorded | new<br>new |
-| int | bytes_per_member_129 | B | 130.9 | 131.2 | 78.94 | - | rel: rel 5%: nothing recorded | new |
+| int | bytes_per_member_129 | B | 130.9 | 131.2 | 79.05 | - | rel: rel 5%: nothing recorded | new |
 | int | encoding_10 | code | 2 | 2 | 2 | - | bound: eq: nothing recorded | new |
 | int | encoding_100 | code | 2 | 2 | 2 | - | bound: eq: nothing recorded | new |
 | int | encoding_1000 | code | 5 | 5 | 5 | - | bound: eq: nothing recorded | new |
 | int | encoding_128 | code | 2 | 2 | 2 | - | bound: eq: nothing recorded | new |
 | int | encoding_129 | code | 5 | 5 | 5 | - | bound: eq: nothing recorded | new |
-| int | load_1000_s | s | 3.7 | 3.44 | 3.78 | - | info | info |
-| int | load_100_s | s | 3.49 | 3.76 | 5.49 | - | info | info |
-| int | load_10_s | s | 4.45 | 3.91 | 5 | - | info | info |
-| int | load_128_s | s | 2.98 | 3.46 | 5.79 | - | info | info |
-| int | load_129_s | s | 3.89 | 4 | 3.17 | - | info | info |
+| int | load_1000_s | s | 1.96 | 1.97 | 2.08 | - | info | info |
+| int | load_100_s | s | 1.91 | 1.84 | 3.15 | - | info | info |
+| int | load_10_s | s | 2.26 | 2.16 | 2.46 | - | info | info |
+| int | load_128_s | s | 1.91 | 1.82 | 3.47 | - | info | info |
+| int | load_129_s | s | 1.92 | 1.96 | 2.03 | - | info | info |
 
 ## Not run this time
 

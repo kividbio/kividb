@@ -462,6 +462,7 @@ impl PackedZset {
             buf.truncate(new_start + data - gone);
             self.len = left as u8;
             self.cap = left as u8;
+            self.give_back();
             return;
         }
         let buf = &mut self.buf;
@@ -482,6 +483,20 @@ impl PackedZset {
         let want = cap_for(left);
         if want < cap && (left <= 16 || cap - left >= 16) {
             self.relayout(want);
+        }
+        self.give_back();
+    }
+
+    /// The buffer's room to spare given back once it is more than what the
+    /// block holds (and at least 64 bytes): down to a quarter over, so a
+    /// set that takes an entry out and puts one back, as a queue does,
+    /// moves its buffer only when it has shrunk to half.
+    #[inline]
+    fn give_back(&mut self) {
+        let len = self.buf.len();
+        let spare = self.buf.capacity() - len;
+        if spare > len && spare >= 64 {
+            self.buf.shrink_to(len + len / 4);
         }
     }
 
@@ -1096,6 +1111,37 @@ mod tests {
                 same_as(&set, &model);
             }
         }
+    }
+
+    #[test]
+    fn room_is_given_back_as_entries_go_but_not_at_every_pop() {
+        let mut set = PackedZset::new();
+        for i in 0..MAX_ENTRIES {
+            let mut m = vec![b'm'; MAX_LEN];
+            m[..8].copy_from_slice(format!("{i:08}").as_bytes());
+            add(&mut set, &m, i as f64);
+        }
+        assert!(set.allocation_size() > 9_000);
+        // A queue: one out, one in, at the full size: the buffer stays.
+        let ptr = set.buf.as_ptr();
+        for i in MAX_ENTRIES..MAX_ENTRIES + 50 {
+            set.remove_at(0);
+            let mut m = vec![b'm'; MAX_LEN];
+            m[..8].copy_from_slice(format!("{i:08}").as_bytes());
+            add(&mut set, &m, i as f64);
+            assert_eq!(set.buf.as_ptr(), ptr, "moved at {i}");
+        }
+        while set.len() > 1 {
+            set.remove_at(0);
+            set.check();
+            assert!(
+                set.allocation_size() <= 2 * set.buf.len().max(64) + 64,
+                "{} for {}",
+                set.allocation_size(),
+                set.buf.len()
+            );
+        }
+        assert!(set.allocation_size() < 128, "{}", set.allocation_size());
     }
 
     #[test]

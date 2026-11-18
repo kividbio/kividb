@@ -197,7 +197,7 @@ Measured a key at a time as #297 measured it (100,000 sets of 10 members of
 236 of `used_memory` (1,108; 176). What is left over Redis is mostly the
 key's own entry and the set's header. Sets past 128 members are a table and
 a tree as before; making those smaller is the next step. Suite
-`25-zset-memory` of
+`31-zset-memory` of
 [the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
 the table again and fails a build that loses it.
 

@@ -128,10 +128,12 @@ Redis, in the file or with `CONFIG SET`, and reported by `CONFIG GET` and `OBJEC
 set of up to that many members, none longer than that many bytes, is one block; past either it
 is a hash table and an ordered tree). The `*-max-ziplist-*` names of the hash and sorted-set
 settings are the same settings. A limit goes no higher than what one block holds (128 members
-of 64 bytes for sets and sorted sets, 512 fields for hashes); `0` entries keeps new hashes and
-sorted sets out of blocks. A changed limit applies to a collection at its next write, and a
-collection never moves back to a block; [COMPATIBILITY.md](COMPATIBILITY.md) has the details
-for each type.
+of 64 bytes for sets and sorted sets, 512 fields for hashes): a larger value is taken as that
+maximum, `CONFIG GET` reports what was kept, and a warning naming the maximum is logged. `0`
+entries keeps new hashes and sorted sets out of blocks. A changed limit applies to a hash at
+its next write that sets a field, to a set or a sorted set at its next new member (a changed
+score never moves a sorted set); a collection never moves back to a block.
+[COMPATIBILITY.md](COMPATIBILITY.md) has the details for each type.
 
 Persistence (snapshots and the AOF) is described in [PERSISTENCE.md](PERSISTENCE.md),
 including `rdbcompression` (default `no`; `yes` writes snapshots compressed, which 1.2 cannot read) and the

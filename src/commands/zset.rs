@@ -320,9 +320,7 @@ struct RangeOptions {
 /// as in Redis 8.10), a negative count all of them.
 fn parse_limit(offset: &[u8], count: &[u8]) -> Result<(usize, usize), Vec<u8>> {
     let number = |raw: &[u8]| {
-        std::str::from_utf8(raw)
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
+        crate::member_set::canonical_i64(raw)
             .ok_or_else(|| resp_error("ERR value is not an integer or out of range"))
     };
     let (offset, count) = (number(offset)?, number(count)?);
@@ -355,9 +353,7 @@ fn range_options(cmd: &[&[u8]], from: usize, storing: bool) -> Result<RangeOptio
             "WITHSCORES" if !storing => options.with_scores = true,
             "LIMIT" if i + 2 < cmd.len() => {
                 let number = |raw: &[u8]| {
-                    std::str::from_utf8(raw)
-                        .ok()
-                        .and_then(|s| s.parse::<i64>().ok())
+                    crate::member_set::canonical_i64(raw)
                         .ok_or_else(|| resp_error("ERR value is not an integer or out of range"))
                 };
                 let (offset, count) = (number(cmd[i + 1])?, number(cmd[i + 2])?);
@@ -483,12 +479,7 @@ fn zrange_pairs<'a>(inner: &'a SortedSetInner, p: &RangeParams) -> Vec<(Member<'
             return vec![];
         }
 
-        let parse_idx = |b: &[u8]| -> i64 {
-            std::str::from_utf8(b)
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0)
-        };
+        let parse_idx = |b: &[u8]| -> i64 { crate::member_set::canonical_i64(b).unwrap_or(0) };
         let mut start = parse_idx(p.start);
         let mut stop = parse_idx(p.stop);
 
@@ -1062,11 +1053,7 @@ fn range_error(p: &RangeParams) -> Option<Vec<u8>> {
         }
     } else {
         for end in [p.start, p.stop] {
-            if std::str::from_utf8(end)
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok())
-                .is_none()
-            {
+            if crate::member_set::canonical_i64(end).is_none() {
                 return Some(resp_error("ERR value is not an integer or out of range"));
             }
         }
@@ -1426,10 +1413,7 @@ fn zset_pop(ctx: &mut Ctx, max: bool) -> Vec<u8> {
     let key: &[u8] = cmd[1];
     let count = match cmd.get(2) {
         None => 1,
-        Some(raw) => match std::str::from_utf8(raw)
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-        {
+        Some(raw) => match crate::member_set::canonical_i64(raw) {
             Some(n) if n >= 0 => n as usize,
             Some(_) => return resp_error("ERR value is out of range, must be positive"),
             None => return resp_error("ERR value is not an integer or out of range"),
@@ -1744,10 +1728,7 @@ fn zintercard(ctx: &mut Ctx) -> Vec<u8> {
     match &cmd[2 + num_keys..] {
         [] => {}
         [word, n] if word.eq_ignore_ascii_case(b"LIMIT") => {
-            match std::str::from_utf8(n)
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok())
-            {
+            match crate::member_set::canonical_i64(n) {
                 Some(n) if n > 0 => limit = n as usize,
                 Some(0) => {}
                 _ => return resp_error("ERR LIMIT can't be negative"),
@@ -1925,6 +1906,14 @@ fn zremrangebyrank(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR wrong number of arguments for 'zremrangebyrank' command");
     }
     let key: &[u8] = cmd[1];
+    // Integers as Redis reads them, before the key is looked at: anything
+    // else is an error, where it used to be taken as 0.
+    let (Some(mut start), Some(mut stop)) = (
+        crate::member_set::canonical_i64(cmd[2]),
+        crate::member_set::canonical_i64(cmd[3]),
+    ) else {
+        return resp_error("ERR value is not an integer or out of range");
+    };
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -1938,15 +1927,6 @@ fn zremrangebyrank(ctx: &mut Ctx) -> Vec<u8> {
             if len == 0 {
                 return resp_integer(0);
             }
-
-            let parse_idx = |b: &[u8]| -> i64 {
-                std::str::from_utf8(b)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0)
-            };
-            let mut start = parse_idx(cmd[2]);
-            let mut stop = parse_idx(cmd[3]);
             if start < 0 {
                 start = (len + start).max(0);
             }
@@ -2008,10 +1988,7 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
     // `[count [WITHSCORES]]`
     let count_arg: Option<i64> = match cmd.get(2) {
         None => None,
-        Some(raw) => match std::str::from_utf8(raw)
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-        {
+        Some(raw) => match crate::member_set::canonical_i64(raw) {
             // -i64::MAX ..= i64::MAX: the magnitude has to be a count.
             Some(n) if n != i64::MIN => Some(n),
             Some(_) => return resp_error("ERR value is out of range"),
@@ -2313,8 +2290,7 @@ fn intersect_weighted(
 fn numkeys(cmd: &[&[u8]], at: usize, command: &str) -> Result<usize, Vec<u8>> {
     let n = cmd
         .get(at)
-        .and_then(|raw| std::str::from_utf8(raw).ok())
-        .and_then(|s| s.parse::<i64>().ok())
+        .and_then(|raw| crate::member_set::canonical_i64(raw))
         .ok_or_else(|| resp_error("ERR value is not an integer or out of range"))?;
     if n < 1 {
         return Err(resp_error(&format!(

@@ -1,56 +1,56 @@
-# Regression suite: pr-packed-zsets-d4s_v5-rerun
+# Regression suite: pr-packed-zsets-r2-d4s_v5-rerun
 
 Verdict: **ok**
 
 - Machine: Standard_D4s_v5, 4 vCPU, INTEL(R) XEON(R) PLATINUM 8573C, kernel 7.0.0-1017-azure, glibc 2.39
 - CPU: recorded on INTEL(R) XEON(R) PLATINUM 8573C / Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz; now INTEL(R) XEON(R) PLATINUM 8573C
-- calibration (indicative only): 168.1 ms for a fixed sha256 loop, 4 cores
+- calibration (indicative only): 89.5 ms for a fixed sha256 loop, 4 cores
 - Client: Python 3.12.3, redis-py 5.2.1
 - v1_2_2: `kividb 1.2.2`, sha256 `38fc2cea40c131e041f4914527a98719e5d34dffdfe2abdc1f07ecb86aa6723e`
-- candidate: `kividb 1.2.1 (default build: no Lua, no TLS)`, sha256 `6996623da05521b0e1e5d73326fc74dc2630ab3640cf449a0d39da0311ddb02d`
+- candidate: `kividb 1.2.1 (default build: no Lua, no TLS)`, sha256 `0c97957bdf96c0bae533f60b06af36e3fe2f1723780c647dc96f8ac8955f71c8`
 - redis: `Redis server v=8.10.2 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=75a9b36b1f0aa00`, sha256 `b0cd304980112fa6cd8dced524fdd6b136fd8efb802f5cf9e81610051a11891c`
-- candidate commit: `pr-packed-zsets`
+- candidate commit: `pr-packed-zsets-r2`
 - date: 2026-11-18; FULL=0, SCALE=1
-- run time: 25-zset-memory 156s
+- run time: 31-zset-memory 86s
 
-Host speed (this host vs the recorded one; 1.00 = same, below 1 = slower), from v1.2.2 measured in both sessions: global 0.94x over 10 metrics
-- 25-zset-memory/float: 0.94x (5 metrics)
-- 25-zset-memory/int: 0.96x (5 metrics)
+Host speed (this host vs the recorded one; 1.00 = same, below 1 = slower), from v1.2.2 measured in both sessions: global 1.00x over 10 metrics
+- 31-zset-memory/float: 1.00x (5 metrics)
+- 31-zset-memory/int: 1.00x (5 metrics)
 
-## 25-zset-memory
+## 31-zset-memory
 
 | config | metric | unit | v1.2.2 | candidate | Redis | recorded | gate | result |
 |---|---|---|---:|---:|---:|---:|---|---|
 | float | bytes_per_member_10 | B | 118.8 | 37.58 | 27.96 | 37.58 | rel: <= 39.46 (5% over 37.58, +1)<br>ratio: gain over v1.2.2 3.16x >= 1.90x (60% of recorded 3.16x) | pass<br>pass |
 | float | bytes_per_member_100 | B | 116.4 | 27.31 | 26.16 | 27.31 | rel: <= 28.67 (5% over 27.31, +1)<br>ratio: gain over v1.2.2 4.26x >= 2.56x (60% of recorded 4.26x) | pass<br>pass |
-| float | bytes_per_member_1000 | B | 132.5 | 132.5 | 67.92 | 132.5 | rel: <= 139.1 (5% over 132.5, +1) | pass |
+| float | bytes_per_member_1000 | B | 132.5 | 132.5 | 67.80 | 132.5 | rel: <= 139.1 (5% over 132.5, +1) | pass |
 | float | bytes_per_member_128 | B | 131.7 | 26.96 | 24.42 | 26.96 | rel: <= 28.31 (5% over 26.96, +1)<br>ratio: gain over v1.2.2 4.89x >= 2.93x (60% of recorded 4.89x) | pass<br>pass |
-| float | bytes_per_member_129 | B | 130.9 | 131.2 | 78.80 | 131.2 | rel: <= 137.7 (5% over 131.2, +1) | pass |
+| float | bytes_per_member_129 | B | 130.9 | 131.2 | 79.57 | 131.2 | rel: <= 137.7 (5% over 131.2, +1) | pass |
 | float | encoding_10 | code | 2 | 2 | 2 | 2 | bound: == 2 | pass |
 | float | encoding_100 | code | 2 | 2 | 2 | 2 | bound: == 2 | pass |
 | float | encoding_1000 | code | 5 | 5 | 5 | 5 | bound: == 5 | pass |
 | float | encoding_128 | code | 2 | 2 | 2 | 2 | bound: == 2 | pass |
 | float | encoding_129 | code | 5 | 5 | 5 | 5 | bound: == 5 | pass |
-| float | load_1000_s | s | 3.73 | 4.42 | 4.42 | 4.03 | info | info |
-| float | load_100_s | s | 4.18 | 3.9 | 7.08 | 3.83 | info | info |
-| float | load_10_s | s | 5.12 | 4.27 | 5.25 | 3.59 | info | info |
-| float | load_128_s | s | 4.15 | 3.96 | 7.78 | 3.6 | info | info |
-| float | load_129_s | s | 4.14 | 4 | 4.11 | 3.33 | info | info |
+| float | load_1000_s | s | 1.99 | 1.97 | 2.05 | 2 | info | info |
+| float | load_100_s | s | 1.93 | 1.87 | 3.64 | 1.87 | info | info |
+| float | load_10_s | s | 2.29 | 2.17 | 2.45 | 2.24 | info | info |
+| float | load_128_s | s | 1.96 | 1.86 | 4.05 | 1.86 | info | info |
+| float | load_129_s | s | 1.97 | 1.99 | 2.04 | 1.97 | info | info |
 | int | bytes_per_member_10 | B | 118.8 | 29.58 | 24.76 | 29.58 | rel: <= 31.06 (5% over 29.58, +1)<br>ratio: gain over v1.2.2 4.02x >= 2.41x (60% of recorded 4.02x) | pass<br>pass |
-| int | bytes_per_member_100 | B | 116.4 | 19.31 | 21.05 | 19.31 | rel: <= 20.31 (5% over 19.31, +1)<br>ratio: gain over v1.2.2 6.03x >= 3.62x (60% of recorded 6.03x) | pass<br>pass |
-| int | bytes_per_member_1000 | B | 132.5 | 132.5 | 68.05 | 132.5 | rel: <= 139.1 (5% over 132.5, +1) | pass |
+| int | bytes_per_member_100 | B | 116.4 | 19.31 | 21.04 | 19.31 | rel: <= 20.31 (5% over 19.31, +1)<br>ratio: gain over v1.2.2 6.03x >= 3.62x (60% of recorded 6.03x) | pass<br>pass |
+| int | bytes_per_member_1000 | B | 132.5 | 132.5 | 67.88 | 132.5 | rel: <= 139.1 (5% over 132.5, +1) | pass |
 | int | bytes_per_member_128 | B | 131.7 | 18.96 | 20.42 | 18.96 | rel: <= 19.96 (5% over 18.96, +1)<br>ratio: gain over v1.2.2 6.95x >= 4.17x (60% of recorded 6.95x) | pass<br>pass |
-| int | bytes_per_member_129 | B | 130.9 | 131.2 | 79.06 | 131.2 | rel: <= 137.7 (5% over 131.2, +1) | pass |
+| int | bytes_per_member_129 | B | 130.9 | 131.2 | 79.54 | 131.2 | rel: <= 137.7 (5% over 131.2, +1) | pass |
 | int | encoding_10 | code | 2 | 2 | 2 | 2 | bound: == 2 | pass |
 | int | encoding_100 | code | 2 | 2 | 2 | 2 | bound: == 2 | pass |
 | int | encoding_1000 | code | 5 | 5 | 5 | 5 | bound: == 5 | pass |
 | int | encoding_128 | code | 2 | 2 | 2 | 2 | bound: == 2 | pass |
 | int | encoding_129 | code | 5 | 5 | 5 | 5 | bound: == 5 | pass |
-| int | load_1000_s | s | 3.45 | 3.62 | 4.33 | 3.44 | info | info |
-| int | load_100_s | s | 3.4 | 3.93 | 6.08 | 3.76 | info | info |
-| int | load_10_s | s | 4.77 | 4.25 | 4.96 | 3.91 | info | info |
-| int | load_128_s | s | 4.04 | 3.29 | 6.53 | 3.46 | info | info |
-| int | load_129_s | s | 4.05 | 3.57 | 4.24 | 4 | info | info |
+| int | load_1000_s | s | 1.97 | 1.97 | 2.03 | 1.97 | info | info |
+| int | load_100_s | s | 1.92 | 1.85 | 3.16 | 1.84 | info | info |
+| int | load_10_s | s | 2.32 | 2.15 | 2.35 | 2.16 | info | info |
+| int | load_128_s | s | 1.91 | 1.83 | 3.48 | 1.82 | info | info |
+| int | load_129_s | s | 1.95 | 1.94 | 1.99 | 1.96 | info | info |
 
 ## Not run this time
 

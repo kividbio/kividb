@@ -24,4 +24,4 @@ because they need an older release's binary and a Redis server.
   shape) and `OBJECT ENCODING` after each step, listed apart. Prints each
   difference and a summary.
 
-Memory per member is recorded by regression suite `25-zset-memory`.
+Memory per member is recorded by regression suite `31-zset-memory`.

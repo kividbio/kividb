@@ -1071,3 +1071,62 @@ fn a_transaction_crosses_the_change_of_form() {
     assert_eq!(items[1].text(), "skiplist");
     assert_eq!(items[2], Resp::Int(129));
 }
+
+/// A set grown to 128 members of 64 bytes and popped down to one gives its
+/// room back: it is not kept at the size it was until it is deleted.
+#[test]
+fn a_set_popped_down_gives_its_room_back() {
+    let dir = temp_dir("shrink");
+    let server = Server::start(dir.path(), &[]);
+    let mut c = server.conn();
+    let pairs: Vec<(Vec<u8>, String)> = (0..128)
+        .map(|i| {
+            let mut m = vec![b'm'; 64];
+            m[..8].copy_from_slice(format!("{i:08}").as_bytes());
+            (m, i.to_string())
+        })
+        .collect();
+    c.zadd("z", &pairs);
+    assert_eq!(c.encoding("z"), "listpack");
+    let full = c.cmd(&["MEMORY", "USAGE", "z"]).int();
+    assert!(full > 9_000, "{full}");
+    assert_eq!(c.cmd(&["ZPOPMIN", "z", "127"]).items().len(), 254);
+    let one = c.cmd(&["MEMORY", "USAGE", "z"]).int();
+    assert!(
+        one < 400,
+        "MEMORY USAGE {one} after popping 127 of 128 (was {full})"
+    );
+    assert_eq!(c.cmd(&["ZCARD", "z"]).int(), 1);
+}
+
+/// Integer arguments are read as Redis reads them: `x`, `+1`, `01` and
+/// `-0` are errors, and an error changes nothing.
+#[test]
+fn integer_arguments_are_read_as_redis_reads_them() {
+    let dir = temp_dir("ints");
+    let server = Server::start(dir.path(), &[]);
+    let mut c = server.conn();
+    c.zadd("z", &members(10, "m"));
+    let not_int = Resp::Error("ERR value is not an integer or out of range".into());
+    for bad in ["x", "+1", "01", "-0", "1.0", "9223372036854775808"] {
+        assert_eq!(c.cmd(&["ZREMRANGEBYRANK", "z", bad, "5"]), not_int, "{bad}");
+        assert_eq!(
+            c.cmd(&["ZREMRANGEBYRANK", "nokey", "0", bad]),
+            not_int,
+            "{bad}"
+        );
+        assert_eq!(c.cmd(&["ZRANGE", "z", bad, "1"]), not_int, "{bad}");
+        assert_eq!(
+            c.cmd(&["ZRANGEBYSCORE", "z", "-inf", "+inf", "LIMIT", bad, "1"]),
+            not_int,
+            "{bad}"
+        );
+        assert_eq!(c.cmd(&["ZRANDMEMBER", "z", bad]), not_int, "{bad}");
+        assert!(
+            matches!(c.cmd(&["ZPOPMIN", "z", bad]), Resp::Error(_)),
+            "{bad}"
+        );
+    }
+    assert_eq!(c.cmd(&["ZCARD", "z"]).int(), 10, "nothing was removed");
+    assert_eq!(c.cmd(&["ZREMRANGEBYRANK", "z", "-2", "-1"]).int(), 2);
+}

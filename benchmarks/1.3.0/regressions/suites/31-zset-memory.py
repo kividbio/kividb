@@ -30,7 +30,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 from suite import Suite, Config, KEEP_IMPROVEMENT, EXACT, rel, info, scaled  # noqa: E402
 
-S = Suite("25-zset-memory", [Config("int"), Config("float")])
+S = Suite("31-zset-memory", [Config("int"), Config("float")])
 SIZES = [10, 100, 128, 129, 1000]
 TOTAL = 1_000_000
 BATCH = 250
