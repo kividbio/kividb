@@ -426,9 +426,36 @@ kividb kdb-decompress dump.kdb dump-plain.kdb   # what 1.2 reads
 kividb kdb-compress dump-plain.kdb dump.kdb     # and back
 ```
 
-Both write through a temporary file beside the output, check every block on
-the way, and exit 1 on a damaged input, leaving the output as it was. They
-start no server, and need no shell (`["kividb", "kdb-decompress", ...]`).
+An online backup's BASE (`appendonly.aof.N.base.kdb`) is a snapshot like
+any other: taken by 1.3 with `rdbcompression yes`, the default, 1.2 cannot
+restore it (`--preload-file aof:...` refuses it with `bad magic`). Convert
+the BASE with `kividb kdb-decompress` (and name the plain file in the
+manifest's place of the old one), or take the backup with `rdbcompression
+no` set.
+
+What the two tools check, before they write anything:
+
+* the input is read through as the server loads a snapshot: every key and
+  value parsed, every section after the databases, and for a compressed
+  one every block's length and checksum, its end marker and that nothing
+  follows it. An input the server would refuse is refused (exit 1, a
+  message saying why, no output file). The keys are not kept: memory stays
+  small whatever the file's size;
+* `kdb-compress` takes a plain snapshot only, `kdb-decompress` a compressed
+  one only; the other form is refused (a plain snapshot needs nothing to be
+  read by 1.2);
+* `kdb-compress` refuses a snapshot written by KiviDB 1.2.0 with the empty
+  key in a database before its last (#441): the server reads such a file
+  a second way to load it, which it does not do for a compressed snapshot.
+  Start a server on it and `SAVE`, then compress what it writes;
+* what is written is read through again the same way before it is put in
+  place.
+
+The output goes through a temporary file beside it, synced, renamed into
+place, and its directory synced. An output that exists is not replaced
+(exit 1) unless `--force` comes before the files (`kividb kdb-decompress
+--force <in> <out>`). The tools start no server and need no shell
+(`["kividb", "kdb-decompress", ...]`).
 
 ## When a write is acknowledged
 

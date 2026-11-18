@@ -178,7 +178,9 @@ fn helper_count() -> usize {
 
 /// A block, compressed or found not to shrink.
 struct Packed {
-    raw: Vec<u8>,
+    /// The block's bytes, shared with the writer until it is written: if the
+    /// thread compressing it dies, the writer compresses it itself.
+    raw: Arc<Vec<u8>>,
     /// The compressed bytes; unused when `compressed` is not set.
     data: Vec<u8>,
     compressed: bool,
@@ -189,14 +191,14 @@ struct Packed {
 /// cannot be compressed (no compressor), is stored as it is.
 fn pack(
     cctx: Option<&mut zstd::bulk::Compressor<'static>>,
-    raw: Vec<u8>,
+    raw: Arc<Vec<u8>>,
     mut data: Vec<u8>,
 ) -> Packed {
     data.clear();
     let compressed = match cctx {
         Some(cctx) => {
             data.reserve(zstd::zstd_safe::compress_bound(raw.len()));
-            matches!(cctx.compress_to_buffer(&raw, &mut data), Ok(n) if n < raw.len())
+            matches!(cctx.compress_to_buffer(&raw[..], &mut data), Ok(n) if n < raw.len())
         }
         None => false,
     };
@@ -214,16 +216,27 @@ fn compressor() -> Option<zstd::bulk::Compressor<'static>> {
 }
 
 struct Job {
-    raw: Vec<u8>,
+    raw: Arc<Vec<u8>>,
     data: Vec<u8>,
     done: mpsc::SyncSender<Packed>,
+}
+
+/// `KIVIDB_TEST_COMPRESS_THREADS_DIE=1`, never set otherwise and read in
+/// debug builds only: a compression thread panics on the block it is given,
+/// as a thread that dies would. The writer compresses that block, and every
+/// later one, itself.
+#[cfg(debug_assertions)]
+fn test_thread_dies() -> bool {
+    static DIES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DIES.get_or_init(|| std::env::var("KIVIDB_TEST_COMPRESS_THREADS_DIE").as_deref() == Ok("1"))
 }
 
 /// The threads that compress blocks, for every writer: started once, on
 /// the first compressed snapshot, and kept. Started for each snapshot, as
 /// they were, a server that saves every few minutes made a new thread each
 /// time, and each thread keeps a counter of the allocator's for good
-/// (`memory_use`).
+/// (`memory_use`). A thread that dies is not started again: a writer whose
+/// block it held, or that finds them all gone, compresses on its own thread.
 struct Pool {
     jobs: mpsc::SyncSender<Job>,
     threads: usize,
@@ -253,6 +266,10 @@ fn pool() -> Option<&'static Pool> {
                             Err(_) => return,
                         };
                         let Ok(job) = job else { return };
+                        #[cfg(debug_assertions)]
+                        if test_thread_dies() {
+                            panic!("KIVIDB_TEST_COMPRESS_THREADS_DIE: a compression thread dies");
+                        }
                         let packed = pack(cctx.as_mut(), job.raw, job.data);
                         // The writer may have given up (an error, a full
                         // sync's replica gone): nothing waits for it then.
@@ -268,23 +285,38 @@ fn pool() -> Option<&'static Pool> {
     .as_ref()
 }
 
+/// Said once in the process's life: the compression threads failed, and
+/// snapshots are compressed on the threads that write them.
+fn note_threads_failed() {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        crate::log_warn!(
+            "snapshot: a compression thread is gone; snapshots are compressed on the thread \
+             that writes them from now on (slower, nothing else changes)"
+        );
+    }
+}
+
 /// Writes what is written to it to `out` as a compressed snapshot. What is
 /// written to it is the plain image; [`BlockWriter::finish`] ends it.
 ///
-/// Blocks are compressed on the [`MAX_HELPERS`] threads every writer shares, a few
-/// blocks at a time: it holds no more than a few blocks' worth of memory,
-/// whatever the size of the image.
+/// Blocks are compressed on the [`MAX_HELPERS`] threads every writer
+/// shares, a few blocks at a time: it holds no more than a few blocks' worth
+/// of memory, whatever the size of the image. If those threads fail, the
+/// writer compresses on its own thread, and the snapshot is written all the
+/// same.
 pub struct BlockWriter<W: Write> {
     out: W,
     block_size: usize,
     buf: Vec<u8>,
     /// Where blocks go to be compressed: the pool's queue, if there is
-    /// one and the writer uses it.
+    /// one, the writer uses it, and it has not failed.
     jobs: Option<mpsc::SyncSender<Job>>,
-    /// For the blocks compressed on this thread, when there are no helpers.
+    /// For the blocks compressed on this thread.
     cctx: Option<zstd::bulk::Compressor<'static>>,
-    pending: VecDeque<mpsc::Receiver<Packed>>,
-    /// The most blocks with the helpers at once.
+    /// The blocks with the pool, in order, each with its bytes.
+    pending: VecDeque<(mpsc::Receiver<Packed>, Arc<Vec<u8>>)>,
+    /// The most blocks with the pool at once.
     most_pending: usize,
     spare_raw: Vec<Vec<u8>>,
     spare_data: Vec<Vec<u8>>,
@@ -323,9 +355,25 @@ impl<W: Write> BlockWriter<W> {
         })
     }
 
+    /// The pool failed this writer: everything from here on is compressed
+    /// on this thread.
+    fn without_pool(&mut self) {
+        note_threads_failed();
+        self.jobs = None;
+        if self.cctx.is_none() {
+            self.cctx = compressor();
+        }
+    }
+
+    /// Compress `raw` on this thread and write it.
+    fn pack_here(&mut self, raw: Arc<Vec<u8>>, data: Vec<u8>) -> io::Result<()> {
+        let packed = pack(self.cctx.as_mut(), raw, data);
+        self.write_packed(packed)
+    }
+
     fn write_packed(&mut self, packed: Packed) -> io::Result<()> {
         let Packed {
-            mut raw,
+            raw,
             mut data,
             compressed,
             sum,
@@ -345,21 +393,31 @@ impl<W: Write> BlockWriter<W> {
         self.blocks += 1;
         self.raw += raw.len() as u64;
         self.stored += (BLOCK_HEADER_LEN + bytes.len()) as u64;
-        raw.clear();
+        if let Ok(mut raw) = Arc::try_unwrap(raw) {
+            raw.clear();
+            self.spare_raw.push(raw);
+        }
         data.clear();
-        self.spare_raw.push(raw);
         self.spare_data.push(data);
         Ok(())
     }
 
+    /// Write the oldest block with the pool once it is compressed; if the
+    /// thread that had it died, compressed here.
     fn wait_one(&mut self) -> io::Result<()> {
-        let Some(done) = self.pending.pop_front() else {
+        let Some((done, raw)) = self.pending.pop_front() else {
             return Ok(());
         };
-        let packed = done
-            .recv()
-            .map_err(|_| io::Error::other("a snapshot compression thread failed"))?;
-        self.write_packed(packed)
+        match done.recv() {
+            Ok(packed) => {
+                drop(raw);
+                self.write_packed(packed)
+            }
+            Err(_) => {
+                self.without_pool();
+                self.pack_here(raw, Vec::new())
+            }
+        }
     }
 
     /// Send the block being filled to be compressed and written.
@@ -371,24 +429,39 @@ impl<W: Write> BlockWriter<W> {
             .spare_raw
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(self.block_size));
-        let raw = std::mem::replace(&mut self.buf, fresh);
+        let raw = Arc::new(std::mem::replace(&mut self.buf, fresh));
         let data = self.spare_data.pop().unwrap_or_default();
         let Some(jobs) = self.jobs.clone() else {
-            let packed = pack(self.cctx.as_mut(), raw, data);
-            return self.write_packed(packed);
+            // In order: what is still with the pool first.
+            while !self.pending.is_empty() {
+                self.wait_one()?;
+            }
+            return self.pack_here(raw, data);
         };
         while self.pending.len() >= self.most_pending {
             self.wait_one()?;
         }
         let (done_tx, done_rx) = mpsc::sync_channel(1);
-        jobs.send(Job {
-            raw,
+        let job = Job {
+            raw: Arc::clone(&raw),
             data,
             done: done_tx,
-        })
-        .map_err(|_| io::Error::other("the snapshot compression threads are gone"))?;
-        self.pending.push_back(done_rx);
-        Ok(())
+        };
+        match jobs.send(job) {
+            Ok(()) => {
+                self.pending.push_back((done_rx, raw));
+                Ok(())
+            }
+            // Every thread of the pool is gone.
+            Err(mpsc::SendError(job)) => {
+                self.without_pool();
+                while !self.pending.is_empty() {
+                    self.wait_one()?;
+                }
+                drop(raw);
+                self.pack_here(job.raw, job.data)
+            }
+        }
     }
 
     /// Write the last block and the end. Returns the bytes of the image and
@@ -430,6 +503,42 @@ impl<W: Write> Write for BlockWriter<W> {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// `KIVIDB_TEST_DAMAGE_FULL_SYNC=checksum[:n]` or `truncate[:n]`, never set
+/// otherwise and read in debug builds only: the first `n` (every, without
+/// it) compressed full-sync payloads a master sends are damaged on their
+/// way out, a byte of the first block's data changed, or cut short before
+/// the end marker. A test's way to see a replica refuse them and keep its
+/// dataset.
+#[cfg(debug_assertions)]
+pub fn test_damage_full_sync(payload: &mut Vec<u8>) {
+    static SPEC: std::sync::OnceLock<Option<(String, u64)>> = std::sync::OnceLock::new();
+    static DONE: AtomicU64 = AtomicU64::new(0);
+    let spec = SPEC.get_or_init(|| {
+        let v = std::env::var("KIVIDB_TEST_DAMAGE_FULL_SYNC").ok()?;
+        let (mode, n) = match v.split_once(':') {
+            Some((m, n)) => (m.to_string(), n.parse().ok()?),
+            None => (v, u64::MAX),
+        };
+        Some((mode, n))
+    });
+    let Some((mode, n)) = spec else { return };
+    if !is_compressed(payload) || payload.len() < HEADER_LEN + BLOCK_HEADER_LEN + 2 + END_LEN {
+        return;
+    }
+    if DONE.fetch_add(1, Ordering::Relaxed) >= *n {
+        return;
+    }
+    match mode.as_str() {
+        "checksum" => payload[HEADER_LEN + BLOCK_HEADER_LEN + 1] ^= 0x20,
+        "truncate" => {
+            let len = payload.len() - END_LEN;
+            payload.truncate(len);
+        }
+        _ => {}
+    }
+    crate::log_warn!("KIVIDB_TEST_DAMAGE_FULL_SYNC: a full-sync payload damaged ({mode})");
 }
 
 // ── Reading ─────────────────────────────────────────────────────────────────
@@ -678,21 +787,28 @@ pub fn subcommand(args: &[std::ffi::OsString]) -> Option<i32> {
         "kdb-compress" => true,
         _ => return None,
     };
-    if args.len() != 4 {
+    let mut rest: Vec<&std::ffi::OsString> = args[2..].iter().collect();
+    let force = rest.first().is_some_and(|a| *a == "--force");
+    if force {
+        rest.remove(0);
+    }
+    if rest.len() != 2 {
         eprintln!(
-            "usage: kividb {name} <in> <out>\n  {}",
+            "usage: kividb {name} [--force] <in> <out>\n  {}\n  <in> is read through as the \
+             server loads it, and refused (exit 1, no <out>) if the server would not load it. \
+             <out> is not replaced unless --force is given.",
             if compress {
                 "writes the plain snapshot <in> to <out> compressed, as rdbcompression yes writes it"
             } else {
-                "writes the snapshot <in> to <out> as a plain snapshot (KIVIDB01), which KiviDB \
-                 1.2 and earlier read"
+                "writes the compressed snapshot <in> to <out> as a plain snapshot (KIVIDB01), \
+                 which KiviDB 1.2 and earlier read"
             }
         );
         return Some(1);
     }
-    let input = std::path::Path::new(&args[2]);
-    let output = std::path::Path::new(&args[3]);
-    match convert_file(input, output, compress) {
+    let input = std::path::Path::new(rest[0]);
+    let output = std::path::Path::new(rest[1]);
+    match convert_file(input, output, compress, force) {
         Ok((raw, stored)) => {
             println!(
                 "{}: {raw} bytes of image, {stored} bytes written to {}",
@@ -708,13 +824,28 @@ pub fn subcommand(args: &[std::ffi::OsString]) -> Option<i32> {
     }
 }
 
-/// Write the snapshot `input` to `output`, compressed or plain: through a
-/// temporary file beside it, made durable, then renamed into place. Returns
-/// the bytes of the image and the bytes written.
+fn refused(what: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, what)
+}
+
+/// Write the snapshot `input` to `output`, compressed (`kdb-compress`, from
+/// a plain one) or plain (`kdb-decompress`, from a compressed one).
+///
+/// `input` is first read through as the server loads it (every key and
+/// value parsed, every section, and for a compressed one every block's
+/// length and checksum and its end marker), and refused if the server would
+/// refuse it. A plain image that loads only as KiviDB 1.2.0 wrote the empty
+/// key (#441) is refused for compressing: a compressed snapshot is not read
+/// that way. What is written is read through again before it is put in
+/// place. It goes through a temporary file beside `output`, made durable,
+/// renamed into place, and the directory synced. An `output` that exists is
+/// not replaced unless `force` is set. Refused, nothing is left at
+/// `output`. Returns the bytes of the image and the bytes written.
 pub fn convert_file(
     input: &std::path::Path,
     output: &std::path::Path,
     compress: bool,
+    force: bool,
 ) -> io::Result<(u64, u64)> {
     if let (Ok(a), Ok(b)) = (input.canonicalize(), output.canonicalize())
         && a == b
@@ -724,13 +855,53 @@ pub fn convert_file(
             "<in> and <out> are the same file",
         ));
     }
+    if !force && std::fs::symlink_metadata(output).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} exists: it is not replaced (pass --force to replace it)",
+                output.display()
+            ),
+        ));
+    }
     let mut source = io::BufReader::with_capacity(1 << 20, std::fs::File::open(input)?);
     let mut magic = [0u8; 8];
     if !read_full(&mut source, &mut magic)? || (&magic != MAGIC && &magic != super::KDB_MAGIC) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not a KiviDB snapshot", input.display()),
-        ));
+        return Err(refused(format!(
+            "{} is not a KiviDB snapshot",
+            input.display()
+        )));
+    }
+    match (compress, &magic == MAGIC) {
+        (true, true) => {
+            return Err(refused(format!(
+                "{} is already a compressed snapshot",
+                input.display()
+            )));
+        }
+        (false, false) => {
+            return Err(refused(format!(
+                "{} is not a compressed snapshot: it is a plain one (KIVIDB01), which 1.2 reads \
+                 as it is",
+                input.display()
+            )));
+        }
+        _ => {}
+    }
+    // Read through as the server loads it, before anything is written.
+    let (_, legacy) = super::check_image_file(input).map_err(|e| {
+        refused(format!(
+            "{} would not load, so it is not converted: {e}",
+            input.display()
+        ))
+    })?;
+    if compress && legacy {
+        return Err(refused(format!(
+            "{} was written by KiviDB 1.2.0 with the empty key in a database before its last \
+             (#441), and loads only read that way, which a compressed snapshot is not: start a \
+             server on it and SAVE, then compress what it writes",
+            input.display()
+        )));
     }
     let tmp = {
         let mut name = output.as_os_str().to_owned();
@@ -740,48 +911,47 @@ pub fn convert_file(
     let result = (|| -> io::Result<(u64, u64)> {
         let file = std::fs::File::create(&tmp)?;
         let mut out = io::BufWriter::with_capacity(1 << 20, file);
-        let sizes = if &magic == MAGIC {
-            let mut blocks = BlockReader::after_magic(&mut source)?;
-            let mut inner = [0u8; 8];
-            if !read_full(&mut blocks, &mut inner)? || &inner != super::KDB_MAGIC {
-                return Err(invalid(
-                    "compressed snapshot: what it holds is not a KDB image".into(),
-                ));
-            }
-            if compress {
-                let mut w = BlockWriter::new(&mut out)?;
-                w.write_all(&inner)?;
-                io::copy(&mut blocks, &mut w)?;
-                blocks.finish()?;
-                let (raw, stored, _) = w.finish()?;
-                (raw, stored)
-            } else {
-                out.write_all(&inner)?;
-                io::copy(&mut blocks, &mut out)?;
-                let (_, raw) = blocks.finish()?;
-                (raw, raw)
-            }
-        } else if compress {
+        let sizes = if compress {
             let mut w = BlockWriter::new(&mut out)?;
             w.write_all(&magic)?;
             io::copy(&mut source, &mut w)?;
             let (raw, stored, _) = w.finish()?;
             (raw, stored)
         } else {
-            out.write_all(&magic)?;
-            let n = 8 + io::copy(&mut source, &mut out)?;
-            (n, n)
+            let mut blocks = BlockReader::after_magic(&mut source)?;
+            io::copy(&mut blocks, &mut out)?;
+            let (_, raw) = blocks.finish()?;
+            (raw, raw)
         };
         out.flush()?;
         out.get_ref().sync_all()?;
         drop(out);
+        // What was written loads as what was read.
+        super::check_image_file(&tmp)
+            .map_err(|e| refused(format!("what was written does not load: {e}")))?;
         std::fs::rename(&tmp, output)?;
+        sync_parent(output)?;
         Ok(sizes)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// Make a rename into `path`'s directory durable.
+fn sync_parent(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => std::path::Path::new("."),
+        };
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 #[cfg(test)]

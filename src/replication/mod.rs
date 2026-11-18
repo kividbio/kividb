@@ -3423,7 +3423,10 @@ pub fn begin_full_sync(
     let held = started.elapsed();
 
     // Laid out, and compressed, with writes going on again.
-    let (payload, not_counted) = frozen.into_image_as(compressed)?;
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+    let (mut payload, not_counted) = frozen.into_image_as(compressed)?;
+    #[cfg(debug_assertions)]
+    crate::snapshot::blocks::test_damage_full_sync(&mut payload);
     log_info!(
         "Replication: full-sync payload of {} bytes, {}",
         payload.len(),

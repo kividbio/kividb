@@ -173,6 +173,12 @@ fn spawn(bin: &Path, dir: &Path, port: u16, extra: &[String], env: &[(&str, &str
     if let Ok(model) = std::env::var("KIVIDB_TEST_IO_MODEL") {
         command.args(["--io-model", &model]);
     }
+    // This build writes the plain image, which the 1.2 binary these tests
+    // go back to reads (#879): a compressed one it refuses, by design. 1.2
+    // takes no `--rdbcompression`.
+    if bin == this_bin() {
+        command.args(["--rdbcompression", "no"]);
+    }
     command
         .args(extra)
         .envs(env.iter().copied())
@@ -2220,8 +2226,7 @@ fn downgrade_to_1_2() {
         (&["Q8"][..], false, "int8"),
         (&["BIN"][..], false, "bin"),
     ] {
-        // The plain image, which 1.2 reads (#879).
-        let mut server = Server::start(&["--rdbcompression", "no"]);
+        let mut server = Server::start(&[]);
         let mut c = server.conn();
         assert_eq!(vadd(&mut c, "v", &[3.0, -4.0, 0.5], "a", opts), V::Int(1));
         c.cmd(&["VSETATTR", "v", "a", r#"{"n":1}"#]);

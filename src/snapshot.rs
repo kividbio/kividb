@@ -1881,6 +1881,25 @@ fn read_retrying<R: Read>(
     databases: usize,
 ) -> io::Result<(LoadedSnapshot, usize, R)> {
     read_retrying_within(open, keep, databases, readings_for(databases))
+        .map(|(loaded, keys, reader, _)| (loaded, keys, reader))
+}
+
+/// The databases [`check_image_file`] reads an image for: as many as an
+/// image can have keys in, as a tool does not know the server's.
+const CHECK_DATABASES: usize = 1 << 16;
+
+/// Read the snapshot at `path` (plain or compressed) through, as a server
+/// loads it, holding none of it (`kividb kdb-compress` and `kdb-decompress`,
+/// #879). Returns its keys, and whether it loads only as 1.2.0 wrote the
+/// empty key (#441), a reading a compressed snapshot is not given.
+pub fn check_image_file(path: &std::path::Path) -> io::Result<(usize, bool)> {
+    read_retrying_within(
+        || File::open(path).map(BufReader::new),
+        false,
+        CHECK_DATABASES,
+        readings_for(CHECK_DATABASES),
+    )
+    .map(|(_, keys, _, plan)| (keys, !plan.is_empty()))
 }
 
 /// [`read_retrying`], with no more than `most` readings.
@@ -1889,11 +1908,11 @@ fn read_retrying_within<R: Read>(
     keep: bool,
     databases: usize,
     most: usize,
-) -> io::Result<(LoadedSnapshot, usize, R)> {
+) -> io::Result<(LoadedSnapshot, usize, R, Vec<usize>)> {
     let mut reader = open()?;
     let mut ends = Vec::new();
     let first_error = match read_image(&mut reader, keep, &[], &mut ends, databases) {
-        Ok((loaded, keys)) => return Ok((loaded, keys, reader)),
+        Ok((loaded, keys)) => return Ok((loaded, keys, reader, Vec::new())),
         // Read whole, and refused for its databases (#482).
         Err(e) if is_past_databases(&e) => return Err(e),
         // A compressed snapshot, damaged or not read whole: no 1.2.0 wrote
@@ -1985,7 +2004,7 @@ fn read_retrying_within<R: Read>(
          loads it",
         readings
     );
-    Ok((loaded, keys, reader))
+    Ok((loaded, keys, reader, plan))
 }
 
 /// Whether a reading failed on what it read, not on the disk or the network.
@@ -8762,7 +8781,7 @@ pub(crate) mod readings_tests {
         assert!(text.contains("not every other reading"), "{text}");
         assert!(text.contains("more ways than the 3 readings"), "{text}");
         assert!(verify_snapshot(&image).is_ok());
-        let (loaded, _, _) = read_retrying_within(|| Ok(image.as_slice()), true, 16, 5).unwrap();
+        let (loaded, _, _, _) = read_retrying_within(|| Ok(image.as_slice()), true, 16, 5).unwrap();
         check_1_2_0(&loaded, 4);
     }
 

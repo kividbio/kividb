@@ -15,7 +15,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a file (`bad magic`) and do not start, changing nothing on disk. To go
   back: `CONFIG SET rdbcompression no` and `SAVE` (or `rdbcompression no` in
   the config file before the last shutdown), or convert the file with
-  `kividb kdb-decompress dump.kdb dump-plain.kdb`. Every older snapshot
+  `kividb kdb-decompress dump.kdb dump-plain.kdb`. A backup's BASE taken
+  by 1.3 with the default is compressed too: 1.2 cannot restore it until it
+  is converted the same way, or take the backup with `rdbcompression no`.
+  Every older snapshot
   still loads. Replication across versions keeps working: a 1.3 master
   sends a 1.2.x replica the plain image, and a 1.3 replica reads a 1.2.x
   master's.
@@ -99,7 +102,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the plain image, as 1.2 did. `INFO persistence` gains
   `rdb_last_save_raw_size` and `rdb_last_save_stored_size`, and the save's
   log line gives the ratio. `kividb kdb-decompress <in> <out>` and `kividb
-  kdb-compress <in> <out>` convert a file either way, with no shell needed.
+  kdb-compress <in> <out>` convert a file either way, with no shell needed;
+  each first reads its input through as the server would load it and
+  refuses (exit 1, no output) what the server would refuse, and replaces an
+  existing output only with `--force`.
   Measured on one Standard_D4s_v5 (server on 2 CPUs, `--threads 2`; tmpfs):
 
   | dataset | | 1.2.2 | `no` | `yes` | Redis 8.10.2 |

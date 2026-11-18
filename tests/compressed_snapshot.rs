@@ -109,9 +109,21 @@ impl Conn {
         self.stream.write_all(&out).unwrap();
     }
 
+    /// A command and its reply. A server started from a dataset with search
+    /// indexes answers `LOADING` until it has built them, in the background
+    /// (`spawn_snapshot_index_backfill_thread` in src/main.rs): asked again,
+    /// for up to a minute.
     fn call<A: AsRef<[u8]>>(&mut self, args: &[A]) -> Reply {
-        self.send(args);
-        self.read()
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            self.send(args);
+            match self.read() {
+                Reply::Error(e) if e.starts_with("LOADING") && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                reply => return reply,
+            }
+        }
     }
 
     fn cmd<A: AsRef<[u8]>>(&mut self, args: &[A]) -> String {
@@ -487,7 +499,12 @@ fn a_compressed_snapshot_holds_the_plain_image_and_loads_the_same() {
     let (ok, said) = run_tool(&[&ppath, &again], "kdb-compress");
     assert!(ok, "{said}");
     assert!(std::fs::read(&again).unwrap().starts_with(COMPRESSED));
+    // An output that exists is replaced only with --force.
     let (ok, said) = run_tool(&[&again, &out], "kdb-decompress");
+    assert!(!ok && said.contains("--force"), "{said}");
+    assert_eq!(std::fs::read(&out).unwrap(), plain);
+    let force = Path::new("--force");
+    let (ok, said) = run_tool(&[force, &again, &out], "kdb-decompress");
     assert!(ok, "{said}");
     assert_eq!(std::fs::read(&out).unwrap(), plain, "compressed again");
     let (ok, _) = run_tool(&[&zpath], "kdb-decompress");
@@ -834,4 +851,301 @@ fn a_full_sync_is_compressed_only_for_a_replica_that_takes_it() {
         .parse()
         .unwrap();
     assert_eq!(full, 5, "one full sync each, no more: {info}");
+}
+
+/// A `dump.kdb` as 1.2.0 wrote it, with the empty key under the length that
+/// ends a database (#441): `databases` databases, the empty key in `at`
+/// (as `tests/backup.rs` makes one).
+fn dump_1_2_0(databases: usize, at: usize) -> Vec<u8> {
+    use kividb::shared_bytes::SharedBytes;
+    use kividb::types::KiviDBValue;
+    let string = |v: &str| KiviDBValue::String(SharedBytes::from(v.as_bytes()));
+    let mut image = Vec::new();
+    kividb::snapshot::write_kdb_header(&mut image, databases as u32).unwrap();
+    for db in 0..databases {
+        let before = format!("before-{db}");
+        kividb::snapshot::write_kdb_entry(&mut image, &before, string("1").view()).unwrap();
+        if db == at {
+            image.extend(0u32.to_le_bytes());
+            kividb::snapshot::write_kdb_value(&mut image, string("x").view()).unwrap();
+        }
+        let after = format!("after-{db}");
+        kividb::snapshot::write_kdb_entry(&mut image, &after, string("2").view()).unwrap();
+        kividb::snapshot::write_kdb_db_end(&mut image).unwrap();
+    }
+    image
+}
+
+/// A plain image wrapped in a container, as the server writes one.
+fn compressed_of(image: &[u8]) -> Vec<u8> {
+    let mut w = kividb::snapshot::blocks::BlockWriter::new(Vec::new()).unwrap();
+    w.write_all(image).unwrap();
+    w.finish().unwrap().2
+}
+
+/// `kdb-compress` and `kdb-decompress` read their input through as the
+/// server would load it, and refuse, with exit 1 and no output, what it
+/// would not load; and each refuses the form it does not convert.
+#[test]
+fn the_tools_refuse_what_the_server_would_not_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), &["--rdbcompression", "no"]);
+    let mut c = Conn::connect(server.port);
+    c.ok(&["SET", "timed", "v", "EX", "100000"]);
+    for i in 0..20_000 {
+        c.send(&["SET", &format!("k{i}"), &format!("{i:x}")]);
+    }
+    for _ in 0..20_000 {
+        c.read();
+    }
+    assert_eq!(c.cmd(&["SAVE"]), "OK");
+    let plain = std::fs::read(dir.path().join("dump.kdb")).unwrap();
+    drop(c);
+    drop(server);
+    assert!(plain.starts_with(PLAIN));
+    let compressed = compressed_of(&plain);
+    let at_expiry = plain.windows(8).position(|w| w == b"KIVIEX1\0").unwrap();
+
+    let t = tempfile::tempdir().unwrap();
+    let file = |name: &str, bytes: &[u8]| {
+        let p = t.path().join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    };
+    let refused = |tool: &str, input: &Path, says: &str| {
+        let out = t
+            .path()
+            .join(format!("out-{}", input.file_name().unwrap().to_string_lossy()));
+        let (ok, said) = run_tool(&[input, &out], tool);
+        assert!(!ok, "{tool} {}: {said}", input.display());
+        assert!(said.contains(says), "{tool} {}: {said}", input.display());
+        assert!(!out.exists(), "{tool} {}: an output was left", input.display());
+        assert!(
+            std::fs::read_dir(t.path())
+                .unwrap()
+                .all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")),
+            "a temporary file was left"
+        );
+    };
+    // The wrong form for each.
+    refused(
+        "kdb-compress",
+        &file("z.kdb", &compressed),
+        "already a compressed snapshot",
+    );
+    refused(
+        "kdb-decompress",
+        &file("p.kdb", &plain),
+        "not a compressed snapshot",
+    );
+    refused(
+        "kdb-decompress",
+        &file("junk.kdb", b"hello world"),
+        "not a KiviDB snapshot",
+    );
+    // A plain image cut short, inside a value and inside its expiry section.
+    refused(
+        "kdb-compress",
+        &file("cut1.kdb", &plain[..plain.len() / 2]),
+        "would not load",
+    );
+    refused(
+        "kdb-compress",
+        &file("cut2.kdb", &plain[..at_expiry + 11]),
+        "cut short",
+    );
+    // A container damaged, and one cut short.
+    let mut flipped = compressed.clone();
+    flipped[40] ^= 0x10;
+    refused(
+        "kdb-decompress",
+        &file("flip.kdb", &flipped),
+        "compressed snapshot",
+    );
+    refused(
+        "kdb-decompress",
+        &file("zcut.kdb", &compressed[..compressed.len() - 5]),
+        "compressed snapshot",
+    );
+    // A whole container of a torn image: the container checks out, the image
+    // in it does not load.
+    refused(
+        "kdb-decompress",
+        &file("ztorn.kdb", &compressed_of(&plain[..at_expiry + 11])),
+        "cut short",
+    );
+
+    // 1.2.0's empty key in a database before the last: it loads only read
+    // the 1.2.0 way, which a compressed snapshot is not given. Refused.
+    refused("kdb-compress", &file("legacy.kdb", &dump_1_2_0(16, 7)), "1.2.0");
+    // In the last database it reads one way, and compresses.
+    let last = file("last.kdb", &dump_1_2_0(1, 0));
+    let out = t.path().join("last-z.kdb");
+    let (ok, said) = run_tool(&[&last, &out], "kdb-compress");
+    assert!(ok, "{said}");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(&out, dir.path().join("dump.kdb")).unwrap();
+    let server = start(dir.path(), &["--databases", "1"]);
+    let mut c = Conn::connect(server.port);
+    assert_eq!(c.cmd(&["GET", ""]), "x");
+    assert_eq!(c.cmd(&["DBSIZE"]), "3");
+}
+
+/// Compressed twins of `tests/torn_snapshot.rs`: a whole container whose
+/// image is cut inside a section after the databases (expiry, index) does
+/// not start the server, which says it is cut short and leaves its
+/// directory as it was. (A container cut anywhere is refused for its own
+/// sake: `a_damaged_compressed_dump_does_not_start_the_server` cuts it at
+/// every block's start.)
+#[test]
+fn a_compressed_image_cut_inside_a_section_does_not_start_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start(dir.path(), &["--rdbcompression", "no"]);
+    let mut c = Conn::connect(server.port);
+    c.ok(&["SET", "timed", "v", "EX", "100000"]);
+    c.ok(&[
+        "FT.CREATE", "idx", "ON", "HASH", "PREFIX", "1", "doc:", "SCHEMA", "t", "TEXT",
+    ]);
+    c.ok(&["HSET", "doc:1", "t", "hello"]);
+    assert_eq!(c.cmd(&["SAVE"]), "OK");
+    let plain = std::fs::read(dir.path().join("dump.kdb")).unwrap();
+    drop(c);
+    drop(server);
+    for magic in [&b"KIVIEX1\0"[..], &b"KIVIDX1\0"[..]] {
+        let at = plain.windows(8).position(|w| w == magic).unwrap();
+        for cut in [at + 3, at + 10] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("dump.kdb"), compressed_of(&plain[..cut])).unwrap();
+            std::fs::write(dir.path().join("kividb.lock"), b"").unwrap();
+            let before = directory(dir.path());
+            let (failed, stderr) = fails_to_start(dir.path());
+            let what = format!("cut at {cut}");
+            assert!(failed, "{what}: the server started");
+            assert!(stderr.contains("cut short"), "{what}: {stderr}");
+            assert!(
+                directory(dir.path()) == before,
+                "{what}: the directory changed"
+            );
+        }
+    }
+}
+
+/// A server started with `KIVIDB_TEST_COMPRESS_THREADS_DIE`, whose
+/// compression threads die on the first block each is given (debug builds
+/// only): every save still completes, on the writer's own thread, and loads.
+#[cfg(debug_assertions)]
+#[test]
+fn a_save_completes_when_the_compression_threads_die() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("server.log");
+    let (child, port) = start_verified(|port| {
+        kividb(dir.path(), port, &[])
+            .env("KIVIDB_TEST_COMPRESS_THREADS_DIE", "1")
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap()
+    });
+    let server = Server { child, port };
+    let mut c = Conn::connect(server.port);
+    for i in 0..60_000 {
+        c.send(&["SET", &format!("key:{i}"), &format!("value {i} {}", i * 7)]);
+    }
+    for _ in 0..60_000 {
+        c.read();
+    }
+    for _ in 0..3 {
+        assert_eq!(c.cmd(&["SAVE"]), "OK");
+    }
+    let dump = std::fs::read(dir.path().join("dump.kdb")).unwrap();
+    assert!(dump.starts_with(COMPRESSED));
+    drop(c);
+    drop(server);
+    if std::thread::available_parallelism().map_or(1, |n| n.get()) > 1 {
+        let said = std::fs::read_to_string(&log).unwrap();
+        assert!(said.contains("a compression thread is gone"), "{said}");
+    }
+    let again = tempfile::tempdir().unwrap();
+    std::fs::write(again.path().join("dump.kdb"), &dump).unwrap();
+    let server = start(again.path(), &[]);
+    let mut c = Conn::connect(server.port);
+    assert_eq!(c.cmd(&["DBSIZE"]), "60000");
+    assert_eq!(
+        c.cmd(&["GET", "key:59999"]),
+        format!("value 59999 {}", 59_999 * 7)
+    );
+}
+
+/// A replica that takes `kdb-blocks` sent a compressed payload that is
+/// damaged (a block's checksum does not match) or cut short before its end
+/// marker (`KIVIDB_TEST_DAMAGE_FULL_SYNC` on the master, debug builds only)
+/// keeps its own dataset, says why, and tries again.
+#[cfg(debug_assertions)]
+#[test]
+fn a_replica_keeps_its_data_when_a_compressed_payload_is_damaged() {
+    for mode in ["checksum", "truncate"] {
+        let mdir = tempfile::tempdir().unwrap();
+        let (child, mport) = start_verified(|port| {
+            kividb(mdir.path(), port, &[])
+                .env("KIVIDB_TEST_DAMAGE_FULL_SYNC", mode)
+                .spawn()
+                .unwrap()
+        });
+        let master = Server {
+            child,
+            port: mport,
+        };
+        let mut m = Conn::connect(master.port);
+        for i in 0..20_000 {
+            m.send(&["SET", &format!("m:{i}"), &format!("master value {i}")]);
+        }
+        for _ in 0..20_000 {
+            m.read();
+        }
+        let rdir = tempfile::tempdir().unwrap();
+        let rlog = rdir.path().join("server.log");
+        let (child, rport) = start_verified(|port| {
+            kividb(rdir.path(), port, &[])
+                .stderr(std::fs::File::create(&rlog).unwrap())
+                .spawn()
+                .unwrap()
+        });
+        let replica = Server {
+            child,
+            port: rport,
+        };
+        let mut r = Conn::connect(replica.port);
+        for i in 0..100 {
+            r.ok(&["SET", &format!("mine:{i}"), "kept"]);
+        }
+        r.ok(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]);
+        let full = |m: &mut Conn| -> u64 {
+            m.cmd(&["INFO", "stats"])
+                .lines()
+                .find_map(|l| l.strip_prefix("sync_full:"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while full(&mut m) < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "{mode}: the replica did not try again"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(r.cmd(&["DBSIZE"]), "100", "{mode}");
+        assert_eq!(r.cmd(&["GET", "mine:0"]), "kept", "{mode}");
+        assert!(
+            r.cmd(&["INFO", "replication"])
+                .contains("master_link_status:down"),
+            "{mode}"
+        );
+        let said = std::fs::read_to_string(&rlog).unwrap();
+        assert!(
+            said.contains("not a valid KDB image") && said.contains("compressed snapshot: "),
+            "{mode}: {said}"
+        );
+    }
 }
