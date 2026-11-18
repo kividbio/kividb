@@ -56,10 +56,14 @@ where numbers leave a script behave as Redis's do:
   `table.maxn`, `table.foreach`, `table.foreachi`, `math.mod` (C's `fmod`),
   `string.gfind` (`string.gmatch`) and `gcinfo()`. They are in `EVAL`,
   `EVALSHA`, `EVAL_RO` and function libraries. Scripts written for Redis
-  2.x and 3.x use them, as hibiken/asynq's do (`table.getn(ids)`). Where
-  they differ from Redis: a result with an integer value is an integer (so
-  `'n=' .. table.maxn(t)` is `n=3`, as in Redis), the error of a bad argument names the function (called through `pcall`,
-  Redis names it `'?'`), and `gcinfo()` counts the memory of the Lua 5.4 VM.
+  2.x and 3.x use them, as hibiken/asynq's do (`table.getn(ids)`). A result
+  with an integer value is an integer, as in Redis (`'n=' .. table.maxn(t)`
+  is `n=3`). Where they differ from Redis: the error of a bad argument names
+  the function (called through `pcall`, Redis names it `'?'`),
+  `string.gfind` treats empty matches as Lua 5.4's `string.gmatch` does
+  (`'%a*'` over `'abc'` matches once here, twice on Redis), and `gcinfo()`
+  counts the memory of the Lua 5.4 VM.
+
 What is still Lua 5.4, with the way to write it so that it works on both:
 
 | On KiviDB (Lua 5.4) | On Redis (Lua 5.1) | Works on both |
