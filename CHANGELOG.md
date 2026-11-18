@@ -579,6 +579,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`CLUSTER SLOTS`, `SHARDS` and `NODES` refuse on a standalone, as in
+  Redis (#899).** They answered with empty tables, so a client that asks
+  a standalone for its slots — rueidis, the Go client behind Centrifugo
+  and others — took the empty answer for a cluster's and built a cluster
+  client against it. They now reply `ERR This instance has cluster
+  support disabled`, as the other cluster-only subcommands do; `CLUSTER
+  INFO` still reports `cluster_enabled:0`, and `CLUSTER KEYSLOT` still
+  answers.
+
 - **A client seen as no longer blocked has had its blocking command counted (#896).**
   `INFO clients` could show `blocked_clients:0` before `INFO commandstats` had the
   call of a blocking command (`BLPOP`, `XREAD BLOCK`, ...) that had just been
