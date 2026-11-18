@@ -418,5 +418,108 @@ class SkippedAndNotRun(unittest.TestCase):
         self.assertEqual(summ["verdict"], "ok")
 
 
+# The release gate (scripts/release/regression_gate.py), without git.
+_GATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "scripts", "release")
+sys.path.insert(0, os.path.abspath(_GATE))
+import regression_gate  # noqa: E402
+
+SUITES = ["01-small", "18-big"]
+
+
+def small_env(**kw):
+    env = {"vm": "Standard_D4s_v5", "nproc": 4, "scale": "1", "only": "", "full": "1",
+           "engines_selected": ["v1_2_2", "candidate", "redis"],
+           "suite_seconds": {"01-small": 10}, "needs_more_cpus": {"18-big": 8},
+           "suite_min_cpus": {"18-big": 8}, "min_cpus_only": False, "skipped_configs": []}
+    env.update(kw)
+    return env
+
+
+def big_env(**kw):
+    env = small_env(vm="Standard_D8s_v5", nproc=8, suite_seconds={"18-big": 10}, needs_more_cpus={},
+                    min_cpus_only=True)
+    env.update(kw)
+    return env
+
+
+OK_SUMMARY = {"verdict": "ok", "failed": [], "problems": []}
+
+
+class MinCpus(unittest.TestCase):
+    """Suites that declare Suite(..., min_cpus=N)."""
+
+    def baseline(self):
+        b, _ = build([("01-small/c", "x_rps", "req/s", "higher", 1.0, 1.0, 1.0, 1.0),
+                      ("18-big/c", "y_rps", "req/s", "higher", 1.0, 1.0, 1.0, 1.0)])
+        b["metrics"]["01-small/c/x_rps"]["recorded"]["vm"] = "Standard_D4s_v5"
+        b["metrics"]["18-big/c/y_rps"]["recorded"]["vm"] = "Standard_D8s_v5"
+        return b
+
+    def results(self, *keys):
+        _, res = build([("01-small/c", "x_rps", "req/s", "higher", 1.0, 1.0, 1.0, 1.0),
+                        ("18-big/c", "y_rps", "req/s", "higher", 1.0, 1.0, 1.0, 1.0)])
+        return {k: v for k, v in res.items() if k in keys}
+
+    def test_a_suite_needing_more_cpus_on_a_small_machine_is_not_run_not_invalid(self):
+        b, res = self.baseline(), self.results("01-small/c/x_rps")
+        env = small_env(expected=[{"suite": "01-small", "config": "c", "engines": ["v1_2_2", "candidate"]}])
+        self.assertEqual(compare.validity_problems(env, b, res, False, False), [])
+        _, not_run, _ = compare.evaluate(res, b)
+        self.assertEqual(not_run, ["18-big/c/y_rps"])
+
+    def test_each_suite_is_judged_on_the_machine_it_was_recorded_on(self):
+        b = self.baseline()
+        env = big_env(expected=[{"suite": "18-big", "config": "c", "engines": ["v1_2_2", "candidate"]}])
+        self.assertEqual(compare.validity_problems(env, b, self.results("18-big/c/y_rps"), False, False), [])
+        # A suite recorded on the D4s_v5 run on the D8s_v5 is not comparable.
+        probs = compare.validity_problems(env, b, self.results("01-small/c/x_rps"), False, False)
+        self.assertTrue(any("Standard_D4s_v5 that 01-small was recorded on" in p for p in probs), probs)
+
+    def test_run_below_min_cpus_via_only_is_invalid_and_refused_by_the_gate(self):
+        b, res = self.baseline(), self.results("18-big/c/y_rps")
+        env = small_env(only="18", suite_seconds={"18-big": 10}, needs_more_cpus={},
+                        ran_below_min_cpus={"18-big": 8})
+        probs = compare.validity_problems(env, b, res, False, False)
+        self.assertTrue(any("18-big needs 8 CPUs and ran on 4: not valid for the gate" in p for p in probs), probs)
+        why, covers = regression_gate.judge(env, OK_SUMMARY, SUITES)
+        self.assertTrue(any("fewer CPUs than they declare" in w for w in why), why)
+        self.assertEqual(covers, set())
+
+    def test_the_release_gate_needs_both_runs(self):
+        small = regression_gate.judge(small_env(), dict(OK_SUMMARY, not_run=["18-big/c/y_rps"]), SUITES)
+        self.assertEqual(small, ([], {"01-small"}))
+        # Only the small run: refused, naming the suite.
+        used, uncovered = regression_gate.coverage(SUITES, {"d4": small})
+        self.assertEqual(uncovered, ["18-big"])
+        # With the D8s_v5 --min-cpus-only run: every suite is covered.
+        big = regression_gate.judge(big_env(), dict(OK_SUMMARY, not_run=["01-small/c/x_rps"]), SUITES)
+        self.assertEqual(big, ([], {"18-big"}))
+        used, uncovered = regression_gate.coverage(SUITES, {"d4": small, "d8": big})
+        self.assertEqual((used, uncovered), (["d4", "d8"], []))
+        self.assertEqual(regression_gate.needs([small_env()]), {"18-big": 8})
+
+    def test_a_min_cpus_run_on_a_machine_too_small_covers_nothing(self):
+        why, covers = regression_gate.judge(big_env(nproc=4), OK_SUMMARY, SUITES)
+        self.assertEqual((why, covers), ([], set()))
+
+    def test_the_gate_refuses_other_partial_runs(self):
+        # A metric not run for another reason than needs_more_cpus.
+        why, _ = regression_gate.judge(small_env(needs_more_cpus={}), dict(OK_SUMMARY, not_run=["18-big/c/y_rps"]),
+                                       SUITES)
+        self.assertTrue(any("not run" in w for w in why), why)
+        why, _ = regression_gate.judge(small_env(skipped_configs=["01-small/lua"]), OK_SUMMARY, SUITES)
+        self.assertTrue(any("--candidate-full" in w for w in why), why)
+        why, _ = regression_gate.judge(small_env(only="01"), OK_SUMMARY, SUITES)
+        self.assertTrue(any("partial run" in w for w in why), why)
+        why, _ = regression_gate.judge(big_env(full="0"), OK_SUMMARY, SUITES)
+        self.assertTrue(any("FULL=0" in w for w in why), why)
+        why, _ = regression_gate.judge(small_env(), dict(OK_SUMMARY, verdict="INVALID"), SUITES)
+        self.assertTrue(why)
+
+    def test_the_gate_uses_the_code_check(self):
+        why, covers = regression_gate.judge(small_env(), OK_SUMMARY, SUITES, lambda env: ["code changed"])
+        self.assertEqual((why, covers), (["code changed"], set()))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -401,10 +401,22 @@ def validity_problems(env, baseline, results, smoke, allow_vm_change):
     if not results:
         probs.append("no results: nothing ran")
     metrics = baseline.get("metrics", {})
-    # The machine size the values were recorded on.
-    vms = {m.get("recorded", {}).get("vm") for m in metrics.values()} - {None}
-    if vms and not smoke and env.get("vm") not in vms and not allow_vm_change:
-        probs.append("VM size %r differs from the recorded %s" % (env.get("vm"), ", ".join(sorted(vms))))
+    # The machine size the values were recorded on, per metric that ran: a
+    # suite with min_cpus is recorded on a bigger machine than the others.
+    if not smoke and not allow_vm_change:
+        wrong = {}
+        for k in results:
+            vm = metrics.get(k, {}).get("recorded", {}).get("vm")
+            if vm and vm != env.get("vm"):
+                wrong.setdefault(vm, set()).add(k.split("/", 1)[0])
+        for vm, suites in sorted(wrong.items()):
+            probs.append("VM size %r differs from the %s that %s %s recorded on" % (
+                env.get("vm"), vm, ", ".join(sorted(suites)), "was" if len(suites) == 1 else "were"))
+    # A suite that needs more CPUs than this machine has, run because --only
+    # named it: its numbers are the load generator's, not the server's.
+    for s, n in sorted((env.get("ran_below_min_cpus") or {}).items()):
+        probs.append("%s needs %s CPUs and ran on %s: not valid for the gate (run it with --min-cpus-only "
+                     "on a machine that big)" % (s, n, env.get("nproc", "?")))
     # The reference binaries the values were recorded with.
     pins = baseline.get("pins", {})
     engines = env.get("engines", {})
@@ -488,6 +500,12 @@ def write_summary(outdir, rows, not_run, env, label, problems, smoke, hf=None, b
                                                        ", rustc %s" % d["rustc"] if d.get("rustc") else ""))
         if env.get("skipped_configs"):
             L.append("- skipped (need --candidate-full): %s" % ", ".join(env["skipped_configs"]))
+        if env.get("needs_more_cpus"):
+            L.append("- not run, need more CPUs than this machine's %s (run them with --min-cpus-only on one "
+                     "that big): %s" % (env.get("nproc", "?"), ", ".join(
+                         "%s (%s)" % kv for kv in sorted(env["needs_more_cpus"].items()))))
+        if env.get("min_cpus_only"):
+            L.append("- --min-cpus-only: just the suites that declare min_cpus")
         if env.get("candidate_commit"):
             L.append("- candidate commit: `%s`" % env["candidate_commit"])
         if env.get("date"):
@@ -563,6 +581,8 @@ def record(baseline, results, env, label, reset_gates):
             rec["rustc"] = rustc
         if rustc_full:
             rec["rustc_full"] = rustc_full
+        if env.get("nproc"):
+            rec["nproc"] = env["nproc"]
         ms[key] = {
             "suite": m["suite"], "config": m["config"], "metric": m["metric"],
             "unit": m["unit"], "better": m["better"], "recorded": rec,

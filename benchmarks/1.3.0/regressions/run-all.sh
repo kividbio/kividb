@@ -3,8 +3,14 @@
 #
 #   run-all.sh --candidate <path-to-kividb | tag> [--label NAME] [--only 01,04]
 #              [--engines v1_2_2,candidate,redis] [--record] [--candidate-commit SHA]
-#              [--candidate-full <path-to-kividb built with lua,tls | tag>]
+#              [--candidate-full <path-to-kividb built with lua,tls | tag>] [--min-cpus-only]
 #   FULL=1 run-all.sh ...      also the long configurations (17.5M keys with EX)
+#
+# A suite that declares Suite(..., min_cpus=N) is not run on a machine with
+# fewer CPUs (env.json `needs_more_cpus`) unless --only names it, which makes
+# the run INVALID. --min-cpus-only runs just those suites (on a machine big
+# enough for all of them: exit 2 otherwise); the release gate needs such a run
+# next to the full one.
 #
 # Configurations that need scripts (Config(lua=True)) run v1.2.2's `full`
 # build and the --candidate-full binary; without it they are skipped.
@@ -27,7 +33,7 @@ export REGRESS_LIB=$here/lib
 # shellcheck source=lib/engines.sh
 source "$here/lib/engines.sh"
 
-CANDIDATE= CANDIDATE_FULL= LABEL= ONLY= ENGINES=v1_2_2,candidate,redis RECORD= CAND_COMMIT=
+CANDIDATE= CANDIDATE_FULL= LABEL= ONLY= ENGINES=v1_2_2,candidate,redis RECORD= CAND_COMMIT= MIN_ONLY=0
 REFERENCE_TAG=${REFERENCE_TAG:-v1.2.2}
 SUITE_TIMEOUT=${SUITE_TIMEOUT:-1800}
 while [ $# -gt 0 ]; do
@@ -39,7 +45,8 @@ while [ $# -gt 0 ]; do
     --engines) ENGINES=$2; shift 2 ;;
     --record) RECORD=--record; shift ;;
     --candidate-commit) CAND_COMMIT=$2; shift 2 ;;
-    -h | --help) sed -n '2,23p' "$0"; exit 0 ;;
+    --min-cpus-only) MIN_ONLY=1; shift ;;
+    -h | --help) sed -n '2,29p' "$0"; exit 0 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -142,19 +149,46 @@ vm_size() {
     curl -fs -m 2 http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo "${VM_SIZE:-unknown}"
 }
 
-declare -A SECS
+declare -A SECS NEEDS_MORE BELOW_MIN SUITE_MIN
 SKIPPED=()
+NPROC=$(nproc)
+named_in_only() { # suite -> 0 if an --only entry names it
+  local w
+  for w in ${ONLY//,/ }; do suite_matches "$1" "$w" && return 0; done
+  return 1
+}
 ran=0
 for f in "${SUITES[@]}"; do
   suite=${f%.py}
   want_suite "$suite" || continue
-  echo "=== $suite"
-  s0=$(date +%s)
   # A suite that fails to import or to list its configurations fails the run.
   if ! cfgs=$("$PYTHON" "$here/suites/$f" --configs </dev/null) || [ -z "$cfgs" ]; then
+    echo "=== $suite"
     fail "$suite: --configs failed or listed nothing"
     continue
   fi
+  # The CPUs the suite needs (Suite(..., min_cpus=N)): below that the load
+  # generator, not the server, is what it measures.
+  min=$("$PYTHON" -c 'import json,sys;print(int(json.loads(sys.argv[1].splitlines()[0]).get("min_cpus", 0) or 0))' "$cfgs")
+  [ "$min" -gt 0 ] && SUITE_MIN[$suite]=$min
+  if [ "$MIN_ONLY" = 1 ] && [ "$min" -eq 0 ]; then
+    continue
+  fi
+  if [ "$min" -gt "$NPROC" ]; then
+    if [ "$MIN_ONLY" = 1 ]; then
+      echo "--min-cpus-only: $suite needs $min CPUs and this machine has $NPROC" >&2
+      exit 2
+    fi
+    if ! named_in_only "$suite"; then
+      echo "=== $suite: not run (needs $min CPUs, this machine has $NPROC; run it with --min-cpus-only on one that big)"
+      NEEDS_MORE[$suite]=$min
+      continue
+    fi
+    echo "!!! $suite needs $min CPUs and this machine has $NPROC: run because --only names it; the run is not valid for the gate" >&2
+    BELOW_MIN[$suite]=$min
+  fi
+  echo "=== $suite"
+  s0=$(date +%s)
   while IFS= read -r cfg; do
     name=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["name"])' "$cfg")
     io=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["io"])' "$cfg")
@@ -199,12 +233,25 @@ for f in "${SUITES[@]}"; do
   SECS[$suite]=$(($(date +%s) - s0))
   echo "=== $suite took ${SECS[$suite]} s"
 done
+if [ "$MIN_ONLY" = 1 ] && [ ${#SUITE_MIN[@]} -eq 0 ]; then
+  echo "--min-cpus-only: no suite declares min_cpus; nothing to run (and nothing the release gate needs)"
+  rmdir "$OUT" 2>/dev/null || true
+  exit 0
+fi
 [ $ran -gt 0 ] || fail "nothing ran (--only $ONLY, --engines $ENGINES)"
 if [ -f "$WORK/results.jsonl" ]; then cp "$WORK/results.jsonl" "$OUT/results.jsonl"; fi
 
 # Where and what: env.json.
 {
   secs=$(for k in "${!SECS[@]}"; do printf '"%s": %s,' "$k" "${SECS[$k]}"; done)
+  jmap() { # name of an associative array -> {"k": v, ...}
+    local -n m=$1
+    local k s=
+    for k in "${!m[@]}"; do s+="\"$k\": ${m[$k]},"; done
+    echo "{${s%,}}"
+  }
+  export REGRESS_NEEDS_MORE_CPUS=$(jmap NEEDS_MORE) REGRESS_BELOW_MIN_CPUS=$(jmap BELOW_MIN) \
+    REGRESS_SUITE_MIN_CPUS=$(jmap SUITE_MIN) REGRESS_MIN_CPUS_ONLY=$MIN_ONLY
   "$PYTHON" - "$OUT/env.json" "$LABEL" "$CAND_COMMIT" "{${secs%,}}" "$(vm_size)" \
     "${BIN[v1_2_2]}" "${BIN[candidate]}" "${BIN[redis]}" "$FAILURES" "$EXPECTED" "$ENGINES" \
     "${SCALE:-1}" "${FULL:-0}" "$ONLY" "$CAND_ALLOC" "${FULLBIN[v1_2_2]}" "${FULLBIN[candidate]:-}" \
@@ -267,6 +314,13 @@ env = {
                              ("v1_2_2_full", b122full), ("candidate_full", bcandfull)) if p},
     "skipped_configs": skipped.split(),
     "rustc_override": os.environ.get("REGRESS_ALLOW_RUSTC", "") not in ("", "0"),
+    # Suites that declare min_cpus: not run on this smaller machine
+    # (needs_more_cpus), run below it because --only named them (not valid
+    # for the gate), and what every declaring suite needs.
+    "needs_more_cpus": json.loads(os.environ.get("REGRESS_NEEDS_MORE_CPUS") or "{}"),
+    "ran_below_min_cpus": json.loads(os.environ.get("REGRESS_BELOW_MIN_CPUS") or "{}"),
+    "suite_min_cpus": json.loads(os.environ.get("REGRESS_SUITE_MIN_CPUS") or "{}"),
+    "min_cpus_only": os.environ.get("REGRESS_MIN_CPUS_ONLY") == "1",
 }
 env["run_failed"] = bool(env["failures"])
 json.dump(env, open(out, "w"), indent=1)

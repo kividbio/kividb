@@ -6,7 +6,9 @@
 # Expects in $HOME: cand.tar (the candidate's source tree) and harness.tar (the
 # suite's directory, e.g. benchmarks/1.3.0/regressions/, with its path).
 # Settings (environment): SUITE_DIR (path of the suite in harness.tar), LABEL,
-# CAND_COMMIT, ONLY (comma list, optional), FULL (1 for the long configurations).
+# CAND_COMMIT, ONLY (comma list, optional), FULL (1 for the long configurations),
+# MIN_CPUS_ONLY (1: only the suites that declare min_cpus, `run-all.sh
+# --min-cpus-only`, on the workflow's second machine, a Standard_D8s_v5).
 # Writes the suite's exit status to $HOME/run.exit; the results are in
 # $HOME/harness/$SUITE_DIR/results/$LABEL.
 set -uo pipefail
@@ -66,6 +68,7 @@ echo "redis-server: $REDIS_BIN sha256 $REGRESS_REDIS_SHA256"
 echo "=== suite"
 args=(--candidate "$CAND_BIN" --candidate-full "$CAND_FULL_BIN" --candidate-commit "$CAND_COMMIT" --label "$LABEL")
 [ -n "${ONLY:-}" ] && args+=(--only "$ONLY")
+[ "${MIN_CPUS_ONLY:-0}" = 1 ] && args+=(--min-cpus-only)
 export FULL=${FULL:-0}
 "$HERE/run-all.sh" "${args[@]}"
 rc=$?

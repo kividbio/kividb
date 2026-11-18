@@ -354,19 +354,35 @@ re-record that hides a regression defeats the suite.
    `run-all.sh --candidate v1.3.0-rcN --candidate-full v1.3.0-rcN --label v1.3.0-rcN-d4s_v5`
    (`--candidate-full` takes the RC's `full` tarball, or a `lua,tls` build of
    the same commit; without it suite 25's `scripts` is skipped and the release
-   gate refuses the run). The Actions workflow (below) builds both.
-2. Every gate must pass. A failure is either a regression to fix before the
-   release, or an intended change that is explained in the release PR, after
-   which the baseline is re-recorded.
-3. Commit `results/<label>/` with the release PR, so the release's numbers
-   stay next to the harness that produced them. The release workflow
-   refuses a stable tag without it (`scripts/release/check-regression-results.sh`:
-   a full run with verdict `ok` whose candidate commit is an ancestor of the tag,
-   with `src/`, `Cargo.toml` and `Cargo.lock` unchanged since).
-   The Actions workflow "Regression suite" (`.github/workflows/regression-suite.yml`)
-   makes the VM, builds the candidate, runs the suite and uploads
-   `results/<label>/` as an artifact; docs/RELEASING.md has the steps.
-4. For a new improvement in the release, its suite and its first recorded
+   gate refuses the run). The Actions workflow (below) builds both. Suites
+   that declare `min_cpus` above the machine's 4 CPUs are not run there
+   (`needs_more_cpus` in `env.json`, their metrics "not run").
+2. For those suites, the same candidate with `FULL=1` on a machine with at
+   least that many CPUs (`Standard_D8s_v5` for `min_cpus=8`):
+   `run-all.sh --candidate v1.3.0-rcN --candidate-full v1.3.0-rcN --min-cpus-only --label v1.3.0-rcN-d8s_v5`.
+   Their baseline values were recorded on that machine (`recorded.vm`), and
+   each metric is judged on the machine size it was recorded on. Host-speed
+   scaling (below) works per run: each run's factors come from the v1.2.2
+   values of the suites it ran, against their own recorded ones, so the two
+   machine sizes never mix. With no suite declaring `min_cpus`, this step
+   runs nothing and is not needed.
+3. Every gate must pass in both. A failure is either a regression to fix
+   before the release, or an intended change that is explained in the
+   release PR, after which the baseline is re-recorded.
+4. Commit both `results/<label>/` with the release PR, so the release's
+   numbers stay next to the harness that produced them. The release workflow
+   refuses a stable tag unless the committed runs together cover every suite
+   (`scripts/release/check-regression-results.sh vX.Y.Z --ref HEAD`, or with
+   `--runs v1.3.0-rcN-d4s_v5,v1.3.0-rcN-d8s_v5` to judge just those: runs
+   with verdict `ok` whose candidate commit is an ancestor of the tag, with
+   `src/`, `Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml` unchanged
+   since, and every `min_cpus` suite run on a machine that big; it names
+   every suite no run covers). The Actions workflow "Regression suite"
+   (`.github/workflows/regression-suite.yml`) makes both machines (the
+   second with `big`, its default), builds the candidate on each, runs the
+   suite and uploads each `results/<label>/` as an artifact;
+   docs/RELEASING.md has the steps.
+5. For a new improvement in the release, its suite and its first recorded
    values land with the fix's PR (or right after it), not at release time.
 
 ## Adding a suite
@@ -404,6 +420,16 @@ if __name__ == "__main__":
 - Make the data deterministic, warm up, take the median of 3 where a run is
   cheap, and keep each server run under `SUITE_TIMEOUT`.
 - Wrap dataset sizes in `scaled()` so `SCALE=0.01` can smoke-test the suite.
+- A suite whose load generator, not the server, is the limit on the
+  `Standard_D4s_v5` declares the CPUs it needs, in one line:
+  `S = Suite("18-example", [...], min_cpus=8)`. `run-all.sh` then does not
+  run it on a smaller machine (`needs_more_cpus` in `env.json`: not run, not
+  `INVALID`); `--only 18` runs it anyway and makes the run `INVALID` ("not
+  valid for the gate"); `--min-cpus-only` on a big enough machine runs only
+  such suites. Record its baseline on that machine
+  (`run-all.sh --min-cpus-only --record` on a `Standard_D8s_v5`): its
+  metrics then carry that `recorded.vm`, and the release gate needs its run
+  from such a machine (see "How a release uses it").
 - A configuration that needs Lua says `Config(..., lua=True)`: `run-all.sh`
   then starts v1.2.2's `full` build (fetched to
   `$REGRESS_CACHE/releases/v1.2.2/full/kividb`, SHA-256 checked) and the

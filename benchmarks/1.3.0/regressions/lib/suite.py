@@ -14,6 +14,9 @@ given. See README.md, "Adding a suite".
         Config("big", full_only=True),          # only with FULL=1
         Config("scripts", lua=True),            # lua,tls builds (--candidate-full)
     ])
+    # A suite whose load generator is the limit on 4 vCPUs says so, and is
+    # then run (and recorded) only on a machine with that many CPUs:
+    #   S = Suite("18-example", [...], min_cpus=8)
 
     @S.run
     def run(ctx):
@@ -181,8 +184,15 @@ class Ctx:
 
 
 class Suite:
-    def __init__(self, name, configs):
+    """min_cpus: the CPUs (nproc) the suite needs to measure the server and
+    not its load generator. run-all.sh does not run it on a smaller machine
+    (env.json `needs_more_cpus`) unless --only names it, and then the run is
+    INVALID; the release gate needs a run of it on a machine that big
+    (`run-all.sh --min-cpus-only` on a Standard_D8s_v5 for min_cpus=8)."""
+
+    def __init__(self, name, configs, min_cpus=0):
         self.name, self.configs, self.fn = name, configs, None
+        self.min_cpus = int(min_cpus or 0)
 
     def run(self, fn):
         self.fn = fn
@@ -205,7 +215,7 @@ class Suite:
         a = ap.parse_args(argv)
         if a.configs:
             for c in self.active_configs():
-                print(json.dumps(c.as_dict()))
+                print(json.dumps(dict(c.as_dict(), min_cpus=self.min_cpus)))
             return 0
         cfg = next((c for c in self.configs if c.name == a.config), None)
         if cfg is None:

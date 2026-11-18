@@ -30,7 +30,11 @@ seconds and nothing is built or published.
    scripts need, as `--candidate-full`), runs `run-all.sh`, uploads `results/<label>/` as an
    artifact and deletes the machine whatever happens. It fails when
    `run-all.sh` exits non-zero. It takes two release builds on 4 vCPUs (fat LTO, several minutes each) plus 13 to
-   21 minutes of measuring.
+   21 minutes of measuring. With `big` (leave it ticked, the default) it also
+   makes a `Standard_D8s_v5`, the same way, for the suites that declare
+   `min_cpus=8` (`run-all.sh --min-cpus-only`, results `<label>` ending in
+   `-d8s_v5`): on the D4s_v5 those are not run, and the gate needs their run
+   from a machine that big.
 3. Read `summary.md`. The verdict must be `ok`:
    - `REGRESSED`: a gate failed. Either fix the regression (and cut a new
      candidate), or, for an intended change, explain it in the release PR and
@@ -41,9 +45,10 @@ seconds and nothing is built or published.
      cause and run again; never commit an `INVALID` run as the release's
      result.
    - `SMOKE`: `SCALE` was not 1; only a harness check.
-4. Download the artifact and commit `results/<label>/` (`env.json`,
-   `summary.json`, `summary.md`, `raw.tar.gz`) on the release branch, with the
-   version bump. Tag that commit. The gate needs the run's `candidate_commit`
+4. Download the artifacts and commit each `results/<label>/` (`env.json`,
+   `summary.json`, `summary.md`, `raw.tar.gz`; the D4s_v5 run and the D8s_v5
+   one) on the release branch, with the version bump. Tag that commit. The
+   gate needs the runs together to cover every suite, and each run's `candidate_commit`
    to be an ancestor of the tag with `src/`, `Cargo.toml`, `Cargo.lock` and
    `rust-toolchain.toml` unchanged since, apart from the package version line.
    Any code change after the run means running it again.
