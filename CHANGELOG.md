@@ -642,8 +642,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   missing, its scheduled and retry tasks were never moved back to pending, and
   38 of its `internal/rdb` tests failed. They are there in `EVAL`, `EVALSHA`,
   `EVAL_RO` and function libraries, and do what Lua 5.1's do (`table.setn`
-  raises `'setn' is obsolete`, as in Redis); they are made once when the
-  script VM is, so a script that does not use them is no slower. A number
+  raises `'setn' is obsolete`, as in Redis); they are made when a script
+  first names one, so a VM and a script that do not use them cost nothing. A number
   one returns that has an integer value is an integer, so `'n=' ..
   table.maxn(t)` is `n=3`. See [SCRIPTS.md](docs/SCRIPTS.md).
 - **`CLUSTER SLOTS`, `SHARDS` and `NODES` refuse on a standalone, as in

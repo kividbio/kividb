@@ -62,7 +62,9 @@ where numbers leave a script behave as Redis's do:
   the function (called through `pcall`, Redis names it `'?'`),
   `string.gfind` treats empty matches as Lua 5.4's `string.gmatch` does
   (`'%a*'` over `'abc'` matches once here, twice on Redis), and `gcinfo()`
-  counts the memory of the Lua 5.4 VM.
+  counts the memory of the Lua 5.4 VM. They are made the first time a script
+  names one (`type(table.getn)` is `function` at once), so `pairs(table)`,
+  `pairs(math)` and `pairs(string)` do not list them before that.
 
 What is still Lua 5.4, with the way to write it so that it works on both:
 
