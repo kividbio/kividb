@@ -346,6 +346,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `MULTI`/`EXEC` of two `SET`s about 90 fewer (160 with Lua). Nothing a
   command does or answers has changed.
 
+- **With Lua built in, a command whose keys have no hash tag costs less
+  (#889).** With `lua-parallel-scripts` on (the default in a build with
+  Lua), every command from a client looks for the hash tags of its keys,
+  to take their locks; most keys have none. The look now checks the keys
+  for a `{` in place, eight bytes at a time, without building the general
+  list of where a command's keys are (and, for a command of one argument,
+  without asking which command it is). Measured in instructions per
+  command, pipelined, `execute_command` and all it calls: `GET` about 150
+  fewer (8%), `SET` about 86 fewer (3%), a 10-key `MGET` about 310 fewer
+  (3%). A `GET` or `SET` of a key with a tag costs about 20 and 30 more
+  (1%): it looks for the `{` before the tag is read. Scripts,
+  transactions and the build without Lua are unchanged. Which locks a
+  command takes is the same as before. `scripts/perf/measure.sh` has
+  these workloads as `WORKLOADS=tags`.
+
 - **Small hashes take less than half the memory.** A hash of up to 512
   fields, no field or value longer than 64 bytes, is kept in one block, each
   field next to its value, where it was a table with two allocations for
