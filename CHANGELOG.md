@@ -344,7 +344,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `FCALL` go straight to the script handler; a command a script calls is
   classified as a write once instead of five times, and its replication feed
   is built only when an AOF, a replica, the backlog or a tap reads it;
-  `KEYS` and `ARGV` of up to 4 KB stay until the next script replaces them;
+  `KEYS` and `ARGV` of at most 4 KB and at most 64 arguments in all stay
+  until the next script's are built;
   one argument list per call; ahash for the script cache; and the
   connection's environment is shared, not copied, when a script goes to the
   script-runner thread. Replies, errors and what is replicated are unchanged

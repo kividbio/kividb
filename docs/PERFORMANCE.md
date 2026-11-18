@@ -295,8 +295,8 @@ such as `redis` is found by a table lookup rather than a Lua call; `EVAL`, `EVAL
 `FCALL` go straight to the script handler instead of past every command module; each
 command a script calls is classified as a write once instead of five times, and its
 replication feed is built only when an AOF, a replica, the backlog or a tap reads it;
-`KEYS` and `ARGV` of up to 4 KB are left for the next script to replace instead of being
-swapped out after every call; one argument list for each `EVAL` and each `redis.call`; the
+`KEYS` and `ARGV` of at most 4 KB and at most 64 arguments in all are left for the next
+script to replace instead of being swapped out after every call; one argument list for each `EVAL` and each `redis.call`; the
 digest lookups use ahash; and a script handed to the script-runner thread takes its
 connection's environment by reference count instead of copying it. Replies, errors,
 replication and the AOF are as before.
