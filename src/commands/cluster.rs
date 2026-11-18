@@ -34,14 +34,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
     let state: &Arc<ClusterState> = ctx.cluster;
 
-    // Subcommands that work even when cluster is disabled.
+    // Subcommands that work even when cluster is disabled: INFO reports
+    // `cluster_enabled:0` on a standalone, and KEYSLOT is a pure hash of a
+    // key — nothing about either says "cluster". The replies a client
+    // would read as one — a slot table, a node table — refuse instead
+    // (#899): an empty `CLUSTER SLOTS` answer makes the client take a
+    // standalone for a cluster.
     match sub {
-        // Read-only — work in both standalone and cluster modes
         "INFO" => return cmd_info(state),
         "KEYSLOT" => return cmd_keyslot(&ctx.cmd),
-        "NODES" => return cmd_nodes(state),
-        "SLOTS" => return cmd_slots(state),
-        "SHARDS" => return cmd_shards(state),
 
         // Mutating — require cluster mode (each handler checks via state.enabled)
         "ADDSLOTS" => return cmd_addslots(ctx),
@@ -72,7 +73,11 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
 
     match sub {
         // As in Redis, these refuse on a node with cluster support disabled
-        // (#563): there is no node id, and a slot means nothing.
+        // (#563): there is no node id, and a slot means nothing — and the
+        // slot and node tables most of all (#899).
+        "NODES" => cmd_nodes(state),
+        "SLOTS" => cmd_slots(state),
+        "SHARDS" => cmd_shards(state),
         "MYID" => cmd_myid(state),
         "COUNTKEYSINSLOT" => cmd_countkeysinslot(ctx),
         "GETKEYSINSLOT" => cmd_getkeysinslot(ctx),

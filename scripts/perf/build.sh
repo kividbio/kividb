@@ -15,6 +15,13 @@ else
   (cd /src && git archive "$REV") | tar -xf - -C "/w-$TAG"
 fi
 cd "/w-$TAG"
+# NOOP=1: the tree with a no-op line added to `run_command`, at the marker
+# in src/commands/handler.rs (see stability.sh). It costs a compare and a
+# branch on the command path and changes nothing else.
+if [ -n "${NOOP:-}" ]; then
+  grep -q "perf/stability.sh: no-op line" src/commands/handler.rs || { echo "no no-op marker in handler.rs" >&2; exit 1; }
+  sed -i 's|^\( *\)// perf/stability.sh: no-op line.*|&\n\1if ctx.cmd.len() == 123_456_789 {\n\1    std::hint::black_box(name);\n\1}|' src/commands/handler.rs
+fi
 export CARGO_PROFILE_RELEASE_LTO=${LTO:-off}
 [ "${LTO:-off}" = off ] && export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 export CARGO_PROFILE_RELEASE_DEBUG=1

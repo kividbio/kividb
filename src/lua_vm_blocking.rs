@@ -70,6 +70,12 @@ pub(crate) struct ClientExecEnv {
     pub tracking_table: crate::tracking::TrackingTable,
     pub peer_addr: String,
     pub client_id: u64,
+    /// The connection's `CLIENT NO-TOUCH` flag when this env was made: a
+    /// script's own commands take it as their client's flag (`Ctx::resp`'s `RESP_NO_TOUCH`).
+    /// A copy, not a borrow: the env outlives the loop local, the flag
+    /// cannot be set from inside a script anyway, and the loop remakes the
+    /// env when the flag changes (#566).
+    pub no_touch: bool,
     pub authenticated_user: String,
 }
 
@@ -121,8 +127,12 @@ impl ClientExecEnv {
             client_registry: &self.client_registry,
             // What the commands a script calls see: Redis runs scripts on
             // RESP2 until `redis.setresp`. The script's reply is written in
-            // `client_resp`.
-            resp: 2,
+            // `client_resp`. The connection's `CLIENT NO-TOUCH` rides along.
+            resp: if self.no_touch {
+                2 | crate::commands::ctx::RESP_NO_TOUCH
+            } else {
+                2
+            },
             acl_store: &self.acl_store,
             acl_log: &self.acl_log,
             slowlog: &self.slowlog,
@@ -171,6 +181,7 @@ impl ClientExecEnv {
         tracking_table: &crate::tracking::TrackingTable,
         peer_addr: &str,
         client_id: u64,
+        no_touch: bool,
         authenticated_user: &str,
     ) -> Self {
         Self {
@@ -198,6 +209,7 @@ impl ClientExecEnv {
             tracking_table: tracking_table.clone(),
             peer_addr: peer_addr.to_string(),
             client_id,
+            no_touch,
             authenticated_user: authenticated_user.to_string(),
         }
     }

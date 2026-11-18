@@ -789,8 +789,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // In the order of the members' positions: see
                     // `helpers::scan_position`.
                     let (page, next_cursor) = crate::commands::helpers::scan_page(
-                        inner
-                            .iter()
+                        crate::commands::helpers::prefetched(inner.iter(), |m| m.as_ptr())
                             .map(|m| (crate::commands::helpers::scan_position(&m), m)),
                         cursor,
                         count,

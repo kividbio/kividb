@@ -160,7 +160,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     None => return Some(resp_error("ERR value is not an integer or out of range")),
                 };
             }
-            Some(format_acl_log(ctx.acl_log.get(count as usize), ctx.resp))
+            Some(format_acl_log(
+                ctx.acl_log.get(count as usize),
+                ctx.resp & crate::commands::ctx::RESP_VERSION,
+            ))
         }
 
         // ── ACL SETUSER ───────────────────────────────────────────────────────

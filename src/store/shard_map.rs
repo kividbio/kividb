@@ -40,7 +40,6 @@
 //! and every entry somebody else holds (a snapshot being written), gets a
 //! new entry, as before.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -133,7 +132,7 @@ impl AsRef<[u8]> for StrRef<'_> {
 #[derive(Clone, Copy)]
 pub enum ValueRef<'a> {
     String(StrRef<'a>),
-    List(&'a Arc<RwLock<VecDeque<Arc<[u8]>>>>),
+    List(&'a Arc<RwLock<crate::list_values::ListValues>>),
     Hash(&'a Arc<RwLock<HashFields>>),
     Json(&'a Arc<RwLock<serde_json::Value>>),
     Set(&'a Arc<RwLock<crate::member_set::MemberSet>>),
@@ -304,6 +303,12 @@ fn used(entry: Entry, hash: u64, map: u64) {
 /// key's hash a slot keeps. A key keeps its position for as long as it is
 /// in the table, whatever the table does to make room or give it back.
 pub const SCAN_POSITIONS: u64 = 4096;
+
+/// How many entries a `SCAN` of a shard asks for before it visits them
+/// ([`ShardMap::scan`]): enough for the first to have arrived when the
+/// last is asked for, few enough that what is asked for is not pushed out
+/// again before it is read.
+const SCAN_BATCH: usize = 16;
 
 /// One shard's keys and values: a table of [`Slot`]s, each the address of
 /// an entry holding a key and its value (`entry`).
@@ -1389,48 +1394,124 @@ impl ShardMap {
     /// One page of a `SCAN` of this shard: each entry at a position from
     /// `from` on (see [`SCAN_POSITIONS`]), up to the position that brings
     /// the page to `want` entries, given to `visit`. A position is never
-    /// split between two pages. Returns the position to go on from: zero
-    /// when no entry is at a position past the page.
+    /// split between two pages, so a page holds `want` entries and those
+    /// that share the last one's position (or all that are left, if fewer).
+    /// Returns the position to go on from: zero when no entry is at a
+    /// position past the page.
     ///
     /// A key's position is the fragment of its hash its slot keeps, so the
-    /// pages are found from the slots alone: two passes over the table
-    /// that touch only the entries of the page. It used to hash every key
-    /// of the shard, visiting each entry, for every page (#751).
+    /// pages are found from the slots alone, touching only the entries of
+    /// the page. It used to hash every key of the shard, visiting each
+    /// entry, for every page (#751).
     ///
-    /// While the table grows, both tables are counted and walked: a key
-    /// still in the one it grows from is at its position as much as one
-    /// already moved, and a move between pages keeps the slot, fragment
-    /// and all, so a key moved mid-scan keeps its position too.
+    /// While the table grows, both tables are walked: a key still in the
+    /// one it grows from is at its position as much as one already moved,
+    /// and a move between pages keeps the slot, fragment and all, so a key
+    /// moved mid-scan keeps its position too.
+    ///
+    /// One pass over the slots (#884), where there were two: a count of
+    /// each of the 4,096 positions, cleared and summed for every page, and
+    /// then the walk. A page that may take every entry left (`want` at
+    /// least the shard's length) is visited as the walk finds it. A
+    /// smaller page is gathered first (`ScanPage`).
     pub fn scan(&self, from: u64, want: usize, mut visit: impl FnMut(EntryView<'_>)) -> u64 {
         const POSITIONS: usize = SCAN_POSITIONS as usize;
         let Ok(from) = usize::try_from(from) else {
             return 0;
         };
-        if from >= POSITIONS || self.is_empty() {
+        let len = self.len();
+        if from >= POSITIONS || len == 0 {
             return 0;
         }
-        let mut at = [0u32; POSITIONS];
-        for slot in self.slots() {
-            at[slot.scan_position() & (POSITIONS - 1)] += 1;
+        if want >= len {
+            self.visit_positions(from, &mut visit);
+            return 0;
         }
-        let mut taken = 0usize;
-        let mut end = from;
-        while end < POSITIONS && taken < want.max(1) {
-            taken += at[end] as usize;
-            end += 1;
+        let want = want.max(1);
+        // Keys spread evenly over the positions (fragments of their
+        // hashes): the span that holds `want` of them and a margin (a
+        // sixteenth, and four times the spread of a count of `want`), so
+        // that the guess falls short about never. Only a shard emptied
+        // unevenly (the keys before a cursor deleted, say) holds fewer
+        // there; then the rest of the shard is gathered too, a second pass.
+        let margin = want / 16 + 4 * want.isqrt() + 8;
+        let span = want
+            .saturating_add(margin)
+            .saturating_mul(POSITIONS)
+            .div_ceil(len);
+        let guess = from.saturating_add(span).min(POSITIONS);
+        let mut page = ScanPage::new(from, want, want + margin, guess);
+        page.gather(self, from);
+        if page.held < want && page.later && guess < POSITIONS {
+            page.widen(POSITIONS);
+            page.gather(self, guess);
         }
-        let next = (end..POSITIONS).find(|&p| at[p] != 0).unwrap_or(0);
-        if taken > 0 {
-            for slot in self.slots() {
-                if (from..end).contains(&slot.scan_position()) {
-                    visit(EntryView {
-                        entry: slot.entry(),
-                        _map: std::marker::PhantomData,
-                    });
+        page.cut();
+        // Each entry asked for a few before it is visited: asked for as the
+        // walk found them, most would be pushed out again by the time a
+        // page of thousands is visited, and asked for a batch at once, the
+        // asks wait for each other.
+        Self::visit_batch(page.slots(), true, &mut visit);
+        if page.later { page.end as u64 } else { 0 }
+    }
+
+    /// Every entry at a position from `from` on, given to `visit` as the
+    /// walk finds it: the page of a `want` as large as the shard.
+    ///
+    /// Each entry is somewhere else in memory, and the slot alone says
+    /// whether it is in the page: visited one after the other as the walk
+    /// found them, the misses on the entries' first lines were most of a
+    /// page's time, with the shard locked for reading throughout (#884).
+    /// So the walk asks for the lines an entry's header and key are in as
+    /// it finds the entry, and puts it in a batch, and the entries of a
+    /// full batch are visited together, by then on their way. The walk is
+    /// a plain loop over each table: `next` on the two tables chained cost
+    /// more a slot.
+    #[inline(always)]
+    fn visit_positions(&self, from: usize, visit: &mut impl FnMut(EntryView<'_>)) {
+        let mut batch = [Slot::NONE; SCAN_BATCH];
+        let mut held = 0usize;
+        for table in [&self.table, &self.old] {
+            for &slot in table.iter() {
+                if slot.scan_position() < from {
+                    continue;
+                }
+                slot.prefetch_key();
+                batch[held % SCAN_BATCH] = slot;
+                held += 1;
+                if held == SCAN_BATCH {
+                    Self::visit_batch(&batch, false, visit);
+                    held = 0;
                 }
             }
         }
-        next as u64
+        Self::visit_batch(&batch[..held], false, visit);
+    }
+
+    /// The entries of `batch`, to `visit`, with `ask` the lines of the
+    /// entry a few ahead asked for meanwhile: out of line, and the one place
+    /// `visit` is called from, so that it is inlined here.
+    #[inline(never)]
+    fn visit_batch(batch: &[Slot], ask: bool, visit: &mut impl FnMut(EntryView<'_>)) {
+        // Enough entries in flight to cover a miss to memory (about 100 ns)
+        // with the visits of the ones before: with 8, the page waited for
+        // memory at every entry (#884).
+        const AHEAD: usize = 12;
+        if ask {
+            batch
+                .iter()
+                .take(AHEAD)
+                .for_each(|slot| slot.prefetch_key());
+        }
+        for (i, slot) in batch.iter().enumerate() {
+            if ask && let Some(later) = batch.get(i + AHEAD) {
+                later.prefetch_key();
+            }
+            visit(EntryView {
+                entry: slot.entry(),
+                _map: std::marker::PhantomData,
+            });
+        }
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
@@ -1746,6 +1827,150 @@ fn fail_point(_: u8) {}
 /// while it grows (see [`ShardMap::make_room`]). Any number from two up
 /// empties the old table before the new one, twice its size, is full.
 const GROWTH_STEP: usize = 16;
+
+/// A smaller page of [`ShardMap::scan`], gathered in one pass: the slots
+/// at positions from `from` up to `end` (the end it may still have), then
+/// counted by position. When the slots gathered fill their room
+/// (`want` and a margin, at most twice `want`), `end` comes down to the
+/// position that brings the page to `want` and the slots past it are
+/// dropped, so a page is never more than `want` and the keys sharing the
+/// last one's position, whatever the keys left in the shard are, and never
+/// less while keys are left ahead: a page ends where `want` is reached, as
+/// one counted beforehand did. It takes 8 bytes for each slot it has room
+/// for and 4 for each position, while the page is made.
+struct ScanPage {
+    from: usize,
+    want: usize,
+    end: usize,
+    /// Slots gathered so far, the first `held`, all at positions
+    /// `from..end`; the rest is room.
+    slots: Vec<Slot>,
+    held: usize,
+    /// How many of the slots held are at each position from `from`,
+    /// counted when the page is cut.
+    at: Vec<u32>,
+    /// Whether a slot was at a position from `end` on.
+    later: bool,
+}
+
+impl ScanPage {
+    /// A page from `from` of `want` slots, about `expect` of them before
+    /// `end`.
+    fn new(from: usize, want: usize, expect: usize, end: usize) -> ScanPage {
+        // Room for a count that comes out above its mean; past twice
+        // `want`, `end` comes down.
+        let room = expect
+            .saturating_add(expect / 8 + 16)
+            .min(want.saturating_mul(2).max(64));
+        ScanPage {
+            from,
+            want,
+            end,
+            slots: vec![Slot::NONE; room + 1],
+            held: 0,
+            at: Vec::new(),
+            later: false,
+        }
+    }
+
+    /// The slots gathered.
+    fn slots(&self) -> &[Slot] {
+        &self.slots[..self.held]
+    }
+
+    /// Let the page reach `end` (past the guess it was gathered to).
+    fn widen(&mut self, end: usize) {
+        self.end = end;
+        self.later = false;
+    }
+
+    /// Gather the map's slots at positions from `lo` up to `end`.
+    ///
+    /// Without a branch on the position: whether a slot is in the page is
+    /// as likely as not, and the mispredicted branches were most of the
+    /// walk's time. Every slot is written to the next place, which only a
+    /// slot in the page takes (there is always one place to spare); the
+    /// slots are counted by position once gathered (`cut`). What the loop
+    /// changes is kept in locals: kept in the page, each slot's store had
+    /// to be read back by the next.
+    #[inline(always)]
+    fn gather(&mut self, map: &ShardMap, lo: usize) {
+        let mut end = self.end;
+        let mut held = self.held;
+        let mut later = self.later;
+        let mut slots: &mut [Slot] = &mut self.slots;
+        for table in [&map.table, &map.old] {
+            for &slot in table.iter() {
+                let position = slot.scan_position();
+                let inside = position.wrapping_sub(lo) < end.wrapping_sub(lo);
+                later |= position >= end;
+                slots[held] = slot;
+                held += usize::from(inside);
+                if held + 1 == slots.len() {
+                    self.held = held;
+                    self.end = end;
+                    self.make_room();
+                    later |= self.later;
+                    (held, end) = (self.held, self.end);
+                    slots = &mut self.slots;
+                }
+            }
+        }
+        self.held = held;
+        self.end = end;
+        self.later = later;
+    }
+
+    /// The position after the one that brings the page to `want`, and
+    /// how many slots are before it: `end` and all of them if fewer.
+    fn reach(&self) -> (usize, usize) {
+        let mut taken = 0usize;
+        for (i, &n) in self.at.iter().enumerate() {
+            taken += n as usize;
+            if taken >= self.want {
+                return (self.from + i + 1, taken);
+            }
+        }
+        (self.end, taken)
+    }
+
+    /// End the page where `want` is reached, and drop the slots past it;
+    /// `later` if there were any.
+    fn cut(&mut self) {
+        self.at.clear();
+        self.at.resize(self.end - self.from, 0);
+        for slot in &self.slots[..self.held] {
+            self.at[slot.scan_position() - self.from] += 1;
+        }
+        let (end, kept) = self.reach();
+        self.end = end;
+        if kept < self.held {
+            self.later = true;
+            let mut held = 0;
+            for i in 0..self.held {
+                let slot = self.slots[i];
+                if slot.scan_position() < end {
+                    self.slots[held] = slot;
+                    held += 1;
+                }
+            }
+            self.held = held;
+        }
+    }
+
+    /// The slots fill the room: bring `end` down to where `want` is
+    /// reached and drop the slots past it, and if that leaves no room (many
+    /// keys at one position: a page holds them all), make more.
+    #[cold]
+    #[inline(never)]
+    fn make_room(&mut self) {
+        self.cut();
+        if self.held * 4 > self.slots.len() * 3 {
+            let more = self.slots.len().saturating_mul(2);
+            self.slots.resize(more, Slot::NONE);
+        }
+    }
+}
 
 /// A table with fewer keys than this grows in one step, as hashbrown grows
 /// it: under 0.2 ms.
@@ -2924,6 +3149,130 @@ mod tests {
             assert_eq!(seen.get(format!("g{i}").as_bytes()), Some(&1), "g{i}");
         }
         assert!(seen.values().all(|&times| times == 1));
+    }
+
+    /// The most keys at one position of `map`: what a page may hold past
+    /// `want`, since it never splits a position.
+    fn most_at_one_position(map: &ShardMap) -> usize {
+        let mut at = vec![0usize; SCAN_POSITIONS as usize];
+        for slot in map.slots() {
+            at[slot.scan_position()] += 1;
+        }
+        at.into_iter().max().unwrap_or(0)
+    }
+
+    /// Each page deleted as soon as it is given (`SCAN` piped into `DEL`):
+    /// the keys left are then all past the cursor, far denser there than
+    /// the shard's length says. A page still holds `want` keys and those
+    /// that share the last one's position, never more, and the scan ends
+    /// with the shard empty (#884).
+    #[test]
+    fn a_scan_that_deletes_each_page_keeps_its_pages_at_want() {
+        for (want, n) in [(10, 10_000), (100, 30_000), (1000, 30_000)] {
+            let mut map = ShardMap::new();
+            for i in 0..n {
+                map.insert_str(format!("k:{i}").as_bytes(), "v");
+            }
+            let ties = most_at_one_position(&map);
+            let mut from = 0;
+            let mut pages = 0;
+            loop {
+                let mut keys = Vec::new();
+                let next = map.scan(from, want, |e| keys.push(e.key().to_vec()));
+                pages += 1;
+                assert!(
+                    keys.len() < want + ties,
+                    "a page of {} for {want}",
+                    keys.len()
+                );
+                assert!(
+                    keys.len() >= want || next == 0,
+                    "a short page of {}",
+                    keys.len()
+                );
+                for key in &keys {
+                    assert!(map.remove(key.as_slice()).is_some());
+                }
+                if next == 0 {
+                    break;
+                }
+                assert!(next > from);
+                from = next;
+            }
+            assert!(
+                map.is_empty(),
+                "{} keys left after {pages} pages",
+                map.len()
+            );
+        }
+    }
+
+    /// A shard whose keys before the middle position are gone holds none
+    /// where its length says a page's worth would be: the page reaches
+    /// further, to `want` keys, rather than coming back empty with a
+    /// position to go on from (#884).
+    #[test]
+    fn a_page_reaches_past_positions_left_empty() {
+        let mut map = ShardMap::new();
+        for i in 0..30_000 {
+            map.insert_str(format!("k:{i}").as_bytes(), "v");
+        }
+        let early: Vec<Vec<u8>> = map
+            .slots()
+            .filter(|slot| slot.scan_position() < 2048)
+            .map(|slot| slot.entry().key().to_vec())
+            .collect();
+        for key in &early {
+            assert!(map.remove(key.as_slice()).is_some());
+        }
+        let ties = most_at_one_position(&map);
+        for want in [1, 100, 1000] {
+            let mut n = 0;
+            let next = map.scan(0, want, |_| n += 1);
+            assert!(n >= want && n < want + ties, "a page of {n} for {want}");
+            assert!(next > 2048, "goes on from {next}");
+        }
+    }
+
+    /// A page that may take the rest of the shard (`want` at least its
+    /// length) takes it (#884): every key at a position from `from` on,
+    /// exactly the ones smaller pages from there give, in both tables of a
+    /// growth, and the scan of the shard ends.
+    #[test]
+    fn a_page_as_large_as_the_shard_takes_the_rest_of_it() {
+        let (mut map, n) = growing();
+        map.insert(String::from("new:0"), s("v"));
+        assert!(map.is_growing());
+        let all = map.len();
+        for from in [0u64, 1, 700, 2048, SCAN_POSITIONS - 1] {
+            let mut whole = Vec::new();
+            assert_eq!(map.scan(from, all, |e| whole.push(e.key().to_vec())), 0);
+            let mut paged = Vec::new();
+            let mut at = from;
+            loop {
+                at = map.scan(at, 7, |e| paged.push(e.key().to_vec()));
+                if at == 0 {
+                    break;
+                }
+            }
+            whole.sort();
+            paged.sort();
+            assert_eq!(whole, paged, "from {from}");
+            if from == 0 {
+                assert_eq!(whole.len(), all);
+            }
+        }
+        // A first page of a few, then the rest at once: every key once.
+        let mut seen = std::collections::HashMap::new();
+        let mut note = |e: EntryView<'_>| *seen.entry(e.key().to_vec()).or_insert(0) += 1;
+        let next = map.scan(0, 10, &mut note);
+        assert_ne!(next, 0);
+        map.step_growth(GROWTH_STEP);
+        map.insert(String::from("new:1"), s("v"));
+        assert_eq!(map.scan(next, usize::MAX, &mut note), 0);
+        for i in 0..n {
+            assert_eq!(seen.get(format!("g{i}").as_bytes()), Some(&1), "g{i}");
+        }
     }
 
     /// A full table of keys `g0`, `g1`, ... with their numbers as values,

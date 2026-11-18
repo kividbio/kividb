@@ -894,6 +894,210 @@ fn key_access_tracking_keeps_idle_time_under_noeviction() {
     assert_eq!(c.cmd(&["OBJECT", "IDLETIME", "nokey"]), V::Nil);
 }
 
+/// `CLIENT NO-TOUCH` keeps the client's reads from counting as a use of
+/// the keys they find — `TOUCH` still touches, and its writes count as
+/// uses — until `NO-TOUCH OFF` or `RESET`, under either I/O model (#566).
+#[test]
+fn client_no_touch_leaves_a_keys_use_alone() {
+    let models: &[&str] = if cfg!(target_os = "linux") {
+        &["tokio", "uring"]
+    } else {
+        &["tokio"]
+    };
+    for &model in models {
+        let server = Server::start(&["--io-model", model, "--key-access-tracking", "yes"]);
+        let mut c = server.conn();
+        let mut other = server.conn();
+        assert!(c.cmd(&["SET", "foo", "bar"]).ok());
+        assert_eq!(c.cmd(&["RPUSH", "sorted", "2", "1"]).i(), 2);
+        std::thread::sleep(Duration::from_millis(2100));
+        assert!(c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() >= 2, "{model}");
+
+        assert!(c.cmd(&["CLIENT", "NO-TOUCH", "ON"]).ok());
+        // A `SORT` that stores nothing is a read, as in Redis.
+        assert!(matches!(c.cmd(&["SORT", "sorted"]), V::Arr(_)));
+        assert!(
+            c.cmd(&["OBJECT", "IDLETIME", "sorted"]).i() >= 2,
+            "{model}: a no-touch SORT is no use"
+        );
+        // What Redis calls the `T` flag, in `CLIENT INFO` and `CLIENT LIST`.
+        assert!(c.cmd(&["CLIENT", "INFO"]).s().contains("flags=T"));
+        assert!(c.cmd(&["CLIENT", "LIST"]).s().contains("flags=T"));
+
+        // Its reads are no use of the key; `TOUCH` still touches, as in
+        // Redis.
+        assert_eq!(c.cmd(&["GET", "foo"]).s(), "bar");
+        assert!(
+            c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() >= 2,
+            "{model}: a no-touch read is no use"
+        );
+        assert_eq!(c.cmd(&["TOUCH", "foo"]).i(), 1);
+        assert!(
+            c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() < 2,
+            "{model}: but a no-touch TOUCH touches"
+        );
+        std::thread::sleep(Duration::from_millis(2100));
+
+        // Its writes count as uses: a key one makes is born used, not at
+        // the start of time, and a key it writes is used all the same.
+        assert!(c.cmd(&["SET", "made", "1"]).ok());
+        assert!(
+            c.cmd(&["OBJECT", "IDLETIME", "made"]).i() < 2,
+            "{model}: a key a no-touch client makes is born used"
+        );
+        assert!(c.cmd(&["SET", "foo", "baz"]).ok());
+        assert!(
+            c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() < 2,
+            "{model}: and a write is a use of it"
+        );
+
+        // `SET`s inside a transaction count the same — the EXEC fast
+        // path.
+        std::thread::sleep(Duration::from_millis(2100));
+        assert_eq!(c.cmd(&["MULTI"]).s(), "OK");
+        assert_eq!(c.cmd(&["SET", "execmade", "1"]).s(), "QUEUED");
+        assert_eq!(c.cmd(&["SET", "foo", "qux"]).s(), "QUEUED");
+        assert!(matches!(c.cmd(&["EXEC"]), V::Arr(_)));
+        assert!(
+            c.cmd(&["OBJECT", "IDLETIME", "execmade"]).i() < 2,
+            "{model}"
+        );
+        assert!(c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() < 2, "{model}");
+
+        // A `CLIENT` queued inside a transaction takes hold with what is
+        // queued after it: here the flag drops, and the `GET` is a use.
+        std::thread::sleep(Duration::from_millis(2100));
+        assert_eq!(c.cmd(&["MULTI"]).s(), "OK");
+        assert_eq!(c.cmd(&["CLIENT", "NO-TOUCH", "OFF"]).s(), "QUEUED");
+        assert_eq!(c.cmd(&["GET", "foo"]).s(), "QUEUED");
+        assert!(matches!(c.cmd(&["EXEC"]), V::Arr(_)));
+        assert!(
+            c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() < 2,
+            "{model}: a queued NO-TOUCH OFF takes hold mid-EXEC"
+        );
+        // And one queued ON holds for the commands after the `EXEC`.
+        assert_eq!(c.cmd(&["MULTI"]).s(), "OK");
+        assert_eq!(c.cmd(&["CLIENT", "NO-TOUCH", "ON"]).s(), "QUEUED");
+        assert!(matches!(c.cmd(&["EXEC"]), V::Arr(_)));
+        // No `CLIENT` before the `GET`: that would read the flag back itself.
+        std::thread::sleep(Duration::from_millis(2100));
+        assert_eq!(c.cmd(&["GET", "foo"]).s(), "qux");
+        assert!(
+            c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() >= 2,
+            "{model}: a queued NO-TOUCH ON holds after the EXEC"
+        );
+        assert!(c.cmd(&["CLIENT", "INFO"]).s().contains("flags=T"));
+
+        // Under LFU its reads count nothing, while a key it makes is born
+        // at the initial count and a key it writes is counted: at a count
+        // of 5 the next use always rises.
+        assert!(
+            c.cmd(&["CONFIG", "SET", "maxmemory-policy", "allkeys-lfu"])
+                .ok()
+        );
+        assert!(c.cmd(&["SET", "counted", "1"]).ok());
+        assert_eq!(
+            c.cmd(&["OBJECT", "FREQ", "counted"]).i(),
+            5,
+            "{model}: born at the initial count"
+        );
+        for _ in 0..5 {
+            c.cmd(&["GET", "counted"]);
+        }
+        assert_eq!(
+            c.cmd(&["OBJECT", "FREQ", "counted"]).i(),
+            5,
+            "{model}: its reads do not count"
+        );
+        assert!(c.cmd(&["SET", "counted", "2"]).ok());
+        assert_eq!(
+            c.cmd(&["OBJECT", "FREQ", "counted"]).i(),
+            6,
+            "{model}: but its writes do"
+        );
+        assert!(c.cmd(&["SET", "counted2", "1"]).ok());
+        assert_eq!(other.cmd(&["GET", "counted2"]).s(), "1");
+        assert_eq!(
+            c.cmd(&["OBJECT", "FREQ", "counted2"]).i(),
+            6,
+            "{model}: and another client's reads still do"
+        );
+        // Under an LRU policy too, a key it makes is born used, not taken
+        // for the oldest key there is.
+        assert!(
+            c.cmd(&["CONFIG", "SET", "maxmemory-policy", "allkeys-lru"])
+                .ok()
+        );
+        assert!(c.cmd(&["SET", "lru-made", "1"]).ok());
+        assert!(
+            c.cmd(&["OBJECT", "IDLETIME", "lru-made"]).i() < 2,
+            "{model}: a key it makes under allkeys-lru is born used"
+        );
+        assert!(
+            c.cmd(&["CONFIG", "SET", "maxmemory-policy", "noeviction"])
+                .ok()
+        );
+
+        // Every other connection's commands still are uses.
+        std::thread::sleep(Duration::from_millis(2100));
+        assert_eq!(other.cmd(&["GET", "foo"]).s(), "qux");
+        assert!(c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() < 2, "{model}");
+        std::thread::sleep(Duration::from_millis(2100));
+        c.cmd(&["GET", "foo"]);
+        assert!(
+            c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() >= 2,
+            "{model}: still no use from the no-touch client"
+        );
+
+        // A script that may write counts its declared keys as used, under
+        // NO-TOUCH as without — a key it makes is born used — while a
+        // read-only script's are not.
+        #[cfg(feature = "lua")]
+        {
+            c.cmd(&[
+                "EVAL",
+                "return redis.call('SET', KEYS[1], '9')",
+                "1",
+                "scripted",
+            ]);
+            assert!(
+                c.cmd(&["OBJECT", "IDLETIME", "scripted"]).i() < 2,
+                "{model}: a key a script makes is born used"
+            );
+            std::thread::sleep(Duration::from_millis(2100));
+            c.cmd(&["EVAL", "return redis.call('GET', KEYS[1])", "1", "foo"]);
+            assert!(
+                c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() < 2,
+                "{model}: a script's declared keys count as used"
+            );
+            std::thread::sleep(Duration::from_millis(2100));
+            c.cmd(&["EVAL_RO", "return redis.call('GET', KEYS[1])", "1", "foo"]);
+            assert!(
+                c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() >= 2,
+                "{model}: a read-only script's are not"
+            );
+        }
+
+        // `RESET` puts it back, and `NO-TOUCH OFF` takes it off.
+        assert_eq!(c.cmd(&["RESET"]).s(), "RESET");
+        assert!(c.cmd(&["CLIENT", "INFO"]).s().contains("flags=N"));
+        c.cmd(&["GET", "foo"]);
+        assert!(
+            c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() < 2,
+            "{model}: a use again after RESET"
+        );
+        assert!(c.cmd(&["CLIENT", "NO-TOUCH", "ON"]).ok());
+        assert!(c.cmd(&["CLIENT", "NO-TOUCH", "OFF"]).ok());
+        assert!(c.cmd(&["CLIENT", "INFO"]).s().contains("flags=N"));
+        std::thread::sleep(Duration::from_millis(2100));
+        c.cmd(&["GET", "foo"]);
+        assert!(
+            c.cmd(&["OBJECT", "IDLETIME", "foo"]).i() < 2,
+            "{model}: a use again once it is off"
+        );
+    }
+}
+
 /// `RESTORE ... IDLETIME` and `FREQ`, and what `OBJECT IDLETIME` and `FREQ`
 /// then say, with `key-access-tracking yes` under `noeviction`, as Redis 8.10.2 answers
 /// them (#21). `IDLETIME` is kept; `FREQ` is a count, and there is none
@@ -1654,10 +1858,29 @@ impl Server {
 }
 
 impl Conn {
-    /// A list `key` of 100,000 elements of 100 bytes: about 14 MB, freed
-    /// element by element once it is evicted, and at least 3.2 MB as
-    /// eviction reckons it before it frees it.
+    /// A list `key` of 100,000 elements of 100 bytes, each kept apart: about
+    /// 14 MB, freed element by element once it is evicted, and at least 3.2
+    /// MB as eviction reckons it before it frees it. (Its first element,
+    /// longer than a chunk of packed elements holds, keeps them apart; a
+    /// packed list is reckoned at what its chunks take, exactly.)
     fn big_list(&mut self, key: &str) {
+        let element = "e".repeat(100);
+        let long = "L".repeat(1025);
+        self.cmd(&["RPUSH", key, &long]);
+        let mut push = vec!["RPUSH", key];
+        push.extend(std::iter::repeat_n(element.as_str(), 2000));
+        for _ in 0..50 {
+            self.cmd(&push);
+        }
+        self.cmd(&["LPOP", key]);
+        assert_eq!(self.cmd(&["LLEN", key]).i(), 100_000);
+        assert_eq!(self.cmd(&["OBJECT", "ENCODING", key]).s(), "quicklist");
+    }
+
+    /// The same 100,000 elements of 100 bytes in a packed list: about
+    /// 10.4 MB of chunks, which eviction reckons at exactly that before it
+    /// frees them.
+    fn big_packed_list(&mut self, key: &str) {
         let element = "e".repeat(100);
         let mut push = vec!["RPUSH", key];
         push.extend(std::iter::repeat_n(element.as_str(), 2000));
@@ -1665,6 +1888,11 @@ impl Conn {
             self.cmd(&push);
         }
         assert_eq!(self.cmd(&["LLEN", key]).i(), 100_000);
+        let usage = self.cmd(&["MEMORY", "USAGE", key]).i();
+        assert!(
+            (10_000_000..11_000_000).contains(&usage),
+            "a packed list of 100,000 elements of 100 bytes takes {usage}"
+        );
     }
 
     /// `used_memory` less `mem_not_counted_for_evict`: what is measured
@@ -1716,6 +1944,31 @@ fn lower_limit(server: &Server, c: &mut Conn, limit: i64) -> std::thread::JoinHa
         std::thread::sleep(Duration::from_millis(10));
     }
     lowered
+}
+
+/// A packed list of more than 64 KB goes through the freeing path too, and
+/// is reckoned at what its chunks take: with a limit 8 MB under what is used
+/// (more than the 3.2 MB a plain list of as many elements is reckoned at, less
+/// than the 10.4 MB these chunks take), what is being freed makes the room,
+/// so a write meanwhile is let through, and memory is under the limit once
+/// the list is freed.
+#[test]
+fn a_packed_list_being_freed_is_reckoned_at_its_chunks() {
+    let server = Server::start_freeing_slowly("allkeys-lru");
+    let mut c = server.conn();
+    c.big_packed_list("big");
+    let mut conn = ready_conns(&server, 1).pop().unwrap();
+    let limit = c.used_memory() - 8 * MB;
+    let lowered = lower_limit(&server, &mut c, limit);
+    let reply = conn.cmd(&["SET", "w", &big_value('v')]);
+    assert!(reply.ok(), "a write meanwhile: {reply:?}");
+    assert!(lowered.join().unwrap().ok());
+    assert_eq!(c.cmd(&["EXISTS", "big"]).i(), 0);
+    let counted = c.counted();
+    assert!(
+        counted <= limit,
+        "{counted} counted once freed, limit {limit}"
+    );
 }
 
 /// The last key evicted, a list of 100,000 elements, and still being freed

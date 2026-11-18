@@ -6,7 +6,7 @@ use crate::read_lock;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
-use crate::types::{HashFields, HashInner, SortedSetInner, StreamInner, ZMember};
+use crate::types::{HashFields, HashInner, ListValues, SortedSetInner, StreamInner, ZMember};
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
 
@@ -122,6 +122,15 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
         // holds it to that (at least the three, at most twice them or 64),
         // which a share of the table's entries does not fit.
         ValueRef::String(b) => size_class(16 + key.len() + 2 + b.len() + 2),
+
+        // Chunks of packed elements are counted as allocated, room to spare
+        // included.
+        ValueRef::List(arc) if arc.read().is_packed() => {
+            let inner = arc.read();
+            entry()
+                + layout::arc_of::<RwLock<ListValues>>()
+                + inner.packed_bytes().unwrap_or_default()
+        }
 
         ValueRef::List(arc) => {
             let inner = arc.read();

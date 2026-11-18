@@ -1,3 +1,4 @@
+use crate::list_values::ListValues;
 use crate::store;
 use crate::store::Key;
 use crate::store::ValueRef;
@@ -692,7 +693,7 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
             // u32 element count
             w.write_all(&(inner.len() as u32).to_le_bytes())?;
             for item in inner.iter() {
-                write_bytes(w, item)?;
+                write_bytes(w, &item)?;
             }
         }
 
@@ -2337,12 +2338,12 @@ fn read_image(
                     let mut count_buf = [0u8; 4];
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
-                    let mut deque = VecDeque::with_capacity(hint(count));
+                    let mut list = ListValues::builder(hint(count));
                     for _ in 0..count {
                         let item = read_bytes(&mut r)?;
-                        deque.push_back(Arc::from(item.as_slice()));
+                        list.push(&item);
                     }
-                    KiviDBValue::List(Arc::new(parking_lot::RwLock::new(deque)))
+                    KiviDBValue::List(Arc::new(parking_lot::RwLock::new(list.finish())))
                 }
                 TAG_HASH => {
                     let mut count_buf = [0u8; 4];
@@ -3864,13 +3865,13 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
         1 => {
             // Linked list (RDB v7 and earlier) or quicklist
             let (count, _) = rdb_read_length(r)?;
-            let mut deque = VecDeque::new();
+            let mut list = ListValues::builder(hint(count as usize));
             for _ in 0..count {
                 let item = rdb_read_string(r)?;
-                deque.push_back(Arc::from(item.as_slice()));
+                list.push(&item);
             }
             Ok(Some(KiviDBValue::List(Arc::new(parking_lot::RwLock::new(
-                deque,
+                list.finish(),
             )))))
         }
         2 => {
@@ -3937,7 +3938,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             let mut deque = VecDeque::new();
             rdb_decode_ziplist_into_list(&blob, &mut deque);
             Ok(Some(KiviDBValue::List(Arc::new(parking_lot::RwLock::new(
-                deque,
+                deque.into_iter().collect(),
             )))))
         }
         11 => {
@@ -4025,7 +4026,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                 rdb_decode_ziplist_into_list(&blob, &mut deque);
             }
             Ok(Some(KiviDBValue::List(Arc::new(parking_lot::RwLock::new(
-                deque,
+                deque.into_iter().collect(),
             )))))
         }
         16 => {
@@ -4066,7 +4067,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                 }
             }
             Ok(Some(KiviDBValue::List(Arc::new(parking_lot::RwLock::new(
-                deque,
+                deque.into_iter().collect(),
             )))))
         }
         20 => {
@@ -5817,7 +5818,7 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
             let inner = arc.read();
             out.write_all(&(inner.len() as u32).to_le_bytes())?;
             for item in inner.iter() {
-                write_bytes_vec(out, item)?;
+                write_bytes_vec(out, &item)?;
             }
         }
         KiviDBValue::Hash(arc) => {
@@ -5930,13 +5931,15 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             }
             let count = u32::from_le_bytes(payload[..4].try_into().ok()?) as usize;
             let mut pos = 4usize;
-            let mut deque = VecDeque::new();
+            let mut list = ListValues::builder(hint(count));
             for _ in 0..count {
                 let (bytes, next) = read_bytes_slice(payload, pos)?;
-                deque.push_back(Arc::from(bytes));
+                list.push(bytes);
                 pos = next;
             }
-            Some(KiviDBValue::List(Arc::new(parking_lot::RwLock::new(deque))))
+            Some(KiviDBValue::List(Arc::new(parking_lot::RwLock::new(
+                list.finish(),
+            ))))
         }
         TAG_ARRAY => {
             if payload.len() < 4 {
@@ -7854,10 +7857,9 @@ mod empty_key_tests {
             ),
             (
                 "list".to_string(),
-                KiviDBValue::List(Arc::new(parking_lot::RwLock::new(VecDeque::from([
-                    Arc::from(&b""[..]),
-                    Arc::from(&b"e"[..]),
-                ])))),
+                KiviDBValue::List(Arc::new(parking_lot::RwLock::new(
+                    [&b""[..], &b"e"[..]].into_iter().collect(),
+                ))),
             ),
         ]);
         let whole = image(&[db0, HashMap::from([("after".to_string(), string("1"))])]);
@@ -7896,7 +7898,7 @@ mod empty_key_tests {
             Some(KiviDBValue::List(list)) => {
                 let list = list.read();
                 assert_eq!(list.len(), 2);
-                assert!(list[0].is_empty());
+                assert!(list.get(0).is_some_and(|e| e.is_empty()));
             }
             _ => panic!("list is not a list"),
         }
