@@ -2273,6 +2273,60 @@ end
     // Redis's scripting environment re-exports it as a global, so scripts can use either form.
     lua.load("unpack = table.unpack").exec().unwrap();
 
+    // More of the Lua 5.1 library Redis still ships (#898): `getn` reads a
+    // field 'n' before the length operator, as 5.1's luaL_getn does;
+    // `setn` stores that field, `foreach`/`foreachi` return the first
+    // non-nil result of the call, `math.mod` was fmod's deprecated name,
+    // `gfind` became `gmatch` in 5.2, and `gcinfo` reported the GC count
+    // in K. `table.insert`/`remove` also maintained 'n' in 5.1 — a shim
+    // cannot patch the C functions, but a field 'n' still wins in `getn`.
+    lua.load(
+        r#"
+        table.getn = function(t)
+            if type(t) ~= "table" then
+                error("bad argument #1 to 'getn' (table expected)", 2)
+            end
+            local n = rawget(t, "n")
+            if type(n) == "number" then return n end
+            return #t
+        end
+        table.setn = function(t, n)
+            if type(t) ~= "table" then
+                error("bad argument #1 to 'setn' (table expected)", 2)
+            end
+            if type(n) ~= "number" then
+                error("bad argument #2 to 'setn' (number expected)", 2)
+            end
+            rawset(t, "n", n)
+            return t
+        end
+        table.maxn = function(t)
+            local max = 0
+            for k in pairs(t) do
+                if type(k) == "number" and k > max then max = k end
+            end
+            return max
+        end
+        table.foreach = function(t, f)
+            for k, v in pairs(t) do
+                local r = f(k, v)
+                if r ~= nil then return r end
+            end
+        end
+        table.foreachi = function(t, f)
+            for i = 1, table.getn(t) do
+                local r = f(i, rawget(t, i))
+                if r ~= nil then return r end
+            end
+        end
+        math.mod = math.fmod
+        string.gfind = string.gmatch
+        gcinfo = function() return math.floor(collectgarbage("count")) end
+        "#,
+    )
+    .exec()
+    .unwrap();
+
     // `string.format` with Lua 5.1's integer conversions, as Redis's
     // scripts have them (#747): see [`super::lua_format`].
     // SAFETY: the state has the `string` library, and the closure leaves

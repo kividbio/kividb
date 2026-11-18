@@ -660,6 +660,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Lua has the 5.1 library calls Redis still ships (#898).**
+  `table.getn`, `table.setn`, `table.maxn`, `table.foreach`,
+  `table.foreachi`, `math.mod`, `string.gfind` and `gcinfo` were nil, so
+  a script that calls one — asynq's task-queue scripts call `table.getn`
+  throughout — failed with `attempt to call a nil value`. They answer
+  with 5.1's semantics: `getn` reads a field `n` before the length
+  operator, `foreach`/`foreachi` return the call's first non-nil
+  result, `math.mod` is `fmod`'s deprecated name, `gfind` is `gmatch`,
+  and `gcinfo` reports the GC count in K.
+
 - **`CLUSTER SLOTS`, `SHARDS` and `NODES` refuse on a standalone, as in
   Redis (#899).** They answered with empty tables, so a client that asks
   a standalone for its slots — rueidis, the Go client behind Centrifugo

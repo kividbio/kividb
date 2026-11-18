@@ -2658,3 +2658,65 @@ fn the_implicit_arg_of_a_vararg_function_is_the_one_lua_5_1_makes() {
     let sha = c.cmds(&["SCRIPT", "LOAD", script]);
     assert_eq!(c.cmds(&["EVALSHA", sha.as_str(), "0"]), int(2));
 }
+
+/// Redis runs Lua 5.1, whose `table.getn`, `setn`, `maxn`, `foreach`,
+/// `foreachi`, `math.mod`, `string.gfind` and `gcinfo` asynq and other
+/// libraries still call; on 5.4 they are nil and the script errors
+/// (#898). They answer again, with 5.1's semantics: `getn` reads a field
+/// `n` before the length operator, `foreach`/`foreachi` return the
+/// call's first non-nil result.
+#[test]
+fn lua_5_1_table_and_stdlib_functions_still_exist() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for name in [
+        "table.getn",
+        "table.setn",
+        "table.maxn",
+        "table.foreach",
+        "table.foreachi",
+        "math.mod",
+        "string.gfind",
+        "gcinfo",
+    ] {
+        let got = c.cmds(&["EVAL", &format!("return type({name})"), "0"]);
+        assert_eq!(got.as_str(), "function", "{name}");
+    }
+
+    let cases: &[(&str, i64)] = &[
+        ("table.getn({1, 2, 3})", 3),
+        // A field 'n' set by setn wins over the length operator.
+        (
+            "(function() local t = {1, 2, 3}; table.setn(t, 5); return table.getn(t) end)()",
+            5,
+        ),
+        ("table.maxn({[2] = 'a', [5] = 'b', x = 1})", 5),
+        // foreach returns the first non-nil result of the call.
+        (
+            "table.foreach({a = 4, b = 7}, function(k, v) if v > 5 then return v end end)",
+            7,
+        ),
+        (
+            "(function() local s = 0; table.foreachi({1, 2, 3}, function(i, v) s = s + v end); return s end)()",
+            6,
+        ),
+        ("math.mod(7, 3)", 1),
+        (
+            "(function() local n = 0; for w in string.gfind('a b c', '%a+') do n = n + 1 end; return n end)()",
+            3,
+        ),
+    ];
+    for (expr, want) in cases {
+        let got = c.cmds(&["EVAL", &format!("return {expr}"), "0"]);
+        assert_eq!(got.as_int(), *want, "{expr}");
+    }
+
+    // gcinfo reports the GC count as a number, as 5.1's does.
+    assert_eq!(
+        c.cmds(&["EVAL", "return type(gcinfo())", "0"]).as_str(),
+        "number"
+    );
+}
