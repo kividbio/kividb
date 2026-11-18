@@ -675,7 +675,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     configuration file or `CONFIG SET`; `0` entries turns blocks off. They
     go no higher than 128 and 64, and `CONFIG GET` reports the value kept.
     A lowered limit applies to a set at its next new member.
-  - INSTRUCTIONS_PLACEHOLDER
+  - Commands cost fewer instructions on a block than on the table and tree
+    for most of what a small sorted set is used for (8 and 100 members,
+    pipelined, io_uring): `ZRANGE 0 9` 16-17 % fewer, `ZRANGE 0 -1` of 100
+    members 52 %, `ZRANK` 7-17 %, a changed score by `ZADD` or `ZINCRBY`
+    7-12 %, `ZRANDMEMBER` of 100 members 11 %; `ZSCORE` the same. Adding a
+    new member to a set of exactly 8 costs 5 % more (the block grows by
+    one allocation), and at 100 members a `ZSCORE` miss 2 %, a new member
+    2 %, `ZREM` then `ZADD` 2 % and `ZPOPMIN` 2.5 % more (the entries after
+    it move). Large sets are within 1 % of before, and `GET`/`SET` unchanged.
   - Snapshots, the AOF, replication, `DUMP`/`RESTORE` and `MIGRATE` still
     write members and scores, so their formats do not change: 1.2.2 reads
     what this release writes and the other way round, and `DEBUG DIGEST`
