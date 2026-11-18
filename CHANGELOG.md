@@ -861,7 +861,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to two minutes, and again when the other end calls on it within the hour
   after. Nodes met at the same time (`redis-cli --cluster create` has every
   node meet the first) are saved together, in one write. The vote's save
-  no longer holds up the cluster bus.
+  no longer holds up the cluster bus, and a candidate counts a vote for
+  as long as its election lives (it waited the node timeout, at least
+  2 s): a voter on a slow disk answers once its vote is saved. On Linux a
+  save writes over, in place, the file the save before it replaced, so
+  that it waits on one sync of the disk's journal, not two; nodes.conf is
+  then 64 KiB long, blank lines after the `vars` line, which 1.2 reads.
 
 - **Sorted-set commands read integers as Redis does.** `ZREMRANGEBYRANK
   key x 5` took `x` as 0 and removed members; it now answers `ERR value is

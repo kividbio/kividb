@@ -748,9 +748,17 @@ impl ClusterState {
                     let Some(state) = state.upgrade() else {
                         return;
                     };
+                    // Not while a save something waits on is made (a vote,
+                    // a node met): the disk would commit the two in turn,
+                    // and the vote, which counts, would wait on this one.
+                    let waited = std::time::Instant::now();
+                    while state.saves.urgent.load(Ordering::SeqCst) > 0
+                        && waited.elapsed() < std::time::Duration::from_secs(5)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
                     let saved = persist::save_from_state(&state);
                     last = Some(std::time::Instant::now());
-                    note_save_outcome(&saved, "");
                     if let Err(e) = saved {
                         log_verbose!("Cluster: could not save the cluster config file: {e}");
                     }
@@ -792,7 +800,12 @@ impl ClusterState {
             add();
         }
         self.joining.lock().retain(|n| n.id != id);
-        note_save_outcome(&saved.as_ref().map(|_| ()), node_id_str(&id));
+        if let Err(e) = &saved {
+            log_verbose!(
+                "Cluster: {} not made a member: it could not be saved ({e})",
+                node_id_str(&id)
+            );
+        }
         saved.is_ok()
     }
 
@@ -3002,8 +3015,9 @@ impl ClusterState {
 
     /// How long after a failover of a master began a replica of it may still
     /// be promoted by it: an election lives for [`ELECTION_LIFETIME`], and a
-    /// vote sent at its end is counted for as long as the candidate waits for
-    /// it (the node timeout, at least 2 s). Never less than two node
+    /// vote is counted only while it does (the candidate waits for one at
+    /// most that long, or two node timeouts); a margin of a node timeout (at
+    /// least 2 s) on top. Never less than two node
     /// timeouts, the time a master waits between votes for replicas of the
     /// same master. Neither a source nor a destination hands slots over in
     /// that time after it saw such a failover begin (#516).
@@ -3383,34 +3397,6 @@ const BACKGROUND_SAVE_GAP: std::time::Duration = std::time::Duration::from_milli
 
 /// How long a node met waits for the save that makes it a member.
 const ADMIT_SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// Log a failure to save nodes.conf once, as an error, when saves start
-/// failing, and once more when they work again: a disk that is full or
-/// read-only fails every save, and the bus saves often. `met` is the node a
-/// failed save was to admit, if any: it is not a member until a save works.
-fn note_save_outcome<E: std::fmt::Display>(saved: &Result<(), E>, met: &str) {
-    static FAILING: AtomicBool = AtomicBool::new(false);
-    match saved {
-        Ok(()) => {
-            if FAILING.swap(false, Ordering::Relaxed) {
-                log_warn!("Cluster: the cluster config file is saved again");
-            }
-        }
-        Err(e) => {
-            if !FAILING.swap(true, Ordering::Relaxed) {
-                log_error!(
-                    "Cluster: could not save the cluster config file: {e}. Until it can be, \
-                     changes of topology are not on disk, and no node met is made a member{}",
-                    if met.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" (not {met})")
-                    }
-                );
-            }
-        }
-    }
-}
 
 /// This process's cluster state, once its bus has started: see
 /// [`save_at_shutdown`].

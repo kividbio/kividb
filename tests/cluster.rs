@@ -1982,6 +1982,71 @@ fn a_node_that_cannot_save_makes_no_node_met_a_member() {
     assert!(n.log().contains("is saved again"));
 }
 
+/// A vote whose save takes longer than the node timeout (here, held at the
+/// failpoint for 5 s) still counts: the candidate waits for it as long as
+/// the election lives, and wins the election it started, at its first
+/// epoch. The answer used to be waited for 2 s; every vote was given and
+/// then lost, epoch after epoch, and on a slow enough disk the failover
+/// never completed.
+#[test]
+fn votes_saved_slowly_still_elect_the_replica_at_its_first_epoch() {
+    let (mut nodes, _) = form_cluster(3);
+    let replica = add_replica(&nodes, &nodes[0]);
+    // The two voters, restarted with the failpoint.
+    let mut gates = Vec::new();
+    for node in &mut nodes[1..] {
+        node.kill();
+        node.env
+            .push((FAILPOINT_SAVES.0.to_string(), FAILPOINT_SAVES.1.to_string()));
+        gates.push(SaveGate::new(&node.dir, |_| false));
+        node.spawn();
+    }
+    let mut all: Vec<&Node> = nodes.iter().collect();
+    all.push(&replica);
+    wait_cluster_ok(&all, 4);
+    // Hold every save that has a vote in it: its `lastVoteEpoch` is no
+    // longer 0.
+    for gate in &gates {
+        gate.set_hold(|file| !file.contains(" lastVoteEpoch 0\n"));
+    }
+    nodes[0].kill();
+    for gate in &gates {
+        gate.wait_held(Duration::from_secs(30));
+    }
+    std::thread::sleep(Duration::from_secs(5));
+    for gate in gates {
+        gate.set_hold(|_| false);
+        let held: Vec<PathBuf> = gate.held.lock().clone();
+        for failpoint in held {
+            gate.release(&failpoint);
+        }
+        gate.finish();
+    }
+    wait_until(
+        "the replica to be promoted",
+        Duration::from_secs(30),
+        || replica.is_master(),
+    );
+    let log = replica.log();
+    let epoch_of = |what: &str| {
+        log.lines()
+            .find_map(|l| {
+                l.split_once(what)?
+                    .1
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .unwrap_or_else(|| panic!("no {what:?} in:\n{log}"))
+    };
+    assert_eq!(
+        epoch_of("Starting election for epoch "),
+        epoch_of("Won election at epoch "),
+        "{log}"
+    );
+}
+
 /// Many nodes meeting one at once (as `redis-cli --cluster create` has every
 /// node meet the first) all join, and all agree: the one they meet saves
 /// them together, not one write each.

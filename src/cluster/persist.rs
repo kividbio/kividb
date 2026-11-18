@@ -370,17 +370,133 @@ pub fn remove_leftover_temps(path: &Path) {
     };
     let ours = format!("{name}.tmp-");
     let old = Path::new(name).with_extension("conf.tmp");
+    let spare = format!("{name}.spare-");
     for entry in entries.flatten() {
         let file = entry.file_name();
         let Some(file) = file.to_str() else { continue };
         let leftover = file
             .strip_prefix(&ours)
             .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-            || Path::new(file) == old;
+            || Path::new(file) == old
+            || file
+                .strip_prefix(&spare)
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
         if leftover {
             let _ = fs::remove_file(entry.path());
         }
     }
+}
+
+/// How large a file shaped to be written over is (see [`write_temp_for`]):
+/// room for the nodes.conf of a cluster of a few hundred nodes.
+#[cfg(target_os = "linux")]
+const SPARE_LEN: usize = 64 * 1024;
+
+/// How the temporary file of a save was written (see [`write_temp_for`]).
+#[derive(Clone, Copy, Default)]
+struct Written {
+    /// Over a file whose blocks were already on disk, with `O_DSYNC`: it
+    /// needs no sync of its own.
+    over_spare: bool,
+    /// [`SPARE_LEN`] long: put in place by exchanging it with the file in
+    /// place, which a later save can then write over in turn.
+    shaped: bool,
+}
+
+/// Write `out` to the temporary file `tmp`. A save has to wait on two
+/// commits of the filesystem's journal if its file is new: the new file's
+/// (its sync before the rename) and the rename's (the directory's sync). On
+/// a slow disk that made a vote, which is sent once it is saved, late. So on
+/// Linux the file put in place is not removed but kept, under the temporary
+/// name of the save that replaced it (the two are exchanged, see
+/// [`put_in_place`]), once that save is synced; and the next save writes
+/// over it, in place: no block of it changes but its bytes, the write
+/// returns once they are on the disk (`O_DSYNC`), and the save waits on the
+/// rename's commit alone. Such files are [`SPARE_LEN`] long, the rest of
+/// them blank lines, which every version reads past. A file of another
+/// length (one an earlier version wrote, or one too long for it) is written
+/// anew.
+fn write_temp_for(
+    state: &crate::cluster::ClusterState,
+    tmp: &Path,
+    out: &[u8],
+) -> std::io::Result<Written> {
+    #[cfg(target_os = "linux")]
+    if out.len() <= SPARE_LEN {
+        let spare = state.saves.spares.lock().pop();
+        if let Some(spare) = spare
+            && fs::rename(&spare, tmp).is_ok()
+            && write_direct_shaped(tmp, out, true).is_ok()
+        {
+            return Ok(Written {
+                over_spare: true,
+                shaped: true,
+            });
+        }
+        if write_direct_shaped(tmp, out, false).is_ok() {
+            return Ok(Written {
+                over_spare: false,
+                shaped: true,
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = state;
+    write_temp(tmp, out).map(|()| Written::default())
+}
+
+/// Exchange the files `a` and `b` (`renameat2(RENAME_EXCHANGE)`).
+#[cfg(target_os = "linux")]
+fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
+    let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
+    // SAFETY: both are valid, NUL-terminated paths.
+    let done = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            a.as_ptr(),
+            libc::AT_FDCWD,
+            b.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if done == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Keep `old`, the file a save replaced, for a later save to write over
+/// (see [`write_temp_for`]): only once that save is synced, or a crash
+/// could find it in place, half written. Two at most are kept, as
+/// `nodes.conf.spare-<n>` (removed at startup, as temporary files are).
+fn recycle(state: &crate::cluster::ClusterState, old: Option<std::path::PathBuf>) {
+    let Some(old) = old else {
+        return;
+    };
+    let mut spares = state.saves.spares.lock();
+    // `nodes.conf.tmp-<gen>` becomes `nodes.conf.spare-<n>`.
+    let file = old.file_name().unwrap_or_default().to_string_lossy();
+    let base = file.rsplit_once(".tmp-").map_or(&*file, |(base, _)| base);
+    let free = (0..2).map(|n| old.with_file_name(format!("{base}.spare-{n}")));
+    let free: Vec<std::path::PathBuf> = free.filter(|p| !spares.contains(p)).collect();
+    match free.first() {
+        Some(spare) if spares.len() < 2 && fs::rename(&old, spare).is_ok() => {
+            spares.push(spare.clone());
+        }
+        _ => {
+            drop(spares);
+            let _ = fs::remove_file(old);
+        }
+    }
+}
+
+/// Sync the temporary file `tmp`; nothing to do if it was written over a
+/// file already on disk (see [`write_direct_shaped`]).
+fn sync_temp(tmp: &Path, over_spare: bool) -> std::io::Result<()> {
+    if over_spare { Ok(()) } else { sync_file(tmp) }
 }
 
 /// Write `out` to the temporary file `tmp`. Not synced: see [`sync_file`].
@@ -426,6 +542,72 @@ fn write_direct(tmp_path: &Path, out: &[u8]) -> std::io::Result<()> {
         .truncate(true)
         .custom_flags(libc::O_DIRECT)
         .open(tmp_path)
+        .and_then(|mut f| f.write_all(buf));
+    unsafe { std::alloc::dealloc(ptr, layout) };
+    result
+}
+
+/// Whether the filesystem `path` is on is ext4 or XFS: a sync of a
+/// directory there commits the journal, and the commit first flushes the
+/// disk's write cache, with every write that has completed in it. A write
+/// past the page cache (`O_DIRECT`) over blocks already allocated, that has
+/// completed before the directory's sync, is on the disk once that sync
+/// returns, with no sync of its own (see [`write_direct_shaped`]).
+#[cfg(target_os = "linux")]
+fn journal_flushes_writes(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    const EXT4: i64 = 0xEF53;
+    const XFS: i64 = 0x5846_5342;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let Ok(dir) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: a valid path, and a buffer of the size statfs writes.
+    if unsafe { libc::statfs(dir.as_ptr(), fs.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: statfs succeeded and filled it in.
+    let kind = unsafe { fs.assume_init() }.f_type as i64;
+    kind == EXT4 || kind == XFS
+}
+
+/// Write `out` to `tmp` past the page cache, padded with blank lines to
+/// [`SPARE_LEN`]. `over`: `tmp` is a file of that length already on disk
+/// (see [`write_temp_for`]), written over in place, its size and blocks as
+/// they are: nothing but its bytes need reach the disk. On ext4 or XFS the
+/// sync of the directory after the rename does that ([`journal_flushes_writes`]);
+/// elsewhere the write is made with `O_DSYNC`, and returns once they are.
+/// Else a new file, to be synced.
+#[cfg(target_os = "linux")]
+fn write_direct_shaped(tmp: &Path, out: &[u8], over: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    const ALIGN: usize = 4096;
+    let layout = std::alloc::Layout::from_size_align(SPARE_LEN, ALIGN)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    // SAFETY: `layout` is non-zero in size; the buffer is filled before it
+    // is read, and freed once, below.
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    if ptr.is_null() {
+        return Err(std::io::Error::other("out of memory"));
+    }
+    let buf = unsafe { std::slice::from_raw_parts_mut(ptr, SPARE_LEN) };
+    buf[..out.len()].copy_from_slice(out);
+    buf[out.len()..].fill(b'\n');
+    let flags = if over && !journal_flushes_writes(tmp) {
+        libc::O_DIRECT | libc::O_DSYNC
+    } else {
+        libc::O_DIRECT
+    };
+    let result = fs::OpenOptions::new()
+        .write(true)
+        .create(!over)
+        .truncate(!over)
+        .custom_flags(flags)
+        .open(tmp)
         .and_then(|mut f| f.write_all(buf));
     unsafe { std::alloc::dealloc(ptr, layout) };
     result
@@ -525,12 +707,32 @@ fn sync_dir(path: &Path) -> std::io::Result<()> {
 
 /// Put `tmp`, written and synced, in place of `path`, and sync the rename.
 /// The temporary file is removed if it cannot be.
-fn put_in_place(tmp: &Path, path: &Path) -> std::io::Result<()> {
+///
+/// A `shaped` file (see [`write_temp_for`]) is exchanged with the file in
+/// place, which then has `tmp`'s name: `Some(tmp)` if it is shaped too, to
+/// be kept for a later save ([`recycle`]) once the exchange is synced, and
+/// removed otherwise.
+fn put_in_place(
+    tmp: &Path,
+    path: &Path,
+    shaped: bool,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    #[cfg(target_os = "linux")]
+    if shaped && path.exists() && exchange(tmp, path).is_ok() {
+        let kept = fs::metadata(tmp).is_ok_and(|m| m.len() == SPARE_LEN as u64);
+        if kept {
+            return Ok(Some(tmp.to_path_buf()));
+        }
+        let _ = fs::remove_file(tmp);
+        return Ok(None);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = shaped;
     if let Err(e) = fs::rename(tmp, path) {
         let _ = fs::remove_file(tmp);
         return Err(e);
     }
-    Ok(())
+    Ok(None)
 }
 
 fn save_then(
@@ -591,7 +793,7 @@ fn save_then(
         && state.saves.in_flight.load(Ordering::SeqCst) == 0
         && path.exists()
     {
-        state.saves.note_saved(generation);
+        state.saves.note_saved(generation, false);
         if let Some(publish) = publish {
             publish();
         }
@@ -599,7 +801,12 @@ fn save_then(
     }
     state.saves.in_flight.fetch_add(1, Ordering::SeqCst);
     let tmp = temp_path(path, generation);
-    let written = write_temp(&tmp, &render(&nodes_snap, &slots_snap, epoch, last_vote));
+    let written = write_temp_for(
+        state,
+        &tmp,
+        &render(&nodes_snap, &slots_snap, epoch, last_vote),
+    );
+    let Written { over_spare, shaped } = written.as_ref().copied().unwrap_or_default();
     if let Err(e) = written {
         let _ = fs::remove_file(&tmp);
         state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -614,11 +821,13 @@ fn save_then(
         Some(publish) => {
             let placed = (|| {
                 if !deferred {
-                    sync_file(&tmp)?;
+                    sync_temp(&tmp, over_spare)?;
                 }
                 // For the tests of a crash between the write and the rename.
                 crate::aof::failpoint_noting("nodes-conf-written", &tmp.to_string_lossy());
-                put_in_place(&tmp, path)?;
+                // Not exchanged when the sync is deferred: the file replaced
+                // could be written over before the exchange is on disk.
+                let old = put_in_place(&tmp, path, shaped && !deferred)?;
                 state.saves.in_place.store(generation, Ordering::SeqCst);
                 state
                     .last_saved_fingerprint
@@ -626,12 +835,13 @@ fn save_then(
                 if !deferred {
                     sync_dir(path)?;
                 }
+                recycle(state, old);
                 Ok(())
             })();
             state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
             match placed {
                 Ok(()) => {
-                    state.saves.note_saved(generation);
+                    state.saves.note_saved(generation, true);
                     publish();
                 }
                 Err(ref e) => {
@@ -655,17 +865,19 @@ fn save_then(
         None => {
             drop(saving);
             let placed = (|| {
-                sync_file(&tmp)?;
+                sync_temp(&tmp, over_spare)?;
                 crate::aof::failpoint_noting("nodes-conf-written", &tmp.to_string_lossy());
                 let saving = state.save_lock.lock();
                 if state.saves.in_place.load(Ordering::SeqCst) < generation {
-                    put_in_place(&tmp, path)?;
+                    let old = put_in_place(&tmp, path, shaped)?;
                     state.saves.in_place.store(generation, Ordering::SeqCst);
                     state
                         .last_saved_fingerprint
                         .store(fingerprint, Ordering::Relaxed);
                     drop(saving);
-                    sync_dir(path).map(|()| true)
+                    sync_dir(path)?;
+                    recycle(state, old);
+                    Ok(true)
                 } else {
                     // A newer save is in place: it has all this one had,
                     // and it notes itself saved once it is synced.
@@ -676,7 +888,7 @@ fn save_then(
             })();
             state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
             match &placed {
-                Ok(true) => state.saves.note_saved(generation),
+                Ok(true) => state.saves.note_saved(generation, true),
                 Ok(false) => state.saves.signal(),
                 Err(e) => {
                     let _ = fs::remove_file(&tmp);
@@ -706,6 +918,15 @@ pub struct Saves {
     pub(crate) in_flight: AtomicU64,
     /// The newest save that is on disk, synced (or found to be what is).
     synced: AtomicU64,
+    /// Saves something waits on (a vote, a node met) being made: the bus's
+    /// own wait for them, or the disk's journal commits the two in turn.
+    pub(crate) urgent: AtomicU64,
+    /// Whether the last save written failed (see `note_failed`).
+    failing: std::sync::atomic::AtomicBool,
+    /// Files a save replaced, kept for later saves to write over (see
+    /// `write_temp_for`).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    spares: parking_lot::Mutex<Vec<std::path::PathBuf>>,
     /// The newest that failed, and why.
     failed: parking_lot::Mutex<(u64, String)>,
     /// Signalled whenever a save ends.
@@ -714,17 +935,32 @@ pub struct Saves {
 }
 
 impl Saves {
-    fn note_saved(&self, generation: u64) {
+    /// `written`: the save was written and put in place (not skipped as
+    /// unchanged), and so tells that saves work again.
+    fn note_saved(&self, generation: u64, written: bool) {
         self.synced.fetch_max(generation, Ordering::SeqCst);
+        if written && self.failing.swap(false, Ordering::SeqCst) {
+            log_warn!("Cluster: the cluster config file is saved again");
+        }
         self.signal();
     }
 
+    /// Logged once, as an error, when saves start failing (a disk that is
+    /// full or read-only fails every one, and the bus saves often), and once
+    /// more when one works again.
     fn note_failed(&self, generation: u64, e: &std::io::Error) {
         {
             let mut failed = self.failed.lock();
             if generation > failed.0 {
                 *failed = (generation, e.to_string());
             }
+        }
+        if !self.failing.swap(true, Ordering::SeqCst) {
+            log_error!(
+                "Cluster: could not save the cluster config file: {e}. Until it can be, \
+                 changes of topology are not on disk, no node met is made a member, and no \
+                 vote is cast"
+            );
         }
         self.signal();
     }
@@ -752,8 +988,10 @@ pub fn wait_for_save(
     let saves = &state.saves;
     if saves.written.load(Ordering::SeqCst) < from {
         // Its outcome is noted in `saves`, below.
+        saves.urgent.fetch_add(1, Ordering::SeqCst);
         state.refresh_state();
         let _ = save_from_state(state);
+        saves.urgent.fetch_sub(1, Ordering::SeqCst);
     }
     let mut held = saves.ended_lock.lock();
     loop {
@@ -1147,6 +1385,8 @@ mod tests {
             "nodes.conf.tmp-x",
             "other.conf.tmp-1",
             "nodes.conf.bak",
+            "nodes.conf.spare-0",
+            "nodes.conf.spare-x",
         ] {
             std::fs::write(dir.path().join(name), "x").unwrap();
         }
@@ -1161,6 +1401,7 @@ mod tests {
             [
                 "nodes.conf",
                 "nodes.conf.bak",
+                "nodes.conf.spare-x",
                 "nodes.conf.tmp-x",
                 "other.conf.tmp-1"
             ]

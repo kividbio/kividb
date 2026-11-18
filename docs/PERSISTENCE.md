@@ -502,7 +502,12 @@ until each one lists it, and send each `CLUSTER SAVECONFIG`.
 **How it is written.** To a temporary file beside it
 (`nodes.conf.tmp-<n>`), synced, renamed over it, and the directory synced:
 a crash at any moment leaves the old file or the new one, never part of
-one. Temporary files a crash left are removed at startup. The one
+one. On Linux the file a save replaces is not removed: the two are
+exchanged, and once the save is synced the next save writes over the old
+one in place, so that it waits on one sync of the disk's journal (the
+rename's) rather than two. nodes.conf is then 64 KiB long, blank lines
+after its `vars` line, which every version reads. Temporary files a crash
+left are removed at startup. The one
 exception is the takeover at the end of a slot migration's handover, which
 does not wait for the sync while client writes are paused: a power failure
 in the moment after it can leave the file incomplete.

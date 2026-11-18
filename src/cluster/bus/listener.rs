@@ -372,7 +372,11 @@ pub fn process_message(
                 // with the file would let this node, restarted, vote again in
                 // the same epoch. Not saved, it is not sent, and this node
                 // does not vote in that epoch (it has recorded it as voted).
-                if let Err(e) = state.save_to_disk() {
+                // Saved as a node met is: by the first save begun after it,
+                // one already under way included, not one save a vote.
+                let from = state.saves.written.load(Ordering::SeqCst) + 1;
+                let deadline = std::time::Instant::now() + crate::cluster::ELECTION_LIFETIME;
+                if let Err(e) = crate::cluster::persist::wait_for_save(state, from, deadline) {
                     log_warn!(
                         "Cluster: Did not vote for {} at epoch {}: the vote could not be saved ({e})",
                         node_id_str(&sender_id),
