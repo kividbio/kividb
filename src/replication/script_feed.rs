@@ -158,6 +158,16 @@ pub fn commands_for_propagation(
 /// them out is done all the same (the effects it takes are taken), but a
 /// command sent as it came is not copied only to be counted (#901).
 pub fn propagation_count(ctx: &Ctx<'_>, name: &str, cmd: &[&[u8]], resp: &[u8]) -> usize {
+    // What the commands scripts write most with always give, read without
+    // building it: `set_feed`, `setex_feed` one command; `expire_feed` one
+    // (a `PEXPIREAT` or a `DEL`) for a call answered 1 and none otherwise.
+    match name {
+        "SET" | "SETEX" | "PSETEX" => return 1,
+        "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => {
+            return usize::from(cmd.len() >= 3 && parse_resp_integer(resp) == Some(1));
+        }
+        _ => {}
+    }
     rewritten_for_propagation(ctx, name, cmd, resp)
         .map_or(usize::from(!cmd.is_empty()), |feeds| feeds.len())
 }

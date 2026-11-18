@@ -127,10 +127,11 @@ return struct
 
 /// Scripts by SHA1. A source is shared with whoever runs it: scripts are a
 /// few kilobytes each, and one was copied whole for every call.
-static SCRIPT_STORE: OnceLock<RwLock<HashMap<String, Arc<str>>>> = OnceLock::new();
+static SCRIPT_STORE: OnceLock<RwLock<ahash::AHashMap<String, Arc<str>>>> = OnceLock::new();
 
-fn script_store() -> &'static RwLock<HashMap<String, Arc<str>>> {
-    SCRIPT_STORE.get_or_init(|| RwLock::new(HashMap::new()))
+fn script_store() -> &'static RwLock<ahash::AHashMap<String, Arc<str>>> {
+    // Looked up by every EVALSHA: ahash, not SipHash (#901).
+    SCRIPT_STORE.get_or_init(|| RwLock::new(ahash::AHashMap::new()))
 }
 
 /// How many scripts sent only with `EVAL` the cache keeps, as Redis 7.4:
@@ -143,7 +144,7 @@ const EVAL_SCRIPTS_MAX: usize = 500;
 #[derive(Default)]
 struct EvalScripts {
     by_use: std::collections::BTreeMap<u64, String>,
-    last_used: HashMap<String, u64>,
+    last_used: ahash::AHashMap<String, u64>,
     clock: u64,
 }
 
