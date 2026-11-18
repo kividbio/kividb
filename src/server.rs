@@ -546,6 +546,8 @@ const BIG_BUFFER: usize = 256 * 1024;
 const READ_SIZE: usize = 4 * 1024;
 /// The most a read brings, and what a full read grows the buffer to.
 const READ_BUFFER: usize = 32 * 1024;
+/// Reads in a row that `READ_SIZE` would have held before a grown buffer shrinks.
+const SHORT_READS: u32 = 4;
 
 /// Write one response batch straight to TCP (normal client hot path).
 #[inline]
@@ -820,6 +822,9 @@ where
 
     // ── Connection state ─────────────────────────────────────────────────
     let mut buffer = Vec::with_capacity(READ_SIZE);
+    // Reads in a row under `READ_SIZE`, and whether the last filled its room.
+    let mut short_reads = 0u32;
+    let mut last_read_full = false;
     let mut private_query_buffer = false;
     query_buffer.update(0, buffer.capacity(), private_query_buffer);
     let mut last_query_buffer_activity = Instant::now();
@@ -906,6 +911,12 @@ where
         let was_private_at_read = private_query_buffer;
         let skip_read = std::mem::take(&mut reparse);
         if carried.is_empty() && !skip_read {
+            // Only small requests lately: an empty, grown buffer goes back to `READ_SIZE`.
+            if short_reads >= SHORT_READS && buffer.is_empty() && buffer.capacity() > READ_SIZE {
+                buffer = Vec::with_capacity(READ_SIZE);
+                private_query_buffer = false;
+                query_buffer.update(0, buffer.capacity(), private_query_buffer);
+            }
             // First, so any room past `READ_SIZE` takes the capped read below.
             if buffer.capacity() - buffer.len() < READ_SIZE {
                 buffer.reserve(READ_SIZE);
@@ -916,9 +927,9 @@ where
             // the timer arm is only built then; every other read — including
             // every read of a client that is not sitting on a private buffer —
             // races just the socket and `kill_rx`.
-            // A buffer grown only for bigger reads is given back too, once empty.
+            // A grown buffer is given back too once empty, unless more is waiting.
             let should_maintain_query_buffer = (private_query_buffer
-                || (buffer.is_empty() && buffer.capacity() > READ_SIZE))
+                || (buffer.is_empty() && buffer.capacity() > READ_SIZE && !last_read_full))
                 && buffer.capacity().saturating_sub(buffer.len())
                     > resp::parse::QUERY_BUFFER_MIN_SPARE_FOR_RESIZE;
             let room = buffer.capacity() - buffer.len();
@@ -1010,12 +1021,18 @@ where
             if n == room && buffer.capacity() < READ_BUFFER {
                 buffer.reserve(READ_BUFFER - buffer.len());
             }
+            last_read_full = n == room;
+            short_reads = if n < READ_SIZE {
+                short_reads.saturating_add(1)
+            } else {
+                0
+            };
             // Bytes arrived from the socket: the client is active, so its idle
             // clock restarts. Once per read, not once per command — a pipeline
             // that arrives together is one interaction. The timer arm above
             // `continue`s, so it never reaches here.
             activity.touch();
-            if was_private_at_read || buffer.capacity() > READ_SIZE {
+            if was_private_at_read || (buffer.capacity() > READ_SIZE && !last_read_full) {
                 last_query_buffer_activity = Instant::now();
             }
             crate::stats::TOTAL_NET_INPUT_BYTES

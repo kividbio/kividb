@@ -255,7 +255,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Improved Tokio pipelined request throughput by reading directly into an
   adaptive query buffer, reducing unnecessary copies and idle connection
-  memory (#432).**
+  memory (#432).** On an Apple M3 Pro, `SET` of 1 KiB values at pipeline
+  depth 32 went from 267k to 599k requests a second, and of 4 KiB values
+  from 60k to 240k. This applies wherever the Tokio loop serves clients: on
+  macOS and Windows, and on Linux with `--io-model tokio` or when the
+  default `--io-model auto` finds io_uring unavailable (under Docker's
+  default seccomp profile, for one). TLS connections use the Tokio loop
+  under either model.
 
 - **Small hashes take less than half the memory.** A hash of up to 512
   fields, no field or value longer than 64 bytes, is kept in one block, each

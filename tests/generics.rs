@@ -1492,37 +1492,64 @@ fn test_large_pipeline_is_read_in_larger_reads_until_idle() {
     let port = free_port();
     start_server(port);
     let mut client = Conn::connect(port);
+    let mut observer = Conn::connect(port);
+    let addr = client.stream.local_addr().unwrap().to_string();
     let value = "v".repeat(994);
     // Each SET is 1 KiB on the wire, so a 4 KiB read ends between commands.
     let pipeline: String = (0..20)
         .map(|i| format!("*3\r\n$3\r\nSET\r\n$3\r\nk{i:02}\r\n$994\r\n{value}\r\n"))
         .collect();
     assert_eq!(pipeline.len(), 20 * 1024);
-    let read_events = |client: &mut Conn| -> u64 {
-        let info = client.cmds(&["CLIENT", "INFO"]);
-        client_list_field(info.as_str(), "read-events=")
+    // Asked on the observer, so the client sends nothing after its pipeline.
+    let client_line = |observer: &mut Conn| -> String {
+        let listing = observer.cmds(&["CLIENT", "LIST"]);
+        let line = listing
+            .as_str()
+            .lines()
+            .find(|line| client_list_field(line, "addr=") == Some(addr.as_str()));
+        line.unwrap().to_string()
+    };
+    let read_events = |observer: &mut Conn| -> u64 {
+        let line = client_line(observer);
+        client_list_field(&line, "read-events=")
             .unwrap()
             .parse()
             .unwrap()
     };
     // The reads a pipeline takes when all of it is waiting.
-    let reads_for_pipeline = |client: &mut Conn| -> u64 {
-        let before = read_events(client);
+    let mut reads_for_pipeline = |client: &mut Conn| -> u64 {
+        let before = read_events(&mut observer);
         client
             .stream
             .write_all(b"*3\r\n$5\r\nDEBUG\r\n$5\r\nSLEEP\r\n$4\r\n0.05\r\n")
             .unwrap();
-        thread::sleep(Duration::from_millis(20));
+        // Sent once the sleep runs, so none of it shares the sleep's read.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while client_list_field(&client_line(&mut observer), "cmd=") != Some("debug") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "DEBUG SLEEP never ran"
+            );
+        }
         client.stream.write_all(pipeline.as_bytes()).unwrap();
         for _ in 0..21 {
             assert_eq!(client.read_value().as_str(), "OK");
         }
-        // Less the reads of DEBUG SLEEP and CLIENT INFO.
-        read_events(client) - before - 2
+        // Less the read of DEBUG SLEEP.
+        read_events(&mut observer) - before - 1
     };
 
     assert_eq!(reads_for_pipeline(&mut client), 2, "4 KiB, then the rest");
     assert_eq!(reads_for_pipeline(&mut client), 1, "room kept while busy");
+    for _ in 0..4 {
+        client.cmds(&["PING"]);
+    }
+    assert_eq!(
+        reads_for_pipeline(&mut client),
+        2,
+        "given back after small reads"
+    );
+    // Idle straight after a pipeline.
     thread::sleep(Duration::from_millis(400));
     assert_eq!(reads_for_pipeline(&mut client), 2, "given back when idle");
     assert_eq!(client.cmds(&["GET", "k19"]).as_str(), value);
