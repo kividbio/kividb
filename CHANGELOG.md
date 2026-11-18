@@ -262,6 +262,61 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`SCAN` with a large `COUNT` takes 30-40 % less time, and holds up the
+  connections beside it that much less (#884).** Argo CD sends `SCAN 0 MATCH
+  revoked-token|* COUNT 10000` from every API server, over a keyspace
+  where no key matches. Each page of a shard took two passes over the
+  shard's table: the first counted the keys at each of the 4,096 positions
+  a scan goes through, a count cleared and summed again for every page
+  that cost more than the walk itself for shards of a few thousand keys.
+  The second read the entries of the page one after the other, each a
+  cache miss, with the shard locked for reading throughout. A page is now
+  one pass over the table. A page that may take the rest of the shard
+  asks for each entry's header and key as the walk finds it and reads
+  them 16 at a time. A smaller page first gathers the slots of the
+  positions that should hold `COUNT` keys and a margin (a key's position
+  is a fragment of its hash, so keys spread evenly over them), without a
+  branch on the position, then counts them and ends where `COUNT` is
+  reached; when more keys are there than the shard's length says (each
+  page deleted as soon as it is returned) it drops what is past `COUNT` as
+  it goes, and when fewer (the keys before the cursor deleted) it reaches
+  on to the end of the shard, a second pass. So a page holds what it held
+  before: `COUNT` keys and those that share the last one's position, or
+  the rest of the shard, and never comes back empty while keys are left
+  in it. A key that does not match is still neither copied nor told its
+  type or time to live, and values are never read: 50 KB values cost a
+  scan nothing more than 32-byte ones. What `SCAN` promises is unchanged:
+  a key there for the whole scan is returned, through growth and
+  shrinking of the tables, with `TYPE`, `MATCH` and keys past their time as
+  before. On an Azure D4s_v5, `--threads 4`, Valkey 8.1 with
+  `--io-threads 4` and Redis 8.10.2 on the same VM:
+
+  | | before | now | Valkey 8.1 | Redis 8.10.2 |
+  |---|---|---|---|---|
+  | 40,000 keys of 50 KB: instructions a key looked at | 141 | 97 | | |
+  | server time a call (`INFO commandstats`) | 205 us | 125 us | 191 us | 649 us |
+  | calls a second, 4 connections | 12.5k | 18.2k | 4.8k | 1.5k |
+  | calls a second, 48 connections | 14.9k | 23.2k | 3.0k | 1.6k |
+  | p99 of a `GET` stream on 16 other connections while 4 scan | 1.12 ms | 0.86 ms | 3.36 ms | 4.29 ms |
+  | 1,000,000 keys of 32 bytes: instructions a key looked at | 223 | 212 | | |
+  | server time a call | 505 us | 341 us | 356 us | 843 us |
+  | calls a second, 4 connections | 6.0k | 8.4k | 2.7k | 1.2k |
+  | p99 of the `GET` stream while 4 scan | 1.65 ms | 1.11 ms | 3.81 ms | 5.31 ms |
+  | 1,000,000 keys deleted by `SCAN ... COUNT 1000` and `DEL` of each reply: largest reply | 2,321 | 2,290 | | |
+  | the same: time to delete them all | 2.61 s | 2.29 s | | |
+
+  (The `GET` stream is 16,000 a second, 0.14-0.19 ms at p99 with no scan;
+  Valkey and Redis, which run commands on one thread, served 7,700-9,000
+  and 4,600-4,900 a second of it while the scans ran. The largest replies
+  of the `DEL` loop are `COUNT` and a shard's floor of a sixteenth of its
+  keys, taken when a call starts in a shard it does not finish.) A
+  connection served by the same thread as a running `SCAN` still waits for
+  it, as with any command on the io_uring loop. With `lua-parallel-scripts yes`, `SCAN` still takes the command
+  gate alone (#772): unlike Redis's, a call goes through the keyspace a
+  shard at a time, and without the gate it could find a script's keys
+  halfway through what the script does. Regression suite
+  `22-scan-large-count` measures it.
+
 - **Auto worker threads: one per available CPU (#873).** `--threads 0`
   started the CPUs minus 2 (all of them below 4), so a 4-vCPU machine or
   container got 2 workers. Measured with the server confined to 4 vCPUs and
