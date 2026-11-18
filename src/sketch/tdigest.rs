@@ -52,6 +52,20 @@ pub struct TDigest {
     pub min: f64,
     pub max: f64,
     pub total_compressions: u64,
+    /// The merged view of a digest with unmerged centroids, made by the
+    /// first query after a write and dropped by the next write. It is not
+    /// part of the digest: never saved, sent or compared.
+    pub view_cache: ViewCache,
+}
+
+/// A digest's cached merged view (see `TDigest::view`).
+#[derive(Clone, Debug, Default)]
+pub struct ViewCache(std::sync::OnceLock<Vec<Centroid>>);
+
+impl PartialEq for ViewCache {
+    fn eq(&self, _: &ViewCache) -> bool {
+        true
+    }
 }
 
 /// The capacity of a digest of `compression`: Redis's.
@@ -77,6 +91,7 @@ impl TDigest {
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
             total_compressions: 0,
+            view_cache: ViewCache::default(),
         }
     }
 
@@ -99,11 +114,14 @@ impl TDigest {
 
     /// What it takes in memory beyond the struct.
     pub fn memory_bytes(&self) -> usize {
-        (self.merged.capacity() + self.unmerged.capacity()) * std::mem::size_of::<Centroid>()
+        let cached = self.view_cache.0.get().map_or(0, Vec::capacity);
+        (self.merged.capacity() + self.unmerged.capacity() + cached)
+            * std::mem::size_of::<Centroid>()
     }
 
     /// Add `weight` of `value` (finite, checked by the caller).
     pub fn add(&mut self, value: f64, weight: f64) {
+        self.view_cache = ViewCache::default();
         if self.merged.len() + self.unmerged.len() >= self.capacity() {
             self.compress();
         }
@@ -118,6 +136,7 @@ impl TDigest {
 
     /// Add another digest's centroids (its min and max too).
     pub fn add_digest(&mut self, other: &TDigest) {
+        self.view_cache = ViewCache::default();
         for c in other.merged.iter().chain(other.unmerged.iter()) {
             if self.merged.len() + self.unmerged.len() >= self.capacity() {
                 self.compress();
@@ -141,6 +160,7 @@ impl TDigest {
 
     /// Merge the unmerged centroids in.
     pub fn compress(&mut self) {
+        self.view_cache = ViewCache::default();
         if self.unmerged.is_empty() {
             return;
         }
@@ -174,16 +194,17 @@ impl TDigest {
         self.total_compressions += 1;
     }
 
-    /// Its centroids, merged, without changing it: a copy merged if it has
-    /// unmerged ones.
-    fn view(&self) -> std::borrow::Cow<'_, [Centroid]> {
+    /// Its centroids, merged, without changing it: if it has unmerged ones,
+    /// those of a merged copy, made once and kept until the next write.
+    fn view(&self) -> &[Centroid] {
         if self.unmerged.is_empty() {
-            std::borrow::Cow::Borrowed(&self.merged)
-        } else {
+            return &self.merged;
+        }
+        self.view_cache.0.get_or_init(|| {
             let mut copy = self.clone();
             copy.compress();
-            std::borrow::Cow::Owned(copy.merged)
-        }
+            copy.merged
+        })
     }
 
     /// The value at quantile `q` in [0, 1]; NaN for an empty digest.
@@ -194,7 +215,7 @@ impl TDigest {
     /// Several quantiles from one view.
     pub fn quantiles(&self, qs: &[f64]) -> Vec<f64> {
         let c = self.view();
-        qs.iter().map(|&q| self.quantile_in(&c, q)).collect()
+        qs.iter().map(|&q| self.quantile_in(c, q)).collect()
     }
 
     fn quantile_in(&self, c: &[Centroid], q: f64) -> f64 {
@@ -256,7 +277,7 @@ impl TDigest {
     /// for an empty digest.
     pub fn cdfs(&self, xs: &[f64]) -> Vec<f64> {
         let c = self.view();
-        xs.iter().map(|&x| self.cdf_in(&c, x)).collect()
+        xs.iter().map(|&x| self.cdf_in(c, x)).collect()
     }
 
     fn cdf_in(&self, c: &[Centroid], x: f64) -> f64 {
@@ -450,6 +471,7 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<TDigest> {
         min: if empty { f64::INFINITY } else { min },
         max: if empty { f64::NEG_INFINITY } else { max },
         total_compressions,
+        view_cache: ViewCache::default(),
     })
 }
 
@@ -465,6 +487,40 @@ mod tests {
     }
 
     /// Exact where every centroid is a value: Redis's answers for 1..10.
+    /// A query's cached view is dropped by the next write: answers equal
+    /// those of a copy without one, after every kind of write.
+    #[test]
+    fn view_cache_follows_writes() {
+        let mut seed = 11;
+        let mut t = TDigest::new(20);
+        for i in 0..3000 {
+            let v = rng(&mut seed) * 1000.0;
+            match i % 5 {
+                0 => {
+                    let mut other = TDigest::new(30);
+                    other.add(v, 2.0);
+                    other.add(-v, 1.0);
+                    t.add_digest(&other);
+                }
+                1 => t.compress(),
+                _ => t.add(v, 1.0),
+            }
+            if i % 3 == 0 {
+                let mut uncached = t.clone();
+                uncached.view_cache = ViewCache::default();
+                for q in [0.0, 0.01, 0.5, 0.99, 1.0] {
+                    assert_eq!(t.quantile(q).to_bits(), uncached.quantile(q).to_bits());
+                    assert_eq!(t.quantile(q).to_bits(), t.quantile(q).to_bits());
+                }
+                assert_eq!(t.cdfs(&[v])[0].to_bits(), uncached.cdfs(&[v])[0].to_bits());
+                assert_eq!(
+                    t.trimmed_mean(0.1, 0.9).to_bits(),
+                    uncached.trimmed_mean(0.1, 0.9).to_bits()
+                );
+            }
+        }
+    }
+
     #[test]
     fn singletons_are_exact() {
         let mut t = TDigest::new(100);
