@@ -817,6 +817,16 @@ const READ_BUFFER: usize = 32 * 1024;
 /// first, so a read never lands in a sliver of free space.
 const READ_MIN: usize = 8 * 1024;
 
+/// Where a read into `buf` ends: `READ_BUFFER` past what it holds, or the
+/// whole of a large argument that is still arriving, as Redis sizes a read;
+/// not all the room of a large private query buffer, which a pipeline would
+/// fill with more commands than a read's worth (#893).
+#[inline]
+fn read_end(buf: &Vec<u8>, progress: &resp::parse::Progress) -> usize {
+    buf.capacity()
+        .min(buf.len() + READ_BUFFER.max(progress.minimum_capacity()))
+}
+
 /// A connection's subscriptions, made at its first SUBSCRIBE, with the task
 /// that writes its messages. On this thread: the stream is not `Send`. It
 /// shares the fd with the connection loop and the push task, hence the guard.
@@ -1190,7 +1200,8 @@ pub async fn handle_client(
                 parse_buf.reserve(READ_BUFFER);
             }
             let unparsed = parse_buf.len();
-            let (res, buffer) = stream.read(parse_buf.slice(unparsed..)).await;
+            let end = read_end(&parse_buf, &progress);
+            let (res, buffer) = stream.read(parse_buf.slice(unparsed..end)).await;
             parse_buf = buffer.into_inner();
             match res {
                 Ok(0) => break,
@@ -1260,10 +1271,15 @@ pub async fn handle_client(
         // Outside the parse loop: a park in one turn hands its delivery to
         // the re-dispatch on the next turn.
         let mut blocking_slot = crate::commands::blocking::BlockingSlot::default();
-        // The next turn dispatches the command of this one again: a parked
-        // command resumed, or a write a pause sent back to be held. It is
-        // the same command: not recorded, settled or begun again.
-        let mut redispatch = false;
+        // What is due before the next command (`output_limits::REDISPATCH`,
+        // `WATCH`). REDISPATCH: the next turn dispatches the command of this
+        // one again: a parked command resumed, or a write a pause sent back
+        // to be held. It is the same command: not recorded, settled or begun
+        // again. WATCH: the replies have room to be over an output limit,
+        // and are looked at before each command (#893).
+        let mut due = crate::output_limits::due_at_turn_start(&out_buf, pubsub.limits());
+        // Closed for its output buffer between two commands of this turn.
+        let mut output_limit_closed = false;
 
         // What the client sent that no request can begin with, if it did.
         let mut protocol_error: Option<String> = None;
@@ -1331,15 +1347,35 @@ pub async fn handle_client(
             // For `CLIENT LIST`'s `cmd=` and `db=`, and `tot-cmds`. Not again
             // for a blocked command dispatched once more with what it waited
             // for: it is one command.
-            if !redispatch && !blocking_slot.resuming() {
-                activity.record(&cmd, selected_db);
+            if due == 0 {
+                if !blocking_slot.resuming() {
+                    activity.record(&cmd, selected_db);
+                }
+            } else {
+                // `client-output-buffer-limit` after each reply: see the
+                // matching arm in `src/server.rs` (#893).
+                if due & crate::output_limits::WATCH != 0
+                    && reply_limit.closes_after_reply(
+                        pubsub.limits(),
+                        subscriptions.is_some(),
+                        out_buf.len(),
+                        client_id,
+                    )
+                {
+                    output_limit_closed = true;
+                    break;
+                }
+                if due & crate::output_limits::REDISPATCH == 0 && !blocking_slot.resuming() {
+                    activity.record(&cmd, selected_db);
+                }
             }
             if !aof_wait && crate::aof::acks_wait() && crate::aof::may_log(&cmd) {
                 aof_wait = true;
             }
             // The command before this one is over: its reply is settled, and
             // what it left to tell tracking clients follows it.
-            if std::mem::take(&mut redispatch) {
+            if due & crate::output_limits::REDISPATCH != 0 {
+                due &= !crate::output_limits::REDISPATCH;
                 // A `CLIENT REPLY SKIP` before it is for the dispatch that
                 // replies, not used up by the one that did not.
                 reply_gate.again(&out_buf);
@@ -1498,7 +1534,7 @@ pub async fn handle_client(
                     // set, and did not run (`pause::HELD_IN_GATE`): read
                     // again, and held by the pause check.
                     if crate::pause::is_held(&response) {
-                        redispatch = true;
+                        due |= crate::output_limits::REDISPATCH;
                         continue;
                     }
                     if slowlog_enabled && elapsed_us >= slowlog.threshold_us() {
@@ -1508,7 +1544,12 @@ pub async fn handle_client(
                             .unwrap_or_default();
                         slowlog.record(&cmd, elapsed_us, &peer_addr, client_name);
                     }
-                    out_buf.extend_from_slice(&response);
+                    crate::output_limits::append_reply(
+                        &mut out_buf,
+                        &response,
+                        &mut due,
+                        pubsub.limits(),
+                    );
                     parse_offset += consumed;
                     continue;
                 }
@@ -1582,7 +1623,7 @@ pub async fn handle_client(
                             // `parse_offset` deliberately not advanced: the same
                             // command is re-dispatched, now carrying the delivery.
                             Ok(()) => {
-                                redispatch = true;
+                                due |= crate::output_limits::REDISPATCH;
                                 continue;
                             }
                             Err(reply) => response = reply,
@@ -1604,7 +1645,12 @@ pub async fn handle_client(
                         quit_requested = true;
                         break;
                     }
-                    out_buf.extend_from_slice(&response);
+                    crate::output_limits::append_reply(
+                        &mut out_buf,
+                        &response,
+                        &mut due,
+                        pubsub.limits(),
+                    );
                     parse_offset += consumed;
                     continue;
                 }
@@ -1677,7 +1723,7 @@ pub async fn handle_client(
                     {
                         // See the note at the non-slowlog site above.
                         Ok(()) => {
-                            redispatch = true;
+                            due |= crate::output_limits::REDISPATCH;
                             continue;
                         }
                         Err(reply) => response = reply,
@@ -1719,7 +1765,12 @@ pub async fn handle_client(
                         slowlog.record(&slow_cmd, elapsed_us, &peer_addr, client_name);
                     }
                 }
-                out_buf.extend_from_slice(&response);
+                crate::output_limits::append_reply(
+                    &mut out_buf,
+                    &response,
+                    &mut due,
+                    pubsub.limits(),
+                );
                 parse_offset += consumed;
                 continue;
             }
@@ -1812,7 +1863,8 @@ pub async fn handle_client(
                 let subs = subscriptions.get_or_insert_with(|| {
                     open_subscriptions(&pubsub, &client_registry, client_id, &stream, &write_guard)
                 });
-                out_buf.extend_from_slice(&subs.handle(&cmd, resp_version & RESP_VERSION));
+                let reply = subs.handle(&cmd, resp_version & RESP_VERSION);
+                crate::output_limits::append_reply(&mut out_buf, &reply, &mut due, pubsub.limits());
                 if subs.total() == 0 {
                     subscriptions = None;
                 }
@@ -2161,7 +2213,7 @@ pub async fn handle_client(
                         if crate::pause::writes_must_check(routed.at())
                             && crate::pause::exec_held_in_gate(&tx.queue)
                         {
-                            redispatch = true;
+                            due |= crate::output_limits::REDISPATCH;
                             continue;
                         }
                         // One time for the whole transaction, as Redis's
@@ -3020,7 +3072,7 @@ pub async fn handle_client(
             // A write that got past a `CLIENT PAUSE` before it was set, and
             // went no further (`pause::HELD_IN_GATE`): read again, and held.
             if crate::pause::is_held(&response) {
-                redispatch = true;
+                due |= crate::output_limits::REDISPATCH;
                 continue;
             }
             // `SHUTDOWN` that goes ahead is answered with nothing, and the
@@ -3082,7 +3134,7 @@ pub async fn handle_client(
             if cmd_name == "CLIENT" {
                 resp_version = with_no_touch(resp_version, client_registry.get_no_touch(client_id));
             }
-            out_buf.extend_from_slice(&response);
+            crate::output_limits::append_reply(&mut out_buf, &response, &mut due, pubsub.limits());
             parse_offset += consumed;
         }
         private_query_buffer |= progress.take_private_query_buffer();
@@ -3166,6 +3218,10 @@ pub async fn handle_client(
         // `client-output-buffer-limit` (#774): replies over the hard limit,
         // or over the soft limit for longer than its seconds, end the
         // connection unwritten, as Redis drops such a client and its output.
+        // Already closed for it, between two commands (#893).
+        if output_limit_closed {
+            break;
+        }
         let mut write_within = None;
         if pubsub.limits().may_exceed(out_buf.len()) {
             use crate::output_limits::{Class, Verdict};
@@ -3211,9 +3267,10 @@ pub async fn handle_client(
                         parse_buf.reserve(READ_BUFFER);
                     }
                     early_from = parse_buf.len();
-                    early.set(Some(
-                        reader.read(std::mem::take(&mut parse_buf).slice(early_from..)),
-                    ));
+                    early.set(Some(reader.read({
+                        let end = read_end(&parse_buf, &progress);
+                        std::mem::take(&mut parse_buf).slice(early_from..end)
+                    })));
                     let mut write = std::pin::pin!(stream.write_all(spare_buf));
                     let read = early.as_mut().as_pin_mut().expect("submitted above");
                     tokio::select! {

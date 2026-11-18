@@ -1045,10 +1045,15 @@ where
         // Outside the parse loop: a park in one turn hands its delivery to the
         // re-dispatch on the next turn.
         let mut blocking_slot = crate::commands::blocking::BlockingSlot::default();
-        // The next turn dispatches the command of this one again: a parked
-        // command resumed, or a write a pause sent back to be held. It is
-        // the same command: not recorded, settled or begun again.
-        let mut redispatch = false;
+        // What is due before the next command (`output_limits::REDISPATCH`,
+        // `WATCH`). REDISPATCH: the next turn dispatches the command of this
+        // one again: a parked command resumed, or a write a pause sent back
+        // to be held. It is the same command: not recorded, settled or begun
+        // again. WATCH: the replies have room to be over an output limit,
+        // and are looked at before each command (#893).
+        let mut due = crate::output_limits::due_at_turn_start(&combined, pubsub.limits());
+        // Closed for its output buffer between two commands of this turn.
+        let mut output_limit_closed = false;
 
         // What the client sent that no request can begin with, if it did.
         let mut protocol_error: Option<String> = None;
@@ -1115,15 +1120,40 @@ where
             // For `CLIENT LIST`'s `cmd=` and `db=`, and `tot-cmds`. Not again
             // for a blocked command dispatched once more with what it waited
             // for: it is one command.
-            if !redispatch && !blocking_slot.resuming() {
-                activity.record(&cmd, selected_db);
+            if due == 0 {
+                if !blocking_slot.resuming() {
+                    activity.record(&cmd, selected_db);
+                }
+            } else {
+                // `client-output-buffer-limit`, after each reply once the
+                // replies could be over it (#893): a client over its hard
+                // limit is closed before this command runs, as Redis closes
+                // it at the limit and one reply, and its replies are dropped.
+                // What ran before is applied, and logged and replicated as
+                // it ran; a transaction or a script is one command, and is
+                // never cut in two.
+                if due & crate::output_limits::WATCH != 0
+                    && reply_limit.closes_after_reply(
+                        pubsub.limits(),
+                        subscriptions.is_some(),
+                        combined.len(),
+                        client_id,
+                    )
+                {
+                    output_limit_closed = true;
+                    break;
+                }
+                if due & crate::output_limits::REDISPATCH == 0 && !blocking_slot.resuming() {
+                    activity.record(&cmd, selected_db);
+                }
             }
             if !aof_wait && crate::aof::acks_wait() && crate::aof::may_log(&cmd) {
                 aof_wait = true;
             }
             // The command before this one is over: its reply is settled, and
             // what it left to tell tracking clients follows it.
-            if std::mem::take(&mut redispatch) {
+            if due & crate::output_limits::REDISPATCH != 0 {
+                due &= !crate::output_limits::REDISPATCH;
                 // A `CLIENT REPLY SKIP` before it is for the dispatch that
                 // replies, not used up by the one that did not.
                 reply_gate.again(&combined);
@@ -1282,7 +1312,7 @@ where
                     // set, and did not run (`pause::HELD_IN_GATE`): read
                     // again, and held by the pause check.
                     if crate::pause::is_held(&response) {
-                        redispatch = true;
+                        due |= crate::output_limits::REDISPATCH;
                         continue;
                     }
                     if slowlog_enabled && elapsed_us >= slowlog.threshold_us() {
@@ -1292,7 +1322,12 @@ where
                             .unwrap_or_default();
                         slowlog.record(&cmd, elapsed_us, &peer_addr, client_name);
                     }
-                    combined.extend_from_slice(&response);
+                    crate::output_limits::append_reply(
+                        &mut combined,
+                        &response,
+                        &mut due,
+                        pubsub.limits(),
+                    );
                     parse_offset += consumed;
                     continue;
                 }
@@ -1370,7 +1405,7 @@ where
                             // `parse_offset` deliberately not advanced: the same
                             // command is re-dispatched, now carrying the delivery.
                             Ok(()) => {
-                                redispatch = true;
+                                due |= crate::output_limits::REDISPATCH;
                                 continue;
                             }
                             Err(reply) => response = reply,
@@ -1392,7 +1427,12 @@ where
                         quit_requested = true;
                         break;
                     }
-                    combined.extend_from_slice(&response);
+                    crate::output_limits::append_reply(
+                        &mut combined,
+                        &response,
+                        &mut due,
+                        pubsub.limits(),
+                    );
                     parse_offset += consumed;
                     continue;
                 }
@@ -1468,7 +1508,7 @@ where
                     {
                         // See the note at the non-slowlog site above.
                         Ok(()) => {
-                            redispatch = true;
+                            due |= crate::output_limits::REDISPATCH;
                             continue;
                         }
                         Err(reply) => response = reply,
@@ -1510,7 +1550,12 @@ where
                         slowlog.record(&slow_cmd, elapsed_us, &peer_addr, client_name);
                     }
                 }
-                combined.extend_from_slice(&response);
+                crate::output_limits::append_reply(
+                    &mut combined,
+                    &response,
+                    &mut due,
+                    pubsub.limits(),
+                );
                 parse_offset += consumed;
                 continue;
             }
@@ -1602,7 +1647,13 @@ where
                 let subs = subscriptions.get_or_insert_with(|| {
                     open_subscriptions(&pubsub, &client_registry, client_id, &writer)
                 });
-                combined.extend_from_slice(&subs.handle(&cmd, resp_version & RESP_VERSION));
+                let reply = subs.handle(&cmd, resp_version & RESP_VERSION);
+                crate::output_limits::append_reply(
+                    &mut combined,
+                    &reply,
+                    &mut due,
+                    pubsub.limits(),
+                );
                 if subs.total() == 0 {
                     subscriptions = None;
                 }
@@ -1951,7 +2002,7 @@ where
                         if crate::pause::writes_must_check(routed.at())
                             && crate::pause::exec_held_in_gate(&tx.queue)
                         {
-                            redispatch = true;
+                            due |= crate::output_limits::REDISPATCH;
                             continue;
                         }
                         // One time for the whole transaction, as Redis's
@@ -2809,7 +2860,7 @@ where
             // A write that got past a `CLIENT PAUSE` before it was set, and
             // went no further (`pause::HELD_IN_GATE`): read again, and held.
             if crate::pause::is_held(&response) {
-                redispatch = true;
+                due |= crate::output_limits::REDISPATCH;
                 continue;
             }
             // `SHUTDOWN` that goes ahead is answered with nothing, and the
@@ -2871,7 +2922,7 @@ where
             if cmd_name == "CLIENT" {
                 resp_version = with_no_touch(resp_version, client_registry.get_no_touch(client_id));
             }
-            combined.extend_from_slice(&response);
+            crate::output_limits::append_reply(&mut combined, &response, &mut due, pubsub.limits());
             parse_offset += consumed;
         }
         private_query_buffer |= progress.take_private_query_buffer();
@@ -2940,6 +2991,10 @@ where
         // `client-output-buffer-limit` (#774): replies over the hard limit,
         // or over the soft limit for longer than its seconds, end the
         // connection unwritten, as Redis drops such a client and its output.
+        // Already closed for it, between two commands (#893).
+        if output_limit_closed {
+            break;
+        }
         let mut write_within = None;
         if pubsub.limits().may_exceed(combined.len()) {
             use crate::output_limits::{Class, Verdict};
