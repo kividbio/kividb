@@ -87,6 +87,117 @@ pub(crate) fn fingerprint(member: &[u8]) -> u8 {
     ((x ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8
 }
 
+/// Where among the fingerprints `buf[..n]` the one asked for is `f` and
+/// `is_at` says the entry there is the one looked for: the scan of a set's,
+/// a hash's and a sorted set's block (`packed_hash`, `packed_zset`).
+///
+/// Whatever follows the fingerprints in `buf` (a block's offsets, its
+/// bytes) may be read with them and is masked off, so a whole vector or
+/// word is read wherever `buf` has one: sixteen fingerprints a step with
+/// SSE2 (every x86-64 has it), sixty-four a step (four vectors' marks in
+/// one word) where `buf` has 64 bytes from there, eight a word elsewhere;
+/// a byte at a time only where `buf` ends first. Only an entry whose
+/// fingerprint matches is looked at, so a lookup that misses reads `n`
+/// bytes and nothing else.
+#[inline(always)]
+pub(crate) fn scan_fingerprints(
+    buf: &[u8],
+    n: usize,
+    f: u8,
+    mut is_at: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    debug_assert!(n <= buf.len());
+    let len = buf.len();
+    let mut i = 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{
+            __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
+        };
+        let base = buf.as_ptr();
+        // SAFETY: SSE2 is part of x86-64.
+        let needle = unsafe { _mm_set1_epi8(f as i8) };
+        // SAFETY: called only where `i + 16 <= len`, so the 16 bytes read
+        // are in `buf`; an unaligned load is what `loadu` is for.
+        let marks_at = |i: usize| unsafe {
+            debug_assert!(i + 16 <= len);
+            let chunk = _mm_loadu_si128(base.add(i).cast::<__m128i>());
+            _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, needle)) as u32
+        };
+        if n <= 16 && len >= 16 {
+            // Past the entries, nothing: no branch, `1 << 16` fits.
+            let mut marks = marks_at(0) & (1u32 << n).wrapping_sub(1);
+            while marks != 0 {
+                let at = marks.trailing_zeros() as usize;
+                if is_at(at) {
+                    return Some(at);
+                }
+                marks &= marks - 1;
+            }
+            return None;
+        }
+        while i < n {
+            let mut marks;
+            let step;
+            if n - i > 16 && i + 64 <= len {
+                marks = marks_at(i) as u64
+                    | (marks_at(i + 16) as u64) << 16
+                    | (marks_at(i + 32) as u64) << 32
+                    | (marks_at(i + 48) as u64) << 48;
+                if n - i < 64 {
+                    marks &= (1u64 << (n - i)) - 1;
+                }
+                step = 64;
+            } else if i + 16 <= len {
+                marks = marks_at(i) as u64 & ((1u64 << (n - i).min(16)) - 1);
+                step = 16;
+            } else {
+                break;
+            }
+            while marks != 0 {
+                let at = i + marks.trailing_zeros() as usize;
+                if is_at(at) {
+                    return Some(at);
+                }
+                marks &= marks - 1;
+            }
+            i += step;
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        const LOW: u64 = 0x0101_0101_0101_0101;
+        const HIGH: u64 = 0x8080_8080_8080_8080;
+        let pattern = LOW.wrapping_mul(f as u64);
+        while i < n && i + 8 <= len {
+            // A byte of `word` is zero where a fingerprint equals `f`.
+            // The test below marks every zero byte, and may mark a byte
+            // above one that is not: the full comparison settles it.
+            let word = u64::from_le_bytes(buf[i..i + 8].try_into().unwrap()) ^ pattern;
+            let mut marks = word.wrapping_sub(LOW) & !word & HIGH;
+            if n - i < 8 {
+                marks &= (1u64 << ((n - i) * 8)) - 1;
+            }
+            while marks != 0 {
+                let at = i + (marks.trailing_zeros() as usize >> 3);
+                if is_at(at) {
+                    return Some(at);
+                }
+                marks &= marks - 1;
+            }
+            i += 8;
+        }
+    }
+    // Where `buf` ends too soon for a whole word: a byte at a time.
+    while i < n {
+        if buf[i] == f && is_at(i) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 impl PackedSet {
     pub fn new() -> Self {
         Self::default()
@@ -168,75 +279,14 @@ impl PackedSet {
         self.find_by(member, f)
     }
 
-    /// The scan. The fingerprints take `cap` bytes, a multiple of eight,
-    /// and the offsets follow them, so a whole word (or vector) is always
-    /// there to be read; the places past the members are masked off, and
-    /// there is no byte-at-a-time tail. Sixteen fingerprints at a time with
-    /// SSE2 (every x86-64 has it), eight a word elsewhere.
+    /// The scan: see [`scan_fingerprints`]. The fingerprints take `cap`
+    /// bytes, a multiple of eight, and the offsets follow them.
     #[inline(always)]
     fn find_by(&self, member: &[u8], f: u8) -> Option<usize> {
         let n = self.len();
-        let cap = self.cap as usize;
-        debug_assert!(n <= cap && cap.is_multiple_of(8));
+        debug_assert!(n <= self.cap as usize && (self.cap as usize).is_multiple_of(8));
         let start = self.data_start();
-        #[cfg(target_arch = "x86_64")]
-        {
-            use std::arch::x86_64::{
-                __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
-            };
-            // The block is at least `3 * cap + 2` bytes (fingerprints and
-            // offsets), so 16 bytes from any `i < n <= cap` are in it.
-            assert!(self.buf.len() >= cap + 16);
-            let base = self.buf.as_ptr();
-            let mut i = 0;
-            while i < n {
-                // SAFETY: SSE2 is part of x86-64; `i + 16 <= cap + 16 <=
-                // buf.len()` (asserted above), and an unaligned load is
-                // what `loadu` is for.
-                let mut marks = unsafe {
-                    let needle = _mm_set1_epi8(f as i8);
-                    let chunk = _mm_loadu_si128(base.add(i).cast::<__m128i>());
-                    _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, needle)) as u32
-                };
-                // Past the members, nothing: no branch, `1 << 16` fits.
-                marks &= (1u32 << (n - i).min(16)).wrapping_sub(1);
-                while marks != 0 {
-                    let at = i + marks.trailing_zeros() as usize;
-                    if self.is_at(at, start, member) {
-                        return Some(at);
-                    }
-                    marks &= marks - 1;
-                }
-                i += 16;
-            }
-            None
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            const LOW: u64 = 0x0101_0101_0101_0101;
-            const HIGH: u64 = 0x8080_8080_8080_8080;
-            let pattern = LOW.wrapping_mul(f as u64);
-            let mut i = 0;
-            while i < n {
-                // A byte of `word` is zero where a fingerprint equals `f`.
-                // The test below marks every zero byte, and may mark a byte
-                // above one that is not: the full comparison settles it.
-                let word = u64::from_le_bytes(self.buf[i..i + 8].try_into().unwrap()) ^ pattern;
-                let mut marks = word.wrapping_sub(LOW) & !word & HIGH;
-                if n - i < 8 {
-                    marks &= (1u64 << ((n - i) * 8)) - 1;
-                }
-                while marks != 0 {
-                    let at = i + (marks.trailing_zeros() as usize >> 3);
-                    if self.is_at(at, start, member) {
-                        return Some(at);
-                    }
-                    marks &= marks - 1;
-                }
-                i += 8;
-            }
-            None
-        }
+        scan_fingerprints(&self.buf, n, f, |at| self.is_at(at, start, member))
     }
 
     /// Whether member `at` is `member`: the length first, from the two
