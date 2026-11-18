@@ -2273,6 +2273,12 @@ end
     // Redis's scripting environment re-exports it as a global, so scripts can use either form.
     lua.load("unpack = table.unpack").exec().unwrap();
 
+    // Lua 5.1's `table.getn`, `math.mod`, `gcinfo` and the rest Redis keeps (#898),
+    // made when a script first names one. The globals' `__index` asks for
+    // `gcinfo` through `__kividb_compat51`, which the final setup below takes.
+    let compat51 = super::lua_compat51::prepare(&lua).unwrap();
+    lua.globals().set("__kividb_compat51", compat51).unwrap();
+
     // `string.format` with Lua 5.1's integer conversions, as Redis's
     // scripts have them (#747): see [`super::lua_format`].
     // SAFETY: the state has the `string` library, and the closure leaves
@@ -2304,6 +2310,10 @@ end
     // globals, and globals protection. Must run LAST.
     lua.load(
         r#"
+-- The function that makes the Lua 5.1 library functions (see lua_compat51.rs).
+local _compat51 = __kividb_compat51
+__kividb_compat51 = nil
+
 -- cjson state globals and the array metatable.
 local _guard = {}
 _guard.__is_cjson_array = true
@@ -2433,6 +2443,9 @@ local function env_index(t, k)
     local v = rawget(t, k)
     if v ~= nil then
         return v
+    end
+    if k == "gcinfo" then
+        return _compat51()
     end
     error("Script attempted to access nonexistent global variable '" .. k .. "'", 2)
 end
