@@ -1136,9 +1136,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   applied, in the AOF and on replicas; a transaction or a script is one
   command and runs whole; the soft limit still lets a pipeline run. The
   check is made only once a turn's replies have grown to room for the
-  smallest limit, so a pipeline of small replies pays nothing for it. A
-  read on the io_uring loop takes at most 32 KiB, or the rest of a large
-  argument, not all the room of a large query buffer.
+  smallest limit, so a pipeline of small replies pays nothing for it. How
+  much one read brings no longer matters to the limit.
 
 - **`string.format('%d', x)` in a script takes an `x` with a fraction, as
   Redis does (#747).** Scripts run on Lua 5.4, which failed with "number has

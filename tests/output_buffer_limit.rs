@@ -905,6 +905,50 @@ fn what_was_read_ahead_runs_a_read_at_a_time() {
     }
 }
 
+/// Requests of many arguments, each larger than a read, pipelined: each
+/// arrives in many reads into a query buffer of its own, which is trimmed
+/// between them, and every one runs. A read of 32 KiB into a larger buffer
+/// left room the trim then took, which a check of the read did not allow
+/// for: a debug build panicked and dropped the client (#893).
+#[test]
+fn pipelined_requests_larger_than_a_read_all_run() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        // As tests/memory_usage_zset.rs loads sorted sets of 512 members,
+        // every score changed: two ZADDs of about 15 and 20 KB a key, 100
+        // keys in one write.
+        let scattered = |i: u64| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as f64;
+        let zadd = |key: &str, scores: &dyn Fn(u64) -> f64| {
+            let mut args: Vec<Vec<u8>> = vec![b"ZADD".to_vec(), key.as_bytes().to_vec()];
+            for i in 0..512u64 {
+                args.push(scores(i).to_string().into_bytes());
+                args.push(format!("member-{i:09}").into_bytes());
+            }
+            let refs: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
+            encode(&refs)
+        };
+        let mut c = server.conn();
+        assert!(c.cmd(&["SELECT", "1"]).ok());
+        let mut pipeline = Vec::new();
+        for k in 0..100 {
+            let key = format!("warm:{k}");
+            pipeline.extend_from_slice(&zadd(&key, &|i| i as f64));
+            pipeline.extend_from_slice(&zadd(&key, &scattered));
+        }
+        c.writer
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        c.writer
+            .write_all(&pipeline)
+            .unwrap_or_else(|e| panic!("{io_model}: {e}"));
+        for k in 0..100 {
+            assert_eq!(c.read(), Some(V::Int(512)), "{io_model}: key {k}");
+            assert_eq!(c.read(), Some(V::Int(0)), "{io_model}: key {k} again");
+        }
+    }
+}
+
 /// A blocking command writes the replies to what came before it as it
 /// parks, and the server reads the client while that write waits too.
 #[test]

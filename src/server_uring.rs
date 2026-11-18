@@ -817,16 +817,6 @@ const READ_BUFFER: usize = 32 * 1024;
 /// first, so a read never lands in a sliver of free space.
 const READ_MIN: usize = 8 * 1024;
 
-/// Where a read into `buf` ends: `READ_BUFFER` past what it holds, or the
-/// whole of a large argument that is still arriving, as Redis sizes a read;
-/// not all the room of a large private query buffer, which a pipeline would
-/// fill with more commands than a read's worth (#893).
-#[inline]
-fn read_end(buf: &Vec<u8>, progress: &resp::parse::Progress) -> usize {
-    buf.capacity()
-        .min(buf.len() + READ_BUFFER.max(progress.minimum_capacity()))
-}
-
 /// A connection's subscriptions, made at its first SUBSCRIBE, with the task
 /// that writes its messages. On this thread: the stream is not `Send`. It
 /// shares the fd with the connection loop and the push task, hence the guard.
@@ -1200,8 +1190,7 @@ pub async fn handle_client(
                 parse_buf.reserve(READ_BUFFER);
             }
             let unparsed = parse_buf.len();
-            let end = read_end(&parse_buf, &progress);
-            let (res, buffer) = stream.read(parse_buf.slice(unparsed..end)).await;
+            let (res, buffer) = stream.read(parse_buf.slice(unparsed..)).await;
             parse_buf = buffer.into_inner();
             match res {
                 Ok(0) => break,
@@ -1210,6 +1199,9 @@ pub async fn handle_client(
                 Err(_) => break,
             }
         };
+        // What was read ends the buffer. Checked here, before the trim below,
+        // which takes the consumed front off a private buffer (#893).
+        debug_assert_eq!(parse_buf.len(), unparsed + n);
         // Bytes arrived from the socket: the client is active, so its idle
         // clock restarts. Once per read, not once per command — a pipeline
         // that arrives together is one interaction. EOF and read errors
@@ -1254,7 +1246,6 @@ pub async fn handle_client(
         activity.note_read(n);
 
         query_buffer_peak = query_buffer_peak.max(parse_buf.len().saturating_sub(parse_start));
-        debug_assert_eq!(parse_buf.len(), unparsed + n);
         query_buffer.update(
             parse_buf.len().saturating_sub(parse_start) + carried.len() - carried_from,
             parse_buf.capacity().saturating_sub(parse_buf.len()),
@@ -3296,10 +3287,9 @@ pub async fn handle_client(
                         parse_buf.reserve(READ_BUFFER);
                     }
                     early_from = parse_buf.len();
-                    early.set(Some(reader.read({
-                        let end = read_end(&parse_buf, &progress);
-                        std::mem::take(&mut parse_buf).slice(early_from..end)
-                    })));
+                    early.set(Some(
+                        reader.read(std::mem::take(&mut parse_buf).slice(early_from..)),
+                    ));
                     let mut write = std::pin::pin!(stream.write_all(spare_buf));
                     let read = early.as_mut().as_pin_mut().expect("submitted above");
                     tokio::select! {
