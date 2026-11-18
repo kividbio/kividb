@@ -652,7 +652,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with whole-number scores take 29.6 bytes a member at 10 members (118.8
   before; Redis 8.10.2 24.8) and 19.3 at 100 (116.4; Redis 21.0); with
   fractional scores 37.6 and 27.3 (Redis 28.0 and 26.2). Ten 8-byte
-  members a key, as #297 measured it, take 275 bytes of RSS a key (1,249
+  members a key, as #297 measured it, take 274 bytes of RSS a key (1,249
   before; Redis 186). Larger sorted sets are a table and a tree as before.
   - A score that is an integer of up to 56 bits is kept in one to eight
     bytes (one up to 247), any other as the eight bytes of the float: read

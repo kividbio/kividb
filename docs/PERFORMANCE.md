@@ -193,7 +193,7 @@ Azure `Standard_D4s_v5`:
 | 1,000 | 132.5 | 132.5 | 67.8 | 132.5 | 132.5 | 68.4 |
 
 Measured a key at a time as #297 measured it (100,000 sets of 10 members of
-8 bytes, scores 0 to 9): 275 bytes of RSS a key (1.2.2: 1,249; Redis: 186),
+8 bytes, scores 0 to 9): 274 bytes of RSS a key (1.2.2: 1,249; Redis: 186),
 236 of `used_memory` (1,108; 176). What is left over Redis is mostly the
 key's own entry and the set's header. Sets past 128 members are a table and
 a tree as before; making those smaller is the next step. Suite
