@@ -480,13 +480,13 @@ fn takes_the_gate_alone(name: &str, cmd: &[&[u8]], script_alone: bool, gated: bo
         || (gated
             && matches!(name, "FLUSHALL" | "FLUSHDB" | "SWAPDB")
             && !crate::expiry::replaying())
-        // A build without Lua runs no script beside others: a walk of the
-        // keyspace there takes the gate alone as before, should tag locks be
-        // switched on. With Lua it keeps such scripts out instead
-        // (`run_command`, `tag_locks::walk`, #772).
-        || (cfg!(not(feature = "lua"))
-            && crate::tag_locks::enabled()
-            && crate::tag_locks::sees_the_whole_keyspace(name))
+        // With Lua, `KEYS` and `SCAN` keep the scripts that run beside
+        // others out instead (`run_command`, `tag_locks::walk`, #772). A
+        // build without Lua runs no script beside others, and they take the
+        // gate alone there as before, should tag locks be switched on.
+        || (crate::tag_locks::enabled()
+            && crate::tag_locks::sees_the_whole_keyspace(name)
+            && !(cfg!(feature = "lua") && crate::tag_locks::walks_the_keyspace(name)))
         || crate::tag_locks::is_switch(name, cmd)
         // One argument is at most one key (`DEL k`, `INCR k`): asked here,
         // and the rest out of line, so that what every command runs through
@@ -1672,7 +1672,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     let Some((_command_gate, _alone)) = gates else {
         return busy_reply();
     };
-    // A walk of the keyspace (`KEYS`, `SCAN`, `DBSIZE`, `RANDOMKEY`) and the
+    // A walk of the keyspace (`KEYS`, `SCAN`) and the
     // scripts that run beside others keep each other out, and nothing else:
     // a walk finds every such script's keys as they were before it or as
     // they are after it (`tag_locks::walk`, #772). Before the write gate,

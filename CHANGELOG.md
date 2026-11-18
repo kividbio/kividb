@@ -326,8 +326,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **With `lua-parallel-scripts` on, `KEYS`, `SCAN`, `DBSIZE` and
-  `RANDOMKEY` no longer stop every connection (#772).** So that a walk of
+- **With `lua-parallel-scripts` on, `KEYS` and `SCAN` no longer stop
+  every connection (#772).** So that a walk of
   the keyspace never finds a script running beside others part-way
   through, they took the command gate alone: a `KEYS` over a million keys
   held every connection for as long as it ran, and one that waited for a
@@ -340,9 +340,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are after it, as in Redis. A script that finds a walk under way waits
   for it asleep, off its thread; one that finds walk after walk stops
   waiting after three and holds the walks after it back, so a loop of
-  `SCAN`s cannot keep scripts out. The flushes, `SWAPDB`, transactions and
-  scripts that run alone take the gate alone as before; a build without
-  Lua is unchanged. Measured on 1,000,000 keys with a `KEYS *` loop, 16
+  `SCAN`s cannot keep scripts out. `DBSIZE`, `RANDOMKEY`, the flushes,
+  `SWAPDB`, transactions and scripts that run alone take the gate alone as
+  before (`DBSIZE` and `RANDOMKEY` are quick, and the gate alone also makes
+  them come after the whole of what is in flight, such as active expiry
+  removing a large key, its `expired_keys` and `LATENCY` event included,
+  which Redis's `unit/latency-monitor` asks for); a build without Lua is
+  unchanged. Measured on 1,000,000 keys with a `KEYS *` loop, 16
   connections sending `GET` and 4 a tagged `EVALSHA`, `--threads 4`
   (Azure D8s_v5, server on 4 vCPUs, clients on the other 4), 15 s:
 

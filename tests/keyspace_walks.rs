@@ -1,8 +1,8 @@
 // tests/keyspace_walks.rs
 //
-// With `lua-parallel-scripts` on, a walk of the keyspace (`KEYS`, `SCAN`,
-// `DBSIZE`, `RANDOMKEY`) keeps the scripts that run beside others out while
-// it runs, and nothing else (#772): it finds every script's keys as they were
+// With `lua-parallel-scripts` on, a walk of the keyspace (`KEYS`, `SCAN`)
+// keeps the scripts that run beside others out while it runs, and nothing
+// else (#772; `DBSIZE` and `RANDOMKEY` still take the command gate alone): it finds every script's keys as they were
 // before it or as they are after it, never between, as in Redis, where a
 // script is one step; and connections that are not walking are served
 // meanwhile, where the walk used to take the command gate alone and stop them

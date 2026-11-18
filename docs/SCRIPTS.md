@@ -175,11 +175,12 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   {orders}:waiting` sent while a script on `orders` is running is answered
   when the script has finished; so is a command naming a key of any of the
   tags of a script of several. Keys without a tag are never waited for.
-  `MULTI`/`EXEC`, `FLUSHALL`, `FLUSHDB` and `SWAPDB` wait for every running
-  script, and hold back every other command while they run.
+  `MULTI`/`EXEC`, `DBSIZE`, `RANDOMKEY`, `FLUSHALL`, `FLUSHDB` and `SWAPDB`
+  wait for every running script, and hold back every other command while
+  they run.
 
 - **A walk of the keyspace waits for the scripts running beside others,
-  and only for them.** `KEYS`, `SCAN`, `DBSIZE` and `RANDOMKEY` wait for
+  and only for them.** `KEYS` and `SCAN` wait for
   every script that is running beside others, and keep new ones from
   starting until they are done; they run beside every other command, and
   beside each other, as with `lua-parallel-scripts no`. So a reply of

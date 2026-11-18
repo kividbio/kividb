@@ -36,8 +36,9 @@
 // * A command that changes keys it does not name — `FLUSHALL`, `FLUSHDB`,
 //   `SWAPDB` — takes the gate alone, which waits for every script (a script
 //   holds the gate as a command for as long as it runs). One that only reads
-//   them — `KEYS`, `SCAN`, `DBSIZE`, `RANDOMKEY` — keeps the scripts that run
-//   beside others out while it runs, and nothing else (`walk`, #772).
+//   them by walking it — `KEYS`, `SCAN` — keeps the scripts that run beside
+//   others out while it runs, and nothing else (`walk`, #772); `DBSIZE` and
+//   `RANDOMKEY` take the gate alone.
 //
 // The locks are stripes: a fixed table indexed by a hash of the tag. Two
 // tags that land on one stripe wait for each other when they need not, and
@@ -739,19 +740,26 @@ pub fn sees_the_whole_keyspace(name: &str) -> bool {
     )
 }
 
-/// The commands of [`sees_the_whole_keyspace`] that only read: `KEYS`,
-/// `SCAN`, `DBSIZE`, `RANDOMKEY`. With tag locks on they do not take the
+/// The commands of [`sees_the_whole_keyspace`] that walk it: `KEYS` and
+/// `SCAN`. With tag locks on (in a build with Lua) they do not take the
 /// command gate alone, which stopped every connection for as long as one
 /// ran (a `KEYS` of two million keys, ~280 ms, #772): they keep the scripts
 /// that run beside others out for that long instead ([`walk`]), and run
 /// beside every other command and each other, as they do with tag locks
 /// off. A script that runs alone, a transaction and a write of several keys
 /// hold the gate alone, which a walk holds shared: they are kept out as
-/// before. The flushes and `SWAPDB` write, and still take the gate alone.
-#[cfg(feature = "lua")]
+/// before.
+///
+/// `DBSIZE` and `RANDOMKEY` still take the gate alone. They are quick, and
+/// the gate alone also waits for what is in flight, as a command in Redis
+/// comes after the whole of the one before it: active expiry removing a
+/// large key is seen whole, its `expired_keys` and its `LATENCY` event
+/// with it, by a `DBSIZE` that no longer counts the key (Redis's
+/// `unit/latency-monitor` asks that). The flushes and `SWAPDB` write, and
+/// take the gate alone.
 #[inline]
 pub fn walks_the_keyspace(name: &str) -> bool {
-    matches!(name, "KEYS" | "SCAN" | "DBSIZE" | "RANDOMKEY")
+    matches!(name, "KEYS" | "SCAN")
 }
 
 /// The locks a walk of the keyspace ([`walk`]) and the scripts that run
