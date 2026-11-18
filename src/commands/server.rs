@@ -2819,6 +2819,20 @@ const ALL_COMMANDS: &[&str] = &[
     "SUNIONSTORE",
     "SUNSUBSCRIBE",
     "SWAPDB",
+    "TDIGEST.ADD",
+    "TDIGEST.BYRANK",
+    "TDIGEST.BYREVRANK",
+    "TDIGEST.CDF",
+    "TDIGEST.CREATE",
+    "TDIGEST.INFO",
+    "TDIGEST.MAX",
+    "TDIGEST.MERGE",
+    "TDIGEST.MIN",
+    "TDIGEST.QUANTILE",
+    "TDIGEST.RANK",
+    "TDIGEST.RESET",
+    "TDIGEST.REVRANK",
+    "TDIGEST.TRIMMED_MEAN",
     "TIME",
     "TOUCH",
     "TTL",
@@ -3188,6 +3202,17 @@ const FAST_COMMANDS: &[&str] = &[
     "SPUBLISH",
     "SREM",
     "STRLEN",
+    "TDIGEST.BYRANK",
+    "TDIGEST.BYREVRANK",
+    "TDIGEST.CDF",
+    "TDIGEST.CREATE",
+    "TDIGEST.INFO",
+    "TDIGEST.MAX",
+    "TDIGEST.MIN",
+    "TDIGEST.QUANTILE",
+    "TDIGEST.RANK",
+    "TDIGEST.RESET",
+    "TDIGEST.REVRANK",
     "TIME",
     "TOUCH",
     "TTL",
@@ -3256,6 +3281,7 @@ pub(crate) const ACL_CATEGORIES: &[&str] = &[
     "sortedset",
     "stream",
     "string",
+    "tdigest",
     "timeseries",
     "transaction",
     "vector",
@@ -3315,6 +3341,7 @@ fn command_table() -> std::collections::BTreeMap<&'static str, Vec<u8>> {
             // for the rest.
             let arity = crate::commands::arity::of(name)
                 .or_else(|| crate::commands::bf::arity(name))
+                .or_else(|| crate::commands::tdigest::arity(name))
                 .or_else(|| module_arity(name))
                 .map_or(arity, i64::from);
             // A command with subcommands has no keys of its own: they are
@@ -3728,6 +3755,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
         // command joins its category by being registered.
         "json" => commands_with_prefix("JSON."),
         "bloom" => commands_with_prefix("BF."),
+        "tdigest" => commands_with_prefix("TDIGEST."),
         "search" => commands_with_prefix("FT."),
         "timeseries" => commands_with_prefix("TS."),
         "vector" => vec![
@@ -3824,6 +3852,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
                 "hash",
                 "bitmap",
                 "bloom",
+                "tdigest",
                 "hyperloglog",
                 "geo",
                 "stream",

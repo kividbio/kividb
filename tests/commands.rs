@@ -1120,7 +1120,13 @@ fn test_command_list_filterby_module_built_in() {
     // Redis 8's `bf` module: the probabilistic types.
     let bf = names(&mut c, "bf");
     assert!(bf.contains(&"bf.add".to_string()), "{bf:?}");
-    assert!(bf.iter().all(|n| n.starts_with("bf.")), "{bf:?}");
+    assert!(
+        bf.iter()
+            .all(|n| ["bf.", "cf.", "cms.", "topk.", "tdigest."]
+                .iter()
+                .any(|p| n.starts_with(p))),
+        "{bf:?}"
+    );
 }
 
 // COMMAND LIST FILTERBY ACLCAT returns commands in that category.

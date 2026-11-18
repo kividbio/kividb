@@ -4466,6 +4466,7 @@ pub fn is_write_command(name: &str) -> bool {
                 | "XREADGROUP"
                 | "ZDIFFSTORE"
         ),
+        11 if crate::sketch::is_write(&name.as_bytes()[..11]) => true,
         11 => matches!(
             name,
             "FT.ALIASADD"
@@ -4486,7 +4487,9 @@ pub fn is_write_command(name: &str) -> bool {
             name,
             "BF.LOADCHUNK" | "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
         ),
+        13 if crate::sketch::is_write(&name.as_bytes()[..13]) => true,
         13 => matches!(name, "TS.CREATERULE" | "TS.DELETERULE"),
+        14 if crate::sketch::is_write(&name.as_bytes()[..14]) => true,
         14 => matches!(
             name,
             "FT.ALIASUPDATE"
@@ -4633,6 +4636,10 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "SREM",
     "SUNIONSTORE",
     "SWAPDB",
+    "TDIGEST.ADD",
+    "TDIGEST.CREATE",
+    "TDIGEST.MERGE",
+    "TDIGEST.RESET",
     "TS.ADD",
     "TS.ALTER",
     "TS.CREATE",
@@ -4681,6 +4688,7 @@ fn is_write_command_reference(name: &str) -> bool {
         name,
         // Bloom filters
         "BF.RESERVE" | "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.LOADCHUNK" |
+        "TDIGEST.ADD" | "TDIGEST.CREATE" | "TDIGEST.MERGE" | "TDIGEST.RESET" |
         // Strings
         "SET" | "SETNX" | "SETEX" | "PSETEX" | "MSET" | "MSETNX" | "GETSET" |
         "GETDEL" | "GETEX" | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" |

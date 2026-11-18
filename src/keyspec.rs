@@ -691,7 +691,24 @@ const SKETCHES: &[&str] = &[
     "BF.SCANDUMP",
     "BF.LOADCHUNK",
     "BF.DEBUG",
+    "TDIGEST.ADD",
+    "TDIGEST.BYRANK",
+    "TDIGEST.BYREVRANK",
+    "TDIGEST.CDF",
+    "TDIGEST.CREATE",
+    "TDIGEST.INFO",
+    "TDIGEST.MAX",
+    "TDIGEST.MIN",
+    "TDIGEST.QUANTILE",
+    "TDIGEST.RANK",
+    "TDIGEST.RESET",
+    "TDIGEST.REVRANK",
+    "TDIGEST.TRIMMED_MEAN",
 ];
+
+/// The probabilistic types' merges: `destination numkeys source ...`,
+/// after [`SKETCHES`] for the same reason.
+const SKETCH_MERGES: &[&str] = &["TDIGEST.MERGE"];
 
 const COMMANDS: &[(&[&str], Shape)] = &[
     (FIRST, Shape::First),
@@ -713,6 +730,7 @@ const COMMANDS: &[(&[&str], Shape)] = &[
     (HIMPORT_SET, Shape::HimportSet),
     (MEMORY_USAGE, Shape::MemoryUsage),
     (SKETCHES, Shape::First),
+    (SKETCH_MERGES, Shape::DestinationAndCount),
 ];
 
 /// [`COMMANDS`] by name: open addressing over [`SLOTS`] slots, built when
@@ -1111,6 +1129,19 @@ mod tests {
             // Bloom filters
             | "BF.RESERVE" | "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.EXISTS" | "BF.MEXISTS"
             | "BF.INFO" | "BF.CARD" | "BF.SCANDUMP" | "BF.LOADCHUNK" | "BF.DEBUG"
+            | "TDIGEST.ADD"
+            | "TDIGEST.BYRANK"
+            | "TDIGEST.BYREVRANK"
+            | "TDIGEST.CDF"
+            | "TDIGEST.CREATE"
+            | "TDIGEST.INFO"
+            | "TDIGEST.MAX"
+            | "TDIGEST.MIN"
+            | "TDIGEST.QUANTILE"
+            | "TDIGEST.RANK"
+            | "TDIGEST.RESET"
+            | "TDIGEST.REVRANK"
+            | "TDIGEST.TRIMMED_MEAN"
             // Sharded pub/sub: the channel is hashed to a slot exactly like a key.
             | "SPUBLISH" => One(1),
 
@@ -1192,7 +1223,7 @@ mod tests {
                 numkeys(cmd, 2, 3)
             }
             // dest numkeys key [key ...]
-            "ZUNIONSTORE" | "ZINTERSTORE" | "ZDIFFSTORE" => match numkeys(cmd, 2, 3) {
+            "ZUNIONSTORE" | "ZINTERSTORE" | "ZDIFFSTORE" | "TDIGEST.MERGE" => match numkeys(cmd, 2, 3) {
                 Range { first, last, .. } => {
                     let mut keys = vec![1];
                     keys.extend(first..=last);
