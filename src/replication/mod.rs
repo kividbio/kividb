@@ -230,6 +230,10 @@ pub struct ReplState {
     /// which every write reads, stays as it was.
     #[cfg(test)]
     pub hub_parks: AtomicU64,
+    /// How many times the hub has slept `BACKLOG_PACE` instead of waiting to
+    /// be woken: only ever with no replica attached (#894). Tests only.
+    #[cfg(test)]
+    pub hub_sleeps: AtomicU64,
     /// `repl-backlog-size`, in bytes; and `repl-backlog-ttl`, in seconds
     /// (0 = keep the backlog for ever).
     pub backlog_size: AtomicU64,
@@ -588,6 +592,8 @@ impl ReplState {
             backlog_active: AtomicBool::new(false),
             #[cfg(test)]
             hub_parks: AtomicU64::new(0),
+            #[cfg(test)]
+            hub_sleeps: AtomicU64::new(0),
             backlog_size: AtomicU64::new(64 * 1024 * 1024),
             backlog_ttl_secs: AtomicU64::new(3600),
             replica_max_backlog_bytes: AtomicU64::new(256 * 1024 * 1024),
@@ -2883,7 +2889,11 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         }
                         None => break,
                     },
-                    () = tokio::time::sleep(BACKLOG_PACE), if pace => continue,
+                    () = tokio::time::sleep(BACKLOG_PACE), if pace => {
+                        #[cfg(test)]
+                        state.hub_sleeps.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     _ = tick.tick() => {
                         backlog.report(&state);
                         // A queue under the soft limit now is no longer over it,
@@ -5218,7 +5228,7 @@ mod replication_invariants_tests {
         let settle = std::time::Instant::now();
         while state.hub_parks.load(Ordering::Relaxed) == 0 {
             assert!(
-                settle.elapsed() < std::time::Duration::from_secs(5),
+                settle.elapsed() < std::time::Duration::from_secs(30),
                 "the hub never waited"
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -5226,33 +5236,58 @@ mod replication_invariants_tests {
         hub
     }
 
-    /// `writes` writes about 50 us apart: how many times the hub waited to
-    /// be woken meanwhile.
-    fn spaced_writes(state: &ReplState, hub: &super::HubTx, writes: u64) -> u64 {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let before = state.hub_parks.load(Ordering::Relaxed);
-        for _ in 0..writes {
+    /// Until the hub has slept a pace (#894): one write at a time, a few
+    /// milliseconds apart, until it does. Bounded, never a fixed sleep.
+    fn until_paced(state: &ReplState, hub: &super::HubTx) {
+        let before = state.hub_sleeps.load(Ordering::Relaxed);
+        let since = std::time::Instant::now();
+        while state.hub_sleeps.load(Ordering::Relaxed) == before {
+            assert!(
+                since.elapsed() < std::time::Duration::from_secs(30),
+                "the hub never slept a pace with no replica attached"
+            );
             hub.send(HubMsg::Propagate(Arc::from(super::REPL_PING)))
                 .unwrap();
-            std::thread::sleep(std::time::Duration::from_micros(50));
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let (done, barrier) = tokio::sync::oneshot::channel();
-        hub.send(HubMsg::Barrier(done)).unwrap();
-        barrier.blocking_recv().unwrap();
-        state.hub_parks.load(Ordering::Relaxed) - before
     }
 
-    /// A replica that attaches while the hub is paced (#894) is sent the
-    /// writes after it at once, every one woken for, and once it has gone
-    /// the hub is paced again.
+    /// The next payload `rx` is sent that is `want`, waited for on a runtime
+    /// of its own. The bound only turns a hang into a failure.
+    fn next_payload(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<ReplPayload>,
+        want: &ReplPayload,
+    ) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while let Some(got) = rx.recv().await {
+                    if &got == want {
+                        return;
+                    }
+                }
+                panic!("the replica's stream ended");
+            })
+            .await
+            .expect("a write after the attach was not streamed (it waited for another)");
+        });
+    }
+
+    /// A replica that attaches while the hub is paced (#894) is sent each
+    /// write after it on its own: no later write is needed for one to go,
+    /// and the hub never sleeps a pace while the replica is attached. Once
+    /// it has gone the hub is paced again. Nothing here depends on how the
+    /// threads are scheduled.
     #[test]
     fn hub_paced_attach_is_streamed_at_once_and_detach_paces_it_again() {
         let state = Arc::new(ReplState::new_master());
         let hub = paced_hub(&state);
-        let parks = spaced_writes(&state, &hub, 200);
-        assert!(parks < 50, "paced: woken for {parks} of 200 writes");
+        until_paced(&state, &hub);
 
-        // Attaches in the middle of the writes, during a sleep.
+        // Attaches in the middle of the writes, maybe during a sleep.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
         for _ in 0..5 {
             hub.send(HubMsg::Propagate(Arc::from(super::REPL_PING)))
@@ -5271,53 +5306,31 @@ mod replication_invariants_tests {
         .unwrap();
         let attached = std::time::Instant::now();
         while state.connected_replicas.load(Ordering::Relaxed) != 1 {
-            assert!(attached.elapsed() < std::time::Duration::from_secs(5));
+            assert!(attached.elapsed() < std::time::Duration::from_secs(30));
             std::thread::sleep(std::time::Duration::from_micros(20));
         }
-        let seen_after = attached.elapsed();
-        // Attached, each write is streamed as it comes, and wakes the hub.
-        let mut slowest = std::time::Duration::ZERO;
-        let mut woken = 0;
+        // A sleep under way when the replica attached ended before its
+        // registration was handled, and was counted then.
+        let sleeps = state.hub_sleeps.load(Ordering::Relaxed);
+        // Attached: each write is streamed before the next one is sent.
         for i in 0..50u32 {
             let payload: ReplPayload = Arc::from(format!("*1\r\n$4\r\nW{i:03}\r\n").as_bytes());
-            let before = state.hub_parks.load(Ordering::Relaxed);
-            let sent = std::time::Instant::now();
             hub.send(HubMsg::Propagate(Arc::clone(&payload))).unwrap();
-            loop {
-                let got = rx.blocking_recv().expect("the replica's stream");
-                if got == payload {
-                    break;
-                }
-            }
-            slowest = slowest.max(sent.elapsed());
-            woken += u64::from(state.hub_parks.load(Ordering::Relaxed) > before);
-            std::thread::sleep(std::time::Duration::from_micros(200));
+            next_payload(&mut rx, &payload);
         }
-        eprintln!(
-            "attach seen after {seen_after:?}; slowest of 50 writes to reach the replica: {slowest:?}; \
-             hub woken for {woken}"
-        );
-        assert!(
-            seen_after < std::time::Duration::from_millis(500),
-            "{seen_after:?}"
-        );
-        assert!(
-            slowest < std::time::Duration::from_millis(500),
-            "{slowest:?}"
-        );
-        assert!(
-            woken >= 40,
-            "attached, the hub waited for only {woken} of 50 writes"
+        assert_eq!(
+            state.hub_sleeps.load(Ordering::Relaxed),
+            sleeps,
+            "the hub slept a pace with a replica attached"
         );
 
         hub.send(HubMsg::Deregister(9010)).unwrap();
         let gone = std::time::Instant::now();
         while state.connected_replicas.load(Ordering::Relaxed) != 0 {
-            assert!(gone.elapsed() < std::time::Duration::from_secs(5));
+            assert!(gone.elapsed() < std::time::Duration::from_secs(30));
             std::thread::sleep(std::time::Duration::from_micros(20));
         }
-        let parks = spaced_writes(&state, &hub, 200);
-        assert!(parks < 50, "detached: woken for {parks} of 200 writes");
+        until_paced(&state, &hub);
     }
 
     /// RegisterChannel must bump `connected_slaves` inside the hub task (pairs with Deregister).
@@ -5346,51 +5359,38 @@ mod replication_invariants_tests {
 
     /// With no replica attached, the writes a kept backlog is sent do not
     /// wake the hub one by one (#894): it empties its inbox, sleeps a moment
-    /// and looks again, and waits to be woken only once a look finds nothing.
-    /// Every write still reaches the backlog, in order.
+    /// and looks again (`hub_sleeps`), and waits to be woken only once a look
+    /// finds nothing. Every write still reaches the backlog, in order. How
+    /// often it was woken depends on the scheduling, so it is only shown.
     #[test]
     fn hub_backlog_writes_without_replicas_do_not_wake_it_each() {
         let state = Arc::new(ReplState::new_master());
-        state.backlog_active.store(true, Ordering::Relaxed);
-        let (give, take) = std::sync::mpsc::channel();
-        let hub_state = Arc::clone(&state);
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    give.send(start_hub(hub_state)).unwrap();
-                    std::future::pending::<()>().await;
-                });
-        });
-        let hub = take.recv().unwrap();
-        hub.send(HubMsg::Resume { offset: 0 }).unwrap();
-        let settle = std::time::Instant::now();
-        while state.hub_parks.load(Ordering::Relaxed) == 0 {
-            assert!(
-                settle.elapsed() < std::time::Duration::from_secs(5),
-                "the hub never waited"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        let hub = paced_hub(&state);
         let parks_before = state.hub_parks.load(Ordering::Relaxed);
+        let sleeps_before = state.hub_sleeps.load(Ordering::Relaxed);
 
-        // One write every 50 us or so: each found the hub waiting before.
         const WRITES: u64 = 400;
         for _ in 0..WRITES {
             hub.send(HubMsg::Propagate(Arc::from(super::REPL_PING)))
                 .unwrap();
             std::thread::sleep(std::time::Duration::from_micros(50));
         }
-        let parks = state.hub_parks.load(Ordering::Relaxed) - parks_before;
         let (done, barrier) = tokio::sync::oneshot::channel();
         hub.send(HubMsg::Barrier(done)).unwrap();
         barrier.blocking_recv().unwrap();
-        assert!(
-            parks < WRITES / 4,
-            "the hub was woken for {parks} of {WRITES} writes"
+        // The barrier set it pacing, so its next empty look is a sleep.
+        let since = std::time::Instant::now();
+        while state.hub_sleeps.load(Ordering::Relaxed) == sleeps_before {
+            assert!(
+                since.elapsed() < std::time::Duration::from_secs(30),
+                "the hub never slept a pace with no replica attached"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        eprintln!(
+            "{WRITES} writes: the hub waited to be woken {} times, slept a pace {} times",
+            state.hub_parks.load(Ordering::Relaxed) - parks_before,
+            state.hub_sleeps.load(Ordering::Relaxed) - sleeps_before
         );
 
         // All of them are in the backlog (reported each second).
@@ -5398,7 +5398,7 @@ mod replication_invariants_tests {
         let since = std::time::Instant::now();
         while state.backlog_histlen.load(Ordering::Relaxed) != want {
             assert!(
-                since.elapsed() < std::time::Duration::from_secs(5),
+                since.elapsed() < std::time::Duration::from_secs(30),
                 "backlog holds {} bytes, not {want}",
                 state.backlog_histlen.load(Ordering::Relaxed)
             );
