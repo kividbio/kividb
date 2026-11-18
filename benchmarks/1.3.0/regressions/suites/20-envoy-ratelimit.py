@@ -44,8 +44,10 @@ fails), at most 8 % under v1.2.2's (the build is not ahead of it here: the
 gate says "not worse than"), and THROUGHPUT against the recorded candidate. The
 p99 rows are shown, not gated (`jitter`).
 
-Needs 8 vCPUs: on a Standard_D4s_v5 (server on 2 CPUs) master and v1.2.2 both
-run at 0.9x Redis, which has one thread, and the gates would fail.
+Needs 8 vCPUs (`min_cpus=8`): on a Standard_D4s_v5 (server on 2 CPUs) master and
+v1.2.2 both run at 0.9x Redis, which has one thread, and the gates would fail.
+`run-all.sh` does not run it on a machine under 8 CPUs; run it with
+`run-all.sh --min-cpus-only` on a Standard_D8s_v5.
 
 Needs memtier_benchmark 2.6.1 or newer (`--transaction`, and the stderr line
 it logs for an error reply): `$MEMTIER`, else on PATH.
@@ -102,7 +104,7 @@ def cpu_split():
 
 
 SERVER_CPUS, CLIENT_CPUS = cpu_split()
-S = Suite("20-envoy-ratelimit", [Config("default", threads=len(SERVER_CPUS) if SERVER_CPUS else 0)])
+S = Suite("20-envoy-ratelimit", [Config("default", threads=len(SERVER_CPUS) if SERVER_CPUS else 0)], min_cpus=8)
 
 
 def pin_server(pid):

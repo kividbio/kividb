@@ -1014,8 +1014,11 @@ KiviDB's `MONITOR` feed is not lossless under load (the suite's check: 3,040 of
 56,867 pairs looked as if on two keys with four connections, 0 of 20,000 with
 one): the check runs on one connection and tolerates 5 %.
 
-Run this suite on a D8s_v5 (`run-all.sh --only 20`); on the D4s_v5 of the other
-suites the Redis gate fails by design.
+This suite declares `min_cpus=8`: the normal run on the D4s_v5 of the other
+suites does not run it (`needs_more_cpus` in `env.json`; the Redis gate would
+fail by design there), and `--only 20` on it makes the run `INVALID`. Run it on a
+D8s_v5 with `run-all.sh --candidate <bin> --candidate-full <bin> --min-cpus-only
+--label <label>-d8s_v5` (see "How a release uses it").
 
 ## Recorded run, suite 23
 
