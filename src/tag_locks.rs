@@ -33,9 +33,11 @@
 //   it finds a script's keys as they were before the script or as they are
 //   after it, never between. Keys without a tag belong to no script and
 //   cost a look for `{`.
-// * A command that reads or changes keys it does not name — `KEYS`, `SCAN`,
-//   `DBSIZE`, `FLUSHALL` — takes the gate alone, which waits for every
-//   script (a script holds the gate as a command for as long as it runs).
+// * A command that changes keys it does not name — `FLUSHALL`, `FLUSHDB`,
+//   `SWAPDB` — takes the gate alone, which waits for every script (a script
+//   holds the gate as a command for as long as it runs). One that only reads
+//   them — `KEYS`, `SCAN`, `DBSIZE`, `RANDOMKEY` — keeps the scripts that run
+//   beside others out while it runs, and nothing else (`walk`, #772).
 //
 // The locks are stripes: a fixed table indexed by a hash of the tag. Two
 // tags that land on one stripe wait for each other when they need not, and
@@ -725,13 +727,202 @@ pub fn try_lock_keys<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Option<TriedKe
     Some(TriedKeys { _held: held, busy })
 }
 
-/// Commands that read or change keys they do not name. With tag locks on
-/// they take the command gate alone: no script is then part-way through.
+/// Commands that read or change keys they do not name: refused to a script
+/// held to its tags. With tag locks on, the ones that change them take the
+/// command gate alone, and the ones that only read them keep the scripts
+/// that run beside others out ([`walks_the_keyspace`]): either way, no script
+/// is part-way through while one runs.
 pub fn sees_the_whole_keyspace(name: &str) -> bool {
     matches!(
         name,
         "KEYS" | "SCAN" | "DBSIZE" | "RANDOMKEY" | "FLUSHALL" | "FLUSHDB" | "SWAPDB"
     )
+}
+
+/// The commands of [`sees_the_whole_keyspace`] that only read: `KEYS`,
+/// `SCAN`, `DBSIZE`, `RANDOMKEY`. With tag locks on they do not take the
+/// command gate alone, which stopped every connection for as long as one
+/// ran (a `KEYS` of two million keys, ~280 ms, #772): they keep the scripts
+/// that run beside others out for that long instead ([`walk`]), and run
+/// beside every other command and each other, as they do with tag locks
+/// off. A script that runs alone, a transaction and a write of several keys
+/// hold the gate alone, which a walk holds shared: they are kept out as
+/// before. The flushes and `SWAPDB` write, and still take the gate alone.
+#[cfg(feature = "lua")]
+#[inline]
+pub fn walks_the_keyspace(name: &str) -> bool {
+    matches!(name, "KEYS" | "SCAN" | "DBSIZE" | "RANDOMKEY")
+}
+
+/// The locks a walk of the keyspace ([`walk`]) and the scripts that run
+/// beside others ([`keep_walks_out`]) keep each other out with: one per
+/// thread a script runs on, as the command gate has (`command_gate`). A
+/// script holds its thread's alone, which nothing else on that thread wants
+/// while it runs (a thread runs one script at a time), so what it costs is
+/// one uncontended lock on a line of its own. A walk holds every one of them
+/// shared, beside other walks: one call of `SCAN` or `KEYS` then finds every
+/// script's keys as they were before it or as they are after it, never
+/// between, as in Redis, where a script is one step. Every one, and not
+/// only the slots handed out so far: a thread given its slot while a walk
+/// was counting would run its script beside the walk.
+#[cfg(feature = "lua")]
+const WALK_SLOTS: usize = 128;
+
+#[cfg(feature = "lua")]
+#[repr(align(128))]
+struct WalkSlot(parking_lot::RwLock<()>);
+
+#[cfg(feature = "lua")]
+static WALK_SLOT: [WalkSlot; WALK_SLOTS] =
+    [const { WalkSlot(parking_lot::const_rwlock(())) }; WALK_SLOTS];
+
+/// The slots handed to threads so far: the next is this, modulo their
+/// number. Threads beyond that many share, and their scripts wait for each
+/// other, which is correct.
+#[cfg(feature = "lua")]
+static WALK_SLOTS_GIVEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "lua")]
+thread_local! {
+    /// This thread's slot of [`WALK_SLOT`], once it has run a script beside
+    /// others.
+    static MY_WALK_SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// Held by a script that runs beside others for as long as it runs: no walk
+/// of the keyspace is under way meanwhile ([`walk`]).
+#[cfg(feature = "lua")]
+pub struct WalksKeptOut {
+    _slot: parking_lot::RwLockWriteGuard<'static, ()>,
+}
+
+/// For a script about to run beside others: wait for the walks of the
+/// keyspace under way, if any, and keep new ones out until the script is
+/// done. Taken after the command gate and before the write gate and the
+/// tags' locks, and let go of after them: a walk takes it after the
+/// command gate too, and may enter the write gate inside it (to remove a key
+/// it finds past its time).
+#[cfg(feature = "lua")]
+#[inline]
+pub fn keep_walks_out() -> WalksKeptOut {
+    let mut slot = MY_WALK_SLOT.with(Cell::get);
+    if slot == usize::MAX {
+        slot = WALK_SLOTS_GIVEN.fetch_add(1, Ordering::Relaxed) % WALK_SLOTS;
+        MY_WALK_SLOT.with(|mine| mine.set(slot));
+    }
+    WalksKeptOut {
+        _slot: WALK_SLOT[slot].0.write(),
+    }
+}
+
+/// Held by a walk of the keyspace ([`walks_the_keyspace`]) for as long as
+/// it runs: no script runs beside others meanwhile.
+#[cfg(feature = "lua")]
+pub struct Walk {
+    _not_send: PhantomData<*const ()>,
+}
+
+/// How many walks are under way: counted from before a walk takes its first
+/// slot until it has let go of the last. A script about to run beside
+/// others waits while there are any, off its thread ([`walks_done`]).
+#[cfg(feature = "lua")]
+static WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many walks have started, ever: for a script waiting for walks to
+/// tell one long walk from a stream of them ([`walks_done`]).
+#[cfg(feature = "lua")]
+static WALKS_STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Woken when the last walk under way has ended.
+#[cfg(feature = "lua")]
+static WALKS_ENDED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// For a script about to run beside others, before it runs: wait, asleep,
+/// while a walk of the keyspace is under way. A walk can last as long as a
+/// `KEYS` over millions of keys does, and a script that waited for it in
+/// [`keep_walks_out`], inside the command, would hold its connection's
+/// thread, and every other connection of that thread, for as long. One load
+/// when no walk is under way. A walk that starts after this has looked is
+/// waited for in [`keep_walks_out`]: one walk at most.
+///
+/// Not for ever: a script that has seen more than [`WALK_STREAM`] walks
+/// start while it waited stops waiting here and waits in [`keep_walks_out`]
+/// instead, where it holds the walks that
+/// come after it back from its thread's slot — a stream of `SCAN`s, each
+/// starting before the last has ended, would otherwise keep it out for
+/// ever. (Walks do not wait for such scripts themselves: a walk waits on its
+/// thread, and the script it would wait for may be waiting on that very
+/// thread's loop.)
+#[cfg(feature = "lua")]
+#[inline]
+pub async fn walks_done() {
+    if WALKS.load(Ordering::SeqCst) != 0 {
+        wait_for_walks().await;
+    }
+}
+
+/// How many walks may start while a script waits asleep for walks to end:
+/// see [`walks_done`].
+#[cfg(feature = "lua")]
+const WALK_STREAM: usize = 3;
+
+#[cfg(feature = "lua")]
+#[cold]
+async fn wait_for_walks() {
+    let first = WALKS_STARTED.load(Ordering::SeqCst);
+    loop {
+        let ended = WALKS_ENDED.notified();
+        tokio::pin!(ended);
+        // Enabled before the count is looked at: a walk that ends after the
+        // look wakes it.
+        ended.as_mut().enable();
+        if WALKS.load(Ordering::SeqCst) == 0
+            || WALKS_STARTED.load(Ordering::SeqCst).wrapping_sub(first) > WALK_STREAM
+        {
+            return;
+        }
+        // Walks that overlap never bring the count to 0: they are counted
+        // as they start, looked at every millisecond.
+        tokio::select! {
+            () = &mut ended => {}
+            () = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+    }
+}
+
+/// Wait for the scripts running beside others, and keep new ones out, for
+/// as long as the walk is held. Each slot shared, lowest first: a walk and
+/// the scripts it waits for never wait for each other in a cycle, for a
+/// script holds one slot and waits for nothing a walk holds; and a script
+/// waiting for its slot keeps the walks that come after it out of it, so a
+/// stream of walks does not keep it from running.
+#[cfg(feature = "lua")]
+#[cold]
+#[inline(never)]
+pub fn walk() -> Walk {
+    WALKS.fetch_add(1, Ordering::SeqCst);
+    WALKS_STARTED.fetch_add(1, Ordering::SeqCst);
+    for slot in &WALK_SLOT {
+        // Let go of in `Drop`.
+        std::mem::forget(slot.0.read());
+    }
+    Walk {
+        _not_send: PhantomData,
+    }
+}
+
+#[cfg(feature = "lua")]
+impl Drop for Walk {
+    fn drop(&mut self) {
+        for slot in &WALK_SLOT {
+            // SAFETY: `walk` took every slot shared, once, and this walk
+            // has not let go of them yet.
+            unsafe { slot.0.force_unlock_read() };
+        }
+        if WALKS.fetch_sub(1, Ordering::SeqCst) == 1 {
+            WALKS_ENDED.notify_waiters();
+        }
+    }
 }
 
 /// Whether `cmd` is the command that switches this on or off. It is run
@@ -1402,5 +1593,124 @@ mod tests {
         assert!(held("nk889-d"));
         drop(guard);
         assert!(!crate::write_gate::held_by_this_thread());
+    }
+
+    /// #772: walks of the keyspace run beside each other, and not beside a
+    /// script that runs beside others; a script waits for the walks under
+    /// way, and a walk for the scripts. A walk that comes after a script
+    /// waiting for one does not go ahead of it.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn walks_and_scripts_keep_each_other_out() {
+        use std::sync::mpsc::channel;
+        let first = walk();
+        // Another walk beside it, on another thread.
+        std::thread::scope(|scope| {
+            scope.spawn(|| drop(walk())).join().unwrap();
+        });
+        // A script waits for it.
+        let (ran_tx, ran_rx) = channel();
+        let script = std::thread::spawn(move || {
+            let held = keep_walks_out();
+            ran_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            drop(held);
+        });
+        assert!(ran_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        // A walk that comes now waits behind the script.
+        let (walked_tx, walked_rx) = channel();
+        let later = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let _walk = walk();
+            walked_tx.send(std::time::Instant::now()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        drop(first);
+        ran_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the script ran once the walk was done");
+        let script_started = std::time::Instant::now();
+        let walked = walked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the later walk ran");
+        assert!(
+            walked >= script_started + Duration::from_millis(30),
+            "the later walk went ahead of the script that waited before it"
+        );
+        script.join().unwrap();
+        later.join().unwrap();
+        // Scripts of different threads run beside each other.
+        std::thread::scope(|scope| {
+            let one = keep_walks_out();
+            scope.spawn(|| drop(keep_walks_out())).join().unwrap();
+            drop(one);
+        });
+    }
+
+    /// #772: a script waits for the walks under way off its thread
+    /// (`walks_done`), and runs once they have ended.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn a_script_waits_for_walks_asleep() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // No walk: at once.
+        runtime.block_on(walks_done());
+        let first = walk();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let script = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(walks_done());
+            // Keeps walks out from here, as a script does in its command.
+            let kept = keep_walks_out();
+            done_tx.send(std::time::Instant::now()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            drop(kept);
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        let ended = std::time::Instant::now();
+        drop(first);
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap() >= ended);
+        script.join().unwrap();
+    }
+
+    /// #772: a script woken by a walk ending, and finding another under
+    /// way each time, stops waiting asleep after a few and waits for its
+    /// thread's slot instead, which holds the later walks back: a stream of
+    /// overlapping walks does not keep it out.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn a_stream_of_walks_does_not_keep_a_script_out() {
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            // Two walkers, each starting before the other has ended.
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _walk = walk();
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                });
+            }
+            let ran = scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let started = std::time::Instant::now();
+                runtime.block_on(walks_done());
+                drop(keep_walks_out());
+                started.elapsed()
+            });
+            let took = ran.join().unwrap();
+            stop.store(true, Ordering::Relaxed);
+            assert!(took < Duration::from_secs(2), "{took:?}");
+        });
     }
 }

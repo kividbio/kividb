@@ -480,7 +480,13 @@ fn takes_the_gate_alone(name: &str, cmd: &[&[u8]], script_alone: bool, gated: bo
         || (gated
             && matches!(name, "FLUSHALL" | "FLUSHDB" | "SWAPDB")
             && !crate::expiry::replaying())
-        || (crate::tag_locks::enabled() && crate::tag_locks::sees_the_whole_keyspace(name))
+        // A build without Lua runs no script beside others: a walk of the
+        // keyspace there takes the gate alone as before, should tag locks be
+        // switched on. With Lua it keeps such scripts out instead
+        // (`run_command`, `tag_locks::walk`, #772).
+        || (cfg!(not(feature = "lua"))
+            && crate::tag_locks::enabled()
+            && crate::tag_locks::sees_the_whole_keyspace(name))
         || crate::tag_locks::is_switch(name, cmd)
         // One argument is at most one key (`DEL k`, `INCR k`): asked here,
         // and the rest out of line, so that what every command runs through
@@ -741,6 +747,9 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
             ));
         }
     }
+
+    #[cfg(debug_assertions)]
+    crate::pause::test_stall_in_script(ctx.cmd.as_slice());
 
     if read_only_script && replication::inner_command_blocked_in_readonly_script(name2, &ctx.cmd) {
         return resp_error("ERR Write commands are not allowed from read-only scripts.");
@@ -1641,8 +1650,9 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     } else {
         (None, false)
     };
-    // A command that looks at keys it does not name must not find a script
-    // part-way through: it waits for all of them (`takes_the_gate_alone`).
+    // A command that changes keys it does not name must not find a script
+    // part-way through: it waits for all of them (`takes_the_gate_alone`);
+    // one that only reads them keeps the scripts out while it runs, below.
     // On a thread that holds the gate already, what either takes of it is
     // nothing: the replica's applier holds it for each turn of its master's
     // stream, alone for a command that takes it alone
@@ -1661,6 +1671,18 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     };
     let Some((_command_gate, _alone)) = gates else {
         return busy_reply();
+    };
+    // A walk of the keyspace (`KEYS`, `SCAN`, `DBSIZE`, `RANDOMKEY`) and the
+    // scripts that run beside others keep each other out, and nothing else:
+    // a walk finds every such script's keys as they were before it or as
+    // they are after it (`tag_locks::walk`, #772). Before the write gate,
+    // for a script: a walk may enter it. Not on a thread that holds the gate
+    // alone, where nothing else runs.
+    #[cfg(feature = "lua")]
+    let _walk = if tag_locks && (beside_others || crate::tag_locks::walks_the_keyspace(name)) {
+        walks_and_scripts_kept_apart(beside_others)
+    } else {
+        None
     };
 
     // A write under a script or an `EXEC` that already holds the gate is part
@@ -1890,6 +1912,35 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         result
     };
     crate::tracking::with_what_came_before(result)
+}
+
+/// What a walk of the keyspace, or a script that runs beside others, holds
+/// to keep the other out (see `tag_locks::walk`). Out of line: only those
+/// come here.
+#[cfg(feature = "lua")]
+enum WalkOrScript {
+    Walk {
+        _held: crate::tag_locks::Walk,
+    },
+    Script {
+        _held: crate::tag_locks::WalksKeptOut,
+    },
+}
+
+#[cfg(feature = "lua")]
+#[inline(never)]
+fn walks_and_scripts_kept_apart(beside_others: bool) -> Option<WalkOrScript> {
+    if crate::command_gate::alone_on_this_thread() {
+        None
+    } else if beside_others {
+        Some(WalkOrScript::Script {
+            _held: crate::tag_locks::keep_walks_out(),
+        })
+    } else {
+        Some(WalkOrScript::Walk {
+            _held: crate::tag_locks::walk(),
+        })
+    }
 }
 
 /// The command to the clients in `MONITOR`, unless it is resuming or is an

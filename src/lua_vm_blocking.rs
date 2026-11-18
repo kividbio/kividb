@@ -456,6 +456,10 @@ pub(crate) async fn run_lua_vm_blocking(
             // thread's script runs, this thread serves its other
             // connections — which may be on tags nobody holds.
             let _turn = crate::tag_locks::script_turn(&tags).await;
+            // And the end of a walk of the keyspace under way (`KEYS`,
+            // `SCAN`), which keeps such scripts out while it runs: here too,
+            // and not inside the command (#772).
+            crate::tag_locks::walks_done().await;
             crate::tag_locks::allow_next_script();
             let (resp, sel_out, elapsed_us) = ran_quick(key, sel, || {
                 env.run_execute_borrowed(cmd.to_vec(), sel, aof_enabled, client_resp)

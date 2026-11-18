@@ -175,8 +175,25 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   {orders}:waiting` sent while a script on `orders` is running is answered
   when the script has finished; so is a command naming a key of any of the
   tags of a script of several. Keys without a tag are never waited for.
-  `MULTI`/`EXEC`, and the commands that look at the whole keyspace, wait
-  for every running script.
+  `MULTI`/`EXEC`, `FLUSHALL`, `FLUSHDB` and `SWAPDB` wait for every running
+  script, and hold back every other command while they run.
+
+- **A walk of the keyspace waits for the scripts running beside others,
+  and only for them.** `KEYS`, `SCAN`, `DBSIZE` and `RANDOMKEY` wait for
+  every script that is running beside others, and keep new ones from
+  starting until they are done; they run beside every other command, and
+  beside each other, as with `lua-parallel-scripts no`. So a reply of
+  `KEYS`, or one page of `SCAN`, finds each script's keys as they were
+  before it or as they are after it, never part-way through, as in Redis,
+  where a script is one step. (Across the pages of a `SCAN`, a key a script
+  made or removed meanwhile may or may not be returned, as in Redis.) A
+  `KEYS` over millions of keys holds those scripts back for as long as it
+  runs, and nothing else: a script waits for it asleep, as it waits for a
+  script on its tag, and the thread it would run on goes on serving its
+  other connections. A script that finds walk after walk under way (a loop
+  of `SCAN`s, each starting before the last has ended) stops waiting
+  asleep after three and holds the walks after it back, so it is not kept
+  out.
 
 ### Using it
 

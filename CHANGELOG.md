@@ -326,6 +326,39 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **With `lua-parallel-scripts` on, `KEYS`, `SCAN`, `DBSIZE` and
+  `RANDOMKEY` no longer stop every connection (#772).** So that a walk of
+  the keyspace never finds a script running beside others part-way
+  through, they took the command gate alone: a `KEYS` over a million keys
+  held every connection for as long as it ran, and one that waited for a
+  script held back every command behind it on every thread. They now keep
+  out only the scripts running beside others, which keep them out in turn
+  (a lock per thread a script runs on, which the script holds alone and a
+  walk holds shared); they run beside every other command and each other,
+  as with `lua-parallel-scripts no`. A reply of `KEYS`, or a page of
+  `SCAN`, still finds each script's keys as they were before it or as they
+  are after it, as in Redis. A script that finds a walk under way waits
+  for it asleep, off its thread; one that finds walk after walk stops
+  waiting after three and holds the walks after it back, so a loop of
+  `SCAN`s cannot keep scripts out. The flushes, `SWAPDB`, transactions and
+  scripts that run alone take the gate alone as before; a build without
+  Lua is unchanged. Measured on 1,000,000 keys with a `KEYS *` loop, 16
+  connections sending `GET` and 4 a tagged `EVALSHA`, `--threads 4`
+  (Azure D8s_v5, server on 4 vCPUs, clients on the other 4), 15 s:
+
+  | | `GET`s served | `GET` connections stalled over 50 ms | `GET`s over 50 ms | scripts over 50 ms |
+  |---|---|---|---|---|
+  | before, io_uring | 45,900 | 16 of 16 | 290 | 73 |
+  | after, io_uring | 142,200 | 5 of 16 | 74 | 74 |
+  | `lua-parallel-scripts no`, io_uring | 136,500 | 11 of 16 | 198 | 74 |
+  | before, Tokio | 47,100 | 16 of 16 | 305 | 76 |
+  | after, Tokio | 142,200 | 2 of 16 | 2 | 72 |
+
+  The connections that still stall are those served by the thread running
+  the `KEYS` (io_uring), as with the setting off; the scripts wait for each
+  `KEYS`, which a script cannot run beside. A `SCAN` loop (`COUNT 1000`)
+  stalled nothing over 20 ms before or after.
+
 - **Pub/sub fan-out delivers 18-29 % more messages a second, ahead of
   Redis (#851).** socket.io's Redis adapter publishes every broadcast with
   `PUBLISH socket.io#/#<room>#` to servers that each `PSUBSCRIBE
@@ -429,9 +462,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of the `DEL` loop are `COUNT` and a shard's floor of a sixteenth of its
   keys, taken when a call starts in a shard it does not finish.) A
   connection served by the same thread as a running `SCAN` still waits for
-  it, as with any command on the io_uring loop. With `lua-parallel-scripts yes`, `SCAN` still takes the command
-  gate alone (#772): unlike Redis's, a call goes through the keyspace a
-  shard at a time, and without the gate it could find a script's keys
+  it, as with any command on the io_uring loop. With `lua-parallel-scripts yes`, a call
+  of `SCAN` keeps the scripts running beside others out while it runs, and
+  nothing else (#772, below): unlike Redis's, a call goes through the
+  keyspace a shard at a time, and could otherwise find a script's keys
   halfway through what the script does. Regression suite
   `22-scan-large-count` measures it.
 
