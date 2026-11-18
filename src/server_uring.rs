@@ -507,9 +507,10 @@ async fn park_blocking_uring(
     client_registry.set_blocked(client_id, None, false);
     // A `CLIENT UNBLOCK` that took the client off the list just as its
     // wait ended otherwise, woken say, was answered 1: it is done as it
-    // said. Taken as a wake-up, it was lost, and a client woken for
-    // nothing waited again for ever. It is sent under the list's lock
-    // (`ClientRegistry::unblock`), so by now it is in the channel.
+    // said. Otherwise the client went on as woken, and one woken for
+    // nothing parked again and stayed blocked. It is sent under the
+    // list's lock (`ClientRegistry::unblock`), so by now it is in the
+    // channel.
     let unblocked = if unblockable {
         unblock_rx.try_recv().ok()
     } else {

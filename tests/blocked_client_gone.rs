@@ -1761,8 +1761,8 @@ fn a_pop_that_ends_with_nothing_wakes_nobody_behind_it() {
 
 /// A `CLIENT UNBLOCK` that lands as the client's wait ends otherwise — woken
 /// by a push that someone else's pop then took — is answered 1, and is done:
-/// the client is answered as it says, not left to find nothing and wait
-/// again for ever. The test build holds a woken client, on
+/// the client is answered as it says, not left blocked after finding
+/// nothing. The test build holds a woken client, on
 /// `KIVIDB_TEST_WOKEN_DELAY_MS`, before it is taken off the list.
 #[test]
 fn an_unblock_as_the_client_is_woken_is_not_lost() {
