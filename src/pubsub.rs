@@ -43,6 +43,11 @@ struct Delivery {
     /// The whole frame as RESP2 writes it, built once for every subscriber
     /// it goes to through `subscription` (see [`frame`]).
     frame: Arc<[u8]>,
+    /// A large payload, apart from `frame` (which then ends at its length
+    /// line): copied once for every channel and pattern it goes through,
+    /// and before the subscription table is locked (see
+    /// [`SHARED_PAYLOAD_FROM`]).
+    payload: Option<Arc<[u8]>>,
     /// Roughly what it costs to keep queued, and to send: the payload's and
     /// the channel's lengths and 64.
     weight: usize,
@@ -136,6 +141,14 @@ impl Subscriber {
     fn note_pending(&self, pending: usize) {
         if let Some(activity) = &self.activity {
             activity.set_pubsub_output(pending);
+        }
+    }
+
+    /// What `CLIENT LIST` counts in the connection's `tot-mem` for the
+    /// buffers its writer keeps (see `Outbox`).
+    fn note_kept(&self, bytes: usize) {
+        if let Some(activity) = &self.activity {
+            activity.set_pubsub_kept(bytes);
         }
     }
 
@@ -257,17 +270,19 @@ impl PubSubHub {
         }
         let (channel, payload) = (channel.as_ref(), payload.as_ref());
         let weight = payload.len() + channel.len() + 64;
+        let shared = shared_payload(payload);
         let mut delivered = 0;
         let mut overflowed: Vec<Arc<Subscriber>> = Vec::new();
         {
             let tables = self.inner.tables.read();
             if let Some((key, subscribers)) = tables[CHANNEL].get_key_value(channel) {
-                let frame = frame(CHANNEL, key, channel, payload);
+                let frame = frame(CHANNEL, key, channel, payload, &shared);
                 for subscriber in subscribers {
                     let delivery = Delivery {
                         kind: CHANNEL,
                         subscription: Arc::clone(key),
                         frame: Arc::clone(&frame),
+                        payload: shared.clone(),
                         weight,
                     };
                     delivered += hand_over(subscriber, delivery, from, &mut overflowed);
@@ -279,12 +294,13 @@ impl PubSubHub {
                 if !glob_matches(pattern, channel) {
                     continue;
                 }
-                let frame = frame(PATTERN, pattern, channel, payload);
+                let frame = frame(PATTERN, pattern, channel, payload, &shared);
                 for subscriber in subscribers {
                     let delivery = Delivery {
                         kind: PATTERN,
                         subscription: Arc::clone(pattern),
                         frame: Arc::clone(&frame),
+                        payload: shared.clone(),
                         weight,
                     };
                     delivered += hand_over(subscriber, delivery, from, &mut overflowed);
@@ -319,17 +335,19 @@ impl PubSubHub {
         }
         let (shard, payload) = (shard.as_ref(), payload.as_ref());
         let weight = payload.len() + shard.len() + 64;
+        let shared = shared_payload(payload);
         let mut delivered = 0;
         let mut overflowed: Vec<Arc<Subscriber>> = Vec::new();
         {
             let tables = self.inner.tables.read();
             if let Some((key, subscribers)) = tables[SHARD].get_key_value(shard) {
-                let frame = frame(SHARD, key, shard, payload);
+                let frame = frame(SHARD, key, shard, payload, &shared);
                 for subscriber in subscribers {
                     let delivery = Delivery {
                         kind: SHARD,
                         subscription: Arc::clone(key),
                         frame: Arc::clone(&frame),
+                        payload: shared.clone(),
                         weight,
                     };
                     delivered += hand_over(subscriber, delivery, from, &mut overflowed);
@@ -473,7 +491,18 @@ fn glob_matches(pattern: &[u8], text: &[u8]) -> bool {
 // A message's frame is built once, when it is published, for all the
 // subscribers it goes to through one channel or pattern, as RESP2 writes it;
 // it was framed again for each of them as it was written (#851). The RESP3
-// push differs only in its first byte.
+// push differs only in its first byte. A payload of `SHARED_PAYLOAD_FROM`
+// bytes or more is copied once, before the subscription table is locked,
+// and shared by the frames, as 1.2 shared it: copying 64 MB for each of three
+// patterns with the table locked held up every SUBSCRIBE and PUBLISH behind it.
+
+/// From this size a payload is kept apart from the frames (see above).
+const SHARED_PAYLOAD_FROM: usize = 4 << 10;
+
+/// The payload, copied once to be shared, if it is large.
+fn shared_payload(payload: &[u8]) -> Option<Arc<[u8]>> {
+    (payload.len() >= SHARED_PAYLOAD_FROM).then(|| Arc::from(payload))
+}
 
 /// `n` in decimal, without allocating.
 fn write_count(out: &mut Vec<u8>, n: usize) {
@@ -495,9 +524,17 @@ fn write_bulk(out: &mut Vec<u8>, data: &[u8]) {
 }
 
 /// The frame of a message published on `channel` for the subscribers of
-/// `subscription` (a pattern for `PATTERN`), as RESP2 writes it.
-fn frame(kind: usize, subscription: &[u8], channel: &[u8], payload: &[u8]) -> Arc<[u8]> {
-    let mut out = Vec::with_capacity(subscription.len() + channel.len() + payload.len() + 64);
+/// `subscription` (a pattern for `PATTERN`), as RESP2 writes it; up to the
+/// payload's length line only if the payload is `shared`.
+fn frame(
+    kind: usize,
+    subscription: &[u8],
+    channel: &[u8],
+    payload: &[u8],
+    shared: &Option<Arc<[u8]>>,
+) -> Arc<[u8]> {
+    let inline = if shared.is_some() { 0 } else { payload.len() };
+    let mut out = Vec::with_capacity(subscription.len() + channel.len() + inline + 64);
     match kind {
         PATTERN => {
             write_header(&mut out, 2, 4);
@@ -515,7 +552,13 @@ fn frame(kind: usize, subscription: &[u8], channel: &[u8], payload: &[u8]) -> Ar
         }
     }
     write_bulk(&mut out, channel);
-    write_bulk(&mut out, payload);
+    if shared.is_some() {
+        out.push(b'$');
+        write_count(&mut out, payload.len());
+        out.extend_from_slice(b"\r\n");
+    } else {
+        write_bulk(&mut out, payload);
+    }
     Arc::from(out)
 }
 
@@ -524,8 +567,19 @@ fn frame(kind: usize, subscription: &[u8], channel: &[u8], payload: &[u8]) -> Ar
 fn write_delivery(out: &mut Vec<u8>, resp: u8, delivery: &Delivery) {
     let start = out.len();
     out.extend_from_slice(&delivery.frame);
+    if let Some(payload) = &delivery.payload {
+        out.extend_from_slice(payload);
+        out.extend_from_slice(b"\r\n");
+    }
     if resp >= 3 {
         out[start] = b'>';
+    }
+}
+
+impl Delivery {
+    /// The bytes [`write_delivery`] writes for it.
+    fn len(&self) -> usize {
+        self.frame.len() + self.payload.as_ref().map_or(0, |p| p.len() + 2)
     }
 }
 
@@ -785,10 +839,18 @@ pub struct Outbox {
     frames: Vec<u8>,
 }
 
-/// What an idle subscriber keeps of its buffers: a burst's batch of
-/// thousands of messages is not held on to by every subscriber that had one.
+/// What a subscriber keeps of its buffers once its queue is empty: a
+/// burst's batch of thousands of messages is not held on to by every
+/// subscriber that had one.
 const KEEP_DELIVERIES: usize = 64;
 const KEEP_FRAME_BYTES: usize = 16 << 10;
+/// A subscriber idle this long gives back what it kept: a server with many
+/// quiet subscribers holds nothing for them, as before #851. Only armed when
+/// it keeps more than [`KEEP_IDLE_BYTES`], so that a quiet subscriber that
+/// never had a large batch never sets a timer, and a busy one never waits on
+/// one.
+const IDLE_RELEASE: std::time::Duration = std::time::Duration::from_secs(1);
+const KEEP_IDLE_BYTES: usize = 256;
 
 /// Some messages, in order, taken from the queue.
 pub struct Batch<'a> {
@@ -805,7 +867,17 @@ impl Outbox {
             Ok(delivery) => delivery,
             Err(_) => {
                 self.trim();
-                self.rx.recv().await?
+                if self.kept() > KEEP_IDLE_BYTES {
+                    match tokio::time::timeout(IDLE_RELEASE, self.rx.recv()).await {
+                        Ok(delivery) => delivery?,
+                        Err(_) => {
+                            self.release();
+                            self.rx.recv().await?
+                        }
+                    }
+                } else {
+                    self.rx.recv().await?
+                }
             }
         };
         // Let this thread's other ready connections run first: what they
@@ -854,7 +926,24 @@ impl Outbox {
         if self.frames.capacity() > KEEP_FRAME_BYTES {
             self.frames = Vec::new();
         }
+        self.me.note_kept(self.kept());
     }
+
+    /// Idle: let go of everything kept.
+    fn release(&mut self) {
+        self.deliveries = Vec::new();
+        self.frames = Vec::new();
+        self.me.note_kept(0);
+    }
+
+    /// The bytes of the buffers kept between batches.
+    fn kept(&self) -> usize {
+        kept_bytes(&self.deliveries, &self.frames)
+    }
+}
+
+fn kept_bytes(deliveries: &Vec<Delivery>, frames: &Vec<u8>) -> usize {
+    deliveries.capacity() * std::mem::size_of::<Delivery>() + frames.capacity()
 }
 
 impl Batch<'_> {
@@ -870,7 +959,7 @@ impl Batch<'_> {
         let mut out = std::mem::take(&mut *self.frames);
         out.clear();
         let live = self.me.live.lock();
-        let len: usize = self.deliveries.iter().map(|d| d.frame.len()).sum();
+        let len: usize = self.deliveries.iter().map(Delivery::len).sum();
         out.reserve(len);
         for delivery in self.deliveries.iter() {
             if live[delivery.kind].contains(&delivery.subscription) {
@@ -883,6 +972,14 @@ impl Batch<'_> {
     /// The buffer [`Batch::encode`] gave, written: kept for the next batch.
     pub fn written(&mut self, frames: Vec<u8>) {
         *self.frames = frames;
+        self.me.note_kept(kept_bytes(self.deliveries, self.frames));
+    }
+}
+
+impl Drop for Outbox {
+    /// Its buffers go with it: nothing is left counted for the client.
+    fn drop(&mut self) {
+        self.me.note_kept(0);
     }
 }
 
@@ -1082,6 +1179,83 @@ mod tests {
         assert!(idle);
         assert!(outbox.frames.capacity() <= KEEP_FRAME_BYTES);
         assert!(outbox.deliveries.capacity() <= KEEP_DELIVERIES);
+    }
+
+    /// A subscriber that stays idle gives back what it kept from its last
+    /// batch; one that keeps next to nothing waits without a timer (#851).
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_subscriber_gives_its_buffers_back() {
+        let hub = PubSubHub::new();
+        let (mut subs, mut outbox) = subscriber(&hub, 1);
+        subs.handle(&[b"SUBSCRIBE", b"c"], 2);
+        subs.flushed();
+        hub.publish("c", vec![b'x'; 15 << 10]);
+        {
+            let mut batch = outbox.next().await.unwrap();
+            let out = batch.encode(2);
+            batch.written(out);
+        }
+        assert!(outbox.kept() > 15 << 10);
+        // Not yet idle for long: kept, within the small limits.
+        let waited = tokio::time::timeout(IDLE_RELEASE / 2, outbox.next())
+            .await
+            .is_err();
+        assert!(waited);
+        let kept = outbox.kept();
+        assert!(kept > KEEP_IDLE_BYTES && kept <= KEEP_FRAME_BYTES + 64 * 64);
+        // Idle past IDLE_RELEASE: nothing kept.
+        let waited = tokio::time::timeout(IDLE_RELEASE * 3, outbox.next())
+            .await
+            .is_err();
+        assert!(waited);
+        assert_eq!(outbox.kept(), 0);
+        // And it still delivers.
+        hub.publish("c", &b"after"[..]);
+        assert_eq!(
+            frames(&mut outbox, 2).await,
+            "*3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$5\r\nafter\r\n"
+        );
+    }
+
+    /// A large payload is shared by the frames of every pattern it goes
+    /// through, and framed for the protocol of the moment: a subscriber
+    /// that switches RESP2 -> RESP3 -> RESP2 between batches gets arrays,
+    /// pushes, arrays, of small and large messages alike (#851).
+    #[tokio::test]
+    async fn shared_frames_follow_a_protocol_switch() {
+        let hub = PubSubHub::new();
+        let (mut subs, mut outbox) = subscriber(&hub, 1);
+        let (mut other, mut other_out) = subscriber(&hub, 2);
+        subs.handle(&[b"PSUBSCRIBE", b"a*", b"*b"], 2);
+        other.handle(&[b"PSUBSCRIBE", b"a*"], 2);
+        subs.flushed();
+        other.flushed();
+        let big = vec![b'y'; SHARED_PAYLOAD_FROM + 1];
+        let big_bulk = format!("${}\r\n{}\r\n", big.len(), "y".repeat(big.len()));
+        for (n, resp) in [2u8, 3, 2].into_iter().enumerate() {
+            assert_eq!(hub.publish("ab", &b"s"[..]), 3);
+            assert_eq!(hub.publish("ab", &big[..]), 3);
+            let head = if resp >= 3 { '>' } else { '*' };
+            let got = frames(&mut outbox, resp).await;
+            for pattern in ["a*", "*b"] {
+                for bulk in ["$1\r\ns\r\n".to_string(), big_bulk.clone()] {
+                    let one = format!(
+                        "{head}4\r\n$8\r\npmessage\r\n$2\r\n{pattern}\r\n$2\r\nab\r\n{bulk}"
+                    );
+                    assert!(got.contains(&one), "round {n}, {pattern}: {got:.80}");
+                }
+            }
+            assert_eq!(got.matches("pmessage").count(), 4);
+            // The other subscriber, RESP2 throughout, is not changed by it.
+            let theirs = frames(&mut other_out, 2).await;
+            assert_eq!(
+                theirs,
+                format!(
+                    "*4\r\n$8\r\npmessage\r\n$2\r\na*\r\n$2\r\nab\r\n$1\r\ns\r\n\
+                     *4\r\n$8\r\npmessage\r\n$2\r\na*\r\n$2\r\nab\r\n{big_bulk}"
+                )
+            );
+        }
     }
 
     /// Queued through a pattern, not yet written, when the pattern is

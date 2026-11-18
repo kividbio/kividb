@@ -591,3 +591,48 @@ fn tracking_invalidations_beside_pattern_messages() {
         assert!(matches!(got[0], Resp::Push(_)));
     }
 }
+
+/// A subscriber that shares its frames with another switches from RESP3 to
+/// RESP2 mid-stream: pushes before the HELLO 2, arrays after it, for small
+/// and large (shared-payload) messages; the other subscriber is unaffected.
+#[test]
+fn hello_switch_mid_stream_with_shared_frames() {
+    for io_model in io_models() {
+        let port = start_server(&io_model);
+        let mut switcher = Conn::resp3(port);
+        let mut other = Conn::connect(port);
+        assert_eq!(switcher.cmd(&["PSUBSCRIBE", "sw:*"]).items()[2].int(), 1);
+        assert_eq!(other.cmd(&["PSUBSCRIBE", "sw:*"]).items()[2].int(), 1);
+        let mut publisher = Conn::connect(port);
+        let big = "z".repeat(20_000);
+        let frame = |head: char, payload: &str| {
+            format!(
+                "{head}4\r\n$8\r\npmessage\r\n$4\r\nsw:*\r\n$4\r\nsw:1\r\n${}\r\n{payload}\r\n",
+                payload.len()
+            )
+            .into_bytes()
+        };
+        for payload in ["small", big.as_str()] {
+            assert_eq!(publisher.cmd(&["PUBLISH", "sw:1", payload]).int(), 2);
+        }
+        for payload in ["small", big.as_str()] {
+            assert_eq!(switcher.raw_frame(), frame('>', payload), "{io_model:?}");
+        }
+        match switcher.cmd(&["HELLO", "2"]) {
+            Resp::Array(_) => {}
+            other => panic!("HELLO 2: {other:?}"),
+        }
+        for payload in ["small", big.as_str()] {
+            assert_eq!(publisher.cmd(&["PUBLISH", "sw:1", payload]).int(), 2);
+        }
+        for payload in ["small", big.as_str()] {
+            assert_eq!(switcher.raw_frame(), frame('*', payload), "{io_model:?}");
+        }
+        for _ in 0..2 {
+            for payload in ["small", big.as_str()] {
+                assert_eq!(other.raw_frame(), frame('*', payload), "{io_model:?}");
+            }
+        }
+        assert!(switcher.quiet_for(200) && other.quiet_for(200));
+    }
+}
