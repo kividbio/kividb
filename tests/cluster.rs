@@ -1728,67 +1728,27 @@ fn a_node_killed_while_saving_its_nodes_conf_starts_from_the_old_one() {
     node.kill();
     let before = std::fs::read_to_string(&conf).unwrap();
 
-    // Started with the failpoint, whose stops at startup are let go.
-    node.env.push((
-        "KIVIDB_TEST_FAILPOINTS".to_string(),
-        "nodes-conf-written".to_string(),
-    ));
-    let releasing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let releaser = {
-        let (dir, releasing) = (node.dir.clone(), std::sync::Arc::clone(&releasing));
-        std::thread::spawn(move || {
-            while releasing.load(std::sync::atomic::Ordering::Relaxed) {
-                for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if name.starts_with("failpoint.nodes-conf-written.") {
-                        let _ = std::fs::remove_file(entry.path());
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        })
-    };
+    // Started with the failpoint: every save goes past it, but the one that
+    // has the slots added below.
+    node.env
+        .push((FAILPOINT_SAVES.0.to_string(), FAILPOINT_SAVES.1.to_string()));
+    let gate = SaveGate::new(&node.dir, |file| file.contains(" 0-199\n"));
     node.spawn();
-    // Long enough for the saves of the start to be made.
-    std::thread::sleep(Duration::from_secs(2));
-    releasing.store(false, std::sync::atomic::Ordering::Relaxed);
-    releaser.join().unwrap();
-    let held = |dir: &std::path::Path| {
-        std::fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .find(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("failpoint.nodes-conf-written.")
-            })
-            .is_some()
-    };
-    assert!(!held(&node.dir), "a save of the start still held");
     let saved = std::fs::read_to_string(&conf).unwrap();
 
     let port = node.port;
     let adding = std::thread::spawn(move || {
         Conn::connect(port).try_cmd(&["CLUSTER", "ADDSLOTSRANGE", "100", "199"])
     });
-    wait_until(
-        "the save to reach the failpoint",
-        Duration::from_secs(15),
-        || held(&node.dir),
-    );
+    let held = gate.wait_held(Duration::from_secs(30));
     // The new file is written, beside the old one, which is untouched.
-    let temps: Vec<String> = std::fs::read_dir(&node.dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("nodes.conf.tmp"))
-        .collect();
-    assert_eq!(temps.len(), 1, "{temps:?}");
-    let written = std::fs::read_to_string(node.dir.join(&temps[0])).unwrap();
+    let written =
+        std::fs::read_to_string(node.dir.join(std::fs::read_to_string(&held).unwrap())).unwrap();
     assert!(written.contains(" 0-199\n"), "{written}");
     assert_eq!(std::fs::read_to_string(&conf).unwrap(), saved);
 
     node.kill();
+    gate.finish();
     // Never acknowledged.
     assert!(adding.join().unwrap().is_err());
     for entry in std::fs::read_dir(&node.dir).unwrap().flatten() {
@@ -1819,11 +1779,241 @@ fn a_node_killed_while_saving_its_nodes_conf_starts_from_the_old_one() {
     );
 }
 
+/// `KIVIDB_TEST_FAILPOINTS` for the failpoint `nodes-conf-written`: every
+/// save of nodes.conf stops once its temporary file is written and synced,
+/// before it is put in place (the failpoint's file names the temporary one).
+const FAILPOINT_SAVES: (&str, &str) = ("KIVIDB_TEST_FAILPOINTS", "nodes-conf-written");
+
+type Holds = dyn Fn(&str) -> bool + Send + Sync;
+
+/// Lets the saves of a node started with [`FAILPOINT_SAVES`] go on past the
+/// failpoint, as they reach it, except those whose file `hold` accepts:
+/// those are held there, until [`SaveGate::release`].
+struct SaveGate {
+    hold: std::sync::Arc<parking_lot::Mutex<Box<Holds>>>,
+    held: std::sync::Arc<parking_lot::Mutex<Vec<PathBuf>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SaveGate {
+    fn new(dir: &std::path::Path, hold: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        let hold: std::sync::Arc<parking_lot::Mutex<Box<Holds>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(Box::new(hold)));
+        let held = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<PathBuf>::new()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = {
+            let (dir, hold, held, stop) = (
+                dir.to_path_buf(),
+                std::sync::Arc::clone(&hold),
+                std::sync::Arc::clone(&held),
+                std::sync::Arc::clone(&stop),
+            );
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                        let path = entry.path();
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if !name.starts_with("failpoint.nodes-conf-written.")
+                            || held.lock().contains(&path)
+                        {
+                            continue;
+                        }
+                        // Not yet written, the next time round.
+                        let Ok(file) = std::fs::read_to_string(&path) else {
+                            continue;
+                        };
+                        let Ok(saving) = std::fs::read_to_string(dir.join(file.trim())) else {
+                            continue;
+                        };
+                        if file.trim().is_empty() {
+                            continue;
+                        }
+                        if (hold.lock())(&saving) {
+                            held.lock().push(path);
+                        } else {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+        Self {
+            hold,
+            held,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Hold, from now on, the saves `hold` accepts.
+    fn set_hold(&self, hold: impl Fn(&str) -> bool + Send + Sync + 'static) {
+        *self.hold.lock() = Box::new(hold);
+    }
+
+    /// The failpoint file of the first save held, once there is one.
+    fn wait_held(&self, timeout: Duration) -> PathBuf {
+        let mut first = None;
+        wait_until("a save to be held", timeout, || {
+            first = self.held.lock().first().cloned();
+            first.is_some()
+        });
+        first.unwrap()
+    }
+
+    /// Let the save held at `failpoint` go on.
+    fn release(&self, failpoint: &std::path::Path) {
+        self.held.lock().retain(|p| p != failpoint);
+        std::fs::remove_file(failpoint).unwrap();
+    }
+
+    fn finish(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+    }
+}
+
+/// The temporary files of saves under way in `node`'s directory.
+fn saves_under_way(node: &Node) -> Vec<String> {
+    std::fs::read_dir(&node.dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("nodes.conf.tmp"))
+        .collect()
+}
+
+/// A `CLUSTER FORGET` made while an earlier save of the node it forgets is
+/// still on its way to the file (written, being synced) is not undone by
+/// that save. Saves are synced without the save lock, and a save whose
+/// topology was that of the file in place was skipped, without regard to
+/// one still to come: the FORGET, which put the topology back to what was
+/// in place, was skipped and answered, and the earlier save, put in place
+/// after it, had the node, which a restart brought back.
+#[test]
+fn a_forget_during_an_earlier_save_is_not_undone_by_it() {
+    let mut a = Node::start(&[]);
+    a.kill();
+    a.env
+        .push((FAILPOINT_SAVES.0.to_string(), FAILPOINT_SAVES.1.to_string()));
+    let gate = SaveGate::new(&a.dir, |_| false);
+    a.spawn();
+    let (mut nodes, _) = form_cluster_of(vec![a, Node::start(&[])]);
+    let x = Node::start(&[]);
+    let x_id = x.id();
+    let held_id = x_id.clone();
+    gate.set_hold(move |file| file.contains(&held_id));
+    // Node 0 learns of it from node 1, by gossip, and saves it: held.
+    let r = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MEET", "127.0.0.1", &x.port.to_string()]);
+    assert!(r.is_ok(), "{r:?}");
+    let held = gate.wait_held(Duration::from_secs(30));
+    assert!(row_of(&nodes[0], &x_id).is_some());
+    assert!(!saved_in(&nodes[0], &x_id));
+    // Saved, through the failpoint, before it is answered.
+    let r = nodes[0].conn().cmd(&["CLUSTER", "FORGET", &x_id]);
+    assert!(r.is_ok(), "{r:?}");
+    gate.release(&held);
+    wait_until("the held save to end", Duration::from_secs(15), || {
+        saves_under_way(&nodes[0]).is_empty()
+    });
+    drop(x);
+    stop_all(&mut nodes, Stop::Kill);
+    gate.finish();
+    assert!(
+        !saved_in(&nodes[0], &x_id),
+        "{}",
+        std::fs::read_to_string(nodes[0].dir.join("nodes.conf")).unwrap()
+    );
+    nodes[0].env.clear();
+    nodes[0].spawn();
+    assert!(row_of(&nodes[0], &x_id).is_none());
+}
+
+/// A node that cannot save nodes.conf (here, its directory is read-only)
+/// does not make a node that meets it a member, and does not answer the
+/// MEET: "listed without `handshake`" stays "saved at both ends". It says
+/// so once, as an error. The node that sent the MEET tries again, and once
+/// the disk can be written to the two are members of each other.
+#[cfg(unix)]
+#[test]
+fn a_node_that_cannot_save_makes_no_node_met_a_member() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: run as root, the directory is writable whatever its mode");
+        return;
+    }
+    let a = Node::start(&[]);
+    let n = Node::start(&[]);
+    let (a_id, n_id) = (a.id(), n.id());
+    let mode = |m: u32| {
+        std::fs::set_permissions(&n.dir, std::fs::Permissions::from_mode(m)).unwrap();
+    };
+    mode(0o555);
+    let r = a
+        .conn()
+        .cmd(&["CLUSTER", "MEET", "127.0.0.1", &n.port.to_string()]);
+    assert!(r.is_ok(), "{r:?}");
+    // Several tries of the MEET.
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(row_of(&n, &a_id).is_none(), "made a member unsaved");
+    assert!(row_of(&a, &n_id).is_none(), "made a member unanswered");
+    let log = n.log();
+    assert_eq!(
+        log.matches("could not save the cluster config file")
+            .count(),
+        1,
+        "{log}"
+    );
+    mode(0o755);
+    wait_until(
+        "the two to be members of each other",
+        Duration::from_secs(30),
+        || {
+            row_of(&n, &a_id).is_some_and(|r| !r[2].contains("handshake"))
+                && row_of(&a, &n_id).is_some_and(|r| !r[2].contains("handshake"))
+        },
+    );
+    assert!(saved_in(&n, &a_id) && saved_in(&a, &n_id));
+    assert!(n.log().contains("is saved again"));
+}
+
+/// Many nodes meeting one at once (as `redis-cli --cluster create` has every
+/// node meet the first) all join, and all agree: the one they meet saves
+/// them together, not one write each.
+#[test]
+fn many_nodes_meeting_one_at_once_all_join() {
+    let nodes: Vec<Node> = (0..13).map(|_| Node::start(&[])).collect();
+    let hub = nodes[0].port;
+    let meets: Vec<_> = nodes[1..]
+        .iter()
+        .map(|n| {
+            let port = n.port;
+            std::thread::spawn(move || {
+                Conn::connect(port).cmd(&["CLUSTER", "MEET", "127.0.0.1", &hub.to_string()])
+            })
+        })
+        .collect();
+    for m in meets {
+        let r = m.join().unwrap();
+        assert!(r.is_ok(), "{r:?}");
+    }
+    wait_until("all 13 to know all 13", Duration::from_secs(60), || {
+        nodes
+            .iter()
+            .all(|n| n.cluster_info("cluster_known_nodes") == "13")
+    });
+}
+
 /// A nodes.conf that was cut short — empty, or without its last line, the
 /// `vars` line every save ends with — is refused at startup, with the reason,
 /// and left as it is. Read as far as it went, it used to start the node with
-/// nodes and slots missing and its epochs back at 0; empty, as a new node,
-/// with a new id and none of its slots.
+/// nodes and slots missing and its epochs back at 0. An empty one was
+/// refused before too (it has no `myself` line), and is still.
 #[test]
 fn a_nodes_conf_cut_short_is_refused_not_read_as_far_as_it_goes() {
     let mut node = Node::start(&[]);

@@ -370,10 +370,16 @@ pub struct ClusterState {
     /// unchanged topology is not rewritten. See `persist::save_from_state`.
     pub(crate) save_lock: parking_lot::Mutex<()>,
     pub(crate) last_saved_fingerprint: AtomicU64,
-    /// Saves begun, and the newest of them in place: a save is synced
-    /// without `save_lock`, and is not put in place over a newer one.
-    pub(crate) saves_written: AtomicU64,
-    pub(crate) saves_in_place: AtomicU64,
+    /// Where the saves of nodes.conf stand: a save is synced without
+    /// `save_lock`, and is not put in place over a newer one.
+    pub(crate) saves: persist::Saves,
+    /// `ip:bus_port` of each `CLUSTER MEET` under way (see
+    /// `bus::dialer::send_meet`): its handshake entry is kept while it is.
+    pub(crate) meets: parking_lot::Mutex<ahash::AHashSet<String>>,
+    /// `ip:bus_port` of each `CLUSTER MEET` given up after the peer was
+    /// reached, until when: the peer may have made this node a member, so a
+    /// heartbeat from there takes the MEET up again (`bus::listener`).
+    pub(crate) meets_given_up: parking_lot::Mutex<AHashMap<String, u64>>,
     /// Nodes being admitted after a `CLUSTER MEET`, saved with the members
     /// until they are members: see [`Self::admit_met_node`].
     pub(crate) joining: parking_lot::Mutex<Vec<ClusterNode>>,
@@ -448,8 +454,9 @@ impl ClusterState {
             preferred_endpoint: std::sync::atomic::AtomicU8::new(Endpoint::Ip as u8),
             save_lock: parking_lot::Mutex::new(()),
             last_saved_fingerprint: AtomicU64::new(0),
-            saves_written: AtomicU64::new(0),
-            saves_in_place: AtomicU64::new(0),
+            saves: persist::Saves::default(),
+            meets: parking_lot::Mutex::new(ahash::AHashSet::new()),
+            meets_given_up: parking_lot::Mutex::new(AHashMap::new()),
             joining: parking_lot::Mutex::new(Vec::new()),
             stats_messages_sent: AtomicU64::new(0),
             stats_messages_received: AtomicU64::new(0),
@@ -726,12 +733,24 @@ impl ClusterState {
         let spawned = std::thread::Builder::new()
             .name("kividb-nodes-conf".into())
             .spawn(move || {
+                let mut last: Option<std::time::Instant> = None;
                 while rx.recv().is_ok() {
+                    // One save in `BACKGROUND_SAVE_GAP` at most, of all the
+                    // changes asked for meanwhile: see there.
+                    if let Some(since) = last.map(|t| t.elapsed())
+                        && since < BACKGROUND_SAVE_GAP
+                    {
+                        std::thread::sleep(BACKGROUND_SAVE_GAP - since);
+                    }
+                    let _ = rx.try_recv();
                     let Some(state) = state.upgrade() else {
                         return;
                     };
-                    if let Err(e) = persist::save_from_state(&state) {
-                        log_warn!("Cluster: could not save the cluster config file: {e}");
+                    let saved = persist::save_from_state(&state);
+                    last = Some(std::time::Instant::now());
+                    note_save_outcome(&saved, "");
+                    if let Err(e) = saved {
+                        log_verbose!("Cluster: could not save the cluster config file: {e}");
                     }
                 }
             });
@@ -752,18 +771,27 @@ impl ClusterState {
     /// node that knew it, the cluster had forgotten it for good: a node that
     /// is not a member cannot join by sending heartbeats (#808).
     ///
+    /// The nodes waiting are saved together, in the next save, not one save
+    /// each: a node met by many at once (`redis-cli --cluster create` has
+    /// every node meet the first) waits for one or two writes. If the save
+    /// fails (a full or read-only disk), `node` is not admitted and `false`
+    /// is returned: the MEET is not answered, and the end that sent it tries
+    /// again.
+    ///
     /// Blocks on the disk: not to be called on the bus's thread.
-    pub fn admit_met_node(&self, node: ClusterNode, add: impl FnOnce()) {
+    pub fn admit_met_node(&self, node: ClusterNode, add: impl FnOnce()) -> bool {
         let id = node.id;
         self.joining.lock().push(node);
-        if let Err(e) = self.save_to_disk() {
-            log_warn!(
-                "Cluster: could not save the cluster config file with node {}: {e}",
-                node_id_str(&id)
-            );
+        // Every save numbered from here on has it.
+        let from = self.saves.written.load(Ordering::SeqCst) + 1;
+        let deadline = std::time::Instant::now() + ADMIT_SAVE_WAIT;
+        let saved = persist::wait_for_save(self, from, deadline);
+        if saved.is_ok() {
+            add();
         }
-        add();
         self.joining.lock().retain(|n| n.id != id);
+        note_save_outcome(&saved.as_ref().map(|_| ()), &node_id_str(&id));
+        saved.is_ok()
     }
 
     /// Persist current state to disk, if a config path is configured.
@@ -2137,10 +2165,15 @@ impl ClusterState {
                 .is_some_and(|n| n.flags.contains(NodeFlags::MASTER));
             // A placeholder records when it was created in `ping_sent_ms`.
             let handshake_timeout = timeout.max(1_000);
+            // Not while its MEET is under way: the MEET waits for the peer
+            // to save this node, which can take longer (see `send_meet`).
+            let meets = self.meets.lock();
             nodes.retain(|_, n| {
                 !(n.flags.contains(NodeFlags::HANDSHAKE)
-                    && now.saturating_sub(n.ping_sent_ms) > handshake_timeout)
+                    && now.saturating_sub(n.ping_sent_ms) > handshake_timeout
+                    && !meets.contains(&format!("{}:{}", n.ip, n.cluster_port)))
             });
+            drop(meets);
             for node in nodes.values_mut() {
                 if node.id == me {
                     continue;
@@ -3335,6 +3368,47 @@ pub(crate) const ELECTION_LIFETIME: std::time::Duration = std::time::Duration::f
 pub(crate) const FAILOVER_BEGAN: &str = "a failover of this node began during the migration \
      (CLUSTER FAILOVER on a replica of it, a vote for one, or a FAIL verdict)";
 const FAILOVER_BEGAN_RECENTLY: &str = "a failover of this node began";
+
+/// The least time between two of the saves the bus asks for (`save_soon`),
+/// which are made on a thread of their own. A save is synced twice (the file
+/// before it is renamed into place, and its directory after): a cluster
+/// being formed, each node learning every other within a second or two,
+/// made a save for each node learnt, and its nodes, sharing a disk, kept it
+/// so busy that `redis-cli --cluster create` of 30 nodes took a second
+/// longer. A save something waits on (a node met, a vote, a command's) is
+/// made at once, by what waits.
+const BACKGROUND_SAVE_GAP: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long a node met waits for the save that makes it a member.
+const ADMIT_SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Log a failure to save nodes.conf once, as an error, when saves start
+/// failing, and once more when they work again: a disk that is full or
+/// read-only fails every save, and the bus saves often. `met` is the node a
+/// failed save was to admit, if any: it is not a member until a save works.
+fn note_save_outcome<E: std::fmt::Display>(saved: &Result<(), E>, met: &str) {
+    static FAILING: AtomicBool = AtomicBool::new(false);
+    match saved {
+        Ok(()) => {
+            if FAILING.swap(false, Ordering::Relaxed) {
+                log_warn!("Cluster: the cluster config file is saved again");
+            }
+        }
+        Err(e) => {
+            if !FAILING.swap(true, Ordering::Relaxed) {
+                log_error!(
+                    "Cluster: could not save the cluster config file: {e}. Until it can be, \
+                     changes of topology are not on disk, and no node met is made a member{}",
+                    if met.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (not {met})")
+                    }
+                );
+            }
+        }
+    }
+}
 
 /// This process's cluster state, once its bus has started: see
 /// [`save_at_shutdown`].

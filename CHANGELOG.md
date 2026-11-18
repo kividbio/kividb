@@ -790,11 +790,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`nodes.conf.tmp-<n>`), syncs it, renames it into place and syncs the
   directory, so a crash at any moment leaves the old file or the new one;
   temporary files a crash left are removed at startup. A `nodes.conf` that
-  does not end with its `vars` line, or is empty, is refused at startup
-  with the reason (`... is unreadable: nodes.conf is incomplete ...`) and
-  left as it is, where it was read as far as it went. The format is
-  unchanged: files 1.2 wrote load, and 1.2 loads the files this release
-  writes.
+  does not end with its `vars` line is refused at startup with the reason
+  (`... is unreadable: nodes.conf is incomplete ...`) and left as it is,
+  where it was read as far as it went. An empty one is refused as before,
+  now saying so (`nodes.conf is empty`); unlike Redis, which takes it for a
+  new node: delete the file to start a node afresh. A save that does not
+  change the topology is skipped only when no other save is still on its
+  way to the file. The format is unchanged: files 1.2 wrote load, and 1.2
+  loads the files this release writes.
+
+- **A vote is sent once it is saved, and a node met is a member once it is
+  saved (#808).** A node whose `nodes.conf` cannot be saved (a full or
+  read-only disk) casts no vote in that epoch, makes no node met a member
+  and does not answer its MEET; it logs the failure once, as an error,
+  until a save works again. The end that sent the MEET tries again, for up
+  to two minutes, and again when the other end calls on it within the hour
+  after. Nodes met at the same time (`redis-cli --cluster create` has every
+  node meet the first) are saved together, in one write. The vote's save
+  no longer holds up the cluster bus.
 
 - **Scripts have the Lua 5.1 library functions Redis keeps (#898).**
   `table.getn`, `table.setn`, `table.maxn`, `table.foreach`, `table.foreachi`,

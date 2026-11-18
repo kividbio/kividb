@@ -33,7 +33,7 @@ use ahash::AHashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// What we read out of nodes.conf. Used to repopulate ClusterState on startup.
 pub struct LoadedConfig {
@@ -205,9 +205,10 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
 /// is (and as Redis writes it). One that is not was cut short: by a machine
 /// that went down before a write reached the disk, or a disk that lost its
 /// tail. Read as far as it goes, it would leave out nodes and slots and
-/// start the epochs again from 0; empty, the node would start over as a new
-/// one, with a new id and no slots. Both are refused, with the reason, and
-/// the file is left as it is.
+/// start the epochs again from 0. It is refused, with the reason, and the
+/// file is left as it is. An empty file was refused before too (it has no
+/// `myself` line); now the reason says it is empty. Redis takes one for a
+/// new node: here the file is deleted for that.
 fn check_complete(contents: &str) -> std::io::Result<()> {
     // Blank lines after it are the padding of a direct write.
     let last = contents
@@ -555,6 +556,9 @@ fn save_then(
     let asked = std::time::Instant::now();
     let saving = state.save_lock.lock();
     let locked = asked.elapsed().as_millis();
+    // Numbered before the state is taken: a save numbered after a node was
+    // added to `joining` has it (see `wait_for_save`).
+    let generation = state.saves.written.fetch_add(1, Ordering::SeqCst) + 1;
     let (nodes_snap, slots_snap, epoch, last_vote) = {
         let nodes = state.nodes.read();
         let slots = state.slots.read();
@@ -577,16 +581,29 @@ fn save_then(
         (nodes, slots_copy, epoch, last_vote)
     };
     let fingerprint = topology_fingerprint(&nodes_snap, &slots_snap, epoch, last_vote);
-    if state.last_saved_fingerprint.load(Ordering::Relaxed) == fingerprint && path.exists() {
+    // Unchanged since the save in place, and no other on its way to
+    // replace it: nothing to write. With one on its way (being synced), it
+    // is written all the same, or the older one, put in place after, would
+    // stand: a `CLUSTER FORGET` that returned the topology to what was in
+    // place was skipped, and the save before it, which had the node, put it
+    // back in the file.
+    if state.last_saved_fingerprint.load(Ordering::Relaxed) == fingerprint
+        && state.saves.in_flight.load(Ordering::SeqCst) == 0
+        && path.exists()
+    {
+        state.saves.note_saved(generation);
         if let Some(publish) = publish {
             publish();
         }
         return Ok(());
     }
-    let generation = state.saves_written.fetch_add(1, Ordering::Relaxed) + 1;
+    state.saves.in_flight.fetch_add(1, Ordering::SeqCst);
     let tmp = temp_path(path, generation);
-    if let Err(e) = write_temp(&tmp, &render(&nodes_snap, &slots_snap, epoch, last_vote)) {
+    let written = write_temp(&tmp, &render(&nodes_snap, &slots_snap, epoch, last_vote));
+    if let Err(e) = written {
         let _ = fs::remove_file(&tmp);
+        state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
+        state.saves.note_failed(generation, &e);
         return Err(e);
     }
     let deferred = DEFER_SYNC.with(|d| d.get());
@@ -595,23 +612,35 @@ fn save_then(
         // so that a sync that fails publishes nothing, and no other save is
         // put in place before it is published.
         Some(publish) => {
-            if !deferred && let Err(e) = sync_file(&tmp) {
-                let _ = fs::remove_file(&tmp);
-                return Err(e);
+            let placed = (|| {
+                if !deferred {
+                    sync_file(&tmp)?;
+                }
+                // For the tests of a crash between the write and the rename.
+                crate::aof::failpoint_noting("nodes-conf-written", &tmp.to_string_lossy());
+                put_in_place(&tmp, path)?;
+                state.saves.in_place.store(generation, Ordering::SeqCst);
+                state
+                    .last_saved_fingerprint
+                    .store(fingerprint, Ordering::Relaxed);
+                if !deferred {
+                    sync_dir(path)?;
+                }
+                Ok(())
+            })();
+            state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
+            match placed {
+                Ok(()) => {
+                    state.saves.note_saved(generation);
+                    publish();
+                }
+                Err(ref e) => {
+                    let _ = fs::remove_file(&tmp);
+                    state.saves.note_failed(generation, e);
+                }
             }
-            // For the tests of a crash between the write and the rename.
-            crate::aof::failpoint("nodes-conf-written");
-            put_in_place(&tmp, path)?;
-            state.saves_in_place.store(generation, Ordering::Relaxed);
-            if !deferred {
-                sync_dir(path)?;
-            }
-            state
-                .last_saved_fingerprint
-                .store(fingerprint, Ordering::Relaxed);
-            publish();
             drop(saving);
-            if deferred {
+            if placed.is_ok() && deferred {
                 // The file and its rename, synced on another thread: see
                 // `with_deferred_sync`.
                 let path = path.clone();
@@ -619,32 +648,42 @@ fn save_then(
                     let _ = sync_file(&path).and_then(|()| sync_dir(&path));
                 });
             }
-            Ok(())
+            placed
         }
         // Synced without the lock, then put in place unless a newer save
         // has been meanwhile.
         None => {
             drop(saving);
-            let synced = sync_file(&tmp);
-            if synced.is_err() {
-                let _ = fs::remove_file(&tmp);
-                return synced;
+            let placed = (|| {
+                sync_file(&tmp)?;
+                crate::aof::failpoint_noting("nodes-conf-written", &tmp.to_string_lossy());
+                let saving = state.save_lock.lock();
+                if state.saves.in_place.load(Ordering::SeqCst) < generation {
+                    put_in_place(&tmp, path)?;
+                    state.saves.in_place.store(generation, Ordering::SeqCst);
+                    state
+                        .last_saved_fingerprint
+                        .store(fingerprint, Ordering::Relaxed);
+                    drop(saving);
+                    sync_dir(path).map(|()| true)
+                } else {
+                    // A newer save is in place: it has all this one had,
+                    // and it notes itself saved once it is synced.
+                    drop(saving);
+                    let _ = fs::remove_file(&tmp);
+                    Ok(false)
+                }
+            })();
+            state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
+            match &placed {
+                Ok(true) => state.saves.note_saved(generation),
+                Ok(false) => state.saves.signal(),
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp);
+                    state.saves.note_failed(generation, e);
+                }
             }
-            crate::aof::failpoint("nodes-conf-written");
-            let saving = state.save_lock.lock();
-            if state.saves_in_place.load(Ordering::Relaxed) < generation {
-                put_in_place(&tmp, path)?;
-                state.saves_in_place.store(generation, Ordering::Relaxed);
-                state
-                    .last_saved_fingerprint
-                    .store(fingerprint, Ordering::Relaxed);
-                drop(saving);
-                sync_dir(path)
-            } else {
-                drop(saving);
-                let _ = fs::remove_file(&tmp);
-                Ok(())
-            }
+            placed.map(|_| ())
         }
     };
     if asked.elapsed() > std::time::Duration::from_millis(100) {
@@ -654,6 +693,85 @@ fn save_then(
         );
     }
     result
+}
+
+/// Where this node's saves of nodes.conf stand: see [`save_from_state`].
+#[derive(Default)]
+pub struct Saves {
+    /// Saves begun, numbered from 1.
+    pub(crate) written: AtomicU64,
+    /// The newest put in place; an older one is not put in place over it.
+    pub(crate) in_place: AtomicU64,
+    /// Written and not yet put in place, failed or given up.
+    pub(crate) in_flight: AtomicU64,
+    /// The newest save that is on disk, synced (or found to be what is).
+    synced: AtomicU64,
+    /// The newest that failed, and why.
+    failed: parking_lot::Mutex<(u64, String)>,
+    /// Signalled whenever a save ends.
+    ended: parking_lot::Condvar,
+    ended_lock: parking_lot::Mutex<()>,
+}
+
+impl Saves {
+    fn note_saved(&self, generation: u64) {
+        self.synced.fetch_max(generation, Ordering::SeqCst);
+        self.signal();
+    }
+
+    fn note_failed(&self, generation: u64, e: &std::io::Error) {
+        {
+            let mut failed = self.failed.lock();
+            if generation > failed.0 {
+                *failed = (generation, e.to_string());
+            }
+        }
+        self.signal();
+    }
+
+    fn signal(&self) {
+        let _held = self.ended_lock.lock();
+        self.ended.notify_all();
+    }
+}
+
+/// Wait until a save numbered from `from` on is in place, synced, and make
+/// one, here, if none has begun: `Err` with the reason if the first such
+/// save fails, or none is done by `deadline`. For a node to be admitted
+/// (`ClusterState::admit_met_node`): every node waiting is in the save
+/// begun next, so a burst of `CLUSTER MEET`s is saved in a few writes, not
+/// one each, and one is not kept waiting behind the bus's saves.
+pub fn wait_for_save(
+    state: &crate::cluster::ClusterState,
+    from: u64,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    if state.config_path.is_none() {
+        return Ok(());
+    }
+    let saves = &state.saves;
+    if saves.written.load(Ordering::SeqCst) < from {
+        // Its outcome is noted in `saves`, below.
+        state.refresh_state();
+        let _ = save_from_state(state);
+    }
+    let mut held = saves.ended_lock.lock();
+    loop {
+        if saves.synced.load(Ordering::SeqCst) >= from {
+            return Ok(());
+        }
+        {
+            let failed = saves.failed.lock();
+            if failed.0 >= from {
+                return Err(failed.1.clone());
+            }
+        }
+        if saves.ended.wait_until(&mut held, deadline).timed_out()
+            && saves.synced.load(Ordering::SeqCst) < from
+        {
+            return Err("the save did not end in time".into());
+        }
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

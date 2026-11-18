@@ -470,14 +470,22 @@ format is Redis's, one line a node and a last `vars` line.
 **When it is saved.** On every change of topology: a member learnt or
 forgotten, a role, an address, slots, an epoch, a vote. Changes a command
 makes (`ADDSLOTS`, `REPLICATE`, `FORGET`, `SAVECONFIG`, ...) are saved
-before the command is answered. Changes learnt from the bus are saved on a
-thread of their own as they are learnt, except a node met by `CLUSTER MEET`:
-both ends of the handshake save the other before they show it as a member,
-and the receiving end before it answers. So once the node you sent
-`CLUSTER MEET` to lists the new node in `CLUSTER NODES` without the
-`handshake` flag, both have it on disk. The other members learn it by
-gossip, within a few heartbeats, and save it then. A node also saves the
-file at the start of a shutdown.
+before the command is answered, and a vote before it is sent. Changes
+learnt from the bus are saved on a thread of their own as they are learnt
+(those of 100 ms in one save, so that a cluster being formed does not keep
+its disk busy), except a node met by `CLUSTER MEET`: both ends of the handshake save the
+other before they show it as a member, and the receiving end before it
+answers. So once the node you sent `CLUSTER MEET` to lists the new node in
+`CLUSTER NODES` without the `handshake` flag, both have it on disk. Nodes
+met at the same time are saved together, in one write. The other members
+learn it by gossip, within a few heartbeats, and save it then. A node also
+saves the file at the start of a shutdown.
+
+If the file cannot be saved (a full or read-only disk), the node logs it
+once, as an error, until a save works again. Meanwhile it makes no node
+met a member and does not answer its MEET (the end that sent it tries again,
+for up to two minutes, and again whenever the other end calls on it within
+the hour after), and it casts no vote.
 
 **A cluster stopped whole.** A member that at least one node has in its
 `nodes.conf` is a member again after the cluster restarts: that node tells
@@ -500,13 +508,15 @@ does not wait for the sync while client writes are paused: a power failure
 in the moment after it can leave the file incomplete.
 
 **A file cut short is refused.** A `nodes.conf` that does not end with its
-`vars` line, or is empty, stops the node at startup with
-`cluster config file 'nodes.conf' is unreadable: nodes.conf is incomplete
-...`, and the file is left as it is. Read as far as it went, it would leave
-members and slots out and the epochs at 0; empty, the node would start as a
-new one, with a new id and none of its slots. Restore the file from a
-backup; if there is none, remove it and add the node to the cluster again
-as a new one.
+`vars` line stops the node at startup with `cluster config file
+'nodes.conf' is unreadable: nodes.conf is incomplete ...`, and the file is
+left as it is. Read as far as it went, it would leave members and slots out
+and the epochs at 0. Restore the file from a backup; if there is none,
+remove it and add the node to the cluster again as a new one.
+
+An empty `nodes.conf` (zero bytes) is refused too (`nodes.conf is empty`),
+as it was before. Redis takes an empty file for a new node. To start a node
+afresh, with a new id, delete the file rather than emptying it.
 
 ## When a write is acknowledged
 
