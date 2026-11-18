@@ -232,10 +232,6 @@ pub async fn send_meet(
     peer_bus_port: u16,
 ) -> Result<(), String> {
     let key = format!("{peer_ip}:{peer_bus_port}");
-    if !state.meets.lock().insert(key.clone()) {
-        // One is under way to this address already.
-        return Ok(());
-    }
     state.meets_given_up.lock().remove(&key);
     let give_up = tokio::time::Instant::now() + MEET_GIVE_UP;
     let mut reached = false;
@@ -252,7 +248,6 @@ pub async fn send_meet(
             }
         }
     };
-    state.meets.lock().remove(&key);
     if result.is_err() && reached {
         state
             .meets_given_up
@@ -288,6 +283,28 @@ pub(crate) fn resume_given_up_meet(state: &Arc<ClusterState>, ip: &str, bus_port
     });
 }
 
+/// `addr` in `ClusterState::meets` for as long as this lives.
+struct Awaiting<'a> {
+    state: &'a ClusterState,
+    addr: String,
+}
+
+impl<'a> Awaiting<'a> {
+    fn new(state: &'a ClusterState, addr: &str) -> Self {
+        state.meets.lock().insert(addr.to_string());
+        Self {
+            state,
+            addr: addr.to_string(),
+        }
+    }
+}
+
+impl Drop for Awaiting<'_> {
+    fn drop(&mut self) {
+        self.state.meets.lock().remove(&self.addr);
+    }
+}
+
 /// One MEET and its answer: `Err((reached, why))`, `reached` if the peer
 /// could be connected to.
 async fn meet_once(
@@ -313,6 +330,9 @@ async fn meet_once(
     let mut sock = connect(state, addr, Duration::from_secs(5))
         .await
         .map_err(|e| (false, e))?;
+    // The handshake entry is kept while the answer, and the saves at both
+    // ends it waits on, are (see `ClusterState::meets`).
+    let _awaiting = Awaiting::new(state, addr);
     let reply = match round_trip(state, &mut sock, addr, &meet, MEET_REPLY_WAIT).await {
         Answer::Reply(reply) => *reply,
         Answer::Closed => return Err((true, "the peer did not answer the MEET".into())),

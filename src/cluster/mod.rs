@@ -373,8 +373,10 @@ pub struct ClusterState {
     /// Where the saves of nodes.conf stand: a save is synced without
     /// `save_lock`, and is not put in place over a newer one.
     pub(crate) saves: persist::Saves,
-    /// `ip:bus_port` of each `CLUSTER MEET` under way (see
-    /// `bus::dialer::send_meet`): its handshake entry is kept while it is.
+    /// `ip:bus_port` of each `CLUSTER MEET` waiting for its answer, or for
+    /// this node's save of the peer (see `bus::dialer::send_meet`): its
+    /// handshake entry is kept meanwhile, though that can take longer than
+    /// the failure detector otherwise gives one.
     pub(crate) meets: parking_lot::Mutex<ahash::AHashSet<String>>,
     /// `ip:bus_port` of each `CLUSTER MEET` given up after the peer was
     /// reached, until when: the peer may have made this node a member, so a
