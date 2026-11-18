@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 // src/lib.rs
 //! The internals of the KiviDB server, a Redis-compatible in-memory database.
 //!
@@ -46,6 +47,7 @@ pub mod output_limits;
 pub mod packed_hash;
 pub mod packed_list;
 pub mod packed_set;
+pub mod packed_zset;
 pub mod pause;
 pub mod protected_mode;
 pub mod pubsub;
@@ -59,6 +61,7 @@ pub mod shutdown;
 pub mod sketch;
 pub mod slowlog;
 pub mod snapshot;
+pub mod sorted_set;
 pub mod stats;
 pub mod store;
 pub mod tag_locks;
@@ -217,7 +220,7 @@ async fn server_tokio(
     // server would hang holding all locks. A dedicated runtime makes that
     // impossible. (The io_uring path already does this for its own reasons.)
     let aof_writer = aof::start_aof_writer(aof_rx);
-    std::thread::spawn(move || {
+    crate::cpus::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

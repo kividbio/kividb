@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Integration tests for Sorted Set (ZSET) commands.
 // Each test gets its own server on a fresh random port — fully isolated,
 // runs in parallel with other test files.

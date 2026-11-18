@@ -1,9 +1,11 @@
 {
   "_about": "Recorded values and gates of benchmarks/1.3.0/regressions (see README.md). One entry per metric, keyed suite/config/metric. Written by lib/compare.py --record; gates may be tuned by hand and survive a re-record.",
   "pins": {
-    "_comment": "SHA-256 of the binaries the recorded values were measured with. compare.py marks a run INVALID when v1.2.2's differs (it never should: it is the release tarball's binary), or when redis-server's differs and REGRESS_REDIS_SHA256 does not name the new one (a deliberate Redis bump, after which --record stores it).",
+    "_comment": "SHA-256 of the binaries the recorded values were measured with. compare.py marks a run INVALID when v1.2.2's differs (it never should: it is the release tarball's binary), or when redis-server's differs and REGRESS_REDIS_SHA256 does not name the new one (a deliberate Redis bump, after which --record stores it). redis_source_sha256: the redis-8.10.2.tar.gz a CI machine builds Redis from (lib/engines.sh checks it before building); with it the built binary's own hash is informational.",
     "v1_2_2_sha256": "38fc2cea40c131e041f4914527a98719e5d34dffdfe2abdc1f07ecb86aa6723e",
-    "redis_sha256": "b0cd304980112fa6cd8dced524fdd6b136fd8efb802f5cf9e81610051a11891c"
+    "redis_sha256": "b0cd304980112fa6cd8dced524fdd6b136fd8efb802f5cf9e81610051a11891c",
+    "v1_2_2_full_sha256": "ac5e05fe1274fd1167780e512bc03aa103340f42525a2cef4a2a762e47317ad5",
+    "redis_source_sha256": "b9ffee226b5eecdba98a679260dad764b2a4ebd90dce4ad5ac9e9f3eef9c02b3"
   },
   "metrics": {
     "01-scan-match/default/dbsize": {
@@ -9107,6 +9109,1006 @@
         {
           "kind": "vs_redis",
           "max_x": 1.5
+        }
+      ]
+    },
+    "25-centrifuge-scripts-publish/publish/publish_8x16_per_s": {
+      "suite": "25-centrifuge-scripts-publish",
+      "config": "publish",
+      "metric": "publish_8x16_per_s",
+      "unit": "calls/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1574978.2764,
+        "candidate": 1554221.9533,
+        "redis": 1180752.205,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "ef936b83",
+        "label": "pr900-ef936b83-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.08
+        }
+      ]
+    },
+    "25-centrifuge-scripts-publish/publish/publish_p16_per_s": {
+      "suite": "25-centrifuge-scripts-publish",
+      "config": "publish",
+      "metric": "publish_p16_per_s",
+      "unit": "calls/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 373829.7383,
+        "candidate": 382410.8265,
+        "redis": 405530.758,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "ef936b83",
+        "label": "pr900-ef936b83-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.05
+        }
+      ]
+    },
+    "25-centrifuge-scripts-publish/scripts/add_calls_per_s": {
+      "suite": "25-centrifuge-scripts-publish",
+      "config": "scripts",
+      "metric": "add_calls_per_s",
+      "unit": "calls/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 50915.1837,
+        "candidate": 50280.2091,
+        "redis": 64761.8461,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "ef936b83",
+        "label": "pr900-ef936b83-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.05
+        }
+      ]
+    },
+    "25-centrifuge-scripts-publish/scripts/history_calls_per_s": {
+      "suite": "25-centrifuge-scripts-publish",
+      "config": "scripts",
+      "metric": "history_calls_per_s",
+      "unit": "calls/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 59038.6696,
+        "candidate": 60043.587,
+        "redis": 75907.5678,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "ef936b83",
+        "label": "pr900-ef936b83-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.05
+        }
+      ]
+    },
+    "31-zset-memory/float/bytes_per_member_10": {
+      "suite": "31-zset-memory",
+      "config": "float",
+      "metric": "bytes_per_member_10",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 118.781,
+        "candidate": 37.581,
+        "redis": 27.9581,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "31-zset-memory/float/bytes_per_member_100": {
+      "suite": "31-zset-memory",
+      "config": "float",
+      "metric": "bytes_per_member_100",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 116.388,
+        "candidate": 27.308,
+        "redis": 26.1649,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "31-zset-memory/float/bytes_per_member_1000": {
+      "suite": "31-zset-memory",
+      "config": "float",
+      "metric": "bytes_per_member_1000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 132.4572,
+        "candidate": 132.4892,
+        "redis": 68.1974,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        }
+      ]
+    },
+    "31-zset-memory/float/bytes_per_member_128": {
+      "suite": "31-zset-memory",
+      "config": "float",
+      "metric": "bytes_per_member_128",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 131.7105,
+        "candidate": 26.9605,
+        "redis": 24.4211,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "31-zset-memory/float/bytes_per_member_129": {
+      "suite": "31-zset-memory",
+      "config": "float",
+      "metric": "bytes_per_member_129",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 130.9387,
+        "candidate": 131.1867,
+        "redis": 78.6926,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        }
+      ]
+    },
+    "31-zset-memory/float/encoding_10": {
+      "suite": "31-zset-memory",
+      "config": "float",
+      "metric": "encoding_10",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.0,
+        "candidate": 2.0,
+        "redis": 2.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "31-zset-memory/float/encoding_100": {
+      "suite": "31-zset-memory",
+      "config": "float",
+      "metric": "encoding_100",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.0,
+        "candidate": 2.0,
+        "redis": 2.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "31-zset-memory/float/encoding_1000": {
+      "suite": "31-zset-memory",
+      "config": "float",
+      "metric": "encoding_1000",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5.0,
+        "candidate": 5.0,
+        "redis": 5.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "31-zset-memory/float/encoding_128": {
+      "suite": "31-zset-memory",
+      "config": "float",
+      "metric": "encoding_128",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.0,
+        "candidate": 2.0,
+        "redis": 2.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "31-zset-memory/float/encoding_129": {
+      "suite": "31-zset-memory",
+      "config": "float",
+      "metric": "encoding_129",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5.0,
+        "candidate": 5.0,
+        "redis": 5.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "31-zset-memory/float/load_1000_s": {
+      "suite": "31-zset-memory",
+      "config": "float",
+      "metric": "load_1000_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.994,
+        "candidate": 2.0049,
+        "redis": 2.1047,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "31-zset-memory/float/load_100_s": {
+      "suite": "31-zset-memory",
+      "config": "float",
+      "metric": "load_100_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.9482,
+        "candidate": 1.8739,
+        "redis": 3.62,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "31-zset-memory/float/load_10_s": {
+      "suite": "31-zset-memory",
+      "config": "float",
+      "metric": "load_10_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.2805,
+        "candidate": 2.2373,
+        "redis": 2.4803,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "31-zset-memory/float/load_128_s": {
+      "suite": "31-zset-memory",
+      "config": "float",
+      "metric": "load_128_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.9615,
+        "candidate": 1.8558,
+        "redis": 4.0312,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "31-zset-memory/float/load_129_s": {
+      "suite": "31-zset-memory",
+      "config": "float",
+      "metric": "load_129_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.9406,
+        "candidate": 1.9745,
+        "redis": 1.9979,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "31-zset-memory/int/bytes_per_member_10": {
+      "suite": "31-zset-memory",
+      "config": "int",
+      "metric": "bytes_per_member_10",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 118.7812,
+        "candidate": 29.5812,
+        "redis": 24.7605,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "31-zset-memory/int/bytes_per_member_100": {
+      "suite": "31-zset-memory",
+      "config": "int",
+      "metric": "bytes_per_member_100",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 116.388,
+        "candidate": 19.308,
+        "redis": 21.0455,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "31-zset-memory/int/bytes_per_member_1000": {
+      "suite": "31-zset-memory",
+      "config": "int",
+      "metric": "bytes_per_member_1000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 132.4572,
+        "candidate": 132.4892,
+        "redis": 68.1405,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        }
+      ]
+    },
+    "31-zset-memory/int/bytes_per_member_128": {
+      "suite": "31-zset-memory",
+      "config": "int",
+      "metric": "bytes_per_member_128",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 131.7105,
+        "candidate": 18.9605,
+        "redis": 20.4218,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "31-zset-memory/int/bytes_per_member_129": {
+      "suite": "31-zset-memory",
+      "config": "int",
+      "metric": "bytes_per_member_129",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 130.9387,
+        "candidate": 131.1867,
+        "redis": 79.0459,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 1
+        }
+      ]
+    },
+    "31-zset-memory/int/encoding_10": {
+      "suite": "31-zset-memory",
+      "config": "int",
+      "metric": "encoding_10",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.0,
+        "candidate": 2.0,
+        "redis": 2.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "31-zset-memory/int/encoding_100": {
+      "suite": "31-zset-memory",
+      "config": "int",
+      "metric": "encoding_100",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.0,
+        "candidate": 2.0,
+        "redis": 2.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "31-zset-memory/int/encoding_1000": {
+      "suite": "31-zset-memory",
+      "config": "int",
+      "metric": "encoding_1000",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5.0,
+        "candidate": 5.0,
+        "redis": 5.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "31-zset-memory/int/encoding_128": {
+      "suite": "31-zset-memory",
+      "config": "int",
+      "metric": "encoding_128",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.0,
+        "candidate": 2.0,
+        "redis": 2.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "31-zset-memory/int/encoding_129": {
+      "suite": "31-zset-memory",
+      "config": "int",
+      "metric": "encoding_129",
+      "unit": "code",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5.0,
+        "candidate": 5.0,
+        "redis": 5.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "31-zset-memory/int/load_1000_s": {
+      "suite": "31-zset-memory",
+      "config": "int",
+      "metric": "load_1000_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.964,
+        "candidate": 1.9685,
+        "redis": 2.0766,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "31-zset-memory/int/load_100_s": {
+      "suite": "31-zset-memory",
+      "config": "int",
+      "metric": "load_100_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.913,
+        "candidate": 1.8385,
+        "redis": 3.1461,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "31-zset-memory/int/load_10_s": {
+      "suite": "31-zset-memory",
+      "config": "int",
+      "metric": "load_10_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.2612,
+        "candidate": 2.1568,
+        "redis": 2.456,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "31-zset-memory/int/load_128_s": {
+      "suite": "31-zset-memory",
+      "config": "int",
+      "metric": "load_128_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.9082,
+        "candidate": 1.8162,
+        "redis": 3.4674,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "31-zset-memory/int/load_129_s": {
+      "suite": "31-zset-memory",
+      "config": "int",
+      "metric": "load_129_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.9199,
+        "candidate": 1.9564,
+        "redis": 2.0339,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "pr-packed-zsets-r2",
+        "label": "pr-packed-zsets-r2-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/checks_per_s_bg0k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "checks_per_s_bg0k",
+      "unit": "checks/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 31048.0,
+        "candidate": 31168.0,
+        "redis": 31199.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.05
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/checks_per_s_bg100k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "checks_per_s_bg100k",
+      "unit": "checks/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 27771.0,
+        "candidate": 31399.0,
+        "redis": 31812.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.05
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/checks_per_s_bg50k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "checks_per_s_bg50k",
+      "unit": "checks/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 30646.0,
+        "candidate": 31553.0,
+        "redis": 31907.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.05
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/p99_ms_bg0k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "p99_ms_bg0k",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.3,
+        "candidate": 0.218,
+        "redis": 0.52,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 0.5,
+          "speed": false
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/p99_ms_bg100k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "p99_ms_bg100k",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 6.118,
+        "candidate": 0.19,
+        "redis": 0.122,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 0.5,
+          "speed": false
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6,
+          "speed": false
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/p99_ms_bg50k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "p99_ms_bg50k",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.559,
+        "candidate": 0.145,
+        "redis": 0.078,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 0.5,
+          "speed": false
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6,
+          "speed": false
         }
       ]
     }

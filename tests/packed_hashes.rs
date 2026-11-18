@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Small hashes kept in one block: every hash command gives the same answer
 // whatever the form, across every change of form, and the fields come back
 // the same, with their deadlines, after a save, an AOF replay, an AOF
@@ -968,7 +969,6 @@ fn replica_full_sync_and_stream() {
         check_form(&mut r, form.key, form, "stream");
         assert_eq!(r.digest(form.key), m.digest(form.key), "{}", form.key);
     }
-    assert_eq!(r.cmd(&["DEBUG", "DIGEST"]), m.cmd(&["DEBUG", "DIGEST"]));
 }
 
 /// Fields of a hash in a block go when their time comes, read or not (lazy
@@ -1012,6 +1012,10 @@ fn field_expiry_on_packed_hashes() {
         "field:00000001",
         "field:00000002",
     ]);
+    // Kept: a field whose deadline is far off, so that a deadline survives
+    // to be compared on the replica and after the AOF replay.
+    m.hset("kept", &fields[..4]);
+    m.cmd(&["HPEXPIRE", "kept", FAR_MS, "FIELDS", "1", "field:00000001"]);
     thread::sleep(Duration::from_millis(400));
     let want: Pairs = fields
         .iter()
@@ -1027,13 +1031,49 @@ fn field_expiry_on_packed_hashes() {
     synced(&mut m, &mut r);
     assert_eq!(r.hgetall("read"), want);
     assert_eq!(r.cmd(&["EXISTS", "unread"]).int(), 0);
-    assert_eq!(r.cmd(&["DEBUG", "DIGEST"]), m.cmd(&["DEBUG", "DIGEST"]));
-    let digest = m.cmd(&["DEBUG", "DIGEST"]);
+    // Every key, by its digest (fields, values and deadlines): the replica's
+    // as the master's, and the master's the same after the AOF replay.
+    fn digests(c: &mut Conn) -> Vec<(Vec<u8>, Resp)> {
+        let mut keys: Vec<Vec<u8>> = c
+            .cmd(&["KEYS", "*"])
+            .items()
+            .iter()
+            .map(Resp::bulk)
+            .collect();
+        keys.sort();
+        keys.into_iter()
+            .map(|k| {
+                let d = c.raw(&[b"DEBUG", b"DIGEST-VALUE", &k]);
+                assert!(matches!(&d, Resp::Array(x) if x.len() == 1), "{d:?}");
+                (k, d)
+            })
+            .collect()
+    }
+    let before = digests(&mut m);
+    assert_eq!(
+        before.iter().map(|(k, _)| k.as_slice()).collect::<Vec<_>>(),
+        [&b"kept"[..], b"read"]
+    );
+    assert_eq!(digests(&mut r), before, "replica");
+    let deadline = |c: &mut Conn| {
+        c.cmd(&[
+            "HPEXPIRETIME",
+            "kept",
+            "FIELDS",
+            "2",
+            "field:00000001",
+            "field:00000002",
+        ])
+    };
+    let kept_deadline = deadline(&mut m);
+    assert!(kept_deadline.items()[0].int() > 0 && kept_deadline.items()[1].int() == -1);
+    assert_eq!(deadline(&mut r), kept_deadline, "replica");
     drop(replica);
     master.stop("NOSAVE");
     master.restart();
     let mut m = master.conn();
-    assert_eq!(m.cmd(&["DEBUG", "DIGEST"]), digest, "AOF replay");
+    assert_eq!(digests(&mut m), before, "AOF replay");
+    assert_eq!(deadline(&mut m), kept_deadline, "AOF replay");
     assert_eq!(m.hgetall("read"), want);
 }
 

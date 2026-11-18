@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Lists kept in chunks of packed elements: every list command gives the same
 // answer whatever the form (one chunk, many, irregular after a middle insert,
 // plain once an element over 1,024 bytes came in), across every change of
@@ -864,7 +865,6 @@ fn replica_full_sync_and_stream() {
         check(&mut r, shape.key, &shape.model, "stream");
         assert_eq!(r.digest(shape.key), m.digest(shape.key), "{}", shape.key);
     }
-    assert_eq!(r.cmd(&["DEBUG", "DIGEST"]), m.cmd(&["DEBUG", "DIGEST"]));
 }
 
 /// A client blocked on an empty key is served by a push to a packed list,

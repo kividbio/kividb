@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/memory.rs
 //
 // Rust integration tests for MEMORY commands.
@@ -358,11 +359,12 @@ fn test_memory_usage_sorted_set() {
 #[test]
 fn test_memory_usage_sorted_set_dual_index_overhead() {
     // SortedSet is dual-indexed (BTreeMap + AHashMap), so its memory
-    // per element should be higher than a Set of equal members
+    // per element should be higher than a Set of equal members. (Past 128
+    // members: below that each is one block, #297.)
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-    for i in 0..50 {
+    for i in 0..200 {
         c.cmd(&["SADD", "cmp_set", &format!("member_{i}")]);
         c.cmd(&[
             "ZADD",

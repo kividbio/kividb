@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/entry_table.rs
 //
 // A shard's table of entries (src/store/entry.rs, src/store/shard_map.rs):

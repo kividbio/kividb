@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/search.rs
 //
 // FT.CREATE's schema, the query language, and FT.SEARCH's arguments and

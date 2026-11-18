@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/redis_differences.rs
 //
 // Small differences from Redis 8.10 in argument checking, error texts and

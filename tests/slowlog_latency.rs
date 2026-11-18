@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/slowlog_latency.rs
 //
 // Rust integration tests for SLOWLOG and LATENCY commands.
