@@ -219,20 +219,28 @@ struct Job {
     done: mpsc::SyncSender<Packed>,
 }
 
-/// The threads compressing for one writer. They end when it is dropped.
-struct Helpers {
-    jobs: Option<mpsc::SyncSender<Job>>,
-    threads: Vec<std::thread::JoinHandle<()>>,
+/// The threads that compress blocks, for every writer: started once, on
+/// the first compressed snapshot, and kept. Started for each snapshot, as
+/// they were, a server that saves every few minutes made a new thread each
+/// time, and each thread keeps a counter of the allocator's for good
+/// (`memory_use`).
+struct Pool {
+    jobs: mpsc::SyncSender<Job>,
+    threads: usize,
 }
 
-impl Helpers {
-    fn start(count: usize) -> Option<Helpers> {
+/// The pool, if there is one: none on a machine of one CPU, or if no thread
+/// could be started (the writer compresses on its own thread then).
+fn pool() -> Option<&'static Pool> {
+    static POOL: std::sync::OnceLock<Option<Pool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let count = helper_count();
         if count == 0 {
             return None;
         }
         let (tx, rx) = mpsc::sync_channel::<Job>(count);
         let rx = Arc::new(Mutex::new(rx));
-        let mut threads = Vec::with_capacity(count);
+        let mut threads = 0;
         for _ in 0..count {
             let rx = Arc::clone(&rx);
             let spawned = std::thread::Builder::new()
@@ -246,47 +254,33 @@ impl Helpers {
                         };
                         let Ok(job) = job else { return };
                         let packed = pack(cctx.as_mut(), job.raw, job.data);
+                        // The writer may have given up (an error, a full
+                        // sync's replica gone): nothing waits for it then.
                         let _ = job.done.send(packed);
                     }
                 });
-            match spawned {
-                Ok(thread) => threads.push(thread),
-                // As many as could be started; none, and the writer
-                // compresses on its own thread.
-                Err(_) => break,
+            if spawned.is_ok() {
+                threads += 1;
             }
         }
-        if threads.is_empty() {
-            return None;
-        }
-        Some(Helpers {
-            jobs: Some(tx),
-            threads,
-        })
-    }
-}
-
-impl Drop for Helpers {
-    fn drop(&mut self) {
-        // Closed, the queue ends each thread once it is through its job.
-        self.jobs.take();
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
-        }
-    }
+        (threads > 0).then_some(Pool { jobs: tx, threads })
+    })
+    .as_ref()
 }
 
 /// Writes what is written to it to `out` as a compressed snapshot. What is
 /// written to it is the plain image; [`BlockWriter::finish`] ends it.
 ///
-/// Blocks are compressed on up to [`MAX_HELPERS`] threads of its own, a few
+/// Blocks are compressed on the [`MAX_HELPERS`] threads every writer shares, a few
 /// blocks at a time: it holds no more than a few blocks' worth of memory,
 /// whatever the size of the image.
 pub struct BlockWriter<W: Write> {
     out: W,
     block_size: usize,
     buf: Vec<u8>,
-    helpers: Option<Helpers>,
+    /// Where blocks go to be compressed: the pool's queue, if there is
+    /// one and the writer uses it.
+    jobs: Option<mpsc::SyncSender<Job>>,
     /// For the blocks compressed on this thread, when there are no helpers.
     cctx: Option<zstd::bulk::Compressor<'static>>,
     pending: VecDeque<mpsc::Receiver<Packed>>,
@@ -302,23 +296,22 @@ pub struct BlockWriter<W: Write> {
 impl<W: Write> BlockWriter<W> {
     /// Start a compressed snapshot on `out`: its header is written now.
     pub fn new(out: W) -> io::Result<Self> {
-        Self::with(out, BLOCK_SIZE, helper_count())
+        Self::with(out, BLOCK_SIZE, true)
     }
 
-    fn with(mut out: W, block_size: usize, helpers: usize) -> io::Result<Self> {
+    /// `use_pool` unset: every block compressed on the calling thread.
+    fn with(mut out: W, block_size: usize, use_pool: bool) -> io::Result<Self> {
         out.write_all(&header_bytes(block_size))?;
-        let helpers = Helpers::start(helpers);
-        let most_pending = helpers.as_ref().map_or(0, |h| 2 * h.threads.len());
-        let cctx = if helpers.is_none() {
-            compressor()
-        } else {
-            None
-        };
+        let pool = if use_pool { pool() } else { None };
+        let jobs = pool.map(|p| p.jobs.clone());
+        // Two blocks a thread: each has the next one to hand.
+        let most_pending = pool.map_or(0, |p| 2 * p.threads);
+        let cctx = if jobs.is_none() { compressor() } else { None };
         Ok(BlockWriter {
             out,
             block_size,
             buf: Vec::with_capacity(block_size),
-            helpers,
+            jobs,
             cctx,
             pending: VecDeque::new(),
             most_pending,
@@ -380,8 +373,7 @@ impl<W: Write> BlockWriter<W> {
             .unwrap_or_else(|| Vec::with_capacity(self.block_size));
         let raw = std::mem::replace(&mut self.buf, fresh);
         let data = self.spare_data.pop().unwrap_or_default();
-        let jobs = self.helpers.as_ref().and_then(|h| h.jobs.clone());
-        let Some(jobs) = jobs else {
+        let Some(jobs) = self.jobs.clone() else {
             let packed = pack(self.cctx.as_mut(), raw, data);
             return self.write_packed(packed);
         };
@@ -408,7 +400,6 @@ impl<W: Write> BlockWriter<W> {
         }
         self.out.write_all(&end_bytes(self.blocks, self.raw))?;
         self.stored += END_LEN as u64;
-        self.helpers.take();
         let BlockWriter {
             out, raw, stored, ..
         } = self;
@@ -798,7 +789,7 @@ mod tests {
     use super::*;
 
     fn compress_with(image: &[u8], block_size: usize, helpers: usize) -> Vec<u8> {
-        let mut w = BlockWriter::with(Vec::new(), block_size, helpers).unwrap();
+        let mut w = BlockWriter::with(Vec::new(), block_size, helpers > 0).unwrap();
         // In pieces of every size, as the image's writer writes.
         let mut at = 0;
         let mut step = 1;

@@ -178,8 +178,8 @@ loses it.
 
 Since 1.3.0 a snapshot is written compressed (`rdbcompression yes`, the
 default; see [PERSISTENCE.md](PERSISTENCE.md#compressed-snapshots)): the
-same image, in blocks of 256 KiB compressed with zstd level 1 on the save's
-own threads. On an Azure `Standard_D4s_v5`, the server on 2 CPUs, the file
+same image, in blocks of 256 KiB compressed with zstd level 1 off the
+serving threads. On an Azure `Standard_D4s_v5`, the server on 2 CPUs, the file
 on tmpfs (the save on the VM's disk in its own row):
 
 | dataset | 1.2.2 | 1.3.0 | Redis 8.10.2 |

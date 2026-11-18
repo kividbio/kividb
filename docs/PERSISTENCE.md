@@ -391,8 +391,9 @@ it holds, and the file ends with a marker that gives the number of blocks
 and the length of the image. The file starts with `KIVIDBZ1`, the plain one
 with `KIVIDB01`.
 
-The blocks are compressed on up to two threads of the save's own, never on
-the threads that serve clients, and no more than a few blocks are in
+The blocks are compressed on up to two compression threads (the CPUs less
+one, started at the first compressed save and shared by every save), never
+on the threads that serve clients, and no more than a few blocks are in
 memory at once. The log line of each save gives the image's size, the
 size written and the ratio.
 

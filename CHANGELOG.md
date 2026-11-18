@@ -89,7 +89,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Compressed snapshots: `rdbcompression` is in effect (#879).** With
   `yes`, the default, a snapshot is the same image as before cut into
   blocks of 256 KiB, each compressed with zstd (level 1) on up to two
-  threads of the save's own, never the serving threads, or stored as it is
+  compression threads (the CPUs less one; started once, shared by every
+  save), never the serving threads, or stored as it is
   when it does not shrink; each block carries a checksum, and the file an
   end marker. A file cut short or damaged anywhere is refused whole, naming
   the block, never loaded in part. It applies to `SAVE`, `BGSAVE`, the

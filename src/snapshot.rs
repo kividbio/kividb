@@ -5540,8 +5540,9 @@ impl FrozenDataset {
     /// written as it is laid out, not gathered in memory first: for a dump of
     /// the whole dataset that would be the dataset over again.
     ///
-    /// Compressed with `rdbcompression yes`, the default (#879): on threads of
-    /// its own (see [`blocks::BlockWriter`]), never the serving threads'.
+    /// Compressed with `rdbcompression yes`, the default (#879): on this
+    /// thread and the compression threads (see [`blocks::BlockWriter`]),
+    /// never the serving threads.
     pub fn write_file(self, path: &str) -> std::io::Result<()> {
         let started = std::time::Instant::now();
         let raw = PacedFile::new(File::create(path)?);

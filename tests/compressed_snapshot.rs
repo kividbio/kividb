@@ -179,8 +179,9 @@ fn key_dump(c: &mut Conn) -> Vec<Vec<Reply>> {
         let mut cursor = "0".to_string();
         let mut keys: Vec<Vec<u8>> = Vec::new();
         loop {
-            let Reply::Array(parts) = c.call(&["SCAN", &cursor, "COUNT", "1000"]) else {
-                panic!("SCAN");
+            let reply = c.call(&["SCAN", &cursor, "COUNT", "1000"]);
+            let Reply::Array(parts) = reply else {
+                panic!("SCAN {cursor} in db {db}: {reply:?}");
             };
             cursor = parts[0].text();
             if let Reply::Array(found) = &parts[1] {
