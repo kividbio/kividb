@@ -526,6 +526,8 @@ pub fn allowed_when_out_of_memory(name: &str) -> bool {
             | "MOVE"
             // Takes keys away; Redis flags it a write, but not `denyoom`.
             | "MIGRATE"
+            | "CF.COMPACT"
+            | "CF.DEL"
             | "SWAPDB"
             | "LPOP"
             | "RPOP"

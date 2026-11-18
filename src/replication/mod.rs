@@ -4361,44 +4361,47 @@ pub fn is_write_command(name: &str) -> bool {
                 | "XTRIM"
                 | "ZMPOP"
         ),
-        6 => matches!(
-            name,
-            "APPEND"
-                | "BF.ADD"
-                | "ARMSET"
-                | "ARRING"
-                | "ARSEEK"
-                | "BLMOVE"
-                | "BLMPOP"
-                | "BZMPOP"
-                | "DECRBY"
-                | "EXPIRE"
-                | "GEOADD"
-                | "GETDEL"
-                | "GETSET"
-                | "HGETEX"
-                | "HSETEX"
-                | "HSETNX"
-                | "INCRBY"
-                | "INCREX"
-                | "LMOVEM"
-                | "LPUSHX"
-                | "MSETEX"
-                | "MSETNX"
-                | "PSETEX"
-                | "RENAME"
-                | "RPUSHX"
-                | "SELECT"
-                | "SETBIT"
-                | "SWAPDB"
-                | "TS.ADD"
-                | "TS.DEL"
-                | "UNLINK"
-                | "XCLAIM"
-                | "XDELEX"
-                | "XGROUP"
-                | "XSETID"
-        ),
+        6 if crate::sketch::is_write(&name.as_bytes()[..6]) => true,
+        6 => {
+            matches!(
+                name,
+                "APPEND"
+                    | "BF.ADD"
+                    | "ARMSET"
+                    | "ARRING"
+                    | "ARSEEK"
+                    | "BLMOVE"
+                    | "BLMPOP"
+                    | "BZMPOP"
+                    | "DECRBY"
+                    | "EXPIRE"
+                    | "GEOADD"
+                    | "GETDEL"
+                    | "GETSET"
+                    | "HGETEX"
+                    | "HSETEX"
+                    | "HSETNX"
+                    | "INCRBY"
+                    | "INCREX"
+                    | "LMOVEM"
+                    | "LPUSHX"
+                    | "MSETEX"
+                    | "MSETNX"
+                    | "PSETEX"
+                    | "RENAME"
+                    | "RPUSHX"
+                    | "SELECT"
+                    | "SETBIT"
+                    | "SWAPDB"
+                    | "TS.ADD"
+                    | "TS.DEL"
+                    | "UNLINK"
+                    | "XCLAIM"
+                    | "XDELEX"
+                    | "XGROUP"
+                    | "XSETID"
+            )
+        }
         7 => matches!(
             name,
             "BF.MADD"
@@ -4421,71 +4424,86 @@ pub fn is_write_command(name: &str) -> bool {
                 | "ZPOPMAX"
                 | "ZPOPMIN"
         ),
-        8 => matches!(
-            name,
-            "ARINSERT"
-                | "BITFIELD"
-                | "BZPOPMAX"
-                | "BZPOPMIN"
-                | "EXPIREAT"
-                | "FLUSHALL"
-                | "FT.ALTER"
-                | "HPERSIST"
-                | "HPEXPIRE"
-                | "JSON.DEL"
-                | "JSON.SET"
-                | "RENAMENX"
-                | "SETRANGE"
-                | "TS.ALTER"
-                | "VSETATTR"
-        ),
-        9 => matches!(
-            name,
-            "BF.INSERT"
-                | "FT.CREATE"
-                | "HEXPIREAT"
-                | "JSON.MSET"
-                | "PEXPIREAT"
-                | "RPOPLPUSH"
-                | "TS.CREATE"
-                | "TS.DECRBY"
-                | "TS.INCRBY"
-        ),
-        10 => matches!(
-            name,
-            "ARDELRANGE"
-                | "BF.RESERVE"
-                | "BRPOPLPUSH"
-                | "FT.DICTADD"
-                | "FT.DICTDEL"
-                | "HPEXPIREAT"
-                | "JSON.CLEAR"
-                | "JSON.MERGE"
-                | "SDIFFSTORE"
-                | "XAUTOCLAIM"
-                | "XREADGROUP"
-                | "ZDIFFSTORE"
-        ),
-        11 => matches!(
-            name,
-            "FT.ALIASADD"
-                | "FT.ALIASDEL"
-                | "INCRBYFLOAT"
-                | "JSON.ARRPOP"
-                | "JSON.FORGET"
-                | "JSON.OBJDEL"
-                | "JSON.TOGGLE"
-                | "SINTERSTORE"
-                | "SUNIONSTORE"
-                | "XIDMPRECORD"
-                | "ZINTERSTORE"
-                | "ZRANGESTORE"
-                | "ZUNIONSTORE"
-        ),
-        12 => matches!(
-            name,
-            "BF.LOADCHUNK" | "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
-        ),
+        8 if crate::sketch::is_write(&name.as_bytes()[..8]) => true,
+        8 => {
+            matches!(
+                name,
+                "ARINSERT"
+                    | "BITFIELD"
+                    | "BZPOPMAX"
+                    | "BZPOPMIN"
+                    | "EXPIREAT"
+                    | "FLUSHALL"
+                    | "FT.ALTER"
+                    | "HPERSIST"
+                    | "HPEXPIRE"
+                    | "JSON.DEL"
+                    | "JSON.SET"
+                    | "RENAMENX"
+                    | "SETRANGE"
+                    | "TS.ALTER"
+                    | "VSETATTR"
+            )
+        }
+        9 if crate::sketch::is_write(&name.as_bytes()[..9]) => true,
+        9 => {
+            matches!(
+                name,
+                "BF.INSERT"
+                    | "FT.CREATE"
+                    | "HEXPIREAT"
+                    | "JSON.MSET"
+                    | "PEXPIREAT"
+                    | "RPOPLPUSH"
+                    | "TS.CREATE"
+                    | "TS.DECRBY"
+                    | "TS.INCRBY"
+            )
+        }
+        10 if crate::sketch::is_write(&name.as_bytes()[..10]) => true,
+        10 => {
+            matches!(
+                name,
+                "ARDELRANGE"
+                    | "BF.RESERVE"
+                    | "BRPOPLPUSH"
+                    | "FT.DICTADD"
+                    | "FT.DICTDEL"
+                    | "HPEXPIREAT"
+                    | "JSON.CLEAR"
+                    | "JSON.MERGE"
+                    | "SDIFFSTORE"
+                    | "XAUTOCLAIM"
+                    | "XREADGROUP"
+                    | "ZDIFFSTORE"
+            )
+        }
+        11 if crate::sketch::is_write(&name.as_bytes()[..11]) => true,
+        11 => {
+            matches!(
+                name,
+                "FT.ALIASADD"
+                    | "FT.ALIASDEL"
+                    | "INCRBYFLOAT"
+                    | "JSON.ARRPOP"
+                    | "JSON.FORGET"
+                    | "JSON.OBJDEL"
+                    | "JSON.TOGGLE"
+                    | "SINTERSTORE"
+                    | "SUNIONSTORE"
+                    | "XIDMPRECORD"
+                    | "ZINTERSTORE"
+                    | "ZRANGESTORE"
+                    | "ZUNIONSTORE"
+            )
+        }
+        12 if crate::sketch::is_write(&name.as_bytes()[..12]) => true,
+        12 => {
+            matches!(
+                name,
+                "BF.LOADCHUNK" | "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
+            )
+        }
         13 => matches!(name, "TS.CREATERULE" | "TS.DELETERULE"),
         14 => matches!(
             name,
@@ -4533,6 +4551,14 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "BZMPOP",
     "BZPOPMAX",
     "BZPOPMIN",
+    "CF.ADD",
+    "CF.ADDNX",
+    "CF.COMPACT",
+    "CF.DEL",
+    "CF.INSERT",
+    "CF.INSERTNX",
+    "CF.LOADCHUNK",
+    "CF.RESERVE",
     "COPY",
     "DECR",
     "DECRBY",
@@ -4681,6 +4707,7 @@ fn is_write_command_reference(name: &str) -> bool {
         name,
         // Bloom filters
         "BF.RESERVE" | "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.LOADCHUNK" |
+        "CF.ADD" | "CF.ADDNX" | "CF.COMPACT" | "CF.DEL" | "CF.INSERT" | "CF.INSERTNX" | "CF.LOADCHUNK" | "CF.RESERVE" |
         // Strings
         "SET" | "SETNX" | "SETEX" | "PSETEX" | "MSET" | "MSETNX" | "GETSET" |
         "GETDEL" | "GETEX" | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" |

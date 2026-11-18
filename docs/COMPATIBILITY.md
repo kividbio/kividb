@@ -18,7 +18,7 @@ other files:
 |---|---|
 | Protocol | RESP2 and RESP3 (`HELLO`). Redis clients, `redis-cli` and cluster-aware clients work unchanged. |
 | Core data types | Strings, lists, sets, sorted sets, hashes (with per-field TTLs), streams and consumer groups, bitmaps, geo, Pub/Sub (including sharded). HyperLogLog, which reads Redis's encoding: see *Differences*. |
-| Redis 8 data types | JSON, search and query (`FT.*`, full-text, tag, numeric and vector), time series (`TS.*`), vector sets (`V*`), Bloom filters (`BF.*`). All built in, nothing to load. |
+| Redis 8 data types | JSON, search and query (`FT.*`, full-text, tag, numeric and vector), time series (`TS.*`), vector sets (`V*`), Bloom filters (`BF.*`), Cuckoo filters (`CF.*`). All built in, nothing to load. |
 | Transactions and scripts | `MULTI`/`EXEC`/`WATCH` and scripts run as one step, as in Redis ([EXEC_ATOMICITY.md](EXEC_ATOMICITY.md)). Lua (`EVAL`, `FUNCTION`, `FCALL`) needs the `lua` or `full` build. |
 | Security | `AUTH`, ACLs (users, key and channel patterns, ACL file), protected mode, TLS in the `tls` and `full` builds. |
 | Persistence | Snapshots (`dump.kdb`, compressed with `rdbcompression yes`, which is off by default) and an append-only file. Reads a Redis `dump.rdb`. ([PERSISTENCE.md](PERSISTENCE.md)) |
@@ -214,8 +214,9 @@ other files:
   a `VALKEY080` header) is read, hash field TTLs included.
 - Redis and Valkey can't read KiviDB's `DUMP` payloads or replicate from
   KiviDB ([#450](https://github.com/kividbio/kividb/issues/450)), so moving
-  data back off KiviDB means copying it key by key. Bloom filters are the
-  exception: their payloads are Redis's, and Redis restores them.
+  data back off KiviDB means copying it key by key. Bloom and Cuckoo
+  filters are the exception: their payloads are Redis's, and Redis restores
+  them.
 - `DUMP`/`RESTORE` and `MIGRATE` of time series and vector sets work between
   KiviDB nodes only: their payloads are KiviDB's own, and Redis's for these
   types (module values) aren't read either. A series' compaction rules and
@@ -231,8 +232,8 @@ other files:
   short. `INT8` and `UINT8` vectors aren't supported.
 - A Redis RDB with search index definitions loads without them: run
   `FT.CREATE` again. Bloom filters load (RedisBloom 2.4 and later: Redis
-  Stack 6.2 to 7.4, Redis 8). One with other module data (time series,
-  vector sets, Cuckoo filters, Count-min sketches, Top-K, t-digests) is
+  Stack 6.2 to 7.4, Redis 8), and so do Cuckoo filters. One with other module
+  data (time series, vector sets, Count-min sketches, Top-K, t-digests) is
   refused.
 - Bloom filters: `COPY` copies one, which Redis refuses. A filter made before
   RedisBloom 2.0 (32-bit hashes) is not loaded. A filter has size limits
@@ -245,6 +246,12 @@ other files:
   snapshot, an RDB file or a `DUMP` payload says about a filter is checked
   before it is used: one Redis could not have made is refused. Their `DUMP` payloads carry RDB version 9, so every Redis
   since 6.0 can `RESTORE` them.
+- Cuckoo filters are Redis's byte for byte (replies, `CF.SCANDUMP` chunks,
+  `DUMP`). `COPY` copies one, which Redis refuses. At most 1 GiB and 99
+  sub-filters, made, grown or loaded; `CF.INSERT`, `CF.INSERTNX` and
+  `CF.MEXISTS` have a per-command limit, checked before they start. A
+  sub-filter over 16 MiB is dumped in pieces that follow on, which Redis does
+  not do. See [COMMANDS.md](../COMMANDS.md).
 - Set and sorted-set members can't have their own TTLs. A Dragonfly file
   with a `SADDEX` set, or a KeyDB file or stream with `EXPIREMEMBER` on a set
   or sorted-set member, is refused, naming the key. Hash field TTLs from

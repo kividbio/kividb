@@ -47,10 +47,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Upgrade replicas before their master.** A master sends `BF.*` commands
   and, in a full sync, Bloom filters under a new snapshot record (tag 40);
   a replica of an earlier release cannot apply either.
-- **No downgrade once a Bloom filter exists.** A snapshot or an AOF
-  checkpoint with a Bloom filter in it cannot be read by an earlier release.
-  Delete the filters (or move them off with `DUMP`, which Redis restores)
-  before going back.
+- **No downgrade once a Bloom or Cuckoo filter exists.** A snapshot or an
+  AOF checkpoint with one in it cannot be read by an earlier release: 1.2.2
+  refuses it and does not start, changing nothing on disk. Delete them (or
+  move them off with `DUMP`, which Redis restores) before going back.
+  Upgrade replicas before their master for `CF.*` too.
 - **A sample time of `-0` is refused.** `TS.ADD`, `TS.MADD`, `TS.INCRBY`
   and `TS.DECRBY` answer an error for it, as RedisTimeSeries and 1.2.0 do.
 - **A 1.2.x replica warns once for each idempotent duplicate.** A master
@@ -243,6 +244,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   item and every one after it with the error, so their reply has an entry
   for each item. Replicas and the AOF get only the items a write took.
   Cuckoo filters, Count-min sketches, Top-K and t-digests follow.
+
+- **Cuckoo filters (`CF.*`), as Redis 8 has them built in (part of #453).**
+  `CF.RESERVE`, `CF.ADD`, `CF.ADDNX`, `CF.INSERT`, `CF.INSERTNX`,
+  `CF.EXISTS`, `CF.MEXISTS`, `CF.COUNT`, `CF.DEL`, `CF.COMPACT`,
+  `CF.SCANDUMP`, `CF.LOADCHUNK`, `CF.INFO` and `CF.DEBUG`, and the
+  `cf-bucket-size`, `cf-initial-size`, `cf-expansion-factor`,
+  `cf-max-iterations` and `cf-max-expansions` settings. Filters are laid out
+  byte for byte as Redis lays them out (placement, kicks, growth, the
+  compaction deletes trigger), so replies are Redis 8.10's in RESP2 and RESP3,
+  `CF.SCANDUMP` chunks included (24,000 replies of random sequences compared:
+  `scripts/checks/sketch/cf/compare.py`); RDB files, full syncs, `DUMP`
+  payloads and `CF.SCANDUMP` chunks from Redis load, and `DUMP` writes
+  Redis's format. A filter made from this node's settings goes to replicas
+  and the AOF as a `CF.RESERVE` naming them. `TYPE` is `MBbloomCF`, the ACL
+  category `@cuckoo`. Unlike Redis, a filter has size limits (1 GiB, 99
+  sub-filters), commands of many items a per-command limit checked before
+  they start, and `COPY` copies a filter. Snapshots keep filters under tag
+  40, kind 4.
 
 - **Vector sets store vectors quantized when `VADD` asks for it (#697).**
   `Q8` keeps each vector as int8 with its norm and range, and `BIN` as one

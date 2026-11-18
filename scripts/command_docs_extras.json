@@ -930,6 +930,305 @@
             }
         ]
     },
+    "CF.ADD": {
+        "summary": "Adds an item to a Cuckoo filter, making the filter if the key is missing.",
+        "complexity": "O(f*b + k) for f sub-filters of buckets of b, and k kicks at most.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string"
+            }
+        ]
+    },
+    "CF.ADDNX": {
+        "summary": "Adds an item to a Cuckoo filter if it is not there already.",
+        "complexity": "O(f*b + k) for f sub-filters of buckets of b, and k kicks at most.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string"
+            }
+        ]
+    },
+    "CF.COMPACT": {
+        "summary": "Moves a Cuckoo filter's fingerprints into its older sub-filters, and frees emptied ones.",
+        "complexity": "O(n*f*b) for n fingerprints in f sub-filters of buckets of b.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "CF.COUNT": {
+        "summary": "Returns how many times an item's fingerprint is in a Cuckoo filter.",
+        "complexity": "O(f*b) for f sub-filters of buckets of b.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string"
+            }
+        ]
+    },
+    "CF.DEBUG": {
+        "summary": "",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "CF.DEL": {
+        "summary": "Deletes one copy of an item's fingerprint from a Cuckoo filter.",
+        "complexity": "O(f*b) for f sub-filters of buckets of b, more when it compacts the filter.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string"
+            }
+        ]
+    },
+    "CF.EXISTS": {
+        "summary": "Tells whether an item may have been added to a Cuckoo filter.",
+        "complexity": "O(f*b) for f sub-filters of buckets of b.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string"
+            }
+        ]
+    },
+    "CF.INFO": {
+        "summary": "Describes a Cuckoo filter: size, buckets, sub-filters, items, deletes and parameters.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "CF.INSERT": {
+        "summary": "Adds items to a Cuckoo filter, making it with the given capacity if the key is missing.",
+        "complexity": "O(N*(f*b + k)) for N items.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "capacity",
+                "type": "integer",
+                "token": "CAPACITY",
+                "optional": true
+            },
+            {
+                "name": "nocreate",
+                "type": "pure-token",
+                "token": "NOCREATE",
+                "optional": true
+            },
+            {
+                "name": "items",
+                "type": "pure-token",
+                "token": "ITEMS"
+            },
+            {
+                "name": "item",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "CF.INSERTNX": {
+        "summary": "Adds items that are not there already to a Cuckoo filter, making it if the key is missing.",
+        "complexity": "O(N*(f*b + k)) for N items.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "capacity",
+                "type": "integer",
+                "token": "CAPACITY",
+                "optional": true
+            },
+            {
+                "name": "nocreate",
+                "type": "pure-token",
+                "token": "NOCREATE",
+                "optional": true
+            },
+            {
+                "name": "items",
+                "type": "pure-token",
+                "token": "ITEMS"
+            },
+            {
+                "name": "item",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "CF.LOADCHUNK": {
+        "summary": "Restores a Cuckoo filter from the chunks CF.SCANDUMP gave.",
+        "complexity": "O(n) for a chunk of n bytes.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "iterator",
+                "type": "integer"
+            },
+            {
+                "name": "data",
+                "type": "string"
+            }
+        ]
+    },
+    "CF.MEXISTS": {
+        "summary": "Tells, for each item, whether it may have been added to a Cuckoo filter.",
+        "complexity": "O(N*f*b) for N items.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "CF.RESERVE": {
+        "summary": "Makes an empty Cuckoo filter.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "capacity",
+                "type": "integer"
+            },
+            {
+                "name": "bucketsize",
+                "type": "integer",
+                "token": "BUCKETSIZE",
+                "optional": true
+            },
+            {
+                "name": "maxiterations",
+                "type": "integer",
+                "token": "MAXITERATIONS",
+                "optional": true
+            },
+            {
+                "name": "expansion",
+                "type": "integer",
+                "token": "EXPANSION",
+                "optional": true
+            }
+        ]
+    },
+    "CF.SCANDUMP": {
+        "summary": "Returns a Cuckoo filter in chunks, to be restored with CF.LOADCHUNK.",
+        "complexity": "O(n) for a chunk of n bytes.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "iterator",
+                "type": "integer"
+            }
+        ]
+    },
     "CLUSTER DROPORPHANS": {
         "summary": "Deletes, in the background, the keys a master holds of slots another master owns, those the owner says it has; or reports how the last run went.",
         "complexity": "O(N), N being the number of keys in the node.",

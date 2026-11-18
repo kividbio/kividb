@@ -6,6 +6,7 @@ pub(crate) mod backup;
 pub(crate) mod bf;
 mod bitmap;
 pub mod blocking;
+pub(crate) mod cf;
 pub(crate) mod cluster;
 mod command_docs;
 mod command_docs_table;

@@ -2606,6 +2606,15 @@ fn read_only_key_positions(cmd: &[&[u8]]) -> Vec<usize> {
     }
 }
 
+/// Whether the probabilistic-type write `name` that just failed had found
+/// its key (`BF.*`, `CF.*`).
+#[cold]
+#[inline(never)]
+fn sketch_write_touched(name: &str) -> bool {
+    (name.starts_with("BF.") && crate::commands::bf::take_touched())
+        || (name.starts_with("CF.") && crate::commands::cf::take_touched())
+}
+
 /// [`notify_watchers`] for a `BF.*` write that failed after finding its key,
 /// which is always `cmd[1]`. Kept apart and out of line so `notify_watchers`
 /// keeps its one call site in [`side_effects`], where it is inlined: a second
@@ -3057,11 +3066,7 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
     // A `BF.*` write that failed once it had found its key (`BF.RESERVE` of
     // one there already, `BF.ADD` to a full filter) invalidates a `WATCH`
     // on it all the same, as Redis's do.
-    if writes_operation
-        && !is_mutating_ok_write
-        && name.starts_with("BF.")
-        && crate::commands::bf::take_touched()
-    {
+    if writes_operation && !is_mutating_ok_write && sketch_write_touched(name) {
         notify_failed_bf_write(ctx);
     }
 

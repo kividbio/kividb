@@ -794,6 +794,70 @@ make or grow may take; replication, the AOF and loads are not held to it.
 
 ---
 
+## Cuckoo filter commands (CF.*)
+
+Cuckoo filters, as Redis 8 has them built in (formerly RedisBloom): set
+membership with deletes. A filter is a chain of sub-filters of buckets of
+one-byte fingerprints; an item that finds no room is kicked about up to
+`MAXITERATIONS` times, and then a sub-filter `EXPANSION` times larger is added.
+Filters are laid out byte for byte as Redis lays them out, so replies are Redis
+8.10's in RESP2 and RESP3, `CF.SCANDUMP` and `DUMP` give what Redis can load,
+and a filter moved from Redis (an RDB file, a full sync from a Redis master,
+`RESTORE`/`MIGRATE`, `CF.LOADCHUNK`) answers as it did there. `TYPE` is
+`MBbloomCF`; the ACL category is `@cuckoo`.
+
+| Command | Syntax | Notes |
+|---------|--------|-------|
+| `CF.RESERVE` | `CF.RESERVE key capacity [BUCKETSIZE bucketsize] [MAXITERATIONS maxiterations] [EXPANSION expansion]` | Buckets `capacity / bucketsize` rounded up to a power of two; capacity at least twice the bucket size; expansion rounded up to a power of two, 0 for a filter that does not grow. Defaults from the `cf-*` settings |
+| `CF.ADD` | `CF.ADD key item` | Makes the filter with the `cf-*` settings if the key is missing. `Filter is full` when it cannot grow |
+| `CF.ADDNX` | `CF.ADDNX key item` | `0` if the item may be there already |
+| `CF.INSERT` | `CF.INSERT key [CAPACITY capacity] [NOCREATE] ITEMS item [item ...]` | One reply per item: `1`, or `-1` for one there was no room for. Keywords are taken by their first letter, as Redis takes them |
+| `CF.INSERTNX` | `CF.INSERTNX key [CAPACITY capacity] [NOCREATE] ITEMS item [item ...]` | `0` for an item that may be there |
+| `CF.EXISTS` | `CF.EXISTS key item` | `0` for a missing key, and for a key of another type, as in Redis |
+| `CF.MEXISTS` | `CF.MEXISTS key item [item ...]` | One reply per item |
+| `CF.COUNT` | `CF.COUNT key item` | How many times its fingerprint is in its buckets |
+| `CF.DEL` | `CF.DEL key item` | Deletes one copy; once deletes are over a tenth of the items, newer sub-filters' fingerprints are moved into older ones |
+| `CF.COMPACT` | `CF.COMPACT key` | Moves fingerprints down into older sub-filters and frees the emptied newest ones |
+| `CF.SCANDUMP` | `CF.SCANDUMP key iterator` | Iterator 0 gives the header, then chunks of at most 16 MiB; `[0, nil]` is the end, and the whole answer for a filter with no items |
+| `CF.LOADCHUNK` | `CF.LOADCHUNK key iterator data` | Restore, in order, the chunks `CF.SCANDUMP` gave (from KiviDB or Redis) |
+| `CF.INFO` | `CF.INFO key` | Redis's fields; a map in RESP3 |
+| `CF.DEBUG` | `CF.DEBUG key` | One line of the filter's parameters |
+
+Settings (`CONFIG SET`, the config file), with Redis's ranges: `cf-bucket-size`
+(2), `cf-initial-size` (1024), `cf-expansion-factor` (1), `cf-max-iterations`
+(20) and `cf-max-expansions` (32). A filter a command makes for want of one, or
+a `CF.RESERVE` that took a setting, is sent to replicas and the AOF as a
+`CF.RESERVE` naming every parameter, so a replica or a replay with other
+settings makes the same filter. As in Redis, a client's add to a filter of
+`cf-max-expansions` sub-filters or more is refused with `Maximum expansions
+reached`, and `BUCKETSIZE` is bounded by half of `cf-initial-size`.
+
+### Differences from Redis
+
+- `COPY` copies a filter; Redis refuses it.
+- Size limits: at most 1 GiB in all a filter's sub-filters, and 99 of them,
+  made, grown or loaded (`ERR filter is too large`). Redis has no limit on the
+  bytes.
+- Per-command limit: a `CF.INSERT`, `CF.INSERTNX` or `CF.MEXISTS` of many items
+  may cost at most 8,000,000 steps (each item: its buckets in every
+  sub-filter, and the kicks an add may take), reckoned before it starts; over
+  it, `ERR command reached the per-command limit for Cuckoo filters; send fewer
+  items per command`, and nothing is done. Replication and the AOF are not
+  held to it.
+- With `cf-max-expansions` 1, Redis makes a missing filter, refuses the add and
+  keeps the filter; KiviDB refuses it without making the filter.
+- `CF.SCANDUMP` of a sub-filter over 16 MiB gives it in 16 MiB pieces, each
+  from where the last ended (and `CF.LOADCHUNK` puts each back there); Redis
+  gives the same first 16 MiB for every piece. Chunks of smaller sub-filters
+  are Redis's.
+- Under `maxmemory`, a client's command that would allocate more than is left
+  evicts first under the policy, and is refused with `OOM ...` only if that is
+  not enough.
+- `DUMP` payloads carry RDB version 9, so every Redis since 6.0 can `RESTORE`
+  them; the value is as Redis 8.10 writes it.
+
+---
+
 ## Pub/Sub commands
 
 KiviDB implements the full Redis Pub/Sub command surface including regular channels, glob-pattern subscriptions, and Redis 7.0 shard channels. Every subscribed connection has one queue: a publish appends to the queue of each subscriber, and the connection's own task writes it out. A subscriber therefore sees messages in the order they were published, across all of its channels and patterns, and none is ever dropped from the middle — a subscriber that falls more than 32 MB behind, or stays more than 8 MB behind for 60 seconds, is disconnected instead (Redis's `client-output-buffer-limit pubsub 32mb 8mb 60`). A publish with no subscribers takes no lock.
