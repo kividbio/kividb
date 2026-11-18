@@ -3231,21 +3231,17 @@ unsafe fn write_reply(
                         }
                         let mut len = 0usize;
                         let ptr = ffi::lua_tolstring(state, -1, &mut len);
-                        let text =
-                            String::from_utf8_lossy(std::slice::from_raw_parts(ptr.cast::<u8>(), len))
-                                .into_owned();
+                        let text = String::from_utf8_lossy(std::slice::from_raw_parts(
+                            ptr.cast::<u8>(),
+                            len,
+                        ))
+                        .into_owned();
                         ffi::lua_pop(state, 1);
                         out.extend_from_slice(&resp_error(&text));
                         return true;
                     }
                     ffi::lua_pop(state, 1);
-                    for key in [
-                        c"double",
-                        c"big_number",
-                        c"verbatim_string",
-                        c"set",
-                        c"map",
-                    ] {
+                    for key in [c"double", c"big_number", c"verbatim_string", c"set", c"map"] {
                         ffi::lua_pushstring(state, key.as_ptr());
                         let kind = ffi::lua_rawget(state, idx);
                         ffi::lua_pop(state, 1);
