@@ -1076,9 +1076,10 @@ mod tests {
             batch.written(out);
         }
         // Idle: waiting for the next message, it lets the large ones go.
-        let waiting =
-            tokio::time::timeout(std::time::Duration::from_millis(20), outbox.next()).await;
-        assert!(waiting.is_err());
+        let idle = tokio::time::timeout(std::time::Duration::from_millis(20), outbox.next())
+            .await
+            .is_err();
+        assert!(idle);
         assert!(outbox.frames.capacity() <= KEEP_FRAME_BYTES);
         assert!(outbox.deliveries.capacity() <= KEEP_DELIVERIES);
     }

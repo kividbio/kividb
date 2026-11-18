@@ -94,7 +94,11 @@ impl Conn {
     fn resp3(port: u16) -> Self {
         let mut c = Self::connect(port);
         match c.cmd(&["HELLO", "3"]) {
-            Resp::Map(fields) => assert!(fields.iter().any(|(k, v)| k.text() == "proto" && *v == Resp::Int(3))),
+            Resp::Map(fields) => assert!(
+                fields
+                    .iter()
+                    .any(|(k, v)| k.text() == "proto" && *v == Resp::Int(3))
+            ),
             other => panic!("HELLO 3: {other:?}"),
         }
         c
@@ -315,7 +319,10 @@ fn concurrent_publishers_keep_each_subscribers_order() {
                 assert_eq!(items[1].text(), "fan:*");
                 let (p, seq) = parse_payload(&items[3].text());
                 assert_eq!(items[2].text(), format!("fan:{p}"));
-                assert_eq!(seq, next[p], "{io_model:?} {name}: publisher {p} out of order");
+                assert_eq!(
+                    seq, next[p],
+                    "{io_model:?} {name}: publisher {p} out of order"
+                );
                 next[p] += 1;
             }
         }
@@ -336,7 +343,11 @@ fn concurrent_publishers_keep_each_subscribers_order() {
             }
             let (p, seq) = parse_payload(&items[3].text());
             if p == 0 {
-                assert_eq!(awaiting.take(), Some(seq), "{io_model:?}: pmessage before message");
+                assert_eq!(
+                    awaiting.take(),
+                    Some(seq),
+                    "{io_model:?}: pmessage before message"
+                );
             }
             assert_eq!(seq, next[p], "{io_model:?}");
             next[p] += 1;
@@ -416,7 +427,11 @@ fn punsubscribe_in_the_middle_of_a_burst() {
         let mut next = 0;
         for _ in 0..2000 {
             let msg = sub.read();
-            assert_eq!(parse_payload(&msg.items()[3].text()).1, next, "{io_model:?}");
+            assert_eq!(
+                parse_payload(&msg.items()[3].text()).1,
+                next,
+                "{io_model:?}"
+            );
             next += 1;
         }
         sub.send(&["PUNSUBSCRIBE", "burst:*"]);
@@ -430,7 +445,10 @@ fn punsubscribe_in_the_middle_of_a_burst() {
             assert_eq!(parse_payload(&items[3].text()).1, next, "{io_model:?}");
             next += 1;
         }
-        assert!(sub.quiet_for(300), "{io_model:?}: a message after PUNSUBSCRIBE");
+        assert!(
+            sub.quiet_for(300),
+            "{io_model:?}: a message after PUNSUBSCRIBE"
+        );
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         publisher.join().unwrap();
         assert_eq!(sub.cmd(&["PING"]), Resp::Simple("PONG".into()));
@@ -456,7 +474,11 @@ fn a_subscriber_leaving_mid_fanout_does_not_stop_the_others() {
                 let mut buf = Vec::new();
                 for seq in run * 500..(run + 1) * 500 {
                     let payload = format!("p0:{seq}:{}", "x".repeat(200));
-                    buf.extend(encode(&["PUBLISH", &format!("room:{}", seq % 37), &payload]));
+                    buf.extend(encode(&[
+                        "PUBLISH",
+                        &format!("room:{}", seq % 37),
+                        &payload,
+                    ]));
                 }
                 c.stream.write_all(&buf).unwrap();
                 for _ in 0..500 {
@@ -489,7 +511,10 @@ fn a_subscriber_leaving_mid_fanout_does_not_stop_the_others() {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(receivers, 6, "{io_model:?}: the one that left is still counted");
+        assert_eq!(
+            receivers, 6,
+            "{io_model:?}: the one that left is still counted"
+        );
         assert_eq!(publisher.cmd(&["PUBSUB", "NUMPAT"]).int(), 1);
     }
 }
@@ -509,7 +534,10 @@ fn keyspace_events_reach_pattern_subscribers() {
         let mut pushed = Conn::resp3(port);
         plain.cmd(&["PSUBSCRIBE", "__keyspace@0__:fan*"]);
         pushed.cmd(&["PSUBSCRIBE", "__keyevent@0__:*"]);
-        assert_eq!(c.cmd(&["SET", "fanout-key", "v"]), Resp::Simple("OK".into()));
+        assert_eq!(
+            c.cmd(&["SET", "fanout-key", "v"]),
+            Resp::Simple("OK".into())
+        );
         assert_eq!(
             plain.raw_frame(),
             b"*4\r\n$8\r\npmessage\r\n$19\r\n__keyspace@0__:fan*\r\n$25\r\n__keyspace@0__:fanout-key\r\n$3\r\nset\r\n",
@@ -531,16 +559,25 @@ fn tracking_invalidations_beside_pattern_messages() {
     for io_model in io_models() {
         let port = start_server(&io_model);
         let mut c = Conn::resp3(port);
-        assert_eq!(c.cmd(&["CLIENT", "TRACKING", "on"]), Resp::Simple("OK".into()));
+        assert_eq!(
+            c.cmd(&["CLIENT", "TRACKING", "on"]),
+            Resp::Simple("OK".into())
+        );
         assert_eq!(c.cmd(&["PSUBSCRIBE", "t:*"]).items()[2].int(), 1);
         assert_eq!(c.cmd(&["GET", "tracked"]), Resp::Nil);
         let mut other = Conn::connect(port);
-        assert_eq!(other.cmd(&["SET", "tracked", "1"]), Resp::Simple("OK".into()));
+        assert_eq!(
+            other.cmd(&["SET", "tracked", "1"]),
+            Resp::Simple("OK".into())
+        );
         assert_eq!(other.cmd(&["PUBLISH", "t:1", "hi"]).int(), 1);
         let mut got = vec![c.read(), c.read()];
         got.sort_by_key(|m| m.items()[0].text());
         assert_eq!(got[0].items()[0].text(), "invalidate", "{io_model:?}");
-        assert_eq!(got[0].items()[1], Resp::Array(vec![Resp::Bulk(b"tracked".to_vec())]));
+        assert_eq!(
+            got[0].items()[1],
+            Resp::Array(vec![Resp::Bulk(b"tracked".to_vec())])
+        );
         assert_eq!(
             got[1],
             Resp::Push(vec![
