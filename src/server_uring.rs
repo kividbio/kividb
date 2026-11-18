@@ -833,7 +833,7 @@ fn open_subscriptions(
     let write_guard = Rc::clone(write_guard);
     let registry = std::sync::Arc::clone(client_registry);
     subs.forwarded_by(tokio_uring::spawn(async move {
-        while let Some(batch) = outbox.next().await {
+        while let Some(mut batch) = outbox.next().await {
             let _w = write_guard.lock().await;
             // With the guard held: see `Batch::encode`.
             let frames = batch.encode(registry.get_resp(client_id));
@@ -843,10 +843,11 @@ fn open_subscriptions(
             crate::stats::TOTAL_NET_OUTPUT_BYTES
                 .fetch_add(frames.len() as u64, std::sync::atomic::Ordering::Relaxed);
             crate::stats::record_write();
-            let (res, _) = stream.write_all(frames).await;
+            let (res, frames) = stream.write_all(frames).await;
             if res.is_err() {
                 break;
             }
+            batch.written(frames);
         }
     }));
     subs
