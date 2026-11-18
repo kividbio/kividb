@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;

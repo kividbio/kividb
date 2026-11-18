@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // One time for a whole EXEC (#659).
 //
 // Redis takes one time snapshot for a transaction (`commandTimeSnapshot`,

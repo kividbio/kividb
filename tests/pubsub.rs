@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! Integration tests for all Pub/Sub commands.
 //!
 //! Pub/sub tests are fundamentally multi-threaded — one thread subscribes,

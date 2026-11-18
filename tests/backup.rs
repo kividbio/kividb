@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/backup.rs
 //
 // The BACKUP command family (Redis 8.10) and `preload-file`, end to end:

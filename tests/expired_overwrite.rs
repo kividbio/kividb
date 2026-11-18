@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // A write over a key past its time: counted as expired, and announced as
 // `expired` before the write's own event. The stats and event flags are the
 // process's, so this file has one test.

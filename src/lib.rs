@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 // src/lib.rs
 //! The internals of the KiviDB server, a Redis-compatible in-memory database.
 //!
@@ -219,7 +220,7 @@ async fn server_tokio(
     // server would hang holding all locks. A dedicated runtime makes that
     // impossible. (The io_uring path already does this for its own reasons.)
     let aof_writer = aof::start_aof_writer(aof_rx);
-    std::thread::spawn(move || {
+    crate::cpus::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

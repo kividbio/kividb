@@ -352,7 +352,7 @@ impl ExpireCursor {
 /// the server was killed. Each rests 100 ms between cycles when it is not
 /// behind, so the threads cost next to nothing when there is little to do.
 fn expiry_threads() -> usize {
-    std::thread::available_parallelism()
+    crate::cpus::available_parallelism()
         .map(|n| n.get() / 4)
         .unwrap_or(1)
         .max(1)
@@ -722,7 +722,7 @@ pub fn spawn_active_expire_task(
         // The first thread also reports the latency event and sweeps the
         // hash fields' times.
         let latency = (part == 0).then(|| latency.clone());
-        std::thread::spawn(move || {
+        crate::cpus::spawn(move || {
             let mut cursor = ExpireCursor::part(part, parts);
             let target = crate::expiry::of(&store);
             // Every 100 ms, as Redis's `hz 10`; straight after a cycle that

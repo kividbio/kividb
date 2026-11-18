@@ -1280,7 +1280,7 @@ mod tests {
     fn resolves_on_a_current_thread_runtime() {
         let (tx, rx) = oneshot::channel();
         let val: Value = Arc::from(b"hello".as_slice());
-        std::thread::spawn(move || {
+        crate::cpus::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             let _ = tx.send(val);
         });
@@ -1305,7 +1305,7 @@ mod tests {
         let (_tx1, rx1) = oneshot::channel();
         let (tx2, rx2) = oneshot::channel();
         let (_tx3, rx3) = oneshot::channel();
-        std::thread::spawn(move || {
+        crate::cpus::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             let _ = tx2.send(Arc::from(b"v".as_slice()) as Value);
         });

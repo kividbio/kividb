@@ -416,7 +416,7 @@ mod tests {
             "{before} before, {during} with 256 MB more"
         );
         // Freed on another thread: the count is the process's, not a thread's.
-        std::thread::spawn(move || drop(block)).join().unwrap();
+        crate::cpus::spawn(move || drop(block)).join().unwrap();
         let after = allocated();
         assert!(
             after + SIZE / 2 <= during,
@@ -456,7 +456,7 @@ mod tests {
         let after = counted_by_this_thread().unwrap();
         assert_eq!(before - after, HELD as isize);
         // Starting a thread allocates a little here, and that is all.
-        std::thread::spawn(|| not_counted_add(HELD)).join().unwrap();
+        crate::cpus::spawn(|| not_counted_add(HELD)).join().unwrap();
         let then = counted_by_this_thread().unwrap();
         assert!(then.abs_diff(after) < 64 << 10, "{after}, then {then}");
         counted_again(2 * HELD);
@@ -474,7 +474,7 @@ mod tests {
         let makers: Vec<_> = (0..8)
             .map(|_| {
                 let tx = tx.clone();
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     for _ in 0..200 {
                         tx.send(vec![1u8; BLOCK]).unwrap();
                     }

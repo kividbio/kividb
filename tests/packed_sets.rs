@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Small sets kept in one block (#297, step 1), beside the arrays of integers
 // and the tables: every set command gives the same answer whatever the form,
 // across every change of form, and the members come back the same after a

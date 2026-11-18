@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Integration tests for Vector Set commands (VADD, VREM, VSIM, VCARD, VDIM,
 // VEMB, VISMEMBER, VGETATTR, VSETATTR, VINFO, VLINKS, VRANDMEMBER, VRANGE).
 //

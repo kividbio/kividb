@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/fulltext.rs
 //
 // Integration tests for full-text tokenisation:
