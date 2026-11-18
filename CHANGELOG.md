@@ -888,6 +888,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`MONITOR` no longer loses lines.** A monitor was fed through a ring of
+  4,096 lines shared by all monitors, and one that fell that far behind
+  lost what it had not read without a word: with four connections sending
+  pipelined commands over four worker threads, 1.2.2 showed a monitor
+  between 43 % and 72 % of them (one connection was not affected). Each
+  monitor now has its own queue, held to `client-output-buffer-limit
+  normal` as in Redis (no limit by default): past it the monitor is
+  disconnected and the server logs `Client id=… closed: it is in MONITOR
+  and … bytes behind, over client-output-buffer-limit normal`. Every
+  monitor sees one order, each connection's commands in the order it sent
+  them, and time stamps no longer go back between lines from different
+  threads. Arguments are quoted as Redis quotes them: `\n`, `\r`, `\t`,
+  `\a` and `\b` by name, not as `\x0a` and the like.
+
 - **Sorted-set commands read integers as Redis does.** `ZREMRANGEBYRANK
   key x 5` took `x` as 0 and removed members; it now answers `ERR value is
   not an integer or out of range`, before it looks at the key, as Redis
