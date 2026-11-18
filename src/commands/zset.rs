@@ -483,47 +483,31 @@ fn zrange_pairs(inner: &SortedSetInner, p: &RangeParams) -> Vec<(Vec<u8>, f64)> 
 
         // Only the members asked for are copied. Every member of the set
         // used to be, for each call, and all but these thrown away.
-        let wanted = (stop - start + 1) as usize;
         let copy = |(member, score): (Member<'_>, f64)| (member.to_vec(), score);
         // The tree has no way straight to the hundredth member: it is
         // walked to it, from whichever end is nearer. `start` counts from
         // the end the answer begins at (the top, for REV); past half way,
         // the walk comes from the other end and the answer is turned round.
         let from_far_end = (start as usize) > inner.len() / 2;
+        let (start, stop) = (start as usize, stop as usize);
+        // The same members as ranks from the bottom, for REV.
+        let (first, last) = (len as usize - 1 - stop, len as usize - 1 - start);
         if p.rev == from_far_end {
             if p.rev {
                 // Counted from the top and far from it: near the bottom.
-                let first = len as usize - 1 - stop as usize;
                 let mut found: Vec<(Vec<u8>, f64)> =
-                    inner.iter().skip(first).take(wanted).map(copy).collect();
+                    inner.range_by_rank(first, last).map(copy).collect();
                 found.reverse();
                 found
             } else {
-                inner
-                    .iter()
-                    .skip(start as usize)
-                    .take(wanted)
-                    .map(copy)
-                    .collect()
+                inner.range_by_rank(start, stop).map(copy).collect()
             }
         } else if p.rev {
-            inner
-                .iter()
-                .rev()
-                .skip(start as usize)
-                .take(wanted)
-                .map(copy)
-                .collect()
+            inner.range_by_rank(first, last).rev().map(copy).collect()
         } else {
             // Forward, but nearer the back: walk from the back and turn it.
-            let first = len as usize - 1 - stop as usize;
-            let mut found: Vec<(Vec<u8>, f64)> = inner
-                .iter()
-                .rev()
-                .skip(first)
-                .take(wanted)
-                .map(copy)
-                .collect();
+            let mut found: Vec<(Vec<u8>, f64)> =
+                inner.range_by_rank(start, stop).rev().map(copy).collect();
             found.reverse();
             found
         }
@@ -1517,18 +1501,7 @@ fn zscan(ctx: &mut Ctx) -> Vec<u8> {
             let inner = zs.read();
             // In the order of the members' positions: see
             // `helpers::scan_position`.
-            let (page, next_cursor) = crate::commands::helpers::scan_page(
-                inner.iter_unordered().map(|(member, score)| {
-                    (
-                        crate::commands::helpers::scan_position(&member),
-                        (member, score),
-                    )
-                }),
-                cursor,
-                count,
-                inner.len(),
-                1024,
-            );
+            let (page, next_cursor) = inner.scan_page(cursor, count, 1024);
             let mut items: Vec<Vec<u8>> = Vec::with_capacity(page.len() * 2);
             let pattern = options
                 .pattern

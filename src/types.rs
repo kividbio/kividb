@@ -6,6 +6,7 @@ use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::collections::btree_map;
 use std::fmt;
 use std::ops::RangeBounds;
 use std::sync::Arc;
@@ -316,11 +317,50 @@ impl SortedSetInner {
             .map(|(score, member)| (Member::Shared(member), score.0))
     }
 
+    /// Like `iter`, limited to ranks `start` to `stop`, inclusive.
+    pub fn range_by_rank(
+        &self,
+        start: usize,
+        stop: usize,
+    ) -> impl DoubleEndedIterator<Item = (Member<'_>, f64)> {
+        let len = self.by_score.len();
+        let end = stop.saturating_add(1).min(len);
+        RankRange {
+            keys: self.by_score.keys(),
+            skip_front: start,
+            skip_back: len - end,
+            left: end.saturating_sub(start),
+        }
+    }
+
     /// Members and scores in no particular order.
     pub fn iter_unordered(&self) -> impl Iterator<Item = (Member<'_>, f64)> {
         self.members
             .iter()
             .map(|(member, &score)| (Member::Shared(member), score))
+    }
+
+    /// A page of a scan from `cursor`: see `helpers::scan_page`.
+    pub fn scan_page(
+        &self,
+        cursor: u64,
+        count: usize,
+        pages: usize,
+    ) -> (impl ExactSizeIterator<Item = (Member<'_>, f64)>, u64) {
+        use crate::commands::helpers::{scan_page, scan_position};
+        let (page, next_cursor) = scan_page(
+            self.members
+                .iter()
+                .map(|(member, &score)| (scan_position(member), (member, score))),
+            cursor,
+            count,
+            self.members.len(),
+            pages,
+        );
+        let page = page
+            .into_iter()
+            .map(|(member, score)| (Member::Shared(member), score));
+        (page, next_cursor)
     }
 
     /// Like `iter`, limited to the given range of (score, member) keys.
@@ -377,6 +417,51 @@ impl SortedSetInner {
 impl Default for SortedSetInner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+struct RankRange<'a> {
+    keys: btree_map::Keys<'a, (OrderedFloat<f64>, ZMember), ()>,
+    // Members outside the range, walked past on the first step from each end.
+    skip_front: usize,
+    skip_back: usize,
+    left: usize,
+}
+
+impl<'a> Iterator for RankRange<'a> {
+    type Item = (Member<'a>, f64);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        if self.skip_front > 0 {
+            self.keys.nth(std::mem::take(&mut self.skip_front) - 1);
+        }
+        let (score, member) = self.keys.next()?;
+        Some((Member::Shared(member), score.0))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl DoubleEndedIterator for RankRange<'_> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        if self.skip_back > 0 {
+            self.keys.nth_back(std::mem::take(&mut self.skip_back) - 1);
+        }
+        let (score, member) = self.keys.next_back()?;
+        Some((Member::Shared(member), score.0))
     }
 }
 
