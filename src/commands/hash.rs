@@ -745,6 +745,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // In the order of the fields' positions: see
                     // `helpers::scan_position`.
                     let (page, next_cursor) = crate::commands::helpers::scan_page(
+                        // (Not `helpers::prefetched`: measured slower here.)
                         inner.iter().map(|(f, v)| {
                             (
                                 crate::commands::helpers::scan_position(f.as_bytes()),

@@ -1309,6 +1309,53 @@ pub fn scan_position(element: &[u8]) -> u64 {
     HASHER.hash_one(element) >> (64 - SCAN_POSITION_BITS)
 }
 
+/// `elements` as they come, each one's first cache line at `addr` asked for
+/// `SCAN_AHEAD` elements before it is handed out.
+///
+/// A scan reads every element of a large collection on every page to find
+/// its position, and the elements are each in an allocation of their own:
+/// one cache miss after another, nearly all of a page's time. Asked for
+/// ahead, the misses overlap.
+pub fn prefetched<I: Iterator>(
+    elements: I,
+    addr: impl Fn(&I::Item) -> *const u8,
+) -> impl Iterator<Item = I::Item> {
+    const SCAN_AHEAD: usize = 16;
+    let mut ahead = std::collections::VecDeque::with_capacity(SCAN_AHEAD);
+    let mut elements = elements.fuse();
+    std::iter::from_fn(move || {
+        while ahead.len() < SCAN_AHEAD {
+            let Some(element) = elements.next() else {
+                break;
+            };
+            prefetch_line(addr(&element));
+            ahead.push_back(element);
+        }
+        ahead.pop_front()
+    })
+}
+
+/// Ask for the cache line at `at`. A hint: nothing is read.
+#[inline(always)]
+fn prefetch_line(at: *const u8) {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    // SAFETY: a prefetch reads nothing and faults on nothing.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(at as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    };
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    // SAFETY: as above.
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{0}]",
+            in(reg) at,
+            options(nostack, readonly, preserves_flags)
+        )
+    };
+    #[cfg(any(miri, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    let _ = at;
+}
+
 /// The next page of a scan of a collection of `len` elements: the elements
 /// from `cursor` on, as many as `count` asks for, and the cursor to go on
 /// from — zero when that was the last page.
@@ -1325,10 +1372,44 @@ pub fn scan_page<T>(
     pages: usize,
 ) -> (Vec<T>, u64) {
     let want = count.max(len / pages.max(1)).max(1);
-    let mut ahead: Vec<(u64, T)> = elements
-        .filter(|(position, _)| *position >= cursor)
-        .collect();
-    if ahead.len() <= want {
+    // Only the lowest `want + 1` positions from `cursor` on decide the page,
+    // so only about twice that many elements are kept: when the room fills,
+    // it is cut back to the lowest `want + 1` and what lies past them is
+    // dropped. Collecting every element ahead of the cursor instead made each
+    // call write a vector the size of the collection: once a set's member
+    // became the three-way `Member` of the packed sets (#872), three times
+    // the bytes of the reference it was, a scan of a 200,000-member set took
+    // four and a half times as long.
+    let mut room = want.saturating_mul(2).max(64);
+    let mut ahead: Vec<(u64, T)> = Vec::with_capacity(room.min(len));
+    // Every position past `limit` lies past the page.
+    let mut limit = u64::MAX;
+    let mut dropped = false;
+    for (position, element) in elements {
+        if position < cursor {
+            continue;
+        }
+        if position > limit {
+            dropped = true;
+            continue;
+        }
+        ahead.push((position, element));
+        if ahead.len() >= room {
+            // The page ends at or before the `want`-th lowest position seen so
+            // far (counting from 0), and takes whatever is at that position
+            // only when it takes nothing else: so nothing past it is wanted,
+            // now or after any element still to come.
+            ahead.select_nth_unstable_by_key(want, |(position, _)| *position);
+            limit = ahead[want].0;
+            let before = ahead.len();
+            ahead.retain(|(position, _)| *position <= limit);
+            dropped |= ahead.len() < before;
+            // (Many elements at one position, a hash collision, could keep it
+            // full: room to go on.)
+            room = room.max(ahead.len().saturating_mul(2));
+        }
+    }
+    if ahead.len() <= want && !dropped {
         return (ahead.into_iter().map(|(_, element)| element).collect(), 0);
     }
     // The page ends before the position of the first element left out: so
@@ -1342,7 +1423,8 @@ pub fn scan_page<T>(
         // (Every one of them at a single position: take that position whole.)
         boundary += 1;
     }
-    let more = ahead.iter().any(|(position, _)| *position >= boundary);
+    // What was dropped lies past `limit`, so past the page.
+    let more = dropped || ahead.iter().any(|(position, _)| *position >= boundary);
     (
         ahead
             .into_iter()
@@ -1514,6 +1596,82 @@ mod scan_tests {
                 seen.contains(&n),
                 "{n} was there throughout and was not returned"
             );
+        }
+    }
+
+    /// The page as it was found before the room was bounded: every element
+    /// from `cursor` on collected, then the `want`-th lowest position chosen.
+    fn page_by_collecting_all(
+        elements: &[(u64, u32)],
+        cursor: u64,
+        want: usize,
+    ) -> (Vec<u32>, u64) {
+        let mut ahead: Vec<(u64, u32)> = elements
+            .iter()
+            .copied()
+            .filter(|(p, _)| *p >= cursor)
+            .collect();
+        if ahead.len() <= want {
+            let mut all: Vec<u32> = ahead.into_iter().map(|(_, e)| e).collect();
+            all.sort_unstable();
+            return (all, 0);
+        }
+        ahead.sort_unstable();
+        let mut boundary = ahead[want].0;
+        if ahead[..want].iter().all(|(p, _)| *p == boundary) {
+            boundary += 1;
+        }
+        let more = ahead.iter().any(|(p, _)| *p >= boundary);
+        let mut page: Vec<u32> = ahead
+            .into_iter()
+            .filter(|(p, _)| *p < boundary)
+            .map(|(_, e)| e)
+            .collect();
+        page.sort_unstable();
+        (page, if more { boundary } else { 0 })
+    }
+
+    #[test]
+    fn a_bounded_room_finds_the_same_pages() {
+        // Positions drawn from a small range, so that many elements share
+        // one (collisions), and from the full range; pages small and large
+        // against the room's floor of 64.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for (n, spread) in [
+            (0usize, 1u64 << 48),
+            (1, 1 << 48),
+            (500, 7),
+            (500, 40),
+            (3000, 1 << 48),
+            (5000, 300),
+            (20_000, 1 << 48),
+        ] {
+            let elements: Vec<(u64, u32)> = (0..n as u32).map(|e| (next() % spread, e)).collect();
+            for count in [1usize, 10, 31, 64, 100, 1000, 100_000] {
+                let mut cursor = 0;
+                loop {
+                    let (mut page, more) =
+                        scan_page(elements.iter().copied(), cursor, count, n, 1024);
+                    page.sort_unstable();
+                    let want = count.max(n / 1024).max(1);
+                    let expected = page_by_collecting_all(&elements, cursor, want);
+                    assert_eq!(
+                        (page, more),
+                        expected,
+                        "n {n} spread {spread} count {count} cursor {cursor}"
+                    );
+                    if more == 0 {
+                        break;
+                    }
+                    cursor = more;
+                }
+            }
         }
     }
 
