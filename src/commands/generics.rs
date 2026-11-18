@@ -34,13 +34,12 @@ pub(crate) fn scans_whole(value: ValueRef<'_>) -> bool {
         ValueRef::Set(set) => !set.read().is_table(),
         ValueRef::Hash(hash) => !hash.read().is_table(),
         ValueRef::HashEx(hash) => !hash.read().fields.is_table(),
+        ValueRef::SortedSet(zset) => zset.read().is_packed(),
         _ => matches!(encoding_of(value), "listpack" | "listpackex"),
     }
 }
 
 pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
-    // An entry of a compact structure is at most this long.
-    const SMALL: usize = 64;
     match value {
         ValueRef::String(bytes) => {
             let integer = bytes.len() <= 20
@@ -60,18 +59,8 @@ pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
         ValueRef::List(list) => list.read().encoding().name(),
         // The form it is really kept in (#297).
         ValueRef::Set(set) => set.read().encoding().name(),
-        ValueRef::SortedSet(zset) => {
-            let zset = zset.read();
-            if zset.len() <= 128
-                && zset
-                    .iter_unordered()
-                    .all(|(member, _)| member.len() <= SMALL)
-            {
-                "listpack"
-            } else {
-                "skiplist"
-            }
-        }
+        // The form it is really kept in: a block, or a table and a tree.
+        ValueRef::SortedSet(zset) => zset.read().encoding().name(),
         // The form it is really kept in: a block, or a table. With a field
         // TTL a block is a `listpackex`, as Redis names it.
         ValueRef::Hash(hash) => match hash.read().encoding() {
