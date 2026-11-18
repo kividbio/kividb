@@ -406,6 +406,16 @@ struct RangeParams<'a> {
     limit_count: usize, // usize::MAX means "no limit"
 }
 
+/// The members of a rank walk, pushed one by one: `collect` left the walk
+/// out of line (#920). Borrowed, not copied.
+fn push_members<'a>(members: impl Iterator<Item = (Member<'a>, f64)>) -> Vec<(Member<'a>, f64)> {
+    let mut found = Vec::with_capacity(members.size_hint().0);
+    for pair in members {
+        found.push(pair);
+    }
+    found
+}
+
 /// Core range logic: the members asked for, as the set holds them, and
 /// their scores — no RESP encoding, and no copy of any member.
 /// All public range commands call this and format the output themselves:
@@ -506,18 +516,17 @@ fn zrange_pairs<'a>(inner: &'a SortedSetInner, p: &RangeParams) -> Vec<(Member<'
         if p.rev == from_far_end {
             if p.rev {
                 // Counted from the top and far from it: near the bottom.
-                let mut found: Vec<(Member<'_>, f64)> = inner.range_by_rank(first, last).collect();
+                let mut found = push_members(inner.range_by_rank(first, last));
                 found.reverse();
                 found
             } else {
-                inner.range_by_rank(start, stop).collect()
+                push_members(inner.range_by_rank(start, stop))
             }
         } else if p.rev {
-            inner.range_by_rank(first, last).rev().collect()
+            push_members(inner.range_by_rank(first, last).rev())
         } else {
             // Forward, but nearer the back: walk from the back and turn it.
-            let mut found: Vec<(Member<'_>, f64)> =
-                inner.range_by_rank(start, stop).rev().collect();
+            let mut found = push_members(inner.range_by_rank(start, stop).rev());
             found.reverse();
             found
         }
