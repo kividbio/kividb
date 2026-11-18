@@ -40,6 +40,7 @@ and why.
 | `23-pubsub-pattern-fanout` | #851 | socket.io's Redis adapter: 48 `redis-benchmark` connections `PUBLISH` 200-byte messages to `socket.io#/#room<n>#`, 16 subscribers `PSUBSCRIBE socket.io#/#*` (`pattern`) or `SUBSCRIBE` one channel (`channel`, the plain fan-out guard): messages delivered a second until every subscriber has all of them, messages lost (exactly 0), and the p99 of a probe's own messages from publish to receipt |
 | `27-ratelimit-restarted` | #894 | envoyproxy/ratelimit's checks (`INCRBY` + `EXPIRE` on two keys, four commands in one write, 65 connections with 2 ms of the limiter's own time after each) beside 100 connections of pipelined `INCRBY` + `EXPIRE` pairs at 0, 50k and 100k commands a second, on a server restarted from its own snapshot of 100,000 keys (KiviDB keeps the replication backlog then: `repl_backlog_active` is kept in the raw data); of the 4 vCPUs the server on 0 and 2 (`--threads 2`), the checks on 1, the load on 3: checks a second and their p99, every row gated; recorded on a D4s_v5 (`results/pr-894-d4s_v5`). Needs a C compiler (`lib/ratelimit_load.c`). The issue's own shape, with the clients on CPUs of their own up to 300k, needs 8 CPUs: run the suite's load by hand as the PR describes |
 | `24-snapshot-size` | #879 | `SAVE` of #879's dataset (`DEBUG POPULATE 6000000 k 150`) and of a collections mix (200,000 hashes of 10 fields, 50,000 each of sets, sorted sets and lists of 20), each twice: `-default` (the candidate as it starts, `rdbcompression no`) and `-yes` (the suite sets `CONFIG SET rdbcompression yes` on the candidate): the snapshot's size, the `SAVE` time (median of 3 after a warm-up) and the time a new server takes to load it (best of 2). Gates: `-yes` keeps 60 % of the size gain over v1.2.2 and #879's dataset within 1.5x of Redis's `dump.rdb`; `-default` within 1 % of v1.2.2's size; the save at most 2.5x v1.2.2's time, the load 1.5x |
+| `25-centrifuge-scripts-publish` | #900 | centrifuge v0.40.1's history scripts with the arguments its broker sends (30-day meta TTL), whose 2-3 keys carry no hash tag (each runs alone, on the script-runner thread): `EVALSHA` of `broker_history_list.lua` and `broker_history_add_list.lua` from 16 connections (`scripts`, the `lua,tls` builds); `PUBLISH` to 1,000 channels nobody subscribes to, beside 4 idle subscribers, from 1 connection and from 8, pipeline 16 (`publish`): calls a second counted by the server; a round with any error reply, or a history list of the wrong length, fails the suite. Gates: 10 % and at most 1.05x worse than v1.2.2 in the same session (for now 1.08x for the 8-connection `PUBLISH`, where master is behind v1.2.2 with matching compilers; to go back to 1.05x when that gap is fixed) |
 | `30-script-call-cost` | #901 | server CPU per call and calls a second of short scripts by `EVALSHA` (`redis-benchmark`, 32 connections, one KiviDB worker): Tyk's sliding-log limiter over 5,000 keys of 144 members, the compare-and-delete lock release of #880 on keys another owner holds, and `return 1`, each also with its keys under a hash tag. Needs a `lua,tls` candidate (`--candidate-full`, #921). Gates: CPU per call within 10 % of the recorded value and at most 0.93x v1.2.2's for Tyk, 1.03x for the others; calls a second 10 % |
 | `31-zset-memory` | #825, #297 (step 4) | `used_memory` per sorted-set member, 1,000,000 members in sets of 10, 100, 128, 129 and 1,000: 14-byte members (`membr:<i>`), scores whole (`int`) or with a fraction (`float`); `OBJECT ENCODING` of each size recorded exactly (`listpack` up to 128, `skiplist` past it); the large sets (129 and 1,000) as guard rows |
 
@@ -50,14 +51,38 @@ sandbox that allow it: not Docker's default seccomp profile). Run it on a VM,
 not on a laptop, and nothing else on the machine.
 
 ```sh
+rustup update stable    # the Rust release v1.2.2's binaries were built by, or later: see below
 cargo build --release
+cargo build --release --features lua,tls --target-dir target-full
 benchmarks/1.3.0/regressions/run-all.sh --candidate target/release/kividb \
+    --candidate-full target-full/release/kividb \
     --candidate-commit "$(git rev-parse --short HEAD)" --label master-$(git rev-parse --short HEAD)-d4s_v5
 ```
+
+**Build the candidate with the Rust release the reference was built by.**
+The release workflow builds with the stable Rust of the day (v1.2.2: rustc
+1.100.0, on Amazon Linux 2023). A VM image's older toolchain is not that: on
+2026-11-18 the same master tree built by rustc 1.99.1 ran centrifuge's script
+rows 10-13 % and its one-connection `PUBLISH` row 4-7 % slower than built by
+1.100.0, and v1.2.2 built by 1.99.1 was as slow; an earlier comparison of the
+two read that as a regression of master (#900). `env.json` records the rustc
+of every KiviDB binary (from its `.comment` section), `baseline.json` records
+the candidate's with each value (`recorded.rustc`, `rustc_full`), and
+`compare.py` judges it against v1.2.2's (and the `full` pair's):
+
+- **older** than v1.2.2's, or **unknown** (no `rustc version` in the binary):
+  the run is `INVALID`, because its rows against v1.2.2 compare compilers;
+- **newer**: a `WARN` line only (`rust-toolchain.toml` says `stable`, so a
+  later release is normally built by a newer rustc);
+- `REGRESS_ALLOW_RUSTC=1` turns the `INVALID` cases into warnings, for a
+  deliberate check of the compiler's effect. Run that way in #921, the master
+  `lua,tls` build by rustc 1.99.1 was `REGRESSED` against v1.2.2's on suite 25's
+  script rows by 8-18 % (not kept as a result: it measures the compiler).
 
 | option | |
 |---|---|
 | `--candidate <path\|tag>` | a kividb binary, or a release tag such as `v1.3.0` (its default-build tarball, SHA-256 checked) |
+| `--candidate-full <path\|tag>` | the candidate built with `--features lua,tls` (or a tag: its `full` tarball), for the configurations that need scripts (`Config(lua=True)`: `25-centrifuge-scripts-publish/scripts`); they run v1.2.2's `full` build against it. Without it they are skipped, listed in `summary.md`, and not expected |
 | `--label NAME` | results go to `results/NAME/` (default `run-<UTC time>`) |
 | `--only 01,04` | only these suites (number or full name); an entry that names no suite is an error |
 | `--engines v1_2_2,candidate` | only these engines; gates that need a missing engine are reported as skipped |
@@ -252,8 +277,9 @@ users, not a ratio), `eq` counts, all memory gates, and `info`. `ratio` and
 `vs_redis` already compare within the session. If the global factor is under
 0.7 or over 1.4, the summary adds a `WARN` line (not a failure): the bounds were
 recorded on a faster or slower host. `--record` stores the CPU model in
-`recorded.cpu`. Re-run the self-test with `python lib/test_compare.py` after
-changing this logic.
+`recorded.cpu` (and the candidate's rustc in `recorded.rustc`). Re-run the
+self-tests with `python lib/test_compare.py` and `python lib/test_suite25.py`
+(suite 25's error check) after changing this logic.
 
 Why a few rows differ from the plan's defaults:
 
@@ -328,22 +354,57 @@ re-record that hides a regression defeats the suite.
 1. Once the release's scope is frozen and the final RC is cut (never on a
    build that may still change), run the whole suite with `FULL=1` against the
    RC on the VM size in `baseline.json` (`Standard_D4s_v5`):
-   `run-all.sh --candidate v1.3.0-rcN --label v1.3.0-rcN-d4s_v5`.
-2. Every gate must pass. A failure is either a regression to fix before the
-   release, or an intended change that is explained in the release PR, after
-   which the baseline is re-recorded.
-3. Commit `results/<label>/` with the release PR, so the release's numbers
-   stay next to the harness that produced them. The release workflow
-   refuses a stable tag without it (`scripts/release/check-regression-results.sh`:
-   a full run with verdict `ok` whose candidate commit is an ancestor of the tag,
-   with `src/`, `Cargo.toml` and `Cargo.lock` unchanged since).
-   The Actions workflow "Regression suite" (`.github/workflows/regression-suite.yml`)
-   makes the VM, builds the candidate, runs the suite and uploads
-   `results/<label>/` as an artifact; docs/RELEASING.md has the steps.
-4. For a new improvement in the release, its suite and its first recorded
+   `run-all.sh --candidate v1.3.0-rcN --candidate-full v1.3.0-rcN --label v1.3.0-rcN-d4s_v5`
+   (`--candidate-full` takes the RC's `full` tarball, or a `lua,tls` build of
+   the same commit; without it suite 25's `scripts` is skipped and the release
+   gate refuses the run). The Actions workflow (below) builds both. Suites
+   that declare `min_cpus` above the machine's 4 CPUs are not run there
+   (`needs_more_cpus` in `env.json`, their metrics "not run").
+2. For those suites, the same candidate with `FULL=1` on a machine with at
+   least that many CPUs (`Standard_D8s_v5` for `min_cpus=8`):
+   `run-all.sh --candidate v1.3.0-rcN --candidate-full v1.3.0-rcN --min-cpus-only --label v1.3.0-rcN-d8s_v5`.
+   Their baseline values were recorded on that machine (`recorded.vm`), and
+   each metric is judged on the machine size it was recorded on. Host-speed
+   scaling (below) works per run: each run's factors come from the v1.2.2
+   values of the suites it ran, against their own recorded ones, so the two
+   machine sizes never mix. With no suite declaring `min_cpus`, this step
+   runs nothing and is not needed.
+3. Every gate must pass in both. A failure is either a regression to fix
+   before the release, or an intended change that is explained in the
+   release PR, after which the baseline is re-recorded.
+4. Commit both `results/<label>/` with the release PR, so the release's
+   numbers stay next to the harness that produced them. The release workflow
+   refuses a stable tag unless the committed runs together cover every suite
+   (`scripts/release/check-regression-results.sh vX.Y.Z --ref HEAD`, or with
+   `--runs v1.3.0-rcN-d4s_v5,v1.3.0-rcN-d8s_v5` to judge just those: runs
+   with verdict `ok` whose candidate commit is an ancestor of the tag, with
+   `src/`, `Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml` unchanged
+   since, and every `min_cpus` suite run on a machine that big; it names
+   every suite no run covers). The Actions workflow "Regression suite"
+   (`.github/workflows/regression-suite.yml`) makes both machines (the
+   second with `big`, its default), builds the candidate on each, runs the
+   suite and uploads each `results/<label>/` as an artifact;
+   docs/RELEASING.md has the steps.
+5. For a new improvement in the release, its suite and its first recorded
    values land with the fix's PR (or right after it), not at release time.
 
 ## Adding a suite
+
+Checklist (the release gate refuses a tree that misses any of these):
+
+- [ ] The suite's number is free (directory and open PRs).
+- [ ] If its load generator is the limit on the `Standard_D4s_v5`, it declares
+      `S = Suite("NN-name", [...], min_cpus=8)`; its README text runs it with
+      `run-all.sh --min-cpus-only`, not `--only NN`.
+- [ ] Its baseline is recorded (`--record`) **on the machine it declares**: a
+      `Standard_D4s_v5` without `min_cpus`, a `Standard_D8s_v5` with
+      `min_cpus=8` (`--min-cpus-only --record`). A suite with no rows in
+      `baseline.json` fails the gate ("no recorded values"), and so does a
+      run whose rows say `new`.
+- [ ] Recorded with a candidate built by the release's rustc (or newer), and
+      without `ALLOW_VM_CHANGE`/`REGRESS_ALLOW_RUSTC`: the gate refuses runs
+      that used either.
+- [ ] Its row in the table above, its gates explained in its docstring.
 
 A suite is `suites/NN-name.py`. `run-all.sh` picks up every file named
 `[0-9][0-9]-*.py`, in order.
@@ -378,10 +439,22 @@ if __name__ == "__main__":
 - Make the data deterministic, warm up, take the median of 3 where a run is
   cheap, and keep each server run under `SUITE_TIMEOUT`.
 - Wrap dataset sizes in `scaled()` so `SCALE=0.01` can smoke-test the suite.
-- Suites that need Lua use the `full` build: the v1.2.2 one is fetched to
-  `$REGRESS_CACHE/releases/v1.2.2/full/kividb` (extend `run-all.sh`'s engine
-  table with a `v1_2_2_full`/`candidate_full` pair when the first such suite
-  lands).
+- A suite whose load generator, not the server, is the limit on the
+  `Standard_D4s_v5` declares the CPUs it needs, in one line:
+  `S = Suite("18-example", [...], min_cpus=8)`. `run-all.sh` then does not
+  run it on a smaller machine (`needs_more_cpus` in `env.json`: not run, not
+  `INVALID`); `--only 18` runs it anyway and makes the run `INVALID` ("not
+  valid for the gate"); `--min-cpus-only` on a big enough machine runs only
+  such suites. Record its baseline on that machine
+  (`run-all.sh --min-cpus-only --record` on a `Standard_D8s_v5`): its
+  metrics then carry that `recorded.vm`, and the release gate needs its run
+  from such a machine (see "How a release uses it").
+- A configuration that needs Lua says `Config(..., lua=True)`: `run-all.sh`
+  then starts v1.2.2's `full` build (fetched to
+  `$REGRESS_CACHE/releases/v1.2.2/full/kividb`, SHA-256 checked) and the
+  `--candidate-full` binary under the usual engine names `v1_2_2` and
+  `candidate`, and skips the configuration when `--candidate-full` is not
+  given. `env.json` lists both binaries as `v1_2_2_full` and `candidate_full`.
 - Smoke it (`SCALE=0.01 run-all.sh --only 05 ...`), then run it for real with
   `--only 05 --record`, and twice more without `--record` to see the noise;
   widen a tolerance only for noise you measured.
