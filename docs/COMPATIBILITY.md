@@ -21,7 +21,7 @@ other files:
 | Redis 8 data types | JSON, search and query (`FT.*`, full-text, tag, numeric and vector), time series (`TS.*`), vector sets (`V*`), Bloom filters (`BF.*`). All built in, nothing to load. |
 | Transactions and scripts | `MULTI`/`EXEC`/`WATCH` and scripts run as one step, as in Redis ([EXEC_ATOMICITY.md](EXEC_ATOMICITY.md)). Lua (`EVAL`, `FUNCTION`, `FCALL`) needs the `lua` or `full` build. |
 | Security | `AUTH`, ACLs (users, key and channel patterns, ACL file), protected mode, TLS in the `tls` and `full` builds. |
-| Persistence | Snapshots (`dump.kdb`) and an append-only file. Reads a Redis `dump.rdb`. ([PERSISTENCE.md](PERSISTENCE.md)) |
+| Persistence | Snapshots (`dump.kdb`, compressed with `rdbcompression yes`, which is off by default) and an append-only file. Reads a Redis `dump.rdb`. ([PERSISTENCE.md](PERSISTENCE.md)) |
 | Replication | `REPLICAOF`, partial resync, and replicating from a Redis primary. |
 | Cluster | Redis's cluster protocol: hash slots, `CLUSTER` commands, gossip, failover, atomic slot migration. |
 | Sentinel | Not implemented. |
@@ -164,6 +164,27 @@ other files:
   soonest first; so once a field of a small hash has a TTL the two orders
   differ. They agree for a `listpack`.
 
+**Lists**
+- A list's elements are kept end to end in chunks of up to 64, as Redis
+  keeps a quicklist of listpacks, but the size of a chunk is fixed: Redis
+  closes a node at `list-max-listpack-size` (8 kB by default), KiviDB at 64
+  elements. A list that has had an element longer than 1,024 bytes keeps
+  every element in a block of its own from then on, as 1.2 kept every list.
+- `OBJECT ENCODING` says `listpack` while a list is one chunk and
+  `quicklist` otherwise, so it differs from Redis in two ways:
+  - Redis `listpack`, KiviDB `quicklist`: lists of 65 to about 240 small
+    elements (32 bytes each, say), and short lists that hold, or held, an
+    element of 1,025 to 8,192 bytes.
+  - Redis `quicklist`, KiviDB `listpack`: up to 64 elements of more than
+    8 kB in all, such as a few dozen elements of 1 kB.
+
+  Redis goes back to `listpack` when a quicklist shrinks to one node of
+  half the limit; KiviDB when it is down to one chunk, and never once its
+  elements are kept apart.
+- `list-max-listpack-size`, `list-max-ziplist-size` and
+  `list-compress-depth` are accepted and reported, and change nothing: no
+  chunk is compressed.
+
 **Durability**
 - With the AOF on, a write is acknowledged once its record is in the file,
   as in Redis: a hard kill (`kill -9`, the OOM killer) loses no acknowledged
@@ -250,6 +271,12 @@ other files:
 - `OBJECT IDLETIME` is `0` unless a `maxmemory-policy` that uses it is set,
   or `key-access-tracking yes` is (Redis always keeps it; the setting costs
   about 50 instructions a command, 1 to 1.5% of a pipelined `GET` or `SET`).
+- `CLIENT NO-TOUCH`: the client's reads leave a key's idle time and LFU
+  count alone, and `TOUCH` still touches, as in Redis. Its writes count as
+  uses of their keys, and so do the keys a script declares when the client
+  runs one that may write (`EVAL`, `EVALSHA`, `FCALL`); in Redis a
+  `NO-TOUCH` client's write to a key that is already there, or its script,
+  leaves the key's use alone, and only a key it creates is marked used.
 - `client-output-buffer-limit`'s replica hard limit is
   `repl-replica-max-backlog-bytes` (0: no limit, which lifts
   `repl-replica-sync-max-backlog-bytes` too); during a full sync a replica

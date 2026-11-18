@@ -1,12 +1,12 @@
 use crate::commands::ctx::Ctx;
 
 use crate::commands::memory_layout as layout;
-use crate::member_set::MemberSet;
+use crate::member_set::{Member, MemberSet};
 use crate::read_lock;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
-use crate::types::{HashFields, HashInner, SortedSetInner, StreamInner, ZMember};
+use crate::types::{HashFields, HashInner, ListValues, SortedSetInner, StreamInner, ZMember};
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
 
@@ -123,6 +123,15 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
         // which a share of the table's entries does not fit.
         ValueRef::String(b) => size_class(16 + key.len() + 2 + b.len() + 2),
 
+        // Chunks of packed elements are counted as allocated, room to spare
+        // included.
+        ValueRef::List(arc) if arc.read().is_packed() => {
+            let inner = arc.read();
+            entry()
+                + layout::arc_of::<RwLock<ListValues>>()
+                + inner.packed_bytes().unwrap_or_default()
+        }
+
         ValueRef::List(arc) => {
             let inner = arc.read();
             let len = inner.len();
@@ -173,20 +182,19 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             // was changed has two: the member map keeps the block it had and
             // the score index takes the command's, so the map's is then held
             // by the map alone. Sampled as a set's members are.
-            let members = layout::sampled(inner.members.len(), samples, || {
-                inner.members.keys().map(|m| {
+            let members = layout::sampled(inner.len(), samples, || {
+                inner.iter_unordered().map(|(m, _)| {
                     let block = layout::arc_slice(m.len());
-                    if std::sync::Arc::strong_count(m) == 1 {
-                        2 * block
-                    } else {
-                        block
+                    match m {
+                        Member::Shared(m) if std::sync::Arc::strong_count(m) == 1 => 2 * block,
+                        _ => block,
                     }
                 })
             });
             entry()
                 + layout::arc_of::<RwLock<SortedSetInner>>()
-                + layout::std_hash_map::<ZMember, f64>(inner.members.capacity())
-                + layout::score_index::<(OrderedFloat<f64>, ZMember)>(inner.by_score.len())
+                + layout::std_hash_map::<ZMember, f64>(inner.capacity())
+                + layout::score_index::<(OrderedFloat<f64>, ZMember)>(inner.len())
                 + members
         }
 

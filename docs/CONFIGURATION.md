@@ -85,7 +85,7 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--port` | `6380` | Port to listen on; `0` for none (TLS only, with `--tls-port`) |
 | `--bind` | `0.0.0.0` | Address to listen on. Setting it explicitly turns off [protected mode](#protected-mode) |
 | `--protected-mode <yes\|no>` | `yes` | See [Protected mode](#protected-mode) |
-| `--threads` | `0` (auto) | Worker threads; auto is the number of cores minus 2 (all cores below 4) |
+| `--threads` | `0` (auto) | Worker threads; auto is one per CPU the process may use (see [Worker threads](#worker-threads)) |
 | `--databases` | `16` | Number of databases |
 | `--dir <path>` | start directory | Where `dump.kdb`, `appendonly.aof` and `nodes.conf` live |
 | `--aof` | off | Append-only file persistence |
@@ -120,7 +120,39 @@ open-file limit to `maxclients` plus what it keeps for itself (32 files, or on i
 warning. Cluster bus links, a replica's link to its master and files written while saving
 are not counted in that; leave room for them in a large cluster.
 
-Persistence (snapshots and the AOF) is described in [PERSISTENCE.md](PERSISTENCE.md).
+Persistence (snapshots and the AOF) is described in [PERSISTENCE.md](PERSISTENCE.md),
+including `rdbcompression` (default `no`; `yes` writes snapshots compressed, which 1.2 cannot read) and the
+`kividb kdb-decompress <in> <out>` and `kividb kdb-compress <in> <out>` tools, which convert a
+snapshot between the compressed form and the plain one KiviDB 1.2 reads (refusing an input the
+server would not load, and an existing output unless `--force` is given).
+
+### Worker threads
+
+Commands run on the worker threads, every worker serving its own share of the connections.
+`--threads N` starts exactly `N`. `--threads 0`, the default, starts one per CPU the process
+may actually run on: the CPUs online, cut down to its affinity mask (`taskset`, a cpuset,
+Docker's `--cpuset-cpus`, the Kubernetes static CPU manager) and to its cgroup CPU quota
+(Docker's `--cpus`, a Kubernetes CPU limit; a fraction is rounded down, so `--cpus 1.5` is
+one worker), and never fewer than one. A container limited to 2 CPUs on a 64-CPU host starts 2.
+The startup banner says how the number was chosen:
+
+```
+  * CPUs           : 8 online, 2 available (a cgroup CPU quota of 2 CPUs)
+  * Worker threads : 2 (auto: one per available CPU)
+```
+
+The server's other threads (the AOF writer, the replication hub, expiry, a background save,
+the accept and timer threads) run beside the workers; none is given a CPU of its own.
+Measured with the server confined to 2 and 4 vCPUs, one worker per CPU was the fastest
+setting or within about 10% of it, with AOF or a replica too (during `BGSAVE` on 2 vCPUs a third worker served 22% more); a worker fewer
+cost up to 41% on 2 vCPUs, and more workers than the CPUs (or than the quota) multiplied the
+p99. [PERFORMANCE.md](PERFORMANCE.md#worker-threads) has the numbers.
+
+Set `--threads` yourself to keep CPUs for something else on the same machine, such as the
+application or a load generator, or to keep the count of an earlier release: up to 1.2 auto
+was the CPUs minus 2 (all of them below 4), which is `--threads 2` on 4 CPUs and
+`--threads 6` on 8. A Kubernetes pod with a CPU request but no CPU limit has no quota, so
+the server sees every CPU of the node: give it a limit, or `--threads`.
 
 ## TLS
 

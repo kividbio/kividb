@@ -74,6 +74,10 @@ pub struct Activity {
     /// once, and not shown), and what is queued for a subscriber.
     reply_output: AtomicU64,
     pubsub_output: AtomicU64,
+    /// What a subscriber's writer keeps between batches (its batch and
+    /// frame buffers, #851): memory the client holds, not output waiting,
+    /// so it is in `tot-mem` and `mem_clients_normal` and not in `omem`.
+    pubsub_kept: AtomicU64,
 }
 
 /// A batch of replies this large or larger is shown in `omem` while it is
@@ -368,6 +372,17 @@ impl Activity {
         self.reply_output.load(Ordering::Relaxed) + self.pubsub_output.load(Ordering::Relaxed)
     }
 
+    /// See [`Activity::pubsub_kept`].
+    pub fn set_pubsub_kept(&self, bytes: usize) {
+        self.pubsub_kept.store(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// What the connection holds besides its query buffer: its output and
+    /// a subscriber's kept buffers.
+    pub fn memory(&self) -> u64 {
+        self.output() + self.pubsub_kept.load(Ordering::Relaxed)
+    }
+
     /// The connection's transaction now: the commands queued if it is in
     /// one, and the keys it watches. See [`Activity::tx`].
     #[inline]
@@ -542,6 +557,12 @@ pub struct ClientInfo {
     pub activity: Arc<Activity>,
     pub query_buffer: Arc<QueryBufferMetrics>,
     pub no_evict: bool,
+    /// `CLIENT NO-TOUCH`: this client's reads record no use of the keys
+    /// they find (`T` in `CLIENT LIST`). This is the flag `CLIENT NO-TOUCH`
+    /// and `RESET` write; the connection's loop keeps a copy of its own
+    /// the command dispatcher reads (`Ctx::resp`'s `RESP_NO_TOUCH`), synced back after
+    /// the commands that can change it (#566).
+    pub no_touch: bool,
     /// Waiting in a blocking command: `b` in `CLIENT LIST`.
     pub blocked: bool,
     /// True iff the client has issued ASKING for the next command.
@@ -594,6 +615,9 @@ pub struct ClientInfo {
     pub replica_vset_quant: Option<bool>,
     /// It sent `REPLCONF capa slot-imports` (#741).
     pub replica_slot_imports: bool,
+    /// It sent `REPLCONF capa kdb-blocks`: it reads a compressed snapshot
+    /// (#879).
+    pub replica_kdb_blocks: bool,
     /// Channels, patterns and shard channels this client is subscribed to.
     pub subscriptions: [usize; 3],
 }
@@ -617,6 +641,7 @@ impl ClientInfo {
             activity: Arc::new(activity),
             query_buffer: Arc::default(),
             no_evict: false,
+            no_touch: false,
             blocked: false,
             asking: false,
             readonly: false,
@@ -641,6 +666,7 @@ impl ClientInfo {
             replica_lost_data: 0,
             replica_vset_quant: None,
             replica_slot_imports: false,
+            replica_kdb_blocks: false,
             subscriptions: [0; 3],
         };
         (info, kill_rx)
@@ -684,6 +710,9 @@ impl ClientInfo {
         if self.no_evict {
             flags.push('e');
         }
+        if self.no_touch {
+            flags.push('T');
+        }
         if flags.is_empty() {
             flags.push('N');
         }
@@ -711,8 +740,9 @@ impl ClientInfo {
             qbuf_free,
             self.activity.output(),
             // What KiviDB measures of a client's memory: its query buffer,
-            // and what is waiting to be written to it.
-            qbuf + qbuf_free + self.activity.output(),
+            // what is waiting to be written to it, and a subscriber's kept
+            // buffers.
+            qbuf + qbuf_free + self.activity.memory(),
             self.activity.last_cmd(),
             self.user,
             self.tracking_redirect.map_or(-1, |id| id as i64),
@@ -1051,7 +1081,7 @@ impl ClientRegistryInner {
     }
 
     /// Client `id` waits in a command that is no key's (`WAIT`): blocked,
-    /// counted in `blocked_clients`, and ended by `CLIENT UNBLOCK` through
+    /// listed as blocked, and ended by `CLIENT UNBLOCK` through
     /// `unblock`, until what this returns is dropped.
     pub fn blocked_in(
         &self,
@@ -1060,7 +1090,6 @@ impl ClientRegistryInner {
         with_timeout: bool,
     ) -> BlockedIn<'_> {
         self.set_blocked(id, Some(unblock), with_timeout);
-        crate::stats::BLOCKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
         BlockedIn { registry: self, id }
     }
 
@@ -1104,7 +1133,7 @@ impl ClientRegistryInner {
         let (mut normal, mut replicas) = (0u64, 0u64);
         for info in self.clients.read().values() {
             let (len, free) = info.query_buffer.values();
-            let used = len + free + info.activity.output();
+            let used = len + free + info.activity.memory();
             if info.flags.contains('S') {
                 replicas += used;
             } else {
@@ -1180,6 +1209,7 @@ impl ClientRegistryInner {
                 activity: Arc::clone(&c.activity),
                 query_buffer: Arc::clone(&c.query_buffer),
                 no_evict: c.no_evict,
+                no_touch: c.no_touch,
                 blocked: c.blocked,
                 asking: c.asking,
                 readonly: c.readonly,
@@ -1204,6 +1234,7 @@ impl ClientRegistryInner {
                 replica_lost_data: c.replica_lost_data,
                 replica_vset_quant: c.replica_vset_quant,
                 replica_slot_imports: c.replica_slot_imports,
+                replica_kdb_blocks: c.replica_kdb_blocks,
                 subscriptions: c.subscriptions,
             })
             .collect()
@@ -1222,6 +1253,7 @@ impl ClientRegistryInner {
             activity: Arc::clone(&c.activity),
             query_buffer: Arc::clone(&c.query_buffer),
             no_evict: c.no_evict,
+            no_touch: c.no_touch,
             blocked: c.blocked,
             asking: c.asking,
             readonly: c.readonly,
@@ -1246,6 +1278,7 @@ impl ClientRegistryInner {
             replica_lost_data: c.replica_lost_data,
             replica_vset_quant: c.replica_vset_quant,
             replica_slot_imports: c.replica_slot_imports,
+            replica_kdb_blocks: c.replica_kdb_blocks,
             subscriptions: c.subscriptions,
         })
     }
@@ -1263,6 +1296,17 @@ impl ClientRegistryInner {
     #[inline]
     pub fn get_resp(&self, id: u64) -> u8 {
         self.clients.read().get(&id).map(|c| c.resp).unwrap_or(2)
+    }
+
+    /// The `NO-TOUCH` flag. A connection's loop keeps its own copy for the
+    /// command dispatcher; it reads this back only after a command that
+    /// can have changed it — `CLIENT` or `EXEC` — has run (#566).
+    pub fn get_no_touch(&self, id: u64) -> bool {
+        self.clients
+            .read()
+            .get(&id)
+            .map(|c| c.no_touch)
+            .unwrap_or(false)
     }
 
     /// Hot-path accessor for the cluster routing layer. Returns just the
@@ -1375,7 +1419,6 @@ pub struct BlockedIn<'a> {
 impl Drop for BlockedIn<'_> {
     fn drop(&mut self) {
         self.registry.set_blocked(self.id, None, false);
-        crate::stats::BLOCKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

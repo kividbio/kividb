@@ -1,3 +1,5 @@
+pub use crate::list_values::ListValues;
+use crate::member_set::Member;
 pub use crate::shared_bytes::SharedBytes;
 use crate::vector::DistanceMetric;
 use ahash::AHashMap;
@@ -5,7 +7,9 @@ use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::collections::btree_map;
 use std::fmt;
+use std::ops::RangeBounds;
 use std::sync::Arc;
 
 pub type Cmd<'a> = Vec<&'a [u8]>;
@@ -231,8 +235,8 @@ pub type ZMember = Arc<[u8]>;
 /// update both atomically (they live inside a single RwLock, so this is safe).
 #[derive(Clone)]
 pub struct SortedSetInner {
-    pub members: AHashMap<ZMember, f64>,
-    pub by_score: BTreeMap<(OrderedFloat<f64>, ZMember), ()>,
+    members: AHashMap<ZMember, f64>,
+    by_score: BTreeMap<(OrderedFloat<f64>, ZMember), ()>,
 }
 
 impl SortedSetInner {
@@ -279,6 +283,128 @@ impl SortedSetInner {
         }
     }
 
+    /// Removes and returns the member with the lowest score.
+    pub fn pop_min(&mut self) -> Option<(ZMember, f64)> {
+        let ((score, member), _) = self.by_score.pop_first()?;
+        self.members.remove(member.as_ref());
+        Some((member, score.0))
+    }
+
+    /// Removes and returns the member with the highest score.
+    pub fn pop_max(&mut self) -> Option<(ZMember, f64)> {
+        let ((score, member), _) = self.by_score.pop_last()?;
+        self.members.remove(member.as_ref());
+        Some((member, score.0))
+    }
+
+    pub fn score(&self, member: &[u8]) -> Option<f64> {
+        self.members.get(member).copied()
+    }
+
+    /// The member's 0-based rank by ascending score, and its score.
+    pub fn rank(&self, member: &[u8]) -> Option<(usize, f64)> {
+        let (stored, &score) = self.members.get_key_value(member)?;
+        let rank = self
+            .by_score
+            .range(..(OrderedFloat(score), Arc::clone(stored)))
+            .count();
+        Some((rank, score))
+    }
+
+    /// Members and scores, ordered by score, then by member.
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (Member<'_>, f64)> {
+        self.by_score
+            .keys()
+            .map(|(score, member)| (Member::Shared(member), score.0))
+    }
+
+    /// Like `iter`, limited to ranks `start` to `stop`, inclusive.
+    pub fn range_by_rank(
+        &self,
+        start: usize,
+        stop: usize,
+    ) -> impl DoubleEndedIterator<Item = (Member<'_>, f64)> {
+        let len = self.by_score.len();
+        let end = stop.saturating_add(1).min(len);
+        RankRange {
+            keys: self.by_score.keys(),
+            skip_front: start,
+            skip_back: len - end,
+            left: end.saturating_sub(start),
+        }
+    }
+
+    /// Members and scores in no particular order.
+    pub fn iter_unordered(&self) -> impl Iterator<Item = (Member<'_>, f64)> {
+        self.members
+            .iter()
+            .map(|(member, &score)| (Member::Shared(member), score))
+    }
+
+    /// A page of a scan from `cursor`: see `helpers::scan_page`.
+    pub fn scan_page(
+        &self,
+        cursor: u64,
+        count: usize,
+        pages: usize,
+    ) -> (impl ExactSizeIterator<Item = (Member<'_>, f64)>, u64) {
+        use crate::commands::helpers::{prefetched, scan_page, scan_position};
+        let (page, next_cursor) = scan_page(
+            prefetched(self.members.iter(), |(member, _)| member.as_ptr())
+                .map(|(member, &score)| (scan_position(member), (member, score))),
+            cursor,
+            count,
+            self.members.len(),
+            pages,
+        );
+        let page = page
+            .into_iter()
+            .map(|(member, score)| (Member::Shared(member), score));
+        (page, next_cursor)
+    }
+
+    /// Like `iter`, limited to the given range of (score, member) keys.
+    pub fn range_by_score<R>(&self, range: R) -> impl DoubleEndedIterator<Item = (Member<'_>, f64)>
+    where
+        R: RangeBounds<(OrderedFloat<f64>, ZMember)>,
+    {
+        self.by_score
+            .range(range)
+            .map(|((score, member), _)| (Member::Shared(member), score.0))
+    }
+
+    /// Members at positions of `iter_unordered`, in the order given; may repeat.
+    pub fn members_at(&self, picks: &[usize]) -> Vec<(Member<'_>, f64)> {
+        let mut slots: Vec<usize> = (0..picks.len()).collect();
+        slots.sort_unstable_by_key(|&slot| picks[slot]);
+        let mut out: Vec<Option<(&ZMember, f64)>> = vec![None; picks.len()];
+        // One walk, up to the highest position picked.
+        let mut walk = self.members.iter();
+        let mut at: Option<usize> = None;
+        let mut last: Option<(&ZMember, f64)> = None;
+        for slot in slots {
+            let want = picks[slot];
+            if at != Some(want) {
+                let skip = match at {
+                    Some(at) => want - at - 1,
+                    None => want,
+                };
+                last = walk.nth(skip).map(|(member, &score)| (member, score));
+                at = Some(want);
+            }
+            out[slot] = last;
+        }
+        out.into_iter()
+            .flatten()
+            .map(|(member, score)| (Member::Shared(member), score))
+            .collect()
+    }
+
+    /// Members the member table holds before it grows.
+    pub fn capacity(&self) -> usize {
+        self.members.capacity()
+    }
+
     pub fn len(&self) -> usize {
         self.members.len()
     }
@@ -291,6 +417,51 @@ impl SortedSetInner {
 impl Default for SortedSetInner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+struct RankRange<'a> {
+    keys: btree_map::Keys<'a, (OrderedFloat<f64>, ZMember), ()>,
+    // Members outside the range, walked past on the first step from each end.
+    skip_front: usize,
+    skip_back: usize,
+    left: usize,
+}
+
+impl<'a> Iterator for RankRange<'a> {
+    type Item = (Member<'a>, f64);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        if self.skip_front > 0 {
+            self.keys.nth(std::mem::take(&mut self.skip_front) - 1);
+        }
+        let (score, member) = self.keys.next()?;
+        Some((Member::Shared(member), score.0))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl DoubleEndedIterator for RankRange<'_> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        if self.skip_back > 0 {
+            self.keys.nth_back(std::mem::take(&mut self.skip_back) - 1);
+        }
+        let (score, member) = self.keys.next_back()?;
+        Some((Member::Shared(member), score.0))
     }
 }
 
@@ -1465,7 +1636,7 @@ impl ArrayInner {
 #[derive(Clone)]
 pub enum KiviDBValue {
     String(SharedBytes),
-    List(Arc<RwLock<VecDeque<Arc<[u8]>>>>),
+    List(Arc<RwLock<ListValues>>),
     Hash(Arc<RwLock<HashFields>>),
     Json(Arc<RwLock<serde_json::Value>>),
     Set(Arc<RwLock<crate::member_set::MemberSet>>),

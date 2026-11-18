@@ -1,6 +1,5 @@
 use crate::commands::ctx::Ctx;
 use crate::resp::write::{resp_array, resp_bulk, resp_error, resp_integer};
-use std::sync::Arc;
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     match name {
@@ -20,7 +19,9 @@ fn publish(ctx: &mut Ctx, shard: bool) -> Vec<u8> {
     }
     // Any bytes, as in Redis: it refused a name that was not UTF-8 (#161).
     let channel = ctx.cmd[1];
-    let payload: Arc<[u8]> = Arc::from(ctx.cmd[2]);
+    // Copied into the message's frame, once for each channel or pattern
+    // that has subscribers.
+    let payload = ctx.cmd[2];
     // By this connection: whether it is a client's command, one in a
     // transaction, or a script's redis.call.
     let from = Some(ctx.client_id);

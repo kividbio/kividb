@@ -964,6 +964,10 @@ const HINT_LINES: [u8; 16] = [1, 1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 48
 pub(super) const PREFETCH_LINES: usize = 8;
 
 impl Slot {
+    /// A slot that is no entry's: what an array of slots is filled with
+    /// before the places are taken. Never turned into an entry.
+    pub(super) const NONE: Slot = Slot(0);
+
     #[inline]
     fn fragment(hash: u64) -> u64 {
         // Bits hashbrown uses for neither the bucket (the low bits) nor its
@@ -1054,6 +1058,18 @@ impl Slot {
     #[inline(always)]
     pub(super) fn prefetch_header(self) {
         prefetch((self.0 & ADDRESS) as *const u8, 1);
+    }
+
+    /// Ask for the lines the entry's header and the start of its key are
+    /// in: the key starts at most 28 bytes in (a time to live and a long
+    /// key's length before it), so the line 32 bytes in is the next one
+    /// only when the key may start there. What a walk that matches keys
+    /// reads of each entry (`ShardMap::scan`).
+    #[inline(always)]
+    pub(super) fn prefetch_key(self) {
+        let at = (self.0 & ADDRESS) as *const u8;
+        prefetch(at, 1);
+        prefetch(at.wrapping_add(32), 1);
     }
 }
 

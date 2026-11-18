@@ -950,6 +950,219 @@ fn test_scan_returns_every_lasting_key_while_the_keyspace_grows_and_shrinks() {
     c.cmds(&["SELECT", "0"]);
 }
 
+/// How many shards a database of the in-process test server has: what
+/// `store::num_shards` makes of this machine's cores.
+fn test_shards() -> usize {
+    let cores = thread::available_parallelism().map_or(8, |n| n.get());
+    (cores * 8).next_power_of_two()
+}
+
+/// `MSET` of `n` keys `prefix<i>` from `start`, 500 at a time.
+fn mset_many(conn: &mut Conn, prefix: &str, start: usize, n: usize) {
+    let mut at = start;
+    while at < start + n {
+        let to = (at + 500).min(start + n);
+        mset(conn, (at..to).map(|i| format!("{prefix}{i}")));
+        at = to;
+    }
+}
+
+/// The same guarantee with the pages Argo CD asks for (`COUNT 10000`, a
+/// pattern nothing matches but the lasting keys) and smaller ones (`COUNT
+/// 1000`), while another client writes and deletes all the time, not only
+/// between calls. Each shard starts with more keys than a table grows in
+/// one step (`GROW_IN_STEPS_FROM`, 2,048) and is written to past two more
+/// growths, so the scans run while tables grow in steps, keys in two
+/// tables at once: a page visited as the walk finds it and a page gathered
+/// first (#884) must both still see every key there all along.
+#[test]
+fn test_scan_with_a_large_count_returns_every_lasting_key_under_concurrent_writes() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["SELECT", "10"]);
+    c.cmds(&["FLUSHDB"]);
+
+    const LASTING: usize = 2000;
+    let shards = test_shards();
+    mset(&mut c, (0..LASTING).map(|i| format!("lasting:{i}")));
+    mset(&mut c, (0..4000).map(|i| format!("doomed:{i}")));
+    mset_many(&mut c, "fill:", 0, shards * 2300);
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let writer = {
+        let stop = stop.clone();
+        let progress = progress.clone();
+        thread::spawn(move || {
+            let mut other = Conn::connect(port);
+            other.cmds(&["SELECT", "10"]);
+            let mut added = 0usize;
+            let mut deleted = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                mset(&mut other, (added..added + 500).map(|i| format!("new:{i}")));
+                added += 500;
+                progress.store(added, std::sync::atomic::Ordering::Relaxed);
+                if deleted < 4000 {
+                    let mut args = vec!["DEL".to_string()];
+                    args.extend((deleted..deleted + 100).map(|i| format!("doomed:{i}")));
+                    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                    other.cmds(&refs);
+                    deleted += 100;
+                }
+            }
+            added
+        })
+    };
+
+    // Scans go on until every shard has grown from about 2,300 keys past
+    // 8,000: two growths, each in steps.
+    let grown = shards * 6000;
+    let mut scans = 0;
+    while scans < 30 || progress.load(std::sync::atomic::Ordering::Relaxed) < grown {
+        assert!(scans < 100_000, "the writer made no progress");
+        scans += 1;
+        let count = if scans % 2 == 0 { "10000" } else { "1000" };
+        let mut found = std::collections::HashSet::new();
+        let mut cursor = "0".to_string();
+        let mut calls = 0;
+        loop {
+            calls += 1;
+            assert!(calls <= 100_000, "SCAN never came back to cursor 0");
+            let r = c.cmds(&["SCAN", &cursor, "MATCH", "lasting:*", "COUNT", count]);
+            let parts = r.as_array();
+            cursor = parts[0].as_str().to_string();
+            for item in parts[1].as_array() {
+                let key = item.as_str().to_string();
+                assert!(key.starts_with("lasting:"), "MATCH let {key} through");
+                found.insert(key);
+            }
+            if cursor == "0" {
+                break;
+            }
+        }
+        let missing: Vec<String> = (0..LASTING)
+            .map(|i| format!("lasting:{i}"))
+            .filter(|k| !found.contains(k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "scan {scans} missed {} keys: {:?}",
+            missing.len(),
+            &missing[..missing.len().min(10)]
+        );
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let added = writer.join().expect("the writer");
+    assert!(added >= grown, "only {added} keys added");
+
+    c.cmds(&["FLUSHDB"]);
+    c.cmds(&["SELECT", "0"]);
+}
+
+/// `SCAN cursor COUNT count`: the next cursor and the keys.
+fn scan_page(c: &mut Conn, cursor: &str, count: &str) -> (String, Vec<String>) {
+    let r = c.cmds(&["SCAN", cursor, "COUNT", count]);
+    let parts = r.as_array();
+    let keys = parts[1]
+        .as_array()
+        .iter()
+        .map(|k| k.as_str().to_string())
+        .collect();
+    (parts[0].as_str().to_string(), keys)
+}
+
+fn del_all(c: &mut Conn, keys: &[String]) {
+    if keys.is_empty() {
+        return;
+    }
+    let mut args = vec!["DEL"];
+    args.extend(keys.iter().map(String::as_str));
+    c.cmds(&args);
+}
+
+/// `redis-cli --scan | xargs redis-cli del`: each page deleted as soon as
+/// it is returned. The keys left in a shard are then all past the cursor,
+/// so a page sized from the shard's length (#884, before review) came out
+/// several times `COUNT`. A reply holds `COUNT` keys, a few more for the
+/// last position, plus at most a shard's own floor (a sixteenth of it)
+/// when it starts in a shard it does not finish; and the scan deletes
+/// every key.
+#[test]
+fn test_scan_that_deletes_each_page_keeps_pages_near_count() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["SELECT", "11"]);
+    c.cmds(&["FLUSHDB"]);
+    let per_shard = 2500;
+    let n = test_shards() * per_shard;
+    mset_many(&mut c, "gone:", 0, n);
+
+    const COUNT: usize = 1000;
+    let most = COUNT + COUNT / 4 + per_shard / 16;
+    let mut cursor = "0".to_string();
+    let mut deleted = 0;
+    let mut largest = 0;
+    loop {
+        let (next, keys) = scan_page(&mut c, &cursor, &COUNT.to_string());
+        largest = largest.max(keys.len());
+        assert!(
+            keys.len() <= most,
+            "a reply of {} keys for COUNT {COUNT}",
+            keys.len()
+        );
+        deleted += keys.len();
+        del_all(&mut c, &keys);
+        cursor = next;
+        if cursor == "0" {
+            break;
+        }
+    }
+    assert_eq!(
+        deleted, n,
+        "the scan returned every key once (largest reply {largest})"
+    );
+    assert_eq!(c.cmds(&["DBSIZE"]).as_int(), 0);
+    c.cmds(&["SELECT", "0"]);
+}
+
+/// A shard whose keys before the middle position were deleted (a cleanup
+/// by `SCAN` and `DEL` that stopped half way through it) holds fewer keys
+/// there than its length says. A scan from its start still fills its
+/// first reply, instead of answering a page with nothing in it and a
+/// cursor to go on from.
+#[test]
+fn test_scan_of_a_half_emptied_shard_fills_its_reply() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["SELECT", "12"]);
+    c.cmds(&["FLUSHDB"]);
+    mset_many(&mut c, "half:", 0, test_shards() * 2500);
+
+    // The cursor is the shard, then its 12-bit position: delete what the
+    // scan returns while it is in the first half of shard 0.
+    let mut cursor = "0".to_string();
+    loop {
+        let (next, keys) = scan_page(&mut c, &cursor, "100");
+        del_all(&mut c, &keys);
+        let at: u64 = next.parse().unwrap();
+        cursor = next;
+        if at == 0 || at >> 12 != 0 || at & 4095 >= 2048 {
+            break;
+        }
+    }
+    let (next, keys) = scan_page(&mut c, "0", "100");
+    assert!(
+        keys.len() >= 100,
+        "a reply of {} keys, cursor {next}",
+        keys.len()
+    );
+    c.cmds(&["FLUSHDB"]);
+    c.cmds(&["SELECT", "0"]);
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // SERVER COMMANDS
 // ═════════════════════════════════════════════════════════════════════════════

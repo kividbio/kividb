@@ -369,7 +369,7 @@ fn cmd_geoadd(ctx: &mut Ctx) -> Vec<u8> {
         i += 3;
 
         let score = encode_geohash(lon, lat);
-        let existing = inner.members.get(member.as_ref()).copied();
+        let existing = inner.score(member.as_ref());
 
         match existing {
             None if flag_xx => continue, // XX: only update existing
@@ -428,12 +428,12 @@ fn cmd_geodist(ctx: &mut Ctx) -> Vec<u8> {
     drop(map);
 
     let inner = zs.read();
-    let score1 = match inner.members.get(cmd[2]) {
-        Some(&s) => s,
+    let score1 = match inner.score(cmd[2]) {
+        Some(s) => s,
         None => return resp_null_bulk(),
     };
-    let score2 = match inner.members.get(cmd[3]) {
-        Some(&s) => s,
+    let score2 = match inner.score(cmd[3]) {
+        Some(s) => s,
         None => return resp_null_bulk(),
     };
     drop(inner);
@@ -490,9 +490,9 @@ fn cmd_geopos(ctx: &mut Ctx) -> Vec<u8> {
     let mut results: Vec<Vec<u8>> = Vec::with_capacity(cmd.len() - 2);
 
     for member_bytes in &cmd[2..] {
-        match inner.members.get(*member_bytes) {
+        match inner.score(member_bytes) {
             None => results.push(resp_null_for(resp)),
-            Some(&score) => {
+            Some(score) => {
                 let (lon, lat) = decode_geohash(score);
                 results.push(coord_pair(resp, lon, lat));
             }
@@ -542,9 +542,9 @@ fn cmd_geohash(ctx: &mut Ctx) -> Vec<u8> {
     let mut results: Vec<Vec<u8>> = Vec::with_capacity(cmd.len() - 2);
 
     for member_bytes in &cmd[2..] {
-        match inner.members.get(*member_bytes) {
+        match inner.score(member_bytes) {
             None => results.push(resp_null_for(resp)),
-            Some(&score) => {
+            Some(score) => {
                 let (lon, lat) = decode_geohash(score);
                 results.push(resp_bulk_str(&geohash_string(lon, lat)));
             }
@@ -773,15 +773,15 @@ fn members_in(zset: &SortedSetInner, area: &Area, limit: Option<usize>) -> Vec<F
             ((cell.bits + 1) << shift) as f64,
         );
         let first: ZMember = Arc::from(&[][..]);
-        for ((score, member), _) in zset.by_score.range((OrderedFloat(from), first)..) {
-            if score.0 >= to {
+        for (member, score) in zset.range_by_score((OrderedFloat(from), first)..) {
+            if score >= to {
                 break;
             }
-            let (lon, lat) = decode_geohash(score.0);
+            let (lon, lat) = decode_geohash(score);
             if let Some(distance_m) = area.contains(lon, lat) {
                 found.push(Found {
-                    member: member.clone(),
-                    score: score.0,
+                    member: member.to_shared(),
+                    score,
                     distance_m,
                     lon,
                     lat,
@@ -839,7 +839,7 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
     };
     let position_of = |member: &[u8]| -> Result<(f64, f64), Vec<u8>> {
         zset.as_ref()
-            .and_then(|zset| zset.read().members.get(member).copied())
+            .and_then(|zset| zset.read().score(member))
             .map(decode_geohash)
             .ok_or_else(|| resp_error("ERR could not decode requested zset member"))
     };

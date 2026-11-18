@@ -4,6 +4,7 @@ use crate::commands::blocking;
 use crate::commands::ctx::Ctx;
 use crate::commands::helpers::format_score;
 use crate::keyspace_events::{KS_SORTED_SET, notify};
+use crate::member_set::Member;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
@@ -406,17 +407,17 @@ fn zrange_pairs(inner: &SortedSetInner, p: &RangeParams) -> Vec<(Vec<u8>, f64)> 
         let Some(range) = score_range(min, max) else {
             return vec![];
         };
-        let within = inner.by_score.range(range);
+        let within = inner.range_by_score(range);
         if p.rev {
             within
                 .rev()
-                .map(|((score, member), _)| (member.as_ref().to_vec(), score.0))
+                .map(|(member, score)| (member.as_ref().to_vec(), score))
                 .skip(p.limit_offset)
                 .take(p.limit_count)
                 .collect()
         } else {
             within
-                .map(|((score, member), _)| (member.as_ref().to_vec(), score.0))
+                .map(|(member, score)| (member.as_ref().to_vec(), score))
                 .skip(p.limit_offset)
                 .take(p.limit_count)
                 .collect()
@@ -435,27 +436,25 @@ fn zrange_pairs(inner: &SortedSetInner, p: &RangeParams) -> Vec<(Vec<u8>, f64)> 
 
         if p.rev {
             inner
-                .by_score
                 .iter()
                 .rev()
-                .filter(|((_, member), _)| lex_in_range(member.as_ref()))
-                .map(|((score, member), _)| (member.as_ref().to_vec(), score.0))
+                .filter(|(member, _)| lex_in_range(member.as_ref()))
+                .map(|(member, score)| (member.as_ref().to_vec(), score))
                 .skip(p.limit_offset)
                 .take(p.limit_count)
                 .collect()
         } else {
             inner
-                .by_score
                 .iter()
-                .filter(|((_, member), _)| lex_in_range(member.as_ref()))
-                .map(|((score, member), _)| (member.as_ref().to_vec(), score.0))
+                .filter(|(member, _)| lex_in_range(member.as_ref()))
+                .map(|(member, score)| (member.as_ref().to_vec(), score))
                 .skip(p.limit_offset)
                 .take(p.limit_count)
                 .collect()
         }
     } else {
         // Index-based — unchanged, already correct
-        let len = inner.by_score.len() as i64;
+        let len = inner.len() as i64;
         if len == 0 {
             return vec![];
         }
@@ -484,57 +483,31 @@ fn zrange_pairs(inner: &SortedSetInner, p: &RangeParams) -> Vec<(Vec<u8>, f64)> 
 
         // Only the members asked for are copied. Every member of the set
         // used to be, for each call, and all but these thrown away.
-        let wanted = (stop - start + 1) as usize;
-        let copy = |((score, member), _): (&(OrderedFloat<f64>, ZMember), &())| {
-            (member.as_ref().to_vec(), score.0)
-        };
+        let copy = |(member, score): (Member<'_>, f64)| (member.to_vec(), score);
         // The tree has no way straight to the hundredth member: it is
         // walked to it, from whichever end is nearer. `start` counts from
         // the end the answer begins at (the top, for REV); past half way,
         // the walk comes from the other end and the answer is turned round.
-        let from_far_end = (start as usize) > inner.by_score.len() / 2;
+        let from_far_end = (start as usize) > inner.len() / 2;
+        let (start, stop) = (start as usize, stop as usize);
+        // The same members as ranks from the bottom, for REV.
+        let (first, last) = (len as usize - 1 - stop, len as usize - 1 - start);
         if p.rev == from_far_end {
             if p.rev {
                 // Counted from the top and far from it: near the bottom.
-                let first = len as usize - 1 - stop as usize;
-                let mut found: Vec<(Vec<u8>, f64)> = inner
-                    .by_score
-                    .iter()
-                    .skip(first)
-                    .take(wanted)
-                    .map(copy)
-                    .collect();
+                let mut found: Vec<(Vec<u8>, f64)> =
+                    inner.range_by_rank(first, last).map(copy).collect();
                 found.reverse();
                 found
             } else {
-                inner
-                    .by_score
-                    .iter()
-                    .skip(start as usize)
-                    .take(wanted)
-                    .map(copy)
-                    .collect()
+                inner.range_by_rank(start, stop).map(copy).collect()
             }
         } else if p.rev {
-            inner
-                .by_score
-                .iter()
-                .rev()
-                .skip(start as usize)
-                .take(wanted)
-                .map(copy)
-                .collect()
+            inner.range_by_rank(first, last).rev().map(copy).collect()
         } else {
             // Forward, but nearer the back: walk from the back and turn it.
-            let first = len as usize - 1 - stop as usize;
-            let mut found: Vec<(Vec<u8>, f64)> = inner
-                .by_score
-                .iter()
-                .rev()
-                .skip(first)
-                .take(wanted)
-                .map(copy)
-                .collect();
+            let mut found: Vec<(Vec<u8>, f64)> =
+                inner.range_by_rank(start, stop).rev().map(copy).collect();
             found.reverse();
             found
         }
@@ -631,7 +604,7 @@ fn zadd(ctx: &mut Ctx) -> Vec<u8> {
     let written = write_zset(ctx, &key, |inner| {
         if flag_incr
             && let Some((incr, member)) = pairs.first()
-            && (inner.members.get(member.as_ref()).copied().unwrap_or(0.0) + incr).is_nan()
+            && (inner.score(member.as_ref()).unwrap_or(0.0) + incr).is_nan()
         {
             return Err(resp_error("ERR resulting score is not a number (NaN)"));
         }
@@ -639,7 +612,7 @@ fn zadd(ctx: &mut Ctx) -> Vec<u8> {
         let mut changed = 0i64;
         let mut last_score: Option<f64> = None; // used for INCR mode
         for (score, member) in pairs.drain(..) {
-            let existing = inner.members.get(member.as_ref()).copied();
+            let existing = inner.score(member.as_ref());
 
             let final_score = if flag_incr {
                 // INCR: add to the existing score; a new member's is the
@@ -753,8 +726,8 @@ fn zscore(ctx: &mut Ctx) -> Vec<u8> {
             crate::stats::record_miss();
             resp_null_bulk()
         }
-        Some(ValueRef::SortedSet(zs)) => match zs.read().members.get(cmd[2]) {
-            Some(&score) => {
+        Some(ValueRef::SortedSet(zs)) => match zs.read().score(cmd[2]) {
+            Some(score) => {
                 crate::stats::record_hit();
                 score_reply(resp, score)
             }
@@ -795,8 +768,8 @@ fn zmscore(ctx: &mut Ctx) -> Vec<u8> {
             let inner = zs.read();
             let results = cmd[2..]
                 .iter()
-                .map(|m| match inner.members.get(*m) {
-                    Some(&score) => score_reply(resp, score),
+                .map(|m| match inner.score(m) {
+                    Some(score) => score_reply(resp, score),
                     None => resp_null_for(resp),
                 })
                 .collect();
@@ -841,21 +814,14 @@ fn zrank(ctx: &mut Ctx) -> Vec<u8> {
             let inner = zs.read();
             let member = cmd[2];
 
-            // Single lookup — get both the Arc key and the score at once
-            match inner.members.get_key_value(member) {
+            match inner.rank(member) {
                 None => {
                     crate::stats::record_miss();
                     none()
                 }
-                Some((stored_arc, &score)) => {
+                Some((rank, score)) => {
                     crate::stats::record_hit();
-                    // Count all entries that sort strictly before this one.
-                    // The BTreeSet orders by (score, member) so we range
-                    // up to (exclusive) the exact key of this member.
-                    let rank = inner
-                        .by_score
-                        .range(..(OrderedFloat(score), stored_arc.clone()))
-                        .count() as i64;
+                    let rank = rank as i64;
 
                     if with_score {
                         resp_array(vec![
@@ -906,14 +872,10 @@ fn zrevrank(ctx: &mut Ctx) -> Vec<u8> {
             let inner = zs.read();
             let member = cmd[2];
 
-            match inner.members.get_key_value(member) {
+            match inner.rank(member) {
                 None => none(),
-                Some((stored_arc, &score)) => {
-                    let asc_rank = inner
-                        .by_score
-                        .range(..(OrderedFloat(score), stored_arc.clone()))
-                        .count() as i64;
-                    let revrank = inner.members.len() as i64 - 1 - asc_rank;
+                Some((asc_rank, score)) => {
+                    let revrank = inner.len() as i64 - 1 - asc_rank as i64;
 
                     if with_score {
                         resp_array(vec![
@@ -1314,7 +1276,7 @@ fn zcount(ctx: &mut Ctx) -> Vec<u8> {
             let count = match score_range(min, max) {
                 None => 0,
                 Some((Bound::Unbounded, Bound::Unbounded)) => inner.len(),
-                Some(range) => inner.by_score.range(range).count(),
+                Some(range) => inner.range_by_score(range).count(),
             };
             resp_integer(count as i64)
         }
@@ -1338,8 +1300,8 @@ fn zincrby(ctx: &mut Ctx) -> Vec<u8> {
     let written = write_zset(ctx, &key, |inner| {
         // A new member's score is the increment itself: `-0` too, as Redis
         // replies (#422). It is stored as 0 (`SortedSetInner::insert`).
-        let new_score = match inner.members.get(member.as_ref()) {
-            Some(&old) => old + incr,
+        let new_score = match inner.score(member.as_ref()) {
+            Some(old) => old + incr,
             None => incr,
         };
         if new_score.is_nan() {
@@ -1473,22 +1435,17 @@ fn zset_pop(ctx: &mut Ctx, max: bool) -> Vec<u8> {
         None => resp_array(vec![]),
         Some(ValueRef::SortedSet(zs)) => {
             let mut inner = zs.write();
-            let mut popped: Vec<(ZMember, f64)> =
-                Vec::with_capacity(count.min(inner.by_score.len()));
+            let mut popped: Vec<(ZMember, f64)> = Vec::with_capacity(count.min(inner.len()));
 
             for _ in 0..count {
-                // BTreeMap::pop_first / pop_last are stable since Rust 1.66
                 let next = if max {
-                    inner.by_score.pop_last()
+                    inner.pop_max()
                 } else {
-                    inner.by_score.pop_first()
+                    inner.pop_min()
                 };
                 match next {
                     None => break,
-                    Some(((score, member), _)) => {
-                        inner.members.remove(member.as_ref());
-                        popped.push((member, score.0));
-                    }
+                    Some(pair) => popped.push(pair),
                 }
             }
             // Into one buffer: a vector for the member, one for the score
@@ -1544,25 +1501,14 @@ fn zscan(ctx: &mut Ctx) -> Vec<u8> {
             let inner = zs.read();
             // In the order of the members' positions: see
             // `helpers::scan_position`.
-            let (page, next_cursor) = crate::commands::helpers::scan_page(
-                inner.members.iter().map(|(member, score)| {
-                    (
-                        crate::commands::helpers::scan_position(member),
-                        (member, *score),
-                    )
-                }),
-                cursor,
-                count,
-                inner.members.len(),
-                1024,
-            );
+            let (page, next_cursor) = inner.scan_page(cursor, count, 1024);
             let mut items: Vec<Vec<u8>> = Vec::with_capacity(page.len() * 2);
             let pattern = options
                 .pattern
                 .as_deref()
                 .map(crate::commands::glob_redis::Glob::new);
             for (member, score) in page {
-                if pattern.as_ref().is_some_and(|glob| !glob.matches(member)) {
+                if pattern.as_ref().is_some_and(|glob| !glob.matches(&member)) {
                     continue;
                 }
                 // ZSCAN keeps the flat, all-bulk-string shape under RESP3
@@ -1963,15 +1909,13 @@ fn zremrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
                 return resp_integer(0);
             };
             let mut inner = zs.write();
-            // Collect the keys before modifying the index.
-            let to_remove: Vec<ScoreKey> = inner
-                .by_score
-                .range(range)
-                .map(|(key, _)| key.clone())
+            // Collect the members before removing them.
+            let to_remove: Vec<ZMember> = inner
+                .range_by_score(range)
+                .map(|(member, _)| member.to_shared())
                 .collect();
-            for key in &to_remove {
-                inner.by_score.remove(key);
-                inner.members.remove(key.1.as_ref());
+            for member in &to_remove {
+                inner.remove(member);
             }
             resp_integer(to_remove.len() as i64)
         }
@@ -1995,7 +1939,7 @@ fn zremrangebyrank(ctx: &mut Ctx) -> Vec<u8> {
         None => resp_integer(0),
         Some(ValueRef::SortedSet(zs)) => {
             let mut inner = zs.write();
-            let len = inner.by_score.len() as i64;
+            let len = inner.len() as i64;
             if len == 0 {
                 return resp_integer(0);
             }
@@ -2021,19 +1965,16 @@ fn zremrangebyrank(ctx: &mut Ctx) -> Vec<u8> {
                 return resp_integer(0);
             }
 
-            let to_remove: Vec<(OrderedFloat<f64>, ZMember)> = inner
-                .by_score
-                .keys()
-                .cloned()
+            let to_remove: Vec<ZMember> = inner
+                .iter()
                 .enumerate()
                 .filter(|(i, _)| *i as i64 >= start && *i as i64 <= stop)
-                .map(|(_, k)| k)
+                .map(|(_, (member, _))| member.to_shared())
                 .collect();
 
             let count = to_remove.len() as i64;
-            for key in to_remove {
-                inner.members.remove(key.1.as_ref());
-                inner.by_score.remove(&key);
+            for member in to_remove {
+                inner.remove(&member);
             }
             resp_integer(count)
         }
@@ -2062,16 +2003,14 @@ fn zremrangebylex(ctx: &mut Ctx) -> Vec<u8> {
         None => resp_integer(0),
         Some(ValueRef::SortedSet(zs)) => {
             let mut inner = zs.write();
-            let to_remove: Vec<(OrderedFloat<f64>, ZMember)> = inner
-                .by_score
-                .keys()
-                .filter(|(_, member)| lex_in_range(member.as_ref()))
-                .cloned()
+            let to_remove: Vec<ZMember> = inner
+                .iter()
+                .filter(|(member, _)| lex_in_range(member.as_ref()))
+                .map(|(member, _)| member.to_shared())
                 .collect();
             let count = to_remove.len() as i64;
-            for key in to_remove {
-                inner.members.remove(key.1.as_ref());
-                inner.by_score.remove(&key);
+            for member in to_remove {
+                inner.remove(&member);
             }
             resp_integer(count)
         }
@@ -2129,7 +2068,7 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
         }
         Some(ValueRef::SortedSet(zs)) => {
             let inner = zs.read();
-            let len = inner.members.len();
+            let len = inner.len();
 
             if len == 0 {
                 return if cmd.len() > 2 {
@@ -2142,8 +2081,8 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
             // No count argument → return single random member as bulk string
             if cmd.len() == 2 {
                 let at = pseudo_rand(len);
-                return match inner.members.keys().nth(at) {
-                    Some(member) => resp_bulk(member.as_ref()),
+                return match inner.iter_unordered().nth(at) {
+                    Some((member, _)) => resp_bulk(member.as_ref()),
                     None => resp_null_bulk(),
                 };
             }
@@ -2154,12 +2093,12 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
             if count_arg >= 0 && (count_arg as u64) >= len as u64 {
                 // As many as there are, or more: all of them, as Redis
                 // answers, from the highest score down.
-                for ((OrderedFloat(score), member), ()) in inner.by_score.iter().rev() {
+                for (member, score) in inner.iter().rev() {
                     push_member_score(
                         &mut result,
                         resp,
                         member.as_ref(),
-                        with_scores.then_some(*score),
+                        with_scores.then_some(score),
                     );
                 }
             } else {
@@ -2177,7 +2116,7 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
                         .map(|_| pseudo_rand(len))
                         .collect()
                 };
-                for (member, score) in members_at(&inner, &picks) {
+                for (member, score) in inner.members_at(&picks) {
                     push_member_score(
                         &mut result,
                         resp,
@@ -2191,32 +2130,6 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
         }
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
     }
-}
-
-/// The members at the given positions of the member table (any order, a
-/// position may repeat), with their scores, in the order the positions are
-/// given in. The table is walked once, to the highest position.
-fn members_at<'a>(inner: &'a SortedSetInner, picks: &[usize]) -> Vec<(&'a ZMember, f64)> {
-    let mut slots: Vec<usize> = (0..picks.len()).collect();
-    slots.sort_unstable_by_key(|&slot| picks[slot]);
-    let mut out: Vec<Option<(&ZMember, f64)>> = vec![None; picks.len()];
-    let mut walk = inner.members.iter();
-    // The table position of the last member read, and that member.
-    let mut at: Option<usize> = None;
-    let mut last: Option<(&ZMember, f64)> = None;
-    for slot in slots {
-        let want = picks[slot];
-        if at != Some(want) {
-            let skip = match at {
-                Some(at) => want - at - 1,
-                None => want,
-            };
-            last = walk.nth(skip).map(|(member, &score)| (member, score));
-            at = Some(want);
-        }
-        out[slot] = last;
-    }
-    out.into_iter().flatten().collect()
 }
 
 /// A random index below `n`, for ZRANDMEMBER. It used to be derived from
@@ -2247,9 +2160,8 @@ fn zlexcount(ctx: &mut Ctx) -> Vec<u8> {
         Some(ValueRef::SortedSet(zs)) => {
             let inner = zs.read();
             let count = inner
-                .by_score
-                .keys()
-                .filter(|(_, member)| lex_in_range(member.as_ref(), &min, &max))
+                .iter()
+                .filter(|(member, _)| lex_in_range(member.as_ref(), &min, &max))
                 .count() as i64;
             resp_integer(count)
         }
@@ -2334,9 +2246,8 @@ fn read_zset_snapshot(
             // data outside the lock — the lock is dropped after this block.
             let inner = zs.read();
             let snapshot: std::collections::BTreeMap<Vec<u8>, f64> = inner
-                .members
-                .iter()
-                .map(|(k, &v)| (k.as_ref().to_vec(), v))
+                .iter_unordered()
+                .map(|(k, v)| (k.as_ref().to_vec(), v))
                 .collect();
             Ok(Some(snapshot))
         }
@@ -2773,15 +2684,14 @@ fn pop_members(
             let mut popped = Vec::new();
             while popped.len() < count {
                 let entry = if want_max {
-                    inner.by_score.pop_last()
+                    inner.pop_max()
                 } else {
-                    inner.by_score.pop_first()
+                    inner.pop_min()
                 };
-                let Some(((score, member), _)) = entry else {
+                let Some((member, score)) = entry else {
                     break;
                 };
-                inner.members.remove(member.as_ref());
-                popped.push((resp_bulk(member.as_ref()), score_reply(resp, score.0)));
+                popped.push((resp_bulk(member.as_ref()), score_reply(resp, score)));
             }
             Ok(popped)
         }
@@ -2863,18 +2773,17 @@ fn zmpop(ctx: &mut Ctx) -> Vec<u8> {
                 let mut popped_pairs: Vec<Vec<u8>> = Vec::new();
                 for _ in 0..count {
                     let entry = if want_max {
-                        inner.by_score.pop_last()
+                        inner.pop_max()
                     } else {
-                        inner.by_score.pop_first()
+                        inner.pop_min()
                     };
                     match entry {
                         None => break,
-                        Some(((score, member), _)) => {
-                            inner.members.remove(member.as_ref());
+                        Some((member, score)) => {
                             // Each pair is its own nested array: [member, score]
                             popped_pairs.push(resp_array(vec![
                                 resp_bulk(member.as_ref()),
-                                score_reply(resp, score.0),
+                                score_reply(resp, score),
                             ]));
                         }
                     }
@@ -3008,18 +2917,16 @@ mod score_range_tests {
     }
 
     fn by_scan(zs: &SortedSetInner, min: (f64, bool), max: (f64, bool)) -> Vec<ScoreKey> {
-        zs.by_score
-            .keys()
-            .filter(|(score, _)| in_bounds(score.0, min, max))
-            .cloned()
+        zs.iter()
+            .filter(|(_, score)| in_bounds(*score, min, max))
+            .map(|(member, score)| (OrderedFloat(score), member.to_shared()))
             .collect()
     }
 
     fn by_range(zs: &SortedSetInner, min: (f64, bool), max: (f64, bool)) -> Vec<ScoreKey> {
         score_range(min, max).map_or_else(Vec::new, |range| {
-            zs.by_score
-                .range(range)
-                .map(|(key, _)| key.clone())
+            zs.range_by_score(range)
+                .map(|(member, score)| (OrderedFloat(score), member.to_shared()))
                 .collect()
         })
     }

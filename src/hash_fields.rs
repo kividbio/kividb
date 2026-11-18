@@ -21,7 +21,6 @@
 //! the hash keeps them as. Snapshots, the AOF, replication and `DUMP` see
 //! nothing else, so none of them depends on the form.
 
-use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -106,56 +105,8 @@ pub fn set_packed_value(limit: usize) -> usize {
 }
 
 /// A value, as a hash hands it out: the table's shared bytes, or a block's
-/// bytes. Either is its bytes (`Deref`).
-#[derive(Clone, Copy)]
-pub enum Value<'a> {
-    Shared(&'a Arc<[u8]>),
-    Bytes(&'a [u8]),
-}
-
-impl<'a> Value<'a> {
-    /// The value as shared bytes: the table's own, or a new copy.
-    #[inline]
-    pub fn to_shared(self) -> Arc<[u8]> {
-        match self {
-            Value::Shared(bytes) => Arc::clone(bytes),
-            Value::Bytes(bytes) => Arc::from(bytes),
-        }
-    }
-
-    /// The bytes, for as long as the hash is borrowed.
-    #[inline]
-    pub fn bytes(self) -> &'a [u8] {
-        match self {
-            Value::Shared(bytes) => bytes,
-            Value::Bytes(bytes) => bytes,
-        }
-    }
-}
-
-impl Deref for Value<'_> {
-    type Target = [u8];
-    #[inline]
-    fn deref(&self) -> &[u8] {
-        match self {
-            Value::Shared(bytes) => bytes,
-            Value::Bytes(bytes) => bytes,
-        }
-    }
-}
-
-impl AsRef<[u8]> for Value<'_> {
-    #[inline]
-    fn as_ref(&self) -> &[u8] {
-        self
-    }
-}
-
-impl std::fmt::Debug for Value<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", String::from_utf8_lossy(self))
-    }
-}
+/// bytes. Either is its bytes (`Deref`). The same as a list's elements.
+pub use crate::element::Value;
 
 /// What a hash is kept as, by Redis's names for its encodings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

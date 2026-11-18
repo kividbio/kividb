@@ -53,16 +53,18 @@ you already use carry over, under the same names.
 directive KiviDB doesn't know stops the server, with an error naming it.
 Start from KiviDB's own file and carry over the settings you changed.
 Directives for machinery KiviDB doesn't have (`io-threads`, `hz`,
-`tcp-keepalive`, `lazyfree-lazy-eviction`, `rdbcompression` and similar)
+`tcp-keepalive`, `lazyfree-lazy-eviction` and similar)
 are accepted with a warning and do nothing. `lazyfree-lazy-expire` and
 `lazyfree-lazy-user-del` are in effect: `lazyfree-lazy-user-del yes` makes
 `DEL` free a large value in the background, as `UNLINK` does.
+`rdbcompression` is in effect too: `yes` writes `dump.kdb` compressed
+(the default is `no`, which 1.2 reads) (see [PERSISTENCE.md](PERSISTENCE.md#compressed-snapshots)).
 
 The ones that behave differently:
 
 | Directive | In KiviDB |
 |---|---|
-| `io-threads` | Accepted, no effect: commands run on every core. `--threads` sets the worker count (default: cores − 2). |
+| `io-threads` | Accepted, no effect: commands run on every core. `--threads` sets the worker count (default: one per CPU available to the process). |
 | `save <points>` | Accepted with a warning, no effect. KiviDB doesn't snapshot on a schedule. Use `appendonly yes`, or `BGSAVE`. |
 | `appendfsync` | `always` and `everysec` as in Redis. `no` is taken as `everysec`, with a warning. |
 | `dbfilename`, `appendfilename` | Fixed: `dump.kdb` and `appendonly.aof`. KiviDB reads a Redis `dump.rdb` if there is no `dump.kdb`. `CONFIG GET dbfilename` answers `dump.kdb`, with `CONFIG GET dir` the place to find it after a `SAVE`. |

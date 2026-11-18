@@ -22,6 +22,8 @@ pub mod command_gate;
 mod commands;
 mod compaction;
 mod config;
+mod cpus;
+mod element;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
@@ -33,6 +35,7 @@ pub mod keyspace_events;
 pub mod keyspec;
 pub mod latency;
 pub mod lazyfree;
+mod list_values;
 pub mod listen;
 #[cfg(feature = "lua")]
 mod lua_vm_blocking;
@@ -42,6 +45,7 @@ pub mod monitor;
 pub mod node_tls;
 pub mod output_limits;
 mod packed_hash;
+mod packed_list;
 mod packed_set;
 pub mod pause;
 mod ping;
@@ -98,9 +102,8 @@ fn print_banner(threads: usize, config: &Arc<Config>) {
     let version = env!("CARGO_PKG_VERSION");
 
     // get system info
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(0);
+    let cpus = cpus::detect();
+    let available = cpus::available(&cpus);
 
     let mem_gb = {
         // read from /proc/meminfo on linux, fallback on mac
@@ -179,7 +182,14 @@ fn print_banner(threads: usize, config: &Arc<Config>) {
     if mem_gb > 0 {
         println!("  * Memory         : {mem_gb}GiB available");
     }
-    println!("  * CPUs           : {cores} cores detected");
+    if available.threads == cpus.online {
+        println!("  * CPUs           : {} online", cpus.online);
+    } else {
+        println!(
+            "  * CPUs           : {} online, {} available ({})",
+            cpus.online, available.threads, available.reason
+        );
+    }
     if port == 0 {
         println!("  * Listening on   : no plaintext port (port 0): TLS only");
     } else {
@@ -205,7 +215,10 @@ fn print_banner(threads: usize, config: &Arc<Config>) {
         println!("  * Node ID        : (printed after cluster init)");
     }
 
-    println!("  * Worker threads : {threads}");
+    println!(
+        "  * Worker threads : {threads} ({})",
+        config.threads_reason()
+    );
     println!("  * AOF            : {aof_status}");
     // Name the source recovery will actually use. This line used to read
     // "KDB snapshot (SAVE / BGSAVE)" unconditionally, which was true even with
@@ -281,6 +294,12 @@ fn is_uring_available() -> bool {
 
 // Entry point
 fn main() {
+    // `kividb kdb-decompress <in> <out>` and `kividb kdb-compress <in> <out>`
+    // (#879): tools, not a server. For images with no shell, as `--ping` is.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(code) = snapshot::blocks::subcommand(&args) {
+        std::process::exit(code);
+    }
     // An error that ends the server is logged like any other line, rather
     // than printed as a Rust `Debug` dump.
     if let Err(e) = run() {

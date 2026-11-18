@@ -8,6 +8,20 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// [`Ctx::resp`]'s top bit: the connection is `CLIENT NO-TOUCH`, so its
+/// reads record no use of the keys they find (#566). The connection's loop
+/// keeps it in its own protocol byte and reads it back from
+/// `client_registry` (`T` in `CLIENT LIST`) after a `CLIENT` command.
+pub const RESP_NO_TOUCH: u8 = 0x80;
+/// [`Ctx::resp`] without [`RESP_NO_TOUCH`]: the protocol, 2 or 3.
+pub const RESP_VERSION: u8 = 0x7f;
+
+/// `resp` with its [`RESP_NO_TOUCH`] bit set to `on`.
+#[inline]
+pub fn with_no_touch(resp: u8, on: bool) -> u8 {
+    (resp & RESP_VERSION) | if on { RESP_NO_TOUCH } else { 0 }
+}
+
 /// Minimal trait so both the tokio and std AOF queues can be stored in Ctx
 /// without making Ctx generic (which would infect every call site).
 ///
@@ -112,6 +126,11 @@ pub struct Ctx<'a> {
     /// lookup there is cheap in isolation but adds real cross-core cache-line
     /// traffic at full core count. `client_registry` still holds the value too
     /// (kept in sync by the caller) for introspection commands like CLIENT INFO.
+    ///
+    /// Its top bit, [`RESP_NO_TOUCH`], is the connection's `CLIENT NO-TOUCH`
+    /// flag, carried here so that no command pays for a field of its own;
+    /// the protocol is `resp & RESP_VERSION`, and, being 2 or 3, bit 0 alone
+    /// says RESP3 (#566).
     pub resp: u8,
     pub acl_store: &'a crate::acl::AclStore,
     pub acl_log: &'a crate::acl::SharedAclLog,
