@@ -645,6 +645,59 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     counts the chunks as allocated; eviction's estimate of what freeing a
     list gives back is their bytes, and lazy freeing's effort their number.
 
+- **Small sorted sets take a quarter to a sixth of the memory (#297, part
+  of #825).** A sorted set of up to 128 members of up to 64 bytes is kept in
+  one block, its entries in order by score and then by member, where it
+  was a hash table and a tree that each held the member: 14-byte members
+  with whole-number scores take 29.6 bytes a member at 10 members (118.8
+  before; Redis 8.10.2 24.8) and 19.3 at 100 (116.4; Redis 21.0); with
+  fractional scores 37.6 and 27.3 (Redis 28.0 and 26.2). Ten 8-byte
+  members a key, as #297 measured it, take 274 bytes of RSS a key (1,249
+  before; Redis 186). Sorted sets of more than 128 members (or with a
+  member longer than 64 bytes) are unchanged: still a table and a tree,
+  at the same size as before; #825's 800-member feeds among them.
+  - A score that is an integer of up to 56 bits is kept in one to eight
+    bytes (one up to 247), any other as the eight bytes of the float: read
+    back, every score is the same float, bit for bit. A member is found by
+    scanning one byte a member (a fingerprint), as in small sets and
+    hashes; a rank is a position, and a range of scores a binary search.
+  - A sorted set moves to the table and the tree when a write adds a member
+    past 128 or one longer than 64 bytes, or when one `ZADD` (or `GEOADD`)
+    gives more than 128 pairs, as Redis moves a listpack to a skiplist;
+    never back. A set built whole (a snapshot or AOF load, `RESTORE`,
+    `MIGRATE`, `ZRANGESTORE`, `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE`,
+    `GEOSEARCHSTORE`) is one block if it fits, laid down once.
+  - `OBJECT ENCODING` reports the form a sorted set is kept in, `listpack`
+    or `skiplist`, and `ZSCAN` returns a block whole, in order, with cursor
+    0, as Redis returns a listpack. A set that became large and was taken
+    back under the limit used to be reported as `listpack`; it is a
+    `skiplist`, as in Redis.
+  - `zset-max-listpack-entries` (default 128) and `zset-max-listpack-value`
+    (64), and their `zset-max-ziplist-*` names, now take effect, from the
+    configuration file or `CONFIG SET`; `0` entries turns blocks off. They
+    go no higher than 128 and 64, and `CONFIG GET` reports the value kept;
+    a larger value logs a warning naming the maximum (also for the set and
+    hash limits, which are clamped the same way). A lowered limit applies
+    to a set at its next new member. A set's buffer gives its room back as
+    members go (once more than half of it is spare), so one popped down
+    from 128 long members does not keep their bytes.
+  - Commands cost fewer instructions on a block than on the table and tree
+    for most of what a small sorted set is used for (8 and 100 members,
+    pipelined, io_uring): `ZRANGE 0 9` 16-17 % fewer, `ZRANGE 0 -1` of 100
+    members 52 %, `ZRANK` 7-17 %, a changed score by `ZADD` or `ZINCRBY`
+    7-12 %, `ZRANDMEMBER` of 100 members 11 %; `ZSCORE` the same. Adding a
+    new member to a set of exactly 8 costs 5 % more (the block grows by
+    one allocation), and at 100 members a `ZSCORE` miss 2 %, a new member
+    2 %, `ZREM` then `ZADD` 2 % and `ZPOPMIN` 2.5 % more (the entries after
+    it move). Large sets are within 1 % of before, and `GET`/`SET` unchanged.
+  - Snapshots, the AOF, replication, `DUMP`/`RESTORE` and `MIGRATE` still
+    write members and scores, so their formats do not change: 1.2.2 reads
+    what this release writes and the other way round, and `DEBUG DIGEST-VALUE`
+    does not depend on the form. `MEMORY USAGE`, eviction and lazy freeing
+    count a block as the one allocation it is. A large sorted set keeps its
+    table and tree behind one more pointer, so its handle in every key is
+    the size of a block's.
+
 - **Active defrag's pass ends about twice as fast, at the same CPU cap
   (#240, #291).** It slept after every batch of 128 buckets, and each sleep
   overshot; it now sleeps once a millisecond of work is owed its rest, at
@@ -774,8 +827,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   restart of every node, a busy disk making the save slow) could come back
   with no node that had it, and since a node that is not a member cannot
   join by sending heartbeats, the cluster never learnt it again: it stayed
-  out of `CLUSTER NODES` and `SHARDS` until it was met again. Now both ends of a `CLUSTER MEET` save the other, synced, before
-  showing it as a member (the receiving end before it answers): once the
+  out of `CLUSTER NODES` and `SHARDS` until it was met again. Now both
+  ends of a `CLUSTER MEET` save the other, synced, before showing it as a
+  member (the receiving end before it answers): once the
   node that ran `CLUSTER MEET` lists the new node without `handshake`, a
   cluster stopped whole, even killed, keeps it, and the nodes that had not
   heard of it yet learn it again by gossip. A node also saves its
@@ -808,6 +862,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   after. Nodes met at the same time (`redis-cli --cluster create` has every
   node meet the first) are saved together, in one write. The vote's save
   no longer holds up the cluster bus.
+
+- **Sorted-set commands read integers as Redis does.** `ZREMRANGEBYRANK
+  key x 5` took `x` as 0 and removed members; it now answers `ERR value is
+  not an integer or out of range`, before it looks at the key, as Redis
+  does. And `+1`, `01` and `-0`, which Redis refuses, were taken as numbers
+  by the indexes of `ZRANGE`/`ZREVRANGE`/`ZRANGESTORE`, the counts of
+  `ZPOPMIN`/`ZPOPMAX`/`ZRANDMEMBER`/`ZMPOP` (and `LMPOP`), `LIMIT` offsets
+  and counts, `ZINTERCARD`'s `LIMIT` and `numkeys`: each now gets Redis's
+  error.
 
 - **Scripts have the Lua 5.1 library functions Redis keeps (#898).**
   `table.getn`, `table.setn`, `table.maxn`, `table.foreach`, `table.foreachi`,
