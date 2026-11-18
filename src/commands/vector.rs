@@ -1599,29 +1599,114 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
 // ── Helpers for filtered search ──────────────────────────────────────────────
 
+/// [`nearest_shown`] asks the index search for at most one vector in this
+/// many; past that it measures every vector instead. An HNSW search for that
+/// many costs about what measuring every vector does.
+pub(crate) const SEARCH_SHARE: usize = 16;
+
 /// The nearest `k` an index search finds, less the documents whose `field`
-/// a query is not to see ([`crate::commands::search::field_hidden`]).
-/// `search(n)` is the nearest `n`; while hits were left out and the search
-/// found all it was asked for, it is asked for more.
+/// a query is not to see ([`crate::commands::search::field_hidden`]),
+/// nearest first, and whether `deadline` passed first.
+///
+/// `search(n)` is the nearest `n`. While hits were left out and the search
+/// found all it was asked for, it is asked for more, at least twice as many
+/// each round, up to one [`SEARCH_SHARE`]th of the index. Then every vector
+/// of `live` is measured, exactly, keeping the nearest twice as many as the
+/// search would have been asked for next, and four times as many again each
+/// pass, until `k` of them are shown. The search used to be asked for more
+/// until it was asked for the whole index (an HNSW search with as many
+/// candidates), past the query's `TIMEOUT`.
+///
+/// Cut short by the deadline, it is the shown ones found so far, nearest
+/// first.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn nearest_shown(
     db: &crate::store::Db,
     field: &str,
     k: usize,
     now: &crate::types::QueryClock,
+    deadline: Option<std::time::Instant>,
+    live: &LiveIndex,
+    query: &[f32],
+    metric: &crate::vector::DistanceMetric,
+    search: impl FnMut(usize) -> Vec<crate::vector::KnnResult>,
+) -> (Vec<crate::vector::KnnResult>, bool) {
+    // Read only once a search has left hits out.
+    let size = || match live {
+        LiveIndex::Flat(idx) => idx.vectors.read().len(),
+        LiveIndex::Hnsw(idx) => idx.live_count.load(std::sync::atomic::Ordering::Relaxed),
+    };
+    let measure = |n: usize| {
+        let mut scorer = FilteredKnn::new(live, query, n, metric);
+        let cut = scorer.offer_every(deadline);
+        (scorer.nearest(), cut)
+    };
+    shown_of(k, size, deadline, search, measure, |key| {
+        crate::commands::search::field_hidden(db, key, field, now)
+    })
+}
+
+/// [`nearest_shown`] over an index of `size()` vectors, with the exact nearest
+/// `n` of every vector, nearest first, as `measure(n)`, and what is hidden
+/// as `hidden`. The clock is read before a round or pass only once it asks
+/// for [`DEADLINE_EVERY`] or more, as
+/// [`crate::commands::search::no_time_for`] does elsewhere, and every
+/// [`DEADLINE_EVERY`] documents looked at.
+///
+/// [`DEADLINE_EVERY`]: crate::commands::search::DEADLINE_EVERY
+fn shown_of(
+    k: usize,
+    size: impl Fn() -> usize,
+    deadline: Option<std::time::Instant>,
     mut search: impl FnMut(usize) -> Vec<crate::vector::KnnResult>,
-) -> Vec<crate::vector::KnnResult> {
+    mut measure: impl FnMut(usize) -> (Vec<crate::vector::KnnResult>, bool),
+    hidden: impl Fn(&str) -> bool,
+) -> (Vec<crate::vector::KnnResult>, bool) {
+    use crate::commands::search::{deadline_due, no_time_for};
     let mut want = k;
     loop {
         let mut found = search(want);
         let all = found.len() >= want;
         let before = found.len();
-        found.retain(|hit| !crate::commands::search::field_hidden(db, &hit.key, field, now));
-        let hidden = before - found.len();
-        if hidden == 0 || found.len() >= k || !all {
+        found.retain(|hit| !hidden(&hit.key));
+        let left_out = before - found.len();
+        if left_out == 0 || found.len() >= k || !all {
             found.truncate(k);
-            return found;
+            return (found, false);
         }
-        want = want.saturating_add(hidden.max(want));
+        want = want.saturating_add(left_out.max(want));
+        if no_time_for(deadline, want) {
+            return (found, true);
+        }
+        if want.saturating_mul(SEARCH_SHARE) > size() {
+            break;
+        }
+    }
+    // Each pass looks at the hits past those the last one looked at.
+    let (mut shown, mut looked_at, mut seen) = (Vec::new(), 0, 0u32);
+    let mut keep = want.saturating_mul(2);
+    loop {
+        let (measured, cut) = measure(keep);
+        let had = measured.len();
+        for hit in measured.into_iter().skip(looked_at) {
+            if deadline_due(deadline, &mut seen) {
+                return (shown, true);
+            }
+            if !hidden(&hit.key) {
+                shown.push(hit);
+                if shown.len() >= k {
+                    return (shown, cut);
+                }
+            }
+        }
+        if cut || had < keep {
+            return (shown, cut);
+        }
+        looked_at = had;
+        keep = keep.saturating_mul(4);
+        if no_time_for(deadline, keep) {
+            return (shown, true);
+        }
     }
 }
 
@@ -1681,6 +1766,46 @@ impl<'a> FilteredKnn<'a> {
             }
         };
         self.best.offer(distance, key);
+    }
+
+    /// Measure every vector the index holds, until `deadline` has passed
+    /// (the clock read every [`DEADLINE_EVERY`] vectors): then true.
+    ///
+    /// The index's locks are held for the whole walk, so the caller must not
+    /// hold a shard's lock (see [`FilteredKnn`]).
+    ///
+    /// [`DEADLINE_EVERY`]: crate::commands::search::DEADLINE_EVERY
+    pub(crate) fn offer_every(&mut self, deadline: Option<std::time::Instant>) -> bool {
+        let dim = self.query.vector().len();
+        let mut seen = 0u32;
+        match self.live {
+            LiveIndex::Flat(idx) => {
+                let vectors = idx.vectors.read();
+                for (key, v) in vectors.iter() {
+                    if crate::commands::search::deadline_due(deadline, &mut seen) {
+                        return true;
+                    }
+                    if v.len() == dim {
+                        self.best.offer(self.query.to_raw(v), key);
+                    }
+                }
+            }
+            LiveIndex::Hnsw(idx) => {
+                let ids = idx.key_to_id.read();
+                let nodes = idx.nodes.read();
+                for (key, &id) in ids.iter() {
+                    if crate::commands::search::deadline_due(deadline, &mut seen) {
+                        return true;
+                    }
+                    if let Some(v) = idx.vector_of(&nodes, id, key)
+                        && v.len() == dim
+                    {
+                        self.best.offer(self.query.to_unit(v), key);
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// The nearest, nearest first.
@@ -2517,5 +2642,179 @@ mod filtered_knn_tests {
                 }
             }
         }
+    }
+
+    /// Every vector of the index measured: the exact order of them all,
+    /// from a FLAT index and an HNSW graph; past the deadline, it says so.
+    #[test]
+    fn every_vector_measured_is_the_exact_order_of_the_index() {
+        use crate::vector::{DistanceMetric, HnswIndex, VectorIndex};
+        let dim = 37;
+        let data: Vec<(String, Vec<f32>)> = (0..3000)
+            .map(|i| (format!("doc:{i}"), vector(dim, i as u64 + 1)))
+            .collect();
+        let all: Vec<&str> = data.iter().map(|(k, _)| k.as_str()).collect();
+        for metric in [DistanceMetric::Cosine, DistanceMetric::L2] {
+            let flat = Arc::new(VectorIndex::new());
+            let graph = Arc::new(HnswIndex::new(16, 64));
+            for (key, v) in &data {
+                flat.insert(key.clone(), v.clone());
+                crate::vector::hnsw_insert(&graph, key.clone(), v.clone(), &metric);
+            }
+            let q = vector(dim, 9_999);
+            let want = exact(&data, &all, &q, all.len(), &metric);
+            for live in [
+                LiveIndex::Flat(flat.clone()),
+                LiveIndex::Hnsw(graph.clone()),
+            ] {
+                let mut scorer = FilteredKnn::new(&live, &q, usize::MAX, &metric);
+                assert!(!scorer.offer_every(None));
+                let got = scorer.nearest();
+                assert_eq!(got.len(), want.len(), "{metric:?}");
+                assert!(got.windows(2).all(|w| w[0].score <= w[1].score));
+                let got_keys: Vec<&str> = got.iter().map(|r| r.key.as_str()).collect();
+                assert_eq!(
+                    got_keys[..10],
+                    want[..10].iter().map(String::as_str).collect::<Vec<_>>()[..],
+                    "{metric:?}"
+                );
+
+                let past = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+                let mut scorer = FilteredKnn::new(&live, &q, usize::MAX, &metric);
+                assert!(scorer.offer_every(past));
+                assert!(scorer.nearest().len() < all.len());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod nearest_shown_tests {
+    use super::*;
+    use crate::vector::KnnResult;
+
+    /// `n` hits `d:0` .. at distance 0, 1, ...: the nearest `want` of them.
+    fn index(n: usize) -> impl Fn(usize) -> Vec<KnnResult> {
+        move |want| {
+            (0..want.min(n))
+                .map(|i| KnnResult {
+                    key: format!("d:{i}"),
+                    score: i as f32,
+                })
+                .collect()
+        }
+    }
+
+    fn key_number(key: &str) -> usize {
+        key[2..].parse().unwrap()
+    }
+
+    fn keys(found: &[KnnResult]) -> Vec<usize> {
+        found.iter().map(|hit| key_number(&hit.key)).collect()
+    }
+
+    /// `shown_of` over `index(n)`: (what it returned, the sizes the search
+    /// was asked for, whether every vector was measured).
+    fn run(
+        n: usize,
+        k: usize,
+        deadline: Option<std::time::Instant>,
+        hidden: impl Fn(&str) -> bool,
+    ) -> ((Vec<usize>, bool), Vec<usize>, bool) {
+        let search = index(n);
+        let mut asked = Vec::new();
+        let mut measured = false;
+        let (found, cut) = shown_of(
+            k,
+            || n,
+            deadline,
+            |want| {
+                asked.push(want);
+                search(want)
+            },
+            |keep| {
+                measured = true;
+                (search(keep.min(n)), false)
+            },
+            hidden,
+        );
+        ((keys(&found), cut), asked, measured)
+    }
+
+    /// Nothing hidden: one search, of `k`, as before.
+    #[test]
+    fn nothing_hidden_is_one_search() {
+        let (found, asked, measured) = run(1000, 10, None, |_| false);
+        assert_eq!(found, ((0..10).collect(), false));
+        assert_eq!(asked, [10]);
+        assert!(!measured);
+    }
+
+    /// A few of the nearest hidden: more asked for, and the nearest `k`
+    /// shown, nearest first.
+    #[test]
+    fn a_few_hidden_are_made_up_for() {
+        let (found, asked, measured) = run(1000, 10, None, |key| key_number(key).is_multiple_of(3));
+        let want: Vec<usize> = (0..100usize)
+            .filter(|i| !i.is_multiple_of(3))
+            .take(10)
+            .collect();
+        assert_eq!(found, (want, false));
+        assert_eq!(asked, [10, 20]);
+        assert!(!measured);
+    }
+
+    /// Most of the nearest hidden: searches, each at least twice the last,
+    /// up to a SEARCH_SHAREth of the index, then every vector measured, and
+    /// the nearest `k` shown, nearest first.
+    #[test]
+    fn mostly_hidden_measures_every_vector_past_a_share_of_the_index() {
+        let n = 1_000_000;
+        let (found, asked, measured) = run(n, 10, None, |key| key_number(key) < 100_000);
+        assert_eq!(found, ((100_000..100_010).collect(), false));
+        assert!(asked.windows(2).all(|w| w[1] >= 2 * w[0]), "{asked:?}");
+        assert!(asked.iter().all(|&a| a * SEARCH_SHARE <= n), "{asked:?}");
+        assert!(measured);
+    }
+
+    /// The index holds fewer than `k` shown: what it has.
+    #[test]
+    fn an_index_with_fewer_than_k_shown_ends() {
+        let (found, _, _) = run(5, 10, None, |key| key_number(key) < 2);
+        assert_eq!(found, (vec![2, 3, 4], false));
+        let (found, _, measured) = run(1000, 10, None, |_| true);
+        assert_eq!(found, (vec![], false));
+        assert!(measured);
+    }
+
+    /// Past the deadline between rounds: no more rounds, and what was found
+    /// is only the shown ones, nearest first. A round too small to be worth
+    /// a clock read is never cut.
+    #[test]
+    fn the_deadline_stops_the_rounds() {
+        let past = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let hidden = |key: &str| key_number(key).is_multiple_of(2) || key_number(key) < 1500;
+        let (found, asked, measured) = run(1_000_000, 2000, past, hidden);
+        let want: Vec<usize> = (0..2000).filter(|&i| !hidden(&format!("d:{i}"))).collect();
+        assert_eq!(found, (want, true));
+        assert_eq!(asked, [2000]);
+        assert!(!measured);
+
+        let (found, _, _) = run(1_000_000, 10, past, |key| key_number(key) < 15);
+        assert_eq!(found, ((15..25).collect(), false));
+    }
+
+    /// Past the deadline while the measured vectors are looked at: the
+    /// shown ones before it, nearest first.
+    #[test]
+    fn the_deadline_stops_the_look_through_every_vector() {
+        let past = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        // 10,000 vectors: the searches stop at 640, too few to read the
+        // clock for, and the pass keeps 1,280.
+        let hidden = |key: &str| key_number(key) < 9000 && !key_number(key).is_multiple_of(5000);
+        let (found, asked, measured) = run(10_000, 10, past, hidden);
+        assert_eq!(*asked.last().unwrap(), 320);
+        assert!(measured);
+        assert_eq!(found, (vec![0], true));
     }
 }

@@ -50,3 +50,37 @@ measured above. Instruction counts leave out what a clock read costs in
 cycles.
 No row gains 5%, so there is no regression suite row: a change of more than
 1% on one of these rows is a regression.
+
+## Mostly hidden nearest vectors (#670 item 3)
+
+`TTLS="0 1 h900 h990 h999"` adds the case where the vector field of that many
+hashes in a thousand is past its deadline and still stored (the sweep is
+paused), so an unfiltered KNN's nearest are mostly hidden from it; `ALGO=HNSW`
+builds the index as HNSW. `search-knn` is the kind it changes:
+
+    TTLS="0 1 h900 h990 h999" KINDS=search-knn ALGO=HNSW \
+      benchmarks/1.3.0/search-clock/run.sh before=... after=...
+
+Not measured under callgrind yet (no valgrind on the machine the change was
+written on). Wall clock, milliseconds a query, median of 3 batches of 50,
+Apple M3 Pro, `--threads 1`, master `d1a6712c` and the change, `KNN 10`:
+
+| index | docs | ttl | master | change |
+|---|---:|---|---:|---:|
+| FLAT | 50,000 | 0 | 1.44 | 1.42 |
+| FLAT | 50,000 | 1 | 1.38 | 1.30 |
+| FLAT | 50,000 | h900 | 3.73 | 3.43 |
+| FLAT | 50,000 | h990 | 6.76 | 5.89 |
+| FLAT | 50,000 | h999 | 19.14 | 18.40 |
+| HNSW | 50,000 | 0 | 0.84 | 0.82 |
+| HNSW | 50,000 | 1 | 0.91 | 1.14 |
+| HNSW | 50,000 | h900 | 1.14 | 1.26 |
+| HNSW | 50,000 | h990 | 4.09 | 4.02 |
+| HNSW | 50,000 | h999 | 27.78 | 23.30 |
+| FLAT | 3,000 | h999 | 2.20 | 2.01 |
+| HNSW | 3,000 | h999 | 4.34 | 2.14 |
+
+The `0` and `1` rows take the same path on both (one search, nothing left
+out); their differences are the laptop's noise. With `TIMEOUT 1` on HNSW,
+50,000 hashes, `h999`: master 24.5 ms (it does not look at the clock),
+the change 1.9 ms, returning the shown ones it had found.

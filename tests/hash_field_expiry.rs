@@ -1392,6 +1392,61 @@ fn ft_knn_with_few_or_no_vectors_to_show() {
     }
 }
 
+/// The keys an FT.HYBRID over `index` ranks by its vector side alone (a
+/// SEARCH no document matches), `k` nearest the origin, in order.
+fn hybrid_nearest(c: &mut Conn, index: &str, k: usize) -> Vec<String> {
+    let (origin, k) = (vec2(0.0, 0.0), k.to_string());
+    let args: [&[u8]; 18] = [
+        b"FT.HYBRID",
+        index.as_bytes(),
+        b"SEARCH",
+        b"nothingmatchesthis",
+        b"VSIM",
+        b"@vec",
+        b"$q",
+        b"KNN",
+        b"2",
+        b"K",
+        k.as_bytes(),
+        b"PARAMS",
+        b"2",
+        b"q",
+        &origin,
+        b"LOAD",
+        b"1",
+        b"@__key",
+    ];
+    cmd_bytes(c, &args).arr()[3]
+        .arr()
+        .iter()
+        .map(|row| {
+            let kv = row.arr();
+            let at = kv.chunks(2).position(|kv| kv[0].s() == "__key").unwrap();
+            kv[2 * at + 1].s().to_string()
+        })
+        .collect()
+}
+
+/// The hundred nearest vectors due: FT.HYBRID's vector side gives up on the
+/// index search after a few rounds and measures every vector, and ranks the
+/// ten nearest the query sees.
+#[test]
+fn ft_hybrid_knn_past_many_due_nearest_vectors() {
+    for algo in ["FLAT", "HNSW"] {
+        let server = Server::start(&[]);
+        let mut c = server.conn();
+        vectors(&mut c, "e", algo, 3000, 100, false, false);
+        assert_eq!(
+            hybrid_nearest(&mut c, "e", 10),
+            keys("e", 100..110),
+            "{algo}"
+        );
+        // Nothing due: the index, as before.
+        vectors(&mut c, "f", algo, 3000, 0, false, false);
+        assert_eq!(hybrid_nearest(&mut c, "f", 10), keys("f", 0..10), "{algo}");
+    }
+}
+
 /// Each result of an FT.HYBRID over index `v`, by key, with its fields.
 fn hybrid(c: &mut Conn, search: &str) -> Vec<(String, Vec<(String, String)>)> {
     let origin = vec2(0.0, 0.0);

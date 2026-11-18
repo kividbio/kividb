@@ -673,12 +673,24 @@ fn vsim_ranked(
                 VectorAlgo::Hnsw { ef_runtime, .. } => *ef_runtime,
                 VectorAlgo::Flat => k.saturating_mul(2),
             });
-            crate::commands::vector::nearest_shown(db, &field.name, *k, now, |n| match live {
-                LiveIndex::Flat(idx) => crate::vector::knn_flat(idx, query_vec, n, metric),
-                LiveIndex::Hnsw(idx) => {
-                    crate::vector::knn_hnsw(idx, query_vec, n, ef.max(n).max(50), metric)
-                }
-            })
+            let (nearest, cut) = crate::commands::vector::nearest_shown(
+                db,
+                &field.name,
+                *k,
+                now,
+                deadline,
+                live,
+                query_vec,
+                metric,
+                |n| match live {
+                    LiveIndex::Flat(idx) => crate::vector::knn_flat(idx, query_vec, n, metric),
+                    LiveIndex::Hnsw(idx) => {
+                        crate::vector::knn_hnsw(idx, query_vec, n, ef.max(n).max(50), metric)
+                    }
+                },
+            );
+            timed_out = cut;
+            nearest
         }
         VectorMethod::Knn { k, ef_runtime } => {
             let knn = crate::vector::filter::Knn {
