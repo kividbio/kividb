@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Collection storage step 4: small sorted sets in one block.
+
+Bytes per member is the growth of INFO used_memory over the load divided by
+the members, as the earlier steps take it (`17-set-memory`, `19-hash-memory`,
+`21-list-memory`): TOTAL members (1,000,000) in sorted sets of N members each
+(TOTAL / N keys), N = 10, 100, 128, 129 and 1,000, loaded with ZADD of up to
+250 pairs a command in pipelines of about 5,000 members. Keys are
+`k:zst:<i>` (16 bytes); members `membr:<i>` (14 bytes, i zero-padded to 8
+digits), the size the redesign was measured with.
+
+  int    scores 0..N-1: whole numbers, which a block keeps in one to three
+         bytes
+  float  scores i + 0.5: kept as the eight bytes of the float
+
+At Redis's limits (zset-max-listpack-entries 128, zset-max-listpack-value 64)
+the members make a block up to 128 and the table and tree at 129 and 1,000.
+`encoding_<n>` records what OBJECT ENCODING says of the first key (2
+listpack, 5 skiplist) and must not change.
+
+Gates: memory per member within 5 % (or 1 B) of recorded at every size; at
+10, 100 and 128 members, where the block replaced the table and the tree, it
+must also keep 60 % of the gain over v1.2.2 measured in the same session. The
+large sets (129 and 1,000) are guard rows: the change must not cost them.
+"""
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+from suite import Suite, Config, KEEP_IMPROVEMENT, EXACT, rel, info, scaled  # noqa: E402
+
+S = Suite("25-zset-memory", [Config("int"), Config("float")])
+SIZES = [10, 100, 128, 129, 1000]
+TOTAL = 1_000_000
+BATCH = 250
+ENCODINGS = {"listpack": 2, "skiplist": 5}
+
+
+def pairs(start, n, half):
+    out = []
+    for i in range(start, start + n):
+        out += [("%d.5" % i) if half else ("%d" % i), "membr:%08d" % i]
+    return out
+
+
+def load(c, n, total, half):
+    keys = max(1, total // n)
+    p = c.pipeline(transaction=False)
+    pending = 0
+    for k in range(keys):
+        key = "k:zst:%010d" % k
+        done = 0
+        while done < n:
+            m = min(BATCH, n - done)
+            p.execute_command("ZADD", key, *pairs(done, m, half))
+            done += m
+            pending += m
+            if pending >= 5000:
+                p.execute()
+                pending = 0
+    p.execute()
+    return keys
+
+
+@S.run
+def run(ctx):
+    c = ctx.client()
+    half = ctx.config.name == "float"
+    total = scaled(TOTAL)
+    for n in SIZES:
+        n_here = min(n, total)
+        c.flushall()
+        time.sleep(0.5)
+        u0 = c.info("memory")["used_memory"]
+        t = time.perf_counter()
+        keys = load(c, n_here, total, half)
+        secs = time.perf_counter() - t
+        u1 = c.info("memory")["used_memory"]
+        first = "k:zst:%010d" % 0
+        assert c.zcard(first) == n_here, "ZCARD %d != %d" % (c.zcard(first), n_here)
+        per = (u1 - u0) / float(keys * n_here)
+        gate = [rel(5, abs=1)]
+        if n <= 128:
+            gate.append(KEEP_IMPROVEMENT)
+        ctx.emit("bytes_per_member_%d" % n, per, "B", "lower", gate=gate)
+        enc = c.object("encoding", first)
+        enc = enc.decode() if isinstance(enc, bytes) else enc
+        ctx.emit("encoding_%d" % n, ENCODINGS.get(enc, 0), "code", "lower", gate=EXACT)
+        ctx.emit("load_%d_s" % n, secs, "s", "lower", gate=info())
+    c.flushall()
+
+
+if __name__ == "__main__":
+    sys.exit(S.main())

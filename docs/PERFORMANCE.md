@@ -174,6 +174,33 @@ bytes keeps its elements apart, as 1.2 did, and takes what 1.2 took. Suite
 this table again (1M elements, 10 to 100,000 a list) and fails a build that
 loses it.
 
+## Memory of small sorted sets
+
+Since 1.3.0 a sorted set of up to 128 members of up to 64 bytes is kept in
+one block, its entries in order by score and then by member, each score as
+its integer in one to eight bytes where it is one (`listpack` in
+`OBJECT ENCODING`), where 1.2 kept every sorted set as a hash table and a
+tree holding a shared copy of each member. Bytes of `used_memory` a member,
+1M members in sets of each size, 14-byte members (`membr:00000001`), on an
+Azure `Standard_D4s_v5`:
+
+| members a set | 1.2.2 whole scores | 1.3.0 whole scores | Redis 8.10.2 whole scores | 1.2.2 fractions | 1.3.0 fractions | Redis 8.10.2 fractions |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 118.8 | 29.6 | 24.8 | 118.8 | 37.6 | 28.0 |
+| 100 | 116.4 | 19.3 | 21.0 | 116.4 | 27.3 | 26.2 |
+| 128 | 131.7 | 19.0 | 20.4 | 131.7 | 27.0 | 24.4 |
+| 129 | 130.9 | 131.2 | 78.9 | 130.9 | 131.2 | 78.3 |
+| 1,000 | 132.5 | 132.5 | 67.8 | 132.5 | 132.5 | 68.4 |
+
+Measured a key at a time as #297 measured it (100,000 sets of 10 members of
+8 bytes, scores 0 to 9): 275 bytes of RSS a key (1.2.2: 1,249; Redis: 186),
+236 of `used_memory` (1,108; 176). What is left over Redis is mostly the
+key's own entry and the set's header. Sets past 128 members are a table and
+a tree as before; making those smaller is the next step. Suite
+`25-zset-memory` of
+[the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
+the table again and fails a build that loses it.
+
 ## Snapshot size
 
 Since 1.3.0 a snapshot can be written compressed (`rdbcompression yes`,

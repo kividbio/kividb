@@ -645,6 +645,45 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     counts the chunks as allocated; eviction's estimate of what freeing a
     list gives back is their bytes, and lazy freeing's effort their number.
 
+- **Small sorted sets take a quarter to a sixth of the memory (#825,
+  #297).** A sorted set of up to 128 members of up to 64 bytes is kept in
+  one block, its entries in order by score and then by member, where it
+  was a hash table and a tree that each held the member: 14-byte members
+  with whole-number scores take 29.6 bytes a member at 10 members (118.8
+  before; Redis 8.10.2 24.8) and 19.3 at 100 (116.4; Redis 21.0); with
+  fractional scores 37.6 and 27.3 (Redis 28.0 and 26.2). Ten 8-byte
+  members a key, as #297 measured it, take 275 bytes of RSS a key (1,249
+  before; Redis 186). Larger sorted sets are a table and a tree as before.
+  - A score that is an integer of up to 56 bits is kept in one to eight
+    bytes (one up to 247), any other as the eight bytes of the float: read
+    back, every score is the same float, bit for bit. A member is found by
+    scanning one byte a member (a fingerprint), as in small sets and
+    hashes; a rank is a position, and a range of scores a binary search.
+  - A sorted set moves to the table and the tree when a write adds a member
+    past 128 or one longer than 64 bytes, or when one `ZADD` (or `GEOADD`)
+    gives more than 128 pairs, as Redis moves a listpack to a skiplist;
+    never back. A set built whole (a snapshot or AOF load, `RESTORE`,
+    `MIGRATE`, `ZRANGESTORE`, `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE`,
+    `GEOSEARCHSTORE`) is one block if it fits, laid down once.
+  - `OBJECT ENCODING` reports the form a sorted set is kept in, `listpack`
+    or `skiplist`, and `ZSCAN` returns a block whole, in order, with cursor
+    0, as Redis returns a listpack. A set that became large and was taken
+    back under the limit used to be reported as `listpack`; it is a
+    `skiplist`, as in Redis.
+  - `zset-max-listpack-entries` (default 128) and `zset-max-listpack-value`
+    (64), and their `zset-max-ziplist-*` names, now take effect, from the
+    configuration file or `CONFIG SET`; `0` entries turns blocks off. They
+    go no higher than 128 and 64, and `CONFIG GET` reports the value kept.
+    A lowered limit applies to a set at its next new member.
+  - INSTRUCTIONS_PLACEHOLDER
+  - Snapshots, the AOF, replication, `DUMP`/`RESTORE` and `MIGRATE` still
+    write members and scores, so their formats do not change: 1.2.2 reads
+    what this release writes and the other way round, and `DEBUG DIGEST`
+    does not depend on the form. `MEMORY USAGE`, eviction and lazy freeing
+    count a block as the one allocation it is. A large sorted set keeps its
+    table and tree behind one more pointer, so its handle in every key is
+    the size of a block's.
+
 - **Active defrag's pass ends about twice as fast, at the same CPU cap
   (#240, #291).** It slept after every batch of 128 buckets, and each sleep
   overshot; it now sleeps once a millisecond of work is owed its rest, at
