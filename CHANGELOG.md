@@ -347,14 +347,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   | background (cmds/s) | 1.2.2 | before | after | Redis |
   |---|---|---|---|---|
   | 0 | 31.4k, 0.14 ms | 31.4k, 0.15 ms | 31.7k, 0.09 ms | 31.7k, 0.10 ms |
-  | 100,000 | 23.7k, 3.7 ms | 24.4k, 3.7 ms | 31.6k, 0.17 ms | 31.8k, 0.10 ms |
-  | 150,000 | 23.3k, 4.2 ms | 21.1k, 5.0 ms | 29.6k, 1.3 ms | 31.9k, 0.11 ms |
-  | 200,000 | 23.9k, 4.3 ms | 22.2k, 5.1 ms | 24.0k, 4.8 ms | 27.7k, 0.87 ms |
-  | 300,000 | 22.3k, 5.7 ms | 18.9k, 8.3 ms | 28.4k, 0.74 ms | 23.6k, 0.98 ms |
+  | 100,000 | 23.7k, 3.7 ms | 24.4k, 3.7 ms | 31.7k, 0.15 ms | 31.8k, 0.10 ms |
+  | 150,000 | 23.3k, 4.2 ms | 21.1k, 5.0 ms | 30.1k, 1.2 ms | 31.9k, 0.11 ms |
+  | 200,000 | 23.9k, 4.3 ms | 22.2k, 5.1 ms | 25.5k, 4.2 ms | 27.7k, 0.87 ms |
+  | 300,000 | 22.3k, 5.7 ms | 18.9k, 8.3 ms | 28.4k, 0.71 ms | 23.6k, 0.98 ms |
 
-  The server's CPU at 0 went from 76 % to 54 % (46 % with no backlog), and
-  pipelined `SET` on such a server from 0.87M to 1.14M a second at
-  pipeline 16 (1.34M with no backlog) and from 1.33M to 1.42M at 100.
+  On the tokio loop, whose workers take each other's connections when one
+  is held up, the same case after the change is at or better than Redis at
+  every rate: 31.8-31.9k checks a second at a p99 of 0.07-0.09 ms up to
+  200,000, 27.6k at 0.74 ms at 300,000.
+  The server's CPU at 0 went from 76 % to 53 % (44 % with no backlog), and
+  pipelined `SET` on such a server (`redis-benchmark -c 50`) from 0.87M
+  to 1.15M a second at pipeline 16 (1.34M with no backlog) and from 1.34M
+  to 1.48M at 100 (3.5M with no backlog); `GET` and a server with no
+  backlog are unchanged.
   At 150,000 and 200,000 the two io_uring workers are still at times put
   on one CPU by the scheduler, and connections wait out the other's time
   slice: pinned each to a CPU of its own (by hand, with `taskset`), the
