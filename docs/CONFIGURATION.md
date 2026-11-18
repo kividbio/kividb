@@ -120,6 +120,21 @@ open-file limit to `maxclients` plus what it keeps for itself (32 files, or on i
 warning. Cluster bus links, a replica's link to its master and files written while saving
 are not counted in that; leave room for them in a large cluster.
 
+Small collections are kept in one block of memory up to Redis's limits, which are set as in
+Redis, in the file or with `CONFIG SET`, and reported by `CONFIG GET` and `OBJECT ENCODING`:
+`set-max-intset-entries` (512), `set-max-listpack-entries` (128) and `set-max-listpack-value`
+(64) for sets; `hash-max-listpack-entries` (512) and `hash-max-listpack-value` (64) for hashes;
+`zset-max-listpack-entries` (128) and `zset-max-listpack-value` (64) for sorted sets (a sorted
+set of up to that many members, none longer than that many bytes, is one block; past either it
+is a hash table and an ordered tree). The `*-max-ziplist-*` names of the hash and sorted-set
+settings are the same settings. A limit goes no higher than what one block holds (128 members
+of 64 bytes for sets and sorted sets, 512 fields for hashes): a larger value is taken as that
+maximum, `CONFIG GET` reports what was kept, and a warning naming the maximum is logged. `0`
+entries keeps new hashes and sorted sets out of blocks. A changed limit applies to a hash at
+its next write that sets a field, to a set or a sorted set at its next new member (a changed
+score never moves a sorted set); a collection never moves back to a block.
+[COMPATIBILITY.md](COMPATIBILITY.md) has the details for each type.
+
 Persistence (snapshots and the AOF) is described in [PERSISTENCE.md](PERSISTENCE.md),
 including `rdbcompression` (default `no`; `yes` writes snapshots compressed, which 1.2 cannot read) and the
 `kividb kdb-decompress <in> <out>` and `kividb kdb-compress <in> <out>` tools, which convert a

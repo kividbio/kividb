@@ -2439,7 +2439,9 @@ fn read_image_body(
                     let mut count_buf = [0u8; 4];
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
-                    let mut ss = SortedSetInner::new();
+                    // A block laid down once if the members fit one; the
+                    // table and the tree as before if not.
+                    let mut ss = SortedSetInner::loader(count);
                     for _ in 0..count {
                         let member = read_bytes(&mut r)?;
                         let mut score_buf = [0u8; 8];
@@ -2450,9 +2452,9 @@ fn read_image_body(
                                 format!("{NAN_SCORE} in key '{}'", String::from_utf8_lossy(&key)),
                             ));
                         };
-                        ss.insert(Arc::from(member.as_slice()), score);
+                        ss.push(&member, score);
                     }
-                    KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(ss)))
+                    KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(ss.finish())))
                 }
                 TAG_STREAM | TAG_STREAM_V2 | TAG_STREAM_V3 => read_stream_value(&mut r, tag[0])?,
                 TAG_JSON => {
@@ -3953,14 +3955,14 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
         3 => {
             // Sorted set v1 (score as double string)
             let (count, _) = rdb_read_length(r)?;
-            let mut ss = SortedSetInner::new();
+            let mut ss = SortedSetInner::loader(hint(count as usize));
             for _ in 0..count {
                 let member = rdb_read_string(r)?;
                 let score = zset_score_or_error(rdb_read_double_v1(r)?)?;
-                ss.insert(Arc::from(member.as_slice()), score);
+                ss.push(&member, score);
             }
             Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss),
+                parking_lot::RwLock::new(ss.finish()),
             ))))
         }
         4 => {
@@ -3980,16 +3982,16 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
         5 => {
             // Sorted set v2 (score as binary double)
             let (count, _) = rdb_read_length(r)?;
-            let mut ss = SortedSetInner::new();
+            let mut ss = SortedSetInner::loader(hint(count as usize));
             for _ in 0..count {
                 let member = rdb_read_string(r)?;
                 let mut score_buf = [0u8; 8];
                 r.read_exact(&mut score_buf)?;
                 let score = zset_score_or_error(f64::from_le_bytes(score_buf))?;
-                ss.insert(Arc::from(member.as_slice()), score);
+                ss.push(&member, score);
             }
             Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss),
+                parking_lot::RwLock::new(ss.finish()),
             ))))
         }
         // The numbers are Redis's (`RDB_TYPE_*` in rdb.h). Up to 1.1.0 most
@@ -4046,9 +4048,9 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             // RDB_TYPE_ZSET_ZIPLIST (Redis up to 6.2): member, score, member,
             // score..., the scores as text.
             let blob = rdb_read_string(r)?;
-            let mut ss = SortedSetInner::new();
             let mut deque = VecDeque::new();
             rdb_decode_ziplist_into_list(&blob, &mut deque);
+            let mut ss = SortedSetInner::loader(deque.len() / 2);
             let mut iter = deque.into_iter();
             while let (Some(member), Some(score_bytes)) = (iter.next(), iter.next()) {
                 let score: f64 = std::str::from_utf8(&score_bytes)
@@ -4058,10 +4060,10 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                         io::Error::new(io::ErrorKind::InvalidData, "bad ziplist zset score")
                     })?;
                 let score = zset_score_or_error(score)?;
-                ss.insert(Arc::from(member.as_ref()), score);
+                ss.push(&member, score);
             }
             Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss),
+                parking_lot::RwLock::new(ss.finish()),
             ))))
         }
         13 => {
@@ -4104,8 +4106,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
         17 => {
             // RDB_TYPE_ZSET_LISTPACK (Redis 7.0+).
             let blob = rdb_read_string(r)?;
-            let mut ss = SortedSetInner::new();
-            rdb_decode_listpack_into_zset(&blob, &mut ss)?;
+            let ss = rdb_decode_listpack_into_zset(&blob)?;
             Ok(Some(KiviDBValue::SortedSet(Arc::new(
                 parking_lot::RwLock::new(ss),
             ))))
@@ -5123,11 +5124,12 @@ fn rdb_decode_listpack_into_hash(blob: &[u8]) -> io::Result<crate::types::HashFi
 }
 
 /// member, score, member, score..., a score as an integer or as text.
-fn rdb_decode_listpack_into_zset(blob: &[u8], ss: &mut SortedSetInner) -> io::Result<()> {
+fn rdb_decode_listpack_into_zset(blob: &[u8]) -> io::Result<SortedSetInner> {
     let elements = lp_elements(blob)?;
     if elements.len() % 2 != 0 {
         return Err(malformed_listpack());
     }
+    let mut ss = SortedSetInner::loader(elements.len() / 2);
     let mut iter = elements.into_iter();
     while let (Some(member), Some(score)) = (iter.next(), iter.next()) {
         let score: f64 = std::str::from_utf8(&score)
@@ -5135,9 +5137,9 @@ fn rdb_decode_listpack_into_zset(blob: &[u8], ss: &mut SortedSetInner) -> io::Re
             .and_then(|s| s.parse().ok())
             .ok_or_else(malformed_listpack)?;
         let score = zset_score_or_error(score)?;
-        ss.insert(Arc::from(member.as_slice()), score);
+        ss.push(&member, score);
     }
-    Ok(())
+    Ok(ss.finish())
 }
 
 /// Load a snapshot and populate the store directly.
@@ -6141,7 +6143,7 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             }
             let count = u32::from_le_bytes(payload[..4].try_into().ok()?) as usize;
             let mut pos = 4usize;
-            let mut ss = crate::types::SortedSetInner::new();
+            let mut ss = crate::types::SortedSetInner::loader(count);
             for _ in 0..count {
                 let (member_bytes, next) = read_bytes_slice(payload, pos)?;
                 if next + 8 > payload.len() {
@@ -6150,11 +6152,11 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 let score = zset_score(f64::from_bits(u64::from_le_bytes(
                     payload[next..next + 8].try_into().ok()?,
                 )))?;
-                ss.insert(Arc::from(member_bytes), score);
+                ss.push(member_bytes, score);
                 pos = next + 8;
             }
             Some(KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(
-                ss,
+                ss.finish(),
             ))))
         }
         TAG_JSON => {

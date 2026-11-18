@@ -164,6 +164,28 @@ other files:
   soonest first; so once a field of a small hash has a TTL the two orders
   differ. They agree for a `listpack`.
 
+**Sorted sets**
+- Small sorted sets are kept as Redis keeps them, and `OBJECT ENCODING`
+  says so: `listpack` for up to `zset-max-listpack-entries` (128) members
+  of up to `zset-max-listpack-value` (64) bytes, `skiplist` otherwise (a
+  hash table and an ordered tree here). A set moves when a write adds a
+  member past either limit, or when one `ZADD` (or `GEOADD`) gives more
+  pairs than the entries limit, as in Redis; never back: a set taken back
+  under the limit stays a `skiplist`, as in Redis. A set made whole (a
+  load, `RESTORE`, `MIGRATE`, `ZRANGESTORE`, `ZUNIONSTORE` and the other
+  `*STORE` commands) is a `listpack` if it fits, as Redis loads one.
+- `ZSCAN` returns a `listpack` whole, in order, with cursor 0, whatever
+  `COUNT` says, as Redis does.
+- The two limits go no higher than 128 and 64 (the most one block holds);
+  a larger value is taken as those, and `CONFIG GET` says so (Redis keeps
+  what it is given, and its listpack holds more). The `zset-max-ziplist-*`
+  names set and report the same two settings. A lowered limit applies to
+  a set at its next new member; a changed score never moves a set, as in
+  Redis.
+- `SORT` of a `listpack` sorted set leaves it a `listpack`; Redis 8.10
+  turns the set it sorts into a `skiplist`, so `OBJECT ENCODING` differs
+  after a `SORT` (the replies do not).
+
 **Lists**
 - A list's elements are kept end to end in chunks of up to 64, as Redis
   keeps a quicklist of listpacks, but the size of a chunk is fixed: Redis
