@@ -1226,3 +1226,152 @@ fn a_push_that_wakes_a_client_replies_after_its_pop_is_counted() {
         }
     }
 }
+
+/// What `CLIENT LIST` reports for `name`'s `qbuf` — its read-ahead and
+/// unparsed buffer, counted together.
+fn qbuf_of(c: &mut Conn, name: &str) -> Option<i64> {
+    let V::Str(list) = c.cmd(&["CLIENT", "LIST"]) else {
+        panic!("CLIENT LIST is a bulk string");
+    };
+    let named = format!("name={name} ");
+    list.lines()
+        .find(|line| line.contains(&named))?
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("qbuf=")?.parse().ok())
+}
+
+/// A client that sends without reading while it waits is read ahead only so
+/// far: its read-ahead and its unparsed buffer are held to
+/// `client-query-buffer-limit` together, so a request just under it is kept
+/// whole — the client is not closed — and `qbuf` and `mem_clients_normal`
+/// never show it past the limit by more than a read. (The io_uring loop
+/// does not read a client that waits: its send stays in the socket until it
+/// is unblocked, then runs the same.)
+#[test]
+fn a_client_that_sends_without_reading_is_held_to_the_limit_once() {
+    let limit = 1 << 20;
+    let one_read = 4 * 1024;
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        assert_eq!(
+            ctl.cmd(&["CONFIG", "SET", "client-query-buffer-limit", "1mb"]),
+            s("OK")
+        );
+        let name = format!("sender-{io}");
+        let c = blocked_client(&server, &mut ctl, &name, &["BLPOP", "hold", "0"]);
+        let baseline = info_field(&mut ctl, "memory", "mem_clients_normal");
+
+        // One request just under the limit, sent and never read back.
+        let payload = "x".repeat(1_000_000);
+        let mut writer = c.writer.try_clone().unwrap();
+        let sending = thread::spawn(move || {
+            let _ = writer.write_all(&request(&["SET", "held:key", &payload]));
+        });
+        thread::sleep(Duration::from_millis(500));
+        for _ in 0..3 {
+            let qbuf = qbuf_of(&mut ctl, &name).unwrap_or(-1);
+            assert!(
+                (0..=limit + one_read).contains(&qbuf),
+                "{io}: qbuf {qbuf} is past the limit plus one read"
+            );
+            let mem = info_field(&mut ctl, "memory", "mem_clients_normal");
+            assert!(
+                mem <= baseline + limit + one_read,
+                "{io}: mem_clients_normal {mem} is past {baseline} plus the limit"
+            );
+            assert!(
+                listed(&mut ctl, &name),
+                "{io}: a client under the limit was closed"
+            );
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        // Unblocked, what it sent runs: the whole request was read.
+        assert_eq!(ctl.cmd(&["RPUSH", "hold", "x"]), V::Int(1));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ctl.cmd(&["EXISTS", "held:key"]) != V::Int(1) {
+            assert!(
+                Instant::now() < deadline,
+                "{io}: the request read ahead never ran"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        drop(c);
+        let _ = sending.join();
+    }
+}
+
+/// The two halves of what a waiting client holds are bounded together, not
+/// each alone: what it already held unread in `buffer` when its command
+/// parked counts against `client-query-buffer-limit` with what it sends
+/// into `carried` while it waits. Here the buffer's half is what a request
+/// ahead of `BLPOP` left, still to be compacted; the client used to be read
+/// past the limit because only `carried` was counted.
+#[test]
+fn what_a_waiting_client_holds_is_bounded_together() {
+    let server = Server::start("tokio");
+    let mut ctl = server.conn();
+    assert_eq!(
+        ctl.cmd(&["CONFIG", "SET", "client-query-buffer-limit", "1mb"]),
+        s("OK")
+    );
+    let mut c = server.conn();
+    assert_eq!(c.cmd(&["CLIENT", "SETNAME", "held"]), s("OK"));
+
+    // A request over half the limit, sent all but its last bytes: it sits
+    // unparsed in the buffer while they are read. They arrive with a command
+    // that parks, in one write, so the read that completes the SET holds the
+    // BLPOP too — and what the SET left in the buffer is still to be
+    // compacted when the wait begins.
+    let filler = "x".repeat(700_000);
+    let first = request(&["SET", "filler", &filler]);
+    let split = first.len() - 4;
+    c.writer.write_all(&first[..split]).unwrap();
+    thread::sleep(Duration::from_millis(300));
+    c.writer
+        .write_all(&[&first[split..], &request(&["BLPOP", "hold", "0"])].concat())
+        .unwrap();
+    wait_blocked(&mut ctl, 1);
+    assert_eq!(ctl.cmd(&["EXISTS", "filler"]), V::Int(1));
+
+    // More sends, under the limit on their own but past it with what the
+    // buffer already holds: the client is closed.
+    let mut writer = c.writer.try_clone().unwrap();
+    let flood = thread::spawn(move || {
+        let ping = request(&["PING"]);
+        let chunk: Vec<u8> = ping.iter().copied().cycle().take(64 * 1024).collect();
+        for _ in 0..11 {
+            if writer.write_all(&chunk).is_err() {
+                return;
+            }
+        }
+    });
+    let stream = c.reader.get_mut();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut sink = [0u8; 4096];
+    let closed = loop {
+        match stream.read(&mut sink) {
+            Ok(0) => break true,
+            Ok(_) => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break false;
+            }
+            Err(_) => break true,
+        }
+    };
+    drop(c);
+    let _ = flood.join();
+    assert!(
+        closed,
+        "a client holding over the limit in buffer and read-ahead was kept"
+    );
+    assert!(!listed(&mut ctl, "held"));
+}

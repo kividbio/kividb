@@ -370,6 +370,8 @@ async fn park_blocking_uring(
     watch: &PeerWatch,
     repl_state: &crate::replication::ReplState,
     carried: &mut Vec<u8>,
+    carried_from: usize,
+    held_elsewhere: usize,
     activity: &crate::client_registry::Activity,
     limit: crate::server::HardLimit,
 ) -> Result<(), Vec<u8>> {
@@ -399,7 +401,16 @@ async fn park_blocking_uring(
         // The client is read while it waits, as the connection's own write
         // reads it (#865).
         let write = std::pin::pin!(stream.write_all(payload));
-        let (res, mut returned) = read_while_writing(write, watch, carried, activity, limit).await;
+        let (res, mut returned) = read_while_writing(
+            write,
+            watch,
+            carried,
+            carried_from,
+            held_elsewhere,
+            activity,
+            limit,
+        )
+        .await;
         drop(_w);
         returned.clear();
         *out_buf = returned;
@@ -678,6 +689,8 @@ async fn read_while_writing(
     >,
     watch: &PeerWatch,
     carried: &mut Vec<u8>,
+    carried_from: usize,
+    held_elsewhere: usize,
     activity: &crate::client_registry::Activity,
     mut limit: crate::server::HardLimit,
 ) -> tokio_uring::BufResult<(), Vec<u8>> {
@@ -693,7 +706,9 @@ async fn read_while_writing(
                     crate::stats::record_read();
                     activity.touch();
                     activity.note_read(n);
-                    if crate::server::carried_too_much(carried) || limit.over_after(n) {
+                    if crate::server::carried_too_much(held_elsewhere, carried, carried_from)
+                        || limit.over_after(n)
+                    {
                         // SAFETY: the connection's descriptor, open while it runs.
                         unsafe { libc::shutdown(watch.fd, libc::SHUT_RDWR) };
                         reading = false;
@@ -1181,7 +1196,9 @@ pub async fn handle_client(
                 carried = Vec::new();
                 carried_from = 0;
             } else if carried_from > carried.len() / 2 {
-                carried.drain(0..carried_from);
+                // What was moved out of `carried` is given back — capacity
+                // with it — in steps, rather than at the end (#869).
+                carried = carried.split_off(carried_from);
                 carried_from = 0;
             }
             (unparsed, n)
@@ -1610,6 +1627,8 @@ pub async fn handle_client(
                             &peer_watch,
                             &repl_state,
                             &mut carried,
+                            carried_from,
+                            parse_buf.len() - parse_start,
                             &activity,
                             limit,
                         ))
@@ -1711,6 +1730,8 @@ pub async fn handle_client(
                         &peer_watch,
                         &repl_state,
                         &mut carried,
+                        carried_from,
+                        parse_buf.len() - parse_start,
                         &activity,
                         limit,
                     ))
@@ -3311,6 +3332,8 @@ pub async fn handle_client(
                                         write,
                                         &peer_watch,
                                         &mut carried,
+                                        carried_from,
+                                        parse_buf.len() - parse_start,
                                         &activity,
                                         limit,
                                     ))
@@ -3339,6 +3362,8 @@ pub async fn handle_client(
                         write,
                         &peer_watch,
                         &mut carried,
+                        carried_from,
+                        parse_buf.len() - parse_start,
                         &activity,
                         limit,
                     ))
@@ -3357,6 +3382,8 @@ pub async fn handle_client(
                         write,
                         &peer_watch,
                         &mut carried,
+                        carried_from,
+                        parse_buf.len() - parse_start,
                         &activity,
                         limit,
                     ));

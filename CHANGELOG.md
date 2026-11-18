@@ -731,6 +731,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   writes before it waits; if that write fails, the client is closed at
   once, and what it pipelined after the blocking command is not run.
 
+- **What a waiting client has read ahead and its unparsed buffer are held
+  to `client-query-buffer-limit` together (#869).** What a client sent
+  while it waited — in a blocking command, held by a pause, in `WAIT`,
+  behind replies not yet written — was read ahead bounded by
+  `client-query-buffer-limit` on the read-ahead alone; the unread bytes
+  it already held in the parse buffer counted nowhere, so the two could
+  each reach the limit — about twice it, held — without the client being
+  closed. The bound is now the same count `CLIENT LIST` reports as
+  `qbuf`, `buffer.len() - read_start + carried.len() - carried_from`, and
+  the read-ahead gives its consumed prefix back — capacity with it — in
+  steps as it is moved on, rather than at the end. The io_uring loop
+  holds the same bound.
+
 - **`CLIENT NO-TOUCH` now keeps the client's reads from counting as a
   use of the keys they find (#566).** The command was accepted and
   answered `OK`, but the flag was never kept: a `NO-TOUCH` client's `GET`
