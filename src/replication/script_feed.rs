@@ -145,6 +145,31 @@ pub fn commands_for_propagation(
     cmd: &[&[u8]],
     resp: &[u8],
 ) -> Vec<Vec<Vec<u8>>> {
+    rewritten_for_propagation(ctx, name, cmd, resp).unwrap_or_else(|| {
+        if cmd.is_empty() {
+            return Vec::new();
+        }
+        vec![cmd.iter().map(|b| b.to_vec()).collect()]
+    })
+}
+
+/// How many commands [`commands_for_propagation`] would give, for a write
+/// nothing reads (`replication::write_is_observed`): what it does to work
+/// them out is done all the same (the effects it takes are taken), but a
+/// command sent as it came is not copied only to be counted (#901).
+pub fn propagation_count(ctx: &Ctx<'_>, name: &str, cmd: &[&[u8]], resp: &[u8]) -> usize {
+    rewritten_for_propagation(ctx, name, cmd, resp)
+        .map_or(usize::from(!cmd.is_empty()), |feeds| feeds.len())
+}
+
+/// [`commands_for_propagation`] for a command sent as something else than
+/// itself; `None` for one sent as it came.
+fn rewritten_for_propagation(
+    ctx: &Ctx<'_>,
+    name: &str,
+    cmd: &[&[u8]],
+    resp: &[u8],
+) -> Option<Vec<Vec<Vec<u8>>>> {
     // Upper case already, from every caller that runs commands; made so only
     // if it is not.
     let upper;
@@ -154,7 +179,7 @@ pub fn commands_for_propagation(
     } else {
         name
     };
-    match name {
+    Some(match name {
         "SPOP" => spop_feed(cmd, resp),
         "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => expire_feed(ctx, cmd, resp),
         // A TTL given as "this long from now" means something else to whoever
@@ -212,13 +237,8 @@ pub fn commands_for_propagation(
             blocking_pop_feed(name, cmd, resp)
         }
         "BRPOPLPUSH" => blocking_move_feed(cmd, resp, "RPOPLPUSH", 3),
-        _ => {
-            if cmd.is_empty() {
-                return Vec::new();
-            }
-            vec![cmd.iter().map(|b| b.to_vec()).collect()]
-        }
-    }
+        _ => return None,
+    })
 }
 
 /// Replace an auto-generated `XADD` ID (`*`, or `ms-*`) with the concrete ID the
