@@ -18,6 +18,7 @@ pub mod bloom;
 pub mod cuckoo;
 pub mod murmur;
 pub mod redis_module;
+pub mod room;
 
 use std::io;
 
@@ -99,8 +100,8 @@ pub fn is_write(name: &[u8]) -> bool {
 
 /// Whether `bytes` more fit under `maxmemory` (always, without one),
 /// reckoned as eviction reckons it: what is counted against the limit.
-/// Asked by the commands from clients that make or grow a filter, once
-/// they have evicted what they could; never while loading one, nor for a
+/// Asked before a command from a client that makes or grows a filter runs,
+/// and again when it runs ([`room`]); never while loading one, nor for a
 /// command from a master or the AOF.
 pub fn room_for(bytes: u64) -> bool {
     let limit = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
