@@ -590,7 +590,7 @@ where
     S: AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        while let Some(batch) = outbox.next().await {
+        while let Some(mut batch) = outbox.next().await {
             let mut g = writer.lock().await;
             // With the writer held: see `Batch::encode`.
             let frames = batch.encode(client_registry.get_resp(client_id));
@@ -602,6 +602,7 @@ where
             if g.write_all(&frames).await.is_err() {
                 break;
             }
+            batch.written(frames);
         }
     })
 }
