@@ -4059,6 +4059,15 @@ fn set_global_keys_argv<A: AsRef<[u8]>>(lua: &Lua, keys: &[A], argv: &[A]) -> Re
             use mlua::ffi;
             ffi::lua_checkstack(state, 6);
             ffi::lua_rawgeti(state, ffi::LUA_REGISTRYINDEX, ffi::LUA_RIDX_GLOBALS);
+            // KEYS and ARGV are unset before the next call's are built: what
+            // runs while they are (a collection can) does not see the last
+            // call's. Both keys are in the table already, so this allocates
+            // nothing.
+            for name in [c"KEYS", c"ARGV"] {
+                ffi::lua_pushstring(state, name.as_ptr());
+                ffi::lua_pushnil(state);
+                ffi::lua_rawset(state, -3);
+            }
             for (name, items) in [(c"KEYS", keys), (c"ARGV", argv)] {
                 ffi::lua_pushstring(state, name.as_ptr());
                 ffi::lua_createtable(state, items.len() as std::ffi::c_int, 0);
