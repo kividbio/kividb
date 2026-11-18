@@ -915,6 +915,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`CLIENT UNBLOCK` reaches a client that was woken and is parking
+  again.** It could answer 1 for a client blocked in `BLPOP` (or another
+  blocking pop) that had just been woken and was parking again, and the
+  client then stayed blocked; or answer 0 for it when the pop ahead of it
+  ended with nothing. And a blocking pop that ended with nothing (its
+  timeout, or `CLIENT UNBLOCK`) woke the next client waiting on its key
+  for no reason, which is what opened that window: Redis's unit/pause
+  failed on it now and then.
+
 - **Sorted-set commands read integers as Redis does.** `ZREMRANGEBYRANK
   key x 5` took `x` as 0 and removed members; it now answers `ERR value is
   not an integer or out of range`, before it looks at the key, as Redis
