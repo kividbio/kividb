@@ -306,6 +306,19 @@ class Rules(unittest.TestCase):
         self.assertEqual(hf["counts"]["s/c"], 4)
         self.assertIsNotNone([r for r in rows if r["metric"] == "x_pct"][0]["host"])
 
+    def test_a_candidate_built_by_another_rustc_is_flagged(self):
+        env = {"engines": {"v1_2_2": {"rustc": "1.100.0"}, "candidate": {"rustc": "1.99.1"},
+                           "v1_2_2_full": {"rustc": "1.100.0"}, "candidate_full": {"rustc": "1.100.0"},
+                           "redis": {"rustc": None}}}
+        warns = compare.toolchain_warnings(env)
+        self.assertEqual(len(warns), 1)
+        self.assertIn("candidate was built by rustc 1.99.1", warns[0])
+        env["engines"]["candidate"]["rustc"] = "1.100.0"
+        self.assertEqual(compare.toolchain_warnings(env), [])
+        self.assertEqual(compare.toolchain_warnings({}), [])
+        del env["engines"]["candidate_full"]  # not given: nothing to compare
+        self.assertEqual(compare.toolchain_warnings(env), [])
+
 
 if __name__ == "__main__":
     unittest.main()

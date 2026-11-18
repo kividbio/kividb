@@ -12,6 +12,7 @@ given. See README.md, "Adding a suite".
         Config("tokio", io="tokio"),
         Config("uring1", io="uring", threads=1, engines=("v1_2_2", "candidate")),
         Config("big", full_only=True),          # only with FULL=1
+        Config("scripts", lua=True),            # lua,tls builds (--candidate-full)
     ])
 
     @S.run
@@ -113,17 +114,23 @@ class Config:
 
     self_hosted=True: run-all.sh starts no server; the suite starts its own
     from ctx.bin (several nodes, a cluster: lib/nodes.py), and ctx.port and
-    ctx.pid are None."""
+    ctx.pid are None.
 
-    def __init__(self, name, io="auto", threads=0, engines=ENGINES, full_only=False, self_hosted=False):
+    lua=True: the configuration needs scripts. run-all.sh runs v1.2.2's
+    `full` build (lua,tls) and the candidate given with --candidate-full in
+    place of the default builds, under the same engine names; without
+    --candidate-full the configuration is skipped (and not expected)."""
+
+    def __init__(self, name, io="auto", threads=0, engines=ENGINES, full_only=False, self_hosted=False,
+                 lua=False):
         self.name, self.io, self.threads = name, io, threads
         self.engines, self.full_only = tuple(engines), full_only
-        self.self_hosted = self_hosted
+        self.self_hosted, self.lua = self_hosted, lua
 
     def as_dict(self):
         return {"name": self.name, "io": self.io, "threads": self.threads,
                 "engines": list(self.engines), "full_only": self.full_only,
-                "self_hosted": self.self_hosted}
+                "self_hosted": self.self_hosted, "lua": self.lua}
 
 
 class Ctx:

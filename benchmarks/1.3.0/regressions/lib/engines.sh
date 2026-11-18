@@ -10,8 +10,9 @@
 #        compare.py also checks the v1.2.2 binary's SHA-256 against the pin in
 #        baseline.json.
 #        <variant> is "default" (glibc, no Lua) or one of full, lua, tls.
-#   engines_resolve_candidate <path|tag> <dir>   -> prints the binary's path
-#        An existing file is used as it is; anything else is taken as a tag.
+#   engines_resolve_candidate <path|tag> <dir> [variant] -> prints the binary's path
+#        An existing file is used as it is; anything else is taken as a tag
+#        (its <variant> tarball, default "default").
 #   engines_resolve_redis <dir>                  -> prints redis-server's path
 #        $REDIS_SERVER, else /opt/redis-$REDIS_VERSION/src/redis-server, else
 #        built from the $REDIS_VERSION tag of github.com/redis/redis into <dir>.
@@ -86,12 +87,12 @@ engines_fetch_release() {
 }
 
 engines_resolve_candidate() {
-  local what=$1 dir=$2
+  local what=$1 dir=$2 variant=${3:-default}
   if [ -f "$what" ]; then
     [ -x "$what" ] || { engines_log "$what is not executable"; return 1; }
     (cd "$(dirname "$what")" && echo "$(pwd)/$(basename "$what")")
   else
-    engines_fetch_release "$what" default "$dir"
+    engines_fetch_release "$what" "$variant" "$dir"
   fi
 }
 

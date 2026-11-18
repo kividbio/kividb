@@ -3,7 +3,11 @@
 #
 #   run-all.sh --candidate <path-to-kividb | tag> [--label NAME] [--only 01,04]
 #              [--engines v1_2_2,candidate,redis] [--record] [--candidate-commit SHA]
+#              [--candidate-full <path-to-kividb built with lua,tls | tag>]
 #   FULL=1 run-all.sh ...      also the long configurations (17.5M keys with EX)
+#
+# Configurations that need scripts (Config(lua=True)) run v1.2.2's `full`
+# build and the --candidate-full binary; without it they are skipped.
 #
 # Each suite runs against v1.2.2 (the release tarball, SHA-256 checked), the
 # candidate and Redis 8.10.x, one server at a time on this machine, each
@@ -21,18 +25,19 @@ export REGRESS_LIB=$here/lib
 # shellcheck source=lib/engines.sh
 source "$here/lib/engines.sh"
 
-CANDIDATE= LABEL= ONLY= ENGINES=v1_2_2,candidate,redis RECORD= CAND_COMMIT=
+CANDIDATE= CANDIDATE_FULL= LABEL= ONLY= ENGINES=v1_2_2,candidate,redis RECORD= CAND_COMMIT=
 REFERENCE_TAG=${REFERENCE_TAG:-v1.2.2}
 SUITE_TIMEOUT=${SUITE_TIMEOUT:-1800}
 while [ $# -gt 0 ]; do
   case $1 in
     --candidate) CANDIDATE=$2; shift 2 ;;
+    --candidate-full) CANDIDATE_FULL=$2; shift 2 ;;
     --label) LABEL=$2; shift 2 ;;
     --only) ONLY=$2; shift 2 ;;
     --engines) ENGINES=$2; shift 2 ;;
     --record) RECORD=--record; shift ;;
     --candidate-commit) CAND_COMMIT=$2; shift 2 ;;
-    -h | --help) sed -n '2,17p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -73,8 +78,13 @@ export PYTHON=$VENV/bin/python
 # Engines.
 declare -A BIN KIND
 BIN[v1_2_2]=$(engines_fetch_release "$REFERENCE_TAG" default "$REGRESS_CACHE/releases")
-engines_fetch_release "$REFERENCE_TAG" full "$REGRESS_CACHE/releases" >/dev/null  # for suites that need Lua
 BIN[candidate]=$(engines_resolve_candidate "$CANDIDATE" "$REGRESS_CACHE/releases")
+# The lua,tls builds, for the configurations that need scripts (Config(lua=True)).
+declare -A FULLBIN
+FULLBIN[v1_2_2]=$(engines_fetch_release "$REFERENCE_TAG" full "$REGRESS_CACHE/releases")
+if [ -n "$CANDIDATE_FULL" ]; then
+  FULLBIN[candidate]=$(engines_resolve_candidate "$CANDIDATE_FULL" "$REGRESS_CACHE/releases" full)
+fi
 BIN[redis]=$(engines_resolve_redis "$REGRESS_CACHE/redis")
 KIND[v1_2_2]=kividb KIND[candidate]=kividb KIND[redis]=redis
 # redis-cli and redis-benchmark of the same build, for the suites that drive them.
@@ -131,6 +141,7 @@ vm_size() {
 }
 
 declare -A SECS
+SKIPPED=()
 ran=0
 for f in "${SUITES[@]}"; do
   suite=${f%.py}
@@ -148,23 +159,31 @@ for f in "${SUITES[@]}"; do
     threads=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["threads"])' "$cfg")
     engs=$("$PYTHON" -c 'import json,sys;print(" ".join(json.loads(sys.argv[1])["engines"]))' "$cfg")
     selfh=$("$PYTHON" -c 'import json,sys;print(int(json.loads(sys.argv[1]).get("self_hosted", False)))' "$cfg")
+    lua=$("$PYTHON" -c 'import json,sys;print(int(json.loads(sys.argv[1]).get("lua", False)))' "$cfg")
+    if [ "$lua" = 1 ] && [ -z "$CANDIDATE_FULL" ] && want_engine candidate; then
+      echo "--- $suite $name: skipped (needs scripts: pass --candidate-full <lua,tls build>)"
+      SKIPPED+=("$suite/$name")
+      continue
+    fi
     "$PYTHON" -c 'import json,sys;c=json.loads(sys.argv[1]);print(json.dumps({"suite":sys.argv[2],"config":c["name"],"engines":c["engines"]}))' \
       "$cfg" "$suite" >>"$EXPECTED"
     for e in $engs; do
       want_engine "$e" || continue
       echo "--- $suite $name $e"
       ran=$((ran + 1))
+      bin=${BIN[$e]}
+      [ "$lua" = 1 ] && [ -n "${FULLBIN[$e]:-}" ] && bin=${FULLBIN[$e]}
       srv=()
       if [ "$selfh" = 1 ]; then
         # The suite starts (and always stops) its own servers from --bin.
         ENGINE_LOG=/dev/null
       else
-        engine_start "${KIND[$e]}" "${BIN[$e]}" "$io" "$threads" || { fail "$suite $name $e: server did not start"; continue; }
+        engine_start "${KIND[$e]}" "$bin" "$io" "$threads" || { fail "$suite $name $e: server did not start"; continue; }
         srv=(--port "$ENGINE_PORT" --pid "$ENGINE_PID")
       fi
       # In the background and waited for, so that a signal stops the run at once.
       timeout "$SUITE_TIMEOUT" "$PYTHON" "$here/suites/$f" --config "$name" --engine "$e" \
-        --kind "${KIND[$e]}" "${srv[@]}" --bin "${BIN[$e]}" --out "$WORK" </dev/null &
+        --kind "${KIND[$e]}" "${srv[@]}" --bin "$bin" --out "$WORK" </dev/null &
       CHILD=$!
       rc=0
       wait "$CHILD" || rc=$?
@@ -186,10 +205,11 @@ if [ -f "$WORK/results.jsonl" ]; then cp "$WORK/results.jsonl" "$OUT/results.jso
   secs=$(for k in "${!SECS[@]}"; do printf '"%s": %s,' "$k" "${SECS[$k]}"; done)
   "$PYTHON" - "$OUT/env.json" "$LABEL" "$CAND_COMMIT" "{${secs%,}}" "$(vm_size)" \
     "${BIN[v1_2_2]}" "${BIN[candidate]}" "${BIN[redis]}" "$FAILURES" "$EXPECTED" "$ENGINES" \
-    "${SCALE:-1}" "${FULL:-0}" "$ONLY" "$CAND_ALLOC" <<'EOF'
-import json, sys, os, platform, subprocess, hashlib, datetime
+    "${SCALE:-1}" "${FULL:-0}" "$ONLY" "$CAND_ALLOC" "${FULLBIN[v1_2_2]}" "${FULLBIN[candidate]:-}" \
+    "${SKIPPED[*]:-}" <<'EOF'
+import json, sys, os, platform, subprocess, hashlib, datetime, re
 (out, label, commit, secs, vm, b122, bcand, bredis, failures, expected, engines,
- scale, full, only, alloc) = sys.argv[1:16]
+ scale, full, only, alloc, b122full, bcandfull, skipped) = sys.argv[1:19]
 def sha(p):
     h = hashlib.sha256()
     with open(os.path.realpath(p), "rb") as f:
@@ -201,6 +221,17 @@ def ver(p):
         return subprocess.run([p, "--version"], capture_output=True, text=True, timeout=10).stdout.strip().splitlines()[0]
     except Exception as e:
         return "?"
+def rustc(p):
+    # The compiler named in the binary's .comment section ("rustc version
+    # 1.100.0 (...)"). Two builds of the same code by two Rust releases
+    # differed by 10-30 % on script and PUBLISH rows (#900): compare.py warns
+    # when the candidate's differs from v1.2.2's.
+    try:
+        with open(os.path.realpath(p), "rb") as f:
+            m = re.search(rb"rustc version ([0-9][0-9A-Za-z.\-]*)", f.read())
+        return m.group(1).decode() if m else None
+    except Exception:
+        return None
 cpu = "?"
 try:
     cpu = next(l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name"))
@@ -229,8 +260,10 @@ env = {
     "scale": scale, "full": full, "only": only, "engines_selected": engines.split(","),
     "failures": [l.strip() for l in open(failures) if l.strip()],
     "expected": [json.loads(l) for l in open(expected) if l.strip()],
-    "engines": {k: {"path": p, "sha256": sha(p), "version": ver(p)}
-                for k, p in (("v1_2_2", b122), ("candidate", bcand), ("redis", bredis))},
+    "engines": {k: {"path": p, "sha256": sha(p), "version": ver(p), "rustc": rustc(p) if k != "redis" else None}
+                for k, p in (("v1_2_2", b122), ("candidate", bcand), ("redis", bredis),
+                             ("v1_2_2_full", b122full), ("candidate_full", bcandfull)) if p},
+    "skipped_configs": skipped.split(),
 }
 env["run_failed"] = bool(env["failures"])
 json.dump(env, open(out, "w"), indent=1)

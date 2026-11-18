@@ -40,6 +40,8 @@ and why.
 | `23-pubsub-pattern-fanout` | #851 | socket.io's Redis adapter: 48 `redis-benchmark` connections `PUBLISH` 200-byte messages to `socket.io#/#room<n>#`, 16 subscribers `PSUBSCRIBE socket.io#/#*` (`pattern`) or `SUBSCRIBE` one channel (`channel`, the plain fan-out guard): messages delivered a second until every subscriber has all of them, messages lost (exactly 0), and the p99 of a probe's own messages from publish to receipt |
 | `24-snapshot-size` | #879 | `SAVE` of #879's dataset (`DEBUG POPULATE 6000000 k 150`) and of a collections mix (200,000 hashes of 10 fields, 50,000 each of sets, sorted sets and lists of 20), each twice: `-default` (the candidate as it starts, `rdbcompression no`) and `-yes` (the suite sets `CONFIG SET rdbcompression yes` on the candidate): the snapshot's size, the `SAVE` time (median of 3 after a warm-up) and the time a new server takes to load it (best of 2). Gates: `-yes` keeps 60 % of the size gain over v1.2.2 and #879's dataset within 1.5x of Redis's `dump.rdb`; `-default` within 1 % of v1.2.2's size; the save at most 2.5x v1.2.2's time, the load 1.5x |
 
+| `25-centrifuge-scripts-publish` | #900 | centrifuge v0.40.1's history scripts, whose 2-3 keys carry no hash tag (each runs alone, on the script-runner thread): `EVALSHA` of `broker_history_list.lua` and `broker_history_add_list.lua` from 16 connections (`scripts`, the `lua,tls` builds); `PUBLISH` to 1,000 channels nobody subscribes to, beside 4 idle subscribers, from 1 connection and from 8, pipeline 16 (`publish`): calls a second counted by the server. Gates: 10 % and at most 1.05x worse than v1.2.2 in the same session |
+
 ## Running it
 
 Linux only (it reads `/proc/<pid>/status`, and io_uring needs a kernel and a
@@ -47,14 +49,28 @@ sandbox that allow it: not Docker's default seccomp profile). Run it on a VM,
 not on a laptop, and nothing else on the machine.
 
 ```sh
+rustup update stable    # the Rust release v1.2.2's binaries were built by, or later: see below
 cargo build --release
+cargo build --release --features lua,tls --target-dir target-full
 benchmarks/1.3.0/regressions/run-all.sh --candidate target/release/kividb \
+    --candidate-full target-full/release/kividb \
     --candidate-commit "$(git rev-parse --short HEAD)" --label master-$(git rev-parse --short HEAD)-d4s_v5
 ```
+
+**Build the candidate with the Rust release the reference was built by.**
+The release workflow builds with the stable Rust of the day (v1.2.2: rustc
+1.100.0, on Amazon Linux 2023). A VM image's older toolchain is not that: on
+2026-11-18 the same master tree built by rustc 1.99.1 ran centrifuge's script
+rows 10-13 % and its one-connection `PUBLISH` row 4-7 % slower than built by
+1.100.0, and v1.2.2 built by 1.99.1 was as slow; an earlier comparison of the
+two read that as a regression of master (#900). `env.json` records the rustc
+of every KiviDB binary (from its `.comment` section) and `summary.md` warns
+when the candidate's differs from v1.2.2's.
 
 | option | |
 |---|---|
 | `--candidate <path\|tag>` | a kividb binary, or a release tag such as `v1.3.0` (its default-build tarball, SHA-256 checked) |
+| `--candidate-full <path\|tag>` | the candidate built with `--features lua,tls` (or a tag: its `full` tarball), for the configurations that need scripts (`Config(lua=True)`: `25-centrifuge-scripts-publish/scripts`); they run v1.2.2's `full` build against it. Without it they are skipped, listed in `summary.md`, and not expected |
 | `--label NAME` | results go to `results/NAME/` (default `run-<UTC time>`) |
 | `--only 01,04` | only these suites (number or full name); an entry that names no suite is an error |
 | `--engines v1_2_2,candidate` | only these engines; gates that need a missing engine are reported as skipped |
@@ -375,10 +391,12 @@ if __name__ == "__main__":
 - Make the data deterministic, warm up, take the median of 3 where a run is
   cheap, and keep each server run under `SUITE_TIMEOUT`.
 - Wrap dataset sizes in `scaled()` so `SCALE=0.01` can smoke-test the suite.
-- Suites that need Lua use the `full` build: the v1.2.2 one is fetched to
-  `$REGRESS_CACHE/releases/v1.2.2/full/kividb` (extend `run-all.sh`'s engine
-  table with a `v1_2_2_full`/`candidate_full` pair when the first such suite
-  lands).
+- A configuration that needs Lua says `Config(..., lua=True)`: `run-all.sh`
+  then starts v1.2.2's `full` build (fetched to
+  `$REGRESS_CACHE/releases/v1.2.2/full/kividb`, SHA-256 checked) and the
+  `--candidate-full` binary under the usual engine names `v1_2_2` and
+  `candidate`, and skips the configuration when `--candidate-full` is not
+  given. `env.json` lists both binaries as `v1_2_2_full` and `candidate_full`.
 - Smoke it (`SCALE=0.01 run-all.sh --only 05 ...`), then run it for real with
   `--only 05 --record`, and twice more without `--record` to see the noise;
   widen a tolerance only for noise you measured.

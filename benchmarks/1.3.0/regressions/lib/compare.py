@@ -327,6 +327,22 @@ def host_warnings(hf):
     return []
 
 
+def toolchain_warnings(env):
+    """A candidate built by another Rust release than v1.2.2 was: the same code
+    built by rustc 1.99.1 ran script and PUBLISH rows 10-30 % slower than built
+    by 1.100.0 (#900), which a gate against v1.2.2 reads as a regression (or a
+    gain). Shown, not gated: build the candidate with the release's Rust."""
+    engines = env.get("engines", {}) if env else {}
+    out = []
+    for ref, cand in (("v1_2_2", "candidate"), ("v1_2_2_full", "candidate_full")):
+        a = (engines.get(ref) or {}).get("rustc")
+        b = (engines.get(cand) or {}).get("rustc")
+        if a and b and a != b:
+            out.append("WARN: %s was built by rustc %s and %s by rustc %s: speed rows against v1.2.2 compare "
+                       "compilers as well as code (build the candidate with rustc %s)" % (cand, b, ref, a, a))
+    return out
+
+
 def recorded_cpus(baseline):
     return sorted({m["recorded"]["cpu"] for m in baseline.get("metrics", {}).values()
                    if m.get("recorded", {}).get("cpu")})
@@ -381,7 +397,7 @@ def validity_problems(env, baseline, results, smoke, allow_vm_change):
 
 def write_summary(outdir, rows, not_run, env, label, problems, smoke, hf=None, baseline=None):
     hf = hf or {"global": None, "groups": {}, "counts": {}, "n": 0}
-    warns = host_warnings(hf)
+    warns = host_warnings(hf) + toolchain_warnings(env)
     rec_cpus = recorded_cpus(baseline or {})
     fails = [r for r in rows if r["status"] == "FAIL"]
     verdict = "INVALID" if problems else "SMOKE" if smoke else "REGRESSED" if fails else "ok"
@@ -417,10 +433,13 @@ def write_summary(outdir, rows, not_run, env, label, problems, smoke, hf=None, b
             L.append("- calibration (indicative only): %s ms for a fixed sha256 loop, %s cores" % (
                 env["calib_ms"], env.get("nproc", "?")))
         L.append("- Client: Python %s, redis-py %s" % (env.get("python", "?"), env.get("redis_py", "?")))
-        for e in ENG:
+        for e in ENG + ("v1_2_2_full", "candidate_full"):
             d = env.get("engines", {}).get(e)
             if d:
-                L.append("- %s: `%s`, sha256 `%s`" % (e, d.get("version", "?"), d.get("sha256", "?")))
+                L.append("- %s: `%s`, sha256 `%s`%s" % (e, d.get("version", "?"), d.get("sha256", "?"),
+                                                       ", rustc %s" % d["rustc"] if d.get("rustc") else ""))
+        if env.get("skipped_configs"):
+            L.append("- skipped (need --candidate-full): %s" % ", ".join(env["skipped_configs"]))
         if env.get("candidate_commit"):
             L.append("- candidate commit: `%s`" % env["candidate_commit"])
         if env.get("date"):
