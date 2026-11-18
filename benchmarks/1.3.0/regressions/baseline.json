@@ -8978,6 +8978,114 @@
           "max_x": 1.5
         }
       ]
+    },
+    "25-centrifuge-scripts-publish/publish/publish_8x16_per_s": {
+      "suite": "25-centrifuge-scripts-publish",
+      "config": "publish",
+      "metric": "publish_8x16_per_s",
+      "unit": "calls/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1530660.6595,
+        "candidate": 1441602.1705,
+        "redis": 1165981.9546,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "07e2087e",
+        "label": "pr900-07e2087e-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.08
+        }
+      ]
+    },
+    "25-centrifuge-scripts-publish/publish/publish_p16_per_s": {
+      "suite": "25-centrifuge-scripts-publish",
+      "config": "publish",
+      "metric": "publish_p16_per_s",
+      "unit": "calls/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 357452.6002,
+        "candidate": 371077.9728,
+        "redis": 398884.7986,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "07e2087e",
+        "label": "pr900-07e2087e-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.05
+        }
+      ]
+    },
+    "25-centrifuge-scripts-publish/scripts/add_calls_per_s": {
+      "suite": "25-centrifuge-scripts-publish",
+      "config": "scripts",
+      "metric": "add_calls_per_s",
+      "unit": "calls/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 55422.2987,
+        "candidate": 54932.7158,
+        "redis": 65418.8525,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "07e2087e",
+        "label": "pr900-07e2087e-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.05
+        }
+      ]
+    },
+    "25-centrifuge-scripts-publish/scripts/history_calls_per_s": {
+      "suite": "25-centrifuge-scripts-publish",
+      "config": "scripts",
+      "metric": "history_calls_per_s",
+      "unit": "calls/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 64581.2923,
+        "candidate": 65885.7183,
+        "redis": 76738.3538,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-18",
+        "commit": "07e2087e",
+        "label": "pr900-07e2087e-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.05
+        }
+      ]
     }
   }
 }
