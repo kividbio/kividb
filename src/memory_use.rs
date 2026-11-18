@@ -432,6 +432,25 @@ mod tests {
     fn what_a_thread_leaves_out_comes_off_its_own_share() {
         let _alone = WHOLE_PROCESS.lock();
         const HELD: usize = 1 << 20;
+        // A process gives its first threads counters of their own, and a
+        // test binary that has run many tests (each on a thread of its own,
+        // most starting more) has none left to give: say so, and run this
+        // in a process of its own instead.
+        const CHILD: &str = "KIVIDB_MEMORY_USE_TEST_CHILD";
+        if counted_by_this_thread().is_none() && std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "memory_use::tests::what_a_thread_leaves_out_comes_off_its_own_share",
+                    "--exact",
+                    "--test-threads",
+                    "1",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed in a process of its own");
+            return;
+        }
         let before = counted_by_this_thread().expect("a counter of its own");
         not_counted_add(HELD);
         let after = counted_by_this_thread().unwrap();
