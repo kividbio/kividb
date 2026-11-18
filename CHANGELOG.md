@@ -686,7 +686,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     it move). Large sets are within 1 % of before, and `GET`/`SET` unchanged.
   - Snapshots, the AOF, replication, `DUMP`/`RESTORE` and `MIGRATE` still
     write members and scores, so their formats do not change: 1.2.2 reads
-    what this release writes and the other way round, and `DEBUG DIGEST`
+    what this release writes and the other way round, and `DEBUG DIGEST-VALUE`
     does not depend on the form. `MEMORY USAGE`, eviction and lazy freeing
     count a block as the one allocation it is. A large sorted set keeps its
     table and tree behind one more pointer, so its handle in every key is

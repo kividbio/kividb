@@ -878,7 +878,25 @@ fn replica_full_sync_and_stream() {
         check_form(&mut r, form.key, form, "stream");
         assert_eq!(r.digest(form.key), m.digest(form.key), "{}", form.key);
     }
-    assert_eq!(r.cmd(&["DEBUG", "DIGEST"]), m.cmd(&["DEBUG", "DIGEST"]));
+    // And every key, each by its digest.
+    let keys = |c: &mut Conn| {
+        let mut all: Vec<Vec<u8>> = c
+            .cmd(&["KEYS", "*"])
+            .items()
+            .iter()
+            .map(Resp::bulk)
+            .collect();
+        all.sort();
+        all
+    };
+    let all = keys(&mut m);
+    assert_eq!(keys(&mut r), all);
+    for key in &all {
+        let digest = |c: &mut Conn| c.raw(&[b"DEBUG", b"DIGEST-VALUE", key]);
+        let want = digest(&mut m);
+        assert!(matches!(&want, Resp::Array(d) if d.len() == 1), "{want:?}");
+        assert_eq!(digest(&mut r), want);
+    }
 }
 
 /// Clients blocked on a packed set are served in the order they blocked,

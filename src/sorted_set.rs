@@ -720,14 +720,12 @@ impl SortedSetInner {
     /// table and the tree if not, built in one go either way.
     pub fn loader(count: usize) -> Loader {
         if count > packed_entries() {
-            Loader::Large(SortedSetInner {
-                repr: Repr::Large(Box::default()),
-            })
+            Loader(Building::Large(Box::default()))
         } else {
-            Loader::Packed {
+            Loader(Building::Packed {
                 bytes: Vec::new(),
                 entries: Vec::with_capacity(count),
-            }
+            })
         }
     }
 
@@ -744,59 +742,63 @@ impl SortedSetInner {
 }
 
 /// See [`SortedSetInner::loader`].
-pub enum Loader {
+pub struct Loader(Building);
+
+enum Building {
     /// The members so far, end to end in `bytes`; for each, where it ends
     /// and its score.
     Packed {
         bytes: Vec<u8>,
         entries: Vec<(u32, f64)>,
     },
-    Large(SortedSetInner),
+    /// The table and the tree, filled as the members come (a large load is
+    /// as fast as it was before blocks).
+    Large(Box<Large>),
 }
 
 impl Loader {
     pub fn push(&mut self, member: &[u8], score: f64) {
         // -0 + 0 is 0; any other score is itself.
         let score = score + 0.0;
-        match self {
-            Loader::Packed { bytes, entries } => {
+        match &mut self.0 {
+            Building::Packed { bytes, entries } => {
                 // A member given twice counts once, so the count is known
                 // only at the end: past twice the limit, it is past it.
                 if member.len() > packed_value() || entries.len() >= 2 * packed_entries() {
                     // Past what a block holds: the large form, with those
                     // given so far, then this one.
-                    let mut set = Self::large_of(bytes, entries);
-                    set.large_mut().insert(Arc::from(member), score);
-                    *self = Loader::Large(set);
+                    let mut large = Self::large_of(bytes, entries);
+                    large.insert(Arc::from(member), score);
+                    self.0 = Building::Large(large);
                 } else {
                     bytes.extend_from_slice(member);
                     entries.push((bytes.len() as u32, score));
                 }
             }
-            Loader::Large(set) => {
-                set.large_mut().insert(Arc::from(member), score);
+            Building::Large(large) => {
+                large.insert(Arc::from(member), score);
             }
         }
     }
 
     /// The large form of the members given so far, in the order given.
-    fn large_of(bytes: &[u8], entries: &[(u32, f64)]) -> SortedSetInner {
-        let mut set = SortedSetInner {
-            repr: Repr::Large(Box::default()),
-        };
+    fn large_of(bytes: &[u8], entries: &[(u32, f64)]) -> Box<Large> {
+        let mut large = Box::<Large>::default();
         let mut from = 0;
         for &(end, score) in entries {
             let end = end as usize;
-            set.large_mut().insert(Arc::from(&bytes[from..end]), score);
+            large.insert(Arc::from(&bytes[from..end]), score);
             from = end;
         }
-        set
+        large
     }
 
     pub fn finish(self) -> SortedSetInner {
-        match self {
-            Loader::Large(set) => set,
-            Loader::Packed { bytes, entries } => {
+        match self.0 {
+            Building::Large(large) => SortedSetInner {
+                repr: Repr::Large(large),
+            },
+            Building::Packed { bytes, entries } => {
                 let mut pairs: Vec<(&[u8], f64)> = Vec::with_capacity(entries.len());
                 let mut from = 0;
                 for &(end, score) in &entries {
@@ -839,7 +841,9 @@ impl Loader {
                     pairs = kept;
                 }
                 if pairs.len() > packed_entries() {
-                    return Self::large_of(&bytes, &entries);
+                    return SortedSetInner {
+                        repr: Repr::Large(Self::large_of(&bytes, &entries)),
+                    };
                 }
                 SortedSetInner {
                     repr: Repr::Packed(PackedZset::from_sorted(&pairs)),
