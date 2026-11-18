@@ -878,8 +878,10 @@ const _: () = assert!(
     "the table's slots bunch up: change the hash"
 );
 
-/// How `name`'s keys are found.
-#[inline]
+/// How `name`'s keys are found. Always inline: called on its own, from the
+/// command path's look for tags (`regular_key_positions`), it cost a GET 57
+/// instructions, nearly what `key_positions` around it costs (#889).
+#[inline(always)]
 fn shape(name: &[u8]) -> Shape {
     let len = name.len();
     if len == 0 || len > LONGEST {
@@ -1002,6 +1004,46 @@ pub fn key_positions(name: &str, cmd: &[&[u8]]) -> Keys {
             }
         }
     }
+}
+
+/// The keys of `cmd` as `(first, last, step)`: every `step`-th argument from
+/// `first` to `last`, none when `first > last`. That is where most commands
+/// name their keys, and this finds them without building a [`Keys`]: for
+/// the command path, where every command from a client asks (the tags'
+/// locks, `tag_locks`, #889). `None` for a command whose keys are found
+/// another way (a count of keys, an option, a subcommand): ask
+/// [`key_positions`]. Where it answers, it answers as `key_positions` does
+/// (`tests::regular_positions_are_key_positions`). Always inline: called on
+/// its own it costs what `key_positions` does.
+#[inline(always)]
+pub fn regular_key_positions(name: &str, cmd: &[&[u8]]) -> Option<(usize, usize, usize)> {
+    const NO_KEYS: Option<(usize, usize, usize)> = Some((1, 0, 1));
+    let len = cmd.len();
+    if len < 2 {
+        return NO_KEYS;
+    }
+    match shape(name.as_bytes()) {
+        Shape::NoKeys => NO_KEYS,
+        Shape::First => Some((1, 1, 1)),
+        Shape::SourceAndDestination if len >= 3 => Some((1, 2, 1)),
+        Shape::SourceAndDestination => NO_KEYS,
+        Shape::All => Some((1, len - 1, 1)),
+        Shape::Pairs => Some((1, len - 1, 2)),
+        Shape::Triples => Some((1, len - 1, 3)),
+        Shape::AllButLast if len >= 3 => Some((1, len - 2, 1)),
+        Shape::AllButLast => NO_KEYS,
+        Shape::AfterOperation => Some((2, len - 1, 1)),
+        _ => None,
+    }
+}
+
+/// Every name in [`COMMANDS`], for the tests here and in `tag_locks`.
+#[cfg(test)]
+pub(crate) fn table_names() -> Vec<&'static str> {
+    COMMANDS
+        .iter()
+        .flat_map(|(names, _)| names.iter().copied())
+        .collect()
 }
 
 #[cfg(test)]
@@ -1591,6 +1633,68 @@ mod tests {
                 .map(|i| cmd[i as usize])
                 .collect();
             assert_eq!(keys(&cmd), expected, "{cmd:?}");
+        }
+    }
+
+    /// The command path's look for keys (`regular_key_positions`, #889)
+    /// finds what `key_positions` finds, for every command of the table,
+    /// a few without keys, and argument lists of every length up to 12 made
+    /// of words its parsers look for; and it answers for the commonest
+    /// shapes.
+    #[test]
+    fn regular_positions_are_key_positions() {
+        let mut names = table_names();
+        names.extend(["PING", "MULTI", "EXEC", "EVALSHA", "FCALL", "X", ""]);
+        let words: &[&[u8]] = &[
+            b"a", b"", b"0", b"1", b"2", b"3", b"-1", b"STREAMS", b"STORE", b"KEYS", b"HELP",
+            b"SET", b"USAGE", b"$", b"{t}:k",
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |below: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % below as u64) as usize
+        };
+        let mut answered = 0usize;
+        for name in &names {
+            for len in 0..=12 {
+                for _ in 0..30 {
+                    let mut cmd: Vec<&[u8]> = (0..len).map(|_| words[next(words.len())]).collect();
+                    if let Some(first) = cmd.first_mut() {
+                        *first = name.as_bytes();
+                    }
+                    let Some((first, last, step)) = regular_key_positions(name, &cmd) else {
+                        continue;
+                    };
+                    answered += 1;
+                    let regular: Vec<usize> = (first..=last).step_by(step).collect();
+                    let general: Vec<usize> = key_positions(name, &cmd).iter().collect();
+                    assert_eq!(regular, general, "{name} {cmd:?}");
+                }
+            }
+        }
+        assert!(answered > 50_000, "{answered}");
+        for name in [
+            "GET",
+            "SET",
+            "INCR",
+            "HGET",
+            "MGET",
+            "DEL",
+            "MSET",
+            "RENAME",
+            "BLPOP",
+            "BITOP",
+            "JSON.MSET",
+            "BF.ADD",
+            "PING",
+            "MULTI",
+        ] {
+            assert!(
+                regular_key_positions(name, &[name.as_bytes(), b"k", b"v", b"w"]).is_some(),
+                "{name}"
+            );
         }
     }
 }

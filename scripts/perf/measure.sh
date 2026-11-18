@@ -16,6 +16,12 @@
 # not depend on the default): GET and SET with 100 B and 1 KB values,
 # pipelined (-P 16) and not (-P 1); and pipelined INCR, HGET, LPUSH, LPOP and
 # a 16-key MGET. Labels end in -no / -yes.
+# WORKLOADS=tags runs what the hash-tag locks of a build with Lua cost a
+# command (#889; `tag_locks`, on with lua-parallel-scripts): GET and SET of
+# keys without a tag and of keys with one ({t}:<n>), a 10-key MGET, a
+# one-key EVALSHA on a tagged key, and MULTI + 2 SET + EXEC (per
+# transaction: N transactions of four commands). Run it on a build with
+# FEATURES=lua,tls and on the default one (where EVALSHA is refused).
 # CMP=plain preloads plaincmp.c's memcmp and bcmp into the server: counts
 # that do not move with where the stack and the string literals happen to
 # lie (see plaincmp.c). Compare two trees with the same CMP.
@@ -52,9 +58,20 @@ one() { # tag, label, redis-benchmark args...
   else
     redis-benchmark -p $PORT -q -c 1 -P $P -r 10000 -n 20000 -d "$DSIZE" -t set > /dev/null 2>&1
   fi
-  redis-benchmark -p $PORT -q -c 1 -P $P -r 10000 -n 2000 "$@" > /dev/null 2>&1
-  callgrind_control -i on > /dev/null 2>&1
-  redis-benchmark -p $PORT -q -c 1 -P $P -r 10000 -n "$N" "$@" > /dev/null 2>&1
+  # SETUP: a command sent once before the warm-up (redis-cli's arguments).
+  # shellcheck disable=SC2086
+  [ -n "${SETUP:-}" ] && redis-cli -p $PORT $SETUP > /dev/null 2>&1
+  if [ -n "${PIPEFILE:-}" ]; then
+    # What redis-benchmark cannot send (a transaction): $PIPEFILE-warm,
+    # then $PIPEFILE with N of them, in RESP, through `redis-cli --pipe`.
+    redis-cli -p $PORT --pipe < "$PIPEFILE-warm" > /dev/null 2>&1
+    callgrind_control -i on > /dev/null 2>&1
+    redis-cli -p $PORT --pipe < "$PIPEFILE" > /dev/null 2>&1
+  else
+    redis-benchmark -p $PORT -q -c 1 -P $P -r 10000 -n 2000 "$@" > /dev/null 2>&1
+    callgrind_control -i on > /dev/null 2>&1
+    redis-benchmark -p $PORT -q -c 1 -P $P -r 10000 -n "$N" "$@" > /dev/null 2>&1
+  fi
   callgrind_control -i off > /dev/null 2>&1
   callgrind_control -d > /dev/null 2>&1
   redis-cli -p $PORT shutdown nosave > /dev/null 2>&1
@@ -81,6 +98,38 @@ one() { # tag, label, redis-benchmark args...
 V100=$(printf 'x%.0s' $(seq 100))
 LRU="--maxmemory 64gb --maxmemory-policy allkeys-lru"
 LFU="--maxmemory 64gb --maxmemory-policy allkeys-lfu"
+if [ "${WORKLOADS:-}" = tags ]; then
+  # No space in the script: SETUP is split into redis-cli's arguments.
+  SCRIPT="return(redis.call('GET',KEYS[1]))"
+  SHA=$(printf '%s' "$SCRIPT" | sha1sum | cut -c1-40)
+  # MULTI, SET, SET, EXEC on keys key:<n> with 100 B values, in RESP.
+  txns() {
+    awk -v n="$1" -v v="$V100" 'BEGIN {
+      srand(1)
+      for (i = 0; i < n; i++) {
+        printf "*1\r\n$5\r\nMULTI\r\n"
+        for (j = 0; j < 2; j++)
+          printf "*3\r\n$3\r\nSET\r\n$16\r\nkey:%012d\r\n$100\r\n%s\r\n", int(rand() * 10000), v
+        printf "*1\r\n$4\r\nEXEC\r\n"
+      }
+    }'
+  }
+  txns 2000 > /tmp/multi-warm
+  txns "$N" > /tmp/multi
+  K="key:__rand_int__"
+  for tag in "$@"; do
+    DSIZE=100; one "$tag" GET-100 -d 100 -t get
+    DSIZE=100; one "$tag" SET-100 -d 100 -t set
+    PRELOAD="SET {t}:__rand_int__ $V100" DSIZE=100 one "$tag" GET-TAG GET "{t}:__rand_int__"
+    DSIZE=100 one "$tag" SET-TAG SET "{t}:__rand_int__" "$V100"
+    DSIZE=100 one "$tag" MGET10 MGET $K $K $K $K $K $K $K $K $K $K
+    PRELOAD="SET {t}:__rand_int__ $V100" SETUP="SCRIPT LOAD $SCRIPT" DSIZE=100 \
+      one "$tag" EVALSHA-TAG EVALSHA "$SHA" 1 "{t}:__rand_int__"
+    PIPEFILE=/tmp/multi DSIZE=100 one "$tag" MULTI-2SET
+  done | tee /out/raw.txt
+  echo done
+  exit 0
+fi
 if [ "${WORKLOADS:-}" = access ]; then
   for tag in "$@"; do
     for mode in no yes; do
