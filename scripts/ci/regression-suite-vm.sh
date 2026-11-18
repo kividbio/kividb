@@ -4,7 +4,9 @@
 # runs the regression suite on it. Not for a laptop.
 #
 # Expects in $HOME: cand.tar (the candidate's source tree) and harness.tar (the
-# suite's directory, e.g. benchmarks/1.3.0/regressions/, with its path).
+# suite's directory, e.g. benchmarks/1.3.0/regressions/, with its path, and
+# the harnesses suites run next to it: benchmarks/1.3.0/vector-sets,
+# benchmarks/redisvl-compat).
 # Settings (environment): SUITE_DIR (path of the suite in harness.tar), LABEL,
 # CAND_COMMIT, ONLY (comma list, optional), FULL (1 for the long configurations),
 # MIN_CPUS_ONLY (1: only the suites that declare min_cpus, `run-all.sh

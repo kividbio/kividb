@@ -290,7 +290,14 @@ jobs:
         run: |
           set -euo pipefail
           git -C cand -c core.autocrlf=false archive --format=tar HEAD > cand.tar
-          tar -C harness -cf harness.tar "$DIR"
+          # The suite and the harnesses next to it that suites run:
+          # 09-vector-sets runs <suite>/../vector-sets/bench.py, 10-redisvl
+          # runs benchmarks/redisvl-compat (without them both fail, INVALID).
+          extra=()
+          for d in "$(dirname "$DIR")/vector-sets" benchmarks/redisvl-compat; do
+            [[ -d "harness/$d" ]] && extra+=("$d")
+          done
+          tar -C harness -cf harness.tar "$DIR" "${extra[@]}"
           scp -i "$SSH_KEY_PATH" $SSH_OPTS cand.tar harness.tar \
             harness/scripts/ci/regression-suite-vm.sh ubuntu@"$HOST":/home/ubuntu/
 
