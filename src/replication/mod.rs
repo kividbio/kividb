@@ -2869,7 +2869,14 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     }
                     tokio::select! {
                     msg = hub_rx.recv(), if !pace => match msg {
-                        Some(m) => m,
+                        // Woken by a write: the next empty look sleeps too,
+                        // or writes that come one at a time would each wake
+                        // it. With a replica attached `paced` is cleared
+                        // above before it is looked at.
+                        Some(m) => {
+                            paced = true;
+                            m
+                        }
                         None => break,
                     },
                     () = tokio::time::sleep(BACKLOG_PACE), if pace => continue,
