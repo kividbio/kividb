@@ -10,6 +10,8 @@ sliding log, four commands, cost 32.7 microseconds of server CPU a call on
 master against 13.8 on Redis 8.10.2 (#901). These rows keep what the #901
 work gained.
 
+One KiviDB worker (--threads 1): the cost of one call, without the
+script-runner hand-off that two workers add for untagged scripts (#880).
 Workloads, each by redis-benchmark (--threads 2, 32 connections, one
 command at a time), EVALSHA of a script loaded first:
 
@@ -32,9 +34,12 @@ addStandardJob need Node and the bullmq package; they were measured for #901
 by scratch harnesses and are in docs/PERFORMANCE.md, not here.
 
 Gates: CPU per call within 10 % of the recorded value, and at most the
-given fraction of v1.2.2's measured in the same session; calls a second
-10 % (no v1.2.2 gate: with --threads 2 the untagged rows are bound by the
-one script that runs at a time, not by its cost alone). Redis is shown.
+given fraction of v1.2.2's measured in the same session (VS_V1_2_2: Tyk's
+script cost 0.86x v1.2.2's on one worker for #901, `return 1` 0.97x and
+the lock 1.0x); calls a second 10 %. Redis is shown, not gated: on one
+worker #901 left Tyk at 0.97x Redis's CPU per call, `return 1` at 1.18x.
+With two workers the CPU a call costs is mostly the workers and the
+script-runner waiting for each other, which is why this runs one.
 """
 import os
 import subprocess
@@ -46,7 +51,7 @@ from suite import (Suite, Config, THROUGHPUT, rel, vs_v1_2_2, median)  # noqa: E
 from nodes import redis_tool  # noqa: E402
 
 S = Suite("30-script-call-cost", [
-    Config("scripts", threads=2, lua=True),
+    Config("scripts", threads=1, lua=True),
 ])
 ROUNDS = 3
 WARMUP_S = 2.0
@@ -152,7 +157,7 @@ WORKLOADS = [
 ]
 
 # At most this many times v1.2.2's CPU per call (measured in the same session).
-VS_V1_2_2 = {"tyk": 0.85, "lock": 0.85, "return1": 0.85}
+VS_V1_2_2 = {"tyk": 0.93, "lock": 1.03, "return1": 1.03}
 
 
 @S.run
