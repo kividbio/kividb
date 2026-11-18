@@ -28,7 +28,13 @@ thread_local! {
 pub fn allocates(name: &str) -> bool {
     matches!(
         name,
-        "BF.ADD" | "BF.INSERT" | "BF.LOADCHUNK" | "BF.MADD" | "BF.RESERVE"
+        "BF.ADD"
+            | "BF.INSERT"
+            | "BF.LOADCHUNK"
+            | "BF.MADD"
+            | "BF.RESERVE"
+            | "TDIGEST.CREATE"
+            | "TDIGEST.MERGE"
     )
 }
 

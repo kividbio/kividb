@@ -13,12 +13,15 @@
 //! even when it fails, as Redis's do. No keyspace events, as in Redis.
 //!
 //! Beyond Redis: a compression of at most `sketch::tdigest::MAX_COMPRESSION`,
-//! and a per-command limit on the work of a query of many values and of a
-//! merge, checked before it starts.
+//! and a per-command limit on the work of a query of many values
+//! ([`BUDGET`]) and of a merge ([`MERGE_BUDGET`]), checked before it starts.
+//! Under `maxmemory`, a client's `TDIGEST.CREATE` or `TDIGEST.MERGE` that
+//! would allocate more than is left evicts first, under the policy, before
+//! it takes its keys (`sketch::room`), and is refused with `OOM` only if
+//! that is not enough.
 
 use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use crate::commands::bf::{parse_double, parse_ll};
 use crate::commands::ctx::Ctx;
@@ -39,9 +42,14 @@ const OOM: &str = "OOM command not allowed when used memory > 'maxmemory'.";
 const OVER_BUDGET: &str =
     "ERR T-Digest: command reached the per-command limit; send fewer values per command";
 
-/// What one query of many values, or one merge, may cost at most (values
-/// times centroids, or centroids read), checked before it starts.
-pub const BUDGET: u64 = 20_000_000;
+/// What one query of many values may cost at most (values times
+/// centroids), checked before it starts: some 15 ms of work (11,000
+/// quantiles of a digest of compression 100).
+pub const BUDGET: u64 = 4_000_000;
+
+/// The most centroids one merge may read: one digest of the largest
+/// compression, full, some 30 ms of work (or a thousand of compression 100).
+pub const MERGE_BUDGET: u64 = 600_010;
 
 fn too_large() -> Vec<u8> {
     resp_error(&format!(
@@ -87,18 +95,12 @@ fn double(resp: u8, v: f64) -> Vec<u8> {
     resp_double_for(resp, v)
 }
 
-fn make_room(ctx: &mut Ctx, bytes: u64) -> Result<(), Vec<u8>> {
-    let from_client = !ctx.apply_replication && !ctx.repl_state.is_slave();
-    let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed) as u64;
-    if from_client && limit != 0 && bytes != 0 && !crate::sketch::room_for(bytes) {
-        let made = limit
-            .checked_sub(bytes)
-            .is_some_and(|room| crate::eviction::make_room(ctx, room as usize, true));
-        if !made {
-            return Err(resp_error(OOM));
-        }
-    }
-    Ok(())
+/// Room under `maxmemory` for `bytes` more, for a command from a client:
+/// `OOM` if they do not fit. The room was made before the command took its
+/// keys (`sketch::room`, which also stops a command here that is only asked
+/// what it wants): nothing is evicted here.
+fn room(ctx: &Ctx, bytes: u64) -> Result<(), Vec<u8>> {
+    crate::sketch::room::check(ctx, |_| bytes).map_err(|_| resp_error(OOM))
 }
 
 /// A compression as Redis reads one.
@@ -159,38 +161,58 @@ fn digest_at(ctx: &Ctx, key: &[u8]) -> Result<Option<Arc<parking_lot::RwLock<Ske
     }
 }
 
-/// Run `f` on the digest at `key`, for reading.
-fn with_digest<T>(ctx: &Ctx, key: &[u8], f: impl FnOnce(&TDigest) -> T) -> Result<T, Vec<u8>> {
-    match digest_at(ctx, key) {
-        Ok(Some(s)) => match &*s.read() {
-            Sketch::TDigest(t) => Ok(f(t)),
-            #[allow(unreachable_patterns)]
-            _ => Err(resp_error(WRONGTYPE)),
-        },
-        Ok(None) => Err(resp_error(NO_KEY)),
-        Err(()) => Err(resp_error(WRONGTYPE)),
+/// The value at `key` if it is a sketch: `NO_KEY` if missing, `WRONGTYPE` if
+/// it is no sketch. The caller tells a sketch of another type under its own
+/// lock of it. `write`: expired first as a write expires it.
+fn sketch_at(
+    ctx: &Ctx,
+    key: &[u8],
+    write: bool,
+) -> Result<Arc<parking_lot::RwLock<Sketch>>, Vec<u8>> {
+    let gone = if write {
+        crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
+        false
+    } else {
+        crate::commands::helpers::lazy_expire_on_read(ctx.store, *ctx.selected_db, key)
+    };
+    if gone {
+        return Err(resp_error(NO_KEY));
+    }
+    let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
+    let map = read_lock!(shard);
+    match map.get(key) {
+        None => Err(resp_error(NO_KEY)),
+        Some(ValueRef::Sketch(sketch)) => Ok(Arc::clone(sketch)),
+        Some(_) => Err(resp_error(WRONGTYPE)),
     }
 }
 
-/// Run `f` on the digest at `key`, for writing.
+/// Run `f` on the digest at `key`, for reading, under one hold of it.
+fn with_digest<T>(ctx: &Ctx, key: &[u8], f: impl FnOnce(&TDigest) -> T) -> Result<T, Vec<u8>> {
+    let sketch = sketch_at(ctx, key, false)?;
+    match &*sketch.read() {
+        Sketch::TDigest(t) => Ok(f(t)),
+        #[allow(unreachable_patterns)]
+        _ => Err(resp_error(WRONGTYPE)),
+    }
+}
+
+/// Run `f` on the digest at `key`, for writing, under one hold of it.
 fn with_digest_mut<T>(
     ctx: &Ctx,
     key: &[u8],
     f: impl FnOnce(&mut TDigest) -> T,
 ) -> Result<T, Vec<u8>> {
-    crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
-    match digest_at(ctx, key) {
-        Ok(Some(s)) => match &mut *s.write() {
-            Sketch::TDigest(t) => Ok(f(t)),
-            #[allow(unreachable_patterns)]
-            _ => Err(resp_error(WRONGTYPE)),
-        },
-        Ok(None) => Err(resp_error(NO_KEY)),
-        Err(()) => Err(resp_error(WRONGTYPE)),
+    let sketch = sketch_at(ctx, key, true)?;
+    match &mut *sketch.write() {
+        Sketch::TDigest(t) => Ok(f(t)),
+        #[allow(unreachable_patterns)]
+        _ => Err(resp_error(WRONGTYPE)),
     }
 }
 
 fn insert(ctx: &Ctx, key: &[u8], t: TDigest) {
+    debug_assert!(!crate::sketch::room::asking());
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let mut map = write_lock!(shard);
     map.insert(
@@ -227,7 +249,7 @@ fn create(ctx: &mut Ctx) -> Vec<u8> {
             Err(e) => return e,
         };
     }
-    if let Err(e) = make_room(ctx, capacity_of(c) as u64 * 16) {
+    if let Err(e) = room(ctx, capacity_of(c) as u64 * 16) {
         return e;
     }
     insert(ctx, key, TDigest::new(c));
@@ -262,25 +284,21 @@ fn add(ctx: &mut Ctx) -> Vec<u8> {
     }
     TOUCHED.set(true);
     let key = ctx.cmd[1];
-    match digest_at(ctx, key) {
-        Ok(Some(_)) => {}
-        Ok(None) => return resp_error(NO_KEY),
-        Err(()) => return resp_error(WRONGTYPE),
-    }
-    let mut values = Vec::with_capacity(ctx.cmd.len() - 2);
-    for raw in &ctx.cmd[2..] {
-        match value(raw) {
-            Ok(v) => values.push(v),
-            Err(e) => return e,
-        }
-    }
+    let values = &ctx.cmd[2..];
+    // The one hold of the digest: its type, then the values, read before
+    // any is added.
     match with_digest_mut(ctx, key, |t| {
-        for v in values {
+        let mut read = Vec::with_capacity(values.len());
+        for raw in values {
+            read.push(value(raw)?);
+        }
+        for v in read {
             t.add(v, 1.0);
         }
+        Ok(())
     }) {
-        Ok(()) => resp_simple("OK"),
-        Err(e) => e,
+        Ok(Ok(())) => resp_simple("OK"),
+        Ok(Err(e)) | Err(e) => e,
     }
 }
 
@@ -353,7 +371,7 @@ fn merge(ctx: &mut Ctx) -> Vec<u8> {
                     _ => return resp_error(WRONGTYPE),
                 };
                 work = work.saturating_add((copy.merged.len() + copy.unmerged.len()) as u64);
-                if !ctx.apply_replication && work > BUDGET {
+                if !ctx.apply_replication && work > MERGE_BUDGET {
                     return resp_error(OVER_BUDGET);
                 }
                 sources.push(copy);
@@ -398,7 +416,7 @@ fn merge(ctx: &mut Ctx) -> Vec<u8> {
     {
         t = TDigest::new(k.compression);
     }
-    if let Err(e) = make_room(ctx, t.capacity() as u64 * 16) {
+    if let Err(e) = room(ctx, t.capacity() as u64 * 16) {
         return e;
     }
     if let Some(k) = &kept {

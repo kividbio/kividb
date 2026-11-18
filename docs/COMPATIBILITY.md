@@ -272,7 +272,8 @@ other files:
   A query never changes a digest, so `TDIGEST.INFO`'s node counts can differ.
   Their `DUMP` payloads are KiviDB's own (Redis's are refused). A compression
   of at most 100,000; queries of many values and merges have a per-command
-  limit. See [COMMANDS.md](../COMMANDS.md).
+  limit. `TDIGEST.MERGE` needs read permission on its sources and write
+  permission on its destination. See [COMMANDS.md](../COMMANDS.md).
 - Set and sorted-set members can't have their own TTLs. A Dragonfly file
   with a `SADDEX` set, or a KeyDB file or stream with `EXPIREMEMBER` on a set
   or sorted-set member, is refused, naming the key. Hash field TTLs from

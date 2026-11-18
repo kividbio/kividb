@@ -833,10 +833,18 @@ answers are Redis's. `TYPE` is `TDIS-TYPE`; the ACL category is `@tdigest`.
 - A compression below 5 sizes centroids as 5 does.
 - Size limit: a compression of at most 100,000 (`ERR T-Digest: compression
   parameter is too large (at most 100000)`); Redis takes more.
-- Per-command limit: a query of many values, or a merge, may cost at most
-  20,000,000 steps (values times centroids, or centroids read), checked
-  before it starts: `ERR T-Digest: command reached the per-command limit;
-  send fewer values per command`. Replication and the AOF are not held to it.
+- Per-command limits, so that no command takes more than some tens of
+  milliseconds: a query of many values may cost at most 4,000,000 steps
+  (values times centroids: some 11,000 quantiles of a digest of compression
+  100), and a merge may read at most 600,010 centroids (one full digest of
+  the largest compression, or a thousand of compression 100), checked before
+  it starts: `ERR T-Digest: command reached the per-command limit; send fewer
+  values per command`. Replication and the AOF are not held to them.
+- `TDIGEST.MERGE` needs read permission on its sources and write permission
+  on its destination; Redis lets read permission on the destination do.
+- Under `maxmemory`, a client's `TDIGEST.CREATE` or `TDIGEST.MERGE` that would
+  allocate more than is left evicts first under the policy, before it takes
+  its keys, and is refused with `OOM ...` only if that is not enough.
 - `DUMP`, `RESTORE` and `MIGRATE` use KiviDB's own payload: Redis's payloads
   and RDB values of t-digests are refused, and Redis cannot restore KiviDB's.
 - `COPY` copies a digest; Redis refuses it.

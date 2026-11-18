@@ -4466,7 +4466,6 @@ pub fn is_write_command(name: &str) -> bool {
                 | "XREADGROUP"
                 | "ZDIFFSTORE"
         ),
-        11 if crate::sketch::is_write(&name.as_bytes()[..11]) => true,
         11 => matches!(
             name,
             "FT.ALIASADD"
@@ -4478,6 +4477,7 @@ pub fn is_write_command(name: &str) -> bool {
                 | "JSON.TOGGLE"
                 | "SINTERSTORE"
                 | "SUNIONSTORE"
+                | "TDIGEST.ADD"
                 | "XIDMPRECORD"
                 | "ZINTERSTORE"
                 | "ZRANGESTORE"
@@ -4487,9 +4487,10 @@ pub fn is_write_command(name: &str) -> bool {
             name,
             "BF.LOADCHUNK" | "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
         ),
-        13 if crate::sketch::is_write(&name.as_bytes()[..13]) => true,
-        13 => matches!(name, "TS.CREATERULE" | "TS.DELETERULE"),
-        14 if crate::sketch::is_write(&name.as_bytes()[..14]) => true,
+        13 => matches!(
+            name,
+            "TDIGEST.MERGE" | "TDIGEST.RESET" | "TS.CREATERULE" | "TS.DELETERULE"
+        ),
         14 => matches!(
             name,
             "FT.ALIASUPDATE"
@@ -4499,6 +4500,7 @@ pub fn is_write_command(name: &str) -> bool {
                 | "JSON.NUMINCRBY"
                 | "JSON.NUMMULTBY"
                 | "JSON.STRAPPEND"
+                | "TDIGEST.CREATE"
                 | "ZREMRANGEBYLEX"
         ),
         15 => name == "ZREMRANGEBYRANK",
