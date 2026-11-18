@@ -1086,7 +1086,9 @@ where
                 // its way up while `carried` still holds the same bytes.
                 std::mem::swap(&mut buffer, &mut carried);
                 read_start = carried_from;
-                carried.clear();
+                // The buffer's own allocation is not kept in `carried`
+                // either: what the next wait reads grows its own.
+                carried = Vec::new();
                 carried_from = 0;
                 unpresented = (buffer.len() - read_start).saturating_sub(temp.len());
             } else {
@@ -1487,7 +1489,7 @@ where
                         let limit = HardLimit::new(
                             pubsub.limits(),
                             subscriptions.is_some(),
-                            combined.len() + carried.len() - carried_from,
+                            combined.len() + carried.len() - carried_from + unpresented,
                             client_id,
                         );
                         // Boxed, and so polled out of line: the wait is cold, and the
@@ -1593,7 +1595,7 @@ where
                     let limit = HardLimit::new(
                         pubsub.limits(),
                         subscriptions.is_some(),
-                        combined.len() + carried.len() - carried_from,
+                        combined.len() + carried.len() - carried_from + unpresented,
                         client_id,
                     );
                     // Boxed, and so polled out of line: the wait is cold, and the
@@ -3137,16 +3139,29 @@ where
             quit_requested = true;
         }
 
+        // A request that crosses `presented_end` completes past it — as one
+        // a read ends within did — so the turn can have run into the
+        // un-offered tail: no more of it is left than is unconsumed.
+        unpresented = unpresented.min(buffer.len() - parse_offset);
         read_start = parse_offset;
 
+        if read_start == buffer.len() {
+            buffer.clear();
+            read_start = 0;
+            // A buffer that grew to hold one large request — or a read-ahead's
+            // vector handed to it — is given back at the end of the batch that
+            // finished it, rather than kept at that size for the life of the
+            // connection.
+            if buffer.capacity() > BIG_BUFFER {
+                buffer = Vec::with_capacity(4 * 1024);
+                query_buffer_peak = 0;
+            }
         // Only compact when we've consumed a meaningful chunk AND there's
         // data left to preserve. This amortizes the memmove cost.
-        if read_start > 0 && read_start > buffer.len() / 2 {
+        } else if read_start > 0 && read_start > buffer.len() / 2 {
             buffer.drain(0..read_start);
             read_start = 0;
         }
-        // A buffer that grew to hold one large request is not kept at that
-        // size for the life of the connection.
         query_buffer.update(
             buffer.len().saturating_sub(read_start) + carried.len() - carried_from,
             buffer.capacity().saturating_sub(buffer.len()),
@@ -3205,7 +3220,7 @@ where
                         let limit = HardLimit::new(
                             pubsub.limits(),
                             subscriptions.is_some(),
-                            waiting + carried.len() - carried_from,
+                            waiting + carried.len() - carried_from + unpresented,
                             client_id,
                         );
                         read_while_writing(
@@ -3228,7 +3243,7 @@ where
                 let limit = HardLimit::new(
                     pubsub.limits(),
                     subscriptions.is_some(),
-                    waiting + carried.len() - carried_from,
+                    waiting + carried.len() - carried_from + unpresented,
                     client_id,
                 );
                 let write = std::pin::pin!(write_tcp_batch(&writer, &mut combined));

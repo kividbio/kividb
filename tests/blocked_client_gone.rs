@@ -1415,6 +1415,142 @@ fn what_was_read_ahead_is_held_in_the_one_allocation() {
     }
 }
 
+/// What the read-ahead's vector becomes while it replays is given back when
+/// the replay ends: it is the client's query buffer until then, and a
+/// connection that runs small commands afterwards is not left holding a
+/// large one. (Kept, a thousand released clients that had each sent a
+/// megabyte showed hundreds of megabytes of `used_memory` after.)
+#[test]
+fn the_buffer_a_read_ahead_became_is_given_back() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        let name = format!("give-back-{io}");
+        let mut c = blocked_client(&server, &mut ctl, &name, &["BLPOP", "hold", "0"]);
+        let before = info_field(&mut ctl, "memory", "used_memory");
+
+        // About 860KB behind the `BLPOP`, all small requests — none marks
+        // the buffer as its own — then released twice: the read-ahead's
+        // vector becomes the query buffer on tokio and the replay runs it
+        // to its end. (On io_uring a parked client is not read; what was
+        // sent replays out of the socket the same way.)
+        let mut queued = request(&["BLPOP", "hold2", "0"]);
+        queued.extend_from_slice(&request(&["PING"]).repeat(57 * 1024));
+        c.writer.write_all(&queued).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(ctl.cmd(&["RPUSH", "hold", "v"]), V::Int(1));
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            listed(&mut ctl, &name),
+            "{io}: the second BLPOP never parked"
+        );
+        assert_eq!(ctl.cmd(&["RPUSH", "hold2", "v"]), V::Int(1));
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            listed(&mut ctl, &name),
+            "{io}: the client did not run its read-ahead out"
+        );
+
+        // Nothing of the requests is left but what has not been answered:
+        // the query buffer the read-ahead became is small again. Kept, it
+        // showed about a megabyte more.
+        let held = info_field(&mut ctl, "memory", "used_memory") - before;
+        assert!(
+            held < 500_000,
+            "{io}: the drained read-ahead's allocation stayed as the query buffer: {held}"
+        );
+        drop(c);
+    }
+}
+
+/// A request that crosses what one read offered completes past it — as one
+/// a read ends within did — and what it ran past is then run: nothing of
+/// the offered tail is left still un-offered. (Counted as still held, the
+/// tail the one request ran through was offered against the next read too:
+/// a parked client that sent one big request and was released closed on
+/// the turn after its request ran, its offered end wrapped — a panic on a
+/// debug build, which is what CI runs.)
+#[test]
+fn a_request_that_ran_past_the_offer_is_not_still_held() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        let name = format!("past-{io}");
+        let mut c = blocked_client(&server, &mut ctl, &name, &["BLPOP", "hold", "0"]);
+
+        // One big request behind the `BLPOP`: read ahead whole on tokio and
+        // handed to the buffer once released, where the one request starts
+        // inside the first offered part and runs the whole tail through.
+        c.writer
+            .write_all(&request(&["SET", "big", &"x".repeat(600 * 1024)]))
+            .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(ctl.cmd(&["RPUSH", "hold", "v"]), V::Int(1));
+
+        // The blocked reply, then the request's, then one it is still there
+        // to answer: the connection is not lost to its own replay.
+        assert_eq!(c.read(), V::Arr(vec![s("hold"), s("v")]));
+        assert_eq!(c.read(), s("OK"));
+        assert_eq!(c.cmd(&["PING"]), s("PONG"));
+        drop(c);
+    }
+}
+
+/// While a read-ahead is still being offered a turn at a time, a reply that
+/// must wait is written as any other is: the client is read meanwhile, or
+/// its sends block against the replies it is not reading. (On io_uring the
+/// write matched neither arm once the read-ahead was handed over —
+/// `carried` empty, the tail not yet offered — and a client sending
+/// against its stalled replies hung for as long as they did.)
+#[test]
+fn a_client_sends_while_its_replay_waits_to_be_written() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        // A value big enough that its `GET` cannot be written at once.
+        assert_eq!(
+            ctl.cmd(&["SET", "v", &"x".repeat(8 * 1024 * 1024)]),
+            s("OK")
+        );
+        let name = format!("replay-write-{io}");
+        let mut c = server.conn();
+        assert_eq!(c.cmd(&["CLIENT", "SETNAME", &name]), s("OK"));
+
+        // `GET v` stalls the write. Behind it, enough small requests to
+        // fill the early read and reach `carried`, then another `GET v`
+        // and a tail of more: handed over on release, the second `GET v`'s
+        // reply stalls while the tail is still to be offered.
+        c.send(&["GET", "v"]);
+        let mut queued = request(&["GET", "k"]).repeat(12 * 1024);
+        queued.extend_from_slice(&request(&["GET", "v"]));
+        queued.extend_from_slice(&request(&["GET", "k"]).repeat(20 * 1024));
+        c.writer.write_all(&queued).unwrap();
+        thread::sleep(Duration::from_millis(400));
+        // Reading the stalled reply lets the write out and the replay in.
+        assert_eq!(c.read(), V::Str("x".repeat(8 * 1024 * 1024)));
+        thread::sleep(Duration::from_millis(400));
+
+        // The client sends on, never reading: what it sends must keep being
+        // read. Hung against the stalled write instead, its send stops once
+        // the sockets' room is spent.
+        let mut writer = c.writer.try_clone().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let chunk = request(&["PING"]).repeat(8 * 1024);
+            let mut sent = 0usize;
+            while sent < 12 * 1024 * 1024 && writer.write_all(&chunk).is_ok() {
+                sent += chunk.len();
+            }
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(15)).is_ok(),
+            "{io}: the client's sends hung behind its stalled replies"
+        );
+        drop(c);
+    }
+}
+
 /// What has already run is not held against a client that waits: a request
 /// that completed in the same read the blocking command arrived in leaves
 /// nothing to count, so the client stays — counted for what it still

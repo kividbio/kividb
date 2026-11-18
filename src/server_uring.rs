@@ -1223,7 +1223,9 @@ pub async fn handle_client(
                 // bytes.
                 std::mem::swap(&mut parse_buf, &mut carried);
                 parse_start = carried_from;
-                carried.clear();
+                // The buffer's own allocation is not kept in `carried`
+                // either: what the next wait reads grows its own.
+                carried = Vec::new();
                 carried_from = 0;
                 let remaining = parse_buf.len() - parse_start;
                 unpresented = remaining.saturating_sub(READ_BUFFER);
@@ -1661,7 +1663,7 @@ pub async fn handle_client(
                         let limit = crate::server::HardLimit::new(
                             pubsub.limits(),
                             subscriptions.is_some(),
-                            out_buf.len() + carried.len() - carried_from,
+                            out_buf.len() + carried.len() - carried_from + unpresented,
                             client_id,
                         );
                         // Boxed, and so polled out of line: the wait is cold, and the
@@ -1764,7 +1766,7 @@ pub async fn handle_client(
                     let limit = crate::server::HardLimit::new(
                         pubsub.limits(),
                         subscriptions.is_some(),
-                        out_buf.len() + carried.len() - carried_from,
+                        out_buf.len() + carried.len() - carried_from + unpresented,
                         client_id,
                     );
                     // Boxed, and so polled out of line: the wait is cold, and the
@@ -3266,6 +3268,10 @@ pub async fn handle_client(
             quit_requested = true;
         }
 
+        // A request that crosses `presented_end` completes past it — as one
+        // a read ends within did — so the turn can have run into the
+        // un-offered tail: no more of it is left than is unconsumed.
+        unpresented = unpresented.min(parse_buf.len() - parse_offset);
         parse_start = parse_offset;
         if parse_start == parse_buf.len() {
             parse_buf.clear();
@@ -3405,12 +3411,15 @@ pub async fn handle_client(
                 // Read ahead still to run, from a write that waited: the client
                 // is read while this one is written too. Not when this turn
                 // hands the connection on, whose bytes are the replication
-                // link's.
-                None if !carried.is_empty() && connection_handoff.is_none() => {
+                // link's. The read ahead is `carried`'s or, already handed to
+                // `parse_buf`, the tail not yet offered.
+                None if (!carried.is_empty() || unpresented > 0)
+                    && connection_handoff.is_none() =>
+                {
                     let limit = crate::server::HardLimit::new(
                         pubsub.limits(),
                         subscriptions.is_some(),
-                        waiting + carried.len() - carried_from,
+                        waiting + carried.len() - carried_from + unpresented,
                         client_id,
                     );
                     let write = std::pin::pin!(stream.write_all(spare_buf));
@@ -3432,7 +3441,7 @@ pub async fn handle_client(
                     let limit = crate::server::HardLimit::new(
                         pubsub.limits(),
                         subscriptions.is_some(),
-                        waiting + carried.len() - carried_from,
+                        waiting + carried.len() - carried_from + unpresented,
                         client_id,
                     );
                     let write = std::pin::pin!(stream.write_all(spare_buf));
