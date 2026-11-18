@@ -915,6 +915,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   while the read-ahead still holds it. The io_uring loop holds the same
   bound.
 
+- **What a waiting client read ahead is replayed out of the allocation it
+  was read into.** The read-ahead was moved a read's worth a turn into the
+  query buffer, which reserved and doubled its way up while the
+  read-ahead's own allocation still held the same bytes — a client kept
+  about twice what it held, and at a thousand waiting clients holding a
+  megabyte each the difference was hundreds of megabytes of RSS. When the
+  buffer has nothing left to run, the read-ahead's vector is now handed to
+  it whole and offered on a read's worth a turn, so one allocation carries
+  the bytes. The io_uring loop does the same.
+
 - **`CLIENT NO-TOUCH` now keeps the client's reads from counting as a
   use of the keys they find (#566).** The command was accepted and
   answered `OK`, but the flag was never kept: a `NO-TOUCH` client's `GET`
