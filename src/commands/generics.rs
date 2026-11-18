@@ -62,7 +62,10 @@ pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
         ValueRef::Set(set) => set.read().encoding().name(),
         ValueRef::SortedSet(zset) => {
             let zset = zset.read();
-            if zset.members.len() <= 128 && zset.members.keys().all(|member| member.len() <= SMALL)
+            if zset.len() <= 128
+                && zset
+                    .iter_unordered()
+                    .all(|(member, _)| member.len() <= SMALL)
             {
                 "listpack"
             } else {
@@ -1534,7 +1537,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(ValueRef::List(l)) => l.read().iter().map(|e| e.to_shared()).collect(),
                 Some(ValueRef::Set(s)) => s.read().iter().map(|m| m.to_shared()).collect(),
                 Some(ValueRef::SortedSet(z)) => {
-                    z.read().by_score.keys().map(|(_, m)| m.clone()).collect()
+                    z.read().iter().map(|(m, _)| m.to_shared()).collect()
                 }
                 Some(_) => {
                     return Some(resp_error(

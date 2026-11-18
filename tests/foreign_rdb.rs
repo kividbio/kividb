@@ -330,8 +330,8 @@ fn rdb_files_saved_by_valkey_9_0_and_9_1_load_whole() {
         match &db["zset:big"] {
             KiviDBValue::SortedSet(z) => {
                 let z = z.read();
-                assert_eq!(z.members.len(), 300, "Valkey {label}");
-                assert_eq!(z.members.get(&b"z0123"[..]).copied(), Some(184.5));
+                assert_eq!(z.len(), 300, "Valkey {label}");
+                assert_eq!(z.score(b"z0123"), Some(184.5));
             }
             _ => panic!("Valkey {label}: zset:big is not a sorted set"),
         }
