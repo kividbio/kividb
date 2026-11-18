@@ -571,7 +571,7 @@ fn tracking_invalidations_beside_pattern_messages() {
             Resp::Simple("OK".into())
         );
         assert_eq!(other.cmd(&["PUBLISH", "t:1", "hi"]).int(), 1);
-        let mut got = vec![c.read(), c.read()];
+        let mut got = [c.read(), c.read()];
         got.sort_by_key(|m| m.items()[0].text());
         assert_eq!(got[0].items()[0].text(), "invalidate", "{io_model:?}");
         assert_eq!(
