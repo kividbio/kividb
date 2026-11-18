@@ -4114,6 +4114,92 @@ fn mixed_writes_reach_replicas_as_they_took_effect_on_io_uring() {
     mixed_writes_reach_replicas_as_they_took_effect("uring");
 }
 
+/// Every key, with its type, value digest and expiry time.
+fn every_key(c: &mut Conn) -> Vec<(String, V, V, V)> {
+    let mut keys: Vec<String> = c
+        .cmd(&["KEYS", "*"])
+        .arr()
+        .iter()
+        .map(|k| k.s().to_string())
+        .collect();
+    keys.sort();
+    keys.into_iter()
+        .map(|k| {
+            let t = c.cmd(&["TYPE", &k]);
+            let d = c.cmd(&["DEBUG", "DIGEST-VALUE", &k]);
+            let e = c.cmd(&["PEXPIRETIME", &k]);
+            (k, t, d, e)
+        })
+        .collect()
+}
+
+/// A master with the AOF on that keeps its backlog (restarted from its own
+/// data) under the mixed load of every worker, killed once its writers have
+/// stopped and the AOF has been flushed: it comes back holding exactly what
+/// it held, and the counters at the increments answered (#894: the writes
+/// for the stream and the AOF's records are made at one place).
+fn an_aof_master_keeping_its_backlog_reloads_what_it_held(model: &str) {
+    let mut master = Server::start(&["--io-model", model, "--aof"]);
+    write_batch(&mut master.conn(), 0, 20);
+    master.shutdown();
+    master.restart();
+    assert_eq!(
+        master.conn().info("replication", "repl_backlog_active"),
+        "1"
+    );
+    let scripts = !matches!(master.conn().cmd(&["EVAL", "return 1", "0"]), V::Err(_));
+    let mut acked = vec![0u64; MIXED_COUNTERS];
+    for round in 0..rounds(2) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let writers: Vec<_> = (0..6u64)
+            .map(|w| {
+                mixed_writer(
+                    master.port,
+                    ((round as u64) << 8) | w,
+                    scripts,
+                    Arc::clone(&stop),
+                )
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(800));
+        stop.store(true, Ordering::Relaxed);
+        for w in writers {
+            for (total, n) in acked.iter_mut().zip(w.join().unwrap()) {
+                *total += n;
+            }
+        }
+        let before = every_key(&mut master.conn());
+        assert!(before.len() > 50, "{}", before.len());
+        // appendfsync everysec: a second and a half for the last of it.
+        std::thread::sleep(Duration::from_millis(1500));
+        master.kill();
+        master.restart();
+        let mut m = master.conn();
+        assert!(
+            before == every_key(&mut m),
+            "round {round}: the reload differs"
+        );
+        for (n, count) in acked.iter().enumerate() {
+            let held = match m.cmd(&["GET", &format!("cnt:{n}")]) {
+                V::Nil => 0,
+                v => v.s().parse::<u64>().unwrap(),
+            };
+            assert_eq!(held, *count, "round {round}: cnt:{n}");
+        }
+    }
+}
+
+#[test]
+fn an_aof_master_keeping_its_backlog_reloads_what_it_held_on_tokio() {
+    an_aof_master_keeping_its_backlog_reloads_what_it_held("tokio");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_aof_master_keeping_its_backlog_reloads_what_it_held_on_io_uring() {
+    an_aof_master_keeping_its_backlog_reloads_what_it_held("uring");
+}
+
 /// Every key of databases 0 and 1 with what `DEBUG DIGEST-VALUE` and
 /// `PEXPIRETIME` say of it.
 #[cfg(feature = "lua")]
