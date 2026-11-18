@@ -3720,19 +3720,19 @@ unsafe fn run_and_push(state: *mut mlua::ffi::lua_State) -> bool {
         ));
         return false;
     }
-    // A string is used where Lua has it; a number is written out.
-    enum Arg {
-        Lua(*const u8, usize),
-        Written(usize),
-    }
+    // A string is used where Lua has it; a number is written out, into
+    // `written`, and used where it was written: the bytes of each stay where
+    // they are as `written` grows (#901: one list of arguments, not two).
     let mut written: Vec<Vec<u8>> = Vec::new();
-    let mut args: Vec<Arg> = Vec::with_capacity(count as usize);
+    let mut cmd: Vec<&[u8]> = Vec::with_capacity(count as usize);
     for index in 1..=count {
         let bytes = match unsafe { ffi::lua_type(state, index) } {
             ffi::LUA_TSTRING => {
                 let mut len = 0usize;
                 let ptr = unsafe { ffi::lua_tolstring(state, index, &mut len) };
-                args.push(Arg::Lua(ptr.cast(), len));
+                // SAFETY: Lua keeps a string that is on its stack, and these
+                // stay on it until this function returns.
+                cmd.push(unsafe { std::slice::from_raw_parts(ptr.cast(), len) });
                 continue;
             }
             ffi::LUA_TNUMBER => {
@@ -3758,18 +3758,11 @@ unsafe fn run_and_push(state: *mut mlua::ffi::lua_State) -> bool {
                 return false;
             }
         };
+        // SAFETY: the bytes are on the heap, held by `written`, which keeps
+        // them, unchanged and in place, until this function returns.
+        cmd.push(unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) });
         written.push(bytes);
-        args.push(Arg::Written(written.len() - 1));
     }
-    let cmd: Vec<&[u8]> = args
-        .iter()
-        .map(|arg| match arg {
-            // SAFETY: Lua keeps a string that is on its stack, and these
-            // stay on it until this function returns.
-            Arg::Lua(ptr, len) => unsafe { std::slice::from_raw_parts(*ptr, *len) },
-            Arg::Written(at) => written[*at].as_slice(),
-        })
-        .collect();
 
     let ctx = unsafe { &mut *(addr as *mut Ctx<'_>) };
     let reply = execute_command_from_script(ctx, cmd, read_only);
@@ -4049,9 +4042,9 @@ fn eval(ctx: &mut Ctx, use_sha: bool, read_only: bool) -> Vec<u8> {
     // The arguments where they are, not copies: they are copied once, into
     // the Lua strings the script sees. (What they point at is the caller's
     // and outlives the script; `ctx.cmd` itself is swapped by each
-    // `redis.call`, which is why these are taken out of it first.)
-    let keys: Vec<&[u8]> = ctx.cmd[3..3 + numkeys].to_vec();
-    let argv: Vec<&[u8]> = ctx.cmd[3 + numkeys..].to_vec();
+    // `redis.call`, which is why these are taken out of it first.) One
+    // list, the keys first.
+    let args: Vec<&[u8]> = ctx.cmd[3..].to_vec();
 
     let ctx_ptr: *mut Ctx = ctx;
 
@@ -4059,7 +4052,7 @@ fn eval(ctx: &mut Ctx, use_sha: bool, read_only: bool) -> Vec<u8> {
     let client_id = ctx.client_id;
     count_script_commands(registry, client_id, || {
         match try_with_lua(Vm::Eval, |lua| {
-            eval_script(lua, ctx_ptr, &source, keys, argv, read_only)
+            eval_script(lua, ctx_ptr, &source, &args, numkeys, read_only)
         }) {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => script_error_to_resp(&e, &sha1_hex(&source)),
@@ -4698,11 +4691,12 @@ fn eval_script(
     lua: &Lua,
     ctx_ptr: *mut Ctx,
     source: &Arc<str>,
-    keys: Vec<&[u8]>,
-    argv: Vec<&[u8]>,
+    args: &[&[u8]],
+    numkeys: usize,
     read_only: bool,
 ) -> Result<Vec<u8>, String> {
     let ctx = unsafe { &mut *ctx_ptr };
+    let (keys, argv) = args.split_at(numkeys);
     let saved_db = *ctx.selected_db;
 
     let had_shebang = source.starts_with("#!");
@@ -4742,7 +4736,7 @@ fn eval_script(
         crate::replication::PropagationGroup::begin(ctx.repl_state, ctx.hub_tx, ctx.aof_tx);
 
     install_redis_eval_handlers(lua)?;
-    set_global_keys_argv(lua, &keys, &argv)?;
+    set_global_keys_argv(lua, keys, argv)?;
 
     install_eval_timeout_hook(lua)?;
     let _hook_guard = LuaHookGuard(lua);
