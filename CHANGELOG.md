@@ -672,6 +672,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   first names one, so a VM and a script that do not use them cost nothing. A number
   one returns that has an integer value is an integer, so `'n=' ..
   table.maxn(t)` is `n=3`. See [SCRIPTS.md](docs/SCRIPTS.md).
+
+- **`string.format` in scripts is the patched `str_format` itself, with
+  no per-call scan (#771).** The 5.1-compatible integer conversions of
+  #747 came from a Rust wrapper that read the whole format string on
+  every call to decide whether Lua's own `string.format` could take it:
+  a script holding twenty `format` calls ran about 6% slower under
+  `EVALSHA`. `string.format` is now a copy of Lua 5.4.7's `str_format`
+  patched where 5.1 differed — integer conversions take any number and
+  convert it through explicit double-to-integer steps that give
+  x86-64's answers on every architecture (a real cast of a double out
+  of range is undefined behaviour), every conversion accepts the flag
+  set 5.1's did and a sixth flag character is the error 5.1 raised —
+  compiled by `build.rs` against the headers of the same vendored Lua
+  the library builds with. A call costs what a C function call costs,
+  and an error now names the argument at fault, which the wrapper
+  could not always do.
+
 - **`CLUSTER SLOTS`, `SHARDS` and `NODES` refuse on a standalone, as in
   Redis (#899).** They answered with empty tables, so a client that asks
   a standalone for its slots — rueidis, the Go client behind Centrifugo
