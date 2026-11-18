@@ -282,23 +282,32 @@ of the limiter's own time after each check) beside 100 connections of pipelined 
 `EXPIRE` pairs at a fixed rate; the server on vCPUs 0 and 2 (one hyper-thread of two
 cores, `--threads 2`, io_uring), the checks on 4-5 and the load on 6-7; the server started
 from a snapshot of 100,000 keys, so that it keeps a replication backlog with no replica.
-Checks a second and their p99:
+Checks a second and their p99, on master:
 
-| background | off | auto | with #919, off | with #919, auto | Redis 8.10.2 |
-|---|---|---|---|---|---|
-| 0 | 31.6k, 0.16 ms | 31.7k, 0.10 ms | 31.3k, 0.14 ms | 31.5k, 0.12 ms | 31.6k, 0.12 ms |
-| 100,000 | 30.1k, 0.68 ms | 31.4k, 0.26 ms | 31.8k, 0.11 ms | 31.8k, 0.10 ms | 32.0k, 0.05 ms |
-| 150,000 | 25.2k, 3.9 ms | 30.9k, 2.7 ms | 31.4k, 0.50 ms | 31.7k, 0.14 ms | 32.0k, 0.06 ms |
-| 200,000 | 21.5k, 5.2 ms | 28.9k, 3.5 ms | 31.1k, 1.8 ms | 31.6k, 0.17 ms | 31.9k, 0.10 ms |
-| 300,000 | 23.7k, 6.9 ms | 24.2k, 8.3 ms | 30.9k, 0.27 ms | 30.9k, 0.26 ms | 22.6k, 1.4 ms |
+| background | off | auto | Redis 8.10.2 |
+|---|---|---|---|
+| 0 | 31.6k, 0.16 ms | 31.7k, 0.10 ms | 31.6k, 0.12 ms |
+| 100,000 | 30.1k, 0.68 ms | 31.4k, 0.26 ms | 32.0k, 0.05 ms |
+| 150,000 | 25.2k, 3.9 ms | 30.9k, 2.7 ms | 32.0k, 0.06 ms |
+| 200,000 | 21.5k, 5.2 ms | 28.9k, 3.5 ms | 31.9k, 0.10 ms |
+| 300,000 | 23.7k, 6.9 ms | 24.2k, 8.3 ms | 22.6k, 1.4 ms |
 
-Bound alone, the workers keep their CPUs but the replication thread still takes every
-write (the first two columns); with the change of #919, which lets the writes for a backlog
-with no replica wake that thread once a millisecond instead of each time, `auto` keeps the
-p99 at 0.10-0.26 ms at every rate (`off` reaches 1.8 ms at 200,000 in one run of three).
-Redis, on one core, is saturated at 300,000. On the tokio I/O model `auto` binds nothing:
-its workers take each other's connections (31.5-32.0k at 0.06-0.16 ms at every rate, both
-settings, without #919).
+On its own `auto` helps up to 200,000 a second but does not fix the rate limiter's p99:
+the replication thread still wakes for every write and takes turns with the workers on
+their CPUs, and at 300,000 `auto` is worse than `off` (8.3 against 6.9 ms). Redis, on one
+core, is saturated at 300,000. On the tokio I/O model `auto` binds nothing: its workers take
+each other's connections (31.5-32.0k at 0.06-0.16 ms at every rate, both settings).
+
+What fixes the p99 is [#919](https://github.com/kividbio/kividb/pull/919) (a backlog with no
+replica wakes that thread once a millisecond, not for each write): with it, measured on its
+branch, `off` gives 31.8k / 0.11, 31.4k / 0.50, 31.1k / 1.8 and 30.9k / 0.27 ms at 100,000 to
+300,000, and `auto` 31.8k / 0.10, 31.7k / 0.14, 31.6k / 0.17 and 30.9k / 0.26 ms; `auto` then
+differs from `off` only at 150,000-200,000.
+
+**`SAVE` holds writes a little longer.** 948,000 keys of 100 B, the server on vCPUs 0 and 2
+(`--threads 2`), a `SET` every millisecond from another connection: `SAVE` took 0.77-0.88 s
+with `off` and 0.72-0.82 s with `auto`, and the longest `SET` during it was 22.5-22.8 ms
+with `off` and 25.7-29.2 ms with `auto` (three runs each).
 
 **Throughput is unchanged.** An empty server, `redis-benchmark -c 50 -r 100000 -d 100` on
 vCPUs 4-7, `SET` / `GET` a second, off and auto:
@@ -314,7 +323,8 @@ threads and 50 connections each on 4-7, `SET`:`GET` 1:1, 100 B: 311k ops/s at a 
 
 **When the server shares its CPUs, leave it off.** With `stress-ng --cpu 2` busy on the
 server's two vCPUs, a bound worker cannot move to the other CPU when its own is busy:
-unpipelined `GET` from 50 connections fell from 91k a second (off) to 61k (auto), and the
+unpipelined `GET` from 50 connections fell by a third, from 91k a second (off) to 61k
+(auto), and the
 rate limiter's p99 at rest went from 1.3 to 3.0 ms (at 100,000 background, 24.5k checks a
 second at 5.9 ms against 19.6k at 6.9 ms).
 

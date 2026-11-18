@@ -45,6 +45,7 @@ use super::{
     CLUSTER_SLOTS, ClusterState, HANDOVER_FAILOVER_GRACE, MigrationState, NodeFlags, NodeId,
     key_hash_slot, node_id_str,
 };
+use crate::cpus::BuilderExt as _;
 use crate::replication::ReplState;
 use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::Ordering;
@@ -615,10 +616,7 @@ pub(crate) fn drop_orphans(env: &Env, wanted: Option<Vec<u16>>) -> Result<u64, S
     let env = env.clone();
     let spawned = std::thread::Builder::new()
         .name("kividb-drop-orphans".into())
-        .spawn(move || {
-            crate::cpus::release_this_thread();
-            run_drop(&env, &slots, &owners)
-        });
+        .spawn_released(move || run_drop(&env, &slots, &owners));
     if let Err(e) = spawned {
         let why = format!("could not start the thread that deletes the keys: {e}");
         cluster.orphans.finish_drop("stopped", 0, 0, &why);
@@ -1084,10 +1082,7 @@ pub(crate) fn start_watching(cluster: &Arc<ClusterState>) {
     let orphans = Arc::clone(&cluster.orphans);
     let spawned = std::thread::Builder::new()
         .name("kividb-orphans".into())
-        .spawn(move || {
-            crate::cpus::release_this_thread();
-            watch(&weak, &orphans)
-        });
+        .spawn_released(move || watch(&weak, &orphans));
     if let Err(e) = spawned {
         log_error!(
             "Cluster: could not start the thread that looks for keys of slots this node does \

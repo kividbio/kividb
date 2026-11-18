@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/tls_replication.rs
 // Requires --features tls.
 //
@@ -5,7 +6,6 @@
 // node connects to others with is the process's, not a server's, so these
 // tests have a file of their own, and all of them use one CA and one
 // certificate: whichever test sets it up last, the others are served alike.
-
 #![cfg(feature = "tls")]
 
 use std::io::{Read, Write};

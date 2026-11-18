@@ -193,14 +193,17 @@ shares its CPUs with other busy processes: a bound worker cannot move to a CPU t
 while its own is busy. [PERFORMANCE.md](PERFORMANCE.md#worker-cpu-affinity) has both
 cases measured.
 
-The server says what it did, after the I/O model line:
+The server says what it did, after the I/O model line, once every worker has tried its
+bind:
 
 ```
 I/O model      : io_uring
-Worker CPUs    : each worker on a CPU of its own: worker 0 on CPU 0, worker 1 on CPU 2 (worker-cpu-affinity auto)
+Worker CPUs    : pinned 2 of 2: worker 0 on CPU 0, worker 1 on CPU 2 (worker-cpu-affinity auto)
 ```
 
-or why it did not (`not pinned: 2 workers on 4 CPUs: pinned only when they are as many`).
+or that only some binds took (`pinned 1 of 2 (worker-cpu-affinity auto); refused: ...`, naming each refused bind and
+the error), or
+why it did not bind (`not pinned: 2 workers on 4 CPUs: pinned only when they are as many`).
 The server's other threads (the replication hub, the AOF writer, expiry, the script runner,
 a full sync's or a backup's work) are not bound: they run on any of the process's CPUs,
 which with `auto` in effect are the workers' CPUs, so they take turns with the workers as
@@ -208,7 +211,12 @@ before; a thread a worker starts is given all of the process's CPUs back first. 
 I/O model is not bound (its workers take each other's connections, so none waits behind one
 that is held up). Linux only: macOS has no call that binds a thread to a CPU, and on
 FreeBSD the setting is not implemented; there it is accepted and the server says it did
-nothing. Redis's `server-cpulist` binds the server's threads to a list of CPUs together,
+nothing. The binds are made once, at startup: if the cpuset changes later, the kernel
+decides (verified on cgroup v2, Linux 7.0: a worker whose CPU is removed runs on the whole
+new set and goes back to its CPU when it returns; cgroup v1, not verified here, resets each
+thread to the new set), the startup line is not updated, and a thread started after the
+change is given the CPUs the process had at startup; a Kubernetes pod's exclusive CPUs
+under the static CPU manager do not change while its container runs. Redis's `server-cpulist` binds the server's threads to a list of CPUs together,
 not one each; KiviDB accepts it, as it accepts Redis's other settings, and does nothing
 with it.
 

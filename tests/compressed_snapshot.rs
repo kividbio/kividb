@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/compressed_snapshot.rs
 //
 // Compressed snapshots (#879). With `rdbcompression yes` (opt-in in 1.3), a

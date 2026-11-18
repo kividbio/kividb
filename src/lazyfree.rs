@@ -8,6 +8,7 @@
 //! (#19). They used to be `0` always, and everything was freed on the thread
 //! that removed it, under the shard lock.
 
+use crate::cpus::BuilderExt as _;
 use std::cell::Cell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,8 +36,7 @@ fn worker() -> &'static Sender<Job> {
         // `free_later` frees in place.
         let started = std::thread::Builder::new()
             .name("kividb-lazyfree".into())
-            .spawn(move || {
-                crate::cpus::release_this_thread();
+            .spawn_released(move || {
                 for (what, objects) in rx {
                     // For a test: frees that fall behind. Each one waits
                     // for its `failpoint.lazyfree-held.<n>` file to be

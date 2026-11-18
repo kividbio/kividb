@@ -32,6 +32,8 @@
 //! thread: with the `mimalloc` feature, Rust's allocations do not go
 //! through glibc, and a trim would give back nothing.
 
+#[cfg(all(target_os = "linux", not(feature = "mimalloc")))]
+use crate::cpus::BuilderExt as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(all(target_os = "linux", not(feature = "mimalloc")))]
 use std::time::{Duration, Instant};
@@ -101,10 +103,7 @@ pub fn start() {
         STARTED.call_once(|| {
             let started = std::thread::Builder::new()
                 .name("kividb-give-back".into())
-                .spawn(|| {
-                    crate::cpus::release_this_thread();
-                    run()
-                });
+                .spawn_released(run);
             if let Err(e) = started {
                 crate::log_warn!("could not start the thread that gives memory back: {e}");
             }

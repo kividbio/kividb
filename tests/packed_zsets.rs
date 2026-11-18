@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Small sorted sets kept in one block: every sorted-set command gives the
 // same answer whatever the form, across every change of form, and the
 // members come back the same, in order, scores bit for bit, after a save, an

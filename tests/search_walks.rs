@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/search_walks.rs
 //
 // The walks a search command makes over every document of an index — the

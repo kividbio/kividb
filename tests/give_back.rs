@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/give_back.rs
 //
 // Freed memory goes back to the system without a MEMORY PURGE once a lot of

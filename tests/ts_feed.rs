@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/ts_feed.rs
 //
 // Time series writes as the readers of the write stream see them: a live

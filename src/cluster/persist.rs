@@ -506,8 +506,7 @@ fn save_then(
         Ok(())
     } else if deferred {
         let path = path.clone();
-        std::thread::spawn(move || {
-            crate::cpus::release_this_thread();
+        crate::cpus::spawn(move || {
             let _ = sync_saved(&path);
         });
         Ok(())

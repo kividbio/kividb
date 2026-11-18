@@ -18,6 +18,7 @@
 // dialled instead. Once anything has been written, any failure is the
 // command's error, as it always was, and the connection is closed.
 
+use crate::cpus::BuilderExt as _;
 use std::io::BufReader;
 use std::time::{Duration, Instant};
 
@@ -202,8 +203,7 @@ fn sweep_in_the_background() {
     }
     let started = std::thread::Builder::new()
         .name("migrate-conns".into())
-        .spawn(|| {
-            crate::cpus::release_this_thread();
+        .spawn_released(|| {
             let mut empty_since: Option<Instant> = None;
             loop {
                 std::thread::sleep(Duration::from_secs(1));

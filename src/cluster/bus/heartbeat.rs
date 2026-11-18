@@ -16,6 +16,7 @@ use crate::cluster::ClusterState;
 use crate::cluster::bus::BusMessage;
 use crate::cluster::bus::dialer;
 use crate::cluster::node::{NodeFlags, NodeId, node_id_str};
+use crate::cpus::BuilderExt as _;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -104,8 +105,7 @@ const BUS_STALL_WARN: Duration = Duration::from_secs(10);
 pub(crate) fn spawn_bus_watchdog() {
     let spawned = std::thread::Builder::new()
         .name("kividb-bus-watch".into())
-        .spawn(|| {
-            crate::cpus::release_this_thread();
+        .spawn_released(|| {
             let mut stalled = false;
             loop {
                 std::thread::sleep(Duration::from_secs(1));
@@ -757,11 +757,7 @@ pub(crate) async fn answer_mfstart(
     // Let writes that were already in the gate finish and queue. One that is
     // past the pause check but not yet in the gate waits for the failover
     // there, and is redirected (`pause::HANDOFF`).
-    let _ = tokio::task::spawn_blocking(|| {
-        crate::cpus::release_this_thread();
-        drop(crate::write_gate::cut())
-    })
-    .await;
+    let _ = crate::cpus::spawn_blocking(|| drop(crate::write_gate::cut())).await;
     let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
     if starter
         .hub_tx

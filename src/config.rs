@@ -1184,6 +1184,10 @@ impl Config {
             if self.protected_mode { "yes" } else { "no" }
         ));
         out.push_str(&format!("threads {}\n", self.threads));
+        out.push_str(&format!(
+            "worker-cpu-affinity {}\n",
+            self.worker_cpu_affinity.name()
+        ));
         out.push_str(&format!("aof {}\n", if self.aof { "yes" } else { "no" }));
         out.push_str(&format!(
             "aof-preamble {}\n",
@@ -2678,16 +2682,17 @@ mod config_file_tests {
         assert!(
             Config {
                 port: 7002,
+                worker_cpu_affinity: crate::cpus::WorkerCpuAffinity::Auto,
                 ..config
             }
             .rewrite_to_disk()
             .is_ok()
         );
-        assert!(
-            std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("port 7002\n")
-        );
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("port 7002\n"), "{written}");
+        // CONFIG REWRITE dropped this setting once: a restart came back
+        // unpinned.
+        assert!(written.contains("worker-cpu-affinity auto\n"), "{written}");
     }
 }
 

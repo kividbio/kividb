@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/stats.rs
 //
 // INFO stats, counted. Its counters are the process's, so the one test here

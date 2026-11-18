@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! The HNSW graph on its own, without a server or a client in the way: build
 //! it from a vector-db-benchmark dataset of the "tar" kind (`vectors.npy`
 //! and `tests.jsonl`, such as dbpedia-openai-100K-1536-angular) with several

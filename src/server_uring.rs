@@ -92,12 +92,11 @@ pub async fn handle_replica_connection_uring(
     {
         Ok(()) => None,
         Err(registration) => {
-            match tokio::task::spawn_blocking({
+            match crate::cpus::spawn_blocking({
                 let store = Arc::clone(&store);
                 let repl_state = Arc::clone(&repl_state);
                 let hub_tx = hub_tx.clone();
                 move || {
-                    crate::cpus::release_this_thread();
                     crate::replication::begin_full_sync(
                         &store,
                         &index_store,

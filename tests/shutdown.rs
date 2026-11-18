@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/shutdown.rs
 use std::io::Write;
 use std::net::TcpStream;

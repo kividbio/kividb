@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/checkpoint.rs
 //
 // AOF checkpoints (`BGREWRITEAOF`, `SAVE`, `BGSAVE`) one at a time, and a

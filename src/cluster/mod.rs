@@ -41,6 +41,7 @@ pub use slot::{CLUSTER_SLOTS, crc16, key_hash_slot};
 /// changes it (see `ClusterState::note_by_hand`).
 pub const BY_HAND_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+use crate::cpus::BuilderExt as _;
 use ahash::AHashMap;
 use parking_lot::RwLock;
 use std::path::PathBuf;
@@ -713,8 +714,7 @@ impl ClusterState {
         let state = std::sync::Arc::downgrade(self);
         let spawned = std::thread::Builder::new()
             .name("kividb-nodes-conf".into())
-            .spawn(move || {
-                crate::cpus::release_this_thread();
+            .spawn_released(move || {
                 while rx.recv().is_ok() {
                     let Some(state) = state.upgrade() else {
                         return;

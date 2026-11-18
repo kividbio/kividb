@@ -77,6 +77,74 @@ impl Pinning {
     }
 }
 
+/// What the workers' attempts to bind themselves came to: each worker reports
+/// once, and the last one gets the startup line, which says what happened,
+/// not what was planned (a bind refused with EPERM or EINVAL is named).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct PinReport {
+    cpus: Vec<usize>,
+    left: std::sync::atomic::AtomicUsize,
+    failed: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl PinReport {
+    pub fn new(cpus: Vec<usize>) -> Self {
+        let left = std::sync::atomic::AtomicUsize::new(cpus.len());
+        Self {
+            cpus,
+            left,
+            failed: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The CPU worker N is to be bound to.
+    pub fn cpu(&self, worker: usize) -> usize {
+        self.cpus[worker]
+    }
+
+    /// Every CPU the workers are bound to: the process's, as the rule bound
+    /// them only when they are as many.
+    pub fn cpus(&self) -> &[usize] {
+        &self.cpus
+    }
+
+    /// Worker `worker` has tried: the startup line, once every worker has.
+    pub fn tried(&self, worker: usize, result: &std::io::Result<()>) -> Option<String> {
+        if let Err(e) = result {
+            let mut failed = self.failed.lock().unwrap_or_else(|p| p.into_inner());
+            failed.push(format!("worker {worker} on CPU {}: {e}", self.cpus[worker]));
+        }
+        if self.left.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) != 1 {
+            return None;
+        }
+        let failed = self.failed.lock().unwrap_or_else(|p| p.into_inner());
+        let n = self.cpus.len();
+        let bound = n - failed.len();
+        let mut line = if failed.is_empty() {
+            format!(
+                "pinned {n} of {n}: {} (worker-cpu-affinity auto)",
+                self.cpus
+                    .iter()
+                    .enumerate()
+                    .map(|(worker, cpu)| format!("worker {worker} on CPU {cpu}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else if bound == 0 {
+            "not pinned: the system refused every bind".to_string()
+        } else {
+            format!("pinned {bound} of {n} (worker-cpu-affinity auto)")
+        };
+        if !failed.is_empty() {
+            let mut failed = failed.clone();
+            failed.sort();
+            line.push_str(&format!("; refused: {}", failed.join(", ")));
+        }
+        Some(line)
+    }
+}
+
 /// Whether to bind the `workers` io_uring workers to CPUs, given the CPUs
 /// the process may use (`allowed`, its affinity mask, which on Linux is
 /// already cut down to its cgroup's cpuset) and the cgroup CPU quota.
@@ -201,8 +269,8 @@ pub fn pin_this_thread(cpu: usize, allowed: &[usize]) -> std::io::Result<()> {
 }
 
 /// Give the calling thread back every CPU the process may use, if a worker
-/// that started it was pinned. Called first by every helper thread and
-/// blocking task; one relaxed load when nothing is pinned.
+/// that started it was pinned. Run first by every thread the server starts
+/// (the spawn functions below); one relaxed load when nothing is pinned.
 #[inline]
 pub fn release_this_thread() {
     if !PINNED.load(std::sync::atomic::Ordering::Relaxed) || FREE.with(|free| free.get()) {
@@ -213,6 +281,116 @@ pub fn release_this_thread() {
         let _ = set_affinity(allowed);
     }
     FREE.with(|free| free.set(true));
+}
+
+/// `std::thread::available_parallelism`, for the process. std reads the
+/// calling thread's mask, and on a bound worker that is one CPU: a `SAVE`
+/// run there froze the dataset with one thread instead of one per CPU, and
+/// held writes twice as long (42 against 23 ms on two CPUs). Once a worker
+/// is bound this answers with the CPUs the process may use.
+#[allow(clippy::disallowed_methods)]
+pub fn available_parallelism() -> std::io::Result<std::num::NonZeroUsize> {
+    #[cfg(target_os = "linux")]
+    if PINNED.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(n) = ALLOWED
+            .get()
+            .and_then(|cpus| std::num::NonZeroUsize::new(cpus.len()))
+    {
+        return Ok(n);
+    }
+    std::thread::available_parallelism()
+}
+
+// ── Starting threads ──────────────────────────────────────────────────────
+//
+// Every thread the server starts goes through one of these, so that a thread
+// a pinned worker starts — a `SAVE`'s freeze threads, a cluster fan-out, a
+// full sync's dump, a script — is not held to that worker's one CPU:
+// clippy.toml's `disallowed-methods` forbids the std and tokio calls
+// anywhere else. Each runs `release_this_thread` first, then the closure.
+
+/// `std::thread::spawn`, released.
+#[allow(clippy::disallowed_methods)]
+pub fn spawn<F, T>(f: F) -> std::thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        release_this_thread();
+        f()
+    })
+}
+
+/// `std::thread::Builder::spawn`, released: `Builder::new().name(..).spawn_released(f)`.
+pub trait BuilderExt {
+    fn spawn_released<F, T>(self, f: F) -> std::io::Result<std::thread::JoinHandle<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static;
+}
+
+impl BuilderExt for std::thread::Builder {
+    #[allow(clippy::disallowed_methods)]
+    fn spawn_released<F, T>(self, f: F) -> std::io::Result<std::thread::JoinHandle<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.spawn(move || {
+            release_this_thread();
+            f()
+        })
+    }
+}
+
+/// `std::thread::Scope::spawn`, released: `scope.spawn_released(f)`.
+pub trait ScopeExt<'scope> {
+    fn spawn_released<F, T>(self, f: F) -> std::thread::ScopedJoinHandle<'scope, T>
+    where
+        F: FnOnce() -> T + Send + 'scope,
+        T: Send + 'scope;
+}
+
+impl<'scope, 'env> ScopeExt<'scope> for &'scope std::thread::Scope<'scope, 'env> {
+    #[allow(clippy::disallowed_methods)]
+    fn spawn_released<F, T>(self, f: F) -> std::thread::ScopedJoinHandle<'scope, T>
+    where
+        F: FnOnce() -> T + Send + 'scope,
+        T: Send + 'scope,
+    {
+        self.spawn(move || {
+            release_this_thread();
+            f()
+        })
+    }
+}
+
+/// `tokio::task::spawn_blocking`, released.
+#[allow(clippy::disallowed_methods)]
+pub fn spawn_blocking<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        release_this_thread();
+        f()
+    })
+}
+
+/// `tokio::runtime::Handle::spawn_blocking`, released (scripts use it).
+#[allow(clippy::disallowed_methods)]
+#[cfg_attr(not(feature = "lua"), allow(dead_code))]
+pub fn spawn_blocking_on<F, R>(handle: &tokio::runtime::Handle, f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    handle.spawn_blocking(move || {
+        release_this_thread();
+        f()
+    })
 }
 
 /// What the operating system says the process may run on.
@@ -526,6 +704,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_pin_report_says_what_happened() {
+        let ok = || Ok(());
+        let refused = || Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        let all = PinReport::new(vec![0, 2]);
+        assert_eq!(all.tried(1, &ok()), None);
+        assert_eq!(
+            all.tried(0, &ok()).unwrap(),
+            "pinned 2 of 2: worker 0 on CPU 0, worker 1 on CPU 2 (worker-cpu-affinity auto)"
+        );
+        let one = PinReport::new(vec![0, 2]);
+        assert_eq!(one.tried(0, &ok()), None);
+        let line = one.tried(1, &refused()).unwrap();
+        assert!(
+            line.starts_with(
+                "pinned 1 of 2 (worker-cpu-affinity auto); refused: worker 1 on CPU 2: "
+            ),
+            "{line}"
+        );
+        let none = PinReport::new(vec![4]);
+        let line = none.tried(0, &refused()).unwrap();
+        assert!(
+            line.starts_with(
+                "not pinned: the system refused every bind; refused: worker 0 on CPU 4"
+            ),
+            "{line}"
+        );
+    }
+
     /// A helper thread a pinned worker starts gets every allowed CPU back.
     #[cfg(target_os = "linux")]
     #[test]
@@ -543,6 +750,29 @@ mod tests {
             })
             .join()
             .unwrap();
+            // Through the wrappers, released without asking: a thread, a
+            // named one, a scoped one (a SAVE's freeze threads).
+            let want = allowed.clone();
+            let seen = spawn(allowed_cpu_ids).join().unwrap().unwrap();
+            assert_eq!(seen, want);
+            let seen = std::thread::Builder::new()
+                .name("test-released".into())
+                .spawn_released(allowed_cpu_ids)
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap();
+            assert_eq!(seen, want);
+            let seen = std::thread::scope(|scope| {
+                scope
+                    .spawn_released(allowed_cpu_ids)
+                    .join()
+                    .unwrap()
+                    .unwrap()
+            });
+            assert_eq!(seen, want);
+            // The pinned thread itself stays where it is.
+            assert_eq!(allowed_cpu_ids().unwrap(), vec![allowed[0]]);
         })
         .join()
         .unwrap();

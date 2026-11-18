@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Integration tests for string and JSON commands.
 // Same harness pattern as vector_hash.rs — each test gets its own server
 // on a random port so tests are fully isolated and can run in parallel.

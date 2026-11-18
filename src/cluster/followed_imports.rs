@@ -67,6 +67,7 @@
 
 use super::migration::{self, Env, HeldBefore, Ranges, in_ranges, slot_runs, slots_of};
 use super::{ClusterState, NodeId, key_hash_slot, node_id_str, orphans};
+use crate::cpus::BuilderExt as _;
 use crate::replication::{SLOT_IMPORTS_MARKER, SlotImportsEvent};
 use parking_lot::{Condvar, Mutex};
 use std::sync::{Arc, Weak};
@@ -693,10 +694,7 @@ pub(crate) fn start(cluster: &Arc<ClusterState>, repl_state: &crate::replication
     let weak = Arc::downgrade(cluster);
     let spawned = std::thread::Builder::new()
         .name("kividb-import-cleanup".into())
-        .spawn(move || {
-            crate::cpus::release_this_thread();
-            run(&weak)
-        });
+        .spawn_released(move || run(&weak));
     if let Err(e) = spawned {
         log_error!(
             "Cluster: could not start the thread that deletes what an unfinished import into \

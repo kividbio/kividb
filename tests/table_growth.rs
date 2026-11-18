@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // A shard's table grows without holding up other connections (#752).
 //
 // hashbrown grew a full table in one step, every key hashed again with the

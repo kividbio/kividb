@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/blocked_client_gone.rs
 //
 // A client that goes while the server is waiting on its behalf — in a

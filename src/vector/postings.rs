@@ -22,6 +22,7 @@
 // without them.
 
 use super::{FieldType, SchemaField};
+use crate::cpus::BuilderExt as _;
 use ahash::AHashMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -1595,8 +1596,7 @@ fn tidy(shared: &SharedPostings) {
     let worker = Arc::clone(shared);
     let started = std::thread::Builder::new()
         .name("kividb-postings".into())
-        .spawn(move || {
-            crate::cpus::release_this_thread();
+        .spawn_released(move || {
             let mut spare: Option<Vec<u32>> = None;
             loop {
                 let wanted = worker.lock.read().spare_wanted();
@@ -2437,7 +2437,7 @@ mod tests {
             .map(|_| {
                 let shared = Arc::clone(&shared);
                 let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     while !stop.load(SeqCst) {
                         let p = shared.read();
                         let all = p.live().clone();
@@ -2452,7 +2452,7 @@ mod tests {
             .map(|w| {
                 let shared = Arc::clone(&shared);
                 let named = Arc::clone(&named);
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     let mut seed = 0x9e37_79b9_7f4a_7c15u64 ^ ((w + 1) << 40);
                     let mut next = move || {
                         seed ^= seed << 13;

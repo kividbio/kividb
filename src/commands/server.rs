@@ -1,4 +1,5 @@
 use crate::commands::ctx::Ctx;
+use crate::cpus::BuilderExt as _;
 use crate::loglevel::LOG_LEVEL;
 use crate::read_lock;
 use crate::resp::write::*;
@@ -2105,8 +2106,7 @@ fn keysizes_count_aside(store: &crate::store::Store, count: KeysizesCounter) -> 
     let store = Arc::clone(store);
     std::thread::Builder::new()
         .name("keysizes".to_string())
-        .spawn(move || {
-            crate::cpus::release_this_thread();
+        .spawn_released(move || {
             // Dropped last, after the count is kept.
             let _done = Done(keysizes_key(&store));
             let began = std::time::Instant::now();
@@ -4463,8 +4463,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             tokio::spawn(async move {
                 let started = std::time::Instant::now();
-                let snap = tokio::task::spawn_blocking(move || {
-                    crate::cpus::release_this_thread();
+                let snap = crate::cpus::spawn_blocking(move || {
                     crate::replication::save_dataset(&store, &index_store_snap, &repl_state)
                 })
                 .await;
