@@ -40,10 +40,18 @@ the runs) must stay N: the trim never empties a feed. The load is checked
 (800 members in every sampled feed) before anything is measured, and a run
 fails on any error reply memtier reports.
 
-Gates, against Redis in the same session, ~15 % under what was published:
-ops/s at least 1.5x Redis at 200 connections and 1.7x at 500, the read p50 at
-most 0.6x Redis's; and THROUGHPUT / MEMORY against the recorded candidate. The
-p99 rows are shown, not gated (`jitter`: client and server share the VM).
+Gates (set from three runs on a Standard_D8s_v5, 8 vCPUs shared by the server
+and memtier, nothing pinned: master measured 1.86-2.11x Redis's ops/s, 0.46-0.51x
+its read p50, and 0.945-1.03x v1.2.2's ops/s, one run in three at the low end
+of both: this suite is noisier than 20): ops/s at least 1.75x Redis in the
+same session and at most 10 % under v1.2.2's (master is not ahead of v1.2.2
+here, so the gate says "not worse than"), the read p50 at most 0.55x Redis's
+and 15 % over the recorded one (master's read p50 is 1.3x v1.2.2's: 0.70 ms
+against 0.54-0.56 at 200 connections; recorded as it is, not gated against
+v1.2.2); THROUGHPUT / MEMORY against the recorded candidate. The p99 rows are
+shown, not gated (`jitter`: client and server share the VM). memtier's four
+threads are at 100 % of a CPU each while it drives KiviDB, so the ops/s rows
+bound the server from below; they are not its limit.
 
 Needs memtier_benchmark 2.6.1 or newer (`--transaction`, and the stderr line
 it logs for an error reply): `$MEMTIER`, else on PATH.
@@ -57,7 +65,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from suite import (Suite, Config, THROUGHPUT, MEMORY, EXACT, info, jitter, vs_redis, median, scaled)  # noqa: E402
+from suite import (Suite, Config, THROUGHPUT, MEMORY, EXACT, info, jitter, rel, vs_redis, vs_v1_2_2, median, scaled)  # noqa: E402
 from rss import used_memory_mib  # noqa: E402
 
 S = Suite("18-mastodon-feed-fanout", [Config("default")])
@@ -69,7 +77,7 @@ SECONDS = 20
 WARMUP_SECONDS = 10
 RUNS = 3
 # Connections -> the floor over Redis for the mix's ops/s (published 1.7x / 2.0x).
-CONNS = {200: 1.5, 500: 1.7}
+CONNS = {200: 1.75, 500: 1.75}
 READ = "Zrevrangebyscores"  # memtier's name for the timeline read's stats
 
 # ── The mix: the issue's seven commands. The WEIGHTS ARE A PLACEHOLDER, a
@@ -160,10 +168,10 @@ def run(ctx):
         ctx.raw["runs"][conns] = runs
         ops = [r[0] for r in runs]
         ctx.emit("ops_c%d" % conns, median(ops), "ops/s", "higher",
-                 gate=[THROUGHPUT, vs_redis(round(1 / floor, 3))], samples=ops)
+                 gate=[THROUGHPUT, vs_redis(round(1 / floor, 3)), vs_v1_2_2(1.1)], samples=ops)
         read_p50 = [r[2] for r in runs]
         ctx.emit("read_p50_ms_c%d" % conns, median(read_p50), "ms", "lower",
-                 gate=jitter(vs_redis(0.6)), samples=read_p50)
+                 gate=jitter([vs_redis(0.55), rel(15)]), samples=read_p50)
         p99 = [r[1] for r in runs]
         ctx.emit("p99_ms_c%d" % conns, median(p99), "ms", "lower", gate=jitter(info()), samples=p99)
         read_p99 = [r[3] for r in runs]

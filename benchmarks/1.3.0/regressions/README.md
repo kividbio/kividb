@@ -34,7 +34,7 @@ and why.
 | `15-brpop-many-keys` | #758 | jobs/s delivered to 1,000 and 4,000 workers each in `BRPOP` over 270 queues (and 1,000 over one queue, a guard) while 200 `LPUSH`es go out every 0.1 s; PING p99/max beside it; jobs lost (exactly 0) and clients left blocked after the workers go (0) |
 | `16-random-sample` | #839 | `ZRANDMEMBER` / `HRANDFIELD` of a sorted set / hash of 100, 10,000 and 1,000,000 members, with no count, 1, 10, -1, -10, `WITHSCORES` / `WITHVALUES`: microseconds a call (mean of 150-3,000 calls, median of 3 rounds) and the replies checked (length, distinct for a positive count) |
 | `17-set-memory` | #297 (step 1) | `used_memory` per set member, 1,000,000 members in sets of 10, 100, 1,000 and 100,000: 14-byte strings (`membr:<i>`) and integers (`0`..`n-1`); `OBJECT ENCODING` of each size recorded exactly; the tables (1,000 and 100,000) as guard rows |
-| `18-mastodon-feed-fanout` | #849 | Mastodon's home-feed fan-out (FeedManager mix: `ZADD`, `ZREMRANGEBYRANK 0 -801`, `ZREVRANGE 40 40 WITHSCORES`, `ZSCORE`, `EXISTS`, `ZREVRANGEBYSCORE ... LIMIT 0 20`, `ZRANGEBYSCORE`) over 20,000 feeds of 800 members with memtier_benchmark at 200 and 500 connections: ops/s and the timeline read's p50 against Redis, p99 shown beside them, `used_memory` and bytes per member |
+| `18-mastodon-feed-fanout` | #849 | Mastodon's home-feed fan-out (FeedManager mix: `ZADD`, `ZREMRANGEBYRANK 0 -801`, `ZREVRANGE 40 40 WITHSCORES`, `ZSCORE`, `EXISTS`, `ZREVRANGEBYSCORE ... LIMIT 0 20`, `ZRANGEBYSCORE`) over 20,000 feeds of 800 members with memtier_benchmark at 200 and 500 connections: ops/s and the timeline read's p50 against Redis, p99 shown beside them, `used_memory` and bytes per member; recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-18)) |
 | `19-hash-memory` | collection storage step 2 | `used_memory` per hash field, 1,000,000 fields in hashes of 10, 100, 1,000 and 100,000: 14-byte fields (`field:<i>`) with 32-byte values, plain and with one field TTL a hash; `OBJECT ENCODING` of each size recorded exactly (`listpack`, `listpackex`, `hashtable`); the tables (1,000 and 100,000) as guard rows |
 
 ## Running it
@@ -324,6 +324,8 @@ re-record that hides a regression defeats the suite.
    build that may still change), run the whole suite with `FULL=1` against the
    RC on the VM size in `baseline.json` (`Standard_D4s_v5`):
    `run-all.sh --candidate v1.3.0-rcN --label v1.3.0-rcN-d4s_v5`.
+   Suites 18 and 20 are recorded on a `Standard_D8s_v5`, because their gates need 8
+   vCPUs: run them there (`--only 18,20`), and the rest on the D4s_v5.
 2. Every gate must pass. A failure is either a regression to fix before the
    release, or an intended change that is explained in the release PR, after
    which the baseline is re-recorded.
@@ -862,6 +864,54 @@ The 1,000 and 100,000 rows are guards: sets past the block's and the array's
 limits are tables, as in v1.2.2, and must not grow. Instructions per command
 are not measured here (the suite has no callgrind harness); #297's PR has
 them from `scripts/perf`-style runs.
+
+## Recorded run, suite 18
+
+Recorded 2026-11-18 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C),
+the values of `pr870-d1a6712c-d8s_v5-rerun2` (`compare.py --record`, with
+`--allow-vm-change`); the candidate is master `d1a6712c` (this PR adds only
+the suite), `cargo build --release` with rustc 1.100.0 (the compiler of the
+v1.2.2 release binary: a build by 1.99.1 would look 5-13 % slower);
+memtier_benchmark 2.6.1; Redis 8.10.2 from the VM image. Four runs, all with
+verdict `ok`: `pr870-d1a6712c-d8s_v5` (the first: its 500-connection master
+rate, 231,000, is the low outlier below, so the baseline takes the second),
+`-rerun2` (recorded), `-rerun3`, and `-verify` (a fresh run against the
+recorded values and the final gates). A run takes about 10 minutes. Nothing is
+pinned: the server (8 threads) and memtier share the 8 vCPUs.
+
+Three runs (the range over them):
+
+| | v1.2.2 | master | Redis 8.10.2 | master / Redis | master / v1.2.2 |
+|---|---:|---:|---:|---:|---:|
+| ops/s, 200 connections | 253,000-261,000 | 254,000-261,000 | 126,000-131,000 | 1.98-2.02x | 1.00-1.03x |
+| ops/s, 500 connections | 245,000-264,000 | 231,000-261,000 | 124,000 | 1.86-2.11x | 0.945-0.988x |
+| timeline read p50, 200, ms | 0.54-0.57 | 0.70-0.71 | 1.46-1.48 | 0.48x | 1.25-1.30x |
+| timeline read p50, 500, ms | 1.36-1.48 | 1.79-2.00 | 3.85-3.94 | 0.46-0.51x | 1.31-1.35x |
+| mix p99, 200 / 500, ms | 3.9-4.0 / 5.7-6.1 | 1.4-1.6 / 3.4-4.0 | 2.9-3.0 / 7.5-7.7 | | |
+| `used_memory`, MiB (bytes per member) | 1,727 (113.2) | 1,727 (113.2) | 1,214 (79.5) | 1.42x | 1.00x |
+
+What is true and not flattering: master is not ahead of v1.2.2 in the mix's
+rate (the same within noise, 500 connections up to 5.5 % below it in the low
+run), its timeline read p50 is 25-35 % worse than v1.2.2's (still half of
+Redis's), and a member costs 42 % more memory than in Redis, as in v1.2.2.
+What it does better is p99: a third to two thirds of v1.2.2's, and below
+Redis's. So the gates are "at least 1.75x Redis" (6 % under the lowest
+ratio measured), "at most 10 % under v1.2.2" (`vs_v1_2_2` 1.1: the
+runs went up to 5.5 % under it), the read p50 at most 0.55x Redis's and 15 %
+over the recorded one (master's read p50 against v1.2.2 is recorded, not
+gated), 10 % against the recorded rate and 5 % on the memory. This suite is
+noisier than 20: a 10 % loss in the rate is caught by the `v1.2.2` gate only
+at its edge.
+
+Which side is the limit. Master used 346 % of CPU on average (v1.2.2 378 %)
+and memtier's four threads were at 100 % of a CPU each (400 %) in 29 of 87
+samples, the rest of the time Redis's runs, warm-ups and the load: server and
+client together fill the 8 vCPUs, so the mix's rate is bounded by the client
+and by the machine, not by the server alone. That the two builds are equal
+here says the client is the limit; the p50 and p99 are the rows that see the
+server.
+
+Run this suite on a D8s_v5 (`run-all.sh --only 18`).
 
 ## Recorded run, suite 19
 
