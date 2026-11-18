@@ -174,14 +174,20 @@ fn eval_script_added(sha: &str) {
 /// recently used.
 fn eval_script_used(sha: &str) {
     let mut scripts = EVAL_SCRIPTS.lock();
-    let Some(was) = scripts.last_used.get(sha).copied() else {
+    let scripts = &mut *scripts;
+    let Some(last_used) = scripts.last_used.get_mut(sha) else {
         return;
     };
     scripts.clock += 1;
     let now = scripts.clock;
-    scripts.by_use.remove(&was);
-    scripts.by_use.insert(now, sha.to_string());
-    scripts.last_used.insert(sha.to_string(), now);
+    // Moved to its new place, not made again: a script sent with `EVAL` each
+    // time (Appwrite's) made two copies of its digest a call (#901).
+    let was = std::mem::replace(last_used, now);
+    let name = scripts
+        .by_use
+        .remove(&was)
+        .unwrap_or_else(|| sha.to_string());
+    scripts.by_use.insert(now, name);
 }
 
 /// `SCRIPT LOAD` of a script: kept from now on, whatever `EVAL` sent.
