@@ -832,24 +832,40 @@ impl Drop for ClearScriptEval<'_> {
             *c.borrow_mut() = None;
         });
         // The arguments are let go of. What stands in for them until the
-        // next script sets its own is one empty table kept with the VM: no
-        // script sees it, each being given new tables before it runs.
-        let empty = match self.lua.app_data_ref::<EmptyArguments>() {
-            Some(empty) => Some(empty.0.clone()),
-            None => self.lua.create_table().ok().inspect(|table| {
-                self.lua.set_app_data(EmptyArguments(table.clone()));
-            }),
+        // next script sets its own is one empty table kept with the VM (in
+        // its registry): no script sees it, each being given new tables
+        // before it runs. On Lua's stack, in one protected call: through
+        // mlua's tables it was a twentieth of what a short script cost.
+        //
+        // SAFETY: the closure leaves the stack empty, and runs protected.
+        let _ = unsafe {
+            self.lua.exec_raw::<()>((), |state| {
+                use mlua::ffi;
+                ffi::lua_checkstack(state, 4);
+                ffi::lua_rawgeti(state, ffi::LUA_REGISTRYINDEX, ffi::LUA_RIDX_GLOBALS);
+                if ffi::lua_getfield(state, ffi::LUA_REGISTRYINDEX, NO_ARGUMENTS.as_ptr())
+                    != ffi::LUA_TTABLE
+                {
+                    ffi::lua_pop(state, 1);
+                    ffi::lua_createtable(state, 0, 0);
+                    ffi::lua_pushvalue(state, -1);
+                    ffi::lua_setfield(state, ffi::LUA_REGISTRYINDEX, NO_ARGUMENTS.as_ptr());
+                }
+                for name in [c"KEYS", c"ARGV"] {
+                    ffi::lua_pushstring(state, name.as_ptr());
+                    ffi::lua_pushvalue(state, -2);
+                    // Raw: past the `__newindex` that protects the globals.
+                    ffi::lua_rawset(state, -4);
+                }
+                ffi::lua_settop(state, 0);
+            })
         };
-        if let Some(empty) = empty {
-            let globals = self.lua.globals();
-            let _ = globals.raw_set("KEYS", empty.clone());
-            let _ = globals.raw_set("ARGV", empty);
-        }
     }
 }
 
-/// See [`ClearScriptEval`]'s `drop`.
-struct EmptyArguments(LuaTable);
+/// Where in a VM's registry the empty table stands in for `KEYS` and `ARGV`
+/// between scripts (see [`ClearScriptEval`]'s `drop`).
+const NO_ARGUMENTS: &std::ffi::CStr = c"__kividb_no_arguments";
 
 struct ScriptEval {
     /// Opaque `*mut Ctx` — stored as integer to avoid naming `Ctx`'s lifetime on this struct.
