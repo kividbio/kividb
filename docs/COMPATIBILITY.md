@@ -271,7 +271,10 @@ other files:
 - Top-K: with a decay of 1 every answer is Redis's; below 1, which bucket
   decays is left to chance, drawn from a generator each sketch keeps (so
   replicas and the AOF stay identical to the master), and answers are as
-  good as Redis's, not bit for bit the same. Items are binary-safe (Redis
+  good as Redis's, not bit for bit the same. `DUMP` (Redis's format) does
+  not carry the generator: a copy made by `RESTORE`, `MIGRATE` or a slot's
+  move starts it afresh, and from then on does not make the choices the
+  original would have. Items are binary-safe (Redis
   cuts them at a zero byte in replies). `COPY` copies one, which Redis
   refuses. Size limits (k 65,536, 67,108,864 buckets, 65,536 rows) and a
   per-command limit on `TOPK.ADD`, `TOPK.INCRBY`, `TOPK.QUERY` and

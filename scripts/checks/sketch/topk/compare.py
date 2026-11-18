@@ -17,6 +17,10 @@ Redis 8.10.2 never finishes its reply to a `TOPK.INCRBY` whose bad increment is
 not the last one (the client waits for ever), so the sequences put a bad
 increment only last.
 
+After the sequences, counts at the top of 32 bits: 42,949 `TOPK.INCRBY key x
+100000` on sketches of k 1 and 2, decays 1 and 0.9, then more; every reply
+compared exactly (a count past 2^32 - 1 wraps, in Redis as here).
+
 --quality: Zipf streams (s = 0.8 to 1.2, 200,000 items over 20,000 distinct)
 added to both with the default decay of 0.9, and the share of the true top k
 each lists (recall), and how close its counts are, printed side by side.
@@ -195,6 +199,31 @@ def quality(ports):
             print(f"{s:<4}  {k:<3} {row[0]:>12.3f} {row[1]:>14.3f} {errs[0]:>15.4f} {errs[1]:>16.4f}")
 
 
+def at_the_top(ports, diffs):
+    """Counts taken past 2^32 - 1; the replies compared exactly, appended to
+    `diffs` where they differ. Returns how many were compared."""
+    compared = 0
+    for key, shape in (("top1", (1, 1, 1, 1)), ("top2", (2, 1, 1, 1)), ("top3", (2, 2, 3, "0.9"))):
+        conns = [Conn(p, db=3) for p in ports]
+        for c in conns:
+            c.raw("DEL", key)
+            c.raw("TOPK.RESERVE", key, *shape)
+            one = b"*4\r\n$11\r\nTOPK.INCRBY\r\n$%d\r\n%s\r\n$1\r\nx\r\n$6\r\n100000\r\n" % (len(key), key.encode())
+            c.s.sendall(one * 42_949)
+            for _ in range(42_949):
+                c.read()
+        for cmd in (["TOPK.LIST", key, "WITHCOUNT"], ["TOPK.COUNT", key, "x"],
+                    ["TOPK.INCRBY", key, "x", "100000"], ["TOPK.LIST", key, "WITHCOUNT"],
+                    ["TOPK.COUNT", key, "x"], ["TOPK.QUERY", key, "x"],
+                    ["TOPK.INCRBY", key, "y", "5", "x", "70000"], ["TOPK.LIST", key, "WITHCOUNT"],
+                    ["TOPK.COUNT", key, "x", "y"]):
+            replies = [c.raw(*cmd) for c in conns]
+            compared += 1
+            if replies[0] != replies[1]:
+                diffs.append(("top", False, cmd, replies[0], replies[1]))
+    return compared
+
+
 def main():
     argv = sys.argv[1:]
     opts = {"--seed": "1", "--steps": "400", "--sequences": "20", "--capture": None}
@@ -252,6 +281,7 @@ def main():
         json.dump(fixture, open(capture, "w"), indent=0)
         print(f"captured {sum(len(q['cases']) for q in fixture['sequences'])} cases")
         return 0
+    total += at_the_top(ports, diffs)
     for s, resp3, cmd, a, b in diffs[:40]:
         print(f"seq {s} RESP{3 if resp3 else 2}: {cmd!r}\n  redis  {a!r}\n  kividb {b!r}")
     print(f"{total} replies compared ({by_shape} by shape), {len(diffs)} differ")

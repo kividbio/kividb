@@ -737,3 +737,323 @@ fn hostile_payloads_are_refused() {
 }
 
 const REDIS_DUMP: &str = "07814e8a4af9360f100002020203020104000000000000f03f05c30d180503ad4d230100e0070001000005c31e30010000e00d000403ad4d2305201a0898d02582407e000001200b20000000050100050668656c6c6f00000f005531a20539918c1c";
+
+// ── maxmemory: room is made before a command takes its keys ─────────────
+
+/// A field of `INFO section`.
+fn info_field(c: &mut Conn, section: &str, field: &str) -> String {
+    let prefix = format!("{field}:");
+    String::from_utf8_lossy(&c.cmd(&["INFO", section]))
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix).map(|v| v.trim().to_string()))
+        .unwrap_or_default()
+}
+
+/// The keys of the selected database, sorted.
+fn all_keys(c: &mut Conn) -> Vec<String> {
+    let reply = c.cmd(&["KEYS", "*"]);
+    let mut keys: Vec<String> = String::from_utf8_lossy(&reply)
+        .split("\r\n")
+        .skip(1)
+        .filter(|l| !l.is_empty() && !l.starts_with('$'))
+        .map(str::to_string)
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Room for a sketch is made before the command takes its key, where it
+/// is made for every command: the keys evicted for it are deleted in the
+/// order of writes, so that a write to one of them by another client meets
+/// the master and its replica in the same order. With evictions forced by
+/// sketches made and written while other clients write the keys evicted,
+/// the replica ends with every key the master has, and nothing else, each
+/// alike (`DEBUG DIGEST-VALUE`).
+#[test]
+fn room_is_made_before_the_command_takes_its_keys() {
+    let (dir, replica_dir) = (tmp_dir("room-order"), tmp_dir("room-order-replica"));
+    let master = Child::start(&dir, &["--maxmemory-policy", "allkeys-lru"]);
+    let replica = Child::start(
+        &replica_dir,
+        &["--replicaof", "127.0.0.1", &master.port.to_string()],
+    );
+    let mut m = master.conn();
+    let mut r = replica.conn();
+    wait_until("the replica to sync", || {
+        info_field(&mut r, "replication", "master_link_status") == "up"
+    });
+    let used: u64 = info_field(&mut m, "memory", "used_memory").parse().unwrap();
+    let limit = (used + 4_000_000).to_string();
+    assert_eq!(m.cmd(&["CONFIG", "SET", "maxmemory", &limit]), b"+OK\r\n");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let value = "v".repeat(8_000);
+    thread::scope(|s| {
+        s.spawn(|| {
+            let mut c = master.conn();
+            let mut i = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let key = format!("f{}", i % 24);
+                let other = format!("f{}", (i + 7) % 24);
+                let n = i.to_string();
+                c.cmd(&["DEL", &key]);
+                c.cmd(&["TOPK.RESERVE", &key, "10", "20000", "2", "0.9"]);
+                c.cmd(&["TOPK.ADD", &other, &n]);
+                i += 1;
+            }
+        });
+        for t in 0..2 {
+            let (value, stop, master) = (&value, &stop, &master);
+            s.spawn(move || {
+                let mut c = master.conn();
+                let mut i = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let key = format!("s{}", (i * 7 + t) % 300);
+                    if i.is_multiple_of(5) {
+                        c.cmd(&["DEL", &key]);
+                    } else {
+                        c.cmd(&["SET", &key, value]);
+                    }
+                    i += 1;
+                }
+            });
+        }
+        thread::sleep(Duration::from_secs(4));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    let evicted: u64 = info_field(&mut m, "stats", "evicted_keys").parse().unwrap();
+    assert!(evicted > 0, "room was made by evicting");
+    assert_eq!(m.cmd(&["CONFIG", "SET", "maxmemory", "0"]), b"+OK\r\n");
+    assert_eq!(m.cmd(&["SET", "last", "1"]), b"+OK\r\n");
+    wait_until("the replica to have the last write", || {
+        r.cmd(&["GET", "last"]) == b"$1\r\n1\r\n"
+    });
+    let keys = all_keys(&mut m);
+    assert_eq!(all_keys(&mut r), keys);
+    for key in &keys {
+        assert_eq!(
+            r.cmd(&["DEBUG", "DIGEST-VALUE", key]),
+            m.cmd(&["DEBUG", "DIGEST-VALUE", key]),
+            "{key}"
+        );
+    }
+    drop((master, replica));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&replica_dir);
+}
+
+/// A command that finds no room when it runs is refused with `OOM`: it
+/// evicts nothing itself, as room is made only before a command takes its
+/// keys. (Room for it is not asked for first here, by a hook of debug
+/// builds: as if what was made had been taken meanwhile.)
+#[test]
+#[cfg(debug_assertions)]
+fn a_command_that_finds_no_room_evicts_nothing() {
+    let dir = tmp_dir("room-none");
+    let (child, port) = start_verified(|port| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
+            .current_dir(&dir)
+            .env("KIVIDB_TEST_NO_ROOM_BEFORE", "1")
+            .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
+            .args(["--threads", "2", "--loglevel", "warning"])
+            .args(["--configfile", "kividb.conf", "--dir"])
+            .arg(&dir)
+            .args(["--maxmemory-policy", "allkeys-lru"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("could not start kividb")
+    });
+    let server = Child { port, child };
+    wait_until("kividb to answer", || {
+        TcpStream::connect(("127.0.0.1", port)).is_ok()
+    });
+    let mut c = server.conn();
+    let value = "v".repeat(10_000);
+    for i in 0..100 {
+        assert_eq!(c.cmd(&["SET", &format!("s{i}"), &value]), b"+OK\r\n");
+    }
+    let used: u64 = info_field(&mut c, "memory", "used_memory").parse().unwrap();
+    let limit = (used + 500_000).to_string();
+    assert_eq!(c.cmd(&["CONFIG", "SET", "maxmemory", &limit]), b"+OK\r\n");
+    // More than is left.
+    assert_eq!(
+        c.cmd(&["TOPK.RESERVE", "big", "10", "100000", "4", "0.9"]),
+        b"-OOM command not allowed when used memory > 'maxmemory'.\r\n"
+    );
+    assert_eq!(c.cmd(&["EXISTS", "big"]), b":0\r\n");
+    assert_eq!(info_field(&mut c, "stats", "evicted_keys"), "0");
+    assert_eq!(c.cmd(&["DBSIZE"]), b":100\r\n");
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Replicas that attach late, replays, transactions ────────────────────
+
+/// A replica that attaches part-way through a workload takes the sketches
+/// in its full sync, each with its generator, and then makes the choices
+/// the master makes: it ends with the master's sketches.
+#[test]
+fn a_replica_that_attaches_mid_workload_ends_with_the_masters_sketches() {
+    let (dir, replica_dir) = (tmp_dir("mid"), tmp_dir("mid-replica"));
+    let master = Child::start(&dir, &[]);
+    let mut m = master.conn();
+    workload(&mut m, 0x2545_f491_4f6c_dd1d, 1500);
+    let replica = Child::start(
+        &replica_dir,
+        &["--replicaof", "127.0.0.1", &master.port.to_string()],
+    );
+    // Writes while it syncs, and after.
+    workload(&mut m, 0x6a09_e667_f3bc_c908, 1500);
+    let mut r = replica.conn();
+    wait_until("the replica to sync", || {
+        String::from_utf8_lossy(&r.cmd(&["INFO", "replication"])).contains("master_link_status:up")
+    });
+    workload(&mut m, 0xbb67_ae85_84ca_a73b, 1500);
+    assert_eq!(m.cmd(&["SET", "last", "1"]), b"+OK\r\n");
+    wait_until("the replica to catch up", || {
+        r.cmd(&["GET", "last"]) == b"$1\r\n1\r\n"
+    });
+    assert_eq!(digests(&mut r), digests(&mut m));
+    drop((master, replica));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&replica_dir);
+}
+
+/// A restart with nothing but the commands in the AOF (no snapshot taken,
+/// the AOF's base made before any sketch) replays them, chances and all,
+/// and ends with the sketches the master had.
+#[test]
+fn a_restart_that_replays_the_aof_commands_ends_with_the_sketches() {
+    let dir = tmp_dir("aof-replay");
+    let on_master = {
+        let master = Child::start(&dir, &["--aof"]);
+        let mut m = master.conn();
+        workload(&mut m, 0x3c6e_f372_fe94_f82b, 3000);
+        let on_master = digests(&mut m);
+        assert_eq!(m.cmd(&["SET", "last", "1"]), b"+OK\r\n");
+        wait_until("the AOF to hold the last write", || {
+            aof_files(&dir)
+                .iter()
+                .any(|(_, bytes)| bytes.windows(8).any(|w| w == b"\r\nlast\r\n"))
+        });
+        on_master
+    };
+    // What is there to load: the commands, and no snapshot.
+    assert!(!dir.join("dump.kdb").exists() && !dir.join("dump.rdb").exists());
+    let files = aof_files(&dir);
+    assert!(!files.is_empty());
+    for (name, bytes) in &files {
+        // Commands only, after the log's 16-byte header: no snapshot in it.
+        let body = bytes
+            .strip_prefix(b"KIVIDLT1")
+            .map_or(&bytes[..], |rest| &rest[8..]);
+        assert!(body.starts_with(b"*"), "{name}");
+        assert!(body.windows(8).any(|w| w == b"TOPK.ADD"), "{name}");
+    }
+    let server = Child::start(&dir, &["--aof"]);
+    let mut c = server.conn();
+    assert_eq!(digests(&mut c), on_master);
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The AOF's files under `dir` (its `appendonlydir`, or `dir` itself): name
+/// and bytes.
+fn aof_files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    for d in [dir.to_path_buf(), dir.join("appendonlydir")] {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.filter_map(Result::ok) {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.contains("appendonly") && e.path().is_file() {
+                out.push((name, std::fs::read(e.path()).unwrap_or_default()));
+            }
+        }
+    }
+    out
+}
+
+/// A transaction of Top-K writes reaches a replica as one, and the replica
+/// makes the master's choices in it.
+#[test]
+fn a_transaction_applied_on_a_replica_ends_with_the_masters_sketches() {
+    let (dir, replica_dir) = (tmp_dir("multi"), tmp_dir("multi-replica"));
+    let master = Child::start(&dir, &[]);
+    let replica = Child::start(
+        &replica_dir,
+        &["--replicaof", "127.0.0.1", &master.port.to_string()],
+    );
+    let mut m = master.conn();
+    let mut r = replica.conn();
+    wait_until("the replica to sync", || {
+        String::from_utf8_lossy(&r.cmd(&["INFO", "replication"])).contains("master_link_status:up")
+    });
+    workload(&mut m, 0xa54f_f53a_5f1d_36f1, 200);
+    for round in 0..50 {
+        assert_eq!(m.cmd(&["MULTI"]), b"+OK\r\n");
+        for i in 0..6 {
+            let key = format!("w:{i}");
+            let a = format!("t{}", (round * 7 + i) % 30);
+            let b = format!("t{}", (round * 3 + i) % 11);
+            assert_eq!(m.cmd(&["TOPK.ADD", &key, &a, &b, &a]), b"+QUEUED\r\n");
+            assert_eq!(
+                m.cmd(&["TOPK.INCRBY", &key, &b, "5", &a, "3"]),
+                b"+QUEUED\r\n"
+            );
+        }
+        let exec = m.cmd(&["EXEC"]);
+        assert!(exec.starts_with(b"*12\r\n"), "{}", shown(&exec));
+    }
+    assert_eq!(m.cmd(&["SET", "last", "1"]), b"+OK\r\n");
+    wait_until("the replica to catch up", || {
+        r.cmd(&["GET", "last"]) == b"$1\r\n1\r\n"
+    });
+    assert_eq!(digests(&mut r), digests(&mut m));
+    drop((master, replica));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&replica_dir);
+}
+
+/// A count past 2^32 − 1 wraps, in the buckets and in the heap, as Redis
+/// 8.10.2's does: 42,949 `TOPK.INCRBY t x 100000` count 4,294,900,000;
+/// one more, 32,704 (observed on Redis 8.10.2).
+#[test]
+fn counts_wrap_at_the_top_as_in_redis() {
+    let _serial = serial();
+    let port = start(config(kividb::config::IoModel::Tokio));
+    let mut c = Conn::connect(port);
+    c.cmd(&["FLUSHALL"]);
+    for (key, shape) in [("t", ["2", "1", "1", "1"]), ("u", ["2", "2", "3", "0.9"])] {
+        let mut args = vec!["TOPK.RESERVE", key];
+        args.extend(shape);
+        assert_eq!(c.cmd(&args), b"+OK\r\n");
+        for _ in 0..42_948 {
+            c.cmd(&["TOPK.INCRBY", key, "x", "100000"]);
+        }
+        c.cmd(&["TOPK.INCRBY", key, "x", "100000"]);
+        assert_eq!(
+            c.cmd(&["TOPK.LIST", key, "WITHCOUNT"]),
+            b"*2\r\n$1\r\nx\r\n:4294900000\r\n",
+            "{key}"
+        );
+        assert_eq!(c.cmd(&["TOPK.COUNT", key, "x"]), b"*1\r\n:4294900000\r\n");
+        c.cmd(&["TOPK.INCRBY", key, "x", "100000"]);
+        assert_eq!(
+            c.cmd(&["TOPK.LIST", key, "WITHCOUNT"]),
+            b"*2\r\n$1\r\nx\r\n:32704\r\n",
+            "{key}"
+        );
+        assert_eq!(c.cmd(&["TOPK.COUNT", key, "x"]), b"*1\r\n:32704\r\n");
+        // Another item: in `t`'s one bucket it only decays x's count; `u`
+        // has buckets for it.
+        c.cmd(&["TOPK.INCRBY", key, "y", "5"]);
+        let listed: &[u8] = if key == "t" {
+            b"*2\r\n$1\r\nx\r\n:32704\r\n"
+        } else {
+            b"*4\r\n$1\r\nx\r\n:32704\r\n$1\r\ny\r\n:5\r\n"
+        };
+        assert_eq!(c.cmd(&["TOPK.LIST", key, "WITHCOUNT"]), listed, "{key}");
+    }
+}

@@ -820,8 +820,15 @@ category is `@topk`.
 | `TOPK.INFO` | `TOPK.INFO key` | `k`, `width`, `depth` and `decay`; a map in RESP3 |
 
 The commands go to replicas and the AOF as they came: each sketch draws its
-chances from its own generator, saved with it, so a replica, an AOF replay and
-a restart make the master's choices and end with its sketch.
+chances from its own generator, saved with it, so a replica (one that attaches
+late too: a full sync carries the generator), an AOF replay and a restart make
+the master's choices and end with its sketch. `DUMP` writes Redis's format,
+which has no place for the generator: a sketch restored from a `DUMP` payload
+(`RESTORE`, and so `MIGRATE` and the move of a slot in cluster mode) starts
+its generator afresh, as a new sketch's starts. From then on, below a decay of
+1, it does not make the choices the original would have made, only choices as
+good; its replicas still end with its sketch. `COPY` keeps the generator. A
+count past 2^32 − 1 wraps, in the buckets and the heap, as Redis's does.
 
 ### Differences from Redis
 
@@ -837,14 +844,18 @@ a restart make the master's choices and end with its sketch.
   (at most k 65536, 67108864 buckets and 65536 rows)`; a snapshot, RDB file
   or `RESTORE` payload with a larger sketch is refused. Redis has no limit.
 - Per-command limit: a `TOPK.ADD` or `TOPK.INCRBY` may cost at most
-  4,000,000 steps, an item costing its rows times one more than its
-  increment, plus a sixteenth of `k` (some 230,000 items of `TOPK.ADD` at the
-  default size); `TOPK.QUERY` and `TOPK.COUNT` likewise. A command over it is
-  refused before it starts, with `TopK: command reached the per-command limit;
-  send fewer items per command`. Replication and the AOF are not held to it.
+  8,000,000 steps, an item costing its rows times 64 more than its
+  increment, plus a sixteenth of `k` (some 17,000 items of `TOPK.ADD` at the
+  default size, or eleven increments of 100,000 at depth 7), so that no
+  command takes more than some tens of milliseconds; `TOPK.QUERY` and
+  `TOPK.COUNT` likewise (an item costing one plus a sixteenth of `k`). A
+  command over it is refused before it starts, with `TopK: command reached
+  the per-command limit; send fewer items per command`. Replication and the
+  AOF are not held to it.
 - Under `maxmemory`, a client's `TOPK.RESERVE` that would allocate more than is
-  left evicts first under the policy, and is refused with `OOM ...` only if
-  that is not enough.
+  left, or `TOPK.ADD` or `TOPK.INCRBY` that would copy what a snapshot or a
+  copy shares, evicts first under the policy, before it takes its key, and is
+  refused with `OOM ...` only if that is not enough.
 - `DUMP` payloads carry RDB version 9, so every Redis since 6.0 can
   `RESTORE` them; the value is as Redis 8.10 writes it.
 

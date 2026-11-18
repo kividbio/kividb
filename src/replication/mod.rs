@@ -4421,27 +4421,25 @@ pub fn is_write_command(name: &str) -> bool {
                 | "ZPOPMAX"
                 | "ZPOPMIN"
         ),
-        8 if crate::sketch::is_write(&name.as_bytes()[..8]) => true,
-        8 => {
-            matches!(
-                name,
-                "ARINSERT"
-                    | "BITFIELD"
-                    | "BZPOPMAX"
-                    | "BZPOPMIN"
-                    | "EXPIREAT"
-                    | "FLUSHALL"
-                    | "FT.ALTER"
-                    | "HPERSIST"
-                    | "HPEXPIRE"
-                    | "JSON.DEL"
-                    | "JSON.SET"
-                    | "RENAMENX"
-                    | "SETRANGE"
-                    | "TS.ALTER"
-                    | "VSETATTR"
-            )
-        }
+        8 => matches!(
+            name,
+            "ARINSERT"
+                | "BITFIELD"
+                | "BZPOPMAX"
+                | "BZPOPMIN"
+                | "EXPIREAT"
+                | "FLUSHALL"
+                | "FT.ALTER"
+                | "HPERSIST"
+                | "HPEXPIRE"
+                | "JSON.DEL"
+                | "JSON.SET"
+                | "RENAMENX"
+                | "SETRANGE"
+                | "TOPK.ADD"
+                | "TS.ALTER"
+                | "VSETATTR"
+        ),
         9 => matches!(
             name,
             "BF.INSERT"
@@ -4469,32 +4467,32 @@ pub fn is_write_command(name: &str) -> bool {
                 | "XREADGROUP"
                 | "ZDIFFSTORE"
         ),
-        11 if crate::sketch::is_write(&name.as_bytes()[..11]) => true,
-        11 => {
-            matches!(
-                name,
-                "FT.ALIASADD"
-                    | "FT.ALIASDEL"
-                    | "INCRBYFLOAT"
-                    | "JSON.ARRPOP"
-                    | "JSON.FORGET"
-                    | "JSON.OBJDEL"
-                    | "JSON.TOGGLE"
-                    | "SINTERSTORE"
-                    | "SUNIONSTORE"
-                    | "XIDMPRECORD"
-                    | "ZINTERSTORE"
-                    | "ZRANGESTORE"
-                    | "ZUNIONSTORE"
-            )
-        }
-        12 if crate::sketch::is_write(&name.as_bytes()[..12]) => true,
-        12 => {
-            matches!(
-                name,
-                "BF.LOADCHUNK" | "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
-            )
-        }
+        11 => matches!(
+            name,
+            "FT.ALIASADD"
+                | "FT.ALIASDEL"
+                | "INCRBYFLOAT"
+                | "JSON.ARRPOP"
+                | "JSON.FORGET"
+                | "JSON.OBJDEL"
+                | "JSON.TOGGLE"
+                | "SINTERSTORE"
+                | "SUNIONSTORE"
+                | "TOPK.INCRBY"
+                | "XIDMPRECORD"
+                | "ZINTERSTORE"
+                | "ZRANGESTORE"
+                | "ZUNIONSTORE"
+        ),
+        12 => matches!(
+            name,
+            "BF.LOADCHUNK"
+                | "FT.DROPINDEX"
+                | "FT.SYNUPDATE"
+                | "HINCRBYFLOAT"
+                | "JSON.ARRTRIM"
+                | "TOPK.RESERVE"
+        ),
         13 => matches!(name, "TS.CREATERULE" | "TS.DELETERULE"),
         14 => matches!(
             name,

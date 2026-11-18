@@ -26,6 +26,8 @@
 //! The chances are drawn from a generator kept in the sketch (and saved
 //! with it), not from the process: so a replica, and a replay of the AOF,
 //! make exactly the choices the master made, and end with the same sketch.
+//! Redis's format has no place for it: a sketch read from it (an RDB file,
+//! `RESTORE`, and so `MIGRATE`) starts at [`RNG_START`], as a new one does.
 //! Answers under a decay below 1 are therefore not Redis's bit for bit,
 //! only as good: see the checks in `scripts/checks/sketch/topk/`.
 //!
@@ -50,10 +52,12 @@ pub const MAX_DEPTH: u64 = 1 << 16;
 /// The largest increment `TOPK.INCRBY` takes, as in Redis.
 pub const MAX_INCREMENT: i64 = 100_000;
 /// What one `TOPK.ADD` or `TOPK.INCRBY` may cost at most, reckoned before it
-/// starts: for each item, its rows times one more than its increment (the
-/// most decay steps it can take), and a sixteenth of `k` (the heap is
-/// searched for it). Some 230,000 items of `TOPK.ADD` at the default size.
-pub const BUDGET: u64 = 4_000_000;
+/// starts, in steps of some 2.5 ns: for each item, its rows times 64 (a
+/// row's hashing and bucket) and its increment (the most decay steps it
+/// can take there), and a sixteenth of `k` (the heap is searched for it).
+/// Some 17,000 items of `TOPK.ADD` at the default size, or eleven
+/// increments of 100,000 at depth 7: a few tens of milliseconds at most.
+pub const BUDGET: u64 = 8_000_000;
 
 /// Entries of the decay's lookup table: `decay^i` for `i` below it.
 const LOOKUP: usize = 256;
@@ -140,7 +144,7 @@ fn lookup_for(decay: f64) -> Box<[f64; LOOKUP]> {
 /// What one item costs a command (see [`BUDGET`]).
 pub fn cost(k: u32, depth: u32, increment: u64) -> u64 {
     u64::from(depth)
-        .saturating_mul(increment.saturating_add(1))
+        .saturating_mul(increment.saturating_add(64))
         .saturating_add(u64::from(k) / 16)
 }
 

@@ -78,16 +78,6 @@ impl Sketch {
     }
 }
 
-/// Whether `name` (upper case) is a write of the probabilistic types other
-/// than Bloom filters, for `replication::is_write_command`: kept out of its
-/// length buckets, and out of line, so that the command path of every other
-/// command is the code it was.
-#[cold]
-#[inline(never)]
-pub fn is_write(name: &[u8]) -> bool {
-    matches!(name, b"TOPK.ADD" | b"TOPK.INCRBY" | b"TOPK.RESERVE")
-}
-
 /// Whether `bytes` more fit under `maxmemory` (always, without one),
 /// reckoned as eviction reckons it: what is counted against the limit.
 /// Asked before a command from a client that makes or grows a filter runs,

@@ -257,7 +257,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   random sequences compared: `scripts/checks/sketch/topk/compare.py`); with
   a decay below 1 the chances come from a generator each sketch keeps and
   saves, so a replica, an AOF replay and a restart end with the master's
-  sketch exactly, and the heavy hitters of Zipf streams are found as well as
+  sketch exactly (a copy made from a `DUMP` payload, which has no place for
+  the generator, starts it afresh), and the heavy hitters of Zipf streams are found as well as
   Redis finds them. RDB files, full syncs and `DUMP` payloads from Redis
   load, and `DUMP` writes Redis's format. `TYPE` is `TopK-TYPE`, the ACL
   category `@topk`. Unlike Redis, a sketch has size limits (k 65,536,

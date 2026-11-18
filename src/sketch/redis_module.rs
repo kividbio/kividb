@@ -218,6 +218,35 @@ fn no_memory() -> io::Error {
 
 // ── Reading ─────────────────────────────────────────────────────────────
 
+/// The encoding of an LZF-compressed string, after the length's marker.
+const RDB_ENC_LZF: u64 = 3;
+
+/// An RDB length, and whether it is a special encoding's number instead.
+fn rdb_length(r: &mut impl Read) -> io::Result<(u64, bool)> {
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b)?;
+    Ok(match b[0] >> 6 {
+        0 => (u64::from(b[0] & 0x3f), false),
+        1 => {
+            let mut next = [0u8; 1];
+            r.read_exact(&mut next)?;
+            ((u64::from(b[0] & 0x3f) << 8) | u64::from(next[0]), false)
+        }
+        2 if b[0] == 0x80 => {
+            let mut v = [0u8; 4];
+            r.read_exact(&mut v)?;
+            (u64::from(u32::from_be_bytes(v)), false)
+        }
+        2 if b[0] == 0x81 => {
+            let mut v = [0u8; 8];
+            r.read_exact(&mut v)?;
+            (u64::from_be_bytes(v), false)
+        }
+        2 => return Err(super::invalid("an RDB length of an unknown form")),
+        _ => (u64::from(b[0] & 0x3f), true),
+    })
+}
+
 struct Reader<'r, R: Read> {
     r: &'r mut R,
     what: &'static str,
@@ -256,6 +285,39 @@ impl<R: Read> Reader<'_, R> {
     fn string(&mut self) -> io::Result<Vec<u8>> {
         self.opcode(OPCODE_STRING)?;
         crate::snapshot::rdb_read_string(self.r)
+    }
+
+    /// A string that must be `len` bytes, plain or LZF-compressed as Redis
+    /// writes one (`mismatch` if it is another length): its length, or a
+    /// compressed one's original length, is checked before anything is
+    /// allocated, and only the bytes the payload holds are read.
+    fn string_of(&mut self, len: u64, mismatch: &str) -> io::Result<Vec<u8>> {
+        self.opcode(OPCODE_STRING)?;
+        let want = usize::try_from(len).map_err(|_| self.bad(mismatch))?;
+        let (n, encoded) = rdb_length(self.r)?;
+        if !encoded {
+            if n != len {
+                return Err(self.bad(mismatch));
+            }
+            return super::read_vec(self.r, want);
+        }
+        if n != RDB_ENC_LZF {
+            return Err(self.bad("a string of an unexpected encoding"));
+        }
+        let (compressed, _) = rdb_length(self.r)?;
+        let (original, _) = rdb_length(self.r)?;
+        if original != len {
+            return Err(self.bad(mismatch));
+        }
+        // Redis compresses a string only if that makes it shorter.
+        if compressed == 0 || compressed >= len {
+            return Err(self.bad("a compressed string of a bad length"));
+        }
+        let compressed = super::read_vec(self.r, compressed as usize)?;
+        match lzf::decompress(&compressed, want) {
+            Ok(out) if out.len() == want => Ok(out),
+            _ => Err(self.bad("a compressed string that does not decompress")),
+        }
     }
 
     fn end(&mut self) -> io::Result<()> {
@@ -347,28 +409,22 @@ fn read_topk(r: &mut Reader<'_, impl Read>) -> io::Result<TopK> {
     if !super::topk::fits(k, width, depth) || !super::topk::decay_ok(decay) {
         return Err(r.bad("a sketch over the size limits is not supported"));
     }
-    let raw = r.string()?;
-    if raw.len() as u64 != width * depth * 8 {
-        return Err(r.bad("the buckets do not match the width and depth"));
-    }
+    let raw = r.string_of(
+        width * depth * 8,
+        "the buckets do not match the width and depth",
+    )?;
     let buckets = super::topk::buckets_from_bytes(&raw)?;
     drop(raw);
-    let places = r.string()?;
-    if places.len() as u64 != k * TOPK_SLOT as u64 {
-        return Err(r.bad("the heap does not match k"));
-    }
+    let places = r.string_of(k * TOPK_SLOT as u64, "the heap does not match k")?;
     let mut heap = Vec::with_capacity(k as usize);
     for place in places.as_chunks::<TOPK_SLOT>().0 {
         let word = |at: usize| {
             u32::from_le_bytes([place[at], place[at + 1], place[at + 2], place[at + 3]])
         };
         let (fp, len, count) = (word(0), word(4), word(16));
-        let mut item = r.string()?;
+        let mut item = r.string_of(u64::from(len) + 1, "an item does not match its length")?;
         if item.pop() != Some(0) {
             return Err(r.bad("an item does not end in a zero byte"));
-        }
-        if item.len() as u64 != u64::from(len) {
-            return Err(r.bad("an item does not match its length"));
         }
         // An empty place: no item, no fingerprint, no count.
         let empty = item.is_empty() && fp == 0 && count == 0;
@@ -427,6 +483,62 @@ pub fn read(name: &str, encver: u64, r: &mut impl Read) -> io::Result<Option<Ske
 mod tests {
     use super::*;
     use crate::sketch::bloom::{BloomChain, Params};
+
+    /// `value` (a module value as [`super::read`] takes it) with the plain
+    /// string whose opcode is at `at` LZF-compressed, as Redis writes one:
+    /// that one, then the same claiming another original or compressed
+    /// length (every one to be refused), then with its compressed bytes
+    /// damaged (to be refused, or read within the limits).
+    fn lzf_variants(
+        value: &[u8],
+        at: usize,
+        next: &mut impl FnMut() -> u64,
+    ) -> (Vec<u8>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut r = &value[at + 1..];
+        let (len, encoded) = rdb_length(&mut r).unwrap();
+        assert!(!encoded);
+        let (data, rest) = r.split_at(len as usize);
+        let compressed = lzf::compress(data).unwrap();
+        let build = |original: u64, clen: u64, bytes: &[u8]| {
+            let mut w = Writer {
+                out: value[..at + 1].to_vec(),
+            };
+            w.out.push(0xc0 | RDB_ENC_LZF as u8);
+            w.len(clen);
+            w.len(original);
+            w.out.extend_from_slice(bytes);
+            w.out.extend_from_slice(rest);
+            w.out
+        };
+        let clen = compressed.len() as u64;
+        let good = build(len, clen, &compressed);
+        let wrong = [
+            (len - 1, clen),
+            (len + 1, clen),
+            (1 << 40, clen),
+            (u64::MAX, clen),
+            (len, 0),
+            (len, len),
+            (len, 1 << 40),
+            (len, clen - 1),
+        ]
+        .into_iter()
+        .map(|(original, c)| build(original, c, &compressed))
+        .collect();
+        let damaged = (0..2000)
+            .map(|_| {
+                let mut c = compressed.clone();
+                if next().is_multiple_of(2) {
+                    let i = next() as usize % c.len();
+                    c[i] = next() as u8;
+                } else {
+                    c.truncate(next() as usize % c.len());
+                }
+                build(len, c.len() as u64, &c)
+            })
+            .collect();
+        (good, wrong, damaged)
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -540,6 +652,25 @@ mod tests {
                     u64::from(read.depth)
                 ));
                 assert_eq!(read.heap.len(), read.k as usize);
+            }
+        }
+        // The buckets LZF-compressed, as Redis writes them.
+        let mut w = Writer { out: Vec::new() };
+        w.uint(3);
+        w.uint(5);
+        w.uint(2);
+        w.double(0.9);
+        let (compressed, wrong, damaged) = lzf_variants(&good, w.out.len(), &mut next);
+        let Ok(Some(Sketch::TopK(read))) = super::read(TOPK_TYPE, 0, &mut &compressed[..]) else {
+            panic!("compressed buckets not read");
+        };
+        assert_eq!(read.buckets, t.buckets);
+        for bad in wrong {
+            assert!(super::read(TOPK_TYPE, 0, &mut &bad[..]).is_err());
+        }
+        for bad in damaged {
+            if let Ok(Some(Sketch::TopK(read))) = super::read(TOPK_TYPE, 0, &mut &bad[..]) {
+                assert_eq!(read.buckets.len(), 10);
             }
         }
     }

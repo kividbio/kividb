@@ -7,7 +7,8 @@
 //! decay's chances are drawn from a generator kept in the sketch, so that
 //! a replica and an AOF replay make the master's choices exactly (the
 //! commands are sent as they came), and answers are as good as Redis's
-//! rather than the same.
+//! rather than the same. A sketch restored from a `DUMP` payload (Redis's
+//! format, which has no place for the generator) starts it afresh.
 //!
 //! A write invalidates a `WATCH` on its key even when it fails, as Redis's
 //! do (see [`take_touched`]). No keyspace events, as in Redis.
@@ -15,13 +16,12 @@
 //! Beyond Redis: a sketch is held to `sketch::topk`'s size limits, and a
 //! command to a per-command amount of work, reckoned before it starts.
 //! Under `maxmemory`, a client's `TOPK.RESERVE` that would not fit evicts
-//! first, under the policy, and is refused with `OOM` only if that is not
-//! enough. A command from a master or the AOF is held to neither the
+//! first, under the policy, before it takes its key (`sketch::room`), and
+//! is refused with `OOM` only if that is not enough. A command from a master or the AOF is held to neither the
 //! per-command limit nor `maxmemory`.
 
 use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use crate::commands::bf::{parse_double, parse_ll};
 use crate::commands::ctx::Ctx;
@@ -96,21 +96,12 @@ fn resp(ctx: &Ctx) -> u8 {
 }
 
 /// Room under `maxmemory` for `bytes` more, for a command from a client:
-/// keys are evicted first as the policy allows; `OOM` if that is not
-/// enough. Nothing for a command from a master or the AOF, nor on a
-/// replica.
-fn make_room(ctx: &mut Ctx, bytes: u64) -> Result<(), Vec<u8>> {
-    let from_client = !ctx.apply_replication && !ctx.repl_state.is_slave();
-    let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed) as u64;
-    if from_client && limit != 0 && bytes != 0 && !crate::sketch::room_for(bytes) {
-        let made = limit
-            .checked_sub(bytes)
-            .is_some_and(|room| crate::eviction::make_room(ctx, room as usize, true));
-        if !made {
-            return Err(resp_error(OOM));
-        }
-    }
-    Ok(())
+/// `OOM` if they do not fit. The room was made before the command took its
+/// keys (`sketch::room`, which also stops a command here that is only asked
+/// what it wants): nothing is evicted here. Nothing for a command from a
+/// master or the AOF, nor on a replica.
+fn room(ctx: &Ctx, bytes: u64) -> Result<(), Vec<u8>> {
+    crate::sketch::room::check(ctx, |_| bytes).map_err(|_| resp_error(OOM))
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────────
@@ -149,19 +140,16 @@ fn with_sketch<T>(ctx: &Ctx, key: &[u8], f: impl FnOnce(&TopK) -> T) -> Result<T
     }
 }
 
-/// The sketch at `key` for writing, or the error a missing key or another
-/// type gets.
+/// The sketch at `key` for writing, or the error a missing key or a value
+/// that is no sketch gets; the caller tells a sketch of another type under
+/// its own lock of it.
 fn sketch_for_write(ctx: &Ctx, key: &[u8]) -> Result<Arc<parking_lot::RwLock<Sketch>>, Vec<u8>> {
     crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let map = read_lock!(shard);
     match map.get(key) {
         None => Err(resp_error(NO_KEY)),
-        Some(ValueRef::Sketch(sketch)) => match &*sketch.read() {
-            Sketch::TopK(_) => Ok(Arc::clone(sketch)),
-            #[allow(unreachable_patterns)]
-            _ => Err(resp_error(WRONGTYPE)),
-        },
+        Some(ValueRef::Sketch(sketch)) => Ok(Arc::clone(sketch)),
         Some(_) => Err(resp_error(WRONGTYPE)),
     }
 }
@@ -207,13 +195,14 @@ fn reserve(ctx: &mut Ctx) -> Vec<u8> {
     if !crate::sketch::topk::fits(k, width, depth) {
         return too_large();
     }
-    if let Err(e) = make_room(ctx, TopK::bytes_for(k, width, depth)) {
+    if let Err(e) = room(ctx, TopK::bytes_for(k, width, depth)) {
         return e;
     }
     let sketch = match TopK::new(k, width, depth, decay) {
         Ok(t) => t,
         Err(e) => return topk_error(e),
     };
+    debug_assert!(!crate::sketch::room::asking());
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let mut map = write_lock!(shard);
     if map.get(key).is_some() {
@@ -261,30 +250,34 @@ fn add_items(ctx: &mut Ctx, name: &str, pairs: bool) -> Vec<u8> {
         Ok(s) => s,
         Err(e) => return e,
     };
-    let incs = increments(ctx, pairs);
-    let copy = {
-        let guard = sketch.read();
-        let Sketch::TopK(t) = &*guard else {
-            return resp_error(WRONGTYPE);
+    if crate::sketch::room::asking() {
+        // What it would copy of the buckets and heap a snapshot or a copy
+        // shares.
+        let copy = match &*sketch.read() {
+            Sketch::TopK(t) => t.copy_bytes(),
+            #[allow(unreachable_patterns)]
+            _ => 0,
         };
-        if !ctx.apply_replication {
-            let total = incs.iter().fold(0u64, |acc, inc| {
-                acc.saturating_add(cost(t.k, t.depth, u64::from(inc.unwrap_or(0))))
-            });
-            if total > BUDGET {
-                return resp_error(OVER_BUDGET);
-            }
-        }
-        t.copy_bytes()
-    };
-    if let Err(e) = make_room(ctx, copy) {
-        return e;
+        return room(ctx, copy).err().unwrap_or_default();
     }
-    let step = if pairs { 2 } else { 1 };
+    let incs = increments(ctx, pairs);
+    // The one hold of the sketch: its type, the limits and the items.
     let mut guard = sketch.write();
     let Sketch::TopK(t) = &mut *guard else {
         return resp_error(WRONGTYPE);
     };
+    if !ctx.apply_replication {
+        let total = incs.iter().fold(0u64, |acc, inc| {
+            acc.saturating_add(cost(t.k, t.depth, u64::from(inc.unwrap_or(0))))
+        });
+        if total > BUDGET {
+            return resp_error(OVER_BUDGET);
+        }
+    }
+    if let Err(e) = room(ctx, t.copy_bytes()) {
+        return e;
+    }
+    let step = if pairs { 2 } else { 1 };
     // Redis takes the items in order up to one with an increment it does
     // not take, answers that one with the error and stops (and sends no
     // more of the reply it began, so that a client waits for the rest).
