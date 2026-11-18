@@ -988,7 +988,11 @@ and by the machine, not by the server alone. That the two builds are equal
 here says the client is the limit; the p50 and p99 are the rows that see the
 server.
 
-Run this suite on a D8s_v5 (`run-all.sh --only 18`).
+This suite declares `min_cpus=8`: the normal run on the D4s_v5 of the other
+suites does not run it (`needs_more_cpus` in `env.json`), and `--only 18` on it
+makes the run `INVALID`. Run it on a D8s_v5 with `run-all.sh --candidate <bin>
+--candidate-full <bin> --min-cpus-only --label <label>-d8s_v5` (see "How a
+release uses it").
 
 ## Recorded run, suite 19
 
