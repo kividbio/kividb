@@ -194,10 +194,10 @@ fn value_digest(h: &mut Xxh3, value: crate::store::ValueRef<'_>) {
         }
         ValueRef::SortedSet(zset) => {
             h.update(b"z");
-            for (score, member) in zset.read().by_score.keys() {
+            for (member, score) in zset.read().iter() {
                 h.update(&score.to_bits().to_le_bytes());
                 h.update(&(member.len() as u64).to_le_bytes());
-                h.update(member);
+                h.update(&member);
             }
         }
         ValueRef::Stream(stream) => {
