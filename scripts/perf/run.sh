@@ -20,6 +20,10 @@
 #   WORKLOADS=full      also INCR and DEL, and each of GET, SET, INCR, DEL
 #                       with a TTL on every key and under allkeys-lru, and
 #                       GET, SET and INCR under allkeys-lfu
+#   WORKLOADS=tags      what the hash-tag locks cost a command (#889):
+#                       GET/SET of untagged and tagged keys, MGET of 10,
+#                       a tagged EVALSHA, MULTI + 2 SET + EXEC (see
+#                       measure.sh); with EXEC=1 and CMP=plain
 #   ONLY=<regex>        measure only the workloads whose label matches
 #   PROFILE=1           keep the hottest functions of each workload in
 #                       target/perf/out-<tag>/profile-*.txt

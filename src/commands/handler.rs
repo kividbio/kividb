@@ -1910,11 +1910,12 @@ fn feed_monitors(ctx: &Ctx, name: &str) {
 
 /// With scripts locked by hash tag (`tag_locks`), for a client's command:
 /// the locks of the tags of the keys it names. Out of line: only with
-/// `tag_locks` on does a command come here.
+/// `tag_locks` on does a command come here. A command none of whose keys
+/// has a `{` takes nothing, and is told so without the general list of its
+/// keys (`tag_locks::named_keys`, #889).
 #[inline(never)]
 fn lock_tags_of_named_keys(ctx: &Ctx, name: &str) -> Option<crate::tag_locks::KeysGuard> {
-    let keys = crate::keyspec::key_positions(name, &ctx.cmd);
-    crate::tag_locks::lock_keys(keys.iter().map(|pos| ctx.cmd[pos]))
+    crate::tag_locks::lock_named_keys(name, &ctx.cmd)
 }
 
 /// The order of the keys a write names (see `write_order`), and where it
