@@ -754,6 +754,41 @@ fn a_pipeline_sent_before_reading_is_answered() {
     }
 }
 
+/// The same with the first commands sent one at a time, each its own turn:
+/// the replies fill the socket a turn at a time, so a later turn finds it
+/// already full before it writes anything. The io_uring loop reads on
+/// while it writes only once a send without waiting finds the socket full;
+/// it must, whether that send took part of the replies or none of them.
+#[test]
+fn a_pipeline_sent_in_parts_before_reading_is_answered() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        let value = "v".repeat(MB);
+        assert!(server.conn().cmd(&["SET", "big", &value]).ok());
+        let mut c = server.conn();
+        c.writer
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        for i in 0..10 {
+            c.writer
+                .write_all(b"*2\r\n$3\r\nGET\r\n$3\r\nbig\r\n")
+                .unwrap_or_else(|e| panic!("{io_model}: GET {i}: {e}"));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let set = format!("*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n${MB}\r\n{value}\r\n");
+        c.writer
+            .write_all(set.repeat(16).as_bytes())
+            .unwrap_or_else(|e| panic!("{io_model}: the server stopped reading: {e}"));
+        for _ in 0..10 {
+            assert_eq!(c.read(), Some(V::Bulk(value.clone().into_bytes())));
+        }
+        for _ in 0..16 {
+            assert!(c.read().unwrap().ok());
+        }
+    }
+}
+
 /// What the server reads ahead counts against `client-query-buffer-limit`:
 /// past it, the client is closed, as Redis closes one whose query buffer
 /// reaches the limit.
