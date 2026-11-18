@@ -711,8 +711,9 @@ impl tokio_uring::OneshotOutputTransform for SendNowOutput {
 /// A batch of replies goes this way first, and nearly always all of it
 /// fits. Only a socket that is full makes the connection read on while it
 /// writes the rest (#865). The next read goes with the send only for a
-/// client that is still sending (the turn's read filled its room): for one
-/// that waits for its replies, a read submitted with them reached the
+/// client that is still sending (the turn's read filled its room), or on a
+/// worker with few connections (`FEW_CONNECTIONS`): for one that waits for
+/// its replies on a busy worker, a read submitted with them reached the
 /// kernel before the client could have answered, so the kernel parked it
 /// on every turn and woke the thread for it later, where a read submitted
 /// a turn later finds the next request there already. That was 10 % of the
@@ -898,6 +899,36 @@ const READ_BUFFER: usize = 32 * 1024;
 /// first, so a read never lands in a sliver of free space.
 const READ_MIN: usize = 8 * 1024;
 
+thread_local! {
+    /// The client connections this worker serves now (see `send_now`).
+    static CONNECTIONS_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One of `CONNECTIONS_HERE` while it lives.
+struct ConnectionHere;
+
+impl ConnectionHere {
+    fn new() -> Self {
+        CONNECTIONS_HERE.with(|n| n.set(n.get() + 1));
+        ConnectionHere
+    }
+}
+
+impl Drop for ConnectionHere {
+    fn drop(&mut self) {
+        CONNECTIONS_HERE.with(|n| n.set(n.get() - 1));
+    }
+}
+
+/// With at most this many connections on its worker, a connection's next
+/// read is submitted with its replies whatever its client does (see
+/// `send_now`): the worker has nothing else to do before the client
+/// answers, so the read is parked in the kernel either way, and going with
+/// the send saves the turn a ring round. Measured with unpipelined GETs on
+/// two workers: two connections a worker, 4 % more a second with the read
+/// sent along; four, the same rate and 3 % more CPU; eight, 10 % fewer.
+const FEW_CONNECTIONS: usize = 2;
+
 /// A connection's subscriptions, made at its first SUBSCRIBE, with the task
 /// that writes its messages. On this thread: the stream is not `Send`. It
 /// shares the fd with the connection loop and the push task, hence the guard.
@@ -975,6 +1006,7 @@ pub async fn handle_client(
         let _ = stream.write_all(denied.to_vec()).await;
         return Ok(());
     }
+    let _here = ConnectionHere::new();
 
     // ── Client registry bookkeeping ──────────────────────────────────────
     let client_id = crate::client_registry::next_client_id();
@@ -3393,12 +3425,13 @@ pub async fn handle_client(
                         };
                     }
                     // A client still sending (this turn's read filled the
-                    // room it had) has that read submitted with the send, so
-                    // that the two reach the kernel together: it finds the
-                    // next requests there at once, and the turn takes one
-                    // ring round, not two. One that waits for its replies has
-                    // it submitted on the next turn, once it has had them.
-                    if read_filled {
+                    // room it had), or one of few on this worker, has that
+                    // read submitted with the send, so that the two reach the
+                    // kernel together and the turn takes one ring round, not
+                    // two. One that waits for its replies on a busy worker
+                    // has it submitted on the next turn, by when it has
+                    // answered.
+                    if read_filled || CONNECTIONS_HERE.with(|n| n.get()) <= FEW_CONNECTIONS {
                         submit_early_read!();
                     }
                     let (sent, mut spare_buf) = send_now(&stream, spare_buf).await;
