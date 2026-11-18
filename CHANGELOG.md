@@ -341,33 +341,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before. Azure D8s_v5, the server on two vCPUs of separate cores
   (`--threads 2`, io_uring), the checks and the background load on
   CPUs of their own, the server started from a snapshot of 100,000 keys,
-  checks a second and p99 (medians of three), master before / after,
-  Redis 8.10.2 beside it:
+  checks a second and p99 (medians of three; the 1.2.2 release binary,
+  master and this change all built with rustc 1.100.0), Redis 8.10.2
+  beside it:
 
   | background (cmds/s) | 1.2.2 | before | after | Redis |
   |---|---|---|---|---|
-  | 0 | 31.4k, 0.14 ms | 31.4k, 0.15 ms | 31.7k, 0.09 ms | 31.7k, 0.10 ms |
-  | 100,000 | 23.7k, 3.7 ms | 24.4k, 3.7 ms | 31.7k, 0.15 ms | 31.8k, 0.10 ms |
-  | 150,000 | 23.3k, 4.2 ms | 21.1k, 5.0 ms | 30.1k, 1.2 ms | 31.9k, 0.11 ms |
-  | 200,000 | 23.9k, 4.3 ms | 22.2k, 5.1 ms | 25.5k, 4.2 ms | 27.7k, 0.87 ms |
-  | 300,000 | 22.3k, 5.7 ms | 18.9k, 8.3 ms | 28.4k, 0.71 ms | 23.6k, 0.98 ms |
+  | 0 | 31.5k, 0.17 ms | 31.4k, 0.22 ms | 31.5k, 0.14 ms | 31.7k, 0.11 ms |
+  | 100,000 | 30.3k, 0.74 ms | 29.9k, 0.85 ms | 31.9k, 0.10 ms | 32.0k, 0.06 ms |
+  | 150,000 | 26.6k, 3.7 ms | 25.1k, 4.0 ms | 31.8k, 0.13 ms | 32.1k, 0.05 ms |
+  | 200,000 | 23.1k, 4.2 ms | 25.1k, 4.2 ms | 31.4k, 0.59 ms | 31.9k, 0.10 ms |
+  | 300,000 | 25.1k, 3.9 ms | 22.8k, 5.1 ms | 31.2k, 0.23 ms | 22.5k, 1.2 ms |
 
   On the tokio loop, whose workers take each other's connections when one
-  is held up, the same case after the change is at or better than Redis at
-  every rate: 31.8-31.9k checks a second at a p99 of 0.07-0.09 ms up to
-  200,000, 27.6k at 0.74 ms at 300,000.
-  The server's CPU at 0 went from 76 % to 53 % (44 % with no backlog), and
-  pipelined `SET` on such a server (`redis-benchmark -c 50`) from 0.87M
-  to 1.15M a second at pipeline 16 (1.34M with no backlog) and from 1.34M
-  to 1.48M at 100 (3.5M with no backlog); `GET` and a server with no
-  backlog are unchanged.
-  At 150,000 and 200,000 the two io_uring workers are still at times put
-  on one CPU by the scheduler, and connections wait out the other's time
-  slice: pinned each to a CPU of its own (by hand, with `taskset`), the
-  same server keeps 31.3-31.6k checks a second at a p99 of 0.17-0.22 ms
-  there. A server with no backlog (one
-  started empty, as benchmarks start it) is unchanged: 31.7-31.8k checks a
-  second at a p99 of 0.07-0.09 ms at every rate. Suite
+  is held up, the same case after the change: 31.7-32.0k checks a second
+  at a p99 of 0.06-0.11 ms at every rate. Pipelined `SET` on such a
+  server (`redis-benchmark -c 50`) went from 0.94M to 1.16M a second at
+  pipeline 16 and from 1.30M to 1.50M at 100; `GET` is unchanged.
+  At 200,000 the two io_uring workers are still at times put on one CPU by
+  the scheduler, and connections wait out the other's time slice (0.17,
+  0.59 and 1.0 ms in three runs): `worker-cpu-affinity auto` binds each to
+  a CPU of its own. A server with no backlog (one started empty, as
+  benchmarks start it) does none of this: 31.6-31.9k checks a second at a
+  p99 of 0.06-0.10 ms at every rate. `WAIT` with no replica attached no
+  longer waits for the replication thread (it has nothing to count): 62 us
+  a call, 1.99 ms before this, 83 us on master; an idle server with the
+  backlog kept uses 0.13 % of a CPU, as before. Suite
   `27-ratelimit-restarted` measures it.
 
 - **Pub/sub fan-out delivers 18-29 % more messages a second, ahead of

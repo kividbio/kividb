@@ -226,7 +226,9 @@ pub struct ReplState {
     /// How many times the hub has waited to be woken by the next message,
     /// its inbox empty. With no replica attached it sleeps a moment instead
     /// while writes keep coming (#894): each such wait is a wake-up some
-    /// write has to pay for.
+    /// write has to pay for. Tests only: the release layout of this struct,
+    /// which every write reads, stays as it was.
+    #[cfg(test)]
     pub hub_parks: AtomicU64,
     /// `repl-backlog-size`, in bytes; and `repl-backlog-ttl`, in seconds
     /// (0 = keep the backlog for ever).
@@ -584,6 +586,7 @@ impl ReplState {
             full_sync_guard_ratio: AtomicU64::new(50),
             master_credentials: RwLock::new((String::new(), String::new())),
             backlog_active: AtomicBool::new(false),
+            #[cfg(test)]
             hub_parks: AtomicU64::new(0),
             backlog_size: AtomicU64::new(64 * 1024 * 1024),
             backlog_ttl_secs: AtomicU64::new(3600),
@@ -2864,6 +2867,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                 }
                 None => {
                     let pace = std::mem::take(&mut paced);
+                    #[cfg(test)]
                     if !pace {
                         state.hub_parks.fetch_add(1, Ordering::Relaxed);
                     }
@@ -5195,7 +5199,7 @@ mod replication_invariants_tests {
 
     /// A hub on a thread of its own, as the server runs it, keeping the
     /// backlog and with no replica; returned once it has waited once.
-    fn paced_hub(state: &Arc<ReplState>) -> HubTx {
+    fn paced_hub(state: &Arc<ReplState>) -> super::HubTx {
         state.backlog_active.store(true, Ordering::Relaxed);
         let (give, take) = std::sync::mpsc::channel();
         let hub_state = Arc::clone(state);
@@ -5224,7 +5228,7 @@ mod replication_invariants_tests {
 
     /// `writes` writes about 50 us apart: how many times the hub waited to
     /// be woken meanwhile.
-    fn spaced_writes(state: &ReplState, hub: &HubTx, writes: u64) -> u64 {
+    fn spaced_writes(state: &ReplState, hub: &super::HubTx, writes: u64) -> u64 {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let before = state.hub_parks.load(Ordering::Relaxed);
         for _ in 0..writes {
