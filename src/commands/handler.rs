@@ -1835,7 +1835,22 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     } else {
         (None, false)
     };
-    let result = match dispatch_command_handlers(ctx, name) {
+    // A script command is none of the handlers': each was asked, and every
+    // one of them said no, before it got to `lua::handle` (#901: 1,400
+    // instructions an `EVALSHA`). With Lua it goes there at once.
+    #[cfg(feature = "lua")]
+    let script = matches!(
+        name,
+        "EVALSHA" | "EVAL" | "EVALSHA_RO" | "EVAL_RO" | "FCALL" | "FCALL_RO"
+    );
+    #[cfg(not(feature = "lua"))]
+    let script = false;
+    let dispatched = if script {
+        None
+    } else {
+        dispatch_command_handlers(ctx, name)
+    };
+    let result = match dispatched {
         Some(result) => result,
         None => not_dispatched(ctx, name),
     };
