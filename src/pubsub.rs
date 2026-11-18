@@ -16,6 +16,7 @@
 //! subscriptions left, when it is an ordinary connection again.
 
 use crate::client_registry::{Activity, ClientRegistry};
+use crate::cpus::BuilderExt as _;
 use crate::output_limits::{Class, Limits, OutputLimits};
 use ahash::{AHashMap, AHashSet};
 use parking_lot::{Mutex, RwLock};
@@ -416,7 +417,7 @@ impl PubSubHub {
 fn watch_soft_limit(shared: std::sync::Weak<Shared>) {
     let _ = std::thread::Builder::new()
         .name("kividb-pubsub-limit".into())
-        .spawn(move || {
+        .spawn_released(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 let Some(shared) = shared.upgrade() else {

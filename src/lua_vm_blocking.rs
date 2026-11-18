@@ -10,12 +10,13 @@
 //! shown itself to be quick (`FAST_SCRIPTS`): after one run under `PROMOTE_US` it runs on the
 //! worker, like any other command, and one run over `DEMOTE_US` there sends it back to the pool.
 
-#[cfg(feature = "lua")]
 use crate::commands::ctx::AofSender;
 #[cfg(feature = "lua")]
 use crate::commands::ctx::Ctx;
 #[cfg(feature = "lua")]
 use crate::commands::execute_command;
+#[cfg(feature = "lua")]
+use crate::cpus::BuilderExt as _;
 
 /// The AOF queue, as a script run on another thread holds it. Both server
 /// paths queue on a tokio channel.
@@ -384,7 +385,7 @@ fn runner() -> &'static Runner {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<&'static Runner>();
         let handle = std::thread::Builder::new()
             .name("script-runner".into())
-            .spawn(move || {
+            .spawn_released(move || {
                 let runner = ready_rx.recv().expect("the script runner is given itself");
                 runner.run();
             })
@@ -524,7 +525,7 @@ pub(crate) async fn run_lua_vm_blocking(
     if key.is_some() {
         crate::stats::scripts::offloaded_to_pool();
     }
-    let (resp, sel_out, elapsed_us, ran_us) = tokio::task::spawn_blocking(move || {
+    let (resp, sel_out, elapsed_us, ran_us) = crate::cpus::spawn_blocking(move || {
         let t0 = std::time::Instant::now();
         let (r, db) = env.run_execute(owned, sel, aof_enabled, client_resp);
         let elapsed_us = t0.elapsed().as_micros() as u64;

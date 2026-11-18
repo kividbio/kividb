@@ -314,7 +314,7 @@ mod tests {
         let guard = lock_keys(0, [b"k".as_slice()].into_iter());
         let entered = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&entered);
-        let other = std::thread::spawn(move || {
+        let other = crate::cpus::spawn(move || {
             let _guard = lock_keys(0, [b"other".as_slice(), b"k".as_slice()].into_iter());
             flag.store(true, Ordering::SeqCst);
         });
@@ -342,7 +342,7 @@ mod tests {
         for _ in 0..100 {
             let held = hold();
             let (got, get) = std::sync::mpsc::channel();
-            let other = std::thread::spawn(move || {
+            let other = crate::cpus::spawn(move || {
                 beside();
                 let _ = got.send(());
             });
@@ -362,7 +362,7 @@ mod tests {
         let shared = lock_key_shared(0, b"t");
         let entered = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&entered);
-        let whole = std::thread::spawn(move || {
+        let whole = crate::cpus::spawn(move || {
             let _guard = lock_keys(0, [b"t".as_slice()].into_iter());
             flag.store(true, Ordering::SeqCst);
         });
@@ -376,7 +376,7 @@ mod tests {
         let whole = lock_keys(0, [b"u".as_slice(), b"t".as_slice()].into_iter());
         let entered = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&entered);
-        let shared = std::thread::spawn(move || {
+        let shared = crate::cpus::spawn(move || {
             let _guard = lock_key_shared(0, b"t");
             flag.store(true, Ordering::SeqCst);
         });
@@ -405,7 +405,7 @@ mod tests {
         let first = lock_keys_shared(0, keys.into_iter());
         let entered = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&entered);
-        let whole = std::thread::spawn(move || {
+        let whole = crate::cpus::spawn(move || {
             let _guard = lock_keys(0, [b"ms:b".as_slice()].into_iter());
             flag.store(true, Ordering::SeqCst);
         });
@@ -445,7 +445,7 @@ mod tests {
         let entered = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&entered);
         // An expiry of the key in database 3.
-        let other = std::thread::spawn(move || {
+        let other = crate::cpus::spawn(move || {
             let _guard = lock_keys(3, [b"m".as_slice()].into_iter());
             flag.store(true, Ordering::SeqCst);
         });
@@ -462,7 +462,7 @@ mod tests {
         let (a, b) = (b"order:a".as_slice(), b"order:b".as_slice());
         assert_ne!(stripe_of(0, a), stripe_of(0, b));
         let _guard = lock_keys(0, [a].into_iter());
-        std::thread::spawn(move || {
+        crate::cpus::spawn(move || {
             let _guard = lock_keys(0, [b].into_iter());
         })
         .join()
@@ -499,7 +499,7 @@ mod tests {
         let entered = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&entered);
         // An `HSET` of the key the walk is at.
-        let write = std::thread::spawn(move || {
+        let write = crate::cpus::spawn(move || {
             let _guard = lock_keys(0, [b"doc:1".as_slice()].into_iter());
             flag.store(true, Ordering::SeqCst);
         });
@@ -527,7 +527,7 @@ mod tests {
     fn opposite_key_orders_do_not_deadlock() {
         let threads: Vec<_> = (0..8)
             .map(|t| {
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     for i in 0..2000 {
                         let keys: [&[u8]; 3] = if (t + i) % 2 == 0 {
                             [b"x", b"y", b"z"]

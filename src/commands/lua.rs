@@ -1213,7 +1213,7 @@ fn keep_the_runtime_listening() {
         && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
     {
         let remote = handle.clone();
-        handle.spawn_blocking(move || {
+        crate::cpus::spawn_blocking_on(&handle, move || {
             remote.spawn(async {});
         });
     }
@@ -6129,7 +6129,7 @@ mod lua_busy_allow_tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         for flusher in [true, false] {
             let done_tx = done_tx.clone();
-            std::thread::spawn(move || {
+            crate::cpus::spawn(move || {
                 for _ in 0..200_000 {
                     if flusher {
                         let _ = flush_functions(false);

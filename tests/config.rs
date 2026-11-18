@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/config.rs
 use std::thread;
 // tests/config.rs

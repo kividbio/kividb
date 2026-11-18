@@ -2065,7 +2065,7 @@ mod tests {
         let key = |i: usize| format!("{i:0>3000}");
         let expires = ttl.then_some(u64::MAX / 2);
         // Made on a thread that ends, so that its slabs are nobody's.
-        let mut map = std::thread::spawn(move || {
+        let mut map = crate::cpus::spawn(move || {
             let mut map = ShardMap::new();
             for i in 0..64 {
                 map.insert_str_expiring(key(i), b"v", expires);
@@ -2178,7 +2178,7 @@ mod tests {
         let members: Vec<Vec<u8>> = (-30i64..30).map(|n| n.to_string().into_bytes()).collect();
         // Made on a thread that ends, so that its slabs are nobody's.
         let setup = members.clone();
-        let mut map = std::thread::spawn(move || {
+        let mut map = crate::cpus::spawn(move || {
             let mut map = ShardMap::new();
             for i in 0..64 {
                 let mut set = MemberSet::new();
@@ -2869,7 +2869,7 @@ mod tests {
         let now = crate::commands::helpers::now_ms() + 1_000_000_000;
         let late = now + 3_600_000;
         // Made on a thread that ends, so that its slabs are nobody's.
-        let mut map = std::thread::spawn(move || {
+        let mut map = crate::cpus::spawn(move || {
             let mut map = ShardMap::new();
             for i in 0..64 {
                 map.insert_str_expiring(long(i), b"v", Some(late));
