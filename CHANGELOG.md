@@ -102,8 +102,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wrapper that does this, and clippy refuses a direct `thread::spawn` or `spawn_blocking`.
   It is not a fix for the rate limiter's p99 on its own. Azure D8s_v5, a rate limiter
   (`INCRBY` + `EXPIRE`, 65 connections) beside 100 connections of pipelined load, the server
-  on two vCPUs of separate cores started from a snapshot, checks a second and p99 on master,
-  off / auto / Redis 8.10.2: 25.2k at 3.9 ms / 30.9k at 2.7 ms / 32.0k at 0.06 ms at
+  on two vCPUs of separate cores started from a snapshot, checks a second and p99 before
+  #919, off / auto / Redis 8.10.2: 25.2k at 3.9 ms / 30.9k at 2.7 ms / 32.0k at 0.06 ms at
   150,000 commands a second of load, 21.5k at 5.2 / 28.9k at 3.5 / 31.9k at 0.10 ms at
   200,000, and at 300,000 `auto` is worse: 23.7k at 6.9 ms / 24.2k at 8.3 ms / 22.6k at
   1.4 ms. The p99 is fixed by #919's backlog change; with it `auto` differs from `off` only

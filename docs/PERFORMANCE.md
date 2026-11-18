@@ -282,7 +282,7 @@ of the limiter's own time after each check) beside 100 connections of pipelined 
 `EXPIRE` pairs at a fixed rate; the server on vCPUs 0 and 2 (one hyper-thread of two
 cores, `--threads 2`, io_uring), the checks on 4-5 and the load on 6-7; the server started
 from a snapshot of 100,000 keys, so that it keeps a replication backlog with no replica.
-Checks a second and their p99, on master:
+Checks a second and their p99, on master before #919 (ea84fc08):
 
 | background | off | auto | Redis 8.10.2 |
 |---|---|---|---|
@@ -298,9 +298,9 @@ their CPUs, and at 300,000 `auto` is worse than `off` (8.3 against 6.9 ms). Redi
 core, is saturated at 300,000. On the tokio I/O model `auto` binds nothing: its workers take
 each other's connections (31.5-32.0k at 0.06-0.16 ms at every rate, both settings).
 
-What fixes the p99 is [#919](https://github.com/kividbio/kividb/pull/919) (a backlog with no
-replica wakes that thread once a millisecond, not for each write): with it, measured on its
-branch, `off` gives 31.8k / 0.11, 31.4k / 0.50, 31.1k / 1.8 and 30.9k / 0.27 ms at 100,000 to
+What fixes the p99 is [#919](https://github.com/kividbio/kividb/pull/919), now on master (a
+backlog with no replica wakes that thread once a millisecond, not for each write): with it
+merged in, `off` gives 31.8k / 0.11, 31.4k / 0.50, 31.1k / 1.8 and 30.9k / 0.27 ms at 100,000 to
 300,000, and `auto` 31.8k / 0.10, 31.7k / 0.14, 31.6k / 0.17 and 30.9k / 0.26 ms; `auto` then
 differs from `off` only at 150,000-200,000.
 
