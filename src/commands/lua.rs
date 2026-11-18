@@ -830,6 +830,25 @@ thread_local! {
 /// Clears script evaluation context when leaving `EVAL` / `FCALL`.
 struct ClearScriptEval<'a> {
     lua: &'a Lua,
+    /// Whether the script's `KEYS` and `ARGV` are big enough to be worth
+    /// letting go of now ([`arguments_worth_releasing`]).
+    release_arguments: bool,
+}
+
+/// Arguments of more than this many bytes are let go of when their script
+/// ends; smaller ones stay in `KEYS` and `ARGV` until the next script
+/// replaces them, unseen by anyone (#901: replacing them after every script
+/// was a tenth of what `return 1` cost).
+const RELEASE_ARGUMENTS_BYTES: usize = 4096;
+
+fn arguments_worth_releasing<A: AsRef<[u8]>>(keys: &[A], argv: &[A]) -> bool {
+    keys.len() + argv.len() > 64
+        || keys
+            .iter()
+            .chain(argv)
+            .map(|a| a.as_ref().len())
+            .sum::<usize>()
+            > RELEASE_ARGUMENTS_BYTES
 }
 
 impl Drop for ClearScriptEval<'_> {
@@ -837,6 +856,9 @@ impl Drop for ClearScriptEval<'_> {
         SCRIPT_EVAL.with(|c| {
             *c.borrow_mut() = None;
         });
+        if !self.release_arguments {
+            return;
+        }
         // The arguments are let go of. What stands in for them until the
         // next script sets its own is one empty table kept with the VM (in
         // its registry): no script sees it, each being given new tables
@@ -4768,7 +4790,10 @@ fn eval_script(
         });
     });
 
-    let _clear_eval = ClearScriptEval { lua };
+    let _clear_eval = ClearScriptEval {
+        lua,
+        release_arguments: arguments_worth_releasing(keys, argv),
+    };
     // What the script writes goes to replicas between a `MULTI` and an
     // `EXEC`, and to the AOF as one piece, when it ends (#172).
     let _propagation =
@@ -4887,7 +4912,10 @@ fn eval_function_call(
         });
     });
 
-    let _clear_eval = ClearScriptEval { lua };
+    let _clear_eval = ClearScriptEval {
+        lua,
+        release_arguments: arguments_worth_releasing(&keys, &argv),
+    };
     // What the script writes goes to replicas between a `MULTI` and an
     // `EXEC`, and to the AOF as one piece, when it ends (#172).
     let _propagation =
