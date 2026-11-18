@@ -571,6 +571,8 @@ fn journal_flushes_writes(path: &Path) -> bool {
         return false;
     }
     // SAFETY: statfs succeeded and filled it in.
+    // `f_type`'s type differs between targets.
+    #[allow(clippy::unnecessary_cast)]
     let kind = unsafe { fs.assume_init() }.f_type as i64;
     kind == EXT4 || kind == XFS
 }
