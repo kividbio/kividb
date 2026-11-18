@@ -1584,9 +1584,19 @@ fn a_full_sync_cut_off_part_way_costs_the_replica_nothing() {
     let replica = Server::start(&[]);
     let (mut m, mut r) = (master.conn(), replica.conn());
 
-    // A few megabytes on the master, so that there is a middle to cut in.
-    let value = "x".repeat(400);
+    // A few megabytes on the master, so that there is a middle to cut in:
+    // values that do not compress to nothing, so that the payload is
+    // megabytes compressed too (#879).
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
     for i in 0..15_000 {
+        let value: String = (0..25)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                format!("{x:016x}")
+            })
+            .collect();
         assert!(m.cmd(&["SET", &format!("big:{i}"), &value]).ok());
     }
     // And a dataset of its own on the replica.

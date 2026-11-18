@@ -103,7 +103,7 @@ def run(ctx):
         loads = []
         for _ in range(2):
             t = time.perf_counter()
-            again = ns.start(args=("--dir", first.dir))
+            again = ns.start(dir=first.dir)
             ready = (time.perf_counter() - t) * 1000
             got = again.client().dbsize()
             assert got == n, (got, n)
