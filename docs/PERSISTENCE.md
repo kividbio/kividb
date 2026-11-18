@@ -502,15 +502,21 @@ until each one lists it, and send each `CLUSTER SAVECONFIG`.
 **How it is written.** To a temporary file beside it
 (`nodes.conf.tmp-<n>`), synced, renamed over it, and the directory synced:
 a crash at any moment leaves the old file or the new one, never part of
-one. On Linux the file a save replaces is not removed: the two are
-exchanged, and once the save is synced the next save writes over the old
-one in place, so that it waits on one sync of the disk's journal (the
-rename's) rather than two. nodes.conf is then 64 KiB long, blank lines
-after its `vars` line, which every version reads. Temporary files a crash
-left are removed at startup. The one
-exception is the takeover at the end of a slot migration's handover, which
-does not wait for the sync while client writes are paused: a power failure
-in the moment after it can leave the file incomplete.
+one. Every save writes a new file; nothing is written over in place. On
+Linux it is written past the page cache, padded with blank lines to a
+multiple of 4 KiB, as before. Temporary files a crash left are removed at
+startup. The one exception is the takeover at the end of a slot
+migration's handover, which does not wait for the sync while client writes
+are paused: a power failure in the moment after it can leave the file
+incomplete.
+
+**Failover needs a disk that syncs it quickly.** A master saves its vote,
+synced, before it sends it, and a replica its promotion, so a failover
+waits on several saves, each two syncs of the disk (the file's and the
+directory's). A candidate counts a vote for as long as its election lives,
+10 seconds, and then stands again at a new epoch: a vote whose save takes
+longer than that is never counted, and the failover does not complete.
+RESULTS_DOCS
 
 **A file cut short is refused.** A `nodes.conf` that does not end with its
 `vars` line stops the node at startup with `cluster config file

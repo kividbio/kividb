@@ -958,10 +958,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   node meet the first) are saved together, in one write. The vote's save
   no longer holds up the cluster bus, and a candidate counts a vote for
   as long as its election lives (it waited the node timeout, at least
-  2 s): a voter on a slow disk answers once its vote is saved. On Linux a
-  save writes over, in place, the file the save before it replaced, so
-  that it waits on one sync of the disk's journal, not two; nodes.conf is
-  then 64 KiB long, blank lines after the `vars` line, which 1.2 reads.
+  2 s): a voter on a slow disk answers once its vote is saved. A save
+  now waits on two syncs (the file before its rename, the directory
+  after), so on a slow disk a failover takes longer than before; see
+  [PERSISTENCE.md](docs/PERSISTENCE.md#the-clusters-nodesconf) for what
+  it needs of the disk.
 
 - **`CLIENT UNBLOCK` reaches a client that was woken and is parking
   again.** It could answer 1 for a client blocked in `BLPOP` (or another
