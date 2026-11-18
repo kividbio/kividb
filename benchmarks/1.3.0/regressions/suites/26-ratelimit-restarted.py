@@ -13,40 +13,37 @@ was handed to the replication thread one by one, waking it each time. On two
 CPUs that thread took them from the connections.
 
 So each engine is started, loaded with 100,000 keys, saved and stopped, and
-started again from that snapshot (KiviDB: `repl_backlog_active:1`, recorded).
-Its threads are pinned to two CPUs of separate cores; the checks and the
-background load run on CPUs of their own:
+started again from that snapshot (KiviDB: `repl_backlog_active:1`, kept in
+the raw data). On the standard 4-vCPU VM (two cores, two hyper-threads each,
+the first four CPUs this process may use if it has more): the server's
+threads on CPUs 0 and 2 (one hyper-thread of each core), the checks on 1, the
+background load on 3:
 
   checks      65 connections, each a closed loop of checks with 2 ms of the
-              limiter's own time after each (about 31,000 checks a second
-              when the server is idle)
+              limiter's own time after each (about 21,600 checks a second
+              on one hyper-thread, whatever the server)
   background  100 connections sending `INCRBY` + `EXPIRE` pairs, paced to
               BG_RATES commands a second in all
 
-Needs 8 CPUs (server on CPUs 0 and 2, checks on 4-5, background on 6-7; two
-background threads reach 300,000 commands a second) and a C compiler: the
-load is `lib/ratelimit_load.c`, built once into $REGRESS_CACHE.
+Needs a C compiler: the load is `lib/ratelimit_load.c`, built once into
+$REGRESS_CACHE. The #894 issue's own shape (checks and load on CPUs of their
+own, up to 300,000 a second) needs 8 CPUs; the PR measured it by hand.
 
 Metrics, for each background rate (median of 3 rounds of 10 s):
 
   checks_per_s_bg<k>  checks a second
   p99_ms_bg<k>        p99 of a check, request to last reply
 
-KiviDB's `repl_backlog_active` after the restart (1: the case of #894) is
-kept in the raw data.
-
 Gates: checks a second 10 % and at most 1.05x worse than Redis this session;
 the p99 is scheduling on a shared VM (jitter): 100 % or 0.5 ms, and with
-background load, 60 % of the gain over v1.2.2 kept. Not against Redis's p99:
-with the backlog kept every write is still encoded and handed on, and at
-100,000 the candidate's 0.15 ms was 2.4x Redis's 0.06 ms in the first run.
+background load, 60 % of the gain over v1.2.2 kept. On D8s_v5 restricted to
+these four CPUs (rustc 1.99.1 builds): p99 at 0 and 50,000, master 0.3-3.4
+and 0.9-3.5 ms, the change 0.31-0.33 and 0.45-0.48 ms, Redis 0.25 and
+0.66-0.70 ms.
 
-The 200,000 rows are shown, not gated (UNGATED): that is the part of #894
-still open. With three busy threads on the two CPUs (the workers and the
-replication thread) the scheduler at times puts both io_uring workers on
-one CPU, and in two runs of three the candidate fell to 19-21k checks a
-second at a p99 of 5 ms (31.3k at 0.3 ms in the third). Gate them once the
-workers keep a CPU each.
+The 100,000 rows are shown, not gated (UNGATED): the clients share the
+server's cores, and there Redis, master and the change all had a p99 of
+3.4-6 ms; they measure the clients.
 """
 import os
 import re
@@ -58,10 +55,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import (Suite, Config, THROUGHPUT, KEEP_IMPROVEMENT, rel, vs_redis, jitter, info, median)  # noqa: E402
 from nodes import Nodes  # noqa: E402
 
-S = Suite("25-ratelimit-restarted", [Config("t2", threads=2, self_hosted=True)])
+S = Suite("26-ratelimit-restarted", [Config("t2", threads=2, self_hosted=True)])
 KEYS = 100_000
-BG_RATES = (0, 100_000, 200_000, 300_000)
-UNGATED = (200_000,)
+BG_RATES = (0, 50_000, 100_000)
+UNGATED = (100_000,)
 ROUNDS = 3
 SECONDS = 10
 THINK_US = 2000
@@ -80,11 +77,13 @@ def load_binary():
 
 
 def cpus():
-    """Server, checks and background CPUs: two separate cores for the server."""
+    """Server, checks and background CPUs, of the first four this process may
+    use: the server on the first and third (separate cores on a D4s_v5,
+    whose CPUs 0-1 and 2-3 are the two hyper-threads of a core)."""
     have = sorted(os.sched_getaffinity(0))
-    if len(have) < 8:
-        raise RuntimeError("25-ratelimit-restarted needs 8 CPUs, this process may use %d" % len(have))
-    return have[0:3:2], have[4:6], have[6:8]
+    if len(have) < 4:
+        raise RuntimeError("26-ratelimit-restarted needs 4 CPUs, this process may use %d" % len(have))
+    return [have[0], have[2]], [have[1]], [have[3]]
 
 
 def pin(pid, which):

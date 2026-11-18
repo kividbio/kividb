@@ -4914,9 +4914,18 @@ pub async fn wait_for_replicas(
         reply: crate::resp::write::resp_integer(n).to_vec(),
         close: false,
     };
-    let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
-    if hub_tx.send(HubMsg::Barrier(barrier_tx)).is_ok() {
-        let _ = barrier_rx.await;
+    // The barrier makes the targets of the replicas attached now exact. With
+    // none attached there is nothing for it to make exact: a replica that
+    // attaches while this waits has its target taken when it is first seen,
+    // barrier or not. So no barrier then, as `EXEC` takes none for a queued
+    // `WAIT` without replicas: with the backlog kept and no replica the hub
+    // looks at its inbox about once a millisecond (#894), and `WAIT 0 0`
+    // would wait for that.
+    if !state.replica_progress.lock().is_empty() {
+        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+        if hub_tx.send(HubMsg::Barrier(barrier_tx)).is_ok() {
+            let _ = barrier_rx.await;
+        }
     }
     let mut targets = WaitTargets::default();
     let deadline = (timeout_ms > 0)
@@ -5182,6 +5191,129 @@ mod replication_invariants_tests {
             "timed out waiting connected_replicas={want}, got {}",
             state.connected_replicas.load(Ordering::Relaxed)
         );
+    }
+
+    /// A hub on a thread of its own, as the server runs it, keeping the
+    /// backlog and with no replica; returned once it has waited once.
+    fn paced_hub(state: &Arc<ReplState>) -> HubTx {
+        state.backlog_active.store(true, Ordering::Relaxed);
+        let (give, take) = std::sync::mpsc::channel();
+        let hub_state = Arc::clone(state);
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    give.send(start_hub(hub_state)).unwrap();
+                    std::future::pending::<()>().await;
+                });
+        });
+        let hub = take.recv().unwrap();
+        hub.send(HubMsg::Resume { offset: 0 }).unwrap();
+        let settle = std::time::Instant::now();
+        while state.hub_parks.load(Ordering::Relaxed) == 0 {
+            assert!(
+                settle.elapsed() < std::time::Duration::from_secs(5),
+                "the hub never waited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        hub
+    }
+
+    /// `writes` writes about 50 us apart: how many times the hub waited to
+    /// be woken meanwhile.
+    fn spaced_writes(state: &ReplState, hub: &HubTx, writes: u64) -> u64 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let before = state.hub_parks.load(Ordering::Relaxed);
+        for _ in 0..writes {
+            hub.send(HubMsg::Propagate(Arc::from(super::REPL_PING)))
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        let (done, barrier) = tokio::sync::oneshot::channel();
+        hub.send(HubMsg::Barrier(done)).unwrap();
+        barrier.blocking_recv().unwrap();
+        state.hub_parks.load(Ordering::Relaxed) - before
+    }
+
+    /// A replica that attaches while the hub is paced (#894) is sent the
+    /// writes after it at once, every one woken for, and once it has gone
+    /// the hub is paced again.
+    #[test]
+    fn hub_paced_attach_is_streamed_at_once_and_detach_paces_it_again() {
+        let state = Arc::new(ReplState::new_master());
+        let hub = paced_hub(&state);
+        let parks = spaced_writes(&state, &hub, 200);
+        assert!(parks < 50, "paced: woken for {parks} of 200 writes");
+
+        // Attaches in the middle of the writes, during a sleep.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ReplPayload>();
+        for _ in 0..5 {
+            hub.send(HubMsg::Propagate(Arc::from(super::REPL_PING)))
+                .unwrap();
+        }
+        hub.send(HubMsg::RegisterChannel {
+            addr: "test-replica".into(),
+            peer_ip: "127.0.0.1".into(),
+            peer_port: 9_010,
+            tx,
+            replica_id: 9010,
+            pending_bytes: Arc::default(),
+            base: 0,
+            slot_imports: false,
+        })
+        .unwrap();
+        let attached = std::time::Instant::now();
+        while state.connected_replicas.load(Ordering::Relaxed) != 1 {
+            assert!(attached.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_micros(20));
+        }
+        let seen_after = attached.elapsed();
+        // Attached, each write is streamed as it comes, and wakes the hub.
+        let mut slowest = std::time::Duration::ZERO;
+        let mut woken = 0;
+        for i in 0..50u32 {
+            let payload: ReplPayload = Arc::from(format!("*1\r\n$4\r\nW{i:03}\r\n").as_bytes());
+            let before = state.hub_parks.load(Ordering::Relaxed);
+            let sent = std::time::Instant::now();
+            hub.send(HubMsg::Propagate(Arc::clone(&payload))).unwrap();
+            loop {
+                let got = rx.blocking_recv().expect("the replica's stream");
+                if got == payload {
+                    break;
+                }
+            }
+            slowest = slowest.max(sent.elapsed());
+            woken += u64::from(state.hub_parks.load(Ordering::Relaxed) > before);
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        eprintln!(
+            "attach seen after {seen_after:?}; slowest of 50 writes to reach the replica: {slowest:?}; \
+             hub woken for {woken}"
+        );
+        assert!(
+            seen_after < std::time::Duration::from_millis(500),
+            "{seen_after:?}"
+        );
+        assert!(
+            slowest < std::time::Duration::from_millis(500),
+            "{slowest:?}"
+        );
+        assert!(
+            woken >= 40,
+            "attached, the hub waited for only {woken} of 50 writes"
+        );
+
+        hub.send(HubMsg::Deregister(9010)).unwrap();
+        let gone = std::time::Instant::now();
+        while state.connected_replicas.load(Ordering::Relaxed) != 0 {
+            assert!(gone.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_micros(20));
+        }
+        let parks = spaced_writes(&state, &hub, 200);
+        assert!(parks < 50, "detached: woken for {parks} of 200 writes");
     }
 
     /// RegisterChannel must bump `connected_slaves` inside the hub task (pairs with Deregister).
