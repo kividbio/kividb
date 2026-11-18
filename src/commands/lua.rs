@@ -3981,8 +3981,63 @@ fn install_redis_eval_handlers(lua: &Lua) -> Result<(), String> {
     redis_table
         .set("pcall", fast_pcall)
         .map_err(|e| e.to_string())?;
+    install_global_lookup(lua)?;
     lua.set_app_data(RedisHandlersInstalled);
     Ok(())
+}
+
+/// What a global missing from `_G` is, made a table (#901). The globals'
+/// `__index` is `env_index`, a Lua function, so every `redis.call(...)`
+/// began with a call of it to find `redis`. In its place goes a table that
+/// holds what `env_index` gives for `_G`, `redis`, `cjson`, `cmsgpack` and
+/// `bit`, and whose own `__index` hands any other name to `env_index` (by a
+/// tail call: its error names the script's line, as before).
+/// `getmetatable(_G).__index` still gives `env_index`: the table is not
+/// reachable from a script, which could otherwise change it with `rawset`.
+///
+/// Done once a VM, when it runs its first script, and not when it is made:
+/// what a new VM allocates moves what the functions VM holds after a run of
+/// `FUNCTION LOAD`s (`test_function_loads_are_collected`). Nothing a script
+/// sent has run in the VM before this.
+const GLOBAL_LOOKUP: &str = r#"
+local G, globals_mt, view_mt = ...
+local env_index = rawget(globals_mt, "__index")
+local lookup = { _G = G }
+for _, name in ipairs({ "redis", "cjson", "cmsgpack", "bit" }) do
+    lookup[name] = env_index(G, name)
+end
+setmetatable(lookup, {
+    __index = function(_, k)
+        return env_index(G, k)
+    end,
+    __newindex = rawget(globals_mt, "__newindex"),
+})
+rawset(globals_mt, "__index", lookup)
+rawset(view_mt, "__index", function(_, k)
+    if k == "__index" then
+        return env_index
+    end
+    return globals_mt[k]
+end)
+"#;
+
+fn install_global_lookup(lua: &Lua) -> Result<(), String> {
+    let globals = lua.globals();
+    let Some(globals_mt) = globals.metatable() else {
+        return Ok(());
+    };
+    // The view of the globals' metatable that `getmetatable(_G)` gives.
+    let getmetatable: LuaFunction = globals.raw_get("getmetatable").map_err(|e| e.to_string())?;
+    let view: LuaTable = getmetatable
+        .call(globals.clone())
+        .map_err(|e| e.to_string())?;
+    let Some(view_mt) = view.metatable() else {
+        return Ok(());
+    };
+    lua.load(GLOBAL_LOOKUP)
+        .set_name("=kividb_globals")
+        .call::<()>((globals, globals_mt, view_mt))
+        .map_err(|e| e.to_string())
 }
 
 fn set_global_keys_argv<A: AsRef<[u8]>>(lua: &Lua, keys: &[A], argv: &[A]) -> Result<(), String> {
