@@ -11,6 +11,7 @@
 - [Memory of small sets](#memory-of-small-sets)
 - [Memory of small hashes](#memory-of-small-hashes)
 - [Worker threads](#worker-threads)
+- [Worker CPU affinity](#worker-cpu-affinity)
 - [Earlier runs](#earlier-runs)
 - [Independent reviews](#independent-reviews)
 
@@ -239,6 +240,56 @@ Unpipelined, 500 connections, ops/s and p99:
   p99 of 27.5 ms, one 119k at 4.7 ms; with `--cpus 2.5`, three workers 282k at 18.2 ms,
   two 273k at 2.1 ms; and with `--cpus 2`, three workers 223k at 35.6 ms, two 270k at
   2.0 ms. Auto rounds the quota down.
+
+## Worker CPU affinity
+
+`worker-cpu-affinity auto` against `off`
+([#894](https://github.com/kividbio/kividb/issues/894); see
+[CONFIGURATION.md](CONFIGURATION.md#worker-cpu-affinity)), measured in November 2026 on one
+Azure `Standard_D8s_v5` (8 vCPUs, 4 cores of two hyper-threads), every binary built with
+rustc 1.100.0 (as releases are), medians of three runs.
+
+**A rate limiter beside other replicas' load.** envoyproxy/ratelimit's checks (`INCRBY` +
+`EXPIRE` on two keys, the four in one write; 65 connections, each a closed loop with 2 ms
+of the limiter's own time after each check) beside 100 connections of pipelined `INCRBY` +
+`EXPIRE` pairs at a fixed rate; the server on vCPUs 0 and 2 (one hyper-thread of two
+cores, `--threads 2`, io_uring), the checks on 4-5 and the load on 6-7; the server started
+from a snapshot of 100,000 keys, so that it keeps a replication backlog with no replica.
+Checks a second and their p99:
+
+| background | off | auto | with #919, off | with #919, auto | Redis 8.10.2 |
+|---|---|---|---|---|---|
+| 0 | 31.6k, 0.16 ms | 31.7k, 0.10 ms | 31.3k, 0.14 ms | 31.5k, 0.12 ms | 31.6k, 0.12 ms |
+| 100,000 | 30.1k, 0.68 ms | 31.4k, 0.26 ms | 31.8k, 0.11 ms | 31.8k, 0.10 ms | 32.0k, 0.05 ms |
+| 150,000 | 25.2k, 3.9 ms | 30.9k, 2.7 ms | 31.4k, 0.50 ms | 31.7k, 0.14 ms | 32.0k, 0.06 ms |
+| 200,000 | 21.5k, 5.2 ms | 28.9k, 3.5 ms | 31.1k, 1.8 ms | 31.6k, 0.17 ms | 31.9k, 0.10 ms |
+| 300,000 | 23.7k, 6.9 ms | 24.2k, 8.3 ms | 30.9k, 0.27 ms | 30.9k, 0.26 ms | 22.6k, 1.4 ms |
+
+Bound alone, the workers keep their CPUs but the replication thread still takes every
+write (the first two columns); with the change of #919, which lets the writes for a backlog
+with no replica wake that thread once a millisecond instead of each time, `auto` keeps the
+p99 at 0.10-0.26 ms at every rate (`off` reaches 1.8 ms at 200,000 in one run of three).
+Redis, on one core, is saturated at 300,000. On the tokio I/O model `auto` binds nothing:
+its workers take each other's connections (31.5-32.0k at 0.06-0.16 ms at every rate, both
+settings, without #919).
+
+**Throughput is unchanged.** An empty server, `redis-benchmark -c 50 -r 100000 -d 100` on
+vCPUs 4-7, `SET` / `GET` a second, off and auto:
+
+| | pipeline 1 | 16 | 100 |
+|---|---|---|---|
+| io_uring, off | 123k / 120k | 1.55M / 1.56M | 2.88M / 3.78M |
+| io_uring, auto | 123k / 120k | 1.56M / 1.57M | 2.94M / 3.82M |
+
+A `--threads 4` server on vCPUs 0-3 (each worker on one of them with `auto`), memtier with 4
+threads and 50 connections each on 4-7, `SET`:`GET` 1:1, 100 B: 311k ops/s at a p99 of
+0.94 ms, off and auto alike.
+
+**When the server shares its CPUs, leave it off.** With `stress-ng --cpu 2` busy on the
+server's two vCPUs, a bound worker cannot move to the other CPU when its own is busy:
+unpipelined `GET` from 50 connections fell from 91k a second (off) to 61k (auto), and the
+rate limiter's p99 at rest went from 1.3 to 3.0 ms (at 100,000 background, 24.5k checks a
+second at 5.9 ms against 19.6k at 6.9 ms).
 
 ## Earlier runs
 
