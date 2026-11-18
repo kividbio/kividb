@@ -30,6 +30,9 @@ the recorded candidate value is scaled to this host by an effective factor f
 (rates x f, times / f; f < 1 = this host is slower):
   own  = the metric's own v1.2.2 now/recorded (None if v1.2.2 lacks it);
   grp  = the median of `own` over the suite/config's speed metrics (at least 3),
+         else over the speed metrics recorded on the same machine (VM size
+         and CPU model, at least 3: suites recorded on another host, or on
+         a min_cpus suite's bigger machine, are not scaled by this one's),
          else over all suites (global); none at all = no scaling, said so;
   own is None                -> f = grp
   own < grp / 1.3            -> f = own   (this metric slowed more: loosens)
@@ -98,18 +101,33 @@ def gates_of(entry, m):
 
 def host_factors(results, baseline):
     """-> {"global": f|None, "groups": {"suite/config": f}, "counts": {...}}."""
-    per_group, allf = {}, []
+    per_group, per_host, allf = {}, {}, []
     for key, m in results.items():
         entry = baseline.get("metrics", {}).get(key)
         if not entry or not speed_metric(m["unit"], gates_of(entry, m)):
             continue
-        f = metric_speed(m, entry.get("recorded", {}))
+        rec = entry.get("recorded", {})
+        f = metric_speed(m, rec)
         if f is not None:
             per_group.setdefault("%s/%s" % (m["suite"], m["config"]), []).append(f)
+            per_host.setdefault(recorded_host(rec), []).append(f)
             allf.append(f)
     return {"global": median(allf), "n": len(allf),
             "groups": {g: median(v) for g, v in sorted(per_group.items())},
-            "counts": {g: len(v) for g, v in sorted(per_group.items())}}
+            "counts": {g: len(v) for g, v in sorted(per_group.items())},
+            "hosts": {h: median(v) for h, v in sorted(per_host.items())},
+            "host_counts": {h: len(v) for h, v in sorted(per_host.items())}}
+
+
+def recorded_host(rec):
+    """The machine a metric's values were recorded on: VM size and CPU model.
+    A suite/config with too few speed metrics of its own is scaled by the
+    factor of the metrics recorded on the same machine, not by all of them:
+    suites recorded on another CPU (or on the bigger machine of a min_cpus
+    suite) would otherwise be scaled by a factor that says how the OTHER
+    host compares (#921: suite 25, recorded on this very CPU, judged at the
+    1.17x of the suites recorded on an older one)."""
+    return "%s / %s" % (rec.get("vm") or "?", rec.get("cpu") or "?")
 
 
 def load_results(path):
@@ -156,7 +174,7 @@ def improvement(better, old, new):
 def check_gate(g, m, rec, host=None):
     """-> (status, limit_text). status: pass, FAIL, new, skip, info.
 
-    host: {"mode": "anchor"|"suite"|"global", "speed": f} for a speed-dependent
+    host: {"mode": "anchor"|"suite"|"host"|"global", "speed": f} for a speed-dependent
     metric: a `rel` gate then judges against the recorded candidate value
     scaled to this host (see the module docstring)."""
     kind = g.get("kind")
@@ -243,8 +261,12 @@ def host_for(g, m, rec, hf, gates=None):
         return None
     own = metric_speed(m, rec)
     k = "%s/%s" % (m["suite"], m["config"])
+    hk = recorded_host(rec)
     if hf["counts"].get(k, 0) >= MIN_GROUP:
         grp, grule = hf["groups"][k], "group"
+    elif len(hf.get("hosts", {})) > 1 and hf["host_counts"].get(hk, 0) >= MIN_GROUP:
+        # (With one recording host its factor is the global one.)
+        grp, grule = hf["hosts"][hk], "host"
     elif hf["global"] is not None:
         grp, grule = hf["global"], "global"
     else:
@@ -285,7 +307,8 @@ def evaluate(results, baseline, smoke=False):
             if host:
                 bad = [("this metric's", host["own"])] if host["mode"] in ("own-slower", "anchor") else []
                 if host["group"] is not None:
-                    bad.append(("the %s" % ("global" if host["mode"] == "global" else "suite/config's"), host["group"]))
+                    bad.append(("the %s" % ({"global": "global", "host": "recording host's"}.get(
+                        host["mode"], "suite/config's")), host["group"]))
                 for what, f in bad:
                     if f is not None and not (FACTOR_MIN <= f <= FACTOR_MAX):
                         hf["problems"].append(
@@ -517,7 +540,10 @@ def write_summary(outdir, rows, not_run, env, label, problems, smoke, hf=None, b
         L += ["Host speed (this host vs the recorded one; 1.00 = same, below 1 = slower), from v1.2.2 "
               "measured in both sessions: global %.2fx over %d metrics" % (hf["global"], hf["n"])]
         L += ["- %s: %.2fx (%d metrics%s)" % (g, f, hf["counts"][g], "" if hf["counts"][g] >= MIN_GROUP
-                                              else ", too few: the global factor is used") for g, f in hf["groups"].items()]
+                                              else ", too few: the recording host's factor is used")
+              for g, f in hf["groups"].items()]
+        L += ["- recorded on %s: %.2fx (%d metrics)" % (h, f, hf["host_counts"][h])
+              for h, f in hf.get("hosts", {}).items()]
         L.append("")
         if hf.get("differ"):
             L += ["Metrics whose own v1.2.2 factor differs from their group's by more than %gx "

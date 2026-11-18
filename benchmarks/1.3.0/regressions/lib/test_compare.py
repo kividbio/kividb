@@ -516,6 +516,28 @@ class MinCpus(unittest.TestCase):
         why, _ = regression_gate.judge(small_env(), dict(OK_SUMMARY, verdict="INVALID"), SUITES)
         self.assertTrue(why)
 
+    def test_a_small_group_is_scaled_by_its_own_recording_hosts_factor(self):
+        # Five suites recorded on an older CPU, now 1.2x faster; one suite of
+        # two metrics recorded on THIS host: it must be judged at its host's
+        # 1.0, not the global 1.2 (which would fail it).
+        specs = [("old%d/c" % i, "t_ms", "ms", "lower", 12.0, 10.0, 10.0, 10.0 / 1.2 * 1.05) for i in range(5)]
+        specs += [("new/c", "a_rps", "req/s", "higher", 100.0, 100.0, 100.0, 95.0),
+                  ("new/c", "b_rps", "req/s", "higher", 100.0, 100.0, 100.0, 95.0)]
+        b, res = build(specs)
+        for k, m in b["metrics"].items():
+            m["recorded"].update({"vm": "D4", "cpu": "new" if k.startswith("new/") else "old"})
+        # The new host's own metrics are too few for a host factor: add a third.
+        specs.append(("new2/c", "c_rps", "req/s", "higher", 100.0, 100.0, 100.0, 100.0))
+        b2, res2 = build(specs)
+        for k, m in b2["metrics"].items():
+            m["recorded"].update({"vm": "D4", "cpu": "new" if k.startswith("new") else "old"})
+        rows, _, hf = compare.evaluate(res2, b2)
+        st = {r["key"]: r for r in rows}
+        self.assertAlmostEqual(hf["global"], 1.2, places=1)
+        self.assertEqual(st["new/c/a_rps"]["host"]["mode"], "host")
+        self.assertAlmostEqual(st["new/c/a_rps"]["host"]["speed"], 1.0)
+        self.assertEqual(st["new/c/a_rps"]["status"], "pass")
+
     def test_the_gate_uses_the_code_check(self):
         why, covers = regression_gate.judge(small_env(), OK_SUMMARY, SUITES, lambda env: ["code changed"])
         self.assertEqual((why, covers), (["code changed"], set()))
