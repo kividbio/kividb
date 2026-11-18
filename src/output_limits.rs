@@ -355,7 +355,9 @@ impl OutputLimits {
 
 /// A connection's replies, held to its class's limits: the clock of its
 /// soft limit. The replies to one batch of commands are written before the
-/// next batch is read, so what is waiting is that batch.
+/// next batch is read, so what is waiting is that batch. It is looked at
+/// after the batch, and, once the replies could be over a limit, after each
+/// command in it (see [`append_reply`]).
 #[derive(Debug, Default)]
 pub struct ReplyLimit {
     since: u64,
@@ -393,6 +395,86 @@ impl ReplyLimit {
     /// The replies are written: nothing is waiting.
     pub fn drained(&mut self) {
         self.since = 0;
+    }
+
+    /// Whether the connection is to be closed now, with `len` bytes of
+    /// replies gathered in this turn: run between two commands, once
+    /// [`WATCH`] is set, so that a client over its hard limit is closed
+    /// after the reply that took it there, not after the rest of what one
+    /// read brought (#893). Counted and logged when it is.
+    #[cold]
+    #[inline(never)]
+    pub fn closes_after_reply(
+        &mut self,
+        limits: &OutputLimits,
+        subscribed: bool,
+        len: usize,
+        client_id: u64,
+    ) -> bool {
+        if !limits.may_exceed(len) {
+            return false;
+        }
+        let class = if subscribed {
+            Class::PubSub
+        } else {
+            Class::Normal
+        };
+        match self.check(limits, class, len) {
+            Verdict::Close => {
+                note_disconnect(client_id, class, len as u64);
+                true
+            }
+            Verdict::Write | Verdict::WriteWithin(_) => false,
+        }
+    }
+}
+
+/// Bits of a connection loop's word of what is due before its next command
+/// runs, one word so that the common case, nothing, is one test.
+///
+/// The command before is dispatched again (a parked command resumed, or a
+/// write a pause sent back to be held).
+pub const REDISPATCH: u8 = 1;
+/// The replies gathered in this turn have room to be over a limit: each
+/// command is preceded by [`ReplyLimit::closes_after_reply`].
+pub const WATCH: u8 = 2;
+
+/// What is due at the start of a turn whose replies go into `out`: [`WATCH`]
+/// if a buffer kept from the turn before already has room for a limit.
+#[inline]
+pub fn due_at_turn_start(out: &Vec<u8>, limits: &OutputLimits) -> u8 {
+    if limits.may_exceed(out.capacity()) {
+        WATCH
+    } else {
+        0
+    }
+}
+
+/// `out.extend_from_slice(reply)`, for a command's reply, and as cheap: the
+/// limits are looked at only in its cold part, when `out` has to grow. Until
+/// `out` has room for as much as the smallest limit, what it holds is within
+/// every limit; once a growth gives it that room, [`WATCH`] is set in `due`
+/// and the replies are checked after each command for the rest of the turn.
+#[inline(always)]
+pub fn append_reply(out: &mut Vec<u8>, reply: &[u8], due: &mut u8, limits: &OutputLimits) {
+    if out.capacity() - out.len() < reply.len() {
+        grow_for_reply(out, reply.len(), due, limits);
+    }
+    // SAFETY: `out` has room for `reply.len()` more bytes, checked or
+    // reserved just above, and `reply` cannot overlap `out`'s spare room,
+    // which nothing else can see.
+    unsafe {
+        std::ptr::copy_nonoverlapping(reply.as_ptr(), out.as_mut_ptr().add(out.len()), reply.len());
+        out.set_len(out.len() + reply.len());
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn grow_for_reply(out: &mut Vec<u8>, more: usize, due: &mut u8, limits: &OutputLimits) {
+    out.reserve(more);
+    if limits.may_exceed(out.capacity()) {
+        *due |= WATCH;
     }
 }
 
@@ -507,5 +589,40 @@ mod tests {
         assert!(!limits.may_exceed(1 << 40));
         limits.set(Class::Normal, Limit::new(0, 4096, 1));
         assert!(limits.may_exceed(4096));
+    }
+
+    #[test]
+    fn a_reply_buffer_is_watched_once_it_has_room_for_a_limit() {
+        let limits = OutputLimits::default();
+        limits.set(Class::PubSub, Limit::default());
+        limits.set(Class::Normal, Limit::new(100_000, 0, 0));
+        let mut out = Vec::with_capacity(1024);
+        assert_eq!(due_at_turn_start(&out, &limits), 0);
+        let mut due = 0;
+        let reply = vec![b'x'; 1000];
+        for _ in 0..50 {
+            append_reply(&mut out, &reply, &mut due, &limits);
+        }
+        assert_eq!(out.len(), 50_000);
+        assert!(out.iter().all(|&b| b == b'x'));
+        // Within the limit, and no room for it yet: nothing to look at.
+        if out.capacity() < 100_000 {
+            assert_eq!(due, 0);
+        }
+        for _ in 0..60 {
+            append_reply(&mut out, &reply, &mut due, &limits);
+        }
+        assert_eq!(due & WATCH, WATCH);
+        assert_eq!(due_at_turn_start(&out, &limits), WATCH);
+        let mut reply_limit = ReplyLimit::default();
+        assert!(!reply_limit.closes_after_reply(&limits, false, 99_999, 1));
+        assert!(reply_limit.closes_after_reply(&limits, false, 100_000, 1));
+        // Another class's limit is not this one's.
+        assert!(!reply_limit.closes_after_reply(&limits, true, 100_000, 1));
+        // Off (0 0 0): never watched.
+        limits.set(Class::Normal, Limit::default());
+        let mut due = 0;
+        append_reply(&mut out, &vec![0; 1 << 20], &mut due, &limits);
+        assert_eq!(due, 0);
     }
 }
