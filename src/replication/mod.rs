@@ -3029,9 +3029,7 @@ mod write_run_tests {
         for t in threads {
             t.join().unwrap();
         }
-        for got in take_all(&mut rx) {
-            panic!("left over: {got:?}");
-        }
+        assert_eq!(take_all(&mut rx), [], "left over");
         assert_eq!(next, [EACH; THREADS as usize]);
     }
 
