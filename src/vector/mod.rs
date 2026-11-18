@@ -7,6 +7,7 @@ pub mod simd;
 pub mod slots;
 pub mod stem;
 pub mod text;
+use crate::cpus::BuilderExt as _;
 use crate::store::ValueRef;
 use ahash::AHashMap;
 use parking_lot::RwLock;
@@ -2865,7 +2866,7 @@ mod indexes_tests {
         let added = Arc::new(AtomicBool::new(false));
         let adder = {
             let (store, added) = (Arc::clone(&store), Arc::clone(&added));
-            std::thread::spawn(move || {
+            crate::cpus::spawn(move || {
                 store
                     .write_to_add()
                     .unwrap()
@@ -2892,7 +2893,7 @@ mod indexes_tests {
 
         let writing = crate::write_order::lock_key_shared(0, b"doc:570");
         let more = Arc::clone(&store);
-        std::thread::spawn(move || {
+        crate::cpus::spawn(move || {
             more.write_to_add()
                 .unwrap()
                 .insert("other".into(), schema("other"));
@@ -4197,7 +4198,7 @@ pub fn spawn_compaction_worker(
 ) {
     std::thread::Builder::new()
         .name("hnsw-compaction".into())
-        .spawn(move || {
+        .spawn_released(move || {
             // Serial processing: one compaction at a time across all indexes.
             // If parallel compaction is ever needed (multiple busy indexes),
             // the fix is a thread pool here — not a tokio runtime.

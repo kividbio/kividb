@@ -854,7 +854,7 @@ fn save_then(
                 // The file and its rename, synced on another thread: see
                 // `with_deferred_sync`.
                 let path = path.clone();
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     let _ = sync_file(&path).and_then(|()| sync_dir(&path));
                 });
             }

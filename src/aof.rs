@@ -1,3 +1,4 @@
+use crate::cpus::BuilderExt as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
@@ -202,7 +203,7 @@ pub fn checkpoint_in_background(
     }
     let spawned = std::thread::Builder::new()
         .name("kividb-bgrewrite".into())
-        .spawn(move || {
+        .spawn_released(move || {
             let _unwinding = Unwinding;
             loop {
                 BACKGROUND_REWRITE.lock().again = false;
@@ -2660,7 +2661,7 @@ pub fn spawn_auto_rewrite_thread(
     if percentage == 0 {
         log_info!("AOF: automatic rewrite disabled (aof-rewrite-percentage 0)");
     }
-    std::thread::spawn(move || {
+    crate::cpus::spawn(move || {
         loop {
             std::thread::sleep(AUTO_REWRITE_CHECK);
             let percentage = AUTO_REWRITE_PERCENTAGE.load(Ordering::Relaxed);

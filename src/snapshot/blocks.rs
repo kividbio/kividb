@@ -36,6 +36,7 @@
 //! (1.2 cannot read the container, and a rollback must work), writes
 //! the plain image. Both are read, told apart by the magic.
 
+use crate::cpus::BuilderExt as _;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -169,7 +170,7 @@ fn end_bytes(blocks: u64, raw: u64) -> [u8; END_LEN] {
 /// and none on a machine of one CPU, where the thread that lays the image
 /// out compresses them itself.
 fn helper_count() -> usize {
-    std::thread::available_parallelism()
+    crate::cpus::available_parallelism()
         .map_or(1, |n| n.get())
         .saturating_sub(1)
         .min(MAX_HELPERS)
@@ -259,7 +260,7 @@ fn pool() -> Option<&'static Pool> {
             let rx = Arc::clone(&rx);
             let spawned = std::thread::Builder::new()
                 .name("kdb-compress".into())
-                .spawn(move || {
+                .spawn_released(move || {
                     let mut cctx = compressor();
                     loop {
                         let job = match rx.lock() {

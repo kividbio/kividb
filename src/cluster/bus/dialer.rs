@@ -347,7 +347,7 @@ async fn meet_once(
     // before it is a member (#808).
     let peer = peer_socket_addr(peer_ip);
     let accepting = Arc::clone(state);
-    let admitted = tokio::task::spawn_blocking(move || {
+    let admitted = crate::cpus::spawn_blocking(move || {
         crate::cluster::bus::listener::accept_meet_reply(&accepting, reply, peer)
     })
     .await

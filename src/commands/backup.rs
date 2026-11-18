@@ -33,6 +33,7 @@
 //! and on a replica as well as on a master.
 
 use crate::commands::ctx::Ctx;
+use crate::cpus::BuilderExt as _;
 use crate::replication::{ReplPayload, ReplState};
 use crate::resp::write::*;
 use parking_lot::Mutex;
@@ -365,7 +366,7 @@ fn start(ctx: &Ctx) -> Vec<u8> {
     let tap = NEXT_TAP.fetch_add(1, Ordering::Relaxed);
     let spawned = std::thread::Builder::new()
         .name("kividb-backup".into())
-        .spawn(move || run_backup(handles, seq, dir, tap));
+        .spawn_released(move || run_backup(handles, seq, dir, tap));
     if let Err(e) = spawned {
         fail(seq, format!("could not start the backup thread: {e}"));
         return resp_error(&format!("ERR could not start the backup: {e}"));
@@ -431,7 +432,7 @@ fn seal(ctx: &Ctx) -> Vec<u8> {
 fn remove_after(seq: u64, wait: std::time::Duration) {
     let _ = std::thread::Builder::new()
         .name("kividb-backup-ttl".into())
-        .spawn(move || {
+        .spawn_released(move || {
             std::thread::sleep(wait);
             let mut backup = BACKUP.lock();
             if backup.seq == seq && backup.phase == Phase::Sealed {

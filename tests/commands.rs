@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/pr1_commands.rs
 //
 // Integration tests for all PR1 commands:

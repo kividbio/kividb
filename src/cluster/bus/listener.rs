@@ -128,7 +128,7 @@ async fn handle_bus_connection(
                         // thread that may wait on the disk (`admit_met_node`).
                         meet @ BusMessage::Meet { .. } => {
                             let state = Arc::clone(&state);
-                            let reply = tokio::task::spawn_blocking(move || {
+                            let reply = crate::cpus::spawn_blocking(move || {
                                 process_message(&state, meet, peer)
                             })
                             .await
@@ -143,7 +143,7 @@ async fn handle_bus_connection(
                         // Voted once the vote is saved: the same.
                         request @ BusMessage::FailoverAuthRequest { .. } => {
                             let state = Arc::clone(&state);
-                            tokio::task::spawn_blocking(move || {
+                            crate::cpus::spawn_blocking(move || {
                                 process_message(&state, request, peer)
                             })
                             .await
