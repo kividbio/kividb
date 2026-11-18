@@ -2690,6 +2690,12 @@ fn notify_failed_bf_write(ctx: &Ctx) {
 ///   is to change, the new value is made from them and put in their place
 ///   under the write lock only if they are still what is there, else made
 ///   again under it.
+/// * `CMS.INCRBY`: the sketch found under the shard's read lock, and
+///   checked and added to under one hold of its own write lock; two of
+///   them on a key run one before the other. Its additions commute (each
+///   counter is held at 2^32 − 1, the total wraps, and an item at the top
+///   is answered with an error but added to all the same), so the sketch
+///   ends as it would in either order.
 ///
 /// The hash commands only while no search index is defined: they bring the
 /// indexes up to date after the shard is let go of, and two of them beside
@@ -2707,7 +2713,7 @@ fn atomic_under_its_shard(ctx: &Ctx, name: &str) -> bool {
     }
     match name {
         "SET" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "LPUSH" | "RPUSH"
-        | "SADD" | "ZADD" | "ZINCRBY" | "PFADD" => true,
+        | "SADD" | "ZADD" | "ZINCRBY" | "PFADD" | "CMS.INCRBY" => true,
         // Asked without the indexes' lock (#544): see `vector::Indexes`.
         "HSET" | "HMSET" | "HSETNX" | "HINCRBY" | "HINCRBYFLOAT" => ctx.index_store.none(),
         _ => false,

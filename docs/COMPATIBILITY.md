@@ -273,7 +273,8 @@ other files:
   at most 134,217,728 counters and 65,536 rows, made or loaded; `CMS.INCRBY`,
   `CMS.QUERY` and `CMS.MERGE` have per-command limits, checked before they
   start. `CMS.MERGE` names its sources as keys (ACL patterns and cluster
-  slots apply to them). See [COMMANDS.md](../COMMANDS.md).
+  slots apply to them), and needs read permission on them and write
+  permission on its destination. See [COMMANDS.md](../COMMANDS.md).
 - Set and sorted-set members can't have their own TTLs. A Dragonfly file
   with a `SADDEX` set, or a KeyDB file or stream with `EXPIREMEMBER` on a set
   or sorted-set member, is refused, naming the key. Hash field TTLs from

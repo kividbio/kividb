@@ -16,15 +16,15 @@
 //! Beyond Redis: a sketch is held to `sketch::cms`'s size limits, a command
 //! to a per-command amount of work, checked before it starts, and a
 //! command from a client that would allocate more than `maxmemory` leaves
-//! room for evicts first, under the policy, and is refused with `OOM` only
-//! if that is not enough. A command from a master or the AOF is held to
+//! room for evicts first, under the policy, before it takes its keys
+//! (`sketch::room`), and is refused with `OOM` only if that is not enough.
+//! A command from a master or the AOF is held to
 //! neither `maxmemory` nor the per-command limits: it must do what the
 //! master did. (The size limits are fixed, so the master never made what a
 //! replica would refuse.)
 
 use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use crate::commands::bf::{parse_double, parse_ll};
 use crate::commands::ctx::Ctx;
@@ -92,21 +92,12 @@ fn wrong_args(name: &str) -> Vec<u8> {
 }
 
 /// Room under `maxmemory` for `bytes` more, for a command from a client:
-/// keys are evicted first as the policy allows; `OOM` if that is not
-/// enough. Before any lock is taken, as eviction takes them. Nothing for a
-/// command from a master or the AOF, nor on a replica.
-fn make_room(ctx: &mut Ctx, bytes: u64) -> Result<(), Vec<u8>> {
-    let from_client = !ctx.apply_replication && !ctx.repl_state.is_slave();
-    let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed) as u64;
-    if from_client && limit != 0 && bytes != 0 && !crate::sketch::room_for(bytes) {
-        let made = limit
-            .checked_sub(bytes)
-            .is_some_and(|room| crate::eviction::make_room(ctx, room as usize, true));
-        if !made {
-            return Err(resp_error(OOM));
-        }
-    }
-    Ok(())
+/// `OOM` if they do not fit. The room was made before the command took its
+/// keys (`sketch::room`, which also stops a command here that is only asked
+/// what it wants): nothing is evicted here. Nothing for a command from a
+/// master or the AOF, nor on a replica.
+fn room(ctx: &Ctx, bytes: u64) -> Result<(), Vec<u8>> {
+    crate::sketch::room::check(ctx, |_| bytes).map_err(|_| resp_error(OOM))
 }
 
 /// Whether the per-command limits apply: not to a command from a master
@@ -170,8 +161,9 @@ fn with_sketch<T>(ctx: &Ctx, key: &[u8], f: impl FnOnce(&CountMin) -> T) -> Resu
     }
 }
 
-/// The sketch at `key` for writing, or the error a missing key or another
-/// type gets. Finding it marks the write as having got to its key.
+/// The sketch at `key` for writing, or the error a missing key or a value
+/// that is no sketch gets; the caller tells a sketch of another type under
+/// its own lock of it. Finding it marks the write as having got to its key.
 fn sketch_for_write(ctx: &Ctx, key: &[u8]) -> Result<Arc<parking_lot::RwLock<Sketch>>, Vec<u8>> {
     crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
@@ -180,12 +172,7 @@ fn sketch_for_write(ctx: &Ctx, key: &[u8]) -> Result<Arc<parking_lot::RwLock<Ske
         None => Err(resp_error(NO_KEY)),
         Some(ValueRef::Sketch(sketch)) => {
             TOUCHED.set(true);
-            #[allow(irrefutable_let_patterns)]
-            if let Sketch::CountMin(_) = &*sketch.read() {
-                Ok(Arc::clone(sketch))
-            } else {
-                Err(resp_error(WRONGTYPE))
-            }
+            Ok(Arc::clone(sketch))
         }
         Some(_) => {
             TOUCHED.set(true);
@@ -200,13 +187,14 @@ fn create(ctx: &mut Ctx, key: &[u8], width: u64, depth: u64) -> Vec<u8> {
     if !crate::sketch::cms::fits(width, depth) {
         return too_large();
     }
-    if let Err(e) = make_room(ctx, CountMin::bytes_for(width, depth)) {
+    if let Err(e) = room(ctx, CountMin::bytes_for(width, depth)) {
         return e;
     }
     let cms = match CountMin::new(width, depth) {
         Ok(cms) => cms,
         Err(e) => return cms_error(e),
     };
+    debug_assert!(!crate::sketch::room::asking());
     crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let mut map = write_lock!(shard);
@@ -297,6 +285,23 @@ fn incrby(ctx: &mut Ctx) -> Vec<u8> {
         Ok(sketch) => sketch,
         Err(e) => return e,
     };
+    if crate::sketch::room::asking() {
+        // What it would copy of counters a snapshot or a copy shares.
+        let copy = match &*sketch.read() {
+            #[allow(irrefutable_let_patterns)]
+            Sketch::CountMin(cms) => cms.copy_bytes(),
+            #[allow(unreachable_patterns)]
+            _ => 0,
+        };
+        return room(ctx, copy).err().unwrap_or_default();
+    }
+    // The one hold of the sketch: its type, the numbers, the limits and
+    // the counters, as Redis checks them in that order.
+    let mut guard = sketch.write();
+    #[allow(irrefutable_let_patterns)]
+    let Sketch::CountMin(cms) = &mut *guard else {
+        return resp_error(WRONGTYPE);
+    };
     let mut values = Vec::with_capacity((argc - 2) / 2);
     for pair in ctx.cmd[2..].as_chunks::<2>().0 {
         match parse_ll(pair[1]) {
@@ -306,24 +311,12 @@ fn incrby(ctx: &mut Ctx) -> Vec<u8> {
         }
     }
     let items = values.len() as u64;
-    let copy = {
-        let guard = sketch.read();
-        let Sketch::CountMin(cms) = &*guard else {
-            return resp_error(WRONGTYPE);
-        };
-        if budgeted(ctx) && items.saturating_mul(cms.depth) > ITEM_BUDGET {
-            return resp_error(OVER_BUDGET);
-        }
-        cms.copy_bytes()
-    };
-    if let Err(e) = make_room(ctx, copy) {
+    if budgeted(ctx) && items.saturating_mul(cms.depth) > ITEM_BUDGET {
+        return resp_error(OVER_BUDGET);
+    }
+    if let Err(e) = room(ctx, cms.copy_bytes()) {
         return e;
     }
-    let mut guard = sketch.write();
-    #[allow(irrefutable_let_patterns)]
-    let Sketch::CountMin(cms) = &mut *guard else {
-        return resp_error(WRONGTYPE);
-    };
     let mut replies = Vec::with_capacity(values.len());
     for (pair, value) in ctx.cmd[2..].as_chunks::<2>().0.iter().zip(values) {
         match cms.incr_by(pair[0], value) {
@@ -398,6 +391,14 @@ fn merge(ctx: &mut Ctx) -> Vec<u8> {
         Ok(sketch) => sketch,
         Err(e) => return e,
     };
+    let (width, depth) = {
+        let guard = dest.read();
+        #[allow(irrefutable_let_patterns)]
+        let Sketch::CountMin(d) = &*guard else {
+            return resp_error(WRONGTYPE);
+        };
+        (d.width, d.depth)
+    };
     let Some(numkeys) = parse_ll(ctx.cmd[2]) else {
         return resp_error("CMS: invalid numkeys");
     };
@@ -424,13 +425,6 @@ fn merge(ctx: &mut Ctx) -> Vec<u8> {
     let n = n as usize;
     let sources = &ctx.cmd[3..3 + n];
     let weighted = weights_at.is_some();
-    let (width, depth) = {
-        let guard = dest.read();
-        let Sketch::CountMin(d) = &*guard else {
-            return resp_error(WRONGTYPE);
-        };
-        (d.width, d.depth)
-    };
     // As Redis goes: each source's weight, then the source.
     let mut copies = Vec::with_capacity(n);
     let mut weights = Vec::with_capacity(n);
@@ -454,9 +448,10 @@ fn merge(ctx: &mut Ctx) -> Vec<u8> {
     if budgeted(ctx) && (n as u64).saturating_mul(counters) > MERGE_BUDGET {
         return resp_error(OVER_BUDGET);
     }
-    if let Err(e) = make_room(ctx, counters * 4) {
+    if let Err(e) = room(ctx, counters * 4) {
         return e;
     }
+    debug_assert!(!crate::sketch::room::asking());
     let weighted: Vec<(&CountMin, i64)> = copies.iter().zip(weights).collect();
     let (sums, count) = match merged(&weighted) {
         Ok(Some(done)) => done,

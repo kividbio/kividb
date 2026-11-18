@@ -825,16 +825,23 @@ Redis can `RESTORE`. `TYPE` is `CMSk-TYPE`; the ACL category is `@cms`.
   a master made.
 - Per-command limits: `CMS.INCRBY` and `CMS.QUERY` may visit at most 250,000
   counters (items × depth: some 35,000 items in a sketch of depth 7), and
-  `CMS.MERGE` read at most 268,435,456 (sources × width × depth). A command
-  over its limit is refused before it starts, with `CMS: command reached the
-  per-command limit; send fewer items per command`, and changes nothing.
-  Replication and the AOF are not held to them.
-- Under `maxmemory`, a client's `CMS.INITBYDIM`, `CMS.INITBYPROB` or
-  `CMS.MERGE` that would allocate more than is left evicts first under the
-  policy, and is refused with `OOM ...` only if that is not enough.
+  `CMS.MERGE` read at most 8,388,608 (sources × width × depth: two sources of
+  4,194,304 counters), so that no command takes more than some tens of
+  milliseconds. A command over its limit is refused before it starts, with
+  `CMS: command reached the per-command limit; send fewer items per
+  command`, and changes nothing. Replication and the AOF are not held to
+  them.
+- Under `maxmemory`, a client's `CMS.INITBYDIM`, `CMS.INITBYPROB`,
+  `CMS.MERGE` or `CMS.INCRBY` (which copies counters a snapshot or a copy
+  shares) that would allocate more than is left evicts first under the
+  policy, before it takes its keys, and is refused with `OOM ...` only if
+  that is not enough.
 - `CMS.MERGE` names its sources as keys (as `ZUNIONSTORE` does), so ACL key
   patterns cover them and, in cluster mode, they must be in the
   destination's slot. Redis's `COMMAND INFO` names only the destination.
+  It needs read permission on its sources and write permission on its
+  destination; Redis checks only the destination, and lets read or write
+  permission do.
 - `DUMP` payloads carry RDB version 9, so every Redis since 6.0 can
   `RESTORE` them; the value is as Redis 8.10 writes it.
 

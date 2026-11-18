@@ -185,6 +185,35 @@ fn no_memory() -> io::Error {
 
 // ── Reading ─────────────────────────────────────────────────────────────
 
+/// The encoding of an LZF-compressed string, after the length's marker.
+const RDB_ENC_LZF: u64 = 3;
+
+/// An RDB length, and whether it is a special encoding's number instead.
+fn rdb_length(r: &mut impl Read) -> io::Result<(u64, bool)> {
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b)?;
+    Ok(match b[0] >> 6 {
+        0 => (u64::from(b[0] & 0x3f), false),
+        1 => {
+            let mut next = [0u8; 1];
+            r.read_exact(&mut next)?;
+            ((u64::from(b[0] & 0x3f) << 8) | u64::from(next[0]), false)
+        }
+        2 if b[0] == 0x80 => {
+            let mut v = [0u8; 4];
+            r.read_exact(&mut v)?;
+            (u64::from(u32::from_be_bytes(v)), false)
+        }
+        2 if b[0] == 0x81 => {
+            let mut v = [0u8; 8];
+            r.read_exact(&mut v)?;
+            (u64::from_be_bytes(v), false)
+        }
+        2 => return Err(super::invalid("an RDB length of an unknown form")),
+        _ => (u64::from(b[0] & 0x3f), true),
+    })
+}
+
 struct Reader<'r, R: Read> {
     r: &'r mut R,
     what: &'static str,
@@ -223,6 +252,39 @@ impl<R: Read> Reader<'_, R> {
     fn string(&mut self) -> io::Result<Vec<u8>> {
         self.opcode(OPCODE_STRING)?;
         crate::snapshot::rdb_read_string(self.r)
+    }
+
+    /// A string that must be `len` bytes, plain or LZF-compressed as Redis
+    /// writes one (`mismatch` if it is another length): its length, or a
+    /// compressed one's original length, is checked before anything is
+    /// allocated, and only the bytes the payload holds are read.
+    fn string_of(&mut self, len: u64, mismatch: &str) -> io::Result<Vec<u8>> {
+        self.opcode(OPCODE_STRING)?;
+        let want = usize::try_from(len).map_err(|_| self.bad(mismatch))?;
+        let (n, encoded) = rdb_length(self.r)?;
+        if !encoded {
+            if n != len {
+                return Err(self.bad(mismatch));
+            }
+            return super::read_vec(self.r, want);
+        }
+        if n != RDB_ENC_LZF {
+            return Err(self.bad("a string of an unexpected encoding"));
+        }
+        let (compressed, _) = rdb_length(self.r)?;
+        let (original, _) = rdb_length(self.r)?;
+        if original != len {
+            return Err(self.bad(mismatch));
+        }
+        // Redis compresses a string only if that makes it shorter.
+        if compressed == 0 || compressed >= len {
+            return Err(self.bad("a compressed string of a bad length"));
+        }
+        let compressed = super::read_vec(self.r, compressed as usize)?;
+        match lzf::decompress(&compressed, want) {
+            Ok(out) if out.len() == want => Ok(out),
+            _ => Err(self.bad("a compressed string that does not decompress")),
+        }
     }
 
     fn end(&mut self) -> io::Result<()> {
@@ -312,10 +374,10 @@ fn read_cms(r: &mut Reader<'_, impl Read>) -> io::Result<CountMin> {
     if !super::cms::fits(width, depth) {
         return Err(r.bad("a sketch over the size limits is not supported"));
     }
-    let data = r.string()?;
-    if data.len() as u64 != width * depth * 4 {
-        return Err(r.bad("the counters do not match the width and depth"));
-    }
+    let data = r.string_of(
+        width * depth * 4,
+        "the counters do not match the width and depth",
+    )?;
     r.end()?;
     let counters = super::cms::counters_from_bytes(&data)?;
     Ok(CountMin {
@@ -476,6 +538,57 @@ mod tests {
             if let Ok(Some(Sketch::CountMin(read))) = super::read(CMS_TYPE, 0, &mut &bad[..]) {
                 assert!(super::super::cms::fits(read.width, read.depth));
                 assert_eq!(read.counters.len() as u64, read.width * read.depth);
+            }
+        }
+        // The counters LZF-compressed, as Redis writes them: read as the
+        // plain ones are; with a corrupt byte, or claiming another (or a
+        // huge) length, compressed or original, refused before anything of
+        // that length is allocated.
+        let plain: Vec<u8> = (0..60u32).flat_map(|i| (i % 7).to_le_bytes()).collect();
+        let compressed = lzf::compress(&plain).unwrap();
+        let lzf_value = |original: u64, clen: u64, data: &[u8]| {
+            let mut w = Writer { out: Vec::new() };
+            w.uint(20);
+            w.uint(3);
+            w.uint(0);
+            w.len(OPCODE_STRING);
+            w.out.push(0xc0 | RDB_ENC_LZF as u8);
+            w.len(clen);
+            w.len(original);
+            w.out.extend_from_slice(data);
+            w.len(OPCODE_EOF);
+            w.out
+        };
+        let read = |value: Vec<u8>| super::read(CMS_TYPE, 0, &mut &value[..]);
+        let clen = compressed.len() as u64;
+        let Ok(Some(Sketch::CountMin(read_back))) = read(lzf_value(240, clen, &compressed)) else {
+            panic!("compressed counters not read");
+        };
+        assert_eq!(read_back.counters.len(), 60);
+        for (original, clen) in [
+            (239, clen),
+            (241, clen),
+            (1 << 40, clen),
+            (u64::MAX, clen),
+            (240, 0),
+            (240, 240),
+            (240, 1 << 40),
+            (240, clen - 1),
+        ] {
+            assert!(read(lzf_value(original, clen, &compressed)).is_err());
+        }
+        for _ in 0..4000 {
+            let mut data = compressed.clone();
+            match next() % 2 {
+                0 => {
+                    let at = next() as usize % data.len();
+                    data[at] = next() as u8;
+                }
+                _ => data.truncate(next() as usize % data.len()),
+            }
+            let n = data.len() as u64;
+            if let Ok(Some(Sketch::CountMin(got))) = read(lzf_value(240, n, &data)) {
+                assert_eq!(got.counters.len(), 60);
             }
         }
     }

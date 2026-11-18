@@ -50,9 +50,10 @@ pub const MAX_DEPTH: u64 = 1 << 16;
 /// depth). A command over it is refused before it starts: some 35,000
 /// items in a sketch of depth 7.
 pub const ITEM_BUDGET: u64 = 250_000;
-/// The most counters one `CMS.MERGE` may read (sources × counters): two
-/// sketches of the largest size.
-pub const MERGE_BUDGET: u64 = 2 * MAX_COUNTERS;
+/// The most counters one `CMS.MERGE` may read (sources × counters):
+/// 2^23, some 17 ms of work (two sources of 4,194,304 counters, or a
+/// thousand of 8,192). A larger merge is refused before it starts.
+pub const MERGE_BUDGET: u64 = 1 << 23;
 
 /// Why a sketch could not be made, grown or merged into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
