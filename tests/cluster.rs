@@ -8081,20 +8081,22 @@ fn a_second_failover_during_the_cleanup_carries_it_on() {
         || cut.replicas[q].is_master(),
     );
     let node = &cut.replicas[q];
-    // Held at its own first batch too, if it has any left: let go.
+    // Held at its own first batch too, if it has any left: let go, until
+    // the import is forgotten. Not only until the keys are gone: the
+    // failpoint comes after the batch's deletes, so a first batch that is
+    // also the last (what is left is one slot's keys, in one shard) is held
+    // there once they are gone, and the import is forgotten only once it
+    // is let go (#904).
     let again = node.dir.join("failpoint.import-cleanup-deleting.1");
     wait_until(
-        "what the import brought to be deleted",
+        "what the import brought to be deleted, and the import to be forgotten",
         Duration::from_secs(90),
         || {
             let _ = std::fs::remove_file(&again);
-            held_of(node, &cut.all_brought()).is_empty()
+            held_of(node, &cut.all_brought()).is_empty() && followed_file(node).is_none()
         },
     );
     assert_held_kept(&cut, node);
-    wait_until("it to forget the import", Duration::from_secs(30), || {
-        followed_file(node).is_none()
-    });
 }
 
 /// The promoted node restarts in the middle of its cleanup. It knows from
