@@ -2376,6 +2376,15 @@ fn string_format_takes_fractions_for_integer_conversions_as_redis_does() {
         ("return string.format('%d', 0/0)", bulk(lowest)),
         ("return string.format('%x', 2^63)", bulk("8000000000000000")),
         ("return string.format('%x', 1e20)", bulk("0")),
+        // NaN and the infinities take the same out-of-range path as
+        // 1e20: the lowest integer for `d`, its top bit for `x` — on
+        // every architecture, not as the host's cast happens to fall.
+        ("return string.format('%d', 1/0)", bulk(lowest)),
+        ("return string.format('%x', 0/0)", bulk("8000000000000000")),
+        (
+            "return string.format('%u', -1e20)",
+            bulk("9223372036854775808"),
+        ),
         ("return string.format('%x', -1.5)", bulk("ffffffffffffffff")),
         (
             "return string.format('%u', -1.5)",
@@ -2383,6 +2392,11 @@ fn string_format_takes_fractions_for_integer_conversions_as_redis_does() {
         ),
         ("return string.format('%c', 300.5)", bulk(",")),
         ("return string.format('a%cb', 0.5)", bulk("ab")),
+        // `%c` takes the `(int)` end of the 64-bit conversion: its low
+        // 32 bits are the byte, so 2^32+65 is 'A'.
+        ("return string.format('%c', 2^32+65)", bulk("A")),
+        // Five flag characters is 5.1's most; a sixth repeats.
+        ("return string.format('%0-+ #d', 5)", bulk("+5")),
         // affinidi-messaging-mediator's store_message: TIME's seconds and
         // microseconds as milliseconds.
         (
@@ -2411,6 +2425,11 @@ fn string_format_takes_fractions_for_integer_conversions_as_redis_does() {
         (
             "return string.format('%d %f', 1.5, 'x')",
             "bad argument #3 to 'format' (number expected, got string)",
+        ),
+        // 5.1's scanformat refused a sixth flag character.
+        (
+            "return string.format('%------d', 1)",
+            "invalid format (repeated flags)",
         ),
     ] {
         let reply = c.cmds(&["EVAL", script, "0"]);

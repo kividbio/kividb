@@ -32,14 +32,7 @@ fn main() {
         .include(include)
         .define(platform, None)
         .define("LUA_COMPAT_5_3", None)
-        .warnings(false)
         .compile("lua51_str_format");
-
-    // cc's `rustc-link-lib` is recorded on the library's rlib, and this
-    // crate's binary does not use the rlib — src/main.rs is a crate root
-    // of its own, which compiles the same modules again — so the archive
-    // must reach bins, tests and benches as a raw linker argument too.
-    println!("cargo:rustc-link-arg=-llua51_str_format");
 
     // cc emits rerun-if-env-changed lines; once a build script emits any
     // rerun-if, the package's files are watched no more — ask for the C

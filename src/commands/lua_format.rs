@@ -11,26 +11,28 @@
 //!
 //! The function is a patched copy of Lua 5.4.7's own `str_format`, the
 //! C in `csrc/lua51_str_format.c`, built by build.rs against the headers
-//! of the same vendored Lua the library was built with: integer
-//! conversions take `lua_isinteger ? lua_tointeger : (lua_Integer)(long)
-//! luaL_checknumber`, check against 5.1's flag set (the same `-+ #0` for
-//! every conversion, where 5.4 restricts them per conversion), and the
-//! formatted item is added up to its first NUL, as 5.1's `strlen(buff)`
-//! did. It formats with the host's `sprintf`, so out-of-range results
-//! are Redis's on the same architecture, and an error names the argument
-//! at fault, which the Rust wrapper it replaces could not always do.
+//! of the same vendored Lua the library was built with. Integer
+//! conversions take `lua_isinteger ? lua_tointeger : <conversion>
+//! luaL_checknumber`, where the conversion gives x86-64's answers on
+//! every architecture — signed for `c d i`, unsigned for `o u x X` —
+//! check against 5.1's flag set (the same `-+ #0` for every conversion,
+//! where 5.4 restricts them per conversion, and a sixth flag character
+//! is an error), and the formatted item is added up to its first NUL,
+//! as 5.1's `strlen(buff)` did. It formats with the host's `sprintf`,
+//! and an error names the argument at fault, which the Rust wrapper it
+//! replaces could not always do.
 
 use mlua::ffi;
 use std::ffi::c_int;
 
-unsafe extern "C" {
-    /// The patched `str_format`, compiled from `csrc/lua51_str_format.c`.
+// The patched `str_format`, compiled from `csrc/lua51_str_format.c`.
+// `C-unwind`, as `lua_CFunction` asks — a Lua error longjmps past it
+// either way. The `#[link]` asks for the archive by name wherever this
+// module is compiled: the binary does not use the library's rlib, so a
+// `rustc-link-lib` on the build alone would never reach it.
+#[link(name = "lua51_str_format", kind = "static")]
+unsafe extern "C-unwind" {
     fn kividb_str_format(state: *mut ffi::lua_State) -> c_int;
-}
-
-/// The `lua_CFunction` over the C entry: `C-unwind`, as the binding asks.
-unsafe extern "C-unwind" fn str_format(state: *mut ffi::lua_State) -> c_int {
-    unsafe { kividb_str_format(state) }
 }
 
 /// Install it as `string.format`, where the library's own was.
@@ -41,7 +43,7 @@ pub(crate) unsafe fn install(state: *mut ffi::lua_State) {
     unsafe {
         ffi::lua_checkstack(state, 2);
         ffi::lua_getglobal(state, c"string".as_ptr());
-        ffi::lua_pushcfunction(state, str_format);
+        ffi::lua_pushcfunction(state, kividb_str_format);
         ffi::lua_setfield(state, -2, c"format".as_ptr());
         ffi::lua_pop(state, 1);
     }

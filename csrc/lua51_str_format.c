@@ -2,21 +2,49 @@
 ** `string.format` for scripts, as Redis's Lua 5.1 has it (#747, #771).
 **
 ** A patched copy of Lua 5.4.7's `str_format` and the helpers it uses
-** (lstrlib.c, MIT licence, Copyright (C) 1994-2025 Lua.org, PUC-Rio),
+** (lstrlib.c, MIT licence, Copyright (C) 1994-2024 Lua.org, PUC-Rio),
 ** so a call costs what a C function call costs and out-of-range results
-** are the host's `snprintf`, as Redis's are. Two changes, marked below:
+** are what x86-64's `sprintf` gives for them, as Redis's are. The
+** changes, each marked PATCH at its site:
 **
 **   * Integer conversions (`c d i o u x X`) take any number, as 5.1's
 **     `luaL_checknumber` + C cast did: an integer keeps its value, and
-**     any other number is cut toward zero through `(long)`, rather than
-**     failing with "number has no integer representation". 5.1's flags
-**     are the same set for every conversion, `-+ #0` — its `scanformat`
-**     did not restrict them by conversion as 5.4's `checkformat` does —
-**     so these conversions check against `FMT51_FLAGS`.
+**     any other number goes through an explicit double-to-integer
+**     conversion that gives x86-64's answers on every architecture —
+**     signed (`c_long`) for `c d i`, unsigned (`c_ulong`) for
+**     `o u x X` — rather than failing with "number has no integer
+**     representation". 5.1's flags are the same set for every
+**     conversion, `-+ #0` — its `scanformat` did not restrict them by
+**     conversion as 5.4's `checkformat` does — so these conversions
+**     check against `FMT51_FLAGS`, and a sixth flag character is the
+**     "invalid format (repeated flags)" error 5.1 raised.
 **
 **   * The formatted item is added up to its first NUL, as 5.1's
 **     `strlen(buff)` did: `format('%c', 0)` gives "" there, not "\0".
 */
+
+/******************************************************************************
+* Copyright (C) 1994-2024 Lua.org, PUC-Rio.
+*
+* Permission is hereby granted, free of charge, to any person obtaining
+* a copy of this software and associated documentation files (the
+* "Software"), to deal in the Software without restriction, including
+* without limitation the rights to use, copy, modify, merge, publish,
+* distribute, sublicense, and/or sell copies of the Software, and to
+* permit persons to whom the Software is furnished to do so, subject to
+* the following conditions:
+*
+* The above copyright notice and this permission notice shall be
+* included in all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+******************************************************************************/
 
 #include <ctype.h>
 #include <float.h>
@@ -43,31 +71,58 @@
 
 
 /*
+** A C `(long)` cast of a double, as x86-64 makes it, written out for
+** every architecture rather than cast — a double that does not fit a
+** `long` casts to undefined behavior in C: x86-64's cvttsd2si leaves
+** the lowest integer for it (and for NaN and the infinities), where
+** aarch64's fcvtzs saturates to LONG_MAX or LONG_MIN. The tests, and
+** Redis on x86-64, hold x86-64's answers: `format('%d', 1e20)` is
+** -9223372036854775808 there. Inside the range the cast is defined and
+** cuts toward zero, as 5.1's did.
+*/
+static lua_Integer c_long (lua_Number n) {
+  if (n > -9223372036854775808.0 && n < 9223372036854775808.0)
+    return (lua_Integer)n;
+  else
+    return LUA_MININTEGER;
+}
+
+
+/*
+** And a C `(unsigned long)` cast of a double, as x86-64 makes it: below
+** 2^63 through the signed conversion, so -1.5 is 2^64 - 1; from 2^63,
+** the signed conversion of what is left after taking 2^63 away, with
+** the top bit set again — `format('%x', 1e20)` is 0 there, as the
+** lowest integer XOR the top bit comes to nothing.
+*/
+static lua_Unsigned c_ulong (lua_Number n) {
+  if (n >= 9223372036854775808.0)
+    return ((lua_Unsigned)c_long(n - 9223372036854775808.0))
+           ^ ((lua_Unsigned)1 << 63);
+  else
+    return (lua_Unsigned)c_long(n);
+}
+
+
+/*
 ** A number for an integer conversion, as 5.1 took one: an integer is
-** itself; anything else number-like is cut toward zero through `long`
-** (and to lua_Integer through that), where 5.4's luaL_checkinteger
-** refused a number with a fraction.
+** itself; anything else number-like goes through the cast 5.1's C made
+** — signed for `c d i`, straight to unsigned for `o u x X` — where
+** 5.4's luaL_checkinteger refused a number with a fraction.
 */
 static lua_Integer intnum (lua_State *L, int arg) {
   if (lua_isinteger(L, arg))
     return lua_tointeger(L, arg);
   else
-    return (lua_Integer)(long)luaL_checknumber(L, arg);
+    return c_long(luaL_checknumber(L, arg));
 }
 
 
-/*
-** And for the unsigned conversions: 5.1 cast the number straight to
-** `unsigned long`, which is not `(unsigned)(long)x` — on x86-64 the two
-** steps differ. `format('%x', 1e20)` is 0 there, as `unsigned long`'s
-** own conversion of a double out of signed range makes it; casting to
-** `long` first would leave the top bit set.
-*/
 static lua_Unsigned uintnum (lua_State *L, int arg) {
   if (lua_isinteger(L, arg))
     return (lua_Unsigned)lua_tointeger(L, arg);
   else
-    return (lua_Unsigned)(unsigned long)luaL_checknumber(L, arg);
+    return c_ulong(luaL_checknumber(L, arg));
 }
 
 
@@ -323,6 +378,9 @@ static void checkformat (lua_State *L, const char *form, const char *flags,
 */
 static const char *getformat (lua_State *L, const char *strfrmt,
                                             char *form) {
+  /* PATCH: 5.1's scanformat refused a sixth flag character. */
+  if (strspn(strfrmt, FMT51_FLAGS) >= sizeof(FMT51_FLAGS))
+    luaL_error(L, "invalid format (repeated flags)");
   /* spans flags, width, and precision ('0' is included as a flag) */
   size_t len = strspn(strfrmt, L_FMTFLAGSF "123456789.");
   len++;  /* adds following character (should be the specifier) */
@@ -372,9 +430,11 @@ int kividb_str_format (lua_State *L) {
       strfrmt = getformat(L, strfrmt, form);
       switch (*strfrmt++) {
         case 'c': {
-          /* 5.1's flags, and any number cut through `long` (see intnum).
-             And as 5.1 added an item up to its first NUL — a `%c` of 0
-             adds nothing — count what is there, not what was written. */
+          /* PATCH: 5.1's flags, and a number taken as 5.1's `(int)` —
+             through the 64-bit conversion, then the low 32 bits, so a
+             `%c` of 2^32+65 is 'A' (see c_long). And as 5.1 added an
+             item up to its first NUL — a `%c` of 0 adds nothing —
+             count what is there, not what was written. */
           checkformat(L, form, FMT51_FLAGS, 1);
           nb = l_sprintf(buff, maxitem, form, (int)intnum(L, arg));
           nb = (int)strlen(buff);
