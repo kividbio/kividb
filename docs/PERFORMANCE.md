@@ -311,9 +311,9 @@ thread and back: with two workers busy, Tyk's script cost 9.2 µs of CPU on the 
 11.8 µs on the workers a call, against 12.8-13.4 µs on one worker that runs it itself; that is
 how scripts are scheduled, [#880](https://github.com/kividbio/kividb/issues/880).
 
-Suite `30-script-call-cost` of
-[the regression suite](../benchmarks/1.3.0/regressions/README.md) measures the Tyk, lock
-and `return 1` rows again (with and without a hash tag) against 1.2.2 and Redis.
+All of it was measured with a Go client (the scripts above, one command at a time per
+connection), `/proc` for the server's CPU, `INFO commandstats` for the calls, and callgrind
+for the instructions, each tree and 1.2.2 built by the same rustc.
 
 ## Worker threads
 

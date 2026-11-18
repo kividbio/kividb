@@ -352,7 +352,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (a differential fuzz of 21,000 scripts against the tree before, RESP2 and
   RESP3). `return 1` and a lock's compare-and-delete still cost 18 % and
   11 % more than in Redis on one worker, around the call rather than in it.
-  Suite `30-script-call-cost` keeps it.
 
 - **Writes on a master with a replication backlog and no replica no
   longer wake the replication thread one by one (#894).** A master that
