@@ -60,3 +60,5 @@ a command; `perf-hot-path.log`):
 | GET-1K-EXEC | 2100 | 2081 | 2040 | 2038 |
 | SET-1K-EXEC | 2424 | 2424 | 2424 | 2424 |
 | MIX-100-EXEC | 4028 | 4028 | 4027 | 4028 |
+
+`compat-optin.log`: the cross-version matrix again with `rdbcompression` opt-in (default `no`), on the tree merged with master: 26/26.
