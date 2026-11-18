@@ -25,9 +25,11 @@
 //!
 //! Beyond Redis: a filter is held to `sketch::cuckoo`'s size limits, and a
 //! command of many items to a per-command amount of work ([`BUDGET`]),
-//! reckoned before it starts. Under `maxmemory`, a client's command that
-//! would allocate more than is left evicts first, under the policy, and is
-//! refused with `OOM` only if that is not enough.
+//! reckoned before it starts, and a compaction to `sketch::cuckoo`'s
+//! `COMPACT_BUDGET`. Under `maxmemory`, a client's command that would
+//! allocate more than is left evicts first, under the policy, before it
+//! takes its key (`sketch::room`), and is refused with `OOM` only if that
+//! is not enough.
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -238,24 +240,12 @@ fn max_bucket_size(ctx: &Ctx) -> u16 {
     }
 }
 
-fn from_client(ctx: &Ctx) -> bool {
-    !ctx.apply_replication && !ctx.repl_state.is_slave()
-}
-
 /// Room under `maxmemory` for `bytes` more, for a command from a client:
-/// keys are evicted first as the policy allows; `OOM` if that is not
-/// enough.
-fn make_room(ctx: &mut Ctx, bytes: u64) -> Result<(), Vec<u8>> {
-    let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed) as u64;
-    if from_client(ctx) && limit != 0 && bytes != 0 && !crate::sketch::room_for(bytes) {
-        let made = limit
-            .checked_sub(bytes)
-            .is_some_and(|room| crate::eviction::make_room(ctx, room as usize, true));
-        if !made {
-            return Err(resp_error(OOM));
-        }
-    }
-    Ok(())
+/// `OOM` if they do not fit. The room was made before the command took its
+/// key (`sketch::room`, which also stops a command here that is only asked
+/// what it wants): nothing is evicted here.
+fn room(ctx: &Ctx, bytes: u64) -> Result<(), Vec<u8>> {
+    crate::sketch::room::check(ctx, |_| bytes).map_err(|_| resp_error(OOM))
 }
 
 /// How many sub-filters a write may grow a filter to as it goes: the fixed
@@ -304,7 +294,8 @@ fn with_filter<T>(ctx: &Ctx, key: &[u8], f: impl FnOnce(&Cuckoo) -> T) -> Result
     }
 }
 
-/// The filter at `key` for writing: `Ok(None)` if missing.
+/// The filter at `key` for writing: `Ok(None)` if missing. A sketch of
+/// another type is told by the caller, under its own lock of it.
 fn filter_for_write(
     ctx: &Ctx,
     key: &[u8],
@@ -314,13 +305,14 @@ fn filter_for_write(
     let map = read_lock!(shard);
     match map.get(key) {
         None => Ok(None),
-        Some(ValueRef::Sketch(sketch)) => match &*sketch.read() {
-            Sketch::Cuckoo(_) => Ok(Some(Arc::clone(sketch))),
-            #[allow(unreachable_patterns)]
-            _ => Err(resp_error(WRONGTYPE)),
-        },
+        Some(ValueRef::Sketch(sketch)) => Ok(Some(Arc::clone(sketch))),
         Some(_) => Err(resp_error(WRONGTYPE)),
     }
+}
+
+/// Whether `sketch` is a Cuckoo filter.
+fn is_cuckoo(sketch: &parking_lot::RwLock<Sketch>) -> bool {
+    matches!(&*sketch.read(), Sketch::Cuckoo(_))
 }
 
 /// Make a filter with `p` at `key` (missing when the caller looked), if
@@ -329,8 +321,9 @@ fn make(ctx: &mut Ctx, key: &[u8], p: Params) -> Result<Arc<parking_lot::RwLock<
     if Cuckoo::bytes_for(&p) > MAX_BYTES {
         return Err(resp_error(TOO_LARGE));
     }
-    make_room(ctx, Cuckoo::bytes_for(&p))?;
+    room(ctx, Cuckoo::bytes_for(&p))?;
     let cf = Cuckoo::new(p).map_err(add_error)?;
+    debug_assert!(!crate::sketch::room::asking());
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let mut map = write_lock!(shard);
     match map.get(key) {
@@ -426,6 +419,7 @@ fn reserve(ctx: &mut Ctx) -> Vec<u8> {
     TOUCHED.set(true);
     match filter_for_write(ctx, key) {
         Err(e) => return e,
+        Ok(Some(s)) if !is_cuckoo(&s) => return resp_error(WRONGTYPE),
         Ok(Some(_)) => return resp_error(EXISTS),
         Ok(None) => {}
     }
@@ -452,28 +446,40 @@ fn filter_or_made(
     // sub-filters or more before it tries, however much room there is. (It
     // makes a missing filter first, and keeps it; here it is not made, so
     // that nothing a command did goes unsent to replicas.)
-    let limit = setting(&MAX_EXPANSIONS_SETTING);
+    // A filter found is checked by the caller, under its hold of it
+    // ([`too_many_filters`]).
     let found = filter_for_write(ctx, key)?;
-    if !ctx.apply_replication {
-        let filters = found.as_ref().map_or(1, |s| match &*s.read() {
-            Sketch::Cuckoo(cf) => cf.filters.len() as u64,
-            #[allow(unreachable_patterns)]
-            _ => 0,
-        });
-        if (found.is_some() || create) && filters >= limit {
-            return Err(resp_error(MAX_EXPANSIONS));
-        }
-    }
     if let Some(s) = found {
         return Ok(Some(s));
     }
     if !create {
         return Ok(None);
     }
+    if !ctx.apply_replication && setting(&MAX_EXPANSIONS_SETTING) <= 1 {
+        return Err(resp_error(MAX_EXPANSIONS));
+    }
     let p = default_params(capacity);
     let made = make(ctx, key, p)?;
     MADE.with_borrow_mut(|m| *m = Some(reserve_form(key, &p)));
     Ok(Some(made))
+}
+
+/// Whether a client's add to `cf` is refused before it starts, as Redis
+/// refuses one to a filter of `cf-max-expansions` sub-filters or more.
+fn too_many_filters(ctx: &Ctx, cf: &Cuckoo) -> bool {
+    !ctx.apply_replication && cf.filters.len() as u64 >= setting(&MAX_EXPANSIONS_SETTING)
+}
+
+/// What it would allocate to add to the filter `sketch` (growing it, or
+/// copying what a snapshot or a copy shares), for a command only asked what
+/// it wants (`sketch::room`): its answer.
+fn asked(ctx: &Ctx, sketch: &parking_lot::RwLock<Sketch>) -> Vec<u8> {
+    let bytes = match &*sketch.read() {
+        Sketch::Cuckoo(cf) => cf.bytes_to_add(),
+        #[allow(unreachable_patterns)]
+        _ => 0,
+    };
+    room(ctx, bytes).err().unwrap_or_default()
 }
 
 /// `CF.ADD key item` and `CF.ADDNX key item`
@@ -492,19 +498,21 @@ fn add(ctx: &mut Ctx, nx: bool) -> Vec<u8> {
         Ok(None) => return resp_error(NOT_FOUND),
         Err(e) => return e,
     };
-    let room = match &*sketch.read() {
-        Sketch::Cuckoo(cf) => cf.bytes_to_add(),
-        #[allow(unreachable_patterns)]
-        _ => 0,
-    };
-    if let Err(e) = make_room(ctx, room) {
-        return e;
+    if crate::sketch::room::asking() {
+        return asked(ctx, &sketch);
     }
     let max = max_filters(ctx);
+    // The one hold of the filter: its type, the limits, room, the add.
     let mut guard = sketch.write();
     let Sketch::Cuckoo(cf) = &mut *guard else {
         return resp_error(WRONGTYPE);
     };
+    if too_many_filters(ctx, cf) {
+        return resp_error(MAX_EXPANSIONS);
+    }
+    if let Err(e) = room(ctx, cf.bytes_to_add()) {
+        return e;
+    }
     if nx && cf.contains(l) {
         return boolean(resp, false);
     }
@@ -582,25 +590,27 @@ fn insert(ctx: &mut Ctx, nx: bool) -> Vec<u8> {
         Ok(None) => return resp_error(NOT_FOUND),
         Err(e) => return e,
     };
-    let (room, cost) = match &*sketch.read() {
-        Sketch::Cuckoo(cf) => (cf.bytes_to_add(), add_cost(cf)),
-        #[allow(unreachable_patterns)]
-        _ => (0, 0),
-    };
-    if !ctx.apply_replication
-        && items.len() > 1
-        && (items.len() as u64).saturating_mul(cost) > BUDGET
-    {
-        return resp_error(OVER_BUDGET);
-    }
-    if let Err(e) = make_room(ctx, room) {
-        return e;
+    if crate::sketch::room::asking() {
+        return asked(ctx, &sketch);
     }
     let max = max_filters(ctx);
+    // The one hold of the filter: its type, the limits, room, the adds.
     let mut guard = sketch.write();
     let Sketch::Cuckoo(cf) = &mut *guard else {
         return resp_error(WRONGTYPE);
     };
+    if too_many_filters(ctx, cf) {
+        return resp_error(MAX_EXPANSIONS);
+    }
+    if !ctx.apply_replication
+        && items.len() > 1
+        && (items.len() as u64).saturating_mul(add_cost(cf)) > BUDGET
+    {
+        return resp_error(OVER_BUDGET);
+    }
+    if let Err(e) = room(ctx, cf.bytes_to_add()) {
+        return e;
+    }
     let mut replies = Vec::with_capacity(items.len());
     for item in items {
         let l = lookup(item);
@@ -784,8 +794,10 @@ fn loadchunk(ctx: &mut Ctx) -> Vec<u8> {
         Err(e) => return e,
     };
     if iter == 1 {
-        if existing.is_some() {
-            return resp_error(EXISTS);
+        match &existing {
+            Some(s) if !is_cuckoo(s) => return resp_error(WRONGTYPE),
+            Some(_) => return resp_error(EXISTS),
+            None => {}
         }
         let cf = match Cuckoo::from_header(data, max_bucket_size(ctx)) {
             Ok(cf) => cf,
@@ -794,9 +806,10 @@ fn loadchunk(ctx: &mut Ctx) -> Vec<u8> {
             Err(HeaderError::TooLarge) => return resp_error(TOO_LARGE),
             Err(HeaderError::NoMemory) => return resp_error(NO_MEMORY),
         };
-        if let Err(e) = make_room(ctx, cf.data_bytes()) {
+        if let Err(e) = room(ctx, cf.data_bytes()) {
             return e;
         }
+        debug_assert!(!crate::sketch::room::asking());
         let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
         let mut map = write_lock!(shard);
         if map.get(key).is_some() {
@@ -835,7 +848,7 @@ fn compact(ctx: &mut Ctx) -> Vec<u8> {
     };
     let mut guard = sketch.write();
     let Sketch::Cuckoo(cf) = &mut *guard else {
-        return resp_error(WRONGTYPE);
+        return resp_error("Cuckoo filter was not found");
     };
     match cf.compact(true) {
         Ok(()) => resp_simple("OK"),

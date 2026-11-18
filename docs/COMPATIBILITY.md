@@ -271,9 +271,11 @@ other files:
 - Cuckoo filters are Redis's byte for byte (replies, `CF.SCANDUMP` chunks,
   `DUMP`). `COPY` copies one, which Redis refuses. At most 1 GiB and 99
   sub-filters, made, grown or loaded; `CF.INSERT`, `CF.INSERTNX` and
-  `CF.MEXISTS` have a per-command limit, checked before they start. A
-  sub-filter over 16 MiB is dumped in pieces that follow on, which Redis does
-  not do. See [COMMANDS.md](../COMMANDS.md).
+  `CF.MEXISTS` have a per-command limit, checked before they start, and a
+  compaction stops at a limit of its own (a large filter compacts in part,
+  where Redis's compaction goes on). A sub-filter over 16 MiB is dumped in
+  pieces that follow on, which Redis does not do. See
+  [COMMANDS.md](../COMMANDS.md).
 - Set and sorted-set members can't have their own TTLs. A Dragonfly file
   with a `SADDEX` set, or a KeyDB file or stream with `EXPIREMEMBER` on a set
   or sorted-set member, is refused, naming the key. Hash field TTLs from

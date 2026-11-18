@@ -28,7 +28,8 @@
 //!
 //! Size limits, which Redis does not have, checked before anything is
 //! allocated, whether a filter is made, grows or is loaded: [`MAX_BYTES`]
-//! in all its sub-filters, and [`MAX_FILTERS`] sub-filters.
+//! in all its sub-filters, and [`MAX_FILTERS`] sub-filters. And a limit on
+//! the work of one compaction, [`COMPACT_BUDGET`], past which it stops.
 
 use std::io;
 use std::sync::Arc;
@@ -46,6 +47,14 @@ pub const MAX_CAPACITY: i64 = 1 << 30;
 pub const CHUNK_MAX: u64 = 16 * 1024 * 1024;
 /// A `CF.SCANDUMP` header's length.
 pub const HEADER_LEN: usize = 38;
+/// The most work one compaction does (`CF.COMPACT`, or the one a `CF.DEL`
+/// starts), in steps of some 1.6 ns: each slot of a newer sub-filter costs
+/// one, and each fingerprint in one the slots of the older sub-filters it
+/// may look at (two buckets of each). Some 25 ms. A compaction that would
+/// go past it stops where it is, its newest sub-filter kept, whoever runs
+/// it: the same on a master, a replica and in a replay. A filter of some
+/// hundreds of thousands of fingerprints compacts whole, as in Redis.
+pub const COMPACT_BUDGET: u64 = 15_000_000;
 
 const ALT_FACTOR: u64 = 0x5bd1_e995;
 
@@ -390,12 +399,23 @@ impl Cuckoo {
 
     /// Move the newer sub-filters' fingerprints down where they fit, from
     /// the newest; drop the newest if it empties. `all`: go on past a
-    /// sub-filter that could not be emptied (`CF.COMPACT`).
+    /// sub-filter that could not be emptied (`CF.COMPACT`). It stops where
+    /// it is at [`COMPACT_BUDGET`].
     pub fn compact(&mut self, all: bool) -> Result<(), CuckooError> {
-        for fi in (1..self.filters.len()).rev() {
+        let look = 2 * u64::from(self.bucket_size);
+        let mut work = 0u64;
+        'filters: for fi in (1..self.filters.len()).rev() {
             let mut emptied = true;
             for bucket in 0..self.filters[fi].buckets {
                 for slot in 0..self.bucket_size as usize {
+                    let at = bucket as usize * self.bucket_size as usize + slot;
+                    work += 1;
+                    if self.filters[fi].data[at] != 0 {
+                        work += fi as u64 * look;
+                    }
+                    if work > COMPACT_BUDGET {
+                        break 'filters;
+                    }
                     if self.relocate(fi, bucket, slot)? == Some(false) {
                         emptied = false;
                     }
@@ -676,6 +696,42 @@ mod tests {
             max_iterations: 20,
             expansion: 1,
         }
+    }
+
+    /// A compaction stops at its budget, where it is, and the same way each
+    /// time: two copies end alike, every item still found; a small filter
+    /// compacts whole.
+    #[test]
+    fn compaction_stops_at_its_budget() {
+        let grown = |items: u32| {
+            let mut cf = Cuckoo::new(Params {
+                capacity: 1 << 12,
+                bucket_size: 2,
+                max_iterations: 20,
+                expansion: 2,
+            })
+            .unwrap();
+            for i in 0..items {
+                cf.insert(lookup(format!("c{i}").as_bytes()), MAX_FILTERS)
+                    .unwrap();
+            }
+            cf
+        };
+        let mut big = grown(1 << 21);
+        assert!(big.filters.len() > 4);
+        let mut again = big.clone();
+        let filters = big.filters.len();
+        big.compact(true).unwrap();
+        again.compact(true).unwrap();
+        assert_eq!(big, again);
+        assert_eq!(big.filters.len(), filters, "stopped before the oldest");
+        assert!((0..1u32 << 21).all(|i| big.contains(lookup(format!("c{i}").as_bytes()))));
+        let mut small = grown(10_000);
+        for i in 0..9_990 {
+            small.delete(lookup(format!("c{i}").as_bytes())).unwrap();
+        }
+        small.compact(true).unwrap();
+        assert_eq!(small.filters.len(), 1, "compacted whole");
     }
 
     /// No false negatives; added items deleted succeed; the false-positive

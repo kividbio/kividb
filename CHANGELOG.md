@@ -262,7 +262,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and the AOF as a `CF.RESERVE` naming them. `TYPE` is `MBbloomCF`, the ACL
   category `@cuckoo`. Unlike Redis, a filter has size limits (1 GiB, 99
   sub-filters), commands of many items a per-command limit checked before
-  they start, and `COPY` copies a filter. Snapshots keep filters under tag
+  they start, a compaction stops at a limit of its own (so a large filter
+  compacts in part), and `COPY` copies a filter. Snapshots keep filters under tag
   40, kind 4.
 
 - **Vector sets store vectors quantized when `VADD` asks for it (#697).**

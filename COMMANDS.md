@@ -850,9 +850,16 @@ reached`, and `BUCKETSIZE` is bounded by half of `cf-initial-size`.
   from where the last ended (and `CF.LOADCHUNK` puts each back there); Redis
   gives the same first 16 MiB for every piece. Chunks of smaller sub-filters
   are Redis's.
+- A compaction (`CF.COMPACT`, or the one a `CF.DEL` starts when deletes pass a
+  tenth of the items) does at most 15,000,000 steps, some 25 ms: a slot of a
+  newer sub-filter is one, and a fingerprint in it the older sub-filters'
+  slots it may look at. One that would go further stops where it is, keeping
+  its newest sub-filter, and `CF.COMPACT` answers `OK`; it is the same on a
+  replica and in a replay. Filters of some hundreds of thousands of
+  fingerprints compact whole, as in Redis; Redis's compaction has no limit.
 - Under `maxmemory`, a client's command that would allocate more than is left
-  evicts first under the policy, and is refused with `OOM ...` only if that is
-  not enough.
+  evicts first under the policy, before it takes its key, and is refused with
+  `OOM ...` only if that is not enough.
 - `DUMP` payloads carry RDB version 9, so every Redis since 6.0 can `RESTORE`
   them; the value is as Redis 8.10 writes it.
 
