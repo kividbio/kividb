@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/parity.rs
 //
 // Behaviour that was documented as a gap against Redis and no longer is:

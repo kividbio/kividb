@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/defrag_pacing.rs
 //
 // Active defrag's pacing (#240, src/compaction.rs `Pacer`): switched off in

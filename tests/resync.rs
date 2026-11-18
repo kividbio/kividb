@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/resync.rs
 //
 // Partial resynchronisation, and how a full one is loaded. Real `kividb`

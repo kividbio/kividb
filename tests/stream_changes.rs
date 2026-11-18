@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Which XREADGROUPs count as a change of the dataset
 // (`rdb_changes_since_last_save`), as in Redis (#27), and that an `HSETEX`
 // nothing observes still counts as one (#543). The count is the process's:

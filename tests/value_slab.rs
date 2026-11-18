@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/value_slab.rs
 //
 // The slabs that hold small string values (#113, src/value_slab.rs), through

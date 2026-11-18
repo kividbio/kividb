@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/hash_field_expiry.rs
 //
 // A hash field's expiry, as the readers of the write stream see it: a

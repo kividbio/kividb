@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/defrag.rs
 //
 // Active defrag (#113, src/compaction.rs): after a delete at random leaves

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/maxmemory.rs
 //
 // Integration tests for maxmemory enforcement (noeviction policy).

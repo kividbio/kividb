@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/ping.rs
 //
 // `kividb --ping`, the health check for images with no shell (#433): it exits

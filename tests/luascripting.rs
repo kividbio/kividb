@@ -1,7 +1,7 @@
+#![allow(clippy::disallowed_methods)]
 // tests/lua_scripting.rs
 // Requires --features lua. Skipped entirely when built without it.
 // Run with: cargo test --features lua --test lua_scripting
-
 #![cfg(feature = "lua")]
 
 use std::io::{BufRead, BufReader, Read, Write};
