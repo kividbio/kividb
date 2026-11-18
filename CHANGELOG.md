@@ -738,11 +738,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `client-query-buffer-limit` on the read-ahead alone; the unread bytes
   it already held in the parse buffer counted nowhere, so the two could
   each reach the limit — about twice it, held — without the client being
-  closed. The bound is now the same count `CLIENT LIST` reports as
-  `qbuf`, `buffer.len() - read_start + carried.len() - carried_from`, and
-  the read-ahead gives its consumed prefix back — capacity with it — in
-  steps as it is moved on, rather than at the end. The io_uring loop
-  holds the same bound.
+  closed. The bound is now the not-yet-run bytes the buffer holds plus
+  the read-ahead's unmoved part, and the read-ahead gives its consumed
+  prefix back — capacity with it — in steps as it is moved on, rather
+  than at the end. What is moved out of the read-ahead is not reserved
+  for again either: the buffer is not grown to a request's full length
+  while the read-ahead still holds it. The io_uring loop holds the same
+  bound.
 
 - **`CLIENT NO-TOUCH` now keeps the client's reads from counting as a
   use of the keys they find (#566).** The command was accepted and

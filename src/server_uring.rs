@@ -1169,6 +1169,12 @@ pub async fn handle_client(
         // that buffer until the next read opportunity; that is the accepted
         // io_uring tradeoff for not racing the read (Redis shrinks such buffers
         // from its client cron instead).
+        //
+        // Whether this turn's bytes were moved out of `carried`, already
+        // held, rather than read: what is already held is not reserved for
+        // again — `parse_buf` would reserve a request's full length while
+        // `carried` still holds it, and the client would keep the two (#869).
+        let mut fed_from_carried = false;
         let (unparsed, n) = if std::mem::take(&mut reparse) {
             // Only a `SHUTDOWN` that failed reparses, and its turn submitted
             // no read with its write.
@@ -1191,6 +1197,7 @@ pub async fn handle_client(
             // a read would have brought it: what one turn runs, and so the
             // replies the output limit looks at after it, is no more than a
             // read brings (#865).
+            fed_from_carried = true;
             let unparsed = parse_buf.len();
             let to = carried.len().min(carried_from + READ_BUFFER);
             parse_buf.extend_from_slice(&carried[carried_from..to]);
@@ -1632,7 +1639,7 @@ pub async fn handle_client(
                             &repl_state,
                             &mut carried,
                             carried_from,
-                            parse_buf.len() - parse_start,
+                            parse_buf.len() - (parse_offset + consumed),
                             &activity,
                             limit,
                         ))
@@ -1735,7 +1742,7 @@ pub async fn handle_client(
                         &repl_state,
                         &mut carried,
                         carried_from,
-                        parse_buf.len() - parse_start,
+                        parse_buf.len() - (parse_offset + consumed),
                         &activity,
                         limit,
                     ))
@@ -3195,7 +3202,7 @@ pub async fn handle_client(
                 resp::parse::PRIVATE_QUERY_BUFFER_MIN_CAPACITY.saturating_sub(parse_buf.len()),
             );
         }
-        if reserve_hint > parse_buf.capacity() {
+        if reserve_hint > parse_buf.capacity() && !fed_from_carried {
             parse_buf.reserve(reserve_hint.saturating_sub(parse_buf.len()));
         }
         query_buffer_peak = query_buffer_peak.max(reserve_hint);

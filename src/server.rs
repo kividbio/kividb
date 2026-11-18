@@ -94,7 +94,7 @@ fn socket_says_gone(_fd: Option<i32>) -> bool {
 /// Otherwise a client that kept sending while it waited — in a blocking
 /// command, a pause, `WAIT` — would be read into memory without end.
 /// `base` is what it already holds unread elsewhere — its `buffer` past
-/// `read_start` — and `from` the prefix of `carried` already moved on:
+/// what has run — and `from` the prefix of `carried` already moved on:
 /// the limit binds the two together, not each alone (#869).
 pub(crate) fn carried_too_much(base: usize, carried: &[u8], from: usize) -> bool {
     let held = base + carried.len() - from;
@@ -960,6 +960,11 @@ where
     loop {
         let was_private_at_read = private_query_buffer;
         let skip_read = std::mem::take(&mut reparse);
+        // Whether this turn's bytes were moved out of `carried`, already
+        // held, rather than read: what is already held is not reserved for
+        // again — `buffer` would reserve a request's full length while
+        // `carried` still holds it, and the client would keep the two (#869).
+        let mut fed_from_carried = false;
         if carried.is_empty() && !skip_read {
             // Redis reclaims private query buffers from its client cron, and the
             // maintenance step below is the equivalent. It can only do anything
@@ -1060,6 +1065,7 @@ where
             // A read's worth a turn, as the socket would have given it: what
             // one turn runs, and so the replies the output limit looks at
             // after it, is no more than a read brings (#865).
+            fed_from_carried = true;
             let to = carried.len().min(carried_from + temp.len());
             buffer.extend_from_slice(&carried[carried_from..to]);
             carried_from = to;
@@ -1271,7 +1277,7 @@ where
                             ReadAhead {
                                 carried: &mut carried,
                                 carried_from,
-                                held_elsewhere: buffer_len - read_start,
+                                held_elsewhere: buffer_len - (parse_offset + consumed),
                             },
                             &mut kill_rx,
                             &activity,
@@ -1288,7 +1294,7 @@ where
                                 ReadAhead {
                                     carried: &mut carried,
                                     carried_from,
-                                    held_elsewhere: buffer_len - read_start,
+                                    held_elsewhere: buffer_len - (parse_offset + consumed),
                                 },
                                 &activity,
                                 socket_fd,
@@ -1464,7 +1470,7 @@ where
                                 reader: &mut reader,
                                 carried: &mut carried,
                                 carried_from,
-                                held_elsewhere: buffer_len - read_start,
+                                held_elsewhere: buffer_len - (parse_offset + consumed),
                                 kill_rx: &mut kill_rx,
                                 client_registry: &client_registry,
                                 client_id,
@@ -1570,7 +1576,7 @@ where
                             reader: &mut reader,
                             carried: &mut carried,
                             carried_from,
-                            held_elsewhere: buffer_len - read_start,
+                            held_elsewhere: buffer_len - (parse_offset + consumed),
                             kill_rx: &mut kill_rx,
                             client_registry: &client_registry,
                             client_id,
@@ -2709,7 +2715,8 @@ where
                                 ReadAhead {
                                     carried: &mut carried,
                                     carried_from,
-                                    held_elsewhere: buffer_len - read_start,
+                                    held_elsewhere: buffer_len
+                                        - (parse_offset + consumed),
                                 },
                                 &mut kill_rx,
                                 &activity,
@@ -2771,7 +2778,8 @@ where
                                     ReadAhead {
                                         carried: &mut carried,
                                         carried_from,
-                                        held_elsewhere: buffer_len - read_start,
+                                        held_elsewhere: buffer_len
+                                            - (parse_offset + consumed),
                                     },
                                     &mut kill_rx,
                                     &activity,
@@ -3073,7 +3081,7 @@ where
                 resp::parse::PRIVATE_QUERY_BUFFER_MIN_CAPACITY.saturating_sub(buffer.len()),
             );
         }
-        if reserve_hint > buffer.capacity() {
+        if reserve_hint > buffer.capacity() && !fed_from_carried {
             buffer.reserve(reserve_hint.saturating_sub(buffer.len()));
         }
         query_buffer_peak = query_buffer_peak.max(reserve_hint);
