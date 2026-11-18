@@ -2405,6 +2405,13 @@ fn string_format_takes_fractions_for_integer_conversions_as_redis_does() {
             "return string.format('%d %d', 1.5, 'x')",
             "bad argument #3 to 'format' (number expected, got string)",
         ),
+        // An error after a fraction the wrapper formatted said #2: it
+        // counted the arguments Lua's `string.format` was left, not the
+        // script's (#771).
+        (
+            "return string.format('%d %f', 1.5, 'x')",
+            "bad argument #3 to 'format' (number expected, got string)",
+        ),
     ] {
         let reply = c.cmds(&["EVAL", script, "0"]);
         assert!(reply.as_error().contains(message), "{script}: {reply:?}");
