@@ -32,6 +32,19 @@ pub fn allocates(name: &str) -> bool {
     )
 }
 
+/// [`allocates`] for the dispatch of every command under `maxmemory`: a
+/// byte's look for the rest, the names asked out of line.
+#[inline]
+pub fn may_allocate(name: &str) -> bool {
+    matches!(name.as_bytes().first(), Some(b'B' | b'C' | b'T')) && allocates_cold(name)
+}
+
+#[cold]
+#[inline(never)]
+fn allocates_cold(name: &str) -> bool {
+    allocates(name)
+}
+
 /// The bytes the command in `ctx`, named `name` (one that [`allocates`]),
 /// would allocate: 0 if it would be refused before it got that far. Asked
 /// by the dispatch, under `maxmemory`, before the command takes its keys'
