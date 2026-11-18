@@ -9813,6 +9813,172 @@
           "kind": "info"
         }
       ]
+    },
+    "27-ratelimit-restarted/t2/checks_per_s_bg0k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "checks_per_s_bg0k",
+      "unit": "checks/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 31048.0,
+        "candidate": 31168.0,
+        "redis": 31199.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.05
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/checks_per_s_bg100k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "checks_per_s_bg100k",
+      "unit": "checks/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 27771.0,
+        "candidate": 31399.0,
+        "redis": 31812.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.05
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/checks_per_s_bg50k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "checks_per_s_bg50k",
+      "unit": "checks/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 30646.0,
+        "candidate": 31553.0,
+        "redis": 31907.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.05
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/p99_ms_bg0k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "p99_ms_bg0k",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.3,
+        "candidate": 0.218,
+        "redis": 0.52,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 0.5,
+          "speed": false
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/p99_ms_bg100k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "p99_ms_bg100k",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 6.118,
+        "candidate": 0.19,
+        "redis": 0.122,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 0.5,
+          "speed": false
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6,
+          "speed": false
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/p99_ms_bg50k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "p99_ms_bg50k",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.559,
+        "candidate": 0.145,
+        "redis": 0.078,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 0.5,
+          "speed": false
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6,
+          "speed": false
+        }
+      ]
     }
   }
 }
