@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/array.rs
 //
 // Integration tests for the Redis 8.8 array type (AR* commands).

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/search_postings.rs
 //
 // TAG and NUMERIC postings (`vector::postings`): a query answered from them

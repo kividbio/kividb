@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/search_stemming.rs
 //
 // Stemming of TEXT fields and the scores of FT.SEARCH, over the wire, held
