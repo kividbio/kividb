@@ -724,10 +724,10 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
         ValueRef::SortedSet(arc) => {
             w.write_all(&[TAG_SORTEDSET])?;
             let inner = arc.read();
-            // Iterate by_score so order is preserved on reload (nice-to-have)
-            w.write_all(&(inner.members.len() as u32).to_le_bytes())?;
-            for (score, member) in inner.by_score.keys() {
-                write_bytes(w, member)?;
+            // Iterate by score so order is preserved on reload (nice-to-have)
+            w.write_all(&(inner.len() as u32).to_le_bytes())?;
+            for (member, score) in inner.iter() {
+                write_bytes(w, &member)?;
                 w.write_all(&score.to_bits().to_le_bytes())?; // f64 as raw bits — lossless
             }
         }
@@ -5964,10 +5964,10 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
         KiviDBValue::SortedSet(arc) => {
             out.write_all(&[TAG_SORTEDSET])?;
             let inner = arc.read();
-            out.write_all(&(inner.members.len() as u32).to_le_bytes())?;
-            for (score, member) in inner.by_score.keys() {
-                write_bytes_vec(out, member)?;
-                out.write_all(&score.0.to_bits().to_le_bytes())?;
+            out.write_all(&(inner.len() as u32).to_le_bytes())?;
+            for (member, score) in inner.iter() {
+                write_bytes_vec(out, &member)?;
+                out.write_all(&score.to_bits().to_le_bytes())?;
             }
         }
         KiviDBValue::Stream(arc) => {
@@ -8004,12 +8004,8 @@ mod empty_key_tests {
         match loaded.dbs[0].get(&b"zset"[..]) {
             Some(KiviDBValue::SortedSet(zset)) => {
                 let zset = zset.read();
-                assert_eq!(zset.members.len(), 2);
-                assert!(
-                    zset.by_score
-                        .keys()
-                        .any(|(score, m)| m.is_empty() && score.0 == 1.5)
-                );
+                assert_eq!(zset.len(), 2);
+                assert!(zset.iter().any(|(m, score)| m.is_empty() && score == 1.5));
             }
             _ => panic!("zset is not a sorted set"),
         }

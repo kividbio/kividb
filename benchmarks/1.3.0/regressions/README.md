@@ -37,7 +37,8 @@ and why.
 | `19-hash-memory` | collection storage step 2 | `used_memory` per hash field, 1,000,000 fields in hashes of 10, 100, 1,000 and 100,000: 14-byte fields (`field:<i>`) with 32-byte values, plain and with one field TTL a hash; `OBJECT ENCODING` of each size recorded exactly (`listpack`, `listpackex`, `hashtable`); the tables (1,000 and 100,000) as guard rows |
 | `21-list-memory` | #297 (step 3) | `used_memory` per list element, 1,000,000 32-byte elements in lists of 10, 100, 1,000 and 100,000, packed in chunks; the same made plain (an element over 1,024 bytes pushed and popped first) as guard rows; `OBJECT ENCODING` of each size recorded exactly |
 | `22-scan-large-count` | #884 | Argo CD's `SCAN <cursor> MATCH revoked-token\|* COUNT 10000` over 40,000 keys of 50 KB that it never matches (`--threads 4`): microseconds a call, client side and the server's own (`INFO commandstats`), calls and keys returned (exactly 0) for a full iteration, and the p99 of four `PING` probes while four other connections loop the same `SCAN` |
-| `23-snapshot-size` | #879 | `SAVE` of #879's dataset (`DEBUG POPULATE 6000000 k 150`) and of a collections mix (200,000 hashes of 10 fields, 50,000 each of sets, sorted sets and lists of 20): the snapshot's size on disk, the `SAVE` time (median of 3 after a warm-up) and the time a new server takes to load it (best of 2); the size gated against v1.2.2 (keep 60 % of the gain) and, for #879's dataset, within 1.5x of Redis's `dump.rdb`; the save at most 2.5x v1.2.2's time (it compresses), the load 1.5x |
+| `23-pubsub-pattern-fanout` | #851 | socket.io's Redis adapter: 48 `redis-benchmark` connections `PUBLISH` 200-byte messages to `socket.io#/#room<n>#`, 16 subscribers `PSUBSCRIBE socket.io#/#*` (`pattern`) or `SUBSCRIBE` one channel (`channel`, the plain fan-out guard): messages delivered a second until every subscriber has all of them, messages lost (exactly 0), and the p99 of a probe's own messages from publish to receipt |
+| `24-snapshot-size` | #879 | `SAVE` of #879's dataset (`DEBUG POPULATE 6000000 k 150`) and of a collections mix (200,000 hashes of 10 fields, 50,000 each of sets, sorted sets and lists of 20): the snapshot's size on disk, the `SAVE` time (median of 3 after a warm-up) and the time a new server takes to load it (best of 2); the size gated against v1.2.2 (keep 60 % of the gain) and, for #879's dataset, within 1.5x of Redis's `dump.rdb`; the save at most 2.5x v1.2.2's time (it compresses), the load 1.5x |
 
 ## Running it
 
@@ -886,6 +887,29 @@ in brackets; Redis's are the same):
 The 1,000 and 100,000 rows are guards: hashes past the block's limits are
 tables, as in v1.2.2, and must not grow. Instructions per command are not
 measured here; the PR has them from callgrind runs of the same builds.
+
+## Recorded run, suite 23
+
+Recorded 2026-11-18 on an Azure Standard_D4s_v5 (Xeon Platinum 8370C),
+`--only 23 --record`; the candidate is commit `37c98d80` (#851, merged with
+master `aee34f90`), `cargo build --release`. Runs: `pr851-37c98d80-d4s_v5`
+(recorded) and `pr851-37c98d80-d4s_v5-rerun` (the noise check: every gate
+passed). A run takes 140 s.
+
+| config | metric | v1.2.2 | candidate | Redis 8.10.2 |
+|---|---|---:|---:|---:|
+| pattern | delivered a second | 1,306,995 | 1,467,643 | 1,366,055 |
+| pattern | p99 publish to receipt, ms | 0.75 | 0.77 | 0.92 |
+| channel | delivered a second | 1,508,943 | 1,468,950 | 1,429,524 |
+| channel | p99 publish to receipt, ms | 0.86 | 0.68 | 0.86 |
+
+KiviDB runs with `--threads 2` here (see the suite's docstring): with the
+default of one worker a CPU, its 4 workers share the 4 vCPUs with the
+clients, and master delivered 1.15M a second with a 4.3 ms p99 in the
+pattern row against Redis's 1.35M and 0.9 ms. The channel row is a guard:
+the 4 Python readers are near their limit there, so it catches a loss, not
+a gain. #851's PR has the pinned measurements (server on 2 vCPUs, clients
+on the other 2, a Rust client), where the difference is larger.
 
 ## Not covered
 

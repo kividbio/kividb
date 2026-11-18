@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import Suite, Config, ratio, vs_redis, vs_v1_2_2, info, scaled, median  # noqa: E402
 from nodes import Nodes  # noqa: E402
 
-S = Suite("23-snapshot-size", [Config("issue", self_hosted=True), Config("coll", self_hosted=True)])
+S = Suite("24-snapshot-size", [Config("issue", self_hosted=True), Config("coll", self_hosted=True)])
 
 
 def dump_path(node):

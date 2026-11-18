@@ -74,6 +74,10 @@ pub struct Activity {
     /// once, and not shown), and what is queued for a subscriber.
     reply_output: AtomicU64,
     pubsub_output: AtomicU64,
+    /// What a subscriber's writer keeps between batches (its batch and
+    /// frame buffers, #851): memory the client holds, not output waiting,
+    /// so it is in `tot-mem` and `mem_clients_normal` and not in `omem`.
+    pubsub_kept: AtomicU64,
 }
 
 /// A batch of replies this large or larger is shown in `omem` while it is
@@ -366,6 +370,17 @@ impl Activity {
     /// What is waiting to be written to the connection: `omem`.
     pub fn output(&self) -> u64 {
         self.reply_output.load(Ordering::Relaxed) + self.pubsub_output.load(Ordering::Relaxed)
+    }
+
+    /// See [`Activity::pubsub_kept`].
+    pub fn set_pubsub_kept(&self, bytes: usize) {
+        self.pubsub_kept.store(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// What the connection holds besides its query buffer: its output and
+    /// a subscriber's kept buffers.
+    pub fn memory(&self) -> u64 {
+        self.output() + self.pubsub_kept.load(Ordering::Relaxed)
     }
 
     /// The connection's transaction now: the commands queued if it is in
@@ -725,8 +740,9 @@ impl ClientInfo {
             qbuf_free,
             self.activity.output(),
             // What KiviDB measures of a client's memory: its query buffer,
-            // and what is waiting to be written to it.
-            qbuf + qbuf_free + self.activity.output(),
+            // what is waiting to be written to it, and a subscriber's kept
+            // buffers.
+            qbuf + qbuf_free + self.activity.memory(),
             self.activity.last_cmd(),
             self.user,
             self.tracking_redirect.map_or(-1, |id| id as i64),
@@ -1117,7 +1133,7 @@ impl ClientRegistryInner {
         let (mut normal, mut replicas) = (0u64, 0u64);
         for info in self.clients.read().values() {
             let (len, free) = info.query_buffer.values();
-            let used = len + free + info.activity.output();
+            let used = len + free + info.activity.memory();
             if info.flags.contains('S') {
                 replicas += used;
             } else {

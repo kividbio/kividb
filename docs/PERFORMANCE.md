@@ -194,7 +194,7 @@ on tmpfs (the save on the VM's disk in its own row):
 Compressing costs CPU on the saving threads: a save to tmpfs of the text
 strings takes 2.0 s instead of 1.2 s, and loading takes up to 1.1 s more.
 `rdbcompression no` writes the plain image, as 1.2 did. Suite
-`23-snapshot-size` of
+`24-snapshot-size` of
 [the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
 the first and last datasets again (snapshot size, save and load time against
 1.2.2 and Redis) and fails a build that loses it.

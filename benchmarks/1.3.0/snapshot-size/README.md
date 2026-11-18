@@ -6,7 +6,7 @@ full sync's time and the master's memory during it, and the latency of
 writes during a save. Against v1.2.2, master before the change, the change
 with `rdbcompression no` and `yes`, and Redis 8.10.2.
 
-The regression gate is suite `23-snapshot-size` of
+The regression gate is suite `24-snapshot-size` of
 [the regression suite](../regressions/README.md); this harness is the fuller
 measurement behind the CHANGELOG and `docs/PERFORMANCE.md`.
 

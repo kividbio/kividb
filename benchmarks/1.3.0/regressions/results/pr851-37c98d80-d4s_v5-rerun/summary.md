@@ -1,30 +1,34 @@
-# Regression suite: kdb879-23-d4s_v5
+# Regression suite: pr851-37c98d80-d4s_v5-rerun
 
 Verdict: **ok**
 
 - Machine: Standard_D4s_v5, 4 vCPU, Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz, kernel 7.0.0-1017-azure, glibc 2.39
 - CPU: recorded on Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz; now Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
-- calibration (indicative only): 93.5 ms for a fixed sha256 loop, 4 cores
+- calibration (indicative only): 93.8 ms for a fixed sha256 loop, 4 cores
 - Client: Python 3.12.3, redis-py 5.2.1
 - v1_2_2: `kividb 1.2.2`, sha256 `38fc2cea40c131e041f4914527a98719e5d34dffdfe2abdc1f07ecb86aa6723e`
-- candidate: `kividb 1.2.1 (default build: no Lua, no TLS)`, sha256 `8e16693cca3e95d08f58ff247e1786d36d2d0ec7cadc699957b2a3b4605c0f94`
+- candidate: `kividb 1.2.1 (default build: no Lua, no TLS)`, sha256 `9ea2f3475adef81bc3f57b2ad7e5a1b4c275c5a067fbd0eb7c360167c8b519cc`
 - redis: `Redis server v=8.10.2 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=75a9b36b1f0aa00`, sha256 `b0cd304980112fa6cd8dced524fdd6b136fd8efb802f5cf9e81610051a11891c`
-- candidate commit: `feat-879`
+- candidate commit: `37c98d80`
 - date: 2026-11-18; FULL=0, SCALE=1
-- run time: 23-snapshot-size 233s
+- run time: 23-pubsub-pattern-fanout 140s
 
-## 23-snapshot-size
+Host speed (this host vs the recorded one; 1.00 = same, below 1 = slower), from v1.2.2 measured in both sessions: global 0.98x over 4 metrics
+- 23-pubsub-pattern-fanout/channel: 0.98x (2 metrics, too few: the global factor is used)
+- 23-pubsub-pattern-fanout/pattern: 0.98x (2 metrics, too few: the global factor is used)
+
+## 23-pubsub-pattern-fanout
 
 | config | metric | unit | v1.2.2 | candidate | Redis | recorded | gate | result |
 |---|---|---|---:|---:|---:|---:|---|---|
-| coll | keys | keys | 350,000 | 350,000 | 350,000 | - | info | info |
-| coll | load_ms | ms | 1,206 | 1,306 | 509.4 | - | vs_v1_2_2: 1.08x v1.2.2 <= 1.5x | pass |
-| coll | save_ms | ms | 946.2 | 562.7 | 1,099 | - | vs_v1_2_2: 0.59x v1.2.2 <= 2.5x | pass |
-| coll | snapshot_mb | MB | 107.5 | 46.08 | 84.11 | - | ratio: ratio: nothing recorded | new |
-| issue | keys | keys | 6,000,000 | 6,000,000 | 6,000,000 | - | info | info |
-| issue | load_ms | ms | 9,835 | 9,734 | 6,063 | - | vs_v1_2_2: 0.99x v1.2.2 <= 1.5x | pass |
-| issue | save_ms | ms | 7,065 | 2,227 | 8,721 | - | vs_v1_2_2: 0.32x v1.2.2 <= 2.5x | pass |
-| issue | snapshot_mb | MB | 1,007 | 49.47 | 213.8 | - | ratio: ratio: nothing recorded<br>vs_redis: 0.23x Redis <= 1.5x | new<br>pass |
+| channel | delivered_per_s | msg/s | 1,477,653 | 1,475,906 | 1,447,275 | 1,468,950 | rel: >= 1,297,659 (10% under 1,441,843, recorded 1,468,950 scaled by host speed 0.98x (global))<br>vs_redis: 0.98x Redis <= 1.1x | pass<br>pass |
+| channel | delivery_p99_ms | ms | 0.933 | 0.692 | 0.846 | 0.685 | rel: <= 1.68 (50% over 0.685, +1) | pass |
+| channel | lost | messages | 0 | 0 | 0 | 0 | bound: == 0 | pass |
+| channel | published_per_s | req/s | 92,436 | 92,322 | 90,511 | 91,870 | info | info |
+| pattern | delivered_per_s | msg/s | 1,285,539 | 1,487,446 | 1,375,753 | 1,467,643 | rel: >= 1,296,504 (10% under 1,440,560, recorded 1,467,643 scaled by host speed 0.98x (global))<br>vs_redis: 0.92x Redis <= 1.1x | pass<br>pass |
+| pattern | delivery_p99_ms | ms | 0.78 | 0.824 | 0.882 | 0.765 | rel: <= 1.77 (50% over 0.765, +1) | pass |
+| pattern | lost | messages | 0 | 0 | 0 | 0 | bound: == 0 | pass |
+| pattern | published_per_s | req/s | 79,481 | 92,081 | 85,082 | 90,840 | info | info |
 
 ## Not run this time
 
