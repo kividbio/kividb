@@ -589,6 +589,150 @@ fn assert_same_dataset(master: &mut Conn, replica: &mut Conn) {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+/// Writes on a connection of their own until `stop`: `INCR counter`,
+/// `RPUSH list`, `SET key:<tag>:<n>`, 64 of each a write, until told to stop
+/// or the server goes (a `SHUTDOWN` under them). Returns how many rounds of
+/// the three were answered.
+fn writer(port: u16, tag: String, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<usize> {
+    std::thread::spawn(move || {
+        let mut c = Conn::connect(port);
+        let mut done = 0;
+        while !stop.load(Ordering::Relaxed) {
+            let mut buf = Vec::new();
+            for i in done..done + 64 {
+                let item = format!("{tag}-{i}");
+                let key = format!("key:{tag}:{i}");
+                for args in [
+                    &["INCR", "counter"][..],
+                    &["RPUSH", "list", &item],
+                    &["SET", &key, "value"],
+                ] {
+                    buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+                    for a in args {
+                        buf.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
+                    }
+                }
+            }
+            if c.writer.write_all(&buf).is_err() {
+                break;
+            }
+            let mut answered = 0;
+            for _ in 0..64 * 3 {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.read())) {
+                    Ok(V::Err(_)) | Err(_) => break,
+                    Ok(_) => answered += 1,
+                }
+            }
+            if answered < 64 * 3 {
+                break;
+            }
+            done += 64;
+        }
+        done
+    })
+}
+
+/// [`assert_same_dataset`], and every key's value digest
+/// (`DEBUG DIGEST-VALUE`) equal on both sides.
+fn assert_same_values(master: &mut Conn, replica: &mut Conn) {
+    assert_same_dataset(master, replica);
+    let keys: Vec<String> = master
+        .cmd(&["KEYS", "*"])
+        .arr()
+        .iter()
+        .map(|k| k.s().to_string())
+        .collect();
+    for chunk in keys.chunks(500) {
+        let mut args = vec!["DEBUG", "DIGEST-VALUE"];
+        args.extend(chunk.iter().map(String::as_str));
+        assert_eq!(master.cmd(&args), replica.cmd(&args));
+    }
+}
+
+/// How many times a test of attaches or restarts goes round: a few here,
+/// more when `KIVIDB_TEST_ROUNDS` says so (the #894 runs used 50 and 10).
+fn rounds(default: usize) -> usize {
+    std::env::var("KIVIDB_TEST_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// A master that keeps its backlog with no replica attached (it started
+/// with data) hands the backlog its writes about once a millisecond, not
+/// one by one (#894). Replicas attached to it at random moments of a write
+/// load are each sent the dataset and then every write after it: none is
+/// lost or applied twice between the cut and the stream.
+#[test]
+fn replicas_attached_under_writes_to_a_master_keeping_its_backlog_miss_nothing() {
+    let mut master = Server::start(&[]);
+    write_batch(&mut master.conn(), 0, 50);
+    master.shutdown();
+    master.restart();
+    let mut m = master.conn();
+    assert_eq!(m.info("replication", "repl_backlog_active"), "1");
+    assert_eq!(m.info("replication", "connected_slaves"), "0");
+    for round in 0..rounds(3) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let load = writer(master.port, format!("a{round}"), Arc::clone(&stop));
+        std::thread::sleep(Duration::from_millis(rand::random::<u64>() % 200));
+        let replica = Server::start(&["--replicaof", "127.0.0.1", &master.port.to_string()]);
+        let mut r = replica.conn();
+        wait_link_up(&mut r);
+        std::thread::sleep(Duration::from_millis(rand::random::<u64>() % 200));
+        stop.store(true, Ordering::Relaxed);
+        assert!(
+            load.join().unwrap() > 0,
+            "round {round}: no write was answered"
+        );
+        assert_same_values(&mut m, &mut r);
+        drop((r, replica));
+        wait_until("the master to see its replica go", || {
+            m.info("replication", "connected_slaves") == "0"
+        });
+    }
+}
+
+/// A master shut down while it is being written to, and started again,
+/// continues its replica from where the replica is, by a partial resync, with
+/// the backlog it keeps from then on: the same data on both sides, and never
+/// the dataset sent again.
+#[test]
+fn a_master_shut_down_under_writes_continues_its_replica_every_time() {
+    let mut master = Server::start(&["--aof"]);
+    let port = master.port.to_string();
+    let mut replica = Server::start(&["--replicaof", "127.0.0.1", &port, "--aof"]);
+    let mut r = replica.conn();
+    write_batch(&mut master.conn(), 0, 20);
+    wait_link_up(&mut r);
+    for round in 0..rounds(2) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let load = writer(master.port, format!("b{round}"), Arc::clone(&stop));
+        std::thread::sleep(Duration::from_millis(100 + rand::random::<u64>() % 200));
+        master.shutdown();
+        stop.store(true, Ordering::Relaxed);
+        load.join().unwrap();
+        master.restart_master(&mut [&mut replica]);
+        let mut m = master.conn();
+        assert_eq!(m.info("replication", "repl_backlog_active"), "1");
+        let stop = Arc::new(AtomicBool::new(false));
+        let load = writer(master.port, format!("c{round}"), Arc::clone(&stop));
+        std::thread::sleep(Duration::from_millis(rand::random::<u64>() % 200));
+        stop.store(true, Ordering::Relaxed);
+        load.join().unwrap();
+        wait_link_up(&mut r);
+        assert_same_values(&mut m, &mut r);
+        assert_eq!(
+            m.stat("sync_full"),
+            0,
+            "round {round}: the replica was sent the dataset again:\n{}\n{}",
+            master.log(),
+            replica.log()
+        );
+        assert_eq!(m.stat("sync_partial_ok"), 1, "round {round}");
+    }
+}
+
 /// A replica that loses its connection and gets it back is sent what it
 /// missed, not the dataset. It used to be sent the dataset every time.
 #[test]
