@@ -262,6 +262,44 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Writes on a master with a replication backlog and no replica no
+  longer wake the replication thread one by one (#894).** A master that
+  starts with data (its own snapshot, or any dataset) keeps the backlog for
+  `repl-backlog-ttl` (an hour) so that a replica can be continued, and so
+  does one whose replicas have gone. Every write was handed to the
+  replication thread and woke it; on a server held to a few CPUs that
+  thread took them from the connections. In #894 an envoy rate limiter
+  (`INCRBY` + `EXPIRE` on two keys a check, 65 connections) beside other
+  replicas' pipelined load ran 8 % slower than on Redis with 1.7x its p99.
+  With no replica attached, the thread now takes what has come in, sleeps a
+  millisecond and looks again, and waits to be woken only once it finds
+  nothing; once a replica attaches, every write is handed on at once, as
+  before. Azure D8s_v5, the server on two vCPUs of separate cores
+  (`--threads 2`, io_uring), the checks and the background load on
+  CPUs of their own, the server started from a snapshot of 100,000 keys,
+  checks a second and p99 (medians of three), master before / after,
+  Redis 8.10.2 beside it:
+
+  | background (cmds/s) | 1.2.2 | before | after | Redis |
+  |---|---|---|---|---|
+  | 0 | 31.4k, 0.14 ms | 31.4k, 0.15 ms | 31.7k, 0.09 ms | 31.7k, 0.10 ms |
+  | 100,000 | 23.7k, 3.7 ms | 24.4k, 3.7 ms | 31.6k, 0.17 ms | 31.8k, 0.10 ms |
+  | 150,000 | 23.3k, 4.2 ms | 21.1k, 5.0 ms | 29.6k, 1.3 ms | 31.9k, 0.11 ms |
+  | 200,000 | 23.9k, 4.3 ms | 22.2k, 5.1 ms | 24.0k, 4.8 ms | 27.7k, 0.87 ms |
+  | 300,000 | 22.3k, 5.7 ms | 18.9k, 8.3 ms | 28.4k, 0.74 ms | 23.6k, 0.98 ms |
+
+  The server's CPU at 0 went from 76 % to 54 % (46 % with no backlog), and
+  pipelined `SET` on such a server from 0.87M to 1.14M a second at
+  pipeline 16 (1.34M with no backlog) and from 1.33M to 1.42M at 100.
+  At 150,000 and 200,000 the two io_uring workers are still at times put
+  on one CPU by the scheduler, and connections wait out the other's time
+  slice: pinned each to a CPU of its own (by hand, with `taskset`), the
+  same server keeps 31.3-31.6k checks a second at a p99 of 0.17-0.22 ms
+  there. A server with no backlog (one
+  started empty, as benchmarks start it) is unchanged: 31.7-31.8k checks a
+  second at a p99 of 0.07-0.09 ms at every rate. Suite
+  `24-ratelimit-restarted` measures it.
+
 - **Pub/sub fan-out delivers 18-29 % more messages a second, ahead of
   Redis (#851).** socket.io's Redis adapter publishes every broadcast with
   `PUBLISH socket.io#/#<room>#` to servers that each `PSUBSCRIBE

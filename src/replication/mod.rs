@@ -223,6 +223,11 @@ pub struct ReplState {
     /// the first full sync; cleared by the hub once no replica has been
     /// attached for `repl-backlog-ttl`. See [`Backlog`].
     pub backlog_active: AtomicBool,
+    /// How many times the hub has waited to be woken by the next message,
+    /// its inbox empty. With no replica attached it sleeps a moment instead
+    /// while writes keep coming (#894): each such wait is a wake-up some
+    /// write has to pay for.
+    pub hub_parks: AtomicU64,
     /// `repl-backlog-size`, in bytes; and `repl-backlog-ttl`, in seconds
     /// (0 = keep the backlog for ever).
     pub backlog_size: AtomicU64,
@@ -579,6 +584,7 @@ impl ReplState {
             full_sync_guard_ratio: AtomicU64::new(50),
             master_credentials: RwLock::new((String::new(), String::new())),
             backlog_active: AtomicBool::new(false),
+            hub_parks: AtomicU64::new(0),
             backlog_size: AtomicU64::new(64 * 1024 * 1024),
             backlog_ttl_secs: AtomicU64::new(3600),
             replica_max_backlog_bytes: AtomicU64::new(256 * 1024 * 1024),
@@ -2372,6 +2378,17 @@ impl Backlog {
 /// The replication stream's heartbeat: an inline-safe `PING`, RESP-encoded.
 const REPL_PING: &[u8] = b"*1\r\n$4\r\nPING\r\n";
 
+/// How long the hub sleeps, with no replica attached, once it has emptied
+/// its inbox of writes for the backlog (#894): what the backlog may lag the
+/// writes by, and so how many it is handed at once, about 300 at 300,000
+/// writes a second.
+const BACKLOG_PACE: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// How many messages the hub takes in a row that way before it goes
+/// through its wait once, so that its once-a-second work is not held off
+/// by writes that keep coming faster than it takes them.
+const BACKLOG_DRAIN: u32 = 1024;
+
 // NEW: global replica id counter
 static NEXT_REPLICA_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -2772,6 +2789,12 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
         let mut leaving: Vec<Arc<ReplicaQueue>> = Vec::new();
         // When the last replica went away, while the backlog is being kept.
         let mut without_replicas: Option<tokio::time::Instant> = None;
+        // The last look at the inbox, with no replica attached, found
+        // something: the next empty look sleeps `BACKLOG_PACE` rather than
+        // waiting to be woken (#894).
+        let mut paced = false;
+        // Messages taken in a row without waiting.
+        let mut drained = 0u32;
 
         loop {
             // What is queued for the replicas and not yet taken by their
@@ -2795,98 +2818,144 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
             if state.replica_queued_memory.load(Ordering::Relaxed) != queued {
                 state.replica_queued_memory.store(queued, Ordering::Relaxed);
             }
-            let msg = tokio::select! {
-                msg = hub_rx.recv() => match msg {
-                    Some(m) => m,
-                    None => break,
-                },
-                _ = tick.tick() => {
-                    backlog.report(&state);
-                    // A queue under the soft limit now is no longer over it,
-                    // though nothing was written to find that out: its clock
-                    // starts again. Without this, a replica that went over,
-                    // drained, and stayed idle was dropped by the first
-                    // large write after, as over it ever since (#774).
-                    let soft = state.replica_soft_limit_bytes.load(Ordering::Relaxed);
-                    if soft != 0 {
-                        for replica in channel_replicas.iter_mut().filter(|r| !r.syncing) {
-                            if replica.pending_bytes.bytes() < soft {
-                                replica.soft_armed = true;
-                                replica.over_soft_since = 0;
+            // With no replica attached, the writes sent here only go into the
+            // backlog, and nothing waits for that. Waiting on the inbox
+            // between them had every write wake this thread (an eventfd write
+            // on the writer's side, a wake-up here), and on a server held to
+            // a few CPUs that thread took them from the connections: after a
+            // restart, which keeps the backlog for an hour, a rate limiter's
+            // p99 went from 0.1 ms to 4-8 ms (#894). So the inbox is emptied
+            // as it comes, and once it is empty the hub sleeps a moment
+            // instead, unwoken by the writes made meanwhile. A look that
+            // finds nothing waits to be woken again, so an idle server stays
+            // idle. A replica attaching is seen at most a moment late; once
+            // one is attached, every write is handed on at once, as before.
+            // At most `BACKLOG_DRAIN` in a row: then once through the wait
+            // below, where the clock's turn comes too.
+            let ready = if socket_replicas.is_empty()
+                && channel_replicas.is_empty()
+                && drained < BACKLOG_DRAIN
+            {
+                match hub_rx.try_recv() {
+                    Ok(m) => {
+                        drained += 1;
+                        Some(m)
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                    Err(mpsc::error::TryRecvError::Empty) => None,
+                }
+            } else {
+                paced = false;
+                None
+            };
+            if ready.is_none() {
+                drained = 0;
+            }
+            let msg = match ready {
+                Some(m) => {
+                    paced = true;
+                    m
+                }
+                None => {
+                    let pace = std::mem::take(&mut paced);
+                    if !pace {
+                        state.hub_parks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    tokio::select! {
+                    msg = hub_rx.recv(), if !pace => match msg {
+                        Some(m) => m,
+                        None => break,
+                    },
+                    () = tokio::time::sleep(BACKLOG_PACE), if pace => continue,
+                    _ = tick.tick() => {
+                        backlog.report(&state);
+                        // A queue under the soft limit now is no longer over it,
+                        // though nothing was written to find that out: its clock
+                        // starts again. Without this, a replica that went over,
+                        // drained, and stayed idle was dropped by the first
+                        // large write after, as over it ever since (#774).
+                        let soft = state.replica_soft_limit_bytes.load(Ordering::Relaxed);
+                        if soft != 0 {
+                            for replica in channel_replicas.iter_mut().filter(|r| !r.syncing) {
+                                if replica.pending_bytes.bytes() < soft {
+                                    replica.soft_armed = true;
+                                    replica.over_soft_since = 0;
+                                }
                             }
                         }
-                    }
-                    // Give the backlog up once no replica has been attached
-                    // for `repl-backlog-ttl`: keeping it means encoding every
-                    // write for a replica that is not coming back.
-                    if channel_replicas.is_empty() && backlog.valid {
-                        let since = *without_replicas.get_or_insert_with(tokio::time::Instant::now);
-                        let ttl = state.backlog_ttl_secs.load(Ordering::Relaxed);
-                        if ttl > 0 && since.elapsed() >= std::time::Duration::from_secs(ttl) {
-                            // As a writer in the gate, so that this cannot
-                            // cross the cut of a full sync that is switching
-                            // the backlog on.
-                            let _gate = crate::write_gate::enter();
-                            if state.connected_replicas.load(Ordering::Relaxed) == 0 {
-                                state.backlog_active.store(false, Ordering::Relaxed);
-                                backlog.give_up();
-                                backlog.report(&state);
-                                log_info!(
-                                    "Replication: No replica for {ttl}s — replication backlog released"
-                                );
+                        // Give the backlog up once no replica has been attached
+                        // for `repl-backlog-ttl`: keeping it means encoding every
+                        // write for a replica that is not coming back.
+                        if channel_replicas.is_empty() && backlog.valid {
+                            let since = *without_replicas.get_or_insert_with(tokio::time::Instant::now);
+                            let ttl = state.backlog_ttl_secs.load(Ordering::Relaxed);
+                            if ttl > 0 && since.elapsed() >= std::time::Duration::from_secs(ttl) {
+                                // As a writer in the gate, so that this cannot
+                                // cross the cut of a full sync that is switching
+                                // the backlog on.
+                                let _gate = crate::write_gate::enter();
+                                if state.connected_replicas.load(Ordering::Relaxed) == 0 {
+                                    state.backlog_active.store(false, Ordering::Relaxed);
+                                    backlog.give_up();
+                                    backlog.report(&state);
+                                    log_info!(
+                                        "Replication: No replica for {ttl}s — replication backlog released"
+                                    );
+                                }
                             }
+                        } else {
+                            without_replicas = None;
                         }
-                    } else {
-                        without_replicas = None;
-                    }
-                    let period = state.repl_ping_period_secs.load(Ordering::Relaxed);
-                    if period == 0
-                        || channel_replicas.is_empty()
-                        || last_ping.elapsed() < std::time::Duration::from_secs(period)
-                    {
-                        continue;
-                    }
-                    last_ping = tokio::time::Instant::now();
-                    // A master with nothing to replicate still has to say so:
-                    // an idle link and a dead one are otherwise identical from
-                    // the replica's side, which is how a replica came to
-                    // report `master_link_status:up` for 15 minutes after its
-                    // master was powered off. The PING is ordinary stream
-                    // content, so it advances the offset like any other byte.
-                    //
-                    // Counted inside the write gate, like a write: a full
-                    // sync's cut then reads an offset that either includes
-                    // this PING, with the PING already in the stream, or does
-                    // not — never one without the other.
-                    //
-                    // And queued, not handled here and now, for the same
-                    // reason: its place in the stream has to be its place in
-                    // the queue, relative to a registration made at a cut.
-                    //
-                    // None once a shutdown has ended the stream: the offset
-                    // it saves is the last byte its replicas are sent. Looked
-                    // at inside the gate, which the shutdown cycles after it
-                    // sets the flag, so that a PING is either wholly before
-                    // the end or not sent.
-                    {
-                        let _gate = crate::write_gate::enter();
-                        // Nor while writes are paused (a manual failover's
-                        // handoff, `CLIENT PAUSE`), as in Redis: a replica
-                        // promoted at the offset it was told to reach must
-                        // find this node there when it follows it.
-                        if state.stream_closed.load(Ordering::SeqCst)
-                            || crate::pause::expiry_deferred()
+                        let period = state.repl_ping_period_secs.load(Ordering::Relaxed);
+                        if period == 0
+                            || channel_replicas.is_empty()
+                            || last_ping.elapsed() < std::time::Duration::from_secs(period)
                         {
                             continue;
                         }
-                        state
-                            .repl_offset
-                            .fetch_add(REPL_PING.len() as u64, Ordering::Relaxed);
-                        if let Some(tx) = own_tx.upgrade() {
-                            let _ = tx.send(HubMsg::Propagate(Arc::from(REPL_PING)));
+                        last_ping = tokio::time::Instant::now();
+                        // A master with nothing to replicate still has to say so:
+                        // an idle link and a dead one are otherwise identical from
+                        // the replica's side, which is how a replica came to
+                        // report `master_link_status:up` for 15 minutes after its
+                        // master was powered off. The PING is ordinary stream
+                        // content, so it advances the offset like any other byte.
+                        //
+                        // Counted inside the write gate, like a write: a full
+                        // sync's cut then reads an offset that either includes
+                        // this PING, with the PING already in the stream, or does
+                        // not — never one without the other.
+                        //
+                        // And queued, not handled here and now, for the same
+                        // reason: its place in the stream has to be its place in
+                        // the queue, relative to a registration made at a cut.
+                        //
+                        // None once a shutdown has ended the stream: the offset
+                        // it saves is the last byte its replicas are sent. Looked
+                        // at inside the gate, which the shutdown cycles after it
+                        // sets the flag, so that a PING is either wholly before
+                        // the end or not sent.
+                        {
+                            let _gate = crate::write_gate::enter();
+                            // Nor while writes are paused (a manual failover's
+                            // handoff, `CLIENT PAUSE`), as in Redis: a replica
+                            // promoted at the offset it was told to reach must
+                            // find this node there when it follows it.
+                            if state.stream_closed.load(Ordering::SeqCst)
+                                || crate::pause::expiry_deferred()
+                            {
+                                continue;
+                            }
+                            state
+                                .repl_offset
+                                .fetch_add(REPL_PING.len() as u64, Ordering::Relaxed);
+                            if let Some(tx) = own_tx.upgrade() {
+                                let _ = tx.send(HubMsg::Propagate(Arc::from(REPL_PING)));
+                            }
                         }
+                        continue;
                     }
-                    continue;
+                    }
                 }
             };
             match msg {
@@ -5102,6 +5171,68 @@ mod replication_invariants_tests {
         await_connected(&state, 1).await;
         hub.send(HubMsg::Deregister(9001)).unwrap();
         await_connected(&state, 0).await;
+    }
+
+    /// With no replica attached, the writes a kept backlog is sent do not
+    /// wake the hub one by one (#894): it empties its inbox, sleeps a moment
+    /// and looks again, and waits to be woken only once a look finds nothing.
+    /// Every write still reaches the backlog, in order.
+    #[test]
+    fn hub_backlog_writes_without_replicas_do_not_wake_it_each() {
+        let state = Arc::new(ReplState::new_master());
+        state.backlog_active.store(true, Ordering::Relaxed);
+        let (give, take) = std::sync::mpsc::channel();
+        let hub_state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    give.send(start_hub(hub_state)).unwrap();
+                    std::future::pending::<()>().await;
+                });
+        });
+        let hub = take.recv().unwrap();
+        hub.send(HubMsg::Resume { offset: 0 }).unwrap();
+        let settle = std::time::Instant::now();
+        while state.hub_parks.load(Ordering::Relaxed) == 0 {
+            assert!(
+                settle.elapsed() < std::time::Duration::from_secs(5),
+                "the hub never waited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let parks_before = state.hub_parks.load(Ordering::Relaxed);
+
+        // One write every 50 us or so: each found the hub waiting before.
+        const WRITES: u64 = 400;
+        for _ in 0..WRITES {
+            hub.send(HubMsg::Propagate(Arc::from(super::REPL_PING)))
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        let parks = state.hub_parks.load(Ordering::Relaxed) - parks_before;
+        let (done, barrier) = tokio::sync::oneshot::channel();
+        hub.send(HubMsg::Barrier(done)).unwrap();
+        barrier.blocking_recv().unwrap();
+        assert!(
+            parks < WRITES / 4,
+            "the hub was woken for {parks} of {WRITES} writes"
+        );
+
+        // All of them are in the backlog (reported each second).
+        let want = WRITES * super::REPL_PING.len() as u64;
+        let since = std::time::Instant::now();
+        while state.backlog_histlen.load(Ordering::Relaxed) != want {
+            assert!(
+                since.elapsed() < std::time::Duration::from_secs(5),
+                "backlog holds {} bytes, not {want}",
+                state.backlog_histlen.load(Ordering::Relaxed)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// Second Deregister must not decrement again (would drive count negative otherwise).

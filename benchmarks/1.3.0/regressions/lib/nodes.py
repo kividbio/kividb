@@ -144,10 +144,15 @@ def redis_cli_7():
 
 
 class Node:
-    def __init__(self, kind, bin, io="auto", threads=0, cluster=False, args=(), env=None):
+    def __init__(self, kind, bin, io="auto", threads=0, cluster=False, args=(), env=None, seed=None):
         self.kind, self.bin, self.cluster = kind, bin, cluster
         self.port = free_port(bus=cluster)
         self.dir = tempfile.mkdtemp(prefix="kividb-regress-node.")
+        # `seed`: a directory whose files (a snapshot another node left) are
+        # copied into this node's before it starts, which loads them.
+        for name in os.listdir(seed) if seed else ():
+            if name != "server.log" and os.path.isfile(os.path.join(seed, name)):
+                shutil.copy2(os.path.join(seed, name), self.dir)
         self.log_path = os.path.join(self.dir, "server.log")
         if kind == "redis":
             cmd = [bin, "--port", str(self.port), "--bind", "127.0.0.1", "--save", "", "--appendonly", "no",
@@ -267,10 +272,10 @@ class Nodes:
     def __init__(self, ctx):
         self.ctx, self.nodes = ctx, []
 
-    def start(self, cluster=False, args=(), io=None, threads=None):
+    def start(self, cluster=False, args=(), io=None, threads=None, seed=None):
         cfg = self.ctx.config
         n = Node(self.ctx.kind, self.ctx.bin, io or cfg.io, cfg.threads if threads is None else threads,
-                 cluster=cluster, args=args)
+                 cluster=cluster, args=args, seed=seed)
         self.nodes.append(n)
         return n
 
