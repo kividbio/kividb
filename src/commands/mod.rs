@@ -7,6 +7,7 @@ pub(crate) mod bf;
 mod bitmap;
 pub mod blocking;
 pub(crate) mod cluster;
+pub(crate) mod cms;
 mod command_docs;
 mod command_docs_table;
 mod connection;

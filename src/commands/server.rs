@@ -2674,6 +2674,12 @@ const ALL_COMMANDS: &[&str] = &[
     "BZPOPMAX",
     "BZPOPMIN",
     "CLIENT",
+    "CMS.INCRBY",
+    "CMS.INFO",
+    "CMS.INITBYDIM",
+    "CMS.INITBYPROB",
+    "CMS.MERGE",
+    "CMS.QUERY",
     "COMMAND",
     "COPY",
     "DBSIZE",
@@ -3127,6 +3133,9 @@ const FAST_COMMANDS: &[&str] = &[
     "BF.CARD",
     "BF.INFO",
     "BF.RESERVE",
+    "CMS.INFO",
+    "CMS.INITBYDIM",
+    "CMS.INITBYPROB",
     "DBSIZE",
     "DECR",
     "DECRBY",
@@ -3236,6 +3245,7 @@ pub(crate) const ACL_CATEGORIES: &[&str] = &[
     "blocking",
     "bloom",
     "cluster",
+    "cms",
     "connection",
     "dangerous",
     "fast",
@@ -3315,6 +3325,7 @@ fn command_table() -> std::collections::BTreeMap<&'static str, Vec<u8>> {
             // for the rest.
             let arity = crate::commands::arity::of(name)
                 .or_else(|| crate::commands::bf::arity(name))
+                .or_else(|| crate::commands::cms::arity(name))
                 .or_else(|| module_arity(name))
                 .map_or(arity, i64::from);
             // A command with subcommands has no keys of its own: they are
@@ -3728,6 +3739,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
         // command joins its category by being registered.
         "json" => commands_with_prefix("JSON."),
         "bloom" => commands_with_prefix("BF."),
+        "cms" => commands_with_prefix("CMS."),
         "search" => commands_with_prefix("FT."),
         "timeseries" => commands_with_prefix("TS."),
         "vector" => vec![
@@ -3824,6 +3836,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
                 "hash",
                 "bitmap",
                 "bloom",
+                "cms",
                 "hyperloglog",
                 "geo",
                 "stream",

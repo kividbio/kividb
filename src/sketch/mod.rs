@@ -15,6 +15,7 @@
 //! * as `BF.SCANDUMP` chunks, which are Redis's too: see [`bloom`].
 
 pub mod bloom;
+pub mod cms;
 pub mod murmur;
 pub mod redis_module;
 
@@ -28,11 +29,14 @@ pub const TAG_SKETCH: u8 = 40;
 /// The kinds under [`TAG_SKETCH`], and the version of each one's encoding.
 const KIND_BLOOM: u8 = 1;
 const BLOOM_VERSION: u8 = 1;
+const KIND_CMS: u8 = 2;
+const CMS_VERSION: u8 = 1;
 
 /// A probabilistic value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Sketch {
     Bloom(bloom::BloomChain),
+    CountMin(cms::CountMin),
 }
 
 impl Sketch {
@@ -40,6 +44,7 @@ impl Sketch {
     pub fn type_name(&self) -> &'static str {
         match self {
             Sketch::Bloom(_) => redis_module::BLOOM_TYPE,
+            Sketch::CountMin(_) => redis_module::CMS_TYPE,
         }
     }
 
@@ -47,6 +52,7 @@ impl Sketch {
     pub fn memory_bytes(&self) -> usize {
         match self {
             Sketch::Bloom(chain) => chain.memory_bytes(),
+            Sketch::CountMin(v) => v.memory_bytes(),
         }
     }
 
@@ -58,6 +64,7 @@ impl Sketch {
             Sketch::Bloom(chain) => {
                 (chain.layers.len() as u64).saturating_add(chain.data_bytes() >> 16)
             }
+            Sketch::CountMin(v) => 1 + (v.data_bytes() >> 16),
         }
     }
 
@@ -65,8 +72,22 @@ impl Sketch {
     pub fn kdb_len(&self) -> u64 {
         2 + match self {
             Sketch::Bloom(chain) => bloom::kdb_len(chain),
+            Sketch::CountMin(v) => cms::kdb_len(v),
         }
     }
+}
+
+/// Whether `name` (upper case) is a write of the probabilistic types other
+/// than Bloom filters, for `replication::is_write_command`: kept out of its
+/// length buckets, and out of line, so that the command path of every other
+/// command is the code it was.
+#[cold]
+#[inline(never)]
+pub fn is_write(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"CMS.INCRBY" | b"CMS.INITBYDIM" | b"CMS.INITBYPROB" | b"CMS.MERGE"
+    )
 }
 
 /// Whether `bytes` more fit under `maxmemory` (always, without one),
@@ -88,6 +109,10 @@ pub fn write_kdb(w: &mut impl io::Write, sketch: &Sketch) -> io::Result<()> {
             w.write_all(&[KIND_BLOOM, BLOOM_VERSION])?;
             bloom::write_kdb(w, chain)
         }
+        Sketch::CountMin(v) => {
+            w.write_all(&[KIND_CMS, CMS_VERSION])?;
+            cms::write_kdb(w, v)
+        }
     }
 }
 
@@ -97,6 +122,7 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<Sketch> {
     r.read_exact(&mut head)?;
     match head {
         [KIND_BLOOM, BLOOM_VERSION] => Ok(Sketch::Bloom(bloom::read_kdb(r)?)),
+        [KIND_CMS, CMS_VERSION] => Ok(Sketch::CountMin(cms::read_kdb(r)?)),
         [kind, version] => Err(invalid(&format!(
             "probabilistic value of kind {kind}, version {version}, is not known to this \
              version of KiviDB"

@@ -5762,7 +5762,9 @@ pub fn dump_payload(value: &KiviDBValue) -> io::Result<Vec<u8>> {
     // while the payload is laid out and its CRC taken.
     if let KiviDBValue::Sketch(sketch) = value {
         let copy = sketch.read().clone();
-        return crate::sketch::redis_module::dump_payload(&copy);
+        if crate::sketch::redis_module::dumps_as_redis(&copy) {
+            return crate::sketch::redis_module::dump_payload(&copy);
+        }
     }
     // A time series goes without its links to other series, its compaction
     // rules and the series it is a compaction of, as RedisTimeSeries leaves

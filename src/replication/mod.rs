@@ -4439,33 +4439,39 @@ pub fn is_write_command(name: &str) -> bool {
                 | "TS.ALTER"
                 | "VSETATTR"
         ),
-        9 => matches!(
-            name,
-            "BF.INSERT"
-                | "FT.CREATE"
-                | "HEXPIREAT"
-                | "JSON.MSET"
-                | "PEXPIREAT"
-                | "RPOPLPUSH"
-                | "TS.CREATE"
-                | "TS.DECRBY"
-                | "TS.INCRBY"
-        ),
-        10 => matches!(
-            name,
-            "ARDELRANGE"
-                | "BF.RESERVE"
-                | "BRPOPLPUSH"
-                | "FT.DICTADD"
-                | "FT.DICTDEL"
-                | "HPEXPIREAT"
-                | "JSON.CLEAR"
-                | "JSON.MERGE"
-                | "SDIFFSTORE"
-                | "XAUTOCLAIM"
-                | "XREADGROUP"
-                | "ZDIFFSTORE"
-        ),
+        9 if crate::sketch::is_write(&name.as_bytes()[..9]) => true,
+        9 => {
+            matches!(
+                name,
+                "BF.INSERT"
+                    | "FT.CREATE"
+                    | "HEXPIREAT"
+                    | "JSON.MSET"
+                    | "PEXPIREAT"
+                    | "RPOPLPUSH"
+                    | "TS.CREATE"
+                    | "TS.DECRBY"
+                    | "TS.INCRBY"
+            )
+        }
+        10 if crate::sketch::is_write(&name.as_bytes()[..10]) => true,
+        10 => {
+            matches!(
+                name,
+                "ARDELRANGE"
+                    | "BF.RESERVE"
+                    | "BRPOPLPUSH"
+                    | "FT.DICTADD"
+                    | "FT.DICTDEL"
+                    | "HPEXPIREAT"
+                    | "JSON.CLEAR"
+                    | "JSON.MERGE"
+                    | "SDIFFSTORE"
+                    | "XAUTOCLAIM"
+                    | "XREADGROUP"
+                    | "ZDIFFSTORE"
+            )
+        }
         11 => matches!(
             name,
             "FT.ALIASADD"
@@ -4486,18 +4492,24 @@ pub fn is_write_command(name: &str) -> bool {
             name,
             "BF.LOADCHUNK" | "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
         ),
-        13 => matches!(name, "TS.CREATERULE" | "TS.DELETERULE"),
-        14 => matches!(
-            name,
-            "FT.ALIASUPDATE"
-                | "GEOSEARCHSTORE"
-                | "JSON.ARRAPPEND"
-                | "JSON.ARRINSERT"
-                | "JSON.NUMINCRBY"
-                | "JSON.NUMMULTBY"
-                | "JSON.STRAPPEND"
-                | "ZREMRANGEBYLEX"
-        ),
+        13 if crate::sketch::is_write(&name.as_bytes()[..13]) => true,
+        13 => {
+            matches!(name, "TS.CREATERULE" | "TS.DELETERULE")
+        }
+        14 if crate::sketch::is_write(&name.as_bytes()[..14]) => true,
+        14 => {
+            matches!(
+                name,
+                "FT.ALIASUPDATE"
+                    | "GEOSEARCHSTORE"
+                    | "JSON.ARRAPPEND"
+                    | "JSON.ARRINSERT"
+                    | "JSON.NUMINCRBY"
+                    | "JSON.NUMMULTBY"
+                    | "JSON.STRAPPEND"
+                    | "ZREMRANGEBYLEX"
+            )
+        }
         15 => name == "ZREMRANGEBYRANK",
         16 => name == "ZREMRANGEBYSCORE",
         _ => false,
@@ -4533,6 +4545,10 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "BZMPOP",
     "BZPOPMAX",
     "BZPOPMIN",
+    "CMS.INCRBY",
+    "CMS.INITBYDIM",
+    "CMS.INITBYPROB",
+    "CMS.MERGE",
     "COPY",
     "DECR",
     "DECRBY",
@@ -4681,6 +4697,7 @@ fn is_write_command_reference(name: &str) -> bool {
         name,
         // Bloom filters
         "BF.RESERVE" | "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.LOADCHUNK" |
+        "CMS.INCRBY" | "CMS.INITBYDIM" | "CMS.INITBYPROB" | "CMS.MERGE" |
         // Strings
         "SET" | "SETNX" | "SETEX" | "PSETEX" | "MSET" | "MSETNX" | "GETSET" |
         "GETDEL" | "GETEX" | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" |

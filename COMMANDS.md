@@ -794,6 +794,52 @@ make or grow may take; replication, the AOF and loads are not held to it.
 
 ---
 
+## Count-min sketch commands (CMS.*)
+
+Count-min sketches, as Redis 8 has them built in (formerly RedisBloom). A
+sketch is `depth` rows of `width` 32-bit counters; an item's count is the
+least of its counter in each row, never below what was added to it. Replies
+and errors are Redis 8.10's, in RESP2 and RESP3, and so are the counts: items
+are placed as Redis places them, so even counters items share agree with
+Redis's. A sketch moved from Redis (an RDB file, a full sync from a Redis
+master, `RESTORE`/`MIGRATE`) answers as it did there, and `DUMP` gives what
+Redis can `RESTORE`. `TYPE` is `CMSk-TYPE`; the ACL category is `@cms`.
+
+| Command | Syntax | Notes |
+|---------|--------|-------|
+| `CMS.INITBYDIM` | `CMS.INITBYDIM key width depth` | Make an empty sketch. `CMS: key already exists` for a key of any type |
+| `CMS.INITBYPROB` | `CMS.INITBYPROB key error probability` | Width `ceil(2 / error)`, depth `ceil(log10(probability) / log10(0.5))`, as Redis sizes them; both in (0, 1) |
+| `CMS.INCRBY` | `CMS.INCRBY key item increment [item increment ...]` | One reply per item: its count after the increment. A counter stops at 2^32 − 1; an item whose count reaches it is answered `CMS: INCRBY overflow` |
+| `CMS.QUERY` | `CMS.QUERY key item [item ...]` | One count per item |
+| `CMS.MERGE` | `CMS.MERGE destination numKeys source [source ...] [WEIGHTS weight [weight ...]]` | The destination (which must exist, and have the sources' width and depth) becomes the weighted sum of the sources; `CMS: MERGE overflow`, changing nothing, if a counter would be below 0 or above 2^32 − 1 |
+| `CMS.INFO` | `CMS.INFO key` | `width`, `depth` and `count` (the total added, which wraps as Redis's does); a map in RESP3 |
+
+### Differences from Redis
+
+- `COPY` copies a sketch; Redis refuses it.
+- Size limits: a sketch has at most 134,217,728 counters (512 MiB) and 65,536
+  rows. `CMS.INITBYDIM` and `CMS.INITBYPROB` over them answer `CMS: sketch is
+  too large (at most 134217728 counters and 65536 rows)`; a snapshot, RDB
+  file or `RESTORE` payload with a larger sketch is refused. Redis has no
+  limit. The limits are fixed, so a replica or a restart never refuses what
+  a master made.
+- Per-command limits: `CMS.INCRBY` and `CMS.QUERY` may visit at most 250,000
+  counters (items × depth: some 35,000 items in a sketch of depth 7), and
+  `CMS.MERGE` read at most 268,435,456 (sources × width × depth). A command
+  over its limit is refused before it starts, with `CMS: command reached the
+  per-command limit; send fewer items per command`, and changes nothing.
+  Replication and the AOF are not held to them.
+- Under `maxmemory`, a client's `CMS.INITBYDIM`, `CMS.INITBYPROB` or
+  `CMS.MERGE` that would allocate more than is left evicts first under the
+  policy, and is refused with `OOM ...` only if that is not enough.
+- `CMS.MERGE` names its sources as keys (as `ZUNIONSTORE` does), so ACL key
+  patterns cover them and, in cluster mode, they must be in the
+  destination's slot. Redis's `COMMAND INFO` names only the destination.
+- `DUMP` payloads carry RDB version 9, so every Redis since 6.0 can
+  `RESTORE` them; the value is as Redis 8.10 writes it.
+
+---
+
 ## Pub/Sub commands
 
 KiviDB implements the full Redis Pub/Sub command surface including regular channels, glob-pattern subscriptions, and Redis 7.0 shard channels. Every subscribed connection has one queue: a publish appends to the queue of each subscriber, and the connection's own task writes it out. A subscriber therefore sees messages in the order they were published, across all of its channels and patterns, and none is ever dropped from the middle — a subscriber that falls more than 32 MB behind, or stays more than 8 MB behind for 60 seconds, is disconnected instead (Redis's `client-output-buffer-limit pubsub 32mb 8mb 60`). A publish with no subscribers takes no lock.

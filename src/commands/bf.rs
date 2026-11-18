@@ -288,7 +288,7 @@ fn insert_form(key: &[u8], p: &Params, items: &[&[u8]]) -> Vec<Vec<u8>> {
 
 /// An integer as Redis reads one (`string2ll`): an optional `-`, digits, no
 /// leading zero, no `+`, nothing else.
-fn parse_ll(raw: &[u8]) -> Option<i64> {
+pub(crate) fn parse_ll(raw: &[u8]) -> Option<i64> {
     let (negative, digits) = match raw {
         [b'-', rest @ ..] => (true, rest),
         _ => (false, raw),
@@ -305,7 +305,7 @@ fn parse_ll(raw: &[u8]) -> Option<i64> {
 
 /// A double as Redis reads one (`strtod`, all of it): decimal or
 /// hexadecimal, `inf`, a sign; not NaN, not blanks around it.
-fn parse_double(raw: &[u8]) -> Option<f64> {
+pub(crate) fn parse_double(raw: &[u8]) -> Option<f64> {
     let text = std::str::from_utf8(raw).ok()?;
     if text.is_empty()
         || text.starts_with(char::is_whitespace)
@@ -458,7 +458,7 @@ fn boolean(resp: u8, b: bool) -> Vec<u8> {
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     if !name.starts_with("BF.") {
-        return None;
+        return other_types(ctx, name);
     }
     let reply = match name {
         "BF.RESERVE" => reserve(ctx),
@@ -475,6 +475,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(reply)
+}
+
+/// The other probabilistic types' commands, which come to the dispatch
+/// where `BF.*` does: so that adding them added nothing to the dispatch of
+/// other commands.
+#[inline(never)]
+fn other_types(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
+    crate::commands::cms::handle(ctx, name)
 }
 
 /// The filter at `key` for reading: `Ok(None)` if there is no key,

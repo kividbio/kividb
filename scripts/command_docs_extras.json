@@ -1047,6 +1047,153 @@
     "CLUSTER SYNCSLOTS": {
         "since": ""
     },
+    "CMS.INCRBY": {
+        "summary": "Adds to the counts of one or more items in a Count-min sketch, and returns their counts.",
+        "complexity": "O(N*d) for N items, d being the sketch's depth.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "items",
+                "type": "block",
+                "multiple": true,
+                "arguments": [
+                    {
+                        "name": "item",
+                        "type": "string"
+                    },
+                    {
+                        "name": "increment",
+                        "type": "integer"
+                    }
+                ]
+            }
+        ]
+    },
+    "CMS.INFO": {
+        "summary": "Describes a Count-min sketch: its width, depth and total count.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "CMS.INITBYDIM": {
+        "summary": "Makes an empty Count-min sketch of the given width and depth.",
+        "complexity": "O(w*d): the counters are zeroed.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "width",
+                "type": "integer"
+            },
+            {
+                "name": "depth",
+                "type": "integer"
+            }
+        ]
+    },
+    "CMS.INITBYPROB": {
+        "summary": "Makes an empty Count-min sketch sized for an error bound and the probability of exceeding it.",
+        "complexity": "O(w*d): the counters are zeroed.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "error",
+                "type": "double"
+            },
+            {
+                "name": "probability",
+                "type": "double"
+            }
+        ]
+    },
+    "CMS.MERGE": {
+        "summary": "Replaces a Count-min sketch with the weighted sum of others of the same shape.",
+        "complexity": "O(n*w*d) for n sources of w*d counters.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "destination",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "numKeys",
+                "type": "integer"
+            },
+            {
+                "name": "source",
+                "type": "key",
+                "key_spec_index": 1,
+                "multiple": true
+            },
+            {
+                "name": "weights",
+                "type": "block",
+                "optional": true,
+                "arguments": [
+                    {
+                        "name": "weights",
+                        "type": "pure-token",
+                        "token": "WEIGHTS"
+                    },
+                    {
+                        "name": "weight",
+                        "type": "integer",
+                        "multiple": true
+                    }
+                ]
+            }
+        ]
+    },
+    "CMS.QUERY": {
+        "summary": "Returns the counts of one or more items in a Count-min sketch.",
+        "complexity": "O(N*d) for N items, d being the sketch's depth.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
     "DELEX": {
         "summary": "Deletes a key, optionally only when its value or value digest matches a condition.",
         "complexity": "O(1) for IFEQ and IFNE. O(N) for IFDEQ and IFDNE, N being the length of the value.",

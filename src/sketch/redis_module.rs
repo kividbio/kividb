@@ -16,10 +16,15 @@ use super::bloom::{
     BloomChain, FLAG_EXACT_SIZE, FLAG_WIDE_HASH, LayerShape, Limits, MAX_LAYER_BYTES, ShapeError,
     Used,
 };
+use super::cms::CountMin;
 
 /// The module type of Bloom filters, and the encoding version written.
 pub const BLOOM_TYPE: &str = "MBbloom--";
 const BLOOM_ENCVER: u64 = 4;
+/// The module type of Count-min sketches, and the encoding version
+/// written: what Redis 8.10 writes.
+pub const CMS_TYPE: &str = "CMSk-TYPE";
+const CMS_ENCVER: u64 = 0;
 
 /// The RDB version `DUMP` payloads of these types carry: 9 (Redis 6.0),
 /// the oldest that has these encodings, so that every Redis since takes
@@ -103,6 +108,26 @@ fn write_bloom(w: &mut Writer, chain: &BloomChain) {
     }
 }
 
+/// A Count-min sketch as Redis saves it (encoding version 0): its width,
+/// depth and total count, then its counters, row by row, as little-endian
+/// 32-bit words in one string.
+fn write_cms(w: &mut Writer, cms: &CountMin) {
+    w.uint(cms.width);
+    w.uint(cms.depth);
+    w.uint(cms.count);
+    w.len(OPCODE_STRING);
+    w.len(cms.data_bytes());
+    for c in cms.counters.iter() {
+        w.out.extend_from_slice(&c.to_le_bytes());
+    }
+}
+
+/// Whether `DUMP` writes `sketch` in Redis's format, which Redis can
+/// `RESTORE`; the other types are dumped in KiviDB's own.
+pub fn dumps_as_redis(sketch: &Sketch) -> bool {
+    matches!(sketch, Sketch::Bloom(_) | Sketch::CountMin(_))
+}
+
 /// The most bytes [`dump_payload`] writes for `sketch`: each field at its
 /// longest, and the layers' bytes.
 fn dump_len(sketch: &Sketch) -> u64 {
@@ -113,6 +138,9 @@ fn dump_len(sketch: &Sketch) -> u64 {
             // 64. Each layer: eight fields of at most 10 bytes, its bytes.
             64 + layers * 80 + chain.data_bytes()
         }
+        // Type, module ID, three fields, the string's head, the end,
+        // version and CRC: under 64.
+        Sketch::CountMin(cms) => 64 + cms.data_bytes(),
     }
 }
 
@@ -129,6 +157,10 @@ pub fn dump_payload(sketch: &Sketch) -> io::Result<Vec<u8>> {
         Sketch::Bloom(chain) => {
             w.len(module_id(BLOOM_TYPE, BLOOM_ENCVER));
             write_bloom(&mut w, chain);
+        }
+        Sketch::CountMin(cms) => {
+            w.len(module_id(CMS_TYPE, CMS_ENCVER));
+            write_cms(&mut w, cms);
         }
     }
     w.len(OPCODE_EOF);
@@ -270,6 +302,30 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
     }
 }
 
+/// A Count-min sketch [`write_cms`] (or Redis) wrote: its shape is checked
+/// against the size limits before its counters are read, and the counters
+/// must be exactly `width × depth` words.
+fn read_cms(r: &mut Reader<'_, impl Read>) -> io::Result<CountMin> {
+    let width = r.uint()?;
+    let depth = r.uint()?;
+    let count = r.uint()?;
+    if !super::cms::fits(width, depth) {
+        return Err(r.bad("a sketch over the size limits is not supported"));
+    }
+    let data = r.string()?;
+    if data.len() as u64 != width * depth * 4 {
+        return Err(r.bad("the counters do not match the width and depth"));
+    }
+    r.end()?;
+    let counters = super::cms::counters_from_bytes(&data)?;
+    Ok(CountMin {
+        width,
+        depth,
+        count,
+        counters,
+    })
+}
+
 /// The value of module type `name` (encoding version `encver`) from an
 /// RDB stream, if it is one of these types; `Ok(None)` for another type.
 pub fn read(name: &str, encver: u64, r: &mut impl Read) -> io::Result<Option<Sketch>> {
@@ -286,6 +342,18 @@ pub fn read(name: &str, encver: u64, r: &mut impl Read) -> io::Result<Option<Ske
                 what: "Bloom filter",
             };
             Ok(Some(Sketch::Bloom(read_bloom(&mut reader)?)))
+        }
+        CMS_TYPE => {
+            if encver != CMS_ENCVER {
+                return Err(super::invalid(&format!(
+                    "Count-min sketch encoding version {encver} is not supported"
+                )));
+            }
+            let mut reader = Reader {
+                r,
+                what: "Count-min sketch",
+            };
+            Ok(Some(Sketch::CountMin(read_cms(&mut reader)?)))
         }
         _ => Ok(None),
     }
@@ -333,6 +401,82 @@ mod tests {
         for len in [7, 9, 16, 4096] {
             let err = read(one_layer_value(&vec![0u8; len])).unwrap_err();
             assert!(err.to_string().contains("do not match"), "{len}: {err}");
+        }
+    }
+
+    /// `DUMP h` on Redis 8.10.2 after `CMS.INITBYDIM h 1000 5` and
+    /// `CMS.INCRBY h hello 1`: read, it is the sketch KiviDB builds from the
+    /// same commands (so the placement is Redis's); written, the same
+    /// fields, the counters as a plain string rather than LZF.
+    const CMS_DUMP: &str = "078108c4a4f9360f10000243e80205020105c340f88000004e20010000e0ff00e0ff00e051000001e0515ae0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e03800f3ff2be0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e05300ebffb3e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e02b00edff9be0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e07f00efffffe0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0bd00010000000f007b16b8c25045f969";
+
+    #[test]
+    fn cms_dump_from_redis() {
+        let payload = hex(CMS_DUMP);
+        let body = &payload[1..payload.len() - 10];
+        let mut r = body;
+        let id = crate::snapshot::rdb_read_plain_length(&mut r).unwrap();
+        assert_eq!(id, module_id(CMS_TYPE, 0));
+        let Some(Sketch::CountMin(read)) = super::read(CMS_TYPE, 0, &mut r).unwrap() else {
+            panic!("not a sketch");
+        };
+        assert!(r.is_empty());
+        let mut ours = CountMin::new(1000, 5).unwrap();
+        ours.incr_by(b"hello", 1).unwrap();
+        assert_eq!(read, ours);
+        let written = dump_payload(&Sketch::CountMin(ours.clone())).unwrap();
+        let mut back = &written[1..written.len() - 10];
+        let id = crate::snapshot::rdb_read_plain_length(&mut back).unwrap();
+        assert_eq!(id, module_id(CMS_TYPE, 0));
+        let Some(Sketch::CountMin(again)) = super::read(CMS_TYPE, 0, &mut back).unwrap() else {
+            panic!("not a sketch");
+        };
+        assert_eq!(again, ours);
+    }
+
+    /// A Count-min value with a corrupt byte, cut short, or claiming a huge
+    /// shape is refused, or read as a sketch within the limits; never a
+    /// panic, nor an allocation the payload does not back.
+    #[test]
+    fn corrupt_cms_values_are_refused_cleanly() {
+        let mut cms = CountMin::new(20, 3).unwrap();
+        for i in 0..40 {
+            cms.incr_by(format!("{i}").as_bytes(), i).unwrap();
+        }
+        let mut w = Writer { out: Vec::new() };
+        write_cms(&mut w, &cms);
+        w.len(OPCODE_EOF);
+        let good = w.out;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..4000 {
+            let mut bad = good.clone();
+            match next() % 3 {
+                0 => {
+                    let at = next() as usize % bad.len();
+                    bad[at] = next() as u8;
+                }
+                1 => bad.truncate(next() as usize % bad.len()),
+                _ => {
+                    // A width or depth of up to 64 bits.
+                    let mut w = Writer { out: Vec::new() };
+                    w.uint(next() >> (next() % 64));
+                    w.uint(next() >> (next() % 64));
+                    w.uint(0);
+                    w.string(&[0u8; 16]);
+                    w.len(OPCODE_EOF);
+                    bad = w.out;
+                }
+            }
+            if let Ok(Some(Sketch::CountMin(read))) = super::read(CMS_TYPE, 0, &mut &bad[..]) {
+                assert!(super::super::cms::fits(read.width, read.depth));
+                assert_eq!(read.counters.len() as u64, read.width * read.depth);
+            }
         }
     }
 

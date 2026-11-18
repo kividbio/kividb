@@ -691,7 +691,16 @@ const SKETCHES: &[&str] = &[
     "BF.SCANDUMP",
     "BF.LOADCHUNK",
     "BF.DEBUG",
+    "CMS.INCRBY",
+    "CMS.INFO",
+    "CMS.INITBYDIM",
+    "CMS.INITBYPROB",
+    "CMS.QUERY",
 ];
+
+/// The probabilistic types' merges: `destination numkeys source ...`,
+/// after [`SKETCHES`] for the same reason.
+const SKETCH_MERGES: &[&str] = &["CMS.MERGE"];
 
 const COMMANDS: &[(&[&str], Shape)] = &[
     (FIRST, Shape::First),
@@ -713,6 +722,7 @@ const COMMANDS: &[(&[&str], Shape)] = &[
     (HIMPORT_SET, Shape::HimportSet),
     (MEMORY_USAGE, Shape::MemoryUsage),
     (SKETCHES, Shape::First),
+    (SKETCH_MERGES, Shape::DestinationAndCount),
 ];
 
 /// [`COMMANDS`] by name: open addressing over [`SLOTS`] slots, built when
@@ -1111,6 +1121,11 @@ mod tests {
             // Bloom filters
             | "BF.RESERVE" | "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.EXISTS" | "BF.MEXISTS"
             | "BF.INFO" | "BF.CARD" | "BF.SCANDUMP" | "BF.LOADCHUNK" | "BF.DEBUG"
+            | "CMS.INCRBY"
+            | "CMS.INFO"
+            | "CMS.INITBYDIM"
+            | "CMS.INITBYPROB"
+            | "CMS.QUERY"
             // Sharded pub/sub: the channel is hashed to a slot exactly like a key.
             | "SPUBLISH" => One(1),
 
@@ -1192,7 +1207,7 @@ mod tests {
                 numkeys(cmd, 2, 3)
             }
             // dest numkeys key [key ...]
-            "ZUNIONSTORE" | "ZINTERSTORE" | "ZDIFFSTORE" => match numkeys(cmd, 2, 3) {
+            "ZUNIONSTORE" | "ZINTERSTORE" | "ZDIFFSTORE" | "CMS.MERGE" => match numkeys(cmd, 2, 3) {
                 Range { first, last, .. } => {
                     let mut keys = vec![1];
                     keys.extend(first..=last);
