@@ -767,6 +767,42 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A command that waits for a script on its hash tag no longer holds up
+  its thread (#882).** With `lua-parallel-scripts` on, a client's command
+  on a key whose tag a script running beside others held waited on the
+  tag's lock on its connection's thread, and every other connection of
+  that thread waited with it, whatever keys they used. The command now
+  tries the locks of its tags without waiting for a script; when a script
+  holds one, or is in line for it, the command takes none of them, and its
+  connection waits for the tag's turn asleep, in line with the scripts and
+  commands of the tag in the order they came, while the thread serves its
+  other connections. What the client pipelined behind the command waits
+  with it, and the replies before it are sent first; a command naming keys
+  of several tags holds none of them while it waits; a client that goes or
+  is killed while it waits leaves nothing behind; a blocking command woken
+  by the script keeps what it was woken for. The replica's applier, the
+  AOF's replay and `EXEC` wait in place, as before. Measured with a ~2 ms
+  tagged script run back to back on one tag, 8 connections reading and
+  writing that tag and 16 reading and writing untagged keys (Azure
+  D8s_v5, server on 4 vCPUs, memtier on the other 4):
+
+  | | untagged ops/s | untagged p50 / p99 | tagged ops/s | scripts/s |
+  |---|---|---|---|---|
+  | `--threads 1`, before / after | 10.4k / 9.9k | 2.16 / 2.16 ms, 4.45 / 4.48 ms | 5.8k / 5.4k | 453 / 453 |
+  | `--threads 2`, before / after | 12.8k / 90.9k | 0.25 / 0.09 ms, 4.26 / 2.83 ms | 8.2k / 7.8k | 473 / 413 |
+  | `--threads 4`, before / after | 16.2k / 110.3k | 0.17 / 0.11 ms, 4.29 / 2.99 ms | 11.7k / 9.6k | 456 / 307 |
+  | `--threads 4`, Tokio loop, before / after | 13.9k / 129.8k | 0.26 / 0.11 ms, 4.19 / 0.30 ms | 10.3k / 10.1k | 467 / 334 |
+
+  With one thread the script runs on the thread every connection is
+  served by, as before. On io_uring a connection served by the thread
+  running the script still waits for it, which is the p99 left. The script
+  runs less often with several threads because the thread it runs on now
+  serves its other connections between runs, where before they stood
+  stalled: its p50 went from 2.1 to 3.2 ms at four threads, the time it
+  waits for its thread. Letting the commands queued for a tag take its
+  turn together rather than one by one gave the same 315 scripts a
+  second, and gave up the order they came in, so they take it one by one.
+
 - **Scripts have the Lua 5.1 library functions Redis keeps (#898).**
   `table.getn`, `table.setn`, `table.maxn`, `table.foreach`, `table.foreachi`,
   `math.mod`, `string.gfind` and the global `gcinfo` were missing (scripts run

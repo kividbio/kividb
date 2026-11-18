@@ -75,6 +75,11 @@ pub struct BlockingWait {
     /// Not a wait: a write that got past a `CLIENT PAUSE` before it was set
     /// is to be read again and held by the pause ([`hold_for_pause`]).
     held_by_pause: bool,
+    /// Not a wait for keys either: a command that found a script on one of
+    /// its hash tags ([`hold_for_tags`]), to be dispatched again once its
+    /// connection has waited for the script's turn, off its thread.
+    #[cfg(feature = "lua")]
+    tags: Option<crate::tag_locks::TagsBusy>,
 }
 
 /// Command state captured at park time and handed back verbatim on resume,
@@ -389,6 +394,12 @@ pub struct BlockingCtl {
     /// Set with `resume` when the client of the command being resumed went
     /// while it waited: see [`client_gone`]. Only read on a resume.
     pub gone: bool,
+    /// The turns of the hash tags a command found a script on, which its
+    /// connection waited for ([`hold_for_tags`]): set for the dispatch that
+    /// runs it again, taken by it once it holds its tags' locks, and let go
+    /// of after the dispatch if it did not get that far.
+    #[cfg(feature = "lua")]
+    pub tag_turns: Option<crate::tag_locks::TagTurns>,
 }
 
 /// The connection loop's end of the parking mechanism.
@@ -504,6 +515,12 @@ impl BlockingSlot {
     /// thread would overwrite.
     #[inline]
     pub fn take_parked(&mut self) -> Option<BlockingWait> {
+        // The turns of the tags a command waited for, if it was refused
+        // before it took the tags' locks: the scripts in line for them go on.
+        #[cfg(feature = "lua")]
+        if self.ctl.tag_turns.is_some() {
+            self.ctl.tag_turns = None;
+        }
         // Looked at in place: moving the wait out of the slot to look at it
         // copied it on every command.
         if self.ctl.parked.is_none() {
@@ -684,6 +701,13 @@ impl BlockingSlot {
         }
     }
 
+    /// The turns of the hash tags the command just sent back waited for
+    /// ([`hold_for_tags`]): held by the dispatch that runs it again.
+    #[cfg(feature = "lua")]
+    pub fn hold_tag_turns(&mut self, turns: crate::tag_locks::TagTurns) {
+        self.ctl.tag_turns = Some(turns);
+    }
+
     /// Clear the resume flag after the guard has fired.
     pub fn clear_resume(&mut self) {
         self.in_resume = false;
@@ -783,6 +807,8 @@ pub fn park_with_state(
                 state,
                 role_epoch: role_changes(ctx.repl_state),
                 held_by_pause: false,
+                #[cfg(feature = "lua")]
+                tags: None,
             });
             ParkOutcome::Parked
         }
@@ -811,6 +837,34 @@ pub fn hold_for_pause(ctx: &mut crate::commands::ctx::Ctx) -> Vec<u8> {
             state: None,
             role_epoch: 0,
             held_by_pause: true,
+            #[cfg(feature = "lua")]
+            tags: None,
+        });
+    }
+    crate::pause::HELD_IN_GATE.to_vec()
+}
+
+/// The reply of a client's command that found a script holding one of its
+/// hash tags, or in line for it (`tag_locks::try_lock_named_keys`): it does
+/// not run now. Its connection waits for the turns of those tags, asleep,
+/// while its thread serves its other connections, and dispatches it again
+/// holding them (#882). Only asked of a dispatch that can park
+/// (`BlockingCtl::awaitable`): any other waits on the locks, as before. The
+/// reply, `pause::HELD_IN_GATE`, is never sent: `execute_command` takes it
+/// as it takes a pause's, for a command that has not run.
+#[cfg(feature = "lua")]
+pub fn hold_for_tags(
+    ctx: &mut crate::commands::ctx::Ctx,
+    busy: crate::tag_locks::TagsBusy,
+) -> Vec<u8> {
+    if let Some(slot) = ctx.blocking.as_mut() {
+        slot.parked = Some(BlockingWait {
+            rxs: Vec::new(),
+            timeout: None,
+            state: None,
+            role_epoch: 0,
+            held_by_pause: false,
+            tags: Some(busy),
         });
     }
     crate::pause::HELD_IN_GATE.to_vec()
@@ -1136,6 +1190,13 @@ impl BlockingWait {
         self.held_by_pause
     }
 
+    /// The hash tags a command found a script on ([`hold_for_tags`]): no
+    /// wait for keys, but for the turns of those tags.
+    #[cfg(feature = "lua")]
+    pub fn take_tags(&mut self) -> Option<crate::tag_locks::TagsBusy> {
+        self.tags.take()
+    }
+
     /// Whether the command is one a replica refuses (`READONLY`): the
     /// blocking list and sorted-set commands and `XREADGROUP`, which write.
     /// `XREAD BLOCK` and `TS.READ BLOCK` may wait on a replica. Asked before
@@ -1236,6 +1297,8 @@ mod tests {
                 state: None,
                 role_epoch: 0,
                 held_by_pause: false,
+                #[cfg(feature = "lua")]
+                tags: None,
             }
             .wait(),
         )

@@ -742,6 +742,9 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         }
     }
 
+    #[cfg(debug_assertions)]
+    crate::pause::test_stall_in_script(ctx.cmd.as_slice());
+
     if read_only_script && replication::inner_command_blocked_in_readonly_script(name2, &ctx.cmd) {
         return resp_error("ERR Write commands are not allowed from read-only scripts.");
     }
@@ -1718,6 +1721,25 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             crate::tag_locks::hold_script_to(&tags)
         }
     });
+    //
+    // A tag a script holds is not waited for here, where the thread would
+    // wait with it and every other connection of the thread behind it: the
+    // command is sent back, and its connection waits for the script off the
+    // thread (#882).
+    #[cfg(feature = "lua")]
+    let _key_tags = if tag_locks
+        && !any_script
+        && !crate::command_gate::alone_on_this_thread()
+        && !crate::tag_locks::in_script()
+    {
+        match lock_tags_of_named_keys(ctx, name) {
+            Ok(held) => held,
+            Err(busy) => return crate::commands::blocking::hold_for_tags(ctx, busy),
+        }
+    } else {
+        None
+    };
+    #[cfg(not(feature = "lua"))]
     let _key_tags = if tag_locks
         && !any_script
         && !crate::command_gate::alone_on_this_thread()
@@ -1909,13 +1931,51 @@ fn feed_monitors(ctx: &Ctx, name: &str) {
 }
 
 /// With scripts locked by hash tag (`tag_locks`), for a client's command:
+/// the locks of the tags of the keys it names. A build without Lua has no
+/// scripts that run beside others, and never comes here.
+#[cfg(not(feature = "lua"))]
+#[inline(never)]
+fn lock_tags_of_named_keys(ctx: &Ctx, name: &str) -> Option<crate::tag_locks::KeysGuard> {
+    crate::tag_locks::lock_named_keys(name, &ctx.cmd)
+}
+
+/// With scripts locked by hash tag (`tag_locks`), for a client's command:
 /// the locks of the tags of the keys it names. Out of line: only with
 /// `tag_locks` on does a command come here. A command none of whose keys
 /// has a `{` takes nothing, and is told so without the general list of its
 /// keys (`tag_locks::named_keys`, #889).
+///
+/// `Err`: a script holds one of them, or is in line for it, and the
+/// command's connection can wait for it without its thread: it is to be
+/// sent back (`blocking::hold_for_tags`, #882). What cannot wait so waits on
+/// the locks, as before: the replica's applier and the AOF's replay (which
+/// never meet a script that runs beside others there: a script from the
+/// stream or the log runs alone, so what they can find holding a tag is a
+/// read-only script of a replica's client, for as long as it runs), a
+/// command of a connection's slow path, and the dispatch of a command whose
+/// client has gone, which only leaves the line it stood in. So does the
+/// dispatch that runs a command again after its connection waited: it holds
+/// the tags' turns, so what holds a lock is a client's command, for a
+/// moment; the turns go once the locks are held.
+#[cfg(feature = "lua")]
 #[inline(never)]
-fn lock_tags_of_named_keys(ctx: &Ctx, name: &str) -> Option<crate::tag_locks::KeysGuard> {
-    crate::tag_locks::lock_named_keys(name, &ctx.cmd)
+fn lock_tags_of_named_keys(
+    ctx: &mut Ctx,
+    name: &str,
+) -> Result<Option<crate::tag_locks::KeysGuard>, crate::tag_locks::TagsBusy> {
+    let Some(slot) = ctx
+        .blocking
+        .as_deref_mut()
+        .filter(|slot| slot.awaitable && !(slot.gone && slot.resume.is_some()))
+    else {
+        return Ok(crate::tag_locks::lock_named_keys(name, &ctx.cmd));
+    };
+    if let Some(turns) = slot.tag_turns.take() {
+        let held = crate::tag_locks::lock_named_keys(name, &ctx.cmd);
+        drop(turns);
+        return Ok(held);
+    }
+    crate::tag_locks::try_lock_named_keys(name, &ctx.cmd)
 }
 
 /// The order of the keys a write names (see `write_order`), and where it

@@ -167,6 +167,20 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   VM); its first run, and any script that turns out slow (over five
   milliseconds), runs alone as before.
 
+- **A command that waits for a script on its tag does not hold up its
+  thread.** Its connection waits, and the thread it is served by goes on
+  serving its other connections, whatever keys they use; what the client
+  pipelined behind the command waits with it, and the replies before it
+  are sent first. The command runs as soon as the script lets go of the
+  tag, in line with the other commands and scripts of that tag in the
+  order they came, so a stream of scripts on a tag cannot keep a command
+  out, nor the reverse. A command naming keys of several tags holds none
+  of them while it waits. The replica's applier and the AOF's replay wait
+  in place, as before; the only script they can meet running beside others
+  is a read-only one of a replica's client, which the applier waits for.
+  `EXEC` takes the command gate alone, and waits in place for every
+  running script, as before.
+
 - **Every other script is as before.** A script with no keys, or with a key
   that has no tag, runs alone and may touch what it likes. So do functions
   (`FCALL`), and scripts inside `MULTI`/`EXEC`.
