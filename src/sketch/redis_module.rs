@@ -16,10 +16,19 @@ use super::bloom::{
     BloomChain, FLAG_EXACT_SIZE, FLAG_WIDE_HASH, LayerShape, Limits, MAX_LAYER_BYTES, ShapeError,
     Used,
 };
+use super::topk::{Slot, TopK};
 
 /// The module type of Bloom filters, and the encoding version written.
 pub const BLOOM_TYPE: &str = "MBbloom--";
 const BLOOM_ENCVER: u64 = 4;
+/// The module type of Top-K sketches, and the encoding version written:
+/// what Redis 8.10 writes.
+pub const TOPK_TYPE: &str = "TopK-TYPE";
+const TOPK_ENCVER: u64 = 0;
+/// A place in Redis's heap as it saves it: the fingerprint, the item's
+/// length, a pointer (meaningless once saved), the count and four bytes of
+/// padding.
+const TOPK_SLOT: usize = 24;
 
 /// The RDB version `DUMP` payloads of these types carry: 9 (Redis 6.0),
 /// the oldest that has these encodings, so that every Redis since takes
@@ -103,6 +112,48 @@ fn write_bloom(w: &mut Writer, chain: &BloomChain) {
     }
 }
 
+/// A Top-K sketch as Redis saves it (encoding version 0): `k`, width,
+/// depth and decay; the buckets (fingerprint and count, little-endian) as
+/// one string; the heap's places as one string; then each place's item, a
+/// string ending in a zero byte (just the zero byte for an empty place).
+/// The pointers Redis's places carry are written as 0: Redis sets them
+/// from the items when it loads.
+fn write_topk(w: &mut Writer, t: &TopK) {
+    w.uint(u64::from(t.k));
+    w.uint(u64::from(t.width));
+    w.uint(u64::from(t.depth));
+    w.double(t.decay);
+    w.len(OPCODE_STRING);
+    w.len(t.buckets.len() as u64 * 8);
+    for b in t.buckets.iter() {
+        w.out.extend_from_slice(&b.fp.to_le_bytes());
+        w.out.extend_from_slice(&b.count.to_le_bytes());
+    }
+    w.len(OPCODE_STRING);
+    w.len((t.heap.len() * TOPK_SLOT) as u64);
+    for s in t.heap.iter() {
+        let len = s.item.as_ref().map_or(0, |i| i.len() as u32);
+        w.out.extend_from_slice(&s.fp.to_le_bytes());
+        w.out.extend_from_slice(&len.to_le_bytes());
+        w.out.extend_from_slice(&[0; 8]);
+        w.out.extend_from_slice(&s.count.to_le_bytes());
+        w.out.extend_from_slice(&[0; 4]);
+    }
+    for s in t.heap.iter() {
+        let item = s.item.as_deref().unwrap_or(&[]);
+        w.len(OPCODE_STRING);
+        w.len(item.len() as u64 + 1);
+        w.out.extend_from_slice(item);
+        w.out.push(0);
+    }
+}
+
+/// Whether `DUMP` writes `sketch` in Redis's format, which Redis can
+/// `RESTORE`; the other types are dumped in KiviDB's own.
+pub fn dumps_as_redis(sketch: &Sketch) -> bool {
+    matches!(sketch, Sketch::Bloom(_) | Sketch::TopK(_))
+}
+
 /// The most bytes [`dump_payload`] writes for `sketch`: each field at its
 /// longest, and the layers' bytes.
 fn dump_len(sketch: &Sketch) -> u64 {
@@ -112,6 +163,16 @@ fn dump_len(sketch: &Sketch) -> u64 {
             // Type, module ID, four fields, the end, version and CRC: under
             // 64. Each layer: eight fields of at most 10 bytes, its bytes.
             64 + layers * 80 + chain.data_bytes()
+        }
+        // Type, module ID, four fields, two strings' heads, the end, version
+        // and CRC: under 96. The buckets, the places, and each item with
+        // its head and zero byte.
+        Sketch::TopK(t) => {
+            96 + t.buckets.len() as u64 * 8
+                + t.heap
+                    .iter()
+                    .map(|s| TOPK_SLOT as u64 + 11 + s.item.as_ref().map_or(0, |i| i.len() as u64))
+                    .sum::<u64>()
         }
     }
 }
@@ -129,6 +190,10 @@ pub fn dump_payload(sketch: &Sketch) -> io::Result<Vec<u8>> {
         Sketch::Bloom(chain) => {
             w.len(module_id(BLOOM_TYPE, BLOOM_ENCVER));
             write_bloom(&mut w, chain);
+        }
+        Sketch::TopK(t) => {
+            w.len(module_id(TOPK_TYPE, TOPK_ENCVER));
+            write_topk(&mut w, t);
         }
     }
     w.len(OPCODE_EOF);
@@ -270,6 +335,61 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
     }
 }
 
+/// A Top-K sketch [`write_topk`] (or Redis) wrote: its shape is checked
+/// against the size limits before anything sized by it is read; the
+/// buckets and places must be exactly what the shape says, and each item
+/// its place's length and a zero byte.
+fn read_topk(r: &mut Reader<'_, impl Read>) -> io::Result<TopK> {
+    let k = r.uint()?;
+    let width = r.uint()?;
+    let depth = r.uint()?;
+    let decay = r.double()?;
+    if !super::topk::fits(k, width, depth) || !super::topk::decay_ok(decay) {
+        return Err(r.bad("a sketch over the size limits is not supported"));
+    }
+    let raw = r.string()?;
+    if raw.len() as u64 != width * depth * 8 {
+        return Err(r.bad("the buckets do not match the width and depth"));
+    }
+    let buckets = super::topk::buckets_from_bytes(&raw)?;
+    drop(raw);
+    let places = r.string()?;
+    if places.len() as u64 != k * TOPK_SLOT as u64 {
+        return Err(r.bad("the heap does not match k"));
+    }
+    let mut heap = Vec::with_capacity(k as usize);
+    for place in places.as_chunks::<TOPK_SLOT>().0 {
+        let word = |at: usize| {
+            u32::from_le_bytes([place[at], place[at + 1], place[at + 2], place[at + 3]])
+        };
+        let (fp, len, count) = (word(0), word(4), word(16));
+        let mut item = r.string()?;
+        if item.pop() != Some(0) {
+            return Err(r.bad("an item does not end in a zero byte"));
+        }
+        if item.len() as u64 != u64::from(len) {
+            return Err(r.bad("an item does not match its length"));
+        }
+        // An empty place: no item, no fingerprint, no count.
+        let empty = item.is_empty() && fp == 0 && count == 0;
+        heap.push(Slot {
+            fp,
+            count,
+            item: (!empty).then(|| std::sync::Arc::from(item.into_boxed_slice())),
+        });
+    }
+    r.end()?;
+    Ok(TopK::from_parts(
+        k as u32,
+        width as u32,
+        depth as u32,
+        decay,
+        buckets,
+        heap,
+        super::topk::RNG_START,
+    ))
+}
+
 /// The value of module type `name` (encoding version `encver`) from an
 /// RDB stream, if it is one of these types; `Ok(None)` for another type.
 pub fn read(name: &str, encver: u64, r: &mut impl Read) -> io::Result<Option<Sketch>> {
@@ -286,6 +406,18 @@ pub fn read(name: &str, encver: u64, r: &mut impl Read) -> io::Result<Option<Ske
                 what: "Bloom filter",
             };
             Ok(Some(Sketch::Bloom(read_bloom(&mut reader)?)))
+        }
+        TOPK_TYPE => {
+            if encver != TOPK_ENCVER {
+                return Err(super::invalid(&format!(
+                    "Top-K sketch encoding version {encver} is not supported"
+                )));
+            }
+            let mut reader = Reader {
+                r,
+                what: "Top-K sketch",
+            };
+            Ok(Some(Sketch::TopK(read_topk(&mut reader)?)))
         }
         _ => Ok(None),
     }
@@ -335,6 +467,84 @@ mod tests {
             assert!(err.to_string().contains("do not match"), "{len}: {err}");
         }
     }
+
+    /// `DUMP t2` on Redis 8.10.2 after `TOPK.RESERVE t2 2 3 1 1` and
+    /// `TOPK.ADD t2 hello`: read, it is the sketch KiviDB builds from the
+    /// same commands; written and read again, the same sketch.
+    #[test]
+    fn topk_dump_from_redis() {
+        let payload = hex(TOPK_DUMP);
+        let body = &payload[1..payload.len() - 10];
+        let mut r = body;
+        let id = crate::snapshot::rdb_read_plain_length(&mut r).unwrap();
+        assert_eq!(id, module_id(TOPK_TYPE, 0));
+        let Some(Sketch::TopK(read)) = super::read(TOPK_TYPE, 0, &mut r).unwrap() else {
+            panic!("not a sketch");
+        };
+        assert!(r.is_empty());
+        let mut ours = TopK::new(2, 3, 1, 1.0).unwrap();
+        ours.incr_by(b"hello", 1).unwrap();
+        assert_eq!(read, ours);
+        let written = dump_payload(&Sketch::TopK(ours.clone())).unwrap();
+        let mut back = &written[1..written.len() - 10];
+        crate::snapshot::rdb_read_plain_length(&mut back).unwrap();
+        let Some(Sketch::TopK(again)) = super::read(TOPK_TYPE, 0, &mut back).unwrap() else {
+            panic!("not a sketch");
+        };
+        assert_eq!(again, ours);
+        assert!(back.is_empty());
+    }
+
+    /// Corrupted Top-K values are refused, or read as a sketch within the
+    /// limits; never a panic.
+    #[test]
+    fn corrupt_topk_values_are_refused_cleanly() {
+        let mut t = TopK::new(3, 5, 2, 0.9).unwrap();
+        for i in 0..30 {
+            t.incr_by(format!("{}", i % 7).as_bytes(), 1).unwrap();
+        }
+        let mut w = Writer { out: Vec::new() };
+        write_topk(&mut w, &t);
+        w.len(OPCODE_EOF);
+        let good = w.out;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..4000 {
+            let mut bad = good.clone();
+            match next() % 3 {
+                0 => {
+                    let at = next() as usize % bad.len();
+                    bad[at] = next() as u8;
+                }
+                1 => bad.truncate(next() as usize % bad.len()),
+                _ => {
+                    let mut w = Writer { out: Vec::new() };
+                    w.uint(next() >> (next() % 64));
+                    w.uint(next() >> (next() % 64));
+                    w.uint(next() >> (next() % 64));
+                    w.double(0.9);
+                    w.string(&[0u8; 16]);
+                    w.len(OPCODE_EOF);
+                    bad = w.out;
+                }
+            }
+            if let Ok(Some(Sketch::TopK(read))) = super::read(TOPK_TYPE, 0, &mut &bad[..]) {
+                assert!(super::super::topk::fits(
+                    u64::from(read.k),
+                    u64::from(read.width),
+                    u64::from(read.depth)
+                ));
+                assert_eq!(read.heap.len(), read.k as usize);
+            }
+        }
+    }
+
+    const TOPK_DUMP: &str = "07814e8a4af9360f100002020203020104000000000000f03f05c30d180503ad4d230100e0070001000005c31e30010000e00d000403ad4d2305201a0898d02582407e000001200b20000000050100050668656c6c6f00000f005531a20539918c1c";
 
     #[test]
     fn bloom_module_id() {

@@ -2820,6 +2820,13 @@ const ALL_COMMANDS: &[&str] = &[
     "SUNSUBSCRIBE",
     "SWAPDB",
     "TIME",
+    "TOPK.ADD",
+    "TOPK.COUNT",
+    "TOPK.INCRBY",
+    "TOPK.INFO",
+    "TOPK.LIST",
+    "TOPK.QUERY",
+    "TOPK.RESERVE",
     "TOUCH",
     "TTL",
     "TYPE",
@@ -3189,6 +3196,8 @@ const FAST_COMMANDS: &[&str] = &[
     "SREM",
     "STRLEN",
     "TIME",
+    "TOPK.INFO",
+    "TOPK.RESERVE",
     "TOUCH",
     "TTL",
     "TYPE",
@@ -3257,6 +3266,7 @@ pub(crate) const ACL_CATEGORIES: &[&str] = &[
     "stream",
     "string",
     "timeseries",
+    "topk",
     "transaction",
     "vector",
     "write",
@@ -3315,6 +3325,7 @@ fn command_table() -> std::collections::BTreeMap<&'static str, Vec<u8>> {
             // for the rest.
             let arity = crate::commands::arity::of(name)
                 .or_else(|| crate::commands::bf::arity(name))
+                .or_else(|| crate::commands::topk::arity(name))
                 .or_else(|| module_arity(name))
                 .map_or(arity, i64::from);
             // A command with subcommands has no keys of its own: they are
@@ -3728,6 +3739,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
         // command joins its category by being registered.
         "json" => commands_with_prefix("JSON."),
         "bloom" => commands_with_prefix("BF."),
+        "topk" => commands_with_prefix("TOPK."),
         "search" => commands_with_prefix("FT."),
         "timeseries" => commands_with_prefix("TS."),
         "vector" => vec![
@@ -3824,6 +3836,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
                 "hash",
                 "bitmap",
                 "bloom",
+                "topk",
                 "hyperloglog",
                 "geo",
                 "stream",

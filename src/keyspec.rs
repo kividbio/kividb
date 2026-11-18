@@ -691,6 +691,13 @@ const SKETCHES: &[&str] = &[
     "BF.SCANDUMP",
     "BF.LOADCHUNK",
     "BF.DEBUG",
+    "TOPK.ADD",
+    "TOPK.COUNT",
+    "TOPK.INCRBY",
+    "TOPK.INFO",
+    "TOPK.LIST",
+    "TOPK.QUERY",
+    "TOPK.RESERVE",
 ];
 
 const COMMANDS: &[(&[&str], Shape)] = &[
@@ -1111,6 +1118,13 @@ mod tests {
             // Bloom filters
             | "BF.RESERVE" | "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.EXISTS" | "BF.MEXISTS"
             | "BF.INFO" | "BF.CARD" | "BF.SCANDUMP" | "BF.LOADCHUNK" | "BF.DEBUG"
+            | "TOPK.ADD"
+            | "TOPK.COUNT"
+            | "TOPK.INCRBY"
+            | "TOPK.INFO"
+            | "TOPK.LIST"
+            | "TOPK.QUERY"
+            | "TOPK.RESERVE"
             // Sharded pub/sub: the channel is hashed to a slot exactly like a key.
             | "SPUBLISH" => One(1),
 

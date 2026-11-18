@@ -47,10 +47,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Upgrade replicas before their master.** A master sends `BF.*` commands
   and, in a full sync, Bloom filters under a new snapshot record (tag 40);
   a replica of an earlier release cannot apply either.
-- **No downgrade once a Bloom filter exists.** A snapshot or an AOF
-  checkpoint with a Bloom filter in it cannot be read by an earlier release.
-  Delete the filters (or move them off with `DUMP`, which Redis restores)
-  before going back.
+- **No downgrade once a Bloom filter or a Top-K sketch exists.** A
+  snapshot or an AOF checkpoint with one in it cannot be read by an earlier
+  release: 1.2.2 refuses it and does not start, changing nothing on disk.
+  Delete them (or move them off with `DUMP`, which Redis restores) before
+  going back. Upgrade replicas before their master for `TOPK.*` too.
 - **A sample time of `-0` is refused.** `TS.ADD`, `TS.MADD`, `TS.INCRBY`
   and `TS.DECRBY` answer an error for it, as RedisTimeSeries and 1.2.0 do.
 - **A 1.2.x replica warns once for each idempotent duplicate.** A master
@@ -243,6 +244,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   item and every one after it with the error, so their reply has an entry
   for each item. Replicas and the AOF get only the items a write took.
   Cuckoo filters, Count-min sketches, Top-K and t-digests follow.
+
+- **Top-K (`TOPK.*`), as Redis 8 has it built in (part of #453).**
+  `TOPK.RESERVE`, `TOPK.ADD`, `TOPK.INCRBY`, `TOPK.QUERY`, `TOPK.COUNT`,
+  `TOPK.LIST` (with `WITHCOUNT`) and `TOPK.INFO`. Replies and errors are
+  Redis 8.10's in RESP2 and RESP3, quirks included (`TOPK.COUNT` answers 0
+  for a kept item whose buckets count less than the least kept). The sketch
+  is Redis's HeavyKeeper, bucket for bucket: with a decay of 1, where
+  nothing is left to chance, every answer is Redis's (30,000 replies of
+  random sequences compared: `scripts/checks/sketch/topk/compare.py`); with
+  a decay below 1 the chances come from a generator each sketch keeps and
+  saves, so a replica, an AOF replay and a restart end with the master's
+  sketch exactly, and the heavy hitters of Zipf streams are found as well as
+  Redis finds them. RDB files, full syncs and `DUMP` payloads from Redis
+  load, and `DUMP` writes Redis's format. `TYPE` is `TopK-TYPE`, the ACL
+  category `@topk`. Unlike Redis, a sketch has size limits (k 65,536,
+  67,108,864 buckets, 65,536 rows), the commands of many items a
+  per-command limit checked before they start, items are binary-safe, and
+  `COPY` copies a sketch. Snapshots keep sketches under tag 40, kind 3.
 
 - **Vector sets store vectors quantized when `VADD` asks for it (#697).**
   `Q8` keeps each vector as int8 with its norm and range, and `BIN` as one

@@ -5189,6 +5189,163 @@
             }
         ]
     },
+    "TOPK.ADD": {
+        "summary": "Adds items to a Top-K sketch, and returns the items each one pushed out of the top k.",
+        "complexity": "O(N*(d+k)) for N items: d buckets and a search of the k kept items each.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "items",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "TOPK.COUNT": {
+        "summary": "Returns the counts a Top-K sketch keeps for one or more items.",
+        "complexity": "O(N*(d+k)) for N items.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "TOPK.INCRBY": {
+        "summary": "Adds to the counts of items in a Top-K sketch, and returns the items each one pushed out of the top k.",
+        "complexity": "O(N*(d*i+k)) for N items of increment i at most.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "items",
+                "type": "block",
+                "multiple": true,
+                "arguments": [
+                    {
+                        "name": "item",
+                        "type": "string"
+                    },
+                    {
+                        "name": "increment",
+                        "type": "integer"
+                    }
+                ]
+            }
+        ]
+    },
+    "TOPK.INFO": {
+        "summary": "Describes a Top-K sketch: k, width, depth and decay.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "TOPK.LIST": {
+        "summary": "Returns the items a Top-K sketch keeps, the largest count first.",
+        "complexity": "O(k log k)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "withcount",
+                "type": "pure-token",
+                "token": "WITHCOUNT",
+                "optional": true
+            }
+        ]
+    },
+    "TOPK.QUERY": {
+        "summary": "Tells whether items are among those a Top-K sketch keeps.",
+        "complexity": "O(N*k) for N items.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "TOPK.RESERVE": {
+        "summary": "Makes an empty Top-K sketch.",
+        "complexity": "O(w*d + k): the buckets and the kept items are set up.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "topk",
+                "type": "integer"
+            },
+            {
+                "name": "params",
+                "type": "block",
+                "optional": true,
+                "arguments": [
+                    {
+                        "name": "width",
+                        "type": "integer"
+                    },
+                    {
+                        "name": "depth",
+                        "type": "integer"
+                    },
+                    {
+                        "name": "decay",
+                        "type": "double"
+                    }
+                ]
+            }
+        ]
+    },
     "TS.ADD": {
         "summary": "Appends a sample to a time series, creating the series if needed.",
         "complexity": "O(1), plus O(M) when M compaction rules are attached.",
