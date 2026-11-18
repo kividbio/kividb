@@ -9,6 +9,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrading
 
+- **A server on `--threads 0` (auto, the default) starts more worker
+  threads (#873).** Auto is now one per CPU the process may use, where it
+  was the CPUs minus 2: 4 workers on 4 CPUs (was 2), 8 on 8 (was 6), 32 on
+  32 (was 30). The server uses more CPU under load, as it can now serve
+  more. To keep the old count, pass it: `--threads 2` on 4 CPUs,
+  `--threads 6` on 8, the CPUs minus 2 from 4 CPUs up. A container with a
+  CPU limit (`--cpus`, a Kubernetes limit) or a cpuset starts one worker per
+  CPU of that limit, not of the host.
+
 - **Upgrade replicas before their master for time series `IGNORE`.** A 1.2
   replica passes `IGNORE` over, and cannot read a snapshot or `DUMP` holding
   a series that has it (tag 17).
@@ -308,6 +317,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   halfway through what the script does. Regression suite
   `22-scan-large-count` measures it.
 
+- **Auto worker threads: one per available CPU (#873).** `--threads 0`
+  started the CPUs minus 2 (all of them below 4), so a 4-vCPU machine or
+  container got 2 workers. Measured with the server confined to 4 vCPUs and
+  memtier on 4 others, 2 workers served 2-22% fewer unpipelined commands
+  than 4 (at 4 the load generator was the limit) and, on the tokio I/O
+  model, had a p99 of 9.7-10.4 ms where 4 workers had 2.0-3.4 ms; on 2
+  vCPUs, where the server was the limit, one worker served 24-41% less
+  than two. Auto now counts the CPUs online, cut down to the process's affinity
+  mask (`taskset`, a cpuset, `docker --cpuset-cpus`) and its cgroup CPU
+  quota (`docker --cpus`, a Kubernetes CPU limit, rounded down), at least
+  one; `std`'s count is used where the cgroup v1 files are the limit. More
+  workers than CPUs is avoided: on 2 vCPUs a third worker multiplied the p99
+  by up to 12, and in a container with `--cpus 1.5` two workers had a p99
+  of 27 ms where one had 4.7. The startup banner says what limited the count
+  (`CPUs : 8 online, 2 available (a cgroup CPU quota of 2 CPUs)`) and
+  whether the worker count was given or auto. `--threads N` starts exactly
+  `N`, as before. [PERFORMANCE.md](docs/PERFORMANCE.md#worker-threads) has
+  the measurements.
+
 - **Every command costs a little less (#867).** The parts of the command
   path that a plain command on a standalone master never runs (cluster
   routing, replica, ACL and memory-limit refusals, the write pause checks,
@@ -606,6 +634,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`CLUSTER SLOTS`, `SHARDS` and `NODES` refuse on a standalone, as in
+  Redis (#899).** They answered with empty tables, so a client that asks
+  a standalone for its slots — rueidis, the Go client behind Centrifugo
+  and others — took the empty answer for a cluster's and built a cluster
+  client against it. They now reply `ERR This instance has cluster
+  support disabled`, as the other cluster-only subcommands do; `CLUSTER
+  INFO` still reports `cluster_enabled:0`, and `CLUSTER KEYSLOT` still
+  answers.
+
+- **A client seen as no longer blocked has had its blocking command counted (#896).**
+  `INFO clients` could show `blocked_clients:0` before `INFO commandstats` had the
+  call of a blocking command (`BLPOP`, `XREAD BLOCK`, ...) that had just been
+  woken (seen on the io_uring loop under load, rarely on tokio). The client
+  now counts as blocked until its call has been counted, still once. A client
+  whose wait ended while a `CLIENT PAUSE` held it is counted once, not twice.
 - **A shard keeps its id across a failover (#563).** `CLUSTER MYSHARDID`
   answered the master's node id, so a shard's id changed when a replica
   took over. Each node now has a shard id of its own, as in Redis: random
@@ -632,6 +675,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reach that limit. The same goes for the replies a blocking command
   writes before it waits; if that write fails, the client is closed at
   once, and what it pipelined after the blocking command is not run.
+
+- **`CLIENT NO-TOUCH` now keeps the client's reads from counting as a
+  use of the keys they find (#566).** The command was accepted and
+  answered `OK`, but the flag was never kept: a `NO-TOUCH` client's `GET`
+  still marked its key as used, under `key-access-tracking` as under an
+  LRU, LFU or LRM `maxmemory-policy`. The flag now lives in the
+  connection, copied into each command's `Ctx` — a byte the dispatcher
+  reads only while key use is being recorded — and that client's reads
+  open no access scope and write nothing after, so nothing marks the keys
+  they find. Its writes still count as uses, so a key it makes is born
+  used rather than at the start of time, and `TOUCH` still touches, as
+  in Redis; `CLIENT LIST` and `CLIENT INFO` show the `T` flag, and
+  `RESET` puts the connection back.
 
 - **A replica of 1.2.0 no longer writes a `TS.INCRBY` its own AOF replay
   refuses (#611).** A 1.2.0 master sends a time above `i64::MAX` as the

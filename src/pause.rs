@@ -488,6 +488,7 @@ pub async fn gate<Q: AsRef<[u8]>, G: std::future::Future<Output = ()>>(
     cmd: &[&[u8]],
     queued: &[Vec<Q>],
     id: u64,
+    already_blocked: bool,
     gone: impl FnOnce() -> G,
 ) -> Option<Option<Ran>> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
@@ -503,7 +504,9 @@ pub async fn gate<Q: AsRef<[u8]>, G: std::future::Future<Output = ()>>(
     if !holds(cmd, queued) {
         return Some(None);
     }
-    let held = Held::new();
+    // A resume dispatch whose slot still counts its client (see
+    // `BlockedCount`) is not counted a second time.
+    let held = (!already_blocked).then(Held::new);
     HELD.fetch_add(1, Ordering::SeqCst);
     // Counted off however the wait ends, the connection going with it.
     let counted = Counted;

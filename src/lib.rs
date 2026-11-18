@@ -23,6 +23,7 @@ pub mod command_gate;
 pub mod commands;
 pub mod compaction;
 pub mod config;
+pub mod cpus;
 pub mod element;
 pub mod eviction;
 pub mod expiry;

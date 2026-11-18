@@ -746,13 +746,24 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The worker threads to start: `--threads`, or with `0` (auto) one per
+    /// CPU the process may run on, its affinity mask and cgroup CPU quota
+    /// counted (src/cpus.rs).
     pub fn resolve_threads(&self) -> usize {
         if self.threads > 0 {
             return self.threads;
         }
-        std::thread::available_parallelism()
-            .map(|n| if n.get() < 4 { n.get() } else { n.get() - 2 })
-            .unwrap_or(12)
+        crate::cpus::available(&crate::cpus::detect()).threads
+    }
+
+    /// How [`Config::resolve_threads`] came to its number, for the banner,
+    /// whose CPUs line says what limited the CPUs available.
+    pub fn threads_reason(&self) -> &'static str {
+        if self.threads > 0 {
+            "--threads"
+        } else {
+            "auto: one per available CPU"
+        }
     }
 
     pub fn addr(&self) -> String {
@@ -2340,6 +2351,24 @@ mod config_file_tests {
             let words = split_config_line(&format!("k {}", quote(value))).unwrap();
             assert_eq!(words, ["k", value]);
         }
+    }
+
+    /// `--threads N` is taken as it is, whatever the machine (#873); only
+    /// `0` asks src/cpus.rs, whose rule has tests of its own.
+    #[test]
+    fn threads_given_are_exact() {
+        for n in [1, 3, 64, 1000] {
+            let config = Config {
+                threads: n,
+                ..Config::default()
+            };
+            assert_eq!(config.resolve_threads(), n);
+            assert_eq!(config.threads_reason(), "--threads");
+        }
+        let auto = Config::default();
+        assert_eq!(auto.threads, 0);
+        assert!(auto.resolve_threads() >= 1);
+        assert_eq!(auto.threads_reason(), "auto: one per available CPU");
     }
 
     #[test]
