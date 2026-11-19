@@ -398,7 +398,7 @@ mod tests {
         let threads: Vec<_> = (0..8)
             .map(|_| {
                 let mine = shared.clone();
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     for _ in 0..20_000 {
                         let copy = mine.clone();
                         assert_eq!(copy[999], 7);

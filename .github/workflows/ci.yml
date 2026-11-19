@@ -11,6 +11,10 @@ on:
       - '.config/nextest.toml'
       - 'scripts/redis_compat*'
       - '.github/workflows/ci.yml'
+      # The regression suite's harness and the release gate (python only:
+      # the `regression-selftest` job; nothing is built for them).
+      - 'benchmarks/*/regressions/**'
+      - 'scripts/release/**'
   # By hand, from the Actions tab: the full build and test of a branch, e.g.
   # master before a release tag. Skips the change detection below.
   workflow_dispatch:
@@ -44,6 +48,7 @@ jobs:
       pull-requests: read
     outputs:
       run_ci: ${{ steps.filter.outputs.source }}
+      harness: ${{ steps.filter.outputs.harness }}
     steps:
       - uses: actions/checkout@v4
 
@@ -64,6 +69,36 @@ jobs:
               - 'scripts/redis_compat*'
               - '.github/workflows/ci.yml'
               - '.github/workflows/linux-verification.yml'
+            harness:
+              - 'benchmarks/*/regressions/lib/**'
+              - 'benchmarks/*/regressions/suites/**'
+              - 'benchmarks/*/regressions/run-all.sh'
+              - 'scripts/release/**'
+              - '.github/workflows/ci.yml'
+
+  # ── The regression suite's self-tests: python only, no VM, seconds ────────
+  # compare.py's gates and host scaling, the release gate
+  # (scripts/release/regression_gate.py) and suite 25's error check, and that
+  # every suite lists its configurations.
+  regression-selftest:
+    needs: detect-changes
+    if: >-
+      always() && needs.detect-changes.result != 'failure' &&
+      (github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.harness == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Self-tests
+        run: |
+          set -euo pipefail
+          for d in benchmarks/*/regressions; do
+            [ -f "$d/lib/test_compare.py" ] || continue
+            (cd "$d/lib" && python3 -m unittest -v test_compare $( [ -f test_suite25.py ] && echo test_suite25 ))
+            for f in "$d"/suites/[0-9][0-9]-*.py; do python3 "$f" --configs > /dev/null; done
+            bash -n "$d/run-all.sh"
+          done
+          bash -n scripts/release/check-regression-results.sh
 
   # -- What `rust` used to do in one 41-minute job, as parallel jobs ---------
   # `cargo test` compiled and ran 75 test binaries one after the other. Now the

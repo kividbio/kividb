@@ -4,9 +4,13 @@
 # runs the regression suite on it. Not for a laptop.
 #
 # Expects in $HOME: cand.tar (the candidate's source tree) and harness.tar (the
-# suite's directory, e.g. benchmarks/1.3.0/regressions/, with its path).
+# suite's directory, e.g. benchmarks/1.3.0/regressions/, with its path, and
+# the harnesses suites run next to it: benchmarks/1.3.0/vector-sets,
+# benchmarks/redisvl-compat).
 # Settings (environment): SUITE_DIR (path of the suite in harness.tar), LABEL,
-# CAND_COMMIT, ONLY (comma list, optional), FULL (1 for the long configurations).
+# CAND_COMMIT, ONLY (comma list, optional), FULL (1 for the long configurations),
+# MIN_CPUS_ONLY (1: only the suites that declare min_cpus, `run-all.sh
+# --min-cpus-only`, on the workflow's second machine, a Standard_D8s_v5).
 # Writes the suite's exit status to $HOME/run.exit; the results are in
 # $HOME/harness/$SUITE_DIR/results/$LABEL.
 set -uo pipefail
@@ -42,23 +46,31 @@ echo "=== build candidate ($CAND_COMMIT)"
 CAND_BIN=$HOME/cand/target/release/kividb
 [ -x "$CAND_BIN" ] || { echo "no $CAND_BIN"; exit 1; }
 "$CAND_BIN" --version | head -1
+# The lua,tls build too, for the configurations that need scripts (run-all.sh
+# --candidate-full; without it they are skipped and the release gate refuses
+# the run). Its own target dir: a features change would rebuild in place.
+(cd cand && cargo build --release --locked --features lua,tls --target-dir target-full) || exit 1
+CAND_FULL_BIN=$HOME/cand/target-full/release/kividb
+[ -x "$CAND_FULL_BIN" ] || { echo "no $CAND_FULL_BIN"; exit 1; }
+"$CAND_FULL_BIN" --version | head -1
 
 HERE=$HOME/harness/$SUITE_DIR
 [ -x "$HERE/run-all.sh" ] || chmod +x "$HERE/run-all.sh"
 
-echo "=== redis 8.10.2 (built from its tag; the suite's pin names the build on our VM image)"
+echo "=== redis 8.10.2 (built from its release tarball, SHA-256 checked against the pin in lib/engines.sh)"
 export REGRESS_CACHE=$HOME/.cache/kividb-regress
 # shellcheck source=/dev/null
 source "$HERE/lib/engines.sh"
 REDIS_BIN=$(engines_resolve_redis "$REGRESS_CACHE/redis") || exit 1
 export REDIS_SERVER=$REDIS_BIN
-REGRESS_REDIS_SHA256=$(sha256sum "$REDIS_BIN" | cut -d' ' -f1)
-export REGRESS_REDIS_SHA256
-echo "redis-server: $REDIS_BIN sha256 $REGRESS_REDIS_SHA256"
+# Informational: a binary built here differs from the VM image's pinned one;
+# compare.py accepts it because its source tarball matched the pin.
+echo "redis-server: $REDIS_BIN sha256 $(sha256sum "$REDIS_BIN" | cut -d' ' -f1)"
 
 echo "=== suite"
-args=(--candidate "$CAND_BIN" --candidate-commit "$CAND_COMMIT" --label "$LABEL")
+args=(--candidate "$CAND_BIN" --candidate-full "$CAND_FULL_BIN" --candidate-commit "$CAND_COMMIT" --label "$LABEL")
 [ -n "${ONLY:-}" ] && args+=(--only "$ONLY")
+[ "${MIN_CPUS_ONLY:-0}" = 1 ] && args+=(--min-cpus-only)
 export FULL=${FULL:-0}
 "$HERE/run-all.sh" "${args[@]}"
 rc=$?

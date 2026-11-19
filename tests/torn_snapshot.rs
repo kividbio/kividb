@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/torn_snapshot.rs
 //
 // A `dump.kdb` cut short inside the sections after its last database (#474).

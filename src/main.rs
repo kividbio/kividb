@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 use crate::replication::{ReplState, start_hub};
 
 use config::Config;
@@ -655,7 +656,7 @@ fn spawn_snapshot_index_backfill_thread(
     index_store: vector::IndexStore,
     index_names: Vec<String>,
 ) {
-    std::thread::spawn(move || {
+    crate::cpus::spawn(move || {
         backfill_snapshot_search_indexes(&store, &index_store, &index_names);
         vector::SNAPSHOT_INDEX_REBUILD.store(false, std::sync::atomic::Ordering::Release);
         log_info!("Search index startup complete — full command set is available");
@@ -730,6 +731,9 @@ fn start_configured_replication(
 
 fn run_tokio(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std::error::Error>> {
     let threads = config.resolve_threads();
+    if let Some(line) = crate::cpus::not_pinned_here(config.worker_cpu_affinity, true) {
+        log_info!("Worker CPUs    : {line}");
+    }
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
         .thread_keep_alive(commands::helpers::RUNTIME_THREAD_KEEP_ALIVE)
@@ -892,7 +896,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let hub_tx = {
         let repl_state_hub = Arc::clone(&repl_state);
         let (tx, rx) = std::sync::mpsc::sync_channel::<crate::replication::HubTx>(1);
-        std::thread::spawn(move || {
+        crate::cpus::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1043,7 +1047,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     let signal_snapshot_index_store = Arc::clone(&index_store);
     let signal_repl_state = Arc::clone(&repl_state);
     let signal_hub_tx = hub_tx.clone();
-    std::thread::spawn(move || {
+    crate::cpus::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1160,7 +1164,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     // The keys active expiry deletes are logged from here on.
     drop(starting);
     let aof_writer = aof::start_aof_writer(tokio_rx);
-    std::thread::spawn(move || {
+    crate::cpus::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1247,8 +1251,29 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         })
         .unzip();
     let inboxes = Arc::new(inboxes);
+    // `worker-cpu-affinity auto`: each worker on a CPU of its own, when they
+    // are as many as the CPUs this process may use (src/cpus.rs).
+    let pinned = {
+        let pinning = crate::cpus::pinning(
+            config.worker_cpu_affinity,
+            threads,
+            crate::cpus::allowed_cpu_ids().as_deref(),
+            crate::cpus::detect().quota,
+        );
+        match pinning {
+            // Said once every worker has tried: what happened, not the plan.
+            crate::cpus::Pinning::Pin(cpus) => Some(Arc::new(crate::cpus::PinReport::new(cpus))),
+            crate::cpus::Pinning::Not(_) => {
+                if config.worker_cpu_affinity != crate::cpus::WorkerCpuAffinity::Off {
+                    log_info!("Worker CPUs    : {}", pinning.describe());
+                }
+                None
+            }
+        }
+    };
     let handles: Vec<_> = (0..threads)
         .map(|worker| {
+            let pinned = pinned.clone();
             let loads = Arc::clone(&loads);
             let inboxes = Arc::clone(&inboxes);
             let mut inbox = inbox_ends[worker].take().expect("one inbox a worker");
@@ -1275,7 +1300,13 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             let cluster_state = Arc::clone(&cluster_state);
             let monitor_registry = Arc::clone(&monitor_registry);
             let tracking_table = Arc::clone(&tracking_table);
-            std::thread::spawn(move || {
+            crate::cpus::spawn(move || {
+                if let Some(report) = &pinned {
+                    let bound = crate::cpus::pin_this_thread(report.cpu(worker), report.cpus());
+                    if let Some(line) = report.tried(worker, &bound) {
+                        log_info!("Worker CPUs    : {line}");
+                    }
+                }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     tokio_uring::start(async move {
                         // Port 0: none, until `CONFIG SET port` opens one.
@@ -1533,7 +1564,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
         let tls_aof_enabled = aof_enabled;
 
         let server = crate::listen::server_of(&config);
-        std::thread::spawn(move || {
+        crate::cpus::spawn(move || {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
@@ -1864,7 +1895,7 @@ async fn async_main_tokio(
         config.aof_rewrite_min_size,
     );
     let aof_writer = aof::start_aof_writer(aof_rx);
-    std::thread::spawn(move || {
+    crate::cpus::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2325,7 +2356,7 @@ async fn async_main_tokio(
                 // command run from the clients' pause to the exit: the
                 // connections already open keep running, and a write one made
                 // after the snapshot's cut was acknowledged and then lost.
-                let ended = tokio::task::spawn_blocking(move || {
+                let ended = crate::cpus::spawn_blocking(move || {
                     crate::shutdown::Final {
                         store: &store_c,
                         index_store: &index_c,
