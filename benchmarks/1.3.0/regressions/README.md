@@ -34,7 +34,7 @@ and why.
 | `15-brpop-many-keys` | #758 | jobs/s delivered to 1,000 and 4,000 workers each in `BRPOP` over 270 queues (and 1,000 over one queue, a guard) while 200 `LPUSH`es go out every 0.1 s; PING p99/max beside it; jobs lost (exactly 0) and clients left blocked after the workers go (0) |
 | `16-random-sample` | #839 | `ZRANDMEMBER` / `HRANDFIELD` of a sorted set / hash of 100, 10,000 and 1,000,000 members, with no count, 1, 10, -1, -10, `WITHSCORES` / `WITHVALUES`: microseconds a call (mean of 150-3,000 calls, median of 3 rounds) and the replies checked (length, distinct for a positive count) |
 | `17-set-memory` | #297 (step 1) | `used_memory` per set member, 1,000,000 members in sets of 10, 100, 1,000 and 100,000: 14-byte strings (`membr:<i>`) and integers (`0`..`n-1`); `OBJECT ENCODING` of each size recorded exactly; the tables (1,000 and 100,000) as guard rows |
-| `18-mastodon-feed-fanout` | #849 | Mastodon's home-feed fan-out (FeedManager mix: `ZADD`, `ZREMRANGEBYRANK 0 -801`, `ZREVRANGE 40 40 WITHSCORES`, `ZSCORE`, `EXISTS`, `ZREVRANGEBYSCORE ... LIMIT 0 20`, `ZRANGEBYSCORE`) over 20,000 feeds of 800 members with memtier_benchmark at 200 and 500 connections: ops/s and the timeline read's p50 against Redis, p99 shown beside them, `used_memory` and bytes per member; recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-18)) |
+| `18-mastodon-feed-fanout` | #849 | Mastodon's home-feed fan-out (FeedManager mix: `ZADD`, `ZREMRANGEBYRANK 0 -801`, `ZREVRANGE 40 40 WITHSCORES`, `ZSCORE`, `EXISTS`, `ZREVRANGEBYSCORE ... LIMIT 0 20`, `ZRANGEBYSCORE`) over 20,000 feeds of 800 members with memtier_benchmark at 200 and 500 connections: ops/s and the timeline read's p50 against Redis and v1.2.2, p99 shown beside them; the same mix paced at 200k requests a second, its read p50 against v1.2.2; `used_memory` and bytes per member; recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-18)) |
 | `19-hash-memory` | collection storage step 2 | `used_memory` per hash field, 1,000,000 fields in hashes of 10, 100, 1,000 and 100,000: 14-byte fields (`field:<i>`) with 32-byte values, plain and with one field TTL a hash; `OBJECT ENCODING` of each size recorded exactly (`listpack`, `listpackex`, `hashtable`); the tables (1,000 and 100,000) as guard rows |
 | `20-envoy-ratelimit` | #849 | envoyproxy/ratelimit's pipelined `INCRBY` + `EXPIRE` pair on one key (memtier_benchmark, `--pipeline 2 --transaction`, 100,000 keys) at 200 and 500 connections: ops/s against Redis, p99 shown beside it, and keys left without a TTL (must be 0); on Linux the server and the client are pinned to separate halves of the CPUs; recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-20)) |
 | `21-list-memory` | #297 (step 3) | `used_memory` per list element, 1,000,000 32-byte elements in lists of 10, 100, 1,000 and 100,000, packed in chunks; the same made plain (an element over 1,024 bytes pushed and popped first) as guard rows; the same sizes with 6-byte elements (job ids); one list of short elements as a queue leaves it: BullMQ's wait list (ids 1 to 200,000 pushed one `LPUSH` at a time), 200,000 ids after ten full rotations (`LPUSH` one, `RPOP` one), and 1,000,000 drained to 100,000 three times, with `MEMORY USAGE` over the growth of `used_memory` beside each (info); `OBJECT ENCODING` of each size recorded exactly |
@@ -978,8 +978,8 @@ What it does better is p99: a third to two thirds of v1.2.2's, and below
 Redis's. So the gates are "at least 1.75x Redis" (6 % under the lowest
 ratio measured), "at most 10 % under v1.2.2" (`vs_v1_2_2` 1.1: the
 runs went up to 5.5 % under it), the read p50 at most 0.55x Redis's and 15 %
-over the recorded one (master's read p50 against v1.2.2 is recorded, not
-gated), 10 % against the recorded rate and 5 % on the memory. This suite is
+over the recorded one (master's read p50 against v1.2.2 was recorded, not
+gated, at first: see "The read p50 against v1.2.2" below), 10 % against the recorded rate and 5 % on the memory. This suite is
 noisier than 20: a 10 % loss in the rate is caught by the `v1.2.2` gate only
 at its edge.
 
@@ -997,6 +997,60 @@ Verified 2026-11-19 on a fresh Standard_D8s_v5 (the same CPU) against the master
 connections 248,500 / 246,800 ops/s against Redis's 115,100 / 96,700. The
 recorded rows carry `recorded.rustc` 1.100.0, the compiler of the recorded run's
 `env.json`.
+
+### The read p50 against v1.2.2
+
+Bisected 2026-11-19 on a D8s_v5 (fat LTO, rustc 1.100.0, each first-parent
+merge built in its own target dir, five alternating runs of this mix at 200
+connections, the md5 of every binary checked). The v1.2.2 tag built on the
+VM and the release binary measure the same (p50 0.48-0.50 ms, p99 3.84-3.87).
+
+| build | read p50, ms | mix p99, ms | ops/s | mean, ms | `ZREVRANGEBYSCORE`, us a call |
+|---|---:|---:|---:|---:|---:|
+| v1.2.2 | 0.50 [0.49-0.51] | 3.86 | 280,000 | 0.71 | 19.4 |
+| `59583540` (before #712) | 0.50 [0.48-0.50] | 3.86 | 280,000 | 0.71 | 19.0 |
+| `e585c821` (#712) | 0.62 [0.61-0.63] | 1.18 | 296,000 | 0.67 | 6.0 |
+| `e3a8d2c5` (before #903) | 0.63 [0.61-0.64] | 1.22 | 294,000 | 0.68 | |
+| `e8a0fdda` (#903) | 0.65 [0.64-0.66] | 1.43 | 282,000 | 0.71 | |
+| master `05b3ffec` | 0.65 [0.64-0.66] | 1.43-1.46 | 282,000 | 0.70 | 4.9 |
+| master, `--threads 6` | 0.62 [0.61-0.62] | 1.17 | 292,000 | 0.68 | |
+| master + 14 us of busy work in each by-score read | 0.50 [0.46-0.53] | 3.82 | 275,000 | 0.72 | 22.8 |
+| master without #712's integer scores | 0.44 [0.41-0.53] | 3.97 | 286,000 | 0.70 | 23.1 |
+
+Flat out, memtier is the limit and the mean latency is fixed by connections
+/ ops/s, so a lower p99 at the same rate means a higher median. #712 replies
+a whole-number score as an integer (Redis's format, #472; a feed's scores
+are status ids, whole numbers of 15 digits) instead of through `{:e}` and a
+string rebuilt from it: the 20-member `WITHSCORES` page became 3x cheaper,
+the workers sleep between requests (voluntary context switches 123k to 257k
+a run) instead of running behind, and the 4 ms waits of connections queued
+behind a busy worker are gone. Making the read as dear again on master, by
+busy work or by taking the integer path out, gives back v1.2.2's p50, and
+its p99 with it. #903 (one worker per CPU: 8 here, where v1.2.2 started 6)
+adds 0.02-0.03 ms with memtier on the same 8 vCPUs; `--threads 6` gives it
+back. Neither is reverted: one is Redis's reply format and a 3x cheaper
+read, the other #903's choice for a server with CPUs of its own. #877 and
+#938 do not move this row.
+
+With the server not saturated the two are equal: at 200k requests a second
+(`--rate-limiting=1000` per connection) the read p50 is 0.46-0.53 ms on
+master against 0.48-0.51 on v1.2.2 (p99 1.12 / 1.11 ms), and 0.29 ms both
+at 100k. Pinned (server on CPUs 0-3 with `--threads 4`, memtier on 4-7) it
+is 0.663 against 0.655; with the server held to 2 workers (the server the
+limit) master is ahead: 0.83 ms against 0.98, at 230k ops/s against 192k.
+
+So the suite gates the flat-out read p50 at most 1.5x v1.2.2's in the same
+session (it is 1.28-1.35x), and adds the paced run, whose read p50 is gated
+at most 1.15x v1.2.2's: that row sees a read that got dearer or replies held
+longer, which the flat-out one cannot tell from a fairer schedule.
+
+The paced rows (`ops_paced`, `read_p50_ms_paced`, `read_p99_ms_paced`) are
+recorded from `results/p50-c153b8d0-d8s_v5` (master `c153b8d0`, rustc 1.100.0,
+a D8s_v5 with a Xeon Platinum 8573C; `run-all.sh --only 18`, verdict `ok`, its
+summary judged with these gates): read p50 0.527 ms against v1.2.2's 0.495
+(1.06x), p99 1.10 against 1.13; flat out 0.647 / 0.511 ms (1.27x) and 1.66 /
+1.29 ms (1.29x) at 200 / 500 connections. Redis serves 128k a second flat out,
+so its paced row is a flat-out one. The other rows keep their recorded values.
 
 This suite declares `min_cpus=8`: the normal run on the D4s_v5 of the other
 suites does not run it (`needs_more_cpus` in `env.json`), and `--only 18` on it

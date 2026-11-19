@@ -7227,6 +7227,30 @@
         }
       ]
     },
+    "18-mastodon-feed-fanout/default/ops_paced": {
+      "suite": "18-mastodon-feed-fanout",
+      "config": "default",
+      "metric": "ops_paced",
+      "unit": "ops/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 199938.07,
+        "candidate": 199928.2,
+        "redis": 128114.51,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-19",
+        "commit": "c153b8d0",
+        "label": "p50-c153b8d0-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
     "18-mastodon-feed-fanout/default/p99_ms_c200": {
       "suite": "18-mastodon-feed-fanout",
       "config": "default",
@@ -7302,6 +7326,11 @@
           "kind": "rel",
           "pct": 15,
           "speed": false
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.5,
+          "speed": false
         }
       ]
     },
@@ -7331,6 +7360,37 @@
         {
           "kind": "rel",
           "pct": 15,
+          "speed": false
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.5,
+          "speed": false
+        }
+      ]
+    },
+    "18-mastodon-feed-fanout/default/read_p50_ms_paced": {
+      "suite": "18-mastodon-feed-fanout",
+      "config": "default",
+      "metric": "read_p50_ms_paced",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.495,
+        "candidate": 0.527,
+        "redis": 1.479,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-19",
+        "commit": "c153b8d0",
+        "label": "p50-c153b8d0-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.15,
           "speed": false
         }
       ]
@@ -7375,6 +7435,31 @@
         "commit": "d1a6712c",
         "label": "pr870-d1a6712c-d8s_v5-rerun2",
         "rustc": "1.100.0"
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "18-mastodon-feed-fanout/default/read_p99_ms_paced": {
+      "suite": "18-mastodon-feed-fanout",
+      "config": "default",
+      "metric": "read_p99_ms_paced",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.127,
+        "candidate": 1.103,
+        "redis": 3.039,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-19",
+        "commit": "c153b8d0",
+        "label": "p50-c153b8d0-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
       },
       "gate": [
         {
