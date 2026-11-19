@@ -865,13 +865,12 @@ pub fn hold_for_pause(ctx: &mut crate::commands::ctx::Ctx) -> Vec<u8> {
 /// while its thread serves its other connections, and dispatches it again
 /// holding them (#882). Only asked of a dispatch that can park
 /// (`BlockingCtl::awaitable`): any other waits on the locks, as before. The
-/// reply, `pause::HELD_IN_GATE`, is never sent: `execute_command` takes it
-/// as it takes a pause's, for a command that has not run.
+/// command's reply is then `pause::HELD_IN_GATE`, which is never sent:
+/// `execute_command` takes it as it takes a pause's, for a command that has
+/// not run.
 #[cfg(feature = "lua")]
-pub fn hold_for_tags(
-    ctx: &mut crate::commands::ctx::Ctx,
-    busy: crate::tag_locks::TagsBusy,
-) -> Vec<u8> {
+#[cold]
+pub fn hold_for_tags(ctx: &mut crate::commands::ctx::Ctx, busy: crate::tag_locks::TagsBusy) {
     if let Some(slot) = ctx.blocking.as_mut() {
         slot.parked = Some(BlockingWait {
             rxs: Vec::new(),
@@ -882,7 +881,6 @@ pub fn hold_for_tags(
             tags: Some(busy),
         });
     }
-    crate::pause::HELD_IN_GATE.to_vec()
 }
 
 thread_local! {

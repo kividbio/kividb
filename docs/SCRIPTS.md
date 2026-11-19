@@ -174,8 +174,11 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   are sent first. The command runs as soon as the script lets go of the
   tag, in line with the other commands and scripts of that tag in the
   order they came, so a stream of scripts on a tag cannot keep a command
-  out, nor the reverse. A command naming keys of several tags holds none
-  of them while it waits. The replica's applier and the AOF's replay wait
+  out, nor the reverse. A command naming keys of several tags holds the
+  lock of none of them while it waits, and waits in line only on the tags
+  a script is on: scripts on its other tags go on meanwhile. (Should a
+  script have come to one of those once it is its turn, it waits for that
+  tag too, holding nothing.) The replica's applier and the AOF's replay wait
   in place, as before; the only script they can meet running beside others
   is a read-only one of a replica's client, which the applier waits for.
   `EXEC` takes the command gate alone, and waits in place for every

@@ -1747,9 +1747,15 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         && !crate::command_gate::alone_on_this_thread()
         && !crate::tag_locks::in_script()
     {
-        match lock_tags_of_named_keys(ctx, name) {
-            Ok(held) => held,
-            Err(busy) => return crate::commands::blocking::hold_for_tags(ctx, busy),
+        // Nearly every command: none of its keys has a `{`, and nothing else
+        // is looked at (#889).
+        match crate::tag_locks::named_keys(name, &ctx.cmd) {
+            None => None,
+            Some(keys) => match lock_tags_found(ctx, keys) {
+                Ok(held) => held,
+                // Sent back (`blocking::hold_for_tags`): not run now.
+                Err(()) => return crate::pause::HELD_IN_GATE.to_vec(),
+            },
         }
     } else {
         None
@@ -1969,59 +1975,47 @@ fn lock_tags_of_named_keys(ctx: &Ctx, name: &str) -> Option<crate::tag_locks::Ke
     crate::tag_locks::lock_named_keys(name, &ctx.cmd)
 }
 
-/// With scripts locked by hash tag (`tag_locks`), for a client's command:
-/// the locks of the tags of the keys it names. Out of line: only with
-/// `tag_locks` on does a command come here. A command none of whose keys
-/// has a `{` takes nothing, and is told so without the general list of its
-/// keys (`tag_locks::named_keys`, #889).
+/// With scripts locked by hash tag (`tag_locks`), for a client's command
+/// with a key that may carry a tag (`tag_locks::named_keys`): the locks of
+/// the tags of the keys it names. Out of line: only a command with a `{` in
+/// a key comes here.
 ///
 /// `Err`: a script holds one of them, or is in line for it, and the
-/// command's connection can wait for it without its thread: it is to be
-/// sent back (`blocking::hold_for_tags`, #882). What cannot wait so waits on
+/// command's connection can wait for it without its thread: it has been
+/// sent back (`blocking::hold_for_tags`, #882), what it waits for kept in
+/// its blocking slot, and is not to run now. What cannot wait so waits on
 /// the locks, as before: the replica's applier and the AOF's replay (which
 /// never meet a script that runs beside others there: a script from the
 /// stream or the log runs alone, so what they can find holding a tag is a
 /// read-only script of a replica's client, for as long as it runs), a
 /// command of a connection's slow path, and the dispatch of a command whose
 /// client has gone, which only leaves the line it stood in. So does the
-/// dispatch that runs a command again after its connection waited: it holds
-/// the tags' turns, so what holds a lock is a client's command, for a
-/// moment; the turns go once the locks are held.
-#[cfg(feature = "lua")]
-#[inline(never)]
-fn lock_tags_of_named_keys(
-    ctx: &mut Ctx,
-    name: &str,
-) -> Result<Option<crate::tag_locks::KeysGuard>, crate::tag_locks::TagsBusy> {
-    // Nearly every command: none of its keys has a `{`, and nothing else
-    // is looked at.
-    let Some(keys) = crate::tag_locks::named_keys(name, &ctx.cmd) else {
-        return Ok(None);
-    };
-    lock_tags_found(ctx, keys)
-}
-
-/// [`lock_tags_of_named_keys`] for a command with a key that may carry a
-/// tag: waiting off the thread for a script on it if the dispatch can.
+/// dispatch that runs a command again after its connection waited holds the
+/// turns of the tags it waited for: no script holds those, and the others
+/// are tried as on the first dispatch; the turns go once the locks are held,
+/// or once it is sent back again, to wait for more of its tags
+/// (`tag_locks::try_lock_found_keys`).
 #[cfg(feature = "lua")]
 #[inline(never)]
 fn lock_tags_found(
     ctx: &mut Ctx,
     keys: crate::tag_locks::NamedKeys,
-) -> Result<Option<crate::tag_locks::KeysGuard>, crate::tag_locks::TagsBusy> {
-    let Some(slot) = ctx
+) -> Result<Option<crate::tag_locks::KeysGuard>, ()> {
+    let mine = match ctx
         .blocking
         .as_deref_mut()
         .filter(|slot| slot.awaitable && !(slot.gone && slot.resume.is_some()))
-    else {
-        return Ok(crate::tag_locks::lock_found_keys(keys, &ctx.cmd));
+    {
+        None => return Ok(crate::tag_locks::lock_found_keys(keys, &ctx.cmd)),
+        Some(slot) => slot.tag_turns.take(),
     };
-    if let Some(turns) = slot.tag_turns.take() {
-        let held = crate::tag_locks::lock_found_keys(keys, &ctx.cmd);
-        drop(turns);
-        return Ok(held);
-    }
-    crate::tag_locks::try_lock_found_keys(keys, &ctx.cmd)
+    let tried = crate::tag_locks::try_lock_found_keys(
+        keys,
+        &ctx.cmd,
+        mine.as_ref().map_or(&[][..], crate::tag_locks::TagTurns::stripes),
+    );
+    drop(mine);
+    tried.map_err(|busy| crate::commands::blocking::hold_for_tags(ctx, busy))
 }
 
 /// The order of the keys a write names (see `write_order`), and where it

@@ -926,7 +926,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   commands of the tag in the order they came, while the thread serves its
   other connections. What the client pipelined behind the command waits
   with it, and the replies before it are sent first; a command naming keys
-  of several tags holds none of them while it waits; a client that goes or
+  of several tags holds the lock of none of them while it waits, and waits
+  in line only on the tags a script is on, so scripts on its other tags go
+  on meanwhile (should one of those be busy once it is its turn, it waits
+  for that tag too, holding nothing); a client that goes or
   is killed while it waits leaves nothing behind; a blocking command woken
   by the script keeps what it was woken for. The replica's applier, the
   AOF's replay and `EXEC` wait in place, as before. Measured with a ~2 ms
