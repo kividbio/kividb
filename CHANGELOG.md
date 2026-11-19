@@ -768,19 +768,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without a filter leave out a document whose vector field has passed its
   deadline and ask the index for more, at least twice as many each round.
   They went on until they had `k` or had asked for the whole index (an HNSW
-  search with that many candidates), and did not look at the clock. Now the
-  index is asked for at most one vector in 16 of what it holds; past that,
-  every vector is measured exactly, keeping the nearest few, four times as
-  many each pass, until `k` are shown. The deadline is checked between rounds
-  and passes and every 1,024 documents looked at; `ON_TIMEOUT return` gives
-  the shown ones found so far, nearest first. Other KNN paths were already
-  bounded: with a filter, `knn_planned` and the exact filtered scan, and
-  `FT.AGGREGATE`, which measures the rows its filter left. Measured
-  (milliseconds a query, wall clock, Apple M3 Pro, 50,000 hashes, `KNN 10`,
-  `benchmarks/1.3.0/search-clock` `h<permille>`): HNSW with 99.9% of the
-  vectors hidden 27.8 before, 23.3 after, and with `TIMEOUT 1` 24.5 before
-  (the timeout ignored), 1.9 after; FLAT 99.9% hidden 19.1 and 18.4; 90% and
-  99% hidden and no TTL within noise.
+  search with that many candidates), and did not look at the clock. Now an
+  HNSW index is asked for at most one vector in 16 of what it holds, and a
+  FLAT one (whose every search measures every vector) once; after that every
+  vector is measured exactly, keeping the nearest few, four times as many
+  each pass, until `k` are shown. The deadline is checked before every round
+  and pass after the first search and every 1,024 documents a pass looks at;
+  `ON_TIMEOUT return` gives the shown ones found so far, nearest first.
+  Other KNN paths were already bounded: with a filter, `knn_planned` and the
+  exact filtered scan, and `FT.AGGREGATE`, which measures the rows its
+  filter left. On HNSW, 200,000 documents with 99% of the nearest hidden
+  (D4s_v5): 798 ms a query before, 425 after; `TIMEOUT 50` stops at 57 ms
+  (it was ignored); a writer's worst `HSET` during the query 813 ms before,
+  70 after. With no field TTL or nothing hidden, instructions a query do not
+  move (callgrind, 0.1%).
 
 ### Fixed
 

@@ -1427,24 +1427,69 @@ fn hybrid_nearest(c: &mut Conn, index: &str, k: usize) -> Vec<String> {
         .collect()
 }
 
-/// The hundred nearest vectors due: FT.HYBRID's vector side gives up on the
-/// index search after a few rounds and measures every vector, and ranks the
-/// ten nearest the query sees.
+/// The thousand nearest vectors due, of 3,000: the index search stops
+/// asking for more (on HNSW at a 16th of the index, on FLAT after its first
+/// search) and every vector is measured. FT.SEARCH and FT.HYBRID's vector
+/// side both get the ten nearest the query sees. (With a hundred due the
+/// searches alone find them: `ft_knn_refills_past_many_due_nearest_vectors`.)
 #[test]
-fn ft_hybrid_knn_past_many_due_nearest_vectors() {
+fn ft_knn_past_most_due_nearest_vectors() {
     for algo in ["FLAT", "HNSW"] {
         let server = Server::start(&[]);
         let mut c = server.conn();
-        vectors(&mut c, "e", algo, 3000, 100, false, false);
+        vectors(&mut c, "e", algo, 3000, 1000, false, false);
+        let want = keys("e", 1000..1010);
         assert_eq!(
-            hybrid_nearest(&mut c, "e", 10),
-            keys("e", 100..110),
-            "{algo}"
+            knn(&mut c, "e", "*=>[KNN 10 @vec $q]"),
+            want,
+            "{algo}: FT.SEARCH"
         );
+        assert_eq!(hybrid_nearest(&mut c, "e", 10), want, "{algo}: FT.HYBRID");
         // Nothing due: the index, as before.
         vectors(&mut c, "f", algo, 3000, 0, false, false);
         assert_eq!(hybrid_nearest(&mut c, "f", 10), keys("f", 0..10), "{algo}");
     }
+}
+
+/// Queries that measure every vector of an HNSW graph while writers add,
+/// overwrite and delete documents in it: the server keeps answering (a
+/// measured pass that took the graph's locks in the other order than an
+/// insert hung it).
+#[test]
+fn ft_knn_measuring_every_vector_beside_writers() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    vectors(&mut c, "w", "HNSW", 3000, 2900, false, false);
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        for _ in 0..3 {
+            scope.spawn(|| {
+                let mut q = server.conn();
+                while !stop.load(Ordering::Relaxed) {
+                    assert_eq!(knn(&mut q, "w", "*=>[KNN 10 @vec $q]").len(), 10);
+                }
+            });
+        }
+        scope.spawn(|| {
+            let mut w = server.conn();
+            let mut i = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                let (fresh, old) = (format!("w:new{i}"), format!("w:{}", 2900 + i % 100));
+                let v = vec2(5000.0 + i as f32, 1.0);
+                for key in [&fresh, &old] {
+                    let hset: [&[u8]; 6] = [b"HSET", key.as_bytes(), b"vec", &v, b"t", b"red"];
+                    cmd_bytes(&mut w, &hset);
+                }
+                if i % 3 == 0 {
+                    w.cmd(&["DEL", &format!("w:new{}", i / 2)]);
+                }
+                i += 1;
+            }
+        });
+        std::thread::sleep(Duration::from_secs(5));
+        stop.store(true, Ordering::Relaxed);
+    });
+    assert_eq!(c.cmd(&["PING"]).s(), "PONG");
 }
 
 /// Each result of an FT.HYBRID over index `v`, by key, with its fields.

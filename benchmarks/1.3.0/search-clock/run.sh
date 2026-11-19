@@ -6,7 +6,7 @@
 #   run.sh <label>=<binary> <label>=<binary> ...
 #
 # Env: DOCS (3000), Q (300 queries measured), KINDS (all five), MODEL (tokio),
-# TTLS ("0 1"; "h90 h99" for the mostly-hidden KNN of #670 item 3).
+# TTLS ("0 1"; "h900 h990 h999" for the mostly-hidden KNN of #670 item 3).
 # Needs valgrind and python3. Prints "kind ttl label instructions-per-query".
 # Instruction counts do not move from run to run on the same binary, so two
 # runs of one binary agree to the digit, and 1% is a real difference.
