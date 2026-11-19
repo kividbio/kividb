@@ -99,6 +99,38 @@ fn len_before(buf: &[u8], end: usize) -> usize {
     }
 }
 
+/// What the walks over a chunk read of a frame: `MIXED` for a chunk that
+/// may hold an element with two-byte lengths, else every length is one
+/// byte and a frame is its element and two, as cheap to step over as the
+/// fixed two-byte lengths were.
+#[inline(always)]
+fn len_fwd<const MIXED: bool>(buf: &[u8], at: usize) -> usize {
+    if MIXED {
+        len_at(buf, at)
+    } else {
+        buf[at] as usize
+    }
+}
+
+#[inline(always)]
+fn len_back<const MIXED: bool>(buf: &[u8], end: usize) -> usize {
+    if MIXED {
+        len_before(buf, end)
+    } else {
+        buf[end - 1] as usize
+    }
+}
+
+#[inline(always)]
+fn hdr_of<const MIXED: bool>(len: usize) -> usize {
+    if MIXED { hdr(len) } else { 1 }
+}
+
+#[inline(always)]
+fn frame_of<const MIXED: bool>(len: usize) -> usize {
+    len + 2 * hdr_of::<MIXED>(len)
+}
+
 /// Write `element`'s frame at `at`; `at + frame_len(element.len()) <=
 /// buf.len()`. An element shorter than [`SHORT`] is framed by one byte of
 /// length on each side, a longer one by two: in front the high bits first,
@@ -129,6 +161,10 @@ struct Chunk {
     start: u32,
     /// Elements held.
     count: u16,
+    /// Whether an element of [`SHORT`] bytes or more has been written since
+    /// the chunk was last empty: the walks over a chunk without one read
+    /// every length as one byte (`len_fwd`).
+    mixed: bool,
 }
 
 /// A copy holds the frames, not the room before them (`COPY` of a queue
@@ -139,6 +175,7 @@ impl Clone for Chunk {
             buf: self.buf[self.start as usize..].to_vec(),
             start: 0,
             count: self.count,
+            mixed: self.mixed,
         }
     }
 }
@@ -196,7 +233,7 @@ impl Chunk {
         self.room_back(need);
         let at = self.buf.len();
         self.buf.resize(at + need, 0);
-        write_frame(&mut self.buf, at, element);
+        self.write(at, element);
         self.count += 1;
     }
 
@@ -277,12 +314,21 @@ impl Chunk {
         }
     }
 
+    /// `element`'s frame at `at`, as [`write_frame`] writes it; a long
+    /// element marks the chunk [`mixed`](Self::mixed).
+    #[inline(always)]
+    fn write(&mut self, at: usize, element: &[u8]) {
+        self.mixed |= element.len() >= SHORT;
+        write_frame(&mut self.buf, at, element);
+    }
+
     /// `next`'s elements after this chunk's: two neighbours that fit in one.
     fn append(&mut self, next: &Chunk) {
         let frames = &next.buf[next.start as usize..];
         self.reserve_back(frames.len());
         self.buf.extend_from_slice(frames);
         self.count += next.count;
+        self.mixed |= next.mixed;
     }
 
     fn push_front(&mut self, element: &[u8]) {
@@ -292,7 +338,7 @@ impl Chunk {
             self.grow_front(growth(need, self.live()));
         }
         let at = self.start as usize - need;
-        write_frame(&mut self.buf, at, element);
+        self.write(at, element);
         self.start = at as u32;
         self.count += 1;
     }
@@ -415,16 +461,31 @@ impl Chunk {
     /// while it says to go on. `false` if it said to stop.
     #[inline]
     fn each_from(&self, i: usize, n: usize, each: &mut impl FnMut(&[u8]) -> bool) -> bool {
+        if self.mixed {
+            self.each_from_in::<true>(i, n, each)
+        } else {
+            self.each_from_in::<false>(i, n, each)
+        }
+    }
+
+    #[inline(always)]
+    fn each_from_in<const MIXED: bool>(
+        &self,
+        i: usize,
+        n: usize,
+        each: &mut impl FnMut(&[u8]) -> bool,
+    ) -> bool {
         let at = if i == 0 {
             self.start as usize
         } else {
-            self.at(i).0
+            self.at_in::<MIXED>(i).0
         };
         let mut frames = &self.buf[at..];
         for _ in 0..n {
-            let len = len_at(frames, 0);
-            let (frame, rest) = frames.split_at(frame_len(len));
-            if !each(&frame[hdr(len)..hdr(len) + len]) {
+            let len = len_fwd::<MIXED>(frames, 0);
+            let h = hdr_of::<MIXED>(len);
+            let (frame, rest) = frames.split_at(len + 2 * h);
+            if !each(&frame[h..h + len]) {
                 return false;
             }
             frames = rest;
@@ -436,17 +497,32 @@ impl Chunk {
     /// while it says to go on. `false` if it said to stop.
     #[inline]
     fn each_back_from(&self, to: usize, n: usize, each: &mut impl FnMut(&[u8]) -> bool) -> bool {
+        if self.mixed {
+            self.each_back_from_in::<true>(to, n, each)
+        } else {
+            self.each_back_from_in::<false>(to, n, each)
+        }
+    }
+
+    #[inline(always)]
+    fn each_back_from_in<const MIXED: bool>(
+        &self,
+        to: usize,
+        n: usize,
+        each: &mut impl FnMut(&[u8]) -> bool,
+    ) -> bool {
         let end = if to == self.count() {
             self.buf.len()
         } else {
-            self.at(to).0
+            self.at_in::<MIXED>(to).0
         };
         let mut frames = &self.buf[self.start as usize..end];
         for _ in 0..n {
             let e = frames.len();
-            let len = len_before(frames, e);
-            let (rest, frame) = frames.split_at(e - frame_len(len));
-            if !each(&frame[hdr(len)..hdr(len) + len]) {
+            let len = len_back::<MIXED>(frames, e);
+            let h = hdr_of::<MIXED>(len);
+            let (rest, frame) = frames.split_at(e - len - 2 * h);
+            if !each(&frame[h..h + len]) {
                 return false;
             }
             frames = rest;
@@ -533,34 +609,49 @@ impl Chunk {
     fn emptied(&mut self) {
         self.buf.clear();
         self.start = 0;
+        self.mixed = false;
     }
 
     /// Where element `i`'s frame begins, and the element's length.
     /// `i < count()`. Stepped to from the nearer end.
     #[inline]
     fn at(&self, i: usize) -> (usize, usize) {
+        if self.mixed {
+            self.at_in::<true>(i)
+        } else {
+            self.at_in::<false>(i)
+        }
+    }
+
+    #[inline(always)]
+    fn at_in<const MIXED: bool>(&self, i: usize) -> (usize, usize) {
         let n = self.count();
         debug_assert!(i < n);
         if i <= n / 2 {
             let mut at = self.start as usize;
             for _ in 0..i {
-                at += frame_len(len_at(&self.buf, at));
+                at += frame_of::<MIXED>(len_fwd::<MIXED>(&self.buf, at));
             }
-            (at, len_at(&self.buf, at))
+            (at, len_fwd::<MIXED>(&self.buf, at))
         } else {
             let mut end = self.buf.len();
             for _ in 0..n - 1 - i {
-                end -= frame_len(len_before(&self.buf, end));
+                end -= frame_of::<MIXED>(len_back::<MIXED>(&self.buf, end));
             }
-            let len = len_before(&self.buf, end);
-            (end - frame_len(len), len)
+            let len = len_back::<MIXED>(&self.buf, end);
+            (end - frame_of::<MIXED>(len), len)
         }
     }
 
     #[inline]
     fn get(&self, i: usize) -> &[u8] {
-        let (at, len) = self.at(i);
-        &self.buf[at + hdr(len)..at + hdr(len) + len]
+        if self.mixed {
+            let (at, len) = self.at_in::<true>(i);
+            &self.buf[at + hdr(len)..at + hdr(len) + len]
+        } else {
+            let (at, len) = self.at_in::<false>(i);
+            &self.buf[at + 1..at + 1 + len]
+        }
     }
 
     /// Make the `old` bytes at `at` into `new` bytes, moving what follows.
@@ -583,7 +674,7 @@ impl Chunk {
     fn set(&mut self, i: usize, element: &[u8]) {
         let (at, len) = self.at(i);
         self.resize_at(at, frame_len(len), frame_len(element.len()));
-        write_frame(&mut self.buf, at, element);
+        self.write(at, element);
     }
 
     /// Put `element` before element `i`; after the last when `i ==
@@ -598,7 +689,7 @@ impl Chunk {
         }
         let (at, _) = self.at(i);
         self.resize_at(at, 0, frame_len(element.len()));
-        write_frame(&mut self.buf, at, element);
+        self.write(at, element);
         self.count += 1;
     }
 
@@ -625,6 +716,7 @@ impl Chunk {
             buf: self.buf[at..].to_vec(),
             start: 0,
             count: self.count - i as u16,
+            mixed: self.mixed,
         };
         self.buf.truncate(at);
         self.count = i as u16;
@@ -966,6 +1058,7 @@ impl PackedList {
             buf: Vec::with_capacity(bytes),
             start: 0,
             count: 0,
+            mixed: false,
         });
     }
 
@@ -980,6 +1073,7 @@ impl PackedList {
             buf: vec![0; bytes],
             start: bytes as u32,
             count: 0,
+            mixed: false,
         });
         m.inserted(0);
     }
@@ -1826,6 +1920,8 @@ pub struct Builder {
     /// The frames of the chunk being filled.
     frames: Vec<u8>,
     count: u16,
+    /// Whether one of them has two-byte lengths (`Chunk::mixed`).
+    mixed: bool,
 }
 
 impl Builder {
@@ -1843,6 +1939,7 @@ impl Builder {
         let at = self.frames.len();
         self.frames.resize(at + frame_len(element.len()), 0);
         write_frame(&mut self.frames, at, element);
+        self.mixed |= element.len() >= SHORT;
         self.count += 1;
         if self.count as usize == CHUNK_ENTRIES {
             self.close_chunk();
@@ -1858,7 +1955,9 @@ impl Builder {
             buf: self.frames.as_slice().to_vec(),
             start: 0,
             count: self.count,
+            mixed: self.mixed,
         });
+        self.mixed = false;
         self.len += self.count as usize;
         self.frames.clear();
         self.count = 0;
