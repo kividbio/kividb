@@ -74,6 +74,9 @@ pub struct Activity {
     /// once, and not shown), and what is queued for a subscriber.
     reply_output: AtomicU64,
     pubsub_output: AtomicU64,
+    /// What is queued for the connection as a `MONITOR` and not yet
+    /// written, as Redis counts a monitor's backlog in its `omem`.
+    monitor_output: AtomicU64,
     /// What a subscriber's writer keeps between batches (its batch and
     /// frame buffers, #851): memory the client holds, not output waiting,
     /// so it is in `tot-mem` and `mem_clients_normal` and not in `omem`.
@@ -369,7 +372,14 @@ impl Activity {
 
     /// What is waiting to be written to the connection: `omem`.
     pub fn output(&self) -> u64 {
-        self.reply_output.load(Ordering::Relaxed) + self.pubsub_output.load(Ordering::Relaxed)
+        self.reply_output.load(Ordering::Relaxed)
+            + self.pubsub_output.load(Ordering::Relaxed)
+            + self.monitor_output.load(Ordering::Relaxed)
+    }
+
+    /// See [`Activity::monitor_output`].
+    pub fn set_monitor_output(&self, bytes: usize) {
+        self.monitor_output.store(bytes as u64, Ordering::Relaxed);
     }
 
     /// See [`Activity::pubsub_kept`].
