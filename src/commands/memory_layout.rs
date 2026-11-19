@@ -256,23 +256,28 @@ mod tests {
     #[test]
     fn a_set_is_what_it_allocates() {
         with_own_counter("a_set_is_what_it_allocates", || {
-            for members in [1usize, 7, 8, 64, 65, 1000] {
-                let (set, bytes) = allocated(|| {
-                    let mut set = MemberSet::new();
-                    for i in 0..members {
-                        set.insert_bytes(format!("member:{i}").as_bytes());
-                    }
-                    set
-                });
-                // A block (up to 128 members) is the one allocation; a
-                // table's members are blocks of their own.
-                let estimate = set.compact_bytes().unwrap_or_else(|| {
-                    set.allocation_size()
-                        + sampled(set.len(), usize::MAX, || {
-                            set.iter().map(|m| arc_slice(m.len()))
-                        })
-                });
-                assert_eq!(estimate, bytes, "{members} members");
+            for members in [1usize, 7, 8, 64, 65, 129, 1000, 5000] {
+                for ints in [false, true] {
+                    let (set, bytes) = allocated(|| {
+                        let mut set = MemberSet::new();
+                        for i in 0..members {
+                            if ints {
+                                set.insert_bytes(i.to_string().as_bytes());
+                            } else {
+                                set.insert_bytes(format!("member:{i}").as_bytes());
+                            }
+                        }
+                        set
+                    });
+                    // A block (up to 128 members) or an array is the one
+                    // allocation; a table (#764) counts its groups and its
+                    // members' entries, mid-resize too.
+                    assert_eq!(
+                        set.allocation_size(),
+                        bytes,
+                        "{members} members, integers {ints}"
+                    );
+                }
             }
         });
     }

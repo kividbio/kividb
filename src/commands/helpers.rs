@@ -732,7 +732,15 @@ pub fn spawn_active_expire_task(
             let mut wait = Duration::from_millis(100);
             let mut shrunk_at = std::time::Instant::now();
             loop {
-                std::thread::sleep(wait);
+                // The first thread also finishes the resizes of large sets
+                // that their writes left part-way (#764), in the time it
+                // would sleep, whatever stops the expiry below: a replica's
+                // and a paused server's sets resize too.
+                if part == 0 {
+                    sleep_finishing_resizes(wait);
+                } else {
+                    std::thread::sleep(wait);
+                }
                 // Nothing expires while writes are paused, as in Redis: the
                 // keys and fields that come due meanwhile go once the pause
                 // is over. Nor while a dataset is being loaded: the load
@@ -773,6 +781,36 @@ pub fn spawn_active_expire_task(
                 crate::field_expiry::sweep(&store, &index_store);
             }
         });
+    }
+}
+
+/// Of each [`RESIZE_SLICE`] of an expiry thread's sleep, the time it works
+/// on the large sets handed to the background (`member_set::after_write`).
+const RESIZE_WORK: Duration = Duration::from_millis(1);
+const RESIZE_SLICE: Duration = Duration::from_millis(2);
+
+/// Sleep for `wait`, working on the large sets' resizes meanwhile, if any
+/// are waiting: [`RESIZE_WORK`] of every [`RESIZE_SLICE`], a step at a time
+/// under each set's lock (`member_set::step_background`), so that no
+/// writer of a set waits on it for longer than a step, and the thread
+/// gets back to expiring when it would have.
+fn sleep_finishing_resizes(wait: Duration) {
+    let until = std::time::Instant::now() + wait;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= until {
+            return;
+        }
+        if !crate::member_set::background_pending() {
+            std::thread::sleep(until - now);
+            return;
+        }
+        crate::member_set::step_background(RESIZE_WORK);
+        let now = std::time::Instant::now();
+        if now >= until {
+            return;
+        }
+        std::thread::sleep((RESIZE_SLICE - RESIZE_WORK).min(until - now));
     }
 }
 

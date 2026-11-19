@@ -157,23 +157,12 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }
 
         ValueRef::Set(arc) => {
-            let inner = arc.read();
-            // An array of integers or a block of members (#297) is one
-            // allocation, counted as allocated, room to spare included.
-            if let Some(compact) = inner.compact_bytes() {
-                entry() + layout::arc_of::<RwLock<MemberSet>>() + compact
-            } else {
-                // The table's one allocation is known from its buckets; each
-                // member is a block of its own, sampled as Redis samples
-                // them: the first members the table holds, which are in no
-                // order of their own. Spreading the sample over the table
-                // walked all of it, as a hash table's iterator skips ahead
-                // one bucket at a time.
-                let members = layout::sampled(inner.len(), samples, || {
-                    inner.iter().map(|m| layout::arc_slice(m.len()))
-                });
-                entry() + layout::arc_of::<RwLock<MemberSet>>() + inner.allocation_size() + members
-            }
+            // Exact in every form, and in O(1), whatever SAMPLES says: an
+            // array of integers or a block of members (#297) is one
+            // allocation, counted as allocated, room to spare included; the
+            // table (#764) counts its groups and its members' entries as it
+            // makes them, at their pool class's size.
+            entry() + layout::arc_of::<RwLock<MemberSet>>() + arc.read().allocation_size()
         }
 
         ValueRef::SortedSet(arc) => {

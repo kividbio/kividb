@@ -2,7 +2,7 @@ use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{lazy_expire_on_read, parse_utf8};
 use crate::commands::set_card::{collect_set, diff_each, inter_each, sets_at, union_of};
 use crate::keyspace_events::{KS_SET, notify};
-use crate::member_set::MemberSet;
+use crate::member_set::{MemberSet, after_write};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
@@ -96,7 +96,7 @@ fn store_set(ctx: &mut Ctx, dst_key: &[u8], set: MemberSet) {
     let shard = store::get_shard(db_ref, dst_key);
     let replaced = write_lock!(shard).insert_expiring(
         dst_key,
-        KiviDBValue::Set(Arc::new(RwLock::new(set))),
+        KiviDBValue::Set(crate::member_set::shared(set)),
         None,
     );
     drop(replaced);
@@ -131,8 +131,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     .count() as i64
             };
             let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
+            // A resize the adds leave in progress is the background's to
+            // finish (`member_set::after_write`).
+            let insert_into = |s: &Arc<RwLock<MemberSet>>| {
+                let mut inner = s.write();
+                let added = insert(&mut inner);
+                after_write(s, &mut inner);
+                added
+            };
             let found = match read_lock!(shard).get(key) {
-                Some(ValueRef::Set(s)) => Some(insert(&mut s.write())),
+                Some(ValueRef::Set(s)) => Some(insert_into(s)),
                 Some(_) => {
                     return Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -146,7 +154,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let mut map = write_lock!(shard);
                     // Looked for again: it may have been made since.
                     match map.get(key) {
-                        Some(ValueRef::Set(s)) => insert(&mut s.write()),
+                        Some(ValueRef::Set(s)) => insert_into(s),
                         Some(_) => {
                             return Some(resp_error(
                                 "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -155,7 +163,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         None => {
                             let mut set = crate::member_set::MemberSet::new();
                             let added = insert(&mut set);
-                            map.insert(key, KiviDBValue::Set(Arc::new(RwLock::new(set))));
+                            map.insert(key, KiviDBValue::Set(crate::member_set::shared(set)));
                             added
                         }
                     }
@@ -335,6 +343,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             removed += 1;
                         }
                     }
+                    after_write(s, &mut inner);
                     drop(inner);
                     crate::stats::record_hit();
                     if removed > 0 {
@@ -399,6 +408,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             break;
                         }
                     }
+                    after_write(s, &mut inner);
                     drop(inner);
                     if popped.is_empty() {
                         crate::stats::record_miss();
@@ -503,7 +513,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let src_key: Vec<u8> = cmd[1].to_vec();
             let dst_key: Vec<u8> = cmd[2].to_vec();
-            let member: Arc<[u8]> = Arc::from(cmd[3]);
+            let member: &[u8] = cmd[3];
             let db = *ctx.selected_db;
             let db_ref = &ctx.store[db];
             const WRONGTYPE: &str =
@@ -527,22 +537,35 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             if src_key == dst_key {
                 // Moving it to where it is: it is there or it is not.
-                return Some(resp_integer(source.read().contains(member.as_ref()) as i64));
+                return Some(resp_integer(source.read().contains(member) as i64));
             }
-            if !source.write().remove(member.as_ref()) {
-                crate::stats::record_miss();
-                return Some(resp_integer(0));
+            {
+                let mut inner = source.write();
+                let removed = inner.remove(member);
+                after_write(&source, &mut inner);
+                if !removed {
+                    crate::stats::record_miss();
+                    return Some(resp_integer(0));
+                }
             }
 
             let added = {
                 let shard = store::get_shard(db_ref, &dst_key);
                 let mut map = write_lock!(shard);
                 match map.get(dst_key.as_slice()) {
-                    Some(ValueRef::Set(s)) => s.write().insert(Arc::clone(&member)),
+                    Some(ValueRef::Set(s)) => {
+                        let mut inner = s.write();
+                        let added = inner.insert_bytes(member);
+                        after_write(s, &mut inner);
+                        added
+                    }
                     _ => {
                         let mut new_set = crate::member_set::MemberSet::new();
-                        new_set.insert(Arc::clone(&member));
-                        map.insert(&*dst_key, KiviDBValue::Set(Arc::new(RwLock::new(new_set))));
+                        new_set.insert_bytes(member);
+                        map.insert(
+                            &*dst_key,
+                            KiviDBValue::Set(crate::member_set::shared(new_set)),
+                        );
                         true
                     }
                 }
@@ -779,13 +802,30 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         Ok(options) => options,
                         Err(e) => return Some(e),
                     };
+                    let pattern = options
+                        .pattern
+                        .as_deref()
+                        .map(crate::commands::glob_redis::Glob::new);
+                    let inner = s.read();
+                    // A table (#764) gives the cursor itself: a page reads
+                    // its own groups, and `COUNT` is the hint it is in Redis
+                    // (#770). A cursor from the scan of the earlier form
+                    // goes on from that position and ends.
+                    if let Some(table) = inner.table() {
+                        crate::stats::record_hit();
+                        return Some(crate::commands::table_scan::sscan_reply(
+                            table,
+                            cursor,
+                            options.count,
+                            pattern.as_ref(),
+                        ));
+                    }
                     // A set Redis would encode compactly comes back whole.
                     let (cursor, count) = if crate::commands::generics::scans_whole(value) {
                         (0, usize::MAX)
                     } else {
                         (cursor, options.count)
                     };
-                    let inner = s.read();
                     // In the order of the members' positions: see
                     // `helpers::scan_position`.
                     let (page, next_cursor) = crate::commands::helpers::scan_page(
@@ -796,10 +836,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         inner.len(),
                         1024,
                     );
-                    let pattern = options
-                        .pattern
-                        .as_deref()
-                        .map(crate::commands::glob_redis::Glob::new);
                     let items: Vec<Vec<u8>> = page
                         .into_iter()
                         .filter(|m| pattern.as_ref().is_none_or(|glob| glob.matches(m)))

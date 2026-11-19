@@ -151,9 +151,7 @@ pub(super) fn read_dragonfly_value(
             if set.is_empty() {
                 return Ok(None);
             }
-            Ok(Some(KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(
-                set,
-            )))))
+            Ok(Some(KiviDBValue::Set(crate::member_set::shared(set))))
         }
         33 | 34 => Err(dragonfly_only(named(), "a Bloom filter", type_id)),
         35 => Err(dragonfly_only(named(), "a count-min sketch", type_id)),

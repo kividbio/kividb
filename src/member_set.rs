@@ -10,12 +10,14 @@
 //! - **Packed.** A set of no more than `set-max-listpack-entries` members,
 //!   none longer than `set-max-listpack-value` bytes, is one block holding
 //!   the members end to end ([`PackedSet`]): a lookup scans a byte a member.
-//! - **Table.** Any other set is a hash table of shared members (`Arc`),
-//!   held directly so that a bucket can be asked for by its number: a
-//!   random member is a random bucket, tried again while it is empty, as
-//!   Redis picks one. A table is never less than a quarter full for long (it
-//!   is shrunk below that: see [`MemberSet::remove`]), so that is a handful
-//!   of tries.
+//! - **Table.** Any other set is a [`CollectionTable`] (#764): each member
+//!   one block of the entry pool, or none at all for a member of up to
+//!   seven bytes, which lives in its slot. It gives `SSCAN` its cursor
+//!   (`table_scan`), a uniformly random member in O(1), and grows and
+//!   shrinks a few members at a time, so no write pays for moving them all.
+//!   A resize that the writes leave unfinished is finished by the
+//!   background ([`after_write`]), and the array a finished one leaves is
+//!   freed there too.
 //!
 //! A set moves from the array to the block, or to the table, when a member
 //! does not fit where it is, and from the block to the table; never back,
@@ -24,11 +26,12 @@
 //! see members as bytes whatever the form: none of them changes.
 
 use std::ops::{ControlFlow, Deref};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
-use hashbrown::HashTable;
+use parking_lot::{Mutex, RwLock};
 
+use crate::collection_table::{CollectionTable, INLINE_MEMBER, MemberIter, MemberRef, Members};
 use crate::packed_set::{self, PackedSet};
 
 /// `set-max-intset-entries` until `CONFIG SET` or the configuration file
@@ -238,21 +241,33 @@ fn int_text_len(n: i64) -> usize {
     digits + (n < 0) as usize
 }
 
-/// A member, as a set hands it out: the table's shared bytes, a block's
-/// bytes, or an array's integer as text. Either is its bytes (`Deref`).
+/// A member, as a collection hands it out: shared bytes (a sorted set's),
+/// borrowed bytes (a block's, or a table entry's), a table's member of up
+/// to seven bytes copied out of its slot, or an array's integer as text.
+/// Each is its bytes (`Deref`).
 pub enum Member<'a> {
     Shared(&'a Arc<[u8]>),
     Bytes(&'a [u8]),
+    Inline([u8; INLINE_MEMBER], u8),
     Int(IntText),
 }
 
 impl Member<'_> {
-    /// The member as shared bytes: the table's own, or a new copy.
+    /// The member as shared bytes: the sorted set's own, or a new copy.
     pub fn to_shared(&self) -> Arc<[u8]> {
         match self {
             Member::Shared(bytes) => Arc::clone(bytes),
-            Member::Bytes(bytes) => Arc::from(*bytes),
-            Member::Int(text) => Arc::from(text.as_bytes()),
+            _ => Arc::from(&**self),
+        }
+    }
+}
+
+impl<'a> From<MemberRef<'a>> for Member<'a> {
+    #[inline]
+    fn from(member: MemberRef<'a>) -> Self {
+        match member {
+            MemberRef::Bytes(bytes) => Member::Bytes(bytes),
+            MemberRef::Inline(bytes, len) => Member::Inline(bytes, len),
         }
     }
 }
@@ -264,6 +279,7 @@ impl Deref for Member<'_> {
         match self {
             Member::Shared(bytes) => bytes,
             Member::Bytes(bytes) => bytes,
+            Member::Inline(bytes, len) => &bytes[..usize::from(*len)],
             Member::Int(text) => text.as_bytes(),
         }
     }
@@ -281,24 +297,23 @@ impl std::fmt::Debug for Member<'_> {
     }
 }
 
-/// A set of byte strings. Each member of the table is shared (`Arc`), as the
-/// commands that copy members between sets and into replies want it.
+/// A set of byte strings.
 #[derive(Clone)]
 pub struct MemberSet {
     repr: Repr,
 }
 
-// Kept inline in every set's shared block: no bigger than the table alone
-// was, so that sets kept as the table do not grow.
+// Kept inline in every set's shared block: no bigger than it was before the
+// table (#764), so that no set grows. The table's header (80 bytes) is
+// boxed: one block a large set.
 const _: () = assert!(std::mem::size_of::<MemberSet>() <= 64);
 
-/// Two levels, so that the table's one spare value of its own (a null
-/// pointer) can tell it from the other two, and a set is no bigger than the
-/// table alone.
+/// Two levels, so that the box's one spare value of its own (a null
+/// pointer) can tell it from the other two.
 #[derive(Clone)]
 enum Repr {
     Small(Small),
-    Table(Table),
+    Table(Box<Table>),
 }
 
 #[derive(Clone)]
@@ -394,17 +409,17 @@ impl MemberSet {
         }
         let mut table = Table::with_capacity(n);
         for m in members {
-            table.insert(m);
+            table.insert(&m);
         }
         // Repeats taken out, few enough for a block after all.
-        let len = table.table.len();
+        let len = table.members.len();
         if len < n
             && len <= packed_entries()
-            && table.table.iter().all(|m| m.len() <= packed_value())
+            && table.members.iter().all(|m| m.len() <= packed_value())
         {
             let mut block = PackedSet::new();
-            for m in table.table.iter() {
-                block.push(m);
+            for m in table.members.iter() {
+                block.push(&m);
             }
             return Self {
                 repr: Repr::Small(Small::Packed(block)),
@@ -413,6 +428,43 @@ impl MemberSet {
         Self {
             repr: Repr::Table(table),
         }
+    }
+
+    /// An empty table with room for `members`, however few: for a set to be
+    /// filled with an unknown number of members that may be many, then put
+    /// in the form it needs ([`Self::into_fitting`]).
+    pub fn new_table(members: usize) -> Self {
+        Self {
+            repr: Repr::Table(Table::with_capacity(members)),
+        }
+    }
+
+    /// A table that a block or an array would hold, made that (as
+    /// [`Self::from_shared`] chooses); any other set as it is.
+    pub fn into_fitting(self) -> Self {
+        let Repr::Table(t) = &self.repr else {
+            return self;
+        };
+        let n = t.members.len();
+        if n <= intset_max() {
+            let numbers: Option<Vec<i64>> = t.members.iter().map(|m| canonical_i64(&m)).collect();
+            if let Some(mut numbers) = numbers {
+                numbers.sort_unstable();
+                return Self {
+                    repr: Repr::Small(Small::Ints(Ints::from_sorted(&numbers), 0)),
+                };
+            }
+        }
+        if n <= packed_entries() && t.members.iter().all(|m| m.len() <= packed_value()) {
+            let mut block = PackedSet::new();
+            for m in t.members.iter() {
+                block.push(&m);
+            }
+            return Self {
+                repr: Repr::Small(Small::Packed(block)),
+            };
+        }
+        self
     }
 
     /// What the set is kept as (`OBJECT ENCODING`).
@@ -447,8 +499,7 @@ impl MemberSet {
     }
 
     /// What an array or a block has allocated, room to spare included: the
-    /// whole of the set's memory but its own header. `None` for the table,
-    /// whose members are blocks of their own. For `MEMORY USAGE`.
+    /// whole of the set's memory but its own header. `None` for the table.
     pub fn compact_bytes(&self) -> Option<usize> {
         match &self.repr {
             Repr::Small(Small::Ints(ints, _)) => Some(each_width!(ints, v => allocated(v))),
@@ -462,24 +513,22 @@ impl MemberSet {
     /// member.
     pub fn free_effort(&self) -> usize {
         match &self.repr {
-            Repr::Table(t) => t.table.len(),
+            Repr::Table(t) => t.members.len(),
             _ => 1,
         }
     }
 
-    /// Bytes that freeing the set gives back, at least (for eviction): an
-    /// array's or a block's, exactly; a table's, `per_member` a member.
-    pub fn freeing_at_least(&self, per_member: usize) -> usize {
-        match &self.repr {
-            Repr::Table(t) => t.table.len() * per_member,
-            _ => self.allocation_size(),
-        }
+    /// Bytes that freeing the set gives back, at least (for eviction):
+    /// exactly what it holds, in every form (`per_member` is kept for the
+    /// callers that pass one for every type).
+    pub fn freeing_at_least(&self, _per_member: usize) -> usize {
+        self.allocation_size()
     }
 
     #[inline]
     pub fn len(&self) -> usize {
         match &self.repr {
-            Repr::Table(t) => t.table.len(),
+            Repr::Table(t) => t.members.len(),
             Repr::Small(Small::Packed(block)) => block.len(),
             Repr::Small(Small::Ints(ints, _)) => ints.len(),
         }
@@ -493,18 +542,20 @@ impl MemberSet {
     /// Members there is room for without growing.
     pub fn capacity(&self) -> usize {
         match &self.repr {
-            Repr::Table(t) => t.table.capacity(),
+            Repr::Table(t) => t.members.capacity(),
             Repr::Small(Small::Packed(block)) => block.len(),
             Repr::Small(Small::Ints(ints, _)) => ints.capacity(),
         }
     }
 
-    /// The bytes of the table's one allocation (buckets and control bytes),
-    /// from its bucket count: no walk. The members' own blocks are not in
-    /// it. For an array or a block, what it has allocated: all of it.
+    /// Everything the set holds but its own header, exactly as `used_memory`
+    /// counts it, in O(1): for the table its box, group arrays, overflow
+    /// groups and members' entries at their pool class's size
+    /// ([`CollectionTable::allocation_size`]); for an array or a block, what
+    /// it has allocated, room to spare included. For `MEMORY USAGE`.
     pub fn allocation_size(&self) -> usize {
         match &self.repr {
-            Repr::Table(t) => t.table.allocation_size(),
+            Repr::Table(t) => std::mem::size_of::<Table>() + t.members.allocation_size(),
             Repr::Small(Small::Packed(block)) => block.allocation_size(),
             Repr::Small(Small::Ints(ints, _)) => each_width!(ints, v => allocated(v)),
         }
@@ -513,7 +564,7 @@ impl MemberSet {
     #[inline]
     pub fn contains(&self, member: &[u8]) -> bool {
         match &self.repr {
-            Repr::Table(t) => t.get(member).is_some(),
+            Repr::Table(t) => t.members.contains(member),
             Repr::Small(Small::Packed(block)) => block.contains(member),
             Repr::Small(Small::Ints(ints, _)) => {
                 canonical_i64(member).is_some_and(|n| ints.find(n).is_ok())
@@ -527,7 +578,7 @@ impl MemberSet {
     #[inline]
     pub fn contains_member(&self, member: &Member<'_>) -> bool {
         match &self.repr {
-            Repr::Table(t) => t.get(member).is_some(),
+            Repr::Table(t) => t.members.contains(member),
             Repr::Small(Small::Packed(block)) => block.contains(member),
             Repr::Small(Small::Ints(ints, _)) => match member {
                 Member::Int(n) => ints.find(n.value()).is_ok(),
@@ -539,7 +590,7 @@ impl MemberSet {
     #[inline]
     pub fn get(&self, member: &[u8]) -> Option<Member<'_>> {
         match &self.repr {
-            Repr::Table(t) => t.get(member).map(Member::Shared),
+            Repr::Table(t) => t.members.get(member).map(Member::from),
             Repr::Small(Small::Packed(block)) => {
                 block.find(member).map(|i| Member::Bytes(block.get(i)))
             }
@@ -552,34 +603,26 @@ impl MemberSet {
 
     /// Adds `member`. False if it was there already.
     pub fn insert(&mut self, member: Arc<[u8]>) -> bool {
-        match &mut self.repr {
-            Repr::Table(t) => t.insert(member),
-            _ => self.insert_compact(&member, Some(&member)),
-        }
+        self.insert_bytes(&member)
     }
 
-    /// Adds `member`, making the shared copy of it only if the table needs
-    /// one. False if it was there already.
+    /// Adds `member`, copying its bytes in. False if it was there already.
     #[inline]
     pub fn insert_bytes(&mut self, member: &[u8]) -> bool {
         match &mut self.repr {
-            Repr::Table(t) => t.insert_bytes(member),
-            _ => self.insert_compact(member, None),
+            Repr::Table(t) => t.insert(member),
+            _ => self.insert_compact(member),
         }
     }
 
-    /// Adds a member of another set: a table's shared as it is.
+    /// Adds a member of another set.
     #[inline]
     pub fn insert_member(&mut self, member: &Member<'_>) -> bool {
-        match member {
-            Member::Shared(shared) => self.insert(Arc::clone(shared)),
-            _ => self.insert_bytes(member),
-        }
+        self.insert_bytes(member)
     }
 
-    /// The insert of an array or a block; `shared` is the member as shared
-    /// bytes when the caller has them, for a table to keep.
-    fn insert_compact(&mut self, member: &[u8], shared: Option<&Arc<[u8]>>) -> bool {
+    /// The insert of an array or a block.
+    fn insert_compact(&mut self, member: &[u8]) -> bool {
         match &mut self.repr {
             Repr::Small(Small::Packed(block)) => {
                 if block.find(member).is_some() {
@@ -623,7 +666,7 @@ impl MemberSet {
                     return true;
                 }
                 let mut table = Table::with_capacity(want);
-                ints.each(|n| table.push_new(Arc::from(IntText::new(n).as_bytes())));
+                ints.each(|n| table.push_new(IntText::new(n).as_bytes()));
                 self.repr = Repr::Table(table);
             }
             Repr::Table(_) => unreachable!("a table inserts by itself"),
@@ -631,10 +674,7 @@ impl MemberSet {
         let Repr::Table(table) = &mut self.repr else {
             unreachable!()
         };
-        table.push_new(match shared {
-            Some(shared) => Arc::clone(shared),
-            None => Arc::from(member),
-        });
+        table.push_new(member);
         true
     }
 
@@ -645,7 +685,7 @@ impl MemberSet {
         };
         let mut table = Table::with_capacity(block.len() + more);
         for m in block.iter() {
-            table.push_new(Arc::from(m));
+            table.push_new(m);
         }
         self.repr = Repr::Table(table);
     }
@@ -654,7 +694,7 @@ impl MemberSet {
     #[inline]
     pub fn remove(&mut self, member: &[u8]) -> bool {
         match &mut self.repr {
-            Repr::Table(t) => t.take(member).is_some(),
+            Repr::Table(t) => t.members.remove(member),
             Repr::Small(Small::Packed(block)) => block.remove(member),
             Repr::Small(Small::Ints(ints, _)) => {
                 match canonical_i64(member).map(|n| ints.find(n)) {
@@ -671,7 +711,7 @@ impl MemberSet {
     /// Removes `member` and hands it back.
     pub fn take(&mut self, member: &[u8]) -> Option<Arc<[u8]>> {
         match &mut self.repr {
-            Repr::Table(t) => t.take(member),
+            Repr::Table(t) => t.members.remove_with(member, |m| Arc::from(&*m)),
             Repr::Small(Small::Packed(block)) => {
                 let at = block.find(member)?;
                 block.remove_at(at);
@@ -688,7 +728,7 @@ impl MemberSet {
 
     pub fn clear(&mut self) {
         match &mut self.repr {
-            Repr::Table(t) => t.table.clear(),
+            Repr::Table(t) => t.members.clear(),
             Repr::Small(Small::Packed(block)) => block.clear(),
             Repr::Small(Small::Ints(ints, _)) => *ints = Ints::W16(Vec::new()),
         }
@@ -698,17 +738,14 @@ impl MemberSet {
         // An array or a block grows as it is added to: it may never need
         // the room.
         if let Repr::Table(t) = &mut self.repr {
-            let hasher = &t.hasher;
-            t.table.reserve(more, |have| hasher.hash_one(&**have));
+            t.members.reserve(more);
         }
     }
 
     pub fn retain(&mut self, mut keep: impl FnMut(&[u8]) -> bool) {
         match &mut self.repr {
-            Repr::Table(t) => {
-                t.table.retain(|have| keep(have));
-                t.shrink_if_sparse();
-            }
+            // A table shrinks as it empties, a few members a write.
+            Repr::Table(t) => t.members.retain(keep),
             Repr::Small(Small::Packed(block)) => block.retain(keep),
             Repr::Small(Small::Ints(ints, _)) => ints.retain(|n| keep(IntText::new(n).as_bytes())),
         }
@@ -719,7 +756,7 @@ impl MemberSet {
     #[inline]
     pub fn for_each(&self, mut f: impl FnMut(&[u8])) {
         match &self.repr {
-            Repr::Table(t) => t.table.iter().for_each(|m| f(m)),
+            Repr::Table(t) => t.members.iter().for_each(|m| f(&m)),
             Repr::Small(Small::Packed(block)) => block.iter().for_each(f),
             Repr::Small(Small::Ints(ints, _)) => {
                 each_width!(ints, v => v.iter().for_each(|&n| f(IntText::new(wide(n)).as_bytes())))
@@ -728,13 +765,13 @@ impl MemberSet {
     }
 
     /// Every member, until `f` says to stop. The form is looked at once,
-    /// outside the loop: over a table this is the loop over its `Arc`s.
+    /// outside the loop: over a table this is the loop over its slots.
     #[inline]
     pub fn try_each<B>(&self, mut f: impl FnMut(Member<'_>) -> ControlFlow<B>) -> ControlFlow<B> {
         match &self.repr {
             Repr::Table(t) => {
-                for m in t.table.iter() {
-                    f(Member::Shared(m))?;
+                for m in t.members.iter() {
+                    f(Member::from(m))?;
                 }
             }
             Repr::Small(Small::Packed(block)) => {
@@ -805,17 +842,14 @@ impl MemberSet {
             Repr::Small(Small::Ints(Ints::W32(v), _)) => Iter::W32(v.iter()),
             Repr::Small(Small::Ints(Ints::W64(v), _)) => Iter::W64(v.iter()),
             Repr::Small(Small::Packed(block)) => Iter::Packed(block.iter()),
-            Repr::Table(t) => Iter::Table(t.table.iter()),
+            Repr::Table(t) => Iter::Table(t.members.iter()),
         }
     }
 
     /// A member, any one as likely as another.
     pub fn random(&self, rng: &mut impl rand::Rng) -> Option<Member<'_>> {
         match &self.repr {
-            Repr::Table(t) => t
-                .table
-                .get_bucket(t.random_bucket(rng)?)
-                .map(Member::Shared),
+            Repr::Table(t) => t.members.random(rng).map(Member::from),
             Repr::Small(Small::Packed(block)) if block.is_empty() => None,
             Repr::Small(Small::Packed(block)) => {
                 Some(Member::Bytes(block.get(rng.gen_range(0..block.len()))))
@@ -843,13 +877,11 @@ impl MemberSet {
         f: impl FnOnce(Member<'_>),
     ) -> bool {
         match &mut self.repr {
-            Repr::Table(t) => match t.pop_random(rng) {
-                Some(member) => {
-                    f(Member::Shared(&member));
-                    true
-                }
-                None => false,
-            },
+            // One pick, shown to `f` on its way out: nothing copied.
+            Repr::Table(t) => t
+                .members
+                .remove_random(rng, |member| f(Member::from(member)))
+                .is_some(),
             Repr::Small(Small::Packed(block)) => {
                 if block.is_empty() {
                     return false;
@@ -873,10 +905,11 @@ impl MemberSet {
     /// Up to `count` different members, chosen at random, without removing
     /// them.
     ///
-    /// A few of many are picked one at a time, picking again when one comes
-    /// up twice. Most of them, or all, are found by walking the table once,
-    /// which is then no more work than the answer is long. A block or an
-    /// array is asked for the chosen places only.
+    /// A few of many (no more than a third) are picked one at a time,
+    /// picking again when one comes up twice: O(count). More of them are
+    /// chosen in one walk of the table (`choose_multiple`): O(len), which is
+    /// then no more than three times the answer. A block or an array is
+    /// asked for the chosen places only.
     pub fn random_distinct(&self, count: usize, rng: &mut impl rand::Rng) -> Vec<Member<'_>> {
         use rand::seq::IteratorRandom;
         let len = self.len();
@@ -899,20 +932,220 @@ impl MemberSet {
             Repr::Table(t) if count * 3 <= len => t,
             _ => return self.iter().choose_multiple(rng, count),
         };
-        let mut seen: ahash::AHashSet<usize> = ahash::AHashSet::with_capacity(count);
+        // Each member is told apart by where it is: an entry by its address,
+        // a member in its slot by its bytes (it has no other copy).
+        let mut seen: ahash::AHashSet<(usize, u64)> = ahash::AHashSet::with_capacity(count);
         let mut picked = Vec::with_capacity(count);
         while picked.len() < count {
-            let Some(at) = t.random_bucket(rng) else {
+            let Some(member) = t.members.random(rng) else {
                 break;
             };
-            if seen.insert(at)
-                && let Some(member) = t.table.get_bucket(at)
-            {
-                picked.push(Member::Shared(member));
+            let identity = match member {
+                MemberRef::Bytes(bytes) => (bytes.as_ptr() as usize, 0),
+                MemberRef::Inline(bytes, len) => {
+                    let mut word = [0u8; 8];
+                    word[..INLINE_MEMBER].copy_from_slice(&bytes);
+                    word[INLINE_MEMBER] = len;
+                    (0, u64::from_le_bytes(word))
+                }
+            };
+            if seen.insert(identity) {
+                picked.push(Member::from(member));
             }
         }
         picked
     }
+
+    /// The table, for `SSCAN`'s cursor (`table_scan`); `None` for an array
+    /// or a block, which `SSCAN` returns whole.
+    #[inline]
+    pub fn table(&self) -> Option<&CollectionTable<Members>> {
+        match &self.repr {
+            Repr::Table(t) => Some(&t.members),
+            Repr::Small(_) => None,
+        }
+    }
+
+    /// Whether the background has work on this set (a resize to finish, or
+    /// a finished one's array to free) that it has not been handed yet; if
+    /// so, it is now marked handed.
+    #[inline]
+    fn hand_over(&mut self) -> bool {
+        match &mut self.repr {
+            Repr::Table(t) if !t.queued => {
+                let due = t.members.resizing() || t.members.holds_retired();
+                t.queued = due;
+                due
+            }
+            _ => false,
+        }
+    }
+
+    /// One step of the background's work on the set: about `budget` units
+    /// of a resize in progress. Returns whether the set has no more for it,
+    /// and the array a finished resize left, to be freed elsewhere.
+    fn background_step(
+        &mut self,
+        budget: usize,
+    ) -> (bool, Option<crate::collection_table::Retired>) {
+        let Repr::Table(t) = &mut self.repr else {
+            return (true, None);
+        };
+        let finished = t.members.step_resize(budget);
+        let retired = t.members.take_retired();
+        if finished {
+            t.queued = false;
+        }
+        (finished, retired)
+    }
+
+    /// Whether the set is handed to the background (tests).
+    #[cfg(test)]
+    pub(crate) fn is_queued(&self) -> bool {
+        matches!(&self.repr, Repr::Table(t) if t.queued)
+    }
+
+    /// Finish whatever resize is in progress now, and free what it leaves
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn finish_resize(&mut self) {
+        while !self.background_step(usize::MAX).0 {}
+    }
+}
+
+// ── the background's part (#764 step 2) ───────────────────────────────────────
+//
+// A table grows and shrinks a few members a write (`WRITE_STEP`), so a set
+// whose writes stop part-way through a resize would hold both arrays until
+// its next write, maybe for ever. A write that leaves its set mid-resize, or
+// with a finished resize's old array kept back (`defer_free`: freeing a big
+// one took about a millisecond), hands the set to the background
+// ([`after_write`]); the active-expire thread finishes the resize in bounded
+// steps, each under the set's own write lock ([`step_background`]), and
+// gives the old arrays to `lazyfree`.
+//
+// The background holds the sets weakly: a key deleted, overwritten,
+// expired, evicted, flushed or moved meanwhile is not kept alive by it, and
+// it never waits for a set's lock (`try_write`), so a reader that holds one
+// for long delays only that set's resize, and nothing waits on the
+// background. A set it finds itself the last holder of (its key gone while
+// it held it) goes to `lazyfree` whole.
+
+type Shared = Arc<RwLock<MemberSet>>;
+
+/// Sets handed to the background, not yet done with.
+static HANDED: Mutex<Vec<Weak<RwLock<MemberSet>>>> = Mutex::new(Vec::new());
+/// How many sets [`HANDED`] holds, read without its lock.
+static HANDED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Units of a resize's moves done under one hold of a set's lock (a unit is
+/// a group visited or a member moved): about 40-80 us of work, so a writer
+/// of that set waits no longer than that for the background.
+pub const BACKGROUND_STEP: usize = 4096;
+
+/// After a write to `set` (whose write lock `inner` is): hands it to the
+/// background if it has work there. A few instructions when not.
+#[inline]
+pub fn after_write(set: &Shared, inner: &mut MemberSet) {
+    if inner.hand_over() {
+        hand(Arc::downgrade(set));
+    }
+}
+
+#[cold]
+fn hand(set: Weak<RwLock<MemberSet>>) {
+    let mut handed = HANDED.lock();
+    handed.push(set);
+    HANDED_COUNT.store(handed.len(), Ordering::Release);
+}
+
+/// `set` made a key's value: shared, and handed to the background if a
+/// resize it went through while it was built is still in progress. What
+/// every set made whole goes through (a load, `RESTORE`, a `*STORE`
+/// command, a new key of `SADD`).
+pub fn shared(mut set: MemberSet) -> Shared {
+    let due = set.hand_over();
+    let shared = Arc::new(RwLock::new(set));
+    if due {
+        hand(Arc::downgrade(&shared));
+    }
+    shared
+}
+
+/// Whether any set waits for the background.
+#[inline]
+pub fn background_pending() -> bool {
+    HANDED_COUNT.load(Ordering::Acquire) > 0
+}
+
+/// What one call of [`step_background`] did.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BackgroundWork {
+    /// Steps taken, each under one hold of a set's lock.
+    pub steps: usize,
+    /// The longest a set's lock was held for one of them.
+    pub longest_hold: std::time::Duration,
+    /// Sets finished with.
+    pub finished: usize,
+}
+
+/// Work on the sets handed to the background for about `budget` of time,
+/// a [`BACKGROUND_STEP`] at a time, each under the set's write lock taken
+/// without waiting. The sets left over are kept for the next call.
+pub fn step_background(budget: std::time::Duration) -> BackgroundWork {
+    let started = std::time::Instant::now();
+    let mut work = BackgroundWork::default();
+    let sets = std::mem::take(&mut *HANDED.lock());
+    let mut kept = Vec::with_capacity(sets.len());
+    let mut sets = sets.into_iter();
+    for weak in sets.by_ref() {
+        if started.elapsed() >= budget {
+            kept.push(weak);
+            break;
+        }
+        // Gone (deleted, overwritten, flushed...): nothing to do.
+        let Some(set) = weak.upgrade() else {
+            continue;
+        };
+        let mut done = false;
+        while started.elapsed() < budget {
+            // A reader holds it (a long `SMEMBERS`, say): next time.
+            let Some(mut inner) = set.try_write() else {
+                break;
+            };
+            let hold = std::time::Instant::now();
+            let (finished, retired) = inner.background_step(BACKGROUND_STEP);
+            drop(inner);
+            work.longest_hold = work.longest_hold.max(hold.elapsed());
+            work.steps += 1;
+            if let Some(retired) = retired {
+                crate::lazyfree::free_later(retired, 0);
+            }
+            if finished {
+                done = true;
+                break;
+            }
+        }
+        if Arc::strong_count(&set) == 1 {
+            // Its key went while this held it, and nothing else can reach
+            // it (the background alone holds it weakly): the last holder
+            // frees it, and a big set is not freed on this thread.
+            crate::lazyfree::free_later(set, 0);
+            continue;
+        }
+        if done {
+            work.finished += 1;
+        } else {
+            kept.push(weak);
+        }
+    }
+    kept.extend(sets);
+    let mut handed = HANDED.lock();
+    // Sets handed over while these were worked on come after them.
+    kept.append(&mut handed);
+    *handed = kept;
+    HANDED_COUNT.store(handed.len(), Ordering::Release);
+    work
 }
 
 /// The members of an array, in ascending order, at the width they need.
@@ -1026,117 +1259,48 @@ impl Ints {
     }
 }
 
-/// The table, as every set was before #297.
-#[derive(Clone, Default)]
+/// The table (#764), boxed (its header is 80 bytes; a set's is 64), and
+/// whether it has been handed to the background ([`after_write`]).
 struct Table {
-    table: HashTable<Arc<[u8]>>,
-    hasher: ahash::RandomState,
+    members: CollectionTable<Members>,
+    queued: bool,
 }
 
 impl Table {
-    fn with_capacity(members: usize) -> Self {
-        Self {
-            table: HashTable::with_capacity(members),
-            hasher: ahash::RandomState::new(),
-        }
+    fn with_capacity(members: usize) -> Box<Self> {
+        let mut members = CollectionTable::with_capacity(members);
+        // A finished resize's old array is freed by the background, not by
+        // the write that finished it.
+        members.defer_free(true);
+        Box::new(Table {
+            members,
+            queued: false,
+        })
     }
 
+    /// Adds `member`; false if it was there. A member is at most
+    /// `collection_table::MAX_LEN` (4 GiB) long: a command's argument is at
+    /// most 512 MB, and nothing longer is ever offered.
     #[inline]
-    fn hash(&self, member: &[u8]) -> u64 {
-        self.hasher.hash_one(member)
-    }
-
-    #[inline]
-    fn get(&self, member: &[u8]) -> Option<&Arc<[u8]>> {
-        self.table.find(self.hash(member), |have| &**have == member)
-    }
-
-    fn insert(&mut self, member: Arc<[u8]>) -> bool {
-        let hash = self.hash(&member);
-        let hasher = &self.hasher;
-        match self.table.entry(
-            hash,
-            |have| **have == *member,
-            |have| hasher.hash_one(&**have),
-        ) {
-            hashbrown::hash_table::Entry::Occupied(_) => false,
-            hashbrown::hash_table::Entry::Vacant(place) => {
-                place.insert(member);
-                true
-            }
-        }
-    }
-
-    #[inline]
-    fn insert_bytes(&mut self, member: &[u8]) -> bool {
-        let hash = self.hash(member);
-        let hasher = &self.hasher;
-        match self.table.entry(
-            hash,
-            |have| &**have == member,
-            |have| hasher.hash_one(&**have),
-        ) {
-            hashbrown::hash_table::Entry::Occupied(_) => false,
-            hashbrown::hash_table::Entry::Vacant(place) => {
-                place.insert(Arc::from(member));
-                true
-            }
-        }
+    fn insert(&mut self, member: &[u8]) -> bool {
+        self.members.insert(member).unwrap_or(false)
     }
 
     /// Adds a member known not to be one.
-    fn push_new(&mut self, member: Arc<[u8]>) {
-        let hash = self.hash(&member);
-        let hasher = &self.hasher;
-        self.table
-            .insert_unique(hash, member, |have| hasher.hash_one(&**have));
+    fn push_new(&mut self, member: &[u8]) {
+        self.insert(member);
     }
+}
 
-    fn take(&mut self, member: &[u8]) -> Option<Arc<[u8]>> {
-        let hash = self.hash(member);
-        let found = self.table.find_entry(hash, |have| &**have == member).ok()?;
-        let (taken, _) = found.remove();
-        self.shrink_if_sparse();
-        Some(taken)
-    }
-
-    /// A table that has lost most of its members is made smaller: it would
-    /// otherwise keep the memory of its largest size for ever, and a random
-    /// bucket of it would nearly always be an empty one.
-    fn shrink_if_sparse(&mut self) {
-        let buckets = self.table.num_buckets();
-        if buckets > 64 && self.table.len() * 8 < buckets {
-            let hasher = &self.hasher;
-            self.table
-                .shrink_to(self.table.len() * 2, |have| hasher.hash_one(&**have));
+impl Clone for Table {
+    /// A table of its own (`COPY`): every member copied, nothing shared.
+    fn clone(&self) -> Self {
+        let mut members = self.members.clone();
+        members.defer_free(true);
+        Table {
+            members,
+            queued: false,
         }
-    }
-
-    /// The bucket a random member is in, if there is a member at all.
-    fn random_bucket(&self, rng: &mut impl rand::Rng) -> Option<usize> {
-        if self.table.is_empty() {
-            return None;
-        }
-        let buckets = self.table.num_buckets();
-        for _ in 0..64 {
-            let at = rng.gen_range(0..buckets);
-            if self.table.get_bucket(at).is_some() {
-                return Some(at);
-            }
-        }
-        // A table made large and filled little (`with_capacity`): sixty-four
-        // empty buckets in a row. Walk to a member instead.
-        use rand::seq::IteratorRandom;
-        let member = self.table.iter().choose(rng)?;
-        self.table
-            .find_bucket_index(self.hash(member), |have| Arc::ptr_eq(have, member))
-    }
-
-    fn pop_random(&mut self, rng: &mut impl rand::Rng) -> Option<Arc<[u8]>> {
-        let at = self.random_bucket(rng)?;
-        let (taken, _) = self.table.get_bucket_entry(at).ok()?.remove();
-        self.shrink_if_sparse();
-        Some(taken)
     }
 }
 
@@ -1147,7 +1311,7 @@ pub enum Iter<'a> {
     W32(std::slice::Iter<'a, i32>),
     W64(std::slice::Iter<'a, i64>),
     Packed(packed_set::Iter<'a>),
-    Table(hashbrown::hash_table::Iter<'a, Arc<[u8]>>),
+    Table(MemberIter<'a>),
 }
 
 impl<'a> Iterator for Iter<'a> {
@@ -1156,7 +1320,7 @@ impl<'a> Iterator for Iter<'a> {
     #[inline]
     fn next(&mut self) -> Option<Member<'a>> {
         let n = match self {
-            Iter::Table(it) => return it.next().map(Member::Shared),
+            Iter::Table(it) => return it.next().map(Member::from),
             Iter::Packed(it) => return it.next().map(Member::Bytes),
             Iter::W16(it) => *it.next()? as i64,
             Iter::W32(it) => *it.next()? as i64,
@@ -1191,7 +1355,14 @@ impl IntoIterator for MemberSet {
     type IntoIter = IntoIter;
     fn into_iter(self) -> Self::IntoIter {
         match self.repr {
-            Repr::Table(t) => IntoIter(Handed::Table(t.table.into_iter())),
+            // Each member a copy of its own: the table's entries are its.
+            Repr::Table(t) => IntoIter(Handed::Table(
+                t.members
+                    .iter()
+                    .map(|m| Arc::from(&*m))
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            )),
             Repr::Small(Small::Packed(block)) => IntoIter(Handed::Packed(block, 0)),
             Repr::Small(Small::Ints(ints, _)) => IntoIter(Handed::Ints(ints, 0)),
         }
@@ -1205,7 +1376,7 @@ pub struct IntoIter(Handed);
 enum Handed {
     Ints(Ints, usize),
     Packed(PackedSet, usize),
-    Table(hashbrown::hash_table::IntoIter<Arc<[u8]>>),
+    Table(std::vec::IntoIter<Arc<[u8]>>),
 }
 
 impl Iterator for IntoIter {
@@ -1848,6 +2019,160 @@ mod tests {
             (Listpack, Hashtable),
         ] {
             assert!(moves.contains(&crossed), "never crossed {crossed:?}");
+        }
+    }
+
+    // ── #764: the table and the background ──────────────────────────────────
+
+    fn table_of(set: &Shared) -> (bool, bool, usize) {
+        let inner = set.read();
+        let t = inner.table().expect("a table");
+        (t.resizing(), t.holds_retired(), inner.allocation_size())
+    }
+
+    /// Steps the background until `set` has nothing left there, as the
+    /// expiry thread would; returns the longest hold of its lock.
+    fn finish_in_background(set: &Shared) -> std::time::Duration {
+        let mut longest = std::time::Duration::ZERO;
+        for _ in 0..1_000_000 {
+            let (resizing, retired, _) = table_of(set);
+            if !resizing && !retired && !set.read().is_queued() {
+                return longest;
+            }
+            let work = step_background(std::time::Duration::from_millis(1));
+            longest = longest.max(work.longest_hold);
+        }
+        panic!("the background never finished the set");
+    }
+
+    /// A set whose writes stop just after a growth started (3M members,
+    /// past the doubling of 2^19 groups) is finished by the background with
+    /// no further write, a step at a time, and its old array freed; after
+    /// most of it is removed, the shrinks the removes leave are finished
+    /// too, and the memory comes back.
+    #[test]
+    fn the_background_finishes_a_resize_the_writes_left() {
+        defaults();
+        let n: usize = if cfg!(debug_assertions) { 400_000 } else { 3_000_000 };
+        let set = shared(MemberSet::new());
+        let mut i = 0usize;
+        // Filled with no background meanwhile: as if its writes outran it.
+        {
+            let mut inner = set.write();
+            while i < n || !inner.table().is_some_and(|t| t.resizing()) {
+                inner.insert_bytes(format!("member:{i:010}").as_bytes());
+                i += 1;
+            }
+            after_write(&set, &mut inner);
+            assert!(inner.is_queued());
+        }
+        let (resizing, _, mid) = table_of(&set);
+        assert!(resizing);
+        let longest = finish_in_background(&set);
+        let (_, _, done) = table_of(&set);
+        assert!(done < mid, "{done} bytes after, {mid} during");
+        assert_eq!(set.read().len(), i);
+        eprintln!("growth to {i} members finished; longest hold {longest:?}");
+        // Down to a twentieth: shrinks, which the background ends.
+        {
+            let mut inner = set.write();
+            for j in 0..i {
+                if j % 20 != 0 {
+                    assert!(inner.remove(format!("member:{j:010}").as_bytes()));
+                }
+            }
+            after_write(&set, &mut inner);
+        }
+        let longest = finish_in_background(&set);
+        let (_, _, shrunk) = table_of(&set);
+        let inner = set.read();
+        assert_eq!(inner.len(), i.div_ceil(20));
+        assert!(
+            shrunk * 8 < done,
+            "{shrunk} bytes after the shrink, {done} before"
+        );
+        // What it holds is what a table built for that many holds, give or
+        // take the arrays' rounding: the old ones are gone.
+        let mut fresh = MemberSet::new_table(inner.len());
+        inner.for_each(|m| {
+            fresh.insert_bytes(m);
+        });
+        assert!(shrunk <= 2 * fresh.allocation_size(), "{shrunk} against {}", fresh.allocation_size());
+        eprintln!("shrink finished; longest hold {longest:?}");
+    }
+
+    /// A set whose key went while it waited for the background is not kept
+    /// alive by it, nor touched after it is freed; one held by a reader is
+    /// left for later, never waited for.
+    #[test]
+    fn the_background_holds_sets_weakly_and_never_waits() {
+        defaults();
+        let grown = || {
+            let set = shared(MemberSet::new());
+            let mut inner = set.write();
+            let mut i = 0;
+            while i < 1000 || !inner.table().is_some_and(|t| t.resizing()) {
+                inner.insert_bytes(format!("m{i}").as_bytes());
+                i += 1;
+            }
+            after_write(&set, &mut inner);
+            drop(inner);
+            set
+        };
+        // Deleted while handed over: the background finds it gone.
+        let gone = grown();
+        let weak = Arc::downgrade(&gone);
+        drop(gone);
+        assert!(weak.upgrade().is_none());
+        step_background(std::time::Duration::from_millis(50));
+        assert!(
+            !HANDED.lock().iter().any(|w| w.ptr_eq(&weak)),
+            "a deleted set stayed handed over"
+        );
+        // Read-locked: skipped, kept for later, then finished.
+        let held = grown();
+        let reader = held.read();
+        let work = step_background(std::time::Duration::from_millis(5));
+        assert!(reader.table().unwrap().resizing());
+        assert!(HANDED.lock().iter().any(|w| w.ptr_eq(&Arc::downgrade(&held))));
+        let _ = work;
+        drop(reader);
+        finish_in_background(&held);
+        assert!(!HANDED.lock().iter().any(|w| w.ptr_eq(&Arc::downgrade(&held))));
+        // A set built mid-growth and made a key's value is handed over at
+        // once (a load, `RESTORE`, a `*STORE` command).
+        let mut built = MemberSet::new_table(0);
+        let mut i = 0;
+        while i < 1000 || !built.table().unwrap().resizing() {
+            built.insert_bytes(format!("x{i}").as_bytes());
+            i += 1;
+        }
+        let built = shared(built);
+        assert!(built.read().is_queued());
+        finish_in_background(&built);
+        let mut copy = built.read().clone();
+        copy.finish_resize();
+        assert_eq!(copy.len(), i);
+    }
+
+    /// A table built for many that holds few is put in the form its
+    /// members would have grown into, as `from_shared` chooses.
+    #[test]
+    fn a_table_that_came_out_small_fits_its_members() {
+        defaults();
+        for (members, want) in [
+            ((0..100).map(|i| i.to_string()).collect::<Vec<_>>(), Encoding::Intset),
+            ((0..100).map(|i| format!("m{i}")).collect(), Encoding::Listpack),
+            ((0..600).map(|i| format!("m{i}")).collect(), Encoding::Hashtable),
+        ] {
+            let mut set = MemberSet::new_table(100_000);
+            for m in &members {
+                set.insert_bytes(m.as_bytes());
+            }
+            let set = set.into_fitting();
+            assert_eq!(set.encoding(), want);
+            assert_eq!(set.len(), members.len());
+            assert!(members.iter().all(|m| set.contains(m.as_bytes())));
         }
     }
 

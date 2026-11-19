@@ -242,8 +242,7 @@ pub(super) fn union_of(sets: &[Option<Set>]) -> MemberSet {
         // At least as big as the biggest: the table at once if that is.
         let mut result = MemberSet::with_capacity(sizes.iter().copied().max().unwrap_or(0));
         for set in &handles {
-            // A table's member is shared as it is; another set's is copied
-            // only if it is new.
+            // A member is copied in only if it is new.
             let _ = set.read().try_each(|member| {
                 result.insert_member(&member);
                 ControlFlow::<()>::Continue(())
@@ -257,8 +256,12 @@ pub(super) fn union_of(sets: &[Option<Set>]) -> MemberSet {
 /// `bound` of them, all different: `SINTERSTORE` and `SDIFFSTORE`.
 ///
 /// Built as members come when it may be an array or a block, so that it is
-/// what adding them one by one makes, as in Redis; built from all of them
-/// at once otherwise, so that a big one is not a block first.
+/// what adding them one by one makes, as in Redis; as a table otherwise,
+/// each member copied into it once, so that a big one is not a block first,
+/// and then put in the form it would have grown into if it came out small
+/// ([`MemberSet::into_fitting`]). The table starts with room for no more
+/// than [`TABLE_START`] and grows as it is filled: `bound` can be far more
+/// than there are.
 pub(super) fn collect_set(
     bound: usize,
     walk: impl FnOnce(&mut dyn FnMut(Member<'_>)),
@@ -270,11 +273,16 @@ pub(super) fn collect_set(
         });
         set
     } else {
-        let mut all = Vec::new();
-        walk(&mut |member| all.push(member.to_shared()));
-        MemberSet::from_shared(all)
+        let mut set = MemberSet::new_table(bound.min(TABLE_START));
+        walk(&mut |member| {
+            set.insert_member(&member);
+        });
+        set.into_fitting()
     }
 }
+
+/// The most room [`collect_set`] makes for a table before it is filled.
+const TABLE_START: usize = 1 << 16;
 
 fn union_card(sets: &[Option<Set>], limit: usize) -> usize {
     let mut sets: Vec<&Set> = sets.iter().flatten().collect();
