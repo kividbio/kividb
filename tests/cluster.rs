@@ -3132,6 +3132,184 @@ fn a_node_whose_nodes_conf_lists_fewer_masters_counts_the_reported_ones() {
     );
 }
 
+/// Between the slots taken and the replication layer made master (held
+/// there), a node completing its promotion owns the slots in its own view
+/// and is still a replica to the replication layer: a write sent to it then
+/// is refused, and it takes writes once released.
+#[test]
+fn a_node_completing_its_promotion_takes_no_write_before_it_is_master() {
+    let (mut nodes, ranges) = form_cluster(3);
+    let holds = failpoints("promotion-taken");
+    let mut replica = add_replica_with(
+        &nodes,
+        &nodes[0],
+        &["--aof", "--appendfsync", "always"],
+        &[(holds.0, holds.1.as_str())],
+    );
+    wait_cluster_ok(&[&nodes[0], &nodes[1], &nodes[2], &replica], 4);
+    let range = ranges[0].0..=ranges[0].1;
+    let (before, after, later) = (
+        key_in(range.clone(), "before"),
+        key_in(range.clone(), "after"),
+        key_in(range.clone(), "later"),
+    );
+    assert!(nodes[0].conn().cmd(&["SET", &before, "v"]).is_ok());
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+
+    fail_saves(&replica, true);
+    nodes[0].kill();
+    promote_then_kill_unsaved(&mut replica, &[&nodes[1], &nodes[2]], &before, &after);
+    replica.spawn();
+    let held = wait_hold(&replica, "promotion-taken", 1);
+    // Its own view has it the owner: the write is not redirected, and is
+    // refused.
+    assert!(
+        replica.my_row()[8..]
+            .iter()
+            .any(|s| spec_holds(s, slot_of(&later)))
+    );
+    let r = replica.conn().cmd(&["SET", &later, "v"]);
+    assert!(r.err().is_some_and(|e| e.starts_with("READONLY")), "{r:?}");
+    none_acknowledged(&replica, range, Duration::from_secs(1)).unwrap();
+    std::fs::remove_file(&held).unwrap();
+    wait_until(
+        "the node to serve as the master",
+        Duration::from_secs(20),
+        || replica.repl_info("role").as_deref() == Some("master"),
+    );
+    let r = cmd_when_serving(&mut replica.conn(), &["SET", &later, "v"]);
+    assert!(r.is_ok(), "{r:?}");
+    wait_one_owner(&[&nodes[1], &nodes[2], &replica], &replica, &later);
+}
+
+/// `node`'s nodes.conf with `k` masters more than the cluster has: each
+/// takes a share of the first slot range of `from`'s row, at `from`'s
+/// config epoch (so `from`'s claims, at that epoch, do not take them back).
+fn with_masters_that_are_not(node: &Node, from: &str, k: usize) {
+    let path = node.dir.join("nodes.conf");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if !line.starts_with(from) {
+            out.push(line.to_string());
+            continue;
+        }
+        let mut fields: Vec<String> = line.split(' ').map(String::from).collect();
+        let (start, end) = fields[8]
+            .split_once('-')
+            .map(|(a, b)| (a.parse::<u32>().unwrap(), b.parse::<u32>().unwrap()))
+            .unwrap();
+        let share = (end - start + 1) / (k as u32 + 1);
+        fields[8] = format!("{start}-{}", start + share - 1);
+        for i in 0..k {
+            let (s, e) = (
+                start + share * (i as u32 + 1),
+                if i + 1 == k {
+                    end
+                } else {
+                    start + share * (i as u32 + 2) - 1
+                },
+            );
+            let mut fake = fields.clone();
+            fake[0] = format!("{:040x}", 0xfa4e_u64 + i as u64);
+            fake[1] = format!("127.0.0.1:{}@{}", 9 + i, 19 + i);
+            fake.truncate(8);
+            fake.push(format!("{s}-{e}"));
+            out.push(fake.join(" "));
+        }
+        out.push(fields.join(" "));
+    }
+    let mut text = out.join("\n");
+    text.push('\n');
+    std::fs::write(&path, text).unwrap();
+}
+
+/// A node restarted before the save of its promotion that cannot complete
+/// it keeps pinging the masters as a replica: its nodes.conf lists five
+/// masters that own slots (two of them gone), and the two that report to
+/// it are no majority of five. The masters report to it for three node
+/// timeouts and then no more, and three node timeouts after their last
+/// report vote for a replacement of it again: `CLUSTER FAILOVER FORCE` by
+/// the shard's other replica is won within that bound, and every node has
+/// that one as the one owner.
+#[test]
+fn a_node_that_cannot_complete_its_promotion_holds_off_a_forced_failover_for_a_bounded_time() {
+    let (mut nodes, ranges) = form_cluster(3);
+    let mut replica = replica_whose_saves_can_fail(&nodes, &nodes[0]);
+    let other = add_replica(&nodes, &nodes[0]);
+    wait_cluster_ok(&[&nodes[0], &nodes[1], &nodes[2], &replica, &other], 5);
+    let range = ranges[0].0..=ranges[0].1;
+    let (before, after) = (
+        key_in(range.clone(), "before"),
+        key_in(range.clone(), "after"),
+    );
+    assert!(nodes[0].conn().cmd(&["SET", &before, "v"]).is_ok());
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "2", "5000"]).int(), 2);
+
+    fail_saves(&replica, true);
+    let r = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+    assert!(r.is_ok(), "{r:?}");
+    let replica_id = replica.id();
+    wait_until(
+        "the old master and the other replica to follow the new master",
+        Duration::from_secs(30),
+        || {
+            replica.is_master()
+                && nodes[0].my_row()[3] == replica_id
+                && other.my_row()[3] == replica_id
+        },
+    );
+    nodes[0].kill();
+    promote_then_kill_unsaved(&mut replica, &[&nodes[1], &nodes[2]], &before, &after);
+    with_masters_that_are_not(&replica, &nodes[1].id(), 2);
+
+    replica.spawn();
+    let restarted = Instant::now();
+    // Reported to, and not completing.
+    std::thread::sleep(Duration::from_millis(2 * NODE_TIMEOUT_MS));
+    assert!(!replica.is_master());
+    assert!(!replica.log().contains("Completing the promotion"));
+    let bound = Duration::from_millis(6 * NODE_TIMEOUT_MS);
+    let deadline = restarted + bound + Duration::from_secs(15);
+    while !other.is_master() {
+        assert!(
+            Instant::now() < deadline,
+            "the forced failover not won {:?} after the restart:\n{}\n{}",
+            restarted.elapsed(),
+            nodes[1].log(),
+            other.log()
+        );
+        let _ = other.conn().cmd(&["CLUSTER", "FAILOVER", "FORCE"]);
+        wait_until_or(Duration::from_secs(3), || other.is_master());
+    }
+    eprintln!(
+        "restart to the forced failover won: {} ms (bound {} ms)",
+        restarted.elapsed().as_millis(),
+        bound.as_millis()
+    );
+    assert!(
+        [&nodes[1], &nodes[2]].iter().any(|n| n
+            .log()
+            .contains("no more reports to it until it says it is a master")),
+        "{}",
+        nodes[1].log()
+    );
+    wait_one_owner(&[&nodes[1], &nodes[2], &other], &other, &before);
+    assert!(!replica.is_master());
+}
+
+/// Wait up to `timeout` for `pred`; whether it held.
+fn wait_until_or(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if pred() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
 /// With a node of 1.2 in the cluster, a master that does not say which
 /// slots it holds the restarted node as the owner of: the promotion is
 /// completed once a majority of all the masters that own slots, the 1.2
