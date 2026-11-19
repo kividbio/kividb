@@ -4703,21 +4703,21 @@ fn a_groupby_read_document_by_document_answers_as_grouping_rows_does() {
         let key = format!("gstr:{i}");
         let mut args = vec!["HSET", &key, "g", &g, "h", h, "n", &n, "t", "some words"];
         let m = ((i * 31) % 17).to_string();
-        if i % 5 != 0 {
+        if !i.is_multiple_of(5) {
             args.extend_from_slice(&["m", &m]);
         }
-        if i % 11 == 0 {
+        if i.is_multiple_of(11) {
             args.extend_from_slice(&["n", "not a number"]);
         }
         c.cmd(&args);
         // Fields with a TTL: one far off, one that has passed.
-        if i % 9 == 0 {
+        if i.is_multiple_of(9) {
             c.cmd(&["HPEXPIRE", &key, "100000", "FIELDS", "1", "h"]);
         }
-        if i % 23 == 0 {
+        if i.is_multiple_of(23) {
             c.cmd(&["HPEXPIRE", &key, "1", "FIELDS", "1", "g"]);
         }
-        let doc = if i % 5 != 0 {
+        let doc = if !i.is_multiple_of(5) {
             format!(
                 r#"{{"g":{g},"h":"{h}","n":{},"m":{m},"t":"some words"}}"#,
                 i % 13

@@ -5,7 +5,7 @@ KiviDB only: the Redis 8.10.2 on the VM image is built without the Query
 Engine module (no FT.*). The issue's comparison with Redis 8.10.3 (the
 `redis:8` image) is in the PR and in this README's recorded run.
 
-The issue's workload, on one server:
+The issue's workload, on one server (`--threads 4` for both engines):
 
   1. FT.CREATE userIdx ON HASH PREFIX 1 user: SCHEMA name TEXT email TAG
      communityNumber NUMERIC age NUMERIC, then 2,000,000 documents
@@ -36,7 +36,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import Suite, Config, THROUGHPUT, MEMORY, KEEP_IMPROVEMENT, EXACT, rel, info, scaled, median  # noqa: E402
 from rss import vmrss_mib, used_memory_mib  # noqa: E402
 
-S = Suite("33-ft-aggregate-groupby", [Config("docs2m", engines=("v1_2_2", "candidate"))])
+# --threads 4: auto is 4 workers on 4 CPUs since #873, but 2 on v1.2.2.
+S = Suite("33-ft-aggregate-groupby", [Config("docs2m", threads=4, engines=("v1_2_2", "candidate"))])
 DOCS = 2_000_000
 REPS = 5
 GROUP = ["GROUPBY", "1", "@communityNumber", "REDUCE", "COUNT", "0", "AS", "n"]

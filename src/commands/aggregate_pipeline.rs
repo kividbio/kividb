@@ -717,7 +717,8 @@ impl StreamGroups {
                 b"GROUPBY" => {
                     let (end, props, reducers) = parse_groupby(cmd, i);
                     // A GROUPBY of no property is one group of every row.
-                    if props.is_empty() || reducers.iter().any(|r| Running::new(&r.func).is_none()) {
+                    if props.is_empty() || reducers.iter().any(|r| Running::new(&r.func).is_none())
+                    {
                         return None;
                     }
                     return Some(Self {
@@ -1080,10 +1081,10 @@ mod tests {
             .map(|i: usize| {
                 let mut row = Row::new();
                 row.insert("__key".to_string(), format!("k:{i}"));
-                if i % 7 != 0 {
+                if !i.is_multiple_of(7) {
                     row.insert("g".to_string(), (i % 13).to_string());
                 }
-                if i % 5 != 0 {
+                if !i.is_multiple_of(5) {
                     let v = match i % 4 {
                         0 => format!("{}.25", i % 17),
                         1 => "-0".to_string(),
