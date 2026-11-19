@@ -332,6 +332,7 @@ fn start_server(port: u16) {
             cluster_enabled: false,
             cluster_node_timeout: 15000,
             configfile: "./kividb.conf".to_string(),
+            enable_debug_command: kividb::config::DebugCommand::Yes,
             ..Default::default()
         };
         kividb::run_for_test(config);

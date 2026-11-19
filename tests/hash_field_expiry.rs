@@ -147,6 +147,8 @@ fn kividb(dir: &Path, port: u16, extra: &[String], env: &[(String, String)]) -> 
         "4",
         "--configfile",
         "kividb.conf",
+        "--enable-debug-command",
+        "yes",
     ]);
     if let Ok(model) = std::env::var("KIVIDB_TEST_IO_MODEL") {
         command.args(["--io-model", &model]);

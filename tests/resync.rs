@@ -250,6 +250,8 @@ fn kividb_with(dir: &Path, port: u16, extra: &[String], env: &[(String, String)]
             "4",
             "--configfile",
             "kividb.conf",
+            "--enable-debug-command",
+            "yes",
         ])
         // The tokio loop unless a test asks for another.
         .args(
@@ -3554,6 +3556,7 @@ fn save_leaves_other_clients_answered() {
         .current_dir(&dir)
         .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
         .args(["--io-model", "tokio", "--threads", "1"])
+        .args(["--enable-debug-command", "yes"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

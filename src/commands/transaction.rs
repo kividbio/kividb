@@ -48,15 +48,26 @@ fn busy(cmd: &[&[u8]]) -> bool {
 }
 
 /// The reply to a command sent inside `MULTI` that cannot be queued: there
-/// is no such command, or it has the wrong number of arguments, or the
+/// is no such command, or it has the wrong number of arguments, or it is a
+/// `DEBUG` that `debug` does not allow the client at `peer_addr`, or the
 /// server is busy. The transaction it was meant for is then refused whole —
 /// `EXEC` answers `-EXECABORT` — rather than run without it.
-pub fn queue_refusal(name: &str, cmd: &[&[u8]]) -> Option<Vec<u8>> {
+pub fn queue_refusal(
+    name: &str,
+    cmd: &[&[u8]],
+    debug: crate::config::DebugCommand,
+    peer_addr: &str,
+) -> Option<Vec<u8>> {
     if !crate::commands::server::is_command(name) {
         return Some(crate::commands::handler::unknown_command(cmd));
     }
     if let Some(wrong_number) = crate::commands::arity::check(name, cmd) {
         return Some(wrong_number);
+    }
+    if name == "DEBUG" && !debug.allows(peer_addr) {
+        return Some(crate::resp::write::resp_error(
+            crate::commands::debug_cmd::NOT_ALLOWED,
+        ));
     }
     // What cannot be one step of several: it ends the process, or takes
     // the connection over. (`MONITOR` is queued, as in Redis, and refused

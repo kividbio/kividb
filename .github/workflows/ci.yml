@@ -346,6 +346,7 @@ jobs:
       - name: Start KiviDB
         run: |
           nohup ./bin/kividb --port 6380 --loglevel error --io-model tokio \
+            --enable-debug-command yes \
             > /tmp/kividb-e2e.log 2>&1 &
           echo $! > /tmp/kividb-e2e.pid
           disown

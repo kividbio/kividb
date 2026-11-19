@@ -506,6 +506,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hashes runs of slots, not all 16,384. A `SETSLOT ... NODE` takes 4.9 ms
   on that disk, where it took 9.7-11.1 ms (5.2-6.0 ms before saves were
   synced).
+- **`DEBUG` is refused by default, as in Redis 7 and later (#949).**
+  `enable-debug-command` was accepted and ignored, so `DEBUG` ran for any
+  user whose ACL allowed it, whatever the setting said. It now takes Redis's
+  three values: `no`, the default, refuses `DEBUG` to every client with
+  Redis's error (`ERR DEBUG command not allowed. ...`); `yes` allows it;
+  `local` allows it only to clients on loopback. It is set at startup, with
+  `--enable-debug-command` or in the config file; `CONFIG GET` reports it
+  and `CONFIG SET` refuses it, as Redis does. The ACL is checked first;
+  inside `MULTI` the refusal discards the transaction, as in Redis (scripts
+  could not run `DEBUG` already). Start the server with
+  `--enable-debug-command yes` for tools and tests that use `DEBUG SLEEP`,
+  `DEBUG POPULATE`, `DEBUG DIGEST-VALUE` and the rest.
+  `enable-protected-configs` and `enable-module-command` are still accepted
+  and change nothing.
 
 - **`FT.AGGREGATE ... GROUPBY` over many documents is 3.8x faster, and a
   search index of many small documents takes 30 % less memory (part of

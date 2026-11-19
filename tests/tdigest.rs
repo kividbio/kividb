@@ -142,6 +142,7 @@ fn config(io_model: kividb::config::IoModel) -> kividb::config::Config {
         loglevel: "error".to_string(),
         io_model,
         configfile: "./kividb.conf".to_string(),
+        enable_debug_command: kividb::config::DebugCommand::Yes,
         ..Default::default()
     }
 }
@@ -193,6 +194,7 @@ impl Child {
                 .current_dir(dir)
                 .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
                 .args(["--threads", "2", "--loglevel", "warning"])
+                .args(["--enable-debug-command", "yes"])
                 .args(["--configfile", "kividb.conf", "--dir"])
                 .arg(dir)
                 .args(extra)
@@ -323,10 +325,9 @@ fn dump_restore_and_migrate() {
     assert_eq!(c.cmd(&args), b"+OK\r\n");
     let payload = bulk(&c.cmd(&["DUMP", "here"]));
     assert_eq!(c.raw(&[b"RESTORE", b"again", b"0", &payload]), b"+OK\r\n");
-    assert_eq!(
-        c.cmd(&["DEBUG", "DIGEST-VALUE", "again"]),
-        c.cmd(&["DEBUG", "DIGEST-VALUE", "here"])
-    );
+    let digest = c.cmd(&["DEBUG", "DIGEST-VALUE", "here"]);
+    assert!(!digest.starts_with(b"-"), "{}", shown(&digest));
+    assert_eq!(c.cmd(&["DEBUG", "DIGEST-VALUE", "again"]), digest);
     let q = c.cmd(&["TDIGEST.QUANTILE", "here", "0.5", "0.99"]);
     assert_eq!(
         c.cmd(&[
@@ -390,7 +391,11 @@ fn workload(c: &mut Conn, seed: u64, steps: usize) {
 
 fn digests(c: &mut Conn) -> Vec<Vec<u8>> {
     (0..6)
-        .map(|i| c.cmd(&["DEBUG", "DIGEST-VALUE", &format!("w:{i}")]))
+        .map(|i| {
+            let d = c.cmd(&["DEBUG", "DIGEST-VALUE", &format!("w:{i}")]);
+            assert!(!d.starts_with(b"-"), "{}", shown(&d));
+            d
+        })
         .collect()
 }
 
@@ -468,6 +473,7 @@ fn generic_commands() {
     assert_eq!(c.cmd(&["UNLINK", "g3"]), b":1\r\n");
     // A query changes nothing.
     let before = c.cmd(&["DEBUG", "DIGEST-VALUE", "g"]);
+    assert!(!before.starts_with(b"-"), "{}", shown(&before));
     c.cmd(&["TDIGEST.QUANTILE", "g", "0.5"]);
     c.cmd(&["TDIGEST.CDF", "g", "2"]);
     assert_eq!(c.cmd(&["DEBUG", "DIGEST-VALUE", "g"]), before);
@@ -690,11 +696,9 @@ fn room_is_made_before_the_command_takes_its_keys() {
     let keys = all_keys(&mut m);
     assert_eq!(all_keys(&mut r), keys);
     for key in &keys {
-        assert_eq!(
-            r.cmd(&["DEBUG", "DIGEST-VALUE", key]),
-            m.cmd(&["DEBUG", "DIGEST-VALUE", key]),
-            "{key}"
-        );
+        let digest = m.cmd(&["DEBUG", "DIGEST-VALUE", key]);
+        assert!(!digest.starts_with(b"-"), "{key}: {}", shown(&digest));
+        assert_eq!(r.cmd(&["DEBUG", "DIGEST-VALUE", key]), digest, "{key}");
     }
     drop((master, replica));
     let _ = std::fs::remove_dir_all(&dir);

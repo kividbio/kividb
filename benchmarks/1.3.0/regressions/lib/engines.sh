@@ -173,7 +173,10 @@ engine_start() {
         --enable-debug-command yes --dir "$ENGINE_DIR" "$@" </dev/null >"$ENGINE_LOG" 2>&1 &
       ;;
     kividb)
-      local args=(--port "$ENGINE_PORT" --bind 127.0.0.1 --protected-mode no --dir "$ENGINE_DIR")
+      # A file, not the flag: v1.2.2 has no --enable-debug-command.
+      echo "enable-debug-command yes" > "$ENGINE_DIR/kividb.conf"
+      local args=(--port "$ENGINE_PORT" --bind 127.0.0.1 --protected-mode no --dir "$ENGINE_DIR"
+                  --configfile "$ENGINE_DIR/kividb.conf")
       [ "$io" != auto ] && args+=(--io-model "$io")
       [ "${threads:-0}" != 0 ] && args+=(--threads "$threads")
       (cd "$ENGINE_DIR" && KIVIDB_NO_UPDATE_CHECK=1 exec "$bin" "${args[@]}" "$@") </dev/null >"$ENGINE_LOG" 2>&1 &

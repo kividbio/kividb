@@ -146,6 +146,8 @@ fn kividb(dir: &Path, port: u16, extra: &[String]) -> Child {
             "4",
             "--configfile",
             "kividb.conf",
+            "--enable-debug-command",
+            "yes",
         ])
         .args(extra)
         .stdin(Stdio::null())

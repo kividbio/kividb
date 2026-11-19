@@ -3170,20 +3170,25 @@ pub async fn handle_client(
                     // So is one that is no command at all, or has the wrong
                     // number of arguments, or arrives while a script has the
                     // server busy.
-                    let refusal =
-                        commands::transaction::queue_refusal(&cmd_name, &cmd).or_else(|| {
-                            crate::cluster::routing::queue_refusal(
-                                &crate::cluster::routing::Caller {
-                                    cluster: &cluster_state,
-                                    registry: &client_registry,
-                                    client_id,
-                                    store: &store,
-                                    db: selected_db,
-                                    ipv6: peer_ipv6,
-                                },
-                                &cmd,
-                            )
-                        });
+                    let refusal = commands::transaction::queue_refusal(
+                        &cmd_name,
+                        &cmd,
+                        config.enable_debug_command,
+                        &peer_addr,
+                    )
+                    .or_else(|| {
+                        crate::cluster::routing::queue_refusal(
+                            &crate::cluster::routing::Caller {
+                                cluster: &cluster_state,
+                                registry: &client_registry,
+                                client_id,
+                                store: &store,
+                                db: selected_db,
+                                ipv6: peer_ipv6,
+                            },
+                            &cmd,
+                        )
+                    });
                     match refusal {
                         Some(refusal) => {
                             tx.aborted = true;
