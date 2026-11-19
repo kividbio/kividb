@@ -2016,6 +2016,12 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
         );
         std::thread::sleep(delay);
     }
+    // Tests: held here, on the migration's own thread, with the stream
+    // caught up and writes not paused yet. Nothing from here to the
+    // TAKEOVER needs a connection to this node, so a test can hold a
+    // command at `routed` meanwhile on the io_uring loop, where that holds
+    // its whole worker (#339).
+    crate::aof::failpoint("handoff-pausing");
     no_failover_since()?;
 
     // ── Handoff ──────────────────────────────────────────────────────────
