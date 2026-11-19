@@ -429,6 +429,7 @@ dependencies = [
  "either",
  "hashbrown",
  "indexmap",
+ "io-uring",
  "libc",
  "lzf",
  "mach2",

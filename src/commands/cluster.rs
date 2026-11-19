@@ -1172,8 +1172,12 @@ fn cmd_meet(ctx: &mut Ctx) -> Vec<u8> {
 
     // Insert a HANDSHAKE placeholder so CLUSTER NODES immediately reflects
     // the in-flight handshake even before the PONG comes back.
-    let placed =
-        crate::cluster::bus::dialer::insert_handshake_placeholder(ctx.cluster, &ip, client_port);
+    let placed = crate::cluster::bus::dialer::insert_handshake_placeholder(
+        ctx.cluster,
+        &ip,
+        client_port,
+        bus_port,
+    );
 
     // Fire off the actual handshake. We don't await it from the command
     // handler — the command returns OK as soon as the request is queued,
@@ -1433,6 +1437,10 @@ fn cmd_failover(ctx: &mut Ctx) -> Vec<u8> {
             ctx.repl_state.become_master();
             ctx.cluster.drop_slots_lost_while_promoting(&claimed);
             log_info!("Cluster: Manual TAKEOVER promoted us to master at epoch {epoch}");
+            // On disk before it is announced and answered, unless the save
+            // takes longer than `PROMOTION_SAVE_WAIT` or fails: see
+            // `ClusterState::save_promotion`.
+            let _ = ctx.cluster.save_promotion();
             // Announce it now, not on the next heartbeat.
             let state = Arc::clone(ctx.cluster);
             bus.spawn(async move {

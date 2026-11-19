@@ -566,6 +566,11 @@ async fn promote(
     // this node was a replica still to the replication layer.
     state.drop_slots_lost_while_promoting(&claimed);
     state.end_election();
+    // On disk before it is announced, unless the save takes longer than
+    // `PROMOTION_SAVE_WAIT` or fails: then it is announced all the same,
+    // and saved in the background (see `ClusterState::save_promotion`).
+    let saving = Arc::clone(state);
+    let _ = crate::cpus::spawn_blocking(move || saving.save_promotion()).await;
     // Announce the new ownership now rather than on the next heartbeat tick:
     // until the others hear it they keep redirecting clients to the old
     // master, and its other replicas keep following a node that is gone.
@@ -624,10 +629,14 @@ pub(crate) async fn broadcast_auth_request(
         let state = Arc::clone(state);
         tokio::spawn(async move {
             let addr = format!("{ip}:{bus_port}");
-            // A master saves its vote, synced, before it answers: on a busy
-            // disk that took longer than the two seconds this used to wait,
-            // and the vote was lost though it had been given.
-            let wait = Duration::from_millis(state.node_timeout_ms.max(2_000));
+            // A master saves its vote, synced, before it answers, which on a
+            // busy or slow disk takes seconds. The candidate waits for votes
+            // for the life of the election, so a vote saved slowly still
+            // counts; one that comes sooner counts as soon as it comes.
+            // Redis waits `max(2 x node timeout, 2 s)`.
+            let wait = crate::cluster::ELECTION_LIFETIME.max(Duration::from_millis(
+                state.node_timeout_ms.saturating_mul(2).max(2_000),
+            ));
             match dialer::exchange(&state, &addr, &msg, wait).await {
                 Ok(Some(BusMessage::FailoverAuthAck {
                     sender_id,

@@ -371,6 +371,23 @@ pub struct ClusterState {
     /// unchanged topology is not rewritten. See `persist::save_from_state`.
     pub(crate) save_lock: parking_lot::Mutex<()>,
     pub(crate) last_saved_fingerprint: AtomicU64,
+    /// Where the saves of nodes.conf stand: a save is synced without
+    /// `save_lock`, and is not put in place over a newer one.
+    pub(crate) saves: std::sync::Arc<persist::Saves>,
+    /// `ip:bus_port` of each `CLUSTER MEET` waiting for its answer, or for
+    /// this node's save of the peer (see `bus::dialer::send_meet`): its
+    /// handshake entry is kept meanwhile, though that can take longer than
+    /// the failure detector otherwise gives one.
+    pub(crate) meets: parking_lot::Mutex<ahash::AHashSet<String>>,
+    /// `ip:bus_port` of each `CLUSTER MEET` given up after the peer was
+    /// reached, until when: the peer may have made this node a member, so a
+    /// heartbeat from there takes the MEET up again (`bus::listener`).
+    pub(crate) meets_given_up: parking_lot::Mutex<AHashMap<String, u64>>,
+    /// Nodes being admitted after a `CLUSTER MEET`, saved with the members
+    /// until they are members: see [`Self::admit_met_node`]. Each entry is
+    /// that of one admission, by its number: two of the same node (a MEET
+    /// and its retry) each remove only their own.
+    pub(crate) joining: parking_lot::Mutex<Vec<(u64, ClusterNode)>>,
     /// Bus traffic counters for `CLUSTER INFO`.
     pub stats_messages_sent: AtomicU64,
     pub stats_messages_received: AtomicU64,
@@ -442,6 +459,10 @@ impl ClusterState {
             preferred_endpoint: std::sync::atomic::AtomicU8::new(Endpoint::Ip as u8),
             save_lock: parking_lot::Mutex::new(()),
             last_saved_fingerprint: AtomicU64::new(0),
+            saves: std::sync::Arc::new(persist::Saves::default()),
+            meets: parking_lot::Mutex::new(ahash::AHashSet::new()),
+            meets_given_up: parking_lot::Mutex::new(AHashMap::new()),
+            joining: parking_lot::Mutex::new(Vec::new()),
             stats_messages_sent: AtomicU64::new(0),
             stats_messages_received: AtomicU64::new(0),
             stats_bus_connects: AtomicU64::new(0),
@@ -516,6 +537,7 @@ impl ClusterState {
             Some(p) => p,
             None => return Ok(Self::new_enabled(None, node_timeout_ms)),
         };
+        persist::remove_leftover_temps(&path);
 
         match persist::load(&path)? {
             Some(loaded) => Ok(Self::build(
@@ -617,6 +639,7 @@ impl ClusterState {
         if !self.enabled {
             return;
         }
+        let _ = FOR_SHUTDOWN.set(std::sync::Arc::downgrade(self));
         let repl_state = std::sync::Arc::clone(&hooks.replica_starter.repl_state);
         let _ = self.hooks.set(hooks);
         let (asked, taker) = (
@@ -715,18 +738,116 @@ impl ClusterState {
         let spawned = std::thread::Builder::new()
             .name("kividb-nodes-conf".into())
             .spawn_released(move || {
-                while rx.recv().is_ok() {
+                let mut last: Option<std::time::Instant> = None;
+                let mut failing = false;
+                loop {
+                    // A save that failed is made again every second, until
+                    // one works (a promotion, say, that must reach the
+                    // disk), as well as when one is asked for.
+                    let asked = if failing {
+                        !matches!(
+                            rx.recv_timeout(std::time::Duration::from_secs(1)),
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                        )
+                    } else {
+                        rx.recv().is_ok()
+                    };
+                    if !asked {
+                        return;
+                    }
+                    // One save in `BACKGROUND_SAVE_GAP` at most, of all the
+                    // changes asked for meanwhile: see there.
+                    if let Some(since) = last.map(|t| t.elapsed())
+                        && since < BACKGROUND_SAVE_GAP
+                    {
+                        std::thread::sleep(BACKGROUND_SAVE_GAP - since);
+                    }
+                    let _ = rx.try_recv();
                     let Some(state) = state.upgrade() else {
                         return;
                     };
-                    if let Err(e) = persist::save_from_state(&state) {
-                        log_warn!("Cluster: could not save the cluster config file: {e}");
+                    // Not while a save something waits on is made (a vote,
+                    // a node met): the disk would commit the two in turn,
+                    // and the vote, which counts, would wait on this one.
+                    let waited = std::time::Instant::now();
+                    while state.saves.urgent.load(Ordering::SeqCst) > 0
+                        && waited.elapsed() < std::time::Duration::from_secs(5)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    let saved = persist::save_from_state(&state);
+                    last = Some(std::time::Instant::now());
+                    failing = saved.is_err();
+                    if let Err(e) = saved {
+                        log_verbose!("Cluster: background save of nodes.conf failed: {e}");
                     }
                 }
             });
         if spawned.is_ok() {
             let _ = self.background_save.set(tx);
         }
+    }
+
+    /// Make `node`, met by a `CLUSTER MEET` (this node sent it, or was sent
+    /// it), a member with `add`, once nodes.conf has it, synced: a node met
+    /// is shown as a member (in `CLUSTER NODES`, without `handshake`) only
+    /// once it is saved. Both ends of a MEET save the other before it is
+    /// shown, and the receiving end before it answers. A cluster stopped
+    /// whole (killed, even) from then on keeps the new node: a node that has
+    /// it in its nodes.conf tells the others of it again, which matters
+    /// because a node that is not a member cannot join by sending
+    /// heartbeats (#808).
+    ///
+    /// The nodes waiting are saved together, in the next save, not one save
+    /// each: a node met by many at once (`redis-cli --cluster create` has
+    /// every node meet the first) waits for one or two writes. If the save
+    /// fails (a full or read-only disk), `node` is not admitted and `false`
+    /// is returned: the MEET is not answered, and the end that sent it tries
+    /// again. The file in place may have the node all the same (a save that
+    /// failed at the directory's sync was renamed into place): it is saved
+    /// again, without it.
+    ///
+    /// Blocks on the disk: not to be called on the bus's thread.
+    pub fn admit_met_node(&self, node: ClusterNode, add: impl FnOnce()) -> bool {
+        let admission = self.begin_admission(node);
+        self.finish_admission(admission, add)
+    }
+
+    /// The first half of [`Self::admit_met_node`]: `node` is in every save
+    /// numbered from the one returned on, until [`Self::finish_admission`].
+    fn begin_admission(&self, node: ClusterNode) -> Admission {
+        static NUMBER: AtomicU64 = AtomicU64::new(0);
+        let number = NUMBER.fetch_add(1, Ordering::Relaxed);
+        let id = node.id;
+        self.joining.lock().push((number, node));
+        Admission {
+            number,
+            id,
+            // Every save numbered from here on has it.
+            from: self.saves.written.load(Ordering::SeqCst) + 1,
+        }
+    }
+
+    /// The second half of [`Self::admit_met_node`].
+    fn finish_admission(&self, admission: Admission, add: impl FnOnce()) -> bool {
+        let deadline = std::time::Instant::now() + ADMIT_SAVE_WAIT;
+        let saved = persist::wait_for_save(self, admission.from, deadline);
+        if saved.is_ok() {
+            add();
+        }
+        // Only this admission's entry: another of the same node, under way,
+        // keeps its own until its save.
+        self.joining
+            .lock()
+            .retain(|(number, _)| *number != admission.number);
+        if let Err(e) = &saved {
+            log_verbose!(
+                "Cluster: {} not made a member: it could not be saved ({e})",
+                node_id_str(&admission.id)
+            );
+            self.save_soon();
+        }
+        saved.is_ok()
     }
 
     /// Persist current state to disk, if a config path is configured.
@@ -2100,10 +2221,15 @@ impl ClusterState {
                 .is_some_and(|n| n.flags.contains(NodeFlags::MASTER));
             // A placeholder records when it was created in `ping_sent_ms`.
             let handshake_timeout = timeout.max(1_000);
+            // Not while its MEET is under way: the MEET waits for the peer
+            // to save this node, which can take longer (see `send_meet`).
+            let meets = self.meets.lock();
             nodes.retain(|_, n| {
                 !(n.flags.contains(NodeFlags::HANDSHAKE)
-                    && now.saturating_sub(n.ping_sent_ms) > handshake_timeout)
+                    && now.saturating_sub(n.ping_sent_ms) > handshake_timeout
+                    && !meets.contains(&format!("{}:{}", n.ip, n.cluster_port)))
             });
+            drop(meets);
             for node in nodes.values_mut() {
                 if node.id == me {
                     continue;
@@ -2633,9 +2759,58 @@ impl ClusterState {
             }
         }
 
-        // Phase 3: persist (which also refreshes the serving state).
-        let _ = self.save_to_disk();
+        // Phase 3: persist, by the caller: see `save_promotion`. The election
+        // is won and the cluster has agreed to it: the promotion holds,
+        // whether or not it can be saved now.
+        self.refresh_state();
         claimed
+    }
+
+    /// Save a promotion [`Self::promote_self`] just made, before it is
+    /// announced: waits for the save at most [`PROMOTION_SAVE_WAIT`], on a
+    /// thread of its own (a save on a slow disk takes seconds, and the bus
+    /// must go on answering meanwhile). The save is made at once, not after
+    /// the gap between the bus's own saves. `Err` with the reason if it
+    /// failed or is not done in that time: the promotion is announced all
+    /// the same, and holds in memory; a save that failed is made again on
+    /// the save thread, every second until one works, and the failure is
+    /// logged as an error until then.
+    ///
+    /// Blocks for up to [`PROMOTION_SAVE_WAIT`]: for a command, or through
+    /// `spawn_blocking` on the bus.
+    pub fn save_promotion(self: &std::sync::Arc<Self>) -> Result<(), String> {
+        if self.config_path.is_none() {
+            return Ok(());
+        }
+        // Every save numbered from here on has the promotion.
+        let from = self.saves.written.load(Ordering::SeqCst) + 1;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let state = std::sync::Arc::clone(self);
+        crate::cpus::spawn(move || {
+            let deadline = std::time::Instant::now() + ELECTION_LIFETIME;
+            let saved = persist::wait_for_save(&state, from, deadline);
+            if saved.is_err() {
+                state.save_soon();
+            }
+            let _ = tx.send(saved);
+        });
+        let saved = match rx.recv_timeout(PROMOTION_SAVE_WAIT) {
+            Ok(saved) => saved,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "the save did not end in {} ms",
+                PROMOTION_SAVE_WAIT.as_millis()
+            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err("the save thread ended".into())
+            }
+        };
+        if let Err(e) = &saved {
+            log_warn!(
+                "Cluster: the promotion is announced before it is on disk ({e}); it is saved \
+                 in the background"
+            );
+        }
+        saved
     }
 
     /// Of the slots a promotion `claimed`, those another master has taken
@@ -2930,8 +3105,9 @@ impl ClusterState {
 
     /// How long after a failover of a master began a replica of it may still
     /// be promoted by it: an election lives for [`ELECTION_LIFETIME`], and a
-    /// vote sent at its end is counted for as long as the candidate waits for
-    /// it (the node timeout, at least 2 s). Never less than two node
+    /// vote is counted only while it does (the candidate waits for one at
+    /// most that long, or two node timeouts); a margin of a node timeout (at
+    /// least 2 s) on top. Never less than two node
     /// timeouts, the time a master waits between votes for replicas of the
     /// same master. Neither a source nor a destination hands slots over in
     /// that time after it saw such a failover begin (#516).
@@ -3298,6 +3474,52 @@ pub(crate) const ELECTION_LIFETIME: std::time::Duration = std::time::Duration::f
 pub(crate) const FAILOVER_BEGAN: &str = "a failover of this node began during the migration \
      (CLUSTER FAILOVER on a replica of it, a vote for one, or a FAIL verdict)";
 const FAILOVER_BEGAN_RECENTLY: &str = "a failover of this node began";
+
+/// The least time between two of the saves the bus asks for (`save_soon`),
+/// which are made on a thread of their own. A save is synced twice (the file
+/// before it is renamed into place, and its directory after): in a cluster
+/// being formed, each node learning every other within a second or two, a
+/// save for each node learnt would keep a disk the nodes share so busy
+/// that `redis-cli --cluster create` of 30 nodes takes a second longer
+/// (measured). A save something waits on (a node met, a vote, a command's,
+/// a promotion) is made at once, by what waits.
+const BACKGROUND_SAVE_GAP: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long a node met waits for the save that makes it a member.
+const ADMIT_SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// One admission of a node met: see [`ClusterState::admit_met_node`].
+struct Admission {
+    /// Its entry in `ClusterState::joining`.
+    number: u64,
+    id: NodeId,
+    /// The first save that has the node.
+    from: u64,
+}
+
+/// How long a promotion waits for its save before it is announced: see
+/// [`ClusterState::save_promotion`].
+pub(crate) const PROMOTION_SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// This process's cluster state, once its bus has started: see
+/// [`save_at_shutdown`].
+static FOR_SHUTDOWN: std::sync::OnceLock<std::sync::Weak<ClusterState>> =
+    std::sync::OnceLock::new();
+
+/// Save nodes.conf as the node knows the cluster now, at the start of a
+/// shutdown, and wait for it. Changes learnt from the bus are saved on a
+/// thread of their own, which the process does not wait for when it exits:
+/// this save is, so the file it leaves has every change it knew of (#808).
+/// Nothing outside cluster mode, and nothing is written if nothing has
+/// changed since the last save.
+pub fn save_at_shutdown() {
+    let Some(state) = FOR_SHUTDOWN.get().and_then(std::sync::Weak::upgrade) else {
+        return;
+    };
+    if let Err(e) = state.save_to_disk() {
+        log_warn!("Cluster: could not save the cluster config file at shutdown: {e}");
+    }
+}
 
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4224,6 +4446,69 @@ mod tests {
         );
         assert!(cs.cast_vote(rb, b, 6, false, None));
         assert_eq!(cs.current_epoch(), 6);
+    }
+
+    /// A vote whose save fails is not sent, and the epoch counts as voted
+    /// in: a second candidate in it gets no vote either, its save or not.
+    #[test]
+    fn a_vote_that_cannot_be_saved_is_not_sent_nor_given_again_in_its_epoch() {
+        let (mut cs, a, b) = three_master_cluster();
+        let (ra, rb) = (add_replica(&cs, a), add_replica(&cs, b));
+        cs.nodes.write().get_mut(&a).unwrap().mark_failed(now_ms());
+        cs.nodes.write().get_mut(&b).unwrap().mark_failed(now_ms());
+        // A directory that is not there: every save fails.
+        cs.config_path = Some(
+            std::env::temp_dir()
+                .join("kividb-no-such-dir-808")
+                .join("nodes.conf"),
+        );
+        let ask = |sender, master| crate::cluster::bus::BusMessage::FailoverAuthRequest {
+            sender_id: sender,
+            sender_ip: "127.0.0.1".into(),
+            sender_client_port: 7000,
+            sender_cluster_port: 17000,
+            request_epoch: 5,
+            master_id: master,
+            force: false,
+            claims: None,
+        };
+        let peer: std::net::SocketAddr = "127.0.0.1:17000".parse().unwrap();
+        assert!(crate::cluster::bus::listener::process_message(&cs, ask(ra, a), peer).is_none());
+        assert_eq!(cs.last_vote_epoch.load(Ordering::SeqCst), 5);
+        cs.config_path = None;
+        assert!(crate::cluster::bus::listener::process_message(&cs, ask(rb, b), peer).is_none());
+        assert!(!cs.cast_vote(rb, b, 5, false, None));
+    }
+
+    /// Two admissions of one node under way at once (a MEET and its retry),
+    /// the first failing: it takes only its own entry with it, so the save
+    /// the second waits on has the node, and the node is a member once that
+    /// save is on disk.
+    #[test]
+    fn a_failed_admission_leaves_another_of_the_same_node_in_its_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        let conf = sub.join("nodes.conf");
+        let mut cs = ClusterState::new_enabled(None, 15000);
+        // Not there yet: saves fail.
+        cs.config_path = Some(conf.clone());
+        let id = generate_node_id();
+        let node = ClusterNode::new(id, "127.0.0.1".into(), 7001, 17001);
+        let first = cs.begin_admission(node.clone());
+        assert!(persist::save_from_state(&cs).is_err());
+        // Begun after the first's save failed: it waits on a later one.
+        let second = cs.begin_admission(node);
+        std::fs::create_dir(&sub).unwrap();
+        assert!(!cs.finish_admission(first, || panic!("a member unsaved")));
+        let mut added = false;
+        assert!(cs.finish_admission(second, || added = true));
+        assert!(added);
+        let saved = std::fs::read_to_string(&conf).unwrap();
+        assert!(
+            saved.lines().any(|l| l.starts_with(node_id_str(&id))),
+            "{saved}"
+        );
+        assert!(cs.joining.lock().is_empty());
     }
 
     /// Two replicas of one master must not both be elected moments apart.
