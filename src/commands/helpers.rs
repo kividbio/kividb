@@ -788,6 +788,8 @@ pub fn spawn_active_expire_task(
 /// on the large sets handed to the background (`member_set::after_write`).
 const RESIZE_WORK: Duration = Duration::from_millis(1);
 const RESIZE_SLICE: Duration = Duration::from_millis(2);
+/// How often an expiry thread with nothing to resize looks again.
+const RESIZE_IDLE_SLICE: Duration = Duration::from_millis(10);
 
 /// Sleep for `wait`, working on the large sets' resizes meanwhile, if any
 /// are waiting: [`RESIZE_WORK`] of every [`RESIZE_SLICE`], a step at a time
@@ -802,8 +804,10 @@ fn sleep_finishing_resizes(wait: Duration) {
             return;
         }
         if !crate::member_set::background_pending() {
-            std::thread::sleep(until - now);
-            return;
+            // In slices, so that a set handed over meanwhile is worked on
+            // within one, not after the whole wait.
+            std::thread::sleep(RESIZE_IDLE_SLICE.min(until - now));
+            continue;
         }
         crate::member_set::step_background(RESIZE_WORK);
         let now = std::time::Instant::now();
