@@ -53,9 +53,9 @@ from suite import (Suite, Config, KEEP_IMPROVEMENT, EXACT, rel, bound, jitter, v
 
 RUNS = 5
 S = Suite("14-sinter-big-small", [
-    Config("default"),
-    Config("n20m", full_only=True),
-    Config("sunion", io="tokio"),
+    Config("default", threads=2),
+    Config("n20m", full_only=True, threads=2),
+    Config("sunion", io="tokio", threads=2),
 ])
 SIZES = {"default": (1_000_000, 5_000_000), "n20m": (20_000_000,)}
 GATES = [rel(50, abs=2), KEEP_IMPROVEMENT, vs_redis(2)]  # replies of ~2,000 members

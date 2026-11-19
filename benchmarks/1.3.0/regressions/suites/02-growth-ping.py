@@ -5,7 +5,8 @@ One loader connection (redis-py) SETs 8,000,000 keys key:N with 16-byte values
 in pipelines of 2,000; one probe connection, in its own process, PINGs every
 1 ms the whole time. Configurations:
 
-  tokio    --io-model tokio, default threads (what Docker's seccomp gives you)
+  tokio    --io-model tokio (what Docker's seccomp gives you), --threads 2
+           (the default on 4 vCPUs when it was recorded)
   uring1   --io-model uring --threads 1: the probe shares the loader's ring
   ex17m    FULL=1 only: 17,500,000 keys with SET ... EX 86400 on Tokio (the TTL
            sweep's lock hand-off, the second half of #780)
@@ -29,9 +30,9 @@ from rss import vmrss_mib, used_memory_mib  # noqa: E402
 
 KIVI = ("v1_2_2", "candidate")
 S = Suite("02-growth-ping", [
-    Config("tokio", io="tokio"),
+    Config("tokio", io="tokio", threads=2),
     Config("uring1", io="uring", threads=1, engines=KIVI),
-    Config("ex17m", io="tokio", full_only=True),
+    Config("ex17m", io="tokio", full_only=True, threads=2),
 ])
 SIZES = {"tokio": (8_000_000, None), "uring1": (8_000_000, None), "ex17m": (17_500_000, 86400)}
 

@@ -43,7 +43,7 @@ CONFIGS = {
     "q8_768_10k": ("Q8", 10000, "speed"),
     "f32_768_10k": ("NOQUANT", 10000, "speed"),
 }
-S = Suite("09-vector-sets", [Config(n) for n in CONFIGS])
+S = Suite("09-vector-sets", [Config(n, threads=2) for n in CONFIGS])
 
 
 @S.run

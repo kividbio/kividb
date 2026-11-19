@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import Suite, Config, EXACT, rel, bound, info  # noqa: E402
 from nodes import Nodes, slot  # noqa: E402
 
-S = Suite("12-search-fanout", [Config("cluster3", engines=("v1_2_2", "candidate"), self_hosted=True)])
+S = Suite("12-search-fanout", [Config("cluster3", engines=("v1_2_2", "candidate"), self_hosted=True, threads=2)])
 CLIENTS, EACH = 8, 250
 
 
