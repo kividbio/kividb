@@ -1154,6 +1154,31 @@ fn chain_cap() -> usize {
     TEST_CHAIN_CAP.with(std::cell::Cell::get)
 }
 
+/// The fresh seed of a resize with a new seed: random. In tests, the next
+/// of a sequence of fixed seeds of the test's thread, so that a test whose
+/// outcome depends on where elements land after a reseed always sees the
+/// same landing (a random one made a test of the reseed count flaky).
+#[cfg(not(test))]
+#[inline]
+fn reseed_hasher() -> ahash::RandomState {
+    ahash::RandomState::new()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RESEEDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reseed_hasher() -> ahash::RandomState {
+    let k = TEST_RESEEDS.with(|n| {
+        n.set(n.get() + 1);
+        n.get()
+    });
+    let seed = k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    ahash::RandomState::with_seeds(seed, seed ^ 0x5851_F42D, seed.rotate_left(23), !seed)
+}
+
 /// The table: a hash's fields or a set's members (`K`), its memory from `A`.
 pub struct CollectionTable<K: Kind, A: Memory = EntryPool> {
     /// The main array (see [`Self::main`]): its groups and its size, apart
@@ -1665,7 +1690,7 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
         debug_assert!(!self.resizing());
         let new = Array::alloc::<A>(bits);
         let main = self.main();
-        let hasher = reseed.then(|| std::mem::replace(&mut self.hasher, ahash::RandomState::new()));
+        let hasher = reseed.then(|| std::mem::replace(&mut self.hasher, reseed_hasher()));
         let rare = self.rare.get_or_insert_with(|| Box::new(Rare::new()));
         if reseed {
             rare.reseeds += 1;
@@ -4643,11 +4668,16 @@ mod tests {
     #[test]
     fn resizes_with_a_new_seed_stop_after_three_in_a_row() {
         TEST_CHAIN_CAP.with(|cap| cap.set(1));
-        // Not scaled under Miri: a smaller table may see no overflow at all.
+        // The reseeds' seeds are the test thread's fixed sequence (see
+        // `reseed_hasher`), so the count does not depend on luck. Not scaled
+        // under Miri: a smaller table may see no overflow at all. Filled to
+        // 0.7 of the growth point (under the 3/4 where a reseed grows the
+        // array): some 14 of the 256 home groups overflow under any seed, so
+        // every reseed's moves make a chain over the cap of 1.
         let mut table = HashT::with_capacity_and_seed(1_000, 41);
         let bits = table.bits;
         let mut i = 0usize;
-        while table.len() < table.capacity() / 2 {
+        while table.len() < table.capacity() * 7 / 10 {
             table
                 .insert(format!("f{i}").as_bytes(), b"v", None)
                 .unwrap();
