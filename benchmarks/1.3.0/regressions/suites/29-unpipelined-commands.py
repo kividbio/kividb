@@ -31,8 +31,9 @@ is emitted ungated (`<row>_client_limited` 1) rather than failed. On a
 `Standard_D4s_v5` that is the two-worker rows: two client CPUs drive two
 workers to about 1.93 CPUs and are themselves at 2.0, and master measured
 the same as v1.2.2 there; the one-worker rows (three client CPUs at about
-1.4) carry the gate. With fewer than 4 CPUs to use, the suite measures
-nothing and emits `skipped_cpus` (info) only.
+1.4) carry the gate. `min_cpus=4`: run-all.sh does not run it on a
+smaller machine; one that limits this process to fewer CPUs than it has
+measures nothing and emits `skipped_cpus` (info) only.
 """
 import os
 import subprocess
@@ -49,7 +50,7 @@ S = Suite("29-unpipelined-commands", [
     Config("uring2", io="uring", threads=2, engines=ENGINES),
     Config("tokio1", io="tokio", threads=1, engines=ENGINES),
     Config("tokio2", io="tokio", threads=2, engines=ENGINES),
-])
+], min_cpus=4)
 CONNS = 64
 KEYS = 5000
 ROUNDS = 3
