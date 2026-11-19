@@ -119,6 +119,12 @@ struct Server {
     dir: std::path::PathBuf,
 }
 
+/// How many new connections a look for one on a free thread opens. On the
+/// io_uring loop the worker held by a script accepts nothing meanwhile,
+/// and the others hand it new connections while it holds fewer than they
+/// do (`run_uring`'s balance): most of a burst can land on it.
+const NEW_CONNS: usize = 32;
+
 /// How long a script is held where it calls `ECHO script-stall:...`.
 const STALL_MS: u64 = 800;
 
@@ -134,6 +140,8 @@ impl Server {
             Command::new(env!("CARGO_BIN_EXE_kividb"))
                 .current_dir(&dir)
                 .env("KIVIDB_TEST_SCRIPT_STALL_MS", STALL_MS.to_string())
+                // A slow run under load must not make the next one run alone.
+                .env("KIVIDB_TEST_KEEP_FAST_SCRIPTS", "1")
                 .args([
                     "--port",
                     &port.to_string(),
@@ -249,17 +257,26 @@ fn start_held_script(
 
 /// `INFO stats`' `scripts_run_beside_others`, from whichever of several new
 /// connections answers first (one on the thread running a held script
-/// waits for it).
-fn scripts_beside_others(server: &Server) -> u64 {
+/// waits for it). `None` if none could say: a held script that runs alone
+/// past `lua-time-limit` has every client answered `-BUSY`.
+fn scripts_beside_others(server: &Server) -> Option<u64> {
     let (tx, rx) = std::sync::mpsc::channel();
     for _ in 0..8 {
         let mut c = server.conn();
         let tx = tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(c.info("stats", "scripts_run_beside_others"));
+            let count = match c.cmd(&["INFO", "stats"]) {
+                V::Str(text) => text.lines().find_map(|line| {
+                    line.strip_prefix("scripts_run_beside_others:")
+                        .and_then(|n| n.trim().parse().ok())
+                }),
+                _ => None,
+            };
+            let _ = tx.send(count);
         });
     }
-    rx.recv().unwrap().parse().unwrap()
+    drop(tx);
+    rx.iter().flatten().next()
 }
 
 /// `start()`'s held script, once it runs beside others. A run that took over
@@ -273,9 +290,9 @@ fn held_beside_others<T>(
     mut warm: impl FnMut(),
 ) -> std::thread::JoinHandle<T> {
     for _ in 0..5 {
-        let before = scripts_beside_others(server);
+        let before = scripts_beside_others(server).expect("scripts_run_beside_others");
         let held = start();
-        if scripts_beside_others(server) > before {
+        if scripts_beside_others(server).is_some_and(|now| now > before) {
             return held;
         }
         let _ = held.join();
@@ -297,17 +314,20 @@ fn free_conn(server: &Server) -> Conn {
 /// over five milliseconds runs alone next time: a held run does, and so can
 /// a quick one on a loaded machine.)
 fn try_free_conn(server: &Server) -> Option<Conn> {
-    let asked = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel();
-    for _ in 0..8 {
-        let mut c = server.conn();
+    // Each opened on a thread of its own, all at once.
+    let port = server.port;
+    for _ in 0..NEW_CONNS {
         let tx = tx.clone();
         std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
             if c.cmd(&["PING"]) == V::Str("PONG".into()) {
                 let _ = tx.send(c);
             }
         });
     }
+    // From here: starting the threads is not what is timed.
+    let asked = Instant::now();
     let c = rx.recv_timeout(Duration::from_millis(STALL_MS / 4)).ok()?;
     (asked.elapsed() < Duration::from_millis(STALL_MS / 4)).then_some(c)
 }
@@ -316,17 +336,19 @@ fn try_free_conn(server: &Server) -> Option<Conn> {
 /// which is not one on the thread busy running a held script; within a
 /// quarter of the stall.
 fn answered_at_once(server: &Server, args: &[&str]) -> V {
-    let asked = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel();
-    for _ in 0..8 {
-        let mut c = server.conn();
+    let port = server.port;
+    for _ in 0..NEW_CONNS {
         let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
         let tx = tx.clone();
         std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             let _ = tx.send(c.cmd(&args));
         });
     }
+    // From here: starting the threads is not what is timed.
+    let asked = Instant::now();
     let reply = rx.recv().unwrap();
     assert!(
         asked.elapsed() < Duration::from_millis(STALL_MS / 4),
@@ -354,7 +376,7 @@ fn a_waiting_command_leaves_its_thread_free(io: &str) {
         reader.send(&["GET", "{a}:k"]);
     }
     std::thread::sleep(Duration::from_millis(50));
-    let others: Vec<std::thread::JoinHandle<Duration>> = (0..10)
+    let others: Vec<std::thread::JoinHandle<Duration>> = (0..NEW_CONNS)
         .map(|_| {
             let mut other = server.conn();
             std::thread::spawn(move || {
@@ -980,10 +1002,20 @@ fn an_exec_whose_client_goes_while_it_waits(io: &str) {
         free_conn(&server).cmd(&["CLIENT", "KILL", "ID", &id.to_string()]),
         V::Int(1)
     );
+    // Closed while its `EXEC` still waited for the script, if the script is
+    // held still: its transaction is not to run at all.
+    let closed_while_waiting = server.holding();
     let (reply, _) = script.join().unwrap();
     assert_eq!(reply, V::Int(1));
 
     let asked = Instant::now();
+    if closed_while_waiting {
+        assert_eq!(
+            c.cmd(&["EXISTS", "{c}:1", "{c}:2"]),
+            V::Int(0),
+            "the transaction of a client that went while it waited ran"
+        );
+    }
     for tag in ["c", "k"] {
         let first = c.cmd(&["GET", &format!("{{{tag}}}:1")]);
         let second = c.cmd(&["GET", &format!("{{{tag}}}:2")]);
@@ -1072,4 +1104,143 @@ fn a_waiting_exec_is_then_held_by_a_pause_tokio() {
 #[test]
 fn a_waiting_exec_is_then_held_by_a_pause_uring() {
     a_waiting_exec_is_then_held_by_a_pause("uring");
+}
+
+/// `STALLS_FIRST` held on `key`, on a connection of its own, once it runs
+/// beside others; made quick (again) on `warm_key`, so that warming it does
+/// not write `key`.
+fn start_held_writer(
+    server: &Server,
+    sha: &str,
+    key: &str,
+    warm_key: &str,
+) -> std::thread::JoinHandle<V> {
+    held_beside_others(
+        server,
+        || {
+            let mut runner = server.conn();
+            runner.send(&["EVALSHA", sha, "1", key, "script", "script-stall:1", "ok"]);
+            let script = std::thread::spawn(move || runner.read());
+            server.wait_until_held();
+            script
+        },
+        || {
+            let mut c = server.conn();
+            for _ in 0..3 {
+                assert_eq!(
+                    c.cmd(&["EVALSHA", sha, "1", warm_key, "warm", "no-stall", "ok"]),
+                    V::Int(1)
+                );
+            }
+        },
+    )
+}
+
+/// `STALLS_FIRST` loaded and made quick on `warm_key`.
+fn quick_writer(c: &mut Conn, warm_key: &str) -> String {
+    let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", STALLS_FIRST]) else {
+        panic!("no digest")
+    };
+    for _ in 0..3 {
+        assert_eq!(
+            c.cmd(&["EVALSHA", &sha, "1", warm_key, "warm", "no-stall", "ok"]),
+            V::Int(1)
+        );
+    }
+    sha
+}
+
+/// A watched key written while the watching `EXEC` waits for a script — by
+/// that script, which writes it only after its stall — fails the
+/// transaction: the watches are checked when it runs, after the wait.
+fn a_key_written_while_a_watching_exec_waits_fails_it(io: &str) {
+    let server = Server::start(io, 4);
+    let mut c = server.conn();
+    let sha = quick_writer(&mut c, "{a}:warm");
+    let script = start_held_writer(&server, &sha, "{a}:w", "{a}:warm");
+    // Watched while the script is held, before it writes the key (after its
+    // stall). `WATCH` takes no tag's turn.
+    let mut tx = free_conn(&server);
+    assert_eq!(tx.cmd(&["WATCH", "{a}:w"]), V::Str("OK".into()));
+    assert!(server.holding(), "the script was not held at the WATCH");
+
+    send_exec(&mut tx, &[], &[&["SET", "x", "1"]], &[]);
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        server.holding(),
+        "the script was not held while EXEC waited"
+    );
+    assert_eq!(answered_at_once(&server, &["EXISTS", "x"]), V::Int(0));
+
+    assert_eq!(script.join().unwrap(), V::Int(1));
+    assert_eq!(
+        tx.read(),
+        V::Nil,
+        "a transaction whose watched key changed ran"
+    );
+    assert_eq!(c.cmd(&["EXISTS", "x"]), V::Int(0));
+    assert_eq!(c.cmd(&["GET", "{a}:w"]), V::Str("script".into()));
+    assert_eq!(c.info("clients", "blocked_clients"), "0");
+}
+
+#[test]
+fn a_key_written_while_a_watching_exec_waits_fails_it_tokio() {
+    a_key_written_while_a_watching_exec_waits_fails_it("tokio");
+}
+
+#[test]
+fn a_key_written_while_a_watching_exec_waits_fails_it_uring() {
+    a_key_written_while_a_watching_exec_waits_fails_it("uring");
+}
+
+/// A watching `EXEC` waiting for a script holds nothing another watching
+/// transaction needs: another connection's replies before its own watching
+/// `EXEC` are sent at once, and both transactions run after the script.
+fn a_waiting_watching_exec_holds_back_no_other_replies(io: &str) {
+    let server = Server::start(io, 4);
+    let mut c = server.conn();
+    let sha = quick_writer(&mut c, "{a}:warm");
+    let script = start_held_writer(&server, &sha, "{a}:w", "{a}:warm");
+    let mut first = free_conn(&server);
+    assert_eq!(first.cmd(&["WATCH", "{a}:other"]), V::Str("OK".into()));
+    let mut second = free_conn(&server);
+    assert_eq!(second.cmd(&["WATCH", "{b}:other"]), V::Str("OK".into()));
+
+    send_exec(&mut first, &[], &[&["SET", "{a}:x", "1"]], &[]);
+    std::thread::sleep(Duration::from_millis(50));
+    // The second's pipeline: a write, and a watching transaction.
+    let mut batch = encode(&["SET", "y", "1"]);
+    for args in [&["MULTI"][..], &["SET", "{b}:x", "1"], &["EXEC"]] {
+        batch.extend_from_slice(&encode(args));
+    }
+    let sent = Instant::now();
+    second.writer.write_all(&batch).unwrap();
+    assert_eq!(second.read(), V::Str("OK".into()));
+    let took = sent.elapsed();
+    assert!(
+        server.holding(),
+        "the script was not held while the second client was answered"
+    );
+    assert!(
+        took < Duration::from_millis(STALL_MS / 4),
+        "the reply before a watching EXEC waited for another one: {took:?}"
+    );
+    assert_eq!(second.read(), V::Str("OK".into()));
+    assert_eq!(second.read(), V::Str("QUEUED".into()));
+
+    assert_eq!(script.join().unwrap(), V::Int(1));
+    assert_eq!(first.read(), V::Arr(vec![V::Str("OK".into())]));
+    assert_eq!(second.read(), V::Arr(vec![V::Str("OK".into())]));
+    assert_eq!(c.cmd(&["EXISTS", "{a}:x", "{b}:x", "y"]), V::Int(3));
+    assert_eq!(c.info("clients", "blocked_clients"), "0");
+}
+
+#[test]
+fn a_waiting_watching_exec_holds_back_no_other_replies_tokio() {
+    a_waiting_watching_exec_holds_back_no_other_replies("tokio");
+}
+
+#[test]
+fn a_waiting_watching_exec_holds_back_no_other_replies_uring() {
+    a_waiting_watching_exec_holds_back_no_other_replies("uring");
 }

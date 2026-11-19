@@ -2590,6 +2590,12 @@ pub async fn handle_client(
                         let (_alone, _waited) = match crate::tag_locks::exec_alone(waited) {
                             Ok(taken) => taken,
                             Err(waits) => {
+                                // Not held while it waits: another
+                                // connection's replies before its own watching
+                                // `EXEC` would wait with it. The dispatch
+                                // again takes it again; the watches are
+                                // checked inside the gates.
+                                drop(_one_at_a_time);
                                 if std::mem::take(&mut aof_wait) {
                                     crate::aof::written(&aof_tx).await;
                                 }

@@ -1419,30 +1419,36 @@ pub async fn run_beside_others() -> RunningBeside {
 async fn wait_for_execs(running: RunningBeside) -> RunningBeside {
     let first = EXECS_STARTED.load(Ordering::SeqCst);
     let stream = || EXECS_STARTED.load(Ordering::SeqCst).wrapping_sub(first) > EXEC_STREAM;
-    let mut running = Some(running);
+    // Not counted while it waits: the `EXEC`s wait for the count.
+    drop(running);
     loop {
         if stream() {
             break;
         }
-        // Not counted while it waits: the `EXEC`s wait for the count.
-        drop(running.take());
         let ended = EXECS_ENDED.notified();
         tokio::pin!(ended);
         // Enabled before the look: an `EXEC` that stops waiting after it
         // wakes this one.
         ended.as_mut().enable();
         if EXECS_WAITING.load(Ordering::SeqCst) != 0 {
+            // Looked at again without counting itself: a count let go of
+            // at every wake would wake the waiting `EXEC`s for nothing, and
+            // one that came in between would wait again.
             tokio::select! {
                 () = &mut ended => {}
                 () = tokio::time::sleep(Duration::from_millis(20)) => {}
             }
+            continue;
         }
-        running = Some(RunningBeside::count());
+        // None waits: counted, and then looked at again, so that an `EXEC`
+        // that starts to wait in between sees the count.
+        let running = RunningBeside::count();
         if EXECS_WAITING.load(Ordering::SeqCst) == 0 {
-            break;
+            return running;
         }
+        drop(running);
     }
-    running.unwrap_or_else(RunningBeside::count)
+    RunningBeside::count()
 }
 
 /// Held by an `EXEC` that waits for the scripts running beside others, from

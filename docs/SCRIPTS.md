@@ -216,7 +216,10 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   and the `EXEC`s wait for it too). The transaction then runs whole, alone,
   as before: its `WATCH`es are checked inside the gate, a `CLIENT PAUSE`
   or slot handoff that came meanwhile holds or refuses it whole, and if
-  its client goes while it waits, nothing of it runs.
+  its client goes while it waits, nothing of it runs. While an `EXEC`
+  waits for a running script, tagged scripts on other tags that arrive are
+  held too (released once more than three `EXEC`s have started waiting),
+  so a very long script delays them for its duration.
 
 - **Every other script is as before.** A script with no keys, or with a key
   that has no tag, runs alone and may touch what it likes. So do functions

@@ -140,6 +140,8 @@ impl Server {
             Command::new(env!("CARGO_BIN_EXE_kividb"))
                 .current_dir(&dir)
                 .env("KIVIDB_TEST_SCRIPT_STALL_MS", STALL_MS.to_string())
+                // A slow run under load must not make the next one run alone.
+                .env("KIVIDB_TEST_KEEP_FAST_SCRIPTS", "1")
                 .args([
                     "--port",
                     &port.to_string(),
@@ -321,22 +323,31 @@ fn held_beside_others<T>(
     panic!("the held script never ran beside others");
 }
 
+/// How many new connections a look for one on a free thread opens. On the
+/// io_uring loop the worker held by a script accepts nothing meanwhile,
+/// and the others hand it new connections while it holds fewer than they
+/// do (`run_uring`'s balance): most of a burst can land on it.
+const NEW_CONNS: usize = 32;
+
 /// A new connection on a thread that is not busy running a held script:
 /// the first of several to answer a `PING`, within a quarter of the stall.
 /// (On the io_uring loop the kernel places connections; on Tokio a
 /// connection whose thread is busy waits for it too.)
 fn free_conn(server: &Server) -> Conn {
-    let asked = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel();
-    for _ in 0..8 {
-        let mut c = server.conn();
+    // Each opened on a thread of its own, all at once.
+    let port = server.port;
+    for _ in 0..NEW_CONNS {
         let tx = tx.clone();
         std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
             if c.cmd(&["PING"]) == V::Str("PONG".into()) {
                 let _ = tx.send(c);
             }
         });
     }
+    // From here: starting the threads is not what is timed.
+    let asked = Instant::now();
     let c = rx
         .recv_timeout(Duration::from_millis(STALL_MS / 4))
         .expect("no new connection was answered at once");
@@ -457,7 +468,7 @@ fn a_waiting_walk_holds_back_no_other_command(io: &str) {
     let mut walker = free_conn(&server);
     walker.send(&["KEYS", "*"]);
     std::thread::sleep(Duration::from_millis(50));
-    let others: Vec<std::thread::JoinHandle<Duration>> = (0..8)
+    let others: Vec<std::thread::JoinHandle<Duration>> = (0..NEW_CONNS)
         .map(|_| {
             let mut other = server.conn();
             std::thread::spawn(move || {
