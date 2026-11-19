@@ -93,9 +93,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The AOF's new log opens with a record of where the old log ended
   (#277).** A log written by 1.2.2 or earlier has none and loads as before.
   Going back to 1.2.x after a checkpoint of this version, 1.2.x replays the
-  record as an unknown command and passes over it (`1 AOF command(s) failed
-  to apply and were skipped`), loading every write, but it counts a log
-  holding only the record as written to: a node stopped cleanly then does
+  record as an unknown command and passes over it (it logs `[WARN]
+  Replication: Replicated command error (non-fatal): -ERR unknown command
+  'KIVIDB.AOF-OLD-LOG-END', with args beginning with: ...`), loading every
+  write, but it counts a log holding only the record as written to: a node
+  stopped cleanly then does
   not go on from its saved replication point (a replica asks for a full
   sync). A `SAVE` or `BGREWRITEAOF` under 1.2.x writes a log without it.
 - **nodes.conf keeps each node's shard id (#563)**, after its address and
@@ -481,21 +483,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **A restart replays the new log of an unfinished checkpoint only after
-  the old one is complete to its recorded length (#277).** A turn-over's
-  new `appendonly.aof` now opens with a record of where the old log
-  (`appendonly.aof.prev`) ended: its length and a hash of its last 4 KiB.
-  When a power failure leaves the old log short of that, the restart
-  replays the old log up to its last whole record and not the new log, so
-  the dataset is always a beginning of the writes; it says so in a
-  `[WARN]`, keeps the new log aside as `superseded.<ms>.<n>.appendonly.aof`
-  with instructions, and starts the log again after the old one. None of
-  the writes left out had been reported synced: a sync of the new log
-  (under `appendfsync always`, or for `WAITAOF`) first syncs the old one.
-  Under `everysec` and `no` the checkpoint also syncs the log just before
-  it turns it over, so the old log's last sync has little left to write.
-  See "The old log is complete before the new one is replayed" in
-  docs/PERSISTENCE.md.
+- **A restart replays the new log of an unfinished checkpoint only when
+  the old log matches that record (its length, and its last 4 KiB)
+  (#277).** A turn-over's new `appendonly.aof` now opens with a record of
+  where the old log (`appendonly.aof.prev`) ended. When a power failure
+  leaves the old log short of that, the restart replays the old log up to
+  its last whole record and does not replay the new log after it; it says
+  so in a `[WARN]`, keeps the new log aside as
+  `superseded.<ms>.<n>.appendonly.aof` with instructions, and starts the
+  log again after the old one. None of the writes left out had been
+  reported synced: a sync of the new log (under `appendfsync always`, or
+  for `WAITAOF`) first syncs the old one. An old log that ends in a record
+  cut short is cut after its last whole record at that restart, before a
+  later checkpoint can add records to it. Under `everysec` and `no` the
+  checkpoint also syncs the log just before it turns it over, so the old
+  log's last sync has little left to write. See "The old log is complete
+  before the new one is replayed" in docs/PERSISTENCE.md.
+- **A write to the AOF that the disk takes only part of is taken back.**
+  The log is cut to where it was before the write, and the write's
+  records, with all queued after them, are written first once the disk
+  takes them. Until then their replies wait (at most 5 seconds, as for a
+  disk that is behind), `WAITAOF` counts no sync, and
+  `aof_last_write_status` reads `err`. See "A write to the log that the
+  disk takes only part of" in docs/PERSISTENCE.md.
 - **With `lua-parallel-scripts` on, `KEYS` and `SCAN` no longer stop
   every connection (#772).** So that a walk of
   the keyspace never finds a script running beside others part-way
