@@ -9,6 +9,8 @@
 //! cargo run --release --example collection_table_bench -- fill
 //! cargo run --release --example collection_table_bench -- random
 //! cargo run --release --example collection_table_bench -- chains
+//! cargo run --release --example collection_table_bench -- classes
+//! cargo run --release --example collection_table_bench -- rss pool|system|today
 //! valgrind --tool=callgrind --toggle-collect='*measured*' --cache-sim=yes \
 //!   target/release/examples/collection_table_bench ops STRUCT WORKLOAD N OP
 //! ```
@@ -33,6 +35,12 @@
 //!   bucket.
 //! - `chains`: chain lengths at the fullest point (3,211,264 elements), as
 //!   counted and as the Poisson model has them.
+//! - `classes`: bytes per element for entries of 9 to 64 bytes, from slab
+//!   classes 16 bytes apart (`SlabMemory`) and from the entry pool's, 8
+//!   apart below 64 (`EntryPool`).
+//! - `rss`: one structure in a fresh process: RSS and `used_memory` with
+//!   #764's 3M fields, then after deleting 90% of them at random (and, for
+//!   glibc, after `malloc_trim`).
 //!
 //! The fixed-seed constructor is for measurements that must repeat; server
 //! code cannot use it (`clippy.toml`).
@@ -45,7 +53,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use kividb::collection_table::{
-    CollectionTable, Fields, Members, Memory, SlabMemory, SystemMemory,
+    CollectionTable, EntryPool, Fields, Members, Memory, SlabMemory, SystemMemory,
 };
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -306,16 +314,16 @@ fn mem() {
     }
     println!("bytes per element (used_memory): table with entries from the system allocator");
     println!(
-        "as counted (requested size) / as glibc really takes them / from value_slab classes; today's structure as counted"
+        "as counted (requested size) / as glibc really takes them / from value_slab's keyspace classes (16 B apart) / from the entry pool (the default: 8 B apart below 64); today's structure as counted"
     );
     println!();
     for w in workloads {
         println!("### {}", w.name());
         println!();
         println!(
-            "| elements | today | table, system (counted) | table, system (glibc real) | table, value_slab |"
+            "| elements | today | table, system (counted) | table, system (glibc real) | table, value_slab | table, entry pool |"
         );
-        println!("|---|---|---|---|---|");
+        println!("|---|---|---|---|---|---|");
         for (label, n) in &sizes {
             let n = *n;
             let (sys, sys_counted) = table_bytes::<SystemMemory>(w, n);
@@ -325,14 +333,22 @@ fn mem() {
             );
             let (glibc, _) = table_bytes::<GlibcMemory>(w, n);
             let (slab, _) = table_bytes::<SlabMemory>(w, n);
+            let (pool, pool_counted) = table_bytes::<EntryPool>(w, n);
+            // The pool's blocks are counted as they are handed out; the
+            // slabs' own lists may have grown meanwhile (a few KiB at most).
+            assert!(
+                (pool as isize - pool_counted).abs() < 64 << 10,
+                "the pool's allocation_size is what is counted: {pool} / {pool_counted}"
+            );
             let today = today_bytes(w, n);
             let per = |b: f64| b / n as f64;
             println!(
-                "| {label} | {:.1} | {:.1} | {:.1} | {:.1} |",
+                "| {label} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |",
                 per(today as f64),
                 per(sys as f64),
                 per(glibc as f64),
-                per(slab as f64)
+                per(slab as f64),
+                per(pool as f64)
             );
         }
         println!();
@@ -987,6 +1003,143 @@ fn chains() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// classes
+// ---------------------------------------------------------------------------
+
+/// Bytes per member of a set of `n` members of `len` bytes, from `A`.
+fn set_bytes<A: Memory>(len: usize, n: usize) -> f64 {
+    let mut t = CollectionTable::<Members, A>::with_capacity_and_seed(0, 1);
+    for i in 0..n {
+        // `len` digits: distinct, as n is under 10^8.
+        t.insert(format!("{i:0>len$}").as_bytes()).unwrap();
+    }
+    while !t.step_resize(usize::MAX) {}
+    t.allocation_size() as f64 / n as f64
+}
+
+fn classes() {
+    let n = 100_000;
+    println!("set of {n} members: bytes per member, entry = member + 1 byte");
+    println!();
+    println!("| member bytes | entry bytes | 16 B classes | 8 B classes below 64 | saved |");
+    println!("|---|---|---|---|---|");
+    let (mut sum16, mut sum8, mut count) = (0f64, 0f64, 0usize);
+    for len in 8..=63 {
+        let b16 = set_bytes::<SlabMemory>(len, n);
+        let b8 = set_bytes::<EntryPool>(len, n);
+        sum16 += b16;
+        sum8 += b8;
+        count += 1;
+        println!(
+            "| {len} | {} | {b16:.1} | {b8:.1} | {:.1} |",
+            len + 1,
+            b16 - b8
+        );
+    }
+    println!(
+        "| mean 8-63 | | {:.2} | {:.2} | {:.2} |",
+        sum16 / count as f64,
+        sum8 / count as f64,
+        (sum16 - sum8) / count as f64
+    );
+}
+
+// ---------------------------------------------------------------------------
+// rss
+// ---------------------------------------------------------------------------
+
+/// The process's resident set, from `/proc/self/status`, in bytes.
+fn rss() -> usize {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| {
+            v.trim()
+                .trim_end_matches(" kB")
+                .trim()
+                .parse::<usize>()
+                .ok()
+        })
+        .map_or(0, |kb| kb << 10)
+}
+
+#[cfg(all(target_os = "linux", not(feature = "mimalloc")))]
+fn trim() -> bool {
+    // SAFETY: glibc's own call, no arguments that point anywhere.
+    unsafe { libc::malloc_trim(0) != 0 }
+}
+
+#[cfg(not(all(target_os = "linux", not(feature = "mimalloc"))))]
+fn trim() -> bool {
+    false
+}
+
+fn rss_after_deletes(structure: &str) {
+    let n = 3_000_000;
+    let w = Workload::H764;
+    let keys: Vec<String> = (0..n).map(|i| w.key(i)).collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.shuffle(&mut StdRng::seed_from_u64(90));
+    let gone = &order[..n * 9 / 10];
+    let mib = |b: usize| b as f64 / f64::from(1 << 20);
+    let base_rss = rss();
+    let base_used = kividb::memory_use::allocated();
+    let report = |stage: &str| {
+        println!(
+            "| {structure} | {stage} | {:.1} | {:.1} |",
+            mib(rss().saturating_sub(base_rss)),
+            mib(kividb::memory_use::allocated().saturating_sub(base_used))
+        );
+    };
+    println!("| structure | stage | RSS MiB (over the start) | used_memory MiB |");
+    println!("|---|---|---|---|");
+    match structure {
+        "pool" | "system" => {
+            fn run<A: Memory>(keys: &[String], gone: &[usize], report: &dyn Fn(&str)) {
+                let mut t = CollectionTable::<Fields, A>::with_capacity_and_seed(0, 4);
+                for k in keys {
+                    t.insert(k.as_bytes(), b"v", None).unwrap();
+                }
+                while !t.step_resize(usize::MAX) {}
+                report("3M fields");
+                for &i in gone {
+                    t.remove(keys[i].as_bytes());
+                }
+                while !t.step_resize(usize::MAX) {}
+                report("90% deleted at random");
+                if trim() {
+                    report("after malloc_trim(0)");
+                }
+                black_box(&t);
+            }
+            if structure == "pool" {
+                run::<EntryPool>(&keys, gone, &report);
+            } else {
+                run::<SystemMemory>(&keys, gone, &report);
+            }
+        }
+        "today" => {
+            let mut t = IndexHash::default();
+            for k in &keys {
+                t.insert(k.clone(), Arc::from(&b"v"[..]));
+            }
+            report("3M fields");
+            for &i in gone {
+                t.swap_remove(keys[i].as_str());
+            }
+            t.shrink_to_fit();
+            report("90% deleted at random (then shrink_to_fit)");
+            if trim() {
+                report("after malloc_trim(0)");
+            }
+            black_box(&t);
+        }
+        _ => panic!("rss pool|system|today"),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let number = |i: usize, default: usize| {
@@ -1005,8 +1158,10 @@ fn main() {
         Some("fill") => fill(),
         Some("random") => random(),
         Some("chains") => chains(),
+        Some("classes") => classes(),
+        Some("rss") => rss_after_deletes(args.get(1).map_or("pool", String::as_str)),
         _ => eprintln!(
-            "usage: collection_table_bench mem | ops STRUCT WORKLOAD N OP | latency [N [WORKLOAD [MODE]]] | scan [N] | fill | random | chains"
+            "usage: collection_table_bench mem | ops STRUCT WORKLOAD N OP | latency [N [WORKLOAD [MODE]]] | scan [N] | fill | random | chains | classes | rss pool|system|today"
         ),
     }
 }

@@ -12,7 +12,7 @@
 //! `Arena`, allocated in chunks, so it is never copied.
 //!
 //! **Elements.** One block per element, aligned to 8 ([`Memory`] says where
-//! from): a hash entry is `[flen:7|TTL:1][vlen:7|LONG:1]`, then `u32 flen,
+//! from; by default the [`EntryPool`]): a hash entry is `[flen:7|TTL:1][vlen:7|LONG:1]`, then `u32 flen,
 //! u32 vlen` when `LONG`, then `[u32 list position][u64 deadline]` when
 //! `TTL`, then the field and the value. A set entry is `[len:7|LONG:1]`,
 //! `u32 len` when `LONG`, then the member. A set member of at most seven
@@ -160,7 +160,7 @@ unsafe impl Memory for SystemMemory {
 /// active defrag empties; the group arrays and arena chunks from the
 /// system. Not for the server: compaction cannot find a collection's entry
 /// to move it, so a slab holding one could never be emptied. Here so that
-/// the two can be measured side by side.
+/// the class steps can be measured against [`EntryPool`]'s.
 pub struct SlabMemory;
 
 // SAFETY: a slab block of `class_of(size)` is at least `size` bytes and
@@ -196,6 +196,55 @@ unsafe impl Memory for SlabMemory {
 
     fn entry_charged(size: usize) -> usize {
         crate::value_slab::class_of(size).map_or(size, crate::value_slab::block_size)
+    }
+}
+
+/// What tables use: entries from `value_slab`'s entry pool, a set of slab
+/// classes of their own (8 bytes apart up to 64, then as the keyspace's)
+/// that active defrag never empties, so a collection's entry, which
+/// compaction cannot move, never pins a slab defrag is emptying. A block
+/// costs, and is counted in `used_memory` at, its class's size; a slab that
+/// empties gives its pages back at once. Entries over
+/// `value_slab::MAX_BLOCK`, the group arrays and the arena chunks come from
+/// the system allocator.
+pub struct EntryPool;
+
+// SAFETY: a pool block of `pool_class_of(size)` is at least `size` bytes
+// and aligned to 8; a larger entry is `SystemMemory`'s. `free_entry` picks
+// the same side `alloc_entry` did, from the same size. Slab blocks are
+// freed on any thread (`value_slab::free` puts another thread's block on
+// the slab's remote list).
+unsafe impl Memory for EntryPool {
+    fn alloc(layout: Layout, zeroed: bool) -> NonNull<u8> {
+        SystemMemory::alloc(layout, zeroed)
+    }
+
+    unsafe fn free(block: NonNull<u8>, layout: Layout) {
+        // SAFETY: the caller's promise.
+        unsafe { SystemMemory::free(block, layout) }
+    }
+
+    #[inline]
+    fn alloc_entry(size: usize) -> NonNull<u8> {
+        match crate::value_slab::pool_class_of(size) {
+            Some(class) => crate::value_slab::alloc(class),
+            None => SystemMemory::alloc(entry_layout(size), false),
+        }
+    }
+
+    #[inline]
+    unsafe fn free_entry(block: NonNull<u8>, size: usize) {
+        match crate::value_slab::pool_class_of(size) {
+            // SAFETY: `alloc_entry` took it from this class.
+            Some(class) => unsafe { crate::value_slab::free(block, class) },
+            // SAFETY: the caller's promise.
+            None => unsafe { SystemMemory::free(block, entry_layout(size)) },
+        }
+    }
+
+    #[inline]
+    fn entry_charged(size: usize) -> usize {
+        crate::value_slab::pool_class_of(size).map_or(size, crate::value_slab::block_size)
     }
 }
 
@@ -1051,7 +1100,7 @@ const RANDOM_PICKS: usize = 128;
 const RESEED_DUE: u8 = 1;
 
 /// The table: a hash's fields or a set's members (`K`), its memory from `A`.
-pub struct CollectionTable<K: Kind, A: Memory = SystemMemory> {
+pub struct CollectionTable<K: Kind, A: Memory = EntryPool> {
     /// The main array (see [`Self::main`]): its groups and its size, apart
     /// so that the header packs into 80 bytes.
     groups: NonNull<Group>,
@@ -1101,7 +1150,7 @@ impl Rare {
 /// growing past 1.6M elements took 0.9 ms to free), so the server can hand
 /// them to a thread of its own rather than pay it on a write
 /// ([`CollectionTable::defer_free`]).
-pub struct Retired<A: Memory = SystemMemory> {
+pub struct Retired<A: Memory = EntryPool> {
     array: Array,
     arena: Arena,
     _memory: PhantomData<A>,
@@ -1915,8 +1964,9 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
     }
 
     /// The bytes the table holds, exactly as `used_memory` counts them for
-    /// `A` = [`SystemMemory`]: the group arrays, the arenas, the rare part
-    /// and the entries at what `A` charges. Not the table's own header,
+    /// `A` = [`EntryPool`] or [`SystemMemory`]: the group arrays, the arenas,
+    /// the rare part and the entries at what `A` charges (a pool block at
+    /// its class's size). Not the table's own header,
     /// which is inside whatever holds the table.
     pub fn allocation_size(&self) -> usize {
         let mut bytes = A::charged(Array::layout(self.main().bits)) + self.entry_bytes;
@@ -4305,6 +4355,34 @@ mod tests {
         assert!(set.iter().all(|m| copy_set.contains(&m)));
         drop((copy, hash, copy_set, set));
         assert_eq!(live(), (blocks0, chunks0, bytes0));
+    }
+
+    /// Entries of the default memory, the entry pool, cost their class's
+    /// size: 8 bytes apart up to 64.
+    #[test]
+    fn pool_entries_cost_their_class() {
+        let mut hash = CollectionTable::<Fields>::with_capacity_and_seed(0, 35);
+        let mut set = CollectionTable::<Members>::with_capacity_and_seed(0, 35);
+        let n = scale(5_000);
+        for i in 0..n {
+            // 11-byte entries (16), 21-byte members (24), 60-byte entries (64).
+            hash.insert(format!("f{i:07}").as_bytes(), b"v", None)
+                .unwrap();
+            set.insert(format!("member-{i:0>13}").as_bytes()).unwrap();
+            hash.insert(format!("g{i:07}").as_bytes(), &[b'w'; 50], None)
+                .unwrap();
+        }
+        assert_eq!(field_header_for(8, 1, false).size(), 11);
+        assert_eq!(member_size(20), 21);
+        assert_eq!(field_header_for(8, 50, false).size(), 60);
+        assert_eq!(hash.entry_bytes, n * (16 + 64));
+        assert_eq!(set.entry_bytes, n * 24);
+        hash.check();
+        set.check();
+        // Freed on another thread, as `lazyfree` would.
+        std::thread::spawn(move || drop((hash, set)))
+            .join()
+            .unwrap();
     }
 
     #[test]
