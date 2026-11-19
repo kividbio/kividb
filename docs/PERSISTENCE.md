@@ -132,7 +132,9 @@ by the once-a-second sync, as soon as the disk takes them. Until then:
   system's message). That covers writes, `EVAL`, `EVALSHA` and `FCALL`, and
   an `EXEC` whose transaction holds a write (`-EXECABORT Transaction
   discarded because of: MISCONF ...`). Reads, `PING` and read-only scripts
-  are served. A script or transaction already running is not cut short;
+  are served. A script or transaction already running is not cut short.
+  `MIGRATE` and `FT.DROPINDEX ... DD`, which take their own locks, are not
+  refused: their deletes are held with the rest;
 * the replies to the writes already held wait, as for a disk that is behind
   (at most 5 seconds, then sent without them and counted in
   `aof_acks_before_write`), and `WAITAOF` counts no sync;
