@@ -79,6 +79,9 @@ pub mod server;
 mod set_card;
 mod sets;
 pub mod slowlog;
+// HSCAN and SSCAN over the large form of hashes and sets (#770).
+#[cfg(target_pointer_width = "64")]
+mod table_scan;
 // `pub(crate)` only so `replication::script_feed` can share XADD's option scan
 // when rewriting an auto-generated ID; the handlers themselves stay internal.
 pub(crate) mod stream_extra;
