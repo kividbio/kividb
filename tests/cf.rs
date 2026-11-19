@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/cf.rs
 //
 // Cuckoo filters (`CF.*`), against what Redis 8.10.2 does:
