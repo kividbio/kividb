@@ -747,9 +747,40 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // No field has a deadline anywhere: none is past it, as `field_hidden`
     // knew.
     let watching = crate::field_expiry::any_watched();
+    // Steps that begin with a GROUPBY that can take a document at a time
+    // (`aggregate_pipeline::StreamGroups`): each document goes into its
+    // group as it is read, and is never a row. Not with a KNN clause or
+    // scores, which are of the rows; not in a cluster, whose masters send
+    // their rows to be grouped together; not for JSON, whose rows name
+    // fields by their schema's attribute.
+    let mut stream = if knn.is_none()
+        && !addscores
+        && !json
+        && !crate::cluster::search::is_forwarded(ctx)
+        && !crate::cluster::search::coordinates(ctx)
+    {
+        crate::commands::aggregate_pipeline::StreamGroups::plan(cmd, 3)
+    } else {
+        None
+    };
     let mut add_row = |key: &str,
                        inner: &crate::vector::Fields,
                        json_doc: Option<&serde_json::Value>| {
+        if let Some(stream) = stream.as_mut() {
+            // What the row would hold: each field that is text, and the
+            // key as `__key` unless the hash has a field of that name.
+            stream.add(|name| {
+                match inner
+                    .get_bytes(name)
+                    .and_then(|v| std::str::from_utf8(v).ok())
+                {
+                    Some(v) => Some(v),
+                    None if name == "__key" => Some(key),
+                    None => None,
+                }
+            });
+            return;
+        }
         // ── Build row ─────────────────────────────────────────────────
         // Only rows that passed the filter reach here.
         let mut row: Row = ahash::AHashMap::new();
@@ -913,8 +944,24 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // ── Parse and execute pipeline clauses ────────────────────────────────────
     // To the same deadline: GROUPBY, APPLY, FILTER and SORTBY over a large
     // scan cost as much as the scan.
-    let (rows, cut, groups) =
-        crate::commands::aggregate_pipeline::run_counted(rows, cmd, 3, deadline);
+    let (rows, cut, groups) = match stream {
+        // The GROUPBY ran with the scan: its groups go on to the steps
+        // after it, which a scan cut short leaves out but for `LIMIT`.
+        Some(stream) => {
+            let end = stream.end();
+            let grouped = stream.finish();
+            let n = grouped.len();
+            crate::commands::aggregate_pipeline::run_from(
+                grouped,
+                cmd,
+                end,
+                deadline,
+                timed_out_scan,
+                Some(n),
+            )
+        }
+        None => crate::commands::aggregate_pipeline::run_counted(rows, cmd, 3, deadline),
+    };
     timed_out |= cut;
     if cut && crate::commands::search::on_timeout_fails() {
         return Some(resp_error("Timeout limit was reached"));
