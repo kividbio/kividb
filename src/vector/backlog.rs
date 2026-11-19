@@ -522,7 +522,7 @@ pub const AUTO_FROM_CPUS: usize = 8;
 /// `search-index-threads auto`: no helper under a CPU quota or with fewer
 /// than [`AUTO_FROM_CPUS`] CPUs, otherwise (CPUs - 2) / 2, at least one.
 ///
-/// The helpers run beside the workers, which are one per CPU (#873), and
+/// The helpers run beside the workers, which are half the CPUs, and
 /// take CPU time they would otherwise have: serving latency is what `auto`
 /// keeps. Under a quota (a container's `--cpus`, a Kubernetes CPU limit)
 /// `SCHED_IDLE` keeps them off busy CPUs but not off the quota: with idle

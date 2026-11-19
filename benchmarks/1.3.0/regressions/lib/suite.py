@@ -126,7 +126,7 @@ class Config:
 
     threads: KiviDB's `--threads`, stated by every configuration (the count
     its values were recorded with). The default worker count is a policy that
-    changes with the machine and the release (#903 made it one per CPU), so a
+    changes with the machine and the release (#903 made it one per CPU, a later change half the CPUs), so a
     configuration that left it out measured that policy along with the code.
     0 means no `--threads` (the server's own default): only suite 32, which
     watches the default on purpose, uses it. Redis ignores it."""
@@ -137,7 +137,7 @@ class Config:
             raise ValueError(
                 "Config(%r) has no threads=. Add threads=N to it: N is the KiviDB --threads its baseline "
                 "values were recorded with (the 'Worker threads' line of the candidate's server log in "
-                "results/<label>/raw.tar.gz; before #903 the default on 4 vCPUs was 2, after it one per CPU), "
+                "results/<label>/raw.tar.gz; before #903 the default on 4 vCPUs was 2, after it one per CPU, now half the CPUs rounded up), "
                 "e.g. Config(%r, threads=2). threads=0 (no --threads, the server's default) is only for a "
                 "suite that measures the default itself (32-default-threads). See README 'Thread counts'."
                 % (name, name))
