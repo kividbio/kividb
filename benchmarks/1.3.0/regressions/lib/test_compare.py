@@ -585,6 +585,29 @@ class GateStrict(unittest.TestCase):
         self.assertEqual(regression_gate.unrecorded(["26-new", "29-session"], self.baseline(), session),
                          ["26-new"])
 
+    def test_a_session_suite_of_info_rows_only_is_refused(self):
+        rows = [self.row("29-session/c/skipped_cpus", "info"), self.row("29-session/d/get_per_s", "info")]
+        self.assertEqual(regression_gate.session_only(rows), {"29-session"})
+        exempt, unjudged = regression_gate.session_exempt({"run-a": rows})
+        self.assertEqual(exempt, set())
+        self.assertIn("every row was info", unjudged["run-a"]["29-session"])
+        self.assertEqual(regression_gate.unrecorded(["01-small", "29-session"], self.baseline(), exempt),
+                         ["29-session"])
+
+    def test_a_session_suite_with_a_vs_gate_skipped_is_refused(self):
+        rows = [self.row("29-session/c/get_per_s", "vs_v1_2_2"),
+                {"key": "29-session/c/set_per_s", "gates": [{"gate": {"kind": "vs_redis"}, "status": "skip"}]}]
+        exempt, unjudged = regression_gate.session_exempt({"run-a": rows})
+        self.assertEqual(exempt, set())
+        self.assertIn("skipped", unjudged["run-a"]["29-session"])
+        self.assertEqual(regression_gate.unrecorded(["01-small", "29-session"], self.baseline(), exempt),
+                         ["29-session"])
+        # Another run that judged it does exempt it; the first still covers nothing of it.
+        exempt, unjudged = regression_gate.session_exempt(
+            {"run-a": rows, "run-b": [self.row("29-session/c/get_per_s", "vs_v1_2_2")]})
+        self.assertEqual(exempt, {"29-session"})
+        self.assertEqual(set(unjudged), {"run-a"})
+
     def test_rows_that_are_new_are_refused(self):
         summ = dict(OK_SUMMARY, rows=[{"key": "01-small/c/x_rps", "status": "new"}])
         why, covers = regression_gate.judge(self.env(), summ, ["01-small"])

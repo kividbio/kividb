@@ -25,6 +25,9 @@ since (the package version line aside) and the suite directory unchanged
 apart from added results/ directories. A suite with no rows in baseline.json
 fails the gate outright, unless every gate it emits is session-relative
 (vs_v1_2_2, vs_redis, info: session_only()), which needs nothing recorded.
+A run covers such a suite only if it passed at least one of its vs_v1_2_2 /
+vs_redis gates and skipped none (all-info rows judge nothing); one that no
+run judged is refused like an unrecorded suite.
 """
 import json
 import os
@@ -68,6 +71,56 @@ def session_only(rows):
         for g in gates:
             ks.add((g.get("gate") or {}).get("kind"))
     return {s for s, ks in kinds.items() if ks and ks <= SESSION_GATES}
+
+
+# The session gates that compare with another engine (info judges nothing).
+VS_GATES = SESSION_GATES - {"info"}
+
+
+def session_unjudged(rows, exempt):
+    """{suite: why} for the session-only suites (`exempt`, from
+    session_only()) that these rows, one run's, did not judge. A suite whose
+    rows are all `info` (suite 29 turns a client-limited row into info, and
+    emits only info below its CPUs), or whose vs_v1_2_2 / vs_redis gates were
+    skipped (no v1.2.2 or Redis value), would pass with no gate judged. A run
+    covers such a suite only if it passed at least one of its vs gates and
+    skipped none."""
+    passed, skipped, seen = set(), set(), set()
+    for r in rows:
+        s = suite_of(r["key"])
+        if s not in exempt:
+            continue
+        seen.add(s)
+        for g in r.get("gates") or []:
+            if (g.get("gate") or {}).get("kind") in VS_GATES:
+                if g.get("status") == "skip":
+                    skipped.add(s)
+                elif g.get("status") == "pass":
+                    passed.add(s)
+    out = {}
+    for s in sorted(seen):
+        if s in skipped:
+            out[s] = "a vs_v1_2_2/vs_redis gate was skipped (v1.2.2 or Redis not measured)"
+        elif s not in passed:
+            out[s] = "no vs_v1_2_2/vs_redis gate passed (every row was info)"
+    return out
+
+
+def session_exempt(runs):
+    """runs: {label: that run's rows (rejudge())}. -> (the session-only
+    suites at least one run judged, which need nothing recorded; {label:
+    {suite: why}} for runs that ran a session-only suite without judging it,
+    which do not cover it). A session-only suite no run judged is refused like
+    an unrecorded one."""
+    exempt = session_only([r for rows in runs.values() for r in rows])
+    unjudged = {}
+    judged = set()
+    for label, rows in runs.items():
+        u = session_unjudged(rows, exempt)
+        if u:
+            unjudged[label] = u
+        judged |= {suite_of(r["key"]) for r in rows if suite_of(r["key"]) in exempt} - set(u)
+    return judged, unjudged
 
 
 def unrecorded(suites, baseline, session=()):
@@ -350,7 +403,7 @@ def main(argv):
             f.write(lines)
         return env, compare.load_results(rpath)
 
-    judged, envs, rows = {}, [], []
+    judged, envs, run_rows = {}, [], {}
     for run in runs:
         try:
             env, results = raw_files(run)
@@ -359,12 +412,21 @@ def main(argv):
             continue
         envs.append(env)
         summ = rejudge(compare, env, results, baseline)
-        rows += summ.get("rows") or []
+        run_rows[run] = summ.get("rows") or []
         judged[run] = judge(env, summ, suites, code_reasons, baseline)
-    missing = unrecorded(suites, baseline, session_only(rows))
+    exempt, unjudged = session_exempt(run_rows)
+    # A run covers a session-only suite only if it judged a gate of it.
+    for run, u in unjudged.items():
+        why, covers = judged[run]
+        judged[run] = (why, covers - set(u))
+    missing = unrecorded(suites, baseline, exempt)
     if missing:
         error("%s/baseline.json has no recorded values for: %s. A suite must be recorded (run-all.sh --record "
               "on the machine it declares) before a release can count it." % (base, ", ".join(missing)))
+        for run, u in sorted(unjudged.items()):
+            for s, w in sorted(u.items()):
+                if s in missing:
+                    say("  %s: %s has only session-relative gates, and this run judged none: %s" % (run, s, w))
         return 1
     used, uncovered = coverage(suites, judged)
     if not uncovered:
@@ -376,6 +438,8 @@ def main(argv):
             say("  %s: %s" % (run, "; ".join(why)))
         else:
             say("  %s: counts, for %d suites" % (run, len(covers)))
+        for s, w in sorted(unjudged.get(run, {}).items()):
+            say("  %s: does not cover %s (session-relative gates only): %s" % (run, s, w))
     need = needs(envs)
     named = ", ".join("%s (needs a %s-CPU run: run-all.sh --min-cpus-only)" % (s, need[s]) if s in need else s
                       for s in uncovered)

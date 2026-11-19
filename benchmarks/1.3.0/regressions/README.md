@@ -475,7 +475,10 @@ if __name__ == "__main__":
   suite must be recorded like any other. Recording freezes each gate as the
   suite declared it then, so a suite that picks a row's gate at run time
   (`29-unpipelined-commands`: client-limited rows are `info`) must stay
-  session-only.
+  session-only. A run covers a session-only suite only if at least one of
+  its `vs_v1_2_2`/`vs_redis` gates passed and none was skipped (no v1.2.2 or
+  Redis value): rows that are all `info` judge nothing, and a session-only
+  suite no run judged is refused like an unrecorded one (`session_exempt()`).
 - State `threads=` on every `Config`.
 - Add its row to the table at the top and its numbers below.
 
