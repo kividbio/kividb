@@ -1332,9 +1332,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             }
 
-            // Verify the trailer (version + checksum) and decode.
-            let value = match crate::snapshot::restore_payload_checked(payload) {
+            // Verify the trailer (version + checksum) and decode. A
+            // probabilistic value is held to `maxmemory` for a client by
+            // the size its payload declares, before that is allocated
+            // (room for it was made before the command took its key:
+            // `sketch::room`).
+            let (value, no_room) = crate::sketch::room::loading_for_client(ctx, || {
+                crate::snapshot::restore_payload_checked(payload)
+            });
+            let value = match value {
                 Ok(v) => v,
+                Err(_) if no_room => {
+                    return Some(resp_error(
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    ));
+                }
                 Err(e) => return Some(resp_error(e.message())),
             };
 
@@ -1800,6 +1812,31 @@ fn system_time_to_unix(exp: SystemTime, unit: TimeUnit) -> i64 {
         // To the nearest second, as `TTL` (Redis's `(ms + 500) / 1000`).
         TimeUnit::Secs => ms_to_nearest_secs(i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
         TimeUnit::Millis => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
+    }
+}
+
+/// `RESTORE`, only asked what it wants (`sketch::room`): a payload that may
+/// hold a probabilistic value is decoded as far as the size the value
+/// declares, which its reader then says (`sketch::room::declared`), and no
+/// further; any other payload is not decoded, and wants nothing beyond
+/// what every write is given room for.
+pub(crate) fn restore_wanted(ctx: &Ctx) {
+    let Some(payload) = ctx.cmd.get(3) else {
+        return;
+    };
+    // Refused `BUSYKEY` when it runs: it wants nothing.
+    let replace = ctx.cmd[4..]
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case(b"REPLACE"));
+    if !replace {
+        let key = ctx.cmd[1];
+        let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
+        if read_lock!(shard).contains_key(key) {
+            return;
+        }
+    }
+    if crate::snapshot::payload_may_hold_sketch(payload) {
+        let _ = crate::snapshot::restore_payload_checked(payload);
     }
 }
 

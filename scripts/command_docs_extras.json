@@ -930,6 +930,305 @@
             }
         ]
     },
+    "CF.ADD": {
+        "summary": "Adds an item to a Cuckoo filter, making the filter if the key is missing.",
+        "complexity": "O(f*b + k) for f sub-filters of buckets of b, and k kicks at most.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string"
+            }
+        ]
+    },
+    "CF.ADDNX": {
+        "summary": "Adds an item to a Cuckoo filter if it is not there already.",
+        "complexity": "O(f*b + k) for f sub-filters of buckets of b, and k kicks at most.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string"
+            }
+        ]
+    },
+    "CF.COMPACT": {
+        "summary": "Moves a Cuckoo filter's fingerprints into its older sub-filters, and frees emptied ones.",
+        "complexity": "O(n*f*b) for n fingerprints in f sub-filters of buckets of b.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "CF.COUNT": {
+        "summary": "Returns how many times an item's fingerprint is in a Cuckoo filter.",
+        "complexity": "O(f*b) for f sub-filters of buckets of b.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string"
+            }
+        ]
+    },
+    "CF.DEBUG": {
+        "summary": "",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "CF.DEL": {
+        "summary": "Deletes one copy of an item's fingerprint from a Cuckoo filter.",
+        "complexity": "O(f*b) for f sub-filters of buckets of b, more when it compacts the filter.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string"
+            }
+        ]
+    },
+    "CF.EXISTS": {
+        "summary": "Tells whether an item may have been added to a Cuckoo filter.",
+        "complexity": "O(f*b) for f sub-filters of buckets of b.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string"
+            }
+        ]
+    },
+    "CF.INFO": {
+        "summary": "Describes a Cuckoo filter: size, buckets, sub-filters, items, deletes and parameters.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "CF.INSERT": {
+        "summary": "Adds items to a Cuckoo filter, making it with the given capacity if the key is missing.",
+        "complexity": "O(N*(f*b + k)) for N items.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "capacity",
+                "type": "integer",
+                "token": "CAPACITY",
+                "optional": true
+            },
+            {
+                "name": "nocreate",
+                "type": "pure-token",
+                "token": "NOCREATE",
+                "optional": true
+            },
+            {
+                "name": "items",
+                "type": "pure-token",
+                "token": "ITEMS"
+            },
+            {
+                "name": "item",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "CF.INSERTNX": {
+        "summary": "Adds items that are not there already to a Cuckoo filter, making it if the key is missing.",
+        "complexity": "O(N*(f*b + k)) for N items.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "capacity",
+                "type": "integer",
+                "token": "CAPACITY",
+                "optional": true
+            },
+            {
+                "name": "nocreate",
+                "type": "pure-token",
+                "token": "NOCREATE",
+                "optional": true
+            },
+            {
+                "name": "items",
+                "type": "pure-token",
+                "token": "ITEMS"
+            },
+            {
+                "name": "item",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "CF.LOADCHUNK": {
+        "summary": "Restores a Cuckoo filter from the chunks CF.SCANDUMP gave.",
+        "complexity": "O(n) for a chunk of n bytes.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "iterator",
+                "type": "integer"
+            },
+            {
+                "name": "data",
+                "type": "string"
+            }
+        ]
+    },
+    "CF.MEXISTS": {
+        "summary": "Tells, for each item, whether it may have been added to a Cuckoo filter.",
+        "complexity": "O(N*f*b) for N items.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "CF.RESERVE": {
+        "summary": "Makes an empty Cuckoo filter.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "capacity",
+                "type": "integer"
+            },
+            {
+                "name": "bucketsize",
+                "type": "integer",
+                "token": "BUCKETSIZE",
+                "optional": true
+            },
+            {
+                "name": "maxiterations",
+                "type": "integer",
+                "token": "MAXITERATIONS",
+                "optional": true
+            },
+            {
+                "name": "expansion",
+                "type": "integer",
+                "token": "EXPANSION",
+                "optional": true
+            }
+        ]
+    },
+    "CF.SCANDUMP": {
+        "summary": "Returns a Cuckoo filter in chunks, to be restored with CF.LOADCHUNK.",
+        "complexity": "O(n) for a chunk of n bytes.",
+        "group": "module",
+        "module": "bf",
+        "since": "1.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "iterator",
+                "type": "integer"
+            }
+        ]
+    },
     "CLUSTER DROPORPHANS": {
         "summary": "Deletes, in the background, the keys a master holds of slots another master owns, those the owner says it has; or reports how the last run went.",
         "complexity": "O(N), N being the number of keys in the node.",
@@ -1046,6 +1345,153 @@
     },
     "CLUSTER SYNCSLOTS": {
         "since": ""
+    },
+    "CMS.INCRBY": {
+        "summary": "Adds to the counts of one or more items in a Count-min sketch, and returns their counts.",
+        "complexity": "O(N*d) for N items, d being the sketch's depth.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "items",
+                "type": "block",
+                "multiple": true,
+                "arguments": [
+                    {
+                        "name": "item",
+                        "type": "string"
+                    },
+                    {
+                        "name": "increment",
+                        "type": "integer"
+                    }
+                ]
+            }
+        ]
+    },
+    "CMS.INFO": {
+        "summary": "Describes a Count-min sketch: its width, depth and total count.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "CMS.INITBYDIM": {
+        "summary": "Makes an empty Count-min sketch of the given width and depth.",
+        "complexity": "O(w*d): the counters are zeroed.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "width",
+                "type": "integer"
+            },
+            {
+                "name": "depth",
+                "type": "integer"
+            }
+        ]
+    },
+    "CMS.INITBYPROB": {
+        "summary": "Makes an empty Count-min sketch sized for an error bound and the probability of exceeding it.",
+        "complexity": "O(w*d): the counters are zeroed.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "error",
+                "type": "double"
+            },
+            {
+                "name": "probability",
+                "type": "double"
+            }
+        ]
+    },
+    "CMS.MERGE": {
+        "summary": "Replaces a Count-min sketch with the weighted sum of others of the same shape.",
+        "complexity": "O(n*w*d) for n sources of w*d counters.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "destination",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "numKeys",
+                "type": "integer"
+            },
+            {
+                "name": "source",
+                "type": "key",
+                "key_spec_index": 1,
+                "multiple": true
+            },
+            {
+                "name": "weights",
+                "type": "block",
+                "optional": true,
+                "arguments": [
+                    {
+                        "name": "weights",
+                        "type": "pure-token",
+                        "token": "WEIGHTS"
+                    },
+                    {
+                        "name": "weight",
+                        "type": "integer",
+                        "multiple": true
+                    }
+                ]
+            }
+        ]
+    },
+    "CMS.QUERY": {
+        "summary": "Returns the counts of one or more items in a Count-min sketch.",
+        "complexity": "O(N*d) for N items, d being the sketch's depth.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string",
+                "multiple": true
+            }
+        ]
     },
     "DELEX": {
         "summary": "Deletes a key, optionally only when its value or value digest matches a condition.",
@@ -5186,6 +5632,436 @@
                 "type": "integer",
                 "token": "LIMIT",
                 "optional": true
+            }
+        ]
+    },
+    "TOPK.ADD": {
+        "summary": "Adds items to a Top-K sketch, and returns the items each one pushed out of the top k.",
+        "complexity": "O(N*(d+k)) for N items: d buckets and a search of the k kept items each.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "items",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "TOPK.COUNT": {
+        "summary": "Returns the counts a Top-K sketch keeps for one or more items.",
+        "complexity": "O(N*(d+k)) for N items.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "TOPK.INCRBY": {
+        "summary": "Adds to the counts of items in a Top-K sketch, and returns the items each one pushed out of the top k.",
+        "complexity": "O(N*(d*i+k)) for N items of increment i at most.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "items",
+                "type": "block",
+                "multiple": true,
+                "arguments": [
+                    {
+                        "name": "item",
+                        "type": "string"
+                    },
+                    {
+                        "name": "increment",
+                        "type": "integer"
+                    }
+                ]
+            }
+        ]
+    },
+    "TOPK.INFO": {
+        "summary": "Describes a Top-K sketch: k, width, depth and decay.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "TOPK.LIST": {
+        "summary": "Returns the items a Top-K sketch keeps, the largest count first.",
+        "complexity": "O(k log k)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "withcount",
+                "type": "pure-token",
+                "token": "WITHCOUNT",
+                "optional": true
+            }
+        ]
+    },
+    "TOPK.QUERY": {
+        "summary": "Tells whether items are among those a Top-K sketch keeps.",
+        "complexity": "O(N*k) for N items.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "item",
+                "type": "string",
+                "multiple": true
+            }
+        ]
+    },
+    "TOPK.RESERVE": {
+        "summary": "Makes an empty Top-K sketch.",
+        "complexity": "O(w*d + k): the buckets and the kept items are set up.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.0.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "topk",
+                "type": "integer"
+            },
+            {
+                "name": "params",
+                "type": "block",
+                "optional": true,
+                "arguments": [
+                    {
+                        "name": "width",
+                        "type": "integer"
+                    },
+                    {
+                        "name": "depth",
+                        "type": "integer"
+                    },
+                    {
+                        "name": "decay",
+                        "type": "double"
+                    }
+                ]
+            }
+        ]
+    },
+    "TDIGEST.ADD": {
+        "summary": "Adds values to a t-digest.",
+        "complexity": "O(N) for N values, amortised.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "value",
+                "type": "double",
+                "multiple": true
+            }
+        ]
+    },
+    "TDIGEST.BYRANK": {
+        "summary": "Returns the values at the given ranks of a t-digest, the smallest rank 0.",
+        "complexity": "O(c + N*c) for N ranks and c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "rank",
+                "type": "integer",
+                "multiple": true
+            }
+        ]
+    },
+    "TDIGEST.BYREVRANK": {
+        "summary": "Returns the values at the given ranks of a t-digest, the largest rank 0.",
+        "complexity": "O(c + N*c) for N ranks and c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "reverse_rank",
+                "type": "integer",
+                "multiple": true
+            }
+        ]
+    },
+    "TDIGEST.CDF": {
+        "summary": "Returns the share of a t-digest's values at or below each value given.",
+        "complexity": "O(c + N*c) for N values and c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "value",
+                "type": "double",
+                "multiple": true
+            }
+        ]
+    },
+    "TDIGEST.CREATE": {
+        "summary": "Makes an empty t-digest.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "compression",
+                "type": "integer",
+                "token": "COMPRESSION",
+                "optional": true
+            }
+        ]
+    },
+    "TDIGEST.INFO": {
+        "summary": "Describes a t-digest: compression, capacity, centroids and observations.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "TDIGEST.MAX": {
+        "summary": "Returns the largest value added to a t-digest.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "TDIGEST.MERGE": {
+        "summary": "Merges t-digests into a destination.",
+        "complexity": "O(N*c) for N sources of c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "destination-key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "numkeys",
+                "type": "integer"
+            },
+            {
+                "name": "source-key",
+                "type": "key",
+                "key_spec_index": 1,
+                "multiple": true
+            },
+            {
+                "name": "config",
+                "type": "block",
+                "optional": true,
+                "arguments": [
+                    {
+                        "name": "compression",
+                        "type": "integer",
+                        "token": "COMPRESSION"
+                    }
+                ]
+            },
+            {
+                "name": "override",
+                "type": "pure-token",
+                "token": "OVERRIDE",
+                "optional": true
+            }
+        ]
+    },
+    "TDIGEST.MIN": {
+        "summary": "Returns the smallest value added to a t-digest.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "TDIGEST.QUANTILE": {
+        "summary": "Returns the values of a t-digest at the given quantiles.",
+        "complexity": "O(c + N*c) for N quantiles and c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "quantile",
+                "type": "double",
+                "multiple": true
+            }
+        ]
+    },
+    "TDIGEST.RANK": {
+        "summary": "Returns the ranks of values in a t-digest, the smallest rank 0.",
+        "complexity": "O(c + N*c) for N values and c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "value",
+                "type": "double",
+                "multiple": true
+            }
+        ]
+    },
+    "TDIGEST.RESET": {
+        "summary": "Empties a t-digest, keeping its compression.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "TDIGEST.REVRANK": {
+        "summary": "Returns the ranks of values in a t-digest, the largest rank 0.",
+        "complexity": "O(c + N*c) for N values and c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "value",
+                "type": "double",
+                "multiple": true
+            }
+        ]
+    },
+    "TDIGEST.TRIMMED_MEAN": {
+        "summary": "Returns the mean of a t-digest's values between two quantiles.",
+        "complexity": "O(c) for c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "low_cut_quantile",
+                "type": "double"
+            },
+            {
+                "name": "high_cut_quantile",
+                "type": "double"
             }
         ]
     },

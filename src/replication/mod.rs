@@ -4458,44 +4458,46 @@ pub fn is_write_command(name: &str) -> bool {
                 | "XTRIM"
                 | "ZMPOP"
         ),
-        6 => matches!(
-            name,
-            "APPEND"
-                | "BF.ADD"
-                | "ARMSET"
-                | "ARRING"
-                | "ARSEEK"
-                | "BLMOVE"
-                | "BLMPOP"
-                | "BZMPOP"
-                | "DECRBY"
-                | "EXPIRE"
-                | "GEOADD"
-                | "GETDEL"
-                | "GETSET"
-                | "HGETEX"
-                | "HSETEX"
-                | "HSETNX"
-                | "INCRBY"
-                | "INCREX"
-                | "LMOVEM"
-                | "LPUSHX"
-                | "MSETEX"
-                | "MSETNX"
-                | "PSETEX"
-                | "RENAME"
-                | "RPUSHX"
-                | "SELECT"
-                | "SETBIT"
-                | "SWAPDB"
-                | "TS.ADD"
-                | "TS.DEL"
-                | "UNLINK"
-                | "XCLAIM"
-                | "XDELEX"
-                | "XGROUP"
-                | "XSETID"
-        ),
+        6 => {
+            matches!(
+                name,
+                "APPEND"
+                    | "BF.ADD"
+                    | "ARMSET"
+                    | "ARRING"
+                    | "ARSEEK"
+                    | "BLMOVE"
+                    | "BLMPOP"
+                    | "BZMPOP"
+                    | "DECRBY"
+                    | "EXPIRE"
+                    | "GEOADD"
+                    | "GETDEL"
+                    | "GETSET"
+                    | "HGETEX"
+                    | "HSETEX"
+                    | "HSETNX"
+                    | "INCRBY"
+                    | "INCREX"
+                    | "LMOVEM"
+                    | "LPUSHX"
+                    | "MSETEX"
+                    | "MSETNX"
+                    | "PSETEX"
+                    | "RENAME"
+                    | "RPUSHX"
+                    | "SELECT"
+                    | "SETBIT"
+                    | "SWAPDB"
+                    | "TS.ADD"
+                    | "TS.DEL"
+                    | "UNLINK"
+                    | "XCLAIM"
+                    | "XDELEX"
+                    | "XGROUP"
+                    | "XSETID"
+            ) || (matches!(name.as_bytes()[0], b'C') && matches!(name, "CF.ADD" | "CF.DEL"))
+        }
         7 => matches!(
             name,
             "BF.MADD"
@@ -4518,83 +4520,104 @@ pub fn is_write_command(name: &str) -> bool {
                 | "ZPOPMAX"
                 | "ZPOPMIN"
         ),
-        8 => matches!(
-            name,
-            "ARINSERT"
-                | "BITFIELD"
-                | "BZPOPMAX"
-                | "BZPOPMIN"
-                | "EXPIREAT"
-                | "FLUSHALL"
-                | "FT.ALTER"
-                | "HPERSIST"
-                | "HPEXPIRE"
-                | "JSON.DEL"
-                | "JSON.SET"
-                | "RENAMENX"
-                | "SETRANGE"
-                | "TS.ALTER"
-                | "VSETATTR"
-        ),
-        9 => matches!(
-            name,
-            "BF.INSERT"
-                | "FT.CREATE"
-                | "HEXPIREAT"
-                | "JSON.MSET"
-                | "PEXPIREAT"
-                | "RPOPLPUSH"
-                | "TS.CREATE"
-                | "TS.DECRBY"
-                | "TS.INCRBY"
-        ),
-        10 => matches!(
-            name,
-            "ARDELRANGE"
-                | "BF.RESERVE"
-                | "BRPOPLPUSH"
-                | "FT.DICTADD"
-                | "FT.DICTDEL"
-                | "HPEXPIREAT"
-                | "JSON.CLEAR"
-                | "JSON.MERGE"
-                | "SDIFFSTORE"
-                | "XAUTOCLAIM"
-                | "XREADGROUP"
-                | "ZDIFFSTORE"
-        ),
-        11 => matches!(
-            name,
-            "FT.ALIASADD"
-                | "FT.ALIASDEL"
-                | "INCRBYFLOAT"
-                | "JSON.ARRPOP"
-                | "JSON.FORGET"
-                | "JSON.OBJDEL"
-                | "JSON.TOGGLE"
-                | "SINTERSTORE"
-                | "SUNIONSTORE"
-                | "XIDMPRECORD"
-                | "ZINTERSTORE"
-                | "ZRANGESTORE"
-                | "ZUNIONSTORE"
-        ),
-        12 => matches!(
-            name,
-            "BF.LOADCHUNK" | "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
-        ),
-        13 => matches!(name, "TS.CREATERULE" | "TS.DELETERULE"),
-        14 => matches!(
-            name,
-            "FT.ALIASUPDATE"
-                | "GEOSEARCHSTORE"
-                | "JSON.ARRAPPEND"
-                | "JSON.ARRINSERT"
-                | "JSON.NUMINCRBY"
-                | "JSON.NUMMULTBY"
-                | "JSON.STRAPPEND"
-                | "ZREMRANGEBYLEX"
-        ),
+        8 => {
+            matches!(
+                name,
+                "ARINSERT"
+                    | "BITFIELD"
+                    | "BZPOPMAX"
+                    | "BZPOPMIN"
+                    | "EXPIREAT"
+                    | "FLUSHALL"
+                    | "FT.ALTER"
+                    | "HPERSIST"
+                    | "HPEXPIRE"
+                    | "JSON.DEL"
+                    | "JSON.SET"
+                    | "RENAMENX"
+                    | "SETRANGE"
+                    | "TS.ALTER"
+                    | "VSETATTR"
+            ) || (matches!(name.as_bytes()[0], b'C' | b'T')
+                && matches!(name, "CF.ADDNX" | "TOPK.ADD"))
+        }
+        9 => {
+            matches!(
+                name,
+                "BF.INSERT"
+                    | "FT.CREATE"
+                    | "HEXPIREAT"
+                    | "JSON.MSET"
+                    | "PEXPIREAT"
+                    | "RPOPLPUSH"
+                    | "TS.CREATE"
+                    | "TS.DECRBY"
+                    | "TS.INCRBY"
+            ) || (matches!(name.as_bytes()[0], b'C') && matches!(name, "CF.INSERT" | "CMS.MERGE"))
+        }
+        10 => {
+            matches!(
+                name,
+                "ARDELRANGE"
+                    | "BF.RESERVE"
+                    | "BRPOPLPUSH"
+                    | "FT.DICTADD"
+                    | "FT.DICTDEL"
+                    | "HPEXPIREAT"
+                    | "JSON.CLEAR"
+                    | "JSON.MERGE"
+                    | "SDIFFSTORE"
+                    | "XAUTOCLAIM"
+                    | "XREADGROUP"
+                    | "ZDIFFSTORE"
+            ) || (matches!(name.as_bytes()[0], b'C')
+                && matches!(name, "CF.COMPACT" | "CF.RESERVE" | "CMS.INCRBY"))
+        }
+        11 => {
+            matches!(
+                name,
+                "FT.ALIASADD"
+                    | "FT.ALIASDEL"
+                    | "INCRBYFLOAT"
+                    | "JSON.ARRPOP"
+                    | "JSON.FORGET"
+                    | "JSON.OBJDEL"
+                    | "JSON.TOGGLE"
+                    | "SINTERSTORE"
+                    | "SUNIONSTORE"
+                    | "XIDMPRECORD"
+                    | "ZINTERSTORE"
+                    | "ZRANGESTORE"
+                    | "ZUNIONSTORE"
+            ) || (matches!(name.as_bytes()[0], b'C' | b'T')
+                && matches!(name, "CF.INSERTNX" | "TDIGEST.ADD" | "TOPK.INCRBY"))
+        }
+        12 => {
+            matches!(
+                name,
+                "BF.LOADCHUNK" | "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
+            ) || (matches!(name.as_bytes()[0], b'C' | b'T')
+                && matches!(name, "CF.LOADCHUNK" | "TOPK.RESERVE"))
+        }
+        13 => {
+            matches!(name, "TS.CREATERULE" | "TS.DELETERULE")
+                || (matches!(name.as_bytes()[0], b'C' | b'T')
+                    && matches!(name, "CMS.INITBYDIM" | "TDIGEST.MERGE" | "TDIGEST.RESET"))
+        }
+        14 => {
+            matches!(
+                name,
+                "FT.ALIASUPDATE"
+                    | "GEOSEARCHSTORE"
+                    | "JSON.ARRAPPEND"
+                    | "JSON.ARRINSERT"
+                    | "JSON.NUMINCRBY"
+                    | "JSON.NUMMULTBY"
+                    | "JSON.STRAPPEND"
+                    | "ZREMRANGEBYLEX"
+            ) || (matches!(name.as_bytes()[0], b'C' | b'T')
+                && matches!(name, "CMS.INITBYPROB" | "TDIGEST.CREATE"))
+        }
         15 => name == "ZREMRANGEBYRANK",
         16 => name == "ZREMRANGEBYSCORE",
         _ => false,
@@ -4630,6 +4653,18 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "BZMPOP",
     "BZPOPMAX",
     "BZPOPMIN",
+    "CMS.INCRBY",
+    "CMS.INITBYDIM",
+    "CMS.INITBYPROB",
+    "CMS.MERGE",
+    "CF.ADD",
+    "CF.ADDNX",
+    "CF.COMPACT",
+    "CF.DEL",
+    "CF.INSERT",
+    "CF.INSERTNX",
+    "CF.LOADCHUNK",
+    "CF.RESERVE",
     "COPY",
     "DECR",
     "DECRBY",
@@ -4730,6 +4765,13 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "SREM",
     "SUNIONSTORE",
     "SWAPDB",
+    "TOPK.ADD",
+    "TOPK.INCRBY",
+    "TOPK.RESERVE",
+    "TDIGEST.ADD",
+    "TDIGEST.CREATE",
+    "TDIGEST.MERGE",
+    "TDIGEST.RESET",
     "TS.ADD",
     "TS.ALTER",
     "TS.CREATE",
@@ -4778,6 +4820,10 @@ fn is_write_command_reference(name: &str) -> bool {
         name,
         // Bloom filters
         "BF.RESERVE" | "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.LOADCHUNK" |
+        "CMS.INCRBY" | "CMS.INITBYDIM" | "CMS.INITBYPROB" | "CMS.MERGE" |
+        "TOPK.ADD" | "TOPK.INCRBY" | "TOPK.RESERVE" |
+        "CF.ADD" | "CF.ADDNX" | "CF.COMPACT" | "CF.DEL" | "CF.INSERT" | "CF.INSERTNX" | "CF.LOADCHUNK" | "CF.RESERVE" |
+        "TDIGEST.ADD" | "TDIGEST.CREATE" | "TDIGEST.MERGE" | "TDIGEST.RESET" |
         // Strings
         "SET" | "SETNX" | "SETEX" | "PSETEX" | "MSET" | "MSETNX" | "GETSET" |
         "GETDEL" | "GETEX" | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" |

@@ -20,6 +20,8 @@ pub mod acl;
 pub mod aof;
 pub mod cluster;
 pub mod cmdstats;
+#[cfg(target_pointer_width = "64")]
+pub mod collection_table;
 pub mod command_gate;
 pub mod commands;
 pub mod compaction;

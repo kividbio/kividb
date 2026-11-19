@@ -19,6 +19,9 @@ mod cli_directives;
 pub mod client_registry;
 pub mod cluster;
 pub mod cmdstats;
+// The large form of hashes and sets (#764); nothing uses it yet.
+#[cfg(target_pointer_width = "64")]
+mod collection_table;
 pub mod command_gate;
 mod commands;
 mod compaction;

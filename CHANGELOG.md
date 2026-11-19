@@ -47,10 +47,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Upgrade replicas before their master.** A master sends `BF.*` commands
   and, in a full sync, Bloom filters under a new snapshot record (tag 40);
   a replica of an earlier release cannot apply either.
-- **No downgrade once a Bloom filter exists.** A snapshot or an AOF
-  checkpoint with a Bloom filter in it cannot be read by an earlier release.
-  Delete the filters (or move them off with `DUMP`, which Redis restores)
-  before going back.
+- **No downgrade once a Bloom filter, Count-min sketch, Top-K sketch, Cuckoo
+  filter or t-digest exists.** A snapshot or an AOF checkpoint with one in it
+  cannot be read by an earlier release: 1.2.2 refuses it and does not start,
+  changing nothing on disk. Delete them (or move them off with `DUMP`, which
+  Redis restores, t-digests aside) before going back. Upgrade replicas
+  before their master for `CMS.*`, `TOPK.*`, `CF.*` and `TDIGEST.*` too.
 - **A sample time of `-0` is refused.** `TS.ADD`, `TS.MADD`, `TS.INCRBY`
   and `TS.DECRBY` answer an error for it, as RedisTimeSeries and 1.2.0 do.
 - **A 1.2.x replica warns once for each idempotent duplicate.** A master
@@ -264,8 +266,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without `EXPANSION`) goes to replicas and the AOF naming what it took,
   so a replica or a replay with other settings makes the same filter.
   `maxmemory` holds back clients, not a master or the AOF: a client's
-  command that would not fit evicts first under the policy, and gets `OOM`
-  only if that is not enough. `COPY` copies a filter (Redis refuses); a
+  command that would not fit evicts first under the policy, before it
+  takes its key, as every command does, once nothing else refuses it
+  (routing, `BUSY`, `NOREPLICAS`, `LOADING`, the ACL), and gets `OOM` only
+  if that is not enough (or if what was made was taken by another command
+  meanwhile). One command evicts what it needs a few megabytes at a time,
+  letting go of the gates between, so that a full sync, a snapshot, a
+  script or a transaction waits for no more than one step of it; it stops
+  if writes are paused, the node becomes a replica or `maxmemory` is
+  changed meanwhile, and a command that wants more than evicting every key
+  could free is refused at once. A command
+  a transaction runs is given room the same way, and one a script calls
+  too unless the script runs beside others under its hash tags
+  (`lua-parallel-scripts`), where it is refused with `OOM` if it does not
+  fit. A `RESTORE` of a probabilistic value is given room for the size its
+  payload declares (all of a Bloom filter's layers), before anything of it
+  is allocated, unless it is refused `BUSYKEY`.
+  `COPY` copies a filter (Redis refuses); a
   copy, a snapshot and a `DUMP` share the filter's bytes until it is next
   written. As in Redis 8.10, no `BF.*` command sends a keyspace event but
   `new` for a key it made. `MODULE LIST` reports Redis 8's `bf` module,
@@ -283,7 +300,86 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   error for the item it stopped at; `BF.MADD` and `BF.INSERT` answer that
   item and every one after it with the error, so their reply has an entry
   for each item. Replicas and the AOF get only the items a write took.
-  Cuckoo filters, Count-min sketches, Top-K and t-digests follow.
+
+- **Count-min sketches (`CMS.*`), as Redis 8 has them built in (part of
+  #453).** `CMS.INITBYDIM`, `CMS.INITBYPROB`, `CMS.INCRBY`, `CMS.QUERY`,
+  `CMS.MERGE` (with `WEIGHTS`) and `CMS.INFO`. Replies and errors are Redis
+  8.10's in RESP2 and RESP3, with the order in which Redis checks
+  arguments, and counts are Redis's exactly: items are placed in the
+  counters as Redis places them, so counters items share agree too
+  (checked against Redis 8.10.2 on 30,000 replies of random sequences:
+  `scripts/checks/sketch/cms/compare.py`). A counter stops at 2^32 − 1 as
+  Redis's does. RDB files, full syncs and `DUMP` payloads from Redis load,
+  and `DUMP` writes Redis's format. `TYPE` is `CMSk-TYPE`, the ACL category
+  `@cms`. Unlike Redis, a sketch has size limits (134,217,728 counters,
+  65,536 rows), `CMS.INCRBY`, `CMS.QUERY` and `CMS.MERGE` have per-command
+  limits checked before they start (`CMS.MERGE`: 2^23 counters, 8,388,608,
+  in all its sources together), and `COPY` copies a sketch. Snapshots
+  keep sketches under tag 40, kind 2.
+
+- **Top-K (`TOPK.*`), as Redis 8 has it built in (part of #453).**
+  `TOPK.RESERVE`, `TOPK.ADD`, `TOPK.INCRBY`, `TOPK.QUERY`, `TOPK.COUNT`,
+  `TOPK.LIST` (with `WITHCOUNT`) and `TOPK.INFO`. Replies and errors are
+  Redis 8.10's in RESP2 and RESP3, quirks included (`TOPK.COUNT` answers 0
+  for a kept item whose buckets count less than the least kept). The sketch
+  is Redis's HeavyKeeper, bucket for bucket: with a decay of 1, where
+  nothing is left to chance, every answer is Redis's (30,000 replies of
+  random sequences compared: `scripts/checks/sketch/topk/compare.py`); with
+  a decay below 1 the chances come from a generator each sketch keeps and
+  saves, so a replica, an AOF replay and a restart end with the master's
+  sketch exactly (a copy made from a `DUMP` payload, which has no place for
+  the generator, starts it afresh), and the heavy hitters of Zipf streams are found as well as
+  Redis finds them. RDB files, full syncs and `DUMP` payloads from Redis
+  load, and `DUMP` writes Redis's format. `TYPE` is `TopK-TYPE`, the ACL
+  category `@topk`. Unlike Redis, a sketch has size limits (k 65,536,
+  67,108,864 buckets, 65,536 rows), the commands of many items a
+  per-command limit checked before they start, items are binary-safe, and
+  `COPY` copies a sketch. Snapshots keep sketches under tag 40, kind 3.
+
+- **Cuckoo filters (`CF.*`), as Redis 8 has them built in (part of #453).**
+  `CF.RESERVE`, `CF.ADD`, `CF.ADDNX`, `CF.INSERT`, `CF.INSERTNX`,
+  `CF.EXISTS`, `CF.MEXISTS`, `CF.COUNT`, `CF.DEL`, `CF.COMPACT`,
+  `CF.SCANDUMP`, `CF.LOADCHUNK`, `CF.INFO` and `CF.DEBUG`, and the
+  `cf-bucket-size`, `cf-initial-size`, `cf-expansion-factor`,
+  `cf-max-iterations` and `cf-max-expansions` settings. Filters are laid out
+  byte for byte as Redis lays them out (placement, kicks, growth, the
+  compaction deletes trigger), so replies are Redis 8.10's in RESP2 and RESP3,
+  `CF.SCANDUMP` chunks included (24,000 replies of random sequences compared:
+  `scripts/checks/sketch/cf/compare.py`); RDB files, full syncs, `DUMP`
+  payloads and `CF.SCANDUMP` chunks from Redis load, and `DUMP` writes
+  Redis's format. A filter made from this node's settings goes to replicas
+  and the AOF as a `CF.RESERVE` naming them. `TYPE` is `MBbloomCF`, the ACL
+  category `@cuckoo`. Unlike Redis, a filter has size limits (1 GiB, 99
+  sub-filters), commands of many items a per-command limit checked before
+  they start, a compaction stops at a limit of its own (so a large filter
+  compacts in part), and `COPY` copies a filter. Under `maxmemory` a client's
+  write is given room before it takes its key for what it may allocate: the
+  filter it makes, a new sub-filter for an add only when no bucket of the
+  item has a free slot, the growth a `CF.INSERT` of many items needs to hold
+  them (an item that would grow the filter further when there is no room
+  left is answered with `OOM` on its own), and a copy of the sub-filters a
+  `COPY` or a snapshot shares and the write changes, `CF.DEL` and
+  `CF.COMPACT` included (refused with `OOM` at the limit under
+  `noeviction`; unshared, they free and always run). A write either succeeds
+  or changes nothing: every check comes before a filter is made. Snapshots
+  keep filters under tag 40, kind 4.
+
+- **t-digests (`TDIGEST.*`), as Redis 8 has them built in (#453).**
+  `TDIGEST.CREATE`, `TDIGEST.ADD`, `TDIGEST.MERGE` (with `COMPRESSION` and
+  `OVERRIDE`), `TDIGEST.RESET`, `TDIGEST.QUANTILE`, `TDIGEST.CDF`,
+  `TDIGEST.RANK`, `TDIGEST.REVRANK`, `TDIGEST.BYRANK`, `TDIGEST.BYREVRANK`,
+  `TDIGEST.MIN`, `TDIGEST.MAX`, `TDIGEST.TRIMMED_MEAN` and `TDIGEST.INFO`.
+  Replies and errors are Redis 8.10's in RESP2 and RESP3, with the order in
+  which Redis checks arguments, `nan` and `inf` included (16,000 replies of
+  random sequences compared: `scripts/checks/sketch/tdigest/compare.py`).
+  The digest is the published merging digest, so answers are approximations
+  within the same bounds as Redis's rather than bit for bit the same, and
+  Redis's where nothing is approximated. A query never changes a digest, so a
+  replica keeps the master's byte for byte. `TYPE` is `TDIS-TYPE`, the ACL
+  category `@tdigest`. Unlike Redis, a compression of at most 100,000, a
+  per-command limit on queries of many values and merges, `COPY` copies a
+  digest, and `DUMP` gives KiviDB's own payload (Redis's is refused).
+  Snapshots keep digests under tag 40, kind 5.
 
 - **Vector sets store vectors quantized when `VADD` asks for it (#697).**
   `Q8` keeps each vector as int8 with its norm and range, and `BIN` as one
