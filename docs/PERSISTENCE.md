@@ -485,7 +485,9 @@ If the file cannot be saved (a full or read-only disk), the node logs it
 once, as an error, until a save works again. Meanwhile it makes no node
 met a member and does not answer its MEET (the end that sent it tries again,
 for up to two minutes, and again whenever the other end calls on it within
-the hour after), and it casts no vote.
+the hour after), and it casts no vote. A replica that wins an election takes
+over at once (the cluster has agreed to it) and saves its promotion on the
+save thread, trying again every second until the save works.
 
 **A cluster stopped whole.** A member that at least one node has in its
 `nodes.conf` is a member again after the cluster restarts: that node tells
@@ -518,9 +520,8 @@ directory's). A candidate counts a vote for as long as its election lives,
 longer than that is never counted, and the failover does not complete.
 Measured on an Azure D4s_v5, ext4 on a volume that delays every write:
 with writes taking 200 ms, a save took 2.1-2.6 s and a failover of a master
-7.3-8.4 s (1.2 and earlier, which did not sync the file before renaming it,
-4.7-5.6 s); with writes taking 1 s, a save took 8-13 s and no failover
-completed in 330 s (nor did one in 1.2, which waited only 2 s for a vote).
+7.3-8.4 s; with writes taking 1 s, a save took 8-13 s and no failover
+completed in 330 s.
 On an ordinary SSD a save takes a few milliseconds and a failover 3.5-4 s.
 A volume on which a save of nodes.conf takes more than a few seconds is too
 slow for a cluster to fail over: give the cluster file a disk that syncs a

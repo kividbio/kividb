@@ -373,7 +373,7 @@ pub struct ClusterState {
     pub(crate) last_saved_fingerprint: AtomicU64,
     /// Where the saves of nodes.conf stand: a save is synced without
     /// `save_lock`, and is not put in place over a newer one.
-    pub(crate) saves: persist::Saves,
+    pub(crate) saves: std::sync::Arc<persist::Saves>,
     /// `ip:bus_port` of each `CLUSTER MEET` waiting for its answer, or for
     /// this node's save of the peer (see `bus::dialer::send_meet`): its
     /// handshake entry is kept meanwhile, though that can take longer than
@@ -457,7 +457,7 @@ impl ClusterState {
             preferred_endpoint: std::sync::atomic::AtomicU8::new(Endpoint::Ip as u8),
             save_lock: parking_lot::Mutex::new(()),
             last_saved_fingerprint: AtomicU64::new(0),
-            saves: persist::Saves::default(),
+            saves: std::sync::Arc::new(persist::Saves::default()),
             meets: parking_lot::Mutex::new(ahash::AHashSet::new()),
             meets_given_up: parking_lot::Mutex::new(AHashMap::new()),
             joining: parking_lot::Mutex::new(Vec::new()),
@@ -737,7 +737,22 @@ impl ClusterState {
             .name("kividb-nodes-conf".into())
             .spawn_released(move || {
                 let mut last: Option<std::time::Instant> = None;
-                while rx.recv().is_ok() {
+                let mut failing = false;
+                loop {
+                    // A save that failed is made again every second, until
+                    // one works (a promotion, say, that must reach the
+                    // disk), as well as when one is asked for.
+                    let asked = if failing {
+                        !matches!(
+                            rx.recv_timeout(std::time::Duration::from_secs(1)),
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                        )
+                    } else {
+                        rx.recv().is_ok()
+                    };
+                    if !asked {
+                        return;
+                    }
                     // One save in `BACKGROUND_SAVE_GAP` at most, of all the
                     // changes asked for meanwhile: see there.
                     if let Some(since) = last.map(|t| t.elapsed())
@@ -760,8 +775,9 @@ impl ClusterState {
                     }
                     let saved = persist::save_from_state(&state);
                     last = Some(std::time::Instant::now());
+                    failing = saved.is_err();
                     if let Err(e) = saved {
-                        log_verbose!("Cluster: could not save the cluster config file: {e}");
+                        log_verbose!("Cluster: background save of nodes.conf failed: {e}");
                     }
                 }
             });
@@ -776,11 +792,9 @@ impl ClusterState {
     /// once it is saved. Both ends of a MEET save the other before it is
     /// shown, and the receiving end before it answers. A cluster stopped
     /// whole (killed, even) from then on keeps the new node: a node that has
-    /// it in its nodes.conf tells the others of it again. The save used to
-    /// be made on a thread of its own, some time after; on a busy disk a
-    /// node stopped meanwhile came back without it, and when that was every
-    /// node that knew it, the cluster had forgotten it for good: a node that
-    /// is not a member cannot join by sending heartbeats (#808).
+    /// it in its nodes.conf tells the others of it again, which matters
+    /// because a node that is not a member cannot join by sending
+    /// heartbeats (#808).
     ///
     /// The nodes waiting are saved together, in the next save, not one save
     /// each: a node met by many at once (`redis-cli --cluster create` has
@@ -2719,8 +2733,14 @@ impl ClusterState {
             }
         }
 
-        // Phase 3: persist (which also refreshes the serving state).
-        let _ = self.save_to_disk();
+        // Phase 3: persist. The election is won and the cluster has agreed
+        // to it: the promotion holds, whether or not it can be saved now. It
+        // is saved on the save thread, not here on the bus's (a save on a
+        // slow disk took seconds, with the new master answering nobody),
+        // and made again until it works; a failure is logged, as an error,
+        // until then.
+        self.refresh_state();
+        self.save_soon();
         claimed
     }
 
@@ -4344,6 +4364,34 @@ mod tests {
         );
         assert!(cs.cast_vote(rb, b, 6, false, None));
         assert_eq!(cs.current_epoch(), 6);
+    }
+
+    /// A vote whose save fails is not sent, and the epoch counts as voted
+    /// in: a second candidate in it gets no vote either, its save or not.
+    #[test]
+    fn a_vote_that_cannot_be_saved_is_not_sent_nor_given_again_in_its_epoch() {
+        let (mut cs, a, b) = three_master_cluster();
+        let (ra, rb) = (add_replica(&cs, a), add_replica(&cs, b));
+        cs.nodes.write().get_mut(&a).unwrap().mark_failed(now_ms());
+        cs.nodes.write().get_mut(&b).unwrap().mark_failed(now_ms());
+        // A directory that is not there: every save fails.
+        cs.config_path = Some(std::env::temp_dir().join("kividb-no-such-dir-808").join("nodes.conf"));
+        let ask = |sender, master| crate::cluster::bus::BusMessage::FailoverAuthRequest {
+            sender_id: sender,
+            sender_ip: "127.0.0.1".into(),
+            sender_client_port: 7000,
+            sender_cluster_port: 17000,
+            request_epoch: 5,
+            master_id: master,
+            force: false,
+            claims: None,
+        };
+        let peer: std::net::SocketAddr = "127.0.0.1:17000".parse().unwrap();
+        assert!(crate::cluster::bus::listener::process_message(&cs, ask(ra, a), peer).is_none());
+        assert_eq!(cs.last_vote_epoch.load(Ordering::SeqCst), 5);
+        cs.config_path = None;
+        assert!(crate::cluster::bus::listener::process_message(&cs, ask(rb, b), peer).is_none());
+        assert!(!cs.cast_vote(rb, b, 5, false, None));
     }
 
     /// Two replicas of one master must not both be elected moments apart.

@@ -624,15 +624,11 @@ pub(crate) async fn broadcast_auth_request(
         let state = Arc::clone(state);
         tokio::spawn(async move {
             let addr = format!("{ip}:{bus_port}");
-            // A master saves its vote, synced, before it answers: on a busy
-            // or slow disk that takes seconds. The answer is waited for as
-            // long as the election lives, so a vote given late still counts;
-            // one given in time counts as soon as it comes. It used to be
-            // waited for the node timeout (at least 2 s): on a disk where a
-            // save took longer, every vote was given and then lost, at each
-            // epoch in turn (the voter may not vote again in an epoch), and
-            // the failover never completed. Redis waits `max(2 x node
-            // timeout, 2 s)`.
+            // A master saves its vote, synced, before it answers, which on a
+            // busy or slow disk takes seconds. The candidate waits for votes
+            // for the life of the election, so a vote saved slowly still
+            // counts; one that comes sooner counts as soon as it comes.
+            // Redis waits `max(2 x node timeout, 2 s)`.
             let wait = crate::cluster::ELECTION_LIFETIME.max(Duration::from_millis(
                 state.node_timeout_ms.saturating_mul(2).max(2_000),
             ));

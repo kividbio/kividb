@@ -383,8 +383,30 @@ pub fn remove_leftover_temps(path: &Path) {
     }
 }
 
+/// For the tests of a save that fails, and never set otherwise: named in
+/// `KIVIDB_TEST_FAILPOINTS`, `nodes-conf-fail` fails every save while the
+/// file `fail.nodes-conf` is in the working directory, and
+/// `nodes-conf-dir-sync-fail` fails the sync of the directory once for each
+/// time `fail.nodes-conf-dir-sync` is made there.
+fn injected(name: &str, file: &str, once: bool) -> std::io::Result<()> {
+    if !crate::aof::injected(name) {
+        return Ok(());
+    }
+    let hit = if once {
+        fs::remove_file(file).is_ok()
+    } else {
+        Path::new(file).exists()
+    };
+    if hit {
+        Err(std::io::Error::other(format!("{name} (a test's)")))
+    } else {
+        Ok(())
+    }
+}
+
 /// Write `out` to the temporary file `tmp`. Not synced: see [`sync_file`].
 fn write_temp(tmp: &Path, out: &[u8]) -> std::io::Result<()> {
+    injected("nodes-conf-fail", "fail.nodes-conf", false)?;
     #[cfg(target_os = "linux")]
     let written = write_direct(tmp, out).is_ok();
     #[cfg(not(target_os = "linux"))]
@@ -506,6 +528,7 @@ fn sync_file(path: &Path) -> std::io::Result<()> {
 
 /// Sync the directory `path` is in, so that a rename into it is on disk.
 fn sync_dir(path: &Path) -> std::io::Result<()> {
+    injected("nodes-conf-dir-sync-fail", "fail.nodes-conf-dir-sync", true)?;
     #[cfg(unix)]
     {
         let dir = match path.parent() {
@@ -581,12 +604,11 @@ fn save_then(
         (nodes, slots_copy, epoch, last_vote)
     };
     let fingerprint = topology_fingerprint(&nodes_snap, &slots_snap, epoch, last_vote);
-    // Unchanged since the save in place, and no other on its way to
+    // Unchanged since the save in place, synced, and no other on its way to
     // replace it: nothing to write. With one on its way (being synced), it
-    // is written all the same, or the older one, put in place after, would
-    // stand: a `CLUSTER FORGET` that returned the topology to what was in
-    // place was skipped, and the save before it, which had the node, put it
-    // back in the file.
+    // is written all the same: the older one, put in place after, must not
+    // be what stands (a `CLUSTER FORGET` that returns the topology to what
+    // is in place is saved, not skipped).
     if state.last_saved_fingerprint.load(Ordering::Relaxed) == fingerprint
         && state.saves.in_flight.load(Ordering::SeqCst) == 0
         && path.exists()
@@ -603,6 +625,7 @@ fn save_then(
     if let Err(e) = written {
         let _ = fs::remove_file(&tmp);
         state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
+        state.last_saved_fingerprint.store(0, Ordering::Relaxed);
         state.saves.note_failed(generation, &e);
         return Err(e);
     }
@@ -620,32 +643,47 @@ fn save_then(
                 crate::aof::failpoint_noting("nodes-conf-written", &tmp.to_string_lossy());
                 put_in_place(&tmp, path)?;
                 state.saves.in_place.store(generation, Ordering::SeqCst);
-                state
-                    .last_saved_fingerprint
-                    .store(fingerprint, Ordering::Relaxed);
                 if !deferred {
                     sync_dir(path)?;
+                    // Only once it is on disk: a save of the same topology
+                    // made later is skipped on the strength of it.
+                    state
+                        .last_saved_fingerprint
+                        .store(fingerprint, Ordering::Relaxed);
                 }
                 Ok(())
             })();
-            state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
             match placed {
-                Ok(()) => {
+                Ok(()) if !deferred => {
+                    state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
                     state.saves.note_saved(generation, true);
                     publish();
                 }
+                Ok(()) => publish(),
                 Err(ref e) => {
+                    state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
                     let _ = fs::remove_file(&tmp);
+                    state.last_saved_fingerprint.store(0, Ordering::Relaxed);
                     state.saves.note_failed(generation, e);
                 }
             }
             drop(saving);
             if placed.is_ok() && deferred {
                 // The file and its rename, synced on another thread: see
-                // `with_deferred_sync`.
+                // `with_deferred_sync`. Until they are, the save is in
+                // flight, and does not count as done for a save something
+                // waits on (a vote): that waits for this sync, or makes a
+                // save of its own. No fingerprint is kept for it, so the
+                // next save is written whatever it holds.
                 let path = path.clone();
+                let saves = std::sync::Arc::clone(&state.saves);
                 crate::cpus::spawn(move || {
-                    let _ = sync_file(&path).and_then(|()| sync_dir(&path));
+                    let synced = sync_file(&path).and_then(|()| sync_dir(&path));
+                    saves.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    match synced {
+                        Ok(()) => saves.note_saved(generation, true),
+                        Err(e) => saves.note_failed(generation, &e),
+                    }
                 });
             }
             placed
@@ -661,11 +699,17 @@ fn save_then(
                 if state.saves.in_place.load(Ordering::SeqCst) < generation {
                     put_in_place(&tmp, path)?;
                     state.saves.in_place.store(generation, Ordering::SeqCst);
-                    state
-                        .last_saved_fingerprint
-                        .store(fingerprint, Ordering::Relaxed);
                     drop(saving);
                     sync_dir(path)?;
+                    // Only once it is on disk, and if it is still the newest
+                    // in place: a save of the same topology made later is
+                    // skipped on the strength of it.
+                    let _saving = state.save_lock.lock();
+                    if state.saves.in_place.load(Ordering::SeqCst) == generation {
+                        state
+                            .last_saved_fingerprint
+                            .store(fingerprint, Ordering::Relaxed);
+                    }
                     Ok(true)
                 } else {
                     // A newer save is in place: it has all this one had,
@@ -681,6 +725,7 @@ fn save_then(
                 Ok(false) => state.saves.signal(),
                 Err(e) => {
                     let _ = fs::remove_file(&tmp);
+                    state.last_saved_fingerprint.store(0, Ordering::Relaxed);
                     state.saves.note_failed(generation, e);
                 }
             }

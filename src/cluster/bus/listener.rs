@@ -368,10 +368,10 @@ pub fn process_message(
                 force,
                 claims.as_deref(),
             ) {
-                // A vote is sent once it is saved: one sent and then lost
-                // with the file would let this node, restarted, vote again in
-                // the same epoch. Not saved, it is not sent, and this node
-                // does not vote in that epoch (it has recorded it as voted).
+                // A vote is sent once the file that records it is on disk,
+                // so that a restart cannot repeat it. Not saved, it is not
+                // sent, and this node does not vote in that epoch (it has
+                // recorded it as voted).
                 // Saved as a node met is: by the first save begun after it,
                 // one already under way included, not one save a vote.
                 let from = state.saves.written.load(Ordering::SeqCst) + 1;
