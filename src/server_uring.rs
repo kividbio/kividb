@@ -1083,6 +1083,9 @@ pub async fn handle_client(
     tracking_table: crate::tracking::TrackingTable,
 ) -> Result<(), Box<dyn std::error::Error>> {
     stream.set_nodelay(true)?;
+    // Which client address of a node this client is told in a cluster
+    // (#847): its family does not change while it is connected.
+    let peer_ipv6 = crate::cluster::is_ipv6_peer(&peer_addr);
     if let Some(denied) = crate::protected_mode::refusal(&acl_store, &peer_addr) {
         let _ = stream.write_all(denied.to_vec()).await;
         return Ok(());
@@ -1821,6 +1824,7 @@ pub async fn handle_client(
                         apply_replication: false,
                         skip_write_side_effects: false,
                         peer_addr: &peer_addr,
+                        peer_ipv6,
                         monitor_registry: &monitor_registry,
                         authenticated_user: authenticated_user.as_deref().unwrap_or("default"),
                         tracking_table: &tracking_table,
@@ -1923,6 +1927,7 @@ pub async fn handle_client(
                     apply_replication: false,
                     skip_write_side_effects: false,
                     peer_addr: &peer_addr,
+                    peer_ipv6,
                     monitor_registry: &monitor_registry,
                     authenticated_user: authenticated_user.as_deref().unwrap_or("default"),
                     tracking_table: &tracking_table,
@@ -2102,7 +2107,7 @@ pub async fn handle_client(
                     cmd_name.as_str(),
                     &cmd,
                     &cluster_state,
-                    crate::cluster::is_ipv6_peer(&peer_addr),
+                    peer_ipv6,
                 ) {
                     crate::output_limits::append_reply(
                         &mut out_buf,
@@ -2408,7 +2413,7 @@ pub async fn handle_client(
                                 client_id,
                                 store: &store,
                                 db: selected_db,
-                                ipv6: crate::cluster::is_ipv6_peer(&peer_addr),
+                                ipv6: peer_ipv6,
                             },
                             &tx.queue,
                             &mut routed,
@@ -2514,7 +2519,7 @@ pub async fn handle_client(
                                 client_id,
                                 store: &store,
                                 db: selected_db,
-                                ipv6: crate::cluster::is_ipv6_peer(&peer_addr),
+                                ipv6: peer_ipv6,
                             },
                             &tx.queue,
                             routed,
@@ -2699,6 +2704,7 @@ pub async fn handle_client(
                                         apply_replication: false,
                                         skip_write_side_effects: false,
                                         peer_addr: &peer_addr,
+                                        peer_ipv6,
                                         monitor_registry: &monitor_registry,
                                         authenticated_user: authenticated_user
                                             .as_deref()
@@ -2868,6 +2874,7 @@ pub async fn handle_client(
                                         apply_replication: false,
                                         skip_write_side_effects: false,
                                         peer_addr: &peer_addr,
+                                        peer_ipv6,
                                         monitor_registry: &monitor_registry,
                                         authenticated_user: authenticated_user
                                             .as_deref()
@@ -2913,6 +2920,7 @@ pub async fn handle_client(
                                         apply_replication: false,
                                         skip_write_side_effects: false,
                                         peer_addr: &peer_addr,
+                                        peer_ipv6,
                                         monitor_registry: &monitor_registry,
                                         authenticated_user: authenticated_user
                                             .as_deref()
@@ -3171,7 +3179,7 @@ pub async fn handle_client(
                                     client_id,
                                     store: &store,
                                     db: selected_db,
-                                    ipv6: crate::cluster::is_ipv6_peer(&peer_addr),
+                                    ipv6: peer_ipv6,
                                 },
                                 &cmd,
                             )
@@ -3280,6 +3288,7 @@ pub async fn handle_client(
                                 apply_replication: false,
                                 skip_write_side_effects: false,
                                 peer_addr: &peer_addr,
+                                peer_ipv6,
                                 monitor_registry: &monitor_registry,
                                 authenticated_user: authenticated_user
                                     .as_deref()
@@ -3323,6 +3332,7 @@ pub async fn handle_client(
                             apply_replication: false,
                             skip_write_side_effects: false,
                             peer_addr: &peer_addr,
+                            peer_ipv6,
                             monitor_registry: &monitor_registry,
                             authenticated_user: authenticated_user.as_deref().unwrap_or("default"),
                             tracking_table: &tracking_table,

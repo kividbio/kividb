@@ -357,8 +357,9 @@ other files:
 - `cluster-announce-client-ipv4` / `-ipv6` (Valkey 8): a client is told the
   address for the family of its own connection, as in Valkey; one that
   reaches a node listening on `::` over IPv4 (an IPv4-mapped address) counts
-  as IPv4. They travel between nodes in the bus's flags string, not in
-  Valkey's ping extensions, and are not saved in `nodes.conf`: a restarted
+  as IPv4. They travel in a node's own heartbeats (the bus's flags
+  string, not Valkey's ping extensions; never in gossip, as in Valkey), and
+  are not saved in `nodes.conf`: a restarted
   node tells clients a peer's own address until that peer's first heartbeat
   (about a second).
 - Keys a master holds of slots it does not serve (left, for example, on a

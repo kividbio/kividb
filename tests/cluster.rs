@@ -2684,10 +2684,11 @@ fn reply_texts(r: &Resp) -> Vec<String> {
 /// `cluster-announce-client-ipv4` and `-ipv6` (#847): what a client connected
 /// over IPv4, or over IPv6, is told to reach a node at, where it is not the
 /// address nodes use between themselves (Valkey 8). Set at start and with
-/// `CONFIG SET`, they reach the other nodes over the bus; redirects,
-/// `CLUSTER SLOTS`, `SHARDS` and `NODES` give each client its family's, and
-/// the node's own address where none is set for it. The bus keeps using the
-/// node's address.
+/// `CONFIG SET`, they reach the other nodes in the node's own heartbeats;
+/// redirects, `CLUSTER SLOTS` (a replica's entry too), `SHARDS` and `NODES`
+/// give each client its family's, and the node's own address where none is
+/// set for it. The bus keeps using the node's address. Each check after a
+/// change waits for it: the other nodes learn it at their own pace.
 #[test]
 fn nodes_announce_client_addresses_of_their_own() {
     // Listening on `::`, so that a client can come over IPv6 too; an IPv4
@@ -2699,25 +2700,30 @@ fn nodes_announce_client_addresses_of_their_own() {
         Node::start(&args),
     ];
     let (nodes, ranges) = form_cluster_of(nodes);
-    let port = nodes[1].port;
+    // A replica of node 1 with an IPv4 client address of its own.
+    let replica = add_replica_with(
+        &nodes,
+        &nodes[1],
+        &[&args[..], &["--cluster-announce-client-ipv4", "10.0.0.11"]].concat(),
+        &[],
+    );
+    let (port, replica_port) = (nodes[1].port, replica.port);
     let key = key_in(ranges[1].0..=ranges[1].1, "cip");
     let (mut v4, mut v6) = (nodes[0].conn(), Conn::connect_v6(nodes[0].port));
+    let real = format!(" 127.0.0.1:{port}");
+    let ends_with = |r: &Resp, tail: &str| r.err().is_some_and(|e| e.ends_with(tail));
 
-    // Set at start: the other nodes learn it from its heartbeats. No IPv6
-    // one yet: an IPv6 client is told the node's address.
+    // Set at start; no IPv6 one yet, so an IPv6 client is told the node's
+    // address.
     let moved_v4 = format!(" 10.0.0.1:{port}");
     wait_until(
-        "the others to tell IPv4 clients the address set at start",
+        "the others to tell clients the address set at start",
         Duration::from_secs(15),
         || {
-            v4.cmd(&["GET", &key])
-                .err()
-                .is_some_and(|e| e.ends_with(&moved_v4))
+            ends_with(&v4.cmd(&["GET", &key]), &moved_v4)
+                && ends_with(&v6.cmd(&["GET", &key]), &real)
         },
     );
-    let real = format!(" 127.0.0.1:{port}");
-    let e = v6.cmd(&["GET", &key]);
-    assert!(e.err().is_some_and(|e| e.ends_with(&real)), "{e:?}");
 
     // Set at run time.
     let r = nodes[1]
@@ -2729,19 +2735,16 @@ fn nodes_announce_client_addresses_of_their_own() {
         "the others to tell IPv6 clients the address set at run time",
         Duration::from_secs(15),
         || {
-            v6.cmd(&["GET", &key])
-                .err()
-                .is_some_and(|e| e.ends_with(&moved_v6))
+            ends_with(&v6.cmd(&["GET", &key]), &moved_v6)
+                && ends_with(&v4.cmd(&["GET", &key]), &moved_v4)
         },
     );
-    let e = v4.cmd(&["GET", &key]);
-    assert!(e.err().is_some_and(|e| e.ends_with(&moved_v4)), "{e:?}");
     let config = |name: &str| nodes[1].conn().cmd(&["CONFIG", "GET", name]).array()[1].text();
     assert_eq!(config("cluster-announce-client-ipv4"), "10.0.0.1");
     assert_eq!(config("cluster-announce-client-ipv6"), "fd00::1");
 
     // ASK too: a slot of node 0's on its way to node 1, and a key node 0
-    // does not have.
+    // does not have. Node 0 knows node 1's addresses by now.
     let slot = ranges[0].0.to_string();
     let ask_key = key_in(ranges[0].0..=ranges[0].0, "ask");
     let (id0, id1) = (nodes[0].id(), nodes[1].id());
@@ -2766,14 +2769,35 @@ fn nodes_announce_client_addresses_of_their_own() {
         assert!(r.is_ok(), "{r:?}");
     }
 
-    // CLUSTER SLOTS, SHARDS and NODES: each client its family's address.
-    for (c, want, not) in [
-        (&mut v4, "10.0.0.1", "fd00::1"),
-        (&mut v6, "fd00::1", "10.0.0.1"),
+    // CLUSTER SLOTS (the replica's entry too), SHARDS and NODES: each client
+    // its family's address; the replica has no IPv6 one, so its address.
+    let replica_v4 = format!("10.0.0.11:{replica_port}");
+    for (c, want, not, replica_want) in [
+        (&mut v4, "10.0.0.1", "fd00::1", replica_v4.clone()),
+        (
+            &mut v6,
+            "fd00::1",
+            "10.0.0.1",
+            format!("127.0.0.1:{replica_port}"),
+        ),
     ] {
+        wait_until(
+            "the replica's address to reach node 0",
+            Duration::from_secs(15),
+            || {
+                c.cmd(&["CLUSTER", "NODES"])
+                    .text()
+                    .contains(&format!("{replica_want}@"))
+            },
+        );
         let slots = reply_texts(&c.cmd(&["CLUSTER", "SLOTS"]));
         assert!(slots.iter().any(|t| t == want), "{slots:?}");
         assert!(!slots.iter().any(|t| t == not), "{slots:?}");
+        let (rip, rport) = replica_want.rsplit_once(':').unwrap();
+        assert!(
+            slots.windows(2).any(|w| w[0] == rip && w[1] == rport),
+            "replica entry {replica_want}: {slots:?}"
+        );
         let shards = reply_texts(&c.cmd(&["CLUSTER", "SHARDS"]));
         assert!(
             shards.iter().filter(|t| *t == want).count() >= 2,
@@ -2792,6 +2816,37 @@ fn nodes_announce_client_addresses_of_their_own() {
         .cmd(&["CLUSTER", "NODES"])
         .text();
     assert!(mine.contains(&format!("fd00::1:{port}@")), "{mine}");
+
+    // With `cluster-preferred-endpoint-type hostname`, the endpoint is `?`
+    // (no hostname), and the `ip` metadata of CLUSTER SLOTS carries the
+    // client address.
+    for node in &nodes {
+        let r = node.conn().cmd(&[
+            "CONFIG",
+            "SET",
+            "cluster-preferred-endpoint-type",
+            "hostname",
+        ]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+    for (c, want) in [(&mut v4, "10.0.0.1"), (&mut v6, "fd00::1")] {
+        let slots = reply_texts(&c.cmd(&["CLUSTER", "SLOTS"]));
+        assert!(
+            slots.windows(2).any(|w| w[0] == "ip" && w[1] == want),
+            "ip metadata {want}: {slots:?}"
+        );
+        let shards = reply_texts(&c.cmd(&["CLUSTER", "SHARDS"]));
+        assert!(
+            shards.windows(2).any(|w| w[0] == "ip" && w[1] == want),
+            "{shards:?}"
+        );
+    }
+    for node in &nodes {
+        let r = node
+            .conn()
+            .cmd(&["CONFIG", "SET", "cluster-preferred-endpoint-type", "ip"]);
+        assert!(r.is_ok(), "{r:?}");
+    }
 
     // A bad address is refused, as Valkey words it; nothing changes.
     let bad = nodes[1]
@@ -2817,26 +2872,30 @@ fn nodes_announce_client_addresses_of_their_own() {
         assert_eq!(node.cluster_info("cluster_state"), "ok");
     }
 
-    // Empty unsets: the node's address again, for both families.
+    // Empty unsets: the node's address again, for both families, and it
+    // stays so (nothing brings the old ones back, as gossip once could).
     for name in [
         "cluster-announce-client-ipv4",
         "cluster-announce-client-ipv6",
     ] {
         assert!(nodes[1].conn().cmd(&["CONFIG", "SET", name, ""]).is_ok());
     }
-    wait_until(
-        "clients to be told the node's address again",
-        Duration::from_secs(15),
-        || {
-            v4.cmd(&["GET", &key])
-                .err()
-                .is_some_and(|e| e.ends_with(&real))
-                && v6
-                    .cmd(&["GET", &key])
-                    .err()
-                    .is_some_and(|e| e.ends_with(&real))
-        },
-    );
+    let back = |v4: &mut Conn, v6: &mut Conn| {
+        ends_with(&v4.cmd(&["GET", &key]), &real) && ends_with(&v6.cmd(&["GET", &key]), &real)
+    };
+    for node in [&nodes[0], &nodes[2]] {
+        let (mut a, mut b) = (node.conn(), Conn::connect_v6(node.port));
+        wait_until(
+            "clients to be told the node's address again",
+            Duration::from_secs(15),
+            || back(&mut a, &mut b),
+        );
+    }
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until {
+        assert!(back(&mut v4, &mut v6), "an old address came back");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// A bad `cluster-announce-client-ipv4` or `-ipv6` stops the node at start,

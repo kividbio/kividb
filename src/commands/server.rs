@@ -731,19 +731,7 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                         "ERR CONFIG SET failed (possibly related to argument '{param}') - {err}"
                     ))),
                     None => {
-                        let mut ips = ctx
-                            .cluster
-                            .nodes
-                            .read()
-                            .get(&ctx.cluster.myself())
-                            .map(|me| me.client_ips.clone())
-                            .unwrap_or_default();
-                        if v6 {
-                            ips.v6 = value.to_string();
-                        } else {
-                            ips.v4 = value.to_string();
-                        }
-                        ctx.cluster.set_my_client_ips(ips);
+                        ctx.cluster.set_my_client_ip(v6, value);
                         Some(resp_simple("OK"))
                     }
                 }

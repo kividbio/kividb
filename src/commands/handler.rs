@@ -1211,7 +1211,7 @@ fn routed_again_in_gate(
         || registry.get_readonly(client_id),
         |key| crate::read_lock!(crate::store::get_shard(&store[db], key)).contains_key(key),
     )
-    .refusal(crate::cluster::is_ipv6_peer(ctx.peer_addr))
+    .refusal(ctx.peer_ipv6)
 }
 
 // The parts of `run_command` that a plain command on a standalone master
@@ -1275,7 +1275,7 @@ fn route_on_arrival(
                 info.asking = false;
             });
         }
-        if let Some(refusal) = decision.refusal(crate::cluster::is_ipv6_peer(ctx.peer_addr)) {
+        if let Some(refusal) = decision.refusal(ctx.peer_ipv6) {
             return Some(refusal);
         }
         crate::cluster::routing::stall_for_test(name, ctx.cmd.as_slice());
@@ -1402,7 +1402,7 @@ fn checked_in_gate(
                             .contains_key(key)
                 },
             );
-            if let Some(refusal) = decision.refusal(crate::cluster::is_ipv6_peer(ctx.peer_addr)) {
+            if let Some(refusal) = decision.refusal(ctx.peer_ipv6) {
                 return Some(refusal);
             }
         }
@@ -3476,6 +3476,7 @@ mod replica_loading_gate_tests {
             apply_replication: apply_stream,
             skip_write_side_effects: false,
             peer_addr: peer.as_str(),
+            peer_ipv6: crate::cluster::is_ipv6_peer(peer.as_str()),
             monitor_registry: &monitor_registry,
             authenticated_user: "default",
             tracking_table: &tracking_table,

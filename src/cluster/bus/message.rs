@@ -44,10 +44,12 @@
 //
 // A node's hostname (`cluster-announce-hostname`) travels in its flags
 // string, as a `host=<name>` token: nodes that do not know it ignore an
-// unknown token, where a new field would have them drop the message. Its
-// `cluster-announce-client-ipv4` / `-ipv6` travel the same way, as
-// `cip4=<address>` and `cip6=<address>` (#847); an IPv6 address has colons
-// but no commas, and the flags string is split on commas only. A
+// unknown token, where a new field would have them drop the message. The
+// sender's own `cluster-announce-client-ipv4` / `-ipv6` travel the same way
+// in its PING and PONG, as `cip4=<address>` and `cip6=<address>` (#847), and
+// never in gossip, as in Valkey: only a node's own word is taken. An IPv6
+// address has colons but no commas, and the flags string is split on commas
+// only. A
 // hostname has no commas (see `valid_hostname`). Decoders take at least the
 // fields they know and skip any after them, so that a later version can add
 // some.
@@ -71,9 +73,6 @@ pub struct GossipEntry {
     /// The node's `cluster-announce-client-port`; 0 when none, or unknown.
     /// Travels in the flags string as `cport=<port>`, as the hostname does.
     pub announced_client_port: u16,
-    /// The node's client addresses (`cip4=`, `cip6=`); empty when it
-    /// announces none, or the sender does not know them.
-    pub client_ips: ClientIps,
 }
 
 /// One slot range the sender claims to own, with the epoch at which the
@@ -434,7 +433,7 @@ fn encode_gossip(gossip: &[GossipEntry]) -> Vec<u8> {
                     g.flags,
                     &g.hostname,
                     g.announced_client_port,
-                    &g.client_ips,
+                    &ClientIps::default(),
                 )),
                 match g.master_id {
                     Some(m) => resp_bulk(&m),
@@ -861,7 +860,6 @@ fn parse_gossip(buf: &[u8]) -> Result<Vec<GossipEntry>, String> {
             master_id,
             hostname: host_of(flags_str),
             announced_client_port: cport_of(flags_str),
-            client_ips: client_ips_of(flags_str),
         });
     }
     Ok(out)
@@ -1101,7 +1099,6 @@ mod tests {
             gossip: vec![GossipEntry {
                 hostname: String::new(),
                 announced_client_port: 0,
-                client_ips: ClientIps::default(),
                 id: other,
                 ip: "10.0.0.2".into(),
                 client_port: 6381,
@@ -1159,7 +1156,6 @@ mod tests {
                 master_id: Some(me),
                 hostname: String::new(),
                 announced_client_port: 30002,
-                client_ips: ClientIps::default(),
             }],
             slot_claims: vec![],
         };
@@ -1190,10 +1186,10 @@ mod tests {
         assert_eq!(cport_of("master,cport=nonsense"), 0);
     }
 
-    /// A node's client addresses go in the flags string too (#847), as
-    /// `cip4=<address>` and `cip6=<address>`: the sender's own, and each
-    /// gossiped node's. An IPv6 address keeps its colons (the string is split
-    /// on commas). One that is not an address of its family is dropped, as
+    /// A node's client addresses go in its own flags string too (#847), as
+    /// `cip4=<address>` and `cip6=<address>`, and not in its gossip of other
+    /// nodes. An IPv6 address keeps its colons (the string is split on
+    /// commas). One that is not an address of its family is dropped, as
     /// Valkey drops it. A node of an earlier version skips both tokens.
     #[test]
     fn client_addresses_travel_in_the_flags() {
@@ -1225,7 +1221,6 @@ mod tests {
                 master_id: Some(me),
                 hostname: String::new(),
                 announced_client_port: 0,
-                client_ips: ips("", "fd00::2"),
             }],
             slot_claims: vec![],
         };
@@ -1245,7 +1240,6 @@ mod tests {
                 assert_eq!(sender_announced_client_port, 30001);
                 assert_eq!(sender_shard_id, Some(me));
                 assert_eq!(sender_flags, NodeFlags::MASTER);
-                assert_eq!(gossip[0].client_ips, ips("", "fd00::2"));
                 assert_eq!(gossip[0].flags, NodeFlags::REPLICA);
             }
             other => panic!("expected Pong, got {:?}", other),
@@ -1337,7 +1331,6 @@ mod tests {
                 master_id: Some(me),
                 hostname: "shard-1b.db.example".into(),
                 announced_client_port: 0,
-                client_ips: ClientIps::default(),
             }],
             slot_claims: vec![],
             sender_flags: NodeFlags::MASTER,
@@ -1423,7 +1416,6 @@ mod tests {
                 GossipEntry {
                     hostname: String::new(),
                     announced_client_port: 0,
-                    client_ips: ClientIps::default(),
                     id: other1,
                     ip: "10.0.0.2".into(),
                     client_port: 6381,
@@ -1435,7 +1427,6 @@ mod tests {
                 GossipEntry {
                     hostname: String::new(),
                     announced_client_port: 0,
-                    client_ips: ClientIps::default(),
                     id: other2,
                     ip: "10.0.0.3".into(),
                     client_port: 6382,
@@ -1447,7 +1438,6 @@ mod tests {
                 GossipEntry {
                     hostname: String::new(),
                     announced_client_port: 0,
-                    client_ips: ClientIps::default(),
                     id: other3,
                     ip: "10.0.0.4".into(),
                     client_port: 6383,

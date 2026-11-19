@@ -866,6 +866,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + PrepareIoStream + 'static,
 {
     stream.prepare_io()?;
+    // Which client address of a node this client is told in a cluster
+    // (#847): its family does not change while it is connected.
+    let peer_ipv6 = crate::cluster::is_ipv6_peer(&peer_addr);
     if let Some(denied) = crate::protected_mode::refusal(&acl_store, &peer_addr) {
         let _ = stream.write_all(denied).await;
         return Ok(());
@@ -1537,6 +1540,7 @@ where
                         apply_replication: false,
                         skip_write_side_effects: false,
                         peer_addr: &peer_addr,
+                        peer_ipv6,
                         monitor_registry: &monitor_registry,
                         authenticated_user: authenticated_user.as_deref().unwrap_or("default"),
                         tracking_table: &tracking_table,
@@ -1642,6 +1646,7 @@ where
                     apply_replication: false,
                     skip_write_side_effects: false,
                     peer_addr: &peer_addr,
+                    peer_ipv6,
                     monitor_registry: &monitor_registry,
                     authenticated_user: authenticated_user.as_deref().unwrap_or("default"),
                     tracking_table: &tracking_table,
@@ -1823,7 +1828,7 @@ where
                     cmd_name.as_str(),
                     &cmd,
                     &cluster_state,
-                    crate::cluster::is_ipv6_peer(&peer_addr),
+                    peer_ipv6,
                 ) {
                     crate::output_limits::append_reply(
                         &mut combined,
@@ -2148,7 +2153,7 @@ where
                                 client_id,
                                 store: &store,
                                 db: selected_db,
-                                ipv6: crate::cluster::is_ipv6_peer(&peer_addr),
+                                ipv6: peer_ipv6,
                             },
                             &tx.queue,
                             &mut routed,
@@ -2254,7 +2259,7 @@ where
                                 client_id,
                                 store: &store,
                                 db: selected_db,
-                                ipv6: crate::cluster::is_ipv6_peer(&peer_addr),
+                                ipv6: peer_ipv6,
                             },
                             &tx.queue,
                             routed,
@@ -2438,6 +2443,7 @@ where
                                         apply_replication: false,
                                         skip_write_side_effects: false,
                                         peer_addr: &peer_addr,
+                                        peer_ipv6,
                                         monitor_registry: &monitor_registry,
                                         authenticated_user: authenticated_user
                                             .as_deref()
@@ -2610,6 +2616,7 @@ where
                                         apply_replication: false,
                                         skip_write_side_effects: false,
                                         peer_addr: &peer_addr,
+                                        peer_ipv6,
                                         monitor_registry: &monitor_registry,
                                         authenticated_user: authenticated_user
                                             .as_deref()
@@ -2654,6 +2661,7 @@ where
                                         apply_replication: false,
                                         skip_write_side_effects: false,
                                         peer_addr: &peer_addr,
+                                        peer_ipv6,
                                         monitor_registry: &monitor_registry,
                                         authenticated_user: authenticated_user
                                             .as_deref()
@@ -2931,7 +2939,7 @@ where
                                     client_id,
                                     store: &store,
                                     db: selected_db,
-                                    ipv6: crate::cluster::is_ipv6_peer(&peer_addr),
+                                    ipv6: peer_ipv6,
                                 },
                                 &cmd,
                             )
@@ -3038,6 +3046,7 @@ where
                                 apply_replication: false,
                                 skip_write_side_effects: false,
                                 peer_addr: &peer_addr,
+                                peer_ipv6,
                                 monitor_registry: &monitor_registry,
                                 authenticated_user: authenticated_user
                                     .as_deref()
@@ -3082,6 +3091,7 @@ where
                             apply_replication: false,
                             skip_write_side_effects: false,
                             peer_addr: &peer_addr,
+                            peer_ipv6,
                             monitor_registry: &monitor_registry,
                             authenticated_user: authenticated_user.as_deref().unwrap_or("default"),
                             tracking_table: &tracking_table,

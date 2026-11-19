@@ -97,8 +97,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `SHARDS` (`ip` and `endpoint`), `NODES` and `REPLICAS` use them; the bus
   keeps `cluster-announce-ip`. Set at start or with `CONFIG SET` (empty unsets;
   a bad value is `Invalid IPv4 address` / `Invalid IPv6 address`, at start
-  too), they reach the other nodes in their next heartbeats as `cip4=` and
-  `cip6=` tokens of the flags string, which a 1.2 node ignores. They are not
+  too), they reach the other nodes in the node's next heartbeats as `cip4=`
+  and `cip6=` tokens of its flags string, which a 1.2 node ignores. Only a
+  node's own heartbeats carry them, never gossip, as in Valkey. They are not
   saved in `nodes.conf`: a node learns a peer's again from the peer's first
   heartbeat, as for `cluster-announce-client-port`. Tools that start cluster
   nodes for Valkey pass `--cluster-announce-client-ipv4` to every node, which

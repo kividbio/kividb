@@ -61,8 +61,7 @@ impl ClientIps {
 /// (`[::ffff:10.0.0.5]:6379`), and is an IPv4 one.
 pub fn is_ipv6_peer(peer_addr: &str) -> bool {
     match peer_addr.parse::<std::net::SocketAddr>() {
-        Ok(std::net::SocketAddr::V6(addr)) => addr.ip().to_ipv4_mapped().is_none(),
-        Ok(std::net::SocketAddr::V4(_)) => false,
+        Ok(addr) => addr.ip().to_canonical().is_ipv6(),
         Err(_) => peer_addr.starts_with('['),
     }
 }

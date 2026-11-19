@@ -1055,11 +1055,25 @@ impl ClusterState {
         }
     }
 
-    /// Record the client addresses a peer announces. As for its client
-    /// port: its own word stands, none included; second-hand it only fills
-    /// in.
-    pub fn set_peer_client_ips(&self, id: NodeId, ips: &ClientIps, authoritative: bool) {
-        if id == self.myself() || (ips.is_empty() && !authoritative) {
+    /// Change one of this node's client addresses, `cluster-announce-client-ipv6`
+    /// if `v6`, else `-ipv4` (empty: none), under one write of the node table,
+    /// so that two set at once both stay (#847).
+    pub fn set_my_client_ip(&self, v6: bool, ip: &str) {
+        if let Some(me) = self.nodes.write().get_mut(&self.myself()) {
+            if v6 {
+                me.client_ips.v6 = ip.to_string();
+            } else {
+                me.client_ips.v4 = ip.to_string();
+            }
+        }
+    }
+
+    /// Record the client addresses a peer says it announces, none included.
+    /// Only a node's own heartbeat says them: never gossip, as in Valkey, or
+    /// a node that had not heard of a change yet would bring the old ones
+    /// back (#847).
+    pub fn set_peer_client_ips(&self, id: NodeId, ips: &ClientIps) {
+        if id == self.myself() {
             return;
         }
         if let Some(node) = self.nodes.write().get_mut(&id)
@@ -1182,6 +1196,10 @@ impl ClusterState {
     /// loopback or nodes.conf guess and this is a real interface address,
     /// adopt it.
     pub fn learn_self_ip(&self, local_ip: std::net::IpAddr) {
+        // A node listening on `::` that reached a peer over IPv4 has the
+        // IPv4-mapped form (`::ffff:a.b.c.d`) as its end: its IPv4 address
+        // is the one to take, and to hand to clients (#847).
+        let local_ip = local_ip.to_canonical();
         if !self.self_ip_is_guess.load(Ordering::Relaxed)
             || local_ip.is_loopback()
             || local_ip.is_unspecified()
@@ -4619,6 +4637,23 @@ mod tests {
         let recorded = cs.nodes.read().get(&cs.myself()).unwrap().ip.clone();
         assert_eq!(recorded, "10.1.2.3");
         assert_eq!(cs.advertised_ip(&recorded), "10.1.2.3");
+    }
+
+    /// Bound to `::`, a node that reaches a peer over IPv4 has the
+    /// IPv4-mapped form of its address as its end: it learns the IPv4
+    /// address, which is what clients are then told (#847).
+    #[test]
+    fn a_node_on_ipv6_wildcard_learns_its_ipv4_address_not_the_mapped_form() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        cs.configure_self_address("::", 7000, "", 0, 0);
+        let recorded = cs.nodes.read().get(&cs.myself()).unwrap().ip.clone();
+        assert_eq!(cs.advertised_ip(&recorded), "");
+        cs.learn_self_ip("::ffff:127.0.0.1".parse().unwrap());
+        let recorded = cs.nodes.read().get(&cs.myself()).unwrap().ip.clone();
+        assert_eq!(cs.advertised_ip(&recorded), "", "loopback teaches nothing");
+        cs.learn_self_ip("::ffff:10.1.2.3".parse().unwrap());
+        let recorded = cs.nodes.read().get(&cs.myself()).unwrap().ip.clone();
+        assert_eq!(recorded, "10.1.2.3");
     }
 
     #[test]

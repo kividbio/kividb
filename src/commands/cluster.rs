@@ -77,9 +77,9 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
         // slot and node tables most of all (#899).
         // A client is told the addresses for its own connection's family
         // (#847).
-        "NODES" => cmd_nodes(state, crate::cluster::is_ipv6_peer(ctx.peer_addr)),
-        "SLOTS" => cmd_slots(state, crate::cluster::is_ipv6_peer(ctx.peer_addr)),
-        "SHARDS" => cmd_shards(state, crate::cluster::is_ipv6_peer(ctx.peer_addr)),
+        "NODES" => cmd_nodes(state, ctx.peer_ipv6),
+        "SLOTS" => cmd_slots(state, ctx.peer_ipv6),
+        "SHARDS" => cmd_shards(state, ctx.peer_ipv6),
         "MYID" => cmd_myid(state),
         "COUNTKEYSINSLOT" => cmd_countkeysinslot(ctx),
         "GETKEYSINSLOT" => cmd_getkeysinslot(ctx),
@@ -1336,7 +1336,7 @@ fn cmd_replicas(ctx: &mut Ctx) -> Vec<u8> {
             out.push(resp_bulk_str(&format!(
                 "{} {}:{}@{}{} {} {} {} {} {} connected",
                 crate::cluster::node_id_str(&n.id),
-                n.client_ip(crate::cluster::is_ipv6_peer(ctx.peer_addr)),
+                n.client_ip(ctx.peer_ipv6),
                 n.client_facing_port(),
                 n.cluster_port,
                 crate::cluster::persist::hostname_suffix(&n.hostname),
@@ -3173,6 +3173,7 @@ mod tests {
             apply_replication: false,
             skip_write_side_effects: false,
             peer_addr: "127.0.0.1:1",
+            peer_ipv6: false,
             monitor_registry: &monitor_registry,
             authenticated_user: "default",
             tracking_table: &tracking_table,

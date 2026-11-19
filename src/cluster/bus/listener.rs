@@ -596,7 +596,8 @@ fn apply_heartbeat(
     // What a node says of its own hostname stands, none included.
     state.set_peer_hostname(sender_id, &sender_hostname, true);
     state.set_peer_client_port(sender_id, sender_announced_client_port, true);
-    state.set_peer_client_ips(sender_id, &sender_client_ips, true);
+    // Its client addresses only from its own word, never from gossip (#847).
+    state.set_peer_client_ips(sender_id, &sender_client_ips);
     // Its shard: what a master says of its own is its shard's, replicas
     // included (this node too, if it is one); a replica is in its master's
     // (#563). A node of an earlier version says none.
@@ -772,7 +773,6 @@ fn merge_gossip_entry(
     // does not carry them.
     state.set_peer_hostname(g.id, &g.hostname, false);
     state.set_peer_client_port(g.id, g.announced_client_port, false);
-    state.set_peer_client_ips(g.id, &g.client_ips, false);
 }
 
 /// Build a PONG describing ourselves. Includes our slot claims and a gossip
@@ -835,7 +835,6 @@ pub(super) fn sample_gossip(
         master_id: n.master_id,
         hostname: n.hostname.clone(),
         announced_client_port: n.announced_client_port,
-        client_ips: n.client_ips.clone(),
     };
 
     let mut out = Vec::new();
@@ -952,7 +951,6 @@ mod tests {
         let about_gone = GossipEntry {
             hostname: String::new(),
             announced_client_port: 0,
-            client_ips: ClientIps::default(),
             id: gone,
             ip: "10.0.0.7".into(),
             client_port: 7001,
@@ -1018,7 +1016,6 @@ mod tests {
         let b_failed = GossipEntry {
             hostname: String::new(),
             announced_client_port: 0,
-            client_ips: ClientIps::default(),
             id: b,
             ip: "10.0.0.8".into(),
             client_port: 7002,
@@ -1042,7 +1039,6 @@ mod tests {
         GossipEntry {
             hostname: String::new(),
             announced_client_port: 0,
-            client_ips: ClientIps::default(),
             id,
             ip: ip.into(),
             client_port: port,
@@ -1144,7 +1140,6 @@ mod tests {
         let target_pfail = || GossipEntry {
             hostname: String::new(),
             announced_client_port: 0,
-            client_ips: ClientIps::default(),
             id: target,
             ip: "10.0.0.8".into(),
             client_port: 7002,
