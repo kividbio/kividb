@@ -985,22 +985,6 @@ pub fn check_memory_limit() -> bool {
     limit != 0 && crate::memory_use::over(limit)
 }
 
-/// [`check_memory_limit`] for the command in `ctx`: with a limit, also true
-/// for a command that allocates as much as its arguments say
-/// (`sketch::room`), which is asked how much in [`make_room_or_refuse`].
-#[inline]
-fn over_memory_limit(ctx: &Ctx) -> bool {
-    let limit = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
-    limit != 0 && over_the_limit(ctx, limit)
-}
-
-/// [`over_memory_limit`] with a limit, out of line: so that the path of a
-/// command without one is what it was.
-#[inline(never)]
-fn over_the_limit(ctx: &Ctx, limit: usize) -> bool {
-    crate::memory_use::over(limit) || crate::sketch::room::may_allocate(&ctx.cmd)
-}
-
 /// Run one command.
 ///
 /// A blocking command that has to wait registers its waiters and parks them in
@@ -1043,7 +1027,7 @@ pub fn execute_command(mut ctx: Ctx) -> Vec<u8> {
     // Counted and timed for `INFO commandstats` — unless it parked, in which
     // case it has not run yet and is counted when it is resumed.
     let started = std::time::Instant::now();
-    let reply = run_command(ctx, name, started);
+    let reply = run_command::<false>(ctx, name, started);
     if crate::pause::is_held(&reply) {
         // Not run: a `CLIENT PAUSE` sent it back to be held, and it is
         // dispatched again (`blocking::hold_for_pause`). Counted and timed
@@ -1435,25 +1419,18 @@ fn checked_in_gate(
     }
 }
 
-/// Over `maxmemory`: room made for the command, and for what it will
-/// allocate if it is one that allocates as much as its arguments say
-/// (`sketch::room`, asked here), by eviction in the order of writes if
-/// `in_order`, or its `OOM` refusal if it `needs_room` and none could be
-/// made. See `run_command`.
+/// Over `maxmemory`: room made for the command, by eviction in the order of
+/// writes if `in_order`, or its `OOM` refusal if it `needs_room` and none
+/// could be made. See `run_command`.
 #[cold]
 #[inline(never)]
 fn make_room_or_refuse(ctx: &mut Ctx, in_order: bool, needs_room: bool) -> Option<Vec<u8>> {
-    let wanted = crate::sketch::room::wanted_by(ctx);
     // The keys it deletes are writes too, to be cut between and ordered
     // like any other; it orders them itself, so this comes before the
     // command takes the order of its own keys.
     let _evicting = crate::write_gate::enter();
     let limit = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
-    let target = limit.checked_sub(usize::try_from(wanted).unwrap_or(usize::MAX));
-    if limit != 0
-        && !target.is_some_and(|target| crate::eviction::make_room(ctx, target, in_order))
-        && needs_room
-    {
+    if limit != 0 && !crate::eviction::make_room(ctx, limit, in_order) && needs_room {
         log_throttled!(
             60,
             crate::loglevel::WARN,
@@ -1470,13 +1447,61 @@ fn make_room_or_refuse(ctx: &mut Ctx, in_order: bool, needs_room: bool) -> Optio
     None
 }
 
+/// For a command that allocates as much as its arguments say
+/// (`sketch::room`): what it wants, put in `wanted`, and whether that does
+/// not fit under `maxmemory`. Its room is then made by [`make_room_for`].
+#[cold]
+#[inline(never)]
+fn over_with_room_wanted(ctx: &mut Ctx, name: &str, wanted: &mut u64) -> bool {
+    if crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return false;
+    }
+    *wanted = crate::sketch::room::wanted(ctx, name);
+    !crate::sketch::room_for(*wanted)
+}
+
+/// [`make_room_or_refuse`] for a command that allocates as much as its
+/// arguments say: room made for the command and the `wanted` bytes, or its
+/// `OOM` refusal.
+#[cold]
+#[inline(never)]
+fn make_room_for(ctx: &mut Ctx, in_order: bool, wanted: u64) -> Option<Vec<u8>> {
+    // Before the command takes the order of its own keys, as for every
+    // command (see `make_room_or_refuse`).
+    let _evicting = crate::write_gate::enter();
+    let limit = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
+    let target = limit.checked_sub(usize::try_from(wanted).unwrap_or(usize::MAX));
+    if limit != 0 && !target.is_some_and(|target| crate::eviction::make_room(ctx, target, in_order))
+    {
+        return Some(crate::tracking::with_what_came_before(resp_error(
+            "OOM command not allowed when used memory > 'maxmemory'.",
+        )));
+    }
+    None
+}
+
 /// [`execute_command`], once the command's name is known; it started at
-/// `started`.
-fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8> {
+/// `started`. `ROOM`: a command that allocates as much as its arguments say
+/// (`sketch::room`), which the arity check finds: it is asked how much
+/// before it takes its keys' order, and room is made for that too, in this
+/// function's second instance; the first, every other command's, is as it
+/// was.
+fn run_command<const ROOM: bool>(
+    ctx: &mut Ctx,
+    name: &str,
+    started: std::time::Instant,
+) -> Vec<u8> {
     // The wrong number of arguments is refused before anything else looks
     // at the command, as in Redis. See `arity`.
-    if let Some(refusal) = crate::commands::arity::check(name, &ctx.cmd) {
-        return refusal;
+    if let Some(refusal) = crate::commands::arity::check_dispatch(name, &ctx.cmd) {
+        // None, of a command that allocates as much as its arguments say.
+        if refusal.is_empty() {
+            if !ROOM {
+                return run_command::<true>(ctx, name, started);
+            }
+        } else {
+            return refusal;
+        }
     }
 
     // [`ReplState::is_slave`] is a relaxed atomic load — avoid `role()` here (it allocates).
@@ -1579,12 +1604,10 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // handoff): the dataset stands still then, as in Redis, where eviction
     // waits like expiry (`PAUSE_ACTION_EVICT`). Its `DEL`s moved the
     // replication offset a paused master had reported (#424).
-    //
-    // A command that allocates as much as its arguments say is asked how
-    // much first, and room is made for that too (`sketch::room`).
+    let mut room_wanted = 0;
     let over_limit = !repl_is_slave
         && !ctx.apply_replication
-        && over_memory_limit(ctx)
+        && (check_memory_limit() || (ROOM && over_with_room_wanted(ctx, name, &mut room_wanted)))
         && !crate::pause::expiry_deferred();
     // A library of functions is memory too, though not in the keyspace.
     let loads_functions = name == "FUNCTION"
@@ -1741,7 +1764,12 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
 
     if over_limit {
         let in_order = ordered || (!gated && !ctx.apply_replication);
-        if let Some(refusal) = make_room_or_refuse(ctx, in_order, needs_room) {
+        let refused = if ROOM {
+            make_room_for(ctx, in_order, room_wanted)
+        } else {
+            make_room_or_refuse(ctx, in_order, needs_room)
+        };
+        if let Some(refusal) = refused {
             return refusal;
         }
     }

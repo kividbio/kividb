@@ -23,50 +23,18 @@ thread_local! {
     static ASKED: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
-/// Whether `name` is a command that may allocate as much as its arguments,
-/// or the value it grows, say: one to be asked what it wants ([`wanted`]).
-pub fn allocates(name: &str) -> bool {
-    matches!(
-        name,
-        "BF.ADD" | "BF.INSERT" | "BF.LOADCHUNK" | "BF.MADD" | "BF.RESERVE"
-    )
-}
+/// The commands that may allocate as much as their arguments, or the value
+/// they grow, say: those to be asked what they want ([`wanted`]). The
+/// dispatch finds them in its arity lookup (`arity::check_dispatch`).
+pub const ALLOCATES: &[&str] = &[
+    "BF.ADD",
+    "BF.INSERT",
+    "BF.LOADCHUNK",
+    "BF.MADD",
+    "BF.RESERVE",
+];
 
-/// Whether the command `cmd` may be one that [`allocates`], for the dispatch
-/// of every command under `maxmemory`: a look at its first byte, the names
-/// asked out of line.
-#[inline]
-pub fn may_allocate(cmd: &[&[u8]]) -> bool {
-    matches!(
-        cmd.first().and_then(|n| n.first()),
-        Some(b'B' | b'C' | b'T' | b'b' | b'c' | b't')
-    ) && name_allocates(cmd)
-}
-
-#[cold]
-#[inline(never)]
-fn name_allocates(cmd: &[&[u8]]) -> bool {
-    upper_name(cmd).is_some_and(|name| allocates(&name))
-}
-
-/// The command's name in upper case, if it is one of these types' names.
-fn upper_name(cmd: &[&[u8]]) -> Option<String> {
-    let name = cmd.first()?;
-    (name.len() <= 16).then(|| String::from_utf8_lossy(name).to_ascii_uppercase())
-}
-
-/// What the command in `ctx` would allocate, if it is one that
-/// [`allocates`] ([`wanted`]); 0 for any other.
-#[cold]
-#[inline(never)]
-pub fn wanted_by(ctx: &mut Ctx) -> u64 {
-    match upper_name(&ctx.cmd) {
-        Some(name) if allocates(&name) => wanted(ctx, &name),
-        _ => 0,
-    }
-}
-
-/// The bytes the command in `ctx`, named `name` (one that [`allocates`]),
+/// The bytes the command in `ctx`, named `name` (one of [`ALLOCATES`]),
 /// would allocate: 0 if it would be refused before it got that far. Asked
 /// by the dispatch, under `maxmemory`, before the command takes its keys'
 /// order.
@@ -91,7 +59,7 @@ pub fn asking() -> bool {
 /// Refused by [`check`].
 pub struct NoRoom;
 
-/// In a handler that [`allocates`], once it knows what it would allocate
+/// In a handler of one of [`ALLOCATES`], once it knows what it would allocate
 /// and before it takes a lock: `Err` if it is only being asked (it has now
 /// said what: `bytes`), or if it is a command from a client and `bytes` do
 /// not fit under `maxmemory`. A command from a master or the AOF is never
