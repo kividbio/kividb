@@ -326,7 +326,10 @@ pub fn cpu_quota() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
         let (mask, counted) = if PINNED.load(std::sync::atomic::Ordering::Relaxed) {
-            (ALLOWED.get()?.len(), UNPINNED.get().copied().flatten()?.get())
+            (
+                ALLOWED.get()?.len(),
+                UNPINNED.get().copied().flatten()?.get(),
+            )
         } else {
             (
                 allowed_cpu_ids()?.len(),
