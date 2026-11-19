@@ -3245,6 +3245,22 @@ fn a_node_that_cannot_complete_its_promotion_holds_off_a_forced_failover_for_a_b
     );
     assert!(nodes[0].conn().cmd(&["SET", &before, "v"]).is_ok());
     assert_eq!(nodes[0].conn().cmd(&["WAIT", "2", "5000"]).int(), 2);
+    // Its nodes.conf, as it will start from, has every master with its
+    // slots.
+    let a_id = nodes[1].id();
+    wait_until(
+        "the replica to have saved the slots of every master",
+        Duration::from_secs(10),
+        || {
+            let saved = std::fs::read_to_string(replica.dir.join("nodes.conf")).unwrap_or_default();
+            [&nodes[0], &nodes[1], &nodes[2]].iter().all(|n| {
+                let id = n.id();
+                saved
+                    .lines()
+                    .any(|l| l.starts_with(&id) && l.split(" ").count() > 8)
+            })
+        },
+    );
 
     fail_saves(&replica, true);
     let r = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
@@ -3261,7 +3277,7 @@ fn a_node_that_cannot_complete_its_promotion_holds_off_a_forced_failover_for_a_b
     );
     nodes[0].kill();
     promote_then_kill_unsaved(&mut replica, &[&nodes[1], &nodes[2]], &before, &after);
-    with_masters_that_are_not(&replica, &nodes[1].id(), 2);
+    with_masters_that_are_not(&replica, &a_id, 2);
 
     replica.spawn();
     let restarted = Instant::now();
