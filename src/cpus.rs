@@ -1,6 +1,6 @@
 //! How many worker threads `--threads 0` (auto) starts, and why.
 //!
-//! Auto is half the CPUs the process may actually run on, rounded up ([`default_workers`]):
+//! Auto is half the CPUs the process may actually run on, rounded up, and at least 2 when it may use 2 or more ([`default_workers`]):
 //! the CPUs online, cut down to the affinity mask (`taskset`, a cpuset, Docker's
 //! `--cpuset-cpus`, Kubernetes' static CPU manager) and to the cgroup CPU
 //! quota (Docker's `--cpus`, a Kubernetes CPU limit), at least one.
@@ -481,8 +481,10 @@ pub fn available(cpus: &Cpus) -> Auto {
 }
 
 /// The workers `--threads 0` (auto) starts on `cpus` available CPUs (see
-/// [`available`]): half of them, rounded up, so 1 on 1 or 2 CPUs, 2 on 3 or
-/// 4, 4 on 8, 8 on 16.
+/// [`available`]): half of them, rounded up, but never fewer than 2 when there are 2 or more
+/// CPUs: 1 on 1 CPU, 2 on 2, 3 or 4, 3 on 6, 4 on 8, 8 on 16. On 2 dedicated CPUs one worker
+/// served 78-85% of the best count on `GET` and 84% on pipelined `SET`, and had a p99 of 64.5 ms
+/// where two had 3.2 ms on tokio (Standard_D4s_v5, 500 connections).
 ///
 /// Measured on a Standard_D8s_v5 confined to 4, 6 and 8 vCPUs, across 14 workloads, one worker per CPU lost up
 /// to 37.9% of the throughput of the best count (8.2% on average) and raised
@@ -492,7 +494,10 @@ pub fn available(cpus: &Cpus) -> Auto {
 /// application, the AOF writer, the replication hub and a background save
 /// run on. Only the count is a rule: `--threads N` starts exactly `N`.
 pub fn default_workers(cpus: usize) -> usize {
-    cpus.max(1).div_ceil(2)
+    match cpus.max(1) {
+        1 => 1,
+        n => n.div_ceil(2).max(2),
+    }
 }
 
 /// `2.5` as `2.5`, `2.0` as `2`.
@@ -600,10 +605,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_starts_half_the_cpus_rounded_up() {
+    fn auto_starts_half_the_cpus_rounded_up_and_at_least_two() {
         for (cpus, workers) in [
             (1, 1),
-            (2, 1),
+            (2, 2),
             (3, 2),
             (4, 2),
             (6, 3),
@@ -616,11 +621,14 @@ mod tests {
         // Never zero.
         assert_eq!(default_workers(0), 1);
         // The CPUs counted are the available ones: a 2-CPU quota on a
-        // 16-CPU machine is 1 worker, a 4-CPU mask on 64 is 2.
-        assert_eq!(default_workers(auto(16, Some(16), Some(2.0))), 1);
-        assert_eq!(default_workers(auto(16, None, Some(2.5))), 1);
+        // 16-CPU machine is 2 workers (never fewer than 2 on 2 CPUs), a
+        // 4-CPU mask on 64 is 2, a quota under 2 CPUs is 1.
+        assert_eq!(default_workers(auto(16, Some(16), Some(2.0))), 2);
+        assert_eq!(default_workers(auto(16, None, Some(2.5))), 2);
         assert_eq!(default_workers(auto(64, Some(4), None)), 2);
         assert_eq!(default_workers(auto(8, None, Some(0.5))), 1);
+        assert_eq!(default_workers(auto(16, None, Some(1.5))), 1);
+        assert_eq!(default_workers(auto(8, Some(2), None)), 2);
     }
 
     #[test]

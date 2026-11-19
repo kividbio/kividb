@@ -355,7 +355,7 @@ docker run -p 6380:6380 \
 
 **CPUs.** The server starts half as many worker threads as the CPUs the container may use,
 rounded up: with
-`--cpus 2` or `--cpuset-cpus 0,1` it starts 1, whatever the host has. A fraction is rounded
+`--cpus 2` or `--cpuset-cpus 0,1` it starts 2, whatever the host has (never fewer than 2 where it may use 2 or more). A fraction is rounded
 down, since more workers than the quota are throttled, which costs latency. Without a CPU
 limit it sees every CPU of the host: give it a limit, or `--threads N`, when it shares the
 host. See [Worker threads](CONFIGURATION.md#worker-threads).

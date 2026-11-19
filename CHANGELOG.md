@@ -24,13 +24,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   version one can roll back to.
 
 - **A server on `--threads 0` (auto, the default) starts half the CPUs, rounded
-  up.** Up to 1.2.2 auto was the CPUs minus 2 (all of them below 4), so a
+  up, at least 2.** Up to 1.2.2 auto was the CPUs minus 2 (all of them below 4), so a
   server that relied on the default starts a different number of workers
-  now, on most machines fewer:
+  now on most machines (not on 2 CPUs, where it is unchanged):
 
   | CPUs | 1.2.2 | now |
   |---:|---:|---:|
-  | 2 | 2 | 1 |
+  | 2 | 2 | 2 |
   | 4 | 2 | 2 |
   | 8 | 6 | 4 |
   | 16 | 14 | 8 |
@@ -833,14 +833,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   halfway through what the script does. Regression suite
   `22-scan-large-count` measures it.
 
-- **Auto worker threads: half the available CPUs, rounded up (#873).**
+- **Auto worker threads: half the available CPUs, rounded up, at least 2 (#873).**
   `--threads 0` started the CPUs minus 2 (all of them below 4) up to 1.2.2;
-  it is now 1 worker on 1 or 2 CPUs, 2 on 3 or 4, 3 on 6, 4 on 8, 8 on 16.
+  it is now 1 worker on 1 CPU, 2 on 2, 3 or 4, 3 on 6, 4 on 8, 8 on 16.
   Measured on a `Standard_D8s_v5` with the server on 4, 6 and 8 vCPUs, across
   14 workloads that saturate it, one worker per CPU lost up to 37.9% of the
   throughput of the best count (8.2% on average) and raised the p99 of a
   server that shared its machine by up to 1011%; half the CPUs lost 6.3% at
   worst and 1.3% on average, with 13 of the 14 within 3% of the best count.
+  On 2 dedicated CPUs (a Standard_D4s_v5 run with the server on 2 CPUs) one worker served 78-85% of the best count's throughput on `GET` (50 connections) and 84% on `SET` pipelined 16, and had a p99 of 64.5 ms against 3.2 ms with two workers on tokio (500 connections) and of 4.5 ms against 0.66 ms on a near-idle load; two workers were within a few percent of the best count except on `XADD` and pub  worst and 1.3% on average, with 13 of the 14 within 3% of the best count.sub (91-94%), which is why auto starts at least 2.
   The CPUs left over are what the load generator, the application and the
   server's own other threads (the AOF writer, the replication hub, a
   background save) run on. The count is taken from the CPUs the process may
@@ -850,9 +851,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   where the cgroup v1 files are the limit. The startup banner says what
   limited the CPUs (`CPUs : 8 online, 2 available (a cgroup CPU quota of 2
   CPUs)`) and how the worker count was chosen (`Worker threads : 1 (auto:
-  half the available CPUs)`). `--threads N` starts exactly `N`, as before;
+  half the available CPUs, at least 2)`). `--threads N` starts exactly `N`, as before;
   `worker-cpu-affinity auto` binds the workers only when they are as many as
-  the CPUs, so with the default count it takes `--threads` set to the CPUs.
+  the CPUs, so with the default count it binds only on 1 or 2 CPUs; on more it takes `--threads` set to the CPUs.
   The number of keyspace shards and the vector index helper threads
   (`search-index-threads auto`) follow the CPUs, not the workers, and do not
   change. A server that relied on the default starts fewer workers than the

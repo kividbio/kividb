@@ -161,16 +161,16 @@ server would not load, and an existing output unless `--force` is given).
 
 Commands run on the worker threads, every worker serving its own share of the connections.
 `--threads N` starts exactly `N`. `--threads 0`, the default, starts half the CPUs the process
-may actually run on, rounded up: 1 on 1 or 2 CPUs, 2 on 3 or 4, 3 on 6, 4 on 8, 8 on 16. The
+may actually run on, rounded up, and never fewer than 2 where it may use 2 or more: 1 on 1 CPU, 2 on 2, 3 or 4, 3 on 6, 4 on 8, 8 on 16. The
 CPUs counted are the CPUs online, cut down to the process's affinity mask (`taskset`, a cpuset,
 Docker's `--cpuset-cpus`, the Kubernetes static CPU manager) and to its cgroup CPU quota
 (Docker's `--cpus`, a Kubernetes CPU limit; a fraction is rounded down, so `--cpus 1.5` is
 1 CPU and one worker), and never fewer than one. A container limited to 2 CPUs on a 64-CPU host
-starts 1. The startup banner says how the number was chosen:
+starts 2. The startup banner says how the number was chosen:
 
 ```
   * CPUs           : 8 online, 2 available (a cgroup CPU quota of 2 CPUs)
-  * Worker threads : 1 (auto: half the available CPUs)
+  * Worker threads : 2 (auto: half the available CPUs, at least 2 unless 1 CPU)
 ```
 
 The server's other threads (the AOF writer, the replication hub, expiry, a background save,
@@ -179,7 +179,7 @@ CPUs the workers leave are what they, the application and the load generator use
 a `Standard_D8s_v5` with the server on 4, 6 and 8 vCPUs, across 14 workloads, one worker per
 CPU lost up to 37.9% of the throughput of the best count (8.2% on average) and raised the p99 of a
 server that shared its machine by up to 1011%; half the CPUs lost 6.3% at worst and 1.3% on
-average, with 13 of the 14 within 3% of the best count. [PERFORMANCE.md](PERFORMANCE.md#worker-threads)
+average, with 13 of the 14 within 3% of the best count. On 2 dedicated CPUs (a Standard_D4s_v5 run with the server on 2 CPUs) one worker served 78-85% of the best count's throughput on `GET` (50 connections) and 84% on `SET` pipelined 16, and had a p99 of 64.5 ms against 3.2 ms with two workers on tokio (500 connections) and of 4.5 ms against 0.66 ms on a near-idle load; two workers were within a few percent of the best count except on `XADD` and pubaverage, with 13 of the 14 within 3% of the best count. [PERFORMANCE.md](PERFORMANCE.md#worker-threads)sub (91-94%), which is why auto starts at least 2. [PERFORMANCE.md](PERFORMANCE.md#worker-threads)
 has the numbers.
 
 Set `--threads` yourself to use every CPU on a machine the server has to itself, or to keep
@@ -188,7 +188,7 @@ which is:
 
 | CPUs | 1.2.2 | now |
 |---:|---:|---:|
-| 2 | 2 | 1 |
+| 2 | 2 | 2 |
 | 4 | 2 | 2 |
 | 8 | 6 | 4 |
 | 16 | 14 | 8 |
@@ -238,7 +238,7 @@ number. [SEARCH.md](SEARCH.md#index-builds-and-ef_runtime) and
 `CONFIG GET` reports it, it is read only at startup) binds each io_uring worker to a CPU
 of its own: worker N to the N-th CPU the process may use. It does so only when the workers
 are exactly as many as those CPUs: `--threads` set to the CPUs of the cpuset, or to the N CPUs of a
-`taskset` (the default count is half of them, so on its own it does not bind), and never when what limits the process is a cgroup CPU quota
+`taskset`. The default count is half of them (at least 2), so it binds on its own only on 1 or 2 CPUs (as many workers as CPUs); on more it takes `--threads` set to the CPUs. It never binds when what limits the process is a cgroup CPU quota
 (Docker's `--cpus`, a Kubernetes CPU limit): a quota is time on any CPU, not CPUs of the
 server's own. The default is `off`: the workers run wherever the scheduler puts them.
 

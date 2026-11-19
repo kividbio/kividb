@@ -235,7 +235,7 @@ and a C compiler). Suites 18, 20 and 34 use `memtier_benchmark` 2.6.1 or newer
 The default worker count is a policy, not code under test: #903 changed it
 from the CPUs minus two (all of them below four) to one per available CPU,
 which on the `Standard_D4s_v5` is 4 workers instead of 2; a later change made it half the
-available CPUs, rounded up (2 on a `Standard_D4s_v5`, 4 on a `Standard_D8s_v5`). With the clients
+available CPUs, rounded up (2 on a `Standard_D4s_v5`, 4 on a `Standard_D8s_v5`; never fewer than 2 where there are 2 or more CPUs). With the clients
 on the same 4 vCPUs that moved rows that `--threads` did not pin: `05`
 `shapes/xadd5_rps` 594k/s with 2 workers, 426k with 4; `08`
 `ftinfo/hset_vec_doc_rps` 98.6k against 89.1k. So every configuration now

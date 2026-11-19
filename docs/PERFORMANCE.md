@@ -504,7 +504,7 @@ Unpipelined, 500 connections, ops/s and p99:
 
 ### Half the CPUs is the default
 
-`--threads 0` starts half the available CPUs, rounded up (1 on 1 or 2, 2 on 3 or 4, 3 on 6,
+`--threads 0` starts half the available CPUs, rounded up, and at least 2 where there are 2 or more (1 on 1, 2 on 2, 3 or 4, 3 on 6,
 4 on 8, 8 on 16). It was chosen from a matrix of worker counts on one Azure `Standard_D8s_v5`
 (8 vCPUs, 4 cores with two hyper-threads each): master `006f8d10` built by rustc 1.100.0, the
 v1.2.2 release binary and Redis 8.10.2, three runs, the median. The server was either unpinned
@@ -527,7 +527,7 @@ The worst throughput cell of one per
 CPU was `XADD` on io_uring with the server on 4 vCPUs of 2 cores (37.9% lost).
 
 A server that has its CPUs to itself, with its clients elsewhere, can use more workers: set
-`--threads` to the CPUs, and `worker-cpu-affinity auto` then binds them. The regression suite
+`--threads` to the CPUs, and `worker-cpu-affinity auto` then binds them. On 2 dedicated CPUs (a Standard_D4s_v5 run with the server on 2 CPUs) one worker served 78-85% of the best count's throughput on `GET` (50 connections) and 84% on `SET` pipelined 16, and had a p99 of 64.5 ms against 3.2 ms with two workers on tokio (500 connections) and of 4.5 ms against 0.66 ms on a near-idle load; two workers were within a few percent of the best count except on `XADD` and pub`--threads` to the CPUs, and `worker-cpu-affinity auto` then binds them. The regression suitesub (91-94%), which is why auto starts at least 2. The regression suite
 `32-default-threads` records the default against the best explicit count on a
 `Standard_D4s_v5`, with the load generators on the same CPUs.
 
