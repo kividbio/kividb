@@ -297,18 +297,30 @@ fn check_as<const DISPATCH: bool>(name: &str, cmd: &[&[u8]]) -> Option<Vec<u8>> 
         }
         return refusal(arities, name, cmd, arity, DISPATCH);
     }
-    check_long(arities, name, cmd, DISPATCH)
+    check_long::<DISPATCH>(arities, name, cmd)
 }
 
 #[inline(never)]
-fn check_long(arities: &Arities, name: &str, cmd: &[&[u8]], dispatch: bool) -> Option<Vec<u8>> {
+fn check_long<const DISPATCH: bool>(
+    arities: &Arities,
+    name: &str,
+    cmd: &[&[u8]],
+) -> Option<Vec<u8>> {
     let Some(&(arity, container)) = arities.commands.get(name) else {
-        return (dispatch && arities.rooms.contains_key(name)).then(Vec::new);
+        return if DISPATCH { room(arities, name) } else { None };
     };
     if fits(arity, cmd.len()) && !container {
         return None;
     }
-    refusal(arities, name, cmd, arity, dispatch)
+    refusal(arities, name, cmd, arity, DISPATCH)
+}
+
+/// For the dispatch, a long name not in the table: `Some` of an empty reply
+/// if it is one of `sketch::room::ALLOCATES`.
+#[cold]
+#[inline(never)]
+fn room(arities: &Arities, name: &str) -> Option<Vec<u8>> {
+    arities.rooms.contains_key(name).then(Vec::new)
 }
 
 #[cold]
