@@ -1697,7 +1697,7 @@ mod tests {
             let tags_a = ScriptTags::One(a.as_bytes());
             let turn_a = script_turn(&tags_a).await;
             let script_a = lock_for_script(&tags_a);
-            let busy = on_another_thread(&[]).err().expect("busy");
+            let busy = on_another_thread(&[]).expect_err("busy");
             assert_eq!(busy.0, vec![stripe_of(a.as_bytes())]);
             drop(script_a);
             drop(turn_a);
@@ -1707,7 +1707,7 @@ mod tests {
                 .await
                 .expect("a script on the other tag was held up");
             let script_b = lock_for_script(&tags_b);
-            let again = on_another_thread(turns.stripes()).err().expect("busy");
+            let again = on_another_thread(turns.stripes()).expect_err("busy");
             let mut both = vec![stripe_of(a.as_bytes()), stripe_of(b.as_bytes())];
             both.sort_unstable();
             assert_eq!(again.0, both);
