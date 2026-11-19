@@ -446,6 +446,7 @@ async fn park_blocking_uring(
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
     client_registry.set_blocked(client_id, Some(unblock_tx), wait.has_timeout());
     let fd = watch.fd;
+    let mut unblockable = true;
     let delivery = if crate::commands::blocking::ended_by_role_change(
         park_epoch,
         refused_on_replica,
@@ -465,7 +466,6 @@ async fn park_blocking_uring(
         // killed, which shuts the socket down) must not be left in line for
         // an element nobody will receive. See `PeerWatch`.
         let mut gone = watch.gone();
-        let mut unblockable = true;
         loop {
             tokio::select! {
                 delivery = &mut waiting => {
@@ -477,6 +477,12 @@ async fn park_blocking_uring(
                     if peer_has_gone(fd) {
                         interrupted.gone = true;
                         break None;
+                    }
+                    #[cfg(debug_assertions)]
+                    if delivery.is_some()
+                        && let Some(delay) = crate::commands::blocking::test_woken_delay()
+                    {
+                        tokio::time::sleep(delay).await;
                     }
                     break delivery;
                 }
@@ -490,6 +496,7 @@ async fn park_blocking_uring(
                             how == crate::commands::blocking::Unblock::Error;
                         interrupted.role_changed =
                             how == crate::commands::blocking::Unblock::RoleChange;
+                        unblockable = false;
                         break None;
                     }
                     Err(_) => unblockable = false,
@@ -498,6 +505,25 @@ async fn park_blocking_uring(
         }
     };
     client_registry.set_blocked(client_id, None, false);
+    // A `CLIENT UNBLOCK` that took the client off the list just as its
+    // wait ended otherwise, woken say, was answered 1: it is done as it
+    // said. Otherwise the client went on as woken, and one woken for
+    // nothing parked again and stayed blocked. It is sent under the
+    // list's lock (`ClientRegistry::unblock`), so by now it is in the
+    // channel.
+    let unblocked = if unblockable {
+        unblock_rx.try_recv().ok()
+    } else {
+        None
+    };
+    let delivery = match unblocked {
+        Some(how) => {
+            interrupted.unblocked_with_error = how == crate::commands::blocking::Unblock::Error;
+            interrupted.role_changed = how == crate::commands::blocking::Unblock::RoleChange;
+            None
+        }
+        None => delivery,
+    };
     slot.hold_count(counted);
     // Woken, or unblocked otherwise, at the moment this node became a
     // replica: ended as the sweep ends it.

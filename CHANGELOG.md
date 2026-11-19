@@ -351,6 +351,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A short script call costs the server less, level with Redis for Tyk's
+  rate limiter and centrifuge's history scripts (#901).** One call of Tyk's
+  sliding-log limiter (four sorted-set commands) cost 16.1 µs of server CPU
+  on one worker against Redis 8.10.2's 13.8; it now costs 13.4, and
+  centrifuge's history scripts 10.1 and 12.4 µs against 11.1 and 13.0
+  (1.2.2: 15.6, 14.2, 14.9). With two workers the server runs Tyk's script
+  92.3k times a second (master 60.7k, Redis 72.6k), `return 1` 187k (160k,
+  161k), and a BullMQ worker's `moveToFinished` costs 37.3 µs of server CPU
+  a job (47.9, Redis 42.0); Azure `Standard_D8s_v5`, server on 2 CPUs, rustc
+  1.100.0, the numbers in docs/PERFORMANCE.md. Instructions per call fell
+  30 % for Tyk's script and for `return 1`. What changed: a script's reply is
+  written as RESP from Lua's stack into one buffer instead of value by value
+  through mlua, and a short array is told from `{ok=...}`, `{err=...}` and
+  the RESP3 shapes by walking it; `redis` and the other library globals are
+  found by a table lookup instead of a Lua call; `EVAL`, `EVALSHA` and
+  `FCALL` go straight to the script handler; a command a script calls is
+  classified as a write once instead of five times, and its replication feed
+  is built only when an AOF, a replica, the backlog or a tap reads it;
+  `KEYS` and `ARGV` of at most 4 KB and at most 64 arguments in all stay
+  until the next script's are built;
+  one argument list per call; ahash for the script cache; and the
+  connection's environment is shared, not copied, when a script goes to the
+  script-runner thread. Replies, errors and what is replicated are unchanged
+  (a differential fuzz of 21,000 scripts against the tree before, RESP2 and
+  RESP3). `return 1` and a lock's compare-and-delete still cost 18 % and
+  11 % more than in Redis on one worker, around the call rather than in it.
+
 - **Writes on a master with a replication backlog and no replica no
   longer wake the replication thread one by one (#894).** A master that
   starts with data (its own snapshot, or any dataset) keeps the backlog for
@@ -891,7 +918,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`MONITOR` no longer loses lines.** A monitor was fed through a ring of
   4,096 lines shared by all monitors, and one that fell that far behind
   lost what it had not read without a word: with four connections sending
-  pipelined commands over four worker threads, 1.2.2 showed a monitor
+  pipelined commands over four worker threads, a monitor of 1.2.2 missed
   between 43 % and 72 % of them (one connection was not affected). Each
   monitor now has its own queue, held to `client-output-buffer-limit
   normal` as in Redis (no limit by default): past it the monitor is
@@ -901,6 +928,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   them, and time stamps no longer go back between lines from different
   threads. Arguments are quoted as Redis quotes them: `\n`, `\r`, `\t`,
   `\a` and `\b` by name, not as `\x0a` and the like.
+
+- **`CLIENT UNBLOCK` reaches a client that was woken and is parking
+  again.** It could answer 1 for a client blocked in `BLPOP` (or another
+  blocking pop) that had just been woken and was parking again, and the
+  client then stayed blocked; or answer 0 for it when the pop ahead of it
+  ended with nothing. And a blocking pop that ended with nothing (its
+  timeout, or `CLIENT UNBLOCK`) woke the next client waiting on its key
+  for no reason, which is what opened that window: Redis's unit/pause
+  failed on it now and then.
 
 - **Sorted-set commands read integers as Redis does.** `ZREMRANGEBYRANK
   key x 5` took `x` as 0 and removed members; it now answers `ERR value is

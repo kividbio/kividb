@@ -26,10 +26,15 @@ seconds and nothing is built or published.
    (`v1.3.0-rc4-d4s_v5`), and `only` stays empty. Tick `full` for the long
    configurations: leave it ticked (it is the default), the gate requires a FULL run. The workflow makes one
    `Standard_D4s_v5` (the size `baseline.json` was recorded on), builds the
-   candidate on it, runs `run-all.sh`, uploads `results/<label>/` as an
+   candidate on it (the default build and the `lua,tls` build that suite 25's
+   scripts need, as `--candidate-full`), runs `run-all.sh`, uploads `results/<label>/` as an
    artifact and deletes the machine whatever happens. It fails when
-   `run-all.sh` exits non-zero. It takes a release build on 4 vCPUs (fat LTO, several minutes) plus 13 to
-   21 minutes of measuring.
+   `run-all.sh` exits non-zero. It takes two release builds on 4 vCPUs (fat LTO, several minutes each) plus 13 to
+   21 minutes of measuring. With `big` (leave it ticked, the default) it also
+   makes a `Standard_D8s_v5`, the same way, for the suites that declare
+   `min_cpus=8` (`run-all.sh --min-cpus-only`, results `<label>` ending in
+   `-d8s_v5`): on the D4s_v5 those are not run, and the gate needs their run
+   from a machine that big.
 3. Read `summary.md`. The verdict must be `ok`:
    - `REGRESSED`: a gate failed. Either fix the regression (and cut a new
      candidate), or, for an intended change, explain it in the release PR and
@@ -40,9 +45,10 @@ seconds and nothing is built or published.
      cause and run again; never commit an `INVALID` run as the release's
      result.
    - `SMOKE`: `SCALE` was not 1; only a harness check.
-4. Download the artifact and commit `results/<label>/` (`env.json`,
-   `summary.json`, `summary.md`, `raw.tar.gz`) on the release branch, with the
-   version bump. Tag that commit. The gate needs the run's `candidate_commit`
+4. Download the artifacts and commit each `results/<label>/` (`env.json`,
+   `summary.json`, `summary.md`, `raw.tar.gz`; the D4s_v5 run and the D8s_v5
+   one) on the release branch, with the version bump. Tag that commit. The
+   gate needs the runs together to cover every suite, and each run's `candidate_commit`
    to be an ancestor of the tag with `src/`, `Cargo.toml`, `Cargo.lock` and
    `rust-toolchain.toml` unchanged since, apart from the package version line.
    Any code change after the run means running it again.
@@ -54,6 +60,26 @@ seconds and nothing is built or published.
 
    It needs bash and python3 and reads the repository through git. It prints
    why each committed run does not count, or `OK`.
+
+   It does not trust a run's `summary.json`: it judges each run again from
+   its `raw.tar.gz` (`env.json`, `results.jsonl`) with the tagged tree's
+   `lib/compare.py` and `baseline.json`, so an edited summary or a baseline
+   loosened after the run is seen. It refuses a run made with
+   `ALLOW_VM_CHANGE=1` or `REGRESS_ALLOW_RUSTC=1`, a run on another machine
+   size than a covered suite was recorded on, rows with no recorded value
+   (`new`), a suite of the tree with no rows in `baseline.json`, and any
+   change to `benchmarks/X.Y.0/regressions/` since the candidate commit other
+   than added `results/` directories.
+
+   **What it cannot check yet:** that the measured binary is the released
+   one. `env.json` records the candidate's SHA-256, but the gate runs in
+   `release.yml`'s first job (`verify-version`), before anything is built,
+   and the release builds its binaries afresh from the tag in containers
+   (Amazon Linux 2023), so there is no artifact to compare with at that
+   point, and the Actions run's binaries are built on the VM, not taken from
+   the release. The link is the candidate commit (ancestor of the tag, code
+   and harness unchanged since) and the rustc rule; comparing hashes would
+   need the release's build to be the one measured.
 
 The gate counts a run only when its verdict is `ok`, with no failed gate, at
 full scale (no `SCALE`, no `only`), with `FULL=1`, no metric "not run", all suites
@@ -80,7 +106,9 @@ tolerance), never to make a red run green:
 
 ```bash
 # on a Standard_D4s_v5 with the candidate built, from a clean tree
+cargo build --release --features lua,tls --target-dir target-full
 FULL=1 benchmarks/1.3.0/regressions/run-all.sh --candidate target/release/kividb \
+    --candidate-full target-full/release/kividb \
     --candidate-commit "$(git rev-parse --short HEAD)" --label <label> --record
 ```
 
