@@ -272,12 +272,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   if that is not enough (or if what was made was taken by another command
   meanwhile). One command evicts what it needs a few megabytes at a time,
   letting go of the gates between, so that a full sync, a snapshot, a
-  script or a transaction waits for no more than one step of it. A command
+  script or a transaction waits for no more than one step of it; it stops
+  if writes are paused, the node becomes a replica or `maxmemory` is
+  changed meanwhile, and a command that wants more than evicting every key
+  could free is refused at once. A command
   a transaction runs is given room the same way, and one a script calls
   too unless the script runs beside others under its hash tags
   (`lua-parallel-scripts`), where it is refused with `OOM` if it does not
   fit. A `RESTORE` of a probabilistic value is given room for the size its
-  payload declares, before anything of it is allocated.
+  payload declares (all of a Bloom filter's layers), before anything of it
+  is allocated, unless it is refused `BUSYKEY`.
   `COPY` copies a filter (Redis refuses); a
   copy, a snapshot and a `DUMP` share the filter's bytes until it is next
   written. As in Redis 8.10, no `BF.*` command sends a keyspace event but

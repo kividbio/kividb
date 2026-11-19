@@ -145,25 +145,46 @@ struct Child {
     port: u16,
     child: std::process::Child,
     dir: std::path::PathBuf,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
 }
 
 impl Child {
     fn start(tag: &str, extra: &[&str]) -> Child {
-        let dir = tmp_dir(tag);
+        Child::start_env(tag, extra, &[])
+    }
+
+    fn start_env(tag: &str, extra: &[&str], env: &[(&str, &str)]) -> Child {
+        let args = extra.iter().map(|a| a.to_string()).collect();
+        let env = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Child::spawn_in(tmp_dir(tag), args, env)
+    }
+
+    fn spawn_in(dir: std::path::PathBuf, args: Vec<String>, env: Vec<(String, String)>) -> Child {
         let (child, port) = start_verified(|port| {
             std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
                 .current_dir(&dir)
+                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
                 .args(["--threads", "2", "--loglevel", "warning"])
                 .args(["--configfile", "kividb.conf", "--dir"])
                 .arg(&dir)
-                .args(extra)
+                .args(&args)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .spawn()
                 .expect("could not start kividb")
         });
-        let child = Child { port, child, dir };
+        let child = Child {
+            port,
+            child,
+            dir,
+            args,
+            env,
+        };
         wait_until("kividb to answer", || {
             TcpStream::connect(("127.0.0.1", port)).is_ok_and(|mut c| {
                 c.write_all(b"PING\r\n").is_ok() && {
@@ -173,6 +194,17 @@ impl Child {
             })
         });
         child
+    }
+
+    /// Killed and started again in its directory, as it was started.
+    fn restart(mut self) -> Child {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let dir = std::mem::take(&mut self.dir);
+        let args = std::mem::take(&mut self.args);
+        let env = std::mem::take(&mut self.env);
+        std::mem::forget(self);
+        Child::spawn_in(dir, args, env)
     }
 
     /// A replica of `master`, in sync.
@@ -194,7 +226,9 @@ impl Drop for Child {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if !self.dir.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -533,6 +567,10 @@ fn a_cuckoo_write_never_makes_a_filter_and_fails() {
     );
     assert_eq!(m.cmd(&["EXISTS", "over"]), b":0\r\n");
     alike(&master, &replica, "over the per-command limit");
+    // At the limit, with a replica: whatever eviction does (it may stop
+    // for a while when what it frees stays allocated, #284), an add either
+    // makes its filter and is sent, or is refused and makes nothing. How
+    // many get room is not asserted here (see the test after this one).
     let used = used_memory(&mut m);
     m.ok(&[
         "CONFIG",
@@ -541,20 +579,84 @@ fn a_cuckoo_write_never_makes_a_filter_and_fails() {
         &(used + 10_000_000).to_string(),
     ]);
     fill_to_the_limit(&mut m, "s", 10_000, false);
-    // A refused add makes nothing (eviction may stop for a while, refusing
-    // writes, when what it frees stays allocated: #284).
-    let mut added = 0;
     for i in 0..50 {
         let key = format!("new{i}");
         match m.cmd(&["CF.ADD", &key, "x"]).as_slice() {
-            b":1\r\n" => added += 1,
+            b":1\r\n" => {}
             OOM => assert_eq!(m.cmd(&["EXISTS", &key]), b":0\r\n", "{key}"),
             other => panic!("{key}: {}", shown(other)),
         }
     }
-    assert!(added > 10, "{added} of 50 added");
     m.ok(&["CONFIG", "SET", "maxmemory", "0"]);
     alike(&master, &replica, "at the limit");
+}
+
+/// At the limit with an evicting policy (no replica, whose queue can keep
+/// what eviction frees allocated), every `CF.ADD` to a missing key is
+/// given room for its filter and succeeds: the room asked for before it
+/// ran is all it needs.
+#[test]
+fn adds_that_make_filters_at_the_limit_all_succeed() {
+    let server = Child::start("cf-at-limit", &["--maxmemory-policy", "allkeys-lru"]);
+    let mut c = server.conn();
+    let used = used_memory(&mut c);
+    c.ok(&[
+        "CONFIG",
+        "SET",
+        "maxmemory",
+        &(used + 10_000_000).to_string(),
+    ]);
+    fill_to_the_limit(&mut c, "s", 10_000, false);
+    for i in 0..100 {
+        let key = format!("new{i}");
+        assert_eq!(c.cmd(&["CF.ADD", &key, "x"]), b":1\r\n", "{key}");
+    }
+}
+
+/// A `CF.INSERT` that makes its filter (with `CAPACITY`, and the master's
+/// `cf-*` settings) and has items refused for room is sent as the filter
+/// it made and the items it added: the replica, and the master started
+/// again from its AOF, end with the same filter.
+#[test]
+fn an_insert_that_makes_its_filter_and_refuses_items_reaches_the_replica_and_the_aof() {
+    let master = Child::start(
+        "cf-made-refused",
+        &["--aof", "--maxmemory-policy", "noeviction"],
+    );
+    let replica = Child::replica_of("cf-made-refused-replica", &master);
+    let mut m = master.conn();
+    for (name, value) in [
+        ("cf-bucket-size", "1"),
+        ("cf-max-iterations", "1"),
+        ("cf-expansion-factor", "2"),
+    ] {
+        m.ok(&["CONFIG", "SET", name, value]);
+    }
+    m.ok(&["SET", "other", "1"]);
+    let used = used_memory(&mut m);
+    m.ok(&[
+        "CONFIG",
+        "SET",
+        "maxmemory",
+        &(used + 1_000_000).to_string(),
+    ]);
+    let mut args = vec!["CF.INSERT", "k", "CAPACITY", "4", "ITEMS"];
+    args.extend(std::iter::repeat_n("x", 60));
+    let reply = m.cmd(&args);
+    m.ok(&["CONFIG", "SET", "maxmemory", "0"]);
+    let text = String::from_utf8_lossy(&reply).to_string();
+    assert!(text.starts_with("*60\r\n"), "{text}");
+    assert!(text.contains(":1\r\n"), "{text}");
+    assert!(text.contains("-OOM"), "{text}");
+    alike(&master, &replica, "made, items refused");
+    let info = m.cmd(&["CF.INFO", "k"]);
+    assert_eq!(replica.conn().cmd(&["CF.INFO", "k"]), info);
+    let before = dataset(&mut m);
+    thread::sleep(Duration::from_millis(1500));
+    drop(m);
+    let master = master.restart();
+    let mut m = master.conn();
+    assert_eq!(dataset(&mut m), before, "the AOF");
 }
 
 /// A command of many items is given room for the growth that holds them;
@@ -706,6 +808,173 @@ fn restore_asks_for_room() {
     assert!(evicted(&mut c) - before > 100, "room was made for it");
     c.ok(&["CONFIG", "SET", "maxmemory", "0"]);
     assert_eq!(c.cmd(&["CMS.QUERY", "cms", "a"]), b"*1\r\n:0\r\n");
+}
+
+// ── Room and what it was asked under ─────────────────────────────────────
+
+/// `CF.DEL` and `CF.COMPACT` of a filter nothing shares allocate nothing
+/// and free: over the limit with `noeviction` they run (a write that may
+/// add is refused, as before).
+#[test]
+fn deletes_that_allocate_nothing_run_over_the_limit() {
+    let server = Child::start("cf-over", &["--maxmemory-policy", "noeviction"]);
+    let mut c = server.conn();
+    c.ok(&["CF.RESERVE", "f", "1024", "EXPANSION", "1"]);
+    for i in 0..3000 {
+        c.cmd(&["CF.ADD", "f", &format!("i{i}")]);
+    }
+    c.ok(&["SET", "pad", &"v".repeat(2_000_000)]);
+    let used = used_memory(&mut c);
+    c.ok(&["CONFIG", "SET", "maxmemory", &(used / 2).to_string()]);
+    assert_eq!(c.cmd(&["CF.DEL", "f", "i1"]), b":1\r\n");
+    assert_eq!(c.cmd(&["CF.COMPACT", "f"]), b"+OK\r\n");
+    assert_eq!(c.cmd(&["CF.ADD", "f", "new"]), OOM);
+    c.ok(&["CONFIG", "SET", "maxmemory", "0"]);
+}
+
+/// A Bloom filter of several layers restored near the limit with an
+/// evicting policy is given room for all its layers, and each layer is
+/// held to its own size as it is read.
+#[test]
+fn a_bloom_filter_of_several_layers_restores_near_the_limit() {
+    let server = Child::start("bf-layers", &["--maxmemory-policy", "allkeys-lru"]);
+    let mut c = server.conn();
+    c.ok(&["BF.RESERVE", "b", "0.01", "50000", "EXPANSION", "2"]);
+    let mut n = 0;
+    while n < 350_000 {
+        let mut args = vec!["BF.MADD".to_string(), "b".to_string()];
+        args.extend((n..n + 1000).map(|i| format!("i{i}")));
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        c.cmd(&refs);
+        n += 1000;
+    }
+    let filters = c.cmd(&["BF.INFO", "b", "FILTERS"]);
+    let layers: u64 = String::from_utf8_lossy(&filters)
+        .lines()
+        .find_map(|l| l.strip_prefix(':')?.parse().ok())
+        .unwrap_or(0);
+    assert!(layers >= 3, "{}", shown(&filters));
+    let payload = bulk(&c.cmd(&["DUMP", "b"]));
+    assert_eq!(c.cmd(&["DEL", "b"]), b":1\r\n");
+    let used = used_memory(&mut c);
+    c.ok(&[
+        "CONFIG",
+        "SET",
+        "maxmemory",
+        &(used + 8_000_000).to_string(),
+    ]);
+    fill_to_the_limit(&mut c, "s", 10_000, false);
+    assert_eq!(c.raw(&[b"RESTORE", b"b", b"0", &payload]), b"+OK\r\n");
+    c.ok(&["CONFIG", "SET", "maxmemory", "0"]);
+    assert_eq!(c.cmd(&["BF.EXISTS", "b", "i7"]), b":1\r\n");
+}
+
+/// A `RESTORE` refused `BUSYKEY` is given no room (nothing is evicted for
+/// it); and a command that wants more than evicting every key could free
+/// is refused at once, the keys left where they are.
+#[test]
+fn room_is_not_made_for_what_cannot_run() {
+    let server = Child::start("not-made", &["--maxmemory-policy", "allkeys-lru"]);
+    let mut c = server.conn();
+    c.ok(&["CMS.INITBYDIM", "cms", "500000", "1"]);
+    let payload = bulk(&c.cmd(&["DUMP", "cms"]));
+    c.ok(&["SET", "busy", "1"]);
+    for i in 0..300 {
+        c.ok(&["SET", &format!("s{i}"), &"v".repeat(10_000)]);
+    }
+    // Room for the payload (counted twice while the command runs) but not
+    // for the sketch too: room would be made by evicting, were the command
+    // asked what it wants.
+    let limit = used_memory(&mut c) + 5_000_000;
+    c.ok(&["CONFIG", "SET", "maxmemory", &limit.to_string()]);
+    let before = evicted(&mut c);
+    let reply = c.raw(&[b"RESTORE", b"busy", b"0", &payload]);
+    assert!(reply.starts_with(b"-BUSYKEY"), "{}", shown(&reply));
+    assert_eq!(evicted(&mut c), before, "evicted for BUSYKEY");
+    fill_to_the_limit(&mut c, "t", 10_000, false);
+    // Between the limit less what the server held before it had any data,
+    // and the limit: eviction could never free it.
+    let startup: u64 = info_field(&mut c, "memory", "used_memory_startup")
+        .parse()
+        .unwrap();
+    assert!(startup > 0, "used_memory_startup {startup}");
+    // With the 128 KiB a command is given beyond what it says.
+    let width = ((limit - (128 << 10) - startup / 2) / 4).to_string();
+    let before = evicted(&mut c);
+    assert_eq!(c.cmd(&["CMS.INITBYDIM", "huge", &width, "1"]), OOM);
+    assert!(
+        evicted(&mut c) - before < 20,
+        "evicted for a request that cannot fit"
+    );
+}
+
+/// Eviction for one command looks again, in each step, at what it was
+/// asked under: writes paused, this node made a replica, `maxmemory`
+/// changed. (Debug builds: a hook stalls 300 ms between steps.)
+#[cfg(debug_assertions)]
+#[test]
+fn eviction_in_steps_stops_when_what_it_was_asked_under_changes() {
+    for change in ["pause", "replica", "maxmemory"] {
+        let master = Child::start_env(
+            &format!("steps-{change}"),
+            &["--maxmemory-policy", "allkeys-lru"],
+            &[("KIVIDB_TEST_FAILPOINTS", "sketch-room-step-stall")],
+        );
+        // No replica: one's queue can keep what eviction frees allocated
+        // (#284), and eviction then stops of itself.
+        let mut c = master.conn();
+        let used = used_memory(&mut c);
+        c.ok(&[
+            "CONFIG",
+            "SET",
+            "maxmemory",
+            &(used + 30_000_000).to_string(),
+        ]);
+        fill_to_the_limit(&mut c, "s", 10_000, false);
+        // 16 MiB (a power of two of buckets): four steps and more, 300 ms
+        // apart.
+        let offset_before = info_field(&mut c, "replication", "master_repl_offset");
+        let port = master.port;
+        let sized = thread::spawn(move || {
+            let mut c = Conn::connect(port);
+            c.cmd(&["CF.RESERVE", "big", "16000000", "BUCKETSIZE", "1"])
+        });
+        thread::sleep(Duration::from_millis(450));
+        match change {
+            "pause" => c.ok(&["CLIENT", "PAUSE", "3000", "WRITE"]),
+            "replica" => {
+                let nowhere = common::free_port().to_string();
+                c.ok(&["REPLICAOF", "127.0.0.1", &nowhere]);
+            }
+            _ => c.ok(&["CONFIG", "SET", "maxmemory", "0"]),
+        }
+        thread::sleep(Duration::from_millis(400));
+        let (evicted_then, offset_then) = (
+            evicted(&mut c),
+            info_field(&mut c, "replication", "master_repl_offset"),
+        );
+        thread::sleep(Duration::from_millis(1200));
+        assert_eq!(evicted(&mut c), evicted_then, "{change}: went on evicting");
+        if change == "pause" {
+            assert_eq!(
+                info_field(&mut c, "replication", "master_repl_offset"),
+                offset_then,
+                "the offset of a paused master moved"
+            );
+        }
+        let reply = sized.join().unwrap();
+        match change {
+            // Held by the pause, then dispatched, and sized, again: it
+            // evicted again once the pause was over.
+            "pause" => {
+                assert!(evicted(&mut c) > evicted_then, "not sized again");
+                assert_eq!(reply, b"+OK\r\n", "{}", shown(&reply));
+                let _ = &offset_before;
+            }
+            "replica" => assert!(reply.starts_with(b"-"), "{}", shown(&reply)),
+            _ => assert_eq!(reply, b"+OK\r\n", "{}", shown(&reply)),
+        }
+    }
 }
 
 // ── Transactions and scripts ─────────────────────────────────────────────

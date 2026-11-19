@@ -487,6 +487,27 @@ impl<R: Read> Reader<'_, R> {
         }
     }
 
+    /// Past a string, plain or LZF-compressed, without holding it: what a
+    /// reader only asked the size of skips.
+    fn skip_string(&mut self) -> io::Result<()> {
+        self.opcode(OPCODE_STRING)?;
+        let (n, encoded) = rdb_length(self.r)?;
+        let len = if !encoded {
+            n
+        } else if n == RDB_ENC_LZF {
+            let (compressed, _) = rdb_length(self.r)?;
+            let (_original, _) = rdb_length(self.r)?;
+            compressed
+        } else {
+            return Err(super::invalid("a string of an unexpected encoding"));
+        };
+        let skipped = io::copy(&mut Read::take(&mut *self.r, len), &mut io::sink())?;
+        if skipped != len {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        Ok(())
+    }
+
     fn end(&mut self) -> io::Result<()> {
         self.opcode(OPCODE_EOF)
     }
@@ -523,13 +544,21 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
         if let Some(why) = super::bloom::over_limits(claimed) {
             return Err(r.bad(&why));
         }
-        super::room::declared(claimed.bytes)?;
-        // Then by what was read: its bits must be its bytes times 8, and no
-        // more than those bytes is read or reserved (a compressed string's
-        // length is its own word: what it makes is held to them too).
         if bits % 8 != 0 {
             return Err(r.bad("a layer's bytes do not match its bits"));
         }
+        // Room for the layer, as it comes (the layers before it are counted
+        // already); only asked, the layers are added up and skipped.
+        if super::room::declared_part(bits / 8)? {
+            r.skip_string()?;
+            used.bytes = claimed.bytes;
+            used.hashes = claimed.hashes;
+            r.uint()?;
+            continue;
+        }
+        // Then by what was read: its bits must be its bytes times 8, and no
+        // more than those bytes is read or reserved (a compressed string's
+        // length is its own word: what it makes is held to them too).
         let data = r.string_of(bits / 8, "a layer's bytes do not match its bits")?;
         if (data.len() as u64).checked_mul(8) != Some(bits) {
             return Err(r.bad("a layer's bytes do not match its bits"));
@@ -553,6 +582,7 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
         datas.push(data);
     }
     r.end()?;
+    super::room::declared_end()?;
     // The layers are the strings read: nothing more is allocated, and
     // neither `maxmemory` nor `bloom-max-filter-bytes` is consulted (a
     // file, a full sync or a `RESTORE` is taken whole).

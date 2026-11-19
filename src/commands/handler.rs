@@ -1575,11 +1575,14 @@ fn room_before_dispatch(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     if crate::sketch::room_for(wanted) {
         return None;
     }
-    // More than the limit itself: no eviction can make room for it.
-    let Some(target) = limit.checked_sub(usize::try_from(wanted).unwrap_or(usize::MAX)) else {
+    // More than evicting every key could free (what the server held before
+    // it had any, `used_memory_startup`, is never freed): refused at once,
+    // rather than after emptying the keyspace for nothing.
+    let wanted_usize = usize::try_from(wanted).unwrap_or(usize::MAX);
+    if wanted_usize > limit.saturating_sub(crate::commands::memory::startup_used()) {
         return Some(sketch_oom());
-    };
-    make_room_in_steps(ctx, target, wanted)
+    }
+    make_room_in_steps(ctx, wanted_usize)
 }
 
 /// Room made for a command beyond what it says it allocates
@@ -1600,29 +1603,57 @@ const EVICTION_STEP: usize = 4 << 20;
 /// transaction, which hold the gates already, it holds them throughout, as
 /// they do. It stops, refused, after twice the steps its size takes (and a
 /// few more), should writes elsewhere fill memory as fast as it frees it.
-fn make_room_in_steps(ctx: &mut Ctx, target: usize, wanted: u64) -> Option<Vec<u8>> {
+///
+/// What it was asked under is looked at again in each step, in the gates:
+/// writes paused meanwhile (`CLIENT PAUSE`, a failover, a slot handoff),
+/// this node become a replica, or `maxmemory` changed. Paused or a replica,
+/// it stops, room made or not, and the command goes on to what it meets
+/// then (held by the pause, `READONLY`): dispatched again after a pause, it
+/// is sized again from the start. The limit, and the target with it, are
+/// the limit of the moment; none, it stops.
+fn make_room_in_steps(ctx: &mut Ctx, wanted: usize) -> Option<Vec<u8>> {
     #[cfg(feature = "lua")]
     let overrun = crate::commands::lua::running_script_is_over_its_time_limit;
     #[cfg(not(feature = "lua"))]
     let overrun = || false;
-    let steps = usize::try_from(wanted / EVICTION_STEP as u64)
-        .unwrap_or(usize::MAX)
-        .saturating_mul(2)
-        .saturating_add(8);
-    for _ in 0..steps {
+    let steps = (wanted / EVICTION_STEP).saturating_mul(2).saturating_add(8);
+    for step in 0..steps {
+        #[cfg(debug_assertions)]
+        if step > 0 {
+            stall_between_steps_for_test();
+        }
+        let _ = step;
+        let _gate =
+            crate::command_gate::enter_unless(std::time::Duration::from_millis(10), overrun)?;
+        let _evicting = crate::write_gate::enter();
+        let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed);
+        if limit == 0 || ctx.repl_state.is_slave() || crate::pause::expiry_deferred() {
+            return None;
+        }
+        let Some(target) = limit.checked_sub(wanted) else {
+            return Some(sketch_oom());
+        };
         let used = crate::memory_use::counted();
         if used <= target {
             return None;
         }
-        let step = target.max(used.saturating_sub(EVICTION_STEP));
-        let _gate =
-            crate::command_gate::enter_unless(std::time::Duration::from_millis(10), overrun)?;
-        let _evicting = crate::write_gate::enter();
-        if !crate::eviction::make_room(ctx, step, true) {
+        if !crate::eviction::make_room(ctx, target.max(used.saturating_sub(EVICTION_STEP)), true) {
             return Some(sketch_oom());
         }
     }
-    (crate::memory_use::counted() > target).then(sketch_oom)
+    let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed);
+    (limit != 0 && crate::memory_use::counted().saturating_add(wanted) > limit).then(sketch_oom)
+}
+
+/// `KIVIDB_TEST_FAILPOINTS` names `sketch-room-step-stall` (debug builds):
+/// a pause of 300 ms between two steps of [`make_room_in_steps`], out of
+/// the gates, for a test to change what it was asked under meanwhile.
+#[cfg(debug_assertions)]
+fn stall_between_steps_for_test() {
+    static STALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *STALL.get_or_init(|| crate::aof::injected("sketch-room-step-stall")) {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
 }
 
 /// The `OOM` refusal of a command there is no room for.

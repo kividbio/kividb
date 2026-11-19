@@ -1824,6 +1824,17 @@ pub(crate) fn restore_wanted(ctx: &Ctx) {
     let Some(payload) = ctx.cmd.get(3) else {
         return;
     };
+    // Refused `BUSYKEY` when it runs: it wants nothing.
+    let replace = ctx.cmd[4..]
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case(b"REPLACE"));
+    if !replace {
+        let key = ctx.cmd[1];
+        let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
+        if read_lock!(shard).contains_key(key) {
+            return;
+        }
+    }
     if crate::snapshot::payload_may_hold_sketch(payload) {
         let _ = crate::snapshot::restore_payload_checked(payload);
     }

@@ -166,11 +166,18 @@ pub fn check(ctx: &Ctx, bytes: impl FnOnce(&Ctx) -> u64) -> Result<(), NoRoom> {
 /// (always for one that is not held to it), looked at as it runs: for an
 /// allocation a command makes past what it was given room for, which is
 /// then answered for that item alone.
+///
+/// Nothing (0 bytes) always fits: a command that allocates nothing, such as
+/// `CF.DEL` of a filter nothing shares, which frees, is not refused here
+/// over the limit. (One that may add to memory use is refused over the
+/// limit before it runs, by `make_room_or_refuse`, as before.)
 pub fn fits(ctx: &Ctx, bytes: impl FnOnce(&Ctx) -> u64) -> bool {
     let from_client = !ctx.apply_replication && !ctx.repl_state.is_slave();
-    !(from_client
-        && crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed) != 0
-        && !super::room_for(bytes(ctx)))
+    if !from_client || crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed) == 0 {
+        return true;
+    }
+    let bytes = bytes(ctx);
+    bytes == 0 || super::room_for(bytes)
 }
 
 /// Run `f` (a client's `RESTORE`), holding the probabilistic values it
@@ -218,6 +225,38 @@ pub fn declared(bytes: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// [`declared`] for a value read in parts, each part's `bytes` as its
+/// header gives them (a Bloom filter's layers): a client's `RESTORE` under
+/// `maxmemory` is held to each part as it is read. Only asked what it
+/// wants, it adds the part to what it has said and is to skip the part's
+/// bytes (`Ok(true)`), so that it says the whole at the end
+/// ([`declared_end`]).
+pub fn declared_part(bytes: u64) -> std::io::Result<bool> {
+    match ASKED.get() {
+        Asked::No => declared(bytes).map(|()| false),
+        Asked::Asking => {
+            ASKED.set(Asked::Said(bytes));
+            Ok(true)
+        }
+        Asked::Said(before) => {
+            ASKED.set(Asked::Said(before.saturating_add(bytes)));
+            Ok(true)
+        }
+    }
+}
+
+/// After the parts of a value read in parts ([`declared_part`]): if only
+/// asked, the reading stops here, having said the whole.
+pub fn declared_end() -> std::io::Result<()> {
+    if asking() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "no room under maxmemory for the value",
+        ));
+    }
+    Ok(())
+}
+
 /// `KIVIDB_TEST_NO_ROOM_BEFORE`, never set otherwise, and read in debug
 /// builds only: commands are not asked what they want, so that a test can
 /// see one find no room when it runs.
@@ -253,5 +292,18 @@ mod tests {
         assert!(declared(1234).is_err());
         assert_eq!(ASKED.get(), Asked::Said(1234));
         ASKED.set(Asked::No);
+    }
+
+    /// A value read in parts, asked: the parts add up, and the reading
+    /// stops at the end; not asked, each part goes on.
+    #[test]
+    fn parts_add_up_when_asked() {
+        assert!(!declared_part(10).unwrap());
+        assert!(declared_end().is_ok());
+        let _asking = Asking::begin();
+        assert!(declared_part(10).unwrap());
+        assert!(declared_part(32).unwrap());
+        assert!(declared_end().is_err());
+        assert_eq!(ASKED.get(), Asked::Said(42));
     }
 }
