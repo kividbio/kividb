@@ -1652,9 +1652,10 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
 /// many costs about what measuring every vector does.
 pub(crate) const SEARCH_SHARE: usize = 16;
 
-/// The nearest `k` an index search finds, less the documents whose `field`
-/// a query is not to see ([`crate::commands::search::field_hidden`]),
-/// nearest first, and whether `deadline` passed first.
+/// The nearest `k` an index search finds, less the hits a query leaves out
+/// ([`crate::commands::search::hit_left_out`]: a document past its `field`'s
+/// deadline, or one deleted or written over whose vector is still in the
+/// index), nearest first, and whether `deadline` passed first.
 ///
 /// `search(n)` is the nearest `n`. While hits were left out and the search
 /// found all it was asked for, an HNSW search is asked for more, at least
@@ -1671,6 +1672,7 @@ pub(crate) const SEARCH_SHARE: usize = 16;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn nearest_shown(
     db: &crate::store::Db,
+    on: &crate::vector::IndexOn,
     field: &str,
     k: usize,
     now: &crate::types::QueryClock,
@@ -1692,7 +1694,7 @@ pub(crate) fn nearest_shown(
         (scorer.nearest(), cut)
     };
     shown_of(k, room, deadline, search, measure, |key| {
-        crate::commands::search::field_hidden(db, key, field, now)
+        crate::commands::search::hit_left_out(db, on, key, field, now)
     })
 }
 
@@ -1814,6 +1816,15 @@ impl<'a> FilteredKnn<'a> {
                 }
             }
             LiveIndex::Hnsw(idx) => {
+                // A vector waiting to be linked is the key's latest.
+                if let Some(d) = idx.backlog.with_waiting(key, |w| {
+                    (w.vector.len() == dim).then(|| self.query.to_unit(&w.vector))
+                }) {
+                    if let Some(d) = d {
+                        self.best.offer(d, key);
+                    }
+                    return;
+                }
                 let Some(id) = idx.key_to_id.read().get(key).copied() else {
                     return;
                 };
@@ -2112,7 +2123,7 @@ fn knn_among(
 }
 
 /// The nearest `knn.k` of the documents `ids`, each measured.
-fn knn_measured(
+pub(crate) fn knn_measured(
     def: &crate::vector::IndexDef,
     ids: &crate::vector::postings::Bits,
     knn: &crate::vector::filter::Knn,
@@ -2144,12 +2155,27 @@ fn knn_measured(
                 }
             }
             LiveIndex::Hnsw(graph) => {
+                // A vector waiting to be linked is the key's latest: it is
+                // measured where it waits, and the graph not asked.
+                let mut run: Vec<&Arc<str>> = run.iter().collect();
+                if !graph.backlog.is_empty() {
+                    let waiting = graph.backlog.read();
+                    run.retain(|key| match waiting.get(&***key) {
+                        Some(w) => {
+                            if w.vector.len() == dim {
+                                best.offer(query.to_unit(&w.vector), key);
+                            }
+                            false
+                        }
+                        None => true,
+                    });
+                }
                 // The two locks one after the other, never together: an
                 // insert takes the ids' for writing while it holds the
                 // nodes'.
                 let found: Vec<(usize, &Arc<str>)> = {
                     let key_to_id = graph.key_to_id.read();
-                    run.iter()
+                    run.into_iter()
                         .filter_map(|key| key_to_id.get(&**key).map(|&id| (id, key)))
                         .collect()
                 };
@@ -2935,7 +2961,7 @@ mod nearest_shown_tests {
                 pass += 1;
                 let mut hits = index(100)(keep);
                 if pass == 2 {
-                    hits.swap(0, 7);
+                    hits.swap(7, 20);
                 }
                 (hits, false)
             },

@@ -430,7 +430,7 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
             crate::commands::lua::script_settle_slot(slot);
             None
         }
-        crate::cluster::routing::RouteDecision::TryAgain => decision.refusal(),
+        crate::cluster::routing::RouteDecision::TryAgain => decision.refusal(false),
         crate::cluster::routing::RouteDecision::Passthrough => None,
         _ => Some(resp_error(
             "ERR Script attempted to access a non local key in a cluster node",
@@ -787,6 +787,20 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // A `SELECT` is an inner write but changes no data (`writes_the_dataset`).
     #[cfg_attr(not(feature = "lua"), allow(unused_variables))]
     let writes_data = inner_write && replication::writes_the_dataset(name2, ctx.cmd.as_slice());
+
+    // Room for a command that allocates as much as its arguments say, as
+    // for one from a client, where that can be made (`room_in_script`):
+    // before the refusal of a write over the limit, which it may make room
+    // for.
+    if inner_write
+        && !repl_is_slave
+        && !ctx.apply_replication
+        && !skip_mem
+        && crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed) != 0
+        && let Some(refusal) = room_in_script(ctx, name2)
+    {
+        return refusal;
+    }
 
     if !repl_is_slave
         && check_memory_limit()
@@ -1214,7 +1228,7 @@ fn routed_again_in_gate(
         || registry.get_readonly(client_id),
         |key| crate::read_lock!(crate::store::get_shard(&store[db], key)).contains_key(key),
     )
-    .refusal()
+    .refusal(ctx.peer_ipv6)
 }
 
 // The parts of `run_command` that a plain command on a standalone master
@@ -1278,7 +1292,7 @@ fn route_on_arrival(
                 info.asking = false;
             });
         }
-        if let Some(refusal) = decision.refusal() {
+        if let Some(refusal) = decision.refusal(ctx.peer_ipv6) {
             return Some(refusal);
         }
         crate::cluster::routing::stall_for_test(name, ctx.cmd.as_slice());
@@ -1405,7 +1419,7 @@ fn checked_in_gate(
                             .contains_key(key)
                 },
             );
-            if let Some(refusal) = decision.refusal() {
+            if let Some(refusal) = decision.refusal(ctx.peer_ipv6) {
                 return Some(refusal);
             }
         }
@@ -1450,13 +1464,256 @@ fn make_room_or_refuse(ctx: &mut Ctx, in_order: bool, needs_room: bool) -> Optio
     None
 }
 
+/// For a command from a client that allocates as much as its arguments say
+/// (`sketch::room`), where the arity check's cold path finds it
+/// (`arity::check_dispatch`), before anything else in `run_command`: room
+/// made for it ([`room_before_dispatch`]), or its refusal, unless something
+/// before the gates refuses it. That is asked first, by the checks
+/// `run_command` makes after this, and nothing is made or evicted for a
+/// command they refuse: routing (`MOVED`, `ASK`, ...), `BUSY`, `NOREPLICAS`,
+/// `LOADING`, the ACL. (A replica's client, a master's stream and the AOF
+/// are not held to `maxmemory`.) Checked here rather than where
+/// `run_command` checks them so that the common path pays as little as it
+/// can for it. Measured (instructions per GET and SET, `scripts/perf`): a
+/// flag carried down to there cost some ten; leaving the common path for
+/// good, as a refusal does (a path of its own around the rest, or
+/// `run_command` again from here), fifteen to twenty-five; this, room
+/// made here and the common path taken up again, three to six.
+/// Something that changes between the two (a slot moving, a script
+/// starting) only means room made for a command then refused, or refused
+/// `OOM` when it runs without the room.
+#[cold]
+#[inline(never)]
+fn room_on_arrival(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
+    if crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed) == 0
+        || ctx.apply_replication
+        || ctx.repl_state.is_slave()
+        || refused_before_the_gates(ctx, name)
+    {
+        return None;
+    }
+    room_before_dispatch(ctx, name)
+}
+
+/// Whether `run_command` refuses the command before its gates, by the
+/// checks it makes there (for a master's client; see [`room_on_arrival`]).
+/// Asks only: `ASKING` is left for the routing to take.
+fn refused_before_the_gates(ctx: &Ctx, name: &str) -> bool {
+    if ctx.cluster.enabled
+        && !ctx.bypass_cluster_check
+        && !crate::command_gate::alone_on_this_thread()
+    {
+        let asking = ctx.client_registry.get_asking(ctx.client_id);
+        let (store, db) = (ctx.store, *ctx.selected_db);
+        let (registry, client_id) = (ctx.client_registry, ctx.client_id);
+        let decision = crate::cluster::routing::route_named(
+            name,
+            ctx.cmd.as_slice(),
+            ctx.cluster,
+            asking,
+            || registry.get_readonly(client_id),
+            |key: &[u8]| {
+                crate::read_lock!(crate::store::get_shard(&store[db], key)).contains_key(key)
+            },
+        );
+        if decision.refusal(ctx.peer_ipv6).is_some() {
+            return true;
+        }
+    }
+    #[cfg(feature = "lua")]
+    if crate::commands::lua::lua_server_busy_for_command(ctx.cmd.as_slice()) {
+        return true;
+    }
+    if ctx.repl_state.min_replicas_to_write.load(Ordering::Relaxed) != 0
+        && refused_without_replicas(ctx, name)
+    {
+        return true;
+    }
+    if crate::vector::SNAPSHOT_INDEX_REBUILD.load(Ordering::Relaxed) && refused_while_loading(name)
+    {
+        return true;
+    }
+    (crate::acl::RESTRICTED_CMD_CLIENTS.load(Ordering::Relaxed) > 0
+        || crate::acl::RESTRICTED_KEY_CLIENTS.load(Ordering::Relaxed) > 0)
+        && ctx
+            .acl_store
+            .read()
+            .get(ctx.authenticated_user)
+            .is_some_and(|user| {
+                crate::acl::check_permission(user, name, ctx.cmd.as_slice()).is_err()
+            })
+}
+
+/// For a command that allocates as much as its arguments say (`sketch::room`),
+/// under `maxmemory`, once nothing before the gates refuses it (routing,
+/// `BUSY`, `READONLY`, `NOREPLICAS`, `LOADING`, the ACL): room made for what
+/// it wants before it takes its keys' order ([`make_room_in_steps`]), or its
+/// refusal. Not for a command
+/// that is not held to `maxmemory` (on a replica, from a master or the
+/// AOF), nor while writes are paused. A command its handler refuses before
+/// its allocation (its arguments, its key's type, the per-command limit)
+/// wants nothing, and nothing is evicted for it.
+#[cold]
+#[inline(never)]
+fn room_before_dispatch(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
+    let limit = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
+    if limit == 0
+        || ctx.apply_replication
+        || ctx.repl_state.is_slave()
+        || crate::pause::expiry_deferred()
+    {
+        return None;
+    }
+    let wanted = match crate::sketch::room::wanted(ctx, name) {
+        Ok(wanted) => wanted,
+        Err(refusal) => return Some(refusal),
+    };
+    if wanted == 0 {
+        return None;
+    }
+    // With what the command allocates besides on its way to its check
+    // (its reply, a copy of its arguments, a decoded payload's pieces): its
+    // check looks again, and must find the room still there.
+    let wanted = wanted.saturating_add(ROOM_SLACK);
+    if crate::sketch::room_for(wanted) {
+        return None;
+    }
+    // More than evicting every key could free (what the server held before
+    // it had any, `used_memory_startup`, is never freed): refused at once,
+    // rather than after emptying the keyspace for nothing.
+    let wanted_usize = usize::try_from(wanted).unwrap_or(usize::MAX);
+    if wanted_usize > limit.saturating_sub(crate::commands::memory::startup_used()) {
+        return Some(sketch_oom());
+    }
+    make_room_in_steps(ctx, wanted_usize)
+}
+
+/// Room made for a command beyond what it says it allocates
+/// ([`room_before_dispatch`]).
+const ROOM_SLACK: u64 = 128 << 10;
+
+/// What eviction for one command frees at most in one hold of the gates
+/// ([`make_room_in_steps`]): some tens of thousands of small keys, a few
+/// milliseconds.
+const EVICTION_STEP: usize = 4 << 20;
+
+/// Evict until memory use is down to `target`, for a command that wants
+/// `wanted` bytes: a step of [`EVICTION_STEP`] bytes at a time, each in the
+/// gates in which every command's room is made (see `make_room_or_refuse`),
+/// let go between steps. One command that wants a 1 GiB filter evicts all
+/// it needs, but a cut (a full sync, a snapshot), a script, a transaction
+/// or a flush waits for no more than one step of it; inside a script or a
+/// transaction, which hold the gates already, it holds them throughout, as
+/// they do. It stops, refused, after twice the steps its size takes (and a
+/// few more), should writes elsewhere fill memory as fast as it frees it.
+///
+/// What it was asked under is looked at again in each step, in the gates:
+/// writes paused meanwhile (`CLIENT PAUSE`, a failover, a slot handoff),
+/// this node become a replica, or `maxmemory` changed. Paused or a replica,
+/// it stops, room made or not, and the command goes on to what it meets
+/// then (held by the pause, `READONLY`): dispatched again after a pause, it
+/// is sized again from the start. The limit, and the target with it, are
+/// the limit of the moment; none, it stops.
+fn make_room_in_steps(ctx: &mut Ctx, wanted: usize) -> Option<Vec<u8>> {
+    #[cfg(feature = "lua")]
+    let overrun = crate::commands::lua::running_script_is_over_its_time_limit;
+    #[cfg(not(feature = "lua"))]
+    let overrun = || false;
+    let steps = (wanted / EVICTION_STEP).saturating_mul(2).saturating_add(8);
+    for step in 0..steps {
+        #[cfg(debug_assertions)]
+        if step > 0 {
+            stall_between_steps_for_test();
+        }
+        let _ = step;
+        let _gate =
+            crate::command_gate::enter_unless(std::time::Duration::from_millis(10), overrun)?;
+        let _evicting = crate::write_gate::enter();
+        let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed);
+        if limit == 0 || ctx.repl_state.is_slave() || crate::pause::expiry_deferred() {
+            return None;
+        }
+        let Some(target) = limit.checked_sub(wanted) else {
+            return Some(sketch_oom());
+        };
+        let used = crate::memory_use::counted();
+        if used <= target {
+            return None;
+        }
+        if !crate::eviction::make_room(ctx, target.max(used.saturating_sub(EVICTION_STEP)), true) {
+            return Some(sketch_oom());
+        }
+    }
+    let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed);
+    (limit != 0 && crate::memory_use::counted().saturating_add(wanted) > limit).then(sketch_oom)
+}
+
+/// `KIVIDB_TEST_FAILPOINTS` names `sketch-room-step-stall` (debug builds):
+/// a pause of 300 ms between two steps of [`make_room_in_steps`], out of
+/// the gates, for a test to change what it was asked under meanwhile.
+#[cfg(debug_assertions)]
+fn stall_between_steps_for_test() {
+    static STALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *STALL.get_or_init(|| crate::aof::injected("sketch-room-step-stall")) {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
+/// The `OOM` refusal of a command there is no room for.
+fn sketch_oom() -> Vec<u8> {
+    crate::tracking::with_what_came_before(resp_error(
+        "OOM command not allowed when used memory > 'maxmemory'.",
+    ))
+}
+
+/// For a command a script calls that allocates as much as its arguments
+/// say, under `maxmemory`: room made for it as for one from a client
+/// ([`room_before_dispatch`]), when the script runs alone (as it holds the
+/// gates, the eviction is a part of it, as in a transaction). Not for one
+/// that runs beside other scripts under its tags (`lua-parallel-scripts`):
+/// eviction would delete keys of theirs from under them. Such a command is
+/// refused with `OOM` if what it allocates does not fit. Nor for one that
+/// the script's checks after this refuse (too few replicas, the ACL), which
+/// are asked first, as they would answer.
+#[cold]
+#[inline(never)]
+fn room_in_script(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
+    if !crate::commands::arity::allocates(name) || crate::tag_locks::beside_others() {
+        return None;
+    }
+    #[cfg(feature = "lua")]
+    if crate::commands::lua::script_min_replicas_gate(ctx, ctx.cmd[0]).is_some() {
+        return None;
+    }
+    if (crate::acl::RESTRICTED_CMD_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) > 0
+        || crate::acl::RESTRICTED_KEY_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) > 0)
+        && ctx
+            .acl_store
+            .read()
+            .get(ctx.authenticated_user)
+            .is_some_and(|user| {
+                crate::acl::check_permission(user, name, ctx.cmd.as_slice()).is_err()
+            })
+    {
+        return None;
+    }
+    room_before_dispatch(ctx, name)
+}
+
 /// [`execute_command`], once the command's name is known; it started at
 /// `started`.
 fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8> {
     // The wrong number of arguments is refused before anything else looks
     // at the command, as in Redis. See `arity`.
-    if let Some(refusal) = crate::commands::arity::check(name, &ctx.cmd) {
-        return refusal;
+    if let Some(refusal) = crate::commands::arity::check_dispatch(name, &ctx.cmd) {
+        // Empty: a command that allocates as much as its arguments say,
+        // given room here if nothing below refuses it (`room_on_arrival`).
+        if !refusal.is_empty() {
+            return refusal;
+        }
+        if let Some(refusal) = room_on_arrival(ctx, name) {
+            return refusal;
+        }
     }
 
     // [`ReplState::is_slave`] is a relaxed atomic load — avoid `role()` here (it allocates).
@@ -2719,6 +2976,18 @@ fn read_only_key_positions(cmd: &[&[u8]]) -> Vec<usize> {
     }
 }
 
+/// Whether the probabilistic-type write `name` that just failed had found
+/// its key (`BF.*`, `CF.*`, `CMS.*`, `TDIGEST.*`, `TOPK.*`).
+#[cold]
+#[inline(never)]
+fn sketch_write_touched(name: &str) -> bool {
+    (name.starts_with("BF.") && crate::commands::bf::take_touched())
+        || (name.starts_with("CF.") && crate::commands::cf::take_touched())
+        || (name.starts_with("CMS.") && crate::commands::cms::take_touched())
+        || (name.starts_with("TDIGEST.") && crate::commands::tdigest::take_touched())
+        || (name.starts_with("TOPK.") && crate::commands::topk::take_touched())
+}
+
 /// [`notify_watchers`] for a `BF.*` write that failed after finding its key,
 /// which is always `cmd[1]`. Kept apart and out of line so `notify_watchers`
 /// keeps its one call site in [`side_effects`], where it is inlined: a second
@@ -2758,6 +3027,12 @@ fn notify_failed_bf_write(ctx: &Ctx) {
 ///   is to change, the new value is made from them and put in their place
 ///   under the write lock only if they are still what is there, else made
 ///   again under it.
+/// * `CMS.INCRBY`: the sketch found under the shard's read lock, and
+///   checked and added to under one hold of its own write lock; two of
+///   them on a key run one before the other. Its additions commute (each
+///   counter is held at 2^32 − 1, the total wraps, and an item at the top
+///   is answered with an error but added to all the same), so the sketch
+///   ends as it would in either order.
 ///
 /// The hash commands only while no search index is defined: they bring the
 /// indexes up to date after the shard is let go of, and two of them beside
@@ -2778,7 +3053,9 @@ fn atomic_under_its_shard(ctx: &Ctx, name: &str) -> bool {
         | "SADD" | "ZADD" | "ZINCRBY" | "PFADD" => true,
         // Asked without the indexes' lock (#544): see `vector::Indexes`.
         "HSET" | "HMSET" | "HSETNX" | "HINCRBY" | "HINCRBYFLOAT" => ctx.index_store.none(),
-        _ => false,
+        // Apart from the names above, which the commands on the common path
+        // are among: a name more there moved their match.
+        _ => name == "CMS.INCRBY",
     }
 }
 
@@ -3155,11 +3432,15 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
             //
             // Kept behind `write_is_observed` so an instance with no replicas
             // and AOF off never pays for it. In the observed case the verbatim
-            // arm allocates exactly what the previous `ctx.cmd` clone did.
-            for parts in
-                replication::script_feed::commands_for_propagation(ctx, name, &ctx.cmd, result)
-            {
-                replication::replicate_one_write(ctx, &parts);
+            // arm allocates exactly what the previous `ctx.cmd` clone did,
+            // except for a write the hub alone reads that goes out as it came:
+            // encoded from `ctx.cmd` itself (`write_as_it_came`, #894).
+            if !replication::write_as_it_came(ctx, name, &ctx.cmd) {
+                for parts in
+                    replication::script_feed::commands_for_propagation(ctx, name, &ctx.cmd, result)
+                {
+                    replication::replicate_one_write(ctx, &parts);
+                }
             }
         }
 
@@ -3179,11 +3460,7 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
     // A `BF.*` write that failed once it had found its key (`BF.RESERVE` of
     // one there already, `BF.ADD` to a full filter) invalidates a `WATCH`
     // on it all the same, as Redis's do.
-    if writes_operation
-        && !is_mutating_ok_write
-        && name.starts_with("BF.")
-        && crate::commands::bf::take_touched()
-    {
+    if writes_operation && !is_mutating_ok_write && sketch_write_touched(name) {
         notify_failed_bf_write(ctx);
     }
 
@@ -3505,8 +3782,7 @@ mod replica_loading_gate_tests {
     fn run_as_slave(repl_state: &Arc<ReplState>, cmd: Vec<Vec<u8>>, apply_stream: bool) -> Vec<u8> {
         let store = crate::store::new_store(1);
         let lastsave = Arc::new(RwLock::new(0i64));
-        let (hub_tx, mut hub_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::replication::HubMsg>();
+        let (hub_tx, mut hub_rx) = crate::replication::HubTx::channel();
         tokio::spawn(async move { while hub_rx.recv().await.is_some() {} });
 
         let config = Arc::new(Config::default_replica());
@@ -3559,6 +3835,7 @@ mod replica_loading_gate_tests {
             apply_replication: apply_stream,
             skip_write_side_effects: false,
             peer_addr: peer.as_str(),
+            peer_ipv6: crate::cluster::is_ipv6_peer(peer.as_str()),
             monitor_registry: &monitor_registry,
             authenticated_user: "default",
             tracking_table: &tracking_table,

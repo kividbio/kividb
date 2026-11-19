@@ -20,6 +20,8 @@ pub mod acl;
 pub mod aof;
 pub mod cluster;
 pub mod cmdstats;
+#[cfg(target_pointer_width = "64")]
+pub mod collection_table;
 pub mod command_gate;
 pub mod commands;
 pub mod compaction;
@@ -259,16 +261,10 @@ async fn server_tokio(
     );
     if let Some((host, port)) = config.replicaof_addr() {
         replica_starter.start(host, port);
-    } else if let Some(master_id) = cluster_state.my_master_id() {
-        // A cluster replica restarting: resume following its master.
-        let addr = cluster_state
-            .nodes
-            .read()
-            .get(&master_id)
-            .map(|m| (m.ip.clone(), m.client_port));
-        if let Some((ip, port)) = addr {
-            replica_starter.start(ip, port);
-        }
+    } else if cluster_state.my_master_id().is_some() {
+        // A cluster replica restarting: read-only, and following its master
+        // once the bus says it may (`ClusterState::first_sync_may_begin`).
+        replica_starter.repl_state.become_slave();
     }
 
     let addr: SocketAddr = config.addr().parse()?;

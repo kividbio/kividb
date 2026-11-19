@@ -794,7 +794,7 @@ fn sort_of_a_compact_set() {
 #[test]
 fn the_digest_is_the_same_in_both_forms() {
     let dir = temp_dir("digest");
-    let server = Server::start(&dir, &[]);
+    let server = Server::start(&dir, &["--enable-debug-command", "yes"]);
     let mut c = server.conn();
     let members: Vec<String> = [1, 2, 3, -70_000, i64::MIN, i64::MAX]
         .iter()

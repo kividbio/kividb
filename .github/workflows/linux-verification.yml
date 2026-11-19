@@ -225,6 +225,7 @@ jobs:
           set -euo pipefail
           ./target/release/kividb --port 6380 --bind 127.0.0.1 \
             --loglevel notice --io-model ${{ matrix.io_model }} \
+            --enable-debug-command yes \
             > /tmp/kividb-${{ matrix.io_model }}.log 2>&1 &
           for _ in $(seq 1 60); do
             redis-cli -p 6380 ping >/dev/null 2>&1 && break

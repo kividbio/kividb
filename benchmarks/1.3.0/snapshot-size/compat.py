@@ -24,7 +24,7 @@ def check(name, ok, detail=""):
 def start(binary, d, port, extra=(), conf=""):
     os.makedirs(d, exist_ok=True)
     with open(d + "/kividb.conf", "w") as f:
-        f.write(conf)
+        f.write("enable-debug-command yes\n" + conf)
     log = open(d + "/server.log", "a")
     return subprocess.Popen([binary, "--port", str(port), "--bind", "127.0.0.1", "--dir", d,
                              "--configfile", d + "/kividb.conf", "--update-check", "no", *extra],

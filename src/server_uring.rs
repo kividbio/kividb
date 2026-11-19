@@ -256,8 +256,8 @@ pub async fn handle_replica_connection_uring(
                             && let Ok(s) = std::str::from_utf8(cmd[2])
                             && let Ok(offset) = s.parse::<u64>()
                         {
-                            let _ = hub_tx
-                                .send(crate::replication::HubMsg::AckOffset { replica_id, offset });
+                            // Out of the writes' order: see `HubTx::send_ack`.
+                            let _ = hub_tx.send_ack(replica_id, offset);
                         }
                         parse_offset += consumed;
                     }
@@ -1138,6 +1138,9 @@ pub async fn handle_client(
     tracking_table: crate::tracking::TrackingTable,
 ) -> Result<(), Box<dyn std::error::Error>> {
     stream.set_nodelay(true)?;
+    // Which client address of a node this client is told in a cluster
+    // (#847): its family does not change while it is connected.
+    let peer_ipv6 = crate::cluster::is_ipv6_peer(&peer_addr);
     if let Some(denied) = crate::protected_mode::refusal(&acl_store, &peer_addr) {
         let _ = stream.write_all(denied.to_vec()).await;
         return Ok(());
@@ -1150,7 +1153,7 @@ pub async fn handle_client(
     // The socket's own address, as Redis shows it (#566): not the bind
     // setting, which can be 0.0.0.0.
     client_info.laddr = local_address(&stream).map_or_else(
-        || format!("{}:{}", config.bind, config.port),
+        || crate::config::host_port(&config.bind, config.port),
         |a| a.to_string(),
     );
     let activity = Arc::clone(&client_info.activity);
@@ -1876,6 +1879,7 @@ pub async fn handle_client(
                         apply_replication: false,
                         skip_write_side_effects: false,
                         peer_addr: &peer_addr,
+                        peer_ipv6,
                         monitor_registry: &monitor_registry,
                         authenticated_user: authenticated_user.as_deref().unwrap_or("default"),
                         tracking_table: &tracking_table,
@@ -1978,6 +1982,7 @@ pub async fn handle_client(
                     apply_replication: false,
                     skip_write_side_effects: false,
                     peer_addr: &peer_addr,
+                    peer_ipv6,
                     monitor_registry: &monitor_registry,
                     authenticated_user: authenticated_user.as_deref().unwrap_or("default"),
                     tracking_table: &tracking_table,
@@ -2153,9 +2158,12 @@ pub async fn handle_client(
             // it has subscriptions. Mirrors the tokio loop in server.rs: inside
             // MULTI they are queued, and EXEC runs them (#23).
             if crate::pubsub::is_subscription_command(cmd_name.as_str()) && !tx.active {
-                if let Some(refusal) =
-                    crate::pubsub::shard_subscribe_refusal(cmd_name.as_str(), &cmd, &cluster_state)
-                {
+                if let Some(refusal) = crate::pubsub::shard_subscribe_refusal(
+                    cmd_name.as_str(),
+                    &cmd,
+                    &cluster_state,
+                    peer_ipv6,
+                ) {
                     crate::output_limits::append_reply(
                         &mut out_buf,
                         &refusal,
@@ -2460,6 +2468,7 @@ pub async fn handle_client(
                                 client_id,
                                 store: &store,
                                 db: selected_db,
+                                ipv6: peer_ipv6,
                             },
                             &tx.queue,
                             &mut routed,
@@ -2565,6 +2574,7 @@ pub async fn handle_client(
                                 client_id,
                                 store: &store,
                                 db: selected_db,
+                                ipv6: peer_ipv6,
                             },
                             &tx.queue,
                             routed,
@@ -2749,6 +2759,7 @@ pub async fn handle_client(
                                         apply_replication: false,
                                         skip_write_side_effects: false,
                                         peer_addr: &peer_addr,
+                                        peer_ipv6,
                                         monitor_registry: &monitor_registry,
                                         authenticated_user: authenticated_user
                                             .as_deref()
@@ -2918,6 +2929,7 @@ pub async fn handle_client(
                                         apply_replication: false,
                                         skip_write_side_effects: false,
                                         peer_addr: &peer_addr,
+                                        peer_ipv6,
                                         monitor_registry: &monitor_registry,
                                         authenticated_user: authenticated_user
                                             .as_deref()
@@ -2963,6 +2975,7 @@ pub async fn handle_client(
                                         apply_replication: false,
                                         skip_write_side_effects: false,
                                         peer_addr: &peer_addr,
+                                        peer_ipv6,
                                         monitor_registry: &monitor_registry,
                                         authenticated_user: authenticated_user
                                             .as_deref()
@@ -3212,19 +3225,25 @@ pub async fn handle_client(
                     // So is one that is no command at all, or has the wrong
                     // number of arguments, or arrives while a script has the
                     // server busy.
-                    let refusal =
-                        commands::transaction::queue_refusal(&cmd_name, &cmd).or_else(|| {
-                            crate::cluster::routing::queue_refusal(
-                                &crate::cluster::routing::Caller {
-                                    cluster: &cluster_state,
-                                    registry: &client_registry,
-                                    client_id,
-                                    store: &store,
-                                    db: selected_db,
-                                },
-                                &cmd,
-                            )
-                        });
+                    let refusal = commands::transaction::queue_refusal(
+                        &cmd_name,
+                        &cmd,
+                        config.enable_debug_command,
+                        &peer_addr,
+                    )
+                    .or_else(|| {
+                        crate::cluster::routing::queue_refusal(
+                            &crate::cluster::routing::Caller {
+                                cluster: &cluster_state,
+                                registry: &client_registry,
+                                client_id,
+                                store: &store,
+                                db: selected_db,
+                                ipv6: peer_ipv6,
+                            },
+                            &cmd,
+                        )
+                    });
                     match refusal {
                         Some(refusal) => {
                             tx.aborted = true;
@@ -3329,6 +3348,7 @@ pub async fn handle_client(
                                 apply_replication: false,
                                 skip_write_side_effects: false,
                                 peer_addr: &peer_addr,
+                                peer_ipv6,
                                 monitor_registry: &monitor_registry,
                                 authenticated_user: authenticated_user
                                     .as_deref()
@@ -3372,6 +3392,7 @@ pub async fn handle_client(
                             apply_replication: false,
                             skip_write_side_effects: false,
                             peer_addr: &peer_addr,
+                            peer_ipv6,
                             monitor_registry: &monitor_registry,
                             authenticated_user: authenticated_user.as_deref().unwrap_or("default"),
                             tracking_table: &tracking_table,

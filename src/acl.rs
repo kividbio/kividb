@@ -1136,10 +1136,12 @@ const WRITE_ONLY_COMMANDS: &[&str] = &[
 /// Commands whose first key is written and whose other keys are only read.
 const DESTINATION_FIRST: &[&str] = &[
     "BITOP",
+    "CMS.MERGE",
     "GEOSEARCHSTORE",
     "SDIFFSTORE",
     "SINTERSTORE",
     "SUNIONSTORE",
+    "TDIGEST.MERGE",
     "ZDIFFSTORE",
     "ZINTERSTORE",
     "ZRANGESTORE",

@@ -167,7 +167,7 @@ pub mod acceptor {
         use crate::listen::{Kind, Listener};
         let server = crate::listen::server_of(config);
         let files = Files::of(config);
-        let addr: std::net::SocketAddr = format!("{}:{}", config.bind, config.tls_port)
+        let addr: std::net::SocketAddr = crate::config::host_port(&config.bind, config.tls_port)
             .parse()
             .map_err(|_| format!("invalid TLS bind address '{}'", config.bind))?;
         if !config.tls_enabled() {

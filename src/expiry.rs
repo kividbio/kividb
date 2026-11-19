@@ -503,8 +503,6 @@ mod propagation_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    use tokio::sync::mpsc;
-
     use crate::commands::helpers::{
         ExpireCursor, active_expire_cycle, delete_key_if_expired, expire_on_read, is_expired,
         now_ms,
@@ -524,7 +522,7 @@ mod propagation_tests {
     fn server() -> (
         Store,
         Arc<ReplState>,
-        mpsc::UnboundedReceiver<HubMsg>,
+        crate::replication::HubRx,
         super::Undisturbed,
     ) {
         let undisturbed = super::Undisturbed::here();
@@ -532,13 +530,13 @@ mod propagation_tests {
         std::mem::forget(Arc::clone(&store));
         let repl_state = Arc::new(ReplState::new_master());
         repl_state.backlog_active.store(true, Ordering::Relaxed);
-        let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+        let (hub_tx, hub_rx) = crate::replication::HubTx::channel();
         super::register(&store, &repl_state, &hub_tx);
         (store, repl_state, hub_rx, undisturbed)
     }
 
     /// Everything in the stream so far, as one text.
-    fn stream(rx: &mut mpsc::UnboundedReceiver<HubMsg>) -> String {
+    fn stream(rx: &mut crate::replication::HubRx) -> String {
         let mut out = String::new();
         while let Ok(msg) = rx.try_recv() {
             if let HubMsg::Propagate(payload) = msg {

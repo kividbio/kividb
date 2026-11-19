@@ -85,8 +85,10 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--port` | `6380` | Port to listen on; `0` for none (TLS only, with `--tls-port`) |
 | `--bind` | `0.0.0.0` | Address to listen on. Setting it explicitly turns off [protected mode](#protected-mode) |
 | `--protected-mode <yes\|no>` | `yes` | See [Protected mode](#protected-mode) |
+| `--enable-debug-command <no\|yes\|local>` | `no` | Who may run `DEBUG`: nobody, any client its ACL user allows, or only clients on loopback; startup only (see below the table) |
 | `--threads` | `0` (auto) | Worker threads; auto is one per CPU the process may use (see [Worker threads](#worker-threads)) |
 | `--worker-cpu-affinity <off\|auto>` | `off` | `auto` binds each io_uring worker to a CPU of its own when they are as many as the process's CPUs (see [Worker CPU affinity](#worker-cpu-affinity)) |
+| `--search-index-threads <auto\|N>` | `auto` | Helper threads that link vectors written to HNSW indexes; startup only (see [Search index threads](#search-index-threads)) |
 | `--databases` | `16` | Number of databases |
 | `--dir <path>` | start directory | Where `dump.kdb`, `appendonly.aof` and `nodes.conf` live |
 | `--aof` | off | Append-only file persistence |
@@ -107,12 +109,25 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--slowlog-max-len <n>` | `128` | Slowlog entries kept |
 | `--cluster-enabled <yes\|no>` | `no` | Cluster mode: a cluster bus on `<port> + 10000`, topology in `nodes.conf`, gossip, failure detection and failover |
 | `--cluster-node-timeout <ms>` | `15000` | Time without a reply before a peer is suspected to have failed |
+| `--cluster-announce-client-ipv4 <addr>`, `--cluster-announce-client-ipv6 <addr>` | none | The address clients connected over IPv4 / IPv6 are told to reach this node at, in redirects and `CLUSTER SLOTS`, `SHARDS`, `NODES` and `REPLICAS`, where it is not the one nodes use between themselves (Valkey 8). Unset, a client is told the node's address. Changeable with `CONFIG SET` (empty unsets); the other nodes learn it from this node's next heartbeat |
 | `--tls-port <port>` | `0` (off) | TLS listener (TLS builds only); with `--port 0`, the only one |
 | `--tls-cert-file`, `--tls-key-file` | none | Server certificate and key (PEM) |
 | `--tls-ca-cert-file` | none | CA that client certificates are checked against |
 | `--tls-auth-clients <yes\|optional\|no>` | `yes` | Whether clients must present a certificate (only with `--tls-ca-cert-file`) |
 | `--tls-auth-clients-allowed-names <names>` | none | Names a client certificate's CN or DNS name must match; `*.` is one label |
 | `--update-check <yes\|no>` | `yes` | The [startup update check](#startup-update-check) |
+
+`DEBUG` is refused by default from 1.3.0, as in Redis 7 and later: `enable-debug-command`
+is `no`, and every client gets Redis's `ERR DEBUG command not allowed ...`. Start the server
+with `--enable-debug-command yes` (or `enable-debug-command yes` in the config file) to allow
+it to any client whose ACL user may run `DEBUG`, or `local` to allow it only to clients on
+loopback (`127.0.0.0/8`, `::1`). Behind a proxy every client has the proxy's address, so
+`local` means local to the proxy. The ACL is checked first. Inside `MULTI` the refusal
+discards the transaction (`EXEC` answers `EXECABORT`); a script cannot run `DEBUG` whatever
+the setting. The setting is read at startup only: `CONFIG GET enable-debug-command` reports
+it and `CONFIG SET` refuses it, whatever the value. Up to 1.2.2 it was accepted and ignored,
+and `DEBUG` was open to any user whose ACL allowed it. `redis-cli --cluster fix` compares a
+key both nodes hold with `DEBUG DIGEST-VALUE`, so it needs `DEBUG` allowed, as with Redis 7.
 
 `maxclients` (default `10000`, in the file or with `CONFIG SET`) counts plaintext and TLS
 clients, TLS ones from the start of their handshake. At startup KiviDB raises the soft
@@ -169,6 +184,42 @@ application or a load generator, or to keep the count of an earlier release: up 
 was the CPUs minus 2 (all of them below 4), which is `--threads 2` on 4 CPUs and
 `--threads 6` on 8. A Kubernetes pod with a CPU request but no CPU limit has no quota, so
 the server sees every CPU of the node: give it a limit, or `--threads`.
+
+### Search index threads
+
+`--search-index-threads` (`search-index-threads` in the configuration file; read at startup,
+`CONFIG GET search-index-threads` shows it, `CONFIG SET` refuses it) is how many helper
+threads link the vectors written to HNSW indexes into their graphs, so that one client
+loading documents does not build the graph on one CPU. `0` starts none: each write links
+its own vector, as up to 1.2. `auto`, the default, starts none under a CPU quota (Docker's
+`--cpus`, a Kubernetes CPU limit) or with fewer than 8 CPUs, and otherwise (CPUs - 2) / 2:
+three on 8, seven on 16. A number starts that many on any machine. The log says how many
+started, on the first write that needs them.
+
+So on a server of fewer than 8 CPUs builds run at 1.2's speed by default, and
+`search-index-threads 1` (or more) trades serving latency for build speed. The helpers take
+CPU time the workers would otherwise have. With every CPU of a 4-vCPU server busy (GET/SET
+from memtier, one client loading 384-d vectors in pipelines, one `HSET` every 2 ms from
+another client):
+
+| helpers | GET/SET p99 | KNN p50 | `HSET` p99 | build alone |
+|---|---:|---:|---:|---:|
+| master (links in the writes) | 1.61 ms | 0.87 ms | 2.25 ms | 1,550 docs/s |
+| 0 (`auto` below 8 CPUs) | 1.64 ms | 0.89 ms | 2.32 ms | 1,540 docs/s |
+| 1 | 2.10 ms | 1.08 ms | 4.4-34 ms | 3,190 docs/s |
+| 2 | 2.62 ms | 1.13 ms | 5.5 ms | 3,620 docs/s |
+
+The `HSET` column is one writer connection, so it shows where that connection landed:
+4.4-34 ms with one helper is a connection that shared the bulk loader's worker in two runs
+of three. Over 8 writer connections (one `HSET` every 2 ms in turn), the one or few on the bulk
+loader's worker wait behind its pipelines in every build, helpers or not (their median
+15-25 ms with none, 12-16 ms with one helper); on the others one helper raised the `HSET`
+p99 from 2.3-2.7 ms to 4.5-4.7 ms. Under a CPU quota a helper spends the quota and the
+whole server is throttled (GET/SET p99 8-9 ms against 0.35 ms beside a load with
+`--cpus 2` and one helper), which is why `auto` starts none there: in a container or a
+Kubernetes pod with a CPU limit, builds run at 1.2's speed unless the setting is given a
+number. [SEARCH.md](SEARCH.md#index-builds-and-ef_runtime) and
+[PERFORMANCE.md](PERFORMANCE.md#vector-index-builds) have more.
 
 ### Worker CPU affinity
 

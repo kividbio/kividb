@@ -9,8 +9,15 @@
 //   PING <sender_id> <sender_endpoint> <gossip_array>
 //     "I'm alive. Here are some peers I know about, in case you don't."
 //
-//   PONG <sender_id> <sender_endpoint> <gossip_array>
+//   PONG <sender_id> <sender_endpoint> <gossip_array> [... <held_as_owner>]
 //     "Reply to your PING/MEET. Same gossip payload as PING."
+//     A PONG to a node that the sender holds as the owner of slots, while
+//     that node's own heartbeats say it is a replica, has an eighth field:
+//     a 2-element array of the number of masters that own slots in the
+//     sender's view and those slots, at that node's config epoch in the
+//     sender's view, in the form of the slot claims (an [`OwnerReport`]). A
+//     node of an earlier version reads no further than the seventh field.
+//     See `ClusterState::promotion_to_complete`.
 //
 //   FAILOVER_AUTH_REQUEST <sender_id> <endpoint> <master_id> [force | <slot_claims>]
 //   FAILOVER_AUTH_ACK <sender_id> <epoch>
@@ -44,13 +51,18 @@
 //
 // A node's hostname (`cluster-announce-hostname`) travels in its flags
 // string, as a `host=<name>` token: nodes that do not know it ignore an
-// unknown token, where a new field would have them drop the message. A
+// unknown token, where a new field would have them drop the message. The
+// sender's own `cluster-announce-client-ipv4` / `-ipv6` travel the same way
+// in its PING and PONG, as `cip4=<address>` and `cip6=<address>` (#847), and
+// never in gossip, as in Valkey: only a node's own word is taken. An IPv6
+// address has colons but no commas, and the flags string is split on commas
+// only. A
 // hostname has no commas (see `valid_hostname`). Decoders take at least the
 // fields they know and skip any after them, so that a later version can add
 // some.
 // Up to 3 entries per heartbeat; receiver merges them into its routing table.
 
-use crate::cluster::node::{NodeFlags, NodeId, parse_node_id};
+use crate::cluster::node::{ClientIps, NodeFlags, NodeId, parse_node_id};
 use crate::resp::write::{resp_array, resp_bulk, resp_bulk_str};
 
 /// One node's entry inside a gossip payload.
@@ -73,11 +85,39 @@ pub struct GossipEntry {
 /// One slot range the sender claims to own, with the epoch at which the
 /// claim was made. Receivers compare against their own ownership and
 /// keep the higher epoch's claim.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotClaim {
     pub start: u16,
     pub end: u16,
     pub epoch: u64,
+}
+
+/// What a PONG's sender says of the node it answers, when it holds that
+/// node as the owner of slots while that node says it is a replica: the
+/// eighth field of the PONG. See `ClusterState::promotion_to_complete`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerReport {
+    /// How many masters own slots in the sender's view.
+    pub masters: usize,
+    /// The slots it holds the node as the owner of, each range at that
+    /// node's config epoch in the sender's view.
+    pub claims: Vec<SlotClaim>,
+}
+
+impl OwnerReport {
+    /// A report as it may be taken in: at least one range and at most one
+    /// per slot, each within the slots and not reversed, and a count of
+    /// masters between 1 and the number of slots (each owns one at least).
+    /// Anything else is taken for no report.
+    pub fn valid(masters: usize, claims: Vec<SlotClaim>) -> Option<Self> {
+        let slots = crate::cluster::CLUSTER_SLOTS;
+        let ranges_fit = !claims.is_empty()
+            && claims.len() <= slots
+            && claims
+                .iter()
+                .all(|c| c.start <= c.end && (c.end as usize) < slots);
+        (ranges_fit && (1..=slots).contains(&masters)).then_some(Self { masters, claims })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +141,9 @@ pub enum BusMessage {
         sender_hostname: String,
         /// Its `cluster-announce-client-port`; 0 when it announces none.
         sender_announced_client_port: u16,
+        /// Its `cluster-announce-client-ipv4` / `-ipv6`; empty when it
+        /// announces none, or is of an earlier version (#847).
+        sender_client_ips: ClientIps,
         /// Its shard id (`CLUSTER MYSHARDID`), as a `shard=` token of its
         /// flags string; `None` from a node of an earlier version (#563).
         sender_shard_id: Option<NodeId>,
@@ -119,11 +162,21 @@ pub enum BusMessage {
         sender_hostname: String,
         /// Its `cluster-announce-client-port`; 0 when it announces none.
         sender_announced_client_port: u16,
+        /// Its `cluster-announce-client-ipv4` / `-ipv6`; empty when it
+        /// announces none, or is of an earlier version (#847).
+        sender_client_ips: ClientIps,
         /// Its shard id (`CLUSTER MYSHARDID`), as a `shard=` token of its
         /// flags string; `None` from a node of an earlier version (#563).
         sender_shard_id: Option<NodeId>,
         gossip: Vec<GossipEntry>,
         slot_claims: Vec<SlotClaim>,
+        /// The slots the sender holds the node it answers as the owner of,
+        /// at that node's config epoch in the sender's view, and how many
+        /// masters own slots there, when that node says it is a replica;
+        /// `None` otherwise, from a node of an earlier version, and for a
+        /// field that is not a valid report ([`OwnerReport::valid`]). See
+        /// `ClusterState::promotion_to_complete`.
+        held_as_owner: Option<OwnerReport>,
     },
     /// "I'm a replica of a FAIL'd master, and I want your vote to take over."
     /// Sent by a replica during election. The receiver (a master) replies
@@ -238,6 +291,7 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_client_ips,
             sender_shard_id,
             gossip,
             slot_claims,
@@ -255,6 +309,7 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
                     *sender_flags,
                     sender_hostname,
                     *sender_announced_client_port,
+                    sender_client_ips,
                 ),
                 sender_shard_id.as_ref(),
             )),
@@ -275,33 +330,47 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_client_ips,
             sender_shard_id,
             gossip,
             slot_claims,
-        } => resp_array(vec![
-            resp_bulk_str("PONG"),
-            resp_bulk(sender_id),
-            resp_bulk_str(&format_endpoint(
-                sender_ip,
-                *sender_client_port,
-                *sender_cluster_port,
-                *sender_config_epoch,
-            )),
-            resp_bulk_str(&with_shard(
-                flags_with_host(
-                    *sender_flags,
-                    sender_hostname,
-                    *sender_announced_client_port,
-                ),
-                sender_shard_id.as_ref(),
-            )),
-            match sender_master_id {
-                Some(m) => resp_bulk(m),
-                None => resp_bulk(b""),
-            },
-            encode_gossip(gossip),
-            encode_slot_claims(slot_claims),
-        ]),
+            held_as_owner,
+        } => {
+            let mut fields = vec![
+                resp_bulk_str("PONG"),
+                resp_bulk(sender_id),
+                resp_bulk_str(&format_endpoint(
+                    sender_ip,
+                    *sender_client_port,
+                    *sender_cluster_port,
+                    *sender_config_epoch,
+                )),
+                resp_bulk_str(&with_shard(
+                    flags_with_host(
+                        *sender_flags,
+                        sender_hostname,
+                        *sender_announced_client_port,
+                        sender_client_ips,
+                    ),
+                    sender_shard_id.as_ref(),
+                )),
+                match sender_master_id {
+                    Some(m) => resp_bulk(m),
+                    None => resp_bulk(b""),
+                },
+                encode_gossip(gossip),
+                encode_slot_claims(slot_claims),
+            ];
+            // Only when there is something in it: every other PONG keeps
+            // the seven fields it had.
+            if let Some(report) = held_as_owner {
+                fields.push(resp_array(vec![
+                    resp_bulk_str(&report.masters.to_string()),
+                    encode_slot_claims(&report.claims),
+                ]));
+            }
+            resp_array(fields)
+        }
         BusMessage::FailoverAuthRequest {
             sender_id,
             sender_ip,
@@ -418,6 +487,7 @@ fn encode_gossip(gossip: &[GossipEntry]) -> Vec<u8> {
                     g.flags,
                     &g.hostname,
                     g.announced_client_port,
+                    &ClientIps::default(),
                 )),
                 match g.master_id {
                     Some(m) => resp_bulk(&m),
@@ -446,9 +516,14 @@ fn format_flags(f: NodeFlags) -> String {
     parts.join(",")
 }
 
-/// The flags string with the node's hostname and announced client port in
-/// it, where it has them.
-fn flags_with_host(flags: NodeFlags, hostname: &str, client_port: u16) -> String {
+/// The flags string with the node's hostname, announced client port and
+/// client addresses in it, where it has them.
+fn flags_with_host(
+    flags: NodeFlags,
+    hostname: &str,
+    client_port: u16,
+    client_ips: &ClientIps,
+) -> String {
     let mut s = format_flags(flags);
     if !hostname.is_empty() {
         if !s.is_empty() {
@@ -464,7 +539,34 @@ fn flags_with_host(flags: NodeFlags, hostname: &str, client_port: u16) -> String
         s.push_str("cport=");
         s.push_str(&client_port.to_string());
     }
+    for (token, ip) in [("cip4=", &client_ips.v4), ("cip6=", &client_ips.v6)] {
+        if !ip.is_empty() {
+            if !s.is_empty() {
+                s.push(',');
+            }
+            s.push_str(token);
+            s.push_str(ip);
+        }
+    }
     s
+}
+
+/// The client addresses in a flags string, each only if it is an address
+/// of its family (as Valkey loads them from its ping extensions); empty
+/// where there is none.
+fn client_ips_of(flags: &str) -> ClientIps {
+    let find = |token: &str, ipv6: bool| {
+        flags
+            .split(',')
+            .find_map(|tok| tok.strip_prefix(token))
+            .filter(|ip| !ip.is_empty() && crate::config::client_ip_error(ip, ipv6).is_none())
+            .unwrap_or("")
+            .to_string()
+    };
+    ClientIps {
+        v4: find("cip4=", false),
+        v6: find("cip6=", true),
+    }
 }
 
 /// `flags` with a `shard=<id>` token for the sender's shard id. A node of an
@@ -569,6 +671,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
             let sender_flags = parse_flags(flags_str);
             let sender_hostname = host_of(flags_str);
             let sender_announced_client_port = cport_of(flags_str);
+            let sender_client_ips = client_ips_of(flags_str);
             let sender_shard_id = shard_of(flags_str);
             let sender_master_id = if parts[4].is_empty() {
                 None
@@ -588,11 +691,16 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_client_ips,
                     sender_shard_id,
                     gossip,
                     slot_claims,
                 }
             } else {
+                // The eighth field, if there is one that reads as a valid
+                // report; one that does not is left out, as an earlier
+                // version leaves it.
+                let held_as_owner = parts.get(7).and_then(|f| parse_owner_report(f));
                 BusMessage::Pong {
                     sender_id,
                     sender_ip,
@@ -603,9 +711,11 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_client_ips,
                     sender_shard_id,
                     gossip,
                     slot_claims,
+                    held_as_owner,
                 }
             };
             Ok(Some((msg, consumed)))
@@ -812,6 +922,30 @@ fn parse_gossip(buf: &[u8]) -> Result<Vec<GossipEntry>, String> {
         });
     }
     Ok(out)
+}
+
+/// The eighth field of a PONG ([`OwnerReport`]): `[masters, claims]`.
+/// `None` for anything that is not that, or is not a valid report: more
+/// ranges than there are slots, a range reversed or past the last slot, a
+/// count of masters of 0 or above the number of slots.
+fn parse_owner_report(buf: &[u8]) -> Option<OwnerReport> {
+    if buf.first() != Some(&b'*') {
+        return None;
+    }
+    let (fields, _) = parse_resp_array(buf).ok()??;
+    let [masters, claims] = fields.as_slice() else {
+        return None;
+    };
+    let masters: usize = std::str::from_utf8(masters).ok()?.parse().ok()?;
+    if claims.first() != Some(&b'*') {
+        return None;
+    }
+    // The count of ranges, before any is read.
+    let (entries, _) = parse_resp_array(claims).ok()??;
+    if entries.is_empty() || entries.len() > crate::cluster::CLUSTER_SLOTS {
+        return None;
+    }
+    OwnerReport::valid(masters, parse_slot_claims(claims).ok()?)
 }
 
 fn parse_slot_claims(buf: &[u8]) -> Result<Vec<SlotClaim>, String> {
@@ -1023,6 +1157,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id: None,
         };
         let bytes = encode(&msg);
@@ -1060,6 +1195,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id: None,
         };
         let bytes = encode(&msg);
@@ -1091,6 +1227,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: "a.example".into(),
             sender_announced_client_port: 30001,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id: None,
             gossip: vec![GossipEntry {
                 id: other,
@@ -1132,6 +1269,81 @@ mod tests {
         assert_eq!(cport_of("master,cport=nonsense"), 0);
     }
 
+    /// A node's client addresses go in its own flags string too (#847), as
+    /// `cip4=<address>` and `cip6=<address>`, and not in its gossip of other
+    /// nodes. An IPv6 address keeps its colons (the string is split on
+    /// commas). One that is not an address of its family is dropped, as
+    /// Valkey drops it. A node of an earlier version skips both tokens.
+    #[test]
+    fn client_addresses_travel_in_the_flags() {
+        let me = generate_node_id();
+        let other = generate_node_id();
+        let ips = |v4: &str, v6: &str| ClientIps {
+            v4: v4.into(),
+            v6: v6.into(),
+        };
+        let msg = BusMessage::Pong {
+            sender_id: me,
+            sender_ip: "10.0.0.1".into(),
+            sender_client_port: 6380,
+            sender_cluster_port: 16380,
+            sender_config_epoch: 3,
+            sender_flags: NodeFlags::MASTER,
+            sender_master_id: None,
+            sender_hostname: "a.example".into(),
+            sender_announced_client_port: 30001,
+            sender_client_ips: ips("203.0.113.7", "2001:db8::7"),
+            sender_shard_id: Some(me),
+            gossip: vec![GossipEntry {
+                id: other,
+                ip: "10.0.0.2".into(),
+                client_port: 6380,
+                cluster_port: 16380,
+                config_epoch: 2,
+                flags: NodeFlags::REPLICA,
+                master_id: Some(me),
+                hostname: String::new(),
+                announced_client_port: 0,
+            }],
+            slot_claims: vec![],
+            held_as_owner: None,
+        };
+        let (decoded, _) = decode(&encode(&msg)).unwrap().unwrap();
+        match decoded {
+            BusMessage::Pong {
+                sender_hostname,
+                sender_announced_client_port,
+                sender_client_ips,
+                sender_shard_id,
+                sender_flags,
+                gossip,
+                ..
+            } => {
+                assert_eq!(sender_client_ips, ips("203.0.113.7", "2001:db8::7"));
+                assert_eq!(sender_hostname, "a.example");
+                assert_eq!(sender_announced_client_port, 30001);
+                assert_eq!(sender_shard_id, Some(me));
+                assert_eq!(sender_flags, NodeFlags::MASTER);
+                assert_eq!(gossip[0].flags, NodeFlags::REPLICA);
+            }
+            other => panic!("expected Pong, got {:?}", other),
+        }
+        let flags = "master,host=a.example,cip4=203.0.113.7,cip6=2001:db8::7";
+        // What an older node's parser makes of it: the flags, and its hostname.
+        assert_eq!(parse_flags(flags), NodeFlags::MASTER);
+        assert_eq!(host_of(flags), "a.example");
+        // Of the wrong family, or no address: dropped.
+        assert_eq!(
+            client_ips_of("master,cip4=2001:db8::7,cip6=10.0.0.1"),
+            ClientIps::default()
+        );
+        assert_eq!(
+            client_ips_of("master,cip4=a.example,cip6="),
+            ClientIps::default()
+        );
+        assert_eq!(client_ips_of("master"), ClientIps::default());
+    }
+
     /// The sender's shard id goes in its flags string, as `shard=<id>`
     /// (#563): a node of an earlier version skips the token, and one sent
     /// by such a node has none.
@@ -1149,9 +1361,11 @@ mod tests {
             sender_master_id: Some(generate_node_id()),
             sender_hostname: "a.example".into(),
             sender_announced_client_port: 30001,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id,
             gossip: vec![],
             slot_claims: vec![],
+            held_as_owner: None,
         };
         for said in [Some(shard), None] {
             let (decoded, _) = decode(&encode(&pong(said))).unwrap().unwrap();
@@ -1204,10 +1418,12 @@ mod tests {
                 announced_client_port: 0,
             }],
             slot_claims: vec![],
+            held_as_owner: None,
             sender_flags: NodeFlags::MASTER,
             sender_master_id: None,
             sender_hostname: "shard-1a.db.example".into(),
             sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id: None,
         };
         let bytes = encode(&msg);
@@ -1247,6 +1463,160 @@ mod tests {
             decode(&longer),
             Ok(Some((BusMessage::Pong { .. }, _)))
         ));
+    }
+
+    fn report_pong(held_as_owner: Option<OwnerReport>) -> BusMessage {
+        let me = generate_node_id();
+        BusMessage::Pong {
+            sender_id: me,
+            sender_ip: "10.0.0.1".into(),
+            sender_client_port: 6380,
+            sender_cluster_port: 16380,
+            sender_config_epoch: 3,
+            sender_flags: NodeFlags::MASTER,
+            sender_master_id: None,
+            sender_hostname: String::new(),
+            sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
+            sender_shard_id: Some(me),
+            gossip: vec![],
+            slot_claims: vec![SlotClaim {
+                start: 0,
+                end: 99,
+                epoch: 3,
+            }],
+            held_as_owner,
+        }
+    }
+
+    /// A PONG of seven fields, as `report_pong(None)` encodes it, with
+    /// `eighth` (raw RESP) as its eighth field.
+    fn pong_with_eighth(eighth: &[u8]) -> Vec<u8> {
+        let bytes = encode(&report_pong(None));
+        let (parts, _) = parse_resp_array(&bytes).unwrap().unwrap();
+        assert_eq!(parts.len(), 7);
+        let mut out = format!("*{}\r\n", parts.len() + 1).into_bytes();
+        for (i, part) in parts.iter().enumerate() {
+            if i == 5 || i == 6 {
+                out.extend_from_slice(part);
+            } else {
+                out.extend_from_slice(&resp_bulk(part));
+            }
+        }
+        out.extend_from_slice(eighth);
+        out
+    }
+
+    fn decoded_report(bytes: &[u8]) -> Option<OwnerReport> {
+        let (decoded, _) = decode(bytes).unwrap().unwrap();
+        let BusMessage::Pong { held_as_owner, .. } = decoded else {
+            panic!("expected Pong");
+        };
+        held_as_owner
+    }
+
+    /// The slots a PONG's sender holds its addressee as the owner of, and
+    /// how many masters own slots in its view, travel as an eighth field,
+    /// only when there are some: a PONG without them is the seven fields it
+    /// was, and a node that reads seven (an earlier version) reads the rest
+    /// of the PONG as before. A field that does not read as a report is
+    /// taken for none.
+    #[test]
+    fn slots_held_as_owner_travel_as_an_eighth_field() {
+        let report = OwnerReport {
+            masters: 3,
+            claims: vec![
+                SlotClaim {
+                    start: 100,
+                    end: 199,
+                    epoch: 7,
+                },
+                SlotClaim {
+                    start: 300,
+                    end: 300,
+                    epoch: 7,
+                },
+            ],
+        };
+        let bytes = encode(&report_pong(Some(report.clone())));
+        let (parts, _) = parse_resp_array(&bytes).unwrap().unwrap();
+        assert_eq!(parts.len(), 8);
+        let (decoded, _) = decode(&bytes).unwrap().unwrap();
+        let BusMessage::Pong {
+            held_as_owner,
+            slot_claims,
+            ..
+        } = decoded
+        else {
+            panic!("expected Pong");
+        };
+        assert_eq!(held_as_owner, Some(report));
+        assert_eq!(slot_claims.len(), 1);
+
+        let bytes = encode(&report_pong(None));
+        let (parts, _) = parse_resp_array(&bytes).unwrap().unwrap();
+        assert_eq!(parts.len(), 7);
+        assert_eq!(decoded_report(&bytes), None);
+
+        // An eighth field that is not a report: none.
+        assert_eq!(
+            decoded_report(&pong_with_eighth(&resp_bulk(b"later"))),
+            None
+        );
+    }
+
+    /// A report is taken in only as it can be: one that has no range, more
+    /// ranges than there are slots, a range reversed or past the last slot,
+    /// or a count of masters of 0 or above the number of slots, is taken for
+    /// none, and the rest of the PONG is read as usual.
+    #[test]
+    fn a_report_out_of_bounds_is_taken_for_none() {
+        let field = |masters: &str, ranges: &[(u32, u32)]| {
+            let claims: Vec<Vec<u8>> = ranges
+                .iter()
+                .map(|(s, e)| {
+                    resp_array(vec![
+                        resp_bulk_str(&s.to_string()),
+                        resp_bulk_str(&e.to_string()),
+                        resp_bulk_str("7"),
+                    ])
+                })
+                .collect();
+            resp_array(vec![resp_bulk_str(masters), resp_array(claims)])
+        };
+        let good = decoded_report(&pong_with_eighth(&field("3", &[(0, 99), (16383, 16383)])));
+        assert_eq!(good.map(|r| (r.masters, r.claims.len())), Some((3, 2)));
+
+        let too_many: Vec<(u32, u32)> = (0..=crate::cluster::CLUSTER_SLOTS as u32)
+            .map(|i| (i % 16384, i % 16384))
+            .collect();
+        for (masters, ranges) in [
+            ("3", vec![]),
+            ("3", too_many),
+            ("3", vec![(10, 9)]),
+            ("3", vec![(0, 16384)]),
+            ("3", vec![(16384, 16384)]),
+            ("3", vec![(0, 70000)]),
+            ("0", vec![(0, 99)]),
+            ("16385", vec![(0, 99)]),
+            ("18446744073709551616", vec![(0, 99)]),
+            ("-1", vec![(0, 99)]),
+            ("x", vec![(0, 99)]),
+        ] {
+            let bytes = pong_with_eighth(&field(masters, &ranges));
+            assert_eq!(
+                decoded_report(&bytes),
+                None,
+                "{masters} masters, {} ranges",
+                ranges.len()
+            );
+        }
+        // Not a pair, or the claims not an array.
+        let one = resp_array(vec![resp_bulk_str("3")]);
+        let flat = resp_array(vec![resp_bulk_str("3"), resp_bulk_str("0")]);
+        for eighth in [one, flat] {
+            assert_eq!(decoded_report(&pong_with_eighth(&eighth)), None);
+        }
     }
 
     #[test]
@@ -1322,6 +1692,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id: None,
         };
         let bytes = encode(&msg);
@@ -1372,6 +1743,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id: None,
         };
         let bytes = encode(&msg);

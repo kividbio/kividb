@@ -47,9 +47,10 @@ pub fn refusal(acl_store: &crate::acl::AclStore, peer_addr: &str) -> Option<&'st
 }
 
 /// Whether a client at `peer_addr` is on this machine.
-fn is_local(peer_addr: &str) -> bool {
+pub(crate) fn is_local(peer_addr: &str) -> bool {
     match peer_addr.parse::<std::net::SocketAddr>() {
-        Ok(addr) => addr.ip().is_loopback(),
+        // A dual-stack listener sees IPv4 clients as IPv4-mapped.
+        Ok(addr) => addr.ip().to_canonical().is_loopback(),
         // Not an IP address (a Unix socket): on this machine.
         Err(_) => true,
     }
@@ -63,8 +64,10 @@ mod tests {
     fn only_clients_of_this_machine_are_local() {
         assert!(is_local("127.0.0.1:5000"));
         assert!(is_local("[::1]:5000"));
+        assert!(is_local("[::ffff:127.0.0.1]:5000"));
         assert!(is_local("/tmp/kividb.sock"));
         assert!(!is_local("10.0.0.7:5000"));
+        assert!(!is_local("[::ffff:10.0.0.7]:5000"));
         assert!(!is_local("[2001:db8::1]:5000"));
     }
 }

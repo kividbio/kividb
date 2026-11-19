@@ -59,6 +59,46 @@ pub enum IoModel {
     Tokio, // always use tokio
 }
 
+/// `enable-debug-command`: who may run `DEBUG`, as in Redis.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DebugCommand {
+    /// Nobody.
+    #[default]
+    No,
+    /// Any client its ACL user allows.
+    Yes,
+    /// Only clients on loopback.
+    Local,
+}
+
+impl DebugCommand {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::No => "no",
+            Self::Yes => "yes",
+            Self::Local => "local",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "no" => Some(Self::No),
+            "yes" => Some(Self::Yes),
+            "local" => Some(Self::Local),
+            _ => None,
+        }
+    }
+
+    /// Whether a client at `peer_addr` may run `DEBUG`.
+    pub fn allows(self, peer_addr: &str) -> bool {
+        match self {
+            Self::No => false,
+            Self::Yes => true,
+            Self::Local => crate::protected_mode::is_local(peer_addr),
+        }
+    }
+}
+
 /// What `kividb --version` prints after the name: the version, and which of
 /// the release's builds this is (`update_check::variant`), since the
 /// `kividb` and `kividb-full` packages install the same `/usr/bin/kividb`
@@ -103,6 +143,11 @@ pub struct Config {
     #[arg(skip)]
     pub bind_explicit: bool,
 
+    /// Who may run DEBUG: no (nobody), yes, or local (loopback clients
+    /// only). Startup only.
+    #[arg(long, default_value = "no", value_enum, ignore_case = true)]
+    pub enable_debug_command: DebugCommand,
+
     /// Number of worker threads (0 = auto)
     #[arg(long, default_value_t = 0)]
     pub threads: usize,
@@ -112,6 +157,13 @@ pub struct Config {
     /// as those CPUs). See docs/CONFIGURATION.md.
     #[arg(long, default_value = "off", value_enum)]
     pub worker_cpu_affinity: crate::cpus::WorkerCpuAffinity,
+
+    /// Helper threads that link the vectors written to HNSW indexes into
+    /// their graphs: a number (0: each write links its own vector, as 1.2
+    /// did) or auto (none under a CPU quota or below 8 CPUs, otherwise
+    /// (CPUs - 2) / 2). Startup only. See docs/SEARCH.md.
+    #[arg(long, default_value = "auto", value_parser = parse_index_threads)]
+    pub search_index_threads: crate::vector::backlog::IndexThreads,
 
     /// Enable append-only file persistence
     #[arg(long, default_value_t = false)]
@@ -553,6 +605,18 @@ pub struct Config {
     #[arg(long, default_value_t = 0)]
     pub cluster_announce_client_port: u16,
 
+    /// The address clients connected over IPv4 are told to reach this node
+    /// at (redirects, `CLUSTER SLOTS`, `SHARDS`, `NODES`), where it is not
+    /// the one nodes use between themselves (Valkey 8's
+    /// `cluster-announce-client-ipv4`). Empty = the node's address.
+    /// Settable at runtime.
+    #[arg(long, default_value = "")]
+    pub cluster_announce_client_ipv4: String,
+
+    /// The same for clients connected over IPv6 (`cluster-announce-client-ipv6`).
+    #[arg(long, default_value = "")]
+    pub cluster_announce_client_ipv6: String,
+
     /// Bus port announced to the cluster. 0 = `port` + 10000.
     #[arg(long, default_value_t = 0)]
     pub cluster_announce_bus_port: u16,
@@ -655,6 +719,7 @@ impl Default for Config {
             bind: "0.0.0.0".into(),
             threads: 0,
             worker_cpu_affinity: crate::cpus::WorkerCpuAffinity::Off,
+            search_index_threads: crate::vector::backlog::IndexThreads::Auto,
             aof: false,
             aof_preamble: true,
             lua_parallel_scripts: true,
@@ -726,11 +791,14 @@ impl Default for Config {
             cluster_preferred_endpoint_type: "ip".into(),
             cluster_announce_port: 0,
             cluster_announce_client_port: 0,
+            cluster_announce_client_ipv4: String::new(),
+            cluster_announce_client_ipv6: String::new(),
             cluster_announce_bus_port: 0,
             cluster_port: 0,
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
             bind_explicit: false,
+            enable_debug_command: DebugCommand::No,
             configfile_loaded: false,
             configfile_named: false,
             cluster_bus_secret: String::new(),
@@ -774,7 +842,7 @@ impl Config {
     }
 
     pub fn addr(&self) -> String {
-        format!("{}:{}", self.bind, self.port)
+        host_port(&self.bind, self.port)
     }
 
     /// Returns (host, port) if this instance should run as a replica.
@@ -799,6 +867,7 @@ impl Config {
             bind: String::new(),
             threads: 1,
             worker_cpu_affinity: crate::cpus::WorkerCpuAffinity::Off,
+            search_index_threads: crate::vector::backlog::IndexThreads::Auto,
             aof: false,
             aof_preamble: true,
             lua_parallel_scripts: true,
@@ -870,11 +939,14 @@ impl Config {
             cluster_preferred_endpoint_type: "ip".into(),
             cluster_announce_port: 0,
             cluster_announce_client_port: 0,
+            cluster_announce_client_ipv4: String::new(),
+            cluster_announce_client_ipv6: String::new(),
             cluster_announce_bus_port: 0,
             cluster_port: 0,
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
             bind_explicit: false,
+            enable_debug_command: DebugCommand::No,
             configfile_loaded: false,
             configfile_named: false,
             cluster_bus_secret: String::new(),
@@ -1043,6 +1115,14 @@ impl Config {
                 self.repl_diskless_load
             ));
         }
+        for (ip, v6) in [
+            (&self.cluster_announce_client_ipv4, false),
+            (&self.cluster_announce_client_ipv6, true),
+        ] {
+            if let Some(err) = client_ip_error(ip, v6) {
+                return Err(err.into());
+            }
+        }
         if !self.hll_write_format.eq_ignore_ascii_case("legacy")
             && !self.hll_write_format.eq_ignore_ascii_case("redis")
         {
@@ -1149,6 +1229,8 @@ impl Config {
                 match name.to_ascii_lowercase().as_str() {
                     "cluster-announce-ip" => config.cluster_announce_ip.clear(),
                     "cluster-announce-hostname" => config.cluster_announce_hostname.clear(),
+                    "cluster-announce-client-ipv4" => config.cluster_announce_client_ipv4.clear(),
+                    "cluster-announce-client-ipv6" => config.cluster_announce_client_ipv6.clear(),
                     _ => {}
                 }
                 continue;
@@ -1183,10 +1265,19 @@ impl Config {
             "protected-mode {}\n",
             if self.protected_mode { "yes" } else { "no" }
         ));
+        out.push_str(&format!(
+            "enable-debug-command {}\n",
+            self.enable_debug_command.name()
+        ));
         out.push_str(&format!("threads {}\n", self.threads));
         out.push_str(&format!(
             "worker-cpu-affinity {}\n",
             self.worker_cpu_affinity.name()
+        ));
+        out.push_str(&format!(
+            "search-index-threads {}
+",
+            self.search_index_threads.name()
         ));
         out.push_str(&format!("aof {}\n", if self.aof { "yes" } else { "no" }));
         out.push_str(&format!(
@@ -1357,6 +1448,18 @@ impl Config {
             out.push_str(&format!(
                 "cluster-announce-client-port {}\n",
                 self.cluster_announce_client_port
+            ));
+        }
+        if !self.cluster_announce_client_ipv4.is_empty() {
+            out.push_str(&format!(
+                "cluster-announce-client-ipv4 {}\n",
+                self.cluster_announce_client_ipv4
+            ));
+        }
+        if !self.cluster_announce_client_ipv6.is_empty() {
+            out.push_str(&format!(
+                "cluster-announce-client-ipv6 {}\n",
+                self.cluster_announce_client_ipv6
             ));
         }
         if self.cluster_announce_bus_port != 0 {
@@ -1630,6 +1733,10 @@ impl Config {
                 };
                 set!(worker_cpu_affinity, mode)
             }
+            "search-index-threads" => {
+                let value = one()?;
+                set!(search_index_threads, parse_index_threads(value)?)
+            }
             "dir" => set!(dir, one()?.to_string()),
             "aof" | "appendonly" => set!(aof, yes_no(key, one()?)?),
             "aof-preamble" | "aof-use-rdb-preamble" => set!(aof_preamble, yes_no(key, one()?)?),
@@ -1737,6 +1844,20 @@ impl Config {
             "cluster-announce-port" => set!(cluster_announce_port, number(key, one()?)?),
             "cluster-announce-client-port" => {
                 set!(cluster_announce_client_port, number(key, one()?)?)
+            }
+            "cluster-announce-client-ipv4" => {
+                let ip = one()?;
+                if let Some(err) = client_ip_error(ip, false) {
+                    return Err(err.into());
+                }
+                set!(cluster_announce_client_ipv4, ip.to_string())
+            }
+            "cluster-announce-client-ipv6" => {
+                let ip = one()?;
+                if let Some(err) = client_ip_error(ip, true) {
+                    return Err(err.into());
+                }
+                set!(cluster_announce_client_ipv6, ip.to_string())
             }
             "cluster-announce-bus-port" => set!(cluster_announce_bus_port, number(key, one()?)?),
             "cluster-port" => set!(cluster_port, number(key, one()?)?),
@@ -1853,6 +1974,16 @@ impl Config {
             "tls-key-file" => set!(tls_key_file, one()?.to_string()),
             "tls-ca-cert-file" => set!(tls_ca_cert_file, one()?.to_string()),
             "protected-mode" => set!(protected_mode, yes_no(key, one()?)?),
+            "enable-debug-command" => {
+                let value = one()?;
+                let Some(mode) = DebugCommand::parse(value) else {
+                    return Err(format!(
+                        "invalid value '{value}' for 'enable-debug-command': expected no, yes \
+                         or local"
+                    ));
+                };
+                set!(enable_debug_command, mode)
+            }
             "tls-cluster" => set!(tls_cluster, yes_no(key, one()?)?),
             "tls-replication" => set!(tls_replication, yes_no(key, one()?)?),
             "tls-client-cert-file" => set!(tls_client_cert_file, one()?.to_string()),
@@ -2230,6 +2361,15 @@ fn parse_memory_flag(value: &str) -> Result<usize, String> {
 /// Parse Redis-style `yes` / `no` into a bool. Used by `--cluster-enabled`
 /// and any future flags that want to mirror redis.conf phrasing rather than
 /// clap's default `true` / `false`.
+fn parse_index_threads(s: &str) -> Result<crate::vector::backlog::IndexThreads, String> {
+    crate::vector::backlog::IndexThreads::parse(s).ok_or_else(|| {
+        format!(
+            "invalid value '{s}' for 'search-index-threads': expected auto or a number from 0 to {}",
+            crate::vector::backlog::MAX_INDEX_THREADS
+        )
+    })
+}
+
 fn parse_yes_no(s: &str) -> Result<bool, String> {
     match s.to_ascii_lowercase().as_str() {
         "yes" | "true" | "1" => Ok(true),
@@ -2248,6 +2388,37 @@ pub enum RewriteError {
     /// (#475).
     DefaultConfigFile(String),
     Io(std::io::Error),
+}
+
+/// `host:port` as a socket address is written: an IPv6 address in brackets
+/// (`[::1]:6379`). `bind ::` and `bind ::1` were joined as `:::6379`, which
+/// is no address, and the server did not start.
+pub fn host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Why `value` is not a `cluster-announce-client-ipv4` (`ipv6` false) or
+/// `-ipv6` address, as Valkey words it; `None` when it is one, or empty
+/// (unset).
+pub fn client_ip_error(value: &str, ipv6: bool) -> Option<&'static str> {
+    if value.is_empty() {
+        return None;
+    }
+    if ipv6 {
+        value
+            .parse::<std::net::Ipv6Addr>()
+            .err()
+            .map(|_| "Invalid IPv6 address")
+    } else {
+        value
+            .parse::<std::net::Ipv4Addr>()
+            .err()
+            .map(|_| "Invalid IPv4 address")
+    }
 }
 
 #[cfg(test)]
@@ -2304,6 +2475,40 @@ mod config_file_tests {
         assert!(load("protected-mode yes\n").unwrap().0.protected_mode);
         assert!(load("protected-mode maybe\n").is_err());
         assert!(load("bind 0.0.0.0\n").unwrap().0.bind_explicit);
+    }
+
+    #[test]
+    fn enable_debug_command_is_no_unless_set_at_startup() {
+        use clap::Parser;
+        assert_eq!(Config::default().enable_debug_command, DebugCommand::No);
+        let flag = |v: &str| {
+            Config::try_parse_from(["kividb", "--enable-debug-command", v])
+                .map(|c| c.enable_debug_command)
+        };
+        assert_eq!(flag("no").unwrap(), DebugCommand::No);
+        assert_eq!(flag("YES").unwrap(), DebugCommand::Yes);
+        assert_eq!(flag("local").unwrap(), DebugCommand::Local);
+        assert!(flag("maybe").is_err());
+        let file = |text: &str| load(text).map(|(c, _)| c.enable_debug_command);
+        assert_eq!(file("enable-debug-command no\n"), Ok(DebugCommand::No));
+        assert_eq!(file("enable-debug-command yes\n"), Ok(DebugCommand::Yes));
+        assert_eq!(
+            file("enable-debug-command Local\n"),
+            Ok(DebugCommand::Local)
+        );
+        let err = file("enable-debug-command maybe\n").unwrap_err();
+        assert!(err.contains("expected no, yes or local"), "{err}");
+        assert!(file("enable-debug-command\n").is_err());
+    }
+
+    #[test]
+    fn local_debug_is_for_loopback_and_unix_socket_clients() {
+        assert!(DebugCommand::Local.allows("127.0.0.1:5000"));
+        assert!(DebugCommand::Local.allows("[::1]:5000"));
+        assert!(DebugCommand::Local.allows("/tmp/kividb.sock"));
+        assert!(!DebugCommand::Local.allows("10.0.0.7:5000"));
+        assert!(DebugCommand::Yes.allows("10.0.0.7:5000"));
+        assert!(!DebugCommand::No.allows("127.0.0.1:5000"));
     }
 
     /// `appendonly`, Redis's spelling of the AOF switch, must work in a config file.
@@ -2858,5 +3063,53 @@ mod validate_tests {
             ..cfg()
         };
         assert!(c.validate(true).unwrap_err().contains("CLUSTER REPLICATE"));
+    }
+}
+
+#[cfg(test)]
+mod client_ip_tests {
+    use super::*;
+
+    #[test]
+    fn client_addresses_are_checked_by_family() {
+        assert_eq!(client_ip_error("", false), None);
+        assert_eq!(client_ip_error("", true), None);
+        assert_eq!(client_ip_error("10.0.0.1", false), None);
+        assert_eq!(client_ip_error("2001:db8::7", true), None);
+        assert_eq!(
+            client_ip_error("2001:db8::7", false),
+            Some("Invalid IPv4 address")
+        );
+        assert_eq!(
+            client_ip_error("10.0.0.1", true),
+            Some("Invalid IPv6 address")
+        );
+        assert_eq!(
+            client_ip_error("a.example", false),
+            Some("Invalid IPv4 address")
+        );
+        let mut c = Config::default();
+        assert!(
+            c.apply_config_text("cluster-announce-client-ipv4 10.0.0.1\n", &|_| false)
+                .is_ok()
+        );
+        assert_eq!(c.cluster_announce_client_ipv4, "10.0.0.1");
+        let e = c
+            .apply_config_text("cluster-announce-client-ipv6 10.0.0.1\n", &|_| false)
+            .unwrap_err();
+        assert!(e.contains("Invalid IPv6 address"), "{e}");
+    }
+
+    #[test]
+    fn an_ipv6_bind_address_is_bracketed() {
+        assert_eq!(host_port("127.0.0.1", 6379), "127.0.0.1:6379");
+        assert_eq!(host_port("::", 6379), "[::]:6379");
+        assert_eq!(host_port("::1", 6379), "[::1]:6379");
+        assert_eq!(host_port("[::1]", 6379), "[::1]:6379");
+        assert!(
+            host_port("::", 6379)
+                .parse::<std::net::SocketAddr>()
+                .is_ok()
+        );
     }
 }

@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import Suite, Config, KEEP_IMPROVEMENT, rel, info, bound, scaled, median  # noqa: E402
 from nodes import redis_tool  # noqa: E402
 
-S = Suite("06-stream-consumers", [Config("pel")])
+S = Suite("06-stream-consumers", [Config("pel", threads=2)])
 LAT = [rel(50, abs=0.5), KEEP_IMPROVEMENT]
 
 

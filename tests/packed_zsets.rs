@@ -730,7 +730,7 @@ fn every_change_of_form_keeps_every_member() {
 fn save_aof_and_rewrite_round_trips() {
     // Snapshot.
     let dir = temp_dir("save");
-    let mut server = Server::start(dir.path(), &[]);
+    let mut server = Server::start(dir.path(), &["--enable-debug-command", "yes"]);
     let mut c = server.conn();
     let forms = load_forms(&mut c);
     reference_copies(&mut c, &forms);
@@ -743,7 +743,7 @@ fn save_aof_and_rewrite_round_trips() {
 
     // AOF replay, with removals and conversions in the log.
     let dir = temp_dir("aof");
-    let mut server = Server::start(dir.path(), &["--aof"]);
+    let mut server = Server::start(dir.path(), &["--aof", "--enable-debug-command", "yes"]);
     let mut c = server.conn();
     let forms = load_forms(&mut c);
     reference_copies(&mut c, &forms);
@@ -797,9 +797,9 @@ fn save_aof_and_rewrite_round_trips() {
 #[test]
 fn dump_restore_and_migrate() {
     let dir = temp_dir("dump");
-    let server = Server::start(dir.path(), &[]);
+    let server = Server::start(dir.path(), &["--enable-debug-command", "yes"]);
     let other_dir = temp_dir("dump-to");
-    let other = Server::start(other_dir.path(), &[]);
+    let other = Server::start(other_dir.path(), &["--enable-debug-command", "yes"]);
     let mut c = server.conn();
     let forms = load_forms(&mut c);
     for form in &forms {
@@ -847,12 +847,21 @@ fn synced(m: &mut Conn, r: &mut Conn) {
 #[test]
 fn replica_full_sync_and_stream() {
     let dir = temp_dir("master");
-    let master = Server::start(dir.path(), &[]);
+    let master = Server::start(dir.path(), &["--enable-debug-command", "yes"]);
     let mut m = master.conn();
     let mut forms = load_forms(&mut m);
     let rdir = temp_dir("replica");
     let port = master.port.to_string();
-    let replica = Server::start(rdir.path(), &["--replicaof", "127.0.0.1", &port]);
+    let replica = Server::start(
+        rdir.path(),
+        &[
+            "--replicaof",
+            "127.0.0.1",
+            &port,
+            "--enable-debug-command",
+            "yes",
+        ],
+    );
     let mut r = replica.conn();
     wait_for("the link", || {
         r.info("replication", "master_link_status") == "up"
