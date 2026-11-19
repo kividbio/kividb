@@ -1,3 +1,4 @@
+use crate::cpus::ScopeExt as _;
 use crate::list_values::ListValues;
 use crate::store;
 use crate::store::Key;
@@ -5358,7 +5359,7 @@ fn freeze(
     // copied as the store keeps it (inline up to 24 bytes) rather than into
     // an allocation of its own. With ten million keys on a node it took
     // seconds on one thread, and grew with the keys.
-    let threads = std::thread::available_parallelism()
+    let threads = crate::cpus::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
         .clamp(1, 8);
@@ -5377,7 +5378,7 @@ fn freeze(
             let handles: Vec<_> = shards
                 .chunks(per)
                 .map(|run| {
-                    scope.spawn(move || {
+                    scope.spawn_released(move || {
                         let mut strings = Vec::new();
                         let mut encoded = CapturedBuf::default();
                         let mut sketches = Vec::new();

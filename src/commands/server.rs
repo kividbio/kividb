@@ -1,4 +1,5 @@
 use crate::commands::ctx::Ctx;
+use crate::cpus::BuilderExt as _;
 use crate::loglevel::LOG_LEVEL;
 use crate::read_lock;
 use crate::resp::write::*;
@@ -2105,7 +2106,7 @@ fn keysizes_count_aside(store: &crate::store::Store, count: KeysizesCounter) -> 
     let store = Arc::clone(store);
     std::thread::Builder::new()
         .name("keysizes".to_string())
-        .spawn(move || {
+        .spawn_released(move || {
             // Dropped last, after the count is kept.
             let _done = Done(keysizes_key(&store));
             let began = std::time::Instant::now();
@@ -2276,6 +2277,10 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         // As given with `--threads` (0: one per core), the value `CONFIG
         // REWRITE` keeps, not the count it resolved to on this machine.
         ("threads", ctx.config.threads.to_string()),
+        (
+            "worker-cpu-affinity",
+            ctx.config.worker_cpu_affinity.name().to_string(),
+        ),
         // The value in force, not the one the server started with.
         (
             "maxmemory",
@@ -4471,7 +4476,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             tokio::spawn(async move {
                 let started = std::time::Instant::now();
-                let snap = tokio::task::spawn_blocking(move || {
+                let snap = crate::cpus::spawn_blocking(move || {
                     crate::replication::save_dataset(&store, &index_store_snap, &repl_state)
                 })
                 .await;

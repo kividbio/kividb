@@ -2268,7 +2268,7 @@ mod write_shards_tests {
         let locked = Arc::new(AtomicBool::new(false));
         let mset = {
             let (db, keys, locked) = (Arc::clone(&db), keys.clone(), Arc::clone(&locked));
-            std::thread::spawn(move || {
+            crate::cpus::spawn(move || {
                 let mut shards = WriteShards::lock(&db, keys.iter().map(String::as_bytes));
                 locked.store(true, Ordering::SeqCst);
                 for key in &keys {
@@ -2320,7 +2320,7 @@ mod write_shards_tests {
         let writers: Vec<_> = (0..8)
             .map(|w| {
                 let (db, keys, inside) = (Arc::clone(&db), keys.clone(), Arc::clone(&inside));
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     for round in 0..2000usize {
                         // A different window of the keys each time, so the
                         // writers overlap in some shards and not others.

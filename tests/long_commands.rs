@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // A long command on one connection does not hold up the others (#754).
 //
 // On the Tokio runtime a command runs inline on a worker thread. The worker

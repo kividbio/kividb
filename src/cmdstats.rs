@@ -276,7 +276,7 @@ mod tests {
         let before = of("pfdebug");
         let threads: Vec<_> = (0..4)
             .map(|_| {
-                std::thread::spawn(|| {
+                crate::cpus::spawn(|| {
                     for _ in 0..250 {
                         record(
                             "PFDEBUG",

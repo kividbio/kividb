@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Small hashes kept in one block: every hash command gives the same answer
 // whatever the form, across every change of form, and the fields come back
 // the same, with their deadlines, after a save, an AOF replay, an AOF

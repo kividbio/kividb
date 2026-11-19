@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Fan-out of one message to many subscribers (#851): a message's frame is
 // built once for each channel or pattern it goes through and shared by all
 // of their subscribers, and a subscriber's buffers are kept from one batch

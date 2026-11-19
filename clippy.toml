@@ -1,0 +1,14 @@
+# Every thread the server starts goes through src/cpus.rs: a thread started by
+# an io_uring worker bound with `worker-cpu-affinity auto` would otherwise be
+# held to that worker's one CPU (a SAVE's freeze threads, a cluster fan-out,
+# a full sync's dump, a script). Tests are allowed these (`allow` at the top
+# of each test crate, `cfg_attr(test, ...)` for unit tests).
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "use crate::cpus::spawn: a thread a pinned worker starts must get the process's CPUs back" },
+    { path = "std::thread::Builder::spawn", reason = "use crate::cpus::BuilderExt::spawn_released" },
+    { path = "std::thread::Builder::spawn_scoped", reason = "use crate::cpus::ScopeExt::spawn_released" },
+    { path = "std::thread::Scope::spawn", reason = "use crate::cpus::ScopeExt::spawn_released" },
+    { path = "tokio::task::spawn_blocking", reason = "use crate::cpus::spawn_blocking" },
+    { path = "tokio::runtime::Handle::spawn_blocking", reason = "use crate::cpus::spawn_blocking_on" },
+    { path = "tokio::runtime::Runtime::spawn_blocking", reason = "use crate::cpus::spawn_blocking_on" },
+]

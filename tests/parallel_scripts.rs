@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/parallel_scripts.rs
 //
 // `lua-parallel-scripts`: scripts whose KEYS share a hash tag, run beside

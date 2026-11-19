@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/cluster.rs
 //
 // Cluster mode, end to end: real `kividb` processes, each in its own working
