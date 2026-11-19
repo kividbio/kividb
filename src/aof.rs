@@ -301,6 +301,286 @@ fn as_turn_over_mark(item: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(rest.try_into().ok()?))
 }
 
+// ── Where the old log ends ───────────────────────────────────────────────────
+//
+// A turn-over's new log opens, after its header, with a record of how long
+// the old log was at the turn-over and a hash of its last bytes (#277). The
+// old log's last records and the new log's first ones are made durable by
+// separate syncs: the writer does not sync the new log before the old one,
+// but the kernel writes pages back when it likes, and a power failure in
+// between can keep records of the new log and lose the end of the old one.
+// Recovery replays the new log only once the old log is found complete to
+// that length (see [`old_log_end`]); otherwise it stops at the end of the
+// old log, and the new log is kept aside, not applied over the hole.
+//
+// One record, which a release that does not know it replays as an unknown
+// command and passes over; clients cannot send it (the name is no command).
+// Fixed in size, so that a log's records start at a known place after it
+// (see [`records_start`]).
+
+/// The command name of the record.
+const OLD_LOG_END_NAME: &[u8] = b"KIVIDB.AOF-OLD-LOG-END";
+
+/// The record's length: `*3`, the name, 20 digits of length, 16 hex digits
+/// of hash.
+const OLD_LOG_END_LEN: usize = 4 + 5 + 22 + 2 + 5 + 20 + 2 + 5 + 16 + 2;
+
+/// How many of the old log's last bytes the record's hash covers.
+const OLD_LOG_END_EDGE: u64 = 4096;
+
+/// The record for an old log `len` bytes long whose last bytes hash to
+/// `hash` (see [`hash_of_end`]).
+fn old_log_end_record(len: u64, hash: u64) -> Vec<u8> {
+    let record = format!(
+        "*3\r\n$22\r\n{}\r\n$20\r\n{len:020}\r\n$16\r\n{hash:016x}\r\n",
+        std::str::from_utf8(OLD_LOG_END_NAME).expect("ASCII")
+    );
+    debug_assert_eq!(record.len(), OLD_LOG_END_LEN);
+    record.into_bytes()
+}
+
+/// The length and hash in the record; `None` for anything else.
+fn as_old_log_end(cmd: &[Vec<u8>]) -> Option<(u64, u64)> {
+    let [name, len, hash] = cmd else {
+        return None;
+    };
+    if name.as_slice() != OLD_LOG_END_NAME || len.len() != 20 || hash.len() != 16 {
+        return None;
+    }
+    let len = std::str::from_utf8(len).ok()?.parse().ok()?;
+    let hash = u64::from_str_radix(std::str::from_utf8(hash).ok()?, 16).ok()?;
+    Some((len, hash))
+}
+
+fn is_old_log_end(cmd: &[Vec<u8>]) -> bool {
+    matches!(cmd, [name, _, _] if name.as_slice() == OLD_LOG_END_NAME)
+}
+
+/// The hash of `end`, the last bytes of a log up to the length recorded:
+/// [`OLD_LOG_END_EDGE`] of them, or all of a shorter log.
+fn hash_of_end(end: &[u8]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(end)
+}
+
+/// [`hash_of_end`] of the first `len` bytes of `file`, which is at least
+/// that long.
+fn hash_of_end_of(mut file: &std::fs::File, len: u64) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let from = len.saturating_sub(OLD_LOG_END_EDGE);
+    file.seek(SeekFrom::Start(from))?;
+    let mut end = Vec::with_capacity((len - from) as usize);
+    file.take(len - from).read_to_end(&mut end)?;
+    if (end.len() as u64) < len - from {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("{AOF_PREV_PATH} is shorter than {len} bytes"),
+        ));
+    }
+    Ok(hash_of_end(&end))
+}
+
+/// Open the new log of a turn-over with the record of where the old log,
+/// `appendonly.aof.prev` now, ends. Called with the log locked, before
+/// anything else is written to `file`, which holds its header alone: one
+/// small write to the page cache, and a read of the old log's last bytes,
+/// which are in it. With no old log (there was no log to move aside),
+/// nothing is written.
+///
+/// A record that cannot be written is taken off again, and the log goes on
+/// as one with no record (replayed as logs were before it): half of one,
+/// with records after it, would make the log unreadable.
+fn note_old_log_end(file: &mut std::fs::File) -> std::io::Result<()> {
+    use std::io::Write;
+    let old = match std::fs::File::open(AOF_PREV_PATH) {
+        Ok(old) => old,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let len = old.metadata()?.len();
+    let record = old_log_end_record(len, hash_of_end_of(&old, len)?);
+    if let Err(e) = file.write_all(&record) {
+        file.set_len(AOF_DELTA_HEADER_LEN as u64)?;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// What a log's record of the old log's end says of the old log (see
+/// [`old_log_end`]).
+#[derive(Debug, PartialEq, Eq)]
+enum OldLogEnd {
+    /// The log has no such record (written by 1.2.2 or earlier, or holding
+    /// no whole record at all): replayed after the old log, as before.
+    Unrecorded,
+    /// The old log is there to the length recorded, with the same last
+    /// bytes: the new log goes on from it.
+    Whole,
+    /// The old log does not reach the end recorded, or the start of the new
+    /// log never reached the disk (the reason says which): the new log's
+    /// records may come after a hole, and are not replayed.
+    Short(String),
+}
+
+/// Judge `log`, the new log of a turn-over, against the old log it goes on
+/// from: `prev_len` bytes long, with `end_hash` giving its [`hash_of_end`]
+/// up to a length.
+///
+/// The record is the first thing after the header, written before any
+/// record and in the same page. Zeros there, with something after them, are
+/// a start of the log that never reached the disk while later pages did: no
+/// sync of the log was made after its first records were written (a sync
+/// writes every page), so none of its records was ever reported synced, and
+/// they may come after a hole in the old log that nothing can tell.
+fn old_log_end(
+    log: &[u8],
+    prev_len: u64,
+    end_hash: impl FnOnce(u64) -> std::io::Result<u64>,
+) -> std::io::Result<OldLogEnd> {
+    if aof_delta_generation(log).is_none() {
+        return Ok(OldLogEnd::Unrecorded);
+    }
+    let rest = &log[AOF_DELTA_HEADER_LEN..];
+    let Some(&first) = rest.first() else {
+        return Ok(OldLogEnd::Unrecorded);
+    };
+    match parse_one_command(rest) {
+        Some((cmd, _)) => match as_old_log_end(&cmd) {
+            Some((len, _)) if prev_len < len => Ok(OldLogEnd::Short(format!(
+                "{AOF_PREV_PATH} is {prev_len} bytes long, and was {len} when {AOF_PATH} was \
+                 started after it"
+            ))),
+            Some((len, hash)) => Ok(if end_hash(len)? == hash {
+                OldLogEnd::Whole
+            } else {
+                OldLogEnd::Short(format!(
+                    "the last bytes of {AOF_PREV_PATH} before byte {len}, where it ended when \
+                     {AOF_PATH} was started after it, are not the ones written there"
+                ))
+            }),
+            None => Ok(OldLogEnd::Unrecorded),
+        },
+        None if first == 0 && rest.iter().any(|&b| b != 0) => Ok(OldLogEnd::Short(format!(
+            "the start of {AOF_PATH} never reached the disk, and records after it did"
+        ))),
+        None => Ok(OldLogEnd::Unrecorded),
+    }
+}
+
+/// [`old_log_end`] of `log` against `appendonly.aof.prev` on disk.
+fn old_log_end_on_disk(log: &[u8]) -> std::io::Result<OldLogEnd> {
+    let prev = std::fs::File::open(AOF_PREV_PATH)?;
+    let prev_len = prev.metadata()?.len();
+    old_log_end(log, prev_len, |len| hash_of_end_of(&prev, len))
+}
+
+/// Say, at a start, that the old log of a checkpoint that did not finish
+/// stops short of where the new log goes on from, and what is done.
+fn warn_of_short_old_log(why: &str) {
+    log_warn!(
+        "AOF: a checkpoint did not finish, and {AOF_PREV_PATH} on disk does not reach where \
+         {AOF_PATH} goes on from: {why}. The power failed, most likely, before the last writes \
+         of {AOF_PREV_PATH} were synced. The dataset is loaded up to the end of \
+         {AOF_PREV_PATH}, as a log cut short is, and the writes in {AOF_PATH}, which came \
+         after the ones lost, are not applied over the hole: {AOF_PATH} is kept aside, and \
+         starts again where {AOF_PREV_PATH} now ends"
+    );
+}
+
+/// Keep the log aside, its records not replayed: they come after the end of
+/// an old log that is not on disk (see [`OldLogEnd::Short`]).
+fn keep_log_after_short_old_log() -> std::io::Result<()> {
+    if let Some(name) = keep_aside(AOF_PATH)? {
+        sync_dir()?;
+        log_warn!(
+            "{}",
+            kept_warning(NewLogWhy::AfterShortOldLog, AOF_PATH, &name)
+        );
+    }
+    Ok(())
+}
+
+/// After the old log has been replayed alone, `prev` its replay, because
+/// the log `log` goes on from more of it than is on disk: the log is kept
+/// aside, the old log is cut after its last whole record, and the log starts
+/// again on it, with its own save number and the record of where the old
+/// log ends now. The next start loads the same, and what is written from
+/// here on goes on from it.
+///
+/// Stopped at any point, the next start does it again: the log still goes
+/// on from more of the old log than there is, and a log kept already is not
+/// kept again (see [`keep_aside`]).
+fn cut_at_old_log(log: &[u8], prev: &ReplayStats) -> std::io::Result<()> {
+    let generation = aof_delta_generation(log).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "the log has no header")
+    })?;
+    keep_log_after_short_old_log()?;
+    // A record cut short, or a transaction without its `EXEC`, was not
+    // replayed: cut off, so that nothing written after it follows half a
+    // record.
+    if prev.truncated_tail {
+        let old = std::fs::OpenOptions::new()
+            .write(true)
+            .open(AOF_PREV_PATH)?;
+        old.set_len(prev.valid_len)?;
+        sync_log(&old, true)?;
+    }
+    let old = std::fs::File::open(AOF_PREV_PATH)?;
+    let len = old.metadata()?.len();
+    let mut fresh = delta_header(generation).to_vec();
+    fresh.extend_from_slice(&old_log_end_record(len, hash_of_end_of(&old, len)?));
+    write_file_durably(AOF_PATH, &fresh)
+}
+
+// ── Syncs, as a test sees them ───────────────────────────────────────────────
+//
+// A test of a power failure needs to know what was on the disk: what was
+// synced, not what was written (`kill -9` keeps the page cache). With
+// `note-syncs` in `KIVIDB_TEST_FAILPOINTS`, every sync of a log notes, in
+// [`SYNC_NOTES`] in the data directory, the file (by inode) and its length
+// when the sync began, which the sync made durable; every sync of the data
+// directory, and every turn-over, a line too. Off, a sync costs one more
+// load and branch.
+
+/// Where the syncs are noted, one per line: `file <inode> <length>`, `dir`,
+/// `turned-over`.
+pub(crate) const SYNC_NOTES: &str = "synced-lengths.test";
+
+fn noting_syncs() -> bool {
+    failpoint_named("note-syncs")
+}
+
+fn note_sync(line: &str) {
+    use std::io::Write;
+    if let Ok(mut notes) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(SYNC_NOTES)
+    {
+        let _ = notes.write_all(format!("{line}\n").as_bytes());
+    }
+}
+
+/// Sync a log (`all`: its metadata as well, as `sync_all` does): see
+/// [`SYNC_NOTES`].
+fn sync_log(file: &std::fs::File, all: bool) -> std::io::Result<()> {
+    let noted = noting_syncs().then(|| file.metadata().ok()).flatten();
+    if all {
+        file.sync_all()?;
+    } else {
+        file.sync_data()?;
+    }
+    if let Some(meta) = noted {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            note_sync(&format!("file {} {}", meta.ino(), meta.len()));
+        }
+        #[cfg(not(unix))]
+        let _ = meta;
+    }
+    Ok(())
+}
+
 // ── Vector set quantization in the log ───────────────────────────────────────
 
 /// Follows a `VADD` whose options were kept; 1.2 skips it as unknown.
@@ -498,6 +778,12 @@ enum NewLogWhy {
     /// off. Its records may be in the dump, or in the log, or in neither
     /// (#368).
     FinishedBesideSaveWithAofOff,
+    /// At a start: the new log of a checkpoint that did not finish, whose
+    /// old log does not reach the end the new log recorded for it (a power
+    /// failure before the old log was synced), or whose own start, or name,
+    /// never reached the disk. Its records would come after a hole, and are
+    /// not replayed (#277).
+    AfterShortOldLog,
 }
 
 /// The warning for the log at `path`, kept as `name`. Whether its writes
@@ -550,6 +836,18 @@ fn kept_warning(why: NewLogWhy, path: &str, name: &str) -> String {
              (RESP, after a 16-byte header if it starts with KIVIDLT1) and send only those; \
              remove the file once it is not needed"
         ),
+        NewLogWhy::AfterShortOldLog => format!(
+            "AOF: {path} holds writes made after the last ones in {AOF_PREV_PATH} that reached \
+             the disk: the power failed before all of {AOF_PREV_PATH} was synced. Applied, they \
+             would follow a hole, a dataset no client ever saw, so the dataset is loaded up to \
+             the end of {AOF_PREV_PATH} on disk and {path} is not replayed, as a log cut short \
+             loses its last writes. {kept} None of its writes was reported synced (WAITAOF, \
+             appendfsync always): a sync of it waits for {AOF_PREV_PATH}'s. To apply them \
+             anyway, knowing that the writes between the two are lost, send them to the server \
+             (`tail -c +17 {name} | redis-cli --pipe`; a first record KIVIDB.AOF-OLD-LOG-END is \
+             refused as an unknown command and changes nothing); remove the file once it is not \
+             needed"
+        ),
         NewLogWhy::Older | NewLogWhy::AddedTo { .. } => {
             format!("AOF: {path} is older than dump.kdb and is not replayed. {kept} {apply}")
         }
@@ -573,11 +871,8 @@ fn keep_aside(path: &str) -> std::io::Result<Option<String>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let header = if aof_delta_generation(&read_head(path)).is_some() {
-        AOF_DELTA_HEADER_LEN as u64
-    } else {
-        0
-    };
+    // A header, and the record of where an old log ended, are no records.
+    let header = records_start(&read_head(path)) as u64;
     if len <= header {
         return Ok(None);
     }
@@ -715,7 +1010,7 @@ fn write_new_log(added: &[u8]) -> std::io::Result<std::fs::File> {
             .open(&tmp)?;
         file.write_all(&delta_header(generation))?;
         file.write_all(added)?;
-        file.sync_all()?;
+        sync_log(&file, true)?;
         std::fs::rename(&tmp, AOF_PATH)?;
         Ok(file)
     })();
@@ -1269,11 +1564,32 @@ pub const AOF_PREV_PATH: &str = "appendonly.aof.prev";
 /// Synced here, on a disk running behind, it held every write for seconds
 /// (#243).
 fn perform_turn_over(file: &mut std::fs::File) -> std::io::Result<OldLog> {
+    if noting_syncs() {
+        note_sync("turned-over");
+    }
     let moved = move_log_aside();
     // Whether or not it got all the way: the writer goes on in whatever file
     // has the log's name now, never in one that has been moved aside.
     let old = std::mem::replace(file, open_aof()?);
-    match moved? {
+    let moved = moved?;
+    // Before anything else is written to the new log. A record not written
+    // leaves a log that is replayed as logs were before the record: logged,
+    // and the turn-over goes on. Under `appendfsync always` a write that
+    // fails stops the server, this one as any other (see [`write_batch`]).
+    if let Err(e) = note_old_log_end(file) {
+        if fsync_always() {
+            sync_failed_under_always(
+                &format!("recording where {AOF_PREV_PATH} ends in {AOF_PATH}"),
+                &e,
+            );
+        }
+        log_warn!(
+            "AOF: where {AOF_PREV_PATH} ends could not be recorded in {AOF_PATH}: {e} — should \
+             the power fail before {AOF_PREV_PATH} is synced, a restart cannot check that it is \
+             complete before it replays {AOF_PATH}"
+        );
+    }
+    match moved {
         MovedAside::ToSync => {
             // With the log locked: turn-overs are numbered in the order made.
             let number = TURN_OVERS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1295,7 +1611,7 @@ fn finish_turn_over(old: OldLog) -> std::io::Result<()> {
     let synced = if injected_failure("turn-over-sync-fails") {
         Err(std::io::Error::other("failure injected by a test"))
     } else {
-        old.sync_data().and_then(|()| sync_dir())
+        sync_log(&old, false).and_then(|()| sync_dir())
     };
     match &synced {
         Ok(()) => old_log_synced(number),
@@ -1312,7 +1628,7 @@ fn finish_turn_over(old: OldLog) -> std::io::Result<()> {
 /// Sync the old log a turn-over moved aside, and the directory.
 fn sync_old_log() -> std::io::Result<()> {
     match std::fs::File::open(AOF_PREV_PATH) {
-        Ok(old) => old.sync_data()?,
+        Ok(old) => sync_log(&old, false)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
@@ -1445,10 +1761,19 @@ fn prepare_new_log(generation: u64) -> std::io::Result<()> {
         keep_finished_old_log()?;
         FINISHED_OLD_LOG_KEPT.store(true, Ordering::Relaxed);
     }
+    // Most of what the log will hold at the turn-over is in it now. Synced
+    // here, with nothing held, the sync of the old log after the turn-over
+    // has only what comes from here on to write, and the time in which a
+    // power failure can keep the new log's first records and lose the old
+    // one's last is that much shorter (#277). A failure is reported by that
+    // sync, which is the one that counts.
+    if let Ok(log) = std::fs::File::open(AOF_PATH) {
+        let _ = sync_log(&log, false);
+    }
     let mut fresh = std::fs::File::create(TURN_OVER_TMP)?;
     fresh.write_all(AOF_DELTA_MAGIC)?;
     fresh.write_all(&generation.to_le_bytes())?;
-    fresh.sync_all()
+    sync_log(&fresh, true)
 }
 
 /// What [`move_log_aside`] left to sync.
@@ -1498,16 +1823,13 @@ fn move_log_aside() -> std::io::Result<MovedAside> {
         // the new log has the name, these records are in both; the old log's
         // length is noted first, so that they are cut off it again rather
         // than replayed twice if this stops before then.
-        let records = if aof_delta_generation(&current).is_some() {
-            &current[AOF_DELTA_HEADER_LEN..]
-        } else {
-            &current[..]
-        };
+        // Its record of where the old log ended is not one of them.
+        let records = &current[records_start(&current)..];
         let mut old = std::fs::OpenOptions::new().append(true).open(prev)?;
         let before = old.metadata()?.len();
         write_file_durably(TURN_OVER_APPENDING, &before.to_le_bytes())?;
         old.write_all(records)?;
-        old.sync_data()?;
+        sync_log(&old, false)?;
         failpoint("turn-over-appended");
         std::fs::rename(TURN_OVER_TMP, AOF_PATH)?;
         sync_dir()?;
@@ -1550,7 +1872,7 @@ fn settle_turn_over() -> std::io::Result<()> {
             .open(AOF_PREV_PATH)?;
         if old.metadata()?.len() > before {
             old.set_len(before)?;
-            old.sync_all()?;
+            sync_log(&old, true)?;
         }
     }
     std::fs::remove_file(TURN_OVER_APPENDING)
@@ -1585,6 +1907,26 @@ fn recover_turn_over() {
         let done = if fresh {
             std::fs::rename(TURN_OVER_TMP, AOF_PATH)
         } else {
+            // A new log that holds records, whose name never reached the
+            // disk: its records were never reported synced (the directory
+            // is synced before any is), and come after the old log's,
+            // which may not all be there. Not replayed, and kept aside
+            // before the next turn-over writes over it.
+            match keep_aside(TURN_OVER_TMP) {
+                Ok(Some(name)) => {
+                    if let Err(e) = sync_dir() {
+                        fatal_persistence(&format!("{TURN_OVER_TMP} could not be kept aside: {e}"));
+                    }
+                    log_warn!(
+                        "{}",
+                        kept_warning(NewLogWhy::AfterShortOldLog, TURN_OVER_TMP, &name)
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => fatal_persistence(&format!(
+                    "{TURN_OVER_TMP}, which holds records, could not be kept aside: {e}"
+                )),
+            }
             let mut header = AOF_DELTA_MAGIC.to_vec();
             header.extend_from_slice(&read_generation().saturating_add(1).to_le_bytes());
             write_file_durably(AOF_PATH, &header)
@@ -1651,7 +1993,7 @@ fn write_file_durably(path: &str, bytes: &[u8]) -> std::io::Result<()> {
     {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        sync_log(&file, true)?;
     }
     std::fs::rename(&tmp, path)?;
     sync_dir()
@@ -1663,6 +2005,9 @@ fn sync_dir() -> std::io::Result<()> {
     #[cfg(unix)]
     {
         std::fs::File::open(".")?.sync_all()?;
+        if noting_syncs() {
+            note_sync("dir");
+        }
     }
     Ok(())
 }
@@ -1777,7 +2122,7 @@ fn sync_before_reply(file: &std::fs::File) {
         if OLD_LOG_UNSYNCED.load(Ordering::Acquire) != 0 {
             sync_old_log()?;
         }
-        file.sync_data()
+        sync_log(file, false)
     })();
     if let Err(e) = synced {
         sync_failed_under_always(&format!("the fsync of {AOF_PATH}"), &e);
@@ -1860,7 +2205,7 @@ fn do_fsync() {
         }
     }
 
-    if let Err(e) = file.sync_data() {
+    if let Err(e) = sync_log(&file, false) {
         log_throttled!(
             10,
             crate::loglevel::ERROR,
@@ -1902,7 +2247,7 @@ fn turn_over_aof(generation: u64) -> impl FnOnce() -> std::io::Result<()> {
         None => match move_log_aside()? {
             MovedAside::ToSync => {
                 if let Ok(old) = std::fs::File::open(AOF_PREV_PATH) {
-                    old.sync_data()?;
+                    sync_log(&old, false)?;
                 }
                 sync_dir()
             }
@@ -2025,6 +2370,9 @@ fn checkpoint_inner(
         // Before writes are held, and before the log is locked to turn it
         // over: it waits for the disk.
         prepare_new_log(generation)?;
+        // A test holds the checkpoint here to write records the old log has
+        // not synced by its turn-over, as a busy server would.
+        failpoint("turn-over-prepared");
     }
 
     // Between whole writes: a write is either in what is captured, with its
@@ -2177,8 +2525,15 @@ fn logs_as_saved() -> std::io::Result<LogsAtSave> {
         // Not synced, it is shorter after a power cut than recorded: read
         // as changed, it is replayed, as when nothing was recorded. Under
         // `appendfsync always` a failure is not passed over (see
-        // [`sync_failed_under_always`]).
-        if let Err(e) = log.file.sync_data()
+        // [`sync_failed_under_always`]). Not ahead of the old log of a
+        // turn-over not yet synced, as no sync of the log is (#277).
+        let seen = OLD_LOG_UNSYNCED.load(Ordering::Acquire);
+        let synced = if seen == 0 {
+            Ok(())
+        } else {
+            sync_old_log().map(|()| old_log_synced(seen))
+        };
+        if let Err(e) = synced.and_then(|()| sync_log(&log.file, false))
             && fsync_always()
         {
             sync_failed_under_always(&format!("the fsync of {AOF_PATH}"), &e);
@@ -2338,13 +2693,14 @@ fn read_saved() -> Option<Saved> {
     })
 }
 
-/// The first bytes of a log, enough for its header; empty if there is none.
+/// The first bytes of a log, enough for its header and the record of where
+/// an old log ended that may follow it; empty if there is none.
 fn read_head(path: &str) -> Vec<u8> {
     use std::io::Read;
     let mut head = Vec::new();
     if let Ok(file) = std::fs::File::open(path) {
         let _ = file
-            .take(AOF_DELTA_HEADER_LEN as u64)
+            .take((AOF_DELTA_HEADER_LEN + OLD_LOG_END_LEN) as u64)
             .read_to_end(&mut head);
     }
     head
@@ -2452,7 +2808,7 @@ impl DumpOnDisk {
             // one, unless it was added to after this dump was saved.
             (Some(log), true) if log < saved.number => {
                 if written_since_a_save_with_no_log(path, saved) {
-                    LogAge::AddedToFrom(AOF_DELTA_HEADER_LEN as u64)
+                    LogAge::AddedToFrom(records_start(&head) as u64)
                 } else {
                     match added_to_since(path, saved) {
                         Some(from) => LogAge::AddedToFrom(from),
@@ -2521,7 +2877,8 @@ fn written_since_a_save_with_no_log(path: &str, saved: &Saved) -> bool {
         return false;
     };
     logs[0].0 == 0
-        && std::fs::metadata(path).is_ok_and(|meta| meta.len() > AOF_DELTA_HEADER_LEN as u64)
+        && std::fs::metadata(path)
+            .is_ok_and(|meta| meta.len() > records_start(&read_head(path)) as u64)
 }
 
 /// Where what was added to the log at `path` since the dump of `saved` was
@@ -2584,12 +2941,21 @@ fn aof_delta_generation(buf: &[u8]) -> Option<u64> {
     buf[8..16].try_into().ok().map(u64::from_le_bytes)
 }
 
-/// Where the records of a log start: after its delta header, if it has one.
+/// Where the records of a log start: after its delta header, if it has one,
+/// and after the record of where the old log ended that follows it, if one
+/// does (see [`old_log_end_record`]).
 fn records_start(buf: &[u8]) -> usize {
-    if aof_delta_generation(buf).is_some() {
-        AOF_DELTA_HEADER_LEN
+    if aof_delta_generation(buf).is_none() {
+        return 0;
+    }
+    let recorded = buf[AOF_DELTA_HEADER_LEN..]
+        .get(..OLD_LOG_END_LEN)
+        .and_then(parse_one_command)
+        .is_some_and(|(cmd, used)| used == OLD_LOG_END_LEN && as_old_log_end(&cmd).is_some());
+    if recorded {
+        AOF_DELTA_HEADER_LEN + OLD_LOG_END_LEN
     } else {
-        0
+        AOF_DELTA_HEADER_LEN
     }
 }
 
@@ -3185,7 +3551,9 @@ pub fn replay_aof(
     let mut records = commands.into_iter().zip(live).peekable();
     while let Some((cmd, live)) = records.next() {
         // Read with the record before it, below.
-        if is_vset_quant_marker(&cmd) {
+        // Where an old log ended: read before the replay, if at all (see
+        // [`old_log_end`]).
+        if is_vset_quant_marker(&cmd) || is_old_log_end(&cmd) {
             continue;
         }
         // What is left of a transaction here is whole: its commands are
@@ -3430,6 +3798,9 @@ pub fn recover_local(
         // snapshot reached the disk: the old log, then the new one, on top of
         // the old snapshot. One that did finish only left the old log behind.
         let mut resumed_checkpoint = false;
+        // Of those, one whose old log does not reach where the new one goes
+        // on from (#277): the old log alone is replayed.
+        let mut cut_at_old_log_end = false;
         // What an older log had added to it after the dump was saved with the
         // AOF off, its name, and whether it is all of the log: it goes on
         // from the dump (see [`LogAge::AddedToFrom`]).
@@ -3486,22 +3857,48 @@ pub fn recover_local(
                     }
                 }
             } else if let Some(LogAge::AddedToFrom(from)) = prev_age {
-                // And the log goes on from what was added.
+                // And the log goes on from what was added, if the old log is
+                // all there (#277).
+                let end = old_log_end_on_disk(&buf).unwrap_or_else(|e| {
+                    fatal_persistence(&format!("{AOF_PREV_PATH} cannot be read: {e}"))
+                });
                 let prev = match std::fs::read(AOF_PREV_PATH) {
                     Ok(prev) => prev,
                     Err(e) => fatal_persistence(&format!("{AOF_PREV_PATH} cannot be read: {e}")),
                 };
                 let mut both = prev.get(from as usize..).unwrap_or_default().to_vec();
-                both.extend_from_slice(&buf[records_start(&buf)..]);
+                if let OldLogEnd::Short(why) = &end {
+                    warn_of_short_old_log(why);
+                    // Kept aside, and left with its header alone: the log
+                    // started again with what was added keeps none of it.
+                    let kept = keep_log_after_short_old_log()
+                        .and_then(|()| write_file_durably(AOF_PATH, &buf[..AOF_DELTA_HEADER_LEN]));
+                    if let Err(e) = kept {
+                        fatal_persistence(&format!(
+                            "{AOF_PATH}, which goes on from more of {AOF_PREV_PATH} than is on \
+                             disk, cannot be kept aside: {e}"
+                        ));
+                    }
+                } else {
+                    both.extend_from_slice(&buf[records_start(&buf)..]);
+                }
                 added = Some((AOF_PREV_PATH, true, both));
             } else {
-                log_warn!(
-                    "AOF: a checkpoint did not finish — replaying {AOF_PREV_PATH} and then \
-                     {AOF_PATH} on top of the snapshot it started from"
-                );
+                // The new log goes on from the old one only if the old one
+                // is all there (#277).
+                let end = old_log_end_on_disk(&buf).unwrap_or_else(|e| {
+                    fatal_persistence(&format!("{AOF_PREV_PATH} cannot be read: {e}"))
+                });
+                match &end {
+                    OldLogEnd::Short(why) => warn_of_short_old_log(why),
+                    _ => log_warn!(
+                        "AOF: a checkpoint did not finish — replaying {AOF_PREV_PATH} and then \
+                         {AOF_PATH} on top of the snapshot it started from"
+                    ),
+                }
                 resumed_checkpoint = true;
                 recovery.exact_dump = false;
-                if let Err(e) = replay_aof(
+                let replayed = replay_aof(
                     AOF_PREV_PATH,
                     store,
                     index_store,
@@ -3512,8 +3909,18 @@ pub fn recover_local(
                     compaction_tx,
                     repl_state,
                     dump_loaded,
-                ) {
-                    fatal_persistence(&format!("{AOF_PREV_PATH} cannot be replayed: {e}"));
+                );
+                let stats = replayed.unwrap_or_else(|e| {
+                    fatal_persistence(&format!("{AOF_PREV_PATH} cannot be replayed: {e}"))
+                });
+                if matches!(end, OldLogEnd::Short(_)) {
+                    if let Err(e) = cut_at_old_log(&buf, &stats) {
+                        fatal_persistence(&format!(
+                            "{AOF_PATH}, which goes on from more of {AOF_PREV_PATH} than is on \
+                             disk, cannot be kept aside and started again: {e}"
+                        ));
+                    }
+                    cut_at_old_log_end = true;
                 }
             }
         }
@@ -3582,7 +3989,14 @@ pub fn recover_local(
                 Err(e) => fatal_persistence(&format!("{AOF_PATH} cannot be read: {e}")),
             };
         }
-        if !left_out {
+        if cut_at_old_log_end {
+            // As the replay of a log would have: every index there is now,
+            // and the snapshot's graphs brought up to date by the walk.
+            recovery.index_names = crate::vector::index_names(index_store);
+            if dump_loaded {
+                recovery.hnsw_loaded = false;
+            }
+        } else if !left_out {
             if dump_loaded {
                 log_info!("Replaying {AOF_PATH} on top of the snapshot (writes since the dump)");
                 if aof_delta_generation(&buf).is_none() {
@@ -3594,7 +4008,7 @@ pub fn recover_local(
                 }
             }
             let empty_delta =
-                aof_delta_generation(&buf).is_some() && buf.len() <= AOF_DELTA_HEADER_LEN;
+                aof_delta_generation(&buf).is_some() && buf.len() <= records_start(&buf);
             if empty_delta {
                 // dump.kdb is the whole dataset; the log has nothing to add.
             } else {
@@ -3853,7 +4267,7 @@ pub fn recover_from_aof(
                     .open(AOF_PATH)
                     .and_then(|file| {
                         file.set_len(stats.valid_len)?;
-                        file.sync_all()
+                        sync_log(&file, true)
                     });
                 if let Err(e) = trimmed {
                     fatal_persistence(&format!(
@@ -4150,6 +4564,159 @@ mod kept_warning_tests {
             assert!(warning.contains("not in the dataset"), "{warning}");
             assert!(warning.contains(NAME), "{warning}");
         }
+    }
+}
+
+#[cfg(test)]
+mod old_log_end_tests {
+    use super::*;
+
+    fn set(key: &str) -> Vec<u8> {
+        format!("*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n$1\r\n1\r\n", key.len()).into_bytes()
+    }
+
+    /// An old log of `n` records, and a new log that goes on from it, with
+    /// the record of where it ends, and `after` records.
+    fn logs(n: usize, after: usize) -> (Vec<u8>, Vec<u8>) {
+        let mut prev = delta_header(4).to_vec();
+        for i in 0..n {
+            prev.extend_from_slice(&set(&format!("old:{i}")));
+        }
+        let len = prev.len() as u64;
+        let from = len.saturating_sub(OLD_LOG_END_EDGE) as usize;
+        let mut log = delta_header(5).to_vec();
+        log.extend_from_slice(&old_log_end_record(len, hash_of_end(&prev[from..])));
+        for i in 0..after {
+            log.extend_from_slice(&set(&format!("new:{i}")));
+        }
+        (prev, log)
+    }
+
+    /// [`old_log_end`] of `log` against `prev` as it is on disk.
+    fn judge(log: &[u8], prev: &[u8]) -> OldLogEnd {
+        old_log_end(log, prev.len() as u64, |len| {
+            let len = len as usize;
+            let from = len.saturating_sub(OLD_LOG_END_EDGE as usize);
+            Ok(hash_of_end(&prev[from..len]))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn the_record_is_one_fixed_size_record_no_client_can_send() {
+        let record = old_log_end_record(123_456, 0xfeed);
+        assert_eq!(record.len(), OLD_LOG_END_LEN);
+        let (cmd, used) = parse_one_command(&record).unwrap();
+        assert_eq!(used, OLD_LOG_END_LEN);
+        assert_eq!(as_old_log_end(&cmd), Some((123_456, 0xfeed)));
+        assert!(is_old_log_end(&cmd));
+        assert!(!crate::replication::is_write_command_bytes(&cmd[0]));
+        let record = old_log_end_record(u64::MAX, u64::MAX);
+        assert_eq!(record.len(), OLD_LOG_END_LEN);
+    }
+
+    #[test]
+    fn an_old_log_all_there_is_whole() {
+        for n in [0, 1, 300] {
+            let (prev, log) = logs(n, 3);
+            assert_eq!(judge(&log, &prev), OldLogEnd::Whole, "{n} records");
+            // Added to since (a later turn-over added a log's records to
+            // it): still there to the length recorded.
+            let mut more = prev.clone();
+            more.extend_from_slice(&set("later"));
+            assert_eq!(judge(&log, &more), OldLogEnd::Whole);
+        }
+    }
+
+    #[test]
+    fn an_old_log_cut_short_is_short_however_little_is_missing() {
+        let (prev, log) = logs(300, 3);
+        for cut in [1, 2, 17, prev.len() - 16, prev.len()] {
+            let short = &prev[..prev.len() - cut];
+            assert!(
+                matches!(judge(&log, short), OldLogEnd::Short(_)),
+                "cut {cut} bytes"
+            );
+        }
+        // And with nothing after the record in the log: the record says the
+        // old log is short, and the log is started again all the same.
+        let (prev, log) = logs(10, 0);
+        assert!(matches!(
+            judge(&log, &prev[..prev.len() - 1]),
+            OldLogEnd::Short(_)
+        ));
+    }
+
+    #[test]
+    fn an_old_log_whose_last_bytes_are_zeros_is_short() {
+        // The length reached the disk, the data did not.
+        let (prev, log) = logs(300, 3);
+        for zeroed in [1, 40, 4096, 9000] {
+            let mut damaged = prev.clone();
+            let from = damaged.len() - zeroed;
+            damaged[from..].fill(0);
+            assert!(
+                matches!(judge(&log, &damaged), OldLogEnd::Short(_)),
+                "{zeroed} zeros"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_log_whose_start_never_reached_the_disk_is_short() {
+        let (prev, log) = logs(300, 100);
+        let mut damaged = log.clone();
+        damaged[AOF_DELTA_HEADER_LEN..AOF_DELTA_HEADER_LEN + OLD_LOG_END_LEN + 40].fill(0);
+        assert!(matches!(judge(&damaged, &prev), OldLogEnd::Short(_)));
+        // Zeros to the end, nothing after them: nothing to keep from the
+        // new log, which its replay cuts off as a torn tail.
+        let mut zeros = log[..AOF_DELTA_HEADER_LEN].to_vec();
+        zeros.extend_from_slice(&[0; 300]);
+        assert_eq!(judge(&zeros, &prev), OldLogEnd::Unrecorded);
+    }
+
+    #[test]
+    fn a_record_torn_at_the_end_of_the_log_is_no_record() {
+        let (prev, log) = logs(300, 0);
+        for keep in [1, 20, OLD_LOG_END_LEN - 1] {
+            let torn = &log[..AOF_DELTA_HEADER_LEN + keep];
+            assert_eq!(judge(torn, &prev), OldLogEnd::Unrecorded, "{keep} bytes");
+            assert_eq!(records_start(torn), AOF_DELTA_HEADER_LEN);
+        }
+    }
+
+    #[test]
+    fn a_log_without_the_record_is_judged_as_before() {
+        // As 1.2.2 and earlier write them, and an empty one.
+        let (prev, _) = logs(300, 0);
+        let mut log = delta_header(5).to_vec();
+        assert_eq!(judge(&log, &prev), OldLogEnd::Unrecorded);
+        log.extend_from_slice(&set("new"));
+        assert_eq!(judge(&log, &prev), OldLogEnd::Unrecorded);
+        assert_eq!(judge(&log, &prev[..20]), OldLogEnd::Unrecorded);
+        assert_eq!(judge(&set("legacy"), &prev), OldLogEnd::Unrecorded);
+    }
+
+    #[test]
+    fn the_records_of_a_log_start_after_the_record() {
+        let (_, log) = logs(3, 2);
+        let start = records_start(&log);
+        assert_eq!(start, AOF_DELTA_HEADER_LEN + OLD_LOG_END_LEN);
+        assert!(log[start..].starts_with(&set("new:0")));
+        assert_eq!(records_start(&log[..start]), start);
+        let plain = delta_header(5);
+        assert_eq!(records_start(&plain), AOF_DELTA_HEADER_LEN);
+        assert_eq!(records_start(&set("legacy")), 0);
+    }
+
+    #[test]
+    fn a_replay_passes_the_record_over() {
+        let (_, log) = logs(3, 2);
+        let (commands, consumed) = parse_aof_commands(&log[AOF_DELTA_HEADER_LEN..]);
+        assert_eq!(consumed, log.len() - AOF_DELTA_HEADER_LEN);
+        assert_eq!(commands.iter().filter(|c| is_old_log_end(c)).count(), 1);
+        assert_eq!(unfinished_transaction(&commands), None);
+        assert!(live_after_flushes(&commands).iter().all(|&live| live));
     }
 }
 

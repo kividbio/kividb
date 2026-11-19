@@ -791,7 +791,11 @@ fn aof_records(log: &[u8]) -> Vec<Vec<String>> {
             args.push(String::from_utf8_lossy(arg).into_owned());
             at += len + 2;
         }
-        out.push(args);
+        // Where the old log ended, at the start of a turn-over's new log:
+        // no write.
+        if args.first().map(String::as_str) != Some("KIVIDB.AOF-OLD-LOG-END") {
+            out.push(args);
+        }
     }
     out
 }
@@ -1070,7 +1074,8 @@ fn aof_rewrite_keeps_each_set_as_stored() {
     for round in 0..3 {
         rewrite(&mut c);
         assert!(aof_of(&server).is_empty(), "round {round}");
-        assert!(size(&server) <= 16, "round {round}: {}", size(&server));
+        // The header, and the record of where the old log ended.
+        assert!(size(&server) <= 16 + 83, "round {round}: {}", size(&server));
         server.kill();
         server.restart();
         c = server.conn();

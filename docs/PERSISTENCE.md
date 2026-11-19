@@ -47,6 +47,63 @@ If a checkpoint is stopped part way (a crash, a kill), the previous log is
 kept as `appendonly.aof.prev`. At the next start it is replayed, and then
 the new log, on top of the snapshot the checkpoint started from.
 
+### The old log is complete before the new one is replayed
+
+The old log's last writes and the new log's first ones reach the disk
+through separate syncs. The server never syncs the new log before the old
+one, but the operating system writes pages back to the disk on its own, in
+any order, so a power failure before the old log's sync can leave the new
+log's first writes on disk and lose the old log's last ones.
+
+So the new log opens, after its header, with a record of where the old log
+ended when the log was turned over: its length, and a hash of its last
+4 KiB (`KIVIDB.AOF-OLD-LOG-END`, 83 bytes, written with the log locked, at
+the cost of one small write). A restart replays the new log only after the
+old one is complete to its recorded length, with those last bytes. If it is
+not (the power failed before the old log was synced), the restart:
+
+* replays the old log up to its last whole record, as it would a log cut
+  short, and not the new log: the dataset is what the writes up to there
+  made, never later writes without the earlier ones;
+* logs `[WARN] AOF: a checkpoint did not finish, and appendonly.aof.prev on
+  disk does not reach where appendonly.aof goes on from: ...`, and why;
+* keeps the new log as `superseded.<ms>.<n>.appendonly.aof` (see [Logs kept
+  aside](#logs-kept-aside)), with a warning that says how to apply its
+  writes by hand, knowing that the ones between the two logs are lost;
+* starts `appendonly.aof` again after the old log, which it cuts after its
+  last whole record, so the next start loads the same dataset and the writes
+  made from then on follow it.
+
+None of the writes in such a new log was reported synced: under
+`appendfsync always` a reply, and `WAITAOF` under any setting, waits for a
+sync of the new log, and that sync first syncs the old log and the
+directory. What is lost is writes that `everysec` (or `no`) allows a power
+failure to lose, and with `always`, writes not yet acknowledged.
+
+The same holds when the new log's first page never reached the disk while
+later pages did (zeros after its header, records after them): its records
+are not replayed, and it is kept aside. A new log whose name never reached
+the disk (`appendonly.aof.rewrite.tmp`, holding records, beside an
+`appendonly.aof.prev` and no log) is kept aside too, and the old log
+replayed. To make that window short, the checkpoint syncs the log just
+before it turns it over, with nothing held: the old log's last sync then
+has only the writes made in between to write.
+
+As for any log cut short, `aof-load-truncated no` changes nothing (the
+server warns that it has no effect): the restart loads what is there, logs
+what it leaves out, and keeps it.
+
+A log written by 1.2.2 or earlier has no such record, and loads as it did
+there: the old log, then the new one. Going back to 1.2.x after this
+version has turned a log over: 1.2.x replays the record as an unknown
+command and passes over it (its start logs `1 AOF command(s) failed to
+apply and were skipped`), and loads every write. It does not check where
+the old log ended, and does not count a log that holds nothing but the
+record as empty, so a node stopped cleanly does not go on from its saved
+replication point: a replica asks its master for a full sync, and a
+master's replicas are sent everything again. The log on disk is not a Redis AOF (it starts with `KIVIDLT1`), and
+nothing about Redis tools changes.
+
 The snapshot such a checkpoint, or a save with the AOF off, was writing is
 left in `dir` as `dump.kdb.<pid>.<n>.tmp`, as big as `dump.kdb`. Nothing
 reads it. The next start removes those files, once it holds the data

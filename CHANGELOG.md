@@ -80,6 +80,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   In a cluster of more than one master, `FT.HYBRID` is now refused, where
   1.2.x answered from the one node's slots without saying so.
+- **The AOF's new log opens with a record of where the old log ended
+  (#277).** A log written by 1.2.2 or earlier has none and loads as before.
+  Going back to 1.2.x after a checkpoint of this version, 1.2.x replays the
+  record as an unknown command and passes over it (`1 AOF command(s) failed
+  to apply and were skipped`), loading every write, but it counts a log
+  holding only the record as written to: a node stopped cleanly then does
+  not go on from its saved replication point (a replica asks for a full
+  sync). A `SAVE` or `BGREWRITEAOF` under 1.2.x writes a log without it.
 - **nodes.conf keeps each node's shard id (#563)**, after its address and
   hostname as Redis writes it: `ip:port@cport,<hostname>,shard-id=<id>`.
   An earlier release reading the file takes `<hostname>,shard-id=<id>` for
@@ -463,6 +471,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A restart replays the new log of an unfinished checkpoint only after
+  the old one is complete to its recorded length (#277).** A turn-over's
+  new `appendonly.aof` now opens with a record of where the old log
+  (`appendonly.aof.prev`) ended: its length and a hash of its last 4 KiB.
+  When a power failure leaves the old log short of that, the restart
+  replays the old log up to its last whole record and not the new log, so
+  the dataset is always a beginning of the writes; it says so in a
+  `[WARN]`, keeps the new log aside as `superseded.<ms>.<n>.appendonly.aof`
+  with instructions, and starts the log again after the old one. None of
+  the writes left out had been reported synced: a sync of the new log
+  (under `appendfsync always`, or for `WAITAOF`) first syncs the old one.
+  The checkpoint also syncs the log just before it turns it over, so the
+  old log's last sync has little left to write. See "The old log is
+  complete before the new one is replayed" in docs/PERSISTENCE.md.
 - **With `lua-parallel-scripts` on, `KEYS` and `SCAN` no longer stop
   every connection (#772).** So that a walk of
   the keyspace never finds a script running beside others part-way
