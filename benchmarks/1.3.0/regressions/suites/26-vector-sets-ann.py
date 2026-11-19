@@ -15,8 +15,9 @@ SHA-256 checked):
             dimensions, cosine
 
 Configurations: the first 100,000 vectors of each (`glove100_100k`,
-`laion768_100k`), and the first 1,000,000 with FULL=1 (`glove100_1m`,
-`laion768_1m`; set SUITE_TIMEOUT=7200 for them). Queries: the first 500 of
+`laion768_100k`), and the first 1,000,000 with VSET_1M=1 (`glove100_1m`,
+`laion768_1m`; not with FULL=1: Redis loads them at under 1,000 VADD/s, and
+Garnet runs in the same window, so they need SUITE_TIMEOUT=7200). Queries: the first 500 of
 the dataset's test vectors. Ground truth: the exact top 10 by cosine over the
 vectors loaded (not the dataset's own, which is over all of them), computed
 with numpy and cached beside the dataset.
@@ -51,17 +52,21 @@ Rows, per configuration:
                              client processes, asyncio; 2 s warm-up, 10 s)
   vsim_p99_ms_c1/_c16/_c100  their p99
 
-Garnet: in the `redis` engine's run the suite starts $GARNET_SERVER (the
-GarnetServer of its latest release, with `--enable-vector-set-preview`;
-GARNET_ARGS adds to `--index 1g --memory 64g`, the 1.2.0 suite's flags),
-measures it the same way and emits its rows as `garnet_<row>`, shown, never
-gated. Garnet's vector sets are a preview (DiskANN, `EF` is its L_search).
-GARNET_SERVER=none leaves Garnet out, for a run on a machine without it.
+Garnet: in the `redis` engine's run the suite starts $GARNET_SERVER, the
+GarnetServer of Garnet v2.2.13 (`linux-x64-based.tar.xz`, SHA-256
+23a4f19d5ffd1c533f1db7cc9ef4c00a5f811aa2914544cc819fd23215fa557c, on .NET
+10), with `--enable-vector-set-preview` (GARNET_ARGS adds to `--index 1g
+--memory 64g`, the 1.2.0 suite's flags), and measures it the same way. Its
+numbers go into `raw["garnet"]`, not into rows: compare.py wants every row
+from every engine. Garnet's vector sets are a preview (DiskANN, `EF` is its
+L_search). GARNET_SERVER=none leaves Garnet out, for a run on a machine
+without it; anything else that is not an executable fails the suite before
+it loads anything.
 
 Gates (candidate): against Redis only where KiviDB is ahead, as #627 asks:
 `vadd_per_s` at least 10x Redis's and `bytes_per_vector` at most 0.8x (no
-graph to build or hold; measured off the VM at 135-150x and 0.23-0.57x, see
-README). recall_at_10 at least TARGET. The q/s rows hold against the
+graph to build or hold; measured off the VM at 120-180x and 0.23-0.57x).
+recall_at_10 at least TARGET. The q/s rows hold against the
 recorded candidate within 25 % (suite 09's tolerance for VSIM q/s); KiviDB
 loses them to Redis's HNSW search (4-40x at 100,000 vectors, more at 1M:
 #710), which the rows record. p99 is shown.
@@ -87,16 +92,18 @@ from ports import free_port  # noqa: E402
 DATASETS = {
     "glove100": {
         "file": "glove-100-angular.hdf5",
-        "url": "http://ann-benchmarks.com/glove-100-angular.hdf5",
+        "url": "https://ann-benchmarks.com/glove-100-angular.hdf5",
         "sha256": "544af1d5e84e112cd4749571dcfd8ca109818a572f850af75a3a09e093a953c4",
     },
     "laion768": {
         "file": "laion-img-emb-768-1M-cosine.hdf5",
-        "url": "http://benchmarks.redislabs.s3.amazonaws.com/vecsim/laion400m/laion-img-emb-768-1M-cosine.hdf5",
+        # Path-style: the bucket's name has a dot, which the virtual-host
+        # name's certificate does not cover.
+        "url": "https://s3.amazonaws.com/benchmarks.redislabs/vecsim/laion400m/laion-img-emb-768-1M-cosine.hdf5",
         "sha256": "86376b43c51bbdd484b6ab58365e34d9ee7568d0b94af98ee37535e1585ba753",
     },
 }
-# name: (dataset, vectors, FULL=1 only)
+# name: (dataset, vectors, VSET_1M=1 only)
 CONFIGS = {
     "glove100_100k": ("glove100", 100_000, False),
     "laion768_100k": ("laion768", 100_000, False),
@@ -120,7 +127,8 @@ WARMUP = 2.0
 VADD_VS_REDIS = 0.1
 MEMORY_VS_REDIS = 0.8
 
-S = Suite("26-vector-sets-ann", [Config(n, full_only=f) for n, (_, _, f) in CONFIGS.items()])
+BIG = os.environ.get("VSET_1M", "0") not in ("", "0")
+S = Suite("26-vector-sets-ann", [Config(n) for n, (_, _, big) in CONFIGS.items() if BIG or not big])
 
 # Set before the client processes fork, so they share them.
 DATA = QUERIES = None
@@ -151,7 +159,9 @@ def fetch(name):
     path = os.path.join(dataset_dir(), ds["file"])
     if not os.path.exists(path):
         part = path + ".part"
-        with urllib.request.urlopen(ds["url"], timeout=60) as r, open(part, "wb") as f:
+        # ann-benchmarks.com answers urllib's own User-Agent with 403.
+        req = urllib.request.Request(ds["url"], headers={"User-Agent": "kividb-regress"})
+        with urllib.request.urlopen(req, timeout=60) as r, open(part, "wb") as f:
             shutil.copyfileobj(r, f, 1 << 20)
         os.replace(part, path)
     got = sha256_of(path)
@@ -282,7 +292,11 @@ def measure(port, pid, truth, extra=()):
     TARGET_PORT, VADD_EXTRA = port, tuple(extra)
     c = redis.Redis(port=port, socket_timeout=600)
     c.delete(KEY)
+    # A server just started (Garnet's .NET runtime) gives some of its start-up
+    # memory back in its first seconds.
+    time.sleep(3)
     mem0, rss0 = used_memory(c), rss_bytes(pid)
+    phase = {}
     t0 = time.perf_counter()
     with mp.get_context("fork").Pool(LOAD_CLIENTS) as pool:
         errors = [e for e in pool.map(load_worker, range(LOAD_CLIENTS)) if e]
@@ -299,7 +313,9 @@ def measure(port, pid, truth, extra=()):
         vinfo = dict(zip(vinfo[0::2], vinfo[1::2]))
     dec = lambda v: v.decode() if isinstance(v, bytes) else v  # noqa: E731
     raw = {"vinfo": {dec(k): dec(v) for k, v in vinfo.items()}, "load_s": round(load_s, 2),
-           "vadd_extra": list(extra), "ladder": []}
+           "vadd_extra": list(extra), "ladder": [], "phase_s": phase}
+    phase["load"] = round(load_s, 1)
+    t = time.perf_counter()
 
     ef, recall = None, 0.0
     for ef in EFS:
@@ -307,6 +323,7 @@ def measure(port, pid, truth, extra=()):
         raw["ladder"].append([ef, round(recall, 4)])
         if recall >= TARGET:
             break
+    phase["ladder"] = round(time.perf_counter() - t, 1)
     rows = {
         "vadd_per_s": len(DATA) / load_s,
         "bytes_per_vector": None if mem0 is None else (mem1 - mem0) / len(DATA),
@@ -314,23 +331,32 @@ def measure(port, pid, truth, extra=()):
         "ef": ef,
         "recall_at_10": recall,
     }
+    t = time.perf_counter()
     for n in CLIENTS:
         qps, p99 = query_cell(n, ef)
         rows["vsim_qps_c%d" % n], rows["vsim_p99_ms_c%d" % n] = qps, p99
+    phase["queries"] = round(time.perf_counter() - t, 1)
+    t = time.perf_counter()
     c.delete(KEY)
+    phase["delete"] = round(time.perf_counter() - t, 1)
     return rows, raw
 
 
 # ── Garnet ───────────────────────────────────────────────────────────────────
 
-def garnet(truth):
-    """Garnet measured beside Redis -> (rows, raw), or (None, why not)."""
-    import redis
+def garnet_binary():
+    """$GARNET_SERVER, or None for GARNET_SERVER=none; anything else fails."""
     binary = os.environ.get("GARNET_SERVER", "")
     if binary == "none":
-        return None, "GARNET_SERVER=none"
+        return None
     if not binary or not os.access(binary, os.X_OK):
         raise RuntimeError("$GARNET_SERVER (GarnetServer, or none) is not set to an executable")
+    return binary
+
+
+def garnet(binary, truth):
+    """Garnet measured beside Redis -> its rows and raw, for raw["garnet"]."""
+    import redis
     port = free_port()
     workdir = tempfile.mkdtemp(prefix="kividb-regress-garnet.")
     cmd = [binary, "--port", str(port), "--bind", "127.0.0.1", "--enable-vector-set-preview",
@@ -358,7 +384,8 @@ def garnet(truth):
         rows, raw = measure(port, proc.pid, truth, extra=("XDISTANCE_METRIC", "COSINE"))
         raw["server"] = {k: v for k, v in server.items() if "version" in k}
         raw["cmd"] = cmd
-        return rows, raw
+        raw["rows"] = rows
+        return raw
     finally:
         proc.terminate()
         try:
@@ -374,32 +401,27 @@ def garnet(truth):
 
 # ── rows ─────────────────────────────────────────────────────────────────────
 
-def emit(ctx, rows, prefix="", gated=True):
+def emit(ctx, rows):
     note = None if rows["recall_at_10"] >= TARGET else "recall %.3f under %.2f at EF %d" % (
         rows["recall_at_10"], TARGET, EFS[-1])
-
-    def g(gates):
-        return gates if gated else info()
-
-    ctx.emit(prefix + "vadd_per_s", rows["vadd_per_s"], "VADD/s", "higher",
-             gate=g([THROUGHPUT, vs_redis(VADD_VS_REDIS)]))
-    if rows["bytes_per_vector"] is not None:
-        ctx.emit(prefix + "bytes_per_vector", rows["bytes_per_vector"], "B", "lower",
-                 gate=g([MEMORY, vs_redis(MEMORY_VS_REDIS)]))
-    ctx.emit(prefix + "rss_per_vector", rows["rss_per_vector"], "B", "lower", gate=info())
-    ctx.emit(prefix + "ef", rows["ef"], "EF", "lower", gate=info(), note=note)
-    ctx.emit(prefix + "recall_at_10", rows["recall_at_10"], "ratio", "higher",
-             gate=g(bound(min=TARGET)), note=note)
+    ctx.emit("vadd_per_s", rows["vadd_per_s"], "VADD/s", "higher",
+             gate=[THROUGHPUT, vs_redis(VADD_VS_REDIS)])
+    ctx.emit("bytes_per_vector", rows["bytes_per_vector"], "B", "lower",
+             gate=[MEMORY, vs_redis(MEMORY_VS_REDIS)])
+    ctx.emit("rss_per_vector", rows["rss_per_vector"], "B", "lower", gate=info())
+    ctx.emit("ef", rows["ef"], "EF", "lower", gate=info(), note=note)
+    ctx.emit("recall_at_10", rows["recall_at_10"], "ratio", "higher", gate=bound(min=TARGET), note=note)
     for n in CLIENTS:
-        ctx.emit(prefix + "vsim_qps_c%d" % n, rows["vsim_qps_c%d" % n], "q/s", "higher",
-                 gate=g(rel(25)), note=note)
-        ctx.emit(prefix + "vsim_p99_ms_c%d" % n, rows["vsim_p99_ms_c%d" % n], "ms", "lower",
+        ctx.emit("vsim_qps_c%d" % n, rows["vsim_qps_c%d" % n], "q/s", "higher", gate=rel(25), note=note)
+        ctx.emit("vsim_p99_ms_c%d" % n, rows["vsim_p99_ms_c%d" % n], "ms", "lower",
                  gate=jitter(info()), note=note)
 
 
 @S.run
 def run(ctx):
     global DATA, QUERIES
+    # Before anything loads: a run that cannot start Garnet fails at once.
+    garnet_bin = garnet_binary()
     name, n, _ = CONFIGS[ctx.config.name]
     n = scaled(n, step=2000)
     DATA, QUERIES, truth = load_data(name, n)
@@ -410,10 +432,7 @@ def run(ctx):
     ctx.raw.update(raw)
     emit(ctx, rows)
     if ctx.engine == "redis":
-        g_rows, g_raw = garnet(truth)
-        ctx.raw["garnet"] = g_raw
-        if g_rows is not None:
-            emit(ctx, g_rows, prefix="garnet_", gated=False)
+        ctx.raw["garnet"] = garnet(garnet_bin, truth) if garnet_bin else "GARNET_SERVER=none"
 
 
 if __name__ == "__main__":
