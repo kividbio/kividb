@@ -400,10 +400,14 @@ async fn park_blocking_uring(
         crate::stats::TOTAL_NET_OUTPUT_BYTES
             .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
         crate::stats::record_write();
-        let _w = write_guard.lock().await;
         // The client is read while it waits, as the connection's own write
-        // reads it (#865).
-        let write = std::pin::pin!(stream.write_all(payload));
+        // reads it (#865): while the write lock is held by the task that
+        // writes pushes (a subscriber's messages, tracking's invalidations)
+        // too, which waits for the client to read them.
+        let write = std::pin::pin!(async {
+            let _w = write_guard.lock().await;
+            stream.write_all(payload).await
+        });
         let (res, mut returned) = read_while_writing(
             write,
             watch,
@@ -416,7 +420,6 @@ async fn park_blocking_uring(
             limit,
         )
         .await;
-        drop(_w);
         returned.clear();
         *out_buf = returned;
         if res.is_err() {
@@ -706,6 +709,116 @@ fn recv_into(fd: std::os::fd::RawFd, carried: &mut Vec<u8>) -> std::io::Result<u
     Ok(n as usize)
 }
 
+/// What a [`send_now`] holds until the kernel is done with it: the buffer,
+/// and the stream, so that its descriptor stays open (and its number is not
+/// reused) for as long as the send may still be submitted.
+struct SendNow {
+    _stream: Rc<tokio_uring::net::TcpStream>,
+    buf: Vec<u8>,
+}
+
+struct SendNowOutput;
+
+impl tokio_uring::OneshotOutputTransform for SendNowOutput {
+    type Output = (std::io::Result<usize>, Vec<u8>);
+    type StoredData = SendNow;
+
+    fn transform_oneshot_output(self, data: SendNow, cqe: io_uring::cqueue::Entry) -> Self::Output {
+        let res = if cqe.result() >= 0 {
+            Ok(cqe.result() as usize)
+        } else {
+            Err(std::io::Error::from_raw_os_error(-cqe.result()))
+        };
+        (res, data.buf)
+    }
+}
+
+/// One uring `send` of `buf` that does not wait for room in the socket
+/// (`MSG_DONTWAIT`): how much of it went, or `WouldBlock` if none could.
+/// Never parked in the kernel: done when the ring is next entered.
+///
+/// A batch of replies goes this way first, and nearly always all of it
+/// fits. Only a socket that is full makes the connection read on while it
+/// writes the rest (#865): a read submitted with every write, as the loop
+/// did before, reached the kernel before the client could have answered
+/// the replies it goes with, so the kernel parked it on every turn and woke
+/// the thread for it later, where a read submitted a turn later finds the
+/// next request there already. That was 10 % of the throughput of plain,
+/// unpipelined commands on many connections.
+async fn send_now(
+    stream: &Rc<tokio_uring::net::TcpStream>,
+    buf: Vec<u8>,
+) -> (std::io::Result<usize>, Vec<u8>) {
+    use std::os::fd::AsRawFd;
+    // A batch over 4 GiB goes in parts: the first is a short send.
+    let len = buf.len().min(u32::MAX as usize);
+    #[cfg(debug_assertions)]
+    let len = match test_send_now() {
+        TestSend::As => len,
+        TestSend::Short => (len / 2).max(1),
+        TestSend::None => return (Err(std::io::ErrorKind::WouldBlock.into()), buf),
+        TestSend::Interrupted => return (Err(std::io::ErrorKind::Interrupted.into()), buf),
+    };
+    let sqe = io_uring::opcode::Send::new(
+        io_uring::types::Fd(stream.as_raw_fd()),
+        buf.as_ptr(),
+        len as u32,
+    )
+    .flags(libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+    .build();
+    tokio_uring::UnsubmittedOneshot::new(
+        SendNow {
+            _stream: Rc::clone(stream),
+            buf,
+        },
+        SendNowOutput,
+        sqe,
+    )
+    .submit()
+    .await
+}
+
+/// Debug builds only, for tests: what `send_now` does with its next batch.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy)]
+enum TestSend {
+    /// Sends it, as a release build does.
+    As,
+    /// Sends half of it at most: a short send.
+    Short,
+    /// Sends none of it: `WouldBlock`.
+    None,
+    /// Sends none of it: `Interrupted`.
+    Interrupted,
+}
+
+/// `KIVIDB_TEST_SEND_NOW`, a comma-separated cycle of `as`, `short`, `none`
+/// and `interrupted` that the batches of every connection take in turn, so
+/// that a test meets each way a send without waiting can end, wherever the
+/// kernel's socket buffers stand. Unset: every batch `as`.
+#[cfg(debug_assertions)]
+fn test_send_now() -> TestSend {
+    static CYCLE: std::sync::OnceLock<Vec<TestSend>> = std::sync::OnceLock::new();
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let cycle = CYCLE.get_or_init(|| {
+        std::env::var("KIVIDB_TEST_SEND_NOW")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| match s.trim() {
+                "as" => Some(TestSend::As),
+                "short" => Some(TestSend::Short),
+                "none" => Some(TestSend::None),
+                "interrupted" => Some(TestSend::Interrupted),
+                _ => None,
+            })
+            .collect()
+    });
+    if cycle.is_empty() {
+        return TestSend::As;
+    }
+    cycle[NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % cycle.len()]
+}
+
 /// `write`, a batch of replies being written, with what the client sends
 /// meanwhile read into `carried`, to be run after it (#865), as
 /// `server::read_while_writing` does on the tokio loop: a client that sends
@@ -714,15 +827,13 @@ fn recv_into(fd: std::os::fd::RawFd, carried: &mut Vec<u8>) -> std::io::Result<u
 /// were written, each side would wait for the other for good. Past
 /// `client-query-buffer-limit` or `limit`, the socket is shut down, which
 /// ends the write with an error, and the connection with it.
-async fn read_while_writing(
-    mut write: std::pin::Pin<
-        &mut dyn std::future::Future<Output = tokio_uring::BufResult<(), Vec<u8>>>,
-    >,
+async fn read_while_writing<T>(
+    mut write: std::pin::Pin<&mut dyn std::future::Future<Output = T>>,
     watch: &PeerWatch,
     read_ahead: crate::server::ReadAhead<'_>,
     activity: &crate::client_registry::Activity,
     mut limit: crate::server::HardLimit,
-) -> tokio_uring::BufResult<(), Vec<u8>> {
+) -> T {
     let mut reading = true;
     loop {
         tokio::select! {
@@ -3410,14 +3521,44 @@ pub async fn handle_client(
             if shown {
                 activity.set_reply_output(spare_buf.len());
             }
-            let _w = write_guard.lock().await;
+            let _w = match write_guard.try_lock() {
+                Ok(w) => w,
+                // The task that writes pushes (a subscriber's messages,
+                // tracking's invalidations) has the socket, and waits for
+                // the client to read them. The client is read meanwhile, as
+                // while the connection's own replies wait (#865): one that
+                // sends a pipeline before it reads would otherwise wait for
+                // the connection, and the connection for it, for good. Not
+                // when this turn hands the connection on: its bytes are the
+                // replication link's then.
+                Err(_) if connection_handoff.is_none() => {
+                    let limit = crate::server::HardLimit::new(
+                        pubsub.limits(),
+                        subscriptions.is_some(),
+                        spare_buf.len() + carried.len() - carried_from + unpresented,
+                        client_id,
+                    );
+                    let lock = std::pin::pin!(write_guard.lock());
+                    Box::pin(read_while_writing(
+                        lock,
+                        &peer_watch,
+                        crate::server::ReadAhead {
+                            carried: &mut carried,
+                            carried_from,
+                            held_elsewhere: parse_buf.len() - parse_start,
+                        },
+                        &activity,
+                        limit,
+                    ))
+                    .await
+                }
+                Err(_) => write_guard.lock().await,
+            };
             debug_assert!(early.is_none(), "a read in flight before this turn's write");
             let waiting = spare_buf.len();
             let (res, returned) = match write_within {
-                // The read the next turn makes, submitted before this write so
-                // that the two reach the kernel together (#865). If it finishes
-                // first, the client is sending while its replies wait, and is
-                // read on while they are written. Not when this turn ends the
+                // Sent at once, if the socket has room for it all, as it
+                // nearly always has (`send_now`). Not when this turn ends the
                 // connection or hands it on, nor while there is still read
                 // ahead to run — whether still in `carried` or already handed
                 // to `parse_buf` but not yet offered, since what the early
@@ -3428,46 +3569,80 @@ pub async fn handle_client(
                     && shutdown_wait.is_none()
                     && connection_handoff.is_none() =>
                 {
-                    if parse_buf.capacity().saturating_sub(parse_buf.len()) < READ_MIN {
-                        parse_buf.reserve(READ_BUFFER);
-                    }
-                    early_from = parse_buf.len();
-                    early.set(Some(
-                        reader.read(std::mem::take(&mut parse_buf).slice(early_from..)),
-                    ));
-                    let mut write = std::pin::pin!(stream.write_all(spare_buf));
-                    let read = early.as_mut().as_pin_mut().expect("submitted above");
-                    tokio::select! {
-                        biased;
-                        written = &mut write => written,
-                        (got, buffer) = read => {
-                            early.set(None);
-                            parse_buf = buffer.into_inner();
-                            match got {
-                                Ok(n) if n > 0 => {
-                                    early_got = Some(n);
-                                    let limit = crate::server::HardLimit::new(
-                                        pubsub.limits(),
-                                        subscriptions.is_some(),
-                                        waiting + n,
-                                        client_id,
-                                    );
-                                    Box::pin(read_while_writing(
-                                        write,
-                                        &peer_watch,
-                                        crate::server::ReadAhead {
-                                            carried: &mut carried,
-                                            carried_from,
-                                            held_elsewhere: parse_buf.len() - parse_start,
-                                        },
-                                        &activity,
-                                        limit,
-                                    ))
-                                    .await
+                    let (sent, spare_buf) = send_now(&stream, spare_buf).await;
+                    match sent {
+                        Ok(n) if n == spare_buf.len() => (Ok(()), spare_buf),
+                        Err(e)
+                            if !matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                            ) =>
+                        {
+                            (Err(e), spare_buf)
+                        }
+                        // The socket is full (or the send was interrupted):
+                        // the client may be sending while its replies wait
+                        // (#865). The read the next turn makes is submitted
+                        // before the rest is written, so that the two reach
+                        // the kernel together; if it finishes first, the
+                        // client is read on while the rest is written.
+                        sent => {
+                            let sent = sent.unwrap_or(0);
+                            #[cfg(debug_assertions)]
+                            if sent == 0 {
+                                crate::stats::DEBUG_SENDS_NONE
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                crate::stats::DEBUG_SENDS_SHORT
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if parse_buf.capacity().saturating_sub(parse_buf.len()) < READ_MIN {
+                                parse_buf.reserve(READ_BUFFER);
+                            }
+                            early_from = parse_buf.len();
+                            early.set(Some(
+                                reader.read(std::mem::take(&mut parse_buf).slice(early_from..)),
+                            ));
+                            // The rest, from where the send stopped: written
+                            // out of the same buffer, not copied to its front.
+                            let mut write = std::pin::pin!(async {
+                                let (res, rest) = stream.write_all(spare_buf.slice(sent..)).await;
+                                (res, rest.into_inner())
+                            });
+                            let read = early.as_mut().as_pin_mut().expect("submitted above");
+                            tokio::select! {
+                                biased;
+                                written = &mut write => written,
+                                (got, buffer) = read => {
+                                    early.set(None);
+                                    parse_buf = buffer.into_inner();
+                                    match got {
+                                        Ok(n) if n > 0 => {
+                                            early_got = Some(n);
+                                            let limit = crate::server::HardLimit::new(
+                                                pubsub.limits(),
+                                                subscriptions.is_some(),
+                                                waiting + n,
+                                                client_id,
+                                            );
+                                            Box::pin(read_while_writing(
+                                                write,
+                                                &peer_watch,
+                                                crate::server::ReadAhead {
+                                                    carried: &mut carried,
+                                                    carried_from,
+                                                    held_elsewhere: parse_buf.len() - parse_start,
+                                                },
+                                                &activity,
+                                                limit,
+                                            ))
+                                            .await
+                                        }
+                                        // The client's end, or an error: the
+                                        // next turn's read sees it again.
+                                        _ => write.await,
+                                    }
                                 }
-                                // The client's end, or an error: the next
-                                // turn's read sees it again.
-                                _ => write.await,
                             }
                         }
                     }
