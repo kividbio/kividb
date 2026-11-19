@@ -400,10 +400,14 @@ async fn park_blocking_uring(
         crate::stats::TOTAL_NET_OUTPUT_BYTES
             .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
         crate::stats::record_write();
-        let _w = write_guard.lock().await;
         // The client is read while it waits, as the connection's own write
-        // reads it (#865).
-        let write = std::pin::pin!(stream.write_all(payload));
+        // reads it (#865): while the write lock is held by the task that
+        // writes pushes (a subscriber's messages, tracking's invalidations)
+        // too, which waits for the client to read them.
+        let write = std::pin::pin!(async {
+            let _w = write_guard.lock().await;
+            stream.write_all(payload).await
+        });
         let (res, mut returned) = read_while_writing(
             write,
             watch,
@@ -416,7 +420,6 @@ async fn park_blocking_uring(
             limit,
         )
         .await;
-        drop(_w);
         returned.clear();
         *out_buf = returned;
         if res.is_err() {
@@ -714,15 +717,13 @@ fn recv_into(fd: std::os::fd::RawFd, carried: &mut Vec<u8>) -> std::io::Result<u
 /// were written, each side would wait for the other for good. Past
 /// `client-query-buffer-limit` or `limit`, the socket is shut down, which
 /// ends the write with an error, and the connection with it.
-async fn read_while_writing(
-    mut write: std::pin::Pin<
-        &mut dyn std::future::Future<Output = tokio_uring::BufResult<(), Vec<u8>>>,
-    >,
+async fn read_while_writing<T>(
+    mut write: std::pin::Pin<&mut dyn std::future::Future<Output = T>>,
     watch: &PeerWatch,
     read_ahead: crate::server::ReadAhead<'_>,
     activity: &crate::client_registry::Activity,
     mut limit: crate::server::HardLimit,
-) -> tokio_uring::BufResult<(), Vec<u8>> {
+) -> T {
     let mut reading = true;
     loop {
         tokio::select! {
@@ -3372,7 +3373,39 @@ pub async fn handle_client(
             if shown {
                 activity.set_reply_output(spare_buf.len());
             }
-            let _w = write_guard.lock().await;
+            let _w = match write_guard.try_lock() {
+                Ok(w) => w,
+                // The task that writes pushes (a subscriber's messages,
+                // tracking's invalidations) has the socket, and waits for
+                // the client to read them. The client is read meanwhile, as
+                // while the connection's own replies wait (#865): one that
+                // sends a pipeline before it reads would otherwise wait for
+                // the connection, and the connection for it, for good. Not
+                // when this turn hands the connection on: its bytes are the
+                // replication link's then.
+                Err(_) if connection_handoff.is_none() => {
+                    let limit = crate::server::HardLimit::new(
+                        pubsub.limits(),
+                        subscriptions.is_some(),
+                        spare_buf.len() + carried.len() - carried_from + unpresented,
+                        client_id,
+                    );
+                    let lock = std::pin::pin!(write_guard.lock());
+                    Box::pin(read_while_writing(
+                        lock,
+                        &peer_watch,
+                        crate::server::ReadAhead {
+                            carried: &mut carried,
+                            carried_from,
+                            held_elsewhere: parse_buf.len() - parse_start,
+                        },
+                        &activity,
+                        limit,
+                    ))
+                    .await
+                }
+                Err(_) => write_guard.lock().await,
+            };
             debug_assert!(early.is_none(), "a read in flight before this turn's write");
             let waiting = spare_buf.len();
             let (res, returned) = match write_within {

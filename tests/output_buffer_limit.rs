@@ -755,6 +755,64 @@ fn a_pipeline_sent_before_reading_is_answered() {
     }
 }
 
+/// A subscriber that does not read its messages while it sends a pipeline
+/// is answered in full. With its socket full of messages, the task that
+/// writes them waits for room while it holds the connection's write lock;
+/// the connection, with replies to write, waited for that lock without
+/// reading, and the client, still sending, never read: each waited for the
+/// other for good, as in #865.
+#[test]
+fn a_pipeline_sent_while_messages_wait_is_answered() {
+    let _turn = serial();
+    const MESSAGES: usize = 6000;
+    const PINGS: usize = 1_000_000;
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        let mut sub = subscriber(&server, "ch");
+        socket2::SockRef::from(&sub.writer)
+            .set_recv_buffer_size(64 * 1024)
+            .unwrap();
+        // 6 MB of messages, under the pubsub class's soft limit: more than
+        // the two sockets' buffers hold, so the rest waits in the server.
+        let mut publisher = server.conn();
+        let message = "m".repeat(1000);
+        let publish = format!("*3\r\n$7\r\nPUBLISH\r\n$2\r\nch\r\n$1000\r\n{message}\r\n");
+        publisher
+            .writer
+            .write_all(publish.repeat(MESSAGES).as_bytes())
+            .unwrap();
+        for _ in 0..MESSAGES {
+            assert!(matches!(publisher.read(), Some(V::Int(_))), "{io_model}");
+        }
+        sub.writer
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        sub.writer
+            .write_all(b"*1\r\n$4\r\nPING\r\n".repeat(PINGS).as_slice())
+            .unwrap_or_else(|e| panic!("{io_model}: the server stopped reading: {e}"));
+        // Every message, then every PING's reply.
+        let pong = b"$4\r\npong\r\n";
+        let (mut seen, mut pongs, mut tail) = (0usize, 0usize, Vec::new());
+        let mut buf = vec![0u8; 1 << 20];
+        while pongs < PINGS {
+            let n = sub
+                .reader
+                .read(&mut buf)
+                .unwrap_or_else(|e| panic!("{io_model}: {e} after {pongs} replies"));
+            assert!(n > 0, "{io_model}: closed after {pongs} replies");
+            tail.extend_from_slice(&buf[..n]);
+            seen += n;
+            let mut at = 0;
+            while let Some(i) = tail[at..].windows(pong.len()).position(|w| w == pong) {
+                pongs += 1;
+                at += i + pong.len();
+            }
+            tail.drain(..at.max(tail.len().saturating_sub(pong.len() - 1)));
+        }
+        assert!(seen >= MESSAGES * 1000, "{io_model}: {seen} bytes");
+    }
+}
+
 /// What the server reads ahead counts against `client-query-buffer-limit`:
 /// past it, the client is closed, as Redis closes one whose query buffer
 /// reaches the limit.
