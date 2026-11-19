@@ -5475,7 +5475,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
                 out.push_str(&format!(
                     "aof_last_write_status:{}\r\n",
-                    if crate::aof::AOF_LOST_RECORDS.load(Ordering::Relaxed) == 0 {
+                    // Or holds records it cannot write (a full disk) yet.
+                    if crate::aof::AOF_LOST_RECORDS.load(Ordering::Relaxed) == 0
+                        && !crate::aof::write_failing()
+                    {
                         "ok"
                     } else {
                         "err"

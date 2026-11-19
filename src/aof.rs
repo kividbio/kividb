@@ -398,8 +398,33 @@ fn note_old_log_end(file: &mut std::fs::File) -> std::io::Result<()> {
     };
     let len = old.metadata()?.len();
     let record = old_log_end_record(len, hash_of_end_of(&old, len)?);
-    if let Err(e) = file.write_all(&record) {
-        file.set_len(AOF_DELTA_HEADER_LEN as u64)?;
+    let written = if INJECT_SHORT_WRITES.load(Ordering::Relaxed)
+        && std::path::Path::new(SHORT_RECORD_TEST_FILE).exists()
+    {
+        file.write_all(&record[..OLD_LOG_END_LEN / 2])
+            .and(Err(std::io::Error::other("short write injected by a test")))
+    } else {
+        file.write_all(&record)
+    };
+    if let Err(e) = written {
+        // Records after half of one would make the log unreadable from
+        // there on: a log that cannot be put back stops the server, as a
+        // write that cannot be taken back does (see [`write_batch`]).
+        let cut = if INJECT_SHORT_WRITES.load(Ordering::Relaxed)
+            && std::path::Path::new(SHORT_RECORD_CUT_TEST_FILE).exists()
+        {
+            Err(std::io::Error::other("failure injected by a test"))
+        } else {
+            file.set_len(AOF_DELTA_HEADER_LEN as u64)
+        };
+        if let Err(cut) = cut {
+            log_fatal!(
+                "AOF: where {AOF_PREV_PATH} ends could not be recorded in {AOF_PATH} ({e}), \
+                 and what was written of the record could not be taken off again ({cut}) — \
+                 exiting rather than write records after half of one"
+            );
+            std::process::exit(1);
+        }
         return Err(e);
     }
     Ok(())
@@ -457,11 +482,35 @@ fn old_log_end(
                      {AOF_PATH} was started after it, are not the ones written there"
                 ))
             }),
+            // The record's name, with values that are none: damaged, as
+            // below.
+            None if is_old_log_end(&cmd)
+                && rest
+                    .get(OLD_LOG_END_LEN..)
+                    .is_some_and(|past| past.iter().any(|&b| b != 0)) =>
+            {
+                Ok(OldLogEnd::Short(format!(
+                    "the record at the start of {AOF_PATH} of where {AOF_PREV_PATH} ended is \
+                     damaged, and there is more after it"
+                )))
+            }
             None => Ok(OldLogEnd::Unrecorded),
         },
         None if first == 0 && rest.iter().any(|&b| b != 0) => Ok(OldLogEnd::Short(format!(
             "the start of {AOF_PATH} never reached the disk, and records after it did"
         ))),
+        // Not a whole record where the record is, with bytes past where it
+        // would end: its start is damaged, and what follows cannot be shown
+        // to go on from the old log. Nothing past it is a record cut short
+        // at the end of the log, with nothing to replay.
+        None if rest
+            .get(OLD_LOG_END_LEN..)
+            .is_some_and(|past| past.iter().any(|&b| b != 0)) =>
+        {
+            Ok(OldLogEnd::Short(format!(
+                "the start of {AOF_PATH} is not a whole record, and there is more after it"
+            )))
+        }
         None => Ok(OldLogEnd::Unrecorded),
     }
 }
@@ -499,6 +548,59 @@ fn keep_log_after_short_old_log() -> std::io::Result<()> {
     Ok(())
 }
 
+/// How much of `records` (a log's records, after any header) is whole
+/// records, as a replay takes them: without a record cut short at the end,
+/// or a transaction whose `EXEC` is not there. All of it when what follows
+/// the last whole record is damage rather than a record cut short: that is
+/// left for the replay to refuse.
+fn whole_records(records: &[u8]) -> usize {
+    let (commands, consumed) = parse_aof_commands(records);
+    if consumed < records.len() && classify_tail(&records[consumed..]) == Tail::Corrupt {
+        return records.len();
+    }
+    match unfinished_transaction(&commands) {
+        Some(multi) => record_offset(records, multi),
+        None => consumed,
+    }
+}
+
+/// The old log of a checkpoint that did not finish ends in a record cut
+/// short (or a transaction without its `EXEC`), which its replay left out:
+/// cut off it, after its last whole record. Left there, a later turn-over
+/// that adds the log's records to the old log (see [`move_log_aside`])
+/// wrote them after it, and the old log could not be read past it: the
+/// server refused to start, or read the records after it as part of it.
+///
+/// With `recorded`, the log records where the old log ends ([`OldLogEnd::
+/// Whole`], the record cut short within that end): the record is rewritten
+/// first, in place, to the new end, and synced; then the old log is cut.
+/// Stopped between the two, the old log is longer than recorded, with the
+/// same bytes up to that length: still whole, and cut at the next start.
+fn cut_torn_old_log(prev: &ReplayStats, recorded: bool) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let old = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(AOF_PREV_PATH)?;
+    let end = prev.valid_len;
+    if recorded {
+        let record = old_log_end_record(end, hash_of_end_of(&old, end)?);
+        let mut log = std::fs::OpenOptions::new().write(true).open(AOF_PATH)?;
+        log.seek(SeekFrom::Start(AOF_DELTA_HEADER_LEN as u64))?;
+        log.write_all(&record)?;
+        sync_log(&log, false)?;
+        failpoint("old-log-end-rewritten");
+    }
+    old.set_len(end)?;
+    sync_log(&old, true)?;
+    log_warn!(
+        "AOF: {AOF_PREV_PATH} ended in a record cut short ({} bytes), which was not replayed: it is \
+         cut off, after the last whole record",
+        prev.bytes - end
+    );
+    Ok(())
+}
+
 /// After the old log has been replayed alone, `prev` its replay, because
 /// the log `log` goes on from more of it than is on disk: the log is kept
 /// aside, the old log is cut after its last whole record, and the log starts
@@ -514,6 +616,7 @@ fn cut_at_old_log(log: &[u8], prev: &ReplayStats) -> std::io::Result<()> {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "the log has no header")
     })?;
     keep_log_after_short_old_log()?;
+    failpoint("short-old-log-kept");
     // A record cut short, or a transaction without its `EXEC`, was not
     // replayed: cut off, so that nothing written after it follows half a
     // record.
@@ -524,6 +627,7 @@ fn cut_at_old_log(log: &[u8], prev: &ReplayStats) -> std::io::Result<()> {
         old.set_len(prev.valid_len)?;
         sync_log(&old, true)?;
     }
+    failpoint("short-old-log-cut");
     let old = std::fs::File::open(AOF_PREV_PATH)?;
     let len = old.metadata()?.len();
     let mut fresh = delta_header(generation).to_vec();
@@ -1480,6 +1584,7 @@ pub fn start_aof_writer(
         // (the tests do): left alone.
         *UNOPENED.lock() = Some(rx);
     }
+    INJECT_SHORT_WRITES.store(failpoint_named("short-writes"), Ordering::Relaxed);
     WRITER_RUNNING.store(true, Ordering::Release);
 
     // Whatever survived startup (an AOF that was just replayed, or nothing) is
@@ -1675,8 +1780,51 @@ fn write_queued(
         // is woken to go on, and the sync gets its turn.
         let more_queued = batch.len() >= MAX_AOF_BATCH_BYTES;
         drained += batch.len();
+        // What a write before this one could not write goes first, with the
+        // barriers that wait for it (see [`UNWRITTEN`]).
+        let took_unwritten = HAS_UNWRITTEN.load(Ordering::Relaxed);
+        if took_unwritten {
+            let mut held = UNWRITTEN.lock();
+            let mut before = std::mem::take(&mut held.bytes);
+            before.append(&mut batch);
+            batch = before;
+            let mut waiting = std::mem::take(&mut held.barriers);
+            waiting.append(&mut barriers);
+            barriers = waiting;
+        }
+        if !write_batch(file, &batch) {
+            // Kept, in order, for the next write to try again: nothing is
+            // written after it until it is, and its barriers wait for it.
+            let mut held = UNWRITTEN.lock();
+            held.bytes = batch;
+            held.barriers = std::mem::take(&mut barriers);
+            HAS_UNWRITTEN.store(true, Ordering::Relaxed);
+            drop(held);
+            // The records before a turn-over's mark are the old log's: with
+            // some not written, the log is not turned over, and the
+            // checkpoint fails, as one does whose turn-over fails.
+            if let Some(generation) = mark {
+                let refused = Err(std::io::Error::other(format!(
+                    "records before the turn-over could not be written to {AOF_PATH}"
+                )));
+                let done = {
+                    let mut waiters = TURN_OVER_WAITERS.lock();
+                    waiters
+                        .iter()
+                        .position(|(g, _)| *g == generation)
+                        .map(|at| waiters.swap_remove(at).1)
+                };
+                if let Some(done) = done {
+                    let _ = done.send(refused);
+                }
+            }
+            return (wrote, released);
+        }
+        if took_unwritten {
+            HAS_UNWRITTEN.store(false, Ordering::Relaxed);
+            log_warn!("AOF: the records that could not be written to {AOF_PATH} are written now");
+        }
         wrote |= !batch.is_empty();
-        write_batch(file, &batch);
         released |= !barriers.is_empty();
         // Under `appendfsync always`, the replies the barriers stand for go
         // out once what is before them is on the disk. The writer thread
@@ -1906,16 +2054,32 @@ fn recover_turn_over() {
             "AOF: a checkpoint was stopped while turning {AOF_PATH} over — completing the \
              turn-over, and replaying {AOF_PREV_PATH}"
         );
-        let fresh = std::fs::read(TURN_OVER_TMP)
-            .is_ok_and(|b| b.len() == AOF_DELTA_HEADER_LEN && aof_delta_generation(&b).is_some());
-        let done = if fresh {
+        let tmp = std::fs::read(TURN_OVER_TMP).ok();
+        let fresh = tmp
+            .as_deref()
+            .is_some_and(|b| b.len() == AOF_DELTA_HEADER_LEN && aof_delta_generation(b).is_some());
+        // A new log that holds records, whose name never reached the disk
+        // (the old log's did): put in place, and replayed after the old log,
+        // if the old log is there to where the new one records it ended.
+        let goes_on = !fresh
+            && tmp
+                .as_deref()
+                .is_some_and(|b| matches!(old_log_end_on_disk(b), Ok(OldLogEnd::Whole)));
+        if goes_on {
+            log_warn!(
+                "AOF: {TURN_OVER_TMP} holds the records written after the turn-over, and \
+                 {AOF_PREV_PATH} is complete to where it recorded it ended: it is put in place as \
+                 {AOF_PATH}"
+            );
+        }
+        let done = if fresh || goes_on {
             std::fs::rename(TURN_OVER_TMP, AOF_PATH)
         } else {
-            // A new log that holds records, whose name never reached the
-            // disk: its records were never reported synced (the directory
-            // is synced before any is), and come after the old log's,
-            // which may not all be there. Not replayed, and kept aside
-            // before the next turn-over writes over it.
+            // One whose old log is not there to that end, or that does not
+            // say where it ended: its records were never reported synced
+            // (the directory is synced before any is), and come after the
+            // old log's, which may not all be there. Not replayed, and kept
+            // aside before the next turn-over writes over it.
             match keep_aside(TURN_OVER_TMP) {
                 Ok(Some(name)) => {
                     if let Err(e) = sync_dir() {
@@ -1933,7 +2097,8 @@ fn recover_turn_over() {
             }
             let mut header = AOF_DELTA_MAGIC.to_vec();
             header.extend_from_slice(&read_generation().saturating_add(1).to_le_bytes());
-            write_file_durably(AOF_PATH, &header)
+            // Kept: removed, so that no save number is taken from it.
+            write_file_durably(AOF_PATH, &header).and_then(|()| remove_if_there(TURN_OVER_TMP))
         };
         if let Err(e) = done.and_then(|()| sync_dir()) {
             fatal_persistence(&format!(
@@ -2057,26 +2222,114 @@ fn drain_into(
     None
 }
 
-fn write_batch(file: &mut std::fs::File, batch: &[u8]) {
+/// Records the writer could not write, in order, and the barriers waiting
+/// for them. A write the disk took only part of (a full disk) used to leave
+/// half a record in the log, and the next write went on after it: the log
+/// could not be read past it, and the records after it were replies' writes
+/// acknowledged as written. Now what was written of it is taken back, and
+/// the whole is kept here: the next write writes it first, with what came
+/// after it, so the log never holds a record after one it is missing, and
+/// no reply, nor `WAITAOF`, counts a record that is not in the file. The
+/// writer tries again at each write and at the second's sync. A reply
+/// waits for its records as it does for a disk that is behind: at most
+/// [`ACK_WAIT_LIMIT`], and then goes without them, counted. Taken with the
+/// log locked.
+struct Unwritten {
+    bytes: Vec<u8>,
+    barriers: Vec<u64>,
+}
+
+static UNWRITTEN: parking_lot::Mutex<Unwritten> = parking_lot::const_mutex(Unwritten {
+    bytes: Vec::new(),
+    barriers: Vec::new(),
+});
+
+/// Whether [`UNWRITTEN`] holds anything: read with the log locked.
+static HAS_UNWRITTEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the AOF has records it could not write: `aof_last_write_status`.
+pub fn write_failing() -> bool {
+    HAS_UNWRITTEN.load(Ordering::Relaxed)
+}
+
+/// `short-writes` in `KIVIDB_TEST_FAILPOINTS`: while [`SHORT_WRITE_TEST_FILE`]
+/// is in the data directory, a write to the log takes half of what it is
+/// given and fails, as on a full disk; while [`SHORT_RECORD_TEST_FILE`] is,
+/// so does the write of a turn-over's record, and with
+/// [`SHORT_RECORD_CUT_TEST_FILE`] as well, what was written of it cannot be
+/// taken back. Read once, when the writer starts: a load and a branch a
+/// write otherwise.
+static INJECT_SHORT_WRITES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub(crate) const SHORT_WRITE_TEST_FILE: &str = "short-write.test";
+pub(crate) const SHORT_RECORD_TEST_FILE: &str = "short-write.record.test";
+pub(crate) const SHORT_RECORD_CUT_TEST_FILE: &str = "short-write.cut.test";
+
+/// Write `batch`, whole records, to the log: whether it was written. A
+/// write that fails part-way is taken back, and the log is as it was before
+/// it (see [`UNWRITTEN`]); one that cannot be taken back stops the server
+/// rather than have records written after half of one. Under `appendfsync
+/// always` a write that fails stops the server, as in Redis.
+fn write_batch(file: &mut std::fs::File, batch: &[u8]) -> bool {
     use std::io::Write;
     if batch.is_empty() {
-        return;
+        return true;
     }
-    if let Err(e) = file.write_all(batch) {
-        // Replies wait for this write and its sync: none can be sent
-        // without it, nor with it lost. Redis exits too.
-        if fsync_always() {
+    let mut done = 0;
+    let failed = loop {
+        if done == batch.len() {
+            break None;
+        }
+        if INJECT_SHORT_WRITES.load(Ordering::Relaxed)
+            && std::path::Path::new(SHORT_WRITE_TEST_FILE).exists()
+        {
+            let half = (batch.len() - done) / 2;
+            if file.write_all(&batch[done..done + half]).is_ok() {
+                done += half;
+            }
+            break Some(std::io::Error::other("short write injected by a test"));
+        }
+        match file.write(&batch[done..]) {
+            Ok(0) => break Some(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => break Some(e),
+        }
+    };
+    let Some(e) = failed else {
+        return true;
+    };
+    // Replies wait for this write and its sync: none can be sent without
+    // it, nor with it lost. Redis exits too.
+    if fsync_always() {
+        log_fatal!(
+            "AOF: write to {AOF_PATH} failed under appendfsync always: {e} — exiting rather than acknowledge writes that are not on disk"
+        );
+        std::process::exit(1);
+    }
+    if done > 0 {
+        let cut = file
+            .metadata()
+            .and_then(|meta| file.set_len(meta.len().saturating_sub(done as u64)))
+            .and_then(|()| file.sync_data());
+        if let Err(cut) = cut {
             log_fatal!(
-                "AOF: write to {AOF_PATH} failed under appendfsync always: {e} — exiting rather than acknowledge writes that are not on disk"
+                "AOF: write to {AOF_PATH} failed part-way ({e}), and what was written of it could \
+                 not be taken back ({cut}) — exiting rather than write records after half of one"
             );
             std::process::exit(1);
         }
-        log_throttled!(
-            10,
-            crate::loglevel::ERROR,
-            "AOF: write to {AOF_PATH} failed: {e} — writes are not being made durable; check free disk space and permissions on the data directory"
-        );
     }
+    log_throttled!(
+        10,
+        crate::loglevel::ERROR,
+        "AOF: write to {AOF_PATH} failed: {e} — what was written of it is taken back, and its \
+         records are kept to be written first, as soon as the disk takes them. Until then \
+         replies to writes wait for them (at most 5 s, then go without, counted in \
+         aof_acks_before_write) and WAITAOF counts none; check free disk space and permissions \
+         on the data directory"
+    );
+    false
 }
 
 /// `appendfsync always`: sync the file for the replies waiting for it, and
@@ -2145,7 +2398,7 @@ pub fn sync_for_shutdown() {
 /// the lock, so that connections writing their records do not wait out the
 /// disk.
 fn do_fsync() {
-    let (had_data, written, file) = {
+    let (had_data, written, unwritten, file) = {
         let mut log = LOG.lock();
         let Some(log) = log.as_mut() else {
             return;
@@ -2155,8 +2408,13 @@ fn do_fsync() {
         // What the sync covers: what is on this file now. Records others
         // write once the lock is let go may miss it, so they are not counted.
         let written = AOF_WRITTEN.load(Ordering::Relaxed);
-        (had_data, written, log.file.try_clone())
+        // Records the writer could not write are counted in `written`, and
+        // are not in the file: the sync is made for what is, and counts
+        // nothing for `WAITAOF` until they are written (see [`UNWRITTEN`]).
+        let unwritten = HAS_UNWRITTEN.load(Ordering::Relaxed);
+        (had_data, written, unwritten, log.file.try_clone())
     };
+    let counted = |written: u64| if unwritten { 0 } else { written };
     let Ok(file) = file else {
         return;
     };
@@ -2183,7 +2441,7 @@ fn do_fsync() {
     // the next sync, which would answer replies with their writes lost.
     if fsync_always() {
         sync_before_reply(&file);
-        AOF_FSYNCED.fetch_max(written, Ordering::Relaxed);
+        AOF_FSYNCED.fetch_max(counted(written), Ordering::Relaxed);
         return;
     }
     // Not ahead of the old log a turn-over has moved aside. The checkpoint
@@ -2216,7 +2474,7 @@ fn do_fsync() {
             "AOF: fsync of {AOF_PATH} failed: {e} — writes acknowledged since the last good fsync may be lost on power failure; check the disk"
         );
     } else {
-        AOF_FSYNCED.fetch_max(written, Ordering::Relaxed);
+        AOF_FSYNCED.fetch_max(counted(written), Ordering::Relaxed);
     }
 }
 
@@ -3374,7 +3632,8 @@ pub(crate) fn parse_one_command(buf: &[u8]) -> Option<(Vec<Vec<u8>>, usize)> {
         .ok()?;
     pos = line_end + 2;
 
-    let mut args = Vec::with_capacity(argc);
+    // A count read from damage can be anything: not reserved up front.
+    let mut args = Vec::with_capacity(argc.min(64));
     for _ in 0..argc {
         if *buf.get(pos)? != b'$' {
             return None;
@@ -3386,7 +3645,9 @@ pub(crate) fn parse_one_command(buf: &[u8]) -> Option<(Vec<Vec<u8>>, usize)> {
             .ok()?;
         pos = line_end + 2;
         let end = pos.checked_add(len)?;
-        if buf.len() < end + 2 {
+        // The value ends with its CRLF: without it, the length did not
+        // describe the bytes, and what was read is no record.
+        if buf.get(end..end.checked_add(2)?)? != b"\r\n" {
             return None;
         }
         args.push(buf[pos..end].to_vec());
@@ -3870,7 +4131,10 @@ pub fn recover_local(
                     Ok(prev) => prev,
                     Err(e) => fatal_persistence(&format!("{AOF_PREV_PATH} cannot be read: {e}")),
                 };
-                let mut both = prev.get(from as usize..).unwrap_or_default().to_vec();
+                // Its whole records only: a record cut short at its end, with
+                // the log's records after it, would be damage in the middle.
+                let added_part = prev.get(from as usize..).unwrap_or_default();
+                let mut both = added_part[..whole_records(added_part)].to_vec();
                 if let OldLogEnd::Short(why) = &end {
                     warn_of_short_old_log(why);
                     // Kept aside, and left with its header alone: the log
@@ -3925,6 +4189,12 @@ pub fn recover_local(
                         ));
                     }
                     cut_at_old_log_end = true;
+                } else if stats.truncated_tail
+                    && let Err(e) = cut_torn_old_log(&stats, end == OldLogEnd::Whole)
+                {
+                    fatal_persistence(&format!(
+                        "{AOF_PREV_PATH} ends in a record cut short that could not be cut off: {e}"
+                    ));
                 }
             }
         }
@@ -4721,6 +4991,59 @@ mod old_log_end_tests {
         assert_eq!(commands.iter().filter(|c| is_old_log_end(c)).count(), 1);
         assert_eq!(unfinished_transaction(&commands), None);
         assert!(live_after_flushes(&commands).iter().all(|&live| live));
+    }
+
+    #[test]
+    fn a_damaged_record_with_more_after_it_is_short() {
+        let (prev, log) = logs(300, 50);
+        // A byte of the record changed: no record, and records after it.
+        for at in [AOF_DELTA_HEADER_LEN + 1, AOF_DELTA_HEADER_LEN + 40] {
+            let mut damaged = log.clone();
+            damaged[at] = b'x';
+            assert!(
+                matches!(judge(&damaged, &prev), OldLogEnd::Short(_)),
+                "byte {at}"
+            );
+        }
+        // Damaged, with nothing past where it would end: nothing to keep.
+        let mut alone = log[..AOF_DELTA_HEADER_LEN + OLD_LOG_END_LEN].to_vec();
+        alone[AOF_DELTA_HEADER_LEN + 1] = b'x';
+        assert_eq!(judge(&alone, &prev), OldLogEnd::Unrecorded);
+    }
+
+    #[test]
+    fn a_value_without_its_crlf_is_no_record() {
+        let mut record = set("k");
+        assert!(parse_one_command(&record).is_some());
+        let at = record.len() - 2;
+        record[at] = b'x';
+        assert!(parse_one_command(&record).is_none());
+        // A whole record but for that is damage, not a record cut short.
+        assert_eq!(classify_tail(&record), Tail::Corrupt);
+        // A count read from damage is not reserved.
+        assert!(parse_one_command(b"*99999999999999\r\n$1\r\na\r\n").is_none());
+    }
+
+    #[test]
+    fn whole_records_leave_out_a_record_cut_short_but_not_damage() {
+        let mut records = set("a");
+        records.extend_from_slice(&set("b"));
+        let whole = records.len();
+        records.extend_from_slice(&set("c")[..9]);
+        assert_eq!(whole_records(&records), whole);
+        // A bulk longer than the rest of the file: cut short, too.
+        let mut huge = set("a");
+        huge.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$999999999\r\nab");
+        assert_eq!(whole_records(&huge), set("a").len());
+        // A transaction without its EXEC.
+        let mut open = set("a");
+        open.extend_from_slice(b"*1\r\n$5\r\nMULTI\r\n");
+        open.extend_from_slice(&set("b"));
+        assert_eq!(whole_records(&open), set("a").len());
+        // Damage is kept, for the replay to refuse.
+        let mut damaged = set("a");
+        damaged.extend_from_slice(b"garbage that is no record");
+        assert_eq!(whole_records(&damaged), damaged.len());
     }
 }
 

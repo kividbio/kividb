@@ -2702,15 +2702,20 @@ enum Loss {
     /// they were made): the logs under their names from before, each with
     /// what was synced of it.
     Renames,
+    /// Of the turn-over's renames, only the old log's on disk: the new log
+    /// under the name it was written under, with all that was written to it
+    /// (written back), and the old log what was synced of it.
+    NewLogsName,
 }
 
 impl Loss {
-    const ALL: [Loss; 5] = [
+    const ALL: [Loss; 6] = [
         Loss::Unsynced,
         Loss::OldLogsEnd,
         Loss::OldLogsEndAsZeros,
         Loss::NewLogsStart,
         Loss::Renames,
+        Loss::NewLogsName,
     ];
 }
 
@@ -2725,7 +2730,8 @@ const NEW_LOG: &str = "appendonly.aof.rewrite.tmp";
 #[cfg(unix)]
 fn after_power_failure(dir: &Path, loss: Loss, renamed: bool) -> Option<PathBuf> {
     let synced = Synced::read(dir);
-    if matches!(loss, Loss::Renames) && (!renamed || synced.dir_since_turn_over) {
+    if matches!(loss, Loss::Renames | Loss::NewLogsName) && (!renamed || synced.dir_since_turn_over)
+    {
         return None;
     }
     let image = tempfile::tempdir().unwrap().keep();
@@ -2793,6 +2799,13 @@ fn after_power_failure(dir: &Path, loss: Loss, renamed: bool) -> Option<PathBuf>
                 }
                 std::fs::rename(image.join(OLD_LOG), image.join(LOG)).unwrap();
             }
+        }
+        Loss::NewLogsName => {
+            if !image.join(OLD_LOG).exists() || !image.join(LOG).exists() {
+                return None;
+            }
+            cut(OLD_LOG);
+            std::fs::rename(image.join(LOG), image.join(NEW_LOG)).unwrap();
         }
     }
     Some(image)
@@ -3273,5 +3286,288 @@ fn logs_of_1_2_load_here_and_1_2_loads_logs_written_here() {
             let mut c = server.restart();
             assert_eq!(loaded_of(&mut c, "w", 1100, &what), 1100, "{what}");
         }
+    }
+}
+
+// ── An old log cut short, and a turn-over after it ───────────────────────────
+
+/// A server in `dir`, held at its first `failpoint` during its start, and
+/// killed there.
+fn killed_at_start(dir: &Path, failpoint: &str) {
+    let mut child = launch(dir, common::free_port(), "tokio", failpoint, true);
+    let held = dir.join(format!("failpoint.{failpoint}.1"));
+    let deadline = Instant::now() + LONG;
+    while !held.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the server ended before {failpoint}"
+        );
+        assert!(Instant::now() < deadline, "{failpoint} not reached");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    std::fs::remove_file(held).unwrap();
+}
+
+/// An old log of `n` records `old:<i>` with `tail` after them.
+fn old_log_with(n: usize, tail: &[u8]) -> Vec<u8> {
+    let mut old = delta_header(1);
+    for i in 0..n {
+        old.extend_from_slice(&set_record(&format!("old:{i}"), "1"));
+    }
+    old.extend_from_slice(tail);
+    old
+}
+
+/// An old log that ends in a record cut short, beside a new log, of a
+/// checkpoint that did not finish: the replay leaves the record out, and
+/// it is cut off. Left there, the next checkpoint's turn-over added the
+/// log's records after it (the old log still being needed), and a restart
+/// before that checkpoint finished could not read past it: the server
+/// refused to start, or, when the record cut short declared a value longer
+/// than the rest of the file, read the records after it as that value and
+/// lost them. Then the same with a second stop in the middle of cutting it.
+#[test]
+fn an_old_log_cut_short_is_cut_before_records_are_added_to_it() {
+    let n = 100;
+    let torn = set_record("old:torn", "1")[..9].to_vec();
+    let huge = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$999999999\r\nab".to_vec();
+    // (what, old log, new log, a stop in the middle of the cut)
+    type Case = (&'static str, Vec<u8>, Vec<u8>, Option<&'static str>);
+    let mut cases: Vec<Case> = Vec::new();
+    for (name, tail) in [("cut short", &torn), ("a huge value cut short", &huge)] {
+        // As 1.2.2 leaves it, and as a power failure leaves this
+        // version's new log with its first page lost: no record.
+        cases.push((name, old_log_with(n, tail), delta_header(2), None));
+        // The old log ended in the record cut short when the log was turned
+        // over (a write cut short): the new log's record says so.
+        let old = old_log_with(n, tail);
+        let mut new = delta_header(2);
+        new.extend_from_slice(&old_log_end(&old));
+        cases.push((name, old.clone(), new.clone(), None));
+        cases.push((name, old, new, Some("old-log-end-rewritten")));
+    }
+    for (what, old, new, stop) in cases {
+        let what = format!(
+            "{what}, {} record, stopped: {stop:?}",
+            if new.len() > 16 { "a" } else { "no" }
+        );
+        let dir = tempfile::tempdir().unwrap().keep();
+        std::fs::write(dir.join(OLD_LOG), &old).unwrap();
+        std::fs::write(dir.join(LOG), &new).unwrap();
+        if let Some(stop) = stop {
+            killed_at_start(&dir, stop);
+        }
+        let mut server = Server::start_in(dir, "tokio", "dump-installing");
+        let mut c = server.conn();
+        assert_eq!(loaded_of(&mut c, "old", n, &what), n, "{what}");
+        let prev = std::fs::read(server.dir.join(OLD_LOG)).unwrap();
+        assert_eq!(prev, old_log_with(n, b""), "{what}: not cut");
+        fill_seq(&mut c, 0, 300);
+        durable(&mut c);
+        // The next checkpoint adds those to the old log, and is stopped
+        // before its snapshot is in place.
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        assert!(server.reached("dump-installing.1", LONG), "{what}");
+        fill_seq(&mut c, 300, 100);
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        server.release("dump-installing.1");
+        server.failpoints.clear();
+        let mut c = server.restart();
+        assert_eq!(loaded_of(&mut c, "old", n, &what), n, "{what}");
+        assert_eq!(loaded_of(&mut c, "w", 400, &what), 400, "{what}");
+        assert!(kept_aside(&server.dir).is_empty(), "{what}");
+    }
+}
+
+/// A second stop in the middle of what a start does after an old log found
+/// short of where the new log goes on from: the next start loads the same,
+/// keeps the new log aside once, and goes on from there.
+#[test]
+fn a_stop_while_a_log_after_a_short_old_log_is_started_again_loads_the_same() {
+    let n = 100;
+    let old = old_log_with(n, b"");
+    let mut new = delta_header(2);
+    new.extend_from_slice(&old_log_end(&old));
+    for i in 0..n {
+        new.extend_from_slice(&set_record(&format!("new:{i}"), "1"));
+    }
+    let torn = &old[..old.len() - 5];
+    for stop in ["short-old-log-kept", "short-old-log-cut"] {
+        let dir = tempfile::tempdir().unwrap().keep();
+        std::fs::write(dir.join(OLD_LOG), torn).unwrap();
+        std::fs::write(dir.join(LOG), &new).unwrap();
+        killed_at_start(&dir, stop);
+        let mut server = Server::start_in(dir, "tokio", "");
+        let mut c = server.conn();
+        assert_eq!(loaded_of(&mut c, "old", n, stop), n - 1, "{stop}");
+        assert_eq!(loaded_of(&mut c, "new", n, stop), 0, "{stop}");
+        let kept = kept_aside(&server.dir);
+        assert_eq!(kept.len(), 1, "{stop}: {kept:?}");
+        assert_eq!(kept[0].1, new, "{stop}");
+        assert!(c.cmd(&["SET", "after", "1"]).ok());
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        assert_eq!(loaded_of(&mut c, "old", n, stop), n - 1, "{stop}");
+        assert_eq!(c.cmd(&["GET", "after"]).s(), "1", "{stop}");
+        assert_eq!(kept_aside(&server.dir).len(), 1, "{stop}");
+    }
+}
+
+/// The turn-over's new log under the name it was written under, holding
+/// records, beside the old log and no log: the old log's rename reached the
+/// disk and the new log's did not. Put in place and replayed when the old
+/// log is there to where the new one records it ended; kept aside, not
+/// replayed, when it is not.
+#[test]
+fn a_new_log_whose_name_was_lost_is_replayed_when_the_old_log_is_whole() {
+    let n = 100;
+    let old = old_log_with(n, b"");
+    let mut new = delta_header(2);
+    new.extend_from_slice(&old_log_end(&old));
+    for i in 0..n {
+        new.extend_from_slice(&set_record(&format!("new:{i}"), "1"));
+    }
+    for whole in [true, false] {
+        let what = format!("old log whole: {whole}");
+        let dir = tempfile::tempdir().unwrap().keep();
+        let on_disk = if whole {
+            &old[..]
+        } else {
+            &old[..old.len() - 5]
+        };
+        std::fs::write(dir.join(OLD_LOG), on_disk).unwrap();
+        std::fs::write(dir.join(NEW_LOG), &new).unwrap();
+        let mut server = Server::start_in(dir, "tokio", "");
+        let mut c = server.conn();
+        let (old_loaded, new_loaded) = if whole { (n, n) } else { (n - 1, 0) };
+        assert_eq!(loaded_of(&mut c, "old", n, &what), old_loaded, "{what}");
+        assert_eq!(loaded_of(&mut c, "new", n, &what), new_loaded, "{what}");
+        assert_eq!(kept_aside(&server.dir).len(), usize::from(!whole), "{what}");
+        assert!(!server.dir.join(NEW_LOG).exists(), "{what}");
+        assert!(c.cmd(&["SET", "after", "1"]).ok());
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        assert_eq!(loaded_of(&mut c, "new", n, &what), new_loaded, "{what}");
+        assert_eq!(c.cmd(&["GET", "after"]).s(), "1", "{what}");
+    }
+}
+
+// ── A write the disk takes only part of ──────────────────────────────────────
+
+/// Whether `c` has a reply waiting, without reading it.
+fn has_reply(c: &mut Conn) -> bool {
+    let socket = c.reader.get_ref();
+    socket.set_nonblocking(true).unwrap();
+    let peeked = socket.peek(&mut [0]);
+    socket.set_nonblocking(false).unwrap();
+    !c.reader.buffer().is_empty() || matches!(peeked, Ok(n) if n > 0)
+}
+
+/// A write to the log that the disk takes only part of (a full disk): what
+/// it wrote is taken back, and nothing is written after it until all of it
+/// is. Its reply waits, `WAITAOF` counts it not, and `INFO` says the log is
+/// failing; once the disk takes it, all goes on in order. Killed while it
+/// fails, the log loads, with every write acknowledged before.
+#[test]
+fn a_write_to_the_log_cut_short_is_taken_back_and_written_again() {
+    for &io in io_models() {
+        for end in ["the disk takes it again", "killed"] {
+            let what = format!("{io}, {end}");
+            let mut server = Server::start(io, "short-writes");
+            let mut c = server.conn();
+            fill_seq(&mut c, 0, 300);
+            durable(&mut c);
+            std::fs::write(server.dir.join("short-write.test"), b"").unwrap();
+            send(&mut c, &["MSET", "w:300", "1", "w:301", "1"]);
+            let mut w = server.conn();
+            send(&mut w, &["SET", "w:302", "1"]);
+            std::thread::sleep(Duration::from_millis(1000));
+            assert!(!has_reply(&mut c), "{what}: acknowledged, not written");
+            assert!(!has_reply(&mut w), "{what}: acknowledged, not written");
+            let mut i = server.conn();
+            let waited = i.cmd(&["WAITAOF", "1", "0", "200"]);
+            assert_eq!(waited.arr()[0].i(), 0, "{what}: WAITAOF counted it");
+            assert_eq!(info_field(&mut i, "aof_last_write_status"), "err", "{what}");
+            if end == "killed" {
+                drop((c, w, i));
+                server.kill();
+                std::fs::remove_file(server.dir.join("short-write.test")).unwrap();
+                let mut c = server.restart();
+                assert!(loaded_of(&mut c, "w", 303, &what) >= 300, "{what}");
+                continue;
+            }
+            std::fs::remove_file(server.dir.join("short-write.test")).unwrap();
+            assert!(c.read().ok(), "{what}");
+            assert!(w.read().ok(), "{what}");
+            assert_eq!(info_field(&mut i, "aof_last_write_status"), "ok", "{what}");
+            assert_eq!(info_field(&mut i, "aof_acks_before_write"), "0", "{what}");
+            fill_seq(&mut c, 303, 100);
+            durable(&mut c);
+            drop((c, w, i));
+            server.kill();
+            let mut c = server.restart();
+            assert_eq!(loaded_of(&mut c, "w", 403, &what), 403, "{what}");
+        }
+    }
+}
+
+/// The record of where the old log ends, written only in part at a
+/// turn-over: taken off again, and the log goes on without it. If it cannot
+/// be taken off either, the server stops rather than write records after
+/// half of one.
+#[test]
+fn a_record_of_the_old_logs_end_cut_short_is_taken_off_or_stops_the_server() {
+    for taken_off in [true, false] {
+        let what = format!("taken off: {taken_off}");
+        let mut server = Server::start("tokio", "short-writes");
+        let mut c = server.conn();
+        fill_seq(&mut c, 0, 300);
+        durable(&mut c);
+        std::fs::write(server.dir.join("short-write.record.test"), b"").unwrap();
+        if !taken_off {
+            std::fs::write(server.dir.join("short-write.cut.test"), b"").unwrap();
+            send(&mut c, &["BGREWRITEAOF"]);
+            // The turn-over is made by the next write, or the writer.
+            let mut w = server.conn();
+            send(&mut w, &["SET", "w:300", "1"]);
+            let deadline = Instant::now() + LONG;
+            while server.child.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "{what}: the server did not stop");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let log = std::fs::read_to_string(server.dir.join("server.log")).unwrap();
+            assert!(
+                log.contains("exiting rather than write records after half of one"),
+                "{what}"
+            );
+            for f in ["short-write.record.test", "short-write.cut.test"] {
+                std::fs::remove_file(server.dir.join(f)).unwrap();
+            }
+            let mut c = server.restart();
+            assert!(loaded_of(&mut c, "w", 301, &what) >= 300, "{what}");
+            continue;
+        }
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        wait_idle(&mut c);
+        std::fs::remove_file(server.dir.join("short-write.record.test")).unwrap();
+        let log = std::fs::read(server.dir.join(LOG)).unwrap();
+        assert!(
+            !holds(&log, b"KIVIDB.AOF-OLD-LOG-END"),
+            "{what}: half a record is left"
+        );
+        fill_seq(&mut c, 300, 100);
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        assert_eq!(loaded_of(&mut c, "w", 400, &what), 400, "{what}");
     }
 }
