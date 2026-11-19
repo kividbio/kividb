@@ -492,21 +492,27 @@ One not saved by then (a slow disk, a failed save) takes over all the same
 background, made again every second until the save works.
 
 A node stopped before that save was done starts again from the file of
-before: a replica of the old master. The other masters still send the old
-master's slots to it, and say so in their answers to its heartbeats. Once a
-majority of the masters that own slots say it owns every slot of its old
-master at a config epoch newer than any it knows for those slots, it
-completes the promotion at that epoch, within a heartbeat or two of
-starting: it takes the slots, saves the promotion as above, and serves them
-with the dataset it has (with the AOF on, everything it had acknowledged).
-It does not sync from the old master first, even if that one is reachable:
-a node that starts as a replica begins its first sync only once a majority
-of the masters that own slots (its own not counted) has answered it, or a
-node timeout after it started, and not at all when it is to complete a
-promotion. It does not take them if another node owns them at a newer epoch (a replica
-elected since, a `CLUSTER FAILOVER TAKEOVER`): it follows that one. Nodes of
-1.2 among the masters say nothing of it, so the majority has to be made of
-masters of a later release.
+before: a replica of the old master. It completes the promotion from what
+the masters report: a master that holds it as the owner of slots says so in
+its answers to its heartbeats, with the config epoch and the number of
+masters that own slots in its view. Once a majority of the masters that own
+slots (of the greater of that number and its own count) say it owns every
+slot of its old master at a config epoch newer than any it knows for those
+slots, it completes the promotion at that epoch, within a heartbeat or two
+of starting: it takes exactly those slots, saves the promotion as above, and
+serves them with the dataset it has. With the AOF on, that is everything it
+had acknowledged. Without it (and no snapshot from a clean shutdown), the
+node serves none of them until a replica that holds them takes over or its
+replicas answer that they hold nothing either, as a master back without its
+dataset does; with no replica, it serves what it has. A node that starts as
+a replica begins its first sync once enough of the masters have answered
+that it is not to complete a promotion (with three masters, two of them), or
+a node timeout after it started, and not at all when it is to complete one.
+It does not take the slots if another node owns them at a newer epoch (a
+replica elected since, a `CLUSTER FAILOVER TAKEOVER`): it follows that one.
+A master that voted for another replica to replace the node says nothing of
+it while that election may still be won. Nodes of 1.2 among the masters say
+nothing of it, so the majority has to be made of masters of a later release.
 
 A filesystem that cannot sync a directory at all (some FUSE, CIFS and 9p
 mounts answer `EINVAL` or `ENOTSUP`) does not fail the save: the node warns

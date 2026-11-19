@@ -1394,9 +1394,9 @@ mod tests {
     }
 
     /// A master that voted for a replacement of a node sends that node no
-    /// report while the vote may still be won and announced: the node
-    /// would complete its promotion on it and take writes that the winner's
-    /// claim then replaces.
+    /// report while the vote may still be won and announced: the node is not
+    /// to complete a promotion of its own while the winner's newer claim is
+    /// on its way.
     #[test]
     fn a_master_that_voted_for_a_replacement_sends_no_report() {
         let cs = ClusterState::new_enabled(None, 15000);

@@ -705,11 +705,11 @@ fn start_configured_replication(
     // Still a replica as far as the cluster is concerned: mark the role so
     // this node stays read-only. The bus starts the replication client
     // (`ClusterState::reconcile_replication`) once it knows the master's
-    // address, and, for this first sync after a start, once a quorum of the
-    // masters has answered or a node timeout has passed: a node restarted
-    // before its promotion was saved learns from them that it is the owner,
-    // and is promoted instead of syncing over the writes it took as master
-    // (`ClusterState::first_sync_may_begin`).
+    // address, and, for this first sync after a start, once enough of the
+    // masters have answered that it is not to complete a promotion, or a
+    // node timeout has passed: a node restarted before its promotion was
+    // saved learns from them that it is the owner, and completes the
+    // promotion (`ClusterState::first_sync_may_begin`).
     log_info!(
         "Cluster: Restored replica role of master {}: replicating once the masters have \
          answered (at most one node timeout)",

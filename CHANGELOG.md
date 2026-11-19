@@ -1076,25 +1076,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for what failover needs of the disk.
 
 - **A node that restarts before its promotion was saved completes it once a
-  majority of the masters report it as the owner.** A replica that won an
-  election and was stopped before a save of its promotion was done starts
-  again from the `nodes.conf` of before, as a replica of the old master,
-  while the other masters send that master's slots to it. A master now
-  tells such a node, in its answer to the node's heartbeat, which slots it
-  holds it as the owner of and at which config epoch (a field that 1.2
-  nodes do not send and do not read). Once a majority of the masters that
-  own slots say it owns every slot of its old master, at a config epoch
-  newer than any it knows for those slots, the node takes them over at that
-  epoch, saves that as a promotion is saved, and serves them with the
-  dataset it has. So that a sync with the old master, if it is reachable,
-  does not replace that dataset first, a node that starts as a replica
-  begins its first sync once a majority of the masters that own slots (its
-  own master not counted) has answered it, or one node timeout after it
-  started, whichever is first, and not at all if it is to complete a
-  promotion; later syncs do not wait. A master that owns those slots at a
-  newer epoch (another replica elected since, a `CLUSTER FAILOVER
-  TAKEOVER`) is followed instead, as before. With nodes of 1.2 among the
-  masters, the majority has to be made of masters of this release.
+  majority of the masters report it as the owner.** A node restarted before
+  the save of its promotion was done completes the promotion from what the
+  masters report. A master tells such a node, in its answer to the node's
+  heartbeat, which slots it holds it as the owner of, at which config
+  epoch, and how many masters own slots in its view (a field that 1.2 nodes
+  do not send and do not read). Once a majority of the masters that own
+  slots (of the greater of that count and the node's own) say it owns every
+  slot of its old master, at a config epoch newer than any it knows for
+  those slots, the node takes exactly those slots over at that epoch, saves
+  that as a promotion is saved, and serves them with the dataset it has.
+  Without the AOF (and no snapshot from a clean shutdown), it serves none of
+  them until a replica that holds them has taken over or its replicas have
+  answered that they hold nothing either, as a master back without its
+  dataset does; with no replica, it serves what it has. A master that voted
+  for another replica to replace the node gives no such answer while that
+  election may still be won, and votes for no replacement of the node while
+  the node may be completing its promotion on its answer. A node that starts
+  as a replica begins its first sync once enough of the masters have
+  answered that it is not to complete a promotion (with three masters, two
+  of them), or one node timeout after it started, whichever is first, and
+  not at all if it is to complete one; later syncs do not wait. A master
+  that owns those slots at a newer epoch (another replica elected since, a
+  `CLUSTER FAILOVER TAKEOVER`) is followed instead, as before. With nodes of
+  1.2 among the masters, the majority has to be made of masters of this
+  release.
 
 - **`MONITOR` no longer loses lines.** A monitor was fed through a ring of
   4,096 lines shared by all monitors, and one that fell that far behind

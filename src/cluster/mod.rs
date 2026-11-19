@@ -3062,9 +3062,9 @@ impl ClusterState {
     /// here. Also `None` while this node's vote for a replacement of `to`
     /// may still be won and announced ([`Self::vote_withholds_reports`]):
     /// a replica elected to replace it, with this vote, may be saving its
-    /// promotion and not yet have announced it, and `to`, completing its own
-    /// promotion on this report, would take writes the winner's claim then
-    /// replaces. A report sent is noted, and this node votes for no
+    /// promotion and not yet have announced it, and `to` is not to
+    /// complete a promotion of its own meanwhile: the winner's newer claim
+    /// is on its way. A report sent is noted, and this node votes for no
     /// replacement of `to` for a while after it ([`Self::cast_vote`]).
     /// Both are decided under `last_vote_for`: one or the other.
     pub fn owner_report_for(&self, to: NodeId) -> Option<crate::cluster::bus::OwnerReport> {
