@@ -3331,7 +3331,9 @@ fn old_log_with(n: usize, tail: &[u8]) -> Vec<u8> {
 #[test]
 fn an_old_log_cut_short_is_cut_before_records_are_added_to_it() {
     let n = 100;
-    let torn = set_record("old:torn", "1")[..9].to_vec();
+    // Cut inside a value: the records added after it are misread from there
+    // (a cut just after a length can happen to line up with them again).
+    let torn = set_record("old:torn", "1")[..21].to_vec();
     let huge = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$999999999\r\nab".to_vec();
     // (what, old log, new log, a stop in the middle of the cut)
     type Case = (&'static str, Vec<u8>, Vec<u8>, Option<&'static str>);
