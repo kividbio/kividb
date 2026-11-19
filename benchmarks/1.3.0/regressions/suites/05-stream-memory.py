@@ -32,7 +32,7 @@ from suite import Suite, Config, MEMORY, KEEP_IMPROVEMENT, rel, info, scaled, me
 from rss import vmrss_mib, used_memory_mib  # noqa: E402
 from nodes import redis_tool  # noqa: E402
 
-S = Suite("05-stream-memory", [Config("one1m"), Config("shapes")])
+S = Suite("05-stream-memory", [Config("one1m", threads=2), Config("shapes", threads=2)])
 PER_ENTRY = [rel(5, abs=1), KEEP_IMPROVEMENT]
 RATE = rel(15)
 

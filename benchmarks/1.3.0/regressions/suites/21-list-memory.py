@@ -44,7 +44,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 from suite import Suite, Config, KEEP_IMPROVEMENT, EXACT, rel, info, scaled  # noqa: E402
 
-S = Suite("21-list-memory", [Config("packed"), Config("plain"), Config("short"), Config("queue")])
+S = Suite("21-list-memory", [Config("packed", threads=4), Config("plain", threads=4), Config("short", threads=4), Config("queue", threads=4)])
 SIZES = [10, 100, 1000, 100_000]
 TOTAL = 1_000_000
 BATCH = 500

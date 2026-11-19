@@ -8,8 +8,18 @@ fn parse_sleep_seconds(raw: &[u8]) -> Option<f64> {
     std::str::from_utf8(raw).ok()?.parse().ok()
 }
 
+/// Redis's refusal while `enable-debug-command` does not allow the client.
+pub(crate) const NOT_ALLOWED: &str = "ERR DEBUG command not allowed. If the \
+    enable-debug-command option is set to \"local\", you can run it from a local connection, \
+    otherwise you need to set this option in the configuration file, and then restart the \
+    server.";
+
 /// `DEBUG ...` — protocol helpers and sleep match Redis `debug.c` for scripting tests.
 pub fn handle(ctx: &mut Ctx) -> Option<Vec<u8>> {
+    // After the ACL check, which runs before any command is dispatched.
+    if !ctx.config.enable_debug_command.allows(ctx.peer_addr) {
+        return Some(resp_error(NOT_ALLOWED));
+    }
     if ctx.cmd.len() < 2 {
         return Some(resp_error(
             "ERR wrong number of arguments for 'debug' command",

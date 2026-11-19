@@ -79,6 +79,7 @@ fn spawn(dir: &Path, port: u16, extra: &[String]) -> Child {
     Command::new(kividb_bin())
         .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
         .args(["--dir", dir.to_str().unwrap(), "--loglevel", "warning"])
+        .args(["--enable-debug-command", "yes"])
         .args(extra)
         .stdout(Stdio::null())
         .spawn()

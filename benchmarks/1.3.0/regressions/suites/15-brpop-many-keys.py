@@ -62,9 +62,9 @@ BATCH = 200
 EVERY = 0.1
 
 S = Suite("15-brpop-many-keys", [
-    Config("c1000"),
-    Config("c4000"),
-    Config("c1000x1"),
+    Config("c1000", threads=2),
+    Config("c4000", threads=2),
+    Config("c1000x1", threads=2),
 ])
 SHAPES = {"c1000": (1000, 270), "c4000": (4000, 270), "c1000x1": (1000, 1)}
 

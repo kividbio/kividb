@@ -2016,6 +2016,12 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
         );
         std::thread::sleep(delay);
     }
+    // Tests: held here, on the migration's own thread, with the stream
+    // caught up and writes not paused yet. Nothing from here to the
+    // TAKEOVER needs a connection to this node, so a test can hold a
+    // command at `routed` meanwhile on the io_uring loop, where that holds
+    // its whole worker (#339).
+    crate::aof::failpoint("handoff-pausing");
     no_failover_since()?;
 
     // ── Handoff ──────────────────────────────────────────────────────────
@@ -3523,7 +3529,7 @@ mod tests {
         index_store: crate::vector::IndexStore,
         repl_state: Arc<ReplState>,
         hub_tx: HubTx,
-        _hub_rx: tokio::sync::mpsc::UnboundedReceiver<crate::replication::HubMsg>,
+        _hub_rx: crate::replication::HubRx,
     }
 
     impl Lost {
@@ -3539,7 +3545,7 @@ mod tests {
             for i in 0..OLD {
                 set(&store, &old_key(i), "old");
             }
-            let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (hub_tx, _hub_rx) = crate::replication::HubTx::channel();
             Lost {
                 cluster: Arc::new(cluster),
                 other,

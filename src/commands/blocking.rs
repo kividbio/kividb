@@ -1393,7 +1393,7 @@ mod gone_resume_tests {
         let _pause = crate::pause::TEST_LOCK.lock();
         let store = crate::store::new_store(1);
         let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
-        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (hub_tx, _hub_rx) = crate::replication::HubTx::channel();
         let config = Arc::new(crate::config::Config::default());
         let started_at = Instant::now();
         let index_store = crate::vector::new_index_store();
@@ -1443,6 +1443,7 @@ mod gone_resume_tests {
                 apply_replication: false,
                 skip_write_side_effects: false,
                 peer_addr: "127.0.0.1:1",
+                peer_ipv6: false,
                 monitor_registry: &monitor_registry,
                 authenticated_user: "default",
                 tracking_table: &tracking_table,
@@ -1460,7 +1461,7 @@ mod gone_resume_tests {
         let _pause = crate::pause::TEST_LOCK.lock();
         let store = crate::store::new_store(1);
         let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
-        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (hub_tx, _hub_rx) = crate::replication::HubTx::channel();
         let config = Arc::new(crate::config::Config::default());
         let started_at = Instant::now();
         let index_store = crate::vector::new_index_store();
@@ -1510,6 +1511,7 @@ mod gone_resume_tests {
                 apply_replication: false,
                 skip_write_side_effects: false,
                 peer_addr: "127.0.0.1:1",
+                peer_ipv6: false,
                 monitor_registry: &monitor_registry,
                 authenticated_user: "default",
                 tracking_table: &tracking_table,

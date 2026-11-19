@@ -1223,7 +1223,7 @@ fn deleted_before_anything_else(aof: &[Vec<String>], key: &str, made_by: usize) 
 /// of it, and a replay has none of the keys.
 #[test]
 fn a_write_that_finds_its_key_past_its_time_reaches_no_replica_as_a_change() {
-    let mut master = Server::with_aof();
+    let mut master = Server::start(&["--aof", "--enable-debug-command", "yes"]);
     let replica = Server::replica_of(&master);
     let (mut m, mut r) = (master.conn(), replica.conn());
     m.ok(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]);
@@ -1275,7 +1275,7 @@ fn a_write_that_finds_its_key_past_its_time_reaches_no_replica_as_a_change() {
 /// The same from a transaction and, with Lua, from a script.
 #[test]
 fn a_write_in_a_transaction_or_a_script_that_finds_its_key_past_its_time() {
-    let master = Server::with_aof();
+    let master = Server::start(&["--aof", "--enable-debug-command", "yes"]);
     let replica = Server::replica_of(&master);
     let (mut m, mut r) = (master.conn(), replica.conn());
     m.ok(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]);

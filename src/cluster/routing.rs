@@ -20,7 +20,11 @@ pub enum RouteDecision {
     /// The dispatcher should respond with -MOVED instead of executing.
     Moved {
         slot: u16,
+        /// The target's endpoint for a client connected over IPv4, and over
+        /// IPv6 (`ClusterState::endpoint_of`): they differ only where the
+        /// target announces a client address (#847).
         target_ip: String,
+        target_ip6: String,
         target_port: u16,
     },
     /// Slot is being migrated away from us. Key isn't here anymore — tell
@@ -28,6 +32,7 @@ pub enum RouteDecision {
     Ask {
         slot: u16,
         target_ip: String,
+        target_ip6: String,
         target_port: u16,
     },
     /// Multi-key command spanning slots — respond with -CROSSSLOT.
@@ -47,19 +52,28 @@ pub enum RouteDecision {
 
 impl RouteDecision {
     /// The reply that turns the command away, or `None` when it may run here.
-    pub fn refusal(&self) -> Option<Vec<u8>> {
+    /// `ipv6_client` says whether the client is connected over IPv6, for the
+    /// address a redirect gives it (#847).
+    pub fn refusal(&self, ipv6_client: bool) -> Option<Vec<u8>> {
+        let pick = |v4: &'_ str, v6: &'_ str| if ipv6_client { v6 } else { v4 }.to_string();
         match self {
             RouteDecision::Passthrough | RouteDecision::OwnedSlot(_) => None,
             RouteDecision::Moved {
                 slot,
                 target_ip,
+                target_ip6,
                 target_port,
-            } => Some(moved_error(*slot, target_ip, *target_port)),
+            } => Some(moved_error(
+                *slot,
+                &pick(target_ip, target_ip6),
+                *target_port,
+            )),
             RouteDecision::Ask {
                 slot,
                 target_ip,
+                target_ip6,
                 target_port,
-            } => Some(ask_error(*slot, target_ip, *target_port)),
+            } => Some(ask_error(*slot, &pick(target_ip, target_ip6), *target_port)),
             RouteDecision::CrossSlot => Some(crossslot_error()),
             RouteDecision::Unassigned { slot } => Some(clusterdown_error(*slot)),
             RouteDecision::ClusterDown => Some(clusterdown_state_error()),
@@ -110,6 +124,9 @@ pub struct Caller<'a> {
     pub client_id: u64,
     pub store: &'a crate::store::Store,
     pub db: usize,
+    /// Whether the client is connected over IPv6: which address a redirect
+    /// gives it (#847).
+    pub ipv6: bool,
 }
 
 impl Caller<'_> {
@@ -163,7 +180,7 @@ pub fn queue_refusal(caller: &Caller, cmd: &[&[u8]]) -> Option<Vec<u8>> {
         return None;
     }
     let asking = caller.asking();
-    caller.route(cmd, asking).refusal()
+    caller.route(cmd, asking).refusal(caller.ipv6)
 }
 
 /// The reply that refuses to run a queued transaction, or `None` when EXEC
@@ -293,7 +310,7 @@ fn route_queue(caller: &Caller, queue: &[Vec<Vec<u8>>], asking: bool) -> Option<
             crate::read_lock!(shard).contains_key(key)
         },
     )
-    .refusal()
+    .refusal(caller.ipv6)
 }
 
 // ── For the tests of a command routed before its keys moved (#331) ──────────
@@ -440,16 +457,19 @@ fn route_keys<'k, I: Iterator<Item = &'k [u8]>>(
 
     let me = cluster.myself();
     let node_addr = |id: &crate::cluster::NodeId| {
-        cluster
-            .nodes
-            .read()
-            .get(id)
-            .map(|n| (cluster.endpoint_of(n), n.client_facing_port()))
+        cluster.nodes.read().get(id).map(|n| {
+            (
+                cluster.endpoint_of(n, false),
+                cluster.endpoint_of(n, true),
+                n.client_facing_port(),
+            )
+        })
     };
     let moved_to = |id: &crate::cluster::NodeId| match node_addr(id) {
-        Some((ip, port)) => RouteDecision::Moved {
+        Some((ip, ip6, port)) => RouteDecision::Moved {
             slot: first_slot,
             target_ip: ip,
+            target_ip6: ip6,
             target_port: port,
         },
         None => RouteDecision::Unassigned { slot: first_slot },
@@ -503,9 +523,10 @@ fn route_keys<'k, I: Iterator<Item = &'k [u8]>>(
                 // None here: either all moved or never existed. The
                 // destination can answer either way.
                 match node_addr(&dest_id) {
-                    Some((ip, port)) => RouteDecision::Ask {
+                    Some((ip, ip6, port)) => RouteDecision::Ask {
                         slot: first_slot,
                         target_ip: ip,
+                        target_ip6: ip6,
                         target_port: port,
                     },
                     None => RouteDecision::Unassigned { slot: first_slot },

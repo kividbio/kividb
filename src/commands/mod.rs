@@ -6,7 +6,9 @@ pub(crate) mod backup;
 pub(crate) mod bf;
 mod bitmap;
 pub mod blocking;
+pub(crate) mod cf;
 pub(crate) mod cluster;
+pub(crate) mod cms;
 mod command_docs;
 mod command_docs_table;
 mod connection;
@@ -14,6 +16,7 @@ pub mod ctx;
 mod debug_cmd;
 pub mod expr;
 mod generics;
+pub(crate) use generics::restore_wanted;
 mod geo;
 mod glob_redis;
 pub mod handler;
@@ -76,18 +79,25 @@ pub mod server;
 mod set_card;
 mod sets;
 pub mod slowlog;
+// HSCAN and SSCAN over the large form of hashes and sets (#770).
+#[cfg(target_pointer_width = "64")]
+mod table_scan;
 // `pub(crate)` only so `replication::script_feed` can share XADD's option scan
 // when rewriting an auto-generated ID; the handlers themselves stay internal.
 pub(crate) mod stream_extra;
 pub(crate) mod streams;
 mod strftime;
 mod strings;
+pub(crate) mod tdigest;
+pub(crate) mod topk;
 pub mod transaction;
 // `pub(crate)` only so `replication::script_feed` finds where a
 // `TS.INCRBY` has its `TIMESTAMP`, as the command reads it.
 pub(crate) mod ts;
 mod ts_query;
-mod vector;
+// `pub(crate)` only so `vector::backlog`'s property test runs the filtered
+// KNN ways a query takes.
+pub(crate) mod vector;
 mod vset;
 mod vset_filter;
 mod zset;

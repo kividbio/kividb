@@ -455,7 +455,7 @@ fn save(c: &mut Conn, dir: &Path, compression: &str) -> Vec<u8> {
 #[test]
 fn a_compressed_snapshot_holds_the_plain_image_and_loads_the_same() {
     let dir = tempfile::tempdir().unwrap();
-    let server = start(dir.path(), &[]);
+    let server = start(dir.path(), &["--enable-debug-command", "yes"]);
     let mut c = Conn::connect(server.port);
     // Off by default in 1.3: a rollback to 1.2 must work.
     assert_eq!(
@@ -516,7 +516,7 @@ fn a_compressed_snapshot_holds_the_plain_image_and_loads_the_same() {
     for (what, image) in [("plain", &plain), ("compressed", &compressed)] {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("dump.kdb"), image).unwrap();
-        let server = start(dir.path(), &[]);
+        let server = start(dir.path(), &["--enable-debug-command", "yes"]);
         let mut c = Conn::connect(server.port);
         let loaded = key_dump(&mut c);
         assert_eq!(loaded.len(), expected.len(), "{what}");

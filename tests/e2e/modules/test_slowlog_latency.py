@@ -84,15 +84,21 @@ def start_custom_server(port: int, extra_args: list[str]) -> subprocess.Popen:
     Start a server instance on `port` with `extra_args` and block until ready.
     Returns the Popen handle — caller must terminate() it.
     """
+    # A directory of its own: one engine to a data directory.
+    cwd = tempfile.mkdtemp(prefix="kividb-e2e-")
     if _IS_REDIS:
         base_args = [KIVI_BINARY, "--port", str(port), "--loglevel", "warning",
                      "--save", "", "--appendonly", "no", "--protected-mode", "no"]
     else:
-        base_args = [KIVI_BINARY, "--port", str(port), "--loglevel", "error"]
+        # A file, not the flag: releases before 1.3 have no such flag.
+        conf = os.path.join(cwd, "kividb.conf")
+        with open(conf, "w") as f:
+            f.write("enable-debug-command yes\n")
+        base_args = [KIVI_BINARY, "--port", str(port), "--loglevel", "error",
+                     "--configfile", conf]
     proc = subprocess.Popen(
         base_args + extra_args,
-        # A directory of its own: one engine to a data directory.
-        cwd=tempfile.mkdtemp(prefix="kividb-e2e-"),
+        cwd=cwd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

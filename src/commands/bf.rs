@@ -26,7 +26,8 @@
 //! Beyond Redis: a filter is held to size limits (`bloom-max-filter-bytes`
 //! and those of `sketch::bloom`), and a command from a client that would
 //! allocate more than `maxmemory` leaves room for evicts first, under the
-//! policy, and is refused with `OOM` only if that is not enough. A command
+//! policy, before it takes its keys (`sketch::room`), and is refused with
+//! `OOM` only if that is not enough. A command
 //! from a master or the AOF is held to neither `maxmemory` nor
 //! `bloom-max-filter-bytes`, only to the fixed limits, so that a replica or
 //! a replay never drops what the master took.
@@ -288,7 +289,7 @@ fn insert_form(key: &[u8], p: &Params, items: &[&[u8]]) -> Vec<Vec<u8>> {
 
 /// An integer as Redis reads one (`string2ll`): an optional `-`, digits, no
 /// leading zero, no `+`, nothing else.
-fn parse_ll(raw: &[u8]) -> Option<i64> {
+pub(crate) fn parse_ll(raw: &[u8]) -> Option<i64> {
     let (negative, digits) = match raw {
         [b'-', rest @ ..] => (true, rest),
         _ => (false, raw),
@@ -305,7 +306,7 @@ fn parse_ll(raw: &[u8]) -> Option<i64> {
 
 /// A double as Redis reads one (`strtod`, all of it): decimal or
 /// hexadecimal, `inf`, a sign; not NaN, not blanks around it.
-fn parse_double(raw: &[u8]) -> Option<f64> {
+pub(crate) fn parse_double(raw: &[u8]) -> Option<f64> {
     let text = std::str::from_utf8(raw).ok()?;
     if text.is_empty()
         || text.starts_with(char::is_whitespace)
@@ -378,27 +379,17 @@ fn shape_error(e: ShapeError) -> Vec<u8> {
 }
 
 /// The limits of a write, and room for it under `maxmemory`: for a command
-/// from a client, when there is a limit and what it would allocate
-/// (`bytes`, asked only then) does not fit, keys are evicted first as the
-/// policy allows, as Redis evicts before a command; `OOM` if that is not
-/// enough. Before any lock is taken, as eviction takes them. A command
-/// from a master or the AOF is held to neither `maxmemory` nor
-/// `bloom-max-filter-bytes` ([`Limits::structural`]), nor is a replica, as
-/// no write on one is.
+/// from a client, `OOM` if what it would allocate (`bytes`) does not fit.
+/// The room was made before the command took its keys' order, as Redis
+/// evicts before a command (`sketch::room`): nothing is evicted here.
+/// Before any lock is taken. A command from a master or the AOF is held to
+/// neither `maxmemory` nor `bloom-max-filter-bytes`
+/// ([`Limits::structural`]), nor is a replica, as no write on one is.
 fn limits(ctx: &mut Ctx, bytes: impl FnOnce(&Ctx) -> u64) -> Result<Limits, Vec<u8>> {
-    let from_client = !ctx.apply_replication && !ctx.repl_state.is_slave();
-    let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed) as u64;
-    if from_client && limit != 0 {
-        let bytes = bytes(ctx);
-        if !crate::sketch::room_for(bytes) {
-            let made = limit
-                .checked_sub(bytes)
-                .is_some_and(|room| crate::eviction::make_room(ctx, room as usize, true));
-            if !made {
-                return Err(resp_error(OOM));
-            }
-        }
+    if crate::sketch::room::check(ctx, bytes).is_err() {
+        return Err(resp_error(OOM));
     }
+    let from_client = !ctx.apply_replication && !ctx.repl_state.is_slave();
     Ok(if from_client {
         Limits::client()
     } else {
@@ -458,7 +449,7 @@ fn boolean(resp: u8, b: bool) -> Vec<u8> {
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     if !name.starts_with("BF.") {
-        return None;
+        return other_types(ctx, name);
     }
     let reply = match name {
         "BF.RESERVE" => reserve(ctx),
@@ -475,6 +466,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(reply)
+}
+
+/// The other probabilistic types' commands, which come to the dispatch
+/// where `BF.*` does: so that adding them added nothing to the dispatch of
+/// other commands.
+#[inline(never)]
+fn other_types(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
+    // Each type's handler answers `None` for a name not its own.
+    match name.as_bytes().first() {
+        Some(b'C') if name.starts_with("CF.") => crate::commands::cf::handle(ctx, name),
+        Some(b'C') => crate::commands::cms::handle(ctx, name),
+        Some(b'T') if name.starts_with("TOPK.") => crate::commands::topk::handle(ctx, name),
+        Some(b'T') => crate::commands::tdigest::handle(ctx, name),
+        _ => None,
+    }
 }
 
 /// The filter at `key` for reading: `Ok(None)` if there is no key,
@@ -511,6 +517,7 @@ fn with_filter_mut<T>(
     missing: impl FnOnce() -> Vec<u8>,
     f: impl FnOnce(&mut BloomChain, bool) -> T,
 ) -> Result<T, Vec<u8>> {
+    debug_assert!(!crate::sketch::room::asking());
     crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let mut map = write_lock!(shard);
@@ -598,6 +605,7 @@ fn reserve(ctx: &mut Ctx) -> Vec<u8> {
         Ok(limits) => limits,
         Err(e) => return e,
     };
+    debug_assert!(!crate::sketch::room::asking());
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
     let mut map = write_lock!(shard);
@@ -1075,6 +1083,7 @@ fn loadchunk(ctx: &mut Ctx) -> Vec<u8> {
         Ok(limits) => limits,
         Err(e) => return e,
     };
+    debug_assert!(!crate::sketch::room::asking());
     crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let mut map = write_lock!(shard);

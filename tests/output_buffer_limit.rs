@@ -254,6 +254,8 @@ impl Server {
                 io_model,
                 "--threads",
                 "2",
+                "--enable-debug-command",
+                "yes",
             ]);
             if with_config {
                 command.args(["--configfile", "kividb.conf"]);

@@ -20,9 +20,11 @@ for kind in $KINDS; do
     for spec in "$@"; do
       label=${spec%%=*} bin=${spec#*=}
       rm -rf /tmp/sc && mkdir -p /tmp/sc && cd /tmp/sc || exit 1
+      # A file, not the flag: older binaries have no --enable-debug-command.
+      echo "enable-debug-command yes" > /tmp/sc/kividb.conf
       valgrind --tool=callgrind --instr-atstart=no --callgrind-out-file=/tmp/sc/out \
         "$bin" --port $PORT --bind 127.0.0.1 --io-model "$MODEL" --threads 1 \
-        --loglevel warning > /tmp/sc/log 2>&1 &
+        --loglevel warning --configfile /tmp/sc/kividb.conf > /tmp/sc/log 2>&1 &
       vg=$!
       for _ in $(seq 240); do redis-cli -p $PORT ping 2>/dev/null | grep -q PONG && break; sleep 0.5; done
       python3 -I "$HERE/bench.py" load $PORT "$DOCS" $ttl > /dev/null || { echo "$kind $ttl $label LOAD-FAILED"; kill -9 $vg; continue; }

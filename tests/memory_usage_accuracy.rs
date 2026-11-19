@@ -221,7 +221,7 @@ fn memory_usage_of_sets_and_hashes_is_what_their_keys_take() {
 /// count of at least 0.
 #[test]
 fn samples_are_read_as_redis_reads_them() {
-    let server = Server::start();
+    let mut server = Server::start();
     let mut c = server.connect();
     assert!(matches!(
         c.cmd(&[b"MEMORY", b"USAGE", b"none"]),
@@ -280,7 +280,7 @@ const SHARE_MOVES: i64 = 64;
 /// `used_memory` gives the deleted keys back.
 #[test]
 fn memory_usage_of_a_key_stays_put_when_other_keys_come_and_go() {
-    let server = Server::start();
+    let mut server = Server::start();
     let mut c = server.connect();
     let names: Vec<Vec<u8>> = (0..64)
         .flat_map(|i| [b(format!("set:{i}")), b(format!("hash:{i}"))])
