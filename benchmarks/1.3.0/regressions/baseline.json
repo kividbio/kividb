@@ -7698,7 +7698,8 @@
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-18",
         "commit": "d1a6712c",
-        "label": "pr887-d1a6712c-d8s_v5"
+        "label": "pr887-d1a6712c-d8s_v5",
+        "rustc": "1.100.0"
       },
       "gate": [
         {
@@ -7721,7 +7722,8 @@
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-18",
         "commit": "d1a6712c",
-        "label": "pr887-d1a6712c-d8s_v5"
+        "label": "pr887-d1a6712c-d8s_v5",
+        "rustc": "1.100.0"
       },
       "gate": [
         {
@@ -7752,7 +7754,8 @@
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-18",
         "commit": "d1a6712c",
-        "label": "pr887-d1a6712c-d8s_v5"
+        "label": "pr887-d1a6712c-d8s_v5",
+        "rustc": "1.100.0"
       },
       "gate": [
         {
@@ -7783,7 +7786,8 @@
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-18",
         "commit": "d1a6712c",
-        "label": "pr887-d1a6712c-d8s_v5"
+        "label": "pr887-d1a6712c-d8s_v5",
+        "rustc": "1.100.0"
       },
       "gate": [
         {
@@ -7806,7 +7810,8 @@
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-18",
         "commit": "d1a6712c",
-        "label": "pr887-d1a6712c-d8s_v5"
+        "label": "pr887-d1a6712c-d8s_v5",
+        "rustc": "1.100.0"
       },
       "gate": [
         {
