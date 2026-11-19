@@ -940,7 +940,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   connections (Redis 8.10.2: 64k), p99 11.4 to 5.0 ms; LiteLLM's whole
   per-request mix of scripts, spend counters and cache from 89k to 226k
   commands a second, p99 19.8 to 3.8 ms (Redis: 104k, 9.5 ms). Scripts of
-  one tag and commands that are not scripts are unchanged.
+  one tag and commands that are not scripts are unchanged. Suite
+  `36-litellm-ratelimit` of the 1.3.0 regression suite measures this
+  again, and fails if the candidate runs fewer than 90 % of LiteLLM's
+  scripts beside others. On a Standard_D8s_v5, server on 4 CPUs, 200
+  connections: `BATCH_RATE_LIMITER` for a key and its team 167k calls a
+  second (Redis 8.10.2: 67k; 1.2.2: 61k), the per-request mix 232k (Redis:
+  93k; 1.2.2: 75k).
 
 - **Small sets take a half to a twelfth of the memory (#297).** A set of
   up to 128 members of up to 64 bytes is kept in one block, the members end

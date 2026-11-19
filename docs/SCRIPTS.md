@@ -296,6 +296,15 @@ master could have run them one after another.
   declare a key without a tag so that the script runs alone. Up to 1.2.2 a
   script whose `KEYS` carried two different tags was not held to them; it
   is now.
+- A key name a script builds while it runs is checked when the script uses
+  it, not read from the script's text. One that keeps a tag of the
+  script's `KEYS` is allowed (LiteLLM's limiter builds `<prefix>:requests`
+  from its window key `{api_key:k1}:window`, and runs beside others). One
+  that carries none of them is refused at that call, every time, by
+  design: it is the cluster's rule for a key of another slot, and there is
+  no setting that lets such a script run beside others. Declare that key
+  in `KEYS`, give it one of the tags, or let the script run alone (a key
+  without a tag in `KEYS`, or `lua-parallel-scripts no`).
 - `SCRIPT KILL` stops every running script that has not yet written, not
   one of them: with several running there is no saying which was meant.
 - Each thread that runs scripts this way keeps a Lua VM of its own. Scripts
