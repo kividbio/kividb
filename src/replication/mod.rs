@@ -4927,6 +4927,13 @@ fn in_group() -> bool {
     IN_GROUP.with(|g| g.get())
 }
 
+/// Whether this thread runs a script or a transaction (a propagation group
+/// is open): what it calls was admitted with it, and is not refused on its
+/// own (`aof::refusal_while_failing`).
+pub(crate) fn in_propagation_group() -> bool {
+    in_group()
+}
+
 /// Count a write of the open group, if one is open. At the second, the group
 /// becomes a transaction: its `MULTI` goes in front of the first.
 #[inline]

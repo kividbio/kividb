@@ -3489,11 +3489,16 @@ fn a_write_to_the_log_cut_short_is_taken_back_and_written_again() {
             durable(&mut c);
             std::fs::write(server.dir.join("short-write.test"), b"").unwrap();
             send(&mut c, &["MSET", "w:300", "1", "w:301", "1"]);
-            let mut w = server.conn();
-            send(&mut w, &["SET", "w:302", "1"]);
             std::thread::sleep(Duration::from_millis(1000));
             assert!(!has_reply(&mut c), "{what}: acknowledged, not written");
-            assert!(!has_reply(&mut w), "{what}: acknowledged, not written");
+            // From then on, writes are refused, as Redis refuses them.
+            let mut w = server.conn();
+            let refused = w.cmd(&["SET", "w:302", "1"]);
+            assert_eq!(
+                refused,
+                V::Err("MISCONF Errors writing to the AOF file: No space left on device".into()),
+                "{what}"
+            );
             let mut i = server.conn();
             let waited = i.cmd(&["WAITAOF", "1", "0", "200"]);
             assert_eq!(waited.arr()[0].i(), 0, "{what}: WAITAOF counted it");
@@ -3508,7 +3513,8 @@ fn a_write_to_the_log_cut_short_is_taken_back_and_written_again() {
             }
             std::fs::remove_file(server.dir.join("short-write.test")).unwrap();
             assert!(c.read().ok(), "{what}");
-            assert!(w.read().ok(), "{what}");
+            // Accepted again once the disk takes what is held.
+            assert!(w.cmd(&["SET", "w:302", "1"]).ok(), "{what}");
             assert_eq!(info_field(&mut i, "aof_last_write_status"), "ok", "{what}");
             assert_eq!(info_field(&mut i, "aof_acks_before_write"), "0", "{what}");
             fill_seq(&mut c, 303, 100);
@@ -3572,4 +3578,314 @@ fn a_record_of_the_old_logs_end_cut_short_is_taken_off_or_stops_the_server() {
         let mut c = server.restart();
         assert_eq!(loaded_of(&mut c, "w", 400, &what), 400, "{what}");
     }
+}
+
+// ── While the log cannot be written ──────────────────────────────────────────
+
+const MISCONF: &str = "MISCONF Errors writing to the AOF file: No space left on device";
+
+/// A server whose next write to the log fails (`short-writes`), with `INCR
+/// k` sent and held: written to memory, and not to the log.
+fn with_a_write_held(failpoints: &str) -> (Server, Conn) {
+    let server = Server::start("tokio", failpoints);
+    let mut c = server.conn();
+    fill_seq(&mut c, 0, 100);
+    durable(&mut c);
+    std::fs::write(server.dir.join("short-write.test"), b"").unwrap();
+    let mut held = server.conn();
+    send(&mut held, &["INCR", "k"]);
+    let deadline = Instant::now() + LONG;
+    while info_field(&mut c, "aof_last_write_status") != "err" {
+        assert!(Instant::now() < deadline, "the write was not held");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    (server, held)
+}
+
+/// What would be logged is refused while the log cannot be written, as
+/// Redis refuses it; reads are served; nothing more is held; and writes are
+/// accepted again once the disk takes what is held.
+#[test]
+fn writes_are_refused_while_the_log_cannot_be_written() {
+    let (server, mut held) = with_a_write_held("short-writes");
+    let mut c = server.conn();
+    let big = "x".repeat(10_000);
+    for i in 0..1000 {
+        assert_eq!(
+            c.cmd(&["SET", &format!("refused:{i}"), &big]),
+            V::Err(MISCONF.into())
+        );
+    }
+    assert_eq!(c.cmd(&["GET", "w:0"]).s(), "1");
+    assert_eq!(c.cmd(&["PING"]).s(), "PONG");
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 101);
+    // A transaction that writes is refused whole, at its EXEC.
+    assert!(c.cmd(&["MULTI"]).ok());
+    assert_eq!(c.cmd(&["SET", "in-tx", "1"]).s(), "QUEUED");
+    assert_eq!(
+        c.cmd(&["EXEC"]),
+        V::Err(format!(
+            "EXECABORT Transaction discarded because of: {MISCONF}"
+        ))
+    );
+    assert_eq!(c.cmd(&["EXISTS", "in-tx"]).i(), 0);
+    // Nothing of the refused writes is held: what is held is the INCR.
+    let log = std::fs::read_to_string(server.dir.join("server.log")).unwrap();
+    assert!(!log.contains("past the limit"), "held more");
+    std::fs::remove_file(server.dir.join("short-write.test")).unwrap();
+    assert_eq!(held.read().i(), 1);
+    assert!(c.cmd(&["SET", "after", "1"]).ok());
+    durable(&mut c);
+    drop((c, held));
+    let mut server = server;
+    server.kill();
+    let mut c = server.restart();
+    assert_eq!(c.cmd(&["GET", "k"]).s(), "1");
+    assert_eq!(c.cmd(&["GET", "after"]).s(), "1");
+    assert_eq!(c.cmd(&["EXISTS", "refused:0"]).i(), 0);
+}
+
+/// A save with the AOF off records the logs beside its dump. Made while a
+/// write was held, the log recorded did not hold it; written later, it made
+/// the log read as added to since the dump, and replayed over it: an `INCR`
+/// applied twice. The save now fails until what is held is written. The
+/// same for the AOF turned on again, whose checkpoint cannot turn the log
+/// over past what is held.
+#[test]
+fn a_save_or_an_enable_waits_for_what_the_log_could_not_take() {
+    for then in ["BGSAVE", "appendonly yes"] {
+        let (mut server, mut held) = with_a_write_held("short-writes");
+        let mut c = server.conn();
+        assert!(c.cmd(&["CONFIG", "SET", "appendonly", "no"]).ok(), "{then}");
+        if then == "BGSAVE" {
+            let started = c.cmd(&["BGSAVE"]);
+            if started.s().contains("started") {
+                wait_idle(&mut c);
+                assert_eq!(
+                    info_field(&mut c, "rdb_last_bgsave_status"),
+                    "err",
+                    "{then}"
+                );
+            }
+            assert!(!server.dir.join("dump.kdb").exists(), "{then}: saved");
+        } else {
+            let enabled = c.cmd(&["CONFIG", "SET", "appendonly", "yes"]);
+            assert!(matches!(enabled, V::Err(_)), "{then}: {enabled:?}");
+        }
+        std::fs::remove_file(server.dir.join("short-write.test")).unwrap();
+        assert_eq!(held.read().i(), 1, "{then}");
+        // The second's sync writes it.
+        let deadline = Instant::now() + LONG;
+        while info_field(&mut c, "aof_last_write_status") != "ok" {
+            assert!(Instant::now() < deadline, "{then}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(1500));
+        drop((c, held));
+        server.kill();
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["GET", "k"]).s(), "1", "{then}: applied twice");
+    }
+}
+
+/// A shutdown with writes held in memory says so. `SHUTDOWN` keeps the
+/// server running, its final save having failed; `SHUTDOWN NOSAVE` exits
+/// with status 1, saying how many bytes were lost.
+#[test]
+fn a_shutdown_with_writes_held_says_so() {
+    let (mut server, held) = with_a_write_held("short-writes");
+    let mut c = server.conn();
+    let refused = c.cmd(&["SHUTDOWN"]);
+    assert!(matches!(refused, V::Err(_)), "{refused:?}");
+    assert_eq!(c.cmd(&["PING"]).s(), "PONG");
+    let log = std::fs::read_to_string(server.dir.join("server.log")).unwrap();
+    assert!(log.contains("in memory only"), "the final save's error");
+    send(&mut c, &["SHUTDOWN", "NOSAVE"]);
+    let status = server.child.wait().unwrap();
+    assert_eq!(status.code(), Some(1));
+    let log = std::fs::read_to_string(server.dir.join("server.log")).unwrap();
+    assert!(
+        log.contains("are lost with the process"),
+        "no word of the loss"
+    );
+    drop((c, held));
+}
+
+/// Under `appendfsync always`, a reply's sync counted for `WAITAOF` all
+/// that was written, records the disk had not taken included, after a
+/// switch to `everysec` left barriers for it. `WAITAOF` counts nothing while
+/// records are held, and answers once the second's sync has written them.
+#[test]
+fn waitaof_counts_no_record_the_disk_has_not_taken() {
+    let server = Server::start("tokio", "short-writes,aof-fsync-before-reply");
+    let mut c = server.conn();
+    assert!(c.cmd(&["CONFIG", "SET", "appendfsync", "always"]).ok());
+    // The reply's sync for x is held; z's barrier waits behind it.
+    send(&mut c, &["SET", "x", "1"]);
+    assert!(server.reached("aof-fsync-before-reply.1", LONG));
+    let mut z = server.conn();
+    send(&mut z, &["SET", "z", "1"]);
+    std::thread::sleep(Duration::from_millis(200));
+    let mut a = server.conn();
+    assert!(a.cmd(&["CONFIG", "SET", "appendfsync", "everysec"]).ok());
+    std::fs::write(server.dir.join("short-write.test"), b"").unwrap();
+    let mut y = server.conn();
+    send(&mut y, &["SET", "y", "1"]);
+    let deadline = Instant::now() + LONG;
+    while info_field(&mut a, "aof_last_write_status") != "err" {
+        assert!(Instant::now() < deadline, "y was not held");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // A WAITAOF from now waits for y.
+    let mut w = server.conn();
+    send(&mut w, &["WAITAOF", "1", "0", "20000"]);
+    server.release("aof-fsync-before-reply.1");
+    // The sync for z's barrier, held in turn.
+    assert!(server.reached("aof-fsync-before-reply.2", LONG));
+    server.release("aof-fsync-before-reply.2");
+    assert!(c.read().ok());
+    assert!(z.read().ok());
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !has_reply(&mut w),
+        "WAITAOF counted y, which is not in the file"
+    );
+    // Once the disk takes it, the second's sync writes it, and WAITAOF
+    // answers.
+    std::fs::remove_file(server.dir.join("short-write.test")).unwrap();
+    let started = Instant::now();
+    assert_eq!(w.read().arr()[0].i(), 1);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(y.read().ok());
+}
+
+/// A replica whose log cannot be written keeps applying its master's
+/// stream, and holds its records. A full sync replaces its dataset: what is
+/// held is of the dataset replaced, and is dropped; the rebase onto the new
+/// dataset turns the log over, and a restart loads the new dataset, not the
+/// old one's records over it.
+#[test]
+fn a_full_sync_drops_what_the_replicas_log_could_not_take() {
+    let first = Server::start("tokio", "");
+    let mut m = first.conn();
+    for i in 0..100 {
+        assert!(m.cmd(&["SET", &format!("a:{i}"), "1"]).ok());
+    }
+    let mut replica = Server::start("tokio", "short-writes");
+    let mut r = replica.conn();
+    let port = first.port.to_string();
+    assert!(r.cmd(&["REPLICAOF", "127.0.0.1", &port]).ok());
+    let until = |r: &mut Conn, keys: i64| {
+        let deadline = Instant::now() + LONG;
+        while r.cmd(&["DBSIZE"]).i() != keys {
+            assert!(
+                Instant::now() < deadline,
+                "the replica did not reach {keys} keys"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    until(&mut r, 100);
+    std::fs::write(replica.dir.join("short-write.test"), b"").unwrap();
+    for i in 0..50 {
+        assert!(m.cmd(&["SET", &format!("b:{i}"), "1"]).ok());
+    }
+    until(&mut r, 150);
+    let deadline = Instant::now() + LONG;
+    while info_field(&mut r, "aof_last_write_status") != "err" {
+        assert!(Instant::now() < deadline, "the replica's log did not fail");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Another master, another dataset: a full sync.
+    let second = Server::start("tokio", "");
+    let mut m2 = second.conn();
+    for i in 0..200 {
+        assert!(m2.cmd(&["SET", &format!("c:{i}"), "1"]).ok());
+    }
+    drop(first);
+    let port = second.port.to_string();
+    assert!(r.cmd(&["REPLICAOF", "127.0.0.1", &port]).ok());
+    let deadline = Instant::now() + LONG;
+    while r.cmd(&["EXISTS", "c:199"]).i() != 1 || r.cmd(&["DBSIZE"]).i() != 200 {
+        assert!(Instant::now() < deadline, "no full sync");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::remove_file(replica.dir.join("short-write.test")).unwrap();
+    for i in 0..10 {
+        assert!(m2.cmd(&["SET", &format!("d:{i}"), "1"]).ok());
+    }
+    until(&mut r, 210);
+    let deadline = Instant::now() + LONG;
+    while info_field(&mut r, "aof_last_write_status") != "ok" {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    drop((r, m2));
+    replica.kill();
+    drop(second);
+    let mut r = replica.restart();
+    assert_eq!(
+        r.cmd(&["EXISTS", "b:0"]).i(),
+        0,
+        "the replaced dataset's writes"
+    );
+    assert_eq!(r.cmd(&["EXISTS", "a:0"]).i(), 0, "the replaced dataset");
+    assert_eq!(r.cmd(&["DBSIZE"]).i(), 210);
+}
+
+/// An old log that ends in a record cut short, left by a checkpoint that
+/// did not finish, and then a save with the AOF off, which records the
+/// logs beside its dump: the next start with the AOF on finds the old log
+/// older than that dump and leaves it out (kept aside), without cutting it,
+/// and the start after that judges it the same way.
+#[test]
+fn a_torn_old_log_beside_a_dump_saved_with_the_aof_off_is_judged_the_same_twice() {
+    let mut server = Server::start("tokio", "dump-installing");
+    let mut c = server.conn();
+    fill_seq(&mut c, 0, 100);
+    assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+    assert!(server.reached("dump-installing.1", LONG));
+    fill_seq(&mut c, 100, 100);
+    durable(&mut c);
+    drop(c);
+    server.kill();
+    server.release("dump-installing.1");
+    // The old log cut short.
+    let prev = server.dir.join(OLD_LOG);
+    let len = std::fs::metadata(&prev).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&prev)
+        .unwrap()
+        .set_len(len - 5)
+        .unwrap();
+    // A run with the AOF off saves a dump beside the logs.
+    server.failpoints.clear();
+    server.aof = false;
+    let mut c = server.restart();
+    assert!(c.cmd(&["SET", "off", "1"]).ok());
+    assert!(c.cmd(&["SAVE"]).ok());
+    drop(c);
+    server.kill();
+    server.aof = true;
+    let prev_before = std::fs::read(&prev).ok();
+    let mut c = server.restart();
+    let first = (c.cmd(&["DBSIZE"]).i(), c.cmd(&["GET", "off"]));
+    assert_eq!(first.1.s(), "1");
+    let kept = kept_aside(&server.dir).len();
+    if let Some(before) = &prev_before
+        && server.dir.join(OLD_LOG).exists()
+    {
+        assert_eq!(
+            &std::fs::read(&prev).unwrap(),
+            before,
+            "the old log was cut"
+        );
+    }
+    drop(c);
+    server.kill();
+    let mut c = server.restart();
+    assert_eq!((c.cmd(&["DBSIZE"]).i(), c.cmd(&["GET", "off"])), first);
+    assert_eq!(kept_aside(&server.dir).len(), kept);
 }

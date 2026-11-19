@@ -1830,6 +1830,14 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     {
         return resp_error(replication::NOREPLICAS);
     }
+    // While the AOF cannot be written, what would be logged is refused, as
+    // Redis refuses it (`MISCONF`). One relaxed load a command otherwise.
+    if crate::aof::write_failing()
+        && let Some(refusal) =
+            crate::aof::refusal_while_failing(ctx.cmd.as_slice(), name, ctx.apply_replication)
+    {
+        return refusal;
+    }
     // `LOADING` is for clients. A command arriving from the master's stream
     // (or from AOF replay) has to be applied regardless: refusing it does not
     // make the master retry, it just drops the write, and the replica quietly

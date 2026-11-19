@@ -751,6 +751,23 @@ static LOG_SUPERSEDED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// The dataset has moved on without the log. See [`LOG_SUPERSEDED`].
 pub fn log_superseded() {
     LOG_SUPERSEDED.store(true, Ordering::Relaxed);
+    // Records held because the disk would not take them (see
+    // [`UNWRITTEN`]) are of the dataset just replaced: written later, they
+    // would go into the log after it, and the rebase onto the new dataset
+    // could not turn the log over past them. Dropped, as what was queued
+    // for the writer is. Their replies, if any wait, go out as for a disk
+    // that is behind.
+    let _log = LOG.lock();
+    if HAS_UNWRITTEN.swap(false, Ordering::AcqRel) {
+        let mut held = UNWRITTEN.lock();
+        log_warn!(
+            "AOF: {} bytes of records that could not be written to {AOF_PATH} are of the dataset a \
+             full sync replaced, and are dropped",
+            held.bytes.len()
+        );
+        held.bytes = Vec::new();
+        held.barriers = Vec::new();
+    }
 }
 
 /// Get the log ready for `CONFIG SET appendonly yes`, with the turn of the
@@ -779,7 +796,10 @@ pub fn open_log(_turn: &CheckpointTurn) -> std::io::Result<()> {
         if LOG_SUPERSEDED.load(Ordering::Relaxed) || on_disk.age_of(AOF_PATH) != LogAge::GoesOn {
             // What is still queued goes to the old log, and the barriers in
             // it are answered. No turn-over mark is: the turn is held.
-            write_queued(&mut log.file, &mut log.rx, None);
+            write_queued(&mut log.file, &mut log.rx, None, true);
+            // Held, they would land in the new log, after the snapshot of the
+            // enable that holds them: applied twice.
+            all_written("the AOF cannot be turned on until they are")?;
             log.file = start_new_log(NewLogWhy::Enable, &[]).map_err(made)?;
         }
         return Ok(());
@@ -1234,7 +1254,7 @@ pub fn stream_applied() {
 fn write_what_is_queued(block: bool) -> Option<bool> {
     let mut log = if block { LOG.lock() } else { LOG.try_lock()? };
     let log = log.as_mut()?;
-    Some(write_queued(&mut log.file, &mut log.rx, None).1)
+    Some(write_queued(&mut log.file, &mut log.rx, None, false).1)
 }
 
 /// A barrier in the queue, followed by its number.
@@ -1317,6 +1337,37 @@ fn sync_failed_under_always(what: &str, e: &std::io::Error) -> ! {
 pub fn acks_wait() -> bool {
     AOF_ENABLED.load(Ordering::Relaxed)
         && (ACK_AFTER_WRITE.load(Ordering::Relaxed) || fsync_always())
+}
+
+/// For a connection's loop, before a command runs: whether the replies of
+/// its batch wait for the AOF (`wait`), because the command may write a
+/// record ([`may_log`]). While the log cannot be written, such a command is
+/// refused (see [`refusal_while_failing`]) and writes nothing, and its
+/// reply would wait for records of others the disk has not taken: instead,
+/// where [`AOF_WRITTEN`] stands is noted in `refused_from`, and the batch
+/// waits only if a record was queued since (see [`take_wait`]): the command
+/// was let through after all, the log having recovered meanwhile.
+#[inline]
+pub fn note_logged_command(cmd: &[&[u8]], wait: &mut bool, refused_from: &mut Option<u64>) {
+    if !*wait && acks_wait() && may_log(cmd) {
+        if write_failing() {
+            refused_from.get_or_insert(AOF_WRITTEN.load(Ordering::Relaxed));
+        } else {
+            *wait = true;
+        }
+    }
+}
+
+/// Whether the replies of the batch wait for the AOF now (see
+/// [`note_logged_command`]), and no longer after this.
+#[inline]
+pub fn take_wait(wait: &mut bool, refused_from: &mut Option<u64>) -> bool {
+    if let Some(from) = refused_from.take()
+        && AOF_WRITTEN.load(Ordering::Relaxed) != from
+    {
+        *wait = true;
+    }
+    std::mem::take(wait)
 }
 
 /// Whether a command may write a record its reply should wait for: a write,
@@ -1744,10 +1795,15 @@ fn sync_old_log() -> std::io::Result<()> {
 /// mark on the way (see [`turn_over_mark`]), and answering the barriers
 /// taken once what was before them is written. Returns whether anything was
 /// written, and whether any barrier was answered.
+///
+/// `retry`: whether records a write before could not write (see
+/// [`UNWRITTEN`]) are tried again now. Only the writer's sync does; anyone
+/// else adds what is queued after them.
 fn write_queued(
     file: &mut std::fs::File,
     rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
     mut first: Option<Vec<u8>>,
+    retry: bool,
 ) -> (bool, bool) {
     let mut wrote = false;
     let mut released = false;
@@ -1783,6 +1839,24 @@ fn write_queued(
         // What a write before this one could not write goes first, with the
         // barriers that wait for it (see [`UNWRITTEN`]).
         let took_unwritten = HAS_UNWRITTEN.load(Ordering::Relaxed);
+        if took_unwritten && !retry {
+            // Only the writer's sync tries the disk again, once a second: a
+            // connection's write, with the log locked, would write all that
+            // is held and take it back again, on its own thread. What came
+            // goes after what is held, in order.
+            let mut held = UNWRITTEN.lock();
+            held.bytes.append(&mut batch);
+            held.barriers.append(&mut barriers);
+            hold_no_more_than_the_limit(held.bytes.len());
+            drop(held);
+            if let Some(generation) = mark {
+                refuse_turn_over(generation);
+            }
+            if more_queued && drained < MAX_AOF_PASS_BYTES {
+                continue;
+            }
+            return (wrote, released);
+        }
         if took_unwritten {
             let mut held = UNWRITTEN.lock();
             let mut before = std::mem::take(&mut held.bytes);
@@ -1798,25 +1872,14 @@ fn write_queued(
             let mut held = UNWRITTEN.lock();
             held.bytes = batch;
             held.barriers = std::mem::take(&mut barriers);
-            HAS_UNWRITTEN.store(true, Ordering::Relaxed);
+            hold_no_more_than_the_limit(held.bytes.len());
+            HAS_UNWRITTEN.store(true, Ordering::Release);
             drop(held);
             // The records before a turn-over's mark are the old log's: with
             // some not written, the log is not turned over, and the
             // checkpoint fails, as one does whose turn-over fails.
             if let Some(generation) = mark {
-                let refused = Err(std::io::Error::other(format!(
-                    "records before the turn-over could not be written to {AOF_PATH}"
-                )));
-                let done = {
-                    let mut waiters = TURN_OVER_WAITERS.lock();
-                    waiters
-                        .iter()
-                        .position(|(g, _)| *g == generation)
-                        .map(|at| waiters.swap_remove(at).1)
-                };
-                if let Some(done) = done {
-                    let _ = done.send(refused);
-                }
+                refuse_turn_over(generation);
             }
             return (wrote, released);
         }
@@ -2247,9 +2310,158 @@ static UNWRITTEN: parking_lot::Mutex<Unwritten> = parking_lot::const_mutex(Unwri
 /// Whether [`UNWRITTEN`] holds anything: read with the log locked.
 static HAS_UNWRITTEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether the AOF has records it could not write: `aof_last_write_status`.
+/// Whether the AOF has records it could not write: `aof_last_write_status`,
+/// and the refusal of writes (see [`refusal_while_failing`]).
+#[inline]
 pub fn write_failing() -> bool {
     HAS_UNWRITTEN.load(Ordering::Relaxed)
+}
+
+/// At an exit, after the last sync ([`sync_for_shutdown`]): whether records
+/// are still held, in memory only, and lost with the process. Said, every
+/// time, with how many bytes.
+pub fn lost_at_exit() -> bool {
+    if !write_failing() {
+        return false;
+    }
+    log_error!(
+        "AOF: {} bytes of records could not be written to {AOF_PATH} ({}) and are lost with the \
+         process: the writes they hold are not on disk",
+        unwritten_bytes(),
+        last_write_error()
+    );
+    true
+}
+
+/// How many bytes of records are held (see [`UNWRITTEN`]).
+pub fn unwritten_bytes() -> usize {
+    UNWRITTEN.lock().bytes.len()
+}
+
+/// The most [`UNWRITTEN`] holds. While anything is held, writes from
+/// clients are refused (see [`refusal_while_failing`]), so what is held is
+/// the batch that failed, what was queued before the refusal began (the
+/// writes in flight, at most [`MAX_AOF_PASS_BYTES`] a pass), and what is not
+/// refused: a replica's stream from its master, and the deletes of keys
+/// that expire or are evicted. Past this, the server stops rather than hold
+/// writes in memory without end, or write the log with a hole in it.
+pub(crate) const MAX_UNWRITTEN_BYTES: usize = 256 * 1024 * 1024;
+
+fn hold_no_more_than_the_limit(held: usize) {
+    if held > MAX_UNWRITTEN_BYTES {
+        log_fatal!(
+            "AOF: {held} bytes of records could not be written to {AOF_PATH} ({}) and are held \
+             in memory, past the limit of {MAX_UNWRITTEN_BYTES} — exiting rather than hold more, \
+             or write the log with a hole in it. Free disk space in the data directory",
+            last_write_error()
+        );
+        std::process::exit(1);
+    }
+}
+
+/// Why the last write to the log failed, as Redis words it in `MISCONF`:
+/// the system's message, without Rust's "(os error N)".
+static LAST_WRITE_ERROR: parking_lot::Mutex<String> = parking_lot::const_mutex(String::new());
+
+fn last_write_error() -> String {
+    LAST_WRITE_ERROR.lock().clone()
+}
+
+fn note_write_error(e: &std::io::Error) {
+    let text = e.to_string();
+    let text = match text.rfind(" (os error ") {
+        Some(at) => text[..at].to_string(),
+        None => text,
+    };
+    *LAST_WRITE_ERROR.lock() = text;
+}
+
+/// While the log cannot be written ([`write_failing`]): the refusal of a
+/// command that would be logged, as Redis refuses it (`-MISCONF Errors
+/// writing to the AOF file: ...`): a write, or a script or a transaction
+/// that may make some, refused whole before it runs. Not a command applied
+/// from a master's stream (a replica keeps applying it, and holds its
+/// records with the rest), nor one a script or a transaction admitted
+/// before runs: they are not cut in two. Out of line: called only while
+/// the log fails.
+#[cold]
+#[inline(never)]
+pub(crate) fn refusal_while_failing(
+    cmd: &[&[u8]],
+    name: &str,
+    applied_from_master: bool,
+) -> Option<Vec<u8>> {
+    if applied_from_master || crate::replication::in_propagation_group() {
+        return None;
+    }
+    // A `SELECT` is logged, and changes no data: served.
+    let writes = crate::replication::command_mutates_for_replication(name, cmd)
+        && crate::replication::writes_the_dataset(name, cmd);
+    // A script, or a function, that may write: refused whole, before it
+    // runs. `EVAL_RO`, `EVALSHA_RO` and `FCALL_RO` write nothing, and run.
+    let script = cmd.first().is_some_and(|name| {
+        ["EVAL", "EVALSHA", "FCALL"]
+            .iter()
+            .any(|s| name.eq_ignore_ascii_case(s.as_bytes()))
+    });
+    (writes || script).then(misconf)
+}
+
+/// Whether a transaction is refused at its `EXEC` while the log cannot be
+/// written: when a command queued in it would be logged.
+pub(crate) fn exec_refusal_while_failing(queued: &[Vec<Vec<u8>>]) -> Option<Vec<u8>> {
+    if !write_failing() {
+        return None;
+    }
+    queued
+        .iter()
+        .any(|cmd| {
+            let cmd: Vec<&[u8]> = cmd.iter().map(Vec::as_slice).collect();
+            cmd.first()
+                .is_some_and(|name| !name.eq_ignore_ascii_case(b"SELECT"))
+                && may_log(&cmd)
+        })
+        .then(misconf)
+}
+
+/// `-MISCONF Errors writing to the AOF file: <why>`, Redis's words.
+pub(crate) fn misconf() -> Vec<u8> {
+    format!(
+        "-MISCONF Errors writing to the AOF file: {}\r\n",
+        last_write_error()
+    )
+    .into_bytes()
+}
+
+/// After `write_queued`: an error if records are still held, for a caller
+/// that is about to record what the log holds, or to replace it.
+fn all_written(what: &str) -> std::io::Result<()> {
+    if HAS_UNWRITTEN.load(Ordering::Relaxed) {
+        return Err(std::io::Error::other(format!(
+            "{} bytes of records could not be written to {AOF_PATH} ({}), so {what}",
+            unwritten_bytes(),
+            last_write_error()
+        )));
+    }
+    Ok(())
+}
+
+/// A turn-over whose mark comes after records not written: refused, and
+/// its checkpoint fails, as one does whose turn-over fails.
+fn refuse_turn_over(generation: u64) {
+    let refused = Err(std::io::Error::other(format!(
+        "records before the turn-over could not be written to {AOF_PATH}"
+    )));
+    let done = {
+        let mut waiters = TURN_OVER_WAITERS.lock();
+        waiters
+            .iter()
+            .position(|(g, _)| *g == generation)
+            .map(|at| waiters.swap_remove(at).1)
+    };
+    if let Some(done) = done {
+        let _ = done.send(refused);
+    }
 }
 
 /// `short-writes` in `KIVIDB_TEST_FAILPOINTS`: while [`SHORT_WRITE_TEST_FILE`]
@@ -2287,7 +2499,8 @@ fn write_batch(file: &mut std::fs::File, batch: &[u8]) -> bool {
             if file.write_all(&batch[done..done + half]).is_ok() {
                 done += half;
             }
-            break Some(std::io::Error::other("short write injected by a test"));
+            // As a full disk fails it (ENOSPC).
+            break Some(std::io::Error::from_raw_os_error(28));
         }
         match file.write(&batch[done..]) {
             Ok(0) => break Some(std::io::Error::from(std::io::ErrorKind::WriteZero)),
@@ -2299,6 +2512,7 @@ fn write_batch(file: &mut std::fs::File, batch: &[u8]) -> bool {
     let Some(e) = failed else {
         return true;
     };
+    note_write_error(&e);
     // Replies wait for this write and its sync: none can be sent without
     // it, nor with it lost. Redis exits too.
     if fsync_always() {
@@ -2342,6 +2556,13 @@ fn sync_for_replies() {
         // What the sync covers, as in [`do_fsync`]: `WAITAOF` and the
         // second's sync see it synced.
         let written = AOF_WRITTEN.load(Ordering::Relaxed);
+        // With records held (see [`UNWRITTEN`]), `written` counts them, and
+        // they are not in the file: nothing is counted, as in `do_fsync`.
+        let written = if HAS_UNWRITTEN.load(Ordering::Relaxed) {
+            0
+        } else {
+            written
+        };
         match log.as_ref() {
             Some(log) => (barriers, written, Some(log.file.try_clone())),
             // The AOF turned off since: nothing to sync.
@@ -2404,7 +2625,7 @@ fn do_fsync() {
             return;
         };
         // Drain pending writes before fsyncing, coalesced into one write.
-        let had_data = write_queued(&mut log.file, &mut log.rx, None).0;
+        let had_data = write_queued(&mut log.file, &mut log.rx, None, true).0;
         // What the sync covers: what is on this file now. Records others
         // write once the lock is let go may miss it, so they are not counted.
         let written = AOF_WRITTEN.load(Ordering::Relaxed);
@@ -2783,7 +3004,10 @@ fn logs_on_disk() -> std::io::Result<LogsAtSave> {
 /// recorded, and read as added to it since.
 fn logs_as_saved() -> std::io::Result<LogsAtSave> {
     if let Some(log) = LOG.lock().as_mut() {
-        write_queued(&mut log.file, &mut log.rx, None);
+        write_queued(&mut log.file, &mut log.rx, None, true);
+        // Recorded beside the dump while held, the log would read as added
+        // to since once they are written, and be replayed over it.
+        all_written("the save, which records the logs beside its dump, cannot be made")?;
         // Not synced, it is shorter after a power cut than recorded: read
         // as changed, it is replayed, as when nothing was recorded. Under
         // `appendfsync always` a failure is not passed over (see
@@ -5488,7 +5712,7 @@ mod backlog_tests {
         for _ in 0..records {
             tx.send(record.clone()).expect("send");
         }
-        let (wrote, released) = write_queued(&mut file, &mut rx, None);
+        let (wrote, released) = write_queued(&mut file, &mut rx, None, true);
         assert!(wrote);
         assert!(!released);
         assert!(rx.try_recv().is_err(), "nothing is left queued");
@@ -5514,10 +5738,10 @@ mod backlog_tests {
         for _ in 0..records {
             tx.send(record.clone()).expect("send");
         }
-        write_queued(&mut file, &mut rx, None);
+        write_queued(&mut file, &mut rx, None, true);
         let len = std::fs::metadata(&path).expect("metadata").len();
         assert_eq!(len, MAX_AOF_PASS_BYTES as u64, "one pass writes its budget");
-        write_queued(&mut file, &mut rx, None);
+        write_queued(&mut file, &mut rx, None, true);
         assert!(rx.try_recv().is_err(), "the next pass takes the rest");
         let len = std::fs::metadata(&path).expect("metadata").len();
         assert_eq!(len, (records * record.len()) as u64);
