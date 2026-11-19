@@ -166,6 +166,7 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
                 hostname: hostname.to_string(),
                 // Not persisted: the peer says it again on its next heartbeat.
                 announced_client_port: 0,
+                client_ips: Default::default(),
                 // A file an earlier version wrote has none: a master gets a
                 // new one, as Redis gives it one, and its replicas take it
                 // below.
@@ -1083,6 +1084,7 @@ mod tests {
                 fail_since_ms: 0,
                 hostname: String::new(),
                 announced_client_port: 0,
+                client_ips: Default::default(),
                 shard_id: generate_node_id(),
             },
         );
@@ -1119,6 +1121,7 @@ mod tests {
                 fail_since_ms: 0,
                 hostname: String::new(),
                 announced_client_port: 0,
+                client_ips: Default::default(),
                 shard_id: generate_node_id(),
             },
         );

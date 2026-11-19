@@ -228,6 +228,11 @@ pub fn allowed_cpu_ids() -> Option<Vec<usize>> {
 #[cfg(target_os = "linux")]
 static ALLOWED: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
 
+/// `std::thread::available_parallelism` as the first worker saw it before
+/// it was pinned: the CPU quota is in it, which the mask alone is not.
+#[cfg(target_os = "linux")]
+static UNPINNED: std::sync::OnceLock<Option<std::num::NonZeroUsize>> = std::sync::OnceLock::new();
+
 /// Set once a worker has been pinned: [`release_this_thread`] has work.
 static PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -261,7 +266,11 @@ fn set_affinity(cpus: &[usize]) -> std::io::Result<()> {
 /// compression, lazy free, pub/sub, vector postings) — would be held to the
 /// worker's one CPU. Each such thread calls [`release_this_thread`] first.
 #[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)]
 pub fn pin_this_thread(cpu: usize, allowed: &[usize]) -> std::io::Result<()> {
+    // What std counts while this thread still has the process's CPUs: the
+    // mask and a CPU quota (cgroup `cpu.max`, a container's `--cpus`).
+    let _ = UNPINNED.get_or_init(|| std::thread::available_parallelism().ok());
     let _ = ALLOWED.set(allowed.to_vec());
     PINNED.store(true, std::sync::atomic::Ordering::Relaxed);
     FREE.with(|free| free.set(false));
@@ -287,7 +296,8 @@ pub fn release_this_thread() {
 /// calling thread's mask, and on a bound worker that is one CPU: a `SAVE`
 /// run there froze the dataset with one thread instead of one per CPU, and
 /// held writes twice as long (42 against 23 ms on two CPUs). Once a worker
-/// is bound this answers with the CPUs the process may use.
+/// is bound this answers with the CPUs the process may use, no more than a
+/// CPU quota allows (as std counts it).
 #[allow(clippy::disallowed_methods)]
 pub fn available_parallelism() -> std::io::Result<std::num::NonZeroUsize> {
     #[cfg(target_os = "linux")]
@@ -296,9 +306,40 @@ pub fn available_parallelism() -> std::io::Result<std::num::NonZeroUsize> {
             .get()
             .and_then(|cpus| std::num::NonZeroUsize::new(cpus.len()))
     {
-        return Ok(n);
+        return Ok(match UNPINNED.get().copied().flatten() {
+            Some(quota) => n.min(quota),
+            None => n,
+        });
     }
     std::thread::available_parallelism()
+}
+
+/// The CPUs a CPU quota (cgroup `cpu.max`, a container's `--cpus`) lets the
+/// process use, when that is fewer than the CPUs its mask holds: `None`
+/// without a quota, or with one at least as large as the mask.
+///
+/// Under a quota a thread that runs only on idle CPUs (`SCHED_IDLE`) still
+/// spends the quota: with CPUs idle beside it, it runs, and the whole
+/// process is then throttled to the end of the period.
+#[allow(clippy::disallowed_methods)]
+pub fn cpu_quota() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let (mask, counted) = if PINNED.load(std::sync::atomic::Ordering::Relaxed) {
+            (
+                ALLOWED.get()?.len(),
+                UNPINNED.get().copied().flatten()?.get(),
+            )
+        } else {
+            (
+                allowed_cpu_ids()?.len(),
+                std::thread::available_parallelism().ok()?.get(),
+            )
+        };
+        (counted < mask).then_some(counted)
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
 }
 
 // ── Starting threads ──────────────────────────────────────────────────────

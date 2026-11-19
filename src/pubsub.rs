@@ -1011,6 +1011,7 @@ pub fn shard_subscribe_refusal(
     name: &str,
     cmd: &[&[u8]],
     cluster: &crate::cluster::ClusterState,
+    ipv6_client: bool,
 ) -> Option<Vec<u8>> {
     if name != "SSUBSCRIBE" || !cluster.enabled {
         return None;
@@ -1034,7 +1035,7 @@ pub fn shard_subscribe_refusal(
         || true,
         |_| false,
     )
-    .refusal()
+    .refusal(ipv6_client)
 }
 
 #[cfg(test)]

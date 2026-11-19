@@ -40,6 +40,32 @@ bitflags! {
     }
 }
 
+/// A node's `cluster-announce-client-ipv4` and `-ipv6` (#847): empty when
+/// it announces none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientIps {
+    pub v4: String,
+    pub v6: String,
+}
+
+impl ClientIps {
+    pub fn is_empty(&self) -> bool {
+        self.v4.is_empty() && self.v6.is_empty()
+    }
+}
+
+/// Whether a client's address, as `SocketAddr` writes it, is an IPv6 one
+/// (`[::1]:6379`): what Valkey's `isClientConnIpV6` asks of the client's
+/// connection, to pick the address it is told (#847). An IPv4 client of a
+/// node listening on `::` arrives as an IPv4-mapped address
+/// (`[::ffff:10.0.0.5]:6379`), and is an IPv4 one.
+pub fn is_ipv6_peer(peer_addr: &str) -> bool {
+    match peer_addr.parse::<std::net::SocketAddr>() {
+        Ok(addr) => addr.ip().to_canonical().is_ipv6(),
+        Err(_) => peer_addr.starts_with('['),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClusterNode {
     pub id: NodeId,
@@ -62,6 +88,11 @@ pub struct ClusterNode {
     /// balancer that maps ports); 0 if it announces none. Nodes reach each
     /// other at `client_port` regardless (#110).
     pub announced_client_port: u16,
+    /// The node's `cluster-announce-client-ipv4` / `-ipv6`: the addresses
+    /// clients connected over IPv4 / IPv6 are told to reach it at, where
+    /// that is not `ip` (#847). Empty if it announces none. Nodes reach each
+    /// other at `ip` regardless.
+    pub client_ips: ClientIps,
     /// The shard the node is in, as Redis's `shard_id` (`CLUSTER MYSHARDID`):
     /// random when the node is first known, its master's while it is a
     /// replica, and kept by a replica that is promoted, so that a shard keeps
@@ -86,6 +117,7 @@ impl ClusterNode {
             fail_since_ms: 0,
             hostname: String::new(),
             announced_client_port: 0,
+            client_ips: ClientIps::default(),
             shard_id: generate_node_id(),
         }
     }
@@ -97,6 +129,23 @@ impl ClusterNode {
             self.announced_client_port
         } else {
             self.client_port
+        }
+    }
+
+    /// The address a client is told to reach this node at, as Valkey's
+    /// `clusterNodeIp`: its `cluster-announce-client-ipv6` for a client
+    /// connected over IPv6, its `-ipv4` for any other, and its address when
+    /// it announces none for the client's family.
+    pub fn client_ip(&self, ipv6_client: bool) -> &str {
+        let announced = if ipv6_client {
+            &self.client_ips.v6
+        } else {
+            &self.client_ips.v4
+        };
+        if announced.is_empty() {
+            &self.ip
+        } else {
+            announced
         }
     }
 
@@ -219,5 +268,30 @@ mod tests {
         let a = generate_node_id();
         let b = generate_node_id();
         assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod client_address_tests {
+    use super::*;
+
+    #[test]
+    fn a_client_is_told_its_familys_address() {
+        let mut node = ClusterNode::new(generate_node_id(), "10.0.0.1".into(), 6379, 16379);
+        assert_eq!(node.client_ip(false), "10.0.0.1");
+        assert_eq!(node.client_ip(true), "10.0.0.1");
+        node.client_ips.v4 = "203.0.113.7".into();
+        assert_eq!(node.client_ip(false), "203.0.113.7");
+        assert_eq!(node.client_ip(true), "10.0.0.1");
+        node.client_ips.v6 = "2001:db8::7".into();
+        assert_eq!(node.client_ip(true), "2001:db8::7");
+    }
+
+    #[test]
+    fn an_ipv4_mapped_peer_is_an_ipv4_client() {
+        assert!(!is_ipv6_peer("127.0.0.1:50000"));
+        assert!(is_ipv6_peer("[::1]:50000"));
+        assert!(is_ipv6_peer("[2001:db8::7]:50000"));
+        assert!(!is_ipv6_peer("[::ffff:127.0.0.1]:50000"));
     }
 }

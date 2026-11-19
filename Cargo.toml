@@ -160,6 +160,9 @@ mach2 = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-uring = "0.5"
+# tokio-uring's own (same version): a `send` with `MSG_DONTWAIT`, which
+# tokio-uring's streams do not offer, is built as its `UnsubmittedOneshot`.
+io-uring = "0.6"
 # Behind the `mimalloc` feature: see there.
 mimalloc = { version = "0.1", default-features = false, optional = true }
 

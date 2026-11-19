@@ -31,7 +31,8 @@ pub mod search;
 pub mod slot;
 
 pub use node::{
-    ClusterNode, NODE_ID_ZERO, NodeFlags, NodeId, generate_node_id, node_id_str, parse_node_id,
+    ClientIps, ClusterNode, NODE_ID_ZERO, NodeFlags, NodeId, generate_node_id, is_ipv6_peer,
+    node_id_str, parse_node_id,
 };
 pub use routing::{RouteDecision, clusterdown_error, crossslot_error, moved_error, route_command};
 pub use slot::{CLUSTER_SLOTS, crc16, key_hash_slot};
@@ -511,6 +512,7 @@ impl ClusterState {
                 fail_since_ms: 0,
                 hostname: String::new(),
                 announced_client_port: 0,
+                client_ips: Default::default(),
                 shard_id: generate_node_id(),
             },
         );
@@ -619,6 +621,10 @@ impl ClusterState {
         state.set_replica_validity_factor(config.cluster_replica_validity_factor);
         state.set_my_hostname(&config.cluster_announce_hostname);
         state.set_my_announced_client_port(config.cluster_announce_client_port);
+        state.set_my_client_ips(ClientIps {
+            v4: config.cluster_announce_client_ipv4.clone(),
+            v6: config.cluster_announce_client_ipv6.clone(),
+        });
         state.search_pool.size_for(config.resolve_threads());
         if !config.cluster_bus_secret.is_empty() {
             let _ = state
@@ -1041,6 +1047,42 @@ impl ClusterState {
         }
     }
 
+    /// Set this node's `cluster-announce-client-ipv4` and `-ipv6` (empty:
+    /// none). Peers learn them from the next heartbeat (#847).
+    pub fn set_my_client_ips(&self, ips: ClientIps) {
+        if let Some(me) = self.nodes.write().get_mut(&self.myself()) {
+            me.client_ips = ips;
+        }
+    }
+
+    /// Change one of this node's client addresses, `cluster-announce-client-ipv6`
+    /// if `v6`, else `-ipv4` (empty: none), under one write of the node table,
+    /// so that two set at once both stay (#847).
+    pub fn set_my_client_ip(&self, v6: bool, ip: &str) {
+        if let Some(me) = self.nodes.write().get_mut(&self.myself()) {
+            if v6 {
+                me.client_ips.v6 = ip.to_string();
+            } else {
+                me.client_ips.v4 = ip.to_string();
+            }
+        }
+    }
+
+    /// Record the client addresses a peer says it announces, none included.
+    /// Only a node's own heartbeat says them: never gossip, as in Valkey, or
+    /// a node that had not heard of a change yet would bring the old ones
+    /// back (#847).
+    pub fn set_peer_client_ips(&self, id: NodeId, ips: &ClientIps) {
+        if id == self.myself() {
+            return;
+        }
+        if let Some(node) = self.nodes.write().get_mut(&id)
+            && node.client_ips != *ips
+        {
+            node.client_ips = ips.clone();
+        }
+    }
+
     /// Record the client port a peer announces. As for its hostname: its own
     /// word stands, none included; second-hand it only fills in.
     pub fn set_peer_client_port(&self, id: NodeId, port: u16, authoritative: bool) {
@@ -1127,11 +1169,13 @@ impl ClusterState {
     }
 
     /// Where clients are told to find `node`, as Redis's
-    /// `cluster-preferred-endpoint-type` has it: its address; its hostname,
-    /// `?` if it announces none; or empty, for "the address you used".
-    pub fn endpoint_of(&self, node: &ClusterNode) -> String {
+    /// `cluster-preferred-endpoint-type` has it: its address (for a client
+    /// connected over IPv6 or IPv4, the client address it announces for
+    /// that family, if any: `ClusterNode::client_ip`); its hostname, `?` if
+    /// it announces none; or empty, for "the address you used".
+    pub fn endpoint_of(&self, node: &ClusterNode, ipv6_client: bool) -> String {
         match self.preferred_endpoint() {
-            Endpoint::Ip => node.ip.clone(),
+            Endpoint::Ip => node.client_ip(ipv6_client).to_string(),
             Endpoint::Hostname if node.hostname.is_empty() => "?".to_string(),
             Endpoint::Hostname => node.hostname.clone(),
             Endpoint::Unknown => String::new(),
@@ -1152,6 +1196,10 @@ impl ClusterState {
     /// loopback or nodes.conf guess and this is a real interface address,
     /// adopt it.
     pub fn learn_self_ip(&self, local_ip: std::net::IpAddr) {
+        // A node listening on `::` that reached a peer over IPv4 has the
+        // IPv4-mapped form (`::ffff:a.b.c.d`) as its end: its IPv4 address
+        // is the one to take, and to hand to clients (#847).
+        let local_ip = local_ip.to_canonical();
         if !self.self_ip_is_guess.load(Ordering::Relaxed)
             || local_ip.is_loopback()
             || local_ip.is_unspecified()
@@ -4589,6 +4637,23 @@ mod tests {
         let recorded = cs.nodes.read().get(&cs.myself()).unwrap().ip.clone();
         assert_eq!(recorded, "10.1.2.3");
         assert_eq!(cs.advertised_ip(&recorded), "10.1.2.3");
+    }
+
+    /// Bound to `::`, a node that reaches a peer over IPv4 has the
+    /// IPv4-mapped form of its address as its end: it learns the IPv4
+    /// address, which is what clients are then told (#847).
+    #[test]
+    fn a_node_on_ipv6_wildcard_learns_its_ipv4_address_not_the_mapped_form() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        cs.configure_self_address("::", 7000, "", 0, 0);
+        let recorded = cs.nodes.read().get(&cs.myself()).unwrap().ip.clone();
+        assert_eq!(cs.advertised_ip(&recorded), "");
+        cs.learn_self_ip("::ffff:127.0.0.1".parse().unwrap());
+        let recorded = cs.nodes.read().get(&cs.myself()).unwrap().ip.clone();
+        assert_eq!(cs.advertised_ip(&recorded), "", "loopback teaches nothing");
+        cs.learn_self_ip("::ffff:10.1.2.3".parse().unwrap());
+        let recorded = cs.nodes.read().get(&cs.myself()).unwrap().ip.clone();
+        assert_eq!(recorded, "10.1.2.3");
     }
 
     #[test]

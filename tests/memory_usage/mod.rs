@@ -123,33 +123,69 @@ pub fn free_port() -> u16 {
     }
 }
 
+fn spawn_server(dir: &std::path::Path, port: u16) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kividb"));
+    command
+        .current_dir(dir)
+        .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
+        .args(["--configfile", "kividb.conf", "--threads", "2"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Ok(model) = std::env::var("KIVIDB_TEST_IO_MODEL") {
+        command.args(["--io-model", &model]);
+    }
+    command.spawn().expect("start kividb")
+}
+
 impl Server {
     pub fn start() -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
         let port = free_port();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kividb"));
-        command
-            .current_dir(&dir)
-            .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
-            .args(["--configfile", "kividb.conf", "--threads", "2"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if let Ok(model) = std::env::var("KIVIDB_TEST_IO_MODEL") {
-            command.args(["--io-model", &model]);
-        }
-        let child = command.spawn().expect("start kividb");
+        let child = spawn_server(&dir, port);
         Server { port, dir, child }
     }
 
-    pub fn connect(&self) -> Conn {
+    /// Starts the server again on another port.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.port = free_port();
+        self.child = spawn_server(&self.dir, self.port);
+    }
+
+    /// A connection to this server, and no other. The port was free when it
+    /// was picked, but the probe holds nothing while the server starts: a
+    /// server another test process is starting on the same port can bind it
+    /// first, and this one then exits with the port in use. Connecting
+    /// would reach that other server, and `used_memory` would be its, with
+    /// whatever its test loads at the time on top of this one's keys. So
+    /// the server that answers has to be the child's own (`process_id`),
+    /// and if it is not, the child starts again on another port.
+    pub fn connect(&mut self) -> Conn {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
+            if self.child.try_wait().ok().flatten().is_some() {
+                self.restart();
+                continue;
+            }
             match TcpStream::connect(("127.0.0.1", self.port)) {
                 Ok(s) => {
                     let mut c = Conn {
                         reader: BufReader::new(s.try_clone().unwrap()),
                         writer: s,
                     };
+                    if c.process_id() != self.child.id() as u64 {
+                        drop(c);
+                        // The child may be about to bind: give it a moment
+                        // before deciding that it has lost the port.
+                        std::thread::sleep(Duration::from_millis(100));
+                        if self.child.try_wait().ok().flatten().is_some() {
+                            self.restart();
+                        } else if Instant::now() >= deadline {
+                            panic!("port {} is another server's", self.port);
+                        }
+                        continue;
+                    }
                     // No snapshots while it is measured.
                     c.ok(&[b"CONFIG", b"SET", b"save", b""]);
                     return c;
@@ -271,6 +307,21 @@ impl Conn {
         }
     }
 
+    /// `process_id` of the server this connection reaches.
+    pub fn process_id(&mut self) -> u64 {
+        let Reply::Bulk(Some(info)) = self.cmd(&[b"INFO", b"server"]) else {
+            panic!("INFO server");
+        };
+        String::from_utf8(info)
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("process_id:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
     pub fn used_memory(&mut self) -> u64 {
         let Reply::Bulk(Some(info)) = self.cmd(&[b"INFO", b"memory"]) else {
             panic!("INFO memory");
@@ -335,7 +386,7 @@ pub struct Row {
 }
 
 pub fn run(case: &Case) -> Row {
-    let server = Server::start();
+    let mut server = Server::start();
     let mut c = server.connect();
     let keys = (MEMBERS_PER_CASE / case.size.max(1)).clamp(200, 20_000);
 

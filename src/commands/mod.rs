@@ -87,7 +87,9 @@ pub mod transaction;
 // `TS.INCRBY` has its `TIMESTAMP`, as the command reads it.
 pub(crate) mod ts;
 mod ts_query;
-mod vector;
+// `pub(crate)` only so `vector::backlog`'s property test runs the filtered
+// KNN ways a query takes.
+pub(crate) mod vector;
 mod vset;
 mod vset_filter;
 mod zset;
