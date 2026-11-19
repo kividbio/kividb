@@ -221,6 +221,48 @@ fn no_memory() -> io::Error {
 /// The encoding of an LZF-compressed string, after the length's marker.
 const RDB_ENC_LZF: u64 = 3;
 
+/// The most bytes LZF makes of each one it reads: 264 from a back reference
+/// of 3, at most.
+const LZF_MOST_PER_BYTE: u64 = 88;
+
+/// An RDB string of at most `max_len` bytes, plain or LZF-compressed: one
+/// longer than its declared shape is refused by the length it declares
+/// (and a compressed one by what its compressed bytes can make), before
+/// anything of that length is reserved; only the bytes the stream holds are
+/// read.
+fn rdb_read_string_at_most(r: &mut impl Read, max_len: u64) -> io::Result<Vec<u8>> {
+    let longer = || super::invalid("a string longer than its declared shape");
+    let (n, encoded) = rdb_length(r)?;
+    if !encoded {
+        if n > max_len {
+            return Err(longer());
+        }
+        return super::read_vec(r, usize::try_from(n).map_err(|_| longer())?);
+    }
+    if n != RDB_ENC_LZF {
+        return Err(super::invalid("a string of an unexpected encoding"));
+    }
+    let (compressed, _) = rdb_length(r)?;
+    let (original, _) = rdb_length(r)?;
+    if original > max_len {
+        return Err(longer());
+    }
+    // Redis compresses a string only if that makes it shorter.
+    if compressed == 0
+        || compressed >= original
+        || original > compressed.saturating_mul(LZF_MOST_PER_BYTE)
+    {
+        return Err(super::invalid("a compressed string of a bad length"));
+    }
+    let data = super::read_vec(r, compressed as usize)?;
+    match lzf::decompress(&data, original as usize) {
+        Ok(out) if out.len() as u64 == original => Ok(out),
+        _ => Err(super::invalid(
+            "a compressed string that does not decompress",
+        )),
+    }
+}
+
 /// An RDB length, and whether it is a special encoding's number instead.
 fn rdb_length(r: &mut impl Read) -> io::Result<(u64, bool)> {
     let mut b = [0u8; 1];
@@ -288,35 +330,15 @@ impl<R: Read> Reader<'_, R> {
     }
 
     /// A string that must be `len` bytes, plain or LZF-compressed as Redis
-    /// writes one (`mismatch` if it is another length): its length, or a
-    /// compressed one's original length, is checked before anything is
-    /// allocated, and only the bytes the payload holds are read.
+    /// writes one (`mismatch` if it is another length): no longer than
+    /// that is read or reserved ([`rdb_read_string_at_most`]).
     fn string_of(&mut self, len: u64, mismatch: &str) -> io::Result<Vec<u8>> {
         self.opcode(OPCODE_STRING)?;
-        let want = usize::try_from(len).map_err(|_| self.bad(mismatch))?;
-        let (n, encoded) = rdb_length(self.r)?;
-        if !encoded {
-            if n != len {
-                return Err(self.bad(mismatch));
-            }
-            return super::read_vec(self.r, want);
-        }
-        if n != RDB_ENC_LZF {
-            return Err(self.bad("a string of an unexpected encoding"));
-        }
-        let (compressed, _) = rdb_length(self.r)?;
-        let (original, _) = rdb_length(self.r)?;
-        if original != len {
-            return Err(self.bad(mismatch));
-        }
-        // Redis compresses a string only if that makes it shorter.
-        if compressed == 0 || compressed >= len {
-            return Err(self.bad("a compressed string of a bad length"));
-        }
-        let compressed = super::read_vec(self.r, compressed as usize)?;
-        match lzf::decompress(&compressed, want) {
-            Ok(out) if out.len() == want => Ok(out),
-            _ => Err(self.bad("a compressed string that does not decompress")),
+        match rdb_read_string_at_most(self.r, len) {
+            Ok(s) if s.len() as u64 == len => Ok(s),
+            Ok(_) => Err(self.bad(mismatch)),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => Err(self.bad(mismatch)),
+            Err(e) => Err(e),
         }
     }
 
@@ -397,6 +419,10 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
     }
 }
 
+/// The longest item a Top-K sketch read is let have: as long as a client's
+/// command may send (`proto-max-bulk-len`'s default, 512 MiB).
+const MAX_ITEM_BYTES: u64 = 512 << 20;
+
 /// A Top-K sketch [`write_topk`] (or Redis) wrote: its shape is checked
 /// against the size limits before anything sized by it is read; the
 /// buckets and places must be exactly what the shape says, and each item
@@ -422,6 +448,9 @@ fn read_topk(r: &mut Reader<'_, impl Read>) -> io::Result<TopK> {
             u32::from_le_bytes([place[at], place[at + 1], place[at + 2], place[at + 3]])
         };
         let (fp, len, count) = (word(0), word(4), word(16));
+        if u64::from(len) > MAX_ITEM_BYTES {
+            return Err(r.bad("an item longer than its declared shape"));
+        }
         let mut item = r.string_of(u64::from(len) + 1, "an item does not match its length")?;
         if item.pop() != Some(0) {
             return Err(r.bad("an item does not end in a zero byte"));
@@ -673,6 +702,60 @@ mod tests {
                 assert_eq!(read.buckets.len(), 10);
             }
         }
+    }
+
+    /// An item longer than an item may be, or than its place says, is
+    /// refused by what it declares: a payload of a few bytes declaring one
+    /// of gigabytes reserves nothing of that size.
+    #[test]
+    fn items_longer_than_their_shape_are_refused() {
+        let t = TopK::new(1, 2, 1, 1.0).unwrap();
+        let value = |len: u32, item: &[u8]| {
+            let mut w = Writer { out: Vec::new() };
+            w.uint(1);
+            w.uint(2);
+            w.uint(1);
+            w.double(1.0);
+            let buckets = vec![0u8; 2 * 8];
+            w.string(&buckets);
+            let mut place = vec![0u8; TOPK_SLOT];
+            place[0..4].copy_from_slice(&7u32.to_le_bytes());
+            place[4..8].copy_from_slice(&len.to_le_bytes());
+            place[16..20].copy_from_slice(&3u32.to_le_bytes());
+            w.string(&place);
+            w.out.extend_from_slice(item);
+            w.len(OPCODE_EOF);
+            w.out
+        };
+        let _ = &t;
+        let read = |v: Vec<u8>| super::read(TOPK_TYPE, 0, &mut &v[..]);
+        // As it should be: "ab" and its zero byte.
+        let mut w = Writer { out: Vec::new() };
+        w.string(b"ab\0");
+        assert!(read(value(2, &w.out)).is_ok());
+        // Declared huge, plain or compressed, with a few bytes behind.
+        for len in [u32::MAX, (512 << 20) + 1, 1 << 30] {
+            let mut w = Writer { out: Vec::new() };
+            w.len(OPCODE_STRING);
+            w.len(u64::from(len) + 1);
+            w.out.extend_from_slice(b"ab");
+            assert!(read(value(len, &w.out)).is_err(), "{len}");
+            let mut w = Writer { out: Vec::new() };
+            w.len(OPCODE_STRING);
+            w.out.push(0xc0 | RDB_ENC_LZF as u8);
+            w.len(4);
+            w.len(u64::from(len) + 1);
+            w.out.extend_from_slice(&[1, b'a', b'b', 0]);
+            assert!(read(value(len, &w.out)).is_err(), "{len}");
+        }
+        // Within the limit, but more than its compressed bytes can make.
+        let mut w = Writer { out: Vec::new() };
+        w.len(OPCODE_STRING);
+        w.out.push(0xc0 | RDB_ENC_LZF as u8);
+        w.len(4);
+        w.len(100_001);
+        w.out.extend_from_slice(&[1, b'a', b'b', 0]);
+        assert!(read(value(100_000, &w.out)).is_err());
     }
 
     const TOPK_DUMP: &str = "07814e8a4af9360f100002020203020104000000000000f03f05c30d180503ad4d230100e0070001000005c31e30010000e00d000403ad4d2305201a0898d02582407e000001200b20000000050100050668656c6c6f00000f005531a20539918c1c";
