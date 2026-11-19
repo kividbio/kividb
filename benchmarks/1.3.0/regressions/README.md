@@ -48,9 +48,10 @@ and why.
 | `29-unpipelined-commands` | 1.3.0 regression, never released | an API gateway's per-request commands (Tyk's) sent one at a time from 64 connections (`redis-benchmark -c 64`, no `-P`), io_uring and Tokio, against `--threads 1` (`uring1`, `tokio1`) and `--threads 2` (`uring2`, `tokio2`): `SET` of 385 bytes, `GET`, `INCR`, `PTTL`, `PUBLISH` of 177 bytes to no subscriber, a second each from the server's own `total_commands_processed`; the server pinned to its first CPUs, the client to the next (at most 6). Gate: each rate at most 1.05x worse than v1.2.2 in the same session; a row where the client used 95 % of its CPUs is shown, not gated (on a `Standard_D4s_v5`, the two-worker rows); `min_cpus=4`: not run on a smaller machine |
 | `30-script-call-cost` | #901 | server CPU per call and calls a second of short scripts by `EVALSHA` (`redis-benchmark`, 32 connections, one KiviDB worker): Tyk's sliding-log limiter over 5,000 keys of 144 members, the compare-and-delete lock release of #880 on keys another owner holds, and `return 1`, each also with its keys under a hash tag. Needs a `lua,tls` candidate (`--candidate-full`, #921). Gates: CPU per call within 10 % of the recorded value and at most 0.93x v1.2.2's for Tyk, 1.03x for the others; calls a second 10 % |
 | `31-zset-memory` | #825, #297 (step 4) | `used_memory` per sorted-set member, 1,000,000 members in sets of 10, 100, 128, 129 and 1,000: 14-byte members (`membr:<i>`), scores whole (`int`) or with a fraction (`float`); `OBJECT ENCODING` of each size recorded exactly (`listpack` up to 128, `skiplist` past it); the large sets (129 and 1,000) as guard rows |
-| `32-default-threads` | #903 | the default worker count itself: unpipelined `GET` (50 connections), `SET` pipeline 16, suite 05's `XADD` and suite 23's pattern fan-out, each with no `--threads` and with every explicit count from 1 to the CPUs, server and clients sharing the machine; `<row>_default_vs_best` (default / best) recorded but informational until the default worker count is settled, then gated at 0.90; `pubsub_lost` exact |
+| `32-default-threads` | #903 | the default worker count itself: unpipelined `GET` (50 connections), `SET` pipeline 16, suite 05's `XADD` and suite 23's pattern fan-out, each with no `--threads` and with every explicit count from 1 to the CPUs, server and clients sharing the machine; `<row>_default_vs_best` (default / best) recorded but informational (the default is half the CPUs, rounded up, since the change that re-recorded it; it may become a gate at 0.90); `pubsub_lost` exact |
 | `33-ft-aggregate-groupby` | #761 | #761's 2,000,000 hashes (`name TEXT email TAG communityNumber NUMERIC age NUMERIC`, pipelines of 2,000): `FT.AGGREGATE userIdx * GROUPBY 1 @communityNumber REDUCE COUNT 0 AS n LIMIT 0 10`, the same with `REDUCE AVG 1 @age` and `SORTBY 2 @n DESC`, and the first over `@age:[20 40]`: median ms of 5 after a warm-up, and the reply's group total (exactly 1000); `used_memory` and RSS once loaded, the peak RSS (`VmHWM`) after the queries, and FT.INFO's memory parts as info rows. v1.2.2 and the candidate only: the VM image's Redis has no Query Engine |
 | `34-kong-ratelimit` | #849 | Kong's rate-limiting plugin with `policy: redis`: its per-request script (`incr`, and `expire` when the count is 1; Kong 3.9.4's `usage()`, verbatim) sent as Kong sends it (`EVAL` with the script text) and by `EVALSHA`, on one key, `ratelimit:<route>:<service>:<identifier>:<period_date>:minute`, from memtier_benchmark at 200 and 500 connections over 100,000 identifiers; with the key as Kong builds it (`plain`) and with the identifier under a hash tag (`tag`), in two configurations: `default` (`lua-parallel-scripts yes`) and `serial` (`lua-parallel-scripts no` on KiviDB). ops/s against Redis, p99 shown, keys left without a TTL (must be 0); every call's key checked under MONITOR first, for each way of calling. Gates: at least 1.2x Redis at 200 connections and 1.3x at 500 in every configuration and key form. Needs 8 vCPUs and the `lua,tls` builds (`--candidate-full`) |
+| `35-tokio-pipelined-reads` | #432 / #891 | the Tokio loop (`--io-model tokio --threads 1`, the server on the first CPU, `redis-benchmark --threads 3` on the next three, 50 connections): `SET` of 1,024-byte values at pipeline 16 and of 4,096-byte values at pipeline 32, a second from the server's own `total_commands_processed` (median of 3); and one connection with a 64 KiB receive buffer that sends 400,000 `SET`s of 20-byte values (19 MB) in one write before reading a reply: 1 if it is written within 20 s and every reply arrives. Gates: the rates 10 % and 60 % of the gain over v1.2.2 in the same session; the pipeline `>= 1` (v1.2.2 stalls). Recorded on a D4s_v5 (`results/pr-891-d4s_v5`) |
 | `36-litellm-ratelimit` | #871 | LiteLLM's proxy rate limiter: its five Lua scripts byte for byte (`litellm/rust/crates/redis-store/src/rate_limits/lua.rs`, main @ 4b12a405; SHA-1s checked against `SCRIPT LOAD`), called as one request calls them, by `EVALSHA`, from memtier_benchmark (`--transaction`: one key and its team a call) at 200 and 500 connections over 50,000 keys: `BATCH_RATE_LIMITER` for one descriptor (one hash tag) and for key + team (two), `CHECK_AND_INCREMENT_BY_N` and `PARALLEL_ACQUIRE` for key + team, and the 13-command per-request mix. A 22-call transcript checked exactly first (window reset, all-or-nothing over the limit, the reconcile, acquire and release, TTLs), and every script call's keys under MONITOR; the candidate must run at least 90 % of its scripts beside others (`INFO stats` `scripts_run_beside_others`), or the suite fails. ops/s against Redis (a floor per workload, see the docstring), p99 shown, keys left without a TTL (must be 0). Needs 8 vCPUs and the `lua,tls` builds (`--candidate-full`) |
 
 ## Running it
@@ -235,7 +236,8 @@ and a C compiler). Suites 18, 20 and 34 use `memtier_benchmark` 2.6.1 or newer
 
 The default worker count is a policy, not code under test: #903 changed it
 from the CPUs minus two (all of them below four) to one per available CPU,
-which on the `Standard_D4s_v5` is 4 workers instead of 2. With the clients
+which on the `Standard_D4s_v5` is 4 workers instead of 2; a later change made it half the
+available CPUs, rounded up (2 on a `Standard_D4s_v5`, 4 on a `Standard_D8s_v5`; never fewer than 2 where there are 2 or more CPUs). With the clients
 on the same 4 vCPUs that moved rows that `--threads` did not pin: `05`
 `shapes/xadd5_rps` 594k/s with 2 workers, 426k with 4; `08`
 `ftinfo/hset_vec_doc_rps` 98.6k against 89.1k. So every configuration now
@@ -256,6 +258,7 @@ was re-recorded for it:
 | `21-list-memory` (all four configurations) | 4 | re-recorded in #940 with the candidate at its default of the day on 4 vCPUs (4 workers, after #903) |
 | `33-ft-aggregate-groupby` | 4 | as recorded (#944) |
 | `34-kong-ratelimit` | the server's pinned CPUs (4) | as suite `20`: the server is pinned to half the CPUs of a `Standard_D8s_v5` and gets `--threads` to match |
+| `35-tokio-pipelined-reads` | 1 | as recorded: one worker on its own CPU, the client on the other three |
 | `36-litellm-ratelimit` | the server's pinned CPUs (4) | as suites `20` and `34` |
 | `32-default-threads` | 0 (none) | measures the default on purpose |
 
@@ -1449,6 +1452,23 @@ memtier log error replies and the suite fails, which was checked by hand.
 This suite declares `min_cpus=8`: run it on a Standard_D8s_v5 with
 `run-all.sh --candidate <bin> --candidate-full <bin> --min-cpus-only --label
 <label>-d8s_v5`, or `--only 34` on a machine with 8 CPUs.
+
+## Recorded run, suite 35
+
+Recorded 2026-11-19 on an Azure Standard_D4s_v5 (Xeon Platinum 8370C),
+`--only 35 --record`; the candidate is #891 at `3747bb7b` (master `b701f59f`
+merged in), `cargo build --release` by rustc 1.100.0. Runs:
+`pr-891-d4s_v5` (recorded) and `pr-891-d4s_v5-rerun1`, `-rerun2` (the same
+binaries again: `ok` twice). A run takes about 2 minutes.
+
+| metric | v1.2.2 | candidate (recorded / rerun 1 / rerun 2) | gate |
+|---|---:|---:|---|
+| `SET` 1 KiB, pipeline 16, a second | 287,617 | 587,037 / 581,730 / 589,116 (2.0x) | rel 10%; keep 60% of gain |
+| `SET` 4 KiB, pipeline 32, a second | 96,304 | 235,149 / 237,883 / 239,279 (2.4-2.5x) | rel 10%; keep 60% of gain |
+| 19 MB pipeline through a 64 KiB receive buffer | stalls (0; given up after 20 s) | 1 (written in 0.13 s) | `>= 1` |
+
+v1.2.2's rates moved by 3 % across the three runs (287,617 to 296,520 for
+1 KiB), the candidate's by 1-2 %.
 
 ## Recorded run, suite 36
 

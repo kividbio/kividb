@@ -188,12 +188,12 @@ fn print_banner(threads: usize, config: &Arc<Config>) {
     if mem_gb > 0 {
         println!("  * Memory         : {mem_gb}GiB available");
     }
-    if available.threads == cpus.online {
+    if available.cpus == cpus.online {
         println!("  * CPUs           : {} online", cpus.online);
     } else {
         println!(
             "  * CPUs           : {} online, {} available ({})",
-            cpus.online, available.threads, available.reason
+            cpus.online, available.cpus, available.reason
         );
     }
     if port == 0 {

@@ -210,6 +210,8 @@ fn start_server(port: u16) {
             slowlog_log_slower_than: 10_000,
             slowlog_max_len: 128,
             query_buffer_idle_resize_after_ms: 150,
+            // `DEBUG SLEEP` holds a connection still in the read-size test.
+            enable_debug_command: kividb::config::DebugCommand::Yes,
             cluster_enabled: false,
             cluster_node_timeout: 15000,
             configfile: "./kividb.conf".to_string(),
@@ -1696,6 +1698,94 @@ fn test_client_list_reserves_query_buffer_for_declared_large_argument() {
     assert!(
         capacity.is_some_and(|capacity| capacity < 1_000_000),
         "idle partial request retained excess query-buffer capacity: {line}"
+    );
+}
+
+#[test]
+fn test_large_pipeline_is_read_in_larger_reads_until_idle() {
+    // Another test's pause would hold a SET and read the rest uncounted.
+    let _lock = pause_lock();
+    let port = free_port();
+    start_server(port);
+    let mut client = Conn::connect(port);
+    let mut observer = Conn::connect(port);
+    let addr = client.stream.local_addr().unwrap().to_string();
+    let value = "v".repeat(994);
+    // Each SET is 1 KiB on the wire, so a 4 KiB read ends between commands.
+    let pipeline: String = (0..20)
+        .map(|i| format!("*3\r\n$3\r\nSET\r\n$3\r\nk{i:02}\r\n$994\r\n{value}\r\n"))
+        .collect();
+    assert_eq!(pipeline.len(), 20 * 1024);
+    // Asked on the observer, so the client sends nothing after its pipeline.
+    let client_line = |observer: &mut Conn| -> String {
+        let listing = observer.cmds(&["CLIENT", "LIST"]);
+        let line = listing
+            .as_str()
+            .lines()
+            .find(|line| client_list_field(line, "addr=") == Some(addr.as_str()));
+        line.unwrap().to_string()
+    };
+    let read_events = |observer: &mut Conn| -> u64 {
+        let line = client_line(observer);
+        client_list_field(&line, "read-events=")
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    // The reads a pipeline takes when all of it is waiting.
+    let mut reads_for_pipeline = |client: &mut Conn| -> u64 {
+        let before = read_events(&mut observer);
+        client
+            .stream
+            .write_all(b"*3\r\n$5\r\nDEBUG\r\n$5\r\nSLEEP\r\n$4\r\n0.05\r\n")
+            .unwrap();
+        // Sent once the sleep runs, so none of it shares the sleep's read.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while client_list_field(&client_line(&mut observer), "cmd=") != Some("debug") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "DEBUG SLEEP never ran"
+            );
+        }
+        client.stream.write_all(pipeline.as_bytes()).unwrap();
+        for _ in 0..21 {
+            assert_eq!(client.read_value().as_str(), "OK");
+        }
+        // Less the read of DEBUG SLEEP.
+        read_events(&mut observer) - before - 1
+    };
+
+    assert_eq!(reads_for_pipeline(&mut client), 2, "4 KiB, then the rest");
+    assert_eq!(reads_for_pipeline(&mut client), 1, "room kept while busy");
+    for _ in 0..4 {
+        client.cmds(&["PING"]);
+    }
+    assert_eq!(
+        reads_for_pipeline(&mut client),
+        2,
+        "given back after small reads"
+    );
+    // Idle straight after a pipeline.
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(reads_for_pipeline(&mut client), 2, "given back when idle");
+    assert_eq!(client.cmds(&["GET", "k19"]).as_str(), value);
+
+    // A request that exactly fills the room of a buffer given back, and
+    // then silence: the full read grows the buffer, and it is given back
+    // all the same once the client is quiet.
+    thread::sleep(Duration::from_millis(400));
+    let exact = format!(
+        "*3\r\n$3\r\nSET\r\n$5\r\nexact\r\n$4063\r\n{}\r\n",
+        "e".repeat(4063)
+    );
+    assert_eq!(exact.len(), 4096);
+    client.stream.write_all(exact.as_bytes()).unwrap();
+    assert_eq!(client.read_value().as_str(), "OK");
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        reads_for_pipeline(&mut client),
+        2,
+        "given back when idle after a full read"
     );
 }
 

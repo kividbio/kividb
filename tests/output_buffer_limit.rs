@@ -1032,6 +1032,40 @@ fn what_was_read_ahead_runs_a_read_at_a_time() {
     }
 }
 
+/// A large argument leaves a large buffer, but the reads after it still
+/// bring no more than a read's worth a turn.
+#[test]
+fn after_a_large_argument_a_turn_is_still_one_read() {
+    let _turn = serial();
+    // The io_uring loop reads into all of a large buffer.
+    let server = Server::start("tokio");
+    let small = "s".repeat(1000);
+    assert!(server.conn().cmd(&["SET", "s", &small]).ok());
+    server.config_set("normal 3mb 0 0");
+
+    // A 1 MB `SET`, then 20,000 `GET s`: 20 MB of replies in all, and
+    // 1.7 MB to a 32 KiB read.
+    let big = "b".repeat(MB);
+    let mut pipeline = format!("*3\r\n$3\r\nSET\r\n$1\r\nb\r\n${MB}\r\n{big}\r\n").into_bytes();
+    pipeline.extend_from_slice(&b"*2\r\n$3\r\nGET\r\n$1\r\ns\r\n".repeat(20_000));
+    let mut c = server.conn();
+    c.writer
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    c.writer
+        .write_all(&pipeline)
+        .expect("the server stopped reading");
+    assert!(c.read().unwrap().ok());
+    for i in 0..20_000 {
+        assert_eq!(c.read(), Some(V::Bulk(small.clone().into_bytes())), "{i}");
+    }
+    assert_eq!(
+        server.info_field("client_output_buffer_limit_disconnections"),
+        "0"
+    );
+    server.config_set("normal 0 0 0");
+}
+
 /// Requests of many arguments, each larger than a read, pipelined: each
 /// arrives in many reads into a query buffer of its own, which is trimmed
 /// between them, and every one runs. A read of 32 KiB into a larger buffer
@@ -1073,6 +1107,51 @@ fn pipelined_requests_larger_than_a_read_all_run() {
             assert_eq!(c.read(), Some(V::Int(512)), "{io_model}: key {k}");
             assert_eq!(c.read(), Some(V::Int(0)), "{io_model}: key {k} again");
         }
+    }
+}
+
+/// A client with a small receive buffer that sends a long pipeline of small
+/// commands before it reads a reply is answered in full. The Tokio loop read
+/// 4 KiB at a time, while its replies waited too, and so answered such a
+/// pipeline a few hundred bytes at a time: segments so small that the
+/// client's receive buffer filled with their overhead long before its
+/// window did, and the client and the server then waited for each other
+/// for good.
+#[test]
+fn a_pipeline_through_a_small_receive_buffer_is_answered() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        let mut c = server.conn();
+        // 64 KiB was enough against a release build; a debug build answers
+        // more slowly, and needs a smaller buffer to show it.
+        socket2::SockRef::from(&c.writer)
+            .set_recv_buffer_size(16 * 1024)
+            .unwrap();
+        // 400,000 `SET`s of 20-byte values: 19 MB.
+        let value = "v".repeat(20);
+        let mut pipeline = Vec::new();
+        for i in 0..400_000 {
+            let key = format!("pk:{}", i % 1000);
+            pipeline.extend_from_slice(
+                format!(
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n$20\r\n{value}\r\n",
+                    key.len()
+                )
+                .as_bytes(),
+            );
+        }
+        // A stall fails the test rather than hanging it.
+        c.writer
+            .set_write_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        c.writer
+            .write_all(&pipeline)
+            .unwrap_or_else(|e| panic!("{io_model}: the pipeline stalled: {e}"));
+        for i in 0..400_000 {
+            assert_eq!(c.read(), Some(V::Str("OK".into())), "{io_model} {i}");
+        }
+        assert_eq!(c.cmd(&["GET", "pk:999"]).text(), value, "{io_model}");
     }
 }
 

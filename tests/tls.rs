@@ -1278,13 +1278,13 @@ fn test_tls_pipelined_commands() {
 
     let mut conn = make_tls_client(tls, &certs.cert_der);
 
-    // Send 5 commands without reading between them
+    // One write: a TLS record larger than the server's first read.
+    let value = |i: u8| format!("val_{i}").repeat(600);
+    let mut batch = Vec::new();
     for i in 0..5u8 {
-        send_cmd(
-            &mut conn,
-            &["SET", &format!("pipe_key_{i}"), &format!("val_{i}")],
-        );
+        send_cmd(&mut batch, &["SET", &format!("pipe_key_{i}"), &value(i)]);
     }
+    conn.write_all(&batch).unwrap();
 
     // Read all 5 responses
     for _ in 0..5 {
@@ -1294,7 +1294,7 @@ fn test_tls_pipelined_commands() {
     // Verify all keys
     for i in 0..5u8 {
         send_cmd(&mut conn, &["GET", &format!("pipe_key_{i}")]);
-        assert_eq!(read_resp(&mut conn), format!("val_{i}"));
+        assert_eq!(read_resp(&mut conn), value(i));
     }
 }
 
