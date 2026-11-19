@@ -107,6 +107,12 @@ pub struct Config {
     #[arg(long, default_value_t = 0)]
     pub threads: usize,
 
+    /// Bind each io_uring worker to a CPU of its own: off, or auto (worker
+    /// N on the N-th CPU the process may use, when the workers are as many
+    /// as those CPUs). See docs/CONFIGURATION.md.
+    #[arg(long, default_value = "off", value_enum)]
+    pub worker_cpu_affinity: crate::cpus::WorkerCpuAffinity,
+
     /// Enable append-only file persistence
     #[arg(long, default_value_t = false)]
     pub aof: bool,
@@ -648,6 +654,7 @@ impl Default for Config {
             port: 6380,
             bind: "0.0.0.0".into(),
             threads: 0,
+            worker_cpu_affinity: crate::cpus::WorkerCpuAffinity::Off,
             aof: false,
             aof_preamble: true,
             lua_parallel_scripts: true,
@@ -791,6 +798,7 @@ impl Config {
             port: 0,
             bind: String::new(),
             threads: 1,
+            worker_cpu_affinity: crate::cpus::WorkerCpuAffinity::Off,
             aof: false,
             aof_preamble: true,
             lua_parallel_scripts: true,
@@ -1176,6 +1184,10 @@ impl Config {
             if self.protected_mode { "yes" } else { "no" }
         ));
         out.push_str(&format!("threads {}\n", self.threads));
+        out.push_str(&format!(
+            "worker-cpu-affinity {}\n",
+            self.worker_cpu_affinity.name()
+        ));
         out.push_str(&format!("aof {}\n", if self.aof { "yes" } else { "no" }));
         out.push_str(&format!(
             "aof-preamble {}\n",
@@ -1609,6 +1621,15 @@ impl Config {
                 }
             }
             "threads" => set!(threads, number(key, one()?)?),
+            "worker-cpu-affinity" => {
+                let value = one()?;
+                let Some(mode) = crate::cpus::WorkerCpuAffinity::parse(value) else {
+                    return Err(format!(
+                        "invalid value '{value}' for 'worker-cpu-affinity': expected off or auto"
+                    ));
+                };
+                set!(worker_cpu_affinity, mode)
+            }
             "dir" => set!(dir, one()?.to_string()),
             "aof" | "appendonly" => set!(aof, yes_no(key, one()?)?),
             "aof-preamble" | "aof-use-rdb-preamble" => set!(aof_preamble, yes_no(key, one()?)?),
@@ -2047,6 +2068,10 @@ impl Config {
                                 | "hash-max-ziplist-entries"
                                 | "hash-max-listpack-value"
                                 | "hash-max-ziplist-value"
+                                | "zset-max-listpack-entries"
+                                | "zset-max-ziplist-entries"
+                                | "zset-max-listpack-value"
+                                | "zset-max-ziplist-value"
                                 | "rdbchecksum"
                                 | "rdbcompression"
                         ) || crate::commands::server::remembered_config(key).is_none() => {}
@@ -2407,7 +2432,7 @@ mod config_file_tests {
         #[cfg(not(feature = "lua"))]
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         let (_, warnings) = load(
-            "maxclients 10000\nlatency-tracking yes\nzset-max-listpack-entries 128\n\
+            "maxclients 10000\nlatency-tracking yes\nlist-compress-depth 0\n\
              proto-max-bulk-len 512mb\nlatency-monitor-threshold 0\nacllog-max-len 128\n",
         )
         .unwrap();
@@ -2416,9 +2441,13 @@ mod config_file_tests {
         // #232), and acllog-max-len, which the ACL log goes by.
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
-            warnings[0].contains("'zset-max-listpack-entries'"),
+            warnings[0].contains("'list-compress-depth'"),
             "{warnings:?}"
         );
+        // The sorted sets' limits are in effect: no warning.
+        let (_, warnings) =
+            load("zset-max-listpack-entries 128\nzset-max-ziplist-value 64\n").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
         let err = load("maxclients 0\n").unwrap_err();
         assert!(err.contains("maxclients"), "{err}");
         let err = load("array-slice-size 300\n").unwrap_err();
@@ -2653,16 +2682,17 @@ mod config_file_tests {
         assert!(
             Config {
                 port: 7002,
+                worker_cpu_affinity: crate::cpus::WorkerCpuAffinity::Auto,
                 ..config
             }
             .rewrite_to_disk()
             .is_ok()
         );
-        assert!(
-            std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("port 7002\n")
-        );
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("port 7002\n"), "{written}");
+        // CONFIG REWRITE dropped this setting once: a restart came back
+        // unpinned.
+        assert!(written.contains("worker-cpu-affinity auto\n"), "{written}");
     }
 }
 

@@ -164,6 +164,28 @@ other files:
   soonest first; so once a field of a small hash has a TTL the two orders
   differ. They agree for a `listpack`.
 
+**Sorted sets**
+- Small sorted sets are kept as Redis keeps them, and `OBJECT ENCODING`
+  says so: `listpack` for up to `zset-max-listpack-entries` (128) members
+  of up to `zset-max-listpack-value` (64) bytes, `skiplist` otherwise (a
+  hash table and an ordered tree here). A set moves when a write adds a
+  member past either limit, or when one `ZADD` (or `GEOADD`) gives more
+  pairs than the entries limit, as in Redis; never back: a set taken back
+  under the limit stays a `skiplist`, as in Redis. A set made whole (a
+  load, `RESTORE`, `MIGRATE`, `ZRANGESTORE`, `ZUNIONSTORE` and the other
+  `*STORE` commands) is a `listpack` if it fits, as Redis loads one.
+- `ZSCAN` returns a `listpack` whole, in order, with cursor 0, whatever
+  `COUNT` says, as Redis does.
+- The two limits go no higher than 128 and 64 (the most one block holds);
+  a larger value is taken as those, and `CONFIG GET` says so (Redis keeps
+  what it is given, and its listpack holds more). The `zset-max-ziplist-*`
+  names set and report the same two settings. A lowered limit applies to
+  a set at its next new member; a changed score never moves a set, as in
+  Redis.
+- `SORT` of a `listpack` sorted set leaves it a `listpack`; Redis 8.10
+  turns the set it sorts into a `skiplist`, so `OBJECT ENCODING` differs
+  after a `SORT` (the replies do not).
+
 **Lists**
 - A list's elements are kept end to end in chunks of up to 64, as Redis
   keeps a quicklist of listpacks, but the size of a chunk is fixed: Redis
@@ -289,6 +311,27 @@ other files:
   it on, and overrides a raised `repl-replica-max-backlog-bytes` earlier in
   the file (the last line wins). The limits count the bytes waiting, not
   the allocator's rounding of them.
+- `MONITOR` shows every command once, as Redis does: nothing is dropped.
+  A monitor that reads more slowly than commands run has what it has not
+  read kept for it, held to `client-output-buffer-limit normal` (the class
+  Redis counts a monitor in; no limit by default, as in Redis); past that
+  limit it is disconnected, with `Client id=… closed: it is in MONITOR and
+  … bytes behind` in the log and `client_output_buffer_limit_disconnections`
+  counted; what it has not read shows in its `omem` in `CLIENT LIST`.
+  Every monitor sees the same order, a connection's commands always in the
+  order it sent them, and time stamps in the order of the lines (they are
+  read from the system clock, so they go back only when the clock is set
+  back, as in Redis). A command is shown when it is called, before it runs;
+  Redis shows it once it has run. So a script's `EVAL` is shown before the
+  commands it calls (Redis: after them), `SELECT` is shown with the
+  database it was called in (Redis: the one it selected), and two
+  connections' commands on one key that arrive at nearly the same moment
+  on two worker threads can have run in the other order than they are
+  shown; Redis, with one thread, has no such moment. `AUTH` and `HELLO …
+  AUTH` are not shown at all (Redis shows them with the password as
+  `(redacted)`). Up to 1.2.2 a monitor that fell 4,096
+  lines behind lost lines without a word: with four connections sending at
+  full speed, half or more of what they sent.
 - A replica doesn't enforce `maxmemory` on what its master sends. A replica
   of a KiviDB master older than 1.1.3 expires keys by its own clock (such a
   master sends no `DEL` for the keys it expires). A replica of a 1.2.0

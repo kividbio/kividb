@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // A key that goes for its time, as the AOF and replicas see it.
 //
 // Only the master deletes a key for its time, and it sends the deletion on

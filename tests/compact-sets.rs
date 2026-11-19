@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Sets of integers kept as a sorted array (#297): what a client sees has to be
 // the same as for any other set, on either side of the change of form, and
 // across a save, an AOF replay and DUMP/RESTORE. Each test runs its own

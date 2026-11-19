@@ -89,6 +89,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`worker-cpu-affinity auto`: each io_uring worker on a CPU of its own (#894).** Off by
+  default. With `auto`, worker N is bound to the N-th CPU the process may use, when the
+  workers are exactly as many as those CPUs (a cpuset or `taskset` of `--threads` CPUs, the
+  Kubernetes static CPU manager), and never under a cgroup CPU quota. An io_uring worker
+  serves its connections alone, and the scheduler at times puts two workers on one CPU
+  when a third busy thread shares their CPUs; every connection of one then waits out the
+  other's time slice. The server says after the I/O model line what it bound, or why not;
+  the tokio I/O model and systems other than Linux bind nothing and say so. Threads a bound
+  worker starts (a full sync's dump, scripts, backups, snapshot compression) are given all
+  of the process's CPUs back first; every thread in the server is started through one
+  wrapper that does this, and clippy refuses a direct `thread::spawn` or `spawn_blocking`.
+  It is not a fix for the rate limiter's p99 on its own. Azure D8s_v5, a rate limiter
+  (`INCRBY` + `EXPIRE`, 65 connections) beside 100 connections of pipelined load, the server
+  on two vCPUs of separate cores started from a snapshot, checks a second and p99 before
+  #919, off / auto / Redis 8.10.2: 25.2k at 3.9 ms / 30.9k at 2.7 ms / 32.0k at 0.06 ms at
+  150,000 commands a second of load, 21.5k at 5.2 / 28.9k at 3.5 / 31.9k at 0.10 ms at
+  200,000, and at 300,000 `auto` is worse: 23.7k at 6.9 ms / 24.2k at 8.3 ms / 22.6k at
+  1.4 ms. The p99 is fixed by #919's backlog change; with it `auto` differs from `off` only
+  at 150,000-200,000 (0.14-0.17 ms against 0.50-1.8 ms). Pipelined and unpipelined
+  `GET`/`SET` and a 4-worker server under memtier are unchanged. Leave it off when the
+  server shares its CPUs with other busy processes: with `stress-ng` on the same two CPUs,
+  unpipelined `GET` fell by a third, from 91k to 61k a second. A `SAVE` of 948,000 keys
+  holds writes for up to 26-29 ms with `auto` against 23 ms with `off`. See
+  docs/CONFIGURATION.md and docs/PERFORMANCE.md (binaries built with rustc 1.100.0).
+
 - **Compressed snapshots, opt-in: `rdbcompression yes` (#879).**
   `rdbcompression`, which was accepted and did nothing, is in effect; it
   defaults to `no` in 1.3 (see Upgrading). With `yes` (config file, command
@@ -325,6 +350,105 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dataset digest lets the replica continue without a full sync.
 
 ### Changed
+
+- **`FT.AGGREGATE ... GROUPBY` over many documents is 3.8x faster, and a
+  search index of many small documents takes 30 % less memory (part of
+  #761).** On #761's 2,000,000 hashes (`name TEXT email TAG
+  communityNumber NUMERIC age NUMERIC`), `GROUPBY 1 @communityNumber REDUCE
+  COUNT 0` took 3,453 ms and now takes 916 (Redis 8.10.3: 1,907); with
+  `REDUCE AVG 1 @age` and `SORTBY` 3,885 and 1,017 (Redis 2,428); over
+  `@age:[20 40]` 1,308 and 351 (Redis 759). The server's peak RSS over the
+  load and the queries fell from 3,722 MiB to 1,534 (Redis 2,158), its RSS
+  once loaded from 2,171 MiB to 1,476 (Redis 1,509) and `used_memory` from
+  1,755 MiB to 1,224 (Redis 1,454). Azure `Standard_D4s_v5`, server on 3
+  CPUs, the client on the fourth, rustc 1.100.0, medians of 3 runs;
+  suite `33-ft-aggregate-groupby` of `benchmarks/1.3.0/regressions` gates
+  it. What changed: a query whose steps
+  begin with a `GROUPBY` whose reducers keep a running value (`COUNT`,
+  `SUM`, `AVG`, `MIN`, `MAX`, `COUNT_DISTINCT`, `COUNT_DISTINCTISH`) puts
+  each hash into its group as it reads it, where it made a row of every
+  document first (a map of all its fields, each name and value a string of
+  its own, some 1.5 GB here) and grouped the rows. The groups, their order
+  and their values are the same. JSON indexes, `ADDSCORES`, a KNN clause,
+  a step before the `GROUPBY` other than `LOAD`, other reducers and a query
+  across a cluster still group rows. In the index, a TEXT term or a TAG
+  value that one document holds keeps that document in place rather than
+  in a list of its own, a term found in one field keeps that field's
+  documents in place, and the tables that find a tag's or a key's number
+  hold the number alone, where they held a copy of the text too: FT.INFO's
+  `text_postings_bytes` fell from 352 MB to 0.3 MB here, `postings_tag_bytes`
+  from 296 to 208, `postings_ids_bytes` from 198 to 128 (`text_terms_bytes`
+  rose from 132 to 165: a term is larger, holding its documents).
+
+- **A short script call costs the server less, level with Redis for Tyk's
+  rate limiter and centrifuge's history scripts (#901).** One call of Tyk's
+  sliding-log limiter (four sorted-set commands) cost 16.1 µs of server CPU
+  on one worker against Redis 8.10.2's 13.8; it now costs 13.4, and
+  centrifuge's history scripts 10.1 and 12.4 µs against 11.1 and 13.0
+  (1.2.2: 15.6, 14.2, 14.9). With two workers the server runs Tyk's script
+  92.3k times a second (master 60.7k, Redis 72.6k), `return 1` 187k (160k,
+  161k), and a BullMQ worker's `moveToFinished` costs 37.3 µs of server CPU
+  a job (47.9, Redis 42.0); Azure `Standard_D8s_v5`, server on 2 CPUs, rustc
+  1.100.0, the numbers in docs/PERFORMANCE.md. Instructions per call fell
+  30 % for Tyk's script and for `return 1`. What changed: a script's reply is
+  written as RESP from Lua's stack into one buffer instead of value by value
+  through mlua, and a short array is told from `{ok=...}`, `{err=...}` and
+  the RESP3 shapes by walking it; `redis` and the other library globals are
+  found by a table lookup instead of a Lua call; `EVAL`, `EVALSHA` and
+  `FCALL` go straight to the script handler; a command a script calls is
+  classified as a write once instead of five times, and its replication feed
+  is built only when an AOF, a replica, the backlog or a tap reads it;
+  `KEYS` and `ARGV` of at most 4 KB and at most 64 arguments in all stay
+  until the next script's are built;
+  one argument list per call; ahash for the script cache; and the
+  connection's environment is shared, not copied, when a script goes to the
+  script-runner thread. Replies, errors and what is replicated are unchanged
+  (a differential fuzz of 21,000 scripts against the tree before, RESP2 and
+  RESP3). `return 1` and a lock's compare-and-delete still cost 18 % and
+  11 % more than in Redis on one worker, around the call rather than in it.
+
+- **Writes on a master with a replication backlog and no replica no
+  longer wake the replication thread one by one (#894).** A master that
+  starts with data (its own snapshot, or any dataset) keeps the backlog for
+  `repl-backlog-ttl` (an hour) so that a replica can be continued, and so
+  does one whose replicas have gone. Every write was handed to the
+  replication thread and woke it; on a server held to a few CPUs that
+  thread took them from the connections. In #894 an envoy rate limiter
+  (`INCRBY` + `EXPIRE` on two keys a check, 65 connections) beside other
+  replicas' pipelined load ran 8 % slower than on Redis with 1.7x its p99.
+  With no replica attached, the thread now takes what has come in, sleeps a
+  millisecond and looks again, and waits to be woken only once it finds
+  nothing; once a replica attaches, every write is handed on at once, as
+  before. Azure D8s_v5, the server on two vCPUs of separate cores
+  (`--threads 2`, io_uring), the checks and the background load on
+  CPUs of their own, the server started from a snapshot of 100,000 keys,
+  checks a second and p99 (medians of three; the 1.2.2 release binary,
+  master and this change all built with rustc 1.100.0), Redis 8.10.2
+  beside it:
+
+  | background (cmds/s) | 1.2.2 | before | after | Redis |
+  |---|---|---|---|---|
+  | 0 | 31.5k, 0.17 ms | 31.4k, 0.22 ms | 31.5k, 0.14 ms | 31.7k, 0.11 ms |
+  | 100,000 | 30.3k, 0.74 ms | 29.9k, 0.85 ms | 31.9k, 0.10 ms | 32.0k, 0.06 ms |
+  | 150,000 | 26.6k, 3.7 ms | 25.1k, 4.0 ms | 31.8k, 0.13 ms | 32.1k, 0.05 ms |
+  | 200,000 | 23.1k, 4.2 ms | 25.1k, 4.2 ms | 31.4k, 0.59 ms | 31.9k, 0.10 ms |
+  | 300,000 | 25.1k, 3.9 ms | 22.8k, 5.1 ms | 31.2k, 0.23 ms | 22.5k, 1.2 ms |
+
+  On the tokio loop, whose workers take each other's connections when one
+  is held up, the same case after the change: 31.7-32.0k checks a second
+  at a p99 of 0.06-0.11 ms at every rate. Pipelined `SET` on such a
+  server (`redis-benchmark -c 50`) went from 0.94M to 1.16M a second at
+  pipeline 16 and from 1.30M to 1.50M at 100; `GET` is unchanged.
+  At 200,000 the two io_uring workers are still at times put on one CPU by
+  the scheduler, and connections wait out the other's time slice (0.17,
+  0.59 and 1.0 ms in three runs); the opt-in `worker-cpu-affinity auto`
+  (#927) binds each to a CPU of its own. A server with no backlog (one started empty, as
+  benchmarks start it) does none of this: 31.6-31.9k checks a second at a
+  p99 of 0.06-0.10 ms at every rate. `WAIT` with no replica attached no
+  longer waits for the replication thread (it has nothing to count): 62 us
+  a call, 1.99 ms before this, 83 us on master; an idle server with the
+  backlog kept uses 0.13 % of a CPU, as before. Suite
+  `27-ratelimit-restarted` measures it.
 
 - **Pub/sub fan-out delivers 18-29 % more messages a second, ahead of
   Redis (#851).** socket.io's Redis adapter publishes every broadcast with
@@ -580,19 +704,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     this release writes and the other way round. `MEMORY USAGE`, eviction
     and lazy freeing count a block or an array as the one allocation it is.
 
-- **Lists take about half the memory (#297).** A list's elements are kept
-  end to end in chunks of up to 64, each element between two copies of its
-  length, where every element had an allocation, a shared header and a slot
-  of its own. Bytes of `used_memory` an element, 32-byte elements, 3M
-  elements in lists of each size:
+- **Lists take about half the memory, short elements a fifth (#297).** A
+  list's elements are kept end to end in chunks of up to 64, each element
+  between two copies of its length (one byte each for an element shorter
+  than 128 bytes), where every element had an allocation, a shared header
+  and a slot of its own. Bytes of `used_memory` an element, 32-byte
+  elements, 1M elements in lists of each size (3M in one list):
 
   | elements a list | 1.2.2 | now | Redis 8.10.2 |
   |---:|---:|---:|---:|
-  | 10 | 76.0 | 48.8 | 45.0 |
-  | 100 | 65.2 | 38.4 | 36.4 |
-  | 1,000 | 64.1 | 36.7 | 34.6 |
-  | 100,000 | 68.5 | 36.7 | 34.3 |
-  | 3,000,000 | 69.8 | 36.7 | 34.3 |
+  | 10 | 75.6 | 46.4 | 44.0 |
+  | 100 | 65.2 | 36.4 | 36.4 |
+  | 1,000 | 64.1 | 34.7 | 34.6 |
+  | 100,000 | 68.5 | 34.7 | 34.3 |
+  | 3,000,000 | 69.8 | 34.7 | 34.3 |
+
+  Six-byte job ids, 100,000 a list: 44.5 bytes an element in 1.2.2, 8.7
+  now, 5.0 in Redis (which keeps such numbers as integers). A list drained
+  to a tenth of its length gives back the room it kept for the rest.
 
   Suite `21-list-memory` of the 1.3.0 regression suite measures this again.
   - A push or a pop at either end moves nothing in its chunk: each chunk
@@ -644,6 +773,59 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     memory. `MEMORY USAGE`
     counts the chunks as allocated; eviction's estimate of what freeing a
     list gives back is their bytes, and lazy freeing's effort their number.
+
+- **Small sorted sets take a quarter to a sixth of the memory (#297, part
+  of #825).** A sorted set of up to 128 members of up to 64 bytes is kept in
+  one block, its entries in order by score and then by member, where it
+  was a hash table and a tree that each held the member: 14-byte members
+  with whole-number scores take 29.6 bytes a member at 10 members (118.8
+  before; Redis 8.10.2 24.8) and 19.3 at 100 (116.4; Redis 21.0); with
+  fractional scores 37.6 and 27.3 (Redis 28.0 and 26.2). Ten 8-byte
+  members a key, as #297 measured it, take 274 bytes of RSS a key (1,249
+  before; Redis 186). Sorted sets of more than 128 members (or with a
+  member longer than 64 bytes) are unchanged: still a table and a tree,
+  at the same size as before; #825's 800-member feeds among them.
+  - A score that is an integer of up to 56 bits is kept in one to eight
+    bytes (one up to 247), any other as the eight bytes of the float: read
+    back, every score is the same float, bit for bit. A member is found by
+    scanning one byte a member (a fingerprint), as in small sets and
+    hashes; a rank is a position, and a range of scores a binary search.
+  - A sorted set moves to the table and the tree when a write adds a member
+    past 128 or one longer than 64 bytes, or when one `ZADD` (or `GEOADD`)
+    gives more than 128 pairs, as Redis moves a listpack to a skiplist;
+    never back. A set built whole (a snapshot or AOF load, `RESTORE`,
+    `MIGRATE`, `ZRANGESTORE`, `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE`,
+    `GEOSEARCHSTORE`) is one block if it fits, laid down once.
+  - `OBJECT ENCODING` reports the form a sorted set is kept in, `listpack`
+    or `skiplist`, and `ZSCAN` returns a block whole, in order, with cursor
+    0, as Redis returns a listpack. A set that became large and was taken
+    back under the limit used to be reported as `listpack`; it is a
+    `skiplist`, as in Redis.
+  - `zset-max-listpack-entries` (default 128) and `zset-max-listpack-value`
+    (64), and their `zset-max-ziplist-*` names, now take effect, from the
+    configuration file or `CONFIG SET`; `0` entries turns blocks off. They
+    go no higher than 128 and 64, and `CONFIG GET` reports the value kept;
+    a larger value logs a warning naming the maximum (also for the set and
+    hash limits, which are clamped the same way). A lowered limit applies
+    to a set at its next new member. A set's buffer gives its room back as
+    members go (once more than half of it is spare), so one popped down
+    from 128 long members does not keep their bytes.
+  - Commands cost fewer instructions on a block than on the table and tree
+    for most of what a small sorted set is used for (8 and 100 members,
+    pipelined, io_uring): `ZRANGE 0 9` 16-17 % fewer, `ZRANGE 0 -1` of 100
+    members 52 %, `ZRANK` 7-17 %, a changed score by `ZADD` or `ZINCRBY`
+    7-12 %, `ZRANDMEMBER` of 100 members 11 %; `ZSCORE` the same. Adding a
+    new member to a set of exactly 8 costs 5 % more (the block grows by
+    one allocation), and at 100 members a `ZSCORE` miss 2 %, a new member
+    2 %, `ZREM` then `ZADD` 2 % and `ZPOPMIN` 2.5 % more (the entries after
+    it move). Large sets are within 1 % of before, and `GET`/`SET` unchanged.
+  - Snapshots, the AOF, replication, `DUMP`/`RESTORE` and `MIGRATE` still
+    write members and scores, so their formats do not change: 1.2.2 reads
+    what this release writes and the other way round, and `DEBUG DIGEST-VALUE`
+    does not depend on the form. `MEMORY USAGE`, eviction and lazy freeing
+    count a block as the one allocation it is. A large sorted set keeps its
+    table and tree behind one more pointer, so its handle in every key is
+    the size of a block's.
 
 - **Active defrag's pass ends about twice as fast, at the same CPU cap
   (#240, #291).** It slept after every batch of 128 buckets, and each sleep
@@ -767,6 +949,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`MONITOR` no longer loses lines.** A monitor was fed through a ring of
+  4,096 lines shared by all monitors, and one that fell that far behind
+  lost what it had not read without a word: with four connections sending
+  pipelined commands over four worker threads, a monitor of 1.2.2 missed
+  between 43 % and 72 % of them (one connection was not affected). Each
+  monitor now has its own queue, held to `client-output-buffer-limit
+  normal` as in Redis (no limit by default): past it the monitor is
+  disconnected and the server logs `Client id=… closed: it is in MONITOR
+  and … bytes behind, over client-output-buffer-limit normal`. Every
+  monitor sees one order, each connection's commands in the order it sent
+  them, and time stamps in the order of the lines: they no longer go back
+  between lines from different threads (only when the system clock is set
+  back, as in Redis). What a monitor has not read yet shows in its `omem`
+  in `CLIENT LIST`. Arguments are quoted as Redis quotes them: `\n`, `\r`, `\t`,
+  `\a` and `\b` by name, not as `\x0a` and the like.
+
+- **`CLIENT UNBLOCK` reaches a client that was woken and is parking
+  again.** It could answer 1 for a client blocked in `BLPOP` (or another
+  blocking pop) that had just been woken and was parking again, and the
+  client then stayed blocked; or answer 0 for it when the pop ahead of it
+  ended with nothing. And a blocking pop that ended with nothing (its
+  timeout, or `CLIENT UNBLOCK`) woke the next client waiting on its key
+  for no reason, which is what opened that window: Redis's unit/pause
+  failed on it now and then.
+
+- **Sorted-set commands read integers as Redis does.** `ZREMRANGEBYRANK
+  key x 5` took `x` as 0 and removed members; it now answers `ERR value is
+  not an integer or out of range`, before it looks at the key, as Redis
+  does. And `+1`, `01` and `-0`, which Redis refuses, were taken as numbers
+  by the indexes of `ZRANGE`/`ZREVRANGE`/`ZRANGESTORE`, the counts of
+  `ZPOPMIN`/`ZPOPMAX`/`ZRANDMEMBER`/`ZMPOP` (and `LMPOP`), `LIMIT` offsets
+  and counts, `ZINTERCARD`'s `LIMIT` and `numkeys`: each now gets Redis's
+  error.
+
 - **Scripts have the Lua 5.1 library functions Redis keeps (#898).**
   `table.getn`, `table.setn`, `table.maxn`, `table.foreach`, `table.foreachi`,
   `math.mod`, `string.gfind` and the global `gcinfo` were missing (scripts run
@@ -852,6 +1068,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for again either: the buffer is not grown to a request's full length
   while the read-ahead still holds it. The io_uring loop holds the same
   bound.
+
+- **What a waiting client read ahead is replayed out of the allocation it
+  was read into.** The read-ahead was moved a read's worth a turn into the
+  query buffer, which reserved and doubled its way up while the
+  read-ahead's own allocation still held the same bytes — a client kept
+  about twice what it held, and at a thousand waiting clients holding a
+  megabyte each the difference was hundreds of megabytes of RSS. When the
+  buffer has nothing left to run, the read-ahead's vector is now handed to
+  it whole and offered on a read's worth a turn, so one allocation carries
+  the bytes. The io_uring loop does the same.
 
 - **`CLIENT NO-TOUCH` now keeps the client's reads from counting as a
   use of the keys they find (#566).** The command was accepted and

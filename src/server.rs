@@ -255,6 +255,7 @@ where
     waiter
         .client_registry
         .set_blocked(waiter.client_id, Some(unblock_tx), wait.has_timeout());
+    let mut unblockable = true;
     let delivery = if crate::commands::blocking::ended_by_role_change(
         park_epoch,
         refused_on_replica,
@@ -269,7 +270,6 @@ where
         let waiting = wait.wait();
         tokio::pin!(waiting);
         let mut temp = [0u8; 4096];
-        let mut unblockable = true;
         loop {
             tokio::select! {
                 delivery = &mut waiting => {
@@ -290,6 +290,12 @@ where
                     ) {
                         waiter.interrupted.gone = true;
                         break None;
+                    }
+                    #[cfg(debug_assertions)]
+                    if delivery.is_some()
+                        && let Some(delay) = crate::commands::blocking::test_woken_delay()
+                    {
+                        tokio::time::sleep(delay).await;
                     }
                     break delivery;
                 }
@@ -329,6 +335,7 @@ where
                             how == crate::commands::blocking::Unblock::Error;
                         waiter.interrupted.role_changed =
                             how == crate::commands::blocking::Unblock::RoleChange;
+                        unblockable = false;
                         break None;
                     }
                     Err(_) => unblockable = false,
@@ -339,6 +346,26 @@ where
     waiter
         .client_registry
         .set_blocked(waiter.client_id, None, false);
+    // A `CLIENT UNBLOCK` that took the client off the list just as its
+    // wait ended otherwise, woken say, was answered 1: it is done as it
+    // said. Otherwise the client went on as woken, and one woken for
+    // nothing parked again and stayed blocked. It is sent under the
+    // list's lock (`ClientRegistry::unblock`), so by now it is in the
+    // channel.
+    let unblocked = if unblockable {
+        unblock_rx.try_recv().ok()
+    } else {
+        None
+    };
+    let delivery = match unblocked {
+        Some(how) => {
+            waiter.interrupted.unblocked_with_error =
+                how == crate::commands::blocking::Unblock::Error;
+            waiter.interrupted.role_changed = how == crate::commands::blocking::Unblock::RoleChange;
+            None
+        }
+        None => delivery,
+    };
     slot.hold_count(counted);
     // Woken, or unblocked otherwise, at the moment this node became a
     // replica: ended as the sweep ends it.
@@ -671,6 +698,39 @@ where
     subs
 }
 
+/// A connection made a monitor, with the task that writes what it is shown.
+fn start_monitoring<S>(
+    monitor_registry: &crate::monitor::SharedMonitorRegistry,
+    client_registry: &crate::client_registry::ClientRegistry,
+    client_id: u64,
+    pubsub: &crate::pubsub::PubSubHub,
+    writer: &Arc<Mutex<tokio::io::WriteHalf<S>>>,
+) -> crate::monitor::Monitoring
+where
+    S: AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut monitoring, mut outbox) = crate::monitor::connect(
+        monitor_registry,
+        Arc::clone(client_registry),
+        client_id,
+        pubsub.shared_limits(),
+    );
+    let writer = Arc::clone(writer);
+    monitoring.forwarded_by(tokio::spawn(async move {
+        while let Some(lines) = outbox.next().await {
+            let mut g = writer.lock().await;
+            crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(lines.len() as u64, Ordering::Relaxed);
+            crate::stats::record_write();
+            if g.write_all(&lines).await.is_err() {
+                break;
+            }
+            drop(g);
+            outbox.written(lines);
+        }
+    }));
+    monitoring
+}
+
 /// Replica / monitor: channel-fed writer multiplexes onto `writer`.
 fn spawn_mux_to_socket<S>(
     writer: Arc<Mutex<tokio::io::WriteHalf<S>>>,
@@ -953,6 +1013,12 @@ where
     // a blocking command's wait was cut short.
     let mut carried: Vec<u8> = Vec::new();
     let mut carried_from = 0usize;
+    // Bytes at `buffer`'s end not yet offered to the parser: `carried`'s
+    // vector is handed to `buffer` whole when it is replayed — the same
+    // bytes stay in the one allocation rather than being copied a chunk a
+    // turn into a second, doubling, one — and a read's worth is offered a
+    // turn, as a chunk moved a turn was (#865).
+    let mut unpresented = 0usize;
     let mut interrupted = crate::commands::blocking::Interrupted::default();
 
     // After a `SHUTDOWN` that failed: what follows it in the buffer is read
@@ -966,7 +1032,7 @@ where
         // again — `buffer` would reserve a request's full length while
         // `carried` still holds it, and the client would keep the two (#869).
         let mut fed_from_carried = false;
-        if carried.is_empty() && !skip_read {
+        if unpresented == 0 && carried.is_empty() && !skip_read {
             // Redis reclaims private query buffers from its client cron, and the
             // maintenance step below is the equivalent. It can only do anything
             // when the buffer is private and has spare capacity to reclaim, so
@@ -1062,22 +1128,43 @@ where
             crate::stats::record_read();
             activity.note_read(n);
             buffer.extend_from_slice(&temp[..n]);
+        } else if unpresented > 0 {
+            // What `carried`'s vector was handed over as is offered on, a
+            // read's worth a turn.
+            fed_from_carried = true;
+            unpresented = unpresented.saturating_sub(temp.len());
         } else if !carried.is_empty() {
             // A read's worth a turn, as the socket would have given it: what
             // one turn runs, and so the replies the output limit looks at
             // after it, is no more than a read brings (#865).
             fed_from_carried = true;
-            let to = carried.len().min(carried_from + temp.len());
-            buffer.extend_from_slice(&carried[carried_from..to]);
-            carried_from = to;
-            if carried_from == carried.len() {
+            if read_start == buffer.len() {
+                // `carried`'s whole vector becomes the buffer when nothing
+                // of the buffer's is still to run: the read ahead is then
+                // replayed out of the allocation it was read into, rather
+                // than copied a chunk a turn into a second one that doubles
+                // its way up while `carried` still holds the same bytes.
+                std::mem::swap(&mut buffer, &mut carried);
+                read_start = carried_from;
+                // The buffer's own allocation is not kept in `carried`
+                // either: what the next wait reads grows its own.
                 carried = Vec::new();
                 carried_from = 0;
-            } else if carried_from > carried.len() / 2 {
-                // What was moved out of `carried` is given back — capacity
-                // with it — in steps, rather than at the end (#869).
-                carried = carried.split_off(carried_from);
-                carried_from = 0;
+                unpresented = (buffer.len() - read_start).saturating_sub(temp.len());
+            } else {
+                let to = carried.len().min(carried_from + temp.len());
+                buffer.extend_from_slice(&carried[carried_from..to]);
+                carried_from = to;
+                if carried_from == carried.len() {
+                    carried = Vec::new();
+                    carried_from = 0;
+                } else if carried_from > carried.len() / 2 {
+                    // What was moved out of `carried` is given back —
+                    // capacity with it — in steps, rather than at the end
+                    // (#869).
+                    carried = carried.split_off(carried_from);
+                    carried_from = 0;
+                }
             }
         }
         query_buffer_peak = query_buffer_peak.max(buffer.len().saturating_sub(read_start));
@@ -1115,15 +1202,21 @@ where
         // `cmd` borrows `buffer` for the whole parse round: what it holds is
         // known only from here.
         let buffer_len = buffer.len();
+        // What was handed over from `carried` is offered a read's worth a
+        // turn: commands start only before `presented_end`, which a request
+        // that crosses it completes past — as one a read ends within did.
+        let presented_end = buffer.len() - unpresented;
         let was_private_query_buffer = private_query_buffer;
-        while let Some((consumed, cmd)) =
-            match progress.next_request(&mut buffer, parse_offset, authenticated_user.is_some()) {
-                Ok(request) => request,
-                Err(e) => {
-                    protocol_error = Some(e);
-                    None
+        while parse_offset < presented_end
+            && let Some((consumed, cmd)) =
+                match progress.next_request(&mut buffer, parse_offset, authenticated_user.is_some())
+                {
+                    Ok(request) => request,
+                    Err(e) => {
+                        protocol_error = Some(e);
+                        None
+                    }
                 }
-            }
         {
             private_query_buffer |= progress.take_private_query_buffer();
             if cmd.is_empty() {
@@ -1456,7 +1549,7 @@ where
                         let limit = HardLimit::new(
                             pubsub.limits(),
                             subscriptions.is_some(),
-                            combined.len() + carried.len() - carried_from,
+                            combined.len() + carried.len() - carried_from + unpresented,
                             client_id,
                         );
                         // Boxed, and so polled out of line: the wait is cold, and the
@@ -1562,7 +1655,7 @@ where
                     let limit = HardLimit::new(
                         pubsub.limits(),
                         subscriptions.is_some(),
-                        combined.len() + carried.len() - carried_from,
+                        combined.len() + carried.len() - carried_from + unpresented,
                         client_id,
                     );
                     // Boxed, and so polled out of line: the wait is cold, and the
@@ -1814,9 +1907,12 @@ where
             // runs it (#550).
             if cmd_name == "MONITOR" && !tx.active {
                 if monitoring.is_none() {
-                    monitoring = Some(crate::monitor::Monitoring::start(
+                    monitoring = Some(start_monitoring(
                         &monitor_registry,
-                        push_tx.clone(),
+                        &client_registry,
+                        client_id,
+                        &pubsub,
+                        &writer,
                     ));
                     client_registry.update(client_id, |info| info.flags = "O".to_string());
                 }
@@ -3106,16 +3202,29 @@ where
             quit_requested = true;
         }
 
+        // A request that crosses `presented_end` completes past it — as one
+        // a read ends within did — so the turn can have run into the
+        // un-offered tail: no more of it is left than is unconsumed.
+        unpresented = unpresented.min(buffer.len() - parse_offset);
         read_start = parse_offset;
 
+        if read_start == buffer.len() {
+            buffer.clear();
+            read_start = 0;
+            // A buffer that grew to hold one large request — or a read-ahead's
+            // vector handed to it — is given back at the end of the batch that
+            // finished it, rather than kept at that size for the life of the
+            // connection.
+            if buffer.capacity() > BIG_BUFFER {
+                buffer = Vec::with_capacity(4 * 1024);
+                query_buffer_peak = 0;
+            }
         // Only compact when we've consumed a meaningful chunk AND there's
         // data left to preserve. This amortizes the memmove cost.
-        if read_start > 0 && read_start > buffer.len() / 2 {
+        } else if read_start > 0 && read_start > buffer.len() / 2 {
             buffer.drain(0..read_start);
             read_start = 0;
         }
-        // A buffer that grew to hold one large request is not kept at that
-        // size for the life of the connection.
         query_buffer.update(
             buffer.len().saturating_sub(read_start) + carried.len() - carried_from,
             buffer.capacity().saturating_sub(buffer.len()),
@@ -3174,7 +3283,7 @@ where
                         let limit = HardLimit::new(
                             pubsub.limits(),
                             subscriptions.is_some(),
-                            waiting + carried.len() - carried_from,
+                            waiting + carried.len() - carried_from + unpresented,
                             client_id,
                         );
                         read_while_writing(
@@ -3197,7 +3306,7 @@ where
                 let limit = HardLimit::new(
                     pubsub.limits(),
                     subscriptions.is_some(),
-                    waiting + carried.len() - carried_from,
+                    waiting + carried.len() - carried_from + unpresented,
                     client_id,
                 );
                 let write = std::pin::pin!(write_tcp_batch(&writer, &mut combined));

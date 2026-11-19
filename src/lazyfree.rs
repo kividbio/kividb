@@ -8,6 +8,7 @@
 //! (#19). They used to be `0` always, and everything was freed on the thread
 //! that removed it, under the shard lock.
 
+use crate::cpus::BuilderExt as _;
 use std::cell::Cell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,7 +36,7 @@ fn worker() -> &'static Sender<Job> {
         // `free_later` frees in place.
         let started = std::thread::Builder::new()
             .name("kividb-lazyfree".into())
-            .spawn(move || {
+            .spawn_released(move || {
                 for (what, objects) in rx {
                     // For a test: frees that fall behind. Each one waits
                     // for its `failpoint.lazyfree-held.<n>` file to be
@@ -138,7 +139,8 @@ pub fn effort(value: &KiviDBValue) -> u64 {
         // Redis counts an intset or a listpack.
         KiviDBValue::Set(set) => set.read().free_effort(),
         KiviDBValue::VectorSet(set) => set.read().entries.len(),
-        KiviDBValue::SortedSet(zset) => zset.read().len(),
+        // A block of entries (#297) is one allocation.
+        KiviDBValue::SortedSet(zset) => zset.read().free_effort(),
         KiviDBValue::Stream(stream) => {
             let stream = stream.read();
             // A stream loaded from disk has not recorded its nodes: take them

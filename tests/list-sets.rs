@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Integration tests for List and Set commands.
 // Same harness as string-json.rs and vector_hash.rs — each test gets its
 // own server on a random port so tests run fully isolated and in parallel.
