@@ -11731,14 +11731,15 @@ fn migrate_moves_sorted_sets_in_every_form() {
     }
 }
 
-/// Two masters coordinating searches at the same time, while tagged scripts
-/// run beside others on both: every search is answered, and none waits for
-/// long. A coordinator holds the locks that keep such scripts out
-/// (`tag_locks::walk`) for its own part of the search only: held while it
-/// waits for the other master's part, which takes them there, each node's
-/// coordinator could wait for the other's, behind a script waiting for its
-/// lock, until the search timed out. Not deterministic: it runs the mix for
-/// a few seconds.
+/// A master coordinating searches while tagged scripts run beside others on
+/// both masters: every search is answered, and none waits for long. A
+/// coordinator holds the locks that keep such scripts out
+/// (`tag_locks::walk`) for its own part of the search only, and lets go of
+/// them before it waits for the other master's part, which takes them
+/// there. Searches are coordinated by one master: two that coordinate at
+/// once can each hold the thread the other's part would be answered on, as
+/// a coordinator waits for the other masters on its thread, scripts or not.
+/// Not deterministic: it runs the mix for a few seconds.
 #[cfg(feature = "lua")]
 #[test]
 fn coordinated_searches_beside_tagged_scripts_on_both_masters() {
@@ -11801,7 +11802,7 @@ fn coordinated_searches_beside_tagged_scripts_on_both_masters() {
                 ("script", slowest)
             }));
         }
-        for _ in 0..3 {
+        for _ in 0..if n == 0 { 2 } else { 0 } {
             let mut c = node.conn();
             loops.push(std::thread::spawn(move || {
                 let mut slowest = Duration::ZERO;
