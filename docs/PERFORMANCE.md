@@ -471,7 +471,7 @@ cores with two hyper-threads each): the server confined with `taskset`, memtier_
 2.6.1 with 4 threads on the other CPUs, 1M keys of 100 B and 500k of 2 KB, `GET`:`SET`
 9:1, three runs of 8 s, the median. "4 vCPUs" is the server on the two hyper-threads of 2
 cores, "4 cores" on one hyper-thread of each of the 4 cores with memtier on the siblings.
-Up to 1.2, auto started 2 workers on 4 vCPUs and 2 on 2.
+Up to 1.2, auto started 2 workers on 4 vCPUs and 2 on 2. The table and the first three bullets below are that study; the default is now half the CPUs ([below](#half-the-cpus-is-the-default)).
 
 Unpipelined, 500 connections, ops/s and p99:
 
@@ -501,6 +501,35 @@ Unpipelined, 500 connections, ops/s and p99:
   p99 of 27.5 ms, one 119k at 4.7 ms; with `--cpus 2.5`, three workers 282k at 18.2 ms,
   two 273k at 2.1 ms; and with `--cpus 2`, three workers 223k at 35.6 ms, two 270k at
   2.0 ms. Auto rounds the quota down.
+
+### Half the CPUs is the default
+
+`--threads 0` starts half the available CPUs, rounded up, and at least 2 where there are 2 or more (1 on 1, 2 on 2, 3 or 4, 3 on 6,
+4 on 8, 8 on 16). It was chosen from a matrix of worker counts on one Azure `Standard_D8s_v5`
+(8 vCPUs, 4 cores with two hyper-threads each): master `006f8d10` built by rustc 1.100.0, the
+v1.2.2 release binary and Redis 8.10.2, three runs, the median. The server was either unpinned
+on all 8 vCPUs beside its load generator (alone, or with an application-like neighbour of 4
+threads busy 3 ms of every 6), or confined to CPUs 0-3 (4 vCPUs, on 2 cores) or 0-5 (6 vCPUs,
+on 3 cores) with the load generator on the others. Over the 14 cells that saturate the server
+(`GET`:`SET` at 100 B and 2 KB, `SET` pipelined 16 and 100, `XADD`, pub/sub), the throughput
+lost against the best count measured in the same cell:
+
+| policy | worst loss | average loss | cells within 3% of the best |
+|---|---:|---:|---:|
+| one per CPU | 37.9% | 8.2% | 9 of 14 |
+| CPUs minus 2 (all below 4), as 1.2.2 | 26.2% | 4.8% | 10 of 14 |
+| half the CPUs, rounded up | 6.3% | 1.3% | 13 of 14 |
+
+One worker per CPU also raised the p99 of a server that shared its machine with other busy
+threads: by up to 1011% in the paced cells (`GET`, `SET` and `EXPIRE` over 200 connections at a fixed 100,000 requests a
+second and at 2,000) against up to 20% for half the CPUs, and by up to 229% in the saturating cells against up to 4%.
+The worst throughput cell of one per
+CPU was `XADD` on io_uring with the server on 4 vCPUs of 2 cores (37.9% lost).
+
+A server that has its CPUs to itself, with its clients elsewhere, can use more workers: set
+`--threads` to the CPUs, and `worker-cpu-affinity auto` then binds them. On 2 dedicated CPUs (a Standard_D4s_v5 run with the server on 2 CPUs) one worker served 78-85% of the best count's throughput on `GET` (50 connections) and 84% on `SET` pipelined 16, and had a p99 of 64.5 ms against 3.2 ms with two workers on tokio (500 connections) and of 4.5 ms against 0.66 ms on a near-idle load; two workers were within a few percent of the best count except on `XADD` and pub`--threads` to the CPUs, and `worker-cpu-affinity auto` then binds them. The regression suitesub (91-94%), which is why auto starts at least 2. The regression suite
+`32-default-threads` records the default against the best explicit count on a
+`Standard_D4s_v5`, with the load generators on the same CPUs.
 
 ## Worker CPU affinity
 

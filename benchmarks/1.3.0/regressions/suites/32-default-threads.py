@@ -3,7 +3,7 @@
 
 Every other configuration states its `--threads` (the count its values were
 recorded with), so none of them measures the default policy along with the
-code. The default changed in 1.3.0 (#903: one worker per available CPU, where
+code. The default changed in 1.3.0 (#903: one worker per available CPU, then half the available CPUs, rounded up;
 1.2 started the CPUs minus two, all of them below four) and what is best
 depends on where the clients run: with the load generator on the same 4
 vCPUs, suite 05's `XADD` row served 594k/s with 2 workers and 426k with 4.
@@ -30,11 +30,11 @@ For each row, medians of the 3 rounds: `<row>_default` (the default's rate),
 that was) and `<row>_default_vs_best` (default / best).
 
 Gates: `pubsub_lost` 0, exactly. `<row>_default_vs_best` is recorded and
-shown but INFORMATIONAL for now: with today's default (one per CPU) XADD's
-ratio is about 0.71 on the Standard_D4s_v5, so the intended gate (at least
+shown but INFORMATIONAL: with the default of one per CPU XADD's
+ratio was about 0.71 on the Standard_D4s_v5 (half the CPUs, rounded up, replaced it), so a gate (at least
 0.90: the default at most 10 % under the best explicit count of the same
-build) would fail on master the day the suite lands. It becomes that gate when
-the default worker count is settled (the owner's decision). The rates are
+build) would have failed on master the day the suite landed. It can become that gate: the default
+worker count is settled now, and the recorded rows say where it stands. The rates are
 shown, not gated (the other suites gate the code at fixed counts). v1.2.2 runs too, as a reference of the old rule
 (its ratio is shown, not gated).
 """
@@ -51,7 +51,7 @@ import subprocess  # noqa: E402
 S = Suite("32-default-threads", [Config("shared", threads=0, engines=("v1_2_2", "candidate"), self_hosted=True)])
 ROUNDS = 3
 KEYS = 100_000
-# Informational for now: with today's default (one worker per CPU, #903) XADD's
+# Informational: with the default of #903 (one worker per CPU) XADD's
 # default/best is about 0.71 on the Standard_D4s_v5, so a 0.90 gate would fail the
 # release gate on the day the suite lands. The rows are recorded and shown; they
 # become gates (bound(min=0.9)) once the default worker count is settled, a
