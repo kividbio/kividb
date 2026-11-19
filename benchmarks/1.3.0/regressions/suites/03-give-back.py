@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import (Suite, Config, MEMORY, GIVE_BACK, KEEP_IMPROVEMENT, info, scaled)  # noqa: E402
 from rss import vmrss_mib, used_memory_mib, sample_at, smaps_mib  # noqa: E402
 
-S = Suite("03-give-back", [Config("hashdel"), Config("hdel"), Config("churn")])
+S = Suite("03-give-back", [Config("hashdel", threads=2), Config("hdel", threads=2), Config("churn", threads=2)])
 MARKS = (1.5, 5, 15)
 
 

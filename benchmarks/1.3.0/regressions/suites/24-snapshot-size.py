@@ -41,7 +41,7 @@ from nodes import Nodes  # noqa: E402
 S = Suite(
     "24-snapshot-size",
     [
-        Config(name, self_hosted=True)
+        Config(name, self_hosted=True, threads=4)
         for name in ("issue-default", "issue-yes", "coll-default", "coll-yes")
     ],
 )

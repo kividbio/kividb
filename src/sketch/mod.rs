@@ -15,8 +15,13 @@
 //! * as `BF.SCANDUMP` chunks, which are Redis's too: see [`bloom`].
 
 pub mod bloom;
+pub mod cms;
+pub mod cuckoo;
 pub mod murmur;
 pub mod redis_module;
+pub mod room;
+pub mod tdigest;
+pub mod topk;
 
 use std::io;
 
@@ -28,11 +33,23 @@ pub const TAG_SKETCH: u8 = 40;
 /// The kinds under [`TAG_SKETCH`], and the version of each one's encoding.
 const KIND_BLOOM: u8 = 1;
 const BLOOM_VERSION: u8 = 1;
+const KIND_CMS: u8 = 2;
+const CMS_VERSION: u8 = 1;
+const KIND_TOPK: u8 = 3;
+const TOPK_VERSION: u8 = 1;
+const KIND_CUCKOO: u8 = 4;
+const CUCKOO_VERSION: u8 = 1;
+const KIND_TDIGEST: u8 = 5;
+const TDIGEST_VERSION: u8 = 1;
 
 /// A probabilistic value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Sketch {
     Bloom(bloom::BloomChain),
+    CountMin(cms::CountMin),
+    TopK(topk::TopK),
+    Cuckoo(cuckoo::Cuckoo),
+    TDigest(tdigest::TDigest),
 }
 
 impl Sketch {
@@ -40,6 +57,10 @@ impl Sketch {
     pub fn type_name(&self) -> &'static str {
         match self {
             Sketch::Bloom(_) => redis_module::BLOOM_TYPE,
+            Sketch::CountMin(_) => redis_module::CMS_TYPE,
+            Sketch::TopK(_) => redis_module::TOPK_TYPE,
+            Sketch::Cuckoo(_) => redis_module::CUCKOO_TYPE,
+            Sketch::TDigest(_) => redis_module::TDIGEST_TYPE,
         }
     }
 
@@ -47,6 +68,10 @@ impl Sketch {
     pub fn memory_bytes(&self) -> usize {
         match self {
             Sketch::Bloom(chain) => chain.memory_bytes(),
+            Sketch::CountMin(v) => v.memory_bytes(),
+            Sketch::TopK(v) => v.memory_bytes(),
+            Sketch::Cuckoo(v) => v.memory_bytes(),
+            Sketch::TDigest(v) => v.memory_bytes(),
         }
     }
 
@@ -58,6 +83,10 @@ impl Sketch {
             Sketch::Bloom(chain) => {
                 (chain.layers.len() as u64).saturating_add(chain.data_bytes() >> 16)
             }
+            Sketch::CountMin(v) => 1 + (v.data_bytes() >> 16),
+            Sketch::TopK(v) => 1 + (v.data_bytes() >> 16),
+            Sketch::Cuckoo(v) => 1 + (v.data_bytes() >> 16),
+            Sketch::TDigest(v) => 1 + (v.memory_bytes() as u64 >> 16),
         }
     }
 
@@ -65,14 +94,18 @@ impl Sketch {
     pub fn kdb_len(&self) -> u64 {
         2 + match self {
             Sketch::Bloom(chain) => bloom::kdb_len(chain),
+            Sketch::CountMin(v) => cms::kdb_len(v),
+            Sketch::TopK(v) => topk::kdb_len(v),
+            Sketch::Cuckoo(v) => cuckoo::kdb_len(v),
+            Sketch::TDigest(v) => tdigest::kdb_len(v),
         }
     }
 }
 
 /// Whether `bytes` more fit under `maxmemory` (always, without one),
 /// reckoned as eviction reckons it: what is counted against the limit.
-/// Asked by the commands from clients that make or grow a filter, once
-/// they have evicted what they could; never while loading one, nor for a
+/// Asked before a command from a client that makes or grows a filter runs,
+/// and again when it runs ([`room`]); never while loading one, nor for a
 /// command from a master or the AOF.
 pub fn room_for(bytes: u64) -> bool {
     let limit = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
@@ -88,6 +121,22 @@ pub fn write_kdb(w: &mut impl io::Write, sketch: &Sketch) -> io::Result<()> {
             w.write_all(&[KIND_BLOOM, BLOOM_VERSION])?;
             bloom::write_kdb(w, chain)
         }
+        Sketch::CountMin(v) => {
+            w.write_all(&[KIND_CMS, CMS_VERSION])?;
+            cms::write_kdb(w, v)
+        }
+        Sketch::TopK(v) => {
+            w.write_all(&[KIND_TOPK, TOPK_VERSION])?;
+            topk::write_kdb(w, v)
+        }
+        Sketch::Cuckoo(v) => {
+            w.write_all(&[KIND_CUCKOO, CUCKOO_VERSION])?;
+            cuckoo::write_kdb(w, v)
+        }
+        Sketch::TDigest(v) => {
+            w.write_all(&[KIND_TDIGEST, TDIGEST_VERSION])?;
+            tdigest::write_kdb(w, v)
+        }
     }
 }
 
@@ -97,6 +146,10 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<Sketch> {
     r.read_exact(&mut head)?;
     match head {
         [KIND_BLOOM, BLOOM_VERSION] => Ok(Sketch::Bloom(bloom::read_kdb(r)?)),
+        [KIND_CMS, CMS_VERSION] => Ok(Sketch::CountMin(cms::read_kdb(r)?)),
+        [KIND_TOPK, TOPK_VERSION] => Ok(Sketch::TopK(topk::read_kdb(r)?)),
+        [KIND_CUCKOO, CUCKOO_VERSION] => Ok(Sketch::Cuckoo(cuckoo::read_kdb(r)?)),
+        [KIND_TDIGEST, TDIGEST_VERSION] => Ok(Sketch::TDigest(tdigest::read_kdb(r)?)),
         [kind, version] => Err(invalid(&format!(
             "probabilistic value of kind {kind}, version {version}, is not known to this \
              version of KiviDB"
@@ -141,6 +194,76 @@ pub(crate) fn read_vec(r: &mut impl io::Read, len: usize) -> io::Result<Vec<u8>>
     }
     Ok(out)
 }
+
+/// `n` values of `T`, each made by `of` from `SIZE` bytes, read from `r` a
+/// megabyte at a time: the bytes are never held whole beside the values.
+/// The values' memory is asked for (not assumed), and as the stream gives
+/// them, doubling as `Vec` grows, so that a corrupt length allocates no
+/// more than about twice what the stream holds.
+pub(crate) fn read_values<T, const SIZE: usize>(
+    r: &mut impl io::Read,
+    n: usize,
+    of: impl Fn(&[u8; SIZE]) -> T,
+) -> io::Result<Vec<T>> {
+    // A whole number of values.
+    const STEP: usize = 1 << 20;
+    let total = n
+        .checked_mul(SIZE)
+        .ok_or_else(|| invalid("a value longer than memory"))?;
+    let mut out: Vec<T> = Vec::new();
+    let mut buf = vec![0u8; total.min(STEP)];
+    let mut left = total;
+    while left > 0 {
+        let len = left.min(STEP);
+        r.read_exact(&mut buf[..len])?;
+        let more = len / SIZE;
+        if out.capacity() - out.len() < more {
+            let want = (out.len() + more)
+                .max(out.capacity().saturating_mul(2))
+                .min(n);
+            out.try_reserve_exact(want - out.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::OutOfMemory, "no memory for a sketch")
+            })?;
+        }
+        out.extend(buf[..len].as_chunks::<SIZE>().0.iter().map(&of));
+        left -= len;
+    }
+    Ok(out)
+}
+
+/// `n` values of `T` from zeroed memory, or `None` if it cannot be had (the
+/// memory asked for, not assumed). The pages come zeroed from the system
+/// and are not written here: making a large sketch costs nothing of its
+/// size until it is used, so a command that makes one holds its key's order
+/// and the write gate no longer for its size. `T` is a plain number, or a
+/// struct of them, all of whose zero bytes are a value ([`Zeroed`]).
+pub(crate) fn zeroed<T: Zeroed>(n: usize) -> Option<Vec<T>> {
+    if n == 0 || std::mem::size_of::<T>() == 0 {
+        return Some(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<T>(n).ok()?;
+    // SAFETY: the layout is of n > 0 values of a type of non-zero size; the
+    // memory is zeroed, and all-zero bytes are a `T` (`Zeroed`); the vector
+    // owns it, with the length and capacity it was asked for.
+    unsafe {
+        let p = std::alloc::alloc_zeroed(layout).cast::<T>();
+        if p.is_null() {
+            return None;
+        }
+        Some(Vec::from_raw_parts(p, n, n))
+    }
+}
+
+/// A type all of whose zero bytes are a value of it, for [`zeroed`].
+///
+/// # Safety
+///
+/// Only for plain numbers and structs of them, without padding that matters.
+pub(crate) unsafe trait Zeroed: Copy {}
+// SAFETY: plain numbers.
+unsafe impl Zeroed for u8 {}
+// SAFETY: plain numbers.
+unsafe impl Zeroed for u32 {}
 
 #[cfg(test)]
 mod tests {

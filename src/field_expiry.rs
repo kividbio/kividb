@@ -1087,8 +1087,6 @@ mod propagation_tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use tokio::sync::mpsc;
-
     use crate::replication::replica_client::{ReplicationApplyEnv, run_as_client};
     use crate::replication::{HubMsg, HubTx, ReplState};
     use crate::store::{self, Store, ValueRef};
@@ -1099,7 +1097,7 @@ mod propagation_tests {
         repl: Arc<ReplState>,
         index: IndexStore,
         hub_tx: HubTx,
-        rx: mpsc::UnboundedReceiver<HubMsg>,
+        rx: crate::replication::HubRx,
         env: ReplicationApplyEnv,
         _own: super::OwnWatches,
     }
@@ -1112,7 +1110,7 @@ mod propagation_tests {
         std::mem::forget(Arc::clone(&store));
         let repl = Arc::new(ReplState::new_master());
         repl.backlog_active.store(true, Ordering::Relaxed);
-        let (hub_tx, rx) = mpsc::unbounded_channel();
+        let (hub_tx, rx) = crate::replication::HubTx::channel();
         crate::expiry::register(&store, &repl, &hub_tx);
         let index = crate::vector::new_index_store();
         let own = super::OwnWatches::of(&store);
@@ -1805,7 +1803,7 @@ mod propagation_tests {
             repl,
             index: replica_index,
             hub_tx: m.hub_tx.clone(),
-            rx: mpsc::unbounded_channel().1,
+            rx: crate::replication::HubTx::channel().1,
             env: ReplicationApplyEnv::new_inert(),
             _own: super::OwnWatches::of(&store::new_store(1)),
         }

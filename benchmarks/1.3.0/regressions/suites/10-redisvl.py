@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.join(here, "..", "lib"))
 from suite import Suite, Config, EXACT, bound, info  # noqa: E402
 
 HARNESS = os.path.normpath(os.path.join(here, "..", "..", "..", "redisvl-compat"))
-S = Suite("10-redisvl", [Config("redisvl", engines=("v1_2_2", "candidate"))])
+S = Suite("10-redisvl", [Config("redisvl", engines=("v1_2_2", "candidate"), threads=2)])
 
 
 def venv():
