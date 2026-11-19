@@ -446,6 +446,7 @@ async fn park_blocking_uring(
     let (unblock_tx, mut unblock_rx) = tokio::sync::oneshot::channel();
     client_registry.set_blocked(client_id, Some(unblock_tx), wait.has_timeout());
     let fd = watch.fd;
+    let mut unblockable = true;
     let delivery = if crate::commands::blocking::ended_by_role_change(
         park_epoch,
         refused_on_replica,
@@ -465,7 +466,6 @@ async fn park_blocking_uring(
         // killed, which shuts the socket down) must not be left in line for
         // an element nobody will receive. See `PeerWatch`.
         let mut gone = watch.gone();
-        let mut unblockable = true;
         loop {
             tokio::select! {
                 delivery = &mut waiting => {
@@ -477,6 +477,12 @@ async fn park_blocking_uring(
                     if peer_has_gone(fd) {
                         interrupted.gone = true;
                         break None;
+                    }
+                    #[cfg(debug_assertions)]
+                    if delivery.is_some()
+                        && let Some(delay) = crate::commands::blocking::test_woken_delay()
+                    {
+                        tokio::time::sleep(delay).await;
                     }
                     break delivery;
                 }
@@ -490,6 +496,7 @@ async fn park_blocking_uring(
                             how == crate::commands::blocking::Unblock::Error;
                         interrupted.role_changed =
                             how == crate::commands::blocking::Unblock::RoleChange;
+                        unblockable = false;
                         break None;
                     }
                     Err(_) => unblockable = false,
@@ -498,6 +505,25 @@ async fn park_blocking_uring(
         }
     };
     client_registry.set_blocked(client_id, None, false);
+    // A `CLIENT UNBLOCK` that took the client off the list just as its
+    // wait ended otherwise, woken say, was answered 1: it is done as it
+    // said. Otherwise the client went on as woken, and one woken for
+    // nothing parked again and stayed blocked. It is sent under the
+    // list's lock (`ClientRegistry::unblock`), so by now it is in the
+    // channel.
+    let unblocked = if unblockable {
+        unblock_rx.try_recv().ok()
+    } else {
+        None
+    };
+    let delivery = match unblocked {
+        Some(how) => {
+            interrupted.unblocked_with_error = how == crate::commands::blocking::Unblock::Error;
+            interrupted.role_changed = how == crate::commands::blocking::Unblock::RoleChange;
+            None
+        }
+        None => delivery,
+    };
     slot.hold_count(counted);
     // Woken, or unblocked otherwise, at the moment this node became a
     // replica: ended as the sweep ends it.
@@ -873,6 +899,40 @@ fn open_subscriptions(
         }
     }));
     subs
+}
+
+/// A connection made a monitor, with the task that writes what it is shown.
+/// On this thread, sharing the fd as the subscriptions' task does.
+fn start_monitoring(
+    monitor_registry: &crate::monitor::SharedMonitorRegistry,
+    client_registry: &crate::client_registry::ClientRegistry,
+    client_id: u64,
+    pubsub: &PubSubHub,
+    stream: &Rc<TcpStream>,
+    write_guard: &Rc<tokio::sync::Mutex<()>>,
+) -> crate::monitor::Monitoring {
+    let (mut monitoring, mut outbox) = crate::monitor::connect(
+        monitor_registry,
+        std::sync::Arc::clone(client_registry),
+        client_id,
+        pubsub.shared_limits(),
+    );
+    let stream = Rc::clone(stream);
+    let write_guard = Rc::clone(write_guard);
+    monitoring.forwarded_by(tokio_uring::spawn(async move {
+        while let Some(lines) = outbox.next().await {
+            let _w = write_guard.lock().await;
+            crate::stats::TOTAL_NET_OUTPUT_BYTES
+                .fetch_add(lines.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::stats::record_write();
+            let (res, lines) = stream.write_all(lines).await;
+            if res.is_err() {
+                break;
+            }
+            outbox.written(lines);
+        }
+    }));
+    monitoring
 }
 
 /// The address a client connected to: `laddr` in `CLIENT LIST`.
@@ -2000,9 +2060,13 @@ pub async fn handle_client(
             // runs it (#550).
             if cmd_name == "MONITOR" && !tx.active {
                 if monitoring.is_none() {
-                    monitoring = Some(crate::monitor::Monitoring::start(
+                    monitoring = Some(start_monitoring(
                         &monitor_registry,
-                        push_tx.clone(),
+                        &client_registry,
+                        client_id,
+                        &pubsub,
+                        &stream,
+                        &write_guard,
                     ));
                     client_registry.update(client_id, |info| info.flags = "O".to_string());
                 }

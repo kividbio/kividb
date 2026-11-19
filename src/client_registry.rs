@@ -74,6 +74,9 @@ pub struct Activity {
     /// once, and not shown), and what is queued for a subscriber.
     reply_output: AtomicU64,
     pubsub_output: AtomicU64,
+    /// What is queued for the connection as a `MONITOR` and not yet
+    /// written, as Redis counts a monitor's backlog in its `omem`.
+    monitor_output: AtomicU64,
     /// What a subscriber's writer keeps between batches (its batch and
     /// frame buffers, #851): memory the client holds, not output waiting,
     /// so it is in `tot-mem` and `mem_clients_normal` and not in `omem`.
@@ -369,7 +372,14 @@ impl Activity {
 
     /// What is waiting to be written to the connection: `omem`.
     pub fn output(&self) -> u64 {
-        self.reply_output.load(Ordering::Relaxed) + self.pubsub_output.load(Ordering::Relaxed)
+        self.reply_output.load(Ordering::Relaxed)
+            + self.pubsub_output.load(Ordering::Relaxed)
+            + self.monitor_output.load(Ordering::Relaxed)
+    }
+
+    /// See [`Activity::monitor_output`].
+    pub fn set_monitor_output(&self, bytes: usize) {
+        self.monitor_output.store(bytes as u64, Ordering::Relaxed);
     }
 
     /// See [`Activity::pubsub_kept`].
@@ -1094,13 +1104,17 @@ impl ClientRegistryInner {
     }
 
     /// `CLIENT UNBLOCK`: end the client's wait, if it is waiting.
+    ///
+    /// Sent under the lock: a wait that ends otherwise at the same moment,
+    /// woken say, takes its client off the list under it too
+    /// (`set_blocked`), and then finds what was sent in its channel and does
+    /// it, as was answered.
     pub fn unblock(&self, id: u64, how: crate::commands::blocking::Unblock) -> bool {
-        let sender = self
-            .clients
+        self.clients
             .write()
             .get_mut(&id)
-            .and_then(|info| info.unblock_tx.take());
-        sender.is_some_and(|tx| tx.send(how).is_ok())
+            .and_then(|info| info.unblock_tx.take())
+            .is_some_and(|tx| tx.send(how).is_ok())
     }
 
     /// `clients_in_timeout_table` (#158): clients blocked with a timeout.
@@ -1114,15 +1128,16 @@ impl ClientRegistryInner {
     /// (#591). A client paused by `CLIENT PAUSE` is not blocked, and is let
     /// be, as in Redis. Returns how many were ended.
     pub fn end_blocked_for_role_change(&self) -> usize {
-        let senders: Vec<_> = self
-            .clients
+        // Sent under the lock, as `unblock` sends.
+        self.clients
             .write()
             .values_mut()
-            .filter_map(|info| info.unblock_tx.take())
-            .collect();
-        senders
-            .into_iter()
-            .filter_map(|tx| tx.send(crate::commands::blocking::Unblock::RoleChange).ok())
+            .filter_map(|info| {
+                info.unblock_tx
+                    .take()?
+                    .send(crate::commands::blocking::Unblock::RoleChange)
+                    .ok()
+            })
             .count()
     }
 
