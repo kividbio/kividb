@@ -260,6 +260,7 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
     ]
     .into_iter()
     .chain(crate::commands::bf::config_rows())
+    .chain(crate::commands::cf::config_rows())
     .collect()
 }
 
@@ -1340,6 +1341,11 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
             | "bf-initial-size"
             | "bf-expansion-factor"
             | "bloom-max-filter-bytes" => Some(crate::commands::bf::config_set(&param, value)),
+            "cf-bucket-size"
+            | "cf-initial-size"
+            | "cf-expansion-factor"
+            | "cf-max-iterations"
+            | "cf-max-expansions" => Some(crate::commands::cf::config_set(&param, value)),
             "stream-node-max-entries" => match value.parse::<i64>() {
                 Ok(v) if v >= 0 => {
                     crate::commands::stream_extra::NODE_MAX_ENTRIES
@@ -2741,6 +2747,20 @@ const ALL_COMMANDS: &[&str] = &[
     "BZMPOP",
     "BZPOPMAX",
     "BZPOPMIN",
+    "CF.ADD",
+    "CF.ADDNX",
+    "CF.COMPACT",
+    "CF.COUNT",
+    "CF.DEBUG",
+    "CF.DEL",
+    "CF.EXISTS",
+    "CF.INFO",
+    "CF.INSERT",
+    "CF.INSERTNX",
+    "CF.LOADCHUNK",
+    "CF.MEXISTS",
+    "CF.RESERVE",
+    "CF.SCANDUMP",
     "CLIENT",
     "CMS.INCRBY",
     "CMS.INFO",
@@ -3211,6 +3231,8 @@ const FAST_COMMANDS: &[&str] = &[
     "CMS.INFO",
     "CMS.INITBYDIM",
     "CMS.INITBYPROB",
+    "CF.INFO",
+    "CF.RESERVE",
     "DBSIZE",
     "DECR",
     "DECRBY",
@@ -3324,6 +3346,7 @@ pub(crate) const ACL_CATEGORIES: &[&str] = &[
     "cluster",
     "cms",
     "connection",
+    "cuckoo",
     "dangerous",
     "fast",
     "generic",
@@ -3405,6 +3428,7 @@ fn command_table() -> std::collections::BTreeMap<&'static str, Vec<u8>> {
                 .or_else(|| crate::commands::bf::arity(name))
                 .or_else(|| crate::commands::cms::arity(name))
                 .or_else(|| crate::commands::topk::arity(name))
+                .or_else(|| crate::commands::cf::arity(name))
                 .or_else(|| module_arity(name))
                 .map_or(arity, i64::from);
             // A command with subcommands has no keys of its own: they are
@@ -3820,6 +3844,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
         "bloom" => commands_with_prefix("BF."),
         "cms" => commands_with_prefix("CMS."),
         "topk" => commands_with_prefix("TOPK."),
+        "cuckoo" => commands_with_prefix("CF."),
         "search" => commands_with_prefix("FT."),
         "timeseries" => commands_with_prefix("TS."),
         "vector" => vec![
@@ -3918,6 +3943,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
                 "bloom",
                 "cms",
                 "topk",
+                "cuckoo",
                 "hyperloglog",
                 "geo",
                 "stream",

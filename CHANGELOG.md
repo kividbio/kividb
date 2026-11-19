@@ -306,6 +306,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per-command limit checked before they start, items are binary-safe, and
   `COPY` copies a sketch. Snapshots keep sketches under tag 40, kind 3.
 
+- **Cuckoo filters (`CF.*`), as Redis 8 has them built in (part of #453).**
+  `CF.RESERVE`, `CF.ADD`, `CF.ADDNX`, `CF.INSERT`, `CF.INSERTNX`,
+  `CF.EXISTS`, `CF.MEXISTS`, `CF.COUNT`, `CF.DEL`, `CF.COMPACT`,
+  `CF.SCANDUMP`, `CF.LOADCHUNK`, `CF.INFO` and `CF.DEBUG`, and the
+  `cf-bucket-size`, `cf-initial-size`, `cf-expansion-factor`,
+  `cf-max-iterations` and `cf-max-expansions` settings. Filters are laid out
+  byte for byte as Redis lays them out (placement, kicks, growth, the
+  compaction deletes trigger), so replies are Redis 8.10's in RESP2 and RESP3,
+  `CF.SCANDUMP` chunks included (24,000 replies of random sequences compared:
+  `scripts/checks/sketch/cf/compare.py`); RDB files, full syncs, `DUMP`
+  payloads and `CF.SCANDUMP` chunks from Redis load, and `DUMP` writes
+  Redis's format. A filter made from this node's settings goes to replicas
+  and the AOF as a `CF.RESERVE` naming them. `TYPE` is `MBbloomCF`, the ACL
+  category `@cuckoo`. Unlike Redis, a filter has size limits (1 GiB, 99
+  sub-filters), commands of many items a per-command limit checked before
+  they start, a compaction stops at a limit of its own (so a large filter
+  compacts in part), and `COPY` copies a filter. Snapshots keep filters under tag
+  40, kind 4.
+
 - **Vector sets store vectors quantized when `VADD` asks for it (#697).**
   `Q8` keeps each vector as int8 with its norm and range, and `BIN` as one
   bit per component, as Redis 8 does: about 3.6-3.8x and 15-22x less memory

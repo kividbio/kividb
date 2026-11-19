@@ -484,6 +484,14 @@ fn other_types(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     crate::commands::topk::handle(ctx, name)
 }
 
+/// The other probabilistic types' commands, which come to the dispatch
+/// where `BF.*` does: so that adding them added nothing to the dispatch of
+/// other commands.
+#[inline(never)]
+fn other_types(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
+    crate::commands::cf::handle(ctx, name)
+}
+
 /// The filter at `key` for reading: `Ok(None)` if there is no key,
 /// `Err(())` if it holds another type.
 fn with_filter<T>(

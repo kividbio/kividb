@@ -4451,44 +4451,46 @@ pub fn is_write_command(name: &str) -> bool {
                 | "XTRIM"
                 | "ZMPOP"
         ),
-        6 => matches!(
-            name,
-            "APPEND"
-                | "BF.ADD"
-                | "ARMSET"
-                | "ARRING"
-                | "ARSEEK"
-                | "BLMOVE"
-                | "BLMPOP"
-                | "BZMPOP"
-                | "DECRBY"
-                | "EXPIRE"
-                | "GEOADD"
-                | "GETDEL"
-                | "GETSET"
-                | "HGETEX"
-                | "HSETEX"
-                | "HSETNX"
-                | "INCRBY"
-                | "INCREX"
-                | "LMOVEM"
-                | "LPUSHX"
-                | "MSETEX"
-                | "MSETNX"
-                | "PSETEX"
-                | "RENAME"
-                | "RPUSHX"
-                | "SELECT"
-                | "SETBIT"
-                | "SWAPDB"
-                | "TS.ADD"
-                | "TS.DEL"
-                | "UNLINK"
-                | "XCLAIM"
-                | "XDELEX"
-                | "XGROUP"
-                | "XSETID"
-        ),
+        6 => {
+            matches!(
+                name,
+                "APPEND"
+                    | "ARMSET"
+                    | "ARRING"
+                    | "ARSEEK"
+                    | "BF.ADD"
+                    | "BLMOVE"
+                    | "BLMPOP"
+                    | "BZMPOP"
+                    | "DECRBY"
+                    | "EXPIRE"
+                    | "GEOADD"
+                    | "GETDEL"
+                    | "GETSET"
+                    | "HGETEX"
+                    | "HSETEX"
+                    | "HSETNX"
+                    | "INCRBY"
+                    | "INCREX"
+                    | "LMOVEM"
+                    | "LPUSHX"
+                    | "MSETEX"
+                    | "MSETNX"
+                    | "PSETEX"
+                    | "RENAME"
+                    | "RPUSHX"
+                    | "SELECT"
+                    | "SETBIT"
+                    | "SWAPDB"
+                    | "TS.ADD"
+                    | "TS.DEL"
+                    | "UNLINK"
+                    | "XCLAIM"
+                    | "XDELEX"
+                    | "XGROUP"
+                    | "XSETID"
+            ) || (matches!(name.as_bytes()[0], b'C') && matches!(name, "CF.ADD" | "CF.DEL"))
+        }
         7 => matches!(
             name,
             "BF.MADD"
@@ -4636,6 +4638,14 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "CMS.INITBYDIM",
     "CMS.INITBYPROB",
     "CMS.MERGE",
+    "CF.ADD",
+    "CF.ADDNX",
+    "CF.COMPACT",
+    "CF.DEL",
+    "CF.INSERT",
+    "CF.INSERTNX",
+    "CF.LOADCHUNK",
+    "CF.RESERVE",
     "COPY",
     "DECR",
     "DECRBY",
@@ -4789,6 +4799,7 @@ fn is_write_command_reference(name: &str) -> bool {
         "BF.RESERVE" | "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.LOADCHUNK" |
         "CMS.INCRBY" | "CMS.INITBYDIM" | "CMS.INITBYPROB" | "CMS.MERGE" |
         "TOPK.ADD" | "TOPK.INCRBY" | "TOPK.RESERVE" |
+        "CF.ADD" | "CF.ADDNX" | "CF.COMPACT" | "CF.DEL" | "CF.INSERT" | "CF.INSERTNX" | "CF.LOADCHUNK" | "CF.RESERVE" |
         // Strings
         "SET" | "SETNX" | "SETEX" | "PSETEX" | "MSET" | "MSETNX" | "GETSET" |
         "GETDEL" | "GETEX" | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" |

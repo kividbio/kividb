@@ -112,6 +112,9 @@ What the RDB reader takes from Redis:
 - **Top-K sketches** load, and answer as they did on Redis (an RDB file, a
   full sync, `RESTORE` and `MIGRATE`). One with k over 65,536, more than
   67,108,864 buckets or 65,536 rows is refused.
+- **Cuckoo filters** load, and answer as they did on Redis (an RDB file, a
+  full sync, `RESTORE`, `MIGRATE` and `CF.SCANDUMP` chunks); the `cf-*`
+  settings carry over in the config file. One over 1 GiB is refused.
 - **Search index definitions and dictionaries are not loaded.** KiviDB keeps
   its own indexes. Run `FT.CREATE` (and `FT.DICTADD`) again after the move;
   `FT.CREATE` indexes the keys that are already there.

@@ -39,6 +39,12 @@ pub const ALLOCATES: &[&str] = &[
     "TOPK.ADD",
     "TOPK.INCRBY",
     "TOPK.RESERVE",
+    "CF.ADD",
+    "CF.ADDNX",
+    "CF.INSERT",
+    "CF.INSERTNX",
+    "CF.LOADCHUNK",
+    "CF.RESERVE",
 ];
 
 /// The bytes the command in `ctx`, named `name` (one of [`ALLOCATES`]),

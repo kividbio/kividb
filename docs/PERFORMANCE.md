@@ -434,6 +434,11 @@ depend on their order). The writes behind Redis's here are not chased yet.
 | `TOPK.ADD` of one item | 0.55M | 0.87M | -37% |
 | `TOPK.QUERY` of one item | 1.03M | 1.11M | -7% |
 
+
+
+| `CF.ADD` of one item | 0.50M | 0.96M | -48% |
+| `CF.EXISTS` of one item | 1.07M | 0.97M | +10% |
+
 ## Earlier runs
 
 KiviDB 1.1 was also measured on AWS Graviton3 bare metal in October 2026, against

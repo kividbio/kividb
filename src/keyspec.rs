@@ -703,6 +703,20 @@ const SKETCHES: &[&str] = &[
     "TOPK.LIST",
     "TOPK.QUERY",
     "TOPK.RESERVE",
+    "CF.ADD",
+    "CF.ADDNX",
+    "CF.COMPACT",
+    "CF.COUNT",
+    "CF.DEBUG",
+    "CF.DEL",
+    "CF.EXISTS",
+    "CF.INFO",
+    "CF.INSERT",
+    "CF.INSERTNX",
+    "CF.LOADCHUNK",
+    "CF.MEXISTS",
+    "CF.RESERVE",
+    "CF.SCANDUMP",
 ];
 
 /// The probabilistic types' merges: `destination numkeys source ...`,
@@ -1140,6 +1154,20 @@ mod tests {
             | "TOPK.LIST"
             | "TOPK.QUERY"
             | "TOPK.RESERVE"
+            | "CF.ADD"
+            | "CF.ADDNX"
+            | "CF.COMPACT"
+            | "CF.COUNT"
+            | "CF.DEBUG"
+            | "CF.DEL"
+            | "CF.EXISTS"
+            | "CF.INFO"
+            | "CF.INSERT"
+            | "CF.INSERTNX"
+            | "CF.LOADCHUNK"
+            | "CF.MEXISTS"
+            | "CF.RESERVE"
+            | "CF.SCANDUMP"
             // Sharded pub/sub: the channel is hashed to a slot exactly like a key.
             | "SPUBLISH" => One(1),
 

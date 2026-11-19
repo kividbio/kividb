@@ -18,6 +18,7 @@ use super::bloom::{
 };
 use super::cms::CountMin;
 use super::topk::{Slot, TopK};
+use super::cuckoo::{Cuckoo, Shape, SubFilter};
 
 /// The module type of Bloom filters, and the encoding version written.
 pub const BLOOM_TYPE: &str = "MBbloom--";
@@ -34,6 +35,10 @@ const TOPK_ENCVER: u64 = 0;
 /// length, a pointer (meaningless once saved), the count and four bytes of
 /// padding.
 const TOPK_SLOT: usize = 24;
+/// The module type of Cuckoo filters, and the encoding version written:
+/// what Redis 8.10 writes.
+pub const CUCKOO_TYPE: &str = "MBbloomCF";
+const CUCKOO_ENCVER: u64 = 4;
 
 /// The RDB version `DUMP` payloads of these types carry: 9 (Redis 6.0),
 /// the oldest that has these encodings, so that every Redis since takes
@@ -179,6 +184,29 @@ pub fn dumps_as_redis(sketch: &Sketch) -> bool {
     matches!(sketch, Sketch::Bloom(_) | Sketch::TopK(_))
 }
 
+/// A Cuckoo filter as Redis saves it (encoding version 4): sub-filters,
+/// the first one's buckets, items, deletes, bucket size, kick limit and
+/// expansion; then each sub-filter's buckets and bytes.
+fn write_cuckoo(w: &mut Writer, cf: &Cuckoo) {
+    w.uint(cf.filters.len() as u64);
+    w.uint(cf.filters[0].buckets);
+    w.uint(cf.items);
+    w.uint(cf.deletes);
+    w.uint(u64::from(cf.bucket_size));
+    w.uint(u64::from(cf.max_iterations));
+    w.uint(u64::from(cf.expansion));
+    for f in &cf.filters {
+        w.uint(f.buckets);
+        w.string(&f.data);
+    }
+}
+
+/// Whether `DUMP` writes `sketch` in Redis's format, which Redis can
+/// `RESTORE`; the other types are dumped in KiviDB's own.
+pub fn dumps_as_redis(sketch: &Sketch) -> bool {
+    matches!(sketch, Sketch::Bloom(_) | Sketch::Cuckoo(_))
+}
+
 /// The most bytes [`dump_payload`] writes for `sketch`: each field at its
 /// longest, and the layers' bytes.
 fn dump_len(sketch: &Sketch) -> u64 {
@@ -202,6 +230,9 @@ fn dump_len(sketch: &Sketch) -> u64 {
                     .map(|s| TOPK_SLOT as u64 + 11 + s.item.as_ref().map_or(0, |i| i.len() as u64))
                     .sum::<u64>()
         }
+        // Type, module ID, seven fields, the end, version and CRC: under
+        // 128. Each sub-filter: two fields and a string head, its bytes.
+        Sketch::Cuckoo(cf) => 128 + cf.filters.len() as u64 * 32 + cf.data_bytes(),
     }
 }
 
@@ -226,6 +257,10 @@ pub fn dump_payload(sketch: &Sketch) -> io::Result<Vec<u8>> {
         Sketch::TopK(t) => {
             w.len(module_id(TOPK_TYPE, TOPK_ENCVER));
             write_topk(&mut w, t);
+        }
+        Sketch::Cuckoo(cf) => {
+            w.len(module_id(CUCKOO_TYPE, CUCKOO_ENCVER));
+            write_cuckoo(&mut w, cf);
         }
     }
     w.len(OPCODE_EOF);
@@ -531,6 +566,59 @@ fn read_topk(r: &mut Reader<'_, impl Read>) -> io::Result<TopK> {
     ))
 }
 
+/// A Cuckoo filter [`write_cuckoo`] (or Redis) wrote: its shape is checked
+/// against the size limits before any sub-filter's bytes are read, and
+/// each sub-filter must have the buckets its place in the chain gives and
+/// exactly their bytes.
+fn read_cuckoo(r: &mut Reader<'_, impl Read>) -> io::Result<Cuckoo> {
+    let filters = r.uint()?;
+    let buckets = r.uint()?;
+    let items = r.uint()?;
+    let deletes = r.uint()?;
+    let to16 = |v: u64| u16::try_from(v).ok();
+    let bucket_size = to16(r.uint()?).ok_or_else(|| r.bad("a field is out of range"))?;
+    let max_iterations = to16(r.uint()?).ok_or_else(|| r.bad("a field is out of range"))?;
+    let expansion = to16(r.uint()?).ok_or_else(|| r.bad("a field is out of range"))?;
+    let shape = Shape {
+        items,
+        buckets,
+        deletes,
+        filters,
+        bucket_size,
+        max_iterations,
+        expansion,
+    };
+    shape
+        .check()
+        .map_err(|_| r.bad("a filter of this shape is not supported"))?;
+    let mut subs = Vec::with_capacity(filters as usize);
+    let mut want = buckets;
+    for _ in 0..filters {
+        let n = r.uint()?;
+        if n != want {
+            return Err(r.bad("a sub-filter's buckets do not follow from the first's"));
+        }
+        let data = r.string_of(
+            n * u64::from(bucket_size),
+            "a sub-filter's bytes do not match its buckets",
+        )?;
+        subs.push(SubFilter {
+            buckets: n,
+            data: std::sync::Arc::new(data.into_boxed_slice()),
+        });
+        want = want.saturating_mul(u64::from(expansion.max(1)));
+    }
+    r.end()?;
+    Ok(Cuckoo {
+        items,
+        deletes,
+        bucket_size,
+        max_iterations,
+        expansion,
+        filters: subs,
+    })
+}
+
 /// The value of module type `name` (encoding version `encver`) from an
 /// RDB stream, if it is one of these types; `Ok(None)` for another type.
 pub fn read(name: &str, encver: u64, r: &mut impl Read) -> io::Result<Option<Sketch>> {
@@ -571,6 +659,18 @@ pub fn read(name: &str, encver: u64, r: &mut impl Read) -> io::Result<Option<Ske
                 what: "Top-K sketch",
             };
             Ok(Some(Sketch::TopK(read_topk(&mut reader)?)))
+        }
+        CUCKOO_TYPE => {
+            if encver != CUCKOO_ENCVER {
+                return Err(super::invalid(&format!(
+                    "Cuckoo filter encoding version {encver} is not supported"
+                )));
+            }
+            let mut reader = Reader {
+                r,
+                what: "Cuckoo filter",
+            };
+            Ok(Some(Sketch::Cuckoo(read_cuckoo(&mut reader)?)))
         }
         _ => Ok(None),
     }
@@ -954,6 +1054,127 @@ mod tests {
     }
 
     const TOPK_DUMP: &str = "07814e8a4af9360f100002020203020104000000000000f03f05c30d180503ad4d230100e0070001000005c31e30010000e00d000403ad4d2305201a0898d02582407e000001200b20000000050100050668656c6c6f00000f005531a20539918c1c";
+
+    /// `DUMP d` on Redis 8.10.2 after `CF.RESERVE d 24 BUCKETSIZE 3
+    /// EXPANSION 4 MAXITERATIONS 7`, 40 `CF.ADD`s of `x0` to `x39` and `CF.DEL
+    /// d x1`: read, it is the filter KiviDB builds from the same commands;
+    /// written, the same bytes but the trailer.
+    #[test]
+    fn cuckoo_dump_from_redis() {
+        let payload = hex(CUCKOO_DUMP);
+        let body = &payload[1..payload.len() - 10];
+        let mut r = body;
+        let id = crate::snapshot::rdb_read_plain_length(&mut r).unwrap();
+        assert_eq!(id, module_id(CUCKOO_TYPE, 4));
+        let Some(Sketch::Cuckoo(read)) = super::read(CUCKOO_TYPE, 4, &mut r).unwrap() else {
+            panic!("not a filter");
+        };
+        assert!(r.is_empty());
+        let mut ours = Cuckoo::new(super::super::cuckoo::Params {
+            capacity: 24,
+            bucket_size: 3,
+            max_iterations: 7,
+            expansion: 4,
+        })
+        .unwrap();
+        for i in 0..40 {
+            ours.insert(super::super::cuckoo::lookup(format!("x{i}").as_bytes()), 32)
+                .unwrap();
+        }
+        ours.delete(super::super::cuckoo::lookup(b"x1")).unwrap();
+        assert_eq!(read, ours);
+        let written = dump_payload(&Sketch::Cuckoo(ours)).unwrap();
+        let mut back = &written[1..written.len() - 10];
+        crate::snapshot::rdb_read_plain_length(&mut back).unwrap();
+        let Some(Sketch::Cuckoo(again)) = super::read(CUCKOO_TYPE, 4, &mut back).unwrap() else {
+            panic!("not a filter");
+        };
+        assert_eq!(again, read);
+    }
+
+    /// Corrupted Cuckoo values are refused, or read as a filter within the
+    /// limits; never a panic.
+    #[test]
+    fn corrupt_cuckoo_values_are_refused_cleanly() {
+        let good = hex(CUCKOO_DUMP);
+        let good = &good[10..good.len() - 10];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..4000 {
+            let mut bad = good.to_vec();
+            match next() % 3 {
+                0 => {
+                    let at = next() as usize % bad.len();
+                    bad[at] = next() as u8;
+                }
+                1 => bad.truncate(next() as usize % bad.len()),
+                _ => {
+                    let mut w = Writer { out: Vec::new() };
+                    for _ in 0..7 {
+                        w.uint(next() >> (next() % 64));
+                    }
+                    w.uint(next() >> (next() % 64));
+                    w.string(&[0u8; 16]);
+                    w.len(OPCODE_EOF);
+                    bad = w.out;
+                }
+            }
+            if let Ok(Some(Sketch::Cuckoo(read))) = super::read(CUCKOO_TYPE, 4, &mut &bad[..]) {
+                assert!(read.data_bytes() <= super::super::cuckoo::MAX_BYTES);
+                assert!(!read.filters.is_empty());
+            }
+        }
+        // A sub-filter's bytes LZF-compressed, as Redis writes them.
+        let mut cf = Cuckoo::new(super::super::cuckoo::Params {
+            capacity: 1024,
+            bucket_size: 2,
+            max_iterations: 20,
+            expansion: 1,
+        })
+        .unwrap();
+        for i in 0..20 {
+            let l = super::super::cuckoo::lookup(format!("{i}").as_bytes());
+            cf.insert(l, 8).unwrap();
+        }
+        let mut w = Writer { out: Vec::new() };
+        write_cuckoo(&mut w, &cf);
+        w.len(OPCODE_EOF);
+        let plain = w.out;
+        let mut w = Writer { out: Vec::new() };
+        for v in [
+            cf.filters.len() as u64,
+            cf.filters[0].buckets,
+            cf.items,
+            cf.deletes,
+            u64::from(cf.bucket_size),
+            u64::from(cf.max_iterations),
+            u64::from(cf.expansion),
+            cf.filters[0].buckets,
+        ] {
+            w.uint(v);
+        }
+        let (compressed, wrong, damaged) = lzf_variants(&plain, w.out.len(), &mut next);
+        let Ok(Some(Sketch::Cuckoo(read))) = super::read(CUCKOO_TYPE, 4, &mut &compressed[..])
+        else {
+            panic!("compressed filter not read");
+        };
+        assert_eq!(read, cf);
+        for bad in wrong {
+            assert!(super::read(CUCKOO_TYPE, 4, &mut &bad[..]).is_err());
+        }
+        for bad in damaged {
+            if let Ok(Some(Sketch::Cuckoo(read))) = super::read(CUCKOO_TYPE, 4, &mut &bad[..]) {
+                assert_eq!(read.data_bytes(), cf.data_bytes());
+            }
+        }
+    }
+
+    const CUCKOO_DUMP: &str = "07813016e5a289821404020202080227020102030207020402080518ce62a000e214c07bc5b2287cfc65b328da864700003f12ac022005c33c4060010000e00400005c600d004d6005e006000036e0050f0ac200001d0000b5fbdef830401803a10000cf40070b00ea14007200005d00001cb1200d0000000f0038111f3ba6bb5b4f";
 
     #[test]
     fn bloom_module_id() {
