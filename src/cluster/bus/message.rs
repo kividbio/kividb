@@ -9,8 +9,13 @@
 //   PING <sender_id> <sender_endpoint> <gossip_array>
 //     "I'm alive. Here are some peers I know about, in case you don't."
 //
-//   PONG <sender_id> <sender_endpoint> <gossip_array>
+//   PONG <sender_id> <sender_endpoint> <gossip_array> [... <held_as_owner>]
 //     "Reply to your PING/MEET. Same gossip payload as PING."
+//     A PONG to a node that the sender holds as the owner of slots, while
+//     that node's own heartbeats say it is a replica, has an eighth field:
+//     those slots, at that node's config epoch in the sender's view, in the
+//     form of the slot claims. A node of an earlier version reads no further
+//     than the seventh field. See `ClusterState::promotion_to_complete`.
 //
 //   FAILOVER_AUTH_REQUEST <sender_id> <endpoint> <master_id> [force | <slot_claims>]
 //   FAILOVER_AUTH_ACK <sender_id> <epoch>
@@ -135,6 +140,11 @@ pub enum BusMessage {
         sender_shard_id: Option<NodeId>,
         gossip: Vec<GossipEntry>,
         slot_claims: Vec<SlotClaim>,
+        /// The slots the sender holds the node it answers as the owner of,
+        /// at that node's config epoch in the sender's view, when that node
+        /// says it is a replica; empty otherwise, and from a node of an
+        /// earlier version. See `ClusterState::promotion_to_complete`.
+        held_as_owner: Vec<SlotClaim>,
     },
     /// "I'm a replica of a FAIL'd master, and I want your vote to take over."
     /// Sent by a replica during election. The receiver (a master) replies
@@ -292,31 +302,40 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             sender_shard_id,
             gossip,
             slot_claims,
-        } => resp_array(vec![
-            resp_bulk_str("PONG"),
-            resp_bulk(sender_id),
-            resp_bulk_str(&format_endpoint(
-                sender_ip,
-                *sender_client_port,
-                *sender_cluster_port,
-                *sender_config_epoch,
-            )),
-            resp_bulk_str(&with_shard(
-                flags_with_host(
-                    *sender_flags,
-                    sender_hostname,
-                    *sender_announced_client_port,
-                    sender_client_ips,
-                ),
-                sender_shard_id.as_ref(),
-            )),
-            match sender_master_id {
-                Some(m) => resp_bulk(m),
-                None => resp_bulk(b""),
-            },
-            encode_gossip(gossip),
-            encode_slot_claims(slot_claims),
-        ]),
+            held_as_owner,
+        } => {
+            let mut fields = vec![
+                resp_bulk_str("PONG"),
+                resp_bulk(sender_id),
+                resp_bulk_str(&format_endpoint(
+                    sender_ip,
+                    *sender_client_port,
+                    *sender_cluster_port,
+                    *sender_config_epoch,
+                )),
+                resp_bulk_str(&with_shard(
+                    flags_with_host(
+                        *sender_flags,
+                        sender_hostname,
+                        *sender_announced_client_port,
+                        sender_client_ips,
+                    ),
+                    sender_shard_id.as_ref(),
+                )),
+                match sender_master_id {
+                    Some(m) => resp_bulk(m),
+                    None => resp_bulk(b""),
+                },
+                encode_gossip(gossip),
+                encode_slot_claims(slot_claims),
+            ];
+            // Only when there is something in it: every other PONG keeps
+            // the seven fields it had.
+            if !held_as_owner.is_empty() {
+                fields.push(encode_slot_claims(held_as_owner));
+            }
+            resp_array(fields)
+        }
         BusMessage::FailoverAuthRequest {
             sender_id,
             sender_ip,
@@ -643,6 +662,13 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     slot_claims,
                 }
             } else {
+                // The eighth field, if there is one that reads as claims;
+                // one that does not is left out, as an earlier version
+                // leaves it.
+                let held_as_owner = match parts.get(7) {
+                    Some(f) if f.first() == Some(&b'*') => parse_slot_claims(f).unwrap_or_default(),
+                    _ => Vec::new(),
+                };
                 BusMessage::Pong {
                     sender_id,
                     sender_ip,
@@ -657,6 +683,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     sender_shard_id,
                     gossip,
                     slot_claims,
+                    held_as_owner,
                 }
             };
             Ok(Some((msg, consumed)))
@@ -1223,6 +1250,7 @@ mod tests {
                 announced_client_port: 0,
             }],
             slot_claims: vec![],
+            held_as_owner: vec![],
         };
         let (decoded, _) = decode(&encode(&msg)).unwrap().unwrap();
         match decoded {
@@ -1281,6 +1309,7 @@ mod tests {
             sender_shard_id,
             gossip: vec![],
             slot_claims: vec![],
+            held_as_owner: vec![],
         };
         for said in [Some(shard), None] {
             let (decoded, _) = decode(&encode(&pong(said))).unwrap().unwrap();
@@ -1333,6 +1362,7 @@ mod tests {
                 announced_client_port: 0,
             }],
             slot_claims: vec![],
+            held_as_owner: vec![],
             sender_flags: NodeFlags::MASTER,
             sender_master_id: None,
             sender_hostname: "shard-1a.db.example".into(),
@@ -1377,6 +1407,89 @@ mod tests {
             decode(&longer),
             Ok(Some((BusMessage::Pong { .. }, _)))
         ));
+    }
+
+    /// The slots a PONG's sender holds its addressee as the owner of travel
+    /// as an eighth field, only when there are some: a PONG without them is
+    /// the seven fields it was, and a node that reads seven (an earlier
+    /// version) reads the rest of the PONG as before. A field that does not
+    /// read as claims is taken for none.
+    #[test]
+    fn slots_held_as_owner_travel_as_an_eighth_field() {
+        let me = generate_node_id();
+        let pong = |held_as_owner: Vec<SlotClaim>| BusMessage::Pong {
+            sender_id: me,
+            sender_ip: "10.0.0.1".into(),
+            sender_client_port: 6380,
+            sender_cluster_port: 16380,
+            sender_config_epoch: 3,
+            sender_flags: NodeFlags::MASTER,
+            sender_master_id: None,
+            sender_hostname: String::new(),
+            sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
+            sender_shard_id: Some(me),
+            gossip: vec![],
+            slot_claims: vec![SlotClaim {
+                start: 0,
+                end: 99,
+                epoch: 3,
+            }],
+            held_as_owner,
+        };
+        let held = vec![
+            SlotClaim {
+                start: 100,
+                end: 199,
+                epoch: 7,
+            },
+            SlotClaim {
+                start: 300,
+                end: 300,
+                epoch: 7,
+            },
+        ];
+        let bytes = encode(&pong(held));
+        let (parts, _) = parse_resp_array(&bytes).unwrap().unwrap();
+        assert_eq!(parts.len(), 8);
+        let (decoded, _) = decode(&bytes).unwrap().unwrap();
+        let BusMessage::Pong {
+            held_as_owner,
+            slot_claims,
+            ..
+        } = decoded
+        else {
+            panic!("expected Pong");
+        };
+        let ranges: Vec<(u16, u16, u64)> = held_as_owner
+            .iter()
+            .map(|c| (c.start, c.end, c.epoch))
+            .collect();
+        assert_eq!(ranges, [(100, 199, 7), (300, 300, 7)]);
+        assert_eq!(slot_claims.len(), 1);
+
+        let bytes = encode(&pong(vec![]));
+        let (parts, _) = parse_resp_array(&bytes).unwrap().unwrap();
+        assert_eq!(parts.len(), 7);
+        let (decoded, _) = decode(&bytes).unwrap().unwrap();
+        assert!(
+            matches!(decoded, BusMessage::Pong { held_as_owner, .. } if held_as_owner.is_empty())
+        );
+
+        // An eighth field that is not claims: none.
+        let mut other = format!("*{}\r\n", parts.len() + 1).into_bytes();
+        for (i, part) in parts.iter().enumerate() {
+            if i == 5 || i == 6 {
+                other.extend_from_slice(part);
+            } else {
+                other.extend_from_slice(&resp_bulk(part));
+            }
+        }
+        other.extend_from_slice(&resp_bulk(b"later"));
+        let (decoded, _) = decode(&other).unwrap().unwrap();
+        assert!(
+            matches!(decoded, BusMessage::Pong { held_as_owner, .. } if held_as_owner.is_empty())
+        );
     }
 
     #[test]

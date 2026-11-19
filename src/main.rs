@@ -702,32 +702,20 @@ fn start_configured_replication(
     let Some(master_id) = cluster_state.my_master_id() else {
         return;
     };
-    let master_addr = cluster_state
-        .nodes
-        .read()
-        .get(&master_id)
-        .map(|m| (m.ip.clone(), m.client_port));
-    match master_addr {
-        Some((ip, port)) if !ip.is_empty() && port != 0 => {
-            log_info!(
-                "Cluster: Restored replica role of master {} → restarting replication client",
-                cluster::node::node_id_str(&master_id)
-            );
-            starter.start(ip, port);
-        }
-        _ => {
-            // Still a replica as far as the cluster is concerned: mark the
-            // role so this node stays read-only, and let gossip supply the
-            // master's address (see `cluster::bus` — it re-points us once the
-            // master is known).
-            log_info!(
-                "Cluster: Recorded master {} has no known address yet — waiting for gossip \
-                 before replicating",
-                cluster::node::node_id_str(&master_id)
-            );
-            starter.repl_state.become_slave();
-        }
-    }
+    // Still a replica as far as the cluster is concerned: mark the role so
+    // this node stays read-only. The bus starts the replication client
+    // (`ClusterState::reconcile_replication`) once it knows the master's
+    // address, and, for this first sync after a start, once a quorum of the
+    // masters has answered or a node timeout has passed: a node restarted
+    // before its promotion was saved learns from them that it is the owner,
+    // and is promoted instead of syncing over the writes it took as master
+    // (`ClusterState::first_sync_may_begin`).
+    log_info!(
+        "Cluster: Restored replica role of master {}: replicating once the masters have \
+         answered (at most one node timeout)",
+        cluster::node::node_id_str(&master_id)
+    );
+    starter.repl_state.become_slave();
 }
 
 fn run_tokio(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std::error::Error>> {

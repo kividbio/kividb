@@ -280,7 +280,7 @@ pub fn process_message(
             state.save_soon();
 
             // Reply with our own PONG so the peer learns OUR id.
-            Some(encode(&our_pong(state)))
+            Some(encode(&our_pong(state, None)))
         }
         BusMessage::Ping {
             sender_id,
@@ -301,7 +301,8 @@ pub fn process_message(
             // we are alive — but it does not get itself added by pinging.
             // Otherwise a node removed with CLUSTER FORGET, which still has
             // us in *its* table, would re-add itself on its next heartbeat.
-            if sender_is_member(state, &sender_id) {
+            let member = sender_is_member(state, &sender_id);
+            if member {
                 apply_heartbeat(
                     state,
                     sender_id,
@@ -319,7 +320,9 @@ pub fn process_message(
                     &slot_claims,
                 );
             }
-            Some(encode(&our_pong(state)))
+            // Made after the PING is taken in: if the sender says it is a
+            // replica and still owns slots here, the PONG says which.
+            Some(encode(&our_pong(state, member.then_some(sender_id))))
         }
         BusMessage::Pong {
             sender_id,
@@ -335,6 +338,7 @@ pub fn process_message(
             sender_announced_client_port,
             sender_client_ips,
             sender_shard_id,
+            held_as_owner,
         } => {
             // A PONG is a reply to something we sent. From a stranger it is
             // only acceptable as the answer to our own MEET — which the
@@ -356,6 +360,10 @@ pub fn process_message(
                     gossip,
                     &slot_claims,
                 );
+                // What the sender holds of this node, in its own words:
+                // never relayed, so never another node's stale view.
+                state.note_held_as_owner(sender_id, held_as_owner);
+                state.note_pong_heard(sender_id);
             }
             None
         }
@@ -504,6 +512,9 @@ pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: Socke
         sender_announced_client_port,
         sender_client_ips,
         sender_shard_id,
+        // A node met has not been this node's peer: it holds it as the
+        // owner of nothing.
+        held_as_owner: _,
     } = msg
     {
         state.forgotten.write().remove(&sender_id);
@@ -778,7 +789,12 @@ fn merge_gossip_entry(
 /// Build a PONG describing ourselves. Includes our slot claims and a gossip
 /// section — this is the gossip propagation mechanism, piggybacking on every
 /// reply.
-fn our_pong(state: &ClusterState) -> BusMessage {
+///
+/// `to`, the member it answers: if this node holds it as the owner of slots
+/// while it says it is a replica, the PONG says which slots, at its config
+/// epoch here (`held_as_owner`). That is a node restarted before the save of
+/// its promotion was done: see `ClusterState::promotion_to_complete`.
+fn our_pong(state: &ClusterState, to: Option<NodeId>) -> BusMessage {
     let nodes = state.nodes.read();
     let me = nodes
         .get(&state.myself())
@@ -786,7 +802,16 @@ fn our_pong(state: &ClusterState) -> BusMessage {
         .unwrap_or_else(|| ClusterNode::new(state.myself(), String::new(), 0, 0));
 
     let gossip = sample_gossip(&nodes, state.myself(), GOSSIP_SAMPLE);
+    let to_is_replica = to.is_some_and(|id| {
+        nodes
+            .get(&id)
+            .is_some_and(|n| n.flags.contains(NodeFlags::REPLICA))
+    });
     drop(nodes);
+    let held_as_owner = match to {
+        Some(id) if to_is_replica => state.slot_claims_of(id),
+        _ => Vec::new(),
+    };
 
     BusMessage::Pong {
         sender_id: state.myself(),
@@ -802,6 +827,7 @@ fn our_pong(state: &ClusterState) -> BusMessage {
         sender_shard_id: Some(me.shard_id),
         gossip,
         slot_claims: state.my_slot_claims(),
+        held_as_owner,
     }
 }
 
@@ -1205,6 +1231,101 @@ mod tests {
         assert!(my_node.flags.contains(NodeFlags::REPLICA));
         assert!(!my_node.flags.contains(NodeFlags::MASTER));
         assert_eq!(my_node.master_id, Some(winner));
+    }
+
+    /// A PONG to a node held here as the owner of slots that says it is a
+    /// replica says which slots, at its config epoch here; to a master that
+    /// owns them, or a replica that owns none, it says nothing. What a
+    /// master's PONG says of this node is noted, and withdrawn by one that
+    /// says nothing.
+    #[test]
+    fn a_pong_tells_a_replica_the_slots_it_is_held_as_the_owner_of() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let restarted = generate_node_id();
+        process_message(&cs, meet(restarted), peer());
+        let mut announced = ping(restarted, NodeFlags::MASTER, vec![]);
+        if let BusMessage::Ping {
+            slot_claims,
+            sender_config_epoch,
+            ..
+        } = &mut announced
+        {
+            *sender_config_epoch = 7;
+            *slot_claims = vec![SlotClaim {
+                start: 0,
+                end: 99,
+                epoch: 7,
+            }];
+        }
+        let held = |reply: Option<Vec<u8>>| {
+            let (msg, _) = crate::cluster::bus::message::decode(&reply.unwrap())
+                .unwrap()
+                .unwrap();
+            let BusMessage::Pong { held_as_owner, .. } = msg else {
+                panic!("expected a PONG");
+            };
+            held_as_owner
+                .iter()
+                .map(|c| (c.start, c.end, c.epoch))
+                .collect::<Vec<_>>()
+        };
+        // A master owning the slots: nothing.
+        assert!(held(process_message(&cs, announced, peer())).is_empty());
+        // The same node, restarted as a replica: the slots, at epoch 7.
+        let mut as_replica = ping(restarted, NodeFlags::REPLICA, vec![]);
+        if let BusMessage::Ping {
+            sender_master_id, ..
+        } = &mut as_replica
+        {
+            *sender_master_id = Some(generate_node_id());
+        }
+        assert_eq!(
+            held(process_message(&cs, as_replica.clone(), peer())),
+            [(0, 99, 7)]
+        );
+        // A replica that owns nothing: nothing.
+        let other = generate_node_id();
+        process_message(&cs, meet(other), peer());
+        assert!(
+            held(process_message(
+                &cs,
+                ping(other, NodeFlags::REPLICA, vec![]),
+                peer()
+            ))
+            .is_empty()
+        );
+
+        // On the other side: noted from a PONG, and withdrawn.
+        let master = generate_node_id();
+        process_message(&cs, meet(master), peer());
+        let pong = |held_as_owner: Vec<SlotClaim>| BusMessage::Pong {
+            sender_id: master,
+            sender_ip: String::new(),
+            sender_client_port: 7000,
+            sender_cluster_port: 17000,
+            sender_config_epoch: 1,
+            sender_flags: NodeFlags::MASTER,
+            sender_master_id: None,
+            sender_hostname: String::new(),
+            sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
+            sender_shard_id: None,
+            gossip: vec![],
+            slot_claims: vec![],
+            held_as_owner,
+        };
+        process_message(
+            &cs,
+            pong(vec![SlotClaim {
+                start: 0,
+                end: 9,
+                epoch: 3,
+            }]),
+            peer(),
+        );
+        assert_eq!(cs.held_as_owner_by(master), Some(vec![(0, 9, 3)]));
+        process_message(&cs, pong(vec![]), peer());
+        assert_eq!(cs.held_as_owner_by(master), None);
     }
 
     /// Losing *some* slots is a resharding, not a failover.

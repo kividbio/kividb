@@ -72,6 +72,41 @@ pub struct ElectionState {
     pub deadline_ms: Option<u64>,
 }
 
+/// What one master last said, in a PONG, of the slots it holds this node
+/// as the owner of. See [`ClusterState::promotion_to_complete`].
+#[derive(Debug, Clone)]
+struct HeldAsOwner {
+    /// The slots, each range at this node's config epoch in that master's
+    /// view.
+    claims: Vec<crate::cluster::bus::SlotClaim>,
+    /// When it said so.
+    at: std::time::Instant,
+}
+
+/// The wait before a replica's first sync after it starts: see
+/// [`ClusterState::first_sync_may_begin`].
+struct FirstSync {
+    /// When the cluster state was made (at startup).
+    started: std::time::Instant,
+    /// The wait is over, for good.
+    open: AtomicBool,
+    /// The nodes this one has had a PONG from since it started.
+    heard: parking_lot::Mutex<ahash::AHashSet<NodeId>>,
+}
+
+/// Whether this node, a replica, is to complete a promotion it does not
+/// remember: see [`ClusterState::promotion_to_complete`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsavedPromotion {
+    /// No quorum of masters holds this node as the owner of its master's
+    /// slots.
+    None,
+    /// A quorum does, but the promotion is not completed, for this reason.
+    NotCompleted(String),
+    /// Take the slots of `master` over at config epoch `epoch`.
+    Complete { master: NodeId, epoch: u64 },
+}
+
 /// Why a master holds writes until it has made sure it still owns its
 /// slots. See [`ClusterState::hold_writes_until_confirmed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +313,12 @@ pub struct ClusterState {
     /// None when not actively running an election.
     pub election: parking_lot::Mutex<Option<ElectionState>>,
     pub election_pending: std::sync::atomic::AtomicBool,
+    /// What each master last told this node, in a PONG, of the slots it
+    /// holds this node as the owner of while this node says it is a
+    /// replica. See [`Self::promotion_to_complete`]. Taken alone.
+    held_as_owner: parking_lot::Mutex<AHashMap<NodeId, HeldAsOwner>>,
+    /// See [`Self::first_sync_may_begin`]. `heard` is taken alone.
+    first_sync: FirstSync,
     /// Per-slot migration state. Empty entries mean "not migrating".
     /// Mutating via CLUSTER SETSLOT MIGRATING/IMPORTING/STABLE/NODE.
     pub migrations: RwLock<AHashMap<u16, MigrationState>>,
@@ -418,6 +459,9 @@ impl ClusterState {
         config_path: Option<PathBuf>,
         node_timeout_ms: u64,
     ) -> Self {
+        let starts_as_replica = nodes
+            .get(&myself)
+            .is_some_and(|n| n.flags.contains(NodeFlags::REPLICA));
         let state = Self {
             enabled,
             myself: RwLock::new(myself),
@@ -431,6 +475,13 @@ impl ClusterState {
             last_vote_epoch: AtomicU64::new(last_vote_epoch),
             election: parking_lot::Mutex::new(None),
             election_pending: AtomicBool::new(false),
+            held_as_owner: parking_lot::Mutex::new(AHashMap::new()),
+            first_sync: FirstSync {
+                started: std::time::Instant::now(),
+                // Only a node that starts as a replica waits.
+                open: AtomicBool::new(!starts_as_replica),
+                heard: parking_lot::Mutex::new(ahash::AHashSet::new()),
+            },
             migrations: RwLock::new(AHashMap::new()),
             slot_migrations: migration::Registry::default(),
             slot_deletions: Default::default(),
@@ -2162,7 +2213,7 @@ impl ClusterState {
         };
         match wanted {
             Some((ip, port)) => {
-                if ip.is_empty() || port == 0 {
+                if ip.is_empty() || port == 0 || !self.first_sync_may_begin() {
                     return;
                 }
                 if !repl_state.is_already_following(&ip, port) {
@@ -2859,6 +2910,187 @@ impl ClusterState {
             );
         }
         saved
+    }
+
+    /// Note what master `from` says, in a PONG, of the slots it holds this
+    /// node as the owner of (`claims`; none: it holds it as the owner of
+    /// nothing, or is of an earlier version). Only ever from the master's own
+    /// PONG to this node, never relayed. See [`Self::promotion_to_complete`].
+    pub fn note_held_as_owner(&self, from: NodeId, claims: Vec<crate::cluster::bus::SlotClaim>) {
+        let mut held = self.held_as_owner.lock();
+        if claims.is_empty() {
+            held.remove(&from);
+        } else {
+            held.insert(
+                from,
+                HeldAsOwner {
+                    claims,
+                    at: std::time::Instant::now(),
+                },
+            );
+        }
+    }
+
+    /// Whether this node, a replica, is to complete a promotion that the
+    /// rest of the cluster has and it does not: elected, its promotion
+    /// announced, and the process stopped before a save of it was done (a
+    /// full disk, a read-only directory, a disk slower than
+    /// `PROMOTION_SAVE_WAIT`). Restarted from nodes.conf, it is a replica of
+    /// the old master, while the masters route that master's slots to it.
+    ///
+    /// The rule. This node, a replica of master M in its own view, where M
+    /// owns the slots S (not none), completes the promotion when a quorum
+    /// (a majority of the masters that own slots in its view, the quorum of
+    /// an election) of masters that own slots in its view have each told it
+    /// in their own PONG to it, within the last two node timeouts, that they
+    /// hold it as the owner of every slot of S at a config epoch greater
+    /// than every config epoch this node knows for S: M's, and its own. It
+    /// takes S over at the greatest of those epochs. Not while a full sync
+    /// it began is unfinished (it may hold part of a dataset).
+    ///
+    /// Why this cannot make two owners of S:
+    ///
+    /// * The epoch is one the majority already holds this node at for S, so
+    ///   the cluster's routing does not change: no other node's claim is
+    ///   overruled, here or anywhere, beyond what the majority has decided.
+    /// * A master that owns S, or some of it, at a newer epoch than that one
+    ///   (another replica elected after this node, a `CLUSTER FAILOVER` or
+    ///   `TAKEOVER` by another, a slot handover) has its claim taken in here
+    ///   like any other: then M no longer owns S here, or this node follows
+    ///   that master, and the rule does not apply. Each master that took that
+    ///   claim in no longer holds this node as the owner of S and says so,
+    ///   so it counts no more; and a claim of this node's at an older epoch
+    ///   is refused everywhere.
+    /// * Only what a master says of its own slot table counts, in its own
+    ///   PONG: gossip carries none of it, so a relayed, stale view never
+    ///   does. A master's word counts for two node timeouts, and is
+    ///   withdrawn by its next PONG that holds this node as the owner of
+    ///   nothing.
+    /// * An epoch not greater than one this node knows for S, M's or its
+    ///   own, is from before this node knew M as the owner: from a view in
+    ///   which this node owned S before M did (M took S from it since), or
+    ///   of other slots. It is refused.
+    /// * The old master M, if it is alive (it was cut off, and is back),
+    ///   owns S at an older epoch than the one taken: it takes this node's
+    ///   claim in and follows it, as after any failover.
+    pub fn promotion_to_complete(&self, full_sync_unfinished: bool) -> UnsavedPromotion {
+        if !self.enabled {
+            return UnsavedPromotion::None;
+        }
+        let me = self.myself();
+        let (master, known_epoch) = {
+            let nodes = self.nodes.read();
+            let Some(node) = nodes.get(&me) else {
+                return UnsavedPromotion::None;
+            };
+            let Some(master) = node.master_id else {
+                return UnsavedPromotion::None;
+            };
+            if !node.flags.contains(NodeFlags::REPLICA) {
+                return UnsavedPromotion::None;
+            }
+            let master_epoch = nodes.get(&master).map_or(0, |m| m.config_epoch);
+            (master, master_epoch.max(node.config_epoch))
+        };
+        let window = std::time::Duration::from_millis(self.node_timeout_ms.saturating_mul(2));
+        let reports: Vec<(NodeId, Vec<crate::cluster::bus::SlotClaim>)> = {
+            let mut held = self.held_as_owner.lock();
+            held.retain(|_, h| h.at.elapsed() <= window);
+            if held.is_empty() {
+                return UnsavedPromotion::None;
+            }
+            held.iter().map(|(id, h)| (*id, h.claims.clone())).collect()
+        };
+        let (master_slots, owners) = {
+            let slots = self.slots.read();
+            let master_slots: Vec<u16> = (0..CLUSTER_SLOTS)
+                .filter(|&i| slots[i] == Some(master))
+                .map(|i| i as u16)
+                .collect();
+            let owners: ahash::AHashSet<NodeId> = slots.iter().flatten().copied().collect();
+            (master_slots, owners)
+        };
+        let quorum = owners.len() / 2 + 1;
+        decide_unsaved_promotion(
+            master,
+            &master_slots,
+            known_epoch,
+            &owners,
+            quorum,
+            &reports,
+            full_sync_unfinished,
+        )
+    }
+
+    /// Forget what the masters said of this node's slots: its promotion is
+    /// completed.
+    pub fn forget_held_as_owner(&self) {
+        self.held_as_owner.lock().clear();
+    }
+
+    /// Note that master `from` has answered this node with a PONG: see
+    /// [`Self::first_sync_may_begin`].
+    pub fn note_pong_heard(&self, from: NodeId) {
+        if !self.first_sync.open.load(Ordering::Relaxed) {
+            self.first_sync.heard.lock().insert(from);
+        }
+    }
+
+    /// Whether this node, a replica since it started, may begin its first
+    /// sync with the master its nodes.conf names. Not before it has heard a
+    /// PONG from a quorum of the masters that own slots (its own master not
+    /// counted), or one node timeout has passed since it started, whichever
+    /// is first; and not while [`Self::promotion_to_complete`] says the
+    /// promotion it was elected to is to be completed. A node restarted
+    /// before its promotion was saved still holds the writes it took as the
+    /// master, which a full sync with the old master, if that one is
+    /// reachable, would replace: it learns from the PONGs that it is the
+    /// owner, about a heartbeat after it starts, and is promoted instead of
+    /// syncing. Once true it stays true: only the first sync after a start
+    /// waits, never a later one, nor a node that is no replica (or not in
+    /// cluster mode).
+    fn first_sync_may_begin(&self) -> bool {
+        if self.first_sync.open.load(Ordering::Relaxed) {
+            return true;
+        }
+        let me = self.myself();
+        let master = self.nodes.read().get(&me).and_then(|n| n.master_id);
+        let (heard, quorum) = {
+            let owners: ahash::AHashSet<NodeId> =
+                self.slots.read().iter().flatten().copied().collect();
+            let quorum = owners.len() / 2 + 1;
+            let heard = self.first_sync.heard.lock();
+            let count = heard
+                .iter()
+                .filter(|&&id| owners.contains(&id) && Some(id) != master)
+                .count();
+            (count, quorum)
+        };
+        let waited = self.first_sync.started.elapsed()
+            >= std::time::Duration::from_millis(self.node_timeout_ms);
+        if heard < quorum && !waited {
+            return false;
+        }
+        // Decided on this tick or the next by the election check, which
+        // runs before this one.
+        if matches!(
+            self.promotion_to_complete(false),
+            UnsavedPromotion::Complete { .. }
+        ) {
+            return false;
+        }
+        self.first_sync.open.store(true, Ordering::Relaxed);
+        self.first_sync.heard.lock().clear();
+        true
+    }
+
+    /// For the tests: what master `from` last said of this node's slots.
+    #[cfg(test)]
+    pub(crate) fn held_as_owner_by(&self, from: NodeId) -> Option<Vec<(u16, u16, u64)>> {
+        self.held_as_owner
+            .lock()
+            .get(&from)
+            .map(|h| h.claims.iter().map(|c| (c.start, c.end, c.epoch)).collect())
     }
 
     /// Of the slots a promotion `claimed`, those another master has taken
@@ -3575,6 +3807,74 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// The rule of [`ClusterState::promotion_to_complete`], as a function of
+/// this node's view: its master `master`, the slots it owns here
+/// (`master_slots`), the greatest config epoch this node knows for them
+/// (`known_epoch`: the master's or its own), the masters that own slots here
+/// (`owners`) and the quorum of them, and what each master said (`reports`:
+/// the slots it holds this node as the owner of, each at this node's config
+/// epoch in its view).
+fn decide_unsaved_promotion(
+    master: NodeId,
+    master_slots: &[u16],
+    known_epoch: u64,
+    owners: &ahash::AHashSet<NodeId>,
+    quorum: usize,
+    reports: &[(NodeId, Vec<crate::cluster::bus::SlotClaim>)],
+    full_sync_unfinished: bool,
+) -> UnsavedPromotion {
+    if master_slots.is_empty() {
+        return UnsavedPromotion::None;
+    }
+    // The epoch each master that owns slots here holds this node at as the
+    // owner of every one of the master's slots.
+    let mut covering: Vec<u64> = Vec::new();
+    for (from, claims) in reports {
+        if !owners.contains(from) || claims.is_empty() {
+            continue;
+        }
+        let mut held = vec![false; CLUSTER_SLOTS];
+        for claim in claims {
+            let end = (claim.end as usize).min(CLUSTER_SLOTS - 1);
+            for slot in held.iter_mut().take(end + 1).skip(claim.start as usize) {
+                *slot = true;
+            }
+        }
+        if !master_slots.iter().all(|&s| held[s as usize]) {
+            continue;
+        }
+        // One epoch, this node's in that master's view; the lowest, if a
+        // claim ever said otherwise.
+        covering.push(claims.iter().map(|c| c.epoch).min().unwrap_or(0));
+    }
+    if covering.len() < quorum {
+        return UnsavedPromotion::None;
+    }
+    let newer: Vec<u64> = covering
+        .iter()
+        .copied()
+        .filter(|&e| e > known_epoch)
+        .collect();
+    if newer.len() < quorum {
+        return UnsavedPromotion::NotCompleted(format!(
+            "{} masters hold it as the owner of the slots of {}, {} of them at a config epoch \
+             newer than the epoch {known_epoch} it knows for those slots, and {quorum} are needed",
+            covering.len(),
+            node_id_str(&master),
+            newer.len(),
+        ));
+    }
+    if full_sync_unfinished {
+        return UnsavedPromotion::NotCompleted(
+            "it has not finished loading a full sync, and may hold part of a dataset".into(),
+        );
+    }
+    UnsavedPromotion::Complete {
+        master,
+        epoch: newer.into_iter().max().unwrap_or(known_epoch),
+    }
 }
 
 fn empty_slots() -> Box<[Option<NodeId>; CLUSTER_SLOTS]> {
@@ -4474,6 +4774,148 @@ mod tests {
             .map(|c| (c.start, c.end, c.epoch))
             .collect();
         assert_eq!(claims, vec![(5461, 5999, 4), (6001, 10922, 4)]);
+    }
+
+    fn held(ranges: &[(u16, u16)], epoch: u64) -> Vec<crate::cluster::bus::SlotClaim> {
+        ranges
+            .iter()
+            .map(|&(start, end)| crate::cluster::bus::SlotClaim { start, end, epoch })
+            .collect()
+    }
+
+    /// This node, a replica of `m` (slots 0-99, config epoch 3) in a cluster
+    /// of three masters, `m`, `x` and `y`. Its own config epoch is 1.
+    fn restarted_replica() -> (ClusterState, NodeId, NodeId, NodeId) {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let m = add_master(&cs, 0..=99);
+        let x = add_master(&cs, 100..=199);
+        let y = add_master(&cs, 200..=299);
+        cs.nodes.write().get_mut(&m).unwrap().config_epoch = 3;
+        cs.set_replica_of(m).unwrap();
+        cs.nodes.write().get_mut(&cs.myself()).unwrap().config_epoch = 1;
+        (cs, m, x, y)
+    }
+
+    /// The rule of `promotion_to_complete`: a majority of the masters that
+    /// own slots (two of three, the old master counted) hold this node as
+    /// the owner of all its master's slots at an epoch newer than its
+    /// master's and its own. The greatest such epoch is taken.
+    #[test]
+    fn a_replica_completes_a_promotion_a_majority_holds_it_to() {
+        let (cs, m, x, y) = restarted_replica();
+        assert_eq!(cs.promotion_to_complete(false), UnsavedPromotion::None);
+        cs.note_held_as_owner(x, held(&[(0, 49), (50, 99)], 7));
+        // One master of three.
+        assert_eq!(cs.promotion_to_complete(false), UnsavedPromotion::None);
+        cs.note_held_as_owner(y, held(&[(0, 99)], 8));
+        assert_eq!(
+            cs.promotion_to_complete(false),
+            UnsavedPromotion::Complete {
+                master: m,
+                epoch: 8
+            }
+        );
+        // Not while a full sync is being loaded.
+        assert!(matches!(
+            cs.promotion_to_complete(true),
+            UnsavedPromotion::NotCompleted(_)
+        ));
+        // A master that holds it as the owner of nothing any more withdraws.
+        cs.note_held_as_owner(y, Vec::new());
+        assert_eq!(cs.promotion_to_complete(false), UnsavedPromotion::None);
+    }
+
+    /// Only a master that owns slots, and holds this node as the owner of
+    /// every slot of its master, counts.
+    #[test]
+    fn only_slot_owners_that_hold_all_the_masters_slots_count() {
+        let (cs, _m, x, y) = restarted_replica();
+        let stranger = add_replica(&cs, x);
+        cs.note_held_as_owner(x, held(&[(0, 99)], 7));
+        cs.note_held_as_owner(stranger, held(&[(0, 99)], 7));
+        assert_eq!(cs.promotion_to_complete(false), UnsavedPromotion::None);
+        // Slot 99 is another's in y's view: it has heard of a handover.
+        cs.note_held_as_owner(y, held(&[(0, 98)], 7));
+        assert_eq!(cs.promotion_to_complete(false), UnsavedPromotion::None);
+    }
+
+    /// A majority that holds this node as the owner at an epoch no newer than
+    /// one it knows for the slots (its master's, or its own) is a view from
+    /// before: refused, and said why.
+    #[test]
+    fn an_epoch_no_newer_than_one_known_for_the_slots_is_refused() {
+        let (cs, _m, x, y) = restarted_replica();
+        cs.note_held_as_owner(x, held(&[(0, 99)], 3));
+        cs.note_held_as_owner(y, held(&[(0, 99)], 2));
+        let UnsavedPromotion::NotCompleted(why) = cs.promotion_to_complete(false) else {
+            panic!("completed at an old epoch");
+        };
+        assert!(why.contains("newer than the epoch 3"), "{why}");
+        // Its own config epoch counts too.
+        cs.nodes.write().get_mut(&cs.myself()).unwrap().config_epoch = 9;
+        cs.note_held_as_owner(x, held(&[(0, 99)], 8));
+        cs.note_held_as_owner(y, held(&[(0, 99)], 8));
+        assert!(matches!(
+            cs.promotion_to_complete(false),
+            UnsavedPromotion::NotCompleted(_)
+        ));
+    }
+
+    /// Another replica of the same master that took the slots over at a newer
+    /// epoch: its claim is taken in, this node follows it, and the masters'
+    /// word from before, about the new master's slots at an older epoch than
+    /// its, is refused.
+    #[test]
+    fn a_newer_owner_of_the_masters_slots_is_followed_not_overruled() {
+        let (cs, m, x, y) = restarted_replica();
+        let other = add_replica(&cs, m);
+        cs.note_held_as_owner(x, held(&[(0, 99)], 7));
+        cs.note_held_as_owner(y, held(&[(0, 99)], 7));
+        cs.nodes.write().get_mut(&other).unwrap().config_epoch = 9;
+        cs.apply_peer_slot_claims(other, &held(&[(0, 99)], 9));
+        assert_eq!(cs.my_master_id(), Some(other));
+        assert!(matches!(
+            cs.promotion_to_complete(false),
+            UnsavedPromotion::NotCompleted(_)
+        ));
+    }
+
+    /// A node that starts as a replica begins its first sync once a quorum of
+    /// the masters that own slots, its own master not counted, has answered,
+    /// and not when they hold it as the owner of its master's slots: then it
+    /// is to be promoted instead. Once begun, it is never held back again.
+    #[test]
+    fn a_replica_starts_its_first_sync_once_a_quorum_has_answered() {
+        let (cs, m, x, y) = restarted_replica();
+        // As if started from a nodes.conf that has it a replica.
+        cs.first_sync.open.store(false, Ordering::Relaxed);
+        cs.note_pong_heard(m);
+        cs.note_pong_heard(x);
+        assert!(!cs.first_sync_may_begin(), "its own master counted");
+        cs.note_held_as_owner(x, held(&[(0, 99)], 7));
+        cs.note_held_as_owner(y, held(&[(0, 99)], 7));
+        cs.note_pong_heard(y);
+        assert!(
+            !cs.first_sync_may_begin(),
+            "began a sync over its promotion"
+        );
+        cs.note_held_as_owner(y, Vec::new());
+        assert!(cs.first_sync_may_begin());
+        cs.note_held_as_owner(y, held(&[(0, 99)], 7));
+        assert!(cs.first_sync_may_begin(), "held back again");
+    }
+
+    /// A master, or a node that is not a replica of anyone, has nothing to
+    /// complete.
+    #[test]
+    fn a_master_has_no_promotion_to_complete() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let x = add_master(&cs, 100..=199);
+        let y = add_master(&cs, 200..=299);
+        cs.slots.write()[0] = Some(cs.myself());
+        cs.note_held_as_owner(x, held(&[(0, 0)], 7));
+        cs.note_held_as_owner(y, held(&[(0, 0)], 7));
+        assert_eq!(cs.promotion_to_complete(false), UnsavedPromotion::None);
     }
 
     #[test]

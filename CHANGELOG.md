@@ -1075,6 +1075,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   after); see [PERSISTENCE.md](docs/PERSISTENCE.md#the-clusters-nodesconf)
   for what failover needs of the disk.
 
+- **A node that restarts before its promotion was saved completes it once a
+  majority of the masters report it as the owner.** A replica that won an
+  election and was stopped before a save of its promotion was done starts
+  again from the `nodes.conf` of before, as a replica of the old master,
+  while the other masters send that master's slots to it. A master now
+  tells such a node, in its answer to the node's heartbeat, which slots it
+  holds it as the owner of and at which config epoch (a field that 1.2
+  nodes do not send and do not read). Once a majority of the masters that
+  own slots say it owns every slot of its old master, at a config epoch
+  newer than any it knows for those slots, the node takes them over at that
+  epoch, saves that as a promotion is saved, and serves them with the
+  dataset it has. So that a sync with the old master, if it is reachable,
+  does not replace that dataset first, a node that starts as a replica
+  begins its first sync once a majority of the masters that own slots (its
+  own master not counted) has answered it, or one node timeout after it
+  started, whichever is first, and not at all if it is to complete a
+  promotion; later syncs do not wait. A master that owns those slots at a
+  newer epoch (another replica elected since, a `CLUSTER FAILOVER
+  TAKEOVER`) is followed instead, as before. With nodes of 1.2 among the
+  masters, the majority has to be made of masters of this release.
+
 - **`MONITOR` no longer loses lines.** A monitor was fed through a ring of
   4,096 lines shared by all monitors, and one that fell that far behind
   lost what it had not read without a word: with four connections sending

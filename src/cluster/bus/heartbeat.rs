@@ -257,6 +257,12 @@ async fn check_election(
         None => return,
     };
 
+    // Elected before a restart that lost the save of the promotion: the
+    // masters say so, and it is completed.
+    if complete_unsaved_promotion(state, repl_state).await {
+        return;
+    }
+
     // Is our master FAIL'd?
     let master_failed = {
         let nodes = state.nodes.read();
@@ -418,6 +424,56 @@ async fn check_election(
 /// When a too-stale replica last said it would not stand (logged at most
 /// every 10 s; the check runs every 100 ms).
 static LAST_STALE_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// When this replica last said why it does not complete a promotion the
+/// masters hold it to (logged at most every 10 s).
+static LAST_NOT_COMPLETED_LOG_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Complete the promotion of this node, a replica, if a quorum of the
+/// masters holds it as the owner of its master's slots at a newer config
+/// epoch than any it knows for them (`ClusterState::promotion_to_complete`
+/// has the rule, and why it cannot make two owners). That is a node elected,
+/// its promotion announced, and stopped before it was saved, then started
+/// again from the nodes.conf of before. It is promoted as an election won at
+/// that epoch would promote it ([`promote`]): saved before it is announced,
+/// waiting at most `PROMOTION_SAVE_WAIT`; a save that fails or takes longer
+/// leaves the promotion in memory, serving, and saved again every second.
+/// Stopped again before a save is done, it does the same once restarted:
+/// the masters still hold it as the owner. True if it was promoted.
+async fn complete_unsaved_promotion(
+    state: &Arc<ClusterState>,
+    repl_state: &Arc<crate::replication::ReplState>,
+) -> bool {
+    let full_sync_unfinished = repl_state.full_sync_unfinished.load(Ordering::SeqCst);
+    match state.promotion_to_complete(full_sync_unfinished) {
+        crate::cluster::UnsavedPromotion::None => false,
+        crate::cluster::UnsavedPromotion::NotCompleted(why) => {
+            let now = now_ms_local();
+            if now.saturating_sub(LAST_NOT_COMPLETED_LOG_MS.swap(now, Ordering::Relaxed)) >= 10_000
+            {
+                // Seen for a moment in an ordinary failover too: the old
+                // master, a replica now, heard before the others did.
+                log_info!(
+                    "Cluster: Not taking over the slots the masters hold this node as the owner of: {why}"
+                );
+            }
+            false
+        }
+        crate::cluster::UnsavedPromotion::Complete { master, epoch } => {
+            log_warn!(
+                "Cluster: A majority of the masters hold this node as the owner of the slots of {} \
+                 at config epoch {epoch}, newer than any it knows for them: it was promoted, and \
+                 restarted before the promotion was saved. Completing the promotion",
+                node_id_str(&master)
+            );
+            state.observe_epoch(epoch);
+            state.forget_held_as_owner();
+            promote(state, repl_state, master, epoch).await;
+            true
+        }
+    }
+}
 
 /// Why this replica may not stand for election, if it may not; see
 /// [`stand_refusal`].
