@@ -51,6 +51,7 @@ and why.
 | `32-default-threads` | #903 | the default worker count itself: unpipelined `GET` (50 connections), `SET` pipeline 16, suite 05's `XADD` and suite 23's pattern fan-out, each with no `--threads` and with every explicit count from 1 to the CPUs, server and clients sharing the machine; `<row>_default_vs_best` (default / best) recorded but informational until the default worker count is settled, then gated at 0.90; `pubsub_lost` exact |
 | `33-ft-aggregate-groupby` | #761 | #761's 2,000,000 hashes (`name TEXT email TAG communityNumber NUMERIC age NUMERIC`, pipelines of 2,000): `FT.AGGREGATE userIdx * GROUPBY 1 @communityNumber REDUCE COUNT 0 AS n LIMIT 0 10`, the same with `REDUCE AVG 1 @age` and `SORTBY 2 @n DESC`, and the first over `@age:[20 40]`: median ms of 5 after a warm-up, and the reply's group total (exactly 1000); `used_memory` and RSS once loaded, the peak RSS (`VmHWM`) after the queries, and FT.INFO's memory parts as info rows. v1.2.2 and the candidate only: the VM image's Redis has no Query Engine |
 | `34-kong-ratelimit` | #849 | Kong's rate-limiting plugin with `policy: redis`: its per-request script (`incr`, and `expire` when the count is 1; Kong 3.9.4's `usage()`, verbatim) sent as Kong sends it (`EVAL` with the script text) and by `EVALSHA`, on one key, `ratelimit:<route>:<service>:<identifier>:<period_date>:minute`, from memtier_benchmark at 200 and 500 connections over 100,000 identifiers; with the key as Kong builds it (`plain`) and with the identifier under a hash tag (`tag`), in two configurations: `default` (`lua-parallel-scripts yes`) and `serial` (`lua-parallel-scripts no` on KiviDB). ops/s against Redis, p99 shown, keys left without a TTL (must be 0); every call's key checked under MONITOR first, for each way of calling. Gates: at least 1.2x Redis at 200 connections and 1.3x at 500 in every configuration and key form. Needs 8 vCPUs and the `lua,tls` builds (`--candidate-full`) |
+| `35-tokio-pipelined-reads` | #432 / #891 | the Tokio loop (`--io-model tokio --threads 1`, the server on the first CPU, `redis-benchmark --threads 3` on the next three, 50 connections): `SET` of 1,024-byte values at pipeline 16 and of 4,096-byte values at pipeline 32, a second from the server's own `total_commands_processed` (median of 3); and one connection with a 64 KiB receive buffer that sends 400,000 `SET`s of 20-byte values (19 MB) in one write before reading a reply: 1 if it is written within 20 s and every reply arrives. Gates: the rates 10 % and 60 % of the gain over v1.2.2 in the same session; the pipeline `>= 1` (v1.2.2 stalls). Recorded on a D4s_v5 (`results/pr-891-d4s_v5`) |
 
 ## Running it
 
@@ -255,6 +256,7 @@ was re-recorded for it:
 | `21-list-memory` (all four configurations) | 4 | re-recorded in #940 with the candidate at its default of the day on 4 vCPUs (4 workers, after #903) |
 | `33-ft-aggregate-groupby` | 4 | as recorded (#944) |
 | `34-kong-ratelimit` | the server's pinned CPUs (4) | as suite `20`: the server is pinned to half the CPUs of a `Standard_D8s_v5` and gets `--threads` to match |
+| `35-tokio-pipelined-reads` | 1 | as recorded: one worker on its own CPU, the client on the other three |
 | `32-default-threads` | 0 (none) | measures the default on purpose |
 
 Redis ignores the count. The default itself is watched by
@@ -1447,6 +1449,23 @@ memtier log error replies and the suite fails, which was checked by hand.
 This suite declares `min_cpus=8`: run it on a Standard_D8s_v5 with
 `run-all.sh --candidate <bin> --candidate-full <bin> --min-cpus-only --label
 <label>-d8s_v5`, or `--only 34` on a machine with 8 CPUs.
+
+## Recorded run, suite 35
+
+Recorded 2026-11-19 on an Azure Standard_D4s_v5 (Xeon Platinum 8370C),
+`--only 35 --record`; the candidate is #891 at `3747bb7b` (master `b701f59f`
+merged in), `cargo build --release` by rustc 1.100.0. Runs:
+`pr-891-d4s_v5` (recorded) and `pr-891-d4s_v5-rerun1`, `-rerun2` (the same
+binaries again: `ok` twice). A run takes about 2 minutes.
+
+| metric | v1.2.2 | candidate (recorded / rerun 1 / rerun 2) | gate |
+|---|---:|---:|---|
+| `SET` 1 KiB, pipeline 16, a second | 287,617 | 587,037 / 581,730 / 589,116 (2.0x) | rel 10%; keep 60% of gain |
+| `SET` 4 KiB, pipeline 32, a second | 96,304 | 235,149 / 237,883 / 239,279 (2.4-2.5x) | rel 10%; keep 60% of gain |
+| 19 MB pipeline through a 64 KiB receive buffer | stalls (0; given up after 20 s) | 1 (written in 0.13 s) | `>= 1` |
+
+v1.2.2's rates moved by 3 % across the three runs (287,617 to 296,520 for
+1 KiB), the candidate's by 1-2 %.
 
 ## Not covered
 

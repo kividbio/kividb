@@ -14414,6 +14414,113 @@
           "speed": false
         }
       ]
+    },
+    "35-tokio-pipelined-reads/tokio/set_1k_p16_per_s": {
+      "suite": "35-tokio-pipelined-reads",
+      "config": "tokio",
+      "metric": "set_1k_p16_per_s",
+      "unit": "req/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 287617.1084,
+        "candidate": 587037.0391,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "3747bb7b",
+        "label": "pr-891-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "35-tokio-pipelined-reads/tokio/set_4k_p32_per_s": {
+      "suite": "35-tokio-pipelined-reads",
+      "config": "tokio",
+      "metric": "set_4k_p32_per_s",
+      "unit": "req/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 96303.7828,
+        "candidate": 235149.0317,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "3747bb7b",
+        "label": "pr-891-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "35-tokio-pipelined-reads/tokio/small_rcvbuf_pipeline_ok": {
+      "suite": "35-tokio-pipelined-reads",
+      "config": "tokio",
+      "metric": "small_rcvbuf_pipeline_ok",
+      "unit": "flag",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.0,
+        "candidate": 1.0,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "3747bb7b",
+        "label": "pr-891-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "min": 1
+        }
+      ]
+    },
+    "35-tokio-pipelined-reads/tokio/small_rcvbuf_pipeline_s": {
+      "suite": "35-tokio-pipelined-reads",
+      "config": "tokio",
+      "metric": "small_rcvbuf_pipeline_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 20.0202,
+        "candidate": 0.1333,
+        "redis": null,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "3747bb7b",
+        "label": "pr-891-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
     }
   }
 }
