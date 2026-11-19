@@ -85,10 +85,7 @@ impl SubFilter {
             .checked_mul(u64::from(bucket_size))
             .filter(|&b| b > 0 && b <= MAX_BYTES)
             .ok_or(CuckooError::TooLarge)?;
-        let mut v: Vec<u8> = Vec::new();
-        v.try_reserve_exact(bytes as usize)
-            .map_err(|_| CuckooError::NoMemory)?;
-        v.resize(bytes as usize, 0);
+        let v = super::zeroed::<u8>(bytes as usize).ok_or(CuckooError::NoMemory)?;
         Ok(SubFilter {
             buckets,
             data: Arc::new(v.into_boxed_slice()),
