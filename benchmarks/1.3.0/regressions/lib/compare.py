@@ -15,7 +15,10 @@ Verdicts and exit status:
              (or lacks an engine's value), nothing ran, the VM size
              differs from the recorded one, or the v1.2.2 or
              redis-server binary is not the pinned one
-             (REGRESS_REDIS_SHA256=<sha> accepts a deliberate Redis change)
+             (REGRESS_REDIS_SHA256=<sha> accepts a deliberate Redis change),
+             or the candidate was built by an older rustc than v1.2.2,
+             or by one that cannot be read (REGRESS_ALLOW_RUSTC=1 accepts
+             a deliberate check; a newer rustc only warns)
   SMOKE      SCALE != 1: gates are not checked, only that every       exit 0
              metric came out
 
@@ -27,6 +30,9 @@ the recorded candidate value is scaled to this host by an effective factor f
 (rates x f, times / f; f < 1 = this host is slower):
   own  = the metric's own v1.2.2 now/recorded (None if v1.2.2 lacks it);
   grp  = the median of `own` over the suite/config's speed metrics (at least 3),
+         else over the speed metrics recorded on the same machine (VM size
+         and CPU model, at least 3: suites recorded on another host, or on
+         a min_cpus suite's bigger machine, are not scaled by this one's),
          else over all suites (global); none at all = no scaling, said so;
   own is None                -> f = grp
   own < grp / 1.3            -> f = own   (this metric slowed more: loosens)
@@ -95,18 +101,33 @@ def gates_of(entry, m):
 
 def host_factors(results, baseline):
     """-> {"global": f|None, "groups": {"suite/config": f}, "counts": {...}}."""
-    per_group, allf = {}, []
+    per_group, per_host, allf = {}, {}, []
     for key, m in results.items():
         entry = baseline.get("metrics", {}).get(key)
         if not entry or not speed_metric(m["unit"], gates_of(entry, m)):
             continue
-        f = metric_speed(m, entry.get("recorded", {}))
+        rec = entry.get("recorded", {})
+        f = metric_speed(m, rec)
         if f is not None:
             per_group.setdefault("%s/%s" % (m["suite"], m["config"]), []).append(f)
+            per_host.setdefault(recorded_host(rec), []).append(f)
             allf.append(f)
     return {"global": median(allf), "n": len(allf),
             "groups": {g: median(v) for g, v in sorted(per_group.items())},
-            "counts": {g: len(v) for g, v in sorted(per_group.items())}}
+            "counts": {g: len(v) for g, v in sorted(per_group.items())},
+            "hosts": {h: median(v) for h, v in sorted(per_host.items())},
+            "host_counts": {h: len(v) for h, v in sorted(per_host.items())}}
+
+
+def recorded_host(rec):
+    """The machine a metric's values were recorded on: VM size and CPU model.
+    A suite/config with too few speed metrics of its own is scaled by the
+    factor of the metrics recorded on the same machine, not by all of them:
+    suites recorded on another CPU (or on the bigger machine of a min_cpus
+    suite) would otherwise be scaled by a factor that says how the OTHER
+    host compares (#921: suite 25, recorded on this very CPU, judged at the
+    1.17x of the suites recorded on an older one)."""
+    return "%s / %s" % (rec.get("vm") or "?", rec.get("cpu") or "?")
 
 
 def load_results(path):
@@ -153,7 +174,7 @@ def improvement(better, old, new):
 def check_gate(g, m, rec, host=None):
     """-> (status, limit_text). status: pass, FAIL, new, skip, info.
 
-    host: {"mode": "anchor"|"suite"|"global", "speed": f} for a speed-dependent
+    host: {"mode": "anchor"|"suite"|"host"|"global", "speed": f} for a speed-dependent
     metric: a `rel` gate then judges against the recorded candidate value
     scaled to this host (see the module docstring)."""
     kind = g.get("kind")
@@ -240,8 +261,12 @@ def host_for(g, m, rec, hf, gates=None):
         return None
     own = metric_speed(m, rec)
     k = "%s/%s" % (m["suite"], m["config"])
+    hk = recorded_host(rec)
     if hf["counts"].get(k, 0) >= MIN_GROUP:
         grp, grule = hf["groups"][k], "group"
+    elif len(hf.get("hosts", {})) > 1 and hf["host_counts"].get(hk, 0) >= MIN_GROUP:
+        # (With one recording host its factor is the global one.)
+        grp, grule = hf["hosts"][hk], "host"
     elif hf["global"] is not None:
         grp, grule = hf["global"], "global"
     else:
@@ -282,7 +307,8 @@ def evaluate(results, baseline, smoke=False):
             if host:
                 bad = [("this metric's", host["own"])] if host["mode"] in ("own-slower", "anchor") else []
                 if host["group"] is not None:
-                    bad.append(("the %s" % ("global" if host["mode"] == "global" else "suite/config's"), host["group"]))
+                    bad.append(("the %s" % ({"global": "global", "host": "recording host's"}.get(
+                        host["mode"], "suite/config's")), host["group"]))
                 for what, f in bad:
                     if f is not None and not (FACTOR_MIN <= f <= FACTOR_MAX):
                         hf["problems"].append(
@@ -327,6 +353,62 @@ def host_warnings(hf):
     return []
 
 
+RUSTC_OVERRIDE = "REGRESS_ALLOW_RUSTC"
+
+
+def rustc_version(v):
+    """'1.100.0' (or '1.101.0-nightly') -> (1, 100, 0); None if unknown."""
+    if not v:
+        return None
+    parts = v.split("-", 1)[0].split(".")
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        return None
+
+
+def rustc_check(env, override=None):
+    """(problems, warnings) about the compilers of the candidate and of v1.2.2.
+
+    The same code built by rustc 1.99.1 ran script and PUBLISH rows 10-30 %
+    slower than built by 1.100.0, which v1.2.2's release binaries were built
+    by (#900): a gate against v1.2.2 then compares compilers, not code. A
+    candidate built by an OLDER rustc than v1.2.2, or by one that cannot be
+    read from the binary, makes the run INVALID; a newer one (the normal case:
+    rust-toolchain.toml says `stable`) only warns. REGRESS_ALLOW_RUSTC=1 turns
+    the INVALID cases into warnings, for a deliberate check of the compiler's
+    effect (results/pr900-rustc199-check)."""
+    if override is None:
+        override = os.environ.get(RUSTC_OVERRIDE, "") not in ("", "0") or bool((env or {}).get("rustc_override"))
+    engines = (env or {}).get("engines", {})
+    selected = (env or {}).get("engines_selected") or list(ENG)
+    probs, warns = [], []
+    if "candidate" not in selected or "v1_2_2" not in selected:
+        return probs, warns
+    for ref, cand in (("v1_2_2", "candidate"), ("v1_2_2_full", "candidate_full")):
+        if not engines.get(ref) or not engines.get(cand):
+            continue
+        a, b = engines[ref].get("rustc"), engines[cand].get("rustc")
+        va, vb = rustc_version(a), rustc_version(b)
+        if vb is None or va is None:
+            msg = "%s was built by rustc %s and %s by rustc %s: unknown, so its rows against v1.2.2 may " \
+                  "compare compilers as well as code" % (cand, b or "unknown", ref, a or "unknown")
+            (warns if override else probs).append(("WARN: " if override else "") + msg)
+        elif vb < va:
+            msg = "%s was built by rustc %s, older than %s's %s: its rows against v1.2.2 compare compilers " \
+                  "as well as code (build it with rustc %s or later, or set %s=1 for a deliberate check)" % (
+                      cand, b, ref, a, a, RUSTC_OVERRIDE)
+            (warns if override else probs).append(("WARN: " if override else "") + msg)
+        elif vb > va:
+            warns.append("WARN: %s was built by rustc %s and %s by rustc %s: a newer compiler may account for "
+                         "part of a difference against v1.2.2" % (cand, b, ref, a))
+    return probs, warns
+
+
+def toolchain_warnings(env):
+    return rustc_check(env)[1]
+
+
 def recorded_cpus(baseline):
     return sorted({m["recorded"]["cpu"] for m in baseline.get("metrics", {}).values()
                    if m.get("recorded", {}).get("cpu")})
@@ -342,10 +424,22 @@ def validity_problems(env, baseline, results, smoke, allow_vm_change):
     if not results:
         probs.append("no results: nothing ran")
     metrics = baseline.get("metrics", {})
-    # The machine size the values were recorded on.
-    vms = {m.get("recorded", {}).get("vm") for m in metrics.values()} - {None}
-    if vms and not smoke and env.get("vm") not in vms and not allow_vm_change:
-        probs.append("VM size %r differs from the recorded %s" % (env.get("vm"), ", ".join(sorted(vms))))
+    # The machine size the values were recorded on, per metric that ran: a
+    # suite with min_cpus is recorded on a bigger machine than the others.
+    if not smoke and not allow_vm_change:
+        wrong = {}
+        for k in results:
+            vm = metrics.get(k, {}).get("recorded", {}).get("vm")
+            if vm and vm != env.get("vm"):
+                wrong.setdefault(vm, set()).add(k.split("/", 1)[0])
+        for vm, suites in sorted(wrong.items()):
+            probs.append("VM size %r differs from the %s that %s %s recorded on" % (
+                env.get("vm"), vm, ", ".join(sorted(suites)), "was" if len(suites) == 1 else "were"))
+    # A suite that needs more CPUs than this machine has, run because --only
+    # named it: its numbers are the load generator's, not the server's.
+    for s, n in sorted((env.get("ran_below_min_cpus") or {}).items()):
+        probs.append("%s needs %s CPUs and ran on %s: not valid for the gate (run it with --min-cpus-only "
+                     "on a machine that big)" % (s, n, env.get("nproc", "?")))
     # The reference binaries the values were recorded with.
     pins = baseline.get("pins", {})
     engines = env.get("engines", {})
@@ -354,9 +448,17 @@ def validity_problems(env, baseline, results, smoke, allow_vm_change):
     got = engines.get("v1_2_2", {}).get("sha256")
     if want and "v1_2_2" in selected and got != want:
         probs.append("v1.2.2 binary sha256 %s is not the pinned %s" % (got, want))
+    want = pins.get("v1_2_2_full_sha256")
+    got = engines.get("v1_2_2_full", {}).get("sha256")
+    if want and "v1_2_2" in selected and got and got != want:
+        probs.append("v1.2.2 full binary sha256 %s is not the pinned %s" % (got, want))
+    probs += rustc_check(env)[0]
     want = os.environ.get("REGRESS_REDIS_SHA256") or pins.get("redis_sha256")
     got = engines.get("redis", {}).get("sha256")
-    if want and "redis" in selected and got != want:
+    # A Redis built on this machine from the pinned release tarball (CI) has
+    # its own binary hash: then the source's is the pin, the binary's is shown.
+    src_ok = bool(env.get("redis_source_sha256")) and env.get("redis_source_sha256") == pins.get("redis_source_sha256")
+    if want and "redis" in selected and got != want and not src_ok:
         probs.append("redis-server sha256 %s is not the pinned %s (set REGRESS_REDIS_SHA256=<sha> for a "
                      "deliberate Redis change)" % (got, want))
     # Everything that should have come out did: every recorded metric of every
@@ -381,7 +483,7 @@ def validity_problems(env, baseline, results, smoke, allow_vm_change):
 
 def write_summary(outdir, rows, not_run, env, label, problems, smoke, hf=None, baseline=None):
     hf = hf or {"global": None, "groups": {}, "counts": {}, "n": 0}
-    warns = host_warnings(hf)
+    warns = host_warnings(hf) + toolchain_warnings(env)
     rec_cpus = recorded_cpus(baseline or {})
     fails = [r for r in rows if r["status"] == "FAIL"]
     verdict = "INVALID" if problems else "SMOKE" if smoke else "REGRESSED" if fails else "ok"
@@ -417,10 +519,19 @@ def write_summary(outdir, rows, not_run, env, label, problems, smoke, hf=None, b
             L.append("- calibration (indicative only): %s ms for a fixed sha256 loop, %s cores" % (
                 env["calib_ms"], env.get("nproc", "?")))
         L.append("- Client: Python %s, redis-py %s" % (env.get("python", "?"), env.get("redis_py", "?")))
-        for e in ENG:
+        for e in ENG + ("v1_2_2_full", "candidate_full"):
             d = env.get("engines", {}).get(e)
             if d:
-                L.append("- %s: `%s`, sha256 `%s`" % (e, d.get("version", "?"), d.get("sha256", "?")))
+                L.append("- %s: `%s`, sha256 `%s`%s" % (e, d.get("version", "?"), d.get("sha256", "?"),
+                                                       ", rustc %s" % d["rustc"] if d.get("rustc") else ""))
+        if env.get("skipped_configs"):
+            L.append("- skipped (need --candidate-full): %s" % ", ".join(env["skipped_configs"]))
+        if env.get("needs_more_cpus"):
+            L.append("- not run, need more CPUs than this machine's %s (run them with --min-cpus-only on one "
+                     "that big): %s" % (env.get("nproc", "?"), ", ".join(
+                         "%s (%s)" % kv for kv in sorted(env["needs_more_cpus"].items()))))
+        if env.get("min_cpus_only"):
+            L.append("- --min-cpus-only: just the suites that declare min_cpus")
         if env.get("candidate_commit"):
             L.append("- candidate commit: `%s`" % env["candidate_commit"])
         if env.get("date"):
@@ -432,7 +543,10 @@ def write_summary(outdir, rows, not_run, env, label, problems, smoke, hf=None, b
         L += ["Host speed (this host vs the recorded one; 1.00 = same, below 1 = slower), from v1.2.2 "
               "measured in both sessions: global %.2fx over %d metrics" % (hf["global"], hf["n"])]
         L += ["- %s: %.2fx (%d metrics%s)" % (g, f, hf["counts"][g], "" if hf["counts"][g] >= MIN_GROUP
-                                              else ", too few: the global factor is used") for g, f in hf["groups"].items()]
+                                              else ", too few: the recording host's factor is used")
+              for g, f in hf["groups"].items()]
+        L += ["- recorded on %s: %.2fx (%d metrics)" % (h, f, hf["host_counts"][h])
+              for h, f in hf.get("hosts", {}).items()]
         L.append("")
         if hf.get("differ"):
             L += ["Metrics whose own v1.2.2 factor differs from their group's by more than %gx "
@@ -488,6 +602,16 @@ def record(baseline, results, env, label, reset_gates):
             v = m["values"].get(e)
             rec[e] = v if v is not None else old_rec.get(e)
         rec.update({"vm": env.get("vm"), "cpu": env.get("cpu"), "date": date, "commit": env.get("candidate_commit"), "label": label})
+        # The compiler of the candidate that made these values (#900).
+        eng_env = env.get("engines", {})
+        rustc = (eng_env.get("candidate") or {}).get("rustc")
+        rustc_full = (eng_env.get("candidate_full") or {}).get("rustc")
+        if rustc:
+            rec["rustc"] = rustc
+        if rustc_full:
+            rec["rustc_full"] = rustc_full
+        if env.get("nproc"):
+            rec["nproc"] = env["nproc"]
         ms[key] = {
             "suite": m["suite"], "config": m["config"], "metric": m["metric"],
             "unit": m["unit"], "better": m["better"], "recorded": rec,
@@ -498,6 +622,8 @@ def record(baseline, results, env, label, reset_gates):
     eng = env.get("engines", {})
     if eng.get("v1_2_2", {}).get("sha256"):
         pins.setdefault("v1_2_2_sha256", eng["v1_2_2"]["sha256"])
+    if eng.get("v1_2_2_full", {}).get("sha256"):
+        pins.setdefault("v1_2_2_full_sha256", eng["v1_2_2_full"]["sha256"])
     if eng.get("redis", {}).get("sha256") and (os.environ.get("REGRESS_REDIS_SHA256") or "redis_sha256" not in pins):
         pins["redis_sha256"] = eng["redis"]["sha256"]
     return baseline

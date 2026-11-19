@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! Integration tests for all TS.* (Time Series) commands.
 //!
 //! Each test spins up an isolated server on a random port.

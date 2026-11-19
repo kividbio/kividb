@@ -86,6 +86,7 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--bind` | `0.0.0.0` | Address to listen on. Setting it explicitly turns off [protected mode](#protected-mode) |
 | `--protected-mode <yes\|no>` | `yes` | See [Protected mode](#protected-mode) |
 | `--threads` | `0` (auto) | Worker threads; auto is one per CPU the process may use (see [Worker threads](#worker-threads)) |
+| `--worker-cpu-affinity <off\|auto>` | `off` | `auto` binds each io_uring worker to a CPU of its own when they are as many as the process's CPUs (see [Worker CPU affinity](#worker-cpu-affinity)) |
 | `--databases` | `16` | Number of databases |
 | `--dir <path>` | start directory | Where `dump.kdb`, `appendonly.aof` and `nodes.conf` live |
 | `--aof` | off | Append-only file persistence |
@@ -168,6 +169,56 @@ application or a load generator, or to keep the count of an earlier release: up 
 was the CPUs minus 2 (all of them below 4), which is `--threads 2` on 4 CPUs and
 `--threads 6` on 8. A Kubernetes pod with a CPU request but no CPU limit has no quota, so
 the server sees every CPU of the node: give it a limit, or `--threads`.
+
+### Worker CPU affinity
+
+`--worker-cpu-affinity auto` (or `worker-cpu-affinity auto` in the configuration file;
+`CONFIG GET` reports it, it is read only at startup) binds each io_uring worker to a CPU
+of its own: worker N to the N-th CPU the process may use. It does so only when the workers
+are exactly as many as those CPUs (the default `--threads 0` on a cpuset, or `--threads N`
+with `taskset` of N CPUs), and never when what limits the process is a cgroup CPU quota
+(Docker's `--cpus`, a Kubernetes CPU limit): a quota is time on any CPU, not CPUs of the
+server's own. The default is `off`: the workers run wherever the scheduler puts them.
+
+An io_uring worker serves its connections alone. When the scheduler puts two workers on one
+CPU, which it does at times when a third busy thread shares their CPUs (the replication hub
+while a replication backlog is kept, a background save), every connection of one waits out
+the other's time slice, and the p99 goes to milliseconds
+([#894](https://github.com/kividbio/kividb/issues/894)). Bound, each worker keeps its CPU.
+
+Turn it on when the server has its CPUs to itself: a Kubernetes pod under the static CPU
+manager policy (Guaranteed QoS, whole CPUs), a VM or host where the server is confined with
+`taskset` or a cpuset and nothing else runs on those CPUs. Leave it off when the server
+shares its CPUs with other busy processes: a bound worker cannot move to a CPU that is free
+while its own is busy. [PERFORMANCE.md](PERFORMANCE.md#worker-cpu-affinity) has both
+cases measured.
+
+The server says what it did, after the I/O model line, once every worker has tried its
+bind:
+
+```
+I/O model      : io_uring
+Worker CPUs    : pinned 2 of 2: worker 0 on CPU 0, worker 1 on CPU 2 (worker-cpu-affinity auto)
+```
+
+or that only some binds took (`pinned 1 of 2 (worker-cpu-affinity auto); refused: ...`, naming each refused bind and
+the error), or
+why it did not bind (`not pinned: 2 workers on 4 CPUs: pinned only when they are as many`).
+The server's other threads (the replication hub, the AOF writer, expiry, the script runner,
+a full sync's or a backup's work) are not bound: they run on any of the process's CPUs,
+which with `auto` in effect are the workers' CPUs, so they take turns with the workers as
+before; a thread a worker starts is given all of the process's CPUs back first. The tokio
+I/O model is not bound (its workers take each other's connections, so none waits behind one
+that is held up). Linux only: macOS has no call that binds a thread to a CPU, and on
+FreeBSD the setting is not implemented; there it is accepted and the server says it did
+nothing. The binds are made once, at startup: if the cpuset changes later, the kernel
+decides (verified on cgroup v2, Linux 7.0: a worker whose CPU is removed runs on the whole
+new set and goes back to its CPU when it returns; cgroup v1, not verified here, resets each
+thread to the new set), the startup line is not updated, and a thread started after the
+change is given the CPUs the process had at startup; a Kubernetes pod's exclusive CPUs
+under the static CPU manager do not change while its container runs. Redis's `server-cpulist` binds the server's threads to a list of CPUs together,
+not one each; KiviDB accepts it, as it accepts Redis's other settings, and does nothing
+with it.
 
 ## TLS
 

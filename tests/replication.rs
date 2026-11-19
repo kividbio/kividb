@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/replication_transactions_generic.rs
 //
 // Integration tests for everything implemented in this session:

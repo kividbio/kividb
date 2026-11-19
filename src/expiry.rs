@@ -449,7 +449,7 @@ mod tests {
         let outer = hold();
         let inner = hold();
         assert!(held());
-        std::thread::spawn(|| assert!(!held())).join().unwrap();
+        crate::cpus::spawn(|| assert!(!held())).join().unwrap();
         drop(inner);
         assert!(held());
         drop(outer);
@@ -462,7 +462,7 @@ mod tests {
         let outer = replay();
         let inner = replay();
         assert!(replaying());
-        std::thread::spawn(|| assert!(!replaying())).join().unwrap();
+        crate::cpus::spawn(|| assert!(!replaying())).join().unwrap();
         drop(inner);
         assert!(replaying());
         drop(outer);
@@ -476,7 +476,7 @@ mod tests {
     fn loading_nests_and_is_every_threads() {
         let outer = Loading::start();
         let inner = Loading::start();
-        assert!(std::thread::spawn(loading).join().unwrap());
+        assert!(crate::cpus::spawn(loading).join().unwrap());
         drop(inner);
         assert!(loading());
         drop(outer);
@@ -709,7 +709,7 @@ mod propagation_tests {
         let deleted = Arc::new(AtomicBool::new(false));
         let deleter = {
             let (store, deleted) = (Arc::clone(&store), Arc::clone(&deleted));
-            std::thread::spawn(move || {
+            crate::cpus::spawn(move || {
                 assert!(delete_key_if_expired(&store, 0, "k"));
                 deleted.store(true, Ordering::SeqCst);
             })

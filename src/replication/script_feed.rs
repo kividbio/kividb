@@ -139,12 +139,52 @@ pub(crate) fn effects_take() -> Vec<Vec<Vec<u8>>> {
 ///
 /// `resp` is the reply the command just produced; the rewrites read the effect
 /// out of it (which members were popped, which ID was assigned).
+///
+/// Not inlined: a write's side effects call it only when the stream is
+/// read, and made a two-line wrapper (#901) it was inlined into them,
+/// which cost every `SET` 8 instructions more whether or not it ran.
+#[inline(never)]
 pub fn commands_for_propagation(
     ctx: &Ctx<'_>,
     name: &str,
     cmd: &[&[u8]],
     resp: &[u8],
 ) -> Vec<Vec<Vec<u8>>> {
+    rewritten_for_propagation(ctx, name, cmd, resp).unwrap_or_else(|| {
+        if cmd.is_empty() {
+            return Vec::new();
+        }
+        vec![cmd.iter().map(|b| b.to_vec()).collect()]
+    })
+}
+
+/// How many commands [`commands_for_propagation`] would give, for a write
+/// nothing reads (`replication::write_is_observed`): what it does to work
+/// them out is done all the same (the effects it takes are taken), but a
+/// command sent as it came is not copied only to be counted (#901).
+pub fn propagation_count(ctx: &Ctx<'_>, name: &str, cmd: &[&[u8]], resp: &[u8]) -> usize {
+    // What the commands scripts write most with always give, read without
+    // building it: `set_feed`, `setex_feed` one command; `expire_feed` one
+    // (a `PEXPIREAT` or a `DEL`) for a call answered 1 and none otherwise.
+    match name {
+        "SET" | "SETEX" | "PSETEX" => return 1,
+        "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => {
+            return usize::from(cmd.len() >= 3 && parse_resp_integer(resp) == Some(1));
+        }
+        _ => {}
+    }
+    rewritten_for_propagation(ctx, name, cmd, resp)
+        .map_or(usize::from(!cmd.is_empty()), |feeds| feeds.len())
+}
+
+/// [`commands_for_propagation`] for a command sent as something else than
+/// itself; `None` for one sent as it came.
+fn rewritten_for_propagation(
+    ctx: &Ctx<'_>,
+    name: &str,
+    cmd: &[&[u8]],
+    resp: &[u8],
+) -> Option<Vec<Vec<Vec<u8>>>> {
     // Upper case already, from every caller that runs commands; made so only
     // if it is not.
     let upper;
@@ -154,7 +194,7 @@ pub fn commands_for_propagation(
     } else {
         name
     };
-    match name {
+    Some(match name {
         "SPOP" => spop_feed(cmd, resp),
         "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => expire_feed(ctx, cmd, resp),
         // A TTL given as "this long from now" means something else to whoever
@@ -215,13 +255,8 @@ pub fn commands_for_propagation(
             blocking_pop_feed(name, cmd, resp)
         }
         "BRPOPLPUSH" => blocking_move_feed(cmd, resp, "RPOPLPUSH", 3),
-        _ => {
-            if cmd.is_empty() {
-                return Vec::new();
-            }
-            vec![cmd.iter().map(|b| b.to_vec()).collect()]
-        }
-    }
+        _ => return None,
+    })
 }
 
 /// Replace an auto-generated `XADD` ID (`*`, or `ms-*`) with the concrete ID the
@@ -1326,5 +1361,178 @@ mod tests {
                 b"KEEPTTL".to_vec()
             ]
         );
+    }
+
+    /// `ctx` for the rewrites that read the store: an empty one, as
+    /// `commands::blocking`'s tests make it.
+    fn with_ctx(test: impl FnOnce(&Ctx<'_>)) {
+        use crate::commands::ctx::NoopAofSender;
+        use std::sync::Arc;
+        let store = crate::store::new_store(1);
+        let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
+        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = Arc::new(crate::config::Config::default());
+        let started_at = std::time::Instant::now();
+        let index_store = crate::vector::new_index_store();
+        let dict_store = crate::vector::new_dict_store();
+        let wait_table = Arc::new(crate::wait_table::WaitTable::new());
+        let ts_index = crate::store::new_ts_index();
+        let pubsub = crate::pubsub::PubSubHub::new();
+        let repl_state = Arc::new(crate::replication::ReplState::new_master());
+        let acl_store = crate::acl::new_acl_store("");
+        let acl_log = crate::acl::new_acl_log();
+        let slowlog = crate::slowlog::new_slowlog(u64::MAX, 0);
+        let latency = crate::latency::new_latency_tracker();
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let cluster = Arc::new(crate::cluster::ClusterState::new_disabled());
+        let client_registry = crate::client_registry::new_client_registry();
+        let monitor_registry = crate::monitor::new_monitor_registry();
+        let tracking_table = crate::tracking::new_tracking_table();
+        let mut selected_db = 0usize;
+        let ctx = Ctx {
+            cmd: Vec::new(),
+            store: &store,
+            lastsave: &lastsave,
+            selected_db: &mut selected_db,
+            aof_tx: &NoopAofSender,
+            aof_enabled: false,
+            config: &config,
+            started_at: &started_at,
+            index_store: &index_store,
+            dict_store: &dict_store,
+            wait_table: &wait_table,
+            ts_index: &ts_index,
+            pubsub: &pubsub,
+            hub_tx: &hub_tx,
+            repl_state: &repl_state,
+            watch_registry: &crate::watch::NoopWatchRegistry,
+            client_id: 0,
+            client_registry: &client_registry,
+            resp: 2,
+            acl_store: &acl_store,
+            acl_log: &acl_log,
+            slowlog: &slowlog,
+            latency: &latency,
+            compaction_tx: &compaction_tx,
+            cluster: &cluster,
+            bypass_cluster_check: false,
+            apply_replication: false,
+            skip_write_side_effects: false,
+            peer_addr: "127.0.0.1:1",
+            monitor_registry: &monitor_registry,
+            authenticated_user: "default",
+            tracking_table: &tracking_table,
+            blocking: None,
+        };
+        test(&ctx);
+    }
+
+    /// `propagation_count` (which knows SET, SETEX, PSETEX and the EXPIRE
+    /// family without building their feeds, #901) gives what
+    /// `commands_for_propagation` builds, for every reply, arity, case and
+    /// option of those commands.
+    #[test]
+    fn propagation_count_is_the_number_of_commands_built() {
+        let mut commands: Vec<Vec<String>> = Vec::new();
+        let names = |name: &str| {
+            let mixed: String = name
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i % 2 == 0 {
+                        c.to_ascii_lowercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            vec![name.to_string(), name.to_ascii_lowercase(), mixed]
+        };
+        let times = [
+            vec![],
+            vec!["EX", "10"],
+            vec!["PX", "10000"],
+            vec!["EXAT", "4102444800"],
+            vec!["PXAT", "4102444800000"],
+            vec!["KEEPTTL"],
+            vec!["EX", "0"],
+            vec!["EX", "-5"],
+            vec!["EX", "x"],
+            vec!["EX", "10", "PX", "20"],
+        ];
+        let conditions = [
+            vec![],
+            vec!["NX"],
+            vec!["XX"],
+            vec!["IFEQ", "v"],
+            vec!["IFNE", "EX"],
+        ];
+        for name in names("SET") {
+            for time in &times {
+                for condition in &conditions {
+                    for get in [false, true] {
+                        let mut c = vec![name.clone(), "k".into(), "v".into()];
+                        c.extend(condition.iter().map(|s| s.to_string()));
+                        if get {
+                            c.push("GET".into());
+                        }
+                        c.extend(time.iter().map(|s| s.to_string()));
+                        commands.push(c);
+                    }
+                }
+            }
+            commands.push(vec![name.clone()]);
+            commands.push(vec![name.clone(), "k".into()]);
+        }
+        for name in names("SETEX").into_iter().chain(names("PSETEX")) {
+            for ttl in ["10", "0", "-1", "x"] {
+                commands.push(vec![name.clone(), "k".into(), ttl.into(), "v".into()]);
+            }
+            commands.push(vec![name.clone(), "k".into(), "10".into()]);
+            commands.push(vec![
+                name.clone(),
+                "k".into(),
+                "10".into(),
+                "v".into(),
+                "extra".into(),
+            ]);
+            commands.push(vec![name.clone()]);
+        }
+        for family in ["EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT"] {
+            for name in names(family) {
+                for ttl in ["10", "0", "-5", "4102444800", "x"] {
+                    commands.push(vec![name.clone(), "k".into(), ttl.into()]);
+                    for option in ["NX", "XX", "GT", "LT"] {
+                        commands.push(vec![name.clone(), "k".into(), ttl.into(), option.into()]);
+                    }
+                }
+                commands.push(vec![name.clone(), "k".into()]);
+                commands.push(vec![name.clone()]);
+            }
+        }
+        let replies: [&[u8]; 6] = [
+            b":0
+", b":1
+", b"+OK
+", b"$-1
+", b"$1
+v
+", b"-ERR x
+",
+        ];
+        with_ctx(|ctx| {
+            for c in &commands {
+                let parts: Vec<&[u8]> = c.iter().map(|s| s.as_bytes()).collect();
+                for resp in replies {
+                    assert_eq!(
+                        propagation_count(ctx, &c[0], &parts, resp),
+                        commands_for_propagation(ctx, &c[0], &parts, resp).len(),
+                        "{c:?} answered {}",
+                        String::from_utf8_lossy(resp)
+                    );
+                }
+            }
+        });
+        assert!(commands.len() > 400, "{}", commands.len());
     }
 }
