@@ -1180,6 +1180,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A script running beside others under its hash tags is refused
+  `MIGRATE` (#340).** With `lua-parallel-scripts`, such a script got no
+  hold on the keys it moved, so a write beside it to a key on the wire
+  could be lost when `MIGRATE` deleted it. It now fails with an error, as
+  `KEYS` does in such a script. A script that runs alone keeps `MIGRATE`
+  and its hold.
+
 - **`bind ::` and `bind ::1` start.** The address was joined to the port as
   `:::6379`, which is not one, and the server exited with "invalid socket
   address syntax" (the bus and TLS listeners too); only `[::]` worked. An IPv6

@@ -155,7 +155,19 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   than 0, scripts may select any database. To avoid it, send `SELECT N`
   once from a client at start-up, or use `lua-parallel-scripts no`.
 
-  These two are the only things a script may do without the setting that
+- **A script running beside others may not `MIGRATE`.** A `MIGRATE` holds
+  back writes to the keys it moves until they have left, and a script that
+  runs beside others cannot take that hold, so a write beside it could be
+  lost when the moved key was deleted. It fails instead:
+
+  ```
+  ERR Script attempted to run 'migrate' while running beside other scripts under the hash tag 'orders' of its KEYS (lua-parallel-scripts)
+  ```
+
+  A script that runs alone (its first run, or one whose `KEYS` carry no
+  hash tag) may `MIGRATE`, as before.
+
+  These three are the only things a script may do without the setting that
   it may not do with it.
 
 - **Such scripts run beside each other.** Two scripts that share no tag
