@@ -2260,12 +2260,27 @@ impl<A: Memory> CollectionTable<Fields, A> {
                 Some(false)
             }
             _ => {
-                // SAFETY: a live entry; its own bytes are copied into the new
-                // block before it is freed (the size changes, so it moves).
-                let old = unsafe { field_ref(entry) };
+                // The size changes: a new block, written from the old one,
+                // which is freed once nothing borrows it (not through
+                // `rewrite`, whose arguments would still borrow it).
                 let ttl = ttl.map(|deadline| (deadline, NOT_LISTED));
-                let moved = self.rewrite(found, old.field, old.value, ttl);
-                debug_assert!(moved);
+                let block = {
+                    // SAFETY: a live entry, not changed while `old` lives.
+                    let old = unsafe { field_ref(entry) };
+                    let size =
+                        field_header_for(old.field.len(), old.value.len(), ttl.is_some()).size();
+                    let block = self.new_block(size);
+                    // SAFETY: a new block of `size` bytes; the old entry's
+                    // bytes are elsewhere.
+                    unsafe { write_field_entry(block.as_ptr(), old.field, old.value, ttl) };
+                    block
+                };
+                // SAFETY: the found slot; the old entry is out of it, and
+                // freed with no borrow of it left.
+                unsafe {
+                    (*found.group).slots[found.slot] = block.as_ptr();
+                    self.free_element(entry);
+                }
                 self.after_write();
                 Some(true)
             }
@@ -2291,8 +2306,8 @@ impl<A: Memory> CollectionTable<Fields, A> {
     /// Write a found field's new value and TTL (deadline, list position):
     /// in place if the entry's size is the same (header and all: an equal
     /// size can be another shape), else in a new block. Whether it moved.
-    /// `field` and `value` may be the entry's own bytes only when the size
-    /// changes.
+    /// `field` and `value` are never the entry's own bytes: it may be freed
+    /// here.
     fn rewrite(
         &mut self,
         found: Found,
@@ -2306,7 +2321,7 @@ impl<A: Memory> CollectionTable<Fields, A> {
         let size = field_header_for(field.len(), value.len(), ttl.is_some()).size();
         if size == old_size {
             // SAFETY: the entry is `size` bytes, and `field`/`value` are not
-            // in it (see above).
+            // in it.
             unsafe { write_field_entry(old, field, value, ttl) };
             return false;
         }
