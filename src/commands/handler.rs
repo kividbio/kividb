@@ -1447,19 +1447,6 @@ fn make_room_or_refuse(ctx: &mut Ctx, in_order: bool, needs_room: bool) -> Optio
     None
 }
 
-/// What the arity check's cold path found: its refusal, or (empty) a
-/// command that allocates as much as its arguments say, whose room is made
-/// now ([`room_before_dispatch`]).
-#[cold]
-#[inline(never)]
-fn refused_or_room(ctx: &mut Ctx, name: &str, refusal: Vec<u8>) -> Option<Vec<u8>> {
-    if refusal.is_empty() {
-        room_before_dispatch(ctx, name)
-    } else {
-        Some(refusal)
-    }
-}
-
 /// For a command that allocates as much as its arguments say (`sketch::room`;
 /// the arity check's cold path finds it), under `maxmemory`: room made for
 /// what it wants before it takes its keys' order, in the gates in which
@@ -1514,10 +1501,14 @@ fn room_before_dispatch(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8> {
     // The wrong number of arguments is refused before anything else looks
     // at the command, as in Redis. See `arity`.
-    if let Some(refusal) = crate::commands::arity::check_dispatch(name, &ctx.cmd)
-        && let Some(reply) = refused_or_room(ctx, name, refusal)
-    {
-        return reply;
+    if let Some(refusal) = crate::commands::arity::check_dispatch(name, &ctx.cmd) {
+        // Empty: a command that allocates as much as its arguments say.
+        if !refusal.is_empty() {
+            return refusal;
+        }
+        if let Some(oom) = room_before_dispatch(ctx, name) {
+            return oom;
+        }
     }
 
     // [`ReplState::is_slave`] is a relaxed atomic load — avoid `role()` here (it allocates).
