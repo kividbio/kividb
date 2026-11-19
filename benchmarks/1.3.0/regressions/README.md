@@ -43,6 +43,7 @@ and why.
 | `27-ratelimit-restarted` | #894 | envoyproxy/ratelimit's checks (`INCRBY` + `EXPIRE` on two keys, four commands in one write, 65 connections with 2 ms of the limiter's own time after each) beside 100 connections of pipelined `INCRBY` + `EXPIRE` pairs at 0, 50k and 100k commands a second, on a server restarted from its own snapshot of 100,000 keys (KiviDB keeps the replication backlog then: `repl_backlog_active` is kept in the raw data); of the 4 vCPUs the server on 0 and 2 (`--threads 2`), the checks on 1, the load on 3: checks a second and their p99, every row gated; recorded on a D4s_v5 (`results/pr-894-d4s_v5`). Needs a C compiler (`lib/ratelimit_load.c`). The issue's own shape, with the clients on CPUs of their own up to 300k, needs 8 CPUs: run the suite's load by hand as the PR describes |
 | `24-snapshot-size` | #879 | `SAVE` of #879's dataset (`DEBUG POPULATE 6000000 k 150`) and of a collections mix (200,000 hashes of 10 fields, 50,000 each of sets, sorted sets and lists of 20), each twice: `-default` (the candidate as it starts, `rdbcompression no`) and `-yes` (the suite sets `CONFIG SET rdbcompression yes` on the candidate): the snapshot's size, the `SAVE` time (median of 3 after a warm-up) and the time a new server takes to load it (best of 2). Gates: `-yes` keeps 60 % of the size gain over v1.2.2 and #879's dataset within 1.5x of Redis's `dump.rdb`; `-default` within 1 % of v1.2.2's size; the save at most 2.5x v1.2.2's time, the load 1.5x |
 | `25-centrifuge-scripts-publish` | #900 | centrifuge v0.40.1's history scripts with the arguments its broker sends (30-day meta TTL), whose 2-3 keys carry no hash tag (each runs alone, on the script-runner thread): `EVALSHA` of `broker_history_list.lua` and `broker_history_add_list.lua` from 16 connections (`scripts`, the `lua,tls` builds); `PUBLISH` to 1,000 channels nobody subscribes to, beside 4 idle subscribers, from 1 connection and from 8, pipeline 16 (`publish`): calls a second counted by the server; a round with any error reply, or a history list of the wrong length, fails the suite. Gates: 10 % and at most 1.05x worse than v1.2.2 in the same session (for now 1.08x for the 8-connection `PUBLISH`, where master is behind v1.2.2 with matching compilers; to go back to 1.05x when that gap is fixed) |
+| `29-unpipelined-commands` | 1.3.0 regression, never released | an API gateway's per-request commands (Tyk's) sent one at a time from 64 connections (`redis-benchmark -c 64`, no `-P`), io_uring and Tokio, against `--threads 1` (`uring1`, `tokio1`) and `--threads 2` (`uring2`, `tokio2`): `SET` of 385 bytes, `GET`, `INCR`, `PTTL`, `PUBLISH` of 177 bytes to no subscriber, a second each from the server's own `total_commands_processed`; the server pinned to its first CPUs, the client to the next (at most 6). Gate: each rate at most 1.05x worse than v1.2.2 in the same session; a row where the client used 95 % of its CPUs is shown, not gated (on a `Standard_D4s_v5`, the two-worker rows); `min_cpus=4`: not run on a smaller machine |
 | `30-script-call-cost` | #901 | server CPU per call and calls a second of short scripts by `EVALSHA` (`redis-benchmark`, 32 connections, one KiviDB worker): Tyk's sliding-log limiter over 5,000 keys of 144 members, the compare-and-delete lock release of #880 on keys another owner holds, and `return 1`, each also with its keys under a hash tag. Needs a `lua,tls` candidate (`--candidate-full`, #921). Gates: CPU per call within 10 % of the recorded value and at most 0.93x v1.2.2's for Tyk, 1.03x for the others; calls a second 10 % |
 | `31-zset-memory` | #825, #297 (step 4) | `used_memory` per sorted-set member, 1,000,000 members in sets of 10, 100, 128, 129 and 1,000: 14-byte members (`membr:<i>`), scores whole (`int`) or with a fraction (`float`); `OBJECT ENCODING` of each size recorded exactly (`listpack` up to 128, `skiplist` past it); the large sets (129 and 1,000) as guard rows |
 | `33-ft-aggregate-groupby` | #761 | #761's 2,000,000 hashes (`name TEXT email TAG communityNumber NUMERIC age NUMERIC`, pipelines of 2,000): `FT.AGGREGATE userIdx * GROUPBY 1 @communityNumber REDUCE COUNT 0 AS n LIMIT 0 10`, the same with `REDUCE AVG 1 @age` and `SORTBY 2 @n DESC`, and the first over `@age:[20 40]`: median ms of 5 after a warm-up, and the reply's group total (exactly 1000); `used_memory` and RSS once loaded, the peak RSS (`VmHWM`) after the queries, and FT.INFO's memory parts as info rows. v1.2.2 and the candidate only: the VM image's Redis has no Query Engine |
@@ -467,6 +468,19 @@ if __name__ == "__main__":
   (`with Nodes(ctx) as ns: nodes = ns.cluster(3)`); `ctx.bin` is the engine's
   binary and `ctx.port`/`ctx.pid` are None. A suite that needs one more
   server beside run-all.sh's uses `ns.start()` the same way.
+- Record it (`--record`) unless every gate it emits is session-relative
+  (`vs_v1_2_2`, `vs_redis`, `info`): the release gate refuses a suite with no
+  rows in `baseline.json` (`scripts/release/regression_gate.py`, `unrecorded()`)
+  except such a session-only one (`session_only()`), which needs nothing
+  recorded. One row with a recorded gate (`rel`, `ratio`, `bound`) and the
+  suite must be recorded like any other. Recording freezes each gate as the
+  suite declared it then, so a suite that picks a row's gate at run time
+  (`29-unpipelined-commands`: client-limited rows are `info`) must stay
+  session-only. A run covers a session-only suite only if at least one of
+  its `vs_v1_2_2`/`vs_redis` gates passed and none was skipped (no v1.2.2 or
+  Redis value): rows that are all `info` judge nothing, and a session-only
+  suite no run judged is refused like an unrecorded one (`session_exempt()`).
+- State `threads=` on every `Config`.
 - Add its row to the table at the top and its numbers below.
 
 ## Recorded run, suites 01-04
@@ -1165,6 +1179,36 @@ pattern row against Redis's 1.35M and 0.9 ms. The channel row is a guard:
 the 4 Python readers are near their limit there, so it catches a loss, not
 a gain. #851's PR has the pinned measurements (server on 2 vCPUs, clients
 on the other 2, a Rust client), where the difference is larger.
+
+## Recorded run, suite 29
+
+Run 2026-11-19 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C) held to
+4 vCPUs (`taskset -c 0-3 run-all.sh --only 29`, so the suite sees what a
+`Standard_D4s_v5` gives it), default builds, rustc 1.100.0. Not recorded
+into `baseline.json`: every gate is against v1.2.2 in the same session, and
+the rows that are gated depend on the machine (see "client-limited" below).
+Runs: `s29-master-1-4cpu` (master `16da886f`, before the fix: `REGRESSED`,
+the five `uring1` rows), `s29-fin2-2-4cpu` and `s29-fin2-3-4cpu` (the fix:
+`ok` twice). A run takes about 17 minutes.
+
+| config | metric | v1.2.2 | master | fix (2 runs) |
+|---|---|---:|---:|---:|
+| uring1 | `GET` a second | 140,575 | 123,222 (1.14x worse) | 141,460 / 142,411 |
+| uring1 | `SET` a second | 138,398 | 125,494 (1.10x) | 140,410 / 140,455 |
+| uring1 | `INCR` a second | 142,126 | 129,305 (1.10x) | 142,186 / 141,634 |
+| uring1 | `PTTL` a second | 146,795 | 128,952 (1.14x) | 144,641 / 140,803 |
+| uring1 | `PUBLISH` a second | 146,000 | 131,320 (1.11x) | 142,371 / 145,229 |
+| tokio1 | `GET` a second | 109,109 | 107,966 | 107,964 / 107,981 |
+| uring2 | `GET` a second, client-limited | 164,597 | 165,644 | 164,035 / 164,161 |
+
+On 4 vCPUs the two-worker rows (`uring2`, `tokio2`) are client-limited:
+redis-benchmark's two CPUs run at 2.0 and the server's two at about 1.93,
+and master measured the same as v1.2.2 there, so they are shown, not
+gated. On 8 vCPUs (six client CPUs) they are gated, and there master ran
+9-10 % behind v1.2.2 as well (the PR's Go client: `GET` 216k against 238k).
+v1.2.2's own samples of a row on one worker spread by up to 7 % (the client
+shares the server's core), so a median 1.05x worse is the smallest loss the
+gate catches reliably; master's was 1.10-1.14x.
 
 ## Recorded run, suite 30
 
