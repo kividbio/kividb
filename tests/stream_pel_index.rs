@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // A consumer group's pending entries are indexed by consumer as well as by
 // ID (#637). Every command that adds, moves or removes a pending entry must
 // keep the two in step, and every path that copies or loads a group must

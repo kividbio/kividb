@@ -449,7 +449,7 @@ mod tests {
         let handles: Vec<_> = (0..8)
             .map(|t| {
                 let (a, b) = (Arc::clone(&a), Arc::clone(&b));
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     for i in 0..2000 {
                         let (x, y) = if t % 2 == 0 { (&a, &b) } else { (&b, &a) };
                         if t % 4 < 2 {

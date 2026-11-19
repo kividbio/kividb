@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/ts_default_policy.rs
 //
 // `ts-duplicate-policy`, the duplicate policy of a series made without one.

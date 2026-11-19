@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Integration tests for vector search and hash commands.
 // Each test spins up a KiviDB server on a random port, runs commands
 // via a raw TCP connection, and asserts the RESP responses.

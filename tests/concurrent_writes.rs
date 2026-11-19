@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/concurrent_writes.rs
 //
 // Writes to one key from many clients at once, with the AOF off and no

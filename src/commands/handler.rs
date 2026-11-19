@@ -776,9 +776,18 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     #[cfg(not(feature = "lua"))]
     let skip_mem = false;
 
+    // Whether the command writes, judged by its name and arguments, which it
+    // does not change: asked once here, it was asked five times a command
+    // (#901). A command that writes only with some arguments (GEORADIUS ...
+    // STORE, MIGRATE, ...) counts as a write (`command_mutates_for_replication`).
+    let inner_write = replication::command_mutates_for_replication(name2, ctx.cmd.as_slice());
+    // A `SELECT` is an inner write but changes no data (`writes_the_dataset`).
+    #[cfg_attr(not(feature = "lua"), allow(unused_variables))]
+    let writes_data = inner_write && replication::writes_the_dataset(name2, ctx.cmd.as_slice());
+
     if !repl_is_slave
         && check_memory_limit()
-        && replication::command_mutates_for_replication(name2, ctx.cmd.as_slice())
+        && inner_write
         && !crate::eviction::allowed_when_out_of_memory(name2)
         && !skip_mem
     {
@@ -832,7 +841,7 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     let started = std::time::Instant::now();
     // A write takes the keys it names that are past their time as gone,
     // and they go first, as from a client (`expire_named_keys_first`).
-    if replication::command_mutates_for_replication(name2, ctx.cmd.as_slice()) {
+    if inner_write {
         expire_named_keys_first(ctx, name2, None);
     }
     // What the command records of its effects is read below whether or not
@@ -847,16 +856,12 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // A command that writes only with some arguments (GEORADIUS ... STORE,
     // MIGRATE, ...) must count as a write here too, or a key it emptied is
     // not swept, a client blocked on a key it wrote is not woken, and a
-    // client tracking that key is not told. Judged by the arguments, as the
-    // propagation below judges it (`command_mutates_for_replication`).
-    let inner_write = replication::command_mutates_for_replication(name2, ctx.cmd.as_slice());
-    // A `SELECT` is an inner write but changes no data (`writes_the_dataset`):
-    // a script that has only selected a database can still be killed (#424).
+    // client tracking that key is not told (`inner_write`, judged by the
+    // arguments, as the propagation below judges it). A `SELECT` changes no
+    // data: a script that has only selected a database can still be killed
+    // (#424).
     #[cfg(feature = "lua")]
-    if !result.starts_with(b"-")
-        && inner_write
-        && replication::writes_the_dataset(name2, ctx.cmd.as_slice())
-    {
+    if !result.starts_with(b"-") && writes_data {
         crate::commands::lua::script_note_successful_write();
     }
 
@@ -889,23 +894,33 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         // Not a `SELECT`: a write carries the one it needs, from the database
         // it ran in, and a script that only selected one sent nothing in
         // Redis, whose offset it must not move (#705).
-        && replication::writes_the_dataset(name2, ctx.cmd.as_slice())
+        && writes_data
     {
-        let feeds = replication::script_feed::commands_for_propagation(
-            ctx,
-            name2,
-            ctx.cmd.as_slice(),
-            &result,
-        );
         // Same guard as `apply_write_side_effects`. `record_rdb_change` still runs
         // per feed regardless — it tracks dirty-key count for RDB save, which is
         // independent of whether anything consumes the replication stream.
-        let observed = replication::write_is_observed(ctx);
-        for parts in feeds {
-            if observed {
+        // With nothing to read them, the feeds are only counted, not built.
+        if replication::write_is_observed(ctx) {
+            let feeds = replication::script_feed::commands_for_propagation(
+                ctx,
+                name2,
+                ctx.cmd.as_slice(),
+                &result,
+            );
+            for parts in feeds {
                 replication::replicate_one_write(ctx, &parts);
+                crate::stats::record_rdb_change();
             }
-            crate::stats::record_rdb_change();
+        } else {
+            let feeds = replication::script_feed::propagation_count(
+                ctx,
+                name2,
+                ctx.cmd.as_slice(),
+                &result,
+            );
+            for _ in 0..feeds {
+                crate::stats::record_rdb_change();
+            }
         }
         // A write made from a script dirties a WATCH like any other write,
         // on the keys it changed.
@@ -1846,7 +1861,22 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     } else {
         (None, false)
     };
-    let result = match dispatch_command_handlers(ctx, name) {
+    // A script command is none of the handlers': each was asked, and every
+    // one of them said no, before it got to `lua::handle` (#901: 1,400
+    // instructions an `EVALSHA`). With Lua it goes there at once.
+    #[cfg(feature = "lua")]
+    let script = matches!(
+        name,
+        "EVALSHA" | "EVAL" | "EVALSHA_RO" | "EVAL_RO" | "FCALL" | "FCALL_RO"
+    );
+    #[cfg(not(feature = "lua"))]
+    let script = false;
+    let dispatched = if script {
+        None
+    } else {
+        dispatch_command_handlers(ctx, name)
+    };
+    let result = match dispatched {
         Some(result) => result,
         None => not_dispatched(ctx, name),
     };
@@ -2992,6 +3022,15 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
     // is no client a later read waits for (#42). What it pushes (`BLMOVE`'s
     // destination) its handler wakes, and that is waited for.
     let quiet = waiters && pops_blocking(name);
+    // One that took nothing — its time ran out, or `CLIENT UNBLOCK` ended
+    // it — left its keys as they were. Woken by it, the client at the head
+    // of the line would leave its wait only to find nothing and wait again,
+    // and not be listed as blocked meanwhile: a `CLIENT UNBLOCK` sent for
+    // it then was answered 0, and it stayed blocked.
+    // `XREADGROUP` waits otherwise, and is not told.
+    if quiet && crate::commands::blocking::took_nothing() && name != "XREADGROUP" {
+        return;
+    }
     for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
         let key = ctx.cmd[pos];
         if may_be_empty && drop_if_empty(ctx, db, key) {
