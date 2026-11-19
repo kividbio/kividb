@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 """Raw-RESP client for run.sh: load an index of hashes, or run search queries.
 
-  bench.py load <port> <docs> <ttl 0|1>
+  bench.py load <port> <docs> <ttl 0|1|h<pct>>
   bench.py run  <port> <queries> <kind>
+
+ttl: 0 no field TTL; 1 a far deadline on one field of every hash (nothing
+hidden); h<permille>, e.g. h900: the vector field of that many hashes in a
+thousand past its deadline and still stored (the sweep paused), so a KNN's
+nearest are mostly hidden from it (#670 item 3).
+
+The index is FLAT, or what $ALGO names (HNSW).
 
 Kinds: search-knn, search-filter-knn, search-tag, aggregate-knn,
 aggregate-filter-knn. No dependencies beyond the standard library.
 """
+import os
 import random
 import socket
 import struct
 import sys
+import time
 
 DIM = 8
 
@@ -71,9 +80,13 @@ def vec(rng):
 
 def load(port, docs, ttl):
     c = Conn(port)
+    hidden = 0
+    if ttl.startswith("h"):
+        hidden = int(ttl[1:])
+        c.cmd("DEBUG", "SET-ACTIVE-EXPIRE", "0")
     c.cmd("FT.CREATE", "idx", "ON", "HASH", "PREFIX", "1", "d:", "SCHEMA",
           "t", "TAG", "n", "NUMERIC",
-          "vec", "VECTOR", "FLAT", "6", "TYPE", "FLOAT32", "DIM", str(DIM),
+          "vec", "VECTOR", os.environ.get("ALGO", "FLAT"), "6", "TYPE", "FLOAT32", "DIM", str(DIM),
           "DISTANCE_METRIC", "L2")
     rng = random.Random(670)
     tags = ["red", "green", "blue"]
@@ -81,14 +94,19 @@ def load(port, docs, ttl):
     for i in range(docs):
         batch.append(["HSET", f"d:{i}", "t", tags[i % 3], "n", str(i),
                       "x", "extra", "vec", vec(rng)])
-        if ttl:
+        if ttl == "1":
             # a far deadline: the hash is a HashEx, and nothing expires
             batch.append(["HPEXPIRE", f"d:{i}", "36000000", "FIELDS", "1", "x"])
+        elif i % 1000 < hidden:
+            # the vector past its deadline at once
+            batch.append(["HPEXPIRE", f"d:{i}", "1", "FIELDS", "1", "vec"])
         if len(batch) >= 200:
             c.pipeline(batch)
             batch = []
     if batch:
         c.pipeline(batch)
+    if hidden:
+        time.sleep(0.1)
     print("loaded", docs, "ttl", ttl)
 
 
@@ -118,6 +136,6 @@ def run(port, queries, kind):
 if __name__ == "__main__":
     mode, port = sys.argv[1], int(sys.argv[2])
     if mode == "load":
-        load(port, int(sys.argv[3]), int(sys.argv[4]))
+        load(port, int(sys.argv[3]), sys.argv[4])
     else:
         run(port, int(sys.argv[3]), sys.argv[4])

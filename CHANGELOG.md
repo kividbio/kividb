@@ -1017,11 +1017,73 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `FT.AGGREGATE` with `*=>[KNN 10 @vec $q]` -3.5%, with a tag filter
   -2.8%; `FT.SEARCH` over a tag filter -1.2%, `KNN` with a filter -1.1%, an
   unfiltered `KNN` -0.5%; hashes with no field TTL within 0.2% either way.
-  The search of `FT.SEARCH` and hybrid `KNN` still asks the index for more
-  neighbours, up to the whole index, while hits are left out, and does not
-  stop at the query's `TIMEOUT` (#670).
+
+- **An unfiltered KNN whose nearest vectors are past their deadline stops at
+  the query's `TIMEOUT`, and no longer searches the whole index for more
+  (#670).** `FT.SEARCH` with `*=>[KNN ...]` and `FT.HYBRID`'s `VSIM ... KNN`
+  without a filter leave out a document whose vector field has passed its
+  deadline and ask the index for more, at least twice as many each round.
+  They went on until they had `k` or had asked for the whole index (an HNSW
+  search with that many candidates), and did not look at the clock. Now an
+  HNSW index is asked for at most one vector in 16 of what it holds, and a
+  FLAT one (whose every search measures every vector) once; after that every
+  vector is measured exactly, keeping the nearest few, four times as many
+  each pass, until `k` are shown. The deadline is checked before every round
+  and pass after the first search and every 1,024 documents a pass looks at;
+  `ON_TIMEOUT return` gives the shown ones found so far, nearest first.
+  Other KNN paths were already bounded: with a filter, `knn_planned` and the
+  exact filtered scan, and `FT.AGGREGATE`, which measures the rows its
+  filter left. On HNSW, 200,000 documents with 99% of the nearest hidden
+  (D4s_v5): 798 ms a query before, 425 after; `TIMEOUT 50` stops at 57 ms
+  (it was ignored); a writer's worst `HSET` during the query 813 ms before,
+  70 after. With no field TTL or nothing hidden, instructions a query do not
+  move (callgrind, 0.1%).
 
 ### Fixed
+
+- **A node met just before the whole cluster stops is still a member after
+  it starts again (#808).** Both ends of a `CLUSTER MEET` save the other
+  to `nodes.conf`, synced, before showing it as a member (the receiving
+  end before it answers): once the node that ran `CLUSTER MEET` lists the
+  new node without `handshake`, a cluster stopped whole, even killed,
+  keeps it, and the nodes that had not heard of it yet learn it again by
+  gossip. A node also saves its `nodes.conf` at the start of a shutdown
+  (`SIGTERM`, `SHUTDOWN`), and waits for that save. A node cannot join by
+  heartbeats alone: one no member has in its `nodes.conf` needs a new
+  `CLUSTER MEET`, as in Redis. See
+  [PERSISTENCE.md](docs/PERSISTENCE.md#the-clusters-nodesconf).
+
+- **`nodes.conf` is synced before it replaces the old one, and a file cut
+  short is refused (#808).** A save writes a temporary file beside it
+  (`nodes.conf.tmp-<n>`), syncs it, renames it into place and syncs the
+  directory, so a crash at any moment leaves the old file or the new one;
+  temporary files a crash left are removed at startup. A `nodes.conf` that
+  does not end with its `vars` line is refused at startup with the reason
+  (`... is unreadable: nodes.conf is incomplete ...`) and left as it is.
+  An empty one is refused as empty (`nodes.conf is empty`), unlike Redis,
+  which takes it for a new node: delete the file to start a node afresh. A
+  save that does not change the topology is skipped only when no other
+  save is still on its way to the file. A filesystem that cannot sync a
+  directory (`EINVAL`, `ENOTSUP`) is warned of once and does not fail the
+  save. The format is unchanged: files 1.2 wrote load, and 1.2 loads the
+  files this release writes.
+
+- **A vote is sent once it is saved, and a node met is a member once it is
+  saved (#808).** A node whose `nodes.conf` cannot be saved (a full or
+  read-only disk) casts no vote in that epoch, makes no node met a member
+  and does not answer its MEET; it logs the failure once, as an error,
+  until a save works again. The end that sent the MEET tries again, for up
+  to two minutes, and again when the other end calls on it within the hour
+  after. Nodes met at the same time (`redis-cli --cluster create` has every
+  node meet the first) are saved together, in one write. The vote is saved
+  off the cluster bus's thread, and a candidate counts a vote for as long
+  as its election lives: a voter on a slow disk answers once its vote is
+  saved. A replica that wins an election saves its promotion before it
+  announces it, waiting for the save up to a second; a promotion not
+  saved by then is announced all the same and saved in the background. A
+  save waits on two syncs (the file before its rename, the directory
+  after); see [PERSISTENCE.md](docs/PERSISTENCE.md#the-clusters-nodesconf)
+  for what failover needs of the disk.
 
 - **`MONITOR` no longer loses lines.** A monitor was fed through a ring of
   4,096 lines shared by all monitors, and one that fell that far behind
@@ -1127,6 +1189,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reach that limit. The same goes for the replies a blocking command
   writes before it waits; if that write fails, the client is closed at
   once, and what it pipelined after the blocking command is not run.
+
+- **A subscriber with messages unread that sends a pipeline no longer
+  hangs its connection under io_uring (#938).** A subscriber's messages
+  (and tracking's invalidations) are written by a task of their own, which
+  holds the connection's write lock while it waits for the client to make
+  room. The connection, with replies of its own to write, waited for that
+  lock without reading, so a client that sends a pipeline before it reads
+  anything (a subscriber with 6 MB of messages unread sending 1,000,000
+  `PING`s) and the server each waited for the other for good, as in #865.
+  The loop now reads the client while it waits for the lock too, under
+  the same `client-query-buffer-limit` and hard output limit; the flush
+  before a blocking command does the same. The tokio loop already read on
+  while it waited. With this, the io_uring loop sends a batch of replies
+  first without waiting in the kernel; only when the socket is full does it
+  write the rest while it reads the client, as since #865, so the next
+  request of a client that sends one command at a time is read on the next
+  turn, already there, rather than parked in the kernel beforehand.
 
 - **What a waiting client has read ahead and its unparsed buffer are held
   to `client-query-buffer-limit` together (#869).** What a client sent

@@ -23,7 +23,11 @@ was recorded on, and a candidate commit that is an ancestor of the judged
 commit with src/, Cargo.toml, Cargo.lock and rust-toolchain.toml unchanged
 since (the package version line aside) and the suite directory unchanged
 apart from added results/ directories. A suite with no rows in baseline.json
-fails the gate outright.
+fails the gate outright, unless every gate it emits is session-relative
+(vs_v1_2_2, vs_redis, info: session_only()), which needs nothing recorded.
+A run covers such a suite only if it passed at least one of its vs_v1_2_2 /
+vs_redis gates and skipped none (all-info rows judge nothing); one that no
+run judged is refused like an unrecorded suite.
 """
 import json
 import os
@@ -47,11 +51,85 @@ def suite_of(key):
     return key.split("/", 1)[0]
 
 
-def unrecorded(suites, baseline):
+# Gates judged within the run itself, against what it measured of another
+# engine in the same session: none of them reads a recorded value.
+SESSION_GATES = {"vs_v1_2_2", "vs_redis", "info"}
+
+
+def session_only(rows):
+    """Suites all of whose rows, in the runs judged (rejudge()'s rows), carry
+    only session-relative gates (SESSION_GATES). Such a suite needs nothing
+    recorded: every gate of its compares the candidate with v1.2.2 or Redis
+    measured in the same run. One row with another gate (rel, ratio, bound)
+    and the suite needs its recorded values like any other."""
+    kinds = {}
+    for r in rows:
+        ks = kinds.setdefault(suite_of(r["key"]), set())
+        gates = r.get("gates") or []
+        if not gates:
+            ks.add(None)
+        for g in gates:
+            ks.add((g.get("gate") or {}).get("kind"))
+    return {s for s, ks in kinds.items() if ks and ks <= SESSION_GATES}
+
+
+# The session gates that compare with another engine (info judges nothing).
+VS_GATES = SESSION_GATES - {"info"}
+
+
+def session_unjudged(rows, exempt):
+    """{suite: why} for the session-only suites (`exempt`, from
+    session_only()) that these rows, one run's, did not judge. A suite whose
+    rows are all `info` (suite 29 turns a client-limited row into info, and
+    emits only info below its CPUs), or whose vs_v1_2_2 / vs_redis gates were
+    skipped (no v1.2.2 or Redis value), would pass with no gate judged. A run
+    covers such a suite only if it passed at least one of its vs gates and
+    skipped none."""
+    passed, skipped, seen = set(), set(), set()
+    for r in rows:
+        s = suite_of(r["key"])
+        if s not in exempt:
+            continue
+        seen.add(s)
+        for g in r.get("gates") or []:
+            if (g.get("gate") or {}).get("kind") in VS_GATES:
+                if g.get("status") == "skip":
+                    skipped.add(s)
+                elif g.get("status") == "pass":
+                    passed.add(s)
+    out = {}
+    for s in sorted(seen):
+        if s in skipped:
+            out[s] = "a vs_v1_2_2/vs_redis gate was skipped (v1.2.2 or Redis not measured)"
+        elif s not in passed:
+            out[s] = "no vs_v1_2_2/vs_redis gate passed (every row was info)"
+    return out
+
+
+def session_exempt(runs):
+    """runs: {label: that run's rows (rejudge())}. -> (the session-only
+    suites at least one run judged, which need nothing recorded; {label:
+    {suite: why}} for runs that ran a session-only suite without judging it,
+    which do not cover it). A session-only suite no run judged is refused like
+    an unrecorded one."""
+    exempt = session_only([r for rows in runs.values() for r in rows])
+    unjudged = {}
+    judged = set()
+    for label, rows in runs.items():
+        u = session_unjudged(rows, exempt)
+        if u:
+            unjudged[label] = u
+        judged |= {suite_of(r["key"]) for r in rows if suite_of(r["key"]) in exempt} - set(u)
+    return judged, unjudged
+
+
+def unrecorded(suites, baseline, session=()):
     """Suites of the tree with no metric in baseline.json: nothing of theirs
-    can be judged (every gate would say "new"), so they cannot count."""
+    can be judged (every gate would say "new"), so they cannot count. A suite
+    whose gates are all session-relative (`session`, from session_only()) is
+    judged without recorded values and is not refused for having none."""
     have = {suite_of(k) for k in (baseline or {}).get("metrics", {})}
-    return sorted(s for s in suites if s not in have)
+    return sorted(s for s in suites if s not in have and s not in session)
 
 
 def rejudge(compare, env, results, baseline):
@@ -325,7 +403,7 @@ def main(argv):
             f.write(lines)
         return env, compare.load_results(rpath)
 
-    judged, envs = {}, []
+    judged, envs, run_rows = {}, [], {}
     for run in runs:
         try:
             env, results = raw_files(run)
@@ -334,11 +412,21 @@ def main(argv):
             continue
         envs.append(env)
         summ = rejudge(compare, env, results, baseline)
+        run_rows[run] = summ.get("rows") or []
         judged[run] = judge(env, summ, suites, code_reasons, baseline)
-    missing = unrecorded(suites, baseline)
+    exempt, unjudged = session_exempt(run_rows)
+    # A run covers a session-only suite only if it judged a gate of it.
+    for run, u in unjudged.items():
+        why, covers = judged[run]
+        judged[run] = (why, covers - set(u))
+    missing = unrecorded(suites, baseline, exempt)
     if missing:
         error("%s/baseline.json has no recorded values for: %s. A suite must be recorded (run-all.sh --record "
               "on the machine it declares) before a release can count it." % (base, ", ".join(missing)))
+        for run, u in sorted(unjudged.items()):
+            for s, w in sorted(u.items()):
+                if s in missing:
+                    say("  %s: %s has only session-relative gates, and this run judged none: %s" % (run, s, w))
         return 1
     used, uncovered = coverage(suites, judged)
     if not uncovered:
@@ -350,6 +438,8 @@ def main(argv):
             say("  %s: %s" % (run, "; ".join(why)))
         else:
             say("  %s: counts, for %d suites" % (run, len(covers)))
+        for s, w in sorted(unjudged.get(run, {}).items()):
+            say("  %s: does not cover %s (session-relative gates only): %s" % (run, s, w))
     need = needs(envs)
     named = ", ".join("%s (needs a %s-CPU run: run-all.sh --min-cpus-only)" % (s, need[s]) if s in need else s
                       for s in uncovered)
