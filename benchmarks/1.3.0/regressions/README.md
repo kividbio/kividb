@@ -252,6 +252,7 @@ was re-recorded for it:
 | `30-script-call-cost` | 1 | as before |
 | `21-list-memory` (all four configurations) | 4 | re-recorded in #940 with the candidate at its default of the day on 4 vCPUs (4 workers, after #903) |
 | `33-ft-aggregate-groupby` | 4 | as recorded (#944) |
+| `34-kong-ratelimit` | the server's pinned CPUs (4) | as suite `20`: the server is pinned to half the CPUs of a `Standard_D8s_v5` and gets `--threads` to match |
 | `32-default-threads` | 0 (none) | measures the default on purpose |
 
 Redis ignores the count. The default itself is watched by
