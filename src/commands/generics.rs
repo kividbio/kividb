@@ -219,6 +219,13 @@ fn sort_patterns<'a>(cmd: &'a [&'a [u8]]) -> impl Iterator<Item = &'a [u8]> + 'a
 /// whatever the element (`{q}:w_*`, `{q}:obj:*->w`). Otherwise the element
 /// decides the key, and so the tag. String keys count as hashes do: a read
 /// of one outside the tag is as much outside it as a `GET` of it would be.
+/// Whether `SORT` or `SORT_RO` `cmd` reads keys it does not name: it has a
+/// `BY` or `GET` pattern with a `*` (`tag_locks::walks`).
+#[cfg(feature = "lua")]
+pub(crate) fn sort_reads_keys_it_does_not_name(cmd: &[&[u8]]) -> bool {
+    sort_pattern_outside(cmd, |_| false).is_some()
+}
+
 pub(crate) fn sort_pattern_outside<'a>(
     cmd: &'a [&'a [u8]],
     may_touch: impl Fn(&[u8]) -> bool,

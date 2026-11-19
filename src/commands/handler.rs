@@ -476,17 +476,30 @@ fn writes_several_keys(name: &str, cmd: &[&[u8]]) -> bool {
 /// while the AOF is replayed, where nothing else runs.
 #[inline(always)]
 fn takes_the_gate_alone(name: &str, cmd: &[&[u8]], script_alone: bool, gated: bool) -> bool {
+    gate_alone_rule(name, cmd, script_alone, gated, true)
+}
+
+/// [`takes_the_gate_alone`], with or without its look at the commands that
+/// read keys they do not name (`readers`): `gate_alone_or_walk` asks the
+/// rest of it alone.
+#[inline(always)]
+fn gate_alone_rule(
+    name: &str,
+    cmd: &[&[u8]],
+    script_alone: bool,
+    gated: bool,
+    readers: bool,
+) -> bool {
     script_alone
         || (gated
             && matches!(name, "FLUSHALL" | "FLUSHDB" | "SWAPDB")
             && !crate::expiry::replaying())
-        // With Lua, `KEYS` and `SCAN` keep the scripts that run beside
-        // others out instead (`run_command`, `tag_locks::walk`, #772). A
-        // build without Lua runs no script beside others, and they take the
-        // gate alone there as before, should tag locks be switched on.
-        || (crate::tag_locks::enabled()
-            && crate::tag_locks::sees_the_whole_keyspace(name)
-            && !(cfg!(feature = "lua") && crate::tag_locks::walks_the_keyspace(name)))
+        // A command that reads or changes keys it does not name, with tag
+        // locks on: alone, or, with Lua, the readers beside every command but
+        // the scripts that run beside others (`gate_alone_or_walk`, #772).
+        || (readers
+            && crate::tag_locks::enabled()
+            && crate::tag_locks::reads_keys_it_does_not_name(name))
         || crate::tag_locks::is_switch(name, cmd)
         // One argument is at most one key (`DEL k`, `INCR k`): asked here,
         // and the rest out of line, so that what every command runs through
@@ -1652,7 +1665,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     };
     // A command that changes keys it does not name must not find a script
     // part-way through: it waits for all of them (`takes_the_gate_alone`);
-    // one that only reads them keeps the scripts out while it runs, below.
+    // one that only reads them keeps such scripts out while it runs, below.
     // On a thread that holds the gate already, what either takes of it is
     // nothing: the replica's applier holds it for each turn of its master's
     // stream, alone for a command that takes it alone
@@ -1662,6 +1675,29 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     if gated && !crate::write_gate::held_by_this_thread() {
         crate::pause::test_stall_before_the_gate(ctx.cmd.as_slice());
     }
+    //
+    // With Lua, a command that reads keys it does not name (`KEYS`, `SCAN`,
+    // `INFO`, `FT.SEARCH`, ...) holds the gate shared and keeps out the
+    // scripts that run beside others while it reads, and nothing else
+    // (`gate_alone_or_walk`, `tag_locks::walk`, #772): only it, and the
+    // commands that take the gate alone, come that way.
+    #[cfg(feature = "lua")]
+    let (_command_gate, _alone, _walk) = if crate::command_gate::skips(name, &ctx.cmd) {
+        (None, None, None)
+    } else if takes_the_gate_alone(name, &ctx.cmd, any_script && !beside_others, gated) {
+        let Some(gates) =
+            gate_alone_or_walk(name, &ctx.cmd, any_script && !beside_others, gated, SLICE)
+        else {
+            return busy_reply();
+        };
+        gates
+    } else {
+        let Some(gate) = crate::command_gate::enter_unless(SLICE, overrun) else {
+            return busy_reply();
+        };
+        (Some(gate), None, None)
+    };
+    #[cfg(not(feature = "lua"))]
     let gates = if crate::command_gate::skips(name, &ctx.cmd) {
         Some((None, None))
     } else if takes_the_gate_alone(name, &ctx.cmd, any_script && !beside_others, gated) {
@@ -1669,20 +1705,9 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     } else {
         crate::command_gate::enter_unless(SLICE, overrun).map(|gate| (Some(gate), None))
     };
+    #[cfg(not(feature = "lua"))]
     let Some((_command_gate, _alone)) = gates else {
         return busy_reply();
-    };
-    // A walk of the keyspace (`KEYS`, `SCAN`) and the
-    // scripts that run beside others keep each other out, and nothing else:
-    // a walk finds every such script's keys as they were before it or as
-    // they are after it (`tag_locks::walk`, #772). Before the write gate,
-    // for a script: a walk may enter it. Not on a thread that holds the gate
-    // alone, where nothing else runs.
-    #[cfg(feature = "lua")]
-    let _walk = if tag_locks && (beside_others || crate::tag_locks::walks_the_keyspace(name)) {
-        walks_and_scripts_kept_apart(beside_others)
-    } else {
-        None
     };
 
     // A write under a script or an `EXEC` that already holds the gate is part
@@ -1917,30 +1942,59 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
 /// What a walk of the keyspace, or a script that runs beside others, holds
 /// to keep the other out (see `tag_locks::walk`). Out of line: only those
 /// come here.
+/// What a command holds of the command gate, shared or alone, and, for
+/// one that reads keys it does not name, of the walk locks
+/// (`tag_locks::walk`, a flag of a byte where none is held).
 #[cfg(feature = "lua")]
-enum WalkOrScript {
-    Walk {
-        _held: crate::tag_locks::Walk,
-    },
-    Script {
-        _held: crate::tag_locks::WalksKeptOut,
-    },
-}
+type Gates = (
+    Option<crate::command_gate::Guard>,
+    Option<crate::command_gate::AloneGuard>,
+    Option<crate::tag_locks::Walk>,
+);
 
+/// The gates of a command [`takes_the_gate_alone`] says takes the gate
+/// alone. One that only reads keys it does not name, and that nothing else
+/// makes take it alone, takes the walk locks instead, before the command
+/// gate (as a script that runs beside others takes its own, before its
+/// command), and the gate shared: what it reads is found with no such script
+/// part-way through, and every other command runs beside it. Out of line:
+/// only the commands that take the gate alone come here.
 #[cfg(feature = "lua")]
 #[inline(never)]
-fn walks_and_scripts_kept_apart(beside_others: bool) -> Option<WalkOrScript> {
-    if crate::command_gate::alone_on_this_thread() {
-        None
-    } else if beside_others {
-        Some(WalkOrScript::Script {
-            _held: crate::tag_locks::keep_walks_out(),
-        })
-    } else {
-        Some(WalkOrScript::Walk {
-            _held: crate::tag_locks::walk(),
-        })
+fn gate_alone_or_walk(
+    name: &str,
+    cmd: &[&[u8]],
+    script_alone: bool,
+    gated: bool,
+    slice: std::time::Duration,
+) -> Option<Gates> {
+    let overrun = crate::commands::lua::running_script_is_over_its_time_limit;
+    // What takes the gate alone whatever it reads: as before.
+    let alone = gate_alone_rule(name, cmd, script_alone, gated, false)
+        || (crate::tag_locks::enabled()
+            && crate::tag_locks::sees_the_whole_keyspace(name)
+            && !crate::tag_locks::walks(name, cmd));
+    let walks = !alone
+        && crate::tag_locks::enabled()
+        && crate::tag_locks::reads_keys_it_does_not_name(name)
+        && !crate::command_gate::alone_on_this_thread()
+        && match name {
+            // By its patterns.
+            "SORT" | "SORT_RO" => crate::commands::generics::sort_reads_keys_it_does_not_name(cmd),
+            _ => crate::tag_locks::walks(name, cmd),
+        };
+    if !alone && !walks {
+        // A reader of keys it names after all (`MEMORY USAGE`, `CLUSTER
+        // NODES`, `SORT` by nothing): as any command.
+        return crate::command_gate::enter_unless(slice, overrun)
+            .map(|gate| (Some(gate), None, None));
     }
+    if walks {
+        let walk = crate::tag_locks::walk();
+        return crate::command_gate::enter_unless(slice, overrun)
+            .map(|gate| (Some(gate), None, Some(walk)));
+    }
+    crate::command_gate::enter_alone_unless(slice, overrun).map(|alone| (None, Some(alone), None))
 }
 
 /// The command to the clients in `MONITOR`, unless it is resuming or is an

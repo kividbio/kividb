@@ -340,7 +340,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are after it, as in Redis. A script that finds a walk under way waits
   for it asleep, off its thread; one that finds walk after walk stops
   waiting after three and holds the walks after it back, so a loop of
-  `SCAN`s cannot keep scripts out. `DBSIZE`, `RANDOMKEY`, the flushes,
+  `SCAN`s cannot keep scripts out. A script that runs beside other work is
+  seen whole or not at all, the same way, by the other commands that read
+  keys they do not name: `INFO`, `MEMORY STATS` and `MEMORY DOCTOR`,
+  `FT.SEARCH`, `FT.AGGREGATE`, `FT.HYBRID`, `FT.CURSOR`, `FT.PROFILE`,
+  `FT.INFO`, `FT.TAGVALS`, `FT.SPELLCHECK`, `SORT` and `SORT_RO` with a `BY`
+  or `GET` pattern, `TS.MGET`, `TS.MRANGE`, `TS.MREVRANGE`,
+  `TS.QUERYINDEX`, `TS.QUERYLABELS`, and `CLUSTER COUNTKEYSINSLOT` and
+  `GETKEYSINSLOT`. Commands that are neither scripts nor such readers do
+  not touch these locks. `DBSIZE`, `RANDOMKEY`, the flushes,
   `SWAPDB`, transactions and scripts that run alone take the gate alone as
   before (`DBSIZE` and `RANDOMKEY` are quick, and the gate alone also makes
   them come after the whole of what is in flight, such as active expiry

@@ -179,8 +179,14 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   wait for every running script, and hold back every other command while
   they run.
 
-- **A walk of the keyspace waits for the scripts running beside others,
-  and only for them.** `KEYS` and `SCAN` wait for
+- **A command that reads keys it does not name waits for the scripts
+  running beside others, and only for them.** `KEYS`, `SCAN`, `INFO`,
+  `MEMORY STATS`/`DOCTOR`, the searches of an index (`FT.SEARCH`,
+  `FT.AGGREGATE`, `FT.HYBRID`, `FT.CURSOR`, `FT.PROFILE`, `FT.INFO`,
+  `FT.TAGVALS`, `FT.SPELLCHECK`), `SORT` by a `BY` or `GET` pattern, the
+  label queries of time series (`TS.MGET`, `TS.MRANGE`, `TS.MREVRANGE`,
+  `TS.QUERYINDEX`, `TS.QUERYLABELS`) and `CLUSTER COUNTKEYSINSLOT`/
+  `GETKEYSINSLOT` wait for
   every script that is running beside others, and keep new ones from
   starting until they are done; they run beside every other command, and
   beside each other, as with `lua-parallel-scripts no`. So a reply of

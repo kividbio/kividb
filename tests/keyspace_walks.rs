@@ -105,6 +105,7 @@ impl Conn {
 struct Server {
     port: u16,
     child: Child,
+    dir: std::path::PathBuf,
 }
 
 /// How long a script is held where it calls `ECHO script-stall:...`.
@@ -112,7 +113,22 @@ const STALL_MS: u64 = 800;
 
 impl Server {
     fn start(io: &str, threads: u32) -> Self {
+        Self::start_in(io, threads, &[], |_| {})
+    }
+
+    fn start_with(io: &str, threads: u32, extra: &[&str]) -> Self {
+        Self::start_in(io, threads, extra, |_| {})
+    }
+
+    /// In a directory of its own, `prepare`d before the server starts.
+    fn start_in(
+        io: &str,
+        threads: u32,
+        extra: &[&str],
+        prepare: impl FnOnce(&std::path::Path),
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
+        prepare(&dir);
         let (child, port) = start_verified(|port| {
             let log = std::fs::OpenOptions::new()
                 .create(true)
@@ -136,13 +152,14 @@ impl Server {
                     "--lua-parallel-scripts",
                     "true",
                 ])
+                .args(extra)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(log)
                 .spawn()
                 .expect("could not start kividb")
         });
-        let server = Server { port, child };
+        let server = Server { port, child, dir };
         assert_eq!(server.conn().cmd(&["PING"]), V::Str("PONG".into()));
         server
     }
@@ -445,4 +462,287 @@ fn walks_and_scripts_at_once_tokio() {
 #[test]
 fn walks_and_scripts_at_once_uring() {
     walks_and_scripts_at_once("uring");
+}
+
+// ── Commands that read keys they do not name ────────────────────────────────
+
+/// Writes three keys of `{t}` (a hash an index covers, a string a `SORT`
+/// pattern reads, a time series with a label), is held when `ARGV[1]` says
+/// so, and writes three more like them. Before a run on an empty tag none of
+/// the six is there; after it, all six. Three exist only part-way through.
+const THREE_THEN_THREE: &str = "\
+    redis.call('HSET', KEYS[1], 'f', 'hello') \
+    redis.call('SET', KEYS[2], 'x') \
+    redis.call('TS.ADD', KEYS[3], 1, 1, 'LABELS', 'grp', 'w772') \
+    redis.call('ECHO', ARGV[1]) \
+    redis.call('HSET', KEYS[4], 'f', 'hello') \
+    redis.call('SET', KEYS[5], 'y') \
+    redis.call('TS.ADD', KEYS[6], 1, 1, 'LABELS', 'grp', 'w772') \
+    return 1";
+
+const SIX: [&str; 6] = [
+    "{t}:doc1", "{t}:v_1", "{t}:ts1", "{t}:doc2", "{t}:v_2", "{t}:ts2",
+];
+
+fn run_six(c: &mut Conn, sha: &str, hold: bool) -> V {
+    let mut args = vec!["EVALSHA", sha, "6"];
+    args.extend(SIX);
+    args.push(if hold { "script-stall:1" } else { "no-stall" });
+    c.cmd(&args)
+}
+
+fn delete_six(c: &mut Conn) {
+    let mut del = vec!["DEL"];
+    del.extend(SIX);
+    c.cmd(&del);
+}
+
+/// Loads the script and runs it quickly a few times, leaving the tag empty:
+/// from then on it runs beside others.
+fn quick_six(c: &mut Conn) -> String {
+    let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", THREE_THEN_THREE]) else {
+        panic!("no digest")
+    };
+    for _ in 0..3 {
+        assert_eq!(run_six(c, &sha, false), V::Int(1));
+        delete_six(c);
+    }
+    sha
+}
+
+fn held_six(server: &Server, sha: &str) -> std::thread::JoinHandle<V> {
+    let mut c = server.conn();
+    let mut args = vec!["EVALSHA", sha, "6"];
+    args.extend(SIX);
+    args.push("script-stall:1");
+    c.send(&args);
+    let handle = std::thread::spawn(move || c.read());
+    std::thread::sleep(Duration::from_millis(150));
+    handle
+}
+
+fn count(reply: &V) -> usize {
+    match reply {
+        V::Arr(items) => items.len(),
+        other => panic!("not an array: {other:?}"),
+    }
+}
+
+/// What a reader found while the script was held: its name, and whether it
+/// was the state before the run or after it (`None`: neither).
+type Seen = (&'static str, Option<&'static str>);
+
+/// Every reader of keys it does not name, started while a script that runs
+/// beside others is held between its first three writes and its last
+/// three, finds the six keys all there or none there: `INFO keyspace`,
+/// `DBSIZE`, `FT.SEARCH`, `FT.AGGREGATE`, `FT.INFO`, `SORT` with a `GET`
+/// pattern, `TS.MGET`, `TS.MRANGE`, `TS.MREVRANGE`, `TS.QUERYINDEX`. The
+/// readers are sent from connections on threads not busy with the script.
+fn readers_see_a_script_whole_or_not_at_all(io: &str) {
+    let server = Server::start(io, 4);
+    let mut c = server.conn();
+    assert_eq!(
+        c.cmd(&[
+            "FT.CREATE",
+            "idx772",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "{t}:doc",
+            "SCHEMA",
+            "f",
+            "TEXT"
+        ]),
+        V::Str("OK".into())
+    );
+    assert_eq!(c.cmd(&["RPUSH", "plainlist", "1", "2"]), V::Int(2));
+    let sha = quick_six(&mut c);
+    let base = 1; // plainlist
+    let script = held_six(&server, &sha);
+
+    let readers: Vec<std::thread::JoinHandle<Seen>> = (0..10)
+        .map(|kind| {
+            let mut r = free_conn(&server);
+            std::thread::spawn(move || {
+                let whole = |n: usize, none: usize, all: usize| match n {
+                    n if n == none => Some("before"),
+                    n if n == all => Some("after"),
+                    _ => None,
+                };
+                match kind {
+                    0 => {
+                        let V::Str(text) = r.cmd(&["INFO", "keyspace"]) else {
+                            panic!("INFO")
+                        };
+                        let keys: usize = text
+                            .split("keys=")
+                            .nth(1)
+                            .and_then(|rest| rest.split(',').next())
+                            .and_then(|n| n.parse().ok())
+                            .unwrap_or(0);
+                        ("INFO keyspace", whole(keys, base, base + 6))
+                    }
+                    1 => {
+                        // `MEMORY STATS` counts bytes, not keys: `DBSIZE`,
+                        // which takes the gate alone, stands in.
+                        let V::Int(keys) = r.cmd(&["DBSIZE"]) else {
+                            panic!("DBSIZE")
+                        };
+                        ("DBSIZE", whole(keys as usize, base, base + 6))
+                    }
+                    2 => {
+                        let reply = r.cmd(&["FT.SEARCH", "idx772", "hello", "NOCONTENT"]);
+                        let V::Arr(items) = &reply else {
+                            panic!("FT.SEARCH {reply:?}")
+                        };
+                        let V::Int(total) = items[0] else {
+                            panic!("total")
+                        };
+                        ("FT.SEARCH", whole(total as usize, 0, 2))
+                    }
+                    3 => {
+                        let reply = r.cmd(&["FT.AGGREGATE", "idx772", "hello"]);
+                        let V::Arr(items) = &reply else {
+                            panic!("FT.AGGREGATE {reply:?}")
+                        };
+                        ("FT.AGGREGATE", whole(items.len() - 1, 0, 2))
+                    }
+                    4 => {
+                        let reply = r.cmd(&["FT.INFO", "idx772"]);
+                        let V::Arr(items) = &reply else {
+                            panic!("FT.INFO {reply:?}")
+                        };
+                        let at = items
+                            .iter()
+                            .position(|item| *item == V::Str("num_docs".into()))
+                            .expect("num_docs");
+                        let docs: usize = match &items[at + 1] {
+                            V::Int(n) => *n as usize,
+                            V::Str(n) => n.parse().unwrap(),
+                            other => panic!("num_docs {other:?}"),
+                        };
+                        ("FT.INFO num_docs", whole(docs, 0, 2))
+                    }
+                    5 => {
+                        let reply = r.cmd(&["SORT", "plainlist", "BY", "nosort", "GET", "{t}:v_*"]);
+                        let seen = match reply {
+                            V::Arr(items) if items == [V::Nil, V::Nil] => Some("before"),
+                            V::Arr(items) if items == [V::Str("x".into()), V::Str("y".into())] => {
+                                Some("after")
+                            }
+                            _ => None,
+                        };
+                        ("SORT ... GET", seen)
+                    }
+                    6 => (
+                        "TS.MGET",
+                        whole(count(&r.cmd(&["TS.MGET", "FILTER", "grp=w772"])), 0, 2),
+                    ),
+                    7 => (
+                        "TS.MRANGE",
+                        whole(
+                            count(&r.cmd(&["TS.MRANGE", "-", "+", "FILTER", "grp=w772"])),
+                            0,
+                            2,
+                        ),
+                    ),
+                    8 => (
+                        "TS.MREVRANGE",
+                        whole(
+                            count(&r.cmd(&["TS.MREVRANGE", "-", "+", "FILTER", "grp=w772"])),
+                            0,
+                            2,
+                        ),
+                    ),
+                    _ => (
+                        "TS.QUERYINDEX",
+                        whole(count(&r.cmd(&["TS.QUERYINDEX", "grp=w772"])), 0, 2),
+                    ),
+                }
+            })
+        })
+        .collect();
+    let seen: Vec<Seen> = readers.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(script.join().unwrap(), V::Int(1));
+    let half: Vec<&str> = seen
+        .iter()
+        .filter(|(_, whole)| whole.is_none())
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(
+        half.is_empty(),
+        "saw the script part-way through: {half:?} ({seen:?})"
+    );
+}
+
+#[test]
+fn readers_see_a_script_whole_or_not_at_all_tokio() {
+    readers_see_a_script_whole_or_not_at_all("tokio");
+}
+
+#[test]
+fn readers_see_a_script_whole_or_not_at_all_uring() {
+    readers_see_a_script_whole_or_not_at_all("uring");
+}
+
+/// On a cluster node, `CLUSTER COUNTKEYSINSLOT` and `CLUSTER GETKEYSINSLOT`
+/// of the script's slot find its keys all there or none there.
+#[test]
+fn a_slot_is_counted_with_a_script_whole_or_not_at_all() {
+    let server = Server::start_with("uring", 4, &["--cluster-enabled", "yes"]);
+    let mut c = server.conn();
+    assert_eq!(
+        c.cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]),
+        V::Str("OK".into())
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while c.cmd(&["SET", "{t}:probe", "1"]) != V::Str("OK".into()) {
+        assert!(Instant::now() < deadline, "the slots did not come up");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    c.cmd(&["DEL", "{t}:probe"]);
+    let V::Int(slot) = c.cmd(&["CLUSTER", "KEYSLOT", "{t}"]) else {
+        panic!("KEYSLOT")
+    };
+    let slot = slot.to_string();
+    // Its keys are of one tag, and so of one slot: the index and the time
+    // series are not needed here; the hashes and strings are written.
+    let sha = quick_six(&mut c);
+    let script = held_six(&server, &sha);
+    let mut r = free_conn(&server);
+    let counted = r.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]);
+    let mut r2 = free_conn(&server);
+    let listed = count(&r2.cmd(&["CLUSTER", "GETKEYSINSLOT", &slot, "100"]));
+    assert_eq!(script.join().unwrap(), V::Int(1));
+    assert!(
+        counted == V::Int(0) || counted == V::Int(6),
+        "COUNTKEYSINSLOT found {counted:?}"
+    );
+    assert!(listed == 0 || listed == 6, "GETKEYSINSLOT found {listed}");
+}
+
+/// A snapshot taken while a script runs beside others holds the script
+/// whole or not at all: `SAVE` cuts between whole writes, and a script is
+/// one of them (it holds the write gate for its whole run).
+#[test]
+fn a_snapshot_holds_a_script_whole_or_not_at_all() {
+    let server = Server::start("uring", 4);
+    let mut c = server.conn();
+    let sha = quick_six(&mut c);
+    let script = held_six(&server, &sha);
+    let mut s = free_conn(&server);
+    assert_eq!(s.cmd(&["SAVE"]), V::Str("OK".into()));
+    assert_eq!(script.join().unwrap(), V::Int(1));
+    // The snapshot, loaded by a server of its own.
+    let dump = std::fs::read(server.dir.join("dump.kdb")).expect("dump.kdb");
+    let other = Server::start_in("uring", 4, &[], |dir| {
+        std::fs::write(dir.join("dump.kdb"), &dump).unwrap()
+    });
+    let mut o = other.conn();
+    let keys = o.cmd(&["DBSIZE"]);
+    assert!(
+        keys == V::Int(0) || keys == V::Int(6),
+        "the snapshot holds {keys:?} keys"
+    );
 }

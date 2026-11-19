@@ -461,9 +461,15 @@ pub(crate) async fn run_lua_vm_blocking(
             // and not inside the command (#772).
             crate::tag_locks::walks_done().await;
             crate::tag_locks::allow_next_script();
-            let (resp, sel_out, elapsed_us) = ran_quick(key, sel, || {
-                env.run_execute_borrowed(cmd.to_vec(), sel, aof_enabled, client_resp)
-            });
+            let (resp, sel_out, elapsed_us) = {
+                // A walk that started since is waited for here, on the
+                // thread: one at most. Before the command, as a walk takes
+                // its locks before the command gate.
+                let _walks_out = crate::tag_locks::keep_walks_out();
+                ran_quick(key, sel, || {
+                    env.run_execute_borrowed(cmd.to_vec(), sel, aof_enabled, client_resp)
+                })
+            };
             // Not left for another script if this one was turned away
             // before it got as far as asking.
             crate::tag_locks::take_next_script_allowed();

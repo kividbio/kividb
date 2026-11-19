@@ -36,9 +36,10 @@
 // * A command that changes keys it does not name — `FLUSHALL`, `FLUSHDB`,
 //   `SWAPDB` — takes the gate alone, which waits for every script (a script
 //   holds the gate as a command for as long as it runs). One that only reads
-//   them by walking it — `KEYS`, `SCAN` — keeps the scripts that run beside
-//   others out while it runs, and nothing else (`walk`, #772); `DBSIZE` and
-//   `RANDOMKEY` take the gate alone.
+//   them — `KEYS`, `SCAN`, `INFO`, a search of an index, `SORT` by a pattern
+//   — keeps the scripts that run beside others out while it runs, and
+//   nothing else (`walks`, `walk`, #772); `DBSIZE` and `RANDOMKEY` take the
+//   gate alone.
 //
 // The locks are stripes: a fixed table indexed by a hash of the tag. Two
 // tags that land on one stripe wait for each other when they need not, and
@@ -731,7 +732,7 @@ pub fn try_lock_keys<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Option<TriedKe
 /// Commands that read or change keys they do not name: refused to a script
 /// held to its tags. With tag locks on, the ones that change them take the
 /// command gate alone, and the ones that only read them keep the scripts
-/// that run beside others out ([`walks_the_keyspace`]): either way, no script
+/// that run beside others out ([`walks`]): either way, no script
 /// is part-way through while one runs.
 pub fn sees_the_whole_keyspace(name: &str) -> bool {
     matches!(
@@ -740,26 +741,84 @@ pub fn sees_the_whole_keyspace(name: &str) -> bool {
     )
 }
 
-/// The commands of [`sees_the_whole_keyspace`] that walk it: `KEYS` and
-/// `SCAN`. With tag locks on (in a build with Lua) they do not take the
-/// command gate alone, which stopped every connection for as long as one
-/// ran (a `KEYS` of two million keys, ~280 ms, #772): they keep the scripts
-/// that run beside others out for that long instead ([`walk`]), and run
-/// beside every other command and each other, as they do with tag locks
-/// off. A script that runs alone, a transaction and a write of several keys
-/// hold the gate alone, which a walk holds shared: they are kept out as
-/// before.
-///
-/// `DBSIZE` and `RANDOMKEY` still take the gate alone. They are quick, and
-/// the gate alone also waits for what is in flight, as a command in Redis
-/// comes after the whole of the one before it: active expiry removing a
-/// large key is seen whole, its `expired_keys` and its `LATENCY` event
-/// with it, by a `DBSIZE` that no longer counts the key (Redis's
-/// `unit/latency-monitor` asks that). The flushes and `SWAPDB` write, and
-/// take the gate alone.
+/// Whether `name` is a command that reads, or may read, keys it does not
+/// name: those of [`sees_the_whole_keyspace`], and the ones that read the
+/// keyspace through something else — an index (`FT.*`), the labels of time
+/// series (`TS.M*`, `TS.QUERY*`), a slot (`CLUSTER`), counts over keys
+/// (`INFO`, `MEMORY`) or patterns (`SORT`). Every command with no key in
+/// the key table, and every one whose keys there do not cover what it
+/// reads, was looked at for this list. One match on the name, on the way
+/// of every command with tag locks on; which of them keep scripts out
+/// ([`walks`]) is asked of them only.
 #[inline]
-pub fn walks_the_keyspace(name: &str) -> bool {
-    matches!(name, "KEYS" | "SCAN")
+pub fn reads_keys_it_does_not_name(name: &str) -> bool {
+    // A build without Lua runs no script beside others: the commands of
+    // `sees_the_whole_keyspace` there, as before.
+    if !cfg!(feature = "lua") {
+        return sees_the_whole_keyspace(name);
+    }
+    matches!(
+        name,
+        "KEYS"
+            | "SCAN"
+            | "DBSIZE"
+            | "RANDOMKEY"
+            | "FLUSHALL"
+            | "FLUSHDB"
+            | "SWAPDB"
+            | "INFO"
+            | "MEMORY"
+            | "CLUSTER"
+            | "SORT"
+            | "SORT_RO"
+            | "FT.SEARCH"
+            | "FT.AGGREGATE"
+            | "FT.HYBRID"
+            | "FT.CURSOR"
+            | "FT.PROFILE"
+            | "FT.INFO"
+            | "FT.TAGVALS"
+            | "FT.SPELLCHECK"
+            | "TS.MGET"
+            | "TS.MRANGE"
+            | "TS.MREVRANGE"
+            | "TS.QUERYINDEX"
+            | "TS.QUERYLABELS"
+    )
+}
+
+/// Of [`reads_keys_it_does_not_name`], the commands that keep the scripts
+/// that run beside others out while they read ([`walk`]), and run beside
+/// every other command and each other: `cmd` finds every such script's
+/// keys as they were before it or as they are after it, never between, as
+/// in Redis, where a script is one step. They took the command gate alone
+/// (`KEYS`, `SCAN`), which stopped every connection for as long as one ran
+/// (a `KEYS` of two million keys, ~280 ms, #772), or nothing at all.
+///
+/// Not `DBSIZE` and `RANDOMKEY`, which take the gate alone as before. They
+/// are quick, and the gate alone also waits for what is in flight, as a
+/// command in Redis comes after the whole of the one before it: active
+/// expiry removing a large key is then seen whole by a `DBSIZE` that no
+/// longer counts the key, its `expired_keys` and its `LATENCY` event with
+/// it (Redis's `unit/latency-monitor` waits for `DBSIZE` 0 and then asks
+/// for the event). Nor the flushes and `SWAPDB`, which write. `SORT` only
+/// with a `BY` or `GET` pattern that names keys; `MEMORY` and `CLUSTER`
+/// only for the subcommands that count or list keys.
+#[cfg(feature = "lua")]
+#[cold]
+pub fn walks(name: &str, cmd: &[&[u8]]) -> bool {
+    let sub = |names: &[&[u8]]| {
+        cmd.get(1)
+            .is_some_and(|sub| names.iter().any(|name| sub.eq_ignore_ascii_case(name)))
+    };
+    match name {
+        "DBSIZE" | "RANDOMKEY" | "FLUSHALL" | "FLUSHDB" | "SWAPDB" => false,
+        "MEMORY" => sub(&[b"STATS", b"DOCTOR"]),
+        "CLUSTER" => sub(&[b"COUNTKEYSINSLOT", b"GETKEYSINSLOT"]),
+        // By its patterns, which the command path asks of it itself.
+        "SORT" | "SORT_RO" => false,
+        _ => true,
+    }
 }
 
 /// The locks a walk of the keyspace ([`walk`]) and the scripts that run
@@ -806,10 +865,12 @@ pub struct WalksKeptOut {
 
 /// For a script about to run beside others: wait for the walks of the
 /// keyspace under way, if any, and keep new ones out until the script is
-/// done. Taken after the command gate and before the write gate and the
-/// tags' locks, and let go of after them: a walk takes it after the
-/// command gate too, and may enter the write gate inside it (to remove a key
-/// it finds past its time).
+/// done. Taken before the script's command, and so before the command
+/// gate, the write gate and the tags' locks, and let go of after them, as a
+/// walk takes its locks before the command gate: a script waiting here for
+/// a walk holds nothing the walk, or anything the walk waits for, wants.
+/// Nothing else takes it: a command that is neither a script nor a walk
+/// pays nothing for it.
 #[cfg(feature = "lua")]
 #[inline]
 pub fn keep_walks_out() -> WalksKeptOut {
@@ -823,7 +884,7 @@ pub fn keep_walks_out() -> WalksKeptOut {
     }
 }
 
-/// Held by a walk of the keyspace ([`walks_the_keyspace`]) for as long as
+/// Held by a walk of the keyspace ([`walks`]) for as long as
 /// it runs: no script runs beside others meanwhile.
 #[cfg(feature = "lua")]
 pub struct Walk {
