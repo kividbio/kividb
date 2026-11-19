@@ -134,8 +134,13 @@ class Config:
     def __init__(self, name, io="auto", threads=None, engines=ENGINES, full_only=False, self_hosted=False,
                  lua=False):
         if not isinstance(threads, int) or threads < 0:
-            raise ValueError("Config(%r): state threads=N, the --threads its values were recorded with "
-                             "(0 = the server's default, only for a suite that measures the default)" % name)
+            raise ValueError(
+                "Config(%r) has no threads=. Add threads=N to it: N is the KiviDB --threads its baseline "
+                "values were recorded with (the 'Worker threads' line of the candidate's server log in "
+                "results/<label>/raw.tar.gz; before #903 the default on 4 vCPUs was 2, after it one per CPU), "
+                "e.g. Config(%r, threads=2). threads=0 (no --threads, the server's default) is only for a "
+                "suite that measures the default itself (32-default-threads). See README 'Thread counts'."
+                % (name, name))
         self.name, self.io, self.threads = name, io, threads
         self.engines, self.full_only = tuple(engines), full_only
         self.self_hosted, self.lua = self_hosted, lua
