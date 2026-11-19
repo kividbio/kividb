@@ -755,9 +755,7 @@ fn lock_unless_a_script_has_them(
                     .iter()
                     .copied()
                     .filter(|&other| {
-                        other == stripe
-                            || mine.contains(&other)
-                            || script_has_the_turn(other)
+                        other == stripe || mine.contains(&other) || script_has_the_turn(other)
                     })
                     .collect();
                 busy.dedup();

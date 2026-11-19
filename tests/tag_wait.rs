@@ -173,7 +173,10 @@ impl Server {
     fn wait_until_held(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !self.holding() {
-            assert!(Instant::now() < deadline, "the script never got to its stall");
+            assert!(
+                Instant::now() < deadline,
+                "the script never got to its stall"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }

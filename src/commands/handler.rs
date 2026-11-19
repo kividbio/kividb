@@ -2012,7 +2012,8 @@ fn lock_tags_found(
     let tried = crate::tag_locks::try_lock_found_keys(
         keys,
         &ctx.cmd,
-        mine.as_ref().map_or(&[][..], crate::tag_locks::TagTurns::stripes),
+        mine.as_ref()
+            .map_or(&[][..], crate::tag_locks::TagTurns::stripes),
     );
     drop(mine);
     tried.map_err(|busy| crate::commands::blocking::hold_for_tags(ctx, busy))
