@@ -11965,8 +11965,8 @@
           "speed": false
         },
         {
-          "kind": "ratio",
-          "keep": 0.6,
+          "kind": "vs_v1_2_2",
+          "max_x": 0.5,
           "speed": false
         }
       ]
@@ -11995,8 +11995,8 @@
           "speed": false
         },
         {
-          "kind": "ratio",
-          "keep": 0.6,
+          "kind": "vs_v1_2_2",
+          "max_x": 0.5,
           "speed": false
         }
       ]

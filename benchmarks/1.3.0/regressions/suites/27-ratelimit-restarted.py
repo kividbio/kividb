@@ -43,7 +43,7 @@ message of its own): `redis-benchmark -t set -d 100 -r 100000 -c 50
 
 Gates: checks a second 10 % and at most 1.05x worse than Redis this session;
 the p99 is scheduling on a shared VM (jitter): 100 % or 0.5 ms, and with
-background load, 60 % of the gain over v1.2.2 kept. Recorded on a D4s_v5
+background load at most half of v1.2.2's in the same session. Recorded on a D4s_v5
 (rustc 1.100.0 builds), checks a second and p99, v1.2.2 / the change /
 Redis: 31.0k 0.30 ms / 31.2k 0.22 ms / 31.2k 0.52 ms at 0; 30.6k 1.56 ms /
 31.6k 0.15 ms / 31.9k 0.08 ms at 50,000; 27.8k 6.1 ms / 31.4k 0.19 ms /
@@ -59,7 +59,8 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from suite import (Suite, Config, THROUGHPUT, KEEP_IMPROVEMENT, rel, vs_redis, jitter, median)  # noqa: E402
+from suite import (Suite, Config, THROUGHPUT, KEEP_IMPROVEMENT, rel, vs_redis, vs_v1_2_2, jitter,  # noqa: E402
+                   median)
 from nodes import Nodes, redis_tool  # noqa: E402
 
 S = Suite("27-ratelimit-restarted", [Config("t2", threads=2, self_hosted=True)])
@@ -163,7 +164,11 @@ def run(ctx):
             ctx.emit("checks_per_s_" + k, median([f["ops"] for f in fgs]), "checks/s", "higher",
                      gate=[THROUGHPUT, vs_redis(1.05)], samples=[f["ops"] for f in fgs])
             p99 = [f["p99_us"] / 1e3 for f in fgs]
-            gates = [rel(100, abs=0.5)] + ([KEEP_IMPROVEMENT] if rate else [])
+            # With background load, at most half of v1.2.2's p99 in the same session.
+            # Not a share of the gain over v1.2.2 as recorded: v1.2.2's own p99 here
+            # is the jitter of a starved hub (6.1 ms recorded on a D4s_v5, 1.6-2.3 ms
+            # on a D8s_v5), and master failed that gate in 3 of 3 runs (#950).
+            gates = [rel(100, abs=0.5)] + ([vs_v1_2_2(0.5)] if rate else [])
             ctx.emit("p99_ms_" + k, median(p99), "ms", "lower", gate=jitter(gates), samples=p99)
         ctx.raw["rounds"] = rounds
         client_cpus = ",".join(map(str, fg_cpus + bg_cpus))
