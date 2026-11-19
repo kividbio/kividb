@@ -2,8 +2,9 @@
 //! forms:
 //!
 //! - **Packed.** Elements end to end in chunks of up to
-//!   [`packed_list::CHUNK_ENTRIES`] ([`PackedList`]): four bytes an element
-//!   besides its own, and one allocation a chunk. Every new list is packed.
+//!   [`packed_list::CHUNK_ENTRIES`] ([`PackedList`]): two bytes an element
+//!   besides its own (four for one of 128 bytes or more), and one
+//!   allocation a chunk. Every new list is packed.
 //! - **Plain.** Each element a block of its own (`Arc<[u8]>`) in a
 //!   `VecDeque`, as every list was before. A list becomes plain the first
 //!   time an element longer than [`packed_list::MAX_LEN`] is pushed, set or
@@ -783,7 +784,8 @@ mod tests {
         assert!(list.is_packed());
         assert_eq!(list.free_effort(), 1000usize.div_ceil(CHUNK_ENTRIES));
         // Exactly the frames, and the deque of chunks.
-        let frames: usize = elements.iter().map(|e| e.len() + 4).sum();
+        // Elements of 16 bytes: one byte of length on each side.
+        let frames: usize = elements.iter().map(|e| e.len() + 2).sum();
         let bytes = list.packed_bytes().unwrap();
         assert!(
             bytes >= frames && bytes <= frames + 64 * 32,
@@ -834,7 +836,7 @@ mod tests {
                 assert_same(&front, &model_front, &format!("front {start} {n}"));
                 // Exact buffers for a batch that fills its chunks.
                 if start == 0 && n == 64 {
-                    let frames: usize = batch.iter().map(|e| e.len() + 4).sum();
+                    let frames: usize = batch.iter().map(|e| e.len() + 2).sum();
                     assert_eq!(back.packed_bytes(), Some(frames));
                     assert_eq!(front.packed_bytes(), Some(frames));
                 }
