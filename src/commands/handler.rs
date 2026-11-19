@@ -1830,14 +1830,6 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     {
         return resp_error(replication::NOREPLICAS);
     }
-    // While the AOF cannot be written, what would be logged is refused, as
-    // Redis refuses it (`MISCONF`). One relaxed load a command otherwise.
-    if crate::aof::write_failing()
-        && let Some(refusal) =
-            crate::aof::refusal_while_failing(ctx.cmd.as_slice(), name, ctx.apply_replication)
-    {
-        return refusal;
-    }
     // `LOADING` is for clients. A command arriving from the master's stream
     // (or from AOF replay) has to be applied regardless: refusing it does not
     // make the master retry, it just drops the write, and the replica quietly
@@ -1926,6 +1918,17 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     let writes_operation = replication::command_mutates_for_replication(name, &ctx.cmd);
     let script = matches!(name, "EVAL" | "EVALSHA" | "FCALL");
     let gated = (writes_operation && name != "MIGRATE" && name != "FT.DROPINDEX") || script;
+
+    // While the AOF cannot be written, what would be logged is refused, as
+    // Redis refuses it (`MISCONF`): a write, or a script that may make some.
+    // One relaxed load a write otherwise; none for a read.
+    if (writes_operation || script)
+        && crate::aof::write_failing()
+        && let Some(refusal) =
+            crate::aof::refusal_while_failing(ctx.cmd.as_slice(), name, ctx.apply_replication)
+    {
+        return refusal;
+    }
 
     // The first `SELECT` of a database other than 0 switches every write to
     // carrying a `SELECT` of its own, and has to wait out the writes on
