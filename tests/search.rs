@@ -4636,3 +4636,184 @@ fn a_grouped_aggregation_reports_the_number_of_groups() {
 
     c.cmd(&["FT.DROPINDEX", "gtot", "DD"]);
 }
+
+/// An aggregation over hashes that begins with a `GROUPBY` whose reducers
+/// keep a running value groups the documents as it reads them, without
+/// making each one a row first (#761). What it answers is what grouping the
+/// rows answers: the same query with an `APPLY` ahead of its `GROUPBY`,
+/// which keeps the rows, gives the same reply, for hashes and hashes with
+/// fields that have a TTL (and JSON documents, still grouped from their
+/// rows), with reducers that keep a running value and some that do not,
+/// and the steps after the `GROUPBY`.
+#[test]
+fn a_groupby_read_document_by_document_answers_as_grouping_rows_does() {
+    let mut c = conn();
+    let hash = [
+        "FT.CREATE",
+        "gstr",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "gstr:",
+        "SCHEMA",
+        "g",
+        "NUMERIC",
+        "h",
+        "TAG",
+        "n",
+        "NUMERIC",
+        "t",
+        "TEXT",
+    ];
+    assert!(c.cmd(&hash).ok());
+    let json = [
+        "FT.CREATE",
+        "gstj",
+        "ON",
+        "JSON",
+        "PREFIX",
+        "1",
+        "gstj:",
+        "SCHEMA",
+        "$.g",
+        "AS",
+        "g",
+        "NUMERIC",
+        "$.h",
+        "AS",
+        "h",
+        "TAG",
+        "$.n",
+        "AS",
+        "n",
+        "NUMERIC",
+        "$.t",
+        "AS",
+        "t",
+        "TEXT",
+    ];
+    assert!(c.cmd(&json).ok());
+    for i in 0..400 {
+        let (g, h, n) = (
+            (i % 7).to_string(),
+            ["a", "b", ""][i % 3],
+            format!("{}.{}", i % 13, i % 4),
+        );
+        let key = format!("gstr:{i}");
+        let mut args = vec!["HSET", &key, "g", &g, "h", h, "n", &n, "t", "some words"];
+        let m = ((i * 31) % 17).to_string();
+        if !i.is_multiple_of(5) {
+            args.extend_from_slice(&["m", &m]);
+        }
+        if i.is_multiple_of(11) {
+            args.extend_from_slice(&["n", "not a number"]);
+        }
+        c.cmd(&args);
+        // Fields with a TTL: one far off, one that has passed.
+        if i.is_multiple_of(9) {
+            c.cmd(&["HPEXPIRE", &key, "100000", "FIELDS", "1", "h"]);
+        }
+        if i.is_multiple_of(23) {
+            c.cmd(&["HPEXPIRE", &key, "1", "FIELDS", "1", "g"]);
+        }
+        let doc = if !i.is_multiple_of(5) {
+            format!(
+                r#"{{"g":{g},"h":"{h}","n":{},"m":{m},"t":"some words"}}"#,
+                i % 13
+            )
+        } else {
+            format!(r#"{{"g":{g},"h":"{h}","n":"{n}","t":"some words"}}"#)
+        };
+        c.cmd(&["JSON.SET", &format!("gstj:{i}"), "$", &doc]);
+    }
+    thread::sleep(Duration::from_millis(50));
+    let tails: &[&[&str]] = &[
+        &["GROUPBY", "1", "@g", "REDUCE", "COUNT", "0", "AS", "c"],
+        &[
+            "GROUPBY", "2", "@g", "@h", "REDUCE", "SUM", "1", "@n", "AS", "s", "REDUCE", "AVG",
+            "1", "@n", "AS", "a", "REDUCE", "MIN", "1", "@m", "AS", "lo", "REDUCE", "MAX", "1",
+            "@m",
+        ],
+        &[
+            "GROUPBY",
+            "1",
+            "@h",
+            "REDUCE",
+            "COUNT_DISTINCT",
+            "1",
+            "@m",
+            "AS",
+            "d",
+            "REDUCE",
+            "TOLIST",
+            "1",
+            "@g",
+            "AS",
+            "l",
+            "REDUCE",
+            "STDDEV",
+            "1",
+            "@n",
+            "REDUCE",
+            "QUANTILE",
+            "2",
+            "@m",
+            "0.5",
+            "AS",
+            "q",
+        ],
+        &[
+            "GROUPBY", "1", "@__key", "REDUCE", "COUNT", "0", "LIMIT", "0", "5",
+        ],
+        &[
+            "GROUPBY", "1", "@g", "REDUCE", "SUM", "1", "@m", "AS", "s", "SORTBY", "2", "@s",
+            "DESC", "LIMIT", "1", "3",
+        ],
+        &[
+            "GROUPBY", "1", "@g", "REDUCE", "SUM", "1", "@m", "AS", "s", "FILTER", "@s>200",
+        ],
+        &[
+            "GROUPBY", "1", "@h", "REDUCE", "COUNT", "0", "AS", "c", "GROUPBY", "1", "@c",
+            "REDUCE", "COUNT", "0", "AS", "cc",
+        ],
+        &[
+            "GROUPBY",
+            "1",
+            "@g",
+            "REDUCE",
+            "COUNT",
+            "0",
+            "AS",
+            "c",
+            "WITHCURSOR",
+            "COUNT",
+            "2",
+        ],
+    ];
+    let mut c3 = conn();
+    assert!(matches!(c3.cmd(&["HELLO", "3"]), V::Map(_)));
+    for index in ["gstr", "gstj"] {
+        for query in ["*", "@t:words"] {
+            for tail in tails {
+                let mut streamed = vec!["FT.AGGREGATE", index, query];
+                streamed.extend_from_slice(tail);
+                let mut rows = vec!["FT.AGGREGATE", index, query, "APPLY", "1", "AS", "zz"];
+                rows.extend_from_slice(tail);
+                for c in [&mut c, &mut c3] {
+                    let (a, b) = (c.cmd(&streamed), c.cmd(&rows));
+                    // A cursor's id differs; its first page does not.
+                    let (a, b) = if tail.contains(&"WITHCURSOR") {
+                        (a.arr()[0].clone(), b.arr()[0].clone())
+                    } else {
+                        (a, b)
+                    };
+                    assert_eq!(a, b, "{index} {query} {tail:?}");
+                    assert!(!matches!(a, V::Err(_)), "{a:?}");
+                }
+            }
+        }
+    }
+    c.cmd(&["FT.DROPINDEX", "gstr", "DD"]);
+    c.cmd(&["FT.DROPINDEX", "gstj", "DD"]);
+}

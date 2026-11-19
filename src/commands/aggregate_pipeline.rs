@@ -195,15 +195,28 @@ pub fn run_within(
 /// (Redis's total then depends on how many rows it read before the page was
 /// full, and is not the same under RESP2 and RESP3).
 pub fn run_counted(
-    mut rows: Vec<Row>,
+    rows: Vec<Row>,
     cmd: &[&[u8]],
     start_idx: usize,
     deadline: Option<std::time::Instant>,
 ) -> (Vec<Row>, bool, Option<usize>) {
+    run_from(rows, cmd, start_idx, deadline, false, None)
+}
+
+/// [`run_counted`] from `cmd[start_idx]` on, given what the steps before
+/// it left: whether they were cut short (`cut`: only `LIMIT` runs then) and
+/// the number of groups the last `GROUPBY` made. [`StreamGroups`] ran a
+/// query's first `GROUPBY` with the scan; the steps after it start here.
+pub fn run_from(
+    mut rows: Vec<Row>,
+    cmd: &[&[u8]],
+    start_idx: usize,
+    deadline: Option<std::time::Instant>,
+    mut cut: bool,
+    mut groups: Option<usize>,
+) -> (Vec<Row>, bool, Option<usize>) {
     use crate::commands::search::{deadline_due, no_time_for};
     let mut i = start_idx;
-    let mut cut = false;
-    let mut groups: Option<usize> = None;
 
     while i < cmd.len() {
         let clause = match std::str::from_utf8(cmd[i]) {
@@ -423,14 +436,24 @@ pub fn run_counted(
 // Extracted as its own function to keep `run` readable. Returns the
 // post-clause cursor index and the new rows.
 
-fn run_groupby(
-    rows: Vec<Row>,
-    cmd: &[&[u8]],
-    start: usize,
-    deadline: Option<std::time::Instant>,
-    cut: &mut bool,
-) -> (usize, Vec<Row>) {
-    use crate::commands::search::{DEADLINE_EVERY, deadline_due, past_deadline};
+/// One `REDUCE` of a `GROUPBY`.
+#[derive(Debug)]
+struct Reducer {
+    func: String,
+    args: Vec<String>,
+    alias: String,
+}
+
+impl Reducer {
+    /// The field the reducer reads (its first argument), or "".
+    fn field(&self) -> &str {
+        self.args.first().map(String::as_str).unwrap_or("")
+    }
+}
+
+/// The `GROUPBY` at `cmd[start]`: where it ends, the properties it groups
+/// by, and its reducers.
+fn parse_groupby(cmd: &[&[u8]], start: usize) -> (usize, Vec<String>, Vec<Reducer>) {
     let mut i = start + 1; // skip GROUPBY
 
     let nargs = cmd
@@ -446,13 +469,6 @@ fn run_groupby(
             group_props.push(prop.trim_start_matches('@').to_string());
         }
         i += 1;
-    }
-
-    #[derive(Debug)]
-    struct Reducer {
-        func: String,
-        args: Vec<String>,
-        alias: String,
     }
 
     let mut reducers: Vec<Reducer> = Vec::new();
@@ -510,6 +526,18 @@ fn run_groupby(
 
         reducers.push(Reducer { func, args, alias });
     }
+    (i, group_props, reducers)
+}
+
+fn run_groupby(
+    rows: Vec<Row>,
+    cmd: &[&[u8]],
+    start: usize,
+    deadline: Option<std::time::Instant>,
+    cut: &mut bool,
+) -> (usize, Vec<Row>) {
+    use crate::commands::search::{DEADLINE_EVERY, deadline_due, past_deadline};
+    let (i, group_props, reducers) = parse_groupby(cmd, start);
 
     // The rows of each group, groups in the order they first appear.
     let mut index: ahash::AHashMap<Vec<String>, usize> = ahash::AHashMap::new();
@@ -560,6 +588,245 @@ fn run_groupby(
     }
 
     (i, new_rows)
+}
+
+// ── GROUPBY as the documents are read ───────────────────────────────────────
+//
+// Steps that begin with a GROUPBY whose reducers each keep a running value
+// (COUNT, SUM, AVG, MIN, MAX, COUNT_DISTINCT) have no use for the rows of
+// the documents: each document goes into its group as the scan reads it,
+// and is never a row. A row is a map of every field of the document, each
+// name and value a string of its own: on #761's 2,000,000 documents of four
+// fields, some 14 million allocations and over a gigabyte held until the
+// GROUPBY made its 1,000 groups of them.
+//
+// The groups, their order (that in which they first appear) and every
+// reducer's value are those `run_groupby` makes of the same documents in
+// the same order: the values a document is read for are those its row would
+// hold, and sums are added up in the same order.
+
+/// A reducer's value so far, in a group.
+#[derive(Debug)]
+enum Running {
+    Count,
+    /// The sum of the values that read as numbers: SUM, and AVG, which
+    /// divides it by the group's documents, as `reduce` does.
+    Sum(f64),
+    Avg(f64),
+    Min(Option<f64>),
+    Max(Option<f64>),
+    /// The distinct values, a missing one as "".
+    Distinct(ahash::AHashSet<Box<str>>),
+}
+
+impl Running {
+    /// What a reducer of `func` starts from, if it can run as documents
+    /// are read.
+    fn new(func: &str) -> Option<Self> {
+        Some(match func {
+            "COUNT" => Running::Count,
+            // `Iterator::sum` of f64 starts from -0.0, as `reduce` adds up.
+            "SUM" => Running::Sum(-0.0),
+            "AVG" => Running::Avg(-0.0),
+            "MIN" => Running::Min(None),
+            "MAX" => Running::Max(None),
+            "COUNT_DISTINCT" | "COUNT_DISTINCTISH" => Running::Distinct(Default::default()),
+            _ => return None,
+        })
+    }
+
+    #[inline]
+    fn add(&mut self, value: Option<&str>) {
+        let number = || value.and_then(|v| v.parse::<f64>().ok());
+        match self {
+            Running::Count => {}
+            Running::Sum(sum) | Running::Avg(sum) => {
+                if let Some(n) = number() {
+                    *sum += n;
+                }
+            }
+            // As `Iterator::min_by` keeps the first of equal values and
+            // `max_by` the last.
+            Running::Min(least) => {
+                if let Some(n) = number()
+                    && least.is_none_or(|l| n.total_cmp(&l).is_lt())
+                {
+                    *least = Some(n);
+                }
+            }
+            Running::Max(most) => {
+                if let Some(n) = number()
+                    && most.is_none_or(|m| n.total_cmp(&m).is_ge())
+                {
+                    *most = Some(n);
+                }
+            }
+            Running::Distinct(seen) => {
+                let value = value.unwrap_or("");
+                if !seen.contains(value) {
+                    seen.insert(value.into());
+                }
+            }
+        }
+    }
+
+    /// The reducer's value for a group of `members` documents.
+    fn value(self, members: usize) -> String {
+        use crate::commands::vector::format_f64;
+        match self {
+            Running::Count => members.to_string(),
+            Running::Sum(sum) => format_f64(sum),
+            Running::Avg(sum) => format_f64(sum / members as f64),
+            Running::Min(n) | Running::Max(n) => n.map_or("0".to_string(), format_f64),
+            Running::Distinct(seen) => seen.len().to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StreamGroup {
+    /// The group's value of each property it is grouped by.
+    key: Box<[Box<str>]>,
+    members: usize,
+    running: Box<[Running]>,
+}
+
+/// A query's first `GROUPBY`, run as the documents are read: see above.
+#[derive(Debug)]
+pub struct StreamGroups {
+    props: Vec<String>,
+    reducers: Vec<Reducer>,
+    /// Where the steps after the `GROUPBY` start.
+    end: usize,
+    hasher: ahash::RandomState,
+    /// Group numbers, found by the hash of their key.
+    index: hashbrown::HashTable<u32>,
+    groups: Vec<StreamGroup>,
+}
+
+impl StreamGroups {
+    /// The first `GROUPBY` of the steps from `cmd[start]` on, if it can run
+    /// as documents are read: no step before it but those that leave the
+    /// rows as they are (`LOAD`, which only says what the reply shows, and
+    /// the query's options), and only reducers that keep a running value.
+    pub fn plan(cmd: &[&[u8]], start: usize) -> Option<Self> {
+        let mut i = start;
+        while i < cmd.len() {
+            let word = cmd[i].to_ascii_uppercase();
+            match word.as_slice() {
+                b"GROUPBY" => {
+                    let (end, props, reducers) = parse_groupby(cmd, i);
+                    // A GROUPBY of no property is one group of every row.
+                    if props.is_empty() || reducers.iter().any(|r| Running::new(&r.func).is_none())
+                    {
+                        return None;
+                    }
+                    return Some(Self {
+                        props,
+                        reducers,
+                        end,
+                        hasher: ahash::RandomState::new(),
+                        index: hashbrown::HashTable::new(),
+                        groups: Vec::new(),
+                    });
+                }
+                b"LOAD" | b"PARAMS" | b"DIALECT" | b"SCORER" | b"TIMEOUT" | b"LANGUAGE"
+                | b"WITHCURSOR" => i = clause_end(cmd, i),
+                b"APPLY" | b"FILTER" | b"SORTBY" | b"LIMIT" => return None,
+                _ => i += 1,
+            }
+        }
+        None
+    }
+
+    fn hash<'a>(hasher: &ahash::RandomState, parts: impl Iterator<Item = &'a str>) -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = hasher.build_hasher();
+        for part in parts {
+            h.write_usize(part.len());
+            h.write(part.as_bytes());
+        }
+        h.finish()
+    }
+
+    /// A document into its group: `value(name)` is what its row would hold
+    /// under `name`.
+    #[inline]
+    pub fn add<'a>(&mut self, value: impl Fn(&str) -> Option<&'a str>) {
+        let Self {
+            props,
+            reducers,
+            hasher,
+            index,
+            groups,
+            ..
+        } = self;
+        let of = |p: &String| value(p).unwrap_or("");
+        let hash = Self::hash(hasher, props.iter().map(of));
+        let found = index
+            .find(hash, |&g| {
+                groups[g as usize]
+                    .key
+                    .iter()
+                    .zip(props.iter())
+                    .all(|(k, p)| **k == *of(p))
+            })
+            .copied();
+        let at = match found {
+            Some(g) => g as usize,
+            None => {
+                groups.push(StreamGroup {
+                    key: props.iter().map(|p| Box::from(of(p))).collect(),
+                    members: 0,
+                    running: reducers
+                        .iter()
+                        .map(|r| Running::new(&r.func).unwrap_or(Running::Count))
+                        .collect(),
+                });
+                let g = (groups.len() - 1) as u32;
+                index.insert_unique(hash, g, |&g| {
+                    Self::hash(hasher, groups[g as usize].key.iter().map(|k| &**k))
+                });
+                g as usize
+            }
+        };
+        let group = &mut groups[at];
+        group.members += 1;
+        for (reducer, running) in reducers.iter().zip(group.running.iter_mut()) {
+            if matches!(running, Running::Count) {
+                continue;
+            }
+            running.add(value(reducer.field()));
+        }
+    }
+
+    /// Where the steps after the `GROUPBY` start.
+    pub fn end(&self) -> usize {
+        self.end
+    }
+
+    /// The groups, as rows: as `run_groupby` makes them.
+    pub fn finish(self) -> Vec<Row> {
+        let Self {
+            props,
+            reducers,
+            groups,
+            ..
+        } = self;
+        groups
+            .into_iter()
+            .map(|group| {
+                let mut row: Row = ahash::AHashMap::new();
+                for (prop, value) in props.iter().zip(group.key.into_vec()) {
+                    row.insert(prop.clone(), value.into_string());
+                }
+                for (reducer, running) in reducers.iter().zip(group.running.into_vec()) {
+                    row.insert(reducer.alias.clone(), running.value(group.members));
+                }
+                row
+            })
+            .collect()
+    }
 }
 
 /// One reducer over the rows of one group.
@@ -803,6 +1070,67 @@ mod tests {
                 row
             })
             .collect()
+    }
+
+    /// A GROUPBY run as the documents are read makes the groups that of
+    /// their rows does: the same groups, in the same order, with the same
+    /// values, a missing or unreadable value included.
+    #[test]
+    fn groups_made_as_read_are_those_of_the_rows() {
+        let docs: Vec<Row> = (0..5000)
+            .map(|i: usize| {
+                let mut row = Row::new();
+                row.insert("__key".to_string(), format!("k:{i}"));
+                if !i.is_multiple_of(7) {
+                    row.insert("g".to_string(), (i % 13).to_string());
+                }
+                if !i.is_multiple_of(5) {
+                    let v = match i % 4 {
+                        0 => format!("{}.25", i % 17),
+                        1 => "-0".to_string(),
+                        2 => "x".to_string(),
+                        _ => format!("-{}", i % 11),
+                    };
+                    row.insert("v".to_string(), v);
+                }
+                row.insert("h".to_string(), (i % 3).to_string());
+                row
+            })
+            .collect();
+        for line in [
+            "FT.AGGREGATE idx * GROUPBY 1 @g REDUCE COUNT 0 AS n",
+            "FT.AGGREGATE idx * LOAD 1 @v GROUPBY 2 @g @h REDUCE SUM 1 @v AS s REDUCE AVG 1 @v \
+             REDUCE MIN 1 @v AS lo REDUCE MAX 1 @v AS hi REDUCE COUNT_DISTINCT 1 @v AS d \
+             SORTBY 2 @s DESC LIMIT 0 7",
+            "FT.AGGREGATE idx * GROUPBY 1 @v REDUCE COUNT_DISTINCTISH 1 @h REDUCE SUM 1 @nothing",
+            "FT.AGGREGATE idx * GROUPBY 1 @__key REDUCE COUNT 0 AS n LIMIT 10 3",
+        ] {
+            let cmd = words(line);
+            let (expect, cut, groups) = run_counted(docs.clone(), &cmd, 3, None);
+            assert!(!cut);
+            let mut stream = StreamGroups::plan(&cmd, 3).expect(line);
+            for doc in &docs {
+                stream.add(|name| doc.get(name).map(String::as_str));
+            }
+            let end = stream.end();
+            let made = stream.finish();
+            let n = made.len();
+            let (got, cut, got_groups) = run_from(made, &cmd, end, None, false, Some(n));
+            assert!(!cut);
+            assert_eq!(got_groups, groups, "{line}");
+            assert_eq!(got, expect, "{line}");
+        }
+        // Not as the documents are read: a step before the GROUPBY that
+        // changes the rows, a reducer with no running value, no property.
+        for line in [
+            "FT.AGGREGATE idx * APPLY @v*2 AS w GROUPBY 1 @g REDUCE COUNT 0",
+            "FT.AGGREGATE idx * FILTER @v>1 GROUPBY 1 @g REDUCE COUNT 0",
+            "FT.AGGREGATE idx * GROUPBY 1 @g REDUCE TOLIST 1 @v",
+            "FT.AGGREGATE idx * GROUPBY 0 REDUCE COUNT 0 AS n",
+            "FT.AGGREGATE idx * SORTBY 1 @v",
+        ] {
+            assert!(StreamGroups::plan(&words(line), 3).is_none(), "{line}");
+        }
     }
 
     /// Past the deadline a pipeline stops, keeping only rows it finished;
