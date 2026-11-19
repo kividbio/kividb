@@ -2449,12 +2449,16 @@ fn a_node_restarted_before_its_promotion_was_saved_completes_it() {
         "{}",
         replica.log()
     );
-    // Saved before it was announced.
-    let saved = saved_myself(&replica);
-    assert!(
-        saved.contains("myself,master")
-            && saved.ends_with(&format!(" {}-{}", ranges[0].0, ranges[0].1)),
-        "{saved}"
+    // Saved: the save is made as it takes the slots, and waited for (up to
+    // a second) before it is announced, so it may land just after it serves.
+    let promoted = format!(" {}-{}", ranges[0].0, ranges[0].1);
+    wait_until(
+        "the completed promotion to be saved",
+        Duration::from_secs(10),
+        || {
+            let saved = saved_myself(&replica);
+            saved.contains("myself,master") && saved.ends_with(&promoted)
+        },
     );
     // It still had its dataset, and serves it.
     let mut c = replica.conn();
