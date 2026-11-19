@@ -689,24 +689,30 @@ fn sort_pattern_outside_the_tag(name: &str, cmd: &[&[u8]]) -> Option<String> {
     ))
 }
 
-/// For a command a script calls: whether the script runs beside others and
-/// the command reads or changes keys it does not name, which it may not do
-/// then (see `run_from_script`). `SORT` by a pattern is asked of
-/// `sort_pattern_outside_the_tag`: one within the script's own tag reads
-/// keys only it holds.
-#[cfg(feature = "lua")]
-#[inline]
-fn unnamed_keys_beside_others(name: &str, cmd: &[&[u8]]) -> bool {
-    crate::tag_locks::beside_others()
-        && crate::tag_locks::reads_keys_it_does_not_name(name)
-        && (crate::tag_locks::walks(name, cmd)
-            || crate::tag_locks::changes_keys_it_does_not_name(name, cmd))
-}
-
-#[cfg(not(feature = "lua"))]
-#[inline]
-fn unnamed_keys_beside_others(_name: &str, _cmd: &[&[u8]]) -> bool {
-    false
+/// For a command a script held to its tags calls, of those that read or
+/// change keys they do not name (`tag_locks::reads_keys_it_does_not_name`):
+/// whether it is refused (see `run_from_script`). Those of
+/// `sees_the_whole_keyspace` always; the others when the script runs beside
+/// others. `SORT` by a pattern is asked of `sort_pattern_outside_the_tag`:
+/// one within the script's own tag reads keys only it holds. Out of line:
+/// most commands a script calls are none of these.
+#[cold]
+#[inline(never)]
+fn refused_for_unnamed_keys(name: &str, cmd: &[&[u8]]) -> bool {
+    if crate::tag_locks::sees_the_whole_keyspace(name) {
+        return true;
+    }
+    #[cfg(feature = "lua")]
+    {
+        crate::tag_locks::beside_others()
+            && (crate::tag_locks::walks(name, cmd)
+                || crate::tag_locks::changes_keys_it_does_not_name(name, cmd))
+    }
+    #[cfg(not(feature = "lua"))]
+    {
+        let _ = cmd;
+        false
+    }
 }
 
 fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
@@ -742,8 +748,8 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // called from one of them, it could do neither. A script that runs
     // alone has the server to itself, and may.
     if crate::tag_locks::in_script() {
-        let outside = if crate::tag_locks::sees_the_whole_keyspace(name2)
-            || unnamed_keys_beside_others(name2, &ctx.cmd)
+        let outside = if crate::tag_locks::reads_keys_it_does_not_name(name2)
+            && refused_for_unnamed_keys(name2, &ctx.cmd)
         {
             Some(format!(
                 "ERR Script attempted to run '{}', which looks at keys it does not name, while \
