@@ -2068,9 +2068,11 @@ fn a_save_whose_directory_sync_failed_is_made_again() {
         .conn()
         .cmd(&["CLUSTER", "MEET", "127.0.0.1", &n.port.to_string()]);
     assert!(r.is_ok(), "{r:?}");
-    wait_until("the directory's sync to fail", Duration::from_secs(15), || {
-        !fail.exists()
-    });
+    wait_until(
+        "the directory's sync to fail",
+        Duration::from_secs(15),
+        || !fail.exists(),
+    );
     let held_id = a_id.clone();
     gate.set_hold(move |file| file.contains(&held_id));
     let held = gate.wait_held(Duration::from_secs(15));
@@ -2099,7 +2101,10 @@ fn a_vote_that_cannot_be_saved_is_not_sent() {
     }
     nodes[0].kill();
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !nodes[1..].iter().all(|n| n.log().contains("Did not vote for")) {
+    while !nodes[1..]
+        .iter()
+        .all(|n| n.log().contains("Did not vote for"))
+    {
         assert!(
             Instant::now() < deadline,
             "the voters did not refuse their vote:\n{}\n---\n{}\n---\n{}",
@@ -2178,14 +2183,18 @@ fn a_change_learnt_during_a_save_is_saved_after_it() {
     announce(&nodes[1], "h1.example");
     let held = gate.wait_held(Duration::from_secs(15));
     announce(&nodes[1], "h2.example");
-    wait_until("the second hostname to be learnt", Duration::from_secs(15), || {
-        shows_hostname(&nodes[0], "h2.example")
-    });
+    wait_until(
+        "the second hostname to be learnt",
+        Duration::from_secs(15),
+        || shows_hostname(&nodes[0], "h2.example"),
+    );
     gate.set_hold(|_| false);
     gate.release(&held);
-    wait_until("the second hostname to be saved", Duration::from_secs(15), || {
-        saved_hostname(&nodes[0], "h2.example")
-    });
+    wait_until(
+        "the second hostname to be saved",
+        Duration::from_secs(15),
+        || saved_hostname(&nodes[0], "h2.example"),
+    );
     gate.finish();
 }
 

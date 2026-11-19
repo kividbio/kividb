@@ -4375,7 +4375,11 @@ mod tests {
         cs.nodes.write().get_mut(&a).unwrap().mark_failed(now_ms());
         cs.nodes.write().get_mut(&b).unwrap().mark_failed(now_ms());
         // A directory that is not there: every save fails.
-        cs.config_path = Some(std::env::temp_dir().join("kividb-no-such-dir-808").join("nodes.conf"));
+        cs.config_path = Some(
+            std::env::temp_dir()
+                .join("kividb-no-such-dir-808")
+                .join("nodes.conf"),
+        );
         let ask = |sender, master| crate::cluster::bus::BusMessage::FailoverAuthRequest {
             sender_id: sender,
             sender_ip: "127.0.0.1".into(),
