@@ -34,7 +34,7 @@
 //   after it, never between. Keys without a tag belong to no script and
 //   cost a look for `{`.
 // * A command that changes keys it does not name — `FLUSHALL`, `FLUSHDB`,
-//   `SWAPDB` — takes the gate alone, which waits for every script (a script
+//   `SWAPDB`, `FT.DROPINDEX … DD`, `DEBUG POPULATE` — takes the gate alone, which waits for every script (a script
 //   holds the gate as a command for as long as it runs). One that only reads
 //   them — `KEYS`, `SCAN`, `INFO`, a search of an index, `SORT` by a pattern
 //   — keeps the scripts that run beside others out while it runs, and
@@ -745,7 +745,9 @@ pub fn sees_the_whole_keyspace(name: &str) -> bool {
 /// name: those of [`sees_the_whole_keyspace`], and the ones that read the
 /// keyspace through something else — an index (`FT.*`), the labels of time
 /// series (`TS.M*`, `TS.QUERY*`), a slot (`CLUSTER`), counts over keys
-/// (`INFO`, `MEMORY`) or patterns (`SORT`). Every command with no key in
+/// (`INFO`, `MEMORY`) or patterns (`SORT`); and two that change keys they
+/// do not name, `FT.DROPINDEX … DD` and `DEBUG POPULATE`
+/// ([`changes_keys_it_does_not_name`]). Every command with no key in
 /// the key table, and every one whose keys there do not cover what it
 /// reads, was looked at for this list. One match on the name, on the way
 /// of every command with tag locks on; which of them keep scripts out
@@ -784,6 +786,8 @@ pub fn reads_keys_it_does_not_name(name: &str) -> bool {
             | "TS.MREVRANGE"
             | "TS.QUERYINDEX"
             | "TS.QUERYLABELS"
+            | "FT.DROPINDEX"
+            | "DEBUG"
     )
 }
 
@@ -793,7 +797,7 @@ pub fn reads_keys_it_does_not_name(name: &str) -> bool {
 /// keys as they were before it or as they are after it, never between, as
 /// in Redis, where a script is one step. They took the command gate alone
 /// (`KEYS`, `SCAN`), which stopped every connection for as long as one ran
-/// (a `KEYS` of two million keys, ~280 ms, #772), or nothing at all.
+/// (a `KEYS` of two million keys, ~280 ms, #772).
 ///
 /// Not `DBSIZE` and `RANDOMKEY`, which take the gate alone as before. They
 /// are quick, and the gate alone also waits for what is in flight, as a
@@ -801,9 +805,11 @@ pub fn reads_keys_it_does_not_name(name: &str) -> bool {
 /// expiry removing a large key is then seen whole by a `DBSIZE` that no
 /// longer counts the key, its `expired_keys` and its `LATENCY` event with
 /// it (Redis's `unit/latency-monitor` waits for `DBSIZE` 0 and then asks
-/// for the event). Nor the flushes and `SWAPDB`, which write. `SORT` only
-/// with a `BY` or `GET` pattern that names keys; `MEMORY` and `CLUSTER`
-/// only for the subcommands that count or list keys.
+/// for the event). Nor the flushes, `SWAPDB` and the others that write
+/// ([`changes_keys_it_does_not_name`]). `SORT` only with a `BY` or `GET`
+/// pattern that names keys; `INFO` only for the sections that count keys
+/// (none named, `keyspace`, `default`, `all`, `everything`); `MEMORY` and
+/// `CLUSTER` only for the subcommands that count or list keys.
 #[cfg(feature = "lua")]
 #[cold]
 pub fn walks(name: &str, cmd: &[&[u8]]) -> bool {
@@ -812,12 +818,41 @@ pub fn walks(name: &str, cmd: &[&[u8]]) -> bool {
             .is_some_and(|sub| names.iter().any(|name| sub.eq_ignore_ascii_case(name)))
     };
     match name {
-        "DBSIZE" | "RANDOMKEY" | "FLUSHALL" | "FLUSHDB" | "SWAPDB" => false,
+        "DBSIZE" | "RANDOMKEY" | "FLUSHALL" | "FLUSHDB" | "SWAPDB" | "FT.DROPINDEX" | "DEBUG" => {
+            false
+        }
+        "INFO" => {
+            cmd.len() == 1
+                || cmd[1..].iter().any(|section| {
+                    [&b"keyspace"[..], b"default", b"all", b"everything"]
+                        .iter()
+                        .any(|counts| section.eq_ignore_ascii_case(counts))
+                })
+        }
         "MEMORY" => sub(&[b"STATS", b"DOCTOR"]),
-        "CLUSTER" => sub(&[b"COUNTKEYSINSLOT", b"GETKEYSINSLOT"]),
+        "CLUSTER" => sub(&[b"COUNTKEYSINSLOT", b"GETKEYSINSLOT", b"SLOT-STATS"]),
         // By its patterns, which the command path asks of it itself.
         "SORT" | "SORT_RO" => false,
         _ => true,
+    }
+}
+
+/// Of [`reads_keys_it_does_not_name`], besides the flushes and `SWAPDB`,
+/// the commands that change keys they do not name: `FT.DROPINDEX … DD`,
+/// which deletes the documents of an index, and `DEBUG POPULATE`. With tag
+/// locks on, they take the command gate alone, which waits for every
+/// script; and a script that runs beside others may not call them.
+#[cfg(feature = "lua")]
+#[cold]
+pub fn changes_keys_it_does_not_name(name: &str, cmd: &[&[u8]]) -> bool {
+    match name {
+        "FT.DROPINDEX" => cmd
+            .get(2)
+            .is_some_and(|arg| arg.eq_ignore_ascii_case(b"DD")),
+        "DEBUG" => cmd
+            .get(1)
+            .is_some_and(|sub| sub.eq_ignore_ascii_case(b"POPULATE")),
+        _ => false,
     }
 }
 
@@ -885,10 +920,45 @@ pub fn keep_walks_out() -> WalksKeptOut {
 }
 
 /// Held by a walk of the keyspace ([`walks`]) for as long as
-/// it runs: no script runs beside others meanwhile.
+/// it runs: no script runs beside others meanwhile. A walk may end before
+/// its command does ([`end_walk_here`]).
 #[cfg(feature = "lua")]
 pub struct Walk {
     _not_send: PhantomData<*const ()>,
+}
+
+#[cfg(feature = "lua")]
+thread_local! {
+    /// Whether this thread's command holds a [`Walk`]'s slots now.
+    static WALKING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// For a walk that has read what it reads here, and goes on to wait for
+/// something else — a coordinator of a search across a cluster, which then
+/// waits for the other masters' parts (`cluster::search::fan_out`): let go
+/// of the walk's slots now, not when the command ends. Each of those parts
+/// takes a walk on its own node; held across the wait, two nodes
+/// coordinating at once could each hold a walk the other's part waits for,
+/// behind a script waiting for its slot ([`keep_walks_out`]). Nothing when
+/// no walk is held.
+#[cfg(feature = "lua")]
+pub fn end_walk_here() {
+    if WALKING.with(|walking| walking.replace(false)) {
+        let_go_of_walk();
+    }
+}
+
+/// What [`Walk`] holds, let go of.
+#[cfg(feature = "lua")]
+fn let_go_of_walk() {
+    for slot in &WALK_SLOT {
+        // SAFETY: `walk` took every slot shared, once, and this walk has
+        // not let go of them yet (`WALKING` was set).
+        unsafe { slot.0.force_unlock_read() };
+    }
+    if WALKS.fetch_sub(1, Ordering::SeqCst) == 1 {
+        WALKS_ENDED.notify_waiters();
+    }
 }
 
 /// How many walks are under way: counted from before a walk takes its first
@@ -972,9 +1042,10 @@ pub fn walk() -> Walk {
     WALKS.fetch_add(1, Ordering::SeqCst);
     WALKS_STARTED.fetch_add(1, Ordering::SeqCst);
     for slot in &WALK_SLOT {
-        // Let go of in `Drop`.
+        // Let go of in `Drop`, or in `end_walk_here`.
         std::mem::forget(slot.0.read());
     }
+    WALKING.with(|walking| walking.set(true));
     Walk {
         _not_send: PhantomData,
     }
@@ -983,14 +1054,7 @@ pub fn walk() -> Walk {
 #[cfg(feature = "lua")]
 impl Drop for Walk {
     fn drop(&mut self) {
-        for slot in &WALK_SLOT {
-            // SAFETY: `walk` took every slot shared, once, and this walk
-            // has not let go of them yet.
-            unsafe { slot.0.force_unlock_read() };
-        }
-        if WALKS.fetch_sub(1, Ordering::SeqCst) == 1 {
-            WALKS_ENDED.notify_waiters();
-        }
+        end_walk_here();
     }
 }
 

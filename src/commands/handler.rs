@@ -689,6 +689,26 @@ fn sort_pattern_outside_the_tag(name: &str, cmd: &[&[u8]]) -> Option<String> {
     ))
 }
 
+/// For a command a script calls: whether the script runs beside others and
+/// the command reads or changes keys it does not name, which it may not do
+/// then (see `run_from_script`). `SORT` by a pattern is asked of
+/// `sort_pattern_outside_the_tag`: one within the script's own tag reads
+/// keys only it holds.
+#[cfg(feature = "lua")]
+#[inline]
+fn unnamed_keys_beside_others(name: &str, cmd: &[&[u8]]) -> bool {
+    crate::tag_locks::beside_others()
+        && crate::tag_locks::reads_keys_it_does_not_name(name)
+        && (crate::tag_locks::walks(name, cmd)
+            || crate::tag_locks::changes_keys_it_does_not_name(name, cmd))
+}
+
+#[cfg(not(feature = "lua"))]
+#[inline]
+fn unnamed_keys_beside_others(_name: &str, _cmd: &[&[u8]]) -> bool {
+    false
+}
+
 fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // Re-derive cmd0/name from ctx.cmd in case parts were modified (XREAD BLOCK stripping).
     let cmd0 = ctx.cmd[0];
@@ -715,8 +735,16 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     }
 
     // A script held to the tags of its KEYS keeps to them (`tag_locks`).
+    // One that runs beside others does not call what reads or changes keys
+    // it does not name either (`INFO keyspace`, `FT.SEARCH`, `TS.MGET`, ...):
+    // such a command, sent by a client, keeps out the scripts running beside
+    // others while it runs (`tag_locks::walk`), or waits for every script;
+    // called from one of them, it could do neither. A script that runs
+    // alone has the server to itself, and may.
     if crate::tag_locks::in_script() {
-        let outside = if crate::tag_locks::sees_the_whole_keyspace(name2) {
+        let outside = if crate::tag_locks::sees_the_whole_keyspace(name2)
+            || unnamed_keys_beside_others(name2, &ctx.cmd)
+        {
             Some(format!(
                 "ERR Script attempted to run '{}', which looks at keys it does not name, while \
                  running under the {} of its KEYS (lua-parallel-scripts)",
@@ -1607,7 +1635,9 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     //
     // Nor is FT.DROPINDEX here: with `DD` it may delete millions of documents,
     // and it takes the gate, and the order of their keys, a few at a time
-    // itself (`vector::ft_dropindex`).
+    // itself (`vector::ft_dropindex`). With tag locks on, a `DD` takes the
+    // command gate alone (`gate_alone_or_walk`): it deletes keys whose tags
+    // it does not lock.
     let writes_operation = replication::command_mutates_for_replication(name, &ctx.cmd);
     let script = matches!(name, "EVAL" | "EVALSHA" | "FCALL");
     let gated = (writes_operation && name != "MIGRATE" && name != "FT.DROPINDEX") || script;
@@ -1969,12 +1999,9 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     crate::tracking::with_what_came_before(result)
 }
 
-/// What a walk of the keyspace, or a script that runs beside others, holds
-/// to keep the other out (see `tag_locks::walk`). Out of line: only those
-/// come here.
 /// What a command holds of the command gate, shared or alone, and, for
 /// one that reads keys it does not name, of the walk locks
-/// (`tag_locks::walk`, a flag of a byte where none is held).
+/// (`tag_locks::walk`).
 #[cfg(feature = "lua")]
 type Gates = (
     Option<crate::command_gate::Guard>,
@@ -1999,11 +2026,15 @@ fn gate_alone_or_walk(
     slice: std::time::Duration,
 ) -> Option<Gates> {
     let overrun = crate::commands::lua::running_script_is_over_its_time_limit;
-    // What takes the gate alone whatever it reads: as before.
+    // What takes the gate alone whatever it reads: as before; and, with tag
+    // locks on, what deletes or makes keys it does not name
+    // (`FT.DROPINDEX … DD`, `DEBUG POPULATE`).
     let alone = gate_alone_rule(name, cmd, script_alone, gated, false)
         || (crate::tag_locks::enabled()
             && crate::tag_locks::sees_the_whole_keyspace(name)
-            && !crate::tag_locks::walks(name, cmd));
+            && !crate::tag_locks::walks(name, cmd))
+        || (crate::tag_locks::enabled()
+            && crate::tag_locks::changes_keys_it_does_not_name(name, cmd));
     let walks = !alone
         && crate::tag_locks::enabled()
         && crate::tag_locks::reads_keys_it_does_not_name(name)

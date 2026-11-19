@@ -74,7 +74,8 @@ impl Conn {
 
     fn read(&mut self) -> V {
         let mut line = String::new();
-        self.reader.read_line(&mut line).expect("reply");
+        let read = self.reader.read_line(&mut line).expect("reply");
+        assert!(read > 0, "connection closed");
         let line = line.trim_end_matches(['\r', '\n']);
         let (kind, rest) = line.split_at(1);
         match kind {
@@ -168,6 +169,27 @@ impl Server {
     fn conn(&self) -> Conn {
         Conn::connect(self.port)
     }
+
+    /// The file `pause::test_stall_in_script` keeps in the server's
+    /// directory while a script is held where it calls
+    /// `ECHO script-stall:...`.
+    fn stall_flag(&self) -> std::path::PathBuf {
+        self.dir.join("script-stall.held")
+    }
+
+    /// Whether a script is held there now.
+    fn holding(&self) -> bool {
+        self.stall_flag().exists()
+    }
+
+    /// Waits until a script is held there.
+    fn wait_until_held(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.holding() {
+            assert!(Instant::now() < deadline, "the script never got to its stall");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 impl Drop for Server {
@@ -231,17 +253,16 @@ fn start_held_script(server: &Server, sha: &str, tag: &str) -> std::thread::Join
     args.push("script-stall:1");
     c.send(&args);
     let handle = std::thread::spawn(move || c.read());
-    // Under way, and held: the stall is long, and the script reaches it at
-    // once.
-    std::thread::sleep(Duration::from_millis(150));
+    server.wait_until_held();
     handle
 }
 
 /// A new connection on a thread that is not busy running a held script:
-/// the first of several to answer a `PING`. (On the io_uring loop the
-/// kernel places connections; on Tokio a connection whose thread is busy
-/// waits for it too.)
+/// the first of several to answer a `PING`, within a quarter of the stall.
+/// (On the io_uring loop the kernel places connections; on Tokio a
+/// connection whose thread is busy waits for it too.)
 fn free_conn(server: &Server) -> Conn {
+    let asked = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel();
     for _ in 0..8 {
         let mut c = server.conn();
@@ -252,7 +273,11 @@ fn free_conn(server: &Server) -> Conn {
             }
         });
     }
-    rx.recv().unwrap()
+    let c = rx
+        .recv_timeout(Duration::from_millis(STALL_MS / 4))
+        .expect("no new connection was answered at once");
+    assert!(asked.elapsed() < Duration::from_millis(STALL_MS / 4));
+    c
 }
 
 fn names(reply: &V) -> Vec<String> {
@@ -307,6 +332,8 @@ fn a_walk_never_finds_a_script_part_way(io: &str) {
         .map(|kind| {
             let mut w = server.conn();
             let after = after.clone();
+            // Each walk starts while the script is held.
+            assert!(server.holding(), "the script was done before walk {kind}");
             std::thread::spawn(move || match kind {
                 0 => assert_eq!(names(&w.cmd(&["KEYS", "{t}:*"])), after),
                 1 => {
@@ -331,6 +358,9 @@ fn a_walk_never_finds_a_script_part_way(io: &str) {
             })
         })
         .collect();
+    // Sent while it was held.
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(server.holding(), "the script was done before the walks were sent");
     for walker in walkers {
         walker.join().unwrap();
     }
@@ -518,7 +548,7 @@ fn held_six(server: &Server, sha: &str) -> std::thread::JoinHandle<V> {
     args.push("script-stall:1");
     c.send(&args);
     let handle = std::thread::spawn(move || c.read());
-    std::thread::sleep(Duration::from_millis(150));
+    server.wait_until_held();
     handle
 }
 
@@ -529,16 +559,19 @@ fn count(reply: &V) -> usize {
     }
 }
 
-/// What a reader found while the script was held: its name, and whether it
-/// was the state before the run or after it (`None`: neither).
-type Seen = (&'static str, Option<&'static str>);
+/// What a reader found while the script was held: its name, whether it
+/// was the state before the run or after it (`None`: neither), and whether
+/// the script was still held once the reader had been sent.
+type Seen = (&'static str, Option<&'static str>, bool);
 
 /// Every reader of keys it does not name, started while a script that runs
 /// beside others is held between its first three writes and its last
 /// three, finds the six keys all there or none there: `INFO keyspace`,
-/// `DBSIZE`, `FT.SEARCH`, `FT.AGGREGATE`, `FT.INFO`, `SORT` with a `GET`
-/// pattern, `TS.MGET`, `TS.MRANGE`, `TS.MREVRANGE`, `TS.QUERYINDEX`. The
-/// readers are sent from connections on threads not busy with the script.
+/// `DBSIZE`, `FT.SEARCH`, `FT.AGGREGATE`, `FT.INFO`, `FT.PROFILE`, `SORT`
+/// with a `GET` pattern, `TS.MGET`, `TS.MRANGE`, `TS.MREVRANGE`,
+/// `TS.QUERYINDEX`; and `FT.CURSOR READ` of a cursor made before is
+/// answered only once the script is done. The readers are sent from
+/// connections on threads not busy with the script, while it is held.
 fn readers_see_a_script_whole_or_not_at_all(io: &str) {
     let server = Server::start(io, 4);
     let mut c = server.conn();
@@ -558,14 +591,42 @@ fn readers_see_a_script_whole_or_not_at_all(io: &str) {
         V::Str("OK".into())
     );
     assert_eq!(c.cmd(&["RPUSH", "plainlist", "1", "2"]), V::Int(2));
+    // A cursor over another index, made before the script runs.
+    assert_eq!(
+        c.cmd(&[
+            "FT.CREATE", "idxc", "ON", "HASH", "PREFIX", "1", "{c}:", "SCHEMA", "f", "TEXT"
+        ]),
+        V::Str("OK".into())
+    );
+    for doc in ["{c}:1", "{c}:2", "{c}:3"] {
+        assert_eq!(c.cmd(&["HSET", doc, "f", "hello"]), V::Int(1));
+    }
+    let V::Arr(made) = c.cmd(&[
+        "FT.AGGREGATE", "idxc", "hello", "LOAD", "1", "@f", "WITHCURSOR", "COUNT", "1",
+    ]) else {
+        panic!("WITHCURSOR")
+    };
+    let V::Int(cursor) = made[1] else {
+        panic!("cursor {made:?}")
+    };
+    let cursor = cursor.to_string();
     let sha = quick_six(&mut c);
-    let base = 1; // plainlist
+    let base = 4; // plainlist and the cursor's documents
     let script = held_six(&server, &sha);
 
-    let readers: Vec<std::thread::JoinHandle<Seen>> = (0..10)
+    let readers: Vec<std::thread::JoinHandle<Seen>> = (0..12)
         .map(|kind| {
             let mut r = free_conn(&server);
+            let flag = server.stall_flag();
+            let cursor = cursor.clone();
             std::thread::spawn(move || {
+                // Sent while the script is held, and the reply read: what the
+                // reader saw, and whether the script was still held then.
+                let mut ask = |args: &[&str]| -> (V, bool) {
+                    r.send(args);
+                    let overlapped = flag.exists();
+                    (r.read(), overlapped)
+                };
                 let whole = |n: usize, none: usize, all: usize| match n {
                     n if n == none => Some("before"),
                     n if n == all => Some("after"),
@@ -573,7 +634,7 @@ fn readers_see_a_script_whole_or_not_at_all(io: &str) {
                 };
                 match kind {
                     0 => {
-                        let V::Str(text) = r.cmd(&["INFO", "keyspace"]) else {
+                        let (V::Str(text), sent_held) = ask(&["INFO", "keyspace"]) else {
                             panic!("INFO")
                         };
                         let keys: usize = text
@@ -582,35 +643,35 @@ fn readers_see_a_script_whole_or_not_at_all(io: &str) {
                             .and_then(|rest| rest.split(',').next())
                             .and_then(|n| n.parse().ok())
                             .unwrap_or(0);
-                        ("INFO keyspace", whole(keys, base, base + 6))
+                        ("INFO keyspace", whole(keys, base, base + 6), sent_held)
                     }
                     1 => {
                         // `MEMORY STATS` counts bytes, not keys: `DBSIZE`,
                         // which takes the gate alone, stands in.
-                        let V::Int(keys) = r.cmd(&["DBSIZE"]) else {
+                        let (V::Int(keys), sent_held) = ask(&["DBSIZE"]) else {
                             panic!("DBSIZE")
                         };
-                        ("DBSIZE", whole(keys as usize, base, base + 6))
+                        ("DBSIZE", whole(keys as usize, base, base + 6), sent_held)
                     }
                     2 => {
-                        let reply = r.cmd(&["FT.SEARCH", "idx772", "hello", "NOCONTENT"]);
+                        let (reply, sent_held) = ask(&["FT.SEARCH", "idx772", "hello", "NOCONTENT"]);
                         let V::Arr(items) = &reply else {
                             panic!("FT.SEARCH {reply:?}")
                         };
                         let V::Int(total) = items[0] else {
                             panic!("total")
                         };
-                        ("FT.SEARCH", whole(total as usize, 0, 2))
+                        ("FT.SEARCH", whole(total as usize, 0, 2), sent_held)
                     }
                     3 => {
-                        let reply = r.cmd(&["FT.AGGREGATE", "idx772", "hello"]);
+                        let (reply, sent_held) = ask(&["FT.AGGREGATE", "idx772", "hello"]);
                         let V::Arr(items) = &reply else {
                             panic!("FT.AGGREGATE {reply:?}")
                         };
-                        ("FT.AGGREGATE", whole(items.len() - 1, 0, 2))
+                        ("FT.AGGREGATE", whole(items.len() - 1, 0, 2), sent_held)
                     }
                     4 => {
-                        let reply = r.cmd(&["FT.INFO", "idx772"]);
+                        let (reply, sent_held) = ask(&["FT.INFO", "idx772"]);
                         let V::Arr(items) = &reply else {
                             panic!("FT.INFO {reply:?}")
                         };
@@ -623,10 +684,11 @@ fn readers_see_a_script_whole_or_not_at_all(io: &str) {
                             V::Str(n) => n.parse().unwrap(),
                             other => panic!("num_docs {other:?}"),
                         };
-                        ("FT.INFO num_docs", whole(docs, 0, 2))
+                        ("FT.INFO num_docs", whole(docs, 0, 2), sent_held)
                     }
                     5 => {
-                        let reply = r.cmd(&["SORT", "plainlist", "BY", "nosort", "GET", "{t}:v_*"]);
+                        let (reply, sent_held) =
+                            ask(&["SORT", "plainlist", "BY", "nosort", "GET", "{t}:v_*"]);
                         let seen = match reply {
                             V::Arr(items) if items == [V::Nil, V::Nil] => Some("before"),
                             V::Arr(items) if items == [V::Str("x".into()), V::Str("y".into())] => {
@@ -634,32 +696,50 @@ fn readers_see_a_script_whole_or_not_at_all(io: &str) {
                             }
                             _ => None,
                         };
-                        ("SORT ... GET", seen)
+                        ("SORT ... GET", seen, sent_held)
                     }
-                    6 => (
-                        "TS.MGET",
-                        whole(count(&r.cmd(&["TS.MGET", "FILTER", "grp=w772"])), 0, 2),
-                    ),
-                    7 => (
-                        "TS.MRANGE",
-                        whole(
-                            count(&r.cmd(&["TS.MRANGE", "-", "+", "FILTER", "grp=w772"])),
-                            0,
-                            2,
-                        ),
-                    ),
-                    8 => (
-                        "TS.MREVRANGE",
-                        whole(
-                            count(&r.cmd(&["TS.MREVRANGE", "-", "+", "FILTER", "grp=w772"])),
-                            0,
-                            2,
-                        ),
-                    ),
-                    _ => (
-                        "TS.QUERYINDEX",
-                        whole(count(&r.cmd(&["TS.QUERYINDEX", "grp=w772"])), 0, 2),
-                    ),
+                    6 => {
+                        let (reply, sent_held) = ask(&["TS.MGET", "FILTER", "grp=w772"]);
+                        ("TS.MGET", whole(count(&reply), 0, 2), sent_held)
+                    }
+                    7 => {
+                        let (reply, sent_held) =
+                            ask(&["TS.MRANGE", "-", "+", "FILTER", "grp=w772"]);
+                        ("TS.MRANGE", whole(count(&reply), 0, 2), sent_held)
+                    }
+                    8 => {
+                        let (reply, sent_held) =
+                            ask(&["TS.MREVRANGE", "-", "+", "FILTER", "grp=w772"]);
+                        ("TS.MREVRANGE", whole(count(&reply), 0, 2), sent_held)
+                    }
+                    9 => {
+                        let (reply, sent_held) = ask(&["TS.QUERYINDEX", "grp=w772"]);
+                        ("TS.QUERYINDEX", whole(count(&reply), 0, 2), sent_held)
+                    }
+                    10 => {
+                        let (reply, sent_held) = ask(&[
+                            "FT.PROFILE", "idx772", "SEARCH", "QUERY", "hello", "NOCONTENT",
+                        ]);
+                        // The search's own reply comes first.
+                        let V::Arr(parts) = &reply else {
+                            panic!("FT.PROFILE {reply:?}")
+                        };
+                        let V::Arr(found) = &parts[0] else {
+                            panic!("FT.PROFILE {reply:?}")
+                        };
+                        let V::Int(total) = found[0] else {
+                            panic!("total")
+                        };
+                        ("FT.PROFILE", whole(total as usize, 0, 2), sent_held)
+                    }
+                    _ => {
+                        // Read while the script is held, it is answered after
+                        // the script: the state after it.
+                        let (reply, sent_held) = ask(&["FT.CURSOR", "READ", "idxc", &cursor]);
+                        assert!(matches!(reply, V::Arr(_)), "FT.CURSOR READ {reply:?}");
+                        let after = !flag.exists();
+                        ("FT.CURSOR READ", after.then_some("after"), sent_held)
+                    }
                 }
             })
         })
@@ -668,12 +748,21 @@ fn readers_see_a_script_whole_or_not_at_all(io: &str) {
     assert_eq!(script.join().unwrap(), V::Int(1));
     let half: Vec<&str> = seen
         .iter()
-        .filter(|(_, whole)| whole.is_none())
-        .map(|(name, _)| *name)
+        .filter(|(_, whole, _)| whole.is_none())
+        .map(|(name, _, _)| *name)
         .collect();
     assert!(
         half.is_empty(),
         "saw the script part-way through: {half:?} ({seen:?})"
+    );
+    let late: Vec<&str> = seen
+        .iter()
+        .filter(|(_, _, sent_held)| !sent_held)
+        .map(|(name, _, _)| *name)
+        .collect();
+    assert!(
+        late.is_empty(),
+        "sent after the script was done, so they prove nothing: {late:?}"
     );
 }
 
@@ -715,12 +804,32 @@ fn a_slot_is_counted_with_a_script_whole_or_not_at_all() {
     let counted = r.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]);
     let mut r2 = free_conn(&server);
     let listed = count(&r2.cmd(&["CLUSTER", "GETKEYSINSLOT", &slot, "100"]));
+    let mut r3 = free_conn(&server);
+    let stats = r3.cmd(&["CLUSTER", "SLOT-STATS", "SLOTSRANGE", &slot, &slot]);
+    assert!(server.holding(), "the script was done before the readers");
     assert_eq!(script.join().unwrap(), V::Int(1));
     assert!(
         counted == V::Int(0) || counted == V::Int(6),
         "COUNTKEYSINSLOT found {counted:?}"
     );
     assert!(listed == 0 || listed == 6, "GETKEYSINSLOT found {listed}");
+    let stated = key_count(&stats).unwrap_or_else(|| panic!("SLOT-STATS {stats:?}"));
+    assert!(stated == 0 || stated == 6, "SLOT-STATS found {stated}");
+}
+
+/// The `key-count` of a `CLUSTER SLOT-STATS` reply of one slot.
+fn key_count(reply: &V) -> Option<i64> {
+    match reply {
+        V::Arr(items) => {
+            if let Some(at) = items.iter().position(|v| *v == V::Str("key-count".into())) {
+                if let Some(V::Int(n)) = items.get(at + 1) {
+                    return Some(*n);
+                }
+            }
+            items.iter().find_map(key_count)
+        }
+        _ => None,
+    }
 }
 
 /// A snapshot taken while a script runs beside others holds the script
@@ -746,4 +855,114 @@ fn a_snapshot_holds_a_script_whole_or_not_at_all() {
         keys == V::Int(0) || keys == V::Int(6),
         "the snapshot holds {keys:?} keys"
     );
+}
+
+/// Makes the index the readers of the script's keys look through.
+fn create_index(c: &mut Conn) {
+    assert_eq!(
+        c.cmd(&[
+            "FT.CREATE", "idx772", "ON", "HASH", "PREFIX", "1", "{t}:doc", "SCHEMA", "f", "TEXT"
+        ]),
+        V::Str("OK".into())
+    );
+}
+
+/// A script that runs beside others may not call a command that reads or
+/// changes keys it does not name: it gets the error a `KEYS` gets there,
+/// while another such script is held part-way through. One that runs alone
+/// may; and a section of `INFO` that counts no keys is allowed.
+fn a_script_beside_others_reads_no_keys_it_does_not_name(io: &str) {
+    let server = Server::start(io, 4);
+    let mut c = server.conn();
+    create_index(&mut c);
+    let held = quick_six(&mut c);
+    // Runs what it is given, on a tag of its own; warmed up with nothing to
+    // run, so that from then on it runs beside others.
+    let V::Str(reader) = c.cmd(&[
+        "SCRIPT",
+        "LOAD",
+        "if ARGV[1] == 'warm' then return 1 end return redis.pcall(unpack(ARGV))",
+    ]) else {
+        panic!("no digest")
+    };
+    for _ in 0..3 {
+        assert_eq!(
+            c.cmd(&["EVALSHA", &reader, "1", "{r}:x", "warm"]),
+            V::Int(1)
+        );
+    }
+    let script = held_six(&server, &held);
+    let refused: [&[&str]; 9] = [
+        &["INFO", "keyspace"],
+        &["INFO"],
+        &["FT.SEARCH", "idx772", "hello", "NOCONTENT"],
+        &["FT.AGGREGATE", "idx772", "hello"],
+        &["FT.INFO", "idx772"],
+        &["TS.MGET", "FILTER", "grp=w772"],
+        &["TS.QUERYINDEX", "grp=w772"],
+        &["MEMORY", "STATS"],
+        &["FT.DROPINDEX", "idx772", "DD"],
+    ];
+    for call in refused {
+        let mut r = free_conn(&server);
+        let mut args = vec!["EVALSHA", reader.as_str(), "1", "{r}:x"];
+        args.extend_from_slice(call);
+        let reply = r.cmd(&args);
+        assert!(
+            matches!(&reply, V::Err(e) if e.contains("which looks at keys it does not name")),
+            "{call:?} from a script beside others: {reply:?}"
+        );
+    }
+    let mut r = free_conn(&server);
+    let mut args = vec!["EVALSHA", reader.as_str(), "1", "{r}:x"];
+    args.extend_from_slice(&["INFO", "server"]);
+    assert!(matches!(r.cmd(&args), V::Str(_)), "INFO server");
+    assert!(server.holding(), "the script was done before the calls");
+    assert_eq!(script.join().unwrap(), V::Int(1));
+    // A script of no keys runs alone.
+    let alone = c.cmd(&["EVAL", "return redis.call('INFO', 'keyspace')", "0"]);
+    assert!(matches!(alone, V::Str(ref text) if text.contains("keys=")), "{alone:?}");
+    // The index is still there.
+    assert!(matches!(c.cmd(&["FT.INFO", "idx772"]), V::Arr(_)));
+}
+
+#[test]
+fn a_script_beside_others_reads_no_keys_it_does_not_name_tokio() {
+    a_script_beside_others_reads_no_keys_it_does_not_name("tokio");
+}
+
+#[test]
+fn a_script_beside_others_reads_no_keys_it_does_not_name_uring() {
+    a_script_beside_others_reads_no_keys_it_does_not_name("uring");
+}
+
+/// `FT.DROPINDEX … DD` sent while a script that runs beside others is held
+/// between the writes of two documents of the index runs after the script:
+/// both documents go.
+fn a_drop_of_documents_waits_for_scripts(io: &str) {
+    let server = Server::start(io, 4);
+    let mut c = server.conn();
+    create_index(&mut c);
+    let sha = quick_six(&mut c);
+    let script = held_six(&server, &sha);
+    let mut d = free_conn(&server);
+    d.send(&["FT.DROPINDEX", "idx772", "DD"]);
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(server.holding(), "the script was done before the drop");
+    let reply = d.read();
+    let after = !server.holding();
+    assert_eq!(reply, V::Str("OK".into()));
+    assert!(after, "the documents were dropped while the script was held");
+    assert_eq!(script.join().unwrap(), V::Int(1));
+    assert_eq!(c.cmd(&["EXISTS", "{t}:doc1", "{t}:doc2"]), V::Int(0));
+}
+
+#[test]
+fn a_drop_of_documents_waits_for_scripts_tokio() {
+    a_drop_of_documents_waits_for_scripts("tokio");
+}
+
+#[test]
+fn a_drop_of_documents_waits_for_scripts_uring() {
+    a_drop_of_documents_waits_for_scripts("uring");
 }
