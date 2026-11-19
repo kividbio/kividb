@@ -211,7 +211,7 @@ impl Server {
         if let Some(text) = config {
             std::fs::write(dir.join("kividb.conf"), text).unwrap();
         }
-        Self::start_in(dir, io_model, config.is_some(), &[])
+        Self::start_in(dir, io_model, config.is_some(), &[], &[])
     }
 
     /// A replica of `master`.
@@ -219,7 +219,7 @@ impl Server {
     fn start_replica(master: &Server) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
         let port = master.port.to_string();
-        Self::start_in(dir, "tokio", false, &["--replicaof", "127.0.0.1", &port])
+        Self::start_in(dir, "tokio", false, &["--replicaof", "127.0.0.1", &port], &[])
     }
 
     fn start_in(
@@ -227,6 +227,7 @@ impl Server {
         io_model: &str,
         with_config: bool,
         extra: &[&str],
+        envs: &[(&str, &str)],
     ) -> Self {
         // Verified to be the process started, also on a restart from the same
         // directory (a port is free between a server's exit and the next
@@ -252,6 +253,7 @@ impl Server {
                 command.args(["--configfile", "kividb.conf"]);
             }
             command.args(extra);
+            command.envs(envs.iter().copied());
             command
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -300,7 +302,7 @@ impl Server {
         let _ = self.child.wait();
         let dir = std::mem::take(&mut self.dir);
         std::mem::forget(self);
-        Self::start_in(dir, io_model, true, &[])
+        Self::start_in(dir, io_model, true, &[], &[])
     }
 
     /// `CONFIG GET` of one name: its value.
@@ -755,39 +757,56 @@ fn a_pipeline_sent_before_reading_is_answered() {
     }
 }
 
-/// The same with the first commands sent one at a time, each its own turn:
-/// the replies fill the socket a turn at a time, so a later turn finds it
-/// already full before it writes anything. The io_uring loop reads on
-/// while it writes only once a send without waiting finds the socket full;
-/// it must, whether that send took part of the replies or none of them.
+/// Every way the io_uring loop's first send of a batch of replies can end,
+/// in turn: whole, short, nothing (`WouldBlock`), interrupted. Debug builds
+/// take them from `KIVIDB_TEST_SEND_NOW`, so each comes up whatever the
+/// kernel's socket buffers do. After any but the first, the rest is written
+/// while the client is read: every reply arrives whole and in order, one
+/// command at a time and in #865's pipeline sent before reading. Fails if a
+/// send that took nothing or was interrupted closed the connection, or if a
+/// short send's rest were not written.
+#[cfg(all(target_os = "linux", debug_assertions))]
 #[test]
-fn a_pipeline_sent_in_parts_before_reading_is_answered() {
+fn every_way_a_send_without_waiting_ends_writes_the_rest() {
     let _turn = serial();
-    for &io_model in io_models() {
-        let server = Server::start(io_model);
-        let value = "v".repeat(MB);
-        assert!(server.conn().cmd(&["SET", "big", &value]).ok());
-        let mut c = server.conn();
-        c.writer
-            .set_write_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        for i in 0..10 {
-            c.writer
-                .write_all(b"*2\r\n$3\r\nGET\r\n$3\r\nbig\r\n")
-                .unwrap_or_else(|e| panic!("{io_model}: GET {i}: {e}"));
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let set = format!("*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n${MB}\r\n{value}\r\n");
-        c.writer
-            .write_all(set.repeat(16).as_bytes())
-            .unwrap_or_else(|e| panic!("{io_model}: the server stopped reading: {e}"));
-        for _ in 0..10 {
-            assert_eq!(c.read(), Some(V::Bulk(value.clone().into_bytes())));
-        }
-        for _ in 0..16 {
-            assert!(c.read().unwrap().ok());
-        }
+    let dir = tempfile::tempdir().unwrap().keep();
+    let server = Server::start_in(
+        dir,
+        "uring",
+        false,
+        &[],
+        &[("KIVIDB_TEST_SEND_NOW", "short,none,interrupted,as")],
+    );
+    let value = "v".repeat(MB);
+    assert!(server.conn().cmd(&["SET", "big", &value]).ok());
+    let mut c = server.conn();
+    c.writer
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    for i in 0..40 {
+        assert_eq!(
+            c.cmd(&["GET", "big"]),
+            V::Bulk(value.clone().into_bytes()),
+            "GET {i}"
+        );
+        assert_eq!(c.cmd(&["PING"]), V::Str("PONG".into()), "PING {i}");
     }
+    let mut pipeline = b"*2\r\n$3\r\nGET\r\n$3\r\nbig\r\n".repeat(10);
+    let set = format!("*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n${MB}\r\n{value}\r\n");
+    pipeline.extend_from_slice(set.repeat(16).as_bytes());
+    c.writer
+        .write_all(&pipeline)
+        .unwrap_or_else(|e| panic!("the server stopped reading: {e}"));
+    for _ in 0..10 {
+        assert_eq!(c.read(), Some(V::Bulk(value.clone().into_bytes())));
+    }
+    for _ in 0..16 {
+        assert!(c.read().unwrap().ok());
+    }
+    let short: u64 = server.info_field("debug_sends_short").parse().unwrap();
+    let none: u64 = server.info_field("debug_sends_none").parse().unwrap();
+    assert!(short > 0, "no short send went on to write its rest");
+    assert!(none > 0, "no send that took nothing went on to write");
 }
 
 /// What the server reads ahead counts against `client-query-buffer-limit`:

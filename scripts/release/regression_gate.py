@@ -23,7 +23,8 @@ was recorded on, and a candidate commit that is an ancestor of the judged
 commit with src/, Cargo.toml, Cargo.lock and rust-toolchain.toml unchanged
 since (the package version line aside) and the suite directory unchanged
 apart from added results/ directories. A suite with no rows in baseline.json
-fails the gate outright.
+fails the gate outright, unless every gate it emits is session-relative
+(vs_v1_2_2, vs_redis, info: session_only()), which needs nothing recorded.
 """
 import json
 import os
@@ -47,11 +48,35 @@ def suite_of(key):
     return key.split("/", 1)[0]
 
 
-def unrecorded(suites, baseline):
+# Gates judged within the run itself, against what it measured of another
+# engine in the same session: none of them reads a recorded value.
+SESSION_GATES = {"vs_v1_2_2", "vs_redis", "info"}
+
+
+def session_only(rows):
+    """Suites all of whose rows, in the runs judged (rejudge()'s rows), carry
+    only session-relative gates (SESSION_GATES). Such a suite needs nothing
+    recorded: every gate of its compares the candidate with v1.2.2 or Redis
+    measured in the same run. One row with another gate (rel, ratio, bound)
+    and the suite needs its recorded values like any other."""
+    kinds = {}
+    for r in rows:
+        ks = kinds.setdefault(suite_of(r["key"]), set())
+        gates = r.get("gates") or []
+        if not gates:
+            ks.add(None)
+        for g in gates:
+            ks.add((g.get("gate") or {}).get("kind"))
+    return {s for s, ks in kinds.items() if ks and ks <= SESSION_GATES}
+
+
+def unrecorded(suites, baseline, session=()):
     """Suites of the tree with no metric in baseline.json: nothing of theirs
-    can be judged (every gate would say "new"), so they cannot count."""
+    can be judged (every gate would say "new"), so they cannot count. A suite
+    whose gates are all session-relative (`session`, from session_only()) is
+    judged without recorded values and is not refused for having none."""
     have = {suite_of(k) for k in (baseline or {}).get("metrics", {})}
-    return sorted(s for s in suites if s not in have)
+    return sorted(s for s in suites if s not in have and s not in session)
 
 
 def rejudge(compare, env, results, baseline):
@@ -325,7 +350,7 @@ def main(argv):
             f.write(lines)
         return env, compare.load_results(rpath)
 
-    judged, envs = {}, []
+    judged, envs, rows = {}, [], []
     for run in runs:
         try:
             env, results = raw_files(run)
@@ -334,8 +359,9 @@ def main(argv):
             continue
         envs.append(env)
         summ = rejudge(compare, env, results, baseline)
+        rows += summ.get("rows") or []
         judged[run] = judge(env, summ, suites, code_reasons, baseline)
-    missing = unrecorded(suites, baseline)
+    missing = unrecorded(suites, baseline, session_only(rows))
     if missing:
         error("%s/baseline.json has no recorded values for: %s. A suite must be recorded (run-all.sh --record "
               "on the machine it declares) before a release can count it." % (base, ", ".join(missing)))

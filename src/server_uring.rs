@@ -742,17 +742,27 @@ impl tokio_uring::OneshotOutputTransform for SendNowOutput {
 /// the thread for it later, where a read submitted a turn later finds the
 /// next request there already. That was 10 % of the throughput of plain,
 /// unpipelined commands on many connections.
-fn send_now(
+async fn send_now(
     stream: &Rc<tokio_uring::net::TcpStream>,
     buf: Vec<u8>,
-) -> tokio_uring::InFlightOneshot<SendNow, SendNowOutput> {
+) -> (std::io::Result<usize>, Vec<u8>) {
     use std::os::fd::AsRawFd;
     // A batch over 4 GiB goes in parts: the first is a short send.
-    let len = buf.len().min(u32::MAX as usize) as u32;
-    let sqe =
-        io_uring::opcode::Send::new(io_uring::types::Fd(stream.as_raw_fd()), buf.as_ptr(), len)
-            .flags(libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
-            .build();
+    let len = buf.len().min(u32::MAX as usize);
+    #[cfg(debug_assertions)]
+    let len = match test_send_now() {
+        TestSend::As => len,
+        TestSend::Short => (len / 2).max(1),
+        TestSend::None => return (Err(std::io::ErrorKind::WouldBlock.into()), buf),
+        TestSend::Interrupted => return (Err(std::io::ErrorKind::Interrupted.into()), buf),
+    };
+    let sqe = io_uring::opcode::Send::new(
+        io_uring::types::Fd(stream.as_raw_fd()),
+        buf.as_ptr(),
+        len as u32,
+    )
+    .flags(libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+    .build();
     tokio_uring::UnsubmittedOneshot::new(
         SendNow {
             _stream: Rc::clone(stream),
@@ -762,6 +772,48 @@ fn send_now(
         sqe,
     )
     .submit()
+    .await
+}
+
+/// Debug builds only, for tests: what `send_now` does with its next batch.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy)]
+enum TestSend {
+    /// Sends it, as a release build does.
+    As,
+    /// Sends half of it at most: a short send.
+    Short,
+    /// Sends none of it: `WouldBlock`.
+    None,
+    /// Sends none of it: `Interrupted`.
+    Interrupted,
+}
+
+/// `KIVIDB_TEST_SEND_NOW`, a comma-separated cycle of `as`, `short`, `none`
+/// and `interrupted` that the batches of every connection take in turn, so
+/// that a test meets each way a send without waiting can end, wherever the
+/// kernel's socket buffers stand. Unset: every batch `as`.
+#[cfg(debug_assertions)]
+fn test_send_now() -> TestSend {
+    static CYCLE: std::sync::OnceLock<Vec<TestSend>> = std::sync::OnceLock::new();
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let cycle = CYCLE.get_or_init(|| {
+        std::env::var("KIVIDB_TEST_SEND_NOW")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| match s.trim() {
+                "as" => Some(TestSend::As),
+                "short" => Some(TestSend::Short),
+                "none" => Some(TestSend::None),
+                "interrupted" => Some(TestSend::Interrupted),
+                _ => None,
+            })
+            .collect()
+    });
+    if cycle.is_empty() {
+        return TestSend::As;
+    }
+    cycle[NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % cycle.len()]
 }
 
 /// `write`, a batch of replies being written, with what the client sends
@@ -3446,18 +3498,33 @@ pub async fn handle_client(
                     && shutdown_wait.is_none()
                     && connection_handoff.is_none() =>
                 {
-                    let (sent, mut spare_buf) = send_now(&stream, spare_buf).await;
+                    let (sent, spare_buf) = send_now(&stream, spare_buf).await;
                     match sent {
                         Ok(n) if n == spare_buf.len() => (Ok(()), spare_buf),
-                        Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => (Err(e), spare_buf),
-                        // The socket is full: the client may be sending while
-                        // its replies wait (#865). The read the next turn
-                        // makes is submitted before the rest is written, so
-                        // that the two reach the kernel together; if it
-                        // finishes first, the client is read on while the
-                        // rest is written.
+                        Err(e)
+                            if !matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                            ) =>
+                        {
+                            (Err(e), spare_buf)
+                        }
+                        // The socket is full (or the send was interrupted):
+                        // the client may be sending while its replies wait
+                        // (#865). The read the next turn makes is submitted
+                        // before the rest is written, so that the two reach
+                        // the kernel together; if it finishes first, the
+                        // client is read on while the rest is written.
                         sent => {
-                            spare_buf.drain(..sent.unwrap_or(0));
+                            let sent = sent.unwrap_or(0);
+                            #[cfg(debug_assertions)]
+                            if sent == 0 {
+                                crate::stats::DEBUG_SENDS_NONE
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                crate::stats::DEBUG_SENDS_SHORT
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             if parse_buf.capacity().saturating_sub(parse_buf.len()) < READ_MIN {
                                 parse_buf.reserve(READ_BUFFER);
                             }
@@ -3465,7 +3532,12 @@ pub async fn handle_client(
                             early.set(Some(
                                 reader.read(std::mem::take(&mut parse_buf).slice(early_from..)),
                             ));
-                            let mut write = std::pin::pin!(stream.write_all(spare_buf));
+                            // The rest, from where the send stopped: written
+                            // out of the same buffer, not copied to its front.
+                            let mut write = std::pin::pin!(async {
+                                let (res, rest) = stream.write_all(spare_buf.slice(sent..)).await;
+                                (res, rest.into_inner())
+                            });
                             let read = early.as_mut().as_pin_mut().expect("submitted above");
                             tokio::select! {
                                 biased;

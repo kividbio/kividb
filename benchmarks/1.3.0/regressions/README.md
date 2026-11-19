@@ -463,6 +463,16 @@ if __name__ == "__main__":
   (`with Nodes(ctx) as ns: nodes = ns.cluster(3)`); `ctx.bin` is the engine's
   binary and `ctx.port`/`ctx.pid` are None. A suite that needs one more
   server beside run-all.sh's uses `ns.start()` the same way.
+- Record it (`--record`) unless every gate it emits is session-relative
+  (`vs_v1_2_2`, `vs_redis`, `info`): the release gate refuses a suite with no
+  rows in `baseline.json` (`scripts/release/regression_gate.py`, `unrecorded()`)
+  except such a session-only one (`session_only()`), which needs nothing
+  recorded. One row with a recorded gate (`rel`, `ratio`, `bound`) and the
+  suite must be recorded like any other. Recording freezes each gate as the
+  suite declared it then, so a suite that picks a row's gate at run time
+  (`29-unpipelined-commands`: client-limited rows are `info`) must stay
+  session-only.
+- State `threads=` on every `Config`.
 - Add its row to the table at the top and its numbers below.
 
 ## Recorded run, suites 01-04

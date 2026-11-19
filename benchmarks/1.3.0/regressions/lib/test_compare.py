@@ -562,6 +562,29 @@ class GateStrict(unittest.TestCase):
         self.assertEqual(regression_gate.unrecorded(["01-small", "26-new"], self.baseline()), ["26-new"])
         self.assertEqual(regression_gate.unrecorded(["01-small"], self.baseline()), [])
 
+    @staticmethod
+    def row(key, *kinds):
+        return {"key": key, "gates": [{"gate": {"kind": k}, "status": "pass"} for k in kinds]}
+
+    def test_a_suite_of_session_gates_needs_no_recorded_rows(self):
+        rows = [self.row("29-session/c/get_per_s", "vs_v1_2_2"), self.row("29-session/c/get_cpus", "info"),
+                self.row("29-session/d/set_per_s", "vs_redis")]
+        session = regression_gate.session_only(rows)
+        self.assertEqual(session, {"29-session"})
+        self.assertEqual(regression_gate.unrecorded(["01-small", "29-session"], self.baseline(), session), [])
+
+    def test_a_suite_mixing_recorded_and_session_gates_needs_its_rows(self):
+        rows = [self.row("30-mixed/c/get_per_s", "vs_v1_2_2"), self.row("30-mixed/c/set_per_s", "rel", "vs_v1_2_2")]
+        session = regression_gate.session_only(rows)
+        self.assertEqual(session, set())
+        self.assertEqual(regression_gate.unrecorded(["01-small", "30-mixed"], self.baseline(), session),
+                         ["30-mixed"])
+
+    def test_a_suite_not_run_is_not_taken_for_session_only(self):
+        session = regression_gate.session_only([self.row("29-session/c/get_per_s", "vs_v1_2_2")])
+        self.assertEqual(regression_gate.unrecorded(["26-new", "29-session"], self.baseline(), session),
+                         ["26-new"])
+
     def test_rows_that_are_new_are_refused(self):
         summ = dict(OK_SUMMARY, rows=[{"key": "01-small/c/x_rps", "status": "new"}])
         why, covers = regression_gate.judge(self.env(), summ, ["01-small"])
