@@ -1670,6 +1670,15 @@ impl<'a> FilteredKnn<'a> {
                 }
             }
             LiveIndex::Hnsw(idx) => {
+                // A vector waiting to be linked is the key's latest.
+                if let Some(d) = idx.backlog.with_waiting(key, |w| {
+                    (w.vector.len() == dim).then(|| self.query.to_unit(&w.vector))
+                }) {
+                    if let Some(d) = d {
+                        self.best.offer(d, key);
+                    }
+                    return;
+                }
                 let Some(id) = idx.key_to_id.read().get(key).copied() else {
                     return;
                 };
@@ -1957,12 +1966,27 @@ fn knn_measured(
                 }
             }
             LiveIndex::Hnsw(graph) => {
+                // A vector waiting to be linked is the key's latest: it is
+                // measured where it waits, and the graph not asked.
+                let mut run: Vec<&Arc<str>> = run.iter().collect();
+                if !graph.backlog.is_empty() {
+                    let waiting = graph.backlog.read();
+                    run.retain(|key| match waiting.get(&***key) {
+                        Some(w) => {
+                            if w.vector.len() == dim {
+                                best.offer(query.to_unit(&w.vector), key);
+                            }
+                            false
+                        }
+                        None => true,
+                    });
+                }
                 // The two locks one after the other, never together: an
                 // insert takes the ids' for writing while it holds the
                 // nodes'.
                 let found: Vec<(usize, &Arc<str>)> = {
                     let key_to_id = graph.key_to_id.read();
-                    run.iter()
+                    run.into_iter()
                         .filter_map(|key| key_to_id.get(&**key).map(|&id| (id, key)))
                         .collect()
                 };

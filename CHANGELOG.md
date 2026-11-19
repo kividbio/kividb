@@ -378,6 +378,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   RESP3). `return 1` and a lock's compare-and-delete still cost 18 % and
   11 % more than in Redis on one worker, around the call rather than in it.
 
+- **An HNSW index is built 4x faster from one client (#760).** A vector
+  written to an HNSW index is put in its graph's backlog and linked by
+  helper threads (half the CPUs the server may use, `SCHED_IDLE` on Linux),
+  where up to 1.2 the writing connection's thread linked it inside the
+  write: one client loading documents built the graph on one CPU. A search
+  measures every vector of the backlog exactly beside the graph's, so a
+  document is found from the moment its `HSET` is answered, as before; the
+  backlog holds at most 1,024 vectors and 128 Ki floats, and a writer that
+  finds it full links its vector itself. `FT.CREATE` over existing
+  documents, a restart and a replica's full sync hand their vectors over the
+  same way. `FT.INFO` shows `hnsw_backlog` and `hnsw_backlog_bytes`; the
+  snapshot format is unchanged (a vector still waiting at a save is put in
+  the graph at load, as 1.2.2 also does). An Azure D8s_v5, one client,
+  `M 16 EF_CONSTRUCTION 200`, medians of 3, 1.2.2 / 1.3.0 / Redis 8.10.2:
+  50,000 384-d documents 1,615 / 6,495 / 7,783 a second; 200,000 64-d
+  2,556 / 9,970 / 16,081; `FT.CREATE` over 50,000 written 1,666 / 2,746 /
+  7,442; peak RSS 215 / 218 / 248 MiB. Recall at a given `EF_RUNTIME` is
+  unchanged, fresh and after rounds of overwrites and deletes. GET/SET from
+  other clients during such a load: 144k a second at a p99 of 1.08 ms
+  (before: 137k, 0.39 ms, p99.9 25 against 11.6 ms). Unfiltered KNN was
+  never slower than Redis at the same recall: a KNN looks at at least 50
+  candidates, so the default `EF_RUNTIME 10` gives recall 0.38 at 2,844 q/s
+  where Redis gives 0.11 at 4,276 and 0.42 at 2,006 (`EF_RUNTIME 80`); see
+  docs/PERFORMANCE.md.
+
 - **Writes on a master with a replication backlog and no replica no
   longer wake the replication thread one by one (#894).** A master that
   starts with data (its own snapshot, or any dataset) keeps the backlog for
@@ -923,6 +948,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   timeout, or `CLIENT UNBLOCK`) woke the next client waiting on its key
   for no reason, which is what opened that window: Redis's unit/pause
   failed on it now and then.
+
+- **The catch-up pass of an HNSW compaction takes a key's newer vector.**
+  Writes made while a compaction rebuilds a graph now go to the new graph
+  too, from before the copy, and the copy leaves a key a write touched as
+  the write left it.
 
 - **Sorted-set commands read integers as Redis does.** `ZREMRANGEBYRANK
   key x 5` took `x` as 0 and removed members; it now answers `ERR value is

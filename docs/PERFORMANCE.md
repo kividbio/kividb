@@ -316,6 +316,88 @@ All of it was measured with a Go client (the scripts above, one command at a tim
 connection), `/proc` for the server's CPU, `INFO commandstats` for the calls, and callgrind
 for the instructions, each tree and 1.2.2 built by the same rustc.
 
+## Vector index builds
+
+Since 1.3.0 helper threads link the vectors written to an HNSW index into
+its graph ([#760](https://github.com/kividbio/kividb/issues/760); see
+[SEARCH.md](SEARCH.md#index-builds-and-ef_runtime)). Up to 1.2 each vector
+was linked inside its write, on the thread of the connection that wrote it,
+so one client loading documents built the graph on one CPU. KiviDB spent
+less CPU per document than Redis 8.10's query engine; Redis links on eight
+threads.
+
+Measured on an Azure `Standard_D8s_v5` (4 cores, 8 threads), the client on
+the same machine, one server at a time, rustc 1.100.0 builds of 1.2.2 (from
+its tag), master and this change, Redis 8.10.2 from the `redis:8.10.2` image
+(`--save "" --appendonly no`), medians of 3. `FT.CREATE ... VECTOR HNSW ...
+COSINE M 16 EF_CONSTRUCTION 200`, random vectors in [0, 1), one client
+writing `HSET` pipelines of 1,000; the clock stops when every document is in
+the graph:
+
+| | 1.2.2 | 1.3.0 before | 1.3.0 | Redis 8.10.2 |
+|---|---:|---:|---:|---:|
+| 50,000 × 384-d, documents a second | 1,615 | 1,584 | 6,495 | 7,783 |
+| the same, CPU seconds | 30.6 | 31.2 | 35.9 | 47.0 |
+| the same, peak RSS | 215 MiB | 217 MiB | 218 MiB | 248 MiB |
+| 200,000 × 64-d, documents a second | 2,556 | 2,548 | 9,970 | 16,081 |
+| `FT.CREATE` over the 50,000 already written | 1,666 | 1,648 | 2,746 | 7,442 |
+| 2 rounds of writing over half and deleting a tenth | 40.0 s | 40.5 s | 13.2 s | 12.1 s |
+
+KNN q/s of one client (`KNN 10`, `NOCONTENT`) and recall@10 against exact,
+384-d, at the same `EF_RUNTIME` and at the same recall:
+
+| `EF_RUNTIME` | 1.3.0 recall / q/s | Redis recall / q/s |
+|---|---|---|
+| 10 (the default) | 0.381 / 2,844 (searches with 50: see SEARCH.md) | 0.114 / 4,276 |
+| 40 | 0.381 / 2,942 | 0.288 / 2,942 |
+| 80 | 0.473 / 2,309 | 0.424 / 2,006 |
+| 160 | 0.626 / 1,505 | 0.586 / 1,317 |
+
+So Redis's default answers twice as many queries with a third of the recall;
+at the same recall KiviDB answers 15-30 % more. The issue's "2.3x slower
+unfiltered KNN" is that comparison. On dbpedia-openai-100K-1536 (the
+`vector-benchmark.yml` settings: M 16, EF_CONSTRUCTION 128, 16 upload
+clients, the tool's client on the same machine, medians of 3):
+
+| | 1.2.2 | 1.3.0 | Redis 8.10.2 |
+|---|---:|---:|---:|
+| upload until indexed | 23.9 s | 22.5 s | 17.5 s |
+| ef 64, 1 client: recall / q/s | 0.967 / 1,308 | 0.969 / 1,334 | 0.955 / 1,294 |
+| ef 128, 1 client: recall / q/s | 0.986 / 821 | 0.986 / 807 | 0.980 / 835 |
+| ef 128, 16 clients: q/s | 3,562 | 3,825 | 4,116 |
+
+There 16 clients upload at once, so 1.2.2's workers already linked on
+several threads; the helpers add nothing. KiviDB's recall is the higher at
+each ef, and at the same recall it answers more on one client; on 16
+clients sharing the machine with the server Redis answers 7 % more at a
+recall 0.006 lower.
+
+Recall after the update rounds is that of 1.2.2 (0.365 / 0.463 / 0.619 at
+`EF_RUNTIME` 40 / 80 / 160, against 0.363 / 0.460 / 0.622). Queries beside
+500 `HSET` a second of 200,000 64-d documents: p99 0.35 ms (1.2.2 0.34,
+Redis 0.40).
+
+What the helpers cost the rest of the server: GET/SET from memtier (40
+connections, the server on 6 vCPUs) while one client loads 150,000 384-d
+vectors: master before this change 137k a second at a p99 of 0.39 ms and a p99.9 of 25 ms
+(the writing connection's worker links each vector); 1.3.0 144k, p99 1.08
+ms, p99.9 11.6 ms, the index built in 41 s instead of 130. One helper per
+CPU built it in 36 s but cut GET/SET to 112k at a p99 of 3.7 ms; hence half
+the CPUs, as `SCHED_IDLE`. A 1,536-d KNN beside the same kind of load takes
+1.7 ms at the median against 0.8 ms (the helpers share the cores); Redis
+8.10.2 takes 10.4 ms beside its own load, against 0.9 idle.
+
+Left: 64-d documents build at 0.62x Redis's rate. Per document the helpers
+spend 23 % more CPU than one thread linking alone (93.6 against 77.2 CPU
+seconds for 200,000): no lock shows in the profile (`search_layer` 57 %,
+the distance kernel 18 %, the kernel's futex paths about 1 %); four helpers
+and the writer share 4 cores' 8 hyperthreads and their caches.
+
+Suite `28-ft-hnsw` of
+[the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
+the 50,000 × 384-d build and KNN against 1.2.2 (and Redis, given its query
+engine module) and fails a build that loses it.
+
 ## Worker threads
 
 How many workers to start on a CPU allowance ([#873](https://github.com/kividbio/kividb/issues/873)),

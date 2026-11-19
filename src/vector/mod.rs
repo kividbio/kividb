@@ -1,3 +1,4 @@
+pub mod backlog;
 pub mod doc_keys;
 pub mod filter;
 pub mod postings;
@@ -1533,7 +1534,9 @@ pub fn backfill_from_db_progress(
                     if w.loaded && holds_vector(idx, key, &vec, &w.metric) {
                         continue;
                     }
-                    hnsw_insert_doc(idx, key.to_string(), vec, &w.metric, doc);
+                    // Linked by the helpers, as a write's is: the walk holds
+                    // the key's order, so what it read is the key's latest.
+                    backlog::write(idx, key, vec, &w.metric, doc);
                 }
             }
         }
@@ -1586,6 +1589,12 @@ pub fn backfill_from_db_progress(
 /// Whether `index` holds `vector` for `key`, as an insert of it would have
 /// stored it (a cosine vector at unit length, by the same arithmetic).
 fn holds_vector(index: &HnswIndex, key: &str, vector: &[f32], metric: &DistanceMetric) -> bool {
+    if let Some(same) = index
+        .backlog
+        .with_waiting(key, |w| *w.vector == *as_stored(metric, vector.to_vec()))
+    {
+        return same;
+    }
     let Some(id) = index.key_to_id.read().get(key).copied() else {
         return false;
     };
@@ -1815,6 +1824,11 @@ pub struct HnswIndex {
     /// before it answers.
     reused: AtomicU64,
 
+    /// Vectors written and not linked into the graph yet: the helper
+    /// threads link them, and a search measures each meanwhile (see
+    /// [`backlog`]).
+    pub(crate) backlog: backlog::Backlog,
+
     /// The graph a compaction is building to replace this one, once it has
     /// begun: every write to this graph is made to it too (see
     /// [`compact_hnsw`]). Kept after the swap, for writes that found this
@@ -1822,14 +1836,16 @@ pub struct HnswIndex {
     shadow: parking_lot::Mutex<Option<Arc<HnswIndex>>>,
 
     /// Keys written to this graph while it is a compaction's copy in the
-    /// making: the copy leaves them as those writes left them. Held while
-    /// such a write, or the copy of one key, is made.
+    /// making: the copy leaves them as those writes left them.
     touched: parking_lot::Mutex<Option<ahash::AHashSet<String>>>,
 }
 
 impl HnswIndex {
     pub fn new(m: usize, ef_construction: usize) -> Self {
         Self {
+            backlog: backlog::Backlog::default(),
+            shadow: parking_lot::Mutex::new(None),
+            touched: parking_lot::Mutex::new(None),
             nodes: RwLock::new(HnswNodes::new()),
             slots: std::sync::OnceLock::new(),
             key_to_id: RwLock::new(AHashMap::new()),
@@ -1843,8 +1859,6 @@ impl HnswIndex {
             compaction_in_progress: AtomicBool::new(false),
             free: parking_lot::Mutex::new(Vec::new()),
             reused: AtomicU64::new(0),
-            shadow: parking_lot::Mutex::new(None),
-            touched: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1968,16 +1982,22 @@ impl HnswIndex {
         self.shadow.lock().clone()
     }
 
-    /// `vector` (None: the key's vector is gone) written to this graph as a
-    /// compaction's copy in the making: what the copy then finds for the
-    /// key is left alone.
-    fn mirror(self: &Arc<Self>, key: &str, vector: Option<Vec<f32>>, metric: &DistanceMetric) {
-        let mut touched = self.touched.lock();
-        if let Some(touched) = touched.as_mut() {
+    /// `vector` (as the graph stores it; None: the key's vector is gone)
+    /// written to this graph as a compaction's copy in the making, under
+    /// the key's lock: what the copy then finds for the key is left alone.
+    fn mirror(
+        self: &Arc<Self>,
+        key: &str,
+        vector: Option<Vec<f32>>,
+        metric: &DistanceMetric,
+        doc: u32,
+    ) {
+        let _key = self.backlog.lock_key(key);
+        if let Some(touched) = self.touched.lock().as_mut() {
             touched.insert(key.to_string());
         }
         match vector {
-            Some(v) => hnsw_insert(self, key.to_string(), v, metric),
+            Some(v) => insert_unit(self, key.to_string(), v, metric, doc),
             None => {
                 let node_id = self.key_to_id.write().remove(key);
                 if let Some(node_id) = node_id {
@@ -2588,17 +2608,12 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
             match live {
                 LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
                 LiveIndex::Hnsw(idx) => {
-                    if how == Write::Refresh && idx.key_to_id.read().contains_key(key) {
+                    if how == Write::Refresh
+                        && (idx.backlog.holds(key) || idx.key_to_id.read().contains_key(key))
+                    {
                         continue;
                     }
-                    // While a compaction builds the graph that replaces
-                    // this one, the write is made to that graph too, after
-                    // this one: see `compact_hnsw`.
-                    let copy = vec.clone();
-                    hnsw_insert_doc(idx, key.to_string(), vec, &metric, doc);
-                    if let Some(shadow) = idx.shadow() {
-                        shadow.mirror(key, Some(copy), &metric);
-                    }
+                    backlog::write(idx, key, vec, &metric, doc);
                 }
             }
         }
@@ -2638,15 +2653,20 @@ fn unindex_vector(live: &LiveIndex, key: &str) {
             idx.vectors.write().remove(key);
         }
         LiveIndex::Hnsw(idx) => {
-            let node_id = idx.key_to_id.write().remove(key);
-            if let Some(node_id) = node_id {
-                let mut nodes = idx.nodes.write();
-                if nodes.get(node_id).is_some_and(|n| n.key == key) {
-                    idx.delete(&mut nodes, node_id);
+            {
+                let _key = idx.backlog.lock_key(key);
+                let seen = idx.backlog.ticket(key);
+                let node_id = idx.key_to_id.write().remove(key);
+                if let Some(node_id) = node_id {
+                    let mut nodes = idx.nodes.write();
+                    if nodes.get(node_id).is_some_and(|n| n.key == key) {
+                        idx.delete(&mut nodes, node_id);
+                    }
                 }
+                idx.backlog.forget(key, seen);
             }
             if let Some(shadow) = idx.shadow() {
-                shadow.mirror(key, None, &DistanceMetric::L2);
+                shadow.mirror(key, None, &DistanceMetric::L2, postings::NO_DOC);
             }
         }
     }
@@ -3239,8 +3259,37 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
 type PrecomputedBacklink = (u32, usize, Vec<u32>, Vec<u32>);
 const NEW_NODE: u32 = u32::MAX;
 
-/// [`hnsw_insert`] of the vector of the document whose id is `doc`.
+/// [`hnsw_insert`] of the vector of the document whose id is `doc`, here and
+/// now: a vector of the key's waiting in the backlog is dropped, this one
+/// being the later.
 pub fn hnsw_insert_doc(
+    index: &Arc<HnswIndex>,
+    key: String,
+    vector: Vec<f32>,
+    metric: &DistanceMetric,
+    doc: u32,
+) {
+    let _key = index.backlog.lock_key(&key);
+    let seen = index.backlog.ticket(&key);
+    insert_unit(index, key.clone(), as_stored(metric, vector), metric, doc);
+    index.backlog.forget(&key, seen);
+}
+
+/// A vector as a graph stores it: cosine vectors at unit length, so that
+/// every distance after is a dot product with no square roots.
+fn as_stored(metric: &DistanceMetric, vector: Vec<f32>) -> Vec<f32> {
+    if matches!(metric, DistanceMetric::Cosine) {
+        normalize_to_unit(vector)
+    } else {
+        vector
+    }
+}
+
+/// Insert `vector`, already as the graph stores it ([`as_stored`]), for
+/// `key`, replacing the key's node if it has one. The caller holds the
+/// key's lock in the backlog ([`backlog::Backlog::lock_key`]), so that
+/// inserts and deletes of one key do not cross.
+fn insert_unit(
     index: &Arc<HnswIndex>,
     key: String,
     vector: Vec<f32>,
@@ -3257,13 +3306,6 @@ pub fn hnsw_insert_doc(
         }
     }
 
-    // Cosine vectors are stored as unit-length so that all distance calls can
-    // skip the expensive sqrt/divide and use pure dot product instead.
-    let vector = if matches!(metric, DistanceMetric::Cosine) {
-        normalize_to_unit(vector)
-    } else {
-        vector
-    };
     // The first vector sets the graph's dimension; one of another (which
     // the schema rules out) has nowhere to go.
     let slots = index
@@ -3811,6 +3853,36 @@ pub fn knn_hnsw(
         query
     };
 
+    // Vectors written and not linked yet are measured too, each in place of
+    // what the graph holds for its key; the graph is asked for as many more
+    // as may be left out for that.
+    //
+    // The backlog is held for reading for the whole search: a helper that
+    // linked a key's waiting vector meanwhile would otherwise take it out
+    // of the backlog after the graph was searched with the key's previous
+    // node still in it, and that node would be kept.
+    if index.backlog.is_empty() {
+        return knn_graph(index, query, k, k, ef, metric);
+    }
+    let waiting = index.backlog.read();
+    if waiting.is_empty() {
+        drop(waiting);
+        return knn_graph(index, query, k, k, ef, metric);
+    }
+    let found = knn_graph(index, query, k, k.saturating_add(waiting.len()), ef, metric);
+    backlog::merge(&waiting, query, metric, found, k, None)
+}
+
+/// [`knn_hnsw`] over the graph alone, `query` as the graph holds vectors:
+/// the `keep` nearest (at least `k`) of what a search for `k` finds.
+fn knn_graph(
+    index: &HnswIndex,
+    query: &[f32],
+    k: usize,
+    keep: usize,
+    ef: usize,
+    metric: &DistanceMetric,
+) -> Vec<KnnResult> {
     let Some(slots) = index.slots() else {
         return vec![];
     };
@@ -3845,7 +3917,7 @@ pub fn knn_hnsw(
             .map(|(i, _)| (distance_prenorm(metric, query, slots.vector(i)), i as u32))
             .collect();
         scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-        return into_results(index, slots, &nodes, query, metric, scored, k, reused);
+        return into_results(index, slots, &nodes, query, metric, scored, keep, reused);
     }
 
     // Large graph: HNSW traversal
@@ -3879,7 +3951,7 @@ pub fn knn_hnsw(
         results.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
     }
 
-    into_results(index, slots, &nodes, query, metric, results, k, reused)
+    into_results(index, slots, &nodes, query, metric, results, keep, reused)
 }
 
 /// KNN over the graph, among only the nodes `admit` lets in: the search
@@ -3901,6 +3973,46 @@ pub fn knn_hnsw_admitting(
     index: &HnswIndex,
     query: &[f32],
     k: usize,
+    ef: usize,
+    metric: &DistanceMetric,
+    admit: &mut dyn FnMut(&HnswNode) -> bool,
+    budget: usize,
+    deadline: Option<std::time::Instant>,
+) -> Option<(Vec<KnnResult>, bool)> {
+    // As in `knn_hnsw`: the backlog's vectors let in are measured too.
+    if index.backlog.is_empty() {
+        return admitting_graph(index, query, k, k, ef, metric, admit, budget, deadline);
+    }
+    let waiting = index.backlog.read();
+    if waiting.is_empty() {
+        drop(waiting);
+        return admitting_graph(index, query, k, k, ef, metric, admit, budget, deadline);
+    }
+    let (found, cut) = admitting_graph(
+        index,
+        query,
+        k,
+        k.saturating_add(waiting.len()),
+        ef,
+        metric,
+        admit,
+        budget,
+        deadline,
+    )?;
+    Some((
+        backlog::merge(&waiting, query, metric, found, k, Some(admit)),
+        cut,
+    ))
+}
+
+/// [`knn_hnsw_admitting`] over the graph alone: the `keep` nearest (at
+/// least `k`) of what a search for `k` finds.
+#[allow(clippy::too_many_arguments)]
+fn admitting_graph(
+    index: &HnswIndex,
+    query: &[f32],
+    k: usize,
+    keep: usize,
     ef: usize,
     metric: &DistanceMetric,
     admit: &mut dyn FnMut(&HnswNode) -> bool,
@@ -4029,7 +4141,7 @@ pub fn knn_hnsw_admitting(
             None => false,
         });
     }
-    let nearest = into_results(index, slots, &nodes, query, metric, found, k, reused);
+    let nearest = into_results(index, slots, &nodes, query, metric, found, keep, reused);
     Some((nearest, cut))
 }
 
@@ -4085,14 +4197,14 @@ pub fn maybe_unindex(index_store: &IndexStore, db: usize, key: &(impl AsRef<[u8]
 
 pub fn compact_hnsw(
     index_store: &IndexStore,
-    db_store: &crate::store::Store,
+    _db_store: &crate::store::Store,
     index_name: &str,
     field_name: &str,
 ) -> Result<usize, &'static str> {
     use std::sync::atomic::Ordering;
 
     // ── Step 1: snapshot the Arc<HnswIndex> for the named field ──────────
-    let (old_arc, metric, dim, data_type, prefixes, m, ef_construction) = {
+    let (old_arc, metric, m, ef_construction) = {
         let store = index_store.read();
         let def = match store.get(index_name) {
             Some(d) => d,
@@ -4123,13 +4235,8 @@ pub fn compact_hnsw(
             }
         };
 
-        let (dim, data_type, metric) = match &vf.field_type {
-            FieldType::Vector {
-                dim,
-                data_type,
-                metric,
-                ..
-            } => (*dim, *data_type, metric.clone()),
+        let metric = match &vf.field_type {
+            FieldType::Vector { metric, .. } => metric.clone(),
             _ => {
                 old_arc
                     .compaction_in_progress
@@ -4140,16 +4247,7 @@ pub fn compact_hnsw(
 
         let m = old_arc.m;
         let ef_construction = old_arc.ef_construction;
-        let prefixes = def.prefixes.clone();
-        (
-            old_arc,
-            metric,
-            dim,
-            data_type,
-            prefixes,
-            m,
-            ef_construction,
-        )
+        (old_arc, metric, m, ef_construction)
     };
 
     struct CompactionGuard<'a>(&'a HnswIndex);
@@ -4166,29 +4264,45 @@ pub fn compact_hnsw(
     //
     // The new graph is made first and given to the old one as its shadow:
     // from here on every write to the old graph is made to the new one too,
-    // and marks the key there. The copy below then leaves a marked key as
-    // its write left it. A write either reaches the old graph before the
-    // copy reads it (and is copied) or finds the shadow (and is made to the
-    // new graph itself), so the new graph misses none, and holds no vector
-    // older than the old one's.
+    // under the key's lock in the new graph, and marks the key there. The
+    // copy below then leaves a marked key as its write left it. A write
+    // either reaches the old graph before the copy reads it (and is copied)
+    // or finds the shadow (and is made to the new graph itself), so the new
+    // graph misses none, and holds no vector older than the old one's.
     let new_index = Arc::new(HnswIndex::new(m, ef_construction));
     *new_index.touched.lock() = Some(ahash::AHashSet::new());
     *old_arc.shadow.lock() = Some(Arc::clone(&new_index));
     let live_pairs: Vec<(String, Vec<f32>)> = {
-        let nodes = old_arc.nodes.read();
-        nodes
+        // A vector waiting in the backlog is its key's latest. The
+        // backlog's lock and the graph's are never held together.
+        let waiting: AHashMap<String, Vec<f32>> = old_arc
+            .backlog
+            .read()
             .iter()
+            .map(|(k, w)| (k.clone(), w.vector.to_vec()))
+            .collect();
+        let nodes = old_arc.nodes.read();
+        let mut pairs: Vec<(String, Vec<f32>)> = nodes
+            .iter()
+            .filter(|(_, n)| !waiting.contains_key(&n.key))
             .filter_map(|(id, n)| Some((n.key.clone(), old_arc.vector(id)?.to_vec())))
-            .collect()
+            .collect();
+        drop(nodes);
+        pairs.extend(waiting);
+        pairs
     };
     let mut copied = 0usize;
     for (key, vec) in live_pairs {
-        let touched = new_index.touched.lock();
-        if touched.as_ref().is_some_and(|t| t.contains(&key)) {
+        let _key = new_index.backlog.lock_key(&key);
+        if new_index
+            .touched
+            .lock()
+            .as_ref()
+            .is_some_and(|t| t.contains(&key))
+        {
             continue;
         }
-        hnsw_insert(&new_index, key, vec, &metric);
-        drop(touched);
+        insert_unit(&new_index, key, vec, &metric, postings::NO_DOC);
         copied += 1;
     }
     *new_index.touched.lock() = None;
@@ -4198,7 +4312,6 @@ pub fn compact_hnsw(
     // ── Step 3: swap into the named slot in `indexes` ─────────────────────
     // The old graph keeps its shadow: a write that found the old graph
     // before the swap still reaches the new one.
-    let _ = (dim, data_type, &prefixes, db_store);
     {
         let mut store = index_store.write();
         let def = match store.get_mut(index_name) {

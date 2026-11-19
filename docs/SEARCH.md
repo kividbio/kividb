@@ -25,6 +25,28 @@ redis-cli -p 6380 FT.SEARCH idx '*=>[KNN 10 @vec $q]' PARAMS 2 q <blob> DIALECT 
 
 The full command surface, filters, hybrid search and edge cases are in **[COMMANDS.md](../COMMANDS.md)** (search for `FT.CREATE`, `FT.SEARCH`, `FT.HYBRID`, and so on).
 
+## Index builds and `EF_RUNTIME`
+
+- **Vectors are linked into an HNSW graph by helper threads**: half as many as the CPUs
+  the server may use, started once, and on Linux run as `SCHED_IDLE`, so that they take
+  only CPU time the workers leave (on a server busy serving, the writes link their vectors
+  themselves, as before). A write puts its vector in the graph's backlog and returns; a search measures every
+  vector of the backlog exactly, beside what it finds in the graph, so a document is found
+  from the moment its `HSET` is answered, as before. The backlog holds at most 1,024
+  vectors, and at most 128 Ki floats (85 vectors of 1,536 dimensions, 341 of 384; never
+  fewer than 64): a writer that finds it full links its vector itself. The walk that indexes the
+  documents already there (`FT.CREATE` on existing keys, a restart, a replica's full sync)
+  hands its vectors over the same way. A graph of fewer than 1,000 nodes links each vector
+  in the write.
+- `FT.INFO` shows the backlog as `hnsw_backlog` (and `backlog` per field under
+  `hnsw_indexes`). `hnsw_live_count` counts the graph's nodes, so it trails the documents
+  while the backlog is not empty; `num_docs` does not.
+- **A KNN search looks at no fewer than 50 candidates**, whatever `EF_RUNTIME` says (the
+  default is 10, as in Redis). So the default answers with the recall Redis gives at about
+  `EF_RUNTIME 50`, and costs about what that costs; compare the two at the same recall, not
+  the same `EF_RUNTIME`.
+- Measured numbers are in [PERFORMANCE.md](PERFORMANCE.md#vector-index-builds).
+
 ## Persistence and restarts
 
 - Native snapshots (**`dump.kdb`**) store the **keys**, the **index schemas**, and, when you **`SAVE` / `BGSAVE`** with indexes populated, the **HNSW graph** of each vector field, so search quality after a restart matches the graph you had before shutdown.
