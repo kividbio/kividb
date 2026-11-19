@@ -369,7 +369,7 @@ is still written as before):
 | stream, tag 13 | the stream as before, plus its idempotent-production state (`XADD … IDMP`): per producer, the remembered ids and the entries they map to, and the stream's `IDMP-DURATION` / `IDMP-MAXSIZE` |
 | time series, tag 14 | the series as before, plus its duplicate policy and its compaction rules |
 | time series, tag 17 | tag 14's series, then whether it is a compaction of another series (and which), then its `IGNORE` settings: the time and the value difference. Written only for a series with `IGNORE`; 1.2 refuses it |
-| probabilistic value, tag 40 | a kind (1: Bloom filter, 2: Count-min sketch), the version of that kind's encoding, then the value: a Bloom filter's parameters and each layer's bytes; a sketch's width, depth and count, then its counters |
+| probabilistic value, tag 40 | a kind (1: Bloom filter, 2: Count-min sketch, 3: Top-K, 4: Cuckoo filter, 5: t-digest), the version of that kind's encoding, then the value: a Bloom filter's parameters and each layer's bytes; a Count-min sketch's width, depth and count, then its counters; a Top-K sketch's k, width, depth, decay and generator, its buckets, then each kept item and its count; a Cuckoo filter's `CF.SCANDUMP` header, then each sub-filter's bytes; a t-digest's compression, counts and extremes, then its merged and unmerged centroids |
 | alias section (`KIVIAL1\0`) | `FT.ALIASADD` aliases, so that they survive a restart |
 | field options section (`KIVIFO1\0`) | each index's `STOPWORDS` and each field's options (`AS`, `SORTABLE`, `WEIGHT`, `SEPARATOR`, `CASESENSITIVE`, …), as the words `FT.CREATE` takes |
 | synonyms and dictionaries section (`KIVISD1\0`) | each index's synonym groups (`FT.SYNUPDATE`) and every dictionary (`FT.DICTADD`) |

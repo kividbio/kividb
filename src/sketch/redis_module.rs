@@ -17,8 +17,8 @@ use super::bloom::{
     Used,
 };
 use super::cms::CountMin;
-use super::topk::{Slot, TopK};
 use super::cuckoo::{Cuckoo, Shape, SubFilter};
+use super::topk::{Slot, TopK};
 
 /// The module type of Bloom filters, and the encoding version written.
 pub const BLOOM_TYPE: &str = "MBbloom--";
@@ -143,7 +143,10 @@ fn write_cms(w: &mut Writer, cms: &CountMin) {
 /// Whether `DUMP` writes `sketch` in Redis's format, which Redis can
 /// `RESTORE`; the other types are dumped in KiviDB's own.
 pub fn dumps_as_redis(sketch: &Sketch) -> bool {
-    matches!(sketch, Sketch::Bloom(_) | Sketch::CountMin(_))
+    matches!(
+        sketch,
+        Sketch::Bloom(_) | Sketch::CountMin(_) | Sketch::Cuckoo(_) | Sketch::TopK(_)
+    )
 }
 
 /// A Top-K sketch as Redis saves it (encoding version 0): `k`, width,
@@ -182,12 +185,6 @@ fn write_topk(w: &mut Writer, t: &TopK) {
     }
 }
 
-/// Whether `DUMP` writes `sketch` in Redis's format, which Redis can
-/// `RESTORE`; the other types are dumped in KiviDB's own.
-pub fn dumps_as_redis(sketch: &Sketch) -> bool {
-    matches!(sketch, Sketch::Bloom(_) | Sketch::TopK(_))
-}
-
 /// A Cuckoo filter as Redis saves it (encoding version 4): sub-filters,
 /// the first one's buckets, items, deletes, bucket size, kick limit and
 /// expansion; then each sub-filter's buckets and bytes.
@@ -203,18 +200,6 @@ fn write_cuckoo(w: &mut Writer, cf: &Cuckoo) {
         w.uint(f.buckets);
         w.string(&f.data);
     }
-}
-
-/// Whether `DUMP` writes `sketch` in Redis's format, which Redis can
-/// `RESTORE`; the other types are dumped in KiviDB's own.
-pub fn dumps_as_redis(sketch: &Sketch) -> bool {
-    matches!(sketch, Sketch::Bloom(_) | Sketch::Cuckoo(_))
-}
-
-/// Whether `DUMP` writes `sketch` in Redis's format, which Redis can
-/// `RESTORE`; the other types are dumped in KiviDB's own.
-pub fn dumps_as_redis(sketch: &Sketch) -> bool {
-    matches!(sketch, Sketch::Bloom(_))
 }
 
 /// The most bytes [`dump_payload`] writes for `sketch`: each field at its

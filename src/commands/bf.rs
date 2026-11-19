@@ -473,31 +473,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 /// other commands.
 #[inline(never)]
 fn other_types(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
-    crate::commands::cms::handle(ctx, name)
-}
-
-/// The other probabilistic types' commands, which come to the dispatch
-/// where `BF.*` does: so that adding them added nothing to the dispatch of
-/// other commands.
-#[inline(never)]
-fn other_types(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
-    crate::commands::topk::handle(ctx, name)
-}
-
-/// The other probabilistic types' commands, which come to the dispatch
-/// where `BF.*` does: so that adding them added nothing to the dispatch of
-/// other commands.
-#[inline(never)]
-fn other_types(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
-    crate::commands::cf::handle(ctx, name)
-}
-
-/// The other probabilistic types' commands, which come to the dispatch
-/// where `BF.*` does: so that adding them added nothing to the dispatch of
-/// other commands.
-#[inline(never)]
-fn other_types(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
-    crate::commands::tdigest::handle(ctx, name)
+    // Each type's handler answers `None` for a name not its own.
+    match name.as_bytes().first() {
+        Some(b'C') if name.starts_with("CF.") => crate::commands::cf::handle(ctx, name),
+        Some(b'C') => crate::commands::cms::handle(ctx, name),
+        Some(b'T') if name.starts_with("TOPK.") => crate::commands::topk::handle(ctx, name),
+        Some(b'T') => crate::commands::tdigest::handle(ctx, name),
+        _ => None,
+    }
 }
 
 /// The filter at `key` for reading: `Ok(None)` if there is no key,

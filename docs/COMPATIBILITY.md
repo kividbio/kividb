@@ -18,7 +18,7 @@ other files:
 |---|---|
 | Protocol | RESP2 and RESP3 (`HELLO`). Redis clients, `redis-cli` and cluster-aware clients work unchanged. |
 | Core data types | Strings, lists, sets, sorted sets, hashes (with per-field TTLs), streams and consumer groups, bitmaps, geo, Pub/Sub (including sharded). HyperLogLog, which reads Redis's encoding: see *Differences*. |
-| Redis 8 data types | JSON, search and query (`FT.*`, full-text, tag, numeric and vector), time series (`TS.*`), vector sets (`V*`), Bloom filters (`BF.*`), Count-min sketches (`CMS.*`). All built in, nothing to load. |
+| Redis 8 data types | JSON, search and query (`FT.*`, full-text, tag, numeric and vector), time series (`TS.*`), vector sets (`V*`), Bloom filters (`BF.*`), Cuckoo filters (`CF.*`), Count-min sketches (`CMS.*`), Top-K (`TOPK.*`), t-digests (`TDIGEST.*`). All built in, nothing to load. |
 | Transactions and scripts | `MULTI`/`EXEC`/`WATCH` and scripts run as one step, as in Redis ([EXEC_ATOMICITY.md](EXEC_ATOMICITY.md)). Lua (`EVAL`, `FUNCTION`, `FCALL`) needs the `lua` or `full` build. |
 | Security | `AUTH`, ACLs (users, key and channel patterns, ACL file), protected mode, TLS in the `tls` and `full` builds. |
 | Persistence | Snapshots (`dump.kdb`, compressed with `rdbcompression yes`, which is off by default) and an append-only file. Reads a Redis `dump.rdb`. ([PERSISTENCE.md](PERSISTENCE.md)) |
@@ -236,9 +236,9 @@ other files:
   a `VALKEY080` header) is read, hash field TTLs included.
 - Redis and Valkey can't read KiviDB's `DUMP` payloads or replicate from
   KiviDB ([#450](https://github.com/kividbio/kividb/issues/450)), so moving
-  data back off KiviDB means copying it key by key. Bloom filters and
-  Count-min sketches are the exception: their payloads are Redis's, and
-  Redis restores them.
+  data back off KiviDB means copying it key by key. Bloom and Cuckoo
+  filters, Count-min sketches and Top-K sketches are the exception: their
+  payloads are Redis's, and Redis restores them.
 - `DUMP`/`RESTORE` and `MIGRATE` of time series and vector sets work between
   KiviDB nodes only: their payloads are KiviDB's own, and Redis's for these
   types (module values) aren't read either. A series' compaction rules and
@@ -254,9 +254,9 @@ other files:
   short. `INT8` and `UINT8` vectors aren't supported.
 - A Redis RDB with search index definitions loads without them: run
   `FT.CREATE` again. Bloom filters load (RedisBloom 2.4 and later: Redis
-  Stack 6.2 to 7.4, Redis 8), and so do Count-min sketches. One with other
-  module data (time series, vector sets, Cuckoo filters, Top-K, t-digests)
-  is refused.
+  Stack 6.2 to 7.4, Redis 8), and so do Cuckoo filters, Count-min sketches
+  and Top-K sketches. One with other module data (time series, vector sets,
+  t-digests) is refused.
 - Bloom filters: `COPY` copies one, which Redis refuses. A filter made before
   RedisBloom 2.0 (32-bit hashes) is not loaded. A filter has size limits
   Redis does not have: a client's commands do not make or grow one past

@@ -47,11 +47,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Upgrade replicas before their master.** A master sends `BF.*` commands
   and, in a full sync, Bloom filters under a new snapshot record (tag 40);
   a replica of an earlier release cannot apply either.
-- **No downgrade once a Bloom filter or a Count-min sketch exists.** A
-  snapshot or an AOF checkpoint with one in it cannot be read by an earlier
-  release: 1.2.2 refuses it and does not start, changing nothing on disk.
-  Delete them (or move them off with `DUMP`, which Redis restores) before
-  going back. Upgrade replicas before their master for `CMS.*` too.
+- **No downgrade once a Bloom filter, Count-min sketch, Top-K sketch, Cuckoo
+  filter or t-digest exists.** A snapshot or an AOF checkpoint with one in it
+  cannot be read by an earlier release: 1.2.2 refuses it and does not start,
+  changing nothing on disk. Delete them (or move them off with `DUMP`, which
+  Redis restores, t-digests aside) before going back. Upgrade replicas
+  before their master for `CMS.*`, `TOPK.*`, `CF.*` and `TDIGEST.*` too.
 - **A sample time of `-0` is refused.** `TS.ADD`, `TS.MADD`, `TS.INCRBY`
   and `TS.DECRBY` answer an error for it, as RedisTimeSeries and 1.2.0 do.
 - **A 1.2.x replica warns once for each idempotent duplicate.** A master
@@ -270,7 +271,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   error for the item it stopped at; `BF.MADD` and `BF.INSERT` answer that
   item and every one after it with the error, so their reply has an entry
   for each item. Replicas and the AOF get only the items a write took.
-  Cuckoo filters, Count-min sketches, Top-K and t-digests follow.
+ 
 
 - **Count-min sketches (`CMS.*`), as Redis 8 has them built in (part of
   #453).** `CMS.INITBYDIM`, `CMS.INITBYPROB`, `CMS.INCRBY`, `CMS.QUERY`,

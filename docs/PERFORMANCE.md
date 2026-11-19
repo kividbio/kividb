@@ -428,19 +428,10 @@ depend on their order). The writes behind Redis's here are not chased yet.
 |---|---:|---:|---:|
 | `CMS.INCRBY` of one item | 0.97M | 0.84M | +15% |
 | `CMS.QUERY` of one item | 0.98M | 1.05M | -7% |
-
-
-
 | `TOPK.ADD` of one item | 0.55M | 0.87M | -37% |
 | `TOPK.QUERY` of one item | 1.03M | 1.11M | -7% |
-
-
-
 | `CF.ADD` of one item | 0.50M | 0.96M | -48% |
 | `CF.EXISTS` of one item | 1.07M | 0.97M | +10% |
-
-
-
 | `TDIGEST.ADD` of one value | 0.67M | 0.92M | -27% |
 | `TDIGEST.QUANTILE` of one quantile | 0.85M | 0.81M | +5% |
 

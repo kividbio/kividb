@@ -20,8 +20,8 @@ pub mod cuckoo;
 pub mod murmur;
 pub mod redis_module;
 pub mod room;
-pub mod topk;
 pub mod tdigest;
+pub mod topk;
 
 use std::io;
 

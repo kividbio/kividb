@@ -2692,39 +2692,15 @@ fn read_only_key_positions(cmd: &[&[u8]]) -> Vec<usize> {
 }
 
 /// Whether the probabilistic-type write `name` that just failed had found
-/// its key (`BF.*`, `CMS.*`).
-#[cold]
-#[inline(never)]
-fn sketch_write_touched(name: &str) -> bool {
-    (name.starts_with("BF.") && crate::commands::bf::take_touched())
-        || (name.starts_with("CMS.") && crate::commands::cms::take_touched())
-}
-
-/// Whether the probabilistic-type write `name` that just failed had found
-/// its key (`BF.*`, `TOPK.*`).
-#[cold]
-#[inline(never)]
-fn sketch_write_touched(name: &str) -> bool {
-    (name.starts_with("BF.") && crate::commands::bf::take_touched())
-        || (name.starts_with("TOPK.") && crate::commands::topk::take_touched())
-}
-
-/// Whether the probabilistic-type write `name` that just failed had found
-/// its key (`BF.*`, `CF.*`).
+/// its key (`BF.*`, `CF.*`, `CMS.*`, `TDIGEST.*`, `TOPK.*`).
 #[cold]
 #[inline(never)]
 fn sketch_write_touched(name: &str) -> bool {
     (name.starts_with("BF.") && crate::commands::bf::take_touched())
         || (name.starts_with("CF.") && crate::commands::cf::take_touched())
-}
-
-/// Whether the probabilistic-type write `name` that just failed had found
-/// its key (`BF.*`, `TDIGEST.*`).
-#[cold]
-#[inline(never)]
-fn sketch_write_touched(name: &str) -> bool {
-    (name.starts_with("BF.") && crate::commands::bf::take_touched())
+        || (name.starts_with("CMS.") && crate::commands::cms::take_touched())
         || (name.starts_with("TDIGEST.") && crate::commands::tdigest::take_touched())
+        || (name.starts_with("TOPK.") && crate::commands::topk::take_touched())
 }
 
 /// [`notify_watchers`] for a `BF.*` write that failed after finding its key,

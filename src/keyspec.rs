@@ -734,11 +734,7 @@ const SKETCHES: &[&str] = &[
 
 /// The probabilistic types' merges: `destination numkeys source ...`,
 /// after [`SKETCHES`] for the same reason.
-const SKETCH_MERGES: &[&str] = &["CMS.MERGE"];
-
-/// The probabilistic types' merges: `destination numkeys source ...`,
-/// after [`SKETCHES`] for the same reason.
-const SKETCH_MERGES: &[&str] = &["TDIGEST.MERGE"];
+const SKETCH_MERGES: &[&str] = &["CMS.MERGE", "TDIGEST.MERGE"];
 
 const COMMANDS: &[(&[&str], Shape)] = &[
     (FIRST, Shape::First),

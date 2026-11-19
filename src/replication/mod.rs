@@ -4455,10 +4455,10 @@ pub fn is_write_command(name: &str) -> bool {
             matches!(
                 name,
                 "APPEND"
+                    | "BF.ADD"
                     | "ARMSET"
                     | "ARRING"
                     | "ARSEEK"
-                    | "BF.ADD"
                     | "BLMOVE"
                     | "BLMPOP"
                     | "BZMPOP"
@@ -4513,24 +4513,27 @@ pub fn is_write_command(name: &str) -> bool {
                 | "ZPOPMAX"
                 | "ZPOPMIN"
         ),
-        8 => matches!(
-            name,
-            "ARINSERT"
-                | "BITFIELD"
-                | "BZPOPMAX"
-                | "BZPOPMIN"
-                | "EXPIREAT"
-                | "FLUSHALL"
-                | "FT.ALTER"
-                | "HPERSIST"
-                | "HPEXPIRE"
-                | "JSON.DEL"
-                | "JSON.SET"
-                | "RENAMENX"
-                | "SETRANGE"
-                | "TS.ALTER"
-                | "VSETATTR"
-        ),
+        8 => {
+            matches!(
+                name,
+                "ARINSERT"
+                    | "BITFIELD"
+                    | "BZPOPMAX"
+                    | "BZPOPMIN"
+                    | "EXPIREAT"
+                    | "FLUSHALL"
+                    | "FT.ALTER"
+                    | "HPERSIST"
+                    | "HPEXPIRE"
+                    | "JSON.DEL"
+                    | "JSON.SET"
+                    | "RENAMENX"
+                    | "SETRANGE"
+                    | "TS.ALTER"
+                    | "VSETATTR"
+            ) || (matches!(name.as_bytes()[0], b'C' | b'T')
+                && matches!(name, "CF.ADDNX" | "TOPK.ADD"))
+        }
         9 => {
             matches!(
                 name,
@@ -4543,7 +4546,7 @@ pub fn is_write_command(name: &str) -> bool {
                     | "TS.CREATE"
                     | "TS.DECRBY"
                     | "TS.INCRBY"
-            ) || (matches!(name.as_bytes()[0], b'C') && matches!(name, "CMS.MERGE"))
+            ) || (matches!(name.as_bytes()[0], b'C') && matches!(name, "CF.INSERT" | "CMS.MERGE"))
         }
         10 => {
             matches!(
@@ -4560,31 +4563,39 @@ pub fn is_write_command(name: &str) -> bool {
                     | "XAUTOCLAIM"
                     | "XREADGROUP"
                     | "ZDIFFSTORE"
-            ) || (matches!(name.as_bytes()[0], b'C') && matches!(name, "CMS.INCRBY"))
+            ) || (matches!(name.as_bytes()[0], b'C')
+                && matches!(name, "CF.COMPACT" | "CF.RESERVE" | "CMS.INCRBY"))
         }
-        11 => matches!(
-            name,
-            "FT.ALIASADD"
-                | "FT.ALIASDEL"
-                | "INCRBYFLOAT"
-                | "JSON.ARRPOP"
-                | "JSON.FORGET"
-                | "JSON.OBJDEL"
-                | "JSON.TOGGLE"
-                | "SINTERSTORE"
-                | "SUNIONSTORE"
-                | "XIDMPRECORD"
-                | "ZINTERSTORE"
-                | "ZRANGESTORE"
-                | "ZUNIONSTORE"
-        ),
-        12 => matches!(
-            name,
-            "BF.LOADCHUNK" | "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
-        ),
+        11 => {
+            matches!(
+                name,
+                "FT.ALIASADD"
+                    | "FT.ALIASDEL"
+                    | "INCRBYFLOAT"
+                    | "JSON.ARRPOP"
+                    | "JSON.FORGET"
+                    | "JSON.OBJDEL"
+                    | "JSON.TOGGLE"
+                    | "SINTERSTORE"
+                    | "SUNIONSTORE"
+                    | "XIDMPRECORD"
+                    | "ZINTERSTORE"
+                    | "ZRANGESTORE"
+                    | "ZUNIONSTORE"
+            ) || (matches!(name.as_bytes()[0], b'C' | b'T')
+                && matches!(name, "CF.INSERTNX" | "TDIGEST.ADD" | "TOPK.INCRBY"))
+        }
+        12 => {
+            matches!(
+                name,
+                "BF.LOADCHUNK" | "FT.DROPINDEX" | "FT.SYNUPDATE" | "HINCRBYFLOAT" | "JSON.ARRTRIM"
+            ) || (matches!(name.as_bytes()[0], b'C' | b'T')
+                && matches!(name, "CF.LOADCHUNK" | "TOPK.RESERVE"))
+        }
         13 => {
             matches!(name, "TS.CREATERULE" | "TS.DELETERULE")
-                || (matches!(name.as_bytes()[0], b'C') && matches!(name, "CMS.INITBYDIM"))
+                || (matches!(name.as_bytes()[0], b'C' | b'T')
+                    && matches!(name, "CMS.INITBYDIM" | "TDIGEST.MERGE" | "TDIGEST.RESET"))
         }
         14 => {
             matches!(
@@ -4597,7 +4608,8 @@ pub fn is_write_command(name: &str) -> bool {
                     | "JSON.NUMMULTBY"
                     | "JSON.STRAPPEND"
                     | "ZREMRANGEBYLEX"
-            ) || (matches!(name.as_bytes()[0], b'C') && matches!(name, "CMS.INITBYPROB"))
+            ) || (matches!(name.as_bytes()[0], b'C' | b'T')
+                && matches!(name, "CMS.INITBYPROB" | "TDIGEST.CREATE"))
         }
         15 => name == "ZREMRANGEBYRANK",
         16 => name == "ZREMRANGEBYSCORE",
