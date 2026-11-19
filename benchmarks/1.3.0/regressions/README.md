@@ -35,6 +35,7 @@ and why.
 | `16-random-sample` | #839 | `ZRANDMEMBER` / `HRANDFIELD` of a sorted set / hash of 100, 10,000 and 1,000,000 members, with no count, 1, 10, -1, -10, `WITHSCORES` / `WITHVALUES`: microseconds a call (mean of 150-3,000 calls, median of 3 rounds) and the replies checked (length, distinct for a positive count) |
 | `17-set-memory` | #297 (step 1) | `used_memory` per set member, 1,000,000 members in sets of 10, 100, 1,000 and 100,000: 14-byte strings (`membr:<i>`) and integers (`0`..`n-1`); `OBJECT ENCODING` of each size recorded exactly; the tables (1,000 and 100,000) as guard rows |
 | `19-hash-memory` | collection storage step 2 | `used_memory` per hash field, 1,000,000 fields in hashes of 10, 100, 1,000 and 100,000: 14-byte fields (`field:<i>`) with 32-byte values, plain and with one field TTL a hash; `OBJECT ENCODING` of each size recorded exactly (`listpack`, `listpackex`, `hashtable`); the tables (1,000 and 100,000) as guard rows |
+| `20-envoy-ratelimit` | #849 | envoyproxy/ratelimit's pipelined `INCRBY` + `EXPIRE` pair on one key (memtier_benchmark, `--pipeline 2 --transaction`, 100,000 keys) at 200 and 500 connections: ops/s against Redis, p99 shown beside it, and keys left without a TTL (must be 0); on Linux the server and the client are pinned to separate halves of the CPUs; recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-20)) |
 | `21-list-memory` | #297 (step 3) | `used_memory` per list element, 1,000,000 32-byte elements in lists of 10, 100, 1,000 and 100,000, packed in chunks; the same made plain (an element over 1,024 bytes pushed and popped first) as guard rows; `OBJECT ENCODING` of each size recorded exactly |
 | `22-scan-large-count` | #884 | Argo CD's `SCAN <cursor> MATCH revoked-token\|* COUNT 10000` over 40,000 keys of 50 KB that it never matches (`--threads 4`): microseconds a call, client side and the server's own (`INFO commandstats`), calls and keys returned (exactly 0) for a full iteration, and the p99 of four `PING` probes while four other connections loop the same `SCAN` |
 | `23-pubsub-pattern-fanout` | #851 | socket.io's Redis adapter: 48 `redis-benchmark` connections `PUBLISH` 200-byte messages to `socket.io#/#room<n>#`, 16 subscribers `PSUBSCRIBE socket.io#/#*` (`pattern`) or `SUBSCRIBE` one channel (`channel`, the plain fan-out guard): messages delivered a second until every subscriber has all of them, messages lost (exactly 0), and the p99 of a probe's own messages from publish to receipt |
@@ -143,7 +144,8 @@ the Redis binary, numpy (pinned in `requirements.txt`, for
 and a `redis-cli` 7.0.x for `13-cluster-reshard` (`$REDIS_CLI_7`, else
 `/usr/bin/redis-cli` if it is 7.0.x, as Ubuntu 24.04's `redis-tools` is, else
 built from Redis's 7.0.15 tag into `$REGRESS_CACHE`, which needs git, make
-and a C compiler).
+and a C compiler). Suites 18 and 20 use `memtier_benchmark` 2.6.1 or newer
+(`--transaction` and its error-reply lines; `$MEMTIER`, else on `PATH`).
 
 ## Method
 
@@ -962,6 +964,68 @@ in brackets; Redis's are the same):
 The 1,000 and 100,000 rows are guards: hashes past the block's limits are
 tables, as in v1.2.2, and must not grow. Instructions per command are not
 measured here; the PR has them from callgrind runs of the same builds.
+
+## Recorded run, suite 20
+
+Recorded 2026-11-18 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C),
+`--only 20 --record` with `ALLOW_VM_CHANGE=1`; the candidate is master
+`d1a6712c` (this PR adds only the suite), `cargo build --release` with rustc
+1.100.0 (the compiler of the v1.2.2 release binary: a build by 1.99.1 would
+look 5-13 % slower); memtier_benchmark 2.6.1; Redis 8.10.2 from the VM image.
+Runs: `pr887-d1a6712c-d8s_v5` (recorded) and `-rerun2`, `-rerun3` (the noise
+check: every gate passed). A run takes 447 s. The server has CPUs 0-3 and memtier 4-7 (the
+suite's own split).
+
+Three runs (the range over them; the recorded run is inside it):
+
+| connections | v1.2.2 ops/s | master ops/s | Redis 8.10.2 ops/s | master / Redis | master / v1.2.2 |
+|---:|---:|---:|---:|---:|---:|
+| 200 | 568,000-571,000 | 565,000-574,000 | 289,000-291,000 | 1.94-1.99x | 0.989-1.008x |
+| 500 | 546,000-550,000 | 544,000-549,000 | 283,000-286,000 | 1.90-1.92x | 0.989-1.005x |
+
+p99 (shown, not gated): 1.03-1.05 ms against Redis's 2.7 ms at 200
+connections, 2.7-2.9 ms against 6.8 ms at 500. `keys_without_ttl` was 0 on all
+three engines.
+
+Master is not ahead of v1.2.2 here: the two run within 2 % of each other, and
+both are 1.9-2.0x Redis. So the gates are "at least 1.8x Redis" (5 % under
+the lowest ratio measured, so a loss of 10 % fails), "at most 8 % under v1.2.2"
+(`vs_v1_2_2` 1.08, the within-session gate that would catch a loss), and 10 %
+against the recorded rate. The 1.5x and 1.7x placeholders came from an M3
+laptop.
+
+Which side is the limit. On a `Standard_D4s_v5` (server on 2 CPUs, memtier
+on 2) master, v1.2.2 and Redis are all near 280-310k ops/s: master 0.86-0.94x
+Redis, v1.2.2 the same. There memtier used about 83 % of its two CPUs and
+KiviDB 87-90 % of its two, so neither side had room and the ratio said
+nothing about the server; Redis, one thread at 95-100 % of a CPU, was the only
+one limited by its server. That is why the suite is recorded on 8 vCPUs.
+On the D8s_v5 (server on 4 CPUs) KiviDB uses 337-344 of 400 % and memtier's four
+threads are at 100 % of a CPU each in most samples while they drive it (400 %
+in 40 of 59), so
+KiviDB's rate here is a floor under what it can do, and the ratio to Redis
+a lower bound: the gates are sound against losses, but a server that gets
+10 % faster does not show. A larger client (more memtier threads, more CPUs)
+would measure the server's own limit. KiviDB is 2x Redis here because it
+uses four threads to Redis's one: per CPU it handles about 140,000 ops/s, Redis
+290,000.
+
+KiviDB's `MONITOR` feed is not lossless under load (the suite's check: 3,040 of
+56,867 pairs looked as if on two keys with four connections, 0 of 20,000 with
+one): the check runs on one connection and tolerates 5 %.
+
+Verified 2026-11-19 on a fresh Standard_D8s_v5 (the same CPU) against the master
+`7fd67dbb` (#921 merged), `rustc 1.100.0`, `run-all.sh --min-cpus-only`
+(`results/pr887-7fd67dbb-d8s_v5-verify`): verdict `ok`, host speed 0.94x; 200 / 500
+connections 544,000 / 509,000 ops/s against Redis's 268,000 / 234,000 (2.03x,
+2.17x) and v1.2.2's 549,000 / 499,000. The recorded rows carry `recorded.rustc`
+1.100.0, the compiler of the recorded run's `env.json`.
+
+This suite declares `min_cpus=8`: the normal run on the D4s_v5 of the other
+suites does not run it (`needs_more_cpus` in `env.json`; the Redis gate would
+fail by design there), and `--only 20` on it makes the run `INVALID`. Run it on a
+D8s_v5 with `run-all.sh --candidate <bin> --candidate-full <bin> --min-cpus-only
+--label <label>-d8s_v5` (see "How a release uses it").
 
 ## Recorded run, suite 23
 
