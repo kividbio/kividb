@@ -351,6 +351,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`FT.AGGREGATE ... GROUPBY` over many documents is 3.8x faster, and a
+  search index of many small documents takes 30 % less memory (part of
+  #761).** On #761's 2,000,000 hashes (`name TEXT email TAG
+  communityNumber NUMERIC age NUMERIC`), `GROUPBY 1 @communityNumber REDUCE
+  COUNT 0` took 3,453 ms and now takes 916 (Redis 8.10.3: 1,907); with
+  `REDUCE AVG 1 @age` and `SORTBY` 3,885 and 1,017 (Redis 2,428); over
+  `@age:[20 40]` 1,308 and 351 (Redis 759). The server's peak RSS over the
+  load and the queries fell from 3,722 MiB to 1,534 (Redis 2,158), its RSS
+  once loaded from 2,171 MiB to 1,476 (Redis 1,509) and `used_memory` from
+  1,755 MiB to 1,224 (Redis 1,454). Azure `Standard_D4s_v5`, server on 3
+  CPUs, the client on the fourth, rustc 1.100.0, medians of 3 runs;
+  suite `33-ft-aggregate-groupby` of `benchmarks/1.3.0/regressions` gates
+  it. What changed: a query whose steps
+  begin with a `GROUPBY` whose reducers keep a running value (`COUNT`,
+  `SUM`, `AVG`, `MIN`, `MAX`, `COUNT_DISTINCT`, `COUNT_DISTINCTISH`) puts
+  each hash into its group as it reads it, where it made a row of every
+  document first (a map of all its fields, each name and value a string of
+  its own, some 1.5 GB here) and grouped the rows. The groups, their order
+  and their values are the same. JSON indexes, `ADDSCORES`, a KNN clause,
+  a step before the `GROUPBY` other than `LOAD`, other reducers and a query
+  across a cluster still group rows. In the index, a TEXT term or a TAG
+  value that one document holds keeps that document in place rather than
+  in a list of its own, a term found in one field keeps that field's
+  documents in place, and the tables that find a tag's or a key's number
+  hold the number alone, where they held a copy of the text too: FT.INFO's
+  `text_postings_bytes` fell from 352 MB to 0.3 MB here, `postings_tag_bytes`
+  from 296 to 208, `postings_ids_bytes` from 198 to 128 (`text_terms_bytes`
+  rose from 132 to 165: a term is larger, holding its documents).
+
 - **A short script call costs the server less, level with Redis for Tyk's
   rate limiter and centrifuge's history scripts (#901).** One call of Tyk's
   sliding-log limiter (four sorted-set commands) cost 16.1 µs of server CPU
@@ -675,19 +704,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     this release writes and the other way round. `MEMORY USAGE`, eviction
     and lazy freeing count a block or an array as the one allocation it is.
 
-- **Lists take about half the memory (#297).** A list's elements are kept
-  end to end in chunks of up to 64, each element between two copies of its
-  length, where every element had an allocation, a shared header and a slot
-  of its own. Bytes of `used_memory` an element, 32-byte elements, 3M
-  elements in lists of each size:
+- **Lists take about half the memory, short elements a fifth (#297).** A
+  list's elements are kept end to end in chunks of up to 64, each element
+  between two copies of its length (one byte each for an element shorter
+  than 128 bytes), where every element had an allocation, a shared header
+  and a slot of its own. Bytes of `used_memory` an element, 32-byte
+  elements, 1M elements in lists of each size (3M in one list):
 
   | elements a list | 1.2.2 | now | Redis 8.10.2 |
   |---:|---:|---:|---:|
-  | 10 | 76.0 | 48.8 | 45.0 |
-  | 100 | 65.2 | 38.4 | 36.4 |
-  | 1,000 | 64.1 | 36.7 | 34.6 |
-  | 100,000 | 68.5 | 36.7 | 34.3 |
-  | 3,000,000 | 69.8 | 36.7 | 34.3 |
+  | 10 | 75.6 | 46.4 | 44.0 |
+  | 100 | 65.2 | 36.4 | 36.4 |
+  | 1,000 | 64.1 | 34.7 | 34.6 |
+  | 100,000 | 68.5 | 34.7 | 34.3 |
+  | 3,000,000 | 69.8 | 34.7 | 34.3 |
+
+  Six-byte job ids, 100,000 a list: 44.5 bytes an element in 1.2.2, 8.7
+  now, 5.0 in Redis (which keeps such numbers as integers). A list drained
+  to a tenth of its length gives back the room it kept for the rest.
 
   Suite `21-list-memory` of the 1.3.0 regression suite measures this again.
   - A push or a pop at either end moves nothing in its chunk: each chunk
@@ -914,6 +948,66 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stop at the query's `TIMEOUT` (#670).
 
 ### Fixed
+
+- **A node met just before the whole cluster stops is still a member after
+  it starts again (#808).** Both ends of a `CLUSTER MEET` save the other
+  to `nodes.conf`, synced, before showing it as a member (the receiving
+  end before it answers): once the node that ran `CLUSTER MEET` lists the
+  new node without `handshake`, a cluster stopped whole, even killed,
+  keeps it, and the nodes that had not heard of it yet learn it again by
+  gossip. A node also saves its `nodes.conf` at the start of a shutdown
+  (`SIGTERM`, `SHUTDOWN`), and waits for that save. A node cannot join by
+  heartbeats alone: one no member has in its `nodes.conf` needs a new
+  `CLUSTER MEET`, as in Redis. See
+  [PERSISTENCE.md](docs/PERSISTENCE.md#the-clusters-nodesconf).
+
+- **`nodes.conf` is synced before it replaces the old one, and a file cut
+  short is refused (#808).** A save writes a temporary file beside it
+  (`nodes.conf.tmp-<n>`), syncs it, renames it into place and syncs the
+  directory, so a crash at any moment leaves the old file or the new one;
+  temporary files a crash left are removed at startup. A `nodes.conf` that
+  does not end with its `vars` line is refused at startup with the reason
+  (`... is unreadable: nodes.conf is incomplete ...`) and left as it is.
+  An empty one is refused as empty (`nodes.conf is empty`), unlike Redis,
+  which takes it for a new node: delete the file to start a node afresh. A
+  save that does not change the topology is skipped only when no other
+  save is still on its way to the file. A filesystem that cannot sync a
+  directory (`EINVAL`, `ENOTSUP`) is warned of once and does not fail the
+  save. The format is unchanged: files 1.2 wrote load, and 1.2 loads the
+  files this release writes.
+
+- **A vote is sent once it is saved, and a node met is a member once it is
+  saved (#808).** A node whose `nodes.conf` cannot be saved (a full or
+  read-only disk) casts no vote in that epoch, makes no node met a member
+  and does not answer its MEET; it logs the failure once, as an error,
+  until a save works again. The end that sent the MEET tries again, for up
+  to two minutes, and again when the other end calls on it within the hour
+  after. Nodes met at the same time (`redis-cli --cluster create` has every
+  node meet the first) are saved together, in one write. The vote is saved
+  off the cluster bus's thread, and a candidate counts a vote for as long
+  as its election lives: a voter on a slow disk answers once its vote is
+  saved. A replica that wins an election saves its promotion before it
+  announces it, waiting for the save up to a second; a promotion not
+  saved by then is announced all the same and saved in the background. A
+  save waits on two syncs (the file before its rename, the directory
+  after); see [PERSISTENCE.md](docs/PERSISTENCE.md#the-clusters-nodesconf)
+  for what failover needs of the disk.
+
+- **`MONITOR` no longer loses lines.** A monitor was fed through a ring of
+  4,096 lines shared by all monitors, and one that fell that far behind
+  lost what it had not read without a word: with four connections sending
+  pipelined commands over four worker threads, a monitor of 1.2.2 missed
+  between 43 % and 72 % of them (one connection was not affected). Each
+  monitor now has its own queue, held to `client-output-buffer-limit
+  normal` as in Redis (no limit by default): past it the monitor is
+  disconnected and the server logs `Client id=… closed: it is in MONITOR
+  and … bytes behind, over client-output-buffer-limit normal`. Every
+  monitor sees one order, each connection's commands in the order it sent
+  them, and time stamps in the order of the lines: they no longer go back
+  between lines from different threads (only when the system clock is set
+  back, as in Redis). What a monitor has not read yet shows in its `omem`
+  in `CLIENT LIST`. Arguments are quoted as Redis quotes them: `\n`, `\r`, `\t`,
+  `\a` and `\b` by name, not as `\x0a` and the like.
 
 - **`CLIENT UNBLOCK` reaches a client that was woken and is parking
   again.** It could answer 1 for a client blocked in `BLPOP` (or another

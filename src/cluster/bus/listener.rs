@@ -96,6 +96,26 @@ async fn handle_bus_connection(
                     state
                         .stats_messages_received
                         .fetch_add(1, Ordering::Relaxed);
+                    if let BusMessage::Ping {
+                        sender_id,
+                        ref sender_ip,
+                        sender_cluster_port,
+                        ..
+                    } = msg
+                        && !state.meets_given_up.lock().is_empty()
+                        && !sender_is_member(&state, &sender_id)
+                    {
+                        let ip = if sender_ip.is_empty() || sender_ip == "0.0.0.0" {
+                            peer.ip().to_string()
+                        } else {
+                            sender_ip.clone()
+                        };
+                        crate::cluster::bus::dialer::resume_given_up_meet(
+                            &state,
+                            &ip,
+                            sender_cluster_port,
+                        );
+                    }
                     let reply = match msg {
                         // The one message whose answer has to wait on the
                         // rest of the server; everything else is synchronous.
@@ -103,6 +123,31 @@ async fn handle_bus_connection(
                             crate::cluster::bus::heartbeat::answer_mfstart(&state, sender_id)
                                 .await
                                 .map(|m| encode(&m))
+                        }
+                        // Answered once the sender is saved as a member, on a
+                        // thread that may wait on the disk (`admit_met_node`).
+                        meet @ BusMessage::Meet { .. } => {
+                            let state = Arc::clone(&state);
+                            let reply = crate::cpus::spawn_blocking(move || {
+                                process_message(&state, meet, peer)
+                            })
+                            .await
+                            .unwrap_or(None);
+                            if reply.is_none() {
+                                // Not saved: not answered, and the sender,
+                                // seeing the connection close, tries again.
+                                return Ok(());
+                            }
+                            reply
+                        }
+                        // Voted once the vote is saved: the same.
+                        request @ BusMessage::FailoverAuthRequest { .. } => {
+                            let state = Arc::clone(&state);
+                            crate::cpus::spawn_blocking(move || {
+                                process_message(&state, request, peer)
+                            })
+                            .await
+                            .unwrap_or(None)
                         }
                         other => process_message(&state, other, peer),
                     };
@@ -201,18 +246,35 @@ pub fn process_message(
             // FORGET ban, which exists to stop gossip undoing a removal, not
             // to stop the operator reversing it.
             state.forgotten.write().remove(&sender_id);
-            upsert_node(
-                state,
+            let ip = resolve_ip(sender_ip);
+            let mut node = ClusterNode::new(
                 sender_id,
-                resolve_ip(sender_ip),
+                ip.clone(),
                 sender_client_port,
                 sender_cluster_port,
-                sender_config_epoch,
-                NodeFlags::MASTER,
-                None,
-                true,
             );
-            // Save nodes.conf so the new peer survives restart.
+            node.flags = NodeFlags::MASTER;
+            node.config_epoch = sender_config_epoch;
+            // Saved, so that the new peer survives a restart, before it is
+            // a member, and before it is answered (#808).
+            let admitted = state.admit_met_node(node, || {
+                upsert_node(
+                    state,
+                    sender_id,
+                    ip,
+                    sender_client_port,
+                    sender_cluster_port,
+                    sender_config_epoch,
+                    NodeFlags::MASTER,
+                    None,
+                    true,
+                )
+            });
+            if !admitted {
+                // Not saved, so not a member, and not answered: the sender
+                // tries again (`send_meet`).
+                return None;
+            }
             state.save_soon();
 
             // Reply with our own PONG so the peer learns OUR id.
@@ -306,6 +368,26 @@ pub fn process_message(
                 force,
                 claims.as_deref(),
             ) {
+                // A vote is sent once the file that records it is on disk,
+                // so that a restart cannot repeat it. Not saved, it is not
+                // sent, and this node does not vote in that epoch (it has
+                // recorded it as voted).
+                // Saved as a node met is: by the first save begun after it,
+                // one already under way included, not one save a vote.
+                let from = state.saves.written.load(Ordering::SeqCst) + 1;
+                let deadline = std::time::Instant::now() + crate::cluster::ELECTION_LIFETIME;
+                if let Err(e) = crate::cluster::persist::wait_for_save(state, from, deadline) {
+                    log_warn!(
+                        "Cluster: Did not vote for {} at epoch {}: the vote could not be saved ({e})",
+                        node_id_str(&sender_id),
+                        request_epoch,
+                    );
+                    // Saved again, in the background: the save that failed
+                    // may be the file in place, its rename not synced (it
+                    // failed at the directory's sync).
+                    state.save_soon();
+                    return None;
+                }
                 log_info!(
                     "Cluster: Voted for {} to take over from {} at epoch {}{}",
                     node_id_str(&sender_id),
@@ -313,7 +395,6 @@ pub fn process_message(
                     request_epoch,
                     if force { " (manual failover)" } else { "" },
                 );
-                let _ = state.save_to_disk();
                 Some(encode(&BusMessage::FailoverAuthAck {
                     sender_id: state.myself(),
                     request_epoch,
@@ -399,8 +480,10 @@ pub fn process_message(
 }
 
 /// Accept the PONG that answers our own `MEET`: the one case where a message
-/// from a node we do not know yet is taken at its word.
-pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: SocketAddr) {
+/// from a node we do not know yet is taken at its word. The node is saved
+/// before it is a member (`ClusterState::admit_met_node`): this blocks on
+/// the disk. False if it could not be saved, or `msg` is not a PONG.
+pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: SocketAddr) -> bool {
     if let BusMessage::Pong {
         sender_id,
         sender_ip,
@@ -422,22 +505,38 @@ pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: Socke
         } else {
             sender_ip
         };
-        apply_heartbeat(
-            state,
+        let mut node = ClusterNode::new(
             sender_id,
-            ip,
+            ip.clone(),
             sender_client_port,
             sender_cluster_port,
-            sender_config_epoch,
-            sender_flags,
-            sender_master_id,
-            sender_hostname,
-            sender_announced_client_port,
-            sender_shard_id,
-            gossip,
-            &slot_claims,
         );
+        node.flags = sender_flags & (NodeFlags::MASTER | NodeFlags::REPLICA);
+        node.master_id = sender_master_id;
+        node.config_epoch = sender_config_epoch;
+        node.hostname = sender_hostname.clone();
+        if let Some(shard_id) = sender_shard_id {
+            node.shard_id = shard_id;
+        }
+        return state.admit_met_node(node, || {
+            apply_heartbeat(
+                state,
+                sender_id,
+                ip,
+                sender_client_port,
+                sender_cluster_port,
+                sender_config_epoch,
+                sender_flags,
+                sender_master_id,
+                sender_hostname,
+                sender_announced_client_port,
+                sender_shard_id,
+                gossip,
+                &slot_claims,
+            )
+        });
     }
+    false
 }
 
 /// Everything a PING or PONG tells us: the sender is alive and where it is,
