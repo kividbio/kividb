@@ -460,13 +460,17 @@ fn a_replay_after_the_deadline_has_what_the_master_had() {
 fn the_sweep_logs_each_deletion_once_and_a_replay_follows_it() {
     let mut s = Server::with_aof();
     let mut c = s.conn();
-    let t = now_ms() + 300;
-    let at = t.to_string();
     let keys: Vec<String> = (0..100).map(|i| format!("swept:{i}")).collect();
     let active_before = c.info("expired_keys_active");
     for key in &keys {
-        c.ok(&["SET", key, "5", "PXAT", &at]);
+        c.ok(&["SET", key, "5"]);
         assert_eq!(c.cmd(&["INCR", key]).int(), 6);
+    }
+    // The times to live once every write is in: the writes are logged before
+    // their deletions however slow the machine (a TTL set with the first
+    // write could pass before the last write was sent).
+    for key in &keys {
+        assert_eq!(c.cmd(&["PEXPIRE", key, "300"]).int(), 1);
     }
     wait_for("the sweep", || c.cmd(&["DBSIZE"]).int() == 0);
     assert_eq!(
