@@ -93,6 +93,14 @@ pub static TOTAL_NET_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static TOTAL_NET_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static TOTAL_ERROR_REPLIES: AtomicU64 = AtomicU64::new(0);
 pub static REJECTED_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+/// Debug builds only, for tests: batches of replies the io_uring loop's
+/// first send (`server_uring::send_now`) took only part of, and none of
+/// (`WouldBlock`), before it went on to read while it wrote the rest.
+/// `INFO stats` shows them as `debug_sends_short` and `debug_sends_none`.
+#[cfg(debug_assertions)]
+pub static DEBUG_SENDS_SHORT: AtomicU64 = AtomicU64::new(0);
+#[cfg(debug_assertions)]
+pub static DEBUG_SENDS_NONE: AtomicU64 = AtomicU64::new(0);
 /// Clients closed for `client-output-buffer-limit`: `INFO`'s
 /// `client_output_buffer_limit_disconnections`.
 pub static OUTPUT_BUFFER_LIMIT_DISCONNECTIONS: AtomicU64 = AtomicU64::new(0);

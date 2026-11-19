@@ -2308,21 +2308,31 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 // The nearest `k` whose vector field the query sees: one
                 // past its deadline is left out, and more are asked for.
                 let nearest_of = |k: usize| {
-                    crate::commands::vector::nearest_shown(db, &knn.field, k, now, |k| match live {
-                        LiveIndex::Flat(index) => {
-                            crate::vector::knn_flat(index, &knn.vector, k, metric)
-                        }
-                        LiveIndex::Hnsw(graph) => {
-                            let ef = knn.ef_runtime.unwrap_or(match &field.field_type {
-                                FieldType::Vector {
-                                    algo: VectorAlgo::Hnsw { ef_runtime, .. },
-                                    ..
-                                } => *ef_runtime,
-                                _ => k * 2,
-                            });
-                            crate::vector::knn_hnsw(graph, &knn.vector, k, ef, metric)
-                        }
-                    })
+                    crate::commands::vector::nearest_shown(
+                        db,
+                        &knn.field,
+                        k,
+                        now,
+                        deadline,
+                        live,
+                        &knn.vector,
+                        metric,
+                        |k| match live {
+                            LiveIndex::Flat(index) => {
+                                crate::vector::knn_flat(index, &knn.vector, k, metric)
+                            }
+                            LiveIndex::Hnsw(graph) => {
+                                let ef = knn.ef_runtime.unwrap_or(match &field.field_type {
+                                    FieldType::Vector {
+                                        algo: VectorAlgo::Hnsw { ef_runtime, .. },
+                                        ..
+                                    } => *ef_runtime,
+                                    _ => k * 2,
+                                });
+                                crate::vector::knn_hnsw(graph, &knn.vector, k, ef, metric)
+                            }
+                        },
+                    )
                 };
                 // A document leaves its indexes once its shard is let go
                 // of, so one just deleted or written over can still be
@@ -2331,12 +2341,16 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 let mut live_ones = Vec::new();
                 let mut more = 0;
                 for _ in 0..4 {
-                    let found = nearest_of(knn.k + more);
+                    let (found, cut) = nearest_of(knn.k + more);
                     let asked = knn.k + more;
                     let had = found.len();
                     live_ones = found;
                     live_ones.retain(|hit| holds_document(db, &def, &hit.key));
                     let gone = had - live_ones.len();
+                    if cut {
+                        timed_out = true;
+                        break;
+                    }
                     if gone == 0 || live_ones.len() >= knn.k || had < asked {
                         break;
                     }

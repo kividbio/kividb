@@ -5,7 +5,8 @@
 #
 #   run.sh <label>=<binary> <label>=<binary> ...
 #
-# Env: DOCS (3000), Q (300 queries measured), KINDS (all five), MODEL (tokio).
+# Env: DOCS (3000), Q (300 queries measured), KINDS (all five), MODEL (tokio),
+# TTLS ("0 1"; "h900 h990 h999" for the mostly-hidden KNN of #670 item 3).
 # Needs valgrind and python3. Prints "kind ttl label instructions-per-query".
 # Instruction counts do not move from run to run on the same binary, so two
 # runs of one binary agree to the digit, and 1% is a real difference.
@@ -13,8 +14,9 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 DOCS=${DOCS:-3000} Q=${Q:-300} MODEL=${MODEL:-tokio} PORT=6410
 KINDS=${KINDS:-"search-knn search-filter-knn search-tag aggregate-knn aggregate-filter-knn"}
+TTLS=${TTLS:-"0 1"}
 for kind in $KINDS; do
-  for ttl in 0 1; do
+  for ttl in $TTLS; do
     for spec in "$@"; do
       label=${spec%%=*} bin=${spec#*=}
       rm -rf /tmp/sc && mkdir -p /tmp/sc && cd /tmp/sc || exit 1
