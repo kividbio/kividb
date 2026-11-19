@@ -239,23 +239,26 @@ jobs:
           set -o pipefail
           # Fail if any 1.2 test was skipped, not only if one failed: every
           # test that needs the binary, in each file the filter covers, and
-          # no other. The cluster ones are named after 1.2 (`_1_2_`).
-          expected=$(cat tests/vset_persistence.rs tests/cluster.rs \
+          # no other. The cluster and checkpoint ones are named after 1.2
+          # (`_1_2_`).
+          expected=$(cat tests/vset_persistence.rs tests/cluster.rs tests/checkpoint.rs \
             | grep -c '^#\[ignore = "needs a 1.2 binary')
-          named=$(grep -A1 '^#\[ignore = "needs a 1.2 binary' tests/cluster.rs \
-            | grep -c '^fn [a-z0-9_]*_1_2_')
-          in_cluster=$(grep -c '^#\[ignore = "needs a 1.2 binary' tests/cluster.rs)
-          if [ "$named" != "$in_cluster" ]; then
-            echo "a 1.2 test in tests/cluster.rs is not named with _1_2_" >&2
-            exit 1
-          fi
+          for file in tests/cluster.rs tests/checkpoint.rs; do
+            named=$(grep -A1 '^#\[ignore = "needs a 1.2 binary' "$file" \
+              | grep -c '^fn [a-z0-9_]*_1_2_')
+            in_file=$(grep -c '^#\[ignore = "needs a 1.2 binary' "$file")
+            if [ "$named" != "$in_file" ]; then
+              echo "a 1.2 test in $file is not named with _1_2_" >&2
+              exit 1
+            fi
+          done
           KIVIDB_1_2_BIN="$dir/kividb/kividb" \
             cargo-nextest nextest run --profile ci --color never \
               --archive-file nextest-archive.tar.zst \
               --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
               --workspace-remap "$GITHUB_WORKSPACE" \
               --run-ignored ignored-only \
-              -E 'binary(=vset_persistence) | (binary(=cluster) & test(/_1_2_/))' -j 1 \
+              -E 'binary(=vset_persistence) | ((binary(=cluster) | binary(=checkpoint)) & test(/_1_2_/))' -j 1 \
             2>&1 | tee "$dir/test.log"
           grep -q "$expected tests run: $expected passed" "$dir/test.log"
 

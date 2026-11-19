@@ -1113,6 +1113,10 @@ where
     // A command of the batch being answered may have queued an AOF
     // record: its reply waits for it (see `aof::written`).
     let mut aof_wait = false;
+    // While the AOF cannot be written: where `AOF_WRITTEN` stood when a
+    // command that would be logged came, refused, most likely (see
+    // `aof::note_logged_command`).
+    let mut aof_refused_from: Option<u64> = None;
     let dirty_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut combined = Vec::with_capacity(8192);
     // Negotiated RESP protocol version, updated by HELLO. Kept as local connection
@@ -1504,9 +1508,7 @@ where
                     activity.record(&cmd, selected_db);
                 }
             }
-            if !aof_wait && crate::aof::acks_wait() && crate::aof::may_log(&cmd) {
-                aof_wait = true;
-            }
+            crate::aof::note_logged_command(&cmd, &mut aof_wait, &mut aof_refused_from);
             // The command before this one is over: its reply is settled, and
             // what it left to tell tracking clients follows it.
             if due & crate::output_limits::REDISPATCH != 0 {
@@ -1748,7 +1750,7 @@ where
                         blocking: Some(blocking_slot.prime()),
                     });
                     if let Some(wait) = blocking_slot.take_parked() {
-                        if std::mem::take(&mut aof_wait) {
+                        if crate::aof::take_wait(&mut aof_wait, &mut aof_refused_from) {
                             crate::aof::written(&aof_tx).await;
                         }
                         let limit = HardLimit::new(
@@ -1855,7 +1857,7 @@ where
                 });
                 if let Some(wait) = blocking_slot.take_parked() {
                     waited_from = Some(now_us());
-                    if std::mem::take(&mut aof_wait) {
+                    if crate::aof::take_wait(&mut aof_wait, &mut aof_refused_from) {
                         crate::aof::written(&aof_tx).await;
                     }
                     let limit = HardLimit::new(
@@ -3457,7 +3459,7 @@ where
         activity.note_flush(combined.len(), commands_before);
         activity.note_tx(tx.active.then_some(tx.queue.len()), tx.watched_keys.len());
         // Replies to writes go out once their records are in the AOF (#147).
-        if std::mem::take(&mut aof_wait) {
+        if crate::aof::take_wait(&mut aof_wait, &mut aof_refused_from) {
             crate::aof::written(&aof_tx).await;
         }
         // What its commands woke and nothing has waited for yet stays for

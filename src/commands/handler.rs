@@ -1434,6 +1434,17 @@ fn checked_in_gate(
     routed: &mut crate::cluster::routing::Routed,
     write_gate: &mut Option<crate::write_gate::WriteGuard>,
 ) -> Option<Vec<u8>> {
+    // While the AOF cannot be written, what would be logged is refused, as
+    // Redis refuses it (`MISCONF`): a write, or a script that may make some,
+    // before it touches anything. Found by the one load that brought the
+    // write here (`pause::writes_must_check`): nothing more for a write
+    // otherwise, and nothing for a read.
+    if crate::aof::write_failing()
+        && crate::aof::refused_while_failing(ctx.cmd.as_slice(), name, ctx.apply_replication)
+    {
+        *write_gate = None;
+        return Some(crate::aof::misconf());
+    }
     loop {
         // Not for `SCRIPT LOAD` or `SCRIPT FLUSH`: they change the script
         // cache, not the dataset, and are sent to nobody (#705), so a

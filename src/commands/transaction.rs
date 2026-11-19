@@ -230,6 +230,17 @@ pub fn exec_refusal(
             crate::replication::refused_without_replicas(&name, &parts)
         })
     };
+    // While the AOF cannot be written, a transaction that would be logged
+    // is refused whole, as Redis refuses it (`MISCONF`). One load otherwise.
+    if !busy(cmd)
+        && let Some(misconf) = crate::aof::exec_refusal_while_failing(queue)
+    {
+        let why = String::from_utf8_lossy(&misconf);
+        return Some(crate::resp::write::resp_error(&format!(
+            "EXECABORT Transaction discarded because of: {}",
+            why.trim_start_matches('-').trim_end()
+        )));
+    }
     // `no_room` asks `check_memory_limit` first; asked here, before the
     // queue is looked at, an EXEC under the limit makes nothing per command.
     let why = if busy(cmd) {
