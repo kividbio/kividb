@@ -5792,6 +5792,279 @@
             }
         ]
     },
+    "TDIGEST.ADD": {
+        "summary": "Adds values to a t-digest.",
+        "complexity": "O(N) for N values, amortised.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "value",
+                "type": "double",
+                "multiple": true
+            }
+        ]
+    },
+    "TDIGEST.BYRANK": {
+        "summary": "Returns the values at the given ranks of a t-digest, the smallest rank 0.",
+        "complexity": "O(c + N*c) for N ranks and c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "rank",
+                "type": "integer",
+                "multiple": true
+            }
+        ]
+    },
+    "TDIGEST.BYREVRANK": {
+        "summary": "Returns the values at the given ranks of a t-digest, the largest rank 0.",
+        "complexity": "O(c + N*c) for N ranks and c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "reverse_rank",
+                "type": "integer",
+                "multiple": true
+            }
+        ]
+    },
+    "TDIGEST.CDF": {
+        "summary": "Returns the share of a t-digest's values at or below each value given.",
+        "complexity": "O(c + N*c) for N values and c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "value",
+                "type": "double",
+                "multiple": true
+            }
+        ]
+    },
+    "TDIGEST.CREATE": {
+        "summary": "Makes an empty t-digest.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "compression",
+                "type": "integer",
+                "token": "COMPRESSION",
+                "optional": true
+            }
+        ]
+    },
+    "TDIGEST.INFO": {
+        "summary": "Describes a t-digest: compression, capacity, centroids and observations.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "TDIGEST.MAX": {
+        "summary": "Returns the largest value added to a t-digest.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "TDIGEST.MERGE": {
+        "summary": "Merges t-digests into a destination.",
+        "complexity": "O(N*c) for N sources of c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "destination-key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "numkeys",
+                "type": "integer"
+            },
+            {
+                "name": "source-key",
+                "type": "key",
+                "key_spec_index": 1,
+                "multiple": true
+            },
+            {
+                "name": "config",
+                "type": "block",
+                "optional": true,
+                "arguments": [
+                    {
+                        "name": "compression",
+                        "type": "integer",
+                        "token": "COMPRESSION"
+                    }
+                ]
+            },
+            {
+                "name": "override",
+                "type": "pure-token",
+                "token": "OVERRIDE",
+                "optional": true
+            }
+        ]
+    },
+    "TDIGEST.MIN": {
+        "summary": "Returns the smallest value added to a t-digest.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "TDIGEST.QUANTILE": {
+        "summary": "Returns the values of a t-digest at the given quantiles.",
+        "complexity": "O(c + N*c) for N quantiles and c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "quantile",
+                "type": "double",
+                "multiple": true
+            }
+        ]
+    },
+    "TDIGEST.RANK": {
+        "summary": "Returns the ranks of values in a t-digest, the smallest rank 0.",
+        "complexity": "O(c + N*c) for N values and c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "value",
+                "type": "double",
+                "multiple": true
+            }
+        ]
+    },
+    "TDIGEST.RESET": {
+        "summary": "Empties a t-digest, keeping its compression.",
+        "complexity": "O(1)",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    },
+    "TDIGEST.REVRANK": {
+        "summary": "Returns the ranks of values in a t-digest, the largest rank 0.",
+        "complexity": "O(c + N*c) for N values and c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "value",
+                "type": "double",
+                "multiple": true
+            }
+        ]
+    },
+    "TDIGEST.TRIMMED_MEAN": {
+        "summary": "Returns the mean of a t-digest's values between two quantiles.",
+        "complexity": "O(c) for c centroids.",
+        "group": "module",
+        "module": "bf",
+        "since": "2.4.0",
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "low_cut_quantile",
+                "type": "double"
+            },
+            {
+                "name": "high_cut_quantile",
+                "type": "double"
+            }
+        ]
+    },
     "TS.ADD": {
         "summary": "Appends a sample to a time series, creating the series if needed.",
         "complexity": "O(1), plus O(M) when M compaction rules are attached.",

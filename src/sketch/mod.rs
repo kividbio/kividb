@@ -21,6 +21,7 @@ pub mod murmur;
 pub mod redis_module;
 pub mod room;
 pub mod topk;
+pub mod tdigest;
 
 use std::io;
 
@@ -38,6 +39,8 @@ const KIND_TOPK: u8 = 3;
 const TOPK_VERSION: u8 = 1;
 const KIND_CUCKOO: u8 = 4;
 const CUCKOO_VERSION: u8 = 1;
+const KIND_TDIGEST: u8 = 5;
+const TDIGEST_VERSION: u8 = 1;
 
 /// A probabilistic value.
 #[derive(Clone, Debug, PartialEq)]
@@ -46,6 +49,7 @@ pub enum Sketch {
     CountMin(cms::CountMin),
     TopK(topk::TopK),
     Cuckoo(cuckoo::Cuckoo),
+    TDigest(tdigest::TDigest),
 }
 
 impl Sketch {
@@ -56,6 +60,7 @@ impl Sketch {
             Sketch::CountMin(_) => redis_module::CMS_TYPE,
             Sketch::TopK(_) => redis_module::TOPK_TYPE,
             Sketch::Cuckoo(_) => redis_module::CUCKOO_TYPE,
+            Sketch::TDigest(_) => redis_module::TDIGEST_TYPE,
         }
     }
 
@@ -66,6 +71,7 @@ impl Sketch {
             Sketch::CountMin(v) => v.memory_bytes(),
             Sketch::TopK(v) => v.memory_bytes(),
             Sketch::Cuckoo(v) => v.memory_bytes(),
+            Sketch::TDigest(v) => v.memory_bytes(),
         }
     }
 
@@ -80,6 +86,7 @@ impl Sketch {
             Sketch::CountMin(v) => 1 + (v.data_bytes() >> 16),
             Sketch::TopK(v) => 1 + (v.data_bytes() >> 16),
             Sketch::Cuckoo(v) => 1 + (v.data_bytes() >> 16),
+            Sketch::TDigest(v) => 1 + (v.memory_bytes() as u64 >> 16),
         }
     }
 
@@ -90,6 +97,7 @@ impl Sketch {
             Sketch::CountMin(v) => cms::kdb_len(v),
             Sketch::TopK(v) => topk::kdb_len(v),
             Sketch::Cuckoo(v) => cuckoo::kdb_len(v),
+            Sketch::TDigest(v) => tdigest::kdb_len(v),
         }
     }
 }
@@ -125,6 +133,10 @@ pub fn write_kdb(w: &mut impl io::Write, sketch: &Sketch) -> io::Result<()> {
             w.write_all(&[KIND_CUCKOO, CUCKOO_VERSION])?;
             cuckoo::write_kdb(w, v)
         }
+        Sketch::TDigest(v) => {
+            w.write_all(&[KIND_TDIGEST, TDIGEST_VERSION])?;
+            tdigest::write_kdb(w, v)
+        }
     }
 }
 
@@ -137,6 +149,7 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<Sketch> {
         [KIND_CMS, CMS_VERSION] => Ok(Sketch::CountMin(cms::read_kdb(r)?)),
         [KIND_TOPK, TOPK_VERSION] => Ok(Sketch::TopK(topk::read_kdb(r)?)),
         [KIND_CUCKOO, CUCKOO_VERSION] => Ok(Sketch::Cuckoo(cuckoo::read_kdb(r)?)),
+        [KIND_TDIGEST, TDIGEST_VERSION] => Ok(Sketch::TDigest(tdigest::read_kdb(r)?)),
         [kind, version] => Err(invalid(&format!(
             "probabilistic value of kind {kind}, version {version}, is not known to this \
              version of KiviDB"

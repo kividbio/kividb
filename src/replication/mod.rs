@@ -4749,6 +4749,10 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "TOPK.ADD",
     "TOPK.INCRBY",
     "TOPK.RESERVE",
+    "TDIGEST.ADD",
+    "TDIGEST.CREATE",
+    "TDIGEST.MERGE",
+    "TDIGEST.RESET",
     "TS.ADD",
     "TS.ALTER",
     "TS.CREATE",
@@ -4800,6 +4804,7 @@ fn is_write_command_reference(name: &str) -> bool {
         "CMS.INCRBY" | "CMS.INITBYDIM" | "CMS.INITBYPROB" | "CMS.MERGE" |
         "TOPK.ADD" | "TOPK.INCRBY" | "TOPK.RESERVE" |
         "CF.ADD" | "CF.ADDNX" | "CF.COMPACT" | "CF.DEL" | "CF.INSERT" | "CF.INSERTNX" | "CF.LOADCHUNK" | "CF.RESERVE" |
+        "TDIGEST.ADD" | "TDIGEST.CREATE" | "TDIGEST.MERGE" | "TDIGEST.RESET" |
         // Strings
         "SET" | "SETNX" | "SETEX" | "PSETEX" | "MSET" | "MSETNX" | "GETSET" |
         "GETDEL" | "GETEX" | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" |

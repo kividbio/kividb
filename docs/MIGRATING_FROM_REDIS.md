@@ -115,6 +115,9 @@ What the RDB reader takes from Redis:
 - **Cuckoo filters** load, and answer as they did on Redis (an RDB file, a
   full sync, `RESTORE`, `MIGRATE` and `CF.SCANDUMP` chunks); the `cf-*`
   settings carry over in the config file. One over 1 GiB is refused.
+- **t-digests are not loaded** from Redis (an RDB file, a full sync or
+  `RESTORE` with one is refused, naming it). Add the values again, or move
+  each digest's quantiles over.
 - **Search index definitions and dictionaries are not loaded.** KiviDB keeps
   its own indexes. Run `FT.CREATE` (and `FT.DICTADD`) again after the move;
   `FT.CREATE` indexes the keys that are already there.

@@ -85,6 +85,7 @@ pub(crate) mod streams;
 mod strftime;
 mod strings;
 pub(crate) mod topk;
+pub(crate) mod tdigest;
 pub mod transaction;
 // `pub(crate)` only so `replication::script_feed` finds where a
 // `TS.INCRBY` has its `TIMESTAMP`, as the command reads it.

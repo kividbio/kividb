@@ -2718,6 +2718,15 @@ fn sketch_write_touched(name: &str) -> bool {
         || (name.starts_with("CF.") && crate::commands::cf::take_touched())
 }
 
+/// Whether the probabilistic-type write `name` that just failed had found
+/// its key (`BF.*`, `TDIGEST.*`).
+#[cold]
+#[inline(never)]
+fn sketch_write_touched(name: &str) -> bool {
+    (name.starts_with("BF.") && crate::commands::bf::take_touched())
+        || (name.starts_with("TDIGEST.") && crate::commands::tdigest::take_touched())
+}
+
 /// [`notify_watchers`] for a `BF.*` write that failed after finding its key,
 /// which is always `cmd[1]`. Kept apart and out of line so `notify_watchers`
 /// keeps its one call site in [`side_effects`], where it is inlined: a second

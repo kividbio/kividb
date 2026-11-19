@@ -45,6 +45,8 @@ pub const ALLOCATES: &[&str] = &[
     "CF.INSERTNX",
     "CF.LOADCHUNK",
     "CF.RESERVE",
+    "TDIGEST.CREATE",
+    "TDIGEST.MERGE",
 ];
 
 /// The bytes the command in `ctx`, named `name` (one of [`ALLOCATES`]),

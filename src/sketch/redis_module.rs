@@ -39,6 +39,10 @@ const TOPK_SLOT: usize = 24;
 /// what Redis 8.10 writes.
 pub const CUCKOO_TYPE: &str = "MBbloomCF";
 const CUCKOO_ENCVER: u64 = 4;
+/// The module type of t-digests, as `TYPE` names them. Their values are not
+/// read or written in Redis's format: `DUMP` gives KiviDB's own, and a
+/// Redis payload or RDB value of this type is refused.
+pub const TDIGEST_TYPE: &str = "TDIS-TYPE";
 
 /// The RDB version `DUMP` payloads of these types carry: 9 (Redis 6.0),
 /// the oldest that has these encodings, so that every Redis since takes
@@ -207,6 +211,12 @@ pub fn dumps_as_redis(sketch: &Sketch) -> bool {
     matches!(sketch, Sketch::Bloom(_) | Sketch::Cuckoo(_))
 }
 
+/// Whether `DUMP` writes `sketch` in Redis's format, which Redis can
+/// `RESTORE`; the other types are dumped in KiviDB's own.
+pub fn dumps_as_redis(sketch: &Sketch) -> bool {
+    matches!(sketch, Sketch::Bloom(_))
+}
+
 /// The most bytes [`dump_payload`] writes for `sketch`: each field at its
 /// longest, and the layers' bytes.
 fn dump_len(sketch: &Sketch) -> u64 {
@@ -233,6 +243,8 @@ fn dump_len(sketch: &Sketch) -> u64 {
         // Type, module ID, seven fields, the end, version and CRC: under
         // 128. Each sub-filter: two fields and a string head, its bytes.
         Sketch::Cuckoo(cf) => 128 + cf.filters.len() as u64 * 32 + cf.data_bytes(),
+        // Not written in Redis's format (see `dumps_as_redis`).
+        Sketch::TDigest(_) => 0,
     }
 }
 
@@ -261,6 +273,12 @@ pub fn dump_payload(sketch: &Sketch) -> io::Result<Vec<u8>> {
         Sketch::Cuckoo(cf) => {
             w.len(module_id(CUCKOO_TYPE, CUCKOO_ENCVER));
             write_cuckoo(&mut w, cf);
+        }
+        Sketch::TDigest(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "t-digests are not written in Redis's format",
+            ));
         }
     }
     w.len(OPCODE_EOF);

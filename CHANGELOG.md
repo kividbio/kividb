@@ -325,6 +325,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   compacts in part), and `COPY` copies a filter. Snapshots keep filters under tag
   40, kind 4.
 
+- **t-digests (`TDIGEST.*`), as Redis 8 has them built in (#453).**
+  `TDIGEST.CREATE`, `TDIGEST.ADD`, `TDIGEST.MERGE` (with `COMPRESSION` and
+  `OVERRIDE`), `TDIGEST.RESET`, `TDIGEST.QUANTILE`, `TDIGEST.CDF`,
+  `TDIGEST.RANK`, `TDIGEST.REVRANK`, `TDIGEST.BYRANK`, `TDIGEST.BYREVRANK`,
+  `TDIGEST.MIN`, `TDIGEST.MAX`, `TDIGEST.TRIMMED_MEAN` and `TDIGEST.INFO`.
+  Replies and errors are Redis 8.10's in RESP2 and RESP3, with the order in
+  which Redis checks arguments, `nan` and `inf` included (16,000 replies of
+  random sequences compared: `scripts/checks/sketch/tdigest/compare.py`).
+  The digest is the published merging digest, so answers are approximations
+  within the same bounds as Redis's rather than bit for bit the same, and
+  Redis's where nothing is approximated. A query never changes a digest, so a
+  replica keeps the master's byte for byte. `TYPE` is `TDIS-TYPE`, the ACL
+  category `@tdigest`. Unlike Redis, a compression of at most 100,000, a
+  per-command limit on queries of many values and merges, `COPY` copies a
+  digest, and `DUMP` gives KiviDB's own payload (Redis's is refused).
+  Snapshots keep digests under tag 40, kind 5.
+
 - **Vector sets store vectors quantized when `VADD` asks for it (#697).**
   `Q8` keeps each vector as int8 with its norm and range, and `BIN` as one
   bit per component, as Redis 8 does: about 3.6-3.8x and 15-22x less memory

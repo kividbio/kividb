@@ -974,6 +974,59 @@ reached`, and `BUCKETSIZE` is bounded by half of `cf-initial-size`.
   them; the value is as Redis 8.10 writes it.
 
 
+## t-digest commands (TDIGEST.*)
+
+t-digests, as Redis 8 has them built in (formerly RedisBloom): quantiles,
+ranks and CDFs of a stream of numbers in bounded space. Replies and errors are
+Redis 8.10's in RESP2 and RESP3 (doubles as bulk strings in RESP2; `nan`, `inf`
+and `-inf` as Redis spells them). The numbers are approximations within the
+same bounds as Redis's, not bit for bit the same: KiviDB's digest is the
+published merging digest (Dunning and Ertl), written from the paper. Where
+nothing is approximated (few enough values that each is its own centroid) the
+answers are Redis's. `TYPE` is `TDIS-TYPE`; the ACL category is `@tdigest`.
+
+| `TDIGEST.CREATE` | `TDIGEST.CREATE key [COMPRESSION compression]` | Compression 100 unless given; capacity `6 × compression + 10` centroids, as in Redis |
+| `TDIGEST.ADD` | `TDIGEST.ADD key value [value ...]` | Every value is read before any is added; finite values only |
+| `TDIGEST.MERGE` | `TDIGEST.MERGE destination numkeys source [source ...] [COMPRESSION compression] [OVERRIDE]` | The destination becomes a digest of the compression given (else its own, else the largest of the sources') holding its values (unless `OVERRIDE`) and the sources' |
+| `TDIGEST.RESET` | `TDIGEST.RESET key` | Empties it, keeping its compression |
+| `TDIGEST.QUANTILE` | `TDIGEST.QUANTILE key quantile [quantile ...]` | `nan` for an empty digest |
+| `TDIGEST.CDF` | `TDIGEST.CDF key value [value ...]` | |
+| `TDIGEST.RANK` / `TDIGEST.REVRANK` | `TDIGEST.RANK key value [value ...]` | `-1` past the low (high) end, the count past the other, `-2` for an empty digest |
+| `TDIGEST.BYRANK` / `TDIGEST.BYREVRANK` | `TDIGEST.BYRANK key rank [rank ...]` | `inf` (`-inf`) past the last rank |
+| `TDIGEST.MIN` / `TDIGEST.MAX` | `TDIGEST.MIN key` | Exact |
+| `TDIGEST.TRIMMED_MEAN` | `TDIGEST.TRIMMED_MEAN key low_cut_quantile high_cut_quantile` | The mean of the values from `floor(low · n)` to `ceil(high · n)`, as Redis takes them |
+| `TDIGEST.INFO` | `TDIGEST.INFO key` | Redis's fields; a map in RESP3 |
+
+
+- Answers are approximations within the same bounds as Redis's, not bit for
+  bit the same: on streams of 200,000 values at compression 100, KiviDB's
+  quantiles were closer to the true ones than Redis's at every quantile from
+  0.1 to 0.9 measured (1.4 to 80 times), Redis's closer at 0.001 and 0.999 (see
+  `scripts/checks/sketch/tdigest/README.md`).
+- A query never changes a digest (Redis merges its unmerged centroids first),
+  so that a replica, which sees no queries, keeps the master's digest byte for
+  byte. `TDIGEST.INFO`'s merged and unmerged node counts, their weights and
+  its count of compressions can differ from Redis's for that.
+- A compression below 5 sizes centroids as 5 does.
+- Size limit: a compression of at most 100,000 (`ERR T-Digest: compression
+  parameter is too large (at most 100000)`); Redis takes more.
+- Per-command limits, so that no command takes more than some tens of
+  milliseconds: a query of many values may cost at most 4,000,000 steps
+  (values times centroids: some 11,000 quantiles of a digest of compression
+  100), and a merge may read at most 600,010 centroids (one full digest of
+  the largest compression, or a thousand of compression 100), checked before
+  it starts: `ERR T-Digest: command reached the per-command limit; send fewer
+  values per command`. Replication and the AOF are not held to them.
+- `TDIGEST.MERGE` needs read permission on its sources and write permission
+  on its destination; Redis lets read permission on the destination do.
+- Under `maxmemory`, a client's `TDIGEST.CREATE` or `TDIGEST.MERGE` that would
+  allocate more than is left evicts first under the policy, before it takes
+  its keys, and is refused with `OOM ...` only if that is not enough.
+- `DUMP`, `RESTORE` and `MIGRATE` use KiviDB's own payload: Redis's payloads
+  and RDB values of t-digests are refused, and Redis cannot restore KiviDB's.
+- `COPY` copies a digest; Redis refuses it.
+
+
 ## Pub/Sub commands
 
 KiviDB implements the full Redis Pub/Sub command surface including regular channels, glob-pattern subscriptions, and Redis 7.0 shard channels. Every subscribed connection has one queue: a publish appends to the queue of each subscriber, and the connection's own task writes it out. A subscriber therefore sees messages in the order they were published, across all of its channels and patterns, and none is ever dropped from the middle — a subscriber that falls more than 32 MB behind, or stays more than 8 MB behind for 60 seconds, is disconnected instead (Redis's `client-output-buffer-limit pubsub 32mb 8mb 60`). A publish with no subscribers takes no lock.

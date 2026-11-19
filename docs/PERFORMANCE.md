@@ -439,6 +439,11 @@ depend on their order). The writes behind Redis's here are not chased yet.
 | `CF.ADD` of one item | 0.50M | 0.96M | -48% |
 | `CF.EXISTS` of one item | 1.07M | 0.97M | +10% |
 
+
+
+| `TDIGEST.ADD` of one value | 0.67M | 0.92M | -27% |
+| `TDIGEST.QUANTILE` of one quantile | 0.85M | 0.81M | +5% |
+
 ## Earlier runs
 
 KiviDB 1.1 was also measured on AWS Graviton3 bare metal in October 2026, against

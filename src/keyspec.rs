@@ -717,11 +717,28 @@ const SKETCHES: &[&str] = &[
     "CF.MEXISTS",
     "CF.RESERVE",
     "CF.SCANDUMP",
+    "TDIGEST.ADD",
+    "TDIGEST.BYRANK",
+    "TDIGEST.BYREVRANK",
+    "TDIGEST.CDF",
+    "TDIGEST.CREATE",
+    "TDIGEST.INFO",
+    "TDIGEST.MAX",
+    "TDIGEST.MIN",
+    "TDIGEST.QUANTILE",
+    "TDIGEST.RANK",
+    "TDIGEST.RESET",
+    "TDIGEST.REVRANK",
+    "TDIGEST.TRIMMED_MEAN",
 ];
 
 /// The probabilistic types' merges: `destination numkeys source ...`,
 /// after [`SKETCHES`] for the same reason.
 const SKETCH_MERGES: &[&str] = &["CMS.MERGE"];
+
+/// The probabilistic types' merges: `destination numkeys source ...`,
+/// after [`SKETCHES`] for the same reason.
+const SKETCH_MERGES: &[&str] = &["TDIGEST.MERGE"];
 
 const COMMANDS: &[(&[&str], Shape)] = &[
     (FIRST, Shape::First),
@@ -1168,6 +1185,19 @@ mod tests {
             | "CF.MEXISTS"
             | "CF.RESERVE"
             | "CF.SCANDUMP"
+            | "TDIGEST.ADD"
+            | "TDIGEST.BYRANK"
+            | "TDIGEST.BYREVRANK"
+            | "TDIGEST.CDF"
+            | "TDIGEST.CREATE"
+            | "TDIGEST.INFO"
+            | "TDIGEST.MAX"
+            | "TDIGEST.MIN"
+            | "TDIGEST.QUANTILE"
+            | "TDIGEST.RANK"
+            | "TDIGEST.RESET"
+            | "TDIGEST.REVRANK"
+            | "TDIGEST.TRIMMED_MEAN"
             // Sharded pub/sub: the channel is hashed to a slot exactly like a key.
             | "SPUBLISH" => One(1),
 
