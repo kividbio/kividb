@@ -38,17 +38,38 @@ pub fn allocates(name: &str) -> bool {
     )
 }
 
-/// [`allocates`] for the dispatch of every command under `maxmemory`: a
-/// byte's look for the rest, the names asked out of line.
+/// Whether the command `cmd` may be one that [`allocates`], for the dispatch
+/// of every command under `maxmemory`: a look at its first byte, the names
+/// asked out of line.
 #[inline]
-pub fn may_allocate(name: &str) -> bool {
-    matches!(name.as_bytes().first(), Some(b'B' | b'C' | b'T')) && allocates_cold(name)
+pub fn may_allocate(cmd: &[&[u8]]) -> bool {
+    matches!(
+        cmd.first().and_then(|n| n.first()),
+        Some(b'B' | b'C' | b'T' | b'b' | b'c' | b't')
+    ) && name_allocates(cmd)
 }
 
 #[cold]
 #[inline(never)]
-fn allocates_cold(name: &str) -> bool {
-    allocates(name)
+fn name_allocates(cmd: &[&[u8]]) -> bool {
+    upper_name(cmd).is_some_and(|name| allocates(&name))
+}
+
+/// The command's name in upper case, if it is one of these types' names.
+fn upper_name(cmd: &[&[u8]]) -> Option<String> {
+    let name = cmd.first()?;
+    (name.len() <= 16).then(|| String::from_utf8_lossy(name).to_ascii_uppercase())
+}
+
+/// What the command in `ctx` would allocate, if it is one that
+/// [`allocates`] ([`wanted`]); 0 for any other.
+#[cold]
+#[inline(never)]
+pub fn wanted_by(ctx: &mut Ctx) -> u64 {
+    match upper_name(&ctx.cmd) {
+        Some(name) if allocates(&name) => wanted(ctx, &name),
+        _ => 0,
+    }
 }
 
 /// The bytes the command in `ctx`, named `name` (one that [`allocates`]),
