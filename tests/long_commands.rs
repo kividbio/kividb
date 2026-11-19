@@ -174,6 +174,7 @@ fn start_server() -> u16 {
             io_model: kividb::config::IoModel::Tokio,
             lua_parallel_scripts: false,
             configfile: "./kividb.conf".to_string(),
+            enable_debug_command: kividb::config::DebugCommand::Yes,
             ..Default::default()
         };
         kividb::run_for_test(config);

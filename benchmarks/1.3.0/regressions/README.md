@@ -171,9 +171,11 @@ and a C compiler). Suites 18 and 20 use `memtier_benchmark` 2.6.1 or newer
   directory, with no persistence (`--save ''`/`--appendonly no` for Redis;
   KiviDB saves nothing by default). KiviDB runs with `--protected-mode no
   --bind 127.0.0.1`, `--io-model` as the configuration says (`auto`
-  otherwise) and `--threads` as it says: every configuration states its
-  thread count (see [Thread counts](#thread-counts)). Redis runs with its
-  defaults (`io-threads 1`, jemalloc) and `--enable-debug-command yes`.
+  otherwise), `--threads` as it says (every configuration states its
+  thread count: see [Thread counts](#thread-counts)) and
+  `enable-debug-command yes` in a `--configfile` (v1.2.2 has no flag for
+  it). Redis runs with its defaults (`io-threads 1`, jemalloc) and
+  `--enable-debug-command yes`.
 - Client and server share the machine. Absolute numbers depend on it; the
   gates that compare with v1.2.2 or Redis measure both in the same session,
   and the gates against recorded values are only meaningful on the VM size

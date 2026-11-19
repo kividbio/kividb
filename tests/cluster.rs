@@ -314,9 +314,16 @@ impl Node {
             .find(|(k, _)| k == "KIVIDB_TEST_NODE_BIN")
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| env!("CARGO_BIN_EXE_kividb").to_string());
+        // Releases before 1.3 have no `--enable-debug-command` flag.
+        let debug: &[&str] = if self.env.iter().any(|(k, _)| k == "KIVIDB_TEST_NODE_BIN") {
+            &[]
+        } else {
+            &["--enable-debug-command", "yes"]
+        };
         let child = Command::new(bin)
             .current_dir(&self.dir)
             .args(bind)
+            .args(debug)
             .args([
                 "--port",
                 &self.port.to_string(),
@@ -12548,6 +12555,7 @@ fn a_standalone_snapshot_loads_into_the_shards_of_its_slots() {
     let mut plain = Command::new(env!("CARGO_BIN_EXE_kividb"))
         .current_dir(&dir)
         .args(["--bind", "127.0.0.1", "--port", &port.to_string()])
+        .args(["--enable-debug-command", "yes"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

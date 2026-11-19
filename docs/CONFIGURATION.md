@@ -85,6 +85,7 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--port` | `6380` | Port to listen on; `0` for none (TLS only, with `--tls-port`) |
 | `--bind` | `0.0.0.0` | Address to listen on. Setting it explicitly turns off [protected mode](#protected-mode) |
 | `--protected-mode <yes\|no>` | `yes` | See [Protected mode](#protected-mode) |
+| `--enable-debug-command <no\|yes\|local>` | `no` | Who may run `DEBUG`: nobody, any client its ACL user allows, or only clients on loopback; startup only (see below the table) |
 | `--threads` | `0` (auto) | Worker threads; auto is one per CPU the process may use (see [Worker threads](#worker-threads)) |
 | `--worker-cpu-affinity <off\|auto>` | `off` | `auto` binds each io_uring worker to a CPU of its own when they are as many as the process's CPUs (see [Worker CPU affinity](#worker-cpu-affinity)) |
 | `--search-index-threads <auto\|N>` | `auto` | Helper threads that link vectors written to HNSW indexes; startup only (see [Search index threads](#search-index-threads)) |
@@ -115,6 +116,16 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--tls-auth-clients <yes\|optional\|no>` | `yes` | Whether clients must present a certificate (only with `--tls-ca-cert-file`) |
 | `--tls-auth-clients-allowed-names <names>` | none | Names a client certificate's CN or DNS name must match; `*.` is one label |
 | `--update-check <yes\|no>` | `yes` | The [startup update check](#startup-update-check) |
+
+`DEBUG` is refused by default from 1.3.0, as in Redis 7 and later: `enable-debug-command`
+is `no`, and every client gets Redis's `ERR DEBUG command not allowed ...`. Start the server
+with `--enable-debug-command yes` (or `enable-debug-command yes` in the config file) to allow
+it to any client whose ACL user may run `DEBUG`, or `local` to allow it only to clients on
+loopback (`127.0.0.0/8`, `::1`). The ACL is checked first. Inside `MULTI` the refusal
+discards the transaction (`EXEC` answers `EXECABORT`); a script cannot run `DEBUG` whatever
+the setting. The setting is read at startup only: `CONFIG GET enable-debug-command` reports
+it and `CONFIG SET` refuses it, whatever the value. Up to 1.2.2 it was accepted and ignored,
+and `DEBUG` was open to any user whose ACL allowed it.
 
 `maxclients` (default `10000`, in the file or with `CONFIG SET`) counts plaintext and TLS
 clients, TLS ones from the start of their handshake. At startup KiviDB raises the soft

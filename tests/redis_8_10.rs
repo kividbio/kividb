@@ -185,6 +185,7 @@ fn start(port: u16, replicaof: Option<u16>) {
             io_model: kividb::config::IoModel::Tokio,
             replicaof: replicaof.map(|p| vec!["127.0.0.1".to_string(), p.to_string()]),
             configfile: "./kividb.conf".to_string(),
+            enable_debug_command: kividb::config::DebugCommand::Yes,
             ..Default::default()
         });
     });

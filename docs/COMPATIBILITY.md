@@ -289,6 +289,18 @@ other files:
   clients use what that release has: redis-py's and Jedis's client-side
   caches need Redis 7.4 or later. KiviDB's own release is `kividb_version`,
   in `HELLO` and in `INFO`.
+- `enable-debug-command` is Redis's, `no` by default from 1.3.0 (1.2.2 and
+  earlier ignored it): `DEBUG` is refused with Redis's error unless the
+  server started with `yes`, or with `local` and the client is on loopback
+  (KiviDB has no Unix socket). Inside `MULTI` the refusal discards the
+  transaction, as in Redis. `CONFIG SET` refuses it, whatever the value, as
+  Redis does. Two differences: a user whose ACL does not allow `DEBUG` gets
+  `NOPERM` (Redis checks the setting first), and with `--bind ::` an IPv4
+  client on loopback arrives IPv4-mapped and is not local, as for protected
+  mode (a Redis IPv6 listener takes no IPv4 clients).
+- `enable-protected-configs` and `enable-module-command` are accepted, in
+  the config file and by `CONFIG SET`, and change nothing: KiviDB has no
+  protected configs and no modules.
 - `MEMORY USAGE` is an estimate; `MEMORY MALLOC-STATS` is a stub.
 - `OBJECT IDLETIME` is `0` unless a `maxmemory-policy` that uses it is set,
   or `key-access-tracking yes` is (Redis always keeps it; the setting costs

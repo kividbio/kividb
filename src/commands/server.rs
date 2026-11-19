@@ -1766,6 +1766,10 @@ fn config_set_other(ctx: &Ctx, param: &str, value: &str) -> Vec<u8> {
              immutable config"
         ))
     };
+    // Redis refuses it at run time, even to the value it has.
+    if param == "enable-debug-command" {
+        return immutable();
+    }
     // One `CONFIG GET` reports, read only at startup
     // (`repl-replica-max-backlog-bytes`, `backupdirname`, ...): to what it
     // already is, is no change.
@@ -2307,6 +2311,10 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         (
             "search-index-threads",
             ctx.config.search_index_threads.name(),
+        ),
+        (
+            "enable-debug-command",
+            ctx.config.enable_debug_command.name().to_string(),
         ),
         // The value in force, not the one the server started with.
         (

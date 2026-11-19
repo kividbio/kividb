@@ -47,7 +47,7 @@ pub fn refusal(acl_store: &crate::acl::AclStore, peer_addr: &str) -> Option<&'st
 }
 
 /// Whether a client at `peer_addr` is on this machine.
-fn is_local(peer_addr: &str) -> bool {
+pub(crate) fn is_local(peer_addr: &str) -> bool {
     match peer_addr.parse::<std::net::SocketAddr>() {
         Ok(addr) => addr.ip().is_loopback(),
         // Not an IP address (a Unix socket): on this machine.
