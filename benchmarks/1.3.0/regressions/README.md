@@ -913,6 +913,36 @@ the 4 Python readers are near their limit there, so it catches a loss, not
 a gain. #851's PR has the pinned measurements (server on 2 vCPUs, clients
 on the other 2, a Rust client), where the difference is larger.
 
+## Recorded run, suite 29
+
+Run 2026-11-19 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C) held to
+4 vCPUs (`taskset -c 0-3 run-all.sh --only 29`, so the suite sees what a
+`Standard_D4s_v5` gives it), default builds, rustc 1.100.0. Not recorded
+into `baseline.json`: every gate is against v1.2.2 in the same session, and
+the rows that are gated depend on the machine (see "client-limited" below).
+Runs: `s29-master-1-4cpu` (master `16da886f`, before the fix: `REGRESSED`,
+the five `uring1` rows), `s29-fin2-2-4cpu` and `s29-fin2-3-4cpu` (the fix:
+`ok` twice). A run takes about 17 minutes.
+
+| config | metric | v1.2.2 | master | fix (2 runs) |
+|---|---|---:|---:|---:|
+| uring1 | `GET` a second | 140,575 | 123,222 (1.14x worse) | 141,460 / 142,411 |
+| uring1 | `SET` a second | 138,398 | 125,494 (1.10x) | 140,410 / 140,455 |
+| uring1 | `INCR` a second | 142,126 | 129,305 (1.10x) | 142,186 / 141,634 |
+| uring1 | `PTTL` a second | 146,795 | 128,952 (1.14x) | 144,641 / 140,803 |
+| uring1 | `PUBLISH` a second | 146,000 | 131,320 (1.11x) | 142,371 / 145,229 |
+| tokio1 | `GET` a second | 109,109 | 107,966 | 107,964 / 107,981 |
+| uring2 | `GET` a second, client-limited | 164,597 | 165,644 | 164,035 / 164,161 |
+
+On 4 vCPUs the two-worker rows (`uring2`, `tokio2`) are client-limited:
+redis-benchmark's two CPUs run at 2.0 and the server's two at about 1.93,
+and master measured the same as v1.2.2 there, so they are shown, not
+gated. On 8 vCPUs (six client CPUs) they are gated, and there master ran
+9-10 % behind v1.2.2 as well (the PR's Go client: `GET` 216k against 238k).
+v1.2.2's own samples of a row on one worker spread by up to 7 % (the client
+shares the server's core), so a median 1.05x worse is the smallest loss the
+gate catches reliably; master's was 1.10-1.14x.
+
 ## Not covered
 
 Every row of the gains table in `docs/PERFORMANCE.md` has a suite here (01-13; 14 is #759 and 15 is #758, after that table).
