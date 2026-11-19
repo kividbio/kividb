@@ -2171,7 +2171,7 @@ pub(crate) struct ReplicationApplyEnv {
     /// failing; nothing should ever arrive, because every command applied
     /// through this env runs with `apply_replication: true` and so never
     /// reaches the propagation path at all.
-    _inert_hub_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::replication::HubMsg>>,
+    _inert_hub_rx: Option<crate::replication::HubRx>,
     lastsave: Arc<parking_lot::RwLock<i64>>,
     started_at: std::time::Instant,
     pubsub: crate::pubsub::PubSubHub,
@@ -2204,8 +2204,7 @@ impl ReplicationApplyEnv {
     /// own AOF, and their client-visible side effects go to the server's real
     /// hubs (see [`ReplicaStarter`]).
     fn new(starter: &ReplicaStarter) -> Self {
-        let (discard_hub_tx, mut hub_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::replication::HubMsg>();
+        let (discard_hub_tx, mut hub_rx) = crate::replication::HubTx::channel();
         tokio::spawn(async move { while hub_rx.recv().await.is_some() {} });
         let mut env = Self::with_hub(
             discard_hub_tx,
@@ -2227,8 +2226,7 @@ impl ReplicationApplyEnv {
     /// entirely outside) the runtime that `new` needs for its drain task, so it
     /// keeps the receiver instead of spawning a consumer for it.
     pub(crate) fn new_inert() -> Self {
-        let (discard_hub_tx, hub_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::replication::HubMsg>();
+        let (discard_hub_tx, hub_rx) = crate::replication::HubTx::channel();
         Self::with_hub(
             discard_hub_tx,
             Some(hub_rx),
@@ -2239,7 +2237,7 @@ impl ReplicationApplyEnv {
 
     fn with_hub(
         discard_hub_tx: crate::replication::HubTx,
-        inert_hub_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::replication::HubMsg>>,
+        inert_hub_rx: Option<crate::replication::HubRx>,
         aof_tx: Box<dyn crate::commands::ctx::AofSender>,
         aof_live: bool,
     ) -> Self {
@@ -2767,8 +2765,8 @@ where
                             && let Ok(s) = std::str::from_utf8(cmd[2])
                             && let Ok(offset) = s.parse::<u64>()
                         {
-                            let _ = hub_tx_ack
-                                .send(crate::replication::HubMsg::AckOffset { replica_id, offset });
+                            // Out of the writes' order: see `HubTx::send_ack`.
+                            let _ = hub_tx_ack.send_ack(replica_id, offset);
                         }
                         pos += consumed;
                     }
@@ -2849,7 +2847,7 @@ mod repl_apply_env_tests {
         let ts = crate::store::new_ts_index();
         let (compaction_tx, compaction_rx) = crate::vector::new_compaction_channel();
         drop(compaction_rx);
-        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (hub_tx, _hub_rx) = crate::replication::HubTx::channel();
         let starter = super::ReplicaStarter {
             store: std::sync::Arc::clone(&store),
             index_store: std::sync::Arc::clone(&index),

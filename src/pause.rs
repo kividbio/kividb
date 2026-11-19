@@ -428,6 +428,35 @@ pub fn test_stall_before_the_gate(cmd: &[&[u8]]) {
     }
 }
 
+/// `KIVIDB_TEST_SCRIPT_STALL_MS`, never set otherwise, and read in debug
+/// builds only: a command a script calls with an argument that begins with
+/// `script-stall:` (`redis.call('ECHO', 'script-stall:1')`) waits this long,
+/// every time, holding what the script holds. A test's window into a script
+/// part-way through what it does, without a loop sized to the machine. For
+/// as long as it waits, the file `script-stall.held` is in the server's
+/// working directory: a test knows from it that the script has got there,
+/// and that it is still there.
+#[cfg(debug_assertions)]
+pub fn test_stall_in_script(cmd: &[&[u8]]) {
+    static DELAY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    let delay = DELAY.get_or_init(|| {
+        std::env::var("KIVIDB_TEST_SCRIPT_STALL_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .map(std::time::Duration::from_millis)
+    });
+    if let Some(delay) = *delay
+        && cmd
+            .iter()
+            .skip(1)
+            .any(|arg| arg.starts_with(b"script-stall:"))
+    {
+        let _ = std::fs::write("script-stall.held", b"");
+        std::thread::sleep(delay);
+        let _ = std::fs::remove_file("script-stall.held");
+    }
+}
+
 pub fn clear_pause() {
     let _flag = FLAG_LOCK.lock();
     clear_pause_held();

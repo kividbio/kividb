@@ -166,6 +166,55 @@ pub fn encode_resp_command<A: AsRef<[u8]>>(cmd: &[A]) -> Vec<u8> {
     out
 }
 
+/// [`encode_resp_command`] appended to `out`: the same bytes, in two copies
+/// an argument (its header line, with the end of the argument before it,
+/// and the argument), not five: every write the stream carries is encoded
+/// here, with the backlog kept (#894).
+pub fn encode_resp_command_into<A: AsRef<[u8]>>(out: &mut Vec<u8>, cmd: &[A]) {
+    let size: usize = cmd.iter().map(|part| part.as_ref().len() + 16).sum();
+    out.reserve(size + 16);
+    let mut line = [0u8; 25];
+    let len = header_line(&mut line, false, b'*', cmd.len());
+    out.extend_from_slice(&line[..len]);
+    for (n, part) in cmd.iter().enumerate() {
+        let part = part.as_ref();
+        let len = header_line(&mut line, n > 0, b'$', part.len());
+        out.extend_from_slice(&line[..len]);
+        out.extend_from_slice(part);
+    }
+    if !cmd.is_empty() {
+        out.extend_from_slice(b"\r\n");
+    }
+}
+
+/// `{prefix}{n}\r\n` at the start of `line`, after a `\r\n` (the end of
+/// the argument before) when `after_argument`; its length.
+#[inline]
+fn header_line(line: &mut [u8; 25], after_argument: bool, prefix: u8, n: usize) -> usize {
+    let mut at = 0;
+    if after_argument {
+        line[0] = b'\r';
+        line[1] = b'\n';
+        at = 2;
+    }
+    line[at] = prefix;
+    let mut digits = 1;
+    let mut rest = n / 10;
+    while rest > 0 {
+        digits += 1;
+        rest /= 10;
+    }
+    let end = at + 1 + digits;
+    let mut rest = n;
+    for i in (at + 1..end).rev() {
+        line[i] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+    }
+    line[end] = b'\r';
+    line[end + 1] = b'\n';
+    end + 2
+}
+
 pub fn resp_null_array() -> Vec<u8> {
     b"*-1\r\n".to_vec()
 }
@@ -345,7 +394,7 @@ pub fn write_bulk(buf: &mut Vec<u8>, data: &[u8]) {
 
 #[cfg(test)]
 mod decimal_tests {
-    use super::{resp_bulk, resp_integer};
+    use super::{encode_resp_command, encode_resp_command_into, resp_bulk, resp_integer};
 
     #[test]
     fn integers_are_written_as_format_writes_them() {
@@ -372,5 +421,32 @@ mod decimal_tests {
         assert_eq!(resp_bulk(b"hello"), b"$5\r\nhello\r\n");
         let long = vec![b'x'; 1024];
         assert!(resp_bulk(&long).starts_with(b"$1024\r\n"));
+    }
+
+    /// Appended, a command is the bytes `encode_resp_command` gives it,
+    /// whatever its arguments' lengths, after what the buffer held.
+    #[test]
+    fn a_command_appended_is_the_command_encoded() {
+        let sizes = [
+            0usize, 1, 9, 10, 11, 99, 100, 101, 999, 1000, 12_345, 100_000,
+        ];
+        let mut cases: Vec<Vec<Vec<u8>>> = vec![Vec::new(), vec![Vec::new()]];
+        for (i, &a) in sizes.iter().enumerate() {
+            let b = sizes[(i * 7 + 3) % sizes.len()];
+            cases.push(vec![b"SET".to_vec(), vec![b'k'; a], vec![b'v'; b]]);
+            cases.push(vec![vec![b'x'; a]]);
+        }
+        cases.push((0..12).map(|i| vec![b'a'; i]).collect());
+        for cmd in &cases {
+            let mut out = b"before".to_vec();
+            encode_resp_command_into(&mut out, cmd);
+            assert_eq!(&out[..6], b"before");
+            assert_eq!(
+                &out[6..],
+                &encode_resp_command(cmd)[..],
+                "{:?}",
+                cmd.iter().map(Vec::len).collect::<Vec<_>>()
+            );
+        }
     }
 }

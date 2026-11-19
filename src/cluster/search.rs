@@ -526,6 +526,11 @@ fn done(pool: &Pool, key: &PoolKey, conn: Conn, reply: Reply) -> Result<Reply, S
 /// replies. An error if any of them cannot answer: a search of part of the
 /// data is not one of the whole.
 pub fn fan_out(ctx: &crate::commands::ctx::Ctx, cmd: &[Vec<u8>]) -> Result<Vec<Reply>, String> {
+    // This node's part has been read: the walk it took (`tag_locks::walk`)
+    // is not held while the other masters' parts are waited for, each of
+    // which takes one of its own there.
+    #[cfg(feature = "lua")]
+    crate::tag_locks::end_walk_here();
     let targets = others(ctx.cluster);
     let credentials = ctx.repl_state.master_credentials();
     let db = *ctx.selected_db;

@@ -256,8 +256,8 @@ pub async fn handle_replica_connection_uring(
                             && let Ok(s) = std::str::from_utf8(cmd[2])
                             && let Ok(offset) = s.parse::<u64>()
                         {
-                            let _ = hub_tx
-                                .send(crate::replication::HubMsg::AckOffset { replica_id, offset });
+                            // Out of the writes' order: see `HubTx::send_ack`.
+                            let _ = hub_tx.send_ack(replica_id, offset);
                         }
                         parse_offset += consumed;
                     }
@@ -383,6 +383,61 @@ async fn park_blocking_uring(
     if wait.held_by_pause() {
         slot.held_by_pause();
         return Ok(());
+    }
+    // A command that found a script on its hash tags (`blocking::hold_for_tags`):
+    // see `server::wait_for_tags`.
+    #[cfg(feature = "lua")]
+    if let Some(busy) = wait.take_tags() {
+        slot.held_by_pause();
+        let flushed = if out_buf.is_empty() {
+            true
+        } else {
+            let payload = std::mem::take(out_buf);
+            crate::stats::TOTAL_NET_OUTPUT_BYTES
+                .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::stats::record_write();
+            let _w = write_guard.lock().await;
+            let write = std::pin::pin!(stream.write_all(payload));
+            let (res, mut returned) = read_while_writing(
+                write,
+                watch,
+                crate::server::ReadAhead {
+                    carried,
+                    carried_from,
+                    held_elsewhere,
+                },
+                activity,
+                limit,
+            )
+            .await;
+            drop(_w);
+            returned.clear();
+            *out_buf = returned;
+            res.is_ok()
+        };
+        if let Some(subs) = subscriptions.filter(|_| flushed) {
+            subs.flushed();
+        }
+        // Whether the client is still there is watched as a blocking
+        // command's wait watches it (`PeerWatch`): a kill shuts the socket.
+        let gone = !flushed
+            || tokio::select! {
+                turns = crate::tag_locks::command_turns(&busy) => {
+                    slot.hold_tag_turns(turns);
+                    false
+                }
+                () = watch.gone() => true,
+            };
+        if !gone {
+            return Ok(());
+        }
+        interrupted.gone = true;
+        if slot.resuming() {
+            slot.make_gone();
+            return Ok(());
+        }
+        slot.release_count();
+        return Err(Vec::new());
     }
     if slot.in_resume() && !wait.may_repark() {
         // A resumed handler parked again — it forgot its resume check. Reply as
@@ -3170,20 +3225,25 @@ pub async fn handle_client(
                     // So is one that is no command at all, or has the wrong
                     // number of arguments, or arrives while a script has the
                     // server busy.
-                    let refusal =
-                        commands::transaction::queue_refusal(&cmd_name, &cmd).or_else(|| {
-                            crate::cluster::routing::queue_refusal(
-                                &crate::cluster::routing::Caller {
-                                    cluster: &cluster_state,
-                                    registry: &client_registry,
-                                    client_id,
-                                    store: &store,
-                                    db: selected_db,
-                                    ipv6: peer_ipv6,
-                                },
-                                &cmd,
-                            )
-                        });
+                    let refusal = commands::transaction::queue_refusal(
+                        &cmd_name,
+                        &cmd,
+                        config.enable_debug_command,
+                        &peer_addr,
+                    )
+                    .or_else(|| {
+                        crate::cluster::routing::queue_refusal(
+                            &crate::cluster::routing::Caller {
+                                cluster: &cluster_state,
+                                registry: &client_registry,
+                                client_id,
+                                store: &store,
+                                db: selected_db,
+                                ipv6: peer_ipv6,
+                            },
+                            &cmd,
+                        )
+                    });
                     match refusal {
                         Some(refusal) => {
                             tx.aborted = true;

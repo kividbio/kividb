@@ -1652,9 +1652,10 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
 /// many costs about what measuring every vector does.
 pub(crate) const SEARCH_SHARE: usize = 16;
 
-/// The nearest `k` an index search finds, less the documents whose `field`
-/// a query is not to see ([`crate::commands::search::field_hidden`]),
-/// nearest first, and whether `deadline` passed first.
+/// The nearest `k` an index search finds, less the hits a query leaves out
+/// ([`crate::commands::search::hit_left_out`]: a document past its `field`'s
+/// deadline, or one deleted or written over whose vector is still in the
+/// index), nearest first, and whether `deadline` passed first.
 ///
 /// `search(n)` is the nearest `n`. While hits were left out and the search
 /// found all it was asked for, an HNSW search is asked for more, at least
@@ -1671,6 +1672,7 @@ pub(crate) const SEARCH_SHARE: usize = 16;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn nearest_shown(
     db: &crate::store::Db,
+    on: &crate::vector::IndexOn,
     field: &str,
     k: usize,
     now: &crate::types::QueryClock,
@@ -1692,7 +1694,7 @@ pub(crate) fn nearest_shown(
         (scorer.nearest(), cut)
     };
     shown_of(k, room, deadline, search, measure, |key| {
-        crate::commands::search::field_hidden(db, key, field, now)
+        crate::commands::search::hit_left_out(db, on, key, field, now)
     })
 }
 

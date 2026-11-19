@@ -158,6 +158,23 @@ pub fn commands_for_propagation(
     })
 }
 
+/// Whether [`commands_for_propagation`] gives `cmd` back as it came, known
+/// from its name and length alone, for the writes made most: a `SET` with
+/// no option (with one it may be rewritten: a TTL from now becomes a
+/// moment), and commands that are never rewritten. False is always safe: it
+/// only means the arguments are copied first. The test
+/// `the_writes_sent_as_they_came_are_not_rewritten` holds the list to
+/// `rewritten_for_propagation`.
+#[inline]
+pub fn sent_as_it_came(name: &str, cmd: &[&[u8]]) -> bool {
+    match name {
+        "SET" => cmd.len() == 3,
+        "INCR" | "DECR" | "INCRBY" | "DECRBY" | "APPEND" | "MSET" | "HSET" | "LPUSH" | "RPUSH"
+        | "SADD" | "ZADD" => cmd.len() >= 2,
+        _ => false,
+    }
+}
+
 /// How many commands [`commands_for_propagation`] would give, for a write
 /// nothing reads (`replication::write_is_observed`): what it does to work
 /// them out is done all the same (the effects it takes are taken), but a
@@ -240,6 +257,9 @@ fn rewritten_for_propagation(
         // Sent naming the filter's parameters when it made the filter with
         // a setting of this node's: see `commands::bf`.
         "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.RESERVE" => crate::commands::bf::propagation(cmd),
+        "CF.ADD" | "CF.ADDNX" | "CF.INSERT" | "CF.INSERTNX" | "CF.RESERVE" => {
+            crate::commands::cf::propagation(cmd)
+        }
         "TS.MADD" => ts_madd_feed(cmd, resp),
         "TS.INCRBY" | "TS.DECRBY" => {
             ts_incrby_feed(cmd, resp, crate::commands::ts::applied_as_1_2_0(ctx, cmd))
@@ -1367,7 +1387,7 @@ mod tests {
         use std::sync::Arc;
         let store = crate::store::new_store(1);
         let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
-        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (hub_tx, _hub_rx) = crate::replication::HubTx::channel();
         let config = Arc::new(crate::config::Config::default());
         let started_at = std::time::Instant::now();
         let index_store = crate::vector::new_index_store();
@@ -1423,6 +1443,46 @@ mod tests {
             blocking: None,
         };
         test(&ctx);
+    }
+
+    /// What `sent_as_it_came` says goes out as it came does: no rewrite.
+    #[test]
+    fn the_writes_sent_as_they_came_are_not_rewritten() {
+        let cases: &[&[&str]] = &[
+            &["SET", "k", "v"],
+            &["INCR", "n"],
+            &["DECR", "n"],
+            &["INCRBY", "n", "5"],
+            &["DECRBY", "n", "5"],
+            &["APPEND", "s", "x"],
+            &["MSET", "a", "1", "b", "2"],
+            &["HSET", "h", "f", "v"],
+            &["LPUSH", "l", "x"],
+            &["RPUSH", "l", "x"],
+            &["SADD", "s2", "x"],
+            &["ZADD", "z", "1", "x"],
+        ];
+        with_ctx(|ctx| {
+            for case in cases {
+                let owned = cmd(case);
+                let args = refs(&owned);
+                assert!(sent_as_it_came(case[0], &args), "{case:?}");
+                let feeds = commands_for_propagation(ctx, case[0], &args, b":1\r\n");
+                assert_eq!(feeds, vec![owned.clone()], "{case:?}");
+            }
+            // With an option a SET may be rewritten, and is not taken as sent
+            // as it came.
+            for case in [
+                &["SET", "k", "v", "EX", "10"][..],
+                &["SET", "k", "v", "GET"],
+            ] {
+                assert!(!sent_as_it_came(case[0], &refs(&cmd(case))), "{case:?}");
+            }
+            assert!(!sent_as_it_came(
+                "EXPIRE",
+                &refs(&cmd(&["EXPIRE", "k", "1"]))
+            ));
+        });
     }
 
     /// `propagation_count` (which knows SET, SETEX, PSETEX and the EXPIRE

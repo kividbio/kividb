@@ -59,6 +59,46 @@ pub enum IoModel {
     Tokio, // always use tokio
 }
 
+/// `enable-debug-command`: who may run `DEBUG`, as in Redis.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DebugCommand {
+    /// Nobody.
+    #[default]
+    No,
+    /// Any client its ACL user allows.
+    Yes,
+    /// Only clients on loopback.
+    Local,
+}
+
+impl DebugCommand {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::No => "no",
+            Self::Yes => "yes",
+            Self::Local => "local",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "no" => Some(Self::No),
+            "yes" => Some(Self::Yes),
+            "local" => Some(Self::Local),
+            _ => None,
+        }
+    }
+
+    /// Whether a client at `peer_addr` may run `DEBUG`.
+    pub fn allows(self, peer_addr: &str) -> bool {
+        match self {
+            Self::No => false,
+            Self::Yes => true,
+            Self::Local => crate::protected_mode::is_local(peer_addr),
+        }
+    }
+}
+
 /// What `kividb --version` prints after the name: the version, and which of
 /// the release's builds this is (`update_check::variant`), since the
 /// `kividb` and `kividb-full` packages install the same `/usr/bin/kividb`
@@ -102,6 +142,11 @@ pub struct Config {
     /// before 7: listening on every address by choice is a choice.
     #[arg(skip)]
     pub bind_explicit: bool,
+
+    /// Who may run DEBUG: no (nobody), yes, or local (loopback clients
+    /// only). Startup only.
+    #[arg(long, default_value = "no", value_enum, ignore_case = true)]
+    pub enable_debug_command: DebugCommand,
 
     /// Number of worker threads (0 = auto)
     #[arg(long, default_value_t = 0)]
@@ -753,6 +798,7 @@ impl Default for Config {
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
             bind_explicit: false,
+            enable_debug_command: DebugCommand::No,
             configfile_loaded: false,
             configfile_named: false,
             cluster_bus_secret: String::new(),
@@ -900,6 +946,7 @@ impl Config {
             cluster_bus_port_protected_mode: false,
             protected_mode: true,
             bind_explicit: false,
+            enable_debug_command: DebugCommand::No,
             configfile_loaded: false,
             configfile_named: false,
             cluster_bus_secret: String::new(),
@@ -1217,6 +1264,10 @@ impl Config {
         out.push_str(&format!(
             "protected-mode {}\n",
             if self.protected_mode { "yes" } else { "no" }
+        ));
+        out.push_str(&format!(
+            "enable-debug-command {}\n",
+            self.enable_debug_command.name()
         ));
         out.push_str(&format!("threads {}\n", self.threads));
         out.push_str(&format!(
@@ -1923,6 +1974,16 @@ impl Config {
             "tls-key-file" => set!(tls_key_file, one()?.to_string()),
             "tls-ca-cert-file" => set!(tls_ca_cert_file, one()?.to_string()),
             "protected-mode" => set!(protected_mode, yes_no(key, one()?)?),
+            "enable-debug-command" => {
+                let value = one()?;
+                let Some(mode) = DebugCommand::parse(value) else {
+                    return Err(format!(
+                        "invalid value '{value}' for 'enable-debug-command': expected no, yes \
+                         or local"
+                    ));
+                };
+                set!(enable_debug_command, mode)
+            }
             "tls-cluster" => set!(tls_cluster, yes_no(key, one()?)?),
             "tls-replication" => set!(tls_replication, yes_no(key, one()?)?),
             "tls-client-cert-file" => set!(tls_client_cert_file, one()?.to_string()),
@@ -2414,6 +2475,40 @@ mod config_file_tests {
         assert!(load("protected-mode yes\n").unwrap().0.protected_mode);
         assert!(load("protected-mode maybe\n").is_err());
         assert!(load("bind 0.0.0.0\n").unwrap().0.bind_explicit);
+    }
+
+    #[test]
+    fn enable_debug_command_is_no_unless_set_at_startup() {
+        use clap::Parser;
+        assert_eq!(Config::default().enable_debug_command, DebugCommand::No);
+        let flag = |v: &str| {
+            Config::try_parse_from(["kividb", "--enable-debug-command", v])
+                .map(|c| c.enable_debug_command)
+        };
+        assert_eq!(flag("no").unwrap(), DebugCommand::No);
+        assert_eq!(flag("YES").unwrap(), DebugCommand::Yes);
+        assert_eq!(flag("local").unwrap(), DebugCommand::Local);
+        assert!(flag("maybe").is_err());
+        let file = |text: &str| load(text).map(|(c, _)| c.enable_debug_command);
+        assert_eq!(file("enable-debug-command no\n"), Ok(DebugCommand::No));
+        assert_eq!(file("enable-debug-command yes\n"), Ok(DebugCommand::Yes));
+        assert_eq!(
+            file("enable-debug-command Local\n"),
+            Ok(DebugCommand::Local)
+        );
+        let err = file("enable-debug-command maybe\n").unwrap_err();
+        assert!(err.contains("expected no, yes or local"), "{err}");
+        assert!(file("enable-debug-command\n").is_err());
+    }
+
+    #[test]
+    fn local_debug_is_for_loopback_and_unix_socket_clients() {
+        assert!(DebugCommand::Local.allows("127.0.0.1:5000"));
+        assert!(DebugCommand::Local.allows("[::1]:5000"));
+        assert!(DebugCommand::Local.allows("/tmp/kividb.sock"));
+        assert!(!DebugCommand::Local.allows("10.0.0.7:5000"));
+        assert!(DebugCommand::Yes.allows("10.0.0.7:5000"));
+        assert!(!DebugCommand::No.allows("127.0.0.1:5000"));
     }
 
     /// `appendonly`, Redis's spelling of the AOF switch, must work in a config file.

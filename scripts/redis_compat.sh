@@ -78,7 +78,7 @@ server_pid=
 start_server() {
   local dir
   dir=$(mktemp -d)
-  (cd "$dir" && exec "$BIN" --port "$PORT" --loglevel error ${SERVER_ARGS:-}) > "$OUT/server.log" 2>&1 &
+  (cd "$dir" && exec "$BIN" --port "$PORT" --loglevel error --enable-debug-command yes ${SERVER_ARGS:-}) > "$OUT/server.log" 2>&1 &
   server_pid=$!
   for _ in $(seq 1 100); do
     listening && return 0

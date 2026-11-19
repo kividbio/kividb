@@ -460,13 +460,17 @@ fn a_replay_after_the_deadline_has_what_the_master_had() {
 fn the_sweep_logs_each_deletion_once_and_a_replay_follows_it() {
     let mut s = Server::with_aof();
     let mut c = s.conn();
-    let t = now_ms() + 300;
-    let at = t.to_string();
     let keys: Vec<String> = (0..100).map(|i| format!("swept:{i}")).collect();
     let active_before = c.info("expired_keys_active");
     for key in &keys {
-        c.ok(&["SET", key, "5", "PXAT", &at]);
+        c.ok(&["SET", key, "5"]);
         assert_eq!(c.cmd(&["INCR", key]).int(), 6);
+    }
+    // The times to live once every write is in: the writes are logged before
+    // their deletions however slow the machine (a TTL set with the first
+    // write could pass before the last write was sent).
+    for key in &keys {
+        assert_eq!(c.cmd(&["PEXPIRE", key, "300"]).int(), 1);
     }
     wait_for("the sweep", || c.cmd(&["DBSIZE"]).int() == 0);
     assert_eq!(
@@ -1223,7 +1227,7 @@ fn deleted_before_anything_else(aof: &[Vec<String>], key: &str, made_by: usize) 
 /// of it, and a replay has none of the keys.
 #[test]
 fn a_write_that_finds_its_key_past_its_time_reaches_no_replica_as_a_change() {
-    let mut master = Server::with_aof();
+    let mut master = Server::start(&["--aof", "--enable-debug-command", "yes"]);
     let replica = Server::replica_of(&master);
     let (mut m, mut r) = (master.conn(), replica.conn());
     m.ok(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]);
@@ -1275,7 +1279,7 @@ fn a_write_that_finds_its_key_past_its_time_reaches_no_replica_as_a_change() {
 /// The same from a transaction and, with Lua, from a script.
 #[test]
 fn a_write_in_a_transaction_or_a_script_that_finds_its_key_past_its_time() {
-    let master = Server::with_aof();
+    let master = Server::start(&["--aof", "--enable-debug-command", "yes"]);
     let replica = Server::replica_of(&master);
     let (mut m, mut r) = (master.conn(), replica.conn());
     m.ok(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]);

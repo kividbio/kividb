@@ -137,6 +137,18 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   ERR Script attempted to run 'keys', which looks at keys it does not name, while running under the hash tag 'orders' of its KEYS (lua-parallel-scripts)
   ```
 
+  A script that runs beside others (see below) gets the same message from
+  the other commands that read or change keys they do not name: `INFO`
+  with no section or with `keyspace`, `default`, `all` or `everything`,
+  `MEMORY STATS`/`DOCTOR`, the searches of an index (`FT.SEARCH`,
+  `FT.AGGREGATE`, `FT.HYBRID`, `FT.CURSOR`, `FT.PROFILE`, `FT.INFO`,
+  `FT.TAGVALS`, `FT.SPELLCHECK`), the label queries of time series
+  (`TS.MGET`, `TS.MRANGE`, `TS.MREVRANGE`, `TS.QUERYINDEX`,
+  `TS.QUERYLABELS`), `CLUSTER COUNTKEYSINSLOT`/`GETKEYSINSLOT`/`SLOT-STATS`,
+  `FT.DROPINDEX … DD` and `DEBUG POPULATE`. A script that runs alone may
+  call them. (`SORT` by a pattern within the script's own tag is allowed:
+  it reads only keys the script holds.)
+
   This is the rule a Redis Cluster applies to a key in another slot, and
   it applies from a script's first run, inside a transaction or not.
 
@@ -155,7 +167,18 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   than 0, scripts may select any database. To avoid it, send `SELECT N`
   once from a client at start-up, or use `lua-parallel-scripts no`.
 
-  These two are the only things a script may do without the setting that
+- **A script running beside others may not `MIGRATE`.** A `MIGRATE` holds
+  back writes to the keys it moves until they have left, and a script that
+  runs beside others cannot take that hold. It fails instead:
+
+  ```
+  ERR Script attempted to run 'migrate' while running beside other scripts under the hash tag 'orders' of its KEYS (lua-parallel-scripts)
+  ```
+
+  A script that runs alone (its first run, or one whose `KEYS` carry no
+  hash tag) may `MIGRATE`, as before.
+
+  These three are the only things a script may do without the setting that
   it may not do with it.
 
 - **Such scripts run beside each other.** Two scripts that share no tag
@@ -167,6 +190,23 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   VM); its first run, and any script that turns out slow (over five
   milliseconds), runs alone as before.
 
+- **A command that waits for a script on its tag does not hold up its
+  thread.** Its connection waits, and the thread it is served by goes on
+  serving its other connections, whatever keys they use; what the client
+  pipelined behind the command waits with it, and the replies before it
+  are sent first. The command runs as soon as the script lets go of the
+  tag, in line with the other commands and scripts of that tag in the
+  order they came, so a stream of scripts on a tag cannot keep a command
+  out, nor the reverse. A command naming keys of several tags holds the
+  lock of none of them while it waits, and waits in line only on the tags
+  a script is on: scripts on its other tags go on meanwhile. (Should a
+  script have come to one of those once it is its turn, it waits for that
+  tag too, holding nothing.) The replica's applier and the AOF's replay wait
+  in place, as before; the only script they can meet running beside others
+  is a read-only one of a replica's client, which the applier waits for.
+  `EXEC` takes the command gate alone, and waits in place for every
+  running script, as before.
+
 - **Every other script is as before.** A script with no keys, or with a key
   that has no tag, runs alone and may touch what it likes. So do functions
   (`FCALL`), and scripts inside `MULTI`/`EXEC`.
@@ -175,8 +215,37 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   {orders}:waiting` sent while a script on `orders` is running is answered
   when the script has finished; so is a command naming a key of any of the
   tags of a script of several. Keys without a tag are never waited for.
-  `MULTI`/`EXEC`, and the commands that look at the whole keyspace, wait
-  for every running script.
+  `MULTI`/`EXEC`, `DBSIZE`, `RANDOMKEY`, `FLUSHALL`, `FLUSHDB` and `SWAPDB`
+  wait for every running script, and hold back every other command while
+  they run; so do `FT.DROPINDEX … DD` and `DEBUG POPULATE`.
+
+- **A command that reads keys it does not name waits for the scripts
+  running beside others, and only for them.** `KEYS`, `SCAN`, `INFO` (with
+  no section, or `keyspace`, `default`, `all` or `everything`),
+  `MEMORY STATS`/`DOCTOR`, the searches of an index (`FT.SEARCH`,
+  `FT.AGGREGATE`, `FT.HYBRID`, `FT.CURSOR`, `FT.PROFILE`, `FT.INFO`,
+  `FT.TAGVALS`, `FT.SPELLCHECK`), `SORT` by a `BY` or `GET` pattern, the
+  label queries of time series (`TS.MGET`, `TS.MRANGE`, `TS.MREVRANGE`,
+  `TS.QUERYINDEX`, `TS.QUERYLABELS`) and `CLUSTER COUNTKEYSINSLOT`/
+  `GETKEYSINSLOT`/`SLOT-STATS` wait for
+  every script that is running beside others, and keep new ones from
+  starting until they are done; they run beside every other command, and
+  beside each other, as with `lua-parallel-scripts no`. So a reply of
+  `KEYS`, or one page of `SCAN`, finds each script's keys as they were
+  before it or as they are after it, never part-way through, as in Redis,
+  where a script is one step. (Across the pages of a `SCAN`, a key a script
+  made or removed meanwhile may or may not be returned, as in Redis.) A
+  `KEYS` over millions of keys holds those scripts back for as long as it
+  runs, and nothing else: a script waits for it asleep, as it waits for a
+  script on its tag, and the thread it would run on goes on serving its
+  other connections. A script that finds walk after walk under way (a loop
+  of `SCAN`s, each starting before the last has ended) stops waiting
+  asleep after three and holds the walks after it back, so it is not kept
+  out. A script waits in place, holding its thread, when a walk started
+  first or after three walks have started: a long `FT.AGGREGATE` with no
+  timeout can therefore hold that thread for its whole run. A node that
+  coordinates a search across a cluster holds these locks for its own part
+  of the search, and not while it waits for the other masters.
 
 ### Using it
 

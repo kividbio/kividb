@@ -1661,3 +1661,147 @@ fn config_get_appendfilename_names_the_append_only_file() {
         ["appendfilename", "appendonly.aof"]
     );
 }
+
+/// Redis's refusal of a `DEBUG` that `enable-debug-command` does not allow.
+const DEBUG_NOT_ALLOWED: &str = "ERR DEBUG command not allowed. If the enable-debug-command \
+    option is set to \"local\", you can run it from a local connection, otherwise you need to \
+    set this option in the configuration file, and then restart the server.";
+
+fn is_debug_refusal(reply: &RespValue) -> bool {
+    matches!(reply, RespValue::Error(e) if e == DEBUG_NOT_ALLOWED)
+}
+
+/// `DEBUG` is refused by default and with `no`, and allowed with `yes`.
+#[test]
+fn debug_is_refused_unless_enable_debug_command_allows_it() {
+    let conf_dir = tempfile::tempdir().unwrap();
+    let conf = conf_dir.path().join("kividb.conf");
+    std::fs::write(&conf, "enable-debug-command no\n").unwrap();
+    let conf = conf.to_str().unwrap();
+    for (args, mode) in [
+        (["--configfile", ""], "no"),
+        (["--configfile", conf], "no"),
+        (["--enable-debug-command", "yes"], "yes"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port().to_string();
+        let mut all = vec![
+            "--port",
+            &port,
+            "--bind",
+            "127.0.0.1",
+            "--loglevel",
+            "warning",
+        ];
+        all.extend(["--dir", dir.path().to_str().unwrap()]);
+        all.extend(args);
+        let _server = spawn_kividb(&all);
+        let mut c = Conn::connect(port.parse().unwrap());
+        assert_eq!(config_get(&mut c, "enable-debug-command"), mode, "{args:?}");
+        let reply = c.cmds(&["DEBUG", "SLEEP", "0"]);
+        if mode == "yes" {
+            assert!(reply.is_ok(), "{args:?}: {reply:?}");
+        } else {
+            assert!(is_debug_refusal(&reply), "{args:?}: {reply:?}");
+        }
+    }
+}
+
+/// As in Redis, `enable-debug-command` is set at startup only.
+#[test]
+fn config_set_cannot_change_enable_debug_command() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    for value in ["no", "yes", "local"] {
+        let reply = c.cmds(&["CONFIG", "SET", "enable-debug-command", value]);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if e == "ERR CONFIG SET failed (possibly \
+                related to argument 'enable-debug-command') - can't set immutable config"),
+            "{value}: {reply:?}"
+        );
+    }
+    assert_eq!(config_get(&mut c, "enable-debug-command"), "no");
+    assert!(is_debug_refusal(&c.cmds(&["DEBUG", "SLEEP", "0"])));
+}
+
+/// Refused inside `MULTI` and scripts too, and only after the ACL check.
+#[test]
+fn debug_is_refused_in_transactions_and_scripts_after_the_acl_check() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let aborted =
+        |reply: &RespValue| matches!(reply, RespValue::Error(e) if e.starts_with("EXECABORT"));
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    assert!(is_debug_refusal(&c.cmds(&["DEBUG", "SLEEP", "0"])));
+    let exec = c.cmds(&["EXEC"]);
+    assert!(aborted(&exec), "{exec:?}");
+    #[cfg(feature = "lua")]
+    {
+        let reply = c.cmds(&["EVAL", "return redis.call('DEBUG', 'SLEEP', '0')", "0"]);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if e.contains("not allowed from script")),
+            "{reply:?}"
+        );
+    }
+
+    let user = [
+        "ACL", "SETUSER", "nodebug", "on", "nopass", "+@all", "-debug",
+    ];
+    assert!(c.cmds(&user).is_ok());
+    assert!(c.cmds(&["AUTH", "nodebug", "any"]).is_ok());
+    let noperm =
+        |reply: &RespValue| matches!(reply, RespValue::Error(e) if e.starts_with("NOPERM"));
+    let reply = c.cmds(&["DEBUG", "SLEEP", "0"]);
+    assert!(noperm(&reply), "{reply:?}");
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    let reply = c.cmds(&["DEBUG", "SLEEP", "0"]);
+    assert!(noperm(&reply), "{reply:?}");
+    let exec = c.cmds(&["EXEC"]);
+    assert!(aborted(&exec), "{exec:?}");
+}
+
+/// With `local`, loopback clients may run `DEBUG` and others may not.
+#[test]
+fn enable_debug_command_local_lets_only_loopback_clients_debug() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("kividb.conf");
+    std::fs::write(&conf, "enable-debug-command local\n").unwrap();
+    let port = free_port();
+    let _server = spawn_kividb(&[
+        "--configfile",
+        conf.to_str().unwrap(),
+        "--port",
+        &port.to_string(),
+        "--bind",
+        "0.0.0.0",
+        "--loglevel",
+        "warning",
+        "--dir",
+        dir.path().to_str().unwrap(),
+    ]);
+    let mut c = Conn::connect(port);
+    assert_eq!(config_get(&mut c, "enable-debug-command"), "local");
+    assert!(c.cmds(&["DEBUG", "SLEEP", "0"]).is_ok());
+
+    let Some(ip) = non_loopback_ip() else {
+        eprintln!("no address here but loopback: the non-local client is not tried");
+        return;
+    };
+    let stream = TcpStream::connect((ip, port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let reply = Conn(stream).cmds(&["DEBUG", "SLEEP", "0"]);
+    assert!(is_debug_refusal(&reply), "{ip}: {reply:?}");
+}
+
+/// This machine's address on its default route, if it has one.
+fn non_loopback_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    // A UDP connect sends nothing; it only picks the route.
+    socket.connect("192.0.2.1:9").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+}

@@ -1129,7 +1129,7 @@ fn dataset(c: &mut Conn) -> Vec<Vec<u8>> {
 #[test]
 fn keys_and_names_of_any_bytes_survive_every_copy() {
     // The snapshot.
-    let mut server = Server::start(&[]);
+    let mut server = Server::start(&["--enable-debug-command", "yes"]);
     let mut c = server.conn();
     write_every_type(&mut c);
     let want = dataset(&mut c);
@@ -1141,7 +1141,7 @@ fn keys_and_names_of_any_bytes_survive_every_copy() {
     assert_eq!(dataset(&mut c), want, "after a restart from the snapshot");
 
     // DUMP / RESTORE of every key, into another server.
-    let other = Server::start(&[]);
+    let other = Server::start(&["--enable-debug-command", "yes"]);
     let mut o = other.conn();
     for key in c.scan_all(None) {
         let payload = c.cmd(&[b"DUMP", &key]);
@@ -1164,7 +1164,13 @@ fn keys_and_names_of_any_bytes_survive_every_copy() {
 
     // A replica: its full sync, then the stream.
     let port = server.port.to_string();
-    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let replica = Server::start(&[
+        "--replicaof",
+        "127.0.0.1",
+        &port,
+        "--enable-debug-command",
+        "yes",
+    ]);
     let mut r = replica.conn();
     eventually(30, "the replica's full sync", || {
         r.dbsize() == want.len() as i64 - 1
@@ -1179,7 +1185,7 @@ fn keys_and_names_of_any_bytes_survive_every_copy() {
     drop((r, replica));
 
     // The AOF: its tail replayed, and then its rewrite loaded.
-    let mut aof = Server::start(&["--aof"]);
+    let mut aof = Server::start(&["--aof", "--enable-debug-command", "yes"]);
     let mut a = aof.conn();
     // Each write on disk before its reply: the restarts below kill the server.
     assert_eq!(

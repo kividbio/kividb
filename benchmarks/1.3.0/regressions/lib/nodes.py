@@ -157,8 +157,12 @@ class Node:
                 cmd += ["--cluster-enabled", "yes", "--cluster-config-file", "nodes.conf",
                         "--cluster-node-timeout", "5000"]
         else:
+            # A file, not the flag: v1.2.2 has no --enable-debug-command.
+            conf = os.path.join(self.dir, "kividb.conf")
+            with open(conf, "w") as f:
+                f.write("enable-debug-command yes\n")
             cmd = [bin, "--port", str(self.port), "--bind", "127.0.0.1", "--protected-mode", "no",
-                   "--dir", self.dir]
+                   "--dir", self.dir, "--configfile", conf]
             if io != "auto":
                 cmd += ["--io-model", io]
             if threads:

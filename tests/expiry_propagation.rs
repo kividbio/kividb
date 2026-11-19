@@ -1034,7 +1034,7 @@ fn expired_keys_reach_the_replica_as_deletions() {
 /// while the key is there (#666). See tests/exec_clock.rs for the `DEL`.
 #[test]
 fn a_replica_watch_on_an_expired_key_holds_when_its_master_writes_it_without_a_del() {
-    let master = Server::start(&[]);
+    let master = Server::start(&["--enable-debug-command", "yes"]);
     let port = master.port.to_string();
     let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
     let (mut m, mut r) = (master.conn(), replica.conn());
@@ -2052,7 +2052,7 @@ fn a_replica_of_a_real_1_1_2_master_converges_and_stays_so_after_the_upgrade() {
 
 #[test]
 fn debug_set_active_expire_0_stops_the_sweep() {
-    let server = Server::start(&["--aof"]);
+    let server = Server::start(&["--aof", "--enable-debug-command", "yes"]);
     let mut c = server.conn();
     assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).s(), "OK");
     for i in 0..5 {
@@ -2092,7 +2092,7 @@ fn debug_set_active_expire_0_stops_the_sweep() {
 
 #[test]
 fn debug_pause_cron_1_stops_the_sweep() {
-    let server = Server::start(&[]);
+    let server = Server::start(&["--enable-debug-command", "yes"]);
     let mut c = server.conn();
     assert_eq!(c.cmd(&["DEBUG", "PAUSE-CRON", "1"]).s(), "OK");
     assert_eq!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "1"]).s(), "OK");

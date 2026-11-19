@@ -124,9 +124,13 @@ jobs:
         run: |
           set -euo pipefail
           docker pull "${{ needs.resolve.outputs.image_default }}"
+          # A file, not the flag: releases before 1.3 have no --enable-debug-command.
+          echo "enable-debug-command yes" > "$RUNNER_TEMP/kividb.conf"
           docker run -d --name kividb-smoke-resp${{ matrix.resp }} -p 6380:6380 \
+            -v "$RUNNER_TEMP/kividb.conf:/etc/kividb/kividb.conf:ro" \
             "${{ needs.resolve.outputs.image_default }}" \
-            --port 6380 --loglevel error --io-model tokio --protected-mode no
+            --port 6380 --loglevel error --io-model tokio --protected-mode no \
+            --configfile /etc/kividb/kividb.conf
           for i in $(seq 1 30); do
             nc -z 127.0.0.1 6380 2>/dev/null && echo "KiviDB is up." && exit 0
             sleep 0.5

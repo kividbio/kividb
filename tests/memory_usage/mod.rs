@@ -129,6 +129,7 @@ fn spawn_server(dir: &std::path::Path, port: u16) -> Child {
         .current_dir(dir)
         .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
         .args(["--configfile", "kividb.conf", "--threads", "2"])
+        .args(["--enable-debug-command", "yes"])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if let Ok(model) = std::env::var("KIVIDB_TEST_IO_MODEL") {

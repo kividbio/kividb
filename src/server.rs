@@ -193,6 +193,11 @@ where
         slot.held_by_pause();
         return Ok(());
     }
+    // A command that found a script on its hash tags (`blocking::hold_for_tags`).
+    #[cfg(feature = "lua")]
+    if let Some(busy) = wait.take_tags() {
+        return wait_for_tags(busy, slot, writer, combined, subscriptions, waiter, limit).await;
+    }
     if slot.in_resume() && !wait.may_repark() {
         // A resumed handler parked again — it forgot its resume check. Reply
         // as if the wait timed out rather than looping forever.
@@ -396,6 +401,112 @@ where
         slot.set_pending(delivery, block_state);
     }
     Ok(())
+}
+
+/// Wait, for a command that found a script on one of its hash tags
+/// (`blocking::hold_for_tags`), for the turns of those tags, asleep: the
+/// thread serves its other connections meanwhile (#882). What this
+/// connection sent behind the command waits with it, as behind a blocking
+/// command: it is read, and run after it. The replies before it go out
+/// first, as before a blocking command's wait.
+///
+/// `Ok(())`: the command is to be dispatched again, holding the turns
+/// (`BlockingSlot::hold_tag_turns`), or, its client gone while it was a
+/// blocking command's resume, only to leave the line it stood in. `Err`:
+/// its client went, and nothing is to run for it.
+///
+/// The client is not listed as blocked: it waits for no key and no time,
+/// `CLIENT UNBLOCK` has nothing to end, and a script is a moment, as the
+/// command's own run would have been.
+#[cfg(feature = "lua")]
+async fn wait_for_tags<S, R>(
+    busy: crate::tag_locks::TagsBusy,
+    slot: &mut crate::commands::blocking::BlockingSlot,
+    writer: &Arc<Mutex<tokio::io::WriteHalf<S>>>,
+    combined: &mut Vec<u8>,
+    subscriptions: Option<&crate::pubsub::Subscriptions>,
+    waiter: &mut Waiter<'_, R>,
+    limit: HardLimit,
+) -> Result<(), Vec<u8>>
+where
+    S: AsyncWrite + Unpin + Send,
+    R: tokio::io::AsyncRead + Unpin + Send,
+{
+    // A resume sent back keeps what its wait produced, as one a pause sends
+    // back does.
+    slot.held_by_pause();
+    let flushed = if combined.is_empty() {
+        Ok(())
+    } else {
+        let mut flush = std::pin::pin!(write_tcp_batch(writer, combined));
+        match std::future::poll_fn(|cx| std::task::Poll::Ready(flush.as_mut().poll(cx))).await {
+            std::task::Poll::Ready(flushed) => flushed,
+            std::task::Poll::Pending => {
+                read_while_writing(
+                    flush,
+                    waiter.reader,
+                    ReadAhead {
+                        carried: waiter.carried,
+                        carried_from: waiter.carried_from,
+                        held_elsewhere: waiter.held_elsewhere,
+                    },
+                    waiter.kill_rx,
+                    waiter.activity,
+                    limit,
+                )
+                .await
+            }
+        }
+    };
+    let gone = if flushed.is_err() {
+        combined.clear();
+        true
+    } else {
+        if let Some(subs) = subscriptions {
+            subs.flushed();
+        }
+        let turns = crate::tag_locks::command_turns(&busy);
+        tokio::pin!(turns);
+        let mut temp = [0u8; 4096];
+        loop {
+            tokio::select! {
+                turns = &mut turns => {
+                    slot.hold_tag_turns(turns);
+                    break false;
+                }
+                read = waiter.reader.read(&mut temp) => match read {
+                    Ok(n) if n > 0 => {
+                        crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                        crate::stats::record_read();
+                        waiter.carried.extend_from_slice(&temp[..n]);
+                        waiter.activity.touch();
+                        if carried_too_much(
+                            waiter.held_elsewhere,
+                            waiter.carried,
+                            waiter.carried_from,
+                        ) {
+                            break true;
+                        }
+                    }
+                    _ => break true,
+                },
+                _ = &mut *waiter.kill_rx => break true,
+            }
+        }
+    };
+    if !gone {
+        return Ok(());
+    }
+    waiter.interrupted.gone = true;
+    if slot.resuming() {
+        // A blocking command's resume: dispatched once more, only to leave
+        // its line (`BlockingSlot::make_gone`), which takes the locks
+        // without waiting off the thread.
+        slot.make_gone();
+        return Ok(());
+    }
+    slot.release_count();
+    Err(Vec::new())
 }
 
 /// What a wait, or a write that keeps reading, holds of a client's input:
@@ -2930,20 +3041,25 @@ where
                     // So is one that is no command at all, or has the wrong
                     // number of arguments, or arrives while a script has the
                     // server busy.
-                    let refusal =
-                        commands::transaction::queue_refusal(&cmd_name, &cmd).or_else(|| {
-                            crate::cluster::routing::queue_refusal(
-                                &crate::cluster::routing::Caller {
-                                    cluster: &cluster_state,
-                                    registry: &client_registry,
-                                    client_id,
-                                    store: &store,
-                                    db: selected_db,
-                                    ipv6: peer_ipv6,
-                                },
-                                &cmd,
-                            )
-                        });
+                    let refusal = commands::transaction::queue_refusal(
+                        &cmd_name,
+                        &cmd,
+                        config.enable_debug_command,
+                        &peer_addr,
+                    )
+                    .or_else(|| {
+                        crate::cluster::routing::queue_refusal(
+                            &crate::cluster::routing::Caller {
+                                cluster: &cluster_state,
+                                registry: &client_registry,
+                                client_id,
+                                store: &store,
+                                db: selected_db,
+                                ipv6: peer_ipv6,
+                            },
+                            &cmd,
+                        )
+                    });
                     match refusal {
                         Some(refusal) => {
                             tx.aborted = true;

@@ -600,10 +600,9 @@ fn helper() {
             continue; // the graph is gone
         };
         #[cfg(test)]
-        if index.backlog.held.load(Acquire) {
-            HELD.lock().push(job);
+        let Some(job) = put_aside(&index, job) else {
             continue;
-        }
+        };
         // A panic would leave the vector waiting, where searches still
         // measure it, and the helper gone: it is caught, and the helper
         // goes on to the next.
@@ -632,8 +631,12 @@ fn helper() {
 /// and 7.9 ms at nice 19, against 0.8-1.5 and 2.0 ms with the vectors linked
 /// in the writes (1.2's way); the build alone was as fast with each (3,960-
 /// 4,030 documents a second on those 4 vCPUs, 1,710 in the writes).
+///
+/// Not in unit tests: they wait for the helpers to empty a backlog, and on a
+/// runner whose CPUs the other tests keep busy an idle-class helper can go
+/// unscheduled for longer than they wait.
 fn lower_priority() {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(test)))]
     {
         let param = libc::sched_param { sched_priority: 0 };
         // SAFETY: changes this thread's own scheduling policy only; a
@@ -648,14 +651,36 @@ fn lower_priority() {
 #[cfg(test)]
 static HELD: parking_lot::Mutex<Vec<Job>> = parking_lot::const_mutex(Vec::new());
 
+/// `job`, unless its graph is held back: then it is put aside in [`HELD`]
+/// (None). Under `HELD`'s lock, which [`Backlog::hold`] takes to let the
+/// graph go: a job looked at as the graph is let go is either given back
+/// to the helper or among those `hold(false)` gives back, never left aside.
+#[cfg(test)]
+fn put_aside(index: &HnswIndex, job: Job) -> Option<Job> {
+    if !index.backlog.held.load(Acquire) {
+        return Some(job);
+    }
+    crate::test_hooks::at("backlog: putting aside");
+    let mut held = HELD.lock();
+    if index.backlog.held.load(Acquire) {
+        held.push(job);
+        return None;
+    }
+    Some(job)
+}
+
 #[cfg(test)]
 impl Backlog {
     /// Keep the helpers from linking this graph's vectors (`true`), or let
     /// them, giving them back the jobs they put aside (`false`).
     pub fn hold(&self, on: bool) {
-        self.held.store(on, Release);
-        if !on {
+        if on {
+            self.held.store(true, Release);
+        } else {
+            // The flag goes down under `HELD`'s lock, as a helper reads it
+            // before putting a job aside (see `helper`).
             let mut held = HELD.lock();
+            self.held.store(false, Release);
             let mut jobs = POOL.jobs.lock();
             jobs.extend(held.drain(..));
             drop(jobs);
@@ -922,6 +947,34 @@ mod tests {
             let last = vector(8, 50_000 + 1995 + k);
             assert_eq!(g.vector_of(&nodes, ids[&key], &key).unwrap(), &last[..]);
         }
+    }
+
+    /// A helper that finds its job's graph held back, and the graph let go
+    /// before the job is put aside: the job is the helper's to link, not
+    /// left aside where nothing gives it back (its vector then waited for
+    /// good, and a test waiting for the backlog to empty timed out).
+    #[test]
+    fn a_job_put_aside_as_its_graph_is_let_go_is_linked() {
+        let g = big_graph(8);
+        g.backlog.hold(true);
+        let job = || Job {
+            index: Arc::downgrade(&g),
+            key: Arc::from("k1"),
+            metric: DistanceMetric::L2,
+        };
+        // Counted as queued, as `write` counts a job it queues: the one put
+        // aside goes back to the helpers, which count it done.
+        g.backlog.jobs.fetch_add(1, AcqRel);
+        assert!(put_aside(&g, job()).is_none(), "held: put aside");
+        {
+            let g = Arc::clone(&g);
+            crate::test_hooks::set("backlog: putting aside", move || g.backlog.hold(false));
+        }
+        assert!(
+            put_aside(&g, job()).is_some(),
+            "a job of a graph let go was put aside"
+        );
+        assert!(put_aside(&g, job()).is_some());
     }
 
     /// A search that took the backlog while a key's vector waited, and then

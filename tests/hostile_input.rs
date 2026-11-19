@@ -3,7 +3,7 @@
 //! fit, lengths that lie, nesting without end. Each must be answered with an
 //! error, and the server must go on answering.
 
-use kividb::config::{Config, IoModel};
+use kividb::config::{Config, DebugCommand, IoModel};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::thread;
@@ -48,6 +48,7 @@ fn start_server(requirepass: &str) -> u16 {
             io_model: IoModel::Tokio,
             requirepass,
             slowlog_log_slower_than: u64::MAX,
+            enable_debug_command: DebugCommand::Yes,
             ..Default::default()
         });
     });
