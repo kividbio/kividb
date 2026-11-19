@@ -279,8 +279,8 @@ def errors_are_counted(c):
     before = c.info("all")
     try:
         c.execute_command("EVALSHA", "0" * 40, 0)
-    except Exception as e:  # redis.ResponseError (not imported: the self-test runs without redis-py)
-        if type(e).__name__ != "ResponseError":
+    except Exception as e:  # redis.ResponseError or a subclass (NoScriptError); not imported: the self-test runs without redis-py
+        if not any(k.__name__ == "ResponseError" for k in type(e).__mro__):
             raise
     else:
         raise RuntimeError("EVALSHA of an unknown script did not fail")
