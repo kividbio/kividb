@@ -1984,9 +1984,8 @@ fn lock_tags_of_named_keys(ctx: &Ctx, name: &str) -> Option<crate::tag_locks::Ke
 /// a key comes here.
 ///
 /// `Err`: a script holds one of them, or is in line for it, and the
-/// command's connection can wait for it without its thread: it has been
-/// sent back (`blocking::hold_for_tags`, #882), what it waits for kept in
-/// its blocking slot, and is not to run now. What cannot wait so waits on
+/// command's connection can wait for it without its thread: it is to be
+/// sent back (`blocking::hold_for_tags`, #882), and not to run now. What cannot wait so waits on
 /// the locks, as before: the replica's applier and the AOF's replay (which
 /// never meet a script that runs beside others there: a script from the
 /// stream or the log runs alone, so what they can find holding a tag is a
