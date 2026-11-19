@@ -45,6 +45,7 @@ and why.
 | `25-centrifuge-scripts-publish` | #900 | centrifuge v0.40.1's history scripts with the arguments its broker sends (30-day meta TTL), whose 2-3 keys carry no hash tag (each runs alone, on the script-runner thread): `EVALSHA` of `broker_history_list.lua` and `broker_history_add_list.lua` from 16 connections (`scripts`, the `lua,tls` builds); `PUBLISH` to 1,000 channels nobody subscribes to, beside 4 idle subscribers, from 1 connection and from 8, pipeline 16 (`publish`): calls a second counted by the server; a round with any error reply, or a history list of the wrong length, fails the suite. Gates: 10 % and at most 1.05x worse than v1.2.2 in the same session (for now 1.08x for the 8-connection `PUBLISH`, where master is behind v1.2.2 with matching compilers; to go back to 1.05x when that gap is fixed) |
 | `30-script-call-cost` | #901 | server CPU per call and calls a second of short scripts by `EVALSHA` (`redis-benchmark`, 32 connections, one KiviDB worker): Tyk's sliding-log limiter over 5,000 keys of 144 members, the compare-and-delete lock release of #880 on keys another owner holds, and `return 1`, each also with its keys under a hash tag. Needs a `lua,tls` candidate (`--candidate-full`, #921). Gates: CPU per call within 10 % of the recorded value and at most 0.93x v1.2.2's for Tyk, 1.03x for the others; calls a second 10 % |
 | `31-zset-memory` | #825, #297 (step 4) | `used_memory` per sorted-set member, 1,000,000 members in sets of 10, 100, 128, 129 and 1,000: 14-byte members (`membr:<i>`), scores whole (`int`) or with a fraction (`float`); `OBJECT ENCODING` of each size recorded exactly (`listpack` up to 128, `skiplist` past it); the large sets (129 and 1,000) as guard rows |
+| `33-ft-aggregate-groupby` | #761 | #761's 2,000,000 hashes (`name TEXT email TAG communityNumber NUMERIC age NUMERIC`, pipelines of 2,000): `FT.AGGREGATE userIdx * GROUPBY 1 @communityNumber REDUCE COUNT 0 AS n LIMIT 0 10`, the same with `REDUCE AVG 1 @age` and `SORTBY 2 @n DESC`, and the first over `@age:[20 40]`: median ms of 5 after a warm-up, and the reply's group total (exactly 1000); `used_memory` and RSS once loaded, the peak RSS (`VmHWM`) after the queries, and FT.INFO's memory parts as info rows. v1.2.2 and the candidate only: the VM image's Redis has no Query Engine |
 
 ## Running it
 
@@ -1137,6 +1138,42 @@ value is the gate). The gates against v1.2.2 hold in all three runs; the
 nearest is the `return 1` row under a hash tag: 1.012x in the first run, 0.980x
 and 0.966x in the others, so a 1.03x gate is 1.8 % above the worst of three
 while the three differ by 4.6 %.
+
+## Recorded run, suite 33
+
+Recorded 2026-11-19 on an Azure Standard_D4s_v5 (Xeon Platinum 8370C),
+`--only 33 --record`; the candidate is commit `6f4dc275` (#761: `GROUPBY` as
+the documents are read, and index terms, tags and keys held in place),
+`cargo build --release` by rustc 1.100.0, both engines on `--threads 4`. Runs:
+`pr-761-6f4dc275-d4s_v5` (recorded) and `pr-761-6f4dc275-d4s_v5-rerun` (the
+noise check: every gate passed, host speed 1.00x). A run takes 146 s.
+
+| metric | v1.2.2 | candidate (recorded / rerun) | Redis 8.10.3 | gate |
+|---|---:|---:|---:|---|
+| `count_ms` | 3,179 | 913 / 913 | 1,907 | rel 10%; keep 60% of gain |
+| `avg_ms` | 3,581 | 1,033 / 1,027 | 2,428 | rel 10%; keep 60% of gain |
+| `filtered_ms` | 1,185 | 358 / 355 | 759 | rel 10%; keep 60% of gain |
+| `used_memory_mib` | 2,607 | 1,224 / 1,224 | 1,454 | rel 5%; keep 60% of gain |
+| `rss_loaded_mib` | 3,238 | 1,488 / 1,478 | 1,509 | rel 5%; keep 60% of gain |
+| `rss_peak_mib` | 4,785 | 1,543 / 1,531 | 2,158 | rel 10%; keep 60% of gain |
+| `*_groups` | 10 | 1,000 | 1,000 | exact |
+
+The Redis column is not part of the suite: it is the median of 3 runs of the
+same workload on the same VM against the `redis:8` image (8.10.3, `--save ""
+--appendonly no`, in Docker on CPUs 0-2, the client on CPU 3), and master
+`f8cc49ee` before this change took 3,453 / 3,885 / 1,308 ms, 1,755 MiB of
+`used_memory`, 2,171 MiB of RSS once loaded and a peak of 3,722 MiB in the same
+runs. v1.2.2's group total is the page's 10 rows (#795 fixed it). The peak is
+the server's whole RSS high-water mark, load included: v1.2.2 and master made
+a row (a map of every field, as strings) of each of the 2,000,000 documents
+before grouping them, some 1.5 GB above the loaded RSS.
+
+FT.INFO's memory parts, MiB (v1.2.2 / candidate): TEXT terms 125.8 / 157.8,
+TEXT postings 335.9 / 0.25, TEXT forward entries 54.9 / 54.9, key ids 188.9 /
+122.4, TAG 282.5 / 198.6, NUMERIC 94.0 / 94.0. Most of the 2,000,001 terms
+and 2,000,000 tags are in one document each: the documents of such a term or
+tag are held in place now, not in lists (of capacity 4 for a term's fields)
+of their own.
 
 ## Not covered
 
