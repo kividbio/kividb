@@ -107,6 +107,7 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--slowlog-max-len <n>` | `128` | Slowlog entries kept |
 | `--cluster-enabled <yes\|no>` | `no` | Cluster mode: a cluster bus on `<port> + 10000`, topology in `nodes.conf`, gossip, failure detection and failover |
 | `--cluster-node-timeout <ms>` | `15000` | Time without a reply before a peer is suspected to have failed |
+| `--cluster-announce-client-ipv4 <addr>`, `--cluster-announce-client-ipv6 <addr>` | none | The address clients connected over IPv4 / IPv6 are told to reach this node at, in redirects and `CLUSTER SLOTS`, `SHARDS`, `NODES` and `REPLICAS`, where it is not the one nodes use between themselves (Valkey 8). Unset, a client is told the node's address. Changeable with `CONFIG SET` (empty unsets); the other nodes learn it from this node's next heartbeat |
 | `--tls-port <port>` | `0` (off) | TLS listener (TLS builds only); with `--port 0`, the only one |
 | `--tls-cert-file`, `--tls-key-file` | none | Server certificate and key (PEM) |
 | `--tls-ca-cert-file` | none | CA that client certificates are checked against |

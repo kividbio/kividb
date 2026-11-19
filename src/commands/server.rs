@@ -78,7 +78,7 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
     // and a `CONFIG GET` that met one stopped the node for good, every
     // command that reads the topology queued behind it.
     let (announce_ip, announce_port, announce_bus_port) = ctx.cluster.announce();
-    let (announce_hostname, announce_client_port) = {
+    let (announce_hostname, announce_client_port, client_ips) = {
         let nodes = ctx.cluster.nodes.read();
         let me = nodes.get(&ctx.cluster.myself());
         (
@@ -86,6 +86,11 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
                 .unwrap_or_else(|| ctx.config.cluster_announce_hostname.clone()),
             me.map(|me| me.announced_client_port)
                 .unwrap_or(ctx.config.cluster_announce_client_port),
+            me.map(|me| me.client_ips.clone())
+                .unwrap_or_else(|| crate::cluster::ClientIps {
+                    v4: ctx.config.cluster_announce_client_ipv4.clone(),
+                    v6: ctx.config.cluster_announce_client_ipv6.clone(),
+                }),
         )
     };
     vec![
@@ -164,6 +169,8 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             "cluster-announce-client-port",
             announce_client_port.to_string(),
         ),
+        ("cluster-announce-client-ipv4", client_ips.v4),
+        ("cluster-announce-client-ipv6", client_ips.v6),
         ("cluster-announce-bus-port", announce_bus_port.to_string()),
         ("cluster-port", ctx.config.cluster_port.to_string()),
         (
@@ -715,6 +722,20 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     "ERR argument must be between 0 and 65535 inclusive",
                 )),
             },
+            // What clients connected over IPv4 / IPv6 are told (#847); peers
+            // learn it from the next heartbeat. Empty unsets it.
+            "cluster-announce-client-ipv4" | "cluster-announce-client-ipv6" => {
+                let v6 = param == "cluster-announce-client-ipv6";
+                match crate::config::client_ip_error(value, v6) {
+                    Some(err) => Some(resp_error(&format!(
+                        "ERR CONFIG SET failed (possibly related to argument '{param}') - {err}"
+                    ))),
+                    None => {
+                        ctx.cluster.set_my_client_ip(v6, value);
+                        Some(resp_simple("OK"))
+                    }
+                }
+            }
             "cluster-preferred-endpoint-type" => match crate::cluster::Endpoint::parse(value) {
                 Some(endpoint) => {
                     ctx.cluster.set_preferred_endpoint(endpoint);

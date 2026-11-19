@@ -87,6 +87,8 @@ pub(crate) struct ClientExecEnvParts {
     pub monitor_registry: crate::monitor::SharedMonitorRegistry,
     pub tracking_table: crate::tracking::TrackingTable,
     pub peer_addr: String,
+    /// Whether the client is connected over IPv6 (#847), worked out once.
+    pub peer_ipv6: bool,
     pub client_id: u64,
     /// The connection's `CLIENT NO-TOUCH` flag when this env was made: a
     /// script's own commands take it as their client's flag (`Ctx::resp`'s `RESP_NO_TOUCH`).
@@ -161,6 +163,7 @@ impl ClientExecEnv {
             apply_replication: false,
             skip_write_side_effects: false,
             peer_addr: &self.peer_addr,
+            peer_ipv6: self.peer_ipv6,
             monitor_registry: &self.monitor_registry,
             authenticated_user: &self.authenticated_user,
             tracking_table: &self.tracking_table,
@@ -226,6 +229,7 @@ impl ClientExecEnv {
             monitor_registry: monitor_registry.clone(),
             tracking_table: tracking_table.clone(),
             peer_addr: peer_addr.to_string(),
+            peer_ipv6: crate::cluster::is_ipv6_peer(peer_addr),
             client_id,
             no_touch,
             authenticated_user: authenticated_user.to_string(),
