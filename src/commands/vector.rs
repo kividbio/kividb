@@ -2959,7 +2959,7 @@ mod nearest_shown_tests {
                 pass += 1;
                 let mut hits = index(100)(keep);
                 if pass == 2 {
-                    hits.swap(0, 7);
+                    hits.swap(7, 20);
                 }
                 (hits, false)
             },
