@@ -946,7 +946,8 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // scan cost as much as the scan.
     let (rows, cut, groups) = match stream {
         // The GROUPBY ran with the scan: its groups go on to the steps
-        // after it, which a scan cut short leaves out but for `LIMIT`.
+        // after it, which stop at the deadline as they do after grouped rows.
+        // A scan cut short is reported through `timed_out` below.
         Some(stream) => {
             let end = stream.end();
             let grouped = stream.finish();
@@ -956,7 +957,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 cmd,
                 end,
                 deadline,
-                timed_out_scan,
+                false,
                 Some(n),
             )
         }
