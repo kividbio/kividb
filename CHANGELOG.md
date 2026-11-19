@@ -351,6 +351,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A write costs a master that keeps its replication backlog, or has a
+  replica, a third less (#894).** Each write used to reach the replication
+  thread as a message of its own, in an allocation of its own, after its
+  arguments had been copied once more. Writes are now appended to a run of
+  writes that the thread takes whole, encoded (once, from the client's own
+  arguments for the common commands) outside the lock that keeps them in
+  order. Instructions per pipelined `SET` of 100 bytes (callgrind, fat LTO,
+  io_uring / tokio): with the backlog kept 7,020 → 4,597 / 7,065 → 4,566;
+  with a replica attached 8,222 → 4,914 / 8,482 → 4,940; with no backlog
+  unchanged (2,129 in `execute_command`, 2,130 before); with the AOF alone within 1.2 %, in
+  glibc's `malloc`, not in the write path. On an Azure D8s_v5 (Xeon 8370C), SETs a
+  second, server started from its own snapshot (backlog kept), `--threads
+  2` on two cores, `redis-benchmark -c 100 --threads 4`: 263k → 275k at
+  pipeline 1, 1.07M → 1.34M at 16, 1.23M → 1.70M at 100 (Redis 8.10.2:
+  148k, 790k, 1.04M); with a replica attached 201k → 253k, 695k → 851k,
+  765k → 911k (Redis 144k, 784k, 1.02M); a server with no backlog the same
+  as before (2.71M at 100). With more workers the gain holds: `--threads 4`
+  1.70M → 2.42M and `--threads 6` 2.05M → 2.60M at pipeline 100. The
+  rate-limiter case of #894 (server on two CPUs, restarted from its
+  snapshot, `worker-cpu-affinity auto`): 31.6-31.9k checks a second at a
+  p99 of 0.07-0.12 ms at every background rate from 0 to 300,000 commands a
+  second (Redis: 31.7-32.0k at 0.06-0.11 ms up to 150,000, 28.4k at 0.74 ms
+  at 200,000, 24.3k at 0.91 ms at 300,000).
+
 - **`FT.AGGREGATE ... GROUPBY` over many documents is 3.8x faster, and a
   search index of many small documents takes 30 % less memory (part of
   #761).** On #761's 2,000,000 hashes (`name TEXT email TAG
