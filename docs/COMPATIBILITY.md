@@ -317,15 +317,19 @@ other files:
   Redis counts a monitor in; no limit by default, as in Redis); past that
   limit it is disconnected, with `Client id=… closed: it is in MONITOR and
   … bytes behind` in the log and `client_output_buffer_limit_disconnections`
-  counted. Every monitor sees the same order, a connection's commands
-  always in the order it sent them, and time stamps that never go back. A
-  command is shown when it is called, before it runs, so two connections'
-  commands on one key that arrive at nearly the same moment on two worker
-  threads can have run in the other order than they are shown; Redis, with
-  one thread, has no such moment. Differences in what is shown: `AUTH` and
-  `HELLO … AUTH` are not shown at all (Redis shows them with the password
-  as `(redacted)`), and `SELECT` is shown with the database it was called
-  in (Redis: the one it selected). Up to 1.2.2 a monitor that fell 4,096
+  counted; what it has not read shows in its `omem` in `CLIENT LIST`.
+  Every monitor sees the same order, a connection's commands always in the
+  order it sent them, and time stamps in the order of the lines (they are
+  read from the system clock, so they go back only when the clock is set
+  back, as in Redis). A command is shown when it is called, before it runs;
+  Redis shows it once it has run. So a script's `EVAL` is shown before the
+  commands it calls (Redis: after them), `SELECT` is shown with the
+  database it was called in (Redis: the one it selected), and two
+  connections' commands on one key that arrive at nearly the same moment
+  on two worker threads can have run in the other order than they are
+  shown; Redis, with one thread, has no such moment. `AUTH` and `HELLO …
+  AUTH` are not shown at all (Redis shows them with the password as
+  `(redacted)`). Up to 1.2.2 a monitor that fell 4,096
   lines behind lost lines without a word: with four connections sending at
   full speed, half or more of what they sent.
 - A replica doesn't enforce `maxmemory` on what its master sends. A replica

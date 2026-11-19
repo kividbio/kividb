@@ -8,26 +8,32 @@
 //!   in), and a monitor that falls that far behind is disconnected, with a
 //!   line in the log, as Redis disconnects it. With the default `normal 0 0
 //!   0` it is never disconnected, and what it has not read waits for it, as
-//!   in Redis. (A monitor used to be fed through a broadcast ring of 4096
-//!   lines; one that fell further behind lost lines without a word.)
+//!   in Redis. What is queued shows in its `omem` in `CLIENT LIST`. (A
+//!   monitor used to be fed through a broadcast ring of 4096 lines; one that
+//!   fell further behind lost lines without a word.)
 //! - **One order for everything.** A line is stamped and queued to every
 //!   monitor under one lock, so all monitors see the same order, its time
-//!   stamps never go back, and a connection's commands are in the order it
-//!   sent them. A command is shown when it is called, before it runs (see
-//!   `run_command`): two connections' commands on one key, called at
-//!   nearly the same moment on two threads, can run in the other order
-//!   than they are shown. Redis, with one thread, has no such moment.
+//!   stamps are in the order of the lines (read from the system clock, they
+//!   go back only when the clock is set back, as in Redis), and a
+//!   connection's commands are in the order it sent them. A command is shown
+//!   when it is called, before it runs (see `run_command`); Redis shows it
+//!   once it has run. Two connections' commands on one key, called at
+//!   nearly the same moment on two threads, can run in the other order than
+//!   they are shown. Redis, with one thread, has no such moment.
 //!
 //! Cost: with no monitor, one relaxed load per command (`MONITOR_COUNT`),
 //! as before. With monitors, a command's line is formatted once, then the
-//! lock is taken for the stamp and one queue push a monitor.
+//! lock is taken for the stamp and a push onto each monitor's queue, and
+//! nothing else: the monitors' writers are woken after it is let go, and
+//! only those that had nothing queued.
 
-use crate::client_registry::ClientRegistry;
+use crate::client_registry::{Activity, ClientRegistry};
 use crate::output_limits::{Class, OutputLimits};
 use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 /// Number of currently connected MONITOR clients.
 pub static MONITOR_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -36,6 +42,8 @@ pub static MONITOR_COUNT: AtomicUsize = AtomicUsize::new(0);
 const BATCH_BYTES: usize = 256 << 10;
 /// What the forwarder keeps of its buffer once the queue is empty.
 const KEEP_BUFFER: usize = 16 << 10;
+/// The lines' room the forwarder keeps once the queue is empty.
+const KEEP_LINES: usize = 1024;
 /// The room in front of a line for its time stamp: `+`, ten digits of
 /// seconds, `.` and six of microseconds. (Ten digits from 2001 to 2286; a
 /// clock outside that is given a line made again, `restamp`.)
@@ -46,37 +54,65 @@ struct Sink {
     client_id: u64,
     registry: ClientRegistry,
     limits: Arc<OutputLimits>,
-    queue: mpsc::UnboundedSender<Arc<[u8]>>,
+    /// The connection's, where `CLIENT LIST` reads `omem` from.
+    activity: Option<Arc<Activity>>,
+    /// The lines not yet taken by the forwarder: pushed under the
+    /// registry's lock, so in one order for every monitor; taken by the
+    /// forwarder all at once, under this lock alone.
+    queue: Mutex<VecDeque<Arc<[u8]>>>,
+    /// Set when a line went onto an empty queue: its forwarder is to be
+    /// woken, once the registry's lock is let go.
+    wake: AtomicBool,
+    /// Wakes the forwarder.
+    ready: Notify,
     /// Bytes queued and not yet taken by the forwarder.
     pending: AtomicUsize,
     /// When `pending` went over the soft limit; 0 while it is under.
     over_soft_since: AtomicU64,
-    /// Set once it has been disconnected for falling behind.
+    /// Set once it is over its limit: nothing more is queued.
     closed: AtomicBool,
+    /// Set once it has been disconnected for it, exactly once.
+    disconnected: AtomicBool,
 }
 
 impl Sink {
-    /// Queue `line`. `false`: it took the monitor over its limit, and the
-    /// monitor is to be disconnected.
-    fn offer(&self, line: &Arc<[u8]>) -> bool {
+    /// Queue `line`; under the registry's lock. A line that takes the
+    /// monitor over its limit closes it instead (see `after_offer`).
+    fn offer(&self, line: &Arc<[u8]>) {
         if self.closed.load(Ordering::Relaxed) {
-            return true;
+            return;
         }
         let pending = self.pending.fetch_add(line.len(), Ordering::Relaxed) + line.len();
+        self.note_pending(pending);
         let limit = self.limits.get(Class::Normal);
         let over_soft = limit.soft != 0 && pending as u64 >= limit.soft;
         if (limit.hard != 0 && pending as u64 >= limit.hard)
             || (over_soft && self.over_soft_limit_too_long(limit.soft_seconds))
         {
             self.closed.store(true, Ordering::Relaxed);
-            return false;
+            return;
         }
         if !over_soft && self.over_soft_since.load(Ordering::Relaxed) != 0 {
             self.over_soft_since.store(0, Ordering::Relaxed);
         }
-        // Fails only once the forwarder is gone, with the connection.
-        let _ = self.queue.send(Arc::clone(line));
-        true
+        let mut queue = self.queue.lock();
+        if queue.is_empty() {
+            self.wake.store(true, Ordering::Relaxed);
+        }
+        queue.push_back(Arc::clone(line));
+    }
+
+    /// After the registry's lock: wake the forwarder if a line went onto
+    /// its empty queue, and disconnect the monitor if a line took it over
+    /// its limit.
+    #[inline]
+    fn after_offer(&self) {
+        if self.wake.load(Ordering::Relaxed) && self.wake.swap(false, Ordering::Relaxed) {
+            self.ready.notify_one();
+        }
+        if self.closed.load(Ordering::Relaxed) && !self.disconnected.swap(true, Ordering::Relaxed) {
+            self.disconnect();
+        }
     }
 
     fn over_soft_limit_too_long(&self, seconds: u64) -> bool {
@@ -87,6 +123,14 @@ impl Sink {
         {
             Ok(_) => false,
             Err(since) => now.saturating_sub(since) > seconds,
+        }
+    }
+
+    /// What `CLIENT LIST` shows as the connection's `omem`.
+    #[inline]
+    fn note_pending(&self, pending: usize) {
+        if let Some(activity) = &self.activity {
+            activity.set_monitor_output(pending);
         }
     }
 
@@ -104,10 +148,12 @@ impl Sink {
     }
 }
 
-/// The monitors of a server.
+/// The monitors of a server: the list is replaced, not changed, when one
+/// comes or goes, so that a line's sender holds it past the lock to wake
+/// the monitors' writers.
 #[derive(Default)]
 pub struct MonitorRegistry {
-    sinks: Mutex<Vec<Arc<Sink>>>,
+    sinks: Mutex<Arc<Vec<Arc<Sink>>>>,
 }
 
 impl MonitorRegistry {
@@ -117,37 +163,41 @@ impl MonitorRegistry {
 
     fn add(&self, sink: Arc<Sink>) {
         let mut sinks = self.sinks.lock();
-        sinks.push(sink);
+        let mut next = Vec::clone(&sinks);
+        next.push(sink);
+        *sinks = Arc::new(next);
         MONITOR_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
     fn remove(&self, sink: &Arc<Sink>) {
         let mut sinks = self.sinks.lock();
         if let Some(at) = sinks.iter().position(|s| Arc::ptr_eq(s, sink)) {
-            sinks.swap_remove(at);
+            let mut next = Vec::clone(&sinks);
+            next.swap_remove(at);
+            *sinks = Arc::new(next);
             MONITOR_COUNT.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     /// Stamp `line` (which has [`STAMP`] bytes of room in front) and queue
     /// it to every monitor, under the lock: see the module's documentation.
+    /// The writers are woken, and a monitor over its limit disconnected,
+    /// once the lock is let go.
     fn broadcast(&self, line: Vec<u8>) {
         let mut line: Arc<[u8]> = Arc::from(line);
-        let mut behind: Vec<Arc<Sink>> = Vec::new();
-        {
+        let sinks = {
             let sinks = self.sinks.lock();
             if sinks.is_empty() {
                 return;
             }
             stamp(&mut line);
             for sink in sinks.iter() {
-                if !sink.offer(&line) {
-                    behind.push(Arc::clone(sink));
-                }
+                sink.offer(&line);
             }
-        }
-        for sink in behind {
-            sink.disconnect();
+            Arc::clone(&sinks)
+        };
+        for sink in sinks.iter() {
+            sink.after_offer();
         }
     }
 }
@@ -272,8 +322,8 @@ pub fn format_monitor_line<A: AsRef<[u8]>>(
 
 /// A connection in `MONITOR` mode.
 ///
-/// The connection stays what it was — it can go on sending commands, as it
-/// can in Redis — and what the monitors are shown is written to it by a
+/// The connection stays what it was â€” it can go on sending commands, as it
+/// can in Redis â€” and what the monitors are shown is written to it by a
 /// task of the connection's loop, from the [`Outbox`]. Dropping this ends
 /// the mode: on `RESET`, or with the connection.
 pub struct Monitoring {
@@ -291,15 +341,19 @@ pub fn connect(
     client_id: u64,
     limits: Arc<OutputLimits>,
 ) -> (Monitoring, Outbox) {
-    let (queue, rx) = mpsc::unbounded_channel();
+    let activity = client_registry.activity(client_id);
     let sink = Arc::new(Sink {
         client_id,
         registry: client_registry,
         limits,
-        queue,
+        activity,
+        queue: Mutex::new(VecDeque::new()),
+        wake: AtomicBool::new(false),
+        ready: Notify::new(),
         pending: AtomicUsize::new(0),
         over_soft_since: AtomicU64::new(0),
         closed: AtomicBool::new(false),
+        disconnected: AtomicBool::new(false),
     });
     registry.add(Arc::clone(&sink));
     (
@@ -309,8 +363,8 @@ pub fn connect(
             forwarder: None,
         },
         Outbox {
-            rx,
             me: sink,
+            taken: VecDeque::new(),
             buf: Vec::new(),
         },
     )
@@ -329,42 +383,67 @@ impl Drop for Monitoring {
             task.abort();
         }
         self.registry.remove(&self.sink);
+        self.sink.note_pending(0);
     }
 }
 
 /// The lines queued for a monitor, for its forwarder task.
 pub struct Outbox {
-    rx: mpsc::UnboundedReceiver<Arc<[u8]>>,
     me: Arc<Sink>,
+    /// Lines taken from the queue and not yet written.
+    taken: VecDeque<Arc<[u8]>>,
     buf: Vec<u8>,
 }
 
 impl Outbox {
+    /// What is in the queue, after what was taken before.
+    fn take(&mut self) {
+        let mut queue = self.me.queue.lock();
+        if self.taken.is_empty() {
+            std::mem::swap(&mut *queue, &mut self.taken);
+        } else {
+            self.taken.extend(queue.drain(..));
+        }
+    }
+
     /// Waits for lines and returns the next of them, together, to be
     /// written. Give the buffer back with [`Outbox::written`].
     pub async fn next(&mut self) -> Option<Vec<u8>> {
-        let first = match self.rx.try_recv() {
-            Ok(line) => line,
-            Err(_) => {
-                if self.buf.capacity() > KEEP_BUFFER {
-                    self.buf = Vec::new();
-                }
-                self.rx.recv().await?
+        if self.taken.is_empty() {
+            self.take();
+        }
+        while self.taken.is_empty() {
+            if self.buf.capacity() > KEEP_BUFFER {
+                self.buf = Vec::new();
             }
-        };
+            if self.taken.capacity() > KEEP_LINES {
+                self.taken = VecDeque::new();
+                let mut queue = self.me.queue.lock();
+                if queue.is_empty() && queue.capacity() > KEEP_LINES {
+                    *queue = VecDeque::new();
+                }
+            }
+            // A line queued after the queue was seen empty has set `wake`,
+            // and is notified once its sender lets the registry go: kept
+            // as a permit if this has not begun to wait yet.
+            self.me.ready.notified().await;
+            self.take();
+        }
         // Let this thread's other ready connections run first: what they
         // are shown meanwhile goes out in the same write.
         tokio::task::yield_now().await;
+        self.take();
         let mut out = std::mem::take(&mut self.buf);
         out.clear();
-        out.extend_from_slice(&first);
-        while out.len() < BATCH_BYTES {
-            match self.rx.try_recv() {
-                Ok(line) => out.extend_from_slice(&line),
-                Err(_) => break,
+        while let Some(line) = self.taken.front() {
+            if !out.is_empty() && out.len() + line.len() > BATCH_BYTES {
+                break;
             }
+            out.extend_from_slice(line);
+            self.taken.pop_front();
         }
         let pending = self.me.pending.fetch_sub(out.len(), Ordering::Relaxed) - out.len();
+        self.me.note_pending(pending);
         let soft = self.me.limits.get(Class::Normal).soft;
         if soft == 0 || (pending as u64) < soft {
             self.me.over_soft_since.store(0, Ordering::Relaxed);

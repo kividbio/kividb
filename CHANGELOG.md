@@ -925,8 +925,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   disconnected and the server logs `Client id=… closed: it is in MONITOR
   and … bytes behind, over client-output-buffer-limit normal`. Every
   monitor sees one order, each connection's commands in the order it sent
-  them, and time stamps no longer go back between lines from different
-  threads. Arguments are quoted as Redis quotes them: `\n`, `\r`, `\t`,
+  them, and time stamps in the order of the lines: they no longer go back
+  between lines from different threads (only when the system clock is set
+  back, as in Redis). What a monitor has not read yet shows in its `omem`
+  in `CLIENT LIST`. Arguments are quoted as Redis quotes them: `\n`, `\r`, `\t`,
   `\a` and `\b` by name, not as `\x0a` and the like.
 
 - **`CLIENT UNBLOCK` reaches a client that was woken and is parking

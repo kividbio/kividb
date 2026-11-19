@@ -322,6 +322,266 @@ fn a_monitor_that_falls_behind_waits_or_is_closed_at_its_limit_uring() {
     a_monitor_that_falls_behind_waits_or_is_closed_at_its_limit("uring");
 }
 
+/// A monitor that reads nothing stays over `client-output-buffer-limit
+/// normal`'s soft limit (no hard limit) for longer than its seconds: it is
+/// disconnected, once, and counted.
+fn a_monitor_over_its_soft_limit_too_long_is_closed(io_model: &str) {
+    let port = free_port();
+    let mut server = spawn_server_with(port, &["--io-model", io_model, "--threads", "4"]);
+    assert!(wait_for_server(port), "server did not start");
+    let mut admin = connect_with_retry(port);
+    admin
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    send_cmd(
+        &mut admin,
+        &[
+            "CONFIG",
+            "SET",
+            "client-output-buffer-limit",
+            "normal 0 256kb 1",
+        ],
+    );
+    assert_eq!(read_line(&mut admin), "+OK");
+    let mut monitor = connect_with_retry(port);
+    monitor
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    send_cmd(&mut monitor, &["MONITOR"]);
+    assert_eq!(read_line(&mut monitor), "+OK");
+    // Over the soft limit from early on, for some seconds: past its one.
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        send_numbered(port, 4, 10_000);
+    }
+    let (_, closed) = read_lines(&mut monitor, usize::MAX, Duration::from_secs(5));
+    assert!(closed, "a monitor over its soft limit was not disconnected");
+    assert_eq!(
+        info_field(&mut admin, "client_output_buffer_limit_disconnections"),
+        "1"
+    );
+    server.kill().unwrap();
+    let _ = server.wait();
+}
+
+#[test]
+fn a_monitor_over_its_soft_limit_too_long_is_closed_tokio() {
+    a_monitor_over_its_soft_limit_too_long_is_closed("tokio");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_monitor_over_its_soft_limit_too_long_is_closed_uring() {
+    a_monitor_over_its_soft_limit_too_long_is_closed("uring");
+}
+
+/// `CLIENT LIST` of one client: its line.
+fn client_line(conn: &mut TcpStream, id: &str) -> String {
+    send_cmd(conn, &["CLIENT", "LIST", "ID", id]);
+    let header = read_line(conn);
+    let len: usize = header[1..].parse().unwrap();
+    let mut body = vec![0u8; len + 2];
+    conn.read_exact(&mut body).unwrap();
+    String::from_utf8(body).unwrap().trim().to_string()
+}
+
+fn client_field(line: &str, field: &str) -> String {
+    line.split(' ')
+        .find_map(|kv| kv.strip_prefix(&format!("{field}=")))
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn client_id(conn: &mut TcpStream) -> String {
+    send_cmd(conn, &["CLIENT", "ID"]);
+    read_line(conn)[1..].to_string()
+}
+
+/// What a monitor has not read yet is in its `omem` and `tot-mem`, as Redis
+/// shows it; and `RESET` and `CLIENT KILL` end the mode: the connection that
+/// reset is shown nothing more, and is no monitor in `CLIENT LIST`.
+fn a_monitor_shows_its_backlog_and_ends_with_reset_or_kill(io_model: &str) {
+    let port = free_port();
+    let mut server = spawn_server_with(port, &["--io-model", io_model, "--threads", "4"]);
+    assert!(wait_for_server(port), "server did not start");
+    let mut admin = connect_with_retry(port);
+    admin
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let mut monitor = connect_with_retry(port);
+    monitor
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let id = client_id(&mut monitor);
+    send_cmd(&mut monitor, &["MONITOR"]);
+    assert_eq!(read_line(&mut monitor), "+OK");
+    // Read nothing while much more than the socket holds is shown.
+    send_numbered(port, 4, 100_000);
+    let line = client_line(&mut admin, &id);
+    assert!(client_field(&line, "flags").contains('O'), "{line}");
+    let omem: u64 = client_field(&line, "omem").parse().unwrap();
+    let tot: u64 = client_field(&line, "tot-mem").parse().unwrap();
+    assert!(omem > 1_000_000, "omem of a monitor behind: {line}");
+    assert!(tot >= omem, "{line}");
+    // Read it all: the backlog is gone.
+    let (_, closed) = read_lines(&mut monitor, 400_000, Duration::from_secs(10));
+    assert!(!closed);
+    let line = client_line(&mut admin, &id);
+    let omem: u64 = client_field(&line, "omem").parse().unwrap();
+    assert!(omem < 1000, "omem of a monitor that has read: {line}");
+
+    // RESET: nothing more is shown to it.
+    send_cmd(&mut monitor, &["RESET"]);
+    // Lines shown before the RESET may still come before its reply.
+    loop {
+        let line = read_line(&mut monitor);
+        if line == "+RESET" {
+            break;
+        }
+        assert!(line.starts_with('+'), "{line}");
+    }
+    let line = client_line(&mut admin, &id);
+    assert!(!client_field(&line, "flags").contains('O'), "{line}");
+    send_cmd(&mut admin, &["SET", "after-reset", "1"]);
+    assert_eq!(read_line(&mut admin), "+OK");
+    send_cmd(&mut monitor, &["PING"]);
+    assert_eq!(read_line(&mut monitor), "+PONG");
+
+    // CLIENT KILL of a monitor: it is gone.
+    send_cmd(&mut monitor, &["MONITOR"]);
+    assert_eq!(read_line(&mut monitor), "+OK");
+    send_cmd(&mut admin, &["CLIENT", "KILL", "ID", &id]);
+    assert_eq!(read_line(&mut admin), ":1");
+    let (_, closed) = read_lines(&mut monitor, usize::MAX, Duration::from_secs(5));
+    assert!(closed, "a killed monitor was not closed");
+    send_cmd(&mut admin, &["CLIENT", "LIST", "ID", &id]);
+    assert_eq!(read_line(&mut admin), "$0");
+    server.kill().unwrap();
+    let _ = server.wait();
+}
+
+#[test]
+fn a_monitor_shows_its_backlog_and_ends_with_reset_or_kill_tokio() {
+    a_monitor_shows_its_backlog_and_ends_with_reset_or_kill("tokio");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_monitor_shows_its_backlog_and_ends_with_reset_or_kill_uring() {
+    a_monitor_shows_its_backlog_and_ends_with_reset_or_kill("uring");
+}
+
+/// Passwords are not shown: `MIGRATE … AUTH2 user pass` with the two
+/// redacted, from a client and from a script; `HELLO 3 AUTH` and `AUTH`
+/// not at all, or redacted.
+fn monitor_redacts_passwords(io_model: &str) {
+    let port = free_port();
+    let mut server = spawn_server_with(port, &["--io-model", io_model]);
+    assert!(wait_for_server(port), "server did not start");
+    let mut monitor = connect_with_retry(port);
+    monitor
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    send_cmd(&mut monitor, &["MONITOR"]);
+    assert_eq!(read_line(&mut monitor), "+OK");
+    let mut conn = connect_with_retry(port);
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut hello = connect_with_retry(port);
+    hello
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Port 1: nothing listens, MIGRATE fails at once; it is shown anyway.
+    send_cmd(
+        &mut conn,
+        &[
+            "MIGRATE",
+            "127.0.0.1",
+            "1",
+            "",
+            "0",
+            "100",
+            "AUTH2",
+            "someone",
+            "migratesecret",
+            "KEYS",
+            "k",
+        ],
+    );
+    let _ = read_line(&mut conn);
+    send_cmd(
+        &mut hello,
+        &["HELLO", "3", "AUTH", "someone", "hellosecret"],
+    );
+    let _ = read_line(&mut hello);
+    send_cmd(&mut hello, &["AUTH", "someone", "authsecret"]);
+    let _ = read_line(&mut hello);
+    #[cfg(feature = "lua")]
+    {
+        send_cmd(
+            &mut conn,
+            &[
+                "EVAL",
+                "return redis.pcall('MIGRATE', '127.0.0.1', '1', '', '0', '100', \
+                 'AUTH2', 'someone', ARGV[1], 'KEYS', 'k')",
+                "0",
+                "scriptsecret",
+            ],
+        );
+        let _ = read_line(&mut conn);
+    }
+    send_cmd(&mut conn, &["SET", "marker", "1"]);
+    assert_eq!(read_line(&mut conn), "+OK");
+
+    let mut lines = Vec::new();
+    loop {
+        let line = read_line(&mut monitor);
+        if line.contains("\"marker\"") {
+            break;
+        }
+        lines.push(line);
+    }
+    let shown = lines.join("\n");
+    for secret in ["migratesecret", "hellosecret", "authsecret"] {
+        assert!(!shown.contains(secret), "{secret} shown:\n{shown}");
+    }
+    let migrate: Vec<&String> = lines.iter().filter(|l| l.contains("\"MIGRATE\"")).collect();
+    let want = "\"AUTH2\" \"(redacted)\" \"(redacted)\" \"KEYS\" \"k\"";
+    assert!(
+        migrate
+            .iter()
+            .any(|l| !l.contains(" lua] ") && l.ends_with(want)),
+        "{shown}"
+    );
+    #[cfg(feature = "lua")]
+    assert!(
+        migrate
+            .iter()
+            .any(|l| l.contains(" lua] ") && l.ends_with(want)),
+        "{shown}"
+    );
+    for line in lines
+        .iter()
+        .filter(|l| l.contains("\"HELLO\"") || l.contains("\"AUTH\""))
+    {
+        assert!(line.contains("(redacted)"), "{line}");
+    }
+    server.kill().unwrap();
+    let _ = server.wait();
+}
+
+#[test]
+fn monitor_redacts_passwords_tokio() {
+    monitor_redacts_passwords("tokio");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn monitor_redacts_passwords_uring() {
+    monitor_redacts_passwords("uring");
+}
+
 /// The line of a command with arguments to be quoted, as Redis 8.10 shows
 /// it (time stamp and address aside): `\n`, `\r`, `\t`, `\a` and `\b` by
 /// name, other bytes not printable as `\xHH`, quotes and backslashes
