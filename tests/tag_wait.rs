@@ -237,6 +237,14 @@ fn start_held_script(
 /// (On the io_uring loop the kernel places connections; on Tokio a
 /// connection whose thread is busy waits for it too.)
 fn free_conn(server: &Server) -> Conn {
+    try_free_conn(server).expect("no new connection was answered at once")
+}
+
+/// [`free_conn`], or `None` if no connection was answered at once: every
+/// thread is held, as by a script that runs alone. (A script whose run took
+/// over five milliseconds runs alone next time: a held run does, and so can
+/// a quick one on a loaded machine.)
+fn try_free_conn(server: &Server) -> Option<Conn> {
     let asked = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel();
     for _ in 0..8 {
@@ -248,11 +256,8 @@ fn free_conn(server: &Server) -> Conn {
             }
         });
     }
-    let c = rx
-        .recv_timeout(Duration::from_millis(STALL_MS / 4))
-        .expect("no new connection was answered at once");
-    assert!(asked.elapsed() < Duration::from_millis(STALL_MS / 4));
-    c
+    let c = rx.recv_timeout(Duration::from_millis(STALL_MS / 4)).ok()?;
+    (asked.elapsed() < Duration::from_millis(STALL_MS / 4)).then_some(c)
 }
 
 /// `args`' reply on whichever of several new connections answers first,
@@ -528,19 +533,29 @@ fn a_woken_blocking_pop_waits_for_the_script_uring() {
 
 /// A write that waited for a script and is then held by a `CLIENT PAUSE` set
 /// meanwhile runs once the pause ends, not before. A round counts only if
-/// the pause was set while the script was still held (the client of the
-/// pause is answered at once, but a loaded machine may have been slower
-/// than the stall); up to five rounds.
+/// the script ran beside others and the pause was set while it was still
+/// held (a loaded machine may have been slower than the stall, or have
+/// timed a warm-up run over the five milliseconds that make a script run
+/// alone); up to five rounds.
 fn a_waiting_write_is_then_held_by_a_pause(io: &str) {
     let server = Server::start(io, 2);
     let mut c = server.conn();
-    let sha = quick_script(&mut c, &["a"]);
     for _round in 0..5 {
+        // Quick again: a held run is a slow one, which runs alone next time.
+        let sha = quick_script(&mut c, &["a"]);
         let script = start_held_script(&server, &sha, "a", "after");
-        let mut writer = free_conn(&server);
+        let Some(mut writer) = try_free_conn(&server) else {
+            // The script ran alone.
+            assert_eq!(script.join().unwrap().0, V::Int(1));
+            continue;
+        };
         writer.send(&["SET", "{a}:k", "paused"]);
         std::thread::sleep(Duration::from_millis(50));
-        let mut pauser = free_conn(&server);
+        let Some(mut pauser) = try_free_conn(&server) else {
+            assert_eq!(script.join().unwrap().0, V::Int(1));
+            assert_eq!(writer.read(), V::Str("OK".into()));
+            continue;
+        };
         let paused_at = Instant::now();
         assert_eq!(
             pauser.cmd(&["CLIENT", "PAUSE", &(STALL_MS * 2).to_string(), "WRITE"]),
