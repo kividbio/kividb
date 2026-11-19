@@ -22,7 +22,11 @@ ARG KIVIDB_FEATURES=""
 # Copy only the manifest files first, build a dummy main, then replace with
 # real source. This means `cargo build --release` is only re-run when
 # Cargo.toml/Cargo.lock change, not on every source edit.
-COPY Cargo.toml Cargo.lock ./
+# build.rs and csrc/ too: with the `lua` feature the build script compiles
+# csrc/lua51_str_format.c (the `string.format` of scripts), and without them
+# the image for that feature does not link.
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY csrc ./csrc
 # On arm64, atomics as single instructions (LSE) and not as calls that choose
 # at run time: it needs ARMv8.1, which every arm64 server has (a Raspberry
 # Pi 4 has not). The same flags in both builds, or the second rebuilds the
