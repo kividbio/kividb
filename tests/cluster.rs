@@ -2779,8 +2779,8 @@ fn a_takeover_by_another_replica_during_the_restart_leaves_one_owner() {
 }
 
 /// Without the AOF, a node restarted before the save of its promotion has
-/// what it last saved, not the writes it acknowledged as the master since,
-/// which its replica holds. It completes the promotion fenced, as a master
+/// what it last saved (a snapshot of before its promotion here), not the
+/// writes it acknowledged as the master since, which its replica holds. It completes the promotion fenced, as a master
 /// back without its dataset is: it serves none of the slots, tells the
 /// replica so when it asks for a sync (`+LOSTDATA`), the replica, which
 /// holds the writes, takes over, and the node follows it. Every write
@@ -2796,6 +2796,8 @@ fn a_promotion_completed_without_the_aof_lets_a_replica_with_the_writes_take_ove
     let (before, after) = (key_in(range.clone(), "before"), key_in(range, "after"));
     assert!(nodes[0].conn().cmd(&["SET", &before, "v"]).is_ok());
     assert_eq!(nodes[0].conn().cmd(&["WAIT", "2", "5000"]).int(), 2);
+    // The snapshot it will start from: the write before, not the one after.
+    assert!(replica.conn().cmd(&["SAVE"]).is_ok());
 
     // The replica takes over, its saves failing, and the old master, now
     // its replica, goes: the other replica follows the new master.
