@@ -525,10 +525,11 @@ directory's). A candidate counts a vote for as long as its election lives,
 10 seconds, and then stands again at a new epoch: a vote whose save takes
 longer than that is never counted, and the failover does not complete.
 Measured on an Azure D4s_v5, ext4 on a volume that delays every write:
-with writes taking 200 ms, a save took 2.1-2.6 s and a failover of a master
-7.3-8.4 s; with writes taking 1 s, a save took 8-13 s and no failover
-completed in 330 s.
-On an ordinary SSD a save takes a few milliseconds and a failover 3.5-4 s.
+with writes taking 200 ms, a save took 2.1-2.3 s and a failover of a master
+4.5-6.0 s (the promotion announced after its 1 s wait, its save still under
+way); with writes taking 1 s, a save took 8-13 s and no failover completed
+in 330 s. On the VM's own disk a save takes about 20 ms and a failover
+3.5-4.1 s.
 A volume on which a save of nodes.conf takes more than a few seconds is too
 slow for a cluster to fail over: give the cluster file a disk that syncs a
 small file in well under a second.
