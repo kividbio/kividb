@@ -420,15 +420,17 @@ other 4; 40 s, 3 runs each, medians):
 | helpers | GET/SET p99 | KNN p50 | `HSET` p99 | build alone |
 |---|---:|---:|---:|---:|
 | master (links in the writes) | 1.61 ms | 0.87 ms | 2.25 ms | 1,550 docs/s |
-| 0 | 1.64 ms | 0.89 ms | 2.32 ms | 1,540 docs/s |
-| 1 (`auto` on 4 CPUs) | 2.10 ms | 1.08 ms | 4.4-34 ms | 3,190 docs/s |
+| 0 (`auto` below 8 CPUs) | 1.64 ms | 0.89 ms | 2.32 ms | 1,540 docs/s |
+| 1 | 2.10 ms | 1.08 ms | 4.4-34 ms | 3,190 docs/s |
 | 2 | 2.62 ms | 1.13 ms | 5.5 ms | 3,620 docs/s |
 
-One helper moved GET/SET p99 by 1.3x, two by 1.6x; `auto` starts one on 4
-CPUs and adds one for every two CPUs beyond that. With one helper the
-single `HSET` probe sat behind the loading client's pipelines in two runs
-of three (its median 25 ms: by all signs on the loading client's worker,
-whose pipelines take longer while the backlog is full).
+One helper moved GET/SET p99 by 1.3x, two by 1.6x. The `HSET` column is a
+writer on the bulk loader's worker: with one helper the single `HSET` probe
+sat behind the loading client's pipelines in two runs of three (its median
+25 ms), the loader's pipelines taking longer while the backlog is full. A
+small server that serves while it loads is better off without helpers, so
+`auto` starts none below 8 CPUs (three on 8, seven on 16), and builds there
+run at 1.2's speed unless `search-index-threads` is given a number.
 
 Under a CPU quota there are no helpers. In a container with `--cpus 2` on
 the same 8-vCPU VM, memtier GET/SET from the host while one client loaded

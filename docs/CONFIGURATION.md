@@ -178,14 +178,27 @@ the server sees every CPU of the node: give it a limit, or `--threads`.
 threads link the vectors written to HNSW indexes into their graphs, so that one client
 loading documents does not build the graph on one CPU. `0` starts none: each write links
 its own vector, as up to 1.2. `auto`, the default, starts none under a CPU quota (Docker's
-`--cpus`, a Kubernetes CPU limit) or with fewer than 4 CPUs, and otherwise (CPUs - 2) / 2:
-one on 4 CPUs, three on 8, seven on 16. The log says how many started, on the first write
-that needs them.
+`--cpus`, a Kubernetes CPU limit) or with fewer than 8 CPUs, and otherwise (CPUs - 2) / 2:
+three on 8, seven on 16. A number starts that many on any machine. The log says how many
+started, on the first write that needs them.
 
-The helpers take CPU time the workers would otherwise have. With every CPU of a 4-vCPU
-server busy (GET/SET from memtier, one client loading 384-d vectors) GET/SET p99 was
-1.6 ms with none, 2.1 ms with one and 2.6 ms with two, and the build alone ran at 1,540,
-3,190 and 3,620 documents a second. Under a CPU quota a helper spends the quota and the
+So on a server of fewer than 8 CPUs builds run at 1.2's speed by default, and
+`search-index-threads 1` (or more) trades serving latency for build speed. The helpers take
+CPU time the workers would otherwise have. With every CPU of a 4-vCPU server busy (GET/SET
+from memtier, one client loading 384-d vectors in pipelines, one `HSET` every 2 ms from
+another client):
+
+| helpers | GET/SET p99 | KNN p50 | `HSET` p99 | build alone |
+|---|---:|---:|---:|---:|
+| master (links in the writes) | 1.61 ms | 0.87 ms | 2.25 ms | 1,550 docs/s |
+| 0 (`auto` below 8 CPUs) | 1.64 ms | 0.89 ms | 2.32 ms | 1,540 docs/s |
+| 1 | 2.10 ms | 1.08 ms | 4.4-34 ms | 3,190 docs/s |
+| 2 | 2.62 ms | 1.13 ms | 5.5 ms | 3,620 docs/s |
+
+The `HSET` column is a writer on the bulk loader's worker: with one helper, a connection
+that shares that worker waits behind the loader's pipelines while the backlog is full (25 ms
+at the median in two runs of three; 4.4 ms at the p99 in the third, where it did not share
+it). Under a CPU quota a helper spends the quota and the
 whole server is throttled (GET/SET p99 8-9 ms against 0.35 ms beside a load with
 `--cpus 2` and one helper), which is why `auto` starts none there: in a container or a
 Kubernetes pod with a CPU limit, builds run at 1.2's speed unless the setting is given a

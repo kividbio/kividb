@@ -22,12 +22,15 @@ redis:8.10.2 image: the VM's source-built Redis has no FT.*); it is started
 with `--loadmodule` and the configuration is self-hosted for that reason.
 
 Configurations: `pipeline`, the candidate as it starts (`search-index-threads
-auto`, which on the suite's D4s_v5 starts one helper); `pipeline-n3`, the
+auto`, which on the suite's D4s_v5, below 8 CPUs, starts no helper: the
+writes link their vectors as 1.2.2's do); `pipeline-n3`, the
 candidate with `--search-index-threads 3`, what `auto` gives on 8 CPUs, so
 that the build's gain stays gated whatever the default (v1.2.2 and Redis run
 as in `pipeline`).
 
-Gates: build docs/s within 10 %; for `pipeline-n3` also keeping 60 % of the
+Gates: build docs/s within 10 %; for `pipeline` also at most 1.05x slower than
+v1.2.2 in the same session (the same way of building; 5 % for the noise of two
+builds); for `pipeline-n3` also keeping 60 % of the
 gain over v1.2.2 and not more than 1.5x slower than Redis when it ran; KNN
 q/s within 10 %;
 recall@10 not more than 2 % under recorded (it moves with the graph, which
@@ -305,7 +308,7 @@ def pipeline(ctx):
             time.sleep(0.02)
         built = time.perf_counter() - t0
         ctx.emit("build_docs_per_s", n / built, "docs/s", "higher",
-                 gate=[rel(10), KEEP_IMPROVEMENT, vs_redis(1.5)] if explicit else rel(10))
+                 gate=[rel(10), KEEP_IMPROVEMENT, vs_redis(1.5)] if explicit else [rel(10), vs_v1_2_2(1.05)])
         ctx.emit("acked_docs_per_s", n / acked, "docs/s", "higher", gate=info())
         ctx.emit("rss_per_doc", (vmrss_mib(node.pid) - rss0) * 1048576 / n, "B", "lower", gate=rel(5))
 

@@ -115,7 +115,7 @@ pub struct Config {
 
     /// Helper threads that link the vectors written to HNSW indexes into
     /// their graphs: a number (0: each write links its own vector, as 1.2
-    /// did) or auto (none under a CPU quota or below 4 CPUs, otherwise
+    /// did) or auto (none under a CPU quota or below 8 CPUs, otherwise
     /// (CPUs - 2) / 2). Startup only. See docs/SEARCH.md.
     #[arg(long, default_value = "auto", value_parser = parse_index_threads)]
     pub search_index_threads: crate::vector::backlog::IndexThreads,
