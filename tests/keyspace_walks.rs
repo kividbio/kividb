@@ -850,10 +850,10 @@ fn a_slot_is_counted_with_a_script_whole_or_not_at_all() {
 fn key_count(reply: &V) -> Option<i64> {
     match reply {
         V::Arr(items) => {
-            if let Some(at) = items.iter().position(|v| *v == V::Str("key-count".into())) {
-                if let Some(V::Int(n)) = items.get(at + 1) {
-                    return Some(*n);
-                }
+            if let Some(at) = items.iter().position(|v| *v == V::Str("key-count".into()))
+                && let Some(V::Int(n)) = items.get(at + 1)
+            {
+                return Some(*n);
             }
             items.iter().find_map(key_count)
         }
