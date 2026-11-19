@@ -108,6 +108,8 @@ fn scan_fields<A: Memory>(
 }
 
 #[cfg(test)]
+// Fixed seeds are for tests (clippy.toml forbids them elsewhere).
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
@@ -127,7 +129,7 @@ mod tests {
     fn set_of(n: u64) -> Set {
         let mut set = Set::with_capacity_and_seed(0, 770);
         for i in 0..n {
-            assert!(set.insert(&member(i)));
+            assert!(set.insert(&member(i)).unwrap());
         }
         set
     }
@@ -188,7 +190,7 @@ mod tests {
                 // of resize fall between pages.
                 if growing {
                     for _ in 0..1_000 {
-                        set.insert(&member(next_new));
+                        set.insert(&member(next_new)).unwrap();
                         next_new += 1;
                     }
                     growing = set.len() < 16_000;
@@ -226,7 +228,7 @@ mod tests {
         let n: u64 = 1_000_000;
         let mut set = Set::with_capacity_and_seed(n as usize, 770);
         for i in 0..n {
-            set.insert(&i.to_be_bytes());
+            set.insert(&i.to_be_bytes()).unwrap();
         }
         let mut first = 0;
         let cursor = scan_members(&set, 0, 10, None, |_| first += 1);
@@ -289,7 +291,8 @@ mod tests {
         let mut hash = Hash::with_capacity_and_seed(0, 770);
         for i in 0..n {
             let ttl = (due_every > 0 && i.is_multiple_of(due_every)).then_some(1_000);
-            hash.insert(&member(i), format!("v{i}").as_bytes(), ttl);
+            hash.insert(&member(i), format!("v{i}").as_bytes(), ttl)
+                .unwrap();
         }
         hash
     }
@@ -335,7 +338,7 @@ mod tests {
     #[test]
     fn hscan_reply_has_values_unless_novalues() {
         let mut hash = Hash::new();
-        hash.insert(b"f", b"v", None);
+        hash.insert(b"f", b"v", None).unwrap();
         assert_eq!(
             hscan_reply(&hash, 0, 10, None, false, None),
             b"*2\r\n$1\r\n0\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n"
