@@ -427,7 +427,9 @@ mod decimal_tests {
     /// whatever its arguments' lengths, after what the buffer held.
     #[test]
     fn a_command_appended_is_the_command_encoded() {
-        let sizes = [0usize, 1, 9, 10, 11, 99, 100, 101, 999, 1000, 12_345, 100_000];
+        let sizes = [
+            0usize, 1, 9, 10, 11, 99, 100, 101, 999, 1000, 12_345, 100_000,
+        ];
         let mut cases: Vec<Vec<Vec<u8>>> = vec![Vec::new(), vec![Vec::new()]];
         for (i, &a) in sizes.iter().enumerate() {
             let b = sizes[(i * 7 + 3) % sizes.len()];
@@ -439,7 +441,12 @@ mod decimal_tests {
             let mut out = b"before".to_vec();
             encode_resp_command_into(&mut out, cmd);
             assert_eq!(&out[..6], b"before");
-            assert_eq!(&out[6..], &encode_resp_command(cmd)[..], "{:?}", cmd.iter().map(Vec::len).collect::<Vec<_>>());
+            assert_eq!(
+                &out[6..],
+                &encode_resp_command(cmd)[..],
+                "{:?}",
+                cmd.iter().map(Vec::len).collect::<Vec<_>>()
+            );
         }
     }
 }

@@ -312,9 +312,18 @@ impl Server {
         }
     }
 
+    /// `SIGKILL`, and the port given up. A killed io_uring server's
+    /// listening socket outlives the process by a moment (the kernel
+    /// releases the ring's files after it has gone), and takes a connection
+    /// in that moment, which it then resets: a restart's first `connect`
+    /// reached it, not the restarted server, and read a reset.
     fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !port_is_free(self.port) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Start the server again on its data directory. The data directory is
@@ -4148,7 +4157,7 @@ fn an_aof_master_keeping_its_backlog_reloads_what_it_held(model: &str) {
         "1"
     );
     let scripts = !matches!(master.conn().cmd(&["EVAL", "return 1", "0"]), V::Err(_));
-    let mut acked = vec![0u64; MIXED_COUNTERS];
+    let mut acked = [0u64; MIXED_COUNTERS];
     for round in 0..rounds(2) {
         let stop = Arc::new(AtomicBool::new(false));
         let writers: Vec<_> = (0..6u64)

@@ -1468,10 +1468,16 @@ mod tests {
             }
             // With an option a SET may be rewritten, and is not taken as sent
             // as it came.
-            for case in [&["SET", "k", "v", "EX", "10"][..], &["SET", "k", "v", "GET"]] {
+            for case in [
+                &["SET", "k", "v", "EX", "10"][..],
+                &["SET", "k", "v", "GET"],
+            ] {
                 assert!(!sent_as_it_came(case[0], &refs(&cmd(case))), "{case:?}");
             }
-            assert!(!sent_as_it_came("EXPIRE", &refs(&cmd(&["EXPIRE", "k", "1"]))));
+            assert!(!sent_as_it_came(
+                "EXPIRE",
+                &refs(&cmd(&["EXPIRE", "k", "1"]))
+            ));
         });
     }
 
