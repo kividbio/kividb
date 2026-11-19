@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/cms.rs
 //
 // Count-min sketches (`CMS.*`), against what Redis 8.10.2 does:
