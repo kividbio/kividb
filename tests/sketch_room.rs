@@ -170,6 +170,7 @@ impl Child {
                 .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
                 .args(["--threads", "2", "--loglevel", "warning"])
+                .args(["--enable-debug-command", "yes"])
                 .args(["--configfile", "kividb.conf", "--dir"])
                 .arg(&dir)
                 .args(&args)
@@ -257,6 +258,7 @@ fn dataset(c: &mut Conn) -> Vec<(Vec<u8>, Vec<u8>)> {
     keys.into_iter()
         .map(|k| {
             let d = c.raw(&[b"DEBUG", b"DIGEST-VALUE", &k]);
+            assert!(!d.starts_with(b"-"), "{}", shown(&d));
             (k, d)
         })
         .collect()

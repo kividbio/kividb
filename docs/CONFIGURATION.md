@@ -121,11 +121,13 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 is `no`, and every client gets Redis's `ERR DEBUG command not allowed ...`. Start the server
 with `--enable-debug-command yes` (or `enable-debug-command yes` in the config file) to allow
 it to any client whose ACL user may run `DEBUG`, or `local` to allow it only to clients on
-loopback (`127.0.0.0/8`, `::1`). The ACL is checked first. Inside `MULTI` the refusal
+loopback (`127.0.0.0/8`, `::1`). Behind a proxy every client has the proxy's address, so
+`local` means local to the proxy. The ACL is checked first. Inside `MULTI` the refusal
 discards the transaction (`EXEC` answers `EXECABORT`); a script cannot run `DEBUG` whatever
 the setting. The setting is read at startup only: `CONFIG GET enable-debug-command` reports
 it and `CONFIG SET` refuses it, whatever the value. Up to 1.2.2 it was accepted and ignored,
-and `DEBUG` was open to any user whose ACL allowed it.
+and `DEBUG` was open to any user whose ACL allowed it. `redis-cli --cluster fix` compares a
+key both nodes hold with `DEBUG DIGEST-VALUE`, so it needs `DEBUG` allowed, as with Redis 7.
 
 `maxclients` (default `10000`, in the file or with `CONFIG SET`) counts plaintext and TLS
 clients, TLS ones from the start of their handshake. At startup KiviDB raises the soft

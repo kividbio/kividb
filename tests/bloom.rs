@@ -371,6 +371,7 @@ impl Child {
                     "--loglevel",
                     "warning",
                 ])
+                .args(["--enable-debug-command", "yes"])
                 .args(["--configfile", "kividb.conf", "--dir"])
                 .arg(dir)
                 .args(extra)
@@ -926,11 +927,9 @@ fn room_is_made_before_the_command_takes_its_keys() {
     let keys = all_keys(&mut m);
     assert_eq!(all_keys(&mut r), keys);
     for key in &keys {
-        assert_eq!(
-            r.cmd(&["DEBUG", "DIGEST-VALUE", key]),
-            m.cmd(&["DEBUG", "DIGEST-VALUE", key]),
-            "{key}"
-        );
+        let digest = m.cmd(&["DEBUG", "DIGEST-VALUE", key]);
+        assert!(!digest.starts_with(b"-"), "{key}: {}", shown(&digest));
+        assert_eq!(r.cmd(&["DEBUG", "DIGEST-VALUE", key]), digest, "{key}");
     }
     drop((master, replica));
     let _ = std::fs::remove_dir_all(&dir);

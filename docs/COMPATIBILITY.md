@@ -330,10 +330,8 @@ other files:
   server started with `yes`, or with `local` and the client is on loopback
   (KiviDB has no Unix socket). Inside `MULTI` the refusal discards the
   transaction, as in Redis. `CONFIG SET` refuses it, whatever the value, as
-  Redis does. Two differences: a user whose ACL does not allow `DEBUG` gets
-  `NOPERM` (Redis checks the setting first), and with `--bind ::` an IPv4
-  client on loopback arrives IPv4-mapped and is not local, as for protected
-  mode (a Redis IPv6 listener takes no IPv4 clients).
+  Redis does. One difference: a user whose ACL does not allow `DEBUG` gets
+  `NOPERM` (Redis checks the setting first).
 - `enable-protected-configs` and `enable-module-command` are accepted, in
   the config file and by `CONFIG SET`, and change nothing: KiviDB has no
   protected configs and no modules.

@@ -193,6 +193,7 @@ impl Child {
                 .current_dir(dir)
                 .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
                 .args(["--threads", "2", "--loglevel", "warning"])
+                .args(["--enable-debug-command", "yes"])
                 .args(["--configfile", "kividb.conf", "--dir"])
                 .arg(dir)
                 .args(extra)
@@ -417,17 +418,15 @@ fn dump_restore_and_migrate() {
         c.cmd(&["CF.ADD", "here", &format!("x{i}")]);
     }
     c.cmd(&["CF.DEL", "here", "x1"]);
-    assert_eq!(
-        c.cmd(&["DEBUG", "DIGEST-VALUE", "here"]),
-        c.cmd(&["DEBUG", "DIGEST-VALUE", "from-redis"])
-    );
+    let digest = c.cmd(&["DEBUG", "DIGEST-VALUE", "from-redis"]);
+    assert!(!digest.starts_with(b"-"), "{}", shown(&digest));
+    assert_eq!(c.cmd(&["DEBUG", "DIGEST-VALUE", "here"]), digest);
     let payload = bulk(&c.cmd(&["DUMP", "here"]));
     assert_eq!(&payload[..10], &redis[..10], "type and module ID");
     assert_eq!(c.raw(&[b"RESTORE", b"again", b"0", &payload]), b"+OK\r\n");
-    assert_eq!(
-        c.cmd(&["DEBUG", "DIGEST-VALUE", "again"]),
-        c.cmd(&["DEBUG", "DIGEST-VALUE", "here"])
-    );
+    let digest = c.cmd(&["DEBUG", "DIGEST-VALUE", "here"]);
+    assert!(!digest.starts_with(b"-"), "{}", shown(&digest));
+    assert_eq!(c.cmd(&["DEBUG", "DIGEST-VALUE", "again"]), digest);
     assert_eq!(
         c.cmd(&[
             "MIGRATE",
@@ -489,7 +488,11 @@ fn workload(c: &mut Conn, seed: u64, steps: usize) {
 
 fn digests(c: &mut Conn) -> Vec<Vec<u8>> {
     (0..6)
-        .map(|i| c.cmd(&["DEBUG", "DIGEST-VALUE", &format!("w:{i}")]))
+        .map(|i| {
+            let d = c.cmd(&["DEBUG", "DIGEST-VALUE", &format!("w:{i}")]);
+            assert!(!d.starts_with(b"-"), "{}", shown(&d));
+            d
+        })
         .collect()
 }
 
@@ -885,11 +888,9 @@ fn room_is_made_before_the_command_takes_its_keys() {
     let keys = all_keys(&mut m);
     assert_eq!(all_keys(&mut r), keys);
     for key in &keys {
-        assert_eq!(
-            r.cmd(&["DEBUG", "DIGEST-VALUE", key]),
-            m.cmd(&["DEBUG", "DIGEST-VALUE", key]),
-            "{key}"
-        );
+        let digest = m.cmd(&["DEBUG", "DIGEST-VALUE", key]);
+        assert!(!digest.starts_with(b"-"), "{key}: {}", shown(&digest));
+        assert_eq!(r.cmd(&["DEBUG", "DIGEST-VALUE", key]), digest, "{key}");
     }
     drop((master, replica));
     let _ = std::fs::remove_dir_all(&dir);
