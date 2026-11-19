@@ -5227,6 +5227,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let fill = crate::value_slab::fill();
                 out.push_str(&format!("value_slab_bytes:{}\r\n", fill.slab_bytes));
                 out.push_str(&format!("value_slab_live_bytes:{}\r\n", fill.live_bytes));
+                // The entry pool's slabs (large hashes' and sets' entries),
+                // which active defrag leaves alone: not in the two above.
+                out.push_str(&format!(
+                    "value_slab_pool_bytes:{}\r\n",
+                    crate::value_slab::pool_slab_bytes()
+                ));
                 // Times freed memory was given back to the system after a
                 // large fall in what is allocated (#753).
                 out.push_str(&format!(

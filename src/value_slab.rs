@@ -18,8 +18,9 @@
 //! aligned to its size. A region's first [`SLAB`] bytes hold the headers of
 //! its slabs and nothing else, and are never given back, so a header
 //! outlives the memory it describes: a free that comes late still finds it.
-//! Each of the other slabs holds blocks of one class, sixteen bytes apart in
-//! size. Masking a block's address finds its region, and its offset its
+//! Each of the other slabs holds blocks of one class (the keyspace's are
+//! sixteen bytes apart in size, the entry pool's eight apart below 64, see
+//! below). Masking a block's address finds its region, and its offset its
 //! slab.
 //!
 //! **Ownership.** A slab with room is used by at most one thread at a time,
@@ -34,6 +35,22 @@
 //! out of their lists: no block is handed out of them any more, and
 //! `compaction` moves the values in them elsewhere, so that they empty.
 //! [`finish_evacuation`] puts back those that did not.
+//!
+//! **The entry pool.** A second set of classes, [`pool_class_of`]'s, for the
+//! entries of large hashes and sets (`collection_table::EntryPool`), which
+//! compaction cannot move: [`plan_evacuation`] never chooses their slabs,
+//! and [`fill`] and [`slab_bytes`], which decide whether compaction runs,
+//! leave them out (INFO shows them apart, as `value_slab_pool_bytes`).
+//! Everything else is the same machinery: a block costs (and `used_memory`
+//! counts) its class's size, any thread may free it, and a slab nobody owns
+//! that empties gives its pages back at once. A slab a thread owns (the one
+//! it takes blocks of that class from) is settled only when the thread lets
+//! go of it: when it runs dry, or when the thread ends; until then its
+//! blocks freed by that thread wait on its local list, so each thread can
+//! hold up to one partly used slab per class it has used, the pool's
+//! classes included. Its classes are 8 bytes apart up to 64 (an 11-byte
+//! entry takes 16, a 20-byte one 24), then as the keyspace's, and its
+//! blocks are aligned to 8.
 
 use std::cell::{Cell, UnsafeCell};
 use std::ptr::{self, NonNull};
@@ -56,6 +73,15 @@ const SLABS: usize = REGION / SLAB;
 pub const MAX_BLOCK: usize = 4096;
 const CLASSES: usize = 112;
 const _: () = assert!(block_size(CLASSES - 1) == MAX_BLOCK);
+/// The entry pool's classes ([`pool_class_of`]), numbered after the
+/// keyspace's: 8 bytes apart to 64, 16 apart to 512, then the keyspace's
+/// sizes (8 + 28 + 48 + 32).
+const POOL_CLASSES: usize = 116;
+/// Every class: the keyspace's, then the entry pool's.
+const ALL_CLASSES: usize = CLASSES + POOL_CLASSES;
+const _: () = assert!(block_size(ALL_CLASSES - 1) == MAX_BLOCK);
+// A slab's class is kept in a byte.
+const _: () = assert!(ALL_CLASSES <= 256);
 
 // What a slab is doing.
 /// A thread's, which takes blocks from it.
@@ -158,11 +184,28 @@ pub fn class_of(size: usize) -> Option<usize> {
     })
 }
 
+/// The entry pool's class of a block of `size` bytes, if a slab holds it:
+/// classes compaction never empties (see the module docs).
+#[inline]
+pub fn pool_class_of(size: usize) -> Option<usize> {
+    let size = size.max(1);
+    Some(
+        CLASSES
+            + if size <= 64 {
+                (size - 1) / 8
+            } else if size <= 512 {
+                8 + (size - 65) / 16
+            } else {
+                class_of(size)? + 4
+            },
+    )
+}
+
 /// Each class's block size, looked up: on every block given and taken.
-const SIZES: [u16; CLASSES] = {
-    let mut sizes = [0; CLASSES];
+const SIZES: [u16; ALL_CLASSES] = {
+    let mut sizes = [0; ALL_CLASSES];
     let mut class = 0;
-    while class < CLASSES {
+    while class < ALL_CLASSES {
         sizes[class] = size_of_class(class) as u16;
         class += 1;
     }
@@ -176,6 +219,17 @@ pub const fn block_size(class: usize) -> usize {
 }
 
 const fn size_of_class(class: usize) -> usize {
+    if class >= CLASSES {
+        let pool = class - CLASSES;
+        return if pool < 8 {
+            (pool + 1) * 8
+        } else if pool < 36 {
+            64 + (pool - 7) * 16
+        } else {
+            // From 544 bytes, the keyspace's classes from its 32nd.
+            size_of_class(pool - 4)
+        };
+    }
     if class < 32 {
         (class + 1) * 16
     } else if class < 80 {
@@ -186,10 +240,10 @@ const fn size_of_class(class: usize) -> usize {
 }
 
 /// Blocks in a slab of each class.
-const CAPACITY: [i32; CLASSES] = {
-    let mut capacity = [0; CLASSES];
+const CAPACITY: [i32; ALL_CLASSES] = {
+    let mut capacity = [0; ALL_CLASSES];
     let mut class = 0;
-    while class < CLASSES {
+    while class < ALL_CLASSES {
         capacity[class] = (SLAB / size_of_class(class)) as i32;
         class += 1;
     }
@@ -238,11 +292,24 @@ struct SlabPtr(*const Slab);
 unsafe impl Send for SlabPtr {}
 
 /// Each class's slabs with room that nobody owns.
-static PARTIAL_SLABS: [Mutex<Vec<SlabPtr>>; CLASSES] = [const { Mutex::new(Vec::new()) }; CLASSES];
+static PARTIAL_SLABS: [Mutex<Vec<SlabPtr>>; ALL_CLASSES] =
+    [const { Mutex::new(Vec::new()) }; ALL_CLASSES];
 /// Slabs that hold nothing.
 static EMPTY_SLABS: Mutex<Vec<SlabPtr>> = Mutex::new(Vec::new());
-/// Slabs that are not [`EMPTY`].
+/// Slabs of the keyspace's classes that are not [`EMPTY`].
 static IN_USE: AtomicUsize = AtomicUsize::new(0);
+/// Slabs of the entry pool's classes that are not [`EMPTY`].
+static POOL_IN_USE: AtomicUsize = AtomicUsize::new(0);
+
+/// The count of slabs in use that a slab of `class` is in.
+#[inline]
+fn in_use(class: usize) -> &'static AtomicUsize {
+    if class < CLASSES {
+        &IN_USE
+    } else {
+        &POOL_IN_USE
+    }
+}
 /// Regions taken from the system.
 static REGIONS: AtomicUsize = AtomicUsize::new(0);
 /// Where they are.
@@ -253,7 +320,7 @@ static EVACUATION: Mutex<Vec<(SlabPtr, usize, u32)>> = Mutex::new(Vec::new());
 
 /// A thread's slabs, one a class at most.
 struct Mine {
-    slabs: [Cell<*const Slab>; CLASSES],
+    slabs: [Cell<*const Slab>; ALL_CLASSES],
 }
 
 impl Drop for Mine {
@@ -271,7 +338,7 @@ impl Drop for Mine {
 thread_local! {
     static MINE: Mine = const {
         Mine {
-            slabs: [const { Cell::new(ptr::null()) }; CLASSES],
+            slabs: [const { Cell::new(ptr::null()) }; ALL_CLASSES],
         }
     };
 }
@@ -280,7 +347,8 @@ thread_local! {
 /// takes a block from, for as long as it takes it.
 static NOBODY: u8 = 0;
 
-/// A block of class `class`'s size, aligned to sixteen bytes.
+/// A block of class `class`'s size, aligned to sixteen bytes for the
+/// keyspace's classes and to eight for the entry pool's.
 ///
 /// Must not panic (#358, #370): the active defrag thread lives on after a
 /// panic in a pass, with its own slabs, and allocates again. A panic here
@@ -289,7 +357,7 @@ static NOBODY: u8 = 0;
 /// the same block. Nothing in it panics but on a broken invariant, and a
 /// failed allocation aborts.
 pub fn alloc(class: usize) -> NonNull<u8> {
-    debug_assert!(class < CLASSES);
+    debug_assert!(class < ALL_CLASSES);
     let block = MINE
         .try_with(|mine| {
             let owner = mine as *const Mine as usize;
@@ -469,7 +537,7 @@ fn settle(mut partial: parking_lot::MutexGuard<'_, Vec<SlabPtr>>, slab: &Slab, c
         slab.generation.fetch_add(1, Ordering::Relaxed);
         slab.state.store(EMPTY, Ordering::Relaxed);
         drop(partial);
-        IN_USE.fetch_sub(1, Ordering::Relaxed);
+        in_use(class).fetch_sub(1, Ordering::Relaxed);
         give_back(slab.base());
         EMPTY_SLABS.lock().push(SlabPtr(slab));
     } else if state == FULL && live <= listable(class) {
@@ -521,7 +589,7 @@ fn acquire(class: usize, owner: usize) -> *const Slab {
     s.remote.store(ptr::null_mut(), Ordering::Relaxed);
     s.owner.store(owner, Ordering::Relaxed);
     s.state.store(OWNED, Ordering::Release);
-    IN_USE.fetch_add(1, Ordering::Relaxed);
+    in_use(class).fetch_add(1, Ordering::Relaxed);
     slab
 }
 
@@ -603,7 +671,8 @@ fn give_back(base: *mut u8) {
 #[cfg(not(all(unix, not(miri))))]
 fn give_back(_base: *mut u8) {}
 
-/// What the slabs take, and what is in them.
+/// What the keyspace's slabs take, and what is in them: the entry pool's are
+/// left out, as compaction does not empty them.
 pub struct Fill {
     /// Slabs that hold something (INFO `value_slab_bytes`).
     pub slab_bytes: usize,
@@ -621,9 +690,14 @@ pub fn fill() -> Fill {
         for index in 1..SLABS {
             // SAFETY: a region's headers live as long as the process.
             let slab = unsafe { &*(region as *const Slab).add(index) };
+            // The state first: a slab taken empty gets its class before its
+            // state says it is in use (`acquire`'s release store).
+            let state = slab.state.load(Ordering::Acquire);
             let class = slab.class.load(Ordering::Relaxed) as usize;
-            live_bytes += match slab.state.load(Ordering::Relaxed) {
+            live_bytes += match state {
                 EMPTY => 0,
+                // The entry pool's.
+                _ if class >= CLASSES => 0,
                 OWNED => SLAB,
                 _ => slab.live.load(Ordering::Relaxed).max(0) as usize * block_size(class),
             };
@@ -642,10 +716,11 @@ pub static PAUSE_BETWEEN_PASSES: Mutex<Option<fn()>> = Mutex::new(None);
 
 /// Choose the sparsest slabs nobody owns, holding about `budget` bytes of
 /// blocks between them, for compaction to empty: no block is handed out of
-/// them from now on. Returns how many it chose.
+/// them from now on. Returns how many it chose. Only the keyspace's classes:
+/// never a slab of the entry pool, whose blocks compaction cannot move.
 pub fn plan_evacuation(budget: usize) -> usize {
     let mut candidates: Vec<(usize, usize, SlabPtr, u32, usize)> = Vec::new();
-    for (class, list) in PARTIAL_SLABS.iter().enumerate() {
+    for (class, list) in PARTIAL_SLABS[..CLASSES].iter().enumerate() {
         for &slab in list.lock().iter() {
             // SAFETY: a header lives as long as the process.
             let s = unsafe { &*slab.0 };
@@ -765,9 +840,16 @@ pub fn is_evacuating(block: *const u8, regions: &[usize]) -> bool {
         && slab_of(block).state.load(Ordering::Relaxed) == EVACUATING
 }
 
-/// Bytes of the slabs that hold something (INFO `value_slab_bytes`).
+/// Bytes of the keyspace's slabs that hold something (INFO
+/// `value_slab_bytes`).
 pub fn slab_bytes() -> usize {
     IN_USE.load(Ordering::Relaxed) * SLAB
+}
+
+/// Bytes of the entry pool's slabs that hold something (INFO
+/// `value_slab_pool_bytes`).
+pub fn pool_slab_bytes() -> usize {
+    POOL_IN_USE.load(Ordering::Relaxed) * SLAB
 }
 
 /// Slabs that hold something.
@@ -796,6 +878,26 @@ pub fn generation_of(block: *const u8) -> u32 {
 /// the slabs are the process's, and one such test would take another's.
 #[cfg(test)]
 pub(crate) static EVACUATION_TESTS: Mutex<()> = Mutex::new(());
+
+/// For tests: how many slabs of `class` hold something (are not
+/// [`EMPTY`]).
+#[cfg(test)]
+pub(crate) fn slabs_of_class(class: usize) -> usize {
+    let regions = REGION_LIST.lock().clone();
+    regions
+        .iter()
+        .map(|&region| {
+            (1..SLABS)
+                .filter(|&index| {
+                    // SAFETY: a region's headers live as long as the process.
+                    let slab = unsafe { &*(region as *const Slab).add(index) };
+                    slab.state.load(Ordering::Acquire) != EMPTY
+                        && slab.class.load(Ordering::Relaxed) as usize == class
+                })
+                .count()
+        })
+        .sum()
+}
 
 /// For tests: how many slabs are being emptied.
 #[cfg(test)]
@@ -870,5 +972,128 @@ impl Drop for OnlyEvacuating {
         }
         s.state.store(FULL, Ordering::Relaxed);
         settle(list, s, self.class);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyspace_classes_are_as_they_were() {
+        for size in 1..=MAX_BLOCK {
+            let class = class_of(size).unwrap();
+            assert!(class < CLASSES);
+            let step = if size <= 512 {
+                16
+            } else if size <= 2048 {
+                32
+            } else {
+                64
+            };
+            assert_eq!(block_size(class), size.div_ceil(step) * step, "{size}");
+        }
+        assert_eq!(class_of(MAX_BLOCK + 1), None);
+    }
+
+    #[test]
+    fn pool_classes_fit_tightly() {
+        for size in 1..=MAX_BLOCK {
+            let class = pool_class_of(size).unwrap();
+            assert!((CLASSES..ALL_CLASSES).contains(&class), "{size}");
+            let block = block_size(class);
+            assert!(block >= size, "{size}");
+            // The class below is too small: no size skips a class.
+            if class > CLASSES {
+                assert!(block_size(class - 1) < size.max(1), "{size}");
+            }
+            let step = if size <= 64 {
+                8
+            } else if size <= 512 {
+                16
+            } else if size <= 2048 {
+                32
+            } else {
+                64
+            };
+            assert_eq!(block, size.div_ceil(step) * step, "{size}");
+            // Room for the free list's pointer.
+            assert!(block >= std::mem::size_of::<*mut u8>());
+        }
+        assert_eq!(pool_class_of(MAX_BLOCK + 1), None);
+        assert_eq!(block_size(pool_class_of(11).unwrap()), 16);
+        assert_eq!(block_size(pool_class_of(20).unwrap()), 24);
+    }
+
+    /// Compaction never chooses a slab of the entry pool, and a pool slab
+    /// that empties is given back at once, its blocks freed on another
+    /// thread.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn pool_slabs_are_never_evacuated_and_empty_at_once() {
+        let _one = EVACUATION_TESTS.lock();
+        // A class no other test allocates (blocks of 4,033-4,096 bytes, 16
+        // a slab): `acquire` takes a listed slab of the class before an
+        // empty one, so a test that allocated in the same class meanwhile
+        // could take the very slabs this one asserts on (the small classes
+        // are the tables' and `table_scan`'s, from many threads at once).
+        let class = pool_class_of(MAX_BLOCK).unwrap();
+        let per_slab = capacity(class) as usize;
+        let slabs = if cfg!(miri) { 2 } else { 3 };
+        // Whole slabs and one block more: the slabs before the last are let
+        // go of (nobody's), the last is this thread's.
+        let blocks: Vec<usize> = (0..slabs * per_slab + 1)
+            .map(|_| alloc(class).as_ptr() as usize)
+            .collect();
+        let (full, rest) = blocks.split_at(slabs * per_slab);
+        // Fresh slabs, one after the other.
+        for slab in full.chunks(per_slab) {
+            let first = slab_of(slab[0] as *const u8);
+            assert!(std::ptr::eq(
+                first,
+                slab_of(slab[per_slab - 1] as *const u8)
+            ));
+        }
+        let generations: Vec<u32> = full
+            .chunks(per_slab)
+            .map(|slab| generation_of(slab[0] as *const u8))
+            .collect();
+        // Most of each slab freed on another thread: the slabs get room,
+        // and are listed for the taking.
+        let freed: Vec<usize> = (0..full.len())
+            .filter(|i| !i.is_multiple_of(8))
+            .map(|i| full[i])
+            .collect();
+        let kept: Vec<usize> = (0..full.len())
+            .filter(|i| i.is_multiple_of(8))
+            .map(|i| full[i])
+            .collect();
+        std::thread::spawn(move || {
+            for b in freed {
+                // SAFETY: allocated above, freed once.
+                unsafe { free(NonNull::new(b as *mut u8).unwrap(), class) };
+            }
+        })
+        .join()
+        .unwrap();
+        for slab in full.chunks(per_slab) {
+            let s = slab_of(slab[0] as *const u8);
+            assert_eq!(s.state.load(Ordering::Relaxed), PARTIAL);
+        }
+        // Compaction with all the budget there is: none of them.
+        plan_evacuation(usize::MAX);
+        let regions = regions_snapshot();
+        for &b in &kept {
+            assert!(!is_evacuating(b as *const u8, &regions));
+        }
+        finish_evacuation();
+        // The rest freed: each slab empties, and is given back at once.
+        for &b in kept.iter().chain(rest) {
+            // SAFETY: allocated above, freed once.
+            unsafe { free(NonNull::new(b as *mut u8).unwrap(), class) };
+        }
+        for (slab, generation) in full.chunks(per_slab).zip(generations) {
+            assert_ne!(generation_of(slab[0] as *const u8), generation, "emptied");
+        }
     }
 }
