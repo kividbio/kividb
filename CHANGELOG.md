@@ -483,6 +483,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A command reads the clock once (#632).** The first time a command
+  needs the time, it reads the clock, and every later expiry check in the
+  same command uses that reading, as Redis's `commandTimeSnapshot` does:
+  the look a write on a master makes for the keys it names that are past
+  their time, the command's own lookups, hash field deadlines, and the
+  times to live it sets or reports. A key is either live or expired for
+  the whole command, so `SUNIONSTORE`, `BITOP`, `PFMERGE`, `ZUNIONSTORE`,
+  `SORT … STORE`, `GEOSEARCHSTORE`, `COPY`, `LMOVE`, `SMOVE` and the other
+  commands that read one key and write another find their sources as that
+  first look found them. A transaction keeps one reading for its whole
+  `EXEC`, and a script one for its whole run; the script of an `EVAL` or
+  `FCALL` uses the time its command had already read. The background
+  expiry cycle and eviction go by the clock as before, and replicas still
+  never expire keys by their own clock. A command that looks at no key
+  with a time to live reads no clock at all.
+
 - **A restart replays the new log of an unfinished checkpoint only when
   the old log matches that record (its length, and its last 4 KiB)
   (#277).** A turn-over's new `appendonly.aof` now opens with a record of

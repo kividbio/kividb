@@ -387,6 +387,15 @@ of expiry:
 `EXPIRE` / `PEXPIRE` with a time that is not in the future delete the key,
 and are recorded as `DEL k`.
 
+The moment comes from the command's one reading of the clock, as Redis's
+`commandTimeSnapshot`: a command reads the clock the first time it needs
+it and goes by that time to the end (a transaction by one time for its
+whole `EXEC`, a script by one for its whole run). Every key it looks at
+is live, or past its time, for the whole command. A write on a master
+deletes the keys it names that are past their time first, and records
+their `UNLINK` ahead of itself; what it then reads is what that look
+found, so the record replays to what the master stored.
+
 One form is left as typed: the older KiviDB `HSETEX key seconds … KEEPTTL`,
 whose "keep a field's TTL, or else use this one" has no absolute spelling.
 
