@@ -16,10 +16,33 @@ use super::bloom::{
     BloomChain, FLAG_EXACT_SIZE, FLAG_WIDE_HASH, LayerShape, Limits, MAX_LAYER_BYTES, ShapeError,
     Used,
 };
+use super::cms::CountMin;
+use super::cuckoo::{Cuckoo, Shape, SubFilter};
+use super::topk::{Slot, TopK};
 
 /// The module type of Bloom filters, and the encoding version written.
 pub const BLOOM_TYPE: &str = "MBbloom--";
 const BLOOM_ENCVER: u64 = 4;
+/// The module type of Count-min sketches, and the encoding version
+/// written: what Redis 8.10 writes.
+pub const CMS_TYPE: &str = "CMSk-TYPE";
+const CMS_ENCVER: u64 = 0;
+/// The module type of Top-K sketches, and the encoding version written:
+/// what Redis 8.10 writes.
+pub const TOPK_TYPE: &str = "TopK-TYPE";
+const TOPK_ENCVER: u64 = 0;
+/// A place in Redis's heap as it saves it: the fingerprint, the item's
+/// length, a pointer (meaningless once saved), the count and four bytes of
+/// padding.
+const TOPK_SLOT: usize = 24;
+/// The module type of Cuckoo filters, and the encoding version written:
+/// what Redis 8.10 writes.
+pub const CUCKOO_TYPE: &str = "MBbloomCF";
+const CUCKOO_ENCVER: u64 = 4;
+/// The module type of t-digests, as `TYPE` names them. Their values are not
+/// read or written in Redis's format: `DUMP` gives KiviDB's own, and a
+/// Redis payload or RDB value of this type is refused.
+pub const TDIGEST_TYPE: &str = "TDIS-TYPE";
 
 /// The RDB version `DUMP` payloads of these types carry: 9 (Redis 6.0),
 /// the oldest that has these encodings, so that every Redis since takes
@@ -103,6 +126,82 @@ fn write_bloom(w: &mut Writer, chain: &BloomChain) {
     }
 }
 
+/// A Count-min sketch as Redis saves it (encoding version 0): its width,
+/// depth and total count, then its counters, row by row, as little-endian
+/// 32-bit words in one string.
+fn write_cms(w: &mut Writer, cms: &CountMin) {
+    w.uint(cms.width);
+    w.uint(cms.depth);
+    w.uint(cms.count);
+    w.len(OPCODE_STRING);
+    w.len(cms.data_bytes());
+    for c in cms.counters.iter() {
+        w.out.extend_from_slice(&c.to_le_bytes());
+    }
+}
+
+/// Whether `DUMP` writes `sketch` in Redis's format, which Redis can
+/// `RESTORE`; the other types are dumped in KiviDB's own.
+pub fn dumps_as_redis(sketch: &Sketch) -> bool {
+    matches!(
+        sketch,
+        Sketch::Bloom(_) | Sketch::CountMin(_) | Sketch::Cuckoo(_) | Sketch::TopK(_)
+    )
+}
+
+/// A Top-K sketch as Redis saves it (encoding version 0): `k`, width,
+/// depth and decay; the buckets (fingerprint and count, little-endian) as
+/// one string; the heap's places as one string; then each place's item, a
+/// string ending in a zero byte (just the zero byte for an empty place).
+/// The pointers Redis's places carry are written as 0: Redis sets them
+/// from the items when it loads.
+fn write_topk(w: &mut Writer, t: &TopK) {
+    w.uint(u64::from(t.k));
+    w.uint(u64::from(t.width));
+    w.uint(u64::from(t.depth));
+    w.double(t.decay);
+    w.len(OPCODE_STRING);
+    w.len(t.buckets.len() as u64 * 8);
+    for b in t.buckets.iter() {
+        w.out.extend_from_slice(&b.fp.to_le_bytes());
+        w.out.extend_from_slice(&b.count.to_le_bytes());
+    }
+    w.len(OPCODE_STRING);
+    w.len((t.heap.len() * TOPK_SLOT) as u64);
+    for s in t.heap.iter() {
+        let len = s.item.as_ref().map_or(0, |i| i.len() as u32);
+        w.out.extend_from_slice(&s.fp.to_le_bytes());
+        w.out.extend_from_slice(&len.to_le_bytes());
+        w.out.extend_from_slice(&[0; 8]);
+        w.out.extend_from_slice(&s.count.to_le_bytes());
+        w.out.extend_from_slice(&[0; 4]);
+    }
+    for s in t.heap.iter() {
+        let item = s.item.as_deref().unwrap_or(&[]);
+        w.len(OPCODE_STRING);
+        w.len(item.len() as u64 + 1);
+        w.out.extend_from_slice(item);
+        w.out.push(0);
+    }
+}
+
+/// A Cuckoo filter as Redis saves it (encoding version 4): sub-filters,
+/// the first one's buckets, items, deletes, bucket size, kick limit and
+/// expansion; then each sub-filter's buckets and bytes.
+fn write_cuckoo(w: &mut Writer, cf: &Cuckoo) {
+    w.uint(cf.filters.len() as u64);
+    w.uint(cf.filters[0].buckets);
+    w.uint(cf.items);
+    w.uint(cf.deletes);
+    w.uint(u64::from(cf.bucket_size));
+    w.uint(u64::from(cf.max_iterations));
+    w.uint(u64::from(cf.expansion));
+    for f in &cf.filters {
+        w.uint(f.buckets);
+        w.string(&f.data);
+    }
+}
+
 /// The most bytes [`dump_payload`] writes for `sketch`: each field at its
 /// longest, and the layers' bytes.
 fn dump_len(sketch: &Sketch) -> u64 {
@@ -113,6 +212,24 @@ fn dump_len(sketch: &Sketch) -> u64 {
             // 64. Each layer: eight fields of at most 10 bytes, its bytes.
             64 + layers * 80 + chain.data_bytes()
         }
+        // Type, module ID, three fields, the string's head, the end,
+        // version and CRC: under 64.
+        Sketch::CountMin(cms) => 64 + cms.data_bytes(),
+        // Type, module ID, four fields, two strings' heads, the end, version
+        // and CRC: under 96. The buckets, the places, and each item with
+        // its head and zero byte.
+        Sketch::TopK(t) => {
+            96 + t.buckets.len() as u64 * 8
+                + t.heap
+                    .iter()
+                    .map(|s| TOPK_SLOT as u64 + 11 + s.item.as_ref().map_or(0, |i| i.len() as u64))
+                    .sum::<u64>()
+        }
+        // Type, module ID, seven fields, the end, version and CRC: under
+        // 128. Each sub-filter: two fields and a string head, its bytes.
+        Sketch::Cuckoo(cf) => 128 + cf.filters.len() as u64 * 32 + cf.data_bytes(),
+        // Not written in Redis's format (see `dumps_as_redis`).
+        Sketch::TDigest(_) => 0,
     }
 }
 
@@ -129,6 +246,24 @@ pub fn dump_payload(sketch: &Sketch) -> io::Result<Vec<u8>> {
         Sketch::Bloom(chain) => {
             w.len(module_id(BLOOM_TYPE, BLOOM_ENCVER));
             write_bloom(&mut w, chain);
+        }
+        Sketch::CountMin(cms) => {
+            w.len(module_id(CMS_TYPE, CMS_ENCVER));
+            write_cms(&mut w, cms);
+        }
+        Sketch::TopK(t) => {
+            w.len(module_id(TOPK_TYPE, TOPK_ENCVER));
+            write_topk(&mut w, t);
+        }
+        Sketch::Cuckoo(cf) => {
+            w.len(module_id(CUCKOO_TYPE, CUCKOO_ENCVER));
+            write_cuckoo(&mut w, cf);
+        }
+        Sketch::TDigest(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "t-digests are not written in Redis's format",
+            ));
         }
     }
     w.len(OPCODE_EOF);
@@ -152,6 +287,130 @@ fn no_memory() -> io::Error {
 }
 
 // ── Reading ─────────────────────────────────────────────────────────────
+
+/// The encoding of an LZF-compressed string, after the length's marker.
+const RDB_ENC_LZF: u64 = 3;
+
+/// The most bytes LZF makes of each one it reads: 264 from a back reference
+/// of 3, at most.
+const LZF_MOST_PER_BYTE: u64 = 88;
+
+/// An RDB string of at most `max_len` bytes, plain or LZF-compressed: one
+/// longer than its declared shape is refused by the length it declares
+/// (and a compressed one by what its compressed bytes can make), before
+/// anything of that length is reserved; only the bytes the stream holds are
+/// read.
+fn rdb_read_string_at_most(r: &mut impl Read, max_len: u64) -> io::Result<Vec<u8>> {
+    let longer = || super::invalid("a string longer than its declared shape");
+    let (n, encoded) = rdb_length(r)?;
+    if !encoded {
+        if n > max_len {
+            return Err(longer());
+        }
+        return super::read_vec(r, usize::try_from(n).map_err(|_| longer())?);
+    }
+    rdb_read_compressed_at_most(r, n, max_len)
+}
+
+/// [`rdb_read_string_at_most`] once its length's marker says it is encoded
+/// (`n`, the encoding): an LZF-compressed string of at most `max_len`.
+fn rdb_read_compressed_at_most(r: &mut impl Read, n: u64, max_len: u64) -> io::Result<Vec<u8>> {
+    let longer = || super::invalid("a string longer than its declared shape");
+    if n != RDB_ENC_LZF {
+        return Err(super::invalid("a string of an unexpected encoding"));
+    }
+    let (compressed, _) = rdb_length(r)?;
+    let (original, _) = rdb_length(r)?;
+    if original > max_len {
+        return Err(longer());
+    }
+    // Redis compresses a string only if that makes it shorter.
+    if compressed == 0
+        || compressed >= original
+        || original > compressed.saturating_mul(LZF_MOST_PER_BYTE)
+    {
+        return Err(super::invalid("a compressed string of a bad length"));
+    }
+    let data = super::read_vec(r, compressed as usize)?;
+    lzf_decompress(&data, original as usize)
+}
+
+/// `data`, LZF-compressed as Redis compresses a string (liblzf's format: a
+/// run of up to 32 literal bytes, or a copy of 3 to 264 bytes from up to
+/// 8 KiB back), decompressed to exactly `original` bytes, into memory that
+/// is asked for (not assumed): an error, not an abort, if it cannot be had.
+fn lzf_decompress(data: &[u8], original: usize) -> io::Result<Vec<u8>> {
+    let bad = || super::invalid("a compressed string that does not decompress");
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(original).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "no memory for a compressed string",
+        )
+    })?;
+    let mut at = 0;
+    while at < data.len() {
+        let ctrl = usize::from(data[at]);
+        at += 1;
+        if ctrl < 32 {
+            let run = ctrl + 1;
+            let literal = data.get(at..at + run).ok_or_else(bad)?;
+            if out.len() + run > original {
+                return Err(bad());
+            }
+            out.extend_from_slice(literal);
+            at += run;
+            continue;
+        }
+        let mut len = ctrl >> 5;
+        if len == 7 {
+            len += usize::from(*data.get(at).ok_or_else(bad)?);
+            at += 1;
+        }
+        let back = ((ctrl & 0x1f) << 8) + usize::from(*data.get(at).ok_or_else(bad)?) + 1;
+        at += 1;
+        let len = len + 2;
+        if back > out.len() || out.len() + len > original {
+            return Err(bad());
+        }
+        // Byte by byte: a copy may overlap what it makes.
+        let from = out.len() - back;
+        for i in 0..len {
+            let byte = out[from + i];
+            out.push(byte);
+        }
+    }
+    if out.len() != original {
+        return Err(bad());
+    }
+    Ok(out)
+}
+
+/// An RDB length, and whether it is a special encoding's number instead.
+fn rdb_length(r: &mut impl Read) -> io::Result<(u64, bool)> {
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b)?;
+    Ok(match b[0] >> 6 {
+        0 => (u64::from(b[0] & 0x3f), false),
+        1 => {
+            let mut next = [0u8; 1];
+            r.read_exact(&mut next)?;
+            ((u64::from(b[0] & 0x3f) << 8) | u64::from(next[0]), false)
+        }
+        2 if b[0] == 0x80 => {
+            let mut v = [0u8; 4];
+            r.read_exact(&mut v)?;
+            (u64::from(u32::from_be_bytes(v)), false)
+        }
+        2 if b[0] == 0x81 => {
+            let mut v = [0u8; 8];
+            r.read_exact(&mut v)?;
+            (u64::from_be_bytes(v), false)
+        }
+        2 => return Err(super::invalid("an RDB length of an unknown form")),
+        _ => (u64::from(b[0] & 0x3f), true),
+    })
+}
 
 struct Reader<'r, R: Read> {
     r: &'r mut R,
@@ -188,9 +447,65 @@ impl<R: Read> Reader<'_, R> {
         Ok(f64::from_le_bytes(b))
     }
 
-    fn string(&mut self) -> io::Result<Vec<u8>> {
+    /// A string that must be `len` bytes, plain or LZF-compressed as Redis
+    /// writes one (`mismatch` if it is another length): no longer than
+    /// that is read or reserved ([`rdb_read_string_at_most`]).
+    fn string_of(&mut self, len: u64, mismatch: &str) -> io::Result<Vec<u8>> {
         self.opcode(OPCODE_STRING)?;
-        crate::snapshot::rdb_read_string(self.r)
+        match rdb_read_string_at_most(self.r, len) {
+            Ok(s) if s.len() as u64 == len => Ok(s),
+            Ok(_) => Err(self.bad(mismatch)),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => Err(self.bad(mismatch)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`Reader::string_of`], for a string of `len` bytes that `plain`
+    /// reads into what it makes straight from the stream when it is not
+    /// compressed (the bytes are then never held whole beside it), and
+    /// `whole` makes it from when it is (decompressed first).
+    fn string_as<T>(
+        &mut self,
+        len: u64,
+        mismatch: &str,
+        plain: impl FnOnce(&mut R) -> io::Result<T>,
+        whole: impl FnOnce(&[u8]) -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.opcode(OPCODE_STRING)?;
+        let (n, encoded) = rdb_length(self.r)?;
+        if !encoded {
+            if n != len {
+                return Err(self.bad(mismatch));
+            }
+            return plain(self.r);
+        }
+        match rdb_read_compressed_at_most(self.r, n, len) {
+            Ok(s) if s.len() as u64 == len => whole(&s),
+            Ok(_) => Err(self.bad(mismatch)),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => Err(self.bad(mismatch)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Past a string, plain or LZF-compressed, without holding it: what a
+    /// reader only asked the size of skips.
+    fn skip_string(&mut self) -> io::Result<()> {
+        self.opcode(OPCODE_STRING)?;
+        let (n, encoded) = rdb_length(self.r)?;
+        let len = if !encoded {
+            n
+        } else if n == RDB_ENC_LZF {
+            let (compressed, _) = rdb_length(self.r)?;
+            let (_original, _) = rdb_length(self.r)?;
+            compressed
+        } else {
+            return Err(super::invalid("a string of an unexpected encoding"));
+        };
+        let skipped = io::copy(&mut Read::take(&mut *self.r, len), &mut io::sink())?;
+        if skipped != len {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        Ok(())
     }
 
     fn end(&mut self) -> io::Result<()> {
@@ -229,10 +544,22 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
         if let Some(why) = super::bloom::over_limits(claimed) {
             return Err(r.bad(&why));
         }
-        // Then by what was read (a compressed string's length is its own
-        // word, not the layer's): its bits must be its bytes times 8, and
-        // its bytes are what is charged.
-        let data = r.string()?;
+        if bits % 8 != 0 {
+            return Err(r.bad("a layer's bytes do not match its bits"));
+        }
+        // Room for the layer, as it comes (the layers before it are counted
+        // already); only asked, the layers are added up and skipped.
+        if super::room::declared_part(bits / 8)? {
+            r.skip_string()?;
+            used.bytes = claimed.bytes;
+            used.hashes = claimed.hashes;
+            r.uint()?;
+            continue;
+        }
+        // Then by what was read: its bits must be its bytes times 8, and no
+        // more than those bytes is read or reserved (a compressed string's
+        // length is its own word: what it makes is held to them too).
+        let data = r.string_of(bits / 8, "a layer's bytes do not match its bits")?;
         if (data.len() as u64).checked_mul(8) != Some(bits) {
             return Err(r.bad("a layer's bytes do not match its bits"));
         }
@@ -255,6 +582,7 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
         datas.push(data);
     }
     r.end()?;
+    super::room::declared_end()?;
     // The layers are the strings read: nothing more is allocated, and
     // neither `maxmemory` nor `bloom-max-filter-bytes` is consulted (a
     // file, a full sync or a `RESTORE` is taken whole).
@@ -268,6 +596,145 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
         Err(ShapeError::Bad) => Err(r.bad("the layers do not fit together")),
         Err(_) => Err(r.bad("a layer is too large to load")),
     }
+}
+
+/// A Count-min sketch [`write_cms`] (or Redis) wrote: its shape is checked
+/// against the size limits before its counters are read, and the counters
+/// must be exactly `width × depth` words.
+fn read_cms(r: &mut Reader<'_, impl Read>) -> io::Result<CountMin> {
+    let width = r.uint()?;
+    let depth = r.uint()?;
+    let count = r.uint()?;
+    if !super::cms::fits(width, depth) {
+        return Err(r.bad("a sketch over the size limits is not supported"));
+    }
+    super::room::declared(width * depth * 4)?;
+    let n = (width * depth) as usize;
+    let counters = r.string_as(
+        width * depth * 4,
+        "the counters do not match the width and depth",
+        |s| super::cms::counters_from_reader(s, n),
+        super::cms::counters_from_bytes,
+    )?;
+    r.end()?;
+    Ok(CountMin {
+        width,
+        depth,
+        count,
+        counters,
+    })
+}
+
+/// The longest item a Top-K sketch read is let have: as long as a client's
+/// command may send (`proto-max-bulk-len`'s default, 512 MiB).
+const MAX_ITEM_BYTES: u64 = 512 << 20;
+
+/// A Top-K sketch [`write_topk`] (or Redis) wrote: its shape is checked
+/// against the size limits before anything sized by it is read; the
+/// buckets and places must be exactly what the shape says, and each item
+/// its place's length and a zero byte.
+fn read_topk(r: &mut Reader<'_, impl Read>) -> io::Result<TopK> {
+    let k = r.uint()?;
+    let width = r.uint()?;
+    let depth = r.uint()?;
+    let decay = r.double()?;
+    if !super::topk::fits(k, width, depth) || !super::topk::decay_ok(decay) {
+        return Err(r.bad("a sketch over the size limits is not supported"));
+    }
+    super::room::declared((width * depth * 8).saturating_add(k * TOPK_SLOT as u64))?;
+    let n = (width * depth) as usize;
+    let buckets = r.string_as(
+        width * depth * 8,
+        "the buckets do not match the width and depth",
+        |s| super::topk::buckets_from_reader(s, n),
+        super::topk::buckets_from_bytes,
+    )?;
+    let places = r.string_of(k * TOPK_SLOT as u64, "the heap does not match k")?;
+    let mut heap = Vec::with_capacity(k as usize);
+    for place in places.as_chunks::<TOPK_SLOT>().0 {
+        let word = |at: usize| {
+            u32::from_le_bytes([place[at], place[at + 1], place[at + 2], place[at + 3]])
+        };
+        let (fp, len, count) = (word(0), word(4), word(16));
+        if u64::from(len) > MAX_ITEM_BYTES {
+            return Err(r.bad("an item longer than its declared shape"));
+        }
+        let mut item = r.string_of(u64::from(len) + 1, "an item does not match its length")?;
+        if item.pop() != Some(0) {
+            return Err(r.bad("an item does not end in a zero byte"));
+        }
+        // An empty place: no item, no fingerprint, no count.
+        let empty = item.is_empty() && fp == 0 && count == 0;
+        heap.push(Slot {
+            fp,
+            count,
+            item: (!empty).then(|| std::sync::Arc::from(item.into_boxed_slice())),
+        });
+    }
+    r.end()?;
+    Ok(TopK::from_parts(
+        k as u32,
+        width as u32,
+        depth as u32,
+        decay,
+        buckets,
+        heap,
+        super::topk::RNG_START,
+    ))
+}
+
+/// A Cuckoo filter [`write_cuckoo`] (or Redis) wrote: its shape is checked
+/// against the size limits before any sub-filter's bytes are read, and
+/// each sub-filter must have the buckets its place in the chain gives and
+/// exactly their bytes.
+fn read_cuckoo(r: &mut Reader<'_, impl Read>) -> io::Result<Cuckoo> {
+    let filters = r.uint()?;
+    let buckets = r.uint()?;
+    let items = r.uint()?;
+    let deletes = r.uint()?;
+    let to16 = |v: u64| u16::try_from(v).ok();
+    let bucket_size = to16(r.uint()?).ok_or_else(|| r.bad("a field is out of range"))?;
+    let max_iterations = to16(r.uint()?).ok_or_else(|| r.bad("a field is out of range"))?;
+    let expansion = to16(r.uint()?).ok_or_else(|| r.bad("a field is out of range"))?;
+    let shape = Shape {
+        items,
+        buckets,
+        deletes,
+        filters,
+        bucket_size,
+        max_iterations,
+        expansion,
+    };
+    let bytes = shape
+        .check()
+        .map_err(|_| r.bad("a filter of this shape is not supported"))?;
+    super::room::declared(bytes)?;
+    let mut subs = Vec::with_capacity(filters as usize);
+    let mut want = buckets;
+    for _ in 0..filters {
+        let n = r.uint()?;
+        if n != want {
+            return Err(r.bad("a sub-filter's buckets do not follow from the first's"));
+        }
+        let data = r.string_of(
+            n * u64::from(bucket_size),
+            "a sub-filter's bytes do not match its buckets",
+        )?;
+        subs.push(SubFilter {
+            buckets: n,
+            data: std::sync::Arc::new(data.into_boxed_slice()),
+        });
+        want = want.saturating_mul(u64::from(expansion.max(1)));
+    }
+    r.end()?;
+    Ok(Cuckoo {
+        items,
+        deletes,
+        bucket_size,
+        max_iterations,
+        expansion,
+        filters: subs,
+    })
 }
 
 /// The value of module type `name` (encoding version `encver`) from an
@@ -287,6 +754,42 @@ pub fn read(name: &str, encver: u64, r: &mut impl Read) -> io::Result<Option<Ske
             };
             Ok(Some(Sketch::Bloom(read_bloom(&mut reader)?)))
         }
+        CMS_TYPE => {
+            if encver != CMS_ENCVER {
+                return Err(super::invalid(&format!(
+                    "Count-min sketch encoding version {encver} is not supported"
+                )));
+            }
+            let mut reader = Reader {
+                r,
+                what: "Count-min sketch",
+            };
+            Ok(Some(Sketch::CountMin(read_cms(&mut reader)?)))
+        }
+        TOPK_TYPE => {
+            if encver != TOPK_ENCVER {
+                return Err(super::invalid(&format!(
+                    "Top-K sketch encoding version {encver} is not supported"
+                )));
+            }
+            let mut reader = Reader {
+                r,
+                what: "Top-K sketch",
+            };
+            Ok(Some(Sketch::TopK(read_topk(&mut reader)?)))
+        }
+        CUCKOO_TYPE => {
+            if encver != CUCKOO_ENCVER {
+                return Err(super::invalid(&format!(
+                    "Cuckoo filter encoding version {encver} is not supported"
+                )));
+            }
+            let mut reader = Reader {
+                r,
+                what: "Cuckoo filter",
+            };
+            Ok(Some(Sketch::Cuckoo(read_cuckoo(&mut reader)?)))
+        }
         _ => Ok(None),
     }
 }
@@ -295,6 +798,62 @@ pub fn read(name: &str, encver: u64, r: &mut impl Read) -> io::Result<Option<Ske
 mod tests {
     use super::*;
     use crate::sketch::bloom::{BloomChain, Params};
+
+    /// `value` (a module value as [`super::read`] takes it) with the plain
+    /// string whose opcode is at `at` LZF-compressed, as Redis writes one:
+    /// that one, then the same claiming another original or compressed
+    /// length (every one to be refused), then with its compressed bytes
+    /// damaged (to be refused, or read within the limits).
+    fn lzf_variants(
+        value: &[u8],
+        at: usize,
+        next: &mut impl FnMut() -> u64,
+    ) -> (Vec<u8>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut r = &value[at + 1..];
+        let (len, encoded) = rdb_length(&mut r).unwrap();
+        assert!(!encoded);
+        let (data, rest) = r.split_at(len as usize);
+        let compressed = lzf::compress(data).unwrap();
+        let build = |original: u64, clen: u64, bytes: &[u8]| {
+            let mut w = Writer {
+                out: value[..at + 1].to_vec(),
+            };
+            w.out.push(0xc0 | RDB_ENC_LZF as u8);
+            w.len(clen);
+            w.len(original);
+            w.out.extend_from_slice(bytes);
+            w.out.extend_from_slice(rest);
+            w.out
+        };
+        let clen = compressed.len() as u64;
+        let good = build(len, clen, &compressed);
+        let wrong = [
+            (len - 1, clen),
+            (len + 1, clen),
+            (1 << 40, clen),
+            (u64::MAX, clen),
+            (len, 0),
+            (len, len),
+            (len, 1 << 40),
+            (len, clen - 1),
+        ]
+        .into_iter()
+        .map(|(original, c)| build(original, c, &compressed))
+        .collect();
+        let damaged = (0..2000)
+            .map(|_| {
+                let mut c = compressed.clone();
+                if next().is_multiple_of(2) {
+                    let i = next() as usize % c.len();
+                    c[i] = next() as u8;
+                } else {
+                    c.truncate(next() as usize % c.len());
+                }
+                build(len, c.len() as u64, &c)
+            })
+            .collect();
+        (good, wrong, damaged)
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -335,6 +894,405 @@ mod tests {
             assert!(err.to_string().contains("do not match"), "{len}: {err}");
         }
     }
+
+    /// `DUMP h` on Redis 8.10.2 after `CMS.INITBYDIM h 1000 5` and
+    /// `CMS.INCRBY h hello 1`: read, it is the sketch KiviDB builds from the
+    /// same commands (so the placement is Redis's); written, the same
+    /// fields, the counters as a plain string rather than LZF.
+    const CMS_DUMP: &str = "078108c4a4f9360f10000243e80205020105c340f88000004e20010000e0ff00e0ff00e051000001e0515ae0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e03800f3ff2be0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e05300ebffb3e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e02b00edff9be0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e07f00efffffe0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0ff00e0bd00010000000f007b16b8c25045f969";
+
+    #[test]
+    fn cms_dump_from_redis() {
+        let payload = hex(CMS_DUMP);
+        let body = &payload[1..payload.len() - 10];
+        let mut r = body;
+        let id = crate::snapshot::rdb_read_plain_length(&mut r).unwrap();
+        assert_eq!(id, module_id(CMS_TYPE, 0));
+        let Some(Sketch::CountMin(read)) = super::read(CMS_TYPE, 0, &mut r).unwrap() else {
+            panic!("not a sketch");
+        };
+        assert!(r.is_empty());
+        let mut ours = CountMin::new(1000, 5).unwrap();
+        ours.incr_by(b"hello", 1).unwrap();
+        assert_eq!(read, ours);
+        let written = dump_payload(&Sketch::CountMin(ours.clone())).unwrap();
+        let mut back = &written[1..written.len() - 10];
+        let id = crate::snapshot::rdb_read_plain_length(&mut back).unwrap();
+        assert_eq!(id, module_id(CMS_TYPE, 0));
+        let Some(Sketch::CountMin(again)) = super::read(CMS_TYPE, 0, &mut back).unwrap() else {
+            panic!("not a sketch");
+        };
+        assert_eq!(again, ours);
+    }
+
+    /// A Count-min value with a corrupt byte, cut short, or claiming a huge
+    /// shape is refused, or read as a sketch within the limits; never a
+    /// panic, nor an allocation the payload does not back.
+    #[test]
+    fn corrupt_cms_values_are_refused_cleanly() {
+        let mut cms = CountMin::new(20, 3).unwrap();
+        for i in 0..40 {
+            cms.incr_by(format!("{i}").as_bytes(), i).unwrap();
+        }
+        let mut w = Writer { out: Vec::new() };
+        write_cms(&mut w, &cms);
+        w.len(OPCODE_EOF);
+        let good = w.out;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..4000 {
+            let mut bad = good.clone();
+            match next() % 3 {
+                0 => {
+                    let at = next() as usize % bad.len();
+                    bad[at] = next() as u8;
+                }
+                1 => bad.truncate(next() as usize % bad.len()),
+                _ => {
+                    // A width or depth of up to 64 bits.
+                    let mut w = Writer { out: Vec::new() };
+                    w.uint(next() >> (next() % 64));
+                    w.uint(next() >> (next() % 64));
+                    w.uint(0);
+                    w.string(&[0u8; 16]);
+                    w.len(OPCODE_EOF);
+                    bad = w.out;
+                }
+            }
+            if let Ok(Some(Sketch::CountMin(read))) = super::read(CMS_TYPE, 0, &mut &bad[..]) {
+                assert!(super::super::cms::fits(read.width, read.depth));
+                assert_eq!(read.counters.len() as u64, read.width * read.depth);
+            }
+        }
+        // The counters LZF-compressed, as Redis writes them: read as the
+        // plain ones are; with a corrupt byte, or claiming another (or a
+        // huge) length, compressed or original, refused before anything of
+        // that length is allocated.
+        let plain: Vec<u8> = (0..60u32).flat_map(|i| (i % 7).to_le_bytes()).collect();
+        let compressed = lzf::compress(&plain).unwrap();
+        let lzf_value = |original: u64, clen: u64, data: &[u8]| {
+            let mut w = Writer { out: Vec::new() };
+            w.uint(20);
+            w.uint(3);
+            w.uint(0);
+            w.len(OPCODE_STRING);
+            w.out.push(0xc0 | RDB_ENC_LZF as u8);
+            w.len(clen);
+            w.len(original);
+            w.out.extend_from_slice(data);
+            w.len(OPCODE_EOF);
+            w.out
+        };
+        let read = |value: Vec<u8>| super::read(CMS_TYPE, 0, &mut &value[..]);
+        let clen = compressed.len() as u64;
+        let Ok(Some(Sketch::CountMin(read_back))) = read(lzf_value(240, clen, &compressed)) else {
+            panic!("compressed counters not read");
+        };
+        assert_eq!(read_back.counters.len(), 60);
+        for (original, clen) in [
+            (239, clen),
+            (241, clen),
+            (1 << 40, clen),
+            (u64::MAX, clen),
+            (240, 0),
+            (240, 240),
+            (240, 1 << 40),
+            (240, clen - 1),
+        ] {
+            assert!(read(lzf_value(original, clen, &compressed)).is_err());
+        }
+        for _ in 0..4000 {
+            let mut data = compressed.clone();
+            match next() % 2 {
+                0 => {
+                    let at = next() as usize % data.len();
+                    data[at] = next() as u8;
+                }
+                _ => data.truncate(next() as usize % data.len()),
+            }
+            let n = data.len() as u64;
+            if let Ok(Some(Sketch::CountMin(got))) = read(lzf_value(240, n, &data)) {
+                assert_eq!(got.counters.len(), 60);
+            }
+        }
+    }
+
+    /// `DUMP t2` on Redis 8.10.2 after `TOPK.RESERVE t2 2 3 1 1` and
+    /// `TOPK.ADD t2 hello`: read, it is the sketch KiviDB builds from the
+    /// same commands; written and read again, the same sketch.
+    #[test]
+    fn topk_dump_from_redis() {
+        let payload = hex(TOPK_DUMP);
+        let body = &payload[1..payload.len() - 10];
+        let mut r = body;
+        let id = crate::snapshot::rdb_read_plain_length(&mut r).unwrap();
+        assert_eq!(id, module_id(TOPK_TYPE, 0));
+        let Some(Sketch::TopK(read)) = super::read(TOPK_TYPE, 0, &mut r).unwrap() else {
+            panic!("not a sketch");
+        };
+        assert!(r.is_empty());
+        let mut ours = TopK::new(2, 3, 1, 1.0).unwrap();
+        ours.incr_by(b"hello", 1).unwrap();
+        assert_eq!(read, ours);
+        let written = dump_payload(&Sketch::TopK(ours.clone())).unwrap();
+        let mut back = &written[1..written.len() - 10];
+        crate::snapshot::rdb_read_plain_length(&mut back).unwrap();
+        let Some(Sketch::TopK(again)) = super::read(TOPK_TYPE, 0, &mut back).unwrap() else {
+            panic!("not a sketch");
+        };
+        assert_eq!(again, ours);
+        assert!(back.is_empty());
+    }
+
+    /// Corrupted Top-K values are refused, or read as a sketch within the
+    /// limits; never a panic.
+    #[test]
+    fn corrupt_topk_values_are_refused_cleanly() {
+        let mut t = TopK::new(3, 5, 2, 0.9).unwrap();
+        for i in 0..30 {
+            t.incr_by(format!("{}", i % 7).as_bytes(), 1).unwrap();
+        }
+        let mut w = Writer { out: Vec::new() };
+        write_topk(&mut w, &t);
+        w.len(OPCODE_EOF);
+        let good = w.out;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..4000 {
+            let mut bad = good.clone();
+            match next() % 3 {
+                0 => {
+                    let at = next() as usize % bad.len();
+                    bad[at] = next() as u8;
+                }
+                1 => bad.truncate(next() as usize % bad.len()),
+                _ => {
+                    let mut w = Writer { out: Vec::new() };
+                    w.uint(next() >> (next() % 64));
+                    w.uint(next() >> (next() % 64));
+                    w.uint(next() >> (next() % 64));
+                    w.double(0.9);
+                    w.string(&[0u8; 16]);
+                    w.len(OPCODE_EOF);
+                    bad = w.out;
+                }
+            }
+            if let Ok(Some(Sketch::TopK(read))) = super::read(TOPK_TYPE, 0, &mut &bad[..]) {
+                assert!(super::super::topk::fits(
+                    u64::from(read.k),
+                    u64::from(read.width),
+                    u64::from(read.depth)
+                ));
+                assert_eq!(read.heap.len(), read.k as usize);
+            }
+        }
+        // The buckets LZF-compressed, as Redis writes them.
+        let mut w = Writer { out: Vec::new() };
+        w.uint(3);
+        w.uint(5);
+        w.uint(2);
+        w.double(0.9);
+        let (compressed, wrong, damaged) = lzf_variants(&good, w.out.len(), &mut next);
+        let Ok(Some(Sketch::TopK(read))) = super::read(TOPK_TYPE, 0, &mut &compressed[..]) else {
+            panic!("compressed buckets not read");
+        };
+        assert_eq!(read.buckets, t.buckets);
+        for bad in wrong {
+            assert!(super::read(TOPK_TYPE, 0, &mut &bad[..]).is_err());
+        }
+        for bad in damaged {
+            if let Ok(Some(Sketch::TopK(read))) = super::read(TOPK_TYPE, 0, &mut &bad[..]) {
+                assert_eq!(read.buckets.len(), 10);
+            }
+        }
+    }
+
+    /// An item longer than an item may be, or than its place says, is
+    /// refused by what it declares: a payload of a few bytes declaring one
+    /// of gigabytes reserves nothing of that size.
+    #[test]
+    fn items_longer_than_their_shape_are_refused() {
+        let t = TopK::new(1, 2, 1, 1.0).unwrap();
+        let value = |len: u32, item: &[u8]| {
+            let mut w = Writer { out: Vec::new() };
+            w.uint(1);
+            w.uint(2);
+            w.uint(1);
+            w.double(1.0);
+            let buckets = vec![0u8; 2 * 8];
+            w.string(&buckets);
+            let mut place = vec![0u8; TOPK_SLOT];
+            place[0..4].copy_from_slice(&7u32.to_le_bytes());
+            place[4..8].copy_from_slice(&len.to_le_bytes());
+            place[16..20].copy_from_slice(&3u32.to_le_bytes());
+            w.string(&place);
+            w.out.extend_from_slice(item);
+            w.len(OPCODE_EOF);
+            w.out
+        };
+        let _ = &t;
+        let read = |v: Vec<u8>| super::read(TOPK_TYPE, 0, &mut &v[..]);
+        // As it should be: "ab" and its zero byte.
+        let mut w = Writer { out: Vec::new() };
+        w.string(b"ab\0");
+        assert!(read(value(2, &w.out)).is_ok());
+        // Declared huge, plain or compressed, with a few bytes behind.
+        for len in [u32::MAX, (512 << 20) + 1, 1 << 30] {
+            let mut w = Writer { out: Vec::new() };
+            w.len(OPCODE_STRING);
+            w.len(u64::from(len) + 1);
+            w.out.extend_from_slice(b"ab");
+            assert!(read(value(len, &w.out)).is_err(), "{len}");
+            let mut w = Writer { out: Vec::new() };
+            w.len(OPCODE_STRING);
+            w.out.push(0xc0 | RDB_ENC_LZF as u8);
+            w.len(4);
+            w.len(u64::from(len) + 1);
+            w.out.extend_from_slice(&[1, b'a', b'b', 0]);
+            assert!(read(value(len, &w.out)).is_err(), "{len}");
+        }
+        // Within the limit, but more than its compressed bytes can make.
+        let mut w = Writer { out: Vec::new() };
+        w.len(OPCODE_STRING);
+        w.out.push(0xc0 | RDB_ENC_LZF as u8);
+        w.len(4);
+        w.len(100_001);
+        w.out.extend_from_slice(&[1, b'a', b'b', 0]);
+        assert!(read(value(100_000, &w.out)).is_err());
+    }
+
+    const TOPK_DUMP: &str = "07814e8a4af9360f100002020203020104000000000000f03f05c30d180503ad4d230100e0070001000005c31e30010000e00d000403ad4d2305201a0898d02582407e000001200b20000000050100050668656c6c6f00000f005531a20539918c1c";
+
+    /// `DUMP d` on Redis 8.10.2 after `CF.RESERVE d 24 BUCKETSIZE 3
+    /// EXPANSION 4 MAXITERATIONS 7`, 40 `CF.ADD`s of `x0` to `x39` and `CF.DEL
+    /// d x1`: read, it is the filter KiviDB builds from the same commands;
+    /// written, the same bytes but the trailer.
+    #[test]
+    fn cuckoo_dump_from_redis() {
+        let payload = hex(CUCKOO_DUMP);
+        let body = &payload[1..payload.len() - 10];
+        let mut r = body;
+        let id = crate::snapshot::rdb_read_plain_length(&mut r).unwrap();
+        assert_eq!(id, module_id(CUCKOO_TYPE, 4));
+        let Some(Sketch::Cuckoo(read)) = super::read(CUCKOO_TYPE, 4, &mut r).unwrap() else {
+            panic!("not a filter");
+        };
+        assert!(r.is_empty());
+        let mut ours = Cuckoo::new(super::super::cuckoo::Params {
+            capacity: 24,
+            bucket_size: 3,
+            max_iterations: 7,
+            expansion: 4,
+        })
+        .unwrap();
+        for i in 0..40 {
+            ours.insert(super::super::cuckoo::lookup(format!("x{i}").as_bytes()), 32)
+                .unwrap();
+        }
+        ours.delete(super::super::cuckoo::lookup(b"x1")).unwrap();
+        assert_eq!(read, ours);
+        let written = dump_payload(&Sketch::Cuckoo(ours)).unwrap();
+        let mut back = &written[1..written.len() - 10];
+        crate::snapshot::rdb_read_plain_length(&mut back).unwrap();
+        let Some(Sketch::Cuckoo(again)) = super::read(CUCKOO_TYPE, 4, &mut back).unwrap() else {
+            panic!("not a filter");
+        };
+        assert_eq!(again, read);
+    }
+
+    /// Corrupted Cuckoo values are refused, or read as a filter within the
+    /// limits; never a panic.
+    #[test]
+    fn corrupt_cuckoo_values_are_refused_cleanly() {
+        let good = hex(CUCKOO_DUMP);
+        let good = &good[10..good.len() - 10];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..4000 {
+            let mut bad = good.to_vec();
+            match next() % 3 {
+                0 => {
+                    let at = next() as usize % bad.len();
+                    bad[at] = next() as u8;
+                }
+                1 => bad.truncate(next() as usize % bad.len()),
+                _ => {
+                    let mut w = Writer { out: Vec::new() };
+                    for _ in 0..7 {
+                        w.uint(next() >> (next() % 64));
+                    }
+                    w.uint(next() >> (next() % 64));
+                    w.string(&[0u8; 16]);
+                    w.len(OPCODE_EOF);
+                    bad = w.out;
+                }
+            }
+            if let Ok(Some(Sketch::Cuckoo(read))) = super::read(CUCKOO_TYPE, 4, &mut &bad[..]) {
+                assert!(read.data_bytes() <= super::super::cuckoo::MAX_BYTES);
+                assert!(!read.filters.is_empty());
+            }
+        }
+        // A sub-filter's bytes LZF-compressed, as Redis writes them.
+        let mut cf = Cuckoo::new(super::super::cuckoo::Params {
+            capacity: 1024,
+            bucket_size: 2,
+            max_iterations: 20,
+            expansion: 1,
+        })
+        .unwrap();
+        for i in 0..20 {
+            let l = super::super::cuckoo::lookup(format!("{i}").as_bytes());
+            cf.insert(l, 8).unwrap();
+        }
+        let mut w = Writer { out: Vec::new() };
+        write_cuckoo(&mut w, &cf);
+        w.len(OPCODE_EOF);
+        let plain = w.out;
+        let mut w = Writer { out: Vec::new() };
+        for v in [
+            cf.filters.len() as u64,
+            cf.filters[0].buckets,
+            cf.items,
+            cf.deletes,
+            u64::from(cf.bucket_size),
+            u64::from(cf.max_iterations),
+            u64::from(cf.expansion),
+            cf.filters[0].buckets,
+        ] {
+            w.uint(v);
+        }
+        let (compressed, wrong, damaged) = lzf_variants(&plain, w.out.len(), &mut next);
+        let Ok(Some(Sketch::Cuckoo(read))) = super::read(CUCKOO_TYPE, 4, &mut &compressed[..])
+        else {
+            panic!("compressed filter not read");
+        };
+        assert_eq!(read, cf);
+        for bad in wrong {
+            assert!(super::read(CUCKOO_TYPE, 4, &mut &bad[..]).is_err());
+        }
+        for bad in damaged {
+            if let Ok(Some(Sketch::Cuckoo(read))) = super::read(CUCKOO_TYPE, 4, &mut &bad[..]) {
+                assert_eq!(read.data_bytes(), cf.data_bytes());
+            }
+        }
+    }
+
+    const CUCKOO_DUMP: &str = "07813016e5a289821404020202080227020102030207020402080518ce62a000e214c07bc5b2287cfc65b328da864700003f12ac022005c33c4060010000e00400005c600d004d6005e006000036e0050f0ac200001d0000b5fbdef830401803a10000cf40070b00ea14007200005d00001cb1200d0000000f0038111f3ba6bb5b4f";
 
     #[test]
     fn bloom_module_id() {

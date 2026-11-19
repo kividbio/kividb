@@ -5765,7 +5765,9 @@ pub fn dump_payload(value: &KiviDBValue) -> io::Result<Vec<u8>> {
     // while the payload is laid out and its CRC taken.
     if let KiviDBValue::Sketch(sketch) = value {
         let copy = sketch.read().clone();
-        return crate::sketch::redis_module::dump_payload(&copy);
+        if crate::sketch::redis_module::dumps_as_redis(&copy) {
+            return crate::sketch::redis_module::dump_payload(&copy);
+        }
     }
     // A time series goes without its links to other series, its compaction
     // rules and the series it is a compaction of, as RedisTimeSeries leaves
@@ -5833,6 +5835,14 @@ impl RestoreError {
             RestoreError::BadData => "ERR Bad data format",
         }
     }
+}
+
+/// Whether a `DUMP` payload may hold a probabilistic value: one whose value
+/// is a module's in Redis's encoding (`RDB_TYPE_MODULE_2`), or a sketch in
+/// KiviDB's. Only those are asked what they allocate before a `RESTORE`
+/// runs (`sketch::room`).
+pub fn payload_may_hold_sketch(payload: &[u8]) -> bool {
+    matches!(payload.first(), Some(&7) | Some(&crate::sketch::TAG_SKETCH))
 }
 
 pub fn restore_payload_checked(payload: &[u8]) -> Result<KiviDBValue, RestoreError> {

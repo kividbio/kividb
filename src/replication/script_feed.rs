@@ -240,6 +240,9 @@ fn rewritten_for_propagation(
         // Sent naming the filter's parameters when it made the filter with
         // a setting of this node's: see `commands::bf`.
         "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.RESERVE" => crate::commands::bf::propagation(cmd),
+        "CF.ADD" | "CF.ADDNX" | "CF.INSERT" | "CF.INSERTNX" | "CF.RESERVE" => {
+            crate::commands::cf::propagation(cmd)
+        }
         "TS.MADD" => ts_madd_feed(cmd, resp),
         "TS.INCRBY" | "TS.DECRBY" => {
             ts_incrby_feed(cmd, resp, crate::commands::ts::applied_as_1_2_0(ctx, cmd))
