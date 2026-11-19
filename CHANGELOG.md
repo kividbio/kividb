@@ -1180,6 +1180,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A script running beside others under its hash tags is refused
+  `MIGRATE` (#340).** A `MIGRATE` holds back writes to the keys it moves
+  until they have left, and a script that runs beside others cannot take
+  that hold, so it fails with an error, as `KEYS` does in such a script.
+  A script that runs alone keeps `MIGRATE` and its hold.
 - **A command that waits for a script on its hash tag no longer holds up
   its thread (#882).** With `lua-parallel-scripts` on, a client's command
   on a key whose tag a script running beside others held waited on the
