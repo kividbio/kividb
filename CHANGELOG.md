@@ -486,6 +486,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   p99 of 0.07-0.12 ms at every background rate from 0 to 300,000 commands a
   second (Redis: 31.7-32.0k at 0.06-0.11 ms up to 150,000, 28.4k at 0.74 ms
   at 200,000, 24.3k at 0.91 ms at 300,000).
+- **A cluster reshard takes as long as before `nodes.conf` saves were made
+  durable, and they stay durable.** `redis-cli --cluster reshard` of 1,000
+  slots (suite `13-cluster-reshard` of `benchmarks/1.3.0/regressions`, 3
+  masters, 3,000,000 keys) took 38.3-40.2 s with every save synced and its
+  directory synced, and takes 27.2-27.8 s (27.4-28.6 s before saves were
+  synced), Azure `Standard_D4s_v5`, Xeon 8370C, three runs each on one VM. A
+  save on Linux now writes over the file an earlier save put out of place
+  (`nodes.conf.spare-<n>`, kept once the directory is synced, when it is no
+  longer nodes.conf on disk either), synced as it is written, and exchanges
+  it with nodes.conf (`renameat2` with `RENAME_EXCHANGE`, as atomic as a
+  rename) before the directory is synced: a new temporary file cost a
+  commit of the filesystem's journal of its own. nodes.conf is still
+  replaced whole, never written in place. `CLUSTER SETSLOT ... IMPORTING`,
+  `MIGRATING` and `STABLE`, which change nothing nodes.conf holds, are
+  answered without waiting for a save; `SETSLOT ... NODE` and the other
+  commands that change an owner or a node are answered once their save is
+  synced, as before. The fingerprint that tells whether the topology changed
+  hashes runs of slots, not all 16,384. A `SETSLOT ... NODE` takes 4.9 ms
+  on that disk, where it took 9.7-11.1 ms (5.2-6.0 ms before saves were
+  synced).
 
 - **`FT.AGGREGATE ... GROUPBY` over many documents is 3.8x faster, and a
   search index of many small documents takes 30 % less memory (part of

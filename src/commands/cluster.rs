@@ -1565,6 +1565,19 @@ fn before_slots_come(ctx: &Ctx, slots: &[u16], what: &str) -> Option<Vec<u8>> {
         .map(|e| resp_error(&e))
 }
 
+/// After `SETSLOT IMPORTING`, `MIGRATING` or `STABLE`: what the cluster
+/// serves from is brought up to date, and nodes.conf is saved in the
+/// background, not waited for. These change no slot's owner, no node and no
+/// epoch, nothing nodes.conf holds (a slot being migrated is not in it), so
+/// a save waited for here made nothing of the command's own durable. It
+/// cost the reply a save all the same, skipped as unchanged or, with another
+/// under way, written and synced: on two of the five commands a resharding
+/// sends for each slot. `SETSLOT NODE`, which changes an owner, is answered
+/// once its save is synced.
+fn migration_state_changed(ctx: &Ctx) {
+    ctx.cluster.save_soon();
+}
+
 fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
     let cmd = &ctx.cmd;
     if let Some(err) = require_cluster_mode(ctx.cluster) {
@@ -1616,7 +1629,7 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
             // `CLUSTER GETKEYSINSLOT` that comes next finds the key. One that
             // had not reached the gate is sent on with `-ASK`.
             drop(crate::write_gate::cut());
-            let _ = ctx.cluster.save_to_disk();
+            migration_state_changed(ctx);
             resp_simple("OK")
         }
         "IMPORTING" => {
@@ -1639,7 +1652,7 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
                 return resp_error(&format!("ERR {e}"));
             }
             slot_changed_state();
-            let _ = ctx.cluster.save_to_disk();
+            migration_state_changed(ctx);
             resp_simple("OK")
         }
         "STABLE" => {
@@ -1656,7 +1669,7 @@ fn cmd_setslot(ctx: &mut Ctx) -> Vec<u8> {
                 return resp_error(&format!("ERR {e}"));
             }
             slot_changed_state();
-            let _ = ctx.cluster.save_to_disk();
+            migration_state_changed(ctx);
             resp_simple("OK")
         }
         "NODE" => {

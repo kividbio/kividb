@@ -531,20 +531,31 @@ lists the new node without `handshake`; to have every member save it, wait
 until each one lists it, and send each `CLUSTER SAVECONFIG`.
 
 **How it is written.** To a temporary file beside it
-(`nodes.conf.tmp-<n>`), synced, renamed over it, and the directory synced:
-a crash at any moment leaves the old file or the new one, never part of
-one. Every save writes a new file; nothing is written over in place. On
-Linux it is written past the page cache, padded with blank lines to a
-multiple of 4 KiB. Temporary files a crash left are removed at
-startup. The one exception is the takeover at the end of a slot
+(`nodes.conf.tmp-<n>`), synced, put in place of it, and the directory
+synced: a crash at any moment leaves the old file or the new one, never
+part of one. nodes.conf itself is never written over in place. On Linux the
+file a save puts out of place is kept as a spare (`nodes.conf.spare-<n>`,
+two at most) once the directory is synced, when it is no longer nodes.conf
+on disk either, and a later save writes over it: renamed to that save's
+temporary file, written, its data synced (`fdatasync`), exchanged with
+nodes.conf (`renameat2` with `RENAME_EXCHANGE`, as atomic as a rename), and
+the directory synced. A spare's blocks are allocated already, so syncing
+its data needs no commit of the filesystem's journal: a save costs one
+commit (the directory's) where a new file costs two. A symbolic or hard
+link to nodes.conf is never written through: put out of place, it is
+removed. On a filesystem that cannot exchange two files or sync a
+directory, and on other systems, every save writes a new file. On Linux it
+is written past the page cache, padded with blank lines to a multiple of
+4 KiB. Temporary files and spares are removed at startup. The one
+exception is the takeover at the end of a slot
 migration's handover, which does not wait for the sync while client writes
 are paused: a power failure in the moment after it can leave the file
 incomplete.
 
 **Failover needs a disk that syncs it quickly.** A master saves its vote,
 synced, before it sends it, and a replica its promotion, so a failover
-waits on several saves, each two syncs of the disk (the file's and the
-directory's). A candidate counts a vote for as long as its election lives,
+waits on several saves, each two syncs of the disk (the file's data and
+the directory). A candidate counts a vote for as long as its election lives,
 10 seconds, and then stands again at a new epoch: a vote whose save takes
 longer than that is never counted, and the failover does not complete.
 Measured on an Azure D4s_v5, ext4 on a volume that delays every write:
