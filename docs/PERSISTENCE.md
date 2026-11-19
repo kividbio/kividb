@@ -516,7 +516,15 @@ waits on several saves, each two syncs of the disk (the file's and the
 directory's). A candidate counts a vote for as long as its election lives,
 10 seconds, and then stands again at a new epoch: a vote whose save takes
 longer than that is never counted, and the failover does not complete.
-RESULTS_DOCS
+Measured on an Azure D4s_v5, ext4 on a volume that delays every write:
+with writes taking 200 ms, a save took 2.1-2.6 s and a failover of a master
+7.3-8.4 s (1.2 and earlier, which did not sync the file before renaming it,
+4.7-5.6 s); with writes taking 1 s, a save took 8-13 s and no failover
+completed in 330 s (nor did one in 1.2, which waited only 2 s for a vote).
+On an ordinary SSD a save takes a few milliseconds and a failover 3.5-4 s.
+A volume on which a save of nodes.conf takes more than a few seconds is too
+slow for a cluster to fail over: give the cluster file a disk that syncs a
+small file in well under a second.
 
 **A file cut short is refused.** A `nodes.conf` that does not end with its
 `vars` line stops the node at startup with `cluster config file
