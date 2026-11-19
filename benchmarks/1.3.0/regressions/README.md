@@ -42,6 +42,7 @@ and why.
 | `24-snapshot-size` | #879 | `SAVE` of #879's dataset (`DEBUG POPULATE 6000000 k 150`) and of a collections mix (200,000 hashes of 10 fields, 50,000 each of sets, sorted sets and lists of 20), each twice: `-default` (the candidate as it starts, `rdbcompression no`) and `-yes` (the suite sets `CONFIG SET rdbcompression yes` on the candidate): the snapshot's size, the `SAVE` time (median of 3 after a warm-up) and the time a new server takes to load it (best of 2). Gates: `-yes` keeps 60 % of the size gain over v1.2.2 and #879's dataset within 1.5x of Redis's `dump.rdb`; `-default` within 1 % of v1.2.2's size; the save at most 2.5x v1.2.2's time, the load 1.5x |
 | `25-centrifuge-scripts-publish` | #900 | centrifuge v0.40.1's history scripts with the arguments its broker sends (30-day meta TTL), whose 2-3 keys carry no hash tag (each runs alone, on the script-runner thread): `EVALSHA` of `broker_history_list.lua` and `broker_history_add_list.lua` from 16 connections (`scripts`, the `lua,tls` builds); `PUBLISH` to 1,000 channels nobody subscribes to, beside 4 idle subscribers, from 1 connection and from 8, pipeline 16 (`publish`): calls a second counted by the server; a round with any error reply, or a history list of the wrong length, fails the suite. Gates: 10 % and at most 1.05x worse than v1.2.2 in the same session (for now 1.08x for the 8-connection `PUBLISH`, where master is behind v1.2.2 with matching compilers; to go back to 1.05x when that gap is fixed) |
 | `31-zset-memory` | #825, #297 (step 4) | `used_memory` per sorted-set member, 1,000,000 members in sets of 10, 100, 128, 129 and 1,000: 14-byte members (`membr:<i>`), scores whole (`int`) or with a fraction (`float`); `OBJECT ENCODING` of each size recorded exactly (`listpack` up to 128, `skiplist` past it); the large sets (129 and 1,000) as guard rows |
+| `32-default-threads` | #903 | the default worker count itself: unpipelined `GET` (50 connections), `SET` pipeline 16, suite 05's `XADD` and suite 23's pattern fan-out, each with no `--threads` and with every explicit count from 1 to the CPUs, server and clients sharing the machine; gated: the default at most 10 % under the best explicit count of the same build (`<row>_default_vs_best` at least 0.90) |
 
 ## Running it
 
@@ -150,8 +151,9 @@ and a C compiler).
 - One server at a time, started fresh for each configuration, in an empty
   directory, with no persistence (`--save ''`/`--appendonly no` for Redis;
   KiviDB saves nothing by default). KiviDB runs with `--protected-mode no
-  --bind 127.0.0.1`, `--io-model` and `--threads` as the configuration says
-  (`auto` and the default thread count otherwise). Redis runs with its
+  --bind 127.0.0.1`, `--io-model` as the configuration says (`auto`
+  otherwise) and `--threads` as it says: every configuration states its
+  thread count (see [Thread counts](#thread-counts)). Redis runs with its
   defaults (`io-threads 1`, jemalloc) and `--enable-debug-command yes`.
 - Client and server share the machine. Absolute numbers depend on it; the
   gates that compare with v1.2.2 or Redis measure both in the same session,
@@ -205,6 +207,31 @@ and a C compiler).
   JSON module, so `08-ft-info`, `10-redisvl` and `12-search-fanout` run v1.2.2
   and the candidate only (none of their PRs measured Redis either, except
   RedisVL's 67/67 on the `redis:8.10` image).
+
+### Thread counts
+
+The default worker count is a policy, not code under test: #903 changed it
+from the CPUs minus two (all of them below four) to one per available CPU,
+which on the `Standard_D4s_v5` is 4 workers instead of 2. With the clients
+on the same 4 vCPUs that moved rows that `--threads` did not pin: `05`
+`shapes/xadd5_rps` 594k/s with 2 workers, 426k with 4; `08`
+`ftinfo/hset_vec_doc_rps` 98.6k against 89.1k. So every configuration now
+states its count (`Config(..., threads=N)`; `lib/suite.py` refuses one that
+does not), and it is the count its values were recorded with, so no value
+was re-recorded for it:
+
+| suites / configurations | `--threads` | why |
+|---|---:|---|
+| `01`-`06`, `08`-`12`, `14`-`17`, `19`, `21` (every configuration that had none) | 2 | recorded before #903 (commits `2468f226`, `d66f0f93`, `9501caa6`, `219b9656`, `f767a149`, `9c466db3`, `8160700c`, `5b4a04a4`, `c7e0b47e`, `36771af1`: none contains it), where the default on 4 vCPUs was 2 (the servers' logs in `raw.tar.gz` say `Worker threads : 2`) |
+| `24-snapshot-size`, `31-zset-memory` | 4 | recorded on branches that had merged #903: the candidate's logs say `Worker threads : 4 (auto: one per available CPU)`. v1.2.2 ran with its default of 2 there and runs with 4 now: `24`'s v1.2.2 values are only used by its same-session `vs_v1_2_2` gates on the `SAVE`/load time, and `31` gates memory |
+| `02 uring1`, `07`, `13` | 1 | as before |
+| `22` | 4 | as before |
+| `23`, `25`, `27` | 2 | as before |
+| `32-default-threads` | 0 (none) | measures the default on purpose |
+
+Redis ignores the count. The default itself is watched by
+`32-default-threads` alone: a change of the default policy shows there, and
+nowhere else.
 
 ## Tolerances (gates)
 
@@ -403,6 +430,10 @@ Checklist (the release gate refuses a tree that misses any of these):
 - [ ] Recorded with a candidate built by the release's rustc (or newer), and
       without `ALLOW_VM_CHANGE`/`REGRESS_ALLOW_RUSTC`: the gate refuses runs
       that used either.
+- [ ] Every configuration states `threads=N` (`lib/suite.py` refuses one
+      that does not, and the run is then `INVALID`): the count you record
+      it with, so a later change of the default worker count does not move
+      its rows. Only `32-default-threads` uses `threads=0` (the default).
 - [ ] Its row in the table above, its gates explained in its docstring.
 
 A suite is `suites/NN-name.py`. `run-all.sh` picks up every file named
@@ -416,9 +447,9 @@ from probe import Probe   # PING probes
 from rss import vmrss_mib, used_memory_mib, sample_at
 
 S = Suite("05-example", [
-    Config("tokio", io="tokio"),                                  # all three engines
+    Config("tokio", io="tokio", threads=2),                       # all three engines
     Config("uring1", io="uring", threads=1, engines=("v1_2_2", "candidate")),
-    Config("big", full_only=True),                               # FULL=1 only
+    Config("big", threads=2, full_only=True),                    # FULL=1 only
 ])
 
 @S.run

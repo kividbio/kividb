@@ -9,10 +9,10 @@ given. See README.md, "Adding a suite".
     from suite import Suite, Config, rel, ratio, vs_redis, vs_v1_2_2, bound, info
 
     S = Suite("05-example", [
-        Config("tokio", io="tokio"),
+        Config("tokio", io="tokio", threads=2),  # every configuration states threads
         Config("uring1", io="uring", threads=1, engines=("v1_2_2", "candidate")),
-        Config("big", full_only=True),          # only with FULL=1
-        Config("scripts", lua=True),            # lua,tls builds (--candidate-full)
+        Config("big", threads=2, full_only=True),   # only with FULL=1
+        Config("scripts", threads=2, lua=True),     # lua,tls builds (--candidate-full)
     ])
     # A suite whose load generator is the limit on 4 vCPUs says so, and is
     # then run (and recorded) only on a machine with that many CPUs:
@@ -122,10 +122,20 @@ class Config:
     lua=True: the configuration needs scripts. run-all.sh runs v1.2.2's
     `full` build (lua,tls) and the candidate given with --candidate-full in
     place of the default builds, under the same engine names; without
-    --candidate-full the configuration is skipped (and not expected)."""
+    --candidate-full the configuration is skipped (and not expected).
 
-    def __init__(self, name, io="auto", threads=0, engines=ENGINES, full_only=False, self_hosted=False,
+    threads: KiviDB's `--threads`, stated by every configuration (the count
+    its values were recorded with). The default worker count is a policy that
+    changes with the machine and the release (#903 made it one per CPU), so a
+    configuration that left it out measured that policy along with the code.
+    0 means no `--threads` (the server's own default): only suite 32, which
+    watches the default on purpose, uses it. Redis ignores it."""
+
+    def __init__(self, name, io="auto", threads=None, engines=ENGINES, full_only=False, self_hosted=False,
                  lua=False):
+        if not isinstance(threads, int) or threads < 0:
+            raise ValueError("Config(%r): state threads=N, the --threads its values were recorded with "
+                             "(0 = the server's default, only for a suite that measures the default)" % name)
         self.name, self.io, self.threads = name, io, threads
         self.engines, self.full_only = tuple(engines), full_only
         self.self_hosted, self.lua = self_hosted, lua

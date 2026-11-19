@@ -35,7 +35,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import Suite, Config, KEEP_IMPROVEMENT, rel, info, scaled, median  # noqa: E402
 from nodes import redis_tool, redis_benchmark_for  # noqa: E402
 
-S = Suite("08-ft-info", [Config("ftinfo", engines=("v1_2_2", "candidate"))])
+S = Suite("08-ft-info", [Config("ftinfo", engines=("v1_2_2", "candidate"), threads=2)])
 VEC = b"\x00\x00\x80\x3f\x00\x00\x00\x40"  # [1.0, 2.0] as FLOAT32
 
 
