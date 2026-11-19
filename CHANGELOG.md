@@ -477,7 +477,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are after it, as in Redis. A script that finds a walk under way waits
   for it asleep, off its thread; one that finds walk after walk stops
   waiting after three and holds the walks after it back, so a loop of
-  `SCAN`s cannot keep scripts out. The other commands that read keys they
+  `SCAN`s cannot keep scripts out. A walk that finds a script running
+  beside others waits for it on its thread; on the Tokio loop it hands that
+  worker's other tasks to another thread first, including the one queued
+  to run next, which no other worker takes, so new connections and the
+  thread's other clients are not held with it. The other commands that read keys they
   do not name take the same locks, shared, as `KEYS` and `SCAN`: `INFO`
   (with no section, or `keyspace`, `default`, `all` or `everything`),
   `MEMORY STATS` and `MEMORY DOCTOR`, `FT.SEARCH`, `FT.AGGREGATE`,
@@ -866,6 +870,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   transactions and the build without Lua are unchanged. Which locks a
   command takes is the same as before. `scripts/perf/measure.sh` has
   these workloads as `WORKLOADS=tags`.
+
+  The look then took less again. It asks the arity table, which every
+  command is looked up in anyway, how the command's keys are found, where
+  it asked a second table; it checks a key for a `{` with two or four
+  words looked at together; and a command of one tagged key takes its lock
+  without walking a list of positions. Instructions per command, the same
+  measure, on both I/O loops: `GET` 15 fewer, `SET` 57 fewer, a 10-key
+  `MGET` about 140 fewer, a `GET` or `SET` of a key with a tag about 90 and
+  98 fewer (5 % and 4 %); a tagged `EVALSHA` 0 to 27 fewer, `MULTI` with
+  two `SET`s and `EXEC` 8 more. The build without Lua is unchanged.
 
 - **Small hashes take less than half the memory.** A hash of up to 512
   fields, no field or value longer than 64 bytes, is kept in one block, each

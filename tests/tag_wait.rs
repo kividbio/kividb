@@ -214,22 +214,74 @@ fn quick_script(c: &mut Conn, tags: &[&str]) -> String {
 }
 
 /// Starts the held script on `{tag}:k`, writing `value`, on a connection of
-/// its own, and waits until it is under way.
+/// its own, and waits until it is under way, beside others: see
+/// [`held_beside_others`].
 fn start_held_script(
     server: &Server,
     sha: &str,
     tag: &str,
     value: &str,
 ) -> std::thread::JoinHandle<(V, Instant)> {
-    let mut c = server.conn();
     let key = format!("{{{tag}}}:k");
-    c.send(&["EVALSHA", sha, "1", &key, value, "script-stall:1"]);
-    let handle = std::thread::spawn(move || {
-        let reply = c.read();
-        (reply, Instant::now())
-    });
-    server.wait_until_held();
-    handle
+    held_beside_others(
+        server,
+        || {
+            let mut c = server.conn();
+            c.send(&["EVALSHA", sha, "1", &key, value, "script-stall:1"]);
+            let handle = std::thread::spawn(move || {
+                let reply = c.read();
+                (reply, Instant::now())
+            });
+            server.wait_until_held();
+            handle
+        },
+        || {
+            let mut c = server.conn();
+            for _ in 0..3 {
+                assert_eq!(
+                    c.cmd(&["EVALSHA", sha, "1", &key, "warm", "no-stall"]),
+                    V::Int(1)
+                );
+            }
+        },
+    )
+}
+
+/// `INFO stats`' `scripts_run_beside_others`, from whichever of several new
+/// connections answers first (one on the thread running a held script
+/// waits for it).
+fn scripts_beside_others(server: &Server) -> u64 {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for _ in 0..8 {
+        let mut c = server.conn();
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(c.info("stats", "scripts_run_beside_others"));
+        });
+    }
+    rx.recv().unwrap().parse().unwrap()
+}
+
+/// `start()`'s held script, once it runs beside others. A run that took over
+/// five milliseconds makes the script run alone next time, holding every
+/// thread: a debug build on a loaded machine can take that long for a warm
+/// run. Then it is let finish, made quick again (`warm`), and started again;
+/// five times at most.
+fn held_beside_others<T>(
+    server: &Server,
+    mut start: impl FnMut() -> std::thread::JoinHandle<T>,
+    mut warm: impl FnMut(),
+) -> std::thread::JoinHandle<T> {
+    for _ in 0..5 {
+        let before = scripts_beside_others(server);
+        let held = start();
+        if scripts_beside_others(server) > before {
+            return held;
+        }
+        let _ = held.join();
+        warm();
+    }
+    panic!("the held script never ran beside others");
 }
 
 /// A new connection on a thread that is not busy running a held script:
@@ -809,23 +861,38 @@ fn an_exec_runs_however_the_script_ends(io: &str, ends: Ends) {
             V::Str("OK".into())
         );
     }
-    let mut runner = server.conn();
     let fails = if let Ends::InError = ends {
         "fail"
     } else {
         "ok"
     };
-    runner.send(&[
-        "EVALSHA",
-        &sha,
-        "1",
-        "{a}:k",
-        "script",
-        "script-stall:1",
-        fails,
-    ]);
-    let script = std::thread::spawn(move || runner.read());
-    server.wait_until_held();
+    let script = held_beside_others(
+        &server,
+        || {
+            let mut runner = server.conn();
+            runner.send(&[
+                "EVALSHA",
+                &sha,
+                "1",
+                "{a}:k",
+                "script",
+                "script-stall:1",
+                fails,
+            ]);
+            let script = std::thread::spawn(move || runner.read());
+            server.wait_until_held();
+            script
+        },
+        || {
+            let mut c = server.conn();
+            for _ in 0..3 {
+                assert_eq!(
+                    c.cmd(&["EVALSHA", &sha, "1", "{a}:k", "warm", "no-stall", "ok"]),
+                    V::Int(1)
+                );
+            }
+        },
+    );
 
     let mut tx = free_conn(&server);
     send_exec(

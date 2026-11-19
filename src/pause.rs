@@ -452,7 +452,13 @@ pub fn test_stall_in_script(cmd: &[&[u8]]) {
             .any(|arg| arg.starts_with(b"script-stall:"))
     {
         let _ = std::fs::write("script-stall.held", b"");
-        std::thread::sleep(delay);
+        // Off the runtime, as `test_stall_before_the_gate` waits: on a
+        // worker of the Tokio runtime, the worker's other tasks go to
+        // another thread, the one it had queued to run next among them
+        // (tokio's LIFO slot, which no other worker takes). A script that
+        // computes for as long holds them the same way; this hook is to
+        // hold the script, not those.
+        crate::cluster::migration::off_the_runtime(|| std::thread::sleep(delay));
         let _ = std::fs::remove_file("script-stall.held");
     }
 }

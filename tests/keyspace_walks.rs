@@ -247,17 +247,78 @@ fn quick_script(c: &mut Conn, tags: &[&str]) -> String {
 }
 
 /// Starts the script on `tag`, held part-way through, on a connection of its
-/// own; its reply is what the handle gives.
+/// own, beside others ([`held_beside_others`]); its reply is what the
+/// handle gives.
 fn start_held_script(server: &Server, sha: &str, tag: &str) -> std::thread::JoinHandle<V> {
-    let mut c = server.conn();
-    let keys = keys_of(tag);
-    let mut args = vec!["EVALSHA", sha, "4"];
-    args.extend(keys.iter().map(String::as_str));
-    args.push("script-stall:1");
-    c.send(&args);
-    let handle = std::thread::spawn(move || c.read());
-    server.wait_until_held();
-    handle
+    held_beside_others(
+        server,
+        || {
+            let mut c = server.conn();
+            let keys = keys_of(tag);
+            let mut args = vec!["EVALSHA", sha, "4"];
+            args.extend(keys.iter().map(String::as_str));
+            args.push("script-stall:1");
+            c.send(&args);
+            let handle = std::thread::spawn(move || c.read());
+            server.wait_until_held();
+            handle
+        },
+        || {
+            let mut c = server.conn();
+            for _ in 0..3 {
+                run_script(&mut c, sha, tag, false);
+            }
+        },
+    )
+}
+
+/// `INFO stats`' `scripts_run_beside_others`, from whichever of several new
+/// connections answers first (one on the thread running a held script
+/// waits for it).
+fn scripts_beside_others(server: &Server) -> u64 {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for _ in 0..8 {
+        let mut c = server.conn();
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(beside_others_on(&mut c));
+        });
+    }
+    drop(tx);
+    rx.recv().expect("INFO stats has scripts_run_beside_others")
+}
+
+/// `INFO stats`' `scripts_run_beside_others`, asked on `c`.
+fn beside_others_on(c: &mut Conn) -> u64 {
+    let V::Str(text) = c.cmd(&["INFO", "stats"]) else {
+        panic!("INFO stats")
+    };
+    text.lines()
+        .find_map(|line| line.strip_prefix("scripts_run_beside_others:"))
+        .and_then(|n| n.trim().parse().ok())
+        .expect("INFO stats has scripts_run_beside_others")
+}
+
+/// `start()`'s held script, once it runs beside others. A run that took over
+/// five milliseconds makes the script run alone next time, holding every
+/// thread: a debug build on a loaded machine can take that long for a warm
+/// run. Then it is let finish, made quick again (`warm`), and started again;
+/// five times at most.
+fn held_beside_others<T>(
+    server: &Server,
+    mut start: impl FnMut() -> std::thread::JoinHandle<T>,
+    mut warm: impl FnMut(),
+) -> std::thread::JoinHandle<T> {
+    for _ in 0..5 {
+        let before = scripts_beside_others(server);
+        let held = start();
+        if scripts_beside_others(server) > before {
+            return held;
+        }
+        let _ = held.join();
+        warm();
+    }
+    panic!("the held script never ran beside others");
 }
 
 /// A new connection on a thread that is not busy running a held script:
@@ -548,14 +609,26 @@ fn quick_six(c: &mut Conn) -> String {
 }
 
 fn held_six(server: &Server, sha: &str) -> std::thread::JoinHandle<V> {
-    let mut c = server.conn();
-    let mut args = vec!["EVALSHA", sha, "6"];
-    args.extend(SIX);
-    args.push("script-stall:1");
-    c.send(&args);
-    let handle = std::thread::spawn(move || c.read());
-    server.wait_until_held();
-    handle
+    held_beside_others(
+        server,
+        || {
+            let mut c = server.conn();
+            let mut args = vec!["EVALSHA", sha, "6"];
+            args.extend(SIX);
+            args.push("script-stall:1");
+            c.send(&args);
+            let handle = std::thread::spawn(move || c.read());
+            server.wait_until_held();
+            handle
+        },
+        || {
+            let mut c = server.conn();
+            for _ in 0..3 {
+                assert_eq!(run_six(&mut c, sha, false), V::Int(1));
+                delete_six(&mut c);
+            }
+        },
+    )
 }
 
 fn count(reply: &V) -> usize {

@@ -1287,9 +1287,25 @@ async fn wait_for_walks() {
 pub fn walk() -> Walk {
     WALKS.fetch_add(1, Ordering::SeqCst);
     WALKS_STARTED.fetch_add(1, Ordering::SeqCst);
-    for slot in &WALK_SLOT {
-        // Let go of in `Drop`, or in `end_walk_here`.
-        std::mem::forget(slot.0.read());
+    // Each let go of in `Drop`, or in `end_walk_here`. Those free now are
+    // taken here. Should one be held, by a script running beside others,
+    // the walk waits for it, and for the rest, off the runtime: on a worker
+    // of the Tokio runtime, the worker's other tasks go to another thread
+    // first, the one it had queued to run next among them (tokio's LIFO
+    // slot, which no other worker takes). That task would wait for the
+    // script with the walk, for as long as the script runs: under load it
+    // can be what takes the server's new connections, and every one of them
+    // would wait too (tests/keyspace_walks.rs).
+    let free = WALK_SLOT
+        .iter()
+        .take_while(|slot| slot.0.try_read().map(std::mem::forget).is_some())
+        .count();
+    if free < WALK_SLOTS {
+        crate::cluster::migration::off_the_runtime(|| {
+            for slot in &WALK_SLOT[free..] {
+                std::mem::forget(slot.0.read());
+            }
+        });
     }
     WALKING.with(|walking| walking.set(true));
     Walk {
