@@ -1814,6 +1814,17 @@ pub struct HnswIndex {
     /// it kept may name another node now, and it measures its results again
     /// before it answers.
     reused: AtomicU64,
+
+    /// The graph a compaction is building to replace this one, once it has
+    /// begun: every write to this graph is made to it too (see
+    /// [`compact_hnsw`]). Kept after the swap, for writes that found this
+    /// graph before it.
+    shadow: parking_lot::Mutex<Option<Arc<HnswIndex>>>,
+
+    /// Keys written to this graph while it is a compaction's copy in the
+    /// making: the copy leaves them as those writes left them. Held while
+    /// such a write, or the copy of one key, is made.
+    touched: parking_lot::Mutex<Option<ahash::AHashSet<String>>>,
 }
 
 impl HnswIndex {
@@ -1832,6 +1843,8 @@ impl HnswIndex {
             compaction_in_progress: AtomicBool::new(false),
             free: parking_lot::Mutex::new(Vec::new()),
             reused: AtomicU64::new(0),
+            shadow: parking_lot::Mutex::new(None),
+            touched: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1946,6 +1959,34 @@ impl HnswIndex {
             && let Some(list) = node.upper.lock().get(layer - 1)
         {
             out.extend_from_slice(list);
+        }
+    }
+
+    /// The compaction's new graph this graph's writes are made to as well,
+    /// if one is being built.
+    fn shadow(&self) -> Option<Arc<HnswIndex>> {
+        self.shadow.lock().clone()
+    }
+
+    /// `vector` (None: the key's vector is gone) written to this graph as a
+    /// compaction's copy in the making: what the copy then finds for the
+    /// key is left alone.
+    fn mirror(self: &Arc<Self>, key: &str, vector: Option<Vec<f32>>, metric: &DistanceMetric) {
+        let mut touched = self.touched.lock();
+        if let Some(touched) = touched.as_mut() {
+            touched.insert(key.to_string());
+        }
+        match vector {
+            Some(v) => hnsw_insert(self, key.to_string(), v, metric),
+            None => {
+                let node_id = self.key_to_id.write().remove(key);
+                if let Some(node_id) = node_id {
+                    let mut nodes = self.nodes.write();
+                    if nodes.get(node_id).is_some_and(|n| n.key == key) {
+                        self.delete(&mut nodes, node_id);
+                    }
+                }
+            }
         }
     }
 
@@ -2550,7 +2591,14 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
                     if how == Write::Refresh && idx.key_to_id.read().contains_key(key) {
                         continue;
                     }
+                    // While a compaction builds the graph that replaces
+                    // this one, the write is made to that graph too, after
+                    // this one: see `compact_hnsw`.
+                    let copy = vec.clone();
                     hnsw_insert_doc(idx, key.to_string(), vec, &metric, doc);
+                    if let Some(shadow) = idx.shadow() {
+                        shadow.mirror(key, Some(copy), &metric);
+                    }
                 }
             }
         }
@@ -2596,6 +2644,9 @@ fn unindex_vector(live: &LiveIndex, key: &str) {
                 if nodes.get(node_id).is_some_and(|n| n.key == key) {
                     idx.delete(&mut nodes, node_id);
                 }
+            }
+            if let Some(shadow) = idx.shadow() {
+                shadow.mirror(key, None, &DistanceMetric::L2);
             }
         }
     }
@@ -4026,11 +4077,11 @@ pub fn maybe_unindex(index_store: &IndexStore, db: usize, key: &(impl AsRef<[u8]
 //   4. Old Arc has its refcount drop to zero once all in-flight searches
 //      finish their reads. Memory is reclaimed automatically.
 //
-// Writes (HSET) that arrived during step 2 went into the OLD graph. After
-// the swap they are visible to no-one — this is the only correctness gotcha
-// of shadow-index. We mitigate by re-checking after swap: any keys present
-// in the IndexStore's data hashes but missing from the new graph get
-// re-inserted in a "catch-up" pass.
+// Writes made while the new graph is built go to both graphs: the old one
+// is given the new one as its shadow before the copy (`HnswIndex::mirror`).
+// Before, they went to the old graph only and a pass after the swap took in
+// the keys the copy lacked: a key the copy had and a write changed or
+// deleted meanwhile kept, in the new graph, what the copy had.
 
 pub fn compact_hnsw(
     index_store: &IndexStore,
@@ -4112,6 +4163,17 @@ pub fn compact_hnsw(
     let _guard = CompactionGuard(&old_arc);
 
     // ── Step 2: build the new index from live nodes only ──────────────────
+    //
+    // The new graph is made first and given to the old one as its shadow:
+    // from here on every write to the old graph is made to the new one too,
+    // and marks the key there. The copy below then leaves a marked key as
+    // its write left it. A write either reaches the old graph before the
+    // copy reads it (and is copied) or finds the shadow (and is made to the
+    // new graph itself), so the new graph misses none, and holds no vector
+    // older than the old one's.
+    let new_index = Arc::new(HnswIndex::new(m, ef_construction));
+    *new_index.touched.lock() = Some(ahash::AHashSet::new());
+    *old_arc.shadow.lock() = Some(Arc::clone(&new_index));
     let live_pairs: Vec<(String, Vec<f32>)> = {
         let nodes = old_arc.nodes.read();
         nodes
@@ -4119,14 +4181,25 @@ pub fn compact_hnsw(
             .filter_map(|(id, n)| Some((n.key.clone(), old_arc.vector(id)?.to_vec())))
             .collect()
     };
-
-    let new_index = Arc::new(HnswIndex::new(m, ef_construction));
-    for (key, vec) in &live_pairs {
-        hnsw_insert(&new_index, key.clone(), vec.clone(), &metric);
+    let mut copied = 0usize;
+    for (key, vec) in live_pairs {
+        let touched = new_index.touched.lock();
+        if touched.as_ref().is_some_and(|t| t.contains(&key)) {
+            continue;
+        }
+        hnsw_insert(&new_index, key, vec, &metric);
+        drop(touched);
+        copied += 1;
     }
+    *new_index.touched.lock() = None;
+    #[cfg(test)]
+    crate::test_hooks::at("compact: rebuilt");
 
     // ── Step 3: swap into the named slot in `indexes` ─────────────────────
-    let (doc_on, doc_schema) = {
+    // The old graph keeps its shadow: a write that found the old graph
+    // before the swap still reaches the new one.
+    let _ = (dim, data_type, &prefixes, db_store);
+    {
         let mut store = index_store.write();
         let def = match store.get_mut(index_name) {
             Some(d) => d,
@@ -4144,49 +4217,8 @@ pub fn compact_hnsw(
             field_name.to_string(),
             LiveIndex::Hnsw(Arc::clone(&new_index)),
         );
-        (def.on.clone(), def.fields.clone())
-    };
-
-    // ── Step 4: catch-up pass for writes that landed in old_arc ───────────
-    let mut catchup = 0usize;
-    {
-        let already: ahash::AHashSet<String> = {
-            let kti = new_index.key_to_id.read();
-            kti.keys().cloned().collect()
-        };
-
-        let db_ref = &db_store[0];
-        for shard in db_ref.iter() {
-            #[cfg(target_os = "linux")]
-            let map = shard.read();
-            #[cfg(not(target_os = "linux"))]
-            let map = shard.read();
-
-            for (key, value) in map.iter() {
-                let matches =
-                    prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p.as_bytes()));
-                let key = crate::key_bytes::text_of(key);
-                let key: &str = &key;
-                if !matches || already.contains(key) {
-                    continue;
-                }
-                let Some(inner) = doc_fields(&doc_on, &doc_schema, value) else {
-                    continue;
-                };
-                let raw = match inner.get_bytes(field_name) {
-                    Some(b) => b,
-                    None => continue,
-                };
-                let Some(v) = data_type.decode(raw, dim) else {
-                    continue;
-                };
-                hnsw_insert(&new_index, key.to_string(), v, &metric);
-                catchup += 1;
-            }
-        }
     }
-
-    Ok(live_pairs.len() + catchup)
+    Ok(copied)
 }
 
 /// Spawn the dedicated compaction worker thread.
@@ -4805,5 +4837,106 @@ mod slot_reuse_tests {
             index.nodes.read().count(),
             1000 + index.tombstone_count.load(Relaxed)
         );
+    }
+}
+
+#[cfg(test)]
+mod compaction_catch_up_tests {
+    use super::*;
+    use crate::types::KiviDBValue;
+
+    fn blob(v: &[f32]) -> Arc<[u8]> {
+        v.iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect::<Vec<u8>>()
+            .into()
+    }
+
+    /// `HSET key v <v>` as the command does it: the store, then the index.
+    fn hset(store: &crate::store::Store, indexes: &IndexStore, key: &str, v: &[f32]) {
+        let pairs: Vec<(String, Arc<[u8]>)> = vec![("v".into(), blob(v))];
+        let hash: crate::types::HashFields = pairs.iter().cloned().collect();
+        crate::store::get_shard(&store[0], key)
+            .write()
+            .insert(key, KiviDBValue::Hash(Arc::new(RwLock::new(hash))));
+        maybe_index(indexes, 0, key, &pairs, Write::Whole);
+    }
+
+    fn del(store: &crate::store::Store, indexes: &IndexStore, key: &str) {
+        crate::store::get_shard(&store[0], key).write().remove(key);
+        maybe_unindex(indexes, 0, key);
+    }
+
+    fn point(i: usize) -> Vec<f32> {
+        vec![(i % 37) as f32, (i / 37) as f32, (i % 11) as f32, 1.0]
+    }
+
+    fn graph(indexes: &IndexStore) -> Arc<HnswIndex> {
+        match indexes.read().get("cmp").unwrap().indexes.get("v") {
+            Some(LiveIndex::Hnsw(g)) => Arc::clone(g),
+            _ => unreachable!(),
+        }
+    }
+
+    /// A key written over, and one deleted, while a compaction rebuilds the
+    /// graph (after it copied them, before the new graph replaces the old)
+    /// are found as they are now in the new graph: the catch-up pass used
+    /// to skip every key the rebuild had copied.
+    #[test]
+    fn writes_during_the_rebuild_are_in_the_compacted_graph() {
+        let store = crate::store::new_store(1);
+        let indexes = new_index_store();
+        let def = IndexSchema {
+            name: "cmp".into(),
+            db_index: 0,
+            on: IndexOn::Hash,
+            prefixes: vec!["cmp:".into()],
+            fields: vec![SchemaField {
+                name: "v".into(),
+                field_type: FieldType::Vector {
+                    algo: VectorAlgo::Hnsw {
+                        m: 16,
+                        ef_construction: 64,
+                        ef_runtime: 10,
+                    },
+                    dim: 4,
+                    metric: DistanceMetric::L2,
+                    data_type: VectorType::Float32,
+                },
+                options: FieldOptions::default(),
+            }],
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
+        }
+        .into_def();
+        indexes.write().insert("cmp".into(), def);
+        for i in 0..600 {
+            hset(&store, &indexes, &format!("cmp:{i}"), &point(i));
+        }
+        let far = [1000.0, 1000.0, 1000.0, 1000.0];
+        {
+            let (store, indexes) = (Arc::clone(&store), indexes.clone());
+            crate::test_hooks::set("compact: rebuilt", move || {
+                hset(&store, &indexes, "cmp:5", &far);
+                del(&store, &indexes, "cmp:6");
+            });
+        }
+        compact_hnsw(&indexes, &store, "cmp", "v").unwrap();
+        crate::test_hooks::clear("compact: rebuilt");
+        let g = graph(&indexes);
+        let metric = DistanceMetric::L2;
+        let near = knn_hnsw(&g, &far, 1, 64, &metric);
+        assert_eq!(near[0].key, "cmp:5", "cmp:5 kept the vector it had before");
+        let at_old = knn_hnsw(&g, &point(5), 3, 64, &metric);
+        assert!(at_old.iter().all(|r| r.key != "cmp:5"));
+        assert!(
+            !g.key_to_id.read().contains_key("cmp:6"),
+            "a deleted key stayed"
+        );
+        assert_eq!(g.live_count.load(Relaxed), 599);
     }
 }
