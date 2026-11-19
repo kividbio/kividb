@@ -3860,3 +3860,124 @@ fn a_released_entry_and_a_delivered_one_digest_apart() {
     );
     assert_ne!(digest_of(&mut c, "b"), before);
 }
+
+/// Every key of databases 0 and 1 with what `DEBUG DIGEST-VALUE` and
+/// `PEXPIRETIME` say of it.
+#[cfg(feature = "lua")]
+fn key_digests(c: &mut Conn) -> Vec<(usize, String, String, i64)> {
+    let mut out = Vec::new();
+    for db in [0usize, 1] {
+        assert!(c.cmd(&["SELECT", &db.to_string()]).ok());
+        let mut keys = Vec::new();
+        let mut cursor = "0".to_string();
+        loop {
+            let reply = c.cmd(&["SCAN", &cursor, "COUNT", "1000"]);
+            let parts = reply.arr();
+            cursor = parts[0].s().to_string();
+            keys.extend(parts[1].arr().iter().map(|k| k.s().to_string()));
+            if cursor == "0" {
+                break;
+            }
+        }
+        keys.sort();
+        for key in keys {
+            let digest = c.cmd(&["DEBUG", "DIGEST-VALUE", &key]).arr()[0]
+                .s()
+                .to_string();
+            let at = c.cmd(&["PEXPIRETIME", &key]).i();
+            out.push((db, key, digest, at));
+        }
+    }
+    assert!(c.cmd(&["SELECT", "0"]).ok());
+    out
+}
+
+/// A script's writes with nothing reading the stream but the backlog kept
+/// for a replica that is away: no AOF, no replica attached (#901: a write
+/// that nothing reads only counts its feeds, and the kept backlog must
+/// still be one of the readers). The replica comes back by a partial
+/// resync, and holds what the master holds, key by key.
+#[cfg(feature = "lua")]
+#[test]
+fn script_writes_with_only_the_backlog_to_read_them_are_resumed_by_a_partial_resync() {
+    for io in io_models() {
+        let master = Server::start(&["--io-model", io, "--repl-backlog-size", "67108864"]);
+        let relay = Relay::to(master.port);
+        let replica = Server::start(&[
+            "--io-model",
+            io,
+            "--replicaof",
+            "127.0.0.1",
+            &relay.port.to_string(),
+        ]);
+        let (mut m, mut r) = (master.conn(), replica.conn());
+        write_batch(&mut m, 0, 10);
+        wait_link_up(&mut r);
+        assert_same_dataset(&mut m, &mut r);
+
+        relay.cut();
+        wait_link_down(&mut r);
+        wait_until("the master to see the replica go", || {
+            m.info("replication", "connected_slaves") == "0"
+        });
+        assert_eq!(m.info("replication", "repl_backlog_active"), "1");
+        assert_eq!(m.info("persistence", "aof_enabled"), "0");
+
+        let scripts = [
+            // Plain writes, a TTL and an increment of a float.
+            "redis.call('incrby', KEYS[1], ARGV[1]) \
+             redis.call('set', KEYS[1] .. ':s', ARGV[2], 'EX', 1000) \
+             redis.call('pexpire', KEYS[1] .. ':s', 500000) \
+             return redis.call('incrbyfloat', KEYS[1] .. ':f', '0.5')",
+            // A sorted-set window, as Tyk's limiter keeps it.
+            "redis.call('zadd', KEYS[1] .. ':z', ARGV[1], ARGV[2]) \
+             redis.call('zremrangebyscore', KEYS[1] .. ':z', '-inf', ARGV[1] - 100) \
+             redis.call('expire', KEYS[1] .. ':z', 600) \
+             return redis.call('zcard', KEYS[1] .. ':z')",
+            // Random members and stream IDs, sent as what they did.
+            "redis.call('sadd', KEYS[1] .. ':set', ARGV[1], ARGV[2], 'm') \
+             redis.call('spop', KEYS[1] .. ':set') \
+             return redis.call('xadd', KEYS[1] .. ':x', '*', 'v', ARGV[1])",
+            // Another database.
+            "redis.call('select', 1) redis.call('hset', KEYS[1], 'f', ARGV[1]) \
+             redis.call('select', 0) return 1",
+            // Fails half-way: what it wrote before the error stays (a
+            // tagged one is refused the key outside its tag, a plain one
+            // the increment of text).
+            "redis.call('set', KEYS[1] .. ':half', ARGV[1]) \
+             return redis.call('incr', 'half-text')",
+        ];
+        assert!(m.cmd(&["SET", "half-text", "x"]).ok());
+        for i in 0..3000usize {
+            let script = scripts[i % scripts.len()];
+            let key = if i % 3 == 0 {
+                format!("{{t{}}}k{}", i % 7, i % 50)
+            } else {
+                format!("k{}", i % 50)
+            };
+            let (a1, a2) = (format!("{}", i % 997), format!("v{}", i % 13));
+            let args = ["EVAL", script, "1", &key, &a1, &a2];
+            if i % 10 == 0 {
+                assert!(m.cmd(&["MULTI"]).ok());
+                assert_eq!(m.cmd(&args), V::Str("QUEUED".into()));
+                assert!(matches!(m.cmd(&["EXEC"]), V::Arr(_)));
+            } else {
+                let reply = m.cmd(&args);
+                if i % scripts.len() == 4 {
+                    assert!(matches!(reply, V::Err(_)), "{reply:?}");
+                } else {
+                    assert!(!matches!(reply, V::Err(_)), "{script}: {reply:?}");
+                }
+            }
+        }
+
+        relay.restore();
+        wait_link_up(&mut r);
+        assert_same_dataset(&mut m, &mut r);
+        assert_eq!(m.stat("sync_full"), 1, "{io}: no dataset was sent again");
+        assert_eq!(m.stat("sync_partial_ok"), 1, "{io}");
+        let (on_master, on_replica) = (key_digests(&mut m), key_digests(&mut r));
+        assert!(on_master.len() > 100, "{}", on_master.len());
+        assert_eq!(on_master, on_replica, "{io}");
+    }
+}

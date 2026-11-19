@@ -44,9 +44,26 @@ impl AofSender for AofBridge {
     }
 }
 
+/// What a connection's scripts run with, made once for the connection.
+///
+/// Shared, not copied: a script handed to the runner thread takes the
+/// connection's env with it, and copying it was twenty-odd reference counts
+/// moved, and two strings made, on one thread and let go of on another, for
+/// every script (#901).
 #[cfg(feature = "lua")]
 #[derive(Clone)]
-pub(crate) struct ClientExecEnv {
+pub(crate) struct ClientExecEnv(std::sync::Arc<ClientExecEnvParts>);
+
+#[cfg(feature = "lua")]
+impl std::ops::Deref for ClientExecEnv {
+    type Target = ClientExecEnvParts;
+    fn deref(&self) -> &ClientExecEnvParts {
+        &self.0
+    }
+}
+
+#[cfg(feature = "lua")]
+pub(crate) struct ClientExecEnvParts {
     pub store: crate::store::Store,
     pub lastsave: std::sync::Arc<parking_lot::RwLock<i64>>,
     pub aof_bridge: AofBridge,
@@ -185,7 +202,7 @@ impl ClientExecEnv {
         no_touch: bool,
         authenticated_user: &str,
     ) -> Self {
-        Self {
+        Self(std::sync::Arc::new(ClientExecEnvParts {
             store: store.clone(),
             lastsave: lastsave.clone(),
             aof_bridge,
@@ -212,7 +229,7 @@ impl ClientExecEnv {
             client_id,
             no_touch,
             authenticated_user: authenticated_user.to_string(),
-        }
+        }))
     }
 }
 

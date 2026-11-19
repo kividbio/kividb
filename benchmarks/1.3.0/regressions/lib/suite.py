@@ -12,7 +12,11 @@ given. See README.md, "Adding a suite".
         Config("tokio", io="tokio"),
         Config("uring1", io="uring", threads=1, engines=("v1_2_2", "candidate")),
         Config("big", full_only=True),          # only with FULL=1
+        Config("scripts", lua=True),            # lua,tls builds (--candidate-full)
     ])
+    # A suite whose load generator is the limit on 4 vCPUs says so, and is
+    # then run (and recorded) only on a machine with that many CPUs:
+    #   S = Suite("18-example", [...], min_cpus=8)
 
     @S.run
     def run(ctx):
@@ -113,17 +117,23 @@ class Config:
 
     self_hosted=True: run-all.sh starts no server; the suite starts its own
     from ctx.bin (several nodes, a cluster: lib/nodes.py), and ctx.port and
-    ctx.pid are None."""
+    ctx.pid are None.
 
-    def __init__(self, name, io="auto", threads=0, engines=ENGINES, full_only=False, self_hosted=False):
+    lua=True: the configuration needs scripts. run-all.sh runs v1.2.2's
+    `full` build (lua,tls) and the candidate given with --candidate-full in
+    place of the default builds, under the same engine names; without
+    --candidate-full the configuration is skipped (and not expected)."""
+
+    def __init__(self, name, io="auto", threads=0, engines=ENGINES, full_only=False, self_hosted=False,
+                 lua=False):
         self.name, self.io, self.threads = name, io, threads
         self.engines, self.full_only = tuple(engines), full_only
-        self.self_hosted = self_hosted
+        self.self_hosted, self.lua = self_hosted, lua
 
     def as_dict(self):
         return {"name": self.name, "io": self.io, "threads": self.threads,
                 "engines": list(self.engines), "full_only": self.full_only,
-                "self_hosted": self.self_hosted}
+                "self_hosted": self.self_hosted, "lua": self.lua}
 
 
 class Ctx:
@@ -174,8 +184,15 @@ class Ctx:
 
 
 class Suite:
-    def __init__(self, name, configs):
+    """min_cpus: the CPUs (nproc) the suite needs to measure the server and
+    not its load generator. run-all.sh does not run it on a smaller machine
+    (env.json `needs_more_cpus`) unless --only names it, and then the run is
+    INVALID; the release gate needs a run of it on a machine that big
+    (`run-all.sh --min-cpus-only` on a Standard_D8s_v5 for min_cpus=8)."""
+
+    def __init__(self, name, configs, min_cpus=0):
         self.name, self.configs, self.fn = name, configs, None
+        self.min_cpus = int(min_cpus or 0)
 
     def run(self, fn):
         self.fn = fn
@@ -198,7 +215,7 @@ class Suite:
         a = ap.parse_args(argv)
         if a.configs:
             for c in self.active_configs():
-                print(json.dumps(c.as_dict()))
+                print(json.dumps(dict(c.as_dict(), min_cpus=self.min_cpus)))
             return 0
         cfg = next((c for c in self.configs if c.name == a.config), None)
         if cfg is None:
