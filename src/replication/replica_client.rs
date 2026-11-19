@@ -19,6 +19,7 @@
 // the link is reported down, and the outer loop retries.
 
 use crate::config::Config;
+use crate::cpus::BuilderExt as _;
 use crate::replication::{FullSyncGuard, HubTx, LinkState, ReplState};
 use crate::resp::parse::parse_resp_command;
 use crate::store::{self, SharedTsIndex, Store};
@@ -161,7 +162,7 @@ impl ReplicaStarter {
         let starter = self.clone();
         let spawned = std::thread::Builder::new()
             .name("kividb-replica".into())
-            .spawn(move || {
+            .spawn_released(move || {
                 match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -829,7 +830,7 @@ async fn run_replication_session(
         );
         let ours = {
             let store = store.clone();
-            tokio::task::spawn_blocking(move || crate::replication::digest::dataset_digest(&store))
+            crate::cpus::spawn_blocking(move || crate::replication::digest::dataset_digest(&store))
                 .await
                 .ok()
         };
@@ -968,7 +969,7 @@ async fn run_replication_session(
                     let before = crate::commands::helpers::now_ms()
                         .saturating_sub(uptime.saturating_add(1).saturating_mul(1000));
                     let (store, index_store) = (Arc::clone(store), Arc::clone(index_store));
-                    let deleted = tokio::task::spawn_blocking(move || {
+                    let deleted = crate::cpus::spawn_blocking(move || {
                         crate::commands::helpers::expire_keys_due_before(
                             &store,
                             &index_store,
@@ -1000,7 +1001,7 @@ async fn run_replication_session(
                 .saturating_sub(uptime.saturating_add(1).saturating_mul(1000));
             let store = Arc::clone(store);
             let index_store = Arc::clone(index_store);
-            let removed = tokio::task::spawn_blocking(move || {
+            let removed = crate::cpus::spawn_blocking(move || {
                 crate::field_expiry::expire_fields_due_before(&store, &index_store, before)
             })
             .await
@@ -1280,7 +1281,7 @@ async fn run_replication_session(
                 "Replication: Rebuilding {} search index(es) from the synced dataset",
                 schemas.len()
             );
-            let rebuild = tokio::task::spawn_blocking(move || {
+            let rebuild = crate::cpus::spawn_blocking(move || {
                 crate::vector::register_index_schemas(
                     &index_bg,
                     &schemas,
@@ -1341,7 +1342,7 @@ async fn run_replication_session(
             let index_for_rewrite = Arc::clone(index_store);
             let repl_state_for_rewrite = Arc::clone(repl_state);
             log_info!("Replication: AOF is on — rebasing it onto the synced dataset");
-            let rebased = tokio::task::spawn_blocking(move || {
+            let rebased = crate::cpus::spawn_blocking(move || {
                 crate::replication::save_dataset(
                     &store_for_rewrite,
                     &index_for_rewrite,
@@ -2639,7 +2640,7 @@ where
     {
         Ok(()) => None,
         Err(registration) => {
-            match tokio::task::spawn_blocking({
+            match crate::cpus::spawn_blocking({
                 let store = Arc::clone(&store);
                 let index_store = Arc::clone(&index_store);
                 let repl_state = Arc::clone(&repl_state);

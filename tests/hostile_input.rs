@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! What a client sends that is made to hurt the server: counts that do not
 //! fit, lengths that lie, nesting without end. Each must be answered with an
 //! error, and the server must go on answering.

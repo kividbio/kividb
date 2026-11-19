@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/blocked_commandstats_order.rs
 //
 // A client that `INFO clients` shows as no longer blocked has had its

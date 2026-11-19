@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/redis_8_10.rs
 //
 // Commands and options added between Redis 8.4 and 8.10, over the wire.

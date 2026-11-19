@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/expiry_propagation.rs
 //
 // A key's expiry, as the readers of the write stream see it: the AOF replayed

@@ -21,6 +21,7 @@
 
 use crate::cluster::ClusterState;
 use crate::cluster::node::NodeFlags;
+use crate::cpus::ScopeExt as _;
 use std::io::{BufRead, BufReader, Write};
 use std::net::ToSocketAddrs;
 use std::time::Duration;
@@ -123,7 +124,7 @@ pub fn forward(
             .iter()
             .map(|(host, port)| {
                 let (user, password) = (&user, &password);
-                scope.spawn(move || {
+                scope.spawn_released(move || {
                     run_on(host, *port, user, password, cmd)
                         .err()
                         .map(|e| format!("{host}:{port} ({e})"))

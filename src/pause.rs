@@ -1045,7 +1045,7 @@ mod tests {
         );
         let writer = {
             let (in_gate, out) = (std::sync::Arc::clone(&in_gate), std::sync::Arc::clone(&out));
-            std::thread::spawn(move || {
+            crate::cpus::spawn(move || {
                 let _gate = crate::write_gate::enter();
                 in_gate.wait();
                 out.wait();
@@ -1071,7 +1071,7 @@ mod tests {
         // it, leaves `PAUSE_UNTIL_MS` as the failing one set it. It is not
         // undone with it (#634).
         clear_pause();
-        let failing = std::thread::spawn(move || pause_clients_within(60_000, true, limit * 10));
+        let failing = crate::cpus::spawn(move || pause_clients_within(60_000, true, limit * 10));
         while active().is_none() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
