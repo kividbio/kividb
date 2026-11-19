@@ -1329,4 +1329,91 @@ mod tests {
         assert_eq!(of(|| panic!("made {}", 1)), "made 1");
         assert_eq!(of(|| std::panic::panic_any(7u8)), "a panic with no message");
     }
+
+    /// The entry pool's slabs, sparse and nobody's, beside a sparse
+    /// keyspace: a pass compacts the keyspace and never chooses a pool
+    /// slab, and pool allocations show in neither `fill()` nor
+    /// `slab_bytes()` (what decides whether a pass runs).
+    #[test]
+    fn a_pass_never_chooses_the_entry_pools_slabs() {
+        let _setup = Setup::new();
+        // A pool class no other test allocates (blocks of 3,969-4,032
+        // bytes; `value_slab`'s own test has 4,033-4,096): `acquire` would
+        // hand another test's thread these very slabs.
+        let class = value_slab::pool_class_of(4032).unwrap();
+        let size = value_slab::block_size(class);
+        let per_slab = value_slab::SLAB / size;
+        let slabs = 8;
+        assert_eq!(value_slab::slabs_of_class(class), 0);
+        let (fill_before, bytes_before) = (value_slab::fill(), value_slab::slab_bytes());
+        // Made on a thread that has ended: nobody owns the slabs.
+        let blocks: Vec<usize> = crate::cpus::spawn(move || {
+            (0..slabs * per_slab)
+                .map(|i| {
+                    let block = value_slab::alloc(class);
+                    // SAFETY: a new block of `size` bytes.
+                    unsafe { std::ptr::write_bytes(block.as_ptr(), i as u8, size) };
+                    block.as_ptr() as usize
+                })
+                .collect()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(value_slab::slabs_of_class(class), slabs);
+        // Half a megabyte of pool slabs: neither count moved by it (other
+        // tests may move them by a slab or two meanwhile).
+        let moved = |a: usize, b: usize| a.abs_diff(b) < slabs * value_slab::SLAB / 2;
+        assert!(moved(value_slab::slab_bytes(), bytes_before));
+        let fill = value_slab::fill();
+        assert!(moved(fill.slab_bytes, fill_before.slab_bytes));
+        assert!(moved(fill.live_bytes, fill_before.live_bytes));
+        // An eighth kept: the sparsest slabs there are.
+        let free = |b: usize| {
+            // SAFETY: allocated above, freed once.
+            unsafe { value_slab::free(std::ptr::NonNull::new(b as *mut u8).unwrap(), class) }
+        };
+        let kept: Vec<(usize, usize)> = blocks
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(i, _)| i.is_multiple_of(8))
+            .collect();
+        for (_, b) in blocks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !i.is_multiple_of(8))
+        {
+            free(*b);
+        }
+        let evacuating = |kept: &[(usize, usize)]| {
+            let regions = value_slab::regions_snapshot();
+            kept.iter()
+                .any(|&(_, b)| value_slab::is_evacuating(b as *const u8, &regions))
+        };
+        // Chosen with all the budget there is: no pool slab.
+        value_slab::plan_evacuation(usize::MAX);
+        assert!(!evacuating(&kept));
+        value_slab::finish_evacuation();
+        // A real pass, beside a sparse keyspace: it compacts the keyspace,
+        // and the pool's blocks stay where they are, as they were.
+        let store = sparse_store(&INLINE);
+        let mut streak = Streak::new();
+        let hits_before = hits();
+        stepped(&store, &mut streak);
+        assert!(hits() > hits_before, "the pass moved nothing");
+        assert!(!evacuating(&kept));
+        check(&store, &INLINE);
+        for &(i, b) in &kept {
+            // SAFETY: a live block of `size` bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(b as *const u8, size) };
+            assert!(bytes.iter().all(|&x| x == i as u8), "block {i} changed");
+        }
+        assert_eq!(value_slab::slabs_of_class(class), slabs);
+        kept.into_iter().for_each(|(_, b)| free(b));
+        assert_eq!(
+            value_slab::slabs_of_class(class),
+            0,
+            "empty slabs given back"
+        );
+    }
 }

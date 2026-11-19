@@ -18,8 +18,9 @@
 //! aligned to its size. A region's first [`SLAB`] bytes hold the headers of
 //! its slabs and nothing else, and are never given back, so a header
 //! outlives the memory it describes: a free that comes late still finds it.
-//! Each of the other slabs holds blocks of one class, sixteen bytes apart in
-//! size. Masking a block's address finds its region, and its offset its
+//! Each of the other slabs holds blocks of one class (the keyspace's are
+//! sixteen bytes apart in size, the entry pool's eight apart below 64, see
+//! below). Masking a block's address finds its region, and its offset its
 //! slab.
 //!
 //! **Ownership.** A slab with room is used by at most one thread at a time,
@@ -39,11 +40,17 @@
 //! entries of large hashes and sets (`collection_table::EntryPool`), which
 //! compaction cannot move: [`plan_evacuation`] never chooses their slabs,
 //! and [`fill`] and [`slab_bytes`], which decide whether compaction runs,
-//! leave them out. Everything else is the same machinery: a block costs
-//! (and `used_memory` counts) its class's size, any thread may free it, and
-//! a slab that empties gives its pages back at once. Its classes are 8
-//! bytes apart up to 64 (an 11-byte entry takes 16, a 20-byte one 24), then
-//! as the keyspace's.
+//! leave them out (INFO shows them apart, as `value_slab_pool_bytes`).
+//! Everything else is the same machinery: a block costs (and `used_memory`
+//! counts) its class's size, any thread may free it, and a slab nobody owns
+//! that empties gives its pages back at once. A slab a thread owns (the one
+//! it takes blocks of that class from) is settled only when the thread lets
+//! go of it: when it runs dry, or when the thread ends; until then its
+//! blocks freed by that thread wait on its local list, so each thread can
+//! hold up to one partly used slab per class it has used, the pool's
+//! classes included. Its classes are 8 bytes apart up to 64 (an 11-byte
+//! entry takes 16, a 20-byte one 24), then as the keyspace's, and its
+//! blocks are aligned to 8.
 
 use std::cell::{Cell, UnsafeCell};
 use std::ptr::{self, NonNull};
@@ -340,7 +347,8 @@ thread_local! {
 /// takes a block from, for as long as it takes it.
 static NOBODY: u8 = 0;
 
-/// A block of class `class`'s size, aligned to sixteen bytes.
+/// A block of class `class`'s size, aligned to sixteen bytes for the
+/// keyspace's classes and to eight for the entry pool's.
 ///
 /// Must not panic (#358, #370): the active defrag thread lives on after a
 /// panic in a pass, with its own slabs, and allocates again. A panic here
@@ -682,8 +690,11 @@ pub fn fill() -> Fill {
         for index in 1..SLABS {
             // SAFETY: a region's headers live as long as the process.
             let slab = unsafe { &*(region as *const Slab).add(index) };
+            // The state first: a slab taken empty gets its class before its
+            // state says it is in use (`acquire`'s release store).
+            let state = slab.state.load(Ordering::Acquire);
             let class = slab.class.load(Ordering::Relaxed) as usize;
-            live_bytes += match slab.state.load(Ordering::Relaxed) {
+            live_bytes += match state {
                 EMPTY => 0,
                 // The entry pool's.
                 _ if class >= CLASSES => 0,
@@ -835,9 +846,8 @@ pub fn slab_bytes() -> usize {
     IN_USE.load(Ordering::Relaxed) * SLAB
 }
 
-/// Bytes of the entry pool's slabs that hold something.
-// The library's, for tests and measurements; the server does not ask yet.
-#[allow(dead_code)]
+/// Bytes of the entry pool's slabs that hold something (INFO
+/// `value_slab_pool_bytes`).
 pub fn pool_slab_bytes() -> usize {
     POOL_IN_USE.load(Ordering::Relaxed) * SLAB
 }
@@ -868,6 +878,26 @@ pub fn generation_of(block: *const u8) -> u32 {
 /// the slabs are the process's, and one such test would take another's.
 #[cfg(test)]
 pub(crate) static EVACUATION_TESTS: Mutex<()> = Mutex::new(());
+
+/// For tests: how many slabs of `class` hold something (are not
+/// [`EMPTY`]).
+#[cfg(test)]
+pub(crate) fn slabs_of_class(class: usize) -> usize {
+    let regions = REGION_LIST.lock().clone();
+    regions
+        .iter()
+        .map(|&region| {
+            (1..SLABS)
+                .filter(|&index| {
+                    // SAFETY: a region's headers live as long as the process.
+                    let slab = unsafe { &*(region as *const Slab).add(index) };
+                    slab.state.load(Ordering::Acquire) != EMPTY
+                        && slab.class.load(Ordering::Relaxed) as usize == class
+                })
+                .count()
+        })
+        .sum()
+}
 
 /// For tests: how many slabs are being emptied.
 #[cfg(test)]
@@ -1002,7 +1032,12 @@ mod tests {
     #[allow(clippy::disallowed_methods)]
     fn pool_slabs_are_never_evacuated_and_empty_at_once() {
         let _one = EVACUATION_TESTS.lock();
-        let class = pool_class_of(16).unwrap();
+        // A class no other test allocates (blocks of 4,033-4,096 bytes, 16
+        // a slab): `acquire` takes a listed slab of the class before an
+        // empty one, so a test that allocated in the same class meanwhile
+        // could take the very slabs this one asserts on (the small classes
+        // are the tables' and `table_scan`'s, from many threads at once).
+        let class = pool_class_of(MAX_BLOCK).unwrap();
         let per_slab = capacity(class) as usize;
         let slabs = if cfg!(miri) { 2 } else { 3 };
         // Whole slabs and one block more: the slabs before the last are let

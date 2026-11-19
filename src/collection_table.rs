@@ -44,9 +44,12 @@
 //! except across a resize with a new seed (positions change with the seed),
 //! which only a chain over the cap starts: a scan across one still ends,
 //! and still never returns a cursor at or before the one it was given, but
-//! may miss elements that moved. A scan started from 0 while one is in
-//! progress, or after it, returns every element at least once (with no
-//! writes between pages: exactly once).
+//! may miss elements: a write between two of its pages takes a step of the
+//! resize, which can move an element from an old-seed position the scan has
+//! not reached to a new-seed one it has passed. A scan started after the
+//! resize with a new seed has ended has the guarantee again. (One started
+//! while it is in progress also returns every element if nothing is written
+//! between its pages.)
 //!
 //! **Resizing.** Above the maximum fill (0.875 of the main slots) the table
 //! doubles, below 1/8 it shrinks towards half full, by at most
@@ -160,7 +163,8 @@ unsafe impl Memory for SystemMemory {
 /// active defrag empties; the group arrays and arena chunks from the
 /// system. Not for the server: compaction cannot find a collection's entry
 /// to move it, so a slab holding one could never be emptied. Here so that
-/// the class steps can be measured against [`EntryPool`]'s.
+/// the class steps can be measured against [`EntryPool`]'s: server code
+/// cannot name it (`clippy.toml`).
 pub struct SlabMemory;
 
 // SAFETY: a slab block of `class_of(size)` is at least `size` bytes and
@@ -168,6 +172,7 @@ pub struct SlabMemory;
 // picks the same side `alloc_entry` did, from the same size. Slab blocks
 // are freed on any thread (`value_slab::free` puts another thread's block
 // on the slab's remote list).
+#[allow(clippy::disallowed_types)]
 unsafe impl Memory for SlabMemory {
     fn alloc(layout: Layout, zeroed: bool) -> NonNull<u8> {
         SystemMemory::alloc(layout, zeroed)
@@ -203,8 +208,10 @@ unsafe impl Memory for SlabMemory {
 /// classes of their own (8 bytes apart up to 64, then as the keyspace's)
 /// that active defrag never empties, so a collection's entry, which
 /// compaction cannot move, never pins a slab defrag is emptying. A block
-/// costs, and is counted in `used_memory` at, its class's size; a slab that
-/// empties gives its pages back at once. Entries over
+/// costs, and is counted in `used_memory` at, its class's size; a slab
+/// nobody owns gives its pages back as soon as it empties (one a thread
+/// owns, when the thread lets go of it: INFO `value_slab_pool_bytes` counts
+/// them). Entries over
 /// `value_slab::MAX_BLOCK`, the group arrays and the arena chunks come from
 /// the system allocator.
 pub struct EntryPool;
@@ -506,12 +513,36 @@ impl Arena {
         false
     }
 
-    /// Handed-out group number `i` (`i < self.groups`): a binary search of
-    /// the chunks.
+    /// The chunk group number `i` is in, from the sizes [`Self::take`] gives
+    /// chunks: `c`, `c`, `2c`, `4c` ... doubling up to [`Self::MAX_CHUNK`],
+    /// then that size, where `c` (a power of two) is the first chunk's.
+    #[inline]
+    fn chunk_of(&self, i: usize) -> usize {
+        let c = self.chunks[0].n;
+        let max = Self::MAX_CHUNK;
+        if i < c {
+            0
+        } else if i < max {
+            1 + (i / c).ilog2() as usize
+        } else {
+            i / max + (max / c).ilog2() as usize
+        }
+    }
+
+    /// Handed-out group number `i` (`i < self.groups`): its chunk worked out
+    /// from the chunk sizes, and found by a binary search should that ever
+    /// not hold.
     #[inline]
     fn group_at(&self, i: usize) -> *mut Group {
         debug_assert!(i < self.groups);
-        let c = &self.chunks[self.chunks.partition_point(|c| c.start <= i) - 1];
+        let at = self.chunk_of(i);
+        let c = match self.chunks.get(at) {
+            Some(c) if c.start <= i && i < c.start + c.n => c,
+            _ => {
+                debug_assert!(false, "group {i} is not in chunk {at}");
+                &self.chunks[self.chunks.partition_point(|c| c.start <= i) - 1]
+            }
+        };
         debug_assert!(i - c.start < c.n);
         // SAFETY: `start <= i < start + n` (every chunk but the last is
         // wholly handed out, and the last up to `used`): in the chunk.
@@ -1099,6 +1130,30 @@ const RANDOM_PICKS: usize = 128;
 /// progress; a resize with a new seed starts when that one ends.
 const RESEED_DUE: u8 = 1;
 
+/// Resizes with a new seed in a row, with no growth between them, after
+/// which a long chain starts none until the table grows: a chain that stays
+/// long under three random seeds is not one the seed made, and the table
+/// stays correct either way.
+pub const MAX_RESEEDS_IN_A_ROW: u8 = 3;
+
+/// The chain cap [`place`]'s callers apply: [`CHAIN_CAP`], lowered in tests
+/// to make resizes with a new seed happen.
+#[cfg(not(test))]
+#[inline(always)]
+fn chain_cap() -> usize {
+    CHAIN_CAP
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CHAIN_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(CHAIN_CAP) };
+}
+
+#[cfg(test)]
+fn chain_cap() -> usize {
+    TEST_CHAIN_CAP.with(std::cell::Cell::get)
+}
+
 /// The table: a hash's fields or a set's members (`K`), its memory from `A`.
 pub struct CollectionTable<K: Kind, A: Memory = EntryPool> {
     /// The main array (see [`Self::main`]): its groups and its size, apart
@@ -1130,6 +1185,12 @@ struct Rare {
     defer_free: bool,
     /// Resizes with a new seed so far.
     reseeds: u32,
+    /// Resizes with a new seed since the main array last grew.
+    reseeds_in_a_row: u8,
+    /// A growth [`CollectionTable::reserve`] asked for while a resize was in
+    /// progress: to `2^reserve_bits` groups, started when that one ends (0:
+    /// none).
+    reserve_bits: u8,
 }
 
 impl Rare {
@@ -1140,7 +1201,15 @@ impl Rare {
             retired: None,
             defer_free: false,
             reseeds: 0,
+            reseeds_in_a_row: 0,
+            reserve_bits: 0,
         }
+    }
+
+    /// Whether a chain of `depth` groups makes a resize with a new seed due.
+    #[inline]
+    fn reseed_due(&self, depth: usize) -> bool {
+        rare_reseed_due(depth, self.reseeds_in_a_row)
     }
 }
 
@@ -1234,6 +1303,12 @@ fn shrink_bits(n: usize) -> u8 {
         bits += 1;
     }
     bits
+}
+
+/// [`Rare::reseed_due`], for a caller that has the count borrowed apart.
+#[inline]
+fn rare_reseed_due(depth: usize, reseeds_in_a_row: u8) -> bool {
+    depth > chain_cap() && reseeds_in_a_row < MAX_RESEEDS_IN_A_ROW
 }
 
 /// Put an element (`slot`, hash `h`) in `array`'s chain for it, taking an
@@ -1447,9 +1522,12 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
     /// Add an element known not to be in the table.
     fn add(&mut self, h: u64, slot: *mut u8) {
         if self.len >= self.grow_at && self.main().bits < MAX_BITS {
-            // A growth's moves finish long before the table doubles again
-            // (at WRITE_STEP), but a shrink (after `set_max_fill`) or a
-            // resize with a new seed may be in progress: finished first.
+            // Not reached while a resize is in progress, but after
+            // `set_max_fill`: a growth's or a shrink's moves finish long
+            // before the table reaches its growth point (at WRITE_STEP), and
+            // so do those of a resize with a new seed, which starts under 3/4
+            // of it or else grows the array too (`start_reseed`). Kept as a
+            // safety net: it finishes that resize in one call.
             while self.resizing() {
                 self.step_resize(usize::MAX);
             }
@@ -1459,14 +1537,14 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
         let rare = self.rare.get_or_insert_with(|| Box::new(Rare::new()));
         // SAFETY: the main array and its arena; the element is new.
         let depth = unsafe { place::<A>(main, &mut rare.arena, h, slot) };
-        self.len += 1;
-        if depth > CHAIN_CAP {
+        if rare.reseed_due(depth) {
             self.flags |= RESEED_DUE;
         }
+        self.len += 1;
         if self.resizing() {
             self.step_resize(WRITE_STEP);
         } else if self.flags & RESEED_DUE != 0 {
-            self.start_resize(self.main().bits, true);
+            self.start_reseed();
         }
     }
 
@@ -1566,8 +1644,23 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
         }
     }
 
+    /// Start a resize with a new seed: into an array of the same size, or
+    /// of twice the size if the table is past 3/4 of its growth point (so
+    /// that no growth comes due before it ends), or of the size a `reserve`
+    /// waiting for the resize asked for.
+    fn start_reseed(&mut self) {
+        let mut bits = self.main().bits;
+        if self.len * 4 > self.grow_at * 3 && bits < MAX_BITS {
+            bits += 1;
+        }
+        if let Some(rare) = self.rare.as_mut() {
+            bits = bits.max(std::mem::take(&mut rare.reserve_bits));
+        }
+        self.start_resize(bits, true);
+    }
+
     /// Start moving the elements to a new array of `2^bits` groups; with a
-    /// new random seed if `reseed` (the array then the same size).
+    /// new random seed if `reseed`.
     fn start_resize(&mut self, bits: u8, reseed: bool) {
         debug_assert!(!self.resizing());
         let new = Array::alloc::<A>(bits);
@@ -1577,6 +1670,11 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
         if reseed {
             rare.reseeds += 1;
             self.flags &= !RESEED_DUE;
+        }
+        if bits > main.bits {
+            rare.reseeds_in_a_row = 0;
+        } else if reseed {
+            rare.reseeds_in_a_row = rare.reseeds_in_a_row.saturating_add(1);
         }
         let arena = std::mem::replace(&mut rare.arena, Arena::new());
         rare.old = Some(Old {
@@ -1610,6 +1708,7 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
             old,
             retired,
             defer_free,
+            reseeds_in_a_row,
             ..
         } = &mut **rare;
         let Some(o) = old.as_mut() else {
@@ -1648,7 +1747,7 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
             }
             o.next += 1;
         }
-        if deepest > CHAIN_CAP {
+        if rare_reseed_due(deepest, *reseeds_in_a_row) {
             self.flags |= RESEED_DUE;
         }
         if o.next < o.array.len() {
@@ -1670,8 +1769,14 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
                 _memory: PhantomData,
             });
         }
+        let reserved = self.rare.as_ref().map_or(0, |rare| rare.reserve_bits);
         if self.flags & RESEED_DUE != 0 {
-            self.start_resize(self.main().bits, true);
+            self.start_reseed();
+        } else if reserved > self.main().bits {
+            if let Some(rare) = self.rare.as_mut() {
+                rare.reserve_bits = 0;
+            }
+            self.start_resize(reserved, false);
         } else if shrank && self.sparse() {
             self.start_shrink();
         }
@@ -1701,19 +1806,22 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
     }
 
     /// Room for `more` elements besides those there before the table grows
-    /// again: a growth to that size starts now (and its moves are made a few
-    /// at a time, as any resize's).
+    /// again: a growth to that size starts now, or, if a resize is in
+    /// progress, when it ends (its moves are not hurried: no call does more
+    /// than a step of them); either way the moves are made a few at a time,
+    /// as any resize's. Until a growth waiting so starts, [`Self::capacity`]
+    /// does not show it.
     pub fn reserve(&mut self, more: usize) {
         let want = bits_for(self.len.saturating_add(more), self.max_fill);
         if want <= self.main().bits {
             return;
         }
-        while self.resizing() {
-            self.step_resize(usize::MAX);
+        if self.resizing() {
+            let rare = self.rare.as_mut().expect("a resize in progress");
+            rare.reserve_bits = rare.reserve_bits.max(want);
+            return;
         }
-        if want > self.main().bits {
-            self.start_resize(want, false);
-        }
+        self.start_resize(want, false);
     }
 
     /// Remove every element; the table keeps no memory but an empty group.
@@ -1818,9 +1926,11 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
             }
         };
         for _ in 0..RANDOM_PICKS {
-            let at = rng.gen_range(0..groups * SLOTS);
-            let (group, old) = group_at(at / SLOTS);
-            let slot = at % SLOTS;
+            // One draw: its product with the group count is the group (the
+            // high word) and, scaled again, the slot (from the low word).
+            let wide = u128::from(rng.next_u64()) * groups as u128;
+            let (group, old) = group_at((wide >> 64) as usize);
+            let slot = ((u128::from(wide as u64) * SLOTS as u128) >> 64) as usize;
             // SAFETY: a handed-out group of the table's.
             if unsafe { (*group).is_element(slot) } {
                 return Some((group, slot, old));
@@ -2283,11 +2393,13 @@ impl<A: Memory> CollectionTable<Fields, A> {
         };
         let value = new.as_ref();
         check_len(value.len())?;
-        let (Some(found), Some(old)) = (found, old) else {
+        // The TTL copied out: `old` is not used past here, before `rewrite`
+        // may free the entry.
+        let ttl = old.and_then(|entry| entry.ttl.zip(entry.ttl_position));
+        let Some(found) = found else {
             self.add_field(h, field, value, None);
             return Ok(Updated::Inserted);
         };
-        let ttl = old.ttl.zip(old.ttl_position);
         let moved = self.rewrite(found, field, value, ttl);
         self.after_write();
         Ok(Updated::Replaced { moved })
@@ -2803,7 +2915,7 @@ mod tests {
     /// position if it has a TTL.
     type HashModel = HashMap<Vec<u8>, (Vec<u8>, Option<(u64, u32)>)>;
 
-    fn check_hash(table: &HashT, model: &HashModel) {
+    fn check_hash<A: Memory>(table: &CollectionTable<Fields, A>, model: &HashModel) {
         table.check();
         assert_eq!(table.len(), model.len());
         for (field, (value, ttl)) in model {
@@ -2822,7 +2934,12 @@ mod tests {
     }
 
     /// One random operation of every kind a hash has, against the model.
-    fn hash_op(table: &mut HashT, model: &mut HashModel, rng: &mut StdRng, universe: usize) {
+    fn hash_op<A: Memory>(
+        table: &mut CollectionTable<Fields, A>,
+        model: &mut HashModel,
+        rng: &mut StdRng,
+        universe: usize,
+    ) {
         let field = field_name(rng, universe);
         match rng.gen_range(0..100) {
             0..=44 => {
@@ -3030,7 +3147,7 @@ mod tests {
         }
     }
 
-    fn check_set(table: &SetT, model: &HashSet<Vec<u8>>) {
+    fn check_set<A: Memory>(table: &CollectionTable<Members, A>, model: &HashSet<Vec<u8>>) {
         table.check();
         assert_eq!(table.len(), model.len());
         for member in model {
@@ -3045,7 +3162,12 @@ mod tests {
         assert_eq!(seen.len(), model.len());
     }
 
-    fn set_op(table: &mut SetT, model: &mut HashSet<Vec<u8>>, rng: &mut StdRng, universe: usize) {
+    fn set_op<A: Memory>(
+        table: &mut CollectionTable<Members, A>,
+        model: &mut HashSet<Vec<u8>>,
+        rng: &mut StdRng,
+        universe: usize,
+    ) {
         let member = member_for(rng, universe);
         match rng.gen_range(0..100) {
             0..=59 => assert_eq!(table.insert(&member).unwrap(), model.insert(member)),
@@ -4357,6 +4479,234 @@ mod tests {
         assert_eq!(live(), (blocks0, chunks0, bytes0));
     }
 
+    /// The model tests' operations on the memory tables use, the entry
+    /// pool, through growths, shrinks, copies and `retain`.
+    #[test]
+    fn model_on_the_entry_pool() {
+        let mut rng = StdRng::seed_from_u64(37);
+        let mut hash = CollectionTable::<Fields, EntryPool>::with_capacity_and_seed(0, 37);
+        let mut set = CollectionTable::<Members, EntryPool>::with_capacity_and_seed(0, 37);
+        let mut hash_model = HashModel::new();
+        let mut set_model = HashSet::new();
+        let universe = scale(20_000);
+        for round in 0..2 {
+            for n in 0..universe {
+                hash_op(&mut hash, &mut hash_model, &mut rng, universe);
+                set_op(&mut set, &mut set_model, &mut rng, universe);
+                if n.is_multiple_of(997) {
+                    check_hash(&hash, &hash_model);
+                    check_set(&set, &set_model);
+                }
+            }
+            check_hash(&hash.clone(), &hash_model);
+            check_set(&set.clone(), &set_model);
+            let odd = |len: usize| (len + round).is_multiple_of(3);
+            hash.retain(|e| !odd(e.field.len()));
+            hash_model.retain(|f, _| !odd(f.len()));
+            set.retain(|m| !odd(m.len()));
+            set_model.retain(|m| !odd(m.len()));
+            // Most removed: shrinks.
+            let fields: Vec<Vec<u8>> = hash_model.keys().cloned().collect();
+            for f in fields.iter().skip(universe / 50) {
+                assert!(hash.remove(f));
+                hash_model.remove(f);
+            }
+            let members: Vec<Vec<u8>> = set_model.iter().cloned().collect();
+            for m in members.iter().skip(universe / 50) {
+                assert!(set.remove(m));
+                set_model.remove(m);
+            }
+            check_hash(&hash, &hash_model);
+            check_set(&set, &set_model);
+        }
+    }
+
+    /// A table made on a thread that has ended and dropped on another: the
+    /// pool's slabs it used are all given back.
+    #[test]
+    fn a_table_from_a_thread_that_ended_is_freed_on_another() {
+        // Entries of 3,918 bytes, in a pool class (3,905-3,968) no other
+        // test allocates, so its slabs can be counted.
+        assert_eq!(field_header_for(8, 3_900, false).size(), 3_918);
+        let class = crate::value_slab::pool_class_of(3_918).unwrap();
+        let before = crate::value_slab::slabs_of_class(class);
+        let n = scale(200);
+        let table = std::thread::spawn(move || {
+            let mut t = CollectionTable::<Fields>::with_capacity_and_seed(0, 38);
+            for i in 0..n {
+                t.insert(format!("f{i:07}").as_bytes(), &[b'v'; 3_900], None)
+                    .unwrap();
+            }
+            t
+        })
+        .join()
+        .unwrap();
+        assert!(crate::value_slab::slabs_of_class(class) > before);
+        table.check();
+        assert_eq!(table.entry_bytes, n * 3_968);
+        std::thread::spawn(move || drop(table)).join().unwrap();
+        assert_eq!(crate::value_slab::slabs_of_class(class), before);
+    }
+
+    /// Writes between the pages of a scan while a resize with a new seed is
+    /// in progress: the scan ends, its cursor only goes forward (it may miss
+    /// elements); a scan started after the resize has ended returns every
+    /// element exactly once.
+    #[test]
+    fn a_scan_with_writes_during_a_resize_with_a_new_seed() {
+        let n = if cfg!(miri) { 80 } else { 300 };
+        let top = if cfg!(miri) { 5 } else { 10 };
+        let fields = colliding(39, n, top);
+        let mut table = HashT::with_capacity_and_seed(0, 39);
+        for f in &fields {
+            table.insert(f, b"x", None).unwrap();
+            if reseeding(&table) {
+                break;
+            }
+        }
+        assert!(reseeding(&table));
+        let mut model: HashSet<Vec<u8>> = table.iter().map(|e| e.field.to_vec()).collect();
+        let mut cursor = 0;
+        let mut pages = 0usize;
+        let mut extra = 0usize;
+        let mut returned = HashSet::new();
+        loop {
+            let next = table.scan(cursor, 3, |e| {
+                returned.insert(e.field.to_vec());
+            });
+            pages += 1;
+            assert!(pages < 100_000, "the scan ends");
+            // A write between pages: a step of the resize.
+            let f = format!("extra-{extra}").into_bytes();
+            table.insert(&f, b"y", None).unwrap();
+            model.insert(f);
+            extra += 1;
+            if next == 0 {
+                break;
+            }
+            assert!(next > cursor, "the cursor goes forward");
+            cursor = next;
+        }
+        assert!(returned.iter().all(|f| model.contains(f)));
+        while !table.step_resize(usize::MAX) {}
+        assert!(!reseeding(&table));
+        table.check();
+        let all = scan_fields(&table, 3);
+        assert_eq!(all.len(), model.len());
+        assert!(all.values().all(|&n| n == 1));
+    }
+
+    /// A resize with a new seed that starts above 3/4 of the growth point
+    /// grows the array too; one below it keeps its size.
+    #[test]
+    fn a_resize_with_a_new_seed_near_the_growth_point_grows() {
+        let top = if cfg!(miri) { 8 } else { 10 };
+        let fields = colliding(40, if cfg!(miri) { 60 } else { 100 }, top);
+        for (fill, grows) in [(0.80f64, true), (0.40, false)] {
+            let mut table = HashT::with_capacity_and_seed(0, 40);
+            // To `fill` of the growth point of 2^(top - 1) groups (2^7
+            // under Miri), with fields that never meet in one group.
+            let mut i = 0usize;
+            while table.bits < top as u8 - 1 || table.resizing() {
+                table
+                    .insert(format!("other-{i}").as_bytes(), b"v", None)
+                    .unwrap();
+                i += 1;
+                while !table.step_resize(usize::MAX) {}
+            }
+            while (table.len() as f64) < fill * table.grow_at as f64 {
+                table
+                    .insert(format!("other-{i}").as_bytes(), b"v", None)
+                    .unwrap();
+                i += 1;
+            }
+            while !table.step_resize(usize::MAX) {}
+            let bits = table.bits;
+            let mut started = None;
+            for f in &fields {
+                table.insert(f, b"x", None).unwrap();
+                if reseeding(&table) {
+                    started = Some(table.bits);
+                    break;
+                }
+            }
+            let started = started.expect("a resize with a new seed");
+            assert_eq!(started, if grows { bits + 1 } else { bits }, "fill {fill}");
+            while !table.step_resize(usize::MAX) {}
+            table.check();
+        }
+    }
+
+    /// With the cap made 1 (every overflow is "long"), resizes with a new
+    /// seed stop after MAX_RESEEDS_IN_A_ROW with no growth, and start again
+    /// once the table has grown.
+    #[test]
+    fn resizes_with_a_new_seed_stop_after_three_in_a_row() {
+        TEST_CHAIN_CAP.with(|cap| cap.set(1));
+        // Not scaled under Miri: a smaller table may see no overflow at all.
+        let mut table = HashT::with_capacity_and_seed(1_000, 41);
+        let bits = table.bits;
+        let mut i = 0usize;
+        while table.len() < table.capacity() / 2 {
+            table
+                .insert(format!("f{i}").as_bytes(), b"v", None)
+                .unwrap();
+            i += 1;
+            while !table.step_resize(usize::MAX) {}
+        }
+        assert_eq!(table.bits, bits, "no growth yet");
+        assert_eq!(reseeds(&table), u32::from(MAX_RESEEDS_IN_A_ROW));
+        table.check();
+        // Grown: the count starts afresh.
+        while table.bits == bits {
+            table
+                .insert(format!("f{i}").as_bytes(), b"v", None)
+                .unwrap();
+            i += 1;
+        }
+        while reseeds(&table) <= u32::from(MAX_RESEEDS_IN_A_ROW) && i < 20_000 {
+            table
+                .insert(format!("f{i}").as_bytes(), b"v", None)
+                .unwrap();
+            i += 1;
+        }
+        while !table.step_resize(usize::MAX) {}
+        assert!(reseeds(&table) > u32::from(MAX_RESEEDS_IN_A_ROW));
+        TEST_CHAIN_CAP.with(|cap| cap.set(CHAIN_CAP));
+        table.check();
+        for j in 0..i {
+            assert!(table.contains_key(format!("f{j}").as_bytes()));
+        }
+    }
+
+    /// A reserve while a resize is in progress hurries nothing: the growth
+    /// it asks for starts when that resize ends.
+    #[test]
+    fn a_reserve_during_a_resize_waits_for_it() {
+        let mut table = SetT::with_capacity_and_seed(0, 42);
+        let mut i = 0usize;
+        while !(table.resizing() && table.len() > scale(2_000)) {
+            table.insert(format!("member-{i}").as_bytes()).unwrap();
+            i += 1;
+        }
+        let next = table.rare.as_ref().unwrap().old.as_ref().unwrap().next;
+        let bits = table.bits;
+        table.reserve(scale(50_000));
+        assert!(table.resizing());
+        assert_eq!(table.bits, bits);
+        assert_eq!(
+            table.rare.as_ref().unwrap().old.as_ref().unwrap().next,
+            next,
+            "no moves made by the reserve"
+        );
+        while table.bits == bits {
+            table.step_resize(64);
+        }
+        assert!(table.capacity() >= table.len() + scale(50_000));
+        while !table.step_resize(usize::MAX) {}
+        table.check();
+    }
+
     /// Entries of the default memory, the entry pool, cost their class's
     /// size: 8 bytes apart up to 64.
     #[test]
@@ -4393,6 +4743,9 @@ mod tests {
             table.insert(format!("member-{i}").as_bytes()).unwrap();
         }
         table.reserve(more);
+        // A growth in progress (from the 100) ends first, then the
+        // reserved one starts.
+        while !table.step_resize(usize::MAX) {}
         assert!(table.capacity() >= 100 + more);
         let bits = table.bits;
         for i in 100..100 + more {

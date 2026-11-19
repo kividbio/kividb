@@ -42,9 +42,9 @@
 //!   #764's 3M fields, then after deleting 90% of them at random (and, for
 //!   glibc, after `malloc_trim`).
 //!
-//! The fixed-seed constructor is for measurements that must repeat; server
-//! code cannot use it (`clippy.toml`).
-#![allow(clippy::disallowed_methods)]
+//! The fixed-seed constructor and `SlabMemory` are for measurements; server
+//! code cannot use them (`clippy.toml`).
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::alloc::Layout;
 use std::hint::black_box;

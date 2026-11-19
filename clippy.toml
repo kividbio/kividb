@@ -16,3 +16,9 @@ disallowed-methods = [
     { path = "tokio::runtime::Handle::spawn_blocking", reason = "use crate::cpus::spawn_blocking_on" },
     { path = "tokio::runtime::Runtime::spawn_blocking", reason = "use crate::cpus::spawn_blocking_on" },
 ]
+
+# Entries in the keyspace's slab classes are for measurements only (the bench
+# example): active defrag cannot move a collection's entry.
+disallowed-types = [
+    { path = "kividb::collection_table::SlabMemory", reason = "entries in slabs active defrag empties could never be moved: tables use EntryPool (SlabMemory is for measurements)" },
+]
