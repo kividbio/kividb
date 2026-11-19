@@ -6899,6 +6899,7 @@ fn a_watched_transaction_of_sets_during_a_slot_handoff_is_refused_with_tryagain(
         let watched = format!("{{{key}}}:watched");
         let reply = exec_reaching_its_gates_during_a_slot_handoff_on(
             &["--io-model", model],
+            HandoffOrder::ImportFirst,
             &key,
             &[],
             &[vec!["WATCH", &watched]],
@@ -7024,14 +7025,40 @@ fn exec_on_key_reaching_its_gates_during_a_slot_handoff(
     queued: &[Vec<&str>],
     afterwards: impl FnOnce(&Node),
 ) -> Resp {
-    exec_reaching_its_gates_during_a_slot_handoff_on(&[], key, setup, &[], queued, afterwards)
+    exec_reaching_its_gates_during_a_slot_handoff_on(
+        &[],
+        HandoffOrder::ExecFirst,
+        key,
+        setup,
+        &[],
+        queued,
+        afterwards,
+    )
+}
+
+/// Which comes first in [`exec_reaching_its_gates_during_a_slot_handoff_on`]:
+/// the transaction, held once it is routed, or the import.
+#[derive(Clone, Copy, PartialEq)]
+enum HandoffOrder {
+    /// The transaction is held, then the import is asked for. On the Tokio
+    /// loop only: on io_uring, a command held at `routed` holds its whole
+    /// worker thread, and the import's `CLUSTER SYNCSLOTS START`, when the
+    /// kernel hands its connection to that worker, is never read. The
+    /// handoff never begins, and the transaction is never let go.
+    ExecFirst,
+    /// The import is asked for and held on the source's migration thread
+    /// before writes are paused (the failpoint `handoff-pausing`), then the
+    /// transaction is held, then the handoff goes on. Nothing from there to
+    /// the `TAKEOVER` needs a connection to the source: for both I/O models.
+    ImportFirst,
 }
 
 /// [`exec_on_key_reaching_its_gates_during_a_slot_handoff`], on nodes
-/// started with `args`, with the commands `before` sent ahead of `MULTI`
-/// (a `WATCH`) on the same connection.
+/// started with `args`, in the `order` given, with the commands `before`
+/// sent ahead of `MULTI` (a `WATCH`) on the same connection.
 fn exec_reaching_its_gates_during_a_slot_handoff_on(
     args: &[&str],
+    order: HandoffOrder,
     key: &str,
     setup: &[Vec<&str>],
     before: &[Vec<&str>],
@@ -7039,8 +7066,12 @@ fn exec_reaching_its_gates_during_a_slot_handoff_on(
     afterwards: impl FnOnce(&Node),
 ) -> Resp {
     let key = key.to_string();
+    let failpoints = match order {
+        HandoffOrder::ExecFirst => "routed",
+        HandoffOrder::ImportFirst => "routed,handoff-pausing",
+    };
     let env = [
-        ("KIVIDB_TEST_FAILPOINTS", "routed"),
+        ("KIVIDB_TEST_FAILPOINTS", failpoints),
         ("KIVIDB_TEST_STALL_KEYS", key.as_str()),
     ];
     let (nodes, _) = form_cluster_of(vec![
@@ -7068,12 +7099,31 @@ fn exec_reaching_its_gates_during_a_slot_handoff_on(
     commands.extend(queued.iter().cloned());
     commands.push(vec!["EXEC"]);
     let commands: Vec<&[&str]> = commands.iter().map(Vec::as_slice).collect();
-    let exec = commands_in_background(src.port, &commands);
-    let held = routed_and_held(src, 2);
-    let task_id = dst
-        .conn()
-        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
-        .text();
+    let import = || {
+        dst.conn()
+            .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+            .text()
+    };
+    let (exec, held, task_id) = match order {
+        HandoffOrder::ExecFirst => {
+            let exec = commands_in_background(src.port, &commands);
+            let held = routed_and_held(src, 2);
+            (exec, held, import())
+        }
+        HandoffOrder::ImportFirst => {
+            let task_id = import();
+            let pausing = src.dir.join("failpoint.handoff-pausing.1");
+            wait_until(
+                "the handoff to be about to pause writes",
+                Duration::from_secs(60),
+                || pausing.exists(),
+            );
+            let exec = commands_in_background(src.port, &commands);
+            let held = routed_and_held(src, 2);
+            std::fs::remove_file(pausing).unwrap();
+            (exec, held, task_id)
+        }
+    };
     wait_until(
         "the handoff to hold writes for the TAKEOVER",
         Duration::from_secs(60),
