@@ -33,9 +33,13 @@ within 5 %.
 CPUs this process may use, the server on the first and third (separate cores
 on a D4s_v5), `--threads 2`; memtier_benchmark (GET/SET 1:1, 1 thread, 20
 connections, 100,000 keys of 64 bytes) on the second; the loading client
-and a KNN probe (`EF_RUNTIME 100`, one query at a time), separate processes,
-on the fourth. 20,000 documents first, then for 20 s, three times: the load
-writes on, memtier runs, the probe searches. Gated: GET/SET p99 beside the
+and a KNN probe (`EF_RUNTIME 100`, one query at a time over 8 connections
+in turn), separate processes, on the fourth. 20,000 documents first, then
+for 20 s, five times (medians of the five): the load writes on, memtier
+runs, the probe searches. The probe's KNN p50 is that of its fastest
+connection: one on the loading client's worker waits behind its pipelines
+(1.2's way too), which says where the connection landed, not what the
+helpers cost. Gated: GET/SET p99 beside the
 build and the probe's KNN p50 beside the ingest, each within its recorded
 value and at most a fixed factor of v1.2.2's in the same session (1.2.2
 links each vector in the write, on the writing connection's worker, so its
@@ -64,7 +68,7 @@ ENGINES = ("v1_2_2", "candidate") + (("redis",) if MODULE else ())
 S = Suite("28-ft-hnsw", [Config("pipeline", threads=4, engines=ENGINES, self_hosted=True),
                          Config("beside", threads=2, engines=ENGINES, self_hosted=True)])
 DIM, M, EFC, EF, BATCH = 384, 16, 200, 100, 1000
-BESIDE_S, ROUNDS = 20, 3
+BESIDE_S, ROUNDS, PROBE_CONNS = 20, 5, 8
 # The candidate at most this many times v1.2.2's value in the same session.
 BESIDE_P99_X, BESIDE_KNN_X = 4.0, 3.0
 
@@ -138,41 +142,51 @@ def memtier_bin():
     raise RuntimeError("memtier_benchmark not found ($MEMTIER or PATH)")
 
 
-def ingest_proc(port, cpu, first, seconds, out):
-    """The loading client: HSET pipelines of BATCH new documents for `seconds`."""
+def ingest_proc(port, cpu, first, seconds, ready, go, out):
+    """The loading client: HSET pipelines of BATCH new documents for `seconds`,
+    their vectors made before the clock starts."""
     import numpy as np
     import redis
     os.sched_setaffinity(0, cpu)
     c = redis.Redis(host="127.0.0.1", port=port, socket_timeout=600)
-    rng = np.random.default_rng(first)
+    c.ping()
+    blobs = [x.tobytes() for x in np.random.default_rng(first).random((40 * BATCH, DIM), dtype=np.float32)]
+    ready.set()
+    go.wait()
     n = 0
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < seconds:
-        vecs = rng.random((BATCH, DIM), dtype=np.float32)
         p = c.pipeline(transaction=False)
         for i in range(BATCH):
-            p.hset("doc:%d" % (first + n + i), mapping={"v": vecs[i].tobytes(), "score": i % 101})
+            p.hset("doc:%d" % (first + n + i), mapping={"v": blobs[(n + i) % len(blobs)], "score": i % 101})
         p.execute()
         n += BATCH
     out.put({"docs": n, "s": time.perf_counter() - t0})
 
 
-def probe_proc(port, cpu, seconds, out):
-    """One query at a time, KNN 10 at EF_RUNTIME EF: the latency of each."""
+def probe_proc(port, cpu, seconds, ready, go, out):
+    """One query at a time, KNN 10 at EF_RUNTIME EF, over PROBE_CONNS connections
+    in turn: the latencies of each connection's queries. A connection that shares
+    a worker with the loading client waits behind its pipelines, which is not
+    what this measures: the suite takes the connection with the lowest median."""
     import numpy as np
     import redis
     os.sched_setaffinity(0, cpu)
-    c = redis.Redis(host="127.0.0.1", port=port, socket_timeout=600)
+    cs = [redis.Redis(host="127.0.0.1", port=port, socket_timeout=600) for _ in range(PROBE_CONNS)]
+    for c in cs:
+        c.ping()
     blobs = [x.tobytes() for x in np.random.default_rng(761).random((300, DIM), dtype=np.float32)]
     q = "*=>[KNN 10 @v $vec EF_RUNTIME %d]" % EF
-    lat = []
+    lat = [[] for _ in cs]
+    ready.set()
+    go.wait()
     t0 = time.perf_counter()
     i = 0
     while time.perf_counter() - t0 < seconds:
         t = time.perf_counter()
-        c.execute_command("FT.SEARCH", "idx", q, "PARAMS", "2", "vec", blobs[i % 300],
-                          "NOCONTENT", "LIMIT", "0", "10", "DIALECT", "2")
-        lat.append((time.perf_counter() - t) * 1000)
+        cs[i % len(cs)].execute_command("FT.SEARCH", "idx", q, "PARAMS", "2", "vec", blobs[i % 300],
+                                        "NOCONTENT", "LIMIT", "0", "10", "DIALECT", "2")
+        lat[i % len(cs)].append((time.perf_counter() - t) * 1000)
         i += 1
     out.put(lat)
 
@@ -203,13 +217,18 @@ def beside(ctx):
             time.sleep(0.02)
         c.execute_command("DEBUG", "POPULATE", "100000", "key", "64")
         seconds = max(4, int(BESIDE_S * min(1.0, float(os.environ.get("SCALE", "1") or 1)) or 4))
-        p99s, ops, p50s, docs = [], [], [], []
+        p99s, ops, p50s, docs, conn_p50s = [], [], [], [], []
         first = pre
         mp = multiprocessing.get_context("spawn")
         for _ in range(ROUNDS):
             q_in, q_kn = mp.Queue(), mp.Queue()
-            ing = mp.Process(target=ingest_proc, args=(node.port, cl_cpu, first, seconds, q_in))
-            prb = mp.Process(target=probe_proc, args=(node.port, cl_cpu, seconds, q_kn))
+            r_in, r_kn, go = mp.Event(), mp.Event(), mp.Event()
+            ing = mp.Process(target=ingest_proc, args=(node.port, cl_cpu, first, seconds, r_in, go, q_in))
+            prb = mp.Process(target=probe_proc, args=(node.port, cl_cpu, seconds, r_kn, go, q_kn))
+            ing.start()
+            prb.start()
+            if not (r_in.wait(120) and r_kn.wait(120)):
+                raise RuntimeError("the clients did not start")
             with tempfile.TemporaryDirectory() as tmp:
                 js = os.path.join(tmp, "memtier.json")
                 m = subprocess.Popen(["taskset", "-c", ",".join(map(str, mt_cpu)), mt, "-s", "127.0.0.1",
@@ -218,8 +237,7 @@ def beside(ctx):
                                       "--key-maximum", "100000", "-d", "64", "--test-time", str(seconds),
                                       "--hide-histogram", "--json-out-file", js],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                ing.start()
-                prb.start()
+                go.set()
                 got_in, lat = q_in.get(timeout=seconds + 600), q_kn.get(timeout=seconds + 600)
                 ing.join()
                 prb.join()
@@ -231,12 +249,14 @@ def beside(ctx):
             docs.append(got_in["docs"] / got_in["s"])
             ops.append(tot["Ops/sec"])
             p99s.append(tot["Percentile Latencies"]["p99.00"])
-            lat.sort()
-            p50s.append(lat[len(lat) // 2])
+            meds = sorted(sorted(x)[len(x) // 2] for x in lat if x)
+            p50s.append(meds[0])
+            conn_p50s.append(meds)
         ctx.emit("getset_p99_ms_beside_build", median(p99s), "ms", "lower",
                  gate=jitter([rel(50, abs=0.5), vs_v1_2_2(BESIDE_P99_X)]), samples=p99s)
         ctx.emit("knn_p50_ms_beside_ingest", median(p50s), "ms", "lower",
                  gate=jitter([rel(30, abs=0.2), vs_v1_2_2(BESIDE_KNN_X)]), samples=p50s)
+        ctx.raw["knn_p50_ms_by_connection"] = conn_p50s
         ctx.emit("getset_ops_beside_build", median(ops), "ops/s", "higher", gate=info(), samples=ops)
         ctx.emit("ingest_docs_per_s_beside", median(docs), "docs/s", "higher", gate=info(), samples=docs)
 

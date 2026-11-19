@@ -1109,7 +1109,10 @@ mod concurrency {
                 let def = store.get(name).unwrap();
                 let mut ids = crate::vector::postings::Bits::new();
                 {
-                    let p = def.postings.peek();
+                    // As a query's plan does: the writes queued while a
+                    // reader held the postings applied first, so that every
+                    // document written before has its id.
+                    let p = def.postings.read();
                     for key in candidates {
                         if let Some(id) = p.id(key) {
                             ids.set(id);
