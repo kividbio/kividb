@@ -987,6 +987,33 @@ the 4 Python readers are near their limit there, so it catches a loss, not
 a gain. #851's PR has the pinned measurements (server on 2 vCPUs, clients
 on the other 2, a Rust client), where the difference is larger.
 
+## Recorded run, suite 30
+
+Recorded 2026-11-19 on an Azure Standard_D4s_v5 (4 vCPU, Xeon Platinum **8573C**:
+this VM came with a newer CPU than the 8370C of most other baselines, and
+`recorded.cpu` says so), `--only 30 --record`, the candidate master `7fd67dbb`
+(#921 merged; it holds #928), the default `lua,tls` build by rustc 1.100.0 (the
+compiler of the v1.2.2 release binaries), Redis 8.10.2 from the VM image.
+One KiviDB worker. Runs: `pr934-7fd67dbb-d4s_v5` (recorded), `-rerun2`, `-rerun3`
+(the noise check; every gate passed; a run takes 549 s).
+
+CPU per call, microseconds (the three runs; the recorded value is the first):
+
+| workload | v1.2.2 | master | Redis 8.10.2 | master / v1.2.2 | gate |
+|---|---:|---:|---:|---:|---:|
+| Tyk's sliding log | 14.9-15.1 | 12.5-12.6 | 12.0-12.5 | 0.82-0.84x | 0.93x |
+| compare-and-delete lock | 9.3-9.7 | 8.8-9.1 | 8.0-8.2 | 0.93-0.95x | 1.03x |
+| `return 1` | 8.2-8.4 | 8.0 | 6.7-7.2 | 0.96-0.98x | 1.03x |
+| Tyk, keys under a hash tag | 14.9-15.4 | 12.8-13.5 | 12.1-12.5 | 0.86-0.87x | 0.93x |
+| lock, hash tag | 9.6-9.7 | 9.0-9.4 | 7.7-8.2 | 0.94-0.97x | 1.03x |
+| `return 1`, hash tag | 8.5-8.6 | 8.3-8.7 | 7.0-7.3 | 0.97-1.01x | 1.03x |
+
+The calls a second move by 0.7-5.4 % between the runs (10 % against the recorded
+value is the gate). The gates against v1.2.2 hold in all three runs; the
+nearest is the `return 1` row under a hash tag: 1.012x in the first run, 0.980x
+and 0.966x in the others, so a 1.03x gate is 1.8 % above the worst of three
+while the three differ by 4.6 %.
+
 ## Not covered
 
 Every row of the gains table in `docs/PERFORMANCE.md` has a suite here (01-13; 14 is #759 and 15 is #758, after that table).
