@@ -303,6 +303,9 @@ pub fn process_message(
             // us in *its* table, would re-add itself on its next heartbeat.
             let member = sender_is_member(state, &sender_id);
             if member {
+                if sender_flags.contains(NodeFlags::MASTER) {
+                    state.note_says_master(sender_id);
+                }
                 apply_heartbeat(
                     state,
                     sender_id,
@@ -344,6 +347,9 @@ pub fn process_message(
             // only acceptable as the answer to our own MEET — which the
             // dialer handles through `accept_meet_reply`, not through here.
             if sender_is_member(state, &sender_id) {
+                if sender_flags.contains(NodeFlags::MASTER) {
+                    state.note_says_master(sender_id);
+                }
                 apply_heartbeat(
                     state,
                     sender_id,
@@ -1441,6 +1447,86 @@ mod tests {
         }
         process_message(&cs, completed, peer());
         assert!(cs.cast_vote(q, r, 102, true, None));
+    }
+
+    /// A vote decided while the node's first PING as a replica comes in, in
+    /// between the vote's look at the node table and its taking of
+    /// `last_vote_for`: the PING is answered with a report, and the vote,
+    /// which reads the node's role under the lock, is refused. This node
+    /// never both reports to the node and votes for its replacement.
+    #[test]
+    fn a_report_made_while_a_vote_is_decided_refuses_the_vote() {
+        let cs = std::sync::Arc::new(ClusterState::new_enabled(None, 15000));
+        let (r, q, as_replica) = a_failed_master_and_its_replica(&cs);
+        let reported = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let (cs, reported) = (std::sync::Arc::clone(&cs), std::rc::Rc::clone(&reported));
+            crate::cluster::run_before_vote_lock(move || {
+                let report = report_in(process_message(&cs, as_replica, peer()));
+                reported.set(report.is_some());
+            });
+        }
+        let voted = cs.cast_vote(q, r, 100, false, None);
+        assert!(reported.get(), "the PING was answered with a report");
+        assert!(!voted, "voted for a replacement of a node it reported to");
+    }
+
+    /// Reports to a node that says it is a replica end three node timeouts
+    /// after the first, if it has not said it is a master by then; votes for
+    /// a replacement of it are refused until three node timeouts after the
+    /// last report, and given after. A restart of the node (more PINGs as a
+    /// replica) does not start the reports again; its saying it is a master
+    /// does.
+    #[test]
+    fn reports_to_a_node_that_does_not_complete_end_and_votes_follow() {
+        let node_timeout = 40;
+        let cs = ClusterState::new_enabled(None, node_timeout);
+        let (r, q, as_replica) = a_failed_master_and_its_replica(&cs);
+        let began = std::time::Instant::now();
+        assert!(report_in(process_message(&cs, as_replica.clone(), peer())).is_some());
+        assert!(!cs.cast_vote(q, r, 100, true, None));
+        // Reported on every PING, until the limit.
+        let mut last_report = began;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            if report_in(process_message(&cs, as_replica.clone(), peer())).is_none() {
+                break;
+            }
+            last_report = std::time::Instant::now();
+            assert!(
+                began.elapsed() < std::time::Duration::from_millis(node_timeout * 3 + 30),
+                "still reporting after {:?}",
+                began.elapsed()
+            );
+        }
+        assert!(began.elapsed() >= std::time::Duration::from_millis(node_timeout * 3));
+        // Refused while the last report may still count, given after.
+        if last_report.elapsed() < std::time::Duration::from_millis(node_timeout * 3 - 20) {
+            assert!(!cs.cast_vote(q, r, 101, true, None));
+        }
+        // Restarted, as a replica again: still no report.
+        process_message(&cs, meet(r), peer());
+        assert!(report_in(process_message(&cs, as_replica.clone(), peer())).is_none());
+        std::thread::sleep(std::time::Duration::from_millis(node_timeout * 3 + 10));
+        assert!(report_in(process_message(&cs, as_replica.clone(), peer())).is_none());
+        assert!(cs.cast_vote(q, r, 102, true, None));
+
+        // Its saying it is a master starts the reports afresh.
+        let cs = ClusterState::new_enabled(None, node_timeout);
+        let (r, _q, as_replica) = a_failed_master_and_its_replica(&cs);
+        assert!(report_in(process_message(&cs, as_replica.clone(), peer())).is_some());
+        std::thread::sleep(std::time::Duration::from_millis(node_timeout * 3 + 10));
+        assert!(report_in(process_message(&cs, as_replica.clone(), peer())).is_none());
+        let mut master = ping(r, NodeFlags::MASTER, vec![]);
+        if let BusMessage::Ping {
+            sender_config_epoch,
+            ..
+        } = &mut master
+        {
+            *sender_config_epoch = 7;
+        }
+        process_message(&cs, master, peer());
+        assert!(report_in(process_message(&cs, as_replica, peer())).is_some());
     }
 
     /// Losing *some* slots is a resharding, not a failover.

@@ -180,6 +180,10 @@ pub struct ReplState {
     /// and the replica has not streamed since it loaded it. Until then it
     /// may hold part of the master's dataset, or none of it.
     pub full_sync_unfinished: AtomicBool,
+    /// Replica side: full syncs loaded and streamed from since this process
+    /// started (`note_in_step` after `note_full_sync_started`): its
+    /// dataset is then a master's copy, not what it loaded at startup.
+    pub full_syncs_completed: AtomicU64,
     /// Replica side: full resyncs refused by the dataset guard, and why the
     /// most recent one was refused. See `replica_client::guard_full_sync`.
     pub full_syncs_refused: AtomicU64,
@@ -575,6 +579,7 @@ impl ReplState {
             master_link_down_since_ms: AtomicU64::new(0),
             in_step_ms: AtomicU64::new(0),
             full_sync_unfinished: AtomicBool::new(false),
+            full_syncs_completed: AtomicU64::new(0),
             full_syncs_refused: AtomicU64::new(0),
             last_sync_refusal: RwLock::new(None),
             repl_timeout_secs: AtomicU64::new(60),
@@ -1003,8 +1008,10 @@ impl ReplState {
     #[inline]
     pub fn note_in_step(&self) {
         self.in_step_ms.store(unix_ms(), Ordering::Relaxed);
-        if self.full_sync_unfinished.load(Ordering::Relaxed) {
-            self.full_sync_unfinished.store(false, Ordering::SeqCst);
+        if self.full_sync_unfinished.load(Ordering::Relaxed)
+            && self.full_sync_unfinished.swap(false, Ordering::SeqCst)
+        {
+            self.full_syncs_completed.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -6482,6 +6489,21 @@ mod replication_invariants_tests {
 #[cfg(test)]
 mod backlog_tests {
     use super::*;
+
+    /// A full sync counts as completed once it is loaded and streamed from,
+    /// once: a cluster node that completes a promotion after one is not
+    /// fenced for the dataset it loaded at startup.
+    #[test]
+    fn a_full_sync_counts_once_it_is_loaded_and_streamed() {
+        let r = ReplState::new_master();
+        r.note_in_step();
+        assert_eq!(r.full_syncs_completed.load(Ordering::SeqCst), 0);
+        r.note_full_sync_started();
+        assert_eq!(r.full_syncs_completed.load(Ordering::SeqCst), 0);
+        r.note_in_step();
+        r.note_in_step();
+        assert_eq!(r.full_syncs_completed.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn the_backlog_serves_what_follows_an_offset_while_it_still_has_it() {

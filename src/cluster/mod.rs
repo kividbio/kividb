@@ -83,6 +83,22 @@ struct HeldAsOwner {
     at: std::time::Instant,
 }
 
+/// This master's reports to one node that says it is a replica while this
+/// master holds it as the owner of slots. See
+/// [`ClusterState::owner_report_for`].
+#[derive(Debug, Clone, Copy)]
+struct Reporting {
+    /// When this master first reported to it, since it last said it is a
+    /// master or last owned no slots here.
+    began: std::time::Instant,
+    /// When this master last sent it a report.
+    last: Option<std::time::Instant>,
+    /// It reported for [`ClusterState::report_limit`] without the node
+    /// saying it is a master: no more reports, until it does, or owns no
+    /// slots here.
+    gave_up: bool,
+}
+
 /// The wait before a replica's first sync after it starts: see
 /// [`ClusterState::first_sync_may_begin`].
 struct FirstSync {
@@ -248,7 +264,7 @@ pub struct LostDataset {
     /// The replicas (`ip`, `port`) that answered they hold nothing.
     empty_replicas: parking_lot::Mutex<ahash::AHashSet<(String, u16)>>,
     /// For a fence put up as a promotion was completed
-    /// ([`ClusterState::fence_completed_promotion`]): the master it took
+    /// ([`ClusterState::fence_completion`]): the master it took
     /// over from, whose replicas count as this node's while the fence holds
     /// (they follow this node once they hear of it).
     old_master: parking_lot::Mutex<Option<NodeId>>,
@@ -328,18 +344,17 @@ pub struct ClusterState {
     /// holds this node as the owner of while this node says it is a
     /// replica. See [`Self::promotion_to_complete`]. Taken alone.
     held_as_owner: parking_lot::Mutex<AHashMap<NodeId, HeldAsOwner>>,
-    /// The members this master last told, in a PONG, that it holds them as
-    /// the owner of slots while they say they are replicas, and when
-    /// ([`Self::owner_report_for`]). Taken under `last_vote_for`, never
-    /// alone with it the other way round: a report and a vote for a
-    /// replacement of the same node exclude each other (see
-    /// [`Self::cast_vote`]).
-    reported_as_owner: parking_lot::Mutex<AHashMap<NodeId, std::time::Instant>>,
+    /// The members this master has told, in a PONG, that it holds them as
+    /// the owner of slots while they say they are replicas, and since when
+    /// ([`Self::owner_report_for`]). Taken under `last_vote_for`, or alone:
+    /// a report and a vote for a replacement of the same node exclude each
+    /// other (see [`Self::cast_vote`]).
+    reported_as_owner: parking_lot::Mutex<AHashMap<NodeId, Reporting>>,
     /// How many keys this node loaded at startup, if its dataset was not
     /// known to be all it had (see [`Self::check_dataset_at_start`]); `None`
     /// if it was. A promotion completed after such a start is fenced as a
     /// master that came back without its dataset is
-    /// ([`Self::fence_completed_promotion`]).
+    /// ([`Self::fence_completion`]).
     untrusted_start: parking_lot::Mutex<Option<usize>>,
     /// See [`Self::first_sync_may_begin`]. `heard` is taken alone.
     first_sync: FirstSync,
@@ -1493,7 +1508,7 @@ impl ClusterState {
     ///
     /// What it found is kept: a node that starts as a replica and then
     /// completes a promotion ([`Self::promotion_to_complete`]) is fenced
-    /// the same way at that moment ([`Self::fence_completed_promotion`]).
+    /// the same way at that moment ([`Self::fence_completion`]).
     pub fn check_dataset_at_start(&self, trusted: bool, keys: usize) {
         if !self.enabled {
             return;
@@ -1532,27 +1547,29 @@ impl ClusterState {
         self.refresh_state();
     }
 
-    /// Fence this node, a promotion just completed by
-    /// [`Self::complete_promotion_self`] and not yet served, if its dataset
-    /// at startup was not known to be all it had (no AOF, and no snapshot
-    /// from a clean shutdown: [`Self::check_dataset_at_start`]): it holds
-    /// what it last saved, while a replica of the shard may hold what it
+    /// The fence of a promotion completed by [`Self::complete_promotion_self`],
+    /// decided and put up under its locks (`nodes` is its node table),
+    /// before any of the slots is this node's here: if its dataset at
+    /// startup was not known to be all it had (no AOF, and no snapshot from
+    /// a clean shutdown: [`Self::check_dataset_at_start`]), and no full
+    /// sync has replaced it since ([`Self::trust_dataset`]), it holds what
+    /// it last saved, while a replica of the shard may hold what it
     /// acknowledged since. As for a master that came back without its
     /// dataset ([`LostDataset`]): with a live replica, of this node or of
     /// `old_master` in its view (they follow it once they hear of it), it
     /// serves none of the slots until a replica that holds them takes over
     /// (`+LOSTDATA`) or the replicas answer that they hold nothing either;
-    /// with none, it serves what it has. Called after the slots are taken
-    /// and before the replication layer is made master, so that no write is
-    /// taken before the fence is up.
-    pub fn fence_completed_promotion(&self, old_master: NodeId) {
-        let Some(keys) = *self.untrusted_start.lock() else {
-            return;
-        };
-        let me = self.myself();
-        let replicas = self
-            .nodes
-            .read()
+    /// with none, it serves what it has. Returns what to log, once the locks
+    /// are let go. The locks of `lost` and `untrusted_start` are taken
+    /// alone, never with another held but these.
+    fn fence_completion(
+        &self,
+        nodes: &AHashMap<NodeId, ClusterNode>,
+        me: NodeId,
+        old_master: NodeId,
+    ) -> Option<String> {
+        let keys = (*self.untrusted_start.lock())?;
+        let replicas = nodes
             .values()
             .filter(|n| {
                 n.id != me
@@ -1561,25 +1578,30 @@ impl ClusterState {
             })
             .count();
         if replicas == 0 {
-            log_warn!(
+            return Some(format!(
                 "Cluster: This node completed its promotion with the dataset it started with \
                  ({keys} keys loaded; no AOF, and no snapshot from a clean shutdown), and has no \
                  replica that could hold more: serving what it has"
-            );
-            return;
+            ));
         }
         *self.lost.old_master.lock() = Some(old_master);
         self.lost.offers.store(0, Ordering::Relaxed);
         self.lost.empty_replicas.lock().clear();
         self.lost.since_ms.store(now_ms(), Ordering::Relaxed);
         self.lost.fenced.store(true, Ordering::Relaxed);
-        log_warn!(
+        Some(format!(
             "Cluster: This node completed its promotion with the dataset it started with ({keys} \
              keys loaded; no AOF, and no snapshot from a clean shutdown). It serves none of its \
              slots until a replica that holds them takes over, or its replicas answer that they \
              hold nothing either"
-        );
-        self.refresh_state();
+        ))
+    }
+
+    /// A full sync has replaced the dataset this node started with: it is a
+    /// master's copy, and a promotion completed from here on is not fenced
+    /// for what it loaded at startup.
+    pub fn trust_dataset(&self) {
+        *self.untrusted_start.lock() = None;
     }
 
     /// Whether this node is fenced for a lost dataset ([`LostDataset`]).
@@ -2697,7 +2719,9 @@ impl ClusterState {
     ///   last two node timeouts;
     /// * that master does not say it is a replica while this node has told
     ///   it, within the last three node timeouts, that it holds it as the
-    ///   owner of its slots ([`Self::owner_report_for`]);
+    ///   owner of its slots ([`Self::owner_report_for`]); this node stops
+    ///   telling it so after [`Self::report_limit`], so this refusal lasts
+    ///   six node timeouts at most;
     /// * none of the slots the candidate `claims` for its master, if the
     ///   request says (an automatic failover's, from this version on), has
     ///   an owner here other than that master at a newer config epoch than
@@ -2718,7 +2742,7 @@ impl ClusterState {
             return false;
         }
         let me = self.myself();
-        let master_says_replica = {
+        {
             let nodes = self.nodes.read();
             let i_am_master = nodes
                 .get(&me)
@@ -2738,10 +2762,7 @@ impl ClusterState {
             if !master_failed && !force {
                 return false;
             }
-            nodes
-                .get(&master_id)
-                .is_some_and(|n| n.flags.contains(NodeFlags::REPLICA))
-        };
+        }
         if !self.owns_any_slot(me) {
             return false;
         }
@@ -2758,6 +2779,8 @@ impl ClusterState {
             );
             return false;
         }
+        #[cfg(test)]
+        before_vote_lock();
         // Taken before `handoff_holds` and the tasks of `slot_migrations`
         // (below), and never while either is held.
         let mut voted_for = self.last_vote_for.lock();
@@ -2770,12 +2793,21 @@ impl ClusterState {
         // in a PONG, that it holds it as the owner of its slots: it may be
         // completing its promotion on what this node said
         // (`promotion_to_complete`). Under `last_vote_for`, as the report
-        // is made (`owner_report_for`): one or the other, never both.
+        // is made (`owner_report_for`): one or the other, never both. Its
+        // role is read here, under the lock: a heartbeat that makes it a
+        // replica here comes before the report it is answered with, which
+        // is made under the lock too.
+        let master_says_replica = self
+            .nodes
+            .read()
+            .get(&master_id)
+            .is_some_and(|n| n.flags.contains(NodeFlags::REPLICA));
         if master_says_replica
             && self
                 .reported_as_owner
                 .lock()
                 .get(&master_id)
+                .and_then(|r| r.last)
                 .is_some_and(|at| at.elapsed() < self.report_withholds_votes())
         {
             log_info!(
@@ -3067,9 +3099,19 @@ impl ClusterState {
     /// is on its way. A report sent is noted, and this node votes for no
     /// replacement of `to` for a while after it ([`Self::cast_vote`]).
     /// Both are decided under `last_vote_for`: one or the other.
+    ///
+    /// Reports to one node end [`Self::report_limit`] after the first, if
+    /// it has not said it is a master by then (it cannot complete: too few
+    /// masters report to it, or it refuses their epoch): from then on this
+    /// master sends it none, until it says it is a master or owns no slots
+    /// here, and, three node timeouts after the last report, votes for a
+    /// replacement of it again. That survives the node's restarts: a node
+    /// that restarts over and over as a replica holds up an election of
+    /// its replacement for six node timeouts at most.
     pub fn owner_report_for(&self, to: NodeId) -> Option<crate::cluster::bus::OwnerReport> {
         let claims = self.slot_claims_of(to);
         if claims.is_empty() {
+            self.reported_as_owner.lock().remove(&to);
             return None;
         }
         let masters = self.voting_master_count();
@@ -3081,11 +3123,49 @@ impl ClusterState {
             return None;
         }
         let report = crate::cluster::bus::OwnerReport::valid(masters, claims)?;
-        self.reported_as_owner
-            .lock()
-            .insert(to, std::time::Instant::now());
+        let now = std::time::Instant::now();
+        let mut reporting = self.reported_as_owner.lock();
+        let r = reporting.entry(to).or_insert(Reporting {
+            began: now,
+            last: None,
+            gave_up: false,
+        });
+        if r.gave_up {
+            return None;
+        }
+        if now.duration_since(r.began) >= self.report_limit() {
+            r.gave_up = true;
+            log_warn!(
+                "Cluster: Node {} still says it is a replica {} ms after this master first \
+                 reported it the owner of its slots here: no more reports to it until it says it \
+                 is a master",
+                node_id_str(&to),
+                self.report_limit().as_millis()
+            );
+            return None;
+        }
+        r.last = Some(now);
+        drop(reporting);
         drop(voted_for);
         Some(report)
+    }
+
+    /// How long this master reports to one node at most
+    /// ([`Self::owner_report_for`]): three node timeouts. A node restarted
+    /// before its promotion was saved completes it within a heartbeat or
+    /// two of the first report.
+    fn report_limit(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.node_timeout_ms.saturating_mul(3))
+    }
+
+    /// Member `id` says, in a heartbeat, that it is a master: reports to it
+    /// start afresh, should it say it is a replica again (see
+    /// [`Self::owner_report_for`]).
+    pub fn note_says_master(&self, id: NodeId) {
+        let mut reporting = self.reported_as_owner.lock();
+        if !reporting.is_empty() {
+            reporting.remove(&id);
+        }
     }
 
     /// For how long after this node voted for a replacement of a master it
@@ -3149,7 +3229,14 @@ impl ClusterState {
     /// it for a while after it reported ([`Self::owner_report_for`]): this
     /// node completes nothing on the word of a master that helped elect
     /// another in its place, and no replacement is elected with the votes
-    /// of masters whose word it may be completing on.
+    /// of masters whose word it may be completing on. A master reports to
+    /// one node for three node timeouts at most, so the votes are refused
+    /// for six at most.
+    ///
+    /// Limit: a master that crashes and restarts within about a heartbeat
+    /// forgets that it reported (or voted), as the reports and the
+    /// replacements it voted for are not saved; the exclusion holds for the
+    /// masters that keep running.
     ///
     /// Why this cannot make two owners of S:
     ///
@@ -3248,7 +3335,9 @@ impl ClusterState {
     /// of them, checked with the slots taken under the same locks: a newer
     /// owner's claim (a `CLUSTER FAILOVER TAKEOVER`, another replica's
     /// election) taken in since the decision leaves them alone. `Err` says
-    /// why not. Takes `nodes`, then `slots`.
+    /// why not. Takes `nodes`, then `slots`. Fenced, if its dataset at
+    /// startup was not known to be whole, before the slots are its own
+    /// here ([`Self::fence_completion`]).
     pub fn complete_promotion_self(
         &self,
         old_master: NodeId,
@@ -3260,6 +3349,7 @@ impl ClusterState {
         }
         let me = self.myself();
         let mut claimed = Vec::new();
+        let fenced;
         {
             let mut nodes = self.nodes.write();
             let still_its_replica = nodes.get(&me).is_some_and(|n| {
@@ -3284,6 +3374,9 @@ impl ClusterState {
                         }
                     }
                 }
+                // Up before any of the slots is this node's here, so that
+                // routing never sees it the owner unfenced.
+                fenced = self.fence_completion(&nodes, me, old_master);
                 for &(start, end) in ranges {
                     for slot in start..=end {
                         slots[slot as usize] = Some(me);
@@ -3303,6 +3396,9 @@ impl ClusterState {
             if let Some(old) = nodes.get_mut(&old_master) {
                 old.flags.remove(NodeFlags::MASTER);
             }
+        }
+        if let Some(said) = fenced {
+            log_warn!("{said}");
         }
         self.refresh_state();
         Ok(claimed)
@@ -3346,7 +3442,7 @@ impl ClusterState {
             None => (Vec::new(), ahash::AHashSet::new()),
         };
         let can_fire = !master_slots.is_empty() && {
-            let (n, quorum) = completion_quorum(owners.len(), &reports);
+            let (n, quorum) = completion_quorum(&owners, &reports);
             let reporting: ahash::AHashSet<NodeId> = reports.iter().map(|(id, _)| *id).collect();
             let without = self
                 .first_sync
@@ -4106,16 +4202,44 @@ fn now_ms() -> u64 {
 }
 
 /// The `N` and `Q` of [`ClusterState::promotion_to_complete`]: `N` the
-/// greater of `owners` (the masters that own slots in this node's view) and
-/// the largest count of slot-owning masters among `reports`; `Q` a majority
-/// of `N`.
+/// greater of the number of `owners` (the masters that own slots in this
+/// node's view) and the largest count of slot-owning masters among the
+/// `reports` of those owners (a member that owns no slots here does not
+/// raise it); `Q` a majority of `N`.
 fn completion_quorum(
-    owners: usize,
+    owners: &ahash::AHashSet<NodeId>,
     reports: &[(NodeId, crate::cluster::bus::OwnerReport)],
 ) -> (usize, usize) {
-    let reported = reports.iter().map(|(_, r)| r.masters).max().unwrap_or(0);
-    let n = owners.max(reported);
+    let reported = reports
+        .iter()
+        .filter(|(from, _)| owners.contains(from))
+        .map(|(_, r)| r.masters)
+        .max()
+        .unwrap_or(0);
+    let n = owners.len().max(reported);
     (n, n / 2 + 1)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// For a test of what comes in between: run in `cast_vote` just before
+    /// it takes `last_vote_for`.
+    static BEFORE_VOTE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Have `hook` run, on this thread, in the next `cast_vote` just before it
+/// takes `last_vote_for`.
+#[cfg(test)]
+pub(crate) fn run_before_vote_lock(hook: impl FnOnce() + 'static) {
+    BEFORE_VOTE_LOCK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn before_vote_lock() {
+    if let Some(hook) = BEFORE_VOTE_LOCK.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
 }
 
 /// Whether `claims` cover every slot of `ranges` (each sorted, disjoint).
@@ -4158,7 +4282,7 @@ fn decide_unsaved_promotion(
     if master_slots.is_empty() || reports.is_empty() {
         return UnsavedPromotion::None;
     }
-    let (n, quorum) = completion_quorum(owners.len(), reports);
+    let (n, quorum) = completion_quorum(owners, reports);
     // The epoch each master that owns slots here holds this node at as the
     // owner of every one of the master's slots.
     let mut covering: Vec<u64> = Vec::new();
@@ -5346,7 +5470,6 @@ mod tests {
         cs.check_dataset_at_start(false, 5);
         assert!(!cs.lost_dataset(), "a replica at the start: no fence");
         cs.complete_promotion_self(m, 7, &[(0, 99)]).unwrap();
-        cs.fence_completed_promotion(m);
         assert!(cs.lost_dataset());
         cs.check_lost_dataset_fence();
         assert!(cs.lost_dataset(), "the old master's replica is live");
@@ -5357,7 +5480,6 @@ mod tests {
         let (cs, m, _x, _y) = restarted_replica();
         cs.check_dataset_at_start(false, 5);
         cs.complete_promotion_self(m, 7, &[(0, 99)]).unwrap();
-        cs.fence_completed_promotion(m);
         assert!(!cs.lost_dataset());
 
         // A trusted start: not fenced.
@@ -5365,8 +5487,74 @@ mod tests {
         add_replica(&cs, m);
         cs.check_dataset_at_start(true, 5);
         cs.complete_promotion_self(m, 7, &[(0, 99)]).unwrap();
-        cs.fence_completed_promotion(m);
         assert!(!cs.lost_dataset());
+
+        // A full sync loaded since an untrusted start: not fenced.
+        let (cs, m, _x, _y) = restarted_replica();
+        add_replica(&cs, m);
+        cs.check_dataset_at_start(false, 5);
+        cs.trust_dataset();
+        cs.complete_promotion_self(m, 7, &[(0, 99)]).unwrap();
+        assert!(!cs.lost_dataset());
+    }
+
+    /// The fence is up by the time any of the slots is this node's here:
+    /// a thread that reads the slot table under its lock never sees this
+    /// node the owner while it is unfenced.
+    #[test]
+    fn the_fence_is_up_before_the_slots_are_this_nodes() {
+        let (cs, m, _x, _y) = restarted_replica();
+        add_replica(&cs, m);
+        cs.check_dataset_at_start(false, 5);
+        let cs = std::sync::Arc::new(cs);
+        let me = cs.myself();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (cs, done) = (std::sync::Arc::clone(&cs), std::sync::Arc::clone(&done));
+            std::thread::spawn(move || {
+                let mut seen = 0u64;
+                while !done.load(Ordering::SeqCst) {
+                    let slots = cs.slots.read();
+                    if slots[0] == Some(me) {
+                        assert!(cs.lost_dataset(), "the owner, unfenced");
+                        seen += 1;
+                    }
+                }
+                seen
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        cs.complete_promotion_self(m, 7, &[(0, 99)]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        done.store(true, Ordering::SeqCst);
+        assert!(watcher.join().unwrap() > 0);
+    }
+
+    /// Only reports of masters that own slots in this node's view raise the
+    /// quorum: a member that owns none, with a count of its own, does not
+    /// make the quorum unreachable.
+    #[test]
+    fn only_slot_owners_reports_raise_the_quorum() {
+        let (cs, m, x, y) = restarted_replica();
+        let stranger = generate_node_id();
+        cs.note_held_as_owner(stranger, held_n(&[(0, 99)], 7, 100));
+        cs.note_held_as_owner(x, held(&[(0, 99)], 7));
+        cs.note_held_as_owner(y, held(&[(0, 99)], 7));
+        assert_eq!(
+            cs.promotion_to_complete(false),
+            UnsavedPromotion::Complete {
+                master: m,
+                epoch: 7,
+                slots: vec![(0, 99)],
+            }
+        );
+        // Nor does it hold the first sync back.
+        cs.first_sync.open.store(false, Ordering::Relaxed);
+        cs.note_held_as_owner(x, None);
+        cs.note_held_as_owner(y, None);
+        cs.note_pong_heard(x);
+        cs.note_pong_heard(y);
+        assert!(cs.first_sync_may_begin());
     }
 
     /// Coverage is decided on ranges, whatever their order, overlaps and

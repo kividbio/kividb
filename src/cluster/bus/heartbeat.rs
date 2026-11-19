@@ -472,6 +472,11 @@ async fn complete_unsaved_promotion(
                 node_id_str(&master)
             );
             test_hold("promotion-completing").await;
+            // A full sync loaded since the start: the dataset is a master's
+            // copy, not what was loaded then.
+            if repl_state.full_syncs_completed.load(Ordering::SeqCst) > 0 {
+                state.trust_dataset();
+            }
             state.observe_epoch(epoch);
             state.forget_held_as_owner();
             promote(state, repl_state, master, epoch, Some(&slots)).await
@@ -639,8 +644,12 @@ async fn replica_rank(
 /// only if this node still follows `old_master` and it still owns them
 /// ([`ClusterState::complete_promotion_self`]), and fenced, before any
 /// write is taken, if the node's dataset at startup was not known to be all
-/// it had ([`ClusterState::fence_completed_promotion`]). False if nothing
-/// was taken.
+/// it had (`ClusterState::fence_completion`, under the same locks as the
+/// slots are taken). False if nothing was taken.
+///
+/// Between the slots taken and the replication layer made master, the node
+/// owns them in its own view but is still a replica to the replication
+/// layer: a write routed to it then is refused (`READONLY`).
 async fn promote(
     state: &Arc<ClusterState>,
     repl_state: &Arc<crate::replication::ReplState>,
@@ -655,7 +664,7 @@ async fn promote(
         }
         Some(ranges) => match state.complete_promotion_self(old_master, epoch, ranges) {
             Ok(claimed) => {
-                state.fence_completed_promotion(old_master);
+                test_hold("promotion-taken").await;
                 claimed
             }
             Err(why) => {
