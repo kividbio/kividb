@@ -384,6 +384,61 @@ async fn park_blocking_uring(
         slot.held_by_pause();
         return Ok(());
     }
+    // A command that found a script on its hash tags (`blocking::hold_for_tags`):
+    // see `server::wait_for_tags`.
+    #[cfg(feature = "lua")]
+    if let Some(busy) = wait.take_tags() {
+        slot.held_by_pause();
+        let flushed = if out_buf.is_empty() {
+            true
+        } else {
+            let payload = std::mem::take(out_buf);
+            crate::stats::TOTAL_NET_OUTPUT_BYTES
+                .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::stats::record_write();
+            let _w = write_guard.lock().await;
+            let write = std::pin::pin!(stream.write_all(payload));
+            let (res, mut returned) = read_while_writing(
+                write,
+                watch,
+                crate::server::ReadAhead {
+                    carried,
+                    carried_from,
+                    held_elsewhere,
+                },
+                activity,
+                limit,
+            )
+            .await;
+            drop(_w);
+            returned.clear();
+            *out_buf = returned;
+            res.is_ok()
+        };
+        if let Some(subs) = subscriptions.filter(|_| flushed) {
+            subs.flushed();
+        }
+        // Whether the client is still there is watched as a blocking
+        // command's wait watches it (`PeerWatch`): a kill shuts the socket.
+        let gone = !flushed
+            || tokio::select! {
+                turns = crate::tag_locks::command_turns(&busy) => {
+                    slot.hold_tag_turns(turns);
+                    false
+                }
+                () = watch.gone() => true,
+            };
+        if !gone {
+            return Ok(());
+        }
+        interrupted.gone = true;
+        if slot.resuming() {
+            slot.make_gone();
+            return Ok(());
+        }
+        slot.release_count();
+        return Err(Vec::new());
+    }
     if slot.in_resume() && !wait.may_repark() {
         // A resumed handler parked again — it forgot its resume check. Reply as
         // if the wait timed out rather than looping forever.

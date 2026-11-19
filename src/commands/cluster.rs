@@ -2454,9 +2454,11 @@ struct MoveHold {
 /// What a script writes to a key it did not declare is not held back: the
 /// keys are deleted only if they still hold what was sent, and kept with
 /// `TRYAGAIN` otherwise, as before. Nothing is held, and `None` returned,
-/// from inside a transaction or a script (nothing runs beside them), or
-/// when this thread is in the write gate already (the lock of a key's hash
-/// tag, with `lua-parallel-scripts`).
+/// from inside a transaction or a script that runs alone (nothing runs
+/// beside them), or when this thread is in the write gate already (the
+/// lock of a key's hash tag, with `lua-parallel-scripts`). A script that
+/// runs beside others under its tags is refused `MIGRATE` before it gets
+/// here (`handler::run_from_script`, #340).
 fn hold_while_moving(db: usize, keys: &[&[u8]]) -> Option<MoveHold> {
     if crate::command_gate::alone_on_this_thread() || crate::write_gate::held_by_this_thread() {
         return None;

@@ -51,7 +51,12 @@
 // (`try_lock_keys`, which waits a bounded time at most). So no two of them
 // wait for each other. A script's turns among the scripts of its tags
 // (`script_turn`) are taken the same way, lowest stripe first, before any
-// gate or stripe, and are taken by nothing else.
+// gate or stripe. A client's command that finds a script on some of its
+// tags takes the turns of those tags too, the same way, holding nothing
+// else: its connection waits for them off its thread, and the command is
+// dispatched again holding them (`try_lock_found_keys`, `command_turns`,
+// #882). Should it find a script on another of its tags then, it lets go and
+// waits for the turns of both, so it waits at most once per tag.
 //
 // Whoever takes a tag's lock holds the write gate (`write_gate`) first, a
 // read as a write does: the gate, then the tags' locks, then the keys'
@@ -634,7 +639,7 @@ pub fn lock_named_keys(name: &str, cmd: &[&[u8]]) -> Option<KeysGuard> {
 /// for both kinds, the one `key_positions`' keys give, so that `lock_keys`
 /// is made once here.
 #[inline(never)]
-fn lock_found_keys(keys: NamedKeys, cmd: &[&[u8]]) -> Option<KeysGuard> {
+pub fn lock_found_keys(keys: NamedKeys, cmd: &[&[u8]]) -> Option<KeysGuard> {
     let at = match &keys {
         NamedKeys::Regular { from, last, step } => crate::keyspec::KeyIter::Range {
             next: *from,
@@ -644,6 +649,175 @@ fn lock_found_keys(keys: NamedKeys, cmd: &[&[u8]]) -> Option<KeysGuard> {
         NamedKeys::Other(keys) => keys.iter(),
     };
     lock_keys(at.map(|at| cmd[at]))
+}
+
+/// The stripes of a client's command that a script holds, or has its turn
+/// for ([`script_turn`]): what the command waits for, off its thread
+/// ([`command_turns`]). Lowest first, each once; and the stripes whose turns
+/// it held already, if it had waited before ([`try_lock_found_keys`]).
+#[cfg(feature = "lua")]
+#[derive(Debug)]
+pub struct TagsBusy(Vec<usize>);
+
+/// How long [`try_lock_found_keys`] waits at a time on a tag's lock that a
+/// client's command holds, before it looks again at whether a script has
+/// come for the tag meanwhile.
+#[cfg(feature = "lua")]
+const SPELL: Duration = Duration::from_micros(50);
+
+/// [`lock_found_keys`] for a command whose connection can wait for a script
+/// without its thread (#882): the lock of each tagged key it names
+/// ([`named_keys`]), or [`TagsBusy`] — with nothing taken or entered —
+/// when a script holds one of them or has its turn for it. A lock a
+/// client's command holds is waited for here, as in [`lock_keys`]: a
+/// command holds it for a moment.
+///
+/// All or none: a lock taken is let go of before it says busy, so the
+/// command holds no tag while its connection waits, and nothing waits for it
+/// meanwhile. Taken lowest first, as [`lock_keys`] takes them. The first
+/// look is what [`lock_keys`] does for one stripe, with `try_lock` for
+/// `lock`: what a command on a tag nobody holds costs is what it cost
+/// before.
+///
+/// `mine`: the stripes whose turns the command holds ([`command_turns`]),
+/// dispatched again after it waited. No script holds those, and what holds
+/// them is waited for. A busy answer then names them too: the command lets
+/// its turns go and waits for all of them together, lowest first, so each
+/// time it waits it waits for more of its tags, and it waits once per tag
+/// at most.
+#[cfg(feature = "lua")]
+#[inline(never)]
+pub fn try_lock_found_keys(
+    keys: NamedKeys,
+    cmd: &[&[u8]],
+    mine: &[usize],
+) -> Result<Option<KeysGuard>, TagsBusy> {
+    let at = match &keys {
+        NamedKeys::Regular { from, last, step } => crate::keyspec::KeyIter::Range {
+            next: *from,
+            last: *last,
+            step: *step,
+        },
+        NamedKeys::Other(keys) => keys.iter(),
+    };
+    let mut first: Option<usize> = None;
+    let mut more: Vec<usize> = Vec::new();
+    for key in at.map(|at| cmd[at]) {
+        let Some(tag) = tag_of(key) else { continue };
+        let stripe = stripe_of(tag);
+        match first {
+            None => first = Some(stripe),
+            Some(one) if one == stripe => {}
+            Some(_) => more.push(stripe),
+        }
+    }
+    let Some(first) = first else {
+        return Ok(None);
+    };
+    let gate = crate::write_gate::enter();
+    if more.is_empty()
+        && let Some(held) = STRIPE[first].0.try_lock()
+    {
+        return Ok(Some(KeysGuard {
+            _one: Some(held),
+            _more: Vec::new(),
+            _gate: gate,
+        }));
+    }
+    more.push(first);
+    more.sort_unstable();
+    more.dedup();
+    lock_unless_a_script_has_them(more, gate, mine)
+}
+
+/// The stripes `stripes`, lowest first, each waited for while a client's
+/// command holds it, and none of them if a script has the turn of one: it
+/// may hold the stripe for as long as it runs. Busy, it says which of them
+/// have a script's turn, with `mine` (see [`try_lock_found_keys`]).
+#[cfg(feature = "lua")]
+#[cold]
+#[inline(never)]
+fn lock_unless_a_script_has_them(
+    stripes: Vec<usize>,
+    gate: crate::write_gate::WriteGuard,
+    mine: &[usize],
+) -> Result<Option<KeysGuard>, TagsBusy> {
+    let mut held = Vec::with_capacity(stripes.len());
+    for &stripe in &stripes {
+        loop {
+            if let Some(guard) = STRIPE[stripe].0.try_lock_for(SPELL) {
+                held.push(guard);
+                break;
+            }
+            if !mine.contains(&stripe) && script_has_the_turn(stripe) {
+                drop(held);
+                drop(gate);
+                // The others a script has come for too, so that the command
+                // waits for them together: one is, at least, unless its
+                // script has ended since, which waiting finds at once.
+                let mut busy: Vec<usize> = stripes
+                    .iter()
+                    .copied()
+                    .filter(|&other| {
+                        other == stripe || mine.contains(&other) || script_has_the_turn(other)
+                    })
+                    .collect();
+                busy.dedup();
+                return Err(TagsBusy(busy));
+            }
+        }
+    }
+    Ok(Some(KeysGuard {
+        _one: None,
+        _more: held,
+        _gate: gate,
+    }))
+}
+
+/// Whether a script holds `stripe`'s turn ([`script_turn`]), or a command
+/// that waited for one does ([`command_turns`]). A script takes its turn
+/// before its stripes and lets go of it after them: one that holds a stripe
+/// holds the turn.
+#[cfg(feature = "lua")]
+fn script_has_the_turn(stripe: usize) -> bool {
+    TURN[stripe].try_lock().is_err()
+}
+
+/// The turns of `busy`'s stripes, lowest first as a script takes them
+/// ([`script_turn`]), for a command that found a script on its tags: it
+/// waits for them here, asleep, in line with the scripts of those tags and
+/// the commands that came before it, and is dispatched again holding them,
+/// so that no script that came after it on those tags runs first. Only
+/// those tags': a script on another tag of the command is not held up by it.
+/// It takes its stripes with [`try_lock_found_keys`] then — what holds
+/// those by then is a client's command, for a moment — and lets the turns
+/// go ([`TagTurns`]).
+#[cfg(feature = "lua")]
+pub async fn command_turns(busy: &TagsBusy) -> TagTurns {
+    let mut turns = Vec::with_capacity(busy.0.len());
+    for &stripe in &busy.0 {
+        turns.push(TURN[stripe].lock().await);
+    }
+    TagTurns {
+        stripes: busy.0.clone(),
+        _turns: turns,
+    }
+}
+
+/// What [`command_turns`] holds: kept by the connection until the command
+/// has taken its tags' locks, or has been answered without them.
+#[cfg(feature = "lua")]
+pub struct TagTurns {
+    stripes: Vec<usize>,
+    _turns: Vec<tokio::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(feature = "lua")]
+impl TagTurns {
+    /// The stripes whose turns these are.
+    pub fn stripes(&self) -> &[usize] {
+        &self.stripes
+    }
 }
 
 /// What active expiry holds of the tags of a batch of keys: the locks it
@@ -1844,6 +2018,192 @@ mod tests {
             let took = ran.join().unwrap();
             stop.store(true, Ordering::Relaxed);
             assert!(took < Duration::from_secs(2), "{took:?}");
+        });
+    }
+
+    /// `try_lock_found_keys` over the keys `named_keys` finds, as the command
+    /// path asks it.
+    #[cfg(feature = "lua")]
+    fn try_lock_named(name: &str, cmd: &[&[u8]]) -> Result<Option<KeysGuard>, TagsBusy> {
+        match named_keys(name, cmd) {
+            None => Ok(None),
+            Some(keys) => try_lock_found_keys(keys, cmd, &[]),
+        }
+    }
+
+    /// #882: what `try_lock_found_keys` takes. A tag a script holds is busy,
+    /// and nothing at all is taken then — not the other tags the command
+    /// names, nor the write gate; a tag nobody holds is taken; a key with no
+    /// tag takes nothing. Once the script is done, all are taken.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn a_command_finds_a_scripts_tag_busy_and_takes_nothing() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let held = |tag: &str| STRIPE[stripe_of(tag.as_bytes())].0.is_locked();
+        let script_tag = "tw882-script";
+        let other = (0..)
+            .map(|i| format!("tw882-other-{i}"))
+            .find(|tag| stripe_of(tag.as_bytes()) != stripe_of(script_tag.as_bytes()))
+            .unwrap();
+        let tags = ScriptTags::One(script_tag.as_bytes());
+        let turn = runtime.block_on(script_turn(&tags));
+        let script = lock_for_script(&tags);
+        let both = [
+            b"MGET".to_vec(),
+            format!("{{{other}}}:k").into_bytes(),
+            format!("{{{script_tag}}}:k").into_bytes(),
+        ];
+        let both: Vec<&[u8]> = both.iter().map(Vec::as_slice).collect();
+        let other_key = format!("{{{other}}}:k");
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let busy = try_lock_named("MGET", &both).err().expect("busy");
+                    assert_eq!(
+                        busy.0,
+                        vec![stripe_of(script_tag.as_bytes())],
+                        "the script's stripe only"
+                    );
+                    assert!(!held(&other), "the free tag was kept");
+                    assert!(!crate::write_gate::held_by_this_thread());
+                    let one = try_lock_named("GET", &[b"GET", other_key.as_bytes()]).expect("free");
+                    assert!(one.is_some() && held(&other));
+                    drop(one);
+                    assert!(matches!(
+                        try_lock_named("GET", &[b"GET", b"plain"]),
+                        Ok(None)
+                    ));
+                })
+                .join()
+                .unwrap();
+        });
+        drop(script);
+        drop(turn);
+        let all = try_lock_named("MGET", &both).expect("all free");
+        assert!(all.is_some() && held(&other) && held(script_tag));
+    }
+
+    /// #882: a tag a client's command holds — no script's turn — is waited
+    /// for, as `lock_keys` waits, and taken once it is let go of.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn a_command_waits_a_moment_for_another_commands_tag() {
+        let key = b"{tw882-command}:k".as_slice();
+        let first = lock_keys([key].into_iter());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let taken = try_lock_named("GET", &[b"GET", key]);
+            done_tx.send(matches!(taken, Ok(Some(_)))).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(first);
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        waiter.join().unwrap();
+    }
+
+    /// #882: a command that finds a script on one of its tags waits for that
+    /// tag's turn only: a script on another of its tags is not held up by it.
+    /// Dispatched again holding that turn, and finding a script on the other
+    /// tag now, it is told to wait for both.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn a_waiting_command_holds_only_the_busy_tags_turns() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let a = "tw882-busy-a";
+        let b = (0..)
+            .map(|i| format!("tw882-busy-b-{i}"))
+            .find(|tag| stripe_of(tag.as_bytes()) != stripe_of(a.as_bytes()))
+            .unwrap();
+        let mget = [
+            b"MGET".to_vec(),
+            format!("{{{a}}}:k").into_bytes(),
+            format!("{{{b}}}:k").into_bytes(),
+        ];
+        let mget: Vec<&[u8]> = mget.iter().map(Vec::as_slice).collect();
+        let on_another_thread = |mine: &[usize]| {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let keys = named_keys("MGET", &mget).expect("tagged");
+                        try_lock_found_keys(keys, &mget, mine).map(|held| held.is_some())
+                    })
+                    .join()
+                    .unwrap()
+            })
+        };
+        runtime.block_on(async {
+            let tags_a = ScriptTags::One(a.as_bytes());
+            let turn_a = script_turn(&tags_a).await;
+            let script_a = lock_for_script(&tags_a);
+            let busy = on_another_thread(&[]).expect_err("busy");
+            assert_eq!(busy.0, vec![stripe_of(a.as_bytes())]);
+            drop(script_a);
+            drop(turn_a);
+            let turns = command_turns(&busy).await;
+            let tags_b = ScriptTags::One(b.as_bytes());
+            let turn_b = tokio::time::timeout(Duration::from_millis(200), script_turn(&tags_b))
+                .await
+                .expect("a script on the other tag was held up");
+            let script_b = lock_for_script(&tags_b);
+            let again = on_another_thread(turns.stripes()).expect_err("busy");
+            let mut both = vec![stripe_of(a.as_bytes()), stripe_of(b.as_bytes())];
+            both.sort_unstable();
+            assert_eq!(again.0, both);
+            drop(script_b);
+            drop(turn_b);
+            // And with nothing on either, it takes both.
+            assert_eq!(on_another_thread(turns.stripes()).ok(), Some(true));
+            drop(turns);
+        });
+    }
+
+    /// #882: a command that found a script waits for the tag's turn in line
+    /// with scripts: after the script that holds it, before one that comes
+    /// after it.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn a_waiting_command_is_in_line_with_scripts() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let tag = b"tw882-line".as_slice();
+        let tags = ScriptTags::One(tag);
+        runtime.block_on(async {
+            let running = script_turn(&tags).await;
+            let busy = TagsBusy(vec![stripe_of(tag)]);
+            let order = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let command = tokio::spawn({
+                let order = order.clone();
+                async move {
+                    let turns = command_turns(&busy).await;
+                    order.lock().push("command");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    drop(turns);
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let later = tokio::spawn({
+                let order = order.clone();
+                async move {
+                    let _turn = script_turn(&ScriptTags::One(b"tw882-line")).await;
+                    order.lock().push("later script");
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                order.lock().is_empty(),
+                "nothing goes before the running script"
+            );
+            drop(running);
+            command.await.unwrap();
+            later.await.unwrap();
+            assert_eq!(*order.lock(), vec!["command", "later script"]);
         });
     }
 }
