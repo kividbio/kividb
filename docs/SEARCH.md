@@ -40,10 +40,10 @@ The full command surface, filters, hybrid search and edge cases are in **[COMMAN
     Measured with every CPU of a 4-vCPU server busy (memtier GET/SET, one client loading
     384-d vectors in pipelines, one `HSET` every 2 ms from another client): GET/SET p99
     1.6 ms with none, 2.1 ms with one helper, 2.6 ms with two; the build alone 1,540, 3,190
-    and 3,620 documents a second. With one helper a writer whose connection shares the
-    bulk loader's worker waits behind the loader's pipelines while the backlog is full:
-    its `HSET`s took 25 ms at the median in two runs of three, against a p99 of 2.3 ms
-    with none.
+    and 3,620 documents a second. A writer whose connection shares the bulk loader's
+    worker waits behind the loader's pipelines with or without helpers (its median 15-25
+    ms with none, 12-16 ms with one); on the other connections one helper raised the
+    `HSET` p99 from 2.3-2.7 ms to 4.5-4.7 ms.
   - Under a CPU limit the helpers would spend the quota the workers need and the whole
     server would be throttled (GET/SET p99 8-9 ms against 0.35 ms beside a load with
     `--cpus 2` and one helper), so there builds run at 1.2's speed unless

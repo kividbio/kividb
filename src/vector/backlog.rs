@@ -539,13 +539,12 @@ pub const AUTO_FROM_CPUS: usize = 8;
 /// probe and one `HSET` every 2 ms on the other CPUs, 40 s, 3 runs): GET/SET
 /// p99 1.6-1.7 ms with none (as master), 2.0-2.2 ms with one (1.3x), 2.5-2.7
 /// ms with two (1.6x); KNN p50 0.85-0.90, 1.04-1.10 and 1.10-1.14 ms; the
-/// build alone 1,540, 3,190 and 3,620 documents a second. With one, a
-/// writer whose connection shared the bulk loader's worker waited behind its
-/// pipelines while the backlog was full: the single-`HSET` probe's median
-/// was 25 ms in two runs of three, against a p99 of 2.25 ms in every run
-/// without helpers. A small server that serves while it loads is better off
-/// without them, so `auto` starts them from 8 CPUs; a number starts them on
-/// any machine.
+/// build alone 1,540, 3,190 and 3,620 documents a second. Over 8 writer
+/// connections, those on the bulk loader's worker waited behind its
+/// pipelines in every build (median 15-25 ms with none, 12-16 ms with one);
+/// on the others one helper took the `HSET` p99 from 2.3-2.7 ms to 4.5-4.7.
+/// A small server that serves while it loads is better off without them, so
+/// `auto` starts them from 8 CPUs; a number starts them on any machine.
 pub fn auto_helpers(cpus: usize, quota: bool) -> usize {
     if quota || cpus < AUTO_FROM_CPUS {
         return 0;

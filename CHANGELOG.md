@@ -437,9 +437,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `search-index-threads 1` (or more) trades serving latency for build
   speed: with every CPU of a 4-vCPU server busy, one helper gives a GET/SET
   p99 of 2.1 ms against 1.6 ms with none and builds 3,190 documents a
-  second against 1,540, but a writer sharing the bulk loader's worker
-  waited 25 ms at the median for its `HSET`s in two runs of three (2.3 ms
-  p99 with none); two give 2.6 ms and 3,620. A search takes
+  second against 1,540, and the `HSET` p99 of writers not on the bulk
+  loader's worker goes from 2.3-2.7 to 4.5-4.7 ms (a writer on that worker
+  waits behind its pipelines either way); two give 2.6 ms and 3,620. A
+  search takes
   the backlog's vectors before it walks the graph and does not hold the
   backlog meanwhile, so a long filtered search keeps no write waiting.
   Writes over a waiting key queue no more work for the helpers, and a

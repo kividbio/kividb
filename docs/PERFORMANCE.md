@@ -424,11 +424,20 @@ other 4; 40 s, 3 runs each, medians):
 | 1 | 2.10 ms | 1.08 ms | 4.4-34 ms | 3,190 docs/s |
 | 2 | 2.62 ms | 1.13 ms | 5.5 ms | 3,620 docs/s |
 
-One helper moved GET/SET p99 by 1.3x, two by 1.6x. The `HSET` column is a
-writer on the bulk loader's worker: with one helper the single `HSET` probe
-sat behind the loading client's pipelines in two runs of three (its median
-25 ms), the loader's pipelines taking longer while the backlog is full. A
-small server that serves while it loads is better off without helpers, so
+One helper moved GET/SET p99 by 1.3x, two by 1.6x. The `HSET` column is one
+writer connection: with one helper it shared the bulk loader's worker in two
+runs of three and waited behind its pipelines (median 25 ms). Measured again
+over 8 writer connections (3 runs each, the same load):
+
+| helpers | connections behind the loader | their median | `HSET` p99, other connections | GET/SET p99 |
+|---|---:|---:|---:|---:|
+| master | 2-3 of 8 | 19.6-23.9 ms | 2.3-2.4 ms | 1.05-1.60 ms |
+| 0 | 1-3 of 8 | 15.3-24.6 ms | 2.3-2.7 ms | 1.05-1.63 ms |
+| 1 | 1-3 of 8 | 12.5-15.5 ms | 4.5-4.7 ms | 2.18-2.61 ms |
+
+So a writer on the loader's worker waits in every build; what one helper
+costs is the other connections' latency. A small server that serves while it
+loads is better off without helpers, so
 `auto` starts none below 8 CPUs (three on 8, seven on 16), and builds there
 run at 1.2's speed unless `search-index-threads` is given a number.
 

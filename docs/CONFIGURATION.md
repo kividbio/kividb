@@ -195,10 +195,12 @@ another client):
 | 1 | 2.10 ms | 1.08 ms | 4.4-34 ms | 3,190 docs/s |
 | 2 | 2.62 ms | 1.13 ms | 5.5 ms | 3,620 docs/s |
 
-The `HSET` column is a writer on the bulk loader's worker: with one helper, a connection
-that shares that worker waits behind the loader's pipelines while the backlog is full (25 ms
-at the median in two runs of three; 4.4 ms at the p99 in the third, where it did not share
-it). Under a CPU quota a helper spends the quota and the
+The `HSET` column is one writer connection, so it shows where that connection landed:
+4.4-34 ms with one helper is a connection that shared the bulk loader's worker in two runs
+of three. Over 8 writer connections (one `HSET` every 2 ms in turn), the one or few on the bulk
+loader's worker wait behind its pipelines in every build, helpers or not (their median
+15-25 ms with none, 12-16 ms with one helper); on the others one helper raised the `HSET`
+p99 from 2.3-2.7 ms to 4.5-4.7 ms. Under a CPU quota a helper spends the quota and the
 whole server is throttled (GET/SET p99 8-9 ms against 0.35 ms beside a load with
 `--cpus 2` and one helper), which is why `auto` starts none there: in a container or a
 Kubernetes pod with a CPU limit, builds run at 1.2's speed unless the setting is given a
