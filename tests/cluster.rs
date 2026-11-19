@@ -8437,8 +8437,8 @@ const MIGRATES: &str = "if ARGV[1] == '' then return redis.call('SET', KEYS[1], 
                         return redis.call('MIGRATE', '127.0.0.1', ARGV[1], KEYS[1], '0', '5000')";
 
 /// A script that runs beside others under its hash tag may not `MIGRATE`
-/// (#340): it would get no hold on the keys it moves, and a write beside it
-/// to a key on the wire could be lost. It is refused, and the key stays.
+/// (#340): it cannot take the hold a `MIGRATE` takes on the keys it moves.
+/// It is refused, and the key stays.
 /// A script that runs alone, on a key with no tag, still migrates, under
 /// the hold a `MIGRATE` of a client's takes.
 #[cfg(feature = "lua")]

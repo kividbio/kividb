@@ -745,9 +745,8 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         // and the hold enters the write gate and takes the keys' order,
         // which a script beside others holds already, under its tags' locks:
         // taken there, it would be the other way round from every writer.
-        // So the script got no hold, and a write beside it to a key on the
-        // wire could be lost when the `MIGRATE` deleted it. A script that
-        // runs alone holds every other command back, and keeps its hold.
+        // So such a script is refused. A script that runs alone holds
+        // every other command back, and keeps its hold.
         if name2 == "MIGRATE" && crate::tag_locks::beside_others() {
             return resp_error(&format!(
                 "ERR Script attempted to run 'migrate' while running beside other scripts \

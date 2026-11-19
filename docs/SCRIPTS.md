@@ -157,8 +157,7 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
 
 - **A script running beside others may not `MIGRATE`.** A `MIGRATE` holds
   back writes to the keys it moves until they have left, and a script that
-  runs beside others cannot take that hold, so a write beside it could be
-  lost when the moved key was deleted. It fails instead:
+  runs beside others cannot take that hold. It fails instead:
 
   ```
   ERR Script attempted to run 'migrate' while running beside other scripts under the hash tag 'orders' of its KEYS (lua-parallel-scripts)
