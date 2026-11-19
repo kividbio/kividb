@@ -1033,12 +1033,12 @@ impl PackedList {
                 }
                 // A deque keeps its room when chunks leave it: a list of
                 // 3,000,000 drained to 300,000 kept 2 MB of it, 7 bytes an
-                // element left. Halved once it is a quarter full, so that a
-                // list going up and down across the line does not move it
-                // every time.
+                // element left. Once it is under a quarter full it is given
+                // back to twice what it holds, at once however much was cut
+                // (`LTRIM` of most of a long list), so that a list going up
+                // and down across the line does not move it every time.
                 n if n < m.chunks.capacity() / 4 && m.chunks.capacity() > 8 => {
-                    let room = m.chunks.capacity() / 2;
-                    m.chunks.shrink_to(room);
+                    m.chunks.shrink_to((2 * n).max(8));
                 }
                 _ => {}
             }
@@ -1858,9 +1858,24 @@ impl PackedList {
     /// Checks of the list's shape against its chunks, for tests: the
     /// counts add up, no chunk is empty or over full, every chunk between
     /// the ends outside the run is full, and `locate` finds the first and
-    /// the last element of every chunk where a plain walk finds them.
+    /// the last element of every chunk where a plain walk finds them; and a
+    /// chunk not marked `mixed` holds no element of [`SHORT`] bytes or more,
+    /// read with the decoding of both forms.
     #[cfg(test)]
     pub(crate) fn check_shape(&self) {
+        for c in 0..self.chunk_count() {
+            let chunk = self.chunk(c);
+            let mut at = chunk.start as usize;
+            for i in 0..chunk.count() {
+                let len = len_at(&chunk.buf, at);
+                assert!(
+                    chunk.mixed || len < SHORT,
+                    "element {i} of chunk {c} is {len} bytes in a chunk not marked mixed"
+                );
+                at += frame_len(len);
+            }
+            assert_eq!(at, chunk.buf.len(), "the frames of chunk {c}");
+        }
         let Chunks::Many(m) = &self.chunks else {
             return;
         };
@@ -2083,6 +2098,34 @@ mod tests {
         let mut backward: Vec<&[u8]> = list.range_rev(0, list.len()).collect();
         backward.reverse();
         assert_eq!(backward, expected);
+        // The chunk walks LRANGE takes (one-byte lengths where a chunk is not
+        // mixed): the whole list both ways, and ranges that begin and end
+        // inside chunks.
+        let n = model.len();
+        let mut spans = vec![(0, n)];
+        if n > 2 {
+            spans.push((1, n - 1));
+            spans.push((n / 3, n - n / 5));
+        }
+        if n > CHUNK_ENTRIES + 10 {
+            spans.push((CHUNK_ENTRIES / 2 + 1, CHUNK_ENTRIES + 9));
+        }
+        for (from, to) in spans {
+            let want: Vec<&[u8]> = model.range(from..to).map(Vec::as_slice).collect();
+            let mut walked: Vec<Vec<u8>> = Vec::new();
+            assert!(list.for_each_in(from, to, |e| {
+                walked.push(e.to_vec());
+                true
+            }));
+            assert_eq!(walked, want, "for_each_in {from}..{to}");
+            let mut walked: Vec<Vec<u8>> = Vec::new();
+            assert!(list.for_each_in_rev(from, to, |e| {
+                walked.push(e.to_vec());
+                true
+            }));
+            walked.reverse();
+            assert_eq!(walked, want, "for_each_in_rev {from}..{to}");
+        }
         assert_eq!(list.front(), model.front().map(Vec::as_slice));
         assert_eq!(list.back(), model.back().map(Vec::as_slice));
         // By index: every one of a short list, a spread of a long one.
@@ -2334,9 +2377,14 @@ mod tests {
         for step in 0..60_000 {
             let r = next();
             // Mostly short, one in eight with two-byte lengths or near the
-            // edge between the forms (`SHORT`).
+            // edge between the forms (`SHORT`), a third of those right at
+            // the edges of each form's byte values.
             let len = if (r >> 40) % 8 == 0 {
-                100 + (r >> 16) % 200
+                if (r >> 20) % 3 == 0 {
+                    [127, 128, 255, 256][(r >> 24) as usize % 4]
+                } else {
+                    100 + (r >> 16) % 200
+                }
             } else {
                 (r >> 16) % 40
             };
@@ -2525,6 +2573,55 @@ mod tests {
             };
             assert_eq!(m.chunks.capacity(), room);
         }
+    }
+
+    /// An `LTRIM` that keeps a tenth of a long list gives the deque of chunks
+    /// back to about what is left in one go, not halved once; and the room
+    /// left stays while the list goes up and down a little.
+    #[test]
+    fn a_big_trim_gives_back_the_deque_of_chunks_at_once() {
+        let value = [b'v'; 6];
+        let mut list = PackedList::new();
+        let mut model: VecDeque<Vec<u8>> = VecDeque::new();
+        for i in 0..640_000 {
+            list.push_back(&value);
+            if (100_000..164_000).contains(&i) {
+                model.push_back(value.to_vec());
+            }
+        }
+        let full = list.allocation_size() as f64 / 640_000.0;
+        list.keep_range(100_000, 164_000);
+        assert_same(&list, &model);
+        let Chunks::Many(m) = &list.chunks else {
+            panic!("one chunk")
+        };
+        let (n, room) = (m.chunks.len(), m.chunks.capacity());
+        assert!(room >= n && room <= 2 * n + 8, "{room} for {n} chunks");
+        let trimmed = list.allocation_size() as f64 / 64_000.0;
+        assert!(trimmed < full + 0.5, "{trimmed} {full}");
+        // MEMORY USAGE counts the room: exactly what is held.
+        assert_eq!(
+            list.allocation_size(),
+            std::mem::size_of::<Many>()
+                + room * std::mem::size_of::<Chunk>()
+                + m.chunks.iter().map(|c| c.buf.capacity()).sum::<usize>()
+        );
+        // Up and down by a few chunks at either end: the room stays.
+        for _ in 0..3 {
+            for _ in 0..640 {
+                list.push_back(&value);
+                list.push_front(&value);
+            }
+            for _ in 0..640 {
+                list.drop_front();
+                list.drop_back();
+            }
+        }
+        let Chunks::Many(m) = &list.chunks else {
+            panic!("one chunk")
+        };
+        assert_eq!(m.chunks.capacity(), room);
+        assert_same(&list, &model);
     }
 
     /// Lengths on both sides of the edge between one-byte and two-byte
