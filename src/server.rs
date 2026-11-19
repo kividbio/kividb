@@ -1197,10 +1197,8 @@ where
                 if last_read_full && !private_query_buffer {
                     let mut capped = (&mut reader).take(READ_BUFFER as u64);
                     let mut read = std::pin::pin!(capped.read_buf(&mut buffer));
-                    match std::future::poll_fn(|cx| {
-                        std::task::Poll::Ready(read.as_mut().poll(cx))
-                    })
-                    .await
+                    match std::future::poll_fn(|cx| std::task::Poll::Ready(read.as_mut().poll(cx)))
+                        .await
                     {
                         std::task::Poll::Ready(result) => read_at_once = Some(result),
                         std::task::Poll::Pending => {
