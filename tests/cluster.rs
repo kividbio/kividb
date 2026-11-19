@@ -2409,8 +2409,8 @@ fn promote_then_kill_unsaved(replica: &mut Node, others: &[&Node], key: &str, af
 /// A replica elected and promoted, its promotion announced and taken in by
 /// the other masters, but never saved (every save failed), and the process
 /// killed: restarted from the nodes.conf of before, it is a replica of the
-/// old master, which is dead, while the masters send that master's slots to
-/// it. A majority of the masters tell it, in their PONGs, that they hold it
+/// old master, which is dead, and the owner of that master's slots in the
+/// others' view. A majority of the masters tell it, in their PONGs, that they hold it
 /// as the owner of those slots at a config epoch newer than any it knows
 /// for them, and it completes the promotion at that epoch: it saves it,
 /// serves the slots, the writes it had taken before and after the
@@ -2663,19 +2663,83 @@ fn a_majority_holding_a_node_as_owner_at_an_older_epoch_is_not_followed() {
     assert!(!nodes[0].log().contains("Completing the promotion"));
 }
 
-/// A `CLUSTER FAILOVER TAKEOVER` by another replica of the shard, made as
-/// the node restarts: whichever happens first, the restarted node's
-/// completion at its old epoch or the takeover at a newer one, the
-/// takeover's claim wins everywhere, and every node, the restarted one
-/// included, ends with the one that took over as the one owner.
+/// `KIVIDB_TEST_FAILPOINTS` for [`FAILING_SAVES`] and the holds of the bus
+/// named in `holds` (`promotion-completing`: a restarted node that has
+/// decided to complete its promotion, held before it takes the slots;
+/// `promotion-claiming`: a replica that won an election, held before it
+/// takes its master's slots). A hold makes `failpoint.<name>.<n>` in the
+/// node's directory and waits, the bus running, until it is removed.
+fn failpoints(holds: &str) -> (&'static str, String) {
+    (FAILING_SAVES.0, format!("{},{holds}", FAILING_SAVES.1))
+}
+
+/// The file of the `n`th hold `name` of `node`, once it is there.
+fn wait_hold(node: &Node, name: &str, n: u32) -> PathBuf {
+    let file = node.dir.join(format!("failpoint.{name}.{n}"));
+    wait_until(
+        &format!("node {} to reach {name}", node.port),
+        Duration::from_secs(30),
+        || file.exists(),
+    );
+    file
+}
+
+/// Writes of keys in `range`, sent to `node` for `how_long`: `Err` with
+/// the first one it acknowledged, if it did. It is not the owner, or
+/// serves nothing: each is refused (`MOVED`, `CLUSTERDOWN`, `READONLY`).
+fn none_acknowledged(
+    node: &Node,
+    range: std::ops::RangeInclusive<u16>,
+    how_long: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + how_long;
+    let mut n = 0;
+    while Instant::now() < deadline {
+        let key = key_in(range.clone(), &format!("refused-{n}"));
+        n += 1;
+        let Some(mut c) = Conn::try_connect(node.port) else {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        };
+        let reply = c.cmd(&["SET", &key, "v"]);
+        if reply.is_ok() {
+            return Err(format!(
+                "node {} acknowledged SET {key}:\n{}",
+                node.port,
+                node.log()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+/// A `CLUSTER FAILOVER TAKEOVER` by another replica of the shard, made
+/// while the restarted node has decided to complete its promotion and is
+/// about to take the slots (held there, its bus running): the takeover's
+/// claim, at a newer epoch, is taken in by the restarted node too, which
+/// then takes nothing (it checks again, under the locks it takes the slots
+/// with, that it still follows its old master and that master still owns
+/// them), and follows the node that took over. The restarted node
+/// acknowledges no write throughout, and every node ends with the one that
+/// took over as the one owner.
 #[test]
 fn a_takeover_by_another_replica_during_the_restart_leaves_one_owner() {
     let (nodes, ranges) = form_cluster(3);
-    let mut replica = replica_whose_saves_can_fail(&nodes, &nodes[0]);
+    let holds = failpoints("promotion-completing");
+    let mut replica = add_replica_with(
+        &nodes,
+        &nodes[0],
+        &["--aof", "--appendfsync", "always"],
+        &[(holds.0, holds.1.as_str())],
+    );
     let other = add_replica(&nodes, &nodes[0]);
     wait_cluster_ok(&[&nodes[0], &nodes[1], &nodes[2], &replica, &other], 5);
     let range = ranges[0].0..=ranges[0].1;
-    let (before, after) = (key_in(range.clone(), "before"), key_in(range, "after"));
+    let (before, after) = (
+        key_in(range.clone(), "before"),
+        key_in(range.clone(), "after"),
+    );
     assert!(nodes[0].conn().cmd(&["SET", &before, "v"]).is_ok());
     assert_eq!(nodes[0].conn().cmd(&["WAIT", "2", "5000"]).int(), 2);
 
@@ -2691,17 +2755,379 @@ fn a_takeover_by_another_replica_during_the_restart_leaves_one_owner() {
     );
 
     replica.spawn();
+    let held = wait_hold(&replica, "promotion-completing", 1);
     let r = other.conn().cmd(&["CLUSTER", "FAILOVER", "TAKEOVER"]);
     assert!(r.is_ok(), "{r:?}");
-    let all = [&nodes[0], &nodes[1], &nodes[2], &replica, &other];
-    wait_one_owner(&all, &other, &before);
     let other_id = other.id();
     wait_until(
-        "the restarted node to follow the one that took over",
+        "the restarted node, held, to take the takeover's claim in",
+        Duration::from_secs(30),
+        || replica.my_row()[3] == other_id,
+    );
+    none_acknowledged(&replica, range.clone(), Duration::from_secs(1)).unwrap();
+    std::fs::remove_file(&held).unwrap();
+    wait_until(
+        "the restarted node to give the completion up",
+        Duration::from_secs(10),
+        || replica.log().contains("The promotion is not completed"),
+    );
+    none_acknowledged(&replica, range, Duration::from_secs(3)).unwrap();
+    assert!(!replica.is_master());
+    assert_eq!(replica.my_row()[3], other_id);
+    let all = [&nodes[0], &nodes[1], &nodes[2], &replica, &other];
+    wait_one_owner(&all, &other, &before);
+}
+
+/// Without the AOF, a node restarted before the save of its promotion has
+/// what it last saved, not the writes it acknowledged as the master since,
+/// which its replica holds. It completes the promotion fenced, as a master
+/// back without its dataset is: it serves none of the slots, tells the
+/// replica so when it asks for a sync (`+LOSTDATA`), the replica, which
+/// holds the writes, takes over, and the node follows it. Every write
+/// acknowledged on the shard is on the master that serves it and on its
+/// replicas.
+#[test]
+fn a_promotion_completed_without_the_aof_lets_a_replica_with_the_writes_take_over() {
+    let (mut nodes, ranges) = form_cluster(3);
+    let mut replica = add_replica_with_env(&nodes, &nodes[0], &[FAILING_SAVES]);
+    let other = add_replica(&nodes, &nodes[0]);
+    wait_cluster_ok(&[&nodes[0], &nodes[1], &nodes[2], &replica, &other], 5);
+    let range = ranges[0].0..=ranges[0].1;
+    let (before, after) = (key_in(range.clone(), "before"), key_in(range, "after"));
+    assert!(nodes[0].conn().cmd(&["SET", &before, "v"]).is_ok());
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "2", "5000"]).int(), 2);
+
+    // The replica takes over, its saves failing, and the old master, now
+    // its replica, goes: the other replica follows the new master.
+    fail_saves(&replica, true);
+    let r = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+    assert!(r.is_ok(), "{r:?}");
+    let replica_id = replica.id();
+    wait_until(
+        "the old master and the other replica to follow the new master",
+        Duration::from_secs(30),
+        || {
+            replica.is_master()
+                && nodes[0].my_row()[3] == replica_id
+                && other.my_row()[3] == replica_id
+        },
+    );
+    nodes[0].kill();
+    let moved = format!("MOVED {} 127.0.0.1:{}", slot_of(&before), replica.port);
+    wait_until(
+        "the others to send the slot to the new master",
+        Duration::from_secs(30),
+        || {
+            [&nodes[1], &nodes[2]]
+                .iter()
+                .all(|n| n.conn().cmd(&["GET", &before]).err() == Some(moved.as_str()))
+        },
+    );
+    // A write acknowledged by the new master, and on its replica.
+    let r = cmd_when_serving(&mut replica.conn(), &["SET", &after, "after-promotion"]);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(replica.conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+    replica.kill();
+    fail_saves(&replica, false);
+    assert!(saved_myself(&replica).contains("myself,slave"));
+
+    replica.spawn();
+    wait_until(
+        "the restarted node to complete its promotion",
+        Duration::from_secs(20),
+        || replica.log().contains("Completing the promotion"),
+    );
+    assert!(
+        replica
+            .log()
+            .contains("completed its promotion with the dataset it started with"),
+        "{}",
+        replica.log()
+    );
+    // The replica that holds the write takes over, and the node follows it.
+    let other_id = other.id();
+    wait_until(
+        "the replica that holds the write to take over, and the node to follow it",
+        Duration::from_secs(60),
+        || other.is_master() && !replica.is_master() && replica.my_row()[3] == other_id,
+    );
+    let mut c = other.conn();
+    assert_eq!(c.cmd(&["GET", &after]).text(), "after-promotion");
+    assert_eq!(c.cmd(&["GET", &before]).text(), "v");
+    let live = [&nodes[1], &nodes[2], &replica, &other];
+    wait_one_owner(&live, &other, &before);
+    let mut c = replica.conn();
+    assert!(c.cmd(&["READONLY"]).is_ok());
+    wait_until(
+        "the node, a replica, to have the write",
+        Duration::from_secs(30),
+        || matches!(c.cmd(&["GET", &after]), Resp::Bulk(v) if v == b"after-promotion"),
+    );
+}
+
+/// [`a_promotion_completed_without_the_aof_lets_a_replica_with_the_writes_take_over`]
+/// with no replica in the shard that could hold more than the node: it
+/// completes the promotion and serves what it has, as a master back
+/// without its dataset and without a replica does.
+#[test]
+fn a_promotion_completed_without_the_aof_and_without_a_replica_serves() {
+    let (mut nodes, ranges) = form_cluster(3);
+    let mut replica = add_replica_with_env(&nodes, &nodes[0], &[FAILING_SAVES]);
+    wait_cluster_ok(&[&nodes[0], &nodes[1], &nodes[2], &replica], 4);
+    let range = ranges[0].0..=ranges[0].1;
+    let (before, after, later) = (
+        key_in(range.clone(), "before"),
+        key_in(range.clone(), "after"),
+        key_in(range, "later"),
+    );
+    assert!(nodes[0].conn().cmd(&["SET", &before, "v"]).is_ok());
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+
+    fail_saves(&replica, true);
+    nodes[0].kill();
+    promote_then_kill_unsaved(&mut replica, &[&nodes[1], &nodes[2]], &before, &after);
+    replica.spawn();
+    wait_until(
+        "the restarted node to complete its promotion and serve",
+        Duration::from_secs(20),
+        || replica.is_master() && replica.cluster_info("cluster_state") == "ok",
+    );
+    assert!(
+        replica
+            .log()
+            .contains("has no replica that could hold more: serving what it has"),
+        "{}",
+        replica.log()
+    );
+    let r = cmd_when_serving(&mut replica.conn(), &["SET", &later, "v"]);
+    assert!(r.is_ok(), "{r:?}");
+    wait_one_owner(&[&nodes[1], &nodes[2], &replica], &replica, &later);
+}
+
+/// A replica elected to replace the node has won its votes and not yet
+/// taken the slots or announced it (held there) when the node restarts,
+/// before the save of its own earlier promotion was done. The masters that
+/// voted for the replacement send the node no report while that vote may
+/// still be won, so it does not complete its promotion: it acknowledges no
+/// write. Once the replacement takes the slots and announces it, every
+/// node has it as the one owner, and the node follows it.
+#[test]
+fn a_node_restarted_while_its_replacement_is_promoted_does_not_complete() {
+    let (mut nodes, ranges) = form_cluster(3);
+    let mut replica = replica_whose_saves_can_fail(&nodes, &nodes[0]);
+    let held_env = [("KIVIDB_TEST_FAILPOINTS", "promotion-claiming")];
+    let other = add_replica_with_env(&nodes, &nodes[0], &held_env);
+    wait_cluster_ok(&[&nodes[0], &nodes[1], &nodes[2], &replica, &other], 5);
+    let range = ranges[0].0..=ranges[0].1;
+    let (before, after) = (
+        key_in(range.clone(), "before"),
+        key_in(range.clone(), "after"),
+    );
+    assert!(nodes[0].conn().cmd(&["SET", &before, "v"]).is_ok());
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "2", "5000"]).int(), 2);
+
+    fail_saves(&replica, true);
+    let r = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+    assert!(r.is_ok(), "{r:?}");
+    let replica_id = replica.id();
+    wait_until(
+        "the old master and the other replica to follow the new master",
+        Duration::from_secs(30),
+        || {
+            replica.is_master()
+                && nodes[0].my_row()[3] == replica_id
+                && other.my_row()[3] == replica_id
+        },
+    );
+    nodes[0].kill();
+    promote_then_kill_unsaved(&mut replica, &[&nodes[1], &nodes[2]], &before, &after);
+    // The other replica is elected in its place, and held before it takes
+    // the slots.
+    let held = wait_hold(&other, "promotion-claiming", 1);
+
+    replica.spawn();
+    none_acknowledged(&replica, range, Duration::from_secs(4)).unwrap();
+    assert!(!replica.is_master());
+    assert!(!replica.log().contains("Completing the promotion"));
+    std::fs::remove_file(&held).unwrap();
+    let live = [&nodes[1], &nodes[2], &replica, &other];
+    wait_one_owner(&live, &other, &before);
+    let other_id = other.id();
+    wait_until(
+        "the restarted node to follow the one elected",
         Duration::from_secs(30),
         || !replica.is_master() && replica.my_row()[3] == other_id,
     );
-    wait_one_owner(&all, &other, &before);
+    assert!(!replica.log().contains("Completing the promotion"));
+}
+
+/// `node`'s nodes.conf, as it was before `gone` were added to the cluster:
+/// their rows left out, and their slots given to `to` (as if they had
+/// been `to`'s, and moved to them since).
+fn as_before_they_joined(node: &Node, gone: &[String], to: &str) {
+    let path = node.dir.join("nodes.conf");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut moved: Vec<String> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        if gone.iter().any(|id| id == fields[0]) {
+            moved.extend(fields.iter().skip(8).map(|s| s.to_string()));
+        } else {
+            kept.push(line.to_string());
+        }
+    }
+    for line in &mut kept {
+        if line.starts_with(to) {
+            for spec in &moved {
+                line.push(' ');
+                line.push_str(spec);
+            }
+        }
+    }
+    let mut out = kept.join("\n");
+    out.push('\n');
+    std::fs::write(&path, out).unwrap();
+}
+
+/// The node's nodes.conf is older than the cluster: it lists three masters
+/// that own slots, and the cluster has seven. At its restart only two of
+/// them, A and B, reach it (the four others and the replica elected in its
+/// place on their side are cut off), and A and B have not heard of that
+/// election: they hold the node as the owner, and say so, with seven as
+/// the count of masters that own slots. Two of three would be a majority of
+/// the node's view; two of seven is not, and it does not complete the
+/// promotion. Once the partition heals, every node has the one elected as
+/// the one owner.
+#[test]
+fn a_node_whose_nodes_conf_lists_fewer_masters_counts_the_reported_ones() {
+    let (mut nodes, ranges) = form_cluster_with_env(7, &[BUS_CONTROL, IGNORE_CLAIMS]);
+    let mut replica = replica_whose_saves_can_fail(&nodes, &nodes[0]);
+    let other = add_replica_with_env(&nodes, &nodes[0], &[BUS_CONTROL]);
+    let mut all: Vec<&Node> = nodes.iter().collect();
+    all.extend([&replica, &other]);
+    wait_cluster_ok(&all, 9);
+    let range = ranges[0].0..=ranges[0].1;
+    let (before, after) = (
+        key_in(range.clone(), "before"),
+        key_in(range.clone(), "after"),
+    );
+    assert!(nodes[0].conn().cmd(&["SET", &before, "v"]).is_ok());
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "2", "5000"]).int(), 2);
+
+    fail_saves(&replica, true);
+    let r = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+    assert!(r.is_ok(), "{r:?}");
+    let replica_id = replica.id();
+    wait_until(
+        "the old master and the other replica to follow the new master",
+        Duration::from_secs(30),
+        || {
+            replica.is_master()
+                && nodes[0].my_row()[3] == replica_id
+                && other.my_row()[3] == replica_id
+        },
+    );
+    nodes[0].kill();
+    // A and B take part in nothing of the next election, and hear nothing
+    // of it: their bus is stalled until the node restarts, and they take in
+    // none of the claims of the one elected.
+    let moved = format!("MOVED {} 127.0.0.1:{}", slot_of(&before), replica.port);
+    wait_until(
+        "the others to send the slot to the new master",
+        Duration::from_secs(30),
+        || {
+            nodes[1..]
+                .iter()
+                .all(|n| n.conn().cmd(&["GET", &before]).err() == Some(moved.as_str()))
+        },
+    );
+    let other_id = other.id();
+    for node in &nodes[1..3] {
+        std::fs::write(node.dir.join(IGNORE_CLAIMS.1), &other_id).unwrap();
+        set_bus(node, "stall");
+    }
+    for node in &nodes[1..3] {
+        wait_until("the bus to stall", Duration::from_secs(10), || {
+            node.log().contains("the bus is stalled")
+        });
+    }
+    let four: Vec<&Node> = nodes[3..].iter().collect();
+    promote_then_kill_unsaved(&mut replica, &four, &before, &after);
+    // Elected by the four, four of seven.
+    wait_until(
+        "the other replica to be elected in its place",
+        Duration::from_secs(30),
+        || other.is_master(),
+    );
+    // (A and B, silent for longer than a node timeout, are FAIL to the
+    // four, and their slots with them: the four answer CLUSTERDOWN, so
+    // their slot tables are read.)
+    let slot = slot_of(&before);
+    wait_until(
+        "the four to hold it as the owner of the slot",
+        Duration::from_secs(30),
+        || {
+            four.iter().all(|n| {
+                let rows = n.conn().cmd(&["CLUSTER", "NODES"]).text();
+                let owners: Vec<&str> = rows
+                    .lines()
+                    .filter(|l| {
+                        let fields: Vec<&str> = l.split(" ").collect();
+                        fields.len() > 8
+                            && fields[2].contains("master")
+                            && fields[8..].iter().any(|s| spec_holds(s, slot))
+                    })
+                    .filter_map(|l| l.split(" ").next())
+                    .collect();
+                owners == [other_id.as_str()]
+            })
+        },
+    );
+    // The partition: the four, and the one elected, answer nothing; A and B
+    // run again.
+    for node in four.iter().copied().chain([&other]) {
+        set_bus(node, "stall");
+    }
+    for node in four.iter().copied().chain([&other]) {
+        wait_until("the bus to stall", Duration::from_secs(10), || {
+            node.log().contains("the bus is stalled")
+        });
+    }
+    for node in &nodes[1..3] {
+        set_bus(node, "run");
+        wait_until("the bus to run again", Duration::from_secs(10), || {
+            node.log().contains("the bus runs again")
+        });
+    }
+    let gone: Vec<String> = nodes[3..].iter().map(|n| n.id()).collect();
+    as_before_they_joined(&replica, &gone, &nodes[1].id());
+
+    replica.spawn();
+    let refused = "and the masters report 7 masters that own slots, of which 4 are needed";
+    wait_until(
+        "the restarted node to count the reported masters",
+        Duration::from_secs(20),
+        || replica.log().contains(refused),
+    );
+    none_acknowledged(&replica, range, Duration::from_secs(3)).unwrap();
+    assert!(!replica.is_master());
+    assert!(!replica.log().contains("Completing the promotion"));
+
+    for node in nodes[3..].iter().chain([&other]) {
+        set_bus(node, "run");
+    }
+    for node in &nodes[1..3] {
+        std::fs::remove_file(node.dir.join(IGNORE_CLAIMS.1)).unwrap();
+    }
+    let mut live: Vec<&Node> = nodes[1..].iter().collect();
+    live.extend([&replica, &other]);
+    wait_one_owner(&live, &other, &before);
+    wait_until(
+        "the restarted node to follow the one elected",
+        Duration::from_secs(30),
+        || !replica.is_master() && replica.my_row()[3] == other_id,
+    );
 }
 
 /// With a node of 1.2 in the cluster, a master that does not say which
