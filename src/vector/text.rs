@@ -76,10 +76,16 @@ pub fn fields(entry: &[u32]) -> impl Iterator<Item = (u16, &[u32])> + '_ {
 
 // ── Sets of documents ────────────────────────────────────────────────────────
 
-/// The documents that hold a term in one field: a sorted list while they are
-/// few, a bitmap once the list would be the larger of the two.
+/// The documents that hold a term in one field: one, held in place; a
+/// sorted list while they are few; a bitmap once the list would be the
+/// larger of the two.
+///
+/// Most terms of most indexes are in one document (a name, a number, an
+/// identifier): a list of one was an allocation of its own, 32 bytes for 4
+/// (#761).
 #[derive(Debug, Clone)]
 enum DocSet {
+    One(u32),
     Sparse(Vec<u32>),
     Dense { bits: Bits, len: u32 },
 }
@@ -87,6 +93,7 @@ enum DocSet {
 impl DocSet {
     fn len(&self) -> usize {
         match self {
+            DocSet::One(_) => 1,
             DocSet::Sparse(ids) => ids.len(),
             DocSet::Dense { len, .. } => *len as usize,
         }
@@ -95,6 +102,17 @@ impl DocSet {
     /// Add `doc`. `slots` is how many ids there are, which a bitmap costs.
     fn insert(&mut self, doc: u32, slots: usize) -> bool {
         match self {
+            DocSet::One(one) => {
+                if *one == doc {
+                    return false;
+                }
+                *self = DocSet::Sparse(vec![(*one).min(doc), (*one).max(doc)]);
+                true
+            }
+            DocSet::Sparse(ids) if ids.is_empty() => {
+                *self = DocSet::One(doc);
+                true
+            }
             DocSet::Sparse(ids) => {
                 // Documents mostly come in the order of their ids.
                 match ids.last() {
@@ -131,10 +149,19 @@ impl DocSet {
 
     fn remove(&mut self, doc: u32, slots: usize) -> bool {
         match self {
+            DocSet::One(one) => {
+                if *one != doc {
+                    return false;
+                }
+                *self = DocSet::Sparse(Vec::new());
+                true
+            }
             DocSet::Sparse(ids) => match ids.binary_search(&doc) {
                 Ok(at) => {
                     ids.remove(at);
-                    if ids.capacity() > 16 && ids.len() * 4 < ids.capacity() {
+                    if let [one] = ids[..] {
+                        *self = DocSet::One(one);
+                    } else if ids.capacity() > 16 && ids.len() * 4 < ids.capacity() {
                         ids.shrink_to(ids.len() * 2);
                     }
                     true
@@ -159,6 +186,7 @@ impl DocSet {
 
     fn or_into(&self, out: &mut Bits) {
         match self {
+            DocSet::One(id) => out.set(*id),
             DocSet::Sparse(ids) => ids.iter().for_each(|&id| out.set(id)),
             DocSet::Dense { bits, .. } => out.or_with(bits),
         }
@@ -166,9 +194,89 @@ impl DocSet {
 
     fn bytes(&self) -> usize {
         match self {
+            DocSet::One(_) => 0,
             DocSet::Sparse(ids) => ids.capacity() * 4,
             DocSet::Dense { bits, .. } => bits.bytes(),
         }
+    }
+}
+
+impl<'a> IntoIterator for &'a FieldSets {
+    type Item = &'a (u16, DocSet);
+    type IntoIter = std::slice::Iter<'a, (u16, DocSet)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// A term's documents, by the TEXT field they hold it in: one field's held
+/// in place, as most terms are in one field. A list of fields was an
+/// allocation of its own, room for four from the first.
+#[derive(Debug, Clone, Default)]
+enum FieldSets {
+    #[default]
+    None,
+    One((u16, DocSet)),
+    Many(Vec<(u16, DocSet)>),
+}
+
+impl FieldSets {
+    fn as_slice(&self) -> &[(u16, DocSet)] {
+        match self {
+            FieldSets::None => &[],
+            FieldSets::One(one) => std::slice::from_ref(one),
+            FieldSets::Many(many) => many,
+        }
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, (u16, DocSet)> {
+        self.as_slice().iter()
+    }
+
+    fn get_mut(&mut self, field: u16) -> Option<&mut DocSet> {
+        match self {
+            FieldSets::None => None,
+            FieldSets::One((f, set)) => (*f == field).then_some(set),
+            FieldSets::Many(many) => many.iter_mut().find(|(f, _)| *f == field).map(|(_, s)| s),
+        }
+    }
+
+    /// `set` for `field`, which has none.
+    fn add(&mut self, field: u16, set: DocSet) {
+        *self = match std::mem::take(self) {
+            FieldSets::None => FieldSets::One((field, set)),
+            FieldSets::One(one) => FieldSets::Many(vec![one, (field, set)]),
+            FieldSets::Many(mut many) => {
+                many.push((field, set));
+                FieldSets::Many(many)
+            }
+        };
+    }
+
+    /// `field`'s set gone.
+    fn remove(&mut self, field: u16) {
+        *self = match std::mem::take(self) {
+            FieldSets::One((f, set)) if f != field => FieldSets::One((f, set)),
+            FieldSets::None | FieldSets::One(_) => FieldSets::None,
+            FieldSets::Many(mut many) => {
+                if let Some(at) = many.iter().position(|(f, _)| *f == field) {
+                    many.swap_remove(at);
+                }
+                match many.len() {
+                    0 => FieldSets::None,
+                    1 => FieldSets::One(many.remove(0)),
+                    _ => FieldSets::Many(many),
+                }
+            }
+        };
+    }
+
+    fn bytes(&self) -> usize {
+        let held = match self {
+            FieldSets::Many(many) => many.capacity() * std::mem::size_of::<(u16, DocSet)>(),
+            _ => 0,
+        };
+        held + self.iter().map(|(_, s)| s.bytes()).sum::<usize>()
     }
 }
 
@@ -181,7 +289,7 @@ struct Term {
     /// How many documents hold it, in any field.
     docs: u32,
     /// By field number: the documents holding it there.
-    postings: Vec<(u16, DocSet)>,
+    postings: FieldSets,
 }
 
 impl Term {
@@ -344,7 +452,7 @@ impl TextIndex {
         let term = Term {
             text: text.into(),
             docs: 0,
-            postings: Vec::new(),
+            postings: FieldSets::None,
         };
         if !term.is_stem() {
             self.words += 1;
@@ -368,7 +476,7 @@ impl TextIndex {
     /// A stem no document holds gives its id back.
     fn release(&mut self, id: u32) {
         let term = &mut self.terms[id as usize];
-        term.postings = Vec::new();
+        term.postings = FieldSets::None;
         if !term.is_stem() {
             return;
         }
@@ -455,24 +563,23 @@ impl TextIndex {
             let (field, id) = ((pair >> 32) as u16, pair as u32);
             let term = &mut self.terms[id as usize];
             if came {
-                let at = match term.postings.iter().position(|(f, _)| *f == field) {
-                    Some(at) => at,
+                match term.postings.get_mut(field) {
+                    Some(set) => {
+                        if set.insert(doc, slots) {
+                            self.records += 1;
+                        }
+                    }
                     None => {
-                        term.postings.push((field, DocSet::Sparse(Vec::new())));
-                        term.postings.len() - 1
+                        term.postings.add(field, DocSet::One(doc));
+                        self.records += 1;
                     }
-                };
-                if term.postings[at].1.insert(doc, slots) {
-                    self.records += 1;
                 }
-            } else {
-                if let Some(at) = term.postings.iter().position(|(f, _)| *f == field) {
-                    if term.postings[at].1.remove(doc, slots) {
-                        self.records -= 1;
-                    }
-                    if term.postings[at].1.len() == 0 {
-                        term.postings.swap_remove(at);
-                    }
+            } else if let Some(set) = term.postings.get_mut(field) {
+                if set.remove(doc, slots) {
+                    self.records -= 1;
+                }
+                if set.len() == 0 {
+                    term.postings.remove(field);
                 }
             }
         });
@@ -534,14 +641,7 @@ impl TextIndex {
             + self.terms.iter().map(|t| t.text.len()).sum::<usize>()
             + self.lookup.capacity() * 5
             + self.free.capacity() * 4;
-        let postings = self
-            .terms
-            .iter()
-            .map(|t| {
-                t.postings.capacity() * std::mem::size_of::<(u16, DocSet)>()
-                    + t.postings.iter().map(|(_, s)| s.bytes()).sum::<usize>()
-            })
-            .sum();
+        let postings = self.terms.iter().map(|t| t.postings.bytes()).sum();
         let docs = self.docs.capacity() * 16
             + self
                 .docs
@@ -660,6 +760,47 @@ mod tests {
                 (1, vec![("b".to_string(), false), ("+b2".to_string(), true)]),
             ]
         );
+    }
+
+    /// A term of one document in one field is held in place; one that
+    /// gains documents and fields, and loses them again, keeps its postings
+    /// right all the way.
+    #[test]
+    fn a_term_of_one_document_and_one_field_grows_and_shrinks() {
+        let mut index = TextIndex::new();
+        index.set(7, &[(0, words("solo"))], |_| 1);
+        assert_eq!(docs(&index, "solo", 0), vec![7]);
+        let id = index.term("solo").unwrap() as usize;
+        assert!(matches!(
+            index.terms[id].postings,
+            FieldSets::One((0, DocSet::One(7)))
+        ));
+        assert_eq!(index.bytes().postings, 0);
+
+        index.set(3, &[(0, words("solo"))], |_| 1);
+        index.set(9, &[(1, words("solo"))], |_| 1);
+        assert_eq!(docs(&index, "solo", 0), vec![3, 7]);
+        assert_eq!(docs(&index, "solo", 1), vec![9]);
+        assert_eq!(index.num_records(), 3);
+        assert_eq!(index.df_of("solo"), 3);
+
+        index.remove(3, |_| 1);
+        assert_eq!(docs(&index, "solo", 0), vec![7]);
+        index.remove(7, |_| 1);
+        assert_eq!(docs(&index, "solo", 0), Vec::<u32>::new());
+        assert_eq!(docs(&index, "solo", 1), vec![9]);
+        assert!(matches!(
+            index.terms[id].postings,
+            FieldSets::One((1, DocSet::One(9)))
+        ));
+        index.remove(9, |_| 1);
+        assert!(matches!(index.terms[id].postings, FieldSets::None));
+        assert_eq!(index.num_records(), 0);
+        // Written again, the same document is one posting, not two.
+        index.set(9, &[(1, words("solo solo"))], |_| 1);
+        index.set(9, &[(1, words("solo"))], |_| 1);
+        assert_eq!(docs(&index, "solo", 1), vec![9]);
+        assert_eq!(index.num_records(), 1);
     }
 
     #[test]

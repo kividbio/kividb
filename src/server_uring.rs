@@ -901,6 +901,40 @@ fn open_subscriptions(
     subs
 }
 
+/// A connection made a monitor, with the task that writes what it is shown.
+/// On this thread, sharing the fd as the subscriptions' task does.
+fn start_monitoring(
+    monitor_registry: &crate::monitor::SharedMonitorRegistry,
+    client_registry: &crate::client_registry::ClientRegistry,
+    client_id: u64,
+    pubsub: &PubSubHub,
+    stream: &Rc<TcpStream>,
+    write_guard: &Rc<tokio::sync::Mutex<()>>,
+) -> crate::monitor::Monitoring {
+    let (mut monitoring, mut outbox) = crate::monitor::connect(
+        monitor_registry,
+        std::sync::Arc::clone(client_registry),
+        client_id,
+        pubsub.shared_limits(),
+    );
+    let stream = Rc::clone(stream);
+    let write_guard = Rc::clone(write_guard);
+    monitoring.forwarded_by(tokio_uring::spawn(async move {
+        while let Some(lines) = outbox.next().await {
+            let _w = write_guard.lock().await;
+            crate::stats::TOTAL_NET_OUTPUT_BYTES
+                .fetch_add(lines.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::stats::record_write();
+            let (res, lines) = stream.write_all(lines).await;
+            if res.is_err() {
+                break;
+            }
+            outbox.written(lines);
+        }
+    }));
+    monitoring
+}
+
 /// The address a client connected to: `laddr` in `CLIENT LIST`.
 fn local_address(stream: &TcpStream) -> Option<std::net::SocketAddr> {
     let fd = std::os::fd::AsRawFd::as_raw_fd(stream);
@@ -2026,9 +2060,13 @@ pub async fn handle_client(
             // runs it (#550).
             if cmd_name == "MONITOR" && !tx.active {
                 if monitoring.is_none() {
-                    monitoring = Some(crate::monitor::Monitoring::start(
+                    monitoring = Some(start_monitoring(
                         &monitor_registry,
-                        push_tx.clone(),
+                        &client_registry,
+                        client_id,
+                        &pubsub,
+                        &stream,
+                        &write_guard,
                     ));
                     client_registry.update(client_id, |info| info.flags = "O".to_string());
                 }
