@@ -637,9 +637,14 @@ fn readers_see_a_script_whole_or_not_at_all(io: &str) {
     let base = 4; // plainlist and the cursor's documents
     let script = held_six(&server, &sha);
 
-    let readers: Vec<std::thread::JoinHandle<Seen>> = (0..12)
-        .map(|kind| {
-            let mut r = free_conn(&server);
+    // Every connection first: a reader that waits for the script holds the
+    // thread it is served on (`tag_locks::walk`), which then answers no
+    // new connection.
+    let conns: Vec<Conn> = (0..12).map(|_| free_conn(&server)).collect();
+    let readers: Vec<std::thread::JoinHandle<Seen>> = conns
+        .into_iter()
+        .enumerate()
+        .map(|(kind, mut r)| {
             let flag = server.stall_flag();
             let cursor = cursor.clone();
             std::thread::spawn(move || {
@@ -829,13 +834,16 @@ fn a_slot_is_counted_with_a_script_whole_or_not_at_all() {
     // series are not needed here; the hashes and strings are written.
     let sha = quick_six(&mut c);
     let script = held_six(&server, &sha);
-    let mut r = free_conn(&server);
-    let counted = r.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]);
-    let mut r2 = free_conn(&server);
-    let listed = count(&r2.cmd(&["CLUSTER", "GETKEYSINSLOT", &slot, "100"]));
-    let mut r3 = free_conn(&server);
-    let stats = r3.cmd(&["CLUSTER", "SLOT-STATS", "SLOTSRANGE", &slot, &slot]);
+    // Every connection first: a reader that waits for the script holds its
+    // thread.
+    let (mut r, mut r2, mut r3) = (free_conn(&server), free_conn(&server), free_conn(&server));
+    r.send(&["CLUSTER", "COUNTKEYSINSLOT", &slot]);
+    r2.send(&["CLUSTER", "GETKEYSINSLOT", &slot, "100"]);
+    r3.send(&["CLUSTER", "SLOT-STATS", "SLOTSRANGE", &slot, &slot]);
     assert!(server.holding(), "the script was done before the readers");
+    let counted = r.read();
+    let listed = count(&r2.read());
+    let stats = r3.read();
     assert_eq!(script.join().unwrap(), V::Int(1));
     assert!(
         counted == V::Int(0) || counted == V::Int(6),
