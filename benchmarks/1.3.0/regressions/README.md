@@ -50,6 +50,7 @@ and why.
 | `31-zset-memory` | #825, #297 (step 4) | `used_memory` per sorted-set member, 1,000,000 members in sets of 10, 100, 128, 129 and 1,000: 14-byte members (`membr:<i>`), scores whole (`int`) or with a fraction (`float`); `OBJECT ENCODING` of each size recorded exactly (`listpack` up to 128, `skiplist` past it); the large sets (129 and 1,000) as guard rows |
 | `32-default-threads` | #903 | the default worker count itself: unpipelined `GET` (50 connections), `SET` pipeline 16, suite 05's `XADD` and suite 23's pattern fan-out, each with no `--threads` and with every explicit count from 1 to the CPUs, server and clients sharing the machine; `<row>_default_vs_best` (default / best) recorded but informational until the default worker count is settled, then gated at 0.90; `pubsub_lost` exact |
 | `33-ft-aggregate-groupby` | #761 | #761's 2,000,000 hashes (`name TEXT email TAG communityNumber NUMERIC age NUMERIC`, pipelines of 2,000): `FT.AGGREGATE userIdx * GROUPBY 1 @communityNumber REDUCE COUNT 0 AS n LIMIT 0 10`, the same with `REDUCE AVG 1 @age` and `SORTBY 2 @n DESC`, and the first over `@age:[20 40]`: median ms of 5 after a warm-up, and the reply's group total (exactly 1000); `used_memory` and RSS once loaded, the peak RSS (`VmHWM`) after the queries, and FT.INFO's memory parts as info rows. v1.2.2 and the candidate only: the VM image's Redis has no Query Engine |
+| `34-kong-ratelimit` | #849 | Kong's rate-limiting plugin with `policy: redis`: its per-request script (`incr`, and `expire` when the count is 1; Kong 3.9.4's `usage()`, verbatim) sent as Kong sends it (`EVAL` with the script text) and by `EVALSHA`, on one key, `ratelimit:<route>:<service>:<identifier>:<period_date>:minute`, from memtier_benchmark at 200 and 500 connections over 100,000 identifiers; with the key as Kong builds it (`plain`) and with the identifier under a hash tag (`tag`), in two configurations: `default` (`lua-parallel-scripts yes`) and `serial` (`lua-parallel-scripts no` on KiviDB). ops/s against Redis, p99 shown, keys left without a TTL (must be 0); every call's key checked under MONITOR first, for each way of calling. Gates: at least 1.2x Redis at 200 connections and 1.3x at 500 in every configuration and key form. Needs 8 vCPUs and the `lua,tls` builds (`--candidate-full`) |
 
 ## Running it
 
@@ -162,7 +163,7 @@ the Redis binary, numpy (pinned in `requirements.txt`, for
 and a `redis-cli` 7.0.x for `13-cluster-reshard` (`$REDIS_CLI_7`, else
 `/usr/bin/redis-cli` if it is 7.0.x, as Ubuntu 24.04's `redis-tools` is, else
 built from Redis's 7.0.15 tag into `$REGRESS_CACHE`, which needs git, make
-and a C compiler). Suites 18 and 20 use `memtier_benchmark` 2.6.1 or newer
+and a C compiler). Suites 18, 20 and 34 use `memtier_benchmark` 2.6.1 or newer
 (`--transaction` and its error-reply lines; `$MEMTIER`, else on `PATH`).
 
 ## Method
@@ -253,6 +254,7 @@ was re-recorded for it:
 | `30-script-call-cost` | 1 | as before |
 | `21-list-memory` (all four configurations) | 4 | re-recorded in #940 with the candidate at its default of the day on 4 vCPUs (4 workers, after #903) |
 | `33-ft-aggregate-groupby` | 4 | as recorded (#944) |
+| `34-kong-ratelimit` | the server's pinned CPUs (4) | as suite `20`: the server is pinned to half the CPUs of a `Standard_D8s_v5` and gets `--threads` to match |
 | `32-default-threads` | 0 (none) | measures the default on purpose |
 
 Redis ignores the count. The default itself is watched by
@@ -1365,6 +1367,86 @@ TEXT postings 335.9 / 0.25, TEXT forward entries 54.9 / 54.9, key ids 188.9 /
 and 2,000,000 tags are in one document each: the documents of such a term or
 tag are held in place now, not in lists (of capacity 4 for a term's fields)
 of their own.
+
+## Recorded run, suite 34
+
+Recorded 2026-11-19 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C),
+`--only 34 --record`; the candidate is master `249f76eb` (this PR adds only the
+suite), `cargo build --release --features lua,tls` by rustc 1.100.0 (the
+compiler of the v1.2.2 release binaries, which are the `full` build here too);
+memtier_benchmark 2.6.1; Redis 8.10.2 from the VM image. Runs:
+`pr-951-d8s_v5-r1` (recorded) and `pr-951-d8s_v5-r2` (the noise check: every
+gate passed, host speed 0.99x). A run takes 3,510 s. The server has CPUs 0-3
+(KiviDB `--threads 4`, Redis one thread) and memtier 4-7, the suite's own split.
+
+Kong sends its script as `EVAL` with the script text (lua-resty-redis
+`red:eval`), not by its SHA-1, so the suite measures both: `eval` is what Kong
+does, `evalsha` what a client that caches the script would do. The script is
+Kong 3.9.4's `usage()`, as it is. `eval` is 9 % slower than `evalsha` for the candidate with the key
+untagged (3 % tagged, 5 % for v1.2.2) and 9 % for Redis.
+
+Operations a second, recorded run / rerun, and the candidate's ratio to Redis in
+the same session. `default` is `lua-parallel-scripts yes`, which is also what
+`yes` set by hand gives; `serial` is `lua-parallel-scripts no`. `plain` is
+Kong's key as it is, `tag` has the identifier under a hash tag.
+
+| config | call | key | conns | v1.2.2 | candidate | Redis 8.10.2 | candidate / Redis | candidate / v1.2.2 |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| default | eval | plain | 200 | 145,966 / 144,167 | 195,384 / 192,917 | 110,299 / 110,455 | 1.77x / 1.75x | 1.34x / 1.34x |
+| default | eval | plain | 500 | 144,961 / 142,708 | 197,557 / 195,546 | 111,209 / 108,801 | 1.78x / 1.80x | 1.36x / 1.37x |
+| default | eval | tag | 200 | 236,123 / 260,205 | 295,022 / 291,084 | 110,837 / 109,932 | 2.66x / 2.65x | 1.25x / 1.12x |
+| default | eval | tag | 500 | 245,229 / 252,859 | 293,956 / 294,773 | 109,869 / 107,935 | 2.68x / 2.73x | 1.20x / 1.17x |
+| default | evalsha | plain | 200 | 154,272 / 151,656 | 214,454 / 213,963 | 121,170 / 120,070 | 1.77x / 1.78x | 1.39x / 1.41x |
+| default | evalsha | plain | 500 | 151,512 / 150,185 | 215,431 / 214,924 | 122,009 / 119,321 | 1.77x / 1.80x | 1.42x / 1.43x |
+| default | evalsha | tag | 200 | 266,521 / 267,731 | 304,623 / 301,953 | 120,857 / 120,728 | 2.52x / 2.50x | 1.14x / 1.13x |
+| default | evalsha | tag | 500 | 270,589 / 269,061 | 307,333 / 300,376 | 122,303 / 118,419 | 2.51x / 2.54x | 1.14x / 1.12x |
+| serial | eval | plain | 200 | 147,491 / 146,087 | 199,520 / 200,858 | 112,644 / 109,557 | 1.77x / 1.83x | 1.35x / 1.37x |
+| serial | eval | plain | 500 | 146,716 / 143,164 | 201,847 / 203,569 | 113,382 / 108,361 | 1.78x / 1.88x | 1.38x / 1.42x |
+| serial | eval | tag | 200 | 146,608 / 144,801 | 195,594 / 199,348 | 112,494 / 110,001 | 1.74x / 1.81x | 1.33x / 1.38x |
+| serial | eval | tag | 500 | 146,283 / 143,633 | 201,204 / 202,797 | 111,122 / 108,938 | 1.81x / 1.86x | 1.38x / 1.41x |
+| serial | evalsha | plain | 200 | 156,399 / 155,812 | 222,578 / 220,570 | 122,079 / 120,015 | 1.82x / 1.84x | 1.42x / 1.42x |
+| serial | evalsha | plain | 500 | 156,056 / 152,188 | 224,883 / 225,832 | 124,882 / 118,002 | 1.80x / 1.91x | 1.44x / 1.48x |
+| serial | evalsha | tag | 200 | 155,754 / 153,276 | 216,294 / 216,415 | 123,404 / 119,917 | 1.75x / 1.80x | 1.39x / 1.41x |
+| serial | evalsha | tag | 500 | 156,716 / 153,223 | 221,394 / 223,335 | 124,635 / 118,533 | 1.78x / 1.88x | 1.41x / 1.46x |
+
+Every row is over the floors the suite gates on (1.2x Redis at 200 connections,
+1.3x at 500): the lowest ratio measured is 1.74x. Those floors are about 30 %
+under what was measured; they are the ones proposed in #849, and were not
+changed to fit.
+
+Against Redis, v1.2.2 runs Kong's key as it is (`plain`) at 1.24-1.33x at 200
+and 500 connections, `eval` and `evalsha`, in both configurations; the master
+candidate at 1.75-1.91x. With the key tagged, `default` runs the script
+beside other work under the tag's lock: 2.2-2.4x Redis for v1.2.2 and 2.5-2.7x
+for the candidate. With `lua-parallel-scripts no` a tagged key is as slow as
+an untagged one (1.74-1.91x for the candidate), as the setting says. So the
+1.4x at 200 connections and 1.5x at 500 published for v1.2.2 on Kong's script
+is not reproduced by v1.2.2 here with the key untagged (1.24-1.33x on this
+split of 4 server CPUs and 4 client CPUs), and the candidate clears it
+(1.75-1.91x) in every configuration. p99 (shown, not gated) with the key untagged is
+1.4-1.7 ms for KiviDB at 200 connections and 3.1-4.0 ms at 500, against
+Redis's 3.2-3.5 ms and 7.8-8.8 ms.
+
+`keys_without_ttl` was 0 on all three engines in every pass. The `MONITOR`
+check passed everywhere: 2,000 calls (4 connections x 500) per engine,
+configuration, call and key form, 1,978 distinct keys in them, every call with
+one key of the asked-for form in the KEYS position and `60` as its only ARGV,
+and 2,000 `incr` calls inside the scripts, each on a key a call named; for
+`eval`, the script text equal to Kong's. For example (the first with the key as
+Kong builds it, the second tagged):
+
+```
+"EVALSHA" "6d1bd3dc..." "1" "ratelimit:6f9c5f5c-...:0d3c6e1a-...:c87421:1763571600000:minute" "60"
+"EVALSHA" "6d1bd3dc..." "1" "ratelimit:6f9c5f5c-...:0d3c6e1a-...:{c773}:1763571600000:minute" "60"
+```
+
+KiviDB v1.2.2 writes a newline in `MONITOR`'s script text as `\x0a`, Redis and
+the candidate as `\n`: the check reads both. A call to an unknown SHA-1 makes
+memtier log error replies and the suite fails, which was checked by hand.
+
+This suite declares `min_cpus=8`: run it on a Standard_D8s_v5 with
+`run-all.sh --candidate <bin> --candidate-full <bin> --min-cpus-only --label
+<label>-d8s_v5`, or `--only 34` on a machine with 8 CPUs.
 
 ## Not covered
 
