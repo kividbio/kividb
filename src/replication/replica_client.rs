@@ -2388,7 +2388,8 @@ impl ReplicationApplyEnv {
             apply_replication: true,
             skip_write_side_effects: false,
             peer_addr,
-            peer_ipv6: crate::cluster::is_ipv6_peer(peer_addr),
+            // Not read here: this context bypasses the cluster check.
+            peer_ipv6: false,
             monitor_registry: &self.monitor_registry,
             authenticated_user: "default",
             tracking_table: &self.tracking_table,
