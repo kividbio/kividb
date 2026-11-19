@@ -409,9 +409,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **An HNSW index is built 4x faster from one client (#760).** A vector
   written to an HNSW index is put in its graph's backlog and linked by
-  helper threads (half the CPUs the server may use, `SCHED_IDLE` on Linux;
-  none under a CPU quota such as a container's `--cpus`, where they would
-  spend the quota the workers need),
+  helper threads (`search-index-threads`, startup only: a number, or
+  `auto`, the default: none under a CPU quota such as a container's `--cpus`
+  or a Kubernetes CPU limit, none below 4 CPUs, otherwise (CPUs - 2) / 2;
+  `SCHED_IDLE` on Linux; under a CPU limit builds run at 1.2's speed unless
+  the setting is given a number),
   where up to 1.2 the writing connection's thread linked it inside the
   write: one client loading documents built the graph on one CPU. A search
   measures every vector of the backlog exactly beside the graph's, so a
@@ -428,9 +430,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   7,442; peak RSS 215 / 218 / 248 MiB. Recall at a given `EF_RUNTIME` is
   unchanged, fresh and after rounds of overwrites and deletes. GET/SET from
   other clients during such a load: 144k a second at a p99 of 1.08 ms
-  (before: 137k, 0.39 ms, p99.9 25 against 11.6 ms); with every server CPU
-  busy the backlog stays full and the writes link their vectors themselves,
-  as in 1.2, at a GET/SET p99 of 3.2 ms against 0.8-1.5 ms. A search takes
+  (before: 137k, 0.39 ms, p99.9 25 against 11.6 ms). The build rates
+  above were taken with four helpers on the 8 vCPUs and the GET/SET ones
+  with three on 6 (`auto` now starts three on 8 CPUs, two on 6). With every CPU of a 4-vCPU server busy, `auto`'s one helper
+  gives a GET/SET p99 of 2.1 ms against 1.6 ms with none, and builds 3,190
+  documents a second against 1,540; two give 2.6 ms and 3,620. A search takes
   the backlog's vectors before it walks the graph and does not hold the
   backlog meanwhile, so a long filtered search keeps no write waiting.
   Writes over a waiting key queue no more work for the helpers, and a

@@ -87,6 +87,7 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--protected-mode <yes\|no>` | `yes` | See [Protected mode](#protected-mode) |
 | `--threads` | `0` (auto) | Worker threads; auto is one per CPU the process may use (see [Worker threads](#worker-threads)) |
 | `--worker-cpu-affinity <off\|auto>` | `off` | `auto` binds each io_uring worker to a CPU of its own when they are as many as the process's CPUs (see [Worker CPU affinity](#worker-cpu-affinity)) |
+| `--search-index-threads <auto\|N>` | `auto` | Helper threads that link vectors written to HNSW indexes; startup only (see [Search index threads](#search-index-threads)) |
 | `--databases` | `16` | Number of databases |
 | `--dir <path>` | start directory | Where `dump.kdb`, `appendonly.aof` and `nodes.conf` live |
 | `--aof` | off | Append-only file persistence |
@@ -169,6 +170,27 @@ application or a load generator, or to keep the count of an earlier release: up 
 was the CPUs minus 2 (all of them below 4), which is `--threads 2` on 4 CPUs and
 `--threads 6` on 8. A Kubernetes pod with a CPU request but no CPU limit has no quota, so
 the server sees every CPU of the node: give it a limit, or `--threads`.
+
+### Search index threads
+
+`--search-index-threads` (`search-index-threads` in the configuration file; read at startup,
+`CONFIG GET search-index-threads` shows it, `CONFIG SET` refuses it) is how many helper
+threads link the vectors written to HNSW indexes into their graphs, so that one client
+loading documents does not build the graph on one CPU. `0` starts none: each write links
+its own vector, as up to 1.2. `auto`, the default, starts none under a CPU quota (Docker's
+`--cpus`, a Kubernetes CPU limit) or with fewer than 4 CPUs, and otherwise (CPUs - 2) / 2:
+one on 4 CPUs, three on 8, seven on 16. The log says how many started, on the first write
+that needs them.
+
+The helpers take CPU time the workers would otherwise have. With every CPU of a 4-vCPU
+server busy (GET/SET from memtier, one client loading 384-d vectors) GET/SET p99 was
+1.6 ms with none, 2.1 ms with one and 2.6 ms with two, and the build alone ran at 1,540,
+3,190 and 3,620 documents a second. Under a CPU quota a helper spends the quota and the
+whole server is throttled (GET/SET p99 8-9 ms against 0.35 ms beside a load with
+`--cpus 2` and one helper), which is why `auto` starts none there: in a container or a
+Kubernetes pod with a CPU limit, builds run at 1.2's speed unless the setting is given a
+number. [SEARCH.md](SEARCH.md#index-builds-and-ef_runtime) and
+[PERFORMANCE.md](PERFORMANCE.md#vector-index-builds) have more.
 
 ### Worker CPU affinity
 

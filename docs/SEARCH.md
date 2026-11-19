@@ -27,14 +27,25 @@ The full command surface, filters, hybrid search and edge cases are in **[COMMAN
 
 ## Index builds and `EF_RUNTIME`
 
-- **Vectors are linked into an HNSW graph by helper threads**: half as many as the CPUs
-  the server may use (at least one), started once, and on Linux run as `SCHED_IDLE`, so
-  that they take only CPU time the workers leave. Under a CPU quota (a container's
-  `--cpus`, a Kubernetes CPU limit) there are none and each write links its vector, as
-  before: the helpers would spend the quota the workers need, and the whole server would
-  be throttled (GET/SET p99 8-9 ms against 0.35 ms beside a load, with `--cpus 2`). On a server whose CPUs the workers keep busy the backlog
-  stays full and each write links its own vector, as before (measured with every server
-  CPU busy: the backlog held its limit the whole time). A write puts its vector in the graph's backlog and returns; a search measures every
+- **Vectors are linked into an HNSW graph by helper threads**, as many as
+  `search-index-threads` says (`--search-index-threads`, or in the configuration file;
+  read at startup, `CONFIG GET` shows it): a number, 0 meaning each write links its own
+  vector as 1.2 did, or `auto`, the default. `auto` starts none under a CPU quota (a
+  container's `--cpus`, a Kubernetes CPU limit) or on fewer than 4 CPUs, otherwise
+  (CPUs - 2) / 2: one on 4 CPUs, three on 8, seven on 16. They start on the first write
+  that needs them and run as `SCHED_IDLE` on Linux, taking CPU time the workers leave; the
+  log says how many there are.
+  - The trade-off, measured with every server CPU busy (4 vCPUs, memtier GET/SET, one
+    client loading 384-d vectors): GET/SET p99 1.6 ms with none, 2.1 ms with one, 2.6 ms
+    with two; the build alone 1,540, 3,190 and 3,620 documents a second.
+  - Under a CPU limit the helpers would spend the quota the workers need and the whole
+    server would be throttled (GET/SET p99 8-9 ms against 0.35 ms beside a load with
+    `--cpus 2` and one helper), so there builds run at 1.2's speed unless
+    `search-index-threads` is given a number.
+  - On a server whose CPUs the workers keep busy the backlog stays full and each write
+    links its own vector too (measured with every server CPU busy: the backlog held its
+    limit the whole time).
+- A write puts its vector in the graph's backlog and returns; a search measures every
   vector of the backlog exactly, beside what it finds in the graph, so a document is found
   from the moment its `HSET` is answered, as before. The backlog holds at most 1,024
   vectors, and at most 128 Ki floats (85 vectors of 1,536 dimensions, 341 of 384; never

@@ -467,43 +467,99 @@ static POOL: Pool = Pool {
     ready: parking_lot::Condvar::new(),
 };
 
-/// Helper threads running: 0 until the first write asks, under a CPU
-/// quota, and if none could be started.
+/// Helper threads running: 0 until the first write asks, when
+/// `search-index-threads` (or its `auto` rule) says none, and if none could
+/// be started.
 static HELPERS: AtomicUsize = AtomicUsize::new(0);
 static START: std::sync::Once = std::sync::Once::new();
 
-/// How many helpers link vectors, started once, on the first call: half the
-/// CPUs the process may use (at least one), and none under a CPU quota.
+/// `search-index-threads`: how many helper threads link the vectors written
+/// to HNSW indexes. Read at startup only (the helpers start once, on the
+/// first write that needs them).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IndexThreads {
+    /// [`auto_helpers`]'s rule.
+    #[default]
+    Auto,
+    /// Exactly this many; 0: each write links its vector itself, as 1.2 did.
+    Count(usize),
+}
+
+/// The most helpers `search-index-threads` takes.
+pub const MAX_INDEX_THREADS: usize = 256;
+
+impl IndexThreads {
+    pub fn parse(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("auto") {
+            return Some(Self::Auto);
+        }
+        value
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n <= MAX_INDEX_THREADS)
+            .map(Self::Count)
+    }
+
+    pub fn name(self) -> String {
+        match self {
+            Self::Auto => "auto".to_string(),
+            Self::Count(n) => n.to_string(),
+        }
+    }
+}
+
+/// `search-index-threads` as the server started with it.
+static CONFIGURED: parking_lot::Mutex<IndexThreads> = parking_lot::const_mutex(IndexThreads::Auto);
+
+/// Set `search-index-threads`, before the first write (at startup).
+pub fn configure(threads: IndexThreads) {
+    *CONFIGURED.lock() = threads;
+}
+
+/// With fewer CPUs than this, `auto` starts no helper.
+pub const AUTO_FROM_CPUS: usize = 4;
+
+/// `search-index-threads auto`: no helper under a CPU quota or with fewer
+/// than [`AUTO_FROM_CPUS`] CPUs, otherwise (CPUs - 2) / 2, at least one.
 ///
-/// Under a quota (a container's `--cpus`, Kubernetes' CPU limit) the
-/// helpers spend the quota the workers need: `SCHED_IDLE` keeps them off
-/// busy CPUs, not off the quota, and with idle CPUs beside them they run
-/// until the whole process is throttled. In a container with `--cpus 2` on
-/// an 8-vCPU D8s_v5, memtier GET/SET from the host while one client loaded
-/// 384-d vectors (30 s, 3 runs): with one helper 95k a second at a p99 of
-/// 8.0-9.3 ms (p99.9 45 ms), throttled in every period; with the vectors
-/// linked in the writes 141-142k at 0.34-0.36 ms (p99.9 28 ms), the load
-/// 1,560-1,590 documents a second against 1,910-2,070. So there the writes
-/// link their vectors themselves, as in 1.2.
+/// The helpers run beside the workers, which are one per CPU (#873), and
+/// take CPU time they would otherwise have: serving latency is what `auto`
+/// keeps. Under a quota (a container's `--cpus`, a Kubernetes CPU limit)
+/// `SCHED_IDLE` keeps them off busy CPUs but not off the quota: with idle
+/// CPUs beside them they run until the whole process is throttled. In a
+/// container with `--cpus 2` on an 8-vCPU D8s_v5, memtier GET/SET from the
+/// host while one client loaded 384-d vectors (30 s, 3 runs): with one
+/// helper 93-96k a second at a p99 of 8.0-9.3 ms, throttled in every
+/// period, against 141-142k at 0.35-0.38 ms with the vectors linked in the
+/// writes; with `--cpus 4` and two, 119-121k at 0.95-0.98 ms against
+/// 147-150k at 0.32-0.35 ms.
 ///
-/// They share those CPUs with the workers, which since #873 are one per
-/// CPU. Measured on an Azure D8s_v5, the server on 6 vCPUs and memtier
-/// (GET/SET 1:1, 40 connections) on the other 2, while one client loaded
-/// 150,000 384-d vectors (medians of 3): one helper per CPU took GET/SET
-/// from 137k a second (1.2.2's way, the vectors linked in the writes) to
-/// 112k, p99 0.39 to 3.7 ms; half as many served 144k at a p99 of 1.08 ms
-/// (p99.9 11.6 ms against 25 ms), and built the index in 41 s against 36 s
-/// with all of them and 130 s in the writes.
+/// On 4 vCPUs of a D8s_v5 with every one busy (`--threads 4`, memtier
+/// GET/SET from 50 connections, one client loading 384-d vectors, a KNN
+/// probe and one `HSET` every 2 ms on the other CPUs, 40 s, 3 runs): GET/SET
+/// p99 1.6-1.7 ms with none (as master), 2.0-2.2 ms with one (1.3x), 2.5-2.7
+/// ms with two (1.6x); KNN p50 0.85-0.90, 1.04-1.10 and 1.10-1.14 ms; the
+/// build alone 1,540, 3,190 and 3,620 documents a second. So one on 4 CPUs,
+/// and two CPUs a helper beyond that.
+pub fn auto_helpers(cpus: usize, quota: bool) -> usize {
+    if quota || cpus < AUTO_FROM_CPUS {
+        return 0;
+    }
+    (cpus.saturating_sub(2) / 2).max(1)
+}
+
+/// How many helpers link vectors, started once, on the first call:
+/// `search-index-threads`, or by [`auto_helpers`] for `auto`.
 fn helpers() -> usize {
     START.call_once(|| {
         // The process's CPUs: the first write may come from a worker bound
         // to one (`worker-cpu-affinity`), and std would see only that one.
         let cpus = crate::cpus::available_parallelism().map_or(1, |n| n.get());
-        // Unit tests have helpers whatever the machine: they test them.
-        let want = if !cfg!(test) && crate::cpus::cpu_quota().is_some() {
-            0
-        } else {
-            (cpus / 2).max(1)
+        let want = match *CONFIGURED.lock() {
+            IndexThreads::Count(n) => n,
+            // Unit tests have helpers whatever the machine: they test them.
+            IndexThreads::Auto if cfg!(test) => (cpus / 2).max(1),
+            IndexThreads::Auto => auto_helpers(cpus, crate::cpus::cpu_quota().is_some()),
         };
         let mut started = 0;
         for n in 0..want {
@@ -516,6 +572,10 @@ fn helpers() -> usize {
             }
         }
         HELPERS.store(started, Release);
+        crate::log_info!(
+            "HNSW index threads: {started} (search-index-threads {})",
+            CONFIGURED.lock().name()
+        );
     });
     HELPERS.load(Acquire)
 }
@@ -750,6 +810,30 @@ mod tests {
         assert_eq!(got[0].key, "in");
         assert!(got.iter().all(|r| r.key != "out"));
         assert!(got[1..].iter().all(|r| r.key.ends_with('1')));
+    }
+
+    #[test]
+    fn search_index_threads_parses_and_auto_keeps_small_servers_free() {
+        assert_eq!(IndexThreads::parse("auto"), Some(IndexThreads::Auto));
+        assert_eq!(IndexThreads::parse("AUTO"), Some(IndexThreads::Auto));
+        assert_eq!(IndexThreads::parse("0"), Some(IndexThreads::Count(0)));
+        assert_eq!(IndexThreads::parse("3"), Some(IndexThreads::Count(3)));
+        assert_eq!(IndexThreads::parse("-1"), None);
+        assert_eq!(IndexThreads::parse("many"), None);
+        assert_eq!(
+            IndexThreads::parse(&(MAX_INDEX_THREADS + 1).to_string()),
+            None
+        );
+        assert_eq!(IndexThreads::Count(3).name(), "3");
+        assert_eq!(IndexThreads::Auto.name(), "auto");
+        // Under a quota, none; below AUTO_FROM_CPUS, none.
+        assert_eq!(auto_helpers(16, true), 0);
+        for cpus in 1..AUTO_FROM_CPUS {
+            assert_eq!(auto_helpers(cpus, false), 0, "{cpus} CPUs");
+        }
+        assert_eq!(auto_helpers(8, false), 3);
+        assert_eq!(auto_helpers(16, false), 7);
+        assert!(auto_helpers(AUTO_FROM_CPUS, false) >= 1);
     }
 
     /// A graph past [`HERE_BELOW`], so that writes go through the backlog.

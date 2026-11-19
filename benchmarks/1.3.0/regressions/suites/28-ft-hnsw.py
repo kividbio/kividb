@@ -21,10 +21,15 @@ REGRESS_REDISEARCH_SO names the query engine module (`redisearch.so` of the
 redis:8.10.2 image: the VM's source-built Redis has no FT.*); it is started
 with `--loadmodule` and the configuration is self-hosted for that reason.
 
-Gates: build docs/s within 10 % and keeping 60 % of the gain over v1.2.2, and
-not more than 1.5x slower than Redis when it ran (1.28x on a D8s_v5: the
-helpers are half the CPUs, which keeps GET/SET beside a build at its 1.2
-rate); KNN q/s within 10 %;
+Configurations: `pipeline`, the candidate as it starts (`search-index-threads
+auto`, which on the suite's D4s_v5 starts one helper); `pipeline-n3`, the
+candidate with `--search-index-threads 3`, what `auto` gives on 8 CPUs, so
+that the build's gain stays gated whatever the default (v1.2.2 and Redis run
+as in `pipeline`).
+
+Gates: build docs/s within 10 %; for `pipeline-n3` also keeping 60 % of the
+gain over v1.2.2 and not more than 1.5x slower than Redis when it ran; KNN
+q/s within 10 %;
 recall@10 not more than 2 % under recorded (it moves with the graph, which
 parallel linking builds in another order each run); peak RSS growth a document
 within 5 %.
@@ -41,10 +46,10 @@ connection: one on the loading client's worker waits behind its pipelines
 (1.2's way too), which says where the connection landed, not what the
 helpers cost. Gated: GET/SET p99 beside the
 build and the probe's KNN p50 beside the ingest, each within its recorded
-value and at most a fixed factor of v1.2.2's in the same session (1.2.2
-links each vector in the write, on the writing connection's worker, so its
-GET/SET p99 is that of a worker busy with one long command at a time; the
-candidate's helpers run at the lowest priority beside the workers).
+value and at most 2x v1.2.2's in the same session: on two CPUs
+`search-index-threads auto` starts no helper, so the candidate links in the
+writes as 1.2.2 does, and serving beside a build must not get worse by
+default.
 Documents ingested a second and GET/SET a second are recorded.
 Needs memtier_benchmark (`$MEMTIER`, else on PATH).
 """
@@ -66,15 +71,16 @@ from rss import vmrss_mib  # noqa: E402
 MODULE = os.environ.get("REGRESS_REDISEARCH_SO", "")
 ENGINES = ("v1_2_2", "candidate") + (("redis",) if MODULE else ())
 S = Suite("28-ft-hnsw", [Config("pipeline", threads=4, engines=ENGINES, self_hosted=True),
+                         Config("pipeline-n3", threads=4, engines=ENGINES, self_hosted=True),
                          Config("beside", threads=2, engines=ENGINES, self_hosted=True)])
+# The helper count of `pipeline-n3`'s candidate: `auto` on 8 CPUs.
+EXPLICIT_HELPERS = 3
 DIM, M, EFC, EF, BATCH = 384, 16, 200, 100, 1000
 BESIDE_S, ROUNDS, PROBE_CONNS = 20, 5, 8
 # The candidate at most this many times v1.2.2's value in the same session.
-# Recorded on a D4s_v5 (pr-942-d4s_v5): GET/SET p99 8.6 ms against v1.2.2's
-# 0.72 (11.9x; rounds of 1.6-13.1 ms), KNN p50 0.92 ms against 0.69 (1.34x).
-# The GET/SET gate bounds that cost of the helpers on a two-CPU server; it is
-# not a target.
-BESIDE_P99_X, BESIDE_KNN_X = 16.0, 2.0
+# With the server on two CPUs `search-index-threads auto` starts no helper,
+# so the default must serve as 1.2.2 does there.
+BESIDE_P99_X, BESIDE_KNN_X = 2.0, 2.0
 
 
 def field(info_reply, name):
@@ -257,7 +263,7 @@ def beside(ctx):
             p50s.append(meds[0])
             conn_p50s.append(meds)
         ctx.emit("getset_p99_ms_beside_build", median(p99s), "ms", "lower",
-                 gate=jitter([rel(100, abs=2.0), vs_v1_2_2(BESIDE_P99_X)]), samples=p99s)
+                 gate=jitter([rel(50, abs=0.5), vs_v1_2_2(BESIDE_P99_X)]), samples=p99s)
         ctx.emit("knn_p50_ms_beside_ingest", median(p50s), "ms", "lower",
                  gate=jitter([rel(30, abs=0.2), vs_v1_2_2(BESIDE_KNN_X)]), samples=p50s)
         ctx.raw["knn_p50_ms_by_connection"] = conn_p50s
@@ -268,6 +274,9 @@ def beside(ctx):
 def pipeline(ctx):
     import numpy as np
     args = ("--loadmodule", MODULE) if ctx.kind == "redis" else ()
+    explicit = ctx.config.name == "pipeline-n3"
+    if explicit and ctx.engine == "candidate":
+        args = ("--search-index-threads", str(EXPLICIT_HELPERS))
     with Nodes(ctx) as ns:
         node = ns.start(args=args)
         c = node.client(protocol=2)
@@ -296,7 +305,7 @@ def pipeline(ctx):
             time.sleep(0.02)
         built = time.perf_counter() - t0
         ctx.emit("build_docs_per_s", n / built, "docs/s", "higher",
-                 gate=[rel(10), KEEP_IMPROVEMENT, vs_redis(1.5)])
+                 gate=[rel(10), KEEP_IMPROVEMENT, vs_redis(1.5)] if explicit else rel(10))
         ctx.emit("acked_docs_per_s", n / acked, "docs/s", "higher", gate=info())
         ctx.emit("rss_per_doc", (vmrss_mib(node.pid) - rss0) * 1048576 / n, "B", "lower", gate=rel(5))
 

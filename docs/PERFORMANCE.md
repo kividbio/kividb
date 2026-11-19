@@ -411,6 +411,25 @@ in three of every build (1.2's way included) the probe's median was near
 on the loading client's worker, behind that client's pipelines. Those runs
 are left out above.
 
+How many helpers `search-index-threads auto` starts was set from the same
+load on 4 vCPUs (the server on 4, `--threads 4`; memtier GET/SET from 50
+connections, one client loading 384-d vectors, a KNN probe over 8
+connections reported by its fastest, and one `HSET` every 2 ms, on the
+other 4; 40 s, 3 runs each, medians):
+
+| helpers | GET/SET p99 | KNN p50 | `HSET` p99 | build alone |
+|---|---:|---:|---:|---:|
+| master (links in the writes) | 1.61 ms | 0.87 ms | 2.25 ms | 1,550 docs/s |
+| 0 | 1.64 ms | 0.89 ms | 2.32 ms | 1,540 docs/s |
+| 1 (`auto` on 4 CPUs) | 2.10 ms | 1.08 ms | 4.4-34 ms | 3,190 docs/s |
+| 2 | 2.62 ms | 1.13 ms | 5.5 ms | 3,620 docs/s |
+
+One helper moved GET/SET p99 by 1.3x, two by 1.6x; `auto` starts one on 4
+CPUs and adds one for every two CPUs beyond that. With one helper the
+single `HSET` probe sat behind the loading client's pipelines in two runs
+of three (its median 25 ms: by all signs on the loading client's worker,
+whose pipelines take longer while the backlog is full).
+
 Under a CPU quota there are no helpers. In a container with `--cpus 2` on
 the same 8-vCPU VM, memtier GET/SET from the host while one client loaded
 384-d vectors (30 s, 3 runs), one helper took GET/SET from 141-142k a
