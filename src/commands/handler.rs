@@ -430,7 +430,7 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
             crate::commands::lua::script_settle_slot(slot);
             None
         }
-        crate::cluster::routing::RouteDecision::TryAgain => decision.refusal(),
+        crate::cluster::routing::RouteDecision::TryAgain => decision.refusal(false),
         crate::cluster::routing::RouteDecision::Passthrough => None,
         _ => Some(resp_error(
             "ERR Script attempted to access a non local key in a cluster node",
@@ -1211,7 +1211,7 @@ fn routed_again_in_gate(
         || registry.get_readonly(client_id),
         |key| crate::read_lock!(crate::store::get_shard(&store[db], key)).contains_key(key),
     )
-    .refusal()
+    .refusal(crate::cluster::is_ipv6_peer(ctx.peer_addr))
 }
 
 // The parts of `run_command` that a plain command on a standalone master
@@ -1275,7 +1275,7 @@ fn route_on_arrival(
                 info.asking = false;
             });
         }
-        if let Some(refusal) = decision.refusal() {
+        if let Some(refusal) = decision.refusal(crate::cluster::is_ipv6_peer(ctx.peer_addr)) {
             return Some(refusal);
         }
         crate::cluster::routing::stall_for_test(name, ctx.cmd.as_slice());
@@ -1402,7 +1402,7 @@ fn checked_in_gate(
                             .contains_key(key)
                 },
             );
-            if let Some(refusal) = decision.refusal() {
+            if let Some(refusal) = decision.refusal(crate::cluster::is_ipv6_peer(ctx.peer_addr)) {
                 return Some(refusal);
             }
         }

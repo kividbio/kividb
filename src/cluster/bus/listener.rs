@@ -8,7 +8,7 @@
 
 use crate::cluster::ClusterState;
 use crate::cluster::bus::message::{BusMessage, GossipEntry, decode, encode, exceeds_buffer_limit};
-use crate::cluster::node::{ClusterNode, NodeFlags, NodeId, node_id_str};
+use crate::cluster::node::{ClientIps, ClusterNode, NodeFlags, NodeId, node_id_str};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -22,9 +22,11 @@ pub async fn run_bus_listener(
     bus_port: u16,
     state: Arc<ClusterState>,
 ) -> std::io::Result<()> {
-    let addr: SocketAddr = format!("{bind}:{bus_port}").parse().map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bad bind: {e}"))
-    })?;
+    let addr: SocketAddr = crate::config::host_port(&bind, bus_port)
+        .parse()
+        .map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bad bind: {e}"))
+        })?;
     let listener = TcpListener::bind(addr).await?;
     log_info!("Cluster: Bus listener bound on {addr}");
 
@@ -292,6 +294,7 @@ pub fn process_message(
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_client_ips,
             sender_shard_id,
         } => {
             // A PING from a node we do not know is answered — so it can see
@@ -310,6 +313,7 @@ pub fn process_message(
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_client_ips,
                     sender_shard_id,
                     gossip,
                     &slot_claims,
@@ -329,6 +333,7 @@ pub fn process_message(
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_client_ips,
             sender_shard_id,
         } => {
             // A PONG is a reply to something we sent. From a stranger it is
@@ -346,6 +351,7 @@ pub fn process_message(
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_client_ips,
                     sender_shard_id,
                     gossip,
                     &slot_claims,
@@ -496,6 +502,7 @@ pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: Socke
         sender_master_id,
         sender_hostname,
         sender_announced_client_port,
+        sender_client_ips,
         sender_shard_id,
     } = msg
     {
@@ -515,6 +522,7 @@ pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: Socke
         node.master_id = sender_master_id;
         node.config_epoch = sender_config_epoch;
         node.hostname = sender_hostname.clone();
+        node.client_ips = sender_client_ips.clone();
         if let Some(shard_id) = sender_shard_id {
             node.shard_id = shard_id;
         }
@@ -530,6 +538,7 @@ pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: Socke
                 sender_master_id,
                 sender_hostname,
                 sender_announced_client_port,
+                sender_client_ips,
                 sender_shard_id,
                 gossip,
                 &slot_claims,
@@ -553,6 +562,7 @@ fn apply_heartbeat(
     sender_master_id: Option<NodeId>,
     sender_hostname: String,
     sender_announced_client_port: u16,
+    sender_client_ips: ClientIps,
     sender_shard_id: Option<NodeId>,
     gossip: Vec<GossipEntry>,
     slot_claims: &[crate::cluster::bus::SlotClaim],
@@ -586,6 +596,7 @@ fn apply_heartbeat(
     // What a node says of its own hostname stands, none included.
     state.set_peer_hostname(sender_id, &sender_hostname, true);
     state.set_peer_client_port(sender_id, sender_announced_client_port, true);
+    state.set_peer_client_ips(sender_id, &sender_client_ips, true);
     // Its shard: what a master says of its own is its shard's, replicas
     // included (this node too, if it is one); a replica is in its master's
     // (#563). A node of an earlier version says none.
@@ -761,6 +772,7 @@ fn merge_gossip_entry(
     // does not carry them.
     state.set_peer_hostname(g.id, &g.hostname, false);
     state.set_peer_client_port(g.id, g.announced_client_port, false);
+    state.set_peer_client_ips(g.id, &g.client_ips, false);
 }
 
 /// Build a PONG describing ourselves. Includes our slot claims and a gossip
@@ -786,6 +798,7 @@ fn our_pong(state: &ClusterState) -> BusMessage {
         sender_master_id: me.master_id,
         sender_hostname: me.hostname.clone(),
         sender_announced_client_port: me.announced_client_port,
+        sender_client_ips: me.client_ips.clone(),
         sender_shard_id: Some(me.shard_id),
         gossip,
         slot_claims: state.my_slot_claims(),
@@ -822,6 +835,7 @@ pub(super) fn sample_gossip(
         master_id: n.master_id,
         hostname: n.hostname.clone(),
         announced_client_port: n.announced_client_port,
+        client_ips: n.client_ips.clone(),
     };
 
     let mut out = Vec::new();
@@ -882,6 +896,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id: None,
             gossip,
             slot_claims: vec![],
@@ -937,6 +952,7 @@ mod tests {
         let about_gone = GossipEntry {
             hostname: String::new(),
             announced_client_port: 0,
+            client_ips: ClientIps::default(),
             id: gone,
             ip: "10.0.0.7".into(),
             client_port: 7001,
@@ -977,6 +993,7 @@ mod tests {
             None,
             String::new(),
             0,
+            ClientIps::default(),
             None,
             vec![],
             &[SlotClaim {
@@ -1001,6 +1018,7 @@ mod tests {
         let b_failed = GossipEntry {
             hostname: String::new(),
             announced_client_port: 0,
+            client_ips: ClientIps::default(),
             id: b,
             ip: "10.0.0.8".into(),
             client_port: 7002,
@@ -1024,6 +1042,7 @@ mod tests {
         GossipEntry {
             hostname: String::new(),
             announced_client_port: 0,
+            client_ips: ClientIps::default(),
             id,
             ip: ip.into(),
             client_port: port,
@@ -1125,6 +1144,7 @@ mod tests {
         let target_pfail = || GossipEntry {
             hostname: String::new(),
             announced_client_port: 0,
+            client_ips: ClientIps::default(),
             id: target,
             ip: "10.0.0.8".into(),
             client_port: 7002,

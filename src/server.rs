@@ -878,7 +878,7 @@ where
     // The socket's own address, as Redis shows it (#566): not the bind
     // setting, which can be 0.0.0.0.
     client_info.laddr = stream.local_address().map_or_else(
-        || format!("{}:{}", config.bind, config.port),
+        || crate::config::host_port(&config.bind, config.port),
         |a| a.to_string(),
     );
     let activity = Arc::clone(&client_info.activity);
@@ -1819,9 +1819,12 @@ where
             // it has subscriptions. Inside MULTI they are queued like any other
             // command, and EXEC runs them (#23).
             if crate::pubsub::is_subscription_command(cmd_name.as_str()) && !tx.active {
-                if let Some(refusal) =
-                    crate::pubsub::shard_subscribe_refusal(cmd_name.as_str(), &cmd, &cluster_state)
-                {
+                if let Some(refusal) = crate::pubsub::shard_subscribe_refusal(
+                    cmd_name.as_str(),
+                    &cmd,
+                    &cluster_state,
+                    crate::cluster::is_ipv6_peer(&peer_addr),
+                ) {
                     crate::output_limits::append_reply(
                         &mut combined,
                         &refusal,
@@ -2145,6 +2148,7 @@ where
                                 client_id,
                                 store: &store,
                                 db: selected_db,
+                                ipv6: crate::cluster::is_ipv6_peer(&peer_addr),
                             },
                             &tx.queue,
                             &mut routed,
@@ -2250,6 +2254,7 @@ where
                                 client_id,
                                 store: &store,
                                 db: selected_db,
+                                ipv6: crate::cluster::is_ipv6_peer(&peer_addr),
                             },
                             &tx.queue,
                             routed,
@@ -2926,6 +2931,7 @@ where
                                     client_id,
                                     store: &store,
                                     db: selected_db,
+                                    ipv6: crate::cluster::is_ipv6_peer(&peer_addr),
                                 },
                                 &cmd,
                             )

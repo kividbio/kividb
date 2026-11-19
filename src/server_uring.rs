@@ -1095,7 +1095,7 @@ pub async fn handle_client(
     // The socket's own address, as Redis shows it (#566): not the bind
     // setting, which can be 0.0.0.0.
     client_info.laddr = local_address(&stream).map_or_else(
-        || format!("{}:{}", config.bind, config.port),
+        || crate::config::host_port(&config.bind, config.port),
         |a| a.to_string(),
     );
     let activity = Arc::clone(&client_info.activity);
@@ -2098,9 +2098,12 @@ pub async fn handle_client(
             // it has subscriptions. Mirrors the tokio loop in server.rs: inside
             // MULTI they are queued, and EXEC runs them (#23).
             if crate::pubsub::is_subscription_command(cmd_name.as_str()) && !tx.active {
-                if let Some(refusal) =
-                    crate::pubsub::shard_subscribe_refusal(cmd_name.as_str(), &cmd, &cluster_state)
-                {
+                if let Some(refusal) = crate::pubsub::shard_subscribe_refusal(
+                    cmd_name.as_str(),
+                    &cmd,
+                    &cluster_state,
+                    crate::cluster::is_ipv6_peer(&peer_addr),
+                ) {
                     crate::output_limits::append_reply(
                         &mut out_buf,
                         &refusal,
@@ -2405,6 +2408,7 @@ pub async fn handle_client(
                                 client_id,
                                 store: &store,
                                 db: selected_db,
+                                ipv6: crate::cluster::is_ipv6_peer(&peer_addr),
                             },
                             &tx.queue,
                             &mut routed,
@@ -2510,6 +2514,7 @@ pub async fn handle_client(
                                 client_id,
                                 store: &store,
                                 db: selected_db,
+                                ipv6: crate::cluster::is_ipv6_peer(&peer_addr),
                             },
                             &tx.queue,
                             routed,
@@ -3166,6 +3171,7 @@ pub async fn handle_client(
                                     client_id,
                                     store: &store,
                                     db: selected_db,
+                                    ipv6: crate::cluster::is_ipv6_peer(&peer_addr),
                                 },
                                 &cmd,
                             )

@@ -75,9 +75,11 @@ fn handle_cluster(ctx: &mut Ctx, sub: &str) -> Vec<u8> {
         // As in Redis, these refuse on a node with cluster support disabled
         // (#563): there is no node id, and a slot means nothing — and the
         // slot and node tables most of all (#899).
-        "NODES" => cmd_nodes(state),
-        "SLOTS" => cmd_slots(state),
-        "SHARDS" => cmd_shards(state),
+        // A client is told the addresses for its own connection's family
+        // (#847).
+        "NODES" => cmd_nodes(state, crate::cluster::is_ipv6_peer(ctx.peer_addr)),
+        "SLOTS" => cmd_slots(state, crate::cluster::is_ipv6_peer(ctx.peer_addr)),
+        "SHARDS" => cmd_shards(state, crate::cluster::is_ipv6_peer(ctx.peer_addr)),
         "MYID" => cmd_myid(state),
         "COUNTKEYSINSLOT" => cmd_countkeysinslot(ctx),
         "GETKEYSINSLOT" => cmd_getkeysinslot(ctx),
@@ -468,7 +470,7 @@ fn cmd_getkeysinslot(ctx: &Ctx) -> Vec<u8> {
 // or clients (redis-cli, redis-py cluster client, jedis) will misparse it.
 // Reuse the same line format as nodes.conf — that's by design in Redis too.
 
-fn cmd_nodes(state: &ClusterState) -> Vec<u8> {
+fn cmd_nodes(state: &ClusterState, ipv6_client: bool) -> Vec<u8> {
     use std::fmt::Write;
 
     let nodes = state.nodes.read();
@@ -486,7 +488,7 @@ fn cmd_nodes(state: &ClusterState) -> Vec<u8> {
             out,
             "{} {}:{}@{}{}",
             node_id_str(&node.id),
-            node.ip,
+            node.client_ip(ipv6_client),
             node.client_facing_port(),
             node.cluster_port,
             crate::cluster::persist::hostname_suffix(&node.hostname)
@@ -545,7 +547,7 @@ fn cmd_nodes(state: &ClusterState) -> Vec<u8> {
 // Returns an array of [start, end, [master_ip, master_port, master_id], ...].
 // One element per contiguous range of slots owned by a single master.
 
-fn cmd_slots(state: &ClusterState) -> Vec<u8> {
+fn cmd_slots(state: &ClusterState, ipv6_client: bool) -> Vec<u8> {
     let nodes = state.nodes.read();
     let slots = state.slots.read();
 
@@ -579,14 +581,14 @@ fn cmd_slots(state: &ClusterState) -> Vec<u8> {
         let mut entry = vec![
             resp_integer(a as i64),
             resp_integer(b as i64),
-            slots_node_entry(state, owner),
+            slots_node_entry(state, owner, ipv6_client),
         ];
         // Append replicas of this master.
         for replica in nodes
             .values()
             .filter(|n| n.flags.contains(NodeFlags::REPLICA) && n.master_id == Some(owner_id))
         {
-            entry.push(slots_node_entry(state, replica));
+            entry.push(slots_node_entry(state, replica, ipv6_client));
         }
         entries.push(resp_array(entry));
     }
@@ -600,13 +602,17 @@ fn cmd_slots(state: &ClusterState) -> Vec<u8> {
 /// in place of a hostname, the hostname in place of an address. That last
 /// part is left out when there is nothing in it, which is the reply before
 /// Redis 7 and what every client reads.
-fn slots_node_entry(state: &ClusterState, node: &crate::cluster::ClusterNode) -> Vec<u8> {
+fn slots_node_entry(
+    state: &ClusterState,
+    node: &crate::cluster::ClusterNode,
+    ipv6_client: bool,
+) -> Vec<u8> {
     use crate::cluster::Endpoint;
     let preferred = state.preferred_endpoint();
     let mut fields = vec![
         match preferred {
             Endpoint::Unknown => resp_null_bulk(),
-            _ => resp_bulk_str(&state.endpoint_of(node)),
+            _ => resp_bulk_str(&state.endpoint_of(node, ipv6_client)),
         },
         resp_integer(node.client_facing_port() as i64),
         resp_bulk_str(node_id_str(&node.id)),
@@ -614,7 +620,7 @@ fn slots_node_entry(state: &ClusterState, node: &crate::cluster::ClusterNode) ->
     let mut metadata: Vec<Vec<u8>> = Vec::new();
     if preferred != Endpoint::Ip {
         metadata.push(resp_bulk_str("ip"));
-        metadata.push(resp_bulk_str(&node.ip));
+        metadata.push(resp_bulk_str(node.client_ip(ipv6_client)));
     }
     if preferred != Endpoint::Hostname && !node.hostname.is_empty() {
         metadata.push(resp_bulk_str("hostname"));
@@ -632,7 +638,7 @@ fn slots_node_entry(state: &ClusterState, node: &crate::cluster::ClusterNode) ->
 // Each shard is a map: { slots: [...], nodes: [...] }. See `shard_entries`
 // for which nodes share an entry.
 
-fn cmd_shards(state: &ClusterState) -> Vec<u8> {
+fn cmd_shards(state: &ClusterState, ipv6_client: bool) -> Vec<u8> {
     let nodes = state.nodes.read();
     let slots = state.slots.read();
 
@@ -646,7 +652,7 @@ fn cmd_shards(state: &ClusterState) -> Vec<u8> {
         let node_descs: Vec<Vec<u8>> = entry
             .iter()
             .filter_map(|id| nodes.get(id))
-            .map(|n| node_description(state, n))
+            .map(|n| node_description(state, n, ipv6_client))
             .collect();
         shards.push(resp_array(vec![
             resp_bulk_str("slots"),
@@ -731,7 +737,11 @@ fn link_state(node: &crate::cluster::ClusterNode) -> &'static str {
     }
 }
 
-fn node_description(state: &ClusterState, node: &crate::cluster::ClusterNode) -> Vec<u8> {
+fn node_description(
+    state: &ClusterState,
+    node: &crate::cluster::ClusterNode,
+    ipv6_client: bool,
+) -> Vec<u8> {
     let role = if node.flags.contains(NodeFlags::MASTER) {
         "master"
     } else if node.flags.contains(NodeFlags::REPLICA) {
@@ -752,9 +762,9 @@ fn node_description(state: &ClusterState, node: &crate::cluster::ClusterNode) ->
         resp_bulk_str("port"),
         resp_integer(node.client_facing_port() as i64),
         resp_bulk_str("ip"),
-        resp_bulk_str(&node.ip),
+        resp_bulk_str(node.client_ip(ipv6_client)),
         resp_bulk_str("endpoint"),
-        resp_bulk_str(&state.endpoint_of(node)),
+        resp_bulk_str(&state.endpoint_of(node, ipv6_client)),
     ];
     if !node.hostname.is_empty() {
         fields.push(resp_bulk_str("hostname"));
@@ -1326,7 +1336,7 @@ fn cmd_replicas(ctx: &mut Ctx) -> Vec<u8> {
             out.push(resp_bulk_str(&format!(
                 "{} {}:{}@{}{} {} {} {} {} {} connected",
                 crate::cluster::node_id_str(&n.id),
-                n.ip,
+                n.client_ip(crate::cluster::is_ipv6_peer(ctx.peer_addr)),
                 n.client_facing_port(),
                 n.cluster_port,
                 crate::cluster::persist::hostname_suffix(&n.hostname),

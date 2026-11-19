@@ -89,6 +89,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`cluster-announce-client-ipv4` and `cluster-announce-client-ipv6` (#847),
+  as in Valkey 8.** The address a client is told to reach a node at, where it
+  is not the one nodes use between themselves: a client connected over IPv6
+  gets the node's `-ipv6`, any other its `-ipv4`, and the node's address when
+  the one for its family is unset. Redirects (`MOVED`, `ASK`), `CLUSTER SLOTS`,
+  `SHARDS` (`ip` and `endpoint`), `NODES` and `REPLICAS` use them; the bus
+  keeps `cluster-announce-ip`. Set at start or with `CONFIG SET` (empty unsets;
+  a bad value is `Invalid IPv4 address` / `Invalid IPv6 address`, at start
+  too), they reach the other nodes in their next heartbeats as `cip4=` and
+  `cip6=` tokens of the flags string, which a 1.2 node ignores. They are not
+  saved in `nodes.conf`: a node learns a peer's again from the peer's first
+  heartbeat, as for `cluster-announce-client-port`. Tools that start cluster
+  nodes for Valkey pass `--cluster-announce-client-ipv4` to every node, which
+  KiviDB refused at start.
+
 - **`worker-cpu-affinity auto`: each io_uring worker on a CPU of its own (#894).** Off by
   default. With `auto`, worker N is bound to the N-th CPU the process may use, when the
   workers are exactly as many as those CPUs (a cpuset or `taskset` of `--threads` CPUs, the
@@ -966,6 +981,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   move (callgrind, 0.1%).
 
 ### Fixed
+
+- **`bind ::` and `bind ::1` start.** The address was joined to the port as
+  `:::6379`, which is not one, and the server exited with "invalid socket
+  address syntax" (the bus and TLS listeners too); only `[::]` worked. An IPv6
+  address is put in brackets now. KiviDB still listens on one address.
 
 - **A node met just before the whole cluster stops is still a member after
   it starts again (#808).** Both ends of a `CLUSTER MEET` save the other
