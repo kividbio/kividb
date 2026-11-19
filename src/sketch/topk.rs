@@ -466,9 +466,10 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<TopK> {
             "a Top-K sketch over the size limits is not supported",
         ));
     }
-    let raw = super::read_vec(r, width as usize * depth as usize * 8)?;
-    let buckets = buckets_from_bytes(&raw)?;
-    drop(raw);
+    super::room::declared(
+        (u64::from(width) * u64::from(depth) * 8).saturating_add(u64::from(k) * 16),
+    )?;
+    let buckets = buckets_from_reader(r, width as usize * depth as usize)?;
     let mut heap = Vec::with_capacity((k as usize).min(1024));
     for _ in 0..k {
         let fp = super::read_u32(r)?;
@@ -490,6 +491,15 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<TopK> {
 
 /// Buckets from their bytes (fingerprint and count, little-endian), into
 /// an allocation that is asked for.
+/// `n` buckets (fingerprint and count, little-endian) read from `r`, not
+/// held whole as bytes beside them (`sketch::read_values`).
+pub fn buckets_from_reader(r: &mut impl io::Read, n: usize) -> io::Result<Vec<Bucket>> {
+    super::read_values(r, n, |w: &[u8; 8]| Bucket {
+        fp: u32::from_le_bytes([w[0], w[1], w[2], w[3]]),
+        count: u32::from_le_bytes([w[4], w[5], w[6], w[7]]),
+    })
+}
+
 pub fn buckets_from_bytes(raw: &[u8]) -> io::Result<Vec<Bucket>> {
     let mut v = Vec::new();
     v.try_reserve_exact(raw.len() / 8)

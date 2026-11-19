@@ -251,8 +251,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so a replica or a replay with other settings makes the same filter.
   `maxmemory` holds back clients, not a master or the AOF: a client's
   command that would not fit evicts first under the policy, before it
-  takes its key, as every command does, and gets `OOM` only if that is not
-  enough (or if what was made was taken by another command meanwhile).
+  takes its key, as every command does, once nothing else refuses it
+  (routing, `BUSY`, `NOREPLICAS`, `LOADING`, the ACL), and gets `OOM` only
+  if that is not enough (or if what was made was taken by another command
+  meanwhile). One command evicts what it needs a few megabytes at a time,
+  letting go of the gates between, so that a full sync, a snapshot, a
+  script or a transaction waits for no more than one step of it. A command
+  a transaction runs is given room the same way, and one a script calls
+  too unless the script runs beside others under its hash tags
+  (`lua-parallel-scripts`), where it is refused with `OOM` if it does not
+  fit. A `RESTORE` of a probabilistic value is given room for the size its
+  payload declares, before anything of it is allocated.
   `COPY` copies a filter (Redis refuses); a
   copy, a snapshot and a `DUMP` share the filter's bytes until it is next
   written. As in Redis 8.10, no `BF.*` command sends a keyspace event but
@@ -271,7 +280,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   error for the item it stopped at; `BF.MADD` and `BF.INSERT` answer that
   item and every one after it with the error, so their reply has an entry
   for each item. Replicas and the AOF get only the items a write took.
- 
 
 - **Count-min sketches (`CMS.*`), as Redis 8 has them built in (part of
   #453).** `CMS.INITBYDIM`, `CMS.INITBYPROB`, `CMS.INCRBY`, `CMS.QUERY`,
@@ -285,7 +293,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `DUMP` writes Redis's format. `TYPE` is `CMSk-TYPE`, the ACL category
   `@cms`. Unlike Redis, a sketch has size limits (134,217,728 counters,
   65,536 rows), `CMS.INCRBY`, `CMS.QUERY` and `CMS.MERGE` have per-command
-  limits checked before they start, and `COPY` copies a sketch. Snapshots
+  limits checked before they start (`CMS.MERGE`: 2^23 counters, 8,388,608,
+  in all its sources together), and `COPY` copies a sketch. Snapshots
   keep sketches under tag 40, kind 2.
 
 - **Top-K (`TOPK.*`), as Redis 8 has it built in (part of #453).**
@@ -323,8 +332,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   category `@cuckoo`. Unlike Redis, a filter has size limits (1 GiB, 99
   sub-filters), commands of many items a per-command limit checked before
   they start, a compaction stops at a limit of its own (so a large filter
-  compacts in part), and `COPY` copies a filter. Snapshots keep filters under tag
-  40, kind 4.
+  compacts in part), and `COPY` copies a filter. Under `maxmemory` a client's
+  write is given room before it takes its key for what it may allocate: the
+  filter it makes, a new sub-filter for an add only when no bucket of the
+  item has a free slot, the growth a `CF.INSERT` of many items needs to hold
+  them (an item that would grow the filter further when there is no room
+  left is answered with `OOM` on its own), and a copy of the sub-filters a
+  `COPY` or a snapshot shares and the write changes, `CF.DEL` and
+  `CF.COMPACT` included (refused with `OOM` at the limit under
+  `noeviction`; unshared, they free and always run). A write either succeeds
+  or changes nothing: every check comes before a filter is made. Snapshots
+  keep filters under tag 40, kind 4.
 
 - **t-digests (`TDIGEST.*`), as Redis 8 has them built in (#453).**
   `TDIGEST.CREATE`, `TDIGEST.ADD`, `TDIGEST.MERGE` (with `COMPRESSION` and

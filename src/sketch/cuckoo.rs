@@ -69,6 +69,10 @@ pub enum CuckooError {
     TooLarge,
     /// The system would not allocate it.
     NoMemory,
+    /// A client's command would grow the filter past what it was given
+    /// room for under `maxmemory`, and there is no more
+    /// ([`Cuckoo::insert_within`]).
+    NoRoom,
 }
 
 /// A sub-filter's bytes, shared between copies of the filter until one is
@@ -169,6 +173,68 @@ pub fn expansion_of(expansion: u16) -> u16 {
     }
 }
 
+/// The load, in per cent of its slots, that a Cuckoo filter of buckets of
+/// `bucket_size` reaches before an add fails, about (Fan et al.: some 50%
+/// with buckets of 1, 84% of 2, 95% of 4): what a command of many items is
+/// given room for growing to ([`Cuckoo::bytes_to_add_items`]).
+fn load_percent(bucket_size: u16) -> u64 {
+    match bucket_size {
+        0 | 1 => 50,
+        2 => 84,
+        3 => 90,
+        _ => 95,
+    }
+}
+
+/// The bytes of the sub-filter after one of `last` buckets, in a filter of
+/// `filters` sub-filters and `data` bytes: 0 if it would not grow
+/// ([`Cuckoo::growth_bytes`]).
+fn next_growth(bucket_size: u16, expansion: u16, filters: u64, data: u64, last: u64) -> u64 {
+    if expansion == 0 || filters >= MAX_FILTERS {
+        return 0;
+    }
+    let bytes = last
+        .saturating_mul(u64::from(expansion))
+        .saturating_mul(u64::from(bucket_size));
+    if data.saturating_add(bytes) > MAX_BYTES {
+        0
+    } else {
+        bytes
+    }
+}
+
+/// The bytes of the sub-filters a filter of `filters` sub-filters, `data`
+/// bytes and `last` buckets in its newest grows by to hold `items` items
+/// at [`load_percent`], within the fixed limits.
+fn growth_for(
+    bucket_size: u16,
+    expansion: u16,
+    filters: u64,
+    data: u64,
+    last: u64,
+    items: u64,
+) -> u64 {
+    let load = load_percent(bucket_size);
+    let (mut slots, mut last, mut filters, mut grown) = (data, last, filters, 0u64);
+    while slots.saturating_mul(load) / 100 < items {
+        let bytes = next_growth(
+            bucket_size,
+            expansion,
+            filters,
+            data.saturating_add(grown),
+            last,
+        );
+        if bytes == 0 {
+            break;
+        }
+        grown += bytes;
+        slots += bytes;
+        last = last.saturating_mul(u64::from(expansion));
+        filters += 1;
+    }
+    grown
+}
+
 /// What the free slot found for a fingerprint is: a sub-filter and a byte.
 type Slot = (usize, usize);
 
@@ -206,20 +272,150 @@ impl Cuckoo {
         self.data_bytes() as usize + self.filters.len() * std::mem::size_of::<SubFilter>()
     }
 
-    /// What an add may allocate at most: a new sub-filter, and copies of
-    /// shared ones.
-    pub fn bytes_to_add(&self) -> u64 {
-        let next = self
-            .filters
-            .last()
-            .map_or(0, |f| f.data.len() as u64 * u64::from(self.expansion));
-        let shared: u64 = self
-            .filters
-            .iter()
-            .filter(|f| Arc::strong_count(&f.data) > 1)
-            .map(|f| f.data.len() as u64)
-            .sum();
-        next.saturating_add(shared)
+    /// The bytes of sub-filter `fi` if a snapshot or a copy shares them (a
+    /// write to it copies them first), else 0.
+    fn shared(&self, fi: usize) -> u64 {
+        let f = &self.filters[fi];
+        if Arc::strong_count(&f.data) > 1 {
+            f.data.len() as u64
+        } else {
+            0
+        }
+    }
+
+    /// The bytes of every sub-filter a snapshot or a copy shares.
+    pub fn shared_bytes(&self) -> u64 {
+        (0..self.filters.len()).map(|fi| self.shared(fi)).sum()
+    }
+
+    /// The bytes of the sub-filter the next growth adds; 0 if the filter
+    /// does not grow (`expansion` 0), or may not within the fixed limits
+    /// (it is then refused, having allocated nothing).
+    pub fn growth_bytes(&self) -> u64 {
+        let last = self.filters.last().map_or(0, |f| f.buckets);
+        next_growth(
+            self.bucket_size,
+            self.expansion,
+            self.filters.len() as u64,
+            self.data_bytes(),
+            last,
+        )
+    }
+
+    /// What adding the item `l` may allocate at most: a copy of the
+    /// sub-filter it goes into, if shared; and only if neither of its
+    /// buckets has a free slot in any sub-filter, a copy of the newest
+    /// (where its fingerprint kicks others) and a new sub-filter (if the
+    /// kicks make no room). A filter with a free slot for it never grows
+    /// for it.
+    pub fn bytes_to_add_item(&self, l: Lookup) -> u64 {
+        for fi in (0..self.filters.len()).rev() {
+            if self.find_free(fi, l.h1, l.h2).is_some() {
+                return self.shared(fi);
+            }
+        }
+        self.shared(self.filters.len() - 1)
+            .saturating_add(self.growth_bytes())
+    }
+
+    /// What adding `n` items may allocate, reckoned before a command of
+    /// many items starts: a copy of every shared sub-filter, and the
+    /// sub-filters it grows by for the filter to hold its items and `n`
+    /// more at the load a Cuckoo filter of its bucket size reaches before
+    /// an add fails ([`load_percent`]). Items that crowd the same buckets
+    /// may grow it sooner: each growth past these is asked for as it comes
+    /// ([`Cuckoo::insert_within`]).
+    pub fn bytes_to_add_items(&self, n: u64) -> u64 {
+        let last = self.filters.last().map_or(0, |f| f.buckets);
+        self.shared_bytes().saturating_add(growth_for(
+            self.bucket_size,
+            self.expansion,
+            self.filters.len() as u64,
+            self.data_bytes(),
+            last,
+            self.items.saturating_add(n),
+        ))
+    }
+
+    /// [`Cuckoo::bytes_to_add_items`] for a filter not made yet: what
+    /// making one with `p` and adding `n` items to it may allocate.
+    pub fn bytes_to_make_and_add(p: &Params, n: u64) -> u64 {
+        let buckets = buckets_for(p.capacity, p.bucket_size);
+        let bytes = Cuckoo::bytes_for(p);
+        bytes.saturating_add(growth_for(
+            p.bucket_size,
+            expansion_of(p.expansion),
+            1,
+            bytes,
+            buckets,
+            n,
+        ))
+    }
+
+    /// What deleting the item `l` may allocate: a copy of the sub-filter it
+    /// is deleted from, if shared; of every shared one if the delete
+    /// starts a compaction. Nothing if it is not there.
+    pub fn bytes_to_delete(&self, l: Lookup) -> u64 {
+        let Some((fi, _)) = self.find(l) else {
+            return 0;
+        };
+        if self.compacts_after_delete() {
+            self.shared_bytes()
+        } else {
+            self.shared(fi)
+        }
+    }
+
+    /// What [`Cuckoo::compact`] may allocate: a copy of every shared
+    /// sub-filter, if there is more than one.
+    pub fn bytes_to_compact(&self) -> u64 {
+        if self.filters.len() > 1 {
+            self.shared_bytes()
+        } else {
+            0
+        }
+    }
+
+    /// What `CF.LOADCHUNK key iter data` (with `len` bytes of data) may
+    /// allocate: a copy of the sub-filter the chunk goes into, if shared.
+    pub fn bytes_to_load_chunk(&self, iter: i64, len: usize) -> u64 {
+        self.chunk_place(iter, len)
+            .map_or(0, |(fi, _)| self.shared(fi))
+    }
+
+    /// Where the fingerprint of `l` is, the newest sub-filter first, as a
+    /// delete looks: the sub-filter and the byte.
+    fn find(&self, l: Lookup) -> Option<Slot> {
+        let bs = self.bucket_size as usize;
+        for fi in (0..self.filters.len()).rev() {
+            for h in [l.h1, l.h2] {
+                let b = self.bucket(fi, h);
+                if let Some(j) = self.filters[fi].data[b..b + bs]
+                    .iter()
+                    .position(|&x| x == l.fp)
+                {
+                    return Some((fi, b + j));
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether a delete that finds its item goes on to compact.
+    fn compacts_after_delete(&self) -> bool {
+        let items = self.items.wrapping_sub(1);
+        let deletes = self.deletes.wrapping_add(1);
+        self.filters.len() > 1 && deletes as f64 > items as f64 * 0.1
+    }
+
+    /// Every sub-filter's bytes this filter's own, copied first where a
+    /// snapshot or a copy shares them: before a change that may write to
+    /// any of them, so that it cannot fail part way for want of memory.
+    fn own_all(&mut self) -> Result<(), CuckooError> {
+        for f in &mut self.filters {
+            f.own()?;
+        }
+        Ok(())
     }
 
     fn bucket(&self, fi: usize, h: u64) -> usize {
@@ -274,8 +470,13 @@ impl Cuckoo {
         Ok(false)
     }
 
-    /// Add a sub-filter, `expansion` times the newest.
-    fn grow(&mut self, max_filters: u64) -> Result<(), CuckooError> {
+    /// Add a sub-filter, `expansion` times the newest, if `may_grow` lets
+    /// it have its bytes.
+    fn grow(
+        &mut self,
+        max_filters: u64,
+        may_grow: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<(), CuckooError> {
         if self.filters.len() as u64 >= max_filters {
             return Err(CuckooError::MaxExpansions);
         }
@@ -291,6 +492,9 @@ impl Cuckoo {
         if self.data_bytes().saturating_add(bytes) > MAX_BYTES {
             return Err(CuckooError::TooLarge);
         }
+        if !may_grow(bytes) {
+            return Err(CuckooError::NoRoom);
+        }
         let next = SubFilter::zeroed(buckets, self.bucket_size)?;
         self.filters.push(next);
         Ok(())
@@ -299,6 +503,20 @@ impl Cuckoo {
     /// Add an item's fingerprint. `max_filters` is how many sub-filters it
     /// may grow to (`cf-max-expansions` for a client's command).
     pub fn insert(&mut self, l: Lookup, max_filters: u64) -> Result<(), CuckooError> {
+        self.insert_within(l, max_filters, &mut |_| true)
+    }
+
+    /// [`Cuckoo::insert`], growing the filter only by sub-filters whose
+    /// bytes `may_grow` lets it have: one it does not is
+    /// [`CuckooError::NoRoom`]. An add that fails changes nothing (its
+    /// kicks are undone; a copy of a shared sub-filter it made stays, the
+    /// same bytes).
+    pub fn insert_within(
+        &mut self,
+        l: Lookup,
+        max_filters: u64,
+        may_grow: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<(), CuckooError> {
         loop {
             for fi in (0..self.filters.len()).rev() {
                 if let Some(slot) = self.find_free(fi, l.h1, l.h2) {
@@ -314,7 +532,7 @@ impl Cuckoo {
             if self.expansion == 0 {
                 return Err(CuckooError::Full);
             }
-            self.grow(max_filters)?;
+            self.grow(max_filters, may_grow)?;
         }
     }
 
@@ -348,26 +566,23 @@ impl Cuckoo {
 
     /// Delete one copy of the item's fingerprint, the newest sub-filter
     /// first; then compact if deletes are more than a tenth of the items.
+    /// What it writes to is its own before anything changes: it fails for
+    /// want of memory, if it does, having changed nothing.
     pub fn delete(&mut self, l: Lookup) -> Result<bool, CuckooError> {
-        let bs = self.bucket_size as usize;
-        for fi in (0..self.filters.len()).rev() {
-            for h in [l.h1, l.h2] {
-                let b = self.bucket(fi, h);
-                if let Some(j) = self.filters[fi].data[b..b + bs]
-                    .iter()
-                    .position(|&x| x == l.fp)
-                {
-                    self.filters[fi].own()?[b + j] = 0;
-                    self.items = self.items.wrapping_sub(1);
-                    self.deletes = self.deletes.wrapping_add(1);
-                    if self.filters.len() > 1 && self.deletes as f64 > self.items as f64 * 0.1 {
-                        self.compact(false)?;
-                    }
-                    return Ok(true);
-                }
-            }
+        let Some((fi, at)) = self.find(l) else {
+            return Ok(false);
+        };
+        let compacts = self.compacts_after_delete();
+        if compacts {
+            self.own_all()?;
         }
-        Ok(false)
+        self.filters[fi].own()?[at] = 0;
+        self.items = self.items.wrapping_sub(1);
+        self.deletes = self.deletes.wrapping_add(1);
+        if compacts {
+            self.compact(false)?;
+        }
+        Ok(true)
     }
 
     /// Move the fingerprint at `(fi, bucket, slot)` into an older
@@ -398,7 +613,13 @@ impl Cuckoo {
     /// the newest; drop the newest if it empties. `all`: go on past a
     /// sub-filter that could not be emptied (`CF.COMPACT`). It stops where
     /// it is at [`COMPACT_BUDGET`].
+    ///
+    /// What it writes to is its own before anything changes: it fails for
+    /// want of memory, if it does, having changed nothing.
     pub fn compact(&mut self, all: bool) -> Result<(), CuckooError> {
+        if self.filters.len() > 1 {
+            self.own_all()?;
+        }
         let look = 2 * u64::from(self.bucket_size);
         let mut work = 0u64;
         'filters: for fi in (1..self.filters.len()).rev() {
@@ -481,36 +702,46 @@ impl Cuckoo {
     /// `iter − len − 1`, which with all of it must be in one sub-filter.
     pub fn load_chunk(&mut self, iter: i64, data: &[u8]) -> Result<(), &'static str> {
         const BAD: &str = "Couldn't load chunk!";
+        let (fi, at) = self.chunk_place(iter, data.len()).ok_or(BAD)?;
+        self.filters[fi].own().map_err(|_| BAD)?[at..at + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
+    /// Where `CF.LOADCHUNK key iter data` (`len` bytes of data) puts them:
+    /// the sub-filter and the byte, all of them in it; `None` if they do
+    /// not fit there.
+    fn chunk_place(&self, iter: i64, len: usize) -> Option<(usize, usize)> {
         let offset = iter
-            .checked_sub(data.len() as i64)
+            .checked_sub(len as i64)
             .and_then(|v| v.checked_sub(1))
-            .and_then(|v| u64::try_from(v).ok())
-            .ok_or(BAD)?;
+            .and_then(|v| u64::try_from(v).ok())?;
         // The sub-filter it lands in, as Redis finds it: past the last one,
         // the last, at the offset less all their bytes.
         let mut at = offset;
         let mut fi = self.filters.len() - 1;
         for (i, f) in self.filters.iter().enumerate() {
-            let len = f.data.len() as u64;
-            if at < len {
+            let flen = f.data.len() as u64;
+            if at < flen {
                 fi = i;
                 break;
             }
-            at -= len;
+            at -= flen;
         }
-        let at = usize::try_from(at).map_err(|_| BAD)?;
-        let f = &mut self.filters[fi];
-        if at.saturating_add(data.len()) > f.data.len() {
-            return Err(BAD);
-        }
-        f.own().map_err(|_| BAD)?[at..at + data.len()].copy_from_slice(data);
-        Ok(())
+        let at = usize::try_from(at).ok()?;
+        (at.saturating_add(len) <= self.filters[fi].data.len()).then_some((fi, at))
     }
 
     /// A filter from a `CF.SCANDUMP` header: its sub-filters made, zeroed.
     /// Its bucket size may be `max_bucket_size` at most (Redis bounds a
     /// client's by `cf-initial-size`).
     pub fn from_header(raw: &[u8], max_bucket_size: u16) -> Result<Cuckoo, HeaderError> {
+        let (shape, _) = Cuckoo::header_shape(raw, max_bucket_size)?;
+        Cuckoo::from_shape(&shape)
+    }
+
+    /// The shape a `CF.SCANDUMP` header gives, checked, and the bytes of its
+    /// sub-filters, before anything of them is allocated.
+    pub fn header_shape(raw: &[u8], max_bucket_size: u16) -> Result<(Shape, u64), HeaderError> {
         if raw.len() != HEADER_LEN {
             return Err(HeaderError::Invalid);
         }
@@ -532,7 +763,12 @@ impl Cuckoo {
             ShapeError::Bad => HeaderError::Bad,
             ShapeError::TooLarge => HeaderError::TooLarge,
         })?;
-        let _ = bytes;
+        Ok((shape, bytes))
+    }
+
+    /// A filter of `shape` (checked: [`Cuckoo::header_shape`]), its
+    /// sub-filters made, zeroed.
+    pub fn from_shape(shape: &Shape) -> Result<Cuckoo, HeaderError> {
         let mut filters = Vec::with_capacity(shape.filters as usize);
         let mut buckets = shape.buckets;
         for _ in 0..shape.filters {
@@ -651,9 +887,10 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<Cuckoo> {
         max_iterations: u16_at(34),
         expansion: u16_at(36),
     };
-    shape
+    let bytes = shape
         .check()
         .map_err(|_| super::invalid("a Cuckoo filter of this shape is not supported"))?;
+    super::room::declared(bytes)?;
     let mut filters = Vec::with_capacity(shape.filters as usize);
     let mut buckets = shape.buckets;
     for _ in 0..shape.filters {
@@ -832,6 +1069,103 @@ mod tests {
             ..huge
         };
         assert_eq!(many.check(), Err(ShapeError::TooLarge));
+    }
+
+    /// An add is charged for a new sub-filter only when no bucket of its
+    /// item has a free slot (a 64 MiB filter does not need 64 MiB free for
+    /// every add); and for a copy of the sub-filter it writes to only when
+    /// a snapshot or a copy shares it.
+    #[test]
+    fn an_add_is_charged_for_what_it_may_allocate() {
+        let mut cf = Cuckoo::new(Params {
+            capacity: 1 << 20,
+            bucket_size: 2,
+            max_iterations: 20,
+            expansion: 1,
+        })
+        .unwrap();
+        let l = lookup(b"x");
+        assert_eq!(cf.bytes_to_add_item(l), 0);
+        let shared = cf.clone();
+        assert_eq!(cf.bytes_to_add_item(l), 1 << 20);
+        drop(shared);
+        // Both its buckets full: it may grow.
+        let mut tiny = Cuckoo::new(Params {
+            capacity: 4,
+            bucket_size: 1,
+            max_iterations: 1,
+            expansion: 2,
+        })
+        .unwrap();
+        let x = lookup(b"x");
+        while let Some(at) = tiny.find_free(0, x.h1, x.h2) {
+            tiny.set(at, 7).unwrap();
+        }
+        assert_eq!(tiny.growth_bytes(), 8);
+        assert_eq!(tiny.bytes_to_add_item(x), 8);
+        cf.insert(l, MAX_FILTERS).unwrap();
+        // Many items: room to grow to hold them at the load the bucket size
+        // reaches; none for a few.
+        assert_eq!(cf.bytes_to_add_items(10), 0);
+        assert!(cf.bytes_to_add_items(1 << 21) >= 1 << 20);
+        let p = Params {
+            capacity: 1024,
+            bucket_size: 2,
+            max_iterations: 20,
+            expansion: 1,
+        };
+        assert_eq!(Cuckoo::bytes_to_make_and_add(&p, 10), 1024);
+        assert_eq!(Cuckoo::bytes_to_make_and_add(&p, 2000), 3072);
+    }
+
+    /// A growth refused for room changes nothing, and the add says so.
+    #[test]
+    fn a_growth_without_room_changes_nothing() {
+        let mut cf = Cuckoo::new(Params {
+            capacity: 4,
+            bucket_size: 1,
+            max_iterations: 2,
+            expansion: 1,
+        })
+        .unwrap();
+        let mut refused = 0;
+        for i in 0..100 {
+            let before = cf.clone();
+            let l = lookup(format!("{i}").as_bytes());
+            if let Err(e) = cf.insert_within(l, MAX_FILTERS, &mut |_| false) {
+                assert_eq!(e, CuckooError::NoRoom);
+                assert_eq!(cf, before);
+                refused += 1;
+            }
+        }
+        assert!(refused > 0);
+        assert_eq!(cf.filters.len(), 1);
+    }
+
+    /// A delete or a compaction of a filter a copy shares copies what it
+    /// writes to before it changes anything, and leaves the copy as it was.
+    #[test]
+    fn deletes_of_a_shared_filter() {
+        let mut cf = Cuckoo::new(Params {
+            capacity: 8,
+            bucket_size: 1,
+            max_iterations: 2,
+            expansion: 1,
+        })
+        .unwrap();
+        for i in 0..40 {
+            cf.insert(lookup(format!("{i}").as_bytes()), MAX_FILTERS)
+                .unwrap();
+        }
+        assert!(cf.filters.len() > 1);
+        let copy = cf.clone();
+        assert_eq!(cf.bytes_to_compact(), cf.data_bytes());
+        assert_eq!(cf.bytes_to_delete(lookup(b"absent")), 0);
+        let one = lookup(b"0");
+        assert!(cf.bytes_to_delete(one) > 0);
+        assert!(cf.delete(one).unwrap());
+        assert_ne!(cf, copy);
+        assert!(copy.contains(one));
     }
 
     #[test]

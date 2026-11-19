@@ -430,6 +430,7 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<TDigest> {
     }
     let [min, max, merged_weight, unmerged_weight] = f;
     let capacity = capacity_of(compression);
+    super::room::declared(capacity as u64 * 16)?;
     let mut lists = [Vec::new(), Vec::new()];
     let mut count = 0usize;
     for list in &mut lists {

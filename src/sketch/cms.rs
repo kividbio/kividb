@@ -303,13 +303,20 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<CountMin> {
             "a count-min sketch over the size limits is not supported",
         ));
     }
-    let bytes = super::read_vec(r, (width * depth * 4) as usize)?;
+    super::room::declared(width * depth * 4)?;
     Ok(CountMin {
         width,
         depth,
         count,
-        counters: counters_from_bytes(&bytes)?,
+        counters: counters_from_reader(r, (width * depth) as usize)?,
     })
+}
+
+/// `n` little-endian u32s read from `r`, not held whole as bytes beside
+/// them (`sketch::read_values`).
+pub fn counters_from_reader(r: &mut impl io::Read, n: usize) -> io::Result<Counters> {
+    let v = super::read_values(r, n, |w: &[u8; 4]| u32::from_le_bytes(*w))?;
+    Ok(Counters::from_vec(v))
 }
 
 /// Little-endian u32s from `bytes` (a whole number of them), into an

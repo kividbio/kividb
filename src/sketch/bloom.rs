@@ -1140,6 +1140,7 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<BloomChain> {
         if let Some(why) = over_limits(used) {
             return Err(super::invalid(&why));
         }
+        super::room::declared(used.bytes)?;
         let data = super::read_vec(r, bytes as usize)?;
         shapes.push(LayerShape {
             bytes,

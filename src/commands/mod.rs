@@ -16,6 +16,7 @@ pub mod ctx;
 mod debug_cmd;
 pub mod expr;
 mod generics;
+pub(crate) use generics::restore_wanted;
 mod geo;
 mod glob_redis;
 pub mod handler;

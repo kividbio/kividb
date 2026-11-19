@@ -195,6 +195,42 @@ pub(crate) fn read_vec(r: &mut impl io::Read, len: usize) -> io::Result<Vec<u8>>
     Ok(out)
 }
 
+/// `n` values of `T`, each made by `of` from `SIZE` bytes, read from `r` a
+/// megabyte at a time: the bytes are never held whole beside the values.
+/// The values' memory is asked for (not assumed), and as the stream gives
+/// them, doubling as `Vec` grows, so that a corrupt length allocates no
+/// more than about twice what the stream holds.
+pub(crate) fn read_values<T, const SIZE: usize>(
+    r: &mut impl io::Read,
+    n: usize,
+    of: impl Fn(&[u8; SIZE]) -> T,
+) -> io::Result<Vec<T>> {
+    // A whole number of values.
+    const STEP: usize = 1 << 20;
+    let total = n
+        .checked_mul(SIZE)
+        .ok_or_else(|| invalid("a value longer than memory"))?;
+    let mut out: Vec<T> = Vec::new();
+    let mut buf = vec![0u8; total.min(STEP)];
+    let mut left = total;
+    while left > 0 {
+        let len = left.min(STEP);
+        r.read_exact(&mut buf[..len])?;
+        let more = len / SIZE;
+        if out.capacity() - out.len() < more {
+            let want = (out.len() + more)
+                .max(out.capacity().saturating_mul(2))
+                .min(n);
+            out.try_reserve_exact(want - out.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::OutOfMemory, "no memory for a sketch")
+            })?;
+        }
+        out.extend(buf[..len].as_chunks::<SIZE>().0.iter().map(&of));
+        left -= len;
+    }
+    Ok(out)
+}
+
 /// `n` values of `T` from zeroed memory, or `None` if it cannot be had (the
 /// memory asked for, not assumed). The pages come zeroed from the system
 /// and are not written here: making a large sketch costs nothing of its

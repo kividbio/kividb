@@ -309,6 +309,13 @@ fn rdb_read_string_at_most(r: &mut impl Read, max_len: u64) -> io::Result<Vec<u8
         }
         return super::read_vec(r, usize::try_from(n).map_err(|_| longer())?);
     }
+    rdb_read_compressed_at_most(r, n, max_len)
+}
+
+/// [`rdb_read_string_at_most`] once its length's marker says it is encoded
+/// (`n`, the encoding): an LZF-compressed string of at most `max_len`.
+fn rdb_read_compressed_at_most(r: &mut impl Read, n: u64, max_len: u64) -> io::Result<Vec<u8>> {
+    let longer = || super::invalid("a string longer than its declared shape");
     if n != RDB_ENC_LZF {
         return Err(super::invalid("a string of an unexpected encoding"));
     }
@@ -325,12 +332,58 @@ fn rdb_read_string_at_most(r: &mut impl Read, max_len: u64) -> io::Result<Vec<u8
         return Err(super::invalid("a compressed string of a bad length"));
     }
     let data = super::read_vec(r, compressed as usize)?;
-    match lzf::decompress(&data, original as usize) {
-        Ok(out) if out.len() as u64 == original => Ok(out),
-        _ => Err(super::invalid(
-            "a compressed string that does not decompress",
-        )),
+    lzf_decompress(&data, original as usize)
+}
+
+/// `data`, LZF-compressed as Redis compresses a string (liblzf's format: a
+/// run of up to 32 literal bytes, or a copy of 3 to 264 bytes from up to
+/// 8 KiB back), decompressed to exactly `original` bytes, into memory that
+/// is asked for (not assumed): an error, not an abort, if it cannot be had.
+fn lzf_decompress(data: &[u8], original: usize) -> io::Result<Vec<u8>> {
+    let bad = || super::invalid("a compressed string that does not decompress");
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(original).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "no memory for a compressed string",
+        )
+    })?;
+    let mut at = 0;
+    while at < data.len() {
+        let ctrl = usize::from(data[at]);
+        at += 1;
+        if ctrl < 32 {
+            let run = ctrl + 1;
+            let literal = data.get(at..at + run).ok_or_else(bad)?;
+            if out.len() + run > original {
+                return Err(bad());
+            }
+            out.extend_from_slice(literal);
+            at += run;
+            continue;
+        }
+        let mut len = ctrl >> 5;
+        if len == 7 {
+            len += usize::from(*data.get(at).ok_or_else(bad)?);
+            at += 1;
+        }
+        let back = ((ctrl & 0x1f) << 8) + usize::from(*data.get(at).ok_or_else(bad)?) + 1;
+        at += 1;
+        let len = len + 2;
+        if back > out.len() || out.len() + len > original {
+            return Err(bad());
+        }
+        // Byte by byte: a copy may overlap what it makes.
+        let from = out.len() - back;
+        for i in 0..len {
+            let byte = out[from + i];
+            out.push(byte);
+        }
     }
+    if out.len() != original {
+        return Err(bad());
+    }
+    Ok(out)
 }
 
 /// An RDB length, and whether it is a special encoding's number instead.
@@ -394,11 +447,6 @@ impl<R: Read> Reader<'_, R> {
         Ok(f64::from_le_bytes(b))
     }
 
-    fn string(&mut self) -> io::Result<Vec<u8>> {
-        self.opcode(OPCODE_STRING)?;
-        crate::snapshot::rdb_read_string(self.r)
-    }
-
     /// A string that must be `len` bytes, plain or LZF-compressed as Redis
     /// writes one (`mismatch` if it is another length): no longer than
     /// that is read or reserved ([`rdb_read_string_at_most`]).
@@ -406,6 +454,33 @@ impl<R: Read> Reader<'_, R> {
         self.opcode(OPCODE_STRING)?;
         match rdb_read_string_at_most(self.r, len) {
             Ok(s) if s.len() as u64 == len => Ok(s),
+            Ok(_) => Err(self.bad(mismatch)),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => Err(self.bad(mismatch)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`Reader::string_of`], for a string of `len` bytes that `plain`
+    /// reads into what it makes straight from the stream when it is not
+    /// compressed (the bytes are then never held whole beside it), and
+    /// `whole` makes it from when it is (decompressed first).
+    fn string_as<T>(
+        &mut self,
+        len: u64,
+        mismatch: &str,
+        plain: impl FnOnce(&mut R) -> io::Result<T>,
+        whole: impl FnOnce(&[u8]) -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.opcode(OPCODE_STRING)?;
+        let (n, encoded) = rdb_length(self.r)?;
+        if !encoded {
+            if n != len {
+                return Err(self.bad(mismatch));
+            }
+            return plain(self.r);
+        }
+        match rdb_read_compressed_at_most(self.r, n, len) {
+            Ok(s) if s.len() as u64 == len => whole(&s),
             Ok(_) => Err(self.bad(mismatch)),
             Err(e) if e.kind() == io::ErrorKind::InvalidData => Err(self.bad(mismatch)),
             Err(e) => Err(e),
@@ -448,10 +523,14 @@ fn read_bloom(r: &mut Reader<'_, impl Read>) -> io::Result<BloomChain> {
         if let Some(why) = super::bloom::over_limits(claimed) {
             return Err(r.bad(&why));
         }
-        // Then by what was read (a compressed string's length is its own
-        // word, not the layer's): its bits must be its bytes times 8, and
-        // its bytes are what is charged.
-        let data = r.string()?;
+        super::room::declared(claimed.bytes)?;
+        // Then by what was read: its bits must be its bytes times 8, and no
+        // more than those bytes is read or reserved (a compressed string's
+        // length is its own word: what it makes is held to them too).
+        if bits % 8 != 0 {
+            return Err(r.bad("a layer's bytes do not match its bits"));
+        }
+        let data = r.string_of(bits / 8, "a layer's bytes do not match its bits")?;
         if (data.len() as u64).checked_mul(8) != Some(bits) {
             return Err(r.bad("a layer's bytes do not match its bits"));
         }
@@ -499,12 +578,15 @@ fn read_cms(r: &mut Reader<'_, impl Read>) -> io::Result<CountMin> {
     if !super::cms::fits(width, depth) {
         return Err(r.bad("a sketch over the size limits is not supported"));
     }
-    let data = r.string_of(
+    super::room::declared(width * depth * 4)?;
+    let n = (width * depth) as usize;
+    let counters = r.string_as(
         width * depth * 4,
         "the counters do not match the width and depth",
+        |s| super::cms::counters_from_reader(s, n),
+        super::cms::counters_from_bytes,
     )?;
     r.end()?;
-    let counters = super::cms::counters_from_bytes(&data)?;
     Ok(CountMin {
         width,
         depth,
@@ -529,12 +611,14 @@ fn read_topk(r: &mut Reader<'_, impl Read>) -> io::Result<TopK> {
     if !super::topk::fits(k, width, depth) || !super::topk::decay_ok(decay) {
         return Err(r.bad("a sketch over the size limits is not supported"));
     }
-    let raw = r.string_of(
+    super::room::declared((width * depth * 8).saturating_add(k * TOPK_SLOT as u64))?;
+    let n = (width * depth) as usize;
+    let buckets = r.string_as(
         width * depth * 8,
         "the buckets do not match the width and depth",
+        |s| super::topk::buckets_from_reader(s, n),
+        super::topk::buckets_from_bytes,
     )?;
-    let buckets = super::topk::buckets_from_bytes(&raw)?;
-    drop(raw);
     let places = r.string_of(k * TOPK_SLOT as u64, "the heap does not match k")?;
     let mut heap = Vec::with_capacity(k as usize);
     for place in places.as_chunks::<TOPK_SLOT>().0 {
@@ -591,9 +675,10 @@ fn read_cuckoo(r: &mut Reader<'_, impl Read>) -> io::Result<Cuckoo> {
         max_iterations,
         expansion,
     };
-    shape
+    let bytes = shape
         .check()
         .map_err(|_| r.bad("a filter of this shape is not supported"))?;
+    super::room::declared(bytes)?;
     let mut subs = Vec::with_capacity(filters as usize);
     let mut want = buckets;
     for _ in 0..filters {

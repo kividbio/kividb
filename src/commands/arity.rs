@@ -120,7 +120,11 @@ impl ShortNames {
         let slots = vec![ShortName::default(); Self::SLOTS].into_boxed_slice();
         let mut short = ShortNames { slots };
         for (name, (arity, container)) in commands {
-            short.insert(name, *arity, *container);
+            // Those that allocate as much as their arguments say come after
+            // every other (see `ARITIES`).
+            if !crate::sketch::room::ALLOCATES.contains(name) {
+                short.insert(name, *arity, *container);
+            }
         }
         short
     }
@@ -198,13 +202,14 @@ static ARITIES: LazyLock<Arities> = LazyLock::new(|| {
         .collect();
     let subcommands = table().filter(|(name, _)| name.contains('|')).collect();
     let mut short = ShortNames::of(&commands);
-    // A command that allocates as much as its arguments say (which checks
-    // its own arguments) is in the lookup too, after every other, taken for
-    // one with subcommands: it leaves the common path there
-    // (`check_dispatch`).
+    // A command that allocates as much as its arguments say is in the
+    // lookup too, after every other, taken for one with subcommands: it
+    // leaves the common path there (`check_dispatch`). Its arity is the
+    // table's if it is there (`RESTORE`), else its own to check.
     let mut rooms = ByName::default();
     for &name in crate::sketch::room::ALLOCATES {
-        short.insert(name, -1, true);
+        let arity = commands.get(name).map_or(-1, |&(arity, _)| arity);
+        short.insert(name, arity, true);
         rooms.insert(name, ());
     }
     Arities {
@@ -280,10 +285,16 @@ pub fn check(name: &str, cmd: &[&[u8]]) -> Option<Vec<u8>> {
 
 /// [`check`], for the dispatch: also `Some` of an empty reply for a command
 /// with the right number of arguments that allocates as much as they say
-/// (`sketch::room`), which the dispatch asks how much before it runs.
+/// (`sketch::room`), which the dispatch makes room for before it runs it
+/// (`handler::room_on_arrival`).
 #[inline(always)]
 pub fn check_dispatch(name: &str, cmd: &[&[u8]]) -> Option<Vec<u8>> {
     check_as::<true>(name, cmd)
+}
+
+/// Whether `name` allocates as much as its arguments say (`sketch::room`).
+pub fn allocates(name: &str) -> bool {
+    ARITIES.rooms.contains_key(name)
 }
 
 #[inline(always)]
@@ -366,7 +377,15 @@ mod tests {
         let mut short = 0;
         for (name, entry) in &arities.commands {
             if name.len() <= ShortNames::LONGEST {
-                assert_eq!(arities.short.get(name.as_bytes()), Some(*entry), "{name}");
+                // One that allocates as much as its arguments say is taken
+                // for one with subcommands, to leave the common path.
+                let (arity, container) = *entry;
+                let container = container || crate::sketch::room::ALLOCATES.contains(name);
+                assert_eq!(
+                    arities.short.get(name.as_bytes()),
+                    Some((arity, container)),
+                    "{name}"
+                );
                 short += 1;
             }
         }
