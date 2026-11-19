@@ -94,7 +94,9 @@ whole record before anything else is written: a later checkpoint may add
 the log's records to the old log, and they must not follow half a record.
 When the new log records where the old log ended, that record is first
 rewritten in place to the new end, so a stop between the two still finds
-the old log matching it.
+the old log matching it. A power failure that tears that rewrite (the
+record then holds digits of both ends) reads as a new log that does not
+match the old one: the new log is kept aside, on disk, and not loaded.
 
 To make that window short, the checkpoint syncs the log just
 before it turns it over, with nothing held: the old log's last sync then
@@ -123,13 +125,40 @@ A write to `appendonly.aof` that fails part-way (a full disk) is taken
 back: the file is cut to where it was before the write, and synced, so it
 never holds half a record with more written after it. Its records, and all
 that is queued after them, are kept in memory and written first, in order,
-at the next write or the once-a-second sync, as soon as the disk takes
-them. Until then the replies to those writes wait, as for a disk that is
-behind (at most 5 seconds, then sent without them and counted in
-`aof_acks_before_write`), `WAITAOF` counts no sync, a checkpoint fails
-rather than turn the log over, and `INFO persistence` shows
-`aof_last_write_status:err`. A write that cannot be taken back stops the
-server, as does any failed write under `appendfsync always`.
+by the once-a-second sync, as soon as the disk takes them. Until then:
+
+* commands that would be logged are refused, as Redis refuses them:
+  `-MISCONF Errors writing to the AOF file: No space left on device` (the
+  system's message). That covers writes, `EVAL`, `EVALSHA` and `FCALL`, and
+  an `EXEC` whose transaction holds a write (`-EXECABORT Transaction
+  discarded because of: MISCONF ...`). Reads, `PING` and read-only scripts
+  are served. A script or transaction already running is not cut short;
+* the replies to the writes already held wait, as for a disk that is behind
+  (at most 5 seconds, then sent without them and counted in
+  `aof_acks_before_write`), and `WAITAOF` counts no sync;
+* a checkpoint fails rather than turn the log over; so do `CONFIG SET
+  appendonly yes` and a save with the AOF off, which record or replace the
+  log, each with an error that says why;
+* `INFO persistence` shows `aof_last_write_status:err`.
+
+Once the disk takes them, writes are accepted again.
+
+A replica keeps applying its master's stream, and holds those records
+with the rest. A full sync drops what is held, as it is of the dataset the
+sync replaces.
+
+What is held is bounded: at most 256 MiB (the batch that failed, the writes
+in flight when the refusal began, a replica's stream, and the deletes of
+keys that expire or are evicted). Past that, the server stops rather than
+hold more, or write the log with a hole in it. A write that cannot be taken
+back stops the server too, as does any failed write under `appendfsync
+always`.
+
+At a shutdown, records still held are in memory only. The final save of a
+`SHUTDOWN` fails (its checkpoint cannot turn the log over), the error says
+how many bytes of writes are in memory only, and the server keeps running,
+as for any final save that fails. `SHUTDOWN NOSAVE`, and a shutdown on a
+signal, log that error and exit with status 1.
 
 The snapshot such a checkpoint, or a save with the AOF off, was writing is
 left in `dir` as `dump.kdb.<pid>.<n>.tmp`, as big as `dump.kdb`. Nothing

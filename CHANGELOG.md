@@ -502,9 +502,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A write to the AOF that the disk takes only part of is taken back.**
   The log is cut to where it was before the write, and the write's
   records, with all queued after them, are written first once the disk
-  takes them. Until then their replies wait (at most 5 seconds, as for a
-  disk that is behind), `WAITAOF` counts no sync, and
-  `aof_last_write_status` reads `err`. See "A write to the log that the
+  takes them. Until then commands that would be logged are refused with
+  `-MISCONF Errors writing to the AOF file: <error>`, as Redis refuses
+  them (reads are served), the held writes' replies wait (at most 5
+  seconds, as for a disk that is behind), `WAITAOF` counts no sync, and
+  `aof_last_write_status` reads `err`; once the disk takes them, writes are
+  accepted again. At most 256 MiB is held; past that the server stops. A
+  shutdown with writes still held says how many bytes are in memory only:
+  a `SHUTDOWN` keeps the server running, as when its final save fails, and
+  `SHUTDOWN NOSAVE` exits with status 1. See "A write to the log that the
   disk takes only part of" in docs/PERSISTENCE.md.
 - **Pipelined writes of kilobyte values are about twice as fast on the
   Tokio loop, and a long pipeline through a small receive buffer no longer
