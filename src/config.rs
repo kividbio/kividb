@@ -2598,7 +2598,10 @@ mod config_file_tests {
         let auto = Config::default();
         assert_eq!(auto.threads, 0);
         assert!(auto.resolve_threads() >= 1);
-        assert_eq!(auto.threads_reason(), "auto: half the available CPUs, at least 2 unless 1 CPU");
+        assert_eq!(
+            auto.threads_reason(),
+            "auto: half the available CPUs, at least 2 unless 1 CPU"
+        );
     }
 
     #[test]
