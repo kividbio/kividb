@@ -1480,7 +1480,7 @@ fn ft_knn_measuring_every_vector_beside_writers() {
                     let hset: [&[u8]; 6] = [b"HSET", key.as_bytes(), b"vec", &v, b"t", b"red"];
                     cmd_bytes(&mut w, &hset);
                 }
-                if i % 3 == 0 {
+                if i.is_multiple_of(3) {
                     w.cmd(&["DEL", &format!("w:new{}", i / 2)]);
                 }
                 i += 1;
