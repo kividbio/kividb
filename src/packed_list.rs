@@ -1576,6 +1576,8 @@ impl PackedList {
             while c > from {
                 c -= 1;
                 if m.chunks[c].count() == 0 {
+                    #[cfg(test)]
+                    work::deque_remove(m.chunks.len(), c);
                     m.chunks.remove(c);
                     m.removed(c);
                     to = to.saturating_sub(1);
@@ -1585,6 +1587,8 @@ impl PackedList {
             let mut end = (to + 1).min(m.chunks.len().saturating_sub(1));
             while c < end && c + 1 < m.chunks.len() {
                 if m.chunks[c].count() + m.chunks[c + 1].count() <= CHUNK_ENTRIES {
+                    #[cfg(test)]
+                    work::deque_remove(m.chunks.len(), c + 1);
                     let next = m.chunks.remove(c + 1).unwrap_or_default();
                     m.chunks[c].append(&next);
                     m.removed(c + 1);
@@ -1618,6 +1622,8 @@ impl PackedList {
         let first = from.saturating_sub(1);
         let last = (to + 1).min(n - 1);
         let mut write = first;
+        #[cfg(test)]
+        work::visits(last + 1 - first);
         for read in first..=last {
             let chunk = std::mem::take(&mut m.chunks[read]);
             if chunk.count() == 0 {
@@ -1632,6 +1638,8 @@ impl PackedList {
         }
         let gone = last + 1 - write;
         if gone > 0 {
+            #[cfg(test)]
+            work::visits(n - 1 - last);
             m.chunks.drain(write..=last);
         }
         for chunk in m.chunks.range_mut(first..write) {
@@ -2077,6 +2085,37 @@ impl std::fmt::Debug for PackedList {
         f.debug_list()
             .entries(self.iter().map(String::from_utf8_lossy))
             .finish()
+    }
+}
+
+/// What the chunk repair of `remove_matching` did, counted for the tests
+/// (nothing of it is built outside them): chunk slots visited or moved. A
+/// count, where a timing would depend on the machine and the build.
+#[cfg(test)]
+mod work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SLOTS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn reset() {
+        SLOTS.with(|s| s.set(0));
+    }
+
+    pub fn slots() -> usize {
+        SLOTS.with(Cell::get)
+    }
+
+    /// `n` chunk slots visited or moved.
+    pub fn visits(n: usize) {
+        SLOTS.with(|s| s.set(s.get() + n));
+    }
+
+    /// A `VecDeque::remove` at `at` of `len` slots: it moves the slots on
+    /// the shorter side of `at`.
+    pub fn deque_remove(len: usize, at: usize) {
+        visits(at.min(len.saturating_sub(at + 1)));
     }
 }
 
@@ -2756,34 +2795,29 @@ mod tests {
 
     #[test]
     fn a_dense_lrem_is_one_pass_over_the_list() {
-        // Every other element of 20,000,000 taken out: every chunk falls to
-        // half, and neighbours merge. Timed against one pass reading the
-        // whole list, in the same build: removing emptied and merged chunks
-        // from the deque one at a time was quadratic in the chunks.
-        let n = 20_000_000;
+        // Every other element of a list of 20,000 chunks taken out: every
+        // chunk falls to half, and neighbours merge. Counted, not timed: the
+        // chunk slots the repair visits or moves (see `work`). One pass over
+        // the chunks is a count about the chunks' own; removing emptied and
+        // merged chunks from the deque one at a time moved slots in
+        // proportion to the chunks squared (some 25 million here).
+        let chunks = 20_000;
+        let n = chunks * CHUNK_ENTRIES;
         let mut builder = Builder::new();
         for i in 0..n {
             builder.push(if i % 2 == 0 { b"x" } else { b"y" });
         }
         let mut list = builder.finish();
-        let start = std::time::Instant::now();
-        let mut seen = 0usize;
-        list.for_each_in(0, list.len(), |e| {
-            seen += e.len();
-            true
-        });
-        let pass = start.elapsed();
-        assert_eq!(seen, n);
-        let start = std::time::Instant::now();
+        assert_eq!(list.chunk_count(), chunks);
+        work::reset();
         assert_eq!(list.remove_matching(b"x", 0), n / 2);
-        let lrem = start.elapsed();
-        eprintln!("dense LREM {lrem:?}, one pass {pass:?}");
+        let slots = work::slots();
         assert_eq!(list.len(), n / 2);
         assert_eq!(list.chunk_count(), n / 2 / CHUNK_ENTRIES);
         list.check_shape();
         assert!(
-            lrem < pass * 5 / 2,
-            "LREM {lrem:?} against a pass of {pass:?}"
+            slots > 0 && slots <= 2 * chunks,
+            "the repair visited or moved {slots} chunk slots for {chunks} chunks"
         );
     }
 }
