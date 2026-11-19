@@ -1020,6 +1020,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   writes before it waits; if that write fails, the client is closed at
   once, and what it pipelined after the blocking command is not run.
 
+- **A subscriber with messages unread that sends a pipeline no longer
+  hangs its connection under io_uring (#938).** A subscriber's messages
+  (and tracking's invalidations) are written by a task of their own, which
+  holds the connection's write lock while it waits for the client to make
+  room. The connection, with replies of its own to write, waited for that
+  lock without reading, so a client that sends a pipeline before it reads
+  anything (a subscriber with 6 MB of messages unread sending 1,000,000
+  `PING`s) and the server each waited for the other for good, as in #865.
+  The loop now reads the client while it waits for the lock too, under
+  the same `client-query-buffer-limit` and hard output limit; the flush
+  before a blocking command does the same. The tokio loop already read on
+  while it waited. With this, the io_uring loop sends a batch of replies
+  first without waiting in the kernel; only when the socket is full does it
+  write the rest while it reads the client, as since #865, so the next
+  request of a client that sends one command at a time is read on the next
+  turn, already there, rather than parked in the kernel beforehand.
+
 - **What a waiting client has read ahead and its unparsed buffer are held
   to `client-query-buffer-limit` together (#869).** What a client sent
   while it waited — in a blocking command, held by a pause, in `WAIT`,
