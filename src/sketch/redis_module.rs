@@ -191,6 +191,48 @@ fn no_memory() -> io::Error {
 /// The encoding of an LZF-compressed string, after the length's marker.
 const RDB_ENC_LZF: u64 = 3;
 
+/// The most bytes LZF makes of each one it reads: 264 from a back reference
+/// of 3, at most.
+const LZF_MOST_PER_BYTE: u64 = 88;
+
+/// An RDB string of at most `max_len` bytes, plain or LZF-compressed: one
+/// longer than its declared shape is refused by the length it declares
+/// (and a compressed one by what its compressed bytes can make), before
+/// anything of that length is reserved; only the bytes the stream holds are
+/// read.
+fn rdb_read_string_at_most(r: &mut impl Read, max_len: u64) -> io::Result<Vec<u8>> {
+    let longer = || super::invalid("a string longer than its declared shape");
+    let (n, encoded) = rdb_length(r)?;
+    if !encoded {
+        if n > max_len {
+            return Err(longer());
+        }
+        return super::read_vec(r, usize::try_from(n).map_err(|_| longer())?);
+    }
+    if n != RDB_ENC_LZF {
+        return Err(super::invalid("a string of an unexpected encoding"));
+    }
+    let (compressed, _) = rdb_length(r)?;
+    let (original, _) = rdb_length(r)?;
+    if original > max_len {
+        return Err(longer());
+    }
+    // Redis compresses a string only if that makes it shorter.
+    if compressed == 0
+        || compressed >= original
+        || original > compressed.saturating_mul(LZF_MOST_PER_BYTE)
+    {
+        return Err(super::invalid("a compressed string of a bad length"));
+    }
+    let data = super::read_vec(r, compressed as usize)?;
+    match lzf::decompress(&data, original as usize) {
+        Ok(out) if out.len() as u64 == original => Ok(out),
+        _ => Err(super::invalid(
+            "a compressed string that does not decompress",
+        )),
+    }
+}
+
 /// An RDB length, and whether it is a special encoding's number instead.
 fn rdb_length(r: &mut impl Read) -> io::Result<(u64, bool)> {
     let mut b = [0u8; 1];
@@ -258,35 +300,15 @@ impl<R: Read> Reader<'_, R> {
     }
 
     /// A string that must be `len` bytes, plain or LZF-compressed as Redis
-    /// writes one (`mismatch` if it is another length): its length, or a
-    /// compressed one's original length, is checked before anything is
-    /// allocated, and only the bytes the payload holds are read.
+    /// writes one (`mismatch` if it is another length): no longer than
+    /// that is read or reserved ([`rdb_read_string_at_most`]).
     fn string_of(&mut self, len: u64, mismatch: &str) -> io::Result<Vec<u8>> {
         self.opcode(OPCODE_STRING)?;
-        let want = usize::try_from(len).map_err(|_| self.bad(mismatch))?;
-        let (n, encoded) = rdb_length(self.r)?;
-        if !encoded {
-            if n != len {
-                return Err(self.bad(mismatch));
-            }
-            return super::read_vec(self.r, want);
-        }
-        if n != RDB_ENC_LZF {
-            return Err(self.bad("a string of an unexpected encoding"));
-        }
-        let (compressed, _) = rdb_length(self.r)?;
-        let (original, _) = rdb_length(self.r)?;
-        if original != len {
-            return Err(self.bad(mismatch));
-        }
-        // Redis compresses a string only if that makes it shorter.
-        if compressed == 0 || compressed >= len {
-            return Err(self.bad("a compressed string of a bad length"));
-        }
-        let compressed = super::read_vec(self.r, compressed as usize)?;
-        match lzf::decompress(&compressed, want) {
-            Ok(out) if out.len() == want => Ok(out),
-            _ => Err(self.bad("a compressed string that does not decompress")),
+        match rdb_read_string_at_most(self.r, len) {
+            Ok(s) if s.len() as u64 == len => Ok(s),
+            Ok(_) => Err(self.bad(mismatch)),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => Err(self.bad(mismatch)),
+            Err(e) => Err(e),
         }
     }
 
