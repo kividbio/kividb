@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/tdigest.rs
 //
 // t-digests (`TDIGEST.*`), against what Redis 8.10.2 does:
