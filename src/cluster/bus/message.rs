@@ -44,13 +44,18 @@
 //
 // A node's hostname (`cluster-announce-hostname`) travels in its flags
 // string, as a `host=<name>` token: nodes that do not know it ignore an
-// unknown token, where a new field would have them drop the message. A
+// unknown token, where a new field would have them drop the message. The
+// sender's own `cluster-announce-client-ipv4` / `-ipv6` travel the same way
+// in its PING and PONG, as `cip4=<address>` and `cip6=<address>` (#847), and
+// never in gossip, as in Valkey: only a node's own word is taken. An IPv6
+// address has colons but no commas, and the flags string is split on commas
+// only. A
 // hostname has no commas (see `valid_hostname`). Decoders take at least the
 // fields they know and skip any after them, so that a later version can add
 // some.
 // Up to 3 entries per heartbeat; receiver merges them into its routing table.
 
-use crate::cluster::node::{NodeFlags, NodeId, parse_node_id};
+use crate::cluster::node::{ClientIps, NodeFlags, NodeId, parse_node_id};
 use crate::resp::write::{resp_array, resp_bulk, resp_bulk_str};
 
 /// One node's entry inside a gossip payload.
@@ -101,6 +106,9 @@ pub enum BusMessage {
         sender_hostname: String,
         /// Its `cluster-announce-client-port`; 0 when it announces none.
         sender_announced_client_port: u16,
+        /// Its `cluster-announce-client-ipv4` / `-ipv6`; empty when it
+        /// announces none, or is of an earlier version (#847).
+        sender_client_ips: ClientIps,
         /// Its shard id (`CLUSTER MYSHARDID`), as a `shard=` token of its
         /// flags string; `None` from a node of an earlier version (#563).
         sender_shard_id: Option<NodeId>,
@@ -119,6 +127,9 @@ pub enum BusMessage {
         sender_hostname: String,
         /// Its `cluster-announce-client-port`; 0 when it announces none.
         sender_announced_client_port: u16,
+        /// Its `cluster-announce-client-ipv4` / `-ipv6`; empty when it
+        /// announces none, or is of an earlier version (#847).
+        sender_client_ips: ClientIps,
         /// Its shard id (`CLUSTER MYSHARDID`), as a `shard=` token of its
         /// flags string; `None` from a node of an earlier version (#563).
         sender_shard_id: Option<NodeId>,
@@ -238,6 +249,7 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_client_ips,
             sender_shard_id,
             gossip,
             slot_claims,
@@ -255,6 +267,7 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
                     *sender_flags,
                     sender_hostname,
                     *sender_announced_client_port,
+                    sender_client_ips,
                 ),
                 sender_shard_id.as_ref(),
             )),
@@ -275,6 +288,7 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_client_ips,
             sender_shard_id,
             gossip,
             slot_claims,
@@ -292,6 +306,7 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
                     *sender_flags,
                     sender_hostname,
                     *sender_announced_client_port,
+                    sender_client_ips,
                 ),
                 sender_shard_id.as_ref(),
             )),
@@ -418,6 +433,7 @@ fn encode_gossip(gossip: &[GossipEntry]) -> Vec<u8> {
                     g.flags,
                     &g.hostname,
                     g.announced_client_port,
+                    &ClientIps::default(),
                 )),
                 match g.master_id {
                     Some(m) => resp_bulk(&m),
@@ -446,9 +462,14 @@ fn format_flags(f: NodeFlags) -> String {
     parts.join(",")
 }
 
-/// The flags string with the node's hostname and announced client port in
-/// it, where it has them.
-fn flags_with_host(flags: NodeFlags, hostname: &str, client_port: u16) -> String {
+/// The flags string with the node's hostname, announced client port and
+/// client addresses in it, where it has them.
+fn flags_with_host(
+    flags: NodeFlags,
+    hostname: &str,
+    client_port: u16,
+    client_ips: &ClientIps,
+) -> String {
     let mut s = format_flags(flags);
     if !hostname.is_empty() {
         if !s.is_empty() {
@@ -464,7 +485,34 @@ fn flags_with_host(flags: NodeFlags, hostname: &str, client_port: u16) -> String
         s.push_str("cport=");
         s.push_str(&client_port.to_string());
     }
+    for (token, ip) in [("cip4=", &client_ips.v4), ("cip6=", &client_ips.v6)] {
+        if !ip.is_empty() {
+            if !s.is_empty() {
+                s.push(',');
+            }
+            s.push_str(token);
+            s.push_str(ip);
+        }
+    }
     s
+}
+
+/// The client addresses in a flags string, each only if it is an address
+/// of its family (as Valkey loads them from its ping extensions); empty
+/// where there is none.
+fn client_ips_of(flags: &str) -> ClientIps {
+    let find = |token: &str, ipv6: bool| {
+        flags
+            .split(',')
+            .find_map(|tok| tok.strip_prefix(token))
+            .filter(|ip| !ip.is_empty() && crate::config::client_ip_error(ip, ipv6).is_none())
+            .unwrap_or("")
+            .to_string()
+    };
+    ClientIps {
+        v4: find("cip4=", false),
+        v6: find("cip6=", true),
+    }
 }
 
 /// `flags` with a `shard=<id>` token for the sender's shard id. A node of an
@@ -569,6 +617,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
             let sender_flags = parse_flags(flags_str);
             let sender_hostname = host_of(flags_str);
             let sender_announced_client_port = cport_of(flags_str);
+            let sender_client_ips = client_ips_of(flags_str);
             let sender_shard_id = shard_of(flags_str);
             let sender_master_id = if parts[4].is_empty() {
                 None
@@ -588,6 +637,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_client_ips,
                     sender_shard_id,
                     gossip,
                     slot_claims,
@@ -603,6 +653,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_client_ips,
                     sender_shard_id,
                     gossip,
                     slot_claims,
@@ -1023,6 +1074,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id: None,
         };
         let bytes = encode(&msg);
@@ -1060,6 +1112,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id: None,
         };
         let bytes = encode(&msg);
@@ -1091,6 +1144,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: "a.example".into(),
             sender_announced_client_port: 30001,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id: None,
             gossip: vec![GossipEntry {
                 id: other,
@@ -1132,6 +1186,80 @@ mod tests {
         assert_eq!(cport_of("master,cport=nonsense"), 0);
     }
 
+    /// A node's client addresses go in its own flags string too (#847), as
+    /// `cip4=<address>` and `cip6=<address>`, and not in its gossip of other
+    /// nodes. An IPv6 address keeps its colons (the string is split on
+    /// commas). One that is not an address of its family is dropped, as
+    /// Valkey drops it. A node of an earlier version skips both tokens.
+    #[test]
+    fn client_addresses_travel_in_the_flags() {
+        let me = generate_node_id();
+        let other = generate_node_id();
+        let ips = |v4: &str, v6: &str| ClientIps {
+            v4: v4.into(),
+            v6: v6.into(),
+        };
+        let msg = BusMessage::Pong {
+            sender_id: me,
+            sender_ip: "10.0.0.1".into(),
+            sender_client_port: 6380,
+            sender_cluster_port: 16380,
+            sender_config_epoch: 3,
+            sender_flags: NodeFlags::MASTER,
+            sender_master_id: None,
+            sender_hostname: "a.example".into(),
+            sender_announced_client_port: 30001,
+            sender_client_ips: ips("203.0.113.7", "2001:db8::7"),
+            sender_shard_id: Some(me),
+            gossip: vec![GossipEntry {
+                id: other,
+                ip: "10.0.0.2".into(),
+                client_port: 6380,
+                cluster_port: 16380,
+                config_epoch: 2,
+                flags: NodeFlags::REPLICA,
+                master_id: Some(me),
+                hostname: String::new(),
+                announced_client_port: 0,
+            }],
+            slot_claims: vec![],
+        };
+        let (decoded, _) = decode(&encode(&msg)).unwrap().unwrap();
+        match decoded {
+            BusMessage::Pong {
+                sender_hostname,
+                sender_announced_client_port,
+                sender_client_ips,
+                sender_shard_id,
+                sender_flags,
+                gossip,
+                ..
+            } => {
+                assert_eq!(sender_client_ips, ips("203.0.113.7", "2001:db8::7"));
+                assert_eq!(sender_hostname, "a.example");
+                assert_eq!(sender_announced_client_port, 30001);
+                assert_eq!(sender_shard_id, Some(me));
+                assert_eq!(sender_flags, NodeFlags::MASTER);
+                assert_eq!(gossip[0].flags, NodeFlags::REPLICA);
+            }
+            other => panic!("expected Pong, got {:?}", other),
+        }
+        let flags = "master,host=a.example,cip4=203.0.113.7,cip6=2001:db8::7";
+        // What an older node's parser makes of it: the flags, and its hostname.
+        assert_eq!(parse_flags(flags), NodeFlags::MASTER);
+        assert_eq!(host_of(flags), "a.example");
+        // Of the wrong family, or no address: dropped.
+        assert_eq!(
+            client_ips_of("master,cip4=2001:db8::7,cip6=10.0.0.1"),
+            ClientIps::default()
+        );
+        assert_eq!(
+            client_ips_of("master,cip4=a.example,cip6="),
+            ClientIps::default()
+        );
+        assert_eq!(client_ips_of("master"), ClientIps::default());
+    }
+
     /// The sender's shard id goes in its flags string, as `shard=<id>`
     /// (#563): a node of an earlier version skips the token, and one sent
     /// by such a node has none.
@@ -1149,6 +1277,7 @@ mod tests {
             sender_master_id: Some(generate_node_id()),
             sender_hostname: "a.example".into(),
             sender_announced_client_port: 30001,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id,
             gossip: vec![],
             slot_claims: vec![],
@@ -1208,6 +1337,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: "shard-1a.db.example".into(),
             sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id: None,
         };
         let bytes = encode(&msg);
@@ -1322,6 +1452,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id: None,
         };
         let bytes = encode(&msg);
@@ -1372,6 +1503,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id: None,
         };
         let bytes = encode(&msg);

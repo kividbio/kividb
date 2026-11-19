@@ -674,6 +674,16 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 "0"
             }),
         );
+        // Vectors written and not linked into the graph yet (searches find
+        // them all the same): see `vector::backlog`.
+        put(
+            "hnsw_backlog",
+            resp_bulk_str(&first.backlog.len().to_string()),
+        );
+        put(
+            "hnsw_backlog_bytes",
+            resp_bulk_str(&first.backlog.bytes().to_string()),
+        );
         put(
             "hnsw_indexes",
             resp_array(
@@ -695,6 +705,8 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                             } else {
                                 "0"
                             }),
+                            resp_bulk_str("backlog"),
+                            resp_bulk_str(&graph.backlog.len().to_string()),
                         ])
                     })
                     .collect(),

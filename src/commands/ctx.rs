@@ -151,6 +151,10 @@ pub struct Ctx<'a> {
     /// Address of the connected client — used for MONITOR line formatting.
     /// Already available in handle_client as `peer_addr`.
     pub peer_addr: &'a str,
+    /// Whether the client is connected over IPv6 (`cluster::is_ipv6_peer`
+    /// of `peer_addr`, worked out once per connection): which client address
+    /// of a node it is told in a cluster (#847).
+    pub peer_ipv6: bool,
     /// Monitor registry — broadcast target when MONITOR_COUNT > 0.
     pub monitor_registry: &'a crate::monitor::SharedMonitorRegistry,
     /// The username of the currently authenticated user.
