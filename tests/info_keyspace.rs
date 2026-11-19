@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/info_keyspace.rs
 //
 // INFO keyspace's `avg_ttl`, and INFO keysizes over many keys. `avg_ttl` is

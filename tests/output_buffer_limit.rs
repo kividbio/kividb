@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/output_buffer_limit.rs
 //
 // `client-output-buffer-limit` (#774): `CONFIG SET` and `CONFIG GET` of it,

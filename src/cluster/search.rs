@@ -33,6 +33,7 @@
 
 use crate::cluster::ClusterState;
 use crate::cluster::node::NodeFlags;
+use crate::cpus::ScopeExt as _;
 use std::io::{BufRead, BufReader, Write};
 use std::net::ToSocketAddrs;
 use std::time::Duration;
@@ -543,7 +544,7 @@ pub fn fan_out(ctx: &crate::commands::ctx::Ctx, cmd: &[Vec<u8>]) -> Result<Vec<R
             .iter()
             .map(|(host, port)| {
                 let credentials = &credentials;
-                scope.spawn(move || {
+                scope.spawn_released(move || {
                     ask(pool, host, *port, credentials, db, cmd, definition)
                         .map_err(|e| format!("{host}:{port}: {e}"))
                 })
@@ -742,12 +743,12 @@ mod tests {
             let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let open = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
             let (count, streams) = (accepted.clone(), open.clone());
-            std::thread::spawn(move || {
+            crate::cpus::spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(stream) = stream else { return };
                     let n = count.fetch_add(1, Ordering::SeqCst) + 1;
                     streams.lock().push(stream.try_clone().unwrap());
-                    std::thread::spawn(move || {
+                    crate::cpus::spawn(move || {
                         let mut writer = stream.try_clone().unwrap();
                         let mut reader = BufReader::new(stream);
                         while let Ok(Reply::Array(cmd)) = read_reply(&mut reader) {

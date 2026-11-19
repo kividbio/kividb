@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
+use crate::cpus::available_parallelism;
 use ahash::AHashMap;
 use ahash::AHashSet;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::thread::available_parallelism;
 
 mod access;
 mod entry;

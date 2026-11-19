@@ -161,7 +161,7 @@ mod tests {
                 let applied = Arc::clone(&applied);
                 let propagated = Arc::clone(&propagated);
                 let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
                         let _gate = enter();
                         applied.fetch_add(1, Ordering::SeqCst);
@@ -217,7 +217,7 @@ mod tests {
         let release = Arc::new(AtomicBool::new(false));
         let writer = {
             let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
-            std::thread::spawn(move || {
+            crate::cpus::spawn(move || {
                 let _gate = enter();
                 entered.store(true, Ordering::SeqCst);
                 while !release.load(Ordering::SeqCst) {
@@ -238,7 +238,7 @@ mod tests {
         let started = std::time::Instant::now();
         let releaser = {
             let release = Arc::clone(&release);
-            std::thread::spawn(move || {
+            crate::cpus::spawn(move || {
                 std::thread::sleep(Duration::from_millis(50));
                 release.store(true, Ordering::SeqCst);
             })
@@ -258,7 +258,7 @@ mod tests {
         let _a = enter();
         let done = Arc::new(AtomicBool::new(false));
         let done2 = Arc::clone(&done);
-        let t = std::thread::spawn(move || {
+        let t = crate::cpus::spawn(move || {
             let _b = enter();
             done2.store(true, Ordering::SeqCst);
         });

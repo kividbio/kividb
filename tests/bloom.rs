@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/bloom.rs
 //
 // Bloom filters (`BF.*`), against what Redis 8.10 does:

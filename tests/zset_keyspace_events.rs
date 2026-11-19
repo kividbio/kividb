@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Keyspace events of ZREMRANGEBYSCORE. The flags are the process's, so this
 // file has one test: nothing else changes them.
 

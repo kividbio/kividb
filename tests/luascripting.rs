@@ -1,7 +1,7 @@
+#![allow(clippy::disallowed_methods)]
 // tests/lua_scripting.rs
 // Requires --features lua. Skipped entirely when built without it.
 // Run with: cargo test --features lua --test lua_scripting
-
 #![cfg(feature = "lua")]
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -2898,3 +2898,604 @@ fn the_lua_51_library_functions_are_in_every_script_entry_point() {
     assert_eq!(c.cmds(&["FCALL_RO", "ro51", "0", "10"]), int(1));
     c.cmds(&["FUNCTION", "FLUSH"]);
 }
+
+// ── Script replies, byte for byte (#901) ─────────────────────────────────────
+
+/// One whole reply from `reader`, as the bytes it came in.
+fn read_raw_reply(reader: &mut BufReader<TcpStream>) -> Vec<u8> {
+    let mut out = Vec::new();
+    // Values still to read at each level opened.
+    let mut pending = vec![1usize];
+    while let Some(left) = pending.last_mut() {
+        if *left == 0 {
+            pending.pop();
+            continue;
+        }
+        *left -= 1;
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line).unwrap();
+        assert!(!line.is_empty(), "connection closed");
+        let count = || -> i64 {
+            std::str::from_utf8(&line[1..line.len() - 2])
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        match line[0] {
+            b'$' | b'=' | b'!' if count() >= 0 => {
+                let mut data = vec![0u8; count() as usize + 2];
+                reader.read_exact(&mut data).unwrap();
+                out.extend_from_slice(&line);
+                out.extend_from_slice(&data);
+                continue;
+            }
+            b'*' | b'~' | b'>' if count() > 0 => pending.push(count() as usize),
+            b'%' if count() > 0 => pending.push(2 * count() as usize),
+            b'|' => pending.push(2 * count() as usize + 1),
+            _ => {}
+        }
+        out.extend_from_slice(&line);
+    }
+    out
+}
+
+fn raw_cmd(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, args: &[&str]) -> Vec<u8> {
+    let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+    for arg in args {
+        buf.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        buf.extend_from_slice(arg.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    stream.write_all(&buf).unwrap();
+    read_raw_reply(reader)
+}
+
+/// What a script returns, as the bytes a RESP2 and a RESP3 client get:
+/// replies of every shape, `redis.call` and `redis.pcall` results, errors
+/// raised and returned, `redis.setresp(3)`, globals. The table was made by
+/// a server of the tree before #901 (scripts from a fixed seed of the
+/// differential fuzz of #901), so the way replies are written now cannot
+/// drift from it unnoticed.
+#[test]
+fn test_script_replies_are_the_bytes_they_were() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut setup = Conn::connect(port);
+    let open = |resp3: bool| {
+        let mut c = Conn::connect(port);
+        if resp3 {
+            raw_cmd(&mut c.stream, &mut c.reader, &["HELLO", "3"]);
+        }
+        c
+    };
+    let (mut c2, mut c3) = (open(false), open(true));
+    for (script, resp2, resp3) in SCRIPT_REPLIES {
+        for (c, want) in [(&mut c2, resp2), (&mut c3, resp3)] {
+            setup.cmds(&["FLUSHALL"]);
+            setup.cmds(&["SET", "fz:str", "abc"]);
+            setup.cmds(&["RPUSH", "fz:l", "a", "b", ""]);
+            setup.cmds(&["HSET", "fz:h", "a", "1"]);
+            setup.cmds(&["SADD", "fz:s1", "m"]);
+            setup.cmds(&["ZADD", "fz:z", "1.5", "a"]);
+            setup.cmds(&["SET", "fz:n", "0"]);
+            let got = raw_cmd(
+                &mut c.stream,
+                &mut c.reader,
+                &["EVAL", script, "1", "fz:k", "argv1", "argv2"],
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                String::from_utf8_lossy(want),
+                "{script}"
+            );
+            assert_eq!(&got[..], &want[..], "{script}");
+        }
+    }
+}
+
+/// See [`test_script_replies_are_the_bytes_they_were`]: (script, RESP2
+/// reply, RESP3 reply).
+#[rustfmt::skip]
+const SCRIPT_REPLIES: &[(&str, &[u8], &[u8])] = &[
+    (
+        r#"redis.setresp(3) return {nil, 2}"#,
+        b"*0\r\n",
+        b"*0\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return {}"#,
+        b"*0\r\n",
+        b"*0\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return "\255\254""#,
+        b"$2\r\n\xff\xfe\r\n",
+        b"$2\r\n\xff\xfe\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return {{}, {set='x'}, {set={b=true}}}"#,
+        b"*3\r\n*0\r\n*0\r\n*1\r\n$1\r\nb\r\n",
+        b"*3\r\n*0\r\n*0\r\n~1\r\n$1\r\nb\r\n",
+    ),
+    (
+        r#"return {}"#,
+        b"*0\r\n",
+        b"*0\r\n",
+    ),
+    (
+        r#"return redis.call('get')"#,
+        b"-ERR wrong number of args for 'get' command\r\n",
+        b"-ERR wrong number of args for 'get' command\r\n",
+    ),
+    (
+        r#"return {{{nil, 2}, {42, {big_number='1234567890123456789'}}, redis.call('zscore', 'fz:z', 'a')}, {ARGV[1], {}, {[1]={[1]={[1]=-1e20}}}}, redis.call('time')[1] and 1, {double='x'}}"#,
+        b"*4\r\n*3\r\n*0\r\n*2\r\n:42\r\n$19\r\n1234567890123456789\r\n$3\r\n1.5\r\n*3\r\n$5\r\nargv1\r\n*0\r\n*1\r\n*1\r\n*1\r\n:-9223372036854775808\r\n:1\r\n*0\r\n",
+        b"*4\r\n*3\r\n*0\r\n*2\r\n:42\r\n(1234567890123456789\r\n$3\r\n1.5\r\n*3\r\n$5\r\nargv1\r\n*0\r\n*1\r\n*1\r\n*1\r\n:-9223372036854775808\r\n:1\r\n*0\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return redis.call('time')[1] and 1"#,
+        b":1\r\n",
+        b":1\r\n",
+    ),
+    (
+        r#"local t = {} local c = t for i = 1, 20 do c[1] = {i} c = c[1] end return t"#,
+        b"*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n:20\r\n",
+        b"*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n:20\r\n",
+    ),
+    (
+        r#"return {ok='a\nb\rc'}"#,
+        b"+a b c\r\n",
+        b"+a b c\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return nil"#,
+        b"$-1\r\n",
+        b"_\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return {true, {big_number='1234567890123456789'}}"#,
+        b"*2\r\n:1\r\n$19\r\n1234567890123456789\r\n",
+        b"*2\r\n#t\r\n(1234567890123456789\r\n",
+    ),
+    (
+        r#"return {ok=1}"#,
+        b"*0\r\n",
+        b"*0\r\n",
+    ),
+    (
+        r#"return {nil, 2}"#,
+        b"*0\r\n",
+        b"*0\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return -1e20"#,
+        b":-9223372036854775808\r\n",
+        b":-9223372036854775808\r\n",
+    ),
+    (
+        r#"return string.format('%d', 3)"#,
+        b"$1\r\n3\r\n",
+        b"$1\r\n3\r\n",
+    ),
+    (
+        r#"return {map={a={big_number='1234567890123456789'}}}"#,
+        b"*2\r\n$1\r\na\r\n$19\r\n1234567890123456789\r\n",
+        b"%1\r\n$1\r\na\r\n(1234567890123456789\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return {true, "123", {1, nil, 3}}"#,
+        b"*3\r\n:1\r\n$3\r\n123\r\n*1\r\n:1\r\n",
+        b"*3\r\n#t\r\n$3\r\n123\r\n*1\r\n:1\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return {3.7, {{verbatim_string={format='txt', string='hi'}}, {tonumber('10'), redis.call('time')[1] and 1}, 7//2, {x=1, true}, redis.call('zrange', 'fz:z', 0, -1, 'withscores')}, {{{2^53, "", true, true}, {redis.call('mget', KEYS[1], 'fz:none', 'fz:str'), redis.call('hmget', 'fz:h', 'a', 'zz'), "123"}, {err='WRONG thing'}, redis.status_reply('FINE')}, {ok='a\nb\rc'}}}"#,
+        b"*3\r\n:3\r\n*5\r\n$2\r\nhi\r\n*2\r\n:10\r\n:1\r\n:3\r\n*1\r\n:1\r\n*2\r\n$1\r\na\r\n$3\r\n1.5\r\n*2\r\n*4\r\n*4\r\n:9007199254740992\r\n$0\r\n\r\n:1\r\n:1\r\n*3\r\n*3\r\n$-1\r\n$-1\r\n$3\r\nabc\r\n*2\r\n$1\r\n1\r\n$-1\r\n$3\r\n123\r\n-WRONG thing\r\n+FINE\r\n+a b c\r\n",
+        b"*3\r\n:3\r\n*5\r\n=6\r\ntxt:hi\r\n*2\r\n:10\r\n:1\r\n:3\r\n*1\r\n:1\r\n*2\r\n$1\r\na\r\n$3\r\n1.5\r\n*2\r\n*4\r\n*4\r\n:9007199254740992\r\n$0\r\n\r\n:1\r\n:1\r\n*3\r\n*3\r\n_\r\n_\r\n$3\r\nabc\r\n*2\r\n$1\r\n1\r\n_\r\n$3\r\n123\r\n-WRONG thing\r\n+FINE\r\n+a b c\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return redis.call('zscore', 'fz:z', 'a')"#,
+        b"$3\r\n1.5\r\n",
+        b",1.5\r\n",
+    ),
+    (
+        r#"return math.mininteger"#,
+        b":-9223372036854775808\r\n",
+        b":-9223372036854775808\r\n",
+    ),
+    (
+        r#"return KEYS"#,
+        b"*1\r\n$4\r\nfz:k\r\n",
+        b"*1\r\n$4\r\nfz:k\r\n",
+    ),
+    (
+        r#"return {{{{nil, #ARGV, 0/0, redis.call('ping'), "OK"}, {false, "\255\254"}}}}"#,
+        b"*1\r\n*1\r\n*2\r\n*0\r\n*2\r\n$-1\r\n$2\r\n\xff\xfe\r\n",
+        b"*1\r\n*1\r\n*2\r\n*0\r\n*2\r\n_\r\n$2\r\n\xff\xfe\r\n",
+    ),
+    (
+        r#"return {{map={a=0/0}}, #ARGV}"#,
+        b"*2\r\n*2\r\n$1\r\na\r\n:-9223372036854775808\r\n:2\r\n",
+        b"*2\r\n%1\r\n$1\r\na\r\n:-9223372036854775808\r\n:2\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return {{{map={a={map=1}}}, KEYS[1]}, {err=2}, {{set='x'}, {double=math.mininteger}, "123", false}}"#,
+        b"*3\r\n*2\r\n*2\r\n$1\r\na\r\n*0\r\n$4\r\nfz:k\r\n*0\r\n*4\r\n*0\r\n$20\r\n-9223372036854776000\r\n$3\r\n123\r\n:0\r\n",
+        b"*3\r\n*2\r\n%1\r\n$1\r\na\r\n*0\r\n$4\r\nfz:k\r\n*0\r\n*4\r\n*0\r\n,-9223372036854776000\r\n$3\r\n123\r\n#f\r\n",
+    ),
+    (
+        r#"return 7//2"#,
+        b":3\r\n",
+        b":3\r\n",
+    ),
+    (
+        r#"return "a""#,
+        b"$1\r\na\r\n",
+        b"$1\r\na\r\n",
+    ),
+    (
+        r#"return false"#,
+        b"$-1\r\n",
+        b"_\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return redis.call('get', KEYS[1])"#,
+        b"$-1\r\n",
+        b"_\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return {[1]={[1]={[1]={}}}}"#,
+        b"*1\r\n*1\r\n*1\r\n*0\r\n",
+        b"*1\r\n*1\r\n*1\r\n*0\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return "OK""#,
+        b"$2\r\nOK\r\n",
+        b"$2\r\nOK\r\n",
+    ),
+    (
+        r#"return {double='x'}"#,
+        b"*0\r\n",
+        b"*0\r\n",
+    ),
+    (
+        r#"error({err='TABLEERR x'})"#,
+        b"-TABLEERR x script: cf9d383af29399ff37b748146b58325e9f724df1, on @user_script:1.\r\n",
+        b"-TABLEERR x script: cf9d383af29399ff37b748146b58325e9f724df1, on @user_script:1.\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return {{{{}}}, "", {map=1}, ARGV[1], {{{[2]=1}, KEYS[1], {nil, redis.call('ping'), redis.pcall('nosuchcommand'), 0.5, nil}, {"x\0y", 0, redis.call('get', KEYS[1]), nil}, {ARGV[1], ""}}}}"#,
+        b"*5\r\n*1\r\n*1\r\n*0\r\n$0\r\n\r\n*0\r\n$5\r\nargv1\r\n*1\r\n*5\r\n*0\r\n$4\r\nfz:k\r\n*0\r\n*3\r\n$3\r\nx\x00y\r\n:0\r\n$-1\r\n*2\r\n$5\r\nargv1\r\n$0\r\n\r\n",
+        b"*5\r\n*1\r\n*1\r\n*0\r\n$0\r\n\r\n*0\r\n$5\r\nargv1\r\n*1\r\n*5\r\n*0\r\n$4\r\nfz:k\r\n*0\r\n*3\r\n$3\r\nx\x00y\r\n:0\r\n_\r\n*2\r\n$5\r\nargv1\r\n$0\r\n\r\n",
+    ),
+    (
+        r#"return pcall(function() return redis.call('incr', 'fz:str') end)"#,
+        b"$-1\r\n",
+        b"_\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return redis.call('incr', 'fz:n')"#,
+        b":1\r\n",
+        b":1\r\n",
+    ),
+    (
+        r#"return redis.call('zrange', 'fz:z', 0, -1, 'withscores')"#,
+        b"*2\r\n$1\r\na\r\n$3\r\n1.5\r\n",
+        b"*2\r\n$1\r\na\r\n$3\r\n1.5\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return {err=2}"#,
+        b"*0\r\n",
+        b"*0\r\n",
+    ),
+    (
+        r#"return {double=0/0}"#,
+        b"$3\r\nnan\r\n",
+        b",nan\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return {redis.call('hget', 'fz:h', 'a'), {{{x=1, false}}, {"hello world", {"OK", nil, true, "123", redis.error_reply('plain')}}}, true, redis.call('get', KEYS[1]), {{{map=1}}, {set={b=true}}, {nil, redis.error_reply('MYERR oops'), {1, nil, 3}}}}"#,
+        b"*5\r\n$1\r\n1\r\n*2\r\n*1\r\n*1\r\n$-1\r\n*2\r\n$11\r\nhello world\r\n*1\r\n$2\r\nOK\r\n:1\r\n$-1\r\n*3\r\n*1\r\n*0\r\n*1\r\n$1\r\nb\r\n*0\r\n",
+        b"*5\r\n$1\r\n1\r\n*2\r\n*1\r\n*1\r\n_\r\n*2\r\n$11\r\nhello world\r\n*1\r\n$2\r\nOK\r\n:1\r\n_\r\n*3\r\n*1\r\n*0\r\n~1\r\n$1\r\nb\r\n*0\r\n",
+    ),
+    (
+        r#"return """#,
+        b"$0\r\n\r\n",
+        b"$0\r\n\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return {{{{}, {nil, 2}, {big_number='1234567890123456789'}, 3.0}}, {{0.5, {big_number=5}}, {}}, {ok=1}, {map={a={verbatim_string={format='txt', string='hi'}}}}}"#,
+        b"*4\r\n*1\r\n*4\r\n*0\r\n*0\r\n$19\r\n1234567890123456789\r\n:3\r\n*2\r\n*2\r\n:0\r\n*0\r\n*0\r\n*0\r\n*2\r\n$1\r\na\r\n$2\r\nhi\r\n",
+        b"*4\r\n*1\r\n*4\r\n*0\r\n*0\r\n(1234567890123456789\r\n:3\r\n*2\r\n*2\r\n:0\r\n*0\r\n*0\r\n*0\r\n%1\r\n$1\r\na\r\n=6\r\ntxt:hi\r\n",
+    ),
+    (
+        r#"return {{x=1, "a"}, "hello world", "\255\254", redis.call('ping')}"#,
+        b"*4\r\n*1\r\n$1\r\na\r\n$11\r\nhello world\r\n$2\r\n\xff\xfe\r\n+PONG\r\n",
+        b"*4\r\n*1\r\n$1\r\na\r\n$11\r\nhello world\r\n$2\r\n\xff\xfe\r\n+PONG\r\n",
+    ),
+    (
+        r#"return -1/0"#,
+        b":-9223372036854775808\r\n",
+        b":-9223372036854775808\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return {{[2]=1}, {{{}, {big_number='1234567890123456789'}}}, nil, "ERR custom", {1, nil, 3}}"#,
+        b"*2\r\n*0\r\n*1\r\n*2\r\n*0\r\n$19\r\n1234567890123456789\r\n",
+        b"*2\r\n*0\r\n*1\r\n*2\r\n*0\r\n(1234567890123456789\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return {{{{verbatim_string={format=1, string='hi'}}, ok2='z'}, 7/2, {ok='a\nb\rc'}, {false}}, -2.5, {1, nil, 3}}"#,
+        b"-ERR verbatim_string.format must be a string\r\n",
+        b"-ERR verbatim_string.format must be a string\r\n",
+    ),
+    (
+        r#"return {map={a={1, nil, 3}}}"#,
+        b"*2\r\n$1\r\na\r\n*1\r\n:1\r\n",
+        b"%1\r\n$1\r\na\r\n*1\r\n:1\r\n",
+    ),
+    (
+        r#"return true"#,
+        b":1\r\n",
+        b":1\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return {{0.5}}"#,
+        b"*1\r\n*1\r\n:0\r\n",
+        b"*1\r\n*1\r\n:0\r\n",
+    ),
+    (
+        r#"x = 1 return 1"#,
+        b"-ERR user_script:1: Attempt to modify a readonly table script: a9510e78cfea4842ff709c1b51e9d001e7d13797, on @user_script:1.\r\n",
+        b"-ERR user_script:1: Attempt to modify a readonly table script: a9510e78cfea4842ff709c1b51e9d001e7d13797, on @user_script:1.\r\n",
+    ),
+    (
+        r#"return {redis.call('zscore', 'fz:z', 'a'), {}}"#,
+        b"*2\r\n$3\r\n1.5\r\n*0\r\n",
+        b"*2\r\n$3\r\n1.5\r\n*0\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return {{err=2}, math.mininteger}"#,
+        b"*2\r\n*0\r\n:-9223372036854775808\r\n",
+        b"*2\r\n*0\r\n:-9223372036854775808\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return {{set='x'}}"#,
+        b"*1\r\n*0\r\n",
+        b"*1\r\n*0\r\n",
+    ),
+    (
+        r#"return "line\r\nbreak""#,
+        b"$11\r\nline\r\nbreak\r\n",
+        b"$11\r\nline\r\nbreak\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return 1e20"#,
+        b":-9223372036854775808\r\n",
+        b":-9223372036854775808\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return {big_number='1234567890123456789'}"#,
+        b"$19\r\n1234567890123456789\r\n",
+        b"(1234567890123456789\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return {"", {set='x'}, {"123", ok2='z'}, {{set='x'}, false, {{big_number=5}, {[1]={[1]={[1]=redis.call('get', 'fz:none')}}}, {true}}, {{0.5, true, "123", nil}, {redis.error_reply('MYERR oops')}, {1/0}, redis.error_reply('plain')}, {}}, {redis.call('time')[1] and 1}}"#,
+        b"*5\r\n$0\r\n\r\n*0\r\n*1\r\n$3\r\n123\r\n*5\r\n*0\r\n$-1\r\n*3\r\n*0\r\n*1\r\n*1\r\n*1\r\n$-1\r\n*1\r\n:1\r\n*4\r\n*3\r\n:0\r\n:1\r\n$3\r\n123\r\n*1\r\n-MYERR oops\r\n*1\r\n:-9223372036854775808\r\n-ERR plain\r\n*0\r\n*1\r\n:1\r\n",
+        b"*5\r\n$0\r\n\r\n*0\r\n*1\r\n$3\r\n123\r\n*5\r\n*0\r\n_\r\n*3\r\n*0\r\n*1\r\n*1\r\n*1\r\n_\r\n*1\r\n:1\r\n*4\r\n*3\r\n:0\r\n:1\r\n$3\r\n123\r\n*1\r\n-MYERR oops\r\n*1\r\n:-9223372036854775808\r\n-ERR plain\r\n*0\r\n*1\r\n:1\r\n",
+    ),
+    (
+        r#"return nil"#,
+        b"$-1\r\n",
+        b"_\r\n",
+    ),
+    (
+        r#"return redis.pcall('incr', 'fz:str')"#,
+        b"-ERR value is not an integer or out of range\r\n",
+        b"-ERR value is not an integer or out of range\r\n",
+    ),
+    (
+        r#"return redis.call('hget', 'fz:h', 'a')"#,
+        b"$1\r\n1\r\n",
+        b"$1\r\n1\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return {{{redis.call('hget', 'fz:h', 'a'), {"ERR custom", #ARGV}, {double='x'}}, true, {{err="OK"}, {2^53, false, redis.call('hmget', 'fz:h', 'a', 'zz')}}}, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", {err=ARGV[1]}}"#,
+        b"*3\r\n*3\r\n*3\r\n$1\r\n1\r\n*2\r\n$10\r\nERR custom\r\n:2\r\n*0\r\n:1\r\n*2\r\n-OK\r\n*3\r\n:9007199254740992\r\n:0\r\n*1\r\n$1\r\n1\r\n$40\r\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\r\n-argv1\r\n",
+        b"*3\r\n*3\r\n*3\r\n$1\r\n1\r\n*2\r\n$10\r\nERR custom\r\n:2\r\n*0\r\n#t\r\n*2\r\n-OK\r\n*3\r\n:9007199254740992\r\n#f\r\n*1\r\n$1\r\n1\r\n$40\r\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\r\n-argv1\r\n",
+    ),
+    (
+        r#"return "ERR custom""#,
+        b"$10\r\nERR custom\r\n",
+        b"$10\r\nERR custom\r\n",
+    ),
+    (
+        r#"return 3.0"#,
+        b":3\r\n",
+        b":3\r\n",
+    ),
+    (
+        r#"return {big_number=5}"#,
+        b"*0\r\n",
+        b"*0\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return "123""#,
+        b"$3\r\n123\r\n",
+        b"$3\r\n123\r\n",
+    ),
+    (
+        r#"return {set='x'}"#,
+        b"*0\r\n",
+        b"*0\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return "123""#,
+        b"$3\r\n123\r\n",
+        b"$3\r\n123\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return {{{ok=ARGV[1]}}, nil, "OK", true, {}}"#,
+        b"*1\r\n*1\r\n+argv1\r\n",
+        b"*1\r\n*1\r\n+argv1\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return 2^53"#,
+        b":9007199254740992\r\n",
+        b":9007199254740992\r\n",
+    ),
+    (
+        r#"return {KEYS[1], ARGV[2], #KEYS, #ARGV}"#,
+        b"*4\r\n$4\r\nfz:k\r\n$5\r\nargv2\r\n:1\r\n:2\r\n",
+        b"*4\r\n$4\r\nfz:k\r\n$5\r\nargv2\r\n:1\r\n:2\r\n",
+    ),
+    (
+        r#"return type(getmetatable(_G).__index)"#,
+        b"$8\r\nfunction\r\n",
+        b"$8\r\nfunction\r\n",
+    ),
+    (
+        r#"return {map={a={ok='a\nb\rc'}}}"#,
+        b"*2\r\n$1\r\na\r\n+a b c\r\n",
+        b"%1\r\n$1\r\na\r\n+a b c\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return {map={a="a"}}"#,
+        b"*2\r\n$1\r\na\r\n$1\r\na\r\n",
+        b"%1\r\n$1\r\na\r\n$1\r\na\r\n",
+    ),
+    (
+        r#"return type(_G.redis)"#,
+        b"$5\r\ntable\r\n",
+        b"$5\r\ntable\r\n",
+    ),
+    (
+        r#"return undefined_global"#,
+        b"-ERR Script attempted to access nonexistent global variable 'undefined_global'\r\n",
+        b"-ERR Script attempted to access nonexistent global variable 'undefined_global'\r\n",
+    ),
+    (
+        r#"return cjson.encode({1,2})"#,
+        b"$5\r\n[1,2]\r\n",
+        b"$5\r\n[1,2]\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return redis.pcall('incr', 'fz:str')"#,
+        b"-ERR value is not an integer or out of range\r\n",
+        b"-ERR value is not an integer or out of range\r\n",
+    ),
+    (
+        r#"return {nil, {{}, {0/0, "line\r\nbreak", {redis.call('get', 'fz:none'), false, redis.call('zscore', 'fz:z', 'a')}}, {verbatim_string={format=1, string='hi'}}}, redis.call('type', 'fz:h')}"#,
+        b"*0\r\n",
+        b"*0\r\n",
+    ),
+    (
+        r#"return {{verbatim_string={format=1, string='hi'}}, "a"}"#,
+        b"-ERR verbatim_string.format must be a string\r\n",
+        b"-ERR verbatim_string.format must be a string\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return 1/0"#,
+        b":-9223372036854775808\r\n",
+        b":-9223372036854775808\r\n",
+    ),
+    (
+        r#"return redis.call('incr', 'fz:str')"#,
+        b"-ERR value is not an integer or out of range\r\n",
+        b"-ERR value is not an integer or out of range\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return {{big_number='1234567890123456789'}}"#,
+        b"*1\r\n$19\r\n1234567890123456789\r\n",
+        b"*1\r\n(1234567890123456789\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return {}"#,
+        b"*0\r\n",
+        b"*0\r\n",
+    ),
+    (
+        r#"return {err='WRONG thing'}"#,
+        b"-WRONG thing\r\n",
+        b"-WRONG thing\r\n",
+    ),
+    (
+        r#"return {x=1, {1, nil, 3}}"#,
+        b"*1\r\n*1\r\n:1\r\n",
+        b"*1\r\n*1\r\n:1\r\n",
+    ),
+    (
+        r#"return redis.call('mget', KEYS[1], 'fz:none', 'fz:str')"#,
+        b"*3\r\n$-1\r\n$-1\r\n$3\r\nabc\r\n",
+        b"*3\r\n_\r\n_\r\n$3\r\nabc\r\n",
+    ),
+    (
+        r#"return {{double='x'}, {true, {"hello world"}}}"#,
+        b"*2\r\n*0\r\n*2\r\n:1\r\n*1\r\n$11\r\nhello world\r\n",
+        b"*2\r\n*0\r\n*2\r\n:1\r\n*1\r\n$11\r\nhello world\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return {{}, {x=1, {"\255\254", {false, redis.call('zscore', 'fz:z', 'a'), true, true, ""}, KEYS[1]}}, redis.call('time')[1] and 1}"#,
+        b"*3\r\n*0\r\n*1\r\n*3\r\n$2\r\n\xff\xfe\r\n*5\r\n$-1\r\n$3\r\n1.5\r\n:1\r\n:1\r\n$0\r\n\r\n$4\r\nfz:k\r\n:1\r\n",
+        b"*3\r\n*0\r\n*1\r\n*3\r\n$2\r\n\xff\xfe\r\n*5\r\n_\r\n$3\r\n1.5\r\n:1\r\n:1\r\n$0\r\n\r\n$4\r\nfz:k\r\n:1\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return {{KEYS[1], nil, {ok=KEYS[1]}, {{redis.call('smembers', 'fz:s1')}, {set={b=true}}, nil}, {set={b=true}}}, {{{nil, redis.error_reply('plain'), nil, 1e20}, {"", ok2='z'}, {tonumber('10'), "123"}}, {redis.call('hgetall', 'fz:h')}, {{}, {2^63}}}, 1e20, 7//2}"#,
+        b"*4\r\n*1\r\n$4\r\nfz:k\r\n*3\r\n*3\r\n*0\r\n*1\r\n$0\r\n\r\n*2\r\n:10\r\n$3\r\n123\r\n*1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n*2\r\n*0\r\n*1\r\n:-9223372036854775808\r\n:-9223372036854775808\r\n:3\r\n",
+        b"*4\r\n*1\r\n$4\r\nfz:k\r\n*3\r\n*3\r\n*0\r\n*1\r\n$0\r\n\r\n*2\r\n:10\r\n$3\r\n123\r\n*1\r\n%1\r\n$1\r\na\r\n$1\r\n1\r\n*2\r\n*0\r\n*1\r\n:-9223372036854775808\r\n:-9223372036854775808\r\n:3\r\n",
+    ),
+    (
+        r#"return "hello world""#,
+        b"$11\r\nhello world\r\n",
+        b"$11\r\nhello world\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return {false, "hello world"}"#,
+        b"*2\r\n:0\r\n$11\r\nhello world\r\n",
+        b"*2\r\n#f\r\n$11\r\nhello world\r\n",
+    ),
+    (
+        r#"return os.clock() >= 0"#,
+        b":1\r\n",
+        b":1\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return {false, {{false, {nil, 0, false, nil, 2^53}, {1, nil, 3}, {true, true, nil, "", false}, false}}, nil}"#,
+        b"*2\r\n$-1\r\n*1\r\n*5\r\n$-1\r\n*0\r\n*1\r\n:1\r\n*2\r\n:1\r\n:1\r\n$-1\r\n",
+        b"*2\r\n_\r\n*1\r\n*5\r\n_\r\n*0\r\n*1\r\n:1\r\n*2\r\n:1\r\n:1\r\n_\r\n",
+    ),
+    (
+        r#"return {big_number='1234567890123456789'}"#,
+        b"$19\r\n1234567890123456789\r\n",
+        b"(1234567890123456789\r\n",
+    ),
+    (
+        r#"return {double=3.0}"#,
+        b"$1\r\n3\r\n",
+        b",3\r\n",
+    ),
+    (
+        r#"redis.setresp(3) return redis.call('type', 'fz:h')"#,
+        b"+hash\r\n",
+        b"+hash\r\n",
+    ),
+    (
+        r#"return {nil, {{ok="ERR custom"}, {true, 0}}, {{}, redis.call('lrange', 'fz:l', 0, -1), {big_number='1234567890123456789'}, {set='x'}, {big_number=5}}}"#,
+        b"*0\r\n",
+        b"*0\r\n",
+    ),
+    (
+        r#"return {{x=1, redis.call('type', 'fz:h')}, true, false, #ARGV}"#,
+        b"*4\r\n*1\r\n+hash\r\n:1\r\n$-1\r\n:2\r\n",
+        b"*4\r\n*1\r\n+hash\r\n:1\r\n_\r\n:2\r\n",
+    ),
+    (
+        r#"redis.setresp(2) return {nil, 2}"#,
+        b"*0\r\n",
+        b"*0\r\n",
+    ),
+    (
+        r#"return {{verbatim_string={format='txt', string='hi'}}}"#,
+        b"*1\r\n$2\r\nhi\r\n",
+        b"*1\r\n=6\r\ntxt:hi\r\n",
+    ),
+];

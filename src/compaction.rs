@@ -49,6 +49,7 @@
 //! between them, active defrag turns itself off (`activedefrag no`, INFO
 //! `active_defrag_disabled_by_panics:1`) until it is turned on again.
 
+use crate::cpus::BuilderExt as _;
 use std::cell::{Cell, RefCell};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -235,7 +236,7 @@ fn wasting(ignore: u64, percent: u32) -> bool {
 pub fn spawn(store: Store) {
     std::thread::Builder::new()
         .name("kividb-defrag".into())
-        .spawn(move || {
+        .spawn_released(move || {
             let mut streak = Streak::new();
             let mut wait = TICK;
             loop {
@@ -881,7 +882,7 @@ mod tests {
     fn sparse_store(data: &'static Data) -> Store {
         let store = new_store(1);
         let filling = Arc::clone(&store);
-        std::thread::spawn(move || {
+        crate::cpus::spawn(move || {
             let db = &filling[0];
             for i in 0..data.keys {
                 let key = (data.key)(i);

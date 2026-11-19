@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/blocked_client_gone.rs
 //
 // A client that goes while the server is waiting on its behalf — in a
@@ -1367,6 +1368,190 @@ fn what_a_waiting_client_holds_is_bounded_together() {
     }
 }
 
+/// What was read ahead is replayed out of the allocation it was read into:
+/// `carried`'s vector becomes the query buffer on release rather than the
+/// held bytes being copied a read a turn into a second, doubling, one.
+/// Parked again mid-replay, what the client then holds is about what it
+/// still has to run — with the copy, the moved part sat in a second vector
+/// on top of `carried`'s, and a client holding under a megabyte of requests
+/// showed close to two. (On io_uring a parked client is not read, so what
+/// was sent stays in the socket — there is no second allocation to show.)
+#[test]
+fn what_was_read_ahead_is_held_in_the_one_allocation() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        let name = format!("held-one-{io}");
+        let mut c = blocked_client(&server, &mut ctl, &name, &["BLPOP", "hold", "0"]);
+        let before = info_field(&mut ctl, "memory", "used_memory");
+
+        // Behind the `BLPOP`: a 300KB request, a `BLPOP` of another (still
+        // empty) list, and about 550KB more — under the limit as one
+        // `carried`, so the wait reads them all ahead on tokio (on io_uring
+        // they stay in the socket).
+        let mut queued = request(&["SET", "a", &"x".repeat(300 * 1024)]);
+        queued.extend_from_slice(&request(&["BLPOP", "hold2", "0"]));
+        queued.extend_from_slice(&request(&["PING"]).repeat(34 * 1024));
+        c.writer.write_all(&queued).unwrap();
+        thread::sleep(Duration::from_millis(300));
+
+        // Unblocked, the read ahead replays and `hold2` still being empty
+        // parks the client again with about half of it still to run. What
+        // it holds on top of the stored value is then the one vector the
+        // read ahead was read into — not a grown buffer's on top of a
+        // still-holding `carried`'s.
+        assert_eq!(ctl.cmd(&["RPUSH", "hold", "v"]), V::Int(1));
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            listed(&mut ctl, &name),
+            "{io}: the second BLPOP never parked"
+        );
+
+        let held = info_field(&mut ctl, "memory", "used_memory") - before;
+        assert!(
+            held < 1_650_000,
+            "{io}: a client holding under a megabyte showed {held} — its read ahead was copied into a second allocation"
+        );
+        drop(c);
+    }
+}
+
+/// What the read-ahead's vector becomes while it replays is given back when
+/// the replay ends: it is the client's query buffer until then, and a
+/// connection that runs small commands afterwards is not left holding a
+/// large one. (Kept, a thousand released clients that had each sent a
+/// megabyte showed hundreds of megabytes of `used_memory` after.)
+#[test]
+fn the_buffer_a_read_ahead_became_is_given_back() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        let name = format!("give-back-{io}");
+        let mut c = blocked_client(&server, &mut ctl, &name, &["BLPOP", "hold", "0"]);
+        let before = info_field(&mut ctl, "memory", "used_memory");
+
+        // About 860KB behind the `BLPOP`, all small requests — none marks
+        // the buffer as its own — then released twice: the read-ahead's
+        // vector becomes the query buffer on tokio and the replay runs it
+        // to its end. (On io_uring a parked client is not read; what was
+        // sent replays out of the socket the same way.)
+        let mut queued = request(&["BLPOP", "hold2", "0"]);
+        queued.extend_from_slice(&request(&["PING"]).repeat(57 * 1024));
+        c.writer.write_all(&queued).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(ctl.cmd(&["RPUSH", "hold", "v"]), V::Int(1));
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            listed(&mut ctl, &name),
+            "{io}: the second BLPOP never parked"
+        );
+        assert_eq!(ctl.cmd(&["RPUSH", "hold2", "v"]), V::Int(1));
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            listed(&mut ctl, &name),
+            "{io}: the client did not run its read-ahead out"
+        );
+
+        // Nothing of the requests is left but what has not been answered:
+        // the query buffer the read-ahead became is small again. Kept, it
+        // showed about a megabyte more.
+        let held = info_field(&mut ctl, "memory", "used_memory") - before;
+        assert!(
+            held < 500_000,
+            "{io}: the drained read-ahead's allocation stayed as the query buffer: {held}"
+        );
+        drop(c);
+    }
+}
+
+/// A request that crosses what one read offered completes past it — as one
+/// a read ends within did — and what it ran past is then run: nothing of
+/// the offered tail is left still un-offered. (Counted as still held, the
+/// tail the one request ran through was offered against the next read too:
+/// a parked client that sent one big request and was released closed on
+/// the turn after its request ran, its offered end wrapped — a panic on a
+/// debug build, which is what CI runs.)
+#[test]
+fn a_request_that_ran_past_the_offer_is_not_still_held() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        let name = format!("past-{io}");
+        let mut c = blocked_client(&server, &mut ctl, &name, &["BLPOP", "hold", "0"]);
+
+        // One big request behind the `BLPOP`: read ahead whole on tokio and
+        // handed to the buffer once released, where the one request starts
+        // inside the first offered part and runs the whole tail through.
+        c.writer
+            .write_all(&request(&["SET", "big", &"x".repeat(600 * 1024)]))
+            .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(ctl.cmd(&["RPUSH", "hold", "v"]), V::Int(1));
+
+        // The blocked reply, then the request's, then one it is still there
+        // to answer: the connection is not lost to its own replay.
+        assert_eq!(c.read(), V::Arr(vec![s("hold"), s("v")]));
+        assert_eq!(c.read(), s("OK"));
+        assert_eq!(c.cmd(&["PING"]), s("PONG"));
+        drop(c);
+    }
+}
+
+/// While a read-ahead is still being offered a turn at a time, a reply that
+/// must wait is written as any other is: the client is read meanwhile, or
+/// its sends block against the replies it is not reading. (On io_uring the
+/// write matched neither arm once the read-ahead was handed over —
+/// `carried` empty, the tail not yet offered — and a client sending
+/// against its stalled replies hung for as long as they did.)
+#[test]
+fn a_client_sends_while_its_replay_waits_to_be_written() {
+    for &io in io_models() {
+        let server = Server::start(io);
+        let mut ctl = server.conn();
+        // A value big enough that its `GET` cannot be written at once.
+        assert_eq!(
+            ctl.cmd(&["SET", "v", &"x".repeat(8 * 1024 * 1024)]),
+            s("OK")
+        );
+        let name = format!("replay-write-{io}");
+        let mut c = server.conn();
+        assert_eq!(c.cmd(&["CLIENT", "SETNAME", &name]), s("OK"));
+
+        // `GET v` stalls the write. Behind it, enough small requests to
+        // fill the early read and reach `carried`, then another `GET v`
+        // and a tail of more: handed over on release, the second `GET v`'s
+        // reply stalls while the tail is still to be offered.
+        c.send(&["GET", "v"]);
+        let mut queued = request(&["GET", "k"]).repeat(12 * 1024);
+        queued.extend_from_slice(&request(&["GET", "v"]));
+        queued.extend_from_slice(&request(&["GET", "k"]).repeat(20 * 1024));
+        c.writer.write_all(&queued).unwrap();
+        thread::sleep(Duration::from_millis(400));
+        // Reading the stalled reply lets the write out and the replay in.
+        assert_eq!(c.read(), V::Str("x".repeat(8 * 1024 * 1024)));
+        thread::sleep(Duration::from_millis(400));
+
+        // The client sends on, never reading: what it sends must keep being
+        // read. Hung against the stalled write instead, its send stops once
+        // the sockets' room is spent.
+        let mut writer = c.writer.try_clone().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let chunk = request(&["PING"]).repeat(8 * 1024);
+            let mut sent = 0usize;
+            while sent < 12 * 1024 * 1024 && writer.write_all(&chunk).is_ok() {
+                sent += chunk.len();
+            }
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(15)).is_ok(),
+            "{io}: the client's sends hung behind its stalled replies"
+        );
+        drop(c);
+    }
+}
+
 /// What has already run is not held against a client that waits: a request
 /// that completed in the same read the blocking command arrived in leaves
 /// nothing to count, so the client stays — counted for what it still
@@ -1516,5 +1701,185 @@ fn a_client_that_sends_past_replies_it_never_reads_is_held_to_the_limit() {
         );
         drop(c);
         let _ = sending.join();
+    }
+}
+
+/// The id `CLIENT ID` gives `c`, as `CLIENT UNBLOCK` takes it.
+fn client_id(c: &mut Conn) -> String {
+    let V::Int(id) = c.cmd(&["CLIENT", "ID"]) else {
+        panic!("CLIENT ID is a number");
+    };
+    id.to_string()
+}
+
+/// A client whose blocking pop ends with nothing — `CLIENT UNBLOCK`, here,
+/// or its timeout — wakes nobody behind it: it took nothing, and there is
+/// nothing for them to look at. It used to wake the client next in line,
+/// which left its wait only to find nothing and wait again, and was not
+/// listed as blocked meanwhile: a `CLIENT UNBLOCK` for it then was answered
+/// 0, and it stayed blocked. Redis's unit/pause unblocks two `BLPOP`s on
+/// one key one after the other. The test build holds every wait, on
+/// `KIVIDB_TEST_PARK_DELAY_MS`, before its client is listed: a client woken
+/// for nothing is off the list for that long.
+#[test]
+fn a_pop_that_ends_with_nothing_wakes_nobody_behind_it() {
+    for &io in io_models() {
+        for how in ["TIMEOUT", "ERROR"] {
+            let server =
+                Server::start_with_env(io, 4, &[], &[("KIVIDB_TEST_PARK_DELAY_MS", "500")]);
+            let mut ctl = server.conn();
+            let mut first = server.conn();
+            let first_id = client_id(&mut first);
+            first.send(&["BLPOP", "k", "0"]);
+            wait_blocked(&mut ctl, 1);
+            let mut second = server.conn();
+            let second_id = client_id(&mut second);
+            second.send(&["BLPOP", "k", "0"]);
+            wait_blocked(&mut ctl, 2);
+            assert_eq!(
+                ctl.cmd(&["CLIENT", "UNBLOCK", &first_id, how]),
+                V::Int(1),
+                "{io} {how}"
+            );
+            // Written once the dispatch that ended it is over, wake-ups and
+            // all. A client woken then would be in the half second's hold
+            // for the next tenth of a second at least.
+            match (how, first.read()) {
+                ("TIMEOUT", V::Nil) => {}
+                ("ERROR", V::Err(e)) if e.starts_with("UNBLOCKED") => {}
+                (_, reply) => panic!("{io} {how}: {reply:?}"),
+            }
+            thread::sleep(Duration::from_millis(100));
+            assert_eq!(
+                ctl.cmd(&["CLIENT", "UNBLOCK", &second_id, "TIMEOUT"]),
+                V::Int(1),
+                "{io} {how}: the client behind was not listed as blocked"
+            );
+            assert_eq!(second.read(), V::Nil, "{io} {how}");
+        }
+    }
+}
+
+/// A `CLIENT UNBLOCK` that lands as the client's wait ends otherwise — woken
+/// by a push that someone else's pop then took — is answered 1, and is done:
+/// the client is answered as it says, not left blocked after finding
+/// nothing. The test build holds a woken client, on
+/// `KIVIDB_TEST_WOKEN_DELAY_MS`, before it is taken off the list.
+#[test]
+fn an_unblock_as_the_client_is_woken_is_not_lost() {
+    for &io in io_models() {
+        for how in ["TIMEOUT", "ERROR"] {
+            let server =
+                Server::start_with_env(io, 4, &[], &[("KIVIDB_TEST_WOKEN_DELAY_MS", "500")]);
+            let mut ctl = server.conn();
+            let mut c = server.conn();
+            let id = client_id(&mut c);
+            c.send(&["BLPOP", "k", "0"]);
+            wait_blocked(&mut ctl, 1);
+            // Pushed and popped in one go: the client is woken for an
+            // element that is gone by the time it looks. The reply waits
+            // for it to look, a tenth of a second at most: it is held for
+            // half a second, and is still waiting when the unblock lands.
+            assert_eq!(ctl.cmd(&["MULTI"]), s("OK"));
+            assert_eq!(ctl.cmd(&["LPUSH", "k", "x"]), s("QUEUED"));
+            assert_eq!(ctl.cmd(&["LPOP", "k"]), s("QUEUED"));
+            assert_eq!(ctl.cmd(&["EXEC"]), V::Arr(vec![V::Int(1), s("x")]), "{io}");
+            assert_eq!(
+                ctl.cmd(&["CLIENT", "UNBLOCK", &id, how]),
+                V::Int(1),
+                "{io} {how}"
+            );
+            match (how, c.read()) {
+                ("TIMEOUT", V::Nil) => {}
+                ("ERROR", V::Err(e)) if e.starts_with("UNBLOCKED") => {}
+                (_, reply) => panic!("{io} {how}: {reply:?}"),
+            }
+            wait_blocked(&mut ctl, 0);
+        }
+    }
+}
+
+/// A `BLPOP` inside `MULTI`, which cannot wait, on an empty key that a
+/// client is blocked on, takes nothing and wakes nobody: the blocked client
+/// stays listed, and `CLIENT UNBLOCK` reaches it. The test build holds every
+/// wait, on `KIVIDB_TEST_PARK_DELAY_MS`: a client woken for nothing would be
+/// off the list for that long.
+#[test]
+fn a_pop_in_multi_that_finds_nothing_wakes_nobody() {
+    for &io in io_models() {
+        let server = Server::start_with_env(io, 4, &[], &[("KIVIDB_TEST_PARK_DELAY_MS", "500")]);
+        let mut ctl = server.conn();
+        let mut c = server.conn();
+        let id = client_id(&mut c);
+        c.send(&["BLPOP", "k", "0"]);
+        wait_blocked(&mut ctl, 1);
+        assert_eq!(ctl.cmd(&["MULTI"]), s("OK"));
+        assert_eq!(ctl.cmd(&["BLPOP", "k", "0"]), s("QUEUED"));
+        assert_eq!(ctl.cmd(&["EXEC"]), V::Arr(vec![V::Nil]), "{io}");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            ctl.cmd(&["CLIENT", "UNBLOCK", &id, "TIMEOUT"]),
+            V::Int(1),
+            "{io}: the blocked client was not listed as blocked"
+        );
+        assert_eq!(c.read(), V::Nil, "{io}");
+    }
+}
+
+/// A client woken by a push and unblocked before it looks leaves the
+/// element to the client behind it: `ERROR` takes nothing and passes the
+/// turn on, `TIMEOUT` either takes it or passes it on. Either way the
+/// element goes to exactly one of them. The test build holds a woken
+/// client, on `KIVIDB_TEST_WOKEN_DELAY_MS`, before it is taken off the list.
+#[test]
+fn a_client_unblocked_as_a_push_wakes_it_leaves_the_element_to_the_next() {
+    for &io in io_models() {
+        for how in ["ERROR", "TIMEOUT"] {
+            let server =
+                Server::start_with_env(io, 4, &[], &[("KIVIDB_TEST_WOKEN_DELAY_MS", "500")]);
+            let mut ctl = server.conn();
+            let mut first = server.conn();
+            let first_id = client_id(&mut first);
+            first.send(&["BLPOP", "k", "0"]);
+            wait_blocked(&mut ctl, 1);
+            let mut second = server.conn();
+            let second_id = client_id(&mut second);
+            second.send(&["BLPOP", "k", "0"]);
+            wait_blocked(&mut ctl, 2);
+            // The reply waits a tenth of a second at most for the woken
+            // client to look; it is held for half a second.
+            assert_eq!(ctl.cmd(&["LPUSH", "k", "x"]), V::Int(1), "{io} {how}");
+            assert_eq!(
+                ctl.cmd(&["CLIENT", "UNBLOCK", &first_id, how]),
+                V::Int(1),
+                "{io} {how}"
+            );
+            let first_got = first.read();
+            let started = Instant::now();
+            match (how, first_got) {
+                ("ERROR", V::Err(e)) if e.starts_with("UNBLOCKED") => {
+                    assert_eq!(second.read(), strs(&["k", "x"]), "{io} {how}");
+                }
+                ("TIMEOUT", V::Nil) => {
+                    assert_eq!(second.read(), strs(&["k", "x"]), "{io} {how}");
+                }
+                ("TIMEOUT", got) if got == strs(&["k", "x"]) => {
+                    // Taken by the first: the second is still waiting.
+                    assert_eq!(
+                        ctl.cmd(&["CLIENT", "UNBLOCK", &second_id, "TIMEOUT"]),
+                        V::Int(1),
+                        "{io} {how}"
+                    );
+                    assert_eq!(second.read(), V::Nil, "{io} {how}");
+                }
+                (_, got) => panic!("{io} {how}: {got:?}"),
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "{io} {how}: the element waited {:?}",
+                started.elapsed()
+            );
+            assert_eq!(ctl.cmd(&["LLEN", "k"]), V::Int(0), "{io} {how}");
+        }
     }
 }

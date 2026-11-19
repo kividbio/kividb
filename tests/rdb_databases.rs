@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Snapshots with keys in databases past 15. The RDB reader put every
 // database of 16 or more into database 0, merged with its keys: where names
 // clashed, keys were overwritten, and nothing said so (#477). A KiviDB image

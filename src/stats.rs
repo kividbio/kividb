@@ -444,7 +444,7 @@ pub fn reset_rdb_changes() {
 /// 1 Hz sampling for `instantaneous_ops_per_sec` in INFO, and `used_memory`'s
 /// peak every 100 ms — safe from any startup path.
 pub fn spawn_instantaneous_ops_sampler() {
-    std::thread::spawn(|| {
+    crate::cpus::spawn(|| {
         let (mut last_in, mut last_out) = (0u64, 0u64);
         let mut tick = 0u64;
         loop {

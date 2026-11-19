@@ -89,6 +89,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`worker-cpu-affinity auto`: each io_uring worker on a CPU of its own (#894).** Off by
+  default. With `auto`, worker N is bound to the N-th CPU the process may use, when the
+  workers are exactly as many as those CPUs (a cpuset or `taskset` of `--threads` CPUs, the
+  Kubernetes static CPU manager), and never under a cgroup CPU quota. An io_uring worker
+  serves its connections alone, and the scheduler at times puts two workers on one CPU
+  when a third busy thread shares their CPUs; every connection of one then waits out the
+  other's time slice. The server says after the I/O model line what it bound, or why not;
+  the tokio I/O model and systems other than Linux bind nothing and say so. Threads a bound
+  worker starts (a full sync's dump, scripts, backups, snapshot compression) are given all
+  of the process's CPUs back first; every thread in the server is started through one
+  wrapper that does this, and clippy refuses a direct `thread::spawn` or `spawn_blocking`.
+  It is not a fix for the rate limiter's p99 on its own. Azure D8s_v5, a rate limiter
+  (`INCRBY` + `EXPIRE`, 65 connections) beside 100 connections of pipelined load, the server
+  on two vCPUs of separate cores started from a snapshot, checks a second and p99 before
+  #919, off / auto / Redis 8.10.2: 25.2k at 3.9 ms / 30.9k at 2.7 ms / 32.0k at 0.06 ms at
+  150,000 commands a second of load, 21.5k at 5.2 / 28.9k at 3.5 / 31.9k at 0.10 ms at
+  200,000, and at 300,000 `auto` is worse: 23.7k at 6.9 ms / 24.2k at 8.3 ms / 22.6k at
+  1.4 ms. The p99 is fixed by #919's backlog change; with it `auto` differs from `off` only
+  at 150,000-200,000 (0.14-0.17 ms against 0.50-1.8 ms). Pipelined and unpipelined
+  `GET`/`SET` and a 4-worker server under memtier are unchanged. Leave it off when the
+  server shares its CPUs with other busy processes: with `stress-ng` on the same two CPUs,
+  unpipelined `GET` fell by a third, from 91k to 61k a second. A `SAVE` of 948,000 keys
+  holds writes for up to 26-29 ms with `auto` against 23 ms with `off`. See
+  docs/CONFIGURATION.md and docs/PERFORMANCE.md (binaries built with rustc 1.100.0).
+
 - **Compressed snapshots, opt-in: `rdbcompression yes` (#879).**
   `rdbcompression`, which was accepted and did nothing, is in effect; it
   defaults to `no` in 1.3 (see Upgrading). With `yes` (config file, command
@@ -325,6 +350,76 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dataset digest lets the replica continue without a full sync.
 
 ### Changed
+
+- **A short script call costs the server less, level with Redis for Tyk's
+  rate limiter and centrifuge's history scripts (#901).** One call of Tyk's
+  sliding-log limiter (four sorted-set commands) cost 16.1 µs of server CPU
+  on one worker against Redis 8.10.2's 13.8; it now costs 13.4, and
+  centrifuge's history scripts 10.1 and 12.4 µs against 11.1 and 13.0
+  (1.2.2: 15.6, 14.2, 14.9). With two workers the server runs Tyk's script
+  92.3k times a second (master 60.7k, Redis 72.6k), `return 1` 187k (160k,
+  161k), and a BullMQ worker's `moveToFinished` costs 37.3 µs of server CPU
+  a job (47.9, Redis 42.0); Azure `Standard_D8s_v5`, server on 2 CPUs, rustc
+  1.100.0, the numbers in docs/PERFORMANCE.md. Instructions per call fell
+  30 % for Tyk's script and for `return 1`. What changed: a script's reply is
+  written as RESP from Lua's stack into one buffer instead of value by value
+  through mlua, and a short array is told from `{ok=...}`, `{err=...}` and
+  the RESP3 shapes by walking it; `redis` and the other library globals are
+  found by a table lookup instead of a Lua call; `EVAL`, `EVALSHA` and
+  `FCALL` go straight to the script handler; a command a script calls is
+  classified as a write once instead of five times, and its replication feed
+  is built only when an AOF, a replica, the backlog or a tap reads it;
+  `KEYS` and `ARGV` of at most 4 KB and at most 64 arguments in all stay
+  until the next script's are built;
+  one argument list per call; ahash for the script cache; and the
+  connection's environment is shared, not copied, when a script goes to the
+  script-runner thread. Replies, errors and what is replicated are unchanged
+  (a differential fuzz of 21,000 scripts against the tree before, RESP2 and
+  RESP3). `return 1` and a lock's compare-and-delete still cost 18 % and
+  11 % more than in Redis on one worker, around the call rather than in it.
+
+- **Writes on a master with a replication backlog and no replica no
+  longer wake the replication thread one by one (#894).** A master that
+  starts with data (its own snapshot, or any dataset) keeps the backlog for
+  `repl-backlog-ttl` (an hour) so that a replica can be continued, and so
+  does one whose replicas have gone. Every write was handed to the
+  replication thread and woke it; on a server held to a few CPUs that
+  thread took them from the connections. In #894 an envoy rate limiter
+  (`INCRBY` + `EXPIRE` on two keys a check, 65 connections) beside other
+  replicas' pipelined load ran 8 % slower than on Redis with 1.7x its p99.
+  With no replica attached, the thread now takes what has come in, sleeps a
+  millisecond and looks again, and waits to be woken only once it finds
+  nothing; once a replica attaches, every write is handed on at once, as
+  before. Azure D8s_v5, the server on two vCPUs of separate cores
+  (`--threads 2`, io_uring), the checks and the background load on
+  CPUs of their own, the server started from a snapshot of 100,000 keys,
+  checks a second and p99 (medians of three; the 1.2.2 release binary,
+  master and this change all built with rustc 1.100.0), Redis 8.10.2
+  beside it:
+
+  | background (cmds/s) | 1.2.2 | before | after | Redis |
+  |---|---|---|---|---|
+  | 0 | 31.5k, 0.17 ms | 31.4k, 0.22 ms | 31.5k, 0.14 ms | 31.7k, 0.11 ms |
+  | 100,000 | 30.3k, 0.74 ms | 29.9k, 0.85 ms | 31.9k, 0.10 ms | 32.0k, 0.06 ms |
+  | 150,000 | 26.6k, 3.7 ms | 25.1k, 4.0 ms | 31.8k, 0.13 ms | 32.1k, 0.05 ms |
+  | 200,000 | 23.1k, 4.2 ms | 25.1k, 4.2 ms | 31.4k, 0.59 ms | 31.9k, 0.10 ms |
+  | 300,000 | 25.1k, 3.9 ms | 22.8k, 5.1 ms | 31.2k, 0.23 ms | 22.5k, 1.2 ms |
+
+  On the tokio loop, whose workers take each other's connections when one
+  is held up, the same case after the change: 31.7-32.0k checks a second
+  at a p99 of 0.06-0.11 ms at every rate. Pipelined `SET` on such a
+  server (`redis-benchmark -c 50`) went from 0.94M to 1.16M a second at
+  pipeline 16 and from 1.30M to 1.50M at 100; `GET` is unchanged.
+  At 200,000 the two io_uring workers are still at times put on one CPU by
+  the scheduler, and connections wait out the other's time slice (0.17,
+  0.59 and 1.0 ms in three runs); the opt-in `worker-cpu-affinity auto`
+  (#927) binds each to a CPU of its own. A server with no backlog (one started empty, as
+  benchmarks start it) does none of this: 31.6-31.9k checks a second at a
+  p99 of 0.06-0.10 ms at every rate. `WAIT` with no replica attached no
+  longer waits for the replication thread (it has nothing to count): 62 us
+  a call, 1.99 ms before this, 83 us on master; an idle server with the
+  backlog kept uses 0.13 % of a CPU, as before. Suite
+  `27-ratelimit-restarted` measures it.
 
 - **Pub/sub fan-out delivers 18-29 % more messages a second, ahead of
   Redis (#851).** socket.io's Redis adapter publishes every broadcast with
@@ -820,6 +915,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`CLIENT UNBLOCK` reaches a client that was woken and is parking
+  again.** It could answer 1 for a client blocked in `BLPOP` (or another
+  blocking pop) that had just been woken and was parking again, and the
+  client then stayed blocked; or answer 0 for it when the pop ahead of it
+  ended with nothing. And a blocking pop that ended with nothing (its
+  timeout, or `CLIENT UNBLOCK`) woke the next client waiting on its key
+  for no reason, which is what opened that window: Redis's unit/pause
+  failed on it now and then.
+
 - **Sorted-set commands read integers as Redis does.** `ZREMRANGEBYRANK
   key x 5` took `x` as 0 and removed members; it now answers `ERR value is
   not an integer or out of range`, before it looks at the key, as Redis
@@ -914,6 +1018,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for again either: the buffer is not grown to a request's full length
   while the read-ahead still holds it. The io_uring loop holds the same
   bound.
+
+- **What a waiting client read ahead is replayed out of the allocation it
+  was read into.** The read-ahead was moved a read's worth a turn into the
+  query buffer, which reserved and doubled its way up while the
+  read-ahead's own allocation still held the same bytes — a client kept
+  about twice what it held, and at a thousand waiting clients holding a
+  megabyte each the difference was hundreds of megabytes of RSS. When the
+  buffer has nothing left to run, the read-ahead's vector is now handed to
+  it whole and offered on a read's worth a turn, so one allocation carries
+  the bytes. The io_uring loop does the same.
 
 - **`CLIENT NO-TOUCH` now keeps the client's reads from counting as a
   use of the keys they find (#566).** The command was accepted and
