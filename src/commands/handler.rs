@@ -740,6 +740,20 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
                 crate::tag_locks::script_tags_for_message()
             ));
         }
+        // Nor may it `MIGRATE` (#340). A `MIGRATE` holds back writes to the
+        // keys it moves until they have gone (`cluster::hold_while_moving`),
+        // and the hold enters the write gate and takes the keys' order,
+        // which a script beside others holds already, under its tags' locks:
+        // taken there, it would be the other way round from every writer.
+        // So such a script is refused. A script that runs alone holds
+        // every other command back, and keeps its hold.
+        if name2 == "MIGRATE" && crate::tag_locks::beside_others() {
+            return resp_error(&format!(
+                "ERR Script attempted to run 'migrate' while running beside other scripts \
+                 under the {} of its KEYS (lua-parallel-scripts)",
+                crate::tag_locks::script_tags_for_message()
+            ));
+        }
     }
 
     if read_only_script && replication::inner_command_blocked_in_readonly_script(name2, &ctx.cmd) {

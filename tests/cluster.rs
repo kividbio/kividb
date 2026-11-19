@@ -8429,6 +8429,94 @@ fn a_watched_transaction_of_sets_during_a_slot_handoff_is_refused_with_tryagain(
     }
 }
 
+/// Moves `KEYS[1]` to the node at port `ARGV[1]`, or sets it when
+/// `ARGV[1]` is empty: quick either way, so that once seen it runs beside
+/// other scripts when its key has a hash tag.
+#[cfg(feature = "lua")]
+const MIGRATES: &str = "if ARGV[1] == '' then return redis.call('SET', KEYS[1], 'v') end \
+                        return redis.call('MIGRATE', '127.0.0.1', ARGV[1], KEYS[1], '0', '5000')";
+
+/// A script that runs beside others under its hash tag may not `MIGRATE`
+/// (#340): it cannot take the hold a `MIGRATE` takes on the keys it moves.
+/// It is refused, and the key stays.
+/// A script that runs alone, on a key with no tag, still migrates, under
+/// the hold a `MIGRATE` of a client's takes.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_beside_others_may_not_migrate_and_one_alone_may() {
+    let (nodes, ranges) = form_cluster(2);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let range = ranges[0].0..=ranges[0].1;
+    // `slot_of` takes no hash tag: the tagged key's slot is its tag's.
+    let tag = key_in(range.clone(), "mig");
+    let tagged = format!("{{{tag}}}:k");
+    let plain = key_in(range, "plain");
+    let mut s = src.conn();
+    let mut d = dst.conn();
+    let (src_id, dst_id) = (src.id(), dst.id());
+    // Before their slots migrate: a key not here then is sent on with ASK.
+    assert!(s.cmd(&["SET", &tagged, "v"]).is_ok());
+    assert!(s.cmd(&["SET", &plain, "w"]).is_ok());
+    for key in [&tag, &plain] {
+        let slot = slot_of(key).to_string();
+        let r = d.cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src_id]);
+        assert!(r.is_ok(), "SETSLOT IMPORTING: {r:?}");
+        let r = s.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst_id]);
+        assert!(r.is_ok(), "SETSLOT MIGRATING: {r:?}");
+    }
+    let sha = s.cmd(&["SCRIPT", "LOAD", MIGRATES]).text();
+    let port = dst.port.to_string();
+
+    // Seen to be quick, so that it is run beside others.
+    for _ in 0..4 {
+        let r = s.cmd(&["EVALSHA", &sha, "1", &tagged, ""]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+    let refused = s.cmd(&["EVALSHA", &sha, "1", &tagged, &port]);
+    assert!(
+        refused
+            .err()
+            .is_some_and(|e| e
+                .contains("Script attempted to run 'migrate' while running beside other scripts")),
+        "{refused:?}"
+    );
+    assert_eq!(s.cmd(&["GET", &tagged]).text(), "v");
+    assert!(d.cmd(&["ASKING"]).is_ok());
+    assert!(matches!(d.cmd(&["GET", &tagged]), Resp::Nil));
+
+    // Alone, it migrates.
+    let r = s.cmd(&["EVALSHA", &sha, "1", &plain, &port]);
+    assert_eq!(r.text(), "OK", "{r:?}");
+    assert!(d.cmd(&["ASKING"]).is_ok());
+    assert_eq!(d.cmd(&["GET", &plain]).text(), "w");
+}
+
+/// A command an `EVAL_RO` runs is not held at the test hook that holds a
+/// command between its routing and its gates (#340): it was routed with
+/// the `EVAL_RO`, which was held there already. `EVAL_RO` holds no write
+/// gate, which is what the hook asks to tell a command run inside a script
+/// or a transaction from a client's; held again, the script would wait at
+/// a failpoint no test lets go of.
+#[cfg(feature = "lua")]
+#[test]
+fn a_command_inside_eval_ro_is_not_held_again_at_the_routing_hook() {
+    let key = key_in(0..=8191, "stalled");
+    let env = [
+        ("KIVIDB_TEST_FAILPOINTS", "routed"),
+        ("KIVIDB_TEST_STALL_KEYS", key.as_str()),
+    ];
+    let (nodes, _) = form_cluster_of(vec![Node::start_with_env(&[], &env), Node::start(&[])]);
+    let node = &nodes[0];
+    assert!(run_past_the_stall(node, 1, &["SET", &key, "5"]).is_ok());
+    let reply = run_past_the_stall(
+        node,
+        2,
+        &["EVAL_RO", "return redis.call('GET', KEYS[1])", "1", &key],
+    );
+    assert_eq!(reply.text(), "5", "{reply:?}");
+    assert!(!node.dir.join("failpoint.routed.3").exists());
+}
+
 /// Nor does a `GEORADIUS … STORE` get through, though its name is a read's
 /// (#407). The transaction was taken for one that only reads, and ran: it
 /// stored its result after the handoff's cut, was answered, and the stored
