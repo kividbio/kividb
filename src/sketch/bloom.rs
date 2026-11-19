@@ -1140,6 +1140,15 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<BloomChain> {
         if let Some(why) = over_limits(used) {
             return Err(super::invalid(&why));
         }
+        // Room for the layer, as it comes (the layers before it are counted
+        // already); only asked, the layers are added up and skipped.
+        if super::room::declared_part(bytes)? {
+            let skipped = io::copy(&mut io::Read::take(&mut *r, bytes), &mut io::sink())?;
+            if skipped != bytes {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            continue;
+        }
         let data = super::read_vec(r, bytes as usize)?;
         shapes.push(LayerShape {
             bytes,
@@ -1153,6 +1162,7 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<BloomChain> {
         });
         datas.push(data);
     }
+    super::room::declared_end()?;
     let limits = Limits::structural();
     BloomChain::from_shapes(items, flags, expansion, shapes, Some(datas), limits).map_err(|e| {
         match e {

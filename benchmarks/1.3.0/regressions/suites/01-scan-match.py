@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import (Suite, Config, THROUGHPUT, KEEP_IMPROVEMENT, EXACT, rel, vs_redis, info, median, scaled)  # noqa: E402
 
 RUNS = 3
-S = Suite("01-scan-match", [Config("default")])
+S = Suite("01-scan-match", [Config("default", threads=2)])
 
 
 def load(c):

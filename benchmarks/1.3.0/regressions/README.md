@@ -48,6 +48,7 @@ and why.
 | `29-unpipelined-commands` | 1.3.0 regression, never released | an API gateway's per-request commands (Tyk's) sent one at a time from 64 connections (`redis-benchmark -c 64`, no `-P`), io_uring and Tokio, against `--threads 1` (`uring1`, `tokio1`) and `--threads 2` (`uring2`, `tokio2`): `SET` of 385 bytes, `GET`, `INCR`, `PTTL`, `PUBLISH` of 177 bytes to no subscriber, a second each from the server's own `total_commands_processed`; the server pinned to its first CPUs, the client to the next (at most 6). Gate: each rate at most 1.05x worse than v1.2.2 in the same session; a row where the client used 95 % of its CPUs is shown, not gated (on a `Standard_D4s_v5`, the two-worker rows); `min_cpus=4`: not run on a smaller machine |
 | `30-script-call-cost` | #901 | server CPU per call and calls a second of short scripts by `EVALSHA` (`redis-benchmark`, 32 connections, one KiviDB worker): Tyk's sliding-log limiter over 5,000 keys of 144 members, the compare-and-delete lock release of #880 on keys another owner holds, and `return 1`, each also with its keys under a hash tag. Needs a `lua,tls` candidate (`--candidate-full`, #921). Gates: CPU per call within 10 % of the recorded value and at most 0.93x v1.2.2's for Tyk, 1.03x for the others; calls a second 10 % |
 | `31-zset-memory` | #825, #297 (step 4) | `used_memory` per sorted-set member, 1,000,000 members in sets of 10, 100, 128, 129 and 1,000: 14-byte members (`membr:<i>`), scores whole (`int`) or with a fraction (`float`); `OBJECT ENCODING` of each size recorded exactly (`listpack` up to 128, `skiplist` past it); the large sets (129 and 1,000) as guard rows |
+| `32-default-threads` | #903 | the default worker count itself: unpipelined `GET` (50 connections), `SET` pipeline 16, suite 05's `XADD` and suite 23's pattern fan-out, each with no `--threads` and with every explicit count from 1 to the CPUs, server and clients sharing the machine; `<row>_default_vs_best` (default / best) recorded but informational until the default worker count is settled, then gated at 0.90; `pubsub_lost` exact |
 | `33-ft-aggregate-groupby` | #761 | #761's 2,000,000 hashes (`name TEXT email TAG communityNumber NUMERIC age NUMERIC`, pipelines of 2,000): `FT.AGGREGATE userIdx * GROUPBY 1 @communityNumber REDUCE COUNT 0 AS n LIMIT 0 10`, the same with `REDUCE AVG 1 @age` and `SORTBY 2 @n DESC`, and the first over `@age:[20 40]`: median ms of 5 after a warm-up, and the reply's group total (exactly 1000); `used_memory` and RSS once loaded, the peak RSS (`VmHWM`) after the queries, and FT.INFO's memory parts as info rows. v1.2.2 and the candidate only: the VM image's Redis has no Query Engine |
 | `34-kong-ratelimit` | #849 | Kong's rate-limiting plugin with `policy: redis`: its per-request script (`incr`, and `expire` when the count is 1; Kong 3.9.4's `usage()`, verbatim) sent as Kong sends it (`EVAL` with the script text) and by `EVALSHA`, on one key, `ratelimit:<route>:<service>:<identifier>:<period_date>:minute`, from memtier_benchmark at 200 and 500 connections over 100,000 identifiers; with the key as Kong builds it (`plain`) and with the identifier under a hash tag (`tag`), in two configurations: `default` (`lua-parallel-scripts yes`) and `serial` (`lua-parallel-scripts no` on KiviDB). ops/s against Redis, p99 shown, keys left without a TTL (must be 0); every call's key checked under MONITOR first, for each way of calling. Gates: at least 1.2x Redis at 200 connections and 1.3x at 500 in every configuration and key form. Needs 8 vCPUs and the `lua,tls` builds (`--candidate-full`) |
 
@@ -170,8 +171,9 @@ and a C compiler). Suites 18, 20 and 34 use `memtier_benchmark` 2.6.1 or newer
 - One server at a time, started fresh for each configuration, in an empty
   directory, with no persistence (`--save ''`/`--appendonly no` for Redis;
   KiviDB saves nothing by default). KiviDB runs with `--protected-mode no
-  --bind 127.0.0.1`, `--io-model` and `--threads` as the configuration says
-  (`auto` and the default thread count otherwise). Redis runs with its
+  --bind 127.0.0.1`, `--io-model` as the configuration says (`auto`
+  otherwise) and `--threads` as it says: every configuration states its
+  thread count (see [Thread counts](#thread-counts)). Redis runs with its
   defaults (`io-threads 1`, jemalloc) and `--enable-debug-command yes`.
 - Client and server share the machine. Absolute numbers depend on it; the
   gates that compare with v1.2.2 or Redis measure both in the same session,
@@ -225,6 +227,36 @@ and a C compiler). Suites 18, 20 and 34 use `memtier_benchmark` 2.6.1 or newer
   JSON module, so `08-ft-info`, `10-redisvl` and `12-search-fanout` run v1.2.2
   and the candidate only (none of their PRs measured Redis either, except
   RedisVL's 67/67 on the `redis:8.10` image).
+
+### Thread counts
+
+The default worker count is a policy, not code under test: #903 changed it
+from the CPUs minus two (all of them below four) to one per available CPU,
+which on the `Standard_D4s_v5` is 4 workers instead of 2. With the clients
+on the same 4 vCPUs that moved rows that `--threads` did not pin: `05`
+`shapes/xadd5_rps` 594k/s with 2 workers, 426k with 4; `08`
+`ftinfo/hset_vec_doc_rps` 98.6k against 89.1k. So every configuration now
+states its count (`Config(..., threads=N)`; `lib/suite.py` refuses one that
+does not), and it is the count its values were recorded with, so no value
+was re-recorded for it:
+
+| suites / configurations | `--threads` | why |
+|---|---:|---|
+| `01`-`06`, `08`-`12`, `14`-`17`, `19` (every configuration that had none) | 2 | recorded before #903 (commits `2468f226`, `d66f0f93`, `9501caa6`, `219b9656`, `f767a149`, `9c466db3`, `8160700c`, `5b4a04a4`, `c7e0b47e`, `36771af1`: none contains it), where the default on 4 vCPUs was 2 (the servers' logs in `raw.tar.gz` say `Worker threads : 2`) |
+| `24-snapshot-size`, `31-zset-memory` | 4 | recorded on branches that had merged #903: the candidate's logs say `Worker threads : 4 (auto: one per available CPU)`. v1.2.2 ran with its default of 2 there and runs with 4 now: `24`'s v1.2.2 values are only used by its same-session `vs_v1_2_2` gates on the `SAVE`/load time, and `31` gates memory |
+| `02 uring1`, `07`, `13` | 1 | as before |
+| `22` | 4 | as before |
+| `23`, `25`, `27` | 2 | as before |
+| `18-mastodon-feed-fanout` | 8 | recorded on a `Standard_D8s_v5` (`min_cpus=8`) with the default of the day: the candidate's log says `Worker threads : 8 (auto: one per available CPU)` |
+| `20-envoy-ratelimit` | the server's pinned CPUs (4) | as before: it pins the server to half the CPUs and passes `--threads` to match |
+| `30-script-call-cost` | 1 | as before |
+| `21-list-memory` (all four configurations) | 4 | re-recorded in #940 with the candidate at its default of the day on 4 vCPUs (4 workers, after #903) |
+| `33-ft-aggregate-groupby` | 4 | as recorded (#944) |
+| `32-default-threads` | 0 (none) | measures the default on purpose |
+
+Redis ignores the count. The default itself is watched by
+`32-default-threads` alone: a change of the default policy shows there, and
+nowhere else.
 
 ## Tolerances (gates)
 
@@ -423,6 +455,10 @@ Checklist (the release gate refuses a tree that misses any of these):
 - [ ] Recorded with a candidate built by the release's rustc (or newer), and
       without `ALLOW_VM_CHANGE`/`REGRESS_ALLOW_RUSTC`: the gate refuses runs
       that used either.
+- [ ] Every configuration states `threads=N` (`lib/suite.py` refuses one
+      that does not, and the run is then `INVALID`): the count you record
+      it with, so a later change of the default worker count does not move
+      its rows. Only `32-default-threads` uses `threads=0` (the default).
 - [ ] Its row in the table above, its gates explained in its docstring.
 
 A suite is `suites/NN-name.py`. `run-all.sh` picks up every file named
@@ -436,9 +472,9 @@ from probe import Probe   # PING probes
 from rss import vmrss_mib, used_memory_mib, sample_at
 
 S = Suite("05-example", [
-    Config("tokio", io="tokio"),                                  # all three engines
+    Config("tokio", io="tokio", threads=2),                       # all three engines
     Config("uring1", io="uring", threads=1, engines=("v1_2_2", "candidate")),
-    Config("big", full_only=True),                               # FULL=1 only
+    Config("big", threads=2, full_only=True),                    # FULL=1 only
 ])
 
 @S.run

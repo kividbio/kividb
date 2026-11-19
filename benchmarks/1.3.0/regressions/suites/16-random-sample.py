@@ -45,9 +45,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import (Suite, Config, KEEP_IMPROVEMENT, EXACT, rel, vs_redis, median, scaled)  # noqa: E402
 
 S = Suite("16-random-sample", [
-    Config("n100"),
-    Config("n10k"),
-    Config("n1m"),
+    Config("n100", threads=2),
+    Config("n10k", threads=2),
+    Config("n1m", threads=2),
 ])
 SIZES = {"n100": 100, "n10k": 10_000, "n1m": 1_000_000}
 # Calls per timed round: the dearer the call, the fewer.
