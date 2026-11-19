@@ -482,6 +482,10 @@ pub(crate) async fn run_lua_vm_blocking(
             // `SCAN`), which keeps such scripts out while it runs: here too,
             // and not inside the command (#772).
             crate::tag_locks::walks_done().await;
+            // Counted among the scripts running beside others, which an
+            // `EXEC` waits for asleep; or, while one does, waiting for it
+            // here, asleep (#882).
+            let _running = crate::tag_locks::run_beside_others().await;
             crate::tag_locks::allow_next_script();
             let (resp, sel_out, elapsed_us) = {
                 // A walk that started since is waited for here, on the

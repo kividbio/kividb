@@ -1252,8 +1252,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on meanwhile (should one of those be busy once it is its turn, it waits
   for that tag too, holding nothing); a client that goes or
   is killed while it waits leaves nothing behind; a blocking command woken
-  by the script keeps what it was woken for. The replica's applier, the
-  AOF's replay and `EXEC` wait in place, as before. Measured with a ~2 ms
+  by the script keeps what it was woken for. The replica's applier and the
+  AOF's replay wait in place, as before. An `EXEC`, which takes the
+  command gate alone and so waits for every script running beside others,
+  waits for them the same way: its connection waits asleep until none
+  runs, the replies before it sent and what was pipelined behind it
+  waiting behind it, and scripts that come meanwhile wait for it, so a
+  stream of them cannot keep it out. It then takes the gate alone and runs
+  whole; a `WATCH` is checked inside the gate, a `CLIENT PAUSE` or a slot
+  handoff that came while it waited holds or refuses it whole, and a client
+  that goes while it waits has nothing run. With a tagged script held for
+  800 ms on a `--threads 4` server and one `MULTI`/`SET`/`EXEC` waiting for
+  it, none of 16 connections served by the other threads waited for the
+  script, on either I/O loop. Measured with a ~2 ms
   tagged script run back to back on one tag, 8 connections reading and
   writing that tag and 16 reading and writing untagged keys (Azure
   D8s_v5, server on 4 vCPUs, memtier on the other 4):

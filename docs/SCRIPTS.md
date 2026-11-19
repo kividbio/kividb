@@ -204,8 +204,19 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   tag too, holding nothing.) The replica's applier and the AOF's replay wait
   in place, as before; the only script they can meet running beside others
   is a read-only one of a replica's client, which the applier waits for.
-  `EXEC` takes the command gate alone, and waits in place for every
-  running script, as before.
+
+- **An `EXEC` waits for the scripts running beside others without holding
+  up its thread.** It takes the command gate alone, so it runs after every
+  script running beside others, whatever their tags. When it finds one
+  running, its connection waits asleep until none is, as above: the
+  replies before it are sent, what the client pipelined behind it waits
+  behind it, and the thread serves its other connections. Scripts that
+  come while it waits wait for it, so a stream of them cannot keep it out
+  (a script that sees more than three `EXEC`s start to wait goes ahead,
+  and the `EXEC`s wait for it too). The transaction then runs whole, alone,
+  as before: its `WATCH`es are checked inside the gate, a `CLIENT PAUSE`
+  or slot handoff that came meanwhile holds or refuses it whole, and if
+  its client goes while it waits, nothing of it runs.
 
 - **Every other script is as before.** A script with no keys, or with a key
   that has no tag, runs alone and may touch what it likes. So do functions

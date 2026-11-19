@@ -592,3 +592,417 @@ fn a_waiting_write_is_then_held_by_a_pause_tokio() {
 fn a_waiting_write_is_then_held_by_a_pause_uring() {
     a_waiting_write_is_then_held_by_a_pause("uring");
 }
+
+/// Of new connections, the first `want` to answer a `PING` within a quarter
+/// of the stall while a script is held: connections on threads that are
+/// not running it.
+fn free_conns(server: &Server, want: usize) -> Vec<Conn> {
+    let asked = Instant::now();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for _ in 0..want * 3 {
+        let mut c = server.conn();
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            if c.cmd(&["PING"]) == V::Str("PONG".into()) {
+                let _ = tx.send(c);
+            }
+        });
+    }
+    let deadline = asked + Duration::from_millis(STALL_MS / 4);
+    let mut free = Vec::new();
+    while free.len() < want {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(c) => free.push(c),
+            Err(_) => break,
+        }
+    }
+    free
+}
+
+/// Sends `before`, `MULTI`, `queued`, `EXEC` and `behind` in one write, and
+/// reads the replies up to the `EXEC`'s: `before`'s, `+OK` and a `+QUEUED`
+/// for each queued command.
+fn send_exec(c: &mut Conn, before: &[&[&str]], queued: &[&[&str]], behind: &[&[&str]]) {
+    let mut batch = Vec::new();
+    for args in before {
+        batch.extend_from_slice(&encode(args));
+    }
+    batch.extend_from_slice(&encode(&["MULTI"]));
+    for args in queued {
+        batch.extend_from_slice(&encode(args));
+    }
+    batch.extend_from_slice(&encode(&["EXEC"]));
+    for args in behind {
+        batch.extend_from_slice(&encode(args));
+    }
+    c.writer.write_all(&batch).unwrap();
+    for _ in before {
+        assert_eq!(c.read(), V::Str("OK".into()));
+    }
+    assert_eq!(c.read(), V::Str("OK".into()));
+    for _ in queued {
+        assert_eq!(c.read(), V::Str("QUEUED".into()));
+    }
+}
+
+/// An `EXEC` that finds a script running beside others waits for it asleep
+/// (#882): connections of the other threads, served before the `EXEC` came,
+/// are served while it waits. The replies its client had before it come at
+/// once; what it sent behind it waits behind it; the `EXEC` runs whole,
+/// after the script.
+///
+/// Sixteen probe connections that answered while the script was held; then
+/// the `EXEC`; then a `GET` on each probe: none may take as long as a
+/// quarter of the stall.
+fn an_exec_waits_for_a_script_asleep(io: &str) {
+    let server = Server::start(io, 4);
+    let mut c = server.conn();
+    let sha = quick_script(&mut c, &["a"]);
+    for i in 0..16 {
+        assert_eq!(
+            c.cmd(&["SET", &format!("probe:{i}"), "v"]),
+            V::Str("OK".into())
+        );
+    }
+    let script = start_held_script(&server, &sha, "a", "after");
+    let probes = free_conns(&server, 16);
+    assert_eq!(
+        probes.len(),
+        16,
+        "too few connections were answered at once"
+    );
+
+    let mut tx = free_conn(&server);
+    let mut batch = Vec::new();
+    for args in [
+        &["SET", "plain:before", "1"][..],
+        &["MULTI"],
+        &["SET", "{a}:k", "exec"],
+        &["SET", "{b}:k", "exec"],
+        &["EXEC"],
+        &["SET", "plain:behind", "1"],
+    ] {
+        batch.extend_from_slice(&encode(args));
+    }
+    tx.writer.write_all(&batch).unwrap();
+    // The replies before the EXEC, and when each came.
+    let before = std::thread::spawn(move || {
+        let got: Vec<(V, Instant)> = (0..4).map(|_| (tx.read(), Instant::now())).collect();
+        (tx, got)
+    });
+    std::thread::sleep(Duration::from_millis(50));
+
+    let probed: Vec<std::thread::JoinHandle<Duration>> = probes
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut probe)| {
+            std::thread::spawn(move || {
+                let asked = Instant::now();
+                assert_eq!(
+                    probe.cmd(&["GET", &format!("probe:{i}")]),
+                    V::Str("v".into())
+                );
+                asked.elapsed()
+            })
+        })
+        .collect();
+    let took: Vec<Duration> = probed.into_iter().map(|p| p.join().unwrap()).collect();
+    let held_throughout = server.holding();
+    eprintln!(
+        "{io}: {} of 16 probes over {} ms, slowest {:?}",
+        took.iter()
+            .filter(|t| **t >= Duration::from_millis(STALL_MS / 4))
+            .count(),
+        STALL_MS / 4,
+        took.iter().max()
+    );
+    let stalled = took
+        .iter()
+        .filter(|t| **t >= Duration::from_millis(STALL_MS / 4))
+        .count();
+    assert!(
+        held_throughout,
+        "the script was not held while the probes ran"
+    );
+    assert_eq!(
+        stalled, 0,
+        "probes stalled behind the waiting EXEC: {took:?}"
+    );
+    assert_eq!(
+        answered_at_once(&server, &["EXISTS", "plain:behind"]),
+        V::Int(0),
+        "what was sent behind the EXEC ran before it"
+    );
+    assert_eq!(answered_at_once(&server, &["GET", "{b}:k"]), V::Nil);
+
+    let (reply, script_done) = script.join().unwrap();
+    assert_eq!(reply, V::Int(1));
+    let (mut tx, got) = before.join().unwrap();
+    let replies: Vec<V> = got.iter().map(|(reply, _)| reply.clone()).collect();
+    assert_eq!(
+        replies,
+        vec![
+            V::Str("OK".into()),
+            V::Str("OK".into()),
+            V::Str("QUEUED".into()),
+            V::Str("QUEUED".into())
+        ]
+    );
+    // They came while the script was held, not after it.
+    assert!(
+        got.iter().all(|(_, at)| *at < script_done),
+        "the replies before the EXEC waited for the script"
+    );
+    assert_eq!(
+        tx.read(),
+        V::Arr(vec![V::Str("OK".into()), V::Str("OK".into())])
+    );
+    assert_eq!(tx.read(), V::Str("OK".into()));
+    // After the script, whole.
+    assert_eq!(c.cmd(&["GET", "{a}:k"]), V::Str("exec".into()));
+    assert_eq!(c.cmd(&["GET", "{b}:k"]), V::Str("exec".into()));
+    assert_eq!(c.cmd(&["EXISTS", "plain:behind"]), V::Int(1));
+    assert_eq!(c.info("clients", "blocked_clients"), "0");
+}
+
+#[test]
+fn an_exec_waits_for_a_script_asleep_tokio() {
+    an_exec_waits_for_a_script_asleep("tokio");
+}
+
+#[test]
+fn an_exec_waits_for_a_script_asleep_uring() {
+    an_exec_waits_for_a_script_asleep("uring");
+}
+
+/// Held first, and then fails or writes `KEYS[1]`.
+const STALLS_FIRST: &str = "redis.call('ECHO', ARGV[2]) \
+     if ARGV[3] == 'fail' then error('failed on purpose') end \
+     redis.call('SET', KEYS[1], ARGV[1]) return 1";
+
+/// How the held script ends while an `EXEC` waits for it.
+#[derive(Clone, Copy, Debug)]
+enum Ends {
+    InError,
+    Killed,
+    OverItsTimeLimit,
+}
+
+/// An `EXEC` waiting for a script runs, whole, however the script ends:
+/// with an error, after a `SCRIPT KILL`, or past `lua-time-limit`. And the
+/// threads are served meanwhile.
+fn an_exec_runs_however_the_script_ends(io: &str, ends: Ends) {
+    let server = Server::start(io, 4);
+    let mut c = server.conn();
+    let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", STALLS_FIRST]) else {
+        panic!("no digest")
+    };
+    for _ in 0..3 {
+        assert_eq!(
+            c.cmd(&["EVALSHA", &sha, "1", "{a}:k", "warm", "no-stall", "ok"]),
+            V::Int(1)
+        );
+    }
+    if let Ends::OverItsTimeLimit = ends {
+        assert_eq!(
+            c.cmd(&["CONFIG", "SET", "lua-time-limit", "100"]),
+            V::Str("OK".into())
+        );
+    }
+    let mut runner = server.conn();
+    let fails = if let Ends::InError = ends {
+        "fail"
+    } else {
+        "ok"
+    };
+    runner.send(&[
+        "EVALSHA",
+        &sha,
+        "1",
+        "{a}:k",
+        "script",
+        "script-stall:1",
+        fails,
+    ]);
+    let script = std::thread::spawn(move || runner.read());
+    server.wait_until_held();
+
+    let mut tx = free_conn(&server);
+    send_exec(
+        &mut tx,
+        &[],
+        &[&["SET", "{a}:k", "exec"], &["INCR", "{b}:n"]],
+        &[],
+    );
+    if let Ends::Killed = ends {
+        // Whatever it says: the script is beside others, or has not written.
+        let _ = free_conn(&server).cmd(&["SCRIPT", "KILL"]);
+    }
+    assert_eq!(answered_at_once(&server, &["PING"]), V::Str("PONG".into()));
+    assert_eq!(answered_at_once(&server, &["EXISTS", "{b}:n"]), V::Int(0));
+
+    let reply = script.join().unwrap();
+    match ends {
+        Ends::InError => assert!(
+            matches!(&reply, V::Err(e) if e.contains("failed on purpose")),
+            "{reply:?}"
+        ),
+        Ends::Killed => assert!(matches!(reply, V::Int(1) | V::Err(_)), "{reply:?}"),
+        Ends::OverItsTimeLimit => assert_eq!(reply, V::Int(1)),
+    }
+    assert_eq!(
+        tx.read(),
+        V::Arr(vec![V::Str("OK".into()), V::Int(1)]),
+        "{ends:?}"
+    );
+    assert_eq!(c.cmd(&["GET", "{a}:k"]), V::Str("exec".into()));
+    // Nothing is left waiting: a script runs beside others at once again.
+    let asked = Instant::now();
+    assert_eq!(
+        c.cmd(&["EVALSHA", &sha, "1", "{a}:k", "again", "no-stall", "ok"]),
+        V::Int(1)
+    );
+    assert_eq!(c.cmd(&["MULTI"]), V::Str("OK".into()));
+    assert_eq!(c.cmd(&["INCR", "{b}:n"]), V::Str("QUEUED".into()));
+    assert_eq!(c.cmd(&["EXEC"]), V::Arr(vec![V::Int(2)]));
+    assert!(asked.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn an_exec_runs_however_the_script_ends_tokio() {
+    for ends in [Ends::InError, Ends::Killed, Ends::OverItsTimeLimit] {
+        an_exec_runs_however_the_script_ends("tokio", ends);
+    }
+}
+
+#[test]
+fn an_exec_runs_however_the_script_ends_uring() {
+    for ends in [Ends::InError, Ends::Killed, Ends::OverItsTimeLimit] {
+        an_exec_runs_however_the_script_ends("uring", ends);
+    }
+}
+
+/// A client that goes, or is killed, while its `EXEC` waits for a script
+/// leaves nothing behind, and its transaction ran whole or not at all.
+fn an_exec_whose_client_goes_while_it_waits(io: &str) {
+    let server = Server::start(io, 4);
+    let mut c = server.conn();
+    let sha = quick_script(&mut c, &["a"]);
+    let script = start_held_script(&server, &sha, "a", "after");
+
+    let mut closed = free_conn(&server);
+    send_exec(
+        &mut closed,
+        &[],
+        &[&["SET", "{c}:1", "closed"], &["SET", "{c}:2", "closed"]],
+        &[],
+    );
+    let mut killed = free_conn(&server);
+    let V::Int(id) = killed.cmd(&["CLIENT", "ID"]) else {
+        panic!("CLIENT ID")
+    };
+    send_exec(
+        &mut killed,
+        &[],
+        &[&["SET", "{k}:1", "killed"], &["SET", "{k}:2", "killed"]],
+        &[],
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    drop(closed);
+    assert_eq!(
+        free_conn(&server).cmd(&["CLIENT", "KILL", "ID", &id.to_string()]),
+        V::Int(1)
+    );
+    let (reply, _) = script.join().unwrap();
+    assert_eq!(reply, V::Int(1));
+
+    let asked = Instant::now();
+    for tag in ["c", "k"] {
+        let first = c.cmd(&["GET", &format!("{{{tag}}}:1")]);
+        let second = c.cmd(&["GET", &format!("{{{tag}}}:2")]);
+        assert_eq!(first, second, "a transaction ran in part");
+    }
+    assert_eq!(
+        c.cmd(&["EVALSHA", &sha, "1", "{a}:k", "again", "no-stall"]),
+        V::Int(1)
+    );
+    assert_eq!(c.cmd(&["MULTI"]), V::Str("OK".into()));
+    assert_eq!(c.cmd(&["SET", "{a}:k", "free"]), V::Str("QUEUED".into()));
+    assert_eq!(c.cmd(&["EXEC"]), V::Arr(vec![V::Str("OK".into())]));
+    assert!(asked.elapsed() < Duration::from_secs(2));
+    assert_eq!(c.info("clients", "blocked_clients"), "0");
+}
+
+#[test]
+fn an_exec_whose_client_goes_while_it_waits_tokio() {
+    an_exec_whose_client_goes_while_it_waits("tokio");
+}
+
+#[test]
+fn an_exec_whose_client_goes_while_it_waits_uring() {
+    an_exec_whose_client_goes_while_it_waits("uring");
+}
+
+/// An `EXEC` that waited for a script and is then held by a `CLIENT PAUSE`
+/// set meanwhile runs once the pause ends, not before, and whole. As in
+/// `a_waiting_write_is_then_held_by_a_pause`, a round counts only if the
+/// pause was sent while the script was still held; up to five rounds.
+fn a_waiting_exec_is_then_held_by_a_pause(io: &str) {
+    let server = Server::start(io, 2);
+    let mut c = server.conn();
+    for round in 0..5 {
+        let sha = quick_script(&mut c, &["a"]);
+        let script = start_held_script(&server, &sha, "a", "after");
+        let Some(mut tx) = try_free_conn(&server) else {
+            assert_eq!(script.join().unwrap().0, V::Int(1));
+            continue;
+        };
+        let value = format!("paused-{round}");
+        send_exec(
+            &mut tx,
+            &[],
+            &[&["SET", "{a}:k", &value], &["SET", "{b}:k", &value]],
+            &[],
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        let Some(mut pauser) = try_free_conn(&server) else {
+            assert_eq!(script.join().unwrap().0, V::Int(1));
+            assert!(matches!(tx.read(), V::Arr(_)));
+            continue;
+        };
+        let paused_at = Instant::now();
+        pauser.send(&["CLIENT", "PAUSE", &(STALL_MS * 2).to_string(), "WRITE"]);
+        let in_time = !script.is_finished() && server.holding();
+        assert_eq!(pauser.read(), V::Str("OK".into()));
+        let (reply, _) = script.join().unwrap();
+        assert_eq!(reply, V::Int(1));
+        if !in_time {
+            assert_eq!(pauser.cmd(&["CLIENT", "UNPAUSE"]), V::Str("OK".into()));
+            assert!(matches!(tx.read(), V::Arr(_)));
+            continue;
+        }
+        assert_eq!(
+            tx.read(),
+            V::Arr(vec![V::Str("OK".into()), V::Str("OK".into())])
+        );
+        assert!(
+            paused_at.elapsed() >= Duration::from_millis(STALL_MS * 2 - 50),
+            "the transaction ran during the pause: {:?}",
+            paused_at.elapsed()
+        );
+        assert_eq!(c.cmd(&["GET", "{a}:k"]), V::Str(value.clone()));
+        assert_eq!(c.cmd(&["GET", "{b}:k"]), V::Str(value));
+        return;
+    }
+    panic!("the pause never came while the script was held");
+}
+
+#[test]
+fn a_waiting_exec_is_then_held_by_a_pause_tokio() {
+    a_waiting_exec_is_then_held_by_a_pause("tokio");
+}
+
+#[test]
+fn a_waiting_exec_is_then_held_by_a_pause_uring() {
+    a_waiting_exec_is_then_held_by_a_pause("uring");
+}

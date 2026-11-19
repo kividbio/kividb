@@ -1232,6 +1232,203 @@ impl Drop for Walk {
     }
 }
 
+// An `EXEC` and the scripts that run beside others (#882).
+//
+// An `EXEC` takes the command gate alone, so it waits for every script that
+// runs beside others: each holds the gate shared for as long as it runs.
+// Waiting for that inside the gate would hold the slots of the gate taken
+// already, and the other connections of every thread whose slot it held
+// would wait with it, for as long as the script ran. So an `EXEC` that
+// finds such a script running does not wait there: its connection waits
+// asleep for those scripts to end ([`scripts_beside_done`]), with what the
+// client sent behind it waiting behind it, and dispatches it again; and
+// while it waits, a script about to run beside others waits for it, asleep
+// too ([`run_beside_others`]), so that a stream of scripts does not keep
+// it out. What the scripts and the `EXEC` wait for here is only where they
+// wait: what keeps them apart is the gate.
+
+/// How many scripts are running beside others: counted before a script
+/// takes the command gate, and until it has let go of it.
+#[cfg(feature = "lua")]
+static BESIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Woken when the last script running beside others has ended while an
+/// `EXEC` waits.
+#[cfg(feature = "lua")]
+static BESIDE_ENDED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// How many `EXEC`s wait, asleep, for the scripts running beside others.
+#[cfg(feature = "lua")]
+static EXECS_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many `EXEC`s have started to wait, ever: for a script waiting for
+/// them to tell one from a stream of them ([`run_beside_others`]).
+#[cfg(feature = "lua")]
+static EXECS_STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Woken when the last `EXEC` waiting for scripts has stopped waiting.
+#[cfg(feature = "lua")]
+static EXECS_ENDED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// How many `EXEC`s may start to wait while a script waits for them, before
+/// it goes on regardless: see [`run_beside_others`].
+#[cfg(feature = "lua")]
+const EXEC_STREAM: usize = 3;
+
+/// How long an `EXEC` waits for a slot of the command gate at a time,
+/// inside the gate, before it looks whether a script running beside others
+/// is what it waits for ([`exec_alone`]).
+#[cfg(feature = "lua")]
+const EXEC_SLICE: Duration = Duration::from_millis(1);
+
+/// Held by a script that runs beside others for as long as it runs: it is
+/// counted in [`BESIDE`].
+#[cfg(feature = "lua")]
+pub struct RunningBeside(());
+
+#[cfg(feature = "lua")]
+impl RunningBeside {
+    #[inline]
+    fn count() -> Self {
+        BESIDE.fetch_add(1, Ordering::SeqCst);
+        RunningBeside(())
+    }
+}
+
+#[cfg(feature = "lua")]
+impl Drop for RunningBeside {
+    #[inline]
+    fn drop(&mut self) {
+        // Let go of, and then the `EXEC`s looked for: an `EXEC` says it
+        // waits and then looks at the count, so one of the two sees the
+        // other.
+        if BESIDE.fetch_sub(1, Ordering::SeqCst) == 1 && EXECS_WAITING.load(Ordering::SeqCst) != 0 {
+            BESIDE_ENDED.notify_waiters();
+        }
+    }
+}
+
+/// For a script about to run beside others, after its turns and the walks:
+/// count it among those running, unless an `EXEC` waits for them to end.
+/// Then it waits, asleep, until no `EXEC` waits, and is counted then. One
+/// count and one load when none waits.
+///
+/// Not for ever: a script that has seen more than [`EXEC_STREAM`] `EXEC`s
+/// start to wait while it waited goes on regardless, and an `EXEC` that
+/// comes then waits for it as it waits for the others.
+#[cfg(feature = "lua")]
+#[inline]
+pub async fn run_beside_others() -> RunningBeside {
+    let running = RunningBeside::count();
+    if EXECS_WAITING.load(Ordering::SeqCst) == 0 {
+        return running;
+    }
+    wait_for_execs(running).await
+}
+
+#[cfg(feature = "lua")]
+#[cold]
+async fn wait_for_execs(running: RunningBeside) -> RunningBeside {
+    let first = EXECS_STARTED.load(Ordering::SeqCst);
+    let stream = || EXECS_STARTED.load(Ordering::SeqCst).wrapping_sub(first) > EXEC_STREAM;
+    let mut running = Some(running);
+    loop {
+        if stream() {
+            break;
+        }
+        // Not counted while it waits: the `EXEC`s wait for the count.
+        drop(running.take());
+        let ended = EXECS_ENDED.notified();
+        tokio::pin!(ended);
+        // Enabled before the look: an `EXEC` that stops waiting after it
+        // wakes this one.
+        ended.as_mut().enable();
+        if EXECS_WAITING.load(Ordering::SeqCst) != 0 {
+            tokio::select! {
+                () = &mut ended => {}
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+        running = Some(RunningBeside::count());
+        if EXECS_WAITING.load(Ordering::SeqCst) == 0 {
+            break;
+        }
+    }
+    running.unwrap_or_else(RunningBeside::count)
+}
+
+/// Held by an `EXEC` that waits for the scripts running beside others, from
+/// its first look until it has run: counted in [`EXECS_WAITING`], which
+/// holds back the scripts that come meanwhile ([`run_beside_others`]).
+#[cfg(feature = "lua")]
+pub struct ExecWaits(());
+
+#[cfg(feature = "lua")]
+impl ExecWaits {
+    fn begin() -> Self {
+        EXECS_STARTED.fetch_add(1, Ordering::SeqCst);
+        EXECS_WAITING.fetch_add(1, Ordering::SeqCst);
+        ExecWaits(())
+    }
+}
+
+#[cfg(feature = "lua")]
+impl Drop for ExecWaits {
+    fn drop(&mut self) {
+        if EXECS_WAITING.fetch_sub(1, Ordering::SeqCst) == 1 {
+            EXECS_ENDED.notify_waiters();
+        }
+    }
+}
+
+/// The command gate alone, for an `EXEC`: taken at once, waiting only for
+/// the commands in flight, when no script runs beside others. Otherwise
+/// nothing is held, and the `EXEC` is to wait for them asleep
+/// ([`scripts_beside_done`]) holding the [`ExecWaits`] this returns, and
+/// to ask again with it; on success the `ExecWaits`, if any, is to be held
+/// until the `EXEC` has run. A script that starts as the `EXEC` takes the
+/// gate makes it let go of what it has taken within [`EXEC_SLICE`], and
+/// wait asleep.
+///
+/// With tag locks off, the gate alone, as it is taken there.
+#[cfg(feature = "lua")]
+pub fn exec_alone(
+    waits: Option<ExecWaits>,
+) -> Result<(crate::command_gate::AloneGuard, Option<ExecWaits>), ExecWaits> {
+    if !enabled() && waits.is_none() {
+        return Ok((crate::command_gate::enter_alone(), None));
+    }
+    if BESIDE.load(Ordering::SeqCst) == 0
+        && let Some(alone) = crate::command_gate::enter_alone_unless(EXEC_SLICE, || {
+            BESIDE.load(Ordering::SeqCst) != 0
+        })
+    {
+        return Ok((alone, waits));
+    }
+    Err(waits.unwrap_or_else(ExecWaits::begin))
+}
+
+/// For an `EXEC` that found scripts running beside others
+/// ([`exec_alone`]): wait, asleep, until none does. New ones wait for the
+/// `EXEC` meanwhile ([`run_beside_others`]), so the count comes to 0.
+#[cfg(feature = "lua")]
+pub async fn scripts_beside_done(_waits: &ExecWaits) {
+    loop {
+        let ended = BESIDE_ENDED.notified();
+        tokio::pin!(ended);
+        // Enabled before the look: the last script that ends after it
+        // wakes this.
+        ended.as_mut().enable();
+        if BESIDE.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        tokio::select! {
+            () = &mut ended => {}
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
+}
+
 /// Whether `cmd` is the command that switches this on or off. It is run
 /// with the command gate held alone.
 #[inline(always)]
@@ -2018,6 +2215,77 @@ mod tests {
             let took = ran.join().unwrap();
             stop.store(true, Ordering::Relaxed);
             assert!(took < Duration::from_secs(2), "{took:?}");
+        });
+    }
+
+    /// #882: an `EXEC` that finds a script running beside others takes
+    /// nothing and waits for it asleep; a script that comes meanwhile waits
+    /// for the `EXEC`, asleep too, and runs once it has run. A stream of
+    /// `EXEC`s does not keep a script out. (One test: the counts are the
+    /// process's.)
+    #[cfg(feature = "lua")]
+    #[test]
+    fn an_exec_and_the_scripts_beside_others_wait_for_each_other_asleep() {
+        use std::sync::mpsc::channel;
+        use std::time::Instant;
+        let runtime = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let running = runtime().block_on(run_beside_others());
+        let Err(waits) = exec_alone(Some(ExecWaits::begin())) else {
+            panic!("an EXEC took the gate beside a script running beside others")
+        };
+        assert!(!crate::command_gate::alone_on_this_thread());
+        // A script that comes now waits for the EXEC.
+        let (ran_tx, ran_rx) = channel();
+        let later = std::thread::spawn(move || {
+            let counted = runtime().block_on(run_beside_others());
+            ran_tx.send(Instant::now()).unwrap();
+            drop(counted);
+        });
+        assert!(ran_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        let exec = std::thread::spawn(move || {
+            runtime().block_on(scripts_beside_done(&waits));
+            let Ok((alone, waits)) = exec_alone(Some(waits)) else {
+                panic!("no script runs beside others, and the EXEC was turned away")
+            };
+            std::thread::sleep(Duration::from_millis(30));
+            let done = Instant::now();
+            drop(alone);
+            drop(waits);
+            done
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!exec.is_finished(), "the EXEC ran beside a running script");
+        drop(running);
+        let exec_done = exec.join().unwrap();
+        let later_ran = ran_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            later_ran >= exec_done,
+            "a script ran before the EXEC it came after"
+        );
+        later.join().unwrap();
+
+        // A stream of EXECs, each waiting before the last has stopped.
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        let waits = ExecWaits::begin();
+                        std::thread::sleep(Duration::from_millis(2));
+                        drop(waits);
+                    }
+                });
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            let started = Instant::now();
+            drop(runtime().block_on(run_beside_others()));
+            stop.store(true, Ordering::Relaxed);
+            assert!(started.elapsed() < Duration::from_secs(2));
         });
     }
 

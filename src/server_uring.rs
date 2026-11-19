@@ -347,6 +347,79 @@ fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
+/// What [`asleep_until`] needs of a connection.
+#[cfg(feature = "lua")]
+struct Asleep<'a> {
+    stream: &'a Rc<TcpStream>,
+    write_guard: &'a Rc<tokio::sync::Mutex<()>>,
+    out_buf: &'a mut Vec<u8>,
+    subscriptions: Option<&'a crate::pubsub::Subscriptions>,
+    watch: &'a PeerWatch,
+    carried: &'a mut Vec<u8>,
+    carried_from: usize,
+    held_elsewhere: usize,
+    activity: &'a crate::client_registry::Activity,
+    limit: crate::server::HardLimit,
+}
+
+/// For a command sent back to wait off its thread: send the replies before
+/// it, and then wait, asleep, for `until`, while what the client sends
+/// behind it waits behind it. Whether the client is still there is watched
+/// as a blocking command's wait watches it (`PeerWatch`): a kill shuts the
+/// socket. `None` if it went: nothing is to run for it. See
+/// `server::asleep_until`.
+#[cfg(feature = "lua")]
+async fn asleep_until<F: std::future::Future>(until: F, at: Asleep<'_>) -> Option<F::Output> {
+    let flushed = if at.out_buf.is_empty() {
+        true
+    } else {
+        let payload = std::mem::take(at.out_buf);
+        crate::stats::TOTAL_NET_OUTPUT_BYTES
+            .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::stats::record_write();
+        let _w = at.write_guard.lock().await;
+        let write = std::pin::pin!(at.stream.write_all(payload));
+        let (res, mut returned) = read_while_writing(
+            write,
+            at.watch,
+            crate::server::ReadAhead {
+                carried: at.carried,
+                carried_from: at.carried_from,
+                held_elsewhere: at.held_elsewhere,
+            },
+            at.activity,
+            at.limit,
+        )
+        .await;
+        drop(_w);
+        returned.clear();
+        *at.out_buf = returned;
+        res.is_ok()
+    };
+    if !flushed {
+        return None;
+    }
+    if let Some(subs) = at.subscriptions {
+        subs.flushed();
+    }
+    tokio::select! {
+        done = until => Some(done),
+        () = at.watch.gone() => None,
+    }
+}
+
+/// Wait, for an `EXEC` that found scripts running beside others
+/// (`tag_locks::exec_alone`), until none does, asleep: see
+/// `server::exec_waits_for_scripts`.
+#[cfg(feature = "lua")]
+async fn exec_waits_for_scripts(
+    waits: crate::tag_locks::ExecWaits,
+    at: Asleep<'_>,
+) -> Option<crate::tag_locks::ExecWaits> {
+    asleep_until(crate::tag_locks::scripts_beside_done(&waits), at).await?;
+    Some(waits)
+}
+
 /// Check if a command name (raw bytes, any case) requires connection-level
 /// handling that can't go through the normal execute_command path.
 /// Uses a first-byte filter so we never allocate a String on the fast path.
@@ -389,46 +462,24 @@ async fn park_blocking_uring(
     #[cfg(feature = "lua")]
     if let Some(busy) = wait.take_tags() {
         slot.held_by_pause();
-        let flushed = if out_buf.is_empty() {
-            true
-        } else {
-            let payload = std::mem::take(out_buf);
-            crate::stats::TOTAL_NET_OUTPUT_BYTES
-                .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            crate::stats::record_write();
-            let _w = write_guard.lock().await;
-            let write = std::pin::pin!(stream.write_all(payload));
-            let (res, mut returned) = read_while_writing(
-                write,
+        let turns = asleep_until(
+            crate::tag_locks::command_turns(&busy),
+            Asleep {
+                stream,
+                write_guard,
+                out_buf: &mut *out_buf,
+                subscriptions,
                 watch,
-                crate::server::ReadAhead {
-                    carried,
-                    carried_from,
-                    held_elsewhere,
-                },
+                carried: &mut *carried,
+                carried_from,
+                held_elsewhere,
                 activity,
                 limit,
-            )
-            .await;
-            drop(_w);
-            returned.clear();
-            *out_buf = returned;
-            res.is_ok()
-        };
-        if let Some(subs) = subscriptions.filter(|_| flushed) {
-            subs.flushed();
-        }
-        // Whether the client is still there is watched as a blocking
-        // command's wait watches it (`PeerWatch`): a kill shuts the socket.
-        let gone = !flushed
-            || tokio::select! {
-                turns = crate::tag_locks::command_turns(&busy) => {
-                    slot.hold_tag_turns(turns);
-                    false
-                }
-                () = watch.gone() => true,
-            };
-        if !gone {
+            },
+        )
+        .await;
+        if let Some(turns) = turns {
+            slot.hold_tag_turns(turns);
             return Ok(());
         }
         interrupted.gone = true;
@@ -1554,6 +1605,10 @@ pub async fn handle_client(
         // Outside the parse loop: a park in one turn hands its delivery to
         // the re-dispatch on the next turn.
         let mut blocking_slot = crate::commands::blocking::BlockingSlot::default();
+        // An `EXEC` that waited for scripts running beside others, for its
+        // dispatch again (`exec_waits_for_scripts`).
+        #[cfg(feature = "lua")]
+        let mut exec_waits: Option<crate::tag_locks::ExecWaits> = None;
         // What is due before the next command (`output_limits::REDISPATCH`,
         // `WATCH`). REDISPATCH: the next turn dispatches the command of this
         // one again: a parked command resumed, or a write a pause sent back
@@ -2432,6 +2487,10 @@ pub async fn handle_client(
                 }
 
                 "EXEC" => {
+                    // What it held while it waited for scripts, if it did:
+                    // held until it has run, or let go of if it does not.
+                    #[cfg(feature = "lua")]
+                    let waited = exec_waits.take();
                     // One watching transaction at a time, from its check to
                     // its last command. See `WATCHED_EXEC`.
                     let _one_at_a_time = if tx.active && !tx.watched_keys.is_empty() {
@@ -2519,7 +2578,58 @@ pub async fn handle_client(
                             let queued: Vec<&[u8]> = queued.iter().map(Vec::as_slice).collect();
                             crate::pause::test_stall_before_the_gate(&queued);
                         }
+                        #[cfg(not(feature = "lua"))]
                         let _alone = crate::command_gate::enter_alone();
+                        // A script running beside others holds the gate for
+                        // as long as it runs. Waited for here, the slots of
+                        // the gate taken already would hold every thread
+                        // they belong to: the connection waits for it
+                        // asleep instead, and the `EXEC` is dispatched
+                        // again, whole (#882).
+                        #[cfg(feature = "lua")]
+                        let (_alone, _waited) = match crate::tag_locks::exec_alone(waited) {
+                            Ok(taken) => taken,
+                            Err(waits) => {
+                                if std::mem::take(&mut aof_wait) {
+                                    crate::aof::written(&aof_tx).await;
+                                }
+                                let limit = crate::server::HardLimit::new(
+                                    pubsub.limits(),
+                                    subscriptions.is_some(),
+                                    out_buf.len() + carried.len() - carried_from + unpresented,
+                                    client_id,
+                                );
+                                match Box::pin(exec_waits_for_scripts(
+                                    waits,
+                                    Asleep {
+                                        stream: &stream,
+                                        write_guard: &write_guard,
+                                        out_buf: &mut out_buf,
+                                        subscriptions: subscriptions.as_ref(),
+                                        watch: &peer_watch,
+                                        carried: &mut carried,
+                                        carried_from,
+                                        held_elsewhere: parse_buf.len() - (parse_offset + consumed),
+                                        activity: &activity,
+                                        limit,
+                                    },
+                                ))
+                                .await
+                                {
+                                    Some(waits) => {
+                                        exec_waits = Some(waits);
+                                        due |= crate::output_limits::REDISPATCH;
+                                        continue;
+                                    }
+                                    None => {
+                                        // Gone: nothing runs, and nobody
+                                        // is there to answer.
+                                        quit_requested = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        };
                         // And as one write: a snapshot, a backup or a full sync cuts
                         // before it or after it, never between two of its commands
                         // (#148). The writes it runs are inside this one.
