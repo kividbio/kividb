@@ -1983,31 +1983,45 @@ impl HnswIndex {
     }
 
     /// `vector` (as the graph stores it; None: the key's vector is gone)
-    /// written to this graph as a compaction's copy in the making, under
-    /// the key's lock: what the copy then finds for the key is left alone.
+    /// written to this graph as a compaction's copy in the making: the key
+    /// is marked under its lock first, and what the copy then finds for it
+    /// is left alone. The write goes through this graph's backlog as any
+    /// other does, so a write made during a compaction links its vector
+    /// once in the write at most, not into both graphs.
     fn mirror(
         self: &Arc<Self>,
         key: &str,
-        vector: Option<Vec<f32>>,
+        vector: Option<Arc<[f32]>>,
         metric: &DistanceMetric,
         doc: u32,
     ) {
-        let _key = self.backlog.lock_key(key);
-        if let Some(touched) = self.touched.lock().as_mut() {
-            touched.insert(key.to_string());
-        }
-        match vector {
-            Some(v) => insert_unit(self, key.to_string(), v, metric, doc),
-            None => {
-                let node_id = self.key_to_id.write().remove(key);
-                if let Some(node_id) = node_id {
-                    let mut nodes = self.nodes.write();
-                    if nodes.get(node_id).is_some_and(|n| n.key == key) {
-                        self.delete(&mut nodes, node_id);
-                    }
-                }
+        {
+            let _key = self.backlog.lock_key(key);
+            if let Some(touched) = self.touched.lock().as_mut() {
+                touched.insert(key.to_string());
             }
         }
+        match vector {
+            Some(v) => backlog::write_one(self, key, v, metric, doc),
+            None => self.unlink(key),
+        }
+    }
+
+    /// Take `key` out of the graph, and a vector of its waiting in the
+    /// backlog once the graph no longer holds the key.
+    fn unlink(&self, key: &str) {
+        let _key = self.backlog.lock_key(key);
+        let seen = self.backlog.ticket(key);
+        let node_id = self.key_to_id.write().remove(key);
+        if let Some(node_id) = node_id {
+            let mut nodes = self.nodes.write();
+            if nodes.get(node_id).is_some_and(|n| n.key == key) {
+                self.delete(&mut nodes, node_id);
+            }
+        }
+        #[cfg(test)]
+        crate::test_hooks::at("unlink: deleted");
+        self.backlog.forget(key, seen);
     }
 
     /// Bytes the slots take: the vectors, layer-0 links and flags.
@@ -2653,18 +2667,7 @@ fn unindex_vector(live: &LiveIndex, key: &str) {
             idx.vectors.write().remove(key);
         }
         LiveIndex::Hnsw(idx) => {
-            {
-                let _key = idx.backlog.lock_key(key);
-                let seen = idx.backlog.ticket(key);
-                let node_id = idx.key_to_id.write().remove(key);
-                if let Some(node_id) = node_id {
-                    let mut nodes = idx.nodes.write();
-                    if nodes.get(node_id).is_some_and(|n| n.key == key) {
-                        idx.delete(&mut nodes, node_id);
-                    }
-                }
-                idx.backlog.forget(key, seen);
-            }
+            idx.unlink(key);
             if let Some(shadow) = idx.shadow() {
                 shadow.mirror(key, None, &DistanceMetric::L2, postings::NO_DOC);
             }
@@ -3857,16 +3860,15 @@ pub fn knn_hnsw(
     // what the graph holds for its key; the graph is asked for as many more
     // as may be left out for that.
     //
-    // The backlog is held for reading for the whole search: a helper that
-    // linked a key's waiting vector meanwhile would otherwise take it out
-    // of the backlog after the graph was searched with the key's previous
-    // node still in it, and that node would be kept.
-    if index.backlog.is_empty() {
-        return knn_graph(index, query, k, k, ef, metric);
-    }
-    let waiting = index.backlog.read();
+    // They are taken before the graph is searched, and the backlog is not
+    // held while it is (a write waits on it, and every later search behind
+    // that write): a helper that links a key's vector meanwhile takes it
+    // out of the backlog only after the graph has it, so a key the copy
+    // lacks is one the graph is right about (see `Backlog::snapshot`).
+    let waiting = index.backlog.snapshot();
+    #[cfg(test)]
+    crate::test_hooks::at("knn: backlog taken");
     if waiting.is_empty() {
-        drop(waiting);
         return knn_graph(index, query, k, k, ef, metric);
     }
     let found = knn_graph(index, query, k, k.saturating_add(waiting.len()), ef, metric);
@@ -3979,13 +3981,12 @@ pub fn knn_hnsw_admitting(
     budget: usize,
     deadline: Option<std::time::Instant>,
 ) -> Option<(Vec<KnnResult>, bool)> {
-    // As in `knn_hnsw`: the backlog's vectors let in are measured too.
-    if index.backlog.is_empty() {
-        return admitting_graph(index, query, k, k, ef, metric, admit, budget, deadline);
-    }
-    let waiting = index.backlog.read();
+    // As in `knn_hnsw`: the backlog's vectors let in are measured too,
+    // taken before the walk, which a filter that lets few in makes long.
+    let waiting = index.backlog.snapshot();
+    #[cfg(test)]
+    crate::test_hooks::at("knn: backlog taken");
     if waiting.is_empty() {
-        drop(waiting);
         return admitting_graph(index, query, k, k, ef, metric, admit, budget, deadline);
     }
     let (found, cut) = admitting_graph(
@@ -4279,7 +4280,7 @@ pub fn compact_hnsw(
             .backlog
             .read()
             .iter()
-            .map(|(k, w)| (k.clone(), w.vector.to_vec()))
+            .map(|(k, w)| (k.to_string(), w.vector.to_vec()))
             .collect();
         let nodes = old_arc.nodes.read();
         let mut pairs: Vec<(String, Vec<f32>)> = nodes
@@ -4311,27 +4312,29 @@ pub fn compact_hnsw(
 
     // ── Step 3: swap into the named slot in `indexes` ─────────────────────
     // The old graph keeps its shadow: a write that found the old graph
-    // before the swap still reaches the new one.
-    {
+    // before the swap still reaches the new one. When the old graph is not
+    // the index's any more, the new one is let go at once.
+    let swapped = {
         let mut store = index_store.write();
-        let def = match store.get_mut(index_name) {
-            Some(d) => d,
-            None => return Err("index dropped during compaction"),
-        };
-        match def.indexes.get(field_name) {
-            Some(LiveIndex::Hnsw(current)) => {
-                if !Arc::ptr_eq(current, &old_arc) {
-                    return Err("index was replaced during compaction");
+        match store.get_mut(index_name) {
+            None => Err("index dropped during compaction"),
+            Some(def) => match def.indexes.get(field_name) {
+                Some(LiveIndex::Hnsw(current)) if Arc::ptr_eq(current, &old_arc) => {
+                    def.indexes.insert(
+                        field_name.to_string(),
+                        LiveIndex::Hnsw(Arc::clone(&new_index)),
+                    );
+                    Ok(())
                 }
-            }
-            _ => return Err("field changed type during compaction"),
+                Some(LiveIndex::Hnsw(_)) => Err("index was replaced during compaction"),
+                _ => Err("field changed type during compaction"),
+            },
         }
-        def.indexes.insert(
-            field_name.to_string(),
-            LiveIndex::Hnsw(Arc::clone(&new_index)),
-        );
+    };
+    if swapped.is_err() {
+        *old_arc.shadow.lock() = None;
     }
-    Ok(copied)
+    swapped.map(|()| copied)
 }
 
 /// Spawn the dedicated compaction worker thread.

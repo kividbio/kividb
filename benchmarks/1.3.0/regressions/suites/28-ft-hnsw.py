@@ -28,20 +28,45 @@ rate); KNN q/s within 10 %;
 recall@10 not more than 2 % under recorded (it moves with the graph, which
 parallel linking builds in another order each run); peak RSS growth a document
 within 5 %.
+
+`beside`: what the helpers cost the rest of a busy server. Of the first four
+CPUs this process may use, the server on the first and third (separate cores
+on a D4s_v5), `--threads 2`; memtier_benchmark (GET/SET 1:1, 1 thread, 20
+connections, 100,000 keys of 64 bytes) on the second; the loading client
+and a KNN probe (`EF_RUNTIME 100`, one query at a time), separate processes,
+on the fourth. 20,000 documents first, then for 20 s, three times: the load
+writes on, memtier runs, the probe searches. Gated: GET/SET p99 beside the
+build and the probe's KNN p50 beside the ingest, each within its recorded
+value and at most a fixed factor of v1.2.2's in the same session (1.2.2
+links each vector in the write, on the writing connection's worker, so its
+GET/SET p99 is that of a worker busy with one long command at a time; the
+candidate's helpers run at the lowest priority beside the workers).
+Documents ingested a second and GET/SET a second are recorded.
+Needs memtier_benchmark (`$MEMTIER`, else on PATH).
 """
+import multiprocessing
 import os
+import json
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from suite import Suite, Config, KEEP_IMPROVEMENT, rel, vs_redis, info, scaled, median  # noqa: E402
+from suite import (  # noqa: E402
+    Suite, Config, KEEP_IMPROVEMENT, rel, vs_redis, vs_v1_2_2, info, jitter, scaled, median)
 from nodes import Nodes  # noqa: E402
 from rss import vmrss_mib  # noqa: E402
 
 MODULE = os.environ.get("REGRESS_REDISEARCH_SO", "")
 ENGINES = ("v1_2_2", "candidate") + (("redis",) if MODULE else ())
-S = Suite("28-ft-hnsw", [Config("pipeline", engines=ENGINES, self_hosted=True)])
+S = Suite("28-ft-hnsw", [Config("pipeline", threads=4, engines=ENGINES, self_hosted=True),
+                         Config("beside", threads=2, engines=ENGINES, self_hosted=True)])
 DIM, M, EFC, EF, BATCH = 384, 16, 200, 100, 1000
+BESIDE_S, ROUNDS = 20, 3
+# The candidate at most this many times v1.2.2's value in the same session.
+BESIDE_P99_X, BESIDE_KNN_X = 4.0, 3.0
 
 
 def field(info_reply, name):
@@ -79,6 +104,144 @@ def waiting(c, kind):
 
 @S.run
 def run(ctx):
+    if ctx.config.name == "beside":
+        return beside(ctx)
+    return pipeline(ctx)
+
+
+def create(c):
+    c.execute_command("FT.CREATE", "idx", "ON", "HASH", "PREFIX", "1", "doc:", "SCHEMA",
+                      "score", "NUMERIC", "v", "VECTOR", "HNSW", "10", "TYPE", "FLOAT32",
+                      "DIM", DIM, "DISTANCE_METRIC", "COSINE", "M", M, "EF_CONSTRUCTION", EFC)
+
+
+def cpus():
+    """Server, memtier and clients CPUs, of the first four this process may use:
+    the server on the first and third (separate cores on a D4s_v5, whose CPUs
+    0-1 and 2-3 are the two hyper-threads of a core)."""
+    have = sorted(os.sched_getaffinity(0))
+    if len(have) < 4:
+        raise RuntimeError("28-ft-hnsw/beside needs 4 CPUs, this process may use %d" % len(have))
+    return [have[0], have[2]], [have[1]], [have[3]]
+
+
+def pin(pid, which):
+    """Every thread of `pid` onto `which`; threads it starts later inherit it."""
+    for tid in os.listdir("/proc/%d/task" % pid):
+        os.sched_setaffinity(int(tid), which)
+
+
+def memtier_bin():
+    for p in (os.environ.get("MEMTIER", ""), shutil.which("memtier_benchmark") or ""):
+        if p and os.access(p, os.X_OK):
+            return p
+    raise RuntimeError("memtier_benchmark not found ($MEMTIER or PATH)")
+
+
+def ingest_proc(port, cpu, first, seconds, out):
+    """The loading client: HSET pipelines of BATCH new documents for `seconds`."""
+    import numpy as np
+    import redis
+    os.sched_setaffinity(0, cpu)
+    c = redis.Redis(host="127.0.0.1", port=port, socket_timeout=600)
+    rng = np.random.default_rng(first)
+    n = 0
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < seconds:
+        vecs = rng.random((BATCH, DIM), dtype=np.float32)
+        p = c.pipeline(transaction=False)
+        for i in range(BATCH):
+            p.hset("doc:%d" % (first + n + i), mapping={"v": vecs[i].tobytes(), "score": i % 101})
+        p.execute()
+        n += BATCH
+    out.put({"docs": n, "s": time.perf_counter() - t0})
+
+
+def probe_proc(port, cpu, seconds, out):
+    """One query at a time, KNN 10 at EF_RUNTIME EF: the latency of each."""
+    import numpy as np
+    import redis
+    os.sched_setaffinity(0, cpu)
+    c = redis.Redis(host="127.0.0.1", port=port, socket_timeout=600)
+    blobs = [x.tobytes() for x in np.random.default_rng(761).random((300, DIM), dtype=np.float32)]
+    q = "*=>[KNN 10 @v $vec EF_RUNTIME %d]" % EF
+    lat = []
+    t0 = time.perf_counter()
+    i = 0
+    while time.perf_counter() - t0 < seconds:
+        t = time.perf_counter()
+        c.execute_command("FT.SEARCH", "idx", q, "PARAMS", "2", "vec", blobs[i % 300],
+                          "NOCONTENT", "LIMIT", "0", "10", "DIALECT", "2")
+        lat.append((time.perf_counter() - t) * 1000)
+        i += 1
+    out.put(lat)
+
+
+def beside(ctx):
+    import numpy as np
+    args = ("--loadmodule", MODULE) if ctx.kind == "redis" else ()
+    srv, mt_cpu, cl_cpu = cpus()
+    mt = memtier_bin()
+    with Nodes(ctx) as ns:
+        node = ns.start(args=args)
+        # Before the first vector: the helpers start then, on these CPUs.
+        pin(node.pid, srv)
+        ctx.raw["cpus"] = {"server": srv, "memtier": mt_cpu, "clients": cl_cpu}
+        c = node.client(protocol=2)
+        create(c)
+        pre = scaled(20_000)
+        vecs = np.random.default_rng(760).random((pre, DIM), dtype=np.float32)
+        for s in range(0, pre, BATCH):
+            p = c.pipeline(transaction=False)
+            for i in range(s, min(pre, s + BATCH)):
+                p.hset("doc:%d" % i, mapping={"v": vecs[i].tobytes(), "score": i % 101})
+            p.execute()
+        deadline = time.time() + 900
+        while waiting(c, ctx.kind) != 0 or int(field(c.execute_command("FT.INFO", "idx"), "num_docs")) < pre:
+            if time.time() > deadline:
+                raise RuntimeError("the first documents were not indexed in 900 s")
+            time.sleep(0.02)
+        c.execute_command("DEBUG", "POPULATE", "100000", "key", "64")
+        seconds = max(4, int(BESIDE_S * min(1.0, float(os.environ.get("SCALE", "1") or 1)) or 4))
+        p99s, ops, p50s, docs = [], [], [], []
+        first = pre
+        mp = multiprocessing.get_context("spawn")
+        for _ in range(ROUNDS):
+            q_in, q_kn = mp.Queue(), mp.Queue()
+            ing = mp.Process(target=ingest_proc, args=(node.port, cl_cpu, first, seconds, q_in))
+            prb = mp.Process(target=probe_proc, args=(node.port, cl_cpu, seconds, q_kn))
+            with tempfile.TemporaryDirectory() as tmp:
+                js = os.path.join(tmp, "memtier.json")
+                m = subprocess.Popen(["taskset", "-c", ",".join(map(str, mt_cpu)), mt, "-s", "127.0.0.1",
+                                      "-p", str(node.port), "--protocol=redis", "-t", "1", "-c", "20",
+                                      "--ratio", "1:1", "--key-pattern", "R:R", "--key-prefix", "key:",
+                                      "--key-maximum", "100000", "-d", "64", "--test-time", str(seconds),
+                                      "--hide-histogram", "--json-out-file", js],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                ing.start()
+                prb.start()
+                got_in, lat = q_in.get(timeout=seconds + 600), q_kn.get(timeout=seconds + 600)
+                ing.join()
+                prb.join()
+                _, err = m.communicate(timeout=seconds + 120)
+                if m.returncode != 0:
+                    raise RuntimeError("memtier_benchmark exited %d: %s" % (m.returncode, err[-500:]))
+                tot = json.load(open(js))["ALL STATS"]["Totals"]
+            first += got_in["docs"]
+            docs.append(got_in["docs"] / got_in["s"])
+            ops.append(tot["Ops/sec"])
+            p99s.append(tot["Percentile Latencies"]["p99.00"])
+            lat.sort()
+            p50s.append(lat[len(lat) // 2])
+        ctx.emit("getset_p99_ms_beside_build", median(p99s), "ms", "lower",
+                 gate=jitter([rel(50, abs=0.5), vs_v1_2_2(BESIDE_P99_X)]), samples=p99s)
+        ctx.emit("knn_p50_ms_beside_ingest", median(p50s), "ms", "lower",
+                 gate=jitter([rel(30, abs=0.2), vs_v1_2_2(BESIDE_KNN_X)]), samples=p50s)
+        ctx.emit("getset_ops_beside_build", median(ops), "ops/s", "higher", gate=info(), samples=ops)
+        ctx.emit("ingest_docs_per_s_beside", median(docs), "docs/s", "higher", gate=info(), samples=docs)
+
+
+def pipeline(ctx):
     import numpy as np
     args = ("--loadmodule", MODULE) if ctx.kind == "redis" else ()
     with Nodes(ctx) as ns:

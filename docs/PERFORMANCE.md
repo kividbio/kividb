@@ -387,6 +387,22 @@ the CPUs, as `SCHED_IDLE`. A 1,536-d KNN beside the same kind of load takes
 1.7 ms at the median against 0.8 ms (the helpers share the cores); Redis
 8.10.2 takes 10.4 ms beside its own load, against 0.9 idle.
 
+With every CPU of the server busy (the server on 4 vCPUs with `--threads 4`,
+memtier GET/SET 1:1 from 50 connections on 2 others, one client loading
+384-d vectors, a KNN probe at `EF_RUNTIME 100` and one `HSET` into the index
+every 2 ms, 40 s, 3 runs) the backlog stays at its limit and the writes link
+their vectors themselves, as in 1.2; the helpers still take some of the CPU
+time. GET/SET p99 was 3.2 ms and the `HSET` probe's p99 6.5 ms, against
+0.8-1.5 and 2.0 ms with every vector linked in its write; the KNN probe's
+median 0.9 ms against 0.7-0.8. The helpers as `SCHED_BATCH` at nice 19 gave
+3.8-4.8 and 7.0 ms, at nice 19 alone 4.0-4.8 and 7.9 ms, and the build
+alone was no faster for it (3,960-4,030 documents a second on those 4 vCPUs
+each way, 1,710 linked in the writes); hence `SCHED_IDLE`. In about one run
+in three of every build (1.2's way included) the probe's median was near
+30 ms instead, the same with every build: by all signs its connection was
+on the loading client's worker, behind that client's pipelines. Those runs
+are left out above.
+
 Left: 64-d documents build at 0.62x Redis's rate. Per document the helpers
 spend 23 % more CPU than one thread linking alone (93.6 against 77.2 CPU
 seconds for 200,000): no lock shows in the profile (`search_layer` 57 %,

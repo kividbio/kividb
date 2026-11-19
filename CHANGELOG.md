@@ -380,7 +380,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **An HNSW index is built 4x faster from one client (#760).** A vector
   written to an HNSW index is put in its graph's backlog and linked by
-  helper threads (half the CPUs the server may use, `SCHED_IDLE` on Linux),
+  helper threads (half the CPUs the server may use, within a CPU quota,
+  `SCHED_IDLE` on Linux),
   where up to 1.2 the writing connection's thread linked it inside the
   write: one client loading documents built the graph on one CPU. A search
   measures every vector of the backlog exactly beside the graph's, so a
@@ -397,7 +398,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   7,442; peak RSS 215 / 218 / 248 MiB. Recall at a given `EF_RUNTIME` is
   unchanged, fresh and after rounds of overwrites and deletes. GET/SET from
   other clients during such a load: 144k a second at a p99 of 1.08 ms
-  (before: 137k, 0.39 ms, p99.9 25 against 11.6 ms). Unfiltered KNN was
+  (before: 137k, 0.39 ms, p99.9 25 against 11.6 ms); with every server CPU
+  busy the backlog stays full and the writes link their vectors themselves,
+  as in 1.2, at a GET/SET p99 of 3.2 ms against 0.8-1.5 ms. A search takes
+  the backlog's vectors before it walks the graph and does not hold the
+  backlog meanwhile, so a long filtered search keeps no write waiting.
+  Writes over a waiting key queue no more work for the helpers, and a
+  dropped or compacted graph is freed at once. Unfiltered KNN was
   never slower than Redis at the same recall: a KNN looks at at least 50
   candidates, so the default `EF_RUNTIME 10` gives recall 0.38 at 2,844 q/s
   where Redis gives 0.11 at 4,276 and 0.42 at 2,006 (`EF_RUNTIME 80`); see
@@ -949,10 +956,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for no reason, which is what opened that window: Redis's unit/pause
   failed on it now and then.
 
-- **The catch-up pass of an HNSW compaction takes a key's newer vector.**
+- **Writes made during an HNSW compaction are kept in the rebuilt graph.**
   Writes made while a compaction rebuilds a graph now go to the new graph
   too, from before the copy, and the copy leaves a key a write touched as
-  the write left it.
+  the write left it. Such a write goes through each graph's backlog, as
+  any other does, instead of being linked into both graphs inside the
+  write.
 
 - **Sorted-set commands read integers as Redis does.** `ZREMRANGEBYRANK
   key x 5` took `x` as 0 and removed members; it now answers `ERR value is

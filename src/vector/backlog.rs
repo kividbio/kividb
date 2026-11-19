@@ -42,7 +42,7 @@ use super::{DistanceMetric, HnswIndex, HnswNode, KnnResult, distance_prenorm};
 use ahash::AHashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 /// The most vectors a graph's backlog holds.
@@ -77,15 +77,28 @@ pub struct Waiting {
     pub vector: Arc<[f32]>,
     /// The document's id in the index's postings, or `postings::NO_DOC`.
     pub doc: u32,
+    /// A job for the key is in the helpers' queue and has not taken the
+    /// vector yet: a later write of the key leaves the job to take its
+    /// vector instead of queueing another.
+    queued: bool,
 }
+
+/// The vectors that waited when a search began ([`Backlog::snapshot`]):
+/// key, vector as the graph stores it, document id.
+pub(crate) type Snapshot = Vec<(Arc<str>, Arc<[f32]>, u32)>;
 
 /// One graph's vectors waiting to be linked, by key.
 pub struct Backlog {
-    waiting: parking_lot::RwLock<AHashMap<String, Waiting>>,
+    waiting: parking_lot::RwLock<AHashMap<Arc<str>, Waiting>>,
     /// How many there are, read without the lock.
     len: AtomicUsize,
+    /// Jobs of this graph in the helpers' queue (taken or not).
+    jobs: AtomicUsize,
     tickets: AtomicU64,
     keys: Box<[parking_lot::Mutex<()>]>,
+    /// The helpers leave this graph's jobs alone ([`Backlog::hold`]).
+    #[cfg(test)]
+    held: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Backlog {
@@ -93,6 +106,9 @@ impl Default for Backlog {
         Self {
             waiting: parking_lot::RwLock::new(AHashMap::new()),
             len: AtomicUsize::new(0),
+            jobs: AtomicUsize::new(0),
+            #[cfg(test)]
+            held: std::sync::atomic::AtomicBool::new(false),
             tickets: AtomicU64::new(0),
             keys: (0..KEY_LOCKS)
                 .map(|_| parking_lot::Mutex::new(()))
@@ -119,17 +135,25 @@ impl Backlog {
         self.len() == 0
     }
 
+    /// Jobs of this graph in the helpers' queue: at most one per waiting
+    /// key, plus those a write that linked its own vector left behind.
+    pub fn queued(&self) -> usize {
+        self.jobs.load(Acquire)
+    }
+
     /// Bytes the waiting vectors hold (their keys and floats, and the map's
-    /// entries): allocated, so counted in `used_memory` too.
+    /// entries) and this graph's jobs in the helpers' queue: allocated, so
+    /// counted in `used_memory` too.
     pub fn bytes(&self) -> usize {
+        let jobs = self.queued() * std::mem::size_of::<Job>();
         if self.is_empty() {
-            return 0;
+            return jobs;
         }
         let waiting = self.waiting.read();
-        waiting.capacity() * (std::mem::size_of::<(String, Waiting)>() + 1)
+        jobs + waiting.capacity() * (std::mem::size_of::<(Arc<str>, Waiting)>() + 1)
             + waiting
                 .iter()
-                .map(|(k, w)| k.capacity() + w.vector.len() * 4 + 16)
+                .map(|(k, w)| k.len() + 16 + w.vector.len() * 4 + 16)
                 .sum::<usize>()
     }
 
@@ -144,9 +168,31 @@ impl Backlog {
         self.keys[(h as usize) % KEY_LOCKS].lock()
     }
 
-    /// The waiting vectors, held for reading.
-    pub(crate) fn read(&self) -> parking_lot::RwLockReadGuard<'_, AHashMap<String, Waiting>> {
+    /// The waiting vectors, held for reading: only for as long as it takes
+    /// to look a few keys up, never across a search of the graph (a write
+    /// waits on it, and so then does every later search).
+    pub(crate) fn read(&self) -> parking_lot::RwLockReadGuard<'_, AHashMap<Arc<str>, Waiting>> {
         self.waiting.read()
+    }
+
+    /// Every waiting vector, by reference count: taken by a search before
+    /// it searches the graph, so that the backlog is not held meanwhile.
+    ///
+    /// A key in it is measured as it waited, and what the graph finds for
+    /// it is left out. A key that waited and is not in it any more had its
+    /// vector linked or was deleted before the snapshot (`done`/`forget`
+    /// take a vector out only after the graph has the change), so the graph
+    /// is right about it; one written after the snapshot is a write the
+    /// search may miss, having begun before it.
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        let waiting = self.waiting.read();
+        waiting
+            .iter()
+            .map(|(k, w)| (Arc::clone(k), Arc::clone(&w.vector), w.doc))
+            .collect()
     }
 
     /// `f` of the vector waiting for `key`, if one does.
@@ -163,20 +209,36 @@ impl Backlog {
     }
 
     /// Put `vector` in for `key`, in place of one that waited: its ticket,
-    /// and how many wait now.
-    fn put(&self, key: &str, vector: Arc<[f32]>, doc: u32) -> (u64, usize) {
+    /// how many wait now, and whether a job is to be queued for it (none is
+    /// when one already is and has not taken the vector it waited for: it
+    /// takes this one). The key (an `Arc`) is for that job.
+    fn put(&self, key: &str, vector: Arc<[f32]>, doc: u32) -> (u64, usize, Option<Arc<str>>) {
         let ticket = self.tickets.fetch_add(1, Relaxed);
         let mut waiting = self.waiting.write();
-        waiting.insert(
-            key.to_string(),
-            Waiting {
-                ticket,
-                vector,
-                doc,
-            },
-        );
+        let job = if let Some(w) = waiting.get_mut(key) {
+            w.ticket = ticket;
+            w.vector = vector;
+            w.doc = doc;
+            if std::mem::replace(&mut w.queued, true) {
+                None
+            } else {
+                waiting.get_key_value(key).map(|(k, _)| Arc::clone(k))
+            }
+        } else {
+            let k: Arc<str> = Arc::from(key);
+            waiting.insert(
+                Arc::clone(&k),
+                Waiting {
+                    ticket,
+                    vector,
+                    doc,
+                    queued: true,
+                },
+            );
+            Some(k)
+        };
         self.len.store(waiting.len(), Release);
-        (ticket, waiting.len())
+        (ticket, waiting.len(), job)
     }
 
     /// The vector of `key` if `ticket` is still its own.
@@ -184,6 +246,17 @@ impl Backlog {
         let waiting = self.waiting.read();
         let w = waiting.get(key).filter(|w| w.ticket == ticket)?;
         Some((Arc::clone(&w.vector), w.doc))
+    }
+
+    /// A queued job of `key` takes the key's latest vector: its ticket,
+    /// vector and document id, if the vector still waits for the job (a
+    /// write that linked its own may have taken it out). A write of the key
+    /// after this queues a job of its own.
+    fn take(&self, key: &str) -> Option<(u64, Arc<[f32]>, u32)> {
+        let mut waiting = self.waiting.write();
+        let w = waiting.get_mut(key).filter(|w| w.queued)?;
+        w.queued = false;
+        Some((w.ticket, Arc::clone(&w.vector), w.doc))
     }
 
     /// Take `key`'s vector out if `ticket` is still its own: it is linked.
@@ -231,23 +304,25 @@ pub(crate) fn write(
     if let Some(shadow) = index.shadow()
         && index.slots().is_some_and(|s| s.dim() == stored.len())
     {
-        shadow.mirror(key, Some(stored.to_vec()), metric, doc);
+        shadow.mirror(key, Some(stored), metric, doc);
     }
 }
 
 /// [`write`] to `index` alone, `vector` as the graph stores it.
-fn write_one(
+///
+/// A compaction going on changes nothing here: it copies the waiting
+/// vectors with the graph's, and every write made once it began reaches
+/// the new graph too ([`HnswIndex::mirror`]).
+pub(super) fn write_one(
     index: &Arc<HnswIndex>,
     key: &str,
     vector: Arc<[f32]>,
     metric: &DistanceMetric,
     doc: u32,
 ) {
-    // The first vector makes the slots (and sets the dimension); a
-    // compaction copies the graph and must not miss a vector that waits.
+    // The first vector makes the slots (and sets the dimension).
     let here = index.slots().is_none_or(|s| s.dim() != vector.len())
         || index.live_count.load(Relaxed) < HERE_BELOW
-        || index.compaction_in_progress.load(Acquire)
         || helpers() == 0;
     if here {
         let _key = index.backlog.lock_key(key);
@@ -257,38 +332,69 @@ fn write_one(
         return;
     }
     let most = limit(vector.len());
-    let (ticket, waiting) = index.backlog.put(key, vector, doc);
-    if waiting > most {
-        link(index, key, ticket, metric);
+    let (ticket, waiting, job) = index.backlog.put(key, vector, doc);
+    // A full backlog, or a queue of this graph's jobs twice that long (left
+    // behind by writes that linked their own vectors while the helpers had
+    // no CPU time): the write links its vector itself.
+    if waiting > most || (job.is_some() && index.backlog.queued() >= 2 * most) {
+        link_own(index, key, ticket, metric);
         return;
     }
+    let Some(key) = job else {
+        return; // the key's queued job takes this vector
+    };
+    index.backlog.jobs.fetch_add(1, AcqRel);
     let mut jobs = POOL.jobs.lock();
     jobs.push_back(Job {
-        index: Arc::clone(index),
-        key: key.to_string(),
-        ticket,
+        index: Arc::downgrade(index),
+        key,
         metric: metric.clone(),
     });
     drop(jobs);
     POOL.ready.notify_one();
 }
 
-/// Link `key`'s waiting vector into the graph if `ticket` is still its own.
-fn link(index: &Arc<HnswIndex>, key: &str, ticket: u64, metric: &DistanceMetric) {
+/// Link `key`'s waiting vector into the graph if `ticket` is still its own:
+/// a write that found the backlog full links its own vector.
+fn link_own(index: &Arc<HnswIndex>, key: &str, ticket: u64, metric: &DistanceMetric) {
     let _key = index.backlog.lock_key(key);
     let Some((vector, doc)) = index.backlog.current(key, ticket) else {
         return;
     };
+    insert_then_done(index, key, ticket, vector, metric, doc);
+}
+
+/// A helper's job: link the latest vector of `key`, if one still waits for
+/// a job.
+fn link_queued(index: &Arc<HnswIndex>, key: &str, metric: &DistanceMetric) {
+    let _key = index.backlog.lock_key(key);
+    let Some((ticket, vector, doc)) = index.backlog.take(key) else {
+        return;
+    };
+    insert_then_done(index, key, ticket, vector, metric, doc);
+}
+
+fn insert_then_done(
+    index: &Arc<HnswIndex>,
+    key: &str,
+    ticket: u64,
+    vector: Arc<[f32]>,
+    metric: &DistanceMetric,
+    doc: u32,
+) {
     super::insert_unit(index, key.to_string(), vector.to_vec(), metric, doc);
+    #[cfg(test)]
+    crate::test_hooks::at("backlog: linked");
     index.backlog.done(key, ticket);
 }
 
 /// The `k` nearest of `found` (the graph's, nearest first) and the
-/// backlog's vectors (those `admit` lets in, if given): a key whose vector
-/// waits is measured where it waits, and what the graph found for it is
-/// left out. `query` is as the graph holds vectors.
+/// vectors of `waiting` (those `admit` lets in, if given), taken before
+/// the graph was searched: a key that waited is measured as it waited, and
+/// what the graph found for it is left out. `query` is as the graph holds
+/// vectors.
 pub(crate) fn merge(
-    waiting: &AHashMap<String, Waiting>,
+    waiting: &Snapshot,
     query: &[f32],
     metric: &DistanceMetric,
     mut found: Vec<KnnResult>,
@@ -299,27 +405,30 @@ pub(crate) fn merge(
         found.truncate(k);
         return found;
     }
-    found.retain(|hit| !waiting.contains_key(&hit.key));
+    {
+        let keys: ahash::AHashSet<&str> = waiting.iter().map(|(k, _, _)| &**k).collect();
+        found.retain(|hit| !keys.contains(hit.key.as_str()));
+    }
     found.truncate(k);
     // The nearest k of the waiting ones, by reference; keys are copied only
     // for those kept.
     let mut near: Vec<(f32, &str)> = Vec::with_capacity(k.min(waiting.len()) + 1);
     let mut bound = f32::INFINITY;
-    for (key, w) in waiting.iter() {
-        if w.vector.len() != query.len() {
+    for (key, vector, doc) in waiting.iter() {
+        if vector.len() != query.len() {
             continue;
         }
-        let d = distance_prenorm(metric, query, &w.vector);
+        let d = distance_prenorm(metric, query, vector);
         if near.len() >= k && d.total_cmp(&bound).is_ge() {
             continue;
         }
         if let Some(admit) = admit.as_mut() {
-            let node = HnswNode::new(key.clone(), 0, Vec::new(), w.doc);
+            let node = HnswNode::new(key.to_string(), 0, Vec::new(), *doc);
             if !admit(&node) {
                 continue;
             }
         }
-        near.push((d, key.as_str()));
+        near.push((d, key));
         if near.len() > k {
             near.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
             near.truncate(k);
@@ -339,10 +448,12 @@ pub(crate) fn merge(
 
 // ── The helpers ──────────────────────────────────────────────────────────────
 
+/// A key of a graph to link. Weak: a graph dropped (`FT.DROPINDEX`,
+/// `FLUSHALL`) or replaced by a compaction is freed at once, not when the
+/// helpers get to its jobs, which then find nothing to do.
 struct Job {
-    index: Arc<HnswIndex>,
-    key: String,
-    ticket: u64,
+    index: std::sync::Weak<HnswIndex>,
+    key: Arc<str>,
     metric: DistanceMetric,
 }
 
@@ -369,13 +480,14 @@ static START: std::sync::Once = std::sync::Once::new();
 /// (GET/SET 1:1, 40 connections) on the other 2, while one client loaded
 /// 150,000 384-d vectors (medians of 3): one helper per CPU took GET/SET
 /// from 137k a second (1.2.2's way, the vectors linked in the writes) to
-/// 112k, p99 0.39 to 3.7 ms; half as many, run as `SCHED_IDLE`, served 144k
-/// at a p99 of 1.08 ms (p99.9 11.6 ms against 25 ms), and built the index
-/// in 41 s against 36 s with all of them and 130 s in the writes.
+/// 112k, p99 0.39 to 3.7 ms; half as many served 144k at a p99 of 1.08 ms
+/// (p99.9 11.6 ms against 25 ms), and built the index in 41 s against 36 s
+/// with all of them and 130 s in the writes.
 fn helpers() -> usize {
     START.call_once(|| {
         // The process's CPUs: the first write may come from a worker bound
         // to one (`worker-cpu-affinity`), and std would see only that one.
+        // A CPU quota (a container's `--cpus`) counts too.
         let cpus = crate::cpus::available_parallelism().map_or(1, |n| n.get());
         let want = (cpus / 2).max(1);
         let mut started = 0;
@@ -394,17 +506,7 @@ fn helpers() -> usize {
 }
 
 fn helper() {
-    // Only on CPU time the workers leave: a server busy serving links the
-    // vectors in the writes again (the backlog fills, and a writer that finds
-    // it full links its own), as 1.2 did. `nice 10` instead measured a p99
-    // of 1.4-1.9 ms beside the helpers.
-    #[cfg(target_os = "linux")]
-    {
-        let param = libc::sched_param { sched_priority: 0 };
-        // SAFETY: changes this thread's own scheduling policy only; a
-        // failure leaves it as it was.
-        unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &param) };
-    }
+    lower_priority();
     loop {
         let job = {
             let mut jobs = POOL.jobs.lock();
@@ -415,14 +517,70 @@ fn helper() {
                 POOL.ready.wait(&mut jobs);
             }
         };
+        let Some(index) = job.index.upgrade() else {
+            continue; // the graph is gone
+        };
+        #[cfg(test)]
+        if index.backlog.held.load(Acquire) {
+            HELD.lock().push(job);
+            continue;
+        }
         // A panic would leave the vector waiting, where searches still
         // measure it, and the helper gone: it is caught, and the helper
         // goes on to the next.
         let linked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            link(&job.index, &job.key, job.ticket, &job.metric)
+            link_queued(&index, &job.key, &job.metric)
         }));
+        index.backlog.jobs.fetch_sub(1, AcqRel);
         if linked.is_err() {
             crate::log_warn!("an HNSW insert failed in a helper thread");
+        }
+    }
+}
+
+/// The helpers run on the CPU time the workers leave them: a server busy
+/// serving links the vectors in the writes again (the backlog fills, and a
+/// writer that finds it full links its own), as 1.2 did.
+///
+/// A helper holds locks a worker may want (the key's, the graph's nodes for
+/// writing while it links, the queue's, the backlog's): preempted holding
+/// one, it keeps that worker waiting, and the worker, parked, gives its CPU
+/// to the helper. Measured with every server CPU busy (an Azure D8s_v5, the
+/// server on 4 vCPUs, `--threads 4`; memtier GET/SET 1:1 from 50
+/// connections, one client loading 384-d vectors, a KNN and a single-`HSET`
+/// probe, 40 s, 3 runs): GET/SET p99 3.2 ms and `HSET` p99 6.5 ms as
+/// `SCHED_IDLE`, 3.8-4.8 and 7.0 ms as `SCHED_BATCH` at nice 19, 4.0-4.8
+/// and 7.9 ms at nice 19, against 0.8-1.5 and 2.0 ms with the vectors linked
+/// in the writes (1.2's way); the build alone was as fast with each (3,960-
+/// 4,030 documents a second on those 4 vCPUs, 1,710 in the writes).
+fn lower_priority() {
+    #[cfg(target_os = "linux")]
+    {
+        let param = libc::sched_param { sched_priority: 0 };
+        // SAFETY: changes this thread's own scheduling policy only; a
+        // failure leaves it as it was.
+        unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &param) };
+    }
+}
+
+/// Jobs a helper found while their graph was held back
+/// ([`Backlog::hold`]), kept (unlinked, and counted in the graph's
+/// [`Backlog::queued`]) until it is let go.
+#[cfg(test)]
+static HELD: parking_lot::Mutex<Vec<Job>> = parking_lot::const_mutex(Vec::new());
+
+#[cfg(test)]
+impl Backlog {
+    /// Keep the helpers from linking this graph's vectors (`true`), or let
+    /// them, giving them back the jobs they put aside (`false`).
+    pub fn hold(&self, on: bool) {
+        self.held.store(on, Release);
+        if !on {
+            let mut held = HELD.lock();
+            let mut jobs = POOL.jobs.lock();
+            jobs.extend(held.drain(..));
+            drop(jobs);
+            POOL.ready.notify_all();
         }
     }
 }
@@ -497,15 +655,15 @@ mod tests {
     fn a_stale_ticket_is_not_linked_and_the_latest_is() {
         let g = graph(50, 4);
         let metric = DistanceMetric::L2;
-        let (old, _) = g.backlog.put("x", vec![1.0, 0.0, 0.0, 0.0].into(), 0);
-        let (new, _) = g.backlog.put("x", vec![0.0, 0.0, 0.0, 9.0].into(), 0);
-        link(&g, "x", old, &metric);
+        let (old, _, _) = g.backlog.put("x", vec![1.0, 0.0, 0.0, 0.0].into(), 0);
+        let (new, _, _) = g.backlog.put("x", vec![0.0, 0.0, 0.0, 9.0].into(), 0);
+        link_own(&g, "x", old, &metric);
         assert!(
             !g.key_to_id.read().contains_key("x"),
             "a written-over vector was linked"
         );
         assert_eq!(g.backlog.len(), 1);
-        link(&g, "x", new, &metric);
+        link_own(&g, "x", new, &metric);
         assert!(g.backlog.is_empty());
         let id = g.key_to_id.read()["x"];
         let nodes = g.nodes.read();
@@ -515,18 +673,18 @@ mod tests {
     #[test]
     fn a_delete_takes_a_waiting_vector_out() {
         let g = graph(50, 4);
-        let (t, _) = g.backlog.put("gone", vec![1.0, 2.0, 3.0, 4.0].into(), 0);
+        let (t, _, _) = g.backlog.put("gone", vec![1.0, 2.0, 3.0, 4.0].into(), 0);
         let live = crate::vector::LiveIndex::Hnsw(Arc::clone(&g));
         crate::vector::unindex_vector(&live, "gone");
         assert!(g.backlog.is_empty());
-        link(&g, "gone", t, &DistanceMetric::L2);
+        link_own(&g, "gone", t, &DistanceMetric::L2);
         assert!(!g.key_to_id.read().contains_key("gone"));
     }
 
     #[test]
     fn an_insert_here_and_now_drops_a_waiting_vector() {
         let g = graph(50, 4);
-        let (t, _) = g.backlog.put("y", vec![1.0, 1.0, 1.0, 1.0].into(), 0);
+        let (t, _, _) = g.backlog.put("y", vec![1.0, 1.0, 1.0, 1.0].into(), 0);
         hnsw_insert(
             &g,
             "y".into(),
@@ -534,7 +692,7 @@ mod tests {
             &DistanceMetric::L2,
         );
         assert!(g.backlog.is_empty());
-        link(&g, "y", t, &DistanceMetric::L2);
+        link_own(&g, "y", t, &DistanceMetric::L2);
         let id = g.key_to_id.read()["y"];
         let nodes = g.nodes.read();
         assert_eq!(g.vector_of(&nodes, id, "y").unwrap(), &[2.0, 2.0, 2.0, 2.0]);
@@ -577,6 +735,177 @@ mod tests {
         assert_eq!(got[0].key, "in");
         assert!(got.iter().all(|r| r.key != "out"));
         assert!(got[1..].iter().all(|r| r.key.ends_with('1')));
+    }
+
+    /// A graph past [`HERE_BELOW`], so that writes go through the backlog.
+    fn big_graph(dim: usize) -> Arc<HnswIndex> {
+        graph(HERE_BELOW + 200, dim)
+    }
+
+    /// A filtered search, held in the middle of its walk of the graph (the
+    /// filter waits there), does not keep writes to the same graph waiting:
+    /// they took the backlog for writing, which the search held for reading
+    /// from start to end.
+    #[test]
+    fn a_long_filtered_search_lets_writes_in() {
+        let g = big_graph(8);
+        let metric = DistanceMetric::L2;
+        g.backlog.hold(true);
+        // Something waits, so that the search takes the backlog's way.
+        write(&g, "first", vector(8, 1), &metric, 0);
+        assert_eq!(g.backlog.len(), 1);
+        let q = vector(8, 2);
+        let mut asked = false;
+        let mut admit = |n: &HnswNode| {
+            if !asked {
+                asked = true;
+                let (tx, rx) = std::sync::mpsc::channel();
+                let writer = Arc::clone(&g);
+                crate::cpus::spawn(move || {
+                    for i in 0..50 {
+                        let m = DistanceMetric::L2;
+                        write(&writer, &format!("w{i}"), vector(8, 100 + i), &m, 0);
+                    }
+                    let _ = tx.send(());
+                });
+                assert!(
+                    rx.recv_timeout(std::time::Duration::from_secs(20)).is_ok(),
+                    "writes waited on a search"
+                );
+            }
+            n.key.ends_with('3')
+        };
+        let (got, _) =
+            crate::vector::knn_hnsw_admitting(&g, &q, 5, 64, &metric, &mut admit, usize::MAX, None)
+                .unwrap();
+        assert!(asked);
+        assert!(got.iter().all(|r| r.key.ends_with('3')));
+        assert_eq!(g.backlog.len(), 51);
+        g.backlog.hold(false);
+        assert!(settle(&g, std::time::Duration::from_secs(60)));
+    }
+
+    /// Writes over a few keys while the helpers are held back: one job per
+    /// key waits in the queue, whatever the number of writes, and the job
+    /// links the key's latest vector.
+    #[test]
+    fn overwrites_of_a_waiting_key_queue_no_more_jobs() {
+        let g = big_graph(8);
+        let metric = DistanceMetric::L2;
+        g.backlog.hold(true);
+        for i in 0..2000u64 {
+            write(
+                &g,
+                &format!("hot{}", i % 5),
+                vector(8, 50_000 + i),
+                &metric,
+                0,
+            );
+        }
+        assert_eq!(g.backlog.len(), 5);
+        assert_eq!(g.backlog.queued(), 5);
+        assert!(g.backlog.bytes() >= 5 * std::mem::size_of::<Job>());
+        g.backlog.hold(false);
+        assert!(settle(&g, std::time::Duration::from_secs(60)));
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while g.backlog.queued() > 0 {
+            assert!(std::time::Instant::now() < until, "jobs left in the queue");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let ids = g.key_to_id.read();
+        let nodes = g.nodes.read();
+        for k in 0..5u64 {
+            let key = format!("hot{k}");
+            let last = vector(8, 50_000 + 1995 + k);
+            assert_eq!(g.vector_of(&nodes, ids[&key], &key).unwrap(), &last[..]);
+        }
+    }
+
+    /// A search that took the backlog while a key's vector waited, and then
+    /// found the graph with that vector linked (a helper got to it between
+    /// the two): the key comes once, as written.
+    #[test]
+    fn a_vector_linked_while_a_search_runs_is_found_once() {
+        let g = big_graph(8);
+        let metric = DistanceMetric::L2;
+        g.backlog.hold(true);
+        let far = vec![50.0; 8];
+        write(&g, "k7", far.clone(), &metric, 0);
+        {
+            let g = Arc::clone(&g);
+            crate::test_hooks::set("knn: backlog taken", move || {
+                link_queued(&g, "k7", &DistanceMetric::L2);
+            });
+        }
+        let got = knn_hnsw(&g, &far, 5, 64, &metric);
+        crate::test_hooks::clear("knn: backlog taken");
+        assert!(g.backlog.is_empty(), "the hook did not link k7");
+        assert_eq!(got[0].key, "k7");
+        assert_eq!(got[0].score, 0.0);
+        assert_eq!(got.iter().filter(|r| r.key == "k7").count(), 1);
+        g.backlog.hold(false);
+    }
+
+    /// The two orders the backlog keeps: a vector is taken out of the
+    /// backlog only once the graph has it (a search in between finds it, and
+    /// not the key's previous vector), and a delete takes a waiting vector
+    /// out only once the graph's node is gone (a search in between finds
+    /// the waiting vector or nothing, never the graph's previous one).
+    #[test]
+    fn a_search_between_graph_and_backlog_sees_no_older_vector() {
+        let g = big_graph(8);
+        let metric = DistanceMetric::L2;
+        let old7 = vector(8, 7);
+        let old9 = vector(8, 9);
+        g.backlog.hold(true);
+        let far = vec![50.0; 8];
+        write(&g, "k7", far.clone(), &metric, 0);
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let (g, seen, far, old7) =
+                (Arc::clone(&g), Arc::clone(&seen), far.clone(), old7.clone());
+            crate::test_hooks::set("backlog: linked", move || {
+                let m = DistanceMetric::L2;
+                seen.lock().push(knn_hnsw(&g, &far, 5, 64, &m));
+                seen.lock().push(knn_hnsw(&g, &old7, 5, 64, &m));
+            });
+        }
+        link_queued(&g, "k7", &metric);
+        crate::test_hooks::clear("backlog: linked");
+        {
+            let seen = seen.lock();
+            assert_eq!(seen.len(), 2, "the hook did not run");
+            assert_eq!(seen[0][0].key, "k7");
+            assert_eq!(seen[0][0].score, 0.0);
+            assert_eq!(seen[0].iter().filter(|r| r.key == "k7").count(), 1);
+            assert!(
+                seen[1].iter().all(|r| r.key != "k7" || r.score > 1.0),
+                "k7's previous vector was found"
+            );
+        }
+        // k9: in the graph, a later vector waiting, then deleted.
+        let far9 = vec![-50.0; 8];
+        write(&g, "k9", far9.clone(), &metric, 0);
+        assert!(g.backlog.holds("k9"));
+        seen.lock().clear();
+        {
+            let (g, seen, old9) = (Arc::clone(&g), Arc::clone(&seen), old9.clone());
+            crate::test_hooks::set("unlink: deleted", move || {
+                seen.lock()
+                    .push(knn_hnsw(&g, &old9, 5, 64, &DistanceMetric::L2));
+            });
+        }
+        let live = crate::vector::LiveIndex::Hnsw(Arc::clone(&g));
+        crate::vector::unindex_vector(&live, "k9");
+        crate::test_hooks::clear("unlink: deleted");
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 1, "the hook did not run");
+        assert!(
+            seen[0].iter().all(|r| r.key != "k9" || r.score > 1.0),
+            "k9's previous vector was found after its delete began"
+        );
+        assert!(!g.backlog.holds("k9"));
+        g.backlog.hold(false);
     }
 }
 
@@ -625,20 +954,28 @@ mod concurrency {
             db_index: 0,
             on: IndexOn::Hash,
             prefixes: vec![format!("{name}:")],
-            fields: vec![SchemaField {
-                name: "v".into(),
-                field_type: FieldType::Vector {
-                    algo: VectorAlgo::Hnsw {
-                        m: 16,
-                        ef_construction: 32,
-                        ef_runtime: 10,
+            fields: vec![
+                SchemaField {
+                    name: "v".into(),
+                    field_type: FieldType::Vector {
+                        algo: VectorAlgo::Hnsw {
+                            m: 16,
+                            ef_construction: 32,
+                            ef_runtime: 10,
+                        },
+                        dim: DIM,
+                        metric: metric.clone(),
+                        data_type: VectorType::Float32,
                     },
-                    dim: DIM,
-                    metric: metric.clone(),
-                    data_type: VectorType::Float32,
+                    options: FieldOptions::default(),
                 },
-                options: FieldOptions::default(),
-            }],
+                SchemaField {
+                    // So that documents have ids, for `knn_measured`.
+                    name: "t".into(),
+                    field_type: FieldType::Tag,
+                    options: FieldOptions::default(),
+                },
+            ],
             aliases: Vec::new(),
             stopwords: None,
             synonyms: Default::default(),
@@ -661,7 +998,8 @@ mod concurrency {
                     .flat_map(|x| x.to_le_bytes())
                     .collect::<Vec<u8>>()
                     .into();
-                let pairs: Vec<(String, Arc<[u8]>)> = vec![("v".into(), blob)];
+                let pairs: Vec<(String, Arc<[u8]>)> =
+                    vec![("v".into(), blob), ("t".into(), Arc::from(&b"a"[..]))];
                 let hash: crate::types::HashFields = pairs.iter().cloned().collect();
                 crate::store::get_shard(&store[0], key).write().insert(
                     key,
@@ -702,6 +1040,79 @@ mod concurrency {
 
     fn recall(found: &[KnnResult], want: &[String]) -> usize {
         found.iter().filter(|r| want.contains(&r.key)).count()
+    }
+
+    /// What the filtered searches let in: keys ending in an even digit.
+    fn admitted(key: &str) -> bool {
+        key.as_bytes().last().is_some_and(|b| b % 2 == 0)
+    }
+
+    /// A search of `g` (the index's graph) by `way` (see `run`).
+    #[allow(clippy::too_many_arguments)]
+    fn search(
+        way: usize,
+        indexes: &IndexStore,
+        name: &str,
+        g: &Arc<HnswIndex>,
+        q: &[f32],
+        k: usize,
+        metric: &DistanceMetric,
+        candidates: &[String],
+    ) -> Vec<KnnResult> {
+        let live = LiveIndex::Hnsw(Arc::clone(g));
+        match way {
+            0 => knn_hnsw(g, q, k, 64, metric),
+            1 => {
+                let stored = super::super::as_stored(metric, q.to_vec());
+                let mut admit = |n: &HnswNode| admitted(&n.key);
+                crate::vector::knn_hnsw_admitting(
+                    g,
+                    &stored,
+                    k,
+                    64,
+                    metric,
+                    &mut admit,
+                    usize::MAX,
+                    None,
+                )
+                .expect("no budget")
+                .0
+            }
+            2 => {
+                crate::commands::vector::knn_filtered(
+                    &live,
+                    q,
+                    k,
+                    metric,
+                    candidates.iter().map(String::as_str),
+                    None,
+                )
+                .0
+            }
+            _ => {
+                let store = indexes.read();
+                let def = store.get(name).unwrap();
+                let mut ids = crate::vector::postings::Bits::new();
+                {
+                    let p = def.postings.peek();
+                    for key in candidates {
+                        if let Some(id) = p.id(key) {
+                            ids.set(id);
+                        }
+                    }
+                }
+                let knn = crate::vector::filter::Knn {
+                    k,
+                    field: "v".into(),
+                    vector: q.to_vec(),
+                    alias: "d".into(),
+                    ef_runtime: None,
+                    policy: None,
+                    batch_size: None,
+                };
+                crate::commands::vector::knn_measured(def, &ids, &knn, &live, metric, None).0
+            }
+        }
     }
 
     fn run(seed: u64, metric: DistanceMetric, compact: bool) {
@@ -764,24 +1175,49 @@ mod concurrency {
             searchers.push(std::thread::spawn(move || {
                 let mut rng = Rng((seed * 97 + s) | 1);
                 let mut checked = 0usize;
+                let mut round = s as usize;
+                let k = 20;
+                // What a filter lets in, for the filtered ways.
+                let candidates: Vec<String> = (0..1200)
+                    .map(|i| format!("{name}:b{i}"))
+                    .chain((0..hot).map(|i| format!("{name}:h{i}")))
+                    .filter(|key| admitted(key))
+                    .collect();
                 while !stop.load(Relaxed) {
+                    round += 1;
                     let q = rng.vector();
-                    let before: AHashMap<String, usize> = log
+                    // 0: knn_hnsw; 1: the graph's filtered walk; 2: each
+                    // candidate measured as offered (FilteredKnn); 3: the
+                    // documents of a filter's ids measured (knn_measured).
+                    let way = round % 4;
+                    let before: AHashMap<String, (usize, usize)> = log
                         .lock()
                         .iter()
-                        .map(|(k, h)| (k.clone(), h.acked))
+                        .map(|(k, h)| (k.clone(), (h.acked, h.states.len())))
                         .collect();
-                    let found = knn_hnsw(&graph(&indexes, &name), &q, 20, 64, &metric);
+                    let g = graph(&indexes, &name);
+                    let found = search(way, &indexes, &name, &g, &q, k, &metric, &candidates);
+                    // Keys whose last write was acknowledged before the
+                    // search began and whose vector still waits now: it
+                    // waited all along.
+                    let waited: Vec<String> = before
+                        .iter()
+                        .filter(|(key, (acked, len))| acked == len && g.backlog.holds(key))
+                        .map(|(key, _)| key.clone())
+                        .collect();
                     let log = log.lock();
                     let mut keys = ahash::AHashSet::new();
                     for r in &found {
                         assert!(keys.insert(r.key.clone()), "{} came twice", r.key);
+                        if way == 1 || way == 2 {
+                            assert!(admitted(&r.key), "{} is not let in", r.key);
+                        }
                         let Some(h) = log.get(&r.key) else {
                             continue; // a base key, never written again
                         };
                         // From the state acknowledged when the search began
                         // (none if no write was) to the last one begun.
-                        let from = before.get(&r.key).copied().unwrap_or(0).saturating_sub(1);
+                        let from = before.get(&r.key).map_or(0, |b| b.0).saturating_sub(1);
                         let ok = h.states[from..].iter().any(|st| {
                             st.as_ref().is_some_and(|v| {
                                 let d = dist(&metric, &q, v);
@@ -790,9 +1226,34 @@ mod concurrency {
                         });
                         assert!(
                             ok,
-                            "{} at {} is no state of it since the search began",
+                            "{} at {} is no state of it since the search began (way {way})",
                             r.key, r.score
                         );
+                    }
+                    // Complete: a key that waited all along and is nearer
+                    // than the k-th hit is among the hits (it is measured
+                    // exactly, wherever the graph's walk went).
+                    let kth = if found.len() >= k {
+                        found[k - 1].score
+                    } else {
+                        f32::INFINITY
+                    };
+                    for key in waited {
+                        let h = &log[&key];
+                        if h.states.len() != before[&key].1 || (way != 0 && !admitted(&key)) {
+                            continue;
+                        }
+                        let Some(Some(v)) = h.states.last() else {
+                            continue;
+                        };
+                        let d = dist(&metric, &q, v);
+                        if d < kth - 1e-4 * (1.0 + kth.abs()) {
+                            assert!(
+                                found.iter().any(|r| r.key == key),
+                                "{key} waited from before the search, at {d}, nearer than hit \
+                                 {k} at {kth}, and was not found (way {way})"
+                            );
+                        }
                     }
                     checked += found.len();
                 }
@@ -907,5 +1368,98 @@ mod concurrency {
             }
         }
         assert_eq!(helpers(), helpers_before);
+    }
+
+    /// An index whose graph has jobs queued (the helpers held back): a
+    /// `FLUSHALL`, an `FT.DROPINDEX` or a compaction's swap frees the graph
+    /// at once, not when the helpers get to its jobs.
+    #[test]
+    fn a_graph_let_go_with_jobs_queued_is_freed_at_once() {
+        let metric = DistanceMetric::L2;
+        for round in 0..3u64 {
+            let name = format!("fq{round}");
+            let (store, indexes) = setup(&name, &metric);
+            let mut rng = Rng(round + 101);
+            for i in 0..1200 {
+                write(
+                    &store,
+                    &indexes,
+                    &format!("{name}:{i}"),
+                    Some(&rng.vector()),
+                );
+            }
+            let g = graph(&indexes, &name);
+            g.backlog.hold(true);
+            for i in 1200..1400 {
+                let key = format!("{name}:{i}");
+                let _order = crate::write_order::lock_keys(0, std::iter::once(key.as_bytes()));
+                write(&store, &indexes, &key, Some(&rng.vector()));
+            }
+            assert!(g.backlog.queued() > 0);
+            let gone = Arc::downgrade(&g);
+            drop(g);
+            match round {
+                0 => {
+                    crate::vector::drop_all_indexes(&indexes);
+                }
+                1 => assert!(crate::vector::remove_index(&mut indexes.write(), &name)),
+                _ => {
+                    crate::vector::compact_hnsw(&indexes, &store, &name, "v").unwrap();
+                    // The new graph has every key, the waiting ones too.
+                    let new = graph(&indexes, &name);
+                    assert_eq!(new.live_count.load(Relaxed), 1400);
+                    new.backlog.hold(false);
+                }
+            }
+            // A helper may hold it for a moment, putting a job aside; the
+            // jobs themselves stay held back.
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while gone.upgrade().is_some() {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "round {round}: the graph was kept"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        // The jobs put aside go back to the helpers, which drop them.
+        Backlog::default().hold(false);
+    }
+
+    /// `FT.DROPINDEX` while a compaction rebuilds the graph: the compaction
+    /// gives up, and neither graph is kept.
+    #[test]
+    fn a_drop_during_a_compaction_lets_both_graphs_go() {
+        let metric = DistanceMetric::L2;
+        let name = "dc";
+        let (store, indexes) = setup(name, &metric);
+        let mut rng = Rng(77);
+        for i in 0..1500 {
+            write(
+                &store,
+                &indexes,
+                &format!("{name}:{i}"),
+                Some(&rng.vector()),
+            );
+        }
+        let g = graph(&indexes, name);
+        {
+            let indexes = indexes.clone();
+            crate::test_hooks::set("compact: rebuilt", move || {
+                assert!(crate::vector::remove_index(&mut indexes.write(), "dc"));
+            });
+        }
+        let got = crate::vector::compact_hnsw(&indexes, &store, name, "v");
+        crate::test_hooks::clear("compact: rebuilt");
+        assert!(got.is_err());
+        assert!(g.shadow().is_none(), "the old graph kept the new one");
+        assert!(indexes.read().get(name).is_none());
+        let gone = Arc::downgrade(&g);
+        drop(g);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while gone.upgrade().is_some() {
+            assert!(std::time::Instant::now() < until, "the old graph was kept");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }

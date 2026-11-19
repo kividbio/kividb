@@ -1934,7 +1934,7 @@ fn knn_among(
 }
 
 /// The nearest `knn.k` of the documents `ids`, each measured.
-fn knn_measured(
+pub(crate) fn knn_measured(
     def: &crate::vector::IndexDef,
     ids: &crate::vector::postings::Bits,
     knn: &crate::vector::filter::Knn,

@@ -28,9 +28,11 @@ The full command surface, filters, hybrid search and edge cases are in **[COMMAN
 ## Index builds and `EF_RUNTIME`
 
 - **Vectors are linked into an HNSW graph by helper threads**: half as many as the CPUs
-  the server may use, started once, and on Linux run as `SCHED_IDLE`, so that they take
-  only CPU time the workers leave (on a server busy serving, the writes link their vectors
-  themselves, as before). A write puts its vector in the graph's backlog and returns; a search measures every
+  the server may use (no more than a CPU quota such as a container's `--cpus` allows, and
+  at least one), started once, and on Linux run as `SCHED_IDLE`, so that they take only
+  CPU time the workers leave. On a server whose CPUs the workers keep busy the backlog
+  stays full and each write links its own vector, as before (measured with every server
+  CPU busy: the backlog held its limit the whole time). A write puts its vector in the graph's backlog and returns; a search measures every
   vector of the backlog exactly, beside what it finds in the graph, so a document is found
   from the moment its `HSET` is answered, as before. The backlog holds at most 1,024
   vectors, and at most 128 Ki floats (85 vectors of 1,536 dimensions, 341 of 384; never
@@ -39,7 +41,10 @@ The full command surface, filters, hybrid search and edge cases are in **[COMMAN
   hands its vectors over the same way. A graph of fewer than 1,000 nodes links each vector
   in the write.
 - `FT.INFO` shows the backlog as `hnsw_backlog` (and `backlog` per field under
-  `hnsw_indexes`). `hnsw_live_count` counts the graph's nodes, so it trails the documents
+  `hnsw_indexes`), and as `hnsw_backlog_bytes` the memory it holds, the helpers' queued
+  jobs included: at most one a waiting key, so writes over the same keys do not grow it.
+  A graph dropped (`FT.DROPINDEX`, `FLUSHALL`) or replaced by a compaction is freed at
+  once, whatever its jobs. `hnsw_live_count` counts the graph's nodes, so it trails the documents
   while the backlog is not empty; `num_docs` does not.
 - **A KNN search looks at no fewer than 50 candidates**, whatever `EF_RUNTIME` says (the
   default is 10, as in Redis). So the default answers with the recall Redis gives at about
