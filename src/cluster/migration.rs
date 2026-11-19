@@ -3529,7 +3529,7 @@ mod tests {
         index_store: crate::vector::IndexStore,
         repl_state: Arc<ReplState>,
         hub_tx: HubTx,
-        _hub_rx: tokio::sync::mpsc::UnboundedReceiver<crate::replication::HubMsg>,
+        _hub_rx: crate::replication::HubRx,
     }
 
     impl Lost {
@@ -3545,7 +3545,7 @@ mod tests {
             for i in 0..OLD {
                 set(&store, &old_key(i), "old");
             }
-            let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (hub_tx, _hub_rx) = crate::replication::HubTx::channel();
             Lost {
                 cluster: Arc::new(cluster),
                 other,

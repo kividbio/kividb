@@ -3349,11 +3349,15 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
             //
             // Kept behind `write_is_observed` so an instance with no replicas
             // and AOF off never pays for it. In the observed case the verbatim
-            // arm allocates exactly what the previous `ctx.cmd` clone did.
-            for parts in
-                replication::script_feed::commands_for_propagation(ctx, name, &ctx.cmd, result)
-            {
-                replication::replicate_one_write(ctx, &parts);
+            // arm allocates exactly what the previous `ctx.cmd` clone did,
+            // except for a write the hub alone reads that goes out as it came:
+            // encoded from `ctx.cmd` itself (`write_as_it_came`, #894).
+            if !replication::write_as_it_came(ctx, name, &ctx.cmd) {
+                for parts in
+                    replication::script_feed::commands_for_propagation(ctx, name, &ctx.cmd, result)
+                {
+                    replication::replicate_one_write(ctx, &parts);
+                }
             }
         }
 
@@ -3695,8 +3699,7 @@ mod replica_loading_gate_tests {
     fn run_as_slave(repl_state: &Arc<ReplState>, cmd: Vec<Vec<u8>>, apply_stream: bool) -> Vec<u8> {
         let store = crate::store::new_store(1);
         let lastsave = Arc::new(RwLock::new(0i64));
-        let (hub_tx, mut hub_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::replication::HubMsg>();
+        let (hub_tx, mut hub_rx) = crate::replication::HubTx::channel();
         tokio::spawn(async move { while hub_rx.recv().await.is_some() {} });
 
         let config = Arc::new(Config::default_replica());
