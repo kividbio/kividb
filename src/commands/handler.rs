@@ -1447,6 +1447,14 @@ fn make_room_or_refuse(ctx: &mut Ctx, in_order: bool, needs_room: bool) -> Optio
     None
 }
 
+/// [`run_command`]'s second instance, out of line: so that the first, every
+/// other command's, is compiled as it was.
+#[cold]
+#[inline(never)]
+fn run_room_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8> {
+    run_command::<true>(ctx, name, started)
+}
+
 /// For a command that allocates as much as its arguments say
 /// (`sketch::room`): what it wants, put in `wanted`, and whether that does
 /// not fit under `maxmemory`. Its room is then made by [`make_room_for`].
@@ -1497,7 +1505,7 @@ fn run_command<const ROOM: bool>(
         // None, of a command that allocates as much as its arguments say.
         if refusal.is_empty() {
             if !ROOM {
-                return run_command::<true>(ctx, name, started);
+                return run_room_command(ctx, name, started);
             }
         } else {
             return refusal;
