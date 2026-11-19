@@ -72,16 +72,19 @@ def load(c, kind, n, total):
 
 def settled(c, limit=60.0):
     """used_memory once it has stopped falling: a resize still being finished
-    in the background holds two arrays until it is done."""
-    u = c.info("memory")["used_memory"]
+    in the background holds two arrays until it is done, and gives the old
+    one back all at once when it is (half a second for 3.2M members), so
+    this waits until no lower value has been seen for 2 s."""
+    low = c.info("memory")["used_memory"]
     end = time.perf_counter() + limit
-    while time.perf_counter() < end:
-        time.sleep(0.3)
+    since = time.perf_counter()
+    while time.perf_counter() < end and time.perf_counter() - since < 2.0:
+        time.sleep(0.1)
         now = c.info("memory")["used_memory"]
-        if now >= u - 4096:
-            return min(u, now)
-        u = now
-    return u
+        if now < low - 4096:
+            since = time.perf_counter()
+        low = min(low, now)
+    return low
 
 
 @S.run
