@@ -7,6 +7,7 @@
 // with it. Real `kividb` processes (debug builds): a script is held part-way
 // through by `KIVIDB_TEST_SCRIPT_STALL_MS` (`pause::test_stall_in_script`),
 // and not by a loop sized to the machine. On both I/O loops.
+#![allow(clippy::disallowed_methods)]
 #![cfg(feature = "lua")]
 
 use std::io::{BufRead, BufReader, Read, Write};
