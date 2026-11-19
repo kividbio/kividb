@@ -2765,8 +2765,8 @@ where
                             && let Ok(s) = std::str::from_utf8(cmd[2])
                             && let Ok(offset) = s.parse::<u64>()
                         {
-                            let _ = hub_tx_ack
-                                .send(crate::replication::HubMsg::AckOffset { replica_id, offset });
+                            // Out of the writes' order: see `HubTx::send_ack`.
+                            let _ = hub_tx_ack.send_ack(replica_id, offset);
                         }
                         pos += consumed;
                     }

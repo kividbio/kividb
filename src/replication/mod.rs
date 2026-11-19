@@ -2247,9 +2247,6 @@ pub enum HubMsg {
         slot_imports: bool,
     },
     Propagate(ReplPayload),
-    /// The writes of the next run (see [`HubTx`]): take it, and they are
-    /// handled as one [`HubMsg::Propagate`].
-    Writes,
     /// Replica side: bytes of the master's stream this node has read and
     /// applied, ending at offset `end`. Kept in the backlog, not forwarded.
     Received {
@@ -2765,39 +2762,78 @@ pub fn next_replica_id() -> u64 {
 /// own, queued, and taken off the queue by the hub one at a time. With a
 /// backlog kept, a write paid about 11% of its time for that (#894): the
 /// send, the allocation and the copy, the free. Now a write is appended to
-/// the open *run* of writes, one buffer under one lock, and only the write
-/// that opens a run sends a message ([`HubMsg::Writes`]), which tells the
-/// hub to take that run. The hub takes a run as one piece, which holds
-/// every write appended to it before it was taken.
+/// the open *run* of writes, one buffer under one lock. Runs are numbered as
+/// they are opened, and only the write that opens one queues anything: the
+/// news that run *n* is open ([`Inbox::Run`]), which tells the hub to take
+/// it, and every run before it it has not taken yet. The hub takes a run as
+/// one piece, which holds every write appended to it before it was taken.
 ///
 /// The order is the queue's as before, message for message. Every other
-/// message is sent under the same lock, and closes the open run first
-/// ([`HubTx::send`]): a write appended after it opens another run, whose
-/// [`HubMsg::Writes`] is queued after it. So a write the queue had ahead of
-/// a message, before, is in a run taken ahead of it now, and one it had
-/// behind is in a run taken behind it. Writes to one key are appended, as
-/// they were sent, holding the key's order (`write_order`), so they are in
-/// the stream in the order they took effect; a write never waits for
-/// another to be sent, and a run is taken as soon as the hub gets to its
-/// message, so no write waits for a later one either.
+/// message is queued under the same lock, closes the open run first, and
+/// carries the number of runs opened before it ([`HubTx::send`],
+/// [`Inbox::Ordered`]): the hub takes those runs before it handles the
+/// message, and none opened after it (each such run's news is queued after
+/// the message, since the run is opened after the lock is let go of). So a
+/// write the queue had ahead of a message, before, is in a run taken ahead
+/// of it now, and one it had behind is in a run taken behind it. Writes to
+/// one key are appended, as they were sent, holding the key's order
+/// (`write_order`), so they are in the stream in the order they took effect;
+/// a write never waits for another to be sent, and a run is taken as soon as
+/// the hub gets to its news or to a later message, so no write waits for a
+/// later one either.
+///
+/// The news of a run is queued after the lock is let go of: queuing wakes
+/// the hub, a system call when it is asleep, and other writers waited for
+/// that under the lock, often enough to park on it (#950: about 650
+/// parkings a second at 100k writes a second with a replica attached). It
+/// can come after a later message then, which has taken the run already:
+/// there is nothing left to take for it.
+///
+/// Two exceptions, each with its order kept: a write of
+/// `OWN_MESSAGE_FROM` bytes or more is a message of its own, sent as any
+/// other message is (`HubTx::append_large`); and a replica's
+/// acknowledgement, which needs no place among the writes, is queued
+/// without the lock and without closing the open run ([`HubTx::send_ack`]).
 #[derive(Clone)]
 pub struct HubTx {
-    tx: mpsc::UnboundedSender<HubMsg>,
+    tx: mpsc::UnboundedSender<Inbox>,
     writes: Arc<WriteRuns>,
+}
+
+/// What goes through the hub's inbox (see [`HubTx`]).
+enum Inbox {
+    /// A message, which the hub handles after the first `after_runs` runs of
+    /// writes, and before any other.
+    Ordered { after_runs: u64, msg: HubMsg },
+    /// Run `n` (counted from 0) is open: the hub takes it, and every run
+    /// before it that it has not taken.
+    Run(u64),
+    /// A message with no place among the writes ([`HubTx::send_ack`]).
+    Unordered(HubMsg),
+}
+
+/// What the hub's end of the inbox hands over, in the stream's order.
+enum Delivery {
+    /// A run of writes, whole.
+    Run(Vec<u8>),
+    Msg(HubMsg),
 }
 
 /// [`HubTx`] that does not keep the hub alive.
 #[derive(Debug)]
 pub struct WeakHubTx {
-    tx: mpsc::WeakUnboundedSender<HubMsg>,
+    tx: mpsc::WeakUnboundedSender<Inbox>,
     writes: std::sync::Weak<WriteRuns>,
 }
 
 /// The hub's end of the inbox: the messages, and the runs of writes they
 /// refer to.
 pub struct HubRx {
-    rx: mpsc::UnboundedReceiver<HubMsg>,
+    rx: mpsc::UnboundedReceiver<Inbox>,
     writes: Arc<WriteRuns>,
+    /// Taken off the inbox, not yet handed over: the runs a message or a
+    /// run's news took, and the message.
+    ready: std::collections::VecDeque<Delivery>,
 }
 
 /// Writes on their way to the hub, in runs (see [`HubTx`]).
@@ -2806,21 +2842,56 @@ struct WriteRuns {
     queue: parking_lot::Mutex<RunQueue>,
 }
 
-#[derive(Default)]
 struct RunQueue {
-    /// Not yet taken by the hub, oldest first. For each, one
-    /// [`HubMsg::Writes`] has been queued.
+    /// Not yet taken by the hub, oldest first: runs `taken` to `opened - 1`.
     runs: std::collections::VecDeque<Vec<u8>>,
     /// The last of `runs` takes the next write.
     open: bool,
+    /// Runs opened so far, and taken by the hub so far.
+    opened: u64,
+    taken: u64,
     /// Runs the hub has emptied, kept to be filled again.
     spare: Vec<Vec<u8>>,
+    /// The room a run is opened with: from [`RUN_ROOM_MIN`] to
+    /// [`RUN_ROOM_MAX`], doubled when a run fills up before the hub takes
+    /// it, halved when the hub takes one filled to less than a quarter.
+    room: usize,
+    /// The hub has taken a run since its clock last looked
+    /// ([`WriteRuns::trim_if_idle`]).
+    taken_lately: bool,
 }
 
-/// How many emptied runs are kept, and how large each may be: the memory a
-/// hub holds on to when nothing is written.
+impl Default for RunQueue {
+    fn default() -> Self {
+        Self {
+            runs: std::collections::VecDeque::new(),
+            open: false,
+            opened: 0,
+            taken: 0,
+            spare: Vec::new(),
+            room: RUN_ROOM_MIN,
+            taken_lately: false,
+        }
+    }
+}
+
+/// How many emptied runs are kept to be filled again.
 const SPARE_RUNS: usize = 2;
-const SPARE_RUN_CAPACITY: usize = 256 * 1024;
+/// The room a run is opened with, at least and at most. A run is never
+/// grown under the lock: a write that does not fit in the open run opens
+/// another (whose room is then doubled), so no write waits for a run to be
+/// copied into a larger buffer, and a run holds at most its room. At most,
+/// a millisecond of SETs at 2.6M a second (about 340 KB, #894) fits in
+/// one; what is kept between bursts is at most `SPARE_RUNS` of these, and
+/// let go of after a second in which the hub took none.
+const RUN_ROOM_MIN: usize = 64 * 1024;
+const RUN_ROOM_MAX: usize = 1024 * 1024;
+/// A write at least this large is not copied into a run under the lock: it
+/// is copied into a payload of its own before the lock is taken, and sent as
+/// a message of its own ([`HubTx::send`], which closes the open run, so it
+/// keeps its place). At most [`RUN_ROOM_MIN`], so that every smaller write
+/// fits in a run just opened.
+const OWN_MESSAGE_FROM: usize = 64 * 1024;
 
 impl HubTx {
     /// An inbox, and its hub's end of it.
@@ -2832,16 +2903,27 @@ impl HubTx {
                 tx,
                 writes: Arc::clone(&writes),
             },
-            HubRx { rx, writes },
+            HubRx {
+                rx,
+                writes,
+                ready: std::collections::VecDeque::new(),
+            },
         )
     }
 
     /// Queue `msg` behind every write appended before it, and ahead of
-    /// every write appended after it.
+    /// every write appended after it. Queued under the lock: a run opened
+    /// after it has its news queued after it.
     pub fn send(&self, msg: HubMsg) -> Result<(), mpsc::error::SendError<HubMsg>> {
         let mut queue = self.writes.queue.lock();
         queue.open = false;
-        self.tx.send(msg)
+        let after_runs = queue.opened;
+        self.tx
+            .send(Inbox::Ordered { after_runs, msg })
+            .map_err(|mpsc::error::SendError(item)| match item {
+                Inbox::Ordered { msg, .. } => mpsc::error::SendError(msg),
+                _ => unreachable!("sent as ordered"),
+            })
     }
 
     pub fn downgrade(&self) -> WeakHubTx {
@@ -2851,24 +2933,86 @@ impl HubTx {
         }
     }
 
-    /// Append a write to the stream: what `write` puts at the end of the
-    /// buffer it is given, which holds the writes appended before it.
-    /// False, with nothing appended, once the hub has gone.
+    /// A replica's `REPLCONF ACK`, without the lock and without closing
+    /// the open run: the only message that needs no place among the
+    /// writes, and the most frequent (a replica acknowledges as it
+    /// applies). Closing the run for each split the writes into a run per
+    /// acknowledgement, each a wake-up of the hub and a write to every
+    /// replica's socket of its own (#950: replica lag and `WAIT` p99 at
+    /// 100k writes a second).
+    ///
+    /// Handed to the hub in its place among the other messages, but not
+    /// among the writes: before or after writes appended before or after it.
+    /// No client is told anything different for that: the hub records the
+    /// offset as the replica's (`replica_acks`, `ReplicaProgress::acked`)
+    /// and marks it online, a number the replica sent of the stream it has
+    /// applied, which no write the hub handles before or after it changes.
+    /// Whatever reads it (`WAIT`, `WAITAOF`, `min-replicas`, a failover, a
+    /// shutdown) compares it with a target of its own (the hub's `sent`
+    /// count for the replica, or an offset), which is not taken from it.
+    /// It still comes after its replica's registration, a message queued
+    /// before the replica could have acknowledged anything.
+    pub fn send_ack(&self, replica_id: u64, offset: u64) -> bool {
+        self.tx
+            .send(Inbox::Unordered(HubMsg::AckOffset { replica_id, offset }))
+            .is_ok()
+    }
+
+    /// Append a write to the stream, after the writes appended before it.
+    /// False once the hub has gone.
     #[inline]
-    fn append(&self, write: impl FnOnce(&mut Vec<u8>)) -> bool {
-        let mut queue = self.writes.queue.lock();
-        if !queue.open {
-            // Queued before the run can be filled: the hub cannot take the
-            // run before this lock is let go of.
-            if self.tx.send(HubMsg::Writes).is_err() {
-                return false;
-            }
-            let run = queue.spare.pop().unwrap_or_default();
-            queue.runs.push_back(run);
-            queue.open = true;
+    fn append(&self, write: &[u8]) -> bool {
+        if write.len() >= OWN_MESSAGE_FROM {
+            return self.append_large(write);
         }
-        write(queue.runs.back_mut().expect("an open run"));
-        true
+        let opened = {
+            let mut queue = self.writes.queue.lock();
+            let fits = queue.open && {
+                let run = queue.runs.back().expect("an open run");
+                run.capacity() - run.len() >= write.len()
+            };
+            let opened = (!fits).then(|| {
+                if queue.open {
+                    // Filled before the hub took it: the next is opened
+                    // larger.
+                    queue.room = (queue.room * 2).min(RUN_ROOM_MAX);
+                }
+                let room = queue.room;
+                let run = match queue.spare.pop() {
+                    Some(run) if run.capacity() >= room => run,
+                    _ => Vec::with_capacity(room),
+                };
+                queue.runs.push_back(run);
+                queue.open = true;
+                queue.opened += 1;
+                queue.opened - 1
+            });
+            // Never more than the run's room (`write.len()` is under
+            // `OWN_MESSAGE_FROM`, at most `RUN_ROOM_MIN`): no reallocation.
+            queue
+                .runs
+                .back_mut()
+                .expect("an open run")
+                .extend_from_slice(write);
+            opened
+        };
+        // The news of a run opened, out of the lock (see `HubTx`).
+        opened.is_none_or(|n| self.tx.send(Inbox::Run(n)).is_ok())
+    }
+
+    /// [`Self::append`] of a write of [`OWN_MESSAGE_FROM`] or more (a large
+    /// value, a large transaction): copied into a payload of its own outside
+    /// the lock, then queued as a message of its own, which closes the open
+    /// run ([`Self::send`]). Copied into the run under the lock, every other
+    /// writer waited for the copy (and for the run to be moved to a larger
+    /// buffer), and the run then held it twice. It keeps its place: the
+    /// writes appended before it are in runs taken ahead of it, those
+    /// appended after it in a run opened behind it.
+    #[cold]
+    #[inline(never)]
+    fn append_large(&self, write: &[u8]) -> bool {
+        let payload: ReplPayload = Arc::from(write);
+        self.send(HubMsg::Propagate(payload)).is_ok()
     }
 }
 
@@ -2882,26 +3026,31 @@ impl WeakHubTx {
 }
 
 impl WriteRuns {
-    /// The oldest run, for the [`HubMsg::Writes`] that opened it.
-    fn take(&self) -> Option<Vec<u8>> {
-        let mut queue = self.queue.lock();
-        let run = queue.runs.pop_front();
-        if queue.runs.is_empty() {
-            queue.open = false;
-        }
-        run
-    }
-
-    /// A run the hub is done with, to be filled again.
+    /// A run the hub is done with, to be filled again. Freed outside the
+    /// lock when it is not kept.
     fn give_back(&self, mut run: Vec<u8>) {
-        if run.capacity() > SPARE_RUN_CAPACITY {
+        if run.capacity() > RUN_ROOM_MAX {
             return;
         }
         run.clear();
         let mut queue = self.queue.lock();
-        if queue.spare.len() < SPARE_RUNS {
+        if queue.spare.len() < SPARE_RUNS && run.capacity() >= queue.room {
             queue.spare.push(run);
         }
+    }
+
+    /// The hub's clock, once a second: with no run taken since the last
+    /// look, the runs kept are let go of, and runs open small again.
+    fn trim_if_idle(&self) {
+        let spare = {
+            let mut queue = self.queue.lock();
+            if std::mem::take(&mut queue.taken_lately) {
+                return;
+            }
+            queue.room = RUN_ROOM_MIN;
+            std::mem::take(&mut queue.spare)
+        };
+        drop(spare);
     }
 }
 
@@ -2910,22 +3059,74 @@ impl HubRx {
     /// [`HubMsg::Propagate`] of all of them: for an inbox read by something
     /// else than the hub (a test).
     pub fn try_recv(&mut self) -> Result<HubMsg, mpsc::error::TryRecvError> {
-        self.rx.try_recv().map(|msg| self.writes_as_one(msg))
+        self.try_next().map(Self::as_message)
     }
 
     /// [`Self::try_recv`], waiting for the next message.
     pub async fn recv(&mut self) -> Option<HubMsg> {
-        let msg = self.rx.recv().await?;
-        Some(self.writes_as_one(msg))
+        self.next().await.map(Self::as_message)
     }
 
-    fn writes_as_one(&self, msg: HubMsg) -> HubMsg {
-        match msg {
-            HubMsg::Writes => {
-                let run = self.writes.take().unwrap_or_default();
-                HubMsg::Propagate(Arc::from(run.as_slice()))
+    fn as_message(delivery: Delivery) -> HubMsg {
+        match delivery {
+            Delivery::Run(run) => HubMsg::Propagate(Arc::from(run.as_slice())),
+            Delivery::Msg(msg) => msg,
+        }
+    }
+
+    /// The next run or message, in the stream's order (see [`HubTx`]).
+    fn try_next(&mut self) -> Result<Delivery, mpsc::error::TryRecvError> {
+        loop {
+            if let Some(ready) = self.ready.pop_front() {
+                return Ok(ready);
             }
-            other => other,
+            let item = self.rx.try_recv()?;
+            self.unfold(item);
+        }
+    }
+
+    /// [`Self::try_next`], waiting for it. Cancel-safe: what is taken off
+    /// the inbox is kept in `ready` before anything is awaited again.
+    async fn next(&mut self) -> Option<Delivery> {
+        loop {
+            if let Some(ready) = self.ready.pop_front() {
+                return Some(ready);
+            }
+            let item = self.rx.recv().await?;
+            self.unfold(item);
+        }
+    }
+
+    fn unfold(&mut self, item: Inbox) {
+        match item {
+            Inbox::Run(n) => self.take_runs_before(n + 1),
+            Inbox::Ordered { after_runs, msg } => {
+                self.take_runs_before(after_runs);
+                self.ready.push_back(Delivery::Msg(msg));
+            }
+            Inbox::Unordered(msg) => self.ready.push_back(Delivery::Msg(msg)),
+        }
+    }
+
+    /// Every run numbered under `end` not taken yet, into `ready`. Each is
+    /// queued already: it was opened before the news or message that asks
+    /// for it was queued.
+    fn take_runs_before(&mut self, end: u64) {
+        let mut queue = self.writes.queue.lock();
+        while queue.taken < end {
+            let run = queue
+                .runs
+                .pop_front()
+                .expect("a run is queued before its news, and before any later message");
+            queue.taken += 1;
+            queue.taken_lately = true;
+            if run.len() < queue.room / 4 {
+                queue.room = (queue.room / 2).max(RUN_ROOM_MIN);
+            }
+            self.ready.push_back(Delivery::Run(run));
+        }
+        if queue.runs.is_empty() {
+            queue.open = false;
         }
     }
 }
@@ -2940,6 +3141,8 @@ mod write_run_tests {
     enum Got {
         Writes(Vec<u8>),
         Message(u64),
+        /// The replica id and offset of an `AckOffset`.
+        Ack(u64, u64),
     }
 
     fn take_all(rx: &mut super::HubRx) -> Vec<Got> {
@@ -2948,10 +3151,158 @@ mod write_run_tests {
             got.push(match msg {
                 HubMsg::Propagate(bytes) => Got::Writes(bytes.to_vec()),
                 HubMsg::Deregister(n) => Got::Message(n),
+                HubMsg::AckOffset { replica_id, offset } => Got::Ack(replica_id, offset),
                 _ => panic!("not sent"),
             });
         }
         got
+    }
+
+    /// A write too large to be copied into a run under its lock is handed
+    /// over as a message of its own, between the writes appended before it
+    /// and those appended after it.
+    #[test]
+    fn a_large_write_is_handed_over_between_the_writes_around_it() {
+        let large = vec![b'L'; super::OWN_MESSAGE_FROM];
+        let (tx, mut rx) = HubTx::channel();
+        super::propagate(&tx, b"a".to_vec());
+        super::propagate(&tx, b"b".to_vec());
+        super::propagate(&tx, large.clone());
+        super::propagate(&tx, b"c".to_vec());
+        super::propagate(&tx, large.clone());
+        super::propagate(&tx, large.clone());
+        super::propagate(&tx, b"d".to_vec());
+        assert_eq!(
+            take_all(&mut rx),
+            [
+                Got::Writes(b"ab".to_vec()),
+                Got::Writes(large.clone()),
+                Got::Writes(b"c".to_vec()),
+                Got::Writes(large.clone()),
+                Got::Writes(large),
+                Got::Writes(b"d".to_vec()),
+            ]
+        );
+        // One under the bound goes into the run.
+        let under = vec![b'u'; super::OWN_MESSAGE_FROM - 1];
+        super::propagate(&tx, b"e".to_vec());
+        super::propagate(&tx, under.clone());
+        assert_eq!(
+            take_all(&mut rx),
+            [Got::Writes([&b"e"[..], &under].concat())]
+        );
+    }
+
+    /// An acknowledgement does not close the open run, and is handed over
+    /// in its place among the messages.
+    #[test]
+    fn an_ack_does_not_split_the_run() {
+        let (tx, mut rx) = HubTx::channel();
+        super::propagate(&tx, b"a".to_vec());
+        assert!(tx.send_ack(7, 1));
+        super::propagate(&tx, b"b".to_vec());
+        assert!(tx.send_ack(7, 2));
+        tx.send(HubMsg::Deregister(1)).unwrap();
+        super::propagate(&tx, b"c".to_vec());
+        assert_eq!(
+            take_all(&mut rx),
+            [
+                Got::Writes(b"ab".to_vec()),
+                Got::Ack(7, 1),
+                Got::Ack(7, 2),
+                Got::Message(1),
+                Got::Writes(b"c".to_vec()),
+            ]
+        );
+        // With no run open, it is simply queued.
+        assert!(tx.send_ack(7, 3));
+        super::propagate(&tx, b"d".to_vec());
+        assert_eq!(
+            take_all(&mut rx),
+            [Got::Ack(7, 3), Got::Writes(b"d".to_vec())]
+        );
+    }
+
+    /// The news of a run is queued after its lock is let go of, so a
+    /// message sent meanwhile can be queued ahead of it: the message takes
+    /// the run first, in its place, and the late news finds nothing.
+    #[test]
+    fn a_message_queued_before_a_runs_news_still_comes_after_the_run() {
+        let (tx, mut rx) = HubTx::channel();
+        {
+            // A writer that has opened run 0 and appended to it, and has
+            // not queued the news yet.
+            let mut queue = tx.writes.queue.lock();
+            queue.runs.push_back(b"a".to_vec());
+            queue.open = true;
+            queue.opened = 1;
+        }
+        tx.send(HubMsg::Deregister(1)).unwrap();
+        super::propagate(&tx, b"b".to_vec());
+        tx.tx.send(super::Inbox::Run(0)).unwrap();
+        super::propagate(&tx, b"c".to_vec());
+        assert_eq!(
+            take_all(&mut rx),
+            [
+                Got::Writes(b"a".to_vec()),
+                Got::Message(1),
+                Got::Writes(b"bc".to_vec()),
+            ]
+        );
+        let queue = tx.writes.queue.lock();
+        assert_eq!((queue.opened, queue.taken), (2, 2));
+        assert!(queue.runs.is_empty() && !queue.open);
+    }
+
+    /// A run is never grown, so never copied, under the lock: a write that
+    /// does not fit opens another run, and the next run is opened larger,
+    /// up to the bound. Taken nearly empty, runs open smaller again.
+    #[test]
+    fn a_run_is_never_moved_to_a_larger_buffer() {
+        let (tx, mut rx) = HubTx::channel();
+        let write = vec![b'w'; 1000];
+        let mut sent = 0;
+        for _ in 0..4000 {
+            let before = {
+                let queue = tx.writes.queue.lock();
+                queue
+                    .runs
+                    .back()
+                    .filter(|_| queue.open)
+                    .map(|run| (run.as_ptr(), run.capacity()))
+            };
+            super::propagate(&tx, write.clone());
+            sent += write.len();
+            let queue = tx.writes.queue.lock();
+            let run = queue.runs.back().expect("a run");
+            assert!(run.len() <= super::RUN_ROOM_MAX);
+            if let Some((ptr, capacity)) = before
+                && queue.runs.len() > 1
+                && run.len() == write.len()
+            {
+                // Opened afresh: the one before was left where it was.
+                let previous = &queue.runs[queue.runs.len() - 2];
+                assert_eq!((previous.as_ptr(), previous.capacity()), (ptr, capacity));
+            } else if let Some((ptr, capacity)) = before {
+                assert_eq!((run.as_ptr(), run.capacity()), (ptr, capacity));
+            }
+        }
+        assert_eq!(tx.writes.queue.lock().room, super::RUN_ROOM_MAX);
+        let mut got = 0;
+        for one in take_all(&mut rx) {
+            let Got::Writes(bytes) = one else {
+                panic!("only writes were sent")
+            };
+            assert!(bytes.len() <= super::RUN_ROOM_MAX);
+            got += bytes.len();
+        }
+        assert_eq!(got, sent);
+        // Single writes, each taken at once: the room comes down again.
+        for _ in 0..10 {
+            super::propagate(&tx, b"x".to_vec());
+            assert_eq!(take_all(&mut rx), [Got::Writes(b"x".to_vec())]);
+        }
+        assert_eq!(tx.writes.queue.lock().room, super::RUN_ROOM_MIN);
     }
 
     /// Writes in a row are one run; a message between them ends it, and
@@ -2998,8 +3349,14 @@ mod write_run_tests {
                 let tx = tx.clone();
                 std::thread::spawn(move || {
                     for i in 0..EACH {
-                        if i % 97 == 0 {
+                        if i.is_multiple_of(97) {
                             tx.send(HubMsg::Deregister((t << 32) | i)).unwrap();
+                        } else if i.is_multiple_of(89) {
+                            // Sent as a message of its own.
+                            let pad = "x".repeat(super::OWN_MESSAGE_FROM);
+                            super::propagate(&tx, format!("{t}:{i}:{pad};").into_bytes());
+                        } else if i.is_multiple_of(31) {
+                            assert!(tx.send_ack(t, i));
                         } else {
                             super::propagate(&tx, format!("{t}:{i};").into_bytes());
                         }
@@ -3007,8 +3364,16 @@ mod write_run_tests {
                 })
             })
             .collect();
+        // Acknowledgements have no place among the writes (`send_ack`):
+        // each is handed over once, anywhere among them.
+        let is_ack =
+            |i: u64| !i.is_multiple_of(97) && !i.is_multiple_of(89) && i.is_multiple_of(31);
         let mut next = [0u64; THREADS as usize];
-        let mut seen = |t: u64, i: u64| {
+        let mut acks = [0u64; THREADS as usize];
+        let seen = |next: &mut [u64; THREADS as usize], t: u64, i: u64| {
+            while is_ack(next[t as usize]) {
+                next[t as usize] += 1;
+            }
             assert_eq!(next[t as usize], i, "thread {t} out of order");
             next[t as usize] += 1;
         };
@@ -3017,12 +3382,18 @@ mod write_run_tests {
             done = threads.iter().all(|t| t.is_finished());
             for got in take_all(&mut rx) {
                 match got {
-                    Got::Message(n) => seen(n >> 32, n & 0xffff_ffff),
+                    Got::Message(n) => seen(&mut next, n >> 32, n & 0xffff_ffff),
+                    Got::Ack(t, i) => {
+                        assert!(is_ack(i), "thread {t}: no ack {i} was sent");
+                        acks[t as usize] += 1;
+                    }
                     Got::Writes(bytes) => {
                         let text = String::from_utf8(bytes).unwrap();
                         for write in text.split_terminator(';') {
-                            let (t, i) = write.split_once(':').unwrap();
-                            seen(t.parse().unwrap(), i.parse().unwrap());
+                            let mut fields = write.splitn(3, ':');
+                            let t = fields.next().unwrap().parse().unwrap();
+                            let i = fields.next().unwrap().parse().unwrap();
+                            seen(&mut next, t, i);
                         }
                     }
                 }
@@ -3032,35 +3403,54 @@ mod write_run_tests {
             t.join().unwrap();
         }
         assert_eq!(take_all(&mut rx), [], "left over");
+        for n in next.iter_mut() {
+            while *n < EACH && is_ack(*n) {
+                *n += 1;
+            }
+        }
         assert_eq!(next, [EACH; THREADS as usize]);
+        let per_thread = (0..EACH).filter(|&i| is_ack(i)).count() as u64;
+        assert_eq!(acks.iter().sum::<u64>(), per_thread * THREADS);
     }
 
-    /// The memory kept for runs once they are taken is bounded.
+    /// The memory kept for runs once they are taken is bounded, and let go
+    /// of once the hub has taken none for a while.
     #[test]
     fn emptied_runs_are_kept_only_up_to_a_bound() {
         let (tx, mut rx) = HubTx::channel();
         for _ in 0..10 {
-            super::propagate(&tx, vec![0u8; super::SPARE_RUN_CAPACITY * 2]);
+            for _ in 0..3000 {
+                super::propagate(&tx, vec![0u8; 1000]);
+            }
             tx.send(HubMsg::Deregister(0)).unwrap();
             super::propagate(&tx, vec![0u8; 100]);
             tx.send(HubMsg::Deregister(0)).unwrap();
         }
         // Taken by the hub, which gives them back.
-        while let Ok(msg) = rx.rx.try_recv() {
-            if let HubMsg::Writes = msg {
-                let run = rx.writes.take().unwrap();
+        while let Ok(delivery) = rx.try_next() {
+            if let super::Delivery::Run(run) = delivery {
                 rx.writes.give_back(run);
             }
         }
+        {
+            let queue = tx.writes.queue.lock();
+            assert!(queue.runs.is_empty());
+            assert!(!queue.spare.is_empty());
+            assert!(queue.spare.len() <= super::SPARE_RUNS);
+            assert!(
+                queue
+                    .spare
+                    .iter()
+                    .all(|run| run.is_empty() && run.capacity() <= super::RUN_ROOM_MAX)
+            );
+        }
+        // The clock's first look sees runs taken; its next sees none.
+        tx.writes.trim_if_idle();
+        assert!(!tx.writes.queue.lock().spare.is_empty());
+        tx.writes.trim_if_idle();
         let queue = tx.writes.queue.lock();
-        assert!(queue.runs.is_empty());
-        assert!(queue.spare.len() <= super::SPARE_RUNS);
-        assert!(
-            queue
-                .spare
-                .iter()
-                .all(|run| run.is_empty() && run.capacity() <= super::SPARE_RUN_CAPACITY)
-        );
+        assert!(queue.spare.is_empty());
+        assert_eq!(queue.room, super::RUN_ROOM_MIN);
     }
 }
 
@@ -3087,13 +3477,8 @@ mod write_run_tests {
 /// them for replicas already attached. The master logs how far each
 /// replica's queue went during its sync.
 pub fn start_hub(state: Arc<ReplState>) -> HubTx {
-    let (
-        hub_tx,
-        HubRx {
-            rx: mut hub_rx,
-            writes,
-        },
-    ) = HubTx::channel();
+    let (hub_tx, mut hub_rx) = HubTx::channel();
+    let writes = Arc::clone(&hub_rx.writes);
     let _ = state.hub.set(hub_tx.downgrade());
     // For the heartbeat, which the hub sends to itself. Weak, so that the hub
     // still ends when every real sender is gone.
@@ -3166,7 +3551,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                 && channel_replicas.is_empty()
                 && drained < BACKLOG_DRAIN
             {
-                match hub_rx.try_recv() {
+                match hub_rx.try_next() {
                     Ok(m) => {
                         drained += 1;
                         Some(m)
@@ -3193,7 +3578,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         state.hub_parks.fetch_add(1, Ordering::Relaxed);
                     }
                     tokio::select! {
-                    msg = hub_rx.recv(), if !pace => match msg {
+                    msg = hub_rx.next(), if !pace => match msg {
                         // Woken by a write: the next empty look sleeps too,
                         // or writes that come one at a time would each wake
                         // it. With a replica attached `paced` is cleared
@@ -3211,6 +3596,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     }
                     _ = tick.tick() => {
                         backlog.report(&state);
+                        writes.trim_if_idle();
                         // A queue under the soft limit now is no longer over it,
                         // though nothing was written to find that out: its clock
                         // starts again. Without this, a replica that went over,
@@ -3303,10 +3689,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
             // A run of writes (see `HubTx`): into the backlog at once with no
             // replica attached, without the copy a payload to share is.
             let msg = match msg {
-                HubMsg::Writes => {
-                    let Some(run) = writes.take() else {
-                        continue;
-                    };
+                Delivery::Run(run) => {
                     if socket_replicas.is_empty() && channel_replicas.is_empty() {
                         backlog.push(&run, state.backlog_size.load(Ordering::Relaxed) as usize);
                         writes.give_back(run);
@@ -3316,10 +3699,9 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     writes.give_back(run);
                     HubMsg::Propagate(payload)
                 }
-                other => other,
+                Delivery::Msg(msg) => msg,
             };
             match msg {
-                HubMsg::Writes => unreachable!("a run is handed on as a Propagate"),
                 HubMsg::AckOffset { replica_id, offset } => {
                     // Only for a replica the hub still has. A replica let go
                     // of for its queue limit can still have an ACK on the
@@ -4243,7 +4625,7 @@ pub fn propagate(hub_tx: &HubTx, raw: Vec<u8>) {
 /// [`propagate`] of bytes the caller keeps.
 #[inline]
 fn append_to_stream(hub_tx: &HubTx, raw: &[u8]) {
-    if !hub_tx.append(|run| run.extend_from_slice(raw)) {
+    if !hub_tx.append(raw) {
         log_warn!("Replication: Hub sender closed — replication cannot proceed");
     }
 }
@@ -4286,6 +4668,21 @@ fn straight_to_the_hub<A: AsRef<[u8]>>(ctx: &crate::commands::ctx::Ctx<'_>, part
         }
         len
     });
+    // Appended first and counted after, where `replicate_one_write` counts
+    // first and appends after: the length is known only once the write is
+    // encoded, and encoding it into the thread's buffer is what keeps it
+    // out of the run lock. Either order is one step to everything that
+    // takes the offset and the stream together: both happen inside the
+    // write gate, which the caller holds from before the write took effect
+    // until after this, and each of those takes them at a cut
+    // (`write_gate::cut`: a full sync's `+FULLRESYNC` offset and its
+    // registration with the hub, a backup's tap, the resync point saved
+    // by a node turning into a replica or by an AOF checkpoint, a
+    // shutdown's end of the stream). A cut waits for every writer in the
+    // gate to leave and lets none in, so it sees the write both appended
+    // and counted, or neither. What reads the offset outside a cut (`INFO`,
+    // `ROLE`) only reports it; `WAIT`'s targets are the hub's `sent`
+    // counts, not this offset.
     state.repl_offset.fetch_add(len as u64, Ordering::Relaxed);
     true
 }
@@ -4421,6 +4818,8 @@ pub fn replicate_one_write(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>
                     .extend_from_slice(raw_opt.as_ref().expect("just encoded"))
             });
         } else {
+            // Counted, then appended: `straight_to_the_hub` does the two the
+            // other way round, and says why both are one step to a cut.
             ctx.repl_state
                 .repl_offset
                 .fetch_add(enc_len, Ordering::Relaxed);
