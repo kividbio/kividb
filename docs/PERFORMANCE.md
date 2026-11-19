@@ -411,6 +411,17 @@ in three of every build (1.2's way included) the probe's median was near
 on the loading client's worker, behind that client's pipelines. Those runs
 are left out above.
 
+Under a CPU quota there are no helpers. In a container with `--cpus 2` on
+the same 8-vCPU VM, memtier GET/SET from the host while one client loaded
+384-d vectors (30 s, 3 runs), one helper took GET/SET from 141-142k a
+second at a p99 of 0.35-0.38 ms to 93-96k at 8.0-9.3 ms, the container
+throttled in every period: `SCHED_IDLE` keeps a thread off busy CPUs, not
+off the quota, and with idle CPUs beside it the helper ran until the quota
+was spent. With `--cpus 4`, two helpers: 147-150k at 0.32-0.35 ms against
+119-121k at 0.95-0.98 ms, the load 1,500-1,550 documents a second against
+2,390-2,410. Without helpers under the quota 1.3.0 measures as 1.2 does
+there (140-143k at 0.35 ms with `--cpus 2`, 148-150k at 0.33 ms with 4).
+
 Left: 64-d documents build at 0.62x Redis's rate. Per document the helpers
 spend 23 % more CPU than one thread linking alone (93.6 against 77.2 CPU
 seconds for 200,000): no lock shows in the profile (`search_layer` 57 %,
