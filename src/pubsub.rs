@@ -219,6 +219,12 @@ impl PubSubHub {
         &self.inner.limits
     }
 
+    /// The same limits, shared: for a monitor, held to the `normal` class's
+    /// (`monitor::connect`).
+    pub fn shared_limits(&self) -> Arc<OutputLimits> {
+        Arc::clone(&self.inner.limits)
+    }
+
     fn add(&self, kind: usize, name: &Name, subscriber: &Arc<Subscriber>) {
         let mut tables = self.inner.tables.write();
         tables[kind]

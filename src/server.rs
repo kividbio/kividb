@@ -809,6 +809,39 @@ where
     subs
 }
 
+/// A connection made a monitor, with the task that writes what it is shown.
+fn start_monitoring<S>(
+    monitor_registry: &crate::monitor::SharedMonitorRegistry,
+    client_registry: &crate::client_registry::ClientRegistry,
+    client_id: u64,
+    pubsub: &crate::pubsub::PubSubHub,
+    writer: &Arc<Mutex<tokio::io::WriteHalf<S>>>,
+) -> crate::monitor::Monitoring
+where
+    S: AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut monitoring, mut outbox) = crate::monitor::connect(
+        monitor_registry,
+        Arc::clone(client_registry),
+        client_id,
+        pubsub.shared_limits(),
+    );
+    let writer = Arc::clone(writer);
+    monitoring.forwarded_by(tokio::spawn(async move {
+        while let Some(lines) = outbox.next().await {
+            let mut g = writer.lock().await;
+            crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(lines.len() as u64, Ordering::Relaxed);
+            crate::stats::record_write();
+            if g.write_all(&lines).await.is_err() {
+                break;
+            }
+            drop(g);
+            outbox.written(lines);
+        }
+    }));
+    monitoring
+}
+
 /// Replica / monitor: channel-fed writer multiplexes onto `writer`.
 fn spawn_mux_to_socket<S>(
     writer: Arc<Mutex<tokio::io::WriteHalf<S>>>,
@@ -1985,9 +2018,12 @@ where
             // runs it (#550).
             if cmd_name == "MONITOR" && !tx.active {
                 if monitoring.is_none() {
-                    monitoring = Some(crate::monitor::Monitoring::start(
+                    monitoring = Some(start_monitoring(
                         &monitor_registry,
-                        push_tx.clone(),
+                        &client_registry,
+                        client_id,
+                        &pubsub,
+                        &writer,
                     ));
                     client_registry.update(client_id, |info| info.flags = "O".to_string());
                 }
