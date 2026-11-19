@@ -321,17 +321,23 @@ pub fn check_dispatch(name: &str, cmd: &[&[u8]]) -> Option<Vec<u8>> {
 /// how the command's keys are found (`keyspec::Shape`) if the table has the
 /// name. That is what the look for hash tags needs next
 /// (`tag_locks::named_keys_of`), which would otherwise look the name up
-/// again in `keyspec`'s table (#889). `None`: ask [`check_dispatch`] (a
-/// longer name, the wrong number of arguments, subcommands, a command that
-/// allocates as much as its arguments say). Small, so that it comes back
-/// in a register: the reply is built only on the way that needs it.
+/// again in `keyspec`'s table (#889); a longer name is looked up as
+/// [`check_dispatch`] looks it up, and has no shape here. `None`: ask
+/// [`check_dispatch`] for the reply (the wrong number of arguments,
+/// subcommands, a command that allocates as much as its arguments say).
+/// Small, so that it comes back in a register: the reply is built only on
+/// the way that needs it.
 #[cfg(feature = "lua")]
 #[inline(always)]
 pub fn fits_with_shape(name: &str, cmd: &[&[u8]]) -> Option<Option<crate::keyspec::Shape>> {
+    let arities = &*ARITIES;
     if !(1..=ShortNames::LONGEST).contains(&name.len()) {
-        return None;
+        return match check_long::<true>(arities, name, cmd) {
+            None => Some(None),
+            Some(_) => None,
+        };
     }
-    match ARITIES.short.get_with_shape(name.as_bytes()) {
+    match arities.short.get_with_shape(name.as_bytes()) {
         // As `check_as`: a name not in the table is not refused here.
         None => Some(None),
         Some((arity, container, shape)) => {

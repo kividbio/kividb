@@ -1767,12 +1767,13 @@ fn room_in_script(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     room_before_dispatch(ctx, name)
 }
 
-/// [`execute_command`], once the command's name is known; it started at
-/// `started`.
 /// With Lua, for a command `arity::fits_with_shape` did not let through:
 /// the reply to the wrong number of arguments, or room made for a command
-/// that allocates as much as its arguments say (`room_on_arrival`).
+/// that allocates as much as its arguments say (`room_on_arrival`). Out of
+/// line, off the way of every other command.
 #[cfg(feature = "lua")]
+#[cold]
+#[inline(never)]
 fn arity_refusal(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     let refusal = crate::commands::arity::check_dispatch(name, &ctx.cmd)?;
     // Empty: a command that allocates as much as its arguments say, given
@@ -1783,6 +1784,8 @@ fn arity_refusal(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     room_on_arrival(ctx, name)
 }
 
+/// [`execute_command`], once the command's name is known; it started at
+/// `started`.
 fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8> {
     // The wrong number of arguments is refused before anything else looks
     // at the command, as in Redis. See `arity`. With Lua, the same lookup
