@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/topk.rs
 //
 // Top-K sketches (`TOPK.*`), against what Redis 8.10.2 does:
