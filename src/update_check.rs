@@ -24,6 +24,7 @@
 //! or `KIVIDB_NO_UPDATE_CHECK=1`; and never made by a debug build, or when
 //! `CI` is set in the environment. docs/UPDATE_CHECK.md has the details.
 
+use crate::cpus::BuilderExt as _;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, mpsc};
@@ -78,7 +79,7 @@ pub fn start(config: &crate::config::Config) -> Option<Pending> {
     let (tx, reply) = mpsc::channel();
     std::thread::Builder::new()
         .name("update-check".into())
-        .spawn(move || {
+        .spawn_released(move || {
             let _ = tx.send(check(&url));
         })
         .ok()?;

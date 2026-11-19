@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/resp3.rs — byte-level RESP3 wire-shape tests.
 //
 // Everything here asserts on RAW BYTES rather than going through a parsing

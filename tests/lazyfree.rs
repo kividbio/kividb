@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Freeing in the background, and INFO's count of it (#19): what UNLINK,
 // FLUSHALL / FLUSHDB [ASYNC] and FUNCTION FLUSH ASYNC add to
 // `lazyfreed_objects`, as the Redis suite's unit/lazyfree checks.

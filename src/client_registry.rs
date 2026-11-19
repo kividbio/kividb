@@ -1094,13 +1094,17 @@ impl ClientRegistryInner {
     }
 
     /// `CLIENT UNBLOCK`: end the client's wait, if it is waiting.
+    ///
+    /// Sent under the lock: a wait that ends otherwise at the same moment,
+    /// woken say, takes its client off the list under it too
+    /// (`set_blocked`), and then finds what was sent in its channel and does
+    /// it, as was answered.
     pub fn unblock(&self, id: u64, how: crate::commands::blocking::Unblock) -> bool {
-        let sender = self
-            .clients
+        self.clients
             .write()
             .get_mut(&id)
-            .and_then(|info| info.unblock_tx.take());
-        sender.is_some_and(|tx| tx.send(how).is_ok())
+            .and_then(|info| info.unblock_tx.take())
+            .is_some_and(|tx| tx.send(how).is_ok())
     }
 
     /// `clients_in_timeout_table` (#158): clients blocked with a timeout.
@@ -1114,15 +1118,16 @@ impl ClientRegistryInner {
     /// (#591). A client paused by `CLIENT PAUSE` is not blocked, and is let
     /// be, as in Redis. Returns how many were ended.
     pub fn end_blocked_for_role_change(&self) -> usize {
-        let senders: Vec<_> = self
-            .clients
+        // Sent under the lock, as `unblock` sends.
+        self.clients
             .write()
             .values_mut()
-            .filter_map(|info| info.unblock_tx.take())
-            .collect();
-        senders
-            .into_iter()
-            .filter_map(|tx| tx.send(crate::commands::blocking::Unblock::RoleChange).ok())
+            .filter_map(|info| {
+                info.unblock_tx
+                    .take()?
+                    .send(crate::commands::blocking::Unblock::RoleChange)
+                    .ok()
+            })
             .count()
     }
 

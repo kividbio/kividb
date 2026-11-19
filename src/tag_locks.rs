@@ -1166,7 +1166,7 @@ mod tests {
                 .unwrap();
         });
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn({
+        let waiter = crate::cpus::spawn({
             let key = format!("{{{b}}}:k");
             move || {
                 let _held = lock_keys([key.as_bytes()].into_iter());
@@ -1292,7 +1292,7 @@ mod tests {
         // The same tag waits until the script lets go.
         let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
+        let waiter = crate::cpus::spawn(move || {
             waiting_tx.send(()).unwrap();
             let _held = lock_keys([b"{busy-queue}:k".as_slice()].into_iter());
             done_tx.send(()).unwrap();

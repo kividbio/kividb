@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/tracking_count.rs
 //
 // INFO clients' `tracking_clients`. The count is the process's, so the one

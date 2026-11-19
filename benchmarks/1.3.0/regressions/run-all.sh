@@ -3,7 +3,17 @@
 #
 #   run-all.sh --candidate <path-to-kividb | tag> [--label NAME] [--only 01,04]
 #              [--engines v1_2_2,candidate,redis] [--record] [--candidate-commit SHA]
+#              [--candidate-full <path-to-kividb built with lua,tls | tag>] [--min-cpus-only]
 #   FULL=1 run-all.sh ...      also the long configurations (17.5M keys with EX)
+#
+# A suite that declares Suite(..., min_cpus=N) is not run on a machine with
+# fewer CPUs (env.json `needs_more_cpus`) unless --only names it, which makes
+# the run INVALID. --min-cpus-only runs just those suites (on a machine big
+# enough for all of them: exit 2 otherwise); the release gate needs such a run
+# next to the full one.
+#
+# Configurations that need scripts (Config(lua=True)) run v1.2.2's `full`
+# build and the --candidate-full binary; without it they are skipped.
 #
 # Each suite runs against v1.2.2 (the release tarball, SHA-256 checked), the
 # candidate and Redis 8.10.x, one server at a time on this machine, each
@@ -15,24 +25,28 @@
 #   ALLOW_VM_CHANGE=1          compare/record on another VM size than recorded
 #   REGRESS_REDIS_SHA256=<sha> accept another redis-server than the pinned one
 #   SCALE=0.01                 smoke run: tiny datasets, gates not checked
+#   REGRESS_ALLOW_RUSTC=1      judge a candidate built by an older (or unreadable)
+#                              rustc than v1.2.2 (otherwise INVALID): a deliberate check
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 export REGRESS_LIB=$here/lib
 # shellcheck source=lib/engines.sh
 source "$here/lib/engines.sh"
 
-CANDIDATE= LABEL= ONLY= ENGINES=v1_2_2,candidate,redis RECORD= CAND_COMMIT=
+CANDIDATE= CANDIDATE_FULL= LABEL= ONLY= ENGINES=v1_2_2,candidate,redis RECORD= CAND_COMMIT= MIN_ONLY=0
 REFERENCE_TAG=${REFERENCE_TAG:-v1.2.2}
 SUITE_TIMEOUT=${SUITE_TIMEOUT:-1800}
 while [ $# -gt 0 ]; do
   case $1 in
     --candidate) CANDIDATE=$2; shift 2 ;;
+    --candidate-full) CANDIDATE_FULL=$2; shift 2 ;;
     --label) LABEL=$2; shift 2 ;;
     --only) ONLY=$2; shift 2 ;;
     --engines) ENGINES=$2; shift 2 ;;
     --record) RECORD=--record; shift ;;
     --candidate-commit) CAND_COMMIT=$2; shift 2 ;;
-    -h | --help) sed -n '2,17p' "$0"; exit 0 ;;
+    --min-cpus-only) MIN_ONLY=1; shift ;;
+    -h | --help) sed -n '2,29p' "$0"; exit 0 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -73,8 +87,13 @@ export PYTHON=$VENV/bin/python
 # Engines.
 declare -A BIN KIND
 BIN[v1_2_2]=$(engines_fetch_release "$REFERENCE_TAG" default "$REGRESS_CACHE/releases")
-engines_fetch_release "$REFERENCE_TAG" full "$REGRESS_CACHE/releases" >/dev/null  # for suites that need Lua
 BIN[candidate]=$(engines_resolve_candidate "$CANDIDATE" "$REGRESS_CACHE/releases")
+# The lua,tls builds, for the configurations that need scripts (Config(lua=True)).
+declare -A FULLBIN
+FULLBIN[v1_2_2]=$(engines_fetch_release "$REFERENCE_TAG" full "$REGRESS_CACHE/releases")
+if [ -n "$CANDIDATE_FULL" ]; then
+  FULLBIN[candidate]=$(engines_resolve_candidate "$CANDIDATE_FULL" "$REGRESS_CACHE/releases" full)
+fi
 BIN[redis]=$(engines_resolve_redis "$REGRESS_CACHE/redis")
 KIND[v1_2_2]=kividb KIND[candidate]=kividb KIND[redis]=redis
 # redis-cli and redis-benchmark of the same build, for the suites that drive them.
@@ -130,41 +149,89 @@ vm_size() {
     curl -fs -m 2 http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo "${VM_SIZE:-unknown}"
 }
 
-declare -A SECS
+# Assigned empty: under set -u an unassigned associative array is "unbound".
+declare -A SECS=() NEEDS_MORE=() BELOW_MIN=() SUITE_MIN=()
+SKIPPED=()
+# The CPUs this run may use: the affinity count (nproc), capped by a cgroup
+# CPU quota (cpu.max "<quota> <period>", floored). env.json records this one.
+cpus_usable() {
+  local n q p
+  n=$(nproc)
+  if read -r q p < /sys/fs/cgroup/cpu.max 2>/dev/null && [ "$q" != max ] && [ "${p:-0}" -gt 0 ]; then
+    q=$((q / p)); [ "$q" -lt 1 ] && q=1; [ "$q" -lt "$n" ] && n=$q
+  fi
+  echo "$n"
+}
+NPROC=$(cpus_usable)
+export REGRESS_NPROC=$NPROC
+named_in_only() { # suite -> 0 if an --only entry names it
+  local w
+  for w in ${ONLY//,/ }; do suite_matches "$1" "$w" && return 0; done
+  return 1
+}
 ran=0
 for f in "${SUITES[@]}"; do
   suite=${f%.py}
   want_suite "$suite" || continue
-  echo "=== $suite"
-  s0=$(date +%s)
   # A suite that fails to import or to list its configurations fails the run.
   if ! cfgs=$("$PYTHON" "$here/suites/$f" --configs </dev/null) || [ -z "$cfgs" ]; then
+    echo "=== $suite"
     fail "$suite: --configs failed or listed nothing"
     continue
   fi
+  # The CPUs the suite needs (Suite(..., min_cpus=N)): below that the load
+  # generator, not the server, is what it measures.
+  min=$("$PYTHON" -c 'import json,sys;print(int(json.loads(sys.argv[1].splitlines()[0]).get("min_cpus", 0) or 0))' "$cfgs")
+  [ "$min" -gt 0 ] && SUITE_MIN[$suite]=$min
+  if [ "$MIN_ONLY" = 1 ] && [ "$min" -eq 0 ]; then
+    continue
+  fi
+  if [ "$min" -gt "$NPROC" ]; then
+    if [ "$MIN_ONLY" = 1 ]; then
+      echo "--min-cpus-only: $suite needs $min CPUs and this machine has $NPROC" >&2
+      exit 2
+    fi
+    if ! named_in_only "$suite"; then
+      echo "=== $suite: not run (needs $min CPUs, this machine has $NPROC; run it with --min-cpus-only on one that big)"
+      NEEDS_MORE[$suite]=$min
+      continue
+    fi
+    echo "!!! $suite needs $min CPUs and this machine has $NPROC: run because --only names it; the run is not valid for the gate" >&2
+    BELOW_MIN[$suite]=$min
+  fi
+  echo "=== $suite"
+  s0=$(date +%s)
   while IFS= read -r cfg; do
     name=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["name"])' "$cfg")
     io=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["io"])' "$cfg")
     threads=$("$PYTHON" -c 'import json,sys;print(json.loads(sys.argv[1])["threads"])' "$cfg")
     engs=$("$PYTHON" -c 'import json,sys;print(" ".join(json.loads(sys.argv[1])["engines"]))' "$cfg")
     selfh=$("$PYTHON" -c 'import json,sys;print(int(json.loads(sys.argv[1]).get("self_hosted", False)))' "$cfg")
+    lua=$("$PYTHON" -c 'import json,sys;print(int(json.loads(sys.argv[1]).get("lua", False)))' "$cfg")
+    if [ "$lua" = 1 ] && [ -z "$CANDIDATE_FULL" ] && want_engine candidate; then
+      echo "--- $suite $name: skipped (needs scripts: pass --candidate-full <lua,tls build>)"
+      SKIPPED+=("$suite/$name")
+      continue
+    fi
     "$PYTHON" -c 'import json,sys;c=json.loads(sys.argv[1]);print(json.dumps({"suite":sys.argv[2],"config":c["name"],"engines":c["engines"]}))' \
       "$cfg" "$suite" >>"$EXPECTED"
     for e in $engs; do
       want_engine "$e" || continue
       echo "--- $suite $name $e"
       ran=$((ran + 1))
+      bin=${BIN[$e]}
+      [ "$lua" = 1 ] && [ -n "${FULLBIN[$e]:-}" ] && bin=${FULLBIN[$e]}
       srv=()
       if [ "$selfh" = 1 ]; then
         # The suite starts (and always stops) its own servers from --bin.
         ENGINE_LOG=/dev/null
       else
-        engine_start "${KIND[$e]}" "${BIN[$e]}" "$io" "$threads" || { fail "$suite $name $e: server did not start"; continue; }
+        engine_start "${KIND[$e]}" "$bin" "$io" "$threads" || { fail "$suite $name $e: server did not start"; continue; }
         srv=(--port "$ENGINE_PORT" --pid "$ENGINE_PID")
       fi
       # In the background and waited for, so that a signal stops the run at once.
       timeout "$SUITE_TIMEOUT" "$PYTHON" "$here/suites/$f" --config "$name" --engine "$e" \
-        --kind "${KIND[$e]}" "${srv[@]}" --bin "${BIN[$e]}" --out "$WORK" </dev/null &
+        --kind "${KIND[$e]}" "${srv[@]}" --bin "$bin" --out "$WORK" </dev/null &
       CHILD=$!
       rc=0
       wait "$CHILD" || rc=$?
@@ -178,18 +245,32 @@ for f in "${SUITES[@]}"; do
   SECS[$suite]=$(($(date +%s) - s0))
   echo "=== $suite took ${SECS[$suite]} s"
 done
+if [ "$MIN_ONLY" = 1 ] && [ ${#SUITE_MIN[@]} -eq 0 ]; then
+  echo "--min-cpus-only: no suite declares min_cpus; nothing to run (and nothing the release gate needs)"
+  rmdir "$OUT" 2>/dev/null || true
+  exit 0
+fi
 [ $ran -gt 0 ] || fail "nothing ran (--only $ONLY, --engines $ENGINES)"
 if [ -f "$WORK/results.jsonl" ]; then cp "$WORK/results.jsonl" "$OUT/results.jsonl"; fi
 
 # Where and what: env.json.
 {
   secs=$(for k in "${!SECS[@]}"; do printf '"%s": %s,' "$k" "${SECS[$k]}"; done)
+  jmap() { # name of an associative array -> {"k": v, ...}
+    local -n m=$1
+    local k s=
+    for k in "${!m[@]}"; do s+="\"$k\": ${m[$k]},"; done
+    echo "{${s%,}}"
+  }
+  export REGRESS_NEEDS_MORE_CPUS=$(jmap NEEDS_MORE) REGRESS_BELOW_MIN_CPUS=$(jmap BELOW_MIN) \
+    REGRESS_SUITE_MIN_CPUS=$(jmap SUITE_MIN) REGRESS_MIN_CPUS_ONLY=$MIN_ONLY
   "$PYTHON" - "$OUT/env.json" "$LABEL" "$CAND_COMMIT" "{${secs%,}}" "$(vm_size)" \
     "${BIN[v1_2_2]}" "${BIN[candidate]}" "${BIN[redis]}" "$FAILURES" "$EXPECTED" "$ENGINES" \
-    "${SCALE:-1}" "${FULL:-0}" "$ONLY" "$CAND_ALLOC" <<'EOF'
-import json, sys, os, platform, subprocess, hashlib, datetime
+    "${SCALE:-1}" "${FULL:-0}" "$ONLY" "$CAND_ALLOC" "${FULLBIN[v1_2_2]}" "${FULLBIN[candidate]:-}" \
+    "${SKIPPED[*]:-}" <<'EOF'
+import json, sys, os, platform, subprocess, hashlib, datetime, re
 (out, label, commit, secs, vm, b122, bcand, bredis, failures, expected, engines,
- scale, full, only, alloc) = sys.argv[1:16]
+ scale, full, only, alloc, b122full, bcandfull, skipped) = sys.argv[1:19]
 def sha(p):
     h = hashlib.sha256()
     with open(os.path.realpath(p), "rb") as f:
@@ -201,6 +282,17 @@ def ver(p):
         return subprocess.run([p, "--version"], capture_output=True, text=True, timeout=10).stdout.strip().splitlines()[0]
     except Exception as e:
         return "?"
+def rustc(p):
+    # The compiler named in the binary's .comment section ("rustc version
+    # 1.100.0 (...)"). Two builds of the same code by two Rust releases
+    # differed by 10-30 % on script and PUBLISH rows (#900): compare.py warns
+    # when the candidate's differs from v1.2.2's.
+    try:
+        with open(os.path.realpath(p), "rb") as f:
+            m = re.search(rb"rustc version ([0-9][0-9A-Za-z.\-]*)", f.read())
+        return m.group(1).decode() if m else None
+    except Exception:
+        return None
 cpu = "?"
 try:
     cpu = next(l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name"))
@@ -223,14 +315,30 @@ except Exception:
 import redis
 env = {
     "label": label, "date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"),
-    "vm": vm, "cpu": cpu, "nproc": os.cpu_count(), "calib_ms": calib, "kernel": platform.release(),
+    "vm": vm, "cpu": cpu, "nproc": int(os.environ.get("REGRESS_NPROC") or os.cpu_count()), "cpu_count": os.cpu_count(), "calib_ms": calib, "kernel": platform.release(),
     "glibc": platform.libc_ver()[1], "python": platform.python_version(), "redis_py": redis.__version__,
     "candidate_commit": commit, "candidate_allocator": alloc, "suite_seconds": json.loads(secs),
     "scale": scale, "full": full, "only": only, "engines_selected": engines.split(","),
     "failures": [l.strip() for l in open(failures) if l.strip()],
     "expected": [json.loads(l) for l in open(expected) if l.strip()],
-    "engines": {k: {"path": p, "sha256": sha(p), "version": ver(p)}
-                for k, p in (("v1_2_2", b122), ("candidate", bcand), ("redis", bredis))},
+    "engines": {k: {"path": p, "sha256": sha(p), "version": ver(p), "rustc": rustc(p) if k != "redis" else None}
+                for k, p in (("v1_2_2", b122), ("candidate", bcand), ("redis", bredis),
+                             ("v1_2_2_full", b122full), ("candidate_full", bcandfull)) if p},
+    "skipped_configs": skipped.split(),
+    "rustc_override": os.environ.get("REGRESS_ALLOW_RUSTC", "") not in ("", "0"),
+    # ALLOW_VM_CHANGE=1: judged on another VM size than the recorded one.
+    "allow_vm_change": os.environ.get("ALLOW_VM_CHANGE", "") not in ("", "0"),
+    # Redis built here from its release tarball: the tarball's checked SHA-256
+    # (lib/engines.sh), which is what is pinned for such a build.
+    "redis_source_sha256": (open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(bredis))), "SOURCE_SHA256")).read().strip()
+                            if os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(bredis))), "SOURCE_SHA256")) else None),
+    # Suites that declare min_cpus: not run on this smaller machine
+    # (needs_more_cpus), run below it because --only named them (not valid
+    # for the gate), and what every declaring suite needs.
+    "needs_more_cpus": json.loads(os.environ.get("REGRESS_NEEDS_MORE_CPUS") or "{}"),
+    "ran_below_min_cpus": json.loads(os.environ.get("REGRESS_BELOW_MIN_CPUS") or "{}"),
+    "suite_min_cpus": json.loads(os.environ.get("REGRESS_SUITE_MIN_CPUS") or "{}"),
+    "min_cpus_only": os.environ.get("REGRESS_MIN_CPUS_ONLY") == "1",
 }
 env["run_failed"] = bool(env["failures"])
 json.dump(env, open(out, "w"), indent=1)

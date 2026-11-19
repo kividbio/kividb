@@ -1618,7 +1618,7 @@ mod expiries_tests {
         let readers: Vec<_> = (0..4)
             .map(|_| {
                 let lock = std::sync::Arc::clone(&lock);
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     for _ in 0..1_000 {
                         let times = lock.read();
                         assert!(!times.has_due(now + 30_000));

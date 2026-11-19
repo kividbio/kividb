@@ -171,7 +171,7 @@ mod tests {
         // Another database, another key.
         assert!(!names_a_moving_key(4, "SET", &set(&["SET", "km:a", "1"])));
         assert!(!names_a_moving_key(3, "SET", &set(&["SET", "km:c", "1"])));
-        let waiter = std::thread::spawn(move || {
+        let waiter = crate::cpus::spawn(move || {
             wait_until_moved(3, "INCR", &set(&["INCR", "km:b"]));
         });
         std::thread::sleep(Duration::from_millis(50));

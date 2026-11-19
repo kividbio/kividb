@@ -17,6 +17,7 @@
 // which keys are stored; members of hashes and sets, whose order also
 // differs from node to node, are summed the same way.
 
+use crate::cpus::ScopeExt as _;
 use crate::store::ValueRef;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
@@ -256,7 +257,7 @@ pub fn value_hex(value: ValueRef<'_>) -> String {
 /// The fingerprint of the dataset. Call with nothing writing to it: at
 /// startup, or on a replica between syncs.
 pub fn dataset_digest(store: &crate::store::Store) -> u64 {
-    let threads = std::thread::available_parallelism()
+    let threads = crate::cpus::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
         .clamp(1, 8);
@@ -268,7 +269,7 @@ pub fn dataset_digest(store: &crate::store::Store) -> u64 {
             let handles: Vec<_> = shards
                 .chunks(per)
                 .map(|run| {
-                    scope.spawn(move || {
+                    scope.spawn_released(move || {
                         let mut sum = 0u64;
                         for shard in run {
                             for entry in crate::read_lock!(shard).entries() {
