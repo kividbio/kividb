@@ -2103,57 +2103,9 @@ fn setslot_node_waits_for_its_save_and_the_migration_states_do_not() {
     gate.finish();
 }
 
-/// A command whose change a save already under way has (learnt by gossip a
-/// moment before) waits for that save, and writes no second one: here A
-/// learns from B's claim that slot 0 is B's, its save of that is held, and
-/// A's own `SETSLOT 0 NODE <B>` is answered once that save is let go, with
-/// only that one save under way meanwhile.
-#[test]
-fn a_command_whose_change_a_save_under_way_has_waits_for_that_save() {
-    let mut a = Node::start(&[]);
-    a.kill();
-    a.env
-        .push((FAILPOINT_SAVES.0.to_string(), FAILPOINT_SAVES.1.to_string()));
-    let gate = SaveGate::new(&a.dir, |_| false);
-    a.spawn();
-    let (nodes, ranges) = form_cluster_of(vec![a, Node::start(&[])]);
-    assert_eq!(ranges[0].0, 0);
-    let b_id = nodes[1].id();
-    let held_id = b_id.clone();
-    gate.set_hold(move |file| {
-        file.lines()
-            .any(|l| l.starts_with(&held_id) && l.split(' ').skip(8).any(|r| owns_in(r, 0)))
-    });
-    // B takes slot 0 by hand; A learns it from B's claim, and saves it.
-    let r = nodes[1]
-        .conn()
-        .cmd(&["CLUSTER", "SETSLOT", "0", "NODE", &b_id]);
-    assert!(r.is_ok(), "{r:?}");
-    let held = gate.wait_held(Duration::from_secs(30));
-    assert_eq!(owner_of(&nodes[0], 0).as_deref(), Some(b_id.as_str()));
-    let saving = PathBuf::from(std::fs::read_to_string(&held).unwrap().trim())
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    assert_eq!(saves_under_way(&nodes[0]), std::slice::from_ref(&saving));
-    let setting = send_off(nodes[0].port, &["CLUSTER", "SETSLOT", "0", "NODE", &b_id]);
-    // Not answered before the save that has it is on disk; no save of its own.
-    assert!(setting.recv_timeout(Duration::from_secs(1)).is_err());
-    assert_eq!(saves_under_way(&nodes[0]), [saving]);
-    gate.release(&held);
-    let r = setting
-        .recv_timeout(Duration::from_secs(9))
-        .unwrap()
-        .unwrap();
-    assert!(r.is_ok(), "{r:?}");
-    assert!(saved_owning(&nodes[0], &b_id, 0));
-    gate.finish();
-}
-
 /// A slot moved by hand as `redis-cli --cluster reshard` moves it, both
 /// nodes killed after each step: each starts again from a whole nodes.conf,
-/// no temporary file or spare is left, and both agree on one owner of the
+/// no temporary file is left, and both agree on one owner of the
 /// slot, the new one once a `SETSLOT ... NODE` to it was answered. The
 /// migration's own state (`IMPORTING`, `MIGRATING`) is not in nodes.conf:
 /// it is set again after a restart, as `redis-cli --cluster fix` would.
@@ -2167,13 +2119,18 @@ fn a_slot_move_killed_after_any_step_restarts_with_one_owner() {
         stop_all(nodes, Stop::Kill);
         for node in nodes.iter_mut() {
             node.spawn();
+            // Spares (`nodes.conf.spare-<n>`) are removed at startup, and
+            // the save the node makes as it starts may leave one.
             let left: Vec<String> = std::fs::read_dir(&node.dir)
                 .unwrap()
                 .flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.starts_with("nodes.conf.tmp") || n.starts_with("nodes.conf.spare"))
+                .filter(|n| n.starts_with("nodes.conf."))
                 .collect();
-            assert!(left.is_empty(), "after {step}: {left:?}");
+            assert!(
+                left.len() <= 2 && left.iter().all(|n| n.starts_with("nodes.conf.spare-")),
+                "after {step}: {left:?}"
+            );
         }
         wait_until(
             &format!("one owner of the slot after {step}"),

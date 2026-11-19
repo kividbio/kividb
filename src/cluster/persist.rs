@@ -240,7 +240,7 @@ pub fn save(
     write_temp(&tmp, &render(nodes, slots, current_epoch, last_vote_epoch))?;
     sync_file(&tmp)?;
     fs::rename(&tmp, path)?;
-    sync_dir(path)
+    sync_dir(path).map(|_| ())
 }
 
 /// What nodes.conf holds for this state.
@@ -653,7 +653,9 @@ fn sync_temp(tmp: &Path, spare: bool) -> std::io::Result<()> {
 }
 
 /// Sync the directory `path` is in, so that a rename into it is on disk.
-fn sync_dir(path: &Path) -> std::io::Result<()> {
+/// `Ok(false)` if the filesystem cannot sync it (see [`dir_sync_outcome`]):
+/// the rename stands, not known to be on disk.
+fn sync_dir(path: &Path) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
         let dir = match path.parent() {
@@ -670,33 +672,32 @@ fn sync_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
         let _ = path;
-        injected("nodes-conf-dir-sync-fail", "fail.nodes-conf-dir-sync", true)
+        injected("nodes-conf-dir-sync-fail", "fail.nodes-conf-dir-sync", true).map(|()| false)
     }
 }
 
-/// Set once a sync of the directory was found not to be supported (see
-/// [`dir_sync_outcome`]): no spare is kept from then on, as a rename is not
-/// known to be on disk.
-static DIR_SYNC_SKIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// What a sync of the directory that returned `synced` means for the save.
-/// A filesystem that cannot sync a directory at all (some FUSE, CIFS and 9p
-/// mounts answer `EINVAL` or `ENOTSUP`) does not fail every save: the
-/// rename stands as the filesystem keeps it, and that is said once, as a
-/// warning. Any other error fails the save.
-fn dir_sync_outcome(synced: std::io::Result<()>) -> std::io::Result<()> {
+/// What a sync of the directory that returned `synced` means for the save:
+/// `Ok(true)` if it is synced. A filesystem that cannot sync a directory at
+/// all (some FUSE, CIFS and 9p mounts answer `EINVAL` or `ENOTSUP`) does
+/// not fail every save: the rename stands as the filesystem keeps it
+/// (`Ok(false)`), and that is said once, as a warning. Any other error
+/// fails the save.
+fn dir_sync_outcome(synced: std::io::Result<()>) -> std::io::Result<bool> {
     match synced {
+        Ok(()) => Ok(true),
         Err(e) if cannot_sync_dirs(&e) => {
-            if !DIR_SYNC_SKIPPED.swap(true, Ordering::Relaxed) {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
                 log_warn!(
                     "Cluster: this filesystem cannot sync the directory of the cluster config \
                      file ({e}): a save is renamed into place, but the rename is only as \
                      durable as the filesystem makes it"
                 );
             }
-            Ok(())
+            Ok(false)
         }
-        other => other,
+        Err(e) => Err(e),
     }
 }
 
@@ -849,34 +850,6 @@ fn save_then(
         }
         return Ok(());
     }
-    // The newest save written has this very topology and is still on its
-    // way to the file: this one waits for it rather than write the same file
-    // again (a group commit). A command whose change the bus has just saved
-    // (learnt by gossip a moment before the command came) is answered once
-    // that save is synced, without a second one. Not a save with something
-    // to publish: that one is put in place with the lock held.
-    if publish.is_none()
-        && let Some(newest) = state.saves.newest_written_with(fingerprint)
-        && path.exists()
-    {
-        drop(saving);
-        let deadline = std::time::Instant::now() + OVERTAKEN_SAVE_WAIT;
-        return match wait_synced(&state.saves, newest, deadline) {
-            Ok(()) => {
-                // Every save numbered between the two was skipped or waited
-                // likewise: none has another topology.
-                state.saves.note_saved(generation, false);
-                Ok(())
-            }
-            // Not done in time, or a newer save failed.
-            Err(e) if state.saves.newest_written_with(fingerprint) == Some(newest) => {
-                Err(std::io::Error::other(e))
-            }
-            // It failed, and is no longer the newest written: this one is
-            // made, of the state as it is now.
-            Err(_) => save_then(state, mine, publish),
-        };
-    }
     state.saves.in_flight.fetch_add(1, Ordering::SeqCst);
     // A deferred save is put in place before it is synced: not over a spare
     // (an older nodes.conf, whose blocks a crash could then show under the
@@ -892,7 +865,6 @@ fn save_then(
             return Err(e);
         }
     };
-    state.saves.note_written(generation, fingerprint);
     let result = match publish {
         // A change to publish is synced and put in place with the lock held,
         // so that a sync that fails publishes nothing, and no other save is
@@ -906,20 +878,21 @@ fn save_then(
                 crate::aof::failpoint_noting("nodes-conf-written", &tmp.to_string_lossy());
                 let exchanged = put_in_place(&tmp, path, !deferred)?;
                 state.saves.in_place.store(generation, Ordering::SeqCst);
+                let mut synced = false;
                 if !deferred {
-                    sync_dir(path)?;
+                    synced = sync_dir(path)?;
                     // Only once it is on disk: a save of the same topology
                     // made later is skipped on the strength of it.
                     state
                         .last_saved_fingerprint
                         .store(fingerprint, Ordering::SeqCst);
                 }
-                Ok(exchanged)
+                Ok((exchanged, synced))
             })();
             match placed {
-                Ok(exchanged) if !deferred => {
+                Ok((exchanged, synced)) if !deferred => {
                     if exchanged {
-                        state.saves.keep_spare(&tmp, path, generation);
+                        state.saves.keep_spare(&tmp, path, generation, synced);
                     }
                     state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
                     state.saves.note_saved(generation, true);
@@ -949,7 +922,7 @@ fn save_then(
                 let path = path.clone();
                 let saves = std::sync::Arc::clone(&state.saves);
                 crate::cpus::spawn(move || {
-                    let synced = sync_file(&path).and_then(|()| sync_dir(&path));
+                    let synced = sync_file(&path).and_then(|()| sync_dir(&path).map(|_| ()));
                     saves.in_flight.fetch_sub(1, Ordering::SeqCst);
                     match synced {
                         Ok(()) => saves.note_saved(generation, true),
@@ -971,9 +944,9 @@ fn save_then(
                     let exchanged = put_in_place(&tmp, path, true)?;
                     state.saves.in_place.store(generation, Ordering::SeqCst);
                     drop(saving);
-                    sync_dir(path)?;
+                    let synced = sync_dir(path)?;
                     if exchanged {
-                        state.saves.keep_spare(&tmp, path, generation);
+                        state.saves.keep_spare(&tmp, path, generation, synced);
                     }
                     // Only once it is on disk, and if it is still the newest
                     // in place: a save of the same topology made later is
@@ -1047,10 +1020,6 @@ pub struct Saves {
     /// Saves something waits on (a vote, a node met) being made: the bus's
     /// own wait for them, or the disk's journal commits the two in turn.
     pub(crate) urgent: AtomicU64,
-    /// The newest save written (its number and topology fingerprint), until
-    /// it fails: a save of the same topology waits for it rather than write
-    /// the file again (see `save_then`). Set with `save_lock` held.
-    newest_written: parking_lot::Mutex<(u64, u64)>,
     /// Files a save put out of place (an older nodes.conf), once that is on
     /// disk, to be written over by a later save (see `put_in_place`). At most
     /// [`MAX_SPARES`]; removed at startup.
@@ -1066,25 +1035,19 @@ pub struct Saves {
 }
 
 impl Saves {
-    /// Save `generation`, of the topology `fingerprint`, is written: the
-    /// newest. Called with `save_lock` held.
-    fn note_written(&self, generation: u64, fingerprint: u64) {
-        *self.newest_written.lock() = (generation, fingerprint);
-    }
-
-    /// Keep `old`, the file save `generation` put out of place and whose
-    /// directory is synced since, as a spare: renamed to its name of a spare
-    /// (see [`spare_path`]). Removed instead if there are spares enough, the
-    /// directory could not be synced (the exchange is not known to be on
-    /// disk: the file may still be nodes.conf there), or it is not a plain
-    /// file of one link.
-    fn keep_spare(&self, old: &Path, path: &Path, generation: u64) {
+    /// Keep `old`, the file save `generation` put out of place, as a spare
+    /// once the directory is synced since (`dir_synced`): renamed to its
+    /// name of a spare (see [`spare_path`]). Removed instead if there are
+    /// spares enough, the filesystem does not sync directories (the
+    /// exchange is not known to be on disk: the file may still be
+    /// nodes.conf there), or it is not a plain file of one link.
+    fn keep_spare(&self, old: &Path, path: &Path, generation: u64, dir_synced: bool) {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::MetadataExt;
             let mut spares = self.spares.lock();
             let plain = fs::symlink_metadata(old).is_ok_and(|m| m.is_file() && m.nlink() == 1);
-            if plain && spares.len() < MAX_SPARES && !DIR_SYNC_SKIPPED.load(Ordering::Relaxed) {
+            if plain && dir_synced && spares.len() < MAX_SPARES {
                 let spare = spare_path(path, generation);
                 if fs::rename(old, &spare).is_ok() {
                     spares.push(spare);
@@ -1093,15 +1056,8 @@ impl Saves {
             }
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = (path, generation);
+        let _ = (path, generation, dir_synced);
         let _ = fs::remove_file(old);
-    }
-
-    /// The newest save written, if it has the topology `fingerprint` and has
-    /// not failed.
-    fn newest_written_with(&self, fingerprint: u64) -> Option<u64> {
-        let (generation, written) = *self.newest_written.lock();
-        (generation != 0 && written == fingerprint).then_some(generation)
     }
 
     /// `written`: the save was written and put in place (not skipped as
@@ -1118,12 +1074,6 @@ impl Saves {
     /// full or read-only fails every one, and the bus saves often), and once
     /// more when one works again.
     fn note_failed(&self, generation: u64, e: &std::io::Error) {
-        {
-            let mut newest = self.newest_written.lock();
-            if newest.0 == generation {
-                *newest = (0, 0);
-            }
-        }
         {
             let mut failed = self.failed.lock();
             if generation > failed.0 {
