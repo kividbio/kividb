@@ -72,7 +72,8 @@ impl Conn {
 
     fn read(&mut self) -> V {
         let mut line = String::new();
-        self.reader.read_line(&mut line).expect("reply");
+        let read = self.reader.read_line(&mut line).expect("reply");
+        assert!(read > 0, "connection closed");
         let line = line.trim_end_matches(['\r', '\n']);
         let (kind, rest) = line.split_at(1);
         match kind {
@@ -115,6 +116,7 @@ impl Conn {
 struct Server {
     port: u16,
     child: Child,
+    dir: std::path::PathBuf,
 }
 
 /// How long a script is held where it calls `ECHO script-stall:...`.
@@ -152,13 +154,28 @@ impl Server {
                 .spawn()
                 .expect("could not start kividb")
         });
-        let server = Server { port, child };
+        let server = Server { port, child, dir };
         assert_eq!(server.conn().cmd(&["PING"]), V::Str("PONG".into()));
         server
     }
 
     fn conn(&self) -> Conn {
         Conn::connect(self.port)
+    }
+
+    /// Whether a script is held where it calls `ECHO script-stall:...` now
+    /// (`pause::test_stall_in_script` keeps a file there meanwhile).
+    fn holding(&self) -> bool {
+        self.dir.join("script-stall.held").exists()
+    }
+
+    /// Waits until a script is held there.
+    fn wait_until_held(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.holding() {
+            assert!(Instant::now() < deadline, "the script never got to its stall");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -208,17 +225,16 @@ fn start_held_script(
         let reply = c.read();
         (reply, Instant::now())
     });
-    // Under way, and held: the stall is long, and the script reaches it at
-    // once.
-    std::thread::sleep(Duration::from_millis(150));
+    server.wait_until_held();
     handle
 }
 
 /// A new connection on a thread that is not busy running a held script:
-/// the first of several to answer a `PING`. (On the io_uring loop the
-/// kernel places connections; on Tokio a connection whose thread is busy
-/// waits for it too.)
+/// the first of several to answer a `PING`, within a quarter of the stall.
+/// (On the io_uring loop the kernel places connections; on Tokio a
+/// connection whose thread is busy waits for it too.)
 fn free_conn(server: &Server) -> Conn {
+    let asked = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel();
     for _ in 0..8 {
         let mut c = server.conn();
@@ -229,7 +245,11 @@ fn free_conn(server: &Server) -> Conn {
             }
         });
     }
-    rx.recv().unwrap()
+    let c = rx
+        .recv_timeout(Duration::from_millis(STALL_MS / 4))
+        .expect("no new connection was answered at once");
+    assert!(asked.elapsed() < Duration::from_millis(STALL_MS / 4));
+    c
 }
 
 /// `args`' reply on whichever of several new connections answers first,
@@ -504,30 +524,45 @@ fn a_woken_blocking_pop_waits_for_the_script_uring() {
 }
 
 /// A write that waited for a script and is then held by a `CLIENT PAUSE` set
-/// meanwhile runs once the pause ends, not before.
+/// meanwhile runs once the pause ends, not before. A round counts only if
+/// the pause was set while the script was still held (the client of the
+/// pause is answered at once, but a loaded machine may have been slower
+/// than the stall); up to five rounds.
 fn a_waiting_write_is_then_held_by_a_pause(io: &str) {
     let server = Server::start(io, 2);
     let mut c = server.conn();
     let sha = quick_script(&mut c, &["a"]);
-    let script = start_held_script(&server, &sha, "a", "after");
-    let mut writer = free_conn(&server);
-    writer.send(&["SET", "{a}:k", "paused"]);
-    std::thread::sleep(Duration::from_millis(50));
-    let mut pauser = free_conn(&server);
-    let paused_at = Instant::now();
-    assert_eq!(
-        pauser.cmd(&["CLIENT", "PAUSE", &(STALL_MS * 2).to_string(), "WRITE"]),
-        V::Str("OK".into())
-    );
-    let (reply, _) = script.join().unwrap();
-    assert_eq!(reply, V::Int(1));
-    assert_eq!(writer.read(), V::Str("OK".into()));
-    assert!(
-        paused_at.elapsed() >= Duration::from_millis(STALL_MS * 2 - 50),
-        "the write ran during the pause: {:?}",
-        paused_at.elapsed()
-    );
-    assert_eq!(c.cmd(&["GET", "{a}:k"]), V::Str("paused".into()));
+    for _round in 0..5 {
+        let script = start_held_script(&server, &sha, "a", "after");
+        let mut writer = free_conn(&server);
+        writer.send(&["SET", "{a}:k", "paused"]);
+        std::thread::sleep(Duration::from_millis(50));
+        let mut pauser = free_conn(&server);
+        let paused_at = Instant::now();
+        assert_eq!(
+            pauser.cmd(&["CLIENT", "PAUSE", &(STALL_MS * 2).to_string(), "WRITE"]),
+            V::Str("OK".into())
+        );
+        let in_time = !script.is_finished() && server.holding();
+        let (reply, _) = script.join().unwrap();
+        assert_eq!(reply, V::Int(1));
+        if !in_time {
+            // The script ended before the pause: the write may have run
+            // before it. Again.
+            assert_eq!(pauser.cmd(&["CLIENT", "UNPAUSE"]), V::Str("OK".into()));
+            assert_eq!(writer.read(), V::Str("OK".into()));
+            continue;
+        }
+        assert_eq!(writer.read(), V::Str("OK".into()));
+        assert!(
+            paused_at.elapsed() >= Duration::from_millis(STALL_MS * 2 - 50),
+            "the write ran during the pause: {:?}",
+            paused_at.elapsed()
+        );
+        assert_eq!(c.cmd(&["GET", "{a}:k"]), V::Str("paused".into()));
+        return;
+    }
+    panic!("the pause never came while the script was held");
 }
 
 #[test]
