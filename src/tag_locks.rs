@@ -527,11 +527,48 @@ pub fn lock_keys<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Option<KeysGuard> 
 
 /// Whether `key` may carry a hash tag: whether it has a `{` at all. One
 /// without has no tag ([`tag_of`]); one with may not either (`{}`, no `}`).
-/// Eight bytes at a time up to 32, which on the command path costs a short
-/// key less than a call of `memchr` (#889).
+///
+/// Every command from a client asks this of its keys (#889), so it only
+/// says whether, not where: up to 32 bytes, two or four words that may
+/// overlap, looked at together with no branch between them; `memchr` past
+/// that. A word's bytes that are `{` are the zero bytes of its `^` with
+/// `{{{{{{{{`, and `(x - 0x01…) & !x & 0x80…` is not 0 exactly when `x`
+/// has a zero byte.
 #[inline]
 pub fn may_carry_tag(key: &[u8]) -> bool {
-    position_of(b'{', key).is_some()
+    const ONES: u64 = u64::from_ne_bytes([1; 8]);
+    const HIGHS: u64 = ONES << 7;
+    const BRACES: u64 = ONES * b'{' as u64;
+    // A word of eight bytes, or of none (0, which has no `{`): the length
+    // is known where it is asked, and the `None` side is compiled away.
+    let has = |bytes: Option<&[u8; 8]>| {
+        let x = bytes.map_or(0, |bytes| u64::from_le_bytes(*bytes)) ^ BRACES;
+        x.wrapping_sub(ONES) & !x & HIGHS
+    };
+    let len = key.len();
+    match len {
+        8..=16 => has(key.first_chunk()) | has(key.last_chunk()) != 0,
+        17..=32 => {
+            let (head, tail) = (&key[..16], &key[len - 16..]);
+            has(head.first_chunk())
+                | has(head.last_chunk())
+                | has(tail.first_chunk())
+                | has(tail.last_chunk())
+                != 0
+        }
+        0..8 => {
+            const ONES4: u32 = u32::from_ne_bytes([1; 4]);
+            let has4 = |bytes: Option<&[u8; 4]>| {
+                let x = bytes.map_or(0, |bytes| u32::from_le_bytes(*bytes)) ^ (ONES4 * b'{' as u32);
+                x.wrapping_sub(ONES4) & !x & (ONES4 << 7)
+            };
+            if len < 4 {
+                return key.contains(&b'{');
+            }
+            has4(key.first_chunk()) | has4(key.last_chunk()) != 0
+        }
+        _ => memchr::memchr(b'{', key).is_some(),
+    }
 }
 
 /// Where `byte` is first in `hay`: eight bytes at a time up to 32, which
@@ -592,6 +629,18 @@ pub enum NamedKeys {
 /// positions (#889).
 #[inline]
 pub fn named_keys(name: &str, cmd: &[&[u8]]) -> Option<NamedKeys> {
+    named_keys_of(None, name, cmd)
+}
+
+/// [`named_keys`], told how the command's keys are found when the caller
+/// has it already (`arity::fits_with_shape`, from the lookup every
+/// command makes anyway): the table is then not looked up again (#889).
+#[inline(always)]
+pub(crate) fn named_keys_of(
+    shape: Option<crate::keyspec::Shape>,
+    name: &str,
+    cmd: &[&[u8]],
+) -> Option<NamedKeys> {
     // A key is an argument: a command of one argument (`GET k`, `INCR k`)
     // names that one at most, whatever the command, and the table need not
     // be asked when it has no `{`.
@@ -599,7 +648,11 @@ pub fn named_keys(name: &str, cmd: &[&[u8]]) -> Option<NamedKeys> {
     if one_argument && !may_carry_tag(cmd[1]) {
         return None;
     }
-    let Some((first, last, step)) = crate::keyspec::regular_key_positions(name, cmd) else {
+    let regular = match shape {
+        Some(shape) => crate::keyspec::regular_positions_of(shape, cmd),
+        None => crate::keyspec::regular_key_positions(name, cmd),
+    };
+    let Some((first, last, step)) = regular else {
         return Some(NamedKeys::Other(crate::keyspec::key_positions(name, cmd)));
     };
     // That one has a `{`: whether it is a key is all that is left to know.
@@ -692,6 +745,25 @@ pub fn try_lock_found_keys(
     cmd: &[&[u8]],
     mine: &[usize],
 ) -> Result<Option<KeysGuard>, TagsBusy> {
+    // One key, as most commands on a tagged key name (`GET {t}:k`): the
+    // same steps as below for one stripe, without the walk over positions.
+    if let NamedKeys::Regular { from, last, .. } = keys
+        && from == last
+    {
+        let Some(tag) = tag_of(cmd[from]) else {
+            return Ok(None);
+        };
+        let stripe = stripe_of(tag);
+        let gate = crate::write_gate::enter();
+        if let Some(held) = STRIPE[stripe].0.try_lock() {
+            return Ok(Some(KeysGuard {
+                _one: Some(held),
+                _more: Vec::new(),
+                _gate: gate,
+            }));
+        }
+        return lock_unless_a_script_has_them(vec![stripe], gate, mine);
+    }
     let at = match &keys {
         NamedKeys::Regular { from, last, step } => crate::keyspec::KeyIter::Range {
             next: *from,
@@ -2287,6 +2359,46 @@ mod tests {
             stop.store(true, Ordering::Relaxed);
             assert!(started.elapsed() < Duration::from_secs(2));
         });
+    }
+
+    /// #889: `may_carry_tag` says whether a key has a `{` for every length
+    /// up to past `memchr`'s, wherever the `{` is, and not for bytes next to
+    /// it in value (`z`, `|`, `{` + 128).
+    #[test]
+    fn may_carry_tag_finds_a_brace_at_any_place() {
+        for len in 0..80 {
+            for filler in [b'a', b'z', b'|', b'{' | 0x80, 0x01, 0xff] {
+                let key = vec![filler; len];
+                assert!(!may_carry_tag(&key), "len {len} filler {filler}");
+                for at in 0..len {
+                    let mut key = key.clone();
+                    key[at] = b'{';
+                    assert!(may_carry_tag(&key), "len {len} at {at} filler {filler}");
+                }
+            }
+        }
+    }
+
+    /// #889: the shape the arity lookup carries is `keyspec`'s, for every
+    /// name it has, so `named_keys_of` with it finds what `named_keys`
+    /// finds.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn the_shape_from_the_arity_lookup_is_keyspecs() {
+        let tagged: &[&[u8]] = &[b"{t}:a", b"{t}:b", b"{t}:c", b"{t}:d"];
+        for name in crate::keyspec::table_names() {
+            for len in 2..=5 {
+                let mut cmd: Vec<&[u8]> = vec![name.as_bytes()];
+                cmd.extend_from_slice(&tagged[..len - 1]);
+                let shape = crate::commands::arity::fits_with_shape(name, &cmd).flatten();
+                if let Some(shape) = shape {
+                    assert_eq!(shape, crate::keyspec::shape_of(name), "{name}");
+                }
+                let of = format!("{:?}", named_keys_of(shape, name, &cmd));
+                let plain = format!("{:?}", named_keys(name, &cmd));
+                assert_eq!(of, plain, "{name} with {} arguments", len - 1);
+            }
+        }
     }
 
     /// `try_lock_found_keys` over the keys `named_keys` finds, as the command

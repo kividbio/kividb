@@ -1769,9 +1769,36 @@ fn room_in_script(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
 /// [`execute_command`], once the command's name is known; it started at
 /// `started`.
+/// With Lua, for a command `arity::fits_with_shape` did not let through:
+/// the reply to the wrong number of arguments, or room made for a command
+/// that allocates as much as its arguments say (`room_on_arrival`).
+#[cfg(feature = "lua")]
+fn arity_refusal(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
+    let refusal = crate::commands::arity::check_dispatch(name, &ctx.cmd)?;
+    // Empty: a command that allocates as much as its arguments say, given
+    // room here if nothing below refuses it.
+    if !refusal.is_empty() {
+        return Some(refusal);
+    }
+    room_on_arrival(ctx, name)
+}
+
 fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8> {
     // The wrong number of arguments is refused before anything else looks
-    // at the command, as in Redis. See `arity`.
+    // at the command, as in Redis. See `arity`. With Lua, the same lookup
+    // says how the command's keys are found, for the look for hash tags
+    // below (#889).
+    #[cfg(feature = "lua")]
+    let key_shape = match crate::commands::arity::fits_with_shape(name, &ctx.cmd) {
+        Some(shape) => shape,
+        None => {
+            if let Some(refusal) = arity_refusal(ctx, name) {
+                return refusal;
+            }
+            None
+        }
+    };
+    #[cfg(not(feature = "lua"))]
     if let Some(refusal) = crate::commands::arity::check_dispatch(name, &ctx.cmd) {
         // Empty: a command that allocates as much as its arguments say,
         // given room here if nothing below refuses it (`room_on_arrival`).
@@ -2092,24 +2119,23 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // wait with it and every other connection of the thread behind it: the
     // command is sent back, and its connection waits for the script off the
     // thread (#882).
+    //
+    // Nearly every command: none of its keys has a `{`, and nothing else is
+    // looked at, not even whether this is a script's own call (#889).
     #[cfg(feature = "lua")]
     let _key_tags = if tag_locks
         && !any_script
         && !crate::command_gate::alone_on_this_thread()
+        && let Some(keys) = crate::tag_locks::named_keys_of(key_shape, name, &ctx.cmd)
         && !crate::tag_locks::in_script()
     {
-        // Nearly every command: none of its keys has a `{`, and nothing else
-        // is looked at (#889).
-        match crate::tag_locks::named_keys(name, &ctx.cmd) {
-            None => None,
-            Some(keys) => match lock_tags_found(ctx, keys) {
-                Ok(held) => held,
-                Err(busy) => {
-                    // Sent back: not run now.
-                    crate::commands::blocking::hold_for_tags(ctx, busy);
-                    return crate::pause::HELD_IN_GATE.to_vec();
-                }
-            },
+        match lock_tags_found(ctx, keys) {
+            Ok(held) => held,
+            Err(busy) => {
+                // Sent back: not run now.
+                crate::commands::blocking::hold_for_tags(ctx, busy);
+                return crate::pause::HELD_IN_GATE.to_vec();
+            }
         }
     } else {
         None
