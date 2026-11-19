@@ -9,8 +9,15 @@
 //   PING <sender_id> <sender_endpoint> <gossip_array>
 //     "I'm alive. Here are some peers I know about, in case you don't."
 //
-//   PONG <sender_id> <sender_endpoint> <gossip_array>
+//   PONG <sender_id> <sender_endpoint> <gossip_array> [... <held_as_owner>]
 //     "Reply to your PING/MEET. Same gossip payload as PING."
+//     A PONG to a node that the sender holds as the owner of slots, while
+//     that node's own heartbeats say it is a replica, has an eighth field:
+//     a 2-element array of the number of masters that own slots in the
+//     sender's view and those slots, at that node's config epoch in the
+//     sender's view, in the form of the slot claims (an [`OwnerReport`]). A
+//     node of an earlier version reads no further than the seventh field.
+//     See `ClusterState::promotion_to_complete`.
 //
 //   FAILOVER_AUTH_REQUEST <sender_id> <endpoint> <master_id> [force | <slot_claims>]
 //   FAILOVER_AUTH_ACK <sender_id> <epoch>
@@ -78,11 +85,39 @@ pub struct GossipEntry {
 /// One slot range the sender claims to own, with the epoch at which the
 /// claim was made. Receivers compare against their own ownership and
 /// keep the higher epoch's claim.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotClaim {
     pub start: u16,
     pub end: u16,
     pub epoch: u64,
+}
+
+/// What a PONG's sender says of the node it answers, when it holds that
+/// node as the owner of slots while that node says it is a replica: the
+/// eighth field of the PONG. See `ClusterState::promotion_to_complete`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerReport {
+    /// How many masters own slots in the sender's view.
+    pub masters: usize,
+    /// The slots it holds the node as the owner of, each range at that
+    /// node's config epoch in the sender's view.
+    pub claims: Vec<SlotClaim>,
+}
+
+impl OwnerReport {
+    /// A report as it may be taken in: at least one range and at most one
+    /// per slot, each within the slots and not reversed, and a count of
+    /// masters between 1 and the number of slots (each owns one at least).
+    /// Anything else is taken for no report.
+    pub fn valid(masters: usize, claims: Vec<SlotClaim>) -> Option<Self> {
+        let slots = crate::cluster::CLUSTER_SLOTS;
+        let ranges_fit = !claims.is_empty()
+            && claims.len() <= slots
+            && claims
+                .iter()
+                .all(|c| c.start <= c.end && (c.end as usize) < slots);
+        (ranges_fit && (1..=slots).contains(&masters)).then_some(Self { masters, claims })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +170,13 @@ pub enum BusMessage {
         sender_shard_id: Option<NodeId>,
         gossip: Vec<GossipEntry>,
         slot_claims: Vec<SlotClaim>,
+        /// The slots the sender holds the node it answers as the owner of,
+        /// at that node's config epoch in the sender's view, and how many
+        /// masters own slots there, when that node says it is a replica;
+        /// `None` otherwise, from a node of an earlier version, and for a
+        /// field that is not a valid report ([`OwnerReport::valid`]). See
+        /// `ClusterState::promotion_to_complete`.
+        held_as_owner: Option<OwnerReport>,
     },
     /// "I'm a replica of a FAIL'd master, and I want your vote to take over."
     /// Sent by a replica during election. The receiver (a master) replies
@@ -292,31 +334,43 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             sender_shard_id,
             gossip,
             slot_claims,
-        } => resp_array(vec![
-            resp_bulk_str("PONG"),
-            resp_bulk(sender_id),
-            resp_bulk_str(&format_endpoint(
-                sender_ip,
-                *sender_client_port,
-                *sender_cluster_port,
-                *sender_config_epoch,
-            )),
-            resp_bulk_str(&with_shard(
-                flags_with_host(
-                    *sender_flags,
-                    sender_hostname,
-                    *sender_announced_client_port,
-                    sender_client_ips,
-                ),
-                sender_shard_id.as_ref(),
-            )),
-            match sender_master_id {
-                Some(m) => resp_bulk(m),
-                None => resp_bulk(b""),
-            },
-            encode_gossip(gossip),
-            encode_slot_claims(slot_claims),
-        ]),
+            held_as_owner,
+        } => {
+            let mut fields = vec![
+                resp_bulk_str("PONG"),
+                resp_bulk(sender_id),
+                resp_bulk_str(&format_endpoint(
+                    sender_ip,
+                    *sender_client_port,
+                    *sender_cluster_port,
+                    *sender_config_epoch,
+                )),
+                resp_bulk_str(&with_shard(
+                    flags_with_host(
+                        *sender_flags,
+                        sender_hostname,
+                        *sender_announced_client_port,
+                        sender_client_ips,
+                    ),
+                    sender_shard_id.as_ref(),
+                )),
+                match sender_master_id {
+                    Some(m) => resp_bulk(m),
+                    None => resp_bulk(b""),
+                },
+                encode_gossip(gossip),
+                encode_slot_claims(slot_claims),
+            ];
+            // Only when there is something in it: every other PONG keeps
+            // the seven fields it had.
+            if let Some(report) = held_as_owner {
+                fields.push(resp_array(vec![
+                    resp_bulk_str(&report.masters.to_string()),
+                    encode_slot_claims(&report.claims),
+                ]));
+            }
+            resp_array(fields)
+        }
         BusMessage::FailoverAuthRequest {
             sender_id,
             sender_ip,
@@ -643,6 +697,10 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     slot_claims,
                 }
             } else {
+                // The eighth field, if there is one that reads as a valid
+                // report; one that does not is left out, as an earlier
+                // version leaves it.
+                let held_as_owner = parts.get(7).and_then(|f| parse_owner_report(f));
                 BusMessage::Pong {
                     sender_id,
                     sender_ip,
@@ -657,6 +715,7 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     sender_shard_id,
                     gossip,
                     slot_claims,
+                    held_as_owner,
                 }
             };
             Ok(Some((msg, consumed)))
@@ -863,6 +922,30 @@ fn parse_gossip(buf: &[u8]) -> Result<Vec<GossipEntry>, String> {
         });
     }
     Ok(out)
+}
+
+/// The eighth field of a PONG ([`OwnerReport`]): `[masters, claims]`.
+/// `None` for anything that is not that, or is not a valid report: more
+/// ranges than there are slots, a range reversed or past the last slot, a
+/// count of masters of 0 or above the number of slots.
+fn parse_owner_report(buf: &[u8]) -> Option<OwnerReport> {
+    if buf.first() != Some(&b'*') {
+        return None;
+    }
+    let (fields, _) = parse_resp_array(buf).ok()??;
+    let [masters, claims] = fields.as_slice() else {
+        return None;
+    };
+    let masters: usize = std::str::from_utf8(masters).ok()?.parse().ok()?;
+    if claims.first() != Some(&b'*') {
+        return None;
+    }
+    // The count of ranges, before any is read.
+    let (entries, _) = parse_resp_array(claims).ok()??;
+    if entries.is_empty() || entries.len() > crate::cluster::CLUSTER_SLOTS {
+        return None;
+    }
+    OwnerReport::valid(masters, parse_slot_claims(claims).ok()?)
 }
 
 fn parse_slot_claims(buf: &[u8]) -> Result<Vec<SlotClaim>, String> {
@@ -1223,6 +1306,7 @@ mod tests {
                 announced_client_port: 0,
             }],
             slot_claims: vec![],
+            held_as_owner: None,
         };
         let (decoded, _) = decode(&encode(&msg)).unwrap().unwrap();
         match decoded {
@@ -1281,6 +1365,7 @@ mod tests {
             sender_shard_id,
             gossip: vec![],
             slot_claims: vec![],
+            held_as_owner: None,
         };
         for said in [Some(shard), None] {
             let (decoded, _) = decode(&encode(&pong(said))).unwrap().unwrap();
@@ -1333,6 +1418,7 @@ mod tests {
                 announced_client_port: 0,
             }],
             slot_claims: vec![],
+            held_as_owner: None,
             sender_flags: NodeFlags::MASTER,
             sender_master_id: None,
             sender_hostname: "shard-1a.db.example".into(),
@@ -1377,6 +1463,160 @@ mod tests {
             decode(&longer),
             Ok(Some((BusMessage::Pong { .. }, _)))
         ));
+    }
+
+    fn report_pong(held_as_owner: Option<OwnerReport>) -> BusMessage {
+        let me = generate_node_id();
+        BusMessage::Pong {
+            sender_id: me,
+            sender_ip: "10.0.0.1".into(),
+            sender_client_port: 6380,
+            sender_cluster_port: 16380,
+            sender_config_epoch: 3,
+            sender_flags: NodeFlags::MASTER,
+            sender_master_id: None,
+            sender_hostname: String::new(),
+            sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
+            sender_shard_id: Some(me),
+            gossip: vec![],
+            slot_claims: vec![SlotClaim {
+                start: 0,
+                end: 99,
+                epoch: 3,
+            }],
+            held_as_owner,
+        }
+    }
+
+    /// A PONG of seven fields, as `report_pong(None)` encodes it, with
+    /// `eighth` (raw RESP) as its eighth field.
+    fn pong_with_eighth(eighth: &[u8]) -> Vec<u8> {
+        let bytes = encode(&report_pong(None));
+        let (parts, _) = parse_resp_array(&bytes).unwrap().unwrap();
+        assert_eq!(parts.len(), 7);
+        let mut out = format!("*{}\r\n", parts.len() + 1).into_bytes();
+        for (i, part) in parts.iter().enumerate() {
+            if i == 5 || i == 6 {
+                out.extend_from_slice(part);
+            } else {
+                out.extend_from_slice(&resp_bulk(part));
+            }
+        }
+        out.extend_from_slice(eighth);
+        out
+    }
+
+    fn decoded_report(bytes: &[u8]) -> Option<OwnerReport> {
+        let (decoded, _) = decode(bytes).unwrap().unwrap();
+        let BusMessage::Pong { held_as_owner, .. } = decoded else {
+            panic!("expected Pong");
+        };
+        held_as_owner
+    }
+
+    /// The slots a PONG's sender holds its addressee as the owner of, and
+    /// how many masters own slots in its view, travel as an eighth field,
+    /// only when there are some: a PONG without them is the seven fields it
+    /// was, and a node that reads seven (an earlier version) reads the rest
+    /// of the PONG as before. A field that does not read as a report is
+    /// taken for none.
+    #[test]
+    fn slots_held_as_owner_travel_as_an_eighth_field() {
+        let report = OwnerReport {
+            masters: 3,
+            claims: vec![
+                SlotClaim {
+                    start: 100,
+                    end: 199,
+                    epoch: 7,
+                },
+                SlotClaim {
+                    start: 300,
+                    end: 300,
+                    epoch: 7,
+                },
+            ],
+        };
+        let bytes = encode(&report_pong(Some(report.clone())));
+        let (parts, _) = parse_resp_array(&bytes).unwrap().unwrap();
+        assert_eq!(parts.len(), 8);
+        let (decoded, _) = decode(&bytes).unwrap().unwrap();
+        let BusMessage::Pong {
+            held_as_owner,
+            slot_claims,
+            ..
+        } = decoded
+        else {
+            panic!("expected Pong");
+        };
+        assert_eq!(held_as_owner, Some(report));
+        assert_eq!(slot_claims.len(), 1);
+
+        let bytes = encode(&report_pong(None));
+        let (parts, _) = parse_resp_array(&bytes).unwrap().unwrap();
+        assert_eq!(parts.len(), 7);
+        assert_eq!(decoded_report(&bytes), None);
+
+        // An eighth field that is not a report: none.
+        assert_eq!(
+            decoded_report(&pong_with_eighth(&resp_bulk(b"later"))),
+            None
+        );
+    }
+
+    /// A report is taken in only as it can be: one that has no range, more
+    /// ranges than there are slots, a range reversed or past the last slot,
+    /// or a count of masters of 0 or above the number of slots, is taken for
+    /// none, and the rest of the PONG is read as usual.
+    #[test]
+    fn a_report_out_of_bounds_is_taken_for_none() {
+        let field = |masters: &str, ranges: &[(u32, u32)]| {
+            let claims: Vec<Vec<u8>> = ranges
+                .iter()
+                .map(|(s, e)| {
+                    resp_array(vec![
+                        resp_bulk_str(&s.to_string()),
+                        resp_bulk_str(&e.to_string()),
+                        resp_bulk_str("7"),
+                    ])
+                })
+                .collect();
+            resp_array(vec![resp_bulk_str(masters), resp_array(claims)])
+        };
+        let good = decoded_report(&pong_with_eighth(&field("3", &[(0, 99), (16383, 16383)])));
+        assert_eq!(good.map(|r| (r.masters, r.claims.len())), Some((3, 2)));
+
+        let too_many: Vec<(u32, u32)> = (0..=crate::cluster::CLUSTER_SLOTS as u32)
+            .map(|i| (i % 16384, i % 16384))
+            .collect();
+        for (masters, ranges) in [
+            ("3", vec![]),
+            ("3", too_many),
+            ("3", vec![(10, 9)]),
+            ("3", vec![(0, 16384)]),
+            ("3", vec![(16384, 16384)]),
+            ("3", vec![(0, 70000)]),
+            ("0", vec![(0, 99)]),
+            ("16385", vec![(0, 99)]),
+            ("18446744073709551616", vec![(0, 99)]),
+            ("-1", vec![(0, 99)]),
+            ("x", vec![(0, 99)]),
+        ] {
+            let bytes = pong_with_eighth(&field(masters, &ranges));
+            assert_eq!(
+                decoded_report(&bytes),
+                None,
+                "{masters} masters, {} ranges",
+                ranges.len()
+            );
+        }
+        // Not a pair, or the claims not an array.
+        let one = resp_array(vec![resp_bulk_str("3")]);
+        let flat = resp_array(vec![resp_bulk_str("3"), resp_bulk_str("0")]);
+        for eighth in [one, flat] {
+            assert_eq!(decoded_report(&pong_with_eighth(&eighth)), None);
+        }
     }
 
     #[test]

@@ -24,6 +24,10 @@
 #                       GET/SET of untagged and tagged keys, MGET of 10,
 #                       a tagged EVALSHA, MULTI + 2 SET + EXEC (see
 #                       measure.sh); with EXEC=1 and CMP=plain
+#   WORKLOADS=stream    what feeding the replication stream costs a write
+#                       (#894): SET-100 with no backlog, with a kept one
+#                       (started from a snapshot), with a replica attached,
+#                       with the AOF on; and GET-100
 #   ONLY=<regex>        measure only the workloads whose label matches
 #   PROFILE=1           keep the hottest functions of each workload in
 #                       target/perf/out-<tag>/profile-*.txt

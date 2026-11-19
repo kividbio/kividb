@@ -675,6 +675,7 @@ fn vsim_ranked(
             });
             let (nearest, cut) = crate::commands::vector::nearest_shown(
                 db,
+                &def.on,
                 &field.name,
                 *k,
                 now,

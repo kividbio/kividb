@@ -463,6 +463,49 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A write costs a master that keeps its replication backlog, or has a
+  replica, a third less (#894).** Each write used to reach the replication
+  thread as a message of its own, in an allocation of its own, after its
+  arguments had been copied once more. Writes are now appended to a run of
+  writes that the thread takes whole, encoded (once, from the client's own
+  arguments for the common commands) outside the lock that keeps them in
+  order. Instructions per pipelined `SET` of 100 bytes (callgrind, fat LTO,
+  io_uring / tokio): with the backlog kept 7,020 → 4,597 / 7,065 → 4,566;
+  with a replica attached 8,222 → 4,914 / 8,482 → 4,940; with no backlog
+  unchanged (2,129 in `execute_command`, 2,130 before); with the AOF alone within 1.2 %, in
+  glibc's `malloc`, not in the write path. On an Azure D8s_v5 (Xeon 8370C), SETs a
+  second, server started from its own snapshot (backlog kept), `--threads
+  2` on two cores, `redis-benchmark -c 100 --threads 4`: 263k → 275k at
+  pipeline 1, 1.07M → 1.34M at 16, 1.23M → 1.70M at 100 (Redis 8.10.2:
+  148k, 790k, 1.04M); with a replica attached 201k → 253k, 695k → 851k,
+  765k → 911k (Redis 144k, 784k, 1.02M); a server with no backlog the same
+  as before (2.71M at 100). With more workers the gain holds: `--threads 4`
+  1.70M → 2.42M and `--threads 6` 2.05M → 2.60M at pipeline 100. The
+  rate-limiter case of #894 (server on two CPUs, restarted from its
+  snapshot, `worker-cpu-affinity auto`): 31.6-31.9k checks a second at a
+  p99 of 0.07-0.12 ms at every background rate from 0 to 300,000 commands a
+  second (Redis: 31.7-32.0k at 0.06-0.11 ms up to 150,000, 28.4k at 0.74 ms
+  at 200,000, 24.3k at 0.91 ms at 300,000).
+- **A cluster reshard takes as long as before `nodes.conf` saves were made
+  durable, and they stay durable.** `redis-cli --cluster reshard` of 1,000
+  slots (suite `13-cluster-reshard` of `benchmarks/1.3.0/regressions`, 3
+  masters, 3,000,000 keys) took 38.3-40.2 s with every save synced and its
+  directory synced, and takes 27.2-27.8 s (27.4-28.6 s before saves were
+  synced), Azure `Standard_D4s_v5`, Xeon 8370C, three runs each on one VM. A
+  save on Linux now writes over the file an earlier save put out of place
+  (`nodes.conf.spare-<n>`, kept once the directory is synced, when it is no
+  longer nodes.conf on disk either), synced as it is written, and exchanges
+  it with nodes.conf (`renameat2` with `RENAME_EXCHANGE`, as atomic as a
+  rename) before the directory is synced: a new temporary file cost a
+  commit of the filesystem's journal of its own. nodes.conf is still
+  replaced whole, never written in place. `CLUSTER SETSLOT ... IMPORTING`,
+  `MIGRATING` and `STABLE`, which change nothing nodes.conf holds, are
+  answered without waiting for a save; `SETSLOT ... NODE` and the other
+  commands that change an owner or a node are answered once their save is
+  synced, as before. The fingerprint that tells whether the topology changed
+  hashes runs of slots, not all 16,384. A `SETSLOT ... NODE` takes 4.9 ms
+  on that disk, where it took 9.7-11.1 ms (5.2-6.0 ms before saves were
+  synced).
 - **`DEBUG` is refused by default, as in Redis 7 and later (#949).**
   `enable-debug-command` was accepted and ignored, so `DEBUG` ran for any
   user whose ACL allowed it, whatever the setting said. It now takes Redis's
@@ -1185,6 +1228,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   save waits on two syncs (the file before its rename, the directory
   after); see [PERSISTENCE.md](docs/PERSISTENCE.md#the-clusters-nodesconf)
   for what failover needs of the disk.
+
+- **A node that restarts before its promotion was saved completes it once a
+  majority of the masters report it as the owner.** A node restarted before
+  the save of its promotion was done completes the promotion from what the
+  masters report. A master tells such a node, in its answer to the node's
+  heartbeat, which slots it holds it as the owner of, at which config
+  epoch, and how many masters own slots in its view (a field that 1.2 nodes
+  do not send and do not read). Once a majority of the masters that own
+  slots (of the greater of that count and the node's own) say it owns every
+  slot of its old master, at a config epoch newer than any it knows for
+  those slots, the node takes exactly those slots over at that epoch, saves
+  that as a promotion is saved, and serves them with the dataset it has.
+  Without the AOF (and no snapshot from a clean shutdown), it serves none of
+  them until a replica that holds them has taken over or its replicas have
+  answered that they hold nothing either, as a master back without its
+  dataset does; with no replica, it serves what it has. A master that voted
+  for another replica to replace the node gives no such answer while that
+  election may still be won, and votes for no replacement of the node while
+  the node may be completing its promotion on its answer: a master answers
+  so for three node timeouts at most, and refuses such votes for six at
+  most (90 s at the default node timeout). A node that starts
+  as a replica begins its first sync once enough of the masters have
+  answered that it is not to complete a promotion (with three masters, two
+  of them), or one node timeout after it started, whichever is first, and
+  not at all if it is to complete one; later syncs do not wait. A master
+  that owns those slots at a newer epoch (another replica elected since, a
+  `CLUSTER FAILOVER TAKEOVER`) is followed instead. With nodes of
+  1.2 among the masters, the majority has to be made of masters of this
+  release.
 
 - **`MONITOR` no longer loses lines.** A monitor was fed through a ring of
   4,096 lines shared by all monitors, and one that fell that far behind
@@ -2310,7 +2382,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   write that replaces or removes no document pays one comparison for it.
   A plain KNN query (`*=>[KNN k ...]`) now looks at each key it found, as
   the other queries did, and leaves out one deleted or written over while
-  it ran.
+  it ran, taking the next nearest in its place.
 
 - **`FUNCTION LIST` and `FUNCTION STATS` follow the client's protocol**
   (#476). To a RESP3 client each library, each function and the stats are

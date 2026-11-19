@@ -256,8 +256,8 @@ pub async fn handle_replica_connection_uring(
                             && let Ok(s) = std::str::from_utf8(cmd[2])
                             && let Ok(offset) = s.parse::<u64>()
                         {
-                            let _ = hub_tx
-                                .send(crate::replication::HubMsg::AckOffset { replica_id, offset });
+                            // Out of the writes' order: see `HubTx::send_ack`.
+                            let _ = hub_tx.send_ack(replica_id, offset);
                         }
                         parse_offset += consumed;
                     }
