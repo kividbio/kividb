@@ -22,7 +22,7 @@
 // without them.
 
 use super::{FieldType, SchemaField};
-use ahash::AHashMap;
+use crate::cpus::BuilderExt as _;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
@@ -119,10 +119,13 @@ impl Bits {
     }
 }
 
-/// The documents that hold one tag: a sorted list while they are few, a
-/// bitmap once the list would be the larger of the two.
+/// The documents that hold one tag: one, held in place (a tag of one
+/// document, an e-mail address, an identifier: a list of one was an
+/// allocation of its own, #761); a sorted list while they are few; a bitmap
+/// once the list would be the larger of the two.
 #[derive(Debug, Clone)]
 enum IdSet {
+    One(u32),
     Sparse(Vec<u32>),
     Dense { bits: Bits, len: usize },
 }
@@ -136,6 +139,7 @@ impl Default for IdSet {
 impl IdSet {
     fn len(&self) -> usize {
         match self {
+            IdSet::One(_) => 1,
             IdSet::Sparse(ids) => ids.len(),
             IdSet::Dense { len, .. } => *len,
         }
@@ -144,6 +148,12 @@ impl IdSet {
     /// Add `id`. `slots` is how many ids there are, which a bitmap costs.
     fn insert(&mut self, id: u32, slots: usize) {
         match self {
+            IdSet::One(one) => {
+                if *one != id {
+                    *self = IdSet::Sparse(vec![(*one).min(id), (*one).max(id)]);
+                }
+            }
+            IdSet::Sparse(ids) if ids.is_empty() => *self = IdSet::One(id),
             IdSet::Sparse(ids) => {
                 if let Err(at) = ids.binary_search(&id) {
                     ids.insert(at, id);
@@ -171,9 +181,17 @@ impl IdSet {
 
     fn remove(&mut self, id: u32, slots: usize) {
         match self {
+            IdSet::One(one) => {
+                if *one == id {
+                    *self = IdSet::Sparse(Vec::new());
+                }
+            }
             IdSet::Sparse(ids) => {
                 if let Ok(at) = ids.binary_search(&id) {
                     ids.remove(at);
+                }
+                if let [one] = ids[..] {
+                    *self = IdSet::One(one);
                 }
             }
             IdSet::Dense { bits, len } => {
@@ -192,6 +210,7 @@ impl IdSet {
 
     fn or_into(&self, out: &mut Bits) {
         match self {
+            IdSet::One(id) => out.set(*id),
             IdSet::Sparse(ids) => ids.iter().for_each(|&id| out.set(id)),
             IdSet::Dense { bits, .. } => out.or_with(bits),
         }
@@ -199,6 +218,7 @@ impl IdSet {
 
     fn bytes(&self) -> usize {
         match self {
+            IdSet::One(_) => 0,
             IdSet::Sparse(ids) => ids.capacity() * 4,
             IdSet::Dense { bits, .. } => bits.bytes(),
         }
@@ -240,8 +260,12 @@ impl Held {
 struct TagPostings {
     separator: char,
     case_sensitive: bool,
-    /// Tag → its number, by which the sets and documents refer to it.
-    numbers: AHashMap<Box<str>, u32>,
+    /// Tag → its number, by which the sets and documents refer to it: the
+    /// numbers, found by the hash of their tag's text, which is in `tags`.
+    /// It was a map from a copy of the text: with a tag to a document (an
+    /// e-mail address), a second allocation of every tag (#761).
+    hasher: ahash::RandomState,
+    numbers: hashbrown::HashTable<u32>,
     /// By tag number: the tag and the documents holding it. A tag no
     /// document holds any more gives its number back (`free`).
     tags: Vec<(Box<str>, IdSet)>,
@@ -255,11 +279,20 @@ impl TagPostings {
         Self {
             separator,
             case_sensitive,
-            numbers: AHashMap::new(),
+            hasher: ahash::RandomState::new(),
+            numbers: hashbrown::HashTable::new(),
             tags: Vec::new(),
             free: Vec::new(),
             docs: Vec::new(),
         }
+    }
+
+    /// The number of tag `tag`, if a document holds it.
+    fn number(&self, tag: &str) -> Option<u32> {
+        let hash = self.hasher.hash_one(tag);
+        self.numbers
+            .find(hash, |&n| &*self.tags[n as usize].0 == tag)
+            .copied()
     }
 
     /// The tags of a value, as `filter::eval` reads them.
@@ -279,21 +312,27 @@ impl TagPostings {
     }
 
     fn number_of(&mut self, tag: String) -> u32 {
-        if let Some(&n) = self.numbers.get(tag.as_str()) {
+        let hash = self.hasher.hash_one(tag.as_str());
+        if let Some(&n) = self
+            .numbers
+            .find(hash, |&n| *self.tags[n as usize].0 == *tag)
+        {
             return n;
         }
         let tag: Box<str> = tag.into_boxed_str();
         let n = match self.free.pop() {
             Some(n) => {
-                self.tags[n as usize] = (tag.clone(), IdSet::default());
+                self.tags[n as usize] = (tag, IdSet::default());
                 n
             }
             None => {
-                self.tags.push((tag.clone(), IdSet::default()));
+                self.tags.push((tag, IdSet::default()));
                 (self.tags.len() - 1) as u32
             }
         };
-        self.numbers.insert(tag, n);
+        let (tags, hasher) = (&self.tags, &self.hasher);
+        self.numbers
+            .insert_unique(hash, n, |&n| hasher.hash_one(&*tags[n as usize].0));
         n
     }
 
@@ -328,8 +367,10 @@ impl TagPostings {
     }
 
     fn release(&mut self, n: u32) {
-        let (tag, _) = std::mem::take(&mut self.tags[n as usize]);
-        if self.numbers.remove(&tag).is_some() {
+        let hash = self.hasher.hash_one(&*self.tags[n as usize].0);
+        if let Ok(entry) = self.numbers.find_entry(hash, |&other| other == n) {
+            entry.remove();
+            self.tags[n as usize] = Default::default();
             self.free.push(n);
         }
     }
@@ -347,27 +388,28 @@ impl TagPostings {
     /// `prefixes`.
     fn any_of(&self, values: &[String], prefixes: &[String], out: &mut Bits) {
         for value in values {
-            if let Some(&n) = self.numbers.get(value.as_str()) {
+            if let Some(n) = self.number(value) {
                 self.tags[n as usize].1.or_into(out);
             }
         }
         if !prefixes.is_empty() {
-            for (tag, &n) in &self.numbers {
+            for &n in self.numbers.iter() {
+                let (tag, set) = &self.tags[n as usize];
                 if prefixes.iter().any(|p| tag.starts_with(p.as_str())) {
-                    self.tags[n as usize].1.or_into(out);
+                    set.or_into(out);
                 }
             }
         }
     }
 
     fn bytes(&self) -> usize {
-        let tags: usize = self
-            .tags
-            .iter()
-            .map(|(tag, set)| 24 + tag.len() + set.bytes())
-            .sum();
-        let numbers =
-            self.numbers.capacity() * 24 + self.numbers.keys().map(|k| k.len()).sum::<usize>();
+        let tags: usize = self.tags.capacity() * std::mem::size_of::<(Box<str>, IdSet)>()
+            + self
+                .tags
+                .iter()
+                .map(|(tag, set)| tag.len() + set.bytes())
+                .sum::<usize>();
+        let numbers = self.numbers.capacity() * (std::mem::size_of::<u32>() + 1);
         let docs = self.docs.capacity() * std::mem::size_of::<Held>()
             + self
                 .docs
@@ -1234,9 +1276,14 @@ impl KeyOrder {
 /// moves everything it holds, under the postings' write lock: one map of
 /// 1.8 million keys took 150 ms to. Each of these holds a 256th of the keys,
 /// and they grow at different writes.
+///
+/// A map holds ids alone, found by the hash of their key, which is in the
+/// postings' table of keys (`Postings::keys`): it held a pointer to the key
+/// as well, 24 bytes a slot where this is 4 (#761).
 #[derive(Debug)]
 struct KeyIds {
-    maps: Vec<AHashMap<Arc<str>, u32>>,
+    hasher: ahash::RandomState,
+    maps: Vec<hashbrown::HashTable<u32>>,
     len: usize,
 }
 
@@ -1245,7 +1292,8 @@ const KEY_MAPS: usize = 256;
 impl Default for KeyIds {
     fn default() -> Self {
         Self {
-            maps: (0..KEY_MAPS).map(|_| AHashMap::new()).collect(),
+            hasher: ahash::RandomState::new(),
+            maps: (0..KEY_MAPS).map(|_| hashbrown::HashTable::new()).collect(),
             len: 0,
         }
     }
@@ -1263,19 +1311,29 @@ impl KeyIds {
         (PICK.hash_one(key) >> 56) as usize % KEY_MAPS
     }
 
+    /// The id of `key`, whose key is in `keys`.
     #[inline]
-    fn get(&self, key: &str) -> Option<u32> {
-        self.maps[Self::map_of(key)].get(key).copied()
+    fn get(&self, keys: &[Option<Arc<str>>], key: &str) -> Option<u32> {
+        self.maps[Self::map_of(key)]
+            .find(self.hasher.hash_one(key), |&id| key_text(keys, id) == key)
+            .copied()
     }
 
-    fn insert(&mut self, key: Arc<str>, id: u32) {
-        if self.maps[Self::map_of(&key)].insert(key, id).is_none() {
-            self.len += 1;
-        }
+    /// `id` for `key`, which has none, and is `keys[id]` already.
+    fn insert(&mut self, keys: &[Option<Arc<str>>], key: &str, id: u32) {
+        let hasher = &self.hasher;
+        self.maps[Self::map_of(key)].insert_unique(hasher.hash_one(key), id, |&other| {
+            hasher.hash_one(key_text(keys, other))
+        });
+        self.len += 1;
     }
 
-    fn remove(&mut self, key: &str) -> Option<u32> {
-        let id = self.maps[Self::map_of(key)].remove(key)?;
+    /// `key`'s id, taken out; `keys` still has the key.
+    fn remove(&mut self, keys: &[Option<Arc<str>>], key: &str) -> Option<u32> {
+        let entry = self.maps[Self::map_of(key)]
+            .find_entry(self.hasher.hash_one(key), |&id| key_text(keys, id) == key)
+            .ok()?;
+        let (id, _) = entry.remove();
         self.len -= 1;
         Some(id)
     }
@@ -1595,7 +1653,7 @@ fn tidy(shared: &SharedPostings) {
     let worker = Arc::clone(shared);
     let started = std::thread::Builder::new()
         .name("kividb-postings".into())
-        .spawn(move || {
+        .spawn_released(move || {
             let mut spare: Option<Vec<u32>> = None;
             loop {
                 let wanted = worker.lock.read().spare_wanted();
@@ -1677,7 +1735,7 @@ impl Postings {
     }
 
     pub fn id(&self, key: &str) -> Option<u32> {
-        self.ids.get(key)
+        self.ids.get(&self.keys, key)
     }
 
     pub fn key(&self, id: u32) -> Option<&Arc<str>> {
@@ -1705,7 +1763,7 @@ impl Postings {
 
     /// The document at `key`'s id, given it one if it has none.
     pub fn ensure(&mut self, key: &str) -> u32 {
-        if let Some(id) = self.ids.get(key) {
+        if let Some(id) = self.ids.get(&self.keys, key) {
             return id;
         }
         let key: Arc<str> = Arc::from(key);
@@ -1725,7 +1783,7 @@ impl Postings {
         }
         // Of the key's own bytes, not of its name (`key_bytes::text_of`).
         self.slots[at] = crate::cluster::key_hash_slot(&crate::key_bytes::bytes_of(&key));
-        self.ids.insert(key, id);
+        self.ids.insert(&self.keys, &key, id);
         self.live.set(id);
         self.order.added(id);
         id
@@ -1844,7 +1902,7 @@ impl Postings {
     /// The document at `key` has left the index: out of every set, and its
     /// id is given back.
     pub fn remove(&mut self, key: &str) {
-        let Some(id) = self.ids.remove(key) else {
+        let Some(id) = self.ids.remove(&self.keys, key) else {
             return;
         };
         let slots = self.keys.len();
@@ -1911,7 +1969,7 @@ impl Postings {
             .iter()
             .find_map(|f| match &f.kind {
                 Kind::Tag(t) if f.name == field => {
-                    t.numbers.get(tag).map(|&n| t.tags[n as usize].1.len())
+                    t.number(tag).map(|n| t.tags[n as usize].1.len())
                 }
                 _ => None,
             })
@@ -1975,7 +2033,7 @@ impl Postings {
     /// Bytes held: the id tables, and each field's postings.
     pub fn bytes(&self) -> PostingsBytes {
         let ids = self.keys.capacity() * 16
-            + self.ids.capacity() * 24
+            + self.ids.capacity() * 5
             + self
                 .keys
                 .iter()
@@ -2436,7 +2494,7 @@ mod tests {
             .map(|_| {
                 let shared = Arc::clone(&shared);
                 let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     while !stop.load(SeqCst) {
                         let p = shared.read();
                         let all = p.live().clone();
@@ -2451,7 +2509,7 @@ mod tests {
             .map(|w| {
                 let shared = Arc::clone(&shared);
                 let named = Arc::clone(&named);
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     let mut seed = 0x9e37_79b9_7f4a_7c15u64 ^ ((w + 1) << 40);
                     let mut next = move || {
                         seed ^= seed << 13;

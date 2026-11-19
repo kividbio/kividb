@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/redis_differences.rs
 //
 // Small differences from Redis 8.10 in argument checking, error texts and
@@ -949,7 +950,7 @@ fn resetstat_keeps_the_changes_since_the_last_save() {
 /// One latency sample a second for an event, the highest of that second.
 #[test]
 fn latency_history_keeps_one_sample_a_second() {
-    let server = Server::start("tokio", &[]);
+    let server = Server::start("tokio", &["--enable-debug-command", "yes"]);
     let mut c = server.conn();
     assert!(
         c.cmd(&["CONFIG", "SET", "latency-monitor-threshold", "1"])
@@ -969,7 +970,7 @@ fn latency_history_keeps_one_sample_a_second() {
 /// gave up after 64 picks and answered nil.
 #[test]
 fn randomkey_finds_the_live_key_among_expired_ones() {
-    let server = Server::start("tokio", &[]);
+    let server = Server::start("tokio", &["--enable-debug-command", "yes"]);
     let mut c = server.conn();
     assert!(c.cmd(&["DEBUG", "SET-ACTIVE-EXPIRE", "0"]).ok());
     for i in 0..2000 {

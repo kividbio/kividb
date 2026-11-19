@@ -91,7 +91,6 @@ pub const REDIS_SETTINGS: &[&str] = &[
     "dir",
     "disable-thp",
     "dynamic-hz",
-    "enable-debug-command",
     "enable-module-command",
     "enable-protected-configs",
     "hash-max-listpack-entries",

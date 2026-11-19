@@ -706,7 +706,7 @@ mod tests {
         write: impl FnOnce() + Send + 'static,
     ) -> std::thread::JoinHandle<()> {
         let (done, finished) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
+        let thread = crate::cpus::spawn(move || {
             let _order = crate::write_order::lock_keys(0, std::iter::once(key.as_bytes()));
             write();
             let _ = done.send(());
@@ -820,7 +820,7 @@ mod tests {
     ) -> std::thread::JoinHandle<bool> {
         let (store, index_store) = (Arc::clone(store), Arc::clone(index_store));
         let (done, finished) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
+        let thread = crate::cpus::spawn(move || {
             let deferred = applied(&store, &index_store, cmd);
             let _ = done.send(());
             deferred
@@ -989,7 +989,7 @@ mod tests {
                     // n is due; the sweep, from a thread of its own.
                     std::thread::sleep(Duration::from_millis(60));
                     let (done, finished) = std::sync::mpsc::channel();
-                    *sweeper.borrow_mut() = Some(std::thread::spawn(move || {
+                    *sweeper.borrow_mut() = Some(crate::cpus::spawn(move || {
                         sweep(&store, &index_store);
                         let _ = done.send(());
                     }));
@@ -1087,8 +1087,6 @@ mod propagation_tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use tokio::sync::mpsc;
-
     use crate::replication::replica_client::{ReplicationApplyEnv, run_as_client};
     use crate::replication::{HubMsg, HubTx, ReplState};
     use crate::store::{self, Store, ValueRef};
@@ -1099,7 +1097,7 @@ mod propagation_tests {
         repl: Arc<ReplState>,
         index: IndexStore,
         hub_tx: HubTx,
-        rx: mpsc::UnboundedReceiver<HubMsg>,
+        rx: crate::replication::HubRx,
         env: ReplicationApplyEnv,
         _own: super::OwnWatches,
     }
@@ -1112,7 +1110,7 @@ mod propagation_tests {
         std::mem::forget(Arc::clone(&store));
         let repl = Arc::new(ReplState::new_master());
         repl.backlog_active.store(true, Ordering::Relaxed);
-        let (hub_tx, rx) = mpsc::unbounded_channel();
+        let (hub_tx, rx) = crate::replication::HubTx::channel();
         crate::expiry::register(&store, &repl, &hub_tx);
         let index = crate::vector::new_index_store();
         let own = super::OwnWatches::of(&store);
@@ -1307,7 +1305,7 @@ mod propagation_tests {
                 let _ = stopped.recv();
             });
             load_started.recv().unwrap();
-            assert!(std::thread::spawn(crate::expiry::loading).join().unwrap());
+            assert!(crate::cpus::spawn(crate::expiry::loading).join().unwrap());
             assert_eq!(
                 m.run(&["HPEXPIRE", "h", "100000", "XX", "FIELDS", "1", "f"]),
                 "*1\r\n:-2\r\n"
@@ -1805,7 +1803,7 @@ mod propagation_tests {
             repl,
             index: replica_index,
             hub_tx: m.hub_tx.clone(),
-            rx: mpsc::unbounded_channel().1,
+            rx: crate::replication::HubTx::channel().1,
             env: ReplicationApplyEnv::new_inert(),
             _own: super::OwnWatches::of(&store::new_store(1)),
         }
@@ -1844,7 +1842,7 @@ mod propagation_tests {
                     Arc::clone(&m.index),
                     m.hub_tx.clone(),
                 );
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     wait_for_go.recv().unwrap();
                     let env = ReplicationApplyEnv::new_inert();
                     let cmd: [&[u8]; 4] = [b"HINCRBY", b"obj:2", b"w", b"1"];
@@ -1966,7 +1964,7 @@ mod propagation_tests {
                 Arc::clone(&m.store),
                 Arc::clone(&m.index),
             );
-            std::thread::spawn(move || {
+            crate::cpus::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     super::sweep(&store, &index);
                     std::thread::sleep(Duration::from_millis(1));
@@ -1982,7 +1980,7 @@ mod propagation_tests {
                     m.hub_tx.clone(),
                 );
                 let (keys, stop) = (keys.clone(), Arc::clone(&stop));
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     let env = ReplicationApplyEnv::new_inert();
                     let noop = crate::watch::NoopWatchRegistry;
                     let run = |cmd: &[&str]| {

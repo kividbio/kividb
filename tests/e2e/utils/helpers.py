@@ -299,6 +299,7 @@ def kivi_server():
             KIVI_BINARY,
             "--port", str(KIVI_PORT),
             "--loglevel", "error",
+            "--enable-debug-command", "yes",
         ]
 
     proc = subprocess.Popen(

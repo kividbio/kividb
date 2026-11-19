@@ -74,6 +74,13 @@ pub struct Activity {
     /// once, and not shown), and what is queued for a subscriber.
     reply_output: AtomicU64,
     pubsub_output: AtomicU64,
+    /// What is queued for the connection as a `MONITOR` and not yet
+    /// written, as Redis counts a monitor's backlog in its `omem`.
+    monitor_output: AtomicU64,
+    /// What a subscriber's writer keeps between batches (its batch and
+    /// frame buffers, #851): memory the client holds, not output waiting,
+    /// so it is in `tot-mem` and `mem_clients_normal` and not in `omem`.
+    pubsub_kept: AtomicU64,
 }
 
 /// A batch of replies this large or larger is shown in `omem` while it is
@@ -365,7 +372,25 @@ impl Activity {
 
     /// What is waiting to be written to the connection: `omem`.
     pub fn output(&self) -> u64 {
-        self.reply_output.load(Ordering::Relaxed) + self.pubsub_output.load(Ordering::Relaxed)
+        self.reply_output.load(Ordering::Relaxed)
+            + self.pubsub_output.load(Ordering::Relaxed)
+            + self.monitor_output.load(Ordering::Relaxed)
+    }
+
+    /// See [`Activity::monitor_output`].
+    pub fn set_monitor_output(&self, bytes: usize) {
+        self.monitor_output.store(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// See [`Activity::pubsub_kept`].
+    pub fn set_pubsub_kept(&self, bytes: usize) {
+        self.pubsub_kept.store(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// What the connection holds besides its query buffer: its output and
+    /// a subscriber's kept buffers.
+    pub fn memory(&self) -> u64 {
+        self.output() + self.pubsub_kept.load(Ordering::Relaxed)
     }
 
     /// The connection's transaction now: the commands queued if it is in
@@ -600,6 +625,9 @@ pub struct ClientInfo {
     pub replica_vset_quant: Option<bool>,
     /// It sent `REPLCONF capa slot-imports` (#741).
     pub replica_slot_imports: bool,
+    /// It sent `REPLCONF capa kdb-blocks`: it reads a compressed snapshot
+    /// (#879).
+    pub replica_kdb_blocks: bool,
     /// Channels, patterns and shard channels this client is subscribed to.
     pub subscriptions: [usize; 3],
 }
@@ -648,6 +676,7 @@ impl ClientInfo {
             replica_lost_data: 0,
             replica_vset_quant: None,
             replica_slot_imports: false,
+            replica_kdb_blocks: false,
             subscriptions: [0; 3],
         };
         (info, kill_rx)
@@ -721,8 +750,9 @@ impl ClientInfo {
             qbuf_free,
             self.activity.output(),
             // What KiviDB measures of a client's memory: its query buffer,
-            // and what is waiting to be written to it.
-            qbuf + qbuf_free + self.activity.output(),
+            // what is waiting to be written to it, and a subscriber's kept
+            // buffers.
+            qbuf + qbuf_free + self.activity.memory(),
             self.activity.last_cmd(),
             self.user,
             self.tracking_redirect.map_or(-1, |id| id as i64),
@@ -1074,13 +1104,17 @@ impl ClientRegistryInner {
     }
 
     /// `CLIENT UNBLOCK`: end the client's wait, if it is waiting.
+    ///
+    /// Sent under the lock: a wait that ends otherwise at the same moment,
+    /// woken say, takes its client off the list under it too
+    /// (`set_blocked`), and then finds what was sent in its channel and does
+    /// it, as was answered.
     pub fn unblock(&self, id: u64, how: crate::commands::blocking::Unblock) -> bool {
-        let sender = self
-            .clients
+        self.clients
             .write()
             .get_mut(&id)
-            .and_then(|info| info.unblock_tx.take());
-        sender.is_some_and(|tx| tx.send(how).is_ok())
+            .and_then(|info| info.unblock_tx.take())
+            .is_some_and(|tx| tx.send(how).is_ok())
     }
 
     /// `clients_in_timeout_table` (#158): clients blocked with a timeout.
@@ -1094,15 +1128,16 @@ impl ClientRegistryInner {
     /// (#591). A client paused by `CLIENT PAUSE` is not blocked, and is let
     /// be, as in Redis. Returns how many were ended.
     pub fn end_blocked_for_role_change(&self) -> usize {
-        let senders: Vec<_> = self
-            .clients
+        // Sent under the lock, as `unblock` sends.
+        self.clients
             .write()
             .values_mut()
-            .filter_map(|info| info.unblock_tx.take())
-            .collect();
-        senders
-            .into_iter()
-            .filter_map(|tx| tx.send(crate::commands::blocking::Unblock::RoleChange).ok())
+            .filter_map(|info| {
+                info.unblock_tx
+                    .take()?
+                    .send(crate::commands::blocking::Unblock::RoleChange)
+                    .ok()
+            })
             .count()
     }
 
@@ -1113,7 +1148,7 @@ impl ClientRegistryInner {
         let (mut normal, mut replicas) = (0u64, 0u64);
         for info in self.clients.read().values() {
             let (len, free) = info.query_buffer.values();
-            let used = len + free + info.activity.output();
+            let used = len + free + info.activity.memory();
             if info.flags.contains('S') {
                 replicas += used;
             } else {
@@ -1214,6 +1249,7 @@ impl ClientRegistryInner {
                 replica_lost_data: c.replica_lost_data,
                 replica_vset_quant: c.replica_vset_quant,
                 replica_slot_imports: c.replica_slot_imports,
+                replica_kdb_blocks: c.replica_kdb_blocks,
                 subscriptions: c.subscriptions,
             })
             .collect()
@@ -1257,6 +1293,7 @@ impl ClientRegistryInner {
             replica_lost_data: c.replica_lost_data,
             replica_vset_quant: c.replica_vset_quant,
             replica_slot_imports: c.replica_slot_imports,
+            replica_kdb_blocks: c.replica_kdb_blocks,
             subscriptions: c.subscriptions,
         })
     }

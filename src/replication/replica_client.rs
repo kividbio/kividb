@@ -19,6 +19,7 @@
 // the link is reported down, and the outer loop retries.
 
 use crate::config::Config;
+use crate::cpus::BuilderExt as _;
 use crate::replication::{FullSyncGuard, HubTx, LinkState, ReplState};
 use crate::resp::parse::parse_resp_command;
 use crate::store::{self, SharedTsIndex, Store};
@@ -161,7 +162,7 @@ impl ReplicaStarter {
         let starter = self.clone();
         let spawned = std::thread::Builder::new()
             .name("kividb-replica".into())
-            .spawn(move || {
+            .spawn_released(move || {
                 match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -742,6 +743,9 @@ async fn run_replication_session(
     //
     // And the imports a cluster master has under way (`slot-imports`,
     // #741), unless a test has this node act as an earlier release.
+    //
+    // And that it reads a compressed snapshot (`kdb-blocks`, #879), which a
+    // master of 1.2 or earlier does not know, and passes over.
     let mut capas = vec![
         "REPLCONF",
         "capa",
@@ -750,6 +754,8 @@ async fn run_replication_session(
         "lost-data",
         "capa",
         "vset-quant",
+        "capa",
+        crate::replication::KDB_BLOCKS_CAPA,
     ];
     if !crate::replication::hides_slot_imports_capability() {
         capas.extend(["capa", crate::replication::SLOT_IMPORTS_CAPA]);
@@ -824,7 +830,7 @@ async fn run_replication_session(
         );
         let ours = {
             let store = store.clone();
-            tokio::task::spawn_blocking(move || crate::replication::digest::dataset_digest(&store))
+            crate::cpus::spawn_blocking(move || crate::replication::digest::dataset_digest(&store))
                 .await
                 .ok()
         };
@@ -963,7 +969,7 @@ async fn run_replication_session(
                     let before = crate::commands::helpers::now_ms()
                         .saturating_sub(uptime.saturating_add(1).saturating_mul(1000));
                     let (store, index_store) = (Arc::clone(store), Arc::clone(index_store));
-                    let deleted = tokio::task::spawn_blocking(move || {
+                    let deleted = crate::cpus::spawn_blocking(move || {
                         crate::commands::helpers::expire_keys_due_before(
                             &store,
                             &index_store,
@@ -995,7 +1001,7 @@ async fn run_replication_session(
                 .saturating_sub(uptime.saturating_add(1).saturating_mul(1000));
             let store = Arc::clone(store);
             let index_store = Arc::clone(index_store);
-            let removed = tokio::task::spawn_blocking(move || {
+            let removed = crate::cpus::spawn_blocking(move || {
                 crate::field_expiry::expire_fields_due_before(&store, &index_store, before)
             })
             .await
@@ -1126,7 +1132,13 @@ async fn run_replication_session(
             return Err(SessionError::Superseded);
         }
         let local_keys = count_keys(store);
-        let is_kdb = rdb_bytes.len() >= 8 && rdb_bytes[..8] == *crate::snapshot::KDB_MAGIC;
+        let is_kdb = crate::snapshot::blocks::is_kdb(&rdb_bytes);
+        if crate::snapshot::blocks::is_compressed(&rdb_bytes) {
+            log_info!(
+                "Replication: the master sent a compressed snapshot of {} bytes (kdb-blocks)",
+                rdb_bytes.len()
+            );
+        }
         let verified_keys =
             if local_keys > 0 && is_kdb && repl_state.flush_before_load.load(Ordering::Relaxed) {
                 Some(
@@ -1269,7 +1281,7 @@ async fn run_replication_session(
                 "Replication: Rebuilding {} search index(es) from the synced dataset",
                 schemas.len()
             );
-            let rebuild = tokio::task::spawn_blocking(move || {
+            let rebuild = crate::cpus::spawn_blocking(move || {
                 crate::vector::register_index_schemas(
                     &index_bg,
                     &schemas,
@@ -1330,7 +1342,7 @@ async fn run_replication_session(
             let index_for_rewrite = Arc::clone(index_store);
             let repl_state_for_rewrite = Arc::clone(repl_state);
             log_info!("Replication: AOF is on — rebasing it onto the synced dataset");
-            let rebased = tokio::task::spawn_blocking(move || {
+            let rebased = crate::cpus::spawn_blocking(move || {
                 crate::replication::save_dataset(
                     &store_for_rewrite,
                     &index_for_rewrite,
@@ -1874,8 +1886,8 @@ fn payload_refusal(
 
 /// Parse a full-sync payload into fresh staging stores.
 ///
-/// The master sends a native KDB image (`KIVIDB01`); a Redis master sends an
-/// RDB. Either way a payload that does not parse is an error — the caller
+/// The master sends a native KDB image (`KIVIDB01`, or compressed to a
+/// replica that takes `kdb-blocks`); a Redis master sends an RDB. Either way a payload that does not parse is an error — the caller
 /// must not go on to replace the live dataset with whatever was read so far.
 fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync, SessionError> {
     let staging_store = store::new_store(databases);
@@ -1886,7 +1898,7 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
     let _hold = crate::expiry::hold();
     let _loading = crate::expiry::Loading::start();
 
-    let is_kividb = payload.len() >= 8 && payload[..8] == *crate::snapshot::KDB_MAGIC;
+    let is_kividb = crate::snapshot::blocks::is_kdb(payload);
     let (dbs, expiries, index_schemas, dictionaries, functions) = if is_kividb {
         let loaded = crate::snapshot::load_snapshot_bytes(payload).map_err(|e| {
             payload_refusal(e, |e| {
@@ -2159,7 +2171,7 @@ pub(crate) struct ReplicationApplyEnv {
     /// failing; nothing should ever arrive, because every command applied
     /// through this env runs with `apply_replication: true` and so never
     /// reaches the propagation path at all.
-    _inert_hub_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::replication::HubMsg>>,
+    _inert_hub_rx: Option<crate::replication::HubRx>,
     lastsave: Arc<parking_lot::RwLock<i64>>,
     started_at: std::time::Instant,
     pubsub: crate::pubsub::PubSubHub,
@@ -2192,8 +2204,7 @@ impl ReplicationApplyEnv {
     /// own AOF, and their client-visible side effects go to the server's real
     /// hubs (see [`ReplicaStarter`]).
     fn new(starter: &ReplicaStarter) -> Self {
-        let (discard_hub_tx, mut hub_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::replication::HubMsg>();
+        let (discard_hub_tx, mut hub_rx) = crate::replication::HubTx::channel();
         tokio::spawn(async move { while hub_rx.recv().await.is_some() {} });
         let mut env = Self::with_hub(
             discard_hub_tx,
@@ -2215,8 +2226,7 @@ impl ReplicationApplyEnv {
     /// entirely outside) the runtime that `new` needs for its drain task, so it
     /// keeps the receiver instead of spawning a consumer for it.
     pub(crate) fn new_inert() -> Self {
-        let (discard_hub_tx, hub_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::replication::HubMsg>();
+        let (discard_hub_tx, hub_rx) = crate::replication::HubTx::channel();
         Self::with_hub(
             discard_hub_tx,
             Some(hub_rx),
@@ -2227,7 +2237,7 @@ impl ReplicationApplyEnv {
 
     fn with_hub(
         discard_hub_tx: crate::replication::HubTx,
-        inert_hub_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::replication::HubMsg>>,
+        inert_hub_rx: Option<crate::replication::HubRx>,
         aof_tx: Box<dyn crate::commands::ctx::AofSender>,
         aof_live: bool,
     ) -> Self {
@@ -2376,6 +2386,8 @@ impl ReplicationApplyEnv {
             apply_replication: true,
             skip_write_side_effects: false,
             peer_addr,
+            // Not read here: this context bypasses the cluster check.
+            peer_ipv6: false,
             monitor_registry: &self.monitor_registry,
             authenticated_user: "default",
             tracking_table: &self.tracking_table,
@@ -2435,6 +2447,7 @@ pub(crate) fn run_as_client(
         apply_replication: false,
         skip_write_side_effects: false,
         peer_addr: "client:test",
+        peer_ipv6: false,
         monitor_registry: &env.monitor_registry,
         authenticated_user: "default",
         tracking_table: &env.tracking_table,
@@ -2507,6 +2520,8 @@ pub async fn handle_replica_connection<R, W>(
     vset_quant_announced: bool,
     // It sent `REPLCONF capa slot-imports`.
     slot_imports_announced: bool,
+    // It sent `REPLCONF capa kdb-blocks` (#879).
+    kdb_blocks_announced: bool,
     // The connection's `CLIENT KILL` signal: it ends the link (#595).
     mut kill_rx: crate::client_registry::KillRx,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -2614,6 +2629,7 @@ where
         tx: replica_tx,
         pending_bytes,
         slot_imports: !legacy_sync && repl_state.sends_slot_imports_to(slot_imports_announced),
+        kdb_blocks: !legacy_sync && kdb_blocks_announced,
     };
     let full_sync = match crate::replication::request_continuation(
         &hub_tx,
@@ -2625,7 +2641,7 @@ where
     {
         Ok(()) => None,
         Err(registration) => {
-            match tokio::task::spawn_blocking({
+            match crate::cpus::spawn_blocking({
                 let store = Arc::clone(&store);
                 let index_store = Arc::clone(&index_store);
                 let repl_state = Arc::clone(&repl_state);
@@ -2749,8 +2765,8 @@ where
                             && let Ok(s) = std::str::from_utf8(cmd[2])
                             && let Ok(offset) = s.parse::<u64>()
                         {
-                            let _ = hub_tx_ack
-                                .send(crate::replication::HubMsg::AckOffset { replica_id, offset });
+                            // Out of the writes' order: see `HubTx::send_ack`.
+                            let _ = hub_tx_ack.send_ack(replica_id, offset);
                         }
                         pos += consumed;
                     }
@@ -2831,7 +2847,7 @@ mod repl_apply_env_tests {
         let ts = crate::store::new_ts_index();
         let (compaction_tx, compaction_rx) = crate::vector::new_compaction_channel();
         drop(compaction_rx);
-        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (hub_tx, _hub_rx) = crate::replication::HubTx::channel();
         let starter = super::ReplicaStarter {
             store: std::sync::Arc::clone(&store),
             index_store: std::sync::Arc::clone(&index),

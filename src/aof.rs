@@ -1,3 +1,4 @@
+use crate::cpus::BuilderExt as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
@@ -202,7 +203,7 @@ pub fn checkpoint_in_background(
     }
     let spawned = std::thread::Builder::new()
         .name("kividb-bgrewrite".into())
-        .spawn(move || {
+        .spawn_released(move || {
             let _unwinding = Unwinding;
             loop {
                 BACKGROUND_REWRITE.lock().again = false;
@@ -2660,7 +2661,7 @@ pub fn spawn_auto_rewrite_thread(
     if percentage == 0 {
         log_info!("AOF: automatic rewrite disabled (aof-rewrite-percentage 0)");
     }
-    std::thread::spawn(move || {
+    crate::cpus::spawn(move || {
         loop {
             std::thread::sleep(AUTO_REWRITE_CHECK);
             let percentage = AUTO_REWRITE_PERCENTAGE.load(Ordering::Relaxed);
@@ -3876,6 +3877,12 @@ pub fn recover_from_aof(
 /// (`n` counts from 1 for each name) and waits while the file is there. Read
 /// once; unset, a step costs a load and a branch.
 pub(crate) fn failpoint(name: &'static str) {
+    failpoint_noting(name, "");
+}
+
+/// [`failpoint`], with `note` written in its file, for the test to read
+/// (which file a save is about to put in place, say).
+pub(crate) fn failpoint_noting(name: &'static str, note: &str) {
     if !failpoint_named(name) {
         return;
     }
@@ -3894,7 +3901,7 @@ pub(crate) fn failpoint(name: &'static str) {
         }
     };
     let path = format!("failpoint.{name}.{hit}");
-    if std::fs::write(&path, b"").is_err() {
+    if std::fs::write(&path, note.as_bytes()).is_err() {
         return;
     }
     log_warn!("Test failpoint {path} reached — waiting for it to be removed");

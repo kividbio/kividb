@@ -31,7 +31,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 from suite import Suite, Config, KEEP_IMPROVEMENT, EXACT, rel, info, scaled  # noqa: E402
 
-S = Suite("19-hash-memory", [Config("plain"), Config("ttl")])
+S = Suite("19-hash-memory", [Config("plain", threads=2), Config("ttl", threads=2)])
 SIZES = [10, 100, 1000, 100_000]
 TOTAL = 1_000_000
 BATCH = 250

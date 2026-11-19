@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""#849: Mastodon's home-feed fan-out (FeedManager), the mix published in
+mastodon/mastodon#41702: 1.7x Redis at 200 connections, 2.0x at 500, timeline
+read p50 halved.
+
+Dataset: N = 20,000 home feeds `feed:home:<n>`, n = 10000 .. 10000 + N - 1 (five
+digits, so an id made from n below has a fixed length), each a sorted set of
+800 statuses whose score is their id, as FeedManager stores them: member j
+(0..799) of feed n is the id (1000 + j) * 10^11 + n, from 100000000000000 + n
+to 179900000000000 + n. Every id is below 2^53, so a score is the id exactly.
+
+Load: memtier_benchmark, 4 threads, 200 and 500 connections, `--transaction`,
+which resolves every `__key__` of one pass through the commands to the same
+number n, drawn uniformly from the feeds. So one pass sends, for one feed n
+(MIX below, with its weights):
+
+  ZADD feed:home:n 9000000000n 9000000000n            a status pushed: score = id,
+                                                      newer than every loaded one
+  ZREMRANGEBYRANK feed:home:n 0 -801                  the trim to 800 after it
+  ZREVRANGE feed:home:n 40 40 WITHSCORES              the reblog fall-off check
+  ZSCORE feed:home:n 1799000000n                      a status that is in the feed
+                                                      (its newest loaded one)
+  EXISTS feed:home:n                                  is the feed there
+  ZREVRANGEBYSCORE feed:home:n +inf -inf LIMIT 0 20 WITHSCORES   a timeline page
+  ZRANGEBYSCORE feed:home:n (1000000000n +inf LIMIT 0 20 WITHSCORES   newer than
+                                                      min_id (its oldest loaded one)
+
+`9000000000n` is the digits of n after `9000000000`, e.g. 900000000012345: memtier
+puts n in place of `__key__` inside an argument. Checked with MONITOR on
+memtier 2.6.1. One id per feed is all a pass can make, so the first ZADD to a
+feed adds its id (801 members, and the trim takes the oldest); every later
+one to that feed updates it in place, and its trim finds nothing to take.
+
+Each connection count: one warm-up run, then RUNS runs of SECONDS; the metric
+is the median. Rows per connection count: ops/s for the whole mix, the
+timeline read's (ZREVRANGEBYSCORE) p50, and p99 of the mix and of the read,
+shown next to them (several are worse than Redis at p99 today). Memory:
+used_memory after the load, and its bytes per member. `feeds` (DBSIZE after
+the runs) must stay N: the trim never empties a feed. The load is checked
+(800 members in every sampled feed) before anything is measured, and a run
+fails on any error reply memtier reports.
+
+Gates (set from three runs on a Standard_D8s_v5, 8 vCPUs shared by the server
+and memtier, nothing pinned: master measured 1.86-2.11x Redis's ops/s, 0.46-0.51x
+its read p50, and 0.945-1.03x v1.2.2's ops/s, one run in three at the low end
+of both: this suite is noisier than 20): ops/s at least 1.75x Redis in the
+same session and at most 10 % under v1.2.2's (master is not ahead of v1.2.2
+here, so the gate says "not worse than"), the read p50 at most 0.55x Redis's,
+15 % over the recorded one and at most FLAT_OUT_READ_P50_VS_V1_2_2 (1.5x)
+v1.2.2's in the same session; THROUGHPUT / MEMORY against the recorded
+candidate. The p99 rows are shown, not gated (`jitter`: client and server
+share the VM). memtier's four threads are at 100 % of a CPU each while it
+drives KiviDB, so the ops/s rows bound the server from below; they are not
+its limit.
+
+Paced run: the same mix from PACED_CONNS (200) connections at PACED_RATE
+(1,000) requests a second each, 200k a second in all, below what v1.2.2 or
+master serve flat out here. Its read p50 is gated at most 1.15x v1.2.2's in
+the same session: this is the row that catches a read that got slower, or
+replies held longer, because the server is not saturated and memtier's own
+queue is not what it measures. Its ops/s (the rate asked for; Redis, at
+115-131k flat out, cannot reach it, so its paced row is a flat-out one) and
+read p99 are shown.
+
+Why the flat-out read p50 is not gated tighter against v1.2.2: flat out,
+memtier is the limit and each connection sends its next request when the
+last reply arrives, so the mean latency is fixed by connections / ops/s
+(Little's law): v1.2.2 and master both average 0.70 ms at 200 connections.
+How it is spread is what moves. Master's read p50 is 1.3x v1.2.2's (0.65 ms
+against 0.49-0.50; 1.66 against 1.26 at 500 connections) while its p99 is
+2.6x lower (1.4-1.5 ms against 3.9; 3.1 against 5.6) at the same ops/s.
+The step is #712 (scores of whole numbers replied as integers, Redis's
+format, #472), which made a 20-member WITHSCORES page 3x cheaper on the
+server (INFO commandstats: 19.4 us a call before it, 6.0 after, 4.9 on
+master): the workers then sleep between requests (twice the context
+switches) instead of running behind, and no connection waits behind a busy
+worker any more.
+Measured on master: adding back 14 us of busy work to each by-score read
+gives back v1.2.2's numbers (p50 0.50 ms, p99 3.8 ms), and so does taking
+#712's integer formatting out (p50 0.44, p99 4.0, the read 23 us): the
+p50 is lower only because the server is slower. A further 0.03 ms comes
+from #903 (8 workers on 8 CPUs where 1.2.2 started 6; `--threads 6` gives
+it back; one worker per CPU is #903's choice for a server with CPUs of its
+own). At 200k requests a second (the paced run) master's read p50 equals
+v1.2.2's (0.46-0.53 ms against 0.48-0.51, three runs each) with 7 % less
+server CPU, and at 100k (0.29 ms both).
+
+Needs memtier_benchmark 2.6.1 or newer (`--transaction`, and the stderr line
+it logs for an error reply): `$MEMTIER`, else on PATH.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+from suite import (Suite, Config, THROUGHPUT, MEMORY, EXACT, info, jitter, rel, vs_redis, vs_v1_2_2, median, scaled)  # noqa: E402
+from rss import used_memory_mib  # noqa: E402
+
+S = Suite("18-mastodon-feed-fanout", [Config("default", threads=8)], min_cpus=8)
+FEEDS = 20_000
+FIRST_FEED = 10_000  # feed numbers have five digits
+MEMBERS = 800
+THREADS = 4
+SECONDS = 20
+WARMUP_SECONDS = 10
+RUNS = 3
+# Connections -> the floor over Redis for the mix's ops/s (published 1.7x / 2.0x).
+CONNS = {200: 1.75, 500: 1.75}
+READ = "Zrevrangebyscores"  # memtier's name for the timeline read's stats
+# The paced run: PACED_CONNS connections, each sending PACED_RATE requests a
+# second (memtier's --rate-limiting), 200k a second in all: about 70 % of what
+# v1.2.2 and master serve flat out on a D8s_v5 (280-295k), so the server, not
+# memtier's queue, is what its read p50 measures. Gated against v1.2.2.
+PACED_CONNS = 200
+PACED_RATE = 1000
+# The flat-out read p50 at most this much over v1.2.2's in the same session: see
+# "Why the flat-out read p50 is not gated tighter" in the module notes.
+FLAT_OUT_READ_P50_VS_V1_2_2 = 1.5
+
+# ── The mix: the issue's seven commands. The WEIGHTS ARE A PLACEHOLDER, a
+# reading of FeedManager; replace them with the published run's when
+# recording. `__key__` is the feed number n, the same in every command of a
+# pass (`--transaction`).
+MIX = [
+    ("ZADD feed:home:__key__ 9000000000__key__ 9000000000__key__", 3),
+    ("ZREMRANGEBYRANK feed:home:__key__ 0 -801", 3),
+    ("ZREVRANGE feed:home:__key__ 40 40 WITHSCORES", 1),
+    ("ZSCORE feed:home:__key__ 1799000000__key__", 1),
+    ("EXISTS feed:home:__key__", 1),
+    ("ZREVRANGEBYSCORE feed:home:__key__ +inf -inf LIMIT 0 20 WITHSCORES", 2),
+    ("ZRANGEBYSCORE feed:home:__key__ (1000000000__key__ +inf LIMIT 0 20 WITHSCORES", 1),
+]
+
+
+def memtier_bin():
+    for p in (os.environ.get("MEMTIER", ""), shutil.which("memtier_benchmark") or ""):
+        if p and os.access(p, os.X_OK):
+            return p
+    raise RuntimeError("memtier_benchmark not found ($MEMTIER or PATH)")
+
+
+def status_id(j, n):
+    """Member j of feed n, as the MIX's affixes make them."""
+    return (1000 + j) * 10**11 + n
+
+
+def load(c, feeds):
+    for lo in range(FIRST_FEED, FIRST_FEED + feeds, 50):
+        p = c.pipeline(transaction=False)
+        for n in range(lo, min(lo + 50, FIRST_FEED + feeds)):
+            p.zadd("feed:home:%d" % n, {str(status_id(j, n)): status_id(j, n) for j in range(MEMBERS)})
+        p.execute()
+
+
+def memtier(memtier_path, port, conns, seconds, feeds, rate=0):
+    """One run -> (ops/s, mix p99, read p50, read p99), latencies in ms. `rate`:
+    requests a second per connection (memtier's `--rate-limiting`), 0 = flat out."""
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "out.json")
+        cmd = [memtier_path, "-s", "127.0.0.1", "-p", str(port), "--protocol=redis",
+               "-t", str(THREADS), "-c", str(conns // THREADS), "--test-time", str(seconds),
+               "--transaction", "--key-prefix=", "--key-minimum=%d" % FIRST_FEED,
+               "--key-maximum=%d" % (FIRST_FEED + feeds - 1),
+               "--distinct-client-seed", "--hide-histogram", "--json-out-file", out]
+        for command, ratio in MIX:
+            # --command-key-pattern must follow its --command.
+            cmd += ["--command=" + command, "--command-ratio=%d" % ratio, "--command-key-pattern=R"]
+        if rate:
+            cmd.append("--rate-limiting=%d" % rate)
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                             timeout=seconds + 120)
+        tail = "\n".join(res.stderr.strip().splitlines()[-10:])
+        if res.returncode != 0:
+            raise RuntimeError("memtier_benchmark exited %d:\n%s" % (res.returncode, tail))
+        # memtier answers error replies with a line on stderr, and exits 0.
+        errors = [line for line in res.stderr.splitlines() if "error response" in line]
+        if errors:
+            raise RuntimeError("memtier_benchmark got %d error replies, e.g.:\n%s"
+                               % (len(errors), "\n".join(errors[:5])))
+        with open(out) as f:
+            stats = json.load(f)["ALL STATS"]
+    total, read = stats["Totals"], stats[READ]
+    return (total["Ops/sec"], total["Percentile Latencies"]["p99.00"],
+            read["Percentile Latencies"]["p50.00"], read["Percentile Latencies"]["p99.00"])
+
+
+@S.run
+def run(ctx):
+    memtier_path = memtier_bin()  # before the load, not after it
+    c = ctx.client()
+    c.flushall()
+    feeds = scaled(FEEDS, step=100)
+    t0 = time.perf_counter()
+    load(c, feeds)
+    ctx.raw["load_s"] = round(time.perf_counter() - t0, 1)
+    sampled = range(FIRST_FEED, FIRST_FEED + feeds, max(1, feeds // 100))
+    short = {n: c.zcard("feed:home:%d" % n) for n in sampled}
+    short = {n: card for n, card in short.items() if card != MEMBERS}
+    if short:
+        raise RuntimeError("feeds not loaded with %d members: %r" % (MEMBERS, dict(list(short.items())[:5])))
+    mib = used_memory_mib(c)
+    ctx.emit("used_memory_mib", mib, "MiB", "lower", gate=MEMORY)
+    ctx.emit("bytes_per_member", mib * 1048576 / (feeds * MEMBERS), "bytes", "lower", gate=info())
+    ctx.raw["runs"] = {}
+    for conns, floor in CONNS.items():
+        memtier(memtier_path, ctx.port, conns, WARMUP_SECONDS, feeds)
+        runs = [memtier(memtier_path, ctx.port, conns, SECONDS, feeds) for _ in range(RUNS)]
+        ctx.raw["runs"][conns] = runs
+        ops = [r[0] for r in runs]
+        ctx.emit("ops_c%d" % conns, median(ops), "ops/s", "higher",
+                 gate=[THROUGHPUT, vs_redis(round(1 / floor, 3)), vs_v1_2_2(1.1)], samples=ops)
+        read_p50 = [r[2] for r in runs]
+        ctx.emit("read_p50_ms_c%d" % conns, median(read_p50), "ms", "lower",
+                 gate=jitter([vs_redis(0.55), rel(15), vs_v1_2_2(FLAT_OUT_READ_P50_VS_V1_2_2)]),
+                 samples=read_p50)
+        p99 = [r[1] for r in runs]
+        ctx.emit("p99_ms_c%d" % conns, median(p99), "ms", "lower", gate=jitter(info()), samples=p99)
+        read_p99 = [r[3] for r in runs]
+        ctx.emit("read_p99_ms_c%d" % conns, median(read_p99), "ms", "lower", gate=jitter(info()),
+                 samples=read_p99)
+    # The same mix at a fixed rate below what either build serves flat out.
+    memtier(memtier_path, ctx.port, PACED_CONNS, WARMUP_SECONDS, feeds, PACED_RATE)
+    runs = [memtier(memtier_path, ctx.port, PACED_CONNS, SECONDS, feeds, PACED_RATE) for _ in range(RUNS)]
+    ctx.raw["runs"]["paced"] = runs
+    ops = [r[0] for r in runs]
+    ctx.emit("ops_paced", median(ops), "ops/s", "higher", gate=info(), samples=ops)
+    read_p50 = [r[2] for r in runs]
+    ctx.emit("read_p50_ms_paced", median(read_p50), "ms", "lower",
+             gate=jitter(vs_v1_2_2(1.15)), samples=read_p50)
+    read_p99 = [r[3] for r in runs]
+    ctx.emit("read_p99_ms_paced", median(read_p99), "ms", "lower", gate=jitter(info()),
+             samples=read_p99)
+    ctx.emit("feeds", c.dbsize(), "keys", "higher", gate=EXACT)
+
+
+if __name__ == "__main__":
+    sys.exit(S.main())

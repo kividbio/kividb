@@ -9,10 +9,14 @@ given. See README.md, "Adding a suite".
     from suite import Suite, Config, rel, ratio, vs_redis, vs_v1_2_2, bound, info
 
     S = Suite("05-example", [
-        Config("tokio", io="tokio"),
+        Config("tokio", io="tokio", threads=2),  # every configuration states threads
         Config("uring1", io="uring", threads=1, engines=("v1_2_2", "candidate")),
-        Config("big", full_only=True),          # only with FULL=1
+        Config("big", threads=2, full_only=True),   # only with FULL=1
+        Config("scripts", threads=2, lua=True),     # lua,tls builds (--candidate-full)
     ])
+    # A suite whose load generator is the limit on 4 vCPUs says so, and is
+    # then run (and recorded) only on a machine with that many CPUs:
+    #   S = Suite("18-example", [...], min_cpus=8)
 
     @S.run
     def run(ctx):
@@ -113,17 +117,38 @@ class Config:
 
     self_hosted=True: run-all.sh starts no server; the suite starts its own
     from ctx.bin (several nodes, a cluster: lib/nodes.py), and ctx.port and
-    ctx.pid are None."""
+    ctx.pid are None.
 
-    def __init__(self, name, io="auto", threads=0, engines=ENGINES, full_only=False, self_hosted=False):
+    lua=True: the configuration needs scripts. run-all.sh runs v1.2.2's
+    `full` build (lua,tls) and the candidate given with --candidate-full in
+    place of the default builds, under the same engine names; without
+    --candidate-full the configuration is skipped (and not expected).
+
+    threads: KiviDB's `--threads`, stated by every configuration (the count
+    its values were recorded with). The default worker count is a policy that
+    changes with the machine and the release (#903 made it one per CPU), so a
+    configuration that left it out measured that policy along with the code.
+    0 means no `--threads` (the server's own default): only suite 32, which
+    watches the default on purpose, uses it. Redis ignores it."""
+
+    def __init__(self, name, io="auto", threads=None, engines=ENGINES, full_only=False, self_hosted=False,
+                 lua=False):
+        if not isinstance(threads, int) or threads < 0:
+            raise ValueError(
+                "Config(%r) has no threads=. Add threads=N to it: N is the KiviDB --threads its baseline "
+                "values were recorded with (the 'Worker threads' line of the candidate's server log in "
+                "results/<label>/raw.tar.gz; before #903 the default on 4 vCPUs was 2, after it one per CPU), "
+                "e.g. Config(%r, threads=2). threads=0 (no --threads, the server's default) is only for a "
+                "suite that measures the default itself (32-default-threads). See README 'Thread counts'."
+                % (name, name))
         self.name, self.io, self.threads = name, io, threads
         self.engines, self.full_only = tuple(engines), full_only
-        self.self_hosted = self_hosted
+        self.self_hosted, self.lua = self_hosted, lua
 
     def as_dict(self):
         return {"name": self.name, "io": self.io, "threads": self.threads,
                 "engines": list(self.engines), "full_only": self.full_only,
-                "self_hosted": self.self_hosted}
+                "self_hosted": self.self_hosted, "lua": self.lua}
 
 
 class Ctx:
@@ -174,8 +199,15 @@ class Ctx:
 
 
 class Suite:
-    def __init__(self, name, configs):
+    """min_cpus: the CPUs (nproc) the suite needs to measure the server and
+    not its load generator. run-all.sh does not run it on a smaller machine
+    (env.json `needs_more_cpus`) unless --only names it, and then the run is
+    INVALID; the release gate needs a run of it on a machine that big
+    (`run-all.sh --min-cpus-only` on a Standard_D8s_v5 for min_cpus=8)."""
+
+    def __init__(self, name, configs, min_cpus=0):
         self.name, self.configs, self.fn = name, configs, None
+        self.min_cpus = int(min_cpus or 0)
 
     def run(self, fn):
         self.fn = fn
@@ -198,7 +230,7 @@ class Suite:
         a = ap.parse_args(argv)
         if a.configs:
             for c in self.active_configs():
-                print(json.dumps(c.as_dict()))
+                print(json.dumps(dict(c.as_dict(), min_cpus=self.min_cpus)))
             return 0
         cfg = next((c for c in self.configs if c.name == a.config), None)
         if cfg is None:

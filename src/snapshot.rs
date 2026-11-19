@@ -1,3 +1,4 @@
+use crate::cpus::ScopeExt as _;
 use crate::list_values::ListValues;
 use crate::store;
 use crate::store::Key;
@@ -15,6 +16,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
 
+pub mod blocks;
 mod rdb_dialect;
 pub use rdb_dialect::is_rdb_header;
 mod rdb_extensions;
@@ -723,10 +725,10 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
         ValueRef::SortedSet(arc) => {
             w.write_all(&[TAG_SORTEDSET])?;
             let inner = arc.read();
-            // Iterate by_score so order is preserved on reload (nice-to-have)
-            w.write_all(&(inner.members.len() as u32).to_le_bytes())?;
-            for (score, member) in inner.by_score.keys() {
-                write_bytes(w, member)?;
+            // Iterate by score so order is preserved on reload (nice-to-have)
+            w.write_all(&(inner.len() as u32).to_le_bytes())?;
+            for (member, score) in inner.iter() {
+                write_bytes(w, &member)?;
                 w.write_all(&score.to_bits().to_le_bytes())?; // f64 as raw bits — lossless
             }
         }
@@ -1880,6 +1882,25 @@ fn read_retrying<R: Read>(
     databases: usize,
 ) -> io::Result<(LoadedSnapshot, usize, R)> {
     read_retrying_within(open, keep, databases, readings_for(databases))
+        .map(|(loaded, keys, reader, _)| (loaded, keys, reader))
+}
+
+/// The databases [`check_image_file`] reads an image for: as many as an
+/// image can have keys in, as a tool does not know the server's.
+const CHECK_DATABASES: usize = 1 << 16;
+
+/// Read the snapshot at `path` (plain or compressed) through, as a server
+/// loads it, holding none of it (`kividb kdb-compress` and `kdb-decompress`,
+/// #879). Returns its keys, and whether it loads only as 1.2.0 wrote the
+/// empty key (#441), a reading a compressed snapshot is not given.
+pub fn check_image_file(path: &std::path::Path) -> io::Result<(usize, bool)> {
+    read_retrying_within(
+        || File::open(path).map(BufReader::new),
+        false,
+        CHECK_DATABASES,
+        readings_for(CHECK_DATABASES),
+    )
+    .map(|(_, keys, _, plan)| (keys, !plan.is_empty()))
 }
 
 /// [`read_retrying`], with no more than `most` readings.
@@ -1888,13 +1909,16 @@ fn read_retrying_within<R: Read>(
     keep: bool,
     databases: usize,
     most: usize,
-) -> io::Result<(LoadedSnapshot, usize, R)> {
+) -> io::Result<(LoadedSnapshot, usize, R, Vec<usize>)> {
     let mut reader = open()?;
     let mut ends = Vec::new();
     let first_error = match read_image(&mut reader, keep, &[], &mut ends, databases) {
-        Ok((loaded, keys)) => return Ok((loaded, keys, reader)),
+        Ok((loaded, keys)) => return Ok((loaded, keys, reader, Vec::new())),
         // Read whole, and refused for its databases (#482).
         Err(e) if is_past_databases(&e) => return Err(e),
+        // A compressed snapshot, damaged or not read whole: no 1.2.0 wrote
+        // one, so there is no other way to read it (#879).
+        Err(e) if blocks::is_refusal(&e) => return Err(e),
         Err(e) if !is_layout(&e) => return Err(e),
         Err(e) => e,
     };
@@ -1981,7 +2005,7 @@ fn read_retrying_within<R: Read>(
          loads it",
         readings
     );
-    Ok((loaded, keys, reader))
+    Ok((loaded, keys, reader, plan))
 }
 
 /// Whether a reading failed on what it read, not on the disk or the network.
@@ -2194,12 +2218,53 @@ fn read_image(
     databases: usize,
 ) -> io::Result<(LoadedSnapshot, usize)> {
     let mut r = r;
-    let mut keys_read = 0usize;
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)?;
+    // A compressed snapshot (#879): the image in it, read as it is
+    // decompressed, a block at a time. It is loaded only if the container is
+    // whole, every block checked and its end read, with nothing after it.
+    if &magic == blocks::MAGIC {
+        let read = (|| {
+            let mut container = blocks::BlockReader::after_magic(&mut r)?;
+            let mut inner = [0u8; 8];
+            container.read_exact(&mut inner).map_err(|e| {
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "compressed snapshot: it holds no image",
+                    )
+                } else {
+                    e
+                }
+            })?;
+            if &inner != KDB_MAGIC {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compressed snapshot: what it holds is not a KDB image (bad magic)",
+                ));
+            }
+            let read = read_image_body(&mut container, keep, legacy, ends, databases)?;
+            container.finish()?;
+            Ok(read)
+        })();
+        return read.map_err(blocks::refusal);
+    }
     if &magic != KDB_MAGIC {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
     }
+    read_image_body(r, keep, legacy, ends, databases)
+}
+
+/// [`read_image`] of a plain image, after its magic.
+fn read_image_body(
+    r: impl Read,
+    keep: bool,
+    legacy: &[usize],
+    ends: &mut Vec<usize>,
+    databases: usize,
+) -> io::Result<(LoadedSnapshot, usize)> {
+    let mut r = r;
+    let mut keys_read = 0usize;
 
     let mut db_count_buf = [0u8; 4];
     r.read_exact(&mut db_count_buf)?;
@@ -2375,7 +2440,9 @@ fn read_image(
                     let mut count_buf = [0u8; 4];
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
-                    let mut ss = SortedSetInner::new();
+                    // A block laid down once if the members fit one; the
+                    // table and the tree as before if not.
+                    let mut ss = SortedSetInner::loader(count);
                     for _ in 0..count {
                         let member = read_bytes(&mut r)?;
                         let mut score_buf = [0u8; 8];
@@ -2386,9 +2453,9 @@ fn read_image(
                                 format!("{NAN_SCORE} in key '{}'", String::from_utf8_lossy(&key)),
                             ));
                         };
-                        ss.insert(Arc::from(member.as_slice()), score);
+                        ss.push(&member, score);
                     }
-                    KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(ss)))
+                    KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(ss.finish())))
                 }
                 TAG_STREAM | TAG_STREAM_V2 | TAG_STREAM_V3 => read_stream_value(&mut r, tag[0])?,
                 TAG_JSON => {
@@ -3889,14 +3956,14 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
         3 => {
             // Sorted set v1 (score as double string)
             let (count, _) = rdb_read_length(r)?;
-            let mut ss = SortedSetInner::new();
+            let mut ss = SortedSetInner::loader(hint(count as usize));
             for _ in 0..count {
                 let member = rdb_read_string(r)?;
                 let score = zset_score_or_error(rdb_read_double_v1(r)?)?;
-                ss.insert(Arc::from(member.as_slice()), score);
+                ss.push(&member, score);
             }
             Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss),
+                parking_lot::RwLock::new(ss.finish()),
             ))))
         }
         4 => {
@@ -3916,16 +3983,16 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
         5 => {
             // Sorted set v2 (score as binary double)
             let (count, _) = rdb_read_length(r)?;
-            let mut ss = SortedSetInner::new();
+            let mut ss = SortedSetInner::loader(hint(count as usize));
             for _ in 0..count {
                 let member = rdb_read_string(r)?;
                 let mut score_buf = [0u8; 8];
                 r.read_exact(&mut score_buf)?;
                 let score = zset_score_or_error(f64::from_le_bytes(score_buf))?;
-                ss.insert(Arc::from(member.as_slice()), score);
+                ss.push(&member, score);
             }
             Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss),
+                parking_lot::RwLock::new(ss.finish()),
             ))))
         }
         // The numbers are Redis's (`RDB_TYPE_*` in rdb.h). Up to 1.1.0 most
@@ -3982,9 +4049,9 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             // RDB_TYPE_ZSET_ZIPLIST (Redis up to 6.2): member, score, member,
             // score..., the scores as text.
             let blob = rdb_read_string(r)?;
-            let mut ss = SortedSetInner::new();
             let mut deque = VecDeque::new();
             rdb_decode_ziplist_into_list(&blob, &mut deque);
+            let mut ss = SortedSetInner::loader(deque.len() / 2);
             let mut iter = deque.into_iter();
             while let (Some(member), Some(score_bytes)) = (iter.next(), iter.next()) {
                 let score: f64 = std::str::from_utf8(&score_bytes)
@@ -3994,10 +4061,10 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                         io::Error::new(io::ErrorKind::InvalidData, "bad ziplist zset score")
                     })?;
                 let score = zset_score_or_error(score)?;
-                ss.insert(Arc::from(member.as_ref()), score);
+                ss.push(&member, score);
             }
             Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss),
+                parking_lot::RwLock::new(ss.finish()),
             ))))
         }
         13 => {
@@ -4040,8 +4107,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
         17 => {
             // RDB_TYPE_ZSET_LISTPACK (Redis 7.0+).
             let blob = rdb_read_string(r)?;
-            let mut ss = SortedSetInner::new();
-            rdb_decode_listpack_into_zset(&blob, &mut ss)?;
+            let ss = rdb_decode_listpack_into_zset(&blob)?;
             Ok(Some(KiviDBValue::SortedSet(Arc::new(
                 parking_lot::RwLock::new(ss),
             ))))
@@ -5059,11 +5125,12 @@ fn rdb_decode_listpack_into_hash(blob: &[u8]) -> io::Result<crate::types::HashFi
 }
 
 /// member, score, member, score..., a score as an integer or as text.
-fn rdb_decode_listpack_into_zset(blob: &[u8], ss: &mut SortedSetInner) -> io::Result<()> {
+fn rdb_decode_listpack_into_zset(blob: &[u8]) -> io::Result<SortedSetInner> {
     let elements = lp_elements(blob)?;
     if elements.len() % 2 != 0 {
         return Err(malformed_listpack());
     }
+    let mut ss = SortedSetInner::loader(elements.len() / 2);
     let mut iter = elements.into_iter();
     while let (Some(member), Some(score)) = (iter.next(), iter.next()) {
         let score: f64 = std::str::from_utf8(&score)
@@ -5071,9 +5138,9 @@ fn rdb_decode_listpack_into_zset(blob: &[u8], ss: &mut SortedSetInner) -> io::Re
             .and_then(|s| s.parse().ok())
             .ok_or_else(malformed_listpack)?;
         let score = zset_score_or_error(score)?;
-        ss.insert(Arc::from(member.as_slice()), score);
+        ss.push(&member, score);
     }
-    Ok(())
+    Ok(ss.finish())
 }
 
 /// Load a snapshot and populate the store directly.
@@ -5198,6 +5265,31 @@ impl Write for CapturedBuf {
     }
 }
 
+/// A writer that counts what goes through it: the size of a plain image
+/// as it is written (`INFO persistence`).
+struct CountingWriter<W: Write> {
+    out: W,
+    bytes: u64,
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let n = self.out.write(data)?;
+        self.bytes += n as u64;
+        Ok(n)
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        self.out.write_all(data)?;
+        self.bytes += data.len() as u64;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
+    }
+}
+
 /// What one thread of the capture took: a hold on each string's entry
 /// (its key, bytes and time to live, which do not change while held),
 /// everything else laid out but the probabilistic values, copies of those
@@ -5267,7 +5359,7 @@ fn freeze(
     // copied as the store keeps it (inline up to 24 bytes) rather than into
     // an allocation of its own. With ten million keys on a node it took
     // seconds on one thread, and grew with the keys.
-    let threads = std::thread::available_parallelism()
+    let threads = crate::cpus::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
         .clamp(1, 8);
@@ -5286,7 +5378,7 @@ fn freeze(
             let handles: Vec<_> = shards
                 .chunks(per)
                 .map(|run| {
-                    scope.spawn(move || {
+                    scope.spawn_released(move || {
                         let mut strings = Vec::new();
                         let mut encoded = CapturedBuf::default();
                         let mut sketches = Vec::new();
@@ -5412,6 +5504,22 @@ impl FrozenDataset {
     /// against `maxmemory` while the second part lives: a full sync's or a
     /// backup's image, which deleting keys does not give back (#284).
     pub fn into_image(self) -> std::io::Result<(Vec<u8>, crate::memory_use::NotCounted)> {
+        self.into_image_as(false)
+    }
+
+    /// [`Self::into_image`], compressed if `compressed` is set (#879). A
+    /// compressed image is compressed as it is laid out: the image whole is
+    /// never in memory, only what it compresses to, counted as it grows.
+    pub fn into_image_as(
+        self,
+        compressed: bool,
+    ) -> std::io::Result<(Vec<u8>, crate::memory_use::NotCounted)> {
+        if compressed {
+            let mut writer = blocks::BlockWriter::new(CapturedBuf::default())?;
+            self.write_to(&mut writer)?;
+            let (_, _, out) = writer.finish()?;
+            return Ok(out.finish());
+        }
         let strings_bytes: usize = self
             .dbs
             .iter()
@@ -5453,12 +5561,45 @@ impl FrozenDataset {
     /// Write the image to `path`, made durable, under that name. The image is
     /// written as it is laid out, not gathered in memory first: for a dump of
     /// the whole dataset that would be the dataset over again.
+    ///
+    /// Compressed with `rdbcompression yes` (#879; `no` is the default): on this
+    /// thread and the compression threads (see [`blocks::BlockWriter`]),
+    /// never the serving threads.
     pub fn write_file(self, path: &str) -> std::io::Result<()> {
+        let started = std::time::Instant::now();
         let raw = PacedFile::new(File::create(path)?);
         let mut file = BufWriter::with_capacity(1 << 20, raw);
-        self.write_to(&mut file)?;
+        let compressed = blocks::enabled();
+        let (image, written) = if compressed {
+            let mut writer = blocks::BlockWriter::new(&mut file)?;
+            self.write_to(&mut writer)?;
+            let (image, written, _) = writer.finish()?;
+            (image, written)
+        } else {
+            let mut counted = CountingWriter {
+                out: &mut file,
+                bytes: 0,
+            };
+            self.write_to(&mut counted)?;
+            (counted.bytes, counted.bytes)
+        };
         file.flush()?;
-        file.get_ref().sync_all()
+        file.get_ref().sync_all()?;
+        blocks::record_saved(image, written);
+        if compressed {
+            log_info!(
+                "Snapshot written: {image} bytes of image in {written} bytes, compressed {:.2}x \
+                 (rdbcompression yes), in {} ms",
+                image as f64 / written.max(1) as f64,
+                started.elapsed().as_millis()
+            );
+        } else {
+            log_info!(
+                "Snapshot written: {image} bytes, not compressed (rdbcompression no), in {} ms",
+                started.elapsed().as_millis()
+            );
+        }
+        Ok(())
     }
 
     fn write_to(mut self, out: &mut impl Write) -> std::io::Result<()> {
@@ -5624,7 +5765,9 @@ pub fn dump_payload(value: &KiviDBValue) -> io::Result<Vec<u8>> {
     // while the payload is laid out and its CRC taken.
     if let KiviDBValue::Sketch(sketch) = value {
         let copy = sketch.read().clone();
-        return crate::sketch::redis_module::dump_payload(&copy);
+        if crate::sketch::redis_module::dumps_as_redis(&copy) {
+            return crate::sketch::redis_module::dump_payload(&copy);
+        }
     }
     // A time series goes without its links to other series, its compaction
     // rules and the series it is a compaction of, as RedisTimeSeries leaves
@@ -5692,6 +5835,14 @@ impl RestoreError {
             RestoreError::BadData => "ERR Bad data format",
         }
     }
+}
+
+/// Whether a `DUMP` payload may hold a probabilistic value: one whose value
+/// is a module's in Redis's encoding (`RDB_TYPE_MODULE_2`), or a sketch in
+/// KiviDB's. Only those are asked what they allocate before a `RESTORE`
+/// runs (`sketch::room`).
+pub fn payload_may_hold_sketch(payload: &[u8]) -> bool {
+    matches!(payload.first(), Some(&7) | Some(&crate::sketch::TAG_SKETCH))
 }
 
 pub fn restore_payload_checked(payload: &[u8]) -> Result<KiviDBValue, RestoreError> {
@@ -5845,10 +5996,10 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
         KiviDBValue::SortedSet(arc) => {
             out.write_all(&[TAG_SORTEDSET])?;
             let inner = arc.read();
-            out.write_all(&(inner.members.len() as u32).to_le_bytes())?;
-            for (score, member) in inner.by_score.keys() {
-                write_bytes_vec(out, member)?;
-                out.write_all(&score.0.to_bits().to_le_bytes())?;
+            out.write_all(&(inner.len() as u32).to_le_bytes())?;
+            for (member, score) in inner.iter() {
+                write_bytes_vec(out, &member)?;
+                out.write_all(&score.to_bits().to_le_bytes())?;
             }
         }
         KiviDBValue::Stream(arc) => {
@@ -6001,7 +6152,7 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             }
             let count = u32::from_le_bytes(payload[..4].try_into().ok()?) as usize;
             let mut pos = 4usize;
-            let mut ss = crate::types::SortedSetInner::new();
+            let mut ss = crate::types::SortedSetInner::loader(count);
             for _ in 0..count {
                 let (member_bytes, next) = read_bytes_slice(payload, pos)?;
                 if next + 8 > payload.len() {
@@ -6010,11 +6161,11 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 let score = zset_score(f64::from_bits(u64::from_le_bytes(
                     payload[next..next + 8].try_into().ok()?,
                 )))?;
-                ss.insert(Arc::from(member_bytes), score);
+                ss.push(member_bytes, score);
                 pos = next + 8;
             }
             Some(KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(
-                ss,
+                ss.finish(),
             ))))
         }
         TAG_JSON => {
@@ -7885,12 +8036,8 @@ mod empty_key_tests {
         match loaded.dbs[0].get(&b"zset"[..]) {
             Some(KiviDBValue::SortedSet(zset)) => {
                 let zset = zset.read();
-                assert_eq!(zset.members.len(), 2);
-                assert!(
-                    zset.by_score
-                        .keys()
-                        .any(|(score, m)| m.is_empty() && score.0 == 1.5)
-                );
+                assert_eq!(zset.len(), 2);
+                assert!(zset.iter().any(|(m, score)| m.is_empty() && score == 1.5));
             }
             _ => panic!("zset is not a sorted set"),
         }
@@ -8647,7 +8794,7 @@ pub(crate) mod readings_tests {
         assert!(text.contains("not every other reading"), "{text}");
         assert!(text.contains("more ways than the 3 readings"), "{text}");
         assert!(verify_snapshot(&image).is_ok());
-        let (loaded, _, _) = read_retrying_within(|| Ok(image.as_slice()), true, 16, 5).unwrap();
+        let (loaded, _, _, _) = read_retrying_within(|| Ok(image.as_slice()), true, 16, 5).unwrap();
         check_1_2_0(&loaded, 4);
     }
 

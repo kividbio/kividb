@@ -9,6 +9,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrading
 
+- **Compressed snapshots are opt-in (#879): nothing changes on upgrade.**
+  `rdbcompression` defaults to `no`, and the snapshots 1.3 writes are the
+  plain ones 1.2 reads, so a rollback to 1.2.x keeps working. Before
+  turning on `rdbcompression yes`, know that KiviDB 1.2.2 and earlier
+  cannot read what it writes: `dump.kdb`, the AOF's base and a backup's
+  BASE start with `KIVIDBZ1`, which they refuse (`bad magic`) and do not
+  start on, changing nothing on disk. The way back: `CONFIG SET
+  rdbcompression no` and `SAVE` (or `BGREWRITEAOF` with the AOF on), or
+  convert a file with `kividb kdb-decompress dump.kdb dump-plain.kdb` (a
+  backup's BASE as well). Replication across versions keeps working either
+  way: a 1.3 master sends a 1.2.x replica the plain image. The default is
+  planned to become `yes` in a later release, once 1.3 is the oldest
+  version one can roll back to.
+
 - **A server on `--threads 0` (auto, the default) starts more worker
   threads (#873).** Auto is now one per CPU the process may use, where it
   was the CPUs minus 2: 4 workers on 4 CPUs (was 2), 8 on 8 (was 6), 32 on
@@ -33,10 +47,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Upgrade replicas before their master.** A master sends `BF.*` commands
   and, in a full sync, Bloom filters under a new snapshot record (tag 40);
   a replica of an earlier release cannot apply either.
-- **No downgrade once a Bloom filter exists.** A snapshot or an AOF
-  checkpoint with a Bloom filter in it cannot be read by an earlier release.
-  Delete the filters (or move them off with `DUMP`, which Redis restores)
-  before going back.
+- **No downgrade once a Bloom filter, Count-min sketch, Top-K sketch, Cuckoo
+  filter or t-digest exists.** A snapshot or an AOF checkpoint with one in it
+  cannot be read by an earlier release: 1.2.2 refuses it and does not start,
+  changing nothing on disk. Delete them (or move them off with `DUMP`, which
+  Redis restores, t-digests aside) before going back. Upgrade replicas
+  before their master for `CMS.*`, `TOPK.*`, `CF.*` and `TDIGEST.*` too.
 - **A sample time of `-0` is refused.** `TS.ADD`, `TS.MADD`, `TS.INCRBY`
   and `TS.DECRBY` answer an error for it, as RedisTimeSeries and 1.2.0 do.
 - **A 1.2.x replica warns once for each idempotent duplicate.** A master
@@ -74,6 +90,97 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CLUSTER SLOTS` until it comes back.
 
 ### Added
+
+- **`cluster-announce-client-ipv4` and `cluster-announce-client-ipv6` (#847),
+  as in Valkey 8.** The address a client is told to reach a node at, where it
+  is not the one nodes use between themselves: a client connected over IPv6
+  gets the node's `-ipv6`, any other its `-ipv4`, and the node's address when
+  the one for its family is unset. Redirects (`MOVED`, `ASK`), `CLUSTER SLOTS`,
+  `SHARDS` (`ip` and `endpoint`), `NODES` and `REPLICAS` use them; the bus
+  keeps `cluster-announce-ip`. Set at start or with `CONFIG SET` (empty unsets;
+  a bad value is `Invalid IPv4 address` / `Invalid IPv6 address`, at start
+  too), they reach the other nodes in the node's next heartbeats as `cip4=`
+  and `cip6=` tokens of its flags string, which a 1.2 node ignores. Only a
+  node's own heartbeats carry them, never gossip, as in Valkey. They are not
+  saved in `nodes.conf`: a node learns a peer's again from the peer's first
+  heartbeat, as for `cluster-announce-client-port`. Tools that start cluster
+  nodes for Valkey pass `--cluster-announce-client-ipv4` to every node, which
+  KiviDB refused at start.
+
+- **`worker-cpu-affinity auto`: each io_uring worker on a CPU of its own (#894).** Off by
+  default. With `auto`, worker N is bound to the N-th CPU the process may use, when the
+  workers are exactly as many as those CPUs (a cpuset or `taskset` of `--threads` CPUs, the
+  Kubernetes static CPU manager), and never under a cgroup CPU quota. An io_uring worker
+  serves its connections alone, and the scheduler at times puts two workers on one CPU
+  when a third busy thread shares their CPUs; every connection of one then waits out the
+  other's time slice. The server says after the I/O model line what it bound, or why not;
+  the tokio I/O model and systems other than Linux bind nothing and say so. Threads a bound
+  worker starts (a full sync's dump, scripts, backups, snapshot compression) are given all
+  of the process's CPUs back first; every thread in the server is started through one
+  wrapper that does this, and clippy refuses a direct `thread::spawn` or `spawn_blocking`.
+  It is not a fix for the rate limiter's p99 on its own. Azure D8s_v5, a rate limiter
+  (`INCRBY` + `EXPIRE`, 65 connections) beside 100 connections of pipelined load, the server
+  on two vCPUs of separate cores started from a snapshot, checks a second and p99 before
+  #919, off / auto / Redis 8.10.2: 25.2k at 3.9 ms / 30.9k at 2.7 ms / 32.0k at 0.06 ms at
+  150,000 commands a second of load, 21.5k at 5.2 / 28.9k at 3.5 / 31.9k at 0.10 ms at
+  200,000, and at 300,000 `auto` is worse: 23.7k at 6.9 ms / 24.2k at 8.3 ms / 22.6k at
+  1.4 ms. The p99 is fixed by #919's backlog change; with it `auto` differs from `off` only
+  at 150,000-200,000 (0.14-0.17 ms against 0.50-1.8 ms). Pipelined and unpipelined
+  `GET`/`SET` and a 4-worker server under memtier are unchanged. Leave it off when the
+  server shares its CPUs with other busy processes: with `stress-ng` on the same two CPUs,
+  unpipelined `GET` fell by a third, from 91k to 61k a second. A `SAVE` of 948,000 keys
+  holds writes for up to 26-29 ms with `auto` against 23 ms with `off`. See
+  docs/CONFIGURATION.md and docs/PERFORMANCE.md (binaries built with rustc 1.100.0).
+
+- **Compressed snapshots, opt-in: `rdbcompression yes` (#879).**
+  `rdbcompression`, which was accepted and did nothing, is in effect; it
+  defaults to `no` in 1.3 (see Upgrading). With `yes` (config file, command
+  line or `CONFIG SET`), a snapshot is the same image as before cut into
+  blocks of 256 KiB, each compressed with zstd (level 1) on up to two
+  compression threads (the CPUs less one; started once, shared by every
+  save), never the serving threads, or stored as it is
+  when it does not shrink; each block carries a checksum, and the file an
+  end marker. A file cut short or damaged anywhere is refused whole, naming
+  the block, never loaded in part. It applies to `SAVE`, `BGSAVE`, the
+  snapshot at shutdown, the AOF's base, a backup's base, and a full sync to
+  a replica that says it reads it (`REPLCONF capa kdb-blocks`). `no` writes
+  the plain image, as 1.2 did. `INFO persistence` gains
+  `rdb_last_save_raw_size` and `rdb_last_save_stored_size`, and the save's
+  log line gives the ratio. `kividb kdb-decompress <in> <out>` and `kividb
+  kdb-compress <in> <out>` convert a file either way, with no shell needed;
+  each first reads its input through as the server would load it and
+  refuses (exit 1, no output) what the server would refuse, and replaces an
+  existing output only with `--force`.
+  Measured on one Standard_D4s_v5 (server on 2 CPUs, `--threads 2`; tmpfs):
+
+  | dataset | | 1.2.2 | `no` | `yes` | Redis 8.10.2 |
+  |---|---|---|---|---|---|
+  | 6M strings of 150 B (#879) | file | 1,007 MB | 1,007 MB | **32.7 MB** | 142.9 MB |
+  | | save, wall / CPU | 1.75 / 2.13 s | 1.84 / 2.13 s | 2.08 / 2.99 s | 6.1 / 6.1 s |
+  | | save to the VM's disk | 6.2 s | 6.3 s | **2.0 s** | 6.4 s |
+  | | load | 10.4 s | 10.5 s | 11.2 s | 6.0 s |
+  | | full sync / master memory during it | 10.7 s / +1,055 MB | 10.5 s / +1,055 MB | 10.9 s / **+99 MB** | 11.8 s |
+  | 6M text strings of 16-64 B | file | 359 MB | 359 MB | **131 MB** | 308 MB |
+  | | save, wall / CPU | 1.15 / 1.44 s | 1.20 / 1.53 s | 2.00 / 3.92 s | 5.2 / 5.2 s |
+  | | load | 8.8 s | 8.4 s | 8.7 s | 5.1 s |
+  | | full sync / master memory | 8.7 s / +406 MB | 8.7 s / +407 MB | 10.0 s / +192 MB | 9.1 s |
+  | 6M random strings of 16-64 B | file | 359 MB | 359 MB | 305 MB | 323 MB |
+  | | save, wall / CPU | 1.14 / 1.43 s | 1.21 / 1.57 s | 2.22 / 4.23 s | 5.0 / 4.9 s |
+  | | load | 8.5 s | 8.5 s | 9.0 s | 4.2 s |
+  | 1M hashes, 200k sets, zsets, lists | file | 490 MB | 490 MB | **206 MB** | 392 MB |
+  | | save, wall / CPU | 1.40 / 2.35 s | 1.31 / 2.23 s | 3.04 / 4.23 s | 3.2 / 3.1 s |
+  | | load | 6.1 s | 6.0 s | 6.9 s | 2.6 s |
+  | | full sync / master memory | 6.9 s / +980 MB | 6.4 s / +981 MB | 8.8 s / +712 MB | 5.0 s |
+
+  The save's peak memory is what it was (+73 MB for the strings, +490 MB
+  for the collections, the capture's), and so is the latency of writes
+  during a save (50 % writes, p99 2.1 ms on the issue's dataset either way,
+  within run-to-run noise). The full sync is timed on one machine, where the
+  link costs nothing: it is 1.4-2.4 s slower on the collections and text
+  there, and sends a third to a thirtieth of the bytes. Incompressible
+  blocks are stored as they are: the file is at most 0.01 % larger than the
+  plain image. Re-run with suite `24-snapshot-size` of
+  `benchmarks/1.3.0/regressions`.
 
 - **`TS.CREATE`, `TS.ALTER`, and `TS.ADD` support `IGNORE maxTimeDiff maxValDiff` (#841).**
   Suppresses duplicate or near-duplicate samples whose timestamp and value
@@ -159,8 +266,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without `EXPANSION`) goes to replicas and the AOF naming what it took,
   so a replica or a replay with other settings makes the same filter.
   `maxmemory` holds back clients, not a master or the AOF: a client's
-  command that would not fit evicts first under the policy, and gets `OOM`
-  only if that is not enough. `COPY` copies a filter (Redis refuses); a
+  command that would not fit evicts first under the policy, before it
+  takes its key, as every command does, once nothing else refuses it
+  (routing, `BUSY`, `NOREPLICAS`, `LOADING`, the ACL), and gets `OOM` only
+  if that is not enough (or if what was made was taken by another command
+  meanwhile). One command evicts what it needs a few megabytes at a time,
+  letting go of the gates between, so that a full sync, a snapshot, a
+  script or a transaction waits for no more than one step of it; it stops
+  if writes are paused, the node becomes a replica or `maxmemory` is
+  changed meanwhile, and a command that wants more than evicting every key
+  could free is refused at once. A command
+  a transaction runs is given room the same way, and one a script calls
+  too unless the script runs beside others under its hash tags
+  (`lua-parallel-scripts`), where it is refused with `OOM` if it does not
+  fit. A `RESTORE` of a probabilistic value is given room for the size its
+  payload declares (all of a Bloom filter's layers), before anything of it
+  is allocated, unless it is refused `BUSYKEY`.
+  `COPY` copies a filter (Redis refuses); a
   copy, a snapshot and a `DUMP` share the filter's bytes until it is next
   written. As in Redis 8.10, no `BF.*` command sends a keyspace event but
   `new` for a key it made. `MODULE LIST` reports Redis 8's `bf` module,
@@ -178,7 +300,86 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   error for the item it stopped at; `BF.MADD` and `BF.INSERT` answer that
   item and every one after it with the error, so their reply has an entry
   for each item. Replicas and the AOF get only the items a write took.
-  Cuckoo filters, Count-min sketches, Top-K and t-digests follow.
+
+- **Count-min sketches (`CMS.*`), as Redis 8 has them built in (part of
+  #453).** `CMS.INITBYDIM`, `CMS.INITBYPROB`, `CMS.INCRBY`, `CMS.QUERY`,
+  `CMS.MERGE` (with `WEIGHTS`) and `CMS.INFO`. Replies and errors are Redis
+  8.10's in RESP2 and RESP3, with the order in which Redis checks
+  arguments, and counts are Redis's exactly: items are placed in the
+  counters as Redis places them, so counters items share agree too
+  (checked against Redis 8.10.2 on 30,000 replies of random sequences:
+  `scripts/checks/sketch/cms/compare.py`). A counter stops at 2^32 − 1 as
+  Redis's does. RDB files, full syncs and `DUMP` payloads from Redis load,
+  and `DUMP` writes Redis's format. `TYPE` is `CMSk-TYPE`, the ACL category
+  `@cms`. Unlike Redis, a sketch has size limits (134,217,728 counters,
+  65,536 rows), `CMS.INCRBY`, `CMS.QUERY` and `CMS.MERGE` have per-command
+  limits checked before they start (`CMS.MERGE`: 2^23 counters, 8,388,608,
+  in all its sources together), and `COPY` copies a sketch. Snapshots
+  keep sketches under tag 40, kind 2.
+
+- **Top-K (`TOPK.*`), as Redis 8 has it built in (part of #453).**
+  `TOPK.RESERVE`, `TOPK.ADD`, `TOPK.INCRBY`, `TOPK.QUERY`, `TOPK.COUNT`,
+  `TOPK.LIST` (with `WITHCOUNT`) and `TOPK.INFO`. Replies and errors are
+  Redis 8.10's in RESP2 and RESP3, quirks included (`TOPK.COUNT` answers 0
+  for a kept item whose buckets count less than the least kept). The sketch
+  is Redis's HeavyKeeper, bucket for bucket: with a decay of 1, where
+  nothing is left to chance, every answer is Redis's (30,000 replies of
+  random sequences compared: `scripts/checks/sketch/topk/compare.py`); with
+  a decay below 1 the chances come from a generator each sketch keeps and
+  saves, so a replica, an AOF replay and a restart end with the master's
+  sketch exactly (a copy made from a `DUMP` payload, which has no place for
+  the generator, starts it afresh), and the heavy hitters of Zipf streams are found as well as
+  Redis finds them. RDB files, full syncs and `DUMP` payloads from Redis
+  load, and `DUMP` writes Redis's format. `TYPE` is `TopK-TYPE`, the ACL
+  category `@topk`. Unlike Redis, a sketch has size limits (k 65,536,
+  67,108,864 buckets, 65,536 rows), the commands of many items a
+  per-command limit checked before they start, items are binary-safe, and
+  `COPY` copies a sketch. Snapshots keep sketches under tag 40, kind 3.
+
+- **Cuckoo filters (`CF.*`), as Redis 8 has them built in (part of #453).**
+  `CF.RESERVE`, `CF.ADD`, `CF.ADDNX`, `CF.INSERT`, `CF.INSERTNX`,
+  `CF.EXISTS`, `CF.MEXISTS`, `CF.COUNT`, `CF.DEL`, `CF.COMPACT`,
+  `CF.SCANDUMP`, `CF.LOADCHUNK`, `CF.INFO` and `CF.DEBUG`, and the
+  `cf-bucket-size`, `cf-initial-size`, `cf-expansion-factor`,
+  `cf-max-iterations` and `cf-max-expansions` settings. Filters are laid out
+  byte for byte as Redis lays them out (placement, kicks, growth, the
+  compaction deletes trigger), so replies are Redis 8.10's in RESP2 and RESP3,
+  `CF.SCANDUMP` chunks included (24,000 replies of random sequences compared:
+  `scripts/checks/sketch/cf/compare.py`); RDB files, full syncs, `DUMP`
+  payloads and `CF.SCANDUMP` chunks from Redis load, and `DUMP` writes
+  Redis's format. A filter made from this node's settings goes to replicas
+  and the AOF as a `CF.RESERVE` naming them. `TYPE` is `MBbloomCF`, the ACL
+  category `@cuckoo`. Unlike Redis, a filter has size limits (1 GiB, 99
+  sub-filters), commands of many items a per-command limit checked before
+  they start, a compaction stops at a limit of its own (so a large filter
+  compacts in part), and `COPY` copies a filter. Under `maxmemory` a client's
+  write is given room before it takes its key for what it may allocate: the
+  filter it makes, a new sub-filter for an add only when no bucket of the
+  item has a free slot, the growth a `CF.INSERT` of many items needs to hold
+  them (an item that would grow the filter further when there is no room
+  left is answered with `OOM` on its own), and a copy of the sub-filters a
+  `COPY` or a snapshot shares and the write changes, `CF.DEL` and
+  `CF.COMPACT` included (refused with `OOM` at the limit under
+  `noeviction`; unshared, they free and always run). A write either succeeds
+  or changes nothing: every check comes before a filter is made. Snapshots
+  keep filters under tag 40, kind 4.
+
+- **t-digests (`TDIGEST.*`), as Redis 8 has them built in (#453).**
+  `TDIGEST.CREATE`, `TDIGEST.ADD`, `TDIGEST.MERGE` (with `COMPRESSION` and
+  `OVERRIDE`), `TDIGEST.RESET`, `TDIGEST.QUANTILE`, `TDIGEST.CDF`,
+  `TDIGEST.RANK`, `TDIGEST.REVRANK`, `TDIGEST.BYRANK`, `TDIGEST.BYREVRANK`,
+  `TDIGEST.MIN`, `TDIGEST.MAX`, `TDIGEST.TRIMMED_MEAN` and `TDIGEST.INFO`.
+  Replies and errors are Redis 8.10's in RESP2 and RESP3, with the order in
+  which Redis checks arguments, `nan` and `inf` included (16,000 replies of
+  random sequences compared: `scripts/checks/sketch/tdigest/compare.py`).
+  The digest is the published merging digest, so answers are approximations
+  within the same bounds as Redis's rather than bit for bit the same, and
+  Redis's where nothing is approximated. A query never changes a digest, so a
+  replica keeps the master's byte for byte. `TYPE` is `TDIS-TYPE`, the ACL
+  category `@tdigest`. Unlike Redis, a compression of at most 100,000, a
+  per-command limit on queries of many values and merges, `COPY` copies a
+  digest, and `DUMP` gives KiviDB's own payload (Redis's is refused).
+  Snapshots keep digests under tag 40, kind 5.
 
 - **Vector sets store vectors quantized when `VADD` asks for it (#697).**
   `Q8` keeps each vector as int8 with its norm and range, and `BIN` as one
@@ -272,6 +473,299 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   default seccomp profile, for one). TLS connections use the Tokio loop
   under either model.
 
+- **With `lua-parallel-scripts` on, `KEYS` and `SCAN` no longer stop
+  every connection (#772).** So that a walk of
+  the keyspace never finds a script running beside others part-way
+  through, they took the command gate alone: a `KEYS` over a million keys
+  held every connection for as long as it ran, and one that waited for a
+  script held back every command behind it on every thread. They now keep
+  out only the scripts running beside others, which keep them out in turn
+  (a lock per thread a script runs on, which the script holds alone and a
+  walk holds shared); they run beside every other command and each other,
+  as with `lua-parallel-scripts no`. A reply of `KEYS`, or a page of
+  `SCAN`, still finds each script's keys as they were before it or as they
+  are after it, as in Redis. A script that finds a walk under way waits
+  for it asleep, off its thread; one that finds walk after walk stops
+  waiting after three and holds the walks after it back, so a loop of
+  `SCAN`s cannot keep scripts out. The other commands that read keys they
+  do not name take the same locks, shared, as `KEYS` and `SCAN`: `INFO`
+  (with no section, or `keyspace`, `default`, `all` or `everything`),
+  `MEMORY STATS` and `MEMORY DOCTOR`, `FT.SEARCH`, `FT.AGGREGATE`,
+  `FT.HYBRID`, `FT.CURSOR`, `FT.PROFILE`, `FT.INFO`, `FT.TAGVALS`,
+  `FT.SPELLCHECK`, `SORT` and `SORT_RO` with a `BY` or `GET` pattern,
+  `TS.MGET`, `TS.MRANGE`, `TS.MREVRANGE`, `TS.QUERYINDEX`,
+  `TS.QUERYLABELS`, and `CLUSTER COUNTKEYSINSLOT`, `SLOT-STATS` and
+  `GETKEYSINSLOT`. A node coordinating a search across a cluster holds them
+  for its own part only, not while it waits for the other masters. A
+  script that runs beside others may not call these commands; it gets the
+  error a `KEYS` gets there. Commands that are neither scripts nor such
+  readers do not touch these locks. `FT.DROPINDEX … DD` and `DEBUG
+  POPULATE` run alone when scripts run beside other commands. `DBSIZE`, `RANDOMKEY`, the flushes,
+  `SWAPDB`, transactions and scripts that run alone take the gate alone as
+  before (`DBSIZE` and `RANDOMKEY` are quick, and the gate alone also makes
+  them come after the whole of what is in flight, such as active expiry
+  removing a large key, its `expired_keys` and `LATENCY` event included,
+  which Redis's `unit/latency-monitor` asks for); a build without Lua is
+  unchanged. Measured on 1,000,000 keys with a `KEYS *` loop, 16
+  connections sending `GET` and 4 a tagged `EVALSHA`, `--threads 4`
+  (Azure D8s_v5, server on 4 vCPUs, clients on the other 4), 15 s:
+
+  | | `GET`s served | `GET` connections stalled over 50 ms | `GET`s over 50 ms | scripts over 50 ms |
+  |---|---|---|---|---|
+  | before, io_uring | 45,900 | 16 of 16 | 290 | 73 |
+  | after, io_uring | 142,200 | 5 of 16 | 74 | 74 |
+  | `lua-parallel-scripts no`, io_uring | 136,500 | 11 of 16 | 198 | 74 |
+  | before, Tokio | 47,100 | 16 of 16 | 305 | 76 |
+  | after, Tokio | 142,200 | 2 of 16 | 2 | 72 |
+
+  The connections that still stall are those served by the thread running
+  the `KEYS` (io_uring), as with the setting off; the scripts wait for each
+  `KEYS`, which a script cannot run beside. A `SCAN` loop (`COUNT 1000`)
+  stalled nothing over 20 ms before or after.
+
+- **A write costs a master that keeps its replication backlog, or has a
+  replica, a third less (#894).** Each write used to reach the replication
+  thread as a message of its own, in an allocation of its own, after its
+  arguments had been copied once more. Writes are now appended to a run of
+  writes that the thread takes whole, encoded (once, from the client's own
+  arguments for the common commands) outside the lock that keeps them in
+  order. Instructions per pipelined `SET` of 100 bytes (callgrind, fat LTO,
+  io_uring / tokio): with the backlog kept 7,020 → 4,597 / 7,065 → 4,566;
+  with a replica attached 8,222 → 4,914 / 8,482 → 4,940; with no backlog
+  unchanged (2,129 in `execute_command`, 2,130 before); with the AOF alone within 1.2 %, in
+  glibc's `malloc`, not in the write path. On an Azure D8s_v5 (Xeon 8370C), SETs a
+  second, server started from its own snapshot (backlog kept), `--threads
+  2` on two cores, `redis-benchmark -c 100 --threads 4`: 263k → 275k at
+  pipeline 1, 1.07M → 1.34M at 16, 1.23M → 1.70M at 100 (Redis 8.10.2:
+  148k, 790k, 1.04M); with a replica attached 201k → 253k, 695k → 851k,
+  765k → 911k (Redis 144k, 784k, 1.02M); a server with no backlog the same
+  as before (2.71M at 100). With more workers the gain holds: `--threads 4`
+  1.70M → 2.42M and `--threads 6` 2.05M → 2.60M at pipeline 100. The
+  rate-limiter case of #894 (server on two CPUs, restarted from its
+  snapshot, `worker-cpu-affinity auto`): 31.6-31.9k checks a second at a
+  p99 of 0.07-0.12 ms at every background rate from 0 to 300,000 commands a
+  second (Redis: 31.7-32.0k at 0.06-0.11 ms up to 150,000, 28.4k at 0.74 ms
+  at 200,000, 24.3k at 0.91 ms at 300,000).
+- **A cluster reshard takes as long as before `nodes.conf` saves were made
+  durable, and they stay durable.** `redis-cli --cluster reshard` of 1,000
+  slots (suite `13-cluster-reshard` of `benchmarks/1.3.0/regressions`, 3
+  masters, 3,000,000 keys) took 38.3-40.2 s with every save synced and its
+  directory synced, and takes 27.2-27.8 s (27.4-28.6 s before saves were
+  synced), Azure `Standard_D4s_v5`, Xeon 8370C, three runs each on one VM. A
+  save on Linux now writes over the file an earlier save put out of place
+  (`nodes.conf.spare-<n>`, kept once the directory is synced, when it is no
+  longer nodes.conf on disk either), synced as it is written, and exchanges
+  it with nodes.conf (`renameat2` with `RENAME_EXCHANGE`, as atomic as a
+  rename) before the directory is synced: a new temporary file cost a
+  commit of the filesystem's journal of its own. nodes.conf is still
+  replaced whole, never written in place. `CLUSTER SETSLOT ... IMPORTING`,
+  `MIGRATING` and `STABLE`, which change nothing nodes.conf holds, are
+  answered without waiting for a save; `SETSLOT ... NODE` and the other
+  commands that change an owner or a node are answered once their save is
+  synced, as before. The fingerprint that tells whether the topology changed
+  hashes runs of slots, not all 16,384. A `SETSLOT ... NODE` takes 4.9 ms
+  on that disk, where it took 9.7-11.1 ms (5.2-6.0 ms before saves were
+  synced).
+- **`DEBUG` is refused by default, as in Redis 7 and later (#949).**
+  `enable-debug-command` was accepted and ignored, so `DEBUG` ran for any
+  user whose ACL allowed it, whatever the setting said. It now takes Redis's
+  three values: `no`, the default, refuses `DEBUG` to every client with
+  Redis's error (`ERR DEBUG command not allowed. ...`); `yes` allows it;
+  `local` allows it only to clients on loopback. It is set at startup, with
+  `--enable-debug-command` or in the config file; `CONFIG GET` reports it
+  and `CONFIG SET` refuses it, as Redis does. The ACL is checked first;
+  inside `MULTI` the refusal discards the transaction, as in Redis (scripts
+  could not run `DEBUG` already). Start the server with
+  `--enable-debug-command yes` for tools and tests that use `DEBUG SLEEP`,
+  `DEBUG POPULATE`, `DEBUG DIGEST-VALUE` and the rest.
+  `enable-protected-configs` and `enable-module-command` are still accepted
+  and change nothing.
+
+- **`FT.AGGREGATE ... GROUPBY` over many documents is 3.8x faster, and a
+  search index of many small documents takes 30 % less memory (part of
+  #761).** On #761's 2,000,000 hashes (`name TEXT email TAG
+  communityNumber NUMERIC age NUMERIC`), `GROUPBY 1 @communityNumber REDUCE
+  COUNT 0` took 3,453 ms and now takes 916 (Redis 8.10.3: 1,907); with
+  `REDUCE AVG 1 @age` and `SORTBY` 3,885 and 1,017 (Redis 2,428); over
+  `@age:[20 40]` 1,308 and 351 (Redis 759). The server's peak RSS over the
+  load and the queries fell from 3,722 MiB to 1,534 (Redis 2,158), its RSS
+  once loaded from 2,171 MiB to 1,476 (Redis 1,509) and `used_memory` from
+  1,755 MiB to 1,224 (Redis 1,454). Azure `Standard_D4s_v5`, server on 3
+  CPUs, the client on the fourth, rustc 1.100.0, medians of 3 runs;
+  suite `33-ft-aggregate-groupby` of `benchmarks/1.3.0/regressions` gates
+  it. What changed: a query whose steps
+  begin with a `GROUPBY` whose reducers keep a running value (`COUNT`,
+  `SUM`, `AVG`, `MIN`, `MAX`, `COUNT_DISTINCT`, `COUNT_DISTINCTISH`) puts
+  each hash into its group as it reads it, where it made a row of every
+  document first (a map of all its fields, each name and value a string of
+  its own, some 1.5 GB here) and grouped the rows. The groups, their order
+  and their values are the same. JSON indexes, `ADDSCORES`, a KNN clause,
+  a step before the `GROUPBY` other than `LOAD`, other reducers and a query
+  across a cluster still group rows. In the index, a TEXT term or a TAG
+  value that one document holds keeps that document in place rather than
+  in a list of its own, a term found in one field keeps that field's
+  documents in place, and the tables that find a tag's or a key's number
+  hold the number alone, where they held a copy of the text too: FT.INFO's
+  `text_postings_bytes` fell from 352 MB to 0.3 MB here, `postings_tag_bytes`
+  from 296 to 208, `postings_ids_bytes` from 198 to 128 (`text_terms_bytes`
+  rose from 132 to 165: a term is larger, holding its documents).
+
+- **A short script call costs the server less, level with Redis for Tyk's
+  rate limiter and centrifuge's history scripts (#901).** One call of Tyk's
+  sliding-log limiter (four sorted-set commands) cost 16.1 µs of server CPU
+  on one worker against Redis 8.10.2's 13.8; it now costs 13.4, and
+  centrifuge's history scripts 10.1 and 12.4 µs against 11.1 and 13.0
+  (1.2.2: 15.6, 14.2, 14.9). With two workers the server runs Tyk's script
+  92.3k times a second (master 60.7k, Redis 72.6k), `return 1` 187k (160k,
+  161k), and a BullMQ worker's `moveToFinished` costs 37.3 µs of server CPU
+  a job (47.9, Redis 42.0); Azure `Standard_D8s_v5`, server on 2 CPUs, rustc
+  1.100.0, the numbers in docs/PERFORMANCE.md. Instructions per call fell
+  30 % for Tyk's script and for `return 1`. What changed: a script's reply is
+  written as RESP from Lua's stack into one buffer instead of value by value
+  through mlua, and a short array is told from `{ok=...}`, `{err=...}` and
+  the RESP3 shapes by walking it; `redis` and the other library globals are
+  found by a table lookup instead of a Lua call; `EVAL`, `EVALSHA` and
+  `FCALL` go straight to the script handler; a command a script calls is
+  classified as a write once instead of five times, and its replication feed
+  is built only when an AOF, a replica, the backlog or a tap reads it;
+  `KEYS` and `ARGV` of at most 4 KB and at most 64 arguments in all stay
+  until the next script's are built;
+  one argument list per call; ahash for the script cache; and the
+  connection's environment is shared, not copied, when a script goes to the
+  script-runner thread. Replies, errors and what is replicated are unchanged
+  (a differential fuzz of 21,000 scripts against the tree before, RESP2 and
+  RESP3). `return 1` and a lock's compare-and-delete still cost 18 % and
+  11 % more than in Redis on one worker, around the call rather than in it.
+
+- **An HNSW index is built 4x faster from one client (#760).** A vector
+  written to an HNSW index is put in its graph's backlog and linked by
+  helper threads (`search-index-threads`, startup only: a number, or
+  `auto`, the default: none under a CPU quota such as a container's `--cpus`
+  or a Kubernetes CPU limit, none below 8 CPUs, otherwise (CPUs - 2) / 2;
+  `SCHED_IDLE` on Linux; under a CPU limit builds run at 1.2's speed unless
+  the setting is given a number),
+  where up to 1.2 the writing connection's thread linked it inside the
+  write: one client loading documents built the graph on one CPU. A search
+  measures every vector of the backlog exactly beside the graph's, so a
+  document is found from the moment its `HSET` is answered, as before; the
+  backlog holds at most 1,024 vectors and 128 Ki floats, and a writer that
+  finds it full links its vector itself. `FT.CREATE` over existing
+  documents, a restart and a replica's full sync hand their vectors over the
+  same way. `FT.INFO` shows `hnsw_backlog` and `hnsw_backlog_bytes`; the
+  snapshot format is unchanged (a vector still waiting at a save is put in
+  the graph at load, as 1.2.2 also does). An Azure D8s_v5, one client,
+  `M 16 EF_CONSTRUCTION 200`, medians of 3, 1.2.2 / 1.3.0 / Redis 8.10.2:
+  50,000 384-d documents 1,615 / 6,495 / 7,783 a second; 200,000 64-d
+  2,556 / 9,970 / 16,081; `FT.CREATE` over 50,000 written 1,666 / 2,746 /
+  7,442; peak RSS 215 / 218 / 248 MiB. Recall at a given `EF_RUNTIME` is
+  unchanged, fresh and after rounds of overwrites and deletes. GET/SET from
+  other clients during such a load: 144k a second at a p99 of 1.08 ms
+  (before: 137k, 0.39 ms, p99.9 25 against 11.6 ms). The build rates
+  above were taken with four helpers on the 8 vCPUs and the GET/SET ones
+  with three on 6 (`auto` now starts three on 8 CPUs, none on 6). On a server of fewer
+  than 8 CPUs builds run at 1.2's speed by default, and
+  `search-index-threads 1` (or more) trades serving latency for build
+  speed: with every CPU of a 4-vCPU server busy, one helper gives a GET/SET
+  p99 of 2.1 ms against 1.6 ms with none and builds 3,190 documents a
+  second against 1,540, and the `HSET` p99 of writers not on the bulk
+  loader's worker goes from 2.3-2.7 to 4.5-4.7 ms (a writer on that worker
+  waits behind its pipelines either way); two give 2.6 ms and 3,620. A
+  search takes
+  the backlog's vectors before it walks the graph and does not hold the
+  backlog meanwhile, so a long filtered search keeps no write waiting.
+  Writes over a waiting key queue no more work for the helpers, and a
+  dropped or compacted graph is freed at once. Unfiltered KNN was
+  never slower than Redis at the same recall: a KNN looks at at least 50
+  candidates, so the default `EF_RUNTIME 10` gives recall 0.38 at 2,844 q/s
+  where Redis gives 0.11 at 4,276 and 0.42 at 2,006 (`EF_RUNTIME 80`); see
+  docs/PERFORMANCE.md.
+
+- **Writes on a master with a replication backlog and no replica no
+  longer wake the replication thread one by one (#894).** A master that
+  starts with data (its own snapshot, or any dataset) keeps the backlog for
+  `repl-backlog-ttl` (an hour) so that a replica can be continued, and so
+  does one whose replicas have gone. Every write was handed to the
+  replication thread and woke it; on a server held to a few CPUs that
+  thread took them from the connections. In #894 an envoy rate limiter
+  (`INCRBY` + `EXPIRE` on two keys a check, 65 connections) beside other
+  replicas' pipelined load ran 8 % slower than on Redis with 1.7x its p99.
+  With no replica attached, the thread now takes what has come in, sleeps a
+  millisecond and looks again, and waits to be woken only once it finds
+  nothing; once a replica attaches, every write is handed on at once, as
+  before. Azure D8s_v5, the server on two vCPUs of separate cores
+  (`--threads 2`, io_uring), the checks and the background load on
+  CPUs of their own, the server started from a snapshot of 100,000 keys,
+  checks a second and p99 (medians of three; the 1.2.2 release binary,
+  master and this change all built with rustc 1.100.0), Redis 8.10.2
+  beside it:
+
+  | background (cmds/s) | 1.2.2 | before | after | Redis |
+  |---|---|---|---|---|
+  | 0 | 31.5k, 0.17 ms | 31.4k, 0.22 ms | 31.5k, 0.14 ms | 31.7k, 0.11 ms |
+  | 100,000 | 30.3k, 0.74 ms | 29.9k, 0.85 ms | 31.9k, 0.10 ms | 32.0k, 0.06 ms |
+  | 150,000 | 26.6k, 3.7 ms | 25.1k, 4.0 ms | 31.8k, 0.13 ms | 32.1k, 0.05 ms |
+  | 200,000 | 23.1k, 4.2 ms | 25.1k, 4.2 ms | 31.4k, 0.59 ms | 31.9k, 0.10 ms |
+  | 300,000 | 25.1k, 3.9 ms | 22.8k, 5.1 ms | 31.2k, 0.23 ms | 22.5k, 1.2 ms |
+
+  On the tokio loop, whose workers take each other's connections when one
+  is held up, the same case after the change: 31.7-32.0k checks a second
+  at a p99 of 0.06-0.11 ms at every rate. Pipelined `SET` on such a
+  server (`redis-benchmark -c 50`) went from 0.94M to 1.16M a second at
+  pipeline 16 and from 1.30M to 1.50M at 100; `GET` is unchanged.
+  At 200,000 the two io_uring workers are still at times put on one CPU by
+  the scheduler, and connections wait out the other's time slice (0.17,
+  0.59 and 1.0 ms in three runs); the opt-in `worker-cpu-affinity auto`
+  (#927) binds each to a CPU of its own. A server with no backlog (one started empty, as
+  benchmarks start it) does none of this: 31.6-31.9k checks a second at a
+  p99 of 0.06-0.10 ms at every rate. `WAIT` with no replica attached no
+  longer waits for the replication thread (it has nothing to count): 62 us
+  a call, 1.99 ms before this, 83 us on master; an idle server with the
+  backlog kept uses 0.13 % of a CPU, as before. Suite
+  `27-ratelimit-restarted` measures it.
+
+- **Pub/sub fan-out delivers 18-29 % more messages a second, ahead of
+  Redis (#851).** socket.io's Redis adapter publishes every broadcast with
+  `PUBLISH socket.io#/#<room>#` to servers that each `PSUBSCRIBE
+  socket.io#/#*`, a shape in which 1.2.2 was about 10 % slower than Redis
+  8.10. Each subscriber framed every message again as it wrote it, and its
+  writer allocated its batch and its output buffer afresh for every batch,
+  growing them by reallocation; on glibc those reallocations took the
+  allocator lock the publishing thread was allocating under, so the
+  server's threads mostly waited on each other. A message is now framed
+  once for each channel or pattern it goes through, and that frame is
+  shared by all of their subscribers (a RESP3 subscriber's push differs
+  only in its first byte), with a payload of 4 KB or more copied once,
+  before the subscription table is locked, and shared by the frames;
+  a subscriber keeps its buffers (at most 4 KB of frames and 32 messages)
+  from one batch to the next while messages keep coming, counts them in its
+  `tot-mem`, and gives them back once it has been idle for a second; and
+  its writer lets the thread's other connections run once before it
+  writes, so that what they publish meanwhile goes out in the same write,
+  as Redis writes to a subscriber once a turn of its event loop. One Azure
+  D4s_v5, the server on 2 vCPUs and the clients on the other 2, 16
+  subscribers, 200-byte messages, medians of three, master before / after
+  / Redis 8.10.2:
+  - the issue's memtier run (48 publisher connections): 102,512 / 124,186
+    / 108,666 publishes a second, 1.43M / 1.85M / 1.53M messages
+    delivered;
+  - 48 connections publishing as fast as they are answered, `PSUBSCRIBE`:
+    1.47M / 1.79M / 1.28M delivered a second; plain `SUBSCRIBE` of one
+    channel: 1.54M / 1.82M / 1.34M;
+  - at a fixed 70,000 publishes a second (1.12M deliveries), p99 from
+    publish to receipt 0.88 / 0.69 / 0.81 ms (`PSUBSCRIBE`), 0.79 / 0.70 /
+    0.83 ms (`SUBSCRIBE`);
+  - on the Tokio loop (no Redis column): the memtier run 1.10M / 2.01M
+    delivered a second, 48 `PSUBSCRIBE` publishers 1.04M / 1.83M.
+
+  1.2.2 in an earlier run of the same harness delivered 1.29M (memtier),
+  1.26M (`PSUBSCRIBE`) and 1.34M (`SUBSCRIBE`) a second there.
+  `benchmarks/1.3.0/regressions/suites/23-pubsub-pattern-fanout.py`
+  re-measures it on a shared, unpinned VM with `--threads 2`: there the
+  pattern row is ahead of 1.2.2 and Redis (1.47M against 1.31M and 1.37M a
+  second) and the plain-channel row level with both (1.47M against 1.51M
+  and 1.43M). What a subscriber is sent, in what order, and what counts
+  against `client-output-buffer-limit pubsub` are unchanged.
+
 - **`SSCAN`, `ZSCAN` and `HSCAN` of a large collection are faster, and a
   call no longer copies the collection (#624, #770 in part).** A page was
   found by collecting every element past the cursor into a vector as large
@@ -332,9 +826,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of the `DEL` loop are `COUNT` and a shard's floor of a sixteenth of its
   keys, taken when a call starts in a shard it does not finish.) A
   connection served by the same thread as a running `SCAN` still waits for
-  it, as with any command on the io_uring loop. With `lua-parallel-scripts yes`, `SCAN` still takes the command
-  gate alone (#772): unlike Redis's, a call goes through the keyspace a
-  shard at a time, and without the gate it could find a script's keys
+  it, as with any command on the io_uring loop. With `lua-parallel-scripts yes`, a call
+  of `SCAN` keeps the scripts running beside others out while it runs, and
+  nothing else (#772, below): unlike Redis's, a call goes through the
+  keyspace a shard at a time, and could otherwise find a script's keys
   halfway through what the script does. Regression suite
   `22-scan-large-count` measures it.
 
@@ -483,19 +978,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     this release writes and the other way round. `MEMORY USAGE`, eviction
     and lazy freeing count a block or an array as the one allocation it is.
 
-- **Lists take about half the memory (#297).** A list's elements are kept
-  end to end in chunks of up to 64, each element between two copies of its
-  length, where every element had an allocation, a shared header and a slot
-  of its own. Bytes of `used_memory` an element, 32-byte elements, 3M
-  elements in lists of each size:
+- **Lists take about half the memory, short elements a fifth (#297).** A
+  list's elements are kept end to end in chunks of up to 64, each element
+  between two copies of its length (one byte each for an element shorter
+  than 128 bytes), where every element had an allocation, a shared header
+  and a slot of its own. Bytes of `used_memory` an element, 32-byte
+  elements, 1M elements in lists of each size (3M in one list):
 
   | elements a list | 1.2.2 | now | Redis 8.10.2 |
   |---:|---:|---:|---:|
-  | 10 | 76.0 | 48.8 | 45.0 |
-  | 100 | 65.2 | 38.4 | 36.4 |
-  | 1,000 | 64.1 | 36.7 | 34.6 |
-  | 100,000 | 68.5 | 36.7 | 34.3 |
-  | 3,000,000 | 69.8 | 36.7 | 34.3 |
+  | 10 | 75.6 | 46.4 | 44.0 |
+  | 100 | 65.2 | 36.4 | 36.4 |
+  | 1,000 | 64.1 | 34.7 | 34.6 |
+  | 100,000 | 68.5 | 34.7 | 34.3 |
+  | 3,000,000 | 69.8 | 34.7 | 34.3 |
+
+  Six-byte job ids, 100,000 a list: 44.5 bytes an element in 1.2.2, 8.7
+  now, 5.0 in Redis (which keeps such numbers as integers). A list drained
+  to a tenth of its length gives back the room it kept for the rest.
 
   Suite `21-list-memory` of the 1.3.0 regression suite measures this again.
   - A push or a pop at either end moves nothing in its chunk: each chunk
@@ -547,6 +1047,59 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     memory. `MEMORY USAGE`
     counts the chunks as allocated; eviction's estimate of what freeing a
     list gives back is their bytes, and lazy freeing's effort their number.
+
+- **Small sorted sets take a quarter to a sixth of the memory (#297, part
+  of #825).** A sorted set of up to 128 members of up to 64 bytes is kept in
+  one block, its entries in order by score and then by member, where it
+  was a hash table and a tree that each held the member: 14-byte members
+  with whole-number scores take 29.6 bytes a member at 10 members (118.8
+  before; Redis 8.10.2 24.8) and 19.3 at 100 (116.4; Redis 21.0); with
+  fractional scores 37.6 and 27.3 (Redis 28.0 and 26.2). Ten 8-byte
+  members a key, as #297 measured it, take 274 bytes of RSS a key (1,249
+  before; Redis 186). Sorted sets of more than 128 members (or with a
+  member longer than 64 bytes) are unchanged: still a table and a tree,
+  at the same size as before; #825's 800-member feeds among them.
+  - A score that is an integer of up to 56 bits is kept in one to eight
+    bytes (one up to 247), any other as the eight bytes of the float: read
+    back, every score is the same float, bit for bit. A member is found by
+    scanning one byte a member (a fingerprint), as in small sets and
+    hashes; a rank is a position, and a range of scores a binary search.
+  - A sorted set moves to the table and the tree when a write adds a member
+    past 128 or one longer than 64 bytes, or when one `ZADD` (or `GEOADD`)
+    gives more than 128 pairs, as Redis moves a listpack to a skiplist;
+    never back. A set built whole (a snapshot or AOF load, `RESTORE`,
+    `MIGRATE`, `ZRANGESTORE`, `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE`,
+    `GEOSEARCHSTORE`) is one block if it fits, laid down once.
+  - `OBJECT ENCODING` reports the form a sorted set is kept in, `listpack`
+    or `skiplist`, and `ZSCAN` returns a block whole, in order, with cursor
+    0, as Redis returns a listpack. A set that became large and was taken
+    back under the limit used to be reported as `listpack`; it is a
+    `skiplist`, as in Redis.
+  - `zset-max-listpack-entries` (default 128) and `zset-max-listpack-value`
+    (64), and their `zset-max-ziplist-*` names, now take effect, from the
+    configuration file or `CONFIG SET`; `0` entries turns blocks off. They
+    go no higher than 128 and 64, and `CONFIG GET` reports the value kept;
+    a larger value logs a warning naming the maximum (also for the set and
+    hash limits, which are clamped the same way). A lowered limit applies
+    to a set at its next new member. A set's buffer gives its room back as
+    members go (once more than half of it is spare), so one popped down
+    from 128 long members does not keep their bytes.
+  - Commands cost fewer instructions on a block than on the table and tree
+    for most of what a small sorted set is used for (8 and 100 members,
+    pipelined, io_uring): `ZRANGE 0 9` 16-17 % fewer, `ZRANGE 0 -1` of 100
+    members 52 %, `ZRANK` 7-17 %, a changed score by `ZADD` or `ZINCRBY`
+    7-12 %, `ZRANDMEMBER` of 100 members 11 %; `ZSCORE` the same. Adding a
+    new member to a set of exactly 8 costs 5 % more (the block grows by
+    one allocation), and at 100 members a `ZSCORE` miss 2 %, a new member
+    2 %, `ZREM` then `ZADD` 2 % and `ZPOPMIN` 2.5 % more (the entries after
+    it move). Large sets are within 1 % of before, and `GET`/`SET` unchanged.
+  - Snapshots, the AOF, replication, `DUMP`/`RESTORE` and `MIGRATE` still
+    write members and scores, so their formats do not change: 1.2.2 reads
+    what this release writes and the other way round, and `DEBUG DIGEST-VALUE`
+    does not depend on the form. `MEMORY USAGE`, eviction and lazy freeing
+    count a block as the one allocation it is. A large sorted set keeps its
+    table and tree behind one more pointer, so its handle in every key is
+    the size of a block's.
 
 - **Active defrag's pass ends about twice as fast, at the same CPU cap
   (#240, #291).** It slept after every batch of 128 buckets, and each sleep
@@ -664,11 +1217,221 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `FT.AGGREGATE` with `*=>[KNN 10 @vec $q]` -3.5%, with a tag filter
   -2.8%; `FT.SEARCH` over a tag filter -1.2%, `KNN` with a filter -1.1%, an
   unfiltered `KNN` -0.5%; hashes with no field TTL within 0.2% either way.
-  The search of `FT.SEARCH` and hybrid `KNN` still asks the index for more
-  neighbours, up to the whole index, while hits are left out, and does not
-  stop at the query's `TIMEOUT` (#670).
+
+- **An unfiltered KNN whose nearest vectors are past their deadline stops at
+  the query's `TIMEOUT`, and no longer searches the whole index for more
+  (#670).** `FT.SEARCH` with `*=>[KNN ...]` and `FT.HYBRID`'s `VSIM ... KNN`
+  without a filter leave out a document whose vector field has passed its
+  deadline and ask the index for more, at least twice as many each round.
+  They went on until they had `k` or had asked for the whole index (an HNSW
+  search with that many candidates), and did not look at the clock. Now an
+  HNSW index is asked for at most one vector in 16 of what it holds, and a
+  FLAT one (whose every search measures every vector) once; after that every
+  vector is measured exactly, keeping the nearest few, four times as many
+  each pass, until `k` are shown. The deadline is checked before every round
+  and pass after the first search and every 1,024 documents a pass looks at;
+  `ON_TIMEOUT return` gives the shown ones found so far, nearest first.
+  Other KNN paths were already bounded: with a filter, `knn_planned` and the
+  exact filtered scan, and `FT.AGGREGATE`, which measures the rows its
+  filter left. On HNSW, 200,000 documents with 99% of the nearest hidden
+  (D4s_v5): 798 ms a query before, 425 after; `TIMEOUT 50` stops at 57 ms
+  (it was ignored); a writer's worst `HSET` during the query 813 ms before,
+  70 after. With no field TTL or nothing hidden, instructions a query do not
+  move (callgrind, 0.1%).
 
 ### Fixed
+
+- **A script running beside others under its hash tags is refused
+  `MIGRATE` (#340).** A `MIGRATE` holds back writes to the keys it moves
+  until they have left, and a script that runs beside others cannot take
+  that hold, so it fails with an error, as `KEYS` does in such a script.
+  A script that runs alone keeps `MIGRATE` and its hold.
+- **A command that waits for a script on its hash tag no longer holds up
+  its thread (#882).** With `lua-parallel-scripts` on, a client's command
+  on a key whose tag a script running beside others held waited on the
+  tag's lock on its connection's thread, and every other connection of
+  that thread waited with it, whatever keys they used. The command now
+  tries the locks of its tags without waiting for a script; when a script
+  holds one, or is in line for it, the command takes none of them, and its
+  connection waits for the tag's turn asleep, in line with the scripts and
+  commands of the tag in the order they came, while the thread serves its
+  other connections. What the client pipelined behind the command waits
+  with it, and the replies before it are sent first; a command naming keys
+  of several tags holds the lock of none of them while it waits, and waits
+  in line only on the tags a script is on, so scripts on its other tags go
+  on meanwhile (should one of those be busy once it is its turn, it waits
+  for that tag too, holding nothing); a client that goes or
+  is killed while it waits leaves nothing behind; a blocking command woken
+  by the script keeps what it was woken for. The replica's applier, the
+  AOF's replay and `EXEC` wait in place, as before. Measured with a ~2 ms
+  tagged script run back to back on one tag, 8 connections reading and
+  writing that tag and 16 reading and writing untagged keys (Azure
+  D8s_v5, server on 4 vCPUs, memtier on the other 4):
+
+  | | untagged ops/s | untagged p50 / p99 | tagged ops/s | scripts/s |
+  |---|---|---|---|---|
+  | `--threads 1`, before / after | 10.4k / 9.9k | 2.16 / 2.16 ms, 4.45 / 4.48 ms | 5.8k / 5.4k | 453 / 453 |
+  | `--threads 2`, before / after | 12.8k / 90.9k | 0.25 / 0.09 ms, 4.26 / 2.83 ms | 8.2k / 7.8k | 473 / 413 |
+  | `--threads 4`, before / after | 16.2k / 110.3k | 0.17 / 0.11 ms, 4.29 / 2.99 ms | 11.7k / 9.6k | 456 / 307 |
+  | `--threads 4`, Tokio loop, before / after | 13.9k / 129.8k | 0.26 / 0.11 ms, 4.19 / 0.30 ms | 10.3k / 10.1k | 467 / 334 |
+
+  With one thread the script runs on the thread every connection is
+  served by, as before. On io_uring a connection served by the thread
+  running the script still waits for it, which is the p99 left. The script
+  runs less often with several threads because the thread it runs on now
+  serves its other connections between runs, where before they stood
+  stalled: its p50 went from 2.1 to 3.2 ms at four threads, the time it
+  waits for its thread. Letting the commands queued for a tag take its
+  turn together rather than one by one gave the same 315 scripts a
+  second, and gave up the order they came in, so they take it one by one.
+
+- **`bind ::` and `bind ::1` start.** The address was joined to the port as
+  `:::6379`, which is not one, and the server exited with "invalid socket
+  address syntax" (the bus and TLS listeners too); only `[::]` worked. An IPv6
+  address is put in brackets now. KiviDB still listens on one address.
+
+- **A node met just before the whole cluster stops is still a member after
+  it starts again (#808).** Both ends of a `CLUSTER MEET` save the other
+  to `nodes.conf`, synced, before showing it as a member (the receiving
+  end before it answers): once the node that ran `CLUSTER MEET` lists the
+  new node without `handshake`, a cluster stopped whole, even killed,
+  keeps it, and the nodes that had not heard of it yet learn it again by
+  gossip. A node also saves its `nodes.conf` at the start of a shutdown
+  (`SIGTERM`, `SHUTDOWN`), and waits for that save. A node cannot join by
+  heartbeats alone: one no member has in its `nodes.conf` needs a new
+  `CLUSTER MEET`, as in Redis. See
+  [PERSISTENCE.md](docs/PERSISTENCE.md#the-clusters-nodesconf).
+
+- **`nodes.conf` is synced before it replaces the old one, and a file cut
+  short is refused (#808).** A save writes a temporary file beside it
+  (`nodes.conf.tmp-<n>`), syncs it, renames it into place and syncs the
+  directory, so a crash at any moment leaves the old file or the new one;
+  temporary files a crash left are removed at startup. A `nodes.conf` that
+  does not end with its `vars` line is refused at startup with the reason
+  (`... is unreadable: nodes.conf is incomplete ...`) and left as it is.
+  An empty one is refused as empty (`nodes.conf is empty`), unlike Redis,
+  which takes it for a new node: delete the file to start a node afresh. A
+  save that does not change the topology is skipped only when no other
+  save is still on its way to the file. A filesystem that cannot sync a
+  directory (`EINVAL`, `ENOTSUP`) is warned of once and does not fail the
+  save. The format is unchanged: files 1.2 wrote load, and 1.2 loads the
+  files this release writes.
+
+- **A vote is sent once it is saved, and a node met is a member once it is
+  saved (#808).** A node whose `nodes.conf` cannot be saved (a full or
+  read-only disk) casts no vote in that epoch, makes no node met a member
+  and does not answer its MEET; it logs the failure once, as an error,
+  until a save works again. The end that sent the MEET tries again, for up
+  to two minutes, and again when the other end calls on it within the hour
+  after. Nodes met at the same time (`redis-cli --cluster create` has every
+  node meet the first) are saved together, in one write. The vote is saved
+  off the cluster bus's thread, and a candidate counts a vote for as long
+  as its election lives: a voter on a slow disk answers once its vote is
+  saved. A replica that wins an election saves its promotion before it
+  announces it, waiting for the save up to a second; a promotion not
+  saved by then is announced all the same and saved in the background. A
+  save waits on two syncs (the file before its rename, the directory
+  after); see [PERSISTENCE.md](docs/PERSISTENCE.md#the-clusters-nodesconf)
+  for what failover needs of the disk.
+
+- **A node that restarts before its promotion was saved completes it once a
+  majority of the masters report it as the owner.** A node restarted before
+  the save of its promotion was done completes the promotion from what the
+  masters report. A master tells such a node, in its answer to the node's
+  heartbeat, which slots it holds it as the owner of, at which config
+  epoch, and how many masters own slots in its view (a field that 1.2 nodes
+  do not send and do not read). Once a majority of the masters that own
+  slots (of the greater of that count and the node's own) say it owns every
+  slot of its old master, at a config epoch newer than any it knows for
+  those slots, the node takes exactly those slots over at that epoch, saves
+  that as a promotion is saved, and serves them with the dataset it has.
+  Without the AOF (and no snapshot from a clean shutdown), it serves none of
+  them until a replica that holds them has taken over or its replicas have
+  answered that they hold nothing either, as a master back without its
+  dataset does; with no replica, it serves what it has. A master that voted
+  for another replica to replace the node gives no such answer while that
+  election may still be won, and votes for no replacement of the node while
+  the node may be completing its promotion on its answer: a master answers
+  so for three node timeouts at most, and refuses such votes for six at
+  most (90 s at the default node timeout). A node that starts
+  as a replica begins its first sync once enough of the masters have
+  answered that it is not to complete a promotion (with three masters, two
+  of them), or one node timeout after it started, whichever is first, and
+  not at all if it is to complete one; later syncs do not wait. A master
+  that owns those slots at a newer epoch (another replica elected since, a
+  `CLUSTER FAILOVER TAKEOVER`) is followed instead. With nodes of
+  1.2 among the masters, the majority has to be made of masters of this
+  release.
+
+- **`MONITOR` no longer loses lines.** A monitor was fed through a ring of
+  4,096 lines shared by all monitors, and one that fell that far behind
+  lost what it had not read without a word: with four connections sending
+  pipelined commands over four worker threads, a monitor of 1.2.2 missed
+  between 43 % and 72 % of them (one connection was not affected). Each
+  monitor now has its own queue, held to `client-output-buffer-limit
+  normal` as in Redis (no limit by default): past it the monitor is
+  disconnected and the server logs `Client id=… closed: it is in MONITOR
+  and … bytes behind, over client-output-buffer-limit normal`. Every
+  monitor sees one order, each connection's commands in the order it sent
+  them, and time stamps in the order of the lines: they no longer go back
+  between lines from different threads (only when the system clock is set
+  back, as in Redis). What a monitor has not read yet shows in its `omem`
+  in `CLIENT LIST`. Arguments are quoted as Redis quotes them: `\n`, `\r`, `\t`,
+  `\a` and `\b` by name, not as `\x0a` and the like.
+
+- **`CLIENT UNBLOCK` reaches a client that was woken and is parking
+  again.** It could answer 1 for a client blocked in `BLPOP` (or another
+  blocking pop) that had just been woken and was parking again, and the
+  client then stayed blocked; or answer 0 for it when the pop ahead of it
+  ended with nothing. And a blocking pop that ended with nothing (its
+  timeout, or `CLIENT UNBLOCK`) woke the next client waiting on its key
+  for no reason, which is what opened that window: Redis's unit/pause
+  failed on it now and then.
+
+- **Writes made during an HNSW compaction are kept in the rebuilt graph.**
+  Writes made while a compaction rebuilds a graph now go to the new graph
+  too, from before the copy, and the copy leaves a key a write touched as
+  the write left it. Such a write goes through each graph's backlog, as
+  any other does, instead of being linked into both graphs inside the
+  write.
+
+- **Sorted-set commands read integers as Redis does.** `ZREMRANGEBYRANK
+  key x 5` took `x` as 0 and removed members; it now answers `ERR value is
+  not an integer or out of range`, before it looks at the key, as Redis
+  does. And `+1`, `01` and `-0`, which Redis refuses, were taken as numbers
+  by the indexes of `ZRANGE`/`ZREVRANGE`/`ZRANGESTORE`, the counts of
+  `ZPOPMIN`/`ZPOPMAX`/`ZRANDMEMBER`/`ZMPOP` (and `LMPOP`), `LIMIT` offsets
+  and counts, `ZINTERCARD`'s `LIMIT` and `numkeys`: each now gets Redis's
+  error.
+
+- **Scripts have the Lua 5.1 library functions Redis keeps (#898).**
+  `table.getn`, `table.setn`, `table.maxn`, `table.foreach`, `table.foreachi`,
+  `math.mod`, `string.gfind` and the global `gcinfo` were missing (scripts run
+  on Lua 5.4), so a script that used one failed with `attempt to call a nil
+  value`. hibiken/asynq's scripts end with `return table.getn(ids)`: with it
+  missing, its scheduled and retry tasks were never moved back to pending, and
+  38 of its `internal/rdb` tests failed. They are there in `EVAL`, `EVALSHA`,
+  `EVAL_RO` and function libraries, and do what Lua 5.1's do (`table.setn`
+  raises `'setn' is obsolete`, as in Redis); they are made when a script
+  first names one, so a VM and a script that do not use them cost nothing. A number
+  one returns that has an integer value is an integer, so `'n=' ..
+  table.maxn(t)` is `n=3`. See [SCRIPTS.md](docs/SCRIPTS.md).
+
+- **`string.format` in scripts is the patched `str_format` itself, with
+  no per-call scan (#771).** The 5.1-compatible integer conversions of
+  #747 came from a Rust wrapper that read the whole format string on
+  every call to decide whether Lua's own `string.format` could take it:
+  a script holding twenty `format` calls ran about 6% slower under
+  `EVALSHA`. `string.format` is now a copy of Lua 5.4.7's `str_format`
+  patched where 5.1 differed — integer conversions take any number and
+  convert it through explicit double-to-integer steps that give
+  x86-64's answers on every architecture (a real cast of a double out
+  of range is undefined behaviour), every conversion accepts the flag
+  set 5.1's did and a sixth flag character is the error 5.1 raised —
+  compiled by `build.rs` against the headers of the same vendored Lua
+  the library builds with. A call costs what a C function call costs,
+  and an error now names the argument at fault, which the wrapper
+  could not always do.
 
 - **`CLUSTER SLOTS`, `SHARDS` and `NODES` refuse on a standalone, as in
   Redis (#899).** They answered with empty tables, so a client that asks
@@ -711,6 +1474,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reach that limit. The same goes for the replies a blocking command
   writes before it waits; if that write fails, the client is closed at
   once, and what it pipelined after the blocking command is not run.
+
+- **A subscriber with messages unread that sends a pipeline no longer
+  hangs its connection under io_uring (#938).** A subscriber's messages
+  (and tracking's invalidations) are written by a task of their own, which
+  holds the connection's write lock while it waits for the client to make
+  room. The connection, with replies of its own to write, waited for that
+  lock without reading, so a client that sends a pipeline before it reads
+  anything (a subscriber with 6 MB of messages unread sending 1,000,000
+  `PING`s) and the server each waited for the other for good, as in #865.
+  The loop now reads the client while it waits for the lock too, under
+  the same `client-query-buffer-limit` and hard output limit; the flush
+  before a blocking command does the same. The tokio loop already read on
+  while it waited. With this, the io_uring loop sends a batch of replies
+  first without waiting in the kernel; only when the socket is full does it
+  write the rest while it reads the client, as since #865, so the next
+  request of a client that sends one command at a time is read on the next
+  turn, already there, rather than parked in the kernel beforehand.
+
+- **What a waiting client has read ahead and its unparsed buffer are held
+  to `client-query-buffer-limit` together (#869).** What a client sent
+  while it waited — in a blocking command, held by a pause, in `WAIT`,
+  behind replies not yet written — was read ahead bounded by
+  `client-query-buffer-limit` on the read-ahead alone; the unread bytes
+  it already held in the parse buffer counted nowhere, so the two could
+  each reach the limit — about twice it, held — without the client being
+  closed. The bound is now the not-yet-run bytes the buffer holds plus
+  the read-ahead's unmoved part, and the read-ahead gives its consumed
+  prefix back — capacity with it — in steps as it is moved on, rather
+  than at the end. What is moved out of the read-ahead is not reserved
+  for again either: the buffer is not grown to a request's full length
+  while the read-ahead still holds it. The io_uring loop holds the same
+  bound.
+
+- **What a waiting client read ahead is replayed out of the allocation it
+  was read into.** The read-ahead was moved a read's worth a turn into the
+  query buffer, which reserved and doubled its way up while the
+  read-ahead's own allocation still held the same bytes — a client kept
+  about twice what it held, and at a thousand waiting clients holding a
+  megabyte each the difference was hundreds of megabytes of RSS. When the
+  buffer has nothing left to run, the read-ahead's vector is now handed to
+  it whole and offered on a read's worth a turn, so one allocation carries
+  the bytes. The io_uring loop does the same.
 
 - **`CLIENT NO-TOUCH` now keeps the client's reads from counting as a
   use of the keys they find (#566).** The command was accepted and
@@ -1149,7 +1954,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `client-output-buffer-limit replica 256mb 64mb 60` now takes effect: it
   sets the hard limit back to 256 MB if `repl-replica-max-backlog-bytes`
   was raised earlier in the file (the last line wins), and turns that soft
-  limit on.
+  limit on. A client's replies are held to the limits after each reply,
+  not once for all that one read brought (#893): a pipeline of large
+  replies (`LRANGE`, `SMEMBERS`, `KEYS`, `GET` of a large value) is cut
+  before the command after the reply that takes the client to its hard
+  limit, as Redis closes it at the limit and one reply. What ran before is
+  applied, in the AOF and on replicas; a transaction or a script is one
+  command and runs whole; the soft limit still lets a pipeline run. The
+  check is made only once a turn's replies have grown to room for the
+  smallest limit, so a pipeline of small replies pays nothing for it. How
+  much one read brings no longer matters to the limit.
 
 - **`string.format('%d', x)` in a script takes an `x` with a fraction, as
   Redis does (#747).** Scripts run on Lua 5.4, which failed with "number has
@@ -1673,7 +2487,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   write that replaces or removes no document pays one comparison for it.
   A plain KNN query (`*=>[KNN k ...]`) now looks at each key it found, as
   the other queries did, and leaves out one deleted or written over while
-  it ran.
+  it ran, taking the next nearest in its place.
 
 - **`FUNCTION LIST` and `FUNCTION STATS` follow the client's protocol**
   (#476). To a RESP3 client each library, each function and the stats are

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/give_back.rs
 //
 // Freed memory goes back to the system without a MEMORY PURGE once a lot of
@@ -135,6 +136,22 @@ fn load_hash(c: &mut Conn, key: &str, fields: usize) {
     assert_eq!(c.cmd(&["HLEN", key]), fields.to_string());
 }
 
+/// Wait up to 30 s for `allocator_trims` to rise above `than`; what it is
+/// then. The counter is what the test is about, and it is bumped by the
+/// give-back thread when it trims, which it does on a tick of its own and
+/// only once the server was idle for a second. RSS can fall below the
+/// bound before that (glibc hands back large frees by itself), so the
+/// counter is waited for, not read the moment RSS looks right.
+fn trims_rise_above(c: &mut Conn, than: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut now = c.info("allocator_trims").unwrap_or(0);
+    while now <= than && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+        now = c.info("allocator_trims").unwrap_or(0);
+    }
+    now
+}
+
 /// Wait up to 30 s for RSS to fall to `bound`; what it is then.
 fn rss_falls_to(bound: u64) -> u64 {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -179,9 +196,11 @@ fn memory_of_a_deleted_hash_goes_back_to_the_system() {
         now <= before + grew / 3,
         "RSS {before} before the hash, {loaded} with it, still {now} 30 s after the DEL"
     );
-    let after = c
-        .info("allocator_trims")
-        .expect("allocator_trims in INFO memory");
+    assert!(
+        c.info("allocator_trims").is_some(),
+        "allocator_trims in INFO memory"
+    );
+    let after = trims_rise_above(&mut c, trims);
     assert!(after > trims, "no trim counted");
 
     // Busy: no trim while commands keep coming, and one once they stop.
@@ -231,8 +250,8 @@ fn memory_of_a_deleted_hash_goes_back_to_the_system() {
         "RSS {before} before the hash, {loaded} with it, still {now} 30 s after the load stopped"
     );
     assert!(
-        c.info("allocator_trims").unwrap() > trims,
-        "no trim counted"
+        trims_rise_above(&mut c, trims) > trims,
+        "no trim counted once the load stopped"
     );
 
     // The switch.

@@ -10,11 +10,13 @@
 #        compare.py also checks the v1.2.2 binary's SHA-256 against the pin in
 #        baseline.json.
 #        <variant> is "default" (glibc, no Lua) or one of full, lua, tls.
-#   engines_resolve_candidate <path|tag> <dir>   -> prints the binary's path
-#        An existing file is used as it is; anything else is taken as a tag.
+#   engines_resolve_candidate <path|tag> <dir> [variant] -> prints the binary's path
+#        An existing file is used as it is; anything else is taken as a tag
+#        (its <variant> tarball, default "default").
 #   engines_resolve_redis <dir>                  -> prints redis-server's path
 #        $REDIS_SERVER, else /opt/redis-$REDIS_VERSION/src/redis-server, else
-#        built from the $REDIS_VERSION tag of github.com/redis/redis into <dir>.
+#        built into <dir> from the $REDIS_VERSION release tarball, checked
+#        against $REDIS_SOURCE_SHA256 first (pinned here for 8.10.2).
 #        The version must start with $REDIS_SERIES (8.10.).
 #   engine_start <kind> <bin> <io_model> <threads> [extra args...]
 #        <kind> is kividb or redis. Picks a free non-ephemeral port, starts the
@@ -34,6 +36,13 @@ REGRESS_LIB=${REGRESS_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 REGRESS_CACHE=${REGRESS_CACHE:-$HOME/.cache/kividb-regress}
 REDIS_VERSION=${REDIS_VERSION:-8.10.2}
 REDIS_SERIES=${REDIS_SERIES:-8.10.}
+# SHA-256 of https://download.redis.io/releases/redis-8.10.2.tar.gz (as listed
+# in github.com/redis/redis-hashes); another REDIS_VERSION needs its own.
+if [ "$REDIS_VERSION" = 8.10.2 ]; then
+  REDIS_SOURCE_SHA256=${REDIS_SOURCE_SHA256:-b9ffee226b5eecdba98a679260dad764b2a4ebd90dce4ad5ac9e9f3eef9c02b3}
+else
+  REDIS_SOURCE_SHA256=${REDIS_SOURCE_SHA256:-}
+fi
 KIVIDB_REPO=${KIVIDB_REPO:-kividbio/kividb}
 PYTHON=${PYTHON:-python3}
 
@@ -86,12 +95,12 @@ engines_fetch_release() {
 }
 
 engines_resolve_candidate() {
-  local what=$1 dir=$2
+  local what=$1 dir=$2 variant=${3:-default}
   if [ -f "$what" ]; then
     [ -x "$what" ] || { engines_log "$what is not executable"; return 1; }
     (cd "$(dirname "$what")" && echo "$(pwd)/$(basename "$what")")
   else
-    engines_fetch_release "$what" default "$dir"
+    engines_fetch_release "$what" "$variant" "$dir"
   fi
 }
 
@@ -108,11 +117,24 @@ engines_resolve_redis() {
   for bin in "${REDIS_SERVER:-}" "/opt/redis-$REDIS_VERSION/src/redis-server" "$dir/redis-$REDIS_VERSION/src/redis-server"; do
     if [ -n "$bin" ] && [ -x "$bin" ] && engines_redis_ok "$bin"; then echo "$bin"; return 0; fi
   done
-  engines_log "building Redis $REDIS_VERSION from its tag (a few minutes)"
+  # From the release tarball, checked against its pinned SHA-256 (redis-hashes)
+  # before anything is built: the binary built here differs from the pinned
+  # one of the VM image, so what is pinned for it is its source. The checked
+  # hash is left beside the build (SOURCE_SHA256) for env.json.
+  local url=https://download.redis.io/releases/redis-$REDIS_VERSION.tar.gz got
+  [ -n "$REDIS_SOURCE_SHA256" ] || { engines_log "no REDIS_SOURCE_SHA256 for Redis $REDIS_VERSION: set it"; return 1; }
+  engines_log "building Redis $REDIS_VERSION from $url (a few minutes)"
   mkdir -p "$dir"
-  rm -rf "$dir/redis-$REDIS_VERSION"
-  git clone -q --depth 1 --branch "$REDIS_VERSION" https://github.com/redis/redis.git "$dir/redis-$REDIS_VERSION" >&2 || return 1
+  rm -rf "$dir/redis-$REDIS_VERSION" "$dir/redis-$REDIS_VERSION.tar.gz"
+  curl -fsSL --retry 3 -o "$dir/redis-$REDIS_VERSION.tar.gz" "$url" || { engines_log "cannot fetch $url"; return 1; }
+  got=$(sha256sum "$dir/redis-$REDIS_VERSION.tar.gz" | cut -d' ' -f1)
+  if [ "$got" != "$REDIS_SOURCE_SHA256" ]; then
+    engines_log "SHA-256 of redis-$REDIS_VERSION.tar.gz is $got, not the pinned $REDIS_SOURCE_SHA256"
+    rm -f "$dir/redis-$REDIS_VERSION.tar.gz"; return 1
+  fi
+  tar -xzf "$dir/redis-$REDIS_VERSION.tar.gz" -C "$dir" || return 1
   make -C "$dir/redis-$REDIS_VERSION" -j"$(nproc)" BUILD_TLS=no >"$dir/redis-build.log" 2>&1 || { engines_log "Redis build failed: $dir/redis-build.log"; return 1; }
+  echo "$got" > "$dir/redis-$REDIS_VERSION/SOURCE_SHA256"
   bin=$dir/redis-$REDIS_VERSION/src/redis-server
   engines_redis_ok "$bin" && echo "$bin"
 }
@@ -151,7 +173,10 @@ engine_start() {
         --enable-debug-command yes --dir "$ENGINE_DIR" "$@" </dev/null >"$ENGINE_LOG" 2>&1 &
       ;;
     kividb)
-      local args=(--port "$ENGINE_PORT" --bind 127.0.0.1 --protected-mode no --dir "$ENGINE_DIR")
+      # A file, not the flag: v1.2.2 has no --enable-debug-command.
+      echo "enable-debug-command yes" > "$ENGINE_DIR/kividb.conf"
+      local args=(--port "$ENGINE_PORT" --bind 127.0.0.1 --protected-mode no --dir "$ENGINE_DIR"
+                  --configfile "$ENGINE_DIR/kividb.conf")
       [ "$io" != auto ] && args+=(--io-model "$io")
       [ "${threads:-0}" != 0 ] && args+=(--threads "$threads")
       (cd "$ENGINE_DIR" && KIVIDB_NO_UPDATE_CHECK=1 exec "$bin" "${args[@]}" "$@") </dev/null >"$ENGINE_LOG" 2>&1 &

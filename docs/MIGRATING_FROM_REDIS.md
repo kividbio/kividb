@@ -53,10 +53,12 @@ you already use carry over, under the same names.
 directive KiviDB doesn't know stops the server, with an error naming it.
 Start from KiviDB's own file and carry over the settings you changed.
 Directives for machinery KiviDB doesn't have (`io-threads`, `hz`,
-`tcp-keepalive`, `lazyfree-lazy-eviction`, `rdbcompression` and similar)
+`tcp-keepalive`, `lazyfree-lazy-eviction` and similar)
 are accepted with a warning and do nothing. `lazyfree-lazy-expire` and
 `lazyfree-lazy-user-del` are in effect: `lazyfree-lazy-user-del yes` makes
 `DEL` free a large value in the background, as `UNLINK` does.
+`rdbcompression` is in effect too: `yes` writes `dump.kdb` compressed
+(the default is `no`, which 1.2 reads) (see [PERSISTENCE.md](PERSISTENCE.md#compressed-snapshots)).
 
 The ones that behave differently:
 
@@ -67,7 +69,7 @@ The ones that behave differently:
 | `appendfsync` | `always` and `everysec` as in Redis. `no` is taken as `everysec`, with a warning. |
 | `dbfilename`, `appendfilename` | Fixed: `dump.kdb` and `appendonly.aof`. KiviDB reads a Redis `dump.rdb` if there is no `dump.kdb`. `CONFIG GET dbfilename` answers `dump.kdb`, with `CONFIG GET dir` the place to find it after a `SAVE`. |
 | `client-output-buffer-limit` | As in Redis, but a replica has no soft limit by default. A replica's hard limit is the same setting as `repl-replica-max-backlog-bytes`, and the last line that sets it wins; during a full sync a replica is held to `repl-replica-sync-max-backlog-bytes` instead. A carried-over `client-output-buffer-limit replica 256mb 64mb 60` takes effect: it turns the 64 MB soft limit on and puts the hard limit at 256 MB. Leave it out to keep KiviDB's defaults. |
-| `loadmodule` | Not supported: remove it. Search (`FT.*`), JSON, time series (`TS.*`), vector sets and Bloom filters (`BF.*`) are built in. |
+| `loadmodule` | Not supported: remove it. Search (`FT.*`), JSON, time series (`TS.*`), vector sets, Bloom filters (`BF.*`), Cuckoo filters (`CF.*`), Count-min sketches (`CMS.*`), Top-K (`TOPK.*`) and t-digests (`TDIGEST.*`) are built in. |
 | Sentinel | No Sentinel. Use replication with your own failover, or cluster mode (`--cluster-enabled yes`), which fails over by itself. |
 
 Run `kividb --help` for the command-line flags.
@@ -104,6 +106,18 @@ What the RDB reader takes from Redis:
   Valkey cluster node saved during a slot migration into it: finish or
   cancel the migration and save again. valkey-json documents load as JSON.
 - **RedisJSON documents**, and Lua function libraries (`FUNCTION LOAD`).
+- **Count-min sketches** load, and count as they did on Redis (an RDB
+  file, a full sync, `RESTORE` and `MIGRATE`). One of more than 134,217,728
+  counters or 65,536 rows is refused.
+- **Top-K sketches** load, and answer as they did on Redis (an RDB file, a
+  full sync, `RESTORE` and `MIGRATE`). One with k over 65,536, more than
+  67,108,864 buckets or 65,536 rows is refused.
+- **Cuckoo filters** load, and answer as they did on Redis (an RDB file, a
+  full sync, `RESTORE`, `MIGRATE` and `CF.SCANDUMP` chunks); the `cf-*`
+  settings carry over in the config file. One over 1 GiB is refused.
+- **t-digests are not loaded** from Redis (an RDB file, a full sync or
+  `RESTORE` with one is refused, naming it). Add the values again, or move
+  each digest's quantiles over.
 - **Search index definitions and dictionaries are not loaded.** KiviDB keeps
   its own indexes. Run `FT.CREATE` (and `FT.DICTADD`) again after the move;
   `FT.CREATE` indexes the keys that are already there.

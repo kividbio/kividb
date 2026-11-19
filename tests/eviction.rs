@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/eviction.rs
 //
 // `maxmemory-policy`: what the server does when it reaches `maxmemory`. Real
@@ -2343,7 +2344,12 @@ fn a_replica_that_stops_reading_during_its_full_sync_is_let_go_of() {
 
 #[test]
 fn debug_object_shows_the_idle_time_and_is_not_a_use() {
-    let server = Server::start(&["--maxmemory-policy", "allkeys-lru"]);
+    let server = Server::start(&[
+        "--maxmemory-policy",
+        "allkeys-lru",
+        "--enable-debug-command",
+        "yes",
+    ]);
     let mut c = server.conn();
     assert!(c.cmd(&["SET", "foo", "bar"]).ok());
     let payload = c.dump("foo");

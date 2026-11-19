@@ -144,10 +144,11 @@ def redis_cli_7():
 
 
 class Node:
-    def __init__(self, kind, bin, io="auto", threads=0, cluster=False, args=(), env=None):
+    def __init__(self, kind, bin, io="auto", threads=0, cluster=False, args=(), env=None, dir=None):
         self.kind, self.bin, self.cluster = kind, bin, cluster
         self.port = free_port(bus=cluster)
-        self.dir = tempfile.mkdtemp(prefix="kividb-regress-node.")
+        # `dir`: a stopped node's directory, to start again on what it saved.
+        self.dir = dir or tempfile.mkdtemp(prefix="kividb-regress-node.")
         self.log_path = os.path.join(self.dir, "server.log")
         if kind == "redis":
             cmd = [bin, "--port", str(self.port), "--bind", "127.0.0.1", "--save", "", "--appendonly", "no",
@@ -156,8 +157,12 @@ class Node:
                 cmd += ["--cluster-enabled", "yes", "--cluster-config-file", "nodes.conf",
                         "--cluster-node-timeout", "5000"]
         else:
+            # A file, not the flag: v1.2.2 has no --enable-debug-command.
+            conf = os.path.join(self.dir, "kividb.conf")
+            with open(conf, "w") as f:
+                f.write("enable-debug-command yes\n")
             cmd = [bin, "--port", str(self.port), "--bind", "127.0.0.1", "--protected-mode", "no",
-                   "--dir", self.dir]
+                   "--dir", self.dir, "--configfile", conf]
             if io != "auto":
                 cmd += ["--io-model", io]
             if threads:
@@ -267,10 +272,10 @@ class Nodes:
     def __init__(self, ctx):
         self.ctx, self.nodes = ctx, []
 
-    def start(self, cluster=False, args=(), io=None, threads=None):
+    def start(self, cluster=False, args=(), io=None, threads=None, dir=None):
         cfg = self.ctx.config
         n = Node(self.ctx.kind, self.ctx.bin, io or cfg.io, cfg.threads if threads is None else threads,
-                 cluster=cluster, args=args)
+                 cluster=cluster, args=args, dir=dir)
         self.nodes.append(n)
         return n
 

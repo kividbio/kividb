@@ -19,9 +19,11 @@
 //     exists. For now it's a placeholder, but the column must be present
 //     so the format stays stable.
 //
-// The whole file is rewritten atomically: write to nodes.conf.tmp, then
-// rename. This is the standard way to avoid a half-written file if the
-// process crashes mid-save.
+// The whole file is rewritten atomically: written to a temporary file next
+// to it, synced, renamed over it, and the directory synced. A crash at any
+// point leaves the old file or the new one, never part of one. A file that
+// is cut short all the same (it does not end with its `vars` line) is
+// refused at startup (#808).
 
 use crate::cluster::node::{
     ClusterNode, NodeFlags, NodeId, generate_node_id, node_id_str, parse_node_id,
@@ -31,7 +33,7 @@ use ahash::AHashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// What we read out of nodes.conf. Used to repopulate ClusterState on startup.
 pub struct LoadedConfig {
@@ -50,6 +52,7 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
+    check_complete(&contents)?;
 
     let mut nodes: AHashMap<NodeId, ClusterNode> = AHashMap::new();
     let mut myself: Option<NodeId> = None;
@@ -163,6 +166,7 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
                 hostname: hostname.to_string(),
                 // Not persisted: the peer says it again on its next heartbeat.
                 announced_client_port: 0,
+                client_ips: Default::default(),
                 // A file an earlier version wrote has none: a master gets a
                 // new one, as Redis gives it one, and its replicas take it
                 // below.
@@ -197,9 +201,34 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
     }))
 }
 
-/// Write the cluster state to disk atomically.
-/// state_locked_view is what the caller has already locked and prepared —
-/// we don't reach back into ClusterState to avoid lock-acquisition surprises.
+/// Whether `contents` is a whole nodes.conf: one whose last line is its
+/// `vars` line, ended by a newline, as every file this server has written
+/// is (and as Redis writes it). One that is not was cut short: by a machine
+/// that went down before a write reached the disk, or a disk that lost its
+/// tail, and it may lack nodes, slots and the epochs. It is refused, with
+/// the reason, and the file is left as it is. An empty file is refused too,
+/// as empty. Redis takes one for a new node: here the file is deleted for
+/// that.
+fn check_complete(contents: &str) -> std::io::Result<()> {
+    // Blank lines after it are the padding of a direct write.
+    let last = contents
+        .split_inclusive('\n')
+        .rfind(|line| !line.trim().is_empty());
+    match last {
+        Some(line) if line.ends_with('\n') && line.starts_with("vars ") => Ok(()),
+        Some(_) => Err(io_err(
+            "nodes.conf is incomplete: it does not end with its 'vars' line (cut short by a \
+             crash or a disk fault?)",
+        )),
+        None => Err(io_err(
+            "nodes.conf is empty (cut short by a crash or a disk fault?)",
+        )),
+    }
+}
+
+/// Write the cluster state to `path`: to a temporary file, synced, renamed
+/// over it, and the directory synced. For the tests; the server saves
+/// through [`save_from_state`].
 pub fn save(
     path: &Path,
     nodes: &AHashMap<NodeId, ClusterNode>,
@@ -207,8 +236,20 @@ pub fn save(
     current_epoch: u64,
     last_vote_epoch: u64,
 ) -> std::io::Result<()> {
-    let tmp_path = path.with_extension("conf.tmp");
+    let tmp = temp_path(path, 0);
+    write_temp(&tmp, &render(nodes, slots, current_epoch, last_vote_epoch))?;
+    sync_file(&tmp)?;
+    fs::rename(&tmp, path)?;
+    sync_dir(path).map(|_| ())
+}
 
+/// What nodes.conf holds for this state.
+fn render(
+    nodes: &AHashMap<NodeId, ClusterNode>,
+    slots: &[Option<NodeId>; CLUSTER_SLOTS],
+    current_epoch: u64,
+    last_vote_epoch: u64,
+) -> Vec<u8> {
     // Build the file contents in memory first. The whole file is small
     // (kilobytes for any realistic cluster size) so this is not a concern.
     let mut out: Vec<u8> = Vec::with_capacity(4096);
@@ -285,8 +326,7 @@ pub fn save(
         current_epoch, last_vote_epoch
     )
     .unwrap();
-
-    write_atomically(path, &tmp_path, &out)
+    out
 }
 
 thread_local! {
@@ -305,18 +345,175 @@ pub fn with_deferred_sync<R>(f: impl FnOnce() -> R) -> R {
     result
 }
 
-/// Write to `.tmp` and rename it into place. The caller syncs it (see
-/// [`save_from_state`]).
-fn write_atomically(path: &Path, tmp_path: &Path, out: &[u8]) -> std::io::Result<()> {
+/// The temporary file save number `generation` is written to, beside
+/// `path`: `nodes.conf.tmp-<generation>`. Each save has its own, so that one
+/// can be synced while another is written.
+fn temp_path(path: &Path, generation: u64) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{generation}"));
+    path.with_file_name(name)
+}
+
+/// Remove the temporary files of saves a crash cut short (see
+/// [`temp_path`]), the spares (see [`spare_path`]), and the temporary file
+/// of the versions before them (`nodes.conf.tmp`). Called at startup,
+/// before anything is saved.
+pub fn remove_leftover_temps(path: &Path) {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let ours = [format!("{name}.tmp-"), format!("{name}.spare-")];
+    let old = Path::new(name).with_extension("conf.tmp");
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        let Some(file) = file.to_str() else { continue };
+        let leftover = ours.iter().any(|prefix| {
+            file.strip_prefix(prefix.as_str())
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        }) || Path::new(file) == old;
+        if leftover {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// For the tests of a save that fails, and never set otherwise: named in
+/// `KIVIDB_TEST_FAILPOINTS`, `nodes-conf-fail` fails every save while the
+/// file `fail.nodes-conf` is in the working directory, and
+/// `nodes-conf-dir-sync-fail` fails the sync of the directory once for each
+/// time `fail.nodes-conf-dir-sync` is made there. A file that holds `EINVAL`
+/// or `ENOTSUP` fails it with that error, as a filesystem would.
+fn injected(name: &str, file: &str, once: bool) -> std::io::Result<()> {
+    if !crate::aof::injected(name) {
+        return Ok(());
+    }
+    let hit = if once {
+        let text = fs::read_to_string(file).unwrap_or_default();
+        fs::remove_file(file).is_ok().then_some(text)
+    } else {
+        Path::new(file).exists().then(String::new)
+    };
+    match hit.as_deref().map(str::trim) {
+        None => Ok(()),
+        #[cfg(unix)]
+        Some("EINVAL") => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        #[cfg(unix)]
+        Some("ENOTSUP") => Err(std::io::Error::from_raw_os_error(libc::ENOTSUP)),
+        Some(_) => Err(std::io::Error::other(format!("{name} (a test's)"))),
+    }
+}
+
+/// Write save `generation`, `out`, beside `path`: into a spare (see
+/// [`Saves::spares`]), synced, when `reuse` and there is one, else into a
+/// new temporary file, not synced. Returns its path, and whether it is a
+/// spare. The file is removed if it cannot be written.
+fn write_save(
+    saves: &Saves,
+    path: &Path,
+    generation: u64,
+    out: &[u8],
+    reuse: bool,
+) -> std::io::Result<(std::path::PathBuf, bool)> {
+    injected("nodes-conf-fail", "fail.nodes-conf", false)?;
     #[cfg(target_os = "linux")]
-    let written = write_direct(tmp_path, out).is_ok();
+    if reuse && let Some(tmp) = write_spare(saves, path, generation, out) {
+        return Ok((tmp, true));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (saves, reuse);
+    let tmp = temp_path(path, generation);
+    match write_temp(&tmp, out) {
+        Ok(()) => Ok((tmp, false)),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Write `out` into a spare, renamed first to save `generation`'s
+/// temporary file (see [`temp_path`]), which is returned. A spare that
+/// cannot be written is removed, and the next one tried; `None` when there
+/// is none left.
+#[cfg(target_os = "linux")]
+fn write_spare(
+    saves: &Saves,
+    path: &Path,
+    generation: u64,
+    out: &[u8],
+) -> Option<std::path::PathBuf> {
+    loop {
+        let spare = saves.spares.lock().pop()?;
+        let tmp = temp_path(path, generation);
+        match fs::rename(&spare, &tmp).and_then(|()| overwrite_spare(&tmp, out)) {
+            Ok(()) => return Some(tmp),
+            Err(_) => {
+                let _ = fs::remove_file(&tmp);
+                let _ = fs::remove_file(&spare);
+            }
+        }
+    }
+}
+
+/// Write `out` over the file at `spare`, in place (`O_DIRECT`, as
+/// [`write_direct`]), and synced as it is written (`O_DSYNC`): its blocks are
+/// allocated already, so that needs no commit of the filesystem's journal,
+/// only the write itself (one forced to the disk's media, where a sync after
+/// it flushed the disk's whole cache). Cut to the length written if it was
+/// longer, and that synced. Refused if it is not a plain file of one link: a
+/// symbolic or hard link to nodes.conf that was put out of place with it is
+/// never written through.
+#[cfg(target_os = "linux")]
+fn overwrite_spare(spare: &Path, out: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_DIRECT | libc::O_DSYNC | libc::O_NOFOLLOW)
+        .open(spare)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.nlink() != 1 {
+        return Err(std::io::Error::other("not a spare"));
+    }
+    let len = write_aligned(&mut file, out)?;
+    if meta.len() > len {
+        file.set_len(len)?;
+        file.sync_data()?;
+    }
+    Ok(())
+}
+
+/// The name a spare is kept under between saves: `nodes.conf.spare-<n>`,
+/// `n` the save that put it out of place.
+#[cfg(target_os = "linux")]
+fn spare_path(path: &Path, generation: u64) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".spare-{generation}"));
+    path.with_file_name(name)
+}
+
+/// How many spares a node keeps: one for a command's save and one for the
+/// bus's, under way at once.
+#[cfg(target_os = "linux")]
+const MAX_SPARES: usize = 2;
+
+/// Write `out` to the temporary file `tmp`. Not synced: see [`sync_file`].
+fn write_temp(tmp: &Path, out: &[u8]) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    let written = write_direct(tmp, out).is_ok();
     #[cfg(not(target_os = "linux"))]
     let written = false;
     if !written {
-        let mut f = fs::File::create(tmp_path)?;
+        let mut f = fs::File::create(tmp)?;
         f.write_all(out)?;
     }
-    fs::rename(tmp_path, path)
+    Ok(())
 }
 
 /// Write `out` past the page cache (`O_DIRECT`), padded with blank lines to
@@ -330,6 +527,19 @@ fn write_atomically(path: &Path, tmp_path: &Path, out: &[u8]) -> std::io::Result
 #[cfg(target_os = "linux")]
 fn write_direct(tmp_path: &Path, out: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(tmp_path)?;
+    write_aligned(&mut file, out).map(|_| ())
+}
+
+/// Write `out`, padded with blank lines to the 4 KiB it needs, from the
+/// start of `file`, opened `O_DIRECT`. Returns the length written.
+#[cfg(target_os = "linux")]
+fn write_aligned(file: &mut fs::File, out: &[u8]) -> std::io::Result<u64> {
     const ALIGN: usize = 4096;
     let len = out.len().div_ceil(ALIGN).max(1) * ALIGN;
     let layout = std::alloc::Layout::from_size_align(len, ALIGN)
@@ -343,15 +553,9 @@ fn write_direct(tmp_path: &Path, out: &[u8]) -> std::io::Result<()> {
     let buf = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
     buf[..out.len()].copy_from_slice(out);
     buf[out.len()..].fill(b'\n');
-    let result = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(tmp_path)
-        .and_then(|mut f| f.write_all(buf));
+    let result = file.write_all(buf);
     unsafe { std::alloc::dealloc(ptr, layout) };
-    result
+    result.map(|()| len as u64)
 }
 
 /// What `save` would write, minus the two timestamp columns.
@@ -388,7 +592,18 @@ fn topology_fingerprint(
         // shard it had made up for its master (#563).
         n.shard_id.hash(&mut h);
     }
-    slots.hash(&mut h);
+    // Each run of slots of one owner, by where it starts: the same slots
+    // give the same runs, and hashing a few runs instead of all 16384 slots
+    // took most of the time of a save skipped as unchanged (the bus asks
+    // for one on every heartbeat) and a good part of a command's own.
+    let mut owner_before = None;
+    for (slot, owner) in slots.iter().enumerate() {
+        if owner_before != Some(owner) {
+            slot.hash(&mut h);
+            owner.hash(&mut h);
+            owner_before = Some(owner);
+        }
+    }
     current_epoch.hash(&mut h);
     last_vote_epoch.hash(&mut h);
     h.finish()
@@ -421,10 +636,141 @@ pub fn save_from_state_then(
     save_then(state, mine, Some(publish))
 }
 
-/// Sync the saved file at `path`.
-fn sync_saved(path: &Path) -> std::io::Result<()> {
+/// Sync the file at `path`.
+fn sync_file(path: &Path) -> std::io::Result<()> {
     // Opened for writing: Windows will not flush a file opened to read.
     fs::OpenOptions::new().write(true).open(path)?.sync_all()
+}
+
+/// Sync the directory `path` is in, so that a rename into it is on disk.
+/// `Ok(false)` if the filesystem cannot sync it (see [`dir_sync_outcome`]):
+/// the rename stands, not known to be on disk.
+fn sync_dir(path: &Path) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        };
+        let synced = injected("nodes-conf-dir-sync-fail", "fail.nodes-conf-dir-sync", true)
+            .and_then(|()| fs::File::open(dir)?.sync_all());
+        dir_sync_outcome(synced)
+    }
+    // Windows: a directory cannot be opened as a file here, so the rename
+    // is not synced. NTFS journals it, but the journal is written out
+    // lazily: a power loss soon after the save can leave the file before it.
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        injected("nodes-conf-dir-sync-fail", "fail.nodes-conf-dir-sync", true).map(|()| false)
+    }
+}
+
+/// What a sync of the directory that returned `synced` means for the save:
+/// `Ok(true)` if it is synced. A filesystem that cannot sync a directory at
+/// all (some FUSE, CIFS and 9p mounts answer `EINVAL` or `ENOTSUP`) does
+/// not fail every save: the rename stands as the filesystem keeps it
+/// (`Ok(false)`), and that is said once, as a warning. Any other error
+/// fails the save.
+fn dir_sync_outcome(synced: std::io::Result<()>) -> std::io::Result<bool> {
+    match synced {
+        Ok(()) => Ok(true),
+        Err(e) if cannot_sync_dirs(&e) => {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                log_warn!(
+                    "Cluster: this filesystem cannot sync the directory of the cluster config \
+                     file ({e}): a save is renamed into place, but the rename is only as \
+                     durable as the filesystem makes it"
+                );
+            }
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `e` says the filesystem does not sync directories, rather than
+/// that the sync failed.
+fn cannot_sync_dirs(e: &std::io::Error) -> bool {
+    if matches!(
+        e.kind(),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if let Some(code) = e.raw_os_error() {
+        return code == libc::EINVAL || code == libc::ENOTSUP || code == libc::EOPNOTSUPP;
+    }
+    false
+}
+
+/// Put `tmp`, written and synced, in place of `path`. The temporary file
+/// is removed if it cannot be.
+///
+/// With `exchange` (on Linux), the two are exchanged (`renameat2` with
+/// `RENAME_EXCHANGE`), as atomically as a rename: the file that was in
+/// place is then at `tmp`, and `true` is returned. Once the directory is
+/// synced, that file is no longer nodes.conf on disk either, and it is kept
+/// as a spare ([`Saves::keep_spare`]), to be written over by a later save:
+/// a new file costs a commit of the filesystem's journal to sync, a spare's
+/// data does not. A filesystem that cannot exchange, or no file in place
+/// yet, and `tmp` is renamed.
+fn put_in_place(tmp: &Path, path: &Path, exchange: bool) -> std::io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    if exchange && EXCHANGE_WORKS.load(Ordering::Relaxed) {
+        match exchange_files(tmp, path) {
+            Ok(()) => return Ok(true),
+            Err(e) => match e.raw_os_error() {
+                Some(libc::ENOENT) => {}
+                Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP | libc::EPERM) => {
+                    EXCHANGE_WORKS.store(false, Ordering::Relaxed);
+                }
+                _ => {
+                    let _ = fs::remove_file(tmp);
+                    return Err(e);
+                }
+            },
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = exchange;
+    if let Err(e) = fs::rename(tmp, path) {
+        let _ = fs::remove_file(tmp);
+        return Err(e);
+    }
+    Ok(false)
+}
+
+/// Cleared once the filesystem refuses to exchange two files.
+#[cfg(target_os = "linux")]
+static EXCHANGE_WORKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Exchange the files at `a` and `b`, atomically.
+#[cfg(target_os = "linux")]
+fn exchange_files(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    const RENAME_EXCHANGE: libc::c_uint = 2;
+    let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
+    let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
+    // SAFETY: two NUL-terminated paths, alive for the call.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            a.as_ptr(),
+            libc::AT_FDCWD,
+            b.as_ptr(),
+            RENAME_EXCHANGE,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 fn save_then(
@@ -441,19 +787,26 @@ fn save_then(
             return Ok(());
         }
     };
-    // One writer at a time: two threads saving concurrently share the temp
-    // file's name and would interleave into it. Held to write the file and
-    // put it in place, not to sync it (below): a sync on a busy disk took
-    // seconds, and a slot handover's takeover, with the source's writes
-    // paused, waited behind the bus's save for all of them.
+    // Held to take the state, and to put a file in place, so that what is
+    // in place is always the newest save. Not held, by a save with nothing
+    // to publish (the bus's, a command's), to write and sync its file: a
+    // sync on a busy disk can take seconds, and a slot handover's takeover,
+    // with the source's writes paused, would wait behind the bus's save.
+    // Each save has a file of its own for that (see `temp_path`).
     let asked = std::time::Instant::now();
     let saving = state.save_lock.lock();
     let locked = asked.elapsed().as_millis();
+    // Numbered before the state is taken: a save numbered after a node was
+    // added to `joining` has it (see `wait_for_save`).
+    let generation = state.saves.written.fetch_add(1, Ordering::SeqCst) + 1;
     let (nodes_snap, slots_snap, epoch, last_vote) = {
         let nodes = state.nodes.read();
         let slots = state.slots.read();
-        let epoch = state.current_epoch.load(Ordering::Relaxed);
-        let last_vote = state.last_vote_epoch.load(Ordering::Relaxed);
+        // SeqCst, against a vote's compare-and-swap of `last_vote_epoch`
+        // and its load of `written`: either this save sees the vote, or the
+        // vote waits for a save numbered after this one.
+        let epoch = state.current_epoch.load(Ordering::SeqCst);
+        let last_vote = state.last_vote_epoch.load(Ordering::SeqCst);
         let mut slots_copy: Box<[Option<NodeId>; CLUSTER_SLOTS]> = vec![None; CLUSTER_SLOTS]
             .into_boxed_slice()
             .try_into()
@@ -463,55 +816,336 @@ fn save_then(
         for &slot in mine {
             slots_copy[slot as usize] = Some(me);
         }
-        (nodes.clone(), slots_copy, epoch, last_vote)
+        let mut nodes = nodes.clone();
+        // Nodes met and about to be members (`ClusterState::admit_met_node`).
+        for (_, node) in state.joining.lock().iter() {
+            nodes.entry(node.id).or_insert_with(|| node.clone());
+        }
+        (nodes, slots_copy, epoch, last_vote)
     };
     let fingerprint = topology_fingerprint(&nodes_snap, &slots_snap, epoch, last_vote);
-    if state.last_saved_fingerprint.load(Ordering::Relaxed) == fingerprint && path.exists() {
+    // Unchanged since the save in place, synced, and no other on its way to
+    // replace it: nothing to write. With one on its way (being synced), it
+    // is written all the same: the older one, put in place after, must not
+    // be what stands (a `CLUSTER FORGET` that returns the topology to what
+    // is in place is saved, not skipped). `in_flight` is read first: a save
+    // that fails resets the fingerprint before it leaves `in_flight`.
+    if state.saves.in_flight.load(Ordering::SeqCst) == 0
+        && state.last_saved_fingerprint.load(Ordering::SeqCst) == fingerprint
+        && path.exists()
+    {
+        state.saves.note_saved(generation, false);
         if let Some(publish) = publish {
             publish();
         }
         return Ok(());
     }
-    save(path, &nodes_snap, &slots_snap, epoch, last_vote)?;
+    state.saves.in_flight.fetch_add(1, Ordering::SeqCst);
+    // A deferred save is put in place before it is synced: not over a spare
+    // (an older nodes.conf, whose blocks a crash could then show under the
+    // name), and by a rename, so that it puts nothing out of place either.
     let deferred = DEFER_SYNC.with(|d| d.get());
-    // A change to publish waits for the sync, with the lock held, so that a
-    // sync that fails publishes nothing. A save with nothing to publish (the
-    // bus's) syncs after it has let go of the lock, below.
-    let synced = match publish {
-        Some(publish) => {
-            if !deferred {
-                sync_saved(path)?;
-            }
-            state
-                .last_saved_fingerprint
-                .store(fingerprint, Ordering::Relaxed);
-            publish();
-            !deferred
-        }
-        None => {
-            state
-                .last_saved_fingerprint
-                .store(fingerprint, Ordering::Relaxed);
-            false
+    let out = render(&nodes_snap, &slots_snap, epoch, last_vote);
+    // Written with the lock held when there is something to publish (it is
+    // synced and put in place under it too); otherwise once it is let go:
+    // the file is this save's alone, and its write is synced as it is made
+    // when it is a spare.
+    let saving = if publish.is_some() {
+        Some(saving)
+    } else {
+        drop(saving);
+        None
+    };
+    let (tmp, spare) = match write_save(&state.saves, path, generation, &out, !deferred) {
+        Ok(written) => written,
+        Err(e) => {
+            state.last_saved_fingerprint.store(0, Ordering::SeqCst);
+            state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
+            state.saves.note_failed(generation, &e);
+            return Err(e);
         }
     };
-    drop(saving);
+    let result = match publish {
+        // A change to publish is synced and put in place with the lock held,
+        // so that a sync that fails publishes nothing, and no other save is
+        // put in place before it is published.
+        Some(publish) => {
+            let placed = (|| {
+                if !deferred && !spare {
+                    sync_file(&tmp)?;
+                }
+                // For the tests of a crash between the write and the rename.
+                crate::aof::failpoint_noting("nodes-conf-written", &tmp.to_string_lossy());
+                let exchanged = put_in_place(&tmp, path, !deferred)?;
+                state.saves.in_place.store(generation, Ordering::SeqCst);
+                let mut synced = false;
+                if !deferred {
+                    synced = sync_dir(path)?;
+                    // Only once it is on disk: a save of the same topology
+                    // made later is skipped on the strength of it.
+                    state
+                        .last_saved_fingerprint
+                        .store(fingerprint, Ordering::SeqCst);
+                }
+                Ok((exchanged, synced))
+            })();
+            match placed {
+                Ok((exchanged, synced)) if !deferred => {
+                    if exchanged {
+                        state.saves.keep_spare(&tmp, path, generation, synced);
+                    }
+                    state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    state.saves.note_saved(generation, true);
+                    publish();
+                }
+                Ok(_) => {
+                    // In place, not synced yet: the fingerprint of the save
+                    // before it does not tell what the file holds.
+                    state.last_saved_fingerprint.store(0, Ordering::SeqCst);
+                    publish();
+                }
+                Err(ref e) => {
+                    state.last_saved_fingerprint.store(0, Ordering::SeqCst);
+                    state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let _ = fs::remove_file(&tmp);
+                    state.saves.note_failed(generation, e);
+                }
+            }
+            drop(saving);
+            if placed.is_ok() && deferred {
+                // The file and its rename, synced on another thread: see
+                // `with_deferred_sync`. Until they are, the save is in
+                // flight, and does not count as done for a save something
+                // waits on (a vote): that waits for this sync, or makes a
+                // save of its own. No fingerprint is kept for it, so the
+                // next save is written whatever it holds.
+                let path = path.clone();
+                let saves = std::sync::Arc::clone(&state.saves);
+                crate::cpus::spawn(move || {
+                    let synced = sync_file(&path).and_then(|()| sync_dir(&path).map(|_| ()));
+                    saves.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    match synced {
+                        Ok(()) => saves.note_saved(generation, true),
+                        Err(e) => saves.note_failed(generation, &e),
+                    }
+                });
+            }
+            placed.map(|_| ())
+        }
+        // Synced without the lock, then put in place unless a newer save
+        // has been meanwhile.
+        None => {
+            let placed = (|| {
+                if !spare {
+                    sync_file(&tmp)?;
+                }
+                crate::aof::failpoint_noting("nodes-conf-written", &tmp.to_string_lossy());
+                let saving = state.save_lock.lock();
+                if state.saves.in_place.load(Ordering::SeqCst) < generation {
+                    let exchanged = put_in_place(&tmp, path, true)?;
+                    state.saves.in_place.store(generation, Ordering::SeqCst);
+                    drop(saving);
+                    let synced = sync_dir(path)?;
+                    if exchanged {
+                        state.saves.keep_spare(&tmp, path, generation, synced);
+                    }
+                    // Only once it is on disk, and if it is still the newest
+                    // in place: a save of the same topology made later is
+                    // skipped on the strength of it.
+                    let _saving = state.save_lock.lock();
+                    if state.saves.in_place.load(Ordering::SeqCst) == generation {
+                        state
+                            .last_saved_fingerprint
+                            .store(fingerprint, Ordering::SeqCst);
+                    }
+                    Ok(true)
+                } else {
+                    // A newer save is in place: it has all this one had,
+                    // and it notes itself saved once it is synced.
+                    drop(saving);
+                    let _ = fs::remove_file(&tmp);
+                    Ok(false)
+                }
+            })();
+            match &placed {
+                Ok(true) => {
+                    state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    state.saves.note_saved(generation, true);
+                }
+                Ok(false) => {
+                    state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    state.saves.signal();
+                }
+                Err(e) => {
+                    // Reset before it leaves `in_flight`: see the skip above.
+                    state.last_saved_fingerprint.store(0, Ordering::SeqCst);
+                    state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let _ = fs::remove_file(&tmp);
+                    state.saves.note_failed(generation, e);
+                }
+            }
+            match placed {
+                // Overtaken: done once the newer save is synced, and not
+                // before, so that what waits on this one (a command's reply)
+                // is not answered before its change is on disk.
+                Ok(false) => wait_synced(
+                    &state.saves,
+                    generation,
+                    std::time::Instant::now() + OVERTAKEN_SAVE_WAIT,
+                )
+                .map_err(std::io::Error::other),
+                placed => placed.map(|_| ()),
+            }
+        }
+    };
     if asked.elapsed() > std::time::Duration::from_millis(100) {
         log_info!(
             "Cluster: slow nodes.conf save: {locked} ms for the lock, {} ms in all",
             asked.elapsed().as_millis()
         );
     }
-    if synced {
-        Ok(())
-    } else if deferred {
-        let path = path.clone();
-        std::thread::spawn(move || {
-            let _ = sync_saved(&path);
-        });
-        Ok(())
-    } else {
-        sync_saved(path)
+    result
+}
+
+/// Where this node's saves of nodes.conf stand: see [`save_from_state`].
+#[derive(Default)]
+pub struct Saves {
+    /// Saves begun, numbered from 1.
+    pub(crate) written: AtomicU64,
+    /// The newest put in place; an older one is not put in place over it.
+    pub(crate) in_place: AtomicU64,
+    /// Written and not yet put in place, failed or given up.
+    pub(crate) in_flight: AtomicU64,
+    /// The newest save that is on disk, synced (or found to be what is).
+    synced: AtomicU64,
+    /// Saves something waits on (a vote, a node met) being made: the bus's
+    /// own wait for them, or the disk's journal commits the two in turn.
+    pub(crate) urgent: AtomicU64,
+    /// Files a save put out of place (an older nodes.conf), once that is on
+    /// disk, to be written over by a later save (see `put_in_place`). At most
+    /// [`MAX_SPARES`]; removed at startup.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    spares: parking_lot::Mutex<Vec<std::path::PathBuf>>,
+    /// Whether the last save written failed (see `note_failed`).
+    failing: std::sync::atomic::AtomicBool,
+    /// The newest that failed, and why.
+    failed: parking_lot::Mutex<(u64, String)>,
+    /// Signalled whenever a save ends.
+    ended: parking_lot::Condvar,
+    ended_lock: parking_lot::Mutex<()>,
+}
+
+impl Saves {
+    /// Keep `old`, the file save `generation` put out of place, as a spare
+    /// once the directory is synced since (`dir_synced`): renamed to its
+    /// name of a spare (see [`spare_path`]). Removed instead if there are
+    /// spares enough, the filesystem does not sync directories (the
+    /// exchange is not known to be on disk: the file may still be
+    /// nodes.conf there), or it is not a plain file of one link.
+    fn keep_spare(&self, old: &Path, path: &Path, generation: u64, dir_synced: bool) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mut spares = self.spares.lock();
+            let plain = fs::symlink_metadata(old).is_ok_and(|m| m.is_file() && m.nlink() == 1);
+            if plain && dir_synced && spares.len() < MAX_SPARES {
+                let spare = spare_path(path, generation);
+                if fs::rename(old, &spare).is_ok() {
+                    spares.push(spare);
+                    return;
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (path, generation, dir_synced);
+        let _ = fs::remove_file(old);
+    }
+
+    /// `written`: the save was written and put in place (not skipped as
+    /// unchanged), and so tells that saves work again.
+    fn note_saved(&self, generation: u64, written: bool) {
+        self.synced.fetch_max(generation, Ordering::SeqCst);
+        if written && self.failing.swap(false, Ordering::SeqCst) {
+            log_warn!("Cluster: the cluster config file is saved again");
+        }
+        self.signal();
+    }
+
+    /// Logged once, as an error, when saves start failing (a disk that is
+    /// full or read-only fails every one, and the bus saves often), and once
+    /// more when one works again.
+    fn note_failed(&self, generation: u64, e: &std::io::Error) {
+        {
+            let mut failed = self.failed.lock();
+            if generation > failed.0 {
+                *failed = (generation, e.to_string());
+            }
+        }
+        if !self.failing.swap(true, Ordering::SeqCst) {
+            log_error!(
+                "Cluster: could not save the cluster config file: {e}. Until it can be, \
+                 changes of topology are not on disk, no node met is made a member, and no \
+                 vote is cast"
+            );
+        }
+        self.signal();
+    }
+
+    fn signal(&self) {
+        let _held = self.ended_lock.lock();
+        self.ended.notify_all();
+    }
+}
+
+/// Wait until a save numbered from `from` on is in place, synced, and make
+/// one, here, if none has begun: `Err` with the reason if the first such
+/// save fails, or none is done by `deadline`. For a node to be admitted
+/// (`ClusterState::admit_met_node`): every node waiting is in the save
+/// begun next, so a burst of `CLUSTER MEET`s is saved in a few writes, not
+/// one each, and one is not kept waiting behind the bus's saves.
+pub fn wait_for_save(
+    state: &crate::cluster::ClusterState,
+    from: u64,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    if state.config_path.is_none() {
+        return Ok(());
+    }
+    let saves = &state.saves;
+    if saves.written.load(Ordering::SeqCst) < from {
+        // Its outcome is noted in `saves`, below.
+        saves.urgent.fetch_add(1, Ordering::SeqCst);
+        state.refresh_state();
+        let _ = save_from_state(state);
+        saves.urgent.fetch_sub(1, Ordering::SeqCst);
+    }
+    wait_synced(saves, from, deadline)
+}
+
+/// How long a save overtaken by a newer one (see `save_then`) waits for
+/// that one to be synced.
+const OVERTAKEN_SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Wait until a save numbered from `from` on is in place, synced: `Err`
+/// with the reason if the first such save to end fails, or none is done by
+/// `deadline`.
+fn wait_synced(saves: &Saves, from: u64, deadline: std::time::Instant) -> Result<(), String> {
+    let mut held = saves.ended_lock.lock();
+    loop {
+        if saves.synced.load(Ordering::SeqCst) >= from {
+            return Ok(());
+        }
+        {
+            let failed = saves.failed.lock();
+            if failed.0 >= from {
+                return Err(failed.1.clone());
+            }
+        }
+        if saves.ended.wait_until(&mut held, deadline).timed_out()
+            && saves.synced.load(Ordering::SeqCst) < from
+        {
+            return Err("the save did not end in time".into());
+        }
     }
 }
 
@@ -673,6 +1307,7 @@ mod tests {
                 fail_since_ms: 0,
                 hostname: String::new(),
                 announced_client_port: 0,
+                client_ips: Default::default(),
                 shard_id: generate_node_id(),
             },
         );
@@ -709,6 +1344,7 @@ mod tests {
                 fail_since_ms: 0,
                 hostname: String::new(),
                 announced_client_port: 0,
+                client_ips: Default::default(),
                 shard_id: generate_node_id(),
             },
         );
@@ -804,6 +1440,39 @@ mod tests {
         assert_ne!(topology_fingerprint(&nodes, &slots, 0, 0), before);
     }
 
+    /// The fingerprint hashes runs of slots, not each slot: any change of
+    /// any slot's owner still changes it.
+    #[test]
+    fn every_change_of_a_slots_owner_changes_the_fingerprint() {
+        let (me, other) = (generate_node_id(), generate_node_id());
+        let nodes = AHashMap::new();
+        let mut slots: Box<[Option<NodeId>; CLUSTER_SLOTS]> = vec![None; CLUSTER_SLOTS]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap();
+        let mut seen = vec![topology_fingerprint(&nodes, &slots, 0, 0)];
+        let mut change =
+            |slot: usize, owner: Option<NodeId>, slots: &mut [Option<NodeId>; CLUSTER_SLOTS]| {
+                slots[slot] = owner;
+                let fingerprint = topology_fingerprint(&nodes, slots, 0, 0);
+                assert!(!seen.contains(&fingerprint), "slot {slot}");
+                seen.push(fingerprint);
+            };
+        change(5, Some(me), &mut slots);
+        change(5, Some(other), &mut slots);
+        change(6, Some(other), &mut slots);
+        change(5, None, &mut slots);
+        change(0, Some(me), &mut slots);
+        change(CLUSTER_SLOTS - 1, Some(me), &mut slots);
+        change(7, Some(me), &mut slots);
+        // Back to an earlier topology: its fingerprint again.
+        slots[7] = None;
+        assert_eq!(
+            topology_fingerprint(&nodes, &slots, 0, 0),
+            seen[seen.len() - 2]
+        );
+    }
+
     /// A file an earlier version wrote has no shard ids: a master gets a new
     /// one, and its replica takes it, whichever line comes first.
     #[test]
@@ -823,6 +1492,245 @@ mod tests {
         assert_ne!(loaded.nodes[&master].shard_id, master);
         assert_eq!(loaded.nodes[&master].hostname, "a.example");
         assert_eq!(loaded.slots[0], Some(master));
+    }
+
+    /// A file is whole when it ends with its `vars` line, blank lines (the
+    /// padding of a direct write) after it or not; cut short anywhere, or
+    /// empty, it is refused, and the reason says so (#808).
+    #[test]
+    fn a_file_cut_short_is_refused() {
+        let me = generate_node_id();
+        let mut node = ClusterNode::new(me, "127.0.0.1".into(), 6380, 16380);
+        node.flags = NodeFlags::MYSELF | NodeFlags::MASTER;
+        let mut nodes = AHashMap::new();
+        nodes.insert(me, node);
+        let mut slots: Box<[Option<NodeId>; CLUSTER_SLOTS]> = vec![None; CLUSTER_SLOTS]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap();
+        slots[0] = Some(me);
+        let tmp = NamedTempFile::new().unwrap();
+        save(tmp.path(), &nodes, &slots, 3, 2).unwrap();
+        let whole = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(whole.contains("vars currentEpoch 3 lastVoteEpoch 2\n"));
+        let padded = format!("{whole}\n\n\n");
+        std::fs::write(tmp.path(), &padded).unwrap();
+        assert_eq!(load(tmp.path()).unwrap().unwrap().last_vote_epoch, 2);
+
+        let vars = whole.find("vars ").unwrap();
+        let line_end = whole[..vars - 1].rfind('\n').map_or(0, |i| i + 1);
+        // Its newline: on Linux, blank lines of padding follow.
+        let vars_end = vars + whole[vars..].find('\n').unwrap();
+        for cut in [
+            "",
+            "\n\n",
+            &whole[..vars],
+            &whole[..vars + 5],
+            &whole[..vars_end],
+            &whole[..line_end + 10],
+        ] {
+            std::fs::write(tmp.path(), cut).unwrap();
+            let e = load(tmp.path())
+                .err()
+                .unwrap_or_else(|| panic!("{cut:?} loaded"));
+            let e = e.to_string();
+            assert!(
+                e.contains("incomplete") || e.contains("empty"),
+                "{cut:?}: {e}"
+            );
+        }
+    }
+
+    /// Every save writes a file of its own beside nodes.conf; those a crash
+    /// left, and 1.2's `nodes.conf.tmp`, are removed at startup, and nothing
+    /// else is.
+    #[test]
+    fn leftover_temporary_files_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.conf");
+        assert_eq!(temp_path(&path, 7), dir.path().join("nodes.conf.tmp-7"));
+        for name in [
+            "nodes.conf",
+            "nodes.conf.tmp",
+            "nodes.conf.tmp-1",
+            "nodes.conf.tmp-42",
+            "nodes.conf.tmp-x",
+            "other.conf.tmp-1",
+            "nodes.conf.bak",
+        ] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        remove_leftover_temps(&path);
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "nodes.conf",
+                "nodes.conf.bak",
+                "nodes.conf.tmp-x",
+                "other.conf.tmp-1"
+            ]
+        );
+    }
+
+    /// Spares are removed at startup too, and nothing else of the same look.
+    #[test]
+    fn leftover_spares_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.conf");
+        for name in [
+            "nodes.conf.spare-3",
+            "nodes.conf.spare-",
+            "nodes.conf.spare-x",
+        ] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        remove_leftover_temps(&path);
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["nodes.conf.spare-", "nodes.conf.spare-x"]);
+    }
+
+    /// A node with `masters` other masters, saving to `conf`.
+    #[cfg(target_os = "linux")]
+    fn state_saving_to(conf: &Path, masters: usize) -> crate::cluster::ClusterState {
+        let mut cs = crate::cluster::ClusterState::new_enabled(None, 15000);
+        cs.config_path = Some(conf.to_path_buf());
+        let mut nodes = cs.nodes.write();
+        for i in 0..masters {
+            let id = generate_node_id();
+            let mut node = ClusterNode::new(id, "127.0.0.1".into(), 7000 + i as u16, 17000);
+            node.flags = NodeFlags::MASTER;
+            nodes.insert(id, node);
+        }
+        drop(nodes);
+        cs
+    }
+
+    /// The files in `dir` that are not nodes.conf.
+    #[cfg(target_os = "linux")]
+    fn others(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "nodes.conf")
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// From the second save on, the file put out of place is kept as a
+    /// spare, and a later save is written over it (the same file), not into
+    /// a new one: each save is whole, loads with what it saved, and a file
+    /// that shrank by a block leaves nothing of the longer one behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_save_writes_over_the_file_an_earlier_one_put_out_of_place() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("nodes.conf");
+        // Over 4 KiB of nodes, then none: the file shrinks by a block.
+        let cs = state_saving_to(&conf, 60);
+        cs.claim_slot_range(0, 99).unwrap();
+        save_from_state(&cs).unwrap();
+        assert!(others(dir.path()).is_empty());
+        let first = fs::metadata(&conf).unwrap().ino();
+        assert!(fs::metadata(&conf).unwrap().len() > 4096);
+
+        cs.claim_slot_range(100, 199).unwrap();
+        save_from_state(&cs).unwrap();
+        // The first file, put out of place, is the spare.
+        let spares = others(dir.path());
+        assert_eq!(spares.len(), 1, "{spares:?}");
+        assert!(spares[0].starts_with("nodes.conf.spare-"), "{spares:?}");
+        assert_eq!(
+            fs::metadata(dir.path().join(&spares[0])).unwrap().ino(),
+            first
+        );
+
+        let me = cs.myself();
+        cs.nodes.write().retain(|id, _| *id == me);
+        cs.claim_slot_range(200, 299).unwrap();
+        save_from_state(&cs).unwrap();
+        // Written over the spare.
+        assert_eq!(fs::metadata(&conf).unwrap().ino(), first);
+        assert_eq!(fs::metadata(&conf).unwrap().len(), 4096);
+        let loaded = load(&conf).unwrap().unwrap();
+        assert_eq!(loaded.nodes.len(), 1);
+        assert!((0..300).all(|s| loaded.slots[s] == Some(me)));
+        assert_eq!(loaded.slots[300], None);
+
+        for range in [(300, 309), (310, 319), (320, 329)] {
+            cs.claim_slot_range(range.0, range.1).unwrap();
+            save_from_state(&cs).unwrap();
+            let loaded = load(&conf).unwrap().unwrap();
+            assert!((0..=range.1 as usize).all(|s| loaded.slots[s] == Some(me)));
+            let left = others(dir.path());
+            assert!(
+                left.len() <= MAX_SPARES && left.iter().all(|n| n.starts_with("nodes.conf.spare-")),
+                "{left:?}"
+            );
+        }
+    }
+
+    /// nodes.conf as a symbolic or hard link: the save replaces it, as a
+    /// rename does, and the file it led to is never written through.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linked_nodes_conf_is_replaced_and_never_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("nodes.conf");
+        let elsewhere = dir.path().join("elsewhere.conf");
+        let cs = state_saving_to(&conf, 0);
+        cs.claim_slot_range(0, 9).unwrap();
+        save_from_state(&cs).unwrap();
+        let before = fs::read_to_string(&conf).unwrap();
+
+        fs::rename(&conf, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &conf).unwrap();
+        for range in [(10, 19), (20, 29), (30, 39)] {
+            cs.claim_slot_range(range.0, range.1).unwrap();
+            save_from_state(&cs).unwrap();
+            assert!(!fs::symlink_metadata(&conf).unwrap().is_symlink());
+            assert_eq!(fs::read_to_string(&elsewhere).unwrap(), before);
+        }
+
+        fs::remove_file(&conf).unwrap();
+        fs::hard_link(&elsewhere, &conf).unwrap();
+        for range in [(40, 49), (50, 59), (60, 69)] {
+            cs.claim_slot_range(range.0, range.1).unwrap();
+            save_from_state(&cs).unwrap();
+            assert_eq!(fs::read_to_string(&elsewhere).unwrap(), before);
+        }
+        let loaded = load(&conf).unwrap().unwrap();
+        assert!((0..70).all(|s| loaded.slots[s] == Some(cs.myself())));
+    }
+
+    /// A directory sync the filesystem does not support (`EINVAL`,
+    /// `ENOTSUP`) lets the save stand; any other error fails it.
+    #[test]
+    fn a_directory_sync_the_filesystem_does_not_support_lets_the_save_stand() {
+        use std::io::{Error, ErrorKind};
+        assert!(dir_sync_outcome(Ok(())).is_ok());
+        assert!(dir_sync_outcome(Err(Error::from(ErrorKind::InvalidInput))).is_ok());
+        assert!(dir_sync_outcome(Err(Error::from(ErrorKind::Unsupported))).is_ok());
+        #[cfg(unix)]
+        for code in [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP] {
+            assert!(dir_sync_outcome(Err(Error::from_raw_os_error(code))).is_ok());
+        }
+        #[cfg(unix)]
+        for code in [libc::EIO, libc::ENOSPC, libc::EROFS, libc::EACCES] {
+            let e = dir_sync_outcome(Err(Error::from_raw_os_error(code))).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(code));
+        }
+        assert!(dir_sync_outcome(Err(Error::other("a test's"))).is_err());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/tls.rs
 // Requires --features tls.
 // Run with: cargo test --features tls --test tls
@@ -5,7 +6,6 @@
 // These tests generate a self-signed cert + key in a temp dir at runtime
 // using rcgen (a pure-Rust X.509 generator already in the ecosystem).
 // No openssl CLI dependency.
-
 #![cfg(feature = "tls")]
 
 use std::io::{Read, Write};

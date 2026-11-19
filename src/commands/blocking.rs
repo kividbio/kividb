@@ -75,6 +75,11 @@ pub struct BlockingWait {
     /// Not a wait: a write that got past a `CLIENT PAUSE` before it was set
     /// is to be read again and held by the pause ([`hold_for_pause`]).
     held_by_pause: bool,
+    /// Not a wait for keys either: a command that found a script on one of
+    /// its hash tags ([`hold_for_tags`]), to be dispatched again once its
+    /// connection has waited for the script's turn, off its thread.
+    #[cfg(feature = "lua")]
+    tags: Option<crate::tag_locks::TagsBusy>,
 }
 
 /// Command state captured at park time and handed back verbatim on resume,
@@ -199,6 +204,21 @@ pub fn test_park_delay() -> Option<Duration> {
     static DELAY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
     *DELAY.get_or_init(|| {
         let ms: u64 = std::env::var("KIVIDB_TEST_PARK_DELAY_MS")
+            .ok()?
+            .parse()
+            .ok()?;
+        Some(Duration::from_millis(ms))
+    })
+}
+
+/// In the test build, `KIVIDB_TEST_WOKEN_DELAY_MS`: a client woken in its
+/// wait is held this long before it is taken off the list of blocked
+/// clients, so that a test can `CLIENT UNBLOCK` it in between.
+#[cfg(debug_assertions)]
+pub fn test_woken_delay() -> Option<Duration> {
+    static DELAY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let ms: u64 = std::env::var("KIVIDB_TEST_WOKEN_DELAY_MS")
             .ok()?
             .parse()
             .ok()?;
@@ -389,6 +409,12 @@ pub struct BlockingCtl {
     /// Set with `resume` when the client of the command being resumed went
     /// while it waited: see [`client_gone`]. Only read on a resume.
     pub gone: bool,
+    /// The turns of the hash tags a command found a script on, which its
+    /// connection waited for ([`hold_for_tags`]): set for the dispatch that
+    /// runs it again, taken by it once it holds its tags' locks, and let go
+    /// of after the dispatch if it did not get that far.
+    #[cfg(feature = "lua")]
+    pub tag_turns: Option<crate::tag_locks::TagTurns>,
 }
 
 /// The connection loop's end of the parking mechanism.
@@ -504,6 +530,12 @@ impl BlockingSlot {
     /// thread would overwrite.
     #[inline]
     pub fn take_parked(&mut self) -> Option<BlockingWait> {
+        // The turns of the tags a command waited for, if it was refused
+        // before it took the tags' locks: the scripts in line for them go on.
+        #[cfg(feature = "lua")]
+        if self.ctl.tag_turns.is_some() {
+            self.ctl.tag_turns = None;
+        }
         // Looked at in place: moving the wait out of the slot to look at it
         // copied it on every command.
         if self.ctl.parked.is_none() {
@@ -684,6 +716,13 @@ impl BlockingSlot {
         }
     }
 
+    /// The turns of the hash tags the command just sent back waited for
+    /// ([`hold_for_tags`]): held by the dispatch that runs it again.
+    #[cfg(feature = "lua")]
+    pub fn hold_tag_turns(&mut self, turns: crate::tag_locks::TagTurns) {
+        self.ctl.tag_turns = Some(turns);
+    }
+
     /// Clear the resume flag after the guard has fired.
     pub fn clear_resume(&mut self) {
         self.in_resume = false;
@@ -783,6 +822,8 @@ pub fn park_with_state(
                 state,
                 role_epoch: role_changes(ctx.repl_state),
                 held_by_pause: false,
+                #[cfg(feature = "lua")]
+                tags: None,
             });
             ParkOutcome::Parked
         }
@@ -811,9 +852,49 @@ pub fn hold_for_pause(ctx: &mut crate::commands::ctx::Ctx) -> Vec<u8> {
             state: None,
             role_epoch: 0,
             held_by_pause: true,
+            #[cfg(feature = "lua")]
+            tags: None,
         });
     }
     crate::pause::HELD_IN_GATE.to_vec()
+}
+
+/// The reply of a client's command that found a script holding one of its
+/// hash tags, or in line for it (`tag_locks::try_lock_found_keys`): it does
+/// not run now. Its connection waits for the turns of those tags, asleep,
+/// while its thread serves its other connections, and dispatches it again
+/// holding them (#882). Only asked of a dispatch that can park
+/// (`BlockingCtl::awaitable`): any other waits on the locks, as before. The
+/// command's reply is then `pause::HELD_IN_GATE`, which is never sent:
+/// `execute_command` takes it as it takes a pause's, for a command that has
+/// not run.
+#[cfg(feature = "lua")]
+#[cold]
+pub fn hold_for_tags(ctx: &mut crate::commands::ctx::Ctx, busy: crate::tag_locks::TagsBusy) {
+    if let Some(slot) = ctx.blocking.as_mut() {
+        slot.parked = Some(BlockingWait {
+            rxs: Vec::new(),
+            timeout: None,
+            state: None,
+            role_epoch: 0,
+            held_by_pause: false,
+            tags: Some(busy),
+        });
+    }
+}
+
+thread_local! {
+    /// Set by [`wait_for_keys`] when it ends taking nothing, for the
+    /// command's `settle_written_keys` on the same thread to ask
+    /// ([`took_nothing`]).
+    static TOOK_NOTHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the blocking pop this thread has just run ended taking nothing:
+/// its time ran out, `CLIENT UNBLOCK` ended it, or its client had gone.
+/// Asked once, after the command, by `settle_written_keys`.
+pub fn took_nothing() -> bool {
+    TOOK_NOTHING.with(|took| took.replace(false))
 }
 
 /// Run a command that waits until one of `keys` has something for it.
@@ -857,6 +938,7 @@ pub fn wait_for_keys(
     mut attempt: impl FnMut(&mut crate::commands::ctx::Ctx, &[Vec<u8>]) -> Option<Vec<u8>>,
     empty: impl Fn() -> Vec<u8>,
 ) -> Vec<u8> {
+    TOOK_NOTHING.with(|took| took.set(false));
     let gone = client_gone(ctx);
     let resumed = take_resume(ctx);
     let (deadline, ticket) = match take_state(ctx) {
@@ -871,6 +953,7 @@ pub fn wait_for_keys(
         // nothing, and the turn to the client behind, which may have been
         // this one's.
         leave_lines(ctx, keys, &ticket);
+        TOOK_NOTHING.with(|took| took.set(true));
         return empty();
     }
     let timed_out = matches!(resumed, Some(None));
@@ -969,6 +1052,7 @@ pub fn wait_for_keys(
         (None, Some(remaining)) if !timed_out => Err(remaining),
         (None, _) => {
             crate::stats::record_miss();
+            TOOK_NOTHING.with(|took| took.set(true));
             // A wait that ran out is answered with a null array. A caller
             // that cannot wait (`MULTI`, a script, the replica applier) whose
             // tiny timeout passed while it looked never waited: it gets the
@@ -1014,6 +1098,7 @@ pub fn wait_for_keys(
         // It never stood in line (`may_park` above).
         ParkOutcome::CannotWait => {
             crate::stats::record_miss();
+            TOOK_NOTHING.with(|took| took.set(true));
             empty()
         }
     }
@@ -1136,6 +1221,13 @@ impl BlockingWait {
         self.held_by_pause
     }
 
+    /// The hash tags a command found a script on ([`hold_for_tags`]): no
+    /// wait for keys, but for the turns of those tags.
+    #[cfg(feature = "lua")]
+    pub fn take_tags(&mut self) -> Option<crate::tag_locks::TagsBusy> {
+        self.tags.take()
+    }
+
     /// Whether the command is one a replica refuses (`READONLY`): the
     /// blocking list and sorted-set commands and `XREADGROUP`, which write.
     /// `XREAD BLOCK` and `TS.READ BLOCK` may wait on a replica. Asked before
@@ -1236,6 +1328,8 @@ mod tests {
                 state: None,
                 role_epoch: 0,
                 held_by_pause: false,
+                #[cfg(feature = "lua")]
+                tags: None,
             }
             .wait(),
         )
@@ -1248,7 +1342,7 @@ mod tests {
     fn resolves_on_a_current_thread_runtime() {
         let (tx, rx) = oneshot::channel();
         let val: Value = Arc::from(b"hello".as_slice());
-        std::thread::spawn(move || {
+        crate::cpus::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             let _ = tx.send(val);
         });
@@ -1273,7 +1367,7 @@ mod tests {
         let (_tx1, rx1) = oneshot::channel();
         let (tx2, rx2) = oneshot::channel();
         let (_tx3, rx3) = oneshot::channel();
-        std::thread::spawn(move || {
+        crate::cpus::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             let _ = tx2.send(Arc::from(b"v".as_slice()) as Value);
         });
@@ -1360,7 +1454,7 @@ mod gone_resume_tests {
         let _pause = crate::pause::TEST_LOCK.lock();
         let store = crate::store::new_store(1);
         let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
-        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (hub_tx, _hub_rx) = crate::replication::HubTx::channel();
         let config = Arc::new(crate::config::Config::default());
         let started_at = Instant::now();
         let index_store = crate::vector::new_index_store();
@@ -1410,6 +1504,7 @@ mod gone_resume_tests {
                 apply_replication: false,
                 skip_write_side_effects: false,
                 peer_addr: "127.0.0.1:1",
+                peer_ipv6: false,
                 monitor_registry: &monitor_registry,
                 authenticated_user: "default",
                 tracking_table: &tracking_table,
@@ -1427,7 +1522,7 @@ mod gone_resume_tests {
         let _pause = crate::pause::TEST_LOCK.lock();
         let store = crate::store::new_store(1);
         let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
-        let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (hub_tx, _hub_rx) = crate::replication::HubTx::channel();
         let config = Arc::new(crate::config::Config::default());
         let started_at = Instant::now();
         let index_store = crate::vector::new_index_store();
@@ -1477,6 +1572,7 @@ mod gone_resume_tests {
                 apply_replication: false,
                 skip_write_side_effects: false,
                 peer_addr: "127.0.0.1:1",
+                peer_ipv6: false,
                 monitor_registry: &monitor_registry,
                 authenticated_user: "default",
                 tracking_table: &tracking_table,

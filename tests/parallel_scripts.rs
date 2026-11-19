@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/parallel_scripts.rs
 //
 // `lua-parallel-scripts`: scripts whose KEYS share a hash tag, run beside
@@ -567,6 +568,8 @@ fn a_tagged_script_may_not_sort_by_a_pattern_outside_its_tag() {
         "--aof",
         "--appendfsync",
         "always",
+        "--enable-debug-command",
+        "yes",
     ]);
     let port = master.port.to_string();
     let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);

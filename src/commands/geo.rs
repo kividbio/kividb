@@ -359,33 +359,37 @@ fn cmd_geoadd(ctx: &mut Ctx) -> Vec<u8> {
     let mut added = 0i64;
     let mut changed = 0i64;
     let mut inner = zs.write();
+    // As Redis runs it, a `ZADD` of the command's pairs: a block they cannot
+    // fit becomes the large form first.
+    inner.expect((cmd.len() - i) / 3);
 
     while i + 2 < cmd.len() {
         let (lon, lat) = match lon_lat(cmd[i], cmd[i + 1]) {
             Ok(position) => position,
             Err(e) => return e,
         };
-        let member: ZMember = Arc::from(cmd[i + 2]);
+        let member: &[u8] = cmd[i + 2];
         i += 3;
 
         let score = encode_geohash(lon, lat);
-        let existing = inner.members.get(member.as_ref()).copied();
-
-        match existing {
-            None if flag_xx => continue, // XX: only update existing
+        // One lookup a member.
+        inner.upsert(member, |existing| match existing {
+            None if flag_xx => (None, ()), // XX: only update existing
             None => {
-                inner.insert(member, score);
                 added += 1;
                 changed += 1;
+                (Some(score), ())
             }
-            Some(_old_score) if flag_nx => continue, // NX: only add new
+            Some(_old_score) if flag_nx => (None, ()), // NX: only add new
             Some(old_score) => {
                 if (old_score - score).abs() > f64::EPSILON {
-                    inner.insert(member, score);
                     changed += 1;
+                    (Some(score), ())
+                } else {
+                    (None, ())
                 }
             }
-        }
+        });
     }
 
     drop(inner);
@@ -428,12 +432,12 @@ fn cmd_geodist(ctx: &mut Ctx) -> Vec<u8> {
     drop(map);
 
     let inner = zs.read();
-    let score1 = match inner.members.get(cmd[2]) {
-        Some(&s) => s,
+    let score1 = match inner.score(cmd[2]) {
+        Some(s) => s,
         None => return resp_null_bulk(),
     };
-    let score2 = match inner.members.get(cmd[3]) {
-        Some(&s) => s,
+    let score2 = match inner.score(cmd[3]) {
+        Some(s) => s,
         None => return resp_null_bulk(),
     };
     drop(inner);
@@ -490,9 +494,9 @@ fn cmd_geopos(ctx: &mut Ctx) -> Vec<u8> {
     let mut results: Vec<Vec<u8>> = Vec::with_capacity(cmd.len() - 2);
 
     for member_bytes in &cmd[2..] {
-        match inner.members.get(*member_bytes) {
+        match inner.score(member_bytes) {
             None => results.push(resp_null_for(resp)),
-            Some(&score) => {
+            Some(score) => {
                 let (lon, lat) = decode_geohash(score);
                 results.push(coord_pair(resp, lon, lat));
             }
@@ -542,9 +546,9 @@ fn cmd_geohash(ctx: &mut Ctx) -> Vec<u8> {
     let mut results: Vec<Vec<u8>> = Vec::with_capacity(cmd.len() - 2);
 
     for member_bytes in &cmd[2..] {
-        match inner.members.get(*member_bytes) {
+        match inner.score(member_bytes) {
             None => results.push(resp_null_for(resp)),
-            Some(&score) => {
+            Some(score) => {
                 let (lon, lat) = decode_geohash(score);
                 results.push(resp_bulk_str(&geohash_string(lon, lat)));
             }
@@ -773,15 +777,15 @@ fn members_in(zset: &SortedSetInner, area: &Area, limit: Option<usize>) -> Vec<F
             ((cell.bits + 1) << shift) as f64,
         );
         let first: ZMember = Arc::from(&[][..]);
-        for ((score, member), _) in zset.by_score.range((OrderedFloat(from), first)..) {
-            if score.0 >= to {
+        for (member, score) in zset.range_by_score((OrderedFloat(from), first)..) {
+            if score >= to {
                 break;
             }
-            let (lon, lat) = decode_geohash(score.0);
+            let (lon, lat) = decode_geohash(score);
             if let Some(distance_m) = area.contains(lon, lat) {
                 found.push(Found {
-                    member: member.clone(),
-                    score: score.0,
+                    member: member.to_shared(),
+                    score,
                     distance_m,
                     lon,
                     lat,
@@ -839,7 +843,7 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
     };
     let position_of = |member: &[u8]| -> Result<(f64, f64), Vec<u8>> {
         zset.as_ref()
-            .and_then(|zset| zset.read().members.get(member).copied())
+            .and_then(|zset| zset.read().score(member))
             .map(decode_geohash)
             .ok_or_else(|| resp_error("ERR could not decode requested zset member"))
     };
@@ -1045,17 +1049,17 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
             crate::commands::helpers::delete_key(ctx.store, db, &dest);
             return resp_integer(0);
         }
-        let mut stored = SortedSetInner::new();
-        for point in &found {
-            stored.insert(
-                point.member.clone(),
+        // Built whole: a block, laid down once, if the points fit one.
+        let stored = SortedSetInner::from_pairs(found.iter().map(|point| {
+            (
+                &point.member[..],
                 if store_dist {
                     point.distance_m / unit_m
                 } else {
                     point.score
                 },
-            );
-        }
+            )
+        }));
         // The destination is a new key: whatever was there, and its time
         // to live, are gone.
         crate::commands::helpers::delete_key(ctx.store, db, &dest);

@@ -22,6 +22,7 @@ top of it.
 | `dbfilename` | Always `dump.kdb` (`dump.rdb` is accepted). Any other name is refused. `CONFIG GET dbfilename` answers `dump.kdb`, and `CONFIG GET dir` the directory it is in, so a tool that runs `SAVE` finds the file. |
 | `appendfilename` | Always `appendonly.aof`, which `CONFIG GET appendfilename` answers. Any other name is refused. |
 | `auto-aof-rewrite-percentage`, `auto-aof-rewrite-min-size` | When the AOF has grown by this percentage (default 100) over its size after the last checkpoint, and is at least this size (default 64 MB), a checkpoint runs. Checked every 10 seconds. `0` turns it off. Both can be changed with `CONFIG SET`. |
+| `rdbcompression` | `no` (the default in 1.3): the plain image, which KiviDB 1.2 and earlier read. `yes`: snapshots are written compressed (see [Compressed snapshots](#compressed-snapshots)), which 1.2 cannot read. The default is planned to become `yes` in a later release. `CONFIG SET rdbcompression` works at runtime, from the next snapshot on. |
 | `hll-write-format` | `legacy` (the default) or `redis`. New HyperLogLog values use that format; existing values keep theirs. Per server, set in the config file or with `CONFIG SET`, and written by `CONFIG REWRITE`. See below before switching. |
 
 ## Checkpoints
@@ -312,6 +313,8 @@ only what happened next. Redis rewrites at this point for the same reason.
 | `aof_acks_before_write` | Replies to writes sent after waiting 5 s for their records to reach the file, without them: the disk fell more than 5 s behind. A process killed then can lose those writes. 0 on a disk that keeps up (see [When a write is acknowledged](#when-a-write-is-acknowledged)). |
 | `aof_superseded_files` | Logs kept aside in `dir` (`superseded.*`), which the server never removes (see [Logs kept aside](#logs-kept-aside)). |
 | `aof_superseded_bytes` | Their size in bytes. |
+| `rdb_last_save_raw_size` | The last snapshot written to disk (`dump.kdb`, by a save, a checkpoint or the shutdown): the bytes of its image. 0 before the first. |
+| `rdb_last_save_stored_size` | The bytes it took on disk: fewer than the image with `rdbcompression yes`, the same with `no`. |
 
 `rdb_last_bgsave_status` and `LASTSAVE` report snapshots, as in Redis.
 
@@ -366,7 +369,7 @@ is still written as before):
 | stream, tag 13 | the stream as before, plus its idempotent-production state (`XADD … IDMP`): per producer, the remembered ids and the entries they map to, and the stream's `IDMP-DURATION` / `IDMP-MAXSIZE` |
 | time series, tag 14 | the series as before, plus its duplicate policy and its compaction rules |
 | time series, tag 17 | tag 14's series, then whether it is a compaction of another series (and which), then its `IGNORE` settings: the time and the value difference. Written only for a series with `IGNORE`; 1.2 refuses it |
-| probabilistic value, tag 40 | a kind (1: Bloom filter), the version of that kind's encoding, then the value: a Bloom filter's parameters and each layer's bytes |
+| probabilistic value, tag 40 | a kind (1: Bloom filter, 2: Count-min sketch, 3: Top-K, 4: Cuckoo filter, 5: t-digest), the version of that kind's encoding, then the value: a Bloom filter's parameters and each layer's bytes; a Count-min sketch's width, depth and count, then its counters; a Top-K sketch's k, width, depth, decay and generator, its buckets, then each kept item and its count; a Cuckoo filter's `CF.SCANDUMP` header, then each sub-filter's bytes; a t-digest's compression, counts and extremes, then its merged and unmerged centroids |
 | alias section (`KIVIAL1\0`) | `FT.ALIASADD` aliases, so that they survive a restart |
 | field options section (`KIVIFO1\0`) | each index's `STOPWORDS` and each field's options (`AS`, `SORTABLE`, `WEIGHT`, `SEPARATOR`, `CASESENSITIVE`, …), as the words `FT.CREATE` takes |
 | synonyms and dictionaries section (`KIVISD1\0`) | each index's synonym groups (`FT.SYNUPDATE`) and every dictionary (`FT.DICTADD`) |
@@ -375,6 +378,206 @@ is still written as before):
 An older release stops reading at the first section it does not know, so
 these come after everything it does. A snapshot written by this version
 cannot be read by an older one once it contains any of these.
+
+## Compressed snapshots
+
+With `rdbcompression yes` (off by default in 1.3, so that a rollback to
+1.2 works), every snapshot is written
+compressed: `dump.kdb` (by `SAVE`, `BGSAVE`, a checkpoint of the AOF and the
+shutdown), the base of an online backup, and a full sync to a replica that
+reads it. The image is the plain one, byte for byte, cut into blocks of
+256 KiB, each compressed with zstd (level 1) or, if it does not shrink,
+stored as it is. Each block carries its length and a checksum (xxh3) of what
+it holds, and the file ends with a marker that gives the number of blocks
+and the length of the image. The file starts with `KIVIDBZ1`, the plain one
+with `KIVIDB01`.
+
+The blocks are compressed on up to two compression threads (the CPUs less
+one, started at the first compressed save and shared by every save), never
+on the threads that serve clients, and no more than a few blocks are in
+memory at once. The log line of each save gives the image's size, the
+size written and the ratio.
+
+Loading reads both forms, told apart by the first bytes, and a compressed
+one a block at a time. A compressed snapshot that is cut short anywhere,
+has no end marker, has a block whose checksum or length does not match, or
+has bytes after its end is refused as a whole, with the block named
+(`compressed snapshot: block 3 (at byte 524321) does not match its checksum:
+it is damaged`): it is never loaded in part. At startup that stops the
+server, and leaves its directory as it is, as for any snapshot that cannot be
+loaded.
+
+A full sync is compressed only for a replica that says it reads it (`REPLCONF
+capa kdb-blocks`, which this version's replicas send). A replica of 1.2 or
+earlier, or of Redis, is sent the plain image. A master with `rdbcompression
+no` sends the plain image to every replica.
+
+### Going back to 1.2
+
+With the default, `rdbcompression no`, there is nothing to do: 1.3 writes
+the plain snapshots 1.2 reads. After `rdbcompression yes`, KiviDB 1.2 and
+earlier refuse a compressed snapshot (`bad magic`) and do not start on it;
+nothing is changed on disk. To hand a snapshot to one:
+
+* `CONFIG SET rdbcompression no`, then `SAVE` (with the AOF on, this writes
+  the AOF's base plain too); or set `rdbcompression no` in the config file
+  before the last shutdown;
+* or convert the file, server running or not:
+
+```bash
+kividb kdb-decompress dump.kdb dump-plain.kdb   # what 1.2 reads
+kividb kdb-compress dump-plain.kdb dump.kdb     # and back
+```
+
+An online backup's BASE (`appendonly.aof.N.base.kdb`) is a snapshot like
+any other: taken by 1.3 with `rdbcompression yes`, 1.2 cannot
+restore it (`--preload-file aof:...` refuses it with `bad magic`). Convert
+the BASE with `kividb kdb-decompress` (and name the plain file in the
+manifest's place of the old one), or take the backup with `rdbcompression
+no` set.
+
+What the two tools check, before they write anything:
+
+* the input is read through as the server loads a snapshot: every key and
+  value parsed, every section after the databases, and for a compressed
+  one every block's length and checksum, its end marker and that nothing
+  follows it. An input the server would refuse is refused (exit 1, a
+  message saying why, no output file). The keys are not kept: memory stays
+  small whatever the file's size;
+* `kdb-compress` takes a plain snapshot only, `kdb-decompress` a compressed
+  one only; the other form is refused (a plain snapshot needs nothing to be
+  read by 1.2);
+* `kdb-compress` refuses a snapshot written by KiviDB 1.2.0 with the empty
+  key in a database before its last (#441): the server reads such a file
+  a second way to load it, which it does not do for a compressed snapshot.
+  Start a server on it and `SAVE`, then compress what it writes;
+* what is written is read through again the same way before it is put in
+  place.
+
+The output goes through a temporary file beside it, synced, renamed into
+place, and its directory synced. An output that exists is not replaced
+(exit 1) unless `--force` comes before the files (`kividb kdb-decompress
+--force <in> <out>`). The tools start no server and need no shell
+(`["kividb", "kdb-decompress", ...]`).
+
+## The cluster's nodes.conf
+
+In cluster mode a node keeps what it knows of the cluster in
+`cluster-config-file` (`nodes.conf` in `dir`): its own id, every member's id,
+address, hostname, role and shard, who owns which slots, and the epochs. The
+format is Redis's, one line a node and a last `vars` line.
+
+**When it is saved.** On every change of topology: a member learnt or
+forgotten, a role, an address, slots, an epoch, a vote. Changes a command
+makes (`ADDSLOTS`, `REPLICATE`, `FORGET`, `SAVECONFIG`, ...) are saved
+before the command is answered, and a vote before it is sent. Changes
+learnt from the bus are saved on a thread of their own as they are learnt
+(those of 100 ms in one save, so that a cluster being formed does not keep
+its disk busy), except a node met by `CLUSTER MEET`: both ends of the handshake save the
+other before they show it as a member, and the receiving end before it
+answers. So once the node you sent `CLUSTER MEET` to lists the new node in
+`CLUSTER NODES` without the `handshake` flag, both have it on disk. Nodes
+met at the same time are saved together, in one write. The other members
+learn it by gossip, within a few heartbeats, and save it then. A node also
+saves the file at the start of a shutdown.
+
+If the file cannot be saved (a full or read-only disk), the node logs it
+once, as an error, until a save works again. Meanwhile it makes no node
+met a member and does not answer its MEET (the end that sent it tries again,
+for up to two minutes, and again whenever the other end calls on it within
+the hour after), and it casts no vote. A replica that wins an election saves
+its promotion before it announces it, waiting for the save up to a second.
+One not saved by then (a slow disk, a failed save) takes over all the same
+(the cluster has agreed to it), and the promotion is saved in the
+background, made again every second until the save works.
+
+A node stopped before that save was done starts again from the file of
+before: a replica of the old master. It completes the promotion from what
+the masters report: a master that holds it as the owner of slots says so in
+its answers to its heartbeats, with the config epoch and the number of
+masters that own slots in its view. Once a majority of the masters that own
+slots (of the greater of that number and its own count) say it owns every
+slot of its old master at a config epoch newer than any it knows for those
+slots, it completes the promotion at that epoch, within a heartbeat or two
+of starting: it takes exactly those slots, saves the promotion as above, and
+serves them with the dataset it has. With the AOF on, that is everything it
+had acknowledged. Without it (and no snapshot from a clean shutdown), the
+node serves none of them until a replica that holds them takes over or its
+replicas answer that they hold nothing either, as a master back without its
+dataset does; with no replica, it serves what it has. A node that starts as
+a replica begins its first sync once enough of the masters have answered
+that it is not to complete a promotion (with three masters, two of them), or
+a node timeout after it started, and not at all when it is to complete one.
+It does not take the slots if another node owns them at a newer epoch (a
+replica elected since, a `CLUSTER FAILOVER TAKEOVER`): it follows that one.
+A master that voted for another replica to replace the node says nothing of
+it while that election may still be won. Nodes of 1.2 among the masters say
+nothing of it, so the majority has to be made of masters of a later release.
+
+A filesystem that cannot sync a directory at all (some FUSE, CIFS and 9p
+mounts answer `EINVAL` or `ENOTSUP`) does not fail the save: the node warns
+once, and the rename is as durable as that filesystem makes it.
+
+**A cluster stopped whole.** A member that at least one node has in its
+`nodes.conf` is a member again after the cluster restarts: that node tells
+the others of it by gossip, and the member, from the addresses in its own
+file, finds the rest. One that no node has (a node killed before it ever
+showed it) is not: a node that is not a member cannot join by sending
+heartbeats. It has to be met again with `CLUSTER MEET`, as in Redis. That
+rule keeps a process that can reach the bus port from making itself a
+member. A tool that adds nodes and then may restart the whole cluster
+(an operator, a script) should wait until the node it sent `CLUSTER MEET` to
+lists the new node without `handshake`; to have every member save it, wait
+until each one lists it, and send each `CLUSTER SAVECONFIG`.
+
+**How it is written.** To a temporary file beside it
+(`nodes.conf.tmp-<n>`), synced, put in place of it, and the directory
+synced: a crash at any moment leaves the old file or the new one, never
+part of one. nodes.conf itself is never written over in place. On Linux the
+file a save puts out of place is kept as a spare (`nodes.conf.spare-<n>`,
+two at most) once the directory is synced, when it is no longer nodes.conf
+on disk either, and a later save writes over it: renamed to that save's
+temporary file, written, its data synced (`fdatasync`), exchanged with
+nodes.conf (`renameat2` with `RENAME_EXCHANGE`, as atomic as a rename), and
+the directory synced. A spare's blocks are allocated already, so syncing
+its data needs no commit of the filesystem's journal: a save costs one
+commit (the directory's) where a new file costs two. A symbolic or hard
+link to nodes.conf is never written through: put out of place, it is
+removed. On a filesystem that cannot exchange two files or sync a
+directory, and on other systems, every save writes a new file. On Linux it
+is written past the page cache, padded with blank lines to a multiple of
+4 KiB. Temporary files and spares are removed at startup. The one
+exception is the takeover at the end of a slot
+migration's handover, which does not wait for the sync while client writes
+are paused: a power failure in the moment after it can leave the file
+incomplete.
+
+**Failover needs a disk that syncs it quickly.** A master saves its vote,
+synced, before it sends it, and a replica its promotion, so a failover
+waits on several saves, each two syncs of the disk (the file's data and
+the directory). A candidate counts a vote for as long as its election lives,
+10 seconds, and then stands again at a new epoch: a vote whose save takes
+longer than that is never counted, and the failover does not complete.
+Measured on an Azure D4s_v5, ext4 on a volume that delays every write:
+with writes taking 200 ms, a save took 2.1-2.3 s and a failover of a master
+4.5-6.0 s (the promotion announced after its 1 s wait, its save still under
+way); with writes taking 1 s, a save took 8-13 s and no failover completed
+in 330 s. On the VM's own disk a save takes about 20 ms and a failover
+3.5-4.1 s.
+A volume on which a save of nodes.conf takes more than a few seconds is too
+slow for a cluster to fail over: give the cluster file a disk that syncs a
+small file in well under a second.
+
+**A file cut short is refused.** A `nodes.conf` that does not end with its
+`vars` line stops the node at startup with `cluster config file
+'nodes.conf' is unreadable: nodes.conf is incomplete ...`, and the file is
+left as it is: such a file may lack members, slots and the epochs. Restore
+the file from a backup; if there is none, remove it and add the node to the
+cluster again as a new one.
+
+An empty `nodes.conf` (zero bytes) is refused too (`nodes.conf is empty`).
+Redis takes an empty file for a new node. To start a node
+afresh, with a new id, delete the file rather than emptying it.
 
 ## When a write is acknowledged
 

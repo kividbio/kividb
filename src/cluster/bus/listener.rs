@@ -8,7 +8,7 @@
 
 use crate::cluster::ClusterState;
 use crate::cluster::bus::message::{BusMessage, GossipEntry, decode, encode, exceeds_buffer_limit};
-use crate::cluster::node::{ClusterNode, NodeFlags, NodeId, node_id_str};
+use crate::cluster::node::{ClientIps, ClusterNode, NodeFlags, NodeId, node_id_str};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -22,9 +22,11 @@ pub async fn run_bus_listener(
     bus_port: u16,
     state: Arc<ClusterState>,
 ) -> std::io::Result<()> {
-    let addr: SocketAddr = format!("{bind}:{bus_port}").parse().map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bad bind: {e}"))
-    })?;
+    let addr: SocketAddr = crate::config::host_port(&bind, bus_port)
+        .parse()
+        .map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bad bind: {e}"))
+        })?;
     let listener = TcpListener::bind(addr).await?;
     log_info!("Cluster: Bus listener bound on {addr}");
 
@@ -96,6 +98,26 @@ async fn handle_bus_connection(
                     state
                         .stats_messages_received
                         .fetch_add(1, Ordering::Relaxed);
+                    if let BusMessage::Ping {
+                        sender_id,
+                        ref sender_ip,
+                        sender_cluster_port,
+                        ..
+                    } = msg
+                        && !state.meets_given_up.lock().is_empty()
+                        && !sender_is_member(&state, &sender_id)
+                    {
+                        let ip = if sender_ip.is_empty() || sender_ip == "0.0.0.0" {
+                            peer.ip().to_string()
+                        } else {
+                            sender_ip.clone()
+                        };
+                        crate::cluster::bus::dialer::resume_given_up_meet(
+                            &state,
+                            &ip,
+                            sender_cluster_port,
+                        );
+                    }
                     let reply = match msg {
                         // The one message whose answer has to wait on the
                         // rest of the server; everything else is synchronous.
@@ -103,6 +125,31 @@ async fn handle_bus_connection(
                             crate::cluster::bus::heartbeat::answer_mfstart(&state, sender_id)
                                 .await
                                 .map(|m| encode(&m))
+                        }
+                        // Answered once the sender is saved as a member, on a
+                        // thread that may wait on the disk (`admit_met_node`).
+                        meet @ BusMessage::Meet { .. } => {
+                            let state = Arc::clone(&state);
+                            let reply = crate::cpus::spawn_blocking(move || {
+                                process_message(&state, meet, peer)
+                            })
+                            .await
+                            .unwrap_or(None);
+                            if reply.is_none() {
+                                // Not saved: not answered, and the sender,
+                                // seeing the connection close, tries again.
+                                return Ok(());
+                            }
+                            reply
+                        }
+                        // Voted once the vote is saved: the same.
+                        request @ BusMessage::FailoverAuthRequest { .. } => {
+                            let state = Arc::clone(&state);
+                            crate::cpus::spawn_blocking(move || {
+                                process_message(&state, request, peer)
+                            })
+                            .await
+                            .unwrap_or(None)
                         }
                         other => process_message(&state, other, peer),
                     };
@@ -201,22 +248,39 @@ pub fn process_message(
             // FORGET ban, which exists to stop gossip undoing a removal, not
             // to stop the operator reversing it.
             state.forgotten.write().remove(&sender_id);
-            upsert_node(
-                state,
+            let ip = resolve_ip(sender_ip);
+            let mut node = ClusterNode::new(
                 sender_id,
-                resolve_ip(sender_ip),
+                ip.clone(),
                 sender_client_port,
                 sender_cluster_port,
-                sender_config_epoch,
-                NodeFlags::MASTER,
-                None,
-                true,
             );
-            // Save nodes.conf so the new peer survives restart.
+            node.flags = NodeFlags::MASTER;
+            node.config_epoch = sender_config_epoch;
+            // Saved, so that the new peer survives a restart, before it is
+            // a member, and before it is answered (#808).
+            let admitted = state.admit_met_node(node, || {
+                upsert_node(
+                    state,
+                    sender_id,
+                    ip,
+                    sender_client_port,
+                    sender_cluster_port,
+                    sender_config_epoch,
+                    NodeFlags::MASTER,
+                    None,
+                    true,
+                )
+            });
+            if !admitted {
+                // Not saved, so not a member, and not answered: the sender
+                // tries again (`send_meet`).
+                return None;
+            }
             state.save_soon();
 
             // Reply with our own PONG so the peer learns OUR id.
-            Some(encode(&our_pong(state)))
+            Some(encode(&our_pong(state, None)))
         }
         BusMessage::Ping {
             sender_id,
@@ -230,13 +294,18 @@ pub fn process_message(
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_client_ips,
             sender_shard_id,
         } => {
             // A PING from a node we do not know is answered — so it can see
             // we are alive — but it does not get itself added by pinging.
             // Otherwise a node removed with CLUSTER FORGET, which still has
             // us in *its* table, would re-add itself on its next heartbeat.
-            if sender_is_member(state, &sender_id) {
+            let member = sender_is_member(state, &sender_id);
+            if member {
+                if sender_flags.contains(NodeFlags::MASTER) {
+                    state.note_says_master(sender_id);
+                }
                 apply_heartbeat(
                     state,
                     sender_id,
@@ -248,12 +317,15 @@ pub fn process_message(
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_client_ips,
                     sender_shard_id,
                     gossip,
                     &slot_claims,
                 );
             }
-            Some(encode(&our_pong(state)))
+            // Made after the PING is taken in: if the sender says it is a
+            // replica and still owns slots here, the PONG says which.
+            Some(encode(&our_pong(state, member.then_some(sender_id))))
         }
         BusMessage::Pong {
             sender_id,
@@ -267,12 +339,17 @@ pub fn process_message(
             sender_master_id,
             sender_hostname,
             sender_announced_client_port,
+            sender_client_ips,
             sender_shard_id,
+            held_as_owner,
         } => {
             // A PONG is a reply to something we sent. From a stranger it is
             // only acceptable as the answer to our own MEET — which the
             // dialer handles through `accept_meet_reply`, not through here.
             if sender_is_member(state, &sender_id) {
+                if sender_flags.contains(NodeFlags::MASTER) {
+                    state.note_says_master(sender_id);
+                }
                 apply_heartbeat(
                     state,
                     sender_id,
@@ -284,10 +361,15 @@ pub fn process_message(
                     sender_master_id,
                     sender_hostname,
                     sender_announced_client_port,
+                    sender_client_ips,
                     sender_shard_id,
                     gossip,
                     &slot_claims,
                 );
+                // What the sender holds of this node, in its own words:
+                // never relayed, so never another node's stale view.
+                state.note_held_as_owner(sender_id, held_as_owner);
+                state.note_pong_heard(sender_id);
             }
             None
         }
@@ -306,6 +388,26 @@ pub fn process_message(
                 force,
                 claims.as_deref(),
             ) {
+                // A vote is sent once the file that records it is on disk,
+                // so that a restart cannot repeat it. Not saved, it is not
+                // sent, and this node does not vote in that epoch (it has
+                // recorded it as voted).
+                // Saved as a node met is: by the first save begun after it,
+                // one already under way included, not one save a vote.
+                let from = state.saves.written.load(Ordering::SeqCst) + 1;
+                let deadline = std::time::Instant::now() + crate::cluster::ELECTION_LIFETIME;
+                if let Err(e) = crate::cluster::persist::wait_for_save(state, from, deadline) {
+                    log_warn!(
+                        "Cluster: Did not vote for {} at epoch {}: the vote could not be saved ({e})",
+                        node_id_str(&sender_id),
+                        request_epoch,
+                    );
+                    // Saved again, in the background: the save that failed
+                    // may be the file in place, its rename not synced (it
+                    // failed at the directory's sync).
+                    state.save_soon();
+                    return None;
+                }
                 log_info!(
                     "Cluster: Voted for {} to take over from {} at epoch {}{}",
                     node_id_str(&sender_id),
@@ -313,7 +415,6 @@ pub fn process_message(
                     request_epoch,
                     if force { " (manual failover)" } else { "" },
                 );
-                let _ = state.save_to_disk();
                 Some(encode(&BusMessage::FailoverAuthAck {
                     sender_id: state.myself(),
                     request_epoch,
@@ -399,8 +500,10 @@ pub fn process_message(
 }
 
 /// Accept the PONG that answers our own `MEET`: the one case where a message
-/// from a node we do not know yet is taken at its word.
-pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: SocketAddr) {
+/// from a node we do not know yet is taken at its word. The node is saved
+/// before it is a member (`ClusterState::admit_met_node`): this blocks on
+/// the disk. False if it could not be saved, or `msg` is not a PONG.
+pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: SocketAddr) -> bool {
     if let BusMessage::Pong {
         sender_id,
         sender_ip,
@@ -413,7 +516,11 @@ pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: Socke
         sender_master_id,
         sender_hostname,
         sender_announced_client_port,
+        sender_client_ips,
         sender_shard_id,
+        // A node met has not been this node's peer: it holds it as the
+        // owner of nothing.
+        held_as_owner: _,
     } = msg
     {
         state.forgotten.write().remove(&sender_id);
@@ -422,22 +529,40 @@ pub fn accept_meet_reply(state: &ClusterState, msg: BusMessage, peer_addr: Socke
         } else {
             sender_ip
         };
-        apply_heartbeat(
-            state,
+        let mut node = ClusterNode::new(
             sender_id,
-            ip,
+            ip.clone(),
             sender_client_port,
             sender_cluster_port,
-            sender_config_epoch,
-            sender_flags,
-            sender_master_id,
-            sender_hostname,
-            sender_announced_client_port,
-            sender_shard_id,
-            gossip,
-            &slot_claims,
         );
+        node.flags = sender_flags & (NodeFlags::MASTER | NodeFlags::REPLICA);
+        node.master_id = sender_master_id;
+        node.config_epoch = sender_config_epoch;
+        node.hostname = sender_hostname.clone();
+        node.client_ips = sender_client_ips.clone();
+        if let Some(shard_id) = sender_shard_id {
+            node.shard_id = shard_id;
+        }
+        return state.admit_met_node(node, || {
+            apply_heartbeat(
+                state,
+                sender_id,
+                ip,
+                sender_client_port,
+                sender_cluster_port,
+                sender_config_epoch,
+                sender_flags,
+                sender_master_id,
+                sender_hostname,
+                sender_announced_client_port,
+                sender_client_ips,
+                sender_shard_id,
+                gossip,
+                &slot_claims,
+            )
+        });
     }
+    false
 }
 
 /// Everything a PING or PONG tells us: the sender is alive and where it is,
@@ -454,6 +579,7 @@ fn apply_heartbeat(
     sender_master_id: Option<NodeId>,
     sender_hostname: String,
     sender_announced_client_port: u16,
+    sender_client_ips: ClientIps,
     sender_shard_id: Option<NodeId>,
     gossip: Vec<GossipEntry>,
     slot_claims: &[crate::cluster::bus::SlotClaim],
@@ -487,6 +613,8 @@ fn apply_heartbeat(
     // What a node says of its own hostname stands, none included.
     state.set_peer_hostname(sender_id, &sender_hostname, true);
     state.set_peer_client_port(sender_id, sender_announced_client_port, true);
+    // Its client addresses only from its own word, never from gossip (#847).
+    state.set_peer_client_ips(sender_id, &sender_client_ips);
     // Its shard: what a master says of its own is its shard's, replicas
     // included (this node too, if it is one); a replica is in its master's
     // (#563). A node of an earlier version says none.
@@ -667,7 +795,15 @@ fn merge_gossip_entry(
 /// Build a PONG describing ourselves. Includes our slot claims and a gossip
 /// section — this is the gossip propagation mechanism, piggybacking on every
 /// reply.
-fn our_pong(state: &ClusterState) -> BusMessage {
+///
+/// `to`, the member it answers: if this node, a master, holds it as the
+/// owner of slots while it says it is a replica, the PONG says which slots,
+/// at its config epoch here, and how many masters own slots here
+/// (`held_as_owner`), unless this node's vote for a replacement of it may
+/// still be won (`ClusterState::owner_report_for`). That is a node
+/// restarted before the save of its promotion was done: see
+/// `ClusterState::promotion_to_complete`.
+fn our_pong(state: &ClusterState, to: Option<NodeId>) -> BusMessage {
     let nodes = state.nodes.read();
     let me = nodes
         .get(&state.myself())
@@ -675,7 +811,17 @@ fn our_pong(state: &ClusterState) -> BusMessage {
         .unwrap_or_else(|| ClusterNode::new(state.myself(), String::new(), 0, 0));
 
     let gossip = sample_gossip(&nodes, state.myself(), GOSSIP_SAMPLE);
+    let to_is_replica = me.flags.contains(NodeFlags::MASTER)
+        && to.is_some_and(|id| {
+            nodes
+                .get(&id)
+                .is_some_and(|n| n.flags.contains(NodeFlags::REPLICA))
+        });
     drop(nodes);
+    let held_as_owner = match to {
+        Some(id) if to_is_replica => state.owner_report_for(id),
+        _ => None,
+    };
 
     BusMessage::Pong {
         sender_id: state.myself(),
@@ -687,9 +833,11 @@ fn our_pong(state: &ClusterState) -> BusMessage {
         sender_master_id: me.master_id,
         sender_hostname: me.hostname.clone(),
         sender_announced_client_port: me.announced_client_port,
+        sender_client_ips: me.client_ips.clone(),
         sender_shard_id: Some(me.shard_id),
         gossip,
         slot_claims: state.my_slot_claims(),
+        held_as_owner,
     }
 }
 
@@ -765,7 +913,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::bus::SlotClaim;
+    use crate::cluster::bus::{OwnerReport, SlotClaim};
     use crate::cluster::node::generate_node_id;
 
     fn peer() -> SocketAddr {
@@ -783,6 +931,7 @@ mod tests {
             sender_master_id: None,
             sender_hostname: String::new(),
             sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
             sender_shard_id: None,
             gossip,
             slot_claims: vec![],
@@ -878,6 +1027,7 @@ mod tests {
             None,
             String::new(),
             0,
+            ClientIps::default(),
             None,
             vec![],
             &[SlotClaim {
@@ -1091,6 +1241,292 @@ mod tests {
         assert!(my_node.flags.contains(NodeFlags::REPLICA));
         assert!(!my_node.flags.contains(NodeFlags::MASTER));
         assert_eq!(my_node.master_id, Some(winner));
+    }
+
+    /// A PONG to a node held here as the owner of slots that says it is a
+    /// replica says which slots, at its config epoch here; to a master that
+    /// owns them, or a replica that owns none, it says nothing. What a
+    /// master's PONG says of this node is noted, and withdrawn by one that
+    /// says nothing.
+    #[test]
+    fn a_pong_tells_a_replica_the_slots_it_is_held_as_the_owner_of() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let restarted = generate_node_id();
+        process_message(&cs, meet(restarted), peer());
+        let mut announced = ping(restarted, NodeFlags::MASTER, vec![]);
+        if let BusMessage::Ping {
+            slot_claims,
+            sender_config_epoch,
+            ..
+        } = &mut announced
+        {
+            *sender_config_epoch = 7;
+            *slot_claims = vec![SlotClaim {
+                start: 0,
+                end: 99,
+                epoch: 7,
+            }];
+        }
+        let held = |reply: Option<Vec<u8>>| {
+            let (msg, _) = crate::cluster::bus::message::decode(&reply.unwrap())
+                .unwrap()
+                .unwrap();
+            let BusMessage::Pong { held_as_owner, .. } = msg else {
+                panic!("expected a PONG");
+            };
+            held_as_owner
+                .map(|r| {
+                    assert_eq!(r.masters, 1, "the masters that own slots here");
+                    r.claims
+                        .iter()
+                        .map(|c| (c.start, c.end, c.epoch))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        // A master owning the slots: nothing.
+        assert!(held(process_message(&cs, announced, peer())).is_empty());
+        // The same node, restarted as a replica: the slots, at epoch 7.
+        let mut as_replica = ping(restarted, NodeFlags::REPLICA, vec![]);
+        if let BusMessage::Ping {
+            sender_master_id, ..
+        } = &mut as_replica
+        {
+            *sender_master_id = Some(generate_node_id());
+        }
+        assert_eq!(
+            held(process_message(&cs, as_replica.clone(), peer())),
+            [(0, 99, 7)]
+        );
+        // A replica that owns nothing: nothing.
+        let other = generate_node_id();
+        process_message(&cs, meet(other), peer());
+        assert!(
+            held(process_message(
+                &cs,
+                ping(other, NodeFlags::REPLICA, vec![]),
+                peer()
+            ))
+            .is_empty()
+        );
+
+        // On the other side: noted from a PONG, and withdrawn.
+        let master = generate_node_id();
+        process_message(&cs, meet(master), peer());
+        let pong = |held_as_owner: Option<OwnerReport>| BusMessage::Pong {
+            sender_id: master,
+            sender_ip: String::new(),
+            sender_client_port: 7000,
+            sender_cluster_port: 17000,
+            sender_config_epoch: 1,
+            sender_flags: NodeFlags::MASTER,
+            sender_master_id: None,
+            sender_hostname: String::new(),
+            sender_announced_client_port: 0,
+            sender_client_ips: ClientIps::default(),
+            sender_shard_id: None,
+            gossip: vec![],
+            slot_claims: vec![],
+            held_as_owner,
+        };
+        process_message(
+            &cs,
+            pong(Some(OwnerReport {
+                masters: 3,
+                claims: vec![SlotClaim {
+                    start: 0,
+                    end: 9,
+                    epoch: 3,
+                }],
+            })),
+            peer(),
+        );
+        assert_eq!(cs.held_as_owner_by(master), Some(vec![(0, 9, 3)]));
+        process_message(&cs, pong(None), peer());
+        assert_eq!(cs.held_as_owner_by(master), None);
+    }
+
+    /// A master `r` that owns 0-99 at config epoch 7 in `cs`'s view, which
+    /// owns 100-199, and `r`'s replica `q`; `r` FAIL. Returns the PING of
+    /// `r` restarted as a replica (of another node).
+    fn a_failed_master_and_its_replica(cs: &ClusterState) -> (NodeId, NodeId, BusMessage) {
+        cs.claim_slot_range(100, 199).unwrap();
+        let r = generate_node_id();
+        process_message(cs, meet(r), peer());
+        let mut announced = ping(r, NodeFlags::MASTER, vec![]);
+        if let BusMessage::Ping {
+            slot_claims,
+            sender_config_epoch,
+            ..
+        } = &mut announced
+        {
+            *sender_config_epoch = 7;
+            *slot_claims = vec![SlotClaim {
+                start: 0,
+                end: 99,
+                epoch: 7,
+            }];
+        }
+        process_message(cs, announced, peer());
+        let q = generate_node_id();
+        process_message(cs, meet(q), peer());
+        let mut follows = ping(q, NodeFlags::REPLICA, vec![]);
+        if let BusMessage::Ping {
+            sender_master_id, ..
+        } = &mut follows
+        {
+            *sender_master_id = Some(r);
+        }
+        process_message(cs, follows, peer());
+        cs.nodes.write().get_mut(&r).unwrap().flags |= NodeFlags::FAIL;
+        let mut as_replica = ping(r, NodeFlags::REPLICA, vec![]);
+        if let BusMessage::Ping {
+            sender_master_id, ..
+        } = &mut as_replica
+        {
+            *sender_master_id = Some(generate_node_id());
+        }
+        (r, q, as_replica)
+    }
+
+    fn report_in(reply: Option<Vec<u8>>) -> Option<OwnerReport> {
+        let (msg, _) = crate::cluster::bus::message::decode(&reply.unwrap())
+            .unwrap()
+            .unwrap();
+        let BusMessage::Pong { held_as_owner, .. } = msg else {
+            panic!("expected a PONG");
+        };
+        held_as_owner
+    }
+
+    /// A master that voted for a replacement of a node sends that node no
+    /// report while the vote may still be won and announced: the node is not
+    /// to complete a promotion of its own while the winner's newer claim is
+    /// on its way.
+    #[test]
+    fn a_master_that_voted_for_a_replacement_sends_no_report() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let (r, q, as_replica) = a_failed_master_and_its_replica(&cs);
+        assert!(cs.cast_vote(q, r, 100, false, None));
+        assert_eq!(report_in(process_message(&cs, as_replica, peer())), None);
+        // Another master, that gave no vote, reports.
+        let other = ClusterState::new_enabled(None, 15000);
+        let (_, _, as_replica) = a_failed_master_and_its_replica(&other);
+        let report = report_in(process_message(&other, as_replica, peer())).unwrap();
+        assert_eq!(report.masters, 2);
+        assert_eq!(
+            report
+                .claims
+                .iter()
+                .map(|c| (c.start, c.end, c.epoch))
+                .collect::<Vec<_>>(),
+            [(0, 99, 7)]
+        );
+    }
+
+    /// A master that reported to a node that says it is a replica votes
+    /// for no replacement of it, forced or not, while the node may be
+    /// completing its promotion on that report; once the node says it is a
+    /// master again, it does.
+    #[test]
+    fn a_master_that_reported_votes_for_no_replacement() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let (r, q, as_replica) = a_failed_master_and_its_replica(&cs);
+        assert!(report_in(process_message(&cs, as_replica, peer())).is_some());
+        cs.nodes.write().get_mut(&r).unwrap().flags |= NodeFlags::FAIL;
+        assert!(!cs.cast_vote(q, r, 100, false, None));
+        assert!(!cs.cast_vote(q, r, 101, true, None));
+        // Completed: it says it is a master.
+        let mut completed = ping(r, NodeFlags::MASTER, vec![]);
+        if let BusMessage::Ping {
+            sender_config_epoch,
+            ..
+        } = &mut completed
+        {
+            *sender_config_epoch = 7;
+        }
+        process_message(&cs, completed, peer());
+        assert!(cs.cast_vote(q, r, 102, true, None));
+    }
+
+    /// A vote decided while the node's first PING as a replica comes in, in
+    /// between the vote's look at the node table and its taking of
+    /// `last_vote_for`: the PING is answered with a report, and the vote,
+    /// which reads the node's role under the lock, is refused. This node
+    /// never both reports to the node and votes for its replacement.
+    #[test]
+    fn a_report_made_while_a_vote_is_decided_refuses_the_vote() {
+        let cs = std::sync::Arc::new(ClusterState::new_enabled(None, 15000));
+        let (r, q, as_replica) = a_failed_master_and_its_replica(&cs);
+        let reported = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let (cs, reported) = (std::sync::Arc::clone(&cs), std::rc::Rc::clone(&reported));
+            crate::cluster::run_before_vote_lock(move || {
+                let report = report_in(process_message(&cs, as_replica, peer()));
+                reported.set(report.is_some());
+            });
+        }
+        let voted = cs.cast_vote(q, r, 100, false, None);
+        assert!(reported.get(), "the PING was answered with a report");
+        assert!(!voted, "voted for a replacement of a node it reported to");
+    }
+
+    /// Reports to a node that says it is a replica end three node timeouts
+    /// after the first, if it has not said it is a master by then; votes for
+    /// a replacement of it are refused until three node timeouts after the
+    /// last report, and given after. A restart of the node (more PINGs as a
+    /// replica) does not start the reports again; its saying it is a master
+    /// does.
+    #[test]
+    fn reports_to_a_node_that_does_not_complete_end_and_votes_follow() {
+        let node_timeout = 40;
+        let cs = ClusterState::new_enabled(None, node_timeout);
+        let (r, q, as_replica) = a_failed_master_and_its_replica(&cs);
+        let began = std::time::Instant::now();
+        assert!(report_in(process_message(&cs, as_replica.clone(), peer())).is_some());
+        assert!(!cs.cast_vote(q, r, 100, true, None));
+        // Reported on every PING, until the limit.
+        let mut last_report = began;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            if report_in(process_message(&cs, as_replica.clone(), peer())).is_none() {
+                break;
+            }
+            last_report = std::time::Instant::now();
+            assert!(
+                began.elapsed() < std::time::Duration::from_millis(node_timeout * 3 + 30),
+                "still reporting after {:?}",
+                began.elapsed()
+            );
+        }
+        assert!(began.elapsed() >= std::time::Duration::from_millis(node_timeout * 3));
+        // Refused while the last report may still count, given after.
+        if last_report.elapsed() < std::time::Duration::from_millis(node_timeout * 3 - 20) {
+            assert!(!cs.cast_vote(q, r, 101, true, None));
+        }
+        // Restarted, as a replica again: still no report.
+        process_message(&cs, meet(r), peer());
+        assert!(report_in(process_message(&cs, as_replica.clone(), peer())).is_none());
+        std::thread::sleep(std::time::Duration::from_millis(node_timeout * 3 + 10));
+        assert!(report_in(process_message(&cs, as_replica.clone(), peer())).is_none());
+        assert!(cs.cast_vote(q, r, 102, true, None));
+
+        // Its saying it is a master starts the reports afresh.
+        let cs = ClusterState::new_enabled(None, node_timeout);
+        let (r, _q, as_replica) = a_failed_master_and_its_replica(&cs);
+        assert!(report_in(process_message(&cs, as_replica.clone(), peer())).is_some());
+        std::thread::sleep(std::time::Duration::from_millis(node_timeout * 3 + 10));
+        assert!(report_in(process_message(&cs, as_replica.clone(), peer())).is_none());
+        let mut master = ping(r, NodeFlags::MASTER, vec![]);
+        if let BusMessage::Ping {
+            sender_config_epoch,
+            ..
+        } = &mut master
+        {
+            *sender_config_epoch = 7;
+        }
+        process_message(&cs, master, peer());
+        assert!(report_in(process_message(&cs, as_replica, peer())).is_some());
     }
 
     /// Losing *some* slots is a resharding, not a failover.

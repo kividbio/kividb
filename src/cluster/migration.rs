@@ -32,6 +32,7 @@
 // same credentials replication uses (`masteruser` / `masterauth`).
 
 use super::{ClusterState, MigrationState, NodeId, key_hash_slot};
+use crate::cpus::BuilderExt as _;
 use crate::replication::{HubTx, ReplPayload, ReplState};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -1472,7 +1473,7 @@ fn start_dropping(
     let hub_tx = hub_tx.clone();
     let spawned = std::thread::Builder::new()
         .name("kividb-lost-slots".into())
-        .spawn(move || {
+        .spawn_released(move || {
             let deleted = delete_keys(
                 &store,
                 &repl_state,
@@ -1822,7 +1823,7 @@ pub fn start_source(env: Env, task_id: &str, dest: NodeId, ranges: Ranges) -> Re
     let thread_env = env.clone();
     let spawned = std::thread::Builder::new()
         .name("kividb-slot-migrate".into())
-        .spawn(move || run_source(thread_env, id));
+        .spawn_released(move || run_source(thread_env, id));
     if let Err(e) = spawned {
         env.registry()
             .finish(task_id, TaskState::Failed, Some(e.to_string()));
@@ -2015,6 +2016,12 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
         );
         std::thread::sleep(delay);
     }
+    // Tests: held here, on the migration's own thread, with the stream
+    // caught up and writes not paused yet. Nothing from here to the
+    // TAKEOVER needs a connection to this node, so a test can hold a
+    // command at `routed` meanwhile on the io_uring loop, where that holds
+    // its whole worker (#339).
+    crate::aof::failpoint("handoff-pausing");
     no_failover_since()?;
 
     // ── Handoff ──────────────────────────────────────────────────────────
@@ -2384,7 +2391,7 @@ pub fn start_import(env: Env, ranges: Ranges) -> Result<String, String> {
     let thread_env = env.clone();
     let spawned = std::thread::Builder::new()
         .name("kividb-slot-import".into())
-        .spawn(move || run_import(thread_env, task_id));
+        .spawn_released(move || run_import(thread_env, task_id));
     if let Err(e) = spawned {
         env.registry()
             .finish(&id, TaskState::Failed, Some(e.to_string()));
@@ -3522,7 +3529,7 @@ mod tests {
         index_store: crate::vector::IndexStore,
         repl_state: Arc<ReplState>,
         hub_tx: HubTx,
-        _hub_rx: tokio::sync::mpsc::UnboundedReceiver<crate::replication::HubMsg>,
+        _hub_rx: crate::replication::HubRx,
     }
 
     impl Lost {
@@ -3538,7 +3545,7 @@ mod tests {
             for i in 0..OLD {
                 set(&store, &old_key(i), "old");
             }
-            let (hub_tx, _hub_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (hub_tx, _hub_rx) = crate::replication::HubTx::channel();
             Lost {
                 cluster: Arc::new(cluster),
                 other,
@@ -3961,7 +3968,7 @@ mod tests {
         // answers, and whether it then gives half an answer before it
         // closes it (or closes it at once).
         let script = [(2, false), (1, true), (usize::MAX, false)];
-        let server = std::thread::spawn(move || {
+        let server = crate::cpus::spawn(move || {
             let mut accepted = 0;
             for (answers, half) in script {
                 let (sock, _) = listener.accept().unwrap();
@@ -4187,7 +4194,7 @@ mod tests {
             .map(|i| {
                 let cluster = Arc::clone(&cluster);
                 let path = path.clone();
-                std::thread::spawn(move || {
+                crate::cpus::spawn(move || {
                     let first = i * 100;
                     let import = task(&format!("t{i}"), vec![(first, first + 99)]);
                     cluster.slot_migrations.add(import.clone()).unwrap();
@@ -4242,7 +4249,7 @@ mod tests {
             || {
                 let (cluster, store) = (Arc::clone(&lost.cluster), Arc::clone(&lost.store));
                 let came_there = Arc::clone(&came);
-                writer = Some(std::thread::spawn(move || {
+                writer = Some(crate::cpus::spawn(move || {
                     cluster.slot_deletions.came_here([LOST]);
                     came_there.store(true, Ordering::SeqCst);
                     // Locking no key, as a transaction's commands do.
@@ -4286,12 +4293,12 @@ mod tests {
         lost.cluster.release_slot(OTHER).unwrap();
         let cluster = Arc::clone(&lost.cluster);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        crate::cpus::spawn(move || {
             let mut others = Vec::new();
             let deleted = lost.delete_held(
                 || {
                     let cluster = Arc::clone(&lost.cluster);
-                    others.push(std::thread::spawn(move || {
+                    others.push(crate::cpus::spawn(move || {
                         cluster.claim_slot(OTHER).unwrap();
                     }));
                     // Until the giving holds the slot table, waiting for the
@@ -4301,7 +4308,7 @@ mod tests {
                         std::thread::sleep(Duration::from_millis(1));
                     }
                     let (cluster, store) = (Arc::clone(&lost.cluster), Arc::clone(&lost.store));
-                    others.push(std::thread::spawn(move || {
+                    others.push(crate::cpus::spawn(move || {
                         let counts =
                             crate::commands::cluster::key_counts_per_slot(&store[0], &cluster);
                         assert!(!counts.contains_key(&LOST));

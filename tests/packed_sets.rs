@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Small sets kept in one block (#297, step 1), beside the arrays of integers
 // and the tables: every set command gives the same answer whatever the form,
 // across every change of form, and the members come back the same after a
@@ -298,7 +299,10 @@ fn check_forms(c: &mut Conn, forms: &[(&str, Vec<Vec<u8>>, &str)], what: &str) {
 fn every_set_command_in_each_form() {
     for model in io_models() {
         let dir = temp_dir("commands");
-        let server = Server::start(dir.path(), &["--io-model", model]);
+        let server = Server::start(
+            dir.path(),
+            &["--io-model", model, "--enable-debug-command", "yes"],
+        );
         let mut c = server.conn();
         let forms = load_forms(&mut c);
         for (key, members, form) in &forms {
@@ -676,7 +680,7 @@ fn reference_copies(c: &mut Conn, forms: &[(&str, Vec<Vec<u8>>, &str)]) {
 fn save_aof_and_rewrite_round_trips() {
     // Snapshot.
     let dir = temp_dir("save");
-    let mut server = Server::start(dir.path(), &[]);
+    let mut server = Server::start(dir.path(), &["--enable-debug-command", "yes"]);
     let mut c = server.conn();
     let forms = load_forms(&mut c);
     reference_copies(&mut c, &forms);
@@ -687,7 +691,7 @@ fn save_aof_and_rewrite_round_trips() {
 
     // AOF replay, with removals and conversions in the log.
     let dir = temp_dir("aof");
-    let mut server = Server::start(dir.path(), &["--aof"]);
+    let mut server = Server::start(dir.path(), &["--aof", "--enable-debug-command", "yes"]);
     let mut c = server.conn();
     let forms = load_forms(&mut c);
     reference_copies(&mut c, &forms);

@@ -526,6 +526,8 @@ pub fn allowed_when_out_of_memory(name: &str) -> bool {
             | "MOVE"
             // Takes keys away; Redis flags it a write, but not `denyoom`.
             | "MIGRATE"
+            | "CF.COMPACT"
+            | "CF.DEL"
             | "SWAPDB"
             | "LPOP"
             | "RPOP"
@@ -984,7 +986,7 @@ fn freeing_at_least(value: crate::store::ValueRef<'_>) -> usize {
         V::Hash(hash) => hash.read().freeing_at_least(ELEMENT),
         V::HashEx(hash) => hash.read().fields.freeing_at_least(ELEMENT),
         V::Set(set) => set.read().freeing_at_least(ELEMENT),
-        V::SortedSet(zset) => zset.read().len() * ELEMENT,
+        V::SortedSet(zset) => zset.read().freeing_at_least(ELEMENT),
         V::VectorSet(set) => set.read().entries.len() * ELEMENT,
         V::Json(json) => match &*json.read() {
             serde_json::Value::Array(items) => items.len() * ELEMENT,

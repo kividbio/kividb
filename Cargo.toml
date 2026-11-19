@@ -26,6 +26,8 @@ rust-version = "1.89"
 # over 200 MB).
 include = [
     "/src/**",
+    "/csrc/**",
+    "/build.rs",
     "/Cargo.toml",
     "/Cargo.lock",
     "/README.md",
@@ -90,6 +92,10 @@ serde = "1"
 ordered-float = "4"
 sha2 = "0.10"
 lzf = "0.3"
+# Compressed snapshots (#879): zstd at level 1, a block at a time, on the
+# threads that write a snapshot, never the serving threads. Bundles libzstd
+# (C, BSD-3-Clause), built with the platform's C compiler; no system library.
+zstd = { version = "0.13", default-features = false }
 bitflags = "2.6"
 either = "1"
 # ARGREP's `RE <pattern>` predicate (Redis 8.8 array commands). Linear-time
@@ -110,6 +116,11 @@ rustls-pemfile = { version = "2",   optional = true }
 # the X.509 parser rustls already builds with.
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"], optional = true }
 mlua = { version = "0.10", features = ["lua54", "vendored", "send"], optional = true }
+# A direct dependency puts mlua-sys's `links = "lua"` metadata in this
+# crate's build environment: build.rs compiles the patched lstrlib.c
+# `str_format` (#771) against the include dir of the same vendored Lua
+# 5.4.7 the library was built with.
+mlua-sys = { version = "0.6.8", features = ["lua54", "vendored"], optional = true }
 sha1 = { version = "0.10", optional = true }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 # The startup update check (src/update_check.rs): one HTTPS request to
@@ -127,7 +138,7 @@ boxcar = "0.2"
 [features]
 tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:webpki"]
 # The builds with Lua use mimalloc (on Linux): see `mimalloc` below.
-lua = ["dep:mlua", "dep:sha1", "mimalloc"]
+lua = ["dep:mlua", "dep:mlua-sys", "dep:sha1", "mimalloc"]
 # `mimalloc`: mimalloc under the counting allocator, on Linux. Part of the
 # builds with Lua, and not of the default build.
 #
@@ -149,6 +160,9 @@ mach2 = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-uring = "0.5"
+# tokio-uring's own (same version): a `send` with `MSG_DONTWAIT`, which
+# tokio-uring's streams do not offer, is built as its `UnsubmittedOneshot`.
+io-uring = "0.6"
 # Behind the `mimalloc` feature: see there.
 mimalloc = { version = "0.1", default-features = false, optional = true }
 
@@ -156,6 +170,12 @@ mimalloc = { version = "0.1", default-features = false, optional = true }
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+[build-dependencies]
+# Compiles `csrc/lua51_str_format.c`, the patched lstrlib.c `str_format`
+# that is `string.format` in scripts (#771). Small and pure-Rust; the
+# build script does nothing on a build without the `lua` feature.
+cc = "1"
 
 [dev-dependencies]
 tempfile = "3"

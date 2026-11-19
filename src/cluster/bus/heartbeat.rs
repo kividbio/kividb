@@ -16,6 +16,7 @@ use crate::cluster::ClusterState;
 use crate::cluster::bus::BusMessage;
 use crate::cluster::bus::dialer;
 use crate::cluster::node::{NodeFlags, NodeId, node_id_str};
+use crate::cpus::BuilderExt as _;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -104,7 +105,7 @@ const BUS_STALL_WARN: Duration = Duration::from_secs(10);
 pub(crate) fn spawn_bus_watchdog() {
     let spawned = std::thread::Builder::new()
         .name("kividb-bus-watch".into())
-        .spawn(|| {
+        .spawn_released(|| {
             let mut stalled = false;
             loop {
                 std::thread::sleep(Duration::from_secs(1));
@@ -256,6 +257,12 @@ async fn check_election(
         None => return,
     };
 
+    // Elected before a restart that lost the save of the promotion: the
+    // masters say so, and it is completed.
+    if complete_unsaved_promotion(state, repl_state).await {
+        return;
+    }
+
     // Is our master FAIL'd?
     let master_failed = {
         let nodes = state.nodes.read();
@@ -393,7 +400,7 @@ async fn check_election(
                     election.votes_received.len(),
                     quorum
                 );
-                promote(state, repl_state, master_id, election.epoch).await;
+                promote(state, repl_state, master_id, election.epoch, None).await;
                 return;
             }
             // Election timeout: 10 seconds. After that, abandon and re-start
@@ -417,6 +424,86 @@ async fn check_election(
 /// When a too-stale replica last said it would not stand (logged at most
 /// every 10 s; the check runs every 100 ms).
 static LAST_STALE_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// When this replica last said why it does not complete a promotion the
+/// masters hold it to (logged at most every 10 s).
+static LAST_NOT_COMPLETED_LOG_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Complete the promotion of this node, a replica, if a quorum of the
+/// masters holds it as the owner of its master's slots at a newer config
+/// epoch than any it knows for them (`ClusterState::promotion_to_complete`
+/// has the rule, and why it cannot make two owners). That is a node elected,
+/// its promotion announced, and stopped before it was saved, then started
+/// again from the nodes.conf of before. It is promoted as an election won at
+/// that epoch would promote it ([`promote`]): saved before it is announced,
+/// waiting at most `PROMOTION_SAVE_WAIT`; a save that fails or takes longer
+/// leaves the promotion in memory, serving, and saved again every second.
+/// Stopped again before a save is done, it does the same once restarted:
+/// the masters still hold it as the owner. True if it was promoted.
+async fn complete_unsaved_promotion(
+    state: &Arc<ClusterState>,
+    repl_state: &Arc<crate::replication::ReplState>,
+) -> bool {
+    let full_sync_unfinished = repl_state.full_sync_unfinished.load(Ordering::SeqCst);
+    match state.promotion_to_complete(full_sync_unfinished) {
+        crate::cluster::UnsavedPromotion::None => false,
+        crate::cluster::UnsavedPromotion::NotCompleted(why) => {
+            let now = now_ms_local();
+            if now.saturating_sub(LAST_NOT_COMPLETED_LOG_MS.swap(now, Ordering::Relaxed)) >= 10_000
+            {
+                // Seen for a moment in an ordinary failover too: the old
+                // master, a replica now, heard before the others did.
+                log_info!(
+                    "Cluster: Not taking over the slots the masters hold this node as the owner of: {why}"
+                );
+            }
+            false
+        }
+        crate::cluster::UnsavedPromotion::Complete {
+            master,
+            epoch,
+            slots,
+        } => {
+            log_warn!(
+                "Cluster: A majority of the masters hold this node as the owner of the slots of {} \
+                 at config epoch {epoch}, newer than any it knows for them: it was promoted, and \
+                 restarted before the promotion was saved. Completing the promotion",
+                node_id_str(&master)
+            );
+            test_hold("promotion-completing").await;
+            // A full sync loaded since the start: the dataset is a master's
+            // copy, not what was loaded then.
+            if repl_state.full_syncs_completed.load(Ordering::SeqCst) > 0 {
+                state.trust_dataset();
+            }
+            state.observe_epoch(epoch);
+            state.forget_held_as_owner();
+            promote(state, repl_state, master, epoch, Some(&slots)).await
+        }
+    }
+}
+
+/// For the tests of what comes in between two steps of the bus, and never
+/// set otherwise: a step named in `KIVIDB_TEST_FAILPOINTS` (as for
+/// `aof::failpoint`) creates `failpoint.<name>.<n>` in the data directory
+/// and waits, without holding up the bus, while the file is there: the bus
+/// takes in and answers what comes meanwhile.
+async fn test_hold(name: &'static str) {
+    if !crate::aof::injected(name) {
+        return;
+    }
+    static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let hit = HITS.fetch_add(1, Ordering::Relaxed) + 1;
+    let path = format!("failpoint.{name}.{hit}");
+    if std::fs::write(&path, b"").is_err() {
+        return;
+    }
+    log_warn!("Test failpoint {path} reached — waiting for it to be removed");
+    while std::path::Path::new(&path).exists() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
 
 /// Why this replica may not stand for election, if it may not; see
 /// [`stand_refusal`].
@@ -551,13 +638,41 @@ async fn replica_rank(
 
 /// Take over from `old_master` at `epoch`: claim its slots, switch role in
 /// both the cluster view and the replication layer, and tell everyone at once.
+///
+/// `completing`: a promotion completed after a restart
+/// ([`ClusterState::promotion_to_complete`]), of those slot ranges, taken
+/// only if this node still follows `old_master` and it still owns them
+/// ([`ClusterState::complete_promotion_self`]), and fenced, before any
+/// write is taken, if the node's dataset at startup was not known to be all
+/// it had (`ClusterState::fence_completion`, under the same locks as the
+/// slots are taken). False if nothing was taken.
+///
+/// Between the slots taken and the replication layer made master, the node
+/// owns them in its own view but is still a replica to the replication
+/// layer: a write routed to it then is refused (`READONLY`).
 async fn promote(
     state: &Arc<ClusterState>,
     repl_state: &Arc<crate::replication::ReplState>,
     old_master: NodeId,
     epoch: u64,
-) {
-    let claimed = state.promote_self(old_master, epoch);
+    completing: Option<&[(u16, u16)]>,
+) -> bool {
+    let claimed = match completing {
+        None => {
+            test_hold("promotion-claiming").await;
+            state.promote_self(old_master, epoch)
+        }
+        Some(ranges) => match state.complete_promotion_self(old_master, epoch, ranges) {
+            Ok(claimed) => {
+                test_hold("promotion-taken").await;
+                claimed
+            }
+            Err(why) => {
+                log_warn!("Cluster: The promotion is not completed: {why}");
+                return false;
+            }
+        },
+    };
     // Flip our INFO replication role too — the cluster sees us as master,
     // repl_state needs to agree.
     repl_state.become_master();
@@ -565,10 +680,16 @@ async fn promote(
     // this node was a replica still to the replication layer.
     state.drop_slots_lost_while_promoting(&claimed);
     state.end_election();
+    // On disk before it is announced, unless the save takes longer than
+    // `PROMOTION_SAVE_WAIT` or fails: then it is announced all the same,
+    // and saved in the background (see `ClusterState::save_promotion`).
+    let saving = Arc::clone(state);
+    let _ = crate::cpus::spawn_blocking(move || saving.save_promotion()).await;
     // Announce the new ownership now rather than on the next heartbeat tick:
     // until the others hear it they keep redirecting clients to the old
     // master, and its other replicas keep following a node that is gone.
     send_one_round(state).await;
+    true
 }
 
 /// Broadcast a FailoverAuthRequest to every known master.
@@ -623,10 +744,14 @@ pub(crate) async fn broadcast_auth_request(
         let state = Arc::clone(state);
         tokio::spawn(async move {
             let addr = format!("{ip}:{bus_port}");
-            // A master saves its vote, synced, before it answers: on a busy
-            // disk that took longer than the two seconds this used to wait,
-            // and the vote was lost though it had been given.
-            let wait = Duration::from_millis(state.node_timeout_ms.max(2_000));
+            // A master saves its vote, synced, before it answers, which on a
+            // busy or slow disk takes seconds. The candidate waits for votes
+            // for the life of the election, so a vote saved slowly still
+            // counts; one that comes sooner counts as soon as it comes.
+            // Redis waits `max(2 x node timeout, 2 s)`.
+            let wait = crate::cluster::ELECTION_LIFETIME.max(Duration::from_millis(
+                state.node_timeout_ms.saturating_mul(2).max(2_000),
+            ));
             match dialer::exchange(&state, &addr, &msg, wait).await {
                 Ok(Some(BusMessage::FailoverAuthAck {
                     sender_id,
@@ -756,7 +881,7 @@ pub(crate) async fn answer_mfstart(
     // Let writes that were already in the gate finish and queue. One that is
     // past the pause check but not yet in the gate waits for the failover
     // there, and is redirected (`pause::HANDOFF`).
-    let _ = tokio::task::spawn_blocking(|| drop(crate::write_gate::cut())).await;
+    let _ = crate::cpus::spawn_blocking(|| drop(crate::write_gate::cut())).await;
     let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
     if starter
         .hub_tx

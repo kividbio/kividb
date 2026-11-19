@@ -674,6 +674,16 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 "0"
             }),
         );
+        // Vectors written and not linked into the graph yet (searches find
+        // them all the same): see `vector::backlog`.
+        put(
+            "hnsw_backlog",
+            resp_bulk_str(&first.backlog.len().to_string()),
+        );
+        put(
+            "hnsw_backlog_bytes",
+            resp_bulk_str(&first.backlog.bytes().to_string()),
+        );
         put(
             "hnsw_indexes",
             resp_array(
@@ -695,6 +705,8 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                             } else {
                                 "0"
                             }),
+                            resp_bulk_str("backlog"),
+                            resp_bulk_str(&graph.backlog.len().to_string()),
                         ])
                     })
                     .collect(),
@@ -1336,13 +1348,37 @@ pub(crate) fn filter_each(
     timed_out
 }
 
-/// Whether `key` holds a document of the kind the index covers now.
-fn holds_document(db: &Db, def: &IndexDef, key: &str) -> bool {
+/// Whether a nearest-neighbour search leaves out its hit at `key`: the key
+/// holds no document of the kind the index covers now (it was deleted or
+/// written over, and its vector is still in the index until the write lets
+/// go of its shard), or the query is not to see the document's `field`
+/// ([`field_hidden`]). One read of the shard, let go before the hash is
+/// read.
+pub(crate) fn hit_left_out(
+    db: &Db,
+    on: &crate::vector::IndexOn,
+    key: &str,
+    field: &str,
+    now: &crate::types::QueryClock,
+) -> bool {
     let key = crate::key_bytes::bytes_of(key);
-    crate::store::get_shard(db, &*key)
-        .read()
-        .get(&*key)
-        .is_some_and(|value| crate::vector::is_document(&def.on, value))
+    let hash = {
+        let shard = crate::store::get_shard(db, &*key).read();
+        let Some(value) = shard.get(&*key) else {
+            return true;
+        };
+        if !crate::vector::is_document(on, value) {
+            return true;
+        }
+        if !crate::field_expiry::any_watched() {
+            return false;
+        }
+        match value {
+            ValueRef::HashEx(hash) => std::sync::Arc::clone(hash),
+            _ => return false,
+        }
+    };
+    hash.read().hides(field, now.get())
 }
 
 /// Whether a query is not to see `field` of the document at `key`: a hash
@@ -2293,10 +2329,22 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 .get(&knn.field)
                 .ok_or_else(|| "The vector field has no index".to_string())?;
             let nearest = if matches!(filter, Filter::MatchAll) && args.inkeys.is_none() {
-                // The nearest `k` whose vector field the query sees: one
-                // past its deadline is left out, and more are asked for.
-                let nearest_of = |k: usize| {
-                    crate::commands::vector::nearest_shown(db, &knn.field, k, now, |k| match live {
+                // The nearest `k` documents whose vector field the query
+                // sees. A document leaves its indexes once its shard is let
+                // go of, so one just deleted or written over can still be
+                // among the nearest; it is left out as one past its
+                // deadline is, and more are asked for in its place.
+                let (nearest, cut) = crate::commands::vector::nearest_shown(
+                    db,
+                    &def.on,
+                    &knn.field,
+                    knn.k,
+                    now,
+                    deadline,
+                    live,
+                    &knn.vector,
+                    metric,
+                    |k| match live {
                         LiveIndex::Flat(index) => {
                             crate::vector::knn_flat(index, &knn.vector, k, metric)
                         }
@@ -2310,28 +2358,10 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                             });
                             crate::vector::knn_hnsw(graph, &knn.vector, k, ef, metric)
                         }
-                    })
-                };
-                // A document leaves its indexes once its shard is let go
-                // of, so one just deleted or written over can still be
-                // among the nearest. It is left out, and as many more are
-                // asked for as were left out.
-                let mut live_ones = Vec::new();
-                let mut more = 0;
-                for _ in 0..4 {
-                    let found = nearest_of(knn.k + more);
-                    let asked = knn.k + more;
-                    let had = found.len();
-                    live_ones = found;
-                    live_ones.retain(|hit| holds_document(db, &def, &hit.key));
-                    let gone = had - live_ones.len();
-                    if gone == 0 || live_ones.len() >= knn.k || had < asked {
-                        break;
-                    }
-                    more = gone;
-                }
-                live_ones.truncate(knn.k);
-                live_ones
+                    },
+                );
+                timed_out = cut;
+                nearest
             } else if let Some((nearest, cut)) = crate::commands::vector::knn_planned(
                 ctx,
                 &def,

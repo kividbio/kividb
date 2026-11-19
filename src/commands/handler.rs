@@ -430,7 +430,7 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
             crate::commands::lua::script_settle_slot(slot);
             None
         }
-        crate::cluster::routing::RouteDecision::TryAgain => decision.refusal(),
+        crate::cluster::routing::RouteDecision::TryAgain => decision.refusal(false),
         crate::cluster::routing::RouteDecision::Passthrough => None,
         _ => Some(resp_error(
             "ERR Script attempted to access a non local key in a cluster node",
@@ -476,11 +476,30 @@ fn writes_several_keys(name: &str, cmd: &[&[u8]]) -> bool {
 /// while the AOF is replayed, where nothing else runs.
 #[inline(always)]
 fn takes_the_gate_alone(name: &str, cmd: &[&[u8]], script_alone: bool, gated: bool) -> bool {
+    gate_alone_rule(name, cmd, script_alone, gated, true)
+}
+
+/// [`takes_the_gate_alone`], with or without its look at the commands that
+/// read keys they do not name (`readers`): `gate_alone_or_walk` asks the
+/// rest of it alone.
+#[inline(always)]
+fn gate_alone_rule(
+    name: &str,
+    cmd: &[&[u8]],
+    script_alone: bool,
+    gated: bool,
+    readers: bool,
+) -> bool {
     script_alone
         || (gated
             && matches!(name, "FLUSHALL" | "FLUSHDB" | "SWAPDB")
             && !crate::expiry::replaying())
-        || (crate::tag_locks::enabled() && crate::tag_locks::sees_the_whole_keyspace(name))
+        // A command that reads or changes keys it does not name, with tag
+        // locks on: alone, or, with Lua, the readers beside every command but
+        // the scripts that run beside others (`gate_alone_or_walk`, #772).
+        || (readers
+            && crate::tag_locks::enabled()
+            && crate::tag_locks::reads_keys_it_does_not_name(name))
         || crate::tag_locks::is_switch(name, cmd)
         // One argument is at most one key (`DEL k`, `INCR k`): asked here,
         // and the rest out of line, so that what every command runs through
@@ -670,6 +689,32 @@ fn sort_pattern_outside_the_tag(name: &str, cmd: &[&[u8]]) -> Option<String> {
     ))
 }
 
+/// For a command a script held to its tags calls, of those that read or
+/// change keys they do not name (`tag_locks::reads_keys_it_does_not_name`):
+/// whether it is refused (see `run_from_script`). Those of
+/// `sees_the_whole_keyspace` always; the others when the script runs beside
+/// others. `SORT` by a pattern is asked of `sort_pattern_outside_the_tag`:
+/// one within the script's own tag reads keys only it holds. Out of line:
+/// most commands a script calls are none of these.
+#[cold]
+#[inline(never)]
+fn refused_for_unnamed_keys(name: &str, cmd: &[&[u8]]) -> bool {
+    if crate::tag_locks::sees_the_whole_keyspace(name) {
+        return true;
+    }
+    #[cfg(feature = "lua")]
+    {
+        crate::tag_locks::beside_others()
+            && (crate::tag_locks::walks(name, cmd)
+                || crate::tag_locks::changes_keys_it_does_not_name(name, cmd))
+    }
+    #[cfg(not(feature = "lua"))]
+    {
+        let _ = cmd;
+        false
+    }
+}
+
 fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // Re-derive cmd0/name from ctx.cmd in case parts were modified (XREAD BLOCK stripping).
     let cmd0 = ctx.cmd[0];
@@ -696,8 +741,16 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     }
 
     // A script held to the tags of its KEYS keeps to them (`tag_locks`).
+    // One that runs beside others does not call what reads or changes keys
+    // it does not name either (`INFO keyspace`, `FT.SEARCH`, `TS.MGET`, ...):
+    // such a command, sent by a client, keeps out the scripts running beside
+    // others while it runs (`tag_locks::walk`), or waits for every script;
+    // called from one of them, it could do neither. A script that runs
+    // alone has the server to itself, and may.
     if crate::tag_locks::in_script() {
-        let outside = if crate::tag_locks::sees_the_whole_keyspace(name2) {
+        let outside = if crate::tag_locks::reads_keys_it_does_not_name(name2)
+            && refused_for_unnamed_keys(name2, &ctx.cmd)
+        {
             Some(format!(
                 "ERR Script attempted to run '{}', which looks at keys it does not name, while \
                  running under the {} of its KEYS (lua-parallel-scripts)",
@@ -740,7 +793,24 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
                 crate::tag_locks::script_tags_for_message()
             ));
         }
+        // Nor may it `MIGRATE` (#340). A `MIGRATE` holds back writes to the
+        // keys it moves until they have gone (`cluster::hold_while_moving`),
+        // and the hold enters the write gate and takes the keys' order,
+        // which a script beside others holds already, under its tags' locks:
+        // taken there, it would be the other way round from every writer.
+        // So such a script is refused. A script that runs alone holds
+        // every other command back, and keeps its hold.
+        if name2 == "MIGRATE" && crate::tag_locks::beside_others() {
+            return resp_error(&format!(
+                "ERR Script attempted to run 'migrate' while running beside other scripts \
+                 under the {} of its KEYS (lua-parallel-scripts)",
+                crate::tag_locks::script_tags_for_message()
+            ));
+        }
     }
+
+    #[cfg(debug_assertions)]
+    crate::pause::test_stall_in_script(ctx.cmd.as_slice());
 
     if read_only_script && replication::inner_command_blocked_in_readonly_script(name2, &ctx.cmd) {
         return resp_error("ERR Write commands are not allowed from read-only scripts.");
@@ -776,9 +846,32 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     #[cfg(not(feature = "lua"))]
     let skip_mem = false;
 
+    // Whether the command writes, judged by its name and arguments, which it
+    // does not change: asked once here, it was asked five times a command
+    // (#901). A command that writes only with some arguments (GEORADIUS ...
+    // STORE, MIGRATE, ...) counts as a write (`command_mutates_for_replication`).
+    let inner_write = replication::command_mutates_for_replication(name2, ctx.cmd.as_slice());
+    // A `SELECT` is an inner write but changes no data (`writes_the_dataset`).
+    #[cfg_attr(not(feature = "lua"), allow(unused_variables))]
+    let writes_data = inner_write && replication::writes_the_dataset(name2, ctx.cmd.as_slice());
+
+    // Room for a command that allocates as much as its arguments say, as
+    // for one from a client, where that can be made (`room_in_script`):
+    // before the refusal of a write over the limit, which it may make room
+    // for.
+    if inner_write
+        && !repl_is_slave
+        && !ctx.apply_replication
+        && !skip_mem
+        && crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed) != 0
+        && let Some(refusal) = room_in_script(ctx, name2)
+    {
+        return refusal;
+    }
+
     if !repl_is_slave
         && check_memory_limit()
-        && replication::command_mutates_for_replication(name2, ctx.cmd.as_slice())
+        && inner_write
         && !crate::eviction::allowed_when_out_of_memory(name2)
         && !skip_mem
     {
@@ -832,7 +925,7 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     let started = std::time::Instant::now();
     // A write takes the keys it names that are past their time as gone,
     // and they go first, as from a client (`expire_named_keys_first`).
-    if replication::command_mutates_for_replication(name2, ctx.cmd.as_slice()) {
+    if inner_write {
         expire_named_keys_first(ctx, name2, None);
     }
     // What the command records of its effects is read below whether or not
@@ -847,16 +940,12 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // A command that writes only with some arguments (GEORADIUS ... STORE,
     // MIGRATE, ...) must count as a write here too, or a key it emptied is
     // not swept, a client blocked on a key it wrote is not woken, and a
-    // client tracking that key is not told. Judged by the arguments, as the
-    // propagation below judges it (`command_mutates_for_replication`).
-    let inner_write = replication::command_mutates_for_replication(name2, ctx.cmd.as_slice());
-    // A `SELECT` is an inner write but changes no data (`writes_the_dataset`):
-    // a script that has only selected a database can still be killed (#424).
+    // client tracking that key is not told (`inner_write`, judged by the
+    // arguments, as the propagation below judges it). A `SELECT` changes no
+    // data: a script that has only selected a database can still be killed
+    // (#424).
     #[cfg(feature = "lua")]
-    if !result.starts_with(b"-")
-        && inner_write
-        && replication::writes_the_dataset(name2, ctx.cmd.as_slice())
-    {
+    if !result.starts_with(b"-") && writes_data {
         crate::commands::lua::script_note_successful_write();
     }
 
@@ -889,23 +978,33 @@ fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
         // Not a `SELECT`: a write carries the one it needs, from the database
         // it ran in, and a script that only selected one sent nothing in
         // Redis, whose offset it must not move (#705).
-        && replication::writes_the_dataset(name2, ctx.cmd.as_slice())
+        && writes_data
     {
-        let feeds = replication::script_feed::commands_for_propagation(
-            ctx,
-            name2,
-            ctx.cmd.as_slice(),
-            &result,
-        );
         // Same guard as `apply_write_side_effects`. `record_rdb_change` still runs
         // per feed regardless — it tracks dirty-key count for RDB save, which is
         // independent of whether anything consumes the replication stream.
-        let observed = replication::write_is_observed(ctx);
-        for parts in feeds {
-            if observed {
+        // With nothing to read them, the feeds are only counted, not built.
+        if replication::write_is_observed(ctx) {
+            let feeds = replication::script_feed::commands_for_propagation(
+                ctx,
+                name2,
+                ctx.cmd.as_slice(),
+                &result,
+            );
+            for parts in feeds {
                 replication::replicate_one_write(ctx, &parts);
+                crate::stats::record_rdb_change();
             }
-            crate::stats::record_rdb_change();
+        } else {
+            let feeds = replication::script_feed::propagation_count(
+                ctx,
+                name2,
+                ctx.cmd.as_slice(),
+                &result,
+            );
+            for _ in 0..feeds {
+                crate::stats::record_rdb_change();
+            }
         }
         // A write made from a script dirties a WATCH like any other write,
         // on the keys it changed.
@@ -1196,7 +1295,7 @@ fn routed_again_in_gate(
         || registry.get_readonly(client_id),
         |key| crate::read_lock!(crate::store::get_shard(&store[db], key)).contains_key(key),
     )
-    .refusal()
+    .refusal(ctx.peer_ipv6)
 }
 
 // The parts of `run_command` that a plain command on a standalone master
@@ -1260,7 +1359,7 @@ fn route_on_arrival(
                 info.asking = false;
             });
         }
-        if let Some(refusal) = decision.refusal() {
+        if let Some(refusal) = decision.refusal(ctx.peer_ipv6) {
             return Some(refusal);
         }
         crate::cluster::routing::stall_for_test(name, ctx.cmd.as_slice());
@@ -1387,7 +1486,7 @@ fn checked_in_gate(
                             .contains_key(key)
                 },
             );
-            if let Some(refusal) = decision.refusal() {
+            if let Some(refusal) = decision.refusal(ctx.peer_ipv6) {
                 return Some(refusal);
             }
         }
@@ -1432,13 +1531,256 @@ fn make_room_or_refuse(ctx: &mut Ctx, in_order: bool, needs_room: bool) -> Optio
     None
 }
 
+/// For a command from a client that allocates as much as its arguments say
+/// (`sketch::room`), where the arity check's cold path finds it
+/// (`arity::check_dispatch`), before anything else in `run_command`: room
+/// made for it ([`room_before_dispatch`]), or its refusal, unless something
+/// before the gates refuses it. That is asked first, by the checks
+/// `run_command` makes after this, and nothing is made or evicted for a
+/// command they refuse: routing (`MOVED`, `ASK`, ...), `BUSY`, `NOREPLICAS`,
+/// `LOADING`, the ACL. (A replica's client, a master's stream and the AOF
+/// are not held to `maxmemory`.) Checked here rather than where
+/// `run_command` checks them so that the common path pays as little as it
+/// can for it. Measured (instructions per GET and SET, `scripts/perf`): a
+/// flag carried down to there cost some ten; leaving the common path for
+/// good, as a refusal does (a path of its own around the rest, or
+/// `run_command` again from here), fifteen to twenty-five; this, room
+/// made here and the common path taken up again, three to six.
+/// Something that changes between the two (a slot moving, a script
+/// starting) only means room made for a command then refused, or refused
+/// `OOM` when it runs without the room.
+#[cold]
+#[inline(never)]
+fn room_on_arrival(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
+    if crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed) == 0
+        || ctx.apply_replication
+        || ctx.repl_state.is_slave()
+        || refused_before_the_gates(ctx, name)
+    {
+        return None;
+    }
+    room_before_dispatch(ctx, name)
+}
+
+/// Whether `run_command` refuses the command before its gates, by the
+/// checks it makes there (for a master's client; see [`room_on_arrival`]).
+/// Asks only: `ASKING` is left for the routing to take.
+fn refused_before_the_gates(ctx: &Ctx, name: &str) -> bool {
+    if ctx.cluster.enabled
+        && !ctx.bypass_cluster_check
+        && !crate::command_gate::alone_on_this_thread()
+    {
+        let asking = ctx.client_registry.get_asking(ctx.client_id);
+        let (store, db) = (ctx.store, *ctx.selected_db);
+        let (registry, client_id) = (ctx.client_registry, ctx.client_id);
+        let decision = crate::cluster::routing::route_named(
+            name,
+            ctx.cmd.as_slice(),
+            ctx.cluster,
+            asking,
+            || registry.get_readonly(client_id),
+            |key: &[u8]| {
+                crate::read_lock!(crate::store::get_shard(&store[db], key)).contains_key(key)
+            },
+        );
+        if decision.refusal(ctx.peer_ipv6).is_some() {
+            return true;
+        }
+    }
+    #[cfg(feature = "lua")]
+    if crate::commands::lua::lua_server_busy_for_command(ctx.cmd.as_slice()) {
+        return true;
+    }
+    if ctx.repl_state.min_replicas_to_write.load(Ordering::Relaxed) != 0
+        && refused_without_replicas(ctx, name)
+    {
+        return true;
+    }
+    if crate::vector::SNAPSHOT_INDEX_REBUILD.load(Ordering::Relaxed) && refused_while_loading(name)
+    {
+        return true;
+    }
+    (crate::acl::RESTRICTED_CMD_CLIENTS.load(Ordering::Relaxed) > 0
+        || crate::acl::RESTRICTED_KEY_CLIENTS.load(Ordering::Relaxed) > 0)
+        && ctx
+            .acl_store
+            .read()
+            .get(ctx.authenticated_user)
+            .is_some_and(|user| {
+                crate::acl::check_permission(user, name, ctx.cmd.as_slice()).is_err()
+            })
+}
+
+/// For a command that allocates as much as its arguments say (`sketch::room`),
+/// under `maxmemory`, once nothing before the gates refuses it (routing,
+/// `BUSY`, `READONLY`, `NOREPLICAS`, `LOADING`, the ACL): room made for what
+/// it wants before it takes its keys' order ([`make_room_in_steps`]), or its
+/// refusal. Not for a command
+/// that is not held to `maxmemory` (on a replica, from a master or the
+/// AOF), nor while writes are paused. A command its handler refuses before
+/// its allocation (its arguments, its key's type, the per-command limit)
+/// wants nothing, and nothing is evicted for it.
+#[cold]
+#[inline(never)]
+fn room_before_dispatch(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
+    let limit = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
+    if limit == 0
+        || ctx.apply_replication
+        || ctx.repl_state.is_slave()
+        || crate::pause::expiry_deferred()
+    {
+        return None;
+    }
+    let wanted = match crate::sketch::room::wanted(ctx, name) {
+        Ok(wanted) => wanted,
+        Err(refusal) => return Some(refusal),
+    };
+    if wanted == 0 {
+        return None;
+    }
+    // With what the command allocates besides on its way to its check
+    // (its reply, a copy of its arguments, a decoded payload's pieces): its
+    // check looks again, and must find the room still there.
+    let wanted = wanted.saturating_add(ROOM_SLACK);
+    if crate::sketch::room_for(wanted) {
+        return None;
+    }
+    // More than evicting every key could free (what the server held before
+    // it had any, `used_memory_startup`, is never freed): refused at once,
+    // rather than after emptying the keyspace for nothing.
+    let wanted_usize = usize::try_from(wanted).unwrap_or(usize::MAX);
+    if wanted_usize > limit.saturating_sub(crate::commands::memory::startup_used()) {
+        return Some(sketch_oom());
+    }
+    make_room_in_steps(ctx, wanted_usize)
+}
+
+/// Room made for a command beyond what it says it allocates
+/// ([`room_before_dispatch`]).
+const ROOM_SLACK: u64 = 128 << 10;
+
+/// What eviction for one command frees at most in one hold of the gates
+/// ([`make_room_in_steps`]): some tens of thousands of small keys, a few
+/// milliseconds.
+const EVICTION_STEP: usize = 4 << 20;
+
+/// Evict until memory use is down to `target`, for a command that wants
+/// `wanted` bytes: a step of [`EVICTION_STEP`] bytes at a time, each in the
+/// gates in which every command's room is made (see `make_room_or_refuse`),
+/// let go between steps. One command that wants a 1 GiB filter evicts all
+/// it needs, but a cut (a full sync, a snapshot), a script, a transaction
+/// or a flush waits for no more than one step of it; inside a script or a
+/// transaction, which hold the gates already, it holds them throughout, as
+/// they do. It stops, refused, after twice the steps its size takes (and a
+/// few more), should writes elsewhere fill memory as fast as it frees it.
+///
+/// What it was asked under is looked at again in each step, in the gates:
+/// writes paused meanwhile (`CLIENT PAUSE`, a failover, a slot handoff),
+/// this node become a replica, or `maxmemory` changed. Paused or a replica,
+/// it stops, room made or not, and the command goes on to what it meets
+/// then (held by the pause, `READONLY`): dispatched again after a pause, it
+/// is sized again from the start. The limit, and the target with it, are
+/// the limit of the moment; none, it stops.
+fn make_room_in_steps(ctx: &mut Ctx, wanted: usize) -> Option<Vec<u8>> {
+    #[cfg(feature = "lua")]
+    let overrun = crate::commands::lua::running_script_is_over_its_time_limit;
+    #[cfg(not(feature = "lua"))]
+    let overrun = || false;
+    let steps = (wanted / EVICTION_STEP).saturating_mul(2).saturating_add(8);
+    for step in 0..steps {
+        #[cfg(debug_assertions)]
+        if step > 0 {
+            stall_between_steps_for_test();
+        }
+        let _ = step;
+        let _gate =
+            crate::command_gate::enter_unless(std::time::Duration::from_millis(10), overrun)?;
+        let _evicting = crate::write_gate::enter();
+        let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed);
+        if limit == 0 || ctx.repl_state.is_slave() || crate::pause::expiry_deferred() {
+            return None;
+        }
+        let Some(target) = limit.checked_sub(wanted) else {
+            return Some(sketch_oom());
+        };
+        let used = crate::memory_use::counted();
+        if used <= target {
+            return None;
+        }
+        if !crate::eviction::make_room(ctx, target.max(used.saturating_sub(EVICTION_STEP)), true) {
+            return Some(sketch_oom());
+        }
+    }
+    let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed);
+    (limit != 0 && crate::memory_use::counted().saturating_add(wanted) > limit).then(sketch_oom)
+}
+
+/// `KIVIDB_TEST_FAILPOINTS` names `sketch-room-step-stall` (debug builds):
+/// a pause of 300 ms between two steps of [`make_room_in_steps`], out of
+/// the gates, for a test to change what it was asked under meanwhile.
+#[cfg(debug_assertions)]
+fn stall_between_steps_for_test() {
+    static STALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *STALL.get_or_init(|| crate::aof::injected("sketch-room-step-stall")) {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
+/// The `OOM` refusal of a command there is no room for.
+fn sketch_oom() -> Vec<u8> {
+    crate::tracking::with_what_came_before(resp_error(
+        "OOM command not allowed when used memory > 'maxmemory'.",
+    ))
+}
+
+/// For a command a script calls that allocates as much as its arguments
+/// say, under `maxmemory`: room made for it as for one from a client
+/// ([`room_before_dispatch`]), when the script runs alone (as it holds the
+/// gates, the eviction is a part of it, as in a transaction). Not for one
+/// that runs beside other scripts under its tags (`lua-parallel-scripts`):
+/// eviction would delete keys of theirs from under them. Such a command is
+/// refused with `OOM` if what it allocates does not fit. Nor for one that
+/// the script's checks after this refuse (too few replicas, the ACL), which
+/// are asked first, as they would answer.
+#[cold]
+#[inline(never)]
+fn room_in_script(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
+    if !crate::commands::arity::allocates(name) || crate::tag_locks::beside_others() {
+        return None;
+    }
+    #[cfg(feature = "lua")]
+    if crate::commands::lua::script_min_replicas_gate(ctx, ctx.cmd[0]).is_some() {
+        return None;
+    }
+    if (crate::acl::RESTRICTED_CMD_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) > 0
+        || crate::acl::RESTRICTED_KEY_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) > 0)
+        && ctx
+            .acl_store
+            .read()
+            .get(ctx.authenticated_user)
+            .is_some_and(|user| {
+                crate::acl::check_permission(user, name, ctx.cmd.as_slice()).is_err()
+            })
+    {
+        return None;
+    }
+    room_before_dispatch(ctx, name)
+}
+
 /// [`execute_command`], once the command's name is known; it started at
 /// `started`.
 fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8> {
     // The wrong number of arguments is refused before anything else looks
     // at the command, as in Redis. See `arity`.
-    if let Some(refusal) = crate::commands::arity::check(name, &ctx.cmd) {
-        return refusal;
+    if let Some(refusal) = crate::commands::arity::check_dispatch(name, &ctx.cmd) {
+        // Empty: a command that allocates as much as its arguments say,
+        // given room here if nothing below refuses it (`room_on_arrival`).
+        if !refusal.is_empty() {
+            return refusal;
+        }
+        if let Some(refusal) = room_on_arrival(ctx, name) {
+            return refusal;
+        }
     }
 
     // [`ReplState::is_slave`] is a relaxed atomic load — avoid `role()` here (it allocates).
@@ -1570,7 +1912,9 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     //
     // Nor is FT.DROPINDEX here: with `DD` it may delete millions of documents,
     // and it takes the gate, and the order of their keys, a few at a time
-    // itself (`vector::ft_dropindex`).
+    // itself (`vector::ft_dropindex`). With tag locks on, a `DD` takes the
+    // command gate alone (`gate_alone_or_walk`): it deletes keys whose tags
+    // it does not lock.
     let writes_operation = replication::command_mutates_for_replication(name, &ctx.cmd);
     let script = matches!(name, "EVAL" | "EVALSHA" | "FCALL");
     let gated = (writes_operation && name != "MIGRATE" && name != "FT.DROPINDEX") || script;
@@ -1641,8 +1985,9 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     } else {
         (None, false)
     };
-    // A command that looks at keys it does not name must not find a script
-    // part-way through: it waits for all of them (`takes_the_gate_alone`).
+    // A command that changes keys it does not name must not find a script
+    // part-way through: it waits for all of them (`takes_the_gate_alone`);
+    // one that only reads them keeps such scripts out while it runs, below.
     // On a thread that holds the gate already, what either takes of it is
     // nothing: the replica's applier holds it for each turn of its master's
     // stream, alone for a command that takes it alone
@@ -1652,6 +1997,29 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     if gated && !crate::write_gate::held_by_this_thread() {
         crate::pause::test_stall_before_the_gate(ctx.cmd.as_slice());
     }
+    //
+    // With Lua, a command that reads keys it does not name (`KEYS`, `SCAN`,
+    // `INFO`, `FT.SEARCH`, ...) holds the gate shared and keeps out the
+    // scripts that run beside others while it reads, and nothing else
+    // (`gate_alone_or_walk`, `tag_locks::walk`, #772): only it, and the
+    // commands that take the gate alone, come that way.
+    #[cfg(feature = "lua")]
+    let (_command_gate, _alone, _walk) = if crate::command_gate::skips(name, &ctx.cmd) {
+        (None, None, None)
+    } else if takes_the_gate_alone(name, &ctx.cmd, any_script && !beside_others, gated) {
+        let Some(gates) =
+            gate_alone_or_walk(name, &ctx.cmd, any_script && !beside_others, gated, SLICE)
+        else {
+            return busy_reply();
+        };
+        gates
+    } else {
+        let Some(gate) = crate::command_gate::enter_unless(SLICE, overrun) else {
+            return busy_reply();
+        };
+        (Some(gate), None, None)
+    };
+    #[cfg(not(feature = "lua"))]
     let gates = if crate::command_gate::skips(name, &ctx.cmd) {
         Some((None, None))
     } else if takes_the_gate_alone(name, &ctx.cmd, any_script && !beside_others, gated) {
@@ -1659,6 +2027,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     } else {
         crate::command_gate::enter_unless(SLICE, overrun).map(|gate| (Some(gate), None))
     };
+    #[cfg(not(feature = "lua"))]
     let Some((_command_gate, _alone)) = gates else {
         return busy_reply();
     };
@@ -1718,6 +2087,34 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             crate::tag_locks::hold_script_to(&tags)
         }
     });
+    //
+    // A tag a script holds is not waited for here, where the thread would
+    // wait with it and every other connection of the thread behind it: the
+    // command is sent back, and its connection waits for the script off the
+    // thread (#882).
+    #[cfg(feature = "lua")]
+    let _key_tags = if tag_locks
+        && !any_script
+        && !crate::command_gate::alone_on_this_thread()
+        && !crate::tag_locks::in_script()
+    {
+        // Nearly every command: none of its keys has a `{`, and nothing else
+        // is looked at (#889).
+        match crate::tag_locks::named_keys(name, &ctx.cmd) {
+            None => None,
+            Some(keys) => match lock_tags_found(ctx, keys) {
+                Ok(held) => held,
+                Err(busy) => {
+                    // Sent back: not run now.
+                    crate::commands::blocking::hold_for_tags(ctx, busy);
+                    return crate::pause::HELD_IN_GATE.to_vec();
+                }
+            },
+        }
+    } else {
+        None
+    };
+    #[cfg(not(feature = "lua"))]
     let _key_tags = if tag_locks
         && !any_script
         && !crate::command_gate::alone_on_this_thread()
@@ -1820,7 +2217,22 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     } else {
         (None, false)
     };
-    let result = match dispatch_command_handlers(ctx, name) {
+    // A script command is none of the handlers': each was asked, and every
+    // one of them said no, before it got to `lua::handle` (#901: 1,400
+    // instructions an `EVALSHA`). With Lua it goes there at once.
+    #[cfg(feature = "lua")]
+    let script = matches!(
+        name,
+        "EVALSHA" | "EVAL" | "EVALSHA_RO" | "EVAL_RO" | "FCALL" | "FCALL_RO"
+    );
+    #[cfg(not(feature = "lua"))]
+    let script = false;
+    let dispatched = if script {
+        None
+    } else {
+        dispatch_command_handlers(ctx, name)
+    };
+    let result = match dispatched {
         Some(result) => result,
         None => not_dispatched(ctx, name),
     };
@@ -1892,6 +2304,65 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     crate::tracking::with_what_came_before(result)
 }
 
+/// What a command holds of the command gate, shared or alone, and, for
+/// one that reads keys it does not name, of the walk locks
+/// (`tag_locks::walk`).
+#[cfg(feature = "lua")]
+type Gates = (
+    Option<crate::command_gate::Guard>,
+    Option<crate::command_gate::AloneGuard>,
+    Option<crate::tag_locks::Walk>,
+);
+
+/// The gates of a command [`takes_the_gate_alone`] says takes the gate
+/// alone. One that only reads keys it does not name, and that nothing else
+/// makes take it alone, takes the walk locks instead, before the command
+/// gate (as a script that runs beside others takes its own, before its
+/// command), and the gate shared: what it reads is found with no such script
+/// part-way through, and every other command runs beside it. Out of line:
+/// only the commands that take the gate alone come here.
+#[cfg(feature = "lua")]
+#[inline(never)]
+fn gate_alone_or_walk(
+    name: &str,
+    cmd: &[&[u8]],
+    script_alone: bool,
+    gated: bool,
+    slice: std::time::Duration,
+) -> Option<Gates> {
+    let overrun = crate::commands::lua::running_script_is_over_its_time_limit;
+    // What takes the gate alone whatever it reads: as before; and, with tag
+    // locks on, what deletes or makes keys it does not name
+    // (`FT.DROPINDEX … DD`, `DEBUG POPULATE`).
+    let alone = gate_alone_rule(name, cmd, script_alone, gated, false)
+        || (crate::tag_locks::enabled()
+            && crate::tag_locks::sees_the_whole_keyspace(name)
+            && !crate::tag_locks::walks(name, cmd))
+        || (crate::tag_locks::enabled()
+            && crate::tag_locks::changes_keys_it_does_not_name(name, cmd));
+    let walks = !alone
+        && crate::tag_locks::enabled()
+        && crate::tag_locks::reads_keys_it_does_not_name(name)
+        && !crate::command_gate::alone_on_this_thread()
+        && match name {
+            // By its patterns.
+            "SORT" | "SORT_RO" => crate::commands::generics::sort_reads_keys_it_does_not_name(cmd),
+            _ => crate::tag_locks::walks(name, cmd),
+        };
+    if !alone && !walks {
+        // A reader of keys it names after all (`MEMORY USAGE`, `CLUSTER
+        // NODES`, `SORT` by nothing): as any command.
+        return crate::command_gate::enter_unless(slice, overrun)
+            .map(|gate| (Some(gate), None, None));
+    }
+    if walks {
+        let walk = crate::tag_locks::walk();
+        return crate::command_gate::enter_unless(slice, overrun)
+            .map(|gate| (Some(gate), None, Some(walk)));
+    }
+    crate::command_gate::enter_alone_unless(slice, overrun).map(|alone| (None, Some(alone), None))
+}
+
 /// The command to the clients in `MONITOR`, unless it is resuming or is an
 /// administrative one. See `run_command`.
 #[cold]
@@ -1909,13 +2380,65 @@ fn feed_monitors(ctx: &Ctx, name: &str) {
 }
 
 /// With scripts locked by hash tag (`tag_locks`), for a client's command:
-/// the locks of the tags of the keys it names. Out of line: only with
-/// `tag_locks` on does a command come here. A command none of whose keys
-/// has a `{` takes nothing, and is told so without the general list of its
-/// keys (`tag_locks::named_keys`, #889).
+/// the locks of the tags of the keys it names. A build without Lua has no
+/// scripts that run beside others, and never comes here.
+#[cfg(not(feature = "lua"))]
 #[inline(never)]
 fn lock_tags_of_named_keys(ctx: &Ctx, name: &str) -> Option<crate::tag_locks::KeysGuard> {
     crate::tag_locks::lock_named_keys(name, &ctx.cmd)
+}
+
+/// With scripts locked by hash tag (`tag_locks`), for a client's command
+/// with a key that may carry a tag (`tag_locks::named_keys`): the locks of
+/// the tags of the keys it names. Out of line: only a command with a `{` in
+/// a key comes here.
+///
+/// `Err`: a script holds one of them, or is in line for it, and the
+/// command's connection can wait for it without its thread: it is to be
+/// sent back (`blocking::hold_for_tags`, #882), and not to run now. What cannot wait so waits on
+/// the locks, as before: the replica's applier and the AOF's replay (which
+/// never meet a script that runs beside others there: a script from the
+/// stream or the log runs alone, so what they can find holding a tag is a
+/// read-only script of a replica's client, for as long as it runs), a
+/// command of a connection's slow path, and the dispatch of a command whose
+/// client has gone, which only leaves the line it stood in. So does the
+/// dispatch that runs a command again after its connection waited holds the
+/// turns of the tags it waited for: no script holds those, and the others
+/// are tried as on the first dispatch; the turns go once the locks are held,
+/// or once it is sent back again, to wait for more of its tags
+/// (`tag_locks::try_lock_found_keys`).
+#[cfg(feature = "lua")]
+#[inline(never)]
+fn lock_tags_found(
+    ctx: &mut Ctx,
+    keys: crate::tag_locks::NamedKeys,
+) -> Result<Option<crate::tag_locks::KeysGuard>, crate::tag_locks::TagsBusy> {
+    let Some(slot) = ctx
+        .blocking
+        .as_deref_mut()
+        .filter(|slot| slot.awaitable && !(slot.gone && slot.resume.is_some()))
+    else {
+        return Ok(crate::tag_locks::lock_found_keys(keys, &ctx.cmd));
+    };
+    if let Some(turns) = slot.tag_turns.take() {
+        return lock_tags_holding_turns(&ctx.cmd, keys, turns);
+    }
+    crate::tag_locks::try_lock_found_keys(keys, &ctx.cmd, &[])
+}
+
+/// [`lock_tags_found`] for the dispatch that runs a command again after its
+/// connection waited for the turns of some of its tags.
+#[cfg(feature = "lua")]
+#[cold]
+#[inline(never)]
+fn lock_tags_holding_turns(
+    cmd: &[&[u8]],
+    keys: crate::tag_locks::NamedKeys,
+    turns: crate::tag_locks::TagTurns,
+) -> Result<Option<crate::tag_locks::KeysGuard>, crate::tag_locks::TagsBusy> {
+    let tried = crate::tag_locks::try_lock_found_keys(keys, cmd, turns.stripes());
+    drop(turns);
+    tried
 }
 
 /// The order of the keys a write names (see `write_order`), and where it
@@ -2606,6 +3129,18 @@ fn read_only_key_positions(cmd: &[&[u8]]) -> Vec<usize> {
     }
 }
 
+/// Whether the probabilistic-type write `name` that just failed had found
+/// its key (`BF.*`, `CF.*`, `CMS.*`, `TDIGEST.*`, `TOPK.*`).
+#[cold]
+#[inline(never)]
+fn sketch_write_touched(name: &str) -> bool {
+    (name.starts_with("BF.") && crate::commands::bf::take_touched())
+        || (name.starts_with("CF.") && crate::commands::cf::take_touched())
+        || (name.starts_with("CMS.") && crate::commands::cms::take_touched())
+        || (name.starts_with("TDIGEST.") && crate::commands::tdigest::take_touched())
+        || (name.starts_with("TOPK.") && crate::commands::topk::take_touched())
+}
+
 /// [`notify_watchers`] for a `BF.*` write that failed after finding its key,
 /// which is always `cmd[1]`. Kept apart and out of line so `notify_watchers`
 /// keeps its one call site in [`side_effects`], where it is inlined: a second
@@ -2645,6 +3180,12 @@ fn notify_failed_bf_write(ctx: &Ctx) {
 ///   is to change, the new value is made from them and put in their place
 ///   under the write lock only if they are still what is there, else made
 ///   again under it.
+/// * `CMS.INCRBY`: the sketch found under the shard's read lock, and
+///   checked and added to under one hold of its own write lock; two of
+///   them on a key run one before the other. Its additions commute (each
+///   counter is held at 2^32 − 1, the total wraps, and an item at the top
+///   is answered with an error but added to all the same), so the sketch
+///   ends as it would in either order.
 ///
 /// The hash commands only while no search index is defined: they bring the
 /// indexes up to date after the shard is let go of, and two of them beside
@@ -2665,7 +3206,9 @@ fn atomic_under_its_shard(ctx: &Ctx, name: &str) -> bool {
         | "SADD" | "ZADD" | "ZINCRBY" | "PFADD" => true,
         // Asked without the indexes' lock (#544): see `vector::Indexes`.
         "HSET" | "HMSET" | "HSETNX" | "HINCRBY" | "HINCRBYFLOAT" => ctx.index_store.none(),
-        _ => false,
+        // Apart from the names above, which the commands on the common path
+        // are among: a name more there moved their match.
+        _ => name == "CMS.INCRBY",
     }
 }
 
@@ -2957,6 +3500,15 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
     // is no client a later read waits for (#42). What it pushes (`BLMOVE`'s
     // destination) its handler wakes, and that is waited for.
     let quiet = waiters && pops_blocking(name);
+    // One that took nothing — its time ran out, or `CLIENT UNBLOCK` ended
+    // it — left its keys as they were. Woken by it, the client at the head
+    // of the line would leave its wait only to find nothing and wait again,
+    // and not be listed as blocked meanwhile: a `CLIENT UNBLOCK` sent for
+    // it then was answered 0, and it stayed blocked.
+    // `XREADGROUP` waits otherwise, and is not told.
+    if quiet && crate::commands::blocking::took_nothing() && name != "XREADGROUP" {
+        return;
+    }
     for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
         let key = ctx.cmd[pos];
         if may_be_empty && drop_if_empty(ctx, db, key) {
@@ -3033,11 +3585,15 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
             //
             // Kept behind `write_is_observed` so an instance with no replicas
             // and AOF off never pays for it. In the observed case the verbatim
-            // arm allocates exactly what the previous `ctx.cmd` clone did.
-            for parts in
-                replication::script_feed::commands_for_propagation(ctx, name, &ctx.cmd, result)
-            {
-                replication::replicate_one_write(ctx, &parts);
+            // arm allocates exactly what the previous `ctx.cmd` clone did,
+            // except for a write the hub alone reads that goes out as it came:
+            // encoded from `ctx.cmd` itself (`write_as_it_came`, #894).
+            if !replication::write_as_it_came(ctx, name, &ctx.cmd) {
+                for parts in
+                    replication::script_feed::commands_for_propagation(ctx, name, &ctx.cmd, result)
+                {
+                    replication::replicate_one_write(ctx, &parts);
+                }
             }
         }
 
@@ -3057,11 +3613,7 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
     // A `BF.*` write that failed once it had found its key (`BF.RESERVE` of
     // one there already, `BF.ADD` to a full filter) invalidates a `WATCH`
     // on it all the same, as Redis's do.
-    if writes_operation
-        && !is_mutating_ok_write
-        && name.starts_with("BF.")
-        && crate::commands::bf::take_touched()
-    {
+    if writes_operation && !is_mutating_ok_write && sketch_write_touched(name) {
         notify_failed_bf_write(ctx);
     }
 
@@ -3383,8 +3935,7 @@ mod replica_loading_gate_tests {
     fn run_as_slave(repl_state: &Arc<ReplState>, cmd: Vec<Vec<u8>>, apply_stream: bool) -> Vec<u8> {
         let store = crate::store::new_store(1);
         let lastsave = Arc::new(RwLock::new(0i64));
-        let (hub_tx, mut hub_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::replication::HubMsg>();
+        let (hub_tx, mut hub_rx) = crate::replication::HubTx::channel();
         tokio::spawn(async move { while hub_rx.recv().await.is_some() {} });
 
         let config = Arc::new(Config::default_replica());
@@ -3437,6 +3988,7 @@ mod replica_loading_gate_tests {
             apply_replication: apply_stream,
             skip_write_side_effects: false,
             peer_addr: peer.as_str(),
+            peer_ipv6: crate::cluster::is_ipv6_peer(peer.as_str()),
             monitor_registry: &monitor_registry,
             authenticated_user: "default",
             tracking_table: &tracking_table,

@@ -196,6 +196,9 @@ impl Final<'_> {
         use crate::replication as repl;
         let (nosave, now) = (m & mode::NOSAVE != 0, m & mode::NOW != 0);
         RUNNING.store(true, Ordering::SeqCst);
+        // First, before anything that can take long: a node stopped with a
+        // grace period is killed at its end.
+        crate::cluster::save_at_shutdown();
         // `SHUTDOWN NOSAVE` while a script runs past its time limit: it is
         // the way to stop that script, and the wait below for the writes in
         // flight would be for the script to end, which it may never do.

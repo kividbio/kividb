@@ -16,6 +16,7 @@
 //! subscriptions left, when it is an ordinary connection again.
 
 use crate::client_registry::{Activity, ClientRegistry};
+use crate::cpus::BuilderExt as _;
 use crate::output_limits::{Class, Limits, OutputLimits};
 use ahash::{AHashMap, AHashSet};
 use parking_lot::{Mutex, RwLock};
@@ -40,16 +41,17 @@ struct Delivery {
     kind: usize,
     /// What the subscriber subscribed to: the channel, or the pattern.
     subscription: Name,
-    /// The channel the message was published on.
-    channel: Name,
-    payload: Arc<[u8]>,
-}
-
-impl Delivery {
-    /// Roughly what it costs to keep queued, and to send.
-    fn weight(&self) -> usize {
-        self.payload.len() + self.channel.len() + 64
-    }
+    /// The whole frame as RESP2 writes it, built once for every subscriber
+    /// it goes to through `subscription` (see [`frame`]).
+    frame: Arc<[u8]>,
+    /// A large payload, apart from `frame` (which then ends at its length
+    /// line): copied once for every channel and pattern it goes through,
+    /// and before the subscription table is locked (see
+    /// [`SHARED_PAYLOAD_FROM`]).
+    payload: Option<Arc<[u8]>>,
+    /// Roughly what it costs to keep queued, and to send: the payload's and
+    /// the channel's lengths and 64.
+    weight: usize,
 }
 
 // ── Subscriber ────────────────────────────────────────────────────────────────
@@ -95,7 +97,7 @@ impl Subscriber {
         if self.closed.load(Ordering::Relaxed) {
             return Offer::Refused;
         }
-        let weight = delivery.weight();
+        let weight = delivery.weight;
         let pending = self.pending.fetch_add(weight, Ordering::Relaxed) + weight;
         self.note_pending(pending);
         // As Redis does: at the hard limit at once, over the soft limit once
@@ -140,6 +142,14 @@ impl Subscriber {
     fn note_pending(&self, pending: usize) {
         if let Some(activity) = &self.activity {
             activity.set_pubsub_output(pending);
+        }
+    }
+
+    /// What `CLIENT LIST` counts in the connection's `tot-mem` for the
+    /// buffers its writer keeps (see `Outbox`).
+    fn note_kept(&self, bytes: usize) {
+        if let Some(activity) = &self.activity {
+            activity.set_pubsub_kept(bytes);
         }
     }
 
@@ -209,6 +219,12 @@ impl PubSubHub {
         &self.inner.limits
     }
 
+    /// The same limits, shared: for a monitor, held to the `normal` class's
+    /// (`monitor::connect`).
+    pub fn shared_limits(&self) -> Arc<OutputLimits> {
+        Arc::clone(&self.inner.limits)
+    }
+
     fn add(&self, kind: usize, name: &Name, subscriber: &Arc<Subscriber>) {
         let mut tables = self.inner.tables.write();
         tables[kind]
@@ -240,7 +256,11 @@ impl PubSubHub {
     /// both the channel and a matching pattern counts twice, as in Redis. One
     /// that this message takes over its output buffer limit counts too, as
     /// in Redis, which queues the message and then disconnects it (#774).
-    pub fn publish(&self, channel: &(impl AsRef<[u8]> + ?Sized), payload: Arc<[u8]>) -> usize {
+    pub fn publish(
+        &self,
+        channel: &(impl AsRef<[u8]> + ?Sized),
+        payload: impl AsRef<[u8]>,
+    ) -> usize {
         self.publish_from(channel, payload, None)
     }
 
@@ -249,41 +269,46 @@ impl PubSubHub {
     pub fn publish_from(
         &self,
         channel: &(impl AsRef<[u8]> + ?Sized),
-        payload: Arc<[u8]>,
+        payload: impl AsRef<[u8]>,
         from: Option<u64>,
     ) -> usize {
         if self.inner.subscriptions.load(Ordering::Relaxed) == 0 {
             return 0;
         }
-        let channel = channel.as_ref();
+        let (channel, payload) = (channel.as_ref(), payload.as_ref());
+        let weight = payload.len() + channel.len() + 64;
+        let shared = shared_payload(payload);
         let mut delivered = 0;
         let mut overflowed: Vec<Arc<Subscriber>> = Vec::new();
         {
             let tables = self.inner.tables.read();
-            let mut name: Option<Name> = None;
             if let Some((key, subscribers)) = tables[CHANNEL].get_key_value(channel) {
-                name = Some(Arc::clone(key));
+                let frame = frame(CHANNEL, key, channel, payload, &shared);
                 for subscriber in subscribers {
                     let delivery = Delivery {
                         kind: CHANNEL,
                         subscription: Arc::clone(key),
-                        channel: Arc::clone(key),
-                        payload: Arc::clone(&payload),
+                        frame: Arc::clone(&frame),
+                        payload: shared.clone(),
+                        weight,
                     };
                     delivered += hand_over(subscriber, delivery, from, &mut overflowed);
                 }
             }
+            // One frame for each pattern the channel matches, however many
+            // subscribe to it: Redis too matches each pattern once.
             for (pattern, subscribers) in &tables[PATTERN] {
                 if !glob_matches(pattern, channel) {
                     continue;
                 }
-                let channel = Arc::clone(name.get_or_insert_with(|| Arc::from(channel)));
+                let frame = frame(PATTERN, pattern, channel, payload, &shared);
                 for subscriber in subscribers {
                     let delivery = Delivery {
                         kind: PATTERN,
                         subscription: Arc::clone(pattern),
-                        channel: Arc::clone(&channel),
-                        payload: Arc::clone(&payload),
+                        frame: Arc::clone(&frame),
+                        payload: shared.clone(),
+                        weight,
                     };
                     delivered += hand_over(subscriber, delivery, from, &mut overflowed);
                 }
@@ -297,7 +322,11 @@ impl PubSubHub {
         delivered
     }
 
-    pub fn spublish(&self, shard: &(impl AsRef<[u8]> + ?Sized), payload: Arc<[u8]>) -> usize {
+    pub fn spublish(
+        &self,
+        shard: &(impl AsRef<[u8]> + ?Sized),
+        payload: impl AsRef<[u8]>,
+    ) -> usize {
         self.spublish_from(shard, payload, None)
     }
 
@@ -305,24 +334,28 @@ impl PubSubHub {
     pub fn spublish_from(
         &self,
         shard: &(impl AsRef<[u8]> + ?Sized),
-        payload: Arc<[u8]>,
+        payload: impl AsRef<[u8]>,
         from: Option<u64>,
     ) -> usize {
         if self.inner.subscriptions.load(Ordering::Relaxed) == 0 {
             return 0;
         }
-        let shard = shard.as_ref();
+        let (shard, payload) = (shard.as_ref(), payload.as_ref());
+        let weight = payload.len() + shard.len() + 64;
+        let shared = shared_payload(payload);
         let mut delivered = 0;
         let mut overflowed: Vec<Arc<Subscriber>> = Vec::new();
         {
             let tables = self.inner.tables.read();
             if let Some((key, subscribers)) = tables[SHARD].get_key_value(shard) {
+                let frame = frame(SHARD, key, shard, payload, &shared);
                 for subscriber in subscribers {
                     let delivery = Delivery {
                         kind: SHARD,
                         subscription: Arc::clone(key),
-                        channel: Arc::clone(key),
-                        payload: Arc::clone(&payload),
+                        frame: Arc::clone(&frame),
+                        payload: shared.clone(),
+                        weight,
                     };
                     delivered += hand_over(subscriber, delivery, from, &mut overflowed);
                 }
@@ -390,7 +423,7 @@ impl PubSubHub {
 fn watch_soft_limit(shared: std::sync::Weak<Shared>) {
     let _ = std::thread::Builder::new()
         .name("kividb-pubsub-limit".into())
-        .spawn(move || {
+        .spawn_released(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 let Some(shared) = shared.upgrade() else {
@@ -461,40 +494,100 @@ fn glob_matches(pattern: &[u8], text: &[u8]) -> bool {
 // from the reply to a command it issued by that tag. The framing is the
 // connection's protocol at the moment of writing, so that a `HELLO` while
 // subscribed changes it from the next frame on.
+//
+// A message's frame is built once, when it is published, for all the
+// subscribers it goes to through one channel or pattern, as RESP2 writes it;
+// it was framed again for each of them as it was written (#851). The RESP3
+// push differs only in its first byte. A payload of `SHARED_PAYLOAD_FROM`
+// bytes or more is copied once, before the subscription table is locked,
+// and shared by the frames, as 1.2 shared it: copying 64 MB for each of three
+// patterns with the table locked held up every SUBSCRIBE and PUBLISH behind it.
+
+/// From this size a payload is kept apart from the frames (see above).
+const SHARED_PAYLOAD_FROM: usize = 4 << 10;
+
+/// The payload, copied once to be shared, if it is large.
+fn shared_payload(payload: &[u8]) -> Option<Arc<[u8]>> {
+    (payload.len() >= SHARED_PAYLOAD_FROM).then(|| Arc::from(payload))
+}
+
+/// `n` in decimal, without allocating.
+fn write_count(out: &mut Vec<u8>, n: usize) {
+    crate::resp::write::push_decimal(out, n as u64);
+}
 
 fn write_header(out: &mut Vec<u8>, resp: u8, items: usize) {
     out.push(if resp >= 3 { b'>' } else { b'*' });
-    out.extend_from_slice(items.to_string().as_bytes());
+    write_count(out, items);
     out.extend_from_slice(b"\r\n");
 }
 
 fn write_bulk(out: &mut Vec<u8>, data: &[u8]) {
     out.push(b'$');
-    out.extend_from_slice(data.len().to_string().as_bytes());
+    write_count(out, data.len());
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(data);
     out.extend_from_slice(b"\r\n");
 }
 
-fn write_delivery(out: &mut Vec<u8>, resp: u8, delivery: &Delivery) {
-    match delivery.kind {
+/// The frame of a message published on `channel` for the subscribers of
+/// `subscription` (a pattern for `PATTERN`), as RESP2 writes it; up to the
+/// payload's length line only if the payload is `shared`.
+fn frame(
+    kind: usize,
+    subscription: &[u8],
+    channel: &[u8],
+    payload: &[u8],
+    shared: &Option<Arc<[u8]>>,
+) -> Arc<[u8]> {
+    let inline = if shared.is_some() { 0 } else { payload.len() };
+    let mut out = Vec::with_capacity(subscription.len() + channel.len() + inline + 64);
+    match kind {
         PATTERN => {
-            write_header(out, resp, 4);
-            write_bulk(out, b"pmessage");
-            write_bulk(out, &delivery.subscription);
+            write_header(&mut out, 2, 4);
+            write_bulk(&mut out, b"pmessage");
+            write_bulk(&mut out, subscription);
         }
         kind => {
-            write_header(out, resp, 3);
+            write_header(&mut out, 2, 3);
             let word: &[u8] = if kind == SHARD {
                 b"smessage"
             } else {
                 b"message"
             };
-            write_bulk(out, word);
+            write_bulk(&mut out, word);
         }
     }
-    write_bulk(out, &delivery.channel);
-    write_bulk(out, &delivery.payload);
+    write_bulk(&mut out, channel);
+    if shared.is_some() {
+        out.push(b'$');
+        write_count(&mut out, payload.len());
+        out.extend_from_slice(b"\r\n");
+    } else {
+        write_bulk(&mut out, payload);
+    }
+    Arc::from(out)
+}
+
+/// A delivery's frame for a connection speaking `resp`: under RESP3 a push
+/// (`>`) where RESP2 has an array (`*`).
+fn write_delivery(out: &mut Vec<u8>, resp: u8, delivery: &Delivery) {
+    let start = out.len();
+    out.extend_from_slice(&delivery.frame);
+    if let Some(payload) = &delivery.payload {
+        out.extend_from_slice(payload);
+        out.extend_from_slice(b"\r\n");
+    }
+    if resp >= 3 {
+        out[start] = b'>';
+    }
+}
+
+impl Delivery {
+    /// The bytes [`write_delivery`] writes for it.
+    fn len(&self) -> usize {
+        self.frame.len() + self.payload.as_ref().map_or(0, |p| p.len() + 2)
+    }
 }
 
 /// The reply to one name of a (un)subscribe command. `name` is `None` for an
@@ -586,7 +679,15 @@ pub fn connect(
         names: [Vec::new(), Vec::new(), Vec::new()],
         forwarder: None,
     };
-    (subscriptions, Outbox { rx, me })
+    (
+        subscriptions,
+        Outbox {
+            rx,
+            me,
+            deliveries: Vec::new(),
+            frames: Vec::new(),
+        },
+    )
 }
 
 impl Subscriptions {
@@ -737,26 +838,69 @@ impl Drop for Subscriptions {
 pub struct Outbox {
     rx: mpsc::UnboundedReceiver<Delivery>,
     me: Arc<Subscriber>,
+    /// The batch taken from the queue, and the frames written from it: kept
+    /// from one batch to the next while messages keep coming, so that a
+    /// busy subscriber does not allocate them (and grow them, reallocating)
+    /// for each batch (#851). See [`Outbox::trim`].
+    deliveries: Vec<Delivery>,
+    frames: Vec<u8>,
 }
 
+/// What a subscriber keeps of its buffers once its queue is empty: a
+/// burst's batch of thousands of messages is not held on to by every
+/// subscriber that had one.
+const KEEP_DELIVERIES: usize = 32;
+const KEEP_FRAME_BYTES: usize = 4 << 10;
+/// A subscriber idle this long gives back what it kept: a server with many
+/// quiet subscribers holds nothing for them, as before #851. Only armed when
+/// it keeps more than [`KEEP_IDLE_BYTES`] (less is given back at once), so
+/// that a subscriber that keeps next to nothing never sets a timer,
+/// and a busy one, which finds its queue never empty, never waits on one.
+const IDLE_RELEASE: std::time::Duration = std::time::Duration::from_secs(1);
+const KEEP_IDLE_BYTES: usize = 256;
+
 /// Some messages, in order, taken from the queue.
-pub struct Batch {
-    deliveries: Vec<Delivery>,
-    me: Arc<Subscriber>,
+pub struct Batch<'a> {
+    deliveries: &'a mut Vec<Delivery>,
+    frames: &'a mut Vec<u8>,
+    me: &'a Subscriber,
 }
 
 impl Outbox {
     /// Waits for messages and returns the next of them. The caller locks
     /// the socket for writing, and only then calls [`Batch::encode`].
-    pub async fn next(&mut self) -> Option<Batch> {
-        let first = self.rx.recv().await?;
-        let mut weight = first.weight();
-        let mut deliveries = vec![first];
+    pub async fn next(&mut self) -> Option<Batch<'_>> {
+        let first = match self.rx.try_recv() {
+            Ok(delivery) => delivery,
+            Err(_) => {
+                self.trim();
+                if self.kept() > KEEP_IDLE_BYTES {
+                    match tokio::time::timeout(IDLE_RELEASE, self.rx.recv()).await {
+                        Ok(delivery) => delivery?,
+                        Err(_) => {
+                            self.release();
+                            self.rx.recv().await?
+                        }
+                    }
+                } else {
+                    self.rx.recv().await?
+                }
+            }
+        };
+        // Let this thread's other ready connections run first: what they
+        // publish meanwhile goes out in the same write. Redis, too, writes to
+        // a subscriber once its event loop has served every ready client;
+        // writing at the first message took twice its writes per message
+        // (#851).
+        tokio::task::yield_now().await;
+        let mut weight = first.weight;
+        self.deliveries.clear();
+        self.deliveries.push(first);
         while weight < BATCH_BYTES {
             match self.rx.try_recv() {
                 Ok(delivery) => {
-                    weight += delivery.weight();
-                    deliveries.push(delivery);
+                    weight += delivery.weight;
+                    self.deliveries.push(delivery);
                 }
                 Err(_) => break,
             }
@@ -774,29 +918,87 @@ impl Outbox {
             self.me.released.notified().await;
         }
         Some(Batch {
-            deliveries,
-            me: Arc::clone(&self.me),
+            deliveries: &mut self.deliveries,
+            frames: &mut self.frames,
+            me: &self.me,
         })
+    }
+
+    /// Before waiting for more: let go of buffers a burst made large.
+    fn trim(&mut self) {
+        self.deliveries.clear();
+        if self.deliveries.capacity() > KEEP_DELIVERIES {
+            self.deliveries = Vec::new();
+        }
+        if self.frames.capacity() > KEEP_FRAME_BYTES {
+            self.frames = Vec::new();
+        }
+        if self.kept() <= KEEP_IDLE_BYTES {
+            // Too little to be worth a timer: none is kept.
+            self.release();
+        } else {
+            self.me.note_kept(self.kept());
+        }
+    }
+
+    /// Idle: let go of everything kept.
+    fn release(&mut self) {
+        self.deliveries = Vec::new();
+        self.frames = Vec::new();
+        self.me.note_kept(0);
+    }
+
+    /// The bytes of the buffers kept between batches.
+    fn kept(&self) -> usize {
+        kept_bytes(&self.deliveries, &self.frames)
     }
 }
 
-impl Batch {
+fn kept_bytes(deliveries: &Vec<Delivery>, frames: &Vec<u8>) -> usize {
+    deliveries.capacity() * std::mem::size_of::<Delivery>() + frames.capacity()
+}
+
+impl Batch<'_> {
     /// The frames to write, for a connection speaking `resp` — without the
     /// messages of subscriptions that have ended since they were queued.
-    /// Empty if that is all of them.
+    /// Empty if that is all of them. Give the buffer back with
+    /// [`Batch::written`] once it has been written.
     ///
     /// Called with the socket locked for writing: the connection's loop ends
     /// a subscription before it writes the reply saying so, so a message is
     /// either written before that reply or not at all.
-    pub fn encode(&self, resp: u8) -> Vec<u8> {
+    pub fn encode(&mut self, resp: u8) -> Vec<u8> {
+        let mut out = std::mem::take(&mut *self.frames);
+        out.clear();
         let live = self.me.live.lock();
-        let mut out = Vec::new();
-        for delivery in &self.deliveries {
+        let len: usize = self.deliveries.iter().map(Delivery::len).sum();
+        out.reserve(len);
+        for delivery in self.deliveries.iter() {
             if live[delivery.kind].contains(&delivery.subscription) {
                 write_delivery(&mut out, resp, delivery);
             }
         }
         out
+    }
+
+    /// The buffer [`Batch::encode`] gave, written: kept for the next batch.
+    pub fn written(&mut self, frames: Vec<u8>) {
+        *self.frames = frames;
+        self.me.note_kept(kept_bytes(self.deliveries, self.frames));
+    }
+}
+
+impl Drop for Outbox {
+    /// Its buffers go with it: nothing is left counted for the client.
+    fn drop(&mut self) {
+        self.me.note_kept(0);
+    }
+}
+
+impl Drop for Batch<'_> {
+    /// The messages are let go of here, as the batch was.
+    fn drop(&mut self) {
+        self.deliveries.clear();
     }
 }
 
@@ -809,6 +1011,7 @@ pub fn shard_subscribe_refusal(
     name: &str,
     cmd: &[&[u8]],
     cluster: &crate::cluster::ClusterState,
+    ipv6_client: bool,
 ) -> Option<Vec<u8>> {
     if name != "SSUBSCRIBE" || !cluster.enabled {
         return None;
@@ -832,7 +1035,7 @@ pub fn shard_subscribe_refusal(
         || true,
         |_| false,
     )
-    .refusal()
+    .refusal(ipv6_client)
 }
 
 #[cfg(test)]
@@ -844,7 +1047,7 @@ mod tests {
     }
 
     async fn frames(outbox: &mut Outbox, resp: u8) -> String {
-        let batch = outbox.next().await.unwrap();
+        let mut batch = outbox.next().await.unwrap();
         String::from_utf8(batch.encode(resp)).unwrap()
     }
 
@@ -921,6 +1124,168 @@ mod tests {
         assert_eq!(
             frames(&mut outbox, 2).await,
             "*3\r\n$7\r\nmessage\r\n$1\r\nb\r\n$1\r\n2\r\n"
+        );
+    }
+
+    /// One frame is built for a pattern's subscribers and shared: a RESP3
+    /// subscriber's push does not turn a RESP2 subscriber's array into one,
+    /// whichever is written first (#851).
+    #[tokio::test]
+    async fn a_shared_frame_is_framed_for_each_subscribers_protocol() {
+        let hub = PubSubHub::new();
+        let (mut three, mut three_out) = subscriber(&hub, 1);
+        let (mut two, mut two_out) = subscriber(&hub, 2);
+        three.handle(&[b"PSUBSCRIBE", b"room*"], 3);
+        two.handle(&[b"PSUBSCRIBE", b"room*", b"*1"], 2);
+        three.flushed();
+        two.flushed();
+        assert_eq!(hub.publish("room1", &b"hi"[..]), 3);
+        assert_eq!(
+            frames(&mut three_out, 3).await,
+            ">4\r\n$8\r\npmessage\r\n$5\r\nroom*\r\n$5\r\nroom1\r\n$2\r\nhi\r\n"
+        );
+        let mut two_frames = frames(&mut two_out, 2).await;
+        // The two patterns come in the table's order, as in Redis.
+        let first = "*4\r\n$8\r\npmessage\r\n$5\r\nroom*\r\n$5\r\nroom1\r\n$2\r\nhi\r\n";
+        let second = "*4\r\n$8\r\npmessage\r\n$2\r\n*1\r\n$5\r\nroom1\r\n$2\r\nhi\r\n";
+        if two_frames.starts_with(second) {
+            two_frames = two_frames.replacen(second, "", 1) + second;
+        }
+        assert_eq!(two_frames, format!("{first}{second}"));
+    }
+
+    /// A busy subscriber's batch and frame buffers are kept from one batch
+    /// to the next, and let go of, past a small size, once it is idle.
+    #[tokio::test]
+    async fn batch_buffers_are_reused_and_trimmed_when_idle() {
+        let hub = PubSubHub::new();
+        let (mut subs, mut outbox) = subscriber(&hub, 1);
+        subs.handle(&[b"SUBSCRIBE", b"c"], 2);
+        subs.flushed();
+        let payload = vec![b'x'; 1000];
+        for _ in 0..200 {
+            hub.publish("c", &payload[..]);
+        }
+        let frame_len = "*3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$1000\r\n".len() + 1000 + 2;
+        {
+            let mut batch = outbox.next().await.unwrap();
+            let out = batch.encode(2);
+            assert_eq!(out.len(), 200 * frame_len);
+            batch.written(out);
+        }
+        assert!(outbox.frames.capacity() >= 200 * frame_len);
+        assert!(outbox.deliveries.is_empty() && outbox.deliveries.capacity() >= 200);
+        // More is queued: the next batch takes the same buffers.
+        hub.publish("c", &b"1"[..]);
+        let kept = outbox.frames.as_ptr();
+        {
+            let mut batch = outbox.next().await.unwrap();
+            let out = batch.encode(2);
+            assert_eq!(out.as_ptr(), kept);
+            assert_eq!(out, b"*3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$1\r\n1\r\n");
+            batch.written(out);
+        }
+        // Idle: waiting for the next message, it lets the large ones go.
+        let idle = tokio::time::timeout(std::time::Duration::from_millis(20), outbox.next())
+            .await
+            .is_err();
+        assert!(idle);
+        assert!(outbox.frames.capacity() <= KEEP_FRAME_BYTES);
+        assert!(outbox.deliveries.capacity() <= KEEP_DELIVERIES);
+    }
+
+    /// A subscriber that stays idle gives back what it kept from its last
+    /// batch; one that keeps next to nothing waits without a timer (#851).
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_subscriber_gives_its_buffers_back() {
+        let hub = PubSubHub::new();
+        let (mut subs, mut outbox) = subscriber(&hub, 1);
+        subs.handle(&[b"SUBSCRIBE", b"c"], 2);
+        subs.flushed();
+        hub.publish("c", vec![b'x'; 2 << 10]);
+        {
+            let mut batch = outbox.next().await.unwrap();
+            let out = batch.encode(2);
+            batch.written(out);
+        }
+        assert!(outbox.kept() > 2 << 10);
+        // Not yet idle for long: kept, within the small limits.
+        let waited = tokio::time::timeout(IDLE_RELEASE / 2, outbox.next())
+            .await
+            .is_err();
+        assert!(waited);
+        let kept = outbox.kept();
+        let most = KEEP_FRAME_BYTES + KEEP_DELIVERIES * std::mem::size_of::<Delivery>();
+        assert!(kept > KEEP_IDLE_BYTES && kept <= most);
+        // Idle past IDLE_RELEASE: nothing kept.
+        let waited = tokio::time::timeout(IDLE_RELEASE * 3, outbox.next())
+            .await
+            .is_err();
+        assert!(waited);
+        assert_eq!(outbox.kept(), 0);
+        // And it still delivers.
+        hub.publish("c", &b"after"[..]);
+        assert_eq!(
+            frames(&mut outbox, 2).await,
+            "*3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$5\r\nafter\r\n"
+        );
+    }
+
+    /// A large payload is shared by the frames of every pattern it goes
+    /// through, and framed for the protocol of the moment: a subscriber
+    /// that switches RESP2 -> RESP3 -> RESP2 between batches gets arrays,
+    /// pushes, arrays, of small and large messages alike (#851).
+    #[tokio::test]
+    async fn shared_frames_follow_a_protocol_switch() {
+        let hub = PubSubHub::new();
+        let (mut subs, mut outbox) = subscriber(&hub, 1);
+        let (mut other, mut other_out) = subscriber(&hub, 2);
+        subs.handle(&[b"PSUBSCRIBE", b"a*", b"*b"], 2);
+        other.handle(&[b"PSUBSCRIBE", b"a*"], 2);
+        subs.flushed();
+        other.flushed();
+        let big = vec![b'y'; SHARED_PAYLOAD_FROM + 1];
+        let big_bulk = format!("${}\r\n{}\r\n", big.len(), "y".repeat(big.len()));
+        for (n, resp) in [2u8, 3, 2].into_iter().enumerate() {
+            assert_eq!(hub.publish("ab", &b"s"[..]), 3);
+            assert_eq!(hub.publish("ab", &big[..]), 3);
+            let head = if resp >= 3 { '>' } else { '*' };
+            let got = frames(&mut outbox, resp).await;
+            for pattern in ["a*", "*b"] {
+                for bulk in ["$1\r\ns\r\n".to_string(), big_bulk.clone()] {
+                    let one = format!(
+                        "{head}4\r\n$8\r\npmessage\r\n$2\r\n{pattern}\r\n$2\r\nab\r\n{bulk}"
+                    );
+                    assert!(got.contains(&one), "round {n}, {pattern}: {got:.80}");
+                }
+            }
+            assert_eq!(got.matches("pmessage").count(), 4);
+            // The other subscriber, RESP2 throughout, is not changed by it.
+            let theirs = frames(&mut other_out, 2).await;
+            assert_eq!(
+                theirs,
+                format!(
+                    "*4\r\n$8\r\npmessage\r\n$2\r\na*\r\n$2\r\nab\r\n$1\r\ns\r\n\
+                     *4\r\n$8\r\npmessage\r\n$2\r\na*\r\n$2\r\nab\r\n{big_bulk}"
+                )
+            );
+        }
+    }
+
+    /// Queued through a pattern, not yet written, when the pattern is
+    /// unsubscribed from: not written; the channel's message still is.
+    #[tokio::test]
+    async fn nothing_for_a_pattern_follows_its_punsubscribe() {
+        let hub = PubSubHub::new();
+        let (mut subs, mut outbox) = subscriber(&hub, 1);
+        subs.handle(&[b"SUBSCRIBE", b"news"], 2);
+        subs.handle(&[b"PSUBSCRIBE", b"n*"], 2);
+        subs.flushed();
+        assert_eq!(hub.publish("news", &b"1"[..]), 2);
+        subs.handle(&[b"PUNSUBSCRIBE", b"n*"], 2);
+        assert_eq!(
+            frames(&mut outbox, 2).await,
+            "*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$1\r\n1\r\n"
         );
     }
 

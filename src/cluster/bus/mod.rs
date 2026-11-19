@@ -30,9 +30,10 @@ pub mod message;
 pub use dialer::send_meet;
 pub use heartbeat::{run_failure_detection_loop, run_heartbeat_loop};
 pub use listener::run_bus_listener;
-pub use message::{BusMessage, GossipEntry, SlotClaim, decode, encode};
+pub use message::{BusMessage, GossipEntry, OwnerReport, SlotClaim, decode, encode};
 
 use crate::cluster::ClusterState;
+use crate::cpus::BuilderExt as _;
 use std::sync::Arc;
 
 /// Convention: cluster bus port = client port + 10000.
@@ -60,7 +61,7 @@ pub fn start(
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let spawned = std::thread::Builder::new()
         .name("kividb-cluster-bus".into())
-        .spawn(move || {
+        .spawn_released(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

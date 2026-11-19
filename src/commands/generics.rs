@@ -34,13 +34,12 @@ pub(crate) fn scans_whole(value: ValueRef<'_>) -> bool {
         ValueRef::Set(set) => !set.read().is_table(),
         ValueRef::Hash(hash) => !hash.read().is_table(),
         ValueRef::HashEx(hash) => !hash.read().fields.is_table(),
+        ValueRef::SortedSet(zset) => zset.read().is_packed(),
         _ => matches!(encoding_of(value), "listpack" | "listpackex"),
     }
 }
 
 pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
-    // An entry of a compact structure is at most this long.
-    const SMALL: usize = 64;
     match value {
         ValueRef::String(bytes) => {
             let integer = bytes.len() <= 20
@@ -60,15 +59,8 @@ pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
         ValueRef::List(list) => list.read().encoding().name(),
         // The form it is really kept in (#297).
         ValueRef::Set(set) => set.read().encoding().name(),
-        ValueRef::SortedSet(zset) => {
-            let zset = zset.read();
-            if zset.members.len() <= 128 && zset.members.keys().all(|member| member.len() <= SMALL)
-            {
-                "listpack"
-            } else {
-                "skiplist"
-            }
-        }
+        // The form it is really kept in: a block, or a table and a tree.
+        ValueRef::SortedSet(zset) => zset.read().encoding().name(),
         // The form it is really kept in: a block, or a table. With a field
         // TTL a block is a `listpackex`, as Redis names it.
         ValueRef::Hash(hash) => match hash.read().encoding() {
@@ -209,6 +201,13 @@ fn sort_patterns<'a>(cmd: &'a [&'a [u8]]) -> impl Iterator<Item = &'a [u8]> + 'a
         }
         None
     })
+}
+
+/// Whether `SORT` or `SORT_RO` `cmd` reads keys it does not name: it has a
+/// `BY` or `GET` pattern with a `*` (`tag_locks::walks`).
+#[cfg(feature = "lua")]
+pub(crate) fn sort_reads_keys_it_does_not_name(cmd: &[&[u8]]) -> bool {
+    sort_pattern_outside(cmd, |_| false).is_some()
 }
 
 /// For `SORT` or `SORT_RO` `cmd` called by a script held to a hash tag
@@ -1340,9 +1339,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             }
 
-            // Verify the trailer (version + checksum) and decode.
-            let value = match crate::snapshot::restore_payload_checked(payload) {
+            // Verify the trailer (version + checksum) and decode. A
+            // probabilistic value is held to `maxmemory` for a client by
+            // the size its payload declares, before that is allocated
+            // (room for it was made before the command took its key:
+            // `sketch::room`).
+            let (value, no_room) = crate::sketch::room::loading_for_client(ctx, || {
+                crate::snapshot::restore_payload_checked(payload)
+            });
+            let value = match value {
                 Ok(v) => v,
+                Err(_) if no_room => {
+                    return Some(resp_error(
+                        "OOM command not allowed when used memory > 'maxmemory'.",
+                    ));
+                }
                 Err(e) => return Some(resp_error(e.message())),
             };
 
@@ -1534,7 +1545,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(ValueRef::List(l)) => l.read().iter().map(|e| e.to_shared()).collect(),
                 Some(ValueRef::Set(s)) => s.read().iter().map(|m| m.to_shared()).collect(),
                 Some(ValueRef::SortedSet(z)) => {
-                    z.read().by_score.keys().map(|(_, m)| m.clone()).collect()
+                    z.read().iter().map(|(m, _)| m.to_shared()).collect()
                 }
                 Some(_) => {
                     return Some(resp_error(
@@ -1808,6 +1819,31 @@ fn system_time_to_unix(exp: SystemTime, unit: TimeUnit) -> i64 {
         // To the nearest second, as `TTL` (Redis's `(ms + 500) / 1000`).
         TimeUnit::Secs => ms_to_nearest_secs(i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
         TimeUnit::Millis => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
+    }
+}
+
+/// `RESTORE`, only asked what it wants (`sketch::room`): a payload that may
+/// hold a probabilistic value is decoded as far as the size the value
+/// declares, which its reader then says (`sketch::room::declared`), and no
+/// further; any other payload is not decoded, and wants nothing beyond
+/// what every write is given room for.
+pub(crate) fn restore_wanted(ctx: &Ctx) {
+    let Some(payload) = ctx.cmd.get(3) else {
+        return;
+    };
+    // Refused `BUSYKEY` when it runs: it wants nothing.
+    let replace = ctx.cmd[4..]
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case(b"REPLACE"));
+    if !replace {
+        let key = ctx.cmd[1];
+        let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
+        if read_lock!(shard).contains_key(key) {
+            return;
+        }
+    }
+    if crate::snapshot::payload_may_hold_sketch(payload) {
+        let _ = crate::snapshot::restore_payload_checked(payload);
     }
 }
 

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Sets of integers kept as a sorted array (#297): what a client sees has to be
 // the same as for any other set, on either side of the change of form, and
 // across a save, an AOF replay and DUMP/RESTORE. Each test runs its own
@@ -793,7 +794,7 @@ fn sort_of_a_compact_set() {
 #[test]
 fn the_digest_is_the_same_in_both_forms() {
     let dir = temp_dir("digest");
-    let server = Server::start(&dir, &[]);
+    let server = Server::start(&dir, &["--enable-debug-command", "yes"]);
     let mut c = server.conn();
     let members: Vec<String> = [1, 2, 3, -70_000, i64::MIN, i64::MAX]
         .iter()

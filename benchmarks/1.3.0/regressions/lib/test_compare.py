@@ -307,5 +307,353 @@ class Rules(unittest.TestCase):
         self.assertIsNotNone([r for r in rows if r["metric"] == "x_pct"][0]["host"])
 
 
+
+def rustc_env(cand, cand_full="1.100.0", ref="1.100.0", **extra):
+    env = {"engines": {"v1_2_2": {"rustc": ref}, "candidate": {"rustc": cand},
+                       "v1_2_2_full": {"rustc": ref}, "candidate_full": {"rustc": cand_full},
+                       "redis": {"rustc": None}},
+           "engines_selected": ["v1_2_2", "candidate", "redis"]}
+    env.update(extra)
+    return env
+
+
+class Rustc(unittest.TestCase):
+    """#900: a candidate built by another rustc than v1.2.2's."""
+
+    def setUp(self):
+        self._saved = os.environ.pop(compare.RUSTC_OVERRIDE, None)
+
+    def tearDown(self):
+        os.environ.pop(compare.RUSTC_OVERRIDE, None)
+        if self._saved is not None:
+            os.environ[compare.RUSTC_OVERRIDE] = self._saved
+
+    def problems(self, env):
+        return compare.validity_problems(env, {"metrics": {}}, {"x": {}}, False, False)
+
+    def test_same_rustc_is_silent(self):
+        probs, warns = compare.rustc_check(rustc_env("1.100.0"))
+        self.assertEqual((probs, warns), ([], []))
+        self.assertFalse(any("rustc" in p for p in self.problems(rustc_env("1.100.0"))))
+
+    def test_an_older_rustc_is_invalid(self):
+        probs, _ = compare.rustc_check(rustc_env("1.99.1"))
+        self.assertEqual(len(probs), 1)
+        self.assertIn("candidate was built by rustc 1.99.1, older than v1_2_2's 1.100.0", probs[0])
+        self.assertTrue(any("older than" in p for p in self.problems(rustc_env("1.99.1"))))
+        # The full pair is judged the same way.
+        probs, _ = compare.rustc_check(rustc_env("1.100.0", cand_full="1.99.1"))
+        self.assertIn("candidate_full", probs[0])
+
+    def test_an_unknown_rustc_is_invalid(self):
+        probs, _ = compare.rustc_check(rustc_env(None))
+        self.assertEqual(len(probs), 1)
+        self.assertIn("candidate was built by rustc unknown", probs[0])
+        probs, _ = compare.rustc_check(rustc_env("garbage"))
+        self.assertEqual(len(probs), 1)
+
+    def test_a_newer_rustc_only_warns(self):
+        probs, warns = compare.rustc_check(rustc_env("1.101.0"))
+        self.assertEqual(probs, [])
+        self.assertEqual(len(warns), 1)
+        self.assertIn("newer compiler", warns[0])
+        # Compared as numbers, not strings: 1.100 is newer than 1.99.
+        self.assertEqual(compare.rustc_check(rustc_env("1.100.0", ref="1.99.1"))[0], [])
+
+    def test_the_override_turns_invalid_into_a_warning(self):
+        os.environ[compare.RUSTC_OVERRIDE] = "1"
+        probs, warns = compare.rustc_check(rustc_env("1.99.1"))
+        self.assertEqual(probs, [])
+        self.assertTrue(warns and warns[0].startswith("WARN:"))
+        del os.environ[compare.RUSTC_OVERRIDE]
+        # Or recorded in env.json by run-all.sh.
+        probs, warns = compare.rustc_check(rustc_env(None, rustc_override=True))
+        self.assertEqual(probs, [])
+        self.assertEqual(len(warns), 1)
+
+    def test_no_candidate_or_no_full_pair_is_not_judged(self):
+        env = rustc_env("1.99.1", engines_selected=["v1_2_2", "redis"])
+        self.assertEqual(compare.rustc_check(env), ([], []))
+        env = rustc_env("1.100.0")
+        del env["engines"]["candidate_full"]  # --candidate-full not given
+        self.assertEqual(compare.rustc_check(env), ([], []))
+
+    def test_the_rustc_is_recorded(self):
+        b, res = build([("s/c", "x_rps", "req/s", "higher", 1.0, 1.0, 1.0, 1.0)])
+        env = rustc_env("1.100.0", cand_full="1.101.0")
+        compare.record(b, res, env, "lbl", False)
+        rec = b["metrics"]["s/c/x_rps"]["recorded"]
+        self.assertEqual((rec["rustc"], rec["rustc_full"]), ("1.100.0", "1.101.0"))
+        self.assertEqual(b["pins"].get("v1_2_2_full_sha256"), None)  # no sha in this env
+
+
+class SkippedAndNotRun(unittest.TestCase):
+    """A configuration skipped for want of --candidate-full, and recorded
+    metrics that did not run."""
+
+    def test_not_run_lists_recorded_metrics_without_results(self):
+        b, res = build([("s/a", "x_ms", "ms", "lower", 1.0, 1.0, 1.0, 1.0),
+                        ("s/lua", "y_rps", "req/s", "higher", 1.0, 1.0, 1.0, 1.0)])
+        del res["s/lua/y_rps"]
+        rows, not_run, _ = compare.evaluate(res, b)
+        self.assertEqual(not_run, ["s/lua/y_rps"])
+        self.assertEqual([r["key"] for r in rows], ["s/a/x_ms"])
+
+    def test_a_skipped_configuration_is_not_expected_and_is_shown(self):
+        import tempfile
+        b, res = build([("s/a", "x_ms", "ms", "lower", 1.0, 1.0, 1.0, 1.0),
+                        ("s/lua", "y_rps", "req/s", "higher", 1.0, 1.0, 1.0, 1.0)])
+        del res["s/lua/y_rps"]
+        env = {"expected": [{"suite": "s", "config": "a", "engines": ["v1_2_2", "candidate"]}],
+               "engines_selected": ["v1_2_2", "candidate"], "skipped_configs": ["s/lua"]}
+        # Not expected: missing values of the skipped configuration are not INVALID ...
+        self.assertEqual(compare.validity_problems(env, b, res, False, False), [])
+        rows, not_run, hf = compare.evaluate(res, b)
+        with tempfile.TemporaryDirectory() as d:
+            summ = compare.write_summary(d, rows, not_run, env, "lbl", [], False, hf, b)
+            md = open(os.path.join(d, "summary.md")).read()
+        # ... but it is named, and its metrics are "not run" (which the release gate refuses).
+        self.assertIn("skipped (need --candidate-full): s/lua", md)
+        self.assertEqual(summ["not_run"], ["s/lua/y_rps"])
+        self.assertEqual(summ["verdict"], "ok")
+
+
+# The release gate (scripts/release/regression_gate.py), without git.
+_GATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "scripts", "release")
+sys.path.insert(0, os.path.abspath(_GATE))
+import regression_gate  # noqa: E402
+
+SUITES = ["01-small", "18-big"]
+
+
+def small_env(**kw):
+    env = {"vm": "Standard_D4s_v5", "nproc": 4, "scale": "1", "only": "", "full": "1",
+           "engines_selected": ["v1_2_2", "candidate", "redis"],
+           "suite_seconds": {"01-small": 10}, "needs_more_cpus": {"18-big": 8},
+           "suite_min_cpus": {"18-big": 8}, "min_cpus_only": False, "skipped_configs": []}
+    env.update(kw)
+    return env
+
+
+def big_env(**kw):
+    env = small_env(vm="Standard_D8s_v5", nproc=8, suite_seconds={"18-big": 10}, needs_more_cpus={},
+                    min_cpus_only=True)
+    env.update(kw)
+    return env
+
+
+OK_SUMMARY = {"verdict": "ok", "failed": [], "problems": []}
+
+
+class MinCpus(unittest.TestCase):
+    """Suites that declare Suite(..., min_cpus=N)."""
+
+    def baseline(self):
+        b, _ = build([("01-small/c", "x_rps", "req/s", "higher", 1.0, 1.0, 1.0, 1.0),
+                      ("18-big/c", "y_rps", "req/s", "higher", 1.0, 1.0, 1.0, 1.0)])
+        b["metrics"]["01-small/c/x_rps"]["recorded"]["vm"] = "Standard_D4s_v5"
+        b["metrics"]["18-big/c/y_rps"]["recorded"]["vm"] = "Standard_D8s_v5"
+        return b
+
+    def results(self, *keys):
+        _, res = build([("01-small/c", "x_rps", "req/s", "higher", 1.0, 1.0, 1.0, 1.0),
+                        ("18-big/c", "y_rps", "req/s", "higher", 1.0, 1.0, 1.0, 1.0)])
+        return {k: v for k, v in res.items() if k in keys}
+
+    def test_a_suite_needing_more_cpus_on_a_small_machine_is_not_run_not_invalid(self):
+        b, res = self.baseline(), self.results("01-small/c/x_rps")
+        env = small_env(expected=[{"suite": "01-small", "config": "c", "engines": ["v1_2_2", "candidate"]}])
+        self.assertEqual(compare.validity_problems(env, b, res, False, False), [])
+        _, not_run, _ = compare.evaluate(res, b)
+        self.assertEqual(not_run, ["18-big/c/y_rps"])
+
+    def test_each_suite_is_judged_on_the_machine_it_was_recorded_on(self):
+        b = self.baseline()
+        env = big_env(expected=[{"suite": "18-big", "config": "c", "engines": ["v1_2_2", "candidate"]}])
+        self.assertEqual(compare.validity_problems(env, b, self.results("18-big/c/y_rps"), False, False), [])
+        # A suite recorded on the D4s_v5 run on the D8s_v5 is not comparable.
+        probs = compare.validity_problems(env, b, self.results("01-small/c/x_rps"), False, False)
+        self.assertTrue(any("Standard_D4s_v5 that 01-small was recorded on" in p for p in probs), probs)
+
+    def test_run_below_min_cpus_via_only_is_invalid_and_refused_by_the_gate(self):
+        b, res = self.baseline(), self.results("18-big/c/y_rps")
+        env = small_env(only="18", suite_seconds={"18-big": 10}, needs_more_cpus={},
+                        ran_below_min_cpus={"18-big": 8})
+        probs = compare.validity_problems(env, b, res, False, False)
+        self.assertTrue(any("18-big needs 8 CPUs and ran on 4: not valid for the gate" in p for p in probs), probs)
+        why, covers = regression_gate.judge(env, OK_SUMMARY, SUITES)
+        self.assertTrue(any("fewer CPUs than they declare" in w for w in why), why)
+        self.assertEqual(covers, set())
+
+    def test_the_release_gate_needs_both_runs(self):
+        small = regression_gate.judge(small_env(), dict(OK_SUMMARY, not_run=["18-big/c/y_rps"]), SUITES)
+        self.assertEqual(small, ([], {"01-small"}))
+        # Only the small run: refused, naming the suite.
+        used, uncovered = regression_gate.coverage(SUITES, {"d4": small})
+        self.assertEqual(uncovered, ["18-big"])
+        # With the D8s_v5 --min-cpus-only run: every suite is covered.
+        big = regression_gate.judge(big_env(), dict(OK_SUMMARY, not_run=["01-small/c/x_rps"]), SUITES)
+        self.assertEqual(big, ([], {"18-big"}))
+        used, uncovered = regression_gate.coverage(SUITES, {"d4": small, "d8": big})
+        self.assertEqual((used, uncovered), (["d4", "d8"], []))
+        self.assertEqual(regression_gate.needs([small_env()]), {"18-big": 8})
+
+    def test_a_min_cpus_run_on_a_machine_too_small_covers_nothing(self):
+        why, covers = regression_gate.judge(big_env(nproc=4), OK_SUMMARY, SUITES)
+        self.assertEqual((why, covers), ([], set()))
+
+    def test_the_gate_refuses_other_partial_runs(self):
+        # A metric not run for another reason than needs_more_cpus.
+        why, _ = regression_gate.judge(small_env(needs_more_cpus={}), dict(OK_SUMMARY, not_run=["18-big/c/y_rps"]),
+                                       SUITES)
+        self.assertTrue(any("not run" in w for w in why), why)
+        why, _ = regression_gate.judge(small_env(skipped_configs=["01-small/lua"]), OK_SUMMARY, SUITES)
+        self.assertTrue(any("--candidate-full" in w for w in why), why)
+        why, _ = regression_gate.judge(small_env(only="01"), OK_SUMMARY, SUITES)
+        self.assertTrue(any("partial run" in w for w in why), why)
+        why, _ = regression_gate.judge(big_env(full="0"), OK_SUMMARY, SUITES)
+        self.assertTrue(any("FULL=0" in w for w in why), why)
+        why, _ = regression_gate.judge(small_env(), dict(OK_SUMMARY, verdict="INVALID"), SUITES)
+        self.assertTrue(why)
+
+    def test_a_small_group_is_scaled_by_its_own_recording_hosts_factor(self):
+        # Five suites recorded on an older CPU, now 1.2x faster; one suite of
+        # two metrics recorded on THIS host: it must be judged at its host's
+        # 1.0, not the global 1.2 (which would fail it).
+        specs = [("old%d/c" % i, "t_ms", "ms", "lower", 12.0, 10.0, 10.0, 10.0 / 1.2 * 1.05) for i in range(5)]
+        specs += [("new/c", "a_rps", "req/s", "higher", 100.0, 100.0, 100.0, 95.0),
+                  ("new/c", "b_rps", "req/s", "higher", 100.0, 100.0, 100.0, 95.0)]
+        b, res = build(specs)
+        for k, m in b["metrics"].items():
+            m["recorded"].update({"vm": "D4", "cpu": "new" if k.startswith("new/") else "old"})
+        # The new host's own metrics are too few for a host factor: add a third.
+        specs.append(("new2/c", "c_rps", "req/s", "higher", 100.0, 100.0, 100.0, 100.0))
+        b2, res2 = build(specs)
+        for k, m in b2["metrics"].items():
+            m["recorded"].update({"vm": "D4", "cpu": "new" if k.startswith("new") else "old"})
+        rows, _, hf = compare.evaluate(res2, b2)
+        st = {r["key"]: r for r in rows}
+        self.assertAlmostEqual(hf["global"], 1.2, places=1)
+        self.assertEqual(st["new/c/a_rps"]["host"]["mode"], "host")
+        self.assertAlmostEqual(st["new/c/a_rps"]["host"]["speed"], 1.0)
+        self.assertEqual(st["new/c/a_rps"]["status"], "pass")
+
+    def test_the_gate_uses_the_code_check(self):
+        why, covers = regression_gate.judge(small_env(), OK_SUMMARY, SUITES, lambda env: ["code changed"])
+        self.assertEqual((why, covers), (["code changed"], set()))
+
+
+class GateStrict(unittest.TestCase):
+    """What the release gate must not let through (second review of #921)."""
+
+    def baseline(self):
+        b, _ = build([("01-small/c", "x_rps", "req/s", "higher", 1.0, 100.0, 1.0, 100.0)])
+        b["metrics"]["01-small/c/x_rps"]["recorded"]["vm"] = "Standard_D4s_v5"
+        return b
+
+    def env(self, **kw):
+        e = small_env(needs_more_cpus={}, suite_min_cpus={}, suite_seconds={"01-small": 1},
+                      expected=[{"suite": "01-small", "config": "c", "engines": ["v1_2_2", "candidate"]}],
+                      engines_selected=["v1_2_2", "candidate", "redis"])
+        e.update(kw)
+        return e
+
+    def test_an_unrecorded_suite_is_refused(self):
+        self.assertEqual(regression_gate.unrecorded(["01-small", "26-new"], self.baseline()), ["26-new"])
+        self.assertEqual(regression_gate.unrecorded(["01-small"], self.baseline()), [])
+
+    @staticmethod
+    def row(key, *kinds):
+        return {"key": key, "gates": [{"gate": {"kind": k}, "status": "pass"} for k in kinds]}
+
+    def test_a_suite_of_session_gates_needs_no_recorded_rows(self):
+        rows = [self.row("29-session/c/get_per_s", "vs_v1_2_2"), self.row("29-session/c/get_cpus", "info"),
+                self.row("29-session/d/set_per_s", "vs_redis")]
+        session = regression_gate.session_only(rows)
+        self.assertEqual(session, {"29-session"})
+        self.assertEqual(regression_gate.unrecorded(["01-small", "29-session"], self.baseline(), session), [])
+
+    def test_a_suite_mixing_recorded_and_session_gates_needs_its_rows(self):
+        rows = [self.row("30-mixed/c/get_per_s", "vs_v1_2_2"), self.row("30-mixed/c/set_per_s", "rel", "vs_v1_2_2")]
+        session = regression_gate.session_only(rows)
+        self.assertEqual(session, set())
+        self.assertEqual(regression_gate.unrecorded(["01-small", "30-mixed"], self.baseline(), session),
+                         ["30-mixed"])
+
+    def test_a_suite_not_run_is_not_taken_for_session_only(self):
+        session = regression_gate.session_only([self.row("29-session/c/get_per_s", "vs_v1_2_2")])
+        self.assertEqual(regression_gate.unrecorded(["26-new", "29-session"], self.baseline(), session),
+                         ["26-new"])
+
+    def test_a_session_suite_of_info_rows_only_is_refused(self):
+        rows = [self.row("29-session/c/skipped_cpus", "info"), self.row("29-session/d/get_per_s", "info")]
+        self.assertEqual(regression_gate.session_only(rows), {"29-session"})
+        exempt, unjudged = regression_gate.session_exempt({"run-a": rows})
+        self.assertEqual(exempt, set())
+        self.assertIn("every row was info", unjudged["run-a"]["29-session"])
+        self.assertEqual(regression_gate.unrecorded(["01-small", "29-session"], self.baseline(), exempt),
+                         ["29-session"])
+
+    def test_a_session_suite_with_a_vs_gate_skipped_is_refused(self):
+        rows = [self.row("29-session/c/get_per_s", "vs_v1_2_2"),
+                {"key": "29-session/c/set_per_s", "gates": [{"gate": {"kind": "vs_redis"}, "status": "skip"}]}]
+        exempt, unjudged = regression_gate.session_exempt({"run-a": rows})
+        self.assertEqual(exempt, set())
+        self.assertIn("skipped", unjudged["run-a"]["29-session"])
+        self.assertEqual(regression_gate.unrecorded(["01-small", "29-session"], self.baseline(), exempt),
+                         ["29-session"])
+        # Another run that judged it does exempt it; the first still covers nothing of it.
+        exempt, unjudged = regression_gate.session_exempt(
+            {"run-a": rows, "run-b": [self.row("29-session/c/get_per_s", "vs_v1_2_2")]})
+        self.assertEqual(exempt, {"29-session"})
+        self.assertEqual(set(unjudged), {"run-a"})
+
+    def test_rows_that_are_new_are_refused(self):
+        summ = dict(OK_SUMMARY, rows=[{"key": "01-small/c/x_rps", "status": "new"}])
+        why, covers = regression_gate.judge(self.env(), summ, ["01-small"])
+        self.assertTrue(any("no recorded value" in w and "01-small/c/x_rps" in w for w in why), why)
+        self.assertEqual(covers, set())
+
+    def test_each_override_is_refused(self):
+        for key, text in (("rustc_override", "REGRESS_ALLOW_RUSTC"), ("allow_vm_change", "ALLOW_VM_CHANGE")):
+            why, covers = regression_gate.judge(self.env(**{key: True}), OK_SUMMARY, ["01-small"])
+            self.assertTrue(any(text in w for w in why), (key, why))
+            self.assertEqual(covers, set())
+
+    def test_a_run_on_another_machine_size_is_refused(self):
+        why, _ = regression_gate.judge(self.env(vm="Standard_D8s_v5"), OK_SUMMARY, ["01-small"], baseline=self.baseline())
+        self.assertTrue(any("recorded on another machine size: 01-small (Standard_D4s_v5)" in w for w in why), why)
+        why, covers = regression_gate.judge(self.env(), OK_SUMMARY, ["01-small"], baseline=self.baseline())
+        self.assertEqual((why, covers), ([], {"01-small"}))
+
+    def test_the_run_is_judged_again_not_trusted(self):
+        # A committed summary.json may say ok; the raw results decide.
+        b = self.baseline()
+        _, res = build([("01-small/c", "x_rps", "req/s", "higher", 1.0, 100.0, 1.0, 50.0)])
+        summ = regression_gate.rejudge(compare, self.env(), res, b)
+        self.assertEqual((summ["verdict"], summ["failed"]), ("REGRESSED", ["01-small/c/x_rps"]))
+        why, covers = regression_gate.judge(self.env(), summ, ["01-small"], baseline=b)
+        self.assertTrue(why)
+        self.assertEqual(covers, set())
+        _, res = build([("01-small/c", "x_rps", "req/s", "higher", 1.0, 100.0, 1.0, 100.0)])
+        self.assertEqual(regression_gate.rejudge(compare, self.env(), res, b)["verdict"], "ok")
+
+    def test_rejudging_ignores_the_rustc_override(self):
+        _, res = build([("01-small/c", "x_rps", "req/s", "higher", 1.0, 100.0, 1.0, 100.0)])
+        env = self.env(rustc_override=True, engines={"v1_2_2": {"rustc": "1.100.0"}, "candidate": {"rustc": "1.99.1"}})
+        summ = regression_gate.rejudge(compare, env, res, self.baseline())
+        self.assertEqual(summ["verdict"], "INVALID")
+        self.assertTrue(any("older than" in p for p in summ["problems"]), summ["problems"])
+
+    def test_a_redis_built_from_the_pinned_tarball_is_accepted(self):
+        b = self.baseline()
+        b["pins"] = {"redis_sha256": "image", "redis_source_sha256": "tarball"}
+        env = self.env(engines={"redis": {"sha256": "built-here"}})
+        probs = compare.validity_problems(dict(env, redis_source_sha256="tarball"), b, {"x": {}}, False, False)
+        self.assertFalse(any("redis-server" in p for p in probs), probs)
+        probs = compare.validity_problems(dict(env, redis_source_sha256="other"), b, {"x": {}}, False, False)
+        self.assertTrue(any("redis-server" in p for p in probs), probs)
+
+
 if __name__ == "__main__":
     unittest.main()

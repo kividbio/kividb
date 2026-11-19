@@ -18,10 +18,10 @@ other files:
 |---|---|
 | Protocol | RESP2 and RESP3 (`HELLO`). Redis clients, `redis-cli` and cluster-aware clients work unchanged. |
 | Core data types | Strings, lists, sets, sorted sets, hashes (with per-field TTLs), streams and consumer groups, bitmaps, geo, Pub/Sub (including sharded). HyperLogLog, which reads Redis's encoding: see *Differences*. |
-| Redis 8 data types | JSON, search and query (`FT.*`, full-text, tag, numeric and vector), time series (`TS.*`), vector sets (`V*`), Bloom filters (`BF.*`). All built in, nothing to load. |
+| Redis 8 data types | JSON, search and query (`FT.*`, full-text, tag, numeric and vector), time series (`TS.*`), vector sets (`V*`), Bloom filters (`BF.*`), Cuckoo filters (`CF.*`), Count-min sketches (`CMS.*`), Top-K (`TOPK.*`), t-digests (`TDIGEST.*`). All built in, nothing to load. |
 | Transactions and scripts | `MULTI`/`EXEC`/`WATCH` and scripts run as one step, as in Redis ([EXEC_ATOMICITY.md](EXEC_ATOMICITY.md)). Lua (`EVAL`, `FUNCTION`, `FCALL`) needs the `lua` or `full` build. |
 | Security | `AUTH`, ACLs (users, key and channel patterns, ACL file), protected mode, TLS in the `tls` and `full` builds. |
-| Persistence | Snapshots (`dump.kdb`) and an append-only file. Reads a Redis `dump.rdb`. ([PERSISTENCE.md](PERSISTENCE.md)) |
+| Persistence | Snapshots (`dump.kdb`, compressed with `rdbcompression yes`, which is off by default) and an append-only file. Reads a Redis `dump.rdb`. ([PERSISTENCE.md](PERSISTENCE.md)) |
 | Replication | `REPLICAOF`, partial resync, and replicating from a Redis primary. |
 | Cluster | Redis's cluster protocol: hash slots, `CLUSTER` commands, gossip, failover, atomic slot migration. |
 | Sentinel | Not implemented. |
@@ -164,6 +164,28 @@ other files:
   soonest first; so once a field of a small hash has a TTL the two orders
   differ. They agree for a `listpack`.
 
+**Sorted sets**
+- Small sorted sets are kept as Redis keeps them, and `OBJECT ENCODING`
+  says so: `listpack` for up to `zset-max-listpack-entries` (128) members
+  of up to `zset-max-listpack-value` (64) bytes, `skiplist` otherwise (a
+  hash table and an ordered tree here). A set moves when a write adds a
+  member past either limit, or when one `ZADD` (or `GEOADD`) gives more
+  pairs than the entries limit, as in Redis; never back: a set taken back
+  under the limit stays a `skiplist`, as in Redis. A set made whole (a
+  load, `RESTORE`, `MIGRATE`, `ZRANGESTORE`, `ZUNIONSTORE` and the other
+  `*STORE` commands) is a `listpack` if it fits, as Redis loads one.
+- `ZSCAN` returns a `listpack` whole, in order, with cursor 0, whatever
+  `COUNT` says, as Redis does.
+- The two limits go no higher than 128 and 64 (the most one block holds);
+  a larger value is taken as those, and `CONFIG GET` says so (Redis keeps
+  what it is given, and its listpack holds more). The `zset-max-ziplist-*`
+  names set and report the same two settings. A lowered limit applies to
+  a set at its next new member; a changed score never moves a set, as in
+  Redis.
+- `SORT` of a `listpack` sorted set leaves it a `listpack`; Redis 8.10
+  turns the set it sorts into a `skiplist`, so `OBJECT ENCODING` differs
+  after a `SORT` (the replies do not).
+
 **Lists**
 - A list's elements are kept end to end in chunks of up to 64, as Redis
   keeps a quicklist of listpacks, but the size of a chunk is fixed: Redis
@@ -214,8 +236,9 @@ other files:
   a `VALKEY080` header) is read, hash field TTLs included.
 - Redis and Valkey can't read KiviDB's `DUMP` payloads or replicate from
   KiviDB ([#450](https://github.com/kividbio/kividb/issues/450)), so moving
-  data back off KiviDB means copying it key by key. Bloom filters are the
-  exception: their payloads are Redis's, and Redis restores them.
+  data back off KiviDB means copying it key by key. Bloom and Cuckoo
+  filters, Count-min sketches and Top-K sketches are the exception: their
+  payloads are Redis's, and Redis restores them.
 - `DUMP`/`RESTORE` and `MIGRATE` of time series and vector sets work between
   KiviDB nodes only: their payloads are KiviDB's own, and Redis's for these
   types (module values) aren't read either. A series' compaction rules and
@@ -231,9 +254,9 @@ other files:
   short. `INT8` and `UINT8` vectors aren't supported.
 - A Redis RDB with search index definitions loads without them: run
   `FT.CREATE` again. Bloom filters load (RedisBloom 2.4 and later: Redis
-  Stack 6.2 to 7.4, Redis 8). One with other module data (time series,
-  vector sets, Cuckoo filters, Count-min sketches, Top-K, t-digests) is
-  refused.
+  Stack 6.2 to 7.4, Redis 8), and so do Cuckoo filters, Count-min sketches
+  and Top-K sketches. One with other module data (time series, vector sets,
+  t-digests) is refused.
 - Bloom filters: `COPY` copies one, which Redis refuses. A filter made before
   RedisBloom 2.0 (32-bit hashes) is not loaded. A filter has size limits
   Redis does not have: a client's commands do not make or grow one past
@@ -245,6 +268,41 @@ other files:
   snapshot, an RDB file or a `DUMP` payload says about a filter is checked
   before it is used: one Redis could not have made is refused. Their `DUMP` payloads carry RDB version 9, so every Redis
   since 6.0 can `RESTORE` them.
+- Count-min sketches: counts are Redis's exactly (items are placed as
+  Redis places them). `COPY` copies one, which Redis refuses. A sketch has
+  at most 134,217,728 counters and 65,536 rows, made or loaded; `CMS.INCRBY`,
+  `CMS.QUERY` and `CMS.MERGE` have per-command limits, checked before they
+  start. `CMS.MERGE` names its sources as keys (ACL patterns and cluster
+  slots apply to them), and needs read permission on them and write
+  permission on its destination (Redis checks only the destination,
+  and takes read or write permission on it). See [COMMANDS.md](../COMMANDS.md).
+- Top-K: with a decay of 1 every answer is Redis's; below 1, which bucket
+  decays is left to chance, drawn from a generator each sketch keeps (so
+  replicas and the AOF stay identical to the master), and answers are as
+  good as Redis's, not bit for bit the same. `DUMP` (Redis's format) does
+  not carry the generator: a copy made by `RESTORE`, `MIGRATE` or a slot's
+  move starts it afresh, and from then on does not make the choices the
+  original would have. Items are binary-safe (Redis
+  cuts them at a zero byte in replies). `COPY` copies one, which Redis
+  refuses. Size limits (k 65,536, 67,108,864 buckets, 65,536 rows) and a
+  per-command limit on `TOPK.ADD`, `TOPK.INCRBY`, `TOPK.QUERY` and
+  `TOPK.COUNT`, checked before they start. See [COMMANDS.md](../COMMANDS.md).
+- Cuckoo filters are Redis's byte for byte (replies, `CF.SCANDUMP` chunks,
+  `DUMP`). `COPY` copies one, which Redis refuses. At most 1 GiB and 99
+  sub-filters, made, grown or loaded; `CF.INSERT`, `CF.INSERTNX` and
+  `CF.MEXISTS` have a per-command limit, checked before they start, and a
+  compaction stops at a limit of its own (a large filter compacts in part,
+  where Redis's compaction goes on). A sub-filter over 16 MiB is dumped in
+  pieces that follow on, which Redis does not do. See
+  [COMMANDS.md](../COMMANDS.md).
+- t-digests: answers are approximations within the same bounds as Redis's,
+  not bit for bit the same (where nothing is approximated, they are Redis's).
+  A query never changes a digest, so `TDIGEST.INFO`'s node counts can differ.
+  Their `DUMP` payloads are KiviDB's own (Redis's are refused). A compression
+  of at most 100,000; queries of many values and merges have a per-command
+  limit. `TDIGEST.MERGE` needs read permission on its sources and write
+  permission on its destination (Redis takes read
+  permission on the destination for write). See [COMMANDS.md](../COMMANDS.md).
 - Set and sorted-set members can't have their own TTLs. A Dragonfly file
   with a `SADDEX` set, or a KeyDB file or stream with `EXPIREMEMBER` on a set
   or sorted-set member, is refused, naming the key. Hash field TTLs from
@@ -267,6 +325,16 @@ other files:
   clients use what that release has: redis-py's and Jedis's client-side
   caches need Redis 7.4 or later. KiviDB's own release is `kividb_version`,
   in `HELLO` and in `INFO`.
+- `enable-debug-command` is Redis's, `no` by default from 1.3.0 (1.2.2 and
+  earlier ignored it): `DEBUG` is refused with Redis's error unless the
+  server started with `yes`, or with `local` and the client is on loopback
+  (KiviDB has no Unix socket). Inside `MULTI` the refusal discards the
+  transaction, as in Redis. `CONFIG SET` refuses it, whatever the value, as
+  Redis does. One difference: a user whose ACL does not allow `DEBUG` gets
+  `NOPERM` (Redis checks the setting first).
+- `enable-protected-configs` and `enable-module-command` are accepted, in
+  the config file and by `CONFIG SET`, and change nothing: KiviDB has no
+  protected configs and no modules.
 - `MEMORY USAGE` is an estimate; `MEMORY MALLOC-STATS` is a stub.
 - `OBJECT IDLETIME` is `0` unless a `maxmemory-policy` that uses it is set,
   or `key-access-tracking yes` is (Redis always keeps it; the setting costs
@@ -289,6 +357,27 @@ other files:
   it on, and overrides a raised `repl-replica-max-backlog-bytes` earlier in
   the file (the last line wins). The limits count the bytes waiting, not
   the allocator's rounding of them.
+- `MONITOR` shows every command once, as Redis does: nothing is dropped.
+  A monitor that reads more slowly than commands run has what it has not
+  read kept for it, held to `client-output-buffer-limit normal` (the class
+  Redis counts a monitor in; no limit by default, as in Redis); past that
+  limit it is disconnected, with `Client id=… closed: it is in MONITOR and
+  … bytes behind` in the log and `client_output_buffer_limit_disconnections`
+  counted; what it has not read shows in its `omem` in `CLIENT LIST`.
+  Every monitor sees the same order, a connection's commands always in the
+  order it sent them, and time stamps in the order of the lines (they are
+  read from the system clock, so they go back only when the clock is set
+  back, as in Redis). A command is shown when it is called, before it runs;
+  Redis shows it once it has run. So a script's `EVAL` is shown before the
+  commands it calls (Redis: after them), `SELECT` is shown with the
+  database it was called in (Redis: the one it selected), and two
+  connections' commands on one key that arrive at nearly the same moment
+  on two worker threads can have run in the other order than they are
+  shown; Redis, with one thread, has no such moment. `AUTH` and `HELLO …
+  AUTH` are not shown at all (Redis shows them with the password as
+  `(redacted)`). Up to 1.2.2 a monitor that fell 4,096
+  lines behind lost lines without a word: with four connections sending at
+  full speed, half or more of what they sent.
 - A replica doesn't enforce `maxmemory` on what its master sends. A replica
   of a KiviDB master older than 1.1.3 expires keys by its own clock (such a
   master sends no `DEL` for the keys it expires). A replica of a 1.2.0
@@ -309,8 +398,16 @@ other files:
   new value, where Redis takes it at runtime. Set it in the config file or
   with `--cluster-node-timeout` and restart the node. The announce settings
   (`cluster-announce-ip`, `-port`, `-bus-port`, `-hostname`,
-  `-client-port`) and `cluster-require-full-coverage` can be changed at
-  runtime, as in Redis.
+  `-client-port`, and Valkey 8's `-client-ipv4` and `-client-ipv6`) and
+  `cluster-require-full-coverage` can be changed at runtime, as in Redis.
+- `cluster-announce-client-ipv4` / `-ipv6` (Valkey 8): a client is told the
+  address for the family of its own connection, as in Valkey; one that
+  reaches a node listening on `::` over IPv4 (an IPv4-mapped address) counts
+  as IPv4. They travel in a node's own heartbeats (the bus's flags
+  string, not Valkey's ping extensions; never in gossip, as in Valkey), and
+  are not saved in `nodes.conf`: a restarted
+  node tells clients a peer's own address until that peer's first heartbeat
+  (about a second).
 - Keys a master holds of slots it does not serve (left, for example, on a
   replica promoted after its master crashed right after handing slots over
   in an atomic slot migration) are not deleted on their own. KiviDB logs a

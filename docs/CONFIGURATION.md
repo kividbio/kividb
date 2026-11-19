@@ -85,7 +85,10 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--port` | `6380` | Port to listen on; `0` for none (TLS only, with `--tls-port`) |
 | `--bind` | `0.0.0.0` | Address to listen on. Setting it explicitly turns off [protected mode](#protected-mode) |
 | `--protected-mode <yes\|no>` | `yes` | See [Protected mode](#protected-mode) |
+| `--enable-debug-command <no\|yes\|local>` | `no` | Who may run `DEBUG`: nobody, any client its ACL user allows, or only clients on loopback; startup only (see below the table) |
 | `--threads` | `0` (auto) | Worker threads; auto is one per CPU the process may use (see [Worker threads](#worker-threads)) |
+| `--worker-cpu-affinity <off\|auto>` | `off` | `auto` binds each io_uring worker to a CPU of its own when they are as many as the process's CPUs (see [Worker CPU affinity](#worker-cpu-affinity)) |
+| `--search-index-threads <auto\|N>` | `auto` | Helper threads that link vectors written to HNSW indexes; startup only (see [Search index threads](#search-index-threads)) |
 | `--databases` | `16` | Number of databases |
 | `--dir <path>` | start directory | Where `dump.kdb`, `appendonly.aof` and `nodes.conf` live |
 | `--aof` | off | Append-only file persistence |
@@ -106,12 +109,25 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--slowlog-max-len <n>` | `128` | Slowlog entries kept |
 | `--cluster-enabled <yes\|no>` | `no` | Cluster mode: a cluster bus on `<port> + 10000`, topology in `nodes.conf`, gossip, failure detection and failover |
 | `--cluster-node-timeout <ms>` | `15000` | Time without a reply before a peer is suspected to have failed |
+| `--cluster-announce-client-ipv4 <addr>`, `--cluster-announce-client-ipv6 <addr>` | none | The address clients connected over IPv4 / IPv6 are told to reach this node at, in redirects and `CLUSTER SLOTS`, `SHARDS`, `NODES` and `REPLICAS`, where it is not the one nodes use between themselves (Valkey 8). Unset, a client is told the node's address. Changeable with `CONFIG SET` (empty unsets); the other nodes learn it from this node's next heartbeat |
 | `--tls-port <port>` | `0` (off) | TLS listener (TLS builds only); with `--port 0`, the only one |
 | `--tls-cert-file`, `--tls-key-file` | none | Server certificate and key (PEM) |
 | `--tls-ca-cert-file` | none | CA that client certificates are checked against |
 | `--tls-auth-clients <yes\|optional\|no>` | `yes` | Whether clients must present a certificate (only with `--tls-ca-cert-file`) |
 | `--tls-auth-clients-allowed-names <names>` | none | Names a client certificate's CN or DNS name must match; `*.` is one label |
 | `--update-check <yes\|no>` | `yes` | The [startup update check](#startup-update-check) |
+
+`DEBUG` is refused by default from 1.3.0, as in Redis 7 and later: `enable-debug-command`
+is `no`, and every client gets Redis's `ERR DEBUG command not allowed ...`. Start the server
+with `--enable-debug-command yes` (or `enable-debug-command yes` in the config file) to allow
+it to any client whose ACL user may run `DEBUG`, or `local` to allow it only to clients on
+loopback (`127.0.0.0/8`, `::1`). Behind a proxy every client has the proxy's address, so
+`local` means local to the proxy. The ACL is checked first. Inside `MULTI` the refusal
+discards the transaction (`EXEC` answers `EXECABORT`); a script cannot run `DEBUG` whatever
+the setting. The setting is read at startup only: `CONFIG GET enable-debug-command` reports
+it and `CONFIG SET` refuses it, whatever the value. Up to 1.2.2 it was accepted and ignored,
+and `DEBUG` was open to any user whose ACL allowed it. `redis-cli --cluster fix` compares a
+key both nodes hold with `DEBUG DIGEST-VALUE`, so it needs `DEBUG` allowed, as with Redis 7.
 
 `maxclients` (default `10000`, in the file or with `CONFIG SET`) counts plaintext and TLS
 clients, TLS ones from the start of their handshake. At startup KiviDB raises the soft
@@ -120,7 +136,26 @@ open-file limit to `maxclients` plus what it keeps for itself (32 files, or on i
 warning. Cluster bus links, a replica's link to its master and files written while saving
 are not counted in that; leave room for them in a large cluster.
 
-Persistence (snapshots and the AOF) is described in [PERSISTENCE.md](PERSISTENCE.md).
+Small collections are kept in one block of memory up to Redis's limits, which are set as in
+Redis, in the file or with `CONFIG SET`, and reported by `CONFIG GET` and `OBJECT ENCODING`:
+`set-max-intset-entries` (512), `set-max-listpack-entries` (128) and `set-max-listpack-value`
+(64) for sets; `hash-max-listpack-entries` (512) and `hash-max-listpack-value` (64) for hashes;
+`zset-max-listpack-entries` (128) and `zset-max-listpack-value` (64) for sorted sets (a sorted
+set of up to that many members, none longer than that many bytes, is one block; past either it
+is a hash table and an ordered tree). The `*-max-ziplist-*` names of the hash and sorted-set
+settings are the same settings. A limit goes no higher than what one block holds (128 members
+of 64 bytes for sets and sorted sets, 512 fields for hashes): a larger value is taken as that
+maximum, `CONFIG GET` reports what was kept, and a warning naming the maximum is logged. `0`
+entries keeps new hashes and sorted sets out of blocks. A changed limit applies to a hash at
+its next write that sets a field, to a set or a sorted set at its next new member (a changed
+score never moves a sorted set); a collection never moves back to a block.
+[COMPATIBILITY.md](COMPATIBILITY.md) has the details for each type.
+
+Persistence (snapshots and the AOF) is described in [PERSISTENCE.md](PERSISTENCE.md),
+including `rdbcompression` (default `no`; `yes` writes snapshots compressed, which 1.2 cannot read) and the
+`kividb kdb-decompress <in> <out>` and `kividb kdb-compress <in> <out>` tools, which convert a
+snapshot between the compressed form and the plain one KiviDB 1.2 reads (refusing an input the
+server would not load, and an existing output unless `--force` is given).
 
 ### Worker threads
 
@@ -149,6 +184,92 @@ application or a load generator, or to keep the count of an earlier release: up 
 was the CPUs minus 2 (all of them below 4), which is `--threads 2` on 4 CPUs and
 `--threads 6` on 8. A Kubernetes pod with a CPU request but no CPU limit has no quota, so
 the server sees every CPU of the node: give it a limit, or `--threads`.
+
+### Search index threads
+
+`--search-index-threads` (`search-index-threads` in the configuration file; read at startup,
+`CONFIG GET search-index-threads` shows it, `CONFIG SET` refuses it) is how many helper
+threads link the vectors written to HNSW indexes into their graphs, so that one client
+loading documents does not build the graph on one CPU. `0` starts none: each write links
+its own vector, as up to 1.2. `auto`, the default, starts none under a CPU quota (Docker's
+`--cpus`, a Kubernetes CPU limit) or with fewer than 8 CPUs, and otherwise (CPUs - 2) / 2:
+three on 8, seven on 16. A number starts that many on any machine. The log says how many
+started, on the first write that needs them.
+
+So on a server of fewer than 8 CPUs builds run at 1.2's speed by default, and
+`search-index-threads 1` (or more) trades serving latency for build speed. The helpers take
+CPU time the workers would otherwise have. With every CPU of a 4-vCPU server busy (GET/SET
+from memtier, one client loading 384-d vectors in pipelines, one `HSET` every 2 ms from
+another client):
+
+| helpers | GET/SET p99 | KNN p50 | `HSET` p99 | build alone |
+|---|---:|---:|---:|---:|
+| master (links in the writes) | 1.61 ms | 0.87 ms | 2.25 ms | 1,550 docs/s |
+| 0 (`auto` below 8 CPUs) | 1.64 ms | 0.89 ms | 2.32 ms | 1,540 docs/s |
+| 1 | 2.10 ms | 1.08 ms | 4.4-34 ms | 3,190 docs/s |
+| 2 | 2.62 ms | 1.13 ms | 5.5 ms | 3,620 docs/s |
+
+The `HSET` column is one writer connection, so it shows where that connection landed:
+4.4-34 ms with one helper is a connection that shared the bulk loader's worker in two runs
+of three. Over 8 writer connections (one `HSET` every 2 ms in turn), the one or few on the bulk
+loader's worker wait behind its pipelines in every build, helpers or not (their median
+15-25 ms with none, 12-16 ms with one helper); on the others one helper raised the `HSET`
+p99 from 2.3-2.7 ms to 4.5-4.7 ms. Under a CPU quota a helper spends the quota and the
+whole server is throttled (GET/SET p99 8-9 ms against 0.35 ms beside a load with
+`--cpus 2` and one helper), which is why `auto` starts none there: in a container or a
+Kubernetes pod with a CPU limit, builds run at 1.2's speed unless the setting is given a
+number. [SEARCH.md](SEARCH.md#index-builds-and-ef_runtime) and
+[PERFORMANCE.md](PERFORMANCE.md#vector-index-builds) have more.
+
+### Worker CPU affinity
+
+`--worker-cpu-affinity auto` (or `worker-cpu-affinity auto` in the configuration file;
+`CONFIG GET` reports it, it is read only at startup) binds each io_uring worker to a CPU
+of its own: worker N to the N-th CPU the process may use. It does so only when the workers
+are exactly as many as those CPUs (the default `--threads 0` on a cpuset, or `--threads N`
+with `taskset` of N CPUs), and never when what limits the process is a cgroup CPU quota
+(Docker's `--cpus`, a Kubernetes CPU limit): a quota is time on any CPU, not CPUs of the
+server's own. The default is `off`: the workers run wherever the scheduler puts them.
+
+An io_uring worker serves its connections alone. When the scheduler puts two workers on one
+CPU, which it does at times when a third busy thread shares their CPUs (the replication hub
+while a replication backlog is kept, a background save), every connection of one waits out
+the other's time slice, and the p99 goes to milliseconds
+([#894](https://github.com/kividbio/kividb/issues/894)). Bound, each worker keeps its CPU.
+
+Turn it on when the server has its CPUs to itself: a Kubernetes pod under the static CPU
+manager policy (Guaranteed QoS, whole CPUs), a VM or host where the server is confined with
+`taskset` or a cpuset and nothing else runs on those CPUs. Leave it off when the server
+shares its CPUs with other busy processes: a bound worker cannot move to a CPU that is free
+while its own is busy. [PERFORMANCE.md](PERFORMANCE.md#worker-cpu-affinity) has both
+cases measured.
+
+The server says what it did, after the I/O model line, once every worker has tried its
+bind:
+
+```
+I/O model      : io_uring
+Worker CPUs    : pinned 2 of 2: worker 0 on CPU 0, worker 1 on CPU 2 (worker-cpu-affinity auto)
+```
+
+or that only some binds took (`pinned 1 of 2 (worker-cpu-affinity auto); refused: ...`, naming each refused bind and
+the error), or
+why it did not bind (`not pinned: 2 workers on 4 CPUs: pinned only when they are as many`).
+The server's other threads (the replication hub, the AOF writer, expiry, the script runner,
+a full sync's or a backup's work) are not bound: they run on any of the process's CPUs,
+which with `auto` in effect are the workers' CPUs, so they take turns with the workers as
+before; a thread a worker starts is given all of the process's CPUs back first. The tokio
+I/O model is not bound (its workers take each other's connections, so none waits behind one
+that is held up). Linux only: macOS has no call that binds a thread to a CPU, and on
+FreeBSD the setting is not implemented; there it is accepted and the server says it did
+nothing. The binds are made once, at startup: if the cpuset changes later, the kernel
+decides (verified on cgroup v2, Linux 7.0: a worker whose CPU is removed runs on the whole
+new set and goes back to its CPU when it returns; cgroup v1, not verified here, resets each
+thread to the new set), the startup line is not updated, and a thread started after the
+change is given the CPUs the process had at startup; a Kubernetes pod's exclusive CPUs
+under the static CPU manager do not change while its container runs. Redis's `server-cpulist` binds the server's threads to a list of CPUs together,
+not one each; KiviDB accepts it, as it accepts Redis's other settings, and does nothing
+with it.
 
 ## TLS
 

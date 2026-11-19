@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/shutdown.rs
 use std::io::Write;
 use std::net::TcpStream;
@@ -287,7 +288,8 @@ fn a_restart_is_read_from_its_own_server_only() {
 /// Start a server on `dir`, fill it, have six connections `INCR` a counter
 /// while a seventh sends `SHUTDOWN`, and return how many were acknowledged.
 fn write_until_shutdown(dir: &std::path::Path, port: u16) -> u64 {
-    let (mut server, port, mut conn) = start_on(dir, port);
+    let (mut server, port, mut conn) =
+        start_with(dir, port, &[], &["--enable-debug-command", "yes"], &[]);
     let connect = || {
         let s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();

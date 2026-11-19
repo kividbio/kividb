@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/hash_field_expiry.rs
 //
 // A hash field's expiry, as the readers of the write stream see it: a
@@ -146,6 +147,8 @@ fn kividb(dir: &Path, port: u16, extra: &[String], env: &[(String, String)]) -> 
         "4",
         "--configfile",
         "kividb.conf",
+        "--enable-debug-command",
+        "yes",
     ]);
     if let Ok(model) = std::env::var("KIVIDB_TEST_IO_MODEL") {
         command.args(["--io-model", &model]);
@@ -1390,6 +1393,177 @@ fn ft_knn_with_few_or_no_vectors_to_show() {
             assert_eq!(knn(&mut c, "s", query), keys("s", 2..5), "{algo} {query}");
         }
     }
+}
+
+/// The keys an FT.HYBRID over `index` ranks by its vector side alone (a
+/// SEARCH no document matches), `k` nearest the origin, in order.
+fn hybrid_nearest(c: &mut Conn, index: &str, k: usize) -> Vec<String> {
+    let (origin, k) = (vec2(0.0, 0.0), k.to_string());
+    let args: [&[u8]; 18] = [
+        b"FT.HYBRID",
+        index.as_bytes(),
+        b"SEARCH",
+        b"nothingmatchesthis",
+        b"VSIM",
+        b"@vec",
+        b"$q",
+        b"KNN",
+        b"2",
+        b"K",
+        k.as_bytes(),
+        b"PARAMS",
+        b"2",
+        b"q",
+        &origin,
+        b"LOAD",
+        b"1",
+        b"@__key",
+    ];
+    cmd_bytes(c, &args).arr()[3]
+        .arr()
+        .iter()
+        .map(|row| {
+            let kv = row.arr();
+            let at = kv.chunks(2).position(|kv| kv[0].s() == "__key").unwrap();
+            kv[2 * at + 1].s().to_string()
+        })
+        .collect()
+}
+
+/// The thousand nearest vectors due, of 3,000: the index search stops
+/// asking for more (on HNSW at a 16th of the index, on FLAT after its first
+/// search) and every vector is measured. FT.SEARCH and FT.HYBRID's vector
+/// side both get the ten nearest the query sees. (With a hundred due the
+/// searches alone find them: `ft_knn_refills_past_many_due_nearest_vectors`.)
+#[test]
+fn ft_knn_past_most_due_nearest_vectors() {
+    for algo in ["FLAT", "HNSW"] {
+        let server = Server::start(&[]);
+        let mut c = server.conn();
+        vectors(&mut c, "e", algo, 3000, 1000, false, false);
+        let want = keys("e", 1000..1010);
+        assert_eq!(
+            knn(&mut c, "e", "*=>[KNN 10 @vec $q]"),
+            want,
+            "{algo}: FT.SEARCH"
+        );
+        assert_eq!(hybrid_nearest(&mut c, "e", 10), want, "{algo}: FT.HYBRID");
+        // Nothing due: the index, as before.
+        vectors(&mut c, "f", algo, 3000, 0, false, false);
+        assert_eq!(hybrid_nearest(&mut c, "f", 10), keys("f", 0..10), "{algo}");
+    }
+}
+
+/// The ten nearest of index `index` around the origin, nearest first, each
+/// key with its distance.
+fn knn_scored(c: &mut Conn, index: &str) -> Vec<(String, String)> {
+    let origin = vec2(0.0, 0.0);
+    let args: [&[u8]; 12] = [
+        b"FT.SEARCH",
+        index.as_bytes(),
+        b"*=>[KNN 10 @vec $q]",
+        b"PARAMS",
+        b"2",
+        b"q",
+        &origin,
+        b"RETURN",
+        b"1",
+        b"__vec_score",
+        b"DIALECT",
+        b"2",
+    ];
+    let reply = cmd_bytes(c, &args);
+    reply.arr()[1..]
+        .chunks(2)
+        .map(|row| {
+            let score = row[1].arr().get(1).map_or("?", |s| s.s()).to_string();
+            (row[0].s().to_string(), score)
+        })
+        .collect()
+}
+
+/// Queries that measure every vector of an HNSW graph while writers add,
+/// overwrite and delete documents in it: the server keeps answering (a
+/// measured pass that took the graph's locks in the other order than an
+/// insert hung it). Several writers, each on its own connection, so that
+/// inserts, overwrites and deletes run at once beside the queries; every
+/// connection gives up after 10 s without a reply, so a hang fails the test
+/// instead of holding it. Each query gets ten: `w:2900` to `w:2999` are
+/// written over but never deleted, and a fresh key (the nearest the query
+/// sees) deleted while the query measured it gives its place to the next
+/// nearest; queries came back one or two short.
+#[test]
+fn ft_knn_measuring_every_vector_beside_writers() {
+    let server = Server::start(&[]);
+    let conn = || {
+        let c = server.conn();
+        c.reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        c
+    };
+    let mut c = conn();
+    vectors(&mut c, "w", "HNSW", 3000, 2900, false, false);
+    let stop = AtomicBool::new(false);
+    // How many fresh keys the inserting writer has written.
+    let inserted = std::sync::atomic::AtomicUsize::new(0);
+    let hset = |w: &mut Conn, key: &str, x: f32| {
+        let v = vec2(x, 1.0);
+        let args: [&[u8]; 6] = [b"HSET", key.as_bytes(), b"vec", &v, b"t", b"red"];
+        cmd_bytes(w, &args);
+    };
+    std::thread::scope(|scope| {
+        for _ in 0..3 {
+            scope.spawn(|| {
+                let mut q = conn();
+                while !stop.load(Ordering::Relaxed) {
+                    let got = knn_scored(&mut q, "w");
+                    assert_eq!(got.len(), 10, "{got:?}");
+                }
+            });
+        }
+        // Inserts fresh keys and writes over existing ones.
+        scope.spawn(|| {
+            let mut w = conn();
+            let mut i = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                hset(&mut w, &format!("w:new{i}"), 5000.0 + i as f32);
+                hset(&mut w, &format!("w:{}", 2900 + i % 100), 7000.0 + i as f32);
+                i += 1;
+                inserted.store(i, Ordering::Relaxed);
+            }
+        });
+        // Deletes the fresh keys as they come.
+        scope.spawn(|| {
+            let mut w = conn();
+            let mut j = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                if j + 1 < inserted.load(Ordering::Relaxed) {
+                    w.cmd(&["DEL", &format!("w:new{j}")]);
+                    j += 1;
+                } else {
+                    w.cmd(&["PING"]);
+                }
+            }
+        });
+        // Writes over the old keys from the other end, and adds and deletes
+        // keys of its own.
+        scope.spawn(|| {
+            let mut w = conn();
+            let mut i = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                hset(&mut w, &format!("w:{}", 2999 - i % 100), 9000.0 + i as f32);
+                let own = format!("w:third{i}");
+                hset(&mut w, &own, 11000.0 + i as f32);
+                w.cmd(&["DEL", &own]);
+                i += 1;
+            }
+        });
+        std::thread::sleep(Duration::from_secs(5));
+        stop.store(true, Ordering::Relaxed);
+    });
+    assert_eq!(c.cmd(&["PING"]).s(), "PONG");
 }
 
 /// Each result of an FT.HYBRID over index `v`, by key, with its fields.
