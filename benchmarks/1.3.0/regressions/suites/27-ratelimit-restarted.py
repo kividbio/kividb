@@ -48,7 +48,9 @@ background load, 60 % of the gain over v1.2.2 kept. Recorded on a D4s_v5
 Redis: 31.0k 0.30 ms / 31.2k 0.22 ms / 31.2k 0.52 ms at 0; 30.6k 1.56 ms /
 31.6k 0.15 ms / 31.9k 0.08 ms at 50,000; 27.8k 6.1 ms / 31.4k 0.19 ms /
 31.8k 0.12 ms at 100,000. The SET rows: 10 % and 60 % of the gain over
-v1.2.2 kept (Redis, restarted, keeps no backlog: shown, not gated).
+v1.2.2 kept (Redis, restarted, keeps no backlog: shown, not gated),
+recorded on a D4s_v5 (`results/pr-894-set-d4s_v5`), v1.2.2 / the change /
+Redis: 762k / 1.06M / 785k at pipeline 16, 927k / 1.37M / 1.10M at 100.
 """
 import os
 import re
