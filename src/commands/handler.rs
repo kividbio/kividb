@@ -1753,8 +1753,11 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
             None => None,
             Some(keys) => match lock_tags_found(ctx, keys) {
                 Ok(held) => held,
-                // Sent back (`blocking::hold_for_tags`): not run now.
-                Err(()) => return crate::pause::HELD_IN_GATE.to_vec(),
+                Err(busy) => {
+                    // Sent back: not run now.
+                    crate::commands::blocking::hold_for_tags(ctx, busy);
+                    return crate::pause::HELD_IN_GATE.to_vec();
+                }
             },
         }
     } else {
@@ -2000,23 +2003,33 @@ fn lock_tags_of_named_keys(ctx: &Ctx, name: &str) -> Option<crate::tag_locks::Ke
 fn lock_tags_found(
     ctx: &mut Ctx,
     keys: crate::tag_locks::NamedKeys,
-) -> Result<Option<crate::tag_locks::KeysGuard>, ()> {
-    let mine = match ctx
+) -> Result<Option<crate::tag_locks::KeysGuard>, crate::tag_locks::TagsBusy> {
+    let Some(slot) = ctx
         .blocking
         .as_deref_mut()
         .filter(|slot| slot.awaitable && !(slot.gone && slot.resume.is_some()))
-    {
-        None => return Ok(crate::tag_locks::lock_found_keys(keys, &ctx.cmd)),
-        Some(slot) => slot.tag_turns.take(),
+    else {
+        return Ok(crate::tag_locks::lock_found_keys(keys, &ctx.cmd));
     };
-    let tried = crate::tag_locks::try_lock_found_keys(
-        keys,
-        &ctx.cmd,
-        mine.as_ref()
-            .map_or(&[][..], crate::tag_locks::TagTurns::stripes),
-    );
-    drop(mine);
-    tried.map_err(|busy| crate::commands::blocking::hold_for_tags(ctx, busy))
+    if let Some(turns) = slot.tag_turns.take() {
+        return lock_tags_holding_turns(&ctx.cmd, keys, turns);
+    }
+    crate::tag_locks::try_lock_found_keys(keys, &ctx.cmd, &[])
+}
+
+/// [`lock_tags_found`] for the dispatch that runs a command again after its
+/// connection waited for the turns of some of its tags.
+#[cfg(feature = "lua")]
+#[cold]
+#[inline(never)]
+fn lock_tags_holding_turns(
+    cmd: &[&[u8]],
+    keys: crate::tag_locks::NamedKeys,
+    turns: crate::tag_locks::TagTurns,
+) -> Result<Option<crate::tag_locks::KeysGuard>, crate::tag_locks::TagsBusy> {
+    let tried = crate::tag_locks::try_lock_found_keys(keys, cmd, turns.stripes());
+    drop(turns);
+    tried
 }
 
 /// The order of the keys a write names (see `write_order`), and where it
