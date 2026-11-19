@@ -71,6 +71,9 @@ recorded candidate within 25 % (suite 09's tolerance for VSIM q/s); KiviDB
 loses them to Redis's HNSW search (4-40x at 100,000 vectors, more at 1M:
 #710), which the rows record. p99 is shown.
 
+KiviDB runs with `--threads 4` (all four CPUs of the VM, as auto does since
+#873; v1.2.2 gets the same count); Redis and Garnet use their own threading.
+
 Needs numpy and h5py (requirements.txt).
 """
 import asyncio
@@ -128,7 +131,7 @@ VADD_VS_REDIS = 0.1
 MEMORY_VS_REDIS = 0.8
 
 BIG = os.environ.get("VSET_1M", "0") not in ("", "0")
-S = Suite("26-vector-sets-ann", [Config(n) for n, (_, _, big) in CONFIGS.items() if BIG or not big])
+S = Suite("26-vector-sets-ann", [Config(n, threads=4) for n, (_, _, big) in CONFIGS.items() if BIG or not big])
 
 # Set before the client processes fork, so they share them.
 DATA = QUERIES = None
