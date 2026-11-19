@@ -231,6 +231,9 @@ was re-recorded for it:
 | `02 uring1`, `07`, `13` | 1 | as before |
 | `22` | 4 | as before |
 | `23`, `25`, `27` | 2 | as before |
+| `18-mastodon-feed-fanout` | 8 | recorded on a `Standard_D8s_v5` (`min_cpus=8`) with the default of the day: the candidate's log says `Worker threads : 8 (auto: one per available CPU)` |
+| `20-envoy-ratelimit` | the server's pinned CPUs (4) | as before: it pins the server to half the CPUs and passes `--threads` to match |
+| `30-script-call-cost` | 1 | as before |
 | `32-default-threads` | 0 (none) | measures the default on purpose |
 
 Redis ignores the count. The default itself is watched by
