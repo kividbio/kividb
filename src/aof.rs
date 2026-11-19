@@ -1766,8 +1766,12 @@ fn prepare_new_log(generation: u64) -> std::io::Result<()> {
     // has only what comes from here on to write, and the time in which a
     // power failure can keep the new log's first records and lose the old
     // one's last is that much shorter (#277). A failure is reported by that
-    // sync, which is the one that counts.
-    if let Ok(log) = std::fs::File::open(AOF_PATH) {
+    // sync, which is the one that counts. Not under `appendfsync always`,
+    // where every reply's sync has synced the log already: one more sync
+    // there only took the disk from the replies waiting for theirs.
+    if !fsync_always()
+        && let Ok(log) = std::fs::File::open(AOF_PATH)
+    {
         let _ = sync_log(&log, false);
     }
     let mut fresh = std::fs::File::create(TURN_OVER_TMP)?;

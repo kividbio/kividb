@@ -87,7 +87,8 @@ the disk (`appendonly.aof.rewrite.tmp`, holding records, beside an
 `appendonly.aof.prev` and no log) is kept aside too, and the old log
 replayed. To make that window short, the checkpoint syncs the log just
 before it turns it over, with nothing held: the old log's last sync then
-has only the writes made in between to write.
+has only the writes made in between to write. Under `appendfsync always`
+it does not, since every reply's sync has already synced the log.
 
 As for any log cut short, `aof-load-truncated no` changes nothing (the
 server warns that it has no effect): the restart loads what is there, logs

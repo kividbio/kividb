@@ -482,9 +482,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with instructions, and starts the log again after the old one. None of
   the writes left out had been reported synced: a sync of the new log
   (under `appendfsync always`, or for `WAITAOF`) first syncs the old one.
-  The checkpoint also syncs the log just before it turns it over, so the
-  old log's last sync has little left to write. See "The old log is
-  complete before the new one is replayed" in docs/PERSISTENCE.md.
+  Under `everysec` and `no` the checkpoint also syncs the log just before
+  it turns it over, so the old log's last sync has little left to write.
+  See "The old log is complete before the new one is replayed" in
+  docs/PERSISTENCE.md.
 - **With `lua-parallel-scripts` on, `KEYS` and `SCAN` no longer stop
   every connection (#772).** So that a walk of
   the keyspace never finds a script running beside others part-way
