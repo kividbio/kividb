@@ -154,18 +154,26 @@ this again (with and without field TTLs) and fails a build that loses it.
 ## Memory of lists
 
 Since 1.3.0 a list's elements lie end to end in chunks of up to 64, each
-element between two copies of its length, where 1.2 kept a slot, a shared
+element between two copies of its length (one byte each for an element
+shorter than 128 bytes, two otherwise), where 1.2 kept a slot, a shared
 header and an allocation of its own for every element. Bytes of
-`used_memory` an element, 3M elements of 32 bytes in lists of each size, on
-an Azure `Standard_D4s_v5`:
+`used_memory` an element, 1M elements of 32 bytes in lists of each size (3M
+in one list), on an Azure `Standard_D4s_v5`:
 
 | elements a list | 1.2.2 | 1.3.0 | Redis 8.10.2 |
 |---:|---:|---:|---:|
-| 10 | 76.0 | 48.8 | 45.0 |
-| 100 | 65.2 | 38.4 | 36.4 |
-| 1,000 | 64.1 | 36.7 | 34.6 |
-| 100,000 | 68.5 | 36.7 | 34.3 |
-| 3,000,000 | 69.8 | 36.7 | 34.3 |
+| 10 | 75.6 | 46.4 | 44.0 |
+| 100 | 65.2 | 36.4 | 36.4 |
+| 1,000 | 64.1 | 34.7 | 34.6 |
+| 100,000 | 68.5 | 34.7 | 34.3 |
+| 3,000,000 | 69.8 | 34.7 | 34.3 |
+
+Short elements, which queues hold (job ids), gain most: six-byte ids take
+8.7 bytes an element in lists of 100,000 (1.2.2: 44.5; Redis 8.10.2, which
+keeps such numbers as integers: 5.0), and BullMQ's wait list of 200,000 ids
+8.1 (1.2.2: 45.0; Redis: 5.0). A queue's churn (ten full rotations) leaves
+it as compact as a bulk load, and a list drained to a tenth gives back the
+room it kept for the rest (9.3 bytes an element left, where 1.2.2 kept 192).
 
 At 10 elements most of what is left over Redis is the key's own: its entry
 and the list's header. A list that has had an element longer than 1,024
