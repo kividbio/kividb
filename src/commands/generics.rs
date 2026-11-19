@@ -203,6 +203,13 @@ fn sort_patterns<'a>(cmd: &'a [&'a [u8]]) -> impl Iterator<Item = &'a [u8]> + 'a
     })
 }
 
+/// Whether `SORT` or `SORT_RO` `cmd` reads keys it does not name: it has a
+/// `BY` or `GET` pattern with a `*` (`tag_locks::walks`).
+#[cfg(feature = "lua")]
+pub(crate) fn sort_reads_keys_it_does_not_name(cmd: &[&[u8]]) -> bool {
+    sort_pattern_outside(cmd, |_| false).is_some()
+}
+
 /// For `SORT` or `SORT_RO` `cmd` called by a script held to a hash tag
 /// (`lua-parallel-scripts`): the first `BY` or `GET` pattern that can name
 /// a key outside the tag, which `may_touch` tells (`tag_locks`). Such a key

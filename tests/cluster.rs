@@ -14808,3 +14808,97 @@ fn migrate_moves_sorted_sets_in_every_form() {
         assert_eq!(&got, members, "{name}: the members in their order");
     }
 }
+
+/// A master coordinating searches while tagged scripts run beside others on
+/// both masters: every search is answered, and none waits for long. A
+/// coordinator holds the locks that keep such scripts out
+/// (`tag_locks::walk`) for its own part of the search only, and lets go of
+/// them before it waits for the other master's part, which takes them
+/// there. Searches are coordinated by one master: two that coordinate at
+/// once can each hold the thread the other's part would be answered on, as
+/// a coordinator waits for the other masters on its thread, scripts or not.
+/// Not deterministic: it runs the mix for a few seconds.
+#[cfg(feature = "lua")]
+#[test]
+fn coordinated_searches_beside_tagged_scripts_on_both_masters() {
+    let (nodes, ranges) = form_cluster(2);
+    let r = nodes[0].conn().cmd(&[
+        "FT.CREATE",
+        "docs",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "doc:",
+        "SCHEMA",
+        "f",
+        "TEXT",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    for i in 0..40 {
+        let key = format!("doc:{i}");
+        let slot = slot_of(&key);
+        let node = ranges
+            .iter()
+            .position(|(a, b)| (*a..=*b).contains(&slot))
+            .unwrap();
+        let r = nodes[node].conn().cmd(&["HSET", &key, "f", "hello"]);
+        assert_eq!(r, Resp::Int(1), "{r:?}");
+    }
+    // A tag of each node's slots, and a script on it that runs beside others
+    // once it has run quickly a few times.
+    let tag_of = |node: usize| -> String {
+        let (a, b) = ranges[node];
+        (0..)
+            .map(|i| format!("w{i}"))
+            // A tagged key's slot is its tag's (`slot_of` does not look for
+            // a tag itself).
+            .find(|tag| (a..=b).contains(&slot_of(tag)))
+            .unwrap()
+    };
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut loops = Vec::new();
+    for (n, node) in nodes.iter().enumerate() {
+        let key = format!("{{{}}}:k", tag_of(n));
+        let sha = node
+            .conn()
+            .cmd(&["SCRIPT", "LOAD", "redis.call('INCR', KEYS[1]) return 1"])
+            .text();
+        for _ in 0..3 {
+            assert_eq!(node.conn().cmd(&["EVALSHA", &sha, "1", &key]), Resp::Int(1));
+        }
+        for _ in 0..3 {
+            let mut c = node.conn();
+            let (sha, key) = (sha.clone(), key.clone());
+            loops.push(std::thread::spawn(move || {
+                let mut slowest = Duration::ZERO;
+                while Instant::now() < deadline {
+                    let asked = Instant::now();
+                    assert_eq!(c.cmd(&["EVALSHA", &sha, "1", &key]), Resp::Int(1));
+                    slowest = slowest.max(asked.elapsed());
+                }
+                ("script", slowest)
+            }));
+        }
+        for _ in 0..if n == 0 { 2 } else { 0 } {
+            let mut c = node.conn();
+            loops.push(std::thread::spawn(move || {
+                let mut slowest = Duration::ZERO;
+                while Instant::now() < deadline {
+                    let asked = Instant::now();
+                    let found = c.cmd(&["FT.SEARCH", "docs", "hello", "NOCONTENT"]);
+                    assert_eq!(found.array()[0].int(), 40, "{found:?}");
+                    slowest = slowest.max(asked.elapsed());
+                }
+                ("search", slowest)
+            }));
+        }
+    }
+    for done in loops {
+        let (what, slowest) = done.join().unwrap();
+        assert!(
+            slowest < Duration::from_secs(3),
+            "a {what} waited {slowest:?}"
+        );
+    }
+}
