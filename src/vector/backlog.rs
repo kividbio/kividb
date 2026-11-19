@@ -467,13 +467,24 @@ static POOL: Pool = Pool {
     ready: parking_lot::Condvar::new(),
 };
 
-/// Helper threads running: 0 until the first write asks, and if none
-/// could be started.
+/// Helper threads running: 0 until the first write asks, under a CPU
+/// quota, and if none could be started.
 static HELPERS: AtomicUsize = AtomicUsize::new(0);
 static START: std::sync::Once = std::sync::Once::new();
 
 /// How many helpers link vectors, started once, on the first call: half the
-/// CPUs the process may use (at least one).
+/// CPUs the process may use (at least one), and none under a CPU quota.
+///
+/// Under a quota (a container's `--cpus`, Kubernetes' CPU limit) the
+/// helpers spend the quota the workers need: `SCHED_IDLE` keeps them off
+/// busy CPUs, not off the quota, and with idle CPUs beside them they run
+/// until the whole process is throttled. In a container with `--cpus 2` on
+/// an 8-vCPU D8s_v5, memtier GET/SET from the host while one client loaded
+/// 384-d vectors (30 s, 3 runs): with one helper 95k a second at a p99 of
+/// 8.0-9.3 ms (p99.9 45 ms), throttled in every period; with the vectors
+/// linked in the writes 141-142k at 0.34-0.36 ms (p99.9 28 ms), the load
+/// 1,560-1,590 documents a second against 1,910-2,070. So there the writes
+/// link their vectors themselves, as in 1.2.
 ///
 /// They share those CPUs with the workers, which since #873 are one per
 /// CPU. Measured on an Azure D8s_v5, the server on 6 vCPUs and memtier
@@ -487,9 +498,13 @@ fn helpers() -> usize {
     START.call_once(|| {
         // The process's CPUs: the first write may come from a worker bound
         // to one (`worker-cpu-affinity`), and std would see only that one.
-        // A CPU quota (a container's `--cpus`) counts too.
         let cpus = crate::cpus::available_parallelism().map_or(1, |n| n.get());
-        let want = (cpus / 2).max(1);
+        // Unit tests have helpers whatever the machine: they test them.
+        let want = if !cfg!(test) && crate::cpus::cpu_quota().is_some() {
+            0
+        } else {
+            (cpus / 2).max(1)
+        };
         let mut started = 0;
         for n in 0..want {
             use crate::cpus::BuilderExt;

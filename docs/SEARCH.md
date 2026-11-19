@@ -28,9 +28,11 @@ The full command surface, filters, hybrid search and edge cases are in **[COMMAN
 ## Index builds and `EF_RUNTIME`
 
 - **Vectors are linked into an HNSW graph by helper threads**: half as many as the CPUs
-  the server may use (no more than a CPU quota such as a container's `--cpus` allows, and
-  at least one), started once, and on Linux run as `SCHED_IDLE`, so that they take only
-  CPU time the workers leave. On a server whose CPUs the workers keep busy the backlog
+  the server may use (at least one), started once, and on Linux run as `SCHED_IDLE`, so
+  that they take only CPU time the workers leave. Under a CPU quota (a container's
+  `--cpus`, a Kubernetes CPU limit) there are none and each write links its vector, as
+  before: the helpers would spend the quota the workers need, and the whole server would
+  be throttled (GET/SET p99 8-9 ms against 0.35 ms beside a load, with `--cpus 2`). On a server whose CPUs the workers keep busy the backlog
   stays full and each write links its own vector, as before (measured with every server
   CPU busy: the backlog held its limit the whole time). A write puts its vector in the graph's backlog and returns; a search measures every
   vector of the backlog exactly, beside what it finds in the graph, so a document is found

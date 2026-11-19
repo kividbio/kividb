@@ -314,6 +314,31 @@ pub fn available_parallelism() -> std::io::Result<std::num::NonZeroUsize> {
     std::thread::available_parallelism()
 }
 
+/// The CPUs a CPU quota (cgroup `cpu.max`, a container's `--cpus`) lets the
+/// process use, when that is fewer than the CPUs its mask holds: `None`
+/// without a quota, or with one at least as large as the mask.
+///
+/// Under a quota a thread that runs only on idle CPUs (`SCHED_IDLE`) still
+/// spends the quota: with CPUs idle beside it, it runs, and the whole
+/// process is then throttled to the end of the period.
+#[allow(clippy::disallowed_methods)]
+pub fn cpu_quota() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let (mask, counted) = if PINNED.load(std::sync::atomic::Ordering::Relaxed) {
+            (ALLOWED.get()?.len(), UNPINNED.get().copied().flatten()?.get())
+        } else {
+            (
+                allowed_cpu_ids()?.len(),
+                std::thread::available_parallelism().ok()?.get(),
+            )
+        };
+        (counted < mask).then_some(counted)
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
 // ── Starting threads ──────────────────────────────────────────────────────
 //
 // Every thread the server starts goes through one of these, so that a thread

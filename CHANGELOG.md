@@ -380,8 +380,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **An HNSW index is built 4x faster from one client (#760).** A vector
   written to an HNSW index is put in its graph's backlog and linked by
-  helper threads (half the CPUs the server may use, within a CPU quota,
-  `SCHED_IDLE` on Linux),
+  helper threads (half the CPUs the server may use, `SCHED_IDLE` on Linux;
+  none under a CPU quota such as a container's `--cpus`, where they would
+  spend the quota the workers need),
   where up to 1.2 the writing connection's thread linked it inside the
   write: one client loading documents built the graph on one CPU. A search
   measures every vector of the backlog exactly beside the graph's, so a
