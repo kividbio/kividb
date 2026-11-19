@@ -1192,6 +1192,48 @@ the 4 Python readers are near their limit there, so it catches a loss, not
 a gain. #851's PR has the pinned measurements (server on 2 vCPUs, clients
 on the other 2, a Rust client), where the difference is larger.
 
+## Recorded run, suite 26
+
+Recorded 2026-11-19 on an Azure Standard_D4s_v5 (Xeon Platinum 8370C),
+`--only 26 --record` (`GARNET_SERVER` set, `SUITE_TIMEOUT=3600`); the
+candidate is commit `6065c780` (#922 merged with master `5bd40b4b`),
+`cargo build --release` by rustc 1.100.0, KiviDB on `--threads 4`. Runs:
+`pr922-6065c780-d4s_v5` (recorded; the 100,000-vector configurations only,
+`VSET_1M` unset) and `pr922-6065c780-d4s_v5-rerun` (the noise check: every gate
+passed, host speed 1.04x). A run takes 759 s. The rerun's candidate `VSIM` was
+1.5x faster than the recorded run's (193 / 344 / 369 a second on glove100, 56 /
+142 / 143 on laion768), Redis's 1.0-1.25x: this suite's `VSIM` rates move more
+between runs than the 25 % gate, and the recorded values are the lower run's.
+
+| config | metric | v1.2.2 | candidate | Redis 8.10.2 |
+|---|---|---:|---:|---:|
+| glove100_100k | `VADD` a second | 179,699 | 177,837 | 1,935 |
+| glove100_100k | `used_memory` a vector, bytes | 496 | 196 | 869 |
+| glove100_100k | EF, recall@10 | 10, 1.000 | 10, 0.985 | 640, 0.971 |
+| glove100_100k | `VSIM` a second at 1 / 16 / 100 connections | 81 / 196 / 187 | 125 / 279 / 277 | 463 / 1,182 / 1,166 |
+| glove100_100k | `VSIM` p99 ms at 1 / 16 / 100 | 14.1 / 106 / 1,059 | 9.7 / 78 / 873 | 3.8 / 26 / 174 |
+| laion768_100k | `VADD` a second | 102,935 | 89,907 | 1,600 |
+| laion768_100k | `used_memory` a vector, bytes | 3,168 | 864 | 1,526 |
+| laion768_100k | EF, recall@10 | 10, 0.998 | 10, 0.975 | 80, 0.966 |
+| laion768_100k | `VSIM` a second at 1 / 16 / 100 connections | 25 / 63 / 64 | 54 / 132 / 133 | 1,631 / 4,284 / 4,036 |
+| laion768_100k | `VSIM` p99 ms at 1 / 16 / 100 | 42.8 / 297 / 3,002 | 19.7 / 162 / 1,793 | 0.94 / 7.3 / 42.3 |
+
+KiviDB's `VSIM` is an exact scan (#710), so it needs no EF to reach the target
+and Redis's HNSW search is 3.7-30x faster on it at 100,000 vectors: the rows
+record that, they do not gate it against Redis. What is gated against Redis
+is where KiviDB is ahead: `VADD` (0.01x and 0.02x of Redis's time per vector,
+limit 0.1x) and memory (0.23x and 0.57x, limit 0.8x); recall is at least
+0.95 everywhere. The `VSIM` q/s rows hold within 25 % of the recorded value.
+v1.2.2's own `VSIM` is the same scan, 0.5-0.7x as fast, so the speed gates of
+this first recording were judged against the recorded values only.
+
+Garnet v2.2.13 (`raw["garnet"]` in `raw.tar.gz`, not a row), measured the same
+way: `VADD` 3,833 and 3,087 a second; EF 1,280 (recall 0.960) on glove100 and 80
+(0.971) on laion768; `VSIM` 187 / 567 / 568 a second on glove100 and
+1,244 / 4,070 / 4,213 on laion768 at 1 / 16 / 100 connections; RSS a vector
+10,517 and 14,005 bytes (it has no `used_memory`). It needs the .NET 10 runtime
+(`DOTNET_ROOT`; the tarball is framework-dependent).
+
 ## Recorded run, suite 29
 
 Run 2026-11-19 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C) held to

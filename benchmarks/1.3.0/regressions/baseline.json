@@ -10139,6 +10139,1070 @@
         }
       ]
     },
+    "26-vector-sets-ann/glove100_100k/bytes_per_vector": {
+      "suite": "26-vector-sets-ann",
+      "config": "glove100_100k",
+      "metric": "bytes_per_vector",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 495.7515,
+        "candidate": 195.7447,
+        "redis": 869.1877,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 0.8
+        }
+      ]
+    },
+    "26-vector-sets-ann/glove100_100k/ef": {
+      "suite": "26-vector-sets-ann",
+      "config": "glove100_100k",
+      "metric": "ef",
+      "unit": "EF",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 10.0,
+        "candidate": 10.0,
+        "redis": 640.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "26-vector-sets-ann/glove100_100k/recall_at_10": {
+      "suite": "26-vector-sets-ann",
+      "config": "glove100_100k",
+      "metric": "recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1.0,
+        "candidate": 0.985,
+        "redis": 0.9712,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "min": 0.95
+        }
+      ]
+    },
+    "26-vector-sets-ann/glove100_100k/rss_per_vector": {
+      "suite": "26-vector-sets-ann",
+      "config": "glove100_100k",
+      "metric": "rss_per_vector",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 514.8262,
+        "candidate": 210.6573,
+        "redis": 888.5453,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "26-vector-sets-ann/glove100_100k/vadd_per_s": {
+      "suite": "26-vector-sets-ann",
+      "config": "glove100_100k",
+      "metric": "vadd_per_s",
+      "unit": "VADD/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 179698.8847,
+        "candidate": 177836.7873,
+        "redis": 1934.9294,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 0.1
+        }
+      ]
+    },
+    "26-vector-sets-ann/glove100_100k/vsim_p99_ms_c1": {
+      "suite": "26-vector-sets-ann",
+      "config": "glove100_100k",
+      "metric": "vsim_p99_ms_c1",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 14.1343,
+        "candidate": 9.6802,
+        "redis": 3.8108,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "26-vector-sets-ann/glove100_100k/vsim_p99_ms_c100": {
+      "suite": "26-vector-sets-ann",
+      "config": "glove100_100k",
+      "metric": "vsim_p99_ms_c100",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1058.7433,
+        "candidate": 873.4868,
+        "redis": 174.4978,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "26-vector-sets-ann/glove100_100k/vsim_p99_ms_c16": {
+      "suite": "26-vector-sets-ann",
+      "config": "glove100_100k",
+      "metric": "vsim_p99_ms_c16",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 105.6685,
+        "candidate": 77.9944,
+        "redis": 26.0029,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "26-vector-sets-ann/glove100_100k/vsim_qps_c1": {
+      "suite": "26-vector-sets-ann",
+      "config": "glove100_100k",
+      "metric": "vsim_qps_c1",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 80.8843,
+        "candidate": 124.5851,
+        "redis": 462.5421,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "26-vector-sets-ann/glove100_100k/vsim_qps_c100": {
+      "suite": "26-vector-sets-ann",
+      "config": "glove100_100k",
+      "metric": "vsim_qps_c100",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 186.6853,
+        "candidate": 276.5134,
+        "redis": 1165.5158,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "26-vector-sets-ann/glove100_100k/vsim_qps_c16": {
+      "suite": "26-vector-sets-ann",
+      "config": "glove100_100k",
+      "metric": "vsim_qps_c16",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 195.9244,
+        "candidate": 278.8083,
+        "redis": 1181.5161,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "26-vector-sets-ann/laion768_100k/bytes_per_vector": {
+      "suite": "26-vector-sets-ann",
+      "config": "laion768_100k",
+      "metric": "bytes_per_vector",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3167.7447,
+        "candidate": 863.7547,
+        "redis": 1525.5448,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 0.8
+        }
+      ]
+    },
+    "26-vector-sets-ann/laion768_100k/ef": {
+      "suite": "26-vector-sets-ann",
+      "config": "laion768_100k",
+      "metric": "ef",
+      "unit": "EF",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 10.0,
+        "candidate": 10.0,
+        "redis": 80.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "26-vector-sets-ann/laion768_100k/recall_at_10": {
+      "suite": "26-vector-sets-ann",
+      "config": "laion768_100k",
+      "metric": "recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.9982,
+        "candidate": 0.9752,
+        "redis": 0.9662,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "min": 0.95
+        }
+      ]
+    },
+    "26-vector-sets-ann/laion768_100k/rss_per_vector": {
+      "suite": "26-vector-sets-ann",
+      "config": "laion768_100k",
+      "metric": "rss_per_vector",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3186.6061,
+        "candidate": 884.2035,
+        "redis": 1555.0054,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "26-vector-sets-ann/laion768_100k/vadd_per_s": {
+      "suite": "26-vector-sets-ann",
+      "config": "laion768_100k",
+      "metric": "vadd_per_s",
+      "unit": "VADD/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 102934.8688,
+        "candidate": 89906.9397,
+        "redis": 1600.0934,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 0.1
+        }
+      ]
+    },
+    "26-vector-sets-ann/laion768_100k/vsim_p99_ms_c1": {
+      "suite": "26-vector-sets-ann",
+      "config": "laion768_100k",
+      "metric": "vsim_p99_ms_c1",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 42.8332,
+        "candidate": 19.6615,
+        "redis": 0.9372,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "26-vector-sets-ann/laion768_100k/vsim_p99_ms_c100": {
+      "suite": "26-vector-sets-ann",
+      "config": "laion768_100k",
+      "metric": "vsim_p99_ms_c100",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3002.4014,
+        "candidate": 1793.2754,
+        "redis": 42.2595,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "26-vector-sets-ann/laion768_100k/vsim_p99_ms_c16": {
+      "suite": "26-vector-sets-ann",
+      "config": "laion768_100k",
+      "metric": "vsim_p99_ms_c16",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 297.0424,
+        "candidate": 162.1893,
+        "redis": 7.2814,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "26-vector-sets-ann/laion768_100k/vsim_qps_c1": {
+      "suite": "26-vector-sets-ann",
+      "config": "laion768_100k",
+      "metric": "vsim_qps_c1",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 25.0615,
+        "candidate": 54.2234,
+        "redis": 1631.4496,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "26-vector-sets-ann/laion768_100k/vsim_qps_c100": {
+      "suite": "26-vector-sets-ann",
+      "config": "laion768_100k",
+      "metric": "vsim_qps_c100",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 64.3693,
+        "candidate": 132.4936,
+        "redis": 4035.7361,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "26-vector-sets-ann/laion768_100k/vsim_qps_c16": {
+      "suite": "26-vector-sets-ann",
+      "config": "laion768_100k",
+      "metric": "vsim_qps_c16",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 62.6097,
+        "candidate": 132.4437,
+        "redis": 4284.0338,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-19",
+        "commit": "6065c780",
+        "label": "pr922-6065c780-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 25
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/checks_per_s_bg0k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "checks_per_s_bg0k",
+      "unit": "checks/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 31048.0,
+        "candidate": 31168.0,
+        "redis": 31199.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.05
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/checks_per_s_bg100k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "checks_per_s_bg100k",
+      "unit": "checks/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 27771.0,
+        "candidate": 31399.0,
+        "redis": 31812.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.05
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/checks_per_s_bg50k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "checks_per_s_bg50k",
+      "unit": "checks/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 30646.0,
+        "candidate": 31553.0,
+        "redis": 31907.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.05
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/p99_ms_bg0k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "p99_ms_bg0k",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.3,
+        "candidate": 0.218,
+        "redis": 0.52,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 0.5,
+          "speed": false
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/p99_ms_bg100k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "p99_ms_bg100k",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 6.118,
+        "candidate": 0.19,
+        "redis": 0.122,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 0.5,
+          "speed": false
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6,
+          "speed": false
+        }
+      ]
+    },
+    "27-ratelimit-restarted/t2/p99_ms_bg50k": {
+      "suite": "27-ratelimit-restarted",
+      "config": "t2",
+      "metric": "p99_ms_bg50k",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.559,
+        "candidate": 0.145,
+        "redis": 0.078,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-18",
+        "commit": "b7322be9",
+        "label": "pr-894-d4s_v5"
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 0.5,
+          "speed": false
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6,
+          "speed": false
+        }
+      ]
+    },
+    "30-script-call-cost/scripts/lock_calls_per_s": {
+      "suite": "30-script-call-cost",
+      "config": "scripts",
+      "metric": "lock_calls_per_s",
+      "unit": "calls/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 103403.0582,
+        "candidate": 111013.0433,
+        "redis": 122423.4202,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-19",
+        "commit": "7fd67dbb",
+        "label": "pr934-7fd67dbb-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "30-script-call-cost/scripts/lock_cpu_us_per_call": {
+      "suite": "30-script-call-cost",
+      "config": "scripts",
+      "metric": "lock_cpu_us_per_call",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 9.67,
+        "candidate": 9.0069,
+        "redis": 8.1778,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-19",
+        "commit": "7fd67dbb",
+        "label": "pr934-7fd67dbb-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.03
+        }
+      ]
+    },
+    "30-script-call-cost/scripts/lock_tag_calls_per_s": {
+      "suite": "30-script-call-cost",
+      "config": "scripts",
+      "metric": "lock_tag_calls_per_s",
+      "unit": "calls/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 103010.3269,
+        "candidate": 106473.2744,
+        "redis": 121446.8088,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-19",
+        "commit": "7fd67dbb",
+        "label": "pr934-7fd67dbb-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "30-script-call-cost/scripts/lock_tag_cpu_us_per_call": {
+      "suite": "30-script-call-cost",
+      "config": "scripts",
+      "metric": "lock_tag_cpu_us_per_call",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 9.7068,
+        "candidate": 9.4026,
+        "redis": 8.2422,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-19",
+        "commit": "7fd67dbb",
+        "label": "pr934-7fd67dbb-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.03
+        }
+      ]
+    },
+    "30-script-call-cost/scripts/return1_calls_per_s": {
+      "suite": "30-script-call-cost",
+      "config": "scripts",
+      "metric": "return1_calls_per_s",
+      "unit": "calls/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 120721.1098,
+        "candidate": 125186.8297,
+        "redis": 139707.8424,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-19",
+        "commit": "7fd67dbb",
+        "label": "pr934-7fd67dbb-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "30-script-call-cost/scripts/return1_cpu_us_per_call": {
+      "suite": "30-script-call-cost",
+      "config": "scripts",
+      "metric": "return1_cpu_us_per_call",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 8.2931,
+        "candidate": 7.9971,
+        "redis": 7.1571,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-19",
+        "commit": "7fd67dbb",
+        "label": "pr934-7fd67dbb-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.03
+        }
+      ]
+    },
+    "30-script-call-cost/scripts/return1_tag_calls_per_s": {
+      "suite": "30-script-call-cost",
+      "config": "scripts",
+      "metric": "return1_tag_calls_per_s",
+      "unit": "calls/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 117395.1252,
+        "candidate": 116000.1382,
+        "redis": 137353.7483,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-19",
+        "commit": "7fd67dbb",
+        "label": "pr934-7fd67dbb-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "30-script-call-cost/scripts/return1_tag_cpu_us_per_call": {
+      "suite": "30-script-call-cost",
+      "config": "scripts",
+      "metric": "return1_tag_cpu_us_per_call",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 8.5493,
+        "candidate": 8.6513,
+        "redis": 7.2707,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-19",
+        "commit": "7fd67dbb",
+        "label": "pr934-7fd67dbb-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.03
+        }
+      ]
+    },
+    "30-script-call-cost/scripts/tyk_calls_per_s": {
+      "suite": "30-script-call-cost",
+      "config": "scripts",
+      "metric": "tyk_calls_per_s",
+      "unit": "calls/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 66918.575,
+        "candidate": 79573.7585,
+        "redis": 79809.9467,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-19",
+        "commit": "7fd67dbb",
+        "label": "pr934-7fd67dbb-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "30-script-call-cost/scripts/tyk_cpu_us_per_call": {
+      "suite": "30-script-call-cost",
+      "config": "scripts",
+      "metric": "tyk_cpu_us_per_call",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 14.9419,
+        "candidate": 12.5965,
+        "redis": 12.5441,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-19",
+        "commit": "7fd67dbb",
+        "label": "pr934-7fd67dbb-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 0.93
+        }
+      ]
+    },
+    "30-script-call-cost/scripts/tyk_tag_calls_per_s": {
+      "suite": "30-script-call-cost",
+      "config": "scripts",
+      "metric": "tyk_tag_calls_per_s",
+      "unit": "calls/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 65031.5184,
+        "candidate": 74439.2208,
+        "redis": 80238.4827,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-19",
+        "commit": "7fd67dbb",
+        "label": "pr934-7fd67dbb-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "30-script-call-cost/scripts/tyk_tag_cpu_us_per_call": {
+      "suite": "30-script-call-cost",
+      "config": "scripts",
+      "metric": "tyk_tag_cpu_us_per_call",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 15.3948,
+        "candidate": 13.4654,
+        "redis": 12.4614,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-19",
+        "commit": "7fd67dbb",
+        "label": "pr934-7fd67dbb-d4s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 0.93
+        }
+      ]
+    },
     "31-zset-memory/float/bytes_per_member_10": {
       "suite": "31-zset-memory",
       "config": "float",
@@ -10850,508 +11914,6 @@
       "gate": [
         {
           "kind": "info"
-        }
-      ]
-    },
-    "27-ratelimit-restarted/t2/checks_per_s_bg0k": {
-      "suite": "27-ratelimit-restarted",
-      "config": "t2",
-      "metric": "checks_per_s_bg0k",
-      "unit": "checks/s",
-      "better": "higher",
-      "recorded": {
-        "v1_2_2": 31048.0,
-        "candidate": 31168.0,
-        "redis": 31199.0,
-        "vm": "Standard_D4s_v5",
-        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
-        "date": "2026-11-18",
-        "commit": "b7322be9",
-        "label": "pr-894-d4s_v5"
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 10
-        },
-        {
-          "kind": "vs_redis",
-          "max_x": 1.05
-        }
-      ]
-    },
-    "27-ratelimit-restarted/t2/checks_per_s_bg100k": {
-      "suite": "27-ratelimit-restarted",
-      "config": "t2",
-      "metric": "checks_per_s_bg100k",
-      "unit": "checks/s",
-      "better": "higher",
-      "recorded": {
-        "v1_2_2": 27771.0,
-        "candidate": 31399.0,
-        "redis": 31812.0,
-        "vm": "Standard_D4s_v5",
-        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
-        "date": "2026-11-18",
-        "commit": "b7322be9",
-        "label": "pr-894-d4s_v5"
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 10
-        },
-        {
-          "kind": "vs_redis",
-          "max_x": 1.05
-        }
-      ]
-    },
-    "27-ratelimit-restarted/t2/checks_per_s_bg50k": {
-      "suite": "27-ratelimit-restarted",
-      "config": "t2",
-      "metric": "checks_per_s_bg50k",
-      "unit": "checks/s",
-      "better": "higher",
-      "recorded": {
-        "v1_2_2": 30646.0,
-        "candidate": 31553.0,
-        "redis": 31907.0,
-        "vm": "Standard_D4s_v5",
-        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
-        "date": "2026-11-18",
-        "commit": "b7322be9",
-        "label": "pr-894-d4s_v5"
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 10
-        },
-        {
-          "kind": "vs_redis",
-          "max_x": 1.05
-        }
-      ]
-    },
-    "27-ratelimit-restarted/t2/p99_ms_bg0k": {
-      "suite": "27-ratelimit-restarted",
-      "config": "t2",
-      "metric": "p99_ms_bg0k",
-      "unit": "ms",
-      "better": "lower",
-      "recorded": {
-        "v1_2_2": 0.3,
-        "candidate": 0.218,
-        "redis": 0.52,
-        "vm": "Standard_D4s_v5",
-        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
-        "date": "2026-11-18",
-        "commit": "b7322be9",
-        "label": "pr-894-d4s_v5"
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 100,
-          "abs": 0.5,
-          "speed": false
-        }
-      ]
-    },
-    "27-ratelimit-restarted/t2/p99_ms_bg100k": {
-      "suite": "27-ratelimit-restarted",
-      "config": "t2",
-      "metric": "p99_ms_bg100k",
-      "unit": "ms",
-      "better": "lower",
-      "recorded": {
-        "v1_2_2": 6.118,
-        "candidate": 0.19,
-        "redis": 0.122,
-        "vm": "Standard_D4s_v5",
-        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
-        "date": "2026-11-18",
-        "commit": "b7322be9",
-        "label": "pr-894-d4s_v5"
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 100,
-          "abs": 0.5,
-          "speed": false
-        },
-        {
-          "kind": "ratio",
-          "keep": 0.6,
-          "speed": false
-        }
-      ]
-    },
-    "27-ratelimit-restarted/t2/p99_ms_bg50k": {
-      "suite": "27-ratelimit-restarted",
-      "config": "t2",
-      "metric": "p99_ms_bg50k",
-      "unit": "ms",
-      "better": "lower",
-      "recorded": {
-        "v1_2_2": 1.559,
-        "candidate": 0.145,
-        "redis": 0.078,
-        "vm": "Standard_D4s_v5",
-        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
-        "date": "2026-11-18",
-        "commit": "b7322be9",
-        "label": "pr-894-d4s_v5"
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 100,
-          "abs": 0.5,
-          "speed": false
-        },
-        {
-          "kind": "ratio",
-          "keep": 0.6,
-          "speed": false
-        }
-      ]
-    },
-    "30-script-call-cost/scripts/lock_calls_per_s": {
-      "suite": "30-script-call-cost",
-      "config": "scripts",
-      "metric": "lock_calls_per_s",
-      "unit": "calls/s",
-      "better": "higher",
-      "recorded": {
-        "v1_2_2": 103403.0582,
-        "candidate": 111013.0433,
-        "redis": 122423.4202,
-        "vm": "Standard_D4s_v5",
-        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
-        "date": "2026-11-19",
-        "commit": "7fd67dbb",
-        "label": "pr934-7fd67dbb-d4s_v5",
-        "rustc": "1.100.0",
-        "rustc_full": "1.100.0",
-        "nproc": 4
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 10
-        }
-      ]
-    },
-    "30-script-call-cost/scripts/lock_cpu_us_per_call": {
-      "suite": "30-script-call-cost",
-      "config": "scripts",
-      "metric": "lock_cpu_us_per_call",
-      "unit": "us",
-      "better": "lower",
-      "recorded": {
-        "v1_2_2": 9.67,
-        "candidate": 9.0069,
-        "redis": 8.1778,
-        "vm": "Standard_D4s_v5",
-        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
-        "date": "2026-11-19",
-        "commit": "7fd67dbb",
-        "label": "pr934-7fd67dbb-d4s_v5",
-        "rustc": "1.100.0",
-        "rustc_full": "1.100.0",
-        "nproc": 4
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 10
-        },
-        {
-          "kind": "vs_v1_2_2",
-          "max_x": 1.03
-        }
-      ]
-    },
-    "30-script-call-cost/scripts/lock_tag_calls_per_s": {
-      "suite": "30-script-call-cost",
-      "config": "scripts",
-      "metric": "lock_tag_calls_per_s",
-      "unit": "calls/s",
-      "better": "higher",
-      "recorded": {
-        "v1_2_2": 103010.3269,
-        "candidate": 106473.2744,
-        "redis": 121446.8088,
-        "vm": "Standard_D4s_v5",
-        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
-        "date": "2026-11-19",
-        "commit": "7fd67dbb",
-        "label": "pr934-7fd67dbb-d4s_v5",
-        "rustc": "1.100.0",
-        "rustc_full": "1.100.0",
-        "nproc": 4
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 10
-        }
-      ]
-    },
-    "30-script-call-cost/scripts/lock_tag_cpu_us_per_call": {
-      "suite": "30-script-call-cost",
-      "config": "scripts",
-      "metric": "lock_tag_cpu_us_per_call",
-      "unit": "us",
-      "better": "lower",
-      "recorded": {
-        "v1_2_2": 9.7068,
-        "candidate": 9.4026,
-        "redis": 8.2422,
-        "vm": "Standard_D4s_v5",
-        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
-        "date": "2026-11-19",
-        "commit": "7fd67dbb",
-        "label": "pr934-7fd67dbb-d4s_v5",
-        "rustc": "1.100.0",
-        "rustc_full": "1.100.0",
-        "nproc": 4
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 10
-        },
-        {
-          "kind": "vs_v1_2_2",
-          "max_x": 1.03
-        }
-      ]
-    },
-    "30-script-call-cost/scripts/return1_calls_per_s": {
-      "suite": "30-script-call-cost",
-      "config": "scripts",
-      "metric": "return1_calls_per_s",
-      "unit": "calls/s",
-      "better": "higher",
-      "recorded": {
-        "v1_2_2": 120721.1098,
-        "candidate": 125186.8297,
-        "redis": 139707.8424,
-        "vm": "Standard_D4s_v5",
-        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
-        "date": "2026-11-19",
-        "commit": "7fd67dbb",
-        "label": "pr934-7fd67dbb-d4s_v5",
-        "rustc": "1.100.0",
-        "rustc_full": "1.100.0",
-        "nproc": 4
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 10
-        }
-      ]
-    },
-    "30-script-call-cost/scripts/return1_cpu_us_per_call": {
-      "suite": "30-script-call-cost",
-      "config": "scripts",
-      "metric": "return1_cpu_us_per_call",
-      "unit": "us",
-      "better": "lower",
-      "recorded": {
-        "v1_2_2": 8.2931,
-        "candidate": 7.9971,
-        "redis": 7.1571,
-        "vm": "Standard_D4s_v5",
-        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
-        "date": "2026-11-19",
-        "commit": "7fd67dbb",
-        "label": "pr934-7fd67dbb-d4s_v5",
-        "rustc": "1.100.0",
-        "rustc_full": "1.100.0",
-        "nproc": 4
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 10
-        },
-        {
-          "kind": "vs_v1_2_2",
-          "max_x": 1.03
-        }
-      ]
-    },
-    "30-script-call-cost/scripts/return1_tag_calls_per_s": {
-      "suite": "30-script-call-cost",
-      "config": "scripts",
-      "metric": "return1_tag_calls_per_s",
-      "unit": "calls/s",
-      "better": "higher",
-      "recorded": {
-        "v1_2_2": 117395.1252,
-        "candidate": 116000.1382,
-        "redis": 137353.7483,
-        "vm": "Standard_D4s_v5",
-        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
-        "date": "2026-11-19",
-        "commit": "7fd67dbb",
-        "label": "pr934-7fd67dbb-d4s_v5",
-        "rustc": "1.100.0",
-        "rustc_full": "1.100.0",
-        "nproc": 4
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 10
-        }
-      ]
-    },
-    "30-script-call-cost/scripts/return1_tag_cpu_us_per_call": {
-      "suite": "30-script-call-cost",
-      "config": "scripts",
-      "metric": "return1_tag_cpu_us_per_call",
-      "unit": "us",
-      "better": "lower",
-      "recorded": {
-        "v1_2_2": 8.5493,
-        "candidate": 8.6513,
-        "redis": 7.2707,
-        "vm": "Standard_D4s_v5",
-        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
-        "date": "2026-11-19",
-        "commit": "7fd67dbb",
-        "label": "pr934-7fd67dbb-d4s_v5",
-        "rustc": "1.100.0",
-        "rustc_full": "1.100.0",
-        "nproc": 4
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 10
-        },
-        {
-          "kind": "vs_v1_2_2",
-          "max_x": 1.03
-        }
-      ]
-    },
-    "30-script-call-cost/scripts/tyk_calls_per_s": {
-      "suite": "30-script-call-cost",
-      "config": "scripts",
-      "metric": "tyk_calls_per_s",
-      "unit": "calls/s",
-      "better": "higher",
-      "recorded": {
-        "v1_2_2": 66918.575,
-        "candidate": 79573.7585,
-        "redis": 79809.9467,
-        "vm": "Standard_D4s_v5",
-        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
-        "date": "2026-11-19",
-        "commit": "7fd67dbb",
-        "label": "pr934-7fd67dbb-d4s_v5",
-        "rustc": "1.100.0",
-        "rustc_full": "1.100.0",
-        "nproc": 4
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 10
-        }
-      ]
-    },
-    "30-script-call-cost/scripts/tyk_cpu_us_per_call": {
-      "suite": "30-script-call-cost",
-      "config": "scripts",
-      "metric": "tyk_cpu_us_per_call",
-      "unit": "us",
-      "better": "lower",
-      "recorded": {
-        "v1_2_2": 14.9419,
-        "candidate": 12.5965,
-        "redis": 12.5441,
-        "vm": "Standard_D4s_v5",
-        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
-        "date": "2026-11-19",
-        "commit": "7fd67dbb",
-        "label": "pr934-7fd67dbb-d4s_v5",
-        "rustc": "1.100.0",
-        "rustc_full": "1.100.0",
-        "nproc": 4
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 10
-        },
-        {
-          "kind": "vs_v1_2_2",
-          "max_x": 0.93
-        }
-      ]
-    },
-    "30-script-call-cost/scripts/tyk_tag_calls_per_s": {
-      "suite": "30-script-call-cost",
-      "config": "scripts",
-      "metric": "tyk_tag_calls_per_s",
-      "unit": "calls/s",
-      "better": "higher",
-      "recorded": {
-        "v1_2_2": 65031.5184,
-        "candidate": 74439.2208,
-        "redis": 80238.4827,
-        "vm": "Standard_D4s_v5",
-        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
-        "date": "2026-11-19",
-        "commit": "7fd67dbb",
-        "label": "pr934-7fd67dbb-d4s_v5",
-        "rustc": "1.100.0",
-        "rustc_full": "1.100.0",
-        "nproc": 4
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 10
-        }
-      ]
-    },
-    "30-script-call-cost/scripts/tyk_tag_cpu_us_per_call": {
-      "suite": "30-script-call-cost",
-      "config": "scripts",
-      "metric": "tyk_tag_cpu_us_per_call",
-      "unit": "us",
-      "better": "lower",
-      "recorded": {
-        "v1_2_2": 15.3948,
-        "candidate": 13.4654,
-        "redis": 12.4614,
-        "vm": "Standard_D4s_v5",
-        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
-        "date": "2026-11-19",
-        "commit": "7fd67dbb",
-        "label": "pr934-7fd67dbb-d4s_v5",
-        "rustc": "1.100.0",
-        "rustc_full": "1.100.0",
-        "nproc": 4
-      },
-      "gate": [
-        {
-          "kind": "rel",
-          "pct": 10
-        },
-        {
-          "kind": "vs_v1_2_2",
-          "max_x": 0.93
         }
       ]
     },
