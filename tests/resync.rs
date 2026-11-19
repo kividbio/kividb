@@ -603,10 +603,23 @@ fn assert_same_dataset(master: &mut Conn, replica: &mut Conn) {
 /// or the server goes (a `SHUTDOWN` under them). Returns how many rounds of
 /// the three were answered.
 fn writer(port: u16, tag: String, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<usize> {
+    paced_writer(port, tag, stop, Duration::ZERO)
+}
+
+/// [`writer`], with `pause` after each 64 writes answered.
+fn paced_writer(
+    port: u16,
+    tag: String,
+    stop: Arc<AtomicBool>,
+    pause: Duration,
+) -> std::thread::JoinHandle<usize> {
     std::thread::spawn(move || {
         let mut c = Conn::connect(port);
         let mut done = 0;
         while !stop.load(Ordering::Relaxed) {
+            if !pause.is_zero() && done > 0 {
+                std::thread::sleep(pause);
+            }
             let mut buf = Vec::new();
             for i in done..done + 64 {
                 let item = format!("{tag}-{i}");
@@ -672,6 +685,12 @@ fn rounds(default: usize) -> usize {
 /// one by one (#894). Replicas attached to it at random moments of a write
 /// load are each sent the dataset and then every write after it: none is
 /// lost or applied twice between the cut and the stream.
+///
+/// The load is paced (a millisecond after each 64 writes): unpaced, each
+/// round wrote while the replica synced, and the longer the sync the more
+/// it wrote, so the dataset grew by a quarter a round, to 37M keys at round
+/// 25 of an optimized build, whose sync then took longer than the 30 s wait
+/// for the link.
 #[test]
 fn replicas_attached_under_writes_to_a_master_keeping_its_backlog_miss_nothing() {
     let mut master = Server::start(&[]);
@@ -683,7 +702,12 @@ fn replicas_attached_under_writes_to_a_master_keeping_its_backlog_miss_nothing()
     assert_eq!(m.info("replication", "connected_slaves"), "0");
     for round in 0..rounds(3) {
         let stop = Arc::new(AtomicBool::new(false));
-        let load = writer(master.port, format!("a{round}"), Arc::clone(&stop));
+        let load = paced_writer(
+            master.port,
+            format!("a{round}"),
+            Arc::clone(&stop),
+            Duration::from_millis(1),
+        );
         std::thread::sleep(Duration::from_millis(rand::random::<u64>() % 200));
         let replica = Server::start(&["--replicaof", "127.0.0.1", &master.port.to_string()]);
         let mut r = replica.conn();
