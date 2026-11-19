@@ -790,10 +790,13 @@ fn merge_gossip_entry(
 /// section — this is the gossip propagation mechanism, piggybacking on every
 /// reply.
 ///
-/// `to`, the member it answers: if this node holds it as the owner of slots
-/// while it says it is a replica, the PONG says which slots, at its config
-/// epoch here (`held_as_owner`). That is a node restarted before the save of
-/// its promotion was done: see `ClusterState::promotion_to_complete`.
+/// `to`, the member it answers: if this node, a master, holds it as the
+/// owner of slots while it says it is a replica, the PONG says which slots,
+/// at its config epoch here, and how many masters own slots here
+/// (`held_as_owner`), unless this node's vote for a replacement of it may
+/// still be won (`ClusterState::owner_report_for`). That is a node
+/// restarted before the save of its promotion was done: see
+/// `ClusterState::promotion_to_complete`.
 fn our_pong(state: &ClusterState, to: Option<NodeId>) -> BusMessage {
     let nodes = state.nodes.read();
     let me = nodes
@@ -802,15 +805,16 @@ fn our_pong(state: &ClusterState, to: Option<NodeId>) -> BusMessage {
         .unwrap_or_else(|| ClusterNode::new(state.myself(), String::new(), 0, 0));
 
     let gossip = sample_gossip(&nodes, state.myself(), GOSSIP_SAMPLE);
-    let to_is_replica = to.is_some_and(|id| {
-        nodes
-            .get(&id)
-            .is_some_and(|n| n.flags.contains(NodeFlags::REPLICA))
-    });
+    let to_is_replica = me.flags.contains(NodeFlags::MASTER)
+        && to.is_some_and(|id| {
+            nodes
+                .get(&id)
+                .is_some_and(|n| n.flags.contains(NodeFlags::REPLICA))
+        });
     drop(nodes);
     let held_as_owner = match to {
-        Some(id) if to_is_replica => state.slot_claims_of(id),
-        _ => Vec::new(),
+        Some(id) if to_is_replica => state.owner_report_for(id),
+        _ => None,
     };
 
     BusMessage::Pong {
@@ -903,7 +907,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::bus::SlotClaim;
+    use crate::cluster::bus::{OwnerReport, SlotClaim};
     use crate::cluster::node::generate_node_id;
 
     fn peer() -> SocketAddr {
@@ -1265,9 +1269,14 @@ mod tests {
                 panic!("expected a PONG");
             };
             held_as_owner
-                .iter()
-                .map(|c| (c.start, c.end, c.epoch))
-                .collect::<Vec<_>>()
+                .map(|r| {
+                    assert_eq!(r.masters, 1, "the masters that own slots here");
+                    r.claims
+                        .iter()
+                        .map(|c| (c.start, c.end, c.epoch))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
         };
         // A master owning the slots: nothing.
         assert!(held(process_message(&cs, announced, peer())).is_empty());
@@ -1298,7 +1307,7 @@ mod tests {
         // On the other side: noted from a PONG, and withdrawn.
         let master = generate_node_id();
         process_message(&cs, meet(master), peer());
-        let pong = |held_as_owner: Vec<SlotClaim>| BusMessage::Pong {
+        let pong = |held_as_owner: Option<OwnerReport>| BusMessage::Pong {
             sender_id: master,
             sender_ip: String::new(),
             sender_client_port: 7000,
@@ -1316,16 +1325,122 @@ mod tests {
         };
         process_message(
             &cs,
-            pong(vec![SlotClaim {
-                start: 0,
-                end: 9,
-                epoch: 3,
-            }]),
+            pong(Some(OwnerReport {
+                masters: 3,
+                claims: vec![SlotClaim {
+                    start: 0,
+                    end: 9,
+                    epoch: 3,
+                }],
+            })),
             peer(),
         );
         assert_eq!(cs.held_as_owner_by(master), Some(vec![(0, 9, 3)]));
-        process_message(&cs, pong(vec![]), peer());
+        process_message(&cs, pong(None), peer());
         assert_eq!(cs.held_as_owner_by(master), None);
+    }
+
+    /// A master `r` that owns 0-99 at config epoch 7 in `cs`'s view, which
+    /// owns 100-199, and `r`'s replica `q`; `r` FAIL. Returns the PING of
+    /// `r` restarted as a replica (of another node).
+    fn a_failed_master_and_its_replica(cs: &ClusterState) -> (NodeId, NodeId, BusMessage) {
+        cs.claim_slot_range(100, 199).unwrap();
+        let r = generate_node_id();
+        process_message(cs, meet(r), peer());
+        let mut announced = ping(r, NodeFlags::MASTER, vec![]);
+        if let BusMessage::Ping {
+            slot_claims,
+            sender_config_epoch,
+            ..
+        } = &mut announced
+        {
+            *sender_config_epoch = 7;
+            *slot_claims = vec![SlotClaim {
+                start: 0,
+                end: 99,
+                epoch: 7,
+            }];
+        }
+        process_message(cs, announced, peer());
+        let q = generate_node_id();
+        process_message(cs, meet(q), peer());
+        let mut follows = ping(q, NodeFlags::REPLICA, vec![]);
+        if let BusMessage::Ping {
+            sender_master_id, ..
+        } = &mut follows
+        {
+            *sender_master_id = Some(r);
+        }
+        process_message(cs, follows, peer());
+        cs.nodes.write().get_mut(&r).unwrap().flags |= NodeFlags::FAIL;
+        let mut as_replica = ping(r, NodeFlags::REPLICA, vec![]);
+        if let BusMessage::Ping {
+            sender_master_id, ..
+        } = &mut as_replica
+        {
+            *sender_master_id = Some(generate_node_id());
+        }
+        (r, q, as_replica)
+    }
+
+    fn report_in(reply: Option<Vec<u8>>) -> Option<OwnerReport> {
+        let (msg, _) = crate::cluster::bus::message::decode(&reply.unwrap())
+            .unwrap()
+            .unwrap();
+        let BusMessage::Pong { held_as_owner, .. } = msg else {
+            panic!("expected a PONG");
+        };
+        held_as_owner
+    }
+
+    /// A master that voted for a replacement of a node sends that node no
+    /// report while the vote may still be won and announced: the node
+    /// would complete its promotion on it and take writes that the winner's
+    /// claim then replaces.
+    #[test]
+    fn a_master_that_voted_for_a_replacement_sends_no_report() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let (r, q, as_replica) = a_failed_master_and_its_replica(&cs);
+        assert!(cs.cast_vote(q, r, 100, false, None));
+        assert_eq!(report_in(process_message(&cs, as_replica, peer())), None);
+        // Another master, that gave no vote, reports.
+        let other = ClusterState::new_enabled(None, 15000);
+        let (_, _, as_replica) = a_failed_master_and_its_replica(&other);
+        let report = report_in(process_message(&other, as_replica, peer())).unwrap();
+        assert_eq!(report.masters, 2);
+        assert_eq!(
+            report
+                .claims
+                .iter()
+                .map(|c| (c.start, c.end, c.epoch))
+                .collect::<Vec<_>>(),
+            [(0, 99, 7)]
+        );
+    }
+
+    /// A master that reported to a node that says it is a replica votes
+    /// for no replacement of it, forced or not, while the node may be
+    /// completing its promotion on that report; once the node says it is a
+    /// master again, it does.
+    #[test]
+    fn a_master_that_reported_votes_for_no_replacement() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let (r, q, as_replica) = a_failed_master_and_its_replica(&cs);
+        assert!(report_in(process_message(&cs, as_replica, peer())).is_some());
+        cs.nodes.write().get_mut(&r).unwrap().flags |= NodeFlags::FAIL;
+        assert!(!cs.cast_vote(q, r, 100, false, None));
+        assert!(!cs.cast_vote(q, r, 101, true, None));
+        // Completed: it says it is a master.
+        let mut completed = ping(r, NodeFlags::MASTER, vec![]);
+        if let BusMessage::Ping {
+            sender_config_epoch,
+            ..
+        } = &mut completed
+        {
+            *sender_config_epoch = 7;
+        }
+        process_message(&cs, completed, peer());
+        assert!(cs.cast_vote(q, r, 102, true, None));
     }
 
     /// Losing *some* slots is a resharding, not a failover.
