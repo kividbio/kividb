@@ -1275,7 +1275,7 @@ mod tests {
                 numkeys(cmd, 2, 3)
             }
             // dest numkeys key [key ...]
-            "ZUNIONSTORE" | "ZINTERSTORE" | "ZDIFFSTORE" | "CMS.MERGE" => match numkeys(cmd, 2, 3) {
+            "ZUNIONSTORE" | "ZINTERSTORE" | "ZDIFFSTORE" | "CMS.MERGE" | "TDIGEST.MERGE" => match numkeys(cmd, 2, 3) {
                 Range { first, last, .. } => {
                     let mut keys = vec![1];
                     keys.extend(first..=last);
