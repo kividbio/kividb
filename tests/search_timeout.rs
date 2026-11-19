@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/search_timeout.rs
 //
 // `search-timeout` and `search-on-timeout`, the server settings for how

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Lists kept in chunks of packed elements: every list command gives the same
 // answer whatever the form (one chunk, many, irregular after a middle insert,
 // plain once an element over 1,024 bytes came in), across every change of

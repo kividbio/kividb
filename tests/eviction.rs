@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/eviction.rs
 //
 // `maxmemory-policy`: what the server does when it reaches `maxmemory`. Real

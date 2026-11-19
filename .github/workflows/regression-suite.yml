@@ -10,7 +10,10 @@ name: Regression suite
 # (infra/benchmark-azure/README.md, "How CI signs in"); pick the build to
 # measure with `ref`. It starts one paid Azure machine, a Standard_D4s_v5, the
 # size baseline.json was recorded on (a gate against recorded values is
-# meaningful only on that size; run-all.sh marks a run on another size INVALID).
+# meaningful only on that size; run-all.sh marks a run on another size INVALID),
+# and, with `big` (the default), a second one, a Standard_D8s_v5, for the
+# suites that declare Suite(..., min_cpus=8) (`run-all.sh --min-cpus-only`;
+# on the D4s_v5 they are not run). The release gate needs both runs.
 #
 # Azure parts are the vector benchmark's: OIDC sign-in (azure/login with the
 # repository variables, no stored Azure secret), the kividb-benchmark resource
@@ -34,6 +37,10 @@ on:
         default: ""
       full:
         description: "Also the long configurations (FULL=1, about 8 minutes more). The release gate requires them."
+        type: boolean
+        default: true
+      big:
+        description: "Also the suites that need 8 CPUs (min_cpus), on a second machine, a Standard_D8s_v5 (results <label> with -d8s_v5). The release gate requires them."
         type: boolean
         default: true
       image:
@@ -63,10 +70,41 @@ env:
   # the same secret to this same path.
   SSH_KEY_PATH: /tmp/kividb_benchmark_ssh_key
   VM_SIZE: Standard_D4s_v5
+  # Only for the suites that declare min_cpus=8 (--min-cpus-only).
+  BIG_VM_SIZE: Standard_D8s_v5
 
 jobs:
+  # ── Which machines: the D8s_v5 only when a suite declares min_cpus ────────
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      big: ${{ steps.plan.outputs.big }}
+      machines: ${{ steps.plan.outputs.machines }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Does any suite need more CPUs?
+        id: plan
+        env:
+          INPUT_BIG: ${{ inputs.big }}
+          INPUT_SUITE: ${{ inputs.suite }}
+        run: |
+          set -euo pipefail
+          [[ "$INPUT_SUITE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::suite must look like 1.3.0"; exit 1; }
+          # Suite(..., min_cpus=N) with N >= 1 (the declaration README.md documents).
+          declared=$(grep -lE 'min_cpus *= *[1-9]' "benchmarks/$INPUT_SUITE/regressions/suites/"[0-9][0-9]-*.py 2>/dev/null || true)
+          big=false
+          if [[ "$INPUT_BIG" == "true" && -n "$declared" ]]; then big=true; fi
+          if [[ "$INPUT_BIG" == "true" && -z "$declared" ]]; then
+            echo "No suite declares min_cpus: no Standard_D8s_v5 is made."
+          fi
+          echo "big=$big" >> "$GITHUB_OUTPUT"
+          if [[ "$big" == true ]]; then echo 'machines=["small","big"]'; else echo 'machines=["small"]'; fi >> "$GITHUB_OUTPUT"
+          echo "suites that declare min_cpus: ${declared:-none}"
+
   # ── The machine (Azure, infra/benchmark-azure) ─────────────────────────────
   create:
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Only this job signs in to Azure (and the destroy job below).
@@ -129,16 +167,97 @@ jobs:
           echo "::error::SSH never came up on $HOST"
           exit 1
 
+  # The second machine, for the suites that need 8 CPUs (the same
+  # create.sh, resource group and teardown; its RUN_ID ends in -big).
+  create_big:
+    needs: plan
+    if: needs.plan.outputs.big == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Only this job signs in to Azure (and the destroy job below).
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      host: ${{ steps.create.outputs.server_public_ip }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Write SSH private key and derive its public half
+        id: ssh
+        env:
+          BENCHMARK_SSH_PRIVATE_KEY: ${{ secrets.BENCHMARK_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$BENCHMARK_SSH_PRIVATE_KEY" ]]; then
+            echo "::error::secrets.BENCHMARK_SSH_PRIVATE_KEY is not set."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$BENCHMARK_SSH_PRIVATE_KEY" > "$SSH_KEY_PATH"
+          chmod 600 "$SSH_KEY_PATH"
+          echo "public_key=$(ssh-keygen -y -f "$SSH_KEY_PATH")" >> "$GITHUB_OUTPUT"
+
+      - name: Create the machine
+        id: create
+        env:
+          # The attempt number keeps a re-run's machine apart from what an
+          # earlier attempt may have left; destroy clears every attempt.
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}-big
+          SSH_PUBLIC_KEY: ${{ steps.ssh.outputs.public_key }}
+          LOCATION: ${{ inputs.location }}
+          SERVER_SIZE: ${{ env.BIG_VM_SIZE }}
+          IMAGE: ${{ inputs.image }}
+          CREATE_CLIENT: "false"
+          BOOTSTRAP: "false"
+          USE_PROXIMITY_GROUP: "false"
+        run: bash infra/benchmark-azure/create.sh
+
+      - name: Wait for SSH
+        env:
+          HOST: ${{ steps.create.outputs.server_public_ip }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                 ubuntu@"$HOST" 'echo ready' 2>/dev/null; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::SSH never came up on $HOST"
+          exit 1
+
   # ── Build the candidate on it and run the suite ────────────────────────────
   run:
-    needs: create
+    needs: [plan, create, create_big]
+    # The legs are independent: the D4s_v5 run goes ahead whether or not the
+    # D8s_v5 could be made (its leg then fails, saying so).
+    if: always() && needs.plan.result == 'success' && needs.create.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(needs.plan.outputs.machines) }}
     runs-on: ubuntu-latest
-    # Build (fat LTO on 4 vCPUs) + about 13 minutes of suites, 21 with `full`.
+    # Two builds (default and lua,tls; fat LTO on 4 vCPUs) + the suites
+    # (about 13 minutes, 21 with `full`, plus suite 25's scripts).
     timeout-minutes: 180
     env:
-      HOST: ${{ needs.create.outputs.host }}
+      HOST: ${{ matrix.machine == 'big' && needs.create_big.outputs.host || needs.create.outputs.host }}
       SSH_OPTS: -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=10
     steps:
+      - name: The machine of this leg
+        if: matrix.machine == 'big' && needs.create_big.result != 'success'
+        run: |
+          echo "::error::The Standard_D8s_v5 for the min_cpus suites could not be made (create_big: ${{ needs.create_big.result }}): the release gate needs its run."
+          exit 1
+
       # The candidate: what is built and measured.
       - uses: actions/checkout@v4
         with:
@@ -173,6 +292,7 @@ jobs:
           INPUT_ONLY: ${{ inputs.only }}
           INPUT_SUITE: ${{ inputs.suite }}
           INPUT_FULL: ${{ inputs.full }}
+          MACHINE: ${{ matrix.machine }}
         run: |
           set -euo pipefail
           commit="$(git -C cand rev-parse HEAD)"
@@ -181,6 +301,12 @@ jobs:
             label="$(printf '%s' "$INPUT_REF" | tr -c 'A-Za-z0-9._-' '-')-d4s_v5"
           fi
           [[ "$label" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::label may hold letters, digits, . _ - only"; exit 1; }
+          min_only=0
+          if [[ "$MACHINE" == big ]]; then
+            # The suites that declare min_cpus, on the Standard_D8s_v5.
+            label="${label%-d4s_v5}-d8s_v5"
+            min_only=1
+          fi
           [[ "$INPUT_ONLY" =~ ^[0-9a-z,-]*$ ]] || { echo "::error::only may hold digits, letters, - and commas only"; exit 1; }
           [[ "$INPUT_SUITE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::suite must look like 1.3.0"; exit 1; }
           dir="benchmarks/$INPUT_SUITE/regressions"
@@ -191,6 +317,7 @@ jobs:
             echo "label=$label"
             echo "dir=$dir"
             echo "full=$full"
+            echo "min_only=$min_only"
           } >> "$GITHUB_OUTPUT"
           echo "Candidate $INPUT_REF is commit $commit; label $label; suite $dir; FULL=$full; only='$INPUT_ONLY'"
 
@@ -200,7 +327,14 @@ jobs:
         run: |
           set -euo pipefail
           git -C cand -c core.autocrlf=false archive --format=tar HEAD > cand.tar
-          tar -C harness -cf harness.tar "$DIR"
+          # The suite and the harnesses next to it that suites run:
+          # 09-vector-sets runs <suite>/../vector-sets/bench.py, 10-redisvl
+          # runs benchmarks/redisvl-compat (without them both fail, INVALID).
+          extra=()
+          for d in "$(dirname "$DIR")/vector-sets" benchmarks/redisvl-compat; do
+            [[ -d "harness/$d" ]] && extra+=("$d")
+          done
+          tar -C harness -cf harness.tar "$DIR" "${extra[@]}"
           scp -i "$SSH_KEY_PATH" $SSH_OPTS cand.tar harness.tar \
             harness/scripts/ci/regression-suite-vm.sh ubuntu@"$HOST":/home/ubuntu/
 
@@ -213,12 +347,13 @@ jobs:
           LABEL: ${{ steps.what.outputs.label }}
           COMMIT: ${{ steps.what.outputs.commit }}
           FULL: ${{ steps.what.outputs.full }}
-          ONLY: ${{ inputs.only }}
+          ONLY: ${{ matrix.machine != 'big' && inputs.only || '' }}
+          MIN_ONLY: ${{ steps.what.outputs.min_only }}
         run: |
           set -uo pipefail
           SSH="ssh -i $SSH_KEY_PATH $SSH_OPTS ubuntu@$HOST"
           code=""
-          if ! $SSH "rm -f run.exit run.log; SUITE_DIR='$DIR' LABEL='$LABEL' CAND_COMMIT='$COMMIT' FULL='$FULL' ONLY='$ONLY' nohup bash /home/ubuntu/regression-suite-vm.sh > /home/ubuntu/run.log 2>&1 < /dev/null &"; then
+          if ! $SSH "rm -f run.exit run.log; SUITE_DIR='$DIR' LABEL='$LABEL' CAND_COMMIT='$COMMIT' FULL='$FULL' ONLY='$ONLY' MIN_CPUS_ONLY='$MIN_ONLY' nohup bash /home/ubuntu/regression-suite-vm.sh > /home/ubuntu/run.log 2>&1 < /dev/null &"; then
             echo "::error::Could not start the run on the machine."
             code=125
           fi
@@ -268,7 +403,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: regression-results-${{ steps.what.outputs.label || github.run_id }}
+          name: regression-results-${{ steps.what.outputs.label || format('{0}-{1}', github.run_id, matrix.machine) }}
           path: out
           if-no-files-found: warn
 
@@ -286,7 +421,7 @@ jobs:
 
   # ── Delete the machine, whatever happened ───────────────────────────────────
   destroy:
-    needs: [create, run]
+    needs: [plan, create, create_big, run]
     if: always()
     uses: ./.github/workflows/_benchmark-destroy.yml
     secrets: inherit

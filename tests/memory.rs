@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/memory.rs
 //
 // Rust integration tests for MEMORY commands.

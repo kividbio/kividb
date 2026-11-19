@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/blocking_many_keys.rs
 //
 // Many clients blocked in `BRPOP`/`BLPOP`/`BLMOVE`/`BZPOPMIN` across many

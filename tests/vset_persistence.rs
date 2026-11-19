@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Quantized vector sets through restarts, AOF, replicas and old snapshots.
 
 // The ignored tests need `KIVIDB_1_2_BIN`: a KiviDB 1.2 release binary.

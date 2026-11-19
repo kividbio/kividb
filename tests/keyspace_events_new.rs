@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // Keyspace events added after Redis 8.0: `o` (overwritten) and `c`
 // (type_changed) from 8.2, and `a` (array commands) from 8.10. The flags are
 // the process's, so this file has one test: nothing else changes them.

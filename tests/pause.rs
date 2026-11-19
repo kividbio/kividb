@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // CLIENT PAUSE and CLIENT UNBLOCK (Redis 8.10's unit/pause): what a pause
 // held is let go before anything else runs once the pause is ended.
 //
