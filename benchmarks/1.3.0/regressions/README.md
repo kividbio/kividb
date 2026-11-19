@@ -43,6 +43,7 @@ and why.
 | `27-ratelimit-restarted` | #894 | envoyproxy/ratelimit's checks (`INCRBY` + `EXPIRE` on two keys, four commands in one write, 65 connections with 2 ms of the limiter's own time after each) beside 100 connections of pipelined `INCRBY` + `EXPIRE` pairs at 0, 50k and 100k commands a second, on a server restarted from its own snapshot of 100,000 keys (KiviDB keeps the replication backlog then: `repl_backlog_active` is kept in the raw data); of the 4 vCPUs the server on 0 and 2 (`--threads 2`), the checks on 1, the load on 3: checks a second and their p99, every row gated; recorded on a D4s_v5 (`results/pr-894-d4s_v5`). Needs a C compiler (`lib/ratelimit_load.c`). The issue's own shape, with the clients on CPUs of their own up to 300k, needs 8 CPUs: run the suite's load by hand as the PR describes |
 | `24-snapshot-size` | #879 | `SAVE` of #879's dataset (`DEBUG POPULATE 6000000 k 150`) and of a collections mix (200,000 hashes of 10 fields, 50,000 each of sets, sorted sets and lists of 20), each twice: `-default` (the candidate as it starts, `rdbcompression no`) and `-yes` (the suite sets `CONFIG SET rdbcompression yes` on the candidate): the snapshot's size, the `SAVE` time (median of 3 after a warm-up) and the time a new server takes to load it (best of 2). Gates: `-yes` keeps 60 % of the size gain over v1.2.2 and #879's dataset within 1.5x of Redis's `dump.rdb`; `-default` within 1 % of v1.2.2's size; the save at most 2.5x v1.2.2's time, the load 1.5x |
 | `25-centrifuge-scripts-publish` | #900 | centrifuge v0.40.1's history scripts with the arguments its broker sends (30-day meta TTL), whose 2-3 keys carry no hash tag (each runs alone, on the script-runner thread): `EVALSHA` of `broker_history_list.lua` and `broker_history_add_list.lua` from 16 connections (`scripts`, the `lua,tls` builds); `PUBLISH` to 1,000 channels nobody subscribes to, beside 4 idle subscribers, from 1 connection and from 8, pipeline 16 (`publish`): calls a second counted by the server; a round with any error reply, or a history list of the wrong length, fails the suite. Gates: 10 % and at most 1.05x worse than v1.2.2 in the same session (for now 1.08x for the 8-connection `PUBLISH`, where master is behind v1.2.2 with matching compilers; to go back to 1.05x when that gap is fixed) |
+| `30-script-call-cost` | #901 | server CPU per call and calls a second of short scripts by `EVALSHA` (`redis-benchmark`, 32 connections, one KiviDB worker): Tyk's sliding-log limiter over 5,000 keys of 144 members, the compare-and-delete lock release of #880 on keys another owner holds, and `return 1`, each also with its keys under a hash tag. Needs a `lua,tls` candidate (`--candidate-full`, #921). Gates: CPU per call within 10 % of the recorded value and at most 0.93x v1.2.2's for Tyk, 1.03x for the others; calls a second 10 % |
 | `31-zset-memory` | #825, #297 (step 4) | `used_memory` per sorted-set member, 1,000,000 members in sets of 10, 100, 128, 129 and 1,000: 14-byte members (`membr:<i>`), scores whole (`int`) or with a fraction (`float`); `OBJECT ENCODING` of each size recorded exactly (`listpack` up to 128, `skiplist` past it); the large sets (129 and 1,000) as guard rows |
 
 ## Running it
@@ -1109,6 +1110,33 @@ pattern row against Redis's 1.35M and 0.9 ms. The channel row is a guard:
 the 4 Python readers are near their limit there, so it catches a loss, not
 a gain. #851's PR has the pinned measurements (server on 2 vCPUs, clients
 on the other 2, a Rust client), where the difference is larger.
+
+## Recorded run, suite 30
+
+Recorded 2026-11-19 on an Azure Standard_D4s_v5 (4 vCPU, Xeon Platinum **8573C**:
+this VM came with a newer CPU than the 8370C of most other baselines, and
+`recorded.cpu` says so), `--only 30 --record`, the candidate master `7fd67dbb`
+(#921 merged; it holds #928), the default `lua,tls` build by rustc 1.100.0 (the
+compiler of the v1.2.2 release binaries), Redis 8.10.2 from the VM image.
+One KiviDB worker. Runs: `pr934-7fd67dbb-d4s_v5` (recorded), `-rerun2`, `-rerun3`
+(the noise check; every gate passed; a run takes 549 s).
+
+CPU per call, microseconds (the three runs; the recorded value is the first):
+
+| workload | v1.2.2 | master | Redis 8.10.2 | master / v1.2.2 | gate |
+|---|---:|---:|---:|---:|---:|
+| Tyk's sliding log | 14.9-15.1 | 12.5-12.6 | 12.0-12.5 | 0.82-0.84x | 0.93x |
+| compare-and-delete lock | 9.3-9.7 | 8.8-9.1 | 8.0-8.2 | 0.93-0.95x | 1.03x |
+| `return 1` | 8.2-8.4 | 8.0 | 6.7-7.2 | 0.96-0.98x | 1.03x |
+| Tyk, keys under a hash tag | 14.9-15.4 | 12.8-13.5 | 12.1-12.5 | 0.86-0.87x | 0.93x |
+| lock, hash tag | 9.6-9.7 | 9.0-9.4 | 7.7-8.2 | 0.94-0.97x | 1.03x |
+| `return 1`, hash tag | 8.5-8.6 | 8.3-8.7 | 7.0-7.3 | 0.97-1.01x | 1.03x |
+
+The calls a second move by 0.7-5.4 % between the runs (10 % against the recorded
+value is the gate). The gates against v1.2.2 hold in all three runs; the
+nearest is the `return 1` row under a hash tag: 1.012x in the first run, 0.980x
+and 0.966x in the others, so a 1.03x gate is 1.8 % above the worst of three
+while the three differ by 4.6 %.
 
 ## Not covered
 
