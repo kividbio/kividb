@@ -113,6 +113,13 @@ pub struct Config {
     #[arg(long, default_value = "off", value_enum)]
     pub worker_cpu_affinity: crate::cpus::WorkerCpuAffinity,
 
+    /// Helper threads that link the vectors written to HNSW indexes into
+    /// their graphs: a number (0: each write links its own vector, as 1.2
+    /// did) or auto (none under a CPU quota or below 8 CPUs, otherwise
+    /// (CPUs - 2) / 2). Startup only. See docs/SEARCH.md.
+    #[arg(long, default_value = "auto", value_parser = parse_index_threads)]
+    pub search_index_threads: crate::vector::backlog::IndexThreads,
+
     /// Enable append-only file persistence
     #[arg(long, default_value_t = false)]
     pub aof: bool,
@@ -667,6 +674,7 @@ impl Default for Config {
             bind: "0.0.0.0".into(),
             threads: 0,
             worker_cpu_affinity: crate::cpus::WorkerCpuAffinity::Off,
+            search_index_threads: crate::vector::backlog::IndexThreads::Auto,
             aof: false,
             aof_preamble: true,
             lua_parallel_scripts: true,
@@ -813,6 +821,7 @@ impl Config {
             bind: String::new(),
             threads: 1,
             worker_cpu_affinity: crate::cpus::WorkerCpuAffinity::Off,
+            search_index_threads: crate::vector::backlog::IndexThreads::Auto,
             aof: false,
             aof_preamble: true,
             lua_parallel_scripts: true,
@@ -1213,6 +1222,11 @@ impl Config {
         out.push_str(&format!(
             "worker-cpu-affinity {}\n",
             self.worker_cpu_affinity.name()
+        ));
+        out.push_str(&format!(
+            "search-index-threads {}
+",
+            self.search_index_threads.name()
         ));
         out.push_str(&format!("aof {}\n", if self.aof { "yes" } else { "no" }));
         out.push_str(&format!(
@@ -1667,6 +1681,10 @@ impl Config {
                     ));
                 };
                 set!(worker_cpu_affinity, mode)
+            }
+            "search-index-threads" => {
+                let value = one()?;
+                set!(search_index_threads, parse_index_threads(value)?)
             }
             "dir" => set!(dir, one()?.to_string()),
             "aof" | "appendonly" => set!(aof, yes_no(key, one()?)?),
@@ -2282,6 +2300,15 @@ fn parse_memory_flag(value: &str) -> Result<usize, String> {
 /// Parse Redis-style `yes` / `no` into a bool. Used by `--cluster-enabled`
 /// and any future flags that want to mirror redis.conf phrasing rather than
 /// clap's default `true` / `false`.
+fn parse_index_threads(s: &str) -> Result<crate::vector::backlog::IndexThreads, String> {
+    crate::vector::backlog::IndexThreads::parse(s).ok_or_else(|| {
+        format!(
+            "invalid value '{s}' for 'search-index-threads': expected auto or a number from 0 to {}",
+            crate::vector::backlog::MAX_INDEX_THREADS
+        )
+    })
+}
+
 fn parse_yes_no(s: &str) -> Result<bool, String> {
     match s.to_ascii_lowercase().as_str() {
         "yes" | "true" | "1" => Ok(true),

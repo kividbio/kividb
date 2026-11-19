@@ -2302,6 +2302,12 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
             "worker-cpu-affinity",
             ctx.config.worker_cpu_affinity.name().to_string(),
         ),
+        // As given (`auto` or a number): the helpers start on the first
+        // write to an HNSW index, and the startup log says how many.
+        (
+            "search-index-threads",
+            ctx.config.search_index_threads.name(),
+        ),
         // The value in force, not the one the server started with.
         (
             "maxmemory",

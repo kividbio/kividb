@@ -3716,3 +3716,278 @@ fn num_docs_is_the_same_after_an_aof_replay_and_a_snapshot_load() {
     let _ = wait_for_exit(&mut srv, Duration::from_secs(8));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Vectors linked into the graph by helper threads (vector::backlog)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// A reproducible vector of `dim` floats in [0, 1).
+fn backlog_vector(dim: usize, seed: u64) -> Vec<f32> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..dim)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % 10_000) as f32 / 10_000.0
+        })
+        .collect()
+}
+
+/// `HSET` of every `(key, vector)` through one pipeline, then every reply.
+fn hset_pipelined(c: &mut Conn, docs: &[(String, Vec<f32>)]) {
+    let mut buf = Vec::new();
+    for (key, v) in docs {
+        let blob = pack_f32(v);
+        buf.extend_from_slice(format!("*4\r\n$4\r\nHSET\r\n${}\r\n", key.len()).as_bytes());
+        buf.extend_from_slice(key.as_bytes());
+        buf.extend_from_slice(format!("\r\n$1\r\nv\r\n${}\r\n", blob.len()).as_bytes());
+        buf.extend_from_slice(&blob);
+        buf.extend_from_slice(b"\r\n");
+    }
+    c.stream.write_all(&buf).unwrap();
+    for _ in docs {
+        assert!(!c.read_value().is_error());
+    }
+}
+
+/// The nearest key to `v`, or None.
+fn nearest_key(c: &mut Conn, v: &[f32]) -> Option<String> {
+    let q = pack_f32(v);
+    let res = c.cmd(&[
+        b"FT.SEARCH",
+        b"idx:bl",
+        b"*=>[KNN 1 @v $q EF_RUNTIME 400]",
+        b"PARAMS",
+        b"2",
+        b"q",
+        &q,
+        b"NOCONTENT",
+        b"DIALECT",
+        b"2",
+    ]);
+    let arr = res.as_array();
+    (arr[0].as_int() > 0).then(|| arr[1].as_str().to_string())
+}
+
+/// `field` of `FT.INFO idx:bl`, or "" while the server answers with an
+/// error (it is still loading).
+fn ft_info_field(c: &mut Conn, field: &str) -> String {
+    let info = c.cmds(&["FT.INFO", "idx:bl"]);
+    if info.is_error() {
+        return String::new();
+    }
+    let arr = info.as_array();
+    let pos = arr
+        .iter()
+        .position(|v| v.try_as_str() == Some(field))
+        .unwrap_or_else(|| panic!("{field} not in FT.INFO"));
+    arr[pos + 1].as_str().to_string()
+}
+
+/// One client loads documents through a pipeline into a graph large enough
+/// for its writes to be linked by the helper threads. Each document is
+/// found from the moment its write is answered, a deleted one is not, and a
+/// snapshot taken while vectors still wait loads with every one of them.
+#[test]
+fn vectors_waiting_to_be_linked_are_found_and_survive_a_restart() {
+    let _serial = persist_serial();
+    let dir = temp_dir("hnsw_backlog");
+    let dim = 8;
+    let port1 = free_port();
+    let mut srv1 = start_server_in_dir(port1, &dir);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+
+    let docs: Vec<(String, Vec<f32>)> = (0..6000u64)
+        .map(|i| (format!("bl:{i}"), backlog_vector(dim, i + 1)))
+        .collect();
+    let deleted = ["bl:5999", "bl:5998", "bl:3000"];
+    let over: Vec<f32> = vec![0.5; dim];
+    {
+        let mut c = Conn::connect(port1);
+        assert!(
+            c.cmds(&[
+                "FT.CREATE",
+                "idx:bl",
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "bl:",
+                "SCHEMA",
+                "v",
+                "VECTOR",
+                "HNSW",
+                "10",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "8",
+                "DISTANCE_METRIC",
+                "L2",
+                "M",
+                "16",
+                "EF_CONSTRUCTION",
+                "64",
+            ])
+            .is_ok()
+        );
+        hset_pipelined(&mut c, &docs);
+        // Found at once, the last written too.
+        for (key, v) in docs.iter().rev().take(20).chain(docs.iter().step_by(397)) {
+            assert_eq!(nearest_key(&mut c, v).as_deref(), Some(key.as_str()));
+        }
+        for key in deleted {
+            assert_eq!(c.cmds(&["DEL", key]).as_int(), 1);
+        }
+        // bl:10 written over: found at its new place, not its old one.
+        c.cmd(&[b"HSET", b"bl:10", b"v", &pack_f32(&over)]);
+        assert_eq!(nearest_key(&mut c, &over).as_deref(), Some("bl:10"));
+        assert_ne!(nearest_key(&mut c, &docs[10].1).as_deref(), Some("bl:10"));
+        for key in deleted {
+            let i: usize = key[3..].parse().unwrap();
+            assert_ne!(nearest_key(&mut c, &docs[i].1).as_deref(), Some(key));
+        }
+        // Saved at once, while vectors may still wait.
+        assert!(c.cmds(&["SAVE"]).is_ok());
+        // They are all linked in the end.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while ft_info_field(&mut c, "hnsw_backlog") != "0" {
+            assert!(Instant::now() < deadline, "the backlog never emptied");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            ft_info_field(&mut c, "hnsw_live_count"),
+            (docs.len() - deleted.len()).to_string()
+        );
+    }
+    send_shutdown_nosave(port1);
+    assert!(
+        wait_for_exit(&mut srv1, Duration::from_secs(8)),
+        "srv1 stop"
+    );
+
+    let port2 = free_port();
+    let mut srv2 = start_server_in_dir(port2, &dir);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(30)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while ft_info_field(&mut c, "hnsw_live_count") != (docs.len() - deleted.len()).to_string()
+            || ft_info_field(&mut c, "hnsw_backlog") != "0"
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the graph was not whole after the restart"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(nearest_key(&mut c, &over).as_deref(), Some("bl:10"));
+        for (key, v) in docs
+            .iter()
+            .rev()
+            .skip(2)
+            .take(20)
+            .chain(docs.iter().step_by(397))
+        {
+            if key == "bl:10" || deleted.contains(&key.as_str()) {
+                continue;
+            }
+            assert_eq!(nearest_key(&mut c, v).as_deref(), Some(key.as_str()));
+        }
+    }
+    kill_server(&mut srv2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A crash (SIGKILL) and a `SHUTDOWN` while vectors still wait to be
+/// linked: after the restart every acknowledged vector is found where it
+/// was written, from the AOF and from the snapshot `SHUTDOWN` saves.
+#[test]
+fn acknowledged_vectors_waiting_to_be_linked_survive_a_crash_and_a_shutdown() {
+    let _serial = persist_serial();
+    let dim = 8;
+    let docs: Vec<(String, Vec<f32>)> = (0..6000u64)
+        .map(|i| (format!("bl:{i}"), backlog_vector(dim, i + 7)))
+        .collect();
+    for crash in [true, false] {
+        let dir = temp_dir(if crash {
+            "backlog_kill"
+        } else {
+            "backlog_shutdown"
+        });
+        let port = free_port();
+        let mut srv = if crash {
+            start_aof_server(port, &dir, &["--appendfsync", "always"])
+        } else {
+            start_server_in_dir(port, &dir)
+        };
+        assert!(wait_for_server(port, Duration::from_secs(10)), "start");
+        let mut c = Conn::connect(port);
+        assert!(
+            c.cmds(&[
+                "FT.CREATE",
+                "idx:bl",
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "bl:",
+                "SCHEMA",
+                "v",
+                "VECTOR",
+                "HNSW",
+                "6",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "8",
+                "DISTANCE_METRIC",
+                "L2",
+            ])
+            .is_ok()
+        );
+        hset_pipelined(&mut c, &docs);
+        let waiting = ft_info_field(&mut c, "hnsw_backlog");
+        if crash {
+            kill_server(&mut srv);
+        } else {
+            let _ = c.stream.write_all(b"*1\r\n$8\r\nSHUTDOWN\r\n");
+            assert!(wait_for_exit(&mut srv, Duration::from_secs(30)), "stop");
+        }
+        drop(c);
+        let port = free_port();
+        let mut srv = if crash {
+            start_aof_server(port, &dir, &[])
+        } else {
+            start_server_in_dir(port, &dir)
+        };
+        assert!(wait_for_server(port, Duration::from_secs(60)), "restart");
+        let mut c = Conn::connect(port);
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while ft_info_field(&mut c, "hnsw_live_count") != docs.len().to_string()
+            || ft_info_field(&mut c, "hnsw_backlog") != "0"
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the graph was not whole after the restart (crash {crash}, {waiting} waited)"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        for (key, v) in docs.iter().rev().take(30).chain(docs.iter().step_by(211)) {
+            assert_eq!(
+                nearest_key(&mut c, v).as_deref(),
+                Some(key.as_str()),
+                "crash {crash}"
+            );
+        }
+        kill_server(&mut srv);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

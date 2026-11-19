@@ -1455,35 +1455,74 @@ fn ft_knn_past_most_due_nearest_vectors() {
 /// Queries that measure every vector of an HNSW graph while writers add,
 /// overwrite and delete documents in it: the server keeps answering (a
 /// measured pass that took the graph's locks in the other order than an
-/// insert hung it).
+/// insert hung it). Several writers, each on its own connection, so that
+/// inserts, overwrites and deletes run at once beside the queries; every
+/// connection gives up after 10 s without a reply, so a hang fails the test
+/// instead of holding it.
 #[test]
 fn ft_knn_measuring_every_vector_beside_writers() {
     let server = Server::start(&[]);
-    let mut c = server.conn();
+    let conn = || {
+        let c = server.conn();
+        c.reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        c
+    };
+    let mut c = conn();
     vectors(&mut c, "w", "HNSW", 3000, 2900, false, false);
     let stop = AtomicBool::new(false);
+    // How many fresh keys the inserting writer has written.
+    let inserted = std::sync::atomic::AtomicUsize::new(0);
+    let hset = |w: &mut Conn, key: &str, x: f32| {
+        let v = vec2(x, 1.0);
+        let args: [&[u8]; 6] = [b"HSET", key.as_bytes(), b"vec", &v, b"t", b"red"];
+        cmd_bytes(w, &args);
+    };
     std::thread::scope(|scope| {
         for _ in 0..3 {
             scope.spawn(|| {
-                let mut q = server.conn();
+                let mut q = conn();
                 while !stop.load(Ordering::Relaxed) {
                     assert_eq!(knn(&mut q, "w", "*=>[KNN 10 @vec $q]").len(), 10);
                 }
             });
         }
+        // Inserts fresh keys and writes over existing ones.
         scope.spawn(|| {
-            let mut w = server.conn();
+            let mut w = conn();
             let mut i = 0usize;
             while !stop.load(Ordering::Relaxed) {
-                let (fresh, old) = (format!("w:new{i}"), format!("w:{}", 2900 + i % 100));
-                let v = vec2(5000.0 + i as f32, 1.0);
-                for key in [&fresh, &old] {
-                    let hset: [&[u8]; 6] = [b"HSET", key.as_bytes(), b"vec", &v, b"t", b"red"];
-                    cmd_bytes(&mut w, &hset);
+                hset(&mut w, &format!("w:new{i}"), 5000.0 + i as f32);
+                hset(&mut w, &format!("w:{}", 2900 + i % 100), 7000.0 + i as f32);
+                i += 1;
+                inserted.store(i, Ordering::Relaxed);
+            }
+        });
+        // Deletes the fresh keys as they come.
+        scope.spawn(|| {
+            let mut w = conn();
+            let mut j = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                if j + 1 < inserted.load(Ordering::Relaxed) {
+                    w.cmd(&["DEL", &format!("w:new{j}")]);
+                    j += 1;
+                } else {
+                    w.cmd(&["PING"]);
                 }
-                if i.is_multiple_of(3) {
-                    w.cmd(&["DEL", &format!("w:new{}", i / 2)]);
-                }
+            }
+        });
+        // Writes over the old keys from the other end, and adds and deletes
+        // keys of its own.
+        scope.spawn(|| {
+            let mut w = conn();
+            let mut i = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                hset(&mut w, &format!("w:{}", 2999 - i % 100), 9000.0 + i as f32);
+                let own = format!("w:third{i}");
+                hset(&mut w, &own, 11000.0 + i as f32);
+                w.cmd(&["DEL", &own]);
                 i += 1;
             }
         });
