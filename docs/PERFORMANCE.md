@@ -415,6 +415,20 @@ unpipelined `GET` from 50 connections fell by a third, from 91k a second (off) t
 rate limiter's p99 at rest went from 1.3 to 3.0 ms (at 100,000 background, 24.5k checks a
 second at 5.9 ms against 19.6k at 6.9 ms).
 
+## Probabilistic types on one key
+
+A type's commands on one key, `redis-benchmark -P 16 -c 50 -n 1000000` on one
+D4s_v5 VM (4 vCPUs), KiviDB 1.3 (unreleased) at its default threads against Redis 8.10.2
+(one thread), commands a second (2026-11-19). Writes to one key take its lock in turn,
+so one key's writes do not spread over the threads; many keys do. `CMS.INCRBY` runs
+beside others on its key (its additions commute); `TOPK.*`'s do not (their draws
+depend on their order). The writes behind Redis's here are not chased yet.
+
+| Command | KiviDB | Redis 8.10.2 | |
+|---|---:|---:|---:|
+| `CF.ADD` of one item | 0.50M | 0.96M | -48% |
+| `CF.EXISTS` of one item | 1.07M | 0.97M | +10% |
+
 ## Earlier runs
 
 KiviDB 1.1 was also measured on AWS Graviton3 bare metal in October 2026, against
