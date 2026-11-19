@@ -976,7 +976,14 @@ pub fn check_memory_limit() -> bool {
 #[inline]
 fn over_memory_limit(ctx: &Ctx) -> bool {
     let limit = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
-    limit != 0 && (crate::memory_use::over(limit) || crate::sketch::room::may_allocate(&ctx.cmd))
+    limit != 0 && over_the_limit(ctx, limit)
+}
+
+/// [`over_memory_limit`] with a limit, out of line: so that the path of a
+/// command without one is what it was.
+#[inline(never)]
+fn over_the_limit(ctx: &Ctx, limit: usize) -> bool {
+    crate::memory_use::over(limit) || crate::sketch::room::may_allocate(&ctx.cmd)
 }
 
 /// Run one command.
