@@ -6808,6 +6808,110 @@ fn a_transaction_of_a_no_writes_script_during_a_slot_handoff_runs() {
     assert_eq!(reply.array()[0].text(), "5", "{reply:?}");
 }
 
+/// A transaction is judged whole: a `no-writes` script beside a write
+/// does not let the write through. It is refused with `TRYAGAIN`, none of
+/// it run, and the key the destination has is unchanged (#339).
+#[cfg(feature = "lua")]
+#[test]
+fn a_no_writes_script_beside_a_write_during_a_slot_handoff_is_refused_whole() {
+    let key = key_in(0..=1000, "handoff");
+    let counter = format!("{{{key}}}:counter");
+    let reply = exec_on_key_reaching_its_gates_during_a_slot_handoff(
+        &key,
+        &[vec!["SET", &counter, "1"]],
+        &[
+            // Names the key the test holds the transaction up for.
+            vec!["EVAL", NO_WRITES_SCRIPT, "1", &key],
+            vec!["INCR", &counter],
+        ],
+        |dst| assert_eq!(dst.conn().cmd(&["GET", &counter]).text(), "1"),
+    );
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("TRYAGAIN")),
+        "the transaction is refused whole: {reply:?}"
+    );
+}
+
+/// A script declared `no-writes`, and its SHA1, as `SCRIPT LOAD` gives it.
+#[cfg(feature = "lua")]
+const NO_WRITES_SCRIPT: &str = "#!lua flags=no-writes\nreturn redis.call('GET', KEYS[1])";
+#[cfg(feature = "lua")]
+const NO_WRITES_SCRIPT_SHA: &str = "d623bfea8e37744c1ffa709b62269c5db88a6bc0";
+
+/// What decides is the script's own flags, not the command's name: an
+/// `EVALSHA` of a loaded `no-writes` script, `EVAL_RO`, `FCALL_RO`, and an
+/// `FCALL` of a function registered `no-writes` all run during a handoff
+/// (#339).
+#[cfg(feature = "lua")]
+#[test]
+fn read_only_scripts_and_functions_during_a_slot_handoff_run() {
+    let key = key_in(0..=1000, "handoff");
+    let library = "#!lua name=lib339\n\
+         redis.register_function{function_name='get339', \
+         callback=function(keys) return redis.call('GET', keys[1]) end, flags={'no-writes'}}";
+    let get = "return redis.call('GET', KEYS[1])";
+    let copy = format!("{{{key}}}:copy");
+    let reply = exec_on_key_reaching_its_gates_during_a_slot_handoff(
+        &key,
+        &[
+            vec!["SET", &copy, "5"],
+            vec!["SCRIPT", "LOAD", NO_WRITES_SCRIPT],
+            vec!["FUNCTION", "LOAD", library],
+        ],
+        &[
+            // Only the first names the key the test holds the transaction
+            // up for: it is held once for each command that does.
+            vec!["EVALSHA", NO_WRITES_SCRIPT_SHA, "1", &key],
+            vec!["EVAL_RO", get, "1", &copy],
+            vec!["FCALL_RO", "get339", "1", &copy],
+            vec!["FCALL", "get339", "1", &copy],
+        ],
+        |_| {},
+    );
+    let replies: Vec<String> = reply.array().iter().map(Resp::text).collect();
+    assert_eq!(replies, ["5", "5", "5", "5"], "{reply:?}");
+}
+
+/// An `EVALSHA` of a script this node has not loaded cannot be told to
+/// write nothing, and counts as a write: the transaction is refused with
+/// `TRYAGAIN` during a handoff (#339).
+#[cfg(feature = "lua")]
+#[test]
+fn an_evalsha_of_a_script_not_loaded_during_a_slot_handoff_is_refused() {
+    let reply = exec_reaching_its_gates_during_a_slot_handoff(|key| {
+        vec![vec!["EVALSHA", NO_WRITES_SCRIPT_SHA, "1", key]]
+    });
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("TRYAGAIN")),
+        "the transaction is refused: {reply:?}"
+    );
+}
+
+/// A watched transaction of plain `SET`s, which `EXEC` applies on its fast
+/// path, is refused with `TRYAGAIN` during a handoff, as any transaction
+/// that writes is: not given the null of a transaction whose watched key
+/// changed. The fast path used to check for a handoff itself and answer
+/// that null (#339). On both I/O models, whose fast paths are their own.
+#[test]
+fn a_watched_transaction_of_sets_during_a_slot_handoff_is_refused_with_tryagain() {
+    for model in io_models() {
+        let key = key_in(0..=1000, "handoff");
+        let watched = format!("{{{key}}}:watched");
+        let reply = exec_reaching_its_gates_during_a_slot_handoff_on(
+            &["--io-model", model],
+            &key,
+            &[],
+            &[vec!["WATCH", &watched]],
+            &[vec!["SET", &key, "6"]],
+            |_| {},
+        );
+        assert!(
+            reply.err().is_some_and(|e| e.starts_with("TRYAGAIN")),
+            "{model}: the transaction is refused: {reply:?}"
+        );
+    }
+}
+
 /// Nor does a `GEORADIUS … STORE` get through, though its name is a read's
 /// (#407). The transaction was taken for one that only reads, and ran: it
 /// stored its result after the handoff's cut, was answered, and the stored
@@ -6920,14 +7024,28 @@ fn exec_on_key_reaching_its_gates_during_a_slot_handoff(
     queued: &[Vec<&str>],
     afterwards: impl FnOnce(&Node),
 ) -> Resp {
+    exec_reaching_its_gates_during_a_slot_handoff_on(&[], key, setup, &[], queued, afterwards)
+}
+
+/// [`exec_on_key_reaching_its_gates_during_a_slot_handoff`], on nodes
+/// started with `args`, with the commands `before` sent ahead of `MULTI`
+/// (a `WATCH`) on the same connection.
+fn exec_reaching_its_gates_during_a_slot_handoff_on(
+    args: &[&str],
+    key: &str,
+    setup: &[Vec<&str>],
+    before: &[Vec<&str>],
+    queued: &[Vec<&str>],
+    afterwards: impl FnOnce(&Node),
+) -> Resp {
     let key = key.to_string();
     let env = [
         ("KIVIDB_TEST_FAILPOINTS", "routed"),
         ("KIVIDB_TEST_STALL_KEYS", key.as_str()),
     ];
     let (nodes, _) = form_cluster_of(vec![
-        Node::start_with_env(&[], &env),
-        Node::start_with_env(&[], &[("KIVIDB_TEST_TAKEOVER_DELAY_MS", "1500")]),
+        Node::start_with_env(args, &env),
+        Node::start_with_env(args, &[("KIVIDB_TEST_TAKEOVER_DELAY_MS", "1500")]),
     ]);
     let (src, dst) = (&nodes[0], &nodes[1]);
     let r = src.conn().cmd(&[
@@ -6945,7 +7063,8 @@ fn exec_on_key_reaching_its_gates_during_a_slot_handoff(
         assert!(r.err().is_none(), "{args:?}: {r:?}");
     }
 
-    let mut commands = vec![vec!["MULTI"]];
+    let mut commands = before.to_vec();
+    commands.push(vec!["MULTI"]);
     commands.extend(queued.iter().cloned());
     commands.push(vec!["EXEC"]);
     let commands: Vec<&[&str]> = commands.iter().map(Vec::as_slice).collect();
