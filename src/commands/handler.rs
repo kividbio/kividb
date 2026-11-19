@@ -970,13 +970,20 @@ pub fn check_memory_limit() -> bool {
     limit != 0 && crate::memory_use::over(limit)
 }
 
-/// [`check_memory_limit`] for the command `name`: with a limit, also true
+/// [`check_memory_limit`] for the command in `ctx`: with a limit, also true
 /// for a command that allocates as much as its arguments say
 /// (`sketch::room`), which is asked how much in [`make_room_or_refuse`].
 #[inline]
-fn over_memory_limit(name: &str) -> bool {
+fn over_memory_limit(ctx: &Ctx) -> bool {
     let limit = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
-    limit != 0 && (crate::memory_use::over(limit) || crate::sketch::room::may_allocate(name))
+    limit != 0 && over_the_limit(ctx, limit)
+}
+
+/// [`over_memory_limit`] with a limit, out of line: so that the path of a
+/// command without one is what it was.
+#[inline(never)]
+fn over_the_limit(ctx: &Ctx, limit: usize) -> bool {
+    crate::memory_use::over(limit) || crate::sketch::room::may_allocate(&ctx.cmd)
 }
 
 /// Run one command.
@@ -1420,17 +1427,8 @@ fn checked_in_gate(
 /// made. See `run_command`.
 #[cold]
 #[inline(never)]
-fn make_room_or_refuse(
-    ctx: &mut Ctx,
-    name: &str,
-    in_order: bool,
-    needs_room: bool,
-) -> Option<Vec<u8>> {
-    let wanted = if crate::sketch::room::allocates(name) {
-        crate::sketch::room::wanted(ctx, name)
-    } else {
-        0
-    };
+fn make_room_or_refuse(ctx: &mut Ctx, in_order: bool, needs_room: bool) -> Option<Vec<u8>> {
+    let wanted = crate::sketch::room::wanted_by(ctx);
     // The keys it deletes are writes too, to be cut between and ordered
     // like any other; it orders them itself, so this comes before the
     // command takes the order of its own keys.
@@ -1571,7 +1569,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // much first, and room is made for that too (`sketch::room`).
     let over_limit = !repl_is_slave
         && !ctx.apply_replication
-        && over_memory_limit(name)
+        && over_memory_limit(ctx)
         && !crate::pause::expiry_deferred();
     // A library of functions is memory too, though not in the keyspace.
     let loads_functions = name == "FUNCTION"
@@ -1728,7 +1726,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
 
     if over_limit {
         let in_order = ordered || (!gated && !ctx.apply_replication);
-        if let Some(refusal) = make_room_or_refuse(ctx, name, in_order, needs_room) {
+        if let Some(refusal) = make_room_or_refuse(ctx, in_order, needs_room) {
             return refusal;
         }
     }
