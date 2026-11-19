@@ -169,8 +169,12 @@ struct Arities {
     /// it has subcommands of their own arity (`CONFIG`, `CLIENT`, …) —
     /// together, so that the check every command goes through is one lookup.
     commands: ByName<(i16, bool)>,
-    /// The short ones among them, again.
+    /// The short ones among them, again, and the short ones of
+    /// `sketch::room::ALLOCATES` (`check_dispatch`).
     short: ShortNames,
+    /// `sketch::room::ALLOCATES` (`check_dispatch`): their arity is their
+    /// own to check.
+    rooms: ByName<()>,
     /// The subcommands, as the table writes them: `CONFIG|GET`.
     subcommands: ByName<i16>,
     containers: AHashSet<&'static str>,
@@ -193,18 +197,19 @@ static ARITIES: LazyLock<Arities> = LazyLock::new(|| {
         .map(|(name, arity)| (name, (arity, containers.contains(name))))
         .collect();
     let subcommands = table().filter(|(name, _)| name.contains('|')).collect();
-    let mut commands = commands;
     let mut short = ShortNames::of(&commands);
     // A command that allocates as much as its arguments say (which checks
     // its own arguments) is in the lookup too, after every other, taken for
     // one with subcommands: it leaves the common path there
     // (`check_dispatch`).
+    let mut rooms = ByName::default();
     for &name in crate::sketch::room::ALLOCATES {
-        commands.insert(name, (-1, true));
         short.insert(name, -1, true);
+        rooms.insert(name, ());
     }
     Arities {
         short,
+        rooms,
         commands,
         subcommands,
         containers,
@@ -297,7 +302,9 @@ fn check_as<const DISPATCH: bool>(name: &str, cmd: &[&[u8]]) -> Option<Vec<u8>> 
 
 #[inline(never)]
 fn check_long(arities: &Arities, name: &str, cmd: &[&[u8]], dispatch: bool) -> Option<Vec<u8>> {
-    let (arity, container) = *arities.commands.get(name)?;
+    let Some(&(arity, container)) = arities.commands.get(name) else {
+        return (dispatch && arities.rooms.contains_key(name)).then(Vec::new);
+    };
     if fits(arity, cmd.len()) && !container {
         return None;
     }
