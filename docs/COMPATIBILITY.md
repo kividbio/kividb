@@ -274,7 +274,8 @@ other files:
   `CMS.QUERY` and `CMS.MERGE` have per-command limits, checked before they
   start. `CMS.MERGE` names its sources as keys (ACL patterns and cluster
   slots apply to them), and needs read permission on them and write
-  permission on its destination. See [COMMANDS.md](../COMMANDS.md).
+  permission on its destination (Redis checks only the destination,
+  and takes read or write permission on it). See [COMMANDS.md](../COMMANDS.md).
 - Set and sorted-set members can't have their own TTLs. A Dragonfly file
   with a `SADDEX` set, or a KeyDB file or stream with `EXPIREMEMBER` on a set
   or sorted-set member, is refused, naming the key. Hash field TTLs from
