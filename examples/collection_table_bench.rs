@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! cargo run --release --example collection_table_bench -- mem
-//! cargo run --release --example collection_table_bench -- latency [N]
+//! cargo run --release --example collection_table_bench -- latency [N [WORKLOAD [inline|deferred|today]]]
 //! cargo run --release --example collection_table_bench -- scan [N]
 //! cargo run --release --example collection_table_bench -- fill
 //! valgrind --tool=callgrind --toggle-collect='*measured*' --cache-sim=yes \
@@ -519,6 +519,11 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 }
 
 fn report(label: &str, mut ns: Vec<u64>, total: f64) {
+    // The slowest five, and the length each was the insert of.
+    let mut slowest: Vec<(u64, usize)> = ns.iter().enumerate().map(|(i, &t)| (t, i + 1)).collect();
+    slowest.sort_unstable_by(|a, b| b.cmp(a));
+    slowest.truncate(5);
+    eprintln!("{label}: slowest (ns, length) {slowest:?}");
     ns.sort_unstable();
     println!(
         "| {label} | {:.2} | {} | {} | {} | {:.1} |",
@@ -530,21 +535,40 @@ fn report(label: &str, mut ns: Vec<u64>, total: f64) {
     );
 }
 
-fn latency(n: usize) {
+fn latency(n: usize, only_workload: Option<&str>, only_mode: Option<&str>) {
     println!("| structure | fill s | p99.9 ns | p99.99 ns | max ns | mean ns |");
     println!("|---|---|---|---|---|---|");
+    // `Some(defer)`: the table, with a finished resize's old array freed on
+    // the write that finished it, or handed over and dropped outside the
+    // timing (as the server would hand it to another thread).
     for w in [Workload::H764, Workload::S17] {
+        if only_workload.is_some_and(|o| Workload::parse(o) != w) {
+            continue;
+        }
         let keys: Vec<String> = (0..n).map(|i| w.key(i)).collect();
-        for table in [true, false] {
+        for mode in [Some(false), Some(true), None] {
+            let name = match mode {
+                Some(false) => "inline",
+                Some(true) => "deferred",
+                None => "today",
+            };
+            if only_mode.is_some_and(|o| o != name) {
+                continue;
+            }
             let mut ns = Vec::with_capacity(n);
-            let start = Instant::now();
             let mut th = CollectionTable::<Fields>::new();
             let mut ts = CollectionTable::<Members>::new();
+            if let Some(defer) = mode {
+                th.defer_free(defer);
+                ts.defer_free(defer);
+            }
+            let mut retired = Vec::new();
             let mut ih = IndexHash::default();
             let mut is = TodaySet::new();
+            let start = Instant::now();
             for k in &keys {
                 let t = Instant::now();
-                match (table, w.is_hash()) {
+                match (mode.is_some(), w.is_hash()) {
                     (true, true) => {
                         th.insert(k.as_bytes(), b"v", None);
                     }
@@ -559,16 +583,22 @@ fn latency(n: usize) {
                     }
                 }
                 ns.push(t.elapsed().as_nanos() as u64);
+                if mode == Some(true) {
+                    retired.extend(th.take_retired());
+                    retired.extend(ts.take_retired());
+                }
             }
             let total = start.elapsed().as_secs_f64();
-            let label = match (table, w.is_hash()) {
-                (true, true) => "table, #764 hash",
-                (true, false) => "table, 14 B set",
-                (false, true) => "IndexMap, #764 hash",
-                (false, false) => "HashTable<Arc>, 14 B set",
+            let label = match (mode, w.is_hash()) {
+                (Some(false), true) => "table, #764 hash",
+                (Some(true), true) => "table, #764 hash, old array freed elsewhere",
+                (Some(false), false) => "table, 14 B set",
+                (Some(true), false) => "table, 14 B set, old array freed elsewhere",
+                (None, true) => "IndexMap, #764 hash",
+                (None, false) => "HashTable<Arc>, 14 B set",
             };
             report(label, ns, total);
-            drop(black_box((th, ts, ih, is)));
+            drop(black_box((th, ts, ih, is, retired)));
         }
     }
 }
@@ -701,11 +731,15 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("mem") => mem(),
         Some("ops") => ops(&args[1..]),
-        Some("latency") => latency(number(1, 3_000_000)),
+        Some("latency") => latency(
+            number(1, 3_000_000),
+            args.get(2).map(String::as_str),
+            args.get(3).map(String::as_str),
+        ),
         Some("scan") => scan(number(1, 1_000_000)),
         Some("fill") => fill(),
         _ => eprintln!(
-            "usage: collection_table_bench mem | ops STRUCT WORKLOAD N OP | latency [N] | scan [N] | fill"
+            "usage: collection_table_bench mem | ops STRUCT WORKLOAD N OP | latency [N [WORKLOAD [MODE]]] | scan [N] | fill"
         ),
     }
 }

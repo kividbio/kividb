@@ -4,12 +4,12 @@
 //! it yet; sets (step 2) and hashes (step 3) move onto it later.
 //!
 //! **Layout.** A power-of-two array of 64-byte groups, one cache line each:
-//! seven control bytes, one meta byte and seven 8-byte slots ([`Group`]). A
+//! seven control bytes, one meta byte and seven 8-byte slots (`Group`). A
 //! control byte is 0 for an empty slot, or `0x80 | 7 bits of the hash` for
 //! an element. When a group is full, slot 6 links to an overflow group
-//! (control byte [`LINK_BYTE`], meta bit [`HAS_LINK`]), and the element that
+//! (control byte `LINK_BYTE`, meta bit `HAS_LINK`), and the element that
 //! was there moves into it. Overflow groups come from the array's own
-//! [`Arena`], allocated in chunks, so it is never copied.
+//! `Arena`, allocated in chunks, so it is never copied.
 //!
 //! **Elements.** One block per element, aligned to 16 ([`Memory`] says where
 //! from): a hash entry is `[flen:7|TTL:1][vlen:7|LONG:1]`, then `u32 flen,
@@ -33,10 +33,13 @@
 //! ([`WRITE_STEP`]) or in [`CollectionTable::step_resize`], which the
 //! background task will call. Until the old array is empty, lookups that miss
 //! in the new one look in the old one; an element is in exactly one of them.
+//! The worst write pays for a zeroed array (fresh pages from `calloc`) and
+//! one step; freeing the old array when a resize ends can be handed to
+//! another thread ([`CollectionTable::defer_free`]).
 //!
-//! **Unsafe.** The raw parts are few: [`Group`] (control-byte arithmetic,
+//! **Unsafe.** The raw parts are few: `Group` (control-byte arithmetic,
 //! no `unsafe`), the slot encodings (`inline_member`, the entry readers and
-//! writers), the [`Arena`], and the table's walks over raw group pointers.
+//! writers), the `Arena`, and the table's walks over raw group pointers.
 //! The invariants each relies on are stated where they are, and checked by
 //! `debug_assert!`s and, in tests, by `check()`.
 
@@ -116,7 +119,7 @@ pub struct SlabMemory;
 impl SlabMemory {
     #[inline]
     fn class(layout: Layout) -> Option<usize> {
-        if layout.align() <= 16 {
+        if layout.align() == ENTRY_ALIGN {
             crate::value_slab::class_of(layout.size())
         } else {
             None
@@ -422,30 +425,57 @@ impl Arena {
 // ---------------------------------------------------------------------------
 
 /// `2^bits` groups, zeroed when made.
+///
+/// The block is asked for aligned to 8 and 56 bytes longer, and the groups
+/// start at its first multiple of 64 (`offset` bytes in). Asked for aligned
+/// to 64, the system allocator zeroes a block with `memset` (Rust's
+/// `alloc_zeroed` for an alignment above 16 is `posix_memalign` and a
+/// fill), which for the 64 MiB of a 3M-element table took 13 ms on the
+/// write that started the growth; `calloc` gets fresh pages from the kernel
+/// already zeroed, and they are touched a few at a time by later writes.
 #[derive(Clone, Copy)]
 struct Array {
     groups: NonNull<Group>,
     bits: u8,
+    /// Bytes from the block's start to `groups`: 0 to 56.
+    offset: u8,
 }
+
+/// Room asked for beyond the groups, to align them to 64.
+const ARRAY_SLACK: usize = 64 - 8;
 
 impl Array {
     fn layout(bits: u8) -> Layout {
-        Layout::array::<Group>(1usize << bits).expect("a group array fits in memory")
+        let bytes = std::mem::size_of::<Group>()
+            .checked_shl(u32::from(bits))
+            .and_then(|b| b.checked_add(ARRAY_SLACK))
+            .expect("a group array fits in memory");
+        Layout::from_size_align(bytes, 8).expect("a group array fits in memory")
     }
 
     fn alloc<A: Memory>(bits: u8) -> Self {
         debug_assert!(bits <= MAX_BITS);
+        let block = A::alloc(Self::layout(bits), true);
+        let offset = (64 - block.as_ptr().addr() % 64) % 64;
+        debug_assert!(offset <= ARRAY_SLACK && offset % 8 == 0);
         Array {
-            groups: A::alloc(Self::layout(bits), true).cast(),
+            // SAFETY: `offset <= ARRAY_SLACK`: the groups, `64 << bits`
+            // bytes from there, are in the block.
+            groups: unsafe { block.add(offset) }.cast(),
             bits,
+            offset: offset as u8,
         }
     }
 
     /// # Safety
     /// Made by [`Self::alloc`] with `A`; no group of it is used again.
     unsafe fn free<A: Memory>(self) {
-        // SAFETY: the caller's promise.
-        unsafe { A::free(self.groups.cast(), Self::layout(self.bits)) }
+        // SAFETY: the caller's promise: the block starts `offset` bytes
+        // before the groups.
+        unsafe {
+            let block = self.groups.cast::<u8>().sub(usize::from(self.offset));
+            A::free(block, Self::layout(self.bits))
+        }
     }
 
     #[inline]
@@ -669,10 +699,29 @@ fn inline_member(member: &[u8]) -> Option<*mut u8> {
     if member.len() > INLINE_MEMBER {
         return None;
     }
-    let mut bytes = [0u8; 8];
-    bytes[..member.len()].copy_from_slice(member);
-    let word = 1 | (member.len() << 1) | ((u64::from_le_bytes(bytes) as usize) << 8);
+    let word = 1 | (member.len() << 1) | ((pack7(member) as usize) << 8);
     Some(ptr::without_provenance_mut(word))
+}
+
+/// Up to 7 bytes as a little-endian number, without a call to `memcpy`
+/// (on every lookup of a short member): two loads that overlap for 4 to 7
+/// bytes, three for 1 to 3.
+#[inline]
+fn pack7(bytes: &[u8]) -> u64 {
+    let len = bytes.len();
+    debug_assert!(len <= INLINE_MEMBER);
+    if len >= 4 {
+        let lo = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let at = len - 4;
+        let hi = u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        u64::from(lo) | (u64::from(hi) << (8 * at))
+    } else if len > 0 {
+        u64::from(bytes[0])
+            | (u64::from(bytes[len / 2]) << (8 * (len / 2)))
+            | (u64::from(bytes[len - 1]) << (8 * (len - 1)))
+    } else {
+        0
+    }
 }
 
 #[inline]
@@ -864,6 +913,7 @@ pub struct CollectionTable<K: Kind, A: Memory = SystemMemory> {
     /// so that the header packs into 80 bytes.
     groups: NonNull<Group>,
     bits: u8,
+    offset: u8,
     len: usize,
     /// The length past which `main` doubles.
     grow_at: usize,
@@ -880,6 +930,51 @@ pub struct CollectionTable<K: Kind, A: Memory = SystemMemory> {
 struct Rare {
     arena: Arena,
     old: Option<Old>,
+    /// The array (and arena) of a finished resize, kept for the caller to
+    /// free elsewhere ([`CollectionTable::defer_free`]).
+    retired: Option<(Array, Arena)>,
+    defer_free: bool,
+}
+
+impl Rare {
+    fn new() -> Self {
+        Rare {
+            arena: Arena::new(),
+            old: None,
+            retired: None,
+            defer_free: false,
+        }
+    }
+}
+
+/// The group array and overflow arena a finished resize left behind:
+/// freed when dropped, on whatever thread drops it. Freeing them is the
+/// one cost of a resize that grows with the table (the 16 MiB array left by
+/// growing past 1.6M elements took 0.9 ms to free), so the server can hand
+/// them to a thread of its own rather than pay it on a write
+/// ([`CollectionTable::defer_free`]).
+pub struct Retired<A: Memory = SystemMemory> {
+    array: Array,
+    arena: Arena,
+    _memory: PhantomData<A>,
+}
+
+// SAFETY: it owns its blocks, and nothing else points into them.
+unsafe impl<A: Memory> Send for Retired<A> {}
+
+impl<A: Memory> Retired<A> {
+    /// What freeing it gives back, as `allocation_size` counted it.
+    pub fn bytes(&self) -> usize {
+        A::charged(Array::layout(self.array.bits)) + self.arena.bytes::<A>()
+    }
+}
+
+impl<A: Memory> Drop for Retired<A> {
+    fn drop(&mut self) {
+        // SAFETY: a finished resize's array: every element moved out of it.
+        unsafe { self.array.free::<A>() };
+        self.arena.release::<A>();
+    }
 }
 
 /// The array a resize is moving elements out of.
@@ -1006,9 +1101,11 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
 
     fn build(n: usize, hasher: ahash::RandomState) -> Self {
         let bits = bits_for(n, MAX_FILL);
+        let main = Array::alloc::<A>(bits);
         CollectionTable {
-            groups: Array::alloc::<A>(bits).groups,
+            groups: main.groups,
             bits,
+            offset: main.offset,
             len: 0,
             grow_at: grow_at(bits, MAX_FILL),
             entry_bytes: 0,
@@ -1034,6 +1131,7 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
         Array {
             groups: self.groups,
             bits: self.bits,
+            offset: self.offset,
         }
     }
 
@@ -1123,12 +1221,7 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
             self.start_resize(self.main().bits + 1);
         }
         let main = self.main();
-        let rare = self.rare.get_or_insert_with(|| {
-            Box::new(Rare {
-                arena: Arena::new(),
-                old: None,
-            })
-        });
+        let rare = self.rare.get_or_insert_with(|| Box::new(Rare::new()));
         // SAFETY: the main array and its arena; the element is new.
         unsafe { place::<A>(main, &mut rare.arena, h, slot) };
         self.len += 1;
@@ -1216,12 +1309,7 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
         debug_assert!(!self.resizing());
         let new = Array::alloc::<A>(bits);
         let main = self.main();
-        let rare = self.rare.get_or_insert_with(|| {
-            Box::new(Rare {
-                arena: Arena::new(),
-                old: None,
-            })
-        });
+        let rare = self.rare.get_or_insert_with(|| Box::new(Rare::new()));
         let arena = std::mem::replace(&mut rare.arena, Arena::new());
         rare.old = Some(Old {
             array: main,
@@ -1230,6 +1318,7 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
         });
         self.groups = new.groups;
         self.bits = new.bits;
+        self.offset = new.offset;
         self.grow_at = grow_at(bits, self.max_fill);
     }
 
@@ -1243,7 +1332,12 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
         let Some(rare) = self.rare.as_mut() else {
             return true;
         };
-        let Rare { arena, old } = &mut **rare;
+        let Rare {
+            arena,
+            old,
+            retired,
+            defer_free,
+        } = &mut **rare;
         let Some(o) = old.as_mut() else {
             return true;
         };
@@ -1279,11 +1373,44 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
         if o.next < o.array.len() {
             return false;
         }
-        let mut o = old.take().expect("a resize in progress");
-        // SAFETY: every element has moved out; nothing points into it.
-        unsafe { o.array.free::<A>() };
-        o.arena.release::<A>();
+        let o = old.take().expect("a resize in progress");
+        // Every element has moved out of it; nothing points into it.
+        let done = if *defer_free {
+            // One not taken since an earlier resize is freed now.
+            retired.replace((o.array, o.arena))
+        } else {
+            Some((o.array, o.arena))
+        };
+        if let Some((array, arena)) = done {
+            drop(Retired::<A> {
+                array,
+                arena,
+                _memory: PhantomData,
+            });
+        }
         true
+    }
+
+    /// Keep the array and arena a finished resize leaves for
+    /// [`Self::take_retired`] instead of freeing them on the write that
+    /// finished it. One not taken is freed when the next resize finishes.
+    pub fn defer_free(&mut self, defer: bool) {
+        let rare = self.rare.get_or_insert_with(|| Box::new(Rare::new()));
+        rare.defer_free = defer;
+        if !defer {
+            drop(self.take_retired());
+        }
+    }
+
+    /// The array and arena of the last finished resize, if
+    /// [`Self::defer_free`] kept them.
+    pub fn take_retired(&mut self) -> Option<Retired<A>> {
+        let (array, arena) = self.rare.as_mut()?.retired.take()?;
+        Some(Retired {
+            array,
+            arena,
+            _memory: PhantomData,
+        })
     }
 
     /// Allocate an entry block of `size` bytes.
@@ -1468,6 +1595,9 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
             if let Some(old) = rare.old.as_ref() {
                 bytes += A::charged(Array::layout(old.array.bits)) + old.arena.bytes::<A>();
             }
+            if let Some((array, arena)) = rare.retired.as_ref() {
+                bytes += A::charged(Array::layout(array.bits)) + arena.bytes::<A>();
+            }
         }
         bytes
     }
@@ -1583,6 +1713,7 @@ impl<K: Kind, A: Memory> Drop for CollectionTable<K, A> {
         }
         // SAFETY: no element or group is used after this.
         unsafe { self.main().free::<A>() };
+        drop(self.take_retired());
         if let Some(mut rare) = self.rare.take() {
             rare.arena.release::<A>();
             if let Some(mut old) = rare.old.take() {
@@ -2181,6 +2312,16 @@ mod tests {
     }
 
     #[test]
+    fn pack7_is_a_copy() {
+        let src = [0x01u8, 0x80, 0xff, 0x7f, 0x00, 0x42, 0x99];
+        for len in 0..=7 {
+            let mut bytes = [0u8; 8];
+            bytes[..len].copy_from_slice(&src[..len]);
+            assert_eq!(pack7(&src[..len]), u64::from_le_bytes(bytes), "{len}");
+        }
+    }
+
+    #[test]
     fn entry_encodings() {
         let mut table = HashT::with_capacity_and_seed(0, 3);
         let long = vec![b'L'; 300];
@@ -2655,6 +2796,61 @@ mod tests {
                 <= std::mem::size_of::<
                     indexmap::IndexMap<String, std::sync::Arc<[u8]>, ahash::RandomState>,
                 >()
+        );
+    }
+
+    #[test]
+    fn deferred_free_hands_the_old_array_over() {
+        let (blocks0, chunks0, bytes0) = live();
+        let mut table = SetT::with_capacity_and_seed(0, 20);
+        table.defer_free(true);
+        let mut retired = Vec::new();
+        let mut i = 0;
+        while retired.len() < 3 {
+            table.insert(format!("member-{i}").as_bytes());
+            i += 1;
+            if let Some(r) = table.take_retired() {
+                assert!(!table.resizing());
+                assert!(r.bytes() > 0);
+                retired.push(r);
+            }
+        }
+        table.check();
+        let (_, chunks, bytes) = live();
+        drop(retired);
+        assert!(live().1 < chunks && live().2 < bytes);
+        // One not taken is freed with the table, or by the next resize.
+        while !table.resizing() {
+            table.insert(format!("member-{i}").as_bytes());
+            i += 1;
+        }
+        while !table.step_resize(usize::MAX) {}
+        assert!(table.rare.as_ref().unwrap().retired.is_some());
+        let before = live().2;
+        let size = table.allocation_size();
+        table.defer_free(false);
+        assert!(live().2 < before);
+        assert!(table.allocation_size() < size);
+        drop(table);
+        assert_eq!(live(), (blocks0, chunks0, bytes0));
+        // `allocation_size` counts a retired array until it is taken.
+        let names: Vec<Vec<u8>> = (0..scale(5_000))
+            .map(|i| format!("m-{i}").into_bytes())
+            .collect();
+        let Some(start) = crate::memory_use::allocated_by_this_thread() else {
+            return;
+        };
+        let mut table = CollectionTable::<Members>::with_capacity_and_seed(0, 21);
+        table.defer_free(true);
+        for name in &names {
+            table.insert(name);
+            let now = crate::memory_use::allocated_by_this_thread().unwrap();
+            assert_eq!((now - start) as usize, table.allocation_size());
+        }
+        drop(table);
+        assert_eq!(
+            crate::memory_use::allocated_by_this_thread().unwrap(),
+            start
         );
     }
 
