@@ -821,14 +821,14 @@ impl Default for Config {
 }
 
 impl Config {
-    /// The worker threads to start: `--threads`, or with `0` (auto) one per
-    /// CPU the process may run on, its affinity mask and cgroup CPU quota
+    /// The worker threads to start: `--threads`, or with `0` (auto) half the
+    /// CPUs the process may run on, rounded up, its affinity mask and cgroup CPU quota
     /// counted (src/cpus.rs).
     pub fn resolve_threads(&self) -> usize {
         if self.threads > 0 {
             return self.threads;
         }
-        crate::cpus::available(&crate::cpus::detect()).threads
+        crate::cpus::default_workers(crate::cpus::available(&crate::cpus::detect()).cpus)
     }
 
     /// How [`Config::resolve_threads`] came to its number, for the banner,
@@ -837,7 +837,7 @@ impl Config {
         if self.threads > 0 {
             "--threads"
         } else {
-            "auto: one per available CPU"
+            "auto: half the available CPUs"
         }
     }
 
@@ -2598,7 +2598,7 @@ mod config_file_tests {
         let auto = Config::default();
         assert_eq!(auto.threads, 0);
         assert!(auto.resolve_threads() >= 1);
-        assert_eq!(auto.threads_reason(), "auto: one per available CPU");
+        assert_eq!(auto.threads_reason(), "auto: half the available CPUs");
     }
 
     #[test]

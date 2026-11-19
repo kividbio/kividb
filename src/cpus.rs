@@ -1,21 +1,23 @@
 //! How many worker threads `--threads 0` (auto) starts, and why.
 //!
-//! Auto is one worker per CPU the process may actually run on: the CPUs
-//! online, cut down to the affinity mask (`taskset`, a cpuset, Docker's
+//! Auto is half the CPUs the process may actually run on, rounded up ([`default_workers`]):
+//! the CPUs online, cut down to the affinity mask (`taskset`, a cpuset, Docker's
 //! `--cpuset-cpus`, Kubernetes' static CPU manager) and to the cgroup CPU
 //! quota (Docker's `--cpus`, a Kubernetes CPU limit), at least one.
 //!
-//! Up to 1.2 auto was the CPUs minus two (all of them below four): two
-//! workers on a 4-CPU machine. With the server on 4 vCPUs of 4 cores that
-//! served 27% less than four workers on io_uring and 44% less on tokio,
-//! whose p99 it multiplied by six (#873). No other thread of the server
-//! needs a CPU of its own: the AOF writer, the replication hub, expiry and a
-//! background save run beside the workers, and a worker fewer than the CPUs
-//! was not consistently better with any of them running.
+//! Up to 1.2 auto was the CPUs minus two (all of them below four); #873 made
+//! it one per CPU, and one per CPU lost up to 37.9% of the throughput of the
+//! best count on a Standard_D8s_v5 confined to 4, 6 and 8 vCPUs (8.2% on average, across 14 workloads) and
+//! raised the p99 of a server sharing its machine by up to 11 times, where
+//! half the CPUs lost 6.3% at worst and 1.3% on average. No other thread of
+//! the server needs a CPU of its own: the AOF writer, the replication hub,
+//! expiry and a background save run beside the workers, and the CPUs left
+//! over are what they, the application and the load generator use.
 //!
 //! `worker-cpu-affinity auto` (off by default) also binds each io_uring
 //! worker to a CPU of its own, when the workers are exactly as many as the
-//! CPUs the process may use ([`pinning`]). An io_uring worker serves its
+//! CPUs the process may use ([`pinning`]): with the default count that is
+//! only on one CPU, so it takes `--threads` set to the CPUs. An io_uring worker serves its
 //! connections alone: when the scheduler puts two workers on one CPU, which
 //! it does at times once a third busy thread (the replication hub feeding a
 //! kept backlog) shares their CPUs, every connection of one waits out the
@@ -449,7 +451,7 @@ pub struct Cpus {
 /// The worker count auto picked, and a sentence saying why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Auto {
-    pub threads: usize,
+    pub cpus: usize,
     pub reason: String,
 }
 
@@ -462,20 +464,35 @@ pub struct Auto {
 /// workers 3% more than two, at a p99 of 18 ms (two: 2.1 ms).
 pub fn available(cpus: &Cpus) -> Auto {
     let online = cpus.online.max(1);
-    let mut threads = online;
+    let mut n = online;
     let mut reason = format!("{online} CPUs online");
-    if let Some(mask) = cpus.affinity.filter(|&n| n > 0 && n < threads) {
-        threads = mask;
+    if let Some(mask) = cpus.affinity.filter(|&c| c > 0 && c < n) {
+        n = mask;
         reason = "its affinity mask: a cpuset or taskset".to_string();
     }
     if let Some(quota) = cpus.quota.filter(|q| q.is_finite() && *q > 0.0) {
         let whole = (quota.floor() as usize).max(1);
-        if whole < threads {
-            threads = whole;
+        if whole < n {
+            n = whole;
             reason = format!("a cgroup CPU quota of {} CPUs", trim(quota));
         }
     }
-    Auto { threads, reason }
+    Auto { cpus: n, reason }
+}
+
+/// The workers `--threads 0` (auto) starts on `cpus` available CPUs (see
+/// [`available`]): half of them, rounded up, so 1 on 1 or 2 CPUs, 2 on 3 or
+/// 4, 4 on 8, 8 on 16.
+///
+/// Measured on a Standard_D8s_v5 confined to 4, 6 and 8 vCPUs, across 14 workloads, one worker per CPU lost up
+/// to 37.9% of the throughput of the best count (8.2% on average) and raised
+/// the p99 of a server sharing its machine by up to 11 times; half the CPUs
+/// lost 6.3% at worst and 1.3% on average, and 13 of the 14 were within 3% of
+/// the best count. The CPUs left are what the load generator, the
+/// application, the AOF writer, the replication hub and a background save
+/// run on. Only the count is a rule: `--threads N` starts exactly `N`.
+pub fn default_workers(cpus: usize) -> usize {
+    cpus.max(1).div_ceil(2)
 }
 
 /// `2.5` as `2.5`, `2.0` as `2`.
@@ -579,7 +596,31 @@ mod tests {
             affinity,
             quota,
         })
-        .threads
+        .cpus
+    }
+
+    #[test]
+    fn auto_starts_half_the_cpus_rounded_up() {
+        for (cpus, workers) in [
+            (1, 1),
+            (2, 1),
+            (3, 2),
+            (4, 2),
+            (6, 3),
+            (8, 4),
+            (16, 8),
+            (64, 32),
+        ] {
+            assert_eq!(default_workers(auto(cpus, None, None)), workers, "{cpus}");
+        }
+        // Never zero.
+        assert_eq!(default_workers(0), 1);
+        // The CPUs counted are the available ones: a 2-CPU quota on a
+        // 16-CPU machine is 1 worker, a 4-CPU mask on 64 is 2.
+        assert_eq!(default_workers(auto(16, Some(16), Some(2.0))), 1);
+        assert_eq!(default_workers(auto(16, None, Some(2.5))), 1);
+        assert_eq!(default_workers(auto(64, Some(4), None)), 2);
+        assert_eq!(default_workers(auto(8, None, Some(0.5))), 1);
     }
 
     #[test]

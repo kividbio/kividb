@@ -353,8 +353,9 @@ docker run -p 6380:6380 \
   ghcr.io/kividbio/kividb --aof --requirepass "change-me"
 ```
 
-**CPUs.** The server starts one worker thread per CPU the container may use: with
-`--cpus 2` or `--cpuset-cpus 0,1` it starts 2, whatever the host has. A fraction is rounded
+**CPUs.** The server starts half as many worker threads as the CPUs the container may use,
+rounded up: with
+`--cpus 2` or `--cpuset-cpus 0,1` it starts 1, whatever the host has. A fraction is rounded
 down, since more workers than the quota are throttled, which costs latency. Without a CPU
 limit it sees every CPU of the host: give it a limit, or `--threads N`, when it shares the
 host. See [Worker threads](CONFIGURATION.md#worker-threads).
