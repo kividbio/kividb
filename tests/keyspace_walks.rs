@@ -186,7 +186,10 @@ impl Server {
     fn wait_until_held(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !self.holding() {
-            assert!(Instant::now() < deadline, "the script never got to its stall");
+            assert!(
+                Instant::now() < deadline,
+                "the script never got to its stall"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -360,7 +363,10 @@ fn a_walk_never_finds_a_script_part_way(io: &str) {
         .collect();
     // Sent while it was held.
     std::thread::sleep(Duration::from_millis(20));
-    assert!(server.holding(), "the script was done before the walks were sent");
+    assert!(
+        server.holding(),
+        "the script was done before the walks were sent"
+    );
     for walker in walkers {
         walker.join().unwrap();
     }
@@ -594,7 +600,16 @@ fn readers_see_a_script_whole_or_not_at_all(io: &str) {
     // A cursor over another index, made before the script runs.
     assert_eq!(
         c.cmd(&[
-            "FT.CREATE", "idxc", "ON", "HASH", "PREFIX", "1", "{c}:", "SCHEMA", "f", "TEXT"
+            "FT.CREATE",
+            "idxc",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "{c}:",
+            "SCHEMA",
+            "f",
+            "TEXT"
         ]),
         V::Str("OK".into())
     );
@@ -602,7 +617,15 @@ fn readers_see_a_script_whole_or_not_at_all(io: &str) {
         assert_eq!(c.cmd(&["HSET", doc, "f", "hello"]), V::Int(1));
     }
     let V::Arr(made) = c.cmd(&[
-        "FT.AGGREGATE", "idxc", "hello", "LOAD", "1", "@f", "WITHCURSOR", "COUNT", "1",
+        "FT.AGGREGATE",
+        "idxc",
+        "hello",
+        "LOAD",
+        "1",
+        "@f",
+        "WITHCURSOR",
+        "COUNT",
+        "1",
     ]) else {
         panic!("WITHCURSOR")
     };
@@ -654,7 +677,8 @@ fn readers_see_a_script_whole_or_not_at_all(io: &str) {
                         ("DBSIZE", whole(keys as usize, base, base + 6), sent_held)
                     }
                     2 => {
-                        let (reply, sent_held) = ask(&["FT.SEARCH", "idx772", "hello", "NOCONTENT"]);
+                        let (reply, sent_held) =
+                            ask(&["FT.SEARCH", "idx772", "hello", "NOCONTENT"]);
                         let V::Arr(items) = &reply else {
                             panic!("FT.SEARCH {reply:?}")
                         };
@@ -718,7 +742,12 @@ fn readers_see_a_script_whole_or_not_at_all(io: &str) {
                     }
                     10 => {
                         let (reply, sent_held) = ask(&[
-                            "FT.PROFILE", "idx772", "SEARCH", "QUERY", "hello", "NOCONTENT",
+                            "FT.PROFILE",
+                            "idx772",
+                            "SEARCH",
+                            "QUERY",
+                            "hello",
+                            "NOCONTENT",
                         ]);
                         // The search's own reply comes first.
                         let V::Arr(parts) = &reply else {
@@ -861,7 +890,16 @@ fn a_snapshot_holds_a_script_whole_or_not_at_all() {
 fn create_index(c: &mut Conn) {
     assert_eq!(
         c.cmd(&[
-            "FT.CREATE", "idx772", "ON", "HASH", "PREFIX", "1", "{t}:doc", "SCHEMA", "f", "TEXT"
+            "FT.CREATE",
+            "idx772",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "{t}:doc",
+            "SCHEMA",
+            "f",
+            "TEXT"
         ]),
         V::Str("OK".into())
     );
@@ -921,7 +959,10 @@ fn a_script_beside_others_reads_no_keys_it_does_not_name(io: &str) {
     assert_eq!(script.join().unwrap(), V::Int(1));
     // A script of no keys runs alone.
     let alone = c.cmd(&["EVAL", "return redis.call('INFO', 'keyspace')", "0"]);
-    assert!(matches!(alone, V::Str(ref text) if text.contains("keys=")), "{alone:?}");
+    assert!(
+        matches!(alone, V::Str(ref text) if text.contains("keys=")),
+        "{alone:?}"
+    );
     // The index is still there.
     assert!(matches!(c.cmd(&["FT.INFO", "idx772"]), V::Arr(_)));
 }
@@ -952,7 +993,10 @@ fn a_drop_of_documents_waits_for_scripts(io: &str) {
     let reply = d.read();
     let after = !server.holding();
     assert_eq!(reply, V::Str("OK".into()));
-    assert!(after, "the documents were dropped while the script was held");
+    assert!(
+        after,
+        "the documents were dropped while the script was held"
+    );
     assert_eq!(script.join().unwrap(), V::Int(1));
     assert_eq!(c.cmd(&["EXISTS", "{t}:doc1", "{t}:doc2"]), V::Int(0));
 }

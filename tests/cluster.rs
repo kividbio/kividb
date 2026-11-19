@@ -11744,7 +11744,16 @@ fn migrate_moves_sorted_sets_in_every_form() {
 fn coordinated_searches_beside_tagged_scripts_on_both_masters() {
     let (nodes, ranges) = form_cluster(2);
     let r = nodes[0].conn().cmd(&[
-        "FT.CREATE", "docs", "ON", "HASH", "PREFIX", "1", "doc:", "SCHEMA", "f", "TEXT",
+        "FT.CREATE",
+        "docs",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "doc:",
+        "SCHEMA",
+        "f",
+        "TEXT",
     ]);
     assert!(r.is_ok(), "{r:?}");
     for i in 0..40 {
