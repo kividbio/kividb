@@ -7,10 +7,15 @@
 //! between two copies of its length:
 //!
 //! ```text
-//! [ len: u16 ][ element's bytes ][ len: u16 ]   [ len ][ bytes ][ len ]   ...
+//! [ len ][ element's bytes ][ len ]   [ len ][ bytes ][ len ]   ...
 //! ```
 //!
-//! Four bytes an element besides its own. The length in front lets a chunk
+//! A length is one byte for an element shorter than 128 bytes, two for a
+//! longer one (see `write_frame`): two bytes an element besides its own,
+//! or four. Short elements are the common case of a list (job ids,
+//! counters, small tokens), and for them the lengths were most of what the
+//! element cost: a six-digit job id took ten bytes with two-byte lengths,
+//! and takes eight. The length in front lets a chunk
 //! be read forwards, the one behind backwards, so either end's element is
 //! found in one step and popped by moving a mark; element `i` of a chunk is
 //! reached by stepping from the nearer end, at most half a chunk.
@@ -39,8 +44,9 @@ use std::collections::VecDeque;
 pub const MAX_LEN: usize = 1024;
 /// The most elements in one chunk.
 pub const CHUNK_ENTRIES: usize = 64;
-/// The two lengths around an element.
-const FRAME: usize = 4;
+/// An element shorter than this has one-byte lengths, a longer one
+/// two-byte lengths (see [`write_frame`]).
+const SHORT: usize = 128;
 /// The least a buffer that holds something grows by: a few elements' room,
 /// so that a list pushed to one element at a time is not reallocated at
 /// every push.
@@ -58,20 +64,61 @@ fn growth(need: usize, live: usize) -> usize {
     }
 }
 
+/// The bytes of each of the two lengths of an element of `len` bytes.
 #[inline(always)]
-fn read_len(buf: &[u8], at: usize) -> usize {
-    u16::from_le_bytes([buf[at], buf[at + 1]]) as usize
+fn hdr(len: usize) -> usize {
+    1 + (len >= SHORT) as usize
 }
 
-/// Write `element` between its two lengths at `at`; `at + element.len() +
-/// FRAME <= buf.len()`.
+/// The bytes of the frame of an element of `len` bytes: the element and
+/// its two lengths.
+#[inline(always)]
+fn frame_len(len: usize) -> usize {
+    len + 2 * hdr(len)
+}
+
+/// The length of the element whose frame begins at `at`.
+#[inline(always)]
+fn len_at(buf: &[u8], at: usize) -> usize {
+    let b = buf[at] as usize;
+    if b < 0x80 {
+        b
+    } else {
+        ((b & 0x7f) << 8) | buf[at + 1] as usize
+    }
+}
+
+/// The length of the element whose frame ends at `end`.
+#[inline(always)]
+fn len_before(buf: &[u8], end: usize) -> usize {
+    let b = buf[end - 1] as usize;
+    if b < 0x80 {
+        b
+    } else {
+        ((b & 0x7f) << 8) | buf[end - 2] as usize
+    }
+}
+
+/// Write `element`'s frame at `at`; `at + frame_len(element.len()) <=
+/// buf.len()`. An element shorter than [`SHORT`] is framed by one byte of
+/// length on each side, a longer one by two: in front the high bits first,
+/// with the top bit set, behind the low byte first, so that the byte next
+/// to the element's outer edge says, from either side, which form it is.
 #[inline]
 fn write_frame(buf: &mut [u8], at: usize, element: &[u8]) {
-    let len = (element.len() as u16).to_le_bytes();
     let n = element.len();
-    buf[at..at + 2].copy_from_slice(&len);
-    buf[at + 2..at + 2 + n].copy_from_slice(element);
-    buf[at + 2 + n..at + FRAME + n].copy_from_slice(&len);
+    if n < SHORT {
+        buf[at] = n as u8;
+        buf[at + 1..at + 1 + n].copy_from_slice(element);
+        buf[at + 1 + n] = n as u8;
+    } else {
+        let (hi, lo) = (0x80 | (n >> 8) as u8, n as u8);
+        buf[at] = hi;
+        buf[at + 1] = lo;
+        buf[at + 2..at + 2 + n].copy_from_slice(element);
+        buf[at + 2 + n] = lo;
+        buf[at + 3 + n] = hi;
+    }
 }
 
 /// Up to [`CHUNK_ENTRIES`] elements in one buffer.
@@ -145,7 +192,7 @@ impl Chunk {
     }
 
     fn push_back(&mut self, element: &[u8]) {
-        let need = element.len() + FRAME;
+        let need = frame_len(element.len());
         self.room_back(need);
         let at = self.buf.len();
         self.buf.resize(at + need, 0);
@@ -158,7 +205,7 @@ impl Chunk {
         if self.count <= 1 {
             return;
         }
-        let frame = read_len(&self.buf, self.buf.len() - 2) + FRAME;
+        let frame = frame_len(len_before(&self.buf, self.buf.len()));
         if (self.start as usize) < frame {
             self.grow_front(growth(frame, self.live()));
         }
@@ -174,7 +221,7 @@ impl Chunk {
         if self.count <= 1 {
             return;
         }
-        let frame = read_len(&self.buf, self.start as usize) + FRAME;
+        let frame = frame_len(len_at(&self.buf, self.start as usize));
         self.room_back(frame);
         let start = self.start as usize;
         self.buf.extend_from_within(start..start + frame);
@@ -189,10 +236,11 @@ impl Chunk {
         if from_back {
             let mut end = self.buf.len();
             for _ in 0..self.count() {
-                let len = read_len(&self.buf, end - 2);
-                let at = end - len - FRAME;
-                if len == want && &self.buf[at + 2..at + 2 + len] == element {
-                    self.cut(at, len + FRAME);
+                let len = len_before(&self.buf, end);
+                let at = end - frame_len(len);
+                let from = at + hdr(len);
+                if len == want && &self.buf[from..from + len] == element {
+                    self.cut(at, frame_len(len));
                     return true;
                 }
                 end = at;
@@ -200,12 +248,13 @@ impl Chunk {
         } else {
             let mut at = self.start as usize;
             for _ in 0..self.count() {
-                let len = read_len(&self.buf, at);
-                if len == want && &self.buf[at + 2..at + 2 + len] == element {
-                    self.cut(at, len + FRAME);
+                let len = len_at(&self.buf, at);
+                let from = at + hdr(len);
+                if len == want && &self.buf[from..from + len] == element {
+                    self.cut(at, frame_len(len));
                     return true;
                 }
-                at += len + FRAME;
+                at += frame_len(len);
             }
         }
         false
@@ -237,7 +286,7 @@ impl Chunk {
     }
 
     fn push_front(&mut self, element: &[u8]) {
-        let need = element.len() + FRAME;
+        let need = frame_len(element.len());
         if (self.start as usize) < need {
             // Room in front: a quarter of what is held, at least.
             self.grow_front(growth(need, self.live()));
@@ -302,9 +351,10 @@ impl Chunk {
         if from_back {
             let mut end = self.buf.len();
             for k in 0..n {
-                let len = read_len(&self.buf, end - 2);
-                let at = end - len - FRAME;
-                if len == element.len() && &self.buf[at + 2..at + 2 + len] == element {
+                let len = len_before(&self.buf, end);
+                let at = end - frame_len(len);
+                let from = at + hdr(len);
+                if len == element.len() && &self.buf[from..from + len] == element {
                     mask |= 1 << (n - 1 - k);
                     found += 1;
                     if found == limit {
@@ -316,15 +366,16 @@ impl Chunk {
         } else {
             let mut at = self.start as usize;
             for j in 0..n {
-                let len = read_len(&self.buf, at);
-                if len == element.len() && &self.buf[at + 2..at + 2 + len] == element {
+                let len = len_at(&self.buf, at);
+                let from = at + hdr(len);
+                if len == element.len() && &self.buf[from..from + len] == element {
                     mask |= 1 << j;
                     found += 1;
                     if found == limit {
                         break;
                     }
                 }
-                at += len + FRAME;
+                at += frame_len(len);
             }
         }
         mask
@@ -339,7 +390,7 @@ impl Chunk {
         // Where the run of kept frames not yet moved begins.
         let mut run = read;
         for j in 0..=last {
-            let frame = read_len(&self.buf, read) + FRAME;
+            let frame = frame_len(len_at(&self.buf, read));
             if mask & (1 << j) != 0 {
                 if write != run {
                     self.buf.copy_within(run..read, write);
@@ -371,9 +422,9 @@ impl Chunk {
         };
         let mut frames = &self.buf[at..];
         for _ in 0..n {
-            let len = u16::from_le_bytes([frames[0], frames[1]]) as usize;
-            let (frame, rest) = frames.split_at(len + FRAME);
-            if !each(&frame[2..2 + len]) {
+            let len = len_at(frames, 0);
+            let (frame, rest) = frames.split_at(frame_len(len));
+            if !each(&frame[hdr(len)..hdr(len) + len]) {
                 return false;
             }
             frames = rest;
@@ -393,9 +444,9 @@ impl Chunk {
         let mut frames = &self.buf[self.start as usize..end];
         for _ in 0..n {
             let e = frames.len();
-            let len = u16::from_le_bytes([frames[e - 2], frames[e - 1]]) as usize;
-            let (rest, frame) = frames.split_at(e - len - FRAME);
-            if !each(&frame[2..2 + len]) {
+            let len = len_before(frames, e);
+            let (rest, frame) = frames.split_at(e - frame_len(len));
+            if !each(&frame[hdr(len)..hdr(len) + len]) {
                 return false;
             }
             frames = rest;
@@ -436,8 +487,8 @@ impl Chunk {
             return None;
         }
         let at = self.start as usize;
-        let len = read_len(&self.buf, at);
-        Some(&self.buf[at + 2..at + 2 + len])
+        let len = len_at(&self.buf, at);
+        Some(&self.buf[at + hdr(len)..at + hdr(len) + len])
     }
 
     #[inline]
@@ -446,8 +497,8 @@ impl Chunk {
             return None;
         }
         let end = self.buf.len();
-        let len = read_len(&self.buf, end - 2);
-        Some(&self.buf[end - 2 - len..end - 2])
+        let len = len_before(&self.buf, end);
+        Some(&self.buf[end - hdr(len) - len..end - hdr(len)])
     }
 
     /// Take the first element off. `count() > 0`.
@@ -455,8 +506,8 @@ impl Chunk {
     fn drop_front(&mut self) {
         debug_assert!(self.count > 0);
         let at = self.start as usize;
-        let len = read_len(&self.buf, at);
-        self.start = (at + len + FRAME) as u32;
+        let len = len_at(&self.buf, at);
+        self.start = (at + frame_len(len)) as u32;
         self.count -= 1;
         if self.count == 0 {
             self.emptied();
@@ -468,8 +519,8 @@ impl Chunk {
     fn drop_back(&mut self) {
         debug_assert!(self.count > 0);
         let end = self.buf.len();
-        let len = read_len(&self.buf, end - 2);
-        self.buf.truncate(end - len - FRAME);
+        let len = len_before(&self.buf, end);
+        self.buf.truncate(end - frame_len(len));
         self.count -= 1;
         if self.count == 0 {
             self.emptied();
@@ -493,23 +544,23 @@ impl Chunk {
         if i <= n / 2 {
             let mut at = self.start as usize;
             for _ in 0..i {
-                at += read_len(&self.buf, at) + FRAME;
+                at += frame_len(len_at(&self.buf, at));
             }
-            (at, read_len(&self.buf, at))
+            (at, len_at(&self.buf, at))
         } else {
             let mut end = self.buf.len();
             for _ in 0..n - 1 - i {
-                end -= read_len(&self.buf, end - 2) + FRAME;
+                end -= frame_len(len_before(&self.buf, end));
             }
-            let len = read_len(&self.buf, end - 2);
-            (end - len - FRAME, len)
+            let len = len_before(&self.buf, end);
+            (end - frame_len(len), len)
         }
     }
 
     #[inline]
     fn get(&self, i: usize) -> &[u8] {
         let (at, len) = self.at(i);
-        &self.buf[at + 2..at + 2 + len]
+        &self.buf[at + hdr(len)..at + hdr(len) + len]
     }
 
     /// Make the `old` bytes at `at` into `new` bytes, moving what follows.
@@ -531,7 +582,7 @@ impl Chunk {
     /// Put `element` in element `i`'s place. `i < count()`.
     fn set(&mut self, i: usize, element: &[u8]) {
         let (at, len) = self.at(i);
-        self.resize_at(at, len + FRAME, element.len() + FRAME);
+        self.resize_at(at, frame_len(len), frame_len(element.len()));
         write_frame(&mut self.buf, at, element);
     }
 
@@ -546,7 +597,7 @@ impl Chunk {
             return self.push_back(element);
         }
         let (at, _) = self.at(i);
-        self.resize_at(at, 0, element.len() + FRAME);
+        self.resize_at(at, 0, frame_len(element.len()));
         write_frame(&mut self.buf, at, element);
         self.count += 1;
     }
@@ -561,7 +612,7 @@ impl Chunk {
             return self.drop_back();
         }
         let (at, len) = self.at(i);
-        self.resize_at(at, len + FRAME, 0);
+        self.resize_at(at, frame_len(len), 0);
         self.count -= 1;
     }
 
@@ -877,7 +928,9 @@ impl PackedList {
         }
     }
 
-    /// Back to a single chunk once a list of several is down to one.
+    /// Back to a single chunk once a list of several is down to one; and,
+    /// for a list that was much longer, the deque of chunks given back down
+    /// to what it holds.
     fn settle(&mut self) {
         if let Chunks::Many(m) = &mut self.chunks {
             match m.chunks.len() {
@@ -885,6 +938,15 @@ impl PackedList {
                 1 => {
                     let chunk = m.chunks.pop_front().unwrap_or_default();
                     self.chunks = Chunks::One(chunk);
+                }
+                // A deque keeps its room when chunks leave it: a list of
+                // 3,000,000 drained to 300,000 kept 2 MB of it, 7 bytes an
+                // element left. Halved once it is a quarter full, so that a
+                // list going up and down across the line does not move it
+                // every time.
+                n if n < m.chunks.capacity() / 4 && m.chunks.capacity() > 8 => {
+                    let room = m.chunks.capacity() / 2;
+                    m.chunks.shrink_to(room);
                 }
                 _ => {}
             }
@@ -930,7 +992,7 @@ impl PackedList {
             if element.len() > MAX_LEN {
                 return (k, bytes);
             }
-            bytes += element.len() + FRAME;
+            bytes += frame_len(element.len());
         }
         (elements.len().min(most), bytes)
     }
@@ -1045,7 +1107,7 @@ impl PackedList {
             // A list that filled a chunk at this end is growing here: the
             // new chunk gets room for a quarter of the full one, so that a
             // steady queue does not regrow it at every push.
-            let room = (element.len() + FRAME).max(last.live() / 4);
+            let room = frame_len(element.len()).max(last.live() / 4);
             self.open_back(room);
             self.last_mut().push_back(element);
         }
@@ -1063,7 +1125,7 @@ impl PackedList {
         if first.count() < CHUNK_ENTRIES {
             first.push_front(element);
         } else {
-            let room = (element.len() + FRAME).max(first.live() / 4);
+            let room = frame_len(element.len()).max(first.live() / 4);
             self.open_front(room);
             self.first_mut().push_front(element);
         }
@@ -1779,7 +1841,7 @@ impl Builder {
             return false;
         }
         let at = self.frames.len();
-        self.frames.resize(at + element.len() + FRAME, 0);
+        self.frames.resize(at + frame_len(element.len()), 0);
         write_frame(&mut self.frames, at, element);
         self.count += 1;
         if self.count as usize == CHUNK_ENTRIES {
@@ -1839,12 +1901,12 @@ impl<'a> Iterator for Iter<'a> {
             self.frames = frames;
             self.in_chunk = in_chunk;
         }
-        let len = read_len(self.frames, 0);
-        let (frame, rest) = self.frames.split_at(len + FRAME);
+        let len = len_at(self.frames, 0);
+        let (frame, rest) = self.frames.split_at(frame_len(len));
         self.frames = rest;
         self.in_chunk -= 1;
         self.left -= 1;
-        Some(&frame[2..2 + len])
+        Some(&frame[hdr(len)..hdr(len) + len])
     }
 
     #[inline]
@@ -1880,12 +1942,12 @@ impl<'a> Iterator for RevIter<'a> {
             self.in_chunk = in_chunk;
         }
         let end = self.frames.len();
-        let len = read_len(self.frames, end - 2);
-        let (rest, frame) = self.frames.split_at(end - len - FRAME);
+        let len = len_before(self.frames, end);
+        let (rest, frame) = self.frames.split_at(end - frame_len(len));
         self.frames = rest;
         self.in_chunk -= 1;
         self.left -= 1;
-        Some(&frame[2..2 + len])
+        Some(&frame[hdr(len)..hdr(len) + len])
     }
 
     #[inline]
@@ -2172,7 +2234,14 @@ mod tests {
         let mut model: VecDeque<Vec<u8>> = VecDeque::new();
         for step in 0..60_000 {
             let r = next();
-            let value = vec![b'a' + (r >> 8) as u8 % 26; ((r >> 16) % 40) as usize];
+            // Mostly short, one in eight with two-byte lengths or near the
+            // edge between the forms (`SHORT`).
+            let len = if (r >> 40) % 8 == 0 {
+                100 + (r >> 16) % 200
+            } else {
+                (r >> 16) % 40
+            };
+            let value = vec![b'a' + (r >> 8) as u8 % 26; len as usize];
             // Phases: growing, shrinking, about level; so the list crosses
             // one chunk, many chunks and empty more than once.
             let bias = match (step / 6_000) % 3 {
@@ -2295,20 +2364,112 @@ mod tests {
         for _ in 0..100_000 {
             list.push_back(&value);
         }
-        // 36 bytes an element in its chunk; the chunks between the ends are
+        // 34 bytes an element in its chunk; the chunks between the ends are
         // exact, and the deque of chunks is half a byte an element.
         let per_element = list.allocation_size() as f64 / 100_000.0;
-        assert!(per_element < 38.0, "{per_element}");
+        assert!(per_element < 35.0, "{per_element}");
         // A short list: its one buffer, a quarter over at most.
         let mut list = PackedList::new();
         for _ in 0..10 {
             list.push_back(&value);
         }
         assert!(
-            list.allocation_size() <= 10 * 36 * 5 / 4 + 16,
+            list.allocation_size() <= 10 * 34 * 5 / 4 + 16,
             "{}",
             list.allocation_size()
         );
+        // A job id of six digits: eight bytes, and the chunk's share.
+        let mut list = PackedList::new();
+        for i in 0..100_000 {
+            list.push_back(format!("{}", 100_000 + i).as_bytes());
+        }
+        let per_element = list.allocation_size() as f64 / 100_000.0;
+        assert!(per_element < 9.0, "{per_element}");
+    }
+
+    /// A list drained to a tenth gives back the deque's room with its
+    /// chunks, at either end, and keeps it while it goes up and down a
+    /// little.
+    #[test]
+    fn a_drained_list_gives_back_the_deque_of_chunks() {
+        let value = [b'v'; 6];
+        for from_back in [false, true] {
+            let mut list = PackedList::new();
+            for _ in 0..640_000 {
+                list.push_front(&value);
+            }
+            let full = list.allocation_size() as f64 / 640_000.0;
+            for _ in 0..576_000 {
+                if from_back {
+                    list.drop_back();
+                } else {
+                    list.drop_front();
+                }
+            }
+            let drained = list.allocation_size() as f64 / 64_000.0;
+            assert!(drained < full + 0.5, "{drained} {full}");
+            let Chunks::Many(m) = &list.chunks else {
+                panic!("one chunk")
+            };
+            let room = m.chunks.capacity();
+            // Up and down by a few chunks: the room stays.
+            for _ in 0..3 {
+                for _ in 0..640 {
+                    list.push_back(&value);
+                }
+                for _ in 0..640 {
+                    list.drop_front();
+                }
+            }
+            let Chunks::Many(m) = &list.chunks else {
+                panic!("one chunk")
+            };
+            assert_eq!(m.chunks.capacity(), room);
+        }
+    }
+
+    /// Lengths on both sides of the edge between one-byte and two-byte
+    /// lengths, and at the ends of each form, read and changed every way.
+    #[test]
+    fn both_forms_of_length_are_read_from_either_side() {
+        let lens = [0usize, 1, 2, 126, 127, 128, 129, 255, 256, 1000, MAX_LEN];
+        for &n in &[
+            1usize,
+            5,
+            CHUNK_ENTRIES,
+            CHUNK_ENTRIES + 3,
+            3 * CHUNK_ENTRIES,
+        ] {
+            let mut list = PackedList::new();
+            let mut model: VecDeque<Vec<u8>> = VecDeque::new();
+            for i in 0..n {
+                let value = vec![b'a' + (i % 26) as u8; lens[i % lens.len()]];
+                if i % 2 == 0 {
+                    list.push_back(&value);
+                    model.push_back(value);
+                } else {
+                    list.push_front(&value);
+                    model.push_front(value);
+                }
+            }
+            assert_same(&list, &model);
+            // Each element given another length, of the other form.
+            for i in 0..n {
+                let value = vec![b'z'; lens[(i + 5) % lens.len()]];
+                assert!(list.set(i, &value));
+                model[i] = value;
+            }
+            assert_same(&list, &model);
+            for _ in 0..n / 2 {
+                assert_eq!(list.back(), model.back().map(Vec::as_slice));
+                list.drop_back();
+                model.pop_back();
+                assert_eq!(list.front(), model.front().map(Vec::as_slice));
+                list.drop_front();
+                model.pop_front();
+            }
+            assert_same(&list, &model);
+        }
     }
 
     #[test]
