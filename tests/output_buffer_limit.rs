@@ -1110,6 +1110,51 @@ fn pipelined_requests_larger_than_a_read_all_run() {
     }
 }
 
+/// A client with a small receive buffer that sends a long pipeline of small
+/// commands before it reads a reply is answered in full. The Tokio loop read
+/// 4 KiB at a time, while its replies waited too, and so answered such a
+/// pipeline a few hundred bytes at a time: segments so small that the
+/// client's receive buffer filled with their overhead long before its
+/// window did, and the client and the server then waited for each other
+/// for good.
+#[test]
+fn a_pipeline_through_a_small_receive_buffer_is_answered() {
+    let _turn = serial();
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        let mut c = server.conn();
+        // 64 KiB was enough against a release build; a debug build answers
+        // more slowly, and needs a smaller buffer to show it.
+        socket2::SockRef::from(&c.writer)
+            .set_recv_buffer_size(16 * 1024)
+            .unwrap();
+        // 400,000 `SET`s of 20-byte values: 19 MB.
+        let value = "v".repeat(20);
+        let mut pipeline = Vec::new();
+        for i in 0..400_000 {
+            let key = format!("pk:{}", i % 1000);
+            pipeline.extend_from_slice(
+                format!(
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n$20\r\n{value}\r\n",
+                    key.len()
+                )
+                .as_bytes(),
+            );
+        }
+        // A stall fails the test rather than hanging it.
+        c.writer
+            .set_write_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        c.writer
+            .write_all(&pipeline)
+            .unwrap_or_else(|e| panic!("{io_model}: the pipeline stalled: {e}"));
+        for i in 0..400_000 {
+            assert_eq!(c.read(), Some(V::Str("OK".into())), "{io_model} {i}");
+        }
+        assert_eq!(c.cmd(&["GET", "pk:999"]).text(), value, "{io_model}");
+    }
+}
+
 /// A blocking command writes the replies to what came before it as it
 /// parks, and the server reads the client while that write waits too.
 #[test]

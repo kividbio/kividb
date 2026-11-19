@@ -210,6 +210,8 @@ fn start_server(port: u16) {
             slowlog_log_slower_than: 10_000,
             slowlog_max_len: 128,
             query_buffer_idle_resize_after_ms: 150,
+            // `DEBUG SLEEP` holds a connection still in the read-size test.
+            enable_debug_command: kividb::config::DebugCommand::Yes,
             cluster_enabled: false,
             cluster_node_timeout: 15000,
             configfile: "./kividb.conf".to_string(),
@@ -1767,6 +1769,24 @@ fn test_large_pipeline_is_read_in_larger_reads_until_idle() {
     thread::sleep(Duration::from_millis(400));
     assert_eq!(reads_for_pipeline(&mut client), 2, "given back when idle");
     assert_eq!(client.cmds(&["GET", "k19"]).as_str(), value);
+
+    // A request that exactly fills the room of a buffer given back, and
+    // then silence: the full read grows the buffer, and it is given back
+    // all the same once the client is quiet.
+    thread::sleep(Duration::from_millis(400));
+    let exact = format!(
+        "*3\r\n$3\r\nSET\r\n$5\r\nexact\r\n$4063\r\n{}\r\n",
+        "e".repeat(4063)
+    );
+    assert_eq!(exact.len(), 4096);
+    client.stream.write_all(exact.as_bytes()).unwrap();
+    assert_eq!(client.read_value().as_str(), "OK");
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        reads_for_pipeline(&mut client),
+        2,
+        "given back when idle after a full read"
+    );
 }
 
 // CLIENT NO-EVICT is accepted

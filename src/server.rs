@@ -624,16 +624,19 @@ fn read_while_writing<'a, R: tokio::io::AsyncRead + Unpin + Send>(
     mut limit: HardLimit,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
     Box::pin(async move {
-        let mut temp = [0u8; 4096];
         let mut reading = true;
         loop {
+            // Straight into `carried`, with a read's room (`READ_BUFFER`).
+            let spare = read_ahead.carried.capacity() - read_ahead.carried.len();
+            if reading && spare < READ_BUFFER {
+                read_ahead.carried.reserve(READ_BUFFER);
+            }
             tokio::select! {
                 written = &mut write => return written,
-                read = reader.read(&mut temp), if reading => match read {
+                read = reader.read_buf(&mut *read_ahead.carried), if reading => match read {
                     Ok(n) if n > 0 => {
                         crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                         crate::stats::record_read();
-                        read_ahead.carried.extend_from_slice(&temp[..n]);
                         activity.touch();
                         activity.note_read(n);
                         if carried_too_much(
@@ -737,7 +740,12 @@ const BIG_BUFFER: usize = 256 * 1024;
 
 /// What a read gets room for: small, as idle connections hold it.
 const READ_SIZE: usize = 4 * 1024;
-/// The most a read brings, and what a full read grows the buffer to.
+/// The most a read brings, and what a full read grows the buffer to; also
+/// the room a read made while replies wait gets (`read_while_writing`), and
+/// what a turn runs of what was read ahead. Reads of 4 KiB there answered a
+/// long pipeline of small commands a few hundred bytes at a time: segments
+/// so small that a client with a small receive buffer filled it with their
+/// overhead, and it and the server then waited for each other for good.
 const READ_BUFFER: usize = 32 * 1024;
 /// Reads in a row that `READ_SIZE` would have held before a grown buffer shrinks.
 const SHORT_READS: u32 = 4;
@@ -1172,78 +1180,120 @@ where
             // the timer arm is only built then; every other read — including
             // every read of a client that is not sitting on a private buffer —
             // races just the socket and `kill_rx`.
-            // A grown buffer is given back too once empty, unless more is waiting.
+            // A grown buffer is given back too once empty and the client quiet.
             let should_maintain_query_buffer = (private_query_buffer
-                || (buffer.is_empty() && buffer.capacity() > READ_SIZE && !last_read_full))
+                || (buffer.is_empty() && buffer.capacity() > READ_SIZE))
                 && buffer.capacity().saturating_sub(buffer.len())
                     > resp::parse::QUERY_BUFFER_MIN_SPARE_FOR_RESIZE;
             let room = buffer.capacity() - buffer.len();
             let n = if should_maintain_query_buffer {
-                let resize_deadline = if private_query_buffer
-                    && buffer.capacity() > resp::parse::QUERY_BUFFER_RESIZE_THRESHOLD
-                {
-                    tokio::time::Instant::from_std(
-                        last_query_buffer_resize_check
-                            + resp::parse::QUERY_BUFFER_PEAK_SAMPLE_INTERVAL,
-                    )
+                // After a read that filled its room, what follows is usually
+                // there already, and is read without building the timer.
+                // Only if nothing is does the timer wait, its idle clock
+                // started now (a full read does not restart it): a client
+                // that went quiet after a full read gets its buffer back as
+                // after a short one.
+                let mut read_at_once = None;
+                if last_read_full && !private_query_buffer {
+                    let mut capped = (&mut reader).take(READ_BUFFER as u64);
+                    let mut read = std::pin::pin!(capped.read_buf(&mut buffer));
+                    match std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(read.as_mut().poll(cx))
+                    })
+                    .await
+                    {
+                        std::task::Poll::Ready(result) => read_at_once = Some(result),
+                        std::task::Poll::Pending => {
+                            last_query_buffer_activity = Instant::now();
+                        }
+                    }
+                }
+                if let Some(result) = read_at_once {
+                    match result? {
+                        0 => break,
+                        n => n,
+                    }
                 } else {
-                    tokio::time::Instant::from_std(
-                        last_query_buffer_activity
-                            + query_buffer_idle_resize_after
-                            + tokio::time::Duration::from_millis(10),
-                    )
-                };
-                // A large argument leaves far more room than one turn should run.
+                    let resize_deadline = if private_query_buffer
+                        && buffer.capacity() > resp::parse::QUERY_BUFFER_RESIZE_THRESHOLD
+                    {
+                        tokio::time::Instant::from_std(
+                            last_query_buffer_resize_check
+                                + resp::parse::QUERY_BUFFER_PEAK_SAMPLE_INTERVAL,
+                        )
+                    } else {
+                        tokio::time::Instant::from_std(
+                            last_query_buffer_activity
+                                + query_buffer_idle_resize_after
+                                + tokio::time::Duration::from_millis(10),
+                        )
+                    };
+                    // A large argument leaves far more room than one turn should run.
+                    let mut capped = (&mut reader).take(READ_BUFFER as u64);
+                    tokio::select! {
+                        // Normal case: data arrived from the client
+                        result = capped.read_buf(&mut buffer) => {
+                            match result? {
+                                0 => break,
+                                n => n,
+                            }
+                        }
+                        // CLIENT KILL was called — close this connection immediately
+                        _ = &mut kill_rx => {
+                            // Send a final error so the client knows it was killed,
+                            // then break. Redis sends no response on kill — we match that.
+                            break;
+                        }
+                        // Tokio's socket read is cancellation-safe, so this deadline
+                        // can be checked without abandoning an in-flight operation.
+                        _ = tokio::time::sleep_until(resize_deadline) => {
+                            let resized = if private_query_buffer {
+                                resp::parse::resize_private_query_buffer_after(
+                                    &mut buffer,
+                                    read_start,
+                                    &mut private_query_buffer,
+                                    last_query_buffer_activity.elapsed(),
+                                    query_buffer_idle_resize_after,
+                                    query_buffer_peak,
+                                    progress.minimum_capacity(),
+                                )
+                            } else {
+                                // Grown only for bigger reads, and empty: back to `READ_SIZE`.
+                                buffer = Vec::new();
+                                true
+                            };
+                            if resized {
+                                read_start = 0;
+                                // Exactly a read's room: doubling would undo the trim.
+                                buffer.reserve_exact(READ_SIZE);
+                                query_buffer.update(
+                                    buffer.len(),
+                                    buffer.capacity().saturating_sub(buffer.len()),
+                                    private_query_buffer,
+                                );
+                            }
+                            query_buffer_peak = buffer
+                                .len()
+                                .saturating_sub(read_start)
+                                .max(progress.minimum_capacity());
+                            last_query_buffer_resize_check = Instant::now();
+                            continue;
+                        }
+                    }
+                }
+            } else if room > READ_BUFFER {
+                // More room than a turn should run: what is left of a
+                // read-ahead's vector, handed over whole, with a request
+                // still to complete in it.
                 let mut capped = (&mut reader).take(READ_BUFFER as u64);
                 tokio::select! {
-                    // Normal case: data arrived from the client
                     result = capped.read_buf(&mut buffer) => {
                         match result? {
                             0 => break,
                             n => n,
                         }
                     }
-                    // CLIENT KILL was called — close this connection immediately
-                    _ = &mut kill_rx => {
-                        // Send a final error so the client knows it was killed,
-                        // then break. Redis sends no response on kill — we match that.
-                        break;
-                    }
-                    // Tokio's socket read is cancellation-safe, so this deadline
-                    // can be checked without abandoning an in-flight operation.
-                    _ = tokio::time::sleep_until(resize_deadline) => {
-                        let resized = if private_query_buffer {
-                            resp::parse::resize_private_query_buffer_after(
-                                &mut buffer,
-                                read_start,
-                                &mut private_query_buffer,
-                                last_query_buffer_activity.elapsed(),
-                                query_buffer_idle_resize_after,
-                                query_buffer_peak,
-                                progress.minimum_capacity(),
-                            )
-                        } else {
-                            // Grown only for bigger reads, and empty: back to `READ_SIZE`.
-                            buffer = Vec::new();
-                            true
-                        };
-                        if resized {
-                            read_start = 0;
-                            // Exactly a read's room: doubling would undo the trim.
-                            buffer.reserve_exact(READ_SIZE);
-                            query_buffer.update(
-                                buffer.len(),
-                                buffer.capacity().saturating_sub(buffer.len()),
-                                private_query_buffer,
-                            );
-                        }
-                        query_buffer_peak = buffer
-                            .len()
-                            .saturating_sub(read_start)
-                            .max(progress.minimum_capacity());
-                        last_query_buffer_resize_check = Instant::now();
-                        continue;
-                    }
+                    _ = &mut kill_rx => break,
                 }
             } else {
                 tokio::select! {
@@ -1288,7 +1338,7 @@ where
             // What `carried`'s vector was handed over as is offered on, a
             // read's worth a turn.
             fed_from_carried = true;
-            unpresented = unpresented.saturating_sub(READ_SIZE);
+            unpresented = unpresented.saturating_sub(READ_BUFFER);
         } else if !carried.is_empty() {
             // A read's worth a turn, as the socket would have given it: what
             // one turn runs, and so the replies the output limit looks at
@@ -1306,9 +1356,9 @@ where
                 // either: what the next wait reads grows its own.
                 carried = Vec::new();
                 carried_from = 0;
-                unpresented = (buffer.len() - read_start).saturating_sub(READ_SIZE);
+                unpresented = (buffer.len() - read_start).saturating_sub(READ_BUFFER);
             } else {
-                let to = carried.len().min(carried_from + READ_SIZE);
+                let to = carried.len().min(carried_from + READ_BUFFER);
                 buffer.extend_from_slice(&carried[carried_from..to]);
                 carried_from = to;
                 if carried_from == carried.len() {
