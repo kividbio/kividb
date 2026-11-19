@@ -11772,7 +11772,9 @@ fn coordinated_searches_beside_tagged_scripts_on_both_masters() {
         let (a, b) = ranges[node];
         (0..)
             .map(|i| format!("w{i}"))
-            .find(|tag| (a..=b).contains(&slot_of(&format!("{{{tag}}}"))))
+            // A tagged key's slot is its tag's (`slot_of` does not look for
+            // a tag itself).
+            .find(|tag| (a..=b).contains(&slot_of(tag)))
             .unwrap()
     };
     let deadline = Instant::now() + Duration::from_secs(4);
