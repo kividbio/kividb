@@ -2024,7 +2024,7 @@ pub fn slave_command_allowed_during_loading(name: &str) -> bool {
 /// `delayed:`, waits this long, in the write gate, before it is queued. A
 /// test's window to send another command meanwhile (#423). Unset, a load
 /// and a branch, on a write that is propagated.
-fn test_delay_of_a_bare_write(parts: &[Vec<u8>]) {
+fn test_delay_of_a_bare_write<A: AsRef<[u8]>>(parts: &[A]) {
     static DELAY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
     static TAKEN: AtomicBool = AtomicBool::new(false);
     let delay = DELAY.get_or_init(|| {
@@ -2034,7 +2034,9 @@ fn test_delay_of_a_bare_write(parts: &[Vec<u8>]) {
             .map(std::time::Duration::from_millis)
     });
     if let Some(delay) = *delay
-        && parts.get(1).is_some_and(|key| key.starts_with(b"delayed:"))
+        && parts
+            .get(1)
+            .is_some_and(|key| key.as_ref().starts_with(b"delayed:"))
         && !TAKEN.swap(true, Ordering::Relaxed)
     {
         crate::cluster::migration::off_the_runtime(|| std::thread::sleep(delay));
@@ -4249,11 +4251,21 @@ fn append_to_stream(hub_tx: &HubTx, raw: &[u8]) {
 /// [`replicate_one_write`] of a write as most are: by a client of a master
 /// that only ever used database 0, with the stream there, not in a
 /// transaction or a script, for the hub alone (no AOF, no tap). Encoded
-/// straight into the hub's run of writes (see [`HubTx`]), as
-/// [`ReplState::encode_for_stream`] would have encoded it: no buffer of its
-/// own, no copy of it. False, having done nothing, for any other write.
+/// as [`ReplState::encode_for_stream`] would have encoded it, into a buffer
+/// of the thread's that is kept from write to write (no allocation), and
+/// only copied into the hub's run of writes (see [`HubTx`]) under its lock:
+/// every worker takes that lock for each write, so it is held for one
+/// copy, not for the encoding too (#894: encoding under it, 6 workers at
+/// 2M SETs a second spent 7 % of their time in its slow path, and switched
+/// context 85,000 times a second, 3.5 times as often as with no such
+/// lock). False, having done nothing, for any other write.
 #[inline]
-fn straight_to_the_hub(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>]) -> bool {
+fn straight_to_the_hub<A: AsRef<[u8]>>(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[A]) -> bool {
+    thread_local! {
+        static ENCODED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    /// What a write's buffer may keep between writes.
+    const KEPT: usize = 64 * 1024;
     let state = ctx.repl_state;
     if *ctx.selected_db != 0
         || state.several_databases.load(Ordering::Relaxed)
@@ -4263,17 +4275,38 @@ fn straight_to_the_hub(ctx: &crate::commands::ctx::Ctx<'_>, parts: &[Vec<u8>]) -
         return false;
     }
     test_delay_of_a_bare_write(parts);
-    let mut len = 0;
-    if !ctx.hub_tx.append(|run| {
-        let at = run.len();
-        crate::resp::write::encode_resp_command_into(run, parts);
-        len = run.len() - at;
-    }) {
-        log_warn!("Replication: Hub sender closed — replication cannot proceed");
-        len = crate::resp::write::encode_resp_command(parts).len();
-    }
+    let len = ENCODED.with(|encoded| {
+        let mut encoded = encoded.borrow_mut();
+        encoded.clear();
+        crate::resp::write::encode_resp_command_into(&mut encoded, parts);
+        append_to_stream(ctx.hub_tx, &encoded);
+        let len = encoded.len();
+        if encoded.capacity() > KEPT {
+            *encoded = Vec::new();
+        }
+        len
+    });
     state.repl_offset.fetch_add(len as u64, Ordering::Relaxed);
     true
+}
+
+/// [`replicate_one_write`] of a command the stream carries as it came
+/// ([`script_feed::sent_as_it_came`]), encoded from the client's own
+/// arguments when it goes to the hub alone ([`straight_to_the_hub`]): not
+/// copied into a `Vec<Vec<u8>>` of its own first, which, with the backlog
+/// kept, was an allocation and a free per argument of every write (#894).
+/// False, having done nothing, for any other write: the caller propagates
+/// it as before.
+#[inline]
+pub fn write_as_it_came(ctx: &crate::commands::ctx::Ctx<'_>, name: &str, cmd: &[&[u8]]) -> bool {
+    let state = ctx.repl_state;
+    script_feed::sent_as_it_came(name, cmd)
+        && !ctx.apply_replication
+        && !ctx.aof_enabled
+        && !state.is_slave()
+        && state.stream_taps.load(Ordering::Relaxed) == 0
+        && state.feeds_hub()
+        && straight_to_the_hub(ctx, cmd)
 }
 
 /// One successful write: bump replication offset, fan out to replicas, optional AOF.
