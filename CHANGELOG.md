@@ -473,6 +473,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Pipelined writes of kilobyte values are about twice as fast on the
+  Tokio loop, and a long pipeline through a small receive buffer no longer
+  stalls (#432).** The loop read a client 4 KiB at a time through a stack
+  array and copied it into the query buffer; it now reads into the query
+  buffer itself, 4 KiB at first and up to 32 KiB once a read fills its
+  room, and gives the room back after a few small requests or once the
+  client is quiet, also after a read that exactly filled it. On an Azure
+  D4s_v5 with one worker (50 connections), `SET` of 1 KiB values at
+  pipeline 16 went from 295k to 587k requests a second, and of 4 KiB values
+  at pipeline 32 from 99k to 222k; the server's instructions a command fell
+  by 17 % and 37 % there, and by 25-32 % for single 8 and 16 KiB `SET`s.
+  Pipelined 100-byte commands cost what they did. An idle connection
+  holds about 19 KB instead of 23 KB, and 10,000 connections that each
+  sent one 32 KiB pipeline and then a `PING` every 100 ms hold 191 MB
+  instead of 231 MB.
+  The reads made while replies wait to be written, and the turns that run
+  what they read, are 32 KiB too: at 4 KiB, a client with a 64 KiB receive
+  buffer that sent a 19 MB pipeline of small `SET`s before reading a reply
+  was answered a few hundred bytes at a time, its receive buffer filled
+  with the overhead of those segments, and it and the server waited for
+  each other for good; it now takes 0.13 s. This applies wherever the Tokio
+  loop serves clients: on macOS and Windows, and on Linux with
+  `--io-model tokio` or when the default `--io-model auto` finds io_uring
+  unavailable (under Docker's default seccomp profile, for one). TLS
+  connections use the Tokio loop under either model.
+  `benchmarks/1.3.0/regressions/suites/35-tokio-pipelined-reads.py`
+  re-measures the two rates against v1.2.2 and the pipeline. Thanks
+  @Parikalp-Bhardwaj.
+
 - **With `lua-parallel-scripts` on, `KEYS` and `SCAN` no longer stop
   every connection (#772).** So that a walk of
   the keyspace never finds a script running beside others part-way
