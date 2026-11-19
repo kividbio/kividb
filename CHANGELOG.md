@@ -287,6 +287,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   limits checked before they start, and `COPY` copies a sketch. Snapshots
   keep sketches under tag 40, kind 2.
 
+- **Top-K (`TOPK.*`), as Redis 8 has it built in (part of #453).**
+  `TOPK.RESERVE`, `TOPK.ADD`, `TOPK.INCRBY`, `TOPK.QUERY`, `TOPK.COUNT`,
+  `TOPK.LIST` (with `WITHCOUNT`) and `TOPK.INFO`. Replies and errors are
+  Redis 8.10's in RESP2 and RESP3, quirks included (`TOPK.COUNT` answers 0
+  for a kept item whose buckets count less than the least kept). The sketch
+  is Redis's HeavyKeeper, bucket for bucket: with a decay of 1, where
+  nothing is left to chance, every answer is Redis's (30,000 replies of
+  random sequences compared: `scripts/checks/sketch/topk/compare.py`); with
+  a decay below 1 the chances come from a generator each sketch keeps and
+  saves, so a replica, an AOF replay and a restart end with the master's
+  sketch exactly (a copy made from a `DUMP` payload, which has no place for
+  the generator, starts it afresh), and the heavy hitters of Zipf streams are found as well as
+  Redis finds them. RDB files, full syncs and `DUMP` payloads from Redis
+  load, and `DUMP` writes Redis's format. `TYPE` is `TopK-TYPE`, the ACL
+  category `@topk`. Unlike Redis, a sketch has size limits (k 65,536,
+  67,108,864 buckets, 65,536 rows), the commands of many items a
+  per-command limit checked before they start, items are binary-safe, and
+  `COPY` copies a sketch. Snapshots keep sketches under tag 40, kind 3.
+
 - **Vector sets store vectors quantized when `VADD` asks for it (#697).**
   `Q8` keeps each vector as int8 with its norm and range, and `BIN` as one
   bit per component, as Redis 8 does: about 3.6-3.8x and 15-22x less memory

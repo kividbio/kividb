@@ -276,6 +276,17 @@ other files:
   slots apply to them), and needs read permission on them and write
   permission on its destination (Redis checks only the destination,
   and takes read or write permission on it). See [COMMANDS.md](../COMMANDS.md).
+- Top-K: with a decay of 1 every answer is Redis's; below 1, which bucket
+  decays is left to chance, drawn from a generator each sketch keeps (so
+  replicas and the AOF stay identical to the master), and answers are as
+  good as Redis's, not bit for bit the same. `DUMP` (Redis's format) does
+  not carry the generator: a copy made by `RESTORE`, `MIGRATE` or a slot's
+  move starts it afresh, and from then on does not make the choices the
+  original would have. Items are binary-safe (Redis
+  cuts them at a zero byte in replies). `COPY` copies one, which Redis
+  refuses. Size limits (k 65,536, 67,108,864 buckets, 65,536 rows) and a
+  per-command limit on `TOPK.ADD`, `TOPK.INCRBY`, `TOPK.QUERY` and
+  `TOPK.COUNT`, checked before they start. See [COMMANDS.md](../COMMANDS.md).
 - Set and sorted-set members can't have their own TTLs. A Dragonfly file
   with a `SADDEX` set, or a KeyDB file or stream with `EXPIREMEMBER` on a set
   or sorted-set member, is refused, naming the key. Hash field TTLs from

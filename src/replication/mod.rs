@@ -4736,6 +4736,9 @@ pub(crate) const WRITE_COMMANDS_FOR_TEST: &[&str] = &[
     "SREM",
     "SUNIONSTORE",
     "SWAPDB",
+    "TOPK.ADD",
+    "TOPK.INCRBY",
+    "TOPK.RESERVE",
     "TS.ADD",
     "TS.ALTER",
     "TS.CREATE",
@@ -4785,6 +4788,7 @@ fn is_write_command_reference(name: &str) -> bool {
         // Bloom filters
         "BF.RESERVE" | "BF.ADD" | "BF.MADD" | "BF.INSERT" | "BF.LOADCHUNK" |
         "CMS.INCRBY" | "CMS.INITBYDIM" | "CMS.INITBYPROB" | "CMS.MERGE" |
+        "TOPK.ADD" | "TOPK.INCRBY" | "TOPK.RESERVE" |
         // Strings
         "SET" | "SETNX" | "SETEX" | "PSETEX" | "MSET" | "MSETNX" | "GETSET" |
         "GETDEL" | "GETEX" | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" |

@@ -19,6 +19,7 @@ pub mod cms;
 pub mod murmur;
 pub mod redis_module;
 pub mod room;
+pub mod topk;
 
 use std::io;
 
@@ -32,12 +33,15 @@ const KIND_BLOOM: u8 = 1;
 const BLOOM_VERSION: u8 = 1;
 const KIND_CMS: u8 = 2;
 const CMS_VERSION: u8 = 1;
+const KIND_TOPK: u8 = 3;
+const TOPK_VERSION: u8 = 1;
 
 /// A probabilistic value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Sketch {
     Bloom(bloom::BloomChain),
     CountMin(cms::CountMin),
+    TopK(topk::TopK),
 }
 
 impl Sketch {
@@ -46,6 +50,7 @@ impl Sketch {
         match self {
             Sketch::Bloom(_) => redis_module::BLOOM_TYPE,
             Sketch::CountMin(_) => redis_module::CMS_TYPE,
+            Sketch::TopK(_) => redis_module::TOPK_TYPE,
         }
     }
 
@@ -54,6 +59,7 @@ impl Sketch {
         match self {
             Sketch::Bloom(chain) => chain.memory_bytes(),
             Sketch::CountMin(v) => v.memory_bytes(),
+            Sketch::TopK(v) => v.memory_bytes(),
         }
     }
 
@@ -66,6 +72,7 @@ impl Sketch {
                 (chain.layers.len() as u64).saturating_add(chain.data_bytes() >> 16)
             }
             Sketch::CountMin(v) => 1 + (v.data_bytes() >> 16),
+            Sketch::TopK(v) => 1 + (v.data_bytes() >> 16),
         }
     }
 
@@ -74,6 +81,7 @@ impl Sketch {
         2 + match self {
             Sketch::Bloom(chain) => bloom::kdb_len(chain),
             Sketch::CountMin(v) => cms::kdb_len(v),
+            Sketch::TopK(v) => topk::kdb_len(v),
         }
     }
 }
@@ -101,6 +109,10 @@ pub fn write_kdb(w: &mut impl io::Write, sketch: &Sketch) -> io::Result<()> {
             w.write_all(&[KIND_CMS, CMS_VERSION])?;
             cms::write_kdb(w, v)
         }
+        Sketch::TopK(v) => {
+            w.write_all(&[KIND_TOPK, TOPK_VERSION])?;
+            topk::write_kdb(w, v)
+        }
     }
 }
 
@@ -111,6 +123,7 @@ pub fn read_kdb(r: &mut impl io::Read) -> io::Result<Sketch> {
     match head {
         [KIND_BLOOM, BLOOM_VERSION] => Ok(Sketch::Bloom(bloom::read_kdb(r)?)),
         [KIND_CMS, CMS_VERSION] => Ok(Sketch::CountMin(cms::read_kdb(r)?)),
+        [KIND_TOPK, TOPK_VERSION] => Ok(Sketch::TopK(topk::read_kdb(r)?)),
         [kind, version] => Err(invalid(&format!(
             "probabilistic value of kind {kind}, version {version}, is not known to this \
              version of KiviDB"

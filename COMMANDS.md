@@ -847,6 +847,66 @@ Redis can `RESTORE`. `TYPE` is `CMSk-TYPE`; the ACL category is `@cms`.
 
 ---
 
+## Top-K commands (TOPK.*)
+
+Top-K sketches, as Redis 8 has them built in (formerly RedisBloom): the `k`
+items seen most often, kept by a HeavyKeeper sketch (`depth` rows of `width`
+buckets, each a fingerprint and a count, a bucket of another item decaying
+with probability `decay^count`) and a heap of the `k` largest. Replies and
+errors are Redis 8.10's, in RESP2 and RESP3. With a decay of 1 nothing is left
+to chance and every answer is Redis's; with a decay below 1, chance decides
+which bucket decays, and KiviDB draws it from a generator each sketch keeps,
+so answers are as good as Redis's (the same heavy hitters, within the same
+error) but not bit for bit the same. A sketch moved from Redis (an RDB file, a
+full sync from a Redis master, `RESTORE`/`MIGRATE`) answers as it did there,
+and `DUMP` gives what Redis can `RESTORE`. `TYPE` is `TopK-TYPE`; the ACL
+category is `@topk`.
+
+| `TOPK.RESERVE` | `TOPK.RESERVE key topk [width depth decay]` | Width 8, depth 7, decay 0.9 unless given; decay in (0, 1]. `TopK: key already exists` for a key of any type |
+| `TOPK.ADD` | `TOPK.ADD key item [item ...]` | For each item, the item it pushed out of the top k, or nil |
+| `TOPK.INCRBY` | `TOPK.INCRBY key item increment [item increment ...]` | Increments 0 to 100,000. Items are taken in order; one with a bad increment, and every one after it, is answered with the error |
+| `TOPK.QUERY` | `TOPK.QUERY key item [item ...]` | Whether each item is among the k kept (`#t`/`#f` in RESP3) |
+| `TOPK.COUNT` | `TOPK.COUNT key item [item ...]` | Each item's count in its buckets; 0, as in Redis, for an item kept whose buckets count less than the least kept |
+| `TOPK.LIST` | `TOPK.LIST key [WITHCOUNT]` | The items kept, the largest count first (those counted 0 left out) |
+| `TOPK.INFO` | `TOPK.INFO key` | `k`, `width`, `depth` and `decay`; a map in RESP3 |
+
+The commands go to replicas and the AOF as they came: each sketch draws its
+chances from its own generator, saved with it, so a replica (one that attaches
+late too: a full sync carries the generator), an AOF replay and a restart make
+the master's choices and end with its sketch. `DUMP` writes Redis's format,
+which has no place for the generator: a sketch restored from a `DUMP` payload
+(`RESTORE`, and so `MIGRATE` and the move of a slot in cluster mode) starts
+its generator afresh, as a new sketch's starts. From then on, below a decay of
+1, it does not make the choices the original would have made, only choices as
+good; its replicas still end with its sketch. `COPY` keeps the generator. A
+count past 2^32 − 1 wraps, in the buckets and the heap, as Redis's does.
+
+
+- With a decay below 1, the chances are KiviDB's (see above), not Redis's.
+- Items are binary-safe: Redis cuts an item at its first zero byte when it
+  names it in a reply.
+- A `TOPK.INCRBY` with a bad increment before its last item is answered in
+  full (that item and those after it with the error); Redis stops its reply
+  part way, and the client waits for the rest.
+- Size limits: `k` at most 65,536, at most 67,108,864 buckets (512 MiB) and
+  65,536 rows. `TOPK.RESERVE` over them answers `TopK: sketch is too large
+  (at most k 65536, 67108864 buckets and 65536 rows)`; a snapshot, RDB file
+  or `RESTORE` payload with a larger sketch is refused. Redis has no limit.
+- Per-command limit: a `TOPK.ADD` or `TOPK.INCRBY` may cost at most
+  8,000,000 steps, an item costing its rows times 64 more than its
+  increment, plus a sixteenth of `k` (some 17,000 items of `TOPK.ADD` at the
+  default size, or eleven increments of 100,000 at depth 7), so that no
+  command takes more than some tens of milliseconds; `TOPK.QUERY` and
+  `TOPK.COUNT` likewise (an item costing one plus a sixteenth of `k`). A
+  command over it is refused before it starts, with `TopK: command reached
+  the per-command limit; send fewer items per command`. Replication and the
+  AOF are not held to it.
+- Under `maxmemory`, a client's `TOPK.RESERVE` that would allocate more than is
+  left, or `TOPK.ADD` or `TOPK.INCRBY` that would copy what a snapshot or a
+  copy shares, evicts first under the policy, before it takes its key, and is
+  refused with `OOM ...` only if that is not enough.
+
+
 ## Pub/Sub commands
 
 KiviDB implements the full Redis Pub/Sub command surface including regular channels, glob-pattern subscriptions, and Redis 7.0 shard channels. Every subscribed connection has one queue: a publish appends to the queue of each subscriber, and the connection's own task writes it out. A subscriber therefore sees messages in the order they were published, across all of its channels and patterns, and none is ever dropped from the middle — a subscriber that falls more than 32 MB behind, or stays more than 8 MB behind for 60 seconds, is disconnected instead (Redis's `client-output-buffer-limit pubsub 32mb 8mb 60`). A publish with no subscribers takes no lock.

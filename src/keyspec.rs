@@ -696,6 +696,13 @@ const SKETCHES: &[&str] = &[
     "CMS.INITBYDIM",
     "CMS.INITBYPROB",
     "CMS.QUERY",
+    "TOPK.ADD",
+    "TOPK.COUNT",
+    "TOPK.INCRBY",
+    "TOPK.INFO",
+    "TOPK.LIST",
+    "TOPK.QUERY",
+    "TOPK.RESERVE",
 ];
 
 /// The probabilistic types' merges: `destination numkeys source ...`,
@@ -1126,6 +1133,13 @@ mod tests {
             | "CMS.INITBYDIM"
             | "CMS.INITBYPROB"
             | "CMS.QUERY"
+            | "TOPK.ADD"
+            | "TOPK.COUNT"
+            | "TOPK.INCRBY"
+            | "TOPK.INFO"
+            | "TOPK.LIST"
+            | "TOPK.QUERY"
+            | "TOPK.RESERVE"
             // Sharded pub/sub: the channel is hashed to a slot exactly like a key.
             | "SPUBLISH" => One(1),
 

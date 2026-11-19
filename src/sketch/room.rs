@@ -36,6 +36,9 @@ pub const ALLOCATES: &[&str] = &[
     "CMS.INITBYDIM",
     "CMS.INITBYPROB",
     "CMS.MERGE",
+    "TOPK.ADD",
+    "TOPK.INCRBY",
+    "TOPK.RESERVE",
 ];
 
 /// The bytes the command in `ctx`, named `name` (one of [`ALLOCATES`]),
