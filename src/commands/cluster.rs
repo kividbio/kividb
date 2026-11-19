@@ -1569,10 +1569,11 @@ fn before_slots_come(ctx: &Ctx, slots: &[u16], what: &str) -> Option<Vec<u8>> {
 /// serves from is brought up to date, and nodes.conf is saved in the
 /// background, not waited for. These change no slot's owner, no node and no
 /// epoch, nothing nodes.conf holds (a slot being migrated is not in it), so
-/// a save waited for here made nothing of the command's own durable: it
-/// delayed the reply by a synced save, two of them a slot in a resharding.
-/// `SETSLOT NODE`, which changes an owner, is answered once its save is
-/// synced.
+/// a save waited for here made nothing of the command's own durable. It
+/// cost the reply a save all the same, skipped as unchanged or, with another
+/// under way, written and synced: on two of the five commands a resharding
+/// sends for each slot. `SETSLOT NODE`, which changes an owner, is answered
+/// once its save is synced.
 fn migration_state_changed(ctx: &Ctx) {
     ctx.cluster.save_soon();
 }

@@ -410,10 +410,10 @@ fn injected(name: &str, file: &str, once: bool) -> std::io::Result<()> {
     }
 }
 
-/// Write save `generation`, `out`, beside `path`, not synced: into a spare
-/// (see [`Saves::spares`]) when `reuse` and there is one, else into a new
-/// temporary file. Returns its path, and whether it is a spare. The file is
-/// removed if it cannot be written.
+/// Write save `generation`, `out`, beside `path`: into a spare (see
+/// [`Saves::spares`]), synced, when `reuse` and there is one, else into a
+/// new temporary file, not synced. Returns its path, and whether it is a
+/// spare. The file is removed if it cannot be written.
 fn write_save(
     saves: &Saves,
     path: &Path,
@@ -463,17 +463,19 @@ fn write_spare(
 }
 
 /// Write `out` over the file at `spare`, in place (`O_DIRECT`, as
-/// [`write_direct`]): its blocks are allocated already, so syncing its data
-/// (`fdatasync`) needs no commit of the filesystem's journal, only the
-/// write itself. Cut to the length written if it was longer. Refused if it
-/// is not a plain file of one link: a symbolic or hard link to nodes.conf
-/// that was put out of place with it is never written through.
+/// [`write_direct`]), and synced as it is written (`O_DSYNC`): its blocks are
+/// allocated already, so that needs no commit of the filesystem's journal,
+/// only the write itself (one forced to the disk's media, where a sync after
+/// it flushed the disk's whole cache). Cut to the length written if it was
+/// longer, and that synced. Refused if it is not a plain file of one link: a
+/// symbolic or hard link to nodes.conf that was put out of place with it is
+/// never written through.
 #[cfg(target_os = "linux")]
 fn overwrite_spare(spare: &Path, out: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut file = fs::OpenOptions::new()
         .write(true)
-        .custom_flags(libc::O_DIRECT | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_DIRECT | libc::O_DSYNC | libc::O_NOFOLLOW)
         .open(spare)?;
     let meta = file.metadata()?;
     if !meta.is_file() || meta.nlink() != 1 {
@@ -482,6 +484,7 @@ fn overwrite_spare(spare: &Path, out: &[u8]) -> std::io::Result<()> {
     let len = write_aligned(&mut file, out)?;
     if meta.len() > len {
         file.set_len(len)?;
+        file.sync_data()?;
     }
     Ok(())
 }
@@ -639,19 +642,6 @@ fn sync_file(path: &Path) -> std::io::Result<()> {
     fs::OpenOptions::new().write(true).open(path)?.sync_all()
 }
 
-/// Sync the temporary file `tmp` of a save, written over a spare if
-/// `spare`: its data and what reading it needs (its length), as
-/// `fdatasync` does, not its times. A spare's blocks are allocated, so that
-/// is the write alone, without a commit of the filesystem's journal; a new
-/// file is synced whole.
-fn sync_temp(tmp: &Path, spare: bool) -> std::io::Result<()> {
-    if spare {
-        fs::OpenOptions::new().write(true).open(tmp)?.sync_data()
-    } else {
-        sync_file(tmp)
-    }
-}
-
 /// Sync the directory `path` is in, so that a rename into it is on disk.
 /// `Ok(false)` if the filesystem cannot sync it (see [`dir_sync_outcome`]):
 /// the rename stands, not known to be on disk.
@@ -797,12 +787,12 @@ fn save_then(
             return Ok(());
         }
     };
-    // Held to take the state and write it out, and to put a file in place,
-    // so that what is in place is always the newest save. Not held, by a
-    // save with nothing to publish (the bus's), to sync it: a sync on a busy
-    // disk can take seconds, and a slot handover's takeover, with the
-    // source's writes paused, would wait behind the bus's save. Each save
-    // has a temporary file of its own for that (see `temp_path`).
+    // Held to take the state, and to put a file in place, so that what is
+    // in place is always the newest save. Not held, by a save with nothing
+    // to publish (the bus's, a command's), to write and sync its file: a
+    // sync on a busy disk can take seconds, and a slot handover's takeover,
+    // with the source's writes paused, would wait behind the bus's save.
+    // Each save has a file of its own for that (see `temp_path`).
     let asked = std::time::Instant::now();
     let saving = state.save_lock.lock();
     let locked = asked.elapsed().as_millis();
@@ -856,6 +846,16 @@ fn save_then(
     // name), and by a rename, so that it puts nothing out of place either.
     let deferred = DEFER_SYNC.with(|d| d.get());
     let out = render(&nodes_snap, &slots_snap, epoch, last_vote);
+    // Written with the lock held when there is something to publish (it is
+    // synced and put in place under it too); otherwise once it is let go:
+    // the file is this save's alone, and its write is synced as it is made
+    // when it is a spare.
+    let saving = if publish.is_some() {
+        Some(saving)
+    } else {
+        drop(saving);
+        None
+    };
     let (tmp, spare) = match write_save(&state.saves, path, generation, &out, !deferred) {
         Ok(written) => written,
         Err(e) => {
@@ -871,8 +871,8 @@ fn save_then(
         // put in place before it is published.
         Some(publish) => {
             let placed = (|| {
-                if !deferred {
-                    sync_temp(&tmp, spare)?;
+                if !deferred && !spare {
+                    sync_file(&tmp)?;
                 }
                 // For the tests of a crash between the write and the rename.
                 crate::aof::failpoint_noting("nodes-conf-written", &tmp.to_string_lossy());
@@ -935,9 +935,10 @@ fn save_then(
         // Synced without the lock, then put in place unless a newer save
         // has been meanwhile.
         None => {
-            drop(saving);
             let placed = (|| {
-                sync_temp(&tmp, spare)?;
+                if !spare {
+                    sync_file(&tmp)?;
+                }
                 crate::aof::failpoint_noting("nodes-conf-written", &tmp.to_string_lossy());
                 let saving = state.save_lock.lock();
                 if state.saves.in_place.load(Ordering::SeqCst) < generation {
