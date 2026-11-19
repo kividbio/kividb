@@ -4296,16 +4296,17 @@ fn straight_to_the_hub<A: AsRef<[u8]>>(ctx: &crate::commands::ctx::Ctx<'_>, part
 /// copied into a `Vec<Vec<u8>>` of its own first, which, with the backlog
 /// kept, was an allocation and a free per argument of every write (#894).
 /// False, having done nothing, for any other write: the caller propagates
-/// it as before.
-#[inline]
+/// it as before. Out of line: only an observed write calls it, and inlined
+/// it changed how the writes nothing observes are compiled (#867).
+#[inline(never)]
 pub fn write_as_it_came(ctx: &crate::commands::ctx::Ctx<'_>, name: &str, cmd: &[&[u8]]) -> bool {
     let state = ctx.repl_state;
-    script_feed::sent_as_it_came(name, cmd)
+    !ctx.aof_enabled
         && !ctx.apply_replication
-        && !ctx.aof_enabled
-        && !state.is_slave()
         && state.stream_taps.load(Ordering::Relaxed) == 0
+        && !state.is_slave()
         && state.feeds_hub()
+        && script_feed::sent_as_it_came(name, cmd)
         && straight_to_the_hub(ctx, cmd)
 }
 
