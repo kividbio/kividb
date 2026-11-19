@@ -460,6 +460,91 @@ place, and its directory synced. An output that exists is not replaced
 --force <in> <out>`). The tools start no server and need no shell
 (`["kividb", "kdb-decompress", ...]`).
 
+## The cluster's nodes.conf
+
+In cluster mode a node keeps what it knows of the cluster in
+`cluster-config-file` (`nodes.conf` in `dir`): its own id, every member's id,
+address, hostname, role and shard, who owns which slots, and the epochs. The
+format is Redis's, one line a node and a last `vars` line.
+
+**When it is saved.** On every change of topology: a member learnt or
+forgotten, a role, an address, slots, an epoch, a vote. Changes a command
+makes (`ADDSLOTS`, `REPLICATE`, `FORGET`, `SAVECONFIG`, ...) are saved
+before the command is answered, and a vote before it is sent. Changes
+learnt from the bus are saved on a thread of their own as they are learnt
+(those of 100 ms in one save, so that a cluster being formed does not keep
+its disk busy), except a node met by `CLUSTER MEET`: both ends of the handshake save the
+other before they show it as a member, and the receiving end before it
+answers. So once the node you sent `CLUSTER MEET` to lists the new node in
+`CLUSTER NODES` without the `handshake` flag, both have it on disk. Nodes
+met at the same time are saved together, in one write. The other members
+learn it by gossip, within a few heartbeats, and save it then. A node also
+saves the file at the start of a shutdown.
+
+If the file cannot be saved (a full or read-only disk), the node logs it
+once, as an error, until a save works again. Meanwhile it makes no node
+met a member and does not answer its MEET (the end that sent it tries again,
+for up to two minutes, and again whenever the other end calls on it within
+the hour after), and it casts no vote. A replica that wins an election saves
+its promotion before it announces it, waiting for the save up to a second.
+One not saved by then (a slow disk, a failed save) takes over all the same
+(the cluster has agreed to it), and the promotion is saved in the
+background, made again every second until the save works.
+
+A filesystem that cannot sync a directory at all (some FUSE, CIFS and 9p
+mounts answer `EINVAL` or `ENOTSUP`) does not fail the save: the node warns
+once, and the rename is as durable as that filesystem makes it.
+
+**A cluster stopped whole.** A member that at least one node has in its
+`nodes.conf` is a member again after the cluster restarts: that node tells
+the others of it by gossip, and the member, from the addresses in its own
+file, finds the rest. One that no node has (a node killed before it ever
+showed it) is not: a node that is not a member cannot join by sending
+heartbeats. It has to be met again with `CLUSTER MEET`, as in Redis. That
+rule keeps a process that can reach the bus port from making itself a
+member. A tool that adds nodes and then may restart the whole cluster
+(an operator, a script) should wait until the node it sent `CLUSTER MEET` to
+lists the new node without `handshake`; to have every member save it, wait
+until each one lists it, and send each `CLUSTER SAVECONFIG`.
+
+**How it is written.** To a temporary file beside it
+(`nodes.conf.tmp-<n>`), synced, renamed over it, and the directory synced:
+a crash at any moment leaves the old file or the new one, never part of
+one. Every save writes a new file; nothing is written over in place. On
+Linux it is written past the page cache, padded with blank lines to a
+multiple of 4 KiB. Temporary files a crash left are removed at
+startup. The one exception is the takeover at the end of a slot
+migration's handover, which does not wait for the sync while client writes
+are paused: a power failure in the moment after it can leave the file
+incomplete.
+
+**Failover needs a disk that syncs it quickly.** A master saves its vote,
+synced, before it sends it, and a replica its promotion, so a failover
+waits on several saves, each two syncs of the disk (the file's and the
+directory's). A candidate counts a vote for as long as its election lives,
+10 seconds, and then stands again at a new epoch: a vote whose save takes
+longer than that is never counted, and the failover does not complete.
+Measured on an Azure D4s_v5, ext4 on a volume that delays every write:
+with writes taking 200 ms, a save took 2.1-2.3 s and a failover of a master
+4.5-6.0 s (the promotion announced after its 1 s wait, its save still under
+way); with writes taking 1 s, a save took 8-13 s and no failover completed
+in 330 s. On the VM's own disk a save takes about 20 ms and a failover
+3.5-4.1 s.
+A volume on which a save of nodes.conf takes more than a few seconds is too
+slow for a cluster to fail over: give the cluster file a disk that syncs a
+small file in well under a second.
+
+**A file cut short is refused.** A `nodes.conf` that does not end with its
+`vars` line stops the node at startup with `cluster config file
+'nodes.conf' is unreadable: nodes.conf is incomplete ...`, and the file is
+left as it is: such a file may lack members, slots and the epochs. Restore
+the file from a backup; if there is none, remove it and add the node to the
+cluster again as a new one.
+
+An empty `nodes.conf` (zero bytes) is refused too (`nodes.conf is empty`).
+Redis takes an empty file for a new node. To start a node
+afresh, with a new id, delete the file rather than emptying it.
+
 ## When a write is acknowledged
 
 With the AOF on, the replies to a batch of commands that wrote are sent once

@@ -4766,6 +4766,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "rejected_connections:{}\r\n",
                     crate::stats::REJECTED_CONNECTIONS.load(Ordering::Relaxed)
                 ));
+                #[cfg(debug_assertions)]
+                out.push_str(&format!(
+                    "debug_sends_short:{}\r\ndebug_sends_none:{}\r\n",
+                    crate::stats::DEBUG_SENDS_SHORT.load(Ordering::Relaxed),
+                    crate::stats::DEBUG_SENDS_NONE.load(Ordering::Relaxed)
+                ));
                 out.push_str(&format!(
                     "total_reads_processed:{}\r\n",
                     crate::stats::TOTAL_READS_PROCESSED.total()
