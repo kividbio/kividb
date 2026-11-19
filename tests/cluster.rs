@@ -3978,6 +3978,225 @@ fn counting_writer(
     })
 }
 
+/// What one writer of [`a_manual_failover_under_fast_path_writes_loses_no_acknowledged_write`]
+/// was answered for, by kind of write.
+#[derive(Default, Debug)]
+struct FastAcked {
+    /// The sum of the changes answered to `INCR`, `DECR`, `INCRBY`, `DECRBY`.
+    counter: i64,
+    /// `RPUSH`ed, in order.
+    pushed: Vec<String>,
+    /// `APPEND`ed, in order.
+    appended: String,
+    /// `SADD`, `HSET`, `ZADD` members.
+    members: Vec<String>,
+    /// Keys `SET` or `MSET`.
+    keys: Vec<String>,
+}
+
+/// One connection writing with the commands the replication stream takes
+/// as the client sent them, one at a time, to keys of `tag`'s slot, of its
+/// own (`w`): to whichever of `ports` takes them, as `counting_writer`
+/// does. Returns what it was answered for.
+fn fast_path_failover_writer(
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tag: &str,
+    w: usize,
+    ports: [u16; 2],
+) -> std::thread::JoinHandle<FastAcked> {
+    let stop = std::sync::Arc::clone(stop);
+    let tag = tag.to_string();
+    let patient = |conn: Conn| {
+        conn.stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok()
+            .map(|_| conn)
+    };
+    std::thread::spawn(move || {
+        let mut acked = FastAcked::default();
+        let mut target = 0usize;
+        let mut conn = patient(Conn::connect(ports[target])).expect("a read timeout");
+        let (cnt, list, append) = (
+            format!("{{{tag}}}:cnt:{w}"),
+            format!("{{{tag}}}:l:{w}"),
+            format!("{{{tag}}}:a:{w}"),
+        );
+        let (set, hash, zset) = (
+            format!("{{{tag}}}:s:{w}"),
+            format!("{{{tag}}}:h:{w}"),
+            format!("{{{tag}}}:z:{w}"),
+        );
+        let mut n = 0u64;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            n += 1;
+            let item = format!("{w}-{n}");
+            let key = format!("{{{tag}}}:k:{item}");
+            let other = format!("{{{tag}}}:k2:{item}");
+            let num = n.to_string();
+            let piece = format!("{item};");
+            let args: Vec<&str> = match n % 11 {
+                0 => vec!["INCR", cnt.as_str()],
+                1 => vec!["DECR", cnt.as_str()],
+                2 => vec!["INCRBY", cnt.as_str(), "7"],
+                3 => vec!["DECRBY", cnt.as_str(), "3"],
+                4 => vec!["RPUSH", list.as_str(), item.as_str()],
+                5 => vec!["APPEND", append.as_str(), piece.as_str()],
+                6 => vec!["SADD", set.as_str(), item.as_str()],
+                7 => vec!["HSET", hash.as_str(), item.as_str(), num.as_str()],
+                8 => vec!["ZADD", zset.as_str(), num.as_str(), item.as_str()],
+                9 => vec!["SET", key.as_str(), num.as_str()],
+                _ => vec![
+                    "MSET",
+                    key.as_str(),
+                    num.as_str(),
+                    other.as_str(),
+                    num.as_str(),
+                ],
+            };
+            match conn.try_cmd(&args) {
+                Ok(Resp::Int(_)) | Ok(Resp::Simple(_)) => match n % 11 {
+                    0 => acked.counter += 1,
+                    1 => acked.counter -= 1,
+                    2 => acked.counter += 7,
+                    3 => acked.counter -= 3,
+                    4 => acked.pushed.push(item),
+                    5 => acked.appended.push_str(&piece),
+                    6..=8 => acked.members.push(item),
+                    9 => acked.keys.push(key),
+                    _ => acked.keys.extend([key, other]),
+                },
+                // Redirected, read-only, paused or dropped: not
+                // acknowledged. Try the other node.
+                _ => {
+                    target = 1 - target;
+                    std::thread::sleep(Duration::from_millis(5));
+                    if let Some(c) = Conn::try_connect(ports[target]).and_then(patient) {
+                        conn = c;
+                    }
+                }
+            }
+        }
+        acked
+    })
+}
+
+/// [`manual_failover_swaps_roles_without_losing_acknowledged_writes`] with
+/// several connections writing, with every command the stream takes as the
+/// client sent it (#950): on the new master, each counter at the changes
+/// answered, each list and appended string exactly the writes answered in
+/// the order answered, and each member and key answered there.
+fn a_manual_failover_under_fast_path_writes_loses_no_acknowledged_write(model: &str) {
+    let (nodes, ranges) = form_cluster_of(
+        (0..3)
+            .map(|_| Node::start(&["--io-model", model]))
+            .collect(),
+    );
+    let replica = add_replica_with(&nodes, &nodes[0], &["--io-model", model], &[]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, 4);
+    }
+    let tag = key_in(ranges[0].0..=ranges[0].1, "fast");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..4)
+        .map(|w| fast_path_failover_writer(&stop, &tag, w, [nodes[0].port, replica.port]))
+        .collect();
+    std::thread::sleep(Duration::from_millis(500));
+    let logs = || {
+        let logs: Vec<String> = nodes
+            .iter()
+            .chain(std::iter::once(&replica))
+            .map(|n| format!("==== node {}\n{}", n.port, n.log()))
+            .collect();
+        logs.join("\n")
+    };
+    // Given up when the replica cannot catch up or win in time, and asked
+    // again then, as in `manual_failover_swaps_roles_...`.
+    let mut promoted = false;
+    for attempt in 1..=3 {
+        let reply = replica.conn().cmd(&["CLUSTER", "FAILOVER"]);
+        assert!(reply.is_ok(), "CLUSTER FAILOVER {attempt}: {reply:?}");
+        promoted = (0..150).any(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            replica.is_master()
+        });
+        if promoted {
+            break;
+        }
+    }
+    if !promoted {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        panic!(
+            "the replica was not promoted in 3 manual failovers\n{}",
+            logs()
+        );
+    }
+    let swapped = (0..300).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        replica.is_master() && !nodes[0].is_master()
+    });
+    if !swapped {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        panic!("the old master did not step down within 30 s\n{}", logs());
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut c = replica.conn();
+    let mut total = 0usize;
+    for (w, writer) in writers.into_iter().enumerate() {
+        let acked = writer.join().unwrap();
+        let key = |kind: &str| format!("{{{tag}}}:{kind}:{w}");
+        let counter = match c.cmd(&["GET", &key("cnt")]) {
+            Resp::Nil => 0,
+            v => v.text().parse::<i64>().unwrap(),
+        };
+        assert_eq!(counter, acked.counter, "writer {w}: the counter");
+        let list: Vec<String> = c
+            .cmd(&["LRANGE", &key("l"), "0", "-1"])
+            .array()
+            .iter()
+            .map(Resp::text)
+            .collect();
+        assert_eq!(list, acked.pushed, "writer {w}: the list");
+        let appended = match c.cmd(&["GET", &key("a")]) {
+            Resp::Nil => String::new(),
+            v => v.text(),
+        };
+        assert_eq!(appended, acked.appended, "writer {w}: the appended string");
+        for member in &acked.members {
+            let n: u64 = member.rsplit('-').next().unwrap().parse().unwrap();
+            let (kind, args): (&str, Vec<String>) = match n % 11 {
+                6 => ("SISMEMBER", vec![key("s"), member.clone()]),
+                7 => ("HEXISTS", vec![key("h"), member.clone()]),
+                _ => ("ZSCORE", vec![key("z"), member.clone()]),
+            };
+            let mut all = vec![kind];
+            all.extend(args.iter().map(String::as_str));
+            let reply = c.cmd(&all);
+            assert!(
+                !matches!(reply, Resp::Nil | Resp::Int(0)),
+                "writer {w}: {kind} {member} is missing: {reply:?}"
+            );
+        }
+        for k in &acked.keys {
+            assert_eq!(c.cmd(&["EXISTS", k]).int(), 1, "writer {w}: {k} is missing");
+        }
+        total += acked.pushed.len() + acked.members.len() + acked.keys.len();
+    }
+    assert!(total > 0, "no write was answered");
+}
+
+#[test]
+fn a_manual_failover_under_fast_path_writes_loses_no_acknowledged_write_on_tokio() {
+    a_manual_failover_under_fast_path_writes_loses_no_acknowledged_write("tokio");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_manual_failover_under_fast_path_writes_loses_no_acknowledged_write_on_io_uring() {
+    a_manual_failover_under_fast_path_writes_loses_no_acknowledged_write("uring");
+}
+
 /// A manual failover whose election outlasts the time it has loses no write
 /// the master acknowledged (#185). The votes reach the replica 6 s late, as
 /// they do from voters whose disks are slow to sync them. The master used to

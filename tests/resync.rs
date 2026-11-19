@@ -4353,3 +4353,700 @@ fn script_writes_with_only_the_backlog_to_read_them_are_resumed_by_a_partial_res
         assert_eq!(on_master, on_replica, "{io}");
     }
 }
+
+// ── The fast path under every kind of load (#950) ────────────────────────────
+
+const FAST_KEYS: usize = 48;
+const FAST_COUNTERS: usize = 8;
+
+/// What a [`fast_writer`] does besides the plain writes.
+#[derive(Clone, Copy, Default)]
+struct FastLoad {
+    /// `x:<k>` keys with a time to live of 1 to 30 ms, which expire during
+    /// the load.
+    short_ttls: bool,
+    /// Now and then a value over 64 KiB and over 256 KiB (the bounds of the
+    /// hub's runs and of the runs it kept, #950).
+    large: bool,
+    /// `e:<k>` keys of 300 KB with a long time to live, for an evicting
+    /// policy; `-OOM` (and the `-EXECABORT` of a transaction that had one)
+    /// taken as a write refused.
+    evicting: bool,
+}
+
+/// A command of a [`fast_writer`]'s batch, and the counter its answer
+/// changes, by how much.
+type FastCommand = (Vec<String>, Option<(usize, i64)>);
+
+/// One writer of the fast-path tests: a connection that sends, 32 at a
+/// time, writes drawn by `seed` over keys every writer shares: every
+/// command the replication stream takes as the client sent it (`SET`,
+/// `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `MSET`, `HSET`, `LPUSH`,
+/// `RPUSH`, `SADD`, `ZADD`), and `DEL`, `EXPIRE`, `LTRIM` and transactions
+/// beside them. Once `switch` is set, it goes from database 0 to 1 and back
+/// at each batch, while the others write on. `cnt:<n>` keys are only ever
+/// counted up and down: what it returns is the sum of the answered changes
+/// of each, database 0's first.
+fn fast_writer(
+    port: u16,
+    seed: u64,
+    load: FastLoad,
+    switch: Option<Arc<AtomicBool>>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<Vec<i64>> {
+    use rand::{Rng, SeedableRng};
+    std::thread::spawn(move || {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut c = Conn::connect(port);
+        let mut acked = vec![0i64; 2 * FAST_COUNTERS];
+        let mut db = 0usize;
+        let mut n = 0u64;
+        let owned = |args: &[&str]| -> Vec<String> { args.iter().map(|a| a.to_string()).collect() };
+        while !stop.load(Ordering::Relaxed) {
+            let mut batch: Vec<FastCommand> = Vec::new();
+            if switch.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) {
+                db = 1 - db;
+                batch.push((owned(&["SELECT", &db.to_string()]), None));
+            }
+            for _ in 0..32 {
+                n += 1;
+                let item = format!("{seed}-{n}");
+                let k = rng.gen_range(0..FAST_KEYS);
+                let any = match rng.gen_range(0..4) {
+                    0 => format!("s:{k}"),
+                    1 => format!("l:{k}"),
+                    2 => format!("n:{k}"),
+                    _ => format!("h:{k}"),
+                };
+                let counter = rng.gen_range(0..FAST_COUNTERS);
+                let cnt = format!("cnt:{counter}");
+                let at = db * FAST_COUNTERS + counter;
+                let by = rng.gen_range(1..100i64);
+                let large = |rng: &mut rand::rngs::StdRng| {
+                    let size = [70_000, 300_000][rng.gen_range(0..2)];
+                    format!("{item}:{}", "v".repeat(size))
+                };
+                let roll = rng.gen_range(0..1000);
+                match roll {
+                    0..=119 => batch.push((owned(&["SET", &format!("s:{k}"), &item]), None)),
+                    120..=169 => batch.push((owned(&["INCR", &format!("n:{k}")]), None)),
+                    170..=209 => batch.push((owned(&["DECR", &format!("n:{k}")]), None)),
+                    210..=249 => {
+                        batch.push((owned(&["INCRBY", &format!("n:{k}"), &by.to_string()]), None))
+                    }
+                    250..=289 => {
+                        batch.push((owned(&["DECRBY", &format!("n:{k}"), &by.to_string()]), None))
+                    }
+                    290..=369 => batch.push((owned(&["APPEND", &format!("s:{k}"), &item]), None)),
+                    370..=419 => {
+                        let other = format!("s:{}", rng.gen_range(0..FAST_KEYS));
+                        batch.push((
+                            owned(&["MSET", &format!("s:{k}"), &item, &other, &item]),
+                            None,
+                        ))
+                    }
+                    420..=479 => {
+                        let field = format!("f{}", by % 8);
+                        batch.push((owned(&["HSET", &format!("h:{k}"), &field, &item]), None))
+                    }
+                    480..=529 => batch.push((owned(&["LPUSH", &format!("l:{k}"), &item]), None)),
+                    530..=579 => batch.push((owned(&["RPUSH", &format!("l:{k}"), &item]), None)),
+                    580..=629 => batch.push((owned(&["SADD", &format!("set:{k}"), &item]), None)),
+                    630..=679 => batch.push((
+                        owned(&["ZADD", &format!("z:{k}"), &by.to_string(), &item]),
+                        None,
+                    )),
+                    680..=699 => {
+                        batch.push((owned(&["LTRIM", &format!("l:{k}"), "0", "99"]), None))
+                    }
+                    700..=719 => batch.push((owned(&["DEL", &any]), None)),
+                    720..=739 => {
+                        let secs = (100_000 + rng.gen_range(0..100_000)).to_string();
+                        batch.push((owned(&["EXPIRE", &any, &secs]), None))
+                    }
+                    740..=789 => batch.push((owned(&["INCR", &cnt]), Some((at, 1)))),
+                    790..=819 => batch.push((owned(&["DECR", &cnt]), Some((at, -1)))),
+                    820..=849 => {
+                        batch.push((owned(&["INCRBY", &cnt, &by.to_string()]), Some((at, by))))
+                    }
+                    850..=869 => {
+                        batch.push((owned(&["DECRBY", &cnt, &by.to_string()]), Some((at, -by))))
+                    }
+                    870..=909 => {
+                        // A transaction: its change of a counter counts once
+                        // its EXEC is answered with the results.
+                        let other = rng.gen_range(0..FAST_KEYS);
+                        batch.push((owned(&["MULTI"]), None));
+                        batch.push((owned(&["APPEND", &format!("s:{k}"), &item]), None));
+                        batch.push((owned(&["RPUSH", &format!("l:{other}"), &item]), None));
+                        batch.push((owned(&["INCRBY", &cnt, &by.to_string()]), None));
+                        batch.push((owned(&["EXEC"]), Some((at, by))));
+                    }
+                    910..=959 if load.short_ttls => {
+                        let ms = rng.gen_range(1..30).to_string();
+                        batch.push((owned(&["SET", &format!("x:{k}"), &item]), None));
+                        batch.push((owned(&["PEXPIRE", &format!("x:{k}"), &ms]), None));
+                    }
+                    960..=962 if load.large => {
+                        let value = large(&mut rng);
+                        match rng.gen_range(0..3) {
+                            0 => batch.push((owned(&["SET", &format!("s:{k}"), &value]), None)),
+                            1 => batch
+                                .push((owned(&["HSET", &format!("h:{k}"), "big", &value]), None)),
+                            _ => {
+                                let list = format!("bl:{}", k % 4);
+                                batch.push((owned(&["RPUSH", &list, &value]), None));
+                                batch.push((owned(&["LTRIM", &list, "-4", "-1"]), None));
+                            }
+                        }
+                    }
+                    980..=999 if load.evicting => {
+                        let value = format!("{item}:{}", "e".repeat(300_000));
+                        let key = format!("e:{k}");
+                        batch.push((owned(&["SET", &key, &value]), None));
+                        batch.push((owned(&["EXPIRE", &key, "100000"]), None));
+                    }
+                    _ => batch.push((owned(&["SET", &format!("s:{k}"), &item]), None)),
+                }
+            }
+            let mut buf = Vec::new();
+            for (args, _) in &batch {
+                buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+                for a in args {
+                    buf.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
+                }
+            }
+            if c.writer.write_all(&buf).is_err() {
+                break;
+            }
+            for (args, counter) in &batch {
+                match c.read() {
+                    V::Int(_) => {
+                        if let Some((at, by)) = counter {
+                            acked[*at] += by;
+                        }
+                    }
+                    V::Arr(results) => {
+                        if let Some((at, by)) = counter {
+                            match results.last() {
+                                Some(V::Int(_)) => acked[*at] += by,
+                                // Refused, each of its commands, over
+                                // `maxmemory`: none of them wrote.
+                                Some(V::Err(e)) if load.evicting && e.starts_with("OOM") => {}
+                                _ => panic!("a transaction's INCRBY failed: {results:?}"),
+                            }
+                        }
+                    }
+                    V::Err(e) => assert!(
+                        e.starts_with("WRONGTYPE")
+                            || (load.evicting
+                                && (e.starts_with("OOM") || e.starts_with("EXECABORT"))),
+                        "{args:?}: {e}"
+                    ),
+                    V::Str(_) | V::Nil => {}
+                }
+            }
+        }
+        acked
+    })
+}
+
+/// `SET w:<n>` and `WAIT 1` on the master, over and over until `stop`: each
+/// time `WAIT` says the replica has it, the replica is asked for it at once,
+/// and has to have it. Returns how many were asked.
+fn wait_checker(master: u16, replica: u16, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<u64> {
+    std::thread::spawn(move || {
+        let mut m = Conn::connect(master);
+        let mut r = Conn::connect(replica);
+        let mut checked = 0;
+        let mut n = 0u64;
+        while !stop.load(Ordering::Relaxed) {
+            n += 1;
+            let key = format!("w:{n}");
+            let value = n.to_string();
+            match m.cmd(&["SET", &key, &value]) {
+                // Over `maxmemory`, with nothing to evict.
+                V::Err(e) if e.starts_with("OOM") => continue,
+                reply => assert!(reply.ok(), "{reply:?}"),
+            }
+            match m.cmd(&["WAIT", "1", "5000"]) {
+                V::Int(1) => {
+                    assert_eq!(
+                        r.cmd(&["GET", &key]),
+                        V::Str(value),
+                        "WAIT answered 1 for {key}, and the replica does not have it"
+                    );
+                    checked += 1;
+                }
+                V::Int(0) => {}
+                other => panic!("WAIT: {other:?}"),
+            }
+        }
+        checked
+    })
+}
+
+/// A backup taken and sealed: a tap on the stream attached and detached,
+/// which turns the fast path off and on again.
+fn backup_once(c: &mut Conn) {
+    assert!(c.cmd(&["BACKUP", "START"]).ok());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !c.cmd(&["BACKUP", "SEAL"]).ok() {
+        assert!(Instant::now() < deadline, "the backup was never sealed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = c.cmd(&["BACKUP", "CLEANUP"]);
+}
+
+/// The `x:<k>` keys past their time deleted on the master (read, so their
+/// deletions are sent), in both databases.
+fn settle_short_ttls(m: &mut Conn) {
+    std::thread::sleep(Duration::from_millis(100));
+    for db in ["0", "1"] {
+        assert!(m.cmd(&["SELECT", db]).ok());
+        let keys: Vec<String> = (0..FAST_KEYS).map(|k| format!("x:{k}")).collect();
+        let mut args = vec!["EXISTS"];
+        args.extend(keys.iter().map(String::as_str));
+        let _ = m.cmd(&args);
+    }
+    assert!(m.cmd(&["SELECT", "0"]).ok());
+}
+
+/// A key of database 0 or 1: the database, the key, and its type, value
+/// digest and expiry.
+type KeyRow = (usize, String, V, V, V);
+
+/// Every key of databases 0 and 1, with its type, value digest and expiry.
+fn every_key_of_both_dbs(c: &mut Conn) -> Vec<KeyRow> {
+    let mut all = Vec::new();
+    for db in 0..2usize {
+        assert!(c.cmd(&["SELECT", &db.to_string()]).ok());
+        all.extend(
+            every_key(c)
+                .into_iter()
+                .map(|(k, t, d, e)| (db, k, t, d, e)),
+        );
+    }
+    assert!(c.cmd(&["SELECT", "0"]).ok());
+    all
+}
+
+/// The counters of [`fast_writer`] in databases 0 and 1.
+fn fast_counters(c: &mut Conn) -> Vec<i64> {
+    let mut held = Vec::new();
+    for db in 0..2usize {
+        assert!(c.cmd(&["SELECT", &db.to_string()]).ok());
+        for n in 0..FAST_COUNTERS {
+            held.push(match c.cmd(&["GET", &format!("cnt:{n}")]) {
+                V::Nil => 0,
+                v => v.s().parse::<i64>().unwrap(),
+            });
+        }
+    }
+    assert!(c.cmd(&["SELECT", "0"]).ok());
+    held
+}
+
+/// The replica caught up with the master, and every key of both databases
+/// the same on the two, with each counter at exactly the changes answered
+/// (`acked`, if given).
+fn assert_same_in_both_dbs(m: &mut Conn, r: &mut Conn, acked: Option<&[i64]>, what: &str) {
+    assert_same_dataset(m, r);
+    let on_master = every_key_of_both_dbs(m);
+    let on_replica = every_key_of_both_dbs(r);
+    if on_master != on_replica {
+        let only = |a: &[KeyRow], b: &[KeyRow]| {
+            a.iter()
+                .filter(|x| !b.contains(x))
+                .map(|(db, k, ..)| format!("{db}:{k}"))
+                .take(20)
+                .collect::<Vec<_>>()
+        };
+        panic!(
+            "{what}: the replica differs; differing on the master {:?}, on the replica {:?}",
+            only(&on_master, &on_replica),
+            only(&on_replica, &on_master)
+        );
+    }
+    if let Some(acked) = acked {
+        assert_eq!(
+            fast_counters(m),
+            acked,
+            "{what}: the counters on the master"
+        );
+        assert_eq!(
+            fast_counters(r),
+            acked,
+            "{what}: the counters on the replica"
+        );
+    }
+}
+
+fn sum_into(total: &mut [i64], writers: Vec<std::thread::JoinHandle<Vec<i64>>>) {
+    for w in writers {
+        for (t, n) in total.iter_mut().zip(w.join().unwrap()) {
+            *t += n;
+        }
+    }
+}
+
+/// Clients writing with every command the stream takes as it came, from
+/// every worker, into keys they share: one going between databases 0 and 1
+/// from a moment of the load on, keys whose few milliseconds to live run out
+/// under the load, values over 64 KiB and 256 KiB now and then, a backup's
+/// tap attached and detached (the fast path off and on), and `WAIT 1`
+/// checked against the replica throughout. Then every key the same on the
+/// replica, and each counter at the changes answered (#950). Each round on
+/// a new master: the switch to several databases happens once in a
+/// server's life.
+fn fast_path_writes_reach_a_replica_exactly_once(model: &str) {
+    use rand::{Rng, SeedableRng};
+    let io = ["--io-model", model];
+    for round in 0..rounds(2) {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x950 + round as u64);
+        let master = Server::start(&io);
+        let port = master.port.to_string();
+        let replica = Server::start(&[&io[..], &["--replicaof", "127.0.0.1", &port]].concat());
+        let mut r = replica.conn();
+        wait_link_up(&mut r);
+        let stop = Arc::new(AtomicBool::new(false));
+        let switch = Arc::new(AtomicBool::new(false));
+        let load = FastLoad {
+            short_ttls: true,
+            large: true,
+            evicting: false,
+        };
+        let writers: Vec<_> = (0..6u64)
+            .map(|w| {
+                let switch = (w == 0).then(|| Arc::clone(&switch));
+                fast_writer(
+                    master.port,
+                    ((round as u64) << 8) | w,
+                    load,
+                    switch,
+                    Arc::clone(&stop),
+                )
+            })
+            .collect();
+        let waits = wait_checker(master.port, replica.port, Arc::clone(&stop));
+        let mut m = master.conn();
+        std::thread::sleep(Duration::from_millis(rng.gen_range(50..300)));
+        backup_once(&mut m);
+        std::thread::sleep(Duration::from_millis(rng.gen_range(50..200)));
+        switch.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(rng.gen_range(100..300)));
+        backup_once(&mut m);
+        std::thread::sleep(Duration::from_millis(rng.gen_range(100..300)));
+        stop.store(true, Ordering::Relaxed);
+        let mut acked = vec![0i64; 2 * FAST_COUNTERS];
+        sum_into(&mut acked, writers);
+        let checked = waits.join().unwrap();
+        assert!(checked > 0, "round {round}: no WAIT answered 1");
+        assert!(
+            acked[FAST_COUNTERS..].iter().any(|&n| n != 0),
+            "round {round}: nothing in db 1"
+        );
+        settle_short_ttls(&mut m);
+        assert_same_in_both_dbs(&mut m, &mut r, Some(&acked), &format!("round {round}"));
+    }
+}
+
+#[test]
+fn fast_path_writes_reach_a_replica_exactly_once_on_tokio() {
+    fast_path_writes_reach_a_replica_exactly_once("tokio");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fast_path_writes_reach_a_replica_exactly_once_on_io_uring() {
+    fast_path_writes_reach_a_replica_exactly_once("uring");
+}
+
+/// [`fast_path_writes_reach_a_replica_exactly_once`] with the master over
+/// its `maxmemory` under the load, evicting keys with a time to live
+/// (`volatile-lru`): each eviction's deletion in its place among the
+/// writes.
+fn fast_path_writes_and_evictions_reach_a_replica_exactly_once(model: &str) {
+    let io = ["--io-model", model];
+    for round in 0..rounds(2) {
+        let master = Server::start(&[&io[..], &["--maxmemory-policy", "volatile-lru"]].concat());
+        let port = master.port.to_string();
+        let replica = Server::start(&[&io[..], &["--replicaof", "127.0.0.1", &port]].concat());
+        let mut r = replica.conn();
+        wait_link_up(&mut r);
+        let mut m = master.conn();
+        let used: u64 = m.info("memory", "used_memory").parse().unwrap();
+        let limit = (used + 8 * 1024 * 1024).to_string();
+        assert!(m.cmd(&["CONFIG", "SET", "maxmemory", &limit]).ok());
+        let stop = Arc::new(AtomicBool::new(false));
+        let load = FastLoad {
+            short_ttls: true,
+            large: false,
+            evicting: true,
+        };
+        let writers: Vec<_> = (0..6u64)
+            .map(|w| {
+                fast_writer(
+                    master.port,
+                    ((round as u64) << 8) | w,
+                    load,
+                    None,
+                    Arc::clone(&stop),
+                )
+            })
+            .collect();
+        let waits = wait_checker(master.port, replica.port, Arc::clone(&stop));
+        std::thread::sleep(Duration::from_millis(1500));
+        stop.store(true, Ordering::Relaxed);
+        let mut acked = vec![0i64; 2 * FAST_COUNTERS];
+        sum_into(&mut acked, writers);
+        assert!(
+            waits.join().unwrap() > 0,
+            "round {round}: no WAIT answered 1"
+        );
+        assert!(m.cmd(&["CONFIG", "SET", "maxmemory", "0"]).ok());
+        assert!(
+            m.stat("evicted_keys") > 0,
+            "round {round}: nothing was evicted"
+        );
+        settle_short_ttls(&mut m);
+        assert_same_in_both_dbs(&mut m, &mut r, Some(&acked), &format!("round {round}"));
+    }
+}
+
+#[test]
+fn fast_path_writes_and_evictions_reach_a_replica_exactly_once_on_tokio() {
+    fast_path_writes_and_evictions_reach_a_replica_exactly_once("tokio");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fast_path_writes_and_evictions_reach_a_replica_exactly_once_on_io_uring() {
+    fast_path_writes_and_evictions_reach_a_replica_exactly_once("uring");
+}
+
+/// A master with the AOF on and a replica, under the mixed load: what the
+/// master reloads from its AOF, killed once the load has stopped and the
+/// AOF has been flushed, is what the replica holds, key for key.
+fn a_replica_and_its_masters_aof_hold_the_same_after_a_mixed_load(model: &str) {
+    use rand::{Rng, SeedableRng};
+    let io = ["--io-model", model];
+    for round in 0..rounds(2) {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x950a + round as u64);
+        let mut master = Server::start(&[&io[..], &["--aof"]].concat());
+        let port = master.port.to_string();
+        let replica = Server::start(&[&io[..], &["--replicaof", "127.0.0.1", &port]].concat());
+        let mut r = replica.conn();
+        wait_link_up(&mut r);
+        let stop = Arc::new(AtomicBool::new(false));
+        let switch = Arc::new(AtomicBool::new(false));
+        let load = FastLoad {
+            short_ttls: true,
+            large: true,
+            evicting: false,
+        };
+        let writers: Vec<_> = (0..6u64)
+            .map(|w| {
+                let switch = (w == 0).then(|| Arc::clone(&switch));
+                fast_writer(
+                    master.port,
+                    ((round as u64) << 8) | w,
+                    load,
+                    switch,
+                    Arc::clone(&stop),
+                )
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(rng.gen_range(100..400)));
+        switch.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(rng.gen_range(200..500)));
+        stop.store(true, Ordering::Relaxed);
+        let mut acked = vec![0i64; 2 * FAST_COUNTERS];
+        sum_into(&mut acked, writers);
+        let mut m = master.conn();
+        settle_short_ttls(&mut m);
+        assert_same_in_both_dbs(&mut m, &mut r, Some(&acked), &format!("round {round}"));
+        let on_replica = every_key_of_both_dbs(&mut r);
+        assert!(on_replica.len() > 50, "{}", on_replica.len());
+        // appendfsync everysec: a second and a half for the last of it.
+        drop(m);
+        std::thread::sleep(Duration::from_millis(1500));
+        master.kill();
+        master.restart();
+        let mut m = master.conn();
+        let reloaded = every_key_of_both_dbs(&mut m);
+        assert!(
+            reloaded == on_replica,
+            "round {round}: the master's AOF reloads other data than its replica holds"
+        );
+        assert_eq!(
+            fast_counters(&mut m),
+            acked,
+            "round {round}: counters after the reload"
+        );
+    }
+}
+
+#[test]
+fn a_replica_and_its_masters_aof_hold_the_same_after_a_mixed_load_on_tokio() {
+    a_replica_and_its_masters_aof_hold_the_same_after_a_mixed_load("tokio");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_replica_and_its_masters_aof_hold_the_same_after_a_mixed_load_on_io_uring() {
+    a_replica_and_its_masters_aof_hold_the_same_after_a_mixed_load("uring");
+}
+
+/// `CLIENT PAUSE WRITE` under the mixed load: while the writes are held,
+/// the replica reaches the master's offset and holds every key the master
+/// does (each write answered before the pause, and each half-way through
+/// when it began, is on it); after it, the load goes on and ends exact.
+fn a_pause_under_a_mixed_load_finds_every_write_on_the_replica(model: &str) {
+    let io = ["--io-model", model];
+    let master = Server::start(&io);
+    let port = master.port.to_string();
+    let replica = Server::start(&[&io[..], &["--replicaof", "127.0.0.1", &port]].concat());
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    let stop = Arc::new(AtomicBool::new(false));
+    let load = FastLoad {
+        short_ttls: false,
+        large: true,
+        evicting: false,
+    };
+    let writers: Vec<_> = (0..6u64)
+        .map(|w| fast_writer(master.port, 0x950_0000 | w, load, None, Arc::clone(&stop)))
+        .collect();
+    let mut m = master.conn();
+    for pause in 0..rounds(3) {
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(m.cmd(&["CLIENT", "PAUSE", "20000", "WRITE"]).ok());
+        // Database 0 only, and no SELECT: one waits out a pause of writes.
+        assert_same_dataset(&mut m, &mut r);
+        let on_master = every_key(&mut m);
+        assert!(
+            on_master == every_key(&mut r),
+            "pause {pause}: the replica does not hold what the master does"
+        );
+        assert!(m.cmd(&["CLIENT", "UNPAUSE"]).ok());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    stop.store(true, Ordering::Relaxed);
+    let mut acked = vec![0i64; 2 * FAST_COUNTERS];
+    sum_into(&mut acked, writers);
+    assert_same_in_both_dbs(&mut m, &mut r, Some(&acked), "after the pauses");
+}
+
+#[test]
+fn a_pause_under_a_mixed_load_finds_every_write_on_the_replica_on_tokio() {
+    a_pause_under_a_mixed_load_finds_every_write_on_the_replica("tokio");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pause_under_a_mixed_load_finds_every_write_on_the_replica_on_io_uring() {
+    a_pause_under_a_mixed_load_finds_every_write_on_the_replica("uring");
+}
+
+/// Writes of a few bytes, of just under and over 64 KiB, of 300 KB and of
+/// over 1 MiB to the same keys from several connections: a write of 64 KiB
+/// or more goes to the hub as a message of its own, outside the run of
+/// small writes (#950), and must still reach the replica in its place.
+/// Values say which connection wrote them, and when: a replica that applied
+/// two writes to a key the other way round holds another value. `WAIT 1` is
+/// checked against the replica throughout: the large writes keep the hub
+/// busy, so a `WAIT` that counted the replica before the hub had handed it
+/// the write would be answered while the replica does not have it.
+fn large_and_small_writes_to_one_key_reach_a_replica_in_order(model: &str) {
+    use rand::{Rng, SeedableRng};
+    let io = ["--io-model", model];
+    let master = Server::start(&io);
+    let port = master.port.to_string();
+    let replica = Server::start(&[&io[..], &["--replicaof", "127.0.0.1", &port]].concat());
+    let mut r = replica.conn();
+    wait_link_up(&mut r);
+    const SIZES: [usize; 8] = [8, 8, 8, 8, 60_000, 70_000, 300_000, 1_200_000];
+    for round in 0..rounds(4) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let writers: Vec<_> = (0..6u64)
+            .map(|w| {
+                let stop = Arc::clone(&stop);
+                let port = master.port;
+                std::thread::spawn(move || {
+                    let mut rng = rand::rngs::StdRng::seed_from_u64(((round as u64) << 8) | w);
+                    let mut c = Conn::connect(port);
+                    let mut n = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let mut buf = Vec::new();
+                        let mut sent = 0;
+                        for _ in 0..8 {
+                            n += 1;
+                            let k = rng.gen_range(0..3);
+                            let size = SIZES[rng.gen_range(0..SIZES.len())];
+                            let value = format!("{w}:{n}:{}", "o".repeat(size));
+                            let (key, list, append) =
+                                (format!("o:{k}"), format!("ol:{k}"), format!("oa:{k}"));
+                            let args: Vec<Vec<&str>> = match rng.gen_range(0..5) {
+                                0 | 1 => vec![vec!["SET", key.as_str(), value.as_str()]],
+                                2 => vec![
+                                    vec!["RPUSH", list.as_str(), value.as_str()],
+                                    vec!["LTRIM", list.as_str(), "-6", "-1"],
+                                ],
+                                3 => vec![vec!["APPEND", append.as_str(), value.as_str()]],
+                                _ => vec![vec!["SET", append.as_str(), value.as_str()]],
+                            };
+                            for args in args {
+                                buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+                                for a in args {
+                                    buf.extend_from_slice(
+                                        format!("${}\r\n{a}\r\n", a.len()).as_bytes(),
+                                    );
+                                }
+                                sent += 1;
+                            }
+                        }
+                        c.writer.write_all(&buf).unwrap();
+                        for _ in 0..sent {
+                            let reply = c.read();
+                            assert!(!matches!(reply, V::Err(_)), "{reply:?}");
+                        }
+                    }
+                })
+            })
+            .collect();
+        let waits = wait_checker(master.port, replica.port, Arc::clone(&stop));
+        std::thread::sleep(Duration::from_millis(1000));
+        stop.store(true, Ordering::Relaxed);
+        for w in writers {
+            w.join().unwrap();
+        }
+        assert!(
+            waits.join().unwrap() > 0,
+            "round {round}: no WAIT answered 1"
+        );
+        let mut m = master.conn();
+        // An APPEND to one key goes on growing: started again each round.
+        assert_same_dataset(&mut m, &mut r);
+        let on_master = every_key(&mut m);
+        assert!(on_master.len() >= 6, "{on_master:?}");
+        assert!(
+            on_master == every_key(&mut r),
+            "round {round}: two writes to one key reached the replica the other way round"
+        );
+        for k in 0..3 {
+            let _ = m.cmd(&["DEL", &format!("oa:{k}")]);
+        }
+    }
+}
+
+#[test]
+fn large_and_small_writes_to_one_key_reach_a_replica_in_order_on_tokio() {
+    large_and_small_writes_to_one_key_reach_a_replica_in_order("tokio");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn large_and_small_writes_to_one_key_reach_a_replica_in_order_on_io_uring() {
+    large_and_small_writes_to_one_key_reach_a_replica_in_order("uring");
+}
