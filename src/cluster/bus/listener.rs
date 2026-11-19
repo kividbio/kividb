@@ -382,6 +382,10 @@ pub fn process_message(
                         node_id_str(&sender_id),
                         request_epoch,
                     );
+                    // Saved again, in the background: the save that failed
+                    // may be the file in place, its rename not synced (it
+                    // failed at the directory's sync).
+                    state.save_soon();
                     return None;
                 }
                 log_info!(

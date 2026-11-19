@@ -1562,13 +1562,40 @@ fn three_masters_and_a_newcomer() -> (Vec<Node>, (u16, u16)) {
 
 /// Meet `nodes[3]` from `nodes[0]`, and return as soon as `nodes[0]` shows
 /// it as a member: from then on it has it in its nodes.conf, and so has the
-/// new node `nodes[0]` (#808).
-fn meet_the_newcomer(nodes: &[Node]) -> String {
+/// new node `nodes[0]` (#808). With `gate` (`nodes[0]` started with
+/// [`FAILPOINT_SAVES`]), `nodes[0]`'s save of the new node is held first,
+/// and the new node is checked to be shown only in `handshake` meanwhile.
+fn meet_the_newcomer(nodes: &[Node], gate: Option<&SaveGate>) -> String {
     let id = nodes[3].id();
+    if let Some(gate) = gate {
+        let held_id = id.clone();
+        gate.set_hold(move |file| file.contains(&held_id));
+    }
     let r = nodes[0]
         .conn()
         .cmd(&["CLUSTER", "MEET", "127.0.0.1", &nodes[3].port.to_string()]);
     assert!(r.is_ok(), "MEET: {r:?}");
+    if let Some(gate) = gate {
+        let held = gate.wait_held(Duration::from_secs(15));
+        // The MEET answered (the new node has saved node 0), and node 0's
+        // save of it held: still a handshake.
+        assert!(saved_in(&nodes[3], &nodes[0].id()));
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            row_of(&nodes[0], &id).is_none(),
+            "a member before it is saved"
+        );
+        let address = format!("127.0.0.1:{}@", nodes[3].port);
+        let shown = nodes[0].conn().cmd(&["CLUSTER", "NODES"]).text();
+        assert!(
+            shown
+                .lines()
+                .any(|l| l.contains(&address) && l.contains("handshake")),
+            "{shown}"
+        );
+        gate.set_hold(|_| false);
+        gate.release(&held);
+    }
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         // A tight loop: the point is to stop the cluster at the first moment
@@ -1616,13 +1643,41 @@ fn assert_newcomer_kept(nodes: &[Node], id: &str, range: (u16, u16)) {
 /// member when the cluster starts again, on every node, and serves its
 /// slots: both ends of the MEET have saved the other before it is shown,
 /// and a node that is not a member cannot join by sending heartbeats, so
-/// that is what keeps it (#808). Killed, and stopped cleanly.
+/// that is what keeps it (#808). Killed, and stopped cleanly. Node 0's save
+/// of the new node is held for a moment first: until it is saved, it is
+/// shown only as a handshake.
 #[test]
 fn a_node_met_just_before_the_whole_cluster_stops_is_still_a_member() {
     for how in [Stop::Kill, Stop::Term] {
         let (mut nodes, range) = three_masters_and_a_newcomer();
-        let id = meet_the_newcomer(&nodes);
+        nodes[0].kill();
+        nodes[0]
+            .env
+            .push((FAILPOINT_SAVES.0.to_string(), FAILPOINT_SAVES.1.to_string()));
+        let gate = SaveGate::new(&nodes[0].dir, |_| false);
+        nodes[0].spawn();
+        wait_until(
+            "node 0 to know the masters",
+            Duration::from_secs(30),
+            || {
+                nodes[..3]
+                    .iter()
+                    .all(|n| n.cluster_info("cluster_known_nodes") == "3")
+            },
+        );
+        let id = meet_the_newcomer(&nodes, Some(&gate));
         stop_all(&mut nodes, how);
+        gate.finish();
+        nodes[0].env.clear();
+        for entry in std::fs::read_dir(&nodes[0].dir).unwrap().flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("failpoint.")
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
         // Started the other way round: the new node first, and the one that
         // met it last.
         for node in nodes.iter_mut().rev() {
@@ -1641,7 +1696,7 @@ fn a_node_met_just_before_the_whole_cluster_stops_is_still_a_member() {
 fn a_member_one_node_remembers_is_learnt_again_by_all_after_a_restart() {
     for keeper in [0, 2] {
         let (mut nodes, range) = three_masters_and_a_newcomer();
-        let id = meet_the_newcomer(&nodes);
+        let id = meet_the_newcomer(&nodes, None);
         wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 4);
         for node in &nodes[..3] {
             wait_until("every master to save it", Duration::from_secs(15), || {
@@ -1681,7 +1736,7 @@ fn a_member_one_node_remembers_is_learnt_again_by_all_after_a_restart() {
 #[test]
 fn a_node_no_member_remembers_needs_a_new_meet() {
     let (mut nodes, range) = three_masters_and_a_newcomer();
-    let id = meet_the_newcomer(&nodes);
+    let id = meet_the_newcomer(&nodes, None);
     wait_cluster_ok(&nodes.iter().collect::<Vec<_>>(), 4);
     for node in &nodes[..3] {
         wait_until("every master to save it", Duration::from_secs(15), || {
@@ -1961,13 +2016,19 @@ fn a_node_that_cannot_save_makes_no_node_met_a_member() {
     std::thread::sleep(Duration::from_secs(4));
     assert!(row_of(&n, &a_id).is_none(), "made a member unsaved");
     assert!(row_of(&a, &n_id).is_none(), "made a member unanswered");
+    // The error line of `Saves::note_failed`, once.
     let log = n.log();
-    assert_eq!(
-        log.matches("could not save the cluster config file")
-            .count(),
-        1,
-        "{log}"
-    );
+    let errors = log
+        .lines()
+        .filter(|l| {
+            l.contains("Cluster: could not save the cluster config file: ")
+                && l.ends_with(
+                    ". Until it can be, changes of topology are not on disk, no node met is \
+                     made a member, and no vote is cast",
+                )
+        })
+        .count();
+    assert_eq!(errors, 1, "{log}");
     mode(0o755);
     wait_until(
         "the two to be members of each other",
@@ -2011,6 +2072,8 @@ fn votes_saved_slowly_still_elect_the_replica_at_its_first_epoch() {
         gate.wait_held(Duration::from_secs(30));
     }
     std::thread::sleep(Duration::from_secs(5));
+    // No vote is sent before its save: with both held, no election is won.
+    assert!(!replica.is_master(), "promoted before a vote was saved");
     for gate in gates {
         gate.set_hold(|_| false);
         let held: Vec<PathBuf> = gate.held.lock().clone();
@@ -2045,45 +2108,89 @@ fn votes_saved_slowly_still_elect_the_replica_at_its_first_epoch() {
 }
 
 /// A save whose rename was not synced (the directory's sync failed) is not
-/// taken for one that was: the next save of the same topology is written
-/// again, not skipped as already on disk. Here a node met fails its first
-/// save at the directory's sync; it is not made a member, and when the MEET
-/// is tried again a new save, which has the node, is made (held here at the
-/// failpoint to see it) before the node is a member.
+/// taken for one that was. Here `ADDSLOTS` fails at the directory's sync,
+/// its file renamed into place; `DELSLOTS` then returns the topology to
+/// that of the save before, and is written, not skipped as already on
+/// disk: the file ends as the node is.
 #[test]
 fn a_save_whose_directory_sync_failed_is_made_again() {
-    let a = Node::start(&[]);
     let mut n = Node::start(&[]);
-    let a_id = a.id();
     n.kill();
     n.env.push((
         FAILPOINT_SAVES.0.to_string(),
-        "nodes-conf-written,nodes-conf-dir-sync-fail".to_string(),
+        "nodes-conf-dir-sync-fail".to_string(),
     ));
-    let gate = SaveGate::new(&n.dir, |_| false);
     n.spawn();
+    let file_slots = |n: &Node| -> Vec<String> {
+        std::fs::read_to_string(n.dir.join("nodes.conf"))
+            .unwrap()
+            .lines()
+            .find(|l| l.contains("myself"))
+            .expect("a myself line")
+            .split(' ')
+            .skip(8)
+            .map(String::from)
+            .collect()
+    };
+    let r = n.conn().cmd(&["CLUSTER", "ADDSLOTS", "5000"]);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(file_slots(&n), ["5000"]);
+
     let fail = n.dir.join("fail.nodes-conf-dir-sync");
     std::fs::write(&fail, "").unwrap();
-    let r = a
-        .conn()
-        .cmd(&["CLUSTER", "MEET", "127.0.0.1", &n.port.to_string()]);
-    assert!(r.is_ok(), "{r:?}");
-    wait_until(
-        "the directory's sync to fail",
-        Duration::from_secs(15),
-        || !fail.exists(),
+    let r = n.conn().cmd(&["CLUSTER", "ADDSLOTS", "0"]);
+    assert!(
+        r.err().is_some_and(|e| e.contains("disk save failed")),
+        "ADDSLOTS saved"
     );
-    let held_id = a_id.clone();
-    gate.set_hold(move |file| file.contains(&held_id));
-    let held = gate.wait_held(Duration::from_secs(15));
-    assert!(row_of(&n, &a_id).is_none(), "a member before it is saved");
-    gate.set_hold(|_| false);
-    gate.release(&held);
-    wait_until("the two to be members", Duration::from_secs(30), || {
-        row_of(&n, &a_id).is_some_and(|r| !r[2].contains("handshake"))
-    });
-    assert!(saved_in(&n, &a_id));
-    gate.finish();
+    assert!(!fail.exists());
+    // Renamed into place before the directory's sync failed.
+    assert_eq!(file_slots(&n), ["0", "5000"]);
+
+    let r = n.conn().cmd(&["CLUSTER", "DELSLOTS", "0"]);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(n.my_row()[8..], ["5000".to_string()]);
+    assert_eq!(file_slots(&n), ["5000"]);
+}
+
+/// A filesystem that cannot sync a directory (here the failpoint answers
+/// `EINVAL`, as some FUSE and network mounts do) does not fail the save: it
+/// is warned of once, and the change is saved and acknowledged.
+#[cfg(unix)]
+#[test]
+fn a_directory_that_cannot_be_synced_does_not_fail_the_save() {
+    let mut n = Node::start(&[]);
+    n.kill();
+    n.env.push((
+        FAILPOINT_SAVES.0.to_string(),
+        "nodes-conf-dir-sync-fail".to_string(),
+    ));
+    n.spawn();
+    for slot in ["0", "1"] {
+        std::fs::write(n.dir.join("fail.nodes-conf-dir-sync"), "EINVAL").unwrap();
+        let r = n.conn().cmd(&["CLUSTER", "ADDSLOTS", slot]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+    let conf = std::fs::read_to_string(n.dir.join("nodes.conf")).unwrap();
+    assert!(
+        conf.lines()
+            .any(|l| l.contains("myself") && l.ends_with(" 0-1")),
+        "{conf}"
+    );
+    let log = n.log();
+    let warned = log
+        .lines()
+        .filter(|l| {
+            l.contains(
+                "Cluster: this filesystem cannot sync the directory of the cluster config file (",
+            )
+        })
+        .count();
+    assert_eq!(warned, 1, "{log}");
+    assert!(
+        !log.contains("could not save the cluster config file"),
+        "{log}"
+    );
 }
 
 /// A master whose vote cannot be saved does not send it: with both voters'
@@ -2249,10 +2356,9 @@ fn many_nodes_meeting_one_at_once_all_join() {
 
 /// A nodes.conf that was cut short — empty, or without its last line, the
 /// `vars` line every save ends with — is refused at startup, with the reason,
-/// and left as it is: read as far as it goes, it would leave nodes and
-/// slots out and the epochs at 0. An empty one is refused too.
+/// and left as it is.
 #[test]
-fn a_nodes_conf_cut_short_is_refused_not_read_as_far_as_it_goes() {
+fn a_nodes_conf_cut_short_is_refused() {
     let mut node = Node::start(&[]);
     assert!(
         node.conn()

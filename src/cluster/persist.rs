@@ -23,7 +23,7 @@
 // to it, synced, renamed over it, and the directory synced. A crash at any
 // point leaves the old file or the new one, never part of one. A file that
 // is cut short all the same (it does not end with its `vars` line) is
-// refused at startup rather than read as far as it goes (#808).
+// refused at startup (#808).
 
 use crate::cluster::node::{
     ClusterNode, NodeFlags, NodeId, generate_node_id, node_id_str, parse_node_id,
@@ -204,11 +204,10 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
 /// `vars` line, ended by a newline, as every file this server has written
 /// is (and as Redis writes it). One that is not was cut short: by a machine
 /// that went down before a write reached the disk, or a disk that lost its
-/// tail. Read as far as it goes, it would leave out nodes and slots and
-/// start the epochs again from 0. It is refused, with the reason, and the
-/// file is left as it is. An empty file was refused before too (it has no
-/// `myself` line); now the reason says it is empty. Redis takes one for a
-/// new node: here the file is deleted for that.
+/// tail, and it may lack nodes, slots and the epochs. It is refused, with
+/// the reason, and the file is left as it is. An empty file is refused too,
+/// as empty. Redis takes one for a new node: here the file is deleted for
+/// that.
 fn check_complete(contents: &str) -> std::io::Result<()> {
     // Blank lines after it are the padding of a direct write.
     let last = contents
@@ -387,20 +386,25 @@ pub fn remove_leftover_temps(path: &Path) {
 /// `KIVIDB_TEST_FAILPOINTS`, `nodes-conf-fail` fails every save while the
 /// file `fail.nodes-conf` is in the working directory, and
 /// `nodes-conf-dir-sync-fail` fails the sync of the directory once for each
-/// time `fail.nodes-conf-dir-sync` is made there.
+/// time `fail.nodes-conf-dir-sync` is made there. A file that holds `EINVAL`
+/// or `ENOTSUP` fails it with that error, as a filesystem would.
 fn injected(name: &str, file: &str, once: bool) -> std::io::Result<()> {
     if !crate::aof::injected(name) {
         return Ok(());
     }
     let hit = if once {
-        fs::remove_file(file).is_ok()
+        let text = fs::read_to_string(file).unwrap_or_default();
+        fs::remove_file(file).is_ok().then_some(text)
     } else {
-        Path::new(file).exists()
+        Path::new(file).exists().then(String::new)
     };
-    if hit {
-        Err(std::io::Error::other(format!("{name} (a test's)")))
-    } else {
-        Ok(())
+    match hit.as_deref().map(str::trim) {
+        None => Ok(()),
+        #[cfg(unix)]
+        Some("EINVAL") => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        #[cfg(unix)]
+        Some("ENOTSUP") => Err(std::io::Error::from_raw_os_error(libc::ENOTSUP)),
+        Some(_) => Err(std::io::Error::other(format!("{name} (a test's)"))),
     }
 }
 
@@ -528,22 +532,63 @@ fn sync_file(path: &Path) -> std::io::Result<()> {
 
 /// Sync the directory `path` is in, so that a rename into it is on disk.
 fn sync_dir(path: &Path) -> std::io::Result<()> {
-    injected("nodes-conf-dir-sync-fail", "fail.nodes-conf-dir-sync", true)?;
     #[cfg(unix)]
     {
         let dir = match path.parent() {
             Some(d) if !d.as_os_str().is_empty() => d,
             _ => Path::new("."),
         };
-        fs::File::open(dir)?.sync_all()
+        let synced = injected("nodes-conf-dir-sync-fail", "fail.nodes-conf-dir-sync", true)
+            .and_then(|()| fs::File::open(dir)?.sync_all());
+        dir_sync_outcome(synced)
     }
-    // Windows: a directory cannot be opened as a file; its metadata is
-    // journalled with the rename.
+    // Windows: a directory cannot be opened as a file here, so the rename
+    // is not synced. NTFS journals it, but the journal is written out
+    // lazily: a power loss soon after the save can leave the file before it.
     #[cfg(not(unix))]
     {
         let _ = path;
-        Ok(())
+        injected("nodes-conf-dir-sync-fail", "fail.nodes-conf-dir-sync", true)
     }
+}
+
+/// What a sync of the directory that returned `synced` means for the save.
+/// A filesystem that cannot sync a directory at all (some FUSE, CIFS and 9p
+/// mounts answer `EINVAL` or `ENOTSUP`) does not fail every save: the
+/// rename stands as the filesystem keeps it, and that is said once, as a
+/// warning. Any other error fails the save.
+fn dir_sync_outcome(synced: std::io::Result<()>) -> std::io::Result<()> {
+    match synced {
+        Err(e) if cannot_sync_dirs(&e) => {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                log_warn!(
+                    "Cluster: this filesystem cannot sync the directory of the cluster config \
+                     file ({e}): a save is renamed into place, but the rename is only as \
+                     durable as the filesystem makes it"
+                );
+            }
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// Whether `e` says the filesystem does not sync directories, rather than
+/// that the sync failed.
+fn cannot_sync_dirs(e: &std::io::Error) -> bool {
+    if matches!(
+        e.kind(),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if let Some(code) = e.raw_os_error() {
+        return code == libc::EINVAL || code == libc::ENOTSUP || code == libc::EOPNOTSUPP;
+    }
+    false
 }
 
 /// Put `tmp`, written and synced, in place of `path`. The temporary file
@@ -573,8 +618,8 @@ fn save_then(
     // Held to take the state and write it out, and to put a file in place,
     // so that what is in place is always the newest save. Not held, by a
     // save with nothing to publish (the bus's), to sync it: a sync on a busy
-    // disk took seconds, and a slot handover's takeover, with the source's
-    // writes paused, waited behind the bus's save for all of them. Each save
+    // disk can take seconds, and a slot handover's takeover, with the
+    // source's writes paused, would wait behind the bus's save. Each save
     // has a temporary file of its own for that (see `temp_path`).
     let asked = std::time::Instant::now();
     let saving = state.save_lock.lock();
@@ -585,8 +630,11 @@ fn save_then(
     let (nodes_snap, slots_snap, epoch, last_vote) = {
         let nodes = state.nodes.read();
         let slots = state.slots.read();
-        let epoch = state.current_epoch.load(Ordering::Relaxed);
-        let last_vote = state.last_vote_epoch.load(Ordering::Relaxed);
+        // SeqCst, against a vote's compare-and-swap of `last_vote_epoch`
+        // and its load of `written`: either this save sees the vote, or the
+        // vote waits for a save numbered after this one.
+        let epoch = state.current_epoch.load(Ordering::SeqCst);
+        let last_vote = state.last_vote_epoch.load(Ordering::SeqCst);
         let mut slots_copy: Box<[Option<NodeId>; CLUSTER_SLOTS]> = vec![None; CLUSTER_SLOTS]
             .into_boxed_slice()
             .try_into()
@@ -598,7 +646,7 @@ fn save_then(
         }
         let mut nodes = nodes.clone();
         // Nodes met and about to be members (`ClusterState::admit_met_node`).
-        for node in state.joining.lock().iter() {
+        for (_, node) in state.joining.lock().iter() {
             nodes.entry(node.id).or_insert_with(|| node.clone());
         }
         (nodes, slots_copy, epoch, last_vote)
@@ -608,9 +656,10 @@ fn save_then(
     // replace it: nothing to write. With one on its way (being synced), it
     // is written all the same: the older one, put in place after, must not
     // be what stands (a `CLUSTER FORGET` that returns the topology to what
-    // is in place is saved, not skipped).
-    if state.last_saved_fingerprint.load(Ordering::Relaxed) == fingerprint
-        && state.saves.in_flight.load(Ordering::SeqCst) == 0
+    // is in place is saved, not skipped). `in_flight` is read first: a save
+    // that fails resets the fingerprint before it leaves `in_flight`.
+    if state.saves.in_flight.load(Ordering::SeqCst) == 0
+        && state.last_saved_fingerprint.load(Ordering::SeqCst) == fingerprint
         && path.exists()
     {
         state.saves.note_saved(generation, false);
@@ -624,8 +673,8 @@ fn save_then(
     let written = write_temp(&tmp, &render(&nodes_snap, &slots_snap, epoch, last_vote));
     if let Err(e) = written {
         let _ = fs::remove_file(&tmp);
+        state.last_saved_fingerprint.store(0, Ordering::SeqCst);
         state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
-        state.last_saved_fingerprint.store(0, Ordering::Relaxed);
         state.saves.note_failed(generation, &e);
         return Err(e);
     }
@@ -649,7 +698,7 @@ fn save_then(
                     // made later is skipped on the strength of it.
                     state
                         .last_saved_fingerprint
-                        .store(fingerprint, Ordering::Relaxed);
+                        .store(fingerprint, Ordering::SeqCst);
                 }
                 Ok(())
             })();
@@ -659,11 +708,16 @@ fn save_then(
                     state.saves.note_saved(generation, true);
                     publish();
                 }
-                Ok(()) => publish(),
+                Ok(()) => {
+                    // In place, not synced yet: the fingerprint of the save
+                    // before it does not tell what the file holds.
+                    state.last_saved_fingerprint.store(0, Ordering::SeqCst);
+                    publish();
+                }
                 Err(ref e) => {
+                    state.last_saved_fingerprint.store(0, Ordering::SeqCst);
                     state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
                     let _ = fs::remove_file(&tmp);
-                    state.last_saved_fingerprint.store(0, Ordering::Relaxed);
                     state.saves.note_failed(generation, e);
                 }
             }
@@ -708,7 +762,7 @@ fn save_then(
                     if state.saves.in_place.load(Ordering::SeqCst) == generation {
                         state
                             .last_saved_fingerprint
-                            .store(fingerprint, Ordering::Relaxed);
+                            .store(fingerprint, Ordering::SeqCst);
                     }
                     Ok(true)
                 } else {
@@ -719,17 +773,35 @@ fn save_then(
                     Ok(false)
                 }
             })();
-            state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
             match &placed {
-                Ok(true) => state.saves.note_saved(generation, true),
-                Ok(false) => state.saves.signal(),
+                Ok(true) => {
+                    state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    state.saves.note_saved(generation, true);
+                }
+                Ok(false) => {
+                    state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    state.saves.signal();
+                }
                 Err(e) => {
+                    // Reset before it leaves `in_flight`: see the skip above.
+                    state.last_saved_fingerprint.store(0, Ordering::SeqCst);
+                    state.saves.in_flight.fetch_sub(1, Ordering::SeqCst);
                     let _ = fs::remove_file(&tmp);
-                    state.last_saved_fingerprint.store(0, Ordering::Relaxed);
                     state.saves.note_failed(generation, e);
                 }
             }
-            placed.map(|_| ())
+            match placed {
+                // Overtaken: done once the newer save is synced, and not
+                // before, so that what waits on this one (a command's reply)
+                // is not answered before its change is on disk.
+                Ok(false) => wait_synced(
+                    &state.saves,
+                    generation,
+                    std::time::Instant::now() + OVERTAKEN_SAVE_WAIT,
+                )
+                .map_err(std::io::Error::other),
+                placed => placed.map(|_| ()),
+            }
         }
     };
     if asked.elapsed() > std::time::Duration::from_millis(100) {
@@ -823,6 +895,17 @@ pub fn wait_for_save(
         let _ = save_from_state(state);
         saves.urgent.fetch_sub(1, Ordering::SeqCst);
     }
+    wait_synced(saves, from, deadline)
+}
+
+/// How long a save overtaken by a newer one (see `save_then`) waits for
+/// that one to be synced.
+const OVERTAKEN_SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Wait until a save numbered from `from` on is in place, synced: `Err`
+/// with the reason if the first such save to end fails, or none is done by
+/// `deadline`.
+fn wait_synced(saves: &Saves, from: u64, deadline: std::time::Instant) -> Result<(), String> {
     let mut held = saves.ended_lock.lock();
     loop {
         if saves.synced.load(Ordering::SeqCst) >= from {
@@ -1233,6 +1316,26 @@ mod tests {
                 "other.conf.tmp-1"
             ]
         );
+    }
+
+    /// A directory sync the filesystem does not support (`EINVAL`,
+    /// `ENOTSUP`) lets the save stand; any other error fails it.
+    #[test]
+    fn a_directory_sync_the_filesystem_does_not_support_lets_the_save_stand() {
+        use std::io::{Error, ErrorKind};
+        assert!(dir_sync_outcome(Ok(())).is_ok());
+        assert!(dir_sync_outcome(Err(Error::from(ErrorKind::InvalidInput))).is_ok());
+        assert!(dir_sync_outcome(Err(Error::from(ErrorKind::Unsupported))).is_ok());
+        #[cfg(unix)]
+        for code in [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP] {
+            assert!(dir_sync_outcome(Err(Error::from_raw_os_error(code))).is_ok());
+        }
+        #[cfg(unix)]
+        for code in [libc::EIO, libc::ENOSPC, libc::EROFS, libc::EACCES] {
+            let e = dir_sync_outcome(Err(Error::from_raw_os_error(code))).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(code));
+        }
+        assert!(dir_sync_outcome(Err(Error::other("a test's"))).is_err());
     }
 
     #[test]

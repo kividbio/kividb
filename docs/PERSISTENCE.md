@@ -485,9 +485,15 @@ If the file cannot be saved (a full or read-only disk), the node logs it
 once, as an error, until a save works again. Meanwhile it makes no node
 met a member and does not answer its MEET (the end that sent it tries again,
 for up to two minutes, and again whenever the other end calls on it within
-the hour after), and it casts no vote. A replica that wins an election takes
-over at once (the cluster has agreed to it) and saves its promotion on the
-save thread, trying again every second until the save works.
+the hour after), and it casts no vote. A replica that wins an election saves
+its promotion before it announces it, waiting for the save up to a second.
+One not saved by then (a slow disk, a failed save) takes over all the same
+(the cluster has agreed to it), and the promotion is saved in the
+background, made again every second until the save works.
+
+A filesystem that cannot sync a directory at all (some FUSE, CIFS and 9p
+mounts answer `EINVAL` or `ENOTSUP`) does not fail the save: the node warns
+once, and the rename is as durable as that filesystem makes it.
 
 **A cluster stopped whole.** A member that at least one node has in its
 `nodes.conf` is a member again after the cluster restarts: that node tells
@@ -506,7 +512,7 @@ until each one lists it, and send each `CLUSTER SAVECONFIG`.
 a crash at any moment leaves the old file or the new one, never part of
 one. Every save writes a new file; nothing is written over in place. On
 Linux it is written past the page cache, padded with blank lines to a
-multiple of 4 KiB, as before. Temporary files a crash left are removed at
+multiple of 4 KiB. Temporary files a crash left are removed at
 startup. The one exception is the takeover at the end of a slot
 migration's handover, which does not wait for the sync while client writes
 are paused: a power failure in the moment after it can leave the file
@@ -530,12 +536,12 @@ small file in well under a second.
 **A file cut short is refused.** A `nodes.conf` that does not end with its
 `vars` line stops the node at startup with `cluster config file
 'nodes.conf' is unreadable: nodes.conf is incomplete ...`, and the file is
-left as it is. Read as far as it went, it would leave members and slots out
-and the epochs at 0. Restore the file from a backup; if there is none,
-remove it and add the node to the cluster again as a new one.
+left as it is: such a file may lack members, slots and the epochs. Restore
+the file from a backup; if there is none, remove it and add the node to the
+cluster again as a new one.
 
-An empty `nodes.conf` (zero bytes) is refused too (`nodes.conf is empty`),
-as it was before. Redis takes an empty file for a new node. To start a node
+An empty `nodes.conf` (zero bytes) is refused too (`nodes.conf is empty`).
+Redis takes an empty file for a new node. To start a node
 afresh, with a new id, delete the file rather than emptying it.
 
 ## When a write is acknowledged

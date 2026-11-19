@@ -916,22 +916,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **A node met just before the whole cluster stops is still a member after
-  it starts again (#808).** A node saved a new member to `nodes.conf` on a
-  thread of its own, some time after it learnt it, and the others learnt
-  it by gossip up to a heartbeat later. A cluster stopped meanwhile (a
-  restart of every node, a busy disk making the save slow) could come back
-  with no node that had it, and since a node that is not a member cannot
-  join by sending heartbeats, the cluster never learnt it again: it stayed
-  out of `CLUSTER NODES` and `SHARDS` until it was met again. Now both
-  ends of a `CLUSTER MEET` save the other, synced, before showing it as a
-  member (the receiving end before it answers): once the
-  node that ran `CLUSTER MEET` lists the new node without `handshake`, a
-  cluster stopped whole, even killed, keeps it, and the nodes that had not
-  heard of it yet learn it again by gossip. A node also saves its
-  `nodes.conf` at the start of a shutdown (`SIGTERM`, `SHUTDOWN`), so that
-  a save still being written is not lost with the process. A node still
-  cannot join by heartbeats alone: one no member has in its `nodes.conf`
-  needs a new `CLUSTER MEET`, as in Redis. See
+  it starts again (#808).** Both ends of a `CLUSTER MEET` save the other
+  to `nodes.conf`, synced, before showing it as a member (the receiving
+  end before it answers): once the node that ran `CLUSTER MEET` lists the
+  new node without `handshake`, a cluster stopped whole, even killed,
+  keeps it, and the nodes that had not heard of it yet learn it again by
+  gossip. A node also saves its `nodes.conf` at the start of a shutdown
+  (`SIGTERM`, `SHUTDOWN`), and waits for that save. A node cannot join by
+  heartbeats alone: one no member has in its `nodes.conf` needs a new
+  `CLUSTER MEET`, as in Redis. See
   [PERSISTENCE.md](docs/PERSISTENCE.md#the-clusters-nodesconf).
 
 - **`nodes.conf` is synced before it replaces the old one, and a file cut
@@ -940,13 +933,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   directory, so a crash at any moment leaves the old file or the new one;
   temporary files a crash left are removed at startup. A `nodes.conf` that
   does not end with its `vars` line is refused at startup with the reason
-  (`... is unreadable: nodes.conf is incomplete ...`) and left as it is,
-  where it was read as far as it went. An empty one is refused as before,
-  now saying so (`nodes.conf is empty`); unlike Redis, which takes it for a
-  new node: delete the file to start a node afresh. A save that does not
-  change the topology is skipped only when no other save is still on its
-  way to the file. The format is unchanged: files 1.2 wrote load, and 1.2
-  loads the files this release writes.
+  (`... is unreadable: nodes.conf is incomplete ...`) and left as it is.
+  An empty one is refused as empty (`nodes.conf is empty`), unlike Redis,
+  which takes it for a new node: delete the file to start a node afresh. A
+  save that does not change the topology is skipped only when no other
+  save is still on its way to the file. A filesystem that cannot sync a
+  directory (`EINVAL`, `ENOTSUP`) is warned of once and does not fail the
+  save. The format is unchanged: files 1.2 wrote load, and 1.2 loads the
+  files this release writes.
 
 - **A vote is sent once it is saved, and a node met is a member once it is
   saved (#808).** A node whose `nodes.conf` cannot be saved (a full or
@@ -955,14 +949,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   until a save works again. The end that sent the MEET tries again, for up
   to two minutes, and again when the other end calls on it within the hour
   after. Nodes met at the same time (`redis-cli --cluster create` has every
-  node meet the first) are saved together, in one write. The vote's save
-  no longer holds up the cluster bus, and a candidate counts a vote for
-  as long as its election lives (it waited the node timeout, at least
-  2 s): a voter on a slow disk answers once its vote is saved. A save
-  now waits on two syncs (the file before its rename, the directory
-  after), so on a slow disk a failover takes longer than before; see
-  [PERSISTENCE.md](docs/PERSISTENCE.md#the-clusters-nodesconf) for what
-  it needs of the disk.
+  node meet the first) are saved together, in one write. The vote is saved
+  off the cluster bus's thread, and a candidate counts a vote for as long
+  as its election lives: a voter on a slow disk answers once its vote is
+  saved. A replica that wins an election saves its promotion before it
+  announces it, waiting for the save up to a second; a promotion not
+  saved by then is announced all the same and saved in the background. A
+  save waits on two syncs (the file before its rename, the directory
+  after); see [PERSISTENCE.md](docs/PERSISTENCE.md#the-clusters-nodesconf)
+  for what failover needs of the disk.
 
 - **`CLIENT UNBLOCK` reaches a client that was woken and is parking
   again.** It could answer 1 for a client blocked in `BLPOP` (or another

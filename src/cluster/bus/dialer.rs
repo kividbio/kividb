@@ -225,7 +225,7 @@ const MEET_RESUME_FOR_MS: u64 = 3_600_000;
 /// member while this node does not have it: its heartbeats would not be
 /// heard. So once the peer has been reached, the MEET is sent again until
 /// both ends have the other, for up to [`MEET_GIVE_UP`]; a peer never
-/// reached is given up at once, as before.
+/// reached is given up at once.
 pub async fn send_meet(
     state: Arc<ClusterState>,
     peer_ip: String,
@@ -355,7 +355,8 @@ async fn meet_once(
     if !admitted {
         return Err((true, "could not save the peer as a member".into()));
     }
-    state.save_soon();
+    // Saved: by the admission, and what the reply told of it, after, by
+    // `apply_heartbeat`.
     Ok(())
 }
 

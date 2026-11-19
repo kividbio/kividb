@@ -566,6 +566,11 @@ async fn promote(
     // this node was a replica still to the replication layer.
     state.drop_slots_lost_while_promoting(&claimed);
     state.end_election();
+    // On disk before it is announced, unless the save takes longer than
+    // `PROMOTION_SAVE_WAIT` or fails: then it is announced all the same,
+    // and saved in the background (see `ClusterState::save_promotion`).
+    let saving = Arc::clone(state);
+    let _ = crate::cpus::spawn_blocking(move || saving.save_promotion()).await;
     // Announce the new ownership now rather than on the next heartbeat tick:
     // until the others hear it they keep redirecting clients to the old
     // master, and its other replicas keep following a node that is gone.
