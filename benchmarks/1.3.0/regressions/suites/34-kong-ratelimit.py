@@ -214,9 +214,14 @@ CHECK_CONNS, CHECK_CALLS = 4, 500
 
 
 def unescape(text):
-    """One argument as MONITOR quotes it (backslash n, backslash quote, two backslashes)."""
-    return re.sub(r"\\(.)", lambda m: {"n": "\n", "r": "\r", "t": "\t"}.get(m.group(1), m.group(1)),
-                  text)
+    """One argument as MONITOR quotes it -> the argument. Redis writes a newline as backslash n,
+    KiviDB v1.2.2 as backslash x0a; either way a backslash before a quote or a backslash is dropped."""
+    def one(m):
+        c = m.group(1)
+        if c[0] == "x" and len(c) == 3:
+            return chr(int(c[1:], 16))
+        return {"n": "\n", "r": "\r", "t": "\t"}.get(c, c)
+    return re.sub(r"\\(x[0-9a-fA-F]{2}|.)", one, text)
 
 
 def check_keys(memtier_path, port, sha, form, keys, mode="evalsha"):
