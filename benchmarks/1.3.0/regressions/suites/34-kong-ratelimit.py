@@ -17,8 +17,10 @@ verbatim:
   return result_incr - 1
 
 on one key, `ratelimit:<route>:<service>:<identifier>:<period_date>:<period>`
-(`get_local_key`), with the period's expiry (60 for `minute`). Here it is
-loaded once and sent as `EVALSHA <sha> 1 <key> 60`.
+(`get_local_key`), with the period's expiry (60 for `minute`). Kong sends it as `EVAL <script> 1
+<key> 60` (lua-resty-redis `red:eval`, every request carries the script text);
+the suite sends it both ways, as Kong does (`eval`) and by its SHA-1 after one
+`SCRIPT LOAD` (`evalsha`, what a client that caches the script would send).
 
 Load: memtier_benchmark, 4 threads, 200 and 500 connections, one call at a
 time per connection, the identifier drawn uniformly from 100,000
@@ -36,16 +38,18 @@ to the script-runner (#880).
             time, tagged or not. Redis has no such setting, and runs as in
             `default`.
 
-Before anything is measured, for each key form, a run of 4 connections x 500
-calls under MONITOR: every EVALSHA must name 1 key in the KEYS position, of
-the form asked for, with `60` as its only ARGV; the keys must differ from call
-to call (at least 90 % distinct: memtier without `--distinct-client-seed`
-gives every connection the same sequence, and four connections then send
-each key four times); and where the server shows the script's own calls, each
-`incr` is on a key an EVALSHA named. The suite fails otherwise.
+Before anything is measured, for each way of calling and key form, a run of 4
+connections x 500 calls under MONITOR: every call must name 1 key in the KEYS
+position, of the form asked for, with `60` as its only ARGV (and, for `eval`,
+Kong's script text as its script); the keys must differ from call to call (at
+least 90 % distinct: memtier without `--distinct-client-seed` gives every
+connection the same sequence, and four connections then send each key four
+times); and where the server shows the script's own calls, each `incr` is on a
+key a call named. The suite fails otherwise.
 
 Each connection count: one warm-up run, then RUNS runs of SECONDS; the metric
-is the median. Rows per configuration and key form: ops/s and p99 at each
+is the median. Rows per configuration, way of calling (`eval`, `evalsha`) and
+key form, named `<mode>_<form>_...`: ops/s and p99 at each
 connection count, and `keys_without_ttl` (must be 0: the script sets the
 expiry when it makes the key). The suite fails if the scan sees under 90 % of
 the keys, or a run does no work.
@@ -110,6 +114,9 @@ FORM_KEY = {
     "plain": re.compile(r"^ratelimit:%s:%s:c\d+:%s:minute$" % (ROUTE, SERVICE, PERIOD_DATE)),
     "tag": re.compile(r"^ratelimit:%s:%s:\{c\d+\}:%s:minute$" % (ROUTE, SERVICE, PERIOD_DATE)),
 }
+# How the script is sent: by its SHA-1 (`EVALSHA`), and as Kong sends it
+# (`EVAL` with the script text).
+MODES = ("evalsha", "eval")
 # KiviDB's setting, per configuration.
 PARALLEL = {"default": None, "serial": "no"}
 
@@ -160,8 +167,17 @@ def memtier_bin():
     raise RuntimeError("memtier_benchmark not found ($MEMTIER or PATH)")
 
 
+def call_command(mode, sha, form):
+    """memtier's --command for one call. Kong sends the script itself (`EVAL`,
+    lua-resty-redis `red:eval`), not its SHA-1; memtier takes a quoted argument
+    (single quotes: the script has none) as one."""
+    if mode == "eval":
+        return "EVAL '%s' 1 %s %d" % (SCRIPT, FORMS[form], EXPIRATION)
+    return "EVALSHA %s 1 %s %d" % (sha, FORMS[form], EXPIRATION)
+
+
 def memtier(memtier_path, port, sha, form, conns, keys, seconds=None, requests=None,
-            threads=THREADS):
+            threads=THREADS, mode="evalsha"):
     """One run, for `seconds` or `requests` calls a connection -> (ops/s, p99 ms)."""
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "out.json")
@@ -171,7 +187,7 @@ def memtier(memtier_path, port, sha, form, conns, keys, seconds=None, requests=N
                "--key-prefix=c", "--key-minimum=1", "--key-maximum=%d" % keys,
                "--distinct-client-seed", "--hide-histogram", "--json-out-file", out,
                # --command-key-pattern must follow its --command.
-               "--command=EVALSHA %s 1 %s %d" % (sha, FORMS[form], EXPIRATION),
+               "--command=" + call_command(mode, sha, form),
                "--command-key-pattern=R"]
         pin = (lambda: os.sched_setaffinity(0, CLIENT_CPUS)) if CLIENT_CPUS else None
         res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
@@ -197,11 +213,18 @@ MONITOR_LINE = re.compile(r'^[\d.]+ \[\d+ ([^\]]+)\] (.*)$')
 CHECK_CONNS, CHECK_CALLS = 4, 500
 
 
-def check_keys(memtier_path, port, sha, form, keys):
+def unescape(text):
+    """One argument as MONITOR quotes it (backslash n, backslash quote, two backslashes)."""
+    return re.sub(r"\\(.)", lambda m: {"n": "\n", "r": "\r", "t": "\t"}.get(m.group(1), m.group(1)),
+                  text)
+
+
+def check_keys(memtier_path, port, sha, form, keys, mode="evalsha"):
     """4 connections x 500 calls under MONITOR -> what was seen. Raises unless
-    every EVALSHA names one key of the form in the KEYS position with `60`
-    its only ARGV, the keys differ from call to call, and each `incr` the
-    server shows the script making is on a key an EVALSHA named."""
+    every EVALSHA (EVAL, by `mode`, with Kong's script text) names one key of
+    the form in the KEYS position with `60` its only ARGV, the keys differ from
+    call to call, and each `incr` the server shows the script making is on a
+    key a call named."""
     sock = socket.create_connection(("127.0.0.1", port))
     sock.sendall(b"MONITOR\r\n")
     chunks, stop = [], threading.Event()
@@ -221,7 +244,8 @@ def check_keys(memtier_path, port, sha, form, keys):
     reader.start()
     try:
         time.sleep(0.2)
-        memtier(memtier_path, port, sha, form, CHECK_CONNS, keys, requests=CHECK_CALLS, threads=2)
+        memtier(memtier_path, port, sha, form, CHECK_CONNS, keys, requests=CHECK_CALLS, threads=2,
+               mode=mode)
         time.sleep(0.5)
     finally:
         stop.set()
@@ -238,9 +262,12 @@ def check_keys(memtier_path, port, sha, form, keys):
         if not args:
             continue
         name = args[0].lower()
-        if name == "evalsha" and who != "lua":
+        if name == mode and who != "lua":
             calls += 1
-            if (len(args) != 5 or args[1] != sha or args[2] != "1"
+            first = sha if mode == "evalsha" else None
+            if (len(args) != 5 or args[2] != "1"
+                    or (first is not None and args[1] != first)
+                    or (first is None and unescape(args[1]) != SCRIPT)
                     or not FORM_KEY[form].match(args[3]) or args[4] != str(EXPIRATION)):
                 bad.append(line)
             else:
@@ -253,10 +280,10 @@ def check_keys(memtier_path, port, sha, form, keys):
     # KiviDB's MONITOR feed can drop some lines under load (see suite 20):
     # half of what was sent is plenty to judge by.
     if calls < CHECK_CONNS * CHECK_CALLS // 2:
-        raise RuntimeError("MONITOR saw %d EVALSHA of %d sent" % (calls, CHECK_CONNS * CHECK_CALLS))
+        raise RuntimeError("MONITOR saw %d %s of %d sent" % (calls, mode, CHECK_CONNS * CHECK_CALLS))
     if bad:
-        raise RuntimeError("MONITOR: %d EVALSHA without one %s key in KEYS and ARGV 60, e.g. %s"
-                           % (len(bad), form, bad[0]))
+        raise RuntimeError("MONITOR: %d %s without one %s key in KEYS and ARGV 60, e.g. %s"
+                           % (len(bad), mode, form, bad[0]))
     if len(set(named)) < 0.9 * len(named):
         raise RuntimeError("MONITOR: %d distinct keys in %d calls: the connections share a key "
                            "sequence" % (len(set(named)), len(named)))
@@ -303,28 +330,30 @@ def run(ctx):
                        "os_cpus": os.cpu_count()}
     ctx.raw["monitor"], ctx.raw["runs"], ctx.raw["keys_seen"] = {}, {}, {}
     for form in FORMS:
-        c.flushall()
-        sha = c.script_load(SCRIPT)
-        ctx.raw["monitor"][form] = check_keys(memtier_path, ctx.port, sha, form, keys)
-        ctx.raw["runs"][form] = {}
-        for conns, floor in CONNS.items():
-            memtier(memtier_path, ctx.port, sha, form, conns, keys, seconds=WARMUP_SECONDS)
-            runs = [memtier(memtier_path, ctx.port, sha, form, conns, keys, seconds=SECONDS)
-                    for _ in range(RUNS)]
-            ctx.raw["runs"][form][conns] = runs
-            ops = [r[0] for r in runs]
-            ctx.emit("%s_ops_c%d" % (form, conns), median(ops), "ops/s", "higher",
-                     gate=[THROUGHPUT, vs_redis(round(1 / floor, 3))], samples=ops)
-            p99 = [r[1] for r in runs]
-            ctx.emit("%s_p99_ms_c%d" % (form, conns), median(p99), "ms", "lower",
-                     gate=jitter(info()), samples=p99)
-        missing, seen = keys_without_ttl(c)
-        ctx.raw["keys_seen"][form] = seen
-        # Counted over the keys the runs made, or it says nothing.
-        if seen < 0.9 * keys:
-            raise RuntimeError("the scan saw %d ratelimit:* keys of %d" % (seen, keys))
-        ctx.emit("%s_keys_without_ttl" % form, missing, "keys", "lower", gate=bound(max=0))
-
+        for mode in MODES:
+            c.flushall()
+            sha = c.script_load(SCRIPT)
+            tag = "%s_%s" % (mode, form)
+            ctx.raw["monitor"][tag] = check_keys(memtier_path, ctx.port, sha, form, keys, mode)
+            ctx.raw["runs"][tag] = {}
+            for conns, floor in CONNS.items():
+                memtier(memtier_path, ctx.port, sha, form, conns, keys, seconds=WARMUP_SECONDS,
+                        mode=mode)
+                runs = [memtier(memtier_path, ctx.port, sha, form, conns, keys, seconds=SECONDS,
+                                mode=mode) for _ in range(RUNS)]
+                ctx.raw["runs"][tag][conns] = runs
+                ops = [r[0] for r in runs]
+                ctx.emit("%s_ops_c%d" % (tag, conns), median(ops), "ops/s", "higher",
+                         gate=[THROUGHPUT, vs_redis(round(1 / floor, 3))], samples=ops)
+                p99 = [r[1] for r in runs]
+                ctx.emit("%s_p99_ms_c%d" % (tag, conns), median(p99), "ms", "lower",
+                         gate=jitter(info()), samples=p99)
+            missing, seen = keys_without_ttl(c)
+            ctx.raw["keys_seen"][tag] = seen
+            # Counted over the keys the runs made, or it says nothing.
+            if seen < 0.9 * keys:
+                raise RuntimeError("the scan saw %d ratelimit:* keys of %d" % (seen, keys))
+            ctx.emit("%s_keys_without_ttl" % tag, missing, "keys", "lower", gate=bound(max=0))
 
 if __name__ == "__main__":
     sys.exit(S.main())
