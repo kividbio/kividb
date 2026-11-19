@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import Suite, Config, EXACT, bound, info, median  # noqa: E402
 from nodes import Nodes  # noqa: E402
 
-S = Suite("11-migrate-conns", [Config("migrate")])
+S = Suite("11-migrate-conns", [Config("migrate", threads=2)])
 
 
 @S.run

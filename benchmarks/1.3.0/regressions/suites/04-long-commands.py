@@ -35,8 +35,8 @@ from probe import Probe  # noqa: E402
 RUNS = 3
 PROBES = 4
 S = Suite("04-long-commands", [
-    Config("tokio", io="tokio"),
-    Config("uring", io="uring", engines=("v1_2_2", "candidate")),
+    Config("tokio", io="tokio", threads=2),
+    Config("uring", io="uring", engines=("v1_2_2", "candidate"), threads=2),
 ])
 CMDS = {
     "keys": ("KEYS", "user:99*"),
