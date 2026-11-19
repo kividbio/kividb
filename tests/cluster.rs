@@ -1998,6 +1998,215 @@ fn a_forget_during_an_earlier_save_is_not_undone_by_it() {
     assert!(row_of(&nodes[0], &x_id).is_none());
 }
 
+/// The owner of `slot` in `node`'s `CLUSTER NODES`, by id.
+fn owner_of(node: &Node, slot: u16) -> Option<String> {
+    let nodes = node.conn().cmd(&["CLUSTER", "NODES"]).text();
+    nodes.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let owns = fields.get(8..)?.iter().any(|range| owns_in(range, slot));
+        owns.then(|| fields[0].to_string())
+    })
+}
+
+/// Whether `range`, a slot range of `CLUSTER NODES` or nodes.conf (`N` or
+/// `N-M`), has `slot`.
+fn owns_in(range: &str, slot: u16) -> bool {
+    match range.split_once('-') {
+        _ if range.starts_with('[') => false,
+        Some((a, b)) => {
+            a.parse::<u16>().is_ok_and(|a| a <= slot) && b.parse::<u16>().is_ok_and(|b| slot <= b)
+        }
+        None => range.parse::<u16>().is_ok_and(|n| n == slot),
+    }
+}
+
+/// Whether `node`'s nodes.conf has `id` owning `slot`.
+fn saved_owning(node: &Node, id: &str, slot: u16) -> bool {
+    std::fs::read_to_string(node.dir.join("nodes.conf"))
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.starts_with(id) && l.split(' ').skip(8).any(|r| owns_in(r, slot)))
+}
+
+/// `args`, sent to the node on `port` from a thread of its own: its answer
+/// comes on the channel returned, once there is one.
+fn send_off(port: u16, args: &[&str]) -> std::sync::mpsc::Receiver<std::io::Result<Resp>> {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let _ = tx.send(Conn::connect(port).try_cmd(&args));
+    });
+    rx
+}
+
+/// `SETSLOT ... IMPORTING`, `MIGRATING` and `STABLE` change nothing
+/// nodes.conf holds (no owner, node or epoch): they are answered at once,
+/// even with a save under way that is not on disk yet. `SETSLOT ... NODE`
+/// changes an owner, and is answered only once a save that has it is
+/// synced: here, not before the saves held are let go.
+#[test]
+fn setslot_node_waits_for_its_save_and_the_migration_states_do_not() {
+    let mut a = Node::start(&[]);
+    a.kill();
+    a.env
+        .push((FAILPOINT_SAVES.0.to_string(), FAILPOINT_SAVES.1.to_string()));
+    let gate = SaveGate::new(&a.dir, |_| false);
+    a.spawn();
+    let (nodes, ranges) = form_cluster_of(vec![a, Node::start(&[])]);
+    let (a_id, b_id) = (nodes[0].id(), nodes[1].id());
+    let (theirs, next) = (ranges[1].0, (ranges[1].0 + 1).to_string());
+    gate.set_hold(|_| true);
+    // A slot of B's taken by A, by hand: its save is held.
+    let taking = send_off(
+        nodes[0].port,
+        &["CLUSTER", "SETSLOT", &theirs.to_string(), "NODE", &a_id],
+    );
+    gate.wait_held(Duration::from_secs(30));
+    for args in [
+        vec!["CLUSTER", "SETSLOT", "1", "MIGRATING", b_id.as_str()],
+        vec!["CLUSTER", "SETSLOT", "1", "STABLE"],
+        vec![
+            "CLUSTER",
+            "SETSLOT",
+            next.as_str(),
+            "IMPORTING",
+            b_id.as_str(),
+        ],
+        vec!["CLUSTER", "SETSLOT", next.as_str(), "STABLE"],
+    ] {
+        let answer = send_off(nodes[0].port, &args).recv_timeout(Duration::from_secs(5));
+        assert!(
+            answer
+                .as_ref()
+                .is_ok_and(|r| r.as_ref().is_ok_and(Resp::is_ok)),
+            "{args:?}: {answer:?}"
+        );
+    }
+    // The owner's change is not answered while its save is held.
+    assert!(
+        taking.recv_timeout(Duration::from_secs(1)).is_err(),
+        "SETSLOT NODE answered before its save was on disk"
+    );
+    assert!(!saved_owning(&nodes[0], &a_id, theirs));
+    gate.set_hold(|_| false);
+    let held: Vec<PathBuf> = gate.held.lock().clone();
+    for failpoint in held {
+        gate.release(&failpoint);
+    }
+    let r = taking
+        .recv_timeout(Duration::from_secs(9))
+        .unwrap()
+        .unwrap();
+    assert!(r.is_ok(), "{r:?}");
+    assert!(saved_owning(&nodes[0], &a_id, theirs));
+    gate.finish();
+}
+
+/// A command whose change a save already under way has (learnt by gossip a
+/// moment before) waits for that save, and writes no second one: here A
+/// learns from B's claim that slot 0 is B's, its save of that is held, and
+/// A's own `SETSLOT 0 NODE <B>` is answered once that save is let go, with
+/// only that one save under way meanwhile.
+#[test]
+fn a_command_whose_change_a_save_under_way_has_waits_for_that_save() {
+    let mut a = Node::start(&[]);
+    a.kill();
+    a.env
+        .push((FAILPOINT_SAVES.0.to_string(), FAILPOINT_SAVES.1.to_string()));
+    let gate = SaveGate::new(&a.dir, |_| false);
+    a.spawn();
+    let (nodes, ranges) = form_cluster_of(vec![a, Node::start(&[])]);
+    assert_eq!(ranges[0].0, 0);
+    let b_id = nodes[1].id();
+    let held_id = b_id.clone();
+    gate.set_hold(move |file| {
+        file.lines()
+            .any(|l| l.starts_with(&held_id) && l.split(' ').skip(8).any(|r| owns_in(r, 0)))
+    });
+    // B takes slot 0 by hand; A learns it from B's claim, and saves it.
+    let r = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "SETSLOT", "0", "NODE", &b_id]);
+    assert!(r.is_ok(), "{r:?}");
+    let held = gate.wait_held(Duration::from_secs(30));
+    assert_eq!(owner_of(&nodes[0], 0).as_deref(), Some(b_id.as_str()));
+    let saving = PathBuf::from(std::fs::read_to_string(&held).unwrap().trim())
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(saves_under_way(&nodes[0]), std::slice::from_ref(&saving));
+    let setting = send_off(nodes[0].port, &["CLUSTER", "SETSLOT", "0", "NODE", &b_id]);
+    // Not answered before the save that has it is on disk; no save of its own.
+    assert!(setting.recv_timeout(Duration::from_secs(1)).is_err());
+    assert_eq!(saves_under_way(&nodes[0]), [saving]);
+    gate.release(&held);
+    let r = setting
+        .recv_timeout(Duration::from_secs(9))
+        .unwrap()
+        .unwrap();
+    assert!(r.is_ok(), "{r:?}");
+    assert!(saved_owning(&nodes[0], &b_id, 0));
+    gate.finish();
+}
+
+/// A slot moved by hand as `redis-cli --cluster reshard` moves it, both
+/// nodes killed after each step: each starts again from a whole nodes.conf,
+/// no temporary file or spare is left, and both agree on one owner of the
+/// slot, the new one once a `SETSLOT ... NODE` to it was answered. The
+/// migration's own state (`IMPORTING`, `MIGRATING`) is not in nodes.conf:
+/// it is set again after a restart, as `redis-cli --cluster fix` would.
+#[test]
+fn a_slot_move_killed_after_any_step_restarts_with_one_owner() {
+    let (mut nodes, ranges) = form_cluster(2);
+    let (a_id, b_id) = (nodes[0].id(), nodes[1].id());
+    let slot = ranges[0].1;
+    let s = slot.to_string();
+    let restart = |nodes: &mut Vec<Node>, owner: &str, step: &str| {
+        stop_all(nodes, Stop::Kill);
+        for node in nodes.iter_mut() {
+            node.spawn();
+            let left: Vec<String> = std::fs::read_dir(&node.dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("nodes.conf.tmp") || n.starts_with("nodes.conf.spare"))
+                .collect();
+            assert!(left.is_empty(), "after {step}: {left:?}");
+        }
+        wait_until(
+            &format!("one owner of the slot after {step}"),
+            Duration::from_secs(30),
+            || {
+                nodes
+                    .iter()
+                    .all(|n| owner_of(n, slot).as_deref() == Some(owner))
+            },
+        );
+    };
+    let set = |node: &Node, args: &[&str]| {
+        let mut full = vec!["CLUSTER", "SETSLOT", s.as_str()];
+        full.extend_from_slice(args);
+        let r = node.conn().cmd(&full);
+        assert!(r.is_ok(), "{full:?}: {r:?}");
+    };
+
+    set(&nodes[1], &["IMPORTING", &a_id]);
+    restart(&mut nodes, &a_id, "IMPORTING");
+    set(&nodes[1], &["IMPORTING", &a_id]);
+    set(&nodes[0], &["MIGRATING", &b_id]);
+    restart(&mut nodes, &a_id, "MIGRATING");
+    set(&nodes[1], &["IMPORTING", &a_id]);
+    set(&nodes[0], &["MIGRATING", &b_id]);
+    set(&nodes[1], &["NODE", &b_id]);
+    assert!(saved_owning(&nodes[1], &b_id, slot));
+    restart(&mut nodes, &b_id, "SETSLOT NODE on the new owner");
+    set(&nodes[0], &["NODE", &b_id]);
+    assert!(saved_owning(&nodes[0], &b_id, slot));
+    restart(&mut nodes, &b_id, "SETSLOT NODE on the old owner");
+}
+
 /// A node that cannot save nodes.conf (here, its directory is read-only)
 /// does not make a node that meets it a member, and does not answer the
 /// MEET: "listed without `handshake`" stays "saved at both ends". It says
