@@ -78,10 +78,7 @@ impl Counters {
         if n == 0 || n > MAX_COUNTERS {
             return Err(CmsError::TooLarge);
         }
-        let mut v: Vec<u32> = Vec::new();
-        v.try_reserve_exact(n as usize)
-            .map_err(|_| CmsError::NoMemory)?;
-        v.resize(n as usize, 0);
+        let v = super::zeroed::<u32>(n as usize).ok_or(CmsError::NoMemory)?;
         Ok(Counters(Arc::new(v.into_boxed_slice())))
     }
 
