@@ -156,6 +156,40 @@ pub(crate) fn read_vec(r: &mut impl io::Read, len: usize) -> io::Result<Vec<u8>>
     Ok(out)
 }
 
+/// `n` values of `T` from zeroed memory, or `None` if it cannot be had (the
+/// memory asked for, not assumed). The pages come zeroed from the system
+/// and are not written here: making a large sketch costs nothing of its
+/// size until it is used, so a command that makes one holds its key's order
+/// and the write gate no longer for its size. `T` is a plain number, or a
+/// struct of them, all of whose zero bytes are a value ([`Zeroed`]).
+pub(crate) fn zeroed<T: Zeroed>(n: usize) -> Option<Vec<T>> {
+    if n == 0 || std::mem::size_of::<T>() == 0 {
+        return Some(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<T>(n).ok()?;
+    // SAFETY: the layout is of n > 0 values of a type of non-zero size; the
+    // memory is zeroed, and all-zero bytes are a `T` (`Zeroed`); the vector
+    // owns it, with the length and capacity it was asked for.
+    unsafe {
+        let p = std::alloc::alloc_zeroed(layout).cast::<T>();
+        if p.is_null() {
+            return None;
+        }
+        Some(Vec::from_raw_parts(p, n, n))
+    }
+}
+
+/// A type all of whose zero bytes are a value of it, for [`zeroed`].
+///
+/// # Safety
+///
+/// Only for plain numbers and structs of them, without padding that matters.
+pub(crate) unsafe trait Zeroed: Copy {}
+// SAFETY: plain numbers.
+unsafe impl Zeroed for u8 {}
+// SAFETY: plain numbers.
+unsafe impl Zeroed for u32 {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -71,10 +71,14 @@ pub enum TopKError {
 
 /// One bucket: a fingerprint and its count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
 pub struct Bucket {
     pub fp: u32,
     pub count: u32,
 }
+
+// SAFETY: two u32s, no padding; all zero is an empty bucket (the default).
+unsafe impl super::Zeroed for Bucket {}
 
 /// One place in the heap: empty, or an item with its fingerprint and count.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -154,11 +158,8 @@ impl TopK {
         if !fits(k, width, depth) {
             return Err(TopKError::TooLarge);
         }
-        let mut buckets = Vec::new();
-        buckets
-            .try_reserve_exact((width * depth) as usize)
-            .map_err(|_| TopKError::NoMemory)?;
-        buckets.resize((width * depth) as usize, Bucket::default());
+        let buckets: Vec<Bucket> =
+            super::zeroed((width * depth) as usize).ok_or(TopKError::NoMemory)?;
         let mut heap = Vec::new();
         heap.try_reserve_exact(k as usize)
             .map_err(|_| TopKError::NoMemory)?;
