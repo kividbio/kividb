@@ -2199,8 +2199,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   write that replaces or removes no document pays one comparison for it.
   A plain KNN query (`*=>[KNN k ...]`) now looks at each key it found, as
   the other queries did, and leaves out one deleted or written over while
-  it ran, taking the next nearest in its place: it still returns `k`
-  documents when the index holds that many.
+  it ran, taking the next nearest in its place.
 
 - **`FUNCTION LIST` and `FUNCTION STATS` follow the client's protocol**
   (#476). To a RESP3 client each library, each function and the stats are
