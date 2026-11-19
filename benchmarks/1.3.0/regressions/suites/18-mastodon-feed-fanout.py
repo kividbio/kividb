@@ -45,13 +45,45 @@ and memtier, nothing pinned: master measured 1.86-2.11x Redis's ops/s, 0.46-0.51
 its read p50, and 0.945-1.03x v1.2.2's ops/s, one run in three at the low end
 of both: this suite is noisier than 20): ops/s at least 1.75x Redis in the
 same session and at most 10 % under v1.2.2's (master is not ahead of v1.2.2
-here, so the gate says "not worse than"), the read p50 at most 0.55x Redis's
-and 15 % over the recorded one (master's read p50 is 1.3x v1.2.2's: 0.70 ms
-against 0.54-0.56 at 200 connections; recorded as it is, not gated against
-v1.2.2); THROUGHPUT / MEMORY against the recorded candidate. The p99 rows are
-shown, not gated (`jitter`: client and server share the VM). memtier's four
-threads are at 100 % of a CPU each while it drives KiviDB, so the ops/s rows
-bound the server from below; they are not its limit.
+here, so the gate says "not worse than"), the read p50 at most 0.55x Redis's,
+15 % over the recorded one and at most FLAT_OUT_READ_P50_VS_V1_2_2 (1.5x)
+v1.2.2's in the same session; THROUGHPUT / MEMORY against the recorded
+candidate. The p99 rows are shown, not gated (`jitter`: client and server
+share the VM). memtier's four threads are at 100 % of a CPU each while it
+drives KiviDB, so the ops/s rows bound the server from below; they are not
+its limit.
+
+Paced run: the same mix from PACED_CONNS (200) connections at PACED_RATE
+(1,000) requests a second each, 200k a second in all, below what v1.2.2 or
+master serve flat out here. Its read p50 is gated at most 1.15x v1.2.2's in
+the same session: this is the row that catches a read that got slower, or
+replies held longer, because the server is not saturated and memtier's own
+queue is not what it measures. Its ops/s (the rate asked for; Redis, at
+115-131k flat out, cannot reach it, so its paced row is a flat-out one) and
+read p99 are shown.
+
+Why the flat-out read p50 is not gated tighter against v1.2.2: flat out,
+memtier is the limit and each connection sends its next request when the
+last reply arrives, so the mean latency is fixed by connections / ops/s
+(Little's law): v1.2.2 and master both average 0.70 ms at 200 connections.
+How it is spread is what moves. Master's read p50 is 1.3x v1.2.2's (0.65 ms
+against 0.49-0.50; 1.66 against 1.26 at 500 connections) while its p99 is
+2.6x lower (1.4-1.5 ms against 3.9; 3.1 against 5.6) at the same ops/s.
+The step is #712 (scores of whole numbers replied as integers, Redis's
+format, #472), which made a 20-member WITHSCORES page 3x cheaper on the
+server (INFO commandstats: 19.4 us a call before it, 6.0 after, 4.9 on
+master): the workers then sleep between requests (twice the context
+switches) instead of running behind, and no connection waits behind a busy
+worker any more.
+Measured on master: adding back 14 us of busy work to each by-score read
+gives back v1.2.2's numbers (p50 0.50 ms, p99 3.8 ms), and so does taking
+#712's integer formatting out (p50 0.44, p99 4.0, the read 23 us): the
+p50 is lower only because the server is slower. A further 0.03 ms comes
+from #903 (8 workers on 8 CPUs where 1.2.2 started 6; `--threads 6` gives
+it back; one worker per CPU is #903's choice for a server with CPUs of its
+own). At 200k requests a second (the paced run) master's read p50 equals
+v1.2.2's (0.46-0.53 ms against 0.48-0.51, three runs each) with 7 % less
+server CPU, and at 100k (0.29 ms both).
 
 Needs memtier_benchmark 2.6.1 or newer (`--transaction`, and the stderr line
 it logs for an error reply): `$MEMTIER`, else on PATH.
@@ -79,6 +111,15 @@ RUNS = 3
 # Connections -> the floor over Redis for the mix's ops/s (published 1.7x / 2.0x).
 CONNS = {200: 1.75, 500: 1.75}
 READ = "Zrevrangebyscores"  # memtier's name for the timeline read's stats
+# The paced run: PACED_CONNS connections, each sending PACED_RATE requests a
+# second (memtier's --rate-limiting), 200k a second in all: about 70 % of what
+# v1.2.2 and master serve flat out on a D8s_v5 (280-295k), so the server, not
+# memtier's queue, is what its read p50 measures. Gated against v1.2.2.
+PACED_CONNS = 200
+PACED_RATE = 1000
+# The flat-out read p50 at most this much over v1.2.2's in the same session: see
+# "Why the flat-out read p50 is not gated tighter" in the module notes.
+FLAT_OUT_READ_P50_VS_V1_2_2 = 1.5
 
 # ── The mix: the issue's seven commands. The WEIGHTS ARE A PLACEHOLDER, a
 # reading of FeedManager; replace them with the published run's when
@@ -115,8 +156,9 @@ def load(c, feeds):
         p.execute()
 
 
-def memtier(memtier_path, port, conns, seconds, feeds):
-    """One run -> (ops/s, mix p99, read p50, read p99), latencies in ms."""
+def memtier(memtier_path, port, conns, seconds, feeds, rate=0):
+    """One run -> (ops/s, mix p99, read p50, read p99), latencies in ms. `rate`:
+    requests a second per connection (memtier's `--rate-limiting`), 0 = flat out."""
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, "out.json")
         cmd = [memtier_path, "-s", "127.0.0.1", "-p", str(port), "--protocol=redis",
@@ -127,6 +169,8 @@ def memtier(memtier_path, port, conns, seconds, feeds):
         for command, ratio in MIX:
             # --command-key-pattern must follow its --command.
             cmd += ["--command=" + command, "--command-ratio=%d" % ratio, "--command-key-pattern=R"]
+        if rate:
+            cmd.append("--rate-limiting=%d" % rate)
         res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
                              timeout=seconds + 120)
         tail = "\n".join(res.stderr.strip().splitlines()[-10:])
@@ -171,12 +215,25 @@ def run(ctx):
                  gate=[THROUGHPUT, vs_redis(round(1 / floor, 3)), vs_v1_2_2(1.1)], samples=ops)
         read_p50 = [r[2] for r in runs]
         ctx.emit("read_p50_ms_c%d" % conns, median(read_p50), "ms", "lower",
-                 gate=jitter([vs_redis(0.55), rel(15)]), samples=read_p50)
+                 gate=jitter([vs_redis(0.55), rel(15), vs_v1_2_2(FLAT_OUT_READ_P50_VS_V1_2_2)]),
+                 samples=read_p50)
         p99 = [r[1] for r in runs]
         ctx.emit("p99_ms_c%d" % conns, median(p99), "ms", "lower", gate=jitter(info()), samples=p99)
         read_p99 = [r[3] for r in runs]
         ctx.emit("read_p99_ms_c%d" % conns, median(read_p99), "ms", "lower", gate=jitter(info()),
                  samples=read_p99)
+    # The same mix at a fixed rate below what either build serves flat out.
+    memtier(memtier_path, ctx.port, PACED_CONNS, WARMUP_SECONDS, feeds, PACED_RATE)
+    runs = [memtier(memtier_path, ctx.port, PACED_CONNS, SECONDS, feeds, PACED_RATE) for _ in range(RUNS)]
+    ctx.raw["runs"]["paced"] = runs
+    ops = [r[0] for r in runs]
+    ctx.emit("ops_paced", median(ops), "ops/s", "higher", gate=info(), samples=ops)
+    read_p50 = [r[2] for r in runs]
+    ctx.emit("read_p50_ms_paced", median(read_p50), "ms", "lower",
+             gate=jitter(vs_v1_2_2(1.15)), samples=read_p50)
+    read_p99 = [r[3] for r in runs]
+    ctx.emit("read_p99_ms_paced", median(read_p99), "ms", "lower", gate=jitter(info()),
+             samples=read_p99)
     ctx.emit("feeds", c.dbsize(), "keys", "higher", gate=EXACT)
 
 

@@ -205,15 +205,113 @@ pub(crate) fn peer_socket_addr(peer_ip: &str) -> std::net::SocketAddr {
         .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
 }
 
+/// How long a MEET waits for its reply: the peer answers once it has saved
+/// this node as a member, which on a busy disk can take seconds (#808).
+const MEET_REPLY_WAIT: Duration = Duration::from_secs(30);
+
+/// How long a MEET is tried again, once the peer has been reached, before
+/// it is given up; and how long after that a heartbeat from the peer takes
+/// it up again (see `ClusterState::meets_given_up`).
+const MEET_GIVE_UP: Duration = Duration::from_secs(120);
+const MEET_RETRY: Duration = Duration::from_secs(1);
+const MEET_RESUME_FOR_MS: u64 = 3_600_000;
+
 /// Send a MEET to the given peer, await its PONG, and incorporate the
 /// peer into our routing table. This is what CLUSTER MEET fires off.
+///
+/// The peer answers once it has saved this node as a member; this node
+/// makes it one once it has saved it in turn (`admit_met_node`). Either
+/// save can fail or be slow, and the peer may then have this node as a
+/// member while this node does not have it: its heartbeats would not be
+/// heard. So once the peer has been reached, the MEET is sent again until
+/// both ends have the other, for up to [`MEET_GIVE_UP`]; a peer never
+/// reached is given up at once.
 pub async fn send_meet(
     state: Arc<ClusterState>,
     peer_ip: String,
     peer_bus_port: u16,
 ) -> Result<(), String> {
-    let addr = format!("{peer_ip}:{peer_bus_port}");
+    let key = format!("{peer_ip}:{peer_bus_port}");
+    state.meets_given_up.lock().remove(&key);
+    let give_up = tokio::time::Instant::now() + MEET_GIVE_UP;
+    let mut reached = false;
+    let result = loop {
+        match meet_once(&state, &peer_ip, &key).await {
+            Ok(()) => break Ok(()),
+            Err((was_reached, e)) => {
+                reached |= was_reached;
+                if !reached || tokio::time::Instant::now() >= give_up {
+                    break Err(e);
+                }
+                log_verbose!("Cluster: MEET {key}: {e}; trying again");
+                tokio::time::sleep(MEET_RETRY).await;
+            }
+        }
+    };
+    if result.is_err() && reached {
+        state
+            .meets_given_up
+            .lock()
+            .insert(key, now_ms() + MEET_RESUME_FOR_MS);
+    }
+    result
+}
 
+/// Take up a MEET given up after its peer was reached, now that the peer
+/// sends this node a heartbeat: it has this node as a member, and this node
+/// does not have it (see [`send_meet`]). Only the address the MEET was sent
+/// to does this, and only for an hour after.
+pub(crate) fn resume_given_up_meet(state: &Arc<ClusterState>, ip: &str, bus_port: u16) {
+    let key = format!("{ip}:{bus_port}");
+    let resume = {
+        let mut given_up = state.meets_given_up.lock();
+        given_up.retain(|_, until| *until > now_ms());
+        given_up.remove(&key).is_some()
+    };
+    if !resume {
+        return;
+    }
+    let Some(bus) = state.bus_runtime.get() else {
+        return;
+    };
+    log_info!("Cluster: {key}, met before, calls on this node: meeting it again");
+    let (state, ip) = (Arc::clone(state), ip.to_string());
+    bus.spawn(async move {
+        if let Err(e) = send_meet(state, ip, bus_port).await {
+            log_warn!("Cluster: MEET {key} failed again: {e}");
+        }
+    });
+}
+
+/// `addr` in `ClusterState::meets` for as long as this lives.
+struct Awaiting<'a> {
+    state: &'a ClusterState,
+    addr: String,
+}
+
+impl<'a> Awaiting<'a> {
+    fn new(state: &'a ClusterState, addr: &str) -> Self {
+        state.meets.lock().insert(addr.to_string());
+        Self {
+            state,
+            addr: addr.to_string(),
+        }
+    }
+}
+
+impl Drop for Awaiting<'_> {
+    fn drop(&mut self) {
+        self.state.meets.lock().remove(&self.addr);
+    }
+}
+
+/// One MEET and its answer: `Err((reached, why))`, `reached` if the peer
+/// could be connected to.
+async fn meet_once(
+    state: &Arc<ClusterState>,
+    peer_ip: &str,
+    addr: &str,
+) -> Result<(), (bool, String)> {
     // Build our MEET from current state.
     let meet = {
         let nodes = state.nodes.read();
@@ -229,22 +327,37 @@ pub async fn send_meet(
             sender_config_epoch: me.config_epoch,
         }
     };
-
-    match exchange(&state, &addr, &meet, Duration::from_secs(5)).await? {
-        Some(reply @ BusMessage::Pong { .. }) => {
-            // The answer to our own MEET is the one message from an unknown
-            // node that is taken at its word.
-            crate::cluster::bus::listener::accept_meet_reply(
-                &state,
-                reply,
-                peer_socket_addr(&peer_ip),
-            );
-            state.save_soon();
-            Ok(())
-        }
-        Some(_) => Err("unexpected reply to MEET".into()),
-        None => Err("MEET reply timed out".into()),
+    let mut sock = connect(state, addr, Duration::from_secs(5))
+        .await
+        .map_err(|e| (false, e))?;
+    // The handshake entry is kept while the answer, and the saves at both
+    // ends it waits on, are (see `ClusterState::meets`).
+    let _awaiting = Awaiting::new(state, addr);
+    let reply = match round_trip(state, &mut sock, addr, &meet, MEET_REPLY_WAIT).await {
+        Answer::Reply(reply) => *reply,
+        Answer::Closed => return Err((true, "the peer did not answer the MEET".into())),
+        Answer::TimedOut => return Err((true, "MEET reply timed out".into())),
+        Answer::Failed(e) => return Err((true, e)),
+    };
+    let BusMessage::Pong { .. } = reply else {
+        return Err((true, "unexpected reply to MEET".into()));
+    };
+    // The answer to our own MEET is the one message from an unknown node
+    // that is taken at its word. Off the bus's thread: the node is saved
+    // before it is a member (#808).
+    let peer = peer_socket_addr(peer_ip);
+    let accepting = Arc::clone(state);
+    let admitted = crate::cpus::spawn_blocking(move || {
+        crate::cluster::bus::listener::accept_meet_reply(&accepting, reply, peer)
+    })
+    .await
+    .map_err(|e| (true, format!("accepting the reply to MEET: {e}")))?;
+    if !admitted {
+        return Err((true, "could not save the peer as a member".into()));
     }
+    // Saved: by the admission, and what the reply told of it, after, by
+    // `apply_heartbeat`.
+    Ok(())
 }
 
 /// Add a HANDSHAKE placeholder for a peer we've never spoken to.
@@ -256,7 +369,12 @@ pub async fn send_meet(
 /// detector removes it if the handshake has not completed within a node
 /// timeout — a MEET to an address nobody answers on used to leave a
 /// `handshake` row in `CLUSTER NODES` for as long as the process lived.
-pub fn insert_handshake_placeholder(state: &ClusterState, ip: &str, client_port: u16) -> bool {
+pub fn insert_handshake_placeholder(
+    state: &ClusterState,
+    ip: &str,
+    client_port: u16,
+    bus_port: u16,
+) -> bool {
     let mut nodes = state.nodes.write();
     // Already known by address?
     for n in nodes.values() {
@@ -265,12 +383,7 @@ pub fn insert_handshake_placeholder(state: &ClusterState, ip: &str, client_port:
         }
     }
     let temp_id = crate::cluster::node::generate_node_id();
-    let mut node = ClusterNode::new(
-        temp_id,
-        ip.to_string(),
-        client_port,
-        client_port.saturating_add(10000),
-    );
+    let mut node = ClusterNode::new(temp_id, ip.to_string(), client_port, bus_port);
     node.flags |= NodeFlags::HANDSHAKE;
     node.ping_sent_ms = now_ms();
     nodes.insert(temp_id, node);
