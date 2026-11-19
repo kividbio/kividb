@@ -219,7 +219,13 @@ impl Server {
     fn start_replica(master: &Server) -> Self {
         let dir = tempfile::tempdir().unwrap().keep();
         let port = master.port.to_string();
-        Self::start_in(dir, "tokio", false, &["--replicaof", "127.0.0.1", &port], &[])
+        Self::start_in(
+            dir,
+            "tokio",
+            false,
+            &["--replicaof", "127.0.0.1", &port],
+            &[],
+        )
     }
 
     fn start_in(
