@@ -4929,7 +4929,7 @@ fn in_group() -> bool {
 
 /// Whether this thread runs a script or a transaction (a propagation group
 /// is open): what it calls was admitted with it, and is not refused on its
-/// own (`aof::refusal_while_failing`).
+/// own (`aof::refused_while_failing`).
 pub(crate) fn in_propagation_group() -> bool {
     in_group()
 }

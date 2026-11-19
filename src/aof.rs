@@ -758,7 +758,7 @@ pub fn log_superseded() {
     // for the writer is. Their replies, if any wait, go out as for a disk
     // that is behind.
     let _log = LOG.lock();
-    if HAS_UNWRITTEN.swap(false, Ordering::AcqRel) {
+    if set_unwritten(false) {
         let mut held = UNWRITTEN.lock();
         log_warn!(
             "AOF: {} bytes of records that could not be written to {AOF_PATH} are of the dataset a \
@@ -1342,7 +1342,7 @@ pub fn acks_wait() -> bool {
 /// For a connection's loop, before a command runs: whether the replies of
 /// its batch wait for the AOF (`wait`), because the command may write a
 /// record ([`may_log`]). While the log cannot be written, such a command is
-/// refused (see [`refusal_while_failing`]) and writes nothing, and its
+/// refused (see [`refused_while_failing`]) and writes nothing, and its
 /// reply would wait for records of others the disk has not taken: instead,
 /// where [`AOF_WRITTEN`] stands is noted in `refused_from`, and the batch
 /// waits only if a record was queued since (see [`take_wait`]): the command
@@ -1873,7 +1873,7 @@ fn write_queued(
             held.bytes = batch;
             held.barriers = std::mem::take(&mut barriers);
             hold_no_more_than_the_limit(held.bytes.len());
-            HAS_UNWRITTEN.store(true, Ordering::Release);
+            set_unwritten(true);
             drop(held);
             // The records before a turn-over's mark are the old log's: with
             // some not written, the log is not turned over, and the
@@ -1884,7 +1884,7 @@ fn write_queued(
             return (wrote, released);
         }
         if took_unwritten {
-            HAS_UNWRITTEN.store(false, Ordering::Relaxed);
+            set_unwritten(false);
             log_warn!("AOF: the records that could not be written to {AOF_PATH} are written now");
         }
         wrote |= !batch.is_empty();
@@ -2310,8 +2310,19 @@ static UNWRITTEN: parking_lot::Mutex<Unwritten> = parking_lot::const_mutex(Unwri
 /// Whether [`UNWRITTEN`] holds anything: read with the log locked.
 static HAS_UNWRITTEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Set [`HAS_UNWRITTEN`], with the log locked, and the flag in the write
+/// gate's one load (`pause::set_aof_failing`) that has writes check whether
+/// they are refused. Whether it was set before.
+fn set_unwritten(on: bool) -> bool {
+    let was = HAS_UNWRITTEN.swap(on, Ordering::AcqRel);
+    if was != on {
+        crate::pause::set_aof_failing(on);
+    }
+    was
+}
+
 /// Whether the AOF has records it could not write: `aof_last_write_status`,
-/// and the refusal of writes (see [`refusal_while_failing`]).
+/// and the refusal of writes (see [`refused_while_failing`]).
 #[inline]
 pub fn write_failing() -> bool {
     HAS_UNWRITTEN.load(Ordering::Relaxed)
@@ -2339,7 +2350,7 @@ pub fn unwritten_bytes() -> usize {
 }
 
 /// The most [`UNWRITTEN`] holds. While anything is held, writes from
-/// clients are refused (see [`refusal_while_failing`]), so what is held is
+/// clients are refused (see [`refused_while_failing`]), so what is held is
 /// the batch that failed, what was queued before the refusal began (the
 /// writes in flight, at most [`MAX_AOF_PASS_BYTES`] a pass), and what is not
 /// refused: a replica's stream from its master, and the deletes of keys
@@ -2386,13 +2397,9 @@ fn note_write_error(e: &std::io::Error) {
 /// the log fails.
 #[cold]
 #[inline(never)]
-pub(crate) fn refusal_while_failing(
-    cmd: &[&[u8]],
-    name: &str,
-    applied_from_master: bool,
-) -> Option<Vec<u8>> {
+pub(crate) fn refused_while_failing(cmd: &[&[u8]], name: &str, applied_from_master: bool) -> bool {
     if applied_from_master || crate::replication::in_propagation_group() {
-        return None;
+        return false;
     }
     // A `SELECT` is logged, and changes no data: served.
     let writes = crate::replication::command_mutates_for_replication(name, cmd)
@@ -2404,7 +2411,7 @@ pub(crate) fn refusal_while_failing(
             .iter()
             .any(|s| name.eq_ignore_ascii_case(s.as_bytes()))
     });
-    (writes || script).then(misconf)
+    writes || script
 }
 
 /// Whether a transaction is refused at its `EXEC` while the log cannot be
@@ -2425,6 +2432,8 @@ pub(crate) fn exec_refusal_while_failing(queued: &[Vec<Vec<u8>>]) -> Option<Vec<
 }
 
 /// `-MISCONF Errors writing to the AOF file: <why>`, Redis's words.
+#[cold]
+#[inline(never)]
 pub(crate) fn misconf() -> Vec<u8> {
     format!(
         "-MISCONF Errors writing to the AOF file: {}\r\n",

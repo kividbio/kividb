@@ -75,8 +75,12 @@ const HANDOFF_PAUSE: u64 = 1;
 const KEYS_MOVING: u64 = 2;
 /// [`HANDOFF`]: a `CLIENT PAUSE` may be in force ([`pause_clients`]).
 const CLIENT_PAUSE: u64 = 4;
+/// [`HANDOFF`]: the AOF holds records the disk would not take, and writes
+/// are refused (`aof::refused_while_failing`): the same one load in the
+/// write gate finds it.
+const AOF_FAILING: u64 = 8;
 /// [`HANDOFF`]: one more time keys left here or a slot changed state.
-const ROUTES_MOVED: u64 = 8;
+const ROUTES_MOVED: u64 = 16;
 /// [`HANDOFF`]: the bits below the count.
 const BITS: u64 = ROUTES_MOVED - 1;
 
@@ -705,6 +709,17 @@ pub fn routes_moved_since(routed: u64) -> bool {
 /// (#331). In a cluster only.
 pub(crate) fn routes_moved() {
     HANDOFF.fetch_add(ROUTES_MOVED, Ordering::SeqCst);
+}
+
+/// The AOF holds records the disk would not take, or no longer does
+/// (`aof::UNWRITTEN`, with the log locked): a write that enters the write
+/// gate checks whether it is refused (`checked_in_gate`).
+pub(crate) fn set_aof_failing(on: bool) {
+    if on {
+        HANDOFF.fetch_or(AOF_FAILING, Ordering::SeqCst);
+    } else {
+        HANDOFF.fetch_and(!AOF_FAILING, Ordering::SeqCst);
+    }
 }
 
 /// `MIGRATE` holds keys here, or no longer does (`key_moves`, under its

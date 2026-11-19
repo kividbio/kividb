@@ -1434,6 +1434,17 @@ fn checked_in_gate(
     routed: &mut crate::cluster::routing::Routed,
     write_gate: &mut Option<crate::write_gate::WriteGuard>,
 ) -> Option<Vec<u8>> {
+    // While the AOF cannot be written, what would be logged is refused, as
+    // Redis refuses it (`MISCONF`): a write, or a script that may make some,
+    // before it touches anything. Found by the one load that brought the
+    // write here (`pause::writes_must_check`): nothing more for a write
+    // otherwise, and nothing for a read.
+    if crate::aof::write_failing()
+        && crate::aof::refused_while_failing(ctx.cmd.as_slice(), name, ctx.apply_replication)
+    {
+        *write_gate = None;
+        return Some(crate::aof::misconf());
+    }
     loop {
         // Not for `SCRIPT LOAD` or `SCRIPT FLUSH`: they change the script
         // cache, not the dataset, and are sent to nobody (#705), so a
@@ -1918,17 +1929,6 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     let writes_operation = replication::command_mutates_for_replication(name, &ctx.cmd);
     let script = matches!(name, "EVAL" | "EVALSHA" | "FCALL");
     let gated = (writes_operation && name != "MIGRATE" && name != "FT.DROPINDEX") || script;
-
-    // While the AOF cannot be written, what would be logged is refused, as
-    // Redis refuses it (`MISCONF`): a write, or a script that may make some.
-    // One relaxed load a write otherwise; none for a read.
-    if (writes_operation || script)
-        && crate::aof::write_failing()
-        && let Some(refusal) =
-            crate::aof::refusal_while_failing(ctx.cmd.as_slice(), name, ctx.apply_replication)
-    {
-        return refusal;
-    }
 
     // The first `SELECT` of a database other than 0 switches every write to
     // carrying a `SELECT` of its own, and has to wait out the writes on
