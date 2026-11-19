@@ -1452,13 +1452,44 @@ fn ft_knn_past_most_due_nearest_vectors() {
     }
 }
 
+/// The ten nearest of index `index` around the origin, nearest first, each
+/// key with its distance.
+fn knn_scored(c: &mut Conn, index: &str) -> Vec<(String, String)> {
+    let origin = vec2(0.0, 0.0);
+    let args: [&[u8]; 12] = [
+        b"FT.SEARCH",
+        index.as_bytes(),
+        b"*=>[KNN 10 @vec $q]",
+        b"PARAMS",
+        b"2",
+        b"q",
+        &origin,
+        b"RETURN",
+        b"1",
+        b"__vec_score",
+        b"DIALECT",
+        b"2",
+    ];
+    let reply = cmd_bytes(c, &args);
+    reply.arr()[1..]
+        .chunks(2)
+        .map(|row| {
+            let score = row[1].arr().get(1).map_or("?", |s| s.s()).to_string();
+            (row[0].s().to_string(), score)
+        })
+        .collect()
+}
+
 /// Queries that measure every vector of an HNSW graph while writers add,
 /// overwrite and delete documents in it: the server keeps answering (a
 /// measured pass that took the graph's locks in the other order than an
 /// insert hung it). Several writers, each on its own connection, so that
 /// inserts, overwrites and deletes run at once beside the queries; every
 /// connection gives up after 10 s without a reply, so a hang fails the test
-/// instead of holding it.
+/// instead of holding it. Each query gets ten: `w:2900` to `w:2999` are
+/// written over but never deleted, and a fresh key (the nearest the query
+/// sees) deleted while the query measured it gives its place to the next
+/// nearest; queries came back one or two short.
 #[test]
 fn ft_knn_measuring_every_vector_beside_writers() {
     let server = Server::start(&[]);
@@ -1485,7 +1516,8 @@ fn ft_knn_measuring_every_vector_beside_writers() {
             scope.spawn(|| {
                 let mut q = conn();
                 while !stop.load(Ordering::Relaxed) {
-                    assert_eq!(knn(&mut q, "w", "*=>[KNN 10 @vec $q]").len(), 10);
+                    let got = knn_scored(&mut q, "w");
+                    assert_eq!(got.len(), 10, "{got:?}");
                 }
             });
         }

@@ -3824,10 +3824,14 @@ fn into_results(
         }
         found.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
     }
+    // A node deleted while the search let a writer in is left out before
+    // the cut, so that the next nearest takes its place: the cut first gave
+    // one fewer than asked for, which a KNN beside deletes returned as all
+    // there was. No node is deleted while `nodes` is held.
+    found.retain(|(_, id)| slots.is_live(*id as usize));
     found.truncate(k);
     found
         .into_iter()
-        .filter(|(_, id)| slots.is_live(*id as usize))
         .filter_map(|(score, id)| {
             nodes.get(id as usize).map(|n| KnnResult {
                 key: n.key.clone(),
