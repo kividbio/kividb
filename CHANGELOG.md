@@ -675,19 +675,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     this release writes and the other way round. `MEMORY USAGE`, eviction
     and lazy freeing count a block or an array as the one allocation it is.
 
-- **Lists take about half the memory (#297).** A list's elements are kept
-  end to end in chunks of up to 64, each element between two copies of its
-  length, where every element had an allocation, a shared header and a slot
-  of its own. Bytes of `used_memory` an element, 32-byte elements, 3M
-  elements in lists of each size:
+- **Lists take about half the memory, short elements a fifth (#297).** A
+  list's elements are kept end to end in chunks of up to 64, each element
+  between two copies of its length (one byte each for an element shorter
+  than 128 bytes), where every element had an allocation, a shared header
+  and a slot of its own. Bytes of `used_memory` an element, 32-byte
+  elements, 1M elements in lists of each size (3M in one list):
 
   | elements a list | 1.2.2 | now | Redis 8.10.2 |
   |---:|---:|---:|---:|
-  | 10 | 76.0 | 48.8 | 45.0 |
-  | 100 | 65.2 | 38.4 | 36.4 |
-  | 1,000 | 64.1 | 36.7 | 34.6 |
-  | 100,000 | 68.5 | 36.7 | 34.3 |
-  | 3,000,000 | 69.8 | 36.7 | 34.3 |
+  | 10 | 75.6 | 46.4 | 44.0 |
+  | 100 | 65.2 | 36.4 | 36.4 |
+  | 1,000 | 64.1 | 34.7 | 34.6 |
+  | 100,000 | 68.5 | 34.7 | 34.3 |
+  | 3,000,000 | 69.8 | 34.7 | 34.3 |
+
+  Six-byte job ids, 100,000 a list: 44.5 bytes an element in 1.2.2, 8.7
+  now, 5.0 in Redis (which keeps such numbers as integers). A list drained
+  to a tenth of its length gives back the room it kept for the rest.
 
   Suite `21-list-memory` of the 1.3.0 regression suite measures this again.
   - A push or a pop at either end moves nothing in its chunk: each chunk
