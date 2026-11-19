@@ -91,6 +91,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`cluster-announce-client-ipv4` and `cluster-announce-client-ipv6` (#847),
+  as in Valkey 8.** The address a client is told to reach a node at, where it
+  is not the one nodes use between themselves: a client connected over IPv6
+  gets the node's `-ipv6`, any other its `-ipv4`, and the node's address when
+  the one for its family is unset. Redirects (`MOVED`, `ASK`), `CLUSTER SLOTS`,
+  `SHARDS` (`ip` and `endpoint`), `NODES` and `REPLICAS` use them; the bus
+  keeps `cluster-announce-ip`. Set at start or with `CONFIG SET` (empty unsets;
+  a bad value is `Invalid IPv4 address` / `Invalid IPv6 address`, at start
+  too), they reach the other nodes in the node's next heartbeats as `cip4=`
+  and `cip6=` tokens of its flags string, which a 1.2 node ignores. Only a
+  node's own heartbeats carry them, never gossip, as in Valkey. They are not
+  saved in `nodes.conf`: a node learns a peer's again from the peer's first
+  heartbeat, as for `cluster-announce-client-port`. Tools that start cluster
+  nodes for Valkey pass `--cluster-announce-client-ipv4` to every node, which
+  KiviDB refused at start.
+
 - **`worker-cpu-affinity auto`: each io_uring worker on a CPU of its own (#894).** Off by
   default. With `auto`, worker N is bound to the N-th CPU the process may use, when the
   workers are exactly as many as those CPUs (a cpuset or `taskset` of `--threads` CPUs, the
@@ -498,6 +514,49 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (a differential fuzz of 21,000 scripts against the tree before, RESP2 and
   RESP3). `return 1` and a lock's compare-and-delete still cost 18 % and
   11 % more than in Redis on one worker, around the call rather than in it.
+
+- **An HNSW index is built 4x faster from one client (#760).** A vector
+  written to an HNSW index is put in its graph's backlog and linked by
+  helper threads (`search-index-threads`, startup only: a number, or
+  `auto`, the default: none under a CPU quota such as a container's `--cpus`
+  or a Kubernetes CPU limit, none below 8 CPUs, otherwise (CPUs - 2) / 2;
+  `SCHED_IDLE` on Linux; under a CPU limit builds run at 1.2's speed unless
+  the setting is given a number),
+  where up to 1.2 the writing connection's thread linked it inside the
+  write: one client loading documents built the graph on one CPU. A search
+  measures every vector of the backlog exactly beside the graph's, so a
+  document is found from the moment its `HSET` is answered, as before; the
+  backlog holds at most 1,024 vectors and 128 Ki floats, and a writer that
+  finds it full links its vector itself. `FT.CREATE` over existing
+  documents, a restart and a replica's full sync hand their vectors over the
+  same way. `FT.INFO` shows `hnsw_backlog` and `hnsw_backlog_bytes`; the
+  snapshot format is unchanged (a vector still waiting at a save is put in
+  the graph at load, as 1.2.2 also does). An Azure D8s_v5, one client,
+  `M 16 EF_CONSTRUCTION 200`, medians of 3, 1.2.2 / 1.3.0 / Redis 8.10.2:
+  50,000 384-d documents 1,615 / 6,495 / 7,783 a second; 200,000 64-d
+  2,556 / 9,970 / 16,081; `FT.CREATE` over 50,000 written 1,666 / 2,746 /
+  7,442; peak RSS 215 / 218 / 248 MiB. Recall at a given `EF_RUNTIME` is
+  unchanged, fresh and after rounds of overwrites and deletes. GET/SET from
+  other clients during such a load: 144k a second at a p99 of 1.08 ms
+  (before: 137k, 0.39 ms, p99.9 25 against 11.6 ms). The build rates
+  above were taken with four helpers on the 8 vCPUs and the GET/SET ones
+  with three on 6 (`auto` now starts three on 8 CPUs, none on 6). On a server of fewer
+  than 8 CPUs builds run at 1.2's speed by default, and
+  `search-index-threads 1` (or more) trades serving latency for build
+  speed: with every CPU of a 4-vCPU server busy, one helper gives a GET/SET
+  p99 of 2.1 ms against 1.6 ms with none and builds 3,190 documents a
+  second against 1,540, and the `HSET` p99 of writers not on the bulk
+  loader's worker goes from 2.3-2.7 to 4.5-4.7 ms (a writer on that worker
+  waits behind its pipelines either way); two give 2.6 ms and 3,620. A
+  search takes
+  the backlog's vectors before it walks the graph and does not hold the
+  backlog meanwhile, so a long filtered search keeps no write waiting.
+  Writes over a waiting key queue no more work for the helpers, and a
+  dropped or compacted graph is freed at once. Unfiltered KNN was
+  never slower than Redis at the same recall: a KNN looks at at least 50
+  candidates, so the default `EF_RUNTIME 10` gives recall 0.38 at 2,844 q/s
+  where Redis gives 0.11 at 4,276 and 0.42 at 2,006 (`EF_RUNTIME 80`); see
+  docs/PERFORMANCE.md.
 
 - **Writes on a master with a replication backlog and no replica no
   longer wake the replication thread one by one (#894).** A master that
@@ -1059,6 +1118,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`bind ::` and `bind ::1` start.** The address was joined to the port as
+  `:::6379`, which is not one, and the server exited with "invalid socket
+  address syntax" (the bus and TLS listeners too); only `[::]` worked. An IPv6
+  address is put in brackets now. KiviDB still listens on one address.
+
 - **A node met just before the whole cluster stops is still a member after
   it starts again (#808).** Both ends of a `CLUSTER MEET` save the other
   to `nodes.conf`, synced, before showing it as a member (the receiving
@@ -1127,6 +1191,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   timeout, or `CLIENT UNBLOCK`) woke the next client waiting on its key
   for no reason, which is what opened that window: Redis's unit/pause
   failed on it now and then.
+
+- **Writes made during an HNSW compaction are kept in the rebuilt graph.**
+  Writes made while a compaction rebuilds a graph now go to the new graph
+  too, from before the copy, and the copy leaves a key a write touched as
+  the write left it. Such a write goes through each graph's backlog, as
+  any other does, instead of being linked into both graphs inside the
+  write.
 
 - **Sorted-set commands read integers as Redis does.** `ZREMRANGEBYRANK
   key x 5` took `x` as 0 and removed members; it now answers `ERR value is

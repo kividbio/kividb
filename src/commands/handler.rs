@@ -430,7 +430,7 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
             crate::commands::lua::script_settle_slot(slot);
             None
         }
-        crate::cluster::routing::RouteDecision::TryAgain => decision.refusal(),
+        crate::cluster::routing::RouteDecision::TryAgain => decision.refusal(false),
         crate::cluster::routing::RouteDecision::Passthrough => None,
         _ => Some(resp_error(
             "ERR Script attempted to access a non local key in a cluster node",
@@ -1225,7 +1225,7 @@ fn routed_again_in_gate(
         || registry.get_readonly(client_id),
         |key| crate::read_lock!(crate::store::get_shard(&store[db], key)).contains_key(key),
     )
-    .refusal()
+    .refusal(ctx.peer_ipv6)
 }
 
 // The parts of `run_command` that a plain command on a standalone master
@@ -1289,7 +1289,7 @@ fn route_on_arrival(
                 info.asking = false;
             });
         }
-        if let Some(refusal) = decision.refusal() {
+        if let Some(refusal) = decision.refusal(ctx.peer_ipv6) {
             return Some(refusal);
         }
         crate::cluster::routing::stall_for_test(name, ctx.cmd.as_slice());
@@ -1416,7 +1416,7 @@ fn checked_in_gate(
                             .contains_key(key)
                 },
             );
-            if let Some(refusal) = decision.refusal() {
+            if let Some(refusal) = decision.refusal(ctx.peer_ipv6) {
                 return Some(refusal);
             }
         }
@@ -1513,7 +1513,7 @@ fn refused_before_the_gates(ctx: &Ctx, name: &str) -> bool {
                 crate::read_lock!(crate::store::get_shard(&store[db], key)).contains_key(key)
             },
         );
-        if decision.refusal().is_some() {
+        if decision.refusal(ctx.peer_ipv6).is_some() {
             return true;
         }
     }
@@ -3718,6 +3718,7 @@ mod replica_loading_gate_tests {
             apply_replication: apply_stream,
             skip_write_side_effects: false,
             peer_addr: peer.as_str(),
+            peer_ipv6: crate::cluster::is_ipv6_peer(peer.as_str()),
             monitor_registry: &monitor_registry,
             authenticated_user: "default",
             tracking_table: &tracking_table,

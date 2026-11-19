@@ -43,6 +43,8 @@ and why.
 | `27-ratelimit-restarted` | #894 | envoyproxy/ratelimit's checks (`INCRBY` + `EXPIRE` on two keys, four commands in one write, 65 connections with 2 ms of the limiter's own time after each) beside 100 connections of pipelined `INCRBY` + `EXPIRE` pairs at 0, 50k and 100k commands a second, on a server restarted from its own snapshot of 100,000 keys (KiviDB keeps the replication backlog then: `repl_backlog_active` is kept in the raw data); of the 4 vCPUs the server on 0 and 2 (`--threads 2`), the checks on 1, the load on 3: checks a second and their p99, every row gated; recorded on a D4s_v5 (`results/pr-894-d4s_v5`). Needs a C compiler (`lib/ratelimit_load.c`). The issue's own shape, with the clients on CPUs of their own up to 300k, needs 8 CPUs: run the suite's load by hand as the PR describes |
 | `24-snapshot-size` | #879 | `SAVE` of #879's dataset (`DEBUG POPULATE 6000000 k 150`) and of a collections mix (200,000 hashes of 10 fields, 50,000 each of sets, sorted sets and lists of 20), each twice: `-default` (the candidate as it starts, `rdbcompression no`) and `-yes` (the suite sets `CONFIG SET rdbcompression yes` on the candidate): the snapshot's size, the `SAVE` time (median of 3 after a warm-up) and the time a new server takes to load it (best of 2). Gates: `-yes` keeps 60 % of the size gain over v1.2.2 and #879's dataset within 1.5x of Redis's `dump.rdb`; `-default` within 1 % of v1.2.2's size; the save at most 2.5x v1.2.2's time, the load 1.5x |
 | `25-centrifuge-scripts-publish` | #900 | centrifuge v0.40.1's history scripts with the arguments its broker sends (30-day meta TTL), whose 2-3 keys carry no hash tag (each runs alone, on the script-runner thread): `EVALSHA` of `broker_history_list.lua` and `broker_history_add_list.lua` from 16 connections (`scripts`, the `lua,tls` builds); `PUBLISH` to 1,000 channels nobody subscribes to, beside 4 idle subscribers, from 1 connection and from 8, pipeline 16 (`publish`): calls a second counted by the server; a round with any error reply, or a history list of the wrong length, fails the suite. Gates: 10 % and at most 1.05x worse than v1.2.2 in the same session (for now 1.08x for the 8-connection `PUBLISH`, where master is behind v1.2.2 with matching compilers; to go back to 1.05x when that gap is fixed) |
+| `26-vector-sets-ann` | #627 | Vector sets on real embeddings (glove-100, and LAION image embeddings at 768 dimensions; 100,000 vectors, and 1,000,000 with `VSET_1M=1`), `Q8` on every server, cosine: `VADD` a second (pipelined, 4 clients), `used_memory` and RSS a vector, then `VSIM ... COUNT 10 EF <ef>` at the first EF whose recall@10 against exact results is at least 0.95 (matched recall, not matched parameters): queries a second and p99 at 1, 16 and 100 connections. Redis 8.10.2 measured the same way, and Garnet v2.2.13 (`$GARNET_SERVER`, `--enable-vector-set-preview`, a preview) in Redis's run, kept in `raw["garnet"]`, not in rows. Gates: `VADD` at least 10x Redis, bytes a vector at most 0.8x, recall at least 0.95, q/s within 25 % of recorded |
+| `28-ft-hnsw` | #760 | `FT.CREATE ... VECTOR HNSW` (384-d, COSINE, M 16, EF_CONSTRUCTION 200) and 50,000 random documents written by one client in pipelines of 1,000: documents a second until all are in the graph (FT.INFO `hnsw_backlog` 0); recall@10 against exact and one client's KNN q/s and p99 at `EF_RUNTIME 100`; RSS a document. `pipeline`: the candidate as it starts (`search-index-threads auto`: no helper on the D4s_v5, below 8 CPUs), build within 10 % and at most 1.05x slower than v1.2.2 in the same session. `pipeline-n3`: the candidate with `--search-index-threads 3` (`auto` on 8 CPUs), build within 10 %, 60 % of the gain over v1.2.2 and at most 1.5x Redis's time when `REGRESS_REDISEARCH_SO` points at the query engine module. Both: q/s within 10 %, recall within 2 %, RSS 5 %. `beside` (`--threads 2`, the server on CPUs 0 and 2, so `auto` starts no helper; memtier GET/SET on 1, the loading client and a KNN probe over 8 connections on 3; 20,000 documents, then five rounds of 20 s): GET/SET p99 beside the build and the probe's fastest connection's KNN p50 beside the ingest, each at most 2x v1.2.2's in the same session and within its recorded value (50 % + 0.5 ms, 30 % + 0.2 ms); documents and GET/SET a second shown. Needs memtier_benchmark. Recorded on a D4s_v5 (`results/pr-942-d4s_v5-r3`) |
 | `29-unpipelined-commands` | 1.3.0 regression, never released | an API gateway's per-request commands (Tyk's) sent one at a time from 64 connections (`redis-benchmark -c 64`, no `-P`), io_uring and Tokio, against `--threads 1` (`uring1`, `tokio1`) and `--threads 2` (`uring2`, `tokio2`): `SET` of 385 bytes, `GET`, `INCR`, `PTTL`, `PUBLISH` of 177 bytes to no subscriber, a second each from the server's own `total_commands_processed`; the server pinned to its first CPUs, the client to the next (at most 6). Gate: each rate at most 1.05x worse than v1.2.2 in the same session; a row where the client used 95 % of its CPUs is shown, not gated (on a `Standard_D4s_v5`, the two-worker rows); `min_cpus=4`: not run on a smaller machine |
 | `30-script-call-cost` | #901 | server CPU per call and calls a second of short scripts by `EVALSHA` (`redis-benchmark`, 32 connections, one KiviDB worker): Tyk's sliding-log limiter over 5,000 keys of 144 members, the compare-and-delete lock release of #880 on keys another owner holds, and `return 1`, each also with its keys under a hash tag. Needs a `lua,tls` candidate (`--candidate-full`, #921). Gates: CPU per call within 10 % of the recorded value and at most 0.93x v1.2.2's for Tyk, 1.03x for the others; calls a second 10 % |
 | `31-zset-memory` | #825, #297 (step 4) | `used_memory` per sorted-set member, 1,000,000 members in sets of 10, 100, 128, 129 and 1,000: 14-byte members (`membr:<i>`), scores whole (`int`) or with a fraction (`float`); `OBJECT ENCODING` of each size recorded exactly (`listpack` up to 128, `skiplist` past it); the large sets (129 and 1,000) as guard rows |
@@ -140,6 +142,17 @@ redis-server must match `pins.redis_sha256`
 elsewhere differs, so set `REGRESS_REDIS_SHA256` to use it). Suite 03 measures
 glibc malloc's give-back: a candidate that links mimalloc (a `lua` or `full`
 build) fails it on purpose.
+
+Suite 26 also uses h5py (pinned in `requirements.txt`), downloads its two
+datasets once into `$VSET_DATASETS` (default `$REGRESS_CACHE/datasets`:
+glove-100-angular from ann-benchmarks.com, 485 MB, and
+laion-img-emb-768-1M-cosine from redis/vector-db-benchmark's list, 3.1 GB,
+both over https and SHA-256 checked), and needs `GARNET_SERVER`, the
+GarnetServer of Garnet v2.2.13 (`linux-x64-based.tar.xz`, SHA-256
+`23a4f19d5ffd1c533f1db7cc9ef4c00a5f811aa2914544cc819fd23215fa557c`, on .NET
+10), or `GARNET_SERVER=none` to leave Garnet out. Its 1,000,000-vector
+configurations run only with `VSET_1M=1`, not with `FULL=1`: Redis loads
+them at under 1,000 `VADD`/s, so they need `SUITE_TIMEOUT=7200`.
 
 Suites 05-13 also use `redis-benchmark` and `redis-cli` from the directory of
 the Redis binary, numpy (pinned in `requirements.txt`, for
@@ -1179,6 +1192,48 @@ pattern row against Redis's 1.35M and 0.9 ms. The channel row is a guard:
 the 4 Python readers are near their limit there, so it catches a loss, not
 a gain. #851's PR has the pinned measurements (server on 2 vCPUs, clients
 on the other 2, a Rust client), where the difference is larger.
+
+## Recorded run, suite 26
+
+Recorded 2026-11-19 on an Azure Standard_D4s_v5 (Xeon Platinum 8370C),
+`--only 26 --record` (`GARNET_SERVER` set, `SUITE_TIMEOUT=3600`); the
+candidate is commit `6065c780` (#922 merged with master `5bd40b4b`),
+`cargo build --release` by rustc 1.100.0, KiviDB on `--threads 4`. Runs:
+`pr922-6065c780-d4s_v5` (recorded; the 100,000-vector configurations only,
+`VSET_1M` unset) and `pr922-6065c780-d4s_v5-rerun` (the noise check: every gate
+passed, host speed 1.04x). A run takes 759 s. The rerun's candidate `VSIM` was
+1.5x faster than the recorded run's (193 / 344 / 369 a second on glove100, 56 /
+142 / 143 on laion768), Redis's 1.0-1.25x: this suite's `VSIM` rates move more
+between runs than the 25 % gate, and the recorded values are the lower run's.
+
+| config | metric | v1.2.2 | candidate | Redis 8.10.2 |
+|---|---|---:|---:|---:|
+| glove100_100k | `VADD` a second | 179,699 | 177,837 | 1,935 |
+| glove100_100k | `used_memory` a vector, bytes | 496 | 196 | 869 |
+| glove100_100k | EF, recall@10 | 10, 1.000 | 10, 0.985 | 640, 0.971 |
+| glove100_100k | `VSIM` a second at 1 / 16 / 100 connections | 81 / 196 / 187 | 125 / 279 / 277 | 463 / 1,182 / 1,166 |
+| glove100_100k | `VSIM` p99 ms at 1 / 16 / 100 | 14.1 / 106 / 1,059 | 9.7 / 78 / 873 | 3.8 / 26 / 174 |
+| laion768_100k | `VADD` a second | 102,935 | 89,907 | 1,600 |
+| laion768_100k | `used_memory` a vector, bytes | 3,168 | 864 | 1,526 |
+| laion768_100k | EF, recall@10 | 10, 0.998 | 10, 0.975 | 80, 0.966 |
+| laion768_100k | `VSIM` a second at 1 / 16 / 100 connections | 25 / 63 / 64 | 54 / 132 / 133 | 1,631 / 4,284 / 4,036 |
+| laion768_100k | `VSIM` p99 ms at 1 / 16 / 100 | 42.8 / 297 / 3,002 | 19.7 / 162 / 1,793 | 0.94 / 7.3 / 42.3 |
+
+KiviDB's `VSIM` is an exact scan (#710), so it needs no EF to reach the target
+and Redis's HNSW search is 3.7-30x faster on it at 100,000 vectors: the rows
+record that, they do not gate it against Redis. What is gated against Redis
+is where KiviDB is ahead: `VADD` (0.01x and 0.02x of Redis's time per vector,
+limit 0.1x) and memory (0.23x and 0.57x, limit 0.8x); recall is at least
+0.95 everywhere. The `VSIM` q/s rows hold within 25 % of the recorded value.
+v1.2.2's own `VSIM` is the same scan, 0.5-0.7x as fast, so the speed gates of
+this first recording were judged against the recorded values only.
+
+Garnet v2.2.13 (`raw["garnet"]` in `raw.tar.gz`, not a row), measured the same
+way: `VADD` 3,833 and 3,087 a second; EF 1,280 (recall 0.960) on glove100 and 80
+(0.971) on laion768; `VSIM` 187 / 567 / 568 a second on glove100 and
+1,244 / 4,070 / 4,213 on laion768 at 1 / 16 / 100 connections; RSS a vector
+10,517 and 14,005 bytes (it has no `used_memory`). It needs the .NET 10 runtime
+(`DOTNET_ROOT`; the tarball is framework-dependent).
 
 ## Recorded run, suite 29
 

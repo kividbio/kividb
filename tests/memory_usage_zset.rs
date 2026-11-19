@@ -163,7 +163,7 @@ fn usage_of(c: &mut Conn, keys: &[Vec<u8>], samples: Option<&str>) -> Vec<i64> {
 /// took the first time: nothing of them is left behind or counted twice.
 #[test]
 fn deleting_and_making_again_sorted_sets_gives_back_what_they_report() {
-    let server = Server::start();
+    let mut server = Server::start();
     let mut c = server.connect();
     let keys: Vec<Vec<u8>> = (0..2000).map(|i| b(format!("zset:{i}"))).collect();
     let make: Vec<Cmd> = keys
@@ -216,7 +216,7 @@ fn deleting_and_making_again_sorted_sets_gives_back_what_they_report() {
 /// one length give the same estimate from any sample.
 #[test]
 fn a_sorted_set_is_sampled_as_a_set_is() {
-    let server = Server::start();
+    let mut server = Server::start();
     let mut c = server.connect();
     c.pipeline(&[zadd(b"z", (0..1000).map(|i| (scattered(i), member(i))))]);
     let key = [b("z")];

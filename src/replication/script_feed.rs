@@ -1419,6 +1419,7 @@ mod tests {
             apply_replication: false,
             skip_write_side_effects: false,
             peer_addr: "127.0.0.1:1",
+            peer_ipv6: false,
             monitor_registry: &monitor_registry,
             authenticated_user: "default",
             tracking_table: &tracking_table,
