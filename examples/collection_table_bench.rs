@@ -7,6 +7,8 @@
 //! cargo run --release --example collection_table_bench -- latency [N [WORKLOAD [inline|deferred|today]]]
 //! cargo run --release --example collection_table_bench -- scan [N]
 //! cargo run --release --example collection_table_bench -- fill
+//! cargo run --release --example collection_table_bench -- random
+//! cargo run --release --example collection_table_bench -- chains
 //! valgrind --tool=callgrind --toggle-collect='*measured*' --cache-sim=yes \
 //!   target/release/examples/collection_table_bench ops STRUCT WORKLOAD N OP
 //! ```
@@ -15,7 +17,8 @@
 //!   hash (fields `f0..` = `v`), suite 19's (14-byte fields, 32-byte
 //!   values) and suite 17's sets (14-byte members; integers), at 1k, 100k
 //!   and 3M and just before and after the table's doublings near each.
-//! - `ops`: one operation `OP` (`hit`, `miss`, `insert`, `remove`, `scan`)
+//! - `ops`: one operation `OP` (`hit`, `miss`, `insert`, `remove`, `scan`,
+//!   `random`: a random element, `pop`: remove a random element)
 //!   on `STRUCT` (`table` or `today`) holding `N` elements of `WORKLOAD`
 //!   (`h764`, `s17`, `s17int`), for callgrind: everything outside the
 //!   `measured_*` function is excluded. Prints the operations done, to
@@ -23,7 +26,17 @@
 //! - `latency`: the slowest single inserts while filling to N (3M).
 //! - `scan`: a whole `scan` at COUNT 10 of N (1M) elements, per page.
 //! - `fill`: maximum fill 0.75 / 0.82 / 0.875: overflow share, groups read
-//!   per lookup and bytes per element (open question 1).
+//!   per lookup, bytes per element (open question 1), and the resizes with a
+//!   new seed random keys started (none).
+//! - `random`: wall-clock cost of a random element and of removing one, at
+//!   1k, 100k and 3M, against `IndexMap::get_index` and today's set's random
+//!   bucket.
+//! - `chains`: chain lengths at the fullest point (3,211,264 elements), as
+//!   counted and as the Poisson model has them.
+//!
+//! The fixed-seed constructor is for measurements that must repeat; server
+//! code cannot use it (`clippy.toml`).
+#![allow(clippy::disallowed_methods)]
 
 use std::alloc::Layout;
 use std::hint::black_box;
@@ -95,10 +108,47 @@ impl TodaySet {
             Err(_) => false,
         }
     }
+
+    /// `member_set::Table::random_bucket`: 64 random buckets, then a walk.
+    fn random_bucket(&self, rng: &mut StdRng) -> Option<usize> {
+        if self.table.is_empty() {
+            return None;
+        }
+        let buckets = self.table.num_buckets();
+        for _ in 0..64 {
+            let at = rng.gen_range(0..buckets);
+            if self.table.get_bucket(at).is_some() {
+                return Some(at);
+            }
+        }
+        use rand::seq::IteratorRandom;
+        let member = self.table.iter().choose(rng)?;
+        self.table
+            .find_bucket_index(self.hasher.hash_one(&**member), |have| {
+                Arc::ptr_eq(have, member)
+            })
+    }
+
+    fn random(&self, rng: &mut StdRng) -> Option<&Arc<[u8]>> {
+        self.table.get_bucket(self.random_bucket(rng)?)
+    }
+
+    /// `member_set::Table::pop_random`.
+    fn pop_random(&mut self, rng: &mut StdRng) -> Option<Arc<[u8]>> {
+        let at = self.random_bucket(rng)?;
+        let (taken, _) = self.table.get_bucket_entry(at).ok()?.remove();
+        let buckets = self.table.num_buckets();
+        if buckets > 64 && self.table.len() * 8 < buckets {
+            let hasher = &self.hasher;
+            self.table
+                .shrink_to(self.table.len() * 2, |have| hasher.hash_one(&**have));
+        }
+        Some(taken)
+    }
 }
 
-/// The system's memory, charged what glibc's malloc really takes for it: a
-/// chunk of the size plus 8, rounded up to 16, at least 32.
+/// The system's memory, entries charged what glibc's malloc really takes
+/// for them: a chunk of the size plus 8, rounded up to 16, at least 32.
 struct GlibcMemory;
 
 // SAFETY: `SystemMemory`'s blocks; only what is charged differs.
@@ -110,12 +160,15 @@ unsafe impl Memory for GlibcMemory {
         // SAFETY: the caller's promise.
         unsafe { SystemMemory::free(block, layout) }
     }
-    fn charged(layout: Layout) -> usize {
-        if layout.align() <= 16 {
-            ((layout.size() + 8 + 15) & !15).max(32)
-        } else {
-            layout.size()
-        }
+    fn alloc_entry(size: usize) -> NonNull<u8> {
+        SystemMemory::alloc_entry(size)
+    }
+    unsafe fn free_entry(block: NonNull<u8>, size: usize) {
+        // SAFETY: the caller's promise.
+        unsafe { SystemMemory::free_entry(block, size) }
+    }
+    fn entry_charged(size: usize) -> usize {
+        ((size + 8 + 15) & !15).max(32)
     }
 }
 
@@ -197,14 +250,14 @@ fn table_bytes<A: Memory>(w: Workload, n: usize) -> (usize, isize) {
     if w.is_hash() {
         let mut t = CollectionTable::<Fields, A>::with_capacity_and_seed(0, 1);
         for i in 0..n {
-            t.insert(w.key(i).as_bytes(), &w.value(i), None);
+            t.insert(w.key(i).as_bytes(), &w.value(i), None).unwrap();
         }
         while !t.step_resize(usize::MAX) {}
         (t.allocation_size(), counted() - before)
     } else {
         let mut t = CollectionTable::<Members, A>::with_capacity_and_seed(0, 1);
         for i in 0..n {
-            t.insert(w.key(i).as_bytes());
+            t.insert(w.key(i).as_bytes()).unwrap();
         }
         while !t.step_resize(usize::MAX) {}
         (t.allocation_size(), counted() - before)
@@ -316,7 +369,7 @@ fn measured_today_hash_get(t: &IndexHash, probes: &[String]) -> usize {
 fn measured_table_hash_insert(t: &mut CollectionTable<Fields>, probes: &[String]) -> usize {
     probes
         .iter()
-        .filter(|p| t.insert(black_box(p.as_bytes()), b"v", None))
+        .filter(|p| t.insert(black_box(p.as_bytes()), b"v", None).unwrap())
         .count()
 }
 
@@ -367,7 +420,7 @@ fn measured_today_set_contains(t: &TodaySet, probes: &[String]) -> usize {
 fn measured_table_set_insert(t: &mut CollectionTable<Members>, probes: &[String]) -> usize {
     probes
         .iter()
-        .filter(|p| t.insert(black_box(p.as_bytes())))
+        .filter(|p| t.insert(black_box(p.as_bytes())).unwrap())
         .count()
 }
 
@@ -421,6 +474,64 @@ fn measured_table_hash_scan(t: &CollectionTable<Fields>, pages: usize) -> usize 
     seen
 }
 
+#[inline(never)]
+fn measured_table_hash_random(t: &CollectionTable<Fields>, rng: &mut StdRng, k: usize) -> usize {
+    (0..k)
+        .map(|_| t.random(rng).map_or(0, |e| e.field.len()))
+        .sum()
+}
+
+#[inline(never)]
+fn measured_today_hash_random(t: &IndexHash, rng: &mut StdRng, k: usize) -> usize {
+    (0..k)
+        .map(|_| {
+            t.get_index(rng.gen_range(0..t.len()))
+                .map_or(0, |(f, _)| f.len())
+        })
+        .sum()
+}
+
+#[inline(never)]
+fn measured_table_set_random(t: &CollectionTable<Members>, rng: &mut StdRng, k: usize) -> usize {
+    (0..k).map(|_| t.random(rng).map_or(0, |m| m.len())).sum()
+}
+
+#[inline(never)]
+fn measured_today_set_random(t: &TodaySet, rng: &mut StdRng, k: usize) -> usize {
+    (0..k).map(|_| t.random(rng).map_or(0, |m| m.len())).sum()
+}
+
+#[inline(never)]
+fn measured_table_hash_pop(t: &mut CollectionTable<Fields>, rng: &mut StdRng, k: usize) -> usize {
+    (0..k)
+        .map(|_| t.remove_random(rng, |e| e.field.len()).unwrap_or(0))
+        .sum()
+}
+
+#[inline(never)]
+fn measured_today_hash_pop(t: &mut IndexHash, rng: &mut StdRng, k: usize) -> usize {
+    (0..k)
+        .map(|_| {
+            let at = rng.gen_range(0..t.len());
+            t.swap_remove_index(at).map_or(0, |(f, _)| f.len())
+        })
+        .sum()
+}
+
+#[inline(never)]
+fn measured_table_set_pop(t: &mut CollectionTable<Members>, rng: &mut StdRng, k: usize) -> usize {
+    (0..k)
+        .map(|_| t.remove_random(rng, |m| m.len()).unwrap_or(0))
+        .sum()
+}
+
+#[inline(never)]
+fn measured_today_set_pop(t: &mut TodaySet, rng: &mut StdRng, k: usize) -> usize {
+    (0..k)
+        .map(|_| t.pop_random(rng).map_or(0, |m| m.len()))
+        .sum()
+}
+
 fn fill_from_env() -> Option<u16> {
     std::env::var("FILL")
         .ok()
@@ -454,10 +565,10 @@ fn ops(args: &[String]) {
     for (i, k) in keys.iter().enumerate() {
         match (table, w.is_hash()) {
             (true, true) => {
-                table_hash.insert(k.as_bytes(), &w.value(i), None);
+                table_hash.insert(k.as_bytes(), &w.value(i), None).unwrap();
             }
             (true, false) => {
-                table_set.insert(k.as_bytes());
+                table_set.insert(k.as_bytes()).unwrap();
             }
             (false, true) => {
                 today_hash.insert(k.clone(), Arc::from(w.value(i)));
@@ -481,8 +592,8 @@ fn ops(args: &[String]) {
             chosen.shuffle(&mut rng);
             chosen
         }
-        "scan" => Vec::new(),
-        _ => panic!("OP: hit, miss, insert, remove or scan"),
+        "scan" | "random" | "pop" => Vec::new(),
+        _ => panic!("OP: hit, miss, insert, remove, scan, random or pop"),
     };
     let pages = n / 10;
     let done = match (table, w.is_hash(), op) {
@@ -500,10 +611,23 @@ fn ops(args: &[String]) {
         (false, false, "remove") => measured_today_set_remove(&mut today_set, &probes),
         (true, false, "scan") => measured_table_set_scan(&table_set, pages),
         (true, true, "scan") => measured_table_hash_scan(&table_hash, pages),
+        (true, true, "random") => measured_table_hash_random(&table_hash, &mut rng, lookups),
+        (false, true, "random") => measured_today_hash_random(&today_hash, &mut rng, lookups),
+        (true, false, "random") => measured_table_set_random(&table_set, &mut rng, lookups),
+        (false, false, "random") => measured_today_set_random(&today_set, &mut rng, lookups),
+        (true, true, "pop") => measured_table_hash_pop(&mut table_hash, &mut rng, changes),
+        (false, true, "pop") => measured_today_hash_pop(&mut today_hash, &mut rng, changes),
+        (true, false, "pop") => measured_table_set_pop(&mut table_set, &mut rng, changes),
+        (false, false, "pop") => measured_today_set_pop(&mut today_set, &mut rng, changes),
         _ => panic!("no such measurement"),
     };
     black_box(done);
-    let operations = if op == "scan" { pages } else { probes.len() };
+    let operations = match op {
+        "scan" => pages,
+        "random" => lookups,
+        "pop" => changes,
+        _ => probes.len(),
+    };
     println!(
         "OPS {operations} (result {done}, table resizing {})",
         table_hash.resizing() || table_set.resizing()
@@ -570,10 +694,10 @@ fn latency(n: usize, only_workload: Option<&str>, only_mode: Option<&str>) {
                 let t = Instant::now();
                 match (mode.is_some(), w.is_hash()) {
                     (true, true) => {
-                        th.insert(k.as_bytes(), b"v", None);
+                        th.insert(k.as_bytes(), b"v", None).unwrap();
                     }
                     (true, false) => {
-                        ts.insert(k.as_bytes());
+                        ts.insert(k.as_bytes()).unwrap();
                     }
                     (false, true) => {
                         ih.insert(k.clone(), Arc::from(&b"v"[..]));
@@ -610,7 +734,7 @@ fn latency(n: usize, only_workload: Option<&str>, only_mode: Option<&str>) {
 fn scan(n: usize) {
     let mut t = CollectionTable::<Members>::with_capacity_and_seed(0, 5);
     for i in 0..n {
-        t.insert(Workload::S17.key(i).as_bytes());
+        t.insert(Workload::S17.key(i).as_bytes()).unwrap();
     }
     while !t.step_resize(usize::MAX) {}
     let mut elements = Vec::new();
@@ -654,9 +778,9 @@ fn scan(n: usize) {
 
 fn fill() {
     println!(
-        "| max fill | workload | at doubling (b=19, n) | overflow groups / main | groups read per hit | per miss | longest chain | B/elem at doubling | B/elem just after | B/elem mean 1M-3.3M |"
+        "| max fill | workload | at doubling (b=19, n) | overflow groups / main | groups read per hit | per miss | longest chain | B/elem at doubling | B/elem just after | B/elem mean 1M-3.3M | reseeds |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|");
     for f in [750u16, 820, 875] {
         for w in [Workload::H764, Workload::S17, Workload::S17Int] {
             let top = doubling(19, usize::from(f));
@@ -677,9 +801,9 @@ fn fill() {
             let mut after = 0f64;
             for i in 0..top + top / 10 {
                 if w.is_hash() {
-                    th.insert(w.key(i).as_bytes(), &w.value(i), None);
+                    th.insert(w.key(i).as_bytes(), &w.value(i), None).unwrap();
                 } else {
-                    ts.insert(w.key(i).as_bytes());
+                    ts.insert(w.key(i).as_bytes()).unwrap();
                 }
                 let len = i + 1;
                 let bytes = |th: &CollectionTable<Fields>, ts: &CollectionTable<Members>| {
@@ -705,8 +829,10 @@ fn fill() {
                 }
             }
             let (s, b) = at_doubling.expect("reached the doubling");
+            let reseeds = if w.is_hash() { th.stats() } else { ts.stats() }.reseeds;
+            assert_eq!(reseeds, 0, "random keys never reach the chain cap");
             println!(
-                "| {:.3} | {} | {} | {:.3} | {:.3} | {:.3} | {} | {:.1} | {:.1} | {:.1} |",
+                "| {:.3} | {} | {} | {:.3} | {:.3} | {:.3} | {} | {:.1} | {:.1} | {:.1} | {} |",
                 f64::from(f) / 1000.0,
                 w.name(),
                 top,
@@ -716,9 +842,148 @@ fn fill() {
                 s.max_chain,
                 b,
                 after,
-                sum / points.len() as f64
+                sum / points.len() as f64,
+                reseeds
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// random
+// ---------------------------------------------------------------------------
+
+/// Nanoseconds per call of `f`, over `k` calls.
+fn time_each(k: usize, mut f: impl FnMut() -> usize) -> f64 {
+    let start = Instant::now();
+    let mut sum = 0;
+    for _ in 0..k {
+        sum += f();
+    }
+    black_box(sum);
+    start.elapsed().as_nanos() as f64 / k as f64
+}
+
+fn random() {
+    println!("| workload | n | structure | random ns | remove random ns |");
+    println!("|---|---|---|---|---|");
+    let mut rng = StdRng::seed_from_u64(11);
+    for w in [Workload::H764, Workload::S17] {
+        for n in [1_000usize, 100_000, 3_000_000] {
+            let picks = 1_000_000;
+            let pops = (n / 10).min(100_000);
+            if w.is_hash() {
+                let mut t = CollectionTable::<Fields>::with_capacity_and_seed(0, 3);
+                let mut today = IndexHash::default();
+                for i in 0..n {
+                    t.insert(w.key(i).as_bytes(), &w.value(i), None).unwrap();
+                    today.insert(w.key(i), Arc::from(w.value(i)));
+                }
+                while !t.step_resize(usize::MAX) {}
+                let r = time_each(picks, || t.random(&mut rng).map_or(0, |e| e.value.len()));
+                let p = time_each(pops, || {
+                    t.remove_random(&mut rng, |e| e.value.len()).unwrap_or(0)
+                });
+                println!("| {} | {n} | table | {r:.1} | {p:.1} |", w.name());
+                let r = time_each(picks, || {
+                    let at = rng.gen_range(0..today.len());
+                    today.get_index(at).map_or(0, |(_, v)| v.len())
+                });
+                let p = time_each(pops, || {
+                    let at = rng.gen_range(0..today.len());
+                    today.swap_remove_index(at).map_or(0, |(_, v)| v.len())
+                });
+                println!(
+                    "| {} | {n} | IndexMap get_index / swap_remove_index | {r:.1} | {p:.1} |",
+                    w.name()
+                );
+            } else {
+                let mut t = CollectionTable::<Members>::with_capacity_and_seed(0, 3);
+                let mut today = TodaySet::new();
+                for i in 0..n {
+                    t.insert(w.key(i).as_bytes()).unwrap();
+                    today.insert(w.key(i).as_bytes());
+                }
+                while !t.step_resize(usize::MAX) {}
+                let r = time_each(picks, || t.random(&mut rng).map_or(0, |m| m.len()));
+                let p = time_each(pops, || t.remove_random(&mut rng, |m| m.len()).unwrap_or(0));
+                println!("| {} | {n} | table | {r:.1} | {p:.1} |", w.name());
+                let r = time_each(picks, || today.random(&mut rng).map_or(0, |m| m.len()));
+                let p = time_each(pops, || today.pop_random(&mut rng).map_or(0, |m| m.len()));
+                println!(
+                    "| {} | {n} | HashTable random bucket | {r:.1} | {p:.1} |",
+                    w.name()
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// chains
+// ---------------------------------------------------------------------------
+
+/// P(X >= k) for X ~ Poisson(lambda), summed from the pmf.
+fn poisson_at_least(lambda: f64, k: usize) -> f64 {
+    let mut pmf = (-lambda).exp();
+    let mut below = 0.0;
+    for i in 0..k {
+        below += pmf;
+        pmf *= lambda / (i + 1) as f64;
+    }
+    // Summing the tail directly keeps precision far out.
+    let mut tail = 0.0;
+    let mut term = pmf;
+    for i in k..k + 200 {
+        tail += term;
+        term *= lambda / (i + 1) as f64;
+    }
+    if tail > 0.0 { tail } else { 1.0 - below }
+}
+
+fn chains() {
+    use kividb::collection_table::{CHAIN_BUCKETS, CHAIN_CAP};
+    let n = doubling(19, 875);
+    println!(
+        "chain lengths at {n} elements (the fullest point of 2^19 groups, fill 0.875), cap {CHAIN_CAP}"
+    );
+    for w in [Workload::H764, Workload::S17] {
+        let mut t = CollectionTable::<Members>::with_capacity_and_seed(0, 7);
+        for i in 0..n {
+            t.insert(w.key(i).as_bytes()).unwrap();
+        }
+        while !t.step_resize(usize::MAX) {}
+        let s = t.stats();
+        let lambda = n as f64 / s.groups as f64;
+        println!();
+        println!("### {} (lambda {lambda:.3} a home group)", w.name());
+        println!();
+        println!(
+            "| chain groups | home groups counted | Poisson expected (at least this long) | counted (at least) |"
+        );
+        println!("|---|---|---|---|");
+        let mut at_least = s.chains.iter().sum::<usize>();
+        for g in 1..=CHAIN_BUCKETS {
+            // A chain of g groups holds more than 6 (g - 1) + 1 elements.
+            let p = if g == 1 {
+                1.0
+            } else {
+                poisson_at_least(lambda, 6 * (g - 1) + 2)
+            };
+            println!(
+                "| {g}{} | {} | {:.3e} | {at_least} |",
+                if g == CHAIN_BUCKETS { "+" } else { "" },
+                s.chains[g - 1],
+                p * s.groups as f64
+            );
+            at_least -= s.chains[g - 1];
+        }
+        println!(
+            "\nlongest {} groups, reseeds {}; P(a chain over the cap, per group) = {:.3e}",
+            s.max_chain,
+            s.reseeds,
+            poisson_at_least(lambda, 6 * CHAIN_CAP + 2)
+        );
     }
 }
 
@@ -738,8 +1003,10 @@ fn main() {
         ),
         Some("scan") => scan(number(1, 1_000_000)),
         Some("fill") => fill(),
+        Some("random") => random(),
+        Some("chains") => chains(),
         _ => eprintln!(
-            "usage: collection_table_bench mem | ops STRUCT WORKLOAD N OP | latency [N [WORKLOAD [MODE]]] | scan [N] | fill"
+            "usage: collection_table_bench mem | ops STRUCT WORKLOAD N OP | latency [N [WORKLOAD [MODE]]] | scan [N] | fill | random | chains"
         ),
     }
 }

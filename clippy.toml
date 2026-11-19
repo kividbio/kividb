@@ -3,7 +3,11 @@
 # held to that worker's one CPU (a SAVE's freeze threads, a cluster fan-out,
 # a full sync's dump, a script). Tests are allowed these (`allow` at the top
 # of each test crate, `cfg_attr(test, ...)` for unit tests).
+#
+# A collection table's hash seed is random: the fixed-seed constructor is for
+# tests and measurements (the table's tests, examples/collection_table_bench.rs).
 disallowed-methods = [
+    { path = "kividb::collection_table::CollectionTable::with_capacity_and_seed", reason = "a table's seed must be random: use CollectionTable::with_capacity (fixed seeds are for tests and measurements)" },
     { path = "std::thread::spawn", reason = "use crate::cpus::spawn: a thread a pinned worker starts must get the process's CPUs back" },
     { path = "std::thread::Builder::spawn", reason = "use crate::cpus::BuilderExt::spawn_released" },
     { path = "std::thread::Builder::spawn_scoped", reason = "use crate::cpus::ScopeExt::spawn_released" },
