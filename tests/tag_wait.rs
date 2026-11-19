@@ -533,7 +533,7 @@ fn a_woken_blocking_pop_waits_for_the_script_uring() {
 
 /// A write that waited for a script and is then held by a `CLIENT PAUSE` set
 /// meanwhile runs once the pause ends, not before. A round counts only if
-/// the script ran beside others and the pause was set while it was still
+/// the script ran beside others and the pause was sent while it was still
 /// held (a loaded machine may have been slower than the stall, or have
 /// timed a warm-up run over the five milliseconds that make a script run
 /// alone); up to five rounds.
@@ -557,11 +557,11 @@ fn a_waiting_write_is_then_held_by_a_pause(io: &str) {
             continue;
         };
         let paused_at = Instant::now();
-        assert_eq!(
-            pauser.cmd(&["CLIENT", "PAUSE", &(STALL_MS * 2).to_string(), "WRITE"]),
-            V::Str("OK".into())
-        );
+        // Sent while the script is held: the pause itself waits for the
+        // script, and is set before the waiting write runs again.
+        pauser.send(&["CLIENT", "PAUSE", &(STALL_MS * 2).to_string(), "WRITE"]);
         let in_time = !script.is_finished() && server.holding();
+        assert_eq!(pauser.read(), V::Str("OK".into()));
         let (reply, _) = script.join().unwrap();
         assert_eq!(reply, V::Int(1));
         if !in_time {
