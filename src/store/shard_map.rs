@@ -41,7 +41,6 @@
 //! new entry, as before.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use hashbrown::HashTable;
 use parking_lot::RwLock;
@@ -331,19 +330,6 @@ pub struct ShardMap {
     /// here (`Entry::pos`), in two parts: those that may come due soon, and
     /// those that cannot (see `ttl_list`).
     ttl: TtlList,
-    /// The time a write lock holds the shard at, so that a command sees one
-    /// time throughout ([`now_at`]). [`UNPINNED`] while no write lock holds
-    /// the shard: every look reads the clock. [`PENDING`] once one does,
-    /// until the first entry with a time to live it looks at reads the
-    /// clock and keeps the time here. So a lock that meets no such entry
-    /// never reads the clock: reading it on every write lock of a shard
-    /// with a key with a time to live cost SET, INCR and DEL on such keys
-    /// 3-4% more instructions.
-    ///
-    /// Atomic so that a look through `&self` can keep the time; it is only
-    /// written under the write lock, so a reader, which only ever finds
-    /// [`UNPINNED`] here, never writes it.
-    now: AtomicU64,
     /// Keys a write under this lock has something to say of when it lets
     /// go, and what ([`ToSay`]). One list, so that a write that leaves none
     /// reads one word to find that out.
@@ -381,39 +367,22 @@ enum Ttl {
     Set(Option<u64>),
 }
 
-/// No write lock holds the shard: see `ShardMap::now`.
-const UNPINNED: u64 = 0;
-/// A write lock holds the shard and has not read the clock yet.
-const PENDING: u64 = u64::MAX;
-
-/// Whether `entry` is past its time, by the shard's time `now` (see
-/// `ShardMap::now`). Keys without a time to live never read the clock.
+/// Whether `entry` is past its time. Keys without a time to live never
+/// read the clock.
+///
+/// By the time of the command running on this thread
+/// (`script_clock::command`, #632): every lookup and write lock of one
+/// command goes by the same time, the one the command read first. A write
+/// lock used to keep a time of its own for the same purpose, set when it
+/// was taken and cleared when it was let go of: two stores on every write
+/// lock, which the command's time made redundant. Outside a command (the
+/// background expiry, eviction), each look reads the clock.
 #[inline(always)]
-fn expired(entry: Entry, now: &AtomicU64) -> bool {
-    entry.has_ttl() && entry.expires().is_some_and(|at| past(at, now))
-}
-
-/// Whether the time to live that ends at `at` has, by the shard's time.
-/// Never while the thread is loading a dataset or applying its master's
-/// stream (`expiry::held`): what expired there is said by a `DEL`.
-#[inline]
-fn past(at: u64, now: &AtomicU64) -> bool {
-    now_at(now) > at && !crate::expiry::held()
-}
-
-/// The shard's time: the one its write lock keeps, read from the clock the
-/// first time it is asked for; the clock's own without a write lock.
-#[inline]
-fn now_at(now: &AtomicU64) -> u64 {
-    match now.load(Ordering::Relaxed) {
-        UNPINNED => crate::commands::helpers::now_ms(),
-        PENDING => {
-            let t = crate::commands::helpers::now_ms();
-            now.store(t, Ordering::Relaxed);
-            t
-        }
-        t => t,
-    }
+fn expired(entry: Entry) -> bool {
+    entry.has_ttl()
+        && entry
+            .expires()
+            .is_some_and(crate::commands::helpers::is_past)
 }
 
 /// A key a write found past its time: expired lazily, as Redis counts it.
@@ -475,7 +444,6 @@ impl ShardMap {
             layout: 0,
             hash: ahash::RandomState::new(),
             ttl: TtlList::new(),
-            now: AtomicU64::new(UNPINNED),
             left: Vec::new(),
         }
     }
@@ -699,21 +667,7 @@ impl ShardMap {
     /// The slot of `key`, unless the key is past its time.
     #[inline(always)]
     fn find_live(&self, hash: u64, key: &[u8]) -> Option<Slot> {
-        self.find(hash, key)
-            .filter(|s| !expired(s.entry(), &self.now))
-    }
-
-    /// A write lock holds the shard from now: its time is the clock's when
-    /// it is first needed, and then the same throughout (see `now`).
-    #[inline(always)]
-    pub(super) fn pin_now(&mut self) {
-        *self.now.get_mut() = PENDING;
-    }
-
-    /// The write lock lets go: the clock's time again.
-    #[inline(always)]
-    pub(super) fn unpin_now(&mut self) {
-        *self.now.get_mut() = UNPINNED;
+        self.find(hash, key).filter(|s| !expired(s.entry()))
     }
 
     /// Whether a write has anything to say once the lock lets go: a key
@@ -794,7 +748,7 @@ impl ShardMap {
         match self.find(hash, key) {
             Some(s) => {
                 let e = s.entry();
-                if expired(e, &self.now) {
+                if expired(e) {
                     return Lookup::Past;
                 }
                 used(e, hash, self.id());
@@ -910,7 +864,6 @@ impl ShardMap {
     ) -> Written {
         let hash = self.hash_of(key);
         self.make_room_for(hash, key);
-        let now = &self.now;
         let map = self.id();
         let hasher = &self.hash;
         let list = &mut self.ttl;
@@ -922,7 +875,7 @@ impl ShardMap {
         ) {
             hashbrown::hash_table::Entry::Occupied(mut at) => {
                 let old = at.get().entry();
-                let stale = expired(old, now);
+                let stale = expired(old);
                 if stale {
                     written_over_expired(left, key);
                 }
@@ -1145,7 +1098,7 @@ impl ShardMap {
             return false;
         };
         let old = slot.entry();
-        if expired(old, &self.now) {
+        if expired(old) {
             return false;
         }
         if old.has_ttl() && old.holders() == 1 {
@@ -1180,7 +1133,7 @@ impl ShardMap {
             return false;
         };
         let old = slot.entry();
-        if expired(old, &self.now) {
+        if expired(old) {
             return false;
         }
         used(old, hash, map);
@@ -1333,7 +1286,6 @@ impl ShardMap {
     pub fn put_back(&mut self, taken: Taken) -> Result<Option<Taken>, Taken> {
         let hash = self.hash_of(taken.key());
         self.make_room_for(hash, taken.key());
-        let now = &self.now;
         let hasher = &self.hash;
         let list = &mut self.ttl;
         let left = &mut self.left;
@@ -1345,7 +1297,7 @@ impl ShardMap {
         ) {
             hashbrown::hash_table::Entry::Occupied(mut at) => {
                 let old = at.get().entry();
-                if !expired(old, now) {
+                if !expired(old) {
                     return Err(taken);
                 }
                 written_over_expired(left, key);
@@ -2537,37 +2489,22 @@ mod tests {
     }
 
     #[test]
-    fn a_write_lock_sees_one_time() {
+    fn a_command_sees_one_time_across_its_write_locks() {
         let shard = crate::store::ShardLock::default();
         let soon = crate::commands::helpers::now_ms() + 200;
         shard.write().insert_expiring("k", s("100"), Some(soon));
-        let mut map = shard.write();
-        // Live when the lock first looked at the time: the write that
-        // follows keeps it, however long after.
-        assert!(map.get("k").is_some());
+        let command = crate::script_clock::command();
+        // Live when the command first looked at the time: a write that
+        // follows keeps it, however long after, under this lock or another.
+        assert!(shard.write().get("k").is_some());
         std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(shard.read().get("k").is_some());
+        let mut map = shard.write();
         map.insert("k", s("101"));
         assert_eq!(map.expires("k"), Some(soon));
         drop(map);
+        drop(command);
         assert!(shard.read().get("k").is_none());
-    }
-
-    #[test]
-    fn a_write_lock_reads_the_clock_only_for_a_key_with_a_time_to_live() {
-        let shard = crate::store::ShardLock::default();
-        shard.write().insert("plain", s("1"));
-        shard
-            .write()
-            .insert_expiring("ttl", s("1"), Some(u64::MAX - 1));
-        let mut map = shard.write();
-        assert!(map.get("plain").is_some());
-        map.insert("plain", s("2"));
-        assert_eq!(map.now.load(Ordering::Relaxed), PENDING, "no clock read");
-        assert!(map.get("ttl").is_some());
-        let t = map.now.load(Ordering::Relaxed);
-        assert!(t != PENDING && t != UNPINNED, "read once, and kept");
-        drop(map);
-        assert_eq!(shard.read().now.load(Ordering::Relaxed), UNPINNED);
     }
 
     #[test]
