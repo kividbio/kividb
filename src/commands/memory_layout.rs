@@ -256,6 +256,16 @@ mod tests {
     #[test]
     fn a_set_is_what_it_allocates() {
         with_own_counter("a_set_is_what_it_allocates", || {
+            // A table's members come from the entry pool's slabs. The first
+            // blocks a thread takes of a class make that thread's slab
+            // bookkeeping, which this thread's counter counts, but which is
+            // the thread's and not the set's: made here first, before
+            // anything is measured.
+            let mut warm = MemberSet::new();
+            for i in 0..20_000 {
+                warm.insert_bytes(format!("member:{i}").as_bytes());
+            }
+            drop(warm);
             for members in [1usize, 7, 8, 64, 65, 129, 1000, 5000] {
                 for ints in [false, true] {
                     let (set, bytes) = allocated(|| {

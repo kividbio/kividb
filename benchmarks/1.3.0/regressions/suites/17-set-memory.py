@@ -21,6 +21,15 @@ Gates: memory per member within 5 % (or 1 B) of recorded at every size; at
 10 and 100 members, where the block and the array replaced the table, it must
 also keep 60 % of the gain over v1.2.2 measured in the same session. The
 tables (1,000 and 100,000) are guard rows: the change must not cost them.
+
+#764 step 2 (sets on `CollectionTable`) re-recorded the table rows and added
+one set each of 1,000,000 and 3,000,000 members, and of 3,211,264 and
+3,211,265: just before and just after the table doubles from 2^19 to 2^20
+groups (it grows past 0.875 of 7 x 2^19 slots), its fullest and its emptiest
+point, the bounds of what a large set costs. A set this big is one key of
+that many members. Before `used_memory` is read the server is left until it
+stops falling (a resize that the background, or Redis's rehashing, is still
+finishing; at most 60 s).
 """
 import os
 import sys
@@ -30,7 +39,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import Suite, Config, KEEP_IMPROVEMENT, EXACT, rel, info, scaled  # noqa: E402
 
 S = Suite("17-set-memory", [Config("strings", threads=2), Config("ints", threads=2)])
-SIZES = [10, 100, 1000, 100_000]
+SIZES = [10, 100, 1000, 100_000, 1_000_000, 3_000_000, 3_211_264, 3_211_265]
 TOTAL = 1_000_000
 BATCH = 500
 ENCODINGS = {"intset": 1, "listpack": 2, "hashtable": 3}
@@ -61,12 +70,27 @@ def load(c, kind, n, total):
     return keys
 
 
+def settled(c, limit=60.0):
+    """used_memory once it has stopped falling: a resize still being finished
+    in the background holds two arrays until it is done."""
+    u = c.info("memory")["used_memory"]
+    end = time.perf_counter() + limit
+    while time.perf_counter() < end:
+        time.sleep(0.3)
+        now = c.info("memory")["used_memory"]
+        if now >= u - 4096:
+            return min(u, now)
+        u = now
+    return u
+
+
 @S.run
 def run(ctx):
     c = ctx.client()
     kind = ctx.config.name
-    total = scaled(TOTAL)
     for n in SIZES:
+        # Past TOTAL, one set of n members.
+        total = scaled(max(TOTAL, n))
         n_here = min(n, total)
         c.flushall()
         time.sleep(0.5)
@@ -74,7 +98,7 @@ def run(ctx):
         t = time.perf_counter()
         keys = load(c, kind, n_here, total)
         secs = time.perf_counter() - t
-        u1 = c.info("memory")["used_memory"]
+        u1 = settled(c)
         first = "k:%s:%010d" % (kind[:3], 0)
         assert c.scard(first) == n_here, "SCARD %d != %d" % (c.scard(first), n_here)
         per = (u1 - u0) / float(keys * n_here)

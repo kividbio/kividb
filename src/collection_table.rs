@@ -1834,7 +1834,9 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
     /// Whether [`Self::take_retired`] has an array to hand over.
     #[inline]
     pub fn holds_retired(&self) -> bool {
-        self.rare.as_ref().is_some_and(|rare| rare.retired.is_some())
+        self.rare
+            .as_ref()
+            .is_some_and(|rare| rare.retired.is_some())
     }
 
     /// Room for `more` elements besides those there before the table grows

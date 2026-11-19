@@ -614,7 +614,18 @@ fn sscan_of_each_form() {
     for (key, members, form) in &forms {
         let reply = c.cmd(&["SSCAN", key, "0", "COUNT", "2"]);
         if *form == "hashtable" {
-            assert_ne!(reply.items()[0].text(), "0", "{key}");
+            // Paged by the table's own cursor (#770): COUNT is a hint, and
+            // a table of a few members can come back in one page. A full
+            // scan gives each member once.
+            let mut seen: Vec<Vec<u8>> = reply.items()[1].items().iter().map(Resp::bulk).collect();
+            let mut cursor = reply.items()[0].text();
+            while cursor != "0" {
+                let reply = c.cmd(&["SSCAN", key, &cursor, "COUNT", "2"]);
+                cursor = reply.items()[0].text();
+                seen.extend(reply.items()[1].items().iter().map(Resp::bulk));
+            }
+            seen.sort();
+            assert_eq!(seen, sorted(members), "{key}");
         } else {
             assert_eq!(reply.items()[0].text(), "0", "{key}");
             assert_eq!(reply.items()[1].members(), sorted(members), "{key}");

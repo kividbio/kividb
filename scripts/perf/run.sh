@@ -28,6 +28,13 @@
 #                       (#894): SET-100 with no backlog, with a kept one
 #                       (started from a snapshot), with a replica attached,
 #                       with the AOF on; and GET-100
+#   WORKLOADS=sets      set commands on one set of each form and size
+#                       (#764): SADD, SISMEMBER hit and miss, SMISMEMBER,
+#                       SCARD, SRANDMEMBER, SREM + SADD and SPOP + SADD
+#                       pairs at 10, 128 (block), 512 (integer array),
+#                       1k, 100k, 3M (table); SMEMBERS, SUNIONSTORE,
+#                       SINTER and COPY of big sets (see measure.sh;
+#                       SIZES limits the sizes)
 #   ONLY=<regex>        measure only the workloads whose label matches
 #   PROFILE=1           keep the hottest functions of each workload in
 #                       target/perf/out-<tag>/profile-*.txt

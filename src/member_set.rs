@@ -2053,7 +2053,11 @@ mod tests {
     #[test]
     fn the_background_finishes_a_resize_the_writes_left() {
         defaults();
-        let n: usize = if cfg!(debug_assertions) { 400_000 } else { 3_000_000 };
+        let n: usize = if cfg!(debug_assertions) {
+            400_000
+        } else {
+            3_000_000
+        };
         let set = shared(MemberSet::new());
         let mut i = 0usize;
         // Filled with no background meanwhile: as if its writes outran it.
@@ -2097,7 +2101,11 @@ mod tests {
         inner.for_each(|m| {
             fresh.insert_bytes(m);
         });
-        assert!(shrunk <= 2 * fresh.allocation_size(), "{shrunk} against {}", fresh.allocation_size());
+        assert!(
+            shrunk <= 2 * fresh.allocation_size(),
+            "{shrunk} against {}",
+            fresh.allocation_size()
+        );
         eprintln!("shrink finished; longest hold {longest:?}");
     }
 
@@ -2134,11 +2142,21 @@ mod tests {
         let reader = held.read();
         let work = step_background(std::time::Duration::from_millis(5));
         assert!(reader.table().unwrap().resizing());
-        assert!(HANDED.lock().iter().any(|w| w.ptr_eq(&Arc::downgrade(&held))));
+        assert!(
+            HANDED
+                .lock()
+                .iter()
+                .any(|w| w.ptr_eq(&Arc::downgrade(&held)))
+        );
         let _ = work;
         drop(reader);
         finish_in_background(&held);
-        assert!(!HANDED.lock().iter().any(|w| w.ptr_eq(&Arc::downgrade(&held))));
+        assert!(
+            !HANDED
+                .lock()
+                .iter()
+                .any(|w| w.ptr_eq(&Arc::downgrade(&held)))
+        );
         // A set built mid-growth and made a key's value is handed over at
         // once (a load, `RESTORE`, a `*STORE` command).
         let mut built = MemberSet::new_table(0);
@@ -2161,9 +2179,18 @@ mod tests {
     fn a_table_that_came_out_small_fits_its_members() {
         defaults();
         for (members, want) in [
-            ((0..100).map(|i| i.to_string()).collect::<Vec<_>>(), Encoding::Intset),
-            ((0..100).map(|i| format!("m{i}")).collect(), Encoding::Listpack),
-            ((0..600).map(|i| format!("m{i}")).collect(), Encoding::Hashtable),
+            (
+                (0..100).map(|i| i.to_string()).collect::<Vec<_>>(),
+                Encoding::Intset,
+            ),
+            (
+                (0..100).map(|i| format!("m{i}")).collect(),
+                Encoding::Listpack,
+            ),
+            (
+                (0..600).map(|i| format!("m{i}")).collect(),
+                Encoding::Hashtable,
+            ),
         ] {
             let mut set = MemberSet::new_table(100_000);
             for m in &members {

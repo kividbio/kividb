@@ -2412,8 +2412,19 @@ fn grow_until_refused(
     );
     assert_eq!(c.evicted(), 0);
 
-    // What the key took, measured, and what it reports.
-    let took = c.used_memory() - before;
+    // What the key took, measured, and what it reports, once it has settled:
+    // a set's table (#764) that a write began to grow holds its old array
+    // until the growth is finished, by the background when no more writes
+    // come, which gives the old array back (up to 1.5 times the table's
+    // bytes meanwhile, as a Redis dict holds both tables while it rehashes).
+    let mut took = c.used_memory() - before;
+    let mut still = 0;
+    while still < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let now = c.used_memory() - before;
+        still = if now < took { 0 } else { still + 1 };
+        took = took.min(now);
+    }
     let usage = c.cmd(&["MEMORY", "USAGE", key, "SAMPLES", "0"]).i();
     assert!(
         (took * 9 / 10..=took * 11 / 10).contains(&usage),
