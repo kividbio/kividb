@@ -1039,9 +1039,11 @@ static HANDED: Mutex<Vec<Weak<RwLock<MemberSet>>>> = Mutex::new(Vec::new());
 static HANDED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Units of a resize's moves done under one hold of a set's lock (a unit is
-/// a group visited or a member moved): about 40-80 us of work, so a writer
-/// of that set waits no longer than that for the background.
-pub const BACKGROUND_STEP: usize = 4096;
+/// a group visited or a member moved). Finishing the growth of a 3.2M-member
+/// set, 4,096 of them held the lock for up to 0.49 ms, 1,024 for up to 0.27
+/// ms (a move into pages of the new array touched for the first time costs
+/// a page fault), so a writer of that set waits no longer than that.
+pub const BACKGROUND_STEP: usize = 1024;
 
 /// After a write to `set` (whose write lock `inner` is): hands it to the
 /// background if it has work there. A few instructions when not.

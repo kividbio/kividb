@@ -23,8 +23,9 @@ Tests (each prints one JSON object, and appends it to --out):
   background  a set filled (pipelined) to 3,211,265 members, just past a
             doubling, then left alone: MEMORY USAGE until it stops falling
             (the background finishing the resize), and how long that took
-  digest    DEBUG DIGEST-VALUE and DEBUG DIGEST of a set of 1,000,000 known
-            members (needs --enable-debug-command yes): to compare servers
+  digest    DEBUG DIGEST-VALUE of a set of 1,000,000 known members and of one
+            of 200,000 integers (needs --enable-debug-command yes): to compare
+            servers (KiviDB has no DEBUG DIGEST of the whole dataset)
 
 --pid is the server's process, for its CPU time (/proc/<pid>/stat).
 """
@@ -262,8 +263,9 @@ def t_background(c, a):
 def t_digest(c, a):
     c.flushall()
     load(c, "s", 1_000_000)
-    return {"digest_value": c.execute_command("DEBUG", "DIGEST-VALUE", "s"),
-            "digest": c.execute_command("DEBUG", "DIGEST")}
+    c.sadd("i", *[str(i * 3) for i in range(200_000)])
+    return {"digest_value_s": c.execute_command("DEBUG", "DIGEST-VALUE", "s"),
+            "digest_value_i": c.execute_command("DEBUG", "DIGEST-VALUE", "i")}
 
 
 TESTS = {"fill": t_fill, "sscan": t_sscan, "rand": t_rand, "copy": t_copy, "free": t_free,
