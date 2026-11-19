@@ -1092,13 +1092,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dataset does; with no replica, it serves what it has. A master that voted
   for another replica to replace the node gives no such answer while that
   election may still be won, and votes for no replacement of the node while
-  the node may be completing its promotion on its answer. A node that starts
+  the node may be completing its promotion on its answer: a master answers
+  so for three node timeouts at most, and refuses such votes for six at
+  most (90 s at the default node timeout). A node that starts
   as a replica begins its first sync once enough of the masters have
   answered that it is not to complete a promotion (with three masters, two
   of them), or one node timeout after it started, whichever is first, and
   not at all if it is to complete one; later syncs do not wait. A master
   that owns those slots at a newer epoch (another replica elected since, a
-  `CLUSTER FAILOVER TAKEOVER`) is followed instead, as before. With nodes of
+  `CLUSTER FAILOVER TAKEOVER`) is followed instead. With nodes of
   1.2 among the masters, the majority has to be made of masters of this
   release.
 
