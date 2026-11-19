@@ -943,9 +943,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `FT.AGGREGATE` with `*=>[KNN 10 @vec $q]` -3.5%, with a tag filter
   -2.8%; `FT.SEARCH` over a tag filter -1.2%, `KNN` with a filter -1.1%, an
   unfiltered `KNN` -0.5%; hashes with no field TTL within 0.2% either way.
-  The search of `FT.SEARCH` and hybrid `KNN` still asks the index for more
-  neighbours, up to the whole index, while hits are left out, and does not
-  stop at the query's `TIMEOUT` (#670).
+
+- **An unfiltered KNN whose nearest vectors are past their deadline stops at
+  the query's `TIMEOUT`, and no longer searches the whole index for more
+  (#670).** `FT.SEARCH` with `*=>[KNN ...]` and `FT.HYBRID`'s `VSIM ... KNN`
+  without a filter leave out a document whose vector field has passed its
+  deadline and ask the index for more, at least twice as many each round.
+  They went on until they had `k` or had asked for the whole index (an HNSW
+  search with that many candidates), and did not look at the clock. Now an
+  HNSW index is asked for at most one vector in 16 of what it holds, and a
+  FLAT one (whose every search measures every vector) once; after that every
+  vector is measured exactly, keeping the nearest few, four times as many
+  each pass, until `k` are shown. The deadline is checked before every round
+  and pass after the first search and every 1,024 documents a pass looks at;
+  `ON_TIMEOUT return` gives the shown ones found so far, nearest first.
+  Other KNN paths were already bounded: with a filter, `knn_planned` and the
+  exact filtered scan, and `FT.AGGREGATE`, which measures the rows its
+  filter left. On HNSW, 200,000 documents with 99% of the nearest hidden
+  (D4s_v5): 798 ms a query before, 425 after; `TIMEOUT 50` stops at 57 ms
+  (it was ignored); a writer's worst `HSET` during the query 813 ms before,
+  70 after. With no field TTL or nothing hidden, instructions a query do not
+  move (callgrind, 0.1%).
 
 ### Fixed
 
