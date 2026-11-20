@@ -361,7 +361,8 @@ fn cmd_geoadd(ctx: &mut Ctx) -> Vec<u8> {
     let mut inner = zs.write();
     // As Redis runs it, a `ZADD` of the command's pairs: a block they cannot
     // fit becomes the large form first.
-    inner.expect((cmd.len() - i) / 3);
+    let given = (cmd.len() - i) / 3;
+    inner.expect(given);
 
     while i + 2 < cmd.len() {
         let (lon, lat) = match lon_lat(cmd[i], cmd[i + 1]) {
@@ -391,6 +392,9 @@ fn cmd_geoadd(ctx: &mut Ctx) -> Vec<u8> {
             }
         });
     }
+    // As `ZADD`: a table reserved for members given twice is made as small
+    // as what came.
+    inner.settle(given);
 
     drop(inner);
 

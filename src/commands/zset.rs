@@ -668,6 +668,9 @@ fn zadd(ctx: &mut Ctx) -> Vec<u8> {
                 }
             });
         }
+        // A table reserved for every pair, members given twice included,
+        // is made as small as what came.
+        inner.settle(pairs.len());
         Ok((added, changed, last_score))
     });
     let (added, changed, last_score) = match written {
@@ -2031,65 +2034,45 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
                 };
             }
 
+            // Every member is picked by `random` / `random_distinct`: a
+            // block's by its index, the large form's by a random bucket of
+            // its table. The work is the count asked for, not the size of
+            // the set.
+            let mut rng = rand::thread_rng();
+
             // No count argument → return single random member as bulk string
-            if cmd.len() == 2 {
-                let at = pseudo_rand(len);
-                return match inner.iter_unordered().nth(at) {
-                    Some((member, _)) => resp_bulk(member.as_ref()),
+            let Some(count_arg) = count_arg else {
+                return match inner.random(&mut rng) {
+                    Some((member, _)) => resp_bulk(&member),
                     None => resp_null_bulk(),
                 };
-            }
+            };
 
-            let count_arg = count_arg.unwrap_or(1);
-
-            let mut result: Vec<Vec<u8>> = Vec::new();
             if count_arg >= 0 && (count_arg as u64) >= len as u64 {
                 // As many as there are, or more: all of them, as Redis
                 // answers, from the highest score down.
-                for (member, score) in inner.iter().rev() {
-                    push_member_score(
-                        &mut result,
-                        resp,
-                        member.as_ref(),
-                        with_scores.then_some(score),
-                    );
-                }
+                let all: Vec<(Member<'_>, f64)> = inner.iter().rev().collect();
+                range_reply(&all, resp, with_scores)
+            } else if count_arg >= 0 {
+                // Distinct members, in a random order.
+                let picks = inner.random_distinct(count_arg as usize, &mut rng);
+                range_reply(&picks, resp, with_scores)
             } else {
-                // The positions of the members to give, in the order to give
-                // them in: distinct ones for a positive count, any for a
-                // negative one. Found in one walk of the table, which, short
-                // of an index by position, is as little as it can be: no
-                // copy of the members, and no more of the table than the
-                // last position picked.
-                let picks: Vec<usize> = if count_arg >= 0 {
-                    rand::seq::index::sample(&mut rand::thread_rng(), len, count_arg as usize)
-                        .into_vec()
-                } else {
-                    (0..count_arg.unsigned_abs() as usize)
-                        .map(|_| pseudo_rand(len))
-                        .collect()
-                };
-                for (member, score) in inner.members_at(&picks) {
-                    push_member_score(
-                        &mut result,
-                        resp,
-                        member.as_ref(),
-                        with_scores.then_some(score),
-                    );
-                }
+                // Any members, each picked on its own: written as they are
+                // picked (a sparse table: the rest by one walk).
+                let count = count_arg.unsigned_abs() as usize;
+                let paired = with_scores && resp >= 3;
+                let mut out =
+                    Vec::with_capacity(16 + count.min(1 << 16) * if with_scores { 48 } else { 24 });
+                pairs_header(&mut out, count, with_scores, paired);
+                inner.random_each(count, &mut rng, |member, score| {
+                    push_pair(&mut out, &member, score, resp, with_scores, paired);
+                });
+                out
             }
-
-            resp_array(result)
         }
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
     }
-}
-
-/// A random index below `n`, for ZRANDMEMBER. It used to be derived from
-/// the clock, which gave the same index to every call made within one tick —
-/// `ZRANDMEMBER key -5` could return one member five times.
-fn pseudo_rand(n: usize) -> usize {
-    rand::random::<usize>() % n
 }
 
 fn zlexcount(ctx: &mut Ctx) -> Vec<u8> {
