@@ -42,6 +42,10 @@ pub struct LoadedConfig {
     pub slots: Box<[Option<NodeId>; CLUSTER_SLOTS]>,
     pub current_epoch: u64,
     pub last_vote_epoch: u64,
+    /// `vars ... tookOverFrom <id>`: see `ClusterState::took_over_from`.
+    pub took_over_from: Option<NodeId>,
+    /// `vars ... yieldedTo <id>,<id>`: see `ClusterState::yielded_to`.
+    pub yielded_to: Vec<NodeId>,
 }
 
 /// Read nodes.conf from disk. Returns Ok(None) if the file does not exist
@@ -58,6 +62,8 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
     let mut myself: Option<NodeId> = None;
     let mut current_epoch: u64 = 0;
     let mut last_vote_epoch: u64 = 0;
+    let mut took_over_from: Option<NodeId> = None;
+    let mut yielded_to: Vec<NodeId> = Vec::new();
     // Box<[Option<NodeId>; 16384]> via the same dance as in mod.rs
     let mut slots: Box<[Option<NodeId>; CLUSTER_SLOTS]> = vec![None; CLUSTER_SLOTS]
         .into_boxed_slice()
@@ -78,6 +84,15 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
                 match k {
                     "currentEpoch" => current_epoch = v.parse().unwrap_or(0),
                     "lastVoteEpoch" => last_vote_epoch = v.parse().unwrap_or(0),
+                    // Pairs an earlier version skips, as this one skips
+                    // any it does not know (#743).
+                    "tookOverFrom" => took_over_from = parse_node_id(v.as_bytes()),
+                    "yieldedTo" => {
+                        yielded_to = v
+                            .split(',')
+                            .filter_map(|id| parse_node_id(id.as_bytes()))
+                            .collect()
+                    }
                     _ => {}
                 }
             }
@@ -198,6 +213,8 @@ pub fn load(path: &Path) -> std::io::Result<Option<LoadedConfig>> {
         slots,
         current_epoch,
         last_vote_epoch,
+        took_over_from,
+        yielded_to,
     }))
 }
 
@@ -823,7 +840,15 @@ fn save_then(
         }
         (nodes, slots_copy, epoch, last_vote)
     };
-    let fingerprint = topology_fingerprint(&nodes_snap, &slots_snap, epoch, last_vote);
+    // `tookOverFrom` / `yieldedTo` (#743), on the `vars` line.
+    let links = state.takeover_links_vars();
+    let fingerprint = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        topology_fingerprint(&nodes_snap, &slots_snap, epoch, last_vote).hash(&mut h);
+        links.hash(&mut h);
+        h.finish()
+    };
     // Unchanged since the save in place, synced, and no other on its way to
     // replace it: nothing to write. With one on its way (being synced), it
     // is written all the same: the older one, put in place after, must not
@@ -845,7 +870,13 @@ fn save_then(
     // (an older nodes.conf, whose blocks a crash could then show under the
     // name), and by a rename, so that it puts nothing out of place either.
     let deferred = DEFER_SYNC.with(|d| d.get());
-    let out = render(&nodes_snap, &slots_snap, epoch, last_vote);
+    let mut out = render(&nodes_snap, &slots_snap, epoch, last_vote);
+    if !links.is_empty() {
+        // Before the `vars` line's newline, the file's last byte.
+        out.pop();
+        out.extend_from_slice(links.as_bytes());
+        out.push(b'\n');
+    }
     // Written with the lock held when there is something to publish (it is
     // synced and put in place under it too); otherwise once it is let go:
     // the file is this save's alone, and its write is synced as it is made
