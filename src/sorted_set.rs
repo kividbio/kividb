@@ -6,45 +6,40 @@
 //!   block ([`PackedZset`]): its entries in order, by score and then by
 //!   member, a fingerprint a member to find one by name. A new set is an
 //!   empty block, which allocates nothing.
-//! - **Large.** Past either limit, a hash table of members and an ordered
-//!   tree of `(score, member)`, each holding the member's one `Arc`: rank,
-//!   ranges and lookups by name for sets of any size. The table is held
-//!   directly, so that a bucket can be asked for by its number: a random
-//!   member is a random bucket, tried again while it is empty, as Redis
-//!   picks one (`ZRANDMEMBER`). A table that falls below an eighth full is
-//!   made smaller when that costs the command little (see
-//!   `Large::shrink_if_sparse`), so that is a handful of tries; one too big
-//!   to shrink on the command path is sampled by one walk a command.
+//! - **Large.** Past either limit, a [`CollectionTable`] of members, one
+//!   pool block a member holding its score and its bytes, and an index of
+//!   their order that holds each member as its block's address
+//!   ([`zset_table`](crate::zset_table)): rank, ranges and lookups by name
+//!   for sets of any size. A score is rewritten in place. The table grows
+//!   and shrinks a few members a write (and the rest in the background, as
+//!   a large set's or hash's: [`after_write`]), gives `ZSCAN` its cursor,
+//!   and a member at random in O(1) (`ZRANDMEMBER`).
 //!
-//! A set moves from the block to the table and the tree, its entries in
-//! order in one pass, when a write would take it past a limit, and never
-//! back (as in Redis: a set that has been large is kept large, whatever is
-//! taken out of it). The limits are read at each write that adds a member,
-//! so a `CONFIG SET` takes effect at a set's next new member. A set built
-//! whole (a load, `RESTORE`, a `*STORE` command's result) is built in the
-//! form its size and members call for.
+//! A set moves from the block to the large form, its entries in order in
+//! one pass, when a write would take it past a limit, and never back (as
+//! in Redis: a set that has been large is kept large, whatever is taken out
+//! of it). The limits are read at each write that adds a member, so a
+//! `CONFIG SET` takes effect at a set's next new member. A set built whole
+//! (a load, `RESTORE`, a `*STORE` command's result) is built in the form its
+//! size and members call for, the large form's index in one go.
 //!
 //! Every reader goes through the methods here, so nothing outside knows the
 //! form: what is written to disk and to replicas (members and scores, in
 //! order) is the same either way.
 
+use crate::collection_table::{CollectionTable, Scores};
 use crate::member_set::Member;
 use crate::packed_zset::{self, PackedZset, Score};
-use hashbrown::HashTable;
-use hashbrown::hash_table::Entry;
+use crate::zset_table::{Builder, Large, Probe};
 use ordered_float::OrderedFloat;
-use std::collections::BTreeMap;
-use std::collections::btree_map;
+use parking_lot::RwLock;
 use std::ops::{Bound, RangeBounds};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
-/// A member name stored as a cheaply-cloneable Arc'd byte slice.
-/// Using Arc<[u8]> means cloning the key between the BTreeMap and the table
-/// costs only an atomic refcount increment, not a heap allocation.
+/// A member name stored as a cheaply-cloneable Arc'd byte slice: what
+/// callers hand in and get back for a member they keep.
 pub type ZMember = Arc<[u8]>;
-
-type ScoreKey = (OrderedFloat<f64>, ZMember);
 
 /// `zset-max-listpack-entries` until `CONFIG SET` or the configuration file
 /// gives another: Redis's, and the most a block holds
@@ -147,8 +142,8 @@ pub struct SortedSetInner {
 enum Repr {
     Packed(PackedZset),
     /// Behind a box: a set's handle (`Arc<RwLock<SortedSetInner>>`) is in
-    /// every key that holds one, and a block is a third of the size of the
-    /// table and the tree.
+    /// every key that holds one, and a block is a fraction of the size of
+    /// the table's and the index's headers.
     Large(Box<Large>),
 }
 
@@ -156,250 +151,15 @@ enum Repr {
 /// more.
 const _: () = assert!(std::mem::size_of::<SortedSetInner>() <= 32);
 
-/// The large form: dual representation for O(log N) score-ordered
-/// iteration AND O(1) member lookup:
-///
-///   members:  HashTable<(ZMember, f64)>
-///             → "what is this member's score?" — O(1) average; and
-///               "a member at random" — a random bucket, O(1) average
-///
-///   by_score: BTreeMap<(OrderedFloat<f64>, ZMember), ()>
-///             → "give me all members with scores in [lo, hi]" — O(log N) seek + O(M) scan
-///
-/// The composite key (score, member) in by_score ensures that members with
-/// equal scores are ordered lexicographically — matching Redis semantics exactly.
-///
-/// INVARIANT: members and by_score are always in sync. Every write path must
-/// update both atomically (they live inside a single RwLock, so this is safe).
-#[derive(Clone, Default)]
-struct Large {
-    /// Each member and its score. A `HashTable` rather than a map, for its
-    /// buckets by number (a random member) and nothing else: the same
-    /// table, the same bytes a member, the same hash.
-    members: HashTable<(ZMember, f64)>,
-    hasher: ahash::RandomState,
-    by_score: BTreeMap<(OrderedFloat<f64>, ZMember), ()>,
+/// A bound of a range of `(score, member)` keys, as the large form's index
+/// takes it.
+#[inline]
+fn probe(bound: Bound<&(OrderedFloat<f64>, ZMember)>) -> Bound<Probe<'_>> {
+    bound.map(|(score, member)| Probe {
+        score: score.0,
+        member,
+    })
 }
-
-impl Large {
-    fn with_capacity(members: usize) -> Self {
-        Self {
-            members: HashTable::with_capacity(members),
-            ..Self::default()
-        }
-    }
-
-    #[inline]
-    fn hash(&self, member: &[u8]) -> u64 {
-        self.hasher.hash_one(member)
-    }
-
-    /// The member's own `Arc` and its score.
-    #[inline]
-    fn get(&self, member: &[u8]) -> Option<&(ZMember, f64)> {
-        self.members
-            .find(self.hash(member), |(have, _)| &**have == member)
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.members.len()
-    }
-
-    /// Insert or update a member. Returns true if the member is new.
-    /// This is the ONLY place both maps should be written — keeps the invariant.
-    fn insert(&mut self, member: ZMember, score: f64) -> bool {
-        let hash = self.hash(&member);
-        let hasher = &self.hasher;
-        match self.members.entry(
-            hash,
-            |(have, _)| **have == *member,
-            |(have, _)| hasher.hash_one(&**have),
-        ) {
-            Entry::Occupied(mut found) => {
-                // Member exists — remove old position in the score index
-                // first. The table keeps its own key, as a map would.
-                let old_score = std::mem::replace(&mut found.get_mut().1, score);
-                self.by_score
-                    .remove(&(OrderedFloat(old_score), member.clone()));
-                self.by_score.insert((OrderedFloat(score), member), ());
-                false // not new
-            }
-            Entry::Vacant(place) => {
-                place.insert((member.clone(), score));
-                self.by_score.insert((OrderedFloat(score), member), ());
-                true // new member
-            }
-        }
-    }
-
-    /// Take the member out of the table alone: its `Arc` and score. The
-    /// table is not made smaller here: see [`Self::shrink_if_sparse`].
-    fn take(&mut self, member: &[u8]) -> Option<(ZMember, f64)> {
-        let hash = self.hash(member);
-        let found = self
-            .members
-            .find_entry(hash, |(have, _)| &**have == member)
-            .ok()?;
-        let (taken, _) = found.remove();
-        Some(taken)
-    }
-
-    /// Remove a member from both indexes, the table left its size. Returns
-    /// true if it existed.
-    fn remove_only(&mut self, member: &[u8]) -> bool {
-        match self.take(member) {
-            Some((arc_member, score)) => {
-                let indexed = self.by_score.remove(&(OrderedFloat(score), arc_member));
-                debug_assert!(indexed.is_some(), "member missing from by_score");
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Remove a member. Returns true if it existed.
-    fn remove(&mut self, member: &[u8]) -> bool {
-        let removed = self.remove_only(member);
-        if removed {
-            self.shrink_if_sparse(0);
-        }
-        removed
-    }
-
-    fn pop_min(&mut self) -> Option<(ZMember, f64)> {
-        let ((score, member), _) = self.by_score.pop_first()?;
-        self.take(&member);
-        self.shrink_if_sparse(0);
-        Some((member, score.0))
-    }
-
-    fn pop_max(&mut self) -> Option<(ZMember, f64)> {
-        let ((score, member), _) = self.by_score.pop_last()?;
-        self.take(&member);
-        self.shrink_if_sparse(0);
-        Some((member, score.0))
-    }
-
-    /// Whether the table is less than an eighth full (and more than a few
-    /// buckets): a random bucket of it is more often empty than not.
-    #[inline]
-    fn is_sparse(&self) -> bool {
-        let buckets = self.members.num_buckets();
-        buckets > 64 && self.members.len() * 8 < buckets
-    }
-
-    /// A table that has lost most of its members is made smaller, when that
-    /// costs the command little next to what it did: it would otherwise
-    /// keep the memory of its largest size, and a random bucket of it would
-    /// nearly always be an empty one.
-    ///
-    /// `work` is the members the command wrote or removed (0 for a single
-    /// removal, `ZREM` or `ZPOP*`). A table of up to
-    /// [`SHRINK_INLINE_BUCKETS`] buckets, or eight times `work`, is shrunk:
-    /// a single removal then moves fewer than 8,192 members (0.23 ms) and
-    /// frees 1.5 MB at most. A bigger one is kept as it is (as it was before
-    /// tables shrank), because giving its memory back stalls the command:
-    /// freeing the 2^21 buckets of a million-member table took 20 ms on a
-    /// `Standard_D4s_v5`, and even on the lazy-free thread a `ZPOPMIN` that
-    /// handed it over took 14 ms (the unmapping holds the process's memory
-    /// map). Sampling a sparse table walks it once a command (see
-    /// [`Self::try_bucket`]).
-    fn shrink_if_sparse(&mut self, work: usize) {
-        if !self.is_sparse()
-            || self.members.num_buckets() > SHRINK_INLINE_BUCKETS.max(work.saturating_mul(8))
-        {
-            return;
-        }
-        let hasher = &self.hasher;
-        let mut smaller = HashTable::with_capacity(self.members.len() * 2);
-        for entry in self.members.drain() {
-            smaller.insert_unique(hasher.hash_one(&*entry.0), entry, |(have, _)| {
-                hasher.hash_one(&**have)
-            });
-        }
-        let emptied = std::mem::replace(&mut self.members, smaller);
-        if emptied.num_buckets() > SHRINK_INLINE_BUCKETS {
-            // A command that did as much work as the table is big (a bulk
-            // removal, a `ZADD` of members given many times): its memory
-            // goes back off the command path. Not an object of the
-            // keyspace's: `INFO`'s lazy-free counts are left as they are.
-            crate::lazyfree::free_later(emptied, 0);
-        }
-    }
-
-    /// The bucket of a member picked at random, any one as likely as
-    /// another, in at most sixty-four tries: `None` if the set is empty or
-    /// every try found an empty bucket.
-    ///
-    /// A bucket picked at random is taken if it holds a member and picked
-    /// again if not: each try is every bucket alike, so the one taken is
-    /// every member alike. A table at least an eighth full misses sixty-four
-    /// times in a row about once in five thousand picks; one left sparse
-    /// (reserved for more than came, or too big to shrink on the command
-    /// path) misses more often, and a caller then picks by a walk instead,
-    /// which is uniform too. Whether the tries miss depends on which
-    /// buckets are full, not on which member a hit would give, so switching
-    /// to a walk keeps every pick uniform.
-    #[inline]
-    fn try_bucket(&self, rng: &mut impl rand::Rng) -> Option<usize> {
-        if self.members.is_empty() {
-            return None;
-        }
-        let buckets = self.members.num_buckets();
-        for _ in 0..64 {
-            let at = rng.gen_range(0..buckets);
-            if self.members.get_bucket(at).is_some() {
-                return Some(at);
-            }
-        }
-        None
-    }
-
-    /// A member and its score, picked at random: a random bucket, or after
-    /// sixty-four misses a walk to a random member.
-    fn random(&self, rng: &mut impl rand::Rng) -> Option<&(ZMember, f64)> {
-        if let Some(at) = self.try_bucket(rng) {
-            return self.members.get_bucket(at);
-        }
-        use rand::seq::IteratorRandom;
-        self.members.iter().choose(rng)
-    }
-
-    /// `count` different members, picked at random, in a random order, for
-    /// a count of no more than a third of the set: one bucket at a time, a
-    /// bucket that comes up twice picked again. Each pick is every member
-    /// not yet picked alike, so the sample is as `rand::seq::index::sample`
-    /// would give; the expected tries are at most twelve a member (a table
-    /// an eighth full, the third of it already picked). `None` if a pick
-    /// missed sixty-four times (a sparse table): the caller then samples by
-    /// one walk, and what was picked so far is dropped, which is fair, as
-    /// the misses do not depend on which members were picked.
-    fn random_distinct(
-        &self,
-        count: usize,
-        rng: &mut impl rand::Rng,
-    ) -> Option<Vec<&(ZMember, f64)>> {
-        debug_assert!(count <= self.len());
-        let mut seen: ahash::AHashSet<usize> = ahash::AHashSet::with_capacity(count);
-        let mut picked = Vec::with_capacity(count);
-        while picked.len() < count {
-            let at = self.try_bucket(rng)?;
-            if seen.insert(at)
-                && let Some(entry) = self.members.get_bucket(at)
-            {
-                picked.push(entry);
-            }
-        }
-        Some(picked)
-    }
-}
-
-/// The biggest table (1.5 MB of buckets) a single removal (`ZREM`,
-/// `ZPOP*`) makes smaller: it moves fewer than 8,192 members, about 0.23 ms
-/// on a `Standard_D4s_v5` (4,096 take 0.08 ms, 16,384 0.64 ms; see the
-/// `shrink_cost` test).
-const SHRINK_INLINE_BUCKETS: usize = 1 << 16;
 
 impl SortedSetInner {
     pub fn new() -> Self {
@@ -434,50 +194,57 @@ impl SortedSetInner {
     }
 
     /// The bytes of the large form's own allocation (the box holding the
-    /// table and the tree, without their contents).
+    /// table and the index, without their contents).
     pub const LARGE_HEADER: usize = std::mem::size_of::<Large>();
+
+    /// Everything the set holds but its own handle, in O(1): a block's one
+    /// allocation, room to spare included; for the large form its box, the
+    /// table exactly as `used_memory` counts it (group arrays, overflow
+    /// groups, the members' entries at their pool class's size) and the
+    /// index's estimate (`memory_layout::score_index`). For `MEMORY USAGE`.
+    pub fn allocation_size(&self) -> usize {
+        match &self.repr {
+            Repr::Packed(block) => block.allocation_size(),
+            Repr::Large(large) => Self::LARGE_HEADER + large.allocation_size(),
+        }
+    }
 
     /// How many allocations freeing the set frees, as Redis counts them for
     /// lazy freeing: a block is one.
     pub fn free_effort(&self) -> usize {
         match &self.repr {
             Repr::Packed(_) => 1,
-            Repr::Large(large) => large.members.len(),
+            Repr::Large(large) => large.len(),
         }
     }
 
     /// Bytes that freeing the set gives back, at least (for eviction): a
-    /// block's, exactly; the large form's, `per_member` a member.
-    pub fn freeing_at_least(&self, per_member: usize) -> usize {
+    /// block's, exactly; the large form's box and table exactly (the index,
+    /// which is estimated, not counted: `per_member` is kept for the callers
+    /// that pass one for every type).
+    pub fn freeing_at_least(&self, _per_member: usize) -> usize {
         match &self.repr {
             Repr::Packed(block) => block.allocation_size(),
-            Repr::Large(large) => large.members.len() * per_member,
+            Repr::Large(large) => Self::LARGE_HEADER + large.table_bytes(),
         }
     }
 
-    /// The table and the tree, from the block, in one pass in order; with
-    /// room in the table for `more` members besides.
+    /// The large form, from the block, in one pass in order, the table
+    /// sized for the block's members (a command that adds more grows it as
+    /// they come: a table is never sized for a command's arguments, which
+    /// may name a member many times).
     #[cold]
     #[inline(never)]
-    fn make_large(&mut self, more: usize) {
+    fn make_large(&mut self) {
         let Repr::Packed(block) = &self.repr else {
             return;
         };
-        let mut large = Large::with_capacity(block.len() + more);
-        let mut keys = Vec::with_capacity(block.len());
+        let mut built = Builder::with_capacity(block.len());
         for (member, score) in block.iter() {
-            let member: ZMember = Arc::from(member);
-            // A block's members are distinct.
-            let hasher = &large.hasher;
-            large.members.insert_unique(
-                hasher.hash_one(&*member),
-                (Arc::clone(&member), score),
-                |(have, _)| hasher.hash_one(&**have),
-            );
-            keys.push(((OrderedFloat(score), member), ()));
+            // A block's members are short, different and in order.
+            let _ = built.push(member, score);
         }
-        large.by_score = keys.into_iter().collect();
-        self.repr = Repr::Large(Box::new(large));
+        self.repr = Repr::Large(Box::new(built.finish()));
     }
 
     #[inline]
@@ -496,7 +263,7 @@ impl SortedSetInner {
     /// as it is).
     pub fn expect(&mut self, elements: usize) {
         if self.is_packed() && elements > packed_entries() {
-            self.make_large(elements);
+            self.make_large();
         }
     }
 
@@ -506,16 +273,10 @@ impl SortedSetInner {
     /// holds a sorted set of up to 128 members: `ZADD z -0 m` then
     /// `ZSCORE z m` is `0` (#422).
     pub fn insert(&mut self, member: ZMember, score: f64) -> bool {
-        // -0 + 0 is 0; any other score is itself.
-        let score = score + 0.0;
-        match &mut self.repr {
-            Repr::Large(large) => large.insert(member, score),
-            Repr::Packed(_) => self.insert_bytes(&member, score),
-        }
+        self.insert_bytes(&member, score)
     }
 
-    /// [`insert`](Self::insert) of a member's bytes: a block copies them,
-    /// and the large form makes its `Arc` of them only if the member is new.
+    /// [`insert`](Self::insert) of a member's bytes, which are copied in.
     pub fn insert_bytes(&mut self, member: &[u8], score: f64) -> bool {
         self.upsert(member, |old| (Some(score), old.is_none()))
     }
@@ -551,35 +312,14 @@ impl SortedSetInner {
                             let at = block.lower_bound(score, member, false);
                             block.insert_new(at, member, &Score::new(score), f);
                         } else {
-                            self.make_large(1);
-                            self.large_mut().insert(Arc::from(member), score);
+                            self.make_large();
+                            self.large_mut().insert(member, score);
                         }
                     }
                     out
                 }
             },
-            Repr::Large(large) => match large.get(member) {
-                Some(&(ref key, old)) => {
-                    let (score, out) = decide(Some(old));
-                    if let Some(score) = score {
-                        let score = score + 0.0;
-                        if score.to_bits() != old.to_bits() {
-                            // The member's own `Arc`, for both indexes: no
-                            // second copy of its bytes.
-                            let key = Arc::clone(key);
-                            large.insert(key, score);
-                        }
-                    }
-                    out
-                }
-                None => {
-                    let (score, out) = decide(None);
-                    if let Some(score) = score {
-                        large.insert(Arc::from(member), score + 0.0);
-                    }
-                    out
-                }
-            },
+            Repr::Large(large) => large.upsert(member, decide),
         }
     }
 
@@ -599,22 +339,16 @@ impl SortedSetInner {
 
     /// Removes and returns the member with the lowest score.
     pub fn pop_min(&mut self) -> Option<(ZMember, f64)> {
-        match &mut self.repr {
-            Repr::Large(large) => large.pop_min(),
-            Repr::Packed(_) => self.pop_with(false, |member, score| (Arc::from(member), score)),
-        }
+        self.pop_with(false, |member, score| (Arc::from(member), score))
     }
 
     /// Removes and returns the member with the highest score.
     pub fn pop_max(&mut self) -> Option<(ZMember, f64)> {
-        match &mut self.repr {
-            Repr::Large(large) => large.pop_max(),
-            Repr::Packed(_) => self.pop_with(true, |member, score| (Arc::from(member), score)),
-        }
+        self.pop_with(true, |member, score| (Arc::from(member), score))
     }
 
     /// Removes the member with the lowest score (`max`: the highest), and
-    /// hands it to `take` before it goes: a block's member is not copied.
+    /// hands it to `take` before it goes: it is not copied.
     #[inline]
     pub fn pop_with<R>(&mut self, max: bool, take: impl FnOnce(&[u8], f64) -> R) -> Option<R> {
         match &mut self.repr {
@@ -628,21 +362,14 @@ impl SortedSetInner {
                 block.remove_at(at);
                 Some(out)
             }
-            Repr::Large(large) => {
-                let (member, score) = if max {
-                    large.pop_max()
-                } else {
-                    large.pop_min()
-                }?;
-                Some(take(&member, score))
-            }
+            Repr::Large(large) => large.pop_with(max, take),
         }
     }
 
     pub fn score(&self, member: &[u8]) -> Option<f64> {
         match &self.repr {
             Repr::Packed(block) => block.find(member).map(|i| block.score(i)),
-            Repr::Large(large) => large.get(member).map(|&(_, score)| score),
+            Repr::Large(large) => large.score(member),
         }
     }
 
@@ -650,15 +377,7 @@ impl SortedSetInner {
     pub fn rank(&self, member: &[u8]) -> Option<(usize, f64)> {
         match &self.repr {
             Repr::Packed(block) => block.find(member).map(|i| (i, block.score(i))),
-            Repr::Large(large) => {
-                let (stored, score) = large.get(member)?;
-                let score = *score;
-                let rank = large
-                    .by_score
-                    .range(..(OrderedFloat(score), Arc::clone(stored)))
-                    .count();
-                Some((rank, score))
-            }
+            Repr::Large(large) => large.rank(member),
         }
     }
 
@@ -668,9 +387,8 @@ impl SortedSetInner {
             Repr::Packed(block) => Either::A(Packed(block.iter())),
             Repr::Large(large) => Either::B(
                 large
-                    .by_score
-                    .keys()
-                    .map(|(score, member)| (Member::Shared(member), score.0)),
+                    .iter()
+                    .map(|(member, score)| (Member::Bytes(member), score)),
             ),
         }
     }
@@ -685,12 +403,11 @@ impl SortedSetInner {
         let end = stop.saturating_add(1).min(len);
         match &self.repr {
             Repr::Packed(block) => Either::A(Packed(block.range(start.min(end), end))),
-            Repr::Large(large) => Either::B(RankRange {
-                keys: large.by_score.keys(),
-                skip_front: start,
-                skip_back: len - end,
-                left: end.saturating_sub(start),
-            }),
+            Repr::Large(large) => Either::B(
+                large
+                    .range_by_rank(start.min(end), end)
+                    .map(|(member, score)| (Member::Bytes(member), score)),
+            ),
         }
     }
 
@@ -700,38 +417,19 @@ impl SortedSetInner {
             Repr::Packed(block) => Either::A(Packed(block.iter())),
             Repr::Large(large) => Either::B(
                 large
-                    .members
-                    .iter()
-                    .map(|(member, score)| (Member::Shared(member), *score)),
+                    .iter_unordered()
+                    .map(|(member, score)| (Member::Bytes(member), score)),
             ),
         }
     }
 
-    /// A page of a scan from `cursor`: see `helpers::scan_page`. A block is
-    /// one page, whole, whatever the cursor: as Redis scans a listpack.
-    pub fn scan_page(
-        &self,
-        cursor: u64,
-        count: usize,
-        pages: usize,
-    ) -> (impl ExactSizeIterator<Item = (Member<'_>, f64)>, u64) {
-        use crate::commands::helpers::{prefetched, scan_page, scan_position};
+    /// The table of the large form, for `ZSCAN`'s cursor (`table_scan`);
+    /// `None` for a block, which `ZSCAN` returns whole.
+    #[inline]
+    pub fn table(&self) -> Option<&CollectionTable<Scores>> {
         match &self.repr {
-            Repr::Packed(block) => (Either::A(Packed(block.iter())), 0),
-            Repr::Large(large) => {
-                let (page, next_cursor) = scan_page(
-                    prefetched(large.members.iter(), |(member, _)| member.as_ptr())
-                        .map(|(member, score)| (scan_position(member), (member, *score))),
-                    cursor,
-                    count,
-                    large.members.len(),
-                    pages,
-                );
-                let page = page
-                    .into_iter()
-                    .map(|(member, score)| (Member::Shared(member), score));
-                (Either::B(page), next_cursor)
-            }
+            Repr::Large(large) => Some(large.table()),
+            Repr::Packed(_) => None,
         }
     }
 
@@ -747,9 +445,8 @@ impl SortedSetInner {
             }
             Repr::Large(large) => Either::B(
                 large
-                    .by_score
-                    .range(range)
-                    .map(|((score, member), _)| (Member::Shared(member), score.0)),
+                    .range(probe(range.start_bound()), probe(range.end_bound()))
+                    .map(|(member, score)| (Member::Bytes(member), score)),
             ),
         }
     }
@@ -773,7 +470,7 @@ impl SortedSetInner {
     }
 
     /// A member and its score, any one as likely as another (`ZRANDMEMBER`):
-    /// a block's by its index, the large form's by a random bucket of its
+    /// a block's by its index, the large form's by a random slot of its
     /// table. Neither depends on how many members there are.
     pub fn random(&self, rng: &mut impl rand::Rng) -> Option<(Member<'_>, f64)> {
         match &self.repr {
@@ -784,7 +481,7 @@ impl SortedSetInner {
             }
             Repr::Large(large) => large
                 .random(rng)
-                .map(|(member, score)| (Member::Shared(member), *score)),
+                .map(|(member, score, _)| (Member::Bytes(member), score)),
         }
     }
 
@@ -793,14 +490,13 @@ impl SortedSetInner {
     /// `count` is the size of the set or more, but then in no order that
     /// was picked.
     ///
-    /// A few of many (no more than a third) are picked a bucket at a time,
-    /// a bucket that comes up twice picked again. More are found by one walk
-    /// of the table to the last of the positions chosen, which is then no
-    /// more work than the answer is long. A block is asked for the chosen
-    /// places only. Every way gives each set of `count` members, in each
-    /// order, alike. A table too sparse to pick from by bucket (see
-    /// `Large::try_bucket`) is walked once, whatever the count: no call
-    /// costs more than one walk of the table and the count.
+    /// A few of many (no more than a third) are picked a member at a time
+    /// from the table, a member that comes up twice (told apart by its
+    /// entry's address) picked again: the expected picks are at most 1.5 a
+    /// member. More are found by one walk of the table to the last of the
+    /// positions chosen, which is then no more work than the answer is
+    /// long. A block is asked for the chosen places only. Every way gives
+    /// each set of `count` members, in each order, alike.
     pub fn random_distinct(
         &self,
         count: usize,
@@ -810,24 +506,26 @@ impl SortedSetInner {
         let count = count.min(len);
         if let Repr::Large(large) = &self.repr
             && count * 3 <= len
-            && let Some(picked) = large.random_distinct(count, rng)
         {
-            return picked
-                .into_iter()
-                .map(|(member, score)| (Member::Shared(member), *score))
-                .collect();
+            let mut seen: ahash::AHashSet<usize> = ahash::AHashSet::with_capacity(count);
+            let mut picked = Vec::with_capacity(count);
+            while picked.len() < count {
+                let Some((member, score, at)) = large.random(rng) else {
+                    break;
+                };
+                if seen.insert(at) {
+                    picked.push((Member::Bytes(member), score));
+                }
+            }
+            return picked;
         }
         self.members_at(&rand::seq::index::sample(rng, len, count).into_vec())
     }
 
     /// `count` members picked at random, each on its own (so they may
     /// repeat), handed to `f` in the order picked (`ZRANDMEMBER` with a
-    /// negative count). A block's by index; the large form's by random
-    /// bucket while the buckets tried hold members, and if a pick misses
-    /// sixty-four times (a sparse table), every pick left by one walk of the
-    /// table: a call costs at most one walk and the count, as the walk alone
-    /// did before. Whether a pick misses does not depend on which member a
-    /// hit would give, so every pick is every member alike either way.
+    /// negative count): a block's by index, the large form's by a random
+    /// slot of its table each. A call costs the count, whatever the size.
     pub fn random_each(
         &self,
         count: usize,
@@ -838,41 +536,31 @@ impl SortedSetInner {
         if len == 0 {
             return;
         }
-        let large = match &self.repr {
+        match &self.repr {
             Repr::Packed(block) => {
                 for _ in 0..count {
                     let (member, score) = block.get(rng.gen_range(0..len));
                     f(Member::Bytes(member), score);
                 }
-                return;
             }
-            Repr::Large(large) => large,
-        };
-        let mut done = 0;
-        while done < count {
-            let Some((member, score)) = large
-                .try_bucket(rng)
-                .and_then(|at| large.members.get_bucket(at))
-            else {
-                break;
-            };
-            f(Member::Shared(member), *score);
-            done += 1;
-        }
-        if done < count {
-            let picks: Vec<usize> = (done..count).map(|_| rng.gen_range(0..len)).collect();
-            for (member, score) in self.members_at(&picks) {
-                f(member, score);
+            Repr::Large(large) => {
+                for _ in 0..count {
+                    let Some((member, score, _)) = large.random(rng) else {
+                        return;
+                    };
+                    f(Member::Bytes(member), score);
+                }
             }
         }
     }
 
-    /// After a command has written `written` members: a table it reserved
-    /// for more than came (`ZADD` of members given twice) is made smaller,
-    /// which moves no more members than the command wrote.
-    pub fn settle(&mut self, written: usize) {
+    /// After a command has written `written` members: a table left under
+    /// an eighth full (by a reservation for more than came) starts to shrink,
+    /// a few members a write as any resize. The table is never reserved for
+    /// a command's arguments, so after `ZADD` or `GEOADD` this is a check.
+    pub fn settle(&mut self, _written: usize) {
         if let Repr::Large(large) = &mut self.repr {
-            large.shrink_if_sparse(written);
+            large.shrink_if_sparse();
         }
     }
 
@@ -893,11 +581,11 @@ impl SortedSetInner {
         };
         let mut slots: Vec<usize> = (0..picks.len()).collect();
         slots.sort_unstable_by_key(|&slot| picks[slot]);
-        let mut out: Vec<Option<(&ZMember, f64)>> = vec![None; picks.len()];
+        let mut out: Vec<Option<(&[u8], f64)>> = vec![None; picks.len()];
         // One walk, up to the highest position picked.
-        let mut walk = large.members.iter();
+        let mut walk = large.iter_unordered();
         let mut at: Option<usize> = None;
-        let mut last: Option<(&ZMember, f64)> = None;
+        let mut last: Option<(&[u8], f64)> = None;
         for slot in slots {
             let want = picks[slot];
             if at != Some(want) {
@@ -905,14 +593,14 @@ impl SortedSetInner {
                     Some(at) => want - at - 1,
                     None => want,
                 };
-                last = walk.nth(skip).map(|(member, score)| (member, *score));
+                last = walk.nth(skip);
                 at = Some(want);
             }
             out[slot] = last;
         }
         out.into_iter()
             .flatten()
-            .map(|(member, score)| (Member::Shared(member), score))
+            .map(|(member, score)| (Member::Bytes(member), score))
             .collect()
     }
 
@@ -925,19 +613,7 @@ impl SortedSetInner {
                 block.remove_range(start, stop + 1);
                 stop + 1 - start
             }
-            Repr::Large(_) => {
-                let gone: Vec<ZMember> = self
-                    .range_by_rank(start, stop)
-                    .map(|(member, _)| member.to_shared())
-                    .collect();
-                let large = self.large_mut();
-                for member in &gone {
-                    large.remove_only(member);
-                }
-                // Once, at the end: the command has paid for as many.
-                large.shrink_if_sparse(gone.len());
-                gone.len()
-            }
+            Repr::Large(large) => large.remove_ranks(start, stop + 1),
         }
     }
 
@@ -953,40 +629,20 @@ impl SortedSetInner {
                 block.remove_range(from, to);
                 to - from
             }
-            Repr::Large(_) => {
-                let gone: Vec<ZMember> = self
-                    .range_by_score(range)
-                    .map(|(member, _)| member.to_shared())
-                    .collect();
-                let large = self.large_mut();
-                for member in &gone {
-                    large.remove_only(member);
-                }
-                // Once, at the end: the command has paid for as many.
-                large.shrink_if_sparse(gone.len());
-                gone.len()
+            Repr::Large(large) => {
+                large.remove_range(probe(range.start_bound()), probe(range.end_bound()))
             }
         }
     }
 
     /// Take out the members `gone` says to; how many went.
-    pub fn remove_where(&mut self, mut gone: impl FnMut(&[u8], f64) -> bool) -> usize {
+    pub fn remove_where(&mut self, gone: impl FnMut(&[u8], f64) -> bool) -> usize {
         match &mut self.repr {
-            Repr::Packed(block) => block.retain(|member, score| !gone(member, score)),
-            Repr::Large(_) => {
-                let members: Vec<ZMember> = self
-                    .iter()
-                    .filter(|(member, score)| gone(member, *score))
-                    .map(|(member, _)| member.to_shared())
-                    .collect();
-                let large = self.large_mut();
-                for member in &members {
-                    large.remove_only(member);
-                }
-                // Once, at the end: the command has paid for as many.
-                large.shrink_if_sparse(members.len());
-                members.len()
+            Repr::Packed(block) => {
+                let mut gone = gone;
+                block.retain(|member, score| !gone(member, score))
             }
+            Repr::Large(large) => large.remove_where(gone),
         }
     }
 
@@ -1001,7 +657,7 @@ impl SortedSetInner {
     pub fn capacity(&self) -> usize {
         match &self.repr {
             Repr::Packed(block) => block.len(),
-            Repr::Large(large) => large.members.capacity(),
+            Repr::Large(large) => large.capacity(),
         }
     }
 
@@ -1009,7 +665,7 @@ impl SortedSetInner {
     pub fn len(&self) -> usize {
         match &self.repr {
             Repr::Packed(block) => block.len(),
-            Repr::Large(large) => large.members.len(),
+            Repr::Large(large) => large.len(),
         }
     }
 
@@ -1020,10 +676,14 @@ impl SortedSetInner {
 
     /// A builder of a set of about `count` members, given one at a time
     /// (a load, `RESTORE`, a command's result): a block if they fit one, the
-    /// table and the tree if not, built in one go either way.
+    /// large form if not, its table sized for them (up to 2^16 at first: a
+    /// count read from a file is not trusted further, and the table grows
+    /// as they come) and its index built in one go at the end.
     pub fn loader(count: usize) -> Loader {
         if count > packed_entries() {
-            Loader(Building::Large(Box::default()))
+            Loader(Building::Large(Box::new(Builder::with_capacity(
+                count.min(LOADER_RESERVE),
+            ))))
         } else {
             Loader(Building::Packed {
                 bytes: Vec::new(),
@@ -1044,6 +704,10 @@ impl SortedSetInner {
     }
 }
 
+/// The most members [`SortedSetInner::loader`] reserves room for before
+/// any is given.
+const LOADER_RESERVE: usize = 1 << 16;
+
 /// See [`SortedSetInner::loader`].
 pub struct Loader(Building);
 
@@ -1054,13 +718,22 @@ enum Building {
         bytes: Vec<u8>,
         entries: Vec<(u32, f64)>,
     },
-    /// The table and the tree, filled as the members come (a large load is
-    /// as fast as it was before blocks).
-    Large(Box<Large>),
+    /// The table filled as the members come, the index built at the end.
+    Large(Box<Builder>),
 }
 
 impl Loader {
+    /// Add a member a command gives (at most 512 MB, which the table
+    /// always holds).
     pub fn push(&mut self, member: &[u8], score: f64) {
+        let _ = self.push_loaded(member, score);
+    }
+
+    /// Add a member read from a snapshot, the AOF's base, a replication
+    /// stream or a `RESTORE` payload. A member too long for the table
+    /// ([`crate::collection_table::MAX_LEN`]) is an error, never dropped:
+    /// the load fails.
+    pub fn push_loaded(&mut self, member: &[u8], score: f64) -> std::io::Result<()> {
         // -0 + 0 is 0; any other score is itself.
         let score = score + 0.0;
         match &mut self.0 {
@@ -1070,36 +743,36 @@ impl Loader {
                 if member.len() > packed_value() || entries.len() >= 2 * packed_entries() {
                     // Past what a block holds: the large form, with those
                     // given so far, then this one.
-                    let mut large = Self::large_of(bytes, entries);
-                    large.insert(Arc::from(member), score);
-                    self.0 = Building::Large(large);
+                    let mut built = Self::large_of(bytes, entries, entries.len() + 1);
+                    built.push(member, score).map_err(too_long)?;
+                    self.0 = Building::Large(built);
                 } else {
                     bytes.extend_from_slice(member);
                     entries.push((bytes.len() as u32, score));
                 }
             }
-            Building::Large(large) => {
-                large.insert(Arc::from(member), score);
-            }
+            Building::Large(built) => built.push(member, score).map_err(too_long)?,
         }
+        Ok(())
     }
 
-    /// The large form of the members given so far, in the order given.
-    fn large_of(bytes: &[u8], entries: &[(u32, f64)]) -> Box<Large> {
-        let mut large = Box::<Large>::default();
+    /// The large form's builder, with the members given so far, in the
+    /// order given (each short).
+    fn large_of(bytes: &[u8], entries: &[(u32, f64)], room: usize) -> Box<Builder> {
+        let mut built = Box::new(Builder::with_capacity(room.min(LOADER_RESERVE)));
         let mut from = 0;
         for &(end, score) in entries {
             let end = end as usize;
-            large.insert(Arc::from(&bytes[from..end]), score);
+            let _ = built.push(&bytes[from..end], score);
             from = end;
         }
-        large
+        built
     }
 
     pub fn finish(self) -> SortedSetInner {
         match self.0 {
-            Building::Large(large) => SortedSetInner {
-                repr: Repr::Large(large),
+            Building::Large(built) => SortedSetInner {
+                repr: Repr::Large(Box::new(built.finish())),
             },
             Building::Packed { bytes, entries } => {
                 let mut pairs: Vec<(&[u8], f64)> = Vec::with_capacity(entries.len());
@@ -1144,8 +817,13 @@ impl Loader {
                     pairs = kept;
                 }
                 if pairs.len() > packed_entries() {
+                    // Sized for the members that stay, laid down in order.
+                    let mut built = Builder::with_capacity(pairs.len());
+                    for (member, score) in pairs {
+                        let _ = built.push(member, score);
+                    }
                     return SortedSetInner {
-                        repr: Repr::Large(Self::large_of(&bytes, &entries)),
+                        repr: Repr::Large(Box::new(built.finish())),
                     };
                 }
                 SortedSetInner {
@@ -1154,6 +832,17 @@ impl Loader {
             }
         }
     }
+}
+
+#[cold]
+fn too_long(_: crate::collection_table::TooLong) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "a sorted set member longer than the {} bytes a sorted set holds",
+            crate::collection_table::MAX_LEN
+        ),
+    )
 }
 
 impl Default for SortedSetInner {
@@ -1171,6 +860,153 @@ impl std::fmt::Debug for SortedSetInner {
             )
             .finish()
     }
+}
+
+// ── the background's part ─────────────────────────────────────────────────────
+//
+// See `resize_background`: a write that leaves its set's table mid-resize, or
+// with a finished resize's old array kept back, hands the set over, and the
+// active-expire thread finishes it a step at a time under the set's lock. A
+// resize moves the table's slot words, never an entry, so the index's
+// references stay good throughout.
+
+type Shared = Arc<RwLock<SortedSetInner>>;
+
+impl SortedSetInner {
+    /// Whether the background has work on this set (a resize to finish, or
+    /// a finished one's array to free) that it has not been handed yet; if
+    /// so, it is now marked handed. Near `maxmemory` the work is done here
+    /// instead ([`Self::settle_if_tight`]) and nothing is handed over.
+    #[inline]
+    fn hand_over(&mut self) -> bool {
+        let Repr::Large(large) = &mut self.repr else {
+            return false;
+        };
+        if !(large.resizing() || large.holds_retired()) {
+            return false;
+        }
+        if self.settle_if_tight() {
+            return false;
+        }
+        let Repr::Large(large) = &mut self.repr else {
+            return false;
+        };
+        let due = !large.queued;
+        large.queued = true;
+        due
+    }
+
+    /// Near `maxmemory`, finish a resize in progress and free the old
+    /// arrays now, on this thread: the arrays a resize holds are there only
+    /// until it ends, and must never be what makes the server refuse a
+    /// write or evict a key. Returns whether it did. See
+    /// `resize_background::tight`.
+    #[cold]
+    fn settle_if_tight(&mut self) -> bool {
+        let Repr::Large(large) = &mut self.repr else {
+            return false;
+        };
+        if !crate::resize_background::tight(large.transient_bytes()) {
+            return false;
+        }
+        while !large.step_resize(usize::MAX) {}
+        drop(large.take_retired());
+        true
+    }
+
+    /// One step of the background's work on the set: about `budget` units
+    /// of a resize in progress. Returns whether the set has no more for it,
+    /// and the array a finished resize left, to be freed elsewhere.
+    fn background_step(
+        &mut self,
+        budget: usize,
+    ) -> (bool, Option<crate::collection_table::Retired>) {
+        let Repr::Large(large) = &mut self.repr else {
+            return (true, None);
+        };
+        let finished = large.step_resize(budget);
+        let retired = large.take_retired();
+        if finished {
+            large.queued = false;
+        }
+        (finished, retired)
+    }
+
+    /// Whether the set is handed to the background (tests).
+    #[cfg(test)]
+    pub(crate) fn is_queued(&self) -> bool {
+        matches!(&self.repr, Repr::Large(large) if large.queued)
+    }
+
+    /// Finish whatever resize is in progress now, and free what it leaves
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn finish_resize(&mut self) {
+        while !self.background_step(usize::MAX).0 {}
+    }
+}
+
+impl crate::resize_background::Resizable for RwLock<SortedSetInner> {
+    fn try_step(&self, budget: usize) -> Option<(bool, Option<crate::collection_table::Retired>)> {
+        Some(self.try_write()?.background_step(budget))
+    }
+
+    fn try_settle(&self) -> Option<bool> {
+        let mut inner = self.try_write()?;
+        let Repr::Large(large) = &mut inner.repr else {
+            return Some(false);
+        };
+        let released = large.transient_bytes() > 0;
+        while !large.step_resize(usize::MAX) {}
+        drop(large.take_retired());
+        large.queued = false;
+        Some(released)
+    }
+
+    fn let_go(self: Arc<Self>) -> bool {
+        match Arc::into_inner(self) {
+            Some(last) => {
+                crate::lazyfree::free_later(last, 0);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// After a write to `set` (whose write lock `inner` is): hands it to the
+/// background if its table has work there. A few instructions when not.
+#[inline]
+pub fn after_write(set: &Shared, inner: &mut SortedSetInner) {
+    if inner.hand_over() {
+        hand(set);
+    }
+}
+
+#[cold]
+fn hand(set: &Shared) {
+    let weak: Weak<RwLock<SortedSetInner>> = Arc::downgrade(set);
+    crate::resize_background::hand(weak);
+}
+
+/// `set` made a key's value: shared, and handed to the background if a
+/// resize it went through while it was built is still in progress. What
+/// every sorted set made whole goes through (a new key of `ZADD`, `ZINCRBY`
+/// or `GEOADD`, a load, `RESTORE`, `COPY`, a `*STORE` command's result).
+///
+/// A new `Arc` is never in the background's registry, so a mark of having
+/// been handed over (from a set moved out of another value) is cleared
+/// first.
+pub fn shared(mut set: SortedSetInner) -> Shared {
+    if let Repr::Large(large) = &mut set.repr {
+        large.queued = false;
+    }
+    let due = set.hand_over();
+    let shared = Arc::new(RwLock::new(set));
+    if due {
+        hand(&shared);
+    }
+    shared
 }
 
 /// A block's entries as a sorted set hands them out.
@@ -1289,54 +1125,10 @@ impl<T, A: ExactSizeIterator<Item = T>, B: ExactSizeIterator<Item = T>> ExactSiz
 {
 }
 
-struct RankRange<'a> {
-    keys: btree_map::Keys<'a, ScoreKey, ()>,
-    // Members outside the range, walked past on the first step from each end.
-    skip_front: usize,
-    skip_back: usize,
-    left: usize,
-}
-
-impl<'a> Iterator for RankRange<'a> {
-    type Item = (Member<'a>, f64);
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.left == 0 {
-            return None;
-        }
-        self.left -= 1;
-        if self.skip_front > 0 {
-            self.keys.nth(std::mem::take(&mut self.skip_front) - 1);
-        }
-        let (score, member) = self.keys.next()?;
-        Some((Member::Shared(member), score.0))
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.left, Some(self.left))
-    }
-}
-
-impl DoubleEndedIterator for RankRange<'_> {
-    #[inline]
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.left == 0 {
-            return None;
-        }
-        self.left -= 1;
-        if self.skip_back > 0 {
-            self.keys.nth_back(std::mem::take(&mut self.skip_back) - 1);
-        }
-        let (score, member) = self.keys.next_back()?;
-        Some((Member::Shared(member), score.0))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resize_background::step_background;
     use std::collections::{BTreeSet, HashMap};
 
     fn m(name: &[u8]) -> ZMember {
@@ -1352,19 +1144,14 @@ mod tests {
 
     fn made_large() -> SortedSetInner {
         let mut zs = SortedSetInner::new();
-        zs.make_large(0);
+        zs.make_large();
         zs
     }
 
-    /// `members` and `by_score` hold exactly the same (member, score) pairs.
-    /// (By value: after a score update the two keys can be different Arcs of
-    /// the same bytes, as `insert` keeps the old key in `members`.)
+    /// The table and the index hold exactly the same members, the index's
+    /// references the table's entries (`Large::check`).
     fn assert_in_sync(zs: &SortedSetInner) {
-        let zs = large(zs);
-        assert_eq!(zs.members.len(), zs.by_score.len());
-        for (score, member) in zs.by_score.keys() {
-            assert_eq!(zs.get(member.as_ref()).map(|e| e.1), Some(score.0));
-        }
+        large(zs).check();
     }
 
     fn order(zs: &SortedSetInner) -> Vec<(Vec<u8>, f64)> {
@@ -1416,30 +1203,24 @@ mod tests {
         assert!(zs.remove(b"a"));
         assert!(zs.remove(b"b"));
         assert!(zs.is_empty());
-        assert!(large(&zs).by_score.is_empty());
+        assert!(large(&zs).is_empty());
     }
 
-    /// Removal drops the member's last reference: neither index keeps it.
+    /// A score changed through `upsert` is written into the member's entry
+    /// in place: the entry is where it was, and the index finds it at its
+    /// new score.
     #[test]
-    fn remove_releases_the_member() {
-        let mut zs = made_large();
-        let a = m(b"a");
-        zs.insert(Arc::clone(&a), 1.0);
-        assert_eq!(Arc::strong_count(&a), 3); // ours, members, by_score
-        assert!(zs.remove(b"a"));
-        assert_eq!(Arc::strong_count(&a), 1);
-    }
-
-    /// A score changed through `upsert` keeps the member's one `Arc`.
-    #[test]
-    fn a_large_set_keeps_one_copy_of_a_member_whose_score_changes() {
+    fn a_score_change_rewrites_the_entry_in_place() {
         let mut zs = made_large();
         zs.insert_bytes(b"a", 1.0);
+        zs.insert_bytes(b"b", 1.5);
+        let at = |zs: &SortedSetInner| zs.table().unwrap().entry(b"a").unwrap();
+        let before = at(&zs);
         zs.upsert(b"a", |_| (Some(2.0), ()));
-        let large = large(&zs);
-        let (key, _) = large.get(b"a").unwrap();
-        assert_eq!(Arc::strong_count(key), 2);
+        assert_eq!(at(&zs), before);
         assert_eq!(zs.score(b"a"), Some(2.0));
+        assert_eq!(zs.rank(b"a"), Some((1, 2.0)));
+        assert_in_sync(&zs);
     }
 
     /// The model of a sorted set: (score, member) in order, and each
@@ -1882,15 +1663,14 @@ mod tests {
         assert!(SortedSetInner::new().random(&mut rng).is_none());
     }
 
-    /// A big table emptied of most of its members one at a time is kept at
-    /// its size (shrinking it would stall a command), and the picks stay
-    /// uniform, by the walk; so they do from one reserved far beyond its
-    /// members.
+    /// A big set emptied of most of its members one at a time shrinks its
+    /// table as it goes (a few members a removal, the rest by the
+    /// background), and the picks stay uniform throughout, mid-shrink too.
     #[test]
-    fn random_picks_stay_uniform_in_a_sparse_table() {
+    fn random_picks_stay_uniform_as_a_table_shrinks() {
         let mut rng = rand::thread_rng();
         let mut zs = numbered(100_000, false);
-        let big = large(&zs).members.num_buckets();
+        let big = zs.allocation_size();
         // Every member but m0..m49 by every remover: one at a time, the
         // lowest, the highest, by rank and by score.
         assert_eq!(zs.remove_ranks(90_000, 99_999), 10_000);
@@ -1907,45 +1687,34 @@ mod tests {
         while zs.len() > 50 {
             zs.pop_max();
         }
-        assert_in_sync(&zs);
-        assert_eq!(large(&zs).members.num_buckets(), big);
-        assert!(large(&zs).is_sparse());
+        large(&zs).check();
         let mut one = vec![0u64; 50];
         for _ in 0..50 * 400 {
             one[index_of(&zs.random(&mut rng).unwrap().0)] += 1;
         }
         assert_eq!(chi_square_fails(&one), None);
-
-        // Reserved for a hundred thousand, holding two hundred.
-        let mut zs = SortedSetInner::new();
-        zs.expect(100_000);
-        for i in 0..200 {
-            zs.insert_bytes(format!("m{i}").as_bytes(), i as f64);
-        }
-        assert!(large(&zs).members.num_buckets() > 200 * 256);
-        let mut one = vec![0u64; 200];
-        for _ in 0..200 * 100 {
-            one[index_of(&zs.random(&mut rng).unwrap().0)] += 1;
-        }
-        assert_eq!(chi_square_fails(&one), None);
-        let sample = zs.random_distinct(50, &mut rng);
+        zs.finish_resize();
+        assert!(
+            zs.allocation_size() * 20 < big,
+            "{} bytes left of {big}",
+            zs.allocation_size()
+        );
+        let sample = zs.random_distinct(16, &mut rng);
         let distinct: BTreeSet<usize> = sample.iter().map(|(m, _)| index_of(m)).collect();
-        assert_eq!(distinct.len(), 50);
+        assert_eq!(distinct.len(), 16);
     }
-    /// A table reserved for a hundred thousand and holding one member, or a
-    /// thousand: every pick misses often, and a call falls back to one walk
-    /// for all its picks, so a hundred thousand picks cost about one walk,
-    /// not a hundred thousand; and they are still every member alike.
+
+    /// `ZRANDMEMBER` costs the count asked for: a hundred thousand picks of
+    /// a set that held a hundred thousand members and keeps one, or a
+    /// thousand, take no walk a pick, and are every member alike.
     #[test]
-    fn a_sparse_table_is_sampled_in_one_walk_a_call() {
+    fn picks_cost_the_count_whatever_the_table_held() {
         let mut rng = rand::thread_rng();
         for n in [1usize, 1000] {
-            let mut zs = SortedSetInner::new();
-            zs.expect(100_000);
-            for i in 0..n {
-                zs.insert_bytes(format!("m{i}").as_bytes(), i as f64);
+            let mut zs = numbered(100_000, false);
+            for i in n..100_000 {
+                assert!(zs.remove(format!("m{i}").as_bytes()));
             }
-            assert!(large(&zs).is_sparse());
             let start = std::time::Instant::now();
             let mut counts = vec![0u64; n];
             let mut picks = 0;
@@ -1959,14 +1728,12 @@ mod tests {
             let distinct: BTreeSet<usize> = sample.iter().map(|(m, _)| index_of(m)).collect();
             assert_eq!(distinct.len(), n / 3);
             let took = start.elapsed();
-            // A walk a pick would be 100,000 walks of 131,072 buckets.
             assert!(
                 took < std::time::Duration::from_secs(3),
                 "{n} members: {took:?}"
             );
             if n > 1 {
                 assert_eq!(chi_square_fails(&counts), None, "picks of {n}");
-                // Distinct samples on the walk path: every member alike.
                 let mut all = vec![0u64; n];
                 let mut first = vec![0u64; n];
                 for _ in 0..(5 * n) {
@@ -1979,99 +1746,222 @@ mod tests {
                 assert_eq!(chi_square_fails(&all), None, "distinct of {n}");
                 assert_eq!(chi_square_fails(&first), None, "first of distinct of {n}");
             }
-            // What a ZADD does after its writes: as small as what came.
-            zs.settle(100_000);
-            assert!(!large(&zs).is_sparse());
-            assert_eq!(zs.len(), n);
         }
     }
 
-    /// A single removal makes a table smaller only if it has no more than
-    /// `SHRINK_INLINE_BUCKETS` buckets; a bulk removal, one of up to eight
-    /// buckets a member it removed; a bigger sparse table is kept.
+    /// A table is sized for the members it holds, not for a command's
+    /// arguments: a `ZADD` of a hundred thousand pairs naming two hundred
+    /// members leaves the table a `ZADD` of the two hundred once leaves, and
+    /// `settle` after it has nothing to give back.
     #[test]
-    fn a_shrink_on_the_command_path_is_bounded() {
-        // 30,000 members: 65,536 buckets. Shrunk by a pop once sparse.
-        let mut zs = numbered(30_000, false);
-        let buckets = large(&zs).members.num_buckets();
-        assert_eq!(buckets, SHRINK_INLINE_BUCKETS);
-        while zs.len() > 8_192 {
-            zs.pop_min();
+    fn a_table_is_sized_for_its_members_not_a_commands_arguments() {
+        own_limits(Some([128, 64]));
+        let mut repeated = SortedSetInner::new();
+        repeated.expect(100_000);
+        for i in 0..100_000 {
+            repeated.insert_bytes(format!("m{}", i % 200).as_bytes(), (i % 200) as f64);
         }
-        assert_eq!(large(&zs).members.num_buckets(), buckets);
-        // The first pop that leaves it less than an eighth full.
-        zs.pop_min();
-        assert!(large(&zs).members.num_buckets() < buckets);
-        assert!(!large(&zs).is_sparse());
-        assert_in_sync(&zs);
-
-        // 100,000 members: 131,072 buckets. Popped to 100: kept.
-        let mut zs = numbered(100_000, false);
-        let buckets = large(&zs).members.num_buckets();
-        assert!(buckets > SHRINK_INLINE_BUCKETS);
-        while zs.len() > 100 {
-            zs.pop_min();
+        repeated.settle(100_000);
+        let mut once = SortedSetInner::new();
+        once.expect(200);
+        for i in 0..200 {
+            once.insert_bytes(format!("m{i}").as_bytes(), i as f64);
         }
-        assert!(large(&zs).is_sparse());
-        assert_eq!(large(&zs).members.num_buckets(), buckets);
-        assert_in_sync(&zs);
-        // A bulk removal of the rest but one shrinks it only if it removed
-        // an eighth as many members as there are buckets: 99 do not.
-        assert_eq!(zs.remove_ranks(0, 98), 99);
-        assert_eq!(large(&zs).members.num_buckets(), buckets);
+        once.settle(200);
+        assert!(!repeated.is_packed() && !once.is_packed());
+        assert_eq!(order(&repeated), order(&once));
+        assert_eq!(repeated.capacity(), once.capacity());
+        // Each table has its own random seed, so their overflow groups
+        // differ a little.
+        let (a, b) = (repeated.allocation_size(), once.allocation_size());
+        assert!(a.abs_diff(b) * 20 <= b, "{a} against {b}");
+        own_limits(None);
+    }
 
-        // A bulk removal of most of the set shrinks once, at the end.
+    /// A bulk removal of most of the set shrinks the table as it goes and
+    /// ends at the size of what is left; so does a set popped down one at a
+    /// time. (A table shrinks once under an eighth full: it is never more
+    /// than about seven times the size its members need.)
+    #[test]
+    fn a_removal_leaves_a_table_sized_for_what_is_left() {
         let mut zs = numbered(100_000, false);
+        let full = zs.capacity();
         assert_eq!(zs.remove_ranks(0, 89_999), 90_000);
-        assert!(!large(&zs).is_sparse());
-        assert!(large(&zs).members.num_buckets() < buckets);
-        assert_in_sync(&zs);
+        large(&zs).check();
+        zs.finish_resize();
+        assert!(zs.capacity() < full);
+        assert!(
+            zs.capacity() <= 4 * zs.len(),
+            "{} for {}",
+            zs.capacity(),
+            zs.len()
+        );
+        while zs.len() > 1_000 {
+            zs.pop_min();
+        }
+        zs.finish_resize();
+        assert!(zs.capacity() <= 8 * zs.len());
+        large(&zs).check();
     }
 
-    /// What moving `n` members into a smaller table costs, and freeing a
-    /// big one: printed, for the choice of `SHRINK_INLINE_BUCKETS`. Run with `--release -- --ignored
-    /// --nocapture shrink_cost`.
+    /// A load gives up on a member the table cannot hold, rather than drop
+    /// it: the error says what, and nothing is half built.
     #[test]
-    #[ignore]
-    fn shrink_cost() {
-        for n in [4_096usize, 8_192, 16_384, 65_536, 262_144, 2_097_152] {
-            let mut best = std::time::Duration::MAX;
-            for _ in 0..5 {
-                let mut large = Large::with_capacity(n * 8);
-                for i in 0..n {
-                    large.insert(Arc::from(format!("membr:{i}").as_bytes()), i as f64);
-                }
-                let start = std::time::Instant::now();
-                large.shrink_if_sparse(usize::MAX);
-                best = best.min(start.elapsed());
-                assert!(!large.is_sparse());
+    fn a_load_refuses_what_a_table_cannot_hold() {
+        crate::collection_table::set_test_max_len(Some(100));
+        for count in [10, 1_000] {
+            let mut loader = SortedSetInner::loader(count);
+            for i in 0..count {
+                loader
+                    .push_loaded(format!("m{i}").as_bytes(), i as f64)
+                    .unwrap();
             }
-            println!("shrink of {n} members: {best:?}");
+            let err = loader
+                .push_loaded(&[b'x'; 101], 1.0)
+                .expect_err("a member over the limit");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         }
-        // A million members taken down to 8,192, one at a time: what
-        // shrinking that table would cost (it is not shrunk on the command
-        // path), and its parts.
-        let mut large = Large::default();
-        for i in 0..1_000_000usize {
-            large.insert(Arc::from(format!("membr:{i}").as_bytes()), i as f64);
+        crate::collection_table::set_test_max_len(None);
+    }
+
+    fn table_state(set: &Shared) -> (bool, bool, usize) {
+        let inner = set.read();
+        let t = inner.table().expect("a table");
+        (t.resizing(), t.holds_retired(), inner.allocation_size())
+    }
+
+    /// Steps the background until `set` has nothing left there, as the
+    /// expiry thread would; returns the longest hold of its lock.
+    fn finish_in_background(set: &Shared) -> std::time::Duration {
+        let mut longest = std::time::Duration::ZERO;
+        for _ in 0..1_000_000 {
+            let (resizing, retired, _) = table_state(set);
+            if !resizing && !retired && !set.read().is_queued() {
+                return longest;
+            }
+            let work = step_background(std::time::Duration::from_millis(1));
+            longest = longest.max(work.longest_hold);
         }
-        for i in 0..1_000_000 - 8_192 {
-            large.take(format!("membr:{i}").as_bytes());
+        panic!("the background never finished the set");
+    }
+
+    /// A set whose writes stop just after a growth started is finished by
+    /// the background with no further write, a step at a time, and its old
+    /// array freed; after most of it is removed, the shrinks the removes
+    /// leave are finished too, and the memory comes back. The index's
+    /// references are good throughout: the moves are slot words.
+    #[test]
+    fn the_background_finishes_a_resize_the_writes_left() {
+        own_limits(Some([128, 64]));
+        let n: usize = if cfg!(debug_assertions) {
+            200_000
+        } else {
+            3_000_000
+        };
+        let set = shared(SortedSetInner::new());
+        let mut i = 0usize;
+        {
+            let mut inner = set.write();
+            while i < n || !inner.table().is_some_and(|t| t.resizing()) {
+                inner.insert_bytes(format!("member:{i:010}").as_bytes(), i as f64);
+                i += 1;
+            }
+            after_write(&set, &mut inner);
+            assert!(inner.is_queued());
         }
-        let mut copy = large.clone();
-        let start = std::time::Instant::now();
-        large.shrink_if_sparse(usize::MAX);
-        let whole = start.elapsed();
-        assert!(!large.is_sparse());
-        let start = std::time::Instant::now();
-        let entries: Vec<_> = copy.members.drain().collect();
-        let drained = start.elapsed();
-        let start = std::time::Instant::now();
-        drop(copy);
-        let freed = start.elapsed();
-        println!(
-            "shrink from 2^21 buckets to {}: {whole:?} (drain {drained:?}, free in place {freed:?})",
-            entries.len()
+        let (resizing, _, mid) = table_state(&set);
+        assert!(resizing);
+        let longest = finish_in_background(&set);
+        let (_, _, done) = table_state(&set);
+        assert!(done < mid, "{done} bytes after, {mid} during");
+        assert_eq!(set.read().len(), i);
+        large(&set.read()).check();
+        eprintln!("growth to {i} members finished; longest hold {longest:?}");
+        {
+            let mut inner = set.write();
+            for j in 0..i {
+                if j % 20 != 0 {
+                    assert!(inner.remove(format!("member:{j:010}").as_bytes()));
+                }
+            }
+            after_write(&set, &mut inner);
+        }
+        finish_in_background(&set);
+        let (_, _, shrunk) = table_state(&set);
+        assert_eq!(set.read().len(), i.div_ceil(20));
+        assert!(
+            shrunk * 8 < done,
+            "{shrunk} bytes after the shrink, {done} before"
         );
+        large(&set.read()).check();
+        own_limits(None);
+    }
+
+    /// A set whose key went while it waited for the background is not kept
+    /// alive by it; one held by a reader is left for later, never waited
+    /// for; and a set moved out of its value mid-resize and made a key's
+    /// value again (as a value made whole from another's is) is handed over
+    /// again, not left with the old value's mark (the bug #976 found in
+    /// hashes).
+    #[test]
+    fn the_background_holds_sets_weakly_and_a_rewrapped_set_is_handed_over_again() {
+        own_limits(Some([128, 64]));
+        let grown = || {
+            let set = shared(SortedSetInner::new());
+            let mut inner = set.write();
+            let mut i = 0;
+            while i < 1000 || !inner.table().is_some_and(|t| t.resizing()) {
+                inner.insert_bytes(format!("m{i}").as_bytes(), i as f64);
+                i += 1;
+            }
+            after_write(&set, &mut inner);
+            drop(inner);
+            set
+        };
+        let gone = grown();
+        let weak = Arc::downgrade(&gone);
+        drop(gone);
+        assert!(weak.upgrade().is_none());
+        step_background(std::time::Duration::from_millis(50));
+        assert!(
+            !crate::resize_background::is_handed(weak.as_ptr().cast()),
+            "a deleted set stayed handed over"
+        );
+        let held = grown();
+        let reader = held.read();
+        step_background(std::time::Duration::from_millis(5));
+        assert!(reader.table().unwrap().resizing());
+        assert!(crate::resize_background::is_handed(
+            Arc::as_ptr(&held).cast()
+        ));
+        drop(reader);
+        finish_in_background(&held);
+        assert!(!crate::resize_background::is_handed(
+            Arc::as_ptr(&held).cast()
+        ));
+        let old = grown();
+        let inner = std::mem::take(&mut *old.write());
+        assert!(inner.is_queued());
+        drop(old);
+        let again = shared(inner);
+        assert!(again.read().is_queued());
+        assert!(crate::resize_background::is_handed(
+            Arc::as_ptr(&again).cast()
+        ));
+        finish_in_background(&again);
+        large(&again.read()).check();
+        // A set built whole mid-growth (a load, `RESTORE`, a `*STORE`
+        // command) is handed over as it is made a key's value.
+        let mut loader = SortedSetInner::loader(200_705);
+        for i in 0..200_705 {
+            loader.push(format!("x{i:08}").as_bytes(), i as f64);
+        }
+        let built = loader.finish();
+        assert!(built.table().unwrap().resizing());
+        let built = shared(built);
+        assert!(built.read().is_queued());
+        finish_in_background(&built);
+        large(&built.read()).check();
+        own_limits(None);
     }
 }

@@ -2508,9 +2508,9 @@ fn read_image_body(
                                 format!("{NAN_SCORE} in key '{}'", String::from_utf8_lossy(&key)),
                             ));
                         };
-                        ss.push(&member, score);
+                        ss.push_loaded(&member, score)?;
                     }
-                    KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(ss.finish())))
+                    KiviDBValue::SortedSet(crate::sorted_set::shared(ss.finish()))
                 }
                 TAG_STREAM | TAG_STREAM_V2 | TAG_STREAM_V3 => read_stream_value(&mut r, tag[0])?,
                 TAG_JSON => {
@@ -4029,10 +4029,10 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             for _ in 0..count {
                 let member = rdb_read_string(r)?;
                 let score = zset_score_or_error(rdb_read_double_v1(r)?)?;
-                ss.push(&member, score);
+                ss.push_loaded(&member, score)?;
             }
-            Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss.finish()),
+            Ok(Some(KiviDBValue::SortedSet(crate::sorted_set::shared(
+                ss.finish(),
             ))))
         }
         4 => {
@@ -4055,10 +4055,10 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                 let mut score_buf = [0u8; 8];
                 r.read_exact(&mut score_buf)?;
                 let score = zset_score_or_error(f64::from_le_bytes(score_buf))?;
-                ss.push(&member, score);
+                ss.push_loaded(&member, score)?;
             }
-            Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss.finish()),
+            Ok(Some(KiviDBValue::SortedSet(crate::sorted_set::shared(
+                ss.finish(),
             ))))
         }
         // The numbers are Redis's (`RDB_TYPE_*` in rdb.h). Up to 1.1.0 most
@@ -4125,10 +4125,10 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                         io::Error::new(io::ErrorKind::InvalidData, "bad ziplist zset score")
                     })?;
                 let score = zset_score_or_error(score)?;
-                ss.push(&member, score);
+                ss.push_loaded(&member, score)?;
             }
-            Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss.finish()),
+            Ok(Some(KiviDBValue::SortedSet(crate::sorted_set::shared(
+                ss.finish(),
             ))))
         }
         13 => {
@@ -4167,9 +4167,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             // RDB_TYPE_ZSET_LISTPACK (Redis 7.0+).
             let blob = rdb_read_string(r)?;
             let ss = rdb_decode_listpack_into_zset(&blob)?;
-            Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss),
-            ))))
+            Ok(Some(KiviDBValue::SortedSet(crate::sorted_set::shared(ss))))
         }
         18 => {
             // RDB_TYPE_LIST_QUICKLIST_2 (Redis 7.0+): a count of nodes, each
@@ -5191,7 +5189,7 @@ fn rdb_decode_listpack_into_zset(blob: &[u8]) -> io::Result<SortedSetInner> {
             .and_then(|s| s.parse().ok())
             .ok_or_else(malformed_listpack)?;
         let score = zset_score_or_error(score)?;
-        ss.push(&member, score);
+        ss.push_loaded(&member, score)?;
     }
     Ok(ss.finish())
 }
@@ -6226,12 +6224,12 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 let score = zset_score(f64::from_bits(u64::from_le_bytes(
                     payload[next..next + 8].try_into().ok()?,
                 )))?;
-                ss.push(member_bytes, score);
+                ss.push_loaded(member_bytes, score).ok()?;
                 pos = next + 8;
             }
-            Some(KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(
+            Some(KiviDBValue::SortedSet(crate::sorted_set::shared(
                 ss.finish(),
-            ))))
+            )))
         }
         TAG_JSON => {
             let (bytes, _) = read_bytes_slice(payload, 0)?;

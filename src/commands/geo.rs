@@ -270,7 +270,7 @@ fn get_or_create_zset(ctx: &mut Ctx, key: &[u8]) -> Result<Arc<RwLock<SortedSetI
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
         None => {
-            let zs = Arc::new(RwLock::new(SortedSetInner::new()));
+            let zs = crate::sorted_set::shared(SortedSetInner::new());
             map.insert(key, KiviDBValue::SortedSet(Arc::clone(&zs)));
             Ok(zs)
         }
@@ -393,8 +393,9 @@ fn cmd_geoadd(ctx: &mut Ctx) -> Vec<u8> {
         });
     }
     // As `ZADD`: a table reserved for members given twice is made as small
-    // as what came.
+    // as what came, and one left mid-resize goes to the background.
     inner.settle(given);
+    crate::sorted_set::after_write(&zs, &mut inner);
 
     drop(inner);
 
@@ -746,9 +747,11 @@ fn steps_for(reach_m: f64, lat: f64) -> u8 {
     step.clamp(1, STEP_MAX as i32) as u8
 }
 
-/// A member found inside the area.
-struct Found {
-    member: ZMember,
+/// A member found inside the area: borrowed from the set, whose read lock
+/// the search holds until its reply is made (16 bytes, as the `Arc` it
+/// was: the nearest are sorted out of them).
+struct Found<'a> {
+    member: &'a [u8],
     score: f64,
     distance_m: f64,
     lon: f64,
@@ -757,7 +760,7 @@ struct Found {
 
 /// The members of `zset` inside `area`, in the order the search comes
 /// across them; no more than `limit` of them, if there is a limit.
-fn members_in(zset: &SortedSetInner, area: &Area, limit: Option<usize>) -> Vec<Found> {
+fn members_in<'a>(zset: &'a SortedSetInner, area: &Area, limit: Option<usize>) -> Vec<Found<'a>> {
     let mut found = Vec::new();
     let mut last: Option<Cell> = None;
     for cell in area.cells() {
@@ -788,7 +791,7 @@ fn members_in(zset: &SortedSetInner, area: &Area, limit: Option<usize>) -> Vec<F
             let (lon, lat) = decode_geohash(score);
             if let Some(distance_m) = area.contains(lon, lat) {
                 found.push(Found {
-                    member: member.to_shared(),
+                    member: member.borrowed(),
                     score,
                     distance_m,
                     lon,
@@ -1024,10 +1027,13 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
 
     // No set: nothing found. A destination is emptied of what an earlier
     // search left in it.
-    let found = match (&zset, centre, shape) {
-        (Some(zset), Some((lon, lat)), Some((shape, unit_m))) => {
+    // The set's read lock, once, for as long as what is found borrows its
+    // members (nothing below reads the set again).
+    let held = zset.as_ref().map(|zset| zset.read());
+    let found = match (&held, centre, shape) {
+        (Some(inner), Some((lon, lat)), Some((shape, unit_m))) => {
             let area = Area { lon, lat, shape };
-            let mut found = members_in(&zset.read(), &area, if any { count } else { None });
+            let mut found = members_in(inner, &area, if any { count } else { None });
             // The nearest `count` cannot be picked without sorting: `COUNT`
             // alone sorts by distance. With `ANY` it is the first `count`
             // found that are wanted, in whatever order.
@@ -1049,27 +1055,37 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
 
     if let Some(dest) = store_key {
         let db = *ctx.selected_db;
-        if found.is_empty() {
-            crate::commands::helpers::delete_key(ctx.store, db, &dest);
-            return resp_integer(0);
-        }
+        let count = found.len();
         // Built whole: a block, laid down once, if the points fit one.
-        let stored = SortedSetInner::from_pairs(found.iter().map(|point| {
-            (
-                &point.member[..],
-                if store_dist {
-                    point.distance_m / unit_m
-                } else {
-                    point.score
-                },
-            )
-        }));
+        let stored = (count > 0).then(|| {
+            SortedSetInner::from_pairs(found.iter().map(|point| {
+                (
+                    point.member,
+                    if store_dist {
+                        point.distance_m / unit_m
+                    } else {
+                        point.score
+                    },
+                )
+            }))
+        });
+        // The source's read lock goes before the keyspace is written: the
+        // destination may be the source, and taking it out of the keyspace
+        // reads it again (a second read on this thread waits behind a
+        // writer queued since the first, which waits for the first).
+        drop(found);
+        drop(held);
         // The destination is a new key: whatever was there, and its time
         // to live, are gone.
         crate::commands::helpers::delete_key(ctx.store, db, &dest);
-        let shard = store::get_shard(&ctx.store[db], &dest);
-        write_lock!(shard).insert(dest, KiviDBValue::SortedSet(Arc::new(RwLock::new(stored))));
-        return resp_integer(found.len() as i64);
+        if let Some(stored) = stored {
+            let shard = store::get_shard(&ctx.store[db], &dest);
+            write_lock!(shard).insert(
+                dest,
+                KiviDBValue::SortedSet(crate::sorted_set::shared(stored)),
+            );
+        }
+        return resp_integer(count as i64);
     }
 
     let plain = !with_dist && !with_hash && !with_coord;
@@ -1078,9 +1094,9 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
             .iter()
             .map(|point| {
                 if plain {
-                    return resp_bulk(&point.member);
+                    return resp_bulk(point.member);
                 }
-                let mut item = vec![resp_bulk(&point.member)];
+                let mut item = vec![resp_bulk(point.member)];
                 if with_dist {
                     item.push(resp_bulk_str(&format!("{:.4}", point.distance_m / unit_m)));
                 }

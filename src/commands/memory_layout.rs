@@ -87,6 +87,7 @@ pub fn arc_of<T>() -> usize {
 /// Plain arithmetic, as it is done for every member `SAMPLES 0` looks at;
 /// `an_arc_is_its_counts_and_its_value` holds it to what is allocated. A
 /// slice is at most `isize::MAX` bytes, so the sum cannot overflow.
+#[cfg(test)]
 #[inline]
 pub fn arc_slice(len: usize) -> usize {
     const COUNTS: usize = 2 * std::mem::size_of::<usize>();
@@ -143,13 +144,15 @@ fn btree_leaf<K>() -> Layout {
 ///
 /// How full the nodes are is not seen from outside the map (and is not
 /// worth a walk of it): it depends on the order the keys came in. Keys that
-/// come in order (ascending or descending scores, and every sorted set a
-/// snapshot loads) leave nodes about 6/11 full, 7 children a node; keys
-/// that come at random about 7.6/11, 8.6 children. This counts 7.75, as
-/// many nodes as the keys need (fractionally), so that either order is
-/// within 12% from about a thousand keys up. Fewer keys come to whole
-/// nodes, and the tree can be a leaf off: measured from -18% to +42% at
-/// the worst sizes (a few dozen keys, at random).
+/// come in order one at a time (ascending or descending scores) leave nodes
+/// about 6/11 full, 7 children a node; keys that come at random about
+/// 7.6/11, 8.6 children. This counts 7.75, as many nodes as the keys need
+/// (fractionally), so that either order is within 12% from about a
+/// thousand keys up. Fewer keys come to whole nodes, and the tree can be a
+/// leaf off: measured from -18% to +42% at the worst sizes (a few dozen
+/// keys, at random). A sorted set built whole (a load, `RESTORE`, a block
+/// made large, a `*STORE` result) has its index built in one go, its nodes
+/// full: this counts about 40% more than it holds then.
 pub fn score_index<K>(len: usize) -> usize {
     const CHILDREN: f64 = 7.75;
     let leaf = btree_leaf::<K>();
