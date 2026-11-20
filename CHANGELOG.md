@@ -2860,6 +2860,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   propagated as `XGROUP CREATECONSUMER` when the read starts waiting, as
   Redis does.
 
+- **Non-ASCII literal text in an `FT.AGGREGATE` `timefmt` format is carried
+  through, not mangled (#978).** `timefmt(@ts, "%Y年%m月%d日")` answered
+  `1970å¹´01æ\u009c\u008801æ\u0097¥`: each byte of a multi-byte char was
+  emitted as its own Latin-1 char, invisible control bytes included. Such
+  literal text — the `%` specifiers' handling was already byte-safe — is
+  now written as the chars it encodes, as Redis does.
+
 ## [1.2.2] - 2026-11-13
 
 See [docs/releases/v1.2.2.md](docs/releases/v1.2.2.md).

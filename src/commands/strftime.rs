@@ -55,15 +55,24 @@ pub fn format_unix_seconds(ts: i64, fmt: &str) -> Option<String> {
                 b'A' => out.push_str(weekday_name(date.weekday)),
                 b'B' => out.push_str(month_name(date.month)),
                 b'%' => out.push('%'),
-                other => {
+                _ => {
                     out.push('%');
-                    out.push(other as char);
+                    // The specifier's char, a multi-byte one included; the
+                    // count past it is its own, not the loop's byte.
+                    let ch = fmt[i..].chars().next().unwrap();
+                    out.push(ch);
+                    i += ch.len_utf8();
+                    continue;
                 }
             }
             i += 1;
         } else {
-            out.push(bytes[i] as char);
-            i += 1;
+            // A literal byte at or past 0x80 starts a multi-byte UTF-8
+            // char: the char is pushed, not the byte, or non-ASCII literal
+            // text comes out a Latin-1 byte each (#978).
+            let ch = fmt[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
         }
     }
     Some(out)
@@ -245,6 +254,19 @@ mod tests {
             format_unix_seconds(0, "year=%Y other=%X").unwrap(),
             "year=1970 other=%X"
         );
+    }
+
+    #[test]
+    fn non_ascii_literal_text_is_carried_through() {
+        // Each byte of 年/月/日 was emitted as its own Latin-1 char —
+        // mojibake, invisible control chars included (#978).
+        assert_eq!(
+            format_unix_seconds(0, "%Y年%m月%d日").unwrap(),
+            "1970年01月01日"
+        );
+        // An unrecognised specifier that is itself multi-byte goes through
+        // whole too.
+        assert_eq!(format_unix_seconds(0, "%年 %d").unwrap(), "%年 01");
     }
 
     #[test]
