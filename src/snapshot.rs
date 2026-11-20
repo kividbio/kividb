@@ -82,6 +82,10 @@ const KDB_LANGUAGE_MAGIC: &[u8; 8] = b"KIVILG1\0";
 /// `SCORE` and `SCORE_FIELD` of each index that sets either otherwise than
 /// the default. Last, for the same reason as the language.
 const KDB_SCORE_MAGIC: &[u8; 8] = b"KIVISR1\0";
+/// The indexes made with `NOFREQS`: a count, then each one's name. Last, for
+/// the same reason as the score: an older release reads everything else, and
+/// stops here.
+const KDB_NOFREQS_MAGIC: &[u8; 8] = b"KIVINF1\0";
 
 // Field-type tags used inside the index schema section.
 const SCHEMA_FIELD_TEXT: u8 = 0;
@@ -1056,7 +1060,8 @@ pub fn write_kdb_image<K: AsRef<[u8]>>(
     write_kdb_index_sections(w, index_store)?;
     write_kdb_alias_section(w, index_store)?;
     write_kdb_language_section(w, index_store)?;
-    write_kdb_score_section(w, index_store)
+    write_kdb_score_section(w, index_store)?;
+    write_kdb_nofreqs_section(w, index_store)
 }
 
 /// The language section: `index`, its language, its language field (empty
@@ -1125,6 +1130,46 @@ fn write_kdb_score_section(
                 write_bytes(w, field.as_bytes())?;
             }
             None => w.write_all(&[0])?,
+        }
+    }
+    Ok(())
+}
+
+/// The `NOFREQS` section: the names of the indexes made with it. Absent when
+/// there is none.
+fn write_kdb_nofreqs_section(
+    w: &mut impl Write,
+    index_store: Option<&crate::vector::IndexStore>,
+) -> io::Result<()> {
+    let Some(store) = index_store else {
+        return Ok(());
+    };
+    let guard = store.read();
+    let mut names: Vec<&str> = guard
+        .iter()
+        .filter(|(key, def)| !crate::vector::is_alias(key, def) && def.nofreqs)
+        .map(|(_, def)| def.name.as_str())
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    names.sort_unstable();
+    w.write_all(KDB_NOFREQS_MAGIC)?;
+    w.write_all(&(names.len() as u32).to_le_bytes())?;
+    for name in names {
+        write_bytes(w, name.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Body of the `NOFREQS` section; the magic has already been consumed.
+fn read_nofreqs_section(r: &mut impl Read, schemas: &mut [IndexSchema]) -> io::Result<()> {
+    for _ in 0..read_u32_le(r)? {
+        let index = String::from_utf8(read_bytes(r)?).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "bad NOFREQS index name utf8")
+        })?;
+        if let Some(schema) = schemas.iter_mut().find(|s| s.name == index) {
+            schema.nofreqs = true;
         }
     }
     Ok(())
@@ -2882,6 +2927,8 @@ fn read_image_body(
             )?;
         } else if &magic == KDB_SCORE_MAGIC {
             whole_section("score", read_score_section(&mut r, &mut index_schemas))?;
+        } else if &magic == KDB_NOFREQS_MAGIC {
+            whole_section("NOFREQS", read_nofreqs_section(&mut r, &mut index_schemas))?;
         } else if strict {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -3116,6 +3163,7 @@ fn read_one_index_schema(r: &mut impl Read) -> io::Result<IndexSchema> {
         language: Default::default(),
         default_score: 1.0,
         score_field: None,
+        nofreqs: false,
     })
 }
 
@@ -5213,6 +5261,8 @@ pub struct FrozenDataset {
     language_section: Vec<u8>,
     /// The indexes' scores (see [`write_kdb_score_section`]).
     score_section: Vec<u8>,
+    /// The indexes made with `NOFREQS` (see [`write_kdb_nofreqs_section`]).
+    nofreqs_section: Vec<u8>,
     /// What all of the above takes, which is no key's and which deleting
     /// keys does not give back: not counted against `maxmemory` while the
     /// capture lives (#284). Counted as it is laid out, not at the end
@@ -5460,7 +5510,9 @@ fn freeze(
     write_kdb_language_section(&mut language_section, index_store)?;
     let functions = function_libraries();
     let mut score_section = CapturedBuf::default();
+    let mut nofreqs_section = CapturedBuf::default();
     write_kdb_score_section(&mut score_section, index_store)?;
+    write_kdb_nofreqs_section(&mut nofreqs_section, index_store)?;
     not_counted.add(functions.as_ref().map_or(0, |f| f.len()));
     let mut settle = |section: CapturedBuf| {
         let (bytes, counted) = section.finish();
@@ -5471,6 +5523,7 @@ fn freeze(
     let alias_section = settle(alias_section);
     let language_section = settle(language_section);
     let score_section = settle(score_section);
+    let nofreqs_section = settle(nofreqs_section);
     // Everything is laid out, and counted: a test reads memory here.
     crate::aof::failpoint("snapshot-captured");
 
@@ -5481,6 +5534,7 @@ fn freeze(
         functions,
         language_section,
         score_section,
+        nofreqs_section,
         not_counted,
     })
 }
@@ -5662,7 +5716,8 @@ impl FrozenDataset {
         out.write_all(&self.index_section)?;
         out.write_all(&self.alias_section)?;
         out.write_all(&self.language_section)?;
-        out.write_all(&self.score_section)
+        out.write_all(&self.score_section)?;
+        out.write_all(&self.nofreqs_section)
     }
 }
 
@@ -7177,6 +7232,7 @@ mod field_option_tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def();
         let expected: Vec<(String, FieldOptions)> = def
@@ -7199,6 +7255,7 @@ mod field_option_tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def();
         store.write().insert("bare".into(), bare);
@@ -7258,6 +7315,7 @@ mod field_option_tests {
                 language,
                 default_score: 1.0,
                 score_field: None,
+                nofreqs: false,
             }
             .into_def()
         };
@@ -7330,12 +7388,13 @@ mod field_option_tests {
             language: Default::default(),
             default_score,
             score_field: score_field.map(str::to_string),
+            nofreqs: false,
         }
         .into_def()
     }
 
     /// The magic of every section an image can carry, and its name.
-    const EVERY_SECTION: [(&str, &[u8; 8]); 10] = [
+    const EVERY_SECTION: [(&str, &[u8; 8]); 11] = [
         ("index", KDB_INDEX_MAGIC),
         ("HNSW", KDB_HNSW_MAGIC),
         ("expiry", KDB_EXPIRY_MAGIC),
@@ -7346,6 +7405,7 @@ mod field_option_tests {
         ("functions", KDB_FUNCTIONS_MAGIC),
         ("language", KDB_LANGUAGE_MAGIC),
         ("score", KDB_SCORE_MAGIC),
+        ("NOFREQS", KDB_NOFREQS_MAGIC),
     ];
 
     /// An image that holds every section an image can carry: one key with a
@@ -7390,6 +7450,7 @@ mod field_option_tests {
             },
             default_score: 0.25,
             score_field: Some("rank".into()),
+            nofreqs: true,
         }
         .into_def();
         let store = crate::vector::new_index_store();
@@ -7424,7 +7485,7 @@ mod field_option_tests {
             .windows(8)
             .position(|w| w == KDB_SCORE_MAGIC)
             .expect("score section");
-        for &(name, magic) in &EVERY_SECTION[..EVERY_SECTION.len() - 1] {
+        for &(name, magic) in &EVERY_SECTION[..EVERY_SECTION.len() - 2] {
             let at = image
                 .windows(8)
                 .position(|w| w == magic)
@@ -7449,6 +7510,8 @@ mod field_option_tests {
         assert_eq!(of("plain").score_field, None);
         assert_eq!(of("empty").default_score, 1.0);
         assert_eq!(of("empty").score_field.as_deref(), Some(""));
+        assert!(of("scored").nofreqs);
+        assert!(!of("plain").nofreqs && !of("empty").nofreqs);
 
         // Without the section (an image of an older release), the defaults.
         let mut bare = Vec::new();
@@ -7463,6 +7526,7 @@ mod field_option_tests {
         )
         .unwrap();
         assert!(!bare.windows(8).any(|w| w == KDB_SCORE_MAGIC));
+        assert!(!bare.windows(8).any(|w| w == KDB_NOFREQS_MAGIC));
     }
 
     /// An image cut anywhere inside a section after its databases, in its
@@ -8294,6 +8358,7 @@ mod empty_key_tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         };
         let store = crate::vector::new_index_store();
         store.write().insert("idx20".into(), schema.into_def());

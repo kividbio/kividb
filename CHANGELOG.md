@@ -1318,6 +1318,49 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Search scores and `FT.AGGREGATE` numbers agree with Redis 8.10.2 for
+  `NOFREQS`, `~` in dialect 1 and the way numbers are written (#247).**
+  Checked against a live Redis 8.10.2 on the same indexes and documents,
+  to the last digit:
+  - `NOFREQS` is kept (it was accepted and ignored) and counts a word once
+    in a document however often it is in it, for every scorer; the
+    document's length and the TFIDF norm are the real ones. `FT.INFO` lists
+    it under `index_options`, and it survives snapshots.
+  - In dialect 1, `-` and `~` take the rest of the query as their operand
+    (up to a `)`; a later `~` starts a clause of its own): `~red apple` is
+    an optional `red apple`, and `-red apple` is not (`red apple`), as in
+    Redis. Dialects 2 and later are as they were. An optional inside an
+    optional scores as it does in Redis. **Upgrade note:** a query that
+    names no `DIALECT` is read in the default dialect, 1 unless `FT.CONFIG
+    SET DEFAULT_DIALECT` says otherwise, as in Redis; until now it was read
+    as in dialect 2. Clients that send `DIALECT 2` (RedisVL, LangChain, ...)
+    are not affected.
+  - `FT.AGGREGATE` writes the numbers it computes, and the values of NUMERIC
+    fields it loads, as Redis does: an integer when the number is one (and
+    fits 64 bits), else with 12 significant digits (`1.20376952202`,
+    `3.33333333333e-08`, `1e+20`); `inf`, `-inf` and `nan` for the rest,
+    under RESP2 and RESP3 alike. That is the reducers (`SUM`, `AVG`, `MIN`,
+    `MAX`, `STDDEV`, `QUANTILE`, `FIRST_VALUE`, `TOLIST`), the results of
+    `APPLY`, `ADDSCORES`'s `@__score` and a `KNN` distance. **Upgrade
+    note:** `SUM`, `AVG`, `MIN`, `MAX` and `STDDEV` were written with six
+    decimals (`2.500000`), other numbers with all their digits (`0.1 + 0.2`
+    as `0.30000000000000004`), and a NUMERIC field as it was stored (`1.50`):
+    a client that reads them as numbers gets what they were to 12 digits,
+    and one that compares the text sees the change. The steps of a pipeline
+    still work on the double, not on its 12 digits (`APPLY "@x / 3" AS y
+    APPLY "@y * 3" AS z` gives `@x` back). Also as in Redis: a division by
+    zero is `inf` (or `nan`), not nothing; `exp`, `to_str` and `to_number`
+    are functions; a `QUANTILE` is the value at rank `ceil(q * n)`; `SUM`,
+    `AVG`, `MIN` and `MAX` of values that are not numbers are `nan`, `nan`,
+    `inf` and `-inf` (and `AVG` is over the values that are numbers); and a
+    group's columns come in the order its `GROUPBY` names them.
+  - `SCORER BM25` of a word multiplies the IDF in before it divides, as
+    Redis does: the last digit of its scores was one off.
+
+  `PHONETIC` is still accepted and changes nothing (Redis also matches and
+  scores words that sound alike): see [the compatibility
+  notes](docs/COMPATIBILITY.md).
+
 - **A script running beside others under its hash tags is refused
   `MIGRATE` (#340).** A `MIGRATE` holds back writes to the keys it moves
   until they have left, and a script that runs beside others cannot take

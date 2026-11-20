@@ -206,6 +206,11 @@ fn port() -> u16 {
         });
         for _ in 0..200 {
             if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                // The queries below are checked against a model of dialect
+                // 2, where a `~` or `-` takes the next clause only; the
+                // engine's default, as Redis's, is dialect 1.
+                let set = Conn::connect(port).cmd(&["FT.CONFIG", "SET", "DEFAULT_DIALECT", "2"]);
+                assert!(matches!(&set, V::Str(s) if s == "OK"), "{set:?}");
                 return port;
             }
             thread::sleep(Duration::from_millis(50));

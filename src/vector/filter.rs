@@ -241,6 +241,11 @@ pub struct QueryOptions {
     pub verbatim: bool,
     /// The language to stem the query's words in: the index's if `None`.
     pub language: Option<Language>,
+    /// The query's `DIALECT`, or the engine's default; 0 when not known
+    /// (the later dialects' reading, which is what a query read by the
+    /// engine itself has). In dialect 1, `-` and `~` take the rest of the
+    /// query as their operand: see `Parser::unary_clause`.
+    pub dialect: u8,
 }
 
 /// A parsed query.
@@ -274,6 +279,10 @@ pub fn parse_query_with(
         depth: 0,
         verbatim: options.verbatim,
         language: options.language.unwrap_or(def.language.language),
+        dialect1: options.dialect == 1,
+        stop_tilde: false,
+        stop_minus: false,
+        only_stopwords: false,
     };
     parser.skip_ws();
     let filter = if parser.at_end() {
@@ -331,6 +340,15 @@ struct Parser<'a> {
     verbatim: bool,
     /// The language the query's words are stemmed in.
     language: Language,
+    /// Dialect 1: `-` and `~` apply to the rest of the query.
+    dialect1: bool,
+    /// Dialect 1, inside the operand of a `~` or `-`: a later `~` starts a
+    /// clause of its own, not part of the operand.
+    stop_tilde: bool,
+    /// The same for `-`, inside the operand of one.
+    stop_minus: bool,
+    /// The last run of clauses read was nothing but stopwords.
+    only_stopwords: bool,
 }
 
 /// The most clauses a query may have, and the deepest it may nest. A query is
@@ -426,6 +444,10 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 None | Some(')') | Some('|') => break,
                 Some('=') if self.rest().starts_with("=>[") => break,
+                // Dialect 1: inside the operand of a `~` or `-`, one more
+                // `~` (or `-`, in the operand of a `-`) ends it.
+                Some('~') if self.stop_tilde && clauses.len() + dropped > 0 => break,
+                Some('-') if self.stop_minus && clauses.len() + dropped > 0 => break,
                 _ => {}
             }
             match self.unary(scope)? {
@@ -436,11 +458,13 @@ impl<'a> Parser<'a> {
         if clauses.is_empty() {
             // Nothing but stopwords: they are in no index, so nothing matches.
             return if dropped > 0 {
+                self.only_stopwords = true;
                 Ok(Filter::MatchNone)
             } else {
                 Err(self.syntax_error_at(start))
             };
         }
+        self.only_stopwords = false;
         let mut clauses = clauses.into_iter();
         let first = clauses.next().unwrap_or(Filter::MatchAll);
         Ok(clauses.fold(first, Filter::and))
@@ -460,6 +484,37 @@ impl<'a> Parser<'a> {
     }
 
     fn unary_clause(&mut self, scope: Option<&[String]>) -> Result<Option<Filter>, String> {
+        // Dialect 1: `-` and `~` take the rest of the query, up to the next
+        // `)` (a `|` is part of it), as their operand: `~a b` is an optional
+        // `a b`, `-a b` is not (`a b`), and `a ~b c | d` is `a` with an
+        // optional `b c | d`. A later `~` starts a clause of its own, and in
+        // the operand of a `-`, so does a later `-`.
+        if self.dialect1 && matches!(self.peek(), Some('-' | '~')) {
+            let minus = self.eat('-');
+            if !minus {
+                self.eat('~');
+            }
+            self.skip_ws();
+            let (was_tilde, was_minus) = (self.stop_tilde, self.stop_minus);
+            self.stop_tilde = true;
+            self.stop_minus |= minus;
+            self.only_stopwords = false;
+            let operand = self.or_expr(scope);
+            let only_stopwords = self.only_stopwords;
+            self.stop_tilde = was_tilde;
+            self.stop_minus = was_minus;
+            let operand = operand?;
+            return Ok(Some(
+                if only_stopwords && matches!(operand, Filter::MatchNone) {
+                    // "not, or optionally, a stopword": every document.
+                    Filter::MatchAll
+                } else if minus {
+                    Filter::Not(Box::new(operand))
+                } else {
+                    Filter::Optional(Box::new(operand))
+                },
+            ));
+        }
         if self.eat('-') {
             self.skip_ws();
             return Ok(Some(match self.unary(scope)? {
@@ -1418,6 +1473,7 @@ mod tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def()
     }
@@ -1513,6 +1569,7 @@ mod tests {
             let options = QueryOptions {
                 verbatim: true,
                 language: None,
+                dialect: 0,
             };
             let parsed = parse_query_with(query, &Params::new(), &def, options).unwrap();
             eval(&parsed.filter, &doc(&d))

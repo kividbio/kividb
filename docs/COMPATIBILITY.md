@@ -248,10 +248,26 @@ other files:
   itself. A vector set made
   `NOQUANT` arrives as a set made without an option, so it then accepts a
   `VADD` with any quantization option, the same as after a snapshot reload.
-- Search: no stemming or phonetic matching (`NOSTEM` and `PHONETIC` are
-  accepted and change nothing). `GEO` and `GEOSHAPE` fields, `GEOFILTER` and
-  `INFIELDS` are refused. Query `TIMEOUT` is accepted but doesn't cut a query
-  short. `INT8` and `UINT8` vectors aren't supported.
+- Search: no phonetic matching (`PHONETIC` is accepted and changes nothing:
+  a phonetic field matches and scores as a plain one, where Redis also
+  matches and scores words that sound alike). `GEO` and `GEOSHAPE` fields,
+  `GEOFILTER` and `INFIELDS` are refused. Query `TIMEOUT` is accepted but
+  doesn't cut a query short. `INT8` and `UINT8` vectors aren't supported.
+  Scores, `NOFREQS`, the `~` and `-` of dialect 1 and the way `FT.AGGREGATE`
+  writes numbers (12 significant digits) are Redis 8.10.2's, checked against
+  it to the last digit. Still different: `=> {$weight: …}` on a clause is
+  accepted but does not weigh it (and is refused with a space after `=>`);
+  `FT.SEARCH RETURN` shows a NUMERIC field as it was stored (Redis writes
+  it as a double) and a `KNN` distance as the shortest text of a 32-bit
+  float (Redis, 12 significant digits); in the expressions of `APPLY` and
+  `FILTER`, `-x`, `a+b` with no space and `round`/`pow` are accepted (Redis
+  refuses them), `^` is not a power, a text that is not a number is 0 in
+  arithmetic (Redis refuses it), and
+  `SORTBY` on a TEXT field of numbers sorts them as numbers (Redis, as
+  text); `COUNT_DISTINCTISH` is exact and `TOLIST` lists in the order the
+  values came, where Redis's order is its own; and the scores of
+  `TFIDF`, `TFIDF.DOCNORM` and `BM25` for three or more words one of which
+  has a stem can differ from Redis's in the proximity factor.
 - A Redis RDB with search index definitions loads without them: run
   `FT.CREATE` again. Bloom filters load (RedisBloom 2.4 and later: Redis
   Stack 6.2 to 7.4, Redis 8), and so do Cuckoo filters, Count-min sketches

@@ -366,6 +366,16 @@ pub(crate) fn config_number(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// The dialect a query is read in: the one it names (`given`, 0 if it names
+/// none), or the engine's `FT.CONFIG DEFAULT_DIALECT` (1 unless set).
+pub(crate) fn dialect_or_default(given: u8) -> u8 {
+    if given != 0 {
+        given
+    } else {
+        config_number("DEFAULT_DIALECT", 1).clamp(1, 4) as u8
+    }
+}
+
 /// `ON_TIMEOUT fail` errors when a query runs out of time; `return` and
 /// `return-strict` reply with what was found.
 pub(crate) fn on_timeout_fails() -> bool {
@@ -774,6 +784,15 @@ fn query_options(cmd: &[&[u8]]) -> Result<filter::QueryOptions, String> {
     let mut options = filter::QueryOptions {
         verbatim: cmd.iter().skip(3).any(|a| is(a, "VERBATIM")),
         language: None,
+        dialect: dialect_or_default(
+            cmd.iter()
+                .skip(3)
+                .position(|a| is(a, "DIALECT"))
+                .and_then(|at| cmd.get(at + 4))
+                .and_then(|n| text(n).parse::<u8>().ok())
+                .filter(|n| (1..=4).contains(n))
+                .unwrap_or(0),
+        ),
     };
     if let Some(at) = cmd.iter().skip(3).position(|a| is(a, "LANGUAGE")) {
         let name = cmd.get(at + 4).map(|a| text(a)).unwrap_or_default();

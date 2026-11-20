@@ -15,6 +15,77 @@
 
 pub type Row = ahash::AHashMap<String, String>;
 
+// ── Numbers ─────────────────────────────────────────────────────────────────
+//
+// A row's values are strings, but a number the pipeline computed, or read
+// from a NUMERIC field, is a number to the steps after it (they work on the
+// double, not on the text of it), and is written as Redis writes a double:
+// as an integer when it is one (and fits), else with 12 significant digits
+// (`1.20376952202`). So a number is held in a row as this marker and its 16
+// hex digits of bits, and written as text only where the reply is
+// (`value_reply`), or where a step takes it as text (`text_of`).
+
+pub(crate) const NUMBER: char = '\u{2}';
+
+/// `x` as a row holds a number.
+pub(crate) fn number_value(x: f64) -> String {
+    format!("{NUMBER}{:016x}", x.to_bits())
+}
+
+/// The number a row value is, if it is held as one.
+fn held_number(value: &str) -> Option<f64> {
+    u64::from_str_radix(value.strip_prefix(NUMBER)?, 16)
+        .ok()
+        .map(f64::from_bits)
+}
+
+/// A row value as a number: one held as a number, or text that reads as one.
+pub(crate) fn as_number(value: &str) -> Option<f64> {
+    held_number(value).or_else(|| value.parse::<f64>().ok())
+}
+
+/// A row value as text: a number as Redis writes it, anything else as it is.
+pub(crate) fn text_of(value: &str) -> std::borrow::Cow<'_, str> {
+    match held_number(value) {
+        Some(x) => std::borrow::Cow::Owned(redis_number_text(x)),
+        None => std::borrow::Cow::Borrowed(value),
+    }
+}
+
+/// A double as Redis writes it in an aggregate reply: an integer when it is
+/// one that fits in 64 bits (`%lld`), else `%.12g`; `nan`, `-nan`, `inf` and
+/// `-inf` for the rest, the sign of a NaN as the C library prints it.
+pub(crate) fn redis_number_text(x: f64) -> String {
+    if x.is_nan() {
+        return if x.is_sign_negative() { "-nan" } else { "nan" }.to_string();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    if x == x.trunc() && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&x) {
+        return format!("{}", x as i64);
+    }
+    // `%.12g`: 12 significant digits, in the style of exponent form when the
+    // exponent is below -4 or 12 or more, else fixed; trailing zeros off.
+    let scientific = format!("{x:.11e}");
+    let (digits, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let trim = |text: &str| -> String {
+        if text.contains('.') {
+            text.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            text.to_string()
+        }
+    };
+    if !(-4..12).contains(&exponent) {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{}e{sign}{:02}", trim(digits), exponent.abs())
+    } else {
+        let decimals = (11 - exponent) as usize;
+        trim(&format!("{x:.decimals$}"))
+    }
+}
+
 // ── Values that are not strings ──────────────────────────────────────────────
 //
 // A row's values are strings, which is what nearly every stage of a
@@ -55,7 +126,7 @@ pub fn value_reply(value: &str, resp: u8) -> Vec<u8> {
         .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
     {
         Some(value) => write(&value, resp),
-        None => resp_bulk_str(value),
+        None => resp_bulk_str(&text_of(value)),
     }
 }
 
@@ -69,9 +140,9 @@ fn compare_rows(a: &Row, b: &Row, keys: &[(String, bool)]) -> std::cmp::Ordering
     for (field, ascending) in keys {
         let va = a.get(field).map(|s| s.as_str()).unwrap_or("");
         let vb = b.get(field).map(|s| s.as_str()).unwrap_or("");
-        let ord = match (va.parse::<f64>(), vb.parse::<f64>()) {
-            (Ok(na), Ok(nb)) => na.total_cmp(&nb),
-            _ => va.cmp(vb),
+        let ord = match (as_number(va), as_number(vb)) {
+            (Some(na), Some(nb)) => na.total_cmp(&nb),
+            _ => text_of(va).cmp(&text_of(vb)),
         };
         let ord = if *ascending { ord } else { ord.reverse() };
         if ord != std::cmp::Ordering::Equal {
@@ -291,7 +362,7 @@ pub fn run_from(
                                 cut = true;
                                 break;
                             }
-                            let value = crate::commands::expr::eval(&ast, row).to_resp_string();
+                            let value = crate::commands::expr::eval(&ast, row).row_string();
                             row.insert(alias.clone(), value);
                         }
                         rows.truncate(done);
@@ -529,6 +600,16 @@ fn parse_groupby(cmd: &[&[u8]], start: usize) -> (usize, Vec<String>, Vec<Reduce
     (i, group_props, reducers)
 }
 
+/// The columns of the rows the `GROUPBY` at `cmd[start]` makes, in the order
+/// Redis shows them: the properties it groups by, then its reducers' names.
+pub(crate) fn group_columns(cmd: &[&[u8]], start: usize) -> Vec<String> {
+    let (_, props, reducers) = parse_groupby(cmd, start);
+    props
+        .into_iter()
+        .chain(reducers.into_iter().map(|reducer| reducer.alias))
+        .collect()
+}
+
 fn run_groupby(
     rows: Vec<Row>,
     cmd: &[&[u8]],
@@ -609,10 +690,10 @@ fn run_groupby(
 #[derive(Debug)]
 enum Running {
     Count,
-    /// The sum of the values that read as numbers: SUM, and AVG, which
-    /// divides it by the group's documents, as `reduce` does.
-    Sum(f64),
-    Avg(f64),
+    /// The sum of the values that read as numbers, and how many there were:
+    /// SUM, and AVG, which divides it by them, as `reduce` does.
+    Sum(f64, usize),
+    Avg(f64, usize),
     Min(Option<f64>),
     Max(Option<f64>),
     /// The distinct values, a missing one as "".
@@ -626,8 +707,8 @@ impl Running {
         Some(match func {
             "COUNT" => Running::Count,
             // `Iterator::sum` of f64 starts from -0.0, as `reduce` adds up.
-            "SUM" => Running::Sum(-0.0),
-            "AVG" => Running::Avg(-0.0),
+            "SUM" => Running::Sum(-0.0, 0),
+            "AVG" => Running::Avg(-0.0, 0),
             "MIN" => Running::Min(None),
             "MAX" => Running::Max(None),
             "COUNT_DISTINCT" | "COUNT_DISTINCTISH" => Running::Distinct(Default::default()),
@@ -637,12 +718,13 @@ impl Running {
 
     #[inline]
     fn add(&mut self, value: Option<&str>) {
-        let number = || value.and_then(|v| v.parse::<f64>().ok());
+        let number = || value.and_then(as_number);
         match self {
             Running::Count => {}
-            Running::Sum(sum) | Running::Avg(sum) => {
+            Running::Sum(sum, count) | Running::Avg(sum, count) => {
                 if let Some(n) = number() {
                     *sum += n;
+                    *count += 1;
                 }
             }
             // As `Iterator::min_by` keeps the first of equal values and
@@ -672,12 +754,12 @@ impl Running {
 
     /// The reducer's value for a group of `members` documents.
     fn value(self, members: usize) -> String {
-        use crate::commands::vector::format_f64;
         match self {
             Running::Count => members.to_string(),
-            Running::Sum(sum) => format_f64(sum),
-            Running::Avg(sum) => format_f64(sum / members as f64),
-            Running::Min(n) | Running::Max(n) => n.map_or("0".to_string(), format_f64),
+            Running::Sum(sum, count) => number_value(sum_of(sum, count)),
+            Running::Avg(sum, count) => number_value(average_of(sum, count)),
+            Running::Min(n) => number_value(n.unwrap_or(f64::INFINITY)),
+            Running::Max(n) => number_value(n.unwrap_or(f64::NEG_INFINITY)),
             Running::Distinct(seen) => seen.len().to_string(),
         }
     }
@@ -800,6 +882,17 @@ impl StreamGroups {
         }
     }
 
+    /// Whether the groups are by a property of `numeric`, or a reducer
+    /// counts the distinct values of one: that is by the number, not its
+    /// text.
+    pub fn goes_by_number(&self, numeric: &ahash::AHashSet<String>) -> bool {
+        self.props.iter().any(|p| numeric.contains(p))
+            || self
+                .reducers
+                .iter()
+                .any(|r| r.func.starts_with("COUNT_DISTINCT") && numeric.contains(r.field()))
+    }
+
     /// Where the steps after the `GROUPBY` start.
     pub fn end(&self) -> usize {
         self.end
@@ -829,14 +922,27 @@ impl StreamGroups {
     }
 }
 
+/// SUM of `count` numbers that add up to `sum`: NaN when there were none.
+fn sum_of(sum: f64, count: usize) -> f64 {
+    if count == 0 { f64::NAN } else { sum }
+}
+
+/// AVG of `count` numbers that add up to `sum`: NaN when there were none.
+fn average_of(sum: f64, count: usize) -> f64 {
+    if count == 0 {
+        f64::NAN
+    } else {
+        sum / count as f64
+    }
+}
+
 /// One reducer over the rows of one group.
 fn reduce(func: &str, args: &[String], members: &[&Row]) -> String {
-    use crate::commands::vector::format_f64;
     use serde_json::Value;
 
     let field = args.first().map(String::as_str).unwrap_or("");
     let values = || members.iter().filter_map(|row| row.get(field));
-    let numbers = || values().filter_map(|v| v.parse::<f64>().ok());
+    let numbers = || values().filter_map(|v| as_number(v));
     // In the order they first appear.
     let distinct = || {
         let mut seen: ahash::AHashSet<&String> = ahash::AHashSet::new();
@@ -845,20 +951,26 @@ fn reduce(func: &str, args: &[String], members: &[&Row]) -> String {
 
     match func {
         "COUNT" => members.len().to_string(),
-        "SUM" => format_f64(numbers().sum()),
-        "AVG" => {
-            if members.is_empty() {
-                "0".to_string()
-            } else {
-                format_f64(numbers().sum::<f64>() / members.len() as f64)
-            }
+        // Of the values that are numbers: with none, SUM and AVG are NaN,
+        // MIN is infinity and MAX minus infinity, as in Redis.
+        "SUM" => {
+            let all: Vec<f64> = numbers().collect();
+            number_value(sum_of(all.iter().sum(), all.len()))
         }
-        "MIN" => numbers()
-            .min_by(|a, b| a.total_cmp(b))
-            .map_or("0".to_string(), format_f64),
-        "MAX" => numbers()
-            .max_by(|a, b| a.total_cmp(b))
-            .map_or("0".to_string(), format_f64),
+        "AVG" => {
+            let all: Vec<f64> = numbers().collect();
+            number_value(average_of(all.iter().sum(), all.len()))
+        }
+        "MIN" => number_value(
+            numbers()
+                .min_by(|a, b| a.total_cmp(b))
+                .unwrap_or(f64::INFINITY),
+        ),
+        "MAX" => number_value(
+            numbers()
+                .max_by(|a, b| a.total_cmp(b))
+                .unwrap_or(f64::NEG_INFINITY),
+        ),
         "COUNT_DISTINCT" | "COUNT_DISTINCTISH" => {
             let mut seen: ahash::AHashSet<&str> = ahash::AHashSet::new();
             members
@@ -871,18 +983,19 @@ fn reduce(func: &str, args: &[String], members: &[&Row]) -> String {
             // Of a sample: n - 1 below the line.
             let all: Vec<f64> = numbers().collect();
             if all.len() < 2 {
-                return "0".to_string();
+                return number_value(0.0);
             }
             let mean = all.iter().sum::<f64>() / all.len() as f64;
             let variance =
                 all.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (all.len() - 1) as f64;
-            format_f64(variance.sqrt())
+            number_value(variance.sqrt())
         }
-        // QUANTILE field q — the value a fraction q of the way up.
+        // QUANTILE field q — the value at rank ceil(q * n) of the n numbers,
+        // in order (the first for q 0).
         "QUANTILE" => {
             let mut all: Vec<f64> = numbers().collect();
             if all.is_empty() {
-                return "0".to_string();
+                return number_value(f64::NAN);
             }
             all.sort_by(|a, b| a.total_cmp(b));
             let q = args
@@ -890,11 +1003,14 @@ fn reduce(func: &str, args: &[String], members: &[&Row]) -> String {
                 .and_then(|q| q.parse::<f64>().ok())
                 .unwrap_or(0.5)
                 .clamp(0.0, 1.0);
-            format_f64(all[(q * (all.len() - 1) as f64).round() as usize])
+            let rank = (q * all.len() as f64).ceil() as usize;
+            number_value(all[rank.saturating_sub(1).min(all.len() - 1)])
         }
         // Every distinct value, as a list.
         "TOLIST" => nested(&Value::Array(
-            distinct().map(|v| Value::String(v.clone())).collect(),
+            distinct()
+                .map(|v| Value::String(text_of(v).into_owned()))
+                .collect(),
         )),
         // RANDOM_SAMPLE field n — n of the values, picked at random.
         "RANDOM_SAMPLE" => {
@@ -906,7 +1022,7 @@ fn reduce(func: &str, args: &[String], members: &[&Row]) -> String {
             let all: Vec<&String> = values().collect();
             nested(&Value::Array(
                 all.choose_multiple(&mut rand::thread_rng(), n)
-                    .map(|v| Value::String(v.to_string()))
+                    .map(|v| Value::String(text_of(v).into_owned()))
                     .collect(),
             ))
         }
@@ -992,7 +1108,7 @@ fn collect(args: &[String], members: &[&Row]) -> String {
             Some(fields) => {
                 for field in fields {
                     if let Some(value) = row.get(field) {
-                        entry.insert(field.clone(), Value::String(value.clone()));
+                        entry.insert(field.clone(), Value::String(text_of(value).into_owned()));
                     }
                 }
             }
@@ -1003,7 +1119,7 @@ fn collect(args: &[String], members: &[&Row]) -> String {
                     .collect();
                 all.sort();
                 for (name, value) in all {
-                    entry.insert(name.clone(), Value::String(value.clone()));
+                    entry.insert(name.clone(), Value::String(text_of(value).into_owned()));
                 }
             }
         }
@@ -1024,6 +1140,96 @@ fn collect(args: &[String], members: &[&Row]) -> String {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// A double as Redis 8.10.2 writes it in an FT.AGGREGATE reply (what
+    /// `APPLY "<x>*1"` replied for each): an integer when it is one that fits
+    /// in 64 bits, else 12 significant digits (`%.12g`).
+    #[test]
+    #[allow(clippy::approx_constant)]
+    fn numbers_are_written_as_redis_writes_them() {
+        for (x, text) in [
+            (1e18, "1000000000000000000"),
+            (9_223_372_036_854_775_807.0, "9.22337203685e+18"),
+            (9.3e18, "9.3e+18"),
+            (123_456_789_012_345_680.0, "123456789012345680"),
+            (123_456_789.123_456_79, "123456789.123"),
+            (0.000_099_999_999_999_999, "0.0001"),
+            (99_999_999_999.95, "99999999999.9"),
+            (999_999_999_999.5, "1e+12"),
+            (999_999_999_999.4, "999999999999"),
+            (1e11 * 1.5, "150000000000"),
+            (0.000_01, "1e-05"),
+            (12_345_678_901.234_5, "12345678901.2"),
+            (1.5e300, "1.5e+300"),
+            (5e-324, "4.94065645841e-324"),
+            (2.0 / 3.0, "0.666666666667"),
+            (0.1 * 3.0, "0.3"),
+            (1.000_000_000_000_5, "1"),
+            (1.0 / 7.0 * 1e15, "1.42857142857e+14"),
+            (1.0 / 7.0 * 1e-5, "1.42857142857e-06"),
+            (-7.25, "-7.25"),
+            (-1e-7, "-1e-07"),
+            (1.234567e-6, "1.234567e-06"),
+            (1.203_769_522_023_45, "1.20376952202"),
+            (3.141_592_653_589_79, "3.14159265359"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+            (f64::NAN, "nan"),
+            // The sign of a NaN as the C library writes it (`0.0 / 0.0` and
+            // the square root of a negative number have it set on x86).
+            (f64::from_bits(0xfff8_0000_0000_0000), "-nan"),
+        ] {
+            assert_eq!(redis_number_text(x), text, "{x:e}");
+        }
+        // Held in a row, a number is its bits: the steps after it compute with
+        // the double, and the reply writes the text.
+        let held = number_value(2.0 / 3.0);
+        assert_eq!(as_number(&held), Some(2.0 / 3.0));
+        assert_eq!(text_of(&held), "0.666666666667");
+        assert_eq!(text_of("1.50"), "1.50");
+        assert_eq!(as_number("1.50"), Some(1.5));
+    }
+
+    /// REDUCE over values that are not numbers, as Redis 8.10.2 replies
+    /// (a group of `abc` and `def`): NaN, NaN, infinity, minus infinity and
+    /// 0 for SUM, AVG, MIN, MAX and STDDEV, and NaN for QUANTILE; and a
+    /// quantile is the value at rank ceil(q n).
+    #[test]
+    fn reducers_work_on_the_values_that_are_numbers() {
+        let row = |v: &str| -> Row { [("u".to_string(), v.to_string())].into_iter().collect() };
+        let text = |members: Vec<Row>, func: &str, args: &[&str]| {
+            let members: Vec<&Row> = members.iter().collect();
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            text_of(&reduce(func, &args, &members)).into_owned()
+        };
+        let words = vec![row("abc"), row("def")];
+        for (func, want) in [
+            ("SUM", "nan"),
+            ("AVG", "nan"),
+            ("MIN", "inf"),
+            ("MAX", "-inf"),
+            ("STDDEV", "0"),
+        ] {
+            assert_eq!(text(words.clone(), func, &["u"]), want, "{func}");
+        }
+        assert_eq!(text(words, "QUANTILE", &["u", "0.5"]), "nan");
+        // 2, x, 3.5: the average is of the two that are numbers.
+        let mixed = vec![row("2"), row("x"), row("3.5")];
+        assert_eq!(text(mixed.clone(), "SUM", &["u"]), "5.5");
+        assert_eq!(text(mixed.clone(), "AVG", &["u"]), "2.75");
+        assert_eq!(text(mixed, "STDDEV", &["u"]), "1.06066017178");
+        // 1, 2, 10: rank ceil(q * 3).
+        let three = vec![row("10"), row("1"), row("2")];
+        for (q, want) in [
+            ("0", "1"),
+            ("0.1", "1"),
+            ("0.5", "2"),
+            ("0.75", "10"),
+            ("1", "10"),
+        ] {
+            assert_eq!(text(three.clone(), "QUANTILE", &["u", q]), want, "q {q}");
+        }
+    }
 
     fn words(line: &str) -> Vec<&[u8]> {
         line.split(' ').map(str::as_bytes).collect()
@@ -1145,7 +1351,7 @@ mod tests {
         let (out, cut) = run_within(rows(10), &cmd, 3, gone);
         assert!(!cut);
         assert_eq!(out.len(), 5);
-        assert_eq!(out[0]["d"], "18");
+        assert_eq!(text_of(&out[0]["d"]), "18");
 
         let (out, cut) = run_within(rows(many), &cmd, 3, later);
         assert!(!cut);

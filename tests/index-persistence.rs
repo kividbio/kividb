@@ -1154,6 +1154,98 @@ fn score_options_survive_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `NOFREQS` is part of the index: after a restart a word still counts once
+/// however often it is in a document (and `FT.INFO` still says so).
+#[test]
+fn nofreqs_survives_restart() {
+    let _serial = persist_serial();
+    let dir = temp_dir("nofreqs_snap");
+    let port1 = free_port();
+
+    let mut srv1 = start_server_in_dir(port1, &dir);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+
+    let run = |c: &mut Conn| {
+        text_of(&c.cmds(&[
+            "FT.SEARCH",
+            "idx:nf",
+            "apple",
+            "WITHSCORES",
+            "NOCONTENT",
+            "DIALECT",
+            "2",
+        ]))
+    };
+    // Five occurrences count as one: the shorter the document, the higher
+    // it scores (with frequencies, `nf:3` would be first).
+    let in_order = |reply: &str| {
+        let at = |id: &str| reply.find(id).unwrap_or_else(|| panic!("{id} in {reply}"));
+        at("nf:1") < at("nf:2") && at("nf:2") < at("nf:3")
+    };
+    let before = {
+        let mut c = Conn::connect(port1);
+        assert!(
+            c.cmds(&[
+                "FT.CREATE",
+                "idx:nf",
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "nf:",
+                "NOFREQS",
+                "SCHEMA",
+                "t",
+                "TEXT",
+            ])
+            .is_ok()
+        );
+        for (id, text) in [
+            ("1", "apple apple apple banana"),
+            ("2", "apple banana banana banana banana"),
+            ("3", "cherry cherry apple apple apple apple apple"),
+        ] {
+            assert_eq!(
+                c.cmds(&["HSET", &format!("nf:{id}"), "t", text]).as_int(),
+                1
+            );
+        }
+        assert!(c.cmds(&["SAVE"]).is_ok());
+        let before = run(&mut c);
+        assert!(in_order(&before), "{before}");
+        let info = text_of(&c.cmds(&["FT.INFO", "idx:nf"]));
+        assert!(info.contains("NOFREQS"), "{info}");
+        before
+    };
+
+    send_shutdown_nosave(port1);
+    assert!(
+        wait_for_exit(&mut srv1, Duration::from_secs(8)),
+        "srv1 stop"
+    );
+
+    let port2 = free_port();
+    let mut srv2 = start_server_in_dir(port2, &dir);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        let after = run(&mut c);
+        assert_eq!(after, before);
+        assert!(in_order(&after), "{after}");
+        let info = text_of(&c.cmds(&["FT.INFO", "idx:nf"]));
+        assert!(info.contains("NOFREQS"), "{info}");
+    }
+
+    kill_server(&mut srv2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Snapshot persistence — incremental indexing still works after restart
 // (insert new keys after restart, they are indexed immediately)

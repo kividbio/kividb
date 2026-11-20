@@ -674,6 +674,7 @@ mod tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def();
         index_store.write().insert(prefix.into(), def.clone());

@@ -400,6 +400,9 @@ impl IndexDef {
             a.push("SCORE_FIELD".into());
             a.push(field.clone());
         }
+        if self.nofreqs {
+            a.push("NOFREQS".into());
+        }
         a.push("SCHEMA".into());
         for field in &self.fields {
             a.push(field.name.clone());
@@ -673,6 +676,9 @@ pub struct IndexDef {
     /// `SCORE_FIELD`: the document field whose number multiplies its
     /// relevance. A document without it scores [`IndexDef::default_score`].
     pub score_field: Option<String>,
+    /// `NOFREQS`: a word counts once in a document however often it is in it,
+    /// when relevance is worked out. What the TEXT index holds is unchanged.
+    pub nofreqs: bool,
     /// With `LANGUAGE_FIELD`: the documents whose words were stemmed in a
     /// language other than the index's, and that language. For a write of
     /// some fields of a hash that leaves its language field as it was.
@@ -1175,6 +1181,7 @@ pub fn set_alias(store: &mut AHashMap<String, IndexDef>, alias: &str, index: &In
         language: Default::default(),
         default_score: 1.0,
         score_field: None,
+        nofreqs: false,
     }
     .into_def();
     store.insert(alias.to_string(), marker);
@@ -1235,6 +1242,8 @@ pub struct IndexSchema {
     pub default_score: f64,
     /// See [`IndexDef::score_field`].
     pub score_field: Option<String>,
+    /// See [`IndexDef::nofreqs`].
+    pub nofreqs: bool,
 }
 
 impl IndexSchema {
@@ -1266,6 +1275,7 @@ impl IndexSchema {
             language: self.language,
             default_score: self.default_score,
             score_field: self.score_field,
+            nofreqs: self.nofreqs,
             doc_languages: Arc::new(RwLock::new(AHashMap::new())),
             text: Arc::new(RwLock::new(text::TextIndex::new())),
             postings,
@@ -1409,6 +1419,7 @@ pub fn rebuild_indexes(index_store: &IndexStore, store: &crate::store::Store) {
                 language: def.language.clone(),
                 default_score: def.default_score,
                 score_field: def.score_field.clone(),
+                nofreqs: def.nofreqs,
             }
             .into_def();
             indexes.insert(name, fresh.clone());
@@ -2887,6 +2898,7 @@ mod indexes_tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def()
     }
@@ -4544,6 +4556,7 @@ mod flush_index_tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def();
         let graph = match def.indexes.get("vec") {
@@ -4581,6 +4594,7 @@ mod flush_index_tests {
             language: Default::default(),
             default_score: 0.5,
             score_field: Some("rank".into()),
+            nofreqs: false,
         }
         .into_def();
         let args: Vec<String> = def
@@ -4614,6 +4628,7 @@ mod flush_index_tests {
                 language: Default::default(),
                 default_score: 1.0,
                 score_field: None,
+                nofreqs: false,
             }
             .into_def()
         };
@@ -4647,6 +4662,7 @@ mod alias_tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def()
     }
@@ -4709,6 +4725,7 @@ mod alias_tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         };
         register_index_schemas(&store, &[schema], &Default::default());
         let g = store.read();
@@ -5031,6 +5048,7 @@ mod compaction_catch_up_tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def();
         indexes.write().insert("cmp".into(), def);
