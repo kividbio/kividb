@@ -33,10 +33,31 @@ pub(crate) fn number_value(x: f64) -> String {
 }
 
 /// The number a row value is, if it is held as one.
-fn held_number(value: &str) -> Option<f64> {
-    u64::from_str_radix(value.strip_prefix(NUMBER)?, 16)
-        .ok()
-        .map(f64::from_bits)
+pub(crate) fn held_number(value: &str) -> Option<f64> {
+    let digits = value.strip_prefix(NUMBER)?;
+    // Exactly the 16 lower case hex digits of the bits: no sign, no space.
+    if digits.len() != 16
+        || !digits
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    u64::from_str_radix(digits, 16).ok().map(f64::from_bits)
+}
+
+/// What a stored text that starts with one of the row's markers is given in
+/// front of it, so that it is not taken for what the marker marks.
+pub(crate) const ESCAPE: char = '\u{3}';
+
+/// `raw`, a value as a document holds it, as a row holds it: with [`ESCAPE`]
+/// in front if it starts with a marker.
+pub(crate) fn escaped(raw: &str) -> std::borrow::Cow<'_, str> {
+    if raw.starts_with([NUMBER, NESTED, ESCAPE]) {
+        std::borrow::Cow::Owned(format!("{ESCAPE}{raw}"))
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    }
 }
 
 /// A row value as a number: one held as a number, or text that reads as one.
@@ -46,6 +67,9 @@ pub(crate) fn as_number(value: &str) -> Option<f64> {
 
 /// A row value as text: a number as Redis writes it, anything else as it is.
 pub(crate) fn text_of(value: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(text) = value.strip_prefix(ESCAPE) {
+        return std::borrow::Cow::Borrowed(text);
+    }
     match held_number(value) {
         Some(x) => std::borrow::Cow::Owned(redis_number_text(x)),
         None => std::borrow::Cow::Borrowed(value),
@@ -718,7 +742,8 @@ impl Running {
 
     #[inline]
     fn add(&mut self, value: Option<&str>) {
-        let number = || value.and_then(as_number);
+        // Text of a document, never a number a row holds.
+        let number = || value.and_then(|v| v.parse::<f64>().ok());
         match self {
             Running::Count => {}
             Running::Sum(sum, count) | Running::Avg(sum, count) => {
@@ -784,9 +809,42 @@ pub struct StreamGroups {
     /// Group numbers, found by the hash of their key.
     index: hashbrown::HashTable<u32>,
     groups: Vec<StreamGroup>,
+    /// By property: it is a NUMERIC field, so its group key is the number
+    /// (1.50 and 1.5 are one group), as a row holds it.
+    numeric_props: Vec<bool>,
+    /// By reducer: a `COUNT_DISTINCT` of a NUMERIC field counts numbers.
+    numeric_distinct: Vec<bool>,
+}
+
+/// The most properties a `GROUPBY` read as the documents are may group by.
+const MAX_KEYS: usize = 8;
+
+/// A number as a row holds it (see [`number_value`]), in a buffer: the text
+/// of a group key or of a distinct value, with nothing allocated.
+fn number_key_bytes(x: f64) -> [u8; 17] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bits = x.to_bits();
+    let mut out = [0u8; 17];
+    out[0] = NUMBER as u8;
+    for (k, digit) in out[1..].iter_mut().enumerate() {
+        *digit = HEX[((bits >> (60 - 4 * k)) & 0xf) as usize];
+    }
+    out
 }
 
 impl StreamGroups {
+    /// Tell the groups which fields are NUMERIC (by the name a row gives
+    /// them).
+    pub fn with_numeric(mut self, numeric: &ahash::AHashSet<String>) -> Self {
+        self.numeric_props = self.props.iter().map(|p| numeric.contains(p)).collect();
+        self.numeric_distinct = self
+            .reducers
+            .iter()
+            .map(|r| r.func.starts_with("COUNT_DISTINCT") && numeric.contains(r.field()))
+            .collect();
+        self
+    }
+
     /// The first `GROUPBY` of the steps from `cmd[start]` on, if it can run
     /// as documents are read: no step before it but those that leave the
     /// rows as they are (`LOAD`, which only says what the reply shows, and
@@ -799,7 +857,9 @@ impl StreamGroups {
                 b"GROUPBY" => {
                     let (end, props, reducers) = parse_groupby(cmd, i);
                     // A GROUPBY of no property is one group of every row.
-                    if props.is_empty() || reducers.iter().any(|r| Running::new(&r.func).is_none())
+                    if props.is_empty()
+                        || props.len() > MAX_KEYS
+                        || reducers.iter().any(|r| Running::new(&r.func).is_none())
                     {
                         return None;
                     }
@@ -810,6 +870,8 @@ impl StreamGroups {
                         hasher: ahash::RandomState::new(),
                         index: hashbrown::HashTable::new(),
                         groups: Vec::new(),
+                        numeric_props: Vec::new(),
+                        numeric_distinct: Vec::new(),
                     });
                 }
                 b"LOAD" | b"PARAMS" | b"DIALECT" | b"SCORER" | b"TIMEOUT" | b"LANGUAGE"
@@ -841,24 +903,58 @@ impl StreamGroups {
             hasher,
             index,
             groups,
+            numeric_props,
+            numeric_distinct,
             ..
         } = self;
-        let of = |p: &String| value(p).unwrap_or("");
-        let hash = Self::hash(hasher, props.iter().map(of));
+        // Each key's text, read once. A NUMERIC property's is the number as
+        // a row holds it (held in a buffer on the stack: this is the
+        // per-document path); one that starts with a marker is escaped, as
+        // a row has it.
+        let mut raws: [Option<&'a str>; MAX_KEYS] = [None; MAX_KEYS];
+        let mut held = [[0u8; 17]; MAX_KEYS];
+        let mut is_held = [false; MAX_KEYS];
+        let mut escaped_keys: Vec<(usize, String)> = Vec::new();
+        for (i, p) in props.iter().enumerate() {
+            let raw = value(p);
+            raws[i] = raw;
+            if numeric_props.get(i).copied().unwrap_or(false)
+                && let Some(x) = raw.and_then(|v| v.trim().parse::<f64>().ok())
+            {
+                held[i] = number_key_bytes(x);
+                is_held[i] = true;
+            } else if let Some(v) = raw
+                && v.starts_with([NUMBER, NESTED, ESCAPE])
+            {
+                escaped_keys.push((i, escaped(v).into_owned()));
+            }
+        }
+        let of = |i: usize| -> &str {
+            if is_held[i] {
+                return std::str::from_utf8(&held[i]).unwrap_or("");
+            }
+            if !escaped_keys.is_empty()
+                && let Some((_, text)) = escaped_keys.iter().find(|(j, _)| *j == i)
+            {
+                return text;
+            }
+            raws[i].unwrap_or("")
+        };
+        let hash = Self::hash(hasher, (0..props.len()).map(of));
         let found = index
             .find(hash, |&g| {
                 groups[g as usize]
                     .key
                     .iter()
-                    .zip(props.iter())
-                    .all(|(k, p)| **k == *of(p))
+                    .enumerate()
+                    .all(|(i, k)| **k == *of(i))
             })
             .copied();
         let at = match found {
             Some(g) => g as usize,
             None => {
                 groups.push(StreamGroup {
-                    key: props.iter().map(|p| Box::from(of(p))).collect(),
+                    key: (0..props.len()).map(|i| Box::from(of(i))).collect(),
                     members: 0,
                     running: reducers
                         .iter()
@@ -874,23 +970,20 @@ impl StreamGroups {
         };
         let group = &mut groups[at];
         group.members += 1;
-        for (reducer, running) in reducers.iter().zip(group.running.iter_mut()) {
+        for (at, (reducer, running)) in reducers.iter().zip(group.running.iter_mut()).enumerate() {
             if matches!(running, Running::Count) {
                 continue;
             }
-            running.add(value(reducer.field()));
+            let raw = value(reducer.field());
+            if numeric_distinct.get(at).copied().unwrap_or(false)
+                && let Some(x) = raw.and_then(|v| v.trim().parse::<f64>().ok())
+            {
+                let number = number_key_bytes(x);
+                running.add(std::str::from_utf8(&number).ok());
+            } else {
+                running.add(raw);
+            }
         }
-    }
-
-    /// Whether the groups are by a property of `numeric`, or a reducer
-    /// counts the distinct values of one: that is by the number, not its
-    /// text.
-    pub fn goes_by_number(&self, numeric: &ahash::AHashSet<String>) -> bool {
-        self.props.iter().any(|p| numeric.contains(p))
-            || self
-                .reducers
-                .iter()
-                .any(|r| r.func.starts_with("COUNT_DISTINCT") && numeric.contains(r.field()))
     }
 
     /// Where the steps after the `GROUPBY` start.

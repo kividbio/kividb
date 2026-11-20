@@ -9,6 +9,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrading
 
+- **A query that names no `DIALECT` is read in dialect 1 (#247).** It is
+  read in the default dialect, as in Redis: 1, which `search-default-dialect`
+  (`CONFIG SET`, the configuration file) or `FT.CONFIG SET DEFAULT_DIALECT`
+  changes. Until now such a query was read as in dialect 2, and the two read
+  `-` and `~` differently: `-red apple` is `apple` without `red` in
+  dialect 2, and not (`red apple`) in dialect 1. Nothing fails: a query
+  answers with other documents or scores. Clients that send `DIALECT 2`
+  (RedisVL, LangChain, ...) are not affected. To keep the old reading, set
+  `search-default-dialect 2`. In a cluster, the node that is asked tells the
+  others which dialect it read the query in.
+
+- **`FT.AGGREGATE` and `FT.HYBRID` write numbers as Redis does (#247).** A
+  number a reply computes, or loads from a NUMERIC field, is an integer when
+  it is one, else has 12 significant digits (`2.500000` is now `2.5`,
+  `0.1 + 0.2` is `0.3` and a NUMERIC `1.50` is `1.5`). A reducer with nothing
+  to work on, a division by zero or the square root of a negative number
+  gives `nan`, `inf` or `-inf` where `0`, an empty string or nothing was
+  given; a `QUANTILE` is the value at rank `ceil(q * n)`, `AVG` is over the
+  values that are numbers, and a group's columns come in the order its
+  `GROUPBY` names them (they were sorted by name). A client that reads the
+  values as numbers gets what they were to 12 digits; one that compares the
+  text sees the change. A cluster of 1.2 nodes and 1.3 nodes keeps working
+  (a coordinator asks for numbers as they are held, and an older one is
+  sent their text).
+
+- **Indexes made with `NOFREQS` and `PHONETIC` before this version (#247).**
+  `NOFREQS` was accepted and ignored. A snapshot written by an earlier
+  version does not say an index has it, so one loaded from such a snapshot
+  keeps counting frequencies; one rebuilt from an AOF with no snapshot part
+  (`FT.CREATE ... NOFREQS` replayed) does not. To have the option in force
+  everywhere, make such an index again. `PHONETIC` was kept and did
+  nothing: a field made with it now holds an extra term for each word of
+  three bytes or more (indexed again as the data loads, so the first start
+  of this version takes a little longer and the index a little more room),
+  and queries on it find words that sound alike, with scores that change.
 - **Compressed snapshots are opt-in (#879): nothing changes on upgrade.**
   `rdbcompression` defaults to `no`, and the snapshots 1.3 writes are the
   plain ones 1.2 reads, so a rollback to 1.2.x keeps working. Before
@@ -1338,10 +1373,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **Search scores and `FT.AGGREGATE` numbers agree with Redis 8.10.2 for
-  `NOFREQS`, `~` in dialect 1 and the way numbers are written (#247).**
-  Checked against a live Redis 8.10.2 on the same indexes and documents,
-  to the last digit:
+- **Search scores, `PHONETIC` and `FT.AGGREGATE` numbers agree with Redis
+  8.10.2 for `NOFREQS`, `~` in dialect 1, phonetic fields and the way numbers
+  are written (#247).** Checked against a live Redis 8.10.2 on the same
+  indexes and documents, to the last digit (the few differences left are in
+  [the compatibility notes](docs/COMPATIBILITY.md)):
   - `NOFREQS` is kept (it was accepted and ignored) and counts a word once
     in a document however often it is in it, for every scorer; the
     document's length and the TFIDF norm are the real ones. `FT.INFO` lists
@@ -1350,36 +1386,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (up to a `)`; a later `~` starts a clause of its own): `~red apple` is
     an optional `red apple`, and `-red apple` is not (`red apple`), as in
     Redis. Dialects 2 and later are as they were. An optional inside an
-    optional scores as it does in Redis. **Upgrade note:** a query that
-    names no `DIALECT` is read in the default dialect, 1 unless `FT.CONFIG
-    SET DEFAULT_DIALECT` says otherwise, as in Redis; until now it was read
-    as in dialect 2. Clients that send `DIALECT 2` (RedisVL, LangChain, ...)
-    are not affected.
+    optional scores as it does in Redis. A query that names no `DIALECT` is
+    read in the default dialect, which `search-default-dialect` (`CONFIG
+    SET`, `CONFIG GET`, the configuration file) or `FT.CONFIG SET
+    DEFAULT_DIALECT` sets, 1 unless set.
+  - `PHONETIC dm:en`, `dm:fr`, `dm:pt` and `dm:es` (they were accepted and
+    changed nothing) index a term `<CODE`, the word's Double Metaphone,
+    with each word of `MIN_PHONETIC_TERM_LEN` bytes (3) or more, and a
+    query word on such a field is looked for as the word, as its code and
+    as its stem: `jon` finds `John`. The codes are Redis's (124,000 words
+    compared); a code is no word of the document and is not in its length,
+    as in Redis. `$phonetic: false` turns it off for a clause, and `true`
+    on a field that is not phonetic is an error.
   - `FT.AGGREGATE` writes the numbers it computes, and the values of NUMERIC
     fields it loads, as Redis does: an integer when the number is one (and
     fits 64 bits), else with 12 significant digits (`1.20376952202`,
     `3.33333333333e-08`, `1e+20`); `inf`, `-inf` and `nan` for the rest,
     under RESP2 and RESP3 alike. That is the reducers (`SUM`, `AVG`, `MIN`,
     `MAX`, `STDDEV`, `QUANTILE`, `FIRST_VALUE`, `TOLIST`), the results of
-    `APPLY`, `ADDSCORES`'s `@__score` and a `KNN` distance. **Upgrade
-    note:** `SUM`, `AVG`, `MIN`, `MAX` and `STDDEV` were written with six
-    decimals (`2.500000`), other numbers with all their digits (`0.1 + 0.2`
-    as `0.30000000000000004`), and a NUMERIC field as it was stored (`1.50`):
-    a client that reads them as numbers gets what they were to 12 digits,
-    and one that compares the text sees the change. The steps of a pipeline
-    still work on the double, not on its 12 digits (`APPLY "@x / 3" AS y
-    APPLY "@y * 3" AS z` gives `@x` back). Also as in Redis: a division by
-    zero is `inf` (or `nan`), not nothing; `exp`, `to_str` and `to_number`
-    are functions; a `QUANTILE` is the value at rank `ceil(q * n)`; `SUM`,
-    `AVG`, `MIN` and `MAX` of values that are not numbers are `nan`, `nan`,
-    `inf` and `-inf` (and `AVG` is over the values that are numbers); and a
-    group's columns come in the order its `GROUPBY` names them.
+    `APPLY`, `ADDSCORES`'s `@__score` and a `KNN` distance. The steps of a
+    pipeline still work on the double, not on its 12 digits (`APPLY "@x / 3"
+    AS y APPLY "@y * 3" AS z` gives `@x` back). Also as in Redis: a division
+    by zero is `inf` (or `nan`); `exp`, `to_str` and `to_number` are
+    functions; a `QUANTILE` is the value at rank `ceil(q * n)`; `SUM`, `AVG`,
+    `MIN` and `MAX` of values that are not numbers are `nan`, `nan`, `inf`
+    and `-inf` (and `AVG` is over the values that are numbers); and a
+    group's columns come in the order its `GROUPBY` names them. A
+    `GROUPBY` by a NUMERIC field still runs as the documents are read
+    (#761).
   - `SCORER BM25` of a word multiplies the IDF in before it divides, as
     Redis does: the last digit of its scores was one off.
-
-  `PHONETIC` is still accepted and changes nothing (Redis also matches and
-  scores words that sound alike): see [the compatibility
-  notes](docs/COMPATIBILITY.md).
 
 - **A script running beside others under its hash tags is refused
   `MIGRATE` (#340).** A `MIGRATE` holds back writes to the keys it moves

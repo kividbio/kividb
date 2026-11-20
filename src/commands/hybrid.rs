@@ -865,7 +865,10 @@ fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
                         Some(f) => f.attribute().to_string(),
                         None => name.to_string(),
                     };
-                    row.insert(shown, value.to_string());
+                    row.insert(
+                        shown,
+                        crate::commands::aggregate_pipeline::escaped(value).into_owned(),
+                    );
                 }
                 if load_all && let Some(doc) = doc {
                     row.insert("$".to_string(), doc.to_string());
@@ -882,7 +885,10 @@ fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
             row.insert(name.clone(), score_text(score));
         }
         row.insert("__score".to_string(), score_text(score));
-        row.insert("__key".to_string(), key);
+        row.insert(
+            "__key".to_string(),
+            crate::commands::aggregate_pipeline::escaped(&key).into_owned(),
+        );
         rows.push(row);
     }
 

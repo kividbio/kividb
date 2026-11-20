@@ -764,7 +764,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // The NUMERIC fields of the index, by the name a row gives them: their
     // values are numbers in a row (see `aggregate_pipeline::number_value`).
     // A group by one, or a count of its distinct values, is by the number
-    // (1.50 is 1.5), which the stream does not know: those go by rows.
+    // (1.50 is 1.5): the stream is told which fields they are.
     let numeric: ahash::AHashSet<String> = def
         .fields
         .iter()
@@ -784,7 +784,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         && !crate::cluster::search::coordinates(ctx)
     {
         crate::commands::aggregate_pipeline::StreamGroups::plan(cmd, 3)
-            .filter(|stream| !stream.goes_by_number(&numeric))
+            .map(|stream| stream.with_numeric(&numeric))
     } else {
         None
     };
@@ -823,7 +823,10 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
         // Always include the key itself as a special field.
         // Prefixed with __ so it doesn't collide with user field names.
-        row.insert("__key".to_string(), key.to_string());
+        row.insert(
+            "__key".to_string(),
+            crate::commands::aggregate_pipeline::escaped(key).into_owned(),
+        );
         if let Some(knn) = &knn
             && watching
             && !json
@@ -852,7 +855,10 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 row.insert(shown, crate::commands::aggregate_pipeline::number_value(x));
                 continue;
             }
-            row.insert(shown, s.to_string());
+            row.insert(
+                shown,
+                crate::commands::aggregate_pipeline::escaped(s).into_owned(),
+            );
         }
 
         rows.push(row);
@@ -945,10 +951,20 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // other master too, before any step, then `ON_TIMEOUT`.
     if crate::cluster::search::is_forwarded(ctx) {
         let flag = crate::cluster::search::wants_timeout_flag(cmd).then_some(timed_out);
-        return Some(crate::cluster::search::encode_rows(&rows, flag));
+        return Some(crate::cluster::search::encode_rows(
+            &rows,
+            flag,
+            crate::cluster::search::wants_held_numbers(cmd),
+        ));
     }
     if crate::cluster::search::coordinates(ctx) {
         let mut owned: Vec<Vec<u8>> = cmd.iter().map(|a| a.to_vec()).collect();
+        // Every master reads the query in the dialect this node does.
+        if option("DIALECT").is_none() {
+            owned.push(b"DIALECT".to_vec());
+            owned.push(options.dialect.to_string().into_bytes());
+        }
+        crate::cluster::search::ask_for_held_numbers(&mut owned);
         crate::cluster::search::ask_for_timeout_flag(&mut owned);
         match crate::cluster::search::fan_out(ctx, &owned) {
             Ok(replies) => {

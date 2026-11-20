@@ -641,7 +641,7 @@ fn term_text(term: &TextMatch) -> String {
             crate::vector::stem::STEM_PREFIX,
             stem.stem
         ),
-        TextMatch::Expanded(word) => format!("{word}(expanded)"),
+        TextMatch::Expanded(word) | TextMatch::Phonetic(word) => format!("{word}(expanded)"),
         TextMatch::Prefix(start) => format!("PREFIX{{{start}*}}"),
         TextMatch::Suffix(end) => format!("SUFFIX{{*{end}}}"),
         TextMatch::Infix(part) => format!("INFIX{{*{part}*}}"),
@@ -685,7 +685,18 @@ fn explain_filter(filter: &Filter, text_fields: usize, depth: usize, out: &mut V
                 _ => String::new(),
             };
             let open = format!("{fields}{} {{", if and { "INTERSECT" } else { "UNION" });
-            block(&open, &children, out);
+            out.push(format!("{pad}{open}"));
+            for child in &children {
+                match child {
+                    // A phonetic code is in the scope of the word it is of.
+                    Filter::Text {
+                        term: term @ TextMatch::Phonetic(_),
+                        ..
+                    } => out.push(format!("{pad}  {fields}{}", term_text(term))),
+                    other => explain_filter(other, text_fields, depth + 1, out),
+                }
+            }
+            out.push(format!("{pad}}}"));
         }
         Filter::Not(inner) => block("NOT{", &[inner], out),
         Filter::Optional(inner) => block("OPTIONAL{", &[inner], out),

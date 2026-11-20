@@ -175,7 +175,11 @@ impl DocTerms {
             let bit = 1u64 << u32::from(field).min(63);
             for &raw in tokens {
                 let token = Token(raw);
-                let freq = if token.is_stem() {
+                let freq = if token.is_phonetic() {
+                    // A phonetic code counts as a word does (its field's weight),
+                    // in no position and no length.
+                    unit
+                } else if token.is_stem() {
                     stem_unit
                 } else {
                     pos += 1;
@@ -276,7 +280,7 @@ pub fn is_expansion(filter: &Filter) -> bool {
         Filter::Or(_, right) => matches!(
             &**right,
             Filter::Text {
-                term: TextMatch::Stem(..) | TextMatch::Expanded(..),
+                term: TextMatch::Stem(..) | TextMatch::Expanded(..) | TextMatch::Phonetic(..),
                 ..
             }
         ),
@@ -634,7 +638,9 @@ impl<'q> Scoring<'q> {
                     Some(self.word(text, id, Some(df), stat, doc.len))
                 };
                 match term {
-                    TextMatch::Exact(word) | TextMatch::Expanded(word) => present(word),
+                    TextMatch::Exact(word)
+                    | TextMatch::Expanded(word)
+                    | TextMatch::Phonetic(word) => present(word),
                     TextMatch::Stem(stem) => present(&format!("{STEM_PREFIX}{}", stem.stem)),
                     other => {
                         // RediSearch's union of the words a pattern expands
@@ -763,7 +769,7 @@ impl<'q> Scoring<'q> {
 fn named_terms(filter: &Filter, words: &mut Vec<String>, tags: &mut Vec<(String, String)>) -> bool {
     match filter {
         Filter::Text { term, .. } => match term {
-            TextMatch::Exact(w) | TextMatch::Expanded(w) => {
+            TextMatch::Exact(w) | TextMatch::Expanded(w) | TextMatch::Phonetic(w) => {
                 words.push(w.clone());
                 false
             }
@@ -796,7 +802,10 @@ fn pattern_terms<'f>(filter: &'f Filter, out: &mut Vec<&'f TextMatch>) {
         Filter::Text { term, .. } => {
             if !matches!(
                 term,
-                TextMatch::Exact(_) | TextMatch::Expanded(_) | TextMatch::Stem(_)
+                TextMatch::Exact(_)
+                    | TextMatch::Expanded(_)
+                    | TextMatch::Phonetic(_)
+                    | TextMatch::Stem(_)
             ) {
                 out.push(term);
             }

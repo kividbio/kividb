@@ -1,6 +1,7 @@
 pub mod backlog;
 pub mod doc_keys;
 pub mod filter;
+pub mod phonetic;
 pub mod postings;
 pub mod quant;
 pub mod score;
@@ -784,7 +785,7 @@ impl IndexDef {
     fn text_write(
         &self,
         mut changes: Vec<(u16, Vec<String>)>,
-        restemmed: Vec<(u16, bool)>,
+        restemmed: Vec<(u16, bool, bool)>,
         language: stem::Language,
     ) -> Option<postings::WithId> {
         if changes.is_empty() && restemmed.is_empty() {
@@ -794,8 +795,8 @@ impl IndexDef {
         let units = self.text_units();
         Some(Box::new(move |doc| {
             let mut text = text.write();
-            for (number, stems) in restemmed {
-                if let Some(tokens) = restem(&text, doc, number, stems, language) {
+            for (number, stems, phonetic) in restemmed {
+                if let Some(tokens) = restem(&text, doc, number, stems, phonetic, language) {
                     changes.push((number, tokens));
                 }
             }
@@ -2552,7 +2553,7 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
     // stopwords left out, with their stems (see `IndexDef::write_text`).
     // Read before any lock is taken.
     let mut changes: Vec<(u16, Vec<String>)> = Vec::new();
-    let mut restemmed: Vec<(u16, bool)> = Vec::new();
+    let mut restemmed: Vec<(u16, bool, bool)> = Vec::new();
     let mut language = def.language.language;
     if def.text_fields().next().is_some() {
         let before = (def.language.field.is_some() && !whole).then(|| {
@@ -2571,7 +2572,7 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
                 } else if before.is_some_and(|before| before != language) {
                     // The document's language changed and this field did
                     // not: its words are stemmed again in the new one.
-                    restemmed.push((number, !f.options.nostem));
+                    restemmed.push((number, !f.options.nostem, f.options.phonetic.is_some()));
                 }
                 continue;
             };
@@ -2652,9 +2653,15 @@ fn restem(
     doc: u32,
     number: u16,
     stems: bool,
+    phonetic: bool,
     language: stem::Language,
 ) -> Option<Vec<String>> {
     let words = text.field_words(doc, number)?;
+    let min_phonetic = if phonetic {
+        crate::commands::search_tools::config_number("MIN_PHONETIC_TERM_LEN", 3) as usize
+    } else {
+        0
+    };
     let mut tokens = Vec::with_capacity(words.len() * 2);
     for word in words {
         let stemmed = if stems {
@@ -2662,7 +2669,13 @@ fn restem(
         } else {
             None
         };
+        let code = if phonetic {
+            phonetic::term_of(&word, min_phonetic)
+        } else {
+            None
+        };
         tokens.push(word);
+        tokens.extend(code);
         if let Some(s) = stemmed {
             tokens.push(format!("{}{s}", stem::STEM_PREFIX));
         }

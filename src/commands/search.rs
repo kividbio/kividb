@@ -250,7 +250,14 @@ fn describe_field(field: &SchemaField) -> Vec<Vec<u8>> {
             out.push(resp_integer(*ef_construction as i64));
         }
     }
-    for word in field.options.words(&field.field_type) {
+    // Redis does not report `PHONETIC` in `FT.INFO`'s attributes (it is kept,
+    // and saved: see `IndexDef::create_args`).
+    let mut words = field.options.words(&field.field_type).into_iter();
+    while let Some(word) = words.next() {
+        if word == "PHONETIC" {
+            words.next();
+            continue;
+        }
         out.push(resp_bulk_str(&word));
     }
     out
@@ -880,7 +887,7 @@ pub(crate) fn on_timeout_fails() -> bool {
 pub(crate) fn query_terms(filter: &Filter, out: &mut AHashSet<String>) {
     match filter {
         Filter::Text {
-            term: TextMatch::Exact(term) | TextMatch::Expanded(term),
+            term: TextMatch::Exact(term) | TextMatch::Expanded(term) | TextMatch::Phonetic(term),
             ..
         } => {
             out.insert(term.clone());
@@ -940,7 +947,9 @@ fn candidates(filter: &Filter, def: &IndexDef) -> Option<(Bits, bool)> {
         Filter::MatchNone => Some((Bits::new(), true)),
         Filter::Text { fields, term } => Some(match term {
             // A stopword a synonym brings in is in no index.
-            TextMatch::Exact(t) | TextMatch::Expanded(t) => (word(fields, t), !def.is_stopword(t)),
+            TextMatch::Exact(t) | TextMatch::Expanded(t) | TextMatch::Phonetic(t) => {
+                (word(fields, t), !def.is_stopword(t))
+            }
             TextMatch::Stem(stem) => {
                 let term = format!("{}{}", crate::vector::stem::STEM_PREFIX, stem.stem);
                 (word(fields, &term), true)
@@ -2825,6 +2834,16 @@ fn coordinate(
         &mut shard_cmd,
         args.withscores || (args.sortby.is_none() && args.count > 0),
     );
+    // A query that names no dialect is read in this node's default: every
+    // master is told which, so that they all read it the same way.
+    if args.query.dialect == 0 {
+        shard_cmd.push(b"DIALECT".to_vec());
+        shard_cmd.push(
+            crate::commands::search_tools::dialect_or_default(0)
+                .to_string()
+                .into_bytes(),
+        );
+    }
     crate::cluster::search::ask_for_timeout_flag(&mut shard_cmd);
 
     // This node's part, then the others'.

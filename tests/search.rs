@@ -4698,7 +4698,14 @@ fn a_groupby_read_document_by_document_answers_as_grouping_rows_does() {
         let (g, h, n) = (
             (i % 7).to_string(),
             ["a", "b", ""][i % 3],
-            format!("{}.{}", i % 13, i % 4),
+            // The same number as text that differs: 1.50 and 1.5, 003 and 3.
+            if i % 6 == 0 {
+                format!("{}.{}0", i % 13, i % 4)
+            } else if i % 10 == 3 {
+                format!("00{}", i % 13)
+            } else {
+                format!("{}.{}", i % 13, i % 4)
+            },
         );
         let key = format!("gstr:{i}");
         let mut args = vec!["HSET", &key, "g", &g, "h", h, "n", &n, "t", "some words"];
@@ -4769,6 +4776,29 @@ fn a_groupby_read_document_by_document_answers_as_grouping_rows_does() {
         &[
             "GROUPBY", "1", "@g", "REDUCE", "SUM", "1", "@m", "AS", "s", "SORTBY", "2", "@s",
             "DESC", "LIMIT", "1", "3",
+        ],
+        // By a NUMERIC field whose values are the same number as different
+        // text (`1.50`, `1.5`, `003`).
+        &[
+            "GROUPBY", "1", "@n", "REDUCE", "COUNT", "0", "AS", "c", "SORTBY", "2", "@n", "ASC",
+            "LIMIT", "0", "100",
+        ],
+        &[
+            "GROUPBY",
+            "1",
+            "@h",
+            "REDUCE",
+            "COUNT_DISTINCT",
+            "1",
+            "@n",
+            "AS",
+            "d",
+            "REDUCE",
+            "SUM",
+            "1",
+            "@n",
+            "AS",
+            "s",
         ],
         &[
             "GROUPBY", "1", "@g", "REDUCE", "SUM", "1", "@m", "AS", "s", "FILTER", "@s>200",
@@ -5010,6 +5040,15 @@ fn dialect_1_prefix_operators_take_the_rest_of_the_query_as_redis_does() {
         ("~red apple | pie", 2, &[("op:1", 3.016368642738105), ("op:5", 2.1773083671879347), ("op:2", 1.5081843213690524), ("op:7", 1.0886541835939674), ("op:3", 0.7540921606845262)]),
         ("-apple red", 2, &[("op:3", 0.7540921606845262), ("op:6", 0.7540921606845262)]),
         ("~~red apple", 2, &[("op:5", 3.494209783176421), ("op:2", 2.4203794418735916), ("op:1", 2.262276482053579)]),
+        ("-(red -apple)", 1, &[("op:1", 0.0), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:7", 0.0)]),
+        ("-(@g:{a} -@g:{b})", 1, &[("op:2", 0.0), ("op:4", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("~red (apple ~pie)", 1, &[("op:1", 3.016368642738105), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("-red (apple ~pie)", 1, &[("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("~red @t:(apple ~pie)", 1, &[("op:1", 3.016368642738105), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("~(red ~apple) pie", 1, &[("op:1", 3.016368642738105), ("op:3", 1.5081843213690524), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("-(red | ~apple) pie", 1, &[("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0)]),
+        ("~(red -apple) pie", 1, &[("op:3", 1.5081843213690524), ("op:1", 0.0), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("-red (apple -pie)", 1, &[("op:1", 0.0), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
     ];
     for (query, dialect, want) in cases {
         assert_scores_in(&mut c, "op247", query, *dialect, &[], want);
@@ -5070,6 +5109,30 @@ fn a_query_with_no_dialect_is_read_in_the_default_dialect() {
     assert!(c.cmd(&["FT.CONFIG", "SET", "DEFAULT_DIALECT", "2"]).ok());
     assert_eq!(ids(&mut c, &[]), ["dd:2"]);
     assert_eq!(ids(&mut c, &["DIALECT", "1"]), ["dd:2", "dd:3"]);
+    // The server setting of Redis 8 is the same value.
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "search-default-dialect"]).arr()[1].s(),
+        "2"
+    );
+    assert!(
+        c.cmd(&["CONFIG", "SET", "search-default-dialect", "1"])
+            .ok()
+    );
+    assert_eq!(
+        c.cmd(&["FT.CONFIG", "GET", "DEFAULT_DIALECT"]).arr()[0].arr()[1].s(),
+        "1"
+    );
+    assert_eq!(ids(&mut c, &[]), ["dd:2", "dd:3"]);
+    assert!(
+        c.cmd(&["CONFIG", "SET", "search-default-dialect", "5"])
+            .err()
+            .contains("search-default-dialect")
+    );
+    assert!(
+        c.cmd(&["CONFIG", "SET", "search-default-dialect", "2"])
+            .ok()
+    );
+    assert_eq!(ids(&mut c, &[]), ["dd:2"]);
 }
 
 /// The rows of an FT.AGGREGATE reply, RESP2 or RESP3: each as its name and
@@ -5262,4 +5325,283 @@ fn split_words(line: &str) -> Vec<String> {
         words.push(word);
     }
     words
+}
+
+/// A stored value that looks like a number a row holds (a marker byte and 16
+/// hex digits), or starts with one of the markers, is text, and comes back
+/// as it was stored.
+#[test]
+fn a_stored_value_that_looks_like_a_held_number_is_text() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "hn247",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "hn:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+            "s",
+            "TEXT",
+        ])
+        .ok()
+    );
+    let values = [
+        "\u{2}4008000000000000",
+        "\u{2}",
+        "\u{1}[\"x\"]",
+        "\u{3}\u{2}4008000000000000",
+        "plain",
+    ];
+    for (i, v) in values.iter().enumerate() {
+        c.cmd(&["HSET", &format!("hn:{i}"), "t", &format!("w{i}"), "s", v]);
+    }
+    let want: Vec<Vec<String>> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| vec!["t".into(), format!("w{i}"), "s".into(), (*v).into()])
+        .collect();
+    let rows = aggregate_rows(&c.cmd(&[
+        "FT.AGGREGATE",
+        "hn247",
+        "*",
+        "LOAD",
+        "2",
+        "@t",
+        "@s",
+        "SORTBY",
+        "2",
+        "@t",
+        "ASC",
+    ]));
+    assert_eq!(rows, want);
+    // Grouped (read as the documents are), and with a step that makes rows.
+    for extra in [&[][..], &["APPLY", "1", "AS", "one"][..]] {
+        let mut args = vec!["FT.AGGREGATE", "hn247", "*"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&[
+            "GROUPBY", "1", "@s", "REDUCE", "COUNT", "0", "AS", "c", "SORTBY", "2", "@s", "ASC",
+        ]);
+        let rows = aggregate_rows(&c.cmd(&args));
+        let mut got: Vec<String> = rows.iter().map(|r| r[1].clone()).collect();
+        got.sort();
+        let mut sorted: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+        sorted.sort();
+        assert_eq!(got, sorted, "{extra:?}");
+    }
+}
+
+/// `PHONETIC`: a field made with it indexes a term `<CODE` (Double Metaphone)
+/// with each word of three bytes or more, and a query word on it is looked
+/// for as the word, as `<CODE` and as its stem. Scores and `FT.EXPLAIN` as
+/// Redis 8.10.2 gives them.
+#[test]
+fn phonetic_fields_match_and_score_as_redis_does() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "ph247",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "ph:",
+            "SCHEMA",
+            "p",
+            "TEXT",
+            "PHONETIC",
+            "dm:en",
+            "q",
+            "TEXT",
+            "t",
+            "TEXT",
+            "WEIGHT",
+            "2",
+        ])
+        .ok()
+    );
+    let names = [
+        "john",
+        "jon",
+        "jonathan",
+        "smith",
+        "smyth",
+        "schmidt",
+        "catherine",
+        "katherine",
+        "stephen",
+        "steven",
+        "philip",
+        "filip",
+        "knight",
+        "night",
+        "thomas",
+        "tomas",
+        "wright",
+        "right",
+        "mary",
+        "marie",
+        "meyer",
+        "myers",
+        "cohen",
+        "cohn",
+        "zhang",
+        "ab",
+        "app",
+        "abc",
+    ];
+    for (i, n) in names.iter().enumerate() {
+        let said = format!("the {n} says hello to {}", names[(i * 7 + 3) % names.len()]);
+        c.cmd(&["HSET", &format!("ph:{i:02}"), "p", n, "q", n, "t", &said]);
+    }
+    for (id, p, q, t) in [
+        ("90", "john smith john", "smyth", "x y"),
+        ("91", "jon and mary", "jon", "plain words here"),
+        ("93", "Smith Smyth Schmidt", "none", "none"),
+    ] {
+        c.cmd(&["HSET", &format!("ph:{id}"), "p", p, "q", q, "t", t]);
+    }
+    // The attribute is not in FT.INFO, as in Redis.
+    let info = c.cmd(&["FT.INFO", "ph247"]);
+    assert!(!format!("{info:?}").contains("PHONETIC"), "{info:?}");
+
+    #[rustfmt::skip]
+    let scores: &[ScoreCase] = &[
+        ("@p:john", &[], &[("ph:90", 6.536467200173622), ("ph:00", 6.240555774592154), ("ph:91", 2.0273512572188883), ("ph:01", 1.9432925544569841)]),
+        ("@q:john", &[], &[("ph:00", 4.29726322013517)]),
+        ("john", &[], &[("ph:90", 6.536467200173622), ("ph:00", 6.240555774592154), ("ph:91", 2.0273512572188883), ("ph:01", 1.9432925544569841)]),
+        ("@p:jon", &[], &[("ph:01", 6.240555774592154), ("ph:91", 5.612710251757983), ("ph:90", 2.84239011133434), ("ph:00", 1.9432925544569841)]),
+        ("@q:jon", &[], &[("ph:01", 4.29726322013517), ("ph:91", 3.585358994539095)]),
+        ("jon", &[], &[("ph:01", 6.240555774592154), ("ph:91", 5.612710251757983), ("ph:90", 2.84239011133434), ("ph:00", 1.9432925544569841)]),
+        ("@p:smith", &[], &[("ph:93", 4.3493123721351035), ("ph:03", 3.8216232089343283), ("ph:90", 3.3227586606176214), ("ph:04", 1.9432925544569841)]),
+        ("@q:smith", &[], &[("ph:03", 1.878330654477344)]),
+        ("smith", &[], &[("ph:93", 4.3493123721351035), ("ph:03", 3.8216232089343283), ("ph:04", 3.4656469171855915), ("ph:90", 3.3227586606176214), ("ph:00", 1.5223543627286074), ("ph:08", 1.5223543627286074), ("ph:12", 1.5223543627286074), ("ph:16", 1.5223543627286074), ("ph:20", 1.5223543627286074), ("ph:24", 1.5223543627286074)]),
+        ("@p:smyth", &[], &[("ph:04", 5.673408936716044), ("ph:93", 5.6540245654499675), ("ph:90", 2.1190107956729483), ("ph:03", 1.9432925544569841)]),
+        ("@q:smyth", &[], &[("ph:04", 3.7301163822590597), ("ph:90", 2.390484135706603)]),
+        ("smyth", &[], &[("ph:04", 5.673408936716044), ("ph:93", 5.6540245654499675), ("ph:90", 4.509494931379551), ("ph:03", 1.9432925544569841)]),
+        ("@p:schmidt", &[], &[("ph:05", 6.822839309675367), ("ph:93", 6.055443280589705)]),
+        ("@q:schmidt", &[], &[("ph:05", 4.29726322013517)]),
+        ("schmidt", &[], &[("ph:05", 6.822839309675367), ("ph:93", 6.055443280589705)]),
+        ("@p:katherine", &[], &[("ph:07", 12.469178010732534), ("ph:06", 2.5255760895401975)]),
+        ("@q:katherine", &[], &[("ph:07", 9.943601921192336)]),
+        ("katherine", &[], &[("ph:07", 12.469178010732534), ("ph:06", 2.5255760895401975)]),
+        ("@p:stefan", &[], &[("ph:08", 2.5255760895401975), ("ph:09", 2.5255760895401975)]),
+        ("@q:stefan", &[], &[]),
+        ("stefan", &[], &[("ph:08", 2.5255760895401975), ("ph:09", 2.5255760895401975)]),
+        ("@p:philip", &[], &[("ph:10", 4.760082592257698), ("ph:11", 2.5255760895401975)]),
+        ("@q:philip", &[], &[("ph:10", 2.2345065027175006)]),
+        ("philip", &[], &[("ph:10", 4.760082592257698), ("ph:11", 2.5255760895401975), ("ph:01", 1.8110286997919303), ("ph:05", 1.8110286997919303), ("ph:09", 1.8110286997919303), ("ph:13", 1.8110286997919303), ("ph:17", 1.8110286997919303), ("ph:21", 1.8110286997919303), ("ph:25", 1.8110286997919303)]),
+        ("@p:night", &[], &[("ph:13", 7.68387063913724), ("ph:12", 2.5255760895401975)]),
+        ("@q:night", &[], &[("ph:13", 5.158294549597042)]),
+        ("night", &[], &[("ph:13", 7.68387063913724), ("ph:12", 2.5255760895401975)]),
+        ("@p:thomas", &[], &[("ph:14", 12.469178010732534), ("ph:15", 2.5255760895401975)]),
+        ("@q:thomas", &[], &[("ph:14", 9.943601921192336)]),
+        ("thomas", &[], &[("ph:14", 12.469178010732534), ("ph:15", 2.5255760895401975)]),
+        ("@p:mary", &[], &[("ph:18", 9.700954022367096), ("ph:91", 6.949254994996408), ("ph:19", 5.403690802231926), ("ph:20", 1.9432925544569841)]),
+        ("@q:mary", &[], &[("ph:18", 7.757661467910112), ("ph:19", 3.4603982477749424)]),
+        ("mary", &[], &[("ph:18", 9.700954022367096), ("ph:91", 6.949254994996408), ("ph:19", 5.403690802231926), ("ph:20", 1.9432925544569841)]),
+        ("@p:meyer", &[], &[("ph:20", 7.101587104054026), ("ph:91", 2.0273512572188883), ("ph:18", 1.9432925544569841), ("ph:19", 1.9432925544569841)]),
+        ("@q:meyer", &[], &[("ph:20", 5.158294549597042)]),
+        ("meyer", &[], &[("ph:20", 7.101587104054026), ("ph:91", 2.0273512572188883), ("ph:18", 1.9432925544569841), ("ph:19", 1.9432925544569841)]),
+        ("@p:cohen", &[], &[("ph:22", 8.189913677842585)]),
+        ("@q:cohen", &[], &[("ph:22", 5.158294549597042)]),
+        ("cohen", &[], &[("ph:22", 8.189913677842585)]),
+        ("@p:zhang", &[], &[("ph:24", 5.266125630963042)]),
+        ("@q:zhang", &[], &[("ph:24", 2.2345065027175006)]),
+        ("zhang", &[], &[("ph:24", 5.266125630963042), ("ph:03", 1.8110286997919303), ("ph:07", 1.8110286997919303), ("ph:11", 1.8110286997919303), ("ph:15", 1.8110286997919303), ("ph:19", 1.8110286997919303), ("ph:23", 1.8110286997919303), ("ph:27", 1.8110286997919303)]),
+        ("@p:ab", &[], &[("ph:25", 5.158294549597042), ("ph:26", 3.031619128245542)]),
+        ("@q:ab", &[], &[("ph:25", 5.158294549597042)]),
+        ("ab", &[], &[("ph:25", 5.158294549597042), ("ph:26", 3.031619128245542)]),
+        ("@p:app", &[], &[("ph:26", 8.189913677842585)]),
+        ("@q:app", &[], &[("ph:26", 5.158294549597042)]),
+        ("app", &[], &[("ph:26", 8.189913677842585)]),
+        ("@p:abc", &[], &[("ph:27", 8.189913677842585)]),
+        ("@q:abc", &[], &[("ph:27", 5.158294549597042)]),
+        ("abc", &[], &[("ph:27", 8.189913677842585)]),
+        ("@p:jonathan", &[], &[("ph:02", 8.189913677842585)]),
+        ("@q:jonathan", &[], &[("ph:02", 5.158294549597042)]),
+        ("jonathan", &[], &[("ph:02", 8.189913677842585)]),
+        ("@p:(john smith)", &[], &[("ph:90", 9.859225860791243)]),
+        ("@p:(john smith)", &["SCORER", "TFIDF"], &[("ph:90", 9.5)]),
+        ("@p:(john smith)", &["SCORER", "BM25"], &[("ph:90", 2.3237991235847537)]),
+        ("@p:(john smith)", &["SCORER", "DISMAX"], &[("ph:90", 3.0)]),
+        ("@p:(john smith)", &["SCORER", "TFIDF.DOCNORM"], &[("ph:90", 2.375)]),
+        ("@p:(john smith)", &["SCORER", "BM25STD.TANH"], &[("ph:90", 0.9856451733969455)]),
+        ("@p:(jon | smyth)", &[], &[("ph:01", 6.240555774592154), ("ph:04", 5.673408936716044), ("ph:93", 5.6540245654499675), ("ph:91", 5.612710251757983), ("ph:90", 4.961400907007288), ("ph:00", 1.9432925544569841), ("ph:03", 1.9432925544569841)]),
+        ("@p:(jon | smyth)", &["SCORER", "TFIDF"], &[("ph:91", 5.5), ("ph:01", 4.75), ("ph:90", 4.5), ("ph:04", 3.75), ("ph:93", 3.0), ("ph:00", 0.75), ("ph:03", 0.75)]),
+        ("@p:(jon | smyth)", &["SCORER", "BM25"], &[("ph:01", 1.930877990087295), ("ph:04", 1.5486338564371072), ("ph:91", 1.3470233780239806), ("ph:90", 1.1107428973896212), ("ph:93", 1.1107428973896212), ("ph:00", 0.40190145548654344), ("ph:03", 0.40190145548654344)]),
+        ("@p:(jon | smyth)", &["SCORER", "DISMAX"], &[("ph:01", 4.0), ("ph:04", 4.0), ("ph:90", 2.0), ("ph:91", 2.0), ("ph:93", 2.0), ("ph:00", 1.0), ("ph:03", 1.0)]),
+        ("@p:(jon | smyth)", &["SCORER", "TFIDF.DOCNORM"], &[("ph:01", 1.9), ("ph:04", 1.5), ("ph:93", 1.5), ("ph:91", 1.2222222222222223), ("ph:90", 1.125), ("ph:00", 0.3), ("ph:03", 0.3)]),
+        ("@p:(jon | smyth)", &["SCORER", "BM25STD.TANH"], &[("ph:01", 0.915442963072744), ("ph:04", 0.8892546735121925), ("ph:93", 0.8882363639451106), ("ph:91", 0.8860365571129476), ("ph:90", 0.8455554525180802), ("ph:00", 0.4508950282438057), ("ph:03", 0.4508950282438057)]),
+        ("@p:john @q:jon", &[], &[("ph:01", 6.240555774592154), ("ph:91", 5.612710251757983)]),
+        ("@p:john @q:jon", &["SCORER", "TFIDF"], &[("ph:91", 5.5), ("ph:01", 4.75)]),
+        ("@p:john @q:jon", &["SCORER", "BM25"], &[("ph:01", 1.930877990087295), ("ph:91", 1.3470233780239806)]),
+        ("@p:john @q:jon", &["SCORER", "DISMAX"], &[("ph:01", 5.0), ("ph:91", 3.0)]),
+        ("@p:john @q:jon", &["SCORER", "TFIDF.DOCNORM"], &[("ph:01", 1.9), ("ph:91", 1.2222222222222223)]),
+        ("@p:john @q:jon", &["SCORER", "BM25STD.TANH"], &[("ph:01", 0.915442963072744), ("ph:91", 0.8860365571129476)]),
+        ("@p:(smith) @q:smyth", &[], &[("ph:90", 5.7132427963242245), ("ph:04", 5.673408936716044)]),
+        ("@p:(smith) @q:smyth", &["SCORER", "TFIDF"], &[("ph:04", 3.75), ("ph:90", 2.0)]),
+        ("@p:(smith) @q:smyth", &["SCORER", "BM25"], &[("ph:04", 1.5486338564371072), ("ph:90", 0.5358686073153913)]),
+        ("@p:(smith) @q:smyth", &["SCORER", "DISMAX"], &[("ph:04", 5.0), ("ph:90", 2.0)]),
+        ("@p:(smith) @q:smyth", &["SCORER", "TFIDF.DOCNORM"], &[("ph:04", 1.5), ("ph:90", 0.5)]),
+        ("@p:(smith) @q:smyth", &["SCORER", "BM25STD.TANH"], &[("ph:90", 0.8913198875386024), ("ph:04", 0.8892546735121925)]),
+        ("@p:\"john smith\"", &[], &[("ph:90", 4.897824953783956)]),
+        ("@p:\"john smith\"", &["SCORER", "TFIDF"], &[("ph:90", 5.0)]),
+        ("@p:\"john smith\"", &["SCORER", "BM25"], &[("ph:90", 1.2130562261951328)]),
+        ("@p:\"john smith\"", &["SCORER", "DISMAX"], &[("ph:90", 3.0)]),
+        ("@p:\"john smith\"", &["SCORER", "TFIDF.DOCNORM"], &[("ph:90", 1.25)]),
+        ("@p:\"john smith\"", &["SCORER", "BM25STD.TANH"], &[("ph:90", 0.8409637719431037)]),
+        ("@p:john*", &[], &[("ph:00", 4.29726322013517), ("ph:90", 3.694077088839282)]),
+        ("@p:john*", &["SCORER", "TFIDF"], &[("ph:00", 4.0), ("ph:90", 4.0)]),
+        ("@p:john*", &["SCORER", "BM25"], &[("ph:00", 1.5289765346007516), ("ph:90", 0.9451219225374371)]),
+        ("@p:john*", &["SCORER", "DISMAX"], &[("ph:00", 4.0), ("ph:90", 2.0)]),
+        ("@p:john*", &["SCORER", "TFIDF.DOCNORM"], &[("ph:00", 1.6), ("ph:90", 1.0)]),
+        ("@p:john*", &["SCORER", "BM25STD.TANH"], &[("ph:00", 0.7910816735302957), ("ph:90", 0.7275580381760854)]),
+        ("@p:john=>{$phonetic:false}", &[], &[("ph:00", 4.29726322013517), ("ph:90", 3.694077088839282)]),
+        ("@p:john=>{$phonetic:false}", &["SCORER", "TFIDF"], &[("ph:00", 4.0), ("ph:90", 4.0)]),
+        ("@p:john=>{$phonetic:false}", &["SCORER", "BM25"], &[("ph:00", 1.5289765346007516), ("ph:90", 0.9451219225374371)]),
+        ("@p:john=>{$phonetic:false}", &["SCORER", "DISMAX"], &[("ph:00", 4.0), ("ph:90", 2.0)]),
+        ("@p:john=>{$phonetic:false}", &["SCORER", "TFIDF.DOCNORM"], &[("ph:00", 1.6), ("ph:90", 1.0)]),
+        ("@p:john=>{$phonetic:false}", &["SCORER", "BM25STD.TANH"], &[("ph:00", 0.7910816735302957), ("ph:90", 0.7275580381760854)]),
+        ("@p:john", &[], &[("ph:90", 6.536467200173622), ("ph:00", 6.240555774592154), ("ph:91", 2.0273512572188883), ("ph:01", 1.9432925544569841)]),
+        ("@p:john", &["SCORER", "TFIDF"], &[("ph:90", 7.0), ("ph:00", 4.75), ("ph:91", 1.5), ("ph:01", 0.75)]),
+        ("@p:john", &["SCORER", "BM25"], &[("ph:00", 1.930877990087295), ("ph:90", 1.6539633644405147), ("ph:01", 0.40190145548654344), ("ph:91", 0.40190145548654344)]),
+        ("@p:john", &["SCORER", "DISMAX"], &[("ph:00", 4.0), ("ph:90", 2.0), ("ph:01", 1.0), ("ph:91", 1.0)]),
+        ("@p:john", &["SCORER", "TFIDF.DOCNORM"], &[("ph:00", 1.9), ("ph:90", 1.75), ("ph:91", 0.3333333333333333), ("ph:01", 0.3)]),
+        ("@p:john", &["SCORER", "BM25STD.TANH"], &[("ph:90", 0.9266456247720228), ("ph:00", 0.915442963072744), ("ph:91", 0.4674777185891131), ("ph:01", 0.4508950282438057)]),
+        ("@p:john", &["VERBATIM"], &[("ph:00", 4.29726322013517), ("ph:90", 3.694077088839282)]),
+    ];
+    for (query, extra, want) in scores {
+        assert_scores_in(&mut c, "ph247", query, 2, extra, want);
+    }
+    #[rustfmt::skip]
+    let plans: &[(&str, &str)] = &[
+        ("@p:john", "@p:UNION {\n  @p:john\n  @p:<JN(expanded)\n  @p:+john(expanded)\n}\n"),
+        ("@q:john", "@q:UNION {\n  @q:john\n  @q:+john(expanded)\n}\n"),
+        ("john | mary", "UNION {\n  UNION {\n    john\n    <JN(expanded)\n    +john(expanded)\n  }\n  UNION {\n    mary\n    <MR(expanded)\n    +mari(expanded)\n    mari(expanded)\n  }\n}\n"),
+        ("@p:john=>{$phonetic:false}", "@p:UNION {\n  @p:john\n  @p:+john(expanded)\n}\n"),
+        ("ab", "UNION {\n  ab\n  <AP(expanded)\n  +ab(expanded)\n}\n"),
+        ("x", "UNION {\n  x\n  <S(expanded)\n  +x(expanded)\n}\n"),
+    ];
+    for (query, want) in plans {
+        assert_eq!(c.cmd(&["FT.EXPLAIN", "ph247", query]).s(), *want, "{query}");
+    }
+
+    // A document written again, or deleted, is in the index as it is now.
+    c.cmd(&["HSET", "ph:00", "p", "zzz yyy"]);
+    c.cmd(&["DEL", "ph:90"]);
+    let ids = |c: &mut Conn, q: &str| {
+        c.cmd(&["FT.SEARCH", "ph247", q, "NOCONTENT", "DIALECT", "2"])
+            .id_set()
+    };
+    assert_eq!(ids(&mut c, "@p:john"), ["ph:01", "ph:91"]);
+    assert_eq!(ids(&mut c, "@p:zzz"), ["ph:00"]);
+    // The shortest word given a code is `MIN_PHONETIC_TERM_LEN` bytes (3).
+    c.cmd(&["HSET", "ph:94", "p", "ab", "q", "zz"]);
+    assert_eq!(ids(&mut c, "@p:app"), ["ph:26"]);
 }

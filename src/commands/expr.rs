@@ -23,7 +23,7 @@
 // Box<T> puts the inner Expr on the heap, breaking the infinite-size cycle.
 // This is idiomatic Rust for tree types.
 
-use super::aggregate_pipeline::{NUMBER, number_value, redis_number_text};
+use super::aggregate_pipeline::{held_number, number_value, redis_number_text, text_of};
 use ahash::AHashMap;
 
 // ── Value ─────────────────────────────────────────────────────────────────────
@@ -116,7 +116,7 @@ impl Value {
     /// else by text.
     fn same_as(&self, other: &Value) -> bool {
         match (self.number(), other.number()) {
-            (Some(a), Some(b)) => a == b,
+            (Some(a), Some(b)) if !a.is_nan() && !b.is_nan() => a == b,
             _ => self.as_str() == other.as_str(),
         }
     }
@@ -682,12 +682,9 @@ pub fn eval(expr: &Expr, row: &AHashMap<String, String>) -> Value {
             match row.get(name.as_str()) {
                 // A number the pipeline holds as one is that number; text
                 // is text, which reads as a number where one is wanted.
-                Some(s) => match s.strip_prefix(NUMBER) {
-                    Some(bits) => match u64::from_str_radix(bits, 16) {
-                        Ok(bits) => Value::Num(f64::from_bits(bits)),
-                        Err(_) => Value::Str(s.clone()),
-                    },
-                    None => Value::Str(s.clone()),
+                Some(s) => match held_number(s) {
+                    Some(x) => Value::Num(x),
+                    None => Value::Str(text_of(s).into_owned()),
                 },
                 None => Value::Nil,
             }

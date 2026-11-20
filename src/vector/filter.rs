@@ -69,6 +69,10 @@ pub enum TextMatch {
     /// The bare stem a query's word is expanded with, where it differs from
     /// the word: matched as [`TextMatch::Exact`] is.
     Expanded(String),
+    /// The phonetic code (`<JN`) a query's word is expanded with, on the
+    /// fields that are `PHONETIC`: a document's word of the same code is a
+    /// match (see `phonetic`).
+    Phonetic(String),
 }
 
 /// What [`TextMatch::Stem`] needs to tell whether a document's word has the
@@ -95,6 +99,10 @@ impl TextMatch {
     pub(crate) fn matches(&self, token: &str) -> bool {
         match self {
             TextMatch::Exact(t) | TextMatch::Expanded(t) => token == t,
+            TextMatch::Phonetic(t) => {
+                let min = crate::commands::search_tools::config_number("MIN_PHONETIC_TERM_LEN", 3);
+                super::phonetic::term_of(token, min as usize).as_deref() == Some(t.as_str())
+            }
             TextMatch::Stem(stem) => stem.has(stem.language, token),
             TextMatch::Prefix(p) => token.starts_with(p.as_str()),
             TextMatch::Suffix(s) => token.ends_with(s.as_str()),
@@ -539,10 +547,23 @@ impl<'a> Parser<'a> {
                 if name == "yield_distance_as"
                     && let Filter::VectorRange { yield_as, .. } = &mut clause
                 {
-                    *yield_as = Some(value);
+                    *yield_as = Some(value.clone());
                 }
-                // $weight, $slop, $inorder, $phonetic, $epsilon: accepted;
-                // they tune ranking or approximation, not what matches.
+                // `$phonetic`: whether the clause's words are also looked for by
+                // their phonetic codes (default: on the PHONETIC fields).
+                if name == "phonetic" {
+                    match value.to_ascii_lowercase().as_str() {
+                        "false" => clause = without_phonetic(clause),
+                        "true" => {
+                            if !has_phonetic(&clause) {
+                                return Err("field does not support phonetics".into());
+                            }
+                        }
+                        _ => return Err(self.syntax_error()),
+                    }
+                }
+                // $weight, $slop, $inorder, $epsilon: accepted; they tune
+                // ranking or approximation, not what matches.
             }
         }
         Ok(Some(clause))
@@ -553,7 +574,13 @@ impl<'a> Parser<'a> {
             Some('(') => {
                 self.bump();
                 self.skip_ws();
-                let inner = self.or_expr(scope)?;
+                // A `~` or `-` inside the parentheses is of the group, not
+                // one that ends the operand of the `~` or `-` outside.
+                let flags = (self.stop_tilde, self.stop_minus);
+                (self.stop_tilde, self.stop_minus) = (false, false);
+                let inner = self.or_expr(scope);
+                (self.stop_tilde, self.stop_minus) = flags;
+                let inner = inner?;
                 self.skip_ws();
                 if !self.eat(')') {
                     return Err(self.syntax_error());
@@ -1014,6 +1041,33 @@ impl<'a> Parser<'a> {
                 .iter()
                 .any(|f| f.name == *name && f.options.nostem)
         };
+        // The word's phonetic code, on the PHONETIC fields of the clause:
+        // `word | <CODE | +stem`. A word is expanded whatever its length;
+        // only a word of `MIN_PHONETIC_TERM_LEN` bytes or more has a code in
+        // the index.
+        let base = {
+            let phonetic: Vec<String> = fields
+                .iter()
+                .filter(|name| {
+                    self.def.fields.iter().any(|f| {
+                        f.name == **name
+                            && matches!(f.field_type, FieldType::Text)
+                            && f.options.phonetic.is_some()
+                    })
+                })
+                .cloned()
+                .collect();
+            match super::phonetic::term_of(&word, 0) {
+                Some(code) if !phonetic.is_empty() => Filter::Or(
+                    Box::new(base),
+                    Box::new(Filter::Text {
+                        fields: phonetic,
+                        term: TextMatch::Phonetic(code),
+                    }),
+                ),
+                _ => base,
+            }
+        };
         let stem_fields: Vec<String> = if scoped {
             fields.iter().filter(|f| !nostem(f)).cloned().collect()
         } else {
@@ -1260,6 +1314,48 @@ impl<'a> Parser<'a> {
             out.push((name.to_ascii_lowercase(), value));
         }
         Ok(out)
+    }
+}
+
+/// `clause` without the phonetic codes its words were expanded with
+/// (`$phonetic: false`).
+fn without_phonetic(clause: Filter) -> Filter {
+    match clause {
+        Filter::Or(left, right) => {
+            if matches!(
+                &*right,
+                Filter::Text {
+                    term: TextMatch::Phonetic(_),
+                    ..
+                }
+            ) {
+                return without_phonetic(*left);
+            }
+            Filter::Or(
+                Box::new(without_phonetic(*left)),
+                Box::new(without_phonetic(*right)),
+            )
+        }
+        Filter::And(left, right) => Filter::And(
+            Box::new(without_phonetic(*left)),
+            Box::new(without_phonetic(*right)),
+        ),
+        Filter::Not(inner) => Filter::Not(Box::new(without_phonetic(*inner))),
+        Filter::Optional(inner) => Filter::Optional(Box::new(without_phonetic(*inner))),
+        other => other,
+    }
+}
+
+/// Whether `clause` has a phonetic code in it (a word of a PHONETIC field).
+fn has_phonetic(clause: &Filter) -> bool {
+    match clause {
+        Filter::Text {
+            term: TextMatch::Phonetic(_),
+            ..
+        } => true,
+        Filter::Or(l, r) | Filter::And(l, r) => has_phonetic(l) || has_phonetic(r),
+        Filter::Not(inner) | Filter::Optional(inner) => has_phonetic(inner),
+        _ => false,
     }
 }
 

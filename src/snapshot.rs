@@ -7495,6 +7495,20 @@ mod field_option_tests {
                 "{name} section comes after the score section"
             );
         }
+        // The `NOFREQS` section is the last: a release that does not know it
+        // stops there and reads everything before it.
+        let nofreqs_at = image
+            .windows(8)
+            .position(|w| w == KDB_NOFREQS_MAGIC)
+            .expect("NOFREQS section");
+        assert!(score_at < nofreqs_at);
+        for &(name, magic) in &EVERY_SECTION[..EVERY_SECTION.len() - 1] {
+            let at = image.windows(8).position(|w| w == magic).unwrap();
+            assert!(
+                at < nofreqs_at,
+                "{name} section comes after the NOFREQS section"
+            );
+        }
 
         let loaded = load_snapshot_from(image.as_slice()).unwrap();
         let of = |name: &str| {

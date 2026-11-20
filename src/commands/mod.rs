@@ -1,5 +1,5 @@
 mod acl;
-mod aggregate_pipeline;
+pub(crate) mod aggregate_pipeline;
 pub(crate) mod arity;
 mod array;
 pub(crate) mod backup;

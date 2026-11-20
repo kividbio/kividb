@@ -2632,7 +2632,7 @@ mod config_file_tests {
         let (_, warnings) = load(
             "stream-node-max-entries 100\nstream-node-max-bytes 4kb\n\
              tracking-table-max-keys 1000000\nbusy-reply-threshold 5000\n\
-             search-timeout 0\nsearch-on-timeout return\n",
+             search-timeout 0\nsearch-on-timeout return\nsearch-default-dialect 1\n",
         )
         .unwrap();
         #[cfg(feature = "lua")]
