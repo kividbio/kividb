@@ -1122,7 +1122,14 @@ fn hand(set: &Shared) {
 /// resize it went through while it was built is still in progress. What
 /// every set made whole goes through (a load, `RESTORE`, a `*STORE`
 /// command, a new key of `SADD`).
+///
+/// A new `Arc` is never in the background's registry, so a mark of having
+/// been handed over (from a table moved out of another value) is cleared
+/// first.
 pub fn shared(mut set: MemberSet) -> Shared {
+    if let Repr::Table(t) = &mut set.repr {
+        t.queued = false;
+    }
     let due = set.hand_over();
     let shared = Arc::new(RwLock::new(set));
     if due {

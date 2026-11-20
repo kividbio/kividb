@@ -222,6 +222,30 @@ impl HashFields {
         Self::new()
     }
 
+    /// The hash in the form its fields would have been loaded in, if a
+    /// table made for more holds far fewer (a load that dropped fields
+    /// already past their time): a block if they fit one, else a table
+    /// with room for them, not one at least twice their size.
+    pub fn into_fitting(self) -> Self {
+        let Repr::Table(t) = &self.repr else {
+            return self;
+        };
+        let n = t.fields.len();
+        let longest = packed_value();
+        let fits_block = n <= packed_entries()
+            && t.fields
+                .iter()
+                .all(|e| e.field.len() <= longest && e.value.len() <= longest);
+        if !fits_block && t.fields.capacity() < 2 * n.max(1) {
+            return self;
+        }
+        let mut out = Self::with_capacity(n);
+        for (field, value) in self.iter() {
+            out.insert_bytes(field, &value);
+        }
+        out
+    }
+
     /// What the hash is kept as (`OBJECT ENCODING`).
     #[inline]
     pub fn encoding(&self) -> Encoding {
@@ -527,7 +551,9 @@ impl HashFields {
     }
 
     /// Every field and its value, in [`Self::iter`]'s order, given to `f`:
-    /// one loop for each form, the form chosen once (`HGETALL`).
+    /// one loop for each form, the form chosen once (`HGETALL`, `HKEYS`,
+    /// `HVALS`); a table's walk reads no TTL
+    /// (`CollectionTable::for_each_field`).
     #[inline]
     pub fn for_each(&self, mut f: impl FnMut(&str, Value<'_>)) {
         match &self.repr {
@@ -536,12 +562,9 @@ impl HashFields {
                     f(field, Value::Bytes(value));
                 }
             }
-            Repr::Table(t) => {
-                for entry in t.fields.iter() {
-                    let (field, value) = pair(entry);
-                    f(field, value);
-                }
-            }
+            Repr::Table(t) => t
+                .fields
+                .for_each_field(|field, value| f(name(field), Value::Bytes(value))),
         }
     }
 
@@ -642,6 +665,15 @@ impl HashFields {
         (finished, retired)
     }
 
+    /// Forget that the table was handed to the background: for a value
+    /// about to get a new `Arc` ([`shared`]), which no registry entry can
+    /// point at.
+    fn unqueue(&mut self) {
+        if let Repr::Table(t) = &mut self.repr {
+            t.queued = false;
+        }
+    }
+
     /// Whether the hash is handed to the background (tests).
     #[cfg(test)]
     pub(crate) fn is_queued(&self) -> bool {
@@ -740,7 +772,15 @@ fn hand_ex(hash: &SharedEx) {
 /// resize it went through while it was built is still in progress. What
 /// every hash made whole goes through (a load, `RESTORE`, `COPY`, a new key
 /// of `HSET`).
+///
+/// A table moved here out of another key's value (a hash that gets its
+/// first field TTL: `mem::take` then `shared_ex`) may still say it was
+/// handed over: but that was the old value's handle, which nothing holds
+/// any more, and a new `Arc` is never in the background's registry. The
+/// mark is cleared first, so the table is handed over again under its new
+/// value if it has work there.
 pub fn shared(mut hash: HashFields) -> Shared {
+    hash.unqueue();
     let due = hash.hand_over();
     let shared = Arc::new(RwLock::new(hash));
     if due {
@@ -752,6 +792,7 @@ pub fn shared(mut hash: HashFields) -> Shared {
 /// [`shared`] of a hash with field TTLs (one made whole, or a hash that
 /// gets its first field TTL and moves its fields to a `HashInner`).
 pub fn shared_ex(mut hash: crate::types::HashInner) -> SharedEx {
+    hash.fields.unqueue();
     let due = hash.fields.hand_over();
     let shared = Arc::new(RwLock::new(hash));
     if due {
@@ -1256,6 +1297,81 @@ mod tests {
             .sum();
         // 999 degrees of freedom: mean 999, sd about 45.
         assert!(chi < 1_300.0, "chi-square {chi}");
+    }
+
+    /// A table that a load made for many but that holds few (fields past
+    /// their time dropped) is put at its size: a block if they fit one,
+    /// else a table with room for them.
+    #[test]
+    fn a_table_that_kept_few_fits_them() {
+        let _limits = Limits;
+        own_limits(Some([DEFAULT_PACKED_ENTRIES, DEFAULT_PACKED_VALUE]));
+        let mut small = HashFields::with_capacity(100_000);
+        let mut large = HashFields::with_capacity(100_000);
+        for i in 0..100_000 {
+            small.insert_bytes(&format!("f{i}"), b"v");
+            large.insert_bytes(&format!("f{i}"), b"v");
+        }
+        small.retain(|f, _| f.len() <= 3);
+        large.retain(|f, _| f.len() <= 5);
+        let (small, large) = (small.into_fitting(), large.into_fitting());
+        assert_eq!(small.encoding(), Encoding::Listpack);
+        assert_eq!(small.len(), 100);
+        assert!(large.is_table());
+        assert_eq!(large.len(), 10_000);
+        let fresh = {
+            let mut h = HashFields::with_capacity(10_000);
+            for (f, v) in large.iter() {
+                h.insert_bytes(f, &v);
+            }
+            h
+        };
+        assert!(large.allocation_size() <= fresh.allocation_size() * 11 / 10);
+        // A table already near its size is left as it is.
+        let mut kept = HashFields::with_capacity(1_000);
+        for i in 0..1_000 {
+            kept.insert_bytes(&format!("f{i}"), b"v");
+        }
+        let before = kept.allocation_size();
+        assert_eq!(kept.into_fitting().allocation_size(), before);
+    }
+
+    /// A plain hash handed to the background mid-resize that gets its
+    /// first field TTL (its fields taken out of the old value and wrapped
+    /// anew, as HEXPIRE, HSETEX and HGETEX do) is handed over again under
+    /// the new value: the old value's mark does not come with it.
+    #[test]
+    fn a_table_moved_to_a_new_value_is_handed_over_again() {
+        let _limits = Limits;
+        own_limits(Some([DEFAULT_PACKED_ENTRIES, DEFAULT_PACKED_VALUE]));
+        let plain = shared(HashFields::new());
+        {
+            let mut inner = plain.write();
+            let mut i = 0usize;
+            while i < 5_000 || !inner.table().is_some_and(|t| t.resizing()) {
+                inner.insert_bytes(&format!("field:{i:08}"), b"value");
+                i += 1;
+            }
+            after_write(&plain, &mut inner);
+            assert!(inner.is_queued());
+        }
+        // The upgrade, as the commands make it.
+        let fields = std::mem::take(&mut *plain.write());
+        let ex = shared_ex(crate::types::HashInner::from_fields(fields));
+        assert!(
+            crate::resize_background::is_handed(Arc::as_ptr(&ex).cast()),
+            "the new value was not handed over"
+        );
+        let mid = ex.read().fields.allocation_size();
+        for _ in 0..1_000_000 {
+            if !ex.read().fields.is_queued() {
+                break;
+            }
+            crate::resize_background::step_background(std::time::Duration::from_millis(1));
+        }
+        let inner = ex.read();
+        assert!(!inner.fields.table().unwrap().resizing());
+        assert!(inner.fields.allocation_size() < mid);
     }
 
     /// The background finishes a resize the writes left, a step at a time,

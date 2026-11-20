@@ -1290,8 +1290,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Instructions per command on a large hash (callgrind, the shipped
     build): `HGET`, `HEXISTS`, `HSTRLEN` 1 % more, `HMGET` 1.4 %, an `HDEL`
     and `HSET` pair 2-3 %; `HSET` of a field that is there 2.5 % fewer and
-    `HINCRBY` 6-8 % fewer; `HGETALL` 20 % more (each field is read out of
-    its entry). Hashes in a block: as before, but `HGETALL` 3-4 % more.
+    `HINCRBY` 6-8 % fewer; `HGETALL` 4 % fewer (a walk of the table that
+    reads only each entry's two lengths). Hashes in a block: as before.
 
 - **Lists take about half the memory, short elements a fifth (#297).** A
   list's elements are kept end to end in chunks of up to 64, each element

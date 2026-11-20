@@ -364,9 +364,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             match with_hash_read(ctx, key, |inner| {
                 let mut buf = Vec::with_capacity(16 + inner.len() * 24);
                 push_array_len(&mut buf, inner.len());
-                for k in inner.keys() {
+                inner.for_each(|k, _| {
                     push_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
-                }
+                });
                 Some(buf)
             }) {
                 None => {
@@ -397,9 +397,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             match with_hash_read(ctx, key, |inner| {
                 let mut buf = Vec::with_capacity(16 + inner.len() * 24);
                 push_array_len(&mut buf, inner.len());
-                for v in inner.values() {
-                    push_bulk(&mut buf, &v);
-                }
+                inner.for_each(|_, v| push_bulk(&mut buf, &v));
                 Some(buf)
             }) {
                 None => {

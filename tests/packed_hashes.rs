@@ -1351,3 +1351,83 @@ fn hscan_of_a_table_across_growth_and_shrink_misses_nothing() {
         assert_eq!(c.encoding("t"), "hashtable");
     }
 }
+
+/// A plain hash left mid-growth (its table handed to the background) that
+/// gets its first field TTL from HEXPIRE, HSETEX or HGETEX, sent right
+/// behind the write that started the growth, still has the growth finished
+/// and the old array freed by the background: its value is new, and is
+/// handed over again (the old value's mark used to come with the table, and
+/// then nothing ever finished it: both arrays stayed until a later write).
+#[test]
+fn a_hash_that_gets_its_first_field_ttl_mid_growth_is_still_finished() {
+    let dir = temp_dir("ttl-mid-growth");
+    let server = Server::start(dir.path(), &[]);
+    let mut c = server.conn();
+    // 2^15 groups hold 200,704 fields: the next one doubles the table.
+    let n = 200_704;
+    let resp = |out: &mut Vec<u8>, args: &[&[u8]]| {
+        out.extend(format!("*{}\r\n", args.len()).as_bytes());
+        for a in args {
+            out.extend(format!("${}\r\n", a.len()).as_bytes());
+            out.extend_from_slice(a);
+            out.extend_from_slice(b"\r\n");
+        }
+    };
+    for (cmd, key) in [("HEXPIRE", "a"), ("HSETEX", "b"), ("HGETEX", "c")] {
+        let all = pairs(n + 1, "f");
+        for chunk in all[..n - 999].chunks(1000) {
+            c.hset(key, chunk);
+        }
+        // The growth's write and the command, in one write.
+        let mut out = Vec::new();
+        let mut hset: Vec<&[u8]> = vec![b"HSET", key.as_bytes()];
+        for (f, v) in &all[n - 999..] {
+            hset.push(f);
+            hset.push(v);
+        }
+        resp(&mut out, &hset);
+        let first = all[0].0.as_slice();
+        let mut args: Vec<&[u8]> = match cmd {
+            "HEXPIRE" => vec![b"HEXPIRE", key.as_bytes(), b"100000", b"FIELDS", b"1"],
+            "HSETEX" => vec![
+                b"HSETEX",
+                key.as_bytes(),
+                b"PX",
+                FAR_MS.as_bytes(),
+                b"FIELDS",
+                b"1",
+            ],
+            _ => vec![
+                b"HGETEX",
+                key.as_bytes(),
+                b"PX",
+                FAR_MS.as_bytes(),
+                b"FIELDS",
+                b"1",
+            ],
+        };
+        args.push(first);
+        if cmd == "HSETEX" {
+            args.push(b"v");
+        }
+        resp(&mut out, &args);
+        c.stream.write_all(&out).unwrap();
+        assert_eq!(c.read().int(), 1000, "{cmd}");
+        let reply = c.read();
+        assert!(!matches!(reply, Resp::Error(_)), "{cmd}: {reply:?}");
+        assert_eq!(c.encoding(key), "hashtable");
+        let mid = c.cmd(&["MEMORY", "USAGE", key]).int();
+        // The old array of 2^15 groups is 2 MiB: it goes within seconds.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut now = mid;
+        while now > mid - (1 << 20) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+            now = c.cmd(&["MEMORY", "USAGE", key]).int();
+        }
+        assert!(
+            now <= mid - (1 << 20),
+            "{cmd}: MEMORY USAGE {mid} after the growth began, still {now} 20 s later"
+        );
+        assert_eq!(c.cmd(&["HLEN", key]).int(), (n + 1) as i64);
+    }
+}

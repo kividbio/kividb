@@ -18,9 +18,10 @@ Memory per field at the suite's sizes is in regression suite 19
 `results/d8s_v5`. Master is `7c03b24e`, built in the same session on the
 same VM; the branch is the PR's; Redis 8.10.2. Each KiviDB server runs its
 default worker count (4 on 8 CPUs). Nothing else ran on the machine.
-The branch binary is the PR's tree before its last change, a loop of its
-own for each form in `HGETALL` (`HashFields::for_each`), which only changes
-how `HGETALL` walks a hash (measured in instructions in the PR).
+The branch binary is the PR's tree before its later changes to how
+`HGETALL`, `HKEYS` and `HVALS` walk a hash (`HashFields::for_each`,
+`CollectionTable::for_each_field`) and to a hash moved into a new value
+(measured in instructions and tests in the PR).
 
 **#764's load** (one hash, fields `f0`..`f<n-1>`, each `v`; `used_memory` it
 added once settled):

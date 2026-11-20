@@ -2780,8 +2780,10 @@ fn read_image_body(
                             hmap.remove(&field);
                         }
                     }
+                    // Made with room for every field the file names: put
+                    // at the size of those that stayed.
                     let inner = crate::types::HashInner {
-                        fields: hmap,
+                        fields: hmap.into_fitting(),
                         expiries: exps,
                     };
                     KiviDBValue::HashEx(crate::hash_fields::shared_ex(inner))
