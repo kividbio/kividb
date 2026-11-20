@@ -48,7 +48,6 @@
 // counted tree (#875) and the checks; the binary does not call all of it.
 #![allow(dead_code)]
 
-use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::btree_map;
@@ -58,7 +57,8 @@ use std::ptr::NonNull;
 use ordered_float::OrderedFloat;
 
 use crate::collection_table::{
-    CollectionTable, EntryPool, Memory, Retired, Scores, TooLong, scored_member, scored_score,
+    CollectionTable, EntryPool, Memory, Retired, Scores, TooLong, detached_scored_entry,
+    scored_member, scored_score,
 };
 
 /// A member's entry in the table, as the index holds it: the address of its
@@ -268,59 +268,6 @@ impl PartialEq for Key {
 
 impl Eq for Key {}
 
-/// What a range of the tree is bounded by: a key, or a probe. Ordered as
-/// [`Key`]s are (its address shortcut aside, which only says equal what the
-/// bytes would).
-trait Sortable {
-    fn sort_key(&self) -> (f64, &[u8]);
-}
-
-impl Sortable for Key {
-    #[inline]
-    fn sort_key(&self) -> (f64, &[u8]) {
-        (self.score, self.entry.member())
-    }
-}
-
-impl Sortable for Probe<'_> {
-    #[inline]
-    fn sort_key(&self) -> (f64, &[u8]) {
-        (self.score, self.member)
-    }
-}
-
-impl Ord for dyn Sortable + '_ {
-    #[inline]
-    fn cmp(&self, other: &Self) -> Ordering {
-        let (a, a_member) = self.sort_key();
-        let (b, b_member) = other.sort_key();
-        order(a, a_member, b, b_member)
-    }
-}
-
-impl PartialOrd for dyn Sortable + '_ {
-    #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for dyn Sortable + '_ {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for dyn Sortable + '_ {}
-
-impl<'a> Borrow<dyn Sortable + 'a> for Key {
-    #[inline]
-    fn borrow(&self) -> &(dyn Sortable + 'a) {
-        self
-    }
-}
-
 /// [`ScoreOrder`] as a `BTreeMap` of `(score, entry)`: what the large form
 /// has had (a tree of `(score, member)`), with an 8-byte reference in place
 /// of the member's 16-byte `Arc`. Rank is a walk to the member (as before);
@@ -342,10 +289,85 @@ impl BTreeOrder {
     }
 }
 
-/// [`BTreeOrder`]'s iterator: a range of the tree, with the members outside
-/// a range of ranks stepped past on the first step from each end.
+/// An entry of the empty member outside any table: what the bounds of a
+/// range of scores, `(score, "")`, point to. Only its member is ever read
+/// (a key keeps its own score): its length byte, 0, at offset 8.
+static EMPTY_MEMBER: [u64; 2] = [0, 0];
+
+/// A key that stands for a bound: the probe's score, and an entry of its
+/// own holding the probe's member as the table lays one out
+/// (`collection_table::detached_scored_entry`, kept in `held`; the empty
+/// member is [`EMPTY_MEMBER`]), so that the tree compares a bound with its
+/// keys as it compares two of them, with no call through a trait object.
+/// Its address is no table entry's, so it is never taken for one of them.
+#[inline]
+fn probe_key(probe: &Probe<'_>, held: &mut Option<Box<[u64]>>) -> Key {
+    let entry = if probe.member.is_empty() {
+        NonNull::from(&EMPTY_MEMBER).cast::<u8>()
+    } else {
+        let buf = held.insert(detached_scored_entry(probe.member));
+        // SAFETY: a boxed slice's pointer is never null.
+        unsafe { NonNull::new_unchecked(buf.as_mut_ptr().cast::<u8>()) }
+    };
+    Key {
+        score: probe.score,
+        entry: EntryRef(entry),
+    }
+}
+
+/// [`BTreeIter`]'s walk: the whole tree, lazily from either end, as
+/// `keys()` walks it (a range of ranks), or a range of keys.
+enum Walk<'a> {
+    All(btree_map::Keys<'a, Key, ()>),
+    Range(btree_map::Range<'a, Key, ()>),
+}
+
+impl<'a> Walk<'a> {
+    #[inline]
+    fn next(&mut self) -> Option<&'a Key> {
+        match self {
+            Walk::All(keys) => keys.next(),
+            Walk::Range(range) => range.next().map(|(key, ())| key),
+        }
+    }
+
+    #[inline]
+    fn next_back(&mut self) -> Option<&'a Key> {
+        match self {
+            Walk::All(keys) => keys.next_back(),
+            Walk::Range(range) => range.next_back().map(|(key, ())| key),
+        }
+    }
+
+    #[inline]
+    fn nth(&mut self, n: usize) -> Option<&'a Key> {
+        match self {
+            Walk::All(keys) => keys.nth(n),
+            Walk::Range(range) => range.nth(n).map(|(key, ())| key),
+        }
+    }
+
+    #[inline]
+    fn nth_back(&mut self, n: usize) -> Option<&'a Key> {
+        match self {
+            Walk::All(keys) => keys.nth_back(n),
+            Walk::Range(range) => range.nth_back(n).map(|(key, ())| key),
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Walk::All(keys) => keys.size_hint(),
+            Walk::Range(range) => range.size_hint(),
+        }
+    }
+}
+
+/// [`BTreeOrder`]'s iterator: the tree or a range of it, with the members
+/// outside a range of ranks stepped past on the first step from each end.
 pub struct BTreeIter<'a> {
-    keys: btree_map::Range<'a, Key, ()>,
+    keys: Walk<'a>,
     skip_front: usize,
     skip_back: usize,
     /// Members left, when known (a range of ranks).
@@ -366,7 +388,7 @@ impl<'a> Iterator for BTreeIter<'a> {
         if self.skip_front > 0 {
             self.keys.nth(std::mem::take(&mut self.skip_front) - 1);
         }
-        let (key, _) = self.keys.next()?;
+        let key = self.keys.next()?;
         Some((key.score, &key.entry))
     }
 
@@ -391,29 +413,22 @@ impl DoubleEndedIterator for BTreeIter<'_> {
         if self.skip_back > 0 {
             self.keys.nth_back(std::mem::take(&mut self.skip_back) - 1);
         }
-        let (key, _) = self.keys.next_back()?;
+        let key = self.keys.next_back()?;
         Some((key.score, &key.entry))
-    }
-}
-
-/// `b` as a bound of the tree's keys.
-#[inline]
-fn sortable<'b, 'p>(b: &'b Bound<Probe<'p>>) -> Bound<&'b (dyn Sortable + 'p)> {
-    match b {
-        Bound::Included(p) => Bound::Included(p as &(dyn Sortable + 'p)),
-        Bound::Excluded(p) => Bound::Excluded(p as &(dyn Sortable + 'p)),
-        Bound::Unbounded => Bound::Unbounded,
     }
 }
 
 impl BTreeOrder {
     #[inline]
-    fn range_between<'p>(&self, from: Bound<Probe<'p>>, to: Bound<Probe<'p>>) -> BTreeIter<'_> {
-        let keys = self
-            .map
-            .range::<dyn Sortable + 'p, _>((sortable(&from), sortable(&to)));
+    fn range_between(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> BTreeIter<'_> {
+        let (mut held_from, mut held_to) = (None, None);
+        let lo = from.as_ref().map(|p| probe_key(p, &mut held_from));
+        let hi = to.as_ref().map(|p| probe_key(p, &mut held_to));
+        // The range keeps no bound: the probes' entries can go when this
+        // returns.
+        let keys = self.map.range::<Key, _>((lo.as_ref(), hi.as_ref()));
         BTreeIter {
-            keys,
+            keys: Walk::Range(keys),
             skip_front: 0,
             skip_back: 0,
             left: None,
@@ -424,9 +439,10 @@ impl BTreeOrder {
 // SAFETY: the map holds each reference from `insert`/`from_sorted` to the
 // `remove`/`pop_*` that hands it back (`remove_entry`, `pop_first`,
 // `pop_last` move the key out), and drops the rest with itself; the
-// references `key` makes for a lookup are dropped when it returns. Members'
-// bytes are read only through keys in the map or the call's own. Scores are
-// the keys' own.
+// references `key` makes for a lookup, and the probe keys of a range (which
+// point to entries of their own, never a table's), are dropped when the call
+// returns. Members' bytes are read only through keys in the map or the
+// call's own. Scores are the keys' own.
 unsafe impl ScoreOrder for BTreeOrder {
     type Iter<'a> = BTreeIter<'a>;
 
@@ -497,7 +513,7 @@ unsafe impl ScoreOrder for BTreeOrder {
         let end = end.min(len);
         let start = start.min(end);
         BTreeIter {
-            keys: self.map.range::<Key, _>(..),
+            keys: Walk::All(self.map.keys()),
             skip_front: start,
             skip_back: len - end,
             left: Some(end - start),

@@ -7,8 +7,11 @@ branch, or Redis).
 
 Tests (each prints one JSON object, and appends it to --out):
 
-  mem       one sorted set of N members (1,000, 10,000, 3,000,000) of L bytes
-            (8, 16, 32), loaded by ZADDs of 1,000 pairs, pipelined: in order
+  mem       sorted sets of N members (1,000, 10,000, 3,000,000) of L bytes
+            (8, 16, 32): one set of 3,000,000, and 1,000,000 members in sets
+            of 1,000 or 10,000 (one such set alone is tens of KB, which the
+            connection's buffers move as much); loaded by ZADDs of 1,000
+            pairs, pipelined: in order
             (member i at score i), at random (members in a random order, each
             at a random score), and the random one again after a reload
             (a load gives the members in order; KiviDB has no DEBUG RELOAD,
@@ -145,38 +148,44 @@ def t_mem(c, a):
     zadd_pairs(c, "warm", [(i, member(i, 16)) for i in range(20_000)])
     c.flushall()
     for n in (1_000, 10_000, 3_000_000):
+        # Sets of 1,000 and 10,000 members are a few tens of KB, which the
+        # connection's own buffers move about as much: 1,000,000 members in
+        # sets of that size, the same members in each, as suite 31 loads.
+        keys = max(1, 1_000_000 // n)
         for length in (8, 16, 32):
             row = {}
             for order in ("in_order", "random"):
                 c.flushall()
                 time.sleep(1)
                 u0 = settled(c)
-                if order == "in_order":
-                    pairs = [(i, member(i, length)) for i in range(n)]
-                else:
-                    ids = list(range(n))
-                    rng.shuffle(ids)
-                    pairs = [(rng.random() * 1e6, member(i, length)) for i in ids]
-                zadd_pairs(c, "z", pairs)
-                del pairs
+                for k in range(keys):
+                    if order == "in_order":
+                        pairs = [(i, member(i, length)) for i in range(n)]
+                    else:
+                        ids = list(range(n))
+                        rng.shuffle(ids)
+                        pairs = [(rng.random() * 1e6, member(i, length)) for i in ids]
+                    zadd_pairs(c, "z:%d" % k, pairs)
+                    del pairs
                 u1 = settled(c)
-                assert c.zcard("z") == n
-                row[order] = dict(per_member(u0, u1, n), memory_usage=c.memory_usage("z"))
+                assert c.zcard("z:0") == n
+                row[order] = dict(per_member(u0, u1, n * keys), memory_usage=c.memory_usage("z:0"))
                 if order == "random":
                     # Built again from its serialized form, in order, as a
                     # load builds it: KiviDB has no DEBUG RELOAD, and
                     # RESTORE goes through the same loader as a snapshot
                     # (and Redis's through rdbLoadObject, as its load).
-                    dump = c.dump("z")
-                    c.delete("z")
-                    settled(c)
-                    c.restore("z", 0, dump)
-                    del dump
+                    for k in range(keys):
+                        key = "z:%d" % k
+                        dump = c.dump(key)
+                        c.delete(key)
+                        c.restore(key, 0, dump)
+                        del dump
                     u2 = settled(c)
-                    assert c.zcard("z") == n
-                    row["reloaded"] = dict(per_member(u0, u2, n),
-                                           memory_usage=c.memory_usage("z"))
-            res["n%d_len%d" % (n, length)] = row
+                    assert c.zcard("z:0") == n
+                    row["reloaded"] = dict(per_member(u0, u2, n * keys),
+                                           memory_usage=c.memory_usage("z:0"))
+            res["n%d_len%d" % (n, length)] = dict(row, keys=keys)
     c.flushall()
     return res
 

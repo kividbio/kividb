@@ -2958,6 +2958,18 @@ pub unsafe fn scored_score(entry: *const u8) -> f64 {
     f64::from_bits(unsafe { entry.cast::<u64>().read() })
 }
 
+/// A sorted-set entry of `member` outside any table, in an 8-aligned
+/// buffer of its own, as [`scored_member`] reads one: for an index of a
+/// set's order to compare a bound with its keys as it compares two of them.
+/// Its score is left 0 (an index keeps its own).
+pub fn detached_scored_entry(member: &[u8]) -> Box<[u64]> {
+    let mut buf = vec![0u64; scored_size(member.len()).div_ceil(8)].into_boxed_slice();
+    // SAFETY: the buffer holds `scored_size(member.len())` bytes and does
+    // not overlap `member`; a command's member is far under `MAX_LEN`.
+    unsafe { write_member_entry(buf.as_mut_ptr().cast::<u8>().add(SCORE_BYTES), member) };
+    buf
+}
+
 impl Kind for Scores {
     #[inline]
     unsafe fn hash_of(slot: *mut u8, hasher: &ahash::RandomState) -> u64 {
