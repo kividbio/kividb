@@ -82,6 +82,11 @@ struct ShortName {
     len: u8,
     container: bool,
     arity: i16,
+    /// How its keys are found (`keyspec`), for the look for hash tags on
+    /// the command path, which would otherwise look the name up again
+    /// (`fits_with_shape`, #889). Read only in a build with Lua.
+    #[cfg_attr(not(feature = "lua"), allow(dead_code))]
+    shape: crate::keyspec::Shape,
 }
 
 impl ShortNames {
@@ -144,6 +149,7 @@ impl ShortNames {
             len: name.len() as u8,
             container,
             arity,
+            shape: crate::keyspec::shape_of(name),
         };
     }
 
@@ -162,6 +168,24 @@ impl ShortNames {
             // at its end, and its number is then that of the name without.
             if slot.key == key && slot.len as usize == name.len() {
                 return Some((slot.arity, slot.container));
+            }
+            at = (at + 1) & (Self::SLOTS - 1);
+        }
+    }
+
+    /// [`get`](Self::get), and how its keys are found.
+    #[cfg(feature = "lua")]
+    #[inline(always)]
+    fn get_with_shape(&self, name: &[u8]) -> Option<(i16, bool, crate::keyspec::Shape)> {
+        let key = Self::key(name);
+        let mut at = Self::slot(key);
+        loop {
+            let slot = &self.slots[at];
+            if slot.len == 0 {
+                return None;
+            }
+            if slot.key == key && slot.len as usize == name.len() {
+                return Some((slot.arity, slot.container, slot.shape));
             }
             at = (at + 1) & (Self::SLOTS - 1);
         }
@@ -290,6 +314,40 @@ pub fn check(name: &str, cmd: &[&[u8]]) -> Option<Vec<u8>> {
 #[inline(always)]
 pub fn check_dispatch(name: &str, cmd: &[&[u8]]) -> Option<Vec<u8>> {
     check_as::<true>(name, cmd)
+}
+
+/// For the dispatch with Lua: `Some` when [`check_dispatch`] would say
+/// nothing, found by the one lookup of a name of up to eight bytes, with
+/// how the command's keys are found (`keyspec::Shape`) if the table has the
+/// name. That is what the look for hash tags needs next
+/// (`tag_locks::named_keys_of`), which would otherwise look the name up
+/// again in `keyspec`'s table (#889); a longer name is looked up as
+/// [`check_dispatch`] looks it up, and has no shape here. `None`: ask
+/// [`check_dispatch`] for the reply (the wrong number of arguments,
+/// subcommands, a command that allocates as much as its arguments say).
+/// Small, so that it comes back in a register: the reply is built only on
+/// the way that needs it.
+#[cfg(feature = "lua")]
+#[inline(always)]
+pub fn fits_with_shape(name: &str, cmd: &[&[u8]]) -> Option<Option<crate::keyspec::Shape>> {
+    let arities = &*ARITIES;
+    if !(1..=ShortNames::LONGEST).contains(&name.len()) {
+        return match check_long::<true>(arities, name, cmd) {
+            None => Some(None),
+            Some(_) => None,
+        };
+    }
+    match arities.short.get_with_shape(name.as_bytes()) {
+        // As `check_as`: a name not in the table is not refused here.
+        None => Some(None),
+        Some((arity, container, shape)) => {
+            if fits(arity, cmd.len()) && !container {
+                Some(Some(shape))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Whether `name` allocates as much as its arguments say (`sketch::room`).

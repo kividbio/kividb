@@ -555,7 +555,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are after it, as in Redis. A script that finds a walk under way waits
   for it asleep, off its thread; one that finds walk after walk stops
   waiting after three and holds the walks after it back, so a loop of
-  `SCAN`s cannot keep scripts out. The other commands that read keys they
+  `SCAN`s cannot keep scripts out. A walk that finds a script running
+  beside others waits for it on its thread; on the Tokio loop it hands that
+  worker's other tasks to another thread first, including the one queued
+  to run next, which no other worker takes, so new connections and the
+  thread's other clients are not held with it. The other commands that read keys they
   do not name take the same locks, shared, as `KEYS` and `SCAN`: `INFO`
   (with no section, or `keyspace`, `default`, `all` or `everything`),
   `MEMORY STATS` and `MEMORY DOCTOR`, `FT.SEARCH`, `FT.AGGREGATE`,
@@ -954,6 +958,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   command takes is the same as before. `scripts/perf/measure.sh` has
   these workloads as `WORKLOADS=tags`.
 
+  The look then took less again. It asks the arity table, which every
+  command is looked up in anyway, how the command's keys are found, where
+  it asked a second table; it checks a key for a `{` with two or four
+  words looked at together; and a command of one tagged key takes its lock
+  without walking a list of positions. Instructions per command, the same
+  measure, on both I/O loops: `GET` 15 fewer, `SET` 57 fewer, a 10-key
+  `MGET` about 140 fewer, a `GET` or `SET` of a key with a tag about 90 and
+  98 fewer (5 % and 4 %); a tagged `EVALSHA` 0 to 27 fewer, `MULTI` with
+  two `SET`s and `EXEC` 8 more. The build without Lua is unchanged.
+
 - **Small hashes take less than half the memory.** A hash of up to 512
   fields, no field or value longer than 64 bytes, is kept in one block, each
   field next to its value, where it was a table with two allocations for
@@ -1013,7 +1027,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   connections (Redis 8.10.2: 64k), p99 11.4 to 5.0 ms; LiteLLM's whole
   per-request mix of scripts, spend counters and cache from 89k to 226k
   commands a second, p99 19.8 to 3.8 ms (Redis: 104k, 9.5 ms). Scripts of
-  one tag and commands that are not scripts are unchanged.
+  one tag and commands that are not scripts are unchanged. Suite
+  `36-litellm-ratelimit` of the 1.3.0 regression suite measures this
+  again, and fails if the candidate runs fewer than 90 % of LiteLLM's
+  scripts beside others. On a Standard_D8s_v5, server on 4 CPUs, 200
+  connections: `BATCH_RATE_LIMITER` for a key and its team 167k calls a
+  second (Redis 8.10.2: 67k; 1.2.2: 61k), the per-request mix 232k (Redis:
+  93k; 1.2.2: 75k).
 
 - **Small sets take a half to a twelfth of the memory (#297).** A set of
   up to 128 members of up to 64 bytes is kept in one block, the members end
@@ -1339,8 +1359,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on meanwhile (should one of those be busy once it is its turn, it waits
   for that tag too, holding nothing); a client that goes or
   is killed while it waits leaves nothing behind; a blocking command woken
-  by the script keeps what it was woken for. The replica's applier, the
-  AOF's replay and `EXEC` wait in place, as before. Measured with a ~2 ms
+  by the script keeps what it was woken for. The replica's applier and the
+  AOF's replay wait in place, as before. An `EXEC`, which takes the
+  command gate alone and so waits for every script running beside others,
+  waits for them the same way: its connection waits asleep until none
+  runs, the replies before it sent and what was pipelined behind it
+  waiting behind it, and scripts that come meanwhile wait for it, so a
+  stream of them cannot keep it out. It then takes the gate alone and runs
+  whole; a `WATCH` is checked inside the gate, a `CLIENT PAUSE` or a slot
+  handoff that came while it waited holds or refuses it whole, and a client
+  that goes while it waits has nothing run. With a tagged script held for
+  800 ms on a `--threads 4` server and one `MULTI`/`SET`/`EXEC` waiting for
+  it, none of 16 connections served by the other threads waited for the
+  script, on either I/O loop. Measured with a ~2 ms
   tagged script run back to back on one tag, 8 connections reading and
   writing that tag and 16 reading and writing untagged keys (Azure
   D8s_v5, server on 4 vCPUs, memtier on the other 4):

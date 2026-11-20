@@ -204,8 +204,22 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   tag too, holding nothing.) The replica's applier and the AOF's replay wait
   in place, as before; the only script they can meet running beside others
   is a read-only one of a replica's client, which the applier waits for.
-  `EXEC` takes the command gate alone, and waits in place for every
-  running script, as before.
+
+- **An `EXEC` waits for the scripts running beside others without holding
+  up its thread.** It takes the command gate alone, so it runs after every
+  script running beside others, whatever their tags. When it finds one
+  running, its connection waits asleep until none is, as above: the
+  replies before it are sent, what the client pipelined behind it waits
+  behind it, and the thread serves its other connections. Scripts that
+  come while it waits wait for it, so a stream of them cannot keep it out
+  (a script that sees more than three `EXEC`s start to wait goes ahead,
+  and the `EXEC`s wait for it too). The transaction then runs whole, alone,
+  as before: its `WATCH`es are checked inside the gate, a `CLIENT PAUSE`
+  or slot handoff that came meanwhile holds or refuses it whole, and if
+  its client goes while it waits, nothing of it runs. While an `EXEC`
+  waits for a running script, tagged scripts on other tags that arrive are
+  held too (released once more than three `EXEC`s have started waiting),
+  so a very long script delays them for its duration.
 
 - **Every other script is as before.** A script with no keys, or with a key
   that has no tag, runs alone and may touch what it likes. So do functions
@@ -285,6 +299,15 @@ master could have run them one after another.
   declare a key without a tag so that the script runs alone. Up to 1.2.2 a
   script whose `KEYS` carried two different tags was not held to them; it
   is now.
+- A key name a script builds while it runs is checked when the script uses
+  it, not read from the script's text. One that keeps a tag of the
+  script's `KEYS` is allowed (LiteLLM's limiter builds `<prefix>:requests`
+  from its window key `{api_key:k1}:window`, and runs beside others). One
+  that carries none of them is refused at that call, every time, by
+  design: it is the cluster's rule for a key of another slot, and there is
+  no setting that lets such a script run beside others. Declare that key
+  in `KEYS`, give it one of the tags, or let the script run alone (a key
+  without a tag in `KEYS`, or `lua-parallel-scripts no`).
 - `SCRIPT KILL` stops every running script that has not yet written, not
   one of them: with several running there is no saying which was meant.
 - Each thread that runs scripts this way keeps a Lua VM of its own. Scripts
