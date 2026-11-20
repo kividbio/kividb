@@ -447,15 +447,13 @@ fn zrange_pairs<'a>(inner: &'a SortedSetInner, p: &RangeParams) -> Vec<(Member<'
             return vec![];
         };
         // Those `LIMIT` skips are stepped over, not read.
+        // Pushed one by one, as a rank walk's: `collect` left the walk out
+        // of line (#920).
         let within = inner.range_by_score(range);
         if p.rev {
-            within
-                .rev()
-                .skip(p.limit_offset)
-                .take(p.limit_count)
-                .collect()
+            push_members(within.rev().skip(p.limit_offset).take(p.limit_count))
         } else {
-            within.skip(p.limit_offset).take(p.limit_count).collect()
+            push_members(within.skip(p.limit_offset).take(p.limit_count))
         }
     } else if p.by_lex {
         // REV swaps the bounds

@@ -1060,7 +1060,7 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
         let stored = (count > 0).then(|| {
             SortedSetInner::from_pairs(found.iter().map(|point| {
                 (
-                    &point.member[..],
+                    point.member,
                     if store_dist {
                         point.distance_m / unit_m
                     } else {
@@ -1094,9 +1094,9 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
             .iter()
             .map(|point| {
                 if plain {
-                    return resp_bulk(&point.member);
+                    return resp_bulk(point.member);
                 }
-                let mut item = vec![resp_bulk(&point.member)];
+                let mut item = vec![resp_bulk(point.member)];
                 if with_dist {
                     item.push(resp_bulk_str(&format!("{:.4}", point.distance_m / unit_m)));
                 }

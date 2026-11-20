@@ -142,7 +142,7 @@ Redis, in the file or with `CONFIG SET`, and reported by `CONFIG GET` and `OBJEC
 (64) for sets; `hash-max-listpack-entries` (512) and `hash-max-listpack-value` (64) for hashes;
 `zset-max-listpack-entries` (128) and `zset-max-listpack-value` (64) for sorted sets (a sorted
 set of up to that many members, none longer than that many bytes, is one block; past either it
-is a hash table and an ordered tree). The `*-max-ziplist-*` names of the hash and sorted-set
+is a table of members and an ordered index of them). The `*-max-ziplist-*` names of the hash and sorted-set
 settings are the same settings. A limit goes no higher than what one block holds (128 members
 of 64 bytes for sets and sorted sets, 512 fields for hashes): a larger value is taken as that
 maximum, `CONFIG GET` reports what was kept, and a warning naming the maximum is logged. `0`

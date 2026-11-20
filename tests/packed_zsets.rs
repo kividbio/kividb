@@ -1437,8 +1437,16 @@ fn geosearchstore_into_its_source_never_waits_on_its_writers() {
                 let mut c = Conn::connect(port);
                 while Instant::now() < until {
                     let reply = c.cmd(&[
-                        "GEOSEARCHSTORE", "g", "g", "FROMLONLAT", "13.01", "52.007", "BYRADIUS",
-                        "50", "km", "ASC",
+                        "GEOSEARCHSTORE",
+                        "g",
+                        "g",
+                        "FROMLONLAT",
+                        "13.01",
+                        "52.007",
+                        "BYRADIUS",
+                        "50",
+                        "km",
+                        "ASC",
                     ]);
                     assert!(matches!(reply, Resp::Int(_)), "{reply:?}");
                 }

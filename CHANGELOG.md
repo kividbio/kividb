@@ -1323,6 +1323,67 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `HINCRBY` 6-8 % fewer; `HGETALL` 4 % fewer (a walk of the table that
     reads only each entry's two lengths). Hashes in a block: as before.
 
+- **Large sorted sets take about a third less memory, no write moves every
+  member at once to grow, and `ZSCAN` reads only its page (#875, #825,
+  #770).** A sorted set past the block's limits (`OBJECT ENCODING`
+  `skiplist`) keeps its members in the same table as a large set or hash:
+  each member and its score in one block of the collections' slab pool
+  (`[score][length][member]`, 32 bytes for a 16-byte member), found by name
+  in one probe, its score rewritten in place when it changes. The order of
+  the members is an index that holds each one as the address of its block
+  (a block never moves: a resize moves only the table's 8-byte slots, and
+  active defrag does not move the pool's blocks), so a member's bytes are
+  kept once, where a hash table and a tree each held a 16-byte `Arc` of
+  them. The index is the B-tree the large form had, of 16-byte keys now (24
+  before), and a set built whole (a load, `RESTORE`, a full sync, a `*STORE`
+  result) has it built in one go, its nodes full. Measured on an Azure
+  D8s_v5, `used_memory` a member, before / now / Redis 8.10.2: one set of
+  3,000,000 members of 16 bytes 115.9 / 80.0 / 85.2 added in order, 105.8 /
+  72.8 / 85.2 at random, 115.9 / 63.8 / 79.1 once loaded (8-byte members
+  107.9 / 72.0 / 75.2 in order, 32-byte 131.9 / 96.0 / 107.3); 1,000,000
+  members in sets of 1,000, 16 bytes, 132.5 / 84.4 / 77.9 in order and
+  122.7 / 77.4 / 77.9 at random; Mastodon's home feeds (#825: 20,000 sets of
+  800 status ids) 121.1 / 87.9 / 79.5. Of what is left over Redis, the
+  index is the part still to shrink: 34 bytes a member when members come in
+  order one `ZADD` at a time (the B-tree's nodes half full), 27 at random,
+  18 when built whole, beside 45.7 for the table and its entries (16-byte
+  members, 3,000,000); a counted tree (#875) takes its place.
+  - The table grows and shrinks a few members a write, as a large set's; a
+    resize that the writes leave part-way is finished in the background, a
+    step at a time under the set's own lock, and the old array is freed off
+    the command path. Filling one set to 3,000,000 members one `ZADD` at a
+    time, the slowest `ZADD` took 3.1 ms (126.4 ms before, at a doubling;
+    Redis 8.10.2: 2.3 ms), the 99th percentile 0.055 ms as before.
+  - A set taken from 3,000,000 members down to 1,000 by `ZREM` keeps 0.12
+    MiB of `used_memory` (100 MiB before, its member table at its largest;
+    Redis 36 MiB), and by one `ZREMRANGEBYRANK` 0.09 MiB (0.17 before;
+    Redis 32 MiB). The pool's slabs that still hold one of the members left
+    stay with the process (RSS 58-60 MiB here; 105 and 4 MiB before), as for
+    large sets and hashes: active defrag does not move the pool's blocks.
+  - `ZSCAN` of such a set reads the table's own groups for its page, with
+    `COUNT` a hint as in Redis (a page can be shorter, or empty, before the
+    cursor comes back 0), where it read the whole set on every call: a full
+    scan of 1,000,000 members takes 1.79 / 0.44 / 0.28 s of server CPU at
+    `COUNT` 10 / 100 / 1,000 (20.2 / 20.1 / 19.7 s before; Redis 8.10.2:
+    2.24 / 0.95 / 0.68 s). The page builder is @magic-peach's (#955). A scan
+    begun before an upgrade still ends, but may miss or repeat members.
+  - `MEMORY USAGE` of a sorted set is immediate whatever `SAMPLES` says (the
+    table exact, the index estimated from its length), and eviction's
+    estimate of what a sorted set frees is exact. Snapshots, the AOF,
+    replication, `DUMP`/`RESTORE` and `MIGRATE` are unchanged in both
+    directions with 1.2.2, and `DEBUG DIGEST-VALUE` of a set gives the
+    digest it gave before this change.
+  - Instructions per command (callgrind, the shipped build): `ZADD` of a
+    member there and `ZINCRBY` 2-5 % fewer, `ZSCORE` 1.7 % more (one probe
+    of the table), `ZREM` and `ZADD` of a new member, `ZPOPMIN` and
+    `ZRANDMEMBER` within 1 % (with a count of 10 up to 5.6 % fewer), `ZRANK`
+    level, `ZRANGE 0 9` 0.6 % more, a range from a random rank 1.7-2.6 %
+    more, `ZREMRANGEBYRANK` 1.5-3.3 % fewer, `GEOSEARCH` 2-2.4 % more (20 %
+    fewer on a block); `ZRANGEBYSCORE` 2.7-5 % more from 1,000 members on
+    (its two bounds are found in the tree as keys of their own, and a bound
+    at a member's own score reads the member's bytes through its entry).
+    Sorted sets in a block, and `GET`/`SET`, as before.
+
 - **Lists take about half the memory, short elements a fifth (#297).** A
   list's elements are kept end to end in chunks of up to 64, each element
   between two copies of its length (one byte each for an element shorter
@@ -1402,14 +1463,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fractional scores 37.6 and 27.3 (Redis 28.0 and 26.2). Ten 8-byte
   members a key, as #297 measured it, take 274 bytes of RSS a key (1,249
   before; Redis 186). Sorted sets of more than 128 members (or with a
-  member longer than 64 bytes) are unchanged: still a table and a tree,
-  at the same size as before; #825's 800-member feeds among them.
+  member longer than 64 bytes) are the large form (see the entry on large
+  sorted sets); #825's 800-member feeds among them.
   - A score that is an integer of up to 56 bits is kept in one to eight
     bytes (one up to 247), any other as the eight bytes of the float: read
     back, every score is the same float, bit for bit. A member is found by
     scanning one byte a member (a fingerprint), as in small sets and
     hashes; a rank is a position, and a range of scores a binary search.
-  - A sorted set moves to the table and the tree when a write adds a member
+  - A sorted set moves to the large form when a write adds a member
     past 128 or one longer than 64 bytes, or when one `ZADD` (or `GEOADD`)
     gives more than 128 pairs, as Redis moves a listpack to a skiplist;
     never back. A set built whole (a snapshot or AOF load, `RESTORE`,
