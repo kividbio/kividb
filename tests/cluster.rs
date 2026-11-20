@@ -9106,7 +9106,10 @@ fn a_replica_that_has_not_heard_its_master_take_slots_counts_the_masters_that_ow
     let replica = add_replica_with_env(
         &nodes,
         &nodes[1],
-        &[IGNORE_CLAIMS, ("KIVIDB_TEST_NO_SLOT_IMPORTS_CAPABILITY", "1")],
+        &[
+            IGNORE_CLAIMS,
+            ("KIVIDB_TEST_NO_SLOT_IMPORTS_CAPABILITY", "1"),
+        ],
     );
     {
         let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
@@ -9124,7 +9127,13 @@ fn a_replica_that_has_not_heard_its_master_take_slots_counts_the_masters_that_ow
     let before = Written::on(&nodes[3], a..=b, "before", 100);
     let task_id = nodes[1]
         .conn()
-        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &a.to_string(), &b.to_string()])
+        .cmd(&[
+            "CLUSTER",
+            "MIGRATION",
+            "IMPORT",
+            &a.to_string(),
+            &b.to_string(),
+        ])
         .text();
     assert_eq!(task_id.len(), 40, "{task_id}");
     wait_import_completed(&nodes[1], &task_id);

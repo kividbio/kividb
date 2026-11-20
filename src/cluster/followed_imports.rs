@@ -1069,10 +1069,7 @@ mod tests {
     fn a_taken_marker_reads_back() {
         let bytes = encode_taken(12, &[(0, 100), (5000, 5000)]);
         let (_, args) = crate::resp::parse::parse_resp_command(&bytes).unwrap();
-        assert_eq!(
-            parse_taken(&args),
-            Some((12, vec![(0, 100), (5000, 5000)]))
-        );
+        assert_eq!(parse_taken(&args), Some((12, vec![(0, 100), (5000, 5000)])));
         assert!(parse_marker(&args).is_none());
         let words = |w: &[&str]| -> Option<(u64, Ranges)> {
             let w: Vec<&[u8]> = w.iter().map(|s| s.as_bytes()).collect();
