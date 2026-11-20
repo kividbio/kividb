@@ -389,6 +389,15 @@ thread_local! {
     static PENDING_BEFORE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// What [`before_the_reply`] collected while the command this thread has
+/// just run ran, taken: for a command whose reply comes later.
+pub fn take_what_came_before() -> Vec<u8> {
+    if TRACKING_CLIENT_COUNT.load(Ordering::Relaxed) == 0 {
+        return Vec::new();
+    }
+    PENDING_BEFORE.with_borrow_mut(std::mem::take)
+}
+
 /// `reply`, preceded by whatever [`before_the_reply`] collected while the
 /// command ran.
 #[inline(always)]

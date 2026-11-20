@@ -1117,6 +1117,7 @@ pub fn execute_command(mut ctx: Ctx) -> Vec<u8> {
         // dispatched again (`blocking::hold_for_pause`). Counted and timed
         // then.
         crate::stats::unrecord_command_processed();
+        carry_what_came_before(ctx);
         return reply;
     }
     let elapsed = started.elapsed();
@@ -1145,6 +1146,21 @@ pub fn execute_command(mut ctx: Ctx) -> Vec<u8> {
 fn counted_after_its_wait(ctx: &mut Ctx, name: &str, elapsed: std::time::Duration) {
     if !crate::deferred::counted_after_free(ctx, name, elapsed) {
         crate::latency::note_command(ctx.latency, name, elapsed);
+    }
+    carry_what_came_before(ctx);
+}
+
+/// For a command whose reply comes later (it parked, or stopped to be run
+/// again): the messages for its client that it produced meanwhile
+/// (`tracking::before_the_reply`), which a reply made now would have
+/// begun with, go with the command, to its connection
+/// (`BlockingCtl::before_reply`), to be written before its reply.
+#[cold]
+#[inline(never)]
+fn carry_what_came_before(ctx: &mut Ctx) {
+    if let Some(slot) = ctx.blocking.as_mut() {
+        slot.before_reply
+            .extend(crate::tracking::take_what_came_before());
     }
 }
 

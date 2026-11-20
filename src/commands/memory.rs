@@ -106,17 +106,33 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
         None => return Some(resp_null_bulk()),
     };
 
+    // For a set or a hash, what its entry takes is counted from the entry
+    // itself: its block (header, key, time to live and the value's handle)
+    // and its share of the shard's table (`ShardMap::entry_footprint`).
+    let entry = || map.entry_footprint(key);
+    let bytes = value_bytes(value, key, entry, samples);
+
+    Some(resp_integer(bytes as i64))
+}
+
+/// What `value`, at `key`, takes in memory, as `MEMORY USAGE` says: its
+/// collections' elements sampled `samples` at a time (`usize::MAX`: all).
+/// `entry` is what the key's entry takes, if it is known (a value let go
+/// of has none).
+pub(crate) fn value_bytes(
+    value: ValueRef<'_>,
+    key: &[u8],
+    entry: impl Fn() -> Option<usize>,
+    samples: usize,
+) -> usize {
     // What the key's entry takes: forty bytes of a table that is, on
     // average, two thirds full. The key's own bytes are inside the entry
     // unless there are more than twenty-four of them (`store::Key`).
     let key_overhead = 64 + if key.len() > 24 { key.len() } else { 0 };
 
-    // For a set or a hash, what its entry takes is counted from the entry
-    // itself: its block (header, key, time to live and the value's handle)
-    // and its share of the shard's table (`ShardMap::entry_footprint`).
-    let entry = || map.entry_footprint(key).unwrap_or(key_overhead);
+    let entry = || entry().unwrap_or(key_overhead);
 
-    let bytes: usize = match value {
+    match value {
         // As Redis 8 counts a string: one object holding its header, the
         // key and the value, as the allocator rounds it. Redis's suite
         // holds it to that (at least the three, at most twice them or 64),
@@ -284,9 +300,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 + names
                 + watched
         }
-    };
-
-    Some(resp_integer(bytes as i64))
+    }
 }
 
 fn memory_stats() -> Vec<u8> {

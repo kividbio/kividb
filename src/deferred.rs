@@ -9,10 +9,18 @@
 //! has nobody to hand its connections to.
 //!
 //! So the work is moved instead, to a small pool of threads of its own, and
-//! the connection waits for it, asleep (`server_uring`), while its thread
-//! serves the others. The connection reads its next command, and writes the
-//! reply, only once the work is done: each connection's replies keep their
-//! order. Two kinds of work move:
+//! the connection waits for it (`server_uring`), while its thread serves the
+//! others. The connection reads its next command, and writes the reply, only
+//! once the work is done: each connection's replies keep their order, and a
+//! client that has shut its side for writing gets every reply, as when the
+//! command ran on its thread.
+//!
+//! What moves is the work, not the locks it holds: a command run on the
+//! pool holds the command gate shared, and `HGETALL`, `SMEMBERS`, `LRANGE`
+//! and `SORT` hold their key's shard and value for reading while they build
+//! the reply, as they did on the ring thread. A write to that shard, or a
+//! command that takes the command gate alone, still waits for them, and its
+//! own ring thread with it. Two kinds of work move:
 //!
 //! - A command that only reads, and finds it is long before it has done
 //!   anything ([`run_elsewhere`]): `KEYS`, `SCAN` with a huge `COUNT`,
@@ -180,6 +188,10 @@ pub enum Offload {
 pub struct Freeing {
     values: Vec<KiviDBValue>,
     effort: u64,
+    /// The values' memory, not counted against `maxmemory` from the moment
+    /// their keys were deleted until they are freed: they are gone, and no
+    /// key is evicted, nor any write refused, for them meanwhile.
+    held: crate::memory_use::NotCounted,
     /// What the command is counted as, once the free is done.
     counted: Option<Counted>,
 }
@@ -200,18 +212,33 @@ impl Freeing {
         let Freeing {
             values,
             effort,
+            held,
             counted,
         } = self;
-        crate::commands::helpers::long_work(effort as usize, move || drop(values));
+        // For a test: a free held until `failpoint.deferred-free-held.<n>`
+        // is removed (`KIVIDB_TEST_FAILPOINTS`).
+        crate::aof::failpoint("deferred-free-held");
+        crate::commands::helpers::long_work(effort as usize, move || {
+            drop(values);
+            drop(held);
+        });
         counted
     }
 
     /// Free on the pool; the receiver says when it is done.
     pub fn free_elsewhere(self) -> (tokio::sync::oneshot::Receiver<()>, Option<Counted>) {
         let Freeing {
-            values, counted, ..
+            values,
+            held,
+            counted,
+            ..
         } = self;
-        (spawn(move || drop(values)), counted)
+        let freed = spawn(move || {
+            crate::aof::failpoint("deferred-free-held");
+            drop(values);
+            drop(held);
+        });
+        (freed, counted)
     }
 }
 
@@ -324,12 +351,20 @@ pub fn free_weighed(blocking: &mut Option<&mut BlockingCtl>, value: KiviDBValue,
         return;
     }
     if let Some(slot) = blocking.as_mut().filter(|slot| slot.awaitable) {
+        // What `MEMORY USAGE` would say of it, its elements sampled.
+        let bytes = crate::commands::memory::value_bytes(
+            crate::store::ValueRef::from(&value),
+            &[],
+            || None,
+            5,
+        );
         match slot.parked.as_mut() {
             None => {
                 slot.parked = Some(crate::commands::blocking::BlockingWait::offload(
                     Offload::Free(Freeing {
                         values: vec![value],
                         effort,
+                        held: crate::memory_use::NotCounted::new(bytes),
                         counted: None,
                     }),
                 ));
@@ -339,6 +374,7 @@ pub fn free_weighed(blocking: &mut Option<&mut BlockingCtl>, value: KiviDBValue,
                 if let Some(Offload::Free(freeing)) = wait.offload_mut() {
                     freeing.values.push(value);
                     freeing.effort += effort;
+                    freeing.held.add(bytes);
                     return;
                 }
             }

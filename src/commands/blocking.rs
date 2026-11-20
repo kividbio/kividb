@@ -85,7 +85,8 @@ pub struct BlockingWait {
     /// (`deferred`, #762). Only values to free ([`Self::frees_only`]): the
     /// command has run, and is counted when the free is done. A command to
     /// run again elsewhere has not run.
-    offload: Option<crate::deferred::Offload>,
+    /// Boxed: rare, and the wait is kept small.
+    offload: Option<Box<crate::deferred::Offload>>,
 }
 
 /// Command state captured at park time and handed back verbatim on resume,
@@ -421,6 +422,12 @@ pub struct BlockingCtl {
     /// of after the dispatch if it did not get that far.
     #[cfg(feature = "lua")]
     pub tag_turns: Option<crate::tag_locks::TagTurns>,
+    /// Messages for this client that its command produced before it
+    /// parked, or stopped to be run again: tracking's invalidations of keys
+    /// it evicted (`tracking::before_the_reply`). They go to the client
+    /// before its reply: the connection takes them as it takes the wait
+    /// ([`BlockingSlot::take_before_reply`]).
+    pub before_reply: Vec<u8>,
 }
 
 /// The connection loop's end of the parking mechanism.
@@ -745,6 +752,15 @@ impl BlockingSlot {
     #[cfg(feature = "lua")]
     pub fn hold_tag_turns(&mut self, turns: crate::tag_locks::TagTurns) {
         self.ctl.tag_turns = Some(turns);
+    }
+
+    /// What [`BlockingCtl::before_reply`] holds, appended to `out`: written
+    /// before the reply of the command that parked or stopped.
+    #[cold]
+    pub fn take_before_reply(&mut self, out: &mut Vec<u8>) {
+        if !self.ctl.before_reply.is_empty() {
+            out.append(&mut self.ctl.before_reply);
+        }
     }
 
     /// Clear the resume flag after the guard has fired.
@@ -1248,22 +1264,25 @@ impl BlockingWait {
             held_by_pause: false,
             #[cfg(feature = "lua")]
             tags: None,
-            offload: Some(offload),
+            offload: Some(Box::new(offload)),
         }
     }
 
     /// The work the command left for its connection ([`Self::offload`]).
     pub fn take_offload(&mut self) -> Option<crate::deferred::Offload> {
-        self.offload.take()
+        self.offload.take().map(|offload| *offload)
     }
 
     pub(crate) fn offload_mut(&mut self) -> Option<&mut crate::deferred::Offload> {
-        self.offload.as_mut()
+        self.offload.as_deref_mut()
     }
 
     /// Whether this is only values a command that has run left to free.
     pub fn frees_only(&self) -> bool {
-        matches!(self.offload, Some(crate::deferred::Offload::Free(_)))
+        matches!(
+            self.offload.as_deref(),
+            Some(crate::deferred::Offload::Free(_))
+        )
     }
 
     /// Take the state stashed at park time, so the loop can hand it to the

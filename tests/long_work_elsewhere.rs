@@ -229,9 +229,10 @@ struct Server {
     dir: PathBuf,
     child: Child,
     args: Vec<String>,
+    env: Vec<(String, String)>,
 }
 
-fn spawn(dir: &Path, port: u16, args: &[String]) -> Child {
+fn spawn(dir: &Path, port: u16, args: &[String], env: &[(String, String)]) -> Child {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -250,6 +251,7 @@ fn spawn(dir: &Path, port: u16, args: &[String]) -> Child {
             "yes",
         ])
         .args(args)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log)
@@ -261,18 +263,28 @@ impl Server {
     /// On `io`, with one worker thread: every connection is served by the
     /// thread a long command runs on.
     fn start(io: &str, extra: &[&str]) -> Self {
+        Self::start_env(io, extra, &[])
+    }
+
+    /// [`Server::start`], with `env` in the server's environment.
+    fn start_env(io: &str, extra: &[&str], env: &[(&str, &str)]) -> Self {
+        let env: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         let dir = tempfile::tempdir().unwrap().keep();
         let mut args: Vec<String> = ["--io-model", io, "--threads", "1"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         args.extend(extra.iter().map(|s| s.to_string()));
-        let (child, port) = start_verified(|port| spawn(&dir, port, &args));
+        let (child, port) = start_verified(|port| spawn(&dir, port, &args, &env));
         let server = Server {
             port,
             dir,
             child,
             args,
+            env,
         };
         server.wait_up();
         if io == "uring" {
@@ -320,8 +332,10 @@ impl Server {
     fn restart(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let (child, port, _) =
-            restart_verified(|port| spawn(&self.dir, port, &self.args), self.port);
+        let (child, port, _) = restart_verified(
+            |port| spawn(&self.dir, port, &self.args, &self.env),
+            self.port,
+        );
         self.child = child;
         self.port = port;
         self.wait_up();
@@ -857,5 +871,158 @@ fn a_shutdown_while_a_command_runs_elsewhere() {
         );
         assert_eq!(c.cmd(&["GET", "kept"]), V::Bulk(b"yes".to_vec()));
         assert_eq!(c.int(&["DBSIZE"]), 1_000_001);
+    }
+}
+
+/// A client that sends its commands and shuts its side for writing (`nc
+/// -N`, a batch loader) is answered all of them, long work or not, and what
+/// it sent after the long command runs: as when the command ran on its
+/// connection's thread.
+#[test]
+fn a_client_that_shuts_its_side_for_writing_gets_every_reply() {
+    let _turn = one_at_a_time();
+    for &io in io_models() {
+        let server = Server::start(io, &[]);
+        let mut c = server.conn();
+        c.ok(&["DEBUG", "POPULATE", "1000000", "user"]);
+        for (round, long) in [
+            &["DEL", "h"][..],
+            &["KEYS", "user:99999*"],
+            &["HGETALL", "h"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            c.big("HSET", "h", BIG);
+            let key = format!("after-{round}");
+            let mut batch = request(long);
+            batch.extend_from_slice(&request(&["SET", &key, "v"]));
+            batch.extend_from_slice(&request(&["GET", &key]));
+            let mut half = server.conn();
+            half.writer.write_all(&batch).unwrap();
+            half.writer.shutdown(std::net::Shutdown::Write).unwrap();
+            let first = half.read();
+            match long[0] {
+                "DEL" => assert_eq!(first, V::Int(1), "{io}"),
+                "KEYS" => assert_eq!(first.arr().len(), 11, "{io}"),
+                _ => assert_eq!(first.arr().len(), 2 * BIG, "{io}"),
+            }
+            assert_eq!(half.read(), V::Str("OK".into()), "{io}: {long:?}");
+            assert_eq!(half.read(), V::Bulk(b"v".to_vec()), "{io}: {long:?}");
+            assert!(
+                half.closed_within(Duration::from_secs(30)),
+                "{io}: closed after"
+            );
+            assert_eq!(c.cmd(&["GET", &key]), V::Bulk(b"v".to_vec()), "{io}");
+        }
+    }
+}
+
+/// While a `DEL`'s free waits, its value is not counted against
+/// `maxmemory`: at the limit, writes on another connection evict nothing
+/// and are refused nothing for memory that is already gone. The free is
+/// held (`deferred-free-held`) until the writes are done.
+#[test]
+fn a_free_that_waits_is_not_counted_against_the_limit() {
+    let _turn = one_at_a_time();
+    for &io in io_models() {
+        let server = Server::start_env(
+            io,
+            &["--maxmemory-policy", "allkeys-lru"],
+            &[("KIVIDB_TEST_FAILPOINTS", "deferred-free-held")],
+        );
+        let mut c = server.conn();
+        c.ok(&["DEBUG", "POPULATE", "100000", "k", "100"]);
+        c.big("HSET", "h", BIG);
+        let usage = c.int(&["MEMORY", "USAGE", "h"]);
+        let used: i64 = c.info("memory", "used_memory").parse().unwrap();
+        let mut del = server.conn();
+        del.send(&["DEL", "h"]);
+        let held = server.dir.join("failpoint.deferred-free-held.1");
+        eventually(30, "the free to be held", || held.exists());
+        // Under what was used with the hash, over what is used without it.
+        let limit = used - usage / 2;
+        c.ok(&["CONFIG", "SET", "maxmemory", &limit.to_string()]);
+        let value = "w".repeat(100);
+        for i in 0..2_000 {
+            let reply = c.cmd(&["SET", &format!("k:{}", i * 37 % 100_000), &value]);
+            assert_eq!(reply, V::Str("OK".into()), "{io}: write {i} refused");
+        }
+        let evicted = c.info("stats", "evicted_keys");
+        assert_eq!(
+            evicted, "0",
+            "{io}: keys evicted for a value already deleted"
+        );
+        assert_eq!(c.int(&["DBSIZE"]), 100_000, "{io}");
+        std::fs::remove_file(&held).unwrap();
+        assert_eq!(del.read(), V::Int(1), "{io}");
+        c.ok(&["CONFIG", "SET", "maxmemory", "0"]);
+    }
+}
+
+/// What tracking tells a client of the keys its own command evicted, before
+/// that command parks (`BLPOP`) or stops to be run again (a long
+/// `HGETALL`), is delivered to that client before its reply, and nothing of
+/// it to another client of the same thread.
+#[test]
+fn invalidations_go_to_the_client_whose_command_waits() {
+    let _turn = one_at_a_time();
+    for &io in io_models() {
+        let server = Server::start(io, &["--maxmemory-policy", "volatile-lru"]);
+        let mut c = server.conn();
+        c.big("HSET", "h", BIG);
+        let invalidated = |v: &V| {
+            *v == V::Arr(vec![
+                V::Bulk(b"invalidate".to_vec()),
+                V::Arr(vec![V::Bulk(b"x".to_vec())]),
+            ])
+        };
+        for waits in ["HGETALL", "BLPOP"] {
+            // `x` is the only key with a time to live: the one evicted, and
+            // what evicting it gives back is enough for a write to go on.
+            let x = "x".repeat(400_000);
+            c.ok(&["SET", "x", &x, "EX", "100000"]);
+            let mut a = server.conn();
+            assert!(matches!(a.cmd(&["HELLO", "3"]), V::Map(_)));
+            a.ok(&["CLIENT", "TRACKING", "ON"]);
+            assert_eq!(a.cmd(&["GET", "x"]), V::Bulk(x.into_bytes()));
+            let mut b = server.conn();
+            assert_eq!(b.cmd(&["GET", "nothere"]), V::Nil);
+            // A limit under what is in use, set while nothing is evicted
+            // for it: the next command that runs makes room, by evicting
+            // `x`. That is `a`'s, and its connection is the one told.
+            let used: i64 = c.info("memory", "used_memory").parse().unwrap();
+            c.ok(&["CONFIG", "SET", "maxmemory-policy", "noeviction"]);
+            c.ok(&["CONFIG", "SET", "maxmemory", &(used - 65_536).to_string()]);
+            c.ok(&["CONFIG", "SET", "maxmemory-policy", "volatile-lru"]);
+            if waits == "HGETALL" {
+                a.send(&["HGETALL", "h"]);
+            } else {
+                a.send(&["BLPOP", "q", "0"]);
+            }
+            thread::sleep(Duration::from_millis(20));
+            // Another client of the thread, meanwhile: its reply alone.
+            for _ in 0..3 {
+                assert_eq!(b.cmd(&["GET", "nothere"]), V::Nil, "{io} {waits}");
+            }
+            c.ok(&["CONFIG", "SET", "maxmemory", "0"]);
+            let first = a.read();
+            assert!(invalidated(&first), "{io} {waits}: {first:?}");
+            if waits == "HGETALL" {
+                let V::Map(fields) = a.read() else {
+                    panic!("{io}: HGETALL in RESP3 is a map");
+                };
+                assert_eq!(fields.len(), 2 * BIG);
+            } else {
+                assert_eq!(c.int(&["LPUSH", "q", "v"]), 1);
+                assert_eq!(
+                    a.read().arr(),
+                    vec![V::Bulk(b"q".to_vec()), V::Bulk(b"v".to_vec())],
+                    "{io}"
+                );
+            }
+            assert_eq!(b.cmd(&["GET", "nothere"]), V::Nil, "{io} {waits}");
+            assert_eq!(c.int(&["EXISTS", "x"]), 0, "{io} {waits}: x was evicted");
+        }
     }
 }

@@ -1797,6 +1797,9 @@ where
                         blocking: Some(blocking_slot.prime()),
                     });
                     if let Some(mut wait) = blocking_slot.take_parked() {
+                        // Before its reply: what its client is told of what it did
+                        // before it parked, or stopped to be run again.
+                        blocking_slot.take_before_reply(&mut combined);
                         if crate::aof::take_wait(&mut aof_wait, &mut aof_refused_from) {
                             crate::aof::written(&aof_tx).await;
                         }
@@ -1909,6 +1912,9 @@ where
                     blocking: Some(blocking_slot.prime()),
                 });
                 if let Some(mut wait) = blocking_slot.take_parked() {
+                    // Before its reply: what its client is told of what it did
+                    // before it parked, or stopped to be run again.
+                    blocking_slot.take_before_reply(&mut combined);
                     waited_from = Some(now_us());
                     if crate::aof::take_wait(&mut aof_wait, &mut aof_refused_from) {
                         crate::aof::written(&aof_tx).await;
