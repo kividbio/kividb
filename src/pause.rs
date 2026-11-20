@@ -432,6 +432,32 @@ pub fn test_stall_before_the_gate(cmd: &[&[u8]]) {
     }
 }
 
+/// `KIVIDB_TEST_CLOCK_AHEAD_MS`, never set otherwise, and read in debug
+/// builds only: a write on a master with an argument that begins with
+/// `clock-ahead:` finds the clock this far ahead once it has looked for
+/// the keys it names that are past their time
+/// (`handler::expire_named_keys_first`), until it ends. A test's window
+/// for a key's deadline to fall between that look and the command's own
+/// lookups, with no wait: the command goes by the time it read first
+/// (`script_clock::command`, #632).
+#[cfg(debug_assertions)]
+pub fn test_move_clock_after_the_expiry_check(cmd: &[&[u8]]) {
+    static AHEAD: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let ahead = AHEAD.get_or_init(|| {
+        std::env::var("KIVIDB_TEST_CLOCK_AHEAD_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+    });
+    if let Some(ms) = *ahead
+        && cmd
+            .iter()
+            .skip(1)
+            .any(|arg| arg.starts_with(b"clock-ahead:"))
+    {
+        crate::script_clock::test_move_clock_ahead(ms);
+    }
+}
+
 /// `KIVIDB_TEST_SCRIPT_STALL_MS`, never set otherwise, and read in debug
 /// builds only: a command a script calls with an argument that begins with
 /// `script-stall:` (`redis.call('ECHO', 'script-stall:1')`) waits this long,

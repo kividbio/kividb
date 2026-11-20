@@ -233,7 +233,6 @@ impl ShardWrite<'_> {
     fn release(&mut self, fair: bool) {
         // Before the lock is released. Its line is this thread's already:
         // the lock's word is beside it.
-        self.map.unpin_now();
         let ttls = self.map.ttl_len();
         if self.lock.ttls.load(Ordering::Relaxed) != ttls {
             self.lock.ttls.store(ttls, Ordering::Release);
@@ -354,8 +353,7 @@ impl ShardLock {
     /// if somebody does.
     #[inline(always)]
     pub fn try_write(&self) -> Option<ShardWrite<'_>> {
-        let mut map = self.map.try_write()?;
-        map.pin_now();
+        let map = self.map.try_write()?;
         Some(ShardWrite {
             map: std::mem::ManuallyDrop::new(map),
             lock: self,
@@ -391,8 +389,7 @@ impl ShardLock {
 
     #[inline(always)]
     pub fn write(&self) -> ShardWrite<'_> {
-        let mut map = self.map.write();
-        map.pin_now();
+        let map = self.map.write();
         ShardWrite {
             map: std::mem::ManuallyDrop::new(map),
             lock: self,

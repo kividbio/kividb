@@ -5,9 +5,40 @@
 //!
 //! `TIME` stops holding it once a script runs past `busy-reply-threshold`
 //! (#676). See [`let_time_move`].
+//!
+//! Every other command reads the clock once too (#632): the first time it
+//! asks, and that time holds until it ends. A key is live for the whole
+//! command or expired for the whole of it. See [`command`].
 
 use std::cell::RefCell;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// [`COMMAND_MS`] in a command that has not read the clock yet.
+const PENDING: u64 = u64::MAX;
+
+thread_local! {
+    /// The time of the command running on this thread ([`command`]), in
+    /// milliseconds: [`PENDING`] until it first reads the clock, 0 outside
+    /// a command, where every reading is the clock's own. A unit's time
+    /// ([`FROZEN_MS`]) comes first.
+    static COMMAND_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// Debug builds only: milliseconds added to the clock on this thread
+    /// until the command running on it ends. A test's way to move the clock
+    /// between two expiry checks of one command (see
+    /// `handler::expire_named_keys_first`).
+    static TEST_CLOCK_AHEAD_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Debug builds only: moves this thread's clock `ms` ahead until the
+/// command running on it ends ([`command`]).
+#[cfg(debug_assertions)]
+pub fn test_move_clock_ahead(ms: u64) {
+    TEST_CLOCK_AHEAD_MS.with(|a| a.set(ms));
+}
 
 thread_local! {
     /// How deep this thread is in execution units, and the frozen time
@@ -37,8 +68,21 @@ pub fn enter_script_execution() {
             let ms = wall
                 .as_secs()
                 .saturating_mul(1000)
-                .saturating_add(u64::from(wall.subsec_millis()));
-            FROZEN_MS.with(|f| f.set(ms.max(1)));
+                .saturating_add(u64::from(wall.subsec_millis()))
+                .max(1);
+            // Inside a command (`EVAL`, `FCALL`): the time the command read
+            // when it looked at the keys it names holds for its script too;
+            // and a command that had not read the clock yet keeps the
+            // script's time for the rest of it.
+            let ms = COMMAND_MS.with(|c| match c.get() {
+                0 => ms,
+                PENDING => {
+                    c.set(ms);
+                    ms
+                }
+                command => command,
+            });
+            FROZEN_MS.with(|f| f.set(ms));
         }
         st.0 += 1;
     });
@@ -94,19 +138,53 @@ impl Drop for Frozen {
     }
 }
 
-/// Milliseconds since UNIX epoch; frozen during scripts.
+/// One command's time, as Redis's `commandTimeSnapshot` (#632): the clock
+/// is read the first time the command asks for it ([`wall_ms_now`]), and
+/// that reading answers every later ask until the guard is dropped. Every
+/// expiry check the command makes (the look for keys past their time
+/// before a write, `handler::expire_named_keys_first`, then its own
+/// lookups and those of the shards it locks, its hash fields, the times to
+/// live it sets and reports) goes by the same time, so a key is live for
+/// the whole command or expired for the whole of it.
+///
+/// Read lazily: a command that looks at no key with a time to live reads no
+/// clock. Taken by `handler::run_command` once the command holds its gates,
+/// and after any room made for it under `maxmemory`, which goes by the
+/// clock as the background expiry and eviction do. Inside a unit
+/// ([`freeze`]: a script, an `EXEC`) the unit's time comes first. Commands
+/// do not nest outside a unit: a script's calls and a transaction's queued
+/// commands run inside one.
+///
+/// Two plain thread-local stores and nothing kept on the stack: this is on
+/// every command's path.
+#[must_use = "the command's time holds only while the guard lives"]
+#[inline(always)]
+pub fn command() -> Command {
+    COMMAND_MS.with(|c| c.set(PENDING));
+    Command {
+        _this_thread: std::marker::PhantomData,
+    }
+}
+
+/// See [`command`]. Not `Send`, as [`Frozen`] is not.
+pub struct Command {
+    _this_thread: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for Command {
+    #[inline(always)]
+    fn drop(&mut self) {
+        COMMAND_MS.with(|c| c.set(0));
+        #[cfg(debug_assertions)]
+        TEST_CLOCK_AHEAD_MS.with(|a| a.set(0));
+    }
+}
+
+/// Milliseconds since UNIX epoch, as [`wall_ms_now`] gives them.
 #[allow(dead_code)]
 #[inline]
 pub fn ttl_wall_ms_now() -> u128 {
-    SCRIPT_STATE.with(|s| {
-        if let Some((sec, us)) = s.borrow().1 {
-            return sec as u128 * 1000 + (us / 1000) as u128;
-        }
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    })
+    u128::from(wall_ms_now())
 }
 
 /// [`ttl_wall_ms_now`] as a `u64`: what a key's entry keeps a time to live
@@ -114,19 +192,49 @@ pub fn ttl_wall_ms_now() -> u128 {
 /// lazy expiry check. One thread-local load, and outside a script the
 /// clock read straight into milliseconds: through `SystemTime`, a
 /// `RefCell` borrow and `duration_since` it cost about 75 instructions.
+///
+/// In a unit ([`freeze`]), the unit's time; in a command ([`command`]),
+/// the command's; elsewhere (the background expiry, eviction, timers) the
+/// clock's own.
 #[inline]
 pub fn wall_ms_now() -> u64 {
     let frozen = FROZEN_MS.with(|f| f.get());
     if frozen != 0 {
         return frozen;
     }
-    clock_ms()
+    match COMMAND_MS.with(|c| c.get()) {
+        0 => clock_ms(),
+        PENDING => first_reading_of_the_command(),
+        command => command,
+    }
+}
+
+/// The clock, read for the command running on this thread and kept for the
+/// rest of it ([`command`]).
+#[inline]
+fn first_reading_of_the_command() -> u64 {
+    let now = clock_ms().max(1);
+    COMMAND_MS.with(|c| c.set(now));
+    now
 }
 
 /// The wall clock, in whole milliseconds since the Unix epoch (0 before it).
-#[cfg(unix)]
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+fn clock_ms() -> u64 {
+    os_clock_ms()
+}
+
+/// The wall clock, and a test's move of it ([`test_move_clock_ahead`]).
+#[cfg(debug_assertions)]
 #[inline]
 fn clock_ms() -> u64 {
+    os_clock_ms().saturating_add(TEST_CLOCK_AHEAD_MS.with(|a| a.get()))
+}
+
+#[cfg(unix)]
+#[inline]
+fn os_clock_ms() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -143,7 +251,7 @@ fn clock_ms() -> u64 {
 
 #[cfg(not(unix))]
 #[inline]
-fn clock_ms() -> u64 {
+fn os_clock_ms() -> u64 {
     let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -241,6 +349,73 @@ mod wall_ms_tests {
         drop(outer);
         std::thread::sleep(Duration::from_millis(2));
         assert!(wall_ms_now() > frozen);
+    }
+
+    #[test]
+    fn a_command_keeps_the_time_it_first_read_until_it_ends() {
+        let command = command();
+        let first = wall_ms_now();
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(wall_ms_now(), first);
+        assert_eq!(ttl_wall_ms_now() as u64, first);
+        assert_eq!(
+            wall_system_time_now(),
+            UNIX_EPOCH + Duration::from_millis(first)
+        );
+        {
+            // Its script: the command's time, and the command keeps it.
+            let _script = freeze();
+            std::thread::sleep(Duration::from_millis(2));
+            assert_eq!(wall_ms_now(), first);
+        }
+        assert_eq!(wall_ms_now(), first);
+        drop(command);
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(wall_ms_now() > first);
+    }
+
+    #[test]
+    fn a_command_that_has_not_read_the_clock_keeps_its_scripts_time() {
+        let command = command();
+        let script = freeze();
+        let frozen = wall_ms_now();
+        drop(script);
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(wall_ms_now(), frozen);
+        drop(command);
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(wall_ms_now() > frozen);
+    }
+
+    #[test]
+    fn a_command_inside_a_unit_goes_by_the_units_time() {
+        // A transaction's queued command.
+        let unit = freeze();
+        let frozen = wall_ms_now();
+        std::thread::sleep(Duration::from_millis(2));
+        {
+            let _command = command();
+            assert_eq!(wall_ms_now(), frozen);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(wall_ms_now(), frozen);
+        drop(unit);
+        assert!(wall_ms_now() > frozen);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_command_reads_no_clock_until_asked_and_a_clock_moved_ahead_is_not_seen_after_that() {
+        let command = command();
+        assert_eq!(COMMAND_MS.with(|c| c.get()), PENDING);
+        let first = wall_ms_now();
+        // The window a test opens between two checks of one command.
+        test_move_clock_ahead(60_000);
+        assert_eq!(wall_ms_now(), first);
+        drop(command);
+        // Back with the command's end.
+        let after = wall_ms_now();
+        assert!(after < first + 60_000, "{first} {after}");
     }
 
     #[test]

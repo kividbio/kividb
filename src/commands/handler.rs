@@ -2208,6 +2208,12 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     if hash_beside_others && !ctx.index_store.none() {
         ask_again_for_an_index(ctx, &mut _write_order);
     }
+    // From here to the end, one time for every expiry check the command
+    // makes: the look below for the keys it names that are past their time,
+    // and its own lookups after it (`script_clock::command`, #632). Taken
+    // once its gates and the order of its keys are held, where it may have
+    // waited: the time is the one it runs at.
+    let _clock = crate::script_clock::command();
     // The keys it names that are past their time go first, their deletions
     // sent ahead of it (`expire_named_keys_first`, #628). In the gate and
     // the order of its keys: the deletion falls where it did among the
@@ -2882,6 +2888,9 @@ fn expire_named_keys_first(ctx: &Ctx, name: &str, named: Option<crate::keyspec::
             crate::commands::helpers::delete_key_if_expired(ctx.store, db, key);
         }
     }
+    // A test's window between this look and the command's own lookups.
+    #[cfg(debug_assertions)]
+    crate::pause::test_move_clock_after_the_expiry_check(ctx.cmd.as_slice());
 }
 
 /// Whether `SET` `cmd` writes only on a condition: `NX`, `XX`, `IFEQ`,

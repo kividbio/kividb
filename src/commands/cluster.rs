@@ -2504,7 +2504,9 @@ fn same_hash_but_for_expired_fields(value: &crate::types::KiviDBValue, payload: 
         return false;
     };
     let (now, then) = (now.read(), then.read());
-    let soon = crate::types::field_now().saturating_add(FIELD_TIME_SLACK_MS);
+    // The real clock, not the command's reading: this compares what is in
+    // memory now with a payload that went over the network meanwhile.
+    let soon = crate::replication::unix_ms().saturating_add(FIELD_TIME_SLACK_MS);
     let same_time = |a: Option<&u64>, b: Option<&u64>| a == b;
     // Every field of `a` not about to go is in `b`, the same.
     let held_by = |a: &HashInner, b: &HashInner| {
