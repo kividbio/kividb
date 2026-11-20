@@ -9301,7 +9301,7 @@ fn a_transaction_waiting_for_a_script_during_a_slot_handoff_runs_whole_or_not_at
 #[test]
 fn a_script_waiting_out_a_slot_handoff_holds_back_no_other_replies() {
     for model in io_models() {
-        let (slowest, waiting) = script_waiting_out_a_slot_handoff_on(model);
+        let (slowest, waiting) = script_waiting_out_a_slot_handoff_on(model, false);
         eprintln!("{model}: slowest probe while the script waited: {slowest:?}");
         assert!(
             waiting || slowest >= Duration::from_millis(200),
@@ -9314,15 +9314,36 @@ fn a_script_waiting_out_a_slot_handoff_holds_back_no_other_replies() {
     }
 }
 
+/// The same for a script seen to be quick, which runs alone in a run of the
+/// thread that has the turn (`command_gate::for_a_run`, #880): the gate the
+/// run keeps closed between scripts is open while it is held before its
+/// gates and while it waits the handoff out.
+#[cfg(feature = "lua")]
+#[test]
+fn a_quick_script_waiting_out_a_slot_handoff_holds_back_no_other_replies() {
+    for model in io_models() {
+        let (slowest, waiting) = script_waiting_out_a_slot_handoff_on(model, true);
+        eprintln!("{model}: slowest probe while the quick script waited: {slowest:?}");
+        assert!(
+            waiting || slowest >= Duration::from_millis(200),
+            "{model}: the script did not wait"
+        );
+        assert!(
+            slowest < Duration::from_millis(200),
+            "{model}: a probe waited {slowest:?} while the script waited out the handoff"
+        );
+    }
+}
+
 /// [`a_script_waiting_out_a_slot_handoff_holds_back_no_other_replies`] on
-/// `model`: the longest a probe of another thread waited for a `GET` while
+/// `model`, of a script seen to be `quick` first or not: the longest a probe of another thread waited for a `GET` while
 /// the script waited the handoff out, and whether it was still waiting once
 /// every probe had been answered. The import is held before writes are
 /// paused (`handoff-pausing`), the script once it is routed (`routed`),
 /// and the destination's `TAKEOVER` waits 3 s, so the handoff holds writes
 /// when the script reaches its gates, and for long after.
 #[cfg(feature = "lua")]
-fn script_waiting_out_a_slot_handoff_on(model: &str) -> (Duration, bool) {
+fn script_waiting_out_a_slot_handoff_on(model: &str, quick: bool) -> (Duration, bool) {
     let key = key_in(0..=1000, "handoff-script");
     let env = [
         ("KIVIDB_TEST_FAILPOINTS", "routed,handoff-pausing"),
@@ -9346,6 +9367,14 @@ fn script_waiting_out_a_slot_handoff_on(model: &str) -> (Duration, bool) {
     assert!(set.join().unwrap().is_ok());
     let staying = key_in(1001..=ranges[0].1, "probe");
     assert!(src.conn().cmd(&["SET", &staying, "p"]).is_ok());
+    let body = "return redis.call('SET', KEYS[1], ARGV[1])";
+    if quick {
+        // Run on another key until it runs inline: seen to be quick.
+        let mut c = src.conn();
+        for _ in 0..4 {
+            assert!(c.cmd(&["EVAL", body, "1", &staying, "p"]).is_ok());
+        }
+    }
 
     let task_id = dst
         .conn()
@@ -9360,13 +9389,7 @@ fn script_waiting_out_a_slot_handoff_on(model: &str) -> (Duration, bool) {
     let script = patient_commands_in_background(
         src.port,
         Duration::from_secs(30),
-        &[&[
-            "EVAL",
-            "return redis.call('SET', KEYS[1], ARGV[1])",
-            "1",
-            &key,
-            "6",
-        ]],
+        &[&["EVAL", body, "1", &key, "6"]],
     );
     let held = routed_and_held(src, 2);
     // Connections that answer while the script is held at `routed`: on

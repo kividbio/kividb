@@ -480,10 +480,7 @@ fn close_for_the_run(patience: Option<(std::time::Duration, &mut dyn FnMut() -> 
 /// between two commands of the run (at the depth of the close alone).
 /// Whether it opened it.
 fn end_the_close() -> bool {
-    if !IN_A_RUN.with(|r| r.get())
-        || alone_on_this_thread()
-        || DEPTH.with(|d| d.get() != 1)
-    {
+    if !IN_A_RUN.with(|r| r.get()) || alone_on_this_thread() || DEPTH.with(|d| d.get() != 1) {
         return false;
     }
     IN_A_RUN.with(|r| r.set(false));
@@ -810,7 +807,10 @@ mod tests {
         let (closes, scripts) = run_counts();
         // One close for each round's five, and one more after each wait.
         assert!(closes - closes_before >= 150, "{closes} {closes_before}");
-        assert!(scripts - scripts_before >= 550, "{scripts} {scripts_before}");
+        assert!(
+            scripts - scripts_before >= 550,
+            "{scripts} {scripts_before}"
+        );
         // Inside a command, there is no run to start.
         let command = enter();
         assert!(for_a_run().is_none());

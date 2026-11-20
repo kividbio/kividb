@@ -1062,7 +1062,8 @@ fn info_counts_how_scripts_were_run() {
             // for one or more of them; not those offloaded.
             "scripts_in_alone_runs" => assert!(*n > was && n - was <= sent, "{name}"),
             "scripts_alone_runs" => assert!(
-                *n > was && n - was <= after["scripts_in_alone_runs"] - before["scripts_in_alone_runs"],
+                *n > was
+                    && n - was <= after["scripts_in_alone_runs"] - before["scripts_in_alone_runs"],
                 "{name}"
             ),
             // A run stretched past the demotion limit on a busy machine is
@@ -1552,9 +1553,15 @@ fn plain_beside_alone_scripts(io: &str) {
     // They ran in runs: more scripts than closes of the gate, a close for
     // more than one of them.
     let counts = script_counts(&mut c);
-    let (closes, in_runs) = (counts["scripts_alone_runs"], counts["scripts_in_alone_runs"]);
+    let (closes, in_runs) = (
+        counts["scripts_alone_runs"],
+        counts["scripts_in_alone_runs"],
+    );
     eprintln!("{io}: {in_runs} scripts under {closes} closes of the gate");
-    assert!(closes > 0 && in_runs > closes, "{in_runs} scripts, {closes} closes");
+    assert!(
+        closes > 0 && in_runs > closes,
+        "{in_runs} scripts, {closes} closes"
+    );
 }
 
 /// A script that runs alone is never seen half done, however many of them
@@ -1700,7 +1707,7 @@ fn script_waiting_for_a_migrate(io: &str) {
     });
     std::thread::sleep(Duration::from_millis(300));
     // Connections on every worker thread: each one's worst wait.
-    let probes: Vec<_> = (0..8)
+    let probes: Vec<_> = (0..16)
         .map(|_| {
             std::thread::spawn(move || {
                 let mut probe = Conn::connect(port);
@@ -1725,13 +1732,14 @@ fn script_waiting_for_a_migrate(io: &str) {
          MIGRATE took {migrate_took:?}: {migrated:?}"
     );
     // With the gate closed, every one of them would have waited as long as
-    // the script did.
+    // the script did. Those on the thread the script waits on, or on the
+    // one the MIGRATE waits on, do.
     let quick = worst
         .iter()
         .filter(|w| **w < Duration::from_millis(1000))
         .count();
     assert!(
-        quick >= 4,
+        quick >= 3,
         "commands waited {worst:?} while a script waited for the MIGRATE"
     );
     // It did wait for the MIGRATE, which gave up, and then ran here.
@@ -1741,9 +1749,10 @@ fn script_waiting_for_a_migrate(io: &str) {
     assert_eq!(c.cmd(&["GET", "moving"]), V::Str("v1".into()));
 }
 
-/// A quick script refused before the gate (`NOPERM`) while another client's
-/// slow script holds the gate alone is answered at once, not after the slow
-/// one: its checks come before it asks for the gate. On both I/O loops.
+/// A quick script refused before the gate (`NOPERM`: its user may not run
+/// `EVALSHA`) while another client's slow script holds the gate alone is
+/// answered at once, not after the slow one: its checks come before it asks
+/// for the gate. On both I/O loops.
 #[test]
 fn a_refused_script_does_not_wait_for_a_slow_one() {
     refused_script_beside_a_slow_one("tokio");
@@ -1764,8 +1773,17 @@ fn refused_script_beside_a_slow_one(io: &str) {
         c.cmd(&["EVALSHA", &sha, "1", "secret", "secret"]);
     }
     assert!(
-        c.cmd(&["ACL", "SETUSER", "limited", "on", ">pw", "+@all", "~allowed:*"])
-            .ok()
+        c.cmd(&[
+            "ACL",
+            "SETUSER",
+            "limited",
+            "on",
+            ">pw",
+            "+@all",
+            "-evalsha",
+            "~*"
+        ])
+        .ok()
     );
     // About a second and a half of counting, on the blocking pool: it is
     // too slow ever to be seen to be quick. Measured first.
