@@ -2367,8 +2367,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pool the same way. Inside `MULTI`/`EXEC`, a script, or a command that takes
   the command gate alone, the work runs where it is, as before; `HGETALL`,
   `SMEMBERS`, `LRANGE` and `SORT` also do in cluster mode. `INFO
-  commandstats` and `LATENCY` time the run on the pool (a `DEL` with its
-  free), and the slow log the whole wait. Invalidation messages produced while
+  commandstats` and `LATENCY` time the run on the pool, `INFO
+  commandstats` a `DEL` with its free, and the slow log the whole wait. Invalidation messages produced while
   a command waits are delivered to that client before its reply. On Tokio,
   `HGETALL`, `SMEMBERS`, `LRANGE` and the sort of `SORT` over that many
   elements now run as other long work does (#754), and a `DEL` frees a big

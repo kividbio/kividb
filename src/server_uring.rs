@@ -419,7 +419,6 @@ async fn offloaded(
     offload: crate::deferred::Offload,
     env: Option<crate::deferred::ClientExecEnv>,
     (db, aof_enabled, resp): (usize, bool, u8),
-    latency: &crate::latency::LatencyTracker,
     response: Vec<u8>,
 ) -> Vec<u8> {
     let could_not = || crate::resp::write::resp_error("ERR the command could not be run");
@@ -437,13 +436,8 @@ async fn offloaded(
         }
         crate::deferred::Offload::Free(freeing) => {
             let started = std::time::Instant::now();
-            let (done, counted) = freeing.free_elsewhere();
-            let _ = done.await;
-            // Counted with the free: its own time, and the free's.
-            let own = counted
-                .as_ref()
-                .map_or(std::time::Duration::ZERO, |counted| counted.own);
-            crate::deferred::count_freed(latency, counted, &response, own + started.elapsed());
+            let _ = freeing.free_elsewhere().await;
+            crate::deferred::count_freed(started.elapsed());
             response
         }
     }
@@ -2020,7 +2014,7 @@ pub async fn handle_client(
                     if let Some(mut wait) = blocking_slot.take_parked() {
                         // Before its reply: what its client is told of what it did
                         // before it parked, or stopped to be run again.
-                        blocking_slot.take_before_reply(&mut out_buf);
+                        crate::tracking::put_what_came_before(&mut out_buf);
                         if crate::aof::take_wait(&mut aof_wait, &mut aof_refused_from) {
                             crate::aof::written(&aof_tx).await;
                         }
@@ -2045,7 +2039,6 @@ pub async fn handle_client(
                                 offload,
                                 env,
                                 (selected_db, aof_enabled, resp_version),
-                                &latency,
                                 std::mem::take(&mut response),
                             ))
                             .await;
@@ -2153,7 +2146,7 @@ pub async fn handle_client(
                 if let Some(mut wait) = blocking_slot.take_parked() {
                     // Before its reply: what its client is told of what it did
                     // before it parked, or stopped to be run again.
-                    blocking_slot.take_before_reply(&mut out_buf);
+                    crate::tracking::put_what_came_before(&mut out_buf);
                     waited_from = Some(now_us());
                     if crate::aof::take_wait(&mut aof_wait, &mut aof_refused_from) {
                         crate::aof::written(&aof_tx).await;
@@ -2179,7 +2172,6 @@ pub async fn handle_client(
                             offload,
                             env,
                             (selected_db, aof_enabled, resp_version),
-                            &latency,
                             std::mem::take(&mut response),
                         ))
                         .await;

@@ -1799,14 +1799,14 @@ where
                     if let Some(mut wait) = blocking_slot.take_parked() {
                         // Before its reply: what its client is told of what it did
                         // before it parked, or stopped to be run again.
-                        blocking_slot.take_before_reply(&mut combined);
+                        crate::tracking::put_what_came_before(&mut combined);
                         if crate::aof::take_wait(&mut aof_wait, &mut aof_refused_from) {
                             crate::aof::written(&aof_tx).await;
                         }
                         // Values the command left to free before its reply: freed
                         // here, out of its gates, as long work (#762).
                         if let Some(offload) = wait.take_offload() {
-                            crate::deferred::finish_on_tokio(offload, &latency, &mut response);
+                            crate::deferred::finish_on_tokio(offload, &mut response);
                         } else {
                             let limit = HardLimit::new(
                                 pubsub.limits(),
@@ -1914,7 +1914,7 @@ where
                 if let Some(mut wait) = blocking_slot.take_parked() {
                     // Before its reply: what its client is told of what it did
                     // before it parked, or stopped to be run again.
-                    blocking_slot.take_before_reply(&mut combined);
+                    crate::tracking::put_what_came_before(&mut combined);
                     waited_from = Some(now_us());
                     if crate::aof::take_wait(&mut aof_wait, &mut aof_refused_from) {
                         crate::aof::written(&aof_tx).await;
@@ -1922,7 +1922,7 @@ where
                     // Values the command left to free before its reply: freed
                     // here, out of its gates, as long work (#762).
                     if let Some(offload) = wait.take_offload() {
-                        crate::deferred::finish_on_tokio(offload, &latency, &mut response);
+                        crate::deferred::finish_on_tokio(offload, &mut response);
                     } else {
                         let limit = HardLimit::new(
                             pubsub.limits(),

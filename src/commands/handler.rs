@@ -1117,17 +1117,14 @@ pub fn execute_command(mut ctx: Ctx) -> Vec<u8> {
         // dispatched again (`blocking::hold_for_pause`). Counted and timed
         // then.
         crate::stats::unrecord_command_processed();
-        carry_what_came_before(ctx);
         return reply;
     }
     let elapsed = started.elapsed();
     // For the connection loop's slow log: see `cmdstats::last_command_us`.
     crate::cmdstats::note_last_command(elapsed);
-    if !crate::commands::blocking::left_anything(ctx) {
-        crate::latency::note_command(ctx.latency, name, elapsed);
+    crate::latency::note_command(ctx.latency, name, elapsed);
+    if !crate::commands::blocking::parked(ctx) {
         crate::cmdstats::record(name, &ctx.cmd, &reply, elapsed);
-    } else {
-        counted_after_its_wait(ctx, name, elapsed);
     }
     // An index definition goes to the rest of the cluster once it is made
     // here, with nothing held: see `cluster::ddl`.
@@ -1135,33 +1132,6 @@ pub fn execute_command(mut ctx: Ctx) -> Vec<u8> {
         return crate::cluster::ddl::spread(ctx, reply);
     }
     reply
-}
-
-/// A command that left something for its connection: it is timed now if
-/// it parked (`BLPOP`), and counted when it is resumed. One that has run and
-/// left values to free before its reply is counted, and timed, with the
-/// free, once it is done (`deferred::count_freed`).
-#[cold]
-#[inline(never)]
-fn counted_after_its_wait(ctx: &mut Ctx, name: &str, elapsed: std::time::Duration) {
-    if !crate::deferred::counted_after_free(ctx, name, elapsed) {
-        crate::latency::note_command(ctx.latency, name, elapsed);
-    }
-    carry_what_came_before(ctx);
-}
-
-/// For a command whose reply comes later (it parked, or stopped to be run
-/// again): the messages for its client that it produced meanwhile
-/// (`tracking::before_the_reply`), which a reply made now would have
-/// begun with, go with the command, to its connection
-/// (`BlockingCtl::before_reply`), to be written before its reply.
-#[cold]
-#[inline(never)]
-fn carry_what_came_before(ctx: &mut Ctx) {
-    if let Some(slot) = ctx.blocking.as_mut() {
-        slot.before_reply
-            .extend(crate::tracking::take_what_came_before());
-    }
 }
 
 /// Commands that only ask about keys: no use of a key, as in Redis, and

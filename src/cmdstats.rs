@@ -117,6 +117,20 @@ pub fn note_last_command(elapsed: std::time::Duration) {
     LAST_US.with(|last| last.set(elapsed.as_micros() as u64));
 }
 
+/// `extra` more time for `name` (upper case, a command without
+/// subcommands), already counted on this thread: work its connection did
+/// for it after it ran (`deferred::count_freed`). Its call is not counted
+/// again, nor its latency histogram moved.
+pub fn add_time(name: &str, extra: std::time::Duration) {
+    MINE.with(|mine| {
+        if let Some(counters) = mine.borrow().get(name) {
+            counters
+                .usec
+                .fetch_add(extra.as_micros() as u64, Ordering::Relaxed);
+        }
+    });
+}
+
 /// Count one call. `name` is the command's name in upper case, `cmd` the
 /// whole command, `reply` what it answered.
 #[inline]

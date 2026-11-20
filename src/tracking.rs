@@ -389,13 +389,18 @@ thread_local! {
     static PENDING_BEFORE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// What [`before_the_reply`] collected while the command this thread has
-/// just run ran, taken: for a command whose reply comes later.
-pub fn take_what_came_before() -> Vec<u8> {
+/// For a command whose reply comes later (it parked, or stopped to be run
+/// again): what [`before_the_reply`] collected while it ran on this thread,
+/// which a reply made now would have begun with, appended to its
+/// connection's `out`, to be written before its reply. Called by the
+/// connection right after the command, on the thread it ran on.
+#[cold]
+#[inline(never)]
+pub fn put_what_came_before(out: &mut Vec<u8>) {
     if TRACKING_CLIENT_COUNT.load(Ordering::Relaxed) == 0 {
-        return Vec::new();
+        return;
     }
-    PENDING_BEFORE.with_borrow_mut(std::mem::take)
+    PENDING_BEFORE.with_borrow_mut(|pending| out.append(pending));
 }
 
 /// `reply`, preceded by whatever [`before_the_reply`] collected while the

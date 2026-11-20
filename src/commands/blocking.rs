@@ -82,9 +82,9 @@ pub struct BlockingWait {
     tags: Option<crate::tag_locks::TagsBusy>,
     /// Not a wait at all: work the command left for its connection to have
     /// done off its thread, and to wait for, before it replies
-    /// (`deferred`, #762). Only values to free ([`Self::frees_only`]): the
-    /// command has run, and is counted when the free is done. A command to
-    /// run again elsewhere has not run.
+    /// (`deferred`, #762): a command to run again elsewhere, which has not
+    /// run; or values to free, of a command that has (handed on from
+    /// `BlockingCtl::freeing` by `BlockingSlot::take_parked`).
     /// Boxed: rare, and the wait is kept small.
     offload: Option<Box<crate::deferred::Offload>>,
 }
@@ -422,12 +422,15 @@ pub struct BlockingCtl {
     /// of after the dispatch if it did not get that far.
     #[cfg(feature = "lua")]
     pub tag_turns: Option<crate::tag_locks::TagTurns>,
-    /// Messages for this client that its command produced before it
-    /// parked, or stopped to be run again: tracking's invalidations of keys
-    /// it evicted (`tracking::before_the_reply`). They go to the client
-    /// before its reply: the connection takes them as it takes the wait
-    /// ([`BlockingSlot::take_before_reply`]).
-    pub before_reply: Vec<u8>,
+    /// Whether the dispatch leaves anything to settle after it but a wait:
+    /// the clients it wakes, which it collects while anyone stands in a
+    /// line, or values to free ([`Self::freeing`]). One flag, so that the
+    /// connection tests one thing after a command (`BlockingSlot::take_parked`).
+    pub(crate) after: bool,
+    /// Values a command that has run left to free before its reply
+    /// (`deferred::free_weighed`, #762): not a wait, so not in `parked`,
+    /// which says the command has not run.
+    pub(crate) freeing: Option<Box<crate::deferred::Freeing>>,
 }
 
 /// The connection loop's end of the parking mechanism.
@@ -455,8 +458,6 @@ pub struct BlockingSlot {
     woken: Vec<std::sync::Arc<crate::wait_table::Look>>,
     /// This connection, to the looks it waits for: one per woken client.
     owner: u64,
-    /// Whether the dispatch under way collects the clients it wakes.
-    collecting: bool,
     /// The client's count in `blocked_clients` from the end of its wait to
     /// the end of the dispatch that resumes it. See [`BlockedCount`].
     held_count: Option<BlockedCount>,
@@ -505,8 +506,8 @@ impl BlockingSlot {
     pub fn prime(&mut self) -> &mut BlockingCtl {
         // Nobody stands in any line (nearly always): nothing this command
         // does can wake anyone, and there is nothing to collect.
-        self.collecting = crate::wait_table::anyone_in_line();
-        if self.collecting {
+        self.ctl.after = crate::wait_table::anyone_in_line();
+        if self.ctl.after {
             self.collect();
         }
         self.ctl.awaitable = true;
@@ -557,31 +558,13 @@ impl BlockingSlot {
             }
             // Nearly every command: ran while nobody stood in any line,
             // owes nobody a look, and did not wait.
-            if !self.collecting && self.looked.is_empty() {
+            if !self.ctl.after && self.looked.is_empty() {
                 return None;
             }
             return self.looked_or_waits(None);
         }
         let parked = self.ctl.parked.take();
-        if parked.as_ref().is_some_and(BlockingWait::frees_only) {
-            return self.ran_and_frees(parked);
-        }
         self.looked_or_waits(parked)
-    }
-
-    /// [`take_parked`](Self::take_parked) for a command that has run and
-    /// left values to free before its reply: settled as one that parked
-    /// nothing, and the values handed on.
-    #[cold]
-    #[inline(never)]
-    fn ran_and_frees(&mut self, frees: Option<BlockingWait>) -> Option<BlockingWait> {
-        if self.in_resume {
-            self.resume_over();
-        }
-        if self.collecting || !self.looked.is_empty() {
-            self.looked_or_waits(None);
-        }
-        frees
     }
 
     /// [`take_parked`](Self::take_parked) for a command that may have woken
@@ -591,7 +574,8 @@ impl BlockingSlot {
         // After `resume_over`: a refused resume's ticket, dropped there,
         // passes its turn on, and the client that wakes is this dispatch's to
         // wait for, as the client a handler passes the turn to is.
-        let collected = if self.collecting {
+        // Nothing was collected if it only left values to free: none then.
+        let collected = if self.ctl.after {
             crate::wait_table::take_woken()
         } else {
             None
@@ -624,6 +608,13 @@ impl BlockingSlot {
             // Waited for before the next command of this client that reads
             // (`settles_before`), with those of the commands before it.
             self.woken.append(&mut woken);
+            // Values it left to free before its reply: work for the
+            // connection, handed on as a wait is (`deferred`).
+            if let Some(freeing) = self.ctl.freeing.take() {
+                return Some(BlockingWait::offload(crate::deferred::Offload::Free(
+                    *freeing,
+                )));
+            }
         }
         parked
     }
@@ -752,15 +743,6 @@ impl BlockingSlot {
     #[cfg(feature = "lua")]
     pub fn hold_tag_turns(&mut self, turns: crate::tag_locks::TagTurns) {
         self.ctl.tag_turns = Some(turns);
-    }
-
-    /// What [`BlockingCtl::before_reply`] holds, appended to `out`: written
-    /// before the reply of the command that parked or stopped.
-    #[cold]
-    pub fn take_before_reply(&mut self, out: &mut Vec<u8>) {
-        if !self.ctl.before_reply.is_empty() {
-            out.append(&mut self.ctl.before_reply);
-        }
     }
 
     /// Clear the resume flag after the guard has fired.
@@ -1232,21 +1214,9 @@ pub fn take_state(ctx: &mut crate::commands::ctx::Ctx) -> Option<BlockState> {
     ctx.blocking.as_mut().and_then(|slot| slot.state.take())
 }
 
-/// Whether the handler asked to park during this dispatch: and so has not
-/// run yet. Not a command that has run and only left values to free before
-/// its reply ([`BlockingWait::frees_only`]).
+/// Whether the handler asked to park during this dispatch.
 #[inline]
 pub fn parked(ctx: &crate::commands::ctx::Ctx) -> bool {
-    ctx.blocking
-        .as_ref()
-        .and_then(|slot| slot.parked.as_ref())
-        .is_some_and(|wait| !wait.frees_only())
-}
-
-/// Whether the handler left anything in the slot this dispatch: a wait, or
-/// work for its connection ([`parked`] or not).
-#[inline]
-pub fn left_anything(ctx: &crate::commands::ctx::Ctx) -> bool {
     ctx.blocking
         .as_ref()
         .is_some_and(|slot| slot.parked.is_some())
@@ -1271,18 +1241,6 @@ impl BlockingWait {
     /// The work the command left for its connection ([`Self::offload`]).
     pub fn take_offload(&mut self) -> Option<crate::deferred::Offload> {
         self.offload.take().map(|offload| *offload)
-    }
-
-    pub(crate) fn offload_mut(&mut self) -> Option<&mut crate::deferred::Offload> {
-        self.offload.as_deref_mut()
-    }
-
-    /// Whether this is only values a command that has run left to free.
-    pub fn frees_only(&self) -> bool {
-        matches!(
-            self.offload.as_deref(),
-            Some(crate::deferred::Offload::Free(_))
-        )
     }
 
     /// Take the state stashed at park time, so the loop can hand it to the

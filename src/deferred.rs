@@ -192,28 +192,15 @@ pub struct Freeing {
     /// their keys were deleted until they are freed: they are gone, and no
     /// key is evicted, nor any write refused, for them meanwhile.
     held: crate::memory_use::NotCounted,
-    /// What the command is counted as, once the free is done.
-    counted: Option<Counted>,
-}
-
-/// What a command whose free was waited for is counted as in `INFO
-/// commandstats` and timed as for `LATENCY`, with the free: its name, its
-/// first argument (for a command with subcommands), and how long it took
-/// itself.
-pub struct Counted {
-    name: String,
-    cmd: Vec<Vec<u8>>,
-    pub own: Duration,
 }
 
 impl Freeing {
     /// Free here and now: on Tokio, as long work (`helpers::long_work`).
-    pub fn free_here(self) -> Option<Counted> {
+    pub fn free_here(self) {
         let Freeing {
             values,
             effort,
             held,
-            counted,
         } = self;
         // For a test: a free held until `failpoint.deferred-free-held.<n>`
         // is removed (`KIVIDB_TEST_FAILPOINTS`).
@@ -222,44 +209,30 @@ impl Freeing {
             drop(values);
             drop(held);
         });
-        counted
     }
 
     /// Free on the pool; the receiver says when it is done.
-    pub fn free_elsewhere(self) -> (tokio::sync::oneshot::Receiver<()>, Option<Counted>) {
-        let Freeing {
-            values,
-            held,
-            counted,
-            ..
-        } = self;
-        let freed = spawn(move || {
+    pub fn free_elsewhere(self) -> tokio::sync::oneshot::Receiver<()> {
+        let Freeing { values, held, .. } = self;
+        spawn(move || {
             crate::aof::failpoint("deferred-free-held");
             drop(values);
             drop(held);
-        });
-        (freed, counted)
+        })
     }
 }
 
 /// On the Tokio I/O model, what a command left for its connection: values
-/// to free, freed here as long work (`helpers::long_work`), and the command
-/// counted with the free. A command is sent to be run again only from an
-/// io_uring worker ([`run_elsewhere`]); should one come here, it is told it
-/// could not be run.
-pub fn finish_on_tokio(
-    offload: Offload,
-    latency: &crate::latency::LatencyTracker,
-    response: &mut Vec<u8>,
-) {
+/// to free, freed here as long work (`helpers::long_work`), and the time
+/// that took counted with the command ([`count_freed`]). A command is sent
+/// to be run again only from an io_uring worker ([`run_elsewhere`]); should
+/// one come here, it is told it could not be run.
+pub fn finish_on_tokio(offload: Offload, response: &mut Vec<u8>) {
     match offload {
         Offload::Free(freeing) => {
             let started = std::time::Instant::now();
-            let counted = freeing.free_here();
-            let own = counted
-                .as_ref()
-                .map_or(Duration::ZERO, |counted| counted.own);
-            count_freed(latency, counted, response, own + started.elapsed());
+            freeing.free_here();
+            count_freed(started.elapsed());
         }
         Offload::Rerun(_) => {
             debug_assert!(false, "a command sent to be run again on Tokio");
@@ -268,41 +241,13 @@ pub fn finish_on_tokio(
     }
 }
 
-/// Count a command whose free was waited for ([`Freeing`]), now that it is
-/// done: `elapsed` is its own time and the free's.
-pub fn count_freed(
-    latency: &crate::latency::LatencyTracker,
-    counted: Option<Counted>,
-    reply: &[u8],
-    elapsed: Duration,
-) {
-    let Some(Counted { name, cmd, .. }) = counted else {
-        return;
-    };
-    let cmd: Vec<&[u8]> = cmd.iter().map(Vec::as_slice).collect();
-    crate::latency::note_command(latency, &name, elapsed);
-    crate::cmdstats::record(&name, &cmd, reply, elapsed);
-}
-
-/// For `execute_command`: the command parked something. If it is only
-/// values to free, what it is counted as waits for the free (its name,
-/// and how long it took itself, here); true then.
-pub(crate) fn counted_after_free(ctx: &mut Ctx, name: &str, elapsed: Duration) -> bool {
-    let Some(Offload::Free(freeing)) = ctx
-        .blocking
-        .as_mut()
-        .and_then(|slot| slot.parked.as_mut())
-        .and_then(|wait| wait.offload_mut())
-    else {
-        return false;
-    };
-    let first = ctx.cmd.iter().take(2).map(|arg| arg.to_vec()).collect();
-    freeing.counted = Some(Counted {
-        name: name.to_string(),
-        cmd: first,
-        own: elapsed,
-    });
-    true
+/// The time a `DEL`'s free took after the command ([`Freeing`]), added to
+/// what `INFO commandstats` has for `DEL`: the call was counted, with its
+/// own time, as any command's is (`execute_command`). Only `DEL` leaves
+/// values to free (`lazyfree::release_deleted`). On the thread the command
+/// ran on, whose counters those are.
+pub fn count_freed(took: Duration) {
+    crate::cmdstats::add_time("DEL", took);
 }
 
 /// Whether the command running with `blocking` can be sent to the pool,
@@ -358,27 +303,20 @@ pub fn free_weighed(blocking: &mut Option<&mut BlockingCtl>, value: KiviDBValue,
             || None,
             5,
         );
-        match slot.parked.as_mut() {
-            None => {
-                slot.parked = Some(crate::commands::blocking::BlockingWait::offload(
-                    Offload::Free(Freeing {
-                        values: vec![value],
-                        effort,
-                        held: crate::memory_use::NotCounted::new(bytes),
-                        counted: None,
-                    }),
-                ));
-                return;
-            }
-            Some(wait) => {
-                if let Some(Offload::Free(freeing)) = wait.offload_mut() {
-                    freeing.values.push(value);
-                    freeing.effort += effort;
-                    freeing.held.add(bytes);
-                    return;
-                }
-            }
-        }
+        // Beside the slot's wait, not in it: the command has run, and
+        // finishes as any command that has (`BlockingCtl::freeing`).
+        let freeing = slot.freeing.get_or_insert_with(|| {
+            Box::new(Freeing {
+                values: Vec::new(),
+                effort: 0,
+                held: crate::memory_use::NotCounted::default(),
+            })
+        });
+        freeing.values.push(value);
+        freeing.effort += effort;
+        freeing.held.add(bytes);
+        slot.after = true;
+        return;
     }
     crate::commands::helpers::long_work(effort as usize, move || drop(value));
 }
