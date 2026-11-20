@@ -32,8 +32,8 @@ case), which is the number this suite is about. At 1,000 members a count of
 `bad_replies` counts replies of the wrong length, or with a member twice for
 a positive count: it must be 0 on every engine.
 
-Gates: wall time 50 % or 20 us, server time 50 % or 3 us, whichever is
-larger. At 100,000 and 1,000,000 members every wall-time row must keep 60 %
+Gates: wall time 50 % or 20 us, server time 100 % or 3 us, whichever is
+larger (see SERVER below). At 100,000 and 1,000,000 members every wall-time row must keep 60 %
 of the gain over v1.2.2 measured in the same session (not the server time:
 for one member it is a microsecond or less, too coarse to divide by), and
 the server time of a count of 10 or 1000, either sign, must stay within 3x
@@ -85,16 +85,25 @@ def server_usec(c):
     return stats.get("calls", 0), stats.get("usec", 0)
 
 
+# The server time of the same build moves by up to 1.7x between two VMs of
+# the same size and CPU (`n1k` `m1000_srv_us`: 66 us recorded, 110-115 us on
+# another D4s_v5, the code before and after #969's review alike), so it is
+# held to twice its recorded value; the gains it guards are larger (2-10x
+# master at 100,000 members and more, hundreds of times at the counts of 1
+# and 10).
+SERVER = rel(100, abs=3)
+
+
 def gates_for(cfg, name, server):
     if cfg == "n1k":
-        return [rel(50, abs=20 if not server else 3)]
+        return [SERVER if server else rel(50, abs=20)]
     if not server:
         # Where v1.2.2 and the walk paid for the size: that cost must stay
         # gone. Judged on the wall time: a server time of a microsecond or
         # less is too coarse a denominator for a ratio (the first run's
         # `none` was 0.06 us, its rerun 0.89 us).
         return [rel(50, abs=20), KEEP_IMPROVEMENT]
-    g = [rel(50, abs=3)]
+    g = [SERVER]
     if name.startswith(("c10", "m10")):
         # Ten members or more: several microseconds on both engines, enough
         # to hold to Redis's (both are O(count) now).

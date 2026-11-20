@@ -526,9 +526,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   likely as any other. A distinct sample of up to a third of the set is
   picked a bucket at a time (a bucket that comes up twice is picked again);
   a larger one walks the table once, which is then no longer than the
-  answer. The table is made smaller once it falls below an eighth full, as
-  Redis's is, so the memory of a set that has lost most of its members is
-  given back too. Over a million members, server time a call (`INFO
+  answer; a table left less than an eighth full (a set that lost most of
+  its members) is walked once a call, as before. A table of up to 65,536
+  buckets is made smaller when a removal leaves it less than an eighth
+  full, and any table after a `ZADD` or `GEOADD` that reserved it for
+  members given more than once, or a bulk removal (`ZREMRANGEBY*`) of as
+  many members as it held; a bigger table emptied one member at a time
+  keeps its size, as before, since giving that memory back stalled the
+  command (14 ms for a million-member set's table). Over a million members, server time a call (`INFO
   commandstats`), master before this change, now, and Redis 8.10.2:
   `ZRANDMEMBER z` 1,047 us, 1.0 us, 1.1 us; a count of 10 1,975 us,
   3.2 us, 8.2 us; 1000 2,454 us, 159 us, 711 us; -1000 2,444 us, 243 us,
