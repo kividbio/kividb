@@ -48,7 +48,6 @@
 #                       HEXISTS, HSTRLEN, HGETALL at 10, 128, 512 (block),
 #                       1k, 100k, 3M (table) (see measure.sh; SIZES limits
 #                       the sizes, e.g. SIZES="10 1000")
->>>>>>> upstream/master
 #   ONLY=<regex>        measure only the workloads whose label matches
 #   PROFILE=1           keep the hottest functions of each workload in
 #                       target/perf/out-<tag>/profile-*.txt
