@@ -164,7 +164,8 @@ fn value_digest(h: &mut Xxh3, value: crate::store::ValueRef<'_>) {
             h.update(b"h");
             let mut sum = 0u64;
             for (field, value) in hash.read().iter() {
-                sum = sum.wrapping_add(field_digest(field.as_bytes(), &value, None));
+                let name = crate::hash_fields::saved_name(field);
+                sum = sum.wrapping_add(field_digest(&name, &value, None));
             }
             h.update(&sum.to_le_bytes());
         }
@@ -182,7 +183,8 @@ fn value_digest(h: &mut Xxh3, value: crate::store::ValueRef<'_>) {
             let mut sum = 0u64;
             for (field, value) in inner.fields.iter() {
                 let at = inner.expiries.get(field).copied();
-                sum = sum.wrapping_add(field_digest(field.as_bytes(), &value, at));
+                let name = crate::hash_fields::saved_name(field);
+                sum = sum.wrapping_add(field_digest(&name, &value, at));
             }
             h.update(&sum.to_le_bytes());
         }

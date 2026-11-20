@@ -165,9 +165,9 @@ other files:
 - A hash whose fields and values pass 65,535 bytes together is a
   `hashtable` even when it is within both limits (at most 511 fields of 64
   bytes with 64-byte values fit one block); Redis's listpack holds more.
-- The 64-byte and 65,535-byte limits count a field as it is stored, after
-  the bytes of a field that is not UTF-8 are escaped as text: a binary
-  field Redis keeps in a `listpack` can make a `hashtable` here.
+- The 64-byte and 65,535-byte limits count a field's own bytes, as Redis's
+  do, whatever bytes it holds: a field that is not UTF-8 is as long as it
+  is, and `MEMORY USAGE` counts it so.
 - A lowered limit applies to a hash at its next write that sets a field
   (`HSET` and the like); `HDEL` and field expiry never move a hash, as in
   Redis.
@@ -195,14 +195,23 @@ other files:
 - Small sorted sets are kept as Redis keeps them, and `OBJECT ENCODING`
   says so: `listpack` for up to `zset-max-listpack-entries` (128) members
   of up to `zset-max-listpack-value` (64) bytes, `skiplist` otherwise (a
-  hash table and an ordered tree here). A set moves when a write adds a
+  table of members and an ordered index of them here). A set moves when a write adds a
   member past either limit, or when one `ZADD` (or `GEOADD`) gives more
   pairs than the entries limit, as in Redis; never back: a set taken back
   under the limit stays a `skiplist`, as in Redis. A set made whole (a
   load, `RESTORE`, `MIGRATE`, `ZRANGESTORE`, `ZUNIONSTORE` and the other
   `*STORE` commands) is a `listpack` if it fits, as Redis loads one.
 - `ZSCAN` returns a `listpack` whole, in order, with cursor 0, whatever
-  `COUNT` says, as Redis does.
+  `COUNT` says, as Redis does. A `skiplist` is scanned a page at a time,
+  in no particular order, `COUNT` being a hint as in Redis: a page can be
+  shorter than `COUNT`, or empty, before the cursor comes back 0. Every
+  member there for the whole scan is returned at least once, except in one
+  case no ordinary data reaches: if a run of members that all hash alike
+  makes the table rehash its members with a new seed while a scan is in
+  progress, that scan may miss members (it still ends). A scan begun on
+  1.2.x or earlier and continued after an upgrade (or a cursor from another
+  server) still ends without an error, but may miss or repeat members:
+  begin it again.
 - The two limits go no higher than 128 and 64 (the most one block holds);
   a larger value is taken as those, and `CONFIG GET` says so (Redis keeps
   what it is given, and its listpack holds more). The `zset-max-ziplist-*`
@@ -248,9 +257,22 @@ other files:
 **Data**
 - Keys, values, hash fields, set and sorted-set members, list elements,
   stream consumer group and consumer names and vector-set element names are
-  any bytes, as in Redis. What is still text: ACL rules (a key or channel
-  pattern in `ACL SETUSER` that is not UTF-8 is refused,
-  [#437](https://github.com/kividbio/kividb/issues/437)), search index
+  any bytes, as in Redis. A hash keeps a field name as the bytes it was sent
+  as: `HSCAN MATCH`, `HRANDFIELD`, field TTLs, keyspace notifications and
+  `SORT ... ->field` see those bytes. KDB snapshots, `DUMP` payloads and
+  `DEBUG DIGEST-VALUE` write a field name in the form 1.2 wrote it (a name
+  that is UTF-8 is itself; any other is escaped as text), so files and
+  payloads read the same on 1.2 and here, both ways.
+- ACL key and channel patterns (`~`, `%R~`, `%W~`, `&`, and in selectors)
+  are any bytes, and match a key's or channel's bytes exactly. `ACL
+  SETUSER` refuses white space and NUL in a pattern, as Redis does (and any
+  Unicode white space, which the ACL file is split at). `ACL LIST`,
+  `ACL GETUSER`, `ACL LOG` and the ACL file give a pattern's own bytes, as
+  Redis writes them. In the ACL file a user name is read as written; a
+  rule word that begins with a quote is read as Redis reads a quoted one
+  (`"~app:\xff*"`); a line is split at white space, ASCII white space for
+  a line that is not UTF-8; a pattern may hold a NUL. A user name in an ACL
+  file must be UTF-8. What is still text: ACL user names and command rules, search index
   names, prefixes and field names, and time-series label names and values.
 - A HyperLogLog copied from Redis (`DUMP`/`RESTORE`, an RDB, replication)
   loads and counts as it did on Redis. By default KiviDB writes new

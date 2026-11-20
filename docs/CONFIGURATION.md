@@ -142,7 +142,7 @@ Redis, in the file or with `CONFIG SET`, and reported by `CONFIG GET` and `OBJEC
 (64) for sets; `hash-max-listpack-entries` (512) and `hash-max-listpack-value` (64) for hashes;
 `zset-max-listpack-entries` (128) and `zset-max-listpack-value` (64) for sorted sets (a sorted
 set of up to that many members, none longer than that many bytes, is one block; past either it
-is a hash table and an ordered tree). The `*-max-ziplist-*` names of the hash and sorted-set
+is a table of members and an ordered index of them). The `*-max-ziplist-*` names of the hash and sorted-set
 settings are the same settings. A limit goes no higher than what one block holds (128 members
 of 64 bytes for sets and sorted sets, 512 fields for hashes): a larger value is taken as that
 maximum, `CONFIG GET` reports what was kept, and a warning naming the maximum is logged. `0`
@@ -155,10 +155,12 @@ A set past those limits (`OBJECT ENCODING` `hashtable`) is a table of its own: a
 to seven bytes (any integer of up to seven digits) lives in the table's slot, and any other is
 one block of a pool of slabs kept for collections. A hash past its limits is the same kind of
 table, each field and its value side by side in one block of that pool (a value too long for
-the pool's largest block in a block of the system allocator). The table grows and shrinks a few members
+the pool's largest block in a block of the system allocator). A sorted set past its limits
+(`skiplist`) is the same kind of table, each member and its score in one block of that pool,
+with an index of the members' order beside it. The table grows and shrinks a few members
 at a time with each write, and a resize that the writes leave part-way is finished in the
 background, so no write pays for moving every member at once. Active defrag does not move a
-set's members or a hash's fields: their slabs are not among those it empties, and each slab goes back to the
+set's or a sorted set's members or a hash's fields: their slabs are not among those it empties, and each slab goes back to the
 system as soon as its last member or field is removed. `INFO memory` reports those slabs as
 `value_slab_pool_bytes`, apart from `value_slab_bytes` (the keyspace's slabs, which defrag
 compacts).

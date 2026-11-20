@@ -22,23 +22,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// integer from a string, or to check that a structure is still in its
 /// small form. Values here are not kept in those forms; the answer is the
 /// form Redis would be keeping this value in, by Redis's default limits.
-/// Whether Redis would keep `value` in a compact encoding (`intset`,
-/// `listpack`). Redis scans those whole: `SSCAN`, `HSCAN` and `ZSCAN` of one
-/// reply with every element and cursor 0, whatever the cursor and `COUNT`
-/// say. Clients rely on it — BullMQ's dependency pagination expects a small
-/// set in one page.
-pub(crate) fn scans_whole(value: ValueRef<'_>) -> bool {
-    match value {
-        // By the form it is kept in (#297), as Redis goes by its encoding:
-        // an array or a block whole, a table a page at a time.
-        ValueRef::Set(set) => !set.read().is_table(),
-        ValueRef::Hash(hash) => !hash.read().is_table(),
-        ValueRef::HashEx(hash) => !hash.read().fields.is_table(),
-        ValueRef::SortedSet(zset) => zset.read().is_packed(),
-        _ => matches!(encoding_of(value), "listpack" | "listpackex"),
-    }
-}
-
 pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
     match value {
         ValueRef::String(bytes) => {
@@ -259,10 +242,7 @@ fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
         let map = read_lock!(shard);
         return match (map.peek(&key), field) {
             (Some(ValueRef::String(s)), None) => Some(s.to_vec()),
-            (Some(ValueRef::Hash(h)), Some(field)) => {
-                let name = crate::key_bytes::text_of(field);
-                h.read().get_bytes(&name).map(|v| v.to_vec())
-            }
+            (Some(ValueRef::Hash(h)), Some(field)) => h.read().get_bytes(field).map(|v| v.to_vec()),
             // A field past its deadline is what a hash command makes of it
             // (#415): removed first where this node removes fields, its
             // `HDEL` sent ahead of this `SORT`; kept where the stream or the
@@ -270,12 +250,11 @@ fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
             // out there as it did on the master; hidden from a reader
             // otherwise.
             (Some(ValueRef::HashEx(h)), Some(field)) => {
-                let name = crate::key_bytes::text_of(field);
                 let inner = h.read();
-                let value = inner.fields.get_bytes(&name)?;
+                let value = inner.fields.get_bytes(field)?;
                 if inner
                     .expiries
-                    .get(&*name)
+                    .get(field)
                     .is_none_or(|at| !crate::types::field_due(*at, now))
                 {
                     return Some(value.to_vec());

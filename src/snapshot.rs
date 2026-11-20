@@ -708,7 +708,7 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
             let inner = arc.read();
             w.write_all(&(inner.len() as u32).to_le_bytes())?;
             for (field, val) in inner.iter() {
-                write_bytes(w, field.as_bytes())?;
+                write_bytes(w, &crate::hash_fields::saved_name(field))?;
                 write_bytes(w, &val)?;
             }
         }
@@ -896,14 +896,14 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
             let inner = arc.read();
             w.write_all(&(inner.fields.len() as u32).to_le_bytes())?;
             for (field, val) in inner.fields.iter() {
-                write_bytes(w, field.as_bytes())?;
+                write_bytes(w, &crate::hash_fields::saved_name(field))?;
                 write_bytes(w, &val)?;
             }
             // Expiries: u32 count followed by (field, unix_ms) pairs, the
             // deadlines as they are kept (#594).
             w.write_all(&(inner.expiries.len() as u32).to_le_bytes())?;
             for (field, at) in inner.expiries.iter() {
-                write_bytes(w, field.as_bytes())?;
+                write_bytes(w, &crate::hash_fields::saved_name(field))?;
                 w.write_all(&at.to_le_bytes())?;
             }
         }
@@ -2460,13 +2460,23 @@ fn read_image_body(
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
                     let mut hmap = crate::types::HashFields::with_capacity(hint(count));
+                    let mut collisions = crate::hash_fields::Collisions::default();
                     for _ in 0..count {
                         let field_bytes = read_bytes(&mut r)?;
-                        let field = String::from_utf8(field_bytes).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "bad hash field")
-                        })?;
+                        let field =
+                            crate::hash_fields::loaded_name(&field_bytes).ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidData, "bad hash field")
+                            })?;
                         let val = read_bytes(&mut r)?;
-                        hmap.insert_loaded(field, &val)?;
+                        // Two spellings that stand for one field (a file no
+                        // writer makes): refused, not merged into one.
+                        let added = hmap.insert_loaded(&*field, &val)?;
+                        if !collisions.allows(&field_bytes, &field, added) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "duplicate hash field",
+                            ));
+                        }
                     }
                     KiviDBValue::Hash(crate::hash_fields::shared(hmap))
                 }
@@ -2498,9 +2508,9 @@ fn read_image_body(
                                 format!("{NAN_SCORE} in key '{}'", String::from_utf8_lossy(&key)),
                             ));
                         };
-                        ss.push(&member, score);
+                        ss.push_loaded(&member, score)?;
                     }
-                    KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(ss.finish())))
+                    KiviDBValue::SortedSet(crate::sorted_set::shared(ss.finish()))
                 }
                 TAG_STREAM | TAG_STREAM_V2 | TAG_STREAM_V3 => read_stream_value(&mut r, tag[0])?,
                 TAG_JSON => {
@@ -2746,13 +2756,23 @@ fn read_image_body(
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
                     let mut hmap = crate::types::HashFields::with_capacity(hint(count));
+                    let mut collisions = crate::hash_fields::Collisions::default();
                     for _ in 0..count {
                         let field_bytes = read_bytes(&mut r)?;
-                        let field = String::from_utf8(field_bytes).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "bad hash field")
-                        })?;
+                        let field =
+                            crate::hash_fields::loaded_name(&field_bytes).ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidData, "bad hash field")
+                            })?;
                         let val = read_bytes(&mut r)?;
-                        hmap.insert_loaded(field, &val)?;
+                        // Two spellings that stand for one field (a file no
+                        // writer makes): refused, not merged into one.
+                        let added = hmap.insert_loaded(&*field, &val)?;
+                        if !collisions.allows(&field_bytes, &field, added) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "duplicate hash field",
+                            ));
+                        }
                     }
                     // Expiries: each persisted Unix ms kept as it is (#594). A
                     // field whose time has passed is dropped, unless fields
@@ -2766,18 +2786,19 @@ fn read_image_body(
                     let now = crate::types::field_now();
                     for _ in 0..exp_count {
                         let field_bytes = read_bytes(&mut r)?;
-                        let field = String::from_utf8(field_bytes).map_err(|_| {
-                            io::Error::new(io::ErrorKind::InvalidData, "bad expiry field")
-                        })?;
+                        let field =
+                            crate::hash_fields::loaded_name(&field_bytes).ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidData, "bad expiry field")
+                            })?;
                         let mut ms_buf = [0u8; 8];
                         r.read_exact(&mut ms_buf)?;
                         let abs_ms = u64::from_le_bytes(ms_buf);
                         if !crate::types::field_due(abs_ms, now)
-                            || (keep_past && hmap.contains_key(&field))
+                            || (keep_past && hmap.contains_key(&*field))
                         {
-                            exps.insert(field, abs_ms);
+                            exps.insert(&*field, abs_ms);
                         } else {
-                            hmap.remove(&field);
+                            hmap.remove(&*field);
                         }
                     }
                     // Made with room for every field the file names: put
@@ -4008,10 +4029,10 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             for _ in 0..count {
                 let member = rdb_read_string(r)?;
                 let score = zset_score_or_error(rdb_read_double_v1(r)?)?;
-                ss.push(&member, score);
+                ss.push_loaded(&member, score)?;
             }
-            Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss.finish()),
+            Ok(Some(KiviDBValue::SortedSet(crate::sorted_set::shared(
+                ss.finish(),
             ))))
         }
         4 => {
@@ -4019,10 +4040,9 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             let (count, _) = rdb_read_length(r)?;
             let mut hmap = crate::types::HashFields::with_capacity(hint(count as usize));
             for _ in 0..count {
-                let field_bytes = rdb_read_string(r)?;
-                let field = crate::key_bytes::text_of(&field_bytes).into_owned();
+                let field = rdb_read_string(r)?;
                 let val = rdb_read_string(r)?;
-                hmap.insert_loaded(field, &val)?;
+                hmap.insert_loaded(&field, &val)?;
             }
             Ok(Some(KiviDBValue::Hash(crate::hash_fields::shared(hmap))))
         }
@@ -4035,10 +4055,10 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                 let mut score_buf = [0u8; 8];
                 r.read_exact(&mut score_buf)?;
                 let score = zset_score_or_error(f64::from_le_bytes(score_buf))?;
-                ss.push(&member, score);
+                ss.push_loaded(&member, score)?;
             }
-            Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss.finish()),
+            Ok(Some(KiviDBValue::SortedSet(crate::sorted_set::shared(
+                ss.finish(),
             ))))
         }
         // The numbers are Redis's (`RDB_TYPE_*` in rdb.h). Up to 1.1.0 most
@@ -4105,10 +4125,10 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                         io::Error::new(io::ErrorKind::InvalidData, "bad ziplist zset score")
                     })?;
                 let score = zset_score_or_error(score)?;
-                ss.push(&member, score);
+                ss.push_loaded(&member, score)?;
             }
-            Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss.finish()),
+            Ok(Some(KiviDBValue::SortedSet(crate::sorted_set::shared(
+                ss.finish(),
             ))))
         }
         13 => {
@@ -4120,8 +4140,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             let mut hmap = crate::types::HashFields::with_capacity(deque.len() / 2);
             let mut iter = deque.into_iter();
             while let (Some(field), Some(val)) = (iter.next(), iter.next()) {
-                let field_str = crate::key_bytes::text_of(&field).into_owned();
-                hmap.insert_owned(field_str, val);
+                hmap.insert_owned(field, val);
             }
             Ok(Some(KiviDBValue::Hash(crate::hash_fields::shared(hmap))))
         }
@@ -4148,9 +4167,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             // RDB_TYPE_ZSET_LISTPACK (Redis 7.0+).
             let blob = rdb_read_string(r)?;
             let ss = rdb_decode_listpack_into_zset(&blob)?;
-            Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss),
-            ))))
+            Ok(Some(KiviDBValue::SortedSet(crate::sorted_set::shared(ss))))
         }
         18 => {
             // RDB_TYPE_LIST_QUICKLIST_2 (Redis 7.0+): a count of nodes, each
@@ -4546,11 +4563,10 @@ fn rdb_read_hash_with_ttls(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBV
     let mut inner =
         crate::types::HashInner::from_fields(crate::types::HashFields::with_capacity(fields.len()));
     for (field, value, expires_at) in fields {
-        let field = crate::key_bytes::text_of(&field).into_owned();
         if expires_at != 0 {
-            inner.expiries.insert(field.clone(), expires_at);
+            inner.expiries.insert(&field, expires_at);
         }
-        inner.fields.insert_loaded(field, &value)?;
+        inner.fields.insert_loaded(&field, &value)?;
     }
     Ok(KiviDBValue::HashEx(crate::hash_fields::shared_ex(inner)))
 }
@@ -5154,8 +5170,7 @@ fn rdb_decode_listpack_into_hash(blob: &[u8]) -> io::Result<crate::types::HashFi
     let mut hmap = crate::types::HashFields::with_capacity(elements.len() / 2);
     let mut iter = elements.into_iter();
     while let (Some(field), Some(value)) = (iter.next(), iter.next()) {
-        let field = crate::key_bytes::text_of(&field).into_owned();
-        hmap.insert_loaded(field, &value)?;
+        hmap.insert_loaded(&field, &value)?;
     }
     Ok(hmap)
 }
@@ -5174,7 +5189,7 @@ fn rdb_decode_listpack_into_zset(blob: &[u8]) -> io::Result<SortedSetInner> {
             .and_then(|s| s.parse().ok())
             .ok_or_else(malformed_listpack)?;
         let score = zset_score_or_error(score)?;
-        ss.push(&member, score);
+        ss.push_loaded(&member, score)?;
     }
     Ok(ss.finish())
 }
@@ -6020,7 +6035,7 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
             let inner = arc.read();
             out.write_all(&(inner.len() as u32).to_le_bytes())?;
             for (field, val) in inner.iter() {
-                write_bytes_vec(out, field.as_bytes())?;
+                write_bytes_vec(out, &crate::hash_fields::saved_name(field))?;
                 write_bytes_vec(out, &val)?;
             }
         }
@@ -6085,12 +6100,12 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
             let inner = arc.read();
             out.write_all(&(inner.fields.len() as u32).to_le_bytes())?;
             for (field, val) in inner.fields.iter() {
-                write_bytes_vec(out, field.as_bytes())?;
+                write_bytes_vec(out, &crate::hash_fields::saved_name(field))?;
                 write_bytes_vec(out, &val)?;
             }
             out.write_all(&(inner.expiries.len() as u32).to_le_bytes())?;
             for (field, at) in inner.expiries.iter() {
-                write_bytes_vec(out, field.as_bytes())?;
+                write_bytes_vec(out, &crate::hash_fields::saved_name(field))?;
                 out.write_all(&at.to_le_bytes())?;
             }
         }
@@ -6166,11 +6181,16 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             let mut pos = 4usize;
             // The payload's word for the count: a hint, no more (`hint`).
             let mut map = crate::types::HashFields::with_capacity(hint(count));
+            let mut collisions = crate::hash_fields::Collisions::default();
             for _ in 0..count {
                 let (field_bytes, next) = read_bytes_slice(payload, pos)?;
-                let field = String::from_utf8(field_bytes.to_vec()).ok()?;
+                let field = crate::hash_fields::loaded_name(field_bytes)?;
                 let (val_bytes, next2) = read_bytes_slice(payload, next)?;
-                map.insert_loaded(field, val_bytes).ok()?;
+                // Two spellings of one field: not a payload any writer makes.
+                let added = map.insert_loaded(&*field, val_bytes).ok()?;
+                if !collisions.allows(field_bytes, &field, added) {
+                    return None;
+                }
                 pos = next2;
             }
             Some(KiviDBValue::Hash(crate::hash_fields::shared(map)))
@@ -6204,12 +6224,12 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 let score = zset_score(f64::from_bits(u64::from_le_bytes(
                     payload[next..next + 8].try_into().ok()?,
                 )))?;
-                ss.push(member_bytes, score);
+                ss.push_loaded(member_bytes, score).ok()?;
                 pos = next + 8;
             }
-            Some(KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(
+            Some(KiviDBValue::SortedSet(crate::sorted_set::shared(
                 ss.finish(),
-            ))))
+            )))
         }
         TAG_JSON => {
             let (bytes, _) = read_bytes_slice(payload, 0)?;
@@ -6232,11 +6252,16 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             let mut pos = 4usize;
             // The payload's word for the count: a hint, no more (`hint`).
             let mut map = crate::types::HashFields::with_capacity(hint(count));
+            let mut collisions = crate::hash_fields::Collisions::default();
             for _ in 0..count {
                 let (field_bytes, next) = read_bytes_slice(payload, pos)?;
-                let field = String::from_utf8(field_bytes.to_vec()).ok()?;
+                let field = crate::hash_fields::loaded_name(field_bytes)?;
                 let (val_bytes, next2) = read_bytes_slice(payload, next)?;
-                map.insert_loaded(field, val_bytes).ok()?;
+                // Two spellings of one field: not a payload any writer makes.
+                let added = map.insert_loaded(&*field, val_bytes).ok()?;
+                if !collisions.allows(field_bytes, &field, added) {
+                    return None;
+                }
                 pos = next2;
             }
             // Expiries
@@ -6248,7 +6273,7 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             let mut exps = crate::types::Expiries::new();
             for _ in 0..exp_count {
                 let (field_bytes, next) = read_bytes_slice(payload, pos)?;
-                let field = String::from_utf8(field_bytes.to_vec()).ok()?;
+                let field = crate::hash_fields::loaded_name(field_bytes)?;
                 if next + 8 > payload.len() {
                     return None;
                 }
@@ -6262,8 +6287,8 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 // was gone on a replica that restored it a moment later. It
                 // keeps its expiry either way: kept without one, it lived on
                 // for good (a field `MIGRATE` read just as it ran out).
-                if map.contains_key(&field) {
-                    exps.insert(field, abs_ms);
+                if map.contains_key(&*field) {
+                    exps.insert(&*field, abs_ms);
                 }
             }
             let inner = crate::types::HashInner {
@@ -6862,7 +6887,9 @@ mod field_deadline_tests {
             panic!("not a hash with field TTLs");
         };
         let hash = hash.read();
-        (0..n).map(|i| hash.expiries[&format!("f{i}")]).collect()
+        (0..n)
+            .map(|i| hash.expiries[format!("f{i}").as_str()])
+            .collect()
     }
 
     /// The bounds `field_deadline_ms` puts on a deadline a command gives.
@@ -6909,6 +6936,69 @@ mod field_deadline_tests {
         let _hold = crate::expiry::hold();
         let loaded = load_snapshot_from(&out[..]).unwrap();
         assert_eq!(read_back(&loaded.dbs[0][&b"h"[..]], want.len()), want);
+    }
+
+    /// A file or a payload whose hash names one field twice, in two
+    /// spellings (`é`, and U+F7C3 U+F7A9, which stands for the same two
+    /// bytes): refused, not loaded as one field where the count says two.
+    /// (A name repeated alike is set twice, as before: see
+    /// `a_payload_naming_a_field_twice_keeps_its_first_place_and_last_value`.)
+    #[test]
+    fn two_spellings_of_one_field_are_refused() {
+        let other = "\u{F7C3}\u{F7A9}".as_bytes();
+        let hash = |second: &[u8]| {
+            let mut fields = crate::types::HashFields::new();
+            fields.insert_bytes("\u{e9}", b"1");
+            fields.insert_bytes(second, b"2");
+            KiviDBValue::Hash(crate::hash_fields::shared(fields))
+        };
+        // Written with a stand-in of the same length, put back by hand.
+        let swap = |mut bytes: Vec<u8>| {
+            let at = bytes
+                .windows(6)
+                .position(|w| w == b"zzzzzz")
+                .expect("the stand-in");
+            bytes[at..at + 6].copy_from_slice(other);
+            bytes
+        };
+        let mut payload = Vec::new();
+        serialize_value(&hash(b"zzzzzz"), &mut payload).unwrap();
+        assert!(deserialize_value(&payload).is_some());
+        assert!(deserialize_value(&swap(payload)).is_none());
+        // Such a spelling alone (1.2.0 kept a name given to `HIMPORT` so) is
+        // read as before.
+        let mut alone = crate::types::HashFields::new();
+        alone.insert_bytes("zzzzzz", b"2");
+        let mut payload = Vec::new();
+        serialize_value(
+            &KiviDBValue::Hash(crate::hash_fields::shared(alone)),
+            &mut payload,
+        )
+        .unwrap();
+        let Some(KiviDBValue::Hash(read)) = deserialize_value(&swap(payload)) else {
+            panic!("refused");
+        };
+        assert_eq!(read.read().get_bytes("\u{e9}"), Some(&b"2"[..]));
+
+        let mut image = Vec::new();
+        write_kdb_header(&mut image, 1).unwrap();
+        write_kdb_entry(&mut image, "h", hash(b"zzzzzz").view()).unwrap();
+        write_kdb_db_end(&mut image).unwrap();
+        write_kdb_expiry_maps(&mut image, &[HashMap::<Key, u64>::new()]).unwrap();
+        assert!(load_snapshot_from(&image[..]).is_ok());
+        let err = load_snapshot_from(&swap(image)[..]).err().expect("refused");
+        assert!(err.to_string().contains("duplicate hash field"), "{err}");
+
+        // With field TTLs too.
+        let mut inner = crate::types::HashInner::new();
+        inner.fields.insert_bytes("\u{e9}", b"1");
+        inner.fields.insert_bytes("zzzzzz", b"2");
+        inner.expiries.insert("zzzzzz", 4_102_444_800_000);
+        let ex = KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner)));
+        let mut payload = Vec::new();
+        serialize_value(&ex, &mut payload).unwrap();
+        assert!(deserialize_value(&payload).is_some());
+        assert!(deserialize_value(&swap(payload)).is_none());
     }
 
     /// Bytes as 1.2.0 writes them: a KDB image and a `DUMP` payload of `h`,
@@ -7058,7 +7148,7 @@ mod expiry_section_tests {
         let mut hash = crate::types::HashInner::new();
         hash.fields.insert_bytes("field", b"value");
         hash.expiries
-            .insert("field".to_string(), crate::types::field_now() - 1_000);
+            .insert("field", crate::types::field_now() - 1_000);
         let db0 = HashMap::from([(
             Key::from("hxgone"),
             KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(hash))),
@@ -7084,7 +7174,7 @@ mod expiry_section_tests {
             hash.fields.insert_bytes("gone", b"1");
             hash.fields.insert_bytes("live", b"2");
             hash.expiries
-                .insert("gone".to_string(), crate::types::field_now() - 1_000);
+                .insert("gone", crate::types::field_now() - 1_000);
             KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(hash)))
         };
         let fields_of = |value: &KiviDBValue| match value {
@@ -7093,7 +7183,12 @@ mod expiry_section_tests {
                 let mut f: Vec<(String, bool)> = h
                     .fields
                     .keys()
-                    .map(|k| (k.to_owned(), h.expiries.contains_key(k)))
+                    .map(|k| {
+                        (
+                            String::from_utf8(k.to_vec()).unwrap(),
+                            h.expiries.contains_key(k),
+                        )
+                    })
                     .collect();
                 f.sort();
                 f
@@ -8041,7 +8136,7 @@ mod empty_key_tests {
             assert_eq!(hash.get_bytes("f1"), Some(&b"again"[..]));
             if !hash.is_table() {
                 // A block keeps the field where it was first set.
-                assert_eq!(hash.keys().nth(1), Some("f1"));
+                assert_eq!(hash.keys().nth(1), Some(&b"f1"[..]));
             }
         }
     }

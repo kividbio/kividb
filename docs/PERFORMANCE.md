@@ -198,14 +198,23 @@ Azure `Standard_D4s_v5`:
 | 10 | 118.8 | 29.6 | 24.8 | 118.8 | 37.6 | 28.0 |
 | 100 | 116.4 | 19.3 | 21.0 | 116.4 | 27.3 | 26.2 |
 | 128 | 131.7 | 19.0 | 20.4 | 131.7 | 27.0 | 24.4 |
-| 129 | 130.9 | 131.2 | 78.9 | 130.9 | 131.2 | 78.3 |
-| 1,000 | 132.5 | 132.5 | 67.8 | 132.5 | 132.5 | 68.4 |
+| 129 | 130.9 | 79.1 | 79.1 | 130.9 | 79.1 | 78.8 |
+| 1,000 | 132.5 | 76.4 | 68.0 | 132.5 | 76.4 | 68.0 |
+| 100,000 | 113.7 | 72.1 | 74.2 | 113.7 | 72.1 | 74.2 |
+| 3,000,000 | 115.9 | 71.9 | 75.2 | 115.9 | 71.9 | 75.2 |
 
 Measured a key at a time as #297 measured it (100,000 sets of 10 members of
 8 bytes, scores 0 to 9): 274 bytes of RSS a key (1.2.2: 1,249; Redis: 186),
 236 of `used_memory` (1,108; 176). What is left over Redis is mostly the
-key's own entry and the set's header. Sets past 128 members are a table and
-a tree as before; making those smaller is the next step. Suite
+key's own entry and the set's header. The rows from 129 members on are
+from an Azure `Standard_D8s_v5` (suite 31's recorded run, one set each of
+100,000 and 3,000,000): past 128 members a sorted set is a table of
+members, each member and its score in one block of the collections' pool,
+and an index of their order (a B-tree) that holds each member as the
+address of its block. Of the bytes a member at 3,000,000 (16-byte
+members), the table takes 45.7 and the index 34 when members come in
+order one `ZADD` at a time, 27 at random, 18 for a set built whole (a
+load, `RESTORE`); see `benchmarks/1.3.0/large-zsets`. Suite
 `31-zset-memory` of
 [the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
 the table again and fails a build that loses it.

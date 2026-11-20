@@ -99,9 +99,9 @@ fn a_valkey_9_hash_with_field_ttls_loads_with_them() {
         panic!("h is not a hash with field TTLs");
     };
     let h = h.read();
-    let mut fields: Vec<&str> = h.fields.keys().collect();
+    let mut fields: Vec<&[u8]> = h.fields.keys().collect();
     fields.sort_unstable();
-    assert_eq!(fields, ["a", "b", "gone"]);
+    assert_eq!(fields, [&b"a"[..], b"b", b"gone"]);
     assert_eq!(&h.fields["a"][..], b"1");
     assert_eq!(h.expiries.len(), 2, "b has no TTL");
     assert!(h.expiries["gone"] < now_ms(), "gone is due");
@@ -272,7 +272,7 @@ fn rdb_files_saved_by_valkey_9_0_and_9_1_load_whole() {
             let mut ttls: Vec<(String, u64)> = h
                 .expiries
                 .iter()
-                .map(|(field, at)| (field.clone(), *at))
+                .map(|(field, at)| (String::from_utf8(field.to_vec()).unwrap(), *at))
                 .collect();
             ttls.sort();
             ttls
