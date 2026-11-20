@@ -3,6 +3,9 @@
 # against KiviDB, and compares the results check by check (compare.py).
 #
 #   KIVIDB_IMAGE, REDIS_IMAGE  the servers, both pinned (required)
+#   KIVIDB_LUA_IMAGE           the image for a harness that needs scripting (its folder has a
+#                              `kividb-variant` file saying `lua`): default $KIVIDB_IMAGE-lua, the
+#                              tag of the `lua` variant (release.yml); unchanged if it already ends in -lua or -full
 #   OUT                        where the results go (default ./compat-results)
 #   WORK                       where the harness sets itself up (default ./compat-work)
 #   PORT                       the server's port (default 6379)
@@ -23,6 +26,15 @@ OUT=$(mkdir -p "${OUT:-compat-results}" && cd "${OUT:-compat-results}" && pwd)
 WORK=$(mkdir -p "${WORK:-compat-work}/$NAME" && cd "${WORK:-compat-work}/$NAME" && pwd)
 PORT=${PORT:-6379}
 CONTAINER=compat-$NAME
+
+# A harness whose checks need scripts (Lua) runs against the `lua` variant of the KiviDB image.
+KIVIDB_RUN_IMAGE=$KIVIDB_IMAGE
+if [ "$(cat "$(dirname "$HARNESS")/kividb-variant" 2>/dev/null)" = lua ]; then
+  case $KIVIDB_IMAGE in
+  *-lua | *-full) ;;
+  *) KIVIDB_RUN_IMAGE=${KIVIDB_LUA_IMAGE:-$KIVIDB_IMAGE-lua} ;;
+  esac
+fi
 
 summary() { if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then tee -a "$GITHUB_STEP_SUMMARY"; else cat; fi; }
 
@@ -59,7 +71,7 @@ echo "::endgroup::"
 down=()
 for side in redis kividb; do
   image=$REDIS_IMAGE label=Redis
-  [ "$side" = kividb ] && image=$KIVIDB_IMAGE label=KiviDB
+  [ "$side" = kividb ] && image=$KIVIDB_RUN_IMAGE label=KiviDB
   result=$OUT/$NAME-$side.xml
   rm -f "$result"
   echo "::group::$NAME: against $side ($image)"
