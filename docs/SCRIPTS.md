@@ -246,6 +246,17 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   that has no tag, runs alone and may touch what it likes. So do functions
   (`FCALL`), and scripts inside `MULTI`/`EXEC`.
 
+- **Scripts that run alone and come while one is running are run right
+  after it, on the same thread.** Once a script has been seen to be quick,
+  the thread that runs it also runs the quick scripts that came meanwhile,
+  one after another, for up to 200 microseconds, and only then lets the
+  other commands in. Every other command waits once for all of them, not
+  once for each, and each script is still alone: no command runs beside it
+  or between two of them. A server with many such scripts beside plain
+  commands (a lock's compare-and-delete, a rate limiter with no hash tag)
+  answers the plain commands about as fast as with no scripts at all. The
+  script-runner thread runs the ones left over when no script is running.
+
 - **A command from a client waits for a script on its tag.** `GET
   {orders}:waiting` sent while a script on `orders` is running is answered
   when the script has finished; so is a command naming a key of any of the
@@ -353,7 +364,7 @@ that a server running its scripts one at a time shows it without
 | `scripts_run_alone_no_keys` | ran alone because it has no `KEYS` |
 | `scripts_run_alone_no_tag` | ran alone because a key of its `KEYS` has no hash tag |
 | `scripts_run_alone_not_quick` | ran alone because it has not (or not yet) been seen to be quick |
-| `scripts_handed_to_runner` | (alone, and quick) came while another script was running, and was run by the script-runner thread |
+| `scripts_handed_to_runner` | (alone, and quick) came while another script was running, and was run by the thread running that one, or by the script-runner thread |
 | `scripts_offloaded_to_pool` | (not yet seen to be quick, or seen to be slow) was run on a thread of the blocking pool |
 
 A script that runs alone is counted under the first reason in the table
@@ -364,7 +375,8 @@ then run, is counted each time it got that far. `scripts_handed_to_runner`
 and `scripts_offloaded_to_pool` are a second view of the scripts counted as
 run alone (a script in one of them is also in a `scripts_run_alone_*`
 field): handed to the runner is a quick script that runs alone and came
-while another script was running; offloaded to the pool is one not yet
+while another script was running, run after it by the same thread or by the
+script-runner thread; offloaded to the pool is one not yet
 known to be quick, or demoted as slow.
 Scripts applied by a replica from its master, or replayed from the AOF,
 are not counted. `CONFIG RESETSTAT` sets them all to 0. A build without

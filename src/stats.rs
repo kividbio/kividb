@@ -277,8 +277,8 @@ pub mod scripts {
         ALONE[why as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A quick script is handed to the script-runner thread: another script
-    /// was running when it came.
+    /// A quick script is queued for the thread running another script when
+    /// it came, or for the script-runner thread (`lua_vm_blocking`).
     pub fn handed_to_runner() {
         HANDED_TO_RUNNER.fetch_add(1, Ordering::Relaxed);
     }

@@ -315,10 +315,8 @@ path around the call (the connection loop and the script command's way to the VM
 than in the script: the call's own time (`usec_per_call`) is 0.42 µs against Redis's 0.67 for
 `return 1`, and 6.4 against 7.4 µs for Tyk's. The count hook
 behind `SCRIPT KILL` and `lua-time-limit` makes Lua 5.4 trace every instruction, 3-4 % of a
-call. And an untagged script that meets another one running is handed to the script-runner
-thread and back: with two workers busy, Tyk's script cost 9.2 µs of CPU on the runner and
-11.8 µs on the workers a call, against 12.8-13.4 µs on one worker that runs it itself; that is
-how scripts are scheduled, [#880](https://github.com/kividbio/kividb/issues/880).
+call. And an untagged script that meets another one running is queued, and run after it by
+the thread running that one (see "Scripts that run alone, beside plain commands" below).
 
 All of it was measured with a Go client (the scripts above, one command at a time per
 connection), `/proc` for the server's CPU, `INFO commandstats` for the calls, and callgrind

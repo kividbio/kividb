@@ -1402,3 +1402,182 @@ fn overlapping_tags_end_the_same(io: &str) {
         assert_eq!(replayed[i], before[i], "AOF replay: {k}");
     }
 }
+
+// ── Plain commands beside scripts that run alone (#880) ──────────────────────
+
+impl Conn {
+    /// `calls`, sent at once, and their replies, in order.
+    fn pipeline(&mut self, calls: &[Vec<String>]) -> Vec<V> {
+        let mut buf = Vec::new();
+        for args in calls {
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(a.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+        }
+        self.writer.write_all(&buf).unwrap();
+        calls.iter().map(|_| self.read()).collect()
+    }
+}
+
+/// Untagged keys: the script runs alone, and every other command waits for it.
+/// It writes three keys, one `redis.call` at a time.
+const THREE_KEYS: &str = "local n = redis.call('INCR', KEYS[1]) \
+     redis.call('SET', KEYS[2], n) redis.call('SET', KEYS[3], n) return n";
+
+/// `connections` connections, each sending `EVALSHA` of `sha` on `keys` in
+/// pipelines of 16 until `stop`: the scripts they ran.
+fn script_stream(
+    port: u16,
+    sha: &str,
+    keys: &[&str],
+    connections: usize,
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<std::thread::JoinHandle<usize>> {
+    (0..connections)
+        .map(|_| {
+            let stop = stop.clone();
+            let mut call = vec!["EVALSHA".to_string(), sha.to_string(), keys.len().to_string()];
+            call.extend(keys.iter().map(|k| k.to_string()));
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let calls = vec![call; 16];
+                let mut ran = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for reply in c.pipeline(&calls) {
+                        assert!(matches!(reply, V::Int(_)), "{reply:?}");
+                        ran += 1;
+                    }
+                }
+                ran
+            })
+        })
+        .collect()
+}
+
+/// While connections send script after script that runs alone (its key has no
+/// tag), a plain command on another connection is answered within a bound
+/// each time, and the scripts go on running meanwhile: neither keeps the
+/// other out. On both I/O loops.
+#[test]
+fn a_plain_command_is_answered_beside_a_stream_of_alone_scripts() {
+    plain_beside_alone_scripts("tokio");
+}
+
+#[test]
+fn a_plain_command_is_answered_beside_a_stream_of_alone_scripts_uring() {
+    plain_beside_alone_scripts("uring");
+}
+
+fn plain_beside_alone_scripts(io: &str) {
+    let server = Server::start(&["--io-model", io]);
+    let mut c = server.conn();
+    let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", THREE_KEYS]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    assert!(c.cmd(&["SET", "plain", "v"]).ok());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let streams = script_stream(server.port, &sha, &["n", "n:a", "n:b"], 8, &stop);
+    // Under way, and quick: handed from one thread to another.
+    wait_until("the scripts to run", 30, || {
+        c.info("stats", "scripts_run_alone_no_tag").parse::<u64>().unwrap() > 2000
+    });
+    let before: u64 = c.info("stats", "scripts_run_alone_no_tag").parse().unwrap();
+    let mut probe = server.conn();
+    let mut worst = Duration::ZERO;
+    let mut waits = Vec::new();
+    for _ in 0..2000 {
+        let t = Instant::now();
+        assert_eq!(probe.cmd(&["GET", "plain"]), V::Str("v".into()));
+        let took = t.elapsed();
+        worst = worst.max(took);
+        waits.push(took);
+    }
+    let after: u64 = c.info("stats", "scripts_run_alone_no_tag").parse().unwrap();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ran: usize = streams.into_iter().map(|s| s.join().unwrap()).sum();
+    waits.sort();
+    let p99 = waits[waits.len() * 99 / 100];
+    eprintln!(
+        "{io}: GET beside alone scripts: p50 {:?}, p99 {p99:?}, worst {worst:?}; {} scripts \
+         meanwhile, {ran} in all",
+        waits[waits.len() / 2],
+        after - before
+    );
+    // A debug build on a loaded test machine: bounds far above a wait for a
+    // few scripts, far below a command kept out until the stream ends.
+    assert!(
+        worst < Duration::from_secs(2) && p99 < Duration::from_millis(250),
+        "a GET waited {worst:?} (p99 {p99:?}) beside the scripts"
+    );
+    assert!(
+        after > before + 1000,
+        "the scripts stopped while the GETs ran: {before} -> {after}"
+    );
+    assert!(ran > 2000);
+}
+
+/// A script that runs alone is never seen half done, however many of them
+/// run back to back from many connections: each `MGET` of its three keys
+/// finds them all equal (none of them written yet, or all by the same run).
+/// On both I/O loops.
+#[test]
+fn a_reader_never_sees_an_alone_script_half_done() {
+    alone_script_never_half_done("tokio");
+}
+
+#[test]
+fn a_reader_never_sees_an_alone_script_half_done_uring() {
+    alone_script_never_half_done("uring");
+}
+
+fn alone_script_never_half_done(io: &str) {
+    let server = Server::start(&["--io-model", io]);
+    let mut c = server.conn();
+    let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", THREE_KEYS]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let streams = script_stream(server.port, &sha, &["k", "k:a", "k:b"], 6, &stop);
+    let port = server.port;
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let mut r = Conn::connect(port);
+                let (mut reads, mut last) = (0u64, 0i64);
+                while reads < 20_000 {
+                    let V::Arr(values) = r.cmd(&["MGET", "k", "k:a", "k:b"]) else {
+                        panic!("MGET did not answer with an array")
+                    };
+                    let seen: Vec<Option<i64>> = values
+                        .iter()
+                        .map(|v| match v {
+                            V::Nil => None,
+                            v => Some(v.s().parse().unwrap()),
+                        })
+                        .collect();
+                    assert!(
+                        seen.iter().all(|v| *v == seen[0]),
+                        "a script seen half done: {seen:?}"
+                    );
+                    let n = seen[0].unwrap_or(0);
+                    assert!(n >= last, "went back from {last} to {n}");
+                    last = n;
+                    reads += 1;
+                }
+                last
+            })
+        })
+        .collect();
+    let lasts: Vec<i64> = readers.into_iter().map(|r| r.join().unwrap()).collect();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ran: usize = streams.into_iter().map(|s| s.join().unwrap()).sum();
+    let V::Str(k) = c.cmd(&["GET", "k"]) else {
+        panic!("no k")
+    };
+    assert_eq!(k.parse::<usize>().unwrap(), ran);
+    // The readers saw the scripts run, not just before or after all of them.
+    assert!(lasts.iter().any(|&n| n > 0 && (n as usize) < ran), "{lasts:?} of {ran}");
+}

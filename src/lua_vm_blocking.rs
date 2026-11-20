@@ -9,6 +9,13 @@
 //! scripts ran at about a sixteenth of Redis's rate. So a script is offloaded only until it has
 //! shown itself to be quick (`FAST_SCRIPTS`): after one run under `PROMOTE_US` it runs on the
 //! worker, like any other command, and one run over `DEMOTE_US` there sends it back to the pool.
+//!
+//! Quick scripts that run alone take turns (`Turn`). Whoever has the turn also runs the ones that
+//! came meanwhile (`Runner::run_queued`), one after another, with the command gate closed once
+//! for them all (`command_gate::enter_alone_for_a_run`), for up to `RUN_FOR`; the script-runner
+//! thread takes the ones left when nobody else has the turn. It used to take every one of them:
+//! a fifth busy thread beside four workers on four CPUs, it waited for a CPU while it held the
+//! gate or while scripts queued for it, and the commands of every thread waited with it (#880).
 
 #[cfg(feature = "lua")]
 use crate::commands::ctx::Ctx;
@@ -209,7 +216,8 @@ fn ran_quick(key: u64, db: usize, run: impl FnOnce() -> (Vec<u8>, usize)) -> Don
 
 /// Whether a quick script is running, here or on the runner thread: they take
 /// turns, so that the command gate — which each of them takes alone — is
-/// never fought over by several threads at once.
+/// never fought over by several threads at once. Whoever has the turn also
+/// runs the scripts that came meanwhile (`Runner::run_queued`).
 #[cfg(feature = "lua")]
 static SCRIPT_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -222,7 +230,7 @@ impl Turn {
     fn take() -> Option<Turn> {
         use std::sync::atomic::Ordering;
         SCRIPT_RUNNING
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
             // Not `then_some(Turn)`: that would make a `Turn` either way, and
             // dropping it gives up a turn — somebody else's.
@@ -233,18 +241,39 @@ impl Turn {
 #[cfg(feature = "lua")]
 impl Drop for Turn {
     fn drop(&mut self) {
-        SCRIPT_RUNNING.store(false, std::sync::atomic::Ordering::Release);
-        // Scripts that arrived meanwhile are the runner's.
+        use std::sync::atomic::Ordering;
+        // Given up, and then the queue looked at; `Runner::submit` does the
+        // two the other way round, so one of them sees the other: a script
+        // queued as the turn is given up is never left with nobody to run it.
+        SCRIPT_RUNNING.store(false, Ordering::SeqCst);
+        // Scripts left, or that arrived as it ended, are the runner's.
         if let Some(runner) = RUNNER.get()
-            && runner.waiting.load(std::sync::atomic::Ordering::Acquire) > 0
+            && runner.waiting.load(Ordering::SeqCst) > 0
         {
             runner.thread.unpark();
         }
     }
 }
 
-/// The thread that runs quick scripts when more than one is asked for at
-/// once: one after another, with nothing to wait for between them.
+/// How long whoever has the turn goes on running the scripts that came while
+/// it ran its own, before it lets the gate open: they are run with the gate
+/// closed once for them all, not once for each. Bounded, so that the
+/// commands beside them wait for one run at most; a run that ends with
+/// scripts left wakes the runner thread (`Turn`'s drop). Measured with four
+/// workers on four CPUs (#880): at 50 us runs ended with scripts left too
+/// often, and the runner's wakes, a fifth busy thread, brought the waits
+/// back; 100, 200 and 400 us gave the same latencies.
+#[cfg(feature = "lua")]
+const RUN_FOR: std::time::Duration = std::time::Duration::from_micros(200);
+
+/// How long a run waits for the gate before it asks whether a script running
+/// elsewhere is past its time limit (see `command_gate::enter_unless`).
+#[cfg(feature = "lua")]
+const GATE_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The queue of quick scripts that came while another one was running, and
+/// the thread that runs them when nobody else has the turn: one after
+/// another, with nothing to wait for between them.
 #[cfg(feature = "lua")]
 struct Runner {
     queue:
@@ -280,47 +309,69 @@ fn runner() -> &'static Runner {
 
 #[cfg(feature = "lua")]
 impl Runner {
+    /// Queue a script. Whoever has the turn runs it; the runner thread is
+    /// woken only when nobody has (see `Turn`'s drop for the other side).
     fn submit(&self, job: Job, reply: tokio::sync::oneshot::Sender<Done>) {
         use std::sync::atomic::Ordering;
         self.queue.lock().push_back((job, reply));
-        self.waiting.fetch_add(1, Ordering::Release);
-        self.thread.unpark();
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        if !SCRIPT_RUNNING.load(Ordering::SeqCst) {
+            self.thread.unpark();
+        }
+    }
+
+    /// Run queued scripts, by the thread that has the turn and holds the gate
+    /// alone for a run (`command_gate::enter_alone_for_a_run`), until none is
+    /// left or `RUN_FOR` has passed since `since`.
+    fn run_queued(&self, since: std::time::Instant) {
+        use std::sync::atomic::Ordering;
+        while since.elapsed() < RUN_FOR {
+            let next = self.queue.lock().pop_front();
+            let Some((job, reply)) = next else { break };
+            self.waiting.fetch_sub(1, Ordering::SeqCst);
+            // The client may have gone; its script has run all the same.
+            let _ = reply.send(job.run());
+        }
     }
 
     fn run(&self) {
         use std::sync::atomic::Ordering;
-        /// How long to keep looking for work before sleeping: under load
-        /// the next script is microseconds away, and a sleeping thread takes
-        /// far longer than that to wake.
-        const SPIN: std::time::Duration = std::time::Duration::from_micros(100);
-        let mut idle_since = std::time::Instant::now();
         loop {
-            if self.waiting.load(Ordering::Acquire) == 0 {
-                if idle_since.elapsed() < SPIN {
-                    std::hint::spin_loop();
-                } else {
-                    // `unpark` before this `park` makes it return at once.
-                    std::thread::park();
-                    idle_since = std::time::Instant::now();
-                }
+            // Asleep until there is work and nobody else to do it: a submit
+            // with no turn taken, or a turn given up with scripts left, wakes
+            // it. `unpark` before this `park` makes it return at once.
+            if self.waiting.load(Ordering::SeqCst) == 0 {
+                std::thread::park();
                 continue;
             }
-            // A script running on a worker thread is nearly done: wait for it.
+            // Whoever has the turn runs what is queued, or wakes this thread
+            // when it gives the turn up with scripts left.
             let Some(turn) = Turn::take() else {
-                std::hint::spin_loop();
+                std::thread::park();
                 continue;
             };
-            loop {
-                let next = self.queue.lock().pop_front();
-                let Some((job, reply)) = next else { break };
-                self.waiting.fetch_sub(1, Ordering::Release);
-                // The client may have gone; its script has run all the same.
-                let _ = reply.send(job.run());
+            while self.waiting.load(Ordering::SeqCst) > 0 {
+                let started = std::time::Instant::now();
+                match crate::command_gate::enter_alone_for_a_run(
+                    GATE_SLICE,
+                    crate::commands::running_script_is_over_its_time_limit,
+                ) {
+                    Some(_run) => self.run_queued(started),
+                    // A script elsewhere is past its time limit and holds the
+                    // gate: the next queued one is run on its own, and told
+                    // `BUSY` as it would have been.
+                    None => {
+                        let next = self.queue.lock().pop_front();
+                        let Some((job, reply)) = next else { break };
+                        self.waiting.fetch_sub(1, Ordering::SeqCst);
+                        let _ = reply.send(job.run());
+                    }
+                }
             }
-            // Not through `Drop`: that would wake this very thread.
+            // Not through `Drop`: that would wake this very thread. A script
+            // queued as the turn is given up is found by the look at the top.
             std::mem::forget(turn);
-            SCRIPT_RUNNING.store(false, Ordering::Release);
-            idle_since = std::time::Instant::now();
+            SCRIPT_RUNNING.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -378,19 +429,35 @@ pub(crate) async fn run_lua_vm_blocking(
         }
         let (resp, sel_out, elapsed_us) = match Turn::take() {
             // No other script is running: run this one here, on the command
-            // where it lies.
+            // where it lies, and then the ones that came meanwhile, with the
+            // gate closed once for them all (`Runner::run_queued`). If a
+            // script elsewhere is past its time limit and holds the gate,
+            // this one is run on its own, and told `BUSY`.
             Some(turn) => {
+                let started = std::time::Instant::now();
+                let run = crate::command_gate::enter_alone_for_a_run(
+                    GATE_SLICE,
+                    crate::commands::running_script_is_over_its_time_limit,
+                );
                 let done = ran_quick(key, sel, || {
                     env.run_execute_borrowed(cmd.to_vec(), sel, aof_enabled, client_resp)
                 });
+                // None queued if there is no runner yet.
+                if run.is_some()
+                    && let Some(runner) = RUNNER.get()
+                {
+                    runner.run_queued(started);
+                }
+                drop(run);
                 drop(turn);
                 done
             }
             // One is. Scripts run one at a time, and a worker thread that
             // waited for its turn would be woken for it — a thread hand-off
             // for every script, which is what made scripts slow under load.
-            // The runner thread takes them one after another instead, and
-            // this connection waits without holding its worker.
+            // So it is queued: whoever has the turn runs it before giving
+            // the turn up, or the runner thread does, and this connection
+            // waits without holding its worker.
             None => {
                 let job = Job {
                     env: env.clone(),
