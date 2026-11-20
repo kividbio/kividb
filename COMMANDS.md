@@ -1407,11 +1407,13 @@ a replica does not stand. `CLUSTER FAILOVER` is not subject to either.
 `CLUSTER FAILOVER` (with or without `FORCE`), says in its request which slots
 it would take over: those its master owns in its view, at its master's
 config epoch. A master that knows a newer owner of one of them refuses its
-vote, as in Redis, and answers with that owner, its config epoch and its
-slots (Redis's `UPDATE`). The replica takes that in as if the owner had told
-it itself, and asks again for the slots its master still has; so a replica
-that cannot reach the new owner (down, or cut off from it) is still elected,
-within its first election, and never takes the slots that moved. If its
+vote, as in Redis, and answers with that owner and the slots it last claimed
+in its own heartbeat to that master, at the epochs it gave (Redis's
+`UPDATE`). The replica takes that in as if the owner had told it itself, and
+asks again for the slots its master still has; so a replica that cannot
+reach the new owner (down, or cut off from it) is still elected within its
+first election, provided the masters it asks have heard that owner directly
+since they last started, and never takes the slots that moved. If its
 master has no slots left, it follows their new owner instead. A request whose
 claims are not valid claims is refused. Masters of 1.2 decide votes as
 before: a manual failover's request reaches them without claims, in the form
@@ -1439,7 +1441,10 @@ that master comes back, its replica's claim of its slots at its own epoch is
 taken as the later of the two: the old master gives the slots up and follows
 it, and so does every node that knew the replica as its replica; on the
 collision, it is the replica that moves to a new epoch, whatever the ids, so
-its claim wins on every other node too.
+its claim wins on every other node too. Which node took over from which is
+kept across restarts of either: nodes.conf's `vars` line then carries
+`tookOverFrom <id>` and `yieldedTo <id>,...` (an earlier version skips
+them), until the collision is over.
 
 A master that comes back after it has been replaced finds its slots claimed at
 a higher epoch and becomes a replica of the node that took them. While a slot
@@ -1481,7 +1486,12 @@ UNPAUSE` ends the pause early. During the pause all client
 writes to the source wait, not only those for the moving slots. A source
 that stops during the handover finds it in
 `<cluster-config-file>.handovers` when it starts again, and holds writes
-until it knows where the slots went, in the same way.
+until it knows where the slots went, in the same way. A node whose
+`.handovers` file cannot be read whole (cut short, a line that does not
+read, not text, a read error) does not start: it logs `cluster handovers
+file '...' is unreadable: ...` and leaves the file as it is. Check the
+slots it lists (`CLUSTER SHARDS` on another node), then remove the file by
+hand to start the node.
 
 Until the takeover, what the destination has received is a copy: the source
 still owns and serves the slots. If the destination goes down before taking

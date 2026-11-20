@@ -521,11 +521,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Cluster votes tell a refused replica the newer owner, and check manual
   failovers too (#742).** A master that refuses a replica its vote because
   it knows a newer owner of slots the replica claims answers with that
-  owner, its config epoch and its slots (an `UPDATE`, as in Redis). The
-  replica takes them in as if the owner had told it, and asks again for the
-  slots its master still has: it is elected in its first election even when
-  it cannot reach the new owner, and if its master has none left it follows
-  the new owner. `CLUSTER FAILOVER` and `CLUSTER FAILOVER FORCE` now send
+  owner and the slots it last claimed in its own heartbeat to that master,
+  at the epochs it gave (an `UPDATE`, as in Redis). The replica takes them
+  in as if the owner had told it, and asks again for the slots its master
+  still has: when the masters it asks have heard that owner directly since
+  they last started, it is elected in its first election even when it
+  cannot reach the new owner itself, and if its master has none left it
+  follows the new owner. `CLUSTER FAILOVER` and `CLUSTER FAILOVER FORCE` now send
   the replica's claims too, to masters that say they read them (a
   `vote-claims` token in their heartbeats), and are refused and corrected
   the same way; a master of 1.2 is asked as before. A vote request whose
@@ -538,7 +540,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   master, and every node that knew the replica as its replica, take it at
   the tie, and on the collision the replica is the one that moves to a new
   epoch, whatever the node ids. Claims in a heartbeat are now taken in
-  before a collision is resolved, as in Redis.
+  before a collision is resolved, as in Redis. Which node took over from
+  which is kept across restarts: nodes.conf's `vars` line gains
+  `tookOverFrom <id>` and `yieldedTo <id>,...` while such a link holds (an
+  earlier version skips them).
 - **Cluster: a slot handover whose destination failed, or whose source
   restarted (#743).** A source whose destination was marked FAIL before it
   answered the takeover waits, while a replica of the destination is up and
@@ -549,6 +554,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   source that starts again with one listed holds writes until it knows where
   the slots went (the destination says it took them or not, a claim of them
   arrives, or the destination failed), instead of serving them at once.
+  A node whose `<cluster-config-file>.handovers` cannot be read whole (cut
+  short, a line that does not read, not text, a read error) does not start,
+  with `cluster handovers file '...' is unreadable: ...`, and leaves the
+  file as it is: check the slots it lists (`CLUSTER SHARDS` on another
+  node), then remove it by hand to start the node.
   COMMANDS.md says what each kind of `CLUSTER FAILOVER` guarantees and how
   a config epoch collision is resolved.
 - **`ZRANDMEMBER` costs the count asked for, not the size of the sorted

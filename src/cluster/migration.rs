@@ -2703,12 +2703,17 @@ pub(crate) fn settle_unfinished_handovers(
             .name("kividb-handover-settle".into())
             .spawn_released(move || {
                 let task_id = handover.task_id.clone();
-                let _record = HandoverRecord {
+                let record = HandoverRecord {
                     cluster: &cluster,
                     task_id,
                     kept: false,
                 };
-                let outcome = settle_handover(&cluster, &repl_state, &handover);
+                let (outcome, saved) = settle_handover(&cluster, &repl_state, &handover);
+                if saved {
+                    drop(record);
+                } else {
+                    record.keep_until_saved(Arc::clone(&cluster));
+                }
                 log_warn!(
                     "Cluster: The handover of slots {} to {}, under way when this node stopped, \
                      is settled: {outcome}. Writes are let go",
@@ -2724,8 +2729,14 @@ pub(crate) fn settle_unfinished_handovers(
 }
 
 /// Settle one handover a restarted source may have been in the middle of;
-/// returns how it ended. Waits as [`await_takeover`] does.
-fn settle_handover(cluster: &ClusterState, repl_state: &ReplState, h: &PendingHandover) -> String {
+/// returns how it ended, and whether nodes.conf has that (false: the
+/// slots are handed over in memory, but the save failed, and the record
+/// is to stay until a save works). Waits as [`await_takeover`] does.
+fn settle_handover(
+    cluster: &ClusterState,
+    repl_state: &ReplState,
+    h: &PendingHandover,
+) -> (String, bool) {
     let me = cluster.myself();
     let first = h.ranges[0].0;
     let why = "the source restarted during the handover";
@@ -2735,19 +2746,41 @@ fn settle_handover(cluster: &ClusterState, repl_state: &ReplState, h: &PendingHa
         if let Some(owner) = cluster.slot_owner(first)
             && owner != me
         {
-            return format!("the slots are {}'s now", super::node_id_str(&owner));
+            // A claim took them: the record goes once nodes.conf has that.
+            let saved = cluster.save_to_disk().is_ok();
+            return (
+                format!("the slots are {}'s now", super::node_id_str(&owner)),
+                saved,
+            );
         }
         let unsure =
             match ask_destination_of(cluster, repl_state, &h.task_id, &h.dest, &h.ranges, why) {
                 Asked::Taken => {
                     let handed = cluster.hand_over_slots(slots_of(&h.ranges), h.dest);
-                    // The record goes only once nodes.conf says so.
-                    save_until_done(cluster);
+                    // Not waited for: the hold on writes ends now, and the
+                    // record stays until a save has the outcome.
+                    let saved = match cluster.save_to_disk() {
+                        Ok(()) => true,
+                        Err(e) => {
+                            log_warn!(
+                                "Cluster: Could not save the cluster config after handing slots \
+                                 {} over ({e}): the handover stays recorded until it is saved",
+                                ranges_text(&h.ranges)
+                            );
+                            false
+                        }
+                    };
                     drop_lost_slots(cluster, handed);
-                    return "the destination took them over; their keys here are deleted".into();
+                    return (
+                        "the destination took them over; their keys here are deleted".into(),
+                        saved,
+                    );
                 }
                 Asked::NotTaken => {
-                    return "the destination did not take them over; they stay".into();
+                    return (
+                        "the destination did not take them over; they stay".into(),
+                        true,
+                    );
                 }
                 Asked::Unsure(why) => why,
             };
@@ -2761,9 +2794,12 @@ fn settle_handover(cluster: &ClusterState, repl_state: &ReplState, h: &PendingHa
             .is_none_or(|n| n.flags.contains(super::NodeFlags::FAIL));
         if failed && !cluster.destination_may_fail_over(h.dest, &mut watch) {
             claim_back(cluster, &h.ranges);
-            return format!(
-                "the destination has failed, and they are claimed here again at epoch {}",
-                cluster.current_epoch()
+            return (
+                format!(
+                    "the destination has failed, and they are claimed here again at epoch {}",
+                    cluster.current_epoch()
+                ),
+                true,
             );
         }
         if logged.elapsed() >= LOG_HELD_EVERY {

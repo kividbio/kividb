@@ -8766,6 +8766,90 @@ fn a_handover_stays_recorded_until_the_source_has_saved_its_outcome() {
     assert!(before.missing_on(&nodes[1]).is_empty());
 }
 
+/// A source restarted during a handover whose outcome it then cannot save
+/// (`fail.nodes-conf` makes every save fail) settles the handover in
+/// memory and lets writes go: its other slots are served, the slots handed
+/// over answer `-MOVED`, and the record stays until a save works, rather
+/// than writes held for as long as nodes.conf cannot be saved (#743). A
+/// save that fails at startup stops a node, so the saves are made to fail
+/// once it is up: the destination is down meanwhile, and the source waits
+/// for it, holding writes; then the destination comes back and says it
+/// took the slots.
+#[test]
+fn a_source_that_cannot_save_the_settled_handover_still_lets_writes_go() {
+    let src = Node::start_with_env(&["--appendonly", "yes"], &[FAILING_SAVES]);
+    let dst = Node::start_with_env(&[], &[("KIVIDB_TEST_TAKEOVER_LOST_MS", "8000")]);
+    let (mut nodes, ranges) = form_cluster_of(vec![src, dst]);
+    assert!(
+        nodes[0]
+            .conn()
+            .cmd(&[
+                "CONFIG",
+                "SET",
+                "cluster-slot-migration-write-pause-timeout",
+                "60000"
+            ])
+            .is_ok()
+    );
+    let task_id = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "100"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_until(
+        "the destination to take the slots over",
+        Duration::from_secs(30),
+        || {
+            nodes[1]
+                .log()
+                .contains("TAKEOVER's reply and claim are held back")
+        },
+    );
+    nodes[0].kill();
+    nodes[1].kill();
+    nodes[0].spawn();
+    wait_until(
+        "the restarted source to wait for the destination",
+        Duration::from_secs(20),
+        || {
+            nodes[0]
+                .log()
+                .contains("This node stopped during the handover")
+        },
+    );
+    fail_saves(&nodes[0], true);
+    nodes[1].spawn();
+    // A write to another of its slots is answered, in a bounded time.
+    let other = key_in(200..=ranges[0].1, "other");
+    let port = nodes[0].port;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut c = Conn::connect(port);
+        let _ = tx.send(cmd_when_serving(&mut c, &["SET", &other, "v"]));
+    });
+    let reply = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("writes still held while nodes.conf cannot be saved");
+    assert!(reply.is_ok(), "{reply:?}");
+    let mut c = nodes[0].conn();
+    let reply = cmd_when_serving(&mut c, &["SET", &key_in(0..=100, "moved"), "v"]);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("MOVED")),
+        "{reply:?}"
+    );
+    let path = nodes[0].dir.join("nodes.conf.handovers");
+    assert!(
+        std::fs::read_to_string(&path).is_ok_and(|t| t.contains(&task_id)),
+        "the record went before nodes.conf had the outcome"
+    );
+    fail_saves(&nodes[0], false);
+    wait_until(
+        "the record to go once a save works",
+        Duration::from_secs(20),
+        || !path.exists(),
+    );
+}
+
 /// A destination that took slots over and failed before it answered the
 /// source: its replica, which heard it claim them, is elected and takes
 /// them over with the rest, with the writes the destination took to them,

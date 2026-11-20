@@ -2707,6 +2707,12 @@ impl ClusterState {
         if removed {
             self.forgotten.write().insert(id, now_ms() + FORGET_BAN_MS);
             self.clear_failure_reports(id);
+            // Nothing of it to relay, nor a collision with it to settle.
+            self.own_claims.write().remove(&id);
+            if *self.took_over_from.lock() == Some(id) {
+                *self.took_over_from.lock() = None;
+            }
+            self.yielded_to.lock().remove(&id);
         }
         removed
     }
@@ -3100,12 +3106,18 @@ impl ClusterState {
 
     /// After a heartbeat of `sender` (`sender_master`, at `sender_epoch`)
     /// has been taken in: the takeover links with it are let go once a
-    /// collision with it is over or can no longer happen: it is at another
-    /// config epoch than this node, either of the two is not a master. Kept
-    /// until then, across restarts (nodes.conf), so that a node that took
-    /// over, restarted before its old master came back, still moves on the
-    /// collision; a node that yielded with the lower id and its replica
-    /// both staying put left two masters at one epoch (#743).
+    /// collision with it is over: it is a master above this node's config
+    /// epoch, or this node is no longer a master; for `took_over_from`, also
+    /// once the old master says it is a replica (it follows someone). Never
+    /// on a heartbeat below this node's epoch: one sent before the takeover
+    /// and still on its way would drop the link just before the collision
+    /// it is for. Kept until then, across restarts (nodes.conf), so that a
+    /// node that took over, restarted before its old master came back,
+    /// still moves on the collision; a node that yielded with the lower id
+    /// and its replica both staying put left two masters at one epoch
+    /// (#743). The node that took over always moves while its link holds,
+    /// so the two cannot both stay put; and the one that yielded drops its
+    /// own link only once the other is above it.
     pub fn settle_takeover_links(&self, sender: NodeId, sender_master: bool, sender_epoch: u64) {
         let me = self.myself();
         let (i_am_master, my_epoch) = self
@@ -3114,19 +3126,18 @@ impl ClusterState {
             .get(&me)
             .map(|n| (n.flags.contains(NodeFlags::MASTER), n.config_epoch))
             .unwrap_or((false, 0));
-        let over = !sender_master || !i_am_master || sender_epoch != my_epoch;
-        if !over {
-            return;
-        }
+        let above = sender_master && sender_epoch > my_epoch;
         let mut changed = false;
         {
             let mut took = self.took_over_from.lock();
-            if *took == Some(sender) {
+            if *took == Some(sender) && (above || !sender_master || !i_am_master) {
                 *took = None;
                 changed = true;
             }
         }
-        changed |= self.yielded_to.lock().remove(&sender);
+        if above || !i_am_master {
+            changed |= self.yielded_to.lock().remove(&sender);
+        }
         if changed {
             self.save_soon();
         }
@@ -3270,8 +3281,10 @@ impl ClusterState {
                 old_master.flags.remove(NodeFlags::MASTER);
             }
         }
-        // On a config epoch collision with it, this node moves (#743).
+        // On a config epoch collision with it, this node moves (#743). It
+        // yielded to no one as the new master it now is.
         *self.took_over_from.lock() = Some(failed_master_id);
+        self.yielded_to.lock().clear();
 
         // Phase 3: persist, by the caller: see `save_promotion`. The election
         // is won and the cluster has agreed to it: the promotion holds,
@@ -5671,18 +5684,83 @@ mod tests {
         assert_eq!(*again.took_over_from.lock(), Some(m));
         assert!(again.yielded_to.lock().contains(&y));
 
-        // Same epoch, both masters: kept. Another epoch: let go.
+        // Same epoch, or below, both masters: kept. Above: let go.
         let me = again.myself();
         again.nodes.write().get_mut(&me).unwrap().config_epoch = 5;
         again.settle_takeover_links(m, true, 5);
+        again.settle_takeover_links(m, true, 4);
         assert_eq!(*again.took_over_from.lock(), Some(m));
         again.settle_takeover_links(m, true, 6);
         assert_eq!(*again.took_over_from.lock(), None);
+        // The node yielded to says replica, or is below: kept; above: gone.
         again.settle_takeover_links(y, false, 5);
+        again.settle_takeover_links(y, true, 4);
+        assert!(again.yielded_to.lock().contains(&y));
+        again.settle_takeover_links(y, true, 6);
         assert!(again.yielded_to.lock().is_empty());
         again.save_to_disk().unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("tookOverFrom") && !text.contains("yieldedTo"));
+    }
+
+    /// A heartbeat of the old master sent before the takeover, at E-1, and
+    /// still on its way when the replica has taken over at E, does not let
+    /// the replica's link go: the old master's next heartbeat, at E, is a
+    /// collision, and the replica moves, whatever the ids (the old master,
+    /// which yielded, does not). Its own stale heartbeats as a replica, and
+    /// below, leave the old master's link too (#743).
+    #[test]
+    fn a_stale_heartbeat_keeps_the_takeover_links_until_the_collision() {
+        for _ in 0..16 {
+            // The replica's side, its old master's id the lower.
+            let cs = ClusterState::new_enabled(None, 15000);
+            let me = cs.myself();
+            let m = loop {
+                let m = add_master(&cs, 0..=99);
+                if m < me {
+                    break m;
+                }
+                cs.nodes.write().remove(&m);
+            };
+            let _b = add_master(&cs, 100..=16383);
+            cs.nodes.write().get_mut(&m).unwrap().config_epoch = 4;
+            cs.observe_epoch(4);
+            cs.set_replica_of(m).unwrap();
+            cs.promote_self(m, 5);
+            {
+                let mut nodes = cs.nodes.write();
+                let old = nodes.get_mut(&m).unwrap();
+                old.flags |= NodeFlags::MASTER;
+            }
+            // Stale, at E-1.
+            cs.settle_takeover_links(m, true, 4);
+            assert_eq!(
+                *cs.took_over_from.lock(),
+                Some(m),
+                "a stale heartbeat let it go"
+            );
+            // The collision at E.
+            cs.nodes.write().get_mut(&m).unwrap().config_epoch = 5;
+            assert!(cs.resolve_epoch_collision(m, 5), "the replica must move");
+            assert!(cs.nodes.read()[&me].config_epoch > 5);
+
+            // The old master's side: it yielded to r at E.
+            let (cs, r, _) = three_master_cluster();
+            let me = cs.myself();
+            cs.nodes.write().get_mut(&me).unwrap().config_epoch = 5;
+            cs.nodes.write().get_mut(&r).unwrap().config_epoch = 5;
+            cs.yielded_to.lock().insert(r);
+            cs.settle_takeover_links(r, false, 3);
+            cs.settle_takeover_links(r, true, 4);
+            assert!(cs.yielded_to.lock().contains(&r));
+            assert!(
+                !cs.resolve_epoch_collision(r, 5),
+                "the old master must not move"
+            );
+            // Once the replica is above, the link goes.
+            cs.settle_takeover_links(r, true, 6);
+            assert!(!cs.yielded_to.lock().contains(&r));
+        }
     }
 
     /// A source whose destination failed before it said whether it took
