@@ -6,6 +6,7 @@
 *.log
 *.txt
 !scripts/redis_compat_known_failures.txt
+!scripts/key_utf8_allowlist.txt
 !benchmarks/**/requirements.txt
 !benchmarks/*-compat/kividb-passes.txt
 ./*.py

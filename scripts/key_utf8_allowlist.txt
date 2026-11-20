@@ -1,0 +1,66 @@
+# Places in src/commands where an argument that could be a key is
+# legitimately turned into text — checked by scripts/check_key_utf8.sh
+# (part of #510). One line per site or pattern: path | text the line
+# contains | why the conversion is right.
+#
+# A key argument itself is never text: it reaches the store as bytes, and
+# the test in tests/keyspec_binary_keys.rs walks the key-spec table to
+# prove every command takes one of any bytes. The lines below convert a
+# name that is not a key (an index, alias, dictionary, subcommand, host,
+# database or count), put the key's bytes into a message, or skip a
+# by-text convenience (a notification name) while the key stays bytes.
+src/commands/acl.rs|let sub = String::from_utf8_lossy(cmd[1]).to_ascii_uppercase()|ACL's first argument is a subcommand name, not a key
+src/commands/array.rs|let Some(key) = ctx.cmd.get(1).and_then(|k| parse_utf8(k))|the keyspace-event name; a binary key skips the notification and stays bytes
+src/commands/backup.rs|let sub = String::from_utf8_lossy(ctx.cmd[1]).to_ascii_uppercase()|the backup subcommand name, not a key
+src/commands/bitmap.rs|let op = std::str::from_utf8(cmd[1])|BITOP's first argument is the operation, not a key
+src/commands/cluster.rs|let sub = String::from_utf8_lossy(cmd[1]).to_ascii_uppercase()|CLUSTER's first argument is a subcommand name, not a key
+src/commands/cluster.rs|String::from_utf8_lossy(ctx.cmd[1])|the subcommand name in an error message
+src/commands/cluster.rs|let Ok(host) = std::str::from_utf8(cmd[1]) else|a cluster node's host name, not a key
+src/commands/cluster.rs|let key = String::from_utf8_lossy(key)|the key's bytes in a serialise-error message only
+src/commands/cluster.rs|.map(|k| format!("'{}'", String::from_utf8_lossy(k)))|key names quoted in an error message only
+src/commands/connection.rs|let idx_str = match std::str::from_utf8(cmd[1])|a database index, not a key
+src/commands/debug_cmd.rs|let sub = String::from_utf8_lossy(ctx.cmd[1]).to_ascii_lowercase()|DEBUG's first argument is a subcommand name, not a key
+src/commands/generics.rs|let subcommand = String::from_utf8_lossy(cmd[1]).to_ascii_uppercase()|a container's subcommand name, not a key
+src/commands/generics.rs|let db1: usize = match parse_utf8(cmd[1]).and_then(|s| s.parse().ok())|SWAPDB's first argument is a database number, not a key
+src/commands/handler.rs|String::from_utf8_lossy(key)|the key's bytes in an error message only; the key itself stays bytes
+src/commands/handler.rs|std::str::from_utf8(ctx.cmd[1])|SELECT's database number, not a key
+src/commands/hash_import.rs|let sub = String::from_utf8_lossy(cmd[1]).to_ascii_uppercase()|HIMPORT's first argument is a subcommand name, not a key
+src/commands/hotkeys.rs|let sub = String::from_utf8_lossy(cmd[1]).to_ascii_uppercase()|a subcommand name, not a key
+src/commands/hybrid.rs|k = std::str::from_utf8(cmd[at + 1])|the KNN K count, not a key
+src/commands/hyperloglog.rs|let subcmd = std::str::from_utf8(cmd[1])|PFDEBUG's subcommand name, not a key
+src/commands/latency.rs|let sub = String::from_utf8_lossy(cmd[1]).to_ascii_uppercase()|LATENCY's first argument is a subcommand name, not a key
+src/commands/latency.rs|String::from_utf8_lossy(ctx.cmd[1])|the subcommand name in an error message
+src/commands/lua.rs|let sha = match std::str::from_utf8(ctx.cmd[1])|EVALSHA's digest, not a key
+src/commands/lua.rs|let source = match std::str::from_utf8(ctx.cmd[1])|the script source, not a key
+src/commands/lua.rs|let fn_name = match std::str::from_utf8(ctx.cmd[1])|FCALL's function name, not a key
+src/commands/lua.rs|let sub = String::from_utf8_lossy(ctx.cmd[1]).to_ascii_uppercase()|SCRIPT and FUNCTION's first argument is a subcommand name, not a key
+src/commands/lua.rs|String::from_utf8_lossy(ctx.cmd[1])|the subcommand name in an error message
+src/commands/memory.rs|let sub = String::from_utf8_lossy(cmd[1]).to_ascii_uppercase()|MEMORY's first argument is a subcommand name, not a key
+src/commands/memory.rs|String::from_utf8_lossy(ctx.cmd.get(1).copied().unwrap_or_default())|the subcommand name in an error message
+src/commands/pubsub.rs|let sub = match std::str::from_utf8(ctx.cmd[1])|PUBSUB's first argument is a subcommand name, not a key
+src/commands/pubsub.rs|String::from_utf8_lossy(ctx.cmd[1])|the subcommand name in an error message
+src/commands/search.rs|let name = std::str::from_utf8(cmd[1])|FT.CREATE's index name, not a key
+src/commands/server.rs|let subcmd = String::from_utf8_lossy(cmd[1]).to_ascii_uppercase()|CONFIG's first argument is a subcommand name, not a key
+src/commands/server.rs|let sub = String::from_utf8_lossy(cmd[1]).to_ascii_uppercase()|COMMAND and CLIENT's first argument is a subcommand name, not a key
+src/commands/server.rs|String::from_utf8_lossy(cmd[1])|the subcommand name in an error message
+src/commands/server.rs|let host = match std::str::from_utf8(cmd[1])|REPLICAOF's host name, not a key
+src/commands/server.rs|String::from_utf8_lossy(cmd.get(1).copied().unwrap_or_default())|MODULE's subcommand name in an error message
+src/commands/server.rs|std::str::from_utf8(args[1])|a set-cardinality command's count of keys, not a key
+src/commands/set_card.rs|let numkeys: i64 = parse_utf8(cmd[1])|the count of keys, not a key
+src/commands/sets.rs|let numkeys = match parse_utf8(cmd[1]).and_then(|s| s.parse::<i64>().ok())|the count of keys, not a key
+src/commands/slowlog.rs|let sub = String::from_utf8_lossy(cmd[1]).to_ascii_uppercase()|SLOWLOG's first argument is a subcommand name, not a key
+src/commands/slowlog.rs|String::from_utf8_lossy(ctx.cmd[1])|the subcommand name in an error message
+src/commands/streams.rs|String::from_utf8_lossy(cmd[1])|the subcommand name in an error message
+src/commands/streams.rs|if !std::str::from_utf8(cmd[1])|XREADGROUP's GROUP token, not a key
+src/commands/streams.rs|let subcommand = std::str::from_utf8(cmd[1])|a stream container's subcommand name, not a key
+src/commands/streams.rs|match std::str::from_utf8(cmd[1])|XGROUP's subcommand name, not a key
+src/commands/strings.rs|let numkeys: usize = match parse_utf8(cmd[1]).and_then(|s| s.parse::<i64>().ok())|MSETEX's count of keys, not a key
+src/commands/ts_query.rs|String::from_utf8_lossy(&crate::key_bytes::bytes_of(k))|a series name in a reply label; the series key itself stays bytes
+src/commands/vector.rs|let name = match std::str::from_utf8(cmd[1])|FT.DROPINDEX's index name, not a key
+src/commands/vector.rs|let index_name = match std::str::from_utf8(cmd[1])|an FT index name, not a key
+src/commands/vector.rs|std::str::from_utf8(cmd[1]).map_err(|_| resp_error("ERR alias must be valid UTF-8"))?|FT.ALIASADD's alias name, not a key
+src/commands/vector.rs|let alias = match std::str::from_utf8(cmd[1])|FT.ALIASDEL's alias name, not a key
+src/commands/vector.rs|let index = match std::str::from_utf8(cmd[1])|FT.ALIASLIST's index name, not a key
+src/commands/vector.rs|let dict_name = match std::str::from_utf8(cmd[1])|an FT dictionary name, not a key
+src/commands/vector.rs|let sub = std::str::from_utf8(cmd[1])|FT.DEBUG's subcommand name, not a key
+src/commands/vset.rs|.map(|k| String::from_utf8_lossy(k.as_bytes()).into_owned())|member names in a reply listing; members stay bytes

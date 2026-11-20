@@ -3978,6 +3978,21 @@ fn test_ft_aggregate_geodistance_and_timefmt() {
     let row3 = arr3[1].as_array();
     let date_pos = row3.iter().position(|v| v.as_str() == "date").unwrap();
     assert_eq!(row3[date_pos + 1].as_str(), "2023-11-14");
+
+    // timefmt with non-ASCII literal text in the format (#978)
+    let r4 = c.cmds(&[
+        "FT.AGGREGATE",
+        "events",
+        "*",
+        "APPLY",
+        r#"timefmt(@ts, "%Y年%m月%d日")"#,
+        "AS",
+        "day",
+    ]);
+    let arr4 = r4.as_array();
+    let row4 = arr4[1].as_array();
+    let day_pos = row4.iter().position(|v| v.as_str() == "day").unwrap();
+    assert_eq!(row4[day_pos + 1].as_str(), "2023年11月14日");
 }
 
 #[test]

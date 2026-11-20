@@ -67,6 +67,8 @@ jobs:
               - 'Cargo.lock'
               - '.config/nextest.toml'
               - 'scripts/redis_compat*'
+              - 'scripts/check_key_utf8.sh'
+              - 'scripts/key_utf8_allowlist.txt'
               - '.github/workflows/ci.yml'
               - '.github/workflows/linux-verification.yml'
             harness:
@@ -127,6 +129,13 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+      # Keys are bytes: a command's key argument must not go through
+      # `from_utf8` or `to_str` on its way to the store (#510). What is
+      # legitimate today is in scripts/key_utf8_allowlist.txt; the step
+      # fails on a conversion the list does not know.
+      - name: Keys stay bytes
+        run: scripts/check_key_utf8.sh
 
   build-tests:
     needs: detect-changes

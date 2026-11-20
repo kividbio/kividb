@@ -2993,6 +2993,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   propagated as `XGROUP CREATECONSUMER` when the read starts waiting, as
   Redis does.
 
+- **`FT.AGGREGATE` `timefmt` carries non-ASCII literal text in the format
+  through unchanged (#978).** `timefmt(@ts, "%Y年%m月%d日")` answers
+  `1970年01月01日` for `ts=0`, as Redis does.
+
 ## [1.2.2] - 2026-11-13
 
 See [docs/releases/v1.2.2.md](docs/releases/v1.2.2.md).
