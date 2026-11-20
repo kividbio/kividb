@@ -871,6 +871,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   where Redis gives 0.11 at 4,276 and 0.42 at 2,006 (`EF_RUNTIME 80`); see
   docs/PERFORMANCE.md.
 
+- **A NUMERIC range that takes in many documents is read off the values by
+  document id (#760).** `@field:[lo hi]` is read off the field's sorted
+  list entry by entry while it is narrow; once it may take in more than a
+  quarter of the documents, every document's value is compared in id order
+  instead, four at a time with AVX2, 64 documents to a word of the result.
+  A filtered KNN reads its filter for every query, and `@score:[50 100]`
+  over 200,000 documents set 100,000 bits one at a time, a quarter of the
+  query's time over 64-d vectors. One client, KNN 10 over 200,000 64-d
+  documents with that filter (an Azure D8s_v5, medians of 2): 1,917 →
+  2,215 queries a second at the default `EF_RUNTIME`, 1,390 → 1,517 at 100
+  (Redis 8.10.3: 2,015 and 1,304, at recall 0.25 and 0.58 against
+  KiviDB's 0.62 and 0.78); over 50,000 384-d documents 1,896 → 1,965. The
+  documents a range matches are the same either way: a test reads every
+  range both ways. Regression suite `41-ft-hnsw-vs-redis` gates #760's
+  cases against Redis in the same session.
+
 - **Writes on a master with a replication backlog and no replica no
   longer wake the replication thread one by one (#894).** A master that
   starts with data (its own snapshot, or any dataset) keeps the backlog for
@@ -1242,6 +1258,57 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `DUMP`/`RESTORE` and `MIGRATE` are unchanged in both directions with
     1.2.2.
 
+- **Large hashes take a third to half the memory, no write
+  moves every field at once to grow, and `HSCAN` reads only its page (#764,
+  #770).** A hash past the block's limits (`OBJECT ENCODING` `hashtable`) is
+  the same table as a large set: each field and its value side by side in
+  one block of the collections' slab pool (a value too long for the pool's
+  largest block in a block of its own), with no `String`, no `Arc` and no
+  entries vector. #764's hash of 3,000,000 fields `f0`..`f2999999` of `v`
+  takes 29.6 bytes a field, 84.8 MiB (102.9 bytes and 294.5 MiB before;
+  Redis 8.10.2: 37.9 bytes, 108.5 MiB; Azure D8s_v5); just after the table doubles
+  (3,211,265 fields) 37.2 bytes, its most (Redis 36.8). Suite 19's fields of
+  14 bytes with 32-byte values (`used_memory` a field; before, then now;
+  Redis last): 166.6 / 66.0 / 70.1 at 1,000 fields a hash, 128.8 / 61.8 /
+  76.8 at 100,000, 133.3 / 61.7 / 77.9 at 3,000,000. Every hash key, small
+  ones included, is also 56 bytes smaller (its header went from 88 to 32
+  bytes): 65.8 bytes a field at 10 fields (71.4 before).
+  - The table grows and shrinks a few fields a write; a resize that the
+    writes leave part-way is finished in the background, a step at a time
+    under the hash's own lock, and the old array is freed off the command
+    path, as for sets. Filling one hash to 3,000,000 fields one `HSET` at a
+    time, the slowest `HSET` took 6.9 ms (64.7 ms before, at a doubling;
+    Redis 8.10.2: 6.7 ms), the 99th percentile 0.055 ms as before.
+  - `HSCAN` of such a hash reads the table's own groups for its page, with
+    `COUNT` a hint as in Redis, where it read the whole hash on every call:
+    a full scan of 1,000,000 fields takes 2.36 / 0.51 / 0.36 s of server CPU
+    at `COUNT` 10 / 100 / 1,000 (10.95 / 10.97 / 10.66 s before; Redis
+    8.10.2: 1.93 / 0.50 / 0.34 s). Fields whose TTL is due are skipped in place
+    where readers do not see them. Thanks to @magic-peach for the page
+    builder (#955). A scan begun before an upgrade still ends, but may miss
+    or repeat fields.
+  - Fields are copied, not shared, by `COPY`: 200 ms for 1,000,000 fields
+    (76 ms before; Redis 287 ms), the copy taking 65.5 bytes a field (121
+    before). `DEL` of a 3,000,000-field hash takes 196 ms (147 ms before;
+    Redis 373 ms); `UNLINK` is unchanged.
+  - Field TTLs are kept beside the table as before, a second copy of each
+    name with its deadline: a field with a TTL costs 83 bytes more, as
+    before (Redis 25). Keeping the deadline in the field's entry is a later
+    step.
+  - `MEMORY USAGE` of a hash is exact and immediate whatever `SAMPLES` says,
+    and eviction's estimate of what a hash frees is exact. `HGETALL`,
+    `HKEYS`, `HVALS`, `HSCAN` and `HRANDFIELD` give a large hash's fields in
+    a different order than 1.2.x did (no order, as in Redis), also a hash
+    that is a `hashtable` only because of one long value, which kept the
+    order its fields were set in. Snapshots, the AOF, replication,
+    `DUMP`/`RESTORE` and `MIGRATE` are unchanged in both directions with
+    1.2.2, and `DEBUG DIGEST-VALUE` gives the same digest.
+  - Instructions per command on a large hash (callgrind, the shipped
+    build): `HGET`, `HEXISTS`, `HSTRLEN` 1 % more, `HMGET` 1.4 %, an `HDEL`
+    and `HSET` pair 2-3 %; `HSET` of a field that is there 2.5 % fewer and
+    `HINCRBY` 6-8 % fewer; `HGETALL` 4 % fewer (a walk of the table that
+    reads only each entry's two lengths). Hashes in a block: as before.
+
 - **Lists take about half the memory, short elements a fifth (#297).** A
   list's elements are kept end to end in chunks of up to 64, each element
   between two copies of its length (one byte each for an element shorter
@@ -1585,6 +1652,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   until they have left, and a script that runs beside others cannot take
   that hold, so it fails with an error, as `KEYS` does in such a script.
   A script that runs alone keeps `MIGRATE` and its hold.
+- **A script that reaches its gates during a slot handoff no longer holds
+  every other command back while it waits (#340).** A script that runs
+  alone holds the command gate alone, and one that met a handoff (or a
+  `MIGRATE` of its key) once in the gate waited it out still holding it:
+  no other command ran on any thread until the handoff ended. It now
+  leaves all its gates to wait, and is then dispatched again from the top,
+  so everything checked before the gates (routing, ACL,
+  `lua-parallel-scripts`) is checked again. A write waiting the same way
+  leaves its share of the gate too, so a transaction or script is not held
+  behind it. In a test with the
+  destination's `TAKEOVER` held 3 s, a `GET` on another thread waited
+  about 2.6 s; it now waits under 1 ms.
 - **A command that waits for a script on its hash tag no longer holds up
   its thread (#882).** With `lua-parallel-scripts` on, a client's command
   on a key whose tag a script running beside others held waited on the
@@ -2377,10 +2456,50 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keys that match. `DEL` now follows `lazyfree-lazy-user-del`: with `yes` it
   frees a big value in the background as `UNLINK` does, and a config file
   setting it no longer warns that it has no effect; the default stays `no`.
-  On io_uring, a long command still holds up the connections served by its
-  own thread (#762). In a build with Lua and `lua-parallel-scripts yes`,
-  `KEYS` and `SCAN` still run alone, as before, so as not to see a script
-  part-way through.
+  On io_uring, see the next entry (#762). In a build with Lua and
+  `lua-parallel-scripts yes`, `KEYS` and `SCAN` still run alone, as before,
+  so as not to see a script part-way through.
+
+- **A long command no longer holds up the other connections of its io_uring
+  thread (#762).** On io_uring each worker thread serves its own
+  connections, and a long command used to stall every other connection of
+  its thread for as long (with one worker thread, a `PING`, `GET` or `SET`
+  waited 74 ms behind a `KEYS` over 2M keys, 126 ms behind a `DEL` of a
+  3M-field hash). Now these commands, once they are long, stop before they
+  have done anything and run again on a small pool of threads: `KEYS` when
+  the database holds 65,536 keys or more, `SCAN` when its `COUNT` and the
+  database are both that large, and `HGETALL`, `SMEMBERS`, `LRANGE` and
+  `SORT` without `STORE` over 65,536 elements or more. The free of a big
+  value after `DEL` (one key or several) runs there too, after the key is
+  deleted and the deletion propagated; until it is freed, the value is not
+  counted against `maxmemory`. The connection waits for that work before it
+  writes the reply or reads its next command, so its replies stay in order,
+  a client that has shut its side for writing still gets every reply, and
+  its thread serves the others meanwhile: a `PING`, `GET` or `SET` on that
+  thread waits at most about 1 ms behind those `KEYS`, `SCAN` and `DEL`. The
+  locks stay with the work: a command run on the pool holds the command gate
+  shared, and `HGETALL`, `SMEMBERS`, `LRANGE` and `SORT` hold their key's
+  shard for reading while they build the reply. A write to a key of that
+  shard waits for them, and so does its thread: behind an `HGETALL` of 1M
+  fields, the worst `PING`, `GET` and `SET` on the thread was 6-10 ms on the
+  pool, against 39 ms with the `HGETALL` run on the thread itself (suite
+  04's one-thread configuration, a Standard_D8s_v5), what a `SET` that lands
+  in that shard (one in 64 on 8 CPUs) waits and the thread's own handling of
+  the 1M-field reply, which were not told apart. A command that takes the
+  command gate alone (`EXEC`, a script run alone, a `DEL` of several keys)
+  waits for a `KEYS` or `SCAN` run on the pool the same way. Inside
+  `MULTI`/`EXEC`, a script, or a command that takes the command gate alone,
+  the work runs where it is, as before; `HGETALL`, `SMEMBERS`, `LRANGE` and
+  `SORT` also do in cluster mode. `INFO commandstats` and `LATENCY` time the
+  run on the pool. A `DEL` whose free waits is timed for `LATENCY` by its
+  own time, and counted in `INFO commandstats` with the free; the slow log
+  has the whole wait. Invalidation messages produced while a command waits
+  are delivered to that client before its reply. On Tokio, `HGETALL`,
+  `SMEMBERS`, `LRANGE` and the sort of `SORT` over that many elements now
+  run as other long work does (#754), and a `DEL` frees a big value after
+  the command, out of its gates: a `DEL` of several keys no longer holds the
+  command gate alone while it frees. A `SET` over a big value still frees it
+  in place, on both I/O models.
 
 - **`SINTER` of a big set with a small one costs the small set's size, not
   the big one's (#759).** `SINTER`, `SINTERSTORE`, `SINTERCARD`, `SDIFF`,
@@ -2859,6 +2978,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   restart that replayed the AOF, and a replica never had it. It is now
   propagated as `XGROUP CREATECONSUMER` when the read starts waiting, as
   Redis does.
+
+- **`FT.AGGREGATE` `timefmt` carries non-ASCII literal text in the format
+  through unchanged (#978).** `timefmt(@ts, "%Y年%m月%d日")` answers
+  `1970年01月01日` for `ts=0`, as Redis does.
 
 ## [1.2.2] - 2026-11-13
 

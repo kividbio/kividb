@@ -251,15 +251,35 @@ mod tests {
     #[test]
     fn a_hash_is_what_it_allocates() {
         with_own_counter("a_hash_is_what_it_allocates", || {
-            for fields in [1usize, 3, 4, 8, 15, 64, 65, 513, 1000] {
-                let (hash, bytes) = allocated(|| {
-                    let mut hash = HashFields::default();
-                    for i in 0..fields {
-                        hash.insert_bytes(&format!("field:{i}"), format!("value:{i}").as_bytes());
-                    }
-                    hash
-                });
-                assert_eq!(hash_fields(&hash, usize::MAX), bytes, "{fields} fields");
+            // A table's entries come from the entry pool's slabs: the first
+            // blocks a thread takes of a class make that thread's slab
+            // bookkeeping, which is the thread's and not the hash's. Made
+            // here first, before anything is measured (as for sets).
+            let mut warm = HashFields::default();
+            for i in 0..20_000 {
+                warm.insert_bytes(&format!("field:{i}"), format!("value:{i}").as_bytes());
+                warm.insert_bytes(&format!("long:{i}"), &[b'v'; 100]);
+            }
+            drop(warm);
+            for fields in [1usize, 3, 4, 8, 15, 64, 65, 513, 1000, 5000] {
+                for long in [false, true] {
+                    let (hash, bytes) = allocated(|| {
+                        let mut hash = HashFields::default();
+                        for i in 0..fields {
+                            let value = format!("value:{i}");
+                            let value = if long { value.repeat(12) } else { value };
+                            hash.insert_bytes(&format!("field:{i}"), value.as_bytes());
+                        }
+                        hash
+                    });
+                    // A block is its one allocation; a table (#764) counts
+                    // its box, groups and entries, mid-resize too.
+                    assert_eq!(
+                        hash_fields(&hash, usize::MAX),
+                        bytes,
+                        "{fields} fields, long values {long}"
+                    );
+                }
             }
         });
     }

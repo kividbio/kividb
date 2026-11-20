@@ -785,17 +785,19 @@ pub fn spawn_active_expire_task(
 }
 
 /// Of each [`RESIZE_SLICE`] of an expiry thread's sleep, the time it works
-/// on the large sets handed to the background (`member_set::after_write`).
+/// on the large sets and hashes handed to the background
+/// (`member_set::after_write`, `hash_fields::after_write`).
 const RESIZE_WORK: Duration = Duration::from_millis(1);
 const RESIZE_SLICE: Duration = Duration::from_millis(2);
 /// How often an expiry thread with nothing to resize looks again.
 const RESIZE_IDLE_SLICE: Duration = Duration::from_millis(10);
 
-/// Sleep for `wait`, working on the large sets' resizes meanwhile, if any
-/// are waiting: [`RESIZE_WORK`] of every [`RESIZE_SLICE`], a step at a time
-/// under each set's lock (`member_set::step_background`), so that no
-/// writer of a set waits on it for longer than a step, and the thread
-/// gets back to expiring when it would have.
+/// Sleep for `wait`, working on the large sets' and hashes' resizes
+/// meanwhile, if any are waiting: [`RESIZE_WORK`] of every
+/// [`RESIZE_SLICE`], a step at a time under each one's lock
+/// (`resize_background::step_background`), so that no writer waits on it
+/// for longer than a step, and the thread gets back to expiring when it
+/// would have.
 fn sleep_finishing_resizes(wait: Duration) {
     let until = std::time::Instant::now() + wait;
     loop {
@@ -803,13 +805,13 @@ fn sleep_finishing_resizes(wait: Duration) {
         if now >= until {
             return;
         }
-        if !crate::member_set::background_pending() {
+        if !crate::resize_background::background_pending() {
             // In slices, so that a set handed over meanwhile is worked on
             // within one, not after the whole wait.
             std::thread::sleep(RESIZE_IDLE_SLICE.min(until - now));
             continue;
         }
-        crate::member_set::step_background(RESIZE_WORK);
+        crate::resize_background::step_background(RESIZE_WORK);
         let now = std::time::Instant::now();
         if now >= until {
             return;

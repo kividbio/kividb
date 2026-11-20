@@ -16,6 +16,7 @@
 # not depend on the default): GET and SET with 100 B and 1 KB values,
 # pipelined (-P 16) and not (-P 1); and pipelined INCR, HGET, LPUSH, LPOP and
 # a 16-key MGET. Labels end in -no / -yes.
+# WORKLOADS=sets and WORKLOADS=hashes: see their blocks below.
 # WORKLOADS=tags runs what the hash-tag locks of a build with Lua cost a
 # command (#889; `tag_locks`, on with lua-parallel-scripts): GET and SET of
 # keys without a tag and of keys with one ({t}:<n>), a 10-key MGET, a
@@ -384,6 +385,79 @@ if [ "${WORKLOADS:-}" = sets ]; then
       gen str 1000000 3 5 COPY > /tmp/set
       N=5 PIPEFILE=/tmp/set DSIZE=100 one "$tag" "COPY-S1000000"
     fi
+  done | tee /out/raw.txt
+  echo done
+  exit 0
+fi
+if [ "${WORKLOADS:-}" = hashes ]; then
+  # Hash commands on one hash of each form and size (#764 step 3): fields
+  # `field:<i>` (14 bytes) with 32-byte values, as suite 19's, in hashes of
+  # 10, 128 and 512 fields (a block) and 1,000, 100,000 and 3,000,000 (a
+  # table), plus one integer field `n` for HINCRBY. The fields asked for are
+  # uniform over those the hash holds (a hit) or not in it (a miss). Each
+  # hash is loaded by HSETs of 1,000 fields in RESP through `redis-cli
+  # --pipe` (SIZES limits the sizes, e.g. SIZES="10 1000"). HDEL-HSET is a
+  # pair: HDEL of a field, then HSET of it again (a new field), which leaves
+  # the hash as big as it was. HGETALL is per command, at up to 1,000
+  # fields N of them, at 100,000 NBIG (50).
+  hgen() { # size seed n op -> RESP on stdout
+    awk -v size="$1" -v seed="$2" -v n="$3" -v op="$4" '
+      function f(i) { return sprintf("field:%08d", i) }
+      function v(i) { return sprintf("value:%026d", i) }
+      function miss(i) { return sprintf("absnt:%08d", i) }
+      function cmd(k, a, b, c, d,   x) {
+        printf "*%d\r\n$%d\r\n%s\r\n", k, length(a), a
+        printf "$1\r\nh\r\n"
+        if (k >= 3) printf "$%d\r\n%s\r\n", length(b), b
+        if (k >= 4) printf "$%d\r\n%s\r\n", length(c), c
+        if (k >= 5) printf "$%d\r\n%s\r\n", length(d), d
+      }
+      BEGIN {
+        srand(seed)
+        if (op == "load") {
+          for (i = 0; i < size; i += 1000) {
+            hi = (i + 1000 < size) ? i + 1000 : size
+            printf "*%d\r\n$4\r\nHSET\r\n$1\r\nh\r\n", 2 * (hi - i) + 2
+            for (j = i; j < hi; j++) { a = f(j); b = v(j); printf "$%d\r\n%s\r\n$%d\r\n%s\r\n", length(a), a, length(b), b }
+          }
+          printf "*4\r\n$4\r\nHSET\r\n$1\r\nh\r\n$1\r\nn\r\n$1\r\n0\r\n"
+          exit
+        }
+        for (q = 0; q < n; q++) {
+          r = int(rand() * size)
+          if (op == "HGET-HIT") cmd(3, "HGET", f(r))
+          else if (op == "HGET-MISS") cmd(3, "HGET", miss(r))
+          else if (op == "HSET") cmd(4, "HSET", f(r), v(r + 1))
+          else if (op == "HDEL-HSET") { cmd(3, "HDEL", f(r)); cmd(4, "HSET", f(r), v(r)) }
+          else if (op == "HINCRBY") cmd(4, "HINCRBY", "n", "1")
+          else if (op == "HMGET") {
+            a = f(r); b = f(int(rand() * size)); c = f(int(rand() * size)); d = miss(r)
+            printf "*6\r\n$5\r\nHMGET\r\n$1\r\nh\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", length(a), a, length(b), b, length(c), c, length(d), d
+          }
+          else if (op == "HLEN") cmd(2, "HLEN")
+          else if (op == "HEXISTS") cmd(3, "HEXISTS", f(r))
+          else if (op == "HSTRLEN") cmd(3, "HSTRLEN", f(r))
+          else if (op == "HGETALL") cmd(2, "HGETALL")
+        }
+      }'
+  }
+  for tag in "$@"; do
+    for size in ${SIZES:-10 128 512 1000 100000 3000000}; do
+      label="H$size"
+      hgen "$size" 1 0 load > /tmp/load
+      ops="HGET-HIT HGET-MISS HSET HDEL-HSET HINCRBY HMGET HLEN HEXISTS HSTRLEN"
+      [ "$size" -le 1000 ] && ops="$ops HGETALL"
+      for op in $ops; do
+        { cat /tmp/load; hgen "$size" 2 2000 "$op"; } > /tmp/hash-warm
+        hgen "$size" 3 "$N" "$op" > /tmp/hash
+        PIPEFILE=/tmp/hash DSIZE=100 one "$tag" "$op-$label"
+      done
+      if [ "$size" = 100000 ]; then
+        { cat /tmp/load; hgen "$size" 2 2 HGETALL; } > /tmp/hash-warm
+        hgen "$size" 3 "${NBIG:-50}" HGETALL > /tmp/hash
+        N=${NBIG:-50} PIPEFILE=/tmp/hash DSIZE=100 one "$tag" "HGETALL-$label"
+      fi
+    done
   done | tee /out/raw.txt
   echo done
   exit 0
