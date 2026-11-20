@@ -34,6 +34,13 @@ connections saw at once (a pause of the process, not a wait for the set's
 lock, which the background holds for at most 0.27 ms a step: see
 `member_set::BACKGROUND_STEP`); its cause is not found yet.
 
+**After the review (`results/review-fill`, commit `72ccc7d1`, 4 runs, `A`):**
+worst `SADD` 1.94 / 1.77 / 1.53 / 1.67 ms, worst `PING` 1.84 / 1.48 / 1.30 /
+1.96 ms, `PING` p99.9 0.069-0.089 ms; no ~9 ms pause in any run. The same
+tree with retired arrays given back a megabyte at a time (`madvise`) before
+they are freed (`B`, runs alternated with `A`): 2.86 / 1.05 / 1.84 / 2.33 ms
+worst `SADD`, so that attempt was not kept.
+
 **`SSCAN` of a 1M-member set, the whole of it** (`sscan`; one client,
 redis-py; every member returned, checked):
 

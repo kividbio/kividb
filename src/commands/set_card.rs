@@ -259,12 +259,15 @@ pub(super) fn union_of(sets: &[Option<Set>]) -> MemberSet {
 /// what adding them one by one makes, as in Redis; as a table otherwise,
 /// each member copied into it once, so that a big one is not a block first,
 /// and then put in the form it would have grown into if it came out small
-/// ([`MemberSet::into_fitting`]). The table starts empty and grows as it is
-/// filled, a few members a write, so that it ends the size a set of that
-/// many members built by `SADD` is: `bound` can be far more than there are
-/// (a table made with room for `bound` kept that room, 1 MiB of groups for a
-/// result of a thousand members). For a small result this costs nothing; a
-/// large one pays the growth's moves, about one more move a member.
+/// ([`MemberSet::into_fitting`]). The table starts with room for no more
+/// than [`TABLE_START`] members and grows as it is filled, so that it ends
+/// the size a set of that many members built by `SADD` is: `bound` can be
+/// far more than there are (a table made with room for `bound` kept that
+/// room: 1 MiB of groups for a result of a thousand members), and a result
+/// that came out much smaller than the start is made again at its size.
+/// Started empty instead, a result of 1,000 members cost 29 % more
+/// instructions (`SINTERSTORE`, perf `SINTERSTORE-S100000`), in the moves of
+/// three growths.
 pub(super) fn collect_set(
     bound: usize,
     walk: impl FnOnce(&mut dyn FnMut(Member<'_>)),
@@ -276,13 +279,16 @@ pub(super) fn collect_set(
         });
         set
     } else {
-        let mut set = MemberSet::new_table(0);
+        let mut set = MemberSet::new_table(bound.min(TABLE_START));
         walk(&mut |member| {
             set.insert_member(&member);
         });
         set.into_fitting()
     }
 }
+
+/// The room [`collect_set`] starts a table with, at most.
+const TABLE_START: usize = 1024;
 
 fn union_card(sets: &[Option<Set>], limit: usize) -> usize {
     let mut sets: Vec<&Set> = sets.iter().flatten().collect();

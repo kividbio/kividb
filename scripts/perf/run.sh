@@ -61,7 +61,7 @@ TAG=${1:?usage: run.sh <tag>} MODEL=${MODEL:-uring}
 mkdir -p "$OUT/out-$TAG"
 MSYS_NO_PATHCONV=1 docker run --rm --security-opt seccomp=unconfined ${DNS:+--dns 1.1.1.1} \
   -e MODEL="$MODEL" -e ONLY="${ONLY:-}" -e N="${N:-60000}" -e WORKLOADS="${WORKLOADS:-}" -e LTO="${LTO:-off}" ${OFFLINE+-e OFFLINE="$OFFLINE"} ${PROFILE:+-e PROFILE="$TAG"} \
-  -e FEATURES="${FEATURES:-}" -e NOOP="${NOOP:-}" -e CMP="${CMP:-}" -e EXEC="${EXEC:-}" \
+  -e FEATURES="${FEATURES:-}" -e NOOP="${NOOP:-}" -e CMP="${CMP:-}" -e EXEC="${EXEC:-}" -e SIZES="${SIZES:-}" -e NBIG="${NBIG:-}" \
   -v "$(cygpath -w "$REPO" 2>/dev/null || echo "$REPO"):/src:ro" \
   -v "$(cygpath -w "$HERE" 2>/dev/null || echo "$HERE"):/perf:ro" \
   -v "$(cygpath -w "$OUT/out-$TAG" 2>/dev/null || echo "$OUT/out-$TAG"):/out" \

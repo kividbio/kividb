@@ -210,7 +210,8 @@ if [ "${WORKLOADS:-}" = sets ]; then
   # that leaves the set as big as it was: SREM then SADD of one member
   # (SREM's and SADD's writes, the set never leaving its form), and SPOP
   # then SADD of a new member. The large rows (SMEMBERS and SUNIONSTORE of
-  # 100,000 members with 1,000 of them, SINTER of the 3,000,000 with a set
+  # 100,000 members with 1,000 of them, SINTERSTORE of the same two (a result
+  # of 1,000), SINTER of the 3,000,000 with a set
   # of 10 of its members, COPY of 1,000,000) are per command, NBIG (50) of
   # them, and 5 COPYs.
   gen() { # kind size seed n op -> RESP on stdout
@@ -250,6 +251,7 @@ if [ "${WORKLOADS:-}" = sets ]; then
           else if (op == "SMEMBERS") out("SMEMBERS", "s")
           else if (op == "SINTER") out("SINTER", "s", "small")
           else if (op == "SUNIONSTORE") printf "*4\r\n$11\r\nSUNIONSTORE\r\n$3\r\ndst\r\n$1\r\ns\r\n$5\r\nsmall\r\n"
+          else if (op == "SINTERSTORE") printf "*4\r\n$11\r\nSINTERSTORE\r\n$3\r\ndst\r\n$1\r\ns\r\n$5\r\nsmall\r\n"
           else if (op == "COPY") { d = sprintf("copy:%d", q); printf "*3\r\n$4\r\nCOPY\r\n$1\r\ns\r\n$%d\r\n%s\r\n", length(d), d }
         }
       }'
@@ -271,7 +273,7 @@ if [ "${WORKLOADS:-}" = sets ]; then
         PIPEFILE=/tmp/set DSIZE=100 one "$tag" "$op-$label"
       done
       big=
-      case $size in 100000) big="SMEMBERS SUNIONSTORE" ;; 3000000) big="SINTER" ;; esac
+      case $size in 100000) big="SMEMBERS SUNIONSTORE SINTERSTORE" ;; 3000000) big="SINTER" ;; esac
       for op in $big; do
         k=1000; [ "$op" = SINTER ] && k=10
         { cat /tmp/load; small "$kind" "$k"; gen "$kind" "$size" 2 2 "$op"; } > /tmp/set-warm

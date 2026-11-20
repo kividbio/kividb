@@ -1034,9 +1034,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     writes leave part-way is finished in the background, a step at a time
     under the set's own lock, and the old array is freed off the command
     path. Filling one set to 3,000,000 members one `SADD` at a time, the
-    slowest `SADD` took 1.1 to 9.6 ms over four runs (119 and 142 ms
-    before, at a doubling; Redis 8.10.2: 5.1 ms), the 99th percentile
-    0.055-0.063 ms as before.
+    slowest `SADD` took 1.5 to 1.9 ms over four runs (119 and 142 ms
+    before, at a doubling; Redis 8.10.2: 5.1 ms; two of four earlier runs
+    of this change had one pause of about 9 ms), the 99th percentile
+    0.055 ms as before.
   - `SSCAN` of such a set reads the table's own groups for its page, with
     `COUNT` a hint as in Redis (a page can be shorter, or empty, before the
     cursor comes back 0), where it read the whole set on every call: a full

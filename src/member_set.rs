@@ -440,7 +440,8 @@ impl MemberSet {
     }
 
     /// A table that a block or an array would hold, made that (as
-    /// [`Self::from_shared`] chooses); any other set as it is.
+    /// [`Self::from_shared`] chooses); a table with room for over four
+    /// times its members, made again at its size; any other set as it is.
     pub fn into_fitting(self) -> Self {
         let Repr::Table(t) = &self.repr else {
             return self;
@@ -462,6 +463,15 @@ impl MemberSet {
             }
             return Self {
                 repr: Repr::Small(Small::Packed(block)),
+            };
+        }
+        if t.members.capacity() > 4 * n {
+            let mut table = Table::with_capacity(n);
+            for m in t.members.iter() {
+                table.push_new(&m);
+            }
+            return Self {
+                repr: Repr::Table(table),
             };
         }
         self
@@ -2296,6 +2306,8 @@ mod tests {
             let set = set.into_fitting();
             assert_eq!(set.encoding(), want);
             assert_eq!(set.len(), members.len());
+            // Made again at its size, not left with room for 100,000.
+            assert!(set.capacity() <= 4 * set.len(), "{}", set.capacity());
             assert!(members.iter().all(|m| set.contains(m.as_bytes())));
         }
     }
