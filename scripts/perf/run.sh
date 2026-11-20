@@ -35,6 +35,14 @@
 #                       1k, 100k, 3M (table); SMEMBERS, SUNIONSTORE,
 #                       SINTER and COPY of big sets (see measure.sh;
 #                       SIZES limits the sizes)
+#   WORKLOADS=zsets     sorted-set commands on one set of 128 (block),
+#                       1k, 100k and 1M members (#875): ZADD of a member
+#                       there and (with ZREM) of a new one, ZINCRBY,
+#                       ZSCORE, ZRANK, ZRANGE 0 9 and from a random rank,
+#                       ZRANGEBYSCORE, ZPOPMIN and ZREMRANGEBYRANK (each
+#                       with a ZADD), ZRANDMEMBER (no count and 10),
+#                       GEOSEARCH, and equal-score rows (see measure.sh;
+#                       SIZES limits the sizes)
 #   WORKLOADS=hashes    hash commands on one hash of each form and size
 #                       (#764 step 3): HGET hit and miss, HSET of a field
 #                       there, HDEL + HSET pairs, HINCRBY, HMGET, HLEN,

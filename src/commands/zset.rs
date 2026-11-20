@@ -178,7 +178,7 @@ fn write_zset<R>(
 ) -> Result<R, Vec<u8>> {
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     match read_lock!(shard).get(key) {
-        Some(ValueRef::SortedSet(zs)) => return Ok(write(&mut zs.write())),
+        Some(ValueRef::SortedSet(zs)) => return Ok(write_and_hand(zs, &mut write)),
         Some(_) => {
             return Err(resp_error(
                 "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -189,7 +189,7 @@ fn write_zset<R>(
     let mut map = write_lock!(shard);
     // Looked for again: it may have been made since.
     match map.get(key) {
-        Some(ValueRef::SortedSet(zs)) => Ok(write(&mut zs.write())),
+        Some(ValueRef::SortedSet(zs)) => Ok(write_and_hand(zs, &mut write)),
         Some(_) => Err(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
@@ -199,11 +199,24 @@ fn write_zset<R>(
             if !zs.is_empty() {
                 // Made whole by one command: a block with no room to spare.
                 zs.shrink_to_fit();
-                map.insert(key, KiviDBValue::SortedSet(Arc::new(RwLock::new(zs))));
+                map.insert(key, KiviDBValue::SortedSet(crate::sorted_set::shared(zs)));
             }
             Ok(out)
         }
     }
+}
+
+/// `write` on the set, which is then handed to the background if its table
+/// was left with a resize to finish (`sorted_set::after_write`).
+#[inline]
+fn write_and_hand<R>(
+    zs: &Arc<RwLock<SortedSetInner>>,
+    write: &mut impl FnMut(&mut SortedSetInner) -> R,
+) -> R {
+    let mut inner = zs.write();
+    let out = write(&mut inner);
+    crate::sorted_set::after_write(zs, &mut inner);
+    out
 }
 
 /// The first bulk string of an array reply: the key, in the reply of a
@@ -1344,6 +1357,7 @@ fn zrem(ctx: &mut Ctx) -> Vec<u8> {
                     removed += 1;
                 }
             }
+            crate::sorted_set::after_write(zs, &mut inner);
             resp_integer(removed)
         }
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -1450,6 +1464,7 @@ fn zset_pop(ctx: &mut Ctx, max: bool) -> Vec<u8> {
                     push_pair(&mut out, member, score, resp, true, nest)
                 });
             }
+            crate::sorted_set::after_write(zs, &mut inner);
             out
         }
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -1475,29 +1490,39 @@ fn zscan(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => resp_array(vec![resp_bulk_str("0"), resp_array(vec![])]),
-        Some(value @ ValueRef::SortedSet(zs)) => {
+        Some(ValueRef::SortedSet(zs)) => {
             // The options are read once the key is known to be a sorted set,
             // as Redis does: a missing key is an empty scan whatever they say.
             let options = match crate::commands::helpers::scan_options(cmd, 3, &["NOSCORES"]) {
                 Ok(options) => options,
                 Err(e) => return e,
             };
-            // A sorted set Redis would encode compactly comes back whole.
-            let (cursor, count) = if crate::commands::generics::scans_whole(value) {
-                (0, usize::MAX)
-            } else {
-                (cursor, options.count)
-            };
-            let inner = zs.read();
-            // In the order of the members' positions: see
-            // `helpers::scan_position`.
-            let (page, next_cursor) = inner.scan_page(cursor, count, 1024);
-            let mut items: Vec<Vec<u8>> = Vec::with_capacity(page.len() * 2);
             let pattern = options
                 .pattern
                 .as_deref()
                 .map(crate::commands::glob_redis::Glob::new);
-            for (member, score) in page {
+            // The set's read lock, once: the form is told from this guard. A
+            // second read on this thread (the form looked up again, as
+            // `generics::scans_whole` once did) waits behind a writer queued
+            // since the first, which waits for the first: a deadlock.
+            let inner = zs.read();
+            // A table (#875) gives the cursor itself: a page reads its own
+            // groups, and `COUNT` is the hint it is in Redis (#770). A
+            // cursor of the earlier form goes on from that position.
+            if let Some(table) = inner.table() {
+                return crate::commands::table_scan::zscan_reply(
+                    table,
+                    cursor,
+                    options.count,
+                    pattern.as_ref(),
+                    options.no_scores,
+                );
+            }
+            // A block comes back whole, in order, as Redis returns a
+            // listpack.
+            let next_cursor = 0;
+            let mut items: Vec<Vec<u8>> = Vec::with_capacity(inner.len() * 2);
+            for (member, score) in inner.iter() {
                 if pattern.as_ref().is_some_and(|glob| !glob.matches(&member)) {
                     continue;
                 }
@@ -1895,7 +1920,9 @@ fn zremrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
             let Some(range) = score_range(min, max) else {
                 return resp_integer(0);
             };
-            let removed = zs.write().remove_range_by_score(range);
+            let mut inner = zs.write();
+            let removed = inner.remove_range_by_score(range);
+            crate::sorted_set::after_write(zs, &mut inner);
             resp_integer(removed as i64)
         }
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -1944,6 +1971,7 @@ fn zremrangebyrank(ctx: &mut Ctx) -> Vec<u8> {
             }
 
             let count = inner.remove_ranks(start as usize, stop as usize);
+            crate::sorted_set::after_write(zs, &mut inner);
             resp_integer(count as i64)
         }
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -1970,7 +1998,9 @@ fn zremrangebylex(ctx: &mut Ctx) -> Vec<u8> {
     match map.get(key) {
         None => resp_integer(0),
         Some(ValueRef::SortedSet(zs)) => {
-            let count = zs.write().remove_where(|member, _| lex_in_range(member));
+            let mut inner = zs.write();
+            let count = inner.remove_where(|member, _| lex_in_range(member));
+            crate::sorted_set::after_write(zs, &mut inner);
             resp_integer(count as i64)
         }
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -2364,7 +2394,7 @@ fn store_built(ctx: &mut Ctx, dst_key: &[u8], inner: SortedSetInner) {
         crate::commands::helpers::delete_key(ctx.store, *ctx.selected_db, dst_key);
         return;
     }
-    let zs = Arc::new(RwLock::new(inner));
+    let zs = crate::sorted_set::shared(inner);
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, dst_key);
     let replaced = write_lock!(shard).insert_expiring(dst_key, KiviDBValue::SortedSet(zs), None);
@@ -2632,6 +2662,7 @@ fn pop_members(
                 };
                 popped.push(entry);
             }
+            crate::sorted_set::after_write(zs, &mut inner);
             Ok(popped)
         }
         Some(_) => Err(resp_error(
@@ -2720,6 +2751,7 @@ fn zmpop(ctx: &mut Ctx) -> Vec<u8> {
                         Some(pair) => popped_pairs.push(pair),
                     }
                 }
+                crate::sorted_set::after_write(zs, &mut inner);
 
                 if popped_pairs.is_empty() {
                     continue;

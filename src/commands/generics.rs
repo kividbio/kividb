@@ -22,23 +22,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// integer from a string, or to check that a structure is still in its
 /// small form. Values here are not kept in those forms; the answer is the
 /// form Redis would be keeping this value in, by Redis's default limits.
-/// Whether Redis would keep `value` in a compact encoding (`intset`,
-/// `listpack`). Redis scans those whole: `SSCAN`, `HSCAN` and `ZSCAN` of one
-/// reply with every element and cursor 0, whatever the cursor and `COUNT`
-/// say. Clients rely on it — BullMQ's dependency pagination expects a small
-/// set in one page.
-pub(crate) fn scans_whole(value: ValueRef<'_>) -> bool {
-    match value {
-        // By the form it is kept in (#297), as Redis goes by its encoding:
-        // an array or a block whole, a table a page at a time.
-        ValueRef::Set(set) => !set.read().is_table(),
-        ValueRef::Hash(hash) => !hash.read().is_table(),
-        ValueRef::HashEx(hash) => !hash.read().fields.is_table(),
-        ValueRef::SortedSet(zset) => zset.read().is_packed(),
-        _ => matches!(encoding_of(value), "listpack" | "listpackex"),
-    }
-}
-
 pub(crate) fn encoding_of(value: ValueRef<'_>) -> &'static str {
     match value {
         ValueRef::String(bytes) => {

@@ -1140,3 +1140,272 @@ fn integer_arguments_are_read_as_redis_reads_them() {
     assert_eq!(c.cmd(&["ZCARD", "z"]).int(), 10, "nothing was removed");
     assert_eq!(c.cmd(&["ZREMRANGEBYRANK", "z", "-2", "-1"]).int(), 2);
 }
+
+/// `ZSCAN` of a small sorted set takes the set's read lock once. Two reads
+/// of it on the scanning thread (the form looked up again while the first
+/// was held, as `SSCAN` once did, #965) wait behind a writer queued in
+/// between, which waits for the first: `ZSCAN`, the writer and every client
+/// of that shard hang. A small set raced by writers, on each I/O model.
+#[test]
+fn zscan_of_a_small_zset_never_waits_on_its_writers() {
+    for model in io_models() {
+        let dir = temp_dir("zscan-race");
+        let server = Server::start(dir.path(), &["--io-model", model]);
+        let mut c = server.conn();
+        c.zadd("zl", &members(10, "member"));
+        assert_eq!(c.encoding("zl"), "listpack");
+        let port = server.port;
+        let until = Instant::now() + Duration::from_secs(3);
+        let mut threads = Vec::new();
+        for _ in 0..4 {
+            threads.push(thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                while Instant::now() < until {
+                    let reply = c.cmd(&["ZSCAN", "zl", "0", "COUNT", "2"]);
+                    assert_eq!(reply.items()[0].text(), "0");
+                }
+            }));
+        }
+        for _ in 0..2 {
+            threads.push(thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                while Instant::now() < until {
+                    c.cmd(&["ZADD", "zl", "1", "extra"]);
+                    c.cmd(&["ZREM", "zl", "extra"]);
+                }
+            }));
+        }
+        // A client that waited for ever fails its read after 30 s.
+        for t in threads {
+            assert!(
+                t.join().is_ok(),
+                "{model}: a client never got its reply (deadlock)"
+            );
+        }
+        assert_eq!(c.cmd(&["PING"]), Resp::Simple("PONG".into()), "{model}");
+    }
+}
+
+/// `MEMORY USAGE` of `key` once it has stopped changing for a second: a
+/// table's resize finished in the background gives its old array back at
+/// its end (a debug build's background can take a while to start on it).
+fn settled_usage(c: &mut Conn, key: &str) -> i64 {
+    let mut last = c.cmd(&["MEMORY", "USAGE", key]).int();
+    let mut same = 0;
+    for _ in 0..3000 {
+        thread::sleep(Duration::from_millis(20));
+        let now = c.cmd(&["MEMORY", "USAGE", key]).int();
+        same = if now == last { same + 1 } else { 0 };
+        if same == 50 {
+            break;
+        }
+        last = now;
+    }
+    last
+}
+
+/// Within 5 % of each other (each table has its own random seed, so its
+/// overflow groups differ a little).
+fn about(got: i64, want: i64, what: &str) {
+    assert!(
+        (got - want).abs() * 100 <= want * 5,
+        "{what}: {got} bytes, against {want}"
+    );
+}
+
+/// A sorted set is sized for the members it holds, not for the arguments it
+/// was given or the pairs a command went through: a `ZADD` naming members
+/// many times, the `*STORE` commands' results (of sets that overlap, so the
+/// pairs read are many more than the members kept) and a `GEOADD` naming
+/// points many times leave a set the size of the same members added once.
+#[test]
+fn a_sorted_set_is_sized_for_its_members_not_its_arguments() {
+    let dir = temp_dir("zsize");
+    let server = Server::start(dir.path(), &[]);
+    let mut c = server.conn();
+    let names: Vec<String> = (0..1_000).map(|i| format!("member:{i:06}")).collect();
+    let zadd_all = |c: &mut Conn, key: &str, times: usize| {
+        let mut args: Vec<String> = vec!["ZADD".into(), key.into()];
+        for _ in 0..times {
+            for (i, name) in names.iter().enumerate() {
+                args.push(i.to_string());
+                args.push(name.clone());
+            }
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert_eq!(c.cmd(&args).int(), 1_000);
+    };
+    zadd_all(&mut c, "ref", 1);
+    zadd_all(&mut c, "ten", 10);
+    // One member, 5,000 times: past the entries limit by its pairs, so the
+    // large form, as in Redis, with a table for one member (one group).
+    let mut args: Vec<&str> = vec!["ZADD", "one"];
+    for _ in 0..5_000 {
+        args.extend(["1", "m"]);
+    }
+    assert_eq!(c.cmd(&args).int(), 1);
+    assert_eq!(c.encoding("one"), "skiplist");
+    let one = settled_usage(&mut c, "one");
+    assert!(one < 2_048, "one member named 5,000 times: {one} bytes");
+    assert_eq!(c.encoding("ten"), "skiplist");
+    let want = settled_usage(&mut c, "ref");
+    about(
+        settled_usage(&mut c, "ten"),
+        want,
+        "ZADD of each member ten times",
+    );
+    // `ref` and `ten` hold the same members: a union and an intersection of
+    // the two read 2,000 pairs for 1,000 members; a difference of `ref` and
+    // a set of 1,000 other members reads 2,000 for 1,000; ZRANGESTORE takes
+    // all of one.
+    let others: Vec<(Vec<u8>, String)> = members(1_000, "other");
+    c.zadd("others", &others);
+    for (cmd, args) in [
+        ("ZUNIONSTORE", vec!["ZUNIONSTORE", "u", "2", "ref", "ten"]),
+        ("ZINTERSTORE", vec!["ZINTERSTORE", "i", "2", "ref", "ten"]),
+        ("ZDIFFSTORE", vec!["ZDIFFSTORE", "d", "2", "ref", "others"]),
+        ("ZRANGESTORE", vec!["ZRANGESTORE", "r", "ten", "0", "-1"]),
+    ] {
+        assert_eq!(c.cmd(&args).int(), 1_000, "{cmd}");
+        let key = args[1];
+        assert_eq!(c.encoding(key), "skiplist", "{cmd}");
+        about(settled_usage(&mut c, key), want, cmd);
+    }
+    // GEOADD of 1,000 points, each named five times in one command, against
+    // the same points once.
+    let mut once: Vec<String> = vec!["GEOADD".into(), "g1".into()];
+    let mut five: Vec<String> = vec!["GEOADD".into(), "g5".into()];
+    for (i, name) in names.iter().enumerate() {
+        let lon = format!("{:.6}", -10.0 + (i % 100) as f64 * 0.01);
+        let lat = format!("{:.6}", 40.0 + (i / 100) as f64 * 0.01);
+        once.extend([lon.clone(), lat.clone(), name.clone()]);
+        for _ in 0..5 {
+            five.extend([lon.clone(), lat.clone(), name.clone()]);
+        }
+    }
+    let once: Vec<&str> = once.iter().map(String::as_str).collect();
+    let five: Vec<&str> = five.iter().map(String::as_str).collect();
+    assert_eq!(c.cmd(&once).int(), 1_000);
+    assert_eq!(c.cmd(&five).int(), 1_000);
+    let want = settled_usage(&mut c, "g1");
+    about(
+        settled_usage(&mut c, "g5"),
+        want,
+        "GEOADD of each point five times",
+    );
+}
+
+/// A sorted set that ends a command mid-resize, in every way a set is made
+/// or written whole, is finished by the background with no further write:
+/// its `MEMORY USAGE` falls to that of the same set settled. 200,705
+/// members is one past the doubling at 200,704, so each of them is left
+/// holding its old 2 MiB array of groups. A set made a key's value without
+/// being handed over (`sorted_set::shared`) would keep it.
+#[test]
+fn a_sorted_set_left_mid_resize_is_finished_in_every_way_it_is_made() {
+    const N: usize = 200_705;
+    let dir = temp_dir("zresize");
+    let mut server = Server::start(dir.path(), &[]);
+    let mut c = server.conn();
+    let pairs: Vec<(Vec<u8>, String)> = (0..N)
+        .map(|i| (format!("m:{i:08}").into_bytes(), i.to_string()))
+        .collect();
+    // ZADD: the growth's own writes, then none.
+    for chunk in pairs.chunks(5_000) {
+        let mut args: Vec<&[u8]> = vec![b"ZADD", b"z"];
+        for (m, s) in chunk {
+            args.push(s.as_bytes());
+            args.push(m);
+        }
+        assert!(matches!(c.raw(&args), Resp::Int(_)));
+    }
+    let settled = settled_usage(&mut c, "z");
+    // A set built whole from a dump, a union of one set, a range of one,
+    // and a copy.
+    let Resp::Bulk(dump) = c.cmd(&["DUMP", "z"]) else {
+        panic!("DUMP");
+    };
+    let restore: [&[u8]; 4] = [b"RESTORE", b"restored", b"0", &dump];
+    assert!(c.raw(&restore).ok());
+    assert_eq!(c.cmd(&["ZUNIONSTORE", "u", "1", "z"]).int(), N as i64);
+    assert_eq!(c.cmd(&["ZRANGESTORE", "r", "z", "0", "-1"]).int(), N as i64);
+    assert_eq!(c.cmd(&["COPY", "z", "copy"]).int(), 1);
+    for key in ["restored", "u", "r", "copy"] {
+        assert_eq!(c.cmd(&["ZCARD", key]).int(), N as i64, "{key}");
+        about(settled_usage(&mut c, key), settled, key);
+    }
+    // And from the snapshot.
+    server.stop("SAVE");
+    server.restart();
+    let mut c = server.conn();
+    for key in ["z", "restored", "u", "r", "copy"] {
+        assert_eq!(c.cmd(&["ZCARD", key]).int(), N as i64, "{key} reloaded");
+        about(
+            settled_usage(&mut c, key),
+            settled,
+            &format!("{key} reloaded"),
+        );
+    }
+    assert_eq!(
+        flat_pairs(&c.cmd(&["ZRANGE", "restored", "0", "2", "WITHSCORES"])),
+        vec![
+            (b"m:00000000".to_vec(), 0.0),
+            (b"m:00000001".to_vec(), 1.0),
+            (b"m:00000002".to_vec(), 2.0)
+        ]
+    );
+}
+
+/// The `SCAN` guarantee through `ZSCAN` of a table (#770): members added
+/// between pages grow the table through several doublings, then deleted
+/// ones shrink it; every member there for the whole scan is returned, with
+/// its score. `COUNT` is the hint it is in Redis: a page at `COUNT 10` of
+/// a large set is about ten members, and `NOSCORES` and `MATCH` apply.
+#[test]
+fn zscan_of_a_table_across_growth_and_shrink_misses_nothing() {
+    let dir = temp_dir("zscan-resize");
+    let server = Server::start(dir.path(), &[]);
+    let mut c = server.conn();
+    let lasting = members(2_000, "keep");
+    c.zadd("t", &lasting);
+    let want: std::collections::HashMap<Vec<u8>, f64> = lasting
+        .iter()
+        .map(|(m, s)| (m.clone(), score_of(s.as_bytes())))
+        .collect();
+    for count in ["10", "100"] {
+        let mut seen = std::collections::HashMap::new();
+        let mut cursor = "0".to_string();
+        let mut page = 0usize;
+        loop {
+            let reply = c.cmd(&["ZSCAN", "t", &cursor, "COUNT", count]);
+            cursor = reply.items()[0].text();
+            for pair in reply.items()[1].items().chunks(2) {
+                seen.insert(pair[0].bulk(), score_of(&pair[1].bulk()));
+            }
+            if cursor == "0" {
+                break;
+            }
+            page += 1;
+            // Grown to 11,000 over nine pages, then back to 2,000.
+            if page < 10 {
+                c.zadd("t", &members(1_000 * page, "grow")[1_000 * (page - 1)..]);
+            } else if page == 10 {
+                let mut args = vec!["ZREM".to_string(), "t".to_string()];
+                args.extend((0..9_000).map(|i| format!("grow:{i:08}")));
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                assert_eq!(c.cmd(&args).int(), 9_000);
+            }
+        }
+        for (m, s) in &want {
+            assert_eq!(seen.get(m), Some(s), "COUNT {count}: missed {m:?}");
+        }
+    }
+    // A page at COUNT 10 of a large set is about ten members, not a
+    // thousandth of it.
+    let reply = c.cmd(&["ZSCAN", "t", "0", "COUNT", "10", "NOSCORES"]);
+    let page = reply.items()[1].items().len();
+    assert!((1..=64).contains(&page), "{page} members on one page");
+    let reply = c.cmd(&["ZSCAN", "t", "0", "MATCH", "nothing*", "COUNT", "10000"]);
+    assert_eq!(reply.items()[0].text(), "0");
+    assert!(reply.items()[1].items().is_empty());
+}

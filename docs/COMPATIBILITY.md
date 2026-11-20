@@ -195,14 +195,23 @@ other files:
 - Small sorted sets are kept as Redis keeps them, and `OBJECT ENCODING`
   says so: `listpack` for up to `zset-max-listpack-entries` (128) members
   of up to `zset-max-listpack-value` (64) bytes, `skiplist` otherwise (a
-  hash table and an ordered tree here). A set moves when a write adds a
+  table of members and an ordered index of them here). A set moves when a write adds a
   member past either limit, or when one `ZADD` (or `GEOADD`) gives more
   pairs than the entries limit, as in Redis; never back: a set taken back
   under the limit stays a `skiplist`, as in Redis. A set made whole (a
   load, `RESTORE`, `MIGRATE`, `ZRANGESTORE`, `ZUNIONSTORE` and the other
   `*STORE` commands) is a `listpack` if it fits, as Redis loads one.
 - `ZSCAN` returns a `listpack` whole, in order, with cursor 0, whatever
-  `COUNT` says, as Redis does.
+  `COUNT` says, as Redis does. A `skiplist` is scanned a page at a time,
+  in no particular order, `COUNT` being a hint as in Redis: a page can be
+  shorter than `COUNT`, or empty, before the cursor comes back 0. Every
+  member there for the whole scan is returned at least once, except in one
+  case no ordinary data reaches: if a run of members that all hash alike
+  makes the table rehash its members with a new seed while a scan is in
+  progress, that scan may miss members (it still ends). A scan begun on
+  1.2.x or earlier and continued after an upgrade (or a cursor from another
+  server) still ends without an error, but may miss or repeat members:
+  begin it again.
 - The two limits go no higher than 128 and 64 (the most one block holds);
   a larger value is taken as those, and `CONFIG GET` says so (Redis keeps
   what it is given, and its listpack holds more). The `zset-max-ziplist-*`

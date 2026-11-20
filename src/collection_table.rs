@@ -2913,6 +2913,241 @@ impl<'a> Iterator for FieldIter<'a> {
 
 impl ExactSizeIterator for FieldIter<'_> {}
 
+// ---------------------------------------------------------------------------
+// Sorted sets
+// ---------------------------------------------------------------------------
+
+/// A sorted set's members and their scores (#875, the storage half): an
+/// entry is the score's eight bytes, then the member as a set's entry has
+/// it (`[len:7|LONG:1]`, `u32 len` when `LONG`, the bytes). Never in the
+/// slot: the score needs the block, and the index of the set's order holds
+/// the block's address (`zset_table`). A block does not move while its
+/// member is in the table: a resize moves the slot words, never the blocks
+/// (`place`, `step_resize`), so an address taken at the insert holds until
+/// the removal.
+pub struct Scores;
+
+impl sealed::Sealed for Scores {}
+
+/// Where a sorted-set entry's member starts: after its score.
+const SCORE_BYTES: usize = 8;
+
+#[inline]
+fn scored_size(len: usize) -> usize {
+    SCORE_BYTES + member_size(len)
+}
+
+/// The member of a sorted set's entry.
+///
+/// # Safety
+/// `entry` is a live sorted-set entry, not freed during `'a`.
+#[inline]
+pub unsafe fn scored_member<'a>(entry: *const u8) -> &'a [u8] {
+    // SAFETY: the caller's promise; the member follows the score.
+    unsafe { member_of(entry.add(SCORE_BYTES)) }
+}
+
+/// The score of a sorted set's entry.
+///
+/// # Safety
+/// `entry` is a live sorted-set entry.
+#[inline]
+pub unsafe fn scored_score(entry: *const u8) -> f64 {
+    // SAFETY: the caller's promise; an entry is aligned to 8
+    // (`ENTRY_ALIGN`) and starts with its score.
+    f64::from_bits(unsafe { entry.cast::<u64>().read() })
+}
+
+impl Kind for Scores {
+    #[inline]
+    unsafe fn hash_of(slot: *mut u8, hasher: &ahash::RandomState) -> u64 {
+        // SAFETY: the caller's promise: a sorted-set entry.
+        hasher.hash_one(unsafe { scored_member(slot) })
+    }
+
+    #[inline]
+    unsafe fn block(slot: *mut u8) -> Option<usize> {
+        // SAFETY: the caller's promise: a sorted-set entry.
+        Some(scored_size(unsafe { scored_member(slot) }.len()))
+    }
+}
+
+/// Where a member a lookup did not find goes ([`CollectionTable::lookup`]):
+/// its hash, good until the table next changes.
+#[derive(Clone, Copy, Debug)]
+pub struct Vacant {
+    h: u64,
+}
+
+impl<A: Memory> CollectionTable<Scores, A> {
+    #[inline]
+    fn find_scored(&self, h: u64, member: &[u8]) -> Option<Found> {
+        self.find(
+            h,
+            |seed| seed.hash_one(member),
+            // SAFETY: the table's slots hold sorted-set entries.
+            |slot| unsafe { scored_member(slot) } == member,
+        )
+    }
+
+    /// The member's entry, or where it goes: one hash and one probe for a
+    /// lookup and the insert that may follow it.
+    #[inline]
+    pub fn lookup(&self, member: &[u8]) -> Result<NonNull<u8>, Vacant> {
+        let h = self.hash(member);
+        match self.find_scored(h, member) {
+            // SAFETY: an element's slot is its entry's address, never null.
+            Some(found) => Ok(unsafe { NonNull::new_unchecked(found.value()) }),
+            None => Err(Vacant { h }),
+        }
+    }
+
+    /// The member's entry.
+    #[inline]
+    pub fn entry(&self, member: &[u8]) -> Option<NonNull<u8>> {
+        self.lookup(member).ok()
+    }
+
+    /// Add `member`, which [`Self::lookup`] did not find (`at`), with
+    /// `score`; its entry, which stays where it is until the member is
+    /// removed.
+    pub fn insert_vacant(
+        &mut self,
+        at: Vacant,
+        member: &[u8],
+        score: f64,
+    ) -> Result<NonNull<u8>, TooLong> {
+        check_len(member.len())?;
+        debug_assert_eq!(at.h, self.hash(member), "a Vacant from before a change");
+        debug_assert!(self.find_scored(at.h, member).is_none());
+        let block = self.new_block(scored_size(member.len()));
+        // SAFETY: a new block of that size, aligned to 8; the length was
+        // checked.
+        unsafe {
+            block.as_ptr().cast::<u64>().write(score.to_bits());
+            write_member_entry(block.as_ptr().add(SCORE_BYTES), member);
+        }
+        self.add(at.h, block.as_ptr());
+        Ok(block)
+    }
+
+    /// Write an entry's score in place: eight bytes, nothing moves.
+    ///
+    /// # Safety
+    /// `entry` is a live entry of this table.
+    #[inline]
+    pub unsafe fn set_score(&mut self, entry: NonNull<u8>, score: f64) {
+        // SAFETY: the caller's promise; `&mut self`: nothing reads it now.
+        unsafe { entry.as_ptr().cast::<u64>().write(score.to_bits()) }
+    }
+
+    /// Remove the member, showing `f` its entry before the entry is freed;
+    /// `None` if it was not there.
+    pub fn remove_scored<R>(
+        &mut self,
+        member: &[u8],
+        f: impl FnOnce(NonNull<u8>) -> R,
+    ) -> Option<R> {
+        let found = self.find_scored(self.hash(member), member)?;
+        let slot = self.take_out(found);
+        // SAFETY: out of the table, not yet freed; a slot is never null.
+        let out = f(unsafe { NonNull::new_unchecked(slot) });
+        // SAFETY: out of the table.
+        unsafe { self.free_element(slot) };
+        self.after_remove();
+        Some(out)
+    }
+
+    /// Remove the member whose entry is `entry` (found by its address, one
+    /// hash of its member), and free the entry.
+    ///
+    /// # Safety
+    /// `entry` is a live entry of this table, and nothing reads it after.
+    pub unsafe fn remove_entry(&mut self, entry: NonNull<u8>) {
+        let found = self
+            .find_slot(entry.as_ptr())
+            .expect("an entry of the table");
+        let slot = self.take_out(found);
+        // SAFETY: out of the table.
+        unsafe { self.free_element(slot) };
+        self.after_remove();
+    }
+
+    /// As [`CollectionTable::<Fields>::scan`], for a sorted set's members
+    /// and their scores.
+    pub fn scan_scored(&self, cursor: u64, count: usize, mut f: impl FnMut(&[u8], f64)) -> u64 {
+        self.scan_scored_counted(cursor, count, |m, s| f(m, s)).0
+    }
+
+    /// [`Self::scan_scored`], and how many groups it read.
+    #[doc(hidden)]
+    pub fn scan_scored_counted(
+        &self,
+        cursor: u64,
+        count: usize,
+        mut f: impl FnMut(&[u8], f64),
+    ) -> (u64, usize) {
+        self.scan_raw(cursor, count, |slot| {
+            // SAFETY: a live entry of the table, unchanged while `self` is
+            // borrowed.
+            unsafe { f(scored_member(slot), scored_score(slot)) }
+        })
+    }
+
+    /// The entry of a member picked uniformly at random.
+    #[inline]
+    pub fn random_entry(&self, rng: &mut impl Rng) -> Option<NonNull<u8>> {
+        // SAFETY: a slot is its entry's address, never null.
+        self.random_slot(rng)
+            .map(|slot| unsafe { NonNull::new_unchecked(slot) })
+    }
+
+    /// Every entry, in no particular order.
+    pub fn entries(&self) -> EntryIter<'_> {
+        EntryIter {
+            slots: self.slots(),
+            left: self.len,
+        }
+    }
+}
+
+/// A sorted set's entries, in no particular order
+/// ([`CollectionTable::entries`]): live while the table is borrowed.
+pub struct EntryIter<'a> {
+    slots: Slots<'a>,
+    left: usize,
+}
+
+impl Iterator for EntryIter<'_> {
+    type Item = NonNull<u8>;
+
+    #[inline]
+    fn next(&mut self) -> Option<NonNull<u8>> {
+        let slot = self.slots.next()?;
+        self.left -= 1;
+        // SAFETY: an entry's address, never null.
+        Some(unsafe { NonNull::new_unchecked(slot) })
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl ExactSizeIterator for EntryIter<'_> {}
+
+impl<K: Kind, A: Memory> CollectionTable<K, A> {
+    /// Start a shrink if the table is under 1/8 full and no resize is in
+    /// progress (a table reserved for more than came): its moves are made a
+    /// few at a time, as any resize's.
+    pub fn shrink_if_sparse(&mut self) {
+        if !self.resizing() && self.sparse() {
+            self.start_shrink();
+        }
+    }
+}
+
 /// The cursor position of `key` in a table: the order `scan` visits in. For
 /// tests of the cursor.
 #[cfg(test)]
