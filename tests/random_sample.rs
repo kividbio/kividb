@@ -672,3 +672,112 @@ fn zrandmember_costs_the_count_not_the_size_of_the_set() {
         ratios[1]
     );
 }
+
+/// `ZADD` reserves its table for every pair it is given, members given
+/// twice included; what came is less, and the table is made as small as
+/// that after the writes. A hundred thousand picks from it then cost about
+/// a hundred thousand bucket reads, not a walk each, and are fair.
+#[test]
+fn a_zadd_of_members_given_many_times_leaves_a_table_that_samples_fast() {
+    let server = Server::start();
+    let mut c = server.conn();
+    for (key, n) in [("one", 1usize), ("thousand", 1000)] {
+        let mut args = vec!["ZADD".to_string(), key.to_string()];
+        for i in 0..100_000usize {
+            let at = i % n + 1;
+            args.push(at.to_string());
+            args.push(format!("m{at}"));
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert_eq!(c.cmd(&args), V::Int(n as i64));
+        assert_eq!(c.cmd(&["OBJECT", "ENCODING", key]).text(), "skiplist");
+        let start = Instant::now();
+        let r = c.cmd(&["ZRANDMEMBER", key, "-100000"]);
+        let positive = c.cmd(&["ZRANDMEMBER", key, &(n / 3).max(1).to_string()]);
+        let took = start.elapsed();
+        assert!(took < Duration::from_secs(2), "{key}: {took:?}");
+        let mut counts = vec![0u64; n];
+        for m in r.arr() {
+            counts[index_of(&m.text())] += 1;
+        }
+        assert_eq!(counts.iter().sum::<u64>(), 100_000);
+        if n > 1 {
+            let x = chi_square(&counts);
+            assert!(x < bound(n - 1, 7.0), "{key}: chi-square {x}");
+        }
+        let names = positive.texts();
+        let distinct: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(distinct.len(), (n / 3).max(1));
+    }
+}
+
+/// A set emptied one member at a time to 20,000 of 200,000 keeps its table
+/// (its 262,144 buckets are more than one `ZPOPMIN` makes smaller): most buckets are empty, and a call that misses too often picks
+/// the rest by one walk of the table. It is bounded and fair, and so are
+/// distinct samples.
+#[test]
+fn a_sparse_table_too_big_to_shrink_is_sampled_in_one_walk() {
+    let server = Server::start();
+    let mut c = server.conn();
+    let n = 200_000;
+    let left = 20_000;
+    fill_zset(&mut c, "z", n);
+    for _ in 0..(n - left) / 1000 {
+        assert_eq!(c.cmd(&["ZPOPMIN", "z", "1000"]).arr().len(), 2000);
+    }
+    assert_eq!(c.cmd(&["ZCARD", "z"]), V::Int(left as i64));
+    // m180001..m200000 are left.
+    let at = |name: &str| index_of(name) - (n - left);
+    let start = Instant::now();
+    let mut counts = vec![0u64; left];
+    for m in c.cmd(&["ZRANDMEMBER", "z", "-200000"]).arr() {
+        counts[at(&m.text())] += 1;
+    }
+    let mut seen = vec![0u64; left];
+    for _ in 0..10 {
+        let names = c.cmd(&["ZRANDMEMBER", "z", "5000"]).texts();
+        let distinct: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(distinct.len(), 5000);
+        for name in &names {
+            seen[at(name)] += 1;
+        }
+    }
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    let x = chi_square(&counts);
+    assert!(x < bound(left - 1, 7.0), "-200000: chi-square {x}");
+    let x = chi_square(&seen);
+    assert!(x < bound(left - 1, 7.0), "5000 x 10: chi-square {x}");
+}
+
+/// Draining a million-member set as a queue: no `ZPOPMIN` stalls on making
+/// the table smaller (one removal shrinks only a table of up to 65,536
+/// buckets; this one is kept, as before tables shrank), and what
+/// is left samples fairly.
+#[test]
+fn draining_a_big_sorted_set_does_not_stall_a_pop() {
+    let server = Server::start();
+    let mut c = server.conn();
+    let n = 1_000_000;
+    fill_zset(&mut c, "z", n);
+    let mut times = Vec::new();
+    for _ in 0..(n - 100) / 100 {
+        let start = Instant::now();
+        assert_eq!(c.cmd(&["ZPOPMIN", "z", "100"]).arr().len(), 200);
+        times.push(start.elapsed());
+    }
+    times.sort();
+    let worst = *times.last().unwrap();
+    let median = times[times.len() / 2];
+    assert!(
+        worst < Duration::from_millis(100),
+        "worst ZPOPMIN {worst:?}, median {median:?}"
+    );
+    // m999901..m1000000 are left.
+    let mut counts = vec![0u64; 100];
+    for m in c.cmd(&["ZRANDMEMBER", "z", "-20000"]).arr() {
+        counts[index_of(&m.text()) - (n - 100)] += 1;
+    }
+    let x = chi_square(&counts);
+    assert!(x < bound(99, 7.0), "chi-square {x}");
+}

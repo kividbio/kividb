@@ -668,6 +668,9 @@ fn zadd(ctx: &mut Ctx) -> Vec<u8> {
                 }
             });
         }
+        // A table reserved for every pair, members given twice included,
+        // is made as small as what came.
+        inner.settle(pairs.len());
         Ok((added, changed, last_score))
     });
     let (added, changed, last_score) = match written {
@@ -2056,16 +2059,15 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
                 range_reply(&picks, resp, with_scores)
             } else {
                 // Any members, each picked on its own: written as they are
-                // picked, nothing gathered first.
+                // picked (a sparse table: the rest by one walk).
                 let count = count_arg.unsigned_abs() as usize;
                 let paired = with_scores && resp >= 3;
                 let mut out =
                     Vec::with_capacity(16 + count.min(1 << 16) * if with_scores { 48 } else { 24 });
                 pairs_header(&mut out, count, with_scores, paired);
-                for _ in 0..count {
-                    let (member, score) = inner.random(&mut rng).expect("the set is not empty");
+                inner.random_each(count, &mut rng, |member, score| {
                     push_pair(&mut out, &member, score, resp, with_scores, paired);
-                }
+                });
                 out
             }
         }
