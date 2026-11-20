@@ -327,7 +327,9 @@ pub(super) fn write_one(
     if here {
         let _key = index.backlog.lock_key(key);
         let seen = index.backlog.ticket(key);
+        let linking = Linking::start();
         super::insert_unit(index, key.to_string(), vector.to_vec(), metric, doc);
+        linking.end();
         index.backlog.forget(key, seen);
         return;
     }
@@ -361,7 +363,9 @@ fn link_own(index: &Arc<HnswIndex>, key: &str, ticket: u64, metric: &DistanceMet
     let Some((vector, doc)) = index.backlog.current(key, ticket) else {
         return;
     };
+    let linking = Linking::start();
     insert_then_done(index, key, ticket, vector, metric, doc);
+    linking.end();
 }
 
 /// A helper's job: link the latest vector of `key`, if one still waits for
@@ -459,18 +463,33 @@ struct Job {
 
 struct Pool {
     jobs: parking_lot::Mutex<VecDeque<Job>>,
+    /// Helpers that take jobs ([`ACTIVE`]) wait here for one.
     ready: parking_lot::Condvar,
+    /// The others wait here for [`ACTIVE`] to take them in again. Apart, so
+    /// that a write's `notify_one` always wakes a helper that takes jobs.
+    parked: parking_lot::Condvar,
 }
 
 static POOL: Pool = Pool {
     jobs: parking_lot::const_mutex(VecDeque::new()),
     ready: parking_lot::Condvar::new(),
+    parked: parking_lot::Condvar::new(),
 };
 
 /// Helper threads running: 0 until the first write asks, when
 /// `search-index-threads` (or its `auto` rule) says none, and if none could
 /// be started.
 static HELPERS: AtomicUsize = AtomicUsize::new(0);
+/// Of them, how many take jobs: helpers `0..ACTIVE`; the rest are parked.
+/// All of them with a number; with `auto`, from [`AUTO_FLOOR`] to all,
+/// as [`adapt`] decides. Changed under the queue's lock ([`set_active`]),
+/// at least one while any runs.
+static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+/// `auto`'s count while the server serves ([`auto_helpers`]).
+static AUTO_FLOOR: AtomicUsize = AtomicUsize::new(0);
+/// Whether [`adapt`] changes [`ACTIVE`]: `auto`, with more helpers started
+/// than its floor.
+static ADAPTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static START: std::sync::Once = std::sync::Once::new();
 
 /// `search-index-threads`: how many helper threads link the vectors written
@@ -478,7 +497,9 @@ static START: std::sync::Once = std::sync::Once::new();
 /// first write that needs them).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum IndexThreads {
-    /// [`auto_helpers`]'s rule.
+    /// [`auto_most`] helpers, of which [`auto_helpers`]'s count take jobs
+    /// while the server serves clients, and all of them while it only
+    /// takes the writes that fill the backlogs ([`adapt`]).
     #[default]
     Auto,
     /// Exactly this many; 0: each write links its vector itself, as 1.2 did.
@@ -552,66 +573,360 @@ pub fn auto_helpers(cpus: usize, quota: bool) -> usize {
     (cpus.saturating_sub(2) / 2).max(1)
 }
 
+/// The most helpers `auto` runs, while the server serves nothing but the
+/// writes that fill the backlogs ([`adapt`]): one fewer than the CPUs, the
+/// CPU left being the loading connection's worker. None where
+/// [`auto_helpers`] starts none.
+///
+/// On an Azure D8s_v5 (4 cores, 8 vCPUs; one client loading in `HSET`
+/// pipelines of 1,000, the build timed until nothing waits), 50,000 384-d
+/// documents took 7.9 s with 3 helpers, 6.7 s with 5 and 6.1 s with 7,
+/// against 5.8 s for Redis 8.10; 200,000 64-d ones 21.2, 17.5 and 15.9 s,
+/// against 12.2 s.
+pub fn auto_most(cpus: usize, quota: bool) -> usize {
+    let floor = auto_helpers(cpus, quota);
+    if floor == 0 {
+        return 0;
+    }
+    cpus.saturating_sub(1).max(floor)
+}
+
 /// How many helpers link vectors, started once, on the first call:
-/// `search-index-threads`, or by [`auto_helpers`] for `auto`.
+/// `search-index-threads`, or by [`auto_most`] for `auto`, of which
+/// [`auto_helpers`]'s count take jobs while the server serves.
 fn helpers() -> usize {
     START.call_once(|| {
         // The process's CPUs: the first write may come from a worker bound
         // to one (`worker-cpu-affinity`), and std would see only that one.
         let cpus = crate::cpus::available_parallelism().map_or(1, |n| n.get());
-        let want = match *CONFIGURED.lock() {
-            IndexThreads::Count(n) => n,
-            // Unit tests have helpers whatever the machine: they test them.
-            IndexThreads::Auto if cfg!(test) => (cpus / 2).max(1),
-            IndexThreads::Auto => auto_helpers(cpus, crate::cpus::cpu_quota().is_some()),
+        let (floor, most) = match *CONFIGURED.lock() {
+            IndexThreads::Count(n) => (n, n),
+            // Unit tests have helpers whatever the machine, and some to
+            // take in and park: they test them.
+            IndexThreads::Auto if cfg!(test) => {
+                let floor = (cpus / 2).max(1);
+                (floor, cpus.saturating_sub(1).max(floor + 2))
+            }
+            IndexThreads::Auto => {
+                let quota = crate::cpus::cpu_quota().is_some();
+                (auto_helpers(cpus, quota), auto_most(cpus, quota))
+            }
         };
+        // Before they start: a helper that found 0 would park until the
+        // count changed.
+        ACTIVE.store(floor, Relaxed);
         let mut started = 0;
-        for n in 0..want {
+        for n in 0..most {
             use crate::cpus::BuilderExt;
             let spawned = std::thread::Builder::new()
                 .name(format!("hnsw-link-{n}"))
-                .spawn_released(helper);
+                .spawn_released(move || helper(n));
             if spawned.is_ok() {
                 started += 1;
+            } else {
+                break; // the helpers are numbered from 0 up, with no gap
             }
         }
+        let floor = floor.min(started);
+        AUTO_FLOOR.store(floor, Relaxed);
+        set_active(floor);
+        #[cfg(test)]
+        let pinned_to_most = std::env::var("KIVIDB_TEST_INDEX_HELPERS").is_ok_and(|v| v == "max");
+        #[cfg(not(test))]
+        let pinned_to_most = false;
+        if pinned_to_most {
+            set_active(started);
+        } else {
+            ADAPTIVE.store(started > floor && floor > 0, Release);
+        }
         HELPERS.store(started, Release);
-        crate::log_info!(
-            "HNSW index threads: {started} (search-index-threads {})",
-            CONFIGURED.lock().name()
-        );
+        if started > floor {
+            crate::log_info!(
+                "HNSW index threads: {floor} while serving, up to {started} while only \
+                 loading (search-index-threads {})",
+                CONFIGURED.lock().name()
+            );
+        } else {
+            crate::log_info!(
+                "HNSW index threads: {started} (search-index-threads {})",
+                CONFIGURED.lock().name()
+            );
+        }
     });
     HELPERS.load(Acquire)
 }
 
-fn helper() {
+/// Helper threads started, and how many of them take jobs now: `FT.INFO`'s
+/// `hnsw_index_threads` and `hnsw_index_threads_active` (0 and 0 before the
+/// first write that needs them).
+pub fn threads() -> (usize, usize) {
+    (HELPERS.load(Acquire), ACTIVE.load(Relaxed))
+}
+
+/// Let helpers `0..n` take jobs, and park the others once they finish the
+/// job they have.
+fn set_active(n: usize) {
+    if ACTIVE.load(Relaxed) == n {
+        return;
+    }
+    {
+        let _jobs = POOL.jobs.lock();
+        ACTIVE.store(n, Relaxed);
+    }
+    POOL.ready.notify_all();
+    POOL.parked.notify_all();
+}
+
+fn helper(n: usize) {
     lower_priority();
+    let mut cpu = thread_cpu_ns();
     loop {
         let job = {
             let mut jobs = POOL.jobs.lock();
             loop {
+                if n >= ACTIVE.load(Relaxed) {
+                    POOL.parked.wait(&mut jobs);
+                    continue;
+                }
                 if let Some(job) = jobs.pop_front() {
                     break job;
                 }
                 POOL.ready.wait(&mut jobs);
             }
         };
-        let Some(index) = job.index.upgrade() else {
-            continue; // the graph is gone
+        if let Some(index) = job.index.upgrade() {
+            link_job(&index, job);
+        } // else the graph is gone
+        if ADAPTIVE.load(Relaxed) {
+            let now = thread_cpu_ns();
+            HELPER_CPU_NS.fetch_add(now.saturating_sub(cpu), Relaxed);
+            cpu = now;
+            adapt();
+        }
+    }
+}
+
+fn link_job(index: &Arc<HnswIndex>, job: Job) {
+    #[cfg(test)]
+    let Some(job) = put_aside(index, job) else {
+        return;
+    };
+    // A panic would leave the vector waiting, where searches still
+    // measure it, and the helper gone: it is caught, and the helper
+    // goes on to the next.
+    let linked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        link_queued(index, &job.key, &job.metric)
+    }));
+    index.backlog.jobs.fetch_sub(1, AcqRel);
+    if linked.is_err() {
+        crate::log_warn!("an HNSW insert failed in a helper thread");
+    }
+}
+
+// ── How many helpers `auto` runs ─────────────────────────────────────────────
+//
+// `auto` starts `auto_most` helpers and lets `auto_helpers` of them take jobs
+// while the server serves clients. While it does nothing but take the writes
+// that fill the backlogs (a bulk load, `FT.CREATE` over existing keys, a
+// replica's full sync), all of them take jobs. Nothing is added to the
+// workers' loop to tell: every `TICK` the helper that has just finished a
+// job reads counters that are kept anyway, and the server counts as serving
+// over that tick if, besides the commands that wrote vectors, it served
+// `SERVING_OPS` commands a second, or if its threads, besides the helpers and
+// the links made in writes, used `SERVING_MILLICPUS` of CPU time.
+
+/// How often the helpers look at what the server is doing.
+const TICK: std::time::Duration = std::time::Duration::from_millis(50);
+/// Quiet looks in a row before the parked helpers are taken in: 200 ms.
+const QUIET_TICKS: u32 = 4;
+/// A look this long after the last one finds that the helpers had nothing
+/// to do meanwhile: what was going on then says nothing about now, and the
+/// count goes back to the floor until the next quiet looks.
+const STALE: std::time::Duration = std::time::Duration::from_millis(200);
+/// Commands a second, besides those that wrote a vector, from which the
+/// server counts as serving.
+pub const SERVING_OPS: u64 = 500;
+/// CPU time a second (in thousandths of a CPU) the process uses besides the
+/// helpers and the links made in writes, from which the server counts as
+/// serving: a loading connection's worker reads and stores the documents
+/// in less.
+pub const SERVING_MILLICPUS: u64 = 1000;
+
+/// CPU time the helpers used, added at the end of each job.
+static HELPER_CPU_NS: AtomicU64 = AtomicU64::new(0);
+/// CPU time writes spent linking their own vectors (a full backlog, a small
+/// graph, a walk over the keys).
+static LINK_CPU_NS: AtomicU64 = AtomicU64::new(0);
+/// Vectors written by commands: [`count_write`].
+static WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// A command wrote a vector to an index: such commands are the load the
+/// extra helpers are for, and are not counted as serving.
+pub(crate) fn count_write() {
+    if ADAPTIVE.load(Relaxed) {
+        WRITES.fetch_add(1, Relaxed);
+    }
+}
+
+/// The CPU time a write spends linking a vector, when `auto` adapts.
+struct Linking(Option<u64>);
+
+impl Linking {
+    fn start() -> Self {
+        Self(ADAPTIVE.load(Relaxed).then(thread_cpu_ns))
+    }
+
+    fn end(self) {
+        if let Some(from) = self.0 {
+            LINK_CPU_NS.fetch_add(thread_cpu_ns().saturating_sub(from), Relaxed);
+        }
+    }
+}
+
+/// This thread's CPU time, in nanoseconds.
+fn thread_cpu_ns() -> u64 {
+    cpu_clock_ns(libc::CLOCK_THREAD_CPUTIME_ID)
+}
+
+fn cpu_clock_ns(clock: libc::clockid_t) -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: writes `ts` only; a failure leaves it at zero.
+    unsafe { libc::clock_gettime(clock, &mut ts) };
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
+}
+
+/// What the counters read at one look.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reading {
+    /// Since some fixed point, nanoseconds.
+    pub wall_ns: u64,
+    /// The process's CPU time.
+    pub cpu_ns: u64,
+    /// Of it, the helpers' and the writes' links.
+    pub linking_ns: u64,
+    /// Commands served.
+    pub commands: u64,
+    /// Of them, those that wrote a vector.
+    pub writes: u64,
+}
+
+/// Whether the server served clients between two readings: by
+/// [`SERVING_OPS`] and [`SERVING_MILLICPUS`].
+pub fn serving(from: &Reading, to: &Reading) -> bool {
+    let wall = to.wall_ns.saturating_sub(from.wall_ns).max(1);
+    let other_cpu = to
+        .cpu_ns
+        .saturating_sub(from.cpu_ns)
+        .saturating_sub(to.linking_ns.saturating_sub(from.linking_ns));
+    let other_ops = to
+        .commands
+        .saturating_sub(from.commands)
+        .saturating_sub(to.writes.saturating_sub(from.writes));
+    let ops_per_s = u128::from(other_ops) * 1_000_000_000 / u128::from(wall);
+    let millicpus = u128::from(other_cpu) * 1000 / u128::from(wall);
+    ops_per_s >= u128::from(SERVING_OPS) || millicpus >= u128::from(SERVING_MILLICPUS)
+}
+
+/// The looks so far: the last reading and how many quiet ones came in a row.
+#[derive(Debug, Default)]
+pub struct Gauge {
+    last: Option<Reading>,
+    quiet: u32,
+}
+
+impl Gauge {
+    /// Look at `now`: whether all the helpers take jobs from here on (true)
+    /// or only the floor (false); `None` if it is too soon to look again.
+    pub fn look(&mut self, now: Reading) -> Option<bool> {
+        let tick = TICK.as_nanos() as u64;
+        let stale = STALE.as_nanos() as u64;
+        let Some(last) = self.last else {
+            self.last = Some(now);
+            self.quiet = 0;
+            return Some(false);
         };
-        #[cfg(test)]
-        let Some(job) = put_aside(&index, job) else {
-            continue;
-        };
-        // A panic would leave the vector waiting, where searches still
-        // measure it, and the helper gone: it is caught, and the helper
-        // goes on to the next.
-        let linked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            link_queued(&index, &job.key, &job.metric)
-        }));
-        index.backlog.jobs.fetch_sub(1, AcqRel);
-        if linked.is_err() {
-            crate::log_warn!("an HNSW insert failed in a helper thread");
+        let since = now.wall_ns.saturating_sub(last.wall_ns);
+        if since < tick {
+            return None;
+        }
+        self.last = Some(now);
+        if since > stale || serving(&last, &now) {
+            self.quiet = 0;
+            return Some(false);
+        }
+        self.quiet = self.quiet.saturating_add(1);
+        Some(self.quiet >= QUIET_TICKS)
+    }
+}
+
+static GAUGE: parking_lot::Mutex<Gauge> = parking_lot::const_mutex(Gauge {
+    last: None,
+    quiet: 0,
+});
+
+/// Since the first look, for [`Reading::wall_ns`].
+static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Look, if it is time to, and take the parked helpers in or park them
+/// again. By one helper at a time; the others go on.
+fn adapt() {
+    let Some(mut gauge) = GAUGE.try_lock() else {
+        return;
+    };
+    let epoch = *EPOCH.get_or_init(std::time::Instant::now);
+    let wall_ns = epoch.elapsed().as_nanos() as u64;
+    if gauge
+        .last
+        .is_some_and(|last| wall_ns.saturating_sub(last.wall_ns) < TICK.as_nanos() as u64)
+    {
+        return;
+    }
+    let now = Reading {
+        wall_ns,
+        cpu_ns: cpu_clock_ns(libc::CLOCK_PROCESS_CPUTIME_ID),
+        linking_ns: HELPER_CPU_NS.load(Relaxed) + LINK_CPU_NS.load(Relaxed),
+        commands: crate::stats::TOTAL_COMMANDS_PROCESSED.total(),
+        writes: WRITES.load(Relaxed),
+    };
+    let Some(all) = gauge.look(now) else {
+        return;
+    };
+    #[cfg(test)]
+    if PINNED.load(Relaxed) != usize::MAX {
+        return;
+    }
+    set_active(if all {
+        HELPERS.load(Acquire)
+    } else {
+        AUTO_FLOOR.load(Relaxed)
+    });
+}
+
+/// Tests: keep [`ACTIVE`] at `n` (at least 1, at most the helpers), or
+/// (`None`) let `auto` decide again.
+#[cfg(test)]
+static PINNED: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+#[cfg(test)]
+pub fn pin_active(n: Option<usize>) {
+    helpers();
+    match n {
+        Some(n) => {
+            PINNED.store(n, Relaxed);
+            set_active(n.clamp(1, HELPERS.load(Acquire)));
+        }
+        None => {
+            PINNED.store(usize::MAX, Relaxed);
+            if std::env::var("KIVIDB_TEST_INDEX_HELPERS").is_ok_and(|v| v == "max") {
+                set_active(HELPERS.load(Acquire));
+            } else {
+                set_active(AUTO_FLOOR.load(Relaxed));
+            }
         }
     }
 }
@@ -863,6 +1178,90 @@ mod tests {
         assert_eq!(auto_helpers(8, false), 3);
         assert_eq!(auto_helpers(16, false), 7);
         assert!(auto_helpers(AUTO_FROM_CPUS, false) >= 1);
+        // The most `auto` runs while only loading: none where it starts
+        // none, otherwise one fewer than the CPUs.
+        assert_eq!(auto_most(16, true), 0);
+        for cpus in 1..AUTO_FROM_CPUS {
+            assert_eq!(auto_most(cpus, false), 0, "{cpus} CPUs");
+        }
+        assert_eq!(auto_most(8, false), 7);
+        assert_eq!(auto_most(16, false), 15);
+        for cpus in AUTO_FROM_CPUS..300 {
+            assert!(auto_most(cpus, false) >= auto_helpers(cpus, false));
+        }
+    }
+
+    /// One look every `TICK` from `at`: CPU and commands besides the links
+    /// and the vector writes, a second.
+    fn reading(at: &mut Reading, ms: u64, millicpus: u64, ops: u64, writes: u64) -> Reading {
+        at.wall_ns += ms * 1_000_000;
+        at.cpu_ns += millicpus * ms * 1000 + 7 * ms * 1_000_000; // 7 CPUs linking
+        at.linking_ns += 7 * ms * 1_000_000;
+        at.commands += (ops + writes) * ms / 1000;
+        at.writes += writes * ms / 1000;
+        *at
+    }
+
+    #[test]
+    fn auto_takes_helpers_in_after_quiet_looks_and_parks_them_at_once() {
+        let tick = TICK.as_millis() as u64;
+        let mut g = Gauge::default();
+        let mut at = Reading::default();
+        // The first look: the floor.
+        assert_eq!(g.look(at), Some(false));
+        // Too soon.
+        assert_eq!(g.look(reading(&mut at.clone(), tick / 2, 0, 0, 0)), None);
+        // A load alone (20,000 vector writes a second, the loader's worker
+        // at 0.3 CPU, FT.INFO polled 100 times a second): quiet, and after
+        // QUIET_TICKS looks, all of them.
+        for i in 1..=QUIET_TICKS {
+            let all = g.look(reading(&mut at, tick, 300, 100, 20_000));
+            assert_eq!(all, Some(i >= QUIET_TICKS), "look {i}");
+        }
+        assert_eq!(g.look(reading(&mut at, tick, 300, 100, 20_000)), Some(true));
+        // Clients arrive: back to the floor at the next look, by commands...
+        let clients = reading(&mut at, tick, 300, SERVING_OPS, 20_000);
+        assert_eq!(g.look(clients), Some(false));
+        // ...and again only after QUIET_TICKS quiet looks.
+        for i in 1..=QUIET_TICKS {
+            let all = g.look(reading(&mut at, tick, 300, 0, 20_000));
+            assert_eq!(all, Some(i >= QUIET_TICKS), "look {i}");
+        }
+        // ...or by CPU time: a few expensive commands.
+        let expensive = reading(&mut at, tick, SERVING_MILLICPUS, 50, 0);
+        assert_eq!(g.look(expensive), Some(false));
+        for _ in 0..QUIET_TICKS {
+            g.look(reading(&mut at, tick, 0, 0, 0));
+        }
+        assert_eq!(g.look(reading(&mut at, tick, 0, 0, 0)), Some(true));
+        // A look long after the last (the helpers had nothing to do): the
+        // floor, until quiet looks again.
+        let stale = STALE.as_millis() as u64 + 1;
+        assert_eq!(g.look(reading(&mut at, stale, 0, 0, 0)), Some(false));
+        assert_eq!(g.look(reading(&mut at, tick, 0, 0, 0)), Some(false));
+    }
+
+    #[test]
+    fn serving_counts_what_is_not_the_load() {
+        let from = Reading::default();
+        let second = 1_000_000_000;
+        let to = |cpu_ns, linking_ns, commands, writes| Reading {
+            wall_ns: second,
+            cpu_ns,
+            linking_ns,
+            commands,
+            writes,
+        };
+        let (busy, linking) = (8 * second, 15 * second / 2);
+        // 8 CPUs busy, 7.5 of them linking; 100,000 commands, all writing
+        // vectors: a load.
+        assert!(!serving(&from, &to(busy, linking, 100_000, 100_000)));
+        // The same and 500 other commands.
+        assert!(serving(&from, &to(busy, linking, 100_500, 100_000)));
+        // One CPU besides the links.
+        assert!(serving(&from, &to(busy, 7 * second, 100_000, 100_000)));
+        // Counters reset (CONFIG RESETSTAT) or behind: nothing, not a wrap.
+        assert!(!serving(&from, &to(0, second, 0, 10)));
     }
 
     /// A graph past [`HERE_BELOW`], so that writes go through the backlog.
@@ -1492,6 +1891,99 @@ mod concurrency {
         }
         // The helpers were started once, not per index or per burst.
         assert_eq!(helpers(), helpers_before);
+    }
+
+    /// Helpers taken in and parked again every few hundred microseconds, as
+    /// `auto` does when clients come and go, while writers (`HSET`, `DEL`),
+    /// searchers, compactions and drops race them: every check of `run`
+    /// holds, a graph dropped while writers still write is let go, and no
+    /// vector is left waiting.
+    #[test]
+    fn helpers_taken_in_and_parked_during_a_build_change_nothing() {
+        let most = helpers();
+        assert!(most >= 3, "the tests start some helpers to park");
+        let stop = Arc::new(AtomicBool::new(false));
+        let flipper = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut flips = 0usize;
+                while !stop.load(Relaxed) {
+                    // All, then one, two, ... in turn: every count is seen.
+                    let n = if flips.is_multiple_of(2) {
+                        most
+                    } else {
+                        1 + (flips / 2) % most
+                    };
+                    pin_active(Some(n));
+                    assert!(threads().1 >= 1);
+                    flips += 1;
+                    std::thread::sleep(std::time::Duration::from_micros(300));
+                }
+                flips
+            })
+        };
+        for seed in 21..=24u64 {
+            let metric = if seed % 2 == 0 {
+                DistanceMetric::Cosine
+            } else {
+                DistanceMetric::L2
+            };
+            run(seed, metric, seed % 2 == 0);
+        }
+        let metric = DistanceMetric::L2;
+        for round in 0..4u64 {
+            let name = format!("sd{round}");
+            let (store, indexes) = setup(&name, &metric);
+            let mut rng = Rng(round + 211);
+            for i in 0..1200 {
+                write(
+                    &store,
+                    &indexes,
+                    &format!("{name}:{i}"),
+                    Some(&rng.vector()),
+                );
+            }
+            let g = graph(&indexes, &name);
+            let writers: Vec<_> = (0..3u64)
+                .map(|w| {
+                    let (store, indexes, name) =
+                        (Arc::clone(&store), indexes.clone(), name.clone());
+                    std::thread::spawn(move || {
+                        let mut rng = Rng((round * 7 + w) | 1);
+                        for _ in 0..1500 {
+                            let key = format!("{name}:{}", rng.below(2000));
+                            let v = (rng.below(4) != 0).then(|| rng.vector());
+                            let _order =
+                                crate::write_order::lock_keys(0, std::iter::once(key.as_bytes()));
+                            write(&store, &indexes, &key, v.as_deref());
+                        }
+                    })
+                })
+                .collect();
+            std::thread::sleep(std::time::Duration::from_millis(5 + round * 5));
+            if round % 2 == 0 {
+                assert!(crate::vector::remove_index(&mut indexes.write(), &name));
+            } else {
+                crate::vector::drop_all_indexes(&indexes);
+            }
+            for w in writers {
+                w.join().unwrap();
+            }
+            assert!(settle(&g, std::time::Duration::from_secs(60)));
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while Arc::strong_count(&g) > 1 {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "round {round}: a helper kept the dropped graph"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        stop.store(true, Relaxed);
+        let flips = flipper.join().unwrap();
+        pin_active(None);
+        assert!(flips > 20, "{flips} changes of the count");
+        assert_eq!(helpers(), most);
     }
 
     /// An index dropped while vectors wait and helpers link them: the

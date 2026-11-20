@@ -2639,6 +2639,7 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
                     {
                         continue;
                     }
+                    backlog::count_write();
                     backlog::write(idx, key, vec, &metric, doc);
                 }
             }
