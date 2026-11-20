@@ -10,7 +10,6 @@
 //! shown itself to be quick (`FAST_SCRIPTS`): after one run under `PROMOTE_US` it runs on the
 //! worker, like any other command, and one run over `DEMOTE_US` there sends it back to the pool.
 
-use crate::commands::ctx::AofSender;
 #[cfg(feature = "lua")]
 use crate::commands::ctx::Ctx;
 #[cfg(feature = "lua")]
@@ -18,86 +17,7 @@ use crate::commands::execute_command;
 #[cfg(feature = "lua")]
 use crate::cpus::BuilderExt as _;
 
-/// The AOF queue, as a script run on another thread holds it. Both server
-/// paths queue on a tokio channel.
-#[cfg(feature = "lua")]
-#[derive(Clone)]
-pub(crate) enum AofBridge {
-    Tokio(tokio::sync::mpsc::UnboundedSender<Vec<u8>>),
-}
-
-#[cfg(feature = "lua")]
-impl AofSender for AofBridge {
-    // Same contract as the inherent impls in `commands::ctx`: a record handed
-    // here is never dropped. Writes issued from Lua are as durable as any
-    // other; discarding them would tear a hole in the AOF that is invisible
-    // until a recovery silently comes back short.
-    fn send_aof(&self, data: Vec<u8>) {
-        let failed = match self {
-            Self::Tokio(tx) => tx.send(data).is_err(),
-        };
-        if failed {
-            crate::aof::record_lost_aof_record();
-        } else {
-            crate::aof::records_queued();
-        }
-    }
-}
-
-/// What a connection's scripts run with, made once for the connection.
-///
-/// Shared, not copied: a script handed to the runner thread takes the
-/// connection's env with it, and copying it was twenty-odd reference counts
-/// moved, and two strings made, on one thread and let go of on another, for
-/// every script (#901).
-#[cfg(feature = "lua")]
-#[derive(Clone)]
-pub(crate) struct ClientExecEnv(std::sync::Arc<ClientExecEnvParts>);
-
-#[cfg(feature = "lua")]
-impl std::ops::Deref for ClientExecEnv {
-    type Target = ClientExecEnvParts;
-    fn deref(&self) -> &ClientExecEnvParts {
-        &self.0
-    }
-}
-
-#[cfg(feature = "lua")]
-pub(crate) struct ClientExecEnvParts {
-    pub store: crate::store::Store,
-    pub lastsave: std::sync::Arc<parking_lot::RwLock<i64>>,
-    pub aof_bridge: AofBridge,
-    pub config: std::sync::Arc<crate::config::Config>,
-    pub started_at: std::sync::Arc<std::time::Instant>,
-    pub index_store: crate::vector::IndexStore,
-    pub dict_store: crate::vector::DictStore,
-    pub wait_table: std::sync::Arc<crate::wait_table::WaitTable>,
-    pub ts_index: crate::store::SharedTsIndex,
-    pub pubsub: crate::pubsub::PubSubHub,
-    pub hub_tx: crate::replication::HubTx,
-    pub repl_state: std::sync::Arc<crate::replication::ReplState>,
-    pub watch_registry: crate::watch::WatchRegistry,
-    pub client_registry: crate::client_registry::ClientRegistry,
-    pub acl_store: crate::acl::AclStore,
-    pub acl_log: crate::acl::SharedAclLog,
-    pub slowlog: crate::slowlog::SharedSlowLog,
-    pub latency: crate::latency::SharedLatencyTracker,
-    pub compaction_tx: crate::vector::CompactionTx,
-    pub cluster_state: std::sync::Arc<crate::cluster::ClusterState>,
-    pub monitor_registry: crate::monitor::SharedMonitorRegistry,
-    pub tracking_table: crate::tracking::TrackingTable,
-    pub peer_addr: String,
-    /// Whether the client is connected over IPv6 (#847), worked out once.
-    pub peer_ipv6: bool,
-    pub client_id: u64,
-    /// The connection's `CLIENT NO-TOUCH` flag when this env was made: a
-    /// script's own commands take it as their client's flag (`Ctx::resp`'s `RESP_NO_TOUCH`).
-    /// A copy, not a borrow: the env outlives the loop local, the flag
-    /// cannot be set from inside a script anyway, and the loop remakes the
-    /// env when the flag changes (#566).
-    pub no_touch: bool,
-    pub authenticated_user: String,
-}
+pub(crate) use crate::deferred::{AofBridge, ClientExecEnv};
 
 #[cfg(feature = "lua")]
 impl ClientExecEnv {
@@ -171,69 +91,6 @@ impl ClientExecEnv {
         };
         let out = crate::commands::with_client_resp(client_resp, || execute_command(ctx));
         (out, db)
-    }
-}
-
-#[cfg(feature = "lua")]
-impl ClientExecEnv {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn snapshot(
-        store: &crate::store::Store,
-        lastsave: &std::sync::Arc<parking_lot::RwLock<i64>>,
-        aof_bridge: AofBridge,
-        config: &std::sync::Arc<crate::config::Config>,
-        started_at: &std::sync::Arc<std::time::Instant>,
-        index_store: &crate::vector::IndexStore,
-        dict_store: &crate::vector::DictStore,
-        wait_table: &std::sync::Arc<crate::wait_table::WaitTable>,
-        ts_index: &crate::store::SharedTsIndex,
-        pubsub: &crate::pubsub::PubSubHub,
-        hub_tx: &crate::replication::HubTx,
-        repl_state: &std::sync::Arc<crate::replication::ReplState>,
-        watch_registry: &crate::watch::WatchRegistry,
-        client_registry: &crate::client_registry::ClientRegistry,
-        acl_store: &crate::acl::AclStore,
-        acl_log: &crate::acl::SharedAclLog,
-        slowlog: &crate::slowlog::SharedSlowLog,
-        latency: &crate::latency::SharedLatencyTracker,
-        compaction_tx: &crate::vector::CompactionTx,
-        cluster_state: &std::sync::Arc<crate::cluster::ClusterState>,
-        monitor_registry: &crate::monitor::SharedMonitorRegistry,
-        tracking_table: &crate::tracking::TrackingTable,
-        peer_addr: &str,
-        client_id: u64,
-        no_touch: bool,
-        authenticated_user: &str,
-    ) -> Self {
-        Self(std::sync::Arc::new(ClientExecEnvParts {
-            store: store.clone(),
-            lastsave: lastsave.clone(),
-            aof_bridge,
-            config: config.clone(),
-            started_at: started_at.clone(),
-            index_store: index_store.clone(),
-            dict_store: dict_store.clone(),
-            wait_table: wait_table.clone(),
-            ts_index: ts_index.clone(),
-            pubsub: pubsub.clone(),
-            hub_tx: hub_tx.clone(),
-            repl_state: repl_state.clone(),
-            watch_registry: watch_registry.clone(),
-            client_registry: client_registry.clone(),
-            acl_store: acl_store.clone(),
-            acl_log: acl_log.clone(),
-            slowlog: slowlog.clone(),
-            latency: latency.clone(),
-            compaction_tx: compaction_tx.clone(),
-            cluster_state: cluster_state.clone(),
-            monitor_registry: monitor_registry.clone(),
-            tracking_table: tracking_table.clone(),
-            peer_addr: peer_addr.to_string(),
-            peer_ipv6: crate::cluster::is_ipv6_peer(peer_addr),
-            client_id,
-            no_touch,
-            authenticated_user: authenticated_user.to_string(),
-        }))
     }
 }
 

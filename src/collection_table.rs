@@ -1,7 +1,7 @@
 //! The large form of hashes and sets (#764): [`CollectionTable`].
 //!
-//! The design is on #764. Large sets are kept in it (`member_set`, step 2);
-//! hashes move onto it later (step 3).
+//! The design is on #764. Large sets are kept in it (`member_set`, step 2),
+//! and large hashes (`hash_fields`, step 3).
 //!
 //! **Layout.** A power-of-two array of 64-byte groups, one cache line each:
 //! seven control bytes, one meta byte and seven 8-byte slots (`Group`). A
@@ -50,7 +50,7 @@
 //! resize with a new seed has ended has the guarantee again. A scan whose
 //! pages span a resize with a new seed has no guarantee whether or not
 //! anything is written between its pages: the server's background
-//! (`member_set::step_background`) takes steps of a resize in progress
+//! (`resize_background::step_background`) takes steps of a resize in progress
 //! between pages too. Only a chain over [`CHAIN_CAP`] starts such a resize,
 //! which random keys do not reach (see above).
 //!
@@ -72,8 +72,8 @@
 //! The invariants each relies on are stated where they are, and checked by
 //! `debug_assert!`s and, in tests, by `check()`.
 
-// The hash form and the measurement hooks are not used by the server yet
-// (#764 step 3).
+// The measurement hooks, the field TTLs kept in an entry (#764 step 5) and
+// the memory kinds kept for comparison are not used by the server.
 #![allow(dead_code)]
 
 use std::alloc::Layout;
@@ -703,6 +703,13 @@ fn max_len() -> usize {
     TEST_MAX_LEN.with(std::cell::Cell::get)
 }
 
+/// Lower the limit on this thread (`None`: back to [`MAX_LEN`]), for a
+/// test of a caller's refusal.
+#[cfg(test)]
+pub(crate) fn set_test_max_len(limit: Option<usize>) {
+    TEST_MAX_LEN.with(|max| max.set(limit.unwrap_or(MAX_LEN)));
+}
+
 /// Whether a length is one a table holds: checked before any block is
 /// allocated.
 #[inline]
@@ -884,6 +891,34 @@ unsafe fn field_ref<'a>(entry: *const u8) -> FieldRef<'a> {
             ttl,
             ttl_position,
         }
+    }
+}
+
+/// A hash entry's field and value, its TTL not read: a short entry's data
+/// is at 2, or 14 past a TTL.
+///
+/// # Safety
+/// `entry` is a live hash entry, not freed or rewritten during `'a`.
+#[inline(always)]
+unsafe fn field_and_value<'a>(entry: *const u8) -> (&'a [u8], &'a [u8]) {
+    // SAFETY: the caller's promise; every offset is inside the entry.
+    unsafe {
+        let b0 = *entry;
+        let b1 = *entry.add(1);
+        let (flen, vlen, at) = if b1 & 1 == 0 {
+            (
+                usize::from(b0 >> 1),
+                usize::from(b1 >> 1),
+                2 + 12 * usize::from(b0 & 1),
+            )
+        } else {
+            let h = field_header(entry);
+            (h.flen, h.vlen, h.data_at)
+        };
+        (
+            std::slice::from_raw_parts(entry.add(at), flen),
+            std::slice::from_raw_parts(entry.add(at + flen), vlen),
+        )
     }
 }
 
@@ -2578,9 +2613,43 @@ impl<A: Memory> CollectionTable<Fields, A> {
     }
 
     /// Every field, in no particular order.
-    pub fn iter(&self) -> impl Iterator<Item = FieldRef<'_>> + '_ {
-        // SAFETY: live entries, unchanged while `self` is borrowed.
-        self.slots().map(|slot| unsafe { field_ref(slot) })
+    pub fn iter(&self) -> FieldIter<'_> {
+        FieldIter {
+            slots: self.slots(),
+            left: self.len,
+        }
+    }
+
+    /// Every field and its value, in no particular order, given to `f`:
+    /// a plain walk of the groups (main array, chains, then the old array
+    /// of a resize in progress) that reads only an entry's two lengths, not
+    /// its TTL, for the commands that return a whole hash (`HGETALL`).
+    #[inline]
+    pub fn for_each_field(&self, mut f: impl FnMut(&[u8], &[u8])) {
+        let old = self
+            .rare
+            .as_ref()
+            .and_then(|rare| rare.old.as_ref())
+            .map(|o| (o.array, o.next));
+        for (array, from) in [Some((self.main(), 0)), old].into_iter().flatten() {
+            for index in from..array.len() {
+                let mut group: *const Group = array.group(index);
+                while !group.is_null() {
+                    // SAFETY: a live group of the table, unchanged while
+                    // `self` is borrowed; its full slots hold live entries.
+                    unsafe {
+                        let mut mask = (*group).full();
+                        while mask != 0 {
+                            let entry = (*group).slots[first(mask)];
+                            mask &= mask - 1;
+                            let (field, value) = field_and_value(entry);
+                            f(field, value);
+                        }
+                        group = (*group).link();
+                    }
+                }
+            }
+        }
     }
 
     /// Calls `f` with every field whose position is at or after `cursor`, a
@@ -2815,6 +2884,34 @@ impl<'a> Iterator for MemberIter<'a> {
 }
 
 impl ExactSizeIterator for MemberIter<'_> {}
+
+/// A hash's fields, in no particular order ([`CollectionTable::iter`]): a
+/// type of its own so that a hash's iterator can hold it, and exact about
+/// how many are left.
+pub struct FieldIter<'a> {
+    slots: Slots<'a>,
+    left: usize,
+}
+
+impl<'a> Iterator for FieldIter<'a> {
+    type Item = FieldRef<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<FieldRef<'a>> {
+        let slot = self.slots.next()?;
+        self.left -= 1;
+        // SAFETY: a live entry of the table the iterator borrows, which
+        // stays unchanged while it is borrowed.
+        Some(unsafe { field_ref(slot) })
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl ExactSizeIterator for FieldIter<'_> {}
 
 /// The cursor position of `key` in a table: the order `scan` visits in. For
 /// tests of the cursor.
@@ -3721,6 +3818,37 @@ mod tests {
         }
         assert!(table.resizing());
         chi_square(&table, &members, per, 3);
+    }
+
+    /// `for_each_field` gives what `iter` gives, field and value, for
+    /// short and long entries, with and without a TTL, mid-resize too.
+    #[test]
+    fn for_each_field_is_iter_without_the_ttl() {
+        let mut t = CollectionTable::<Fields>::with_capacity(0);
+        let mut seen_resizing = false;
+        for i in 0..20_000u32 {
+            let field = format!("f{i}");
+            let value = if i % 7 == 0 {
+                vec![b'v'; 200]
+            } else {
+                i.to_string().into_bytes()
+            };
+            let ttl = (i % 3 == 0).then_some(u64::from(i));
+            t.insert(field.as_bytes(), &value, ttl).unwrap();
+            if i % 997 == 0 || (t.resizing() && !seen_resizing) {
+                seen_resizing |= t.resizing();
+                let mut walked: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                t.for_each_field(|f, v| walked.push((f.to_vec(), v.to_vec())));
+                let mut iterated: Vec<(Vec<u8>, Vec<u8>)> = t
+                    .iter()
+                    .map(|e| (e.field.to_vec(), e.value.to_vec()))
+                    .collect();
+                walked.sort();
+                iterated.sort();
+                assert_eq!(walked, iterated, "after {i}");
+            }
+        }
+        assert!(seen_resizing);
     }
 
     #[test]

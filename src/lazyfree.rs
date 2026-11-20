@@ -172,11 +172,17 @@ pub fn release(value: KiviDBValue) {
 /// with `yes`, as `UNLINK` frees it; with `no`, the default, before the
 /// reply, as Redis does.
 ///
-/// Freeing millions of elements takes a while. It takes no lock, but on the
-/// Tokio runtime it used to hold up every other connection's commands for as
-/// long (#754): it runs as other long work does (`helpers::long_work`).
+/// Freeing millions of elements takes a while. It takes no lock, but it
+/// used to hold up other connections' commands for as long: every one on
+/// the Tokio runtime (#754), the ones of its thread on io_uring (#762). The
+/// command's connection frees it once the command is done, out of its gates
+/// (a `DEL` of several keys takes the command gate alone), and on a thread of
+/// its own on io_uring, before it replies (`deferred::free_weighed`).
 #[inline]
-pub fn release_deleted(value: KiviDBValue) {
+pub fn release_deleted(
+    blocking: &mut Option<&mut crate::commands::blocking::BlockingCtl>,
+    value: KiviDBValue,
+) {
     let effort = effort(&value);
     if effort <= THRESHOLD {
         return;
@@ -184,7 +190,7 @@ pub fn release_deleted(value: KiviDBValue) {
     if lazy_user_del() {
         free_later(value, 1);
     } else {
-        crate::commands::helpers::long_work(effort as usize, move || drop(value));
+        crate::deferred::free_weighed(blocking, value, effort);
     }
 }
 

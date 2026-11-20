@@ -330,6 +330,27 @@ pub fn stall_for_test(name: &str, cmd: &[&[u8]]) {
     }
 }
 
+thread_local! {
+    /// Set while a write that waited out a handoff or a move of its keys
+    /// outside its gates is dispatched again (`handler`): it was held at
+    /// `routed` already, and is not held there again.
+    static DISPATCHED_AGAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `dispatch`, as the dispatch again of a write that waited outside its
+/// gates (see [`DISPATCHED_AGAIN`]).
+pub fn dispatched_again<T>(dispatch: impl FnOnce() -> T) -> T {
+    let before = DISPATCHED_AGAIN.with(|again| again.replace(true));
+    let reply = dispatch();
+    DISPATCHED_AGAIN.with(|again| again.set(before));
+    reply
+}
+
+/// Whether the test hook `routed` is set up (`KIVIDB_TEST_STALL_KEYS`).
+pub fn test_stalls_on() -> bool {
+    test_stall_keys().is_some()
+}
+
 fn test_stall_keys() -> Option<&'static [Vec<u8>]> {
     static KEYS: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
     let keys = KEYS.get_or_init(|| {
@@ -351,7 +372,11 @@ fn stall_if_named(keys: &[Vec<u8>], name: &str, cmd: &[&[u8]]) {
     let named = key_positions(name, cmd)
         .iter()
         .any(|pos| keys.iter().any(|key| key.as_slice() == cmd[pos]));
-    if name == "MIGRATE" || !named || crate::write_gate::held_by_this_thread() {
+    if name == "MIGRATE"
+        || !named
+        || crate::write_gate::held_by_this_thread()
+        || DISPATCHED_AGAIN.with(|again| again.get())
+    {
         return;
     }
     // Leaving the worker's other tasks to another thread of the

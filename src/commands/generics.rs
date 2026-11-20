@@ -408,6 +408,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             } else {
                 options.count
             };
+            // On an io_uring worker, long work is run again on a thread of
+            // its own, while this one serves its other connections (#762).
+            if crate::deferred::run_elsewhere(&mut ctx.blocking, cmd, units) {
+                return Some(crate::pause::HELD_IN_GATE.to_vec());
+            }
             let (found, returned, next_cursor) = crate::commands::helpers::long_work(units, walk);
 
             let cursor = next_cursor.to_string();
@@ -429,6 +434,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Any bytes, as Redis's `stringmatchlen` matches them.
             let pattern = cmd[1];
 
+            // On an io_uring worker, long work is run again on a thread of
+            // its own, while this one serves its other connections (#762).
+            let units = crate::commands::helpers::db_len(&ctx.store[*ctx.selected_db]);
+            if crate::deferred::run_elsewhere(&mut ctx.blocking, cmd, units) {
+                return Some(crate::pause::HELD_IN_GATE.to_vec());
+            }
             let db = &ctx.store[*ctx.selected_db];
             // A shard at a time, each let go of before the next is taken:
             // nothing waits for the whole walk, only for the shard it is
@@ -476,8 +487,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 (found, returned)
             };
-            let (found, returned) =
-                crate::commands::helpers::long_work(crate::commands::helpers::db_len(db), walk);
+            let (found, returned) = crate::commands::helpers::long_work(units, walk);
 
             let mut buf = Vec::with_capacity(found.len() + 16);
             buf.push(b'*');
@@ -1022,7 +1032,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         } else if !matches!(value, KiviDBValue::String(_)) {
                             // A string is one allocation: freed here, as
                             // it is dropped, with nothing to weigh.
-                            crate::lazyfree::release_deleted(value)
+                            crate::lazyfree::release_deleted(&mut ctx.blocking, value)
                         }
                     })
                     .is_some();
@@ -1540,6 +1550,24 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let map = read_lock!(shard);
             let missing = !map.contains_key(key);
 
+            // Millions of elements, on an io_uring worker: run again on a
+            // thread of its own, while this one serves its other
+            // connections (#762). Not with `STORE`, which writes; nor in
+            // cluster mode, where it would be routed again (`deferred`).
+            if store_dst.is_none() && !ctx.cluster.enabled {
+                let len = match map.get(key) {
+                    Some(ValueRef::List(l)) => l.read().len(),
+                    Some(ValueRef::Set(s)) => s.read().len(),
+                    Some(ValueRef::SortedSet(z)) => z.read().len(),
+                    _ => 0,
+                };
+                if len >= crate::commands::helpers::LONG_WORK
+                    && crate::deferred::run_elsewhere(&mut ctx.blocking, cmd, len)
+                {
+                    return Some(crate::pause::HELD_IN_GATE.to_vec());
+                }
+            }
+
             let mut elements: Vec<Arc<[u8]>> = match map.get(key) {
                 None => vec![], // ← don't return, just give empty vec
                 Some(ValueRef::List(l)) => l.read().iter().map(|e| e.to_shared()).collect(),
@@ -1610,74 +1638,83 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 .map(|p| p.eq_ignore_ascii_case(b"nosort"))
                 .unwrap_or(false);
 
-            if is_nosort && in_score_order && descending {
-                elements.reverse();
-            } else if constant_by_lex {
-                if descending {
-                    elements.sort_unstable_by(|a, b| b.cmp(a));
-                } else {
-                    elements.sort_unstable();
-                }
-            } else if !is_nosort {
-                // Zip elements with their resolved sort keys, sort the pairs, unzip.
-                // This is the idiomatic Rust way to sort with external keys while
-                // keeping indices aligned — no unsafe, no index juggling.
-                let has_external_keys = sort_keys.iter().any(|k| k.is_some());
-
-                if has_external_keys {
-                    // External BY pattern — sort by resolved numeric keys.
-                    // Missing keys (None) sort as 0.0 matching Redis behaviour.
-                    let mut paired: Vec<(f64, Arc<[u8]>)> = sort_keys
-                        .into_iter()
-                        .zip(elements)
-                        .map(|(k, e)| (k.unwrap_or(0.0), e))
-                        .collect();
-
-                    if descending {
-                        paired.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-                    } else {
-                        paired.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-                    }
-                    elements = paired.into_iter().map(|(_, e)| e).collect();
-                } else if alpha {
-                    // ALPHA sort by element value
+            // On Tokio, the sort of millions of elements is long work: run
+            // as such (`long_work`). `false` for a value that is no number.
+            let units = elements.len();
+            let sorted = crate::commands::helpers::long_work(units, || {
+                if is_nosort && in_score_order && descending {
+                    elements.reverse();
+                } else if constant_by_lex {
                     if descending {
                         elements.sort_unstable_by(|a, b| b.cmp(a));
                     } else {
                         elements.sort_unstable();
                     }
-                } else {
-                    // Numeric sort by element value (default)
-                    // Use a Cell to signal parse failure from inside the closure —
-                    // sort_unstable_by requires Ord so we can't return a Result.
-                    let sort_err = std::cell::Cell::new(false);
-                    elements.sort_unstable_by(|a, b| {
-                        let na = std::str::from_utf8(a)
-                            .ok()
-                            .and_then(|s| s.parse::<f64>().ok());
-                        let nb = std::str::from_utf8(b)
-                            .ok()
-                            .and_then(|s| s.parse::<f64>().ok());
-                        match (na, nb) {
-                            (Some(x), Some(y)) => {
-                                if descending {
-                                    y.total_cmp(&x)
-                                } else {
-                                    x.total_cmp(&y)
+                } else if !is_nosort {
+                    // Zip elements with their resolved sort keys, sort the pairs, unzip.
+                    // This is the idiomatic Rust way to sort with external keys while
+                    // keeping indices aligned — no unsafe, no index juggling.
+                    let has_external_keys = sort_keys.iter().any(|k| k.is_some());
+
+                    if has_external_keys {
+                        // External BY pattern — sort by resolved numeric keys.
+                        // Missing keys (None) sort as 0.0 matching Redis behaviour.
+                        let mut paired: Vec<(f64, Arc<[u8]>)> = sort_keys
+                            .into_iter()
+                            .zip(std::mem::take(&mut elements))
+                            .map(|(k, e)| (k.unwrap_or(0.0), e))
+                            .collect();
+
+                        if descending {
+                            paired.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+                        } else {
+                            paired.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                        }
+                        elements = paired.into_iter().map(|(_, e)| e).collect();
+                    } else if alpha {
+                        // ALPHA sort by element value
+                        if descending {
+                            elements.sort_unstable_by(|a, b| b.cmp(a));
+                        } else {
+                            elements.sort_unstable();
+                        }
+                    } else {
+                        // Numeric sort by element value (default)
+                        // Use a Cell to signal parse failure from inside the closure —
+                        // sort_unstable_by requires Ord so we can't return a Result.
+                        let sort_err = std::cell::Cell::new(false);
+                        elements.sort_unstable_by(|a, b| {
+                            let na = std::str::from_utf8(a)
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok());
+                            let nb = std::str::from_utf8(b)
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok());
+                            match (na, nb) {
+                                (Some(x), Some(y)) => {
+                                    if descending {
+                                        y.total_cmp(&x)
+                                    } else {
+                                        x.total_cmp(&y)
+                                    }
+                                }
+                                _ => {
+                                    sort_err.set(true);
+                                    std::cmp::Ordering::Equal
                                 }
                             }
-                            _ => {
-                                sort_err.set(true);
-                                std::cmp::Ordering::Equal
-                            }
+                        });
+                        if sort_err.get() {
+                            return false;
                         }
-                    });
-                    if sort_err.get() {
-                        return Some(resp_error(
-                            "ERR One or more scores can't be converted into double",
-                        ));
                     }
                 }
+                true
+            });
+            if !sorted {
+                return Some(resp_error(
+                    "ERR One or more scores can't be converted into double",
+                ));
             }
 
             // ── Apply LIMIT ────────────────────────────────────────────────────

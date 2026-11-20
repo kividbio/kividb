@@ -1,5 +1,9 @@
 """PING probes: N connections, each sending PING every 1 ms.
 
+Or GET or SET of a random key (`kind="get"`/`"set"`, keys `<prefix>0` to
+`<prefix><keys-1>`, the value of a SET 8 bytes): a probe that can land in the
+shard of a key a long command holds.
+
 Each probe is its own process with a raw socket, so the probes neither share
 Python's GIL with the workload nor with each other. Timestamps are
 time.perf_counter() (CLOCK_MONOTONIC on Linux), so they can be lined up with
@@ -16,24 +20,54 @@ A PING that was sent late (the probe process was not scheduled) still counts
 from when it was sent, so the numbers are what a client would see.
 """
 import multiprocessing as mp
+import random
 import socket
 import time
 
 
-def _probe(port, interval, ready, stop, q, host):
+def _request(kind, rng, prefix, keys):
+    if kind == "ping":
+        return b"PING\r\n"
+    key = (prefix + str(rng.randrange(keys))).encode()
+    head = b"*2\r\n$3\r\nGET\r\n" if kind == "get" else b"*3\r\n$3\r\nSET\r\n"
+    req = head + b"$%d\r\n%s\r\n" % (len(key), key)
+    if kind == "set":
+        req += b"$8\r\nprobe:v1\r\n"
+    return req
+
+
+def _read_reply(s, buf):
+    """One reply: a line, or a bulk string. What follows it is returned."""
+    while b"\r\n" not in buf:
+        d = s.recv(4096)
+        if not d:
+            raise EOFError("server closed the probe connection")
+        buf += d
+    line, rest = buf.split(b"\r\n", 1)
+    if line[:1] == b"$" and int(line[1:]) >= 0:
+        need = int(line[1:]) + 2
+        while len(rest) < need:
+            d = s.recv(4096)
+            if not d:
+                raise EOFError("server closed the probe connection")
+            rest += d
+        rest = rest[need:]
+    return rest
+
+
+def _probe(port, interval, ready, stop, q, host, kind="ping", prefix="", keys=1, seed=0):
     s = socket.create_connection((host, port))
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    rng = random.Random(seed)
     out = []
 
     def ping():
+        req = _request(kind, rng, prefix, keys)
         t0 = time.perf_counter()
-        s.sendall(b"PING\r\n")
-        buf = b""
-        while not buf.endswith(b"\r\n"):
-            d = s.recv(64)
-            if not d:
-                raise EOFError("server closed the probe connection")
-            buf += d
+        s.sendall(req)
+        rest = _read_reply(s, b"")
+        if rest:
+            raise RuntimeError("the probe read more than one reply")
         return t0, time.perf_counter() - t0
 
     ping()  # warm up: the connection is accepted and served before we report ready
@@ -59,8 +93,10 @@ def percentile(xs, p):
 
 
 class Probe:
-    def __init__(self, port, n=1, interval=0.001, host="127.0.0.1", timeout=30.0):
+    def __init__(self, port, n=1, interval=0.001, host="127.0.0.1", timeout=30.0, kind="ping", prefix="",
+                 keys=1):
         self.port, self.n, self.interval, self.host, self.timeout = port, n, interval, host, timeout
+        self.kind, self.prefix, self.keys = kind, prefix, keys
         self.samples = []  # one list of (t_sent, rtt_seconds) per probe
         self._procs = []
 
@@ -70,9 +106,10 @@ class Probe:
         self._stop = ctx.Event()
         self._q = ctx.Queue()
         self._procs = [
-            ctx.Process(target=_probe, args=(self.port, self.interval, self._ready, self._stop, self._q, self.host),
+            ctx.Process(target=_probe, args=(self.port, self.interval, self._ready, self._stop, self._q, self.host,
+                                             self.kind, self.prefix, self.keys, i),
                         daemon=True)
-            for _ in range(self.n)
+            for i in range(self.n)
         ]
         for p in self._procs:
             p.start()
@@ -121,6 +158,11 @@ class Probe:
                 win = [r for ts, r in out if ts <= t1 and ts + r >= t0 - slack]
             res.append(max(win) * 1000 if win else 0.0)
         return res
+
+    def pct_in(self, t0, t1, p, slack=0.002):
+        """Percentile p in [0, 1] of the requests in flight at any time in [t0, t1], all probes."""
+        win = [r * 1000 for out in self.samples for ts, r in out if ts <= t1 and ts + r >= t0 - slack]
+        return percentile(win, p)
 
     def worst(self, t0=None, t1=None):
         each = self.worst_each(t0, t1)

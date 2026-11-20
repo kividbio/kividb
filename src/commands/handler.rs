@@ -1111,7 +1111,10 @@ pub fn execute_command(mut ctx: Ctx) -> Vec<u8> {
     // Counted and timed for `INFO commandstats` — unless it parked, in which
     // case it has not run yet and is counted when it is resumed.
     let started = std::time::Instant::now();
-    let reply = run_command(ctx, name, started);
+    let mut reply = run_command(ctx, name, started);
+    if sent_back_to_wait(&reply) {
+        reply = dispatched_again_after_waiting(ctx, name, started, reply);
+    }
     if crate::pause::is_held(&reply) {
         // Not run: a `CLIENT PAUSE` sent it back to be held, and it is
         // dispatched again (`blocking::hold_for_pause`). Counted and timed
@@ -1424,14 +1427,15 @@ fn acl_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
 /// For a client's write in the write gate, `write_gate`, when a handoff, a
 /// `MIGRATE`, a move of its keys or a `CLIENT PAUSE` may have come since it
 /// was routed as `routed` (`pause::writes_must_check`): see `run_command`.
-/// The reply to give instead of running it, or `None` to run it, in the
-/// gate again and routed again if it had to wait.
+/// The reply to give instead of running it, or `None` to run it; a write
+/// that has to wait is sent back to wait outside its gates
+/// ([`WAIT_OUT_HANDOFF`], [`WAIT_UNTIL_MOVED`]).
 #[cold]
 #[inline(never)]
 fn checked_in_gate(
     ctx: &mut Ctx,
     name: &str,
-    routed: &mut crate::cluster::routing::Routed,
+    routed: &crate::cluster::routing::Routed,
     write_gate: &mut Option<crate::write_gate::WriteGuard>,
 ) -> Option<Vec<u8>> {
     // While the AOF cannot be written, what would be logged is refused, as
@@ -1445,73 +1449,89 @@ fn checked_in_gate(
         *write_gate = None;
         return Some(crate::aof::misconf());
     }
-    loop {
-        // Not for `SCRIPT LOAD` or `SCRIPT FLUSH`: they change the script
-        // cache, not the dataset, and are sent to nobody (#705), so a
-        // handoff misses nothing of them.
-        // The pause does not hold them (#518), and they used to wait the
-        // handoff out here instead, asleep on their worker thread, with
-        // every other connection of that thread (#528).
-        let handoff = crate::pause::handoff() && name != "SCRIPT";
-        if !handoff
-            && crate::pause::write_held_in_gate(ctx.cmd.as_slice())
-            && !crate::commands::blocking::client_gone(ctx)
-        {
-            *write_gate = None;
-            // `ASKING` was used up when it was routed; the dispatch that
-            // runs it is routed as this one was.
-            if routed.asking() {
-                ctx.client_registry
-                    .update(ctx.client_id, |info| info.asking = true);
-            }
-            return Some(crate::commands::blocking::hold_for_pause(ctx));
-        }
-        if !handoff
-            && !(crate::pause::keys_moving()
-                && crate::key_moves::names_a_moving_key(*ctx.selected_db, name, ctx.cmd.as_slice()))
-        {
-            return routed_again_in_gate(ctx, name, *routed);
-        }
+    // Not for `SCRIPT LOAD` or `SCRIPT FLUSH`: they change the script
+    // cache, not the dataset, and are sent to nobody (#705), so a
+    // handoff misses nothing of them.
+    // The pause does not hold them (#518), and they used to wait the
+    // handoff out here instead, asleep on their worker thread, with
+    // every other connection of that thread (#528).
+    let handoff = crate::pause::handoff() && name != "SCRIPT";
+    if !handoff
+        && crate::pause::write_held_in_gate(ctx.cmd.as_slice())
+        && !crate::commands::blocking::client_gone(ctx)
+    {
         *write_gate = None;
-        if handoff {
+        // `ASKING` was used up when it was routed; the dispatch that
+        // runs it is routed as this one was.
+        if routed.asking() {
+            ctx.client_registry
+                .update(ctx.client_id, |info| info.asking = true);
+        }
+        return Some(crate::commands::blocking::hold_for_pause(ctx));
+    }
+    if !handoff
+        && !(crate::pause::keys_moving()
+            && crate::key_moves::names_a_moving_key(*ctx.selected_db, name, ctx.cmd.as_slice()))
+    {
+        return routed_again_in_gate(ctx, name, *routed);
+    }
+    *write_gate = None;
+    // It waits outside every gate, and is then dispatched again from
+    // the top ([`dispatched_again_after_waiting`], #340): it holds
+    // nothing while it waits, and what it was checked against before
+    // its gates (routing, ACL, `lua-parallel-scripts`, whether it runs
+    // beside other scripts) is decided again. A script that runs alone
+    // holds the command gate alone, and used to wait the handoff out
+    // here with it: no other command ran on any thread meanwhile.
+    Some(if handoff {
+        WAIT_OUT_HANDOFF.to_vec()
+    } else {
+        WAIT_UNTIL_MOVED.to_vec()
+    })
+}
+
+/// What [`checked_in_gate`] answers for a write that has to wait out a
+/// handoff, or until a `MIGRATE` has moved its keys, outside its gates:
+/// never sent. See [`dispatched_again_after_waiting`].
+const WAIT_OUT_HANDOFF: &[u8] = b"\0wait out the handoff\0";
+/// See [`WAIT_OUT_HANDOFF`].
+const WAIT_UNTIL_MOVED: &[u8] = b"\0wait until its keys have moved\0";
+
+/// Whether `reply` is a write sent back by [`checked_in_gate`] to wait. No
+/// reply that is sent begins with a zero byte, so this is one compare for
+/// every other.
+#[inline(always)]
+fn sent_back_to_wait(reply: &[u8]) -> bool {
+    reply.first() == Some(&0) && (reply == WAIT_OUT_HANDOFF || reply == WAIT_UNTIL_MOVED)
+}
+
+/// For a write that [`checked_in_gate`] sent back as `reply`: wait, out of
+/// every gate, for the handoff to end or its keys to have moved, then run
+/// it again from the top (`run_command`), as many times as it is sent back.
+/// The wait is on its worker thread, as it was in the gate
+/// (`pause::wait_out_handoff`). The dispatch again is not held at the test
+/// hook `routed` a second time.
+#[cold]
+#[inline(never)]
+fn dispatched_again_after_waiting(
+    ctx: &mut Ctx,
+    name: &str,
+    started: std::time::Instant,
+    mut reply: Vec<u8>,
+) -> Vec<u8> {
+    while sent_back_to_wait(&reply) {
+        #[cfg(debug_assertions)]
+        if crate::cluster::routing::test_stalls_on() {
+            log_warn!("(test) {name} waits outside its gates");
+        }
+        if reply == WAIT_OUT_HANDOFF {
             crate::pause::wait_out_handoff();
         } else {
             crate::key_moves::wait_until_moved(*ctx.selected_db, name, ctx.cmd.as_slice());
         }
-        // Before its keys are looked for below, as before its first routing.
-        *routed = crate::cluster::routing::Routed::now(false);
-        if ctx.cluster.enabled {
-            let store = ctx.store;
-            let db = *ctx.selected_db;
-            let decision = crate::cluster::routing::route_named(
-                name,
-                ctx.cmd.as_slice(),
-                ctx.cluster,
-                false,
-                || false,
-                // After a handoff, whoever owns the slot; after a move, also
-                // whether the key is still here.
-                |key| {
-                    handoff
-                        || crate::read_lock!(crate::store::get_shard(&store[db], key))
-                            .contains_key(key)
-                },
-            );
-            if let Some(refusal) = decision.refusal(ctx.peer_ipv6) {
-                return Some(refusal);
-            }
-        }
-        if ctx.repl_state.is_slave() && replication::is_denied_on_readonly_replica(name, &ctx.cmd) {
-            return Some(resp_error(
-                "READONLY You can't write against a read only replica.",
-            ));
-        }
-        *write_gate = Some(crate::write_gate::enter());
-        // The caller's loop condition, of which only this can change.
-        if !crate::pause::writes_must_check(routed.at()) {
-            return None;
-        }
+        reply = crate::cluster::routing::dispatched_again(|| run_command(ctx, name, started));
     }
+    reply
 }
 
 /// Over `maxmemory`: room made for the command, by eviction in the order of
@@ -2103,7 +2123,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         && !nested
         && !ctx.apply_replication
         && crate::pause::writes_must_check(routed.at())
-        && let Some(reply) = checked_in_gate(ctx, name, &mut routed, &mut _write_gate)
+        && let Some(reply) = checked_in_gate(ctx, name, &routed, &mut _write_gate)
     {
         return reply;
     }
@@ -2414,7 +2434,11 @@ fn gate_alone_or_walk(
 #[cold]
 #[inline(never)]
 fn feed_monitors(ctx: &Ctx, name: &str) {
-    if !crate::commands::blocking::resuming(ctx) && !crate::commands::server::is_admin_command(name)
+    // Nor when it is run again off its connection's thread: it was shown
+    // when it arrived (`deferred::run_elsewhere`).
+    if !crate::commands::blocking::resuming(ctx)
+        && !crate::deferred::running_elsewhere()
+        && !crate::commands::server::is_admin_command(name)
     {
         crate::monitor::feed(
             ctx.monitor_registry,

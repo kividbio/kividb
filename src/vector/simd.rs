@@ -197,6 +197,39 @@ pub fn dot_norms_at(level: Level, a: &[f32], b: &[f32]) -> (f32, f32, f32) {
     }
 }
 
+/// The values in `[lo, hi]`, as bits: for each word `w` of `out`, `out[w]`
+/// gets bit `i` if `values[64 * w + i]` is in the range and `has[w]` has bit
+/// `i` (a NaN is in no range). A NUMERIC range read by document id
+/// (`postings::NumericPostings::range_by_value`): four compares a vector
+/// register with AVX2, where the compiler turned the plain loop into shifts
+/// of one bit per lane, two lanes at a time.
+pub fn in_range_words(values: &[f64], has: &[u64], lo: f64, hi: f64, out: &mut [u64]) {
+    in_range_words_at(level(), values, has, lo, hi, out)
+}
+
+/// [`in_range_words`] at a given level. Panics if this machine cannot run
+/// `level`. AVX-512 runs the AVX2 code (every CPU with AVX-512F has AVX2).
+pub fn in_range_words_at(
+    level: Level,
+    values: &[f64],
+    has: &[u64],
+    lo: f64,
+    hi: f64,
+    out: &mut [u64],
+) {
+    match level {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: the CPU has AVX2, checked here.
+        Level::Avx512 | Level::Avx2 if std::arch::is_x86_feature_detected!("avx2") => unsafe {
+            x86::in_range_words_avx2(values, has, lo, hi, out)
+        },
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => portable::in_range_words(values, has, lo, hi, out),
+        Level::Portable => portable::in_range_words(values, has, lo, hi, out),
+        other => unsupported(other),
+    }
+}
+
 /// Whether `level` is the detected one or one this CPU also has. The
 /// detected level answers from the cached value without asking the CPU.
 #[cfg(target_arch = "x86_64")]
@@ -224,6 +257,17 @@ fn unsupported(level: Level) -> ! {
 // ── Portable: eight independent sums ─────────────────────────────────────────
 
 mod portable {
+    /// See [`super::in_range_words`].
+    pub(super) fn in_range_words(values: &[f64], has: &[u64], lo: f64, hi: f64, out: &mut [u64]) {
+        for ((word, &have), chunk) in out.iter_mut().zip(has).zip(values.chunks(64)) {
+            let mut bits = 0u64;
+            for (i, &v) in chunk.iter().enumerate() {
+                bits |= u64::from((v >= lo) & (v <= hi)) << i;
+            }
+            *word |= bits & have;
+        }
+    }
+
     /// The sum of eight partial sums, pairwise.
     #[inline(always)]
     fn fold(acc: [f32; 8]) -> f32 {
@@ -292,6 +336,38 @@ mod portable {
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use std::arch::x86_64::*;
+
+    /// # Safety
+    /// The CPU has AVX2.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn in_range_words_avx2(
+        values: &[f64],
+        has: &[u64],
+        lo: f64,
+        hi: f64,
+        out: &mut [u64],
+    ) {
+        let (l, h) = (_mm256_set1_pd(lo), _mm256_set1_pd(hi));
+        for ((word, &have), chunk) in out.iter_mut().zip(has).zip(values.chunks(64)) {
+            let (fours, rest) = chunk.as_chunks::<4>();
+            let mut bits = 0u64;
+            for (q, four) in fours.iter().enumerate() {
+                // SAFETY: four f64s.
+                let v = unsafe { _mm256_loadu_pd(four.as_ptr()) };
+                // Ordered compares: false for a NaN.
+                let m = _mm256_and_pd(
+                    _mm256_cmp_pd::<_CMP_GE_OQ>(v, l),
+                    _mm256_cmp_pd::<_CMP_LE_OQ>(v, h),
+                );
+                bits |= u64::from(_mm256_movemask_pd(m) as u32) << (4 * q);
+            }
+            let base = 4 * fours.len();
+            for (i, &v) in rest.iter().enumerate() {
+                bits |= u64::from((v >= lo) & (v <= hi)) << (base + i);
+            }
+            *word |= bits & have;
+        }
+    }
 
     /// The sum of the eight lanes.
     #[inline]
@@ -1062,6 +1138,71 @@ mod tests {
     /// absolute terms, which bounds what reordering can change.
     fn close(got: f32, want: f64, magnitude: f64) -> bool {
         (got as f64 - want).abs() <= 1e-5 * magnitude.max(1.0)
+    }
+
+    #[test]
+    fn in_range_words_agree_at_every_level() {
+        let special = [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+        ];
+        // Lengths of no whole word and of no whole group of four, and words
+        // `has` leaves partly or wholly out.
+        for len in [0usize, 1, 3, 4, 5, 63, 64, 65, 130, 1000] {
+            let values: Vec<f64> = (0..len)
+                .map(|i| {
+                    if i % 7 == 3 {
+                        special[i % special.len()]
+                    } else {
+                        vector(1, i as u64)[0] as f64 * 10.0
+                    }
+                })
+                .collect();
+            let words = len.div_ceil(64);
+            let has: Vec<u64> = (0..words)
+                .map(|w| match w % 3 {
+                    0 => u64::MAX,
+                    1 => 0x5555_5555_5555_5555,
+                    _ => 0,
+                })
+                .collect();
+            for (lo, hi) in [
+                (-1.0, 1.0),
+                (0.0, 0.0),
+                (-0.0, 0.0),
+                (f64::NEG_INFINITY, f64::INFINITY),
+                (2.0, 1.0),
+                (f64::MIN_POSITIVE, 5.0),
+                (f64::INFINITY, f64::INFINITY),
+            ] {
+                let mut want = vec![0u64; words];
+                for (i, &v) in values.iter().enumerate() {
+                    if v >= lo && v <= hi && has[i / 64] & (1 << (i % 64)) != 0 {
+                        want[i / 64] |= 1 << (i % 64);
+                    }
+                }
+                for level in available() {
+                    // `out` keeps the bits it had.
+                    let mut got = vec![0u64; words];
+                    if words > 0 {
+                        got[0] = 1 << 63;
+                    }
+                    in_range_words_at(level, &values, &has, lo, hi, &mut got);
+                    let mut expected = want.clone();
+                    if words > 0 {
+                        expected[0] |= 1 << 63;
+                    }
+                    assert_eq!(got, expected, "{level:?}, {len} values, [{lo} {hi}]");
+                }
+            }
+        }
     }
 
     #[test]
