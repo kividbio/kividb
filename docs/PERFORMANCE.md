@@ -464,10 +464,17 @@ Measured on an Azure D8s_v5 (an Ice Lake Xeon 8370C), one client loading in `HSE
 pipelines of 1,000, the clock running until nothing waits. The table is regression
 suite 41, one session, Redis 8.10.2 with its query engine:
 
-| documents | master (three link) | seven link | Redis 8.10.2 |
+| documents | with three helpers | with all seven | Redis 8.10.2 |
 |---|---:|---:|---:|
 | 50,000 × 384 | 6,565 a second (1.24x Redis's time) | 7,479 (1.03x) | 7,699 |
 | 200,000 × 64 | 9,638 (1.67x) | 12,216 (1.34x) | 16,416 |
+
+Several loading connections are not taken for clients: the commands that wrote vectors,
+and an estimate of the CPU time each takes on its worker, are left out of what counts as
+serving. On a D8s_v5 with a Xeon 8573C, the documents sent over 1, 4 and 8 connections
+in `HSET` pipelines of 1,000 (2 runs each), all seven helpers linked for the whole load:
+200,000 × 64-d at 12,400-13,100, 13,500-13,600 and 13,700-13,800 documents a second,
+50,000 × 384-d at 8,000-8,200, 8,700 and 8,800.
 
 `FT.CREATE` over 100,000 64-d documents already written, and a replica's full sync of
 them, link on all seven too, but take as long as before (14.5 and 19.6 s against 14.2
@@ -487,18 +494,26 @@ off a graph built by seven helpers are those off one built by three, within the
 ±10 % run-to-run spread of that client.
 
 Clients served during the load see the three helpers. Measured during a 200,000 ×
-64-d load, 3 runs each, medians, master → this behaviour:
+64-d load on a D8s_v5 with a Xeon 8573C, with three helpers (`search-index-threads 3`)
+→ with `auto`, medians:
 
 | beside the load | p50 | p99 | p99.9 | build |
 |---|---:|---:|---:|---:|
-| one KNN client, plus 500 `HSET`s a second | 0.41 → 0.42 ms | 1.03 → 0.78 ms | 1.48 → 1.06 ms | 28.3 → 28.4 s |
-| memtier GET/SET, 4 threads × 10 connections, 17,000 a second for 15 s | 0.055 → 0.055 ms | 12.5 → 12.0 ms | 14.3 → 13.8 ms | 23.2 → 20.7 s |
-| memtier GET/SET at 200 a second | 0.16 → 0.42 ms | 10.0 → 8.0 ms | 12.1 → 9.6 ms | 21.4 → 16.7 s |
+| one KNN client, plus 500 `HSET`s a second (6 runs) | 0.39 → 0.38 ms | 1.00 → 1.10 ms | 1.41 → 1.57 ms | 26.2 → 25.4 s |
+| those `HSET`s, on the connections not on the loader's worker | 0.57 → 0.57 ms | 1.58 → 1.48 ms | 2.10 → 2.05 ms | |
+| memtier GET/SET, 4 threads × 10 connections, 14,000 a second for 15 s (3 runs) | 0.055 → 0.055 ms | 12.9 → 12.9 ms | 14.5 → 14.4 ms | 22.6 → 20.9 s |
+| memtier GET/SET at 200 a second (3 runs) | 0.26 → 0.57 ms | 11.0 → 8.5 ms | 35 → 20 ms | 21.0 → 17.0 s |
 
-- In the first two rows the helpers stayed at three while the clients ran. Sampled
-  every 0.5 s during the memtier row: 3 for the 13 s memtier ran, then 7.
-- The GET/SET p99 of about 12 ms is the connections that share the loading client's
-  worker and wait behind its pipelines, with either number of helpers.
+- In the first rows the helpers stayed at three while the clients ran: `FT.INFO`
+  sampled every 0.1 s showed 3 in every sample of the KNN runs, and in 95 % of those
+  of the memtier runs, the rest in the last 0.8 s as memtier closed its connections;
+  then 7.
+- The KNN rows are within that client's run-to-run spread either way (p99 0.80-1.25
+  ms with three helpers, 0.92-1.22 with `auto`).
+- A connection that shares the loading client's worker waits behind its pipelines,
+  with either number of helpers: the `HSET` writer did in 1 of 6 runs with three
+  helpers and 2 of 6 with `auto` (p50 12 ms), and memtier's ~13 ms p99 is those of
+  its connections that do.
 - 200 commands a second is below what counts as serving, so those clients see all
   seven helpers: their median doubles, while their p99 falls with the shorter build.
 

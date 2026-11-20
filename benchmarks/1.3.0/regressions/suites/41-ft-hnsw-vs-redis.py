@@ -62,11 +62,12 @@ M, EFC, BATCH, SECS, NQ = 16, 200, 1000, 5.0, 300
 WIDE, NARROW = (50, 100), (0, 2)
 WRITES_PER_S = 500
 # The candidate at most this many times slower than Redis this session.
-# Build: what this suite recorded, with room for a run's noise. With
+# Build: what this suite recorded, with room for a run's noise and for the
+# two CPUs a D8s_v5 comes with (Xeon 8370C or 8573C). With
 # `search-index-threads auto` linking on all seven helpers during the load,
-# d384 1.01-1.05x and d64 1.26-1.37x in four runs on a D8s_v5 (they were
-# 1.37x and 1.73x with three; see the PRs of #760).
-BUILD_X = {"d384": 1.2, "d64": 1.55}
+# d384 1.01-1.05x and d64 1.26-1.34x in three runs on an 8370C (they were
+# 1.37x and 1.73x with three helpers; see the PRs of #760).
+BUILD_X = {"d384": 1.25, "d64": 1.6}
 # The same EF_RUNTIME on both: the same work. Without a filter KiviDB was
 # from 0.96x to 1.22x Redis's q/s; with the wide one from 0.93x (d384, EF 100)
 # to 1.35x, its recall higher in every case.

@@ -910,11 +910,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Nothing is added to the workers' loop. Every 50 ms the helper that has
     just finished a job reads counters the server keeps anyway: commands
     served, the process's CPU time, and the helpers' and the writes' time
-    spent linking.
+    spent linking. The vector code counts the commands that wrote vectors,
+    once each, and times one in 64 of them.
   - The server counts as serving at 500 commands a second besides those
-    that wrote vectors, or at a CPU's worth of time besides the links. The
-    helpers drop back at the first look that finds clients, and take the
-    others in again after 200 ms without any.
+    that wrote vectors, or at a CPU's worth of time besides the links and
+    those commands' own time, so several loading connections are not taken
+    for clients. The helpers drop back at the first look that finds
+    clients, and take the others in again after 200 ms without any.
   - A replica follows the same rule.
   - A number still starts exactly that many, all of which link.
   - `CONFIG SET` still refuses the setting.
@@ -932,16 +934,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Recall is unchanged. Peak RSS moves by at most 5 MiB.
 
   Clients served during a 200,000 × 64-d load see the three helpers, as
-  before; medians of 3 runs, before → after:
-  - One KNN client beside 500 `HSET`s a second: KNN p50 0.41 → 0.42 ms,
-    p99 1.03 → 0.78 ms, p99.9 1.48 → 1.06 ms.
-  - memtier GET/SET at about 17,000 a second from 40 connections: p50
-    0.055 ms either way, p99 12.5 → 12.0 ms. The p99 comes from the
+  before; medians, with three helpers (`search-index-threads 3`) → `auto`:
+  - One KNN client beside 500 `HSET`s a second (6 runs): KNN p50 0.39 →
+    0.38 ms, p99 1.00 → 1.10 ms, within that client's run-to-run spread.
+  - memtier GET/SET at about 14,000 a second from 40 connections (3 runs):
+    p50 0.055 ms either way, p99 12.9 ms either way. The p99 comes from the
     connections that share the loading client's worker and wait behind its
     pipelines.
   - Clients that send fewer than 500 commands a second do not count as
     serving, so they see all the helpers. memtier at 200 GET/SET a second:
-    p50 0.16 → 0.42 ms, p99 10.0 → 8.0 ms, build 21.4 → 16.7 s.
+    p50 0.26 → 0.57 ms, p99 11.0 → 8.5 ms, build 21.0 → 17.0 s.
+  - Loads over 4 or 8 connections link on all seven helpers too.
 
 - **Writes on a master with a replication backlog and no replica no
   longer wake the replication thread one by one (#894).** A master that

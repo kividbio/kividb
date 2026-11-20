@@ -39,7 +39,8 @@ The full command surface, filters, hybrid search and edge cases are in **[COMMAN
     `FT.CREATE` over existing keys, a replica's full sync), all of them.
 
   The server counts as serving when, besides the commands that wrote vectors, it served
-  500 commands a second, or its threads used a CPU's worth of time besides the links.
+  500 commands a second, or its threads used a CPU's worth of time besides the links and
+  the commands that wrote vectors.
   The helpers look every 50 ms. They go back to the serving count at the first look that
   finds clients. They take the others in again after 200 ms without any. A number starts
   exactly that many, all of which always link. They start on the first write that needs

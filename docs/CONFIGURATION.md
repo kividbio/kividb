@@ -226,9 +226,13 @@ changes:
 
 Nothing is added to the workers' loop to tell the two apart. Every 50 ms the helper that
 has just finished a job reads counters the server keeps anyway: the commands served, the
-process's CPU time, the helpers' own CPU time and that of links made in writes. The server
+process's CPU time, the helpers' own CPU time and that of links made in writes. The vector
+code also counts the commands that wrote vectors (once each, however many indexes and
+fields they write) and times one in 64 of them on its thread's CPU clock. The server
 counts as serving when, besides the commands that wrote vectors, it served 500 commands a
-second, or its threads used a CPU's worth of time besides the links. The count goes down at
+second, or its threads used a CPU's worth of time besides the links and what those
+commands cost (the timed ones' average times their number), so that loading connections
+are not taken for clients. The count goes down at
 the first look that finds clients. It goes up again only after four quiet looks in a row
 (200 ms). A look more than 200 ms after the last one (the helpers had nothing to do
 meanwhile) starts from the serving count. Each extra helper's thread costs its stack and

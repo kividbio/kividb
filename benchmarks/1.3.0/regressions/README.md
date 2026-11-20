@@ -56,7 +56,7 @@ and why.
 | `37-zrandmember-by-count` | #862 | `ZRANDMEMBER` of a large sorted set (a table and a tree) of 1,000, 100,000 and 1,000,000 members: no count, 1, 10, 1000, -10, -1000, each count with and without `WITHSCORES`; the server's own microseconds a call (`INFO commandstats`, reset before each case) and the client's wall time, median of 3 rounds; replies checked (length, distinct for a positive count). Gates: server time 100 % or 3 us (the same build measured 66 and 110 us on two D4s_v5s), and at 100,000 and 1,000,000 at most 3x Redis for counts of ±10 and ±1000; wall time 50 % or 20 us, and at 100,000 and 1,000,000 60 % of the gain over v1.2.2. See [the run](#recorded-run-suite-37) |
 | `39-bgsave-strings` | #849 | `BGSAVE` while two clients overwrite random keys as fast as they can (kividb.io/blog/redis-bgsave-memory-fork, getsentry/self-hosted#4619): the peak memory from `BGSAVE` to its end (`Pss` summed over the server and the processes it forked, every 50 ms), the memory before, how long the save took and how many writes got through; `small64` is 10,000,000 keys of 64-byte values (about 1 GiB; the published test, 6 million, at the issue's size) and `mixed` is the issue's ~1 GiB of 100 B to 8 KB values. Gates, `small64`: peak at most 0.6x Redis's in the same session, at most 1,536 MiB (the stand-in for "completes in a 1.5 GiB container where Redis fails"; no container is started) and within 15 % of recorded; `mixed`: at most 1.3x Redis's (see [the run](#recorded-run-suite-39-and-40)); the save must succeed. Server on the first half of the CPUs, writers on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` |
 | `40-wp-object-cache` | #849 | a WordPress-shaped object cache (kividb.io/blog/wordpress-redis-object-cache-slow-under-load-how-to-speed-it-up): 1,000,000 string keys of 512 (`d512`) or 2,048 (`d2048`) bytes, `redis-benchmark -c 100 -d D -r 1000000 -t get` and `-t set` with `--threads 4`: requests a second, p50 and p99 against Redis, and the server's RSS and `used_memory` once loaded. Gates: `GET` at 2 KB at least 1.3x Redis in the same session, RSS at most 1.0x Redis's at both sizes, every rate within 10 % of recorded; server on the first half of the CPUs, client on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-39-and-40)) |
-| `41-ft-hnsw-vs-redis` | #760 | #760's own cases against Redis's query engine in the same session: 50,000 384-d (`d384`) and 200,000 64-d (`d64`) random documents (`score` NUMERIC, HNSW `COSINE M 16 EF_CONSTRUCTION 200`) written by one client in `HSET` pipelines of 1,000, documents a second until all are in the graph; then one client, 5 s a case, `KNN 10`: no filter, `@score:[50 100]` (half) and `@score:[0 2]` (3 %) at the default `EF_RUNTIME`, no filter at 50, 100 and 200 and the wide filter at 50 and 100: q/s and recall@10 against exact; `d64` also KNN p99 beside 500 `HSET`s a second; peak RSS. The candidate as it starts on 8 CPUs (`--threads 4`, `search-index-threads auto`: 7 helpers, all of them linking while the load is all the server does, 3 while it serves). Gates: 10 % (rates), 2 % (recall), 5 % (RSS); and against Redis this session: build at most 1.2x (`d384`) / 1.55x (`d64`) slower, the rows at the same `EF_RUNTIME` at most 1.1x (no filter) / 1.2x (wide) slower with recall at least Redis's, the narrow filter faster than Redis, the default rows at most 2.2x (no filter) / 1.8x (wide) slower (a KiviDB KNN looks at no fewer than 50 candidates, Redis's default at 10), peak RSS at most Redis's. Needs `REGRESS_REDISEARCH_SO` (as `28`); `min_cpus=8`, recorded on a D8s_v5 (`results/pr-760-d8s_v5`; the build rows in `results/pr-760-adaptive-d8s_v5`, see [below](#recorded-run-suite-41-build-rows)) |
+| `41-ft-hnsw-vs-redis` | #760 | #760's own cases against Redis's query engine in the same session: 50,000 384-d (`d384`) and 200,000 64-d (`d64`) random documents (`score` NUMERIC, HNSW `COSINE M 16 EF_CONSTRUCTION 200`) written by one client in `HSET` pipelines of 1,000, documents a second until all are in the graph; then one client, 5 s a case, `KNN 10`: no filter, `@score:[50 100]` (half) and `@score:[0 2]` (3 %) at the default `EF_RUNTIME`, no filter at 50, 100 and 200 and the wide filter at 50 and 100: q/s and recall@10 against exact; `d64` also KNN p99 beside 500 `HSET`s a second; peak RSS. The candidate as it starts on 8 CPUs (`--threads 4`, `search-index-threads auto`: 7 helpers, all of them linking while the load is all the server does, 3 while it serves). Gates: 10 % (rates), 2 % (recall), 5 % (RSS); and against Redis this session: build at most 1.25x (`d384`) / 1.6x (`d64`) slower, the rows at the same `EF_RUNTIME` at most 1.1x (no filter) / 1.2x (wide) slower with recall at least Redis's, the narrow filter faster than Redis, the default rows at most 2.2x (no filter) / 1.8x (wide) slower (a KiviDB KNN looks at no fewer than 50 candidates, Redis's default at 10), peak RSS at most Redis's. Needs `REGRESS_REDISEARCH_SO` (as `28`); `min_cpus=8`, recorded on a D8s_v5 (`results/pr-760-d8s_v5`; the build rows in `results/pr-760-adaptive-d8s_v5`, see [below](#recorded-run-suite-41-build-rows)) |
 
 ## Running it
 
@@ -1700,8 +1700,9 @@ image. Two more runs without `--record` (`-verify1`, `-verify2`) and master
 | `d384` candidate / Redis | 6,565 / 8,152 (1.24x) | 7,479 / 7,699 (1.03x) | 7,499 / 7,837 (1.05x) | 7,471 / 7,570 (1.01x) |
 | `d64` candidate / Redis | 9,638 / 16,096 (1.67x) | 12,216 / 16,416 (1.34x) | 11,569 / 15,546 (1.34x) | 12,284 / 15,489 (1.26x) |
 
-The build gates against Redis are now 1.2x (`d384`) and 1.55x (`d64`); they
-were 1.6x and 2.0x.
+The build gates against Redis are now 1.25x (`d384`) and 1.6x (`d64`); they
+were 1.6x and 2.0x. The worst of these runs, 1.05x and 1.34x, with room for
+a run's noise and for the other CPU a D8s_v5 can be (a Xeon 8573C).
 
 Only the two `build_docs_per_s` rows were recorded. The other 36 keep the
 values of `results/pr-760-d8s_v5`, for two reasons:
@@ -1711,10 +1712,11 @@ values of `results/pr-760-d8s_v5`, for two reasons:
   `6e7b05a74` (#976) at 333. That is a master change, not this one, and
   re-recording would hide it.
 - **The query rows.** One client's q/s moves by up to ±10 % from run to run on
-  this VM, master's included. Recall@10 moved by at most 0.024 between the
-  candidate's four runs, either way. In 1 of 4 runs of the candidate, and in master's run, one recall row
-  fell below its 2 % gate (`d384` `wide_default` 0.488 against 0.494;
-  master `none_default` 0.36 against 0.364).
+  this VM, master's included. Recall@10 moved by at most 0.017 between the
+  candidate's three runs, either way. In one of them (`-verify2`), and in
+  master's run, a recall case fell below its 2 % gate: `d384` wide filter at
+  the default `EF_RUNTIME` and at 50 (the same search), 0.488 against 0.494;
+  master's `d384` no filter at the default and at 50, 0.36 against 0.364.
 
 ## Not covered
 
