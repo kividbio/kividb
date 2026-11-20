@@ -518,6 +518,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Plain commands no longer wait behind a stream of scripts that run alone
+  (#880).** A quick script that runs alone (its key has no hash tag, or
+  `lua-parallel-scripts no`) and comes while another one is running is now
+  run right after it, by the thread running that one, with the other
+  commands held back once for the run (up to 200 µs) instead of once for
+  each script; the script-runner thread takes only the ones left over.
+  It used to take all of them: a fifth busy thread beside four workers on
+  four CPUs, it waited for a CPU while it held the command gate, and the
+  commands on every thread waited with it. Nextcloud's mix (`GET` 40,
+  `TTL` 15, `INCRBY` 15, `EXPIRE` 15, `EVALSHA` of its compare-and-delete
+  on a key with no tag 12, `SETEX` 3; 500 connections, `--threads 4` on 4
+  CPUs of an Azure `Standard_D8s_v5`, io_uring): 313k ops/s with a p99 of 2.6 ms, was 299k
+  at 8.6 ms (the same mix with no script: 2.5 ms; Valkey 8.1 with 4 I/O
+  threads: 333k at 2.1 ms); at 200 connections the p99 is 0.94 ms, was 4.4. Each script is
+  still alone: no other command runs beside it or between two of them, and
+  replicas and the AOF get the scripts in the order they ran. A script with
+  no hash tag still runs one at a time; see
+  [docs/SCRIPTS.md](docs/SCRIPTS.md) and docs/PERFORMANCE.md.
+
 - **A script's command on a key it did not declare is routed while its
   slot is being moved (#340).** With the script's slot `MIGRATING` or
   `IMPORTING` on the node, such a command is routed as a client's would

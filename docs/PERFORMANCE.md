@@ -322,6 +322,39 @@ All of it was measured with a Go client (the scripts above, one command at a tim
 connection), `/proc` for the server's CPU, `INFO commandstats` for the calls, and callgrind
 for the instructions, each tree and 1.2.2 built by the same rustc.
 
+## Scripts that run alone, beside plain commands
+
+A script whose key has no hash tag runs alone: no other command runs while it does
+([SCRIPTS.md](SCRIPTS.md)). Since [#880](https://github.com/kividbio/kividb/issues/880), a quick
+one that comes while another is running is run right after it by the thread running that one,
+with the other commands held back once for the run (up to 200 µs), not once for each script.
+It used to go to the script-runner thread, which closed the command gate for each script and,
+as a fifth busy thread beside four workers on four CPUs, waited for a CPU while it held the
+gate: the plain commands of every worker waited with it.
+
+Azure `Standard_D8s_v5`, server on CPUs 0-3 (`--threads 4`, io_uring; Valkey 8.1 with
+`--io-threads 4`; Redis 8.10.2), memtier_benchmark 2.6.1 on CPUs 4-7, 4 threads, one call at a
+time per connection, 100,000 keys written again before each run, medians of 3 runs of 20 s;
+ops/s, p99 and p99.9 in ms:
+
+| workload, connections | before | now | Valkey 8.1 | Redis 8.10 |
+|---|---:|---:|---:|---:|
+| Nextcloud's mix, 500 | 299k, 8.57, 15.7 | 313k, 2.64, 9.0 | 333k, 2.06, 5.3 | 142k, 6.53, 7.8 |
+| Nextcloud's mix, 200 | 290k, 4.38, 9.2 | 319k, 0.94, 3.3 | 342k, 0.72, 1.4 | 145k, 2.69, 2.9 |
+| the same mix with no script, 500 | 310k, 2.43, 5.2 | 306k, 2.48, 5.3 | 339k, 1.97, 4.9 | 146k, 6.33, 7.2 |
+| the same mix with no script, 200 | 315k, 0.94, 1.6 | 313k, 0.95, 1.6 | 342k, 0.73, 1.9 | 147k, 2.64, 2.8 |
+| Superset's mix, 500 | 96.5k, 12.3, 30.3 | 97.3k, 8.6, 12.9 | 97.2k, 9.66, 13.3 | 52k, 15.4, 20.1 |
+
+Nextcloud's mix is `GET` 40, `TTL` 15, `INCRBY` 15, `EXPIRE` 15, `EVALSHA` of its
+compare-and-delete 12 and `SETEX` 3; Superset's is `GET` 85 of 50 KB values, `SETEX` 10,
+`SET NX EX` 3 and its unlock 2. A script alone is where it was: the compare-and-delete at
+264k/s (Valkey 302k, Redis 123k), Appwrite's abuse limiter (`EVAL`) at 137k/s (Valkey 131k,
+Redis 88k), at 500 connections; a script on a tagged key runs beside others and is not
+affected. (Superset's row and the alone rows were run interleaved with the build before, three
+runs each; the others are from one session, one server after another.) With the Tokio I/O loop
+(`--io-model tokio`) the mix's p99 at 500 connections went from 9.0 to 5.4 ms, against 2.2 ms
+with no script: less of a gain than on io_uring, not yet explained. Regression suite 42 (`benchmarks/1.3.0/regressions`) keeps these rows.
+
 ## Vector index builds
 
 Since 1.3.0 helper threads link the vectors written to an HNSW index into
