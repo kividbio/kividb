@@ -1212,3 +1212,52 @@ fn keys_and_names_of_any_bytes_survive_every_copy() {
     let mut a = aof.conn();
     assert_eq!(dataset(&mut a), want, "after loading the rewritten AOF");
 }
+
+/// The array commands' events name the key by its bytes: `ARSET` on a key
+/// that is not text announces `arset`, and `ARDEL` of what it empties
+/// announces `del`, as on any other key — before, `notify_array_event`
+/// asked for the key as UTF-8 and silently sent nothing.
+#[test]
+fn array_events_announce_a_key_that_is_not_text() {
+    let s = Server::start(&[]);
+    let mut c = s.conn();
+    let mut sub = s.conn();
+    assert_eq!(
+        c.cmd(&[b"CONFIG", b"SET", b"notify-keyspace-events", b"EA"])
+            .bytes(),
+        b"OK"
+    );
+    for pat in [
+        b"__keyevent@0__:arset".as_slice(),
+        b"__keyevent@0__:ardel".as_slice(),
+        b"__keyevent@0__:del".as_slice(),
+    ] {
+        assert_eq!(
+            sub.cmd(&[b"PSUBSCRIBE", pat]).arr()[0],
+            V::Str(b"psubscribe".to_vec())
+        );
+    }
+    let event = |sub: &mut Conn| match sub.read() {
+        V::Arr(m) => (m[2].bytes().to_vec(), m[3].bytes().to_vec()),
+        other => panic!("{other:?}"),
+    };
+
+    let key = b"k\xff\xfe\x00k";
+    assert_eq!(c.cmd(&[b"ARSET", key, b"0", b"v"]).int(), 1);
+    assert_eq!(
+        event(&mut sub),
+        (b"__keyevent@0__:arset".to_vec(), key.to_vec())
+    );
+
+    // Deleting its only element deletes the array itself: `ardel`, then the
+    // generic `del`.
+    assert_eq!(c.cmd(&[b"ARDEL", key, b"0"]).int(), 1);
+    assert_eq!(
+        event(&mut sub),
+        (b"__keyevent@0__:ardel".to_vec(), key.to_vec())
+    );
+    assert_eq!(
+        event(&mut sub),
+        (b"__keyevent@0__:del".to_vec(), key.to_vec())
+    );
+}
