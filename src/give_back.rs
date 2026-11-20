@@ -18,6 +18,19 @@
 //! `HDEL` a hundred fields at a time, expiry or eviction, the fall shows the
 //! same, and nothing on the path of a command changes.
 //!
+//! **Or when RSS has drifted far above what is allocated** (#245), without
+//! anything falling: memory that was allocated and freed between two looks,
+//! never seen as a fall, or a fall too small for a trim. A replica that
+//! has applied a heavy stream is one: everything it allocates on the way to
+//! applying a write is allocated on its one applier thread, so in one
+//! arena, which after 2.5M writes of 256 B was 128 MiB with 118 MiB of it
+//! free; a master after the same load kept 22 to 38 MiB that a `MEMORY
+//! PURGE` gave back. So once a second, while idle, the thread compares RSS
+//! with what is allocated ([`gap_worth_trimming`]). The gap a trim leaves
+//! (slab blocks left empty, what the allocator cannot return) is the floor
+//! the next one is measured from, so a server whose gap a trim cannot close
+//! is not trimmed again for it.
+//!
 //! **Only when idle.** A trim walks the free lists of every arena, each
 //! under that arena's lock: on a heap of a gigabyte with its free chunks
 //! scattered, 80 to 130 ms for an arena. A worker thread that allocates in
@@ -49,6 +62,9 @@ const TICKS_A_SECOND: usize = 4;
 const MIN_GAP: Duration = Duration::from_secs(1);
 /// The least fall in what is allocated that is worth a trim.
 const MIN_FALL: usize = 32 << 20;
+/// The least growth of RSS over what is allocated, past what the last trim
+/// left, that is worth a trim.
+const MIN_DRIFT: usize = 16 << 20;
 /// Commands in the last second under which the server counts as idle.
 const IDLE_OPS: u64 = 100;
 
@@ -71,6 +87,21 @@ static SKIPPED_BUSY: AtomicU64 = AtomicU64::new(0);
 pub fn worth_trimming(high: usize, now: usize) -> bool {
     let fall = high.saturating_sub(now);
     fall >= MIN_FALL && fall >= high / 8
+}
+
+/// Whether RSS has drifted far enough above what is allocated for a trim to
+/// give back something worth the walk, nothing having fallen: the gap
+/// between them past `floor`, the gap the last trim left, by [`MIN_DRIFT`]
+/// bytes and by a sixteenth of what is allocated. Lower than for a fall:
+/// a trim made for a drift is made once, and the floor keeps it from being
+/// made again until RSS has drifted as far once more.
+#[cfg_attr(
+    not(all(target_os = "linux", not(feature = "mimalloc"))),
+    allow(dead_code)
+)]
+pub fn gap_worth_trimming(rss: usize, allocated: usize, floor: usize) -> bool {
+    let drift = rss.saturating_sub(allocated).saturating_sub(floor);
+    drift >= MIN_DRIFT && drift >= allocated / 16
 }
 
 /// Whether the server is idle enough for a trim: fewer than [`IDLE_OPS`]
@@ -119,8 +150,13 @@ fn run() {
     let mut high = crate::memory_use::allocated();
     let mut last: Option<Instant> = None;
     let mut waiting = false;
+    let rss = || crate::commands::memory::read_proc_status().0;
+    // The gap between RSS and what is allocated that the last trim left.
+    let mut floor = 0usize;
+    let mut ticks = 0usize;
     loop {
         std::thread::sleep(TICK);
+        ticks = ticks.wrapping_add(1);
         let served = commands();
         let ops = served.saturating_sub(seen.pop_front().unwrap_or(served));
         seen.push_back(served);
@@ -132,7 +168,24 @@ fn run() {
             waiting = false;
             continue;
         }
-        if !worth_trimming(high, now) || last.is_some_and(|at| at.elapsed() < MIN_GAP) {
+        if last.is_some_and(|at| at.elapsed() < MIN_GAP) {
+            continue;
+        }
+        let fell = worth_trimming(high, now);
+        // RSS is read once a second, and only while idle: a drift is only
+        // ever acted on then.
+        let mut drifted = None;
+        if !fell
+            && ticks.is_multiple_of(TICKS_A_SECOND)
+            && idle(ops, crate::lazyfree::pending_objects())
+        {
+            let rss = rss();
+            floor = floor.min(rss.saturating_sub(now));
+            if gap_worth_trimming(rss, now, floor) {
+                drifted = Some(rss);
+            }
+        }
+        if !fell && drifted.is_none() {
             continue;
         }
         if !idle(ops, crate::lazyfree::pending_objects()) {
@@ -146,14 +199,23 @@ fn run() {
         let began = Instant::now();
         crate::commands::memory::purge_allocator();
         TRIMS.fetch_add(1, Ordering::Relaxed);
-        crate::log_verbose!(
-            "Allocated fell from {} to {} bytes: gave free memory back in {:?}",
-            high,
-            now,
-            began.elapsed()
-        );
+        match drifted {
+            Some(before) => crate::log_verbose!(
+                "RSS {} bytes, {} allocated: gave free memory back in {:?}",
+                before,
+                now,
+                began.elapsed()
+            ),
+            None => crate::log_verbose!(
+                "Allocated fell from {} to {} bytes: gave free memory back in {:?}",
+                high,
+                now,
+                began.elapsed()
+            ),
+        }
         last = Some(Instant::now());
         high = crate::memory_use::allocated();
+        floor = rss().saturating_sub(high);
     }
 }
 
@@ -169,7 +231,39 @@ pub fn skipped_busy() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{IDLE_OPS, MIN_FALL, idle, worth_trimming};
+    use super::{IDLE_OPS, MIN_DRIFT, MIN_FALL, gap_worth_trimming, idle, worth_trimming};
+
+    #[test]
+    fn trims_a_large_drift_of_rss_past_the_last_trims_gap_only() {
+        let mib = 1 << 20;
+        // The replica of #245: 316 MiB allocated, RSS 1.35 times that.
+        assert!(gap_worth_trimming(427 * mib, 316 * mib, 0));
+        // Once a trim left 100 MiB it cannot give back, the same RSS is no
+        // longer worth one; 20 MiB more past it is.
+        assert!(!gap_worth_trimming(427 * mib, 316 * mib, 100 * mib));
+        assert!(gap_worth_trimming(
+            (316 + 100 + 20) * mib,
+            316 * mib,
+            100 * mib
+        ));
+        // A small server: 16 MiB, not a sixteenth.
+        assert!(!gap_worth_trimming(20 * mib + MIN_DRIFT - 1, 20 * mib, 0));
+        assert!(gap_worth_trimming(20 * mib + MIN_DRIFT, 20 * mib, 0));
+        // Less than 16 MiB over: not worth it.
+        assert!(!gap_worth_trimming(331 * mib, 316 * mib, 0));
+        // Less than a sixteenth of what is allocated: not worth it.
+        assert!(!gap_worth_trimming(1084 * mib, 1024 * mib, 0));
+        assert!(gap_worth_trimming(1088 * mib, 1024 * mib, 0));
+        // A large server: a sixteenth of what is allocated, not 16 MiB.
+        assert!(!gap_worth_trimming(
+            100 * 1024 * mib + 512 * mib,
+            100 * 1024 * mib,
+            0
+        ));
+        assert!(gap_worth_trimming(130 * 1024 * mib, 100 * 1024 * mib, 0));
+        // RSS below what is allocated (pages not touched yet): nothing to do.
+        assert!(!gap_worth_trimming(mib, 2 * mib, 0));
+    }
 
     #[test]
     fn trims_after_a_large_fall_only() {
