@@ -1,27 +1,29 @@
 #!/usr/bin/env python3
-"""#754: a long command must not hold up other connections (fixed on Tokio in #757).
+"""#754: a long command must not hold up other connections (fixed on Tokio in #757,
+on io_uring in #762).
 
 Dataset: DEBUG POPULATE 2000000 user (keys user:0..user:1999999), and for the
-DEL case a 3,000,000-field hash loaded again before each DEL. Four probe
+DEL cases a 3,000,000-field hash loaded again before each run. Four probe
 connections, each in its own process, PING every 1 ms from 0.6 s before the
 command until 1 s after it. Commands, 3 runs each:
 
-  keys   KEYS user:99*                          (11,111 matches)
-  scan   SCAN 0 MATCH user:99* COUNT 2000000
-  del    DEL big                                (3M-field hash)
+  keys       KEYS user:99*                      (11,111 matches)
+  scan       SCAN 0 MATCH user:99* COUNT 2000000
+  del        DEL big                            (3M-field hash)
+  del_multi  DEL big user:1                     (uring1 only: takes the command gate alone)
 
 Per run: the command's own time, and the worst PING in flight while it ran,
 over all four probes ("worst"). Metrics are medians over the runs, except
-worst_max, the largest worst of the 3 runs, which is what the Tokio bound
-checks: on Tokio a long command now runs off the I/O driver, so no PING should
-wait for it at all.
+worst_max, the largest worst of the 3 runs, which is what the bound checks:
+no PING should wait for a long command at all.
 
-On io_uring (one ring per thread) the probes that share the command's thread
-still wait for it (#762, not fixed). Which probes share it is chance, so on
-uring the worst PING over all probes is shown but not gated; the gate is on
-"least_worst": the worst PING of the probe that waited least, which must
-stay within 1.5x or 10 ms of today's value (a command that held up every
-connection would fail it). Redis is single-threaded and stalls every probe; it is
+On Tokio a long command runs off the I/O driver (#757). On io_uring (one ring
+per thread) the work is sent to a thread of its own and the connection waits
+for it, while its ring serves its other connections (#762). `uring` runs two
+rings, so which probes share the command's ring is chance (the worst over all
+probes is gated, and "least_worst", the probe that waited least, is kept);
+`uring1` runs one ring, so every probe shares it: v1.2.2 stalls all four for
+the whole command. Redis is single-threaded and stalls every probe; it is
 measured in the tokio configuration only.
 """
 import os
@@ -37,12 +39,17 @@ PROBES = 4
 S = Suite("04-long-commands", [
     Config("tokio", io="tokio", threads=2),
     Config("uring", io="uring", engines=("v1_2_2", "candidate"), threads=2),
+    # One ring: every probe is on the long command's thread (#762).
+    Config("uring1", io="uring", engines=("v1_2_2", "candidate"), threads=1),
 ])
 CMDS = {
     "keys": ("KEYS", "user:99*"),
     "scan": ("SCAN", "0", "MATCH", "user:99*", "COUNT", "2000000"),
     "del": ("DEL", "big"),
+    "del_multi": ("DEL", "big", "user:1"),
 }
+# The free of #762 beyond `DEL` of one key: on the one-ring configuration.
+SAME_THREAD_ONLY = ("del_multi",)
 
 
 def load_keys(c):
@@ -77,8 +84,10 @@ def describe(case, rep):
 
 
 def one(ctx, c, case):
-    if case == "del":
+    if case in ("del", "del_multi"):
         load_hash(c)
+    if case == "del_multi":
+        c.set("user:1", "value:1")
     c.ping()
     with Probe(ctx.port, n=PROBES) as pr:
         time.sleep(0.6)
@@ -97,9 +106,11 @@ def run(ctx):
     c = ctx.client()
     load_keys(c)
     ctx.emit("dbsize", c.dbsize(), "keys", "higher", gate=EXACT)
-    tokio = ctx.config.name == "tokio"
+    name = ctx.config.name
     ctx.raw["runs"] = {}
     for case in CMDS:
+        if case in SAME_THREAD_ONLY and name != "uring1":
+            continue
         runs = [one(ctx, c, case) for _ in range(RUNS)]
         ctx.raw["runs"][case] = runs
         cmd = [r["cmd_ms"] for r in runs]
@@ -108,20 +119,18 @@ def run(ctx):
         # it must stay at least 1/0.85 times faster than v1.2.2 measured in the same session.
         gate = [THROUGHPUT, vs_v1_2_2(0.85)] if case == "keys" else THROUGHPUT
         ctx.emit(case + "_cmd_ms", median(cmd), "ms", "lower", gate=gate, samples=cmd)
-        if tokio:
-            # Off the driver: no PING may wait more than 20 ms (the command takes 130-300 ms).
-            ctx.emit(case + "_worst_ping_ms", median(worst), "ms", "lower", gate=jitter(bound(max=20)), samples=worst)
-            ctx.emit(case + "_worst_ping_max_ms", max(worst), "ms", "lower", gate=jitter(bound(max=20)))
-        else:
-            # How many of the 4 probes share the command's ring is chance (0 to 4), so the worst
-            # over all probes is shown only. The gate is on the probe that waited least: a long
-            # command must not hold up every connection, as it does on Redis.
-            ctx.emit(case + "_worst_ping_ms", median(worst), "ms", "lower", gate=jitter(info()), samples=worst)
+        # Off the driver (Tokio), off the ring (io_uring): no PING may wait more than 20 ms
+        # (the command takes 130-300 ms).
+        ctx.emit(case + "_worst_ping_ms", median(worst), "ms", "lower", gate=jitter(bound(max=20)), samples=worst)
+        ctx.emit(case + "_worst_ping_max_ms", max(worst), "ms", "lower", gate=jitter(bound(max=20)))
+        if name == "uring":
+            # Which of the 4 probes share the command's ring is chance (0 to 4): the probe
+            # that waited least, kept as it was gated before #762.
             least = [min(r["each_ms"]) for r in runs]
             ctx.emit(case + "_least_worst_ping_ms", median(least), "ms", "lower", gate=jitter(rel(50, abs=10)),
                      samples=least)
         ctx.emit(case + "_probes_stalled", median([r["stalled"] for r in runs]), "probes", "lower", gate=info())
-        gate = EXACT if case in ("keys", "del") else info()
+        gate = EXACT if case in ("keys", "del", "del_multi") else info()
         ctx.emit(case + "_reply", runs[-1]["n"], "items", "higher", gate=gate)
 
 

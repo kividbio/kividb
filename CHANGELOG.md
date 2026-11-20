@@ -2309,10 +2309,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keys that match. `DEL` now follows `lazyfree-lazy-user-del`: with `yes` it
   frees a big value in the background as `UNLINK` does, and a config file
   setting it no longer warns that it has no effect; the default stays `no`.
-  On io_uring, a long command still holds up the connections served by its
-  own thread (#762). In a build with Lua and `lua-parallel-scripts yes`,
-  `KEYS` and `SCAN` still run alone, as before, so as not to see a script
-  part-way through.
+  On io_uring, see the next entry (#762). In a build with Lua and
+  `lua-parallel-scripts yes`, `KEYS` and `SCAN` still run alone, as before,
+  so as not to see a script part-way through.
+
+- **A long command no longer holds up the other connections of its io_uring
+  thread (#762).** On io_uring each worker thread serves its own
+  connections, and a long command used to stall every other connection of
+  its thread for as long (a `PING` waited 74 ms behind a `KEYS`
+  over 2M keys, 129 ms behind a `DEL` of a 3M-field hash). Now
+  `KEYS`, `SCAN` with a `COUNT` of 65,536 or more, and `HGETALL`,
+  `SMEMBERS`, `LRANGE` and `SORT` without `STORE` over 65,536 elements or
+  more, stop before they have done anything and run again on a small pool of
+  threads; the free of a big value after `DEL` (one key or several) runs
+  there too, after the key is deleted and the deletion propagated. The
+  connection waits for that work, asleep, before it writes the reply or reads
+  its next command, so its replies stay in order, while its thread serves
+  the others (worst `PING` on that thread 0.1-0.25 ms). Inside `MULTI`/`EXEC`,
+  a script, or a command that takes the command gate alone, the work runs
+  where it is, as before; `HGETALL`, `SMEMBERS`, `LRANGE` and `SORT` also do
+  in cluster mode. `INFO commandstats` and `LATENCY` time the run on the
+  pool (a `DEL` with its free), and the slow log the whole wait. On Tokio,
+  `HGETALL`, `SMEMBERS`, `LRANGE` and the sort of `SORT` over that many
+  elements now run as other long work does (#754), and a `DEL` frees a big
+  value after the command, out of its gates: a `DEL` of several keys no
+  longer holds the command gate alone while it frees. A `SET` over a big
+  value still frees it in place, on both I/O models.
 
 - **`SINTER` of a big set with a small one costs the small set's size, not
   the big one's (#759).** `SINTER`, `SINTERSTORE`, `SINTERCARD`, `SDIFF`,

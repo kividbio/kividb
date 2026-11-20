@@ -1122,9 +1122,11 @@ pub fn execute_command(mut ctx: Ctx) -> Vec<u8> {
     let elapsed = started.elapsed();
     // For the connection loop's slow log: see `cmdstats::last_command_us`.
     crate::cmdstats::note_last_command(elapsed);
-    crate::latency::note_command(ctx.latency, name, elapsed);
-    if !crate::commands::blocking::parked(ctx) {
+    if !crate::commands::blocking::left_anything(ctx) {
+        crate::latency::note_command(ctx.latency, name, elapsed);
         crate::cmdstats::record(name, &ctx.cmd, &reply, elapsed);
+    } else {
+        counted_after_its_wait(ctx, name, elapsed);
     }
     // An index definition goes to the rest of the cluster once it is made
     // here, with nothing held: see `cluster::ddl`.
@@ -1132,6 +1134,18 @@ pub fn execute_command(mut ctx: Ctx) -> Vec<u8> {
         return crate::cluster::ddl::spread(ctx, reply);
     }
     reply
+}
+
+/// A command that left something for its connection: it is timed now if
+/// it parked (`BLPOP`), and counted when it is resumed. One that has run and
+/// left values to free before its reply is counted, and timed, with the
+/// free, once it is done (`deferred::count_freed`).
+#[cold]
+#[inline(never)]
+fn counted_after_its_wait(ctx: &mut Ctx, name: &str, elapsed: std::time::Duration) {
+    if !crate::deferred::counted_after_free(ctx, name, elapsed) {
+        crate::latency::note_command(ctx.latency, name, elapsed);
+    }
 }
 
 /// Commands that only ask about keys: no use of a key, as in Redis, and
@@ -2414,7 +2428,11 @@ fn gate_alone_or_walk(
 #[cold]
 #[inline(never)]
 fn feed_monitors(ctx: &Ctx, name: &str) {
-    if !crate::commands::blocking::resuming(ctx) && !crate::commands::server::is_admin_command(name)
+    // Nor when it is run again off its connection's thread: it was shown
+    // when it arrived (`deferred::run_elsewhere`).
+    if !crate::commands::blocking::resuming(ctx)
+        && !crate::deferred::running_elsewhere()
+        && !crate::commands::server::is_admin_command(name)
     {
         crate::monitor::feed(
             ctx.monitor_registry,

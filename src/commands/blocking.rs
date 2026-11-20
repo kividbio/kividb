@@ -80,6 +80,12 @@ pub struct BlockingWait {
     /// connection has waited for the script's turn, off its thread.
     #[cfg(feature = "lua")]
     tags: Option<crate::tag_locks::TagsBusy>,
+    /// Not a wait at all: work the command left for its connection to have
+    /// done off its thread, and to wait for, before it replies
+    /// (`deferred`, #762). Only values to free ([`Self::frees_only`]): the
+    /// command has run, and is counted when the free is done. A command to
+    /// run again elsewhere has not run.
+    offload: Option<crate::deferred::Offload>,
 }
 
 /// Command state captured at park time and handed back verbatim on resume,
@@ -550,7 +556,25 @@ impl BlockingSlot {
             return self.looked_or_waits(None);
         }
         let parked = self.ctl.parked.take();
+        if parked.as_ref().is_some_and(BlockingWait::frees_only) {
+            return self.ran_and_frees(parked);
+        }
         self.looked_or_waits(parked)
+    }
+
+    /// [`take_parked`](Self::take_parked) for a command that has run and
+    /// left values to free before its reply: settled as one that parked
+    /// nothing, and the values handed on.
+    #[cold]
+    #[inline(never)]
+    fn ran_and_frees(&mut self, frees: Option<BlockingWait>) -> Option<BlockingWait> {
+        if self.in_resume {
+            self.resume_over();
+        }
+        if self.collecting || !self.looked.is_empty() {
+            self.looked_or_waits(None);
+        }
+        frees
     }
 
     /// [`take_parked`](Self::take_parked) for a command that may have woken
@@ -824,6 +848,7 @@ pub fn park_with_state(
                 held_by_pause: false,
                 #[cfg(feature = "lua")]
                 tags: None,
+                offload: None,
             });
             ParkOutcome::Parked
         }
@@ -854,6 +879,7 @@ pub fn hold_for_pause(ctx: &mut crate::commands::ctx::Ctx) -> Vec<u8> {
             held_by_pause: true,
             #[cfg(feature = "lua")]
             tags: None,
+            offload: None,
         });
     }
     crate::pause::HELD_IN_GATE.to_vec()
@@ -879,6 +905,7 @@ pub fn hold_for_tags(ctx: &mut crate::commands::ctx::Ctx, busy: crate::tag_locks
             role_epoch: 0,
             held_by_pause: false,
             tags: Some(busy),
+            offload: None,
         });
     }
 }
@@ -1189,15 +1216,56 @@ pub fn take_state(ctx: &mut crate::commands::ctx::Ctx) -> Option<BlockState> {
     ctx.blocking.as_mut().and_then(|slot| slot.state.take())
 }
 
-/// Whether the handler asked to park during this dispatch.
+/// Whether the handler asked to park during this dispatch: and so has not
+/// run yet. Not a command that has run and only left values to free before
+/// its reply ([`BlockingWait::frees_only`]).
 #[inline]
 pub fn parked(ctx: &crate::commands::ctx::Ctx) -> bool {
+    ctx.blocking
+        .as_ref()
+        .and_then(|slot| slot.parked.as_ref())
+        .is_some_and(|wait| !wait.frees_only())
+}
+
+/// Whether the handler left anything in the slot this dispatch: a wait, or
+/// work for its connection ([`parked`] or not).
+#[inline]
+pub fn left_anything(ctx: &crate::commands::ctx::Ctx) -> bool {
     ctx.blocking
         .as_ref()
         .is_some_and(|slot| slot.parked.is_some())
 }
 
 impl BlockingWait {
+    /// No wait: work for the connection to have done off its thread
+    /// (`deferred::Offload`).
+    pub(crate) fn offload(offload: crate::deferred::Offload) -> Self {
+        BlockingWait {
+            rxs: Vec::new(),
+            timeout: None,
+            state: None,
+            role_epoch: 0,
+            held_by_pause: false,
+            #[cfg(feature = "lua")]
+            tags: None,
+            offload: Some(offload),
+        }
+    }
+
+    /// The work the command left for its connection ([`Self::offload`]).
+    pub fn take_offload(&mut self) -> Option<crate::deferred::Offload> {
+        self.offload.take()
+    }
+
+    pub(crate) fn offload_mut(&mut self) -> Option<&mut crate::deferred::Offload> {
+        self.offload.as_mut()
+    }
+
+    /// Whether this is only values a command that has run left to free.
+    pub fn frees_only(&self) -> bool {
+        matches!(self.offload, Some(crate::deferred::Offload::Free(_)))
+    }
+
     /// Take the state stashed at park time, so the loop can hand it to the
     /// resume dispatch. Called before [`wait`](Self::wait), which consumes self.
     pub fn take_state(&mut self) -> Option<BlockState> {
@@ -1330,6 +1398,7 @@ mod tests {
                 held_by_pause: false,
                 #[cfg(feature = "lua")]
                 tags: None,
+                offload: None,
             }
             .wait(),
         )

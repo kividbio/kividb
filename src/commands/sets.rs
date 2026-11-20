@@ -295,17 +295,28 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 Some(ValueRef::Set(s)) => {
                     let inner = s.read();
-                    let mut buf = Vec::with_capacity(16 + inner.len() * 24);
+                    // Millions of members, on an io_uring worker: run again
+                    // on a thread of its own, while this one serves its
+                    // other connections (#762). Not in cluster mode
+                    // (`deferred`).
+                    if inner.len() >= crate::commands::helpers::LONG_WORK
+                        && !ctx.cluster.enabled
+                        && crate::deferred::run_elsewhere(&mut ctx.blocking, cmd, inner.len())
+                    {
+                        return Some(crate::pause::HELD_IN_GATE.to_vec());
+                    }
                     // RESP3 has a real set type (`~`); RESP2 only has arrays.
                     // Identical payload, one byte of header difference — this
                     // keeps the single-pass build instead of collecting into a
                     // Vec just to re-encode it.
-                    push_header(
-                        &mut buf,
-                        if reply_resp(ctx) >= 3 { b'~' } else { b'*' },
-                        inner.len(),
-                    );
-                    inner.for_each(|v| push_bulk(&mut buf, v));
+                    let kind = if reply_resp(ctx) >= 3 { b'~' } else { b'*' };
+                    // On Tokio, as long work.
+                    let buf = crate::commands::helpers::long_work(inner.len(), || {
+                        let mut buf = Vec::with_capacity(16 + inner.len() * 24);
+                        push_header(&mut buf, kind, inner.len());
+                        inner.for_each(|v| push_bulk(&mut buf, v));
+                        buf
+                    });
                     crate::stats::record_hit();
                     Some(buf)
                 }

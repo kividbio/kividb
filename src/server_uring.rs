@@ -348,7 +348,6 @@ fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// What [`asleep_until`] needs of a connection.
-#[cfg(feature = "lua")]
 struct Asleep<'a> {
     stream: &'a Rc<TcpStream>,
     write_guard: &'a Rc<tokio::sync::Mutex<()>>,
@@ -368,7 +367,6 @@ struct Asleep<'a> {
 /// as a blocking command's wait watches it (`PeerWatch`): a kill shuts the
 /// socket. `None` if it went: nothing is to run for it. See
 /// `server::asleep_until`.
-#[cfg(feature = "lua")]
 async fn asleep_until<F: std::future::Future>(until: F, at: Asleep<'_>) -> Option<F::Output> {
     let flushed = if at.out_buf.is_empty() {
         true
@@ -405,6 +403,59 @@ async fn asleep_until<F: std::future::Future>(until: F, at: Asleep<'_>) -> Optio
     tokio::select! {
         done = until => Some(done),
         () = at.watch.gone() => None,
+    }
+}
+
+/// Have the work a command left for a thread of its own done
+/// (`deferred::Offload`, #762), the connection waiting for it asleep, as a
+/// blocking command waits, while this thread serves its other connections.
+/// The command's reply, or, for a command run again there, that run's:
+/// `None` if the client went meanwhile, once the work is done all the same
+/// (its run there is this client's).
+///
+/// `env` is what a command run again runs with; `(db, aof_enabled, resp)`
+/// the connection's database, whether the AOF is on, and its protocol.
+async fn offloaded(
+    offload: crate::deferred::Offload,
+    env: Option<crate::deferred::ClientExecEnv>,
+    (db, aof_enabled, resp): (usize, bool, u8),
+    latency: &crate::latency::LatencyTracker,
+    response: Vec<u8>,
+    at: Asleep<'_>,
+) -> Option<Vec<u8>> {
+    match offload {
+        crate::deferred::Offload::Rerun(cmd) => {
+            let env = env?;
+            // What the slow log has is the whole wait (`waited_from`): none
+            // of it was spent here.
+            crate::cmdstats::note_last_command(std::time::Duration::ZERO);
+            let mut done =
+                crate::deferred::spawn(move || env.run_sent_here(cmd, db, aof_enabled, resp));
+            let reply = match asleep_until(&mut done, at).await {
+                Some(reply) => reply,
+                None => {
+                    let _ = done.await;
+                    return None;
+                }
+            };
+            Some(reply.unwrap_or_else(|_| {
+                crate::resp::write::resp_error("ERR the command could not be run")
+            }))
+        }
+        crate::deferred::Offload::Free(freeing) => {
+            let started = std::time::Instant::now();
+            let (mut done, counted) = freeing.free_elsewhere();
+            let there = asleep_until(&mut done, at).await.is_some();
+            if !there {
+                let _ = done.await;
+            }
+            // Counted with the free: its own time, and the free's.
+            let own = counted
+                .as_ref()
+                .map_or(std::time::Duration::ZERO, |counted| counted.own);
+            crate::deferred::count_freed(latency, counted, &response, own + started.elapsed());
+            there.then_some(response)
+        }
     }
 }
 
@@ -1421,6 +1472,40 @@ pub async fn handle_client(
     // What a script run for this connection is given: see where it is made.
     #[cfg(feature = "lua")]
     let mut lua_env: Option<crate::lua_vm_blocking::ClientExecEnv> = None;
+    // What a command sent to a thread of its own runs with (`offloaded`):
+    // the connection as it is now.
+    macro_rules! client_env {
+        () => {
+            crate::deferred::ClientExecEnv::snapshot(
+                &store,
+                &lastsave,
+                crate::deferred::AofBridge::Tokio(aof_tx.clone()),
+                &config,
+                &started_at,
+                &index_store,
+                &dict_store,
+                &wait_table,
+                &ts_index,
+                &pubsub,
+                &hub_tx,
+                &repl_state,
+                &watch_registry,
+                &client_registry,
+                &acl_store,
+                &acl_log,
+                &slowlog,
+                &latency,
+                &compaction_tx,
+                &cluster_state,
+                &monitor_registry,
+                &tracking_table,
+                &peer_addr,
+                client_id,
+                resp_version & crate::commands::ctx::RESP_NO_TOUCH != 0,
+                authenticated_user.as_deref().unwrap_or("default"),
+            )
+        };
+    }
 
     // After a `SHUTDOWN` that failed: what follows it in the buffer is read
     // before anything more is, and was not answered before it.
@@ -1942,7 +2027,7 @@ pub async fn handle_client(
                         tracking_table: &tracking_table,
                         blocking: Some(blocking_slot.prime()),
                     });
-                    if let Some(wait) = blocking_slot.take_parked() {
+                    if let Some(mut wait) = blocking_slot.take_parked() {
                         if crate::aof::take_wait(&mut aof_wait, &mut aof_refused_from) {
                             crate::aof::written(&aof_tx).await;
                         }
@@ -1953,34 +2038,76 @@ pub async fn handle_client(
                             out_buf.len() + carried.len() - carried_from + unpresented,
                             client_id,
                         );
-                        // Boxed, and so polled out of line: the wait is cold, and the
-                        // connection's own future stays the size it is without it.
-                        match Box::pin(park_blocking_uring(
-                            wait,
-                            &mut blocking_slot,
-                            &stream,
-                            &write_guard,
-                            &mut out_buf,
-                            subscriptions.as_ref(),
-                            (&client_registry, client_id),
-                            &mut interrupted,
-                            &peer_watch,
-                            &repl_state,
-                            &mut carried,
-                            carried_from,
-                            parse_buf.len() - (parse_offset + consumed),
-                            &activity,
-                            limit,
-                        ))
-                        .await
-                        {
-                            // `parse_offset` deliberately not advanced: the same
-                            // command is re-dispatched, now carrying the delivery.
-                            Ok(()) => {
-                                due |= crate::output_limits::REDISPATCH;
-                                continue;
+                        // Long work the command left for a thread of its own (#762):
+                        // waited for asleep, while this thread serves the others.
+                        if let Some(offload) = wait.take_offload() {
+                            let env = matches!(offload, crate::deferred::Offload::Rerun(_))
+                                .then(|| client_env!());
+                            // Boxed, as the park below is: cold.
+                            let done = Box::pin(offloaded(
+                                offload,
+                                env,
+                                (selected_db, aof_enabled, resp_version),
+                                &latency,
+                                std::mem::take(&mut response),
+                                Asleep {
+                                    stream: &stream,
+                                    write_guard: &write_guard,
+                                    out_buf: &mut out_buf,
+                                    subscriptions: subscriptions.as_ref(),
+                                    watch: &peer_watch,
+                                    carried: &mut carried,
+                                    carried_from,
+                                    held_elsewhere: parse_buf.len() - (parse_offset + consumed),
+                                    activity: &activity,
+                                    limit,
+                                },
+                            ))
+                            .await;
+                            match done {
+                                // Run again where a `CLIENT PAUSE` set meanwhile sent
+                                // it back: read again, and held by the pause check.
+                                Some(reply) if crate::pause::is_held(&reply) => {
+                                    due |= crate::output_limits::REDISPATCH;
+                                    continue;
+                                }
+                                Some(reply) => response = reply,
+                                // Gone meanwhile: nobody to reply to.
+                                None => {
+                                    quit_requested = true;
+                                    break;
+                                }
                             }
-                            Err(reply) => response = reply,
+                        } else {
+                            // Boxed, and so polled out of line: the wait is cold, and the
+                            // connection's own future stays the size it is without it.
+                            match Box::pin(park_blocking_uring(
+                                wait,
+                                &mut blocking_slot,
+                                &stream,
+                                &write_guard,
+                                &mut out_buf,
+                                subscriptions.as_ref(),
+                                (&client_registry, client_id),
+                                &mut interrupted,
+                                &peer_watch,
+                                &repl_state,
+                                &mut carried,
+                                carried_from,
+                                parse_buf.len() - (parse_offset + consumed),
+                                &activity,
+                                limit,
+                            ))
+                            .await
+                            {
+                                // `parse_offset` deliberately not advanced: the same
+                                // command is re-dispatched, now carrying the delivery.
+                                Ok(()) => {
+                                    due |= crate::output_limits::REDISPATCH;
+                                    continue;
+                                }
+                                Err(reply) => response = reply,
+                            }
                         }
                     }
 
@@ -2045,7 +2172,7 @@ pub async fn handle_client(
                     tracking_table: &tracking_table,
                     blocking: Some(blocking_slot.prime()),
                 });
-                if let Some(wait) = blocking_slot.take_parked() {
+                if let Some(mut wait) = blocking_slot.take_parked() {
                     waited_from = Some(now_us());
                     if crate::aof::take_wait(&mut aof_wait, &mut aof_refused_from) {
                         crate::aof::written(&aof_tx).await;
@@ -2057,33 +2184,75 @@ pub async fn handle_client(
                         out_buf.len() + carried.len() - carried_from + unpresented,
                         client_id,
                     );
-                    // Boxed, and so polled out of line: the wait is cold, and the
-                    // connection's own future stays the size it is without it.
-                    match Box::pin(park_blocking_uring(
-                        wait,
-                        &mut blocking_slot,
-                        &stream,
-                        &write_guard,
-                        &mut out_buf,
-                        subscriptions.as_ref(),
-                        (&client_registry, client_id),
-                        &mut interrupted,
-                        &peer_watch,
-                        &repl_state,
-                        &mut carried,
-                        carried_from,
-                        parse_buf.len() - (parse_offset + consumed),
-                        &activity,
-                        limit,
-                    ))
-                    .await
-                    {
-                        // See the note at the non-slowlog site above.
-                        Ok(()) => {
-                            due |= crate::output_limits::REDISPATCH;
-                            continue;
+                    // Long work the command left for a thread of its own (#762):
+                    // waited for asleep, while this thread serves the others.
+                    if let Some(offload) = wait.take_offload() {
+                        let env = matches!(offload, crate::deferred::Offload::Rerun(_))
+                            .then(|| client_env!());
+                        // Boxed, as the park below is: cold.
+                        let done = Box::pin(offloaded(
+                            offload,
+                            env,
+                            (selected_db, aof_enabled, resp_version),
+                            &latency,
+                            std::mem::take(&mut response),
+                            Asleep {
+                                stream: &stream,
+                                write_guard: &write_guard,
+                                out_buf: &mut out_buf,
+                                subscriptions: subscriptions.as_ref(),
+                                watch: &peer_watch,
+                                carried: &mut carried,
+                                carried_from,
+                                held_elsewhere: parse_buf.len() - (parse_offset + consumed),
+                                activity: &activity,
+                                limit,
+                            },
+                        ))
+                        .await;
+                        match done {
+                            // Run again where a `CLIENT PAUSE` set meanwhile sent
+                            // it back: read again, and held by the pause check.
+                            Some(reply) if crate::pause::is_held(&reply) => {
+                                due |= crate::output_limits::REDISPATCH;
+                                continue;
+                            }
+                            Some(reply) => response = reply,
+                            // Gone meanwhile: nobody to reply to.
+                            None => {
+                                quit_requested = true;
+                                break;
+                            }
                         }
-                        Err(reply) => response = reply,
+                    } else {
+                        // Boxed, and so polled out of line: the wait is cold, and the
+                        // connection's own future stays the size it is without it.
+                        match Box::pin(park_blocking_uring(
+                            wait,
+                            &mut blocking_slot,
+                            &stream,
+                            &write_guard,
+                            &mut out_buf,
+                            subscriptions.as_ref(),
+                            (&client_registry, client_id),
+                            &mut interrupted,
+                            &peer_watch,
+                            &repl_state,
+                            &mut carried,
+                            carried_from,
+                            parse_buf.len() - (parse_offset + consumed),
+                            &activity,
+                            limit,
+                        ))
+                        .await
+                        {
+                            // See the note at the non-slowlog site above.
+                            Ok(()) => {
+                                due |= crate::output_limits::REDISPATCH;
+                                continue;
+                            }
+                            Err(reply) => response = reply,
+                        }
                     }
                 }
 
