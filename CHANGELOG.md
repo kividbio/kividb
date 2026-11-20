@@ -2428,10 +2428,50 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keys that match. `DEL` now follows `lazyfree-lazy-user-del`: with `yes` it
   frees a big value in the background as `UNLINK` does, and a config file
   setting it no longer warns that it has no effect; the default stays `no`.
-  On io_uring, a long command still holds up the connections served by its
-  own thread (#762). In a build with Lua and `lua-parallel-scripts yes`,
-  `KEYS` and `SCAN` still run alone, as before, so as not to see a script
-  part-way through.
+  On io_uring, see the next entry (#762). In a build with Lua and
+  `lua-parallel-scripts yes`, `KEYS` and `SCAN` still run alone, as before,
+  so as not to see a script part-way through.
+
+- **A long command no longer holds up the other connections of its io_uring
+  thread (#762).** On io_uring each worker thread serves its own
+  connections, and a long command used to stall every other connection of
+  its thread for as long (with one worker thread, a `PING`, `GET` or `SET`
+  waited 74 ms behind a `KEYS` over 2M keys, 126 ms behind a `DEL` of a
+  3M-field hash). Now these commands, once they are long, stop before they
+  have done anything and run again on a small pool of threads: `KEYS` when
+  the database holds 65,536 keys or more, `SCAN` when its `COUNT` and the
+  database are both that large, and `HGETALL`, `SMEMBERS`, `LRANGE` and
+  `SORT` without `STORE` over 65,536 elements or more. The free of a big
+  value after `DEL` (one key or several) runs there too, after the key is
+  deleted and the deletion propagated; until it is freed, the value is not
+  counted against `maxmemory`. The connection waits for that work before it
+  writes the reply or reads its next command, so its replies stay in order,
+  a client that has shut its side for writing still gets every reply, and
+  its thread serves the others meanwhile: a `PING`, `GET` or `SET` on that
+  thread waits at most about 1 ms behind those `KEYS`, `SCAN` and `DEL`. The
+  locks stay with the work: a command run on the pool holds the command gate
+  shared, and `HGETALL`, `SMEMBERS`, `LRANGE` and `SORT` hold their key's
+  shard for reading while they build the reply. A write to a key of that
+  shard waits for them, and so does its thread: behind an `HGETALL` of 1M
+  fields, the worst `PING`, `GET` and `SET` on the thread was 6-10 ms on the
+  pool, against 39 ms with the `HGETALL` run on the thread itself (suite
+  04's one-thread configuration, a Standard_D8s_v5), what a `SET` that lands
+  in that shard (one in 64 on 8 CPUs) waits and the thread's own handling of
+  the 1M-field reply, which were not told apart. A command that takes the
+  command gate alone (`EXEC`, a script run alone, a `DEL` of several keys)
+  waits for a `KEYS` or `SCAN` run on the pool the same way. Inside
+  `MULTI`/`EXEC`, a script, or a command that takes the command gate alone,
+  the work runs where it is, as before; `HGETALL`, `SMEMBERS`, `LRANGE` and
+  `SORT` also do in cluster mode. `INFO commandstats` and `LATENCY` time the
+  run on the pool. A `DEL` whose free waits is timed for `LATENCY` by its
+  own time, and counted in `INFO commandstats` with the free; the slow log
+  has the whole wait. Invalidation messages produced while a command waits
+  are delivered to that client before its reply. On Tokio, `HGETALL`,
+  `SMEMBERS`, `LRANGE` and the sort of `SORT` over that many elements now
+  run as other long work does (#754), and a `DEL` frees a big value after
+  the command, out of its gates: a `DEL` of several keys no longer holds the
+  command gate alone while it frees. A `SET` over a big value still frees it
+  in place, on both I/O models.
 
 - **`SINTER` of a big set with a small one costs the small set's size, not
   the big one's (#759).** `SINTER`, `SINTERSTORE`, `SINTERCARD`, `SDIFF`,

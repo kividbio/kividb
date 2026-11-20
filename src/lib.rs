@@ -27,6 +27,7 @@ pub mod commands;
 pub mod compaction;
 pub mod config;
 pub mod cpus;
+pub mod deferred;
 pub mod element;
 pub mod eviction;
 pub mod expiry;
