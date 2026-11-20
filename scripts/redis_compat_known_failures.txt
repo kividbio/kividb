@@ -11,6 +11,13 @@ unit/hyperloglog | Corrupted dense HyperLogLogs are detected: Wrong length
 # is set (off by default); the test passes with it on.
 unit/introspection-2 | TTL, TYPE and EXISTS do not alter the last access time of a key
 
+# The test expects expiring a set of 1,000,000 integers to take the expiry
+# cycle over 20 ms (`expire-cycle` in LATENCY LATEST). A large set's table
+# (#764) keeps integers of up to seven digits in its slots, with no block to
+# free each, so the set is freed in well under a millisecond and no event is
+# recorded.
+unit/latency-monitor | LATENCY of expire events are correctly collected
+
 # No timer shrinks an idle client's query buffer on io_uring; on Tokio both
 # pass (docs/REDIS_TEST_SUITE.md). The second fails because the first did.
 unit/querybuf | query buffer resized correctly | io_uring

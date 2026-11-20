@@ -389,7 +389,22 @@ pub fn over(limit: usize) -> bool {
     } else {
         recent
     };
-    now > limit
+    now > limit && still_over(limit)
+}
+
+/// Over `limit`: the old arrays of large sets' resizes left to the
+/// background are memory only until those end. Ended now, they are not
+/// what refuses a write or evicts a key (#764). Out of line, and only once
+/// over: the check is on every command's path.
+#[cold]
+#[inline(never)]
+fn still_over(limit: usize) -> bool {
+    if crate::member_set::background_pending() && crate::member_set::release_transients() {
+        let now = counted();
+        RECENT.store(now, Ordering::Relaxed);
+        return now > limit;
+    }
+    true
 }
 
 #[cfg(test)]

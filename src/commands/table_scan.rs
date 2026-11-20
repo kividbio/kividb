@@ -22,8 +22,8 @@
 //! - a hash field whose TTL is due is skipped where readers do not see it
 //!   (`hide_due_at`), from the TTL in its entry: the hash is not copied.
 
-// Nothing calls it yet: sets (#764 step 2) and hashes (step 3) wire it in
-// as they move onto the table.
+// `SSCAN` calls `sscan_reply` (sets are on the table: #764 step 2); the
+// hash side waits for hashes to move onto it (step 3).
 #![allow(dead_code)]
 
 use crate::collection_table::{CollectionTable, Fields, Members, Memory};

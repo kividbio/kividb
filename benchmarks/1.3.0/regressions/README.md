@@ -33,7 +33,7 @@ and why.
 | `14-sinter-big-small` | #759 | `SINTER`/`SINTERCARD`/`SINTERSTORE`/`SDIFF` of a 1M, 5M and (`FULL=1`) 20M-member integer set with a 4,096-member one; `SDIFFSTORE big small` as a cost guard; worst `SADD` to the small set during `SUNION big small` (Tokio, 1M) |
 | `15-brpop-many-keys` | #758 | jobs/s delivered to 1,000 and 4,000 workers each in `BRPOP` over 270 queues (and 1,000 over one queue, a guard) while 200 `LPUSH`es go out every 0.1 s; PING p99/max beside it; jobs lost (exactly 0) and clients left blocked after the workers go (0) |
 | `16-random-sample` | #839 | `ZRANDMEMBER` / `HRANDFIELD` of a sorted set / hash of 100, 10,000 and 1,000,000 members, with no count, 1, 10, -1, -10, `WITHSCORES` / `WITHVALUES`: microseconds a call (mean of 150-3,000 calls, median of 3 rounds) and the replies checked (length, distinct for a positive count) |
-| `17-set-memory` | #297 (step 1) | `used_memory` per set member, 1,000,000 members in sets of 10, 100, 1,000 and 100,000: 14-byte strings (`membr:<i>`) and integers (`0`..`n-1`); `OBJECT ENCODING` of each size recorded exactly; the tables (1,000 and 100,000) as guard rows |
+| `17-set-memory` | #297 (step 1), #764 (step 2) | `used_memory` per set member, 1,000,000 members in sets of 10, 100, 1,000 and 100,000, and one set each of 1M, 3M, 3,211,264 and 3,211,265 members (either side of a doubling of the table): 14-byte strings (`membr:<i>`) and integers (`0`..`n-1`); `OBJECT ENCODING` of each size recorded exactly |
 | `18-mastodon-feed-fanout` | #849 | Mastodon's home-feed fan-out (FeedManager mix: `ZADD`, `ZREMRANGEBYRANK 0 -801`, `ZREVRANGE 40 40 WITHSCORES`, `ZSCORE`, `EXISTS`, `ZREVRANGEBYSCORE ... LIMIT 0 20`, `ZRANGEBYSCORE`) over 20,000 feeds of 800 members with memtier_benchmark at 200 and 500 connections: ops/s and the timeline read's p50 against Redis and v1.2.2, p99 shown beside them; the same mix paced at 200k requests a second, its read p50 against v1.2.2; `used_memory` and bytes per member; recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-18)) |
 | `19-hash-memory` | collection storage step 2 | `used_memory` per hash field, 1,000,000 fields in hashes of 10, 100, 1,000 and 100,000: 14-byte fields (`field:<i>`) with 32-byte values, plain and with one field TTL a hash; `OBJECT ENCODING` of each size recorded exactly (`listpack`, `listpackex`, `hashtable`); the tables (1,000 and 100,000) as guard rows |
 | `20-envoy-ratelimit` | #849 | envoyproxy/ratelimit's pipelined `INCRBY` + `EXPIRE` pair on one key (memtier_benchmark, `--pipeline 2 --transaction`, 100,000 keys) at 200 and 500 connections: ops/s against Redis, p99 shown beside it, and keys left without a TTL (must be 0); on Linux the server and the client are pinned to separate halves of the CPUs; recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-20)) |
@@ -1016,6 +1016,37 @@ The 1,000 and 100,000 rows are guards: sets past the block's and the array's
 limits are tables, as in v1.2.2, and must not grow. Instructions per command
 are not measured here (the suite has no callgrind harness); #297's PR has
 them from `scripts/perf`-style runs.
+
+### Re-recorded for #764 step 2 (large sets on `CollectionTable`)
+
+Recorded 2026-11-20 on an Azure Standard_D4s_v5 (Xeon Platinum 8370C),
+rustc 1.100.0, `cargo build --release`: the candidate is commit `99467f18`
+(run `s17-branch-99467f18-d4s_v5`), against master `0caf6055` measured the
+same way in the same session (`s17-master-0caf6055-d4s_v5`, not recorded).
+Only the changed and new rows were taken into `baseline.json`: every
+`bytes_per_member_*` row, and every row of the new sizes; the `encoding_*`
+and `load_*_s` rows of 10 to 100,000 members are as recorded before. The
+suite now also has one set each of 1,000,000, 3,000,000, 3,211,264 and
+3,211,265 members (the last two either side of the table's doubling from
+2^19 to 2^20 groups), and reads `used_memory` once the server has stopped
+giving memory back (a growth finished in the background frees its old
+array at its end).
+
+| members a set | v1.2.2 strings | master strings | candidate strings | Redis 8.10.2 strings | v1.2.2 integers | master integers | candidate integers | Redis 8.10.2 integers |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 75.6 | 34.2 | 31.8 | 24.8 | 67.6 | 17.2 | 14.8 | 8.8 |
+| 100 | 55.4 | 20.3 | 20.1 | 18.5 | 47.4 | 3.75 | 3.51 | 2.8 |
+| 1,000 | 67.0 | 67.0 | 34.0 | 30.0 | 59.0 | 59.0 | 18.0 | 21.9 |
+| 100,000 | 54.3 | 54.3 | 29.8 | 36.8 | 46.3 | 46.3 | 13.8 | 28.8 |
+| 1,000,000 | 67.7 | 67.7 | 33.5 | 30.1 | 59.7 | 59.7 | 17.5 | 22.1 |
+| 3,000,000 | 55.8 | 55.8 | 29.7 | 37.9 | 47.8 | 47.8 | 13.7 | 35.2 |
+| 3,211,264 (fullest) | 54.2 | 54.2 | 29.4 | 36.8 | 46.2 | 46.2 | 13.4 | 34.3 |
+| 3,211,265 (just grown) | 54.2 | 54.2 | 37.2 | 36.8 | 46.2 | 46.2 | 21.2 | 34.3 |
+
+The block and the array (10 and 100 members) are the same structures as
+before; each set key is 24 bytes smaller because a set's header (`MemberSet`)
+went from 64 to 40 bytes with the table boxed (2.4 B a member at 10, 0.24 at
+100). `OBJECT ENCODING` is unchanged at every size.
 
 ## Recorded run, suite 18
 

@@ -1126,6 +1126,54 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     this release writes and the other way round. `MEMORY USAGE`, eviction
     and lazy freeing count a block or an array as the one allocation it is.
 
+- **Large sets take about half the memory, no write moves every member at
+  once to grow, and `SSCAN` reads only its page (#764, #770).** A set past
+  the block's and the
+  array's limits (`OBJECT ENCODING` `hashtable`) is a table of its own,
+  where each member is one block of a slab pool kept for collections (16
+  bytes for a 14-byte member), or no block at all for a member of up to seven bytes (any
+  integer of up to seven digits), which lives in the table's slot. Measured
+  on an Azure D4s_v5 (`used_memory` a member; before, then now; Redis
+  8.10.2 last): 14-byte members 67.0 / 34.0 / 30.0 at 1,000 members, 54.3 /
+  29.8 / 36.8 at 100,000, 55.8 / 29.7 / 37.9 at 3,000,000; integers 59.0 /
+  18.0 / 21.9, 46.3 / 13.8 / 28.8 and 47.8 / 13.7 / 35.2. Just after the
+  table doubles (3,211,265 members) it is 37.2 and 21.2 bytes, its most.
+  Every set key, small ones included, is also 24 bytes smaller (its header
+  went from 64 to 40 bytes).
+  - The table grows and shrinks a few members a write; a resize that the
+    writes leave part-way is finished in the background, a step at a time
+    under the set's own lock, and the old array is freed off the command
+    path. Filling one set to 3,000,000 members one `SADD` at a time, the
+    slowest `SADD` took 1.5 to 1.9 ms over four runs (119 and 142 ms
+    before, at a doubling; Redis 8.10.2: 5.1 ms; two of four earlier runs
+    of this change had one pause of about 9 ms), the 99th percentile
+    0.055 ms as before.
+  - `SSCAN` of such a set reads the table's own groups for its page, with
+    `COUNT` a hint as in Redis (a page can be shorter, or empty, before the
+    cursor comes back 0), where it read the whole set on every call: a full
+    scan of 1,000,000 members takes 8.0 s at `COUNT 10`, 2.2 s at 100 and
+    1.4 s at 1,000 from one client (33 s at each before), and 1.8 / 0.41 /
+    0.17 s of server CPU (32 / 32 / 31 s before; Redis 8.10.2: 1.8 / 0.37 /
+    0.23 s). Thanks to @magic-peach for
+    the page builder (#955). A scan begun before an upgrade still ends, but
+    may miss or repeat members.
+  - Members are no longer shared between sets: `COPY` of a 1,000,000-member
+    set takes 169 ms (42 ms before; Redis 181 ms) and `SUNIONSTORE` of it
+    with a small set 136 ms (107 ms; Redis 235 ms), each copy taking 33.5
+    bytes a member (35.7 before, when the members were shared and only the
+    table copied).
+  - Instructions per command on a large set (callgrind, the shipped build):
+    `SISMEMBER` 1-2 % more, `SADD` 3 %, `SREM` and `SPOP` 3-5 %, `SMEMBERS`
+    of 100,000 members 31 % more (each member is read out of its slot or
+    entry); sets of 512 members or fewer, and every other command, as
+    before.
+  - `MEMORY USAGE` of a set is exact and immediate whatever `SAMPLES` says.
+    `SMEMBERS`, `SSCAN`, `SINTER`, `SUNION`, `SDIFF`, `SPOP` and
+    `SRANDMEMBER` give a large set's members in a different order than
+    1.2.x did (no order, as in Redis). Snapshots, the AOF, replication,
+    `DUMP`/`RESTORE` and `MIGRATE` are unchanged in both directions with
+    1.2.2.
+
 - **Lists take about half the memory, short elements a fifth (#297).** A
   list's elements are kept end to end in chunks of up to 64, each element
   between two copies of its length (one byte each for an element shorter

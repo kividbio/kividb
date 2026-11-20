@@ -199,6 +199,97 @@ if [ "${WORKLOADS:-}" = access ]; then
   echo done
   exit 0
 fi
+if [ "${WORKLOADS:-}" = sets ]; then
+  # Set commands on one set of each form and size (#764 step 2): 14-byte
+  # members `membr:<i>` (as suite 17's) in sets of 10 and 128 (a block),
+  # 1,000, 100,000 and 3,000,000 (a table); integers 0..511 (an array).
+  # The members asked for are uniform over those the set holds (a hit) or
+  # not in it (a miss). Each set is loaded by SADDs of 1,000 members in
+  # RESP through `redis-cli --pipe` (SIZES limits the sizes, e.g.
+  # SIZES="str:10 int:512"). Rows counted per pair are a pair of commands
+  # that leaves the set as big as it was: SREM then SADD of one member
+  # (SREM's and SADD's writes, the set never leaving its form), and SPOP
+  # then SADD of a new member. The large rows (SMEMBERS and SUNIONSTORE of
+  # 100,000 members with 1,000 of them, SINTERSTORE of the same two (a result
+  # of 1,000), SINTER of the 3,000,000 with a set
+  # of 10 of its members, COPY of 1,000,000) are per command, NBIG (50) of
+  # them, and 5 COPYs.
+  gen() { # kind size seed n op -> RESP on stdout
+    awk -v kind="$1" -v size="$2" -v seed="$3" -v n="$4" -v op="$5" '
+      function m(i) { return kind == "int" ? sprintf("%d", i) : sprintf("membr:%08d", i) }
+      function miss(i) { return kind == "int" ? sprintf("%d", size + i) : sprintf("absnt:%08d", i) }
+      function out(a, b, c,   k) {
+        k = (c == "") ? 2 : 3; if (b == "") k = 1
+        printf "*%d\r\n$%d\r\n%s\r\n", k, length(a), a
+        if (k >= 2) printf "$%d\r\n%s\r\n", length(b), b
+        if (k == 3) printf "$%d\r\n%s\r\n", length(c), c
+      }
+      BEGIN {
+        srand(seed)
+        if (op == "load") {
+          for (i = 0; i < size; i += 1000) {
+            hi = (i + 1000 < size) ? i + 1000 : size
+            printf "*%d\r\n$4\r\nSADD\r\n$1\r\ns\r\n", hi - i + 2
+            for (j = i; j < hi; j++) { v = m(j); printf "$%d\r\n%s\r\n", length(v), v }
+          }
+          exit
+        }
+        fresh = 0
+        for (q = 0; q < n; q++) {
+          r = int(rand() * size)
+          if (op == "SADD") out("SADD", "s", m(r))
+          else if (op == "SISMEMBER-HIT") out("SISMEMBER", "s", m(r))
+          else if (op == "SISMEMBER-MISS") out("SISMEMBER", "s", miss(r))
+          else if (op == "SMISMEMBER") {
+            a = m(r); b = m(int(rand() * size)); c = m(int(rand() * size)); d = miss(r)
+            printf "*6\r\n$10\r\nSMISMEMBER\r\n$1\r\ns\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", length(a), a, length(b), b, length(c), c, length(d), d
+          }
+          else if (op == "SCARD") out("SCARD", "s")
+          else if (op == "SRANDMEMBER") out("SRANDMEMBER", "s")
+          else if (op == "SREM-SADD") { out("SREM", "s", m(r)); out("SADD", "s", m(r)) }
+          else if (op == "SPOP-SADD") { out("SPOP", "s"); out("SADD", "s", kind == "int" ? sprintf("%d", size + 1000000 + fresh) : sprintf("fresh:%08d", fresh)); fresh++ }
+          else if (op == "SMEMBERS") out("SMEMBERS", "s")
+          else if (op == "SINTER") out("SINTER", "s", "small")
+          else if (op == "SUNIONSTORE") printf "*4\r\n$11\r\nSUNIONSTORE\r\n$3\r\ndst\r\n$1\r\ns\r\n$5\r\nsmall\r\n"
+          else if (op == "SINTERSTORE") printf "*4\r\n$11\r\nSINTERSTORE\r\n$3\r\ndst\r\n$1\r\ns\r\n$5\r\nsmall\r\n"
+          else if (op == "COPY") { d = sprintf("copy:%d", q); printf "*3\r\n$4\r\nCOPY\r\n$1\r\ns\r\n$%d\r\n%s\r\n", length(d), d }
+        }
+      }'
+  }
+  small() { # kind k -> a set `small` of k members of `s`
+    awk -v kind="$1" -v k="$2" 'BEGIN {
+      printf "*%d\r\n$4\r\nSADD\r\n$5\r\nsmall\r\n", k + 2
+      for (i = 0; i < k; i++) { v = (kind == "int") ? sprintf("%d", i * 7) : sprintf("membr:%08d", i * 7); printf "$%d\r\n%s\r\n", length(v), v }
+    }'
+  }
+  for tag in "$@"; do
+    for spec in ${SIZES:-str:10 str:128 int:512 str:1000 str:100000 str:3000000}; do
+      kind=${spec%%:*} size=${spec##*:}
+      case $spec in str:*) label="S$size" ;; *) label="I$size" ;; esac
+      gen "$kind" "$size" 1 0 load > /tmp/load
+      for op in SADD SISMEMBER-HIT SISMEMBER-MISS SMISMEMBER SCARD SRANDMEMBER SREM-SADD SPOP-SADD; do
+        { cat /tmp/load; gen "$kind" "$size" 2 2000 "$op"; } > /tmp/set-warm
+        gen "$kind" "$size" 3 "$N" "$op" > /tmp/set
+        PIPEFILE=/tmp/set DSIZE=100 one "$tag" "$op-$label"
+      done
+      big=
+      case $size in 100000) big="SMEMBERS SUNIONSTORE SINTERSTORE" ;; 3000000) big="SINTER" ;; esac
+      for op in $big; do
+        k=1000; [ "$op" = SINTER ] && k=10
+        { cat /tmp/load; small "$kind" "$k"; gen "$kind" "$size" 2 2 "$op"; } > /tmp/set-warm
+        gen "$kind" "$size" 3 "${NBIG:-50}" "$op" > /tmp/set
+        N=${NBIG:-50} PIPEFILE=/tmp/set DSIZE=100 one "$tag" "$op-$label"
+      done
+    done
+    if [ -z "${SIZES:-}" ] || [[ " $SIZES " == *" str:1000000 "* ]]; then
+      gen str 1000000 1 0 load > /tmp/set-warm
+      gen str 1000000 3 5 COPY > /tmp/set
+      N=5 PIPEFILE=/tmp/set DSIZE=100 one "$tag" "COPY-S1000000"
+    fi
+  done | tee /out/raw.txt
+  echo done
+  exit 0
+fi
 for tag in "$@"; do
   DSIZE=100;  one "$tag" GET-100  -d 100  -t get
   DSIZE=100;  one "$tag" SET-100  -d 100  -t set

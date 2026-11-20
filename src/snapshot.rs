@@ -2477,9 +2477,9 @@ fn read_image_body(
                     let mut hset = crate::member_set::MemberSet::with_capacity(hint(count));
                     for _ in 0..count {
                         let member = read_bytes(&mut r)?;
-                        hset.insert_bytes(&member);
+                        hset.insert_loaded(&member)?;
                     }
-                    KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(hset)))
+                    KiviDBValue::Set(crate::member_set::shared(hset))
                 }
                 TAG_SORTEDSET => {
                     let mut count_buf = [0u8; 4];
@@ -3995,11 +3995,9 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             let mut set = crate::member_set::MemberSet::with_capacity(hint(count as usize));
             for _ in 0..count {
                 let member = rdb_read_string(r)?;
-                set.insert_bytes(&member);
+                set.insert_loaded(&member)?;
             }
-            Ok(Some(KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(
-                set,
-            )))))
+            Ok(Some(KiviDBValue::Set(crate::member_set::shared(set))))
         }
         3 => {
             // Sorted set v1 (score as double string)
@@ -4089,9 +4087,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                     set.insert_bytes(crate::member_set::IntText::new(val).as_bytes());
                 }
             }
-            Ok(Some(KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(
-                set,
-            )))))
+            Ok(Some(KiviDBValue::Set(crate::member_set::shared(set))))
         }
         12 => {
             // RDB_TYPE_ZSET_ZIPLIST (Redis up to 6.2): member, score, member,
@@ -4193,9 +4189,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             for item in deque {
                 set.insert(item);
             }
-            Ok(Some(KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(
-                set,
-            )))))
+            Ok(Some(KiviDBValue::Set(crate::member_set::shared(set))))
         }
         // RDB_TYPE_STREAM_LISTPACKS, _2 (Redis 7.0), _3 (7.2), _4 (8.6) and
         // _5 (8.10).
@@ -6196,10 +6190,10 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             let mut set = crate::member_set::MemberSet::with_capacity(hint(count));
             for _ in 0..count {
                 let (bytes, next) = read_bytes_slice(payload, pos)?;
-                set.insert_bytes(bytes);
+                set.insert_loaded(bytes).ok()?;
                 pos = next;
             }
-            Some(KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(set))))
+            Some(KiviDBValue::Set(crate::member_set::shared(set)))
         }
         TAG_SORTEDSET => {
             if payload.len() < 4 {
