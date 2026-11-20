@@ -1,13 +1,12 @@
 use crate::commands::ctx::Ctx;
 
 use crate::commands::memory_layout as layout;
-use crate::member_set::{Member, MemberSet};
+use crate::member_set::MemberSet;
 use crate::read_lock;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
-use crate::types::{HashFields, HashInner, ListValues, SortedSetInner, StreamInner, ZMember};
-use ordered_float::OrderedFloat;
+use crate::types::{HashFields, HashInner, ListValues, SortedSetInner, StreamInner};
 use parking_lot::RwLock;
 
 pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
@@ -172,26 +171,11 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 // allocated, room to spare included.
                 entry() + layout::arc_of::<RwLock<SortedSetInner>>() + block
             } else {
-                // Each member is one block, held by both indexes. One whose
-                // score was changed has two: the member map keeps the block
-                // it had and the score index takes the command's, so the
-                // map's is then held by the map alone. Sampled as a set's
-                // members are.
-                let members = layout::sampled(inner.len(), samples, || {
-                    inner.iter_unordered().map(|(m, _)| {
-                        let block = layout::arc_slice(m.len());
-                        match m {
-                            Member::Shared(m) if std::sync::Arc::strong_count(m) == 1 => 2 * block,
-                            _ => block,
-                        }
-                    })
-                });
+                // Counted exactly, not sampled: the set knows what it asked for.
                 entry()
                     + layout::arc_of::<RwLock<SortedSetInner>>()
                     + SortedSetInner::LARGE_HEADER
-                    + layout::std_hash_map::<ZMember, f64>(inner.capacity())
-                    + layout::score_index::<(OrderedFloat<f64>, ZMember)>(inner.len())
-                    + members
+                    + inner.heap_bytes()
             }
         }
 

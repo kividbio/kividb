@@ -15,6 +15,9 @@ use parking_lot::RwLock;
 use std::ops::Bound;
 use std::sync::Arc;
 
+/// A write that would take a set past `sorted_set::MAX_MEMBERS` members.
+pub(crate) const TOO_MANY_MEMBERS: &str = "ERR sorted set has too many members";
+
 // ── RESP3 shaping ─────────────────────────────────────────────────────────
 //
 // Two things change for sorted sets once RESP3 is negotiated:
@@ -616,6 +619,10 @@ fn zadd(ctx: &mut Ctx) -> Vec<u8> {
         {
             return Err(resp_error("ERR resulting score is not a number (NaN)"));
         }
+        // Checked first, so a refused batch writes nothing.
+        if !flag_xx && !inner.has_room_for(pairs.iter().map(|&(_, member)| member)) {
+            return Err(resp_error(TOO_MANY_MEMBERS));
+        }
         // A block that this command's pairs cannot fit becomes the large
         // form before any is written, as Redis judges by the command.
         inner.expect(pairs.len());
@@ -625,7 +632,7 @@ fn zadd(ctx: &mut Ctx) -> Vec<u8> {
         for &(score, member) in &pairs {
             // One lookup a member: its score, if it has one, decides what
             // is written.
-            inner.upsert(member, |existing| {
+            let stored = inner.upsert(member, |existing| {
                 let final_score = if flag_incr {
                     // INCR: add to the existing score; a new member's is the
                     // increment itself, `-0` too, as Redis replies (#422).
@@ -667,6 +674,9 @@ fn zadd(ctx: &mut Ctx) -> Vec<u8> {
                     }
                 }
             });
+            if stored.is_err() {
+                return Err(resp_error(TOO_MANY_MEMBERS));
+            }
         }
         // A table reserved for every pair, members given twice included,
         // is made as small as what came.
@@ -1304,9 +1314,12 @@ fn zincrby(ctx: &mut Ctx) -> Vec<u8> {
 
     let resp = reply_resp(ctx);
     let written = write_zset(ctx, &key, |inner| {
+        if !inner.has_room_for(std::iter::once(member)) {
+            return Err(resp_error(TOO_MANY_MEMBERS));
+        }
         // A new member's score is the increment itself: `-0` too, as Redis
         // replies (#422). It is stored as 0 (`SortedSetInner::upsert`).
-        inner.upsert(member, |old| {
+        let stored = inner.upsert(member, |old| {
             let new_score = old.map_or(incr, |old| old + incr);
             if new_score.is_nan() {
                 return (
@@ -1315,7 +1328,8 @@ fn zincrby(ctx: &mut Ctx) -> Vec<u8> {
                 );
             }
             (Some(new_score), Ok(new_score))
-        })
+        });
+        stored.unwrap_or_else(|_| Err(resp_error(TOO_MANY_MEMBERS)))
     });
     match written {
         Ok(Ok(new_score)) => score_reply(resp, new_score),
@@ -1617,9 +1631,7 @@ fn zunionstore(ctx: &mut Ctx) -> Vec<u8> {
         }
     }
 
-    let count = result.len() as i64;
-    store_zset(ctx, &dst, result);
-    resp_integer(count)
+    store_zset(ctx, &dst, result)
 }
 
 fn zinter(ctx: &mut Ctx) -> Vec<u8> {
@@ -1696,23 +1708,19 @@ fn zinterstore(ctx: &mut Ctx) -> Vec<u8> {
             Ok(Some(s)) => snapshots.push(s),
             Ok(None) => {
                 // Empty intersection — store empty zset, return 0
-                store_zset(ctx, &dst, ahash::AHashMap::new());
-                return resp_integer(0);
+                return store_zset(ctx, &dst, ahash::AHashMap::new());
             }
             Err(e) => return e,
         }
     }
 
     if snapshots.is_empty() {
-        store_zset(ctx, &dst, ahash::AHashMap::new());
-        return resp_integer(0);
+        return store_zset(ctx, &dst, ahash::AHashMap::new());
     }
 
     let result = intersect_weighted(&snapshots, &weights, agg, count_only);
 
-    let count = result.len() as i64;
-    store_zset(ctx, &dst, result);
-    resp_integer(count)
+    store_zset(ctx, &dst, result)
 }
 
 fn zintercard(ctx: &mut Ctx) -> Vec<u8> {
@@ -1845,8 +1853,7 @@ fn zdiffstore(ctx: &mut Ctx) -> Vec<u8> {
     let base = match read_zset_snapshot(ctx, cmd[3]) {
         Ok(Some(s)) => s,
         Ok(None) => {
-            store_zset(ctx, &dst, ahash::AHashMap::new());
-            return resp_integer(0);
+            return store_zset(ctx, &dst, ahash::AHashMap::new());
         }
         Err(e) => return e,
     };
@@ -1864,9 +1871,7 @@ fn zdiffstore(ctx: &mut Ctx) -> Vec<u8> {
         .filter(|(member, _)| others.iter().all(|o| !o.contains_key(member)))
         .collect();
 
-    let count = result.len() as i64;
-    store_zset(ctx, &dst, result);
-    resp_integer(count)
+    store_zset(ctx, &dst, result)
 }
 
 fn zremrangebyscore(ctx: &mut Ctx) -> Vec<u8> {
@@ -2150,7 +2155,10 @@ fn zrangestore(ctx: &mut Ctx) -> Vec<u8> {
             None => SortedSetInner::new(),
             Some(ValueRef::SortedSet(zs)) => {
                 let inner = zs.read();
-                SortedSetInner::from_pairs(zrange_pairs(&inner, &params))
+                let Ok(stored) = SortedSetInner::from_pairs(zrange_pairs(&inner, &params)) else {
+                    return resp_error(TOO_MANY_MEMBERS);
+                };
+                stored
             }
             Some(_) => {
                 return resp_error(
@@ -2353,9 +2361,14 @@ fn parse_weights_aggregate(cmd: &[&[u8]], start: usize, num_keys: usize) -> Weig
 /// behind rather than an empty sorted set.
 ///
 /// Built whole, in the form its size and members call for: a block, laid
-/// down once, if they fit one.
-fn store_zset(ctx: &mut Ctx, dst_key: &[u8], members: ahash::AHashMap<Vec<u8>, f64>) {
-    store_built(ctx, dst_key, SortedSetInner::from_pairs(members));
+/// down once, if they fit one. Replies with the members stored.
+fn store_zset(ctx: &mut Ctx, dst_key: &[u8], members: ahash::AHashMap<Vec<u8>, f64>) -> Vec<u8> {
+    let Ok(inner) = SortedSetInner::from_pairs(members) else {
+        return resp_error(TOO_MANY_MEMBERS);
+    };
+    let count = inner.len() as i64;
+    store_built(ctx, dst_key, inner);
+    resp_integer(count)
 }
 
 /// [`store_zset`] of a set already built.
@@ -2893,10 +2906,10 @@ mod score_range_tests {
         let mut zs = SortedSetInner::new();
         for (i, &score) in EDGES.iter().enumerate() {
             for name in ["", "a", "b"] {
-                zs.insert(member(&format!("{name}{i}")), score);
+                zs.insert(member(&format!("{name}{i}")), score).unwrap();
             }
         }
-        zs.insert(member(""), 1.0);
+        zs.insert(member(""), 1.0).unwrap();
         zs
     }
 
@@ -2918,8 +2931,8 @@ mod score_range_tests {
     #[test]
     fn signed_zeros_are_the_same_score() {
         let mut zs = SortedSetInner::new();
-        zs.insert(member("neg"), -0.0);
-        zs.insert(member("pos"), 0.0);
+        zs.insert(member("neg"), -0.0).unwrap();
+        zs.insert(member("pos"), 0.0).unwrap();
         for (min, max) in [(-0.0, 0.0), (0.0, -0.0), (0.0, 0.0), (-0.0, -0.0)] {
             assert_eq!(by_range(&zs, (min, false), (max, false)).len(), 2);
             assert!(by_range(&zs, (min, true), (max, false)).is_empty());
@@ -2972,7 +2985,7 @@ mod score_range_tests {
             let mut zs = SortedSetInner::new();
             for i in 0..rng.below(300) {
                 let score = rng.score();
-                zs.insert(member(&format!("m{i:04}")), score);
+                zs.insert(member(&format!("m{i:04}")), score).unwrap();
             }
             for _ in 0..50 {
                 let lo = (rng.score(), rng.below(2) == 0);

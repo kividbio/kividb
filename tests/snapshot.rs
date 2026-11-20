@@ -292,9 +292,9 @@ fn kdb_set_no_duplicates() {
 #[test]
 fn kdb_sorted_set_basic() {
     let mut ss = SortedSetInner::new();
-    ss.insert(Arc::from(b"a".as_slice()), 1.0);
-    ss.insert(Arc::from(b"b".as_slice()), 2.5);
-    ss.insert(Arc::from(b"c".as_slice()), -1.0);
+    ss.insert(Arc::from(b"a".as_slice()), 1.0).unwrap();
+    ss.insert(Arc::from(b"b".as_slice()), 2.5).unwrap();
+    ss.insert(Arc::from(b"c".as_slice()), -1.0).unwrap();
 
     let v = roundtrip_one("zs", KiviDBValue::SortedSet(Arc::new(RwLock::new(ss))));
     match v {
@@ -314,7 +314,7 @@ fn kdb_sorted_set_score_precision() {
     // f64 must survive the to_le_bytes round-trip without precision loss
     let mut ss = SortedSetInner::new();
     let score = std::f64::consts::PI; // 3.141592653589793
-    ss.insert(Arc::from(b"pi".as_slice()), score);
+    ss.insert(Arc::from(b"pi".as_slice()), score).unwrap();
 
     let v = roundtrip_one("pi_set", KiviDBValue::SortedSet(Arc::new(RwLock::new(ss))));
     match v {
@@ -330,10 +330,12 @@ fn kdb_sorted_set_score_precision() {
 #[test]
 fn kdb_sorted_set_extreme_scores() {
     let mut ss = SortedSetInner::new();
-    ss.insert(Arc::from(b"min".as_slice()), f64::MIN);
-    ss.insert(Arc::from(b"max".as_slice()), f64::MAX);
-    ss.insert(Arc::from(b"inf".as_slice()), f64::INFINITY);
-    ss.insert(Arc::from(b"neg_inf".as_slice()), f64::NEG_INFINITY);
+    ss.insert(Arc::from(b"min".as_slice()), f64::MIN).unwrap();
+    ss.insert(Arc::from(b"max".as_slice()), f64::MAX).unwrap();
+    ss.insert(Arc::from(b"inf".as_slice()), f64::INFINITY)
+        .unwrap();
+    ss.insert(Arc::from(b"neg_inf".as_slice()), f64::NEG_INFINITY)
+        .unwrap();
 
     let v = roundtrip_one(
         "extremes",
@@ -354,9 +356,9 @@ fn kdb_sorted_set_extreme_scores() {
 #[test]
 fn kdb_sorted_set_score_order_preserved() {
     let mut ss = SortedSetInner::new();
-    ss.insert(Arc::from(b"c".as_slice()), 3.0);
-    ss.insert(Arc::from(b"a".as_slice()), 1.0);
-    ss.insert(Arc::from(b"b".as_slice()), 2.0);
+    ss.insert(Arc::from(b"c".as_slice()), 3.0).unwrap();
+    ss.insert(Arc::from(b"a".as_slice()), 1.0).unwrap();
+    ss.insert(Arc::from(b"b".as_slice()), 2.0).unwrap();
 
     let v = roundtrip_one(
         "ordered_zs",
@@ -1236,7 +1238,7 @@ fn kdb_all_types_together() {
     );
 
     let mut ss = SortedSetInner::new();
-    ss.insert(Arc::from(b"m".as_slice()), 42.0);
+    ss.insert(Arc::from(b"m".as_slice()), 42.0).unwrap();
     map.insert(
         "zset".to_string(),
         KiviDBValue::SortedSet(Arc::new(RwLock::new(ss))),

@@ -198,6 +198,19 @@ other files:
 - `SORT` of a `listpack` sorted set leaves it a `listpack`; Redis 8.10
   turns the set it sorts into a `skiplist`, so `OBJECT ENCODING` differs
   after a `SORT` (the replies do not).
+- A sorted set holds at most 2^31 (2,147,483,648) members; Redis has no
+  such limit. The limit is for each key, not for the database. A write
+  that would add a member past it is refused whole with
+  `ERR sorted set has too many members`, and changes nothing: `ZADD`
+  (`INCR` too), `ZINCRBY` and `GEOADD` that add a member, and
+  `ZUNIONSTORE`, `ZINTERSTORE`, `ZDIFFSTORE`, `ZRANGESTORE`,
+  `GEOSEARCHSTORE`, and `GEORADIUS` or `GEORADIUSBYMEMBER` with `STORE` or
+  `STOREDIST`, which leave the destination as it was. On a full set,
+  `ZADD XX`, writes that only change the scores of members already there,
+  and removals still work.
+- A larger sorted set is not loaded: `RESTORE` answers
+  `ERR Bad data format`, and a snapshot, RDB file or full sync holding one
+  fails to load, as a damaged one does.
 
 **Lists**
 - A list's elements are kept end to end in chunks of up to 64, as Redis

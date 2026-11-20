@@ -1,5 +1,6 @@
 use crate::cpus::ScopeExt as _;
 use crate::list_values::ListValues;
+use crate::member_slab::SlabFull;
 use crate::store;
 use crate::store::Key;
 use crate::store::ValueRef;
@@ -2498,7 +2499,7 @@ fn read_image_body(
                                 format!("{NAN_SCORE} in key '{}'", String::from_utf8_lossy(&key)),
                             ));
                         };
-                        ss.push(&member, score);
+                        ss.push(&member, score).map_err(too_many_members)?;
                     }
                     KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(ss.finish())))
                 }
@@ -4006,7 +4007,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             for _ in 0..count {
                 let member = rdb_read_string(r)?;
                 let score = zset_score_or_error(rdb_read_double_v1(r)?)?;
-                ss.push(&member, score);
+                ss.push(&member, score).map_err(too_many_members)?;
             }
             Ok(Some(KiviDBValue::SortedSet(Arc::new(
                 parking_lot::RwLock::new(ss.finish()),
@@ -4035,7 +4036,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                 let mut score_buf = [0u8; 8];
                 r.read_exact(&mut score_buf)?;
                 let score = zset_score_or_error(f64::from_le_bytes(score_buf))?;
-                ss.push(&member, score);
+                ss.push(&member, score).map_err(too_many_members)?;
             }
             Ok(Some(KiviDBValue::SortedSet(Arc::new(
                 parking_lot::RwLock::new(ss.finish()),
@@ -4105,7 +4106,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                         io::Error::new(io::ErrorKind::InvalidData, "bad ziplist zset score")
                     })?;
                 let score = zset_score_or_error(score)?;
-                ss.push(&member, score);
+                ss.push(&member, score).map_err(too_many_members)?;
             }
             Ok(Some(KiviDBValue::SortedSet(Arc::new(
                 parking_lot::RwLock::new(ss.finish()),
@@ -5166,6 +5167,14 @@ fn rdb_decode_listpack_into_hash(blob: &[u8]) -> io::Result<crate::types::HashFi
     Ok(hmap)
 }
 
+/// A sorted set too big to load: refused, not cut short.
+fn too_many_members(_: SlabFull) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "sorted set has more members than a set can hold",
+    )
+}
+
 /// member, score, member, score..., a score as an integer or as text.
 fn rdb_decode_listpack_into_zset(blob: &[u8]) -> io::Result<SortedSetInner> {
     let elements = lp_elements(blob)?;
@@ -5180,7 +5189,7 @@ fn rdb_decode_listpack_into_zset(blob: &[u8]) -> io::Result<SortedSetInner> {
             .and_then(|s| s.parse().ok())
             .ok_or_else(malformed_listpack)?;
         let score = zset_score_or_error(score)?;
-        ss.push(&member, score);
+        ss.push(&member, score).map_err(too_many_members)?;
     }
     Ok(ss.finish())
 }
@@ -6210,7 +6219,7 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
                 let score = zset_score(f64::from_bits(u64::from_le_bytes(
                     payload[next..next + 8].try_into().ok()?,
                 )))?;
-                ss.push(member_bytes, score);
+                ss.push(member_bytes, score).ok()?;
                 pos = next + 8;
             }
             Some(KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(
@@ -7875,7 +7884,7 @@ mod nan_score_tests {
     fn zset(scores: &[(&str, f64)]) -> KiviDBValue {
         let mut ss = SortedSetInner::new();
         for (member, score) in scores {
-            ss.insert(Arc::from(member.as_bytes()), *score);
+            ss.insert(Arc::from(member.as_bytes()), *score).unwrap();
         }
         KiviDBValue::SortedSet(Arc::new(parking_lot::RwLock::new(ss)))
     }
@@ -8063,8 +8072,8 @@ mod empty_key_tests {
         members.insert(Arc::from(&b""[..]));
         members.insert(Arc::from(&b"m"[..]));
         let mut zset = SortedSetInner::new();
-        zset.insert(Arc::from(&b""[..]), 1.5);
-        zset.insert(Arc::from(&b"z"[..]), 2.0);
+        zset.insert(Arc::from(&b""[..]), 1.5).unwrap();
+        zset.insert(Arc::from(&b"z"[..]), 2.0).unwrap();
         let db0 = HashMap::from([
             (
                 String::new(),

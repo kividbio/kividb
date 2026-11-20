@@ -35,6 +35,13 @@
 #                       1k, 100k, 3M (table); SMEMBERS, SUNIONSTORE,
 #                       SINTER and COPY of big sets (see measure.sh;
 #                       SIZES limits the sizes)
+#   WORKLOADS=zsets     sorted-set commands on one set of 128 (block),
+#                       1k, 100k and 1M members: ZADD of a member there
+#                       and (with ZREM) of a new one, ZINCRBY, ZSCORE,
+#                       ZRANK, ZRANGE 0 9 and from a random rank,
+#                       ZRANGEBYSCORE, ZPOPMIN and ZREMRANGEBYRANK (each
+#                       with a ZADD), GEOSEARCH (see measure.sh; SIZES
+#                       limits the sizes)
 #   ONLY=<regex>        measure only the workloads whose label matches
 #   PROFILE=1           keep the hottest functions of each workload in
 #                       target/perf/out-<tag>/profile-*.txt

@@ -196,6 +196,84 @@ if [ "${WORKLOADS:-}" = zrand ]; then
   echo done
   exit 0
 fi
+if [ "${WORKLOADS:-}" = zsets ]; then
+  # One sorted set a size: members membr:<i> with score i, loaded by ZADDs of
+  # 1,000 through `redis-cli --pipe` (SIZES limits the sizes). Pair rows
+  # keep the set's size and count per pair. GEOSEARCH's points are as dense
+  # at every size: the 10 nearest within 5 km of a member. -EQ rows load
+  # every member with score 0, so order falls to the members' bytes.
+  zgen() { # size seed n op -> RESP on stdout
+    awk -v size="$1" -v seed="$2" -v n="$3" -v op="$4" '
+      function m(i) { return sprintf("membr:%08d", i) }
+      function out(k,   i) {
+        printf "*%d\r\n", k
+        for (i = 1; i <= k; i++) printf "$%d\r\n%s\r\n", length(a[i]), a[i]
+      }
+      function c(k, x1, x2, x3, x4) { a[1] = x1; a[2] = x2; a[3] = x3; a[4] = x4; out(k) }
+      BEGIN {
+        srand(seed)
+        side = sqrt(size) / 100
+        if (op == "load" || op == "eqload" || op == "geoload") {
+          for (i = 0; i < size; i += 1000) {
+            hi = (i + 1000 < size) ? i + 1000 : size
+            if (op != "geoload") printf "*%d\r\n$4\r\nZADD\r\n$1\r\nz\r\n", 2 * (hi - i) + 2
+            else printf "*%d\r\n$6\r\nGEOADD\r\n$1\r\ng\r\n", 3 * (hi - i) + 2
+            for (j = i; j < hi; j++) {
+              v = m(j)
+              if (op != "geoload") { s = (op == "eqload") ? "0" : sprintf("%d", j); printf "$%d\r\n%s\r\n", length(s), s }
+              else {
+                x = sprintf("%.6f", side * rand()); y = sprintf("%.6f", side * rand())
+                printf "$%d\r\n%s\r\n$%d\r\n%s\r\n", length(x), x, length(y), y
+              }
+              printf "$%d\r\n%s\r\n", length(v), v
+            }
+          }
+          exit
+        }
+        # Members added past the highest score, other ones each seed.
+        top = size + seed * 10000000
+        for (q = 0; q < n; q++) {
+          r = int(rand() * size)
+          if (op == "ZADD-EXISTING") c(4, "ZADD", "z", sprintf("%d", int(rand() * size)), m(r))
+          else if (op == "ZREM-ZADD") { c(3, "ZREM", "z", m(r)); c(4, "ZADD", "z", sprintf("%d", r), m(r)) }
+          else if (op == "ZINCRBY") c(4, "ZINCRBY", "z", "1", m(r))
+          else if (op == "ZSCORE") c(3, "ZSCORE", "z", m(r))
+          else if (op == "ZRANK") c(3, "ZRANK", "z", m(r))
+          else if (op == "ZRANGE-0-9") c(4, "ZRANGE", "z", "0", "9")
+          else if (op == "ZRANGE-DEEP") c(4, "ZRANGE", "z", sprintf("%d", r), sprintf("%d", r + 9))
+          else if (op == "ZRANGEBYSCORE") c(4, "ZRANGEBYSCORE", "z", sprintf("%d", r), sprintf("%d", r + 9))
+          else if (op == "ZPOPMIN-ZADD") { c(2, "ZPOPMIN", "z"); c(4, "ZADD", "z", sprintf("%d", top), m(top)); top++ }
+          else if (op == "ZADD-ZREMRANGEBYRANK") { c(4, "ZADD", "z", sprintf("%d", top), m(top)); c(4, "ZREMRANGEBYRANK", "z", "0", "0"); top++ }
+          else if (op == "GEOSEARCH") {
+            a[1] = "GEOSEARCH"; a[2] = "g"; a[3] = "FROMMEMBER"; a[4] = m(r); a[5] = "BYRADIUS"
+            a[6] = "5"; a[7] = "km"; a[8] = "ASC"; a[9] = "COUNT"; a[10] = "10"; out(10)
+          }
+          else if (op == "ZADD-EXISTING-EQ") { c(4, "ZADD", "z", "1", m(r)); c(4, "ZADD", "z", "0", m(r)) }
+          else if (op == "ZREM-ZADD-EQ") { c(3, "ZREM", "z", m(r)); c(4, "ZADD", "z", "0", m(r)) }
+          else if (op == "ZRANK-EQ") c(3, "ZRANK", "z", m(r))
+          else if (op == "ZRANGEBYSCORE-EQ") {
+            a[1] = "ZRANGEBYSCORE"; a[2] = "z"; a[3] = "0"; a[4] = "0"; a[5] = "LIMIT"; a[6] = "0"; a[7] = "10"; out(7)
+          }
+          else if (op == "ZPOPMIN-ZADD-EQ") { c(2, "ZPOPMIN", "z"); c(4, "ZADD", "z", "0", m(top)); top++ }
+        }
+      }'
+  }
+  for tag in "$@"; do
+    for size in ${SIZES:-128 1000 100000 1000000}; do
+      for op in ZADD-EXISTING ZREM-ZADD ZINCRBY ZSCORE ZRANK ZRANGE-0-9 ZRANGE-DEEP ZRANGEBYSCORE \
+        ZPOPMIN-ZADD ZADD-ZREMRANGEBYRANK GEOSEARCH ZADD-EXISTING-EQ ZREM-ZADD-EQ ZRANK-EQ \
+        ZRANGEBYSCORE-EQ ZPOPMIN-ZADD-EQ; do
+        load=load; [ "$op" = GEOSEARCH ] && load=geoload
+        case $op in *-EQ) load=eqload ;; esac
+        { zgen "$size" 1 0 "$load"; zgen "$size" 2 2000 "$op"; } > /tmp/z-warm
+        zgen "$size" 3 "$N" "$op" > /tmp/z
+        PIPEFILE=/tmp/z DSIZE=100 one "$tag" "$op-Z$size"
+      done
+    done
+  done | tee /out/raw.txt
+  echo done
+  exit 0
+fi
 if [ "${WORKLOADS:-}" = access ]; then
   for tag in "$@"; do
     for mode in no yes; do

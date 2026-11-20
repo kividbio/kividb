@@ -1,5 +1,6 @@
 use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{expire_on_read, is_expired, lazy_expire_on_read, parse_utf8};
+use crate::commands::zset::TOO_MANY_MEMBERS;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
@@ -362,6 +363,10 @@ fn cmd_geoadd(ctx: &mut Ctx) -> Vec<u8> {
     // As Redis runs it, a `ZADD` of the command's pairs: a block they cannot
     // fit becomes the large form first.
     let given = (cmd.len() - i) / 3;
+    // Checked first, so a refused batch writes nothing.
+    if !flag_xx && !inner.has_room_for(cmd[i..].chunks(3).map(|triple| triple[2])) {
+        return resp_error(TOO_MANY_MEMBERS);
+    }
     inner.expect(given);
 
     while i + 2 < cmd.len() {
@@ -374,7 +379,7 @@ fn cmd_geoadd(ctx: &mut Ctx) -> Vec<u8> {
 
         let score = encode_geohash(lon, lat);
         // One lookup a member.
-        inner.upsert(member, |existing| match existing {
+        let stored = inner.upsert(member, |existing| match existing {
             None if flag_xx => (None, ()), // XX: only update existing
             None => {
                 added += 1;
@@ -391,6 +396,9 @@ fn cmd_geoadd(ctx: &mut Ctx) -> Vec<u8> {
                 }
             }
         });
+        if stored.is_err() {
+            return resp_error(TOO_MANY_MEMBERS);
+        }
     }
     // As `ZADD`: a table reserved for members given twice is made as small
     // as what came.
@@ -1064,6 +1072,9 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
                 },
             )
         }));
+        let Ok(stored) = stored else {
+            return resp_error(TOO_MANY_MEMBERS);
+        };
         // The destination is a new key: whatever was there, and its time
         // to live, are gone.
         crate::commands::helpers::delete_key(ctx.store, db, &dest);

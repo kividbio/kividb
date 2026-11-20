@@ -26,6 +26,7 @@ pub mod command_gate;
 pub mod commands;
 pub mod compaction;
 pub mod config;
+mod counted_tree;
 pub mod cpus;
 pub mod element;
 pub mod eviction;
@@ -42,6 +43,7 @@ pub mod listen;
 #[cfg(feature = "lua")]
 mod lua_vm_blocking;
 pub mod member_set;
+mod member_slab;
 pub mod memory_use;
 pub mod monitor;
 pub mod node_tls;
