@@ -8087,9 +8087,10 @@ fn owner_in_view_of(node: &Node, slot: u16) -> Option<String> {
 /// it would take over, the moved ones among them, at its master's old epoch,
 /// and every master knows a newer owner of those. It used to be elected,
 /// and claimed them at the election's epoch, newer than the destination's:
-/// the destination's acknowledged writes to them were lost. Once it hears
-/// the destination's claim, it is elected, to the slots its master still
-/// had.
+/// the destination's acknowledged writes to them were lost. The masters
+/// that refuse it name the new owner (`UPDATE`, #742), and it is elected to
+/// the slots its master still had, before it hears the destination's own
+/// claim or after.
 #[test]
 fn a_replica_that_has_not_heard_its_master_gave_slots_away_is_refused_votes() {
     let (mut nodes, ranges) = form_cluster(5);
@@ -8144,23 +8145,26 @@ fn a_replica_that_has_not_heard_its_master_gave_slots_away_is_refused_votes() {
     nodes[0].kill();
     let refused = format!("Not voting for {replica_id} to take over from {src_id}: it claims slot");
     wait_until(
-        "the masters to refuse the replica their votes, or to elect it",
+        "the masters to refuse the replica their votes",
         Duration::from_secs(60),
         || {
-            replica.is_master()
-                || nodes[1..]
-                    .iter()
-                    .filter(|n| n.log().contains(&refused))
-                    .count()
-                    >= 3
+            nodes[1..]
+                .iter()
+                .filter(|n| n.log().contains(&refused))
+                .count()
+                >= 3
         },
     );
-    assert!(
-        !replica.is_master(),
-        "elected with a claim of the moved slots; slot 50 is now {:?}'s in its view\n{}",
-        owner_in_view_of(&replica, 50),
-        all(&nodes).join("\n")
-    );
+    // Refused, it is told the new owner (`UPDATE`, #742) and may be elected
+    // at once, to the slots its master still had: never to the moved ones.
+    if replica.is_master() {
+        assert_eq!(
+            owner_in_view_of(&replica, 50).as_deref(),
+            Some(dst_id.as_str()),
+            "elected with a claim of the moved slots\n{}",
+            all(&nodes).join("\n")
+        );
+    }
     assert!(
         nodes[1..]
             .iter()
