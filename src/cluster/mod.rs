@@ -232,6 +232,64 @@ pub enum MigrationState {
     Importing { src_id: NodeId },
 }
 
+/// [`ClusterState::migrations`]: the state of each slot being migrated or
+/// imported, behind a lock, and how many there are, kept beside it in an
+/// atomic for [`ClusterState::slots_open`]. Every change is made through
+/// [`Self::write`], whose guard stores the count as it lets go of the
+/// lock: no writer can leave it out of date.
+#[derive(Default)]
+pub struct Migrations {
+    map: RwLock<AHashMap<u16, MigrationState>>,
+    open: std::sync::atomic::AtomicUsize,
+}
+
+impl Migrations {
+    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, AHashMap<u16, MigrationState>> {
+        self.map.read()
+    }
+
+    pub fn write(&self) -> MigrationsWrite<'_> {
+        MigrationsWrite {
+            map: self.map.write(),
+            open: &self.open,
+        }
+    }
+
+    /// Whether any slot is being migrated or imported here. One relaxed
+    /// load: a slot opened by a `SETSLOT` this thread has not synchronised
+    /// with is not seen at once, as if the command asking ran just before.
+    #[inline]
+    pub fn any_open(&self) -> bool {
+        self.open.load(Ordering::Relaxed) != 0
+    }
+}
+
+/// [`Migrations::write`]'s guard.
+pub struct MigrationsWrite<'a> {
+    map: parking_lot::RwLockWriteGuard<'a, AHashMap<u16, MigrationState>>,
+    open: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl std::ops::Deref for MigrationsWrite<'_> {
+    type Target = AHashMap<u16, MigrationState>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for MigrationsWrite<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
+
+impl Drop for MigrationsWrite<'_> {
+    fn drop(&mut self) {
+        // Before the lock is let go of (the fields are dropped after this).
+        self.open.store(self.map.len(), Ordering::Release);
+    }
+}
+
 /// A master that came back without its dataset, still owning its slots.
 ///
 /// With no AOF, a master killed outright (no final snapshot) restarts with
@@ -360,7 +418,7 @@ pub struct ClusterState {
     first_sync: FirstSync,
     /// Per-slot migration state. Empty entries mean "not migrating".
     /// Mutating via CLUSTER SETSLOT MIGRATING/IMPORTING/STABLE/NODE.
-    pub migrations: RwLock<AHashMap<u16, MigrationState>>,
+    pub migrations: Migrations,
     /// Atomic slot migrations (`CLUSTER MIGRATION`), running and recent.
     pub slot_migrations: migration::Registry,
     /// The deletions of the keys of slots that left this node, and the
@@ -548,7 +606,7 @@ impl ClusterState {
                 open: AtomicBool::new(!starts_as_replica),
                 heard: parking_lot::Mutex::new(ahash::AHashSet::new()),
             },
-            migrations: RwLock::new(AHashMap::new()),
+            migrations: Migrations::default(),
             slot_migrations: migration::Registry::default(),
             slot_deletions: Default::default(),
             orphans: Default::default(),
@@ -3799,6 +3857,13 @@ impl ClusterState {
         self.migrations.read().get(&slot).copied()
     }
 
+    /// Whether any slot is being migrated away from this node or imported
+    /// into it (`SETSLOT MIGRATING` / `IMPORTING`): one relaxed load.
+    #[inline]
+    pub fn slots_open(&self) -> bool {
+        self.migrations.any_open()
+    }
+
     /// `CLUSTER SETSLOT <slot> ...`: `f`, the change it makes, unless an
     /// atomic slot migration of `slot` to or from this node is under way
     /// (`migration::Registry::setslot_refusal`, #755). Done with the
@@ -4906,6 +4971,29 @@ mod tests {
         ));
         cs.claim_slot_range(6, 7).unwrap();
         assert!(cs.migrations.read().is_empty());
+    }
+
+    /// `slots_open` follows every change of the migration states, whoever
+    /// makes it.
+    #[test]
+    fn slots_open_says_whether_any_slot_is_migrating_or_importing() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        assert!(!cs.slots_open());
+        let other = add_master(&cs, 100..=100);
+        cs.set_importing(5, other).unwrap();
+        assert!(cs.slots_open());
+        cs.claim_slots(&[1]).unwrap();
+        cs.set_migrating(1, other).unwrap();
+        cs.clear_migration(5);
+        assert!(cs.slots_open());
+        cs.finalize_slot(1, other).unwrap();
+        assert!(!cs.slots_open());
+        cs.set_importing(7, other).unwrap();
+        cs.migrations.write().retain(|_, _| false);
+        assert!(!cs.slots_open());
+        cs.set_importing(7, other).unwrap();
+        cs.soft_reset();
+        assert!(!cs.slots_open());
     }
 
     /// SET-CONFIG-EPOCH only on a node that knows no other one (#563).

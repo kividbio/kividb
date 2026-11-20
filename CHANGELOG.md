@@ -518,6 +518,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A script's command on a key it did not declare is routed while its
+  slot is being moved (#340).** With the script's slot `MIGRATING` or
+  `IMPORTING` on the node, such a command is routed as a client's would
+  be, and one a client would be sent elsewhere for (`-ASK`, `-MOVED`) or
+  asked to retry (`-TRYAGAIN`) fails in the script with `ERR Script
+  attempted to access a non local key in a cluster node`, as in Redis. A
+  write to an undeclared key that a `MIGRATE` is moving at that moment
+  fails with `TRYAGAIN`. The keys a script declares in `KEYS` are not
+  routed again, and a script may delete and make them again while their
+  slot moves. A script that fails part way keeps the writes of the
+  commands it ran before, as in Redis. `MIGRATE`'s `TRYAGAIN` reply names
+  a key deleted at the source while it was being moved apart from one
+  written there. A slot that is not being moved costs scripts nothing
+  more. See [docs/SCRIPTS.md](docs/SCRIPTS.md).
 - **Cluster votes tell a refused replica the newer owner, and check manual
   failovers too (#742).** A master that refuses a replica its vote because
   it knows a newer owner of slots the replica claims answers with that

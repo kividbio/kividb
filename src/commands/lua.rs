@@ -916,6 +916,44 @@ struct ScriptEval {
     /// In a cluster, the slot the script works in: its first key's, from
     /// `KEYS`, or else the first key a `redis.call` used.
     slot: Option<u16>,
+    /// The script's `KEYS`, routed with the command that runs it.
+    declared: DeclaredKeys,
+}
+
+/// Where a running script's `KEYS` are: the arguments of the command that
+/// runs it, which outlive its [`ScriptEval`] (cleared by
+/// [`ClearScriptEval`] before they go). Kept as a pointer and a length, as
+/// `ScriptEval::ctx_addr` is, so that a script pays nothing to keep them;
+/// read only by [`script_declares`].
+#[derive(Clone, Copy)]
+enum DeclaredKeys {
+    /// `EVAL`'s and `EVALSHA`'s.
+    Borrowed(*const &'static [u8], usize),
+    /// `FCALL`'s.
+    Owned(*const Vec<u8>, usize),
+}
+
+impl DeclaredKeys {
+    fn of_eval(keys: &[&[u8]]) -> Self {
+        Self::Borrowed(keys.as_ptr().cast(), keys.len())
+    }
+
+    fn of_function(keys: &[Vec<u8>]) -> Self {
+        Self::Owned(keys.as_ptr(), keys.len())
+    }
+
+    fn contains(self, key: &[u8]) -> bool {
+        // SAFETY: the keys are alive while the `ScriptEval` that holds this
+        // is (see the type).
+        match self {
+            Self::Borrowed(ptr, len) => {
+                unsafe { std::slice::from_raw_parts::<&[u8]>(ptr.cast(), len) }.contains(&key)
+            }
+            Self::Owned(ptr, len) => unsafe { std::slice::from_raw_parts(ptr, len) }
+                .iter()
+                .any(|declared| declared.as_slice() == key),
+        }
+    }
 }
 
 thread_local! {
@@ -974,6 +1012,16 @@ pub(crate) fn script_allow_oom() -> bool {
 /// (see [`ScriptEval::slot`]); `None` outside a script.
 pub(crate) fn script_slot() -> Option<(Option<u16>, bool)> {
     SCRIPT_EVAL.with(|c| c.borrow().as_ref().map(|s| (s.slot, s.allow_cross_slot)))
+}
+
+/// Whether `key` is one of the running script's `KEYS`; `false` outside a
+/// script.
+pub(crate) fn script_declares(key: &[u8]) -> bool {
+    SCRIPT_EVAL.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|s| s.declared.contains(key))
+    })
 }
 
 /// Make `slot` the running script's slot, if it has none yet.
@@ -4858,6 +4906,7 @@ fn eval_script(
             no_writes_flag: sb.no_writes,
             allow_cross_slot: sb.allow_cross_slot,
             slot,
+            declared: DeclaredKeys::of_eval(keys),
         });
     });
 
@@ -4980,6 +5029,7 @@ fn eval_function_call(
             no_writes_flag: run.no_writes,
             allow_cross_slot: run.allow_cross_slot,
             slot,
+            declared: DeclaredKeys::of_function(&keys),
         });
     });
 

@@ -2404,16 +2404,14 @@ fn migrate(ctx: &mut Ctx) -> Vec<u8> {
     let take_back = !not_deleted.kept.is_empty() && only_here(ctx, &not_deleted.kept);
     let taken_back = take_back && take_back_copies(&mut conn.reader, &not_deleted.kept);
     keep(conn, reusable && (taken_back || !take_back));
-    let written: Vec<&[u8]> = not_deleted
-        .kept
-        .iter()
-        .chain(&not_deleted.gone)
-        .copied()
-        .collect();
+    // The copies of the keys gone from here stay at the destination: a
+    // client is sent there for a key that is not here, and may have
+    // written it there since.
+    let (kept, gone) = (not_deleted.kept.clone(), not_deleted.gone.clone());
     // Their order, held until the copies are gone, is let go of.
     drop(not_deleted);
-    if failure.is_none() && !written.is_empty() {
-        failure = Some(written_while_moving(&written, &addr, taken_back));
+    if failure.is_none() && !(kept.is_empty() && gone.is_empty()) {
+        failure = Some(written_while_moving(&kept, &gone, &addr, taken_back));
     }
     match failure {
         None => resp_simple("OK"),
@@ -2451,9 +2449,11 @@ struct MoveHold {
 /// takes to answer, each step at most `MIGRATE`'s timeout. A real handoff
 /// under way is waited out first, as a write waits it out.
 ///
-/// What a script writes to a key it did not declare is not held back: the
-/// keys are deleted only if they still hold what was sent, and kept with
-/// `TRYAGAIN` otherwise, as before. Nothing is held, and `None` returned,
+/// A script, in the write gate already, does not wait on the mark: its
+/// write to a marked key it did not declare is refused with `TRYAGAIN`
+/// (`handler::script_key_refusal`), and its declared keys were waited for
+/// before it ran. The keys are deleted only if they still hold what was
+/// sent, and kept with `TRYAGAIN` otherwise. Nothing is held, and `None` returned,
 /// from inside a transaction or a script that runs alone (nothing runs
 /// beside them), or when this thread is in the write gate already (the
 /// lock of a key's hash tag, with `lua-parallel-scripts`). A script that
@@ -2524,8 +2524,9 @@ fn same_hash_but_for_expired_fields(value: &crate::types::KiviDBValue, payload: 
 /// holds what was sent: the same value, and the same time to live (#274).
 ///
 /// [`hold_while_moving`] keeps the writes of clients off the keys while
-/// they travel (`held`). Where it holds nothing (see there), or a script
-/// writes a key it did not declare, a key can be written in the meantime: the write is acknowledged here, and
+/// they travel (`held`), and a script's commands are refused a key it
+/// did not declare that is marked (`handler::script_key_refusal`). Where it
+/// holds nothing (see there), a key can be written in the meantime: the write is acknowledged here, and
 /// the destination has the value from before it, so deleting the key would
 /// lose an acknowledged write. Such a key is kept, and returned, for
 /// `MIGRATE` to fail with: the slot then still holds it here, its newest
@@ -2677,38 +2678,64 @@ fn take_back_copies(
 }
 
 /// The error `MIGRATE` answers with when keys it moved were written while
-/// they travelled, and were kept here (see [`delete_moved`]).
+/// they travelled (see [`delete_moved`]): `kept` here, with their newest
+/// value, or `gone` from here, deleted by something other than their time
+/// running out, while their copies stay at the destination.
 ///
-/// `TRYAGAIN`: the move did not happen for those keys, and can be made
+/// `TRYAGAIN`: the move did not happen for the kept keys, and can be made
 /// again. A tool resharding a cluster (`redis-cli --cluster reshard`,
 /// `rebalance`) stops on it and says so, rather than moving on to the next
 /// keys as though the slot were empty here; run again (with `REPLACE`, or
 /// `--cluster-replace`, as the destination holds a copy) it takes the keys
 /// along with their writes.
-fn written_while_moving(keys: &[&[u8]], addr: &str, taken_back: bool) -> String {
+fn written_while_moving(kept: &[&[u8]], gone: &[&[u8]], addr: &str, taken_back: bool) -> String {
     const SHOWN: usize = 5;
-    let mut names = keys
-        .iter()
-        .take(SHOWN)
-        .map(|k| format!("'{}'", String::from_utf8_lossy(k)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if keys.len() > SHOWN {
-        names.push_str(&format!(" and {} more", keys.len() - SHOWN));
-    }
-    let copies = if taken_back {
-        format!("The copies sent to {addr} were deleted there; MIGRATE them again")
-    } else {
-        format!("The copy sent to {addr} may be older; MIGRATE them again with REPLACE")
+    let names = |keys: &[&[u8]]| {
+        let mut names = keys
+            .iter()
+            .take(SHOWN)
+            .map(|k| format!("'{}'", String::from_utf8_lossy(k)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if keys.len() > SHOWN {
+            names.push_str(&format!(" and {} more", keys.len() - SHOWN));
+        }
+        names
     };
-    format!(
-        "TRYAGAIN {} written while being migrated, and kept here: {names}. {copies}",
+    let a_key_was = |keys: &[&[u8]]| {
         if keys.len() == 1 {
             "a key was"
         } else {
             "keys were"
         }
-    )
+    };
+    let mut parts = Vec::new();
+    if !kept.is_empty() {
+        let copies = if taken_back {
+            format!("The copies sent to {addr} were deleted there; MIGRATE them again")
+        } else {
+            format!("The copy sent to {addr} may be older; MIGRATE them again with REPLACE")
+        };
+        parts.push(format!(
+            "{} written while being migrated, and kept here: {}. {copies}",
+            a_key_was(kept),
+            names(kept)
+        ));
+    }
+    if !gone.is_empty() {
+        let lead = match (parts.is_empty(), gone.len()) {
+            (true, _) => a_key_was(gone),
+            (false, 1) => "A key was",
+            (false, _) => "Keys were",
+        };
+        parts.push(format!(
+            "{lead} deleted here while being migrated: {}. The {} sent to {addr} {} still there",
+            names(gone),
+            if gone.len() == 1 { "copy" } else { "copies" },
+            if gone.len() == 1 { "is" } else { "are" },
+        ));
+    }
+    format!("TRYAGAIN {}", parts.join(". "))
 }
 
 /// Read one reply that is expected to be a status. `Ok(Ok(()))` for any `+`

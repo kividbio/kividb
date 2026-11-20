@@ -387,8 +387,10 @@ fn busy_reply() -> Vec<u8> {
 /// script has `allow-cross-slot-keys`, in the script's slot.
 ///
 /// The script's own slot, its first key's, was routed with the command that
-/// runs it, ASKING and slots being imported included: a key in it is never
-/// refused here.
+/// runs it, ASKING and slots being imported included: a key in it is not
+/// routed again while the slot stays where it is. While keys move, its
+/// command on a key it did not declare is (see [`script_refusal_while_moving`]);
+/// on its declared keys, never.
 #[cfg(feature = "lua")]
 fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
     let (script_slot, allow_cross_slot) = crate::commands::lua::script_slot()?;
@@ -403,12 +405,21 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
         ));
     }
     if script_slot == Some(first) {
+        // Two relaxed loads while no key or slot moves.
+        if crate::pause::keys_moving() || ctx.cluster.slots_open() {
+            return script_refusal_while_moving(ctx, name, first);
+        }
         return None;
     }
     if script_slot.is_some() && !allow_cross_slot {
         return Some(resp_error(
             "ERR Script attempted to access keys that do not hash to the same slot",
         ));
+    }
+    if crate::pause::keys_moving()
+        && let Some(refusal) = script_write_to_a_moving_key(ctx, name)
+    {
+        return Some(refusal);
     }
     let store = ctx.store;
     let db = *ctx.selected_db;
@@ -432,6 +443,100 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
         }
         crate::cluster::routing::RouteDecision::TryAgain => decision.refusal(false),
         crate::cluster::routing::RouteDecision::Passthrough => None,
+        _ => Some(resp_error(
+            "ERR Script attempted to access a non local key in a cluster node",
+        )),
+    }
+}
+
+/// The keys `ctx.cmd` (a script's command) names that are not among the
+/// script's `KEYS`.
+#[cfg(feature = "lua")]
+fn undeclared_keys<'a>(ctx: &Ctx<'a>, name: &str) -> Vec<&'a [u8]> {
+    crate::keyspec::key_positions(name, &ctx.cmd)
+        .iter()
+        .map(|pos| ctx.cmd[pos])
+        .filter(|key| !crate::commands::lua::script_declares(key))
+        .collect()
+}
+
+/// A script's write to a key it did not declare that a `MIGRATE` is moving
+/// (`key_moves`): refused with `TRYAGAIN`. A client's write to it waits in
+/// the write gate until the key has moved (`checked_in_gate`); a script's,
+/// in the gate already with the whole script, cannot wait there, and runs
+/// beside the `MIGRATE`, which skips the command gate: run, it would change
+/// the key after it was sent. The script's declared keys were waited for
+/// before it ran (a `MIGRATE` that marks one after that waits for the
+/// script in its cut, and has sent nothing), and are not looked at.
+#[cfg(feature = "lua")]
+#[cold]
+#[inline(never)]
+fn script_write_to_a_moving_key(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
+    if !replication::command_mutates_for_replication(name, &ctx.cmd) {
+        return None;
+    }
+    let keys = undeclared_keys(ctx, name);
+    crate::key_moves::one_is_moving(*ctx.selected_db, &keys)
+        .then(|| resp_error("TRYAGAIN a key of the script's command is being migrated"))
+}
+
+/// [`script_key_refusal`] for a command in the script's own slot, `slot`,
+/// while keys or slots move here: its keys that the script did not declare
+/// are looked at as a client's command's would be.
+/// - A write to one that a `MIGRATE` is moving: `TRYAGAIN`
+///   ([`script_write_to_a_moving_key`]).
+/// - With the slot being migrated away or imported here, the command is
+///   routed, as Redis routes every command of a script
+///   (`scriptVerifyClusterState`), and refused with Redis's error if it
+///   would be sent elsewhere (`-ASK`, `-MOVED`) or asked to try again: on
+///   a node migrating the slot, a key that has left already, or one never
+///   made, is the destination's; on the node importing it, a command over
+///   several keys some of which have not arrived yet is not run. Its
+///   declared keys count as here: they were routed with the script, which
+///   may delete one and make it again.
+///
+/// The script was routed with `ASKING` if, and only if, its slot is being
+/// imported here: without it, the script was sent to the slot's owner (and
+/// a slot this node owns is not imported). So `ASKING` is as it was then.
+/// A script refused part way through has run the commands before: as in
+/// Redis, they stay.
+#[cfg(feature = "lua")]
+#[cold]
+#[inline(never)]
+fn script_refusal_while_moving(ctx: &Ctx, name: &str, slot: u16) -> Option<Vec<u8>> {
+    use crate::cluster::MigrationState;
+    use crate::cluster::routing::RouteDecision;
+    if crate::pause::keys_moving()
+        && let Some(refusal) = script_write_to_a_moving_key(ctx, name)
+    {
+        return Some(refusal);
+    }
+    let asking = match ctx.cluster.migration_state(slot)? {
+        MigrationState::Importing { .. } => true,
+        MigrationState::Migrating { .. } => false,
+    };
+    if undeclared_keys(ctx, name).is_empty() {
+        return None;
+    }
+    let store = ctx.store;
+    let db = *ctx.selected_db;
+    let registry = ctx.client_registry;
+    let client_id = ctx.client_id;
+    let decision = crate::cluster::routing::route_named(
+        name,
+        ctx.cmd.as_slice(),
+        ctx.cluster,
+        asking,
+        || registry.get_readonly(client_id),
+        |key| {
+            crate::commands::lua::script_declares(key) || {
+                let shard = crate::store::get_shard(&store[db], key);
+                crate::read_lock!(shard).contains_key(key)
+            }
+        },
+    );
+    match decision {
+        RouteDecision::OwnedSlot(_) | RouteDecision::Passthrough => None,
         _ => Some(resp_error(
             "ERR Script attempted to access a non local key in a cluster node",
         )),
