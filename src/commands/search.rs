@@ -704,14 +704,6 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
             "hnsw_backlog_bytes",
             resp_bulk_str(&first.backlog.bytes().to_string()),
         );
-        // The helper threads that link them (server-wide), and how many of
-        // them take jobs now: `search-index-threads auto` changes that.
-        let (threads, active) = crate::vector::backlog::threads();
-        put("hnsw_index_threads", resp_bulk_str(&threads.to_string()));
-        put(
-            "hnsw_index_threads_active",
-            resp_bulk_str(&active.to_string()),
-        );
         put(
             "hnsw_indexes",
             resp_array(
@@ -739,6 +731,15 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     })
                     .collect(),
             ),
+        );
+        // The helper threads that link them (server-wide), and how many of
+        // them take jobs now: `search-index-threads auto` changes that. After
+        // `hnsw_indexes`, so that the fields before keep their places.
+        let (threads, active) = crate::vector::backlog::threads();
+        put("hnsw_index_threads", resp_bulk_str(&threads.to_string()));
+        put(
+            "hnsw_index_threads_active",
+            resp_bulk_str(&active.to_string()),
         );
     }
 

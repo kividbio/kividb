@@ -679,7 +679,7 @@ fn set_active(n: usize) {
 
 fn helper(n: usize) {
     lower_priority();
-    let mut cpu = thread_cpu_ns();
+    let mut clock = HelperClock::start();
     loop {
         let job = {
             let mut jobs = POOL.jobs.lock();
@@ -698,9 +698,7 @@ fn helper(n: usize) {
             link_job(&index, job);
         } // else the graph is gone
         if ADAPTIVE.load(Relaxed) {
-            let now = thread_cpu_ns();
-            HELPER_CPU_NS.fetch_add(now.saturating_sub(cpu), Relaxed);
-            cpu = now;
+            clock.job_done();
             adapt();
         }
     }
@@ -732,8 +730,10 @@ fn link_job(index: &Arc<HnswIndex>, job: Job) {
 // workers' loop to tell: every `TICK` the helper that has just finished a
 // job reads counters that are kept anyway, and the server counts as serving
 // over that tick if, besides the commands that wrote vectors, it served
-// `SERVING_OPS` commands a second, or if its threads, besides the helpers and
-// the links made in writes, used `SERVING_MILLICPUS` of CPU time.
+// `SERVING_OPS` commands a second, or if its threads, besides the helpers,
+// the links made in writes and the commands that wrote vectors (an estimate
+// of what each costs, times their number), used `SERVING_MILLICPUS` of CPU
+// time.
 
 /// How often the helpers look at what the server is doing.
 const TICK: std::time::Duration = std::time::Duration::from_millis(50);
@@ -747,25 +747,118 @@ const STALE: std::time::Duration = std::time::Duration::from_millis(200);
 /// server counts as serving.
 pub const SERVING_OPS: u64 = 500;
 /// CPU time a second (in thousandths of a CPU) the process uses besides the
-/// helpers and the links made in writes, from which the server counts as
-/// serving: a loading connection's worker reads and stores the documents
-/// in less.
+/// helpers, the links made in writes and the commands that wrote vectors,
+/// from which the server counts as serving.
 pub const SERVING_MILLICPUS: u64 = 1000;
 
-/// CPU time the helpers used, added at the end of each job.
+/// The helpers' CPU clocks (Linux): a look reads each, so a job that runs
+/// across a look is counted up to that look, not all of it at the next.
+#[cfg(target_os = "linux")]
+static HELPER_CLOCKS: parking_lot::Mutex<Vec<libc::clockid_t>> =
+    parking_lot::const_mutex(Vec::new());
+/// Elsewhere, the CPU time the helpers used, added at the end of each job:
+/// a look then misses the part of a job that ran before it (at most one
+/// job's time per helper, about 0.6 ms at 384-d, against a look's 50 ms)
+/// and the next look counts it.
+#[cfg(not(target_os = "linux"))]
 static HELPER_CPU_NS: AtomicU64 = AtomicU64::new(0);
 /// CPU time writes spent linking their own vectors (a full backlog, a small
 /// graph, a walk over the keys).
 static LINK_CPU_NS: AtomicU64 = AtomicU64::new(0);
-/// Vectors written by commands: [`count_write`].
+/// Commands that wrote a vector: [`count_write`].
 static WRITES: AtomicU64 = AtomicU64::new(0);
+/// What a command that writes a vector costs the thread that runs it,
+/// besides linking its own vectors: reading it, storing the document,
+/// indexing it, replying. A running estimate in nanoseconds, from one such
+/// command in [`SAMPLE_EVERY`] on each thread ([`count_write`]).
+static WRITE_CPU_NS: AtomicU64 = AtomicU64::new(0);
+/// One in this many commands that write a vector, on each thread, is timed.
+const SAMPLE_EVERY: u32 = 64;
 
-/// A command wrote a vector to an index: such commands are the load the
-/// extra helpers are for, and are not counted as serving.
+/// A thread's commands that wrote vectors, for [`count_write`].
+#[derive(Clone, Copy)]
+struct Writer {
+    /// The thread's command ([`crate::stats::commands_on_this_thread`])
+    /// counted last.
+    command: u64,
+    /// Commands counted on this thread.
+    counted: u32,
+    /// A command being timed: its number, and the thread's CPU time and
+    /// [`Writer::linked_ns`] when it was counted.
+    timing: Option<(u64, u64, u64)>,
+    /// CPU time this thread spent linking its own vectors ([`Linking`]).
+    linked_ns: u64,
+}
+
+thread_local! {
+    static WRITER: std::cell::Cell<Writer> = const {
+        std::cell::Cell::new(Writer {
+            command: 0,
+            counted: 0,
+            timing: None,
+            linked_ns: 0,
+        })
+    };
+}
+
+/// Commands counted on this thread, for the tests.
+#[cfg(test)]
+pub(crate) fn counted_here() -> u32 {
+    WRITER.with(|w| w.get().counted)
+}
+
+/// The command running on this thread writes a vector to an index: such
+/// commands are the load the extra helpers are for, and are not counted as
+/// serving. Counted once per command, however many indexes and vector
+/// fields it writes: a command's number on its thread
+/// ([`crate::stats::commands_on_this_thread`]) is the same from its start to
+/// its end. Never on a thread that has run no command (number 0), and the
+/// walks over the keys (`FT.CREATE`, loading a snapshot, a replica's full
+/// sync: `backfill_from_db_progress`) do not call it.
+///
+/// One counted command in [`SAMPLE_EVERY`] is timed, on the thread's CPU
+/// clock, from here to the same point of the next command the thread runs,
+/// if that one writes a vector too: one command's whole cost, the parsing
+/// and the reply included, less what the thread spent linking its own
+/// vectors meanwhile. Otherwise the timing is dropped. Two clock reads per
+/// timed command, none for the others.
 pub(crate) fn count_write() {
-    if ADAPTIVE.load(Relaxed) {
-        WRITES.fetch_add(1, Relaxed);
+    if !cfg!(test) && !ADAPTIVE.load(Relaxed) {
+        return;
     }
+    let command = crate::stats::commands_on_this_thread();
+    WRITER.with(|cell| {
+        let mut w = cell.get();
+        if command == 0 || command == w.command {
+            return;
+        }
+        w.command = command;
+        w.counted = w.counted.wrapping_add(1);
+        WRITES.fetch_add(1, Relaxed);
+        if let Some((from, cpu, linked)) = w.timing.take() {
+            if command == from.wrapping_add(1) {
+                let used = thread_cpu_ns()
+                    .saturating_sub(cpu)
+                    .saturating_sub(w.linked_ns.saturating_sub(linked));
+                note_write_cpu(used);
+            }
+        } else if w.counted.is_multiple_of(SAMPLE_EVERY) {
+            w.timing = Some((command, thread_cpu_ns(), w.linked_ns));
+        }
+        cell.set(w);
+    });
+}
+
+/// One timed command's CPU time into [`WRITE_CPU_NS`]: an eighth of the way
+/// from the estimate to it. Samples from two threads at once may lose one.
+fn note_write_cpu(used: u64) {
+    let old = WRITE_CPU_NS.load(Relaxed);
+    let new = if old == 0 {
+        used
+    } else {
+        old - old / 8 + used / 8
+    };
+    WRITE_CPU_NS.store(new, Relaxed);
 }
 
 /// The CPU time a write spends linking a vector, when `auto` adapts.
@@ -778,7 +871,67 @@ impl Linking {
 
     fn end(self) {
         if let Some(from) = self.0 {
-            LINK_CPU_NS.fetch_add(thread_cpu_ns().saturating_sub(from), Relaxed);
+            let used = thread_cpu_ns().saturating_sub(from);
+            LINK_CPU_NS.fetch_add(used, Relaxed);
+            WRITER.with(|cell| {
+                let mut w = cell.get();
+                w.linked_ns = w.linked_ns.wrapping_add(used);
+                cell.set(w);
+            });
+        }
+    }
+}
+
+/// The helpers' CPU time so far.
+fn helpers_cpu_ns() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        HELPER_CLOCKS
+            .lock()
+            .iter()
+            .map(|&clock| cpu_clock_ns(clock))
+            .sum()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        HELPER_CPU_NS.load(Relaxed)
+    }
+}
+
+/// A helper's CPU clock, for [`helpers_cpu_ns`]: on Linux each helper
+/// gives its clock once, as it starts; elsewhere it adds its time at the
+/// end of each job.
+struct HelperClock {
+    #[cfg(not(target_os = "linux"))]
+    cpu: u64,
+}
+
+impl HelperClock {
+    fn start() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let mut clock: libc::clockid_t = 0;
+            // SAFETY: writes `clock` only, for this thread, which never ends.
+            if unsafe { libc::pthread_getcpuclockid(libc::pthread_self(), &mut clock) } == 0 {
+                HELPER_CLOCKS.lock().push(clock);
+            }
+            Self {}
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self {
+                cpu: thread_cpu_ns(),
+            }
+        }
+    }
+
+    /// A job is done.
+    fn job_done(&mut self) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let now = thread_cpu_ns();
+            HELPER_CPU_NS.fetch_add(now.saturating_sub(self.cpu), Relaxed);
+            self.cpu = now;
         }
     }
 }
@@ -813,20 +966,25 @@ pub struct Reading {
     pub commands: u64,
     /// Of them, those that wrote a vector.
     pub writes: u64,
+    /// What one of those costs besides its links ([`WRITE_CPU_NS`]).
+    pub write_cpu_ns: u64,
 }
 
 /// Whether the server served clients between two readings: by
 /// [`SERVING_OPS`] and [`SERVING_MILLICPUS`].
+///
+/// The commands that wrote vectors are left out of both: their count, and
+/// their CPU time as `to` estimates it, so that loading connections (each
+/// with a worker parsing and storing documents) are not taken for clients.
 pub fn serving(from: &Reading, to: &Reading) -> bool {
     let wall = to.wall_ns.saturating_sub(from.wall_ns).max(1);
+    let writes = to.writes.saturating_sub(from.writes);
     let other_cpu = to
         .cpu_ns
         .saturating_sub(from.cpu_ns)
-        .saturating_sub(to.linking_ns.saturating_sub(from.linking_ns));
-    let other_ops = to
-        .commands
-        .saturating_sub(from.commands)
-        .saturating_sub(to.writes.saturating_sub(from.writes));
+        .saturating_sub(to.linking_ns.saturating_sub(from.linking_ns))
+        .saturating_sub(writes.saturating_mul(to.write_cpu_ns));
+    let other_ops = to.commands.saturating_sub(from.commands).saturating_sub(writes);
     let ops_per_s = u128::from(other_ops) * 1_000_000_000 / u128::from(wall);
     let millicpus = u128::from(other_cpu) * 1000 / u128::from(wall);
     ops_per_s >= u128::from(SERVING_OPS) || millicpus >= u128::from(SERVING_MILLICPUS)
@@ -889,9 +1047,10 @@ fn adapt() {
     let now = Reading {
         wall_ns,
         cpu_ns: cpu_clock_ns(libc::CLOCK_PROCESS_CPUTIME_ID),
-        linking_ns: HELPER_CPU_NS.load(Relaxed) + LINK_CPU_NS.load(Relaxed),
+        linking_ns: helpers_cpu_ns() + LINK_CPU_NS.load(Relaxed),
         commands: crate::stats::TOTAL_COMMANDS_PROCESSED.total(),
         writes: WRITES.load(Relaxed),
+        write_cpu_ns: WRITE_CPU_NS.load(Relaxed),
     };
     let Some(all) = gauge.look(now) else {
         return;
@@ -1251,6 +1410,7 @@ mod tests {
             linking_ns,
             commands,
             writes,
+            write_cpu_ns: 0,
         };
         let (busy, linking) = (8 * second, 15 * second / 2);
         // 8 CPUs busy, 7.5 of them linking; 100,000 commands, all writing
@@ -1262,6 +1422,28 @@ mod tests {
         assert!(serving(&from, &to(busy, 7 * second, 100_000, 100_000)));
         // Counters reset (CONFIG RESETSTAT) or behind: nothing, not a wrap.
         assert!(!serving(&from, &to(0, second, 0, 10)));
+        // Four loading connections: their workers parse and store 100,000
+        // documents a second at 20 us each, 2 CPUs, beside 6 CPUs linking.
+        // Without an estimate of what a write costs, that is a CPU's worth
+        // and more besides the links; with it, a load.
+        let loaders = to(busy, 6 * second, 100_000, 100_000);
+        assert!(serving(&from, &loaders));
+        let estimated = |r: Reading| Reading {
+            write_cpu_ns: 20_000,
+            ..r
+        };
+        assert!(!serving(&from, &estimated(loaders)));
+        // The same with 500 other commands, or another CPU busy: clients.
+        let loaders_and_clients = to(busy, 6 * second, 100_500, 100_000);
+        assert!(serving(&from, &estimated(loaders_and_clients)));
+        let loaders_and_a_cpu = to(9 * second, 6 * second, 100_000, 100_000);
+        assert!(serving(&from, &estimated(loaders_and_a_cpu)));
+        // An estimate too high leaves nothing, not a wrap.
+        let r = Reading {
+            write_cpu_ns: u64::MAX,
+            ..loaders
+        };
+        assert!(!serving(&from, &r));
     }
 
     /// A graph past [`HERE_BELOW`], so that writes go through the backlog.
@@ -1461,6 +1643,55 @@ mod tests {
         );
         assert!(!g.backlog.holds("k9"));
         g.backlog.hold(false);
+    }
+
+    /// Helpers started by a write, in a process where nothing else has set
+    /// how many take jobs: they take them, and the backlog empties. Helpers
+    /// that started parked and were never woken left a build's last
+    /// vectors waiting for good, and tests in the same process hid that:
+    /// [`pin_active`] wakes every helper. So this runs in a process of its
+    /// own, the test binary again with this test alone, no pin and no
+    /// `KIVIDB_TEST_INDEX_HELPERS`.
+    #[test]
+    fn helpers_started_by_a_write_take_jobs_with_nothing_pinned() {
+        const ALONE: &str = "KIVIDB_TEST_HELPERS_ALONE";
+        if std::env::var_os(ALONE).is_none() {
+            let path = module_path!();
+            let name = format!(
+                "{}::helpers_started_by_a_write_take_jobs_with_nothing_pinned",
+                path.split_once("::").map_or(path, |(_, rest)| rest)
+            );
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+                .env(ALONE, "1")
+                .env_remove("KIVIDB_TEST_INDEX_HELPERS")
+                .output()
+                .unwrap();
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "{said}");
+            assert!(said.contains("1 passed"), "the test did not run alone: {said}");
+            return;
+        }
+        assert_eq!(HELPERS.load(Acquire), 0, "helpers started before the first write");
+        assert_eq!(PINNED.load(Relaxed), usize::MAX);
+        let g = big_graph(8);
+        let metric = DistanceMetric::L2;
+        let n = 3000;
+        for i in 0..n {
+            write(&g, &format!("u{i}"), vector(8, 90_000 + i), &metric, 0);
+        }
+        assert!(helpers() >= 3);
+        assert!(threads().1 >= 1, "no helper takes jobs");
+        assert!(
+            settle(&g, std::time::Duration::from_secs(30)),
+            "{} vectors still wait after 30 s",
+            g.backlog.len()
+        );
+        assert_eq!(g.live_count.load(Relaxed), HERE_BELOW + 200 + n as usize);
     }
 }
 
@@ -1984,6 +2215,25 @@ mod concurrency {
         pin_active(None);
         assert!(flips > 20, "{flips} changes of the count");
         assert_eq!(helpers(), most);
+        // Let go, the count is `auto`'s again, and the helpers it leaves
+        // taking jobs empty a backlog with nothing waking them. (Whether
+        // helpers that start parked are woken is
+        // `helpers_started_by_a_write_take_jobs_with_nothing_pinned`, in a
+        // process of its own: here every pin woke them.)
+        let (store, indexes) = setup("unpinned", &metric);
+        let mut rng = Rng(4242);
+        for i in 0..3000 {
+            let key = format!("unpinned:{i}");
+            let _order = crate::write_order::lock_keys(0, std::iter::once(key.as_bytes()));
+            write(&store, &indexes, &key, Some(&rng.vector()));
+        }
+        let g = graph(&indexes, "unpinned");
+        assert!(
+            settle(&g, std::time::Duration::from_secs(60)),
+            "{} vectors still wait, {} helpers taking jobs",
+            g.backlog.len(),
+            threads().1
+        );
     }
 
     /// An index dropped while vectors wait and helpers link them: the
@@ -2113,5 +2363,97 @@ mod concurrency {
             assert!(std::time::Instant::now() < until, "the old graph was kept");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    /// An index of `prefix` with two HNSW fields, `v` and `w`.
+    fn two_vectors(name: &str, prefix: &str) -> crate::vector::IndexDef {
+        let hnsw = |field: &str| SchemaField {
+            name: field.into(),
+            field_type: FieldType::Vector {
+                algo: VectorAlgo::Hnsw {
+                    m: 16,
+                    ef_construction: 32,
+                    ef_runtime: 10,
+                },
+                dim: DIM,
+                metric: DistanceMetric::L2,
+                data_type: VectorType::Float32,
+            },
+            options: FieldOptions::default(),
+        };
+        IndexSchema {
+            name: name.into(),
+            db_index: 0,
+            on: IndexOn::Hash,
+            prefixes: vec![prefix.into()],
+            fields: vec![hnsw("v"), hnsw("w")],
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
+            nofreqs: false,
+        }
+        .into_def()
+    }
+
+    /// `auto` leaves the commands that wrote vectors out of what counts as
+    /// serving: each such command counts once, however many indexes and
+    /// vector fields it writes, and the walks over the keys already there
+    /// (`FT.CREATE`, a load, a full sync), or a thread that runs no command,
+    /// count nothing. A loader writing into two indexes used to hide one
+    /// client command per write.
+    #[test]
+    fn a_command_writing_vectors_counts_once_and_a_backfill_not_at_all() {
+        let store = crate::store::new_store(1);
+        let indexes = crate::vector::new_index_store();
+        for name in ["cw1", "cw2"] {
+            indexes.write().insert(name.into(), two_vectors(name, "cw:"));
+        }
+        std::thread::spawn(move || {
+            let mut rng = Rng(5);
+            let mut doc = |key: &str| -> Vec<(String, Arc<[u8]>)> {
+                let pairs: Vec<(String, Arc<[u8]>)> = ["v", "w"]
+                    .iter()
+                    .map(|f| {
+                        let blob: Vec<u8> =
+                            rng.vector().iter().flat_map(|x| x.to_le_bytes()).collect();
+                        (f.to_string(), Arc::from(blob))
+                    })
+                    .collect();
+                let hash: crate::types::HashFields = pairs.iter().cloned().collect();
+                crate::store::get_shard(&store[0], key).write().insert(
+                    key,
+                    KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(hash))),
+                );
+                pairs
+            };
+            let whole = crate::vector::Write::Whole;
+            // No command has run on this thread (a load, a field expiring on
+            // a thread of its own): nothing is counted.
+            maybe_index(&indexes, 0, "cw:0", &doc("cw:0"), whole);
+            assert_eq!(counted_here(), 0);
+            // One command: two indexes, two vector fields each, and a second
+            // key (as `JSON.MSET` writes several): once.
+            crate::stats::record_command_processed();
+            maybe_index(&indexes, 0, "cw:1", &doc("cw:1"), whole);
+            maybe_index(&indexes, 0, "cw:2", &doc("cw:2"), whole);
+            assert_eq!(counted_here(), 1);
+            // The next command: once more.
+            crate::stats::record_command_processed();
+            maybe_index(&indexes, 0, "cw:3", &doc("cw:3"), whole);
+            assert_eq!(counted_here(), 2);
+            // `FT.CREATE` over those keys, in a command of its own: its walk
+            // indexes them and counts nothing.
+            indexes.write().insert("cw3".into(), two_vectors("cw3", "cw:"));
+            crate::stats::record_command_processed();
+            crate::vector::backfill_from_db(&store[0], indexes.read().get("cw3").unwrap());
+            assert_eq!(counted_here(), 2);
+            let g = graph(&indexes, "cw3");
+            assert_eq!(g.live_count.load(Relaxed) + g.backlog.len(), 4);
+        })
+        .join()
+        .unwrap();
     }
 }
