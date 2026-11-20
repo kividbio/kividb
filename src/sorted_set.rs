@@ -8,7 +8,12 @@
 //!   empty block, which allocates nothing.
 //! - **Large.** Past either limit, a hash table of members and an ordered
 //!   tree of `(score, member)`, each holding the member's one `Arc`: rank,
-//!   ranges and lookups by name for sets of any size.
+//!   ranges and lookups by name for sets of any size. The table is held
+//!   directly, so that a bucket can be asked for by its number: a random
+//!   member is a random bucket, tried again while it is empty, as Redis
+//!   picks one (`ZRANDMEMBER`). A table is never less than an eighth full
+//!   for long (it is shrunk below that: see `Large::shrink_if_sparse`), so
+//!   that is a handful of tries.
 //!
 //! A set moves from the block to the table and the tree, its entries in
 //! order in one pass, when a write would take it past a limit, and never
@@ -24,7 +29,8 @@
 
 use crate::member_set::Member;
 use crate::packed_zset::{self, PackedZset, Score};
-use ahash::AHashMap;
+use hashbrown::HashTable;
+use hashbrown::hash_table::Entry;
 use ordered_float::OrderedFloat;
 use std::collections::BTreeMap;
 use std::collections::btree_map;
@@ -33,7 +39,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A member name stored as a cheaply-cloneable Arc'd byte slice.
-/// Using Arc<[u8]> means cloning the key between the BTreeMap and AHashMap
+/// Using Arc<[u8]> means cloning the key between the BTreeMap and the table
 /// costs only an atomic refcount increment, not a heap allocation.
 pub type ZMember = Arc<[u8]>;
 
@@ -152,8 +158,9 @@ const _: () = assert!(std::mem::size_of::<SortedSetInner>() <= 32);
 /// The large form: dual representation for O(log N) score-ordered
 /// iteration AND O(1) member lookup:
 ///
-///   members:  AHashMap<ZMember, f64>
-///             → "what is this member's score?" — O(1) average
+///   members:  HashTable<(ZMember, f64)>
+///             → "what is this member's score?" — O(1) average; and
+///               "a member at random" — a random bucket, O(1) average
 ///
 ///   by_score: BTreeMap<(OrderedFloat<f64>, ZMember), ()>
 ///             → "give me all members with scores in [lo, hi]" — O(log N) seek + O(M) scan
@@ -165,32 +172,81 @@ const _: () = assert!(std::mem::size_of::<SortedSetInner>() <= 32);
 /// update both atomically (they live inside a single RwLock, so this is safe).
 #[derive(Clone, Default)]
 struct Large {
-    members: AHashMap<ZMember, f64>,
+    /// Each member and its score. A `HashTable` rather than a map, for its
+    /// buckets by number (a random member) and nothing else: the same
+    /// table, the same bytes a member, the same hash.
+    members: HashTable<(ZMember, f64)>,
+    hasher: ahash::RandomState,
     by_score: BTreeMap<(OrderedFloat<f64>, ZMember), ()>,
 }
 
 impl Large {
+    fn with_capacity(members: usize) -> Self {
+        Self {
+            members: HashTable::with_capacity(members),
+            ..Self::default()
+        }
+    }
+
+    #[inline]
+    fn hash(&self, member: &[u8]) -> u64 {
+        self.hasher.hash_one(member)
+    }
+
+    /// The member's own `Arc` and its score.
+    #[inline]
+    fn get(&self, member: &[u8]) -> Option<&(ZMember, f64)> {
+        self.members
+            .find(self.hash(member), |(have, _)| &**have == member)
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.members.len()
+    }
+
     /// Insert or update a member. Returns true if the member is new.
     /// This is the ONLY place both maps should be written — keeps the invariant.
     fn insert(&mut self, member: ZMember, score: f64) -> bool {
-        if let Some(&old_score) = self.members.get(&member) {
-            // Member exists — remove old position in the score index first
-            self.by_score
-                .remove(&(OrderedFloat(old_score), member.clone()));
-            self.members.insert(member.clone(), score);
-            self.by_score.insert((OrderedFloat(score), member), ());
-            false // not new
-        } else {
-            self.members.insert(member.clone(), score);
-            self.by_score.insert((OrderedFloat(score), member), ());
-            true // new member
+        let hash = self.hash(&member);
+        let hasher = &self.hasher;
+        match self.members.entry(
+            hash,
+            |(have, _)| **have == *member,
+            |(have, _)| hasher.hash_one(&**have),
+        ) {
+            Entry::Occupied(mut found) => {
+                // Member exists — remove old position in the score index
+                // first. The table keeps its own key, as a map would.
+                let old_score = std::mem::replace(&mut found.get_mut().1, score);
+                self.by_score
+                    .remove(&(OrderedFloat(old_score), member.clone()));
+                self.by_score.insert((OrderedFloat(score), member), ());
+                false // not new
+            }
+            Entry::Vacant(place) => {
+                place.insert((member.clone(), score));
+                self.by_score.insert((OrderedFloat(score), member), ());
+                true // new member
+            }
         }
+    }
+
+    /// Take the member out of the table alone: its `Arc` and score.
+    fn take(&mut self, member: &[u8]) -> Option<(ZMember, f64)> {
+        let hash = self.hash(member);
+        let found = self
+            .members
+            .find_entry(hash, |(have, _)| &**have == member)
+            .ok()?;
+        let (taken, _) = found.remove();
+        self.shrink_if_sparse();
+        Some(taken)
     }
 
     /// Remove a member. Returns true if it existed.
     fn remove(&mut self, member: &[u8]) -> bool {
-        // Retrieve the owned key directly, avoiding a linear scan of the member map.
-        match self.members.remove_entry(member) {
+        match self.take(member) {
             Some((arc_member, score)) => {
                 let indexed = self.by_score.remove(&(OrderedFloat(score), arc_member));
                 debug_assert!(indexed.is_some(), "member missing from by_score");
@@ -202,14 +258,81 @@ impl Large {
 
     fn pop_min(&mut self) -> Option<(ZMember, f64)> {
         let ((score, member), _) = self.by_score.pop_first()?;
-        self.members.remove(member.as_ref());
+        self.take(&member);
         Some((member, score.0))
     }
 
     fn pop_max(&mut self) -> Option<(ZMember, f64)> {
         let ((score, member), _) = self.by_score.pop_last()?;
-        self.members.remove(member.as_ref());
+        self.take(&member);
         Some((member, score.0))
+    }
+
+    /// A table that has lost most of its members is made smaller: it would
+    /// otherwise keep the memory of its largest size for ever, and a random
+    /// bucket of it would nearly always be an empty one.
+    fn shrink_if_sparse(&mut self) {
+        let buckets = self.members.num_buckets();
+        if buckets > 64 && self.members.len() * 8 < buckets {
+            let hasher = &self.hasher;
+            self.members
+                .shrink_to(self.members.len() * 2, |(have, _)| hasher.hash_one(&**have));
+        }
+    }
+
+    /// The bucket of a member picked at random, any one as likely as
+    /// another, if there is a member at all.
+    ///
+    /// A bucket picked at random is taken if it holds a member and picked
+    /// again if not: each try is every bucket alike, so the one taken is
+    /// every member alike. The table is at least an eighth full but for a
+    /// moment (a table reserved for more than came), so sixty-four empty
+    /// buckets in a row are about one call in five thousand at worst;
+    /// then a member is chosen by a walk, which is uniform too.
+    fn random_bucket(&self, rng: &mut impl rand::Rng) -> Option<usize> {
+        if self.members.is_empty() {
+            return None;
+        }
+        let buckets = self.members.num_buckets();
+        for _ in 0..64 {
+            let at = rng.gen_range(0..buckets);
+            if self.members.get_bucket(at).is_some() {
+                return Some(at);
+            }
+        }
+        use rand::seq::IteratorRandom;
+        let (member, _) = self.members.iter().choose(rng)?;
+        self.members
+            .find_bucket_index(self.hash(member), |(have, _)| Arc::ptr_eq(have, member))
+    }
+
+    /// A member and its score, picked at random.
+    #[inline]
+    fn random(&self, rng: &mut impl rand::Rng) -> Option<&(ZMember, f64)> {
+        self.members.get_bucket(self.random_bucket(rng)?)
+    }
+
+    /// `count` different members, picked at random, in a random order, for
+    /// a count of no more than a third of the set: one bucket at a time, a
+    /// bucket that comes up twice picked again. Each pick is every member
+    /// not yet picked alike, so the sample is as `rand::seq::index::sample`
+    /// would give; the expected tries are at most twelve a member (a table
+    /// an eighth full, the third of it already picked).
+    fn random_distinct(&self, count: usize, rng: &mut impl rand::Rng) -> Vec<&(ZMember, f64)> {
+        debug_assert!(count <= self.len());
+        let mut seen: ahash::AHashSet<usize> = ahash::AHashSet::with_capacity(count);
+        let mut picked = Vec::with_capacity(count);
+        while picked.len() < count {
+            let Some(at) = self.random_bucket(rng) else {
+                break;
+            };
+            if seen.insert(at)
+                && let Some(entry) = self.members.get_bucket(at)
+            {
+                picked.push(entry);
+            }
+        }
+        picked
     }
 }
 
@@ -275,17 +398,21 @@ impl SortedSetInner {
         let Repr::Packed(block) = &self.repr else {
             return;
         };
-        let mut members = AHashMap::with_capacity(block.len() + more);
+        let mut large = Large::with_capacity(block.len() + more);
         let mut keys = Vec::with_capacity(block.len());
         for (member, score) in block.iter() {
             let member: ZMember = Arc::from(member);
-            members.insert(Arc::clone(&member), score);
+            // A block's members are distinct.
+            let hasher = &large.hasher;
+            large.members.insert_unique(
+                hasher.hash_one(&*member),
+                (Arc::clone(&member), score),
+                |(have, _)| hasher.hash_one(&**have),
+            );
             keys.push(((OrderedFloat(score), member), ()));
         }
-        self.repr = Repr::Large(Box::new(Large {
-            members,
-            by_score: keys.into_iter().collect(),
-        }));
+        large.by_score = keys.into_iter().collect();
+        self.repr = Repr::Large(Box::new(large));
     }
 
     #[inline]
@@ -366,8 +493,8 @@ impl SortedSetInner {
                     out
                 }
             },
-            Repr::Large(large) => match large.members.get_key_value(member) {
-                Some((key, &old)) => {
+            Repr::Large(large) => match large.get(member) {
+                Some(&(ref key, old)) => {
                     let (score, out) = decide(Some(old));
                     if let Some(score) = score {
                         let score = score + 0.0;
@@ -450,7 +577,7 @@ impl SortedSetInner {
     pub fn score(&self, member: &[u8]) -> Option<f64> {
         match &self.repr {
             Repr::Packed(block) => block.find(member).map(|i| block.score(i)),
-            Repr::Large(large) => large.members.get(member).copied(),
+            Repr::Large(large) => large.get(member).map(|&(_, score)| score),
         }
     }
 
@@ -459,7 +586,8 @@ impl SortedSetInner {
         match &self.repr {
             Repr::Packed(block) => block.find(member).map(|i| (i, block.score(i))),
             Repr::Large(large) => {
-                let (stored, &score) = large.members.get_key_value(member)?;
+                let (stored, score) = large.get(member)?;
+                let score = *score;
                 let rank = large
                     .by_score
                     .range(..(OrderedFloat(score), Arc::clone(stored)))
@@ -509,7 +637,7 @@ impl SortedSetInner {
                 large
                     .members
                     .iter()
-                    .map(|(member, &score)| (Member::Shared(member), score)),
+                    .map(|(member, score)| (Member::Shared(member), *score)),
             ),
         }
     }
@@ -528,7 +656,7 @@ impl SortedSetInner {
             Repr::Large(large) => {
                 let (page, next_cursor) = scan_page(
                     prefetched(large.members.iter(), |(member, _)| member.as_ptr())
-                        .map(|(member, &score)| (scan_position(member), (member, score))),
+                        .map(|(member, score)| (scan_position(member), (member, *score))),
                     cursor,
                     count,
                     large.members.len(),
@@ -579,8 +707,52 @@ impl SortedSetInner {
         (from, to)
     }
 
+    /// A member and its score, any one as likely as another (`ZRANDMEMBER`):
+    /// a block's by its index, the large form's by a random bucket of its
+    /// table. Neither depends on how many members there are.
+    pub fn random(&self, rng: &mut impl rand::Rng) -> Option<(Member<'_>, f64)> {
+        match &self.repr {
+            Repr::Packed(block) if block.is_empty() => None,
+            Repr::Packed(block) => {
+                let (member, score) = block.get(rng.gen_range(0..block.len()));
+                Some((Member::Bytes(member), score))
+            }
+            Repr::Large(large) => large
+                .random(rng)
+                .map(|(member, score)| (Member::Shared(member), *score)),
+        }
+    }
+
+    /// `count` different members and their scores, picked at random, in a
+    /// random order (`ZRANDMEMBER` with a positive count); all of them if
+    /// `count` is the size of the set or more, but then in no order that
+    /// was picked.
+    ///
+    /// A few of many (no more than a third) are picked a bucket at a time,
+    /// a bucket that comes up twice picked again. More are found by one walk
+    /// of the table to the last of the positions chosen, which is then no
+    /// more work than the answer is long. A block is asked for the chosen
+    /// places only. Every way gives each set of `count` members, in each
+    /// order, alike.
+    pub fn random_distinct(
+        &self,
+        count: usize,
+        rng: &mut impl rand::Rng,
+    ) -> Vec<(Member<'_>, f64)> {
+        let len = self.len();
+        let count = count.min(len);
+        match &self.repr {
+            Repr::Large(large) if count * 3 <= len => large
+                .random_distinct(count, rng)
+                .into_iter()
+                .map(|(member, score)| (Member::Shared(member), *score))
+                .collect(),
+            _ => self.members_at(&rand::seq::index::sample(rng, len, count).into_vec()),
+        }
+    }
+
     /// Members at positions of `iter_unordered`, in the order given; may repeat.
-    pub fn members_at(&self, picks: &[usize]) -> Vec<(Member<'_>, f64)> {
+    fn members_at(&self, picks: &[usize]) -> Vec<(Member<'_>, f64)> {
         let large = match &self.repr {
             Repr::Packed(block) => {
                 return picks
@@ -608,7 +780,7 @@ impl SortedSetInner {
                     Some(at) => want - at - 1,
                     None => want,
                 };
-                last = walk.nth(skip).map(|(member, &score)| (member, score));
+                last = walk.nth(skip).map(|(member, score)| (member, *score));
                 at = Some(want);
             }
             out[slot] = last;
@@ -1060,7 +1232,7 @@ mod tests {
         let zs = large(zs);
         assert_eq!(zs.members.len(), zs.by_score.len());
         for (score, member) in zs.by_score.keys() {
-            assert_eq!(zs.members.get(member.as_ref()), Some(&score.0));
+            assert_eq!(zs.get(member.as_ref()).map(|e| e.1), Some(score.0));
         }
     }
 
@@ -1134,7 +1306,7 @@ mod tests {
         zs.insert_bytes(b"a", 1.0);
         zs.upsert(b"a", |_| (Some(2.0), ()));
         let large = large(&zs);
-        let (key, _) = large.members.get_key_value(&b"a"[..]).unwrap();
+        let (key, _) = large.get(b"a").unwrap();
         assert_eq!(Arc::strong_count(key), 2);
         assert_eq!(zs.score(b"a"), Some(2.0));
     }
@@ -1472,5 +1644,162 @@ mod tests {
     fn a_handle_is_no_bigger_than_a_block() {
         assert!(std::mem::size_of::<SortedSetInner>() <= 32);
         assert_eq!(SortedSetInner::new().packed_bytes(), Some(0));
+    }
+
+    /// A set of `n` members `m0..`, `mI` with score `I`, in either form.
+    fn numbered(n: usize, packed: bool) -> SortedSetInner {
+        let mut zs = if packed {
+            SortedSetInner::new()
+        } else {
+            made_large()
+        };
+        for i in 0..n {
+            zs.insert_bytes(format!("m{i}").as_bytes(), i as f64);
+        }
+        assert_eq!(zs.is_packed(), packed);
+        zs
+    }
+
+    fn index_of(member: &[u8]) -> usize {
+        std::str::from_utf8(&member[1..]).unwrap().parse().unwrap()
+    }
+
+    /// Pearson's statistic of `counts` against equal expectation, and a
+    /// bound seven standard deviations over its mean: a fair draw is over
+    /// it about once in a billion.
+    fn chi_square_fails(counts: &[u64]) -> Option<(f64, f64)> {
+        let total: u64 = counts.iter().sum();
+        let expected = total as f64 / counts.len() as f64;
+        let x: f64 = counts
+            .iter()
+            .map(|&o| (o as f64 - expected).powi(2) / expected)
+            .sum();
+        let df = (counts.len() - 1) as f64;
+        let bound = df + 7.0 * (2.0 * df).sqrt();
+        (x >= bound).then_some((x, bound))
+    }
+
+    /// Every member is as likely as any other, one at a time and in a
+    /// distinct sample (counted where it falls in the reply too, so the
+    /// order is random), in both forms; the score is the member's own.
+    #[test]
+    fn random_picks_are_uniform_in_both_forms() {
+        let mut rng = rand::thread_rng();
+        for (n, packed) in [(100, true), (100, false), (1000, false)] {
+            let zs = numbered(n, packed);
+            let mut one = vec![0u64; n];
+            for _ in 0..20 * n {
+                let (member, score) = zs.random(&mut rng).unwrap();
+                assert_eq!(index_of(&member) as f64, score);
+                one[index_of(&member)] += 1;
+            }
+            assert_eq!(chi_square_fails(&one), None, "one, n {n} packed {packed}");
+            // A third of the set (picked a bucket at a time) and most of it
+            // (one walk), and one.
+            for count in [1, n / 10, n / 3, n / 3 + 1, n - 1] {
+                let mut all = vec![0u64; n];
+                let mut first = vec![0u64; n];
+                let mut last = vec![0u64; n];
+                // At least five first and last picks a member expected.
+                for _ in 0..(40 * n / count).max(5 * n) {
+                    let sample = zs.random_distinct(count, &mut rng);
+                    assert_eq!(sample.len(), count);
+                    let distinct: BTreeSet<usize> =
+                        sample.iter().map(|(m, _)| index_of(m)).collect();
+                    assert_eq!(distinct.len(), count, "repeats in {count} of {n}");
+                    for (member, score) in &sample {
+                        assert_eq!(index_of(member) as f64, *score);
+                        all[index_of(member)] += 1;
+                    }
+                    first[index_of(&sample[0].0)] += 1;
+                    last[index_of(&sample[count - 1].0)] += 1;
+                }
+                assert_eq!(
+                    chi_square_fails(&all),
+                    None,
+                    "{count} of {n}, packed {packed}"
+                );
+                assert_eq!(chi_square_fails(&first), None, "first, {count} of {n}");
+                assert_eq!(chi_square_fails(&last), None, "last, {count} of {n}");
+            }
+        }
+    }
+
+    /// A count of the size of the set or more is every member once; none
+    /// is none; an empty set has nothing to pick.
+    #[test]
+    fn random_distinct_edges() {
+        let mut rng = rand::thread_rng();
+        for packed in [true, false] {
+            let zs = numbered(100, packed);
+            for count in [100, 101, usize::MAX] {
+                let mut got: Vec<usize> = zs
+                    .random_distinct(count, &mut rng)
+                    .iter()
+                    .map(|(m, _)| index_of(m))
+                    .collect();
+                got.sort_unstable();
+                assert_eq!(got, (0..100).collect::<Vec<_>>());
+            }
+            assert!(zs.random_distinct(0, &mut rng).is_empty());
+        }
+        let mut zs = made_large();
+        assert!(zs.random(&mut rng).is_none());
+        assert!(zs.random_distinct(3, &mut rng).is_empty());
+        zs.insert_bytes(b"m0", 0.0);
+        assert_eq!(&*zs.random(&mut rng).unwrap().0, b"m0");
+        assert!(SortedSetInner::new().random(&mut rng).is_none());
+    }
+
+    /// A table emptied of most of its members is shrunk, so that a random
+    /// bucket is still likely to be a member, and the picks stay uniform;
+    /// one reserved far beyond its members (no shrink yet) still finds
+    /// them, uniformly, by the walk.
+    #[test]
+    fn random_picks_stay_uniform_in_a_sparse_table() {
+        let mut rng = rand::thread_rng();
+        let mut zs = numbered(100_000, false);
+        let big = large(&zs).members.num_buckets();
+        // Every member but m0..m49 by every remover: one at a time, the
+        // lowest, the highest, by rank and by score.
+        assert_eq!(zs.remove_ranks(90_000, 99_999), 10_000);
+        assert_eq!(
+            zs.remove_range_by_score((
+                Bound::Included((OrderedFloat(50_000.0), m(b""))),
+                Bound::Unbounded
+            )),
+            40_000
+        );
+        for i in 50..40_000 {
+            assert!(zs.remove(format!("m{i}").as_bytes()));
+        }
+        while zs.len() > 50 {
+            zs.pop_max();
+        }
+        assert_in_sync(&zs);
+        let small = large(&zs).members.num_buckets();
+        assert!(small * 64 < big, "{big} buckets, then {small}");
+        assert!(zs.len() * 8 >= small, "{} members in {small}", zs.len());
+        let mut one = vec![0u64; 50];
+        for _ in 0..50 * 400 {
+            one[index_of(&zs.random(&mut rng).unwrap().0)] += 1;
+        }
+        assert_eq!(chi_square_fails(&one), None);
+
+        // Reserved for a hundred thousand, holding two hundred.
+        let mut zs = SortedSetInner::new();
+        zs.expect(100_000);
+        for i in 0..200 {
+            zs.insert_bytes(format!("m{i}").as_bytes(), i as f64);
+        }
+        assert!(large(&zs).members.num_buckets() > 200 * 256);
+        let mut one = vec![0u64; 200];
+        for _ in 0..200 * 100 {
+            one[index_of(&zs.random(&mut rng).unwrap().0)] += 1;
+        }
+        assert_eq!(chi_square_fails(&one), None);
+        let sample = zs.random_distinct(50, &mut rng);
+        let distinct: BTreeSet<usize> = sample.iter().map(|(m, _)| index_of(m)).collect();
+        assert_eq!(distinct.len(), 50);
     }
 }
