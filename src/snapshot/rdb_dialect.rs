@@ -181,14 +181,13 @@ fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
     // One named twice is a corrupt file.
     let mut names = std::collections::HashSet::with_capacity(fields.len());
     for (field, value, expires_at) in fields {
-        let field = String::from_utf8_lossy(&field).into_owned();
         if !names.insert(field.clone()) {
             return Err(rdb_invalid("duplicate hash fields"));
         }
         if let Some(at) = expires_at {
-            inner.expiries.insert(field.clone(), field_deadline(at));
+            inner.expiries.insert(&field, field_deadline(at));
         }
-        inner.fields.insert_loaded(field, &value)?;
+        inner.fields.insert_loaded(&field, &value)?;
     }
     // Nothing there: no key, as Valkey loads none.
     if inner.fields.is_empty() {

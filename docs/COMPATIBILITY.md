@@ -165,9 +165,9 @@ other files:
 - A hash whose fields and values pass 65,535 bytes together is a
   `hashtable` even when it is within both limits (at most 511 fields of 64
   bytes with 64-byte values fit one block); Redis's listpack holds more.
-- The 64-byte and 65,535-byte limits count a field as it is stored, after
-  the bytes of a field that is not UTF-8 are escaped as text: a binary
-  field Redis keeps in a `listpack` can make a `hashtable` here.
+- The 64-byte and 65,535-byte limits count a field's own bytes, as Redis's
+  do, whatever bytes it holds: a field that is not UTF-8 is as long as it
+  is, and `MEMORY USAGE` counts it so.
 - A lowered limit applies to a hash at its next write that sets a field
   (`HSET` and the like); `HDEL` and field expiry never move a hash, as in
   Redis.
@@ -257,9 +257,22 @@ other files:
 **Data**
 - Keys, values, hash fields, set and sorted-set members, list elements,
   stream consumer group and consumer names and vector-set element names are
-  any bytes, as in Redis. What is still text: ACL rules (a key or channel
-  pattern in `ACL SETUSER` that is not UTF-8 is refused,
-  [#437](https://github.com/kividbio/kividb/issues/437)), search index
+  any bytes, as in Redis. A hash keeps a field name as the bytes it was sent
+  as: `HSCAN MATCH`, `HRANDFIELD`, field TTLs, keyspace notifications and
+  `SORT ... ->field` see those bytes. KDB snapshots, `DUMP` payloads and
+  `DEBUG DIGEST-VALUE` write a field name in the form 1.2 wrote it (a name
+  that is UTF-8 is itself; any other is escaped as text), so files and
+  payloads read the same on 1.2 and here, both ways.
+- ACL key and channel patterns (`~`, `%R~`, `%W~`, `&`, and in selectors)
+  are any bytes, and match a key's or channel's bytes exactly. `ACL
+  SETUSER` refuses white space and NUL in a pattern, as Redis does (and any
+  Unicode white space, which the ACL file is split at). `ACL LIST`,
+  `ACL GETUSER`, `ACL LOG` and the ACL file give a pattern's own bytes, as
+  Redis writes them. In the ACL file a user name is read as written; a
+  rule word that begins with a quote is read as Redis reads a quoted one
+  (`"~app:\xff*"`); a line is split at white space, ASCII white space for
+  a line that is not UTF-8; a pattern may hold a NUL. A user name in an ACL
+  file must be UTF-8. What is still text: ACL user names and command rules, search index
   names, prefixes and field names, and time-series label names and values.
 - A HyperLogLog copied from Redis (`DUMP`/`RESTORE`, an RDB, replication)
   loads and counts as it did on Redis. By default KiviDB writes new

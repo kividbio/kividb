@@ -2572,7 +2572,16 @@ fn test_setuser_takes_a_binary_password() {
         assert!(set(&mut admin, b"<\xff\x01").is_ok());
         let r = c.cmd(&[&b"AUTH"[..], &b"bu"[..], &b"\xff\x01"[..]]);
         assert!(r.error_msg().starts_with("WRONGPASS"), "{r:?}");
-        // Anything else that is not UTF-8 is still no rule.
-        assert_eq!(set(&mut admin, b"~\xff").error_msg(), "ERR invalid rule");
+        // A key pattern is bytes too (#510); a command rule is text.
+        assert!(
+            admin
+                .cmd(&[&b"ACL"[..], &b"SETUSER"[..], &b"bk"[..], &b"~\xff*"[..]])
+                .is_ok()
+        );
+        assert!(
+            set(&mut admin, b"+\xff")
+                .error_msg()
+                .starts_with("ERR Error in ACL SETUSER modifier")
+        );
     });
 }
