@@ -634,7 +634,29 @@ impl NumericPostings {
     }
 
     /// The documents whose value is in the range, ends included or not.
+    ///
+    /// Read one of two ways, which give the same documents. A range of few
+    /// documents is read off the sorted list and the B-trees, entry by
+    /// entry. One that may take in more than a quarter of the documents is
+    /// read off the values by document id instead ([`Self::range_by_value`]):
+    /// entry by entry, `@score:[50 100]` over 200,000 documents (half of
+    /// them) was 100,000 bits set one at a time all over the set, a quarter
+    /// of the time of a KNN query with that filter over 64-d vectors.
     fn range(&self, lo: f64, lo_exclusive: bool, hi: f64, hi_exclusive: bool, out: &mut Bits) {
+        self.range_read(lo, lo_exclusive, hi, hi_exclusive, None, out);
+    }
+
+    /// [`Self::range`], read by value if `by_value` says so, in order if it
+    /// says not, and as `range` chooses if it is `None`.
+    fn range_read(
+        &self,
+        lo: f64,
+        lo_exclusive: bool,
+        hi: f64,
+        hi_exclusive: bool,
+        by_value: Option<bool>,
+        out: &mut Bits,
+    ) {
         if lo.is_nan() || hi.is_nan() {
             return;
         }
@@ -653,7 +675,25 @@ impl NumericPostings {
         }
         let from = self.settled.partition_point(|entry| *entry < start);
         let to = self.settled.partition_point(|entry| *entry <= end);
-        for &(_, doc) in &self.settled[from..to] {
+        // At most this many documents, if every entry still is its own.
+        let most = (to - from) + self.frozen.len() + self.recent.len();
+        if by_value.unwrap_or(most.saturating_mul(4) > self.values.len()) {
+            self.range_by_value(lo, lo_exclusive, hi, hi_exclusive, out);
+        } else {
+            self.range_in_order(start, end, from..to, out);
+        }
+    }
+
+    /// [`Self::range`] read off the sorted list (entries `settled`) and the
+    /// B-trees, between the order keys `start` and `end`.
+    fn range_in_order(
+        &self,
+        start: (u64, u32),
+        end: (u64, u32),
+        settled: std::ops::Range<usize>,
+        out: &mut Bits,
+    ) {
+        for &(_, doc) in &self.settled[settled] {
             if self.in_settled.get(doc) {
                 out.set(doc);
             }
@@ -666,6 +706,36 @@ impl NumericPostings {
         for &(_, doc) in self.recent.range(start..=end) {
             out.set(doc);
         }
+    }
+
+    /// [`Self::range`] read off every document's value, in id order, 64
+    /// documents to a word of `out`: the documents that have a value (`has`;
+    /// `values` keeps what a document held before it lost its value) whose
+    /// value is in the range. A NaN is in none. Each word is 16 vector
+    /// compares of 4 values with AVX2 ([`super::simd::in_range_words`]),
+    /// where the list costs a lookup and a bit set apiece.
+    fn range_by_value(
+        &self,
+        lo: f64,
+        lo_exclusive: bool,
+        hi: f64,
+        hi_exclusive: bool,
+        out: &mut Bits,
+    ) {
+        // Ends included: `v > lo` is `v >= lo.next_up()` (+inf has nothing
+        // above it), and `v < hi` is `v <= hi.next_down()`. -0 and 0 are
+        // equal here, as in the order keys.
+        if (lo_exclusive && lo == f64::INFINITY) || (hi_exclusive && hi == f64::NEG_INFINITY) {
+            return;
+        }
+        let lo = if lo_exclusive { lo.next_up() } else { lo };
+        let hi = if hi_exclusive { hi.next_down() } else { hi };
+        let has = &self.has.words;
+        let words = self.values.len().div_ceil(64).min(has.len());
+        if out.words.len() < words {
+            out.words.resize(words, 0);
+        }
+        super::simd::in_range_words(&self.values, &has[..words], lo, hi, &mut out.words[..words]);
     }
 
     fn bytes(&self) -> usize {
@@ -2226,6 +2296,19 @@ mod tests {
         assert_eq!(put(&mut p, "b", "red", "1"), 0);
     }
 
+    /// The keys in `[lo, hi]` (ends as given) of field `n`, read both ways
+    /// (`NumericPostings::range_read`): the two must agree.
+    fn both_ways(p: &Postings, lo: f64, lx: bool, hi: f64, hx: bool) -> Vec<String> {
+        let numbers = p.numeric_field("n").unwrap();
+        let mut ways = [false, true].map(|by_value| {
+            let mut bits = Bits::new();
+            numbers.range_read(lo, lx, hi, hx, Some(by_value), &mut bits);
+            keys(p, &bits)
+        });
+        assert_eq!(ways[0], ways[1], "in order, by value: {lo} {lx} {hi} {hx}");
+        std::mem::take(&mut ways[0])
+    }
+
     #[test]
     fn ranges_and_their_ends() {
         let mut p = Postings::new(&schema());
@@ -2240,8 +2323,20 @@ mod tests {
         ] {
             put(&mut p, key, "", n);
         }
-        let r = |lo, lx, hi, hx| keys(&p, &p.range("n", lo, lx, hi, hx).unwrap());
+        let r = |lo, lx, hi, hx| {
+            let got = keys(&p, &p.range("n", lo, lx, hi, hx).unwrap());
+            assert_eq!(got, both_ways(&p, lo, lx, hi, hx), "{lo} {lx} {hi} {hx}");
+            got
+        };
         assert_eq!(r(0.0, false, 0.0, false), ["b", "c"]);
+        assert_eq!(r(-0.0, false, -0.0, false), ["b", "c"]);
+        assert!(r(0.0, true, 0.0, false).is_empty());
+        assert!(r(-0.0, false, 0.0, true).is_empty());
+        assert!(r(f64::INFINITY, true, f64::INFINITY, false).is_empty());
+        assert!(r(f64::NEG_INFINITY, false, f64::NEG_INFINITY, true).is_empty());
+        assert_eq!(r(f64::INFINITY, false, f64::INFINITY, false), ["g"]);
+        assert_eq!(r(f64::NEG_INFINITY, true, 1.5, false), ["b", "c", "d"]);
+        assert_eq!(r(1.5, false, f64::INFINITY, true), ["d"]);
         assert_eq!(r(-0.0, true, f64::INFINITY, false), ["d", "g"]);
         assert_eq!(r(f64::NEG_INFINITY, false, 0.0, true), ["a"]);
         assert_eq!(
@@ -2400,6 +2495,7 @@ mod tests {
                 want.sort();
                 let got = keys(&p, &p.range("n", lo, lx, hi, hx).unwrap());
                 assert_eq!(got, want, "round {round}: {lo} {lx} {hi} {hx}");
+                assert_eq!(both_ways(&p, lo, lx, hi, hx), want, "round {round}");
             }
             for ascending in [true, false] {
                 let mut walked: Vec<(f64, u32)> = Vec::new();

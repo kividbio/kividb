@@ -871,6 +871,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   where Redis gives 0.11 at 4,276 and 0.42 at 2,006 (`EF_RUNTIME 80`); see
   docs/PERFORMANCE.md.
 
+- **A NUMERIC range that takes in many documents is read off the values by
+  document id (#760).** `@field:[lo hi]` is read off the field's sorted
+  list entry by entry while it is narrow; once it may take in more than a
+  quarter of the documents, every document's value is compared in id order
+  instead, four at a time with AVX2, 64 documents to a word of the result.
+  A filtered KNN reads its filter for every query, and `@score:[50 100]`
+  over 200,000 documents set 100,000 bits one at a time, a quarter of the
+  query's time over 64-d vectors. One client, KNN 10 over 200,000 64-d
+  documents with that filter (an Azure D8s_v5, medians of 2): 1,917 →
+  2,215 queries a second at the default `EF_RUNTIME`, 1,390 → 1,517 at 100
+  (Redis 8.10.3: 2,015 and 1,304, at recall 0.25 and 0.58 against
+  KiviDB's 0.62 and 0.78); over 50,000 384-d documents 1,896 → 1,965. The
+  documents a range matches are the same either way: a test reads every
+  range both ways. Regression suite `41-ft-hnsw-vs-redis` gates #760's
+  cases against Redis in the same session.
+
 - **Writes on a master with a replication backlog and no replica no
   longer wake the replication thread one by one (#894).** A master that
   starts with data (its own snapshot, or any dataset) keeps the backlog for

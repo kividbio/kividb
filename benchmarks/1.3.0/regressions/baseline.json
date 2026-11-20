@@ -20159,6 +20159,1093 @@
           "kind": "info"
         }
       ]
+    },
+    "41-ft-hnsw-vs-redis/d384/build_docs_per_s": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "build_docs_per_s",
+      "unit": "docs/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1685.2427,
+        "candidate": 6456.1077,
+        "redis": 8231.3096,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.6
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/narrow_default_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "narrow_default_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 3332.8,
+        "candidate": 3204.0,
+        "redis": 2096.6,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/narrow_default_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "narrow_default_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1.0,
+        "candidate": 1.0,
+        "redis": 1.0,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/none_default_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "none_default_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 3422.0,
+        "candidate": 3300.6,
+        "redis": 5571.4,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 2.2
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/none_default_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "none_default_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.373,
+        "candidate": 0.3713,
+        "redis": 0.1067,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/none_ef100_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "none_ef100_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2314.4,
+        "candidate": 2229.2,
+        "redis": 2239.0,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.1
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/none_ef100_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "none_ef100_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.529,
+        "candidate": 0.524,
+        "redis": 0.4643,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/none_ef200_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "none_ef200_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1401.2,
+        "candidate": 1363.6,
+        "redis": 1338.4,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.1
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/none_ef200_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "none_ef200_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.688,
+        "candidate": 0.687,
+        "redis": 0.6303,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/none_ef50_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "none_ef50_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 3455.4,
+        "candidate": 3213.4,
+        "redis": 3161.4,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.1
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/none_ef50_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "none_ef50_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.373,
+        "candidate": 0.3713,
+        "redis": 0.32,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/peak_rss_mib": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "peak_rss_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 212.1523,
+        "candidate": 215.957,
+        "redis": 244.4922,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/wide_default_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "wide_default_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1940.6,
+        "candidate": 1958.6,
+        "redis": 2633.4,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.8
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/wide_default_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "wide_default_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.5023,
+        "candidate": 0.5037,
+        "redis": 0.1863,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/wide_ef100_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "wide_ef100_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1256.8,
+        "candidate": 1282.6,
+        "redis": 1395.4,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.2
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/wide_ef100_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "wide_ef100_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.6547,
+        "candidate": 0.6533,
+        "redis": 0.475,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/wide_ef50_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "wide_ef50_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1927.0,
+        "candidate": 2026.2,
+        "redis": 1681.2,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.2
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d384/wide_ef50_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d384",
+      "metric": "wide_ef50_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.5023,
+        "candidate": 0.5037,
+        "redis": 0.3443,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/build_docs_per_s": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "build_docs_per_s",
+      "unit": "docs/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2622.1642,
+        "candidate": 9507.729,
+        "redis": 16227.9954,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 2.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/knn_max_ms_beside_writes": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "knn_max_ms_beside_writes",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 6.8164,
+        "candidate": 4.958,
+        "redis": 14.2116,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/knn_p99_ms_beside_writes": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "knn_p99_ms_beside_writes",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.2631,
+        "candidate": 0.2778,
+        "redis": 0.3801,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 0.2,
+          "speed": false
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/narrow_default_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "narrow_default_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1315.8,
+        "candidate": 1297.4,
+        "redis": 902.6,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/narrow_default_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "narrow_default_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1.0,
+        "candidate": 1.0,
+        "redis": 1.0,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/none_default_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "none_default_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 5194.6,
+        "candidate": 5072.8,
+        "redis": 6832.0,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 2.2
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/none_default_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "none_default_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.5057,
+        "candidate": 0.4923,
+        "redis": 0.1583,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/none_ef100_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "none_ef100_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 3525.0,
+        "candidate": 3395.2,
+        "redis": 3270.0,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.1
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/none_ef100_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "none_ef100_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.6617,
+        "candidate": 0.657,
+        "redis": 0.5847,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/none_ef200_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "none_ef200_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 2152.8,
+        "candidate": 2005.8,
+        "redis": 1935.6,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.1
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/none_ef200_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "none_ef200_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.8083,
+        "candidate": 0.8047,
+        "redis": 0.758,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/none_ef50_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "none_ef50_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 5038.6,
+        "candidate": 5132.8,
+        "redis": 4358.4,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.1
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/none_ef50_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "none_ef50_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.5057,
+        "candidate": 0.4923,
+        "redis": 0.4363,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/peak_rss_mib": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "peak_rss_mib",
+      "unit": "MiB",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 316.1797,
+        "candidate": 315.1953,
+        "redis": 373.2109,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/wide_default_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "wide_default_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1931.4,
+        "candidate": 2302.2,
+        "redis": 2052.0,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.8
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/wide_default_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "wide_default_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.6287,
+        "candidate": 0.6197,
+        "redis": 0.2453,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/wide_ef100_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "wide_ef100_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1432.4,
+        "candidate": 1562.0,
+        "redis": 1328.8,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.2
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/wide_ef100_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "wide_ef100_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.7823,
+        "candidate": 0.7763,
+        "redis": 0.5613,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/wide_ef50_qps": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "wide_ef50_qps",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1974.6,
+        "candidate": 2302.2,
+        "redis": 1575.6,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.2
+        }
+      ]
+    },
+    "41-ft-hnsw-vs-redis/d64/wide_ef50_recall_at_10": {
+      "suite": "41-ft-hnsw-vs-redis",
+      "config": "d64",
+      "metric": "wide_ef50_recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.6287,
+        "candidate": 0.6197,
+        "redis": 0.4183,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "0055dec0",
+        "label": "pr-760-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0
+        }
+      ]
     }
   }
 }
