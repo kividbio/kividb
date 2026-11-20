@@ -27,6 +27,7 @@ mod commands;
 mod compaction;
 mod config;
 mod cpus;
+mod deferred;
 mod element;
 pub mod eviction;
 pub mod expiry;
@@ -1293,6 +1294,8 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             let monitor_registry = Arc::clone(&monitor_registry);
             let tracking_table = Arc::clone(&tracking_table);
             crate::cpus::spawn(move || {
+                // Its connections wait for long work sent off it (#762).
+                crate::deferred::mark_ring_thread();
                 if let Some(report) = &pinned {
                     let bound = crate::cpus::pin_this_thread(report.cpu(worker), report.cpus());
                     if let Some(line) = report.tried(worker, &bound) {

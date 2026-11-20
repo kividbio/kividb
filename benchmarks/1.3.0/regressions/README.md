@@ -20,7 +20,7 @@ and why.
 | `01-scan-match` | #751 / #769 | full `SCAN` iterations over 2,002,000 keys (`MATCH schedule:*`, no `MATCH`, `*:1*`, `COUNT 10000`), `KEYS schedule:*`; `HSCAN`/`SSCAN`/`ZSCAN` of 200k-element collections as guard rows for #770 |
 | `02-growth-ping` | #752 / #780 | worst `PING` while 8M keys are loaded in 2,000-`SET` pipelines; Tokio, and io_uring with `--threads 1`; `FULL=1` adds 17.5M keys with `EX` |
 | `03-give-back` | #753 / #763 | RSS 1.5, 5 and 15 s after deleting a 3M-field hash, `HDEL` of 1M fields, and a mixed churn |
-| `04-long-commands` | #754 / #757 | `KEYS` over 2M keys, `SCAN COUNT 2000000`, `DEL` of a 3M-field hash, each with 4 `PING` probes; Tokio and io_uring |
+| `04-long-commands` | #754 / #757, #762 | `KEYS` over 2M keys, `SCAN COUNT 2000000`, `DEL` of a 3M-field hash, each with 4 `PING` probes; Tokio and io_uring (`--threads 2`), and io_uring with one ring (`uring1`, `--threads 1`: every probe on the command's thread), which also runs `DEL` of the hash and another key (the command gate held alone) and `HGETALL` of a 1M-field hash, with `GET` and `SET` probes on random keys beside the `PING`s |
 | `05-stream-memory` | #639 / #683 (#713) | `used_memory` per stream entry: 1M one-field entries (and RSS), 200k entries of five shared fields, five unique fields, one 200-byte value; `XADD`/`XRANGE` rates as cost guards |
 | `06-stream-consumers` | #637 / #736 | 200k pending over 50 consumers: `XINFO CONSUMERS`, `XPENDING` summary and per consumer, `XREADGROUP` history; `XADD` rate while `XINFO CONSUMERS` is polled every 50 ms; bytes per pending entry |
 | `07-save-ping` | #605 / #696 | worst `PING` during a `SAVE` of 1.5M keys, Tokio `--threads 1` |
@@ -253,6 +253,7 @@ was re-recorded for it:
 | `01`-`06`, `08`-`12`, `14`-`17`, `19` (every configuration that had none) | 2 | recorded before #903 (commits `2468f226`, `d66f0f93`, `9501caa6`, `219b9656`, `f767a149`, `9c466db3`, `8160700c`, `5b4a04a4`, `c7e0b47e`, `36771af1`: none contains it), where the default on 4 vCPUs was 2 (the servers' logs in `raw.tar.gz` say `Worker threads : 2`) |
 | `24-snapshot-size`, `31-zset-memory` | 4 | recorded on branches that had merged #903: the candidate's logs say `Worker threads : 4 (auto: one per available CPU)`. v1.2.2 ran with its default of 2 there and runs with 4 now: `24`'s v1.2.2 values are only used by its same-session `vs_v1_2_2` gates on the `SAVE`/load time, and `31` gates memory |
 | `02 uring1`, `07`, `13` | 1 | as before |
+| `04 uring1` | 1 | one ring, so every probe is on the long command's thread (#762) |
 | `22` | 4 | as before |
 | `23`, `25`, `27` | 2 | as before |
 | `18-mastodon-feed-fanout` | 8 | recorded on a `Standard_D8s_v5` (`min_cpus=8`) with the default of the day: the candidate's log says `Worker threads : 8 (auto: one per available CPU)` |
@@ -692,6 +693,40 @@ against 141.8 on io_uring (0.61x), `keys_schedule_ms` 53.7 ms (recorded
 the same build before the gate was added gave 90.0/87.9 ms (0.61x/0.61x)
 and 97.5/94.3 ms (0.72x/0.67x, before the comparison was inlined). The probes' extra 10 ms on master is the PINGs being served
 meanwhile, which is #757's point: v1.2.2 served none.
+
+### #762: io_uring, the long command's own thread
+
+Suite 04 re-recorded on a `Standard_D8s_v5` (`results/pr-762-d8s_v5-r2`,
+rustc 1.100.0, all three engines, `ALLOW_VM_CHANGE=1`; checked again by
+`results/pr-762-d8s_v5-r2-verify`, verdict ok). It adds the configuration
+`uring1` (one ring: every probe on the command's thread), with `del_multi`
+(`DEL big user:1`, which takes the command gate alone), `hgetall`
+(`HGETALL` of a 1M-field hash) and, beside the 4 `PING` probes, 4 `GET` and
+4 `SET` probes on random keys of the 2M. The worst-PING rows of `uring` are
+gated as Tokio's are (at most 20 ms). Worst request while the command ran,
+median of 3 runs, `PING` / `GET` / `SET`:
+
+| `uring1` | master `f4806977` (`results/master-f4806977-d8s_v5-04`) | #762 | v1.2.2 (`PING`) |
+|---|---:|---:|---:|
+| `KEYS user:99*` over 2M keys | 74.1 / 74.2 / 74.3 ms | 1.1 / 1.1 / 1.1 ms | 131.1 ms |
+| `SCAN ... COUNT 2000000` | 49.6 / 49.7 / 49.6 ms | 0.6 / 0.7 / 0.7 ms | 271.1 ms |
+| `DEL` of a 3M-field hash | 126.5 / 126.7 / 126.7 ms | 0.1 / 0.3 / 0.2 ms | 127.3 ms |
+| `DEL` of the hash and another key | 126.1 / 126.3 / 126.1 ms | 0.07 / 0.08 / 0.10 ms | 127.5 ms |
+| `HGETALL` of 1M fields | 39.0 / 39.0 / 39.0 ms | 8.3 / 8.3 / 8.3 ms (max 10.4) | 61.5 ms |
+
+What is moved to the pool is the work, not its locks. The run of `HGETALL`
+holds its key's shard for reading while it builds the reply, so a `SET` to a
+key of that shard (one of 64 on 8 CPUs) waits for it, and holds up its ring
+thread; the thread also handles the 1M-field reply itself. The two were not
+told apart: the result is 6-10 ms behind an `HGETALL` of 1M fields, against
+39 ms on master. In the recording run, 4 `SET`s of about 8,000 took over
+10 ms in one run, none in the other two (`hgetall_set_over_10ms`); p99.9 of
+the probes over the whole command was 1-3.5 ms. A command that takes the
+command gate alone waits for a `KEYS` or `SCAN` run on the pool in the same
+way (not probed here). The commands take as long as before (`KEYS` 92 ms,
+`SCAN` 66 ms, `DEL` 132-150 ms on `uring1`, with the 12 probes beside them).
+The master run is `--engines candidate` and fails the new gates, as it
+should.
 
 ## Recorded run, suites 05-13
 

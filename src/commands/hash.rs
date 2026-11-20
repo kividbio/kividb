@@ -113,15 +113,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let key: &[u8] = cmd[1];
 
-            match with_hash_read(ctx, key, |inner| {
-                let eff = effective_resp_for_reply(ctx);
+            let eff = effective_resp_for_reply(ctx);
+            let reply = |inner: &crate::types::HashFields| {
                 if eff == 3 {
                     let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(inner.len() * 2);
                     for (k, v) in inner.iter() {
                         chunks.push(resp_bulk(&crate::commands::helpers::name_to_bytes(k)));
                         chunks.push(resp_bulk(v.as_ref()));
                     }
-                    Some(resp_map(chunks))
+                    resp_map(chunks)
                 } else {
                     let count = inner.len() * 2;
                     let mut buf = Vec::with_capacity(16 + count * 32);
@@ -130,9 +130,26 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         push_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
                         push_bulk(&mut buf, &v);
                     }
-                    Some(buf)
+                    buf
                 }
-            }) {
+            };
+            // Millions of fields, on an io_uring worker: run again on a
+            // thread of its own, while this one serves its other connections
+            // (#762). Not in cluster mode (`deferred`).
+            let may_move =
+                !ctx.cluster.enabled && crate::deferred::may_run_elsewhere(&ctx.blocking);
+            // On Tokio, as long work (`long_work`).
+            let mut read = with_hash_read(ctx, key, |inner| {
+                (!may_move || inner.len() < LONG_WORK)
+                    .then(|| long_work(inner.len(), || reply(inner)))
+            });
+            if let Some(Ok(None)) = read {
+                if crate::deferred::run_elsewhere(&mut ctx.blocking, cmd, LONG_WORK) {
+                    return Some(crate::pause::HELD_IN_GATE.to_vec());
+                }
+                read = with_hash_read(ctx, key, |inner| Some(reply(inner)));
+            }
+            match read {
                 None => {
                     crate::stats::record_miss();
                     // A missing key is an empty *map* under RESP3, matching the

@@ -2414,7 +2414,11 @@ fn gate_alone_or_walk(
 #[cold]
 #[inline(never)]
 fn feed_monitors(ctx: &Ctx, name: &str) {
-    if !crate::commands::blocking::resuming(ctx) && !crate::commands::server::is_admin_command(name)
+    // Nor when it is run again off its connection's thread: it was shown
+    // when it arrived (`deferred::run_elsewhere`).
+    if !crate::commands::blocking::resuming(ctx)
+        && !crate::deferred::running_elsewhere()
+        && !crate::commands::server::is_admin_command(name)
     {
         crate::monitor::feed(
             ctx.monitor_registry,

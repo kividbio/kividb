@@ -80,6 +80,13 @@ pub struct BlockingWait {
     /// connection has waited for the script's turn, off its thread.
     #[cfg(feature = "lua")]
     tags: Option<crate::tag_locks::TagsBusy>,
+    /// Not a wait at all: work the command left for its connection to have
+    /// done off its thread, and to wait for, before it replies
+    /// (`deferred`, #762): a command to run again elsewhere, which has not
+    /// run; or values to free, of a command that has (handed on from
+    /// `BlockingCtl::freeing` by `BlockingSlot::take_parked`).
+    /// Boxed: rare, and the wait is kept small.
+    offload: Option<Box<crate::deferred::Offload>>,
 }
 
 /// Command state captured at park time and handed back verbatim on resume,
@@ -415,6 +422,15 @@ pub struct BlockingCtl {
     /// of after the dispatch if it did not get that far.
     #[cfg(feature = "lua")]
     pub tag_turns: Option<crate::tag_locks::TagTurns>,
+    /// Whether the dispatch leaves anything to settle after it but a wait:
+    /// the clients it wakes, which it collects while anyone stands in a
+    /// line, or values to free ([`Self::freeing`]). One flag, so that the
+    /// connection tests one thing after a command (`BlockingSlot::take_parked`).
+    pub(crate) after: bool,
+    /// Values a command that has run left to free before its reply
+    /// (`deferred::free_weighed`, #762): not a wait, so not in `parked`,
+    /// which says the command has not run.
+    pub(crate) freeing: Option<Box<crate::deferred::Freeing>>,
 }
 
 /// The connection loop's end of the parking mechanism.
@@ -442,8 +458,6 @@ pub struct BlockingSlot {
     woken: Vec<std::sync::Arc<crate::wait_table::Look>>,
     /// This connection, to the looks it waits for: one per woken client.
     owner: u64,
-    /// Whether the dispatch under way collects the clients it wakes.
-    collecting: bool,
     /// The client's count in `blocked_clients` from the end of its wait to
     /// the end of the dispatch that resumes it. See [`BlockedCount`].
     held_count: Option<BlockedCount>,
@@ -490,10 +504,13 @@ impl BlockingSlot {
     /// Prepare the slot for the next dispatch and hand out the borrow that
     /// goes into `Ctx`.
     pub fn prime(&mut self) -> &mut BlockingCtl {
+        // Values to free are handed on after the command that left them
+        // (`take_parked`): none is left for the next one.
+        debug_assert!(self.ctl.freeing.is_none(), "values to free left behind");
         // Nobody stands in any line (nearly always): nothing this command
         // does can wake anyone, and there is nothing to collect.
-        self.collecting = crate::wait_table::anyone_in_line();
-        if self.collecting {
+        self.ctl.after = crate::wait_table::anyone_in_line();
+        if self.ctl.after {
             self.collect();
         }
         self.ctl.awaitable = true;
@@ -544,7 +561,7 @@ impl BlockingSlot {
             }
             // Nearly every command: ran while nobody stood in any line,
             // owes nobody a look, and did not wait.
-            if !self.collecting && self.looked.is_empty() {
+            if !self.ctl.after && self.looked.is_empty() {
                 return None;
             }
             return self.looked_or_waits(None);
@@ -560,7 +577,8 @@ impl BlockingSlot {
         // After `resume_over`: a refused resume's ticket, dropped there,
         // passes its turn on, and the client that wakes is this dispatch's to
         // wait for, as the client a handler passes the turn to is.
-        let collected = if self.collecting {
+        // Nothing was collected if it only left values to free: none then.
+        let collected = if self.ctl.after {
             crate::wait_table::take_woken()
         } else {
             None
@@ -593,6 +611,13 @@ impl BlockingSlot {
             // Waited for before the next command of this client that reads
             // (`settles_before`), with those of the commands before it.
             self.woken.append(&mut woken);
+            // Values it left to free before its reply: work for the
+            // connection, handed on as a wait is (`deferred`).
+            if let Some(freeing) = self.ctl.freeing.take() {
+                return Some(BlockingWait::offload(crate::deferred::Offload::Free(
+                    *freeing,
+                )));
+            }
         }
         parked
     }
@@ -824,6 +849,7 @@ pub fn park_with_state(
                 held_by_pause: false,
                 #[cfg(feature = "lua")]
                 tags: None,
+                offload: None,
             });
             ParkOutcome::Parked
         }
@@ -854,6 +880,7 @@ pub fn hold_for_pause(ctx: &mut crate::commands::ctx::Ctx) -> Vec<u8> {
             held_by_pause: true,
             #[cfg(feature = "lua")]
             tags: None,
+            offload: None,
         });
     }
     crate::pause::HELD_IN_GATE.to_vec()
@@ -879,6 +906,7 @@ pub fn hold_for_tags(ctx: &mut crate::commands::ctx::Ctx, busy: crate::tag_locks
             role_epoch: 0,
             held_by_pause: false,
             tags: Some(busy),
+            offload: None,
         });
     }
 }
@@ -1198,6 +1226,26 @@ pub fn parked(ctx: &crate::commands::ctx::Ctx) -> bool {
 }
 
 impl BlockingWait {
+    /// No wait: work for the connection to have done off its thread
+    /// (`deferred::Offload`).
+    pub(crate) fn offload(offload: crate::deferred::Offload) -> Self {
+        BlockingWait {
+            rxs: Vec::new(),
+            timeout: None,
+            state: None,
+            role_epoch: 0,
+            held_by_pause: false,
+            #[cfg(feature = "lua")]
+            tags: None,
+            offload: Some(Box::new(offload)),
+        }
+    }
+
+    /// The work the command left for its connection ([`Self::offload`]).
+    pub fn take_offload(&mut self) -> Option<crate::deferred::Offload> {
+        self.offload.take().map(|offload| *offload)
+    }
+
     /// Take the state stashed at park time, so the loop can hand it to the
     /// resume dispatch. Called before [`wait`](Self::wait), which consumes self.
     pub fn take_state(&mut self) -> Option<BlockState> {
@@ -1330,6 +1378,7 @@ mod tests {
                 held_by_pause: false,
                 #[cfg(feature = "lua")]
                 tags: None,
+                offload: None,
             }
             .wait(),
         )
