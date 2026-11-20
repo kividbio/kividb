@@ -249,7 +249,8 @@ other files:
   `NOQUANT` arrives as a set made without an option, so it then accepts a
   `VADD` with any quantization option, the same as after a snapshot reload.
 - Search: `GEO` and `GEOSHAPE` fields, `GEOFILTER` and `INFIELDS` are
-  refused. Query `TIMEOUT` is accepted but doesn't cut a query short. `INT8`
+  refused. Query `TIMEOUT` (or `search-timeout`) cuts a query short; `ON_TIMEOUT` or
+  `search-on-timeout` chooses a partial reply with a warning, or an error. `INT8`
   and `UINT8` vectors aren't supported. Scores, `NOFREQS`, `PHONETIC`
   (`dm:en`, `dm:fr`, `dm:pt`, `dm:es`: the codes and the scores), the `~` and
   `-` of dialect 1 and the way `FT.AGGREGATE` writes numbers (12 significant
