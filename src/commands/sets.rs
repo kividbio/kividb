@@ -832,10 +832,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         ));
                     }
                     // An array or a block comes back whole, as Redis returns
-                    // an intset or a listpack. (Not `generics::scans_whole`:
-                    // it takes the set's read lock again, and a second read
-                    // on this thread waits behind a writer queued since the
-                    // first, which waits for the first: a deadlock.)
+                    // an intset or a listpack. (The form is told from this
+                    // guard: looking again, as `generics::scans_whole` did,
+                    // takes the set's read lock a second time, and a second
+                    // read on this thread waits behind a writer queued since
+                    // the first, which waits for the first: a deadlock.)
                     let (cursor, count) = (0, usize::MAX);
                     // In the order of the members' positions: see
                     // `helpers::scan_position`.

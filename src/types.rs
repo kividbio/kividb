@@ -1460,7 +1460,10 @@ impl KiviDBValue {
                 KiviDBValue::Set(crate::member_set::shared(set.read().clone()))
             }
             KiviDBValue::VectorSet(set) => KiviDBValue::VectorSet(fresh(set)),
-            KiviDBValue::SortedSet(zset) => KiviDBValue::SortedSet(fresh(zset)),
+            // Through `sorted_set::shared`, as every sorted set made whole.
+            KiviDBValue::SortedSet(zset) => {
+                KiviDBValue::SortedSet(crate::sorted_set::shared(zset.read().clone()))
+            }
             KiviDBValue::Stream(stream) => KiviDBValue::Stream(fresh(stream)),
             KiviDBValue::TimeSeries(series) => KiviDBValue::TimeSeries(fresh(series)),
             KiviDBValue::HashEx(hash) => {
