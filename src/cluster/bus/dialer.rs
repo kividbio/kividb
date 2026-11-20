@@ -418,7 +418,7 @@ pub(super) fn our_ping(state: &ClusterState) -> BusMessage {
         sender_client_port: me.client_port,
         sender_cluster_port: me.cluster_port,
         sender_config_epoch: me.config_epoch,
-        sender_flags: me.flags & (NodeFlags::MASTER | NodeFlags::REPLICA),
+        sender_flags: me.flags & (NodeFlags::MASTER | NodeFlags::REPLICA) | NodeFlags::VOTE_CLAIMS,
         sender_master_id: me.master_id,
         sender_hostname: me.hostname.clone(),
         sender_announced_client_port: me.announced_client_port,

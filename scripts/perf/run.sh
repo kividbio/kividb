@@ -38,6 +38,10 @@
 #   ONLY=<regex>        measure only the workloads whose label matches
 #   PROFILE=1           keep the hottest functions of each workload in
 #                       target/perf/out-<tag>/profile-*.txt
+#   WORKLOADS=zrand     ZRANDMEMBER on a sorted set of about 95,000
+#                       members (#862): no count, 1, 10, 1000, -10
+#                       WITHSCORES, -1000, and ZSCORE beside them; run it
+#                       with N=2000 (a walk of the table is dear)
 #   DNS=1 OFFLINE=      let cargo fetch a new dependency (the image's DNS is
 #                       not always usable; this points it at 1.1.1.1)
 #   FEATURES=lua,tls    build that variant instead of the default one

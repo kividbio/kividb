@@ -8,7 +8,13 @@
 //!   empty block, which allocates nothing.
 //! - **Large.** Past either limit, a hash table of members and an ordered
 //!   tree of `(score, member)`, each holding the member's one `Arc`: rank,
-//!   ranges and lookups by name for sets of any size.
+//!   ranges and lookups by name for sets of any size. The table is held
+//!   directly, so that a bucket can be asked for by its number: a random
+//!   member is a random bucket, tried again while it is empty, as Redis
+//!   picks one (`ZRANDMEMBER`). A table that falls below an eighth full is
+//!   made smaller when that costs the command little (see
+//!   `Large::shrink_if_sparse`), so that is a handful of tries; one too big
+//!   to shrink on the command path is sampled by one walk a command.
 //!
 //! A set moves from the block to the table and the tree, its entries in
 //! order in one pass, when a write would take it past a limit, and never
@@ -24,7 +30,8 @@
 
 use crate::member_set::Member;
 use crate::packed_zset::{self, PackedZset, Score};
-use ahash::AHashMap;
+use hashbrown::HashTable;
+use hashbrown::hash_table::Entry;
 use ordered_float::OrderedFloat;
 use std::collections::BTreeMap;
 use std::collections::btree_map;
@@ -33,7 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A member name stored as a cheaply-cloneable Arc'd byte slice.
-/// Using Arc<[u8]> means cloning the key between the BTreeMap and AHashMap
+/// Using Arc<[u8]> means cloning the key between the BTreeMap and the table
 /// costs only an atomic refcount increment, not a heap allocation.
 pub type ZMember = Arc<[u8]>;
 
@@ -152,8 +159,9 @@ const _: () = assert!(std::mem::size_of::<SortedSetInner>() <= 32);
 /// The large form: dual representation for O(log N) score-ordered
 /// iteration AND O(1) member lookup:
 ///
-///   members:  AHashMap<ZMember, f64>
-///             → "what is this member's score?" — O(1) average
+///   members:  HashTable<(ZMember, f64)>
+///             → "what is this member's score?" — O(1) average; and
+///               "a member at random" — a random bucket, O(1) average
 ///
 ///   by_score: BTreeMap<(OrderedFloat<f64>, ZMember), ()>
 ///             → "give me all members with scores in [lo, hi]" — O(log N) seek + O(M) scan
@@ -165,32 +173,82 @@ const _: () = assert!(std::mem::size_of::<SortedSetInner>() <= 32);
 /// update both atomically (they live inside a single RwLock, so this is safe).
 #[derive(Clone, Default)]
 struct Large {
-    members: AHashMap<ZMember, f64>,
+    /// Each member and its score. A `HashTable` rather than a map, for its
+    /// buckets by number (a random member) and nothing else: the same
+    /// table, the same bytes a member, the same hash.
+    members: HashTable<(ZMember, f64)>,
+    hasher: ahash::RandomState,
     by_score: BTreeMap<(OrderedFloat<f64>, ZMember), ()>,
 }
 
 impl Large {
-    /// Insert or update a member. Returns true if the member is new.
-    /// This is the ONLY place both maps should be written — keeps the invariant.
-    fn insert(&mut self, member: ZMember, score: f64) -> bool {
-        if let Some(&old_score) = self.members.get(&member) {
-            // Member exists — remove old position in the score index first
-            self.by_score
-                .remove(&(OrderedFloat(old_score), member.clone()));
-            self.members.insert(member.clone(), score);
-            self.by_score.insert((OrderedFloat(score), member), ());
-            false // not new
-        } else {
-            self.members.insert(member.clone(), score);
-            self.by_score.insert((OrderedFloat(score), member), ());
-            true // new member
+    fn with_capacity(members: usize) -> Self {
+        Self {
+            members: HashTable::with_capacity(members),
+            ..Self::default()
         }
     }
 
-    /// Remove a member. Returns true if it existed.
-    fn remove(&mut self, member: &[u8]) -> bool {
-        // Retrieve the owned key directly, avoiding a linear scan of the member map.
-        match self.members.remove_entry(member) {
+    #[inline]
+    fn hash(&self, member: &[u8]) -> u64 {
+        self.hasher.hash_one(member)
+    }
+
+    /// The member's own `Arc` and its score.
+    #[inline]
+    fn get(&self, member: &[u8]) -> Option<&(ZMember, f64)> {
+        self.members
+            .find(self.hash(member), |(have, _)| &**have == member)
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Insert or update a member. Returns true if the member is new.
+    /// This is the ONLY place both maps should be written — keeps the invariant.
+    fn insert(&mut self, member: ZMember, score: f64) -> bool {
+        let hash = self.hash(&member);
+        let hasher = &self.hasher;
+        match self.members.entry(
+            hash,
+            |(have, _)| **have == *member,
+            |(have, _)| hasher.hash_one(&**have),
+        ) {
+            Entry::Occupied(mut found) => {
+                // Member exists — remove old position in the score index
+                // first. The table keeps its own key, as a map would.
+                let old_score = std::mem::replace(&mut found.get_mut().1, score);
+                self.by_score
+                    .remove(&(OrderedFloat(old_score), member.clone()));
+                self.by_score.insert((OrderedFloat(score), member), ());
+                false // not new
+            }
+            Entry::Vacant(place) => {
+                place.insert((member.clone(), score));
+                self.by_score.insert((OrderedFloat(score), member), ());
+                true // new member
+            }
+        }
+    }
+
+    /// Take the member out of the table alone: its `Arc` and score. The
+    /// table is not made smaller here: see [`Self::shrink_if_sparse`].
+    fn take(&mut self, member: &[u8]) -> Option<(ZMember, f64)> {
+        let hash = self.hash(member);
+        let found = self
+            .members
+            .find_entry(hash, |(have, _)| &**have == member)
+            .ok()?;
+        let (taken, _) = found.remove();
+        Some(taken)
+    }
+
+    /// Remove a member from both indexes, the table left its size. Returns
+    /// true if it existed.
+    fn remove_only(&mut self, member: &[u8]) -> bool {
+        match self.take(member) {
             Some((arc_member, score)) => {
                 let indexed = self.by_score.remove(&(OrderedFloat(score), arc_member));
                 debug_assert!(indexed.is_some(), "member missing from by_score");
@@ -200,18 +258,148 @@ impl Large {
         }
     }
 
+    /// Remove a member. Returns true if it existed.
+    fn remove(&mut self, member: &[u8]) -> bool {
+        let removed = self.remove_only(member);
+        if removed {
+            self.shrink_if_sparse(0);
+        }
+        removed
+    }
+
     fn pop_min(&mut self) -> Option<(ZMember, f64)> {
         let ((score, member), _) = self.by_score.pop_first()?;
-        self.members.remove(member.as_ref());
+        self.take(&member);
+        self.shrink_if_sparse(0);
         Some((member, score.0))
     }
 
     fn pop_max(&mut self) -> Option<(ZMember, f64)> {
         let ((score, member), _) = self.by_score.pop_last()?;
-        self.members.remove(member.as_ref());
+        self.take(&member);
+        self.shrink_if_sparse(0);
         Some((member, score.0))
     }
+
+    /// Whether the table is less than an eighth full (and more than a few
+    /// buckets): a random bucket of it is more often empty than not.
+    #[inline]
+    fn is_sparse(&self) -> bool {
+        let buckets = self.members.num_buckets();
+        buckets > 64 && self.members.len() * 8 < buckets
+    }
+
+    /// A table that has lost most of its members is made smaller, when that
+    /// costs the command little next to what it did: it would otherwise
+    /// keep the memory of its largest size, and a random bucket of it would
+    /// nearly always be an empty one.
+    ///
+    /// `work` is the members the command wrote or removed (0 for a single
+    /// removal, `ZREM` or `ZPOP*`). A table of up to
+    /// [`SHRINK_INLINE_BUCKETS`] buckets, or eight times `work`, is shrunk:
+    /// a single removal then moves fewer than 8,192 members (0.23 ms) and
+    /// frees 1.5 MB at most. A bigger one is kept as it is (as it was before
+    /// tables shrank), because giving its memory back stalls the command:
+    /// freeing the 2^21 buckets of a million-member table took 20 ms on a
+    /// `Standard_D4s_v5`, and even on the lazy-free thread a `ZPOPMIN` that
+    /// handed it over took 14 ms (the unmapping holds the process's memory
+    /// map). Sampling a sparse table walks it once a command (see
+    /// [`Self::try_bucket`]).
+    fn shrink_if_sparse(&mut self, work: usize) {
+        if !self.is_sparse()
+            || self.members.num_buckets() > SHRINK_INLINE_BUCKETS.max(work.saturating_mul(8))
+        {
+            return;
+        }
+        let hasher = &self.hasher;
+        let mut smaller = HashTable::with_capacity(self.members.len() * 2);
+        for entry in self.members.drain() {
+            smaller.insert_unique(hasher.hash_one(&*entry.0), entry, |(have, _)| {
+                hasher.hash_one(&**have)
+            });
+        }
+        let emptied = std::mem::replace(&mut self.members, smaller);
+        if emptied.num_buckets() > SHRINK_INLINE_BUCKETS {
+            // A command that did as much work as the table is big (a bulk
+            // removal, a `ZADD` of members given many times): its memory
+            // goes back off the command path. Not an object of the
+            // keyspace's: `INFO`'s lazy-free counts are left as they are.
+            crate::lazyfree::free_later(emptied, 0);
+        }
+    }
+
+    /// The bucket of a member picked at random, any one as likely as
+    /// another, in at most sixty-four tries: `None` if the set is empty or
+    /// every try found an empty bucket.
+    ///
+    /// A bucket picked at random is taken if it holds a member and picked
+    /// again if not: each try is every bucket alike, so the one taken is
+    /// every member alike. A table at least an eighth full misses sixty-four
+    /// times in a row about once in five thousand picks; one left sparse
+    /// (reserved for more than came, or too big to shrink on the command
+    /// path) misses more often, and a caller then picks by a walk instead,
+    /// which is uniform too. Whether the tries miss depends on which
+    /// buckets are full, not on which member a hit would give, so switching
+    /// to a walk keeps every pick uniform.
+    #[inline]
+    fn try_bucket(&self, rng: &mut impl rand::Rng) -> Option<usize> {
+        if self.members.is_empty() {
+            return None;
+        }
+        let buckets = self.members.num_buckets();
+        for _ in 0..64 {
+            let at = rng.gen_range(0..buckets);
+            if self.members.get_bucket(at).is_some() {
+                return Some(at);
+            }
+        }
+        None
+    }
+
+    /// A member and its score, picked at random: a random bucket, or after
+    /// sixty-four misses a walk to a random member.
+    fn random(&self, rng: &mut impl rand::Rng) -> Option<&(ZMember, f64)> {
+        if let Some(at) = self.try_bucket(rng) {
+            return self.members.get_bucket(at);
+        }
+        use rand::seq::IteratorRandom;
+        self.members.iter().choose(rng)
+    }
+
+    /// `count` different members, picked at random, in a random order, for
+    /// a count of no more than a third of the set: one bucket at a time, a
+    /// bucket that comes up twice picked again. Each pick is every member
+    /// not yet picked alike, so the sample is as `rand::seq::index::sample`
+    /// would give; the expected tries are at most twelve a member (a table
+    /// an eighth full, the third of it already picked). `None` if a pick
+    /// missed sixty-four times (a sparse table): the caller then samples by
+    /// one walk, and what was picked so far is dropped, which is fair, as
+    /// the misses do not depend on which members were picked.
+    fn random_distinct(
+        &self,
+        count: usize,
+        rng: &mut impl rand::Rng,
+    ) -> Option<Vec<&(ZMember, f64)>> {
+        debug_assert!(count <= self.len());
+        let mut seen: ahash::AHashSet<usize> = ahash::AHashSet::with_capacity(count);
+        let mut picked = Vec::with_capacity(count);
+        while picked.len() < count {
+            let at = self.try_bucket(rng)?;
+            if seen.insert(at)
+                && let Some(entry) = self.members.get_bucket(at)
+            {
+                picked.push(entry);
+            }
+        }
+        Some(picked)
+    }
 }
+
+/// The biggest table (1.5 MB of buckets) a single removal (`ZREM`,
+/// `ZPOP*`) makes smaller: it moves fewer than 8,192 members, about 0.23 ms
+/// on a `Standard_D4s_v5` (4,096 take 0.08 ms, 16,384 0.64 ms; see the
+/// `shrink_cost` test).
+const SHRINK_INLINE_BUCKETS: usize = 1 << 16;
 
 impl SortedSetInner {
     pub fn new() -> Self {
@@ -275,17 +463,21 @@ impl SortedSetInner {
         let Repr::Packed(block) = &self.repr else {
             return;
         };
-        let mut members = AHashMap::with_capacity(block.len() + more);
+        let mut large = Large::with_capacity(block.len() + more);
         let mut keys = Vec::with_capacity(block.len());
         for (member, score) in block.iter() {
             let member: ZMember = Arc::from(member);
-            members.insert(Arc::clone(&member), score);
+            // A block's members are distinct.
+            let hasher = &large.hasher;
+            large.members.insert_unique(
+                hasher.hash_one(&*member),
+                (Arc::clone(&member), score),
+                |(have, _)| hasher.hash_one(&**have),
+            );
             keys.push(((OrderedFloat(score), member), ()));
         }
-        self.repr = Repr::Large(Box::new(Large {
-            members,
-            by_score: keys.into_iter().collect(),
-        }));
+        large.by_score = keys.into_iter().collect();
+        self.repr = Repr::Large(Box::new(large));
     }
 
     #[inline]
@@ -366,8 +558,8 @@ impl SortedSetInner {
                     out
                 }
             },
-            Repr::Large(large) => match large.members.get_key_value(member) {
-                Some((key, &old)) => {
+            Repr::Large(large) => match large.get(member) {
+                Some(&(ref key, old)) => {
                     let (score, out) = decide(Some(old));
                     if let Some(score) = score {
                         let score = score + 0.0;
@@ -450,7 +642,7 @@ impl SortedSetInner {
     pub fn score(&self, member: &[u8]) -> Option<f64> {
         match &self.repr {
             Repr::Packed(block) => block.find(member).map(|i| block.score(i)),
-            Repr::Large(large) => large.members.get(member).copied(),
+            Repr::Large(large) => large.get(member).map(|&(_, score)| score),
         }
     }
 
@@ -459,7 +651,8 @@ impl SortedSetInner {
         match &self.repr {
             Repr::Packed(block) => block.find(member).map(|i| (i, block.score(i))),
             Repr::Large(large) => {
-                let (stored, &score) = large.members.get_key_value(member)?;
+                let (stored, score) = large.get(member)?;
+                let score = *score;
                 let rank = large
                     .by_score
                     .range(..(OrderedFloat(score), Arc::clone(stored)))
@@ -509,7 +702,7 @@ impl SortedSetInner {
                 large
                     .members
                     .iter()
-                    .map(|(member, &score)| (Member::Shared(member), score)),
+                    .map(|(member, score)| (Member::Shared(member), *score)),
             ),
         }
     }
@@ -528,7 +721,7 @@ impl SortedSetInner {
             Repr::Large(large) => {
                 let (page, next_cursor) = scan_page(
                     prefetched(large.members.iter(), |(member, _)| member.as_ptr())
-                        .map(|(member, &score)| (scan_position(member), (member, score))),
+                        .map(|(member, score)| (scan_position(member), (member, *score))),
                     cursor,
                     count,
                     large.members.len(),
@@ -579,8 +772,112 @@ impl SortedSetInner {
         (from, to)
     }
 
+    /// A member and its score, any one as likely as another (`ZRANDMEMBER`):
+    /// a block's by its index, the large form's by a random bucket of its
+    /// table. Neither depends on how many members there are.
+    pub fn random(&self, rng: &mut impl rand::Rng) -> Option<(Member<'_>, f64)> {
+        match &self.repr {
+            Repr::Packed(block) if block.is_empty() => None,
+            Repr::Packed(block) => {
+                let (member, score) = block.get(rng.gen_range(0..block.len()));
+                Some((Member::Bytes(member), score))
+            }
+            Repr::Large(large) => large
+                .random(rng)
+                .map(|(member, score)| (Member::Shared(member), *score)),
+        }
+    }
+
+    /// `count` different members and their scores, picked at random, in a
+    /// random order (`ZRANDMEMBER` with a positive count); all of them if
+    /// `count` is the size of the set or more, but then in no order that
+    /// was picked.
+    ///
+    /// A few of many (no more than a third) are picked a bucket at a time,
+    /// a bucket that comes up twice picked again. More are found by one walk
+    /// of the table to the last of the positions chosen, which is then no
+    /// more work than the answer is long. A block is asked for the chosen
+    /// places only. Every way gives each set of `count` members, in each
+    /// order, alike. A table too sparse to pick from by bucket (see
+    /// `Large::try_bucket`) is walked once, whatever the count: no call
+    /// costs more than one walk of the table and the count.
+    pub fn random_distinct(
+        &self,
+        count: usize,
+        rng: &mut impl rand::Rng,
+    ) -> Vec<(Member<'_>, f64)> {
+        let len = self.len();
+        let count = count.min(len);
+        if let Repr::Large(large) = &self.repr
+            && count * 3 <= len
+            && let Some(picked) = large.random_distinct(count, rng)
+        {
+            return picked
+                .into_iter()
+                .map(|(member, score)| (Member::Shared(member), *score))
+                .collect();
+        }
+        self.members_at(&rand::seq::index::sample(rng, len, count).into_vec())
+    }
+
+    /// `count` members picked at random, each on its own (so they may
+    /// repeat), handed to `f` in the order picked (`ZRANDMEMBER` with a
+    /// negative count). A block's by index; the large form's by random
+    /// bucket while the buckets tried hold members, and if a pick misses
+    /// sixty-four times (a sparse table), every pick left by one walk of the
+    /// table: a call costs at most one walk and the count, as the walk alone
+    /// did before. Whether a pick misses does not depend on which member a
+    /// hit would give, so every pick is every member alike either way.
+    pub fn random_each(
+        &self,
+        count: usize,
+        rng: &mut impl rand::Rng,
+        mut f: impl FnMut(Member<'_>, f64),
+    ) {
+        let len = self.len();
+        if len == 0 {
+            return;
+        }
+        let large = match &self.repr {
+            Repr::Packed(block) => {
+                for _ in 0..count {
+                    let (member, score) = block.get(rng.gen_range(0..len));
+                    f(Member::Bytes(member), score);
+                }
+                return;
+            }
+            Repr::Large(large) => large,
+        };
+        let mut done = 0;
+        while done < count {
+            let Some((member, score)) = large
+                .try_bucket(rng)
+                .and_then(|at| large.members.get_bucket(at))
+            else {
+                break;
+            };
+            f(Member::Shared(member), *score);
+            done += 1;
+        }
+        if done < count {
+            let picks: Vec<usize> = (done..count).map(|_| rng.gen_range(0..len)).collect();
+            for (member, score) in self.members_at(&picks) {
+                f(member, score);
+            }
+        }
+    }
+
+    /// After a command has written `written` members: a table it reserved
+    /// for more than came (`ZADD` of members given twice) is made smaller,
+    /// which moves no more members than the command wrote.
+    pub fn settle(&mut self, written: usize) {
+        if let Repr::Large(large) = &mut self.repr {
+            large.shrink_if_sparse(written);
+        }
+    }
+
     /// Members at positions of `iter_unordered`, in the order given; may repeat.
-    pub fn members_at(&self, picks: &[usize]) -> Vec<(Member<'_>, f64)> {
+    fn members_at(&self, picks: &[usize]) -> Vec<(Member<'_>, f64)> {
         let large = match &self.repr {
             Repr::Packed(block) => {
                 return picks
@@ -608,7 +905,7 @@ impl SortedSetInner {
                     Some(at) => want - at - 1,
                     None => want,
                 };
-                last = walk.nth(skip).map(|(member, &score)| (member, score));
+                last = walk.nth(skip).map(|(member, score)| (member, *score));
                 at = Some(want);
             }
             out[slot] = last;
@@ -635,8 +932,10 @@ impl SortedSetInner {
                     .collect();
                 let large = self.large_mut();
                 for member in &gone {
-                    large.remove(member);
+                    large.remove_only(member);
                 }
+                // Once, at the end: the command has paid for as many.
+                large.shrink_if_sparse(gone.len());
                 gone.len()
             }
         }
@@ -661,8 +960,10 @@ impl SortedSetInner {
                     .collect();
                 let large = self.large_mut();
                 for member in &gone {
-                    large.remove(member);
+                    large.remove_only(member);
                 }
+                // Once, at the end: the command has paid for as many.
+                large.shrink_if_sparse(gone.len());
                 gone.len()
             }
         }
@@ -680,8 +981,10 @@ impl SortedSetInner {
                     .collect();
                 let large = self.large_mut();
                 for member in &members {
-                    large.remove(member);
+                    large.remove_only(member);
                 }
+                // Once, at the end: the command has paid for as many.
+                large.shrink_if_sparse(members.len());
                 members.len()
             }
         }
@@ -1060,7 +1363,7 @@ mod tests {
         let zs = large(zs);
         assert_eq!(zs.members.len(), zs.by_score.len());
         for (score, member) in zs.by_score.keys() {
-            assert_eq!(zs.members.get(member.as_ref()), Some(&score.0));
+            assert_eq!(zs.get(member.as_ref()).map(|e| e.1), Some(score.0));
         }
     }
 
@@ -1134,7 +1437,7 @@ mod tests {
         zs.insert_bytes(b"a", 1.0);
         zs.upsert(b"a", |_| (Some(2.0), ()));
         let large = large(&zs);
-        let (key, _) = large.members.get_key_value(&b"a"[..]).unwrap();
+        let (key, _) = large.get(b"a").unwrap();
         assert_eq!(Arc::strong_count(key), 2);
         assert_eq!(zs.score(b"a"), Some(2.0));
     }
@@ -1472,5 +1775,303 @@ mod tests {
     fn a_handle_is_no_bigger_than_a_block() {
         assert!(std::mem::size_of::<SortedSetInner>() <= 32);
         assert_eq!(SortedSetInner::new().packed_bytes(), Some(0));
+    }
+
+    /// A set of `n` members `m0..`, `mI` with score `I`, in either form.
+    fn numbered(n: usize, packed: bool) -> SortedSetInner {
+        let mut zs = if packed {
+            SortedSetInner::new()
+        } else {
+            made_large()
+        };
+        for i in 0..n {
+            zs.insert_bytes(format!("m{i}").as_bytes(), i as f64);
+        }
+        assert_eq!(zs.is_packed(), packed);
+        zs
+    }
+
+    fn index_of(member: &[u8]) -> usize {
+        std::str::from_utf8(&member[1..]).unwrap().parse().unwrap()
+    }
+
+    /// Pearson's statistic of `counts` against equal expectation, and a
+    /// bound seven standard deviations over its mean: a fair draw is over
+    /// it about once in a billion.
+    fn chi_square_fails(counts: &[u64]) -> Option<(f64, f64)> {
+        let total: u64 = counts.iter().sum();
+        let expected = total as f64 / counts.len() as f64;
+        let x: f64 = counts
+            .iter()
+            .map(|&o| (o as f64 - expected).powi(2) / expected)
+            .sum();
+        let df = (counts.len() - 1) as f64;
+        let bound = df + 7.0 * (2.0 * df).sqrt();
+        (x >= bound).then_some((x, bound))
+    }
+
+    /// Every member is as likely as any other, one at a time and in a
+    /// distinct sample (counted where it falls in the reply too, so the
+    /// order is random), in both forms; the score is the member's own.
+    #[test]
+    fn random_picks_are_uniform_in_both_forms() {
+        let mut rng = rand::thread_rng();
+        for (n, packed) in [(100, true), (100, false), (1000, false)] {
+            let zs = numbered(n, packed);
+            let mut one = vec![0u64; n];
+            for _ in 0..20 * n {
+                let (member, score) = zs.random(&mut rng).unwrap();
+                assert_eq!(index_of(&member) as f64, score);
+                one[index_of(&member)] += 1;
+            }
+            assert_eq!(chi_square_fails(&one), None, "one, n {n} packed {packed}");
+            // A third of the set (picked a bucket at a time) and most of it
+            // (one walk), and one.
+            for count in [1, n / 10, n / 3, n / 3 + 1, n - 1] {
+                let mut all = vec![0u64; n];
+                let mut first = vec![0u64; n];
+                let mut last = vec![0u64; n];
+                // At least five first and last picks a member expected.
+                for _ in 0..(40 * n / count).max(5 * n) {
+                    let sample = zs.random_distinct(count, &mut rng);
+                    assert_eq!(sample.len(), count);
+                    let distinct: BTreeSet<usize> =
+                        sample.iter().map(|(m, _)| index_of(m)).collect();
+                    assert_eq!(distinct.len(), count, "repeats in {count} of {n}");
+                    for (member, score) in &sample {
+                        assert_eq!(index_of(member) as f64, *score);
+                        all[index_of(member)] += 1;
+                    }
+                    first[index_of(&sample[0].0)] += 1;
+                    last[index_of(&sample[count - 1].0)] += 1;
+                }
+                assert_eq!(
+                    chi_square_fails(&all),
+                    None,
+                    "{count} of {n}, packed {packed}"
+                );
+                assert_eq!(chi_square_fails(&first), None, "first, {count} of {n}");
+                assert_eq!(chi_square_fails(&last), None, "last, {count} of {n}");
+            }
+        }
+    }
+
+    /// A count of the size of the set or more is every member once; none
+    /// is none; an empty set has nothing to pick.
+    #[test]
+    fn random_distinct_edges() {
+        let mut rng = rand::thread_rng();
+        for packed in [true, false] {
+            let zs = numbered(100, packed);
+            for count in [100, 101, usize::MAX] {
+                let mut got: Vec<usize> = zs
+                    .random_distinct(count, &mut rng)
+                    .iter()
+                    .map(|(m, _)| index_of(m))
+                    .collect();
+                got.sort_unstable();
+                assert_eq!(got, (0..100).collect::<Vec<_>>());
+            }
+            assert!(zs.random_distinct(0, &mut rng).is_empty());
+        }
+        let mut zs = made_large();
+        assert!(zs.random(&mut rng).is_none());
+        assert!(zs.random_distinct(3, &mut rng).is_empty());
+        zs.insert_bytes(b"m0", 0.0);
+        assert_eq!(&*zs.random(&mut rng).unwrap().0, b"m0");
+        assert!(SortedSetInner::new().random(&mut rng).is_none());
+    }
+
+    /// A big table emptied of most of its members one at a time is kept at
+    /// its size (shrinking it would stall a command), and the picks stay
+    /// uniform, by the walk; so they do from one reserved far beyond its
+    /// members.
+    #[test]
+    fn random_picks_stay_uniform_in_a_sparse_table() {
+        let mut rng = rand::thread_rng();
+        let mut zs = numbered(100_000, false);
+        let big = large(&zs).members.num_buckets();
+        // Every member but m0..m49 by every remover: one at a time, the
+        // lowest, the highest, by rank and by score.
+        assert_eq!(zs.remove_ranks(90_000, 99_999), 10_000);
+        assert_eq!(
+            zs.remove_range_by_score((
+                Bound::Included((OrderedFloat(50_000.0), m(b""))),
+                Bound::Unbounded
+            )),
+            40_000
+        );
+        for i in 50..40_000 {
+            assert!(zs.remove(format!("m{i}").as_bytes()));
+        }
+        while zs.len() > 50 {
+            zs.pop_max();
+        }
+        assert_in_sync(&zs);
+        assert_eq!(large(&zs).members.num_buckets(), big);
+        assert!(large(&zs).is_sparse());
+        let mut one = vec![0u64; 50];
+        for _ in 0..50 * 400 {
+            one[index_of(&zs.random(&mut rng).unwrap().0)] += 1;
+        }
+        assert_eq!(chi_square_fails(&one), None);
+
+        // Reserved for a hundred thousand, holding two hundred.
+        let mut zs = SortedSetInner::new();
+        zs.expect(100_000);
+        for i in 0..200 {
+            zs.insert_bytes(format!("m{i}").as_bytes(), i as f64);
+        }
+        assert!(large(&zs).members.num_buckets() > 200 * 256);
+        let mut one = vec![0u64; 200];
+        for _ in 0..200 * 100 {
+            one[index_of(&zs.random(&mut rng).unwrap().0)] += 1;
+        }
+        assert_eq!(chi_square_fails(&one), None);
+        let sample = zs.random_distinct(50, &mut rng);
+        let distinct: BTreeSet<usize> = sample.iter().map(|(m, _)| index_of(m)).collect();
+        assert_eq!(distinct.len(), 50);
+    }
+    /// A table reserved for a hundred thousand and holding one member, or a
+    /// thousand: every pick misses often, and a call falls back to one walk
+    /// for all its picks, so a hundred thousand picks cost about one walk,
+    /// not a hundred thousand; and they are still every member alike.
+    #[test]
+    fn a_sparse_table_is_sampled_in_one_walk_a_call() {
+        let mut rng = rand::thread_rng();
+        for n in [1usize, 1000] {
+            let mut zs = SortedSetInner::new();
+            zs.expect(100_000);
+            for i in 0..n {
+                zs.insert_bytes(format!("m{i}").as_bytes(), i as f64);
+            }
+            assert!(large(&zs).is_sparse());
+            let start = std::time::Instant::now();
+            let mut counts = vec![0u64; n];
+            let mut picks = 0;
+            zs.random_each(100_000, &mut rng, |member, score| {
+                assert_eq!(index_of(&member) as f64, score);
+                counts[index_of(&member)] += 1;
+                picks += 1;
+            });
+            assert_eq!(picks, 100_000);
+            let sample = zs.random_distinct(n / 3, &mut rng);
+            let distinct: BTreeSet<usize> = sample.iter().map(|(m, _)| index_of(m)).collect();
+            assert_eq!(distinct.len(), n / 3);
+            let took = start.elapsed();
+            // A walk a pick would be 100,000 walks of 131,072 buckets.
+            assert!(
+                took < std::time::Duration::from_secs(3),
+                "{n} members: {took:?}"
+            );
+            if n > 1 {
+                assert_eq!(chi_square_fails(&counts), None, "picks of {n}");
+                // Distinct samples on the walk path: every member alike.
+                let mut all = vec![0u64; n];
+                let mut first = vec![0u64; n];
+                for _ in 0..(5 * n) {
+                    let sample = zs.random_distinct(50, &mut rng);
+                    for (member, _) in &sample {
+                        all[index_of(member)] += 1;
+                    }
+                    first[index_of(&sample[0].0)] += 1;
+                }
+                assert_eq!(chi_square_fails(&all), None, "distinct of {n}");
+                assert_eq!(chi_square_fails(&first), None, "first of distinct of {n}");
+            }
+            // What a ZADD does after its writes: as small as what came.
+            zs.settle(100_000);
+            assert!(!large(&zs).is_sparse());
+            assert_eq!(zs.len(), n);
+        }
+    }
+
+    /// A single removal makes a table smaller only if it has no more than
+    /// `SHRINK_INLINE_BUCKETS` buckets; a bulk removal, one of up to eight
+    /// buckets a member it removed; a bigger sparse table is kept.
+    #[test]
+    fn a_shrink_on_the_command_path_is_bounded() {
+        // 30,000 members: 65,536 buckets. Shrunk by a pop once sparse.
+        let mut zs = numbered(30_000, false);
+        let buckets = large(&zs).members.num_buckets();
+        assert_eq!(buckets, SHRINK_INLINE_BUCKETS);
+        while zs.len() > 8_192 {
+            zs.pop_min();
+        }
+        assert_eq!(large(&zs).members.num_buckets(), buckets);
+        // The first pop that leaves it less than an eighth full.
+        zs.pop_min();
+        assert!(large(&zs).members.num_buckets() < buckets);
+        assert!(!large(&zs).is_sparse());
+        assert_in_sync(&zs);
+
+        // 100,000 members: 131,072 buckets. Popped to 100: kept.
+        let mut zs = numbered(100_000, false);
+        let buckets = large(&zs).members.num_buckets();
+        assert!(buckets > SHRINK_INLINE_BUCKETS);
+        while zs.len() > 100 {
+            zs.pop_min();
+        }
+        assert!(large(&zs).is_sparse());
+        assert_eq!(large(&zs).members.num_buckets(), buckets);
+        assert_in_sync(&zs);
+        // A bulk removal of the rest but one shrinks it only if it removed
+        // an eighth as many members as there are buckets: 99 do not.
+        assert_eq!(zs.remove_ranks(0, 98), 99);
+        assert_eq!(large(&zs).members.num_buckets(), buckets);
+
+        // A bulk removal of most of the set shrinks once, at the end.
+        let mut zs = numbered(100_000, false);
+        assert_eq!(zs.remove_ranks(0, 89_999), 90_000);
+        assert!(!large(&zs).is_sparse());
+        assert!(large(&zs).members.num_buckets() < buckets);
+        assert_in_sync(&zs);
+    }
+
+    /// What moving `n` members into a smaller table costs, and freeing a
+    /// big one: printed, for the choice of `SHRINK_INLINE_BUCKETS`. Run with `--release -- --ignored
+    /// --nocapture shrink_cost`.
+    #[test]
+    #[ignore]
+    fn shrink_cost() {
+        for n in [4_096usize, 8_192, 16_384, 65_536, 262_144, 2_097_152] {
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..5 {
+                let mut large = Large::with_capacity(n * 8);
+                for i in 0..n {
+                    large.insert(Arc::from(format!("membr:{i}").as_bytes()), i as f64);
+                }
+                let start = std::time::Instant::now();
+                large.shrink_if_sparse(usize::MAX);
+                best = best.min(start.elapsed());
+                assert!(!large.is_sparse());
+            }
+            println!("shrink of {n} members: {best:?}");
+        }
+        // A million members taken down to 8,192, one at a time: what
+        // shrinking that table would cost (it is not shrunk on the command
+        // path), and its parts.
+        let mut large = Large::default();
+        for i in 0..1_000_000usize {
+            large.insert(Arc::from(format!("membr:{i}").as_bytes()), i as f64);
+        }
+        for i in 0..1_000_000 - 8_192 {
+            large.take(format!("membr:{i}").as_bytes());
+        }
+        let mut copy = large.clone();
+        let start = std::time::Instant::now();
+        large.shrink_if_sparse(usize::MAX);
+        let whole = start.elapsed();
+        assert!(!large.is_sparse());
+        let start = std::time::Instant::now();
+        let entries: Vec<_> = copy.members.drain().collect();
+        let drained = start.elapsed();
+        let start = std::time::Instant::now();
+        drop(copy);
+        let freed = start.elapsed();
+        println!(
+            "shrink from 2^21 buckets to {}: {whole:?} (drain {drained:?}, free in place {freed:?})",
+            entries.len()
+        );
     }
 }

@@ -15706,6 +15706,2024 @@
         }
       ]
     },
+    "37-zrandmember-by-count/n100k/bad_replies": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "bad_replies",
+      "unit": "replies",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.0,
+        "candidate": 0.0,
+        "redis": 0.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/c1000_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "c1000_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 398.9333,
+        "candidate": 86.93,
+        "redis": 474.1067,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/c1000_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "c1000_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1104.0534,
+        "candidate": 788.9259,
+        "redis": 1167.6839,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/c1000_ws_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "c1000_ws_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 592.21,
+        "candidate": 131.91,
+        "redis": 534.7533,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/c1000_ws_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "c1000_ws_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1938.3144,
+        "candidate": 1469.468,
+        "redis": 1854.152,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/c10_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "c10_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 263.83,
+        "candidate": 1.2867,
+        "redis": 6.58,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/c10_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "c10_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 331.6192,
+        "candidate": 56.7493,
+        "redis": 60.2573,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/c10_ws_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "c10_ws_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 266.8933,
+        "candidate": 2.0267,
+        "redis": 6.9233,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/c10_ws_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "c10_ws_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 338.9165,
+        "candidate": 64.8584,
+        "redis": 68.9646,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/c1_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "c1_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 260.5967,
+        "candidate": 0.4867,
+        "redis": 1.16,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/c1_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "c1_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 321.3258,
+        "candidate": 49.3095,
+        "redis": 49.1564,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/c1_ws_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "c1_ws_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 262.73,
+        "candidate": 1.0033,
+        "redis": 1.1867,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/c1_ws_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "c1_ws_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 323.6594,
+        "candidate": 56.3057,
+        "redis": 50.0322,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/m1000_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "m1000_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 377.2367,
+        "candidate": 128.3767,
+        "redis": 341.0433,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/m1000_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "m1000_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1061.6066,
+        "candidate": 833.2205,
+        "redis": 1026.6486,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/m1000_ws_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "m1000_ws_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 549.88,
+        "candidate": 207.77,
+        "redis": 451.1,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/m1000_ws_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "m1000_ws_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1877.3756,
+        "candidate": 1547.0488,
+        "redis": 1791.5532,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/m10_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "m10_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 232.6,
+        "candidate": 2.3333,
+        "redis": 4.6433,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/m10_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "m10_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 302.5821,
+        "candidate": 60.3095,
+        "redis": 57.4231,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/m10_ws_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "m10_ws_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 235.5733,
+        "candidate": 2.8367,
+        "redis": 5.5,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/m10_ws_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "m10_ws_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 307.065,
+        "candidate": 68.7287,
+        "redis": 66.0681,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/none_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "none_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 231.3733,
+        "candidate": 0.06,
+        "redis": 2.0233,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/none_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "none_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 288.3787,
+        "candidate": 46.7916,
+        "redis": 50.7629,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n100k/zcard": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n100k",
+      "metric": "zcard",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 100000.0,
+        "candidate": 100000.0,
+        "redis": 100000.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/bad_replies": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "bad_replies",
+      "unit": "replies",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.0,
+        "candidate": 0.0,
+        "redis": 0.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/c1000_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "c1000_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 72.271,
+        "candidate": 14.757,
+        "redis": 49.921,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/c1000_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "c1000_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 757.5899,
+        "candidate": 700.1877,
+        "redis": 729.9289,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/c1000_ws_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "c1000_ws_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 156.432,
+        "candidate": 26.083,
+        "redis": 69.003,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/c1000_ws_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "c1000_ws_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1478.2711,
+        "candidate": 1337.6837,
+        "redis": 1387.8637,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/c10_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "c10_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.505,
+        "candidate": 1.013,
+        "redis": 3.471,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/c10_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "c10_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 60.6832,
+        "candidate": 55.1363,
+        "redis": 55.7839,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/c10_ws_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "c10_ws_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4.043,
+        "candidate": 1.141,
+        "redis": 4.495,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/c10_ws_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "c10_ws_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 66.8954,
+        "candidate": 62.9905,
+        "redis": 71.7672,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/c1_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "c1_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.384,
+        "candidate": 0.09,
+        "redis": 0.701,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/c1_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "c1_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 51.8346,
+        "candidate": 48.8332,
+        "redis": 49.325,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/c1_ws_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "c1_ws_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.015,
+        "candidate": 0.171,
+        "redis": 1.221,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/c1_ws_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "c1_ws_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 53.5867,
+        "candidate": 50.5616,
+        "redis": 57.8342,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/m1000_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "m1000_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 68.361,
+        "candidate": 66.414,
+        "redis": 166.066,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/m1000_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "m1000_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 748.9676,
+        "candidate": 743.8945,
+        "redis": 846.5439,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/m1000_ws_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "m1000_ws_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 150.696,
+        "candidate": 78.683,
+        "redis": 187.217,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/m1000_ws_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "m1000_ws_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1469.0276,
+        "candidate": 1390.3789,
+        "redis": 1504.759,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/m10_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "m10_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.137,
+        "candidate": 0.985,
+        "redis": 2.31,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/m10_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "m10_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 58.7291,
+        "candidate": 55.3557,
+        "redis": 54.5533,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/m10_ws_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "m10_ws_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4.114,
+        "candidate": 1.012,
+        "redis": 3.02,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/m10_ws_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "m10_ws_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 65.5896,
+        "candidate": 62.6148,
+        "redis": 68.5575,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/none_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "none_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.028,
+        "candidate": 0.011,
+        "redis": 0.639,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/none_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "none_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 49.4281,
+        "candidate": 47.3044,
+        "redis": 45.3897,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1k/zcard": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1k",
+      "metric": "zcard",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1000.0,
+        "candidate": 1000.0,
+        "redis": 1000.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/bad_replies": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "bad_replies",
+      "unit": "replies",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.0,
+        "candidate": 0.0,
+        "redis": 0.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/c1000_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "c1000_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5731.34,
+        "candidate": 158.9467,
+        "redis": 710.6333,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/c1000_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "c1000_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 6441.0301,
+        "candidate": 858.4455,
+        "redis": 1438.7711,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/c1000_ws_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "c1000_ws_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 6857.0667,
+        "candidate": 215.7,
+        "redis": 739.9867,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/c1000_ws_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "c1000_ws_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 8317.6337,
+        "candidate": 1547.9126,
+        "redis": 2095.2111,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/c10_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "c10_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5316.2067,
+        "candidate": 3.18,
+        "redis": 8.24,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/c10_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "c10_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5405.1846,
+        "candidate": 66.3192,
+        "redis": 61.3504,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/c10_ws_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "c10_ws_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5553.8333,
+        "candidate": 3.94,
+        "redis": 8.5733,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/c10_ws_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "c10_ws_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5731.909,
+        "candidate": 73.7668,
+        "redis": 68.745,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/c1_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "c1_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5146.6467,
+        "candidate": 1.1067,
+        "redis": 1.2067,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/c1_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "c1_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5226.9692,
+        "candidate": 56.7506,
+        "redis": 47.8806,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/c1_ws_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "c1_ws_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5340.4533,
+        "candidate": 1.4333,
+        "redis": 1.28,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/c1_ws_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "c1_ws_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5422.3795,
+        "candidate": 61.7518,
+        "redis": 49.5892,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/m1000_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "m1000_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5100.82,
+        "candidate": 242.5867,
+        "redis": 485.1933,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/m1000_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "m1000_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5829.1281,
+        "candidate": 943.6878,
+        "redis": 1192.7896,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/m1000_ws_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "m1000_ws_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5723.36,
+        "candidate": 327.5,
+        "redis": 651.74,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/m1000_ws_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "m1000_ws_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 7110.188,
+        "candidate": 1639.9292,
+        "redis": 1977.2304,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/m10_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "m10_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4489.7733,
+        "candidate": 3.1467,
+        "redis": 7.2867,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/m10_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "m10_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4652.3596,
+        "candidate": 58.3129,
+        "redis": 64.2996,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/m10_ws_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "m10_ws_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4330.6667,
+        "candidate": 5.7,
+        "redis": 7.46,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/m10_ws_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "m10_ws_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4464.6128,
+        "candidate": 83.8935,
+        "redis": 68.8955,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/none_srv_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "none_srv_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4640.7467,
+        "candidate": 1.02,
+        "redis": 1.1333,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 100,
+          "abs": 3
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/none_us": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "none_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4718.4495,
+        "candidate": 54.6748,
+        "redis": 46.3376,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 50,
+          "abs": 20
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "37-zrandmember-by-count/n1m/zcard": {
+      "suite": "37-zrandmember-by-count",
+      "config": "n1m",
+      "metric": "zcard",
+      "unit": "members",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1000000.0,
+        "candidate": 1000000.0,
+        "redis": 1000000.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-20",
+        "commit": "abba1a73",
+        "label": "pr-862-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
     "39-bgsave-strings/mixed/bgsave_ok": {
       "suite": "39-bgsave-strings",
       "config": "mixed",

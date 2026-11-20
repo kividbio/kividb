@@ -518,6 +518,74 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Cluster votes tell a refused replica the newer owner, and check manual
+  failovers too (#742).** A master that refuses a replica its vote because
+  it knows a newer owner of slots the replica claims answers with that
+  owner and the slots it last claimed in its own heartbeat to that master,
+  at the epochs it gave (an `UPDATE`, as in Redis). The replica takes them
+  in as if the owner had told it, and asks again for the slots its master
+  still has: when the masters it asks have heard that owner directly since
+  they last started, it is elected in its first election even when it
+  cannot reach the new owner itself, and if its master has none left it
+  follows the new owner. `CLUSTER FAILOVER` and `CLUSTER FAILOVER FORCE` now send
+  the replica's claims too, to masters that say they read them (a
+  `vote-claims` token in their heartbeats), and are refused and corrected
+  the same way; a master of 1.2 is asked as before. A vote request whose
+  claims are not valid claims is refused.
+- **Cluster: a config epoch collision between a master and the replica that
+  took it over (#743).** A `CLUSTER FAILOVER TAKEOVER` picks its epoch on
+  its own, and can pick the one its master had just taken unannounced (the
+  end of a slot import, `CLUSTER BUMPEPOCH`). When the master comes back,
+  the replica's claim of its slots at that epoch is the one kept: the
+  master, and every node that knew the replica as its replica, take it at
+  the tie, and on the collision the replica is the one that moves to a new
+  epoch, whatever the node ids. Claims in a heartbeat are now taken in
+  before a collision is resolved, as in Redis. Which node took over from
+  which is kept across restarts: nodes.conf's `vars` line gains
+  `tookOverFrom <id>` and `yieldedTo <id>,...` while such a link holds (an
+  earlier version skips them).
+- **Cluster: a slot handover whose destination failed, or whose source
+  restarted (#743).** A source whose destination was marked FAIL before it
+  answered the takeover waits, while a replica of the destination is up and
+  for as long as an election can take, for that failover: a replica elected
+  with the slots keeps them (with the writes the destination took), and the
+  source gives them up; otherwise the source claims them again as before. A
+  handover under way is listed in `<cluster-config-file>.handovers`; a
+  source that starts again with one listed holds writes until it knows where
+  the slots went (the destination says it took them or not, a claim of them
+  arrives, or the destination failed), instead of serving them at once.
+  A node whose `<cluster-config-file>.handovers` cannot be read whole (cut
+  short, a line that does not read, not text, a read error) does not start,
+  with `cluster handovers file '...' is unreadable: ...`, and leaves the
+  file as it is: check the slots it lists (`CLUSTER SHARDS` on another
+  node), then remove it by hand to start the node.
+  COMMANDS.md says what each kind of `CLUSTER FAILOVER` guarantees and how
+  a config epoch collision is resolved.
+- **`ZRANDMEMBER` costs the count asked for, not the size of the sorted
+  set (#862).** A large sorted set (past `zset-max-listpack-entries`) found
+  its random members by walking its member table up to the last position
+  picked. The table is now asked for a bucket by its number: each member is
+  a random bucket, tried again while it is empty, so every member is as
+  likely as any other. A distinct sample of up to a third of the set is
+  picked a bucket at a time (a bucket that comes up twice is picked again);
+  a larger one walks the table once, which is then no longer than the
+  answer; a table left less than an eighth full (a set that lost most of
+  its members) is walked once a call, as before. A table of up to 65,536
+  buckets is made smaller when a removal leaves it less than an eighth
+  full, and any table after a `ZADD` or `GEOADD` that reserved it for
+  members given more than once, or a bulk removal (`ZREMRANGEBY*`) of as
+  many members as it held; a bigger table emptied one member at a time
+  keeps its size, as before, since giving that memory back stalled the
+  command (14 ms for a million-member set's table). Over a million members, server time a call (`INFO
+  commandstats`), master before this change, now, and Redis 8.10.2:
+  `ZRANDMEMBER z` 1,047 us, 1.0 us, 1.1 us; a count of 10 1,975 us,
+  3.2 us, 8.2 us; 1000 2,454 us, 159 us, 711 us; -1000 2,444 us, 243 us,
+  485 us. At 100,000 members a count of 10 went from 143 us to 1.3 us.
+  Small sets (one block) are read by index as before. Replies are the
+  same: a count of the set's size or more is the whole set from the
+  highest score down, a positive count is distinct members in random
+  order, a negative one may repeat.
+
 - **A command reads the clock once (#632).** The first time a command
   needs the time, it reads the clock, and every later expiry check in the
   same command uses that reading, as Redis's `commandTimeSnapshot` does:

@@ -53,6 +53,7 @@ and why.
 | `34-kong-ratelimit` | #849 | Kong's rate-limiting plugin with `policy: redis`: its per-request script (`incr`, and `expire` when the count is 1; Kong 3.9.4's `usage()`, verbatim) sent as Kong sends it (`EVAL` with the script text) and by `EVALSHA`, on one key, `ratelimit:<route>:<service>:<identifier>:<period_date>:minute`, from memtier_benchmark at 200 and 500 connections over 100,000 identifiers; with the key as Kong builds it (`plain`) and with the identifier under a hash tag (`tag`), in two configurations: `default` (`lua-parallel-scripts yes`) and `serial` (`lua-parallel-scripts no` on KiviDB). ops/s against Redis, p99 shown, keys left without a TTL (must be 0); every call's key checked under MONITOR first, for each way of calling. Gates: at least 1.2x Redis at 200 connections and 1.3x at 500 in every configuration and key form. Needs 8 vCPUs and the `lua,tls` builds (`--candidate-full`) |
 | `35-tokio-pipelined-reads` | #432 / #891 | the Tokio loop (`--io-model tokio --threads 1`, the server on the first CPU, `redis-benchmark --threads 3` on the next three, 50 connections): `SET` of 1,024-byte values at pipeline 16 and of 4,096-byte values at pipeline 32, a second from the server's own `total_commands_processed` (median of 3); and one connection with a 64 KiB receive buffer that sends 400,000 `SET`s of 20-byte values (19 MB) in one write before reading a reply: 1 if it is written within 20 s and every reply arrives. Gates: the rates 10 % and 60 % of the gain over v1.2.2 in the same session; the pipeline `>= 1` (v1.2.2 stalls). Recorded on a D4s_v5 (`results/pr-891-d4s_v5`) |
 | `36-litellm-ratelimit` | #871 | LiteLLM's proxy rate limiter: its five Lua scripts byte for byte (`litellm/rust/crates/redis-store/src/rate_limits/lua.rs`, main @ 4b12a405; SHA-1s checked against `SCRIPT LOAD`), called as one request calls them, by `EVALSHA`, from memtier_benchmark (`--transaction`: one key and its team a call) at 200 and 500 connections over 50,000 keys: `BATCH_RATE_LIMITER` for one descriptor (one hash tag) and for key + team (two), `CHECK_AND_INCREMENT_BY_N` and `PARALLEL_ACQUIRE` for key + team, and the 13-command per-request mix. A 22-call transcript checked exactly first (window reset, all-or-nothing over the limit, the reconcile, acquire and release, TTLs), and every script call's keys under MONITOR; the candidate must run at least 90 % of its scripts beside others (`INFO stats` `scripts_run_beside_others`), or the suite fails. ops/s against Redis (a floor per workload, see the docstring), p99 shown, keys left without a TTL (must be 0). Needs 8 vCPUs and the `lua,tls` builds (`--candidate-full`) |
+| `37-zrandmember-by-count` | #862 | `ZRANDMEMBER` of a large sorted set (a table and a tree) of 1,000, 100,000 and 1,000,000 members: no count, 1, 10, 1000, -10, -1000, each count with and without `WITHSCORES`; the server's own microseconds a call (`INFO commandstats`, reset before each case) and the client's wall time, median of 3 rounds; replies checked (length, distinct for a positive count). Gates: server time 100 % or 3 us (the same build measured 66 and 110 us on two D4s_v5s), and at 100,000 and 1,000,000 at most 3x Redis for counts of ±10 and ±1000; wall time 50 % or 20 us, and at 100,000 and 1,000,000 60 % of the gain over v1.2.2. See [the run](#recorded-run-suite-37) |
 | `39-bgsave-strings` | #849 | `BGSAVE` while two clients overwrite random keys as fast as they can (kividb.io/blog/redis-bgsave-memory-fork, getsentry/self-hosted#4619): the peak memory from `BGSAVE` to its end (`Pss` summed over the server and the processes it forked, every 50 ms), the memory before, how long the save took and how many writes got through; `small64` is 10,000,000 keys of 64-byte values (about 1 GiB; the published test, 6 million, at the issue's size) and `mixed` is the issue's ~1 GiB of 100 B to 8 KB values. Gates, `small64`: peak at most 0.6x Redis's in the same session, at most 1,536 MiB (the stand-in for "completes in a 1.5 GiB container where Redis fails"; no container is started) and within 15 % of recorded; `mixed`: at most 1.3x Redis's (see [the run](#recorded-run-suite-39-and-40)); the save must succeed. Server on the first half of the CPUs, writers on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` |
 | `40-wp-object-cache` | #849 | a WordPress-shaped object cache (kividb.io/blog/wordpress-redis-object-cache-slow-under-load-how-to-speed-it-up): 1,000,000 string keys of 512 (`d512`) or 2,048 (`d2048`) bytes, `redis-benchmark -c 100 -d D -r 1000000 -t get` and `-t set` with `--threads 4`: requests a second, p50 and p99 against Redis, and the server's RSS and `used_memory` once loaded. Gates: `GET` at 2 KB at least 1.3x Redis in the same session, RSS at most 1.0x Redis's at both sizes, every rate within 10 % of recorded; server on the first half of the CPUs, client on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-39-and-40)) |
 
@@ -262,6 +263,7 @@ was re-recorded for it:
 | `34-kong-ratelimit` | the server's pinned CPUs (4) | as suite `20`: the server is pinned to half the CPUs of a `Standard_D8s_v5` and gets `--threads` to match |
 | `35-tokio-pipelined-reads` | 1 | as recorded: one worker on its own CPU, the client on the other three |
 | `36-litellm-ratelimit` | the server's pinned CPUs (4) | as suites `20` and `34` |
+| `37-zrandmember-by-count` | 2 | as suite `16`, whose sizes it extends |
 | `39-bgsave-strings`, `40-wp-object-cache` | the server's pinned CPUs (4) | as suites `20` and `34`: the server is pinned to half the CPUs of a `Standard_D8s_v5` and gets `--threads` to match |
 | `32-default-threads` | 0 (none) | measures the default on purpose |
 
@@ -1544,6 +1546,49 @@ This suite declares `min_cpus=8`: run it on a Standard_D8s_v5 with
 `run-all.sh --candidate <bin> --candidate-full <bin> --min-cpus-only --label
 <label>-d8s_v5`, or `--only 36` on a machine with 8 CPUs.
 
+## Recorded run, suite 37
+
+Recorded 2026-11-20 on an Azure Standard_D4s_v5 (Xeon Platinum 8573C),
+`--only 37 --record`; the candidate is the #862 change (`abba1a73` on its
+branch, on master `73bb6fba`), the default build, rustc 1.100.0. Runs:
+`pr-862-d4s_v5` (recorded), `pr-862-d4s_v5-rerun` (the noise check, with
+the gates as they are now: every gate passed) and
+`master-73bb6fba-d4s_v5-37` (master itself as the candidate, the
+candidate engine only: the walk this replaces). A run takes about 2
+minutes.
+
+The server's own time a call (`INFO commandstats`), microseconds; rerun in
+brackets:
+
+1,000,000 members:
+
+| command | v1.2.2 | master | candidate | Redis 8.10.2 |
+|---|---:|---:|---:|---:|
+| `ZRANDMEMBER z` | 4,641 | 1,047 | 1.02 (0.47) | 1.13 (1.15) |
+| `ZRANDMEMBER z 1` | 5,147 | 1,124 | 1.11 (0.93) | 1.21 (1.18) |
+| `ZRANDMEMBER z 10` | 5,316 | 1,975 | 3.18 (2.35) | 8.24 (8.49) |
+| `ZRANDMEMBER z 10 WITHSCORES` | 5,554 | 1,981 | 3.94 (2.91) | 8.57 (8.65) |
+| `ZRANDMEMBER z 1000` | 5,731 | 2,454 | 159 (163) | 711 (683) |
+| `ZRANDMEMBER z 1000 WITHSCORES` | 6,857 | 2,680 | 216 (224) | 740 (768) |
+| `ZRANDMEMBER z -10` | 4,490 | 1,994 | 3.15 (4.05) | 7.29 (7.51) |
+| `ZRANDMEMBER z -1000` | 5,101 | 2,444 | 243 (253) | 485 (531) |
+| `ZRANDMEMBER z -1000 WITHSCORES` | 5,723 | 2,662 | 328 (353) | 652 (652) |
+
+100,000 members:
+
+| command | v1.2.2 | master | candidate | Redis 8.10.2 |
+|---|---:|---:|---:|---:|
+| `ZRANDMEMBER z` | 231 | 70.3 | 0.06 (0.31) | 2.02 (2.11) |
+| `ZRANDMEMBER z 10` | 264 | 143 | 1.29 (3.38) | 6.58 (6.88) |
+| `ZRANDMEMBER z 1000` | 399 | 345 | 86.9 (90.0) | 474 (513) |
+| `ZRANDMEMBER z -1000` | 377 | 333 | 128 (146) | 341 (377) |
+
+At 1,000 members (a table of a thousand: the walk was short) every row is
+within a few microseconds on all four; a count of 1000 there is the whole
+set. The client's wall time a call (`<case>_us`) is the server's plus about
+50 us of round trip and redis-py's parsing, about 0.7 ms for a thousand
+members: at 1,000,000 members `ZRANDMEMBER z 10` takes 66 us (57) against
+master's 2,040 and Redis's 61 (60). `bad_replies` is 0 on every engine.
 ## Recorded run, suites 39 and 40
 
 Recorded 2026-11-20 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C),
