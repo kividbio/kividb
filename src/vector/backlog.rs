@@ -984,7 +984,10 @@ pub fn serving(from: &Reading, to: &Reading) -> bool {
         .saturating_sub(from.cpu_ns)
         .saturating_sub(to.linking_ns.saturating_sub(from.linking_ns))
         .saturating_sub(writes.saturating_mul(to.write_cpu_ns));
-    let other_ops = to.commands.saturating_sub(from.commands).saturating_sub(writes);
+    let other_ops = to
+        .commands
+        .saturating_sub(from.commands)
+        .saturating_sub(writes);
     let ops_per_s = u128::from(other_ops) * 1_000_000_000 / u128::from(wall);
     let millicpus = u128::from(other_cpu) * 1000 / u128::from(wall);
     ops_per_s >= u128::from(SERVING_OPS) || millicpus >= u128::from(SERVING_MILLICPUS)
@@ -1673,10 +1676,17 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
             assert!(out.status.success(), "{said}");
-            assert!(said.contains("1 passed"), "the test did not run alone: {said}");
+            assert!(
+                said.contains("1 passed"),
+                "the test did not run alone: {said}"
+            );
             return;
         }
-        assert_eq!(HELPERS.load(Acquire), 0, "helpers started before the first write");
+        assert_eq!(
+            HELPERS.load(Acquire),
+            0,
+            "helpers started before the first write"
+        );
         assert_eq!(PINNED.load(Relaxed), usize::MAX);
         let g = big_graph(8);
         let metric = DistanceMetric::L2;
@@ -2409,7 +2419,9 @@ mod concurrency {
         let store = crate::store::new_store(1);
         let indexes = crate::vector::new_index_store();
         for name in ["cw1", "cw2"] {
-            indexes.write().insert(name.into(), two_vectors(name, "cw:"));
+            indexes
+                .write()
+                .insert(name.into(), two_vectors(name, "cw:"));
         }
         std::thread::spawn(move || {
             let mut rng = Rng(5);
@@ -2446,7 +2458,9 @@ mod concurrency {
             assert_eq!(counted_here(), 2);
             // `FT.CREATE` over those keys, in a command of its own: its walk
             // indexes them and counts nothing.
-            indexes.write().insert("cw3".into(), two_vectors("cw3", "cw:"));
+            indexes
+                .write()
+                .insert("cw3".into(), two_vectors("cw3", "cw:"));
             crate::stats::record_command_processed();
             crate::vector::backfill_from_db(&store[0], indexes.read().get("cw3").unwrap());
             assert_eq!(counted_here(), 2);
