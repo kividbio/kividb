@@ -504,6 +504,9 @@ impl BlockingSlot {
     /// Prepare the slot for the next dispatch and hand out the borrow that
     /// goes into `Ctx`.
     pub fn prime(&mut self) -> &mut BlockingCtl {
+        // Values to free are handed on after the command that left them
+        // (`take_parked`): none is left for the next one.
+        debug_assert!(self.ctl.freeing.is_none(), "values to free left behind");
         // Nobody stands in any line (nearly always): nothing this command
         // does can wake anyone, and there is nothing to collect.
         self.ctl.after = crate::wait_table::anyone_in_line();

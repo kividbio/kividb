@@ -468,6 +468,44 @@ fn long_commands_do_not_hold_up_the_other_connections_of_their_thread() {
         });
         assert_not_held_up(io, "DEL of several keys, one big", del_many);
         assert_eq!(c.int(&["EXISTS", "hash", "plain"]), 0);
+
+        // A document and an array of that many items: how much they hold is
+        // reckoned without going through them (`deferred::held_for`). Their
+        // frees can be short: what is checked is that no PING waits for
+        // more than a few milliseconds, as one would for a walk of them.
+        let items: Vec<String> = (0..1_000_000).map(|i| format!("\"item-{i}\"")).collect();
+        c.ok(&["JSON.SET", "doc", "$", &format!("[{}]", items.join(","))]);
+        let (took, worst) = probe_while(port, &mut long, |c| {
+            assert_eq!(c.int(&["DEL", "doc"]), 1);
+        });
+        eprintln!("{io}: DEL of a JSON document took {took:?}, longest PING {worst:?}");
+        assert!(
+            worst < Duration::from_millis(10),
+            "{io}: a PING waited {worst:?} behind DEL of a document"
+        );
+        let mut sent = 0;
+        for start in (0..BIG).step_by(1000) {
+            let mut args = vec!["ARMSET".to_string(), "arr".to_string()];
+            for i in start..BIG.min(start + 1000) {
+                args.push(i.to_string());
+                args.push("v".to_string());
+            }
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            c.send(&args);
+            sent += 1;
+        }
+        for _ in 0..sent {
+            let reply = c.read();
+            assert!(!matches!(reply, V::Err(_)), "{io}: ARMSET {reply:?}");
+        }
+        let (took, worst) = probe_while(port, &mut long, |c| {
+            assert_eq!(c.int(&["DEL", "arr"]), 1);
+        });
+        eprintln!("{io}: DEL of an array took {took:?}, longest PING {worst:?}");
+        assert!(
+            worst < Duration::from_millis(10),
+            "{io}: a PING waited {worst:?} behind DEL of an array"
+        );
     }
 }
 
@@ -934,14 +972,27 @@ fn a_free_that_waits_is_not_counted_against_the_limit() {
         let mut c = server.conn();
         c.ok(&["DEBUG", "POPULATE", "100000", "k", "100"]);
         c.big("HSET", "h", BIG);
-        let usage = c.int(&["MEMORY", "USAGE", "h"]);
-        let used: i64 = c.info("memory", "used_memory").parse().unwrap();
+        let not_counted = |c: &mut Conn| -> i64 {
+            c.info("memory", "mem_not_counted_for_evict")
+                .parse()
+                .unwrap()
+        };
+        let before = not_counted(&mut c);
         let mut del = server.conn();
         del.send(&["DEL", "h"]);
         let held = server.dir.join("failpoint.deferred-free-held.1");
         eventually(30, "the free to be held", || held.exists());
-        // Under what was used with the hash, over what is used without it.
-        let limit = used - usage / 2;
+        // What the value waiting to be freed is not counted for: a part of
+        // what it takes, reckoned without going through it.
+        let hold = not_counted(&mut c) - before;
+        assert!(
+            hold > 0,
+            "{io}: nothing held for the value waiting to be freed"
+        );
+        let used: i64 = c.info("memory", "used_memory").parse().unwrap();
+        // Over what is counted while the free waits, under what was counted
+        // without the hold: short of it, these writes evict and are refused.
+        let limit = used - not_counted(&mut c) + hold / 2;
         c.ok(&["CONFIG", "SET", "maxmemory", &limit.to_string()]);
         let value = "w".repeat(100);
         for i in 0..2_000 {

@@ -118,16 +118,26 @@ pub fn note_last_command(elapsed: std::time::Duration) {
 }
 
 /// `extra` more time for `name` (upper case, a command without
-/// subcommands), already counted on this thread: work its connection did
-/// for it after it ran (`deferred::count_freed`). Its call is not counted
-/// again, nor its latency histogram moved.
+/// subcommands), whose call was counted: work its connection did for it
+/// after it ran (`deferred::count_freed`). Its call is not counted again,
+/// nor its latency histogram moved. On whichever thread asks: a connection
+/// can go on on another thread than the one its command ran on, and the
+/// counters of every thread are summed (`totals`).
 pub fn add_time(name: &str, extra: std::time::Duration) {
+    let usec = extra.as_micros() as u64;
     MINE.with(|mine| {
         if let Some(counters) = mine.borrow().get(name) {
-            counters
-                .usec
-                .fetch_add(extra.as_micros() as u64, Ordering::Relaxed);
+            counters.usec.fetch_add(usec, Ordering::Relaxed);
+            return;
         }
+        if !crate::commands::server::is_registered_command(name) {
+            return;
+        }
+        let counters = Arc::new(Counters::default());
+        counters.usec.store(usec, Ordering::Relaxed);
+        ALL.lock()
+            .push((name.to_ascii_lowercase(), Arc::clone(&counters)));
+        mine.borrow_mut().insert(name.to_string(), counters);
     });
 }
 

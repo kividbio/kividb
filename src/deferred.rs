@@ -285,6 +285,26 @@ pub fn run_elsewhere(blocking: &mut Option<&mut BlockingCtl>, cmd: &[&[u8]], uni
     true
 }
 
+/// The memory a value waiting to be freed is not counted for (`Freeing::held`),
+/// in O(1): its free's effort, which a collection keeps (elements, or
+/// nodes), times a figure no element of its kind takes less than. Short of
+/// what it takes, never over it: holding too little only leaves its memory
+/// counted, as it was before #762, while holding too much would hide other
+/// memory from `maxmemory`. And never more than half of what is counted
+/// now, whatever the figure says.
+fn held_for(value: &KiviDBValue, effort: u64) -> usize {
+    let per = match value {
+        // An integer of a set's array, a sample of a series: 8 or 16 bytes.
+        KiviDBValue::Set(_) | KiviDBValue::TimeSeries(_) => 8,
+        // A field and its value, a member and its score, a node of a
+        // list or a stream, an item of a document, an element of an array.
+        _ => 32,
+    };
+    (effort as usize)
+        .saturating_mul(per)
+        .min(crate::memory_use::counted() / 2)
+}
+
 /// Free `value`, which a write has let go of, and whose freeing is
 /// `effort` ([`crate::lazyfree::effort`]): before the reply, as Redis frees
 /// it. If it is long work and the command's connection can wait, the
@@ -296,13 +316,7 @@ pub fn free_weighed(blocking: &mut Option<&mut BlockingCtl>, value: KiviDBValue,
         return;
     }
     if let Some(slot) = blocking.as_mut().filter(|slot| slot.awaitable) {
-        // What `MEMORY USAGE` would say of it, its elements sampled.
-        let bytes = crate::commands::memory::value_bytes(
-            crate::store::ValueRef::from(&value),
-            &[],
-            || None,
-            5,
-        );
+        let bytes = held_for(&value, effort);
         // Beside the slot's wait, not in it: the command has run, and
         // finishes as any command that has (`BlockingCtl::freeing`).
         let freeing = slot.freeing.get_or_insert_with(|| {

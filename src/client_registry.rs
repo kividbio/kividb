@@ -1359,8 +1359,10 @@ impl ClientRegistryInner {
     /// on an error, or is killed, does not reach with the client still
     /// listed.
     fn no_longer_tracking(gone: Option<ClientInfo>) {
-        if gone.is_some_and(|client| client.tracking) {
-            crate::tracking::TRACKING_CLIENT_COUNT.fetch_sub(1, Ordering::Relaxed);
+        if gone.is_some_and(|client| client.tracking)
+            && crate::tracking::TRACKING_CLIENT_COUNT.fetch_sub(1, Ordering::Relaxed) == 1
+        {
+            crate::tracking::nobody_tracks();
         }
     }
 

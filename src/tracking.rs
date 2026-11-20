@@ -9,7 +9,7 @@
 // Design: DashMap for lock-free concurrent reads from the write path.
 // Each shard is independently locked so SET on "foo" doesn't block
 // GET on "bar" from registering "bar" → client_id.
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Number of clients with CLIENT TRACKING ON.
 /// handler.rs does ONE Relaxed load per command on both the read and write
@@ -262,7 +262,9 @@ impl TrackingTableInner {
     }
 
     pub fn disable_tracking(&self) {
-        TRACKING_CLIENT_COUNT.fetch_sub(1, Ordering::Relaxed);
+        if TRACKING_CLIENT_COUNT.fetch_sub(1, Ordering::Relaxed) == 1 {
+            nobody_tracks();
+        }
     }
 }
 
@@ -380,13 +382,44 @@ pub fn before_the_reply(tell: impl FnOnce()) {
         if slot.as_ref().is_some_and(|held| held.is_empty()) {
             *slot = None;
         } else if let Some(held) = slot.take() {
-            PENDING_BEFORE.with_borrow_mut(|pending| pending.extend_from_slice(&held));
+            let now = NOBODY_TRACKED.load(Ordering::Relaxed);
+            PENDING_BEFORE.with_borrow_mut(|pending| {
+                if PENDING_EPOCH.replace(now) != now {
+                    pending.clear();
+                }
+                pending.extend_from_slice(&held)
+            });
         }
     });
 }
 
 thread_local! {
     static PENDING_BEFORE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// [`NOBODY_TRACKED`] when [`PENDING_BEFORE`] was begun.
+    static PENDING_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times the last tracking client has gone. What a thread holds in
+/// [`PENDING_BEFORE`] from before is for a client that is no longer told:
+/// the command it was for ended, its reply made, while nobody tracked and
+/// [`with_what_came_before`] took nothing. It is dropped, not sent ahead of
+/// another command's reply.
+static NOBODY_TRACKED: AtomicU64 = AtomicU64::new(0);
+
+/// The last tracking client has gone: see [`NOBODY_TRACKED`].
+#[cold]
+pub fn nobody_tracks() {
+    NOBODY_TRACKED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// What this thread holds before a reply, taken: nothing if it is from
+/// before the last tracking client went.
+fn take_pending() -> Vec<u8> {
+    let pending = PENDING_BEFORE.with_borrow_mut(std::mem::take);
+    if PENDING_EPOCH.get() != NOBODY_TRACKED.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    pending
 }
 
 /// For a command whose reply comes later (it parked, or stopped to be run
@@ -397,10 +430,10 @@ thread_local! {
 #[cold]
 #[inline(never)]
 pub fn put_what_came_before(out: &mut Vec<u8>) {
-    if TRACKING_CLIENT_COUNT.load(Ordering::Relaxed) == 0 {
-        return;
+    let mut pending = take_pending();
+    if TRACKING_CLIENT_COUNT.load(Ordering::Relaxed) != 0 {
+        out.append(&mut pending);
     }
-    PENDING_BEFORE.with_borrow_mut(|pending| out.append(pending));
 }
 
 /// `reply`, preceded by whatever [`before_the_reply`] collected while the
@@ -415,7 +448,7 @@ pub fn with_what_came_before(reply: Vec<u8>) -> Vec<u8> {
 
 #[cold]
 fn preceded(reply: Vec<u8>) -> Vec<u8> {
-    let mut before = PENDING_BEFORE.with_borrow_mut(std::mem::take);
+    let mut before = take_pending();
     if before.is_empty() {
         return reply;
     }

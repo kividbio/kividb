@@ -2019,12 +2019,6 @@ pub async fn handle_client(
                             crate::aof::written(&aof_tx).await;
                         }
                         debug_assert!(early.is_none(), "a read in flight while a command parks");
-                        let limit = crate::server::HardLimit::new(
-                            pubsub.limits(),
-                            subscriptions.is_some(),
-                            out_buf.len() + carried.len() - carried_from + unpresented,
-                            client_id,
-                        );
                         // Long work the command left for a thread of its own (#762):
                         // waited for, while this thread serves the others. Not
                         // asleep with the client watched: a client that has shut
@@ -2050,6 +2044,12 @@ pub async fn handle_client(
                             }
                             response = reply;
                         } else {
+                            let limit = crate::server::HardLimit::new(
+                                pubsub.limits(),
+                                subscriptions.is_some(),
+                                out_buf.len() + carried.len() - carried_from + unpresented,
+                                client_id,
+                            );
                             // Boxed, and so polled out of line: the wait is cold, and the
                             // connection's own future stays the size it is without it.
                             match Box::pin(park_blocking_uring(
@@ -2152,12 +2152,6 @@ pub async fn handle_client(
                         crate::aof::written(&aof_tx).await;
                     }
                     debug_assert!(early.is_none(), "a read in flight while a command parks");
-                    let limit = crate::server::HardLimit::new(
-                        pubsub.limits(),
-                        subscriptions.is_some(),
-                        out_buf.len() + carried.len() - carried_from + unpresented,
-                        client_id,
-                    );
                     // Long work the command left for a thread of its own (#762):
                     // waited for, while this thread serves the others. Not
                     // asleep with the client watched: a client that has shut
@@ -2183,6 +2177,12 @@ pub async fn handle_client(
                         }
                         response = reply;
                     } else {
+                        let limit = crate::server::HardLimit::new(
+                            pubsub.limits(),
+                            subscriptions.is_some(),
+                            out_buf.len() + carried.len() - carried_from + unpresented,
+                            client_id,
+                        );
                         // Boxed, and so polled out of line: the wait is cold, and the
                         // connection's own future stays the size it is without it.
                         match Box::pin(park_blocking_uring(
