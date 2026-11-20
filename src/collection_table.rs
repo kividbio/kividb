@@ -1,7 +1,7 @@
 //! The large form of hashes and sets (#764): [`CollectionTable`].
 //!
-//! The design is on #764. Large sets are kept in it (`member_set`, step 2);
-//! hashes move onto it later (step 3).
+//! The design is on #764. Large sets are kept in it (`member_set`, step 2),
+//! and large hashes (`hash_fields`, step 3).
 //!
 //! **Layout.** A power-of-two array of 64-byte groups, one cache line each:
 //! seven control bytes, one meta byte and seven 8-byte slots (`Group`). A
@@ -50,7 +50,7 @@
 //! resize with a new seed has ended has the guarantee again. A scan whose
 //! pages span a resize with a new seed has no guarantee whether or not
 //! anything is written between its pages: the server's background
-//! (`member_set::step_background`) takes steps of a resize in progress
+//! (`resize_background::step_background`) takes steps of a resize in progress
 //! between pages too. Only a chain over [`CHAIN_CAP`] starts such a resize,
 //! which random keys do not reach (see above).
 //!
@@ -72,8 +72,8 @@
 //! The invariants each relies on are stated where they are, and checked by
 //! `debug_assert!`s and, in tests, by `check()`.
 
-// The hash form and the measurement hooks are not used by the server yet
-// (#764 step 3).
+// The measurement hooks, the field TTLs kept in an entry (#764 step 5) and
+// the memory kinds kept for comparison are not used by the server.
 #![allow(dead_code)]
 
 use std::alloc::Layout;
@@ -701,6 +701,13 @@ thread_local! {
 #[cfg(test)]
 fn max_len() -> usize {
     TEST_MAX_LEN.with(std::cell::Cell::get)
+}
+
+/// Lower the limit on this thread (`None`: back to [`MAX_LEN`]), for a
+/// test of a caller's refusal.
+#[cfg(test)]
+pub(crate) fn set_test_max_len(limit: Option<usize>) {
+    TEST_MAX_LEN.with(|max| max.set(limit.unwrap_or(MAX_LEN)));
 }
 
 /// Whether a length is one a table holds: checked before any block is
@@ -2578,9 +2585,11 @@ impl<A: Memory> CollectionTable<Fields, A> {
     }
 
     /// Every field, in no particular order.
-    pub fn iter(&self) -> impl Iterator<Item = FieldRef<'_>> + '_ {
-        // SAFETY: live entries, unchanged while `self` is borrowed.
-        self.slots().map(|slot| unsafe { field_ref(slot) })
+    pub fn iter(&self) -> FieldIter<'_> {
+        FieldIter {
+            slots: self.slots(),
+            left: self.len,
+        }
     }
 
     /// Calls `f` with every field whose position is at or after `cursor`, a
@@ -2815,6 +2824,34 @@ impl<'a> Iterator for MemberIter<'a> {
 }
 
 impl ExactSizeIterator for MemberIter<'_> {}
+
+/// A hash's fields, in no particular order ([`CollectionTable::iter`]): a
+/// type of its own so that a hash's iterator can hold it, and exact about
+/// how many are left.
+pub struct FieldIter<'a> {
+    slots: Slots<'a>,
+    left: usize,
+}
+
+impl<'a> Iterator for FieldIter<'a> {
+    type Item = FieldRef<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<FieldRef<'a>> {
+        let slot = self.slots.next()?;
+        self.left -= 1;
+        // SAFETY: a live entry of the table the iterator borrows, which
+        // stays unchanged while it is borrowed.
+        Some(unsafe { field_ref(slot) })
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl ExactSizeIterator for FieldIter<'_> {}
 
 /// The cursor position of `key` in a table: the order `scan` visits in. For
 /// tests of the cursor.

@@ -29,7 +29,7 @@ use std::ops::{ControlFlow, Deref};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 
 use crate::collection_table::{CollectionTable, INLINE_MEMBER, MemberIter, MemberRef, Members};
 use crate::packed_set::{self, PackedSet};
@@ -1027,7 +1027,7 @@ impl MemberSet {
         let Repr::Table(t) = &mut self.repr else {
             return false;
         };
-        if !tight(t.members.transient_bytes()) {
+        if !crate::resize_background::tight(t.members.transient_bytes()) {
             return false;
         }
         while !t.members.step_resize(usize::MAX) {}
@@ -1069,50 +1069,53 @@ impl MemberSet {
 
 // ── the background's part (#764 step 2) ───────────────────────────────────────
 //
-// A table grows and shrinks a few members a write (`WRITE_STEP`), so a set
-// whose writes stop part-way through a resize would hold both arrays until
-// its next write, maybe for ever. A write that leaves its set mid-resize, or
-// with a finished resize's old array kept back (`defer_free`: freeing a big
-// one took about a millisecond), hands the set to the background
-// ([`after_write`]); the active-expire thread finishes the resize in bounded
-// steps, each under the set's own write lock ([`step_background`]), and
-// gives the old arrays to `lazyfree`.
-//
-// The background holds the sets weakly: a key deleted, overwritten,
-// expired, evicted, flushed or moved meanwhile is not kept alive by it, and
-// it never waits for a set's lock (`try_write`), so a reader that holds one
-// for long delays only that set's resize, and nothing waits on the
-// background. A set it finds itself the last holder of (its key gone while
-// it held it) goes to `lazyfree` whole.
+// See `resize_background`: a write that leaves its set mid-resize, or with a
+// finished resize's old array kept back, hands the set over, and the
+// active-expire thread finishes it a step at a time under the set's lock.
 
 type Shared = Arc<RwLock<MemberSet>>;
 
-/// Sets handed to the background, not yet done with.
-static HANDED: Mutex<Vec<Weak<RwLock<MemberSet>>>> = Mutex::new(Vec::new());
-/// How many sets [`HANDED`] holds, read without its lock.
-static HANDED_COUNT: AtomicUsize = AtomicUsize::new(0);
+impl crate::resize_background::Resizable for RwLock<MemberSet> {
+    fn try_step(&self, budget: usize) -> Option<(bool, Option<crate::collection_table::Retired>)> {
+        Some(self.try_write()?.background_step(budget))
+    }
 
-/// Units of a resize's moves done under one hold of a set's lock (a unit is
-/// a group visited or a member moved). Finishing the growth of a 3.2M-member
-/// set, 4,096 of them held the lock for up to 0.49 ms, 1,024 for up to 0.27
-/// ms (a move into pages of the new array touched for the first time costs
-/// a page fault), so a writer of that set waits no longer than that.
-pub const BACKGROUND_STEP: usize = 1024;
+    fn try_settle(&self) -> Option<bool> {
+        let mut inner = self.try_write()?;
+        let Repr::Table(t) = &mut inner.repr else {
+            return Some(false);
+        };
+        let released = t.members.transient_bytes() > 0;
+        while !t.members.step_resize(usize::MAX) {}
+        drop(t.members.take_retired());
+        t.queued = false;
+        Some(released)
+    }
+
+    fn let_go(self: Arc<Self>) -> bool {
+        match Arc::into_inner(self) {
+            Some(last) => {
+                crate::lazyfree::free_later(last, 0);
+                true
+            }
+            None => false,
+        }
+    }
+}
 
 /// After a write to `set` (whose write lock `inner` is): hands it to the
 /// background if it has work there. A few instructions when not.
 #[inline]
 pub fn after_write(set: &Shared, inner: &mut MemberSet) {
     if inner.hand_over() {
-        hand(Arc::downgrade(set));
+        hand(set);
     }
 }
 
 #[cold]
-fn hand(set: Weak<RwLock<MemberSet>>) {
-    let mut handed = HANDED.lock();
-    handed.push(set);
-    HANDED_COUNT.store(handed.len(), Ordering::Release);
+fn hand(set: &Shared) {
+    let weak: Weak<RwLock<MemberSet>> = Arc::downgrade(set);
+    crate::resize_background::hand(weak);
 }
 
 /// `set` made a key's value: shared, and handed to the background if a
@@ -1123,136 +1126,9 @@ pub fn shared(mut set: MemberSet) -> Shared {
     let due = set.hand_over();
     let shared = Arc::new(RwLock::new(set));
     if due {
-        hand(Arc::downgrade(&shared));
+        hand(&shared);
     }
     shared
-}
-
-/// Whether the arrays a resize holds (`transient` bytes) could take memory
-/// past `maxmemory`: a limit is set and memory is within that many bytes of
-/// it. Read only when a table holds such arrays.
-fn tight(transient: usize) -> bool {
-    let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed);
-    limit != 0 && crate::memory_use::counted().saturating_add(transient) >= limit
-}
-
-/// The process is over `maxmemory` (a command's check): finish every resize
-/// handed to the background and free what they leave, now, so that only
-/// what the sets settle at is counted when the check is made again. A set
-/// whose lock is held is left (it is never waited for). Returns whether
-/// anything was given back.
-pub fn release_transients() -> bool {
-    let sets = std::mem::take(&mut *HANDED.lock());
-    let mut kept = Vec::with_capacity(sets.len());
-    let mut released = false;
-    for weak in sets {
-        let Some(set) = weak.upgrade() else {
-            continue;
-        };
-        match set.try_write() {
-            Some(mut inner) => {
-                if let Repr::Table(t) = &mut inner.repr {
-                    released |= t.members.transient_bytes() > 0;
-                    while !t.members.step_resize(usize::MAX) {}
-                    drop(t.members.take_retired());
-                    t.queued = false;
-                }
-            }
-            None => kept.push(Arc::downgrade(&set)),
-        }
-        if let Some(last) = Arc::into_inner(set) {
-            crate::lazyfree::free_later(last, 0);
-        }
-    }
-    let mut handed = HANDED.lock();
-    kept.append(&mut handed);
-    *handed = kept;
-    HANDED_COUNT.store(handed.len(), Ordering::Release);
-    released
-}
-
-/// Whether any set waits for the background.
-#[inline]
-pub fn background_pending() -> bool {
-    HANDED_COUNT.load(Ordering::Acquire) > 0
-}
-
-/// What one call of [`step_background`] did.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct BackgroundWork {
-    /// Steps taken, each under one hold of a set's lock.
-    pub steps: usize,
-    /// The longest a set's lock was held for one of them.
-    pub longest_hold: std::time::Duration,
-    /// Sets finished with.
-    pub finished: usize,
-}
-
-/// Work on the sets handed to the background for about `budget` of time,
-/// a [`BACKGROUND_STEP`] at a time, each under the set's write lock taken
-/// without waiting. The sets left over are kept for the next call.
-pub fn step_background(budget: std::time::Duration) -> BackgroundWork {
-    let started = std::time::Instant::now();
-    let mut work = BackgroundWork::default();
-    let sets = std::mem::take(&mut *HANDED.lock());
-    let mut kept = Vec::with_capacity(sets.len());
-    let mut sets = sets.into_iter();
-    for weak in sets.by_ref() {
-        if started.elapsed() >= budget {
-            kept.push(weak);
-            break;
-        }
-        // Gone (deleted, overwritten, flushed...): nothing to do.
-        let Some(set) = weak.upgrade() else {
-            continue;
-        };
-        let mut done = false;
-        while started.elapsed() < budget {
-            // A reader holds it (a long `SMEMBERS`, say): next time.
-            let Some(mut inner) = set.try_write() else {
-                break;
-            };
-            let hold = std::time::Instant::now();
-            let (finished, retired) = inner.background_step(BACKGROUND_STEP);
-            drop(inner);
-            work.longest_hold = work.longest_hold.max(hold.elapsed());
-            work.steps += 1;
-            if let Some(retired) = retired {
-                // Near the limit, given back now: `lazyfree` frees it a
-                // moment later, and the next command's check would count it.
-                if tight(retired.bytes()) {
-                    drop(retired);
-                } else {
-                    crate::lazyfree::free_later(retired, 0);
-                }
-            }
-            if finished {
-                done = true;
-                break;
-            }
-        }
-        // Let go of it without ever freeing it here. If its key went while
-        // this held it (deleted, flushed, `UNLINK`ed...), this is the last
-        // holder, and the set goes to `lazyfree` whole: `into_inner` tells
-        // that atomically, where a count read first could see another
-        // holder that lets go just after, leaving the free to this thread.
-        if let Some(last) = Arc::into_inner(set) {
-            crate::lazyfree::free_later(last, 0);
-            continue;
-        }
-        if done {
-            work.finished += 1;
-        } else {
-            kept.push(weak);
-        }
-    }
-    kept.extend(sets);
-    let mut handed = HANDED.lock();
-    // Sets handed over while these were worked on come after them.
-    kept.append(&mut handed);
-    *handed = kept;
-    HANDED_COUNT.store(handed.len(), Ordering::Release);
-    work
 }
 
 /// The members of an array, in ascending order, at the width they need.
@@ -1553,6 +1429,7 @@ impl std::fmt::Debug for MemberSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resize_background::step_background;
 
     fn member(i: usize) -> Arc<[u8]> {
         Arc::from(format!("member-{i}").as_bytes())
@@ -2241,7 +2118,7 @@ mod tests {
         assert!(weak.upgrade().is_none());
         step_background(std::time::Duration::from_millis(50));
         assert!(
-            !HANDED.lock().iter().any(|w| w.ptr_eq(&weak)),
+            !crate::resize_background::is_handed(weak.as_ptr().cast()),
             "a deleted set stayed handed over"
         );
         // Read-locked: skipped, kept for later, then finished.
@@ -2249,21 +2126,15 @@ mod tests {
         let reader = held.read();
         let work = step_background(std::time::Duration::from_millis(5));
         assert!(reader.table().unwrap().resizing());
-        assert!(
-            HANDED
-                .lock()
-                .iter()
-                .any(|w| w.ptr_eq(&Arc::downgrade(&held)))
-        );
+        assert!(crate::resize_background::is_handed(
+            Arc::as_ptr(&held).cast()
+        ));
         let _ = work;
         drop(reader);
         finish_in_background(&held);
-        assert!(
-            !HANDED
-                .lock()
-                .iter()
-                .any(|w| w.ptr_eq(&Arc::downgrade(&held)))
-        );
+        assert!(!crate::resize_background::is_handed(
+            Arc::as_ptr(&held).cast()
+        ));
         // A set built mid-growth and made a key's value is handed over at
         // once (a load, `RESTORE`, a `*STORE` command).
         let mut built = MemberSet::new_table(0);

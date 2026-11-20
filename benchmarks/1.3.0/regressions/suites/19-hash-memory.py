@@ -23,6 +23,15 @@ Gates: memory per field within 5 % (or 1 B) of recorded at every size; at 10
 and 100 fields, where the block replaced the table, it must also keep 60 % of
 the gain over v1.2.2 measured in the same session. The tables (1,000 and
 100,000) are guard rows: the change must not cost them.
+
+#764 step 3 (hashes on `CollectionTable`) re-recorded the table rows and
+added one hash each of 3,000,000 fields, and of 3,211,264 and 3,211,265:
+just before and just after the table doubles from 2^19 to 2^20 groups (it
+grows past 0.875 of 7 x 2^19 slots), its fullest and its emptiest point, the
+bounds of what a large hash costs. A hash this big is one key of that many
+fields. Before `used_memory` is read the server is left until it stops
+falling (a resize that the background, or Redis's rehashing, is still
+finishing; at most 60 s).
 """
 import os
 import sys
@@ -32,7 +41,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from suite import Suite, Config, KEEP_IMPROVEMENT, EXACT, rel, info, scaled  # noqa: E402
 
 S = Suite("19-hash-memory", [Config("plain", threads=2), Config("ttl", threads=2)])
-SIZES = [10, 100, 1000, 100_000]
+SIZES = [10, 100, 1000, 100_000, 3_000_000, 3_211_264, 3_211_265]
 TOTAL = 1_000_000
 BATCH = 250
 ENCODINGS = {"listpack": 2, "hashtable": 3, "listpackex": 4}
@@ -67,12 +76,30 @@ def load(c, n, total, ttl):
     return keys
 
 
+def settled(c, limit=60.0):
+    """used_memory once it has stopped falling: a resize still being finished
+    in the background holds two arrays until it is done, and gives the old
+    one back all at once when it is, so this waits until no lower value has
+    been seen for 2 s."""
+    low = c.info("memory")["used_memory"]
+    end = time.perf_counter() + limit
+    since = time.perf_counter()
+    while time.perf_counter() < end and time.perf_counter() - since < 2.0:
+        time.sleep(0.1)
+        now = c.info("memory")["used_memory"]
+        if now < low - 4096:
+            since = time.perf_counter()
+        low = min(low, now)
+    return low
+
+
 @S.run
 def run(ctx):
     c = ctx.client()
     ttl = ctx.config.name == "ttl"
-    total = scaled(TOTAL)
     for n in SIZES:
+        # Past TOTAL, one hash of n fields.
+        total = scaled(max(TOTAL, n))
         n_here = min(n, total)
         c.flushall()
         time.sleep(0.5)
@@ -80,7 +107,7 @@ def run(ctx):
         t = time.perf_counter()
         keys = load(c, n_here, total, ttl)
         secs = time.perf_counter() - t
-        u1 = c.info("memory")["used_memory"]
+        u1 = settled(c)
         first = "k:has:%010d" % 0
         assert c.hlen(first) == n_here, "HLEN %d != %d" % (c.hlen(first), n_here)
         per = (u1 - u0) / float(keys * n_here)

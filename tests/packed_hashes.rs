@@ -762,7 +762,22 @@ fn hscan_of_each_form() {
         let key = form.key;
         let reply = c.cmd(&["HSCAN", key, "0", "COUNT", "2"]);
         if form.form == "hashtable" {
-            assert_ne!(reply.items()[0].text(), "0", "{key}");
+            // A table (#764) is scanned through its own cursor: a small one
+            // may come back in one page or several, and a full scan gives
+            // each field once.
+            let mut seen = Vec::new();
+            let mut cursor = "0".to_string();
+            loop {
+                let reply = c.cmd(&["HSCAN", key, &cursor, "COUNT", "2"]);
+                cursor = reply.items()[0].text();
+                for pair in reply.items()[1].items().chunks(2) {
+                    seen.push((pair[0].bulk(), pair[1].bulk()));
+                }
+                if cursor == "0" {
+                    break;
+                }
+            }
+            assert_eq!(sorted(&seen), sorted(&form.pairs), "{key}: each field once");
             continue;
         }
         assert_eq!(reply.items()[0].text(), "0", "{key}");
@@ -860,7 +875,8 @@ fn save_aof_and_rewrite_round_trips() {
     let mut c = server.conn();
     check_forms(&mut c, &forms, "aof replay");
     digests_match(&mut c, &forms, "aof replay");
-    assert_eq!(c.hgetall("churn"), churn);
+    // A table has no order of its own: its fields, whatever their order.
+    assert_eq!(sorted(&c.hgetall("churn")), sorted(&churn));
     assert_eq!(c.encoding("churn"), "hashtable");
 
     // AOF rewrite, then replay of what it wrote.
@@ -1168,5 +1184,170 @@ fn eviction_counts_the_blocks() {
             assert_eq!(c.hgetall(&key), fields);
             assert_eq!(c.encoding(&key), "listpack");
         }
+    }
+}
+
+/// `HSCAN` of a small hash takes the hash's read lock once. Two reads of
+/// it on the scanning thread (the form looked up again while the first was
+/// held, as `SSCAN` once did, #965) wait behind a writer queued in between,
+/// which waits for the first: `HSCAN`, the writer and every client of that
+/// shard hang. Small hashes with and without field TTLs, raced by writers,
+/// on each I/O model.
+#[test]
+fn hscan_of_a_small_hash_never_waits_on_its_writers() {
+    for model in io_models() {
+        let dir = temp_dir("hscan-race");
+        let server = Server::start(dir.path(), &["--io-model", model]);
+        let mut c = server.conn();
+        c.hset("hl", &pairs(10, "field"));
+        c.hset("hx", &pairs(10, "field"));
+        c.cmd(&["HPEXPIRE", "hx", FAR_MS, "FIELDS", "1", "field:00000000"]);
+        assert_eq!(c.encoding("hl"), "listpack");
+        assert_eq!(c.encoding("hx"), "listpackex");
+        let port = server.port;
+        let until = Instant::now() + Duration::from_secs(3);
+        let mut threads = Vec::new();
+        for key in ["hl", "hx"] {
+            for _ in 0..3 {
+                threads.push(thread::spawn(move || {
+                    let mut c = Conn::connect(port);
+                    while Instant::now() < until {
+                        let reply = c.cmd(&["HSCAN", key, "0", "COUNT", "2"]);
+                        assert_eq!(reply.items()[0].text(), "0");
+                    }
+                }));
+            }
+            for _ in 0..2 {
+                threads.push(thread::spawn(move || {
+                    let mut c = Conn::connect(port);
+                    while Instant::now() < until {
+                        c.cmd(&["HSET", key, "extra", "v"]);
+                        c.cmd(&["HDEL", key, "extra"]);
+                    }
+                }));
+            }
+        }
+        // A client that waited for ever fails its read after 30 s.
+        for t in threads {
+            assert!(
+                t.join().is_ok(),
+                "{model}: a client never got its reply (deadlock)"
+            );
+        }
+        assert_eq!(c.cmd(&["PING"]), Resp::Simple("PONG".into()), "{model}");
+    }
+}
+
+/// `MEMORY USAGE` of `key` once it has stopped changing: a table's resize
+/// finished in the background gives its old array back at its end.
+fn settled_usage(c: &mut Conn, key: &str) -> i64 {
+    let mut last = c.cmd(&["MEMORY", "USAGE", key]).int();
+    let mut same = 0;
+    for _ in 0..200 {
+        thread::sleep(Duration::from_millis(20));
+        let now = c.cmd(&["MEMORY", "USAGE", key]).int();
+        same = if now == last { same + 1 } else { 0 };
+        if same == 5 {
+            break;
+        }
+        last = now;
+    }
+    last
+}
+
+/// A hash is sized for the fields it holds, not for the arguments it was
+/// given: an `HSET` naming the same fields many times in one command, and
+/// one naming one field thousands of times, leave a table the size of the
+/// same fields set once.
+#[test]
+fn a_hash_set_with_repeated_fields_is_sized_for_its_fields() {
+    let dir = temp_dir("dup-size");
+    let server = Server::start(dir.path(), &[]);
+    let mut c = server.conn();
+    let value = "v".repeat(100);
+    // One field, 5,000 times: a table (the value is past 64 bytes) of one.
+    let mut args: Vec<&str> = vec!["HSET", "one"];
+    for _ in 0..5_000 {
+        args.extend(["f", value.as_str()]);
+    }
+    assert_eq!(c.cmd(&args).int(), 1);
+    assert_eq!(c.encoding("one"), "hashtable");
+    c.cmd(&["HSET", "one-ref", "f", &value]);
+    assert_eq!(c.encoding("one-ref"), "hashtable");
+    let (got, want) = (
+        settled_usage(&mut c, "one"),
+        settled_usage(&mut c, "one-ref"),
+    );
+    assert!(
+        (got - want).abs() * 100 <= want * 5,
+        "one field set 5,000 times: {got}, set once: {want}"
+    );
+    // 1,000 fields, each named ten times in one command.
+    let names: Vec<String> = (0..1_000).map(|i| format!("field:{i:06}")).collect();
+    let mut args: Vec<&str> = vec!["HSET", "many"];
+    for _ in 0..10 {
+        for name in &names {
+            args.extend([name.as_str(), "v"]);
+        }
+    }
+    assert_eq!(c.cmd(&args).int(), 1_000);
+    let mut args: Vec<&str> = vec!["HSET", "many-ref"];
+    for name in &names {
+        args.extend([name.as_str(), "v"]);
+    }
+    assert_eq!(c.cmd(&args).int(), 1_000);
+    let (got, want) = (
+        settled_usage(&mut c, "many"),
+        settled_usage(&mut c, "many-ref"),
+    );
+    assert!(
+        (got - want).abs() * 100 <= want * 5,
+        "1,000 fields named ten times: {got}, once: {want}"
+    );
+}
+
+/// The `SCAN` guarantee through `HSCAN` of a table (#770): fields added
+/// between pages grow the table through several doublings, then deleted
+/// ones shrink it; every field there for the whole scan is returned, with
+/// its value.
+#[test]
+fn hscan_of_a_table_across_growth_and_shrink_misses_nothing() {
+    let dir = temp_dir("hscan-resize");
+    let server = Server::start(dir.path(), &[]);
+    let mut c = server.conn();
+    let lasting = pairs(2_000, "keep");
+    for chunk in lasting.chunks(500) {
+        c.hset("t", chunk);
+    }
+    for count in ["10", "100"] {
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = "0".to_string();
+        let mut page = 0usize;
+        loop {
+            let reply = c.cmd(&["HSCAN", "t", &cursor, "COUNT", count]);
+            cursor = reply.items()[0].text();
+            for pair in reply.items()[1].items().chunks(2) {
+                seen.insert((pair[0].bulk(), pair[1].bulk()));
+            }
+            if cursor == "0" {
+                break;
+            }
+            page += 1;
+            // Grow to 30,000 fields over the first 28 pages, then shrink.
+            if page <= 28 {
+                c.hset("t", &pairs(1_000, &format!("grow{page}-")));
+            } else if page <= 56 {
+                let gone: Vec<String> = (0..1_000)
+                    .map(|i| format!("grow{}-:{i:08}", page - 28))
+                    .collect();
+                let mut args: Vec<&str> = vec!["HDEL", "t"];
+                args.extend(gone.iter().map(String::as_str));
+                c.cmd(&args);
+            }
+        }
+        for pair in &lasting {
+            assert!(seen.contains(pair), "COUNT {count}: missed {pair:?}");
+        }
+        assert_eq!(c.encoding("t"), "hashtable");
     }
 }

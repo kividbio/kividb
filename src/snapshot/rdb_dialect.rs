@@ -21,7 +21,6 @@ use super::{
 };
 use crate::types::KiviDBValue;
 use std::io::{self, Read};
-use std::sync::Arc;
 
 /// The RDB version Valkey 9.0 and 9.1 write (`RDB_VERSION` in Valkey's
 /// `rdb.h`). Valkey 9.2 writes 81, with a type this does not read yet.
@@ -189,7 +188,7 @@ fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
         if let Some(at) = expires_at {
             inner.expiries.insert(field.clone(), field_deadline(at));
         }
-        inner.fields.insert_loaded(field, &value);
+        inner.fields.insert_loaded(field, &value)?;
     }
     // Nothing there: no key, as Valkey loads none.
     if inner.fields.is_empty() {
@@ -198,11 +197,11 @@ fn read_valkey_hash_2(r: &mut impl Read) -> io::Result<Option<KiviDBValue>> {
     if inner.expiries.is_empty() {
         // No field has a TTL left: a plain hash, as Valkey writes one
         // that never had any.
-        return Ok(Some(KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(
+        return Ok(Some(KiviDBValue::Hash(crate::hash_fields::shared(
             inner.fields,
-        )))));
+        ))));
     }
-    Ok(Some(KiviDBValue::HashEx(Arc::new(
-        parking_lot::RwLock::new(inner),
+    Ok(Some(KiviDBValue::HashEx(crate::hash_fields::shared_ex(
+        inner,
     ))))
 }

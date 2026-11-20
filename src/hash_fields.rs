@@ -5,35 +5,36 @@
 //!   no field and no value longer than `hash-max-listpack-value` bytes, is
 //!   one block holding the fields and values end to end ([`PackedHash`]): a
 //!   lookup scans a byte a field.
-//! - **Table.** Any other hash is an `IndexMap` of fields to shared values
-//!   (`Arc`).
+//! - **Table.** Any other hash is a [`CollectionTable`] (#764): each field
+//!   and its value side by side in one block of the entry pool (a value
+//!   past the pool's largest class in a block of the system allocator). It
+//!   gives `HSCAN` its cursor (`table_scan`), a uniformly random field in
+//!   O(1), and grows and shrinks a few fields at a time, so no write pays
+//!   for moving them all. A resize that the writes leave unfinished is
+//!   finished by the background ([`after_write`]), and the array a
+//!   finished one leaves is freed there too.
 //!
 //! A new hash is packed; it moves to the table when a write does not fit
 //! the block, and never back, as in Redis. Either form changes only through
 //! `&mut self`, so under the hash's own lock, as before.
 //!
-//! Fields keep the order they were first set in, which is the order
-//! `HGETALL`, `HKEYS`, `HVALS` and `HSCAN` give them in. Redis keeps that
-//! order for a hash small enough for a listpack, and clients have come to
-//! rely on it (BullMQ's tests among them).
+//! A block keeps its fields in the order they were first set in, which is
+//! the order `HGETALL`, `HKEYS`, `HVALS` and `HSCAN` give them in: Redis
+//! keeps that order for a hash small enough for a listpack, and clients
+//! have come to rely on it (BullMQ's tests among them). A table has no
+//! order, as a Redis hashtable has none.
 //!
 //! Callers see fields as `&str` and values as [`Value`]s: bytes, whatever
 //! the hash keeps them as. Snapshots, the AOF, replication and `DUMP` see
 //! nothing else, so none of them depends on the form.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
+use parking_lot::RwLock;
+
+use crate::collection_table::{CollectionTable, FieldIter, FieldRef, Fields};
 use crate::packed_hash::{self, PackedHash};
-
-type Table = indexmap::IndexMap<String, Arc<[u8]>, ahash::RandomState>;
-
-/// Up to this many fields, removing one keeps the others in order, as in a
-/// Redis listpack (`hash-max-listpack-entries`). A larger hash is a hash
-/// table in Redis too, with no order to keep: there the last field takes the
-/// removed one's place, which costs nothing. A packed hash always keeps
-/// its order.
-pub const HASH_ORDERED_FIELDS: usize = 512;
 
 /// `hash-max-listpack-entries` until `CONFIG SET` or the configuration file
 /// gives another: Redis's, and the most a block holds
@@ -104,8 +105,8 @@ pub fn set_packed_value(limit: usize) -> usize {
     limit
 }
 
-/// A value, as a hash hands it out: the table's shared bytes, or a block's
-/// bytes. Either is its bytes (`Deref`). The same as a list's elements.
+/// A value, as a hash hands it out: bytes of a block or of a table's entry.
+/// It is its bytes (`Deref`). The same as a list's elements.
 pub use crate::element::Value;
 
 /// What a hash is kept as, by Redis's names for its encodings.
@@ -121,14 +122,72 @@ pub struct HashFields {
     repr: Repr,
 }
 
-// Kept inline in every hash's shared block: no bigger than the table alone
-// was, so that hashes kept as the table do not grow.
-const _: () = assert!(std::mem::size_of::<HashFields>() <= std::mem::size_of::<Table>());
+// Kept inline in every hash's shared block: a block's header, or the box of
+// a table (whose own header is 80 bytes).
+const _: () = assert!(std::mem::size_of::<HashFields>() <= 32);
 
 #[derive(Clone)]
 enum Repr {
     Packed(PackedHash),
-    Table(Table),
+    Table(Box<Table>),
+}
+
+/// The table (#764), boxed, and whether it has been handed to the
+/// background ([`after_write`]).
+struct Table {
+    fields: CollectionTable<Fields>,
+    queued: bool,
+}
+
+impl Table {
+    fn with_capacity(fields: usize) -> Box<Self> {
+        let mut table = CollectionTable::with_capacity(fields);
+        // A finished resize's old array is freed by the background, not by
+        // the write that finished it.
+        table.defer_free(true);
+        Box::new(Table {
+            fields: table,
+            queued: false,
+        })
+    }
+
+    /// Set `field` to `value`; true if the field is new. A field or value
+    /// is at most `collection_table::MAX_LEN` (4 GiB) long here: a
+    /// command's argument is at most 512 MB, and a load checks first
+    /// ([`HashFields::insert_loaded`]).
+    #[inline]
+    fn set(&mut self, field: &str, value: &[u8]) -> bool {
+        debug_assert!(field.len() <= crate::collection_table::MAX_LEN);
+        debug_assert!(value.len() <= crate::collection_table::MAX_LEN);
+        self.fields
+            .insert(field.as_bytes(), value, None)
+            .unwrap_or(false)
+    }
+}
+
+impl Clone for Table {
+    /// A table of its own (`COPY`): every field copied, nothing shared.
+    fn clone(&self) -> Self {
+        let mut fields = self.fields.clone();
+        fields.defer_free(true);
+        Table {
+            fields,
+            queued: false,
+        }
+    }
+}
+
+/// A field's name as the table holds it.
+#[inline(always)]
+fn name(field: &[u8]) -> &str {
+    // SAFETY: a table is only ever given fields as `&str` (every insert
+    // below takes one), so its fields are UTF-8, as a block's are.
+    unsafe { std::str::from_utf8_unchecked(field) }
+}
+
+#[inline(always)]
+fn pair(entry: FieldRef<'_>) -> (&str, Value<'_>) {
+    (name(entry.field), Value::Bytes(entry.value))
 }
 
 impl Default for HashFields {
@@ -150,7 +209,7 @@ impl HashFields {
     /// for its index holds vectors, longer than a block takes).
     pub fn table_with_capacity(fields: usize) -> Self {
         Self {
-            repr: Repr::Table(Table::with_capacity_and_hasher(fields, Default::default())),
+            repr: Repr::Table(Table::with_capacity(fields)),
         }
     }
 
@@ -158,9 +217,7 @@ impl HashFields {
     /// that is more than a block would hold.
     pub fn with_capacity(fields: usize) -> Self {
         if fields > packed_entries() {
-            return Self {
-                repr: Repr::Table(Table::with_capacity_and_hasher(fields, Default::default())),
-            };
+            return Self::table_with_capacity(fields);
         }
         Self::new()
     }
@@ -181,10 +238,20 @@ impl HashFields {
         matches!(self.repr, Repr::Table(_))
     }
 
+    /// The table, for `HSCAN`'s cursor (`table_scan`); `None` for a block,
+    /// which `HSCAN` returns whole.
+    #[inline]
+    pub fn table(&self) -> Option<&CollectionTable<Fields>> {
+        match &self.repr {
+            Repr::Table(t) => Some(&t.fields),
+            Repr::Packed(_) => None,
+        }
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         match &self.repr {
-            Repr::Table(t) => t.len(),
+            Repr::Table(t) => t.fields.len(),
             Repr::Packed(p) => p.len(),
         }
     }
@@ -198,16 +265,25 @@ impl HashFields {
     /// counts it: a block is one allocation, a table one per field.
     pub fn free_effort(&self) -> usize {
         match &self.repr {
-            Repr::Table(t) => t.len(),
+            Repr::Table(t) => t.fields.len(),
             Repr::Packed(_) => 1,
         }
     }
 
-    /// Bytes that freeing the hash gives back, at least (for eviction): a
-    /// block's, exactly; a table's, `per_field` a field.
-    pub fn freeing_at_least(&self, per_field: usize) -> usize {
+    /// Bytes that freeing the hash gives back (for eviction): exact in
+    /// either form ([`Self::allocation_size`]).
+    pub fn freeing_at_least(&self, _per_field: usize) -> usize {
+        self.allocation_size()
+    }
+
+    /// Everything the hash holds but its own header, exactly as
+    /// `used_memory` counts it, in O(1): a block's one allocation, room to
+    /// spare included; for the table its box, group arrays, overflow groups
+    /// and entries at their pool class's size
+    /// ([`CollectionTable::allocation_size`]), mid-resize too.
+    pub fn allocation_size(&self) -> usize {
         match &self.repr {
-            Repr::Table(t) => t.len() * per_field,
+            Repr::Table(t) => std::mem::size_of::<Table>() + t.fields.allocation_size(),
             Repr::Packed(p) => p.allocation_size(),
         }
     }
@@ -215,17 +291,14 @@ impl HashFields {
     /// The value of `field`, if the hash has it.
     #[inline(always)]
     pub fn get(&self, field: &str) -> Option<Value<'_>> {
-        match &self.repr {
-            Repr::Table(t) => t.get(field).map(Value::Shared),
-            Repr::Packed(p) => p.get(field).map(Value::Bytes),
-        }
+        self.get_bytes(field).map(Value::Bytes)
     }
 
     /// The bytes of `field`'s value, if the hash has it.
     #[inline(always)]
     pub fn get_bytes(&self, field: &str) -> Option<&[u8]> {
         match &self.repr {
-            Repr::Table(t) => t.get(field).map(|v| &**v),
+            Repr::Table(t) => t.fields.get(field.as_bytes()).map(|entry| entry.value),
             Repr::Packed(p) => p.get(field),
         }
     }
@@ -233,28 +306,75 @@ impl HashFields {
     #[inline(always)]
     pub fn contains_key(&self, field: &str) -> bool {
         match &self.repr {
-            Repr::Table(t) => t.contains_key(field),
+            Repr::Table(t) => t.fields.contains_key(field.as_bytes()),
             Repr::Packed(p) => p.contains(field),
         }
     }
 
-    /// Field `i` and its value, in the order of [`Self::iter`]: a random
-    /// field is a random index, in either form.
-    #[inline]
-    pub fn get_index(&self, i: usize) -> Option<(&str, Value<'_>)> {
+    /// A field and its value, any one as likely as another; `None` if the
+    /// hash is empty.
+    pub fn random(&self, rng: &mut impl rand::Rng) -> Option<(&str, Value<'_>)> {
         match &self.repr {
-            Repr::Table(t) => t.get_index(i).map(|(f, v)| (f.as_str(), Value::Shared(v))),
-            Repr::Packed(p) => (i < p.len()).then(|| {
-                let (field, value) = p.entry(i);
-                (field, Value::Bytes(value))
-            }),
+            Repr::Table(t) => t.fields.random(rng).map(pair),
+            Repr::Packed(p) if p.is_empty() => None,
+            Repr::Packed(p) => {
+                let (field, value) = p.entry(rng.gen_range(0..p.len()));
+                Some((field, Value::Bytes(value)))
+            }
         }
+    }
+
+    /// Up to `count` different fields with their values, chosen at random
+    /// (`HRANDFIELD` with a positive count), in random order.
+    ///
+    /// A few of many (no more than a third) are picked one at a time,
+    /// picking again when one comes up twice: O(count). More of them are
+    /// chosen in one walk of the table (`choose_multiple`), then shuffled:
+    /// O(len), which is then no more than three times the answer. A block is
+    /// asked for the chosen places only.
+    pub fn random_distinct(
+        &self,
+        count: usize,
+        rng: &mut impl rand::Rng,
+    ) -> Vec<(&str, Value<'_>)> {
+        use rand::seq::{IteratorRandom, SliceRandom};
+        let len = self.len();
+        let count = count.min(len);
+        let t = match &self.repr {
+            Repr::Packed(p) => {
+                return rand::seq::index::sample(rng, len, count)
+                    .into_iter()
+                    .map(|i| {
+                        let (field, value) = p.entry(i);
+                        (field, Value::Bytes(value))
+                    })
+                    .collect();
+            }
+            Repr::Table(t) => t,
+        };
+        if count.saturating_mul(3) > len {
+            let mut picked = self.iter().choose_multiple(rng, count);
+            picked.shuffle(rng);
+            return picked;
+        }
+        // Each field is told apart by where its entry is: it has one.
+        let mut seen: ahash::AHashSet<usize> = ahash::AHashSet::with_capacity(count);
+        let mut picked = Vec::with_capacity(count);
+        while picked.len() < count {
+            let Some(entry) = t.fields.random(rng) else {
+                break;
+            };
+            if seen.insert(entry.field.as_ptr() as usize) {
+                picked.push(pair(entry));
+            }
+        }
+        picked
     }
 
     /// The write of `field` with `value` into the block, if there is one
     /// and they fit: `Some(whether the field is new)`. `None` if the hash
     /// is a table, now or because they did not fit: one pass moves the
-    /// fields to it, in order, and the caller writes to it.
+    /// fields to it, and the caller writes to it.
     #[inline(always)]
     fn set_packed(&mut self, field: &str, value: &[u8]) -> Option<bool> {
         match self.repr {
@@ -299,9 +419,9 @@ impl HashFields {
         let Repr::Packed(p) = &self.repr else {
             return;
         };
-        let mut table = Table::with_capacity_and_hasher(p.len() + more, Default::default());
+        let mut table = Table::with_capacity(p.len() + more);
         for (field, value) in p.iter() {
-            table.insert(field.to_owned(), Arc::from(value));
+            table.set(field, value);
         }
         self.repr = Repr::Table(table);
     }
@@ -317,12 +437,7 @@ impl HashFields {
     /// Give `field` the value `value`. Whether the field is new.
     #[inline]
     pub fn insert(&mut self, field: &str, value: &Arc<[u8]>) -> bool {
-        if let Some(added) = self.set_packed(field, value) {
-            return added;
-        }
-        self.table_mut()
-            .insert(field.to_owned(), Arc::clone(value))
-            .is_none()
+        self.insert_bytes(field, value)
     }
 
     /// [`Self::insert`] of bytes.
@@ -331,38 +446,37 @@ impl HashFields {
         if let Some(added) = self.set_packed(field, value) {
             return added;
         }
-        self.table_mut()
-            .insert(field.to_owned(), Arc::from(value))
-            .is_none()
+        self.table_mut().set(field, value)
     }
 
     /// [`Self::insert`] of a field and a value that are the caller's to
-    /// give away (a load): a table takes them as they are.
+    /// give away: copied in either form.
     #[inline]
     pub fn insert_owned(&mut self, field: String, value: Arc<[u8]>) -> bool {
-        if let Some(added) = self.set_packed(&field, &value) {
-            return added;
-        }
-        self.table_mut().insert(field, value).is_none()
+        self.insert_bytes(&field, &value)
     }
 
     /// [`Self::insert`] of a field read from a file or a payload (a load):
-    /// a table takes the field as it is, a block copies both.
+    /// an error, and nothing changed, for a field or a value longer than a
+    /// table holds (`collection_table::MAX_LEN`, 4 GiB), never dropped.
     #[inline]
-    pub fn insert_loaded(&mut self, field: String, value: &[u8]) -> bool {
+    pub fn insert_loaded(&mut self, field: String, value: &[u8]) -> std::io::Result<bool> {
         if let Some(added) = self.set_packed(&field, value) {
-            return added;
+            return Ok(added);
         }
-        self.table_mut().insert(field, Arc::from(value)).is_none()
+        self.table_mut()
+            .fields
+            .insert(field.as_bytes(), value, None)
+            .map_err(|too_long| std::io::Error::new(std::io::ErrorKind::InvalidData, too_long))
     }
 
-    /// Remove `field`. Whether the hash had it. A block, and a table of up
-    /// to [`HASH_ORDERED_FIELDS`] fields, keep the others in order.
+    /// Remove `field`. Whether the hash had it. A block keeps the others in
+    /// order.
     #[inline]
     pub fn remove(&mut self, field: &str) -> bool {
         match &mut self.repr {
             Repr::Packed(p) => p.remove(field),
-            Repr::Table(_) => self.take(field).is_some(),
+            Repr::Table(t) => t.fields.remove(field.as_bytes()),
         }
     }
 
@@ -375,45 +489,59 @@ impl HashFields {
                 p.remove_at(i);
                 Some(out)
             }
-            Repr::Table(_) => self.take(field).map(|v| f(&v)),
+            Repr::Table(t) => t
+                .fields
+                .remove_with(field.as_bytes(), |entry| f(entry.value)),
         }
     }
 
     /// [`Self::remove`], handing back the value.
     pub fn take(&mut self, field: &str) -> Option<Arc<[u8]>> {
-        match &mut self.repr {
-            Repr::Packed(_) => self.take_with(field, |v: &[u8]| Arc::<[u8]>::from(v)),
-            Repr::Table(t) => {
-                if t.len() <= HASH_ORDERED_FIELDS {
-                    t.shift_remove(field)
-                } else {
-                    t.swap_remove(field)
-                }
-            }
-        }
+        self.take_with(field, |v: &[u8]| Arc::<[u8]>::from(v))
     }
 
-    /// Keep the fields `keep` says to, in their order.
+    /// Keep the fields `keep` says to (a block keeps them in order).
     pub fn retain(&mut self, mut keep: impl FnMut(&str, &[u8]) -> bool) {
         match &mut self.repr {
-            Repr::Table(t) => t.retain(|f, v| keep(f, v)),
+            Repr::Table(t) => t
+                .fields
+                .retain(|entry| keep(name(entry.field), entry.value)),
             Repr::Packed(p) => p.retain(keep),
         }
     }
 
     pub fn clear(&mut self) {
         match &mut self.repr {
-            Repr::Table(t) => t.clear(),
+            Repr::Table(t) => t.fields.clear(),
             Repr::Packed(p) => p.clear(),
         }
     }
 
-    /// The fields and their values, in order.
+    /// The fields and their values: a block's in order, a table's in none.
     #[inline]
     pub fn iter(&self) -> Iter<'_> {
         match &self.repr {
-            Repr::Table(t) => Iter::Table(t.iter()),
+            Repr::Table(t) => Iter::Table(t.fields.iter()),
             Repr::Packed(p) => Iter::Packed(p.iter()),
+        }
+    }
+
+    /// Every field and its value, in [`Self::iter`]'s order, given to `f`:
+    /// one loop for each form, the form chosen once (`HGETALL`).
+    #[inline]
+    pub fn for_each(&self, mut f: impl FnMut(&str, Value<'_>)) {
+        match &self.repr {
+            Repr::Packed(p) => {
+                for (field, value) in p.iter() {
+                    f(field, Value::Bytes(value));
+                }
+            }
+            Repr::Table(t) => {
+                for entry in t.fields.iter() {
+                    let (field, value) = pair(entry);
+                    f(field, value);
+                }
+            }
         }
     }
 
@@ -428,48 +556,213 @@ impl HashFields {
     }
 
     /// What the hash's memory is, its own header left out, for
-    /// `MEMORY USAGE`: `samples` of the fields looked at, and the rest
-    /// counted as they are.
-    ///
-    /// A block is its one allocation, exactly. The table (`IndexMap`): its
-    /// table of indexes, its vector of entries (hash, name, value), both
-    /// with room for as many as it reports, and each name's and each
-    /// value's block, sampled. What it reports is the lesser room of the
-    /// two. That is the vector's for a hash made with room for its fields
-    /// (as a snapshot loads one) and both's for one that grew; but deleting
-    /// fields can leave the table fewer free buckets (hashbrown keeps a
-    /// deleted bucket marked until it is rebuilt), and then part of the
-    /// vector's room is not seen and not counted.
-    pub fn layout_bytes(&self, samples: usize) -> usize {
-        use crate::commands::memory_layout::{arc_slice, hash_table, sampled};
-        let table = match &self.repr {
-            Repr::Packed(p) => return p.allocation_size(),
-            Repr::Table(t) => t,
-        };
-        let capacity = table.capacity();
-        let indexes = hash_table(
-            capacity,
-            std::mem::size_of::<usize>(),
-            std::mem::align_of::<usize>(),
-        );
-        let entries = capacity.saturating_mul(std::mem::size_of::<(usize, String, Arc<[u8]>)>());
-        let len = table.len();
-        // An `IndexMap` gets to its n-th entry at once, so the sample is
-        // spread over the hash rather than taken from its first fields only.
-        let bytes = |(name, value): (&String, &Arc<[u8]>)| name.capacity() + arc_slice(value.len());
-        let each = if samples >= len {
-            sampled(len, samples, || table.iter().map(bytes))
-        } else {
-            let step = (len / samples.max(1)).max(1);
-            sampled(len, samples, || table.iter().step_by(step).map(bytes))
-        };
-        indexes + entries + each
+    /// `MEMORY USAGE`: exact in either form and in O(1), whatever `samples`
+    /// says ([`Self::allocation_size`]).
+    pub fn layout_bytes(&self, _samples: usize) -> usize {
+        self.allocation_size()
     }
+
+    /// Whether the background has work on this hash (a resize to finish,
+    /// or a finished one's array to free) that it has not been handed yet;
+    /// if so, it is now marked handed. Near `maxmemory` the work is done
+    /// here instead ([`Self::settle_if_tight`]) and nothing is handed over.
+    #[inline]
+    fn hand_over(&mut self) -> bool {
+        let Repr::Table(t) = &mut self.repr else {
+            return false;
+        };
+        if !(t.fields.resizing() || t.fields.holds_retired()) {
+            return false;
+        }
+        self.hand_over_table()
+    }
+
+    /// [`Self::hand_over`] of a table with work for the background: out of
+    /// line, so that a write that leaves none pays only the check above.
+    #[cold]
+    #[inline(never)]
+    fn hand_over_table(&mut self) -> bool {
+        if self.settle_if_tight() {
+            return false;
+        }
+        let Repr::Table(t) = &mut self.repr else {
+            return false;
+        };
+        let due = !t.queued;
+        t.queued = true;
+        due
+    }
+
+    /// Near `maxmemory`, finish a resize in progress and free the old
+    /// arrays now, on this thread, as a table that grows all at once does
+    /// (and as hashes did before #764): the arrays a resize holds are there
+    /// only until it ends, and must never be what makes the server refuse a
+    /// write or evict a key. Returns whether it did
+    /// (`resize_background::tight`).
+    fn settle_if_tight(&mut self) -> bool {
+        let Repr::Table(t) = &mut self.repr else {
+            return false;
+        };
+        if !crate::resize_background::tight(t.fields.transient_bytes()) {
+            return false;
+        }
+        while !t.fields.step_resize(usize::MAX) {}
+        drop(t.fields.take_retired());
+        true
+    }
+
+    /// Finish a resize in progress and free what it leaves, now. Whether
+    /// any memory was given back.
+    fn settle(&mut self) -> bool {
+        let Repr::Table(t) = &mut self.repr else {
+            return false;
+        };
+        let released = t.fields.transient_bytes() > 0;
+        while !t.fields.step_resize(usize::MAX) {}
+        drop(t.fields.take_retired());
+        t.queued = false;
+        released
+    }
+
+    /// One step of the background's work on the hash: about `budget` units
+    /// of a resize in progress. Returns whether the hash has no more for
+    /// it, and the array a finished resize left, to be freed elsewhere.
+    fn background_step(
+        &mut self,
+        budget: usize,
+    ) -> (bool, Option<crate::collection_table::Retired>) {
+        let Repr::Table(t) = &mut self.repr else {
+            return (true, None);
+        };
+        let finished = t.fields.step_resize(budget);
+        let retired = t.fields.take_retired();
+        if finished {
+            t.queued = false;
+        }
+        (finished, retired)
+    }
+
+    /// Whether the hash is handed to the background (tests).
+    #[cfg(test)]
+    pub(crate) fn is_queued(&self) -> bool {
+        matches!(&self.repr, Repr::Table(t) if t.queued)
+    }
+
+    /// Finish whatever resize is in progress now, and free what it leaves
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn finish_resize(&mut self) {
+        while !self.background_step(usize::MAX).0 {}
+    }
+}
+
+// ── the background's part (#764 step 3) ───────────────────────────────────────
+//
+// As for sets (`member_set`, `resize_background`): a write that leaves its
+// hash mid-resize, or with a finished resize's old array kept back, hands
+// the hash over, and the active-expire thread finishes it a step at a time
+// under the hash's own lock. A hash with field TTLs (`HashInner`) is handed
+// over the same way.
+
+type Shared = Arc<RwLock<HashFields>>;
+type SharedEx = Arc<RwLock<crate::types::HashInner>>;
+
+impl crate::resize_background::Resizable for RwLock<HashFields> {
+    fn try_step(&self, budget: usize) -> Option<(bool, Option<crate::collection_table::Retired>)> {
+        Some(self.try_write()?.background_step(budget))
+    }
+
+    fn try_settle(&self) -> Option<bool> {
+        Some(self.try_write()?.settle())
+    }
+
+    fn let_go(self: Arc<Self>) -> bool {
+        match Arc::into_inner(self) {
+            Some(last) => {
+                crate::lazyfree::free_later(last, 0);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl crate::resize_background::Resizable for RwLock<crate::types::HashInner> {
+    fn try_step(&self, budget: usize) -> Option<(bool, Option<crate::collection_table::Retired>)> {
+        Some(self.try_write()?.fields.background_step(budget))
+    }
+
+    fn try_settle(&self) -> Option<bool> {
+        Some(self.try_write()?.fields.settle())
+    }
+
+    fn let_go(self: Arc<Self>) -> bool {
+        match Arc::into_inner(self) {
+            Some(last) => {
+                crate::lazyfree::free_later(last, 0);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// After a write to `hash` (whose write lock `inner` is): hands it to the
+/// background if it has work there. A few instructions when not.
+#[inline]
+pub fn after_write(hash: &Shared, inner: &mut HashFields) {
+    if inner.hand_over() {
+        hand(hash);
+    }
+}
+
+/// [`after_write`] of a hash with field TTLs.
+#[inline]
+pub fn after_write_ex(hash: &SharedEx, inner: &mut crate::types::HashInner) {
+    if inner.fields.hand_over() {
+        hand_ex(hash);
+    }
+}
+
+#[cold]
+fn hand(hash: &Shared) {
+    let weak: Weak<RwLock<HashFields>> = Arc::downgrade(hash);
+    crate::resize_background::hand(weak);
+}
+
+#[cold]
+fn hand_ex(hash: &SharedEx) {
+    let weak: Weak<RwLock<crate::types::HashInner>> = Arc::downgrade(hash);
+    crate::resize_background::hand(weak);
+}
+
+/// `hash` made a key's value: shared, and handed to the background if a
+/// resize it went through while it was built is still in progress. What
+/// every hash made whole goes through (a load, `RESTORE`, `COPY`, a new key
+/// of `HSET`).
+pub fn shared(mut hash: HashFields) -> Shared {
+    let due = hash.hand_over();
+    let shared = Arc::new(RwLock::new(hash));
+    if due {
+        hand(&shared);
+    }
+    shared
+}
+
+/// [`shared`] of a hash with field TTLs (one made whole, or a hash that
+/// gets its first field TTL and moves its fields to a `HashInner`).
+pub fn shared_ex(mut hash: crate::types::HashInner) -> SharedEx {
+    let due = hash.fields.hand_over();
+    let shared = Arc::new(RwLock::new(hash));
+    if due {
+        hand_ex(&shared);
+    }
+    shared
 }
 
 pub enum Iter<'a> {
     Packed(packed_hash::Iter<'a>),
-    Table(indexmap::map::Iter<'a, String, Arc<[u8]>>),
+    Table(FieldIter<'a>),
 }
 
 impl<'a> Iterator for Iter<'a> {
@@ -479,7 +772,7 @@ impl<'a> Iterator for Iter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Iter::Packed(it) => it.next().map(|(f, v)| (f, Value::Bytes(v))),
-            Iter::Table(it) => it.next().map(|(f, v)| (f.as_str(), Value::Shared(v))),
+            Iter::Table(it) => it.next().map(pair),
         }
     }
 
@@ -495,7 +788,7 @@ impl<'a> Iterator for Iter<'a> {
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
         match self {
             Iter::Packed(it) => it.nth(n).map(|(f, v)| (f, Value::Bytes(v))),
-            Iter::Table(it) => it.nth(n).map(|(f, v)| (f.as_str(), Value::Shared(v))),
+            Iter::Table(it) => it.nth(n).map(pair),
         }
     }
 }
@@ -511,11 +804,10 @@ impl<'a> IntoIterator for &'a HashFields {
     }
 }
 
-/// The fields and values of a hash given away: a table's as they are, a
-/// block's copied out.
+/// The fields and values of a hash given away, copied out.
 pub enum IntoIter {
     Packed(PackedHash, usize),
-    Table(indexmap::map::IntoIter<String, Arc<[u8]>>),
+    Table(std::vec::IntoIter<(String, Arc<[u8]>)>),
 }
 
 impl Iterator for IntoIter {
@@ -554,7 +846,13 @@ impl IntoIterator for HashFields {
     fn into_iter(self) -> IntoIter {
         match self.repr {
             Repr::Packed(p) => IntoIter::Packed(p, 0),
-            Repr::Table(t) => IntoIter::Table(t.into_iter()),
+            Repr::Table(t) => IntoIter::Table(
+                t.fields
+                    .iter()
+                    .map(|entry| (name(entry.field).to_owned(), Arc::from(entry.value)))
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            ),
         }
     }
 }
@@ -628,14 +926,10 @@ mod tests {
                 }
             }
         }
-        fn remove(&mut self, field: &str, ordered: bool) -> bool {
+        fn remove(&mut self, field: &str) -> bool {
             match self.0.iter().position(|(f, _)| f == field) {
                 Some(i) => {
-                    if ordered {
-                        self.0.remove(i);
-                    } else {
-                        self.0.swap_remove(i);
-                    }
+                    self.0.remove(i);
                     true
                 }
                 None => false,
@@ -643,22 +937,25 @@ mod tests {
         }
     }
 
-    /// Contents and `len` always; the order while the hash is packed, and
-    /// while a table keeps it (up to `HASH_ORDERED_FIELDS`, which the model
-    /// follows by removing as the table does).
+    /// Contents and `len` always; the order while the hash is packed (a
+    /// table has none).
     fn assert_same(hash: &HashFields, model: &Model, step: usize) {
         assert_eq!(hash.len(), model.0.len(), "step {step}");
-        let held: Vec<(String, Vec<u8>)> = hash
+        let mut held: Vec<(String, Vec<u8>)> = hash
             .iter()
             .map(|(f, v)| (f.to_string(), v.to_vec()))
             .collect();
-        assert_eq!(held, model.0, "step {step}");
-        for (i, (f, v)) in model.0.iter().enumerate() {
-            assert_eq!(hash.get_bytes(f), Some(v.as_slice()), "step {step} {f}");
-            let (field, value) = hash.get_index(i).unwrap();
-            assert_eq!((field, value.bytes()), (f.as_str(), v.as_slice()));
+        if hash.is_table() {
+            let mut want = model.0.clone();
+            held.sort();
+            want.sort();
+            assert_eq!(held, want, "step {step}");
+        } else {
+            assert_eq!(held, model.0, "step {step}");
         }
-        assert!(hash.get_index(model.0.len()).is_none());
+        for (f, v) in &model.0 {
+            assert_eq!(hash.get_bytes(f), Some(v.as_slice()), "step {step} {f}");
+        }
     }
 
     struct Limits;
@@ -666,6 +963,11 @@ mod tests {
         fn drop(&mut self) {
             own_limits(None);
         }
+    }
+
+    fn rng() -> rand::rngs::StdRng {
+        use rand::SeedableRng;
+        rand::rngs::StdRng::seed_from_u64(764)
     }
 
     #[test]
@@ -694,7 +996,8 @@ mod tests {
         assert_eq!(hash.encoding(), Encoding::Listpack);
         assert!(hash.insert_bytes("f4", b"v"));
         assert!(hash.is_table());
-        let fields: Vec<&str> = hash.keys().collect();
+        let mut fields: Vec<&str> = hash.keys().collect();
+        fields.sort_unstable();
         assert_eq!(fields, ["f0", "f1", "f2", "f3", "f4"]);
         assert_eq!(hash.get_bytes("f0"), Some(&b"w"[..]));
         // By a long field.
@@ -726,7 +1029,7 @@ mod tests {
         assert!(hash.insert_bytes(&format!("{:064}", 511), &value));
         assert!(hash.is_table());
         assert_eq!(hash.len(), 512);
-        assert_eq!(hash.keys().next(), Some(&*format!("{:064}", 0)));
+        assert_eq!(hash.get_bytes(&format!("{:064}", 0)), Some(&value[..]));
     }
 
     #[test]
@@ -754,6 +1057,7 @@ mod tests {
             state ^= state << 17;
             state
         };
+        let mut rng = rng();
         for run in 0..24 {
             // Settings that move during the run, as `CONFIG SET` may.
             let mut limits = [512usize, 64];
@@ -772,7 +1076,7 @@ mod tests {
                 match (r >> 20) % 16 {
                     0..=8 => {
                         let len = if long_every != 0 && (r >> 30) % long_every == 2 {
-                            65 + (r >> 40) as usize % 30
+                            65 + (r >> 40) as usize % 300
                         } else {
                             ((r >> 40) % 64) as usize
                         };
@@ -786,9 +1090,7 @@ mod tests {
                         assert_eq!(did, added, "step {step}");
                     }
                     9..=12 => {
-                        // A table past the ordered limit swaps the last in.
-                        let ordered = !hash.is_table() || hash.len() <= HASH_ORDERED_FIELDS;
-                        let had = model.remove(&name, ordered);
+                        let had = model.remove(&name);
                         let did = if r % 2 == 0 {
                             hash.remove(&name)
                         } else {
@@ -809,13 +1111,21 @@ mod tests {
                             hash.contains_key(&name),
                             model.0.iter().any(|(f, _)| *f == name)
                         );
-                        if !model.0.is_empty() {
-                            let i = (r >> 30) as usize % model.0.len();
-                            let (f, v) = hash.get_index(i).unwrap();
-                            assert_eq!(
-                                (f, v.bytes()),
-                                (model.0[i].0.as_str(), model.0[i].1.as_slice())
-                            );
+                        match hash.random(&mut rng) {
+                            Some((f, v)) => assert!(
+                                model.0.iter().any(|(mf, mv)| mf == f && mv == v.bytes()),
+                                "step {step}"
+                            ),
+                            None => assert!(model.0.is_empty()),
+                        }
+                        let n = (r >> 30) as usize % (model.0.len() + 2);
+                        let picked = hash.random_distinct(n, &mut rng);
+                        assert_eq!(picked.len(), n.min(model.0.len()));
+                        let distinct: std::collections::HashSet<&str> =
+                            picked.iter().map(|(f, _)| *f).collect();
+                        assert_eq!(distinct.len(), picked.len());
+                        for (f, v) in &picked {
+                            assert_eq!(hash.get_bytes(f), Some(v.bytes()));
                         }
                     }
                     14 => {
@@ -834,8 +1144,7 @@ mod tests {
                         own_limits(Some(limits));
                     }
                 }
-                let packed = !hash.is_table();
-                if packed {
+                if !hash.is_table() {
                     assert!(hash.len() <= packed_hash::MAX_ENTRIES);
                 }
                 assert_same(&hash, &model, step);
@@ -844,10 +1153,10 @@ mod tests {
     }
 
     /// A field loaded twice (a file or a payload that names it twice) keeps
-    /// its first place and its last value, in a block and in a table, as
-    /// the `IndexMap` always did.
+    /// its last value, in a block (and its first place there) and in a
+    /// table.
     #[test]
-    fn a_field_loaded_twice_keeps_its_first_place_and_last_value() {
+    fn a_field_loaded_twice_keeps_its_last_value() {
         for (n, table) in [(3usize, false), (600, true)] {
             let mut pairs: Vec<(String, Arc<[u8]>)> = (0..n)
                 .map(|i| (format!("f{i}"), Arc::from(format!("v{i}").as_bytes())))
@@ -856,25 +1165,23 @@ mod tests {
             let collected: HashFields = pairs.iter().cloned().collect();
             let mut loaded = HashFields::with_capacity(pairs.len());
             for (field, value) in &pairs {
-                loaded.insert_loaded(field.clone(), value);
+                loaded.insert_loaded(field.clone(), value).unwrap();
             }
             for hash in [&collected, &loaded] {
                 assert_eq!(hash.is_table(), table, "{n}");
                 assert_eq!(hash.len(), n, "{n}");
-                assert_eq!(
-                    hash.get_index(1).map(|(f, v)| (f, v.to_vec())),
-                    Some(("f1", b"again".to_vec()))
-                );
                 assert_eq!(hash.get_bytes("f1"), Some(&b"again"[..]));
-                let fields: Vec<&str> = hash.keys().take(3).collect();
-                assert_eq!(fields, ["f0", "f1", "f2"][..n.min(3)]);
+                if !table {
+                    let fields: Vec<&str> = hash.keys().collect();
+                    assert_eq!(fields, ["f0", "f1", "f2"]);
+                }
             }
         }
         assert!(HashFields::table_with_capacity(2).is_table());
     }
 
     #[test]
-    fn a_hash_given_away_hands_over_its_fields_in_order() {
+    fn a_hash_given_away_hands_over_its_fields() {
         for n in [3usize, 600] {
             let mut hash = HashFields::new();
             for i in 0..n {
@@ -882,10 +1189,152 @@ mod tests {
             }
             let pairs: Vec<(String, Arc<[u8]>)> = hash.clone().into_iter().collect();
             assert_eq!(pairs.len(), n);
-            assert_eq!(pairs[2], ("f2".to_string(), Arc::from(&b"v2"[..])));
+            assert!(pairs.contains(&("f2".to_string(), Arc::from(&b"v2"[..]))));
             let back: HashFields = pairs.into_iter().collect();
             assert_eq!(back, hash);
             assert_eq!(back.is_table(), hash.is_table());
         }
+    }
+
+    /// A load refuses a field or a value longer than a table holds, with an
+    /// error and nothing changed (#965's review: never dropped). Tried with
+    /// the table's limit lowered: 4 GiB of bytes is not something a test
+    /// makes.
+    #[test]
+    fn a_load_refuses_what_a_table_cannot_hold() {
+        struct Back;
+        impl Drop for Back {
+            fn drop(&mut self) {
+                crate::collection_table::set_test_max_len(None);
+            }
+        }
+        let _back = Back;
+        crate::collection_table::set_test_max_len(Some(100));
+        let mut hash = HashFields::with_capacity(1_000);
+        assert!(hash.insert_loaded("f".into(), b"v").unwrap());
+        let long = vec![b'x'; 101];
+        let err = hash.insert_loaded("g".into(), &long).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let err = hash
+            .insert_loaded(String::from_utf8(long.clone()).unwrap(), b"v")
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(hash.len(), 1);
+        assert_eq!(hash.get_bytes("f"), Some(&b"v"[..]));
+        // A block moves to the table for a long value, and is refused the
+        // same way.
+        let mut small = HashFields::new();
+        small.insert_loaded("a".into(), b"1").unwrap();
+        assert!(small.insert_loaded("b".into(), &long).is_err());
+        assert!(small.get_bytes("b").is_none());
+    }
+
+    /// Random picks of a table are uniform: each of 1,000 fields comes up
+    /// about as often as another (a chi-square bound, generous).
+    #[test]
+    fn random_fields_of_a_table_are_uniform() {
+        let n = 1_000;
+        let mut hash = HashFields::new();
+        for i in 0..n {
+            hash.insert_bytes(&format!("field:{i}"), b"v");
+        }
+        assert!(hash.is_table());
+        let mut counts: ahash::AHashMap<String, usize> = ahash::AHashMap::new();
+        let per = 200;
+        let mut rng = rng();
+        for _ in 0..n * per {
+            let (f, _) = hash.random(&mut rng).unwrap();
+            *counts.entry(f.to_string()).or_default() += 1;
+        }
+        assert_eq!(counts.len(), n);
+        let chi: f64 = counts
+            .values()
+            .map(|&c| {
+                let d = c as f64 - per as f64;
+                d * d / per as f64
+            })
+            .sum();
+        // 999 degrees of freedom: mean 999, sd about 45.
+        assert!(chi < 1_300.0, "chi-square {chi}");
+    }
+
+    /// The background finishes a resize the writes left, a step at a time,
+    /// and frees the old array; a hash with field TTLs too.
+    #[test]
+    fn the_background_finishes_a_hashs_resize() {
+        let _limits = Limits;
+        own_limits(Some([DEFAULT_PACKED_ENTRIES, DEFAULT_PACKED_VALUE]));
+        let hash = shared(HashFields::new());
+        let mut i = 0usize;
+        {
+            let mut inner = hash.write();
+            while i < 5_000 || !inner.table().is_some_and(|t| t.resizing()) {
+                inner.insert_bytes(&format!("field:{i:08}"), b"value");
+                i += 1;
+            }
+            after_write(&hash, &mut inner);
+            assert!(inner.is_queued());
+        }
+        assert!(crate::resize_background::is_handed(
+            Arc::as_ptr(&hash).cast()
+        ));
+        let mid = hash.read().allocation_size();
+        for _ in 0..1_000_000 {
+            {
+                let inner = hash.read();
+                let t = inner.table().unwrap();
+                if !t.resizing() && !t.holds_retired() && !inner.is_queued() {
+                    break;
+                }
+            }
+            crate::resize_background::step_background(std::time::Duration::from_millis(1));
+        }
+        let inner = hash.read();
+        assert!(!inner.table().unwrap().resizing());
+        assert!(!inner.is_queued());
+        assert!(inner.allocation_size() < mid);
+        assert_eq!(inner.len(), i);
+        assert_eq!(inner.get_bytes("field:00000007"), Some(&b"value"[..]));
+        drop(inner);
+        // With field TTLs: the same, through `HashInner`.
+        let mut fields = HashFields::table_with_capacity(0);
+        let mut j = 0usize;
+        while j < 5_000 || !fields.table().unwrap().resizing() {
+            fields.insert_bytes(&format!("f{j}"), b"v");
+            j += 1;
+        }
+        let ex = shared_ex(crate::types::HashInner::from_fields(fields));
+        assert!(ex.read().fields.is_queued());
+        for _ in 0..1_000_000 {
+            if !ex.read().fields.is_queued() {
+                break;
+            }
+            crate::resize_background::step_background(std::time::Duration::from_millis(1));
+        }
+        let inner = ex.read();
+        assert!(!inner.fields.table().unwrap().resizing());
+        assert_eq!(inner.len(), j);
+        let mut copy = inner.fields.clone();
+        copy.finish_resize();
+        assert_eq!(copy, inner.fields);
+    }
+
+    /// `MEMORY USAGE`'s figure is exact in both forms: what was allocated
+    /// for the hash, mid-resize included, by the table's own count.
+    #[test]
+    fn allocation_size_counts_the_box_and_the_table() {
+        let mut hash = HashFields::new();
+        for i in 0..2_000 {
+            hash.insert_bytes(&format!("field:{i}"), b"value");
+        }
+        let Repr::Table(t) = &hash.repr else {
+            panic!("a table");
+        };
+        assert_eq!(
+            hash.allocation_size(),
+            std::mem::size_of::<Table>() + t.fields.allocation_size()
+        );
+        assert_eq!(hash.freeing_at_least(0), hash.allocation_size());
+        assert_eq!(hash.layout_bytes(5), hash.allocation_size());
     }
 }

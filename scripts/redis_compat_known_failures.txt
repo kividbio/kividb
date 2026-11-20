@@ -26,3 +26,12 @@ unit/querybuf | query buffer resized correctly with fat argv | io_uring
 # A known 1.x issue: Lua 5.4 holds more memory than Redis's 5.1 after
 # loading, and used_memory_vm_functions ends just over the test's limit.
 unit/scripting | Verify Lua performs GC correctly after script loading
+
+# The tests raise `hash-max-ziplist-value` to 1,000,000,000 and compare the
+# order HGETALL gives a hash of 8 KB and 64 KB values with a listpack's. The
+# limit here goes no higher than 64 bytes, so that hash is a `hashtable`,
+# which since #764 (hashes on `CollectionTable`) has no order, as a Redis
+# hashtable has none; the fields and values are right (the tests' own sorted
+# comparison passes).
+unit/type/hash | Hash ziplist of various encodings
+unit/type/hash | Hash ziplist of various encodings - sanitize dump

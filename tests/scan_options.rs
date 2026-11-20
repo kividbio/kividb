@@ -461,13 +461,13 @@ fn what_stays_is_returned_while_the_collection_grows_and_shrinks() {
                 let (next, names) = page(&c.run(&args));
                 // At most 23,040 members here: a floor of 22. (A collection
                 // in its compact form comes back whole, cursor 0.) A set's
-                // table (#764) has no floor: a page ends at the first group
+                // or a hash's table (#764) has no floor: a page ends at the first group
                 // boundary once COUNT is reached, and while the table
                 // resizes, a group of the smaller array goes with its groups
                 // in the larger (up to four in a shrink), so a page can pass
                 // COUNT by that unit's members: 64 at most, chains and all,
                 // at any fill these sizes reach.
-                let most = if scan == "SSCAN" {
+                let most = if scan == "SSCAN" || scan == "HSCAN" {
                     count + 64
                 } else {
                     count.max(22) + 2

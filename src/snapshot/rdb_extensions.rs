@@ -248,18 +248,18 @@ fn hash_with_ttls(fields: Vec<(Vec<u8>, Vec<u8>, Option<u64>)>) -> io::Result<Op
         if let Some(at) = expires_at {
             inner.expiries.insert(field.clone(), field_deadline(at));
         }
-        inner.fields.insert_loaded(field, &value);
+        inner.fields.insert_loaded(field, &value)?;
     }
     if inner.fields.is_empty() {
         return Ok(None);
     }
     if inner.expiries.is_empty() {
-        return Ok(Some(KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(
+        return Ok(Some(KiviDBValue::Hash(crate::hash_fields::shared(
             inner.fields,
-        )))));
+        ))));
     }
-    Ok(Some(KiviDBValue::HashEx(Arc::new(
-        parking_lot::RwLock::new(inner),
+    Ok(Some(KiviDBValue::HashEx(crate::hash_fields::shared_ex(
+        inner,
     ))))
 }
 
@@ -319,7 +319,7 @@ pub(super) fn apply_keydb_subexpiry(
         inner.expiries.insert(field, field_deadline(at));
     }
     let emptied = inner.fields.is_empty();
-    *value = KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner)));
+    *value = KiviDBValue::HashEx(crate::hash_fields::shared_ex(inner));
     Ok(if emptied {
         SubExpiry::Emptied
     } else {
