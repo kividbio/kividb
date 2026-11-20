@@ -2983,13 +2983,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   through unchanged (#978).** `timefmt(@ts, "%Y年%m月%d日")` answers
   `1970年01月01日` for `ts=0`, as Redis does.
 
-- **The array commands' events name a key that is not text by its bytes.**
+- **The array commands' keyspace events name the key by its bytes.**
   `ARSET`, `ARMSET`, `ARINSERT`, `ARRING`, `ARSEEK`, `ARDEL` and
-  `ARDELRANGE` asked for the key as UTF-8 before announcing their keyspace
-  events, so on a key that is not text the command ran but nothing was
-  published — no `arset` on `__keyevent@0__:arset`, and no `del` when
-  `ARDEL` emptied the array. The events now name the key as it is, as every
-  other command's events already do.
+  `ARDELRANGE` publish their events for a key of any bytes, as every other
+  command's events do.
 
 ## [1.2.2] - 2026-11-13
 

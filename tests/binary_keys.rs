@@ -1215,8 +1215,7 @@ fn keys_and_names_of_any_bytes_survive_every_copy() {
 
 /// The array commands' events name the key by its bytes: `ARSET` on a key
 /// that is not text announces `arset`, and `ARDEL` of what it empties
-/// announces `del`, as on any other key — before, `notify_array_event`
-/// asked for the key as UTF-8 and silently sent nothing.
+/// announces `del`, as on any other key.
 #[test]
 fn array_events_announce_a_key_that_is_not_text() {
     let s = Server::start(&[]);
