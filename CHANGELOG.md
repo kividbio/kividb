@@ -537,11 +537,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     in selectors too) and passwords of any bytes, and a pattern matches a
     key's or channel's bytes exactly. `ACL LIST`, `ACL GETUSER`, `ACL LOG`'s
     `object` and the ACL file give a pattern's own bytes, as Redis writes
-    them. A word of the ACL file that begins with a quote is read as Redis
-    reads a quoted one; any other is its bytes up to the next white space,
-    as before.
-  - A key or channel pattern with white space or a NUL in it is refused
-    (`Syntax error`), as by Redis: the ACL file could not hold it.
+    them.
+  - The ACL file: a user name is read as written, whatever it begins with,
+    and a file written by an earlier version loads to the same users and
+    rules (a line is split at white space as before; a pattern read from
+    the file may hold a NUL). A rule word that begins with a quote is read
+    as Redis reads a quoted one (`"~app:\xff*"`), and a line that is not
+    UTF-8 is split at ASCII white space.
+  - `ACL SETUSER` refuses white space (any Unicode white space) and NUL in
+    a key or channel pattern, and white space in a user name: what it takes
+    is saved by `ACL SAVE` and reads back the same.
+  - A `RESTORE` payload or a KDB file that names one hash field twice, in
+    two spellings that stand for the same bytes, is refused.
   - Going back to 1.2.x: an ACL file saved with a pattern that is not UTF-8
     in it is refused by 1.2.x at startup and by its `ACL LOAD`; remove the
     pattern (or the user) before the rollback.

@@ -2460,6 +2460,7 @@ fn read_image_body(
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
                     let mut hmap = crate::types::HashFields::with_capacity(hint(count));
+                    let mut collisions = crate::hash_fields::Collisions::default();
                     for _ in 0..count {
                         let field_bytes = read_bytes(&mut r)?;
                         let field =
@@ -2467,7 +2468,15 @@ fn read_image_body(
                                 io::Error::new(io::ErrorKind::InvalidData, "bad hash field")
                             })?;
                         let val = read_bytes(&mut r)?;
-                        hmap.insert_loaded(&*field, &val)?;
+                        // Two spellings that stand for one field (a file no
+                        // writer makes): refused, not merged into one.
+                        let added = hmap.insert_loaded(&*field, &val)?;
+                        if !collisions.allows(&field_bytes, &field, added) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "duplicate hash field",
+                            ));
+                        }
                     }
                     KiviDBValue::Hash(crate::hash_fields::shared(hmap))
                 }
@@ -2747,6 +2756,7 @@ fn read_image_body(
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
                     let mut hmap = crate::types::HashFields::with_capacity(hint(count));
+                    let mut collisions = crate::hash_fields::Collisions::default();
                     for _ in 0..count {
                         let field_bytes = read_bytes(&mut r)?;
                         let field =
@@ -2754,7 +2764,15 @@ fn read_image_body(
                                 io::Error::new(io::ErrorKind::InvalidData, "bad hash field")
                             })?;
                         let val = read_bytes(&mut r)?;
-                        hmap.insert_loaded(&*field, &val)?;
+                        // Two spellings that stand for one field (a file no
+                        // writer makes): refused, not merged into one.
+                        let added = hmap.insert_loaded(&*field, &val)?;
+                        if !collisions.allows(&field_bytes, &field, added) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "duplicate hash field",
+                            ));
+                        }
                     }
                     // Expiries: each persisted Unix ms kept as it is (#594). A
                     // field whose time has passed is dropped, unless fields
@@ -6165,11 +6183,16 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             let mut pos = 4usize;
             // The payload's word for the count: a hint, no more (`hint`).
             let mut map = crate::types::HashFields::with_capacity(hint(count));
+            let mut collisions = crate::hash_fields::Collisions::default();
             for _ in 0..count {
                 let (field_bytes, next) = read_bytes_slice(payload, pos)?;
                 let field = crate::hash_fields::loaded_name(field_bytes)?;
                 let (val_bytes, next2) = read_bytes_slice(payload, next)?;
-                map.insert_loaded(&*field, val_bytes).ok()?;
+                // Two spellings of one field: not a payload any writer makes.
+                let added = map.insert_loaded(&*field, val_bytes).ok()?;
+                if !collisions.allows(field_bytes, &field, added) {
+                    return None;
+                }
                 pos = next2;
             }
             Some(KiviDBValue::Hash(crate::hash_fields::shared(map)))
@@ -6231,11 +6254,16 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             let mut pos = 4usize;
             // The payload's word for the count: a hint, no more (`hint`).
             let mut map = crate::types::HashFields::with_capacity(hint(count));
+            let mut collisions = crate::hash_fields::Collisions::default();
             for _ in 0..count {
                 let (field_bytes, next) = read_bytes_slice(payload, pos)?;
                 let field = crate::hash_fields::loaded_name(field_bytes)?;
                 let (val_bytes, next2) = read_bytes_slice(payload, next)?;
-                map.insert_loaded(&*field, val_bytes).ok()?;
+                // Two spellings of one field: not a payload any writer makes.
+                let added = map.insert_loaded(&*field, val_bytes).ok()?;
+                if !collisions.allows(field_bytes, &field, added) {
+                    return None;
+                }
                 pos = next2;
             }
             // Expiries
@@ -6910,6 +6938,69 @@ mod field_deadline_tests {
         let _hold = crate::expiry::hold();
         let loaded = load_snapshot_from(&out[..]).unwrap();
         assert_eq!(read_back(&loaded.dbs[0][&b"h"[..]], want.len()), want);
+    }
+
+    /// A file or a payload whose hash names one field twice, in two
+    /// spellings (`é`, and U+F7C3 U+F7A9, which stands for the same two
+    /// bytes): refused, not loaded as one field where the count says two.
+    /// (A name repeated alike is set twice, as before: see
+    /// `a_payload_naming_a_field_twice_keeps_its_first_place_and_last_value`.)
+    #[test]
+    fn two_spellings_of_one_field_are_refused() {
+        let other = "\u{F7C3}\u{F7A9}".as_bytes();
+        let hash = |second: &[u8]| {
+            let mut fields = crate::types::HashFields::new();
+            fields.insert_bytes("\u{e9}", b"1");
+            fields.insert_bytes(second, b"2");
+            KiviDBValue::Hash(crate::hash_fields::shared(fields))
+        };
+        // Written with a stand-in of the same length, put back by hand.
+        let swap = |mut bytes: Vec<u8>| {
+            let at = bytes
+                .windows(6)
+                .position(|w| w == b"zzzzzz")
+                .expect("the stand-in");
+            bytes[at..at + 6].copy_from_slice(other);
+            bytes
+        };
+        let mut payload = Vec::new();
+        serialize_value(&hash(b"zzzzzz"), &mut payload).unwrap();
+        assert!(deserialize_value(&payload).is_some());
+        assert!(deserialize_value(&swap(payload)).is_none());
+        // Such a spelling alone (1.2.0 kept a name given to `HIMPORT` so) is
+        // read as before.
+        let mut alone = crate::types::HashFields::new();
+        alone.insert_bytes("zzzzzz", b"2");
+        let mut payload = Vec::new();
+        serialize_value(
+            &KiviDBValue::Hash(crate::hash_fields::shared(alone)),
+            &mut payload,
+        )
+        .unwrap();
+        let Some(KiviDBValue::Hash(read)) = deserialize_value(&swap(payload)) else {
+            panic!("refused");
+        };
+        assert_eq!(read.read().get_bytes("\u{e9}"), Some(&b"2"[..]));
+
+        let mut image = Vec::new();
+        write_kdb_header(&mut image, 1).unwrap();
+        write_kdb_entry(&mut image, "h", hash(b"zzzzzz").view()).unwrap();
+        write_kdb_db_end(&mut image).unwrap();
+        write_kdb_expiry_maps(&mut image, &[HashMap::<Key, u64>::new()]).unwrap();
+        assert!(load_snapshot_from(&image[..]).is_ok());
+        let err = load_snapshot_from(&swap(image)[..]).err().expect("refused");
+        assert!(err.to_string().contains("duplicate hash field"), "{err}");
+
+        // With field TTLs too.
+        let mut inner = crate::types::HashInner::new();
+        inner.fields.insert_bytes("\u{e9}", b"1");
+        inner.fields.insert_bytes("zzzzzz", b"2");
+        inner.expiries.insert("zzzzzz", 4_102_444_800_000);
+        let ex = KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner)));
+        let mut payload = Vec::new();
+        serialize_value(&ex, &mut payload).unwrap();
+        assert!(deserialize_value(&payload).is_some());
+        assert!(deserialize_value(&swap(payload)).is_none());
     }
 
     /// Bytes as 1.2.0 writes them: a KDB image and a `DUMP` payload of `h`,

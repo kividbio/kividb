@@ -135,6 +135,37 @@ pub fn loaded_name(saved: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
         .map(crate::key_bytes::bytes_of)
 }
 
+/// Whether `saved` is the spelling [`saved_name`] gives `field`, which
+/// [`loaded_name`] read from it. Only a name with a character of the
+/// escape's block in it can be another: 1.2.0 kept such a name, given to
+/// `HIMPORT`, as it came. Two spellings of one field are a payload no writer
+/// makes (see [`Collisions`]).
+#[inline]
+fn is_canonical(saved: &[u8], field: &[u8]) -> bool {
+    saved == field || *saved_name(field) == *saved
+}
+
+/// What a load of a hash's names needs to tell a field named twice in two
+/// spellings (refused: one field where the count says two, a file or a
+/// payload made by hand) from one named twice alike, which is set twice, as
+/// a load always has done.
+#[derive(Default)]
+pub struct Collisions {
+    other_spellings: bool,
+}
+
+impl Collisions {
+    /// `saved`, read as `field`, was added to the hash (`added`) or set a
+    /// field it had. `false`: two spellings of one field.
+    #[inline]
+    pub fn allows(&mut self, saved: &[u8], field: &[u8], added: bool) -> bool {
+        if !is_canonical(saved, field) {
+            self.other_spellings = true;
+        }
+        added || !self.other_spellings
+    }
+}
+
 /// A value, as a hash hands it out: bytes of a block or of a table's entry.
 /// It is its bytes (`Deref`). The same as a list's elements.
 pub use crate::element::Value;

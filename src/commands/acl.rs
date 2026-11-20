@@ -189,7 +189,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Ok(s) => s.to_string(),
                 Err(_) => return Some(resp_error("ERR invalid username")),
             };
-            if username.is_empty() || username.contains([' ', '\0', '\t', '\n', '\r']) {
+            // White space would split the name in the ACL file.
+            if username.is_empty() || username.contains(|c: char| c == '\0' || c.is_whitespace()) {
                 return Some(resp_error(
                     "ERR Usernames can't contain spaces or null characters",
                 ));

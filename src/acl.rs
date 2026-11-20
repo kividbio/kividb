@@ -559,10 +559,20 @@ use std::io::Write;
 /// is an error, reported with its line number, and no users are returned.
 ///
 /// The file is bytes, as Redis's is: a key or channel pattern is written as
-/// its own bytes ([`AclUser::to_acl_line`]). A word that begins with a quote
-/// is read as Redis reads one (`"~app:\xff*"`, `'~a b'`); any other word is
-/// its bytes up to the next white space, quotes and all, as every earlier
-/// KiviDB wrote and read it.
+/// its own bytes ([`AclUser::to_acl_line`]). How a line is read
+/// ([`file_line`]):
+///
+/// - A line that is UTF-8 is trimmed and split at white space (Unicode's),
+///   and its user name is the word after `user`, as written, whatever it
+///   begins with. So every file an earlier KiviDB read loads to the same
+///   users and rules.
+/// - A rule word that begins with a quote (which no earlier KiviDB took for
+///   a rule) is read as Redis reads a quoted word: `"~app:\xff*"`.
+/// - A line that is not UTF-8 is split at ASCII white space, as Redis splits
+///   one.
+///
+/// A pattern read from the file may hold a NUL, as one an earlier KiviDB
+/// saved can; `ACL SETUSER` refuses one ([`apply_rule`]).
 pub fn parse_acl_file(
     contents: impl AsRef<[u8]>,
     requirepass: &str,
@@ -572,23 +582,22 @@ pub fn parse_acl_file(
 
     for (index, line) in contents.as_ref().split(|&b| b == b'\n').enumerate() {
         let number = index + 1;
-        let line = line.trim_ascii();
-        // Skip comments and blank lines
-        if line.is_empty() || line.starts_with(b"#") {
-            continue;
-        }
-        let Some(words) = file_words(line) else {
-            errors.push(format!("line {number}: unbalanced quotes"));
-            continue;
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let (keyword, name, rules) = match file_line(line) {
+            FileLine::Skip => continue,
+            FileLine::Unbalanced => {
+                errors.push(format!("line {number}: unbalanced quotes"));
+                continue;
+            }
+            FileLine::Words(keyword, name, rules) => (keyword, name, rules),
         };
-        let mut tokens = words.iter().map(Vec::as_slice);
-        if tokens.next() != Some(&b"user"[..]) {
+        if keyword != b"user" {
             errors.push(format!(
                 "line {number}: a line should start with the 'user' keyword"
             ));
             continue;
         }
-        let Some(name) = tokens.next() else {
+        let Some(name) = name else {
             errors.push(format!("line {number}: 'user' must be followed by a name"));
             continue;
         };
@@ -596,6 +605,7 @@ pub fn parse_acl_file(
             errors.push(format!("line {number}: a user name must be UTF-8"));
             continue;
         };
+        let tokens = rules.iter().map(Vec::as_slice);
         if users.contains_key(name) {
             errors.push(format!("line {number}: duplicate user '{name}'"));
             continue;
@@ -610,7 +620,7 @@ pub fn parse_acl_file(
         let mut user = AclUser::new(name);
         let mut ok = true;
         for rule in &rules {
-            if let Err(e) = apply_rule(&mut user, rule) {
+            if let Err(e) = apply_rule_from(&mut user, rule, RuleFrom::File) {
                 errors.push(format!(
                     "line {number}: error in rule '{}': {e}",
                     String::from_utf8_lossy(rule)
@@ -673,10 +683,70 @@ pub fn save_acl_file(path: &str, store: &AclStore) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The words of a line of an ACL file: apart at white space; a word that
-/// begins with `"` or `'` is read as Redis reads a quoted one (`sdssplitargs`:
-/// `\xHH`, `\n` and the like in double quotes, only `\'` in single ones),
-/// and must end at its closing quote. `None` for a quote left open.
+/// A line of an ACL file, read: see [`parse_acl_file`].
+enum FileLine<'a> {
+    /// Blank, or a comment.
+    Skip,
+    /// A quoted word left open, or closed in the middle of a word.
+    Unbalanced,
+    /// The first word, the user name (as written), and the rules.
+    Words(&'a [u8], Option<&'a [u8]>, Vec<Vec<u8>>),
+}
+
+/// A line, its first word, its user name and the words after it.
+type LineWords<'a> = (&'a [u8], &'a [u8], Option<&'a [u8]>, Vec<&'a [u8]>);
+
+fn file_line(line: &[u8]) -> FileLine<'_> {
+    let quoted = |word: &[u8]| matches!(word.first(), Some(b'"' | b'\''));
+    let (line, keyword, name, rest): LineWords<'_> = match std::str::from_utf8(line) {
+        // As every earlier KiviDB read it: `trim`, `split_whitespace`.
+        Ok(text) => {
+            let text = text.trim();
+            if text.is_empty() || text.starts_with('#') {
+                return FileLine::Skip;
+            }
+            let mut words = text.split_whitespace().map(str::as_bytes);
+            let keyword = words.next().unwrap_or_default();
+            let name = words.next();
+            (text.as_bytes(), keyword, name, words.collect())
+        }
+        Err(_) => {
+            let line = line.trim_ascii();
+            if line.is_empty() || line.starts_with(b"#") {
+                return FileLine::Skip;
+            }
+            let mut words = line
+                .split(u8::is_ascii_whitespace)
+                .filter(|w| !w.is_empty());
+            let keyword = words.next().unwrap_or_default();
+            let name = words.next();
+            (line, keyword, name, words.collect())
+        }
+    };
+    let utf8 = std::str::from_utf8(line).is_ok();
+    // The rules as words of their own, unless one begins with a quote (or
+    // the line is not UTF-8): then what follows the name is read as Redis
+    // reads it. No earlier KiviDB read a rule that began with a quote, nor
+    // a line that is not UTF-8.
+    if utf8 && !rest.iter().any(|w| quoted(w)) {
+        return FileLine::Words(keyword, name, rest.iter().map(|w| w.to_vec()).collect());
+    }
+    let Some(name) = name else {
+        return FileLine::Words(keyword, None, Vec::new());
+    };
+    // Where the name ends, as a slice of `line`.
+    let after = name.as_ptr() as usize - line.as_ptr() as usize + name.len();
+    match file_words(&line[after..]) {
+        Some(rules) => FileLine::Words(keyword, Some(name), rules),
+        None => FileLine::Unbalanced,
+    }
+}
+
+/// The words of what follows a user name in a line of an ACL file: apart at
+/// ASCII white space; a word that begins with `"` or `'` is read as Redis
+/// reads a quoted one (`sdssplitargs`: `\xHH`, `\n` and the like in double
+/// quotes, only `\'` in single ones), and must end at its closing quote.
+/// `None` for a quote left open.
 fn file_words(line: &[u8]) -> Option<Vec<Vec<u8>>> {
     let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
     let mut words = Vec::new();
@@ -794,9 +864,10 @@ fn apply_permission_rule(
     keys: &mut Vec<KeyPattern>,
     channels: &mut Vec<Vec<u8>>,
     rule: &[u8],
+    from: RuleFrom,
 ) -> Result<bool, String> {
     let add_key = |keys: &mut Vec<KeyPattern>, pattern: KeyPattern| -> Result<(), String> {
-        if pattern.pattern.is_empty() || has_spaces(&pattern.pattern) {
+        if pattern.pattern.is_empty() || has_spaces(&pattern.pattern, from) {
             return Err(SYNTAX_ERROR.to_string());
         }
         if pattern.is_all() {
@@ -856,7 +927,7 @@ fn apply_permission_rule(
             )?;
         }
         [b'&', pattern @ ..] => {
-            if pattern.is_empty() || has_spaces(pattern) {
+            if pattern.is_empty() || has_spaces(pattern, from) {
                 return Err(SYNTAX_ERROR.to_string());
             }
             if all_channels(channels) {
@@ -877,13 +948,25 @@ fn apply_permission_rule(
     Ok(true)
 }
 
-/// Whether a pattern has white space or a NUL in it, which Redis refuses in
-/// one (`ACLStringHasSpaces`): a line of the ACL file is split at white
-/// space, and the pattern could not be written there as it is.
-fn has_spaces(pattern: &[u8]) -> bool {
-    pattern
-        .iter()
-        .any(|&b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | 0))
+/// Where a rule comes from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuleFrom {
+    /// `ACL SETUSER`.
+    Command,
+    /// A word of the ACL file.
+    File,
+}
+
+/// Whether a pattern has white space in it (Unicode's, which a line of the
+/// ACL file is split at), or, given to `ACL SETUSER`, a NUL: Redis refuses
+/// both there (`ACLStringHasSpaces`), and with them a pattern is written to
+/// the file as it is and reads back the same. One with a NUL read from the
+/// file is taken: an earlier KiviDB saved one so.
+fn has_spaces(pattern: &[u8], from: RuleFrom) -> bool {
+    (from == RuleFrom::Command && pattern.contains(&0))
+        || pattern
+            .utf8_chunks()
+            .any(|chunk| chunk.valid().chars().any(char::is_whitespace))
 }
 
 /// Append a `+…` / `-…` rule, unless it could not change anything.
@@ -952,7 +1035,7 @@ fn check_password_hash(hash: &[u8]) -> Result<&str, String> {
 }
 
 /// Parse the inside of `(…)` into a selector.
-fn parse_selector(rule: &[u8]) -> Result<Selector, String> {
+fn parse_selector(rule: &[u8], from: RuleFrom) -> Result<Selector, String> {
     let inner = rule
         .strip_prefix(b"(")
         .and_then(|r| r.strip_suffix(b")"))
@@ -967,6 +1050,7 @@ fn parse_selector(rule: &[u8]) -> Result<Selector, String> {
             &mut selector.keys,
             &mut selector.channels,
             part,
+            from,
         )?;
         if !known {
             return Err(SYNTAX_ERROR.to_string());
@@ -986,7 +1070,11 @@ fn parse_selector(rule: &[u8]) -> Result<Selector, String> {
 /// file is: a password (`>`, `<`) and a key or channel pattern (`~`, `%R~`,
 /// `&`) are any bytes; the other rules are words of text.
 pub fn apply_rule(user: &mut AclUser, rule: impl AsRef<[u8]>) -> Result<(), String> {
-    let rule = rule.as_ref();
+    apply_rule_from(user, rule.as_ref(), RuleFrom::Command)
+}
+
+/// [`apply_rule`] of a rule from `from`.
+fn apply_rule_from(user: &mut AclUser, rule: &[u8], from: RuleFrom) -> Result<(), String> {
     match rule {
         b"on" => user.enabled = true,
         b"off" => user.enabled = false,
@@ -1006,7 +1094,7 @@ pub fn apply_rule(user: &mut AclUser, rule: impl AsRef<[u8]>) -> Result<(), Stri
         // Accepted for compatibility with Redis-written files: payloads are
         // always checked.
         b"sanitize-payload" | b"skip-sanitize-payload" => {}
-        [b'(', ..] => user.selectors.push(parse_selector(rule)?),
+        [b'(', ..] => user.selectors.push(parse_selector(rule, from)?),
         [b'>', password @ ..] => {
             let hash = sha256_hex(password);
             if !user.passwords.contains(&hash) {
@@ -1030,8 +1118,13 @@ pub fn apply_rule(user: &mut AclUser, rule: impl AsRef<[u8]>) -> Result<(), Stri
             remove_password(user, hash)?;
         }
         r => {
-            let known =
-                apply_permission_rule(&mut user.commands, &mut user.keys, &mut user.channels, r)?;
+            let known = apply_permission_rule(
+                &mut user.commands,
+                &mut user.keys,
+                &mut user.channels,
+                r,
+                from,
+            )?;
             if !known {
                 return Err(SYNTAX_ERROR.to_string());
             }

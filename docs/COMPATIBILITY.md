@@ -255,13 +255,15 @@ other files:
   that is UTF-8 is itself; any other is escaped as text), so files and
   payloads read the same on 1.2 and here, both ways.
 - ACL key and channel patterns (`~`, `%R~`, `%W~`, `&`, and in selectors)
-  are any bytes but white space and NUL, which Redis refuses in a pattern
-  too, and match a key's or channel's bytes exactly. `ACL LIST`,
+  are any bytes, and match a key's or channel's bytes exactly. `ACL
+  SETUSER` refuses white space and NUL in a pattern, as Redis does (and any
+  Unicode white space, which the ACL file is split at). `ACL LIST`,
   `ACL GETUSER`, `ACL LOG` and the ACL file give a pattern's own bytes, as
-  Redis writes them; a word of the ACL file that begins with a quote is
-  read as Redis reads a quoted one (`"~app:\xff*"`), and any other word is
-  its bytes up to the next white space. A user name in an ACL file must be
-  UTF-8. What is still text: ACL user names and command rules, search index
+  Redis writes them. In the ACL file a user name is read as written; a
+  rule word that begins with a quote is read as Redis reads a quoted one
+  (`"~app:\xff*"`); a line is split at white space, ASCII white space for
+  a line that is not UTF-8; a pattern may hold a NUL. A user name in an ACL
+  file must be UTF-8. What is still text: ACL user names and command rules, search index
   names, prefixes and field names, and time-series label names and values.
 - A HyperLogLog copied from Redis (`DUMP`/`RESTORE`, an RDB, replication)
   loads and counts as it did on Redis. By default KiviDB writes new
