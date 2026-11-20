@@ -549,7 +549,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   source that starts again with one listed holds writes until it knows where
   the slots went (the destination says it took them or not, a claim of them
   arrives, or the destination failed), instead of serving them at once.
-  CLUSTER docs in COMMANDS.md say what each kind of failover guarantees.
+  COMMANDS.md says what each kind of `CLUSTER FAILOVER` guarantees and how
+  a config epoch collision is resolved.
+- **`ZRANDMEMBER` costs the count asked for, not the size of the sorted
+  set (#862).** A large sorted set (past `zset-max-listpack-entries`) found
+  its random members by walking its member table up to the last position
+  picked. The table is now asked for a bucket by its number: each member is
+  a random bucket, tried again while it is empty, so every member is as
+  likely as any other. A distinct sample of up to a third of the set is
+  picked a bucket at a time (a bucket that comes up twice is picked again);
+  a larger one walks the table once, which is then no longer than the
+  answer; a table left less than an eighth full (a set that lost most of
+  its members) is walked once a call, as before. A table of up to 65,536
+  buckets is made smaller when a removal leaves it less than an eighth
+  full, and any table after a `ZADD` or `GEOADD` that reserved it for
+  members given more than once, or a bulk removal (`ZREMRANGEBY*`) of as
+  many members as it held; a bigger table emptied one member at a time
+  keeps its size, as before, since giving that memory back stalled the
+  command (14 ms for a million-member set's table). Over a million members, server time a call (`INFO
+  commandstats`), master before this change, now, and Redis 8.10.2:
+  `ZRANDMEMBER z` 1,047 us, 1.0 us, 1.1 us; a count of 10 1,975 us,
+  3.2 us, 8.2 us; 1000 2,454 us, 159 us, 711 us; -1000 2,444 us, 243 us,
+  485 us. At 100,000 members a count of 10 went from 143 us to 1.3 us.
+  Small sets (one block) are read by index as before. Replies are the
+  same: a count of the set's size or more is the whole set from the
+  highest score down, a positive count is distinct members in random
+  order, a negative one may repeat.
 
 - **A command reads the clock once (#632).** The first time a command
   needs the time, it reads the clock, and every later expiry check in the
