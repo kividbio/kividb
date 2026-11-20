@@ -1409,3 +1409,59 @@ fn zscan_of_a_table_across_growth_and_shrink_misses_nothing() {
     assert_eq!(reply.items()[0].text(), "0");
     assert!(reply.items()[1].items().is_empty());
 }
+
+/// `GEOSEARCHSTORE` into its own source key, raced by writers: the search
+/// holds the set's read lock while what it found borrows the members, and
+/// lets go of it before it writes the keyspace (taking the source out of
+/// the keyspace reads it again; a second read on this thread would wait
+/// behind a writer queued since the first, which waits for the first).
+#[test]
+fn geosearchstore_into_its_source_never_waits_on_its_writers() {
+    for model in io_models() {
+        let dir = temp_dir("geostore-race");
+        let server = Server::start(dir.path(), &["--io-model", model]);
+        let mut c = server.conn();
+        let mut args: Vec<String> = vec!["GEOADD".into(), "g".into()];
+        for i in 0..300 {
+            args.push(format!("{:.4}", 13.0 + (i % 20) as f64 * 0.001));
+            args.push(format!("{:.4}", 52.0 + (i / 20) as f64 * 0.001));
+            args.push(format!("p{i}"));
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert_eq!(c.cmd(&args).int(), 300);
+        let port = server.port;
+        let until = Instant::now() + Duration::from_secs(3);
+        let mut threads = Vec::new();
+        for _ in 0..3 {
+            threads.push(thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                while Instant::now() < until {
+                    let reply = c.cmd(&[
+                        "GEOSEARCHSTORE", "g", "g", "FROMLONLAT", "13.01", "52.007", "BYRADIUS",
+                        "50", "km", "ASC",
+                    ]);
+                    assert!(matches!(reply, Resp::Int(_)), "{reply:?}");
+                }
+            }));
+        }
+        for w in 0..2 {
+            threads.push(thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let mut i = 0;
+                while Instant::now() < until {
+                    let name = format!("w{w}:{i}");
+                    c.cmd(&["GEOADD", "g", "13.005", "52.005", &name]);
+                    c.cmd(&["ZREM", "g", &name]);
+                    i += 1;
+                }
+            }));
+        }
+        for t in threads {
+            assert!(
+                t.join().is_ok(),
+                "{model}: a client never got its reply (deadlock)"
+            );
+        }
+        assert_eq!(c.cmd(&["PING"]), Resp::Simple("PONG".into()), "{model}");
+    }
+}

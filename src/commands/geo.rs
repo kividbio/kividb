@@ -1055,30 +1055,37 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
 
     if let Some(dest) = store_key {
         let db = *ctx.selected_db;
-        if found.is_empty() {
-            crate::commands::helpers::delete_key(ctx.store, db, &dest);
-            return resp_integer(0);
-        }
+        let count = found.len();
         // Built whole: a block, laid down once, if the points fit one.
-        let stored = SortedSetInner::from_pairs(found.iter().map(|point| {
-            (
-                &point.member[..],
-                if store_dist {
-                    point.distance_m / unit_m
-                } else {
-                    point.score
-                },
-            )
-        }));
+        let stored = (count > 0).then(|| {
+            SortedSetInner::from_pairs(found.iter().map(|point| {
+                (
+                    &point.member[..],
+                    if store_dist {
+                        point.distance_m / unit_m
+                    } else {
+                        point.score
+                    },
+                )
+            }))
+        });
+        // The source's read lock goes before the keyspace is written: the
+        // destination may be the source, and taking it out of the keyspace
+        // reads it again (a second read on this thread waits behind a
+        // writer queued since the first, which waits for the first).
+        drop(found);
+        drop(held);
         // The destination is a new key: whatever was there, and its time
         // to live, are gone.
         crate::commands::helpers::delete_key(ctx.store, db, &dest);
-        let shard = store::get_shard(&ctx.store[db], &dest);
-        write_lock!(shard).insert(
-            dest,
-            KiviDBValue::SortedSet(crate::sorted_set::shared(stored)),
-        );
-        return resp_integer(found.len() as i64);
+        if let Some(stored) = stored {
+            let shard = store::get_shard(&ctx.store[db], &dest);
+            write_lock!(shard).insert(
+                dest,
+                KiviDBValue::SortedSet(crate::sorted_set::shared(stored)),
+            );
+        }
+        return resp_integer(count as i64);
     }
 
     let plain = !with_dist && !with_hash && !with_coord;

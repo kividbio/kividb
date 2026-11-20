@@ -139,6 +139,11 @@ def per_member(before, after, n):
 def t_mem(c, a):
     res = {}
     rng = random.Random(825)
+    # A first load of a fresh server pays for things made once (the
+    # keyspace's table, buffers, the entry pool's first slabs), which would
+    # be charged to the first row: one set loaded and dropped first.
+    zadd_pairs(c, "warm", [(i, member(i, 16)) for i in range(20_000)])
+    c.flushall()
     for n in (1_000, 10_000, 3_000_000):
         for length in (8, 16, 32):
             row = {}
