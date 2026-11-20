@@ -405,7 +405,7 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
         ));
     }
     if script_slot == Some(first) {
-        // Two relaxed loads while no key or slot moves.
+        // Two atomic loads while no key or slot moves.
         if crate::pause::keys_moving() || ctx.cluster.slots_open() {
             return script_refusal_while_moving(ctx, name, first);
         }
@@ -443,9 +443,25 @@ fn script_key_refusal(ctx: &Ctx, name: &str) -> Option<Vec<u8>> {
         }
         crate::cluster::routing::RouteDecision::TryAgain => decision.refusal(false),
         crate::cluster::routing::RouteDecision::Passthrough => None,
-        _ => Some(resp_error(
-            "ERR Script attempted to access a non local key in a cluster node",
-        )),
+        _ => Some(script_route_refusal(&decision)),
+    }
+}
+
+/// The error a script's command gets when routing it would not run it here
+/// (see [`script_key_refusal`]): Redis's for a cluster that is down
+/// (`scriptVerifyClusterState`), the client's own `CLUSTERDOWN` for a slot
+/// no node serves, and Redis's "non local key" for a key that is served
+/// elsewhere, or not all here (`-ASK`, `-MOVED`, `-TRYAGAIN`).
+#[cfg(feature = "lua")]
+#[cold]
+fn script_route_refusal(decision: &crate::cluster::routing::RouteDecision) -> Vec<u8> {
+    use crate::cluster::routing::RouteDecision;
+    match decision {
+        RouteDecision::ClusterDown => {
+            resp_error("ERR Script attempted to execute a command while the cluster is down")
+        }
+        RouteDecision::Unassigned { slot } => crate::cluster::routing::clusterdown_error(*slot),
+        _ => resp_error("ERR Script attempted to access a non local key in a cluster node"),
     }
 }
 
@@ -537,9 +553,7 @@ fn script_refusal_while_moving(ctx: &Ctx, name: &str, slot: u16) -> Option<Vec<u
     );
     match decision {
         RouteDecision::OwnedSlot(_) | RouteDecision::Passthrough => None,
-        _ => Some(resp_error(
-            "ERR Script attempted to access a non local key in a cluster node",
-        )),
+        _ => Some(script_route_refusal(&decision)),
     }
 }
 
@@ -3960,6 +3974,44 @@ mod applied_gate_tests {
         // One key named twice is one key.
         assert!(!takes(&["DEL", "a", "a"]));
         assert!(!takes(&["RENAME", "a", "a"]));
+    }
+}
+
+#[cfg(all(test, feature = "lua"))]
+mod script_route_tests {
+    use super::script_route_refusal;
+    use crate::cluster::routing::RouteDecision;
+
+    fn text(reply: Vec<u8>) -> String {
+        String::from_utf8(reply).unwrap()
+    }
+
+    /// A script's command that is not run here says why: the cluster is
+    /// down, its slot is served by no node, or its key is another node's.
+    #[test]
+    fn a_scripts_refused_command_says_what_happened() {
+        assert_eq!(
+            text(script_route_refusal(&RouteDecision::ClusterDown)),
+            "-ERR Script attempted to execute a command while the cluster is down\r\n"
+        );
+        assert_eq!(
+            text(script_route_refusal(&RouteDecision::Unassigned { slot: 7 })),
+            "-CLUSTERDOWN Hash slot 7 is not served\r\n"
+        );
+        for elsewhere in [
+            RouteDecision::TryAgain,
+            RouteDecision::Ask {
+                slot: 7,
+                target_ip: "127.0.0.1".into(),
+                target_ip6: "::1".into(),
+                target_port: 7000,
+            },
+        ] {
+            assert_eq!(
+                text(script_route_refusal(&elsewhere)),
+                "-ERR Script attempted to access a non local key in a cluster node\r\n"
+            );
+        }
     }
 }
 

@@ -256,8 +256,10 @@ impl Migrations {
     }
 
     /// Whether any slot is being migrated or imported here. One relaxed
-    /// load: a slot opened by a `SETSLOT` this thread has not synchronised
-    /// with is not seen at once, as if the command asking ran just before.
+    /// load of the count [`MigrationsWrite`] stores (with `Release`, under
+    /// the lock): a slot opened by a `SETSLOT` this thread has not
+    /// synchronised with is not seen at once, as if the command asking ran
+    /// just before.
     #[inline]
     pub fn any_open(&self) -> bool {
         self.open.load(Ordering::Relaxed) != 0

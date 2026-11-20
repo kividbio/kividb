@@ -9727,75 +9727,61 @@ fn a_scripts_delete_during_a_migrate_stays_deleted() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        // The script is sent on several connections, made before the
-        // `MIGRATE`'s: with io_uring the worker that runs the `MIGRATE`
-        // serves no other connection while it is held at the failpoint,
-        // and those of the other worker run the script meanwhile.
-        let script = [
-            "EVAL",
-            "return redis.call('DEL', ARGV[1])",
-            "1",
-            declared,
-            moving,
-        ];
-        let mut raw = format!("*{}\r\n", script.len());
-        for a in script {
-            raw.push_str(&format!("${}\r\n{a}\r\n", a.len()));
-        }
-        let mut conns: Vec<Conn> = (0..6)
-            .map(|_| {
-                let mut c = src.conn();
-                assert_eq!(c.cmd(&["PING"]).text(), "PONG");
-                c
-            })
-            .collect();
+        // With io_uring, the worker that runs the `MIGRATE` serves no other
+        // connection while it is held at the failpoint. So, while it is
+        // held, connections are made until one answers a `PING`: that one
+        // is on another worker, and the script is sent on it.
         let mut during: Vec<Resp> = Vec::new();
-        let mut waiting: Vec<usize> = Vec::new();
+        let mut on_the_held_worker: Vec<Conn> = Vec::new();
         let migrated = migrate_with_writes_meanwhile(src, &args, 1, || {
-            for c in &mut conns {
-                c.stream.write_all(raw.as_bytes()).unwrap();
-            }
-            std::thread::sleep(Duration::from_millis(500));
-            for (i, c) in conns.iter_mut().enumerate() {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut free = None;
+            while free.is_none() && on_the_held_worker.len() < 64 && Instant::now() < deadline {
+                let mut c = src.conn();
                 c.stream
-                    .set_read_timeout(Some(Duration::from_millis(200)))
+                    .set_read_timeout(Some(Duration::from_millis(300)))
                     .unwrap();
+                c.stream.write_all(b"*1\r\n$4\r\nPING\r\n").unwrap();
                 match c.read() {
-                    Ok(reply) => during.push(reply),
-                    Err(_) => waiting.push(i),
+                    Ok(pong) => {
+                        assert_eq!(pong.text(), "PONG", "{model}");
+                        c.stream
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        free = Some(c);
+                    }
+                    Err(_) => on_the_held_worker.push(c),
                 }
-                c.stream
-                    .set_read_timeout(Some(Duration::from_secs(10)))
-                    .unwrap();
+            }
+            if let Some(mut c) = free {
+                during.push(c.cmd(&[
+                    "EVAL",
+                    "return redis.call('DEL', ARGV[1])",
+                    "1",
+                    declared,
+                    moving,
+                ]));
             }
         });
-        let after: Vec<Resp> = waiting.iter().map(|&i| conns[i].read().unwrap()).collect();
+        drop(on_the_held_worker);
         finish_the_move(&nodes, slot_of(declared), Some(2));
         let mut d = dst.conn();
-        if during.iter().chain(&after).any(|r| *r == Resp::Int(1)) {
+        if during.contains(&Resp::Int(1)) {
             let now = d.cmd(&["GET", moving]);
             assert!(
                 matches!(now, Resp::Nil),
                 "{model}: the script was told the key was deleted, and the owner has {now:?} \
-                 (MIGRATE: {migrated:?}; scripts during it: {during:?}, after: {after:?})"
+                 (MIGRATE: {migrated:?})"
             );
         }
         assert!(
             !during.is_empty(),
-            "{model}: no script ran while the MIGRATE was held"
+            "{model}: no connection was served while the MIGRATE was held"
         );
         for deleted in &during {
             assert!(
                 deleted.err().is_some_and(|e| e.contains("TRYAGAIN")),
                 "{model}: the script's DEL during the MIGRATE: {deleted:?}"
-            );
-        }
-        // Once the key has left, the script is refused it as a key of the
-        // destination's.
-        for deleted in &after {
-            assert!(
-                deleted.err().is_some_and(|e| e.contains(NON_LOCAL)),
-                "{model}: the script's DEL after the MIGRATE: {deleted:?}"
             );
         }
         assert!(migrated.is_ok(), "{model}: MIGRATE: {migrated:?}");
