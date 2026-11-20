@@ -8383,6 +8383,147 @@ fn a_transaction_waiting_for_a_script_during_a_slot_handoff_runs_whole_or_not_at
     }
 }
 
+/// A script that reaches its gates while an atomic slot migration's
+/// handoff holds writes waits the handoff out outside the command gate
+/// (#340): connections of the other threads keep getting replies. It used
+/// to wait holding the gate alone (it runs alone on its first run), and
+/// every other command on the node waited with it, until the handoff ended.
+/// The script is then sent on, and its key is the destination's, unchanged.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_waiting_out_a_slot_handoff_holds_back_no_other_replies() {
+    for model in io_models() {
+        let (slowest, waiting) = script_waiting_out_a_slot_handoff_on(model);
+        eprintln!("{model}: slowest probe while the script waited: {slowest:?}");
+        assert!(
+            waiting || slowest >= Duration::from_millis(200),
+            "{model}: the script did not wait"
+        );
+        assert!(
+            slowest < Duration::from_millis(200),
+            "{model}: a probe waited {slowest:?} while the script waited out the handoff"
+        );
+    }
+}
+
+/// [`a_script_waiting_out_a_slot_handoff_holds_back_no_other_replies`] on
+/// `model`: the longest a probe of another thread waited for a `GET` while
+/// the script waited the handoff out, and whether it was still waiting once
+/// every probe had been answered. The import is held before writes are
+/// paused (`handoff-pausing`), the script once it is routed (`routed`),
+/// and the destination's `TAKEOVER` waits 3 s, so the handoff holds writes
+/// when the script reaches its gates, and for long after.
+#[cfg(feature = "lua")]
+fn script_waiting_out_a_slot_handoff_on(model: &str) -> (Duration, bool) {
+    let key = key_in(0..=1000, "handoff-script");
+    let env = [
+        ("KIVIDB_TEST_FAILPOINTS", "routed,handoff-pausing"),
+        ("KIVIDB_TEST_STALL_KEYS", key.as_str()),
+    ];
+    let args = ["--io-model", model, "--threads", "4"];
+    let (nodes, ranges) = form_cluster_of(vec![
+        Node::start_with_env(&args, &env),
+        Node::start_with_env(&args, &[("KIVIDB_TEST_TAKEOVER_DELAY_MS", "3000")]),
+    ]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let r = src.conn().cmd(&[
+        "CONFIG",
+        "SET",
+        "cluster-slot-migration-write-pause-timeout",
+        "10000",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let set = commands_in_background(src.port, &[&["SET", &key, "5"]]);
+    std::fs::remove_file(routed_and_held(src, 1)).unwrap();
+    assert!(set.join().unwrap().is_ok());
+    let staying = key_in(1001..=ranges[0].1, "probe");
+    assert!(src.conn().cmd(&["SET", &staying, "p"]).is_ok());
+
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    let pausing = src.dir.join("failpoint.handoff-pausing.1");
+    wait_until(
+        "the handoff to be about to pause writes",
+        Duration::from_secs(60),
+        || pausing.exists(),
+    );
+    let script = patient_commands_in_background(
+        src.port,
+        Duration::from_secs(30),
+        &[&[
+            "EVAL",
+            "return redis.call('SET', KEYS[1], ARGV[1])",
+            "1",
+            &key,
+            "6",
+        ]],
+    );
+    let held = routed_and_held(src, 2);
+    // Connections that answer while the script is held at `routed`: on
+    // io_uring, not on its thread, which the hold and then the wait keep.
+    let mut probes = answering_conns(src.port, 16);
+    assert!(probes.len() >= 4, "only {} probes answered", probes.len());
+    std::fs::remove_file(pausing).unwrap();
+    wait_until(
+        "the handoff to hold writes for the TAKEOVER",
+        Duration::from_secs(60),
+        || dst.log().contains("(test) TAKEOVER waits"),
+    );
+    std::fs::remove_file(held).unwrap();
+    // The script reaches its gates, finds the handoff, and waits it out.
+    std::thread::sleep(Duration::from_millis(300));
+    let mut slowest = Duration::ZERO;
+    for probe in &mut probes {
+        probe
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let asked = Instant::now();
+        assert_eq!(probe.cmd(&["GET", &staying]).text(), "p");
+        slowest = slowest.max(asked.elapsed());
+    }
+    // Measured while the script still waited, or the probes proved nothing.
+    let waiting = !script.is_finished();
+
+    let reply = script.join().unwrap();
+    assert!(
+        reply
+            .err()
+            .is_some_and(|e| e.starts_with("MOVED") || e.starts_with("ASK")),
+        "{model}: the script after the handoff: {reply:?}"
+    );
+    wait_import_completed(dst, &task_id);
+    assert_eq!(dst.conn().cmd(&["GET", &key]).text(), "5");
+    (slowest, waiting)
+}
+
+/// Of `want * 2` new connections to `port`, those that answer a `PING`
+/// within 200 ms: connections on threads that are not held.
+#[cfg(feature = "lua")]
+fn answering_conns(port: u16, want: usize) -> Vec<Conn> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for _ in 0..want * 2 {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
+            if c.cmd(&["PING"]).text() == "PONG" {
+                let _ = tx.send(c);
+            }
+        });
+    }
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let mut answered = Vec::new();
+    while answered.len() < want {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(c) => answered.push(c),
+            Err(_) => break,
+        }
+    }
+    answered
+}
+
 /// A transaction that only reads is not refused during a handoff: it
 /// writes nothing the handoff could miss (#339).
 #[test]

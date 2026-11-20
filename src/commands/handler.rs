@@ -1433,6 +1433,9 @@ fn checked_in_gate(
     name: &str,
     routed: &mut crate::cluster::routing::Routed,
     write_gate: &mut Option<crate::write_gate::WriteGuard>,
+    command_gate: &mut Option<crate::command_gate::Guard>,
+    alone: &mut Option<crate::command_gate::AloneGuard>,
+    #[cfg(feature = "lua")] walk: &mut Option<crate::tag_locks::Walk>,
 ) -> Option<Vec<u8>> {
     // While the AOF cannot be written, what would be logged is refused, as
     // Redis refuses it (`MISCONF`): a write, or a script that may make some,
@@ -1473,10 +1476,27 @@ fn checked_in_gate(
             return routed_again_in_gate(ctx, name, *routed);
         }
         *write_gate = None;
+        // Out of the command gate too while it waits, and back in it the
+        // same way afterwards (#340). A script that does not run beside
+        // others holds the gate alone, and waited the handoff out with it:
+        // no other command ran on any thread until the handoff ended. The
+        // walk locks first, as `gate_alone_or_walk` takes them.
+        let (had_gate, had_alone) = (command_gate.is_some(), alone.is_some());
+        *alone = None;
+        *command_gate = None;
+        #[cfg(feature = "lua")]
+        let had_walk = walk.take().is_some();
         if handoff {
             crate::pause::wait_out_handoff();
         } else {
             crate::key_moves::wait_until_moved(*ctx.selected_db, name, ctx.cmd.as_slice());
+        }
+        #[cfg(feature = "lua")]
+        if had_walk {
+            *walk = Some(crate::tag_locks::walk());
+        }
+        if !gates_taken_again(had_gate, had_alone, command_gate, alone) {
+            return Some(busy_reply());
         }
         // Before its keys are looked for below, as before its first routing.
         *routed = crate::cluster::routing::Routed::now(false);
@@ -1512,6 +1532,37 @@ fn checked_in_gate(
             return None;
         }
     }
+}
+
+/// The command gate taken again after [`checked_in_gate`] let go of it to
+/// wait: shared if `had_gate`, alone if `had_alone`, as `run_command` took
+/// it. False if a script past its time limit holds it, for the command to
+/// be told `BUSY`, as it would have been had it arrived then.
+#[cold]
+#[inline(never)]
+fn gates_taken_again(
+    had_gate: bool,
+    had_alone: bool,
+    command_gate: &mut Option<crate::command_gate::Guard>,
+    alone: &mut Option<crate::command_gate::AloneGuard>,
+) -> bool {
+    #[cfg(feature = "lua")]
+    let overrun = crate::commands::lua::running_script_is_over_its_time_limit;
+    #[cfg(not(feature = "lua"))]
+    let overrun = || false;
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(10);
+    if had_alone {
+        let Some(guard) = crate::command_gate::enter_alone_unless(SLICE, overrun) else {
+            return false;
+        };
+        *alone = Some(guard);
+    } else if had_gate {
+        let Some(guard) = crate::command_gate::enter_unless(SLICE, overrun) else {
+            return false;
+        };
+        *command_gate = Some(guard);
+    }
+    true
 }
 
 /// Over `maxmemory`: room made for the command, by eviction in the order of
@@ -2045,7 +2096,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // (`gate_alone_or_walk`, `tag_locks::walk`, #772): only it, and the
     // commands that take the gate alone, come that way.
     #[cfg(feature = "lua")]
-    let (_command_gate, _alone, _walk) = if crate::command_gate::skips(name, &ctx.cmd) {
+    let (mut _command_gate, mut _alone, mut _walk) = if crate::command_gate::skips(name, &ctx.cmd) {
         (None, None, None)
     } else if takes_the_gate_alone(name, &ctx.cmd, any_script && !beside_others, gated) {
         let Some(gates) =
@@ -2069,7 +2120,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         crate::command_gate::enter_unless(SLICE, overrun).map(|gate| (Some(gate), None))
     };
     #[cfg(not(feature = "lua"))]
-    let Some((_command_gate, _alone)) = gates else {
+    let Some((mut _command_gate, mut _alone)) = gates else {
         return busy_reply();
     };
 
@@ -2103,7 +2154,16 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         && !nested
         && !ctx.apply_replication
         && crate::pause::writes_must_check(routed.at())
-        && let Some(reply) = checked_in_gate(ctx, name, &mut routed, &mut _write_gate)
+        && let Some(reply) = checked_in_gate(
+            ctx,
+            name,
+            &mut routed,
+            &mut _write_gate,
+            &mut _command_gate,
+            &mut _alone,
+            #[cfg(feature = "lua")]
+            &mut _walk,
+        )
     {
         return reply;
     }
