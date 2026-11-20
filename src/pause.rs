@@ -75,8 +75,12 @@ const HANDOFF_PAUSE: u64 = 1;
 const KEYS_MOVING: u64 = 2;
 /// [`HANDOFF`]: a `CLIENT PAUSE` may be in force ([`pause_clients`]).
 const CLIENT_PAUSE: u64 = 4;
+/// [`HANDOFF`]: the AOF holds records the disk would not take, and writes
+/// are refused (`aof::refused_while_failing`): the same one load in the
+/// write gate finds it.
+const AOF_FAILING: u64 = 8;
 /// [`HANDOFF`]: one more time keys left here or a slot changed state.
-const ROUTES_MOVED: u64 = 8;
+const ROUTES_MOVED: u64 = 16;
 /// [`HANDOFF`]: the bits below the count.
 const BITS: u64 = ROUTES_MOVED - 1;
 
@@ -428,6 +432,32 @@ pub fn test_stall_before_the_gate(cmd: &[&[u8]]) {
     }
 }
 
+/// `KIVIDB_TEST_CLOCK_AHEAD_MS`, never set otherwise, and read in debug
+/// builds only: a write on a master with an argument that begins with
+/// `clock-ahead:` finds the clock this far ahead once it has looked for
+/// the keys it names that are past their time
+/// (`handler::expire_named_keys_first`), until it ends. A test's window
+/// for a key's deadline to fall between that look and the command's own
+/// lookups, with no wait: the command goes by the time it read first
+/// (`script_clock::command`, #632).
+#[cfg(debug_assertions)]
+pub fn test_move_clock_after_the_expiry_check(cmd: &[&[u8]]) {
+    static AHEAD: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let ahead = AHEAD.get_or_init(|| {
+        std::env::var("KIVIDB_TEST_CLOCK_AHEAD_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+    });
+    if let Some(ms) = *ahead
+        && cmd
+            .iter()
+            .skip(1)
+            .any(|arg| arg.starts_with(b"clock-ahead:"))
+    {
+        crate::script_clock::test_move_clock_ahead(ms);
+    }
+}
+
 /// `KIVIDB_TEST_SCRIPT_STALL_MS`, never set otherwise, and read in debug
 /// builds only: a command a script calls with an argument that begins with
 /// `script-stall:` (`redis.call('ECHO', 'script-stall:1')`) waits this long,
@@ -452,7 +482,13 @@ pub fn test_stall_in_script(cmd: &[&[u8]]) {
             .any(|arg| arg.starts_with(b"script-stall:"))
     {
         let _ = std::fs::write("script-stall.held", b"");
-        std::thread::sleep(delay);
+        // Off the runtime, as `test_stall_before_the_gate` waits: on a
+        // worker of the Tokio runtime, the worker's other tasks go to
+        // another thread, the one it had queued to run next among them
+        // (tokio's LIFO slot, which no other worker takes). A script that
+        // computes for as long holds them the same way; this hook is to
+        // hold the script, not those.
+        crate::cluster::migration::off_the_runtime(|| std::thread::sleep(delay));
         let _ = std::fs::remove_file("script-stall.held");
     }
 }
@@ -705,6 +741,17 @@ pub fn routes_moved_since(routed: u64) -> bool {
 /// (#331). In a cluster only.
 pub(crate) fn routes_moved() {
     HANDOFF.fetch_add(ROUTES_MOVED, Ordering::SeqCst);
+}
+
+/// The AOF holds records the disk would not take, or no longer does
+/// (`aof::UNWRITTEN`, with the log locked): a write that enters the write
+/// gate checks whether it is refused (`checked_in_gate`).
+pub(crate) fn set_aof_failing(on: bool) {
+    if on {
+        HANDOFF.fetch_or(AOF_FAILING, Ordering::SeqCst);
+    } else {
+        HANDOFF.fetch_and(!AOF_FAILING, Ordering::SeqCst);
+    }
 }
 
 /// `MIGRATE` holds keys here, or no longer does (`key_moves`, under its

@@ -306,6 +306,23 @@ impl Job {
     }
 }
 
+/// `KIVIDB_TEST_KEEP_FAST_SCRIPTS`, never set otherwise, and read in debug
+/// builds only: a script is made a quick one by its first run, and never
+/// sent back to the pool, however long a run of it took. For tests whose
+/// scripts must run beside others on a loaded machine, where one slow run
+/// would otherwise make the next one run alone.
+#[cfg(all(feature = "lua", debug_assertions))]
+fn test_keeps_fast_scripts() -> bool {
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| std::env::var_os("KIVIDB_TEST_KEEP_FAST_SCRIPTS").is_some())
+}
+
+#[cfg(all(feature = "lua", not(debug_assertions)))]
+#[inline(always)]
+fn test_keeps_fast_scripts() -> bool {
+    false
+}
+
 /// Run a quick script, by `run`, and see whether it was one.
 #[cfg(feature = "lua")]
 fn ran_quick(key: u64, db: usize, run: impl FnOnce() -> (Vec<u8>, usize)) -> Done {
@@ -319,7 +336,7 @@ fn ran_quick(key: u64, db: usize, run: impl FnOnce() -> (Vec<u8>, usize)) -> Don
         // Sent to the pool for that, it would wait there with a thread of its
         // own, next to others doing the same — and the scripts of a busy
         // server would never be quick again.
-        if crate::commands::take_last_vm_run_us() > DEMOTE_US {
+        if crate::commands::take_last_vm_run_us() > DEMOTE_US && !test_keeps_fast_scripts() {
             FAST_SCRIPTS.write().remove(&key);
         }
         match ran {
@@ -482,6 +499,10 @@ pub(crate) async fn run_lua_vm_blocking(
             // `SCAN`), which keeps such scripts out while it runs: here too,
             // and not inside the command (#772).
             crate::tag_locks::walks_done().await;
+            // Counted among the scripts running beside others, which an
+            // `EXEC` waits for asleep; or, while one does, waiting for it
+            // here, asleep (#882).
+            let _running = crate::tag_locks::run_beside_others().await;
             crate::tag_locks::allow_next_script();
             let (resp, sel_out, elapsed_us) = {
                 // A walk that started since is waited for here, on the
@@ -547,7 +568,7 @@ pub(crate) async fn run_lua_vm_blocking(
     })
     .await
     .expect("Lua VM offload thread panicked");
-    if ran_us < PROMOTE_US
+    if (ran_us < PROMOTE_US || test_keeps_fast_scripts())
         && let Some(key) = key
     {
         let mut fast = FAST_SCRIPTS.write();

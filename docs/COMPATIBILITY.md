@@ -261,10 +261,44 @@ other files:
   itself. A vector set made
   `NOQUANT` arrives as a set made without an option, so it then accepts a
   `VADD` with any quantization option, the same as after a snapshot reload.
-- Search: no stemming or phonetic matching (`NOSTEM` and `PHONETIC` are
-  accepted and change nothing). `GEO` and `GEOSHAPE` fields, `GEOFILTER` and
-  `INFIELDS` are refused. Query `TIMEOUT` is accepted but doesn't cut a query
-  short. `INT8` and `UINT8` vectors aren't supported.
+- Search: `GEO` and `GEOSHAPE` fields, `GEOFILTER` and `INFIELDS` are
+  refused. Query `TIMEOUT` is accepted but doesn't cut a query short. `INT8`
+  and `UINT8` vectors aren't supported. Scores, `NOFREQS`, `PHONETIC`
+  (`dm:en`, `dm:fr`, `dm:pt`, `dm:es`: the codes and the scores), the `~` and
+  `-` of dialect 1 and the way `FT.AGGREGATE` writes numbers (12 significant
+  digits) were compared with Redis 8.10.2 on the same data, and are its,
+  but for these differences:
+  - Scores: three of the compared queries differ from Redis's in the last
+    digit, all of three words (`apple cherry banana`: `SCORER BM25` on two
+    indexes, and the default scorer on one with field weights; the order
+    Redis adds the terms in); `TFIDF`, `TFIDF.DOCNORM` and `BM25` of three or
+    more words, one of which has a stem, can differ in the proximity factor;
+    a fuzzy term scores one of the document's words it matches, which one
+    can differ (see `vector/score.rs`); documents with the same score come
+    in key order, Redis's in the order they were indexed.
+  - Dialect 1: a field modifier applies to the bare words that follow it
+    (`@title:a b` is `@title:(a b)`) in Redis, to the first only here;
+    `=> {$weight: …}` on a clause is accepted but does not weigh it (and is
+    refused with a space after `=>`); `$phonetic: false` on a group
+    (`@p:(a b)=>{…}`) does not score as Redis does; the text of a syntax
+    error and its offset differ.
+  - After a document with a `PHONETIC` field is changed or deleted, Redis
+    keeps counting it in the frequency of the code term until its garbage
+    collection has run, so scores differ until then; here the count is
+    exact.
+  - `FT.SEARCH RETURN` shows a NUMERIC field as it was stored (Redis writes
+    it as a double) and a `KNN` distance as the shortest text of a 32-bit
+    float (Redis, 12 significant digits); `FT.AGGREGATE` with a `GROUPBY` and
+    no `LIMIT` returns every group (Redis, 10); in the expressions of `APPLY`
+    and `FILTER`, `-x`, `a+b` with no space and `round`/`pow` are accepted
+    (Redis refuses them), `^` is not a power, a text that is not a number is
+    0 in arithmetic (Redis refuses it), `SORTBY` on a TEXT field of numbers
+    sorts them as numbers (Redis, as text); `COUNT_DISTINCTISH` is exact and
+    `TOLIST` lists in the order the values came, where Redis's order is its
+    own; `QUANTILE` is exact (the value at rank `ceil(q * n)`), which is what
+    Redis gives for a small group, while for a group of thousands of values
+    (4,000 were compared) Redis's answer is an estimate, close to it but not
+    the same.
 - A Redis RDB with search index definitions loads without them: run
   `FT.CREATE` again. Bloom filters load (RedisBloom 2.4 and later: Redis
   Stack 6.2 to 7.4, Redis 8), and so do Cuckoo filters, Count-min sketches

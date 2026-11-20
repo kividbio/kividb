@@ -129,11 +129,14 @@ fn test_div() {
     assert_num("10 / 4", &r, 2.5);
 }
 
+/// As a double divides, and as Redis 8.10.2 gives it (`inf`, `-inf`, `nan`
+/// in the reply).
 #[test]
-fn test_div_by_zero_returns_nil() {
+fn test_div_by_zero_is_infinity_or_nan() {
     let r = row!();
-    let v = run("10 / 0", &r);
-    assert!(matches!(v, Value::Nil));
+    assert!(matches!(run("10 / 0", &r), Value::Num(x) if x == f64::INFINITY));
+    assert!(matches!(run("0 - 10 / 0", &r), Value::Num(x) if x == f64::NEG_INFINITY));
+    assert!(matches!(run("0 / 0", &r), Value::Num(x) if x.is_nan()));
 }
 
 #[test]

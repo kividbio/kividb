@@ -1138,6 +1138,7 @@ mod concurrency {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def();
         indexes.write().insert(name.into(), def);

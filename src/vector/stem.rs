@@ -246,6 +246,14 @@ pub fn index_words(
     text: &str,
 ) -> Vec<String> {
     let stems = matches!(field.field_type, FieldType::Text) && !field.options.nostem;
+    // A PHONETIC field indexes the code of each word of `MIN_PHONETIC_TERM_LEN`
+    // bytes or more, after the word (see `phonetic`).
+    let phonetic = matches!(field.field_type, FieldType::Text) && field.options.phonetic.is_some();
+    let min_phonetic = if phonetic {
+        crate::commands::search_tools::config_number("MIN_PHONETIC_TERM_LEN", 3) as usize
+    } else {
+        0
+    };
     let mut out = Vec::new();
     for word in super::tokenize_for_vocab(text) {
         if def.is_stopword(&word) {
@@ -260,7 +268,13 @@ pub fn index_words(
                 term.push_str(&stem);
                 term
             });
+        let code = if phonetic {
+            super::phonetic::term_of(&word, min_phonetic)
+        } else {
+            None
+        };
         out.push(word);
+        out.extend(code);
         out.extend(term);
     }
     out

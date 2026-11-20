@@ -1434,6 +1434,17 @@ fn checked_in_gate(
     routed: &mut crate::cluster::routing::Routed,
     write_gate: &mut Option<crate::write_gate::WriteGuard>,
 ) -> Option<Vec<u8>> {
+    // While the AOF cannot be written, what would be logged is refused, as
+    // Redis refuses it (`MISCONF`): a write, or a script that may make some,
+    // before it touches anything. Found by the one load that brought the
+    // write here (`pause::writes_must_check`): nothing more for a write
+    // otherwise, and nothing for a read.
+    if crate::aof::write_failing()
+        && crate::aof::refused_while_failing(ctx.cmd.as_slice(), name, ctx.apply_replication)
+    {
+        *write_gate = None;
+        return Some(crate::aof::misconf());
+    }
     loop {
         // Not for `SCRIPT LOAD` or `SCRIPT FLUSH`: they change the script
         // cache, not the dataset, and are sent to nobody (#705), so a
@@ -1767,11 +1778,41 @@ fn room_in_script(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     room_before_dispatch(ctx, name)
 }
 
+/// With Lua, for a command `arity::fits_with_shape` did not let through:
+/// the reply to the wrong number of arguments, or room made for a command
+/// that allocates as much as its arguments say (`room_on_arrival`). Out of
+/// line, off the way of every other command.
+#[cfg(feature = "lua")]
+#[cold]
+#[inline(never)]
+fn arity_refusal(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
+    let refusal = crate::commands::arity::check_dispatch(name, &ctx.cmd)?;
+    // Empty: a command that allocates as much as its arguments say, given
+    // room here if nothing below refuses it.
+    if !refusal.is_empty() {
+        return Some(refusal);
+    }
+    room_on_arrival(ctx, name)
+}
+
 /// [`execute_command`], once the command's name is known; it started at
 /// `started`.
 fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8> {
     // The wrong number of arguments is refused before anything else looks
-    // at the command, as in Redis. See `arity`.
+    // at the command, as in Redis. See `arity`. With Lua, the same lookup
+    // says how the command's keys are found, for the look for hash tags
+    // below (#889).
+    #[cfg(feature = "lua")]
+    let key_shape = match crate::commands::arity::fits_with_shape(name, &ctx.cmd) {
+        Some(shape) => shape,
+        None => {
+            if let Some(refusal) = arity_refusal(ctx, name) {
+                return refusal;
+            }
+            None
+        }
+    };
+    #[cfg(not(feature = "lua"))]
     if let Some(refusal) = crate::commands::arity::check_dispatch(name, &ctx.cmd) {
         // Empty: a command that allocates as much as its arguments say,
         // given room here if nothing below refuses it (`room_on_arrival`).
@@ -2092,24 +2133,23 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     // wait with it and every other connection of the thread behind it: the
     // command is sent back, and its connection waits for the script off the
     // thread (#882).
+    //
+    // Nearly every command: none of its keys has a `{`, and nothing else is
+    // looked at, not even whether this is a script's own call (#889).
     #[cfg(feature = "lua")]
     let _key_tags = if tag_locks
         && !any_script
         && !crate::command_gate::alone_on_this_thread()
+        && let Some(keys) = crate::tag_locks::named_keys_of(key_shape, name, &ctx.cmd)
         && !crate::tag_locks::in_script()
     {
-        // Nearly every command: none of its keys has a `{`, and nothing else
-        // is looked at (#889).
-        match crate::tag_locks::named_keys(name, &ctx.cmd) {
-            None => None,
-            Some(keys) => match lock_tags_found(ctx, keys) {
-                Ok(held) => held,
-                Err(busy) => {
-                    // Sent back: not run now.
-                    crate::commands::blocking::hold_for_tags(ctx, busy);
-                    return crate::pause::HELD_IN_GATE.to_vec();
-                }
-            },
+        match lock_tags_found(ctx, keys) {
+            Ok(held) => held,
+            Err(busy) => {
+                // Sent back: not run now.
+                crate::commands::blocking::hold_for_tags(ctx, busy);
+                return crate::pause::HELD_IN_GATE.to_vec();
+            }
         }
     } else {
         None
@@ -2168,6 +2208,12 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
     if hash_beside_others && !ctx.index_store.none() {
         ask_again_for_an_index(ctx, &mut _write_order);
     }
+    // From here to the end, one time for every expiry check the command
+    // makes: the look below for the keys it names that are past their time,
+    // and its own lookups after it (`script_clock::command`, #632). Taken
+    // once its gates and the order of its keys are held, where it may have
+    // waited: the time is the one it runs at.
+    let _clock = crate::script_clock::command();
     // The keys it names that are past their time go first, their deletions
     // sent ahead of it (`expire_named_keys_first`, #628). In the gate and
     // the order of its keys: the deletion falls where it did among the
@@ -2842,6 +2888,9 @@ fn expire_named_keys_first(ctx: &Ctx, name: &str, named: Option<crate::keyspec::
             crate::commands::helpers::delete_key_if_expired(ctx.store, db, key);
         }
     }
+    // A test's window between this look and the command's own lookups.
+    #[cfg(debug_assertions)]
+    crate::pause::test_move_clock_after_the_expiry_check(ctx.cmd.as_slice());
 }
 
 /// Whether `SET` `cmd` writes only on a condition: `NX`, `XX`, `IFEQ`,

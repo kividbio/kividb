@@ -9,6 +9,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrading
 
+- **A query that names no `DIALECT` is read in dialect 1 (#247).** It is
+  read in the default dialect, as in Redis: 1, which `search-default-dialect`
+  (`CONFIG SET`, the configuration file) or `FT.CONFIG SET DEFAULT_DIALECT`
+  changes. Until now such a query was read as in dialect 2, and the two read
+  `-` and `~` differently: `-red apple` is `apple` without `red` in
+  dialect 2, and not (`red apple`) in dialect 1. Nothing fails: a query
+  answers with other documents or scores. Clients that send `DIALECT 2`
+  (RedisVL, LangChain, ...) are not affected. To keep the old reading, set
+  `search-default-dialect 2`. In a cluster, the node that is asked tells the
+  others which dialect it read the query in.
+
+- **`FT.AGGREGATE` and `FT.HYBRID` write numbers as Redis does (#247).** A
+  number a reply computes, or loads from a NUMERIC field, is an integer when
+  it is one, else has 12 significant digits (`2.500000` is now `2.5`,
+  `0.1 + 0.2` is `0.3` and a NUMERIC `1.50` is `1.5`). A reducer with nothing
+  to work on, a division by zero or the square root of a negative number
+  gives `nan`, `inf` or `-inf` where `0`, an empty string or nothing was
+  given; a `QUANTILE` is the value at rank `ceil(q * n)`, `AVG` is over the
+  values that are numbers, and a group's columns come in the order its
+  `GROUPBY` names them (they were sorted by name). A client that reads the
+  values as numbers gets what they were to 12 digits; one that compares the
+  text sees the change. A cluster of 1.2 nodes and 1.3 nodes keeps working
+  (a coordinator asks for numbers as they are held, and an older one is
+  sent their text).
+
+- **Indexes made with `NOFREQS` and `PHONETIC` before this version (#247).**
+  `NOFREQS` was accepted and ignored. A snapshot written by an earlier
+  version does not say an index has it, so one loaded from such a snapshot
+  keeps counting frequencies; one rebuilt from an AOF with no snapshot part
+  (`FT.CREATE ... NOFREQS` replayed) does not. To have the option in force
+  everywhere, make such an index again. `PHONETIC` was kept and did
+  nothing: a field made with it now holds an extra term for each word of
+  three bytes or more (indexed again as the data loads, so the first start
+  of this version takes a little longer and the index a little more room),
+  and queries on it find words that sound alike, with scores that change.
 - **Compressed snapshots are opt-in (#879): nothing changes on upgrade.**
   `rdbcompression` defaults to `no`, and the snapshots 1.3 writes are the
   plain ones 1.2 reads, so a rollback to 1.2.x keeps working. Before
@@ -90,6 +125,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   In a cluster of more than one master, `FT.HYBRID` is now refused, where
   1.2.x answered from the one node's slots without saying so.
+- **The AOF's new log opens with a record of where the old log ended
+  (#277).** A log written by 1.2.2 or earlier has none and loads as before.
+  Going back to 1.2.x after a checkpoint of this version, 1.2.x replays the
+  record as an unknown command and passes over it (it logs `[WARN]
+  Replication: Replicated command error (non-fatal): -ERR unknown command
+  'KIVIDB.AOF-OLD-LOG-END', with args beginning with: ...`), loading every
+  write, but it counts a log holding only the record as written to: a node
+  stopped cleanly then does
+  not go on from its saved replication point (a replica asks for a full
+  sync). A `SAVE` or `BGREWRITEAOF` under 1.2.x writes a log without it.
 - **nodes.conf keeps each node's shard id (#563)**, after its address and
   hostname as Redis writes it: `ip:port@cport,<hostname>,shard-id=<id>`.
   An earlier release reading the file takes `<hostname>,shard-id=<id>` for
@@ -473,6 +518,51 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A command reads the clock once (#632).** The first time a command
+  needs the time, it reads the clock, and every later expiry check in the
+  same command uses that reading, as Redis's `commandTimeSnapshot` does:
+  the look a write on a master makes for the keys it names that are past
+  their time, the command's own lookups, hash field deadlines, and the
+  times to live it sets or reports. A key is either live or expired for
+  the whole command, so `SUNIONSTORE`, `BITOP`, `PFMERGE`, `ZUNIONSTORE`,
+  `SORT … STORE`, `GEOSEARCHSTORE`, `COPY`, `LMOVE`, `SMOVE` and the other
+  commands that read one key and write another find their sources as that
+  first look found them. A transaction keeps one reading for its whole
+  `EXEC`, and a script one for its whole run; the script of an `EVAL` or
+  `FCALL` uses the time its command had already read. The background
+  expiry cycle and eviction go by the clock as before, and replicas still
+  never expire keys by their own clock. A command that looks at no key
+  with a time to live reads no clock at all.
+
+- **A restart replays the new log of an unfinished checkpoint only when
+  the old log matches that record (its length, and its last 4 KiB)
+  (#277).** A turn-over's new `appendonly.aof` now opens with a record of
+  where the old log (`appendonly.aof.prev`) ended. When a power failure
+  leaves the old log short of that, the restart replays the old log up to
+  its last whole record and does not replay the new log after it; it says
+  so in a `[WARN]`, keeps the new log aside as
+  `superseded.<ms>.<n>.appendonly.aof` with instructions, and starts the
+  log again after the old one. None of the writes left out had been
+  reported synced: a sync of the new log (under `appendfsync always`, or
+  for `WAITAOF`) first syncs the old one. An old log that ends in a record
+  cut short is cut after its last whole record at that restart, before a
+  later checkpoint can add records to it. Under `everysec` and `no` the
+  checkpoint also syncs the log just before it turns it over, so the old
+  log's last sync has little left to write. See "The old log is complete
+  before the new one is replayed" in docs/PERSISTENCE.md.
+- **A write to the AOF that the disk takes only part of is taken back.**
+  The log is cut to where it was before the write, and the write's
+  records, with all queued after them, are written first once the disk
+  takes them. Until then commands that would be logged are refused with
+  `-MISCONF Errors writing to the AOF file: <error>`, as Redis refuses
+  them (reads are served), the held writes' replies wait (at most 5
+  seconds, as for a disk that is behind), `WAITAOF` counts no sync, and
+  `aof_last_write_status` reads `err`; once the disk takes them, writes are
+  accepted again. At most 256 MiB is held; past that the server stops. A
+  shutdown with writes still held says how many bytes are in memory only:
+  a `SHUTDOWN` keeps the server running, as when its final save fails, and
+  `SHUTDOWN NOSAVE` exits with status 1. See "A write to the log that the
+  disk takes only part of" in docs/PERSISTENCE.md.
 - **Pipelined writes of kilobyte values are about twice as fast on the
   Tokio loop, and a long pipeline through a small receive buffer no longer
   stalls (#432).** The loop read a client 4 KiB at a time through a stack
@@ -516,7 +606,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are after it, as in Redis. A script that finds a walk under way waits
   for it asleep, off its thread; one that finds walk after walk stops
   waiting after three and holds the walks after it back, so a loop of
-  `SCAN`s cannot keep scripts out. The other commands that read keys they
+  `SCAN`s cannot keep scripts out. A walk that finds a script running
+  beside others waits for it on its thread; on the Tokio loop it hands that
+  worker's other tasks to another thread first, including the one queued
+  to run next, which no other worker takes, so new connections and the
+  thread's other clients are not held with it. The other commands that read keys they
   do not name take the same locks, shared, as `KEYS` and `SCAN`: `INFO`
   (with no section, or `keyspace`, `default`, `all` or `everything`),
   `MEMORY STATS` and `MEMORY DOCTOR`, `FT.SEARCH`, `FT.AGGREGATE`,
@@ -915,6 +1009,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   command takes is the same as before. `scripts/perf/measure.sh` has
   these workloads as `WORKLOADS=tags`.
 
+  The look then took less again. It asks the arity table, which every
+  command is looked up in anyway, how the command's keys are found, where
+  it asked a second table; it checks a key for a `{` with two or four
+  words looked at together; and a command of one tagged key takes its lock
+  without walking a list of positions. Instructions per command, the same
+  measure, on both I/O loops: `GET` 15 fewer, `SET` 57 fewer, a 10-key
+  `MGET` about 140 fewer, a `GET` or `SET` of a key with a tag about 90 and
+  98 fewer (5 % and 4 %); a tagged `EVALSHA` 0 to 27 fewer, `MULTI` with
+  two `SET`s and `EXEC` 8 more. The build without Lua is unchanged.
+
 - **Small hashes take less than half the memory.** A hash of up to 512
   fields, no field or value longer than 64 bytes, is kept in one block, each
   field next to its value, where it was a table with two allocations for
@@ -974,7 +1078,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   connections (Redis 8.10.2: 64k), p99 11.4 to 5.0 ms; LiteLLM's whole
   per-request mix of scripts, spend counters and cache from 89k to 226k
   commands a second, p99 19.8 to 3.8 ms (Redis: 104k, 9.5 ms). Scripts of
-  one tag and commands that are not scripts are unchanged.
+  one tag and commands that are not scripts are unchanged. Suite
+  `36-litellm-ratelimit` of the 1.3.0 regression suite measures this
+  again, and fails if the candidate runs fewer than 90 % of LiteLLM's
+  scripts beside others. On a Standard_D8s_v5, server on 4 CPUs, 200
+  connections: `BATCH_RATE_LIMITER` for a key and its team 167k calls a
+  second (Redis 8.10.2: 67k; 1.2.2: 61k), the per-request mix 232k (Redis:
+  93k; 1.2.2: 75k).
 
 - **Small sets take a half to a twelfth of the memory (#297).** A set of
   up to 128 members of up to 64 bytes is kept in one block, the members end
@@ -1327,6 +1437,50 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Search scores, `PHONETIC` and `FT.AGGREGATE` numbers agree with Redis
+  8.10.2 for `NOFREQS`, `~` in dialect 1, phonetic fields and the way numbers
+  are written (#247).** Checked against a live Redis 8.10.2 on the same
+  indexes and documents, to the last digit (the few differences left are in
+  [the compatibility notes](docs/COMPATIBILITY.md)):
+  - `NOFREQS` is kept (it was accepted and ignored) and counts a word once
+    in a document however often it is in it, for every scorer; the
+    document's length and the TFIDF norm are the real ones. `FT.INFO` lists
+    it under `index_options`, and it survives snapshots.
+  - In dialect 1, `-` and `~` take the rest of the query as their operand
+    (up to a `)`; a later `~` starts a clause of its own): `~red apple` is
+    an optional `red apple`, and `-red apple` is not (`red apple`), as in
+    Redis. Dialects 2 and later are as they were. An optional inside an
+    optional scores as it does in Redis. A query that names no `DIALECT` is
+    read in the default dialect, which `search-default-dialect` (`CONFIG
+    SET`, `CONFIG GET`, the configuration file) or `FT.CONFIG SET
+    DEFAULT_DIALECT` sets, 1 unless set.
+  - `PHONETIC dm:en`, `dm:fr`, `dm:pt` and `dm:es` (they were accepted and
+    changed nothing) index a term `<CODE`, the word's Double Metaphone,
+    with each word of `MIN_PHONETIC_TERM_LEN` bytes (3) or more, and a
+    query word on such a field is looked for as the word, as its code and
+    as its stem: `jon` finds `John`. The codes are Redis's (124,000 words
+    compared); a code is no word of the document and is not in its length,
+    as in Redis. `$phonetic: false` turns it off for a clause, and `true`
+    on a field that is not phonetic is an error.
+  - `FT.AGGREGATE` writes the numbers it computes, and the values of NUMERIC
+    fields it loads, as Redis does: an integer when the number is one (and
+    fits 64 bits), else with 12 significant digits (`1.20376952202`,
+    `3.33333333333e-08`, `1e+20`); `inf`, `-inf` and `nan` for the rest,
+    under RESP2 and RESP3 alike. That is the reducers (`SUM`, `AVG`, `MIN`,
+    `MAX`, `STDDEV`, `QUANTILE`, `FIRST_VALUE`, `TOLIST`), the results of
+    `APPLY`, `ADDSCORES`'s `@__score` and a `KNN` distance. The steps of a
+    pipeline still work on the double, not on its 12 digits (`APPLY "@x / 3"
+    AS y APPLY "@y * 3" AS z` gives `@x` back). Also as in Redis: a division
+    by zero is `inf` (or `nan`); `exp`, `to_str` and `to_number` are
+    functions; a `QUANTILE` is the value at rank `ceil(q * n)`; `SUM`, `AVG`,
+    `MIN` and `MAX` of values that are not numbers are `nan`, `nan`, `inf`
+    and `-inf` (and `AVG` is over the values that are numbers); and a
+    group's columns come in the order its `GROUPBY` names them. A
+    `GROUPBY` by a NUMERIC field still runs as the documents are read
+    (#761).
+  - `SCORER BM25` of a word multiplies the IDF in before it divides, as
+    Redis does: the last digit of its scores was one off.
+
 - **A script running beside others under its hash tags is refused
   `MIGRATE` (#340).** A `MIGRATE` holds back writes to the keys it moves
   until they have left, and a script that runs beside others cannot take
@@ -1348,8 +1502,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on meanwhile (should one of those be busy once it is its turn, it waits
   for that tag too, holding nothing); a client that goes or
   is killed while it waits leaves nothing behind; a blocking command woken
-  by the script keeps what it was woken for. The replica's applier, the
-  AOF's replay and `EXEC` wait in place, as before. Measured with a ~2 ms
+  by the script keeps what it was woken for. The replica's applier and the
+  AOF's replay wait in place, as before. An `EXEC`, which takes the
+  command gate alone and so waits for every script running beside others,
+  waits for them the same way: its connection waits asleep until none
+  runs, the replies before it sent and what was pipelined behind it
+  waiting behind it, and scripts that come meanwhile wait for it, so a
+  stream of them cannot keep it out. It then takes the gate alone and runs
+  whole; a `WATCH` is checked inside the gate, a `CLIENT PAUSE` or a slot
+  handoff that came while it waited holds or refuses it whole, and a client
+  that goes while it waits has nothing run. With a tagged script held for
+  800 ms on a `--threads 4` server and one `MULTI`/`SET`/`EXEC` waiting for
+  it, none of 16 connections served by the other threads waited for the
+  script, on either I/O loop. Measured with a ~2 ms
   tagged script run back to back on one tag, 8 connections reading and
   writing that tag and 16 reading and writing untagged keys (Azure
   D8s_v5, server on 4 vCPUs, memtier on the other 4):

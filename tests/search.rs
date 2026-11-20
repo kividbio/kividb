@@ -2436,7 +2436,7 @@ fn collect_returns_the_documents_of_each_group() {
                     "top".to_string(),
                     V::Arr(vec![
                         entry("Alien", "8.5", "1979"),
-                        entry("Solaris", "8.0", "1972")
+                        entry("Solaris", "8", "1972")
                     ])
                 ),
             ],
@@ -2558,7 +2558,7 @@ fn the_reducers() {
     };
     assert_eq!(get("n").s(), "3");
     assert!((get("avg").s().parse::<f64>().unwrap() - 8.133333).abs() < 1e-5);
-    assert_eq!(get("max").s(), "8.500000");
+    assert_eq!(get("max").s(), "8.5");
     assert!((get("sd").s().parse::<f64>().unwrap() - 0.321455).abs() < 1e-5);
     assert_eq!(get("median").s(), "8");
     assert_eq!(get("best").s(), "Alien");
@@ -4698,7 +4698,14 @@ fn a_groupby_read_document_by_document_answers_as_grouping_rows_does() {
         let (g, h, n) = (
             (i % 7).to_string(),
             ["a", "b", ""][i % 3],
-            format!("{}.{}", i % 13, i % 4),
+            // The same number as text that differs: 1.50 and 1.5, 003 and 3.
+            if i % 6 == 0 {
+                format!("{}.{}0", i % 13, i % 4)
+            } else if i % 10 == 3 {
+                format!("00{}", i % 13)
+            } else {
+                format!("{}.{}", i % 13, i % 4)
+            },
         );
         let key = format!("gstr:{i}");
         let mut args = vec!["HSET", &key, "g", &g, "h", h, "n", &n, "t", "some words"];
@@ -4770,6 +4777,29 @@ fn a_groupby_read_document_by_document_answers_as_grouping_rows_does() {
             "GROUPBY", "1", "@g", "REDUCE", "SUM", "1", "@m", "AS", "s", "SORTBY", "2", "@s",
             "DESC", "LIMIT", "1", "3",
         ],
+        // By a NUMERIC field whose values are the same number as different
+        // text (`1.50`, `1.5`, `003`).
+        &[
+            "GROUPBY", "1", "@n", "REDUCE", "COUNT", "0", "AS", "c", "SORTBY", "2", "@n", "ASC",
+            "LIMIT", "0", "100",
+        ],
+        &[
+            "GROUPBY",
+            "1",
+            "@h",
+            "REDUCE",
+            "COUNT_DISTINCT",
+            "1",
+            "@n",
+            "AS",
+            "d",
+            "REDUCE",
+            "SUM",
+            "1",
+            "@n",
+            "AS",
+            "s",
+        ],
         &[
             "GROUPBY", "1", "@g", "REDUCE", "SUM", "1", "@m", "AS", "s", "FILTER", "@s>200",
         ],
@@ -4816,4 +4846,762 @@ fn a_groupby_read_document_by_document_answers_as_grouping_rows_does() {
     }
     c.cmd(&["FT.DROPINDEX", "gstr", "DD"]);
     c.cmd(&["FT.DROPINDEX", "gstj", "DD"]);
+}
+
+// ── Scores and replies as Redis gives them (#247) ─────────────────────────────
+//
+// The values below are what Redis 8.10.2 (the `redis:8.10.2` image) replied
+// to the same commands on the same index and documents, to the last digit.
+
+/// A query, the options after it, and the (id, score) pairs Redis gave.
+type ScoreCase<'a> = (&'a str, &'a [&'a str], &'a [(&'a str, f64)]);
+/// A query, its dialect, and the pairs Redis gave.
+type DialectCase<'a> = (&'a str, u8, &'a [(&'a str, f64)]);
+/// A query, its dialect, the pairs Redis gave, and the scorer.
+type ScorerCase<'a> = (&'a str, u8, &'a [(&'a str, f64)], &'a str);
+
+/// FT.SEARCH . WITHSCORES NOCONTENT in `dialect`: the (id, score) pairs
+/// against what Redis gave (order apart: ties have no fixed order).
+fn assert_scores_in(
+    c: &mut Conn,
+    index: &str,
+    query: &str,
+    dialect: u8,
+    extra: &[&str],
+    want: &[(&str, f64)],
+) {
+    let dialect = dialect.to_string();
+    let mut args = vec![
+        "FT.SEARCH",
+        index,
+        query,
+        "WITHSCORES",
+        "NOCONTENT",
+        "LIMIT",
+        "0",
+        "100",
+        "DIALECT",
+        &dialect,
+    ];
+    args.extend_from_slice(extra);
+    let reply = c.cmd(&args);
+    let mut got = reply.scores();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut want: Vec<(String, f64)> = want.iter().map(|(k, s)| (k.to_string(), *s)).collect();
+    want.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got.iter().map(|g| &g.0).collect::<Vec<_>>(),
+        want.iter().map(|w| &w.0).collect::<Vec<_>>(),
+        "{query} (dialect {dialect}) {extra:?}: {reply:?}"
+    );
+    for ((id, g), (_, w)) in got.iter().zip(&want) {
+        assert!(
+            (g - w).abs() <= 1e-9 * w.abs().max(1.0),
+            "{query} (dialect {dialect}) {extra:?}: {id} scored {g}, Redis {w}"
+        );
+    }
+}
+
+/// `NOFREQS`: a word counts once in a document, however often it is in it
+/// (the document's length, and the most frequent word's frequency of
+/// TFIDF's norm, are the real ones).
+#[test]
+fn nofreqs_counts_each_word_once_as_redis_does() {
+    let mut c = conn();
+    for (index, prefix, nofreqs) in [("nf247", "nf:", true), ("wf247", "wf:", false)] {
+        let mut create = vec!["FT.CREATE", index, "ON", "HASH", "PREFIX", "1", prefix];
+        if nofreqs {
+            create.push("NOFREQS");
+        }
+        create.extend(["SCHEMA", "t", "TEXT", "u", "TEXT"]);
+        assert!(c.cmd(&create).ok());
+        for (id, t, u) in [
+            ("1", "apple apple apple banana", "apple cherry"),
+            ("2", "apple banana banana banana banana", "banana banana"),
+            ("3", "cherry cherry apple", "apple apple apple apple"),
+            ("4", "banana", "cherry cherry cherry"),
+            ("5", "apple apple", "zzz"),
+            ("6", "plum plum plum plum plum plum", "plum"),
+        ] {
+            c.cmd(&["HSET", &format!("{prefix}{id}"), "t", t, "u", u]);
+        }
+    }
+    let info = c.cmd(&["FT.INFO", "nf247"]);
+    assert!(
+        matches!(info.get("index_options"), V::Arr(o) if o.len() == 1 && o[0].s() == "NOFREQS"),
+        "{info:?}"
+    );
+    let info = c.cmd(&["FT.INFO", "wf247"]);
+    assert!(
+        matches!(info.get("index_options"), V::Arr(o) if o.is_empty()),
+        "{info:?}"
+    );
+
+    #[rustfmt::skip]
+    let nofreqs: &[ScoreCase] = &[
+        ("apple", &[], &[("nf:5", 1.0943407289002423), ("nf:1", 0.8629005184450389), ("nf:2", 0.8060753614160611), ("nf:3", 0.8060753614160611)]),
+        ("banana", &[], &[("nf:4", 0.7879545476287585), ("nf:1", 0.6768591264213853), ("nf:2", 0.632285475898261)]),
+        ("apple banana", &[], &[("nf:1", 1.5397596448664244), ("nf:2", 1.4383608373143222)]),
+        ("apple | cherry", &[], &[("nf:1", 2.2166187712878096), ("nf:3", 2.070646313212583), ("nf:4", 1.575909095257517), ("nf:5", 1.0943407289002423), ("nf:2", 0.8060753614160611)]),
+        ("@t:apple", &[], &[("nf:5", 1.0943407289002423), ("nf:1", 0.8629005184450389), ("nf:2", 0.8060753614160611), ("nf:3", 0.8060753614160611)]),
+        ("@u:apple", &[], &[("nf:1", 0.8629005184450389), ("nf:3", 0.8060753614160611)]),
+        ("@t:apple @u:apple", &[], &[("nf:1", 1.7258010368900778), ("nf:3", 1.6121507228321221)]),
+        ("plum", &[], &[("nf:6", 1.4051864497574047)]),
+        ("ap*", &[], &[("nf:5", 0.5471703644501211), ("nf:1", 0.43145025922251945), ("nf:2", 0.40303768070803053), ("nf:3", 0.40303768070803053)]),
+        ("\"apple banana\"", &[], &[("nf:1", 1.1083093856439048), ("nf:2", 1.0353231566062915)]),
+        ("apple", &["SCORER", "TFIDF"], &[("nf:5", 1.0), ("nf:1", 0.5), ("nf:3", 0.4), ("nf:2", 0.3333333333333333)]),
+        ("apple", &["SCORER", "TFIDF.DOCNORM"], &[("nf:5", 0.6666666666666666), ("nf:1", 0.3333333333333333), ("nf:2", 0.2857142857142857), ("nf:3", 0.2857142857142857)]),
+        ("apple", &["SCORER", "BM25"], &[("nf:1", 0.39999998728434283), ("nf:2", 0.39999998728434283), ("nf:3", 0.39999998728434283), ("nf:5", 0.39999998728434283)]),
+        ("apple", &["SCORER", "DISMAX"], &[("nf:1", 1.0), ("nf:2", 1.0), ("nf:3", 1.0), ("nf:5", 1.0)]),
+        ("apple banana", &["SCORER", "TFIDF"], &[("nf:1", 0.75), ("nf:2", 0.5)]),
+        ("plum", &["SCORER", "BM25"], &[("nf:6", 0.5999999809265143)]),
+    ];
+    for (query, extra, want) in nofreqs {
+        assert_scores_in(&mut c, "nf247", query, 2, extra, want);
+    }
+    // The same documents in an index without it: frequencies count.
+    #[rustfmt::skip]
+    let counted: &[ScoreCase] = &[
+        ("apple", &[], &[("wf:3", 1.5160133164052878), ("wf:1", 1.480362386273343), ("wf:5", 1.4003851787934847), ("wf:2", 0.8060753614160611)]),
+        ("plum", &[], &[("wf:6", 2.820199424975209)]),
+        ("apple", &["SCORER", "TFIDF"], &[("wf:1", 2.0), ("wf:3", 2.0), ("wf:5", 2.0), ("wf:2", 0.3333333333333333)]),
+    ];
+    for (query, extra, want) in counted {
+        assert_scores_in(&mut c, "wf247", query, 2, extra, want);
+    }
+}
+
+/// Dialect 1: `~` and `-` take the rest of the query as their operand (up to
+/// a `)`; a later `~` starts a clause of its own), as in Redis; dialects 2
+/// and later take the next clause only.
+#[test]
+fn dialect_1_prefix_operators_take_the_rest_of_the_query_as_redis_does() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "op247",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "op:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+            "n",
+            "NUMERIC",
+            "g",
+            "TAG",
+        ])
+        .ok()
+    );
+    for (id, t, n, g) in [
+        ("1", "red apple pie", "1", "a"),
+        ("2", "green apple tart", "2", "b"),
+        ("3", "red cherry pie", "3", "a"),
+        ("4", "blue plum cake", "4", "b"),
+        ("5", "apple", "5", "a"),
+        ("6", "red green blue", "6", "c"),
+        ("7", "pie", "7", "c"),
+    ] {
+        c.cmd(&["HSET", &format!("op:{id}"), "t", t, "n", n, "g", g]);
+    }
+
+    #[rustfmt::skip]
+    let cases: &[DialectCase] = &[
+        ("~red apple", 1, &[("op:1", 2.262276482053579), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("red ~apple pie", 1, &[("op:1", 3.016368642738105), ("op:3", 0.7540921606845262), ("op:6", 0.7540921606845262)]),
+        ("~red apple pie", 1, &[("op:1", 3.016368642738105), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("apple ~red pie", 1, &[("op:1", 3.016368642738105), ("op:5", 2.1773083671879347), ("op:2", 1.5081843213690524)]),
+        ("~red ~apple pie", 1, &[("op:1", 3.016368642738105), ("op:3", 0.7540921606845262), ("op:6", 0.7540921606845262), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:7", 0.0)]),
+        ("~green blue plum", 1, &[("op:1", 0.0), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("~cherry pie", 1, &[("op:3", 3.8080784297718657), ("op:1", 0.0), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("~zzz apple", 1, &[("op:1", 0.0), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("red pie ~zzz", 1, &[("op:1", 1.5081843213690524), ("op:3", 1.5081843213690524)]),
+        ("~red apple | pie", 1, &[("op:1", 3.016368642738105), ("op:7", 1.0886541835939674), ("op:3", 0.7540921606845262), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0)]),
+        ("(~red apple) pie", 1, &[("op:1", 3.016368642738105), ("op:7", 1.0886541835939674), ("op:3", 0.7540921606845262)]),
+        ("~(red apple) pie", 1, &[("op:1", 3.016368642738105), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("~red -apple", 1, &[("op:3", 0.7540921606845262), ("op:6", 0.7540921606845262), ("op:1", 0.0), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:7", 0.0)]),
+        ("-apple ~red", 1, &[("op:3", 0.7540921606845262), ("op:6", 0.7540921606845262), ("op:4", 0.0), ("op:7", 0.0)]),
+        ("-apple red", 1, &[("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("red -apple pie", 1, &[("op:3", 0.7540921606845262), ("op:6", 0.7540921606845262)]),
+        ("~@t:red apple", 1, &[("op:1", 2.262276482053579), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("~@n:[1 3] apple", 1, &[("op:1", 1.5081843213690524), ("op:2", 1.5081843213690524), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("@g:{a} ~red pie", 1, &[("op:1", 2.262276482053579), ("op:3", 2.262276482053579), ("op:5", 1.0886541835939674)]),
+        ("apple ~red ~pie cake", 1, &[("op:1", 2.262276482053579), ("op:5", 2.1773083671879347), ("op:2", 1.5081843213690524)]),
+        ("~red apple ~pie", 1, &[("op:1", 3.016368642738105), ("op:7", 1.0886541835939674), ("op:3", 0.7540921606845262), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0)]),
+        ("~~red apple", 1, &[("op:1", 2.262276482053579), ("op:5", 1.3169014159884864), ("op:7", 1.3169014159884864), ("op:2", 0.9121951205045392), ("op:3", 0.9121951205045392), ("op:4", 0.9121951205045392), ("op:6", 0.9121951205045392)]),
+        ("~the apple", 1, &[("op:5", 2.1773083671879347), ("op:1", 1.5081843213690524), ("op:2", 1.5081843213690524), ("op:3", 0.0), ("op:4", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("~red the", 1, &[("op:1", 0.7540921606845262), ("op:3", 0.7540921606845262), ("op:6", 0.7540921606845262), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:7", 0.0)]),
+        ("~red apple", 2, &[("op:1", 2.262276482053579), ("op:5", 2.1773083671879347), ("op:2", 1.5081843213690524)]),
+        ("red ~apple pie", 2, &[("op:1", 3.016368642738105), ("op:3", 1.5081843213690524)]),
+        ("~red apple pie", 2, &[("op:1", 3.016368642738105)]),
+        ("~red apple | pie", 2, &[("op:1", 3.016368642738105), ("op:5", 2.1773083671879347), ("op:2", 1.5081843213690524), ("op:7", 1.0886541835939674), ("op:3", 0.7540921606845262)]),
+        ("-apple red", 2, &[("op:3", 0.7540921606845262), ("op:6", 0.7540921606845262)]),
+        ("~~red apple", 2, &[("op:5", 3.494209783176421), ("op:2", 2.4203794418735916), ("op:1", 2.262276482053579)]),
+        ("-(red -apple)", 1, &[("op:1", 0.0), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:7", 0.0)]),
+        ("-(@g:{a} -@g:{b})", 1, &[("op:2", 0.0), ("op:4", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("~red (apple ~pie)", 1, &[("op:1", 3.016368642738105), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("-red (apple ~pie)", 1, &[("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("~red @t:(apple ~pie)", 1, &[("op:1", 3.016368642738105), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("~(red ~apple) pie", 1, &[("op:1", 3.016368642738105), ("op:3", 1.5081843213690524), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("-(red | ~apple) pie", 1, &[("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0)]),
+        ("~(red -apple) pie", 1, &[("op:3", 1.5081843213690524), ("op:1", 0.0), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+        ("-red (apple -pie)", 1, &[("op:1", 0.0), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)]),
+    ];
+    for (query, dialect, want) in cases {
+        assert_scores_in(&mut c, "op247", query, *dialect, &[], want);
+    }
+    #[rustfmt::skip]
+    let scorers: &[ScorerCase] = &[
+        ("~red apple", 1, &[("op:1", 3.0), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)], "TFIDF"),
+        ("red ~apple pie", 1, &[("op:1", 4.0), ("op:3", 1.0), ("op:6", 1.0)], "TFIDF"),
+        ("~red ~apple pie", 1, &[("op:1", 4.0), ("op:3", 1.0), ("op:6", 1.0), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:7", 0.0)], "TFIDF"),
+        ("~red apple", 1, &[("op:1", 0.9813083849762074), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)], "BM25"),
+        ("red ~apple pie", 1, &[("op:1", 1.3084111799682765), ("op:3", 0.3271027949920691), ("op:6", 0.3271027949920691)], "BM25"),
+        ("~red ~apple pie", 1, &[("op:1", 1.3084111799682765), ("op:3", 0.3271027949920691), ("op:6", 0.3271027949920691), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:7", 0.0)], "BM25"),
+        ("~red apple", 1, &[("op:1", 2.0), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)], "DISMAX"),
+        ("red ~apple pie", 1, &[("op:1", 3.0), ("op:3", 1.0), ("op:6", 1.0)], "DISMAX"),
+        ("~red ~apple pie", 1, &[("op:1", 3.0), ("op:3", 1.0), ("op:6", 1.0), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:7", 0.0)], "DISMAX"),
+        ("~red apple", 1, &[("op:1", 1.0), ("op:2", 0.0), ("op:3", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:6", 0.0), ("op:7", 0.0)], "TFIDF.DOCNORM"),
+        ("red ~apple pie", 1, &[("op:1", 1.3333333333333333), ("op:3", 0.3333333333333333), ("op:6", 0.3333333333333333)], "TFIDF.DOCNORM"),
+        ("~red ~apple pie", 1, &[("op:1", 1.3333333333333333), ("op:3", 0.3333333333333333), ("op:6", 0.3333333333333333), ("op:2", 0.0), ("op:4", 0.0), ("op:5", 0.0), ("op:7", 0.0)], "TFIDF.DOCNORM"),
+    ];
+    for (query, dialect, want, scorer) in scorers {
+        assert_scores_in(&mut c, "op247", query, *dialect, &["SCORER", scorer], want);
+    }
+}
+
+/// A query that names no `DIALECT` is read in the engine's default, 1 unless
+/// `FT.CONFIG SET DEFAULT_DIALECT` says otherwise (a server of its own: the
+/// setting is the process's).
+#[test]
+fn a_query_with_no_dialect_is_read_in_the_default_dialect() {
+    let mut c = own_conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "dd",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "dd:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+        ])
+        .ok()
+    );
+    for (id, t) in [("1", "red apple"), ("2", "red cherry"), ("3", "apple")] {
+        c.cmd(&["HSET", &format!("dd:{id}"), "t", t]);
+    }
+    let ids = |c: &mut Conn, extra: &[&str]| {
+        let mut args = vec!["FT.SEARCH", "dd", "-apple red", "NOCONTENT"];
+        args.extend_from_slice(extra);
+        c.cmd(&args).id_set()
+    };
+    // Dialect 1: not (apple and red). Dialect 2: red, and not apple.
+    assert_eq!(ids(&mut c, &[]), ["dd:2", "dd:3"]);
+    assert_eq!(ids(&mut c, &["DIALECT", "1"]), ["dd:2", "dd:3"]);
+    assert_eq!(ids(&mut c, &["DIALECT", "2"]), ["dd:2"]);
+    assert!(c.cmd(&["FT.CONFIG", "SET", "DEFAULT_DIALECT", "2"]).ok());
+    assert_eq!(ids(&mut c, &[]), ["dd:2"]);
+    assert_eq!(ids(&mut c, &["DIALECT", "1"]), ["dd:2", "dd:3"]);
+    // The server setting of Redis 8 is the same value.
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "search-default-dialect"]).arr()[1].s(),
+        "2"
+    );
+    assert!(
+        c.cmd(&["CONFIG", "SET", "search-default-dialect", "1"])
+            .ok()
+    );
+    assert_eq!(
+        c.cmd(&["FT.CONFIG", "GET", "DEFAULT_DIALECT"]).arr()[0].arr()[1].s(),
+        "1"
+    );
+    assert_eq!(ids(&mut c, &[]), ["dd:2", "dd:3"]);
+    assert!(
+        c.cmd(&["CONFIG", "SET", "search-default-dialect", "5"])
+            .err()
+            .contains("search-default-dialect")
+    );
+    assert!(
+        c.cmd(&["CONFIG", "SET", "search-default-dialect", "2"])
+            .ok()
+    );
+    assert_eq!(ids(&mut c, &[]), ["dd:2"]);
+}
+
+/// The rows of an FT.AGGREGATE reply, RESP2 or RESP3: each as its name and
+/// value pairs, flat.
+fn aggregate_rows(reply: &V) -> Vec<Vec<String>> {
+    match reply {
+        V::Map(_) => reply
+            .get("results")
+            .arr()
+            .iter()
+            .map(|row| match row.get("extra_attributes") {
+                V::Map(pairs) => pairs
+                    .iter()
+                    .flat_map(|(k, v)| [k.s().to_string(), v.s().to_string()])
+                    .collect(),
+                other => panic!("not a map: {other:?}"),
+            })
+            .collect(),
+        V::Arr(rows) => rows[1..]
+            .iter()
+            .map(|row| row.arr().iter().map(|v| v.s().to_string()).collect())
+            .collect(),
+        other => panic!("not an FT.AGGREGATE reply: {other:?}"),
+    }
+}
+
+/// Numbers an FT.AGGREGATE computes, or reads from a NUMERIC field, are
+/// written as Redis writes a double: an integer when it is one, else with 12
+/// significant digits. Under RESP2 and RESP3 alike (Redis sends strings in
+/// both).
+#[test]
+fn aggregate_numbers_are_written_as_redis_writes_them() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "ag247",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "ag:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+            "SORTABLE",
+            "g",
+            "TAG",
+            "n",
+            "NUMERIC",
+            "m",
+            "NUMERIC",
+            "SORTABLE",
+            "s",
+            "TEXT",
+        ])
+        .ok()
+    );
+    let values = [
+        "1",
+        "2",
+        "3.5",
+        "-7.25",
+        "1.20376952202345",
+        "123456789012345",
+        "0.000001234567",
+        "1e20",
+        "-1e-7",
+        "1234567.891",
+        "0",
+        "-0.5",
+        "100",
+        "0.1",
+        "3.14159265358979",
+        "99999999999.5",
+        "12345678901234567890",
+        "0.30000000000000004",
+    ];
+    for (i, v) in values.iter().enumerate() {
+        let (key, t, g) = (format!("ag:{i}"), format!("w{i:02}"), ["b", "a"][i % 2]);
+        c.cmd(&["HSET", &key, "t", &t, "g", g, "n", v, "m", v, "s", v]);
+    }
+
+    #[rustfmt::skip]
+    let cases: &[(&str, &[&[&str]])] = &[
+        ("LOAD 2 @n @m SORTBY 2 @t ASC LIMIT 0 6", &[&["n", "1", "m", "1", "t", "w00"], &["n", "2", "m", "2", "t", "w01"], &["n", "3.5", "m", "3.5", "t", "w02"], &["n", "-7.25", "m", "-7.25", "t", "w03"], &["n", "1.20376952202", "m", "1.20376952202", "t", "w04"], &["n", "123456789012345", "m", "123456789012345", "t", "w05"]]),
+        ("LOAD 3 @t @n @s SORTBY 2 @t ASC LIMIT 6 4", &[&["t", "w06", "n", "1.234567e-06", "s", "0.000001234567"], &["t", "w07", "n", "1e+20", "s", "1e20"], &["t", "w08", "n", "-1e-07", "s", "-1e-7"], &["t", "w09", "n", "1234567.891", "s", "1234567.891"]]),
+        ("LOAD 2 @t @n APPLY \"@n*1\" AS x APPLY \"@x*3\" AS y SORTBY 2 @t ASC LIMIT 0 18", &[&["t", "w00", "n", "1", "x", "1", "y", "3"], &["t", "w01", "n", "2", "x", "2", "y", "6"], &["t", "w02", "n", "3.5", "x", "3.5", "y", "10.5"], &["t", "w03", "n", "-7.25", "x", "-7.25", "y", "-21.75"], &["t", "w04", "n", "1.20376952202", "x", "1.20376952202", "y", "3.61130856607"], &["t", "w05", "n", "123456789012345", "x", "123456789012345", "y", "370370367037035"], &["t", "w06", "n", "1.234567e-06", "x", "1.234567e-06", "y", "3.703701e-06"], &["t", "w07", "n", "1e+20", "x", "1e+20", "y", "3e+20"], &["t", "w08", "n", "-1e-07", "x", "-1e-07", "y", "-3e-07"], &["t", "w09", "n", "1234567.891", "x", "1234567.891", "y", "3703703.673"], &["t", "w10", "n", "0", "x", "0", "y", "0"], &["t", "w11", "n", "-0.5", "x", "-0.5", "y", "-1.5"], &["t", "w12", "n", "100", "x", "100", "y", "300"], &["t", "w13", "n", "0.1", "x", "0.1", "y", "0.3"], &["t", "w14", "n", "3.14159265359", "x", "3.14159265359", "y", "9.42477796077"], &["t", "w15", "n", "99999999999.5", "x", "99999999999.5", "y", "299999999998"], &["t", "w16", "n", "1.23456789012e+19", "x", "1.23456789012e+19", "y", "3.70370367037e+19"], &["t", "w17", "n", "0.3", "x", "0.3", "y", "0.9"]]),
+        ("LOAD 2 @t @n APPLY \"@n/3\" AS x APPLY \"@x*3\" AS y SORTBY 2 @t ASC LIMIT 0 18", &[&["t", "w00", "n", "1", "x", "0.333333333333", "y", "1"], &["t", "w01", "n", "2", "x", "0.666666666667", "y", "2"], &["t", "w02", "n", "3.5", "x", "1.16666666667", "y", "3.5"], &["t", "w03", "n", "-7.25", "x", "-2.41666666667", "y", "-7.25"], &["t", "w04", "n", "1.20376952202", "x", "0.401256507341", "y", "1.20376952202"], &["t", "w05", "n", "123456789012345", "x", "41152263004115", "y", "123456789012345"], &["t", "w06", "n", "1.234567e-06", "x", "4.11522333333e-07", "y", "1.234567e-06"], &["t", "w07", "n", "1e+20", "x", "3.33333333333e+19", "y", "1e+20"], &["t", "w08", "n", "-1e-07", "x", "-3.33333333333e-08", "y", "-1e-07"], &["t", "w09", "n", "1234567.891", "x", "411522.630333", "y", "1234567.891"], &["t", "w10", "n", "0", "x", "0", "y", "0"], &["t", "w11", "n", "-0.5", "x", "-0.166666666667", "y", "-0.5"], &["t", "w12", "n", "100", "x", "33.3333333333", "y", "100"], &["t", "w13", "n", "0.1", "x", "0.0333333333333", "y", "0.1"], &["t", "w14", "n", "3.14159265359", "x", "1.0471975512", "y", "3.14159265359"], &["t", "w15", "n", "99999999999.5", "x", "33333333333.2", "y", "99999999999.5"], &["t", "w16", "n", "1.23456789012e+19", "x", "4115226300411522560", "y", "1.23456789012e+19"], &["t", "w17", "n", "0.3", "x", "0.1", "y", "0.3"]]),
+        ("LOAD 2 @t @n APPLY \"abs(@n)\" AS a APPLY \"floor(@n)\" AS f APPLY \"ceil(@n)\" AS c SORTBY 2 @t ASC LIMIT 0 18", &[&["t", "w00", "n", "1", "a", "1", "f", "1", "c", "1"], &["t", "w01", "n", "2", "a", "2", "f", "2", "c", "2"], &["t", "w02", "n", "3.5", "a", "3.5", "f", "3", "c", "4"], &["t", "w03", "n", "-7.25", "a", "7.25", "f", "-8", "c", "-7"], &["t", "w04", "n", "1.20376952202", "a", "1.20376952202", "f", "1", "c", "2"], &["t", "w05", "n", "123456789012345", "a", "123456789012345", "f", "123456789012345", "c", "123456789012345"], &["t", "w06", "n", "1.234567e-06", "a", "1.234567e-06", "f", "0", "c", "1"], &["t", "w07", "n", "1e+20", "a", "1e+20", "f", "1e+20", "c", "1e+20"], &["t", "w08", "n", "-1e-07", "a", "1e-07", "f", "-1", "c", "0"], &["t", "w09", "n", "1234567.891", "a", "1234567.891", "f", "1234567", "c", "1234568"], &["t", "w10", "n", "0", "a", "0", "f", "0", "c", "0"], &["t", "w11", "n", "-0.5", "a", "0.5", "f", "-1", "c", "0"], &["t", "w12", "n", "100", "a", "100", "f", "100", "c", "100"], &["t", "w13", "n", "0.1", "a", "0.1", "f", "0", "c", "1"], &["t", "w14", "n", "3.14159265359", "a", "3.14159265359", "f", "3", "c", "4"], &["t", "w15", "n", "99999999999.5", "a", "99999999999.5", "f", "99999999999", "c", "100000000000"], &["t", "w16", "n", "1.23456789012e+19", "a", "1.23456789012e+19", "f", "1.23456789012e+19", "c", "1.23456789012e+19"], &["t", "w17", "n", "0.3", "a", "0.3", "f", "0", "c", "1"]]),
+        ("LOAD 2 @t @n APPLY \"sqrt(@n)\" AS r SORTBY 2 @n DESC LIMIT 0 8", &[&["t", "w07", "n", "1e+20", "r", "10000000000"], &["t", "w16", "n", "1.23456789012e+19", "r", "3513641828.82"], &["t", "w05", "n", "123456789012345", "r", "11111111.0611"], &["t", "w15", "n", "99999999999.5", "r", "316227.766016"], &["t", "w09", "n", "1234567.891", "r", "1111.11110651"], &["t", "w12", "n", "100", "r", "10"], &["t", "w02", "n", "3.5", "r", "1.87082869339"], &["t", "w14", "n", "3.14159265359", "r", "1.77245385091"]]),
+        ("LOAD 2 @t @n APPLY \"exp(@n)\" AS r SORTBY 2 @n DESC LIMIT 0 8", &[&["t", "w07", "n", "1e+20", "r", "inf"], &["t", "w16", "n", "1.23456789012e+19", "r", "inf"], &["t", "w05", "n", "123456789012345", "r", "inf"], &["t", "w15", "n", "99999999999.5", "r", "inf"], &["t", "w09", "n", "1234567.891", "r", "inf"], &["t", "w12", "n", "100", "r", "2.68811714182e+43"], &["t", "w02", "n", "3.5", "r", "33.1154519587"], &["t", "w14", "n", "3.14159265359", "r", "23.1406926328"]]),
+        ("LOAD 2 @t @n APPLY \"log(@n)\" AS r SORTBY 2 @n DESC LIMIT 0 8", &[&["t", "w07", "n", "1e+20", "r", "46.0517018599"], &["t", "w16", "n", "1.23456789012e+19", "r", "43.9598377892"], &["t", "w05", "n", "123456789012345", "r", "32.4469123242"], &["t", "w15", "n", "99999999999.5", "r", "25.3284360229"], &["t", "w09", "n", "1234567.891", "r", "14.026231581"], &["t", "w12", "n", "100", "r", "4.60517018599"], &["t", "w02", "n", "3.5", "r", "1.2527629685"], &["t", "w14", "n", "3.14159265359", "r", "1.14472988585"]]),
+        ("LOAD 2 @t @n APPLY \"log2(@n)\" AS r SORTBY 2 @n DESC LIMIT 0 8", &[&["t", "w07", "n", "1e+20", "r", "66.4385618977"], &["t", "w16", "n", "1.23456789012e+19", "r", "63.4206399768"], &["t", "w05", "n", "123456789012345", "r", "46.8109995023"], &["t", "w15", "n", "99999999999.5", "r", "36.5412090438"], &["t", "w09", "n", "1234567.891", "r", "20.2355747443"], &["t", "w12", "n", "100", "r", "6.64385618977"], &["t", "w02", "n", "3.5", "r", "1.80735492206"], &["t", "w14", "n", "3.14159265359", "r", "1.65149612947"]]),
+        ("LOAD 2 @t @n APPLY \"@n/0\" AS r SORTBY 2 @n DESC LIMIT 0 10", &[&["t", "w07", "n", "1e+20", "r", "inf"], &["t", "w16", "n", "1.23456789012e+19", "r", "inf"], &["t", "w05", "n", "123456789012345", "r", "inf"], &["t", "w15", "n", "99999999999.5", "r", "inf"], &["t", "w09", "n", "1234567.891", "r", "inf"], &["t", "w12", "n", "100", "r", "inf"], &["t", "w02", "n", "3.5", "r", "inf"], &["t", "w14", "n", "3.14159265359", "r", "inf"], &["t", "w01", "n", "2", "r", "inf"], &["t", "w04", "n", "1.20376952202", "r", "inf"]]),
+        ("LOAD 2 @t @n APPLY \"@n*@n\" AS r SORTBY 2 @n DESC LIMIT 0 18", &[&["t", "w07", "n", "1e+20", "r", "1e+40"], &["t", "w16", "n", "1.23456789012e+19", "r", "1.52415787532e+38"], &["t", "w05", "n", "123456789012345", "r", "1.52415787532e+28"], &["t", "w15", "n", "99999999999.5", "r", "9.9999999999e+21"], &["t", "w09", "n", "1234567.891", "r", "1.52415787749e+12"], &["t", "w12", "n", "100", "r", "10000"], &["t", "w02", "n", "3.5", "r", "12.25"], &["t", "w14", "n", "3.14159265359", "r", "9.86960440109"], &["t", "w01", "n", "2", "r", "4"], &["t", "w04", "n", "1.20376952202", "r", "1.44906106215"], &["t", "w00", "n", "1", "r", "1"], &["t", "w17", "n", "0.3", "r", "0.09"], &["t", "w13", "n", "0.1", "r", "0.01"], &["t", "w06", "n", "1.234567e-06", "r", "1.52415567749e-12"], &["t", "w10", "n", "0", "r", "0"], &["t", "w08", "n", "-1e-07", "r", "1e-14"], &["t", "w11", "n", "-0.5", "r", "0.25"], &["t", "w03", "n", "-7.25", "r", "52.5625"]]),
+        ("LOAD 2 @t @s APPLY \"@s*2\" AS r SORTBY 2 @t ASC LIMIT 0 18", &[&["t", "w00", "s", "1", "r", "2"], &["t", "w01", "s", "2", "r", "4"], &["t", "w02", "s", "3.5", "r", "7"], &["t", "w03", "s", "-7.25", "r", "-14.5"], &["t", "w04", "s", "1.20376952202345", "r", "2.40753904405"], &["t", "w05", "s", "123456789012345", "r", "246913578024690"], &["t", "w06", "s", "0.000001234567", "r", "2.469134e-06"], &["t", "w07", "s", "1e20", "r", "2e+20"], &["t", "w08", "s", "-1e-7", "r", "-2e-07"], &["t", "w09", "s", "1234567.891", "r", "2469135.782"], &["t", "w10", "s", "0", "r", "0"], &["t", "w11", "s", "-0.5", "r", "-1"], &["t", "w12", "s", "100", "r", "200"], &["t", "w13", "s", "0.1", "r", "0.2"], &["t", "w14", "s", "3.14159265358979", "r", "6.28318530718"], &["t", "w15", "s", "99999999999.5", "r", "199999999999"], &["t", "w16", "s", "12345678901234567890", "r", "2.46913578025e+19"], &["t", "w17", "s", "0.30000000000000004", "r", "0.6"]]),
+        ("LOAD 2 @t @s APPLY \"to_number(@s)\" AS r SORTBY 2 @t ASC LIMIT 0 18", &[&["t", "w00", "s", "1", "r", "1"], &["t", "w01", "s", "2", "r", "2"], &["t", "w02", "s", "3.5", "r", "3.5"], &["t", "w03", "s", "-7.25", "r", "-7.25"], &["t", "w04", "s", "1.20376952202345", "r", "1.20376952202"], &["t", "w05", "s", "123456789012345", "r", "123456789012345"], &["t", "w06", "s", "0.000001234567", "r", "1.234567e-06"], &["t", "w07", "s", "1e20", "r", "1e+20"], &["t", "w08", "s", "-1e-7", "r", "-1e-07"], &["t", "w09", "s", "1234567.891", "r", "1234567.891"], &["t", "w10", "s", "0", "r", "0"], &["t", "w11", "s", "-0.5", "r", "-0.5"], &["t", "w12", "s", "100", "r", "100"], &["t", "w13", "s", "0.1", "r", "0.1"], &["t", "w14", "s", "3.14159265358979", "r", "3.14159265359"], &["t", "w15", "s", "99999999999.5", "r", "99999999999.5"], &["t", "w16", "s", "12345678901234567890", "r", "1.23456789012e+19"], &["t", "w17", "s", "0.30000000000000004", "r", "0.3"]]),
+        ("LOAD 2 @t @s APPLY \"to_str(@s)\" AS r SORTBY 2 @t ASC LIMIT 0 18", &[&["t", "w00", "s", "1", "r", "1"], &["t", "w01", "s", "2", "r", "2"], &["t", "w02", "s", "3.5", "r", "3.5"], &["t", "w03", "s", "-7.25", "r", "-7.25"], &["t", "w04", "s", "1.20376952202345", "r", "1.20376952202345"], &["t", "w05", "s", "123456789012345", "r", "123456789012345"], &["t", "w06", "s", "0.000001234567", "r", "0.000001234567"], &["t", "w07", "s", "1e20", "r", "1e20"], &["t", "w08", "s", "-1e-7", "r", "-1e-7"], &["t", "w09", "s", "1234567.891", "r", "1234567.891"], &["t", "w10", "s", "0", "r", "0"], &["t", "w11", "s", "-0.5", "r", "-0.5"], &["t", "w12", "s", "100", "r", "100"], &["t", "w13", "s", "0.1", "r", "0.1"], &["t", "w14", "s", "3.14159265358979", "r", "3.14159265358979"], &["t", "w15", "s", "99999999999.5", "r", "99999999999.5"], &["t", "w16", "s", "12345678901234567890", "r", "12345678901234567890"], &["t", "w17", "s", "0.30000000000000004", "r", "0.30000000000000004"]]),
+        ("GROUPBY 0 REDUCE SUM 1 @n AS sum", &[&["sum", "1.12345802458e+20"]]),
+        ("GROUPBY 0 REDUCE AVG 1 @n AS avg", &[&["avg", "6241433469890267136"]]),
+        ("GROUPBY 0 REDUCE MIN 1 @n AS min REDUCE MAX 1 @n AS max", &[&["min", "-7.25", "max", "1e+20"]]),
+        ("GROUPBY 0 REDUCE STDDEV 1 @n AS dev", &[&["dev", "2.35786754803e+19"]]),
+        ("GROUPBY 0 REDUCE QUANTILE 2 @n 0.5 AS q50 REDUCE QUANTILE 2 @n 0.9 AS q90", &[&["q50", "1.20376952202", "q90", "1.23456789012e+19"]]),
+        ("GROUPBY 1 @g REDUCE SUM 1 @n AS sum REDUCE AVG 1 @n AS avg REDUCE COUNT 0 AS count SORTBY 2 @g ASC", &[&["g", "a", "sum", "1.00000123557e+20", "avg", "1.11111248396e+19", "count", "9"], &["g", "b", "sum", "1.23456789012e+19", "avg", "1371742100137174016", "count", "9"]]),
+        ("GROUPBY 1 @g REDUCE MIN 1 @s AS lo REDUCE MAX 1 @s AS hi REDUCE STDDEV 1 @s AS dev SORTBY 2 @g ASC", &[&["g", "a", "lo", "-7.25", "hi", "1e+20", "dev", "3.33333281852e+19"], &["g", "b", "lo", "-1e-07", "hi", "1.23456789012e+19", "dev", "4115226300411522048"]]),
+        ("GROUPBY 1 @g REDUCE QUANTILE 2 @n 0.25 AS q1 REDUCE QUANTILE 2 @n 0.75 AS q3 SORTBY 2 @g ASC", &[&["g", "a", "q1", "0.1", "q3", "99999999999.5"], &["g", "b", "q1", "1.234567e-06", "q3", "3.5"]]),
+        ("GROUPBY 1 @g REDUCE FIRST_VALUE 1 @n AS first REDUCE FIRST_VALUE 1 @s AS text SORTBY 2 @g ASC", &[&["g", "a", "first", "2", "text", "2"], &["g", "b", "first", "1", "text", "1"]]),
+        ("GROUPBY 1 @g REDUCE SUM 1 @n AS total APPLY \"@total/7\" AS share SORTBY 2 @g ASC", &[&["g", "a", "total", "1.00000123557e+20", "share", "1.42857319367e+19"], &["g", "b", "total", "1.23456789012e+19", "share", "1763668414462081024"]]),
+        ("LOAD 1 @n GROUPBY 1 @n REDUCE COUNT 0 AS count SORTBY 2 @n ASC LIMIT 0 20", &[&["n", "-7.25", "count", "1"], &["n", "-0.5", "count", "1"], &["n", "-1e-07", "count", "1"], &["n", "0", "count", "1"], &["n", "1.234567e-06", "count", "1"], &["n", "0.1", "count", "1"], &["n", "0.3", "count", "1"], &["n", "1", "count", "1"], &["n", "1.20376952202", "count", "1"], &["n", "2", "count", "1"], &["n", "3.14159265359", "count", "1"], &["n", "3.5", "count", "1"], &["n", "100", "count", "1"], &["n", "1234567.891", "count", "1"], &["n", "99999999999.5", "count", "1"], &["n", "123456789012345", "count", "1"], &["n", "1.23456789012e+19", "count", "1"], &["n", "1e+20", "count", "1"]]),
+        ("ADDSCORES LOAD 1 @t SORTBY 2 @t ASC LIMIT 0 2", &[&["__score", "1.10588235506", "t", "w00"], &["__score", "1.10588235506", "t", "w01"]]),
+    ];
+    let mut c3 = conn();
+    assert!(matches!(c3.cmd(&["HELLO", "3"]), V::Map(_)));
+    for (tail, want) in cases {
+        let mut args = vec!["FT.AGGREGATE", "ag247", "*"];
+        let words = split_words(tail);
+        args.extend(words.iter().map(String::as_str));
+        for (version, c) in [(2, &mut c), (3, &mut c3)] {
+            let rows = aggregate_rows(&c.cmd(&args));
+            let want: Vec<Vec<String>> = want
+                .iter()
+                .map(|row| row.iter().map(|s| s.to_string()).collect())
+                .collect();
+            assert_eq!(rows, want, "RESP{version}: {tail}");
+        }
+    }
+
+    // A number that is not a number (text in a TEXT field) is left as it is,
+    // and a reducer with no number to work on says so as Redis does.
+    let rows = aggregate_rows(&c.cmd(&[
+        "FT.AGGREGATE",
+        "ag247",
+        "@t:w01",
+        "GROUPBY",
+        "0",
+        "REDUCE",
+        "SUM",
+        "1",
+        "@t",
+        "AS",
+        "sum",
+        "REDUCE",
+        "AVG",
+        "1",
+        "@t",
+        "AS",
+        "avg",
+        "REDUCE",
+        "MIN",
+        "1",
+        "@t",
+        "AS",
+        "min",
+        "REDUCE",
+        "MAX",
+        "1",
+        "@t",
+        "AS",
+        "max",
+    ]));
+    assert_eq!(
+        rows,
+        [["sum", "nan", "avg", "nan", "min", "inf", "max", "-inf"]]
+    );
+}
+
+/// The words of an argument list written as one line, `"` quoting a word
+/// (and `\"` a quote in it), for the cases above.
+fn split_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let (mut quoted, mut chars) = (false, line.chars().peekable());
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if quoted && chars.peek() == Some(&'"') => {
+                word.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ' ' if !quoted => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            other => word.push(other),
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// A stored value that looks like a number a row holds (a marker byte and 16
+/// hex digits), or starts with one of the markers, is text, and comes back
+/// as it was stored.
+#[test]
+fn a_stored_value_that_looks_like_a_held_number_is_text() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "hn247",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "hn:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+            "s",
+            "TEXT",
+        ])
+        .ok()
+    );
+    let values = [
+        "\u{2}4008000000000000",
+        "\u{2}",
+        "\u{1}[\"x\"]",
+        "\u{3}\u{2}4008000000000000",
+        "plain",
+    ];
+    for (i, v) in values.iter().enumerate() {
+        c.cmd(&["HSET", &format!("hn:{i}"), "t", &format!("w{i}"), "s", v]);
+    }
+    let want: Vec<Vec<String>> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| vec!["t".into(), format!("w{i}"), "s".into(), (*v).into()])
+        .collect();
+    let rows = aggregate_rows(&c.cmd(&[
+        "FT.AGGREGATE",
+        "hn247",
+        "*",
+        "LOAD",
+        "2",
+        "@t",
+        "@s",
+        "SORTBY",
+        "2",
+        "@t",
+        "ASC",
+    ]));
+    assert_eq!(rows, want);
+    // Grouped (read as the documents are), and with a step that makes rows.
+    for extra in [&[][..], &["APPLY", "1", "AS", "one"][..]] {
+        let mut args = vec!["FT.AGGREGATE", "hn247", "*"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&[
+            "GROUPBY", "1", "@s", "REDUCE", "COUNT", "0", "AS", "c", "SORTBY", "2", "@s", "ASC",
+        ]);
+        let rows = aggregate_rows(&c.cmd(&args));
+        let mut got: Vec<String> = rows.iter().map(|r| r[1].clone()).collect();
+        got.sort();
+        let mut sorted: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+        sorted.sort();
+        assert_eq!(got, sorted, "{extra:?}");
+    }
+}
+
+/// `PHONETIC`: a field made with it indexes a term `<CODE` (Double Metaphone)
+/// with each word of three bytes or more, and a query word on it is looked
+/// for as the word, as `<CODE` and as its stem. Scores and `FT.EXPLAIN` as
+/// Redis 8.10.2 gives them.
+#[test]
+fn phonetic_fields_match_and_score_as_redis_does() {
+    let mut c = conn();
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "ph247",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "ph:",
+            "SCHEMA",
+            "p",
+            "TEXT",
+            "PHONETIC",
+            "dm:en",
+            "q",
+            "TEXT",
+            "t",
+            "TEXT",
+            "WEIGHT",
+            "2",
+        ])
+        .ok()
+    );
+    let names = [
+        "john",
+        "jon",
+        "jonathan",
+        "smith",
+        "smyth",
+        "schmidt",
+        "catherine",
+        "katherine",
+        "stephen",
+        "steven",
+        "philip",
+        "filip",
+        "knight",
+        "night",
+        "thomas",
+        "tomas",
+        "wright",
+        "right",
+        "mary",
+        "marie",
+        "meyer",
+        "myers",
+        "cohen",
+        "cohn",
+        "zhang",
+        "ab",
+        "app",
+        "abc",
+    ];
+    for (i, n) in names.iter().enumerate() {
+        let said = format!("the {n} says hello to {}", names[(i * 7 + 3) % names.len()]);
+        c.cmd(&["HSET", &format!("ph:{i:02}"), "p", n, "q", n, "t", &said]);
+    }
+    for (id, p, q, t) in [
+        ("90", "john smith john", "smyth", "x y"),
+        ("91", "jon and mary", "jon", "plain words here"),
+        ("93", "Smith Smyth Schmidt", "none", "none"),
+    ] {
+        c.cmd(&["HSET", &format!("ph:{id}"), "p", p, "q", q, "t", t]);
+    }
+    // The attribute is not in FT.INFO, as in Redis.
+    let info = c.cmd(&["FT.INFO", "ph247"]);
+    assert!(!format!("{info:?}").contains("PHONETIC"), "{info:?}");
+
+    #[rustfmt::skip]
+    let scores: &[ScoreCase] = &[
+        ("@p:john", &[], &[("ph:90", 6.536467200173622), ("ph:00", 6.240555774592154), ("ph:91", 2.0273512572188883), ("ph:01", 1.9432925544569841)]),
+        ("@q:john", &[], &[("ph:00", 4.29726322013517)]),
+        ("john", &[], &[("ph:90", 6.536467200173622), ("ph:00", 6.240555774592154), ("ph:91", 2.0273512572188883), ("ph:01", 1.9432925544569841)]),
+        ("@p:jon", &[], &[("ph:01", 6.240555774592154), ("ph:91", 5.612710251757983), ("ph:90", 2.84239011133434), ("ph:00", 1.9432925544569841)]),
+        ("@q:jon", &[], &[("ph:01", 4.29726322013517), ("ph:91", 3.585358994539095)]),
+        ("jon", &[], &[("ph:01", 6.240555774592154), ("ph:91", 5.612710251757983), ("ph:90", 2.84239011133434), ("ph:00", 1.9432925544569841)]),
+        ("@p:smith", &[], &[("ph:93", 4.3493123721351035), ("ph:03", 3.8216232089343283), ("ph:90", 3.3227586606176214), ("ph:04", 1.9432925544569841)]),
+        ("@q:smith", &[], &[("ph:03", 1.878330654477344)]),
+        ("smith", &[], &[("ph:93", 4.3493123721351035), ("ph:03", 3.8216232089343283), ("ph:04", 3.4656469171855915), ("ph:90", 3.3227586606176214), ("ph:00", 1.5223543627286074), ("ph:08", 1.5223543627286074), ("ph:12", 1.5223543627286074), ("ph:16", 1.5223543627286074), ("ph:20", 1.5223543627286074), ("ph:24", 1.5223543627286074)]),
+        ("@p:smyth", &[], &[("ph:04", 5.673408936716044), ("ph:93", 5.6540245654499675), ("ph:90", 2.1190107956729483), ("ph:03", 1.9432925544569841)]),
+        ("@q:smyth", &[], &[("ph:04", 3.7301163822590597), ("ph:90", 2.390484135706603)]),
+        ("smyth", &[], &[("ph:04", 5.673408936716044), ("ph:93", 5.6540245654499675), ("ph:90", 4.509494931379551), ("ph:03", 1.9432925544569841)]),
+        ("@p:schmidt", &[], &[("ph:05", 6.822839309675367), ("ph:93", 6.055443280589705)]),
+        ("@q:schmidt", &[], &[("ph:05", 4.29726322013517)]),
+        ("schmidt", &[], &[("ph:05", 6.822839309675367), ("ph:93", 6.055443280589705)]),
+        ("@p:katherine", &[], &[("ph:07", 12.469178010732534), ("ph:06", 2.5255760895401975)]),
+        ("@q:katherine", &[], &[("ph:07", 9.943601921192336)]),
+        ("katherine", &[], &[("ph:07", 12.469178010732534), ("ph:06", 2.5255760895401975)]),
+        ("@p:stefan", &[], &[("ph:08", 2.5255760895401975), ("ph:09", 2.5255760895401975)]),
+        ("@q:stefan", &[], &[]),
+        ("stefan", &[], &[("ph:08", 2.5255760895401975), ("ph:09", 2.5255760895401975)]),
+        ("@p:philip", &[], &[("ph:10", 4.760082592257698), ("ph:11", 2.5255760895401975)]),
+        ("@q:philip", &[], &[("ph:10", 2.2345065027175006)]),
+        ("philip", &[], &[("ph:10", 4.760082592257698), ("ph:11", 2.5255760895401975), ("ph:01", 1.8110286997919303), ("ph:05", 1.8110286997919303), ("ph:09", 1.8110286997919303), ("ph:13", 1.8110286997919303), ("ph:17", 1.8110286997919303), ("ph:21", 1.8110286997919303), ("ph:25", 1.8110286997919303)]),
+        ("@p:night", &[], &[("ph:13", 7.68387063913724), ("ph:12", 2.5255760895401975)]),
+        ("@q:night", &[], &[("ph:13", 5.158294549597042)]),
+        ("night", &[], &[("ph:13", 7.68387063913724), ("ph:12", 2.5255760895401975)]),
+        ("@p:thomas", &[], &[("ph:14", 12.469178010732534), ("ph:15", 2.5255760895401975)]),
+        ("@q:thomas", &[], &[("ph:14", 9.943601921192336)]),
+        ("thomas", &[], &[("ph:14", 12.469178010732534), ("ph:15", 2.5255760895401975)]),
+        ("@p:mary", &[], &[("ph:18", 9.700954022367096), ("ph:91", 6.949254994996408), ("ph:19", 5.403690802231926), ("ph:20", 1.9432925544569841)]),
+        ("@q:mary", &[], &[("ph:18", 7.757661467910112), ("ph:19", 3.4603982477749424)]),
+        ("mary", &[], &[("ph:18", 9.700954022367096), ("ph:91", 6.949254994996408), ("ph:19", 5.403690802231926), ("ph:20", 1.9432925544569841)]),
+        ("@p:meyer", &[], &[("ph:20", 7.101587104054026), ("ph:91", 2.0273512572188883), ("ph:18", 1.9432925544569841), ("ph:19", 1.9432925544569841)]),
+        ("@q:meyer", &[], &[("ph:20", 5.158294549597042)]),
+        ("meyer", &[], &[("ph:20", 7.101587104054026), ("ph:91", 2.0273512572188883), ("ph:18", 1.9432925544569841), ("ph:19", 1.9432925544569841)]),
+        ("@p:cohen", &[], &[("ph:22", 8.189913677842585)]),
+        ("@q:cohen", &[], &[("ph:22", 5.158294549597042)]),
+        ("cohen", &[], &[("ph:22", 8.189913677842585)]),
+        ("@p:zhang", &[], &[("ph:24", 5.266125630963042)]),
+        ("@q:zhang", &[], &[("ph:24", 2.2345065027175006)]),
+        ("zhang", &[], &[("ph:24", 5.266125630963042), ("ph:03", 1.8110286997919303), ("ph:07", 1.8110286997919303), ("ph:11", 1.8110286997919303), ("ph:15", 1.8110286997919303), ("ph:19", 1.8110286997919303), ("ph:23", 1.8110286997919303), ("ph:27", 1.8110286997919303)]),
+        ("@p:ab", &[], &[("ph:25", 5.158294549597042), ("ph:26", 3.031619128245542)]),
+        ("@q:ab", &[], &[("ph:25", 5.158294549597042)]),
+        ("ab", &[], &[("ph:25", 5.158294549597042), ("ph:26", 3.031619128245542)]),
+        ("@p:app", &[], &[("ph:26", 8.189913677842585)]),
+        ("@q:app", &[], &[("ph:26", 5.158294549597042)]),
+        ("app", &[], &[("ph:26", 8.189913677842585)]),
+        ("@p:abc", &[], &[("ph:27", 8.189913677842585)]),
+        ("@q:abc", &[], &[("ph:27", 5.158294549597042)]),
+        ("abc", &[], &[("ph:27", 8.189913677842585)]),
+        ("@p:jonathan", &[], &[("ph:02", 8.189913677842585)]),
+        ("@q:jonathan", &[], &[("ph:02", 5.158294549597042)]),
+        ("jonathan", &[], &[("ph:02", 8.189913677842585)]),
+        ("@p:(john smith)", &[], &[("ph:90", 9.859225860791243)]),
+        ("@p:(john smith)", &["SCORER", "TFIDF"], &[("ph:90", 9.5)]),
+        ("@p:(john smith)", &["SCORER", "BM25"], &[("ph:90", 2.3237991235847537)]),
+        ("@p:(john smith)", &["SCORER", "DISMAX"], &[("ph:90", 3.0)]),
+        ("@p:(john smith)", &["SCORER", "TFIDF.DOCNORM"], &[("ph:90", 2.375)]),
+        ("@p:(john smith)", &["SCORER", "BM25STD.TANH"], &[("ph:90", 0.9856451733969455)]),
+        ("@p:(jon | smyth)", &[], &[("ph:01", 6.240555774592154), ("ph:04", 5.673408936716044), ("ph:93", 5.6540245654499675), ("ph:91", 5.612710251757983), ("ph:90", 4.961400907007288), ("ph:00", 1.9432925544569841), ("ph:03", 1.9432925544569841)]),
+        ("@p:(jon | smyth)", &["SCORER", "TFIDF"], &[("ph:91", 5.5), ("ph:01", 4.75), ("ph:90", 4.5), ("ph:04", 3.75), ("ph:93", 3.0), ("ph:00", 0.75), ("ph:03", 0.75)]),
+        ("@p:(jon | smyth)", &["SCORER", "BM25"], &[("ph:01", 1.930877990087295), ("ph:04", 1.5486338564371072), ("ph:91", 1.3470233780239806), ("ph:90", 1.1107428973896212), ("ph:93", 1.1107428973896212), ("ph:00", 0.40190145548654344), ("ph:03", 0.40190145548654344)]),
+        ("@p:(jon | smyth)", &["SCORER", "DISMAX"], &[("ph:01", 4.0), ("ph:04", 4.0), ("ph:90", 2.0), ("ph:91", 2.0), ("ph:93", 2.0), ("ph:00", 1.0), ("ph:03", 1.0)]),
+        ("@p:(jon | smyth)", &["SCORER", "TFIDF.DOCNORM"], &[("ph:01", 1.9), ("ph:04", 1.5), ("ph:93", 1.5), ("ph:91", 1.2222222222222223), ("ph:90", 1.125), ("ph:00", 0.3), ("ph:03", 0.3)]),
+        ("@p:(jon | smyth)", &["SCORER", "BM25STD.TANH"], &[("ph:01", 0.915442963072744), ("ph:04", 0.8892546735121925), ("ph:93", 0.8882363639451106), ("ph:91", 0.8860365571129476), ("ph:90", 0.8455554525180802), ("ph:00", 0.4508950282438057), ("ph:03", 0.4508950282438057)]),
+        ("@p:john @q:jon", &[], &[("ph:01", 6.240555774592154), ("ph:91", 5.612710251757983)]),
+        ("@p:john @q:jon", &["SCORER", "TFIDF"], &[("ph:91", 5.5), ("ph:01", 4.75)]),
+        ("@p:john @q:jon", &["SCORER", "BM25"], &[("ph:01", 1.930877990087295), ("ph:91", 1.3470233780239806)]),
+        ("@p:john @q:jon", &["SCORER", "DISMAX"], &[("ph:01", 5.0), ("ph:91", 3.0)]),
+        ("@p:john @q:jon", &["SCORER", "TFIDF.DOCNORM"], &[("ph:01", 1.9), ("ph:91", 1.2222222222222223)]),
+        ("@p:john @q:jon", &["SCORER", "BM25STD.TANH"], &[("ph:01", 0.915442963072744), ("ph:91", 0.8860365571129476)]),
+        ("@p:(smith) @q:smyth", &[], &[("ph:90", 5.7132427963242245), ("ph:04", 5.673408936716044)]),
+        ("@p:(smith) @q:smyth", &["SCORER", "TFIDF"], &[("ph:04", 3.75), ("ph:90", 2.0)]),
+        ("@p:(smith) @q:smyth", &["SCORER", "BM25"], &[("ph:04", 1.5486338564371072), ("ph:90", 0.5358686073153913)]),
+        ("@p:(smith) @q:smyth", &["SCORER", "DISMAX"], &[("ph:04", 5.0), ("ph:90", 2.0)]),
+        ("@p:(smith) @q:smyth", &["SCORER", "TFIDF.DOCNORM"], &[("ph:04", 1.5), ("ph:90", 0.5)]),
+        ("@p:(smith) @q:smyth", &["SCORER", "BM25STD.TANH"], &[("ph:90", 0.8913198875386024), ("ph:04", 0.8892546735121925)]),
+        ("@p:\"john smith\"", &[], &[("ph:90", 4.897824953783956)]),
+        ("@p:\"john smith\"", &["SCORER", "TFIDF"], &[("ph:90", 5.0)]),
+        ("@p:\"john smith\"", &["SCORER", "BM25"], &[("ph:90", 1.2130562261951328)]),
+        ("@p:\"john smith\"", &["SCORER", "DISMAX"], &[("ph:90", 3.0)]),
+        ("@p:\"john smith\"", &["SCORER", "TFIDF.DOCNORM"], &[("ph:90", 1.25)]),
+        ("@p:\"john smith\"", &["SCORER", "BM25STD.TANH"], &[("ph:90", 0.8409637719431037)]),
+        ("@p:john*", &[], &[("ph:00", 4.29726322013517), ("ph:90", 3.694077088839282)]),
+        ("@p:john*", &["SCORER", "TFIDF"], &[("ph:00", 4.0), ("ph:90", 4.0)]),
+        ("@p:john*", &["SCORER", "BM25"], &[("ph:00", 1.5289765346007516), ("ph:90", 0.9451219225374371)]),
+        ("@p:john*", &["SCORER", "DISMAX"], &[("ph:00", 4.0), ("ph:90", 2.0)]),
+        ("@p:john*", &["SCORER", "TFIDF.DOCNORM"], &[("ph:00", 1.6), ("ph:90", 1.0)]),
+        ("@p:john*", &["SCORER", "BM25STD.TANH"], &[("ph:00", 0.7910816735302957), ("ph:90", 0.7275580381760854)]),
+        ("@p:john=>{$phonetic:false}", &[], &[("ph:00", 4.29726322013517), ("ph:90", 3.694077088839282)]),
+        ("@p:john=>{$phonetic:false}", &["SCORER", "TFIDF"], &[("ph:00", 4.0), ("ph:90", 4.0)]),
+        ("@p:john=>{$phonetic:false}", &["SCORER", "BM25"], &[("ph:00", 1.5289765346007516), ("ph:90", 0.9451219225374371)]),
+        ("@p:john=>{$phonetic:false}", &["SCORER", "DISMAX"], &[("ph:00", 4.0), ("ph:90", 2.0)]),
+        ("@p:john=>{$phonetic:false}", &["SCORER", "TFIDF.DOCNORM"], &[("ph:00", 1.6), ("ph:90", 1.0)]),
+        ("@p:john=>{$phonetic:false}", &["SCORER", "BM25STD.TANH"], &[("ph:00", 0.7910816735302957), ("ph:90", 0.7275580381760854)]),
+        ("@p:john", &[], &[("ph:90", 6.536467200173622), ("ph:00", 6.240555774592154), ("ph:91", 2.0273512572188883), ("ph:01", 1.9432925544569841)]),
+        ("@p:john", &["SCORER", "TFIDF"], &[("ph:90", 7.0), ("ph:00", 4.75), ("ph:91", 1.5), ("ph:01", 0.75)]),
+        ("@p:john", &["SCORER", "BM25"], &[("ph:00", 1.930877990087295), ("ph:90", 1.6539633644405147), ("ph:01", 0.40190145548654344), ("ph:91", 0.40190145548654344)]),
+        ("@p:john", &["SCORER", "DISMAX"], &[("ph:00", 4.0), ("ph:90", 2.0), ("ph:01", 1.0), ("ph:91", 1.0)]),
+        ("@p:john", &["SCORER", "TFIDF.DOCNORM"], &[("ph:00", 1.9), ("ph:90", 1.75), ("ph:91", 0.3333333333333333), ("ph:01", 0.3)]),
+        ("@p:john", &["SCORER", "BM25STD.TANH"], &[("ph:90", 0.9266456247720228), ("ph:00", 0.915442963072744), ("ph:91", 0.4674777185891131), ("ph:01", 0.4508950282438057)]),
+        ("@p:john", &["VERBATIM"], &[("ph:00", 4.29726322013517), ("ph:90", 3.694077088839282)]),
+    ];
+    for (query, extra, want) in scores {
+        assert_scores_in(&mut c, "ph247", query, 2, extra, want);
+    }
+    #[rustfmt::skip]
+    let plans: &[(&str, &str)] = &[
+        ("@p:john", "@p:UNION {\n  @p:john\n  @p:<JN(expanded)\n  @p:+john(expanded)\n}\n"),
+        ("@q:john", "@q:UNION {\n  @q:john\n  @q:+john(expanded)\n}\n"),
+        ("john | mary", "UNION {\n  UNION {\n    john\n    <JN(expanded)\n    +john(expanded)\n  }\n  UNION {\n    mary\n    <MR(expanded)\n    +mari(expanded)\n    mari(expanded)\n  }\n}\n"),
+        ("@p:john=>{$phonetic:false}", "@p:UNION {\n  @p:john\n  @p:+john(expanded)\n}\n"),
+        ("ab", "UNION {\n  ab\n  <AP(expanded)\n  +ab(expanded)\n}\n"),
+        ("x", "UNION {\n  x\n  <S(expanded)\n  +x(expanded)\n}\n"),
+    ];
+    for (query, want) in plans {
+        assert_eq!(c.cmd(&["FT.EXPLAIN", "ph247", query]).s(), *want, "{query}");
+    }
+
+    // A document written again, or deleted, is in the index as it is now.
+    c.cmd(&["HSET", "ph:00", "p", "zzz yyy"]);
+    c.cmd(&["DEL", "ph:90"]);
+    let ids = |c: &mut Conn, q: &str| {
+        c.cmd(&["FT.SEARCH", "ph247", q, "NOCONTENT", "DIALECT", "2"])
+            .id_set()
+    };
+    assert_eq!(ids(&mut c, "@p:john"), ["ph:01", "ph:91"]);
+    assert_eq!(ids(&mut c, "@p:zzz"), ["ph:00"]);
+    // The shortest word given a code is `MIN_PHONETIC_TERM_LEN` bytes (3).
+    c.cmd(&["HSET", "ph:94", "p", "ab", "q", "zz"]);
+    assert_eq!(ids(&mut c, "@p:app"), ["ph:26"]);
 }

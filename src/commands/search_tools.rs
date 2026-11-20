@@ -366,6 +366,16 @@ pub(crate) fn config_number(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// The dialect a query is read in: the one it names (`given`, 0 if it names
+/// none), or the engine's `FT.CONFIG DEFAULT_DIALECT` (1 unless set).
+pub(crate) fn dialect_or_default(given: u8) -> u8 {
+    if given != 0 {
+        given
+    } else {
+        config_number("DEFAULT_DIALECT", 1).clamp(1, 4) as u8
+    }
+}
+
 /// `ON_TIMEOUT fail` errors when a query runs out of time; `return` and
 /// `return-strict` reply with what was found.
 pub(crate) fn on_timeout_fails() -> bool {
@@ -631,7 +641,7 @@ fn term_text(term: &TextMatch) -> String {
             crate::vector::stem::STEM_PREFIX,
             stem.stem
         ),
-        TextMatch::Expanded(word) => format!("{word}(expanded)"),
+        TextMatch::Expanded(word) | TextMatch::Phonetic(word) => format!("{word}(expanded)"),
         TextMatch::Prefix(start) => format!("PREFIX{{{start}*}}"),
         TextMatch::Suffix(end) => format!("SUFFIX{{*{end}}}"),
         TextMatch::Infix(part) => format!("INFIX{{*{part}*}}"),
@@ -675,7 +685,18 @@ fn explain_filter(filter: &Filter, text_fields: usize, depth: usize, out: &mut V
                 _ => String::new(),
             };
             let open = format!("{fields}{} {{", if and { "INTERSECT" } else { "UNION" });
-            block(&open, &children, out);
+            out.push(format!("{pad}{open}"));
+            for child in &children {
+                match child {
+                    // A phonetic code is in the scope of the word it is of.
+                    Filter::Text {
+                        term: term @ TextMatch::Phonetic(_),
+                        ..
+                    } => out.push(format!("{pad}  {fields}{}", term_text(term))),
+                    other => explain_filter(other, text_fields, depth + 1, out),
+                }
+            }
+            out.push(format!("{pad}}}"));
         }
         Filter::Not(inner) => block("NOT{", &[inner], out),
         Filter::Optional(inner) => block("OPTIONAL{", &[inner], out),
@@ -774,6 +795,15 @@ fn query_options(cmd: &[&[u8]]) -> Result<filter::QueryOptions, String> {
     let mut options = filter::QueryOptions {
         verbatim: cmd.iter().skip(3).any(|a| is(a, "VERBATIM")),
         language: None,
+        dialect: dialect_or_default(
+            cmd.iter()
+                .skip(3)
+                .position(|a| is(a, "DIALECT"))
+                .and_then(|at| cmd.get(at + 4))
+                .and_then(|n| text(n).parse::<u8>().ok())
+                .filter(|n| (1..=4).contains(n))
+                .unwrap_or(0),
+        ),
     };
     if let Some(at) = cmd.iter().skip(3).position(|a| is(a, "LANGUAGE")) {
         let name = cmd.get(at + 4).map(|a| text(a)).unwrap_or_default();

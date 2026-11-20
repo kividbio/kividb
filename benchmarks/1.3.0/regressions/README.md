@@ -52,6 +52,7 @@ and why.
 | `33-ft-aggregate-groupby` | #761 | #761's 2,000,000 hashes (`name TEXT email TAG communityNumber NUMERIC age NUMERIC`, pipelines of 2,000): `FT.AGGREGATE userIdx * GROUPBY 1 @communityNumber REDUCE COUNT 0 AS n LIMIT 0 10`, the same with `REDUCE AVG 1 @age` and `SORTBY 2 @n DESC`, and the first over `@age:[20 40]`: median ms of 5 after a warm-up, and the reply's group total (exactly 1000); `used_memory` and RSS once loaded, the peak RSS (`VmHWM`) after the queries, and FT.INFO's memory parts as info rows. v1.2.2 and the candidate only: the VM image's Redis has no Query Engine |
 | `34-kong-ratelimit` | #849 | Kong's rate-limiting plugin with `policy: redis`: its per-request script (`incr`, and `expire` when the count is 1; Kong 3.9.4's `usage()`, verbatim) sent as Kong sends it (`EVAL` with the script text) and by `EVALSHA`, on one key, `ratelimit:<route>:<service>:<identifier>:<period_date>:minute`, from memtier_benchmark at 200 and 500 connections over 100,000 identifiers; with the key as Kong builds it (`plain`) and with the identifier under a hash tag (`tag`), in two configurations: `default` (`lua-parallel-scripts yes`) and `serial` (`lua-parallel-scripts no` on KiviDB). ops/s against Redis, p99 shown, keys left without a TTL (must be 0); every call's key checked under MONITOR first, for each way of calling. Gates: at least 1.2x Redis at 200 connections and 1.3x at 500 in every configuration and key form. Needs 8 vCPUs and the `lua,tls` builds (`--candidate-full`) |
 | `35-tokio-pipelined-reads` | #432 / #891 | the Tokio loop (`--io-model tokio --threads 1`, the server on the first CPU, `redis-benchmark --threads 3` on the next three, 50 connections): `SET` of 1,024-byte values at pipeline 16 and of 4,096-byte values at pipeline 32, a second from the server's own `total_commands_processed` (median of 3); and one connection with a 64 KiB receive buffer that sends 400,000 `SET`s of 20-byte values (19 MB) in one write before reading a reply: 1 if it is written within 20 s and every reply arrives. Gates: the rates 10 % and 60 % of the gain over v1.2.2 in the same session; the pipeline `>= 1` (v1.2.2 stalls). Recorded on a D4s_v5 (`results/pr-891-d4s_v5`) |
+| `36-litellm-ratelimit` | #871 | LiteLLM's proxy rate limiter: its five Lua scripts byte for byte (`litellm/rust/crates/redis-store/src/rate_limits/lua.rs`, main @ 4b12a405; SHA-1s checked against `SCRIPT LOAD`), called as one request calls them, by `EVALSHA`, from memtier_benchmark (`--transaction`: one key and its team a call) at 200 and 500 connections over 50,000 keys: `BATCH_RATE_LIMITER` for one descriptor (one hash tag) and for key + team (two), `CHECK_AND_INCREMENT_BY_N` and `PARALLEL_ACQUIRE` for key + team, and the 13-command per-request mix. A 22-call transcript checked exactly first (window reset, all-or-nothing over the limit, the reconcile, acquire and release, TTLs), and every script call's keys under MONITOR; the candidate must run at least 90 % of its scripts beside others (`INFO stats` `scripts_run_beside_others`), or the suite fails. ops/s against Redis (a floor per workload, see the docstring), p99 shown, keys left without a TTL (must be 0). Needs 8 vCPUs and the `lua,tls` builds (`--candidate-full`) |
 
 ## Running it
 
@@ -258,6 +259,7 @@ was re-recorded for it:
 | `33-ft-aggregate-groupby` | 4 | as recorded (#944) |
 | `34-kong-ratelimit` | the server's pinned CPUs (4) | as suite `20`: the server is pinned to half the CPUs of a `Standard_D8s_v5` and gets `--threads` to match |
 | `35-tokio-pipelined-reads` | 1 | as recorded: one worker on its own CPU, the client on the other three |
+| `36-litellm-ratelimit` | the server's pinned CPUs (4) | as suites `20` and `34` |
 | `32-default-threads` | 0 (none) | measures the default on purpose |
 
 Redis ignores the count. The default itself is watched by
@@ -1498,6 +1500,46 @@ binaries again: `ok` twice). A run takes about 2 minutes.
 
 v1.2.2's rates moved by 3 % across the three runs (287,617 to 296,520 for
 1 KiB), the candidate's by 1-2 %.
+
+## Recorded run, suite 36
+
+Recorded 2026-11-19 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C),
+`--only 36 --record`; the candidate is `2cb7377cf` (PR #962),
+`cargo build --release --features lua,tls` by rustc 1.100.0; memtier_benchmark
+2.6.1; Redis 8.10.2 from the VM image. Runs: `pr962-d8s_v5-r1` (recorded)
+and `pr962-d8s_v5-r2` (the noise check: every gate passed, host speed 1.00x).
+A run before them, not kept, measured the ratios the floors are set from
+(`FLOORS` in the suite). A run takes 1,600 s. The server has CPUs 0-3
+(KiviDB `--threads 4`, Redis one thread) and memtier 4-7.
+
+Operations a second at 200 / 500 connections, recorded run, and the
+candidate's ratio to Redis in the same session (the noise run within 2 % of
+each candidate value):
+
+| workload | v1.2.2 | candidate | Redis 8.10.2 | candidate / Redis | floor |
+|---|---:|---:|---:|---:|---:|
+| `rpm_key` (`BATCH_RATE_LIMITER`, one tag) | 181,858 / 184,200 | 224,614 / 225,923 | 84,888 / 81,477 | 2.65x / 2.77x | 1.8x |
+| `rpm_key_team` (`BATCH_RATE_LIMITER`, two tags) | 60,975 / 59,788 | 167,294 / 166,639 | 67,136 / 64,231 | 2.49x / 2.59x | 1.7x |
+| `tpm_key_team` (`CHECK_AND_INCREMENT_BY_N`) | 40,079 / 40,865 | 119,169 / 121,206 | 47,175 / 45,604 | 2.53x / 2.66x | 1.7x |
+| `parallel_key_team` (`PARALLEL_ACQUIRE`) | 32,251 / 33,121 | 117,500 / 119,404 | 51,643 / 50,442 | 2.28x / 2.37x | 1.6x |
+| `request_mix` (13 commands a request) | 75,363 / 73,614 | 232,043 / 234,294 | 93,134 / 88,008 | 2.49x / 2.66x | 1.7x |
+
+p99 (shown, not gated), ms at 200 / 500 connections, candidate against
+Redis: `rpm_key_team` 1.36 / 3.73 against 5.79 / 14.97, the mix 1.41 / 3.63
+against 4.22 / 11.26; v1.2.2 runs a key + team call alone and its p99 for
+the mix is 8.03 / 20.35.
+
+With one tag, v1.2.2 already ran the script beside others (2.1-2.3x Redis);
+with two (`*_key_team` and the mix), where it ran alone, it is 0.6-0.9x
+Redis and the candidate 2.3-2.7x. Of the candidate's 4 to 10 million
+scripts a row, all but at most 63 ran beside others (`script_counts` in
+`raw.tar.gz`; the gate is 90 %), the transcript
+matched on all three engines, `keys_without_ttl` was 0 everywhere, and the
+MONITOR check found one `<n>` across each call's `api_key` and `team` keys.
+
+This suite declares `min_cpus=8`: run it on a Standard_D8s_v5 with
+`run-all.sh --candidate <bin> --candidate-full <bin> --min-cpus-only --label
+<label>-d8s_v5`, or `--only 36` on a machine with 8 CPUs.
 
 ## Not covered
 

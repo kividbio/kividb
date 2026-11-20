@@ -69,6 +69,10 @@ pub enum TextMatch {
     /// The bare stem a query's word is expanded with, where it differs from
     /// the word: matched as [`TextMatch::Exact`] is.
     Expanded(String),
+    /// The phonetic code (`<JN`) a query's word is expanded with, on the
+    /// fields that are `PHONETIC`: a document's word of the same code is a
+    /// match (see `phonetic`).
+    Phonetic(String),
 }
 
 /// What [`TextMatch::Stem`] needs to tell whether a document's word has the
@@ -95,6 +99,10 @@ impl TextMatch {
     pub(crate) fn matches(&self, token: &str) -> bool {
         match self {
             TextMatch::Exact(t) | TextMatch::Expanded(t) => token == t,
+            TextMatch::Phonetic(t) => {
+                let min = crate::commands::search_tools::config_number("MIN_PHONETIC_TERM_LEN", 3);
+                super::phonetic::term_of(token, min as usize).as_deref() == Some(t.as_str())
+            }
             TextMatch::Stem(stem) => stem.has(stem.language, token),
             TextMatch::Prefix(p) => token.starts_with(p.as_str()),
             TextMatch::Suffix(s) => token.ends_with(s.as_str()),
@@ -241,6 +249,11 @@ pub struct QueryOptions {
     pub verbatim: bool,
     /// The language to stem the query's words in: the index's if `None`.
     pub language: Option<Language>,
+    /// The query's `DIALECT`, or the engine's default; 0 when not known
+    /// (the later dialects' reading, which is what a query read by the
+    /// engine itself has). In dialect 1, `-` and `~` take the rest of the
+    /// query as their operand: see `Parser::unary_clause`.
+    pub dialect: u8,
 }
 
 /// A parsed query.
@@ -274,6 +287,10 @@ pub fn parse_query_with(
         depth: 0,
         verbatim: options.verbatim,
         language: options.language.unwrap_or(def.language.language),
+        dialect1: options.dialect == 1,
+        stop_tilde: false,
+        stop_minus: false,
+        only_stopwords: false,
     };
     parser.skip_ws();
     let filter = if parser.at_end() {
@@ -331,6 +348,15 @@ struct Parser<'a> {
     verbatim: bool,
     /// The language the query's words are stemmed in.
     language: Language,
+    /// Dialect 1: `-` and `~` apply to the rest of the query.
+    dialect1: bool,
+    /// Dialect 1, inside the operand of a `~` or `-`: a later `~` starts a
+    /// clause of its own, not part of the operand.
+    stop_tilde: bool,
+    /// The same for `-`, inside the operand of one.
+    stop_minus: bool,
+    /// The last run of clauses read was nothing but stopwords.
+    only_stopwords: bool,
 }
 
 /// The most clauses a query may have, and the deepest it may nest. A query is
@@ -426,6 +452,10 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 None | Some(')') | Some('|') => break,
                 Some('=') if self.rest().starts_with("=>[") => break,
+                // Dialect 1: inside the operand of a `~` or `-`, one more
+                // `~` (or `-`, in the operand of a `-`) ends it.
+                Some('~') if self.stop_tilde && clauses.len() + dropped > 0 => break,
+                Some('-') if self.stop_minus && clauses.len() + dropped > 0 => break,
                 _ => {}
             }
             match self.unary(scope)? {
@@ -436,11 +466,13 @@ impl<'a> Parser<'a> {
         if clauses.is_empty() {
             // Nothing but stopwords: they are in no index, so nothing matches.
             return if dropped > 0 {
+                self.only_stopwords = true;
                 Ok(Filter::MatchNone)
             } else {
                 Err(self.syntax_error_at(start))
             };
         }
+        self.only_stopwords = false;
         let mut clauses = clauses.into_iter();
         let first = clauses.next().unwrap_or(Filter::MatchAll);
         Ok(clauses.fold(first, Filter::and))
@@ -460,6 +492,37 @@ impl<'a> Parser<'a> {
     }
 
     fn unary_clause(&mut self, scope: Option<&[String]>) -> Result<Option<Filter>, String> {
+        // Dialect 1: `-` and `~` take the rest of the query, up to the next
+        // `)` (a `|` is part of it), as their operand: `~a b` is an optional
+        // `a b`, `-a b` is not (`a b`), and `a ~b c | d` is `a` with an
+        // optional `b c | d`. A later `~` starts a clause of its own, and in
+        // the operand of a `-`, so does a later `-`.
+        if self.dialect1 && matches!(self.peek(), Some('-' | '~')) {
+            let minus = self.eat('-');
+            if !minus {
+                self.eat('~');
+            }
+            self.skip_ws();
+            let (was_tilde, was_minus) = (self.stop_tilde, self.stop_minus);
+            self.stop_tilde = true;
+            self.stop_minus |= minus;
+            self.only_stopwords = false;
+            let operand = self.or_expr(scope);
+            let only_stopwords = self.only_stopwords;
+            self.stop_tilde = was_tilde;
+            self.stop_minus = was_minus;
+            let operand = operand?;
+            return Ok(Some(
+                if only_stopwords && matches!(operand, Filter::MatchNone) {
+                    // "not, or optionally, a stopword": every document.
+                    Filter::MatchAll
+                } else if minus {
+                    Filter::Not(Box::new(operand))
+                } else {
+                    Filter::Optional(Box::new(operand))
+                },
+            ));
+        }
         if self.eat('-') {
             self.skip_ws();
             return Ok(Some(match self.unary(scope)? {
@@ -484,10 +547,23 @@ impl<'a> Parser<'a> {
                 if name == "yield_distance_as"
                     && let Filter::VectorRange { yield_as, .. } = &mut clause
                 {
-                    *yield_as = Some(value);
+                    *yield_as = Some(value.clone());
                 }
-                // $weight, $slop, $inorder, $phonetic, $epsilon: accepted;
-                // they tune ranking or approximation, not what matches.
+                // `$phonetic`: whether the clause's words are also looked for by
+                // their phonetic codes (default: on the PHONETIC fields).
+                if name == "phonetic" {
+                    match value.to_ascii_lowercase().as_str() {
+                        "false" => clause = without_phonetic(clause),
+                        "true" => {
+                            if !has_phonetic(&clause) {
+                                return Err("field does not support phonetics".into());
+                            }
+                        }
+                        _ => return Err(self.syntax_error()),
+                    }
+                }
+                // $weight, $slop, $inorder, $epsilon: accepted; they tune
+                // ranking or approximation, not what matches.
             }
         }
         Ok(Some(clause))
@@ -498,7 +574,13 @@ impl<'a> Parser<'a> {
             Some('(') => {
                 self.bump();
                 self.skip_ws();
-                let inner = self.or_expr(scope)?;
+                // A `~` or `-` inside the parentheses is of the group, not
+                // one that ends the operand of the `~` or `-` outside.
+                let flags = (self.stop_tilde, self.stop_minus);
+                (self.stop_tilde, self.stop_minus) = (false, false);
+                let inner = self.or_expr(scope);
+                (self.stop_tilde, self.stop_minus) = flags;
+                let inner = inner?;
                 self.skip_ws();
                 if !self.eat(')') {
                     return Err(self.syntax_error());
@@ -959,6 +1041,33 @@ impl<'a> Parser<'a> {
                 .iter()
                 .any(|f| f.name == *name && f.options.nostem)
         };
+        // The word's phonetic code, on the PHONETIC fields of the clause:
+        // `word | <CODE | +stem`. A word is expanded whatever its length;
+        // only a word of `MIN_PHONETIC_TERM_LEN` bytes or more has a code in
+        // the index.
+        let base = {
+            let phonetic: Vec<String> = fields
+                .iter()
+                .filter(|name| {
+                    self.def.fields.iter().any(|f| {
+                        f.name == **name
+                            && matches!(f.field_type, FieldType::Text)
+                            && f.options.phonetic.is_some()
+                    })
+                })
+                .cloned()
+                .collect();
+            match super::phonetic::term_of(&word, 0) {
+                Some(code) if !phonetic.is_empty() => Filter::Or(
+                    Box::new(base),
+                    Box::new(Filter::Text {
+                        fields: phonetic,
+                        term: TextMatch::Phonetic(code),
+                    }),
+                ),
+                _ => base,
+            }
+        };
         let stem_fields: Vec<String> = if scoped {
             fields.iter().filter(|f| !nostem(f)).cloned().collect()
         } else {
@@ -1208,6 +1317,48 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// `clause` without the phonetic codes its words were expanded with
+/// (`$phonetic: false`).
+fn without_phonetic(clause: Filter) -> Filter {
+    match clause {
+        Filter::Or(left, right) => {
+            if matches!(
+                &*right,
+                Filter::Text {
+                    term: TextMatch::Phonetic(_),
+                    ..
+                }
+            ) {
+                return without_phonetic(*left);
+            }
+            Filter::Or(
+                Box::new(without_phonetic(*left)),
+                Box::new(without_phonetic(*right)),
+            )
+        }
+        Filter::And(left, right) => Filter::And(
+            Box::new(without_phonetic(*left)),
+            Box::new(without_phonetic(*right)),
+        ),
+        Filter::Not(inner) => Filter::Not(Box::new(without_phonetic(*inner))),
+        Filter::Optional(inner) => Filter::Optional(Box::new(without_phonetic(*inner))),
+        other => other,
+    }
+}
+
+/// Whether `clause` has a phonetic code in it (a word of a PHONETIC field).
+fn has_phonetic(clause: &Filter) -> bool {
+    match clause {
+        Filter::Text {
+            term: TextMatch::Phonetic(_),
+            ..
+        } => true,
+        Filter::Or(l, r) | Filter::And(l, r) => has_phonetic(l) || has_phonetic(r),
+        Filter::Not(inner) | Filter::Optional(inner) => has_phonetic(inner),
+        _ => false,
+    }
+}
+
 // ── Evaluator ─────────────────────────────────────────────────────────────────
 
 /// Whether `a` can be turned into `b` with at most `max` single-character
@@ -1418,6 +1569,7 @@ mod tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def()
     }
@@ -1513,6 +1665,7 @@ mod tests {
             let options = QueryOptions {
                 verbatim: true,
                 language: None,
+                dialect: 0,
             };
             let parsed = parse_query_with(query, &Params::new(), &def, options).unwrap();
             eval(&parsed.filter, &doc(&d))

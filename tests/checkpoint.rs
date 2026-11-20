@@ -143,12 +143,24 @@ const LONG: Duration = Duration::from_secs(30);
 /// A server in `dir`, with the AOF on if `aof`, its output appended to
 /// `server.log`.
 fn launch(dir: &Path, port: u16, io: &str, failpoints: &str, aof: bool) -> Child {
+    launch_bin(
+        Path::new(env!("CARGO_BIN_EXE_kividb")),
+        dir,
+        port,
+        io,
+        failpoints,
+        aof,
+    )
+}
+
+/// [`launch`], of the binary `bin`.
+fn launch_bin(bin: &Path, dir: &Path, port: u16, io: &str, failpoints: &str, aof: bool) -> Child {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(dir.join("server.log"))
         .unwrap();
-    Command::new(env!("CARGO_BIN_EXE_kividb"))
+    Command::new(bin)
         .current_dir(dir)
         .args([
             "--port",
@@ -179,13 +191,25 @@ struct Server {
     failpoints: String,
     /// Whether it is started with the AOF on: it is, unless a test says not.
     aof: bool,
+    /// The binary: this build's, unless a test runs a release's.
+    bin: PathBuf,
 }
 
 impl Server {
     fn start(io: &'static str, failpoints: &str) -> Self {
-        let dir = tempfile::tempdir().unwrap().keep();
+        Self::start_in(tempfile::tempdir().unwrap().keep(), io, failpoints)
+    }
+
+    /// [`Server::start`], in the data directory `dir` as it is.
+    fn start_in(dir: PathBuf, io: &'static str, failpoints: &str) -> Self {
+        Self::start_bin(Path::new(env!("CARGO_BIN_EXE_kividb")), dir, io, failpoints)
+    }
+
+    /// [`Server::start_in`], of the binary `bin`.
+    fn start_bin(bin: &Path, dir: PathBuf, io: &'static str, failpoints: &str) -> Self {
         // Verified to be the process started: see tests/common/mod.rs.
-        let (child, port) = start_verified(|port| launch(&dir, port, io, failpoints, true));
+        let (child, port) =
+            start_verified(|port| launch_bin(bin, &dir, port, io, failpoints, true));
         let server = Server {
             port,
             dir,
@@ -193,6 +217,7 @@ impl Server {
             io,
             failpoints: failpoints.to_string(),
             aof: true,
+            bin: bin.to_path_buf(),
         };
         assert_eq!(server.conn().cmd(&["PING"]).s(), "PONG");
         server
@@ -223,7 +248,16 @@ impl Server {
         // another process has taken it in the gap (the data directory is what
         // matters; nothing in this file keeps the port).
         let (child, port, _) = restart_verified(
-            |port| launch(&self.dir, port, self.io, &self.failpoints, self.aof),
+            |port| {
+                launch_bin(
+                    &self.bin,
+                    &self.dir,
+                    port,
+                    self.io,
+                    &self.failpoints,
+                    self.aof,
+                )
+            },
             self.port,
         );
         self.child = child;
@@ -2551,4 +2585,1307 @@ fn a_log_kept_aside_already_is_not_kept_again() {
             drop(c);
         }
     }
+}
+
+// ── A power failure while the log is turned over (#277) ──────────────────────
+//
+// `kill -9` keeps the page cache: what a killed server wrote is all there. A
+// power failure keeps what was synced and, of the rest, whatever pages the
+// kernel happened to write back, in any order. These tests build that: the
+// server notes every sync of a log (`note-syncs`: the file, by inode, and
+// its length when the sync began), and after it is killed a copy of its
+// data directory is cut back to what those syncs made durable — every log,
+// or the old log alone while the new one keeps everything written to it,
+// which write-back can leave as well.
+
+/// `w:<from>` .. `w:<from + n - 1>`, in that order, in `MSET`s of 100: one
+/// sequence of writes across a test, so that what a restart loads can be
+/// checked to be a beginning of it (see [`loaded_of`]).
+fn fill_seq(c: &mut Conn, from: usize, n: usize) {
+    let all: Vec<usize> = (from..from + n).collect();
+    for chunk in all.chunks(100) {
+        let mut args = vec!["MSET".to_string()];
+        for i in chunk {
+            args.push(format!("w:{i}"));
+            args.push("1".to_string());
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert!(c.cmd(&args).ok());
+    }
+}
+
+/// How many of `<prefix>:0` .. `<prefix>:<n - 1>` the server has, asserting
+/// that they are the first ones: a restart loads a beginning of the writes,
+/// never later writes without earlier ones.
+fn loaded_of(c: &mut Conn, prefix: &str, n: usize, what: &str) -> usize {
+    let mut there = Vec::with_capacity(n);
+    let all: Vec<usize> = (0..n).collect();
+    for chunk in all.chunks(500) {
+        let mut args = vec!["MGET".to_string()];
+        args.extend(chunk.iter().map(|i| format!("{prefix}:{i}")));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        there.extend(c.cmd(&args).arr().iter().map(|v| *v != V::Nil));
+    }
+    let loaded = there.iter().take_while(|&&t| t).count();
+    if let Some(at) = there[loaded..].iter().position(|&t| t) {
+        panic!(
+            "{what}: {prefix}:{loaded} is not there and {prefix}:{} is: writes were replayed \
+             after a hole",
+            loaded + at
+        );
+    }
+    loaded
+}
+
+/// What the server noted of its syncs (see `note-syncs`).
+#[cfg(unix)]
+struct Synced {
+    /// The length each file, by inode, was last synced to.
+    lengths: std::collections::HashMap<u64, u64>,
+    /// The directory was synced after the last turn-over.
+    dir_since_turn_over: bool,
+}
+
+#[cfg(unix)]
+impl Synced {
+    fn read(dir: &Path) -> Self {
+        let notes = std::fs::read_to_string(dir.join("synced-lengths.test")).unwrap_or_default();
+        let mut lengths = std::collections::HashMap::new();
+        let mut dir_since_turn_over = true;
+        for line in notes.lines() {
+            match line.split(' ').collect::<Vec<_>>().as_slice() {
+                ["file", inode, len] => {
+                    lengths.insert(inode.parse().unwrap(), len.parse().unwrap());
+                }
+                ["dir"] => dir_since_turn_over = true,
+                ["turned-over"] => dir_since_turn_over = false,
+                other => panic!("a sync noted as {other:?}"),
+            }
+        }
+        Synced {
+            lengths,
+            dir_since_turn_over,
+        }
+    }
+
+    /// How much of the file `name` in `dir` was synced; `None` if it is not
+    /// there.
+    fn of(&self, dir: &Path, name: &str) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(dir.join(name)).ok()?;
+        Some(
+            self.lengths
+                .get(&meta.ino())
+                .copied()
+                .unwrap_or(0)
+                .min(meta.len()),
+        )
+    }
+}
+
+/// What a power failure leaves of the logs.
+#[derive(Clone, Copy, Debug)]
+enum Loss {
+    /// Every log what was synced of it, no more.
+    Unsynced,
+    /// The old log what was synced of it; the new log all that was written
+    /// to it, written back by the kernel.
+    OldLogsEnd,
+    /// As [`Loss::OldLogsEnd`], with the old log's length on disk and zeros
+    /// where its unsynced bytes were.
+    OldLogsEndAsZeros,
+    /// The old log what was synced of it; of the new log, the unsynced rest
+    /// of the page where its synced part ends lost, and the pages after it
+    /// written back.
+    NewLogsStart,
+    /// The turn-over's renames not on disk (the directory not synced since
+    /// they were made): the logs under their names from before, each with
+    /// what was synced of it.
+    Renames,
+    /// Of the turn-over's renames, only the old log's on disk: the new log
+    /// under the name it was written under, with all that was written to it
+    /// (written back), and the old log what was synced of it.
+    NewLogsName,
+}
+
+impl Loss {
+    const ALL: [Loss; 6] = [
+        Loss::Unsynced,
+        Loss::OldLogsEnd,
+        Loss::OldLogsEndAsZeros,
+        Loss::NewLogsStart,
+        Loss::Renames,
+        Loss::NewLogsName,
+    ];
+}
+
+const LOG: &str = "appendonly.aof";
+const OLD_LOG: &str = "appendonly.aof.prev";
+const NEW_LOG: &str = "appendonly.aof.rewrite.tmp";
+
+/// A copy of the data directory `dir` of a killed server, as the power
+/// failure `loss` would have left it; `None` for one that cannot happen
+/// there, or that this test does not cover (renames lost after the
+/// directory was synced; a hole inside a log).
+#[cfg(unix)]
+fn after_power_failure(dir: &Path, loss: Loss, renamed: bool) -> Option<PathBuf> {
+    let synced = Synced::read(dir);
+    if matches!(loss, Loss::Renames | Loss::NewLogsName) && (!renamed || synced.dir_since_turn_over)
+    {
+        return None;
+    }
+    let image = tempfile::tempdir().unwrap().keep();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let skip = name.starts_with("failpoint.")
+            || name == "synced-lengths.test"
+            || name == "server.log"
+            || name == "kividb.lock";
+        if !skip && entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), image.join(&name)).unwrap();
+        }
+    }
+    let durable = |name: &str| synced.of(dir, name);
+    let cut = |name: &str| {
+        if let Some(len) = durable(name) {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(image.join(name))
+                .unwrap();
+            file.set_len(len).unwrap();
+        }
+    };
+    let zero = |name: &str, from: u64, to: u64| {
+        let path = image.join(name);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let to = (to as usize).min(bytes.len());
+        if (from as usize) < to {
+            bytes[from as usize..to].fill(0);
+        }
+        std::fs::write(&path, bytes).unwrap();
+    };
+    match loss {
+        Loss::Unsynced => {
+            for name in [LOG, OLD_LOG, NEW_LOG] {
+                cut(name);
+            }
+        }
+        Loss::OldLogsEnd => cut(OLD_LOG),
+        Loss::OldLogsEndAsZeros => {
+            if let Some(len) = durable(OLD_LOG) {
+                zero(OLD_LOG, len, u64::MAX);
+            }
+        }
+        Loss::NewLogsStart => {
+            // Only a start never synced: a hole further on, inside a log,
+            // is refused at the start as damage, with or without a
+            // turn-over.
+            let start = 16 + 83;
+            match durable(LOG) {
+                Some(len) if len < start && image.join(OLD_LOG).exists() => {
+                    cut(OLD_LOG);
+                    zero(LOG, len, 4096);
+                }
+                _ => return None,
+            }
+        }
+        Loss::Renames => {
+            for name in [LOG, OLD_LOG, NEW_LOG] {
+                cut(name);
+            }
+            if image.join(OLD_LOG).exists() {
+                if image.join(LOG).exists() {
+                    std::fs::rename(image.join(LOG), image.join(NEW_LOG)).unwrap();
+                }
+                std::fs::rename(image.join(OLD_LOG), image.join(LOG)).unwrap();
+            }
+        }
+        Loss::NewLogsName => {
+            if !image.join(OLD_LOG).exists() || !image.join(LOG).exists() {
+                return None;
+            }
+            cut(OLD_LOG);
+            std::fs::rename(image.join(LOG), image.join(NEW_LOG)).unwrap();
+        }
+    }
+    Some(image)
+}
+
+/// Checkpoint steps, in order, and whether the log has been turned over at
+/// each (its renames made).
+const CHECKPOINT_STEPS: [(&str, bool); 7] = [
+    ("checkpoint-cutting", false),
+    ("turn-over-prepared", false),
+    ("turn-over-moved-aside", true),
+    ("turn-over-syncing", true),
+    ("checkpoint-turned-over", true),
+    ("dump-installing", true),
+    ("checkpoint-finished", true),
+];
+
+/// The gap of #277, as it was made: records the old log had not synced at
+/// the turn-over (the second's sync held, as a slow disk holds it), and
+/// records in the new log, which the kernel wrote back while the old log's
+/// sync waited. A power failure kept the new log's and lost the old log's
+/// last ones, and a restart replayed the old log and then the new one: the
+/// later writes without the earlier ones, a dataset no client ever saw. Now
+/// the old log is found short of where the new log goes on from: it alone
+/// is replayed, and the new log is kept aside.
+#[cfg(unix)]
+#[test]
+fn a_power_failure_before_the_old_log_is_synced_never_replays_writes_after_a_hole() {
+    for &io in io_models() {
+        let server = Server::start(io, "note-syncs,fsync,turn-over-prepared,turn-over-syncing");
+        let mut c = server.conn();
+        // Synced: the second's sync let go once.
+        fill_seq(&mut c, 0, 300);
+        server.pass("fsync.1");
+        let synced = |server: &Server| {
+            let len = std::fs::metadata(server.dir.join(LOG)).unwrap().len();
+            Synced::read(&server.dir).of(&server.dir, LOG) == Some(len)
+        };
+        let deadline = Instant::now() + LONG;
+        while !synced(&server) {
+            assert!(Instant::now() < deadline, "{io}: the log was not synced");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // From here the second's sync is held, and the checkpoint is held
+        // after it has prepared its new log: these reach the old log, and
+        // are not synced by its turn-over.
+        fill_seq(&mut c, 300, 300);
+        assert!(server.reached("fsync.2", LONG), "{io}");
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        assert!(server.reached("turn-over-prepared.1", LONG), "{io}");
+        fill_seq(&mut c, 600, 300);
+        server.release("turn-over-prepared.1");
+        // The writer is held: the first write after the checkpoint's cut
+        // takes the turn-over, and is the new log's first. The old log's
+        // sync is then held.
+        let mut next = 900;
+        let deadline = Instant::now() + LONG;
+        while !server.dir.join("failpoint.turn-over-syncing.1").exists() {
+            assert!(Instant::now() < deadline, "{io}: no turn-over");
+            fill_seq(&mut c, next, 10);
+            next += 10;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        fill_seq(&mut c, next, 300);
+        let total = next + 300;
+        drop(c);
+        let mut server = server;
+        server.kill();
+
+        for loss in [Loss::OldLogsEnd, Loss::OldLogsEndAsZeros] {
+            let what = format!("{io}, {loss:?}");
+            let synced = Synced::read(&server.dir);
+            let old_len = std::fs::metadata(server.dir.join(OLD_LOG)).unwrap().len();
+            assert!(
+                synced.of(&server.dir, OLD_LOG).unwrap() < old_len,
+                "{what}: the old log was synced to its end, so this test shows nothing"
+            );
+            let image = after_power_failure(&server.dir, loss, true).unwrap();
+            let restarted = Server::start_in(image, io, "");
+            let mut c = restarted.conn();
+            let loaded = loaded_of(&mut c, "w", total, &what);
+            assert!(
+                loaded >= 300,
+                "{what}: synced writes lost ({loaded} loaded)"
+            );
+            assert!(loaded < total, "{what}: {loaded} loaded");
+            let log = std::fs::read_to_string(restarted.dir.join("server.log")).unwrap();
+            assert!(
+                log.contains("does not reach where appendonly.aof goes on from"),
+                "{what}: no word of the old log cut short"
+            );
+            let kept = kept_aside(&restarted.dir);
+            assert_eq!(kept.len(), 1, "{what}: {kept:?}");
+            assert!(kept[0].0.ends_with(".appendonly.aof"), "{what}: {kept:?}");
+            assert!(
+                holds(&kept[0].1, format!("w:{}", total - 1).as_bytes()),
+                "{what}: the new log is not kept"
+            );
+
+            // Started again on the old log: what is written now is kept,
+            // after the same writes as before, restart after restart.
+            assert!(c.cmd(&["SET", "after", "1"]).ok());
+            durable(&mut c);
+            drop(c);
+            let mut restarted = restarted;
+            restarted.kill();
+            let mut c = restarted.restart();
+            assert_eq!(loaded_of(&mut c, "w", total, &what), loaded, "{what}");
+            assert_eq!(c.cmd(&["GET", "after"]).s(), "1", "{what}");
+            assert_eq!(kept_aside(&restarted.dir).len(), 1, "{what}");
+            assert!(c.cmd(&["SAVE"]).ok());
+            assert!(c.cmd(&["SET", "later", "1"]).ok());
+            durable(&mut c);
+            drop(c);
+            restarted.kill();
+            let mut c = restarted.restart();
+            assert_eq!(loaded_of(&mut c, "w", total, &what), loaded, "{what}");
+            assert_eq!(c.cmd(&["GET", "after"]).s(), "1", "{what}");
+            assert_eq!(c.cmd(&["GET", "later"]).s(), "1", "{what}");
+        }
+    }
+}
+
+/// A client writing `w:0`, `w:1`, ... with `SET`s, 20 at a time without
+/// waiting for replies, until it is stopped or the server goes away,
+/// counting what was acknowledged.
+struct Writer {
+    stop: Arc<AtomicBool>,
+    acked: Arc<std::sync::atomic::AtomicUsize>,
+    sent: Arc<std::sync::atomic::AtomicUsize>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Writer {
+    fn start(port: u16) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let acked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let thread = {
+            let (stop, acked, sent) = (stop.clone(), acked.clone(), sent.clone());
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let mut next = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let mut batch = Vec::new();
+                    for i in next..next + 20 {
+                        let key = format!("w:{i}");
+                        batch.extend_from_slice(
+                            format!("*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n$1\r\n1\r\n", key.len())
+                                .as_bytes(),
+                        );
+                    }
+                    sent.store(next + 20, Ordering::SeqCst);
+                    if c.writer.write_all(&batch).is_err() {
+                        return;
+                    }
+                    for _ in 0..20 {
+                        let mut line = String::new();
+                        match c.reader.read_line(&mut line) {
+                            Ok(n) if n > 0 && line.starts_with("+OK") => {
+                                acked.fetch_add(1, Ordering::SeqCst);
+                            }
+                            _ => return,
+                        }
+                    }
+                    next += 20;
+                }
+            })
+        };
+        Writer {
+            stop,
+            acked,
+            sent,
+            thread,
+        }
+    }
+
+    fn acked(&self) -> usize {
+        self.acked.load(Ordering::SeqCst)
+    }
+
+    /// Stop, once the server is gone: how many writes were acknowledged,
+    /// and how many sent.
+    fn stop(self) -> (usize, usize) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.thread.join();
+        (
+            self.acked.load(Ordering::SeqCst),
+            self.sent.load(Ordering::SeqCst),
+        )
+    }
+}
+
+/// `appendfsync always` with `aof-ack-after-write yes`: a write is
+/// acknowledged once it is synced. A power failure at any step of a
+/// checkpoint, with whatever was not synced lost or written back in any
+/// order, loses none of the writes acknowledged, and a restart loads a
+/// beginning of the writes sent, with no hole. A client writes all along.
+#[cfg(unix)]
+#[test]
+fn under_appendfsync_always_a_power_failure_at_any_step_of_a_checkpoint_keeps_every_acknowledged_write()
+ {
+    for &io in io_models() {
+        for (step, renamed) in CHECKPOINT_STEPS {
+            let mut server = Server::start(io, &format!("note-syncs,{step}"));
+            let mut c = server.conn();
+            assert!(c.cmd(&["CONFIG", "SET", "appendfsync", "always"]).ok());
+            let ack = c.cmd(&["CONFIG", "GET", "aof-ack-after-write"]);
+            assert_eq!(ack.arr()[1].s(), "yes", "{io}");
+            fill(&mut c, "base", 400);
+            let writer = Writer::start(server.port);
+            let deadline = Instant::now() + LONG;
+            while writer.acked() < 200 {
+                assert!(Instant::now() < deadline, "{io}: no writes acknowledged");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+            assert!(
+                server.reached(&format!("{step}.1"), LONG),
+                "{io}: {step} not reached"
+            );
+            // Writes go on, where the step lets them.
+            std::thread::sleep(Duration::from_millis(300));
+            drop(c);
+            server.kill();
+            let (acked, sent) = writer.stop();
+
+            for loss in Loss::ALL {
+                let Some(image) = after_power_failure(&server.dir, loss, renamed) else {
+                    continue;
+                };
+                let what = format!("{io}, a power failure at {step}, {loss:?}");
+                let restarted = Server::start_in(image, io, "");
+                let mut c = restarted.conn();
+                assert_eq!(loaded_of(&mut c, "base", 400, &what), 400, "{what}");
+                let loaded = loaded_of(&mut c, "w", sent, &what);
+                assert!(
+                    loaded >= acked,
+                    "{what}: {acked} writes acknowledged, {loaded} loaded"
+                );
+            }
+        }
+    }
+}
+
+/// A checkpoint over one that did not finish adds the log's records to the
+/// old log the unfinished one left (`appendonly.aof.prev`), syncs it, and
+/// starts a new log after it. A power failure after that, with the new
+/// log's records written back and the logs' unsynced bytes lost, loads a
+/// beginning of the writes: the old log is synced to the end the new log
+/// records before the new log takes its name.
+#[cfg(unix)]
+#[test]
+fn a_power_failure_after_a_turn_over_onto_an_unfinished_ones_old_log_loads_a_beginning() {
+    for &io in io_models() {
+        let mut server = Server::start(io, "note-syncs,dump-installing");
+        let mut c = server.conn();
+        fill_seq(&mut c, 0, 300);
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        assert!(server.reached("dump-installing.1", LONG), "{io}");
+        fill_seq(&mut c, 300, 300);
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        // Held by the process killed: the next one's is numbered 1 again.
+        server.release("dump-installing.1");
+
+        // The unfinished checkpoint's old log is still needed: the next
+        // turn-over adds the log's records to it.
+        let mut c = server.restart();
+        assert_eq!(loaded_of(&mut c, "w", 900, io), 600, "{io}");
+        assert!(server.dir.join(OLD_LOG).exists(), "{io}");
+        fill_seq(&mut c, 600, 300);
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        assert!(server.reached("dump-installing.1", LONG), "{io}");
+        fill_seq(&mut c, 900, 300);
+        drop(c);
+        server.kill();
+
+        for loss in Loss::ALL {
+            let Some(image) = after_power_failure(&server.dir, loss, true) else {
+                continue;
+            };
+            let what = format!("{io}, {loss:?}");
+            let restarted = Server::start_in(image, io, "");
+            let mut c = restarted.conn();
+            let loaded = loaded_of(&mut c, "w", 1200, &what);
+            // What was synced before the restart, and the old log the
+            // second turn-over synced.
+            assert!(loaded >= 900, "{what}: {loaded} loaded");
+        }
+    }
+}
+
+/// The header of a delta log and the record of where its old log ends, as
+/// the server writes them.
+fn old_log_end(old: &[u8]) -> Vec<u8> {
+    let from = old.len().saturating_sub(4096);
+    format!(
+        "*3\r\n$22\r\nKIVIDB.AOF-OLD-LOG-END\r\n$20\r\n{:020}\r\n$16\r\n{:016x}\r\n",
+        old.len(),
+        xxhash_rust::xxh3::xxh3_64(&old[from..])
+    )
+    .into_bytes()
+}
+
+/// Torn tails on either side of a turn-over, in a checkpoint that did not
+/// finish (an old log and a new one, no snapshot): a restart loads a
+/// beginning of the writes, keeps aside what it does not load, and goes on
+/// from what it loaded.
+#[test]
+fn torn_tails_either_side_of_a_turn_over_load_a_beginning_of_the_writes() {
+    let n = 200;
+    let mut old = delta_header(1);
+    for i in 0..n {
+        old.extend_from_slice(&set_record(&format!("old:{i}"), "1"));
+    }
+    let new_records = |log: &mut Vec<u8>| {
+        for i in 0..n {
+            log.extend_from_slice(&set_record(&format!("new:{i}"), "1"));
+        }
+    };
+    let mut new = delta_header(2);
+    new.extend_from_slice(&old_log_end(&old));
+    new_records(&mut new);
+    let cut = |bytes: &[u8], by: usize| bytes[..bytes.len() - by].to_vec();
+    let zeros_at_end = |bytes: &[u8], by: usize| {
+        let mut bytes = bytes.to_vec();
+        let len = bytes.len();
+        bytes[len - by..].fill(0);
+        bytes
+    };
+    // The old log as it was when it ended in half a record (a write cut
+    // short): the new log records that length.
+    let mut half = old.clone();
+    half.extend_from_slice(&set_record("old:half", "1")[..10]);
+    let mut after_half = delta_header(2);
+    after_half.extend_from_slice(&old_log_end(&half));
+    new_records(&mut after_half);
+    let mut head_lost = new.clone();
+    head_lost[16..16 + 83 + 30].fill(0);
+    // What 1.2.2 writes: no record.
+    let mut unrecorded = delta_header(2);
+    new_records(&mut unrecorded);
+
+    /// What, the old log, the new log, the old writes loaded, the new
+    /// writes loaded, the new log kept aside.
+    type Case = (&'static str, Vec<u8>, Vec<u8>, usize, usize, bool);
+    let cases: Vec<Case> = vec![
+        ("both whole", old.clone(), new.clone(), n, n, false),
+        ("old log torn", cut(&old, 5), new.clone(), n - 1, 0, true),
+        (
+            "old log zeros",
+            zeros_at_end(&old, 5),
+            new.clone(),
+            n - 1,
+            0,
+            true,
+        ),
+        ("new log torn", old.clone(), cut(&new, 5), n, n - 1, false),
+        ("both torn", cut(&old, 5), cut(&new, 5), n - 1, 0, true),
+        (
+            "old log torn inside its end",
+            half.clone(),
+            after_half,
+            n,
+            n,
+            false,
+        ),
+        (
+            "the record lost, records after it",
+            old.clone(),
+            head_lost,
+            n,
+            0,
+            true,
+        ),
+        (
+            "the record torn, nothing after it",
+            old.clone(),
+            new[..16 + 40].to_vec(),
+            n,
+            0,
+            false,
+        ),
+        ("no record", old.clone(), unrecorded, n, n, false),
+    ];
+    for (what, old_log, new_log, old_loaded, new_loaded, kept) in cases {
+        let dir = tempfile::tempdir().unwrap().keep();
+        std::fs::write(dir.join(OLD_LOG), &old_log).unwrap();
+        std::fs::write(dir.join(LOG), &new_log).unwrap();
+        let mut server = Server::start_in(dir, "tokio", "");
+        let mut c = server.conn();
+        let check = |c: &mut Conn, server: &Server| {
+            assert_eq!(loaded_of(c, "old", n, what), old_loaded, "{what}");
+            assert_eq!(loaded_of(c, "new", n, what), new_loaded, "{what}");
+            assert!(!(new_loaded > 0 && old_loaded < n), "{what}");
+            let kept_logs = kept_aside(&server.dir);
+            assert_eq!(kept_logs.len(), usize::from(kept), "{what}: {kept_logs:?}");
+        };
+        check(&mut c, &server);
+        // Again, and with a write after: the same, and the write kept.
+        assert!(c.cmd(&["SET", "after", "1"]).ok());
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        check(&mut c, &server);
+        assert_eq!(c.cmd(&["GET", "after"]).s(), "1", "{what}");
+        assert!(c.cmd(&["SAVE"]).ok());
+        assert!(!server.dir.join(OLD_LOG).exists(), "{what}");
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        check(&mut c, &server);
+        assert_eq!(c.cmd(&["GET", "after"]).s(), "1", "{what}");
+    }
+}
+
+/// The 1.2 release (`KIVIDB_1_2_BIN`), which writes no record of where the
+/// old log ends: a checkpoint of its that did not finish, and one that did,
+/// load here whole, as they did there. And the other way, what is written
+/// here (the new log opening with the record) loads in 1.2 whole: it
+/// replays the record as an unknown command, and passes over it.
+#[test]
+#[ignore = "needs a 1.2 binary in KIVIDB_1_2_BIN"]
+fn logs_of_1_2_load_here_and_1_2_loads_logs_written_here() {
+    let release = PathBuf::from(std::env::var("KIVIDB_1_2_BIN").expect("KIVIDB_1_2_BIN"));
+    let out = Command::new(&release).arg("--version").output().unwrap();
+    let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(version.starts_with("kividb 1.2."), "{version:?}");
+    let this = PathBuf::from(env!("CARGO_BIN_EXE_kividb"));
+    for (writes, reads) in [(&release, &this), (&this, &release)] {
+        for finished in [false, true] {
+            let what = format!(
+                "written by {}, read by {}, checkpoint finished: {finished}",
+                writes.display(),
+                reads.display()
+            );
+            let dir = tempfile::tempdir().unwrap().keep();
+            let failpoints = if finished { "" } else { "turn-over-syncing" };
+            let mut server = Server::start_bin(writes, dir, "tokio", failpoints);
+            let mut c = server.conn();
+            fill_seq(&mut c, 0, 300);
+            // A checkpoint that finishes: let past the step it holds at.
+            send(&mut c, &["SAVE"]);
+            if !finished {
+                server.pass("turn-over-syncing.1");
+            }
+            assert!(c.read().ok(), "{what}");
+            fill_seq(&mut c, 300, 300);
+            assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED, "{what}");
+            if finished {
+                wait_idle(&mut c);
+            } else {
+                assert!(server.reached("turn-over-syncing.2", LONG), "{what}");
+            }
+            fill_seq(&mut c, 600, 300);
+            durable(&mut c);
+            drop(c);
+            server.kill();
+            assert_eq!(server.dir.join(OLD_LOG).exists(), !finished, "{what}");
+            let _ = std::fs::remove_file(server.dir.join("failpoint.turn-over-syncing.2"));
+
+            server.bin = reads.clone();
+            server.failpoints.clear();
+            let mut c = server.restart();
+            assert_eq!(loaded_of(&mut c, "w", 900, &what), 900, "{what}");
+            assert!(kept_aside(&server.dir).is_empty(), "{what}");
+            // And it goes on from there.
+            fill_seq(&mut c, 900, 100);
+            durable(&mut c);
+            assert!(c.cmd(&["SAVE"]).ok(), "{what}");
+            fill_seq(&mut c, 1000, 100);
+            durable(&mut c);
+            drop(c);
+            server.kill();
+            let mut c = server.restart();
+            assert_eq!(loaded_of(&mut c, "w", 1100, &what), 1100, "{what}");
+        }
+    }
+}
+
+// ── An old log cut short, and a turn-over after it ───────────────────────────
+
+/// A server in `dir`, held at its first `failpoint` during its start, and
+/// killed there.
+fn killed_at_start(dir: &Path, failpoint: &str) {
+    let mut child = launch(dir, common::free_port(), "tokio", failpoint, true);
+    let held = dir.join(format!("failpoint.{failpoint}.1"));
+    let deadline = Instant::now() + LONG;
+    while !held.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the server ended before {failpoint}"
+        );
+        assert!(Instant::now() < deadline, "{failpoint} not reached");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    std::fs::remove_file(held).unwrap();
+}
+
+/// An old log of `n` records `old:<i>` with `tail` after them.
+fn old_log_with(n: usize, tail: &[u8]) -> Vec<u8> {
+    let mut old = delta_header(1);
+    for i in 0..n {
+        old.extend_from_slice(&set_record(&format!("old:{i}"), "1"));
+    }
+    old.extend_from_slice(tail);
+    old
+}
+
+/// An old log that ends in a record cut short, beside a new log, of a
+/// checkpoint that did not finish: the replay leaves the record out, and
+/// it is cut off. Left there, the next checkpoint's turn-over added the
+/// log's records after it (the old log still being needed), and a restart
+/// before that checkpoint finished could not read past it: the server
+/// refused to start, or, when the record cut short declared a value longer
+/// than the rest of the file, read the records after it as that value and
+/// lost them. Then the same with a second stop in the middle of cutting it.
+#[test]
+fn an_old_log_cut_short_is_cut_before_records_are_added_to_it() {
+    let n = 100;
+    // Cut inside a value: the records added after it are misread from there
+    // (a cut just after a length can happen to line up with them again).
+    let torn = set_record("old:torn", "1")[..21].to_vec();
+    let huge = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$999999999\r\nab".to_vec();
+    // (what, old log, new log, a stop in the middle of the cut)
+    type Case = (&'static str, Vec<u8>, Vec<u8>, Option<&'static str>);
+    let mut cases: Vec<Case> = Vec::new();
+    for (name, tail) in [("cut short", &torn), ("a huge value cut short", &huge)] {
+        // As 1.2.2 leaves it, and as a power failure leaves this
+        // version's new log with its first page lost: no record.
+        cases.push((name, old_log_with(n, tail), delta_header(2), None));
+        // The old log ended in the record cut short when the log was turned
+        // over (a write cut short): the new log's record says so.
+        let old = old_log_with(n, tail);
+        let mut new = delta_header(2);
+        new.extend_from_slice(&old_log_end(&old));
+        cases.push((name, old.clone(), new.clone(), None));
+        cases.push((name, old, new, Some("old-log-end-rewritten")));
+    }
+    for (what, old, new, stop) in cases {
+        let what = format!(
+            "{what}, {} record, stopped: {stop:?}",
+            if new.len() > 16 { "a" } else { "no" }
+        );
+        let dir = tempfile::tempdir().unwrap().keep();
+        std::fs::write(dir.join(OLD_LOG), &old).unwrap();
+        std::fs::write(dir.join(LOG), &new).unwrap();
+        if let Some(stop) = stop {
+            killed_at_start(&dir, stop);
+        }
+        let mut server = Server::start_in(dir, "tokio", "dump-installing");
+        let mut c = server.conn();
+        assert_eq!(loaded_of(&mut c, "old", n, &what), n, "{what}");
+        let prev = std::fs::read(server.dir.join(OLD_LOG)).unwrap();
+        assert_eq!(prev, old_log_with(n, b""), "{what}: not cut");
+        fill_seq(&mut c, 0, 300);
+        durable(&mut c);
+        // The next checkpoint adds those to the old log, and is stopped
+        // before its snapshot is in place.
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        assert!(server.reached("dump-installing.1", LONG), "{what}");
+        fill_seq(&mut c, 300, 100);
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        server.release("dump-installing.1");
+        server.failpoints.clear();
+        let mut c = server.restart();
+        assert_eq!(loaded_of(&mut c, "old", n, &what), n, "{what}");
+        assert_eq!(loaded_of(&mut c, "w", 400, &what), 400, "{what}");
+        assert!(kept_aside(&server.dir).is_empty(), "{what}");
+    }
+}
+
+/// A second stop in the middle of what a start does after an old log found
+/// short of where the new log goes on from: the next start loads the same,
+/// keeps the new log aside once, and goes on from there.
+#[test]
+fn a_stop_while_a_log_after_a_short_old_log_is_started_again_loads_the_same() {
+    let n = 100;
+    let old = old_log_with(n, b"");
+    let mut new = delta_header(2);
+    new.extend_from_slice(&old_log_end(&old));
+    for i in 0..n {
+        new.extend_from_slice(&set_record(&format!("new:{i}"), "1"));
+    }
+    let torn = &old[..old.len() - 5];
+    for stop in ["short-old-log-kept", "short-old-log-cut"] {
+        let dir = tempfile::tempdir().unwrap().keep();
+        std::fs::write(dir.join(OLD_LOG), torn).unwrap();
+        std::fs::write(dir.join(LOG), &new).unwrap();
+        killed_at_start(&dir, stop);
+        let mut server = Server::start_in(dir, "tokio", "");
+        let mut c = server.conn();
+        assert_eq!(loaded_of(&mut c, "old", n, stop), n - 1, "{stop}");
+        assert_eq!(loaded_of(&mut c, "new", n, stop), 0, "{stop}");
+        let kept = kept_aside(&server.dir);
+        assert_eq!(kept.len(), 1, "{stop}: {kept:?}");
+        assert_eq!(kept[0].1, new, "{stop}");
+        assert!(c.cmd(&["SET", "after", "1"]).ok());
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        assert_eq!(loaded_of(&mut c, "old", n, stop), n - 1, "{stop}");
+        assert_eq!(c.cmd(&["GET", "after"]).s(), "1", "{stop}");
+        assert_eq!(kept_aside(&server.dir).len(), 1, "{stop}");
+    }
+}
+
+/// The turn-over's new log under the name it was written under, holding
+/// records, beside the old log and no log: the old log's rename reached the
+/// disk and the new log's did not. Put in place and replayed when the old
+/// log is there to where the new one records it ended; kept aside, not
+/// replayed, when it is not.
+#[test]
+fn a_new_log_whose_name_was_lost_is_replayed_when_the_old_log_is_whole() {
+    let n = 100;
+    let old = old_log_with(n, b"");
+    let mut new = delta_header(2);
+    new.extend_from_slice(&old_log_end(&old));
+    for i in 0..n {
+        new.extend_from_slice(&set_record(&format!("new:{i}"), "1"));
+    }
+    for whole in [true, false] {
+        let what = format!("old log whole: {whole}");
+        let dir = tempfile::tempdir().unwrap().keep();
+        let on_disk = if whole {
+            &old[..]
+        } else {
+            &old[..old.len() - 5]
+        };
+        std::fs::write(dir.join(OLD_LOG), on_disk).unwrap();
+        std::fs::write(dir.join(NEW_LOG), &new).unwrap();
+        let mut server = Server::start_in(dir, "tokio", "");
+        let mut c = server.conn();
+        let (old_loaded, new_loaded) = if whole { (n, n) } else { (n - 1, 0) };
+        assert_eq!(loaded_of(&mut c, "old", n, &what), old_loaded, "{what}");
+        assert_eq!(loaded_of(&mut c, "new", n, &what), new_loaded, "{what}");
+        assert_eq!(kept_aside(&server.dir).len(), usize::from(!whole), "{what}");
+        assert!(!server.dir.join(NEW_LOG).exists(), "{what}");
+        assert!(c.cmd(&["SET", "after", "1"]).ok());
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        assert_eq!(loaded_of(&mut c, "new", n, &what), new_loaded, "{what}");
+        assert_eq!(c.cmd(&["GET", "after"]).s(), "1", "{what}");
+    }
+}
+
+// ── A write the disk takes only part of ──────────────────────────────────────
+
+/// Whether `c` has a reply waiting, without reading it.
+fn has_reply(c: &mut Conn) -> bool {
+    let socket = c.reader.get_ref();
+    socket.set_nonblocking(true).unwrap();
+    let peeked = socket.peek(&mut [0]);
+    socket.set_nonblocking(false).unwrap();
+    !c.reader.buffer().is_empty() || matches!(peeked, Ok(n) if n > 0)
+}
+
+/// A write to the log that the disk takes only part of (a full disk): what
+/// it wrote is taken back, and nothing is written after it until all of it
+/// is. Its reply waits, `WAITAOF` counts it not, and `INFO` says the log is
+/// failing; once the disk takes it, all goes on in order. Killed while it
+/// fails, the log loads, with every write acknowledged before.
+#[test]
+fn a_write_to_the_log_cut_short_is_taken_back_and_written_again() {
+    for &io in io_models() {
+        for end in ["the disk takes it again", "killed"] {
+            let what = format!("{io}, {end}");
+            let mut server = Server::start(io, "short-writes");
+            let mut c = server.conn();
+            fill_seq(&mut c, 0, 300);
+            durable(&mut c);
+            std::fs::write(server.dir.join("short-write.test"), b"").unwrap();
+            send(&mut c, &["MSET", "w:300", "1", "w:301", "1"]);
+            std::thread::sleep(Duration::from_millis(1000));
+            assert!(!has_reply(&mut c), "{what}: acknowledged, not written");
+            // From then on, writes are refused, as Redis refuses them.
+            let mut w = server.conn();
+            let refused = w.cmd(&["SET", "w:302", "1"]);
+            assert_eq!(
+                refused,
+                V::Err("MISCONF Errors writing to the AOF file: No space left on device".into()),
+                "{what}"
+            );
+            let mut i = server.conn();
+            let waited = i.cmd(&["WAITAOF", "1", "0", "200"]);
+            assert_eq!(waited.arr()[0].i(), 0, "{what}: WAITAOF counted it");
+            assert_eq!(info_field(&mut i, "aof_last_write_status"), "err", "{what}");
+            if end == "killed" {
+                drop((c, w, i));
+                server.kill();
+                std::fs::remove_file(server.dir.join("short-write.test")).unwrap();
+                let mut c = server.restart();
+                assert!(loaded_of(&mut c, "w", 303, &what) >= 300, "{what}");
+                continue;
+            }
+            std::fs::remove_file(server.dir.join("short-write.test")).unwrap();
+            assert!(c.read().ok(), "{what}");
+            // Accepted again once the disk takes what is held.
+            assert!(w.cmd(&["SET", "w:302", "1"]).ok(), "{what}");
+            assert_eq!(info_field(&mut i, "aof_last_write_status"), "ok", "{what}");
+            assert_eq!(info_field(&mut i, "aof_acks_before_write"), "0", "{what}");
+            fill_seq(&mut c, 303, 100);
+            durable(&mut c);
+            drop((c, w, i));
+            server.kill();
+            let mut c = server.restart();
+            assert_eq!(loaded_of(&mut c, "w", 403, &what), 403, "{what}");
+        }
+    }
+}
+
+/// The record of where the old log ends, written only in part at a
+/// turn-over: taken off again, and the log goes on without it. If it cannot
+/// be taken off either, the server stops rather than write records after
+/// half of one.
+#[test]
+fn a_record_of_the_old_logs_end_cut_short_is_taken_off_or_stops_the_server() {
+    for taken_off in [true, false] {
+        let what = format!("taken off: {taken_off}");
+        let mut server = Server::start("tokio", "short-writes");
+        let mut c = server.conn();
+        fill_seq(&mut c, 0, 300);
+        durable(&mut c);
+        std::fs::write(server.dir.join("short-write.record.test"), b"").unwrap();
+        if !taken_off {
+            std::fs::write(server.dir.join("short-write.cut.test"), b"").unwrap();
+            send(&mut c, &["BGREWRITEAOF"]);
+            // The turn-over is made by the next write, or the writer.
+            let mut w = server.conn();
+            send(&mut w, &["SET", "w:300", "1"]);
+            let deadline = Instant::now() + LONG;
+            while server.child.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "{what}: the server did not stop");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let log = std::fs::read_to_string(server.dir.join("server.log")).unwrap();
+            assert!(
+                log.contains("exiting rather than write records after half of one"),
+                "{what}"
+            );
+            for f in ["short-write.record.test", "short-write.cut.test"] {
+                std::fs::remove_file(server.dir.join(f)).unwrap();
+            }
+            let mut c = server.restart();
+            assert!(loaded_of(&mut c, "w", 301, &what) >= 300, "{what}");
+            continue;
+        }
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        wait_idle(&mut c);
+        std::fs::remove_file(server.dir.join("short-write.record.test")).unwrap();
+        let log = std::fs::read(server.dir.join(LOG)).unwrap();
+        assert!(
+            !holds(&log, b"KIVIDB.AOF-OLD-LOG-END"),
+            "{what}: half a record is left"
+        );
+        fill_seq(&mut c, 300, 100);
+        durable(&mut c);
+        drop(c);
+        server.kill();
+        let mut c = server.restart();
+        assert_eq!(loaded_of(&mut c, "w", 400, &what), 400, "{what}");
+    }
+}
+
+// ── While the log cannot be written ──────────────────────────────────────────
+
+const MISCONF: &str = "MISCONF Errors writing to the AOF file: No space left on device";
+
+/// A server whose next write to the log fails (`short-writes`), with `INCR
+/// k` sent and held: written to memory, and not to the log.
+fn with_a_write_held(failpoints: &str) -> (Server, Conn) {
+    let server = Server::start("tokio", failpoints);
+    let mut c = server.conn();
+    fill_seq(&mut c, 0, 100);
+    durable(&mut c);
+    std::fs::write(server.dir.join("short-write.test"), b"").unwrap();
+    let mut held = server.conn();
+    send(&mut held, &["INCR", "k"]);
+    let deadline = Instant::now() + LONG;
+    while info_field(&mut c, "aof_last_write_status") != "err" {
+        assert!(Instant::now() < deadline, "the write was not held");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    (server, held)
+}
+
+/// What would be logged is refused while the log cannot be written, as
+/// Redis refuses it; reads are served; nothing more is held; and writes are
+/// accepted again once the disk takes what is held.
+#[test]
+fn writes_are_refused_while_the_log_cannot_be_written() {
+    let (server, mut held) = with_a_write_held("short-writes");
+    let mut c = server.conn();
+    let big = "x".repeat(10_000);
+    for i in 0..1000 {
+        assert_eq!(
+            c.cmd(&["SET", &format!("refused:{i}"), &big]),
+            V::Err(MISCONF.into())
+        );
+    }
+    assert_eq!(c.cmd(&["GET", "w:0"]).s(), "1");
+    assert_eq!(c.cmd(&["PING"]).s(), "PONG");
+    assert_eq!(c.cmd(&["DBSIZE"]).i(), 101);
+    // A transaction that writes is refused whole, at its EXEC.
+    assert!(c.cmd(&["MULTI"]).ok());
+    assert_eq!(c.cmd(&["SET", "in-tx", "1"]).s(), "QUEUED");
+    assert_eq!(
+        c.cmd(&["EXEC"]),
+        V::Err(format!(
+            "EXECABORT Transaction discarded because of: {MISCONF}"
+        ))
+    );
+    assert_eq!(c.cmd(&["EXISTS", "in-tx"]).i(), 0);
+    // Nothing of the refused writes is held: what is held is the INCR.
+    let log = std::fs::read_to_string(server.dir.join("server.log")).unwrap();
+    assert!(!log.contains("past the limit"), "held more");
+    std::fs::remove_file(server.dir.join("short-write.test")).unwrap();
+    assert_eq!(held.read().i(), 1);
+    assert!(c.cmd(&["SET", "after", "1"]).ok());
+    durable(&mut c);
+    drop((c, held));
+    let mut server = server;
+    server.kill();
+    let mut c = server.restart();
+    assert_eq!(c.cmd(&["GET", "k"]).s(), "1");
+    assert_eq!(c.cmd(&["GET", "after"]).s(), "1");
+    assert_eq!(c.cmd(&["EXISTS", "refused:0"]).i(), 0);
+}
+
+/// A save with the AOF off records the logs beside its dump. Made while a
+/// write was held, the log recorded did not hold it; written later, it made
+/// the log read as added to since the dump, and replayed over it: an `INCR`
+/// applied twice. The save now fails until what is held is written. The
+/// same for the AOF turned on again, whose checkpoint cannot turn the log
+/// over past what is held.
+#[test]
+fn a_save_or_an_enable_waits_for_what_the_log_could_not_take() {
+    for then in ["BGSAVE", "appendonly yes"] {
+        let (mut server, mut held) = with_a_write_held("short-writes");
+        let mut c = server.conn();
+        assert!(c.cmd(&["CONFIG", "SET", "appendonly", "no"]).ok(), "{then}");
+        if then == "BGSAVE" {
+            let started = c.cmd(&["BGSAVE"]);
+            if started.s().contains("started") {
+                wait_idle(&mut c);
+                assert_eq!(
+                    info_field(&mut c, "rdb_last_bgsave_status"),
+                    "err",
+                    "{then}"
+                );
+            }
+            assert!(!server.dir.join("dump.kdb").exists(), "{then}: saved");
+        } else {
+            let enabled = c.cmd(&["CONFIG", "SET", "appendonly", "yes"]);
+            assert!(matches!(enabled, V::Err(_)), "{then}: {enabled:?}");
+        }
+        std::fs::remove_file(server.dir.join("short-write.test")).unwrap();
+        assert_eq!(held.read().i(), 1, "{then}");
+        // The second's sync writes it.
+        let deadline = Instant::now() + LONG;
+        while info_field(&mut c, "aof_last_write_status") != "ok" {
+            assert!(Instant::now() < deadline, "{then}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(1500));
+        drop((c, held));
+        server.kill();
+        let mut c = server.restart();
+        assert_eq!(c.cmd(&["GET", "k"]).s(), "1", "{then}: applied twice");
+    }
+}
+
+/// A shutdown with writes held in memory says so. `SHUTDOWN` keeps the
+/// server running, its final save having failed; `SHUTDOWN NOSAVE` exits
+/// with status 1, saying how many bytes were lost.
+#[test]
+fn a_shutdown_with_writes_held_says_so() {
+    let (mut server, held) = with_a_write_held("short-writes");
+    let mut c = server.conn();
+    let refused = c.cmd(&["SHUTDOWN"]);
+    assert!(matches!(refused, V::Err(_)), "{refused:?}");
+    assert_eq!(c.cmd(&["PING"]).s(), "PONG");
+    let log = std::fs::read_to_string(server.dir.join("server.log")).unwrap();
+    assert!(log.contains("in memory only"), "the final save's error");
+    send(&mut c, &["SHUTDOWN", "NOSAVE"]);
+    let status = server.child.wait().unwrap();
+    assert_eq!(status.code(), Some(1));
+    let log = std::fs::read_to_string(server.dir.join("server.log")).unwrap();
+    assert!(
+        log.contains("are lost with the process"),
+        "no word of the loss"
+    );
+    drop((c, held));
+}
+
+/// Under `appendfsync always`, a reply's sync counted for `WAITAOF` all
+/// that was written, records the disk had not taken included, after a
+/// switch to `everysec` left barriers for it. `WAITAOF` counts nothing while
+/// records are held, and answers once the second's sync has written them.
+#[test]
+fn waitaof_counts_no_record_the_disk_has_not_taken() {
+    let server = Server::start("tokio", "short-writes,aof-fsync-before-reply");
+    let mut c = server.conn();
+    assert!(c.cmd(&["CONFIG", "SET", "appendfsync", "always"]).ok());
+    // The reply's sync for x is held; z's barrier waits behind it.
+    send(&mut c, &["SET", "x", "1"]);
+    assert!(server.reached("aof-fsync-before-reply.1", LONG));
+    let mut z = server.conn();
+    send(&mut z, &["SET", "z", "1"]);
+    std::thread::sleep(Duration::from_millis(200));
+    let mut a = server.conn();
+    assert!(a.cmd(&["CONFIG", "SET", "appendfsync", "everysec"]).ok());
+    std::fs::write(server.dir.join("short-write.test"), b"").unwrap();
+    let mut y = server.conn();
+    send(&mut y, &["SET", "y", "1"]);
+    let deadline = Instant::now() + LONG;
+    while info_field(&mut a, "aof_last_write_status") != "err" {
+        assert!(Instant::now() < deadline, "y was not held");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // A WAITAOF from now waits for y.
+    let mut w = server.conn();
+    send(&mut w, &["WAITAOF", "1", "0", "20000"]);
+    server.release("aof-fsync-before-reply.1");
+    // The sync for z's barrier, held in turn.
+    assert!(server.reached("aof-fsync-before-reply.2", LONG));
+    server.release("aof-fsync-before-reply.2");
+    assert!(c.read().ok());
+    assert!(z.read().ok());
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !has_reply(&mut w),
+        "WAITAOF counted y, which is not in the file"
+    );
+    // Once the disk takes it, the second's sync writes it, and WAITAOF
+    // answers.
+    std::fs::remove_file(server.dir.join("short-write.test")).unwrap();
+    let started = Instant::now();
+    assert_eq!(w.read().arr()[0].i(), 1);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(y.read().ok());
+}
+
+/// A replica whose log cannot be written keeps applying its master's
+/// stream, and holds its records. A full sync replaces its dataset: what is
+/// held is of the dataset replaced, and is dropped; the rebase onto the new
+/// dataset turns the log over, and a restart loads the new dataset, not the
+/// old one's records over it.
+#[test]
+fn a_full_sync_drops_what_the_replicas_log_could_not_take() {
+    let first = Server::start("tokio", "");
+    let mut m = first.conn();
+    for i in 0..100 {
+        assert!(m.cmd(&["SET", &format!("a:{i}"), "1"]).ok());
+    }
+    let mut replica = Server::start("tokio", "short-writes");
+    let mut r = replica.conn();
+    let port = first.port.to_string();
+    assert!(r.cmd(&["REPLICAOF", "127.0.0.1", &port]).ok());
+    let until = |r: &mut Conn, keys: i64| {
+        let deadline = Instant::now() + LONG;
+        while r.cmd(&["DBSIZE"]).i() != keys {
+            assert!(
+                Instant::now() < deadline,
+                "the replica did not reach {keys} keys"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    until(&mut r, 100);
+    std::fs::write(replica.dir.join("short-write.test"), b"").unwrap();
+    for i in 0..50 {
+        assert!(m.cmd(&["SET", &format!("b:{i}"), "1"]).ok());
+    }
+    until(&mut r, 150);
+    let deadline = Instant::now() + LONG;
+    while info_field(&mut r, "aof_last_write_status") != "err" {
+        assert!(Instant::now() < deadline, "the replica's log did not fail");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Another master, another dataset: a full sync.
+    let second = Server::start("tokio", "");
+    let mut m2 = second.conn();
+    for i in 0..200 {
+        assert!(m2.cmd(&["SET", &format!("c:{i}"), "1"]).ok());
+    }
+    drop(first);
+    let port = second.port.to_string();
+    assert!(r.cmd(&["REPLICAOF", "127.0.0.1", &port]).ok());
+    let deadline = Instant::now() + LONG;
+    while r.cmd(&["EXISTS", "c:199"]).i() != 1 || r.cmd(&["DBSIZE"]).i() != 200 {
+        assert!(Instant::now() < deadline, "no full sync");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::remove_file(replica.dir.join("short-write.test")).unwrap();
+    for i in 0..10 {
+        assert!(m2.cmd(&["SET", &format!("d:{i}"), "1"]).ok());
+    }
+    until(&mut r, 210);
+    let deadline = Instant::now() + LONG;
+    while info_field(&mut r, "aof_last_write_status") != "ok" {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    drop((r, m2));
+    replica.kill();
+    drop(second);
+    let mut r = replica.restart();
+    assert_eq!(
+        r.cmd(&["EXISTS", "b:0"]).i(),
+        0,
+        "the replaced dataset's writes"
+    );
+    assert_eq!(r.cmd(&["EXISTS", "a:0"]).i(), 0, "the replaced dataset");
+    assert_eq!(r.cmd(&["DBSIZE"]).i(), 210);
+}
+
+/// An old log that ends in a record cut short, left by a checkpoint that
+/// did not finish, and then a save with the AOF off, which records the
+/// logs beside its dump: the next start with the AOF on finds the old log
+/// older than that dump and leaves it out (kept aside), without cutting it,
+/// and the start after that judges it the same way.
+#[test]
+fn a_torn_old_log_beside_a_dump_saved_with_the_aof_off_is_judged_the_same_twice() {
+    let mut server = Server::start("tokio", "dump-installing");
+    let mut c = server.conn();
+    fill_seq(&mut c, 0, 100);
+    assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+    assert!(server.reached("dump-installing.1", LONG));
+    fill_seq(&mut c, 100, 100);
+    durable(&mut c);
+    drop(c);
+    server.kill();
+    server.release("dump-installing.1");
+    // The old log cut short.
+    let prev = server.dir.join(OLD_LOG);
+    let len = std::fs::metadata(&prev).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&prev)
+        .unwrap()
+        .set_len(len - 5)
+        .unwrap();
+    // A run with the AOF off saves a dump beside the logs.
+    server.failpoints.clear();
+    server.aof = false;
+    let mut c = server.restart();
+    assert!(c.cmd(&["SET", "off", "1"]).ok());
+    assert!(c.cmd(&["SAVE"]).ok());
+    drop(c);
+    server.kill();
+    server.aof = true;
+    let prev_before = std::fs::read(&prev).ok();
+    let mut c = server.restart();
+    let first = (c.cmd(&["DBSIZE"]).i(), c.cmd(&["GET", "off"]));
+    assert_eq!(first.1.s(), "1");
+    let kept = kept_aside(&server.dir).len();
+    if let Some(before) = &prev_before
+        && server.dir.join(OLD_LOG).exists()
+    {
+        assert_eq!(
+            &std::fs::read(&prev).unwrap(),
+            before,
+            "the old log was cut"
+        );
+    }
+    drop(c);
+    server.kill();
+    let mut c = server.restart();
+    assert_eq!((c.cmd(&["DBSIZE"]).i(), c.cmd(&["GET", "off"])), first);
+    assert_eq!(kept_aside(&server.dir).len(), kept);
 }

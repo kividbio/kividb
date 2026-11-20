@@ -225,6 +225,11 @@ impl Final<'_> {
             // As in Redis, NOSAVE waits for the replicas too, but writes
             // nothing: the pause stays, to the exit.
             crate::aof::sync_for_shutdown();
+            // Records the disk would not take are in memory only: not a
+            // clean exit.
+            if crate::aof::lost_at_exit() {
+                std::process::exit(1);
+            }
             log_info!("SHUTDOWN NOSAVE — skipping snapshot. Goodbye.");
             return Ended::Exit;
         }
@@ -277,11 +282,21 @@ impl Final<'_> {
                 Ended::Exit
             }
             Err(e) => {
-                log_error!(
-                    "Final snapshot failed: {e}. Writes since the last successful save are not \
-                     in dump.kdb (they are in the AOF, if appendonly is on). Check free disk \
-                     space and write permission on the data directory"
-                );
+                if crate::aof::write_failing() {
+                    log_error!(
+                        "Final snapshot failed: {e}. Writes since the last successful save are \
+                         not in dump.kdb, and {} bytes of them could not be written to the AOF \
+                         either: they are in memory only. Check free disk space and write \
+                         permission on the data directory",
+                        crate::aof::unwritten_bytes()
+                    );
+                } else {
+                    log_error!(
+                        "Final snapshot failed: {e}. Writes since the last successful save are \
+                         not in dump.kdb (they are in the AOF, if appendonly is on). Check free \
+                         disk space and write permission on the data directory"
+                    );
+                }
                 if by_command {
                     // Not a clean exit, but there is none: the server runs
                     // on, and the gate opens.
@@ -293,6 +308,7 @@ impl Final<'_> {
                     // Not a clean exit: whatever restarts this node should
                     // know its last writes are not on disk.
                     crate::aof::sync_for_shutdown();
+                    crate::aof::lost_at_exit();
                     std::process::exit(1)
                 }
             }
@@ -308,6 +324,7 @@ impl Final<'_> {
             Ended::KeepRunning
         } else {
             crate::aof::sync_for_shutdown();
+            crate::aof::lost_at_exit();
             std::process::exit(1)
         }
     }

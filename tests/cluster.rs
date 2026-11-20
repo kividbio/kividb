@@ -8299,6 +8299,90 @@ fn a_transaction_that_reaches_its_gates_during_a_slot_handoff_is_refused() {
     );
 }
 
+/// A transaction waiting, off its thread, for a script running beside
+/// others (#882), while an atomic slot migration takes its keys' slot: it
+/// runs whole here before the handoff, or is sent on whole, and the
+/// destination has its two keys equal either way. The script is held 800 ms
+/// on a tag of a slot that stays (`KIVIDB_TEST_SCRIPT_STALL_MS`), and the
+/// destination's `TAKEOVER` waits 1.5 s, so the handoff holds writes
+/// while the transaction is dispatched again.
+#[cfg(feature = "lua")]
+#[test]
+fn a_transaction_waiting_for_a_script_during_a_slot_handoff_runs_whole_or_not_at_all() {
+    let (nodes, ranges) = form_cluster_of(vec![
+        Node::start_with_env(&[], &[("KIVIDB_TEST_SCRIPT_STALL_MS", "800")]),
+        Node::start_with_env(&[], &[("KIVIDB_TEST_TAKEOVER_DELAY_MS", "1500")]),
+    ]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let r = src.conn().cmd(&[
+        "CONFIG",
+        "SET",
+        "cluster-slot-migration-write-pause-timeout",
+        "10000",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let moving = key_in(0..=1000, "exec");
+    let (a, b) = (format!("{{{moving}}}:a"), format!("{{{moving}}}:b"));
+    let staying = key_in(1001..=ranges[0].1, "script");
+    let held = format!("{{{staying}}}:k");
+    let mut c = src.conn();
+    assert!(c.cmd(&["SET", &a, "5"]).is_ok());
+    assert!(c.cmd(&["SET", &b, "5"]).is_ok());
+    let sha = c
+        .cmd(&[
+            "SCRIPT",
+            "LOAD",
+            "redis.call('SET', KEYS[1], ARGV[1]) redis.call('ECHO', ARGV[2]) return 1",
+        ])
+        .text();
+    for _ in 0..3 {
+        assert_eq!(
+            c.cmd(&["EVALSHA", &sha, "1", &held, "warm", "no-stall"])
+                .int(),
+            1
+        );
+    }
+    let script = commands_in_background(
+        src.port,
+        &[&["EVALSHA", &sha, "1", &held, "held", "script-stall:1"]],
+    );
+    let stall = src.dir.join("script-stall.held");
+    wait_until("the script to be held", Duration::from_secs(10), || {
+        stall.exists()
+    });
+    let exec = commands_in_background(
+        src.port,
+        &[&["MULTI"], &["SET", &a, "6"], &["SET", &b, "6"], &["EXEC"]],
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    assert!(
+        stall.exists(),
+        "the script was not held while the import began"
+    );
+    assert_eq!(script.join().unwrap().int(), 1);
+    let reply = exec.join().unwrap();
+    wait_import_completed(dst, &task_id);
+    let mut d = dst.conn();
+    let (got_a, got_b) = (d.cmd(&["GET", &a]).text(), d.cmd(&["GET", &b]).text());
+    match reply.err() {
+        None => {
+            assert_eq!(reply.array().len(), 2, "{reply:?}");
+            assert_eq!((got_a.as_str(), got_b.as_str()), ("6", "6"));
+        }
+        Some(e) => {
+            assert!(
+                e.starts_with("MOVED") || e.starts_with("ASK") || e.starts_with("TRYAGAIN"),
+                "{e}"
+            );
+            assert_eq!((got_a.as_str(), got_b.as_str()), ("5", "5"));
+        }
+    }
+}
+
 /// A transaction that only reads is not refused during a handoff: it
 /// writes nothing the handoff could miss (#339).
 #[test]
@@ -14901,4 +14985,103 @@ fn coordinated_searches_beside_tagged_scripts_on_both_masters() {
             "a {what} waited {slowest:?}"
         );
     }
+}
+/// A query that names no dialect is read in the dialect of the node it was
+/// sent to, on every master: that node tells the others which (a master's own
+/// default could otherwise be another, and the page its part of the answer).
+#[test]
+fn a_query_is_read_in_the_dialect_of_the_node_asked_on_every_master() {
+    let (nodes, ranges) = form_cluster(3);
+    let owner = |key: &str| {
+        let slot = slot_of(key);
+        ranges
+            .iter()
+            .position(|(a, b)| (*a..=*b).contains(&slot))
+            .unwrap()
+    };
+    let r = nodes[0].conn().cmd(&[
+        "FT.CREATE",
+        "dd",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "dd:",
+        "SCHEMA",
+        "t",
+        "TEXT",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let mut on = [0usize; 3];
+    for i in 0..60u32 {
+        let key = format!("dd:{i}");
+        let node = owner(&key);
+        on[node] += 1;
+        // red apple / red cherry / apple: in dialect 1 `-apple red` is not
+        // (apple and red), in dialect 2 it is red without apple.
+        let text = ["red apple", "red cherry", "apple"][(i % 3) as usize];
+        let r = nodes[node].conn().cmd(&["HSET", &key, "t", text]);
+        assert!(matches!(r, Resp::Int(1)), "{r:?}");
+    }
+    assert!(on.iter().all(|n| *n > 5), "{on:?}");
+    let found = |c: &mut Conn, extra: &[&str]| -> Vec<String> {
+        let mut args = vec![
+            "FT.SEARCH",
+            "dd",
+            "-apple red",
+            "NOCONTENT",
+            "LIMIT",
+            "0",
+            "100",
+        ];
+        args.extend_from_slice(extra);
+        let reply = c.cmd(&args);
+        let mut keys: Vec<String> = reply.array()[1..]
+            .iter()
+            .filter_map(|r| match r {
+                Resp::Bulk(b) => Some(String::from_utf8_lossy(b).into_owned()),
+                _ => None,
+            })
+            .collect();
+        keys.sort();
+        keys
+    };
+    // Only the node asked has dialect 2 as its default.
+    assert!(
+        nodes[0]
+            .conn()
+            .cmd(&["CONFIG", "SET", "search-default-dialect", "2"])
+            .is_ok()
+    );
+    let second: Vec<String> = (0..60u32)
+        .filter(|i| i % 3 == 1)
+        .map(|i| format!("dd:{i}"))
+        .collect();
+    let mut first: Vec<String> = (0..60u32)
+        .filter(|i| i % 3 != 0)
+        .map(|i| format!("dd:{i}"))
+        .collect();
+    first.sort();
+    let mut second_sorted = second;
+    second_sorted.sort();
+    let mut c = nodes[0].conn();
+    assert_eq!(found(&mut c, &[]), second_sorted);
+    assert_eq!(found(&mut c, &["DIALECT", "2"]), second_sorted);
+    assert_eq!(found(&mut c, &["DIALECT", "1"]), first);
+    // And the aggregation, grouped.
+    let reply = c.cmd(&[
+        "FT.AGGREGATE",
+        "dd",
+        "-apple red",
+        "GROUPBY",
+        "0",
+        "REDUCE",
+        "COUNT",
+        "0",
+        "AS",
+        "n",
+    ]);
+    assert_eq!(reply.array()[1].array()[1].text(), "20", "{reply:?}");
+    // Another node, whose default is 1, reads it in 1.
+    assert_eq!(found(&mut nodes[1].conn(), &[]), first);
 }

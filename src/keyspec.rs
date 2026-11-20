@@ -323,9 +323,10 @@ fn find_option(cmd: &[&[u8]], from: usize, option: &[u8]) -> Option<usize> {
 
 /// How a command's keys are found. Each command [`COMMANDS`] names has
 /// one; any other has [`Shape::NoKeys`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Shape {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum Shape {
     /// Connection, server, pub/sub, cluster, index and multi-series
+    #[default]
     /// commands, and names that are no command.
     NoKeys,
     /// The first argument.
@@ -1061,12 +1062,26 @@ pub fn key_positions(name: &str, cmd: &[&[u8]]) -> Keys {
 /// its own it costs what `key_positions` does.
 #[inline(always)]
 pub fn regular_key_positions(name: &str, cmd: &[&[u8]]) -> Option<(usize, usize, usize)> {
+    regular_positions_of(shape(name.as_bytes()), cmd)
+}
+
+/// How the keys of the command named `name` are found: what
+/// [`regular_positions_of`] takes. For a table that is looked up anyway on
+/// the command path (`arity`), so that the look for tags need not look
+/// again (#889).
+pub(crate) fn shape_of(name: &str) -> Shape {
+    shape(name.as_bytes())
+}
+
+/// [`regular_key_positions`], for a command whose [`Shape`] is known.
+#[inline(always)]
+pub(crate) fn regular_positions_of(shape: Shape, cmd: &[&[u8]]) -> Option<(usize, usize, usize)> {
     const NO_KEYS: Option<(usize, usize, usize)> = Some((1, 0, 1));
     let len = cmd.len();
     if len < 2 {
         return NO_KEYS;
     }
-    match shape(name.as_bytes()) {
+    match shape {
         Shape::NoKeys => NO_KEYS,
         Shape::First => Some((1, 1, 1)),
         Shape::SourceAndDestination if len >= 3 => Some((1, 2, 1)),
