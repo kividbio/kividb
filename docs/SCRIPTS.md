@@ -17,6 +17,27 @@ Lua: the `lua` and `full` variants.
   `busy-reply-threshold`) is not stopped, but every other client is told
   `BUSY` until it ends. `SCRIPT KILL` (or `FUNCTION KILL`) stops it if it
   has not written anything; otherwise only `SHUTDOWN NOSAVE` does.
+- **On a cluster, a script's commands use keys of its own slot**, the slot
+  of its first key in `KEYS` (or of the first key it uses, with none),
+  that this node serves, as in Redis: a command on keys of another slot
+  fails with `ERR Script attempted to access keys that do not hash to the
+  same slot`, unless the script has the flag `allow-cross-slot-keys`.
+- **While its slot is being moved, a script's command on a key it did not
+  declare is routed as a client's command would be.** With the slot
+  `MIGRATING` away from this node or `IMPORTING` into it (`CLUSTER
+  SETSLOT`), a command that a client would be sent elsewhere for (`-ASK`,
+  `-MOVED`) or asked to retry (`-TRYAGAIN`) fails in the script with
+  `ERR Script attempted to access a non local key in a cluster node`, as
+  in Redis: on the node migrating the slot, a key that has left already,
+  or that does not exist; on the node importing it (the script sent with
+  `ASKING`), a command over several keys of which some have not arrived
+  yet. A write to an undeclared key that a `MIGRATE` is moving at that
+  moment fails with `TRYAGAIN a key of the script's command is being
+  migrated`. The keys in `KEYS` are not affected: they were routed with
+  the script, and the script may read, delete and make them again while
+  the slot moves. A script that fails part way has run the commands
+  before the one that failed, and their writes stay, as in Redis: declare
+  every key a script uses in `KEYS` and it never fails this way.
 
 ## Lua 5.4, and how it differs from Redis's Lua 5.1
 

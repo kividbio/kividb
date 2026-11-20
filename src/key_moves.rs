@@ -109,6 +109,13 @@ pub fn names_a_moving_key(db: usize, name: &str, cmd: &[&[u8]]) -> bool {
     !keys.is_empty() && names_one(&MOVING.lock(), db, &keys)
 }
 
+/// Whether one of `keys`, in database `db`, is a key a `MIGRATE` is moving.
+#[cold]
+#[inline(never)]
+pub fn one_is_moving(db: usize, keys: &[&[u8]]) -> bool {
+    !keys.is_empty() && names_one(&MOVING.lock(), db, keys)
+}
+
 /// Whether a command of the transaction `queue`, in database `db`, names a
 /// key that a `MIGRATE` is moving.
 #[cold]
