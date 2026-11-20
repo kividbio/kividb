@@ -1622,6 +1622,23 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                      - argument must be between 2 and 4294967295 inclusive",
                 )),
             },
+            // The dialect a query that names none is read in: `FT.CONFIG`'s
+            // `DEFAULT_DIALECT` under Redis 8's name.
+            "search-default-dialect" => match value.parse::<u64>() {
+                Ok(n)
+                    if (1..=4).contains(&n)
+                        && crate::commands::search_tools::set_config(
+                            "DEFAULT_DIALECT",
+                            &n.to_string(),
+                        ) =>
+                {
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'search-default-dialect') \
+                     - argument must be between 1 and 4 inclusive",
+                )),
+            },
             "search-on-timeout" => {
                 let policy = value.to_ascii_lowercase();
                 if matches!(
@@ -2469,6 +2486,10 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         (
             "search-on-timeout",
             crate::commands::search_tools::config_value("ON_TIMEOUT").to_ascii_lowercase(),
+        ),
+        (
+            "search-default-dialect",
+            crate::commands::search_tools::config_value("DEFAULT_DIALECT"),
         ),
         (
             "search-min-stem-len",

@@ -586,6 +586,28 @@ pub fn fan_out(ctx: &crate::commands::ctx::Ctx, cmd: &[Vec<u8>]) -> Result<Vec<R
 /// ignores it, and answers in the shape it always did.
 const TIMEOUT_FLAG_PARAM: &[u8] = b"__kividb_timeout_flag";
 const SCORES_MATTER_PARAM: &[u8] = b"__kividb_scores_matter";
+/// A coordinator that holds numbers as numbers (see `aggregate_pipeline::
+/// number_value`) tells the masters it can take them as they are held; a
+/// master that was not told sends their text, as an earlier version did.
+const HELD_NUMBERS_PARAM: &[u8] = b"__kividb_held_numbers";
+
+pub fn ask_for_held_numbers(cmd: &mut Vec<Vec<u8>>) {
+    cmd.extend([
+        b"PARAMS".to_vec(),
+        b"2".to_vec(),
+        HELD_NUMBERS_PARAM.to_vec(),
+        b"1".to_vec(),
+    ]);
+}
+
+pub fn wants_held_numbers(cmd: &[&[u8]]) -> bool {
+    cmd.windows(4).any(|w| {
+        w[0].eq_ignore_ascii_case(b"PARAMS")
+            && w[1] == b"2"
+            && w[2] == HELD_NUMBERS_PARAM
+            && w[3] == b"1"
+    })
+}
 
 pub fn ask_for_scores_matter(cmd: &mut Vec<Vec<u8>>, matters: bool) {
     cmd.extend([
@@ -678,14 +700,25 @@ pub fn decode_search(reply: Reply) -> Result<(Reply, bool), String> {
 /// The rows of an aggregation, as a master sends them to its coordinator:
 /// every column of every row, then, if the coordinator asked for it (see
 /// [`ask_for_timeout_flag`]), whether that master's scan ran out of time.
-pub fn encode_rows(rows: &[ahash::AHashMap<String, String>], timed_out: Option<bool>) -> Vec<u8> {
+pub fn encode_rows(
+    rows: &[ahash::AHashMap<String, String>],
+    timed_out: Option<bool>,
+    held_numbers: bool,
+) -> Vec<u8> {
     use crate::resp::write::{resp_array, resp_bulk_str, resp_integer};
     let body = resp_array(
         rows.iter()
             .map(|row| {
                 resp_array(
                     row.iter()
-                        .flat_map(|(k, v)| [resp_bulk_str(k), resp_bulk_str(v)])
+                        .flat_map(|(k, v)| {
+                            let value = if held_numbers {
+                                std::borrow::Cow::Borrowed(v.as_str())
+                            } else {
+                                crate::commands::aggregate_pipeline::text_of(v)
+                            };
+                            [resp_bulk_str(k), resp_bulk_str(&value)]
+                        })
                         .collect(),
                 )
             })
@@ -877,11 +910,12 @@ mod tests {
         row.insert("__key".to_string(), "doc:1".to_string());
         row.insert("price".to_string(), "10".to_string());
         let (back, timed_out) =
-            decode_rows(parse_reply(&encode_rows(&[row.clone()], Some(false))).unwrap());
+            decode_rows(parse_reply(&encode_rows(&[row.clone()], Some(false), true)).unwrap());
         assert_eq!(back, vec![row.clone()]);
         assert!(!timed_out);
 
-        let (empty, timed_out) = decode_rows(parse_reply(&encode_rows(&[], Some(true))).unwrap());
+        let (empty, timed_out) =
+            decode_rows(parse_reply(&encode_rows(&[], Some(true), true)).unwrap());
         assert!(empty.is_empty());
         assert!(timed_out);
 
@@ -930,11 +964,12 @@ mod tests {
         let mut row = ahash::AHashMap::new();
         row.insert("__key".to_string(), "doc:1".to_string());
         for rows in [vec![], vec![row.clone()], vec![row.clone(), row.clone()]] {
-            let (back, timed_out) = decode_rows(parse_reply(&encode_rows(&rows, None)).unwrap());
+            let (back, timed_out) =
+                decode_rows(parse_reply(&encode_rows(&rows, None, true)).unwrap());
             assert_eq!(back, rows);
             assert!(!timed_out);
             let (back, timed_out) =
-                decode_rows(parse_reply(&encode_rows(&rows, Some(true))).unwrap());
+                decode_rows(parse_reply(&encode_rows(&rows, Some(true), true)).unwrap());
             assert_eq!(back, rows);
             assert!(timed_out);
         }
@@ -957,6 +992,37 @@ mod tests {
         assert!(!asks(&cmd));
         ask_for_timeout_flag(&mut cmd);
         assert!(asks(&cmd));
+    }
+
+    /// A master sends a number as it is held only to a coordinator that
+    /// asked: another (an earlier version, which takes a value for text) is
+    /// sent the text Redis writes.
+    #[test]
+    fn numbers_are_held_only_for_a_coordinator_that_asks() {
+        use crate::commands::aggregate_pipeline::number_value;
+        let held = number_value(2.0 / 3.0);
+        let row: ahash::AHashMap<String, String> = [
+            ("n".to_string(), held.clone()),
+            ("t".to_string(), "text".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let (asked, _) =
+            decode_rows(parse_reply(&encode_rows(std::slice::from_ref(&row), None, true)).unwrap());
+        assert_eq!(asked, vec![row.clone()]);
+        let (plain, _) = decode_rows(parse_reply(&encode_rows(&[row], None, false)).unwrap());
+        assert_eq!(plain[0]["n"], "0.666666666667");
+        assert_eq!(plain[0]["t"], "text");
+
+        let mut cmd: Vec<Vec<u8>> = vec![b"FT.AGGREGATE".to_vec(), b"idx".to_vec(), b"*".to_vec()];
+        let wants = |cmd: &[Vec<u8>]| {
+            let parts: Vec<&[u8]> = cmd.iter().map(Vec::as_slice).collect();
+            wants_held_numbers(&parts)
+        };
+        assert!(!wants(&cmd));
+        ask_for_held_numbers(&mut cmd);
+        ask_for_timeout_flag(&mut cmd);
+        assert!(wants(&cmd));
     }
 
     #[test]

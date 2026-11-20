@@ -14986,3 +14986,102 @@ fn coordinated_searches_beside_tagged_scripts_on_both_masters() {
         );
     }
 }
+/// A query that names no dialect is read in the dialect of the node it was
+/// sent to, on every master: that node tells the others which (a master's own
+/// default could otherwise be another, and the page its part of the answer).
+#[test]
+fn a_query_is_read_in_the_dialect_of_the_node_asked_on_every_master() {
+    let (nodes, ranges) = form_cluster(3);
+    let owner = |key: &str| {
+        let slot = slot_of(key);
+        ranges
+            .iter()
+            .position(|(a, b)| (*a..=*b).contains(&slot))
+            .unwrap()
+    };
+    let r = nodes[0].conn().cmd(&[
+        "FT.CREATE",
+        "dd",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "dd:",
+        "SCHEMA",
+        "t",
+        "TEXT",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let mut on = [0usize; 3];
+    for i in 0..60u32 {
+        let key = format!("dd:{i}");
+        let node = owner(&key);
+        on[node] += 1;
+        // red apple / red cherry / apple: in dialect 1 `-apple red` is not
+        // (apple and red), in dialect 2 it is red without apple.
+        let text = ["red apple", "red cherry", "apple"][(i % 3) as usize];
+        let r = nodes[node].conn().cmd(&["HSET", &key, "t", text]);
+        assert!(matches!(r, Resp::Int(1)), "{r:?}");
+    }
+    assert!(on.iter().all(|n| *n > 5), "{on:?}");
+    let found = |c: &mut Conn, extra: &[&str]| -> Vec<String> {
+        let mut args = vec![
+            "FT.SEARCH",
+            "dd",
+            "-apple red",
+            "NOCONTENT",
+            "LIMIT",
+            "0",
+            "100",
+        ];
+        args.extend_from_slice(extra);
+        let reply = c.cmd(&args);
+        let mut keys: Vec<String> = reply.array()[1..]
+            .iter()
+            .filter_map(|r| match r {
+                Resp::Bulk(b) => Some(String::from_utf8_lossy(b).into_owned()),
+                _ => None,
+            })
+            .collect();
+        keys.sort();
+        keys
+    };
+    // Only the node asked has dialect 2 as its default.
+    assert!(
+        nodes[0]
+            .conn()
+            .cmd(&["CONFIG", "SET", "search-default-dialect", "2"])
+            .is_ok()
+    );
+    let second: Vec<String> = (0..60u32)
+        .filter(|i| i % 3 == 1)
+        .map(|i| format!("dd:{i}"))
+        .collect();
+    let mut first: Vec<String> = (0..60u32)
+        .filter(|i| i % 3 != 0)
+        .map(|i| format!("dd:{i}"))
+        .collect();
+    first.sort();
+    let mut second_sorted = second;
+    second_sorted.sort();
+    let mut c = nodes[0].conn();
+    assert_eq!(found(&mut c, &[]), second_sorted);
+    assert_eq!(found(&mut c, &["DIALECT", "2"]), second_sorted);
+    assert_eq!(found(&mut c, &["DIALECT", "1"]), first);
+    // And the aggregation, grouped.
+    let reply = c.cmd(&[
+        "FT.AGGREGATE",
+        "dd",
+        "-apple red",
+        "GROUPBY",
+        "0",
+        "REDUCE",
+        "COUNT",
+        "0",
+        "AS",
+        "n",
+    ]);
+    assert_eq!(reply.array()[1].array()[1].text(), "20", "{reply:?}");
+    // Another node, whose default is 1, reads it in 1.
+    assert_eq!(found(&mut nodes[1].conn(), &[]), first);
+}

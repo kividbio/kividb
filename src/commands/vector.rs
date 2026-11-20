@@ -665,6 +665,13 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut options = crate::vector::filter::QueryOptions {
         verbatim: option("VERBATIM").is_some(),
         language: None,
+        dialect: crate::commands::search_tools::dialect_or_default(
+            option("DIALECT")
+                .and_then(value_of)
+                .and_then(|n| n.parse::<u8>().ok())
+                .filter(|n| (1..=4).contains(n))
+                .unwrap_or(0),
+        ),
     };
     if let Some(at) = option("LANGUAGE") {
         match value_of(at).and_then(crate::vector::stem::Language::parse) {
@@ -753,6 +760,23 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // scores, which are of the rows; not in a cluster, whose masters send
     // their rows to be grouped together; not for JSON, whose rows name
     // fields by their schema's attribute.
+    //
+    // The NUMERIC fields of the index, by the name a row gives them: their
+    // values are numbers in a row (see `aggregate_pipeline::number_value`).
+    // A group by one, or a count of its distinct values, is by the number
+    // (1.50 is 1.5): the stream is told which fields they are.
+    let numeric: ahash::AHashSet<String> = def
+        .fields
+        .iter()
+        .filter(|f| matches!(f.field_type, FieldType::Numeric))
+        .map(|f| {
+            if json {
+                f.attribute().to_string()
+            } else {
+                f.name.clone()
+            }
+        })
+        .collect();
     let mut stream = if knn.is_none()
         && !addscores
         && !json
@@ -760,6 +784,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         && !crate::cluster::search::coordinates(ctx)
     {
         crate::commands::aggregate_pipeline::StreamGroups::plan(cmd, 3)
+            .map(|stream| stream.with_numeric(&numeric))
     } else {
         None
     };
@@ -792,13 +817,16 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             }
             row.insert(
                 "__score".to_string(),
-                crate::commands::search::number_text(score),
+                crate::commands::aggregate_pipeline::number_value(score),
             );
         }
 
         // Always include the key itself as a special field.
         // Prefixed with __ so it doesn't collide with user field names.
-        row.insert("__key".to_string(), key.to_string());
+        row.insert(
+            "__key".to_string(),
+            crate::commands::aggregate_pipeline::escaped(key).into_owned(),
+        );
         if let Some(knn) = &knn
             && watching
             && !json
@@ -818,7 +846,19 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 Some(f) => f.attribute().to_string(),
                 None => field.to_string(),
             };
-            row.insert(shown, s.to_string());
+            // A NUMERIC field's value is a number in the row, and written
+            // as Redis writes one.
+            if !numeric.is_empty()
+                && numeric.contains(&shown)
+                && let Ok(x) = s.trim().parse::<f64>()
+            {
+                row.insert(shown, crate::commands::aggregate_pipeline::number_value(x));
+                continue;
+            }
+            row.insert(
+                shown,
+                crate::commands::aggregate_pipeline::escaped(s).into_owned(),
+            );
         }
 
         rows.push(row);
@@ -898,7 +938,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let (_, distance) = rank[&row["__key"]];
             row.insert(
                 knn.alias.clone(),
-                crate::commands::search::distance_text(distance),
+                crate::commands::aggregate_pipeline::number_value(f64::from(distance)),
             );
         }
         rows.sort_by_key(|row| rank[&row["__key"]].0);
@@ -911,10 +951,20 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // other master too, before any step, then `ON_TIMEOUT`.
     if crate::cluster::search::is_forwarded(ctx) {
         let flag = crate::cluster::search::wants_timeout_flag(cmd).then_some(timed_out);
-        return Some(crate::cluster::search::encode_rows(&rows, flag));
+        return Some(crate::cluster::search::encode_rows(
+            &rows,
+            flag,
+            crate::cluster::search::wants_held_numbers(cmd),
+        ));
     }
     if crate::cluster::search::coordinates(ctx) {
         let mut owned: Vec<Vec<u8>> = cmd.iter().map(|a| a.to_vec()).collect();
+        // Every master reads the query in the dialect this node does.
+        if option("DIALECT").is_none() {
+            owned.push(b"DIALECT".to_vec());
+            owned.push(options.dialect.to_string().into_bytes());
+        }
+        crate::cluster::search::ask_for_held_numbers(&mut owned);
         crate::cluster::search::ask_for_timeout_flag(&mut owned);
         match crate::cluster::search::fan_out(ctx, &owned) {
             Ok(replies) => {
@@ -930,7 +980,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         if let Some(knn) = &knn {
             let distance = |row: &Row| {
                 row.get(&knn.alias)
-                    .and_then(|d| d.parse::<f64>().ok())
+                    .and_then(|d| crate::commands::aggregate_pipeline::as_number(d))
                     .unwrap_or(f64::INFINITY)
             };
             rows.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
@@ -991,6 +1041,9 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let count = |i: usize| -> usize { word(i).parse::<usize>().unwrap_or(0) };
     let mut everything = false;
     let mut grouped = false;
+    // After a GROUPBY, the order of a group's columns: the properties it
+    // groups by, its reducers' names, then what APPLY made after it.
+    let mut group_order: Vec<String> = Vec::new();
     // (the row's field, the name to show it under). `ADDSCORES` shows the
     // score first in every row, whatever else is asked for, as Redis does:
     // it showed only when a `SORTBY` or `LOAD` named it, and a plain
@@ -1023,6 +1076,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             }
             "GROUPBY" => {
                 grouped = true;
+                group_order = crate::commands::aggregate_pipeline::group_columns(cmd, i);
                 i += 1;
             }
             "APPLY" => {
@@ -1033,6 +1087,9 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
                         .map(|a| String::from_utf8_lossy(a).into_owned())
                         .unwrap_or_default()
                 };
+                if grouped {
+                    group_order.push(label.clone());
+                }
                 shown.push((label.clone(), label));
                 i += 2;
             }
@@ -1061,7 +1118,10 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 }
                 let mut fields: Vec<(&String, &String)> =
                     row.iter().filter(|(k, _)| !k.starts_with("__")).collect();
-                fields.sort();
+                fields.sort_by_key(|(k, _)| {
+                    let at = group_order.iter().position(|c| c == *k);
+                    (at.unwrap_or(usize::MAX), (*k).clone())
+                });
                 for (k, v) in fields {
                     pairs.push((k.clone(), v.clone()));
                 }
@@ -1103,20 +1163,6 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         timed_out,
     ))
 }
-// ── format_f64 ────────────────────────────────────────────────────────────────
-//
-// Format a float for aggregate output.
-// Integers display without decimal point; floats show up to 6 sig digits.
-// This matches Redis's behaviour for numeric aggregate results.
-
-pub(crate) fn format_f64(v: f64) -> String {
-    if v.fract() == 0.0 && v.abs() < 1e15 {
-        format!("{}", v as i64)
-    } else {
-        format!("{:.6}", v)
-    }
-}
-
 // ── FT.TAGVALS ────────────────────────────────────────────────────────────────
 //
 // FT.TAGVALS index field_name

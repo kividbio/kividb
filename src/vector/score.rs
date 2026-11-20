@@ -92,12 +92,14 @@ fn bm25std(idf: f64, f: f64, len: u32, avgdl: f64) -> f64 {
     };
     idf * f * f64::from(k1 + 1.0) / (f + f64::from(k1) * (f64::from(1.0f32 - b) + norm))
 }
-/// RediSearch's older BM25's saturation, `f / (f + k1 (1 - b + b avgdl))`
-/// with `b` 0.5 and no document length, in its `float`s.
-fn bm25_legacy(f: f64, avgdl: f64) -> f64 {
+/// RediSearch's older BM25 of a term of weight `idf`: `idf f / (f + k1 (1 -
+/// b + b avgdl))`, with `b` 0.5 and no document length, in its `float`s. The
+/// weight is multiplied in before the division: that is where the last digit
+/// of a score is.
+fn bm25_legacy(idf: f64, f: f64, avgdl: f64) -> f64 {
     let k1 = 1.2f32;
     let b = 0.5f32;
-    f / (f + f64::from(k1) * (f64::from(1.0f32 - b) + f64::from(b) * avgdl))
+    idf * f / (f + f64::from(k1) * (f64::from(1.0f32 - b) + f64::from(b) * avgdl))
 }
 
 /// What an occurrence of a stem counts, of the field's weight.
@@ -151,7 +153,17 @@ impl DocTerms {
     /// word and a stem there count. With `max_freq`, the frequency of its
     /// most frequent term, whichever it is (TFIDF's norm); otherwise of its
     /// most frequent wanted one.
-    fn read(units: &[(u32, u32)], entry: &[u32], wanted: &Bits, max_freq: bool) -> Self {
+    ///
+    /// With `nofreqs` (`NOFREQS`), a term in the document counts once, however
+    /// often it is in it. The most frequent term's frequency, of the TFIDF
+    /// norm, is still the real one.
+    fn read(
+        units: &[(u32, u32)],
+        entry: &[u32],
+        wanted: &Bits,
+        max_freq: bool,
+        nofreqs: bool,
+    ) -> Self {
         let mut doc = DocTerms::default();
         let mut pos = 0u32;
         // (term, position, frequency, field bit), in the document's order.
@@ -163,7 +175,11 @@ impl DocTerms {
             let bit = 1u64 << u32::from(field).min(63);
             for &raw in tokens {
                 let token = Token(raw);
-                let freq = if token.is_stem() {
+                let freq = if token.is_phonetic() {
+                    // A phonetic code counts as a word does (its field's weight),
+                    // in no position and no length.
+                    unit
+                } else if token.is_stem() {
                     stem_unit
                 } else {
                     pos += 1;
@@ -186,7 +202,7 @@ impl DocTerms {
                 doc.terms.push((id, Stat::default()));
             }
             if let Some((_, stat)) = doc.terms.last_mut() {
-                stat.freq += freq;
+                stat.freq = if nofreqs { 1 } else { stat.freq + freq };
                 stat.fields |= bit;
                 stat.offsets.push(pos);
             }
@@ -264,7 +280,7 @@ pub fn is_expansion(filter: &Filter) -> bool {
         Filter::Or(_, right) => matches!(
             &**right,
             Filter::Text {
-                term: TextMatch::Stem(..) | TextMatch::Expanded(..),
+                term: TextMatch::Stem(..) | TextMatch::Expanded(..) | TextMatch::Phonetic(..),
                 ..
             }
         ),
@@ -326,6 +342,8 @@ pub struct Scoring<'q> {
     /// match.
     wanted: Bits,
     tanh_factor: f64,
+    /// The index was made with `NOFREQS`.
+    nofreqs: bool,
 }
 
 impl<'q> Scoring<'q> {
@@ -410,6 +428,7 @@ impl<'q> Scoring<'q> {
             tag_df,
             wanted,
             tanh_factor,
+            nofreqs: def.nofreqs,
         }
     }
 
@@ -488,6 +507,7 @@ impl<'q> Scoring<'q> {
             entry,
             &self.wanted,
             self.scorer == Scorer::Tfidf,
+            self.nofreqs,
         );
         let Some(res) = self.node(def, &postings, &text, self.filter, &terms, doc) else {
             return 0.0;
@@ -527,7 +547,7 @@ impl<'q> Scoring<'q> {
             Scorer::Bm25Std | Scorer::Bm25StdTanh => {
                 bm25std(idf_bm25(self.n, df), f, len, self.avgdl)
             }
-            Scorer::Bm25 => idf_tfidf(self.n, df) * bm25_legacy(f, self.avgdl),
+            Scorer::Bm25 => bm25_legacy(idf_tfidf(self.n, df), f, self.avgdl),
             Scorer::Tfidf | Scorer::TfidfDocNorm => f * idf_tfidf(self.n, df),
             Scorer::DisMax => f,
             Scorer::DocScore | Scorer::Hamming => 0.0,
@@ -543,7 +563,7 @@ impl<'q> Scoring<'q> {
         let f = f64::from(freq);
         match self.scorer {
             Scorer::Bm25Std | Scorer::Bm25StdTanh => bm25std(1.0, f, len, self.avgdl),
-            Scorer::Bm25 => bm25_legacy(f, self.avgdl),
+            Scorer::Bm25 => bm25_legacy(1.0, f, self.avgdl),
             Scorer::Tfidf | Scorer::TfidfDocNorm | Scorer::DisMax => f,
             Scorer::DocScore | Scorer::Hamming => 0.0,
         }
@@ -552,7 +572,7 @@ impl<'q> Scoring<'q> {
     /// A NUMERIC (or vector range) clause that matched.
     fn numeric_value(&self) -> f64 {
         match self.scorer {
-            Scorer::Bm25 => bm25_legacy(1.0, self.avgdl),
+            Scorer::Bm25 => bm25_legacy(1.0, 1.0, self.avgdl),
             Scorer::Tfidf | Scorer::TfidfDocNorm | Scorer::DisMax => 1.0,
             _ => 0.0,
         }
@@ -618,7 +638,9 @@ impl<'q> Scoring<'q> {
                     Some(self.word(text, id, Some(df), stat, doc.len))
                 };
                 match term {
-                    TextMatch::Exact(word) | TextMatch::Expanded(word) => present(word),
+                    TextMatch::Exact(word)
+                    | TextMatch::Expanded(word)
+                    | TextMatch::Phonetic(word) => present(word),
                     TextMatch::Stem(stem) => present(&format!("{STEM_PREFIX}{}", stem.stem)),
                     other => {
                         // RediSearch's union of the words a pattern expands
@@ -706,10 +728,23 @@ impl<'q> Scoring<'q> {
                 None if super::filter::eval(inner, fields) => None,
                 None => Some(Res::leaf(Kind::Virtual, 0.0, Vec::new())),
             },
-            Filter::Optional(inner) => Some(
-                self.node(def, postings, text, inner, doc, fields)
-                    .unwrap_or_else(|| Res::leaf(Kind::Virtual, 0.0, Vec::new())),
-            ),
+            Filter::Optional(inner) => {
+                let found = self.node(def, postings, text, inner, doc, fields);
+                Some(match found {
+                    // An optional that found nothing, as the optional around
+                    // it sees it, is a hit of a word that is not there, of
+                    // frequency 1: `~~a b` scores every document.
+                    Some(res)
+                        if matches!(**inner, Filter::Optional(_))
+                            && res.kind == Kind::Virtual
+                            && res.value == 0.0 =>
+                    {
+                        Res::leaf(Kind::Virtual, self.virtual_value(1, doc.len), Vec::new())
+                    }
+                    Some(res) => res,
+                    None => Res::leaf(Kind::Virtual, 0.0, Vec::new()),
+                })
+            }
             Filter::And(..) | Filter::Or(..) => {
                 let and = matches!(filter, Filter::And(..));
                 let mut parts = Vec::new();
@@ -734,7 +769,7 @@ impl<'q> Scoring<'q> {
 fn named_terms(filter: &Filter, words: &mut Vec<String>, tags: &mut Vec<(String, String)>) -> bool {
     match filter {
         Filter::Text { term, .. } => match term {
-            TextMatch::Exact(w) | TextMatch::Expanded(w) => {
+            TextMatch::Exact(w) | TextMatch::Expanded(w) | TextMatch::Phonetic(w) => {
                 words.push(w.clone());
                 false
             }
@@ -767,7 +802,10 @@ fn pattern_terms<'f>(filter: &'f Filter, out: &mut Vec<&'f TextMatch>) {
         Filter::Text { term, .. } => {
             if !matches!(
                 term,
-                TextMatch::Exact(_) | TextMatch::Expanded(_) | TextMatch::Stem(_)
+                TextMatch::Exact(_)
+                    | TextMatch::Expanded(_)
+                    | TextMatch::Phonetic(_)
+                    | TextMatch::Stem(_)
             ) {
                 out.push(term);
             }
@@ -883,6 +921,7 @@ mod tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def();
         for (i, words) in [

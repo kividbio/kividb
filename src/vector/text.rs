@@ -39,7 +39,10 @@ const STEM_PREFIX: char = super::stem::STEM_PREFIX;
 const FIELD_MARK: u32 = 1 << 31;
 /// In a document's entry: the term is a stem.
 const STEM_BIT: u32 = 1 << 30;
-const TERM_MASK: u32 = STEM_BIT - 1;
+/// In a document's entry: the term is a phonetic code (`<JN`), counted
+/// as a stem is: no word of the document, no part of its length.
+const PHONETIC_BIT: u32 = 1 << 29;
+const TERM_MASK: u32 = PHONETIC_BIT - 1;
 
 /// A term of a document's entry: its id, and whether it is a stem.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +57,18 @@ impl Token {
     #[inline]
     pub fn is_stem(self) -> bool {
         self.0 & STEM_BIT != 0
+    }
+
+    /// A phonetic code (`<JN`).
+    #[inline]
+    pub fn is_phonetic(self) -> bool {
+        self.0 & PHONETIC_BIT != 0
+    }
+
+    /// A stem or a phonetic code: not a word of the document.
+    #[inline]
+    pub fn is_synthetic(self) -> bool {
+        self.0 & (STEM_BIT | PHONETIC_BIT) != 0
     }
 }
 
@@ -294,7 +309,8 @@ struct Term {
 
 impl Term {
     fn is_stem(&self) -> bool {
-        self.text.starts_with(STEM_PREFIX)
+        self.text
+            .starts_with([STEM_PREFIX, super::phonetic::PHONETIC_PREFIX])
     }
 }
 
@@ -409,7 +425,7 @@ impl TextIndex {
                 terms
                     .iter()
                     .map(|&t| Token(t))
-                    .filter(|t| !t.is_stem())
+                    .filter(|t| !t.is_synthetic())
                     .map(|t| self.text(t.term()).to_string())
                     .collect()
             })
@@ -523,6 +539,8 @@ impl TextIndex {
                     let id = self.intern(t);
                     if t.starts_with(STEM_PREFIX) {
                         id | STEM_BIT
+                    } else if t.starts_with(super::phonetic::PHONETIC_PREFIX) {
+                        id | PHONETIC_BIT
                     } else {
                         id
                     }
@@ -553,7 +571,7 @@ impl TextIndex {
         let length = |entry: &[u32]| -> usize {
             fields(entry)
                 .map(|(f, terms)| {
-                    terms.iter().filter(|&&t| !Token(t).is_stem()).count() * unit(f) as usize
+                    terms.iter().filter(|&&t| !Token(t).is_synthetic()).count() * unit(f) as usize
                 })
                 .sum()
         };

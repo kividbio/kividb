@@ -1,6 +1,7 @@
 pub mod backlog;
 pub mod doc_keys;
 pub mod filter;
+pub mod phonetic;
 pub mod postings;
 pub mod quant;
 pub mod score;
@@ -400,6 +401,9 @@ impl IndexDef {
             a.push("SCORE_FIELD".into());
             a.push(field.clone());
         }
+        if self.nofreqs {
+            a.push("NOFREQS".into());
+        }
         a.push("SCHEMA".into());
         for field in &self.fields {
             a.push(field.name.clone());
@@ -673,6 +677,9 @@ pub struct IndexDef {
     /// `SCORE_FIELD`: the document field whose number multiplies its
     /// relevance. A document without it scores [`IndexDef::default_score`].
     pub score_field: Option<String>,
+    /// `NOFREQS`: a word counts once in a document however often it is in it,
+    /// when relevance is worked out. What the TEXT index holds is unchanged.
+    pub nofreqs: bool,
     /// With `LANGUAGE_FIELD`: the documents whose words were stemmed in a
     /// language other than the index's, and that language. For a write of
     /// some fields of a hash that leaves its language field as it was.
@@ -778,7 +785,7 @@ impl IndexDef {
     fn text_write(
         &self,
         mut changes: Vec<(u16, Vec<String>)>,
-        restemmed: Vec<(u16, bool)>,
+        restemmed: Vec<(u16, bool, bool)>,
         language: stem::Language,
     ) -> Option<postings::WithId> {
         if changes.is_empty() && restemmed.is_empty() {
@@ -788,8 +795,8 @@ impl IndexDef {
         let units = self.text_units();
         Some(Box::new(move |doc| {
             let mut text = text.write();
-            for (number, stems) in restemmed {
-                if let Some(tokens) = restem(&text, doc, number, stems, language) {
+            for (number, stems, phonetic) in restemmed {
+                if let Some(tokens) = restem(&text, doc, number, stems, phonetic, language) {
                     changes.push((number, tokens));
                 }
             }
@@ -1175,6 +1182,7 @@ pub fn set_alias(store: &mut AHashMap<String, IndexDef>, alias: &str, index: &In
         language: Default::default(),
         default_score: 1.0,
         score_field: None,
+        nofreqs: false,
     }
     .into_def();
     store.insert(alias.to_string(), marker);
@@ -1235,6 +1243,8 @@ pub struct IndexSchema {
     pub default_score: f64,
     /// See [`IndexDef::score_field`].
     pub score_field: Option<String>,
+    /// See [`IndexDef::nofreqs`].
+    pub nofreqs: bool,
 }
 
 impl IndexSchema {
@@ -1266,6 +1276,7 @@ impl IndexSchema {
             language: self.language,
             default_score: self.default_score,
             score_field: self.score_field,
+            nofreqs: self.nofreqs,
             doc_languages: Arc::new(RwLock::new(AHashMap::new())),
             text: Arc::new(RwLock::new(text::TextIndex::new())),
             postings,
@@ -1409,6 +1420,7 @@ pub fn rebuild_indexes(index_store: &IndexStore, store: &crate::store::Store) {
                 language: def.language.clone(),
                 default_score: def.default_score,
                 score_field: def.score_field.clone(),
+                nofreqs: def.nofreqs,
             }
             .into_def();
             indexes.insert(name, fresh.clone());
@@ -2541,7 +2553,7 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
     // stopwords left out, with their stems (see `IndexDef::write_text`).
     // Read before any lock is taken.
     let mut changes: Vec<(u16, Vec<String>)> = Vec::new();
-    let mut restemmed: Vec<(u16, bool)> = Vec::new();
+    let mut restemmed: Vec<(u16, bool, bool)> = Vec::new();
     let mut language = def.language.language;
     if def.text_fields().next().is_some() {
         let before = (def.language.field.is_some() && !whole).then(|| {
@@ -2560,7 +2572,7 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
                 } else if before.is_some_and(|before| before != language) {
                     // The document's language changed and this field did
                     // not: its words are stemmed again in the new one.
-                    restemmed.push((number, !f.options.nostem));
+                    restemmed.push((number, !f.options.nostem, f.options.phonetic.is_some()));
                 }
                 continue;
             };
@@ -2641,9 +2653,15 @@ fn restem(
     doc: u32,
     number: u16,
     stems: bool,
+    phonetic: bool,
     language: stem::Language,
 ) -> Option<Vec<String>> {
     let words = text.field_words(doc, number)?;
+    let min_phonetic = if phonetic {
+        crate::commands::search_tools::config_number("MIN_PHONETIC_TERM_LEN", 3) as usize
+    } else {
+        0
+    };
     let mut tokens = Vec::with_capacity(words.len() * 2);
     for word in words {
         let stemmed = if stems {
@@ -2651,7 +2669,13 @@ fn restem(
         } else {
             None
         };
+        let code = if phonetic {
+            phonetic::term_of(&word, min_phonetic)
+        } else {
+            None
+        };
         tokens.push(word);
+        tokens.extend(code);
         if let Some(s) = stemmed {
             tokens.push(format!("{}{s}", stem::STEM_PREFIX));
         }
@@ -2887,6 +2911,7 @@ mod indexes_tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def()
     }
@@ -4544,6 +4569,7 @@ mod flush_index_tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def();
         let graph = match def.indexes.get("vec") {
@@ -4581,6 +4607,7 @@ mod flush_index_tests {
             language: Default::default(),
             default_score: 0.5,
             score_field: Some("rank".into()),
+            nofreqs: false,
         }
         .into_def();
         let args: Vec<String> = def
@@ -4614,6 +4641,7 @@ mod flush_index_tests {
                 language: Default::default(),
                 default_score: 1.0,
                 score_field: None,
+                nofreqs: false,
             }
             .into_def()
         };
@@ -4647,6 +4675,7 @@ mod alias_tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def()
     }
@@ -4709,6 +4738,7 @@ mod alias_tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         };
         register_index_schemas(&store, &[schema], &Default::default());
         let g = store.read();
@@ -5031,6 +5061,7 @@ mod compaction_catch_up_tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def();
         indexes.write().insert("cmp".into(), def);

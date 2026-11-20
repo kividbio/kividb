@@ -250,7 +250,14 @@ fn describe_field(field: &SchemaField) -> Vec<Vec<u8>> {
             out.push(resp_integer(*ef_construction as i64));
         }
     }
-    for word in field.options.words(&field.field_type) {
+    // Redis does not report `PHONETIC` in `FT.INFO`'s attributes (it is kept,
+    // and saved: see `IndexDef::create_args`).
+    let mut words = field.options.words(&field.field_type).into_iter();
+    while let Some(word) = words.next() {
+        if word == "PHONETIC" {
+            words.next();
+            continue;
+        }
         out.push(resp_bulk_str(&word));
     }
     out
@@ -280,6 +287,7 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
     let mut language = crate::vector::stem::LanguageOptions::default();
     let mut default_score = 1.0;
     let mut score_field = None;
+    let mut nofreqs = false;
     let mut skip_initial_scan = false;
     let mut schema_found = false;
     let mut i = 2usize;
@@ -387,7 +395,11 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
                 }
                 i += 2;
             }
-            "MAXTEXTFIELDS" | "NOOFFSETS" | "NOHL" | "NOFIELDS" | "NOFREQS" => i += 1,
+            "NOFREQS" => {
+                nofreqs = true;
+                i += 1;
+            }
+            "MAXTEXTFIELDS" | "NOOFFSETS" | "NOHL" | "NOFIELDS" => i += 1,
             // This one would change results: an index of only the documents
             // an expression accepts. Accepting it and indexing everything
             // would be wrong.
@@ -420,6 +432,7 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
         language,
         default_score,
         score_field,
+        nofreqs,
     }
     .into_def();
 
@@ -528,7 +541,14 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
         out.push(value);
     };
     put("index_name", resp_bulk_str(&def.name));
-    put("index_options", resp_array(vec![]));
+    put(
+        "index_options",
+        resp_array(if def.nofreqs {
+            vec![resp_bulk_str("NOFREQS")]
+        } else {
+            vec![]
+        }),
+    );
     let mut definition = vec![
         resp_bulk_str("key_type"),
         resp_bulk_str(match def.on {
@@ -867,7 +887,7 @@ pub(crate) fn on_timeout_fails() -> bool {
 pub(crate) fn query_terms(filter: &Filter, out: &mut AHashSet<String>) {
     match filter {
         Filter::Text {
-            term: TextMatch::Exact(term) | TextMatch::Expanded(term),
+            term: TextMatch::Exact(term) | TextMatch::Expanded(term) | TextMatch::Phonetic(term),
             ..
         } => {
             out.insert(term.clone());
@@ -927,7 +947,9 @@ fn candidates(filter: &Filter, def: &IndexDef) -> Option<(Bits, bool)> {
         Filter::MatchNone => Some((Bits::new(), true)),
         Filter::Text { fields, term } => Some(match term {
             // A stopword a synonym brings in is in no index.
-            TextMatch::Exact(t) | TextMatch::Expanded(t) => (word(fields, t), !def.is_stopword(t)),
+            TextMatch::Exact(t) | TextMatch::Expanded(t) | TextMatch::Phonetic(t) => {
+                (word(fields, t), !def.is_stopword(t))
+            }
             TextMatch::Stem(stem) => {
                 let term = format!("{}{}", crate::vector::stem::STEM_PREFIX, stem.stem);
                 (word(fields, &term), true)
@@ -1942,6 +1964,7 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
                 if !(1..=4).contains(&dialect) {
                     return Err("DIALECT requires a non negative integer >=1 and <= 4".to_string());
                 }
+                args.query.dialect = dialect as u8;
                 i += 2;
             }
             "PARAMS" => {
@@ -2255,7 +2278,9 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
         .get(index_name)
         .cloned()
         .ok_or_else(|| no_such_index(index_name))?;
-    let query = filter::parse_query_with(query_text, &args.params, &def, args.query)?;
+    let mut options = args.query;
+    options.dialect = crate::commands::search_tools::dialect_or_default(options.dialect);
+    let query = filter::parse_query_with(query_text, &args.params, &def, options)?;
     // Ordered by distance rather than relevance.
     let by_distance =
         query.knn.is_some() || (query.filter.vector_range().is_some() && !query.filter.has_text());
@@ -2809,6 +2834,16 @@ fn coordinate(
         &mut shard_cmd,
         args.withscores || (args.sortby.is_none() && args.count > 0),
     );
+    // A query that names no dialect is read in this node's default: every
+    // master is told which, so that they all read it the same way.
+    if args.query.dialect == 0 {
+        shard_cmd.push(b"DIALECT".to_vec());
+        shard_cmd.push(
+            crate::commands::search_tools::dialect_or_default(0)
+                .to_string()
+                .into_bytes(),
+        );
+    }
     crate::cluster::search::ask_for_timeout_flag(&mut shard_cmd);
 
     // This node's part, then the others'.
@@ -2985,6 +3020,7 @@ mod tests {
             language: Default::default(),
             default_score: 1.0,
             score_field: None,
+            nofreqs: false,
         }
         .into_def();
         index_store.write().insert("i347".into(), def.clone());

@@ -332,7 +332,7 @@ Beyond the report:
 | Feature | Version | Why / what happens |
 |---|---|---|
 | Compact hash encoding | 8.10 | An internal memory optimisation with nothing a client can observe. `HIMPORT` works; hashes are stored as before. |
-| Stemming, including the Malay and Tagalog stemmers; phonetic matching | 8.10 / — | TEXT matches whole words, prefixes, suffixes, infixes and fuzzily. `NOSTEM` and `PHONETIC` are accepted in a schema and change nothing. A query for `running` does not find `run`. |
+| Stemming, including the Malay and Tagalog stemmers; phonetic matching | 8.10 / — | TEXT matches whole words, prefixes, suffixes, infixes and fuzzily, and stems words (Snowball's stemmers; Malay, Tagalog and the other languages without one are indexed as they are). `PHONETIC` indexes each word's Double Metaphone code and a query word finds the words of the same code, as in Redis. |
 | `GEO` and `GEOSHAPE` fields; `GEOFILTER`, `INFIELDS`, `EXPLAINSCORE` | — | Refused with an error rather than ignored. |
 | `search-global-timeout` | 8.10 | Not implemented. Query `TIMEOUT` and `ON_TIMEOUT` cut a query short. |
 | `FT.HYBRID` shard ratio, `EXPLAINSCORE` | 8.10 | |

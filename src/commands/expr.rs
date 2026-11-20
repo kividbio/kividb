@@ -23,6 +23,7 @@
 // Box<T> puts the inner Expr on the heap, breaking the infinite-size cycle.
 // This is idiomatic Rust for tree types.
 
+use super::aggregate_pipeline::{held_number, number_value, redis_number_text, text_of};
 use ahash::AHashMap;
 
 // ── Value ─────────────────────────────────────────────────────────────────────
@@ -61,14 +62,8 @@ impl Value {
     /// Convert to string for string operations.
     pub fn as_str(&self) -> String {
         match self {
-            Value::Num(n) => {
-                // Match Redis: integers print without decimal, floats with up to 17 sig figs
-                if n.fract() == 0.0 && n.abs() < 1e15 {
-                    format!("{}", *n as i64)
-                } else {
-                    format!("{}", n)
-                }
-            }
+            // As Redis writes a double: see `redis_number_text`.
+            Value::Num(n) => redis_number_text(*n),
             Value::Str(s) => s.clone(),
             Value::Bool(b) => {
                 if *b {
@@ -86,14 +81,44 @@ impl Value {
         match self {
             Value::Bool(b) => *b,
             Value::Num(n) => *n != 0.0,
-            Value::Str(s) => !s.is_empty(),
+            // Text that reads as a number (a field's value) is that number.
+            Value::Str(s) => match s.parse::<f64>() {
+                Ok(n) => n != 0.0,
+                Err(_) => !s.is_empty(),
+            },
             Value::Nil => false,
         }
     }
 
-    /// Format for RESP output (what APPLY produces as the new field value).
-    pub fn to_resp_string(&self) -> String {
-        self.as_str()
+    /// What APPLY puts in the row: a number held as a number (so that the
+    /// steps after it work on the double, and the reply writes it as Redis
+    /// does), anything else as text.
+    pub fn row_string(&self) -> String {
+        match self {
+            Value::Num(n) => number_value(*n),
+            Value::Bool(b) => number_value(f64::from(u8::from(*b))),
+            Value::Str(s) => s.clone(),
+            Value::Nil => String::new(),
+        }
+    }
+
+    /// The number this is, if it is one or reads as one.
+    fn number(&self) -> Option<f64> {
+        match self {
+            Value::Num(n) => Some(*n),
+            Value::Str(s) => s.parse::<f64>().ok(),
+            Value::Bool(b) => Some(f64::from(u8::from(*b))),
+            Value::Nil => None,
+        }
+    }
+
+    /// `==`: by number when both are numbers (or text that reads as one),
+    /// else by text.
+    fn same_as(&self, other: &Value) -> bool {
+        match (self.number(), other.number()) {
+            (Some(a), Some(b)) if !a.is_nan() && !b.is_nan() => a == b,
+            _ => self.as_str() == other.as_str(),
+        }
     }
 }
 
@@ -655,14 +680,12 @@ pub fn eval(expr: &Expr, row: &AHashMap<String, String>) -> Value {
 
         Expr::Field(name) => {
             match row.get(name.as_str()) {
-                Some(s) => {
-                    // Try to parse as number — if it works, return Num
-                    if let Ok(n) = s.parse::<f64>() {
-                        Value::Num(n)
-                    } else {
-                        Value::Str(s.clone())
-                    }
-                }
+                // A number the pipeline holds as one is that number; text
+                // is text, which reads as a number where one is wanted.
+                Some(s) => match held_number(s) {
+                    Some(x) => Value::Num(x),
+                    None => Value::Str(text_of(s).into_owned()),
+                },
                 None => Value::Nil,
             }
         }
@@ -683,13 +706,10 @@ pub fn eval(expr: &Expr, row: &AHashMap<String, String>) -> Value {
         }
         Expr::Sub(l, r) => Value::Num(eval(l, row).as_num() - eval(r, row).as_num()),
         Expr::Mul(l, r) => Value::Num(eval(l, row).as_num() * eval(r, row).as_num()),
+        // As a double divides: by zero, infinity or NaN.
         Expr::Div(l, r) => {
             let d = eval(r, row).as_num();
-            if d == 0.0 {
-                Value::Nil
-            } else {
-                Value::Num(eval(l, row).as_num() / d)
-            }
+            Value::Num(eval(l, row).as_num() / d)
         }
         Expr::Mod(l, r) => {
             let d = eval(r, row).as_num();
@@ -700,8 +720,8 @@ pub fn eval(expr: &Expr, row: &AHashMap<String, String>) -> Value {
             }
         }
 
-        Expr::Eq(l, r) => Value::Bool(eval(l, row).as_str() == eval(r, row).as_str()),
-        Expr::Ne(l, r) => Value::Bool(eval(l, row).as_str() != eval(r, row).as_str()),
+        Expr::Eq(l, r) => Value::Bool(eval(l, row).same_as(&eval(r, row))),
+        Expr::Ne(l, r) => Value::Bool(!eval(l, row).same_as(&eval(r, row))),
         Expr::Lt(l, r) => {
             let (lv, rv) = (eval(l, row), eval(r, row));
             Value::Bool(lv.as_num() < rv.as_num())
@@ -827,6 +847,7 @@ fn eval_fn(name: &str, args: &[Expr], row: &AHashMap<String, String>) -> Value {
         "log2" => Value::Num(eargs.first().map(|v| v.as_num().log2()).unwrap_or(0.0)),
         "log" => Value::Num(eargs.first().map(|v| v.as_num().ln()).unwrap_or(0.0)),
         "sqrt" => Value::Num(eargs.first().map(|v| v.as_num().sqrt()).unwrap_or(0.0)),
+        "exp" => Value::Num(eargs.first().map(|v| v.as_num().exp()).unwrap_or(0.0)),
         "pow" => {
             let base = eargs.first().map(|v| v.as_num()).unwrap_or(0.0);
             let exp = eargs.get(1).map(|v| v.as_num()).unwrap_or(1.0);
@@ -857,11 +878,11 @@ fn eval_fn(name: &str, args: &[Expr], row: &AHashMap<String, String>) -> Value {
         }
 
         // Type conversion
-        "tostring" => match eargs.into_iter().next() {
+        "tostring" | "to_str" => match eargs.into_iter().next() {
             Some(v) => Value::Str(v.as_str()),
             None => Value::Str(String::new()),
         },
-        "tonumber" => match eargs.into_iter().next() {
+        "tonumber" | "to_number" => match eargs.into_iter().next() {
             Some(v) => Value::Num(v.as_num()),
             None => Value::Num(0.0),
         },
