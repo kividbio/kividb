@@ -518,6 +518,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`ZRANDMEMBER` costs the count asked for, not the size of the sorted
+  set (#862).** A large sorted set (past `zset-max-listpack-entries`) found
+  its random members by walking its member table up to the last position
+  picked. The table is now asked for a bucket by its number: each member is
+  a random bucket, tried again while it is empty, so every member is as
+  likely as any other. A distinct sample of up to a third of the set is
+  picked a bucket at a time (a bucket that comes up twice is picked again);
+  a larger one walks the table once, which is then no longer than the
+  answer. The table is made smaller once it falls below an eighth full, as
+  Redis's is, so the memory of a set that has lost most of its members is
+  given back too. Over a million members, server time a call (`INFO
+  commandstats`), master before this change, now, and Redis 8.10.2:
+  `ZRANDMEMBER z` 1,047 us, 1.0 us, 1.1 us; a count of 10 1,975 us,
+  3.2 us, 8.2 us; 1000 2,454 us, 159 us, 711 us; -1000 2,444 us, 243 us,
+  485 us. At 100,000 members a count of 10 went from 143 us to 1.3 us.
+  Small sets (one block) are read by index as before. Replies are the
+  same: a count of the set's size or more is the whole set from the
+  highest score down, a positive count is distinct members in random
+  order, a negative one may repeat.
+
 - **A command reads the clock once (#632).** The first time a command
   needs the time, it reads the clock, and every later expiry check in the
   same command uses that reading, as Redis's `commandTimeSnapshot` does:

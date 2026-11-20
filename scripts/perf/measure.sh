@@ -176,6 +176,26 @@ if [ "${WORKLOADS:-}" = tags ]; then
   echo done
   exit 0
 fi
+if [ "${WORKLOADS:-}" = zrand ]; then
+  # ZRANDMEMBER on one sorted set of about 95,000 members (#862: 300,000
+  # ZADDs of m:<n> with score n, n below 100,000), past any block: no count,
+  # 1, 10, 1000, -10 WITHSCORES, -1000; ZSCORE of one member beside them.
+  # A walk of the member table costs tens of thousands of instructions a
+  # call here: run it with a small N (2000).
+  Z="ZADD z __rand_int__ m:__rand_int__"
+  for tag in "$@"; do
+    export PRELOAD="$Z" PRELOAD_R=100000 PRELOAD_N=300000
+    one "$tag" ZRANDMEMBER ZRANDMEMBER z
+    one "$tag" ZRANDMEMBER-1 ZRANDMEMBER z 1
+    one "$tag" ZRANDMEMBER-10 ZRANDMEMBER z 10
+    one "$tag" ZRANDMEMBER-1000 ZRANDMEMBER z 1000
+    one "$tag" ZRANDMEMBER-M10-WS ZRANDMEMBER z -10 WITHSCORES
+    one "$tag" ZRANDMEMBER-M1000 ZRANDMEMBER z -1000
+    one "$tag" ZSCORE ZSCORE z m:1
+  done | tee /out/raw.txt
+  echo done
+  exit 0
+fi
 if [ "${WORKLOADS:-}" = access ]; then
   for tag in "$@"; do
     for mode in no yes; do
