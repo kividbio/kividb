@@ -1652,6 +1652,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   until they have left, and a script that runs beside others cannot take
   that hold, so it fails with an error, as `KEYS` does in such a script.
   A script that runs alone keeps `MIGRATE` and its hold.
+- **A script that reaches its gates during a slot handoff no longer holds
+  every other command back while it waits (#340).** A script that runs
+  alone holds the command gate alone, and one that met a handoff (or a
+  `MIGRATE` of its key) once in the gate waited it out still holding it:
+  no other command ran on any thread until the handoff ended. It now
+  leaves all its gates to wait, and is then dispatched again from the top,
+  so everything checked before the gates (routing, ACL,
+  `lua-parallel-scripts`) is checked again. A write waiting the same way
+  leaves its share of the gate too, so a transaction or script is not held
+  behind it. In a test with the
+  destination's `TAKEOVER` held 3 s, a `GET` on another thread waited
+  about 2.6 s; it now waits under 1 ms.
 - **A command that waits for a script on its hash tag no longer holds up
   its thread (#882).** With `lua-parallel-scripts` on, a client's command
   on a key whose tag a script running beside others held waited on the
