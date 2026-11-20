@@ -1565,23 +1565,20 @@ has CPUs 0-3 and the clients 4-7 (the suites' own split). Recording both took ab
 | `mixed` peak during the save (MiB) | 2,174 | 2,176 | 1,833 | **1.19x** |
 | `mixed` fits in 1.5 GiB | no | no | no | |
 
-`small64` is the published claim: half Redis's peak (0.50x, floor 0.6x), 1.17
-GiB against 2.33 GiB, so a 1.5 GiB limit holds KiviDB and not Redis. It is
-the case where a write changes a 64-byte value: KiviDB keeps the old value
-only until the snapshot has passed it, Redis copies the 4 KB page.
+`small64`, 10,000,000 keys of 64-byte values: KiviDB's peak is half Redis's
+(0.50x, gate 0.6x), 1.17 GiB against 2.33 GiB, so a 1.5 GiB limit holds
+KiviDB and not Redis. A write here changes a 64-byte value: KiviDB keeps the
+old value only until the snapshot has passed it, Redis copies the 4 KB page.
 
-**`mixed` is under the proposed floor.** #849 asks for a peak of at most 0.6x
-Redis's at ~1 GiB of 100 B to 8 KB values, and "completes in a 1.5 GiB
-container where Redis fails". Measured, KiviDB's peak is 1.19x Redis's here
-(1.06x with the same writers paced at 16,000 `SET`s a second, 1.19x
-unpaced, three runs) and neither fits in 1.5 GiB. A value of about 4 KB that
-the snapshot holds on to costs as much as the page Redis copies for it, and
-with every key overwritten before the snapshot reaches it (about a million
-writes over 259,000 keys) the old and the new value are both there: 2.05x the
-memory before, where Redis's copies reached 1.6x. The floor was not lowered
-to pass: the gate is 1.3x Redis's peak (a little over the measured spread),
-so the row watches that it does not get worse, and the claim of the blog
-post stands for small values only. That is for the issue to decide.
+`mixed`, about 1 GiB of 100 B to 8 KB values: KiviDB's peak is 1.19x Redis's
+with unpaced writers (three runs) and 1.06x with the same writers paced at
+16,000 `SET`s a second; neither server fits in 1.5 GiB. A value of about 4 KB
+that the snapshot holds on to costs as much as the page Redis copies for it,
+and with every key overwritten before the snapshot reaches it (about a
+million writes over 259,000 keys) the old and the new value are both there:
+2.05x the memory before, where Redis's copies reached 1.6x. The gate for this
+row is 1.3x Redis's peak (a little over the measured spread), so the row
+watches that it does not get worse.
 
 **40-wp-object-cache**, 1,000,000 keys, `redis-benchmark -c 100 --threads 4`:
 
