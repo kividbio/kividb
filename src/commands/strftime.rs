@@ -68,8 +68,7 @@ pub fn format_unix_seconds(ts: i64, fmt: &str) -> Option<String> {
             i += 1;
         } else {
             // A literal byte at or past 0x80 starts a multi-byte UTF-8
-            // char: the char is pushed, not the byte, or non-ASCII literal
-            // text comes out a Latin-1 byte each (#978).
+            // char, and the whole char is written (#978).
             let ch = fmt[i..].chars().next().unwrap();
             out.push(ch);
             i += ch.len_utf8();
@@ -258,8 +257,7 @@ mod tests {
 
     #[test]
     fn non_ascii_literal_text_is_carried_through() {
-        // Each byte of 年/月/日 was emitted as its own Latin-1 char —
-        // mojibake, invisible control chars included (#978).
+        // Non-ASCII literal text keeps its chars, as Redis does (#978).
         assert_eq!(
             format_unix_seconds(0, "%Y年%m月%d日").unwrap(),
             "1970年01月01日"
@@ -267,6 +265,10 @@ mod tests {
         // An unrecognised specifier that is itself multi-byte goes through
         // whole too.
         assert_eq!(format_unix_seconds(0, "%年 %d").unwrap(), "%年 01");
+        // A multi-byte char right after a specifier, at the end of the
+        // format, and `%%` next to non-ASCII text.
+        assert_eq!(format_unix_seconds(0, "%d日").unwrap(), "01日");
+        assert_eq!(format_unix_seconds(0, "100%%完了").unwrap(), "100%完了");
     }
 
     #[test]
