@@ -104,6 +104,9 @@ jobs:
 
   # ── The machine (Azure, infra/benchmark-azure) ─────────────────────────────
   create:
+    # Its secrets live in the `benchmark` environment, which only runs from
+    # master may use.
+    environment: benchmark
     needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -170,6 +173,9 @@ jobs:
   # The second machine, for the suites that need 8 CPUs (the same
   # create.sh, resource group and teardown; its RUN_ID ends in -big).
   create_big:
+    # Its secrets live in the `benchmark` environment, which only runs from
+    # master may use.
+    environment: benchmark
     needs: plan
     if: needs.plan.outputs.big == 'true'
     runs-on: ubuntu-latest
@@ -236,6 +242,9 @@ jobs:
 
   # ── Build the candidate on it and run the suite ────────────────────────────
   run:
+    # Its secrets live in the `benchmark` environment, which only runs from
+    # master may use.
+    environment: benchmark
     needs: [plan, create, create_big]
     # The legs are independent: the D4s_v5 run goes ahead whether or not the
     # D8s_v5 could be made (its leg then fails, saying so).

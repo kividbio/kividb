@@ -109,6 +109,9 @@ jobs:
           docker push "$IMAGE"
 
   manifests:
+    # Its secrets live in the `release` environment: a run waits for a
+    # required reviewer, and only master and v* tags may use it.
+    environment: release
     needs: per-arch
     runs-on: ubuntu-latest
     permissions:
