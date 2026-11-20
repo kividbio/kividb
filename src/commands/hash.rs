@@ -117,19 +117,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let reply = |inner: &crate::types::HashFields| {
                 if eff == 3 {
                     let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(inner.len() * 2);
-                    for (k, v) in inner.iter() {
+                    inner.for_each(|k, v| {
                         chunks.push(resp_bulk(&crate::commands::helpers::name_to_bytes(k)));
                         chunks.push(resp_bulk(v.as_ref()));
-                    }
+                    });
                     resp_map(chunks)
                 } else {
                     let count = inner.len() * 2;
                     let mut buf = Vec::with_capacity(16 + count * 32);
                     push_array_len(&mut buf, count);
-                    for (k, v) in inner.iter() {
+                    inner.for_each(|k, v| {
                         push_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
                         push_bulk(&mut buf, &v);
-                    }
+                    });
                     buf
                 }
             };
@@ -381,9 +381,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             match with_hash_read(ctx, key, |inner| {
                 let mut buf = Vec::with_capacity(16 + inner.len() * 24);
                 push_array_len(&mut buf, inner.len());
-                for k in inner.keys() {
+                inner.for_each(|k, _| {
                     push_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
-                }
+                });
                 Some(buf)
             }) {
                 None => {
@@ -414,9 +414,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             match with_hash_read(ctx, key, |inner| {
                 let mut buf = Vec::with_capacity(16 + inner.len() * 24);
                 push_array_len(&mut buf, inner.len());
-                for v in inner.values() {
-                    push_bulk(&mut buf, &v);
-                }
+                inner.for_each(|_, v| push_bulk(&mut buf, &v));
                 Some(buf)
             }) {
                 None => {
@@ -638,9 +636,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
 
                     // No count arg — return single random field name
+                    let mut rng = rand::thread_rng();
                     let Some(count) = count else {
-                        let idx = rand::random::<usize>() % inner.len();
-                        let (field, _) = inner.get_index(idx).unwrap();
+                        let (field, _) = inner.random(&mut rng).expect("not empty");
                         return Some(resp_bulk(&crate::commands::helpers::name_to_bytes(field)));
                     };
                     let push =
@@ -671,22 +669,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             push(&mut result, f, v);
                         }
                     } else if count >= 0 {
-                        // Distinct positions, in random order, each read by
-                        // its index: the work is the count, not the size of
-                        // the hash.
-                        let picks =
-                            rand::seq::index::sample(&mut rand::thread_rng(), len, count as usize);
-                        for idx in picks {
-                            if let Some((f, v)) = inner.get_index(idx) {
-                                push(&mut result, f, v);
-                            }
+                        // Distinct fields, in random order: for a few of
+                        // many the work is the count, not the size of the
+                        // hash (`HashFields::random_distinct`).
+                        for (f, v) in inner.random_distinct(count as usize, &mut rng) {
+                            push(&mut result, f, v);
                         }
                     } else {
                         // Negative count — sample with replacement
                         let take = count.unsigned_abs() as usize;
                         for _ in 0..take {
-                            let idx = rand::random::<usize>() % len;
-                            if let Some((f, v)) = inner.get_index(idx) {
+                            if let Some((f, v)) = inner.random(&mut rng) {
                                 push(&mut result, f, v);
                             }
                         }
@@ -736,13 +729,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             Ok(options) => options,
                             Err(e) => return Some(e),
                         };
-                    // A hash Redis would encode compactly comes back whole.
-                    let (cursor, count) = if crate::commands::generics::scans_whole(v) {
-                        (0, usize::MAX)
-                    } else {
-                        (cursor, options.count)
-                    };
-                    // Get a borrow into the field map regardless of variant.
+                    let pattern = options
+                        .pattern
+                        .as_deref()
+                        .map(crate::commands::glob_redis::Glob::new);
+                    // The hash's read lock is taken once, here, and nothing
+                    // below takes it again (not `generics::scans_whole`):
+                    // a second read on this thread waits behind a writer
+                    // queued since the first, which waits for the first.
                     let plain_guard;
                     let ex_guard;
                     let ex_view;
@@ -753,11 +747,51 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         }
                         ValueRef::HashEx(hx) => {
                             ex_guard = hx.read();
+                            // A table is scanned where it is, its due fields
+                            // skipped by their deadlines: a copy of the live
+                            // fields (`visible`) would have a seed, and so
+                            // cursor positions, of its own.
+                            if let Some(table) = ex_guard.fields.table() {
+                                let hide = ex_guard.has_due(now)
+                                    && crate::field_expiry::policy(ctx.store)
+                                        != crate::field_expiry::Policy::Keep;
+                                let expiries = &ex_guard.expiries;
+                                crate::stats::record_hit();
+                                return Some(crate::commands::table_scan::hscan_reply(
+                                    table,
+                                    cursor,
+                                    options.count,
+                                    pattern.as_ref(),
+                                    options.no_values,
+                                    |entry| {
+                                        hide && std::str::from_utf8(entry.field).is_ok_and(|f| {
+                                            expiries.get(f).is_some_and(|at| field_due(*at, now))
+                                        })
+                                    },
+                                ));
+                            }
                             ex_view = visible(ctx, &ex_guard, now);
                             &ex_view
                         }
                         _ => unreachable!(),
                     };
+                    // A table (#764) gives the cursor itself: a page reads
+                    // its own groups, and `COUNT` is the hint it is in Redis
+                    // (#770). A cursor from the scan of the earlier form
+                    // goes on from that position and ends.
+                    if let Some(table) = inner.table() {
+                        crate::stats::record_hit();
+                        return Some(crate::commands::table_scan::hscan_reply(
+                            table,
+                            cursor,
+                            options.count,
+                            pattern.as_ref(),
+                            options.no_values,
+                            |_| false,
+                        ));
+                    }
+                    // A block comes back whole, as Redis returns a listpack.
+                    let (cursor, count) = (0, usize::MAX);
 
                     // In the order of the fields' positions: see
                     // `helpers::scan_position`.
@@ -775,10 +809,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         1024,
                     );
                     let mut items: Vec<Vec<u8>> = Vec::with_capacity(page.len() * 2);
-                    let pattern = options
-                        .pattern
-                        .as_deref()
-                        .map(crate::commands::glob_redis::Glob::new);
                     for (f, v) in page {
                         if pattern.as_ref().is_some_and(|glob| {
                             !glob.matches(&crate::commands::helpers::name_to_bytes(f))
@@ -1202,7 +1232,9 @@ where
             None => None,
             Some(ValueRef::Hash(h)) => {
                 let mut inner = h.write();
-                Some(Ok(f(&mut inner, None)))
+                let out = f(&mut inner, None);
+                crate::hash_fields::after_write(h, &mut inner);
+                Some(Ok(out))
             }
             Some(ValueRef::HashEx(hx)) => {
                 let now = *now.get_or_insert_with(field_now);
@@ -1215,7 +1247,9 @@ where
                 }
                 // Split borrow so the closure can touch both maps.
                 let crate::types::HashInner { fields, expiries } = &mut *inner;
-                Some(Ok(f(fields, Some(expiries))))
+                let out = f(fields, Some(expiries));
+                crate::hash_fields::after_write_ex(hx, &mut inner);
+                Some(Ok(out))
             }
             Some(_) => Some(Err(resp_error(WRONGTYPE))),
         };
@@ -1245,7 +1279,7 @@ fn write_hash<R>(
     let mut tried = false;
     loop {
         let absent = match read_lock!(shard).get(key) {
-            Some(ValueRef::Hash(h)) => return Ok(write(&mut h.write(), None)),
+            Some(ValueRef::Hash(h)) => return Ok(write_plain(h, &mut write)),
             Some(ValueRef::HashEx(hx)) => {
                 let now = *now.get_or_insert_with(field_now);
                 if let Some(out) = write_hash_ex(ctx, hx, now, &mut tried, &mut write) {
@@ -1260,7 +1294,7 @@ fn write_hash<R>(
             let mut map = write_lock!(shard);
             // Looked for again: it may have been made since.
             match map.get(key) {
-                Some(ValueRef::Hash(h)) => return Ok(write(&mut h.write(), None)),
+                Some(ValueRef::Hash(h)) => return Ok(write_plain(h, &mut write)),
                 Some(ValueRef::HashEx(hx)) => {
                     let now = *now.get_or_insert_with(field_now);
                     if let Some(out) = write_hash_ex(ctx, hx, now, &mut tried, &mut write) {
@@ -1272,7 +1306,9 @@ fn write_hash<R>(
                     let mut fields = crate::types::HashFields::default();
                     let out = write(&mut fields, None);
                     if !fields.is_empty() {
-                        let hash = Arc::new(parking_lot::RwLock::new(fields));
+                        // Through `shared`: an `HSET` of many fields can
+                        // leave the new hash's table mid-growth.
+                        let hash = crate::hash_fields::shared(fields);
                         map.insert(key, KiviDBValue::Hash(hash));
                     }
                     return Ok(out);
@@ -1284,11 +1320,24 @@ fn write_hash<R>(
     }
 }
 
+/// [`write_hash`]'s write of a hash with no field TTLs. A resize the write
+/// leaves in progress is the background's to finish
+/// (`hash_fields::after_write`).
+fn write_plain<R>(
+    hash: &Arc<parking_lot::RwLock<crate::types::HashFields>>,
+    write: &mut impl FnMut(&mut crate::types::HashFields, Option<&mut crate::types::Expiries>) -> R,
+) -> R {
+    let mut inner = hash.write();
+    let out = write(&mut inner, None);
+    crate::hash_fields::after_write(hash, &mut inner);
+    out
+}
+
 /// [`write_hash`]'s write of a hash with field TTLs. `None`: fields are due
 /// and to be removed first.
 fn write_hash_ex<R>(
     ctx: &Ctx,
-    hash: &parking_lot::RwLock<crate::types::HashInner>,
+    hash: &Arc<parking_lot::RwLock<crate::types::HashInner>>,
     now: FieldDeadline,
     tried: &mut bool,
     write: &mut impl FnMut(&mut crate::types::HashFields, Option<&mut crate::types::Expiries>) -> R,
@@ -1298,7 +1347,9 @@ fn write_hash_ex<R>(
         return None;
     }
     let crate::types::HashInner { fields, expiries } = &mut *inner;
-    Some(write(fields, Some(expiries)))
+    let out = write(fields, Some(expiries));
+    crate::hash_fields::after_write_ex(hash, &mut inner);
+    Some(out)
 }
 
 // ── Hash field-TTL helpers ───────────────────────────────────────────────────
@@ -1558,7 +1609,7 @@ fn apply_field_expire_inner(
             new_inner.fields = std::mem::take(&mut *plain_w);
             drop(plain_w);
 
-            let new_arc = Arc::new(RwLock::new(new_inner));
+            let new_arc = crate::hash_fields::shared_ex(new_inner);
             map.insert(key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
 
             apply_to_hashex(&new_arc, fields, new_exp, flag, is_past)
@@ -1647,6 +1698,7 @@ fn apply_to_hashex(
         inner.expiries.insert(f.clone(), new_exp);
         out.push(resp_integer(HFE_OK));
     }
+    crate::hash_fields::after_write_ex(hx, &mut inner);
 
     out
 }
@@ -1924,6 +1976,7 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     None => resp_null_for(resp),
                 })
                 .collect();
+            crate::hash_fields::after_write(&h, &mut inner);
             drop(inner);
             if !deleted.is_empty() {
                 let db = *ctx.selected_db;
@@ -1947,6 +2000,7 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     None => resp_null_for(resp),
                 })
                 .collect();
+            crate::hash_fields::after_write_ex(&hx, &mut inner);
             drop(inner);
             crate::stats::record_hit();
             if !deleted.is_empty() {
@@ -2116,7 +2170,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 let mut new_inner = crate::types::HashInner::new();
                 new_inner.fields = std::mem::take(&mut *plain_w);
                 drop(plain_w);
-                let new_arc = Arc::new(parking_lot::RwLock::new(new_inner));
+                let new_arc = crate::hash_fields::shared_ex(new_inner);
                 wmap.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
                 drop(wmap);
                 Some(resp_array(hgetex_apply(
@@ -2226,6 +2280,7 @@ fn hgetex_apply(
         }
         out.push(value);
     }
+    crate::hash_fields::after_write_ex(hx, &mut inner);
     drop(inner);
 
     // Sent as what it did to the fields it found: a read alone, nothing.
@@ -2617,7 +2672,7 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 let mut new_inner = crate::types::HashInner::new();
                 new_inner.fields = std::mem::take(&mut *plain_w);
                 drop(plain_w);
-                let new_arc = Arc::new(parking_lot::RwLock::new(new_inner));
+                let new_arc = crate::hash_fields::shared_ex(new_inner);
                 map.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
                 (new_arc, false)
             }
@@ -2632,7 +2687,7 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 if fxx {
                     return Some(resp_integer(0));
                 }
-                let new_arc = Arc::new(parking_lot::RwLock::new(crate::types::HashInner::new()));
+                let new_arc = crate::hash_fields::shared_ex(crate::types::HashInner::new());
                 map.insert(&*key, KiviDBValue::HashEx(Arc::clone(&new_arc)));
                 (new_arc, false)
             }
@@ -2681,6 +2736,7 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 }
             }
         }
+        crate::hash_fields::after_write_ex(&hx, &mut inner);
         break expiring;
     };
 

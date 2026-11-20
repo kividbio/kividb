@@ -2509,6 +2509,57 @@ fn a_growing_set_evicts_no_more_than_its_settled_size_needs() {
     c.lift_the_limit();
 }
 
+/// The same for a hash (#764 step 3): a large hash's table grows through
+/// the same doublings, and the arrays its resize holds are given back
+/// before the limit is judged.
+#[test]
+fn a_growing_hash_evicts_no_more_than_its_settled_size_needs() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    assert!(
+        c.cmd(&["CONFIG", "SET", "maxmemory-policy", "volatile-lru"])
+            .ok()
+    );
+    let value = "v".repeat(1000);
+    for i in 0..4000 {
+        c.cmd(&["SET", &format!("small:{i}"), &value, "EX", "100000"]);
+    }
+    let limit = c.limit_to(2 * MB);
+    // 105,000 fields: past the doublings at 25,088, 50,176 and 100,352,
+    // stopped just after the last, while its growth is still in progress.
+    let mut added = 0;
+    while added < 105_000 {
+        let pairs: Vec<String> = members(added, 1000)
+            .into_iter()
+            .flat_map(|f| [f, "v".to_string()])
+            .collect();
+        cmd_with(&mut c, &["HSET", "big"], &pairs);
+        added += 1000;
+    }
+    assert_eq!(
+        c.cmd(&["EXISTS", "big"]).i(),
+        1,
+        "the growing hash was evicted"
+    );
+    assert!(
+        c.evicted() > 0,
+        "nothing was evicted: the limit was never reached"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    let used = c.used_memory();
+    assert!(
+        used <= limit + 64 * KB,
+        "used {used} over the limit {limit}"
+    );
+    assert!(
+        limit - used < 256 * KB,
+        "{} bytes under the limit after {} evictions: more was evicted than the hash's size needs",
+        limit - used,
+        c.evicted()
+    );
+    c.lift_the_limit();
+}
+
 /// The same for a hash of many short fields.
 #[test]
 fn noeviction_refuses_a_growing_hash_at_the_limit_and_memory_usage_says_why() {

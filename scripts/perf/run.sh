@@ -35,6 +35,12 @@
 #                       1k, 100k, 3M (table); SMEMBERS, SUNIONSTORE,
 #                       SINTER and COPY of big sets (see measure.sh;
 #                       SIZES limits the sizes)
+#   WORKLOADS=hashes    hash commands on one hash of each form and size
+#                       (#764 step 3): HGET hit and miss, HSET of a field
+#                       there, HDEL + HSET pairs, HINCRBY, HMGET, HLEN,
+#                       HEXISTS, HSTRLEN, HGETALL at 10, 128, 512 (block),
+#                       1k, 100k, 3M (table) (see measure.sh; SIZES limits
+#                       the sizes, e.g. SIZES="10 1000")
 #   ONLY=<regex>        measure only the workloads whose label matches
 #   PROFILE=1           keep the hottest functions of each workload in
 #                       target/perf/out-<tag>/profile-*.txt

@@ -1258,6 +1258,57 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `DUMP`/`RESTORE` and `MIGRATE` are unchanged in both directions with
     1.2.2.
 
+- **Large hashes take a third to half the memory, no write
+  moves every field at once to grow, and `HSCAN` reads only its page (#764,
+  #770).** A hash past the block's limits (`OBJECT ENCODING` `hashtable`) is
+  the same table as a large set: each field and its value side by side in
+  one block of the collections' slab pool (a value too long for the pool's
+  largest block in a block of its own), with no `String`, no `Arc` and no
+  entries vector. #764's hash of 3,000,000 fields `f0`..`f2999999` of `v`
+  takes 29.6 bytes a field, 84.8 MiB (102.9 bytes and 294.5 MiB before;
+  Redis 8.10.2: 37.9 bytes, 108.5 MiB; Azure D8s_v5); just after the table doubles
+  (3,211,265 fields) 37.2 bytes, its most (Redis 36.8). Suite 19's fields of
+  14 bytes with 32-byte values (`used_memory` a field; before, then now;
+  Redis last): 166.6 / 66.0 / 70.1 at 1,000 fields a hash, 128.8 / 61.8 /
+  76.8 at 100,000, 133.3 / 61.7 / 77.9 at 3,000,000. Every hash key, small
+  ones included, is also 56 bytes smaller (its header went from 88 to 32
+  bytes): 65.8 bytes a field at 10 fields (71.4 before).
+  - The table grows and shrinks a few fields a write; a resize that the
+    writes leave part-way is finished in the background, a step at a time
+    under the hash's own lock, and the old array is freed off the command
+    path, as for sets. Filling one hash to 3,000,000 fields one `HSET` at a
+    time, the slowest `HSET` took 6.9 ms (64.7 ms before, at a doubling;
+    Redis 8.10.2: 6.7 ms), the 99th percentile 0.055 ms as before.
+  - `HSCAN` of such a hash reads the table's own groups for its page, with
+    `COUNT` a hint as in Redis, where it read the whole hash on every call:
+    a full scan of 1,000,000 fields takes 2.36 / 0.51 / 0.36 s of server CPU
+    at `COUNT` 10 / 100 / 1,000 (10.95 / 10.97 / 10.66 s before; Redis
+    8.10.2: 1.93 / 0.50 / 0.34 s). Fields whose TTL is due are skipped in place
+    where readers do not see them. Thanks to @magic-peach for the page
+    builder (#955). A scan begun before an upgrade still ends, but may miss
+    or repeat fields.
+  - Fields are copied, not shared, by `COPY`: 200 ms for 1,000,000 fields
+    (76 ms before; Redis 287 ms), the copy taking 65.5 bytes a field (121
+    before). `DEL` of a 3,000,000-field hash takes 196 ms (147 ms before;
+    Redis 373 ms); `UNLINK` is unchanged.
+  - Field TTLs are kept beside the table as before, a second copy of each
+    name with its deadline: a field with a TTL costs 83 bytes more, as
+    before (Redis 25). Keeping the deadline in the field's entry is a later
+    step.
+  - `MEMORY USAGE` of a hash is exact and immediate whatever `SAMPLES` says,
+    and eviction's estimate of what a hash frees is exact. `HGETALL`,
+    `HKEYS`, `HVALS`, `HSCAN` and `HRANDFIELD` give a large hash's fields in
+    a different order than 1.2.x did (no order, as in Redis), also a hash
+    that is a `hashtable` only because of one long value, which kept the
+    order its fields were set in. Snapshots, the AOF, replication,
+    `DUMP`/`RESTORE` and `MIGRATE` are unchanged in both directions with
+    1.2.2, and `DEBUG DIGEST-VALUE` gives the same digest.
+  - Instructions per command on a large hash (callgrind, the shipped
+    build): `HGET`, `HEXISTS`, `HSTRLEN` 1 % more, `HMGET` 1.4 %, an `HDEL`
+    and `HSET` pair 2-3 %; `HSET` of a field that is there 2.5 % fewer and
+    `HINCRBY` 6-8 % fewer; `HGETALL` 4 % fewer (a walk of the table that
+    reads only each entry's two lengths). Hashes in a block: as before.
+
 - **Lists take about half the memory, short elements a fifth (#297).** A
   list's elements are kept end to end in chunks of up to 64, each element
   between two copies of its length (one byte each for an element shorter

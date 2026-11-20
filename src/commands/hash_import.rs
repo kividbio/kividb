@@ -181,7 +181,7 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ctx.store,
                 db,
                 key,
-                KiviDBValue::Hash(Arc::new(RwLock::new(hash))),
+                KiviDBValue::Hash(crate::hash_fields::shared(hash)),
             );
             crate::vector::maybe_index(
                 ctx.index_store,

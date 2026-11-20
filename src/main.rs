@@ -59,6 +59,7 @@ pub mod protected_mode;
 mod pubsub;
 pub mod redis_settings;
 pub mod replication;
+mod resize_background;
 mod resp;
 mod script_clock;
 mod server;
