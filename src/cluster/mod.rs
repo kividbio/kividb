@@ -498,7 +498,16 @@ pub struct ClusterState {
     /// epoch (a `TAKEOVER` whose epoch collided with one this node took
     /// unannounced): this node never moves on a collision with them, which
     /// would put it above them and give it their slots back (#743).
+    /// Both this and `took_over_from` are saved in nodes.conf's `vars`
+    /// line (`tookOverFrom`, `yieldedTo`; an earlier version skips them),
+    /// so that a restart of either node in between keeps the rule, and are
+    /// let go once the collision is over ([`Self::settle_takeover_links`]).
     yielded_to: parking_lot::Mutex<ahash::AHashSet<NodeId>>,
+    /// What each master last claimed in its own PING or PONG, at the
+    /// epochs it gave: all an `UPDATE` relays of it (#742). Its config
+    /// epoch here can be newer (gossip raises it) than what this node
+    /// knows of its slots.
+    own_claims: RwLock<AHashMap<NodeId, Vec<crate::cluster::bus::SlotClaim>>>,
 }
 
 impl ClusterState {
@@ -581,6 +590,7 @@ impl ClusterState {
             vote_claims_peers: RwLock::new(ahash::AHashSet::new()),
             took_over_from: parking_lot::Mutex::new(None),
             yielded_to: parking_lot::Mutex::new(ahash::AHashSet::new()),
+            own_claims: RwLock::new(AHashMap::new()),
         };
         state.refresh_state();
         state
@@ -653,16 +663,21 @@ impl ClusterState {
         persist::remove_leftover_temps(&path);
 
         match persist::load(&path)? {
-            Some(loaded) => Ok(Self::build(
-                true,
-                loaded.myself,
-                loaded.slots,
-                loaded.nodes,
-                loaded.current_epoch,
-                loaded.last_vote_epoch,
-                Some(path),
-                node_timeout_ms,
-            )),
+            Some(loaded) => {
+                let state = Self::build(
+                    true,
+                    loaded.myself,
+                    loaded.slots,
+                    loaded.nodes,
+                    loaded.current_epoch,
+                    loaded.last_vote_epoch,
+                    Some(path),
+                    node_timeout_ms,
+                );
+                *state.took_over_from.lock() = loaded.took_over_from;
+                state.yielded_to.lock().extend(loaded.yielded_to);
+                Ok(state)
+            }
             None => {
                 let state = Self::new_enabled(Some(path), node_timeout_ms);
                 state.save_to_disk()?;
@@ -723,6 +738,10 @@ impl ClusterState {
                     ),
                 )
             })?;
+        // A record of slot handovers it may have been in the middle of that
+        // cannot be read whole: not started, rather than serve slots that
+        // may have moved (#743).
+        migration::check_handovers_file(&state)?;
         // With `tls-cluster` the port to reach this node on is its TLS port,
         // for clients and for the other nodes alike (see `node_tls`); the bus
         // stays where it is. A node with no plaintext port (port 0) has
@@ -2352,6 +2371,7 @@ impl ClusterState {
             }
             addr
         };
+        self.forget_takeover_links();
         // Whatever election we were running is moot: the shard has a master.
         *self.election.lock() = None;
         self.election_pending.store(false, Ordering::SeqCst);
@@ -2757,6 +2777,7 @@ impl ClusterState {
                 me.shard_id = shard;
             }
         }
+        self.forget_takeover_links();
 
         Ok((master_ip, master_port))
     }
@@ -2981,12 +3002,18 @@ impl ClusterState {
     /// The newer owners of the slots a candidate `claims` for `master_id`,
     /// as this node knows them, for the `UPDATE` that answers a vote it
     /// refused for that reason ([`Self::cast_vote`]): each with its
-    /// address, its config epoch here, and every slot it owns here at that
-    /// epoch, as its own PING would claim them. KiviDB has no `UPDATE` of
-    /// Redis's kind otherwise: a candidate learns a slot's new owner from
-    /// that owner's heartbeats only, and one that cannot hear them (the
-    /// owner down, or cut off from it) was refused for good, its master's
-    /// other slots left without a master with it (#742).
+    /// address and exactly what that owner last claimed in its own PING or
+    /// PONG to this node, at the epochs it claimed them at
+    /// ([`Self::note_own_claims`]); this node's own claims when it is the
+    /// owner. Never this node's slot table paired with the owner's config
+    /// epoch here: gossip raises that epoch without the slot view, and a
+    /// slot the owner has since given to another, at an epoch below the
+    /// raised one, would be relayed at the raised one and win against the
+    /// first-hand claim of its new owner on the candidate (#742). An owner
+    /// not heard from first-hand is not named. A candidate learns a slot's
+    /// new owner from that owner's heartbeats otherwise, and one that
+    /// cannot hear them (the owner down, or cut off from it) would never
+    /// learn it.
     pub fn newer_owners_of_claimed(
         &self,
         master_id: NodeId,
@@ -3012,15 +3039,23 @@ impl ClusterState {
                 }
             }
         }
+        let me = self.myself();
         owners
             .into_iter()
             .filter_map(|owner| {
-                let (ip, client_port, cluster_port, config_epoch) = {
+                let (ip, client_port, cluster_port) = {
                     let nodes = self.nodes.read();
                     let n = nodes.get(&owner)?;
-                    (n.ip.clone(), n.client_port, n.cluster_port, n.config_epoch)
+                    (n.ip.clone(), n.client_port, n.cluster_port)
                 };
-                let claims = self.slot_claims_of(owner);
+                let claims = if owner == me {
+                    self.my_slot_claims()
+                } else {
+                    self.own_claims.read().get(&owner).cloned()?
+                };
+                // The epoch the owner itself gave, not the one gossip
+                // raised here.
+                let config_epoch = claims.iter().map(|c| c.epoch).max()?;
                 (!claims.is_empty()).then_some(crate::cluster::bus::OwnerUpdate {
                     id: owner,
                     ip,
@@ -3031,6 +3066,76 @@ impl ClusterState {
                 })
             })
             .collect()
+    }
+
+    /// Note what master `id` claimed in its own PING or PONG, as it gave
+    /// it: what an `UPDATE` relays of it ([`Self::newer_owners_of_claimed`]).
+    pub fn note_own_claims(&self, id: NodeId, claims: &[crate::cluster::bus::SlotClaim]) {
+        let mut own = self.own_claims.write();
+        if own.get(&id).is_some_and(|c| c.as_slice() == claims) {
+            return;
+        }
+        own.insert(id, claims.to_vec());
+    }
+
+    /// The takeover links of [`Self::took_over_from`] and
+    /// [`Self::yielded_to`], as nodes.conf's `vars` line carries them (with
+    /// a leading space; empty when there are none). An earlier version
+    /// skips them.
+    pub(crate) fn takeover_links_vars(&self) -> String {
+        let mut out = String::new();
+        if let Some(id) = *self.took_over_from.lock() {
+            out.push_str(" tookOverFrom ");
+            out.push_str(node_id_str(&id));
+        }
+        let mut yielded: Vec<NodeId> = self.yielded_to.lock().iter().copied().collect();
+        if !yielded.is_empty() {
+            yielded.sort();
+            out.push_str(" yieldedTo ");
+            let ids: Vec<&str> = yielded.iter().map(node_id_str).collect();
+            out.push_str(&ids.join(","));
+        }
+        out
+    }
+
+    /// After a heartbeat of `sender` (`sender_master`, at `sender_epoch`)
+    /// has been taken in: the takeover links with it are let go once a
+    /// collision with it is over or can no longer happen: it is at another
+    /// config epoch than this node, either of the two is not a master. Kept
+    /// until then, across restarts (nodes.conf), so that a node that took
+    /// over, restarted before its old master came back, still moves on the
+    /// collision; a node that yielded with the lower id and its replica
+    /// both staying put left two masters at one epoch (#743).
+    pub fn settle_takeover_links(&self, sender: NodeId, sender_master: bool, sender_epoch: u64) {
+        let me = self.myself();
+        let (i_am_master, my_epoch) = self
+            .nodes
+            .read()
+            .get(&me)
+            .map(|n| (n.flags.contains(NodeFlags::MASTER), n.config_epoch))
+            .unwrap_or((false, 0));
+        let over = !sender_master || !i_am_master || sender_epoch != my_epoch;
+        if !over {
+            return;
+        }
+        let mut changed = false;
+        {
+            let mut took = self.took_over_from.lock();
+            if *took == Some(sender) {
+                *took = None;
+                changed = true;
+            }
+        }
+        changed |= self.yielded_to.lock().remove(&sender);
+        if changed {
+            self.save_soon();
+        }
+    }
+
+    /// This node no longer leads a shard: no takeover link of it applies.
+    fn forget_takeover_links(&self) {
+        *self.took_over_from.lock() = None;
+        self.yielded_to.lock().clear();
     }
 
     /// Note what `id` said of itself in its own PING or PONG: whether it
@@ -3951,33 +4056,66 @@ impl ClusterState {
 
     /// Whether a replica of `dest`, a destination this node handed slots to
     /// and that failed before it said whether it took them, may still be
-    /// elected in its place: `dest` still owns slots here, a replica of it
-    /// is not failed, and `dest` was marked FAIL less than a
-    /// [`Self::failover_window`] ago. Such a replica, if it heard `dest`'s
-    /// claim of the slots, takes them over with the rest at its election's
-    /// epoch, with the writes `dest` took to them; this node claiming them
-    /// back meanwhile would make a second claim of them after `dest`
-    /// failed, and only one of the two can stand (#743). So
-    /// this node waits for that failover first, and claims the slots back
-    /// only if it ends without them going to the replica.
-    pub(crate) fn destination_may_fail_over(&self, dest: NodeId) -> bool {
+    /// elected in its place: `dest` is FAIL here, a replica of it is not
+    /// failed, none of its replicas has become a master yet (`watch` keeps
+    /// the ones seen across calls: a promoted one no longer names `dest` as
+    /// its master), and `dest` was marked FAIL less than a
+    /// [`Self::failover_window`] ago. Whatever `dest` owns here: a new,
+    /// empty destination (a scale-out) owns nothing here but the slots this
+    /// node may have handed it, and its replica can be elected with just
+    /// those. Such a replica, if it heard `dest`'s claim of the slots, takes
+    /// them over at its election's epoch, with the writes `dest` took to
+    /// them; this node claiming them back meanwhile would make a second
+    /// claim of them after `dest` failed, and only one of the two can stand
+    /// (#743). So this node waits for that failover first, and claims the
+    /// slots back only if it ends without them going to the replica. A
+    /// replica seen promoted is waited for one moment more ([`FailoverWatch`]):
+    /// its claims come in the same heartbeat as its role.
+    pub(crate) fn destination_may_fail_over(
+        &self,
+        dest: NodeId,
+        watch: &mut FailoverWatch,
+    ) -> bool {
         let fail_since_ms = {
             let nodes = self.nodes.read();
             let Some(d) = nodes.get(&dest) else {
                 return false;
             };
-            let replica_up = nodes.values().any(|n| {
-                n.master_id == Some(dest)
+            if !d.flags.contains(NodeFlags::FAIL) {
+                return false;
+            }
+            for n in nodes.values() {
+                if n.master_id == Some(dest)
                     && n.flags.contains(NodeFlags::REPLICA)
-                    && !n.flags.intersects(NodeFlags::FAIL | NodeFlags::HANDSHAKE)
+                    && !watch.replicas.contains(&n.id)
+                {
+                    watch.replicas.push(n.id);
+                }
+            }
+            let promoted = watch.replicas.iter().any(|id| {
+                nodes
+                    .get(id)
+                    .is_some_and(|n| n.flags.contains(NodeFlags::MASTER))
             });
-            if !replica_up || !d.flags.contains(NodeFlags::FAIL) {
+            if promoted {
+                let seen = *watch
+                    .promoted_at
+                    .get_or_insert_with(std::time::Instant::now);
+                return seen.elapsed() < FAILOVER_WATCH_SETTLE;
+            }
+            let replica_up = watch.replicas.iter().any(|id| {
+                nodes.get(id).is_some_and(|n| {
+                    n.master_id == Some(dest)
+                        && n.flags.contains(NodeFlags::REPLICA)
+                        && !n.flags.intersects(NodeFlags::FAIL | NodeFlags::HANDSHAKE)
+                })
+            });
+            if !replica_up {
                 return false;
             }
             d.fail_since_ms
         };
-        self.owns_any_slot(dest)
-            && now_ms().saturating_sub(fail_since_ms) < self.failover_window().as_millis() as u64
+        now_ms().saturating_sub(fail_since_ms) < self.failover_window().as_millis() as u64
     }
 
     /// The handoff of an atomic slot migration away from this node is about
@@ -4247,6 +4385,8 @@ impl ClusterState {
         if !self.enabled {
             return;
         }
+        self.forget_takeover_links();
+        self.own_claims.write().clear();
         // Serialize with heartbeat merges and temporarily ban the old peers.
         // An in-flight heartbeat may already have passed its membership check;
         // without this guard it can repopulate slots after the reset returns.
@@ -4349,6 +4489,21 @@ const FAILOVER_BEGAN_RECENTLY: &str = "a failover of this node began";
 /// (measured). A save something waits on (a node met, a vote, a command's,
 /// a promotion) is made at once, by what waits.
 const BACKGROUND_SAVE_GAP: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// What a source waiting on a failed destination's failover has seen of it
+/// across its checks: see [`ClusterState::destination_may_fail_over`].
+#[derive(Debug, Default)]
+pub(crate) struct FailoverWatch {
+    /// The destination's replicas seen so far.
+    replicas: Vec<NodeId>,
+    /// When one of them was first seen a master.
+    promoted_at: Option<std::time::Instant>,
+}
+
+/// How long a source still waits once a replica of its failed destination
+/// is seen a master, for that replica's claims (#743). They come in the
+/// heartbeat that says it is a master, taken in just after its role.
+const FAILOVER_WATCH_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long a node met waits for the save that makes it a member.
 const ADMIT_SAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
@@ -5412,8 +5567,9 @@ mod tests {
     }
 
     /// What an `UPDATE` names for a refused candidate: each newer owner of
-    /// a claimed slot once, with its config epoch and all its slots at it;
-    /// nothing for slots no one newer owns (#742).
+    /// a claimed slot once, with what it last claimed in its own words;
+    /// nothing for slots no one newer owns, nor for an owner not heard
+    /// from first-hand (#742).
     #[test]
     fn the_newer_owners_of_claimed_slots_are_named_with_all_their_slots() {
         let claim = |start, end, epoch| crate::cluster::bus::SlotClaim { start, end, epoch };
@@ -5429,6 +5585,12 @@ mod tests {
                 slots[slot] = Some(b);
             }
         }
+        // Not heard from b itself: nothing relayed.
+        assert!(
+            cs.newer_owners_of_claimed(a, &[claim(5461, 10922, 3)])
+                .is_empty()
+        );
+        cs.note_own_claims(b, &[claim(5461, 5500, 7), claim(10923, 16383, 7)]);
         let owners = cs.newer_owners_of_claimed(a, &[claim(5461, 10922, 3)]);
         assert_eq!(owners.len(), 1);
         assert_eq!(owners[0].id, b);
@@ -5485,19 +5647,61 @@ mod tests {
         }
     }
 
+    /// The takeover links survive a restart: nodes.conf's `vars` line
+    /// carries them, a node started from it has them, and the file still
+    /// reads as before (an earlier version skips the pairs it does not
+    /// know). They go once the collision with that node is over (#743).
+    #[test]
+    fn takeover_links_are_saved_read_back_and_let_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.conf");
+        let cs = ClusterState::from_disk_or_fresh(Some(path.clone()), 15000).unwrap();
+        let m = add_master(&cs, 0..=99);
+        let y = add_master(&cs, 100..=199);
+        *cs.took_over_from.lock() = Some(m);
+        cs.yielded_to.lock().insert(y);
+        cs.save_to_disk().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // The last line but for the blank padding of a direct write.
+        let vars = text.lines().rfind(|l| !l.trim().is_empty()).unwrap();
+        assert!(vars.starts_with("vars currentEpoch "), "{vars}");
+        assert!(vars.contains(&format!("tookOverFrom {}", node_id_str(&m))));
+        assert!(vars.contains(&format!("yieldedTo {}", node_id_str(&y))));
+        let again = ClusterState::from_disk_or_fresh(Some(path.clone()), 15000).unwrap();
+        assert_eq!(*again.took_over_from.lock(), Some(m));
+        assert!(again.yielded_to.lock().contains(&y));
+
+        // Same epoch, both masters: kept. Another epoch: let go.
+        let me = again.myself();
+        again.nodes.write().get_mut(&me).unwrap().config_epoch = 5;
+        again.settle_takeover_links(m, true, 5);
+        assert_eq!(*again.took_over_from.lock(), Some(m));
+        again.settle_takeover_links(m, true, 6);
+        assert_eq!(*again.took_over_from.lock(), None);
+        again.settle_takeover_links(y, false, 5);
+        assert!(again.yielded_to.lock().is_empty());
+        again.save_to_disk().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("tookOverFrom") && !text.contains("yieldedTo"));
+    }
+
     /// A source whose destination failed before it said whether it took
     /// the slots waits while a replica of that destination may still be
     /// elected in its place, and no longer than that (#743).
     #[test]
     fn a_failed_destination_with_a_replica_may_fail_over_for_a_while() {
         let (cs, a, _) = three_master_cluster();
-        assert!(!cs.destination_may_fail_over(a), "not failed");
+        let mut w = FailoverWatch::default();
+        assert!(!cs.destination_may_fail_over(a, &mut w), "not failed");
         cs.nodes.write().get_mut(&a).unwrap().mark_failed(now_ms());
-        assert!(!cs.destination_may_fail_over(a), "no replica");
+        assert!(!cs.destination_may_fail_over(a, &mut w), "no replica");
         let r = add_replica(&cs, a);
-        assert!(cs.destination_may_fail_over(a));
+        assert!(cs.destination_may_fail_over(a, &mut w));
         set_flag(&cs, r, NodeFlags::FAIL);
-        assert!(!cs.destination_may_fail_over(a), "its replica failed too");
+        assert!(
+            !cs.destination_may_fail_over(a, &mut w),
+            "its replica failed too"
+        );
         cs.nodes
             .write()
             .get_mut(&r)
@@ -5506,15 +5710,38 @@ mod tests {
             .remove(NodeFlags::FAIL);
         let long_ago = now_ms() - cs.failover_window().as_millis() as u64 - 1;
         cs.nodes.write().get_mut(&a).unwrap().fail_since_ms = long_ago;
-        assert!(!cs.destination_may_fail_over(a), "the window is over");
+        assert!(
+            !cs.destination_may_fail_over(a, &mut w),
+            "the window is over"
+        );
         cs.nodes.write().get_mut(&a).unwrap().fail_since_ms = now_ms();
-        // Its replica elected: it owns nothing here any more.
-        cs.slots.write().iter_mut().for_each(|o| {
-            if *o == Some(a) {
-                *o = Some(r)
-            }
-        });
-        assert!(!cs.destination_may_fail_over(a), "failed over");
+        assert!(cs.destination_may_fail_over(a, &mut w));
+        // Its replica elected: a master, which no longer names `a`. Waited
+        // for a moment more, for its claims, then not.
+        {
+            let mut nodes = cs.nodes.write();
+            let n = nodes.get_mut(&r).unwrap();
+            n.flags.remove(NodeFlags::REPLICA);
+            n.flags |= NodeFlags::MASTER;
+            n.master_id = None;
+        }
+        assert!(
+            cs.destination_may_fail_over(a, &mut w),
+            "its claims may follow"
+        );
+        w.promoted_at = Some(std::time::Instant::now() - FAILOVER_WATCH_SETTLE);
+        assert!(!cs.destination_may_fail_over(a, &mut w), "failed over");
+
+        // A new, empty destination (a scale-out) owns nothing here, and is
+        // waited for all the same while its replica may be elected.
+        let (cs, _, _) = three_master_cluster();
+        let d = add_master(&cs, 0..=0);
+        cs.slots.write()[0] = Some(cs.myself());
+        assert!(!cs.owns_any_slot(d));
+        let _rd = add_replica(&cs, d);
+        cs.nodes.write().get_mut(&d).unwrap().mark_failed(now_ms());
+        let mut w = FailoverWatch::default();
+        assert!(cs.destination_may_fail_over(d, &mut w), "empty destination");
     }
 
     /// The claims a candidate sends: its master's slots in its view, as

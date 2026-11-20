@@ -677,6 +677,8 @@ fn apply_heartbeat(
     }
     // A replica announces no slots; claims only ever come from masters.
     if sender_flags.contains(NodeFlags::MASTER) && !test_ignores_claims_of(&sender_id) {
+        // What it claims in its own words: all an `UPDATE` relays of it.
+        state.note_own_claims(sender_id, slot_claims);
         state.apply_peer_slot_claims_from(sender_id, slot_claims, former_master);
     }
     // After the claims, as Redis does (`clusterHandleConfigEpochCollision`
@@ -686,6 +688,12 @@ fn apply_heartbeat(
     if sender_flags.contains(NodeFlags::MASTER) {
         state.resolve_epoch_collision(sender_id, config_epoch);
     }
+    // And the links of a takeover with it let go once they no longer apply.
+    state.settle_takeover_links(
+        sender_id,
+        sender_flags.contains(NodeFlags::MASTER),
+        config_epoch,
+    );
     state.save_soon();
 }
 
@@ -1101,7 +1109,17 @@ mod tests {
         epoch: u64,
         claims: &[(u16, u16)],
     ) -> NodeId {
-        let id = generate_node_id();
+        member_as(cs, generate_node_id(), master, epoch, claims)
+    }
+
+    /// [`member`], with the id given.
+    fn member_as(
+        cs: &ClusterState,
+        id: NodeId,
+        master: Option<NodeId>,
+        epoch: u64,
+        claims: &[(u16, u16)],
+    ) -> NodeId {
         process_message(cs, meet(id), peer());
         let flags = if master.is_some() {
             NodeFlags::REPLICA
@@ -1110,6 +1128,52 @@ mod tests {
         };
         process_message(cs, heartbeat(id, flags, master, epoch, claims), peer());
         id
+    }
+
+    /// An `UPDATE` relays an owner only as that owner claimed itself, at
+    /// the epoch it claimed at: never this node's slot table for it at the
+    /// config epoch gossip raised it to (#742). The voter heard b claim
+    /// 50-60 at 9; b has since given slot 50 to c at 10 and moved to 12,
+    /// and the voter heard only b's new epoch, by gossip, not c's claim
+    /// nor b's own new one. Relayed at 12, slot 50 went to b on a candidate
+    /// that held it as c's at 10, and c's claim never won it back there.
+    #[test]
+    fn an_update_relays_what_the_owner_claimed_itself_not_a_gossiped_epoch() {
+        let voter = ClusterState::new_enabled(None, 15000);
+        voter.claim_slot_range(200, 299).unwrap();
+        set_my_epoch(&voter, 2);
+        let a = member(&voter, None, 3, &[(0, 99)]);
+        let b = member(&voter, None, 9, &[(50, 60)]);
+        // As gossip raises it.
+        voter.nodes.write().get_mut(&b).unwrap().config_epoch = 12;
+        let owners = voter.newer_owners_of_claimed(
+            a,
+            &[SlotClaim {
+                start: 0,
+                end: 99,
+                epoch: 3,
+            }],
+        );
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].id, b);
+        assert_eq!(owners[0].config_epoch, 9);
+        let got: Vec<(u16, u16, u64)> = owners[0]
+            .claims
+            .iter()
+            .map(|c| (c.start, c.end, c.epoch))
+            .collect();
+        assert_eq!(got, vec![(50, 60, 9)]);
+
+        // The candidate holds slot 50 as c's, at 10, from c itself.
+        let cand = ClusterState::new_enabled(None, 15000);
+        member_as(&cand, a, None, 3, &[(0, 99)]);
+        cand.set_replica_of(a).unwrap();
+        let c = member(&cand, None, 10, &[(50, 50)]);
+        assert_eq!(cand.slot_owner(50), Some(c));
+        apply_update(&cand, voter.myself(), owners);
+        assert_eq!(cand.slot_owner(50), Some(c), "a relayed claim overrode c's");
+        assert_eq!(cand.slot_owner(51), Some(b));
+        assert_eq!(cand.slot_owner(61), Some(a));
     }
 
     fn set_my_epoch(cs: &ClusterState, epoch: u64) {

@@ -2043,7 +2043,7 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
     // On disk before writes are paused (it adds nothing to the pause), and
     // until this node knows how the handover ended: a restart in between
     // holds writes until it does (#743).
-    let _record = HandoverRecord::write(
+    let record = HandoverRecord::write(
         &env.cluster,
         PendingHandover {
             task_id: task.id.clone(),
@@ -2182,7 +2182,17 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
     let paused_ms = capture_ms + paused_at.elapsed().as_millis() as u64;
     drop(pause);
     drop(counted);
-    let _ = env.cluster.save_to_disk();
+    // The record of the handover goes only once nodes.conf has its outcome:
+    // a restart before that would find the slots this node's in the old
+    // file, and settles the handover again from the record.
+    if let Err(e) = env.cluster.save_to_disk() {
+        log_warn!(
+            "Cluster: Could not save the cluster config after the handover of slots {} ({e}): \
+             the handover stays recorded until it is saved",
+            ranges_text(&task.ranges)
+        );
+        record.keep_until_saved(Arc::clone(&env.cluster));
+    }
     log_info!(
         "Cluster: handover of slots {}: writes paused {} ms (in-flight writes {gate_ms},          last of the stream {}, the destination's takeover {})",
         ranges_text(&task.ranges),
@@ -2323,6 +2333,7 @@ fn await_takeover(env: &Env, task: &Task, error: &str) -> Result<(), String> {
     let held_from = Instant::now();
     let mut logged = Instant::now();
     let mut let_go_logged = false;
+    let mut watch = super::FailoverWatch::default();
     let why = format!("no answer to TAKEOVER: {error}");
     loop {
         match env.cluster.slot_owner(first) {
@@ -2355,7 +2366,7 @@ fn await_takeover(env: &Env, task: &Task, error: &str) -> Result<(), String> {
         // take the slots over with the rest, if it heard the destination
         // claim them: wait for that first (#743). A claim of them by it
         // ends the wait above ("taken over by another node").
-        if failed && env.cluster.destination_may_fail_over(task.dest) {
+        if failed && env.cluster.destination_may_fail_over(task.dest, &mut watch) {
             if logged.elapsed() >= LOG_HELD_EVERY {
                 logged = Instant::now();
                 log_warn!(
@@ -2474,7 +2485,11 @@ fn save_handovers(cluster: &ClusterState) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
-    write_synced(&tmp, (lines.join("\n") + "\n").as_bytes())?;
+    // Ended by its own line, so that a file cut short is known for one.
+    write_synced(
+        &tmp,
+        (lines.join("\n") + "\n" + HANDOVERS_END + "\n").as_bytes(),
+    )?;
     std::fs::rename(&tmp, &path)?;
     if let Some(dir) = path.parent()
         && let Ok(dir) = std::fs::File::open(dir)
@@ -2482,6 +2497,76 @@ fn save_handovers(cluster: &ClusterState) -> std::io::Result<()> {
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+/// The last line of a whole `.handovers` file.
+const HANDOVERS_END: &str = "end";
+
+/// The handovers a `.handovers` file lists. None when there is no file. An
+/// error for anything else that is not a whole file of handovers: one that
+/// cannot be read, is not text, does not end with its `end` line (cut
+/// short), or has a line that does not read as a handover. Such a file is
+/// never taken for fewer handovers than it may list: the node does not
+/// start (`check_handovers_file`), and the file is left as it is.
+fn read_handovers_file(path: &std::path::Path) -> std::io::Result<Vec<PendingHandover>> {
+    let bad = |why: String| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "cluster handovers file '{}' is unreadable: {why}. It lists the slot handovers \
+                 away from this node that it may have been in the middle of; it is left as it \
+                 is. Check each one's slots (CLUSTER SHARDS on another node), then remove the \
+                 file to start the node",
+                path.display()
+            ),
+        )
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(bad(format!("it could not be read ({e})"))),
+    };
+    let text = String::from_utf8(bytes).map_err(|_| bad("it is not text".into()))?;
+    let Some(body) = text.strip_suffix(&format!("{HANDOVERS_END}\n")) else {
+        return Err(bad("it does not end with its 'end' line (cut short)".into()));
+    };
+    if !body.is_empty() && !body.ends_with('\n') {
+        return Err(bad("it does not end with its 'end' line (cut short)".into()));
+    }
+    body.lines()
+        .enumerate()
+        .map(|(n, line)| {
+            parse_handover_line(line)
+                .ok_or_else(|| bad(format!("line {} does not read as a handover", n + 1)))
+        })
+        .collect()
+}
+
+/// At startup, before the node serves anything: an error, with what to do,
+/// if its `.handovers` file is there and cannot be read whole
+/// ([`read_handovers_file`]). The node then does not start, as with a
+/// `nodes.conf` cut short.
+pub(crate) fn check_handovers_file(cluster: &ClusterState) -> std::io::Result<()> {
+    match handovers_path(cluster) {
+        Some(path) => read_handovers_file(&path).map(|_| ()),
+        None => Ok(()),
+    }
+}
+
+/// Save nodes.conf, again every second until it is saved: what must be on
+/// disk before a handover's record goes.
+fn save_until_done(cluster: &ClusterState) {
+    let mut logged = false;
+    while let Err(e) = cluster.save_to_disk() {
+        if !logged {
+            logged = true;
+            log_warn!(
+                "Cluster: Could not save the cluster config after a slot handover ({e}); \
+                 the handover stays recorded until it is saved, tried every second"
+            );
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 /// One line of the file. `None` if it is not one.
@@ -2506,6 +2591,8 @@ fn parse_handover_line(line: &str) -> Option<PendingHandover> {
 struct HandoverRecord<'a> {
     cluster: &'a ClusterState,
     task_id: String,
+    /// Left listed when dropped: see [`Self::keep_until_saved`].
+    kept: bool,
 }
 
 impl<'a> HandoverRecord<'a> {
@@ -2514,15 +2601,45 @@ impl<'a> HandoverRecord<'a> {
     fn write(cluster: &'a ClusterState, handover: PendingHandover) -> Result<Self, String> {
         let task_id = handover.task_id.clone();
         cluster.slot_migrations.handovers.lock().push(handover);
-        let record = HandoverRecord { cluster, task_id };
+        let record = HandoverRecord {
+            cluster,
+            task_id,
+            kept: false,
+        };
         save_handovers(cluster)
             .map_err(|e| format!("could not record the handover under way: {e}"))?;
         Ok(record)
+    }
+
+    /// The handover ended, but nodes.conf could not be saved with its
+    /// outcome: the record stays listed, so that a restart settles the
+    /// handover again rather than serve the slots nodes.conf still gives
+    /// this node, and goes once a save works (tried every second).
+    fn keep_until_saved(mut self, cluster: Arc<ClusterState>) {
+        self.kept = true;
+        let task_id = std::mem::take(&mut self.task_id);
+        let spawned = std::thread::Builder::new()
+            .name("kividb-handover-save".into())
+            .spawn_released(move || {
+                save_until_done(&cluster);
+                let record = HandoverRecord {
+                    cluster: &cluster,
+                    task_id,
+                    kept: false,
+                };
+                drop(record);
+            });
+        if let Err(e) = spawned {
+            log_warn!("Cluster: Could not start saving the cluster config again: {e}");
+        }
     }
 }
 
 impl Drop for HandoverRecord<'_> {
     fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
         self.cluster
             .slot_migrations
             .handovers
@@ -2545,13 +2662,23 @@ pub(crate) fn settle_unfinished_handovers(
     let Some(path) = handovers_path(cluster) else {
         return;
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return;
+    // Checked before the node started (`check_handovers_file`); one that
+    // cannot be read now was changed since: writes are held for good, and
+    // the file left as it is.
+    let listed = match read_handovers_file(&path) {
+        Ok(listed) => listed,
+        Err(e) => {
+            log_error!("Cluster: {e}. Writes are held");
+            cluster.hold_writes_for_handoff();
+            return;
+        }
     };
+    if listed.is_empty() {
+        return;
+    }
     let me = cluster.myself();
-    let unsettled: Vec<PendingHandover> = text
-        .lines()
-        .filter_map(parse_handover_line)
+    let unsettled: Vec<PendingHandover> = listed
+        .into_iter()
         .filter(|h| {
             h.dest != me
                 && cluster.nodes.read().contains_key(&h.dest)
@@ -2579,6 +2706,7 @@ pub(crate) fn settle_unfinished_handovers(
                 let _record = HandoverRecord {
                     cluster: &cluster,
                     task_id,
+                    kept: false,
                 };
                 let outcome = settle_handover(&cluster, &repl_state, &handover);
                 log_warn!(
@@ -2601,6 +2729,7 @@ fn settle_handover(cluster: &ClusterState, repl_state: &ReplState, h: &PendingHa
     let me = cluster.myself();
     let first = h.ranges[0].0;
     let why = "the source restarted during the handover";
+    let mut watch = super::FailoverWatch::default();
     let mut logged = Instant::now();
     loop {
         if let Some(owner) = cluster.slot_owner(first)
@@ -2612,7 +2741,8 @@ fn settle_handover(cluster: &ClusterState, repl_state: &ReplState, h: &PendingHa
             match ask_destination_of(cluster, repl_state, &h.task_id, &h.dest, &h.ranges, why) {
                 Asked::Taken => {
                     let handed = cluster.hand_over_slots(slots_of(&h.ranges), h.dest);
-                    let _ = cluster.save_to_disk();
+                    // The record goes only once nodes.conf says so.
+                    save_until_done(cluster);
                     drop_lost_slots(cluster, handed);
                     return "the destination took them over; their keys here are deleted".into();
                 }
@@ -2629,7 +2759,7 @@ fn settle_handover(cluster: &ClusterState, repl_state: &ReplState, h: &PendingHa
             .read()
             .get(&h.dest)
             .is_none_or(|n| n.flags.contains(super::NodeFlags::FAIL));
-        if failed && !cluster.destination_may_fail_over(h.dest) {
+        if failed && !cluster.destination_may_fail_over(h.dest, &mut watch) {
             claim_back(cluster, &h.ranges);
             return format!(
                 "the destination has failed, and they are claimed here again at epoch {}",
@@ -3497,16 +3627,62 @@ mod tests {
         let path = handovers_path(&cs).unwrap();
         {
             let _record = HandoverRecord::write(&cs, h.clone()).unwrap();
-            let text = std::fs::read_to_string(&path).unwrap();
-            let read: Vec<PendingHandover> = text.lines().filter_map(parse_handover_line).collect();
-            assert_eq!(read, vec![h.clone()]);
+            assert_eq!(read_handovers_file(&path).unwrap(), vec![h.clone()]);
+            assert!(check_handovers_file(&cs).is_ok());
         }
         assert!(!path.exists());
+        assert_eq!(read_handovers_file(&path).unwrap(), vec![]);
         assert_eq!(parse_handover_line("x"), None);
         assert_eq!(parse_handover_line("t notanid 0-5"), None);
         let id = crate::cluster::node::node_id_str(&dest);
         assert_eq!(parse_handover_line(&format!("t {id} 9-5")), None);
         assert_eq!(parse_handover_line(&format!("t {id}")), None);
+    }
+
+    /// A `.handovers` file that is not whole is never read as fewer
+    /// handovers than it may list: cut short (without its `end` line, or
+    /// inside a line, a range shortened), a line that does not read, not
+    /// text, or not readable at all, it is an error, and the file is left
+    /// as it is (#743).
+    #[test]
+    fn a_handovers_file_that_is_not_whole_is_an_error_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cs = ClusterState::new_enabled(None, 15000);
+        cs.config_path = Some(dir.path().join("nodes.conf"));
+        let path = handovers_path(&cs).unwrap();
+        let id = crate::cluster::node::node_id_str(&crate::cluster::node::generate_node_id())
+            .to_string();
+        let whole = format!("t1 {id} 0-100 200-300\nt2 {id} 5-5\nend\n");
+        std::fs::write(&path, &whole).unwrap();
+        assert_eq!(read_handovers_file(&path).unwrap().len(), 2);
+        let cut_at = whole.find("200-30").unwrap() + "200-30".len();
+        let bad: Vec<Vec<u8>> = vec![
+            // Cut short: no `end` line, anywhere.
+            whole.as_bytes()[..cut_at].to_vec(),
+            whole.trim_end_matches("end\n").as_bytes().to_vec(),
+            whole.as_bytes()[..whole.len() - 1].to_vec(),
+            Vec::new(),
+            // A line that does not read.
+            format!("t1 {id} 0-100\ngarbage here\nend\n").into_bytes(),
+            format!("t1 {id} 0-100\n\nend\n").into_bytes(),
+            // Not text.
+            b"t1 \xff\xfe 0-1\nend\n".to_vec(),
+        ];
+        for content in bad {
+            std::fs::write(&path, &content).unwrap();
+            let err = read_handovers_file(&path).unwrap_err();
+            assert!(err.to_string().contains("is unreadable"), "{err}");
+            assert!(check_handovers_file(&cs).is_err());
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                content,
+                "the file was changed"
+            );
+        }
+        // Not readable at all: a directory where the file is.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(read_handovers_file(&path).is_err());
     }
 
     #[test]

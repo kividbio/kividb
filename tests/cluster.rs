@@ -8566,6 +8566,206 @@ fn a_takeover_at_an_epoch_its_master_took_unannounced_keeps_its_slots_master_id_
     a_takeover_at_an_epoch_its_master_took_unannounced_keeps_its_slots(false);
 }
 
+/// The takeover of the test above, with the replica restarted before its
+/// master comes back, and the master, of the lower id, owning a slot the
+/// replica never heard it take: it keeps that one and gives the replica
+/// the rest at the tie, staying a master at the epoch they share. The node
+/// that took over still moves on the collision after its restart (it is
+/// in its nodes.conf), so the two end at different epochs, the same on
+/// every node, each owning its own slots (#743).
+#[test]
+fn a_takeover_still_moves_on_the_collision_after_a_restart() {
+    let (mut nodes, ranges) = form_cluster_with_env(3, &[BUS_CONTROL]);
+    let master_id = nodes[0].id();
+    let replica = loop {
+        let n = Node::start(&[]);
+        if n.id() > master_id {
+            break n;
+        }
+    };
+    let mut replica = attach_replica(&nodes, &nodes[0], replica);
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, 4);
+    }
+    let replica_id = replica.id();
+    // A slot no one owns, for the master to take unannounced.
+    let spare = ranges[2].1;
+    let spare_s = spare.to_string();
+    assert!(
+        nodes[2]
+            .conn()
+            .cmd(&["CLUSTER", "DELSLOTS", &spare_s])
+            .is_ok()
+    );
+    for n in nodes[..2].iter().chain(std::iter::once(&replica)) {
+        let _ = n.conn().cmd(&["CLUSTER", "DELSLOTS", &spare_s]);
+    }
+    wait_until("the slot to be no one's", Duration::from_secs(10), || {
+        nodes
+            .iter()
+            .chain(std::iter::once(&replica))
+            .all(|n| owner_in_view_of(n, spare).is_none())
+    });
+    wait_until(
+        "another master to hold the highest epoch, known to all",
+        Duration::from_secs(30),
+        || {
+            let r = nodes[1].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+            assert!(r.starts_with("BUMPED") || r.starts_with("STILL"), "{r}");
+            let highest = nodes[1].cluster_info("cluster_my_epoch");
+            std::thread::sleep(Duration::from_millis(1500));
+            nodes
+                .iter()
+                .chain(std::iter::once(&replica))
+                .all(|n| n.cluster_info("cluster_current_epoch") == highest)
+                && nodes[0].cluster_info("cluster_my_epoch") != highest
+        },
+    );
+    set_bus(&nodes[0], "mute");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        nodes[0]
+            .conn()
+            .cmd(&["CLUSTER", "ADDSLOTS", &spare_s])
+            .is_ok()
+    );
+    let bumped = nodes[0].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+    let epoch = bumped
+        .strip_prefix("BUMPED ")
+        .unwrap_or_else(|| panic!("{bumped}"))
+        .to_string();
+    nodes[0].kill();
+    let r = replica.conn().cmd(&["CLUSTER", "FAILOVER", "TAKEOVER"]);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(replica.cluster_info("cluster_my_epoch"), epoch);
+    wait_until(
+        "the others to follow the takeover",
+        Duration::from_secs(20),
+        || {
+            nodes[1..]
+                .iter()
+                .all(|n| owner_in_view_of(n, ranges[0].0).as_deref() == Some(replica_id.as_str()))
+        },
+    );
+    // Restarted before its master is back.
+    replica.restart();
+    wait_until(
+        "the replica to serve again",
+        Duration::from_secs(20),
+        || {
+            replica.is_master()
+                && owner_in_view_of(&replica, ranges[0].0).as_deref() == Some(replica_id.as_str())
+        },
+    );
+
+    set_bus(&nodes[0], "run");
+    nodes[0].spawn();
+    let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+    let epoch_in = |n: &Node, id: &str| row_of(n, id).map(|r| r[6].clone());
+    let settled = || {
+        all.iter().all(|n| {
+            owner_in_view_of(n, ranges[0].0).as_deref() == Some(replica_id.as_str())
+                && owner_in_view_of(n, spare).as_deref() == Some(master_id.as_str())
+        }) && {
+            let first = (epoch_in(all[0], &master_id), epoch_in(all[0], &replica_id));
+            first.0 != first.1
+                && all
+                    .iter()
+                    .all(|n| (epoch_in(n, &master_id), epoch_in(n, &replica_id)) == first)
+        }
+    };
+    wait_until(
+        "the two to end at different epochs, each with its own slots, on every node",
+        Duration::from_secs(40),
+        settled,
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        settled(),
+        "{}",
+        all.iter()
+            .map(|n| n.conn().cmd(&["CLUSTER", "NODES"]).text())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// A source whose `.handovers` record cannot be read whole (cut short, or
+/// with a line that does not read) does not start: it cannot tell which
+/// slots it may have been handing over, and serving them could take writes
+/// that belong to another node. The file is left as it is (#743).
+#[test]
+fn a_node_whose_handovers_record_does_not_read_does_not_start() {
+    let (mut nodes, _) = form_cluster(2);
+    let id = nodes[1].id();
+    nodes[0].kill();
+    let path = nodes[0].dir.join("nodes.conf.handovers");
+    for content in [
+        format!("{} {id} 0-100\n", "a".repeat(40)),
+        format!("{} {id} 0-100\ngarbage\nend\n", "a".repeat(40)),
+    ] {
+        std::fs::write(&path, &content).unwrap();
+        let err = nodes[0].try_spawn().unwrap_err();
+        assert!(
+            err.contains("cluster handovers file") && err.contains("is unreadable"),
+            "{err}"
+        );
+        nodes[0].kill();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+    std::fs::remove_file(&path).unwrap();
+    nodes[0].spawn();
+    assert!(nodes[0].is_master());
+}
+
+/// A handover whose outcome the source could not save to nodes.conf stays
+/// recorded until it is saved (`fail.nodes-conf` makes every save fail):
+/// killed before then, the source finds it at its restart, asks the
+/// destination, and hands the slots over, rather than serve them from its
+/// nodes.conf of before (#743).
+#[test]
+fn a_handover_stays_recorded_until_the_source_has_saved_its_outcome() {
+    let src = Node::start_with_env(&[], &[FAILING_SAVES]);
+    let dst = Node::start(&[]);
+    let (mut nodes, _) = form_cluster_of(vec![src, dst]);
+    let before = Written::on(&nodes[0], 0..=100, "before", 50);
+    fail_saves(&nodes[0], true);
+    let task_id = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "100"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_import_completed(&nodes[1], &task_id);
+    wait_task_completed(&nodes[0], &task_id, "the source to finish its side");
+    let path = nodes[0].dir.join("nodes.conf.handovers");
+    assert!(
+        std::fs::read_to_string(&path).is_ok_and(|t| t.contains(&task_id)),
+        "the record went before nodes.conf had the outcome"
+    );
+    nodes[0].kill();
+    fail_saves(&nodes[0], false);
+    nodes[0].spawn();
+    let dst_id = nodes[1].id();
+    wait_until(
+        "the restarted source to settle the handover",
+        Duration::from_secs(30),
+        || {
+            !path.exists()
+                && nodes
+                    .iter()
+                    .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str()))
+        },
+    );
+    let mut c = nodes[0].conn();
+    let reply = cmd_when_serving(&mut c, &["SET", &key_in(0..=100, "late"), "v"]);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("MOVED")),
+        "{reply:?}"
+    );
+    assert!(before.missing_on(&nodes[1]).is_empty());
+}
+
 /// A destination that took slots over and failed before it answered the
 /// source: its replica, which heard it claim them, is elected and takes
 /// them over with the rest, with the writes the destination took to them,
@@ -8577,14 +8777,41 @@ fn a_takeover_at_an_epoch_its_master_took_unannounced_keeps_its_slots_master_id_
 /// acknowledged is on the slots' owner afterwards.
 #[test]
 fn a_source_waits_for_the_failover_of_a_destination_that_failed_mid_handover() {
+    source_waits_for_the_failover_of_a_failed_destination(false);
+}
+
+/// The same with a new, empty destination, as a scale-out has: it owns
+/// nothing but the slots it took, and nothing at all in the source's view.
+/// Its replica is elected with just those (its claims are the destination's
+/// slots in its view: the ones it heard it take), and the source waits for
+/// that as well.
+#[test]
+fn a_source_waits_for_the_failover_of_an_empty_destination_that_failed_mid_handover() {
+    source_waits_for_the_failover_of_a_failed_destination(true);
+}
+
+fn source_waits_for_the_failover_of_a_failed_destination(empty_destination: bool) {
     let src = Node::start_with_env(&[], &[("KIVIDB_TEST_IGNORE_CLAIMS", "ignore-claims")]);
     let dst = Node::start_with_env(&[], &[("KIVIDB_TEST_TAKEOVER_REPLY_DELAY_MS", "60000")]);
     let third = Node::start(&[]);
-    let (mut nodes, _) = form_cluster_of(vec![src, dst, third]);
+    let mut nodes = if empty_destination {
+        let (mut nodes, _) = form_cluster_of(vec![src, third, Node::start(&[])]);
+        let r = nodes[0]
+            .conn()
+            .cmd(&["CLUSTER", "MEET", "127.0.0.1", &dst.port.to_string()]);
+        assert!(r.is_ok(), "MEET: {r:?}");
+        nodes.insert(1, dst);
+        nodes
+    } else {
+        form_cluster_of(vec![src, dst, third]).0
+    };
     let dst_replica = add_replica(&nodes, &nodes[1]);
     {
         let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&dst_replica)).collect();
-        wait_cluster_ok(&all, 4);
+        wait_cluster_ok(&all, all.len());
+    }
+    if empty_destination {
+        assert_eq!(nodes[1].my_row().len(), 8, "the destination owns no slot");
     }
     let dst_id = nodes[1].id();
     std::fs::write(nodes[0].dir.join("ignore-claims"), &dst_id).unwrap();
@@ -8627,7 +8854,13 @@ fn a_source_waits_for_the_failover_of_a_destination_that_failed_mid_handover() {
         Duration::from_secs(40),
         || dst_replica.is_master(),
     );
-    let live = [&nodes[0], &nodes[2], &dst_replica];
+    let live: Vec<&Node> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 1)
+        .map(|(_, n)| n)
+        .chain(std::iter::once(&dst_replica))
+        .collect();
     // Settled on one owner of the slots, whichever.
     let mut owner = None;
     wait_until(
