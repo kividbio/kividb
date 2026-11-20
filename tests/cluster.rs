@@ -8384,11 +8384,12 @@ fn a_transaction_waiting_for_a_script_during_a_slot_handoff_runs_whole_or_not_at
 }
 
 /// A script that reaches its gates while an atomic slot migration's
-/// handoff holds writes waits the handoff out outside the command gate
-/// (#340): connections of the other threads keep getting replies. It used
-/// to wait holding the gate alone (it runs alone on its first run), and
+/// handoff holds writes waits the handoff out outside its gates (#340):
+/// connections of the other threads keep getting replies. It used to wait
+/// holding the command gate alone (it runs alone on its first run), and
 /// every other command on the node waited with it, until the handoff ended.
-/// The script is then sent on, and its key is the destination's, unchanged.
+/// It is then dispatched again from the top, sent on, and its key is the
+/// destination's, unchanged.
 #[cfg(feature = "lua")]
 #[test]
 fn a_script_waiting_out_a_slot_handoff_holds_back_no_other_replies() {
@@ -8472,8 +8473,13 @@ fn script_waiting_out_a_slot_handoff_on(model: &str) -> (Duration, bool) {
         || dst.log().contains("(test) TAKEOVER waits"),
     );
     std::fs::remove_file(held).unwrap();
-    // The script reaches its gates, finds the handoff, and waits it out.
-    std::thread::sleep(Duration::from_millis(300));
+    // The script reaches its gates, finds the handoff, and is sent out of
+    // them to wait it out (logged in debug builds).
+    wait_until(
+        "the script to wait out the handoff outside its gates",
+        Duration::from_secs(10),
+        || src.log().contains("(test) EVAL waits outside its gates"),
+    );
     let mut slowest = Duration::ZERO;
     for probe in &mut probes {
         probe
@@ -8500,7 +8506,7 @@ fn script_waiting_out_a_slot_handoff_on(model: &str) -> (Duration, bool) {
 }
 
 /// Of `want * 2` new connections to `port`, those that answer a `PING`
-/// within 200 ms: connections on threads that are not held.
+/// within a second: connections on threads that are not held.
 #[cfg(feature = "lua")]
 fn answering_conns(port: u16, want: usize) -> Vec<Conn> {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -8513,7 +8519,7 @@ fn answering_conns(port: u16, want: usize) -> Vec<Conn> {
             }
         });
     }
-    let deadline = Instant::now() + Duration::from_millis(200);
+    let deadline = Instant::now() + Duration::from_secs(1);
     let mut answered = Vec::new();
     while answered.len() < want {
         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
