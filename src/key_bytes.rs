@@ -369,16 +369,16 @@ pub fn quoted(bytes: &[u8]) -> String {
 
 // ── Keys and names as text ────────────────────────────────────────────────────
 //
-// What keeps a key, or a hash keeps a field, as a `String` (the search
-// indexes' documents, a hash's fields until #437 makes them bytes) keeps it
-// in this form. A hash keeps its fields by name, as `String`s. Redis's field names are
-// bytes: any bytes. So that a hash can hold them all, a name that is not
-// valid UTF-8 is kept in a form that is — each byte that is not part of
-// valid text becomes one character from a block set aside for it (U+F780 –
-// U+F7FF, private use: byte 0x80 is U+F780, 0xFF is U+F7FF) — and is turned
-// back on the way out. Ordinary text is itself, both ways, and costs one
-// scan. Text that happens to use those characters has their bytes put in
-// the same form, so that nothing can be mistaken for something else.
+// What keeps a key as a `String` (the search indexes' documents, time-series
+// names) keeps it in this form; so do KDB files and `DUMP` payloads for a
+// hash's field names, which 1.1 and 1.2 kept in memory as `String`s in it
+// (`hash_fields::saved_name`). A name that is not valid UTF-8 is kept in a
+// form that is — each byte that is not part of valid text becomes one
+// character from a block set aside for it (U+F780 – U+F7FF, private use:
+// byte 0x80 is U+F780, 0xFF is U+F7FF) — and is turned back on the way out.
+// Ordinary text is itself, both ways, and costs one scan. Text that happens
+// to use those characters has their bytes put in the same form, so that
+// nothing can be mistaken for something else.
 
 const BYTE_BLOCK: u32 = 0xF700;
 

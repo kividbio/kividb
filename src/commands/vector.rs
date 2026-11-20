@@ -840,6 +840,9 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let Ok(s) = std::str::from_utf8(&val) else {
                 continue;
             };
+            // A row's names are text (`key_bytes::text_of`).
+            let field = crate::key_bytes::text_of(field);
+            let field: &str = &field;
             // A field of a JSON document goes by the name the schema
             // gives its path.
             let shown = match def.fields.iter().find(|f| json && f.name == field) {

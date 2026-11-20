@@ -24,9 +24,11 @@
 //! have come to rely on it (BullMQ's tests among them). A table has no
 //! order, as a Redis hashtable has none.
 //!
-//! Callers see fields as `&str` and values as [`Value`]s: bytes, whatever
-//! the hash keeps them as. Snapshots, the AOF, replication and `DUMP` see
-//! nothing else, so none of them depends on the form.
+//! Field names are bytes, any bytes, as Redis's are: a field is kept as the
+//! bytes it was sent as, and every lookup compares bytes. Callers see
+//! fields as `&[u8]` and values as [`Value`]s: bytes, whatever the hash
+//! keeps them as. Snapshots, the AOF, replication and `DUMP` see nothing
+//! else, so none of them depends on the form.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -105,6 +107,34 @@ pub fn set_packed_value(limit: usize) -> usize {
     limit
 }
 
+/// The bytes `field` is written as where KiviDB writes a hash for itself:
+/// its own snapshots (KDB), `DUMP` payloads (and so `MIGRATE` and slot
+/// migration), and the digest (`DEBUG DIGEST`, replication's resync check).
+///
+/// These keep the spelling 1.1 and 1.2 kept a field in, when a hash held
+/// its fields as text: a name that is UTF-8, and has none of the characters
+/// U+F780 to U+F7FF, is itself; any other is [`crate::key_bytes::text_of`]
+/// its bytes. So a file or a payload written here reads the same on a 1.2
+/// server, and one written there reads the same here ([`loaded_name`]),
+/// both ways, byte for byte.
+#[inline]
+pub fn saved_name(field: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    match crate::key_bytes::text_of(field) {
+        std::borrow::Cow::Borrowed(text) => std::borrow::Cow::Borrowed(text.as_bytes()),
+        std::borrow::Cow::Owned(text) => std::borrow::Cow::Owned(text.into_bytes()),
+    }
+}
+
+/// The field a name read from a KDB file or a `DUMP` payload stands for:
+/// the inverse of [`saved_name`]. `None` for bytes that are not UTF-8, which
+/// no writer of that form writes.
+#[inline]
+pub fn loaded_name(saved: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+    std::str::from_utf8(saved)
+        .ok()
+        .map(crate::key_bytes::bytes_of)
+}
+
 /// A value, as a hash hands it out: bytes of a block or of a table's entry.
 /// It is its bytes (`Deref`). The same as a list's elements.
 pub use crate::element::Value;
@@ -156,12 +186,10 @@ impl Table {
     /// command's argument is at most 512 MB, and a load checks first
     /// ([`HashFields::insert_loaded`]).
     #[inline]
-    fn set(&mut self, field: &str, value: &[u8]) -> bool {
+    fn set(&mut self, field: &[u8], value: &[u8]) -> bool {
         debug_assert!(field.len() <= crate::collection_table::MAX_LEN);
         debug_assert!(value.len() <= crate::collection_table::MAX_LEN);
-        self.fields
-            .insert(field.as_bytes(), value, None)
-            .unwrap_or(false)
+        self.fields.insert(field, value, None).unwrap_or(false)
     }
 }
 
@@ -177,17 +205,9 @@ impl Clone for Table {
     }
 }
 
-/// A field's name as the table holds it.
 #[inline(always)]
-fn name(field: &[u8]) -> &str {
-    // SAFETY: a table is only ever given fields as `&str` (every insert
-    // below takes one), so its fields are UTF-8, as a block's are.
-    unsafe { std::str::from_utf8_unchecked(field) }
-}
-
-#[inline(always)]
-fn pair(entry: FieldRef<'_>) -> (&str, Value<'_>) {
-    (name(entry.field), Value::Bytes(entry.value))
+fn pair(entry: FieldRef<'_>) -> (&[u8], Value<'_>) {
+    (entry.field, Value::Bytes(entry.value))
 }
 
 impl Default for HashFields {
@@ -314,30 +334,32 @@ impl HashFields {
 
     /// The value of `field`, if the hash has it.
     #[inline(always)]
-    pub fn get(&self, field: &str) -> Option<Value<'_>> {
+    pub fn get(&self, field: &(impl AsRef<[u8]> + ?Sized)) -> Option<Value<'_>> {
         self.get_bytes(field).map(Value::Bytes)
     }
 
     /// The bytes of `field`'s value, if the hash has it.
     #[inline(always)]
-    pub fn get_bytes(&self, field: &str) -> Option<&[u8]> {
+    pub fn get_bytes(&self, field: &(impl AsRef<[u8]> + ?Sized)) -> Option<&[u8]> {
+        let field = field.as_ref();
         match &self.repr {
-            Repr::Table(t) => t.fields.get(field.as_bytes()).map(|entry| entry.value),
+            Repr::Table(t) => t.fields.get(field).map(|entry| entry.value),
             Repr::Packed(p) => p.get(field),
         }
     }
 
     #[inline(always)]
-    pub fn contains_key(&self, field: &str) -> bool {
+    pub fn contains_key(&self, field: &(impl AsRef<[u8]> + ?Sized)) -> bool {
+        let field = field.as_ref();
         match &self.repr {
-            Repr::Table(t) => t.fields.contains_key(field.as_bytes()),
+            Repr::Table(t) => t.fields.contains_key(field),
             Repr::Packed(p) => p.contains(field),
         }
     }
 
     /// A field and its value, any one as likely as another; `None` if the
     /// hash is empty.
-    pub fn random(&self, rng: &mut impl rand::Rng) -> Option<(&str, Value<'_>)> {
+    pub fn random(&self, rng: &mut impl rand::Rng) -> Option<(&[u8], Value<'_>)> {
         match &self.repr {
             Repr::Table(t) => t.fields.random(rng).map(pair),
             Repr::Packed(p) if p.is_empty() => None,
@@ -360,7 +382,7 @@ impl HashFields {
         &self,
         count: usize,
         rng: &mut impl rand::Rng,
-    ) -> Vec<(&str, Value<'_>)> {
+    ) -> Vec<(&[u8], Value<'_>)> {
         use rand::seq::{IteratorRandom, SliceRandom};
         let len = self.len();
         let count = count.min(len);
@@ -400,7 +422,7 @@ impl HashFields {
     /// is a table, now or because they did not fit: one pass moves the
     /// fields to it, and the caller writes to it.
     #[inline(always)]
-    fn set_packed(&mut self, field: &str, value: &[u8]) -> Option<bool> {
+    fn set_packed(&mut self, field: &[u8], value: &[u8]) -> Option<bool> {
         match self.repr {
             Repr::Table(_) => None,
             Repr::Packed(_) => self.set_in_block(field, value),
@@ -410,7 +432,7 @@ impl HashFields {
     /// [`Self::set_packed`] of a hash in a block: a call of its own, so
     /// that a table's writes stay small enough to inline.
     #[inline(never)]
-    fn set_in_block(&mut self, field: &str, value: &[u8]) -> Option<bool> {
+    fn set_in_block(&mut self, field: &[u8], value: &[u8]) -> Option<bool> {
         let Repr::Packed(p) = &mut self.repr else {
             return None;
         };
@@ -460,13 +482,14 @@ impl HashFields {
 
     /// Give `field` the value `value`. Whether the field is new.
     #[inline]
-    pub fn insert(&mut self, field: &str, value: &Arc<[u8]>) -> bool {
+    pub fn insert(&mut self, field: &(impl AsRef<[u8]> + ?Sized), value: &Arc<[u8]>) -> bool {
         self.insert_bytes(field, value)
     }
 
     /// [`Self::insert`] of bytes.
     #[inline]
-    pub fn insert_bytes(&mut self, field: &str, value: &[u8]) -> bool {
+    pub fn insert_bytes(&mut self, field: &(impl AsRef<[u8]> + ?Sized), value: &[u8]) -> bool {
+        let field = field.as_ref();
         if let Some(added) = self.set_packed(field, value) {
             return added;
         }
@@ -476,36 +499,47 @@ impl HashFields {
     /// [`Self::insert`] of a field and a value that are the caller's to
     /// give away: copied in either form.
     #[inline]
-    pub fn insert_owned(&mut self, field: String, value: Arc<[u8]>) -> bool {
-        self.insert_bytes(&field, &value)
+    pub fn insert_owned(&mut self, field: impl AsRef<[u8]>, value: Arc<[u8]>) -> bool {
+        self.insert_bytes(field.as_ref(), &value)
     }
 
     /// [`Self::insert`] of a field read from a file or a payload (a load):
     /// an error, and nothing changed, for a field or a value longer than a
     /// table holds (`collection_table::MAX_LEN`, 4 GiB), never dropped.
     #[inline]
-    pub fn insert_loaded(&mut self, field: String, value: &[u8]) -> std::io::Result<bool> {
-        if let Some(added) = self.set_packed(&field, value) {
+    pub fn insert_loaded(
+        &mut self,
+        field: impl AsRef<[u8]>,
+        value: &[u8],
+    ) -> std::io::Result<bool> {
+        let field = field.as_ref();
+        if let Some(added) = self.set_packed(field, value) {
             return Ok(added);
         }
         self.table_mut()
             .fields
-            .insert(field.as_bytes(), value, None)
+            .insert(field, value, None)
             .map_err(|too_long| std::io::Error::new(std::io::ErrorKind::InvalidData, too_long))
     }
 
     /// Remove `field`. Whether the hash had it. A block keeps the others in
     /// order.
     #[inline]
-    pub fn remove(&mut self, field: &str) -> bool {
+    pub fn remove(&mut self, field: &(impl AsRef<[u8]> + ?Sized)) -> bool {
+        let field = field.as_ref();
         match &mut self.repr {
             Repr::Packed(p) => p.remove(field),
-            Repr::Table(t) => t.fields.remove(field.as_bytes()),
+            Repr::Table(t) => t.fields.remove(field),
         }
     }
 
     /// [`Self::remove`], handing the value to `f` on its way out.
-    pub fn take_with<R>(&mut self, field: &str, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    pub fn take_with<R>(
+        &mut self,
+        field: &(impl AsRef<[u8]> + ?Sized),
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
+        let field = field.as_ref();
         match &mut self.repr {
             Repr::Packed(p) => {
                 let i = p.find(field)?;
@@ -513,23 +547,19 @@ impl HashFields {
                 p.remove_at(i);
                 Some(out)
             }
-            Repr::Table(t) => t
-                .fields
-                .remove_with(field.as_bytes(), |entry| f(entry.value)),
+            Repr::Table(t) => t.fields.remove_with(field, |entry| f(entry.value)),
         }
     }
 
     /// [`Self::remove`], handing back the value.
-    pub fn take(&mut self, field: &str) -> Option<Arc<[u8]>> {
+    pub fn take(&mut self, field: &(impl AsRef<[u8]> + ?Sized)) -> Option<Arc<[u8]>> {
         self.take_with(field, |v: &[u8]| Arc::<[u8]>::from(v))
     }
 
     /// Keep the fields `keep` says to (a block keeps them in order).
-    pub fn retain(&mut self, mut keep: impl FnMut(&str, &[u8]) -> bool) {
+    pub fn retain(&mut self, mut keep: impl FnMut(&[u8], &[u8]) -> bool) {
         match &mut self.repr {
-            Repr::Table(t) => t
-                .fields
-                .retain(|entry| keep(name(entry.field), entry.value)),
+            Repr::Table(t) => t.fields.retain(|entry| keep(entry.field, entry.value)),
             Repr::Packed(p) => p.retain(keep),
         }
     }
@@ -555,7 +585,7 @@ impl HashFields {
     /// `HVALS`); a table's walk reads no TTL
     /// (`CollectionTable::for_each_field`).
     #[inline]
-    pub fn for_each(&self, mut f: impl FnMut(&str, Value<'_>)) {
+    pub fn for_each(&self, mut f: impl FnMut(&[u8], Value<'_>)) {
         match &self.repr {
             Repr::Packed(p) => {
                 for (field, value) in p.iter() {
@@ -564,12 +594,12 @@ impl HashFields {
             }
             Repr::Table(t) => t
                 .fields
-                .for_each_field(|field, value| f(name(field), Value::Bytes(value))),
+                .for_each_field(|field, value| f(field, Value::Bytes(value))),
         }
     }
 
     #[inline]
-    pub fn keys(&self) -> impl ExactSizeIterator<Item = &str> + '_ {
+    pub fn keys(&self) -> impl ExactSizeIterator<Item = &[u8]> + '_ {
         self.iter().map(|(f, _)| f)
     }
 
@@ -807,7 +837,7 @@ pub enum Iter<'a> {
 }
 
 impl<'a> Iterator for Iter<'a> {
-    type Item = (&'a str, Value<'a>);
+    type Item = (&'a [u8], Value<'a>);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -837,7 +867,7 @@ impl<'a> Iterator for Iter<'a> {
 impl ExactSizeIterator for Iter<'_> {}
 
 impl<'a> IntoIterator for &'a HashFields {
-    type Item = (&'a str, Value<'a>);
+    type Item = (&'a [u8], Value<'a>);
     type IntoIter = Iter<'a>;
 
     fn into_iter(self) -> Iter<'a> {
@@ -848,11 +878,11 @@ impl<'a> IntoIterator for &'a HashFields {
 /// The fields and values of a hash given away, copied out.
 pub enum IntoIter {
     Packed(PackedHash, usize),
-    Table(std::vec::IntoIter<(String, Arc<[u8]>)>),
+    Table(std::vec::IntoIter<(Vec<u8>, Arc<[u8]>)>),
 }
 
 impl Iterator for IntoIter {
-    type Item = (String, Arc<[u8]>);
+    type Item = (Vec<u8>, Arc<[u8]>);
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -862,7 +892,7 @@ impl Iterator for IntoIter {
                     *next += 1;
                     {
                         let (field, value) = p.entry(i);
-                        (field.to_owned(), Arc::from(value))
+                        (field.to_vec(), Arc::from(value))
                     }
                 })
             }
@@ -881,7 +911,7 @@ impl Iterator for IntoIter {
 impl ExactSizeIterator for IntoIter {}
 
 impl IntoIterator for HashFields {
-    type Item = (String, Arc<[u8]>);
+    type Item = (Vec<u8>, Arc<[u8]>);
     type IntoIter = IntoIter;
 
     fn into_iter(self) -> IntoIter {
@@ -890,7 +920,7 @@ impl IntoIterator for HashFields {
             Repr::Table(t) => IntoIter::Table(
                 t.fields
                     .iter()
-                    .map(|entry| (name(entry.field).to_owned(), Arc::from(entry.value)))
+                    .map(|entry| (entry.field.to_vec(), Arc::from(entry.value)))
                     .collect::<Vec<_>>()
                     .into_iter(),
             ),
@@ -898,8 +928,8 @@ impl IntoIterator for HashFields {
     }
 }
 
-impl FromIterator<(String, Arc<[u8]>)> for HashFields {
-    fn from_iter<I: IntoIterator<Item = (String, Arc<[u8]>)>>(iter: I) -> Self {
+impl<F: AsRef<[u8]>> FromIterator<(F, Arc<[u8]>)> for HashFields {
+    fn from_iter<I: IntoIterator<Item = (F, Arc<[u8]>)>>(iter: I) -> Self {
         let iter = iter.into_iter();
         let mut out = Self::with_capacity(iter.size_hint().0);
         for (field, value) in iter {
@@ -909,18 +939,27 @@ impl FromIterator<(String, Arc<[u8]>)> for HashFields {
     }
 }
 
-impl Extend<(String, Arc<[u8]>)> for HashFields {
-    fn extend<I: IntoIterator<Item = (String, Arc<[u8]>)>>(&mut self, iter: I) {
+impl<F: AsRef<[u8]>> Extend<(F, Arc<[u8]>)> for HashFields {
+    fn extend<I: IntoIterator<Item = (F, Arc<[u8]>)>>(&mut self, iter: I) {
         for (field, value) in iter {
             self.insert_owned(field, value);
         }
     }
 }
 
-impl std::ops::Index<&str> for HashFields {
+impl std::ops::Index<&[u8]> for HashFields {
     type Output = [u8];
 
     /// The value of `field`, which the hash must have.
+    fn index(&self, field: &[u8]) -> &[u8] {
+        self.get_bytes(field).expect("no such field")
+    }
+}
+
+impl std::ops::Index<&str> for HashFields {
+    type Output = [u8];
+
+    /// The value of the field named `field`, which the hash must have.
     fn index(&self, field: &str) -> &[u8] {
         self.get_bytes(field).expect("no such field")
     }
@@ -938,10 +977,12 @@ impl PartialEq for HashFields {
 impl std::fmt::Debug for HashFields {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map()
-            .entries(
-                self.iter()
-                    .map(|(field, value)| (field, String::from_utf8_lossy(&value).into_owned())),
-            )
+            .entries(self.iter().map(|(field, value)| {
+                (
+                    String::from_utf8_lossy(field).into_owned(),
+                    String::from_utf8_lossy(&value).into_owned(),
+                )
+            }))
             .finish()
     }
 }
@@ -984,7 +1025,7 @@ mod tests {
         assert_eq!(hash.len(), model.0.len(), "step {step}");
         let mut held: Vec<(String, Vec<u8>)> = hash
             .iter()
-            .map(|(f, v)| (f.to_string(), v.to_vec()))
+            .map(|(f, v)| (String::from_utf8(f.to_vec()).unwrap(), v.to_vec()))
             .collect();
         if hash.is_table() {
             let mut want = model.0.clone();
@@ -1037,9 +1078,9 @@ mod tests {
         assert_eq!(hash.encoding(), Encoding::Listpack);
         assert!(hash.insert_bytes("f4", b"v"));
         assert!(hash.is_table());
-        let mut fields: Vec<&str> = hash.keys().collect();
+        let mut fields: Vec<&[u8]> = hash.keys().collect();
         fields.sort_unstable();
-        assert_eq!(fields, ["f0", "f1", "f2", "f3", "f4"]);
+        assert_eq!(fields, [b"f0", b"f1", b"f2", b"f3", b"f4"]);
         assert_eq!(hash.get_bytes("f0"), Some(&b"w"[..]));
         // By a long field.
         let mut hash = HashFields::new();
@@ -1154,7 +1195,10 @@ mod tests {
                         );
                         match hash.random(&mut rng) {
                             Some((f, v)) => assert!(
-                                model.0.iter().any(|(mf, mv)| mf == f && mv == v.bytes()),
+                                model
+                                    .0
+                                    .iter()
+                                    .any(|(mf, mv)| mf.as_bytes() == f && mv == v.bytes()),
                                 "step {step}"
                             ),
                             None => assert!(model.0.is_empty()),
@@ -1162,7 +1206,7 @@ mod tests {
                         let n = (r >> 30) as usize % (model.0.len() + 2);
                         let picked = hash.random_distinct(n, &mut rng);
                         assert_eq!(picked.len(), n.min(model.0.len()));
-                        let distinct: std::collections::HashSet<&str> =
+                        let distinct: std::collections::HashSet<&[u8]> =
                             picked.iter().map(|(f, _)| *f).collect();
                         assert_eq!(distinct.len(), picked.len());
                         for (f, v) in &picked {
@@ -1171,9 +1215,9 @@ mod tests {
                     }
                     14 => {
                         let cut = (r >> 40) % 5;
-                        let keep = |f: &str| f.as_bytes()[f.len() - 1] as u64 % 5 != cut;
+                        let keep = |f: &[u8]| f[f.len() - 1] as u64 % 5 != cut;
                         hash.retain(|f, _| keep(f));
-                        model.0.retain(|(f, _)| keep(f));
+                        model.0.retain(|(f, _)| keep(f.as_bytes()));
                     }
                     _ => {
                         // The settings change: hashes follow from their next
@@ -1213,8 +1257,8 @@ mod tests {
                 assert_eq!(hash.len(), n, "{n}");
                 assert_eq!(hash.get_bytes("f1"), Some(&b"again"[..]));
                 if !table {
-                    let fields: Vec<&str> = hash.keys().collect();
-                    assert_eq!(fields, ["f0", "f1", "f2"]);
+                    let fields: Vec<&[u8]> = hash.keys().collect();
+                    assert_eq!(fields, [b"f0", b"f1", b"f2"]);
                 }
             }
         }
@@ -1228,9 +1272,9 @@ mod tests {
             for i in 0..n {
                 hash.insert_bytes(&format!("f{i}"), format!("v{i}").as_bytes());
             }
-            let pairs: Vec<(String, Arc<[u8]>)> = hash.clone().into_iter().collect();
+            let pairs: Vec<(Vec<u8>, Arc<[u8]>)> = hash.clone().into_iter().collect();
             assert_eq!(pairs.len(), n);
-            assert!(pairs.contains(&("f2".to_string(), Arc::from(&b"v2"[..]))));
+            assert!(pairs.contains(&(b"f2".to_vec(), Arc::from(&b"v2"[..]))));
             let back: HashFields = pairs.into_iter().collect();
             assert_eq!(back, hash);
             assert_eq!(back.is_table(), hash.is_table());
@@ -1252,9 +1296,9 @@ mod tests {
         let _back = Back;
         crate::collection_table::set_test_max_len(Some(100));
         let mut hash = HashFields::with_capacity(1_000);
-        assert!(hash.insert_loaded("f".into(), b"v").unwrap());
+        assert!(hash.insert_loaded("f", b"v").unwrap());
         let long = vec![b'x'; 101];
-        let err = hash.insert_loaded("g".into(), &long).unwrap_err();
+        let err = hash.insert_loaded("g", &long).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         let err = hash
             .insert_loaded(String::from_utf8(long.clone()).unwrap(), b"v")
@@ -1265,8 +1309,8 @@ mod tests {
         // A block moves to the table for a long value, and is refused the
         // same way.
         let mut small = HashFields::new();
-        small.insert_loaded("a".into(), b"1").unwrap();
-        assert!(small.insert_loaded("b".into(), &long).is_err());
+        small.insert_loaded("a", b"1").unwrap();
+        assert!(small.insert_loaded("b", &long).is_err());
         assert!(small.get_bytes("b").is_none());
     }
 
@@ -1285,7 +1329,9 @@ mod tests {
         let mut rng = rng();
         for _ in 0..n * per {
             let (f, _) = hash.random(&mut rng).unwrap();
-            *counts.entry(f.to_string()).or_default() += 1;
+            *counts
+                .entry(String::from_utf8(f.to_vec()).unwrap())
+                .or_default() += 1;
         }
         assert_eq!(counts.len(), n);
         let chi: f64 = counts

@@ -31,9 +31,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         // Returns all users in ACL file format.
         "LIST" => {
             let store = ctx.acl_store.read();
-            let mut users: Vec<String> = store.values().map(|u| u.to_acl_string()).collect();
+            let mut users: Vec<Vec<u8>> = store.values().map(|u| u.to_acl_line()).collect();
             users.sort(); // deterministic output
-            Some(resp_array(users.iter().map(|s| resp_bulk_str(s)).collect()))
+            Some(resp_array(users.iter().map(|s| resp_bulk(s)).collect()))
         }
 
         // ── ACL USERS ─────────────────────────────────────────────────────────
@@ -96,25 +96,26 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         .selectors
                         .iter()
                         .map(|s| {
+                            // The patterns are their bytes, as Redis gives them.
                             let keys = s
                                 .keys
                                 .iter()
-                                .map(|k| k.to_string())
+                                .map(|k| k.rule())
                                 .collect::<Vec<_>>()
-                                .join(" ");
+                                .join(&b' ');
                             let channels = s
                                 .channels
                                 .iter()
-                                .map(|c| format!("&{c}"))
+                                .map(|c| [&b"&"[..], c].concat())
                                 .collect::<Vec<_>>()
-                                .join(" ");
+                                .join(&b' ');
                             resp_array(vec![
                                 resp_bulk_str("commands"),
                                 resp_bulk_str(&s.commands),
                                 resp_bulk_str("keys"),
-                                resp_bulk_str(&keys),
+                                resp_bulk(&keys),
                                 resp_bulk_str("channels"),
-                                resp_bulk_str(&channels),
+                                resp_bulk(&channels),
                             ])
                         })
                         .collect();
@@ -127,9 +128,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         resp_bulk_str("commands"),
                         resp_bulk_str(&user.commands),
                         resp_bulk_str("keys"),
-                        resp_bulk_str(&user.keys_string()),
+                        resp_bulk(&user.keys_string()),
                         resp_bulk_str("channels"),
-                        resp_bulk_str(&user.channels_string()),
+                        resp_bulk(&user.channels_string()),
                         resp_bulk_str("selectors"),
                         resp_array(selectors),
                     ]))
@@ -193,24 +194,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR Usernames can't contain spaces or null characters",
                 ));
             }
-            let mut args: Vec<String> = Vec::with_capacity(cmd.len().saturating_sub(3));
-            for rule_bytes in cmd.iter().skip(3) {
-                match std::str::from_utf8(rule_bytes) {
-                    Ok(s) => args.push(s.to_string()),
-                    // A password is any bytes, as in Redis: one that is not
-                    // UTF-8 is added, or removed, by its hash.
-                    Err(_) => match rule_bytes.split_first() {
-                        Some((b'>', password)) => {
-                            args.push(format!("#{}", crate::acl::sha256_hex(password)))
-                        }
-                        Some((b'<', password)) => {
-                            args.push(format!("!{}", crate::acl::sha256_hex(password)))
-                        }
-                        _ => return Some(resp_error("ERR invalid rule")),
-                    },
-                }
-            }
-            let rules = match crate::acl::merge_selector_args(args.iter().map(String::as_str)) {
+            // The rules are bytes, as in Redis: a password, and a key or
+            // channel pattern, are any bytes (`acl::apply_rule`).
+            let rules = match crate::acl::merge_selector_args(cmd.iter().skip(3).copied()) {
                 Ok(rules) => rules,
                 Err(e) => return Some(resp_error(&format!("ERR {e}"))),
             };
@@ -226,7 +212,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             for rule in &rules {
                 if let Err(e) = crate::acl::apply_rule(&mut user, rule) {
                     return Some(resp_error(&format!(
-                        "ERR Error in ACL SETUSER modifier '{rule}': {e}"
+                        "ERR Error in ACL SETUSER modifier '{}': {e}",
+                        String::from_utf8_lossy(rule)
                     )));
                 }
             }
@@ -434,7 +421,7 @@ fn format_acl_log(entries: Vec<AclLogEntry>, resp: u8) -> Vec<u8> {
                 resp_bulk_str("context"),
                 resp_bulk_str(&e.context),
                 resp_bulk_str("object"),
-                resp_bulk_str(&e.object),
+                resp_bulk(&e.object),
                 resp_bulk_str("username"),
                 resp_bulk_str(&e.username),
                 resp_bulk_str("age-seconds"),

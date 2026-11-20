@@ -120,6 +120,21 @@ one() { # tag, label, redis-benchmark args...
 }
 
 V100=$(printf 'x%.0s' $(seq 100))
+if [ "${WORKLOADS:-}" = acl ]; then
+  # What the key check costs a user with key patterns (#510): GET and SET
+  # of 100 B as the default user (`~*`, which is not checked key by key),
+  # and as a user limited to `~key:*`, whose every key is matched against
+  # the pattern.
+  USER_SETUP="ACL SETUSER bench on >pw ~key:* &* +@all"
+  for tag in "$@"; do
+    DSIZE=100; one "$tag" GET-100 -d 100 -t get
+    DSIZE=100; one "$tag" SET-100 -d 100 -t set
+    DSIZE=100; SETUP=$USER_SETUP one "$tag" GET-100-KEYS --user bench -a pw -d 100 -t get
+    DSIZE=100; SETUP=$USER_SETUP one "$tag" SET-100-KEYS --user bench -a pw -d 100 -t set
+  done | tee /out/raw.txt
+  echo done
+  exit 0
+fi
 LRU="--maxmemory 64gb --maxmemory-policy allkeys-lru"
 LFU="--maxmemory 64gb --maxmemory-policy allkeys-lfu"
 if [ "${WORKLOADS:-}" = stream ]; then

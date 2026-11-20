@@ -518,6 +518,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Hash field names are bytes in memory, and ACL key and channel patterns
+  are bytes (#510).** Last of the four steps of #437:
+  - A hash keeps a field as the bytes it was sent as, in a block and in a
+    table alike. `HSCAN MATCH` matches those bytes,
+    `hash-max-listpack-value` and `MEMORY USAGE` count them, and the field
+    events of keyspace notifications (`hexpired`, `hdel`, `hexpire`,
+    `hpersist`) carry them.
+  - KDB snapshots, `DUMP` payloads (and so `MIGRATE` and slot migration),
+    full syncs and `DEBUG DIGEST-VALUE` write a field name as 1.2 wrote it,
+    so a snapshot, an AOF, a payload or a replication stream of either
+    version reads the same on the other, byte for byte.
+  - A Redis, Valkey or KeyDB RDB file's hash fields, with their TTLs, load
+    as their bytes.
+  - `HIMPORT PREPARE` keeps a fieldset's names as their bytes, and
+    `HIMPORT SET` sends them on so.
+  - `ACL SETUSER` takes key and channel patterns (`~`, `%R~`, `%W~`, `&`,
+    in selectors too) and passwords of any bytes, and a pattern matches a
+    key's or channel's bytes exactly. `ACL LIST`, `ACL GETUSER`, `ACL LOG`'s
+    `object` and the ACL file give a pattern's own bytes, as Redis writes
+    them. A word of the ACL file that begins with a quote is read as Redis
+    reads a quoted one; any other is its bytes up to the next white space,
+    as before.
+  - A key or channel pattern with white space or a NUL in it is refused
+    (`Syntax error`), as by Redis: the ACL file could not hold it.
+  - Going back to 1.2.x: an ACL file saved with a pattern that is not UTF-8
+    in it is refused by 1.2.x at startup and by its `ACL LOAD`; remove the
+    pattern (or the user) before the rollback.
 - **A script's command on a key it did not declare is routed while its
   slot is being moved (#340).** With the script's slot `MIGRATING` or
   `IMPORTING` on the node, such a command is routed as a client's would

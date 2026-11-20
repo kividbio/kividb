@@ -168,7 +168,11 @@ fn keydb_hash_field_ttls_load_as_field_ttls() {
     };
     {
         let h = h.read();
-        let mut fields: Vec<&str> = h.fields.keys().collect();
+        let mut fields: Vec<&str> = h
+            .fields
+            .keys()
+            .map(|f| std::str::from_utf8(f).unwrap())
+            .collect();
         fields.sort_unstable();
         assert_eq!(fields, ["a", "b", "c"]);
         assert_eq!(h.expiries.len(), 2);

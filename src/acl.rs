@@ -62,36 +62,38 @@ pub fn resync_connection(
 // ── ACL user ──────────────────────────────────────────────────────────────────
 
 /// One key pattern of a user: `~pattern` (read and write), `%R~pattern`,
-/// `%W~pattern` or `%RW~pattern`.
+/// `%W~pattern` or `%RW~pattern`. The pattern is bytes, any bytes but white
+/// space and NUL, as in Redis, and is matched against a key's bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyPattern {
-    pub pattern: String,
+    pub pattern: Vec<u8>,
     pub read: bool,
     pub write: bool,
 }
 
 impl KeyPattern {
     /// `~pattern`: both reading and writing.
-    pub fn read_write(pattern: &str) -> Self {
+    pub fn read_write(pattern: impl AsRef<[u8]>) -> Self {
         Self {
-            pattern: pattern.to_string(),
+            pattern: pattern.as_ref().to_vec(),
             read: true,
             write: true,
         }
     }
 
     fn is_all(&self) -> bool {
-        self.pattern == "*" && self.read && self.write
+        self.pattern == b"*" && self.read && self.write
     }
-}
 
-impl std::fmt::Display for KeyPattern {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match (self.read, self.write) {
-            (true, false) => write!(f, "%R~{}", self.pattern),
-            (false, true) => write!(f, "%W~{}", self.pattern),
-            _ => write!(f, "~{}", self.pattern),
-        }
+    /// The rule that gives it, as Redis writes one (`sdsCatPatternString`):
+    /// `~app:*`, `%R~cache:*`, `%W~log:*`, the pattern's own bytes after it.
+    pub fn rule(&self) -> Vec<u8> {
+        let flag: &[u8] = match (self.read, self.write) {
+            (true, false) => b"%R~",
+            (false, true) => b"%W~",
+            _ => b"~",
+        };
+        [flag, &self.pattern].concat()
     }
 }
 
@@ -102,7 +104,8 @@ impl std::fmt::Display for KeyPattern {
 pub struct Selector {
     pub commands: String,
     pub keys: Vec<KeyPattern>,
-    pub channels: Vec<String>,
+    /// Channel patterns, bytes, held without their `&`.
+    pub channels: Vec<Vec<u8>>,
 }
 
 impl Default for Selector {
@@ -115,13 +118,18 @@ impl Default for Selector {
     }
 }
 
-impl std::fmt::Display for Selector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "({})",
-            describe_permissions(&self.keys, &self.channels, &self.commands)
-        )
+impl Selector {
+    /// `(~k resetchannels -@all +get)`, as `ACL LIST` and the ACL file write
+    /// a selector.
+    pub fn rule(&self) -> Vec<u8> {
+        let mut out = b"(".to_vec();
+        out.extend_from_slice(&describe_permissions(
+            &self.keys,
+            &self.channels,
+            &self.commands,
+        ));
+        out.push(b')');
+        out
     }
 }
 
@@ -141,9 +149,9 @@ pub struct AclUser {
     /// Key patterns. A key is allowed if it matches any of them; the pattern
     /// `*` is "all keys", and no patterns is "no keys".
     pub keys: Vec<KeyPattern>,
-    /// Pub/sub channel patterns, held without their `&`. `*` is every
-    /// channel, none is no channel.
-    pub channels: Vec<String>,
+    /// Pub/sub channel patterns, bytes, held without their `&`. `*` is
+    /// every channel, none is no channel.
+    pub channels: Vec<Vec<u8>>,
     /// Further permission sets; see [`Selector`].
     pub selectors: Vec<Selector>,
 }
@@ -192,7 +200,7 @@ impl AclUser {
 
     /// May read every key (`~*`, `allkeys` or `%R~*`).
     pub fn reads_all_keys(&self) -> bool {
-        self.keys.iter().any(|k| k.pattern == "*" && k.read)
+        self.keys.iter().any(|k| k.pattern == b"*" && k.read)
     }
 
     /// May use every pub/sub channel (`&*` / `allchannels`).
@@ -207,76 +215,95 @@ impl AclUser {
         self.enabled && (self.nopass || self.passwords.contains(&sha256_hex(password)))
     }
 
-    /// The key patterns as `ACL GETUSER` prints them: `~app:* %R~cache:*`.
-    pub fn keys_string(&self) -> String {
-        join(self.keys.iter())
+    /// The key patterns as `ACL GETUSER` prints them: `~app:* %R~cache:*`,
+    /// each pattern its bytes.
+    pub fn keys_string(&self) -> Vec<u8> {
+        keys_rules(&self.keys)
     }
 
     /// The channel patterns as `ACL GETUSER` prints them: `&news.*`.
-    pub fn channels_string(&self) -> String {
-        join(self.channels.iter().map(|c| format!("&{c}")))
+    pub fn channels_string(&self) -> Vec<u8> {
+        channels_rules(&self.channels)
     }
 
-    /// Format as an ACL file / `ACL LIST` line. What this writes,
-    /// [`parse_acl_file`] reads back to the same user.
-    pub fn to_acl_string(&self) -> String {
+    /// Format as an ACL file / `ACL LIST` line, as Redis writes one: the
+    /// patterns are their own bytes. What this writes, [`parse_acl_file`]
+    /// reads back to the same user.
+    pub fn to_acl_line(&self) -> Vec<u8> {
         let mut out = format!(
             "user {} {}",
             self.name,
             if self.enabled { "on" } else { "off" }
-        );
+        )
+        .into_bytes();
         if self.nopass {
-            out.push_str(" nopass");
+            out.extend_from_slice(b" nopass");
         }
         // A user with neither `nopass` nor a password cannot log in. It used
         // to be written as `nopass` — which, read back, let anyone in.
         for hash in &self.passwords {
-            out.push_str(" #");
-            out.push_str(hash);
+            out.extend_from_slice(b" #");
+            out.extend_from_slice(hash.as_bytes());
         }
-        out.push(' ');
-        out.push_str(&describe_permissions(
+        out.push(b' ');
+        out.extend_from_slice(&describe_permissions(
             &self.keys,
             &self.channels,
             &self.commands,
         ));
         for selector in &self.selectors {
-            out.push(' ');
-            out.push_str(&selector.to_string());
+            out.push(b' ');
+            out.extend_from_slice(&selector.rule());
         }
         out
     }
 }
 
-fn join<T: std::fmt::Display>(items: impl Iterator<Item = T>) -> String {
-    items
-        .map(|item| item.to_string())
-        .collect::<Vec<_>>()
-        .join(" ")
+/// `rules`, a space between each.
+fn join(rules: impl Iterator<Item = Vec<u8>>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for rule in rules {
+        if !out.is_empty() {
+            out.push(b' ');
+        }
+        out.extend_from_slice(&rule);
+    }
+    out
+}
+
+fn keys_rules(keys: &[KeyPattern]) -> Vec<u8> {
+    join(keys.iter().map(KeyPattern::rule))
+}
+
+fn channels_rules(channels: &[Vec<u8>]) -> Vec<u8> {
+    join(channels.iter().map(|c| [&b"&"[..], c].concat()))
 }
 
 fn all_keys(keys: &[KeyPattern]) -> bool {
     keys.iter().any(KeyPattern::is_all)
 }
 
-fn all_channels(channels: &[String]) -> bool {
-    channels.iter().any(|c| c == "*")
+fn all_channels(channels: &[Vec<u8>]) -> bool {
+    channels.iter().any(|c| c == b"*")
 }
 
 /// `~a ~b resetchannels &c +@all` — keys, channels, commands, in the order
 /// Redis prints them and in a form that can be applied to an empty user.
-fn describe_permissions(keys: &[KeyPattern], channels: &[String], commands: &str) -> String {
-    let keys = if keys.is_empty() {
-        "resetkeys".to_string()
+fn describe_permissions(keys: &[KeyPattern], channels: &[Vec<u8>], commands: &str) -> Vec<u8> {
+    let mut out = if keys.is_empty() {
+        b"resetkeys".to_vec()
     } else {
-        join(keys.iter())
+        keys_rules(keys)
     };
-    let channels = if channels.is_empty() {
-        "resetchannels".to_string()
+    out.push(b' ');
+    if channels.is_empty() {
+        out.extend_from_slice(b"resetchannels");
     } else {
-        join(channels.iter().map(|c| format!("&{c}")))
-    };
-    format!("{keys} {channels} {commands}")
+        out.extend_from_slice(&channels_rules(channels));
+    }
+    out.push(b' ');
+    out.extend_from_slice(commands.as_bytes());
+    out
 }
 
 // ── SHA-256 helper ─────────────────────────────────────────────────────────────
@@ -343,7 +370,7 @@ pub struct AclLogEntry {
     pub id: u64,
     pub reason: String,              // "auth" or "command" or "key" or "channel"
     pub context: String,             // "toplevel" or "multi" or "lua"
-    pub object: String,              // the offending command/key/channel name
+    pub object: Vec<u8>,             // the offending command/key/channel name, its bytes
     pub username: String,            // which user triggered it
     pub age_seconds: f64,            // seconds since the event (computed at query time)
     pub client_info: String,         // addr:port
@@ -411,7 +438,7 @@ impl AclLog {
     /// Record a refusal: a command, key or channel the user's rules refuse,
     /// or a failed AUTH. The context is the one the connection is in (see
     /// [`log_context`]): `toplevel`, `multi` or `lua`.
-    pub fn record(&self, reason: &str, object: &str, username: &str, client_info: &str) {
+    pub fn record(&self, reason: &str, object: &[u8], username: &str, client_info: &str) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -420,7 +447,7 @@ impl AclLog {
             id: 0,
             reason: reason.into(),
             context: LOG_CONTEXT.with(|context| context.get()).into(),
-            object: object.into(),
+            object: object.to_vec(),
             username: username.into(),
             age_seconds: 0.0,
             client_info: client_info.into(),
@@ -530,22 +557,32 @@ use std::io::Write;
 ///
 /// The file is taken whole or not at all: any line that cannot be understood
 /// is an error, reported with its line number, and no users are returned.
+///
+/// The file is bytes, as Redis's is: a key or channel pattern is written as
+/// its own bytes ([`AclUser::to_acl_line`]). A word that begins with a quote
+/// is read as Redis reads one (`"~app:\xff*"`, `'~a b'`); any other word is
+/// its bytes up to the next white space, quotes and all, as every earlier
+/// KiviDB wrote and read it.
 pub fn parse_acl_file(
-    contents: &str,
+    contents: impl AsRef<[u8]>,
     requirepass: &str,
 ) -> Result<AHashMap<String, AclUser>, String> {
     let mut users: AHashMap<String, AclUser> = AHashMap::new();
     let mut errors: Vec<String> = Vec::new();
 
-    for (index, line) in contents.lines().enumerate() {
+    for (index, line) in contents.as_ref().split(|&b| b == b'\n').enumerate() {
         let number = index + 1;
-        let line = line.trim();
+        let line = line.trim_ascii();
         // Skip comments and blank lines
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() || line.starts_with(b"#") {
             continue;
         }
-        let mut tokens = line.split_whitespace();
-        if tokens.next() != Some("user") {
+        let Some(words) = file_words(line) else {
+            errors.push(format!("line {number}: unbalanced quotes"));
+            continue;
+        };
+        let mut tokens = words.iter().map(Vec::as_slice);
+        if tokens.next() != Some(&b"user"[..]) {
             errors.push(format!(
                 "line {number}: a line should start with the 'user' keyword"
             ));
@@ -553,6 +590,10 @@ pub fn parse_acl_file(
         }
         let Some(name) = tokens.next() else {
             errors.push(format!("line {number}: 'user' must be followed by a name"));
+            continue;
+        };
+        let Ok(name) = std::str::from_utf8(name) else {
+            errors.push(format!("line {number}: a user name must be UTF-8"));
             continue;
         };
         if users.contains_key(name) {
@@ -570,7 +611,10 @@ pub fn parse_acl_file(
         let mut ok = true;
         for rule in &rules {
             if let Err(e) = apply_rule(&mut user, rule) {
-                errors.push(format!("line {number}: error in rule '{rule}': {e}"));
+                errors.push(format!(
+                    "line {number}: error in rule '{}': {e}",
+                    String::from_utf8_lossy(rule)
+                ));
                 ok = false;
                 break;
             }
@@ -598,7 +642,7 @@ pub fn parse_acl_file(
 /// apply each line on top of the user already in memory, so a changed
 /// password was *added* and a removed user stayed.)
 pub fn load_acl_file(path: &str, store: &AclStore, requirepass: &str) -> Result<(), String> {
-    let contents = std::fs::read_to_string(path).map_err(|e| format!("opening '{path}': {e}"))?;
+    let contents = std::fs::read(path).map_err(|e| format!("opening '{path}': {e}"))?;
     let users = parse_acl_file(&contents, requirepass).map_err(|e| format!("{path}: {e}"))?;
     *store.write() = users;
     acl_changed();
@@ -617,7 +661,8 @@ pub fn save_acl_file(path: &str, store: &AclStore) -> std::io::Result<()> {
 
     for name in names {
         if let Some(user) = map.get(name) {
-            writeln!(file, "{}", user.to_acl_string())?;
+            file.write_all(&user.to_acl_line())?;
+            file.write_all(b"\n")?;
         }
     }
     file.flush()?;
@@ -628,25 +673,104 @@ pub fn save_acl_file(path: &str, store: &AclStore) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The words of a line of an ACL file: apart at white space; a word that
+/// begins with `"` or `'` is read as Redis reads a quoted one (`sdssplitargs`:
+/// `\xHH`, `\n` and the like in double quotes, only `\'` in single ones),
+/// and must end at its closing quote. `None` for a quote left open.
+fn file_words(line: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let mut words = Vec::new();
+    let mut i = 0;
+    loop {
+        while i < line.len() && line[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let Some(&first) = line.get(i) else {
+            return Some(words);
+        };
+        let mut word = Vec::new();
+        if first != b'"' && first != b'\'' {
+            while i < line.len() && !line[i].is_ascii_whitespace() {
+                word.push(line[i]);
+                i += 1;
+            }
+            words.push(word);
+            continue;
+        }
+        i += 1;
+        loop {
+            let at = *line.get(i)?;
+            match (first, at) {
+                (b'"', b'\\') if line.get(i + 1) == Some(&b'x') => {
+                    match (
+                        line.get(i + 2).copied().and_then(hex),
+                        line.get(i + 3).copied().and_then(hex),
+                    ) {
+                        (Some(high), Some(low)) => {
+                            word.push(high * 16 + low);
+                            i += 3;
+                        }
+                        _ => {
+                            word.push(b'x');
+                            i += 1;
+                        }
+                    }
+                }
+                (b'"', b'\\') if i + 1 < line.len() => {
+                    i += 1;
+                    word.push(match line[i] {
+                        b'n' => b'\n',
+                        b'r' => b'\r',
+                        b't' => b'\t',
+                        b'b' => 0x08,
+                        b'a' => 0x07,
+                        other => other,
+                    });
+                }
+                (b'\'', b'\\') if line.get(i + 1) == Some(&b'\'') => {
+                    i += 1;
+                    word.push(b'\'');
+                }
+                (quote, byte) if byte == quote => {
+                    // The closing quote ends the word.
+                    if line
+                        .get(i + 1)
+                        .is_some_and(|next| !next.is_ascii_whitespace())
+                    {
+                        return None;
+                    }
+                    i += 1;
+                    break;
+                }
+                (_, byte) => word.push(byte),
+            }
+            i += 1;
+        }
+        words.push(word);
+    }
+}
+
 // ── Rules ─────────────────────────────────────────────────────────────────────
 
 /// Join the pieces of a selector back together. A selector may arrive as one
 /// argument, `(~k +get)`, or — typed without quotes, or read from a file
 /// split on spaces — as several: `(~k`, `+get)`.
-pub fn merge_selector_args<'a>(args: impl Iterator<Item = &'a str>) -> Result<Vec<String>, String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut open: Option<String> = None;
+pub fn merge_selector_args<'a>(
+    args: impl Iterator<Item = &'a [u8]>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut open: Option<Vec<u8>> = None;
     for arg in args {
         match open.as_mut() {
             Some(selector) => {
-                selector.push(' ');
-                selector.push_str(arg);
-                if arg.ends_with(')') {
+                selector.push(b' ');
+                selector.extend_from_slice(arg);
+                if arg.ends_with(b")") {
                     out.push(open.take().unwrap_or_default());
                 }
             }
-            None if arg.starts_with('(') && !arg.ends_with(')') => open = Some(arg.to_string()),
-            None => out.push(arg.to_string()),
+            None if arg.starts_with(b"(") && !arg.ends_with(b")") => open = Some(arg.to_vec()),
+            None => out.push(arg.to_vec()),
         }
     }
     match open {
@@ -668,11 +792,11 @@ const CHANNEL_AFTER_ALL: &str = "Adding a pattern after the * pattern (or the 'a
 fn apply_permission_rule(
     commands: &mut String,
     keys: &mut Vec<KeyPattern>,
-    channels: &mut Vec<String>,
-    rule: &str,
+    channels: &mut Vec<Vec<u8>>,
+    rule: &[u8],
 ) -> Result<bool, String> {
     let add_key = |keys: &mut Vec<KeyPattern>, pattern: KeyPattern| -> Result<(), String> {
-        if pattern.pattern.is_empty() {
+        if pattern.pattern.is_empty() || has_spaces(&pattern.pattern) {
             return Err(SYNTAX_ERROR.to_string());
         }
         if pattern.is_all() {
@@ -691,30 +815,31 @@ fn apply_permission_rule(
     };
 
     match rule {
-        "allkeys" | "~*" => add_key(keys, KeyPattern::read_write("*"))?,
-        "resetkeys" => keys.clear(),
-        "allchannels" | "&*" => {
+        b"allkeys" | b"~*" => add_key(keys, KeyPattern::read_write("*"))?,
+        b"resetkeys" => keys.clear(),
+        b"allchannels" | b"&*" => {
             channels.clear();
-            channels.push("*".to_string());
+            channels.push(b"*".to_vec());
         }
-        "resetchannels" => channels.clear(),
-        "allcommands" | "+@all" => *commands = "+@all".into(),
-        "nocommands" | "-@all" => *commands = "-@all".into(),
+        b"resetchannels" => channels.clear(),
+        b"allcommands" | b"+@all" => *commands = "+@all".into(),
+        b"nocommands" | b"-@all" => *commands = "-@all".into(),
         // Sugar for a read-only user: block every data-mutating command
         // (see the `write` ACL category / `replication::is_write_command`).
         // Does not itself restrict admin/server commands (CONFIG, SHUTDOWN,
         // ...) — combine with explicit `-cmd` rules for full lockdown.
-        "readonly" => push_command_rule(commands, "-@write"),
-        r if r.starts_with('~') => add_key(keys, KeyPattern::read_write(&r[1..]))?,
-        r if r.starts_with('%') => {
-            let Some((flags, pattern)) = r[1..].split_once('~') else {
+        b"readonly" => push_command_rule(commands, "-@write"),
+        [b'~', pattern @ ..] => add_key(keys, KeyPattern::read_write(pattern))?,
+        [b'%', rest @ ..] => {
+            let Some(at) = rest.iter().position(|&b| b == b'~') else {
                 return Err(SYNTAX_ERROR.to_string());
             };
+            let (flags, pattern) = (&rest[..at], &rest[at + 1..]);
             let (mut read, mut write) = (false, false);
-            for flag in flags.chars() {
+            for flag in flags {
                 match flag {
-                    'R' | 'r' => read = true,
-                    'W' | 'w' => write = true,
+                    b'R' | b'r' => read = true,
+                    b'W' | b'w' => write = true,
                     _ => return Err(SYNTAX_ERROR.to_string()),
                 }
             }
@@ -724,31 +849,41 @@ fn apply_permission_rule(
             add_key(
                 keys,
                 KeyPattern {
-                    pattern: pattern.to_string(),
+                    pattern: pattern.to_vec(),
                     read,
                     write,
                 },
             )?;
         }
-        r if r.starts_with('&') => {
-            let pattern = &r[1..];
-            if pattern.is_empty() {
+        [b'&', pattern @ ..] => {
+            if pattern.is_empty() || has_spaces(pattern) {
                 return Err(SYNTAX_ERROR.to_string());
             }
             if all_channels(channels) {
                 return Err(CHANNEL_AFTER_ALL.to_string());
             }
             if !channels.iter().any(|c| c == pattern) {
-                channels.push(pattern.to_string());
+                channels.push(pattern.to_vec());
             }
         }
-        r if r.starts_with('+') || r.starts_with('-') => {
+        [b'+' | b'-', ..] => {
+            // Command rules are text: a command's name is.
+            let r = std::str::from_utf8(rule).map_err(|_| UNKNOWN_COMMAND.to_string())?;
             check_command_rule(r)?;
             push_command_rule(commands, r);
         }
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+/// Whether a pattern has white space or a NUL in it, which Redis refuses in
+/// one (`ACLStringHasSpaces`): a line of the ACL file is split at white
+/// space, and the pattern could not be written there as it is.
+fn has_spaces(pattern: &[u8]) -> bool {
+    pattern
+        .iter()
+        .any(|&b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | 0))
 }
 
 /// Append a `+…` / `-…` rule, unless it could not change anything.
@@ -764,8 +899,10 @@ fn push_command_rule(commands: &mut String, rule: &str) {
 /// A `+…` / `-…` rule must name a category, a command or a subcommand that
 /// exists. One that does not used to be stored and never match — so a typo in
 /// `-@dangerous` granted what it was written to deny.
+const UNKNOWN_COMMAND: &str = "Unknown command or category name in ACL";
+
 fn check_command_rule(rule: &str) -> Result<(), String> {
-    const UNKNOWN: &str = "Unknown command or category name in ACL";
+    const UNKNOWN: &str = UNKNOWN_COMMAND;
     let name = &rule[1..];
     if let Some(category) = name.strip_prefix('@') {
         let category = category.to_ascii_lowercase();
@@ -796,13 +933,15 @@ fn check_command_rule(rule: &str) -> Result<(), String> {
     }
 }
 
-fn check_password_hash(hash: &str) -> Result<(), String> {
+/// The hash of a `#` or `!` rule, if it is one: 64 lower-case hex digits.
+fn check_password_hash(hash: &[u8]) -> Result<&str, String> {
     if hash.len() == 64
         && hash
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
     {
-        Ok(())
+        // ASCII, so text.
+        Ok(std::str::from_utf8(hash).unwrap_or_default())
     } else {
         Err(
             "The password hash must be exactly 64 characters and contain only lowercase \
@@ -813,13 +952,16 @@ fn check_password_hash(hash: &str) -> Result<(), String> {
 }
 
 /// Parse the inside of `(…)` into a selector.
-fn parse_selector(rule: &str) -> Result<Selector, String> {
+fn parse_selector(rule: &[u8]) -> Result<Selector, String> {
     let inner = rule
-        .strip_prefix('(')
-        .and_then(|r| r.strip_suffix(')'))
+        .strip_prefix(b"(")
+        .and_then(|r| r.strip_suffix(b")"))
         .ok_or_else(|| SYNTAX_ERROR.to_string())?;
     let mut selector = Selector::default();
-    for part in inner.split_whitespace() {
+    for part in inner
+        .split(u8::is_ascii_whitespace)
+        .filter(|part| !part.is_empty())
+    {
         let known = apply_permission_rule(
             &mut selector.commands,
             &mut selector.keys,
@@ -839,49 +981,52 @@ fn parse_selector(rule: &str) -> Result<Selector, String> {
 /// `Err` is the reason the rule was refused, in Redis's words. A rule that is
 /// not understood is an error: it used to be skipped, which turned a
 /// misspelt restriction into no restriction.
-pub fn apply_rule(user: &mut AclUser, rule: &str) -> Result<(), String> {
+///
+/// A rule is bytes, as an argument of `ACL SETUSER` or a word of the ACL
+/// file is: a password (`>`, `<`) and a key or channel pattern (`~`, `%R~`,
+/// `&`) are any bytes; the other rules are words of text.
+pub fn apply_rule(user: &mut AclUser, rule: impl AsRef<[u8]>) -> Result<(), String> {
+    let rule = rule.as_ref();
     match rule {
-        "on" => user.enabled = true,
-        "off" => user.enabled = false,
-        "nopass" => {
+        b"on" => user.enabled = true,
+        b"off" => user.enabled = false,
+        b"nopass" => {
             user.nopass = true;
             user.passwords.clear();
         }
-        "resetpass" => {
+        b"resetpass" => {
             user.nopass = false;
             user.passwords.clear();
         }
-        "reset" => {
+        b"reset" => {
             let name = std::mem::take(&mut user.name);
             *user = AclUser::new(&name);
         }
-        "clearselectors" => user.selectors.clear(),
+        b"clearselectors" => user.selectors.clear(),
         // Accepted for compatibility with Redis-written files: payloads are
         // always checked.
-        "sanitize-payload" | "skip-sanitize-payload" => {}
-        r if r.starts_with('(') => user.selectors.push(parse_selector(r)?),
-        r if r.starts_with('>') => {
-            let hash = sha256_hex(&r[1..]);
+        b"sanitize-payload" | b"skip-sanitize-payload" => {}
+        [b'(', ..] => user.selectors.push(parse_selector(rule)?),
+        [b'>', password @ ..] => {
+            let hash = sha256_hex(password);
             if !user.passwords.contains(&hash) {
                 user.passwords.push(hash);
             }
             user.nopass = false;
         }
-        r if r.starts_with('<') => {
-            let hash = sha256_hex(&r[1..]);
+        [b'<', password @ ..] => {
+            let hash = sha256_hex(password);
             remove_password(user, &hash)?;
         }
-        r if r.starts_with('#') => {
-            let hash = &r[1..];
-            check_password_hash(hash)?;
+        [b'#', hash @ ..] => {
+            let hash = check_password_hash(hash)?;
             if !user.passwords.iter().any(|h| h == hash) {
                 user.passwords.push(hash.to_string());
             }
             user.nopass = false;
         }
-        r if r.starts_with('!') => {
-            let hash = &r[1..];
-            check_password_hash(hash)?;
+        [b'!', hash @ ..] => {
+            let hash = check_password_hash(hash)?;
             remove_password(user, hash)?;
         }
         r => {
@@ -1022,8 +1167,7 @@ fn key_matches(patterns: &[KeyPattern], key: &[u8], read: bool, write: bool) -> 
     patterns.iter().any(|p| {
         (!read || p.read)
             && (!write || p.write)
-            && (p.pattern == "*"
-                || crate::commands::helpers::glob_match_bytes(p.pattern.as_bytes(), key))
+            && (p.pattern == b"*" || crate::commands::helpers::glob_match_bytes(&p.pattern, key))
     })
 }
 
@@ -1043,8 +1187,10 @@ pub fn may_read_key(user: &AclUser, key: &[u8]) -> bool {
 pub enum Denied {
     /// The command itself (named as it should be reported: `config|set`).
     Command(String),
-    Key(String),
-    Channel(String),
+    /// A key, its bytes.
+    Key(Vec<u8>),
+    /// A channel, its bytes.
+    Channel(Vec<u8>),
 }
 
 impl Denied {
@@ -1057,10 +1203,12 @@ impl Denied {
         }
     }
 
-    /// The command, key or channel that was refused.
-    pub fn object(&self) -> &str {
+    /// The command, key or channel that was refused: what an ACL log entry
+    /// names, as Redis names it, its bytes.
+    pub fn object(&self) -> &[u8] {
         match self {
-            Denied::Command(s) | Denied::Key(s) | Denied::Channel(s) => s,
+            Denied::Command(s) => s.as_bytes(),
+            Denied::Key(s) | Denied::Channel(s) => s,
         }
     }
 
@@ -1070,11 +1218,13 @@ impl Denied {
             Denied::Command(command) => {
                 format!("NOPERM User {username} has no permissions to run the '{command}' command")
             }
-            Denied::Key(key) => {
-                format!("NOPERM User {username} has no permissions to access the '{key}' key")
-            }
+            Denied::Key(key) => format!(
+                "NOPERM User {username} has no permissions to access the '{}' key",
+                String::from_utf8_lossy(key)
+            ),
             Denied::Channel(channel) => format!(
-                "NOPERM User {username} has no permissions to access the '{channel}' channel"
+                "NOPERM User {username} has no permissions to access the '{}' channel",
+                String::from_utf8_lossy(channel)
             ),
         }
     }
@@ -1229,7 +1379,7 @@ fn channel_arguments(name: &str) -> Option<(std::ops::RangeFrom<usize>, bool, bo
 fn permissions_allow(
     commands: &str,
     keys: &[KeyPattern],
-    channels: &[String],
+    channels: &[Vec<u8>],
     name: &str,
     cmd: &[&[u8]],
 ) -> Result<(), Denied> {
@@ -1252,16 +1402,14 @@ fn permissions_allow(
                 let allowed = if patterns {
                     // A pattern subscription is allowed only for a pattern
                     // the user was given, letter for letter.
-                    channels.iter().any(|c| c.as_bytes() == channel)
+                    channels.iter().any(|c| c == channel)
                 } else {
                     channels
                         .iter()
-                        .any(|c| crate::commands::helpers::glob_match_bytes(c.as_bytes(), channel))
+                        .any(|c| crate::commands::helpers::glob_match_bytes(c, channel))
                 };
                 if !allowed {
-                    return Err(Denied::Channel(
-                        String::from_utf8_lossy(channel).into_owned(),
-                    ));
+                    return Err(Denied::Channel(channel.to_vec()));
                 }
             }
         }
@@ -1275,7 +1423,7 @@ fn permissions_allow(
             let key = cmd[pos];
             let (read, write) = key_access(name, cmd, nth);
             if !key_matches(keys, key, read, write) {
-                return Err(Denied::Key(String::from_utf8_lossy(key).into_owned()));
+                return Err(Denied::Key(key.to_vec()));
             }
         }
     }
@@ -1403,11 +1551,11 @@ mod tests {
         let entries = log.get(usize::MAX);
         assert_eq!(entries.len(), 2);
         let a = &entries[0];
-        assert_eq!((a.object.as_str(), a.count, a.id), ("a", 2, 0));
+        assert_eq!((&a.object[..], a.count, a.id), (&b"a"[..], 2, 0));
         assert_eq!(a.timestamp_created, 1_000);
         assert_eq!(a.timestamp_last_updated, 3_000);
         assert_eq!(a.client_info, "c2");
-        assert_eq!((entries[1].object.as_str(), entries[1].id), ("b", 1));
+        assert_eq!((&entries[1].object[..], entries[1].id), (&b"b"[..], 1));
 
         // More than 60 s after its last update: a new entry.
         log.push(event("a", "c3", 3_000 + 60_001));
@@ -1432,7 +1580,7 @@ mod tests {
         log.push(event("o2", "c", 0));
         let entries = log.get(usize::MAX);
         assert_eq!(entries.len(), 12);
-        assert_eq!((entries[0].object.as_str(), entries[0].count), ("o2", 2));
+        assert_eq!((&entries[0].object[..], entries[0].count), (&b"o2"[..], 2));
     }
 
     /// `acllog-max-len`: the oldest go; 0 keeps nothing.
@@ -1443,8 +1591,8 @@ mod tests {
         for object in ["a", "b", "c"] {
             log.push(event(object, "c", 0));
         }
-        let objects: Vec<String> = log.get(usize::MAX).into_iter().map(|e| e.object).collect();
-        assert_eq!(objects, ["c", "b"]);
+        let objects: Vec<Vec<u8>> = log.get(usize::MAX).into_iter().map(|e| e.object).collect();
+        assert_eq!(objects, [b"c", b"b"]);
         log.set_max_len(0);
         log.push(event("d", "c", 0));
         assert!(log.get(usize::MAX).is_empty());
@@ -1467,7 +1615,7 @@ mod tests {
     #[test]
     fn a_user_holds_every_key_pattern_it_is_given() {
         let u = user(&["on", "nopass", "~app:*", "~session:*", "+@all"]);
-        assert_eq!(u.keys_string(), "~app:* ~session:*");
+        assert_eq!(u.keys_string(), b"~app:* ~session:*");
         assert!(check(&u, &["SET", "app:x", "1"]).is_ok());
         assert!(check(&u, &["SET", "session:x", "1"]).is_ok());
         assert_eq!(
@@ -1513,7 +1661,7 @@ mod tests {
         assert!(check(&u, &["COPY", "ro:a", "wo:b"]).is_ok());
         assert!(check(&u, &["COPY", "wo:a", "ro:b"]).is_err());
         assert!(check(&u, &["SUNIONSTORE", "wo:dst", "ro:a", "ro:b"]).is_ok());
-        assert_eq!(u.keys_string(), "%R~ro:* %W~wo:* ~rw:*");
+        assert_eq!(u.keys_string(), b"%R~ro:* %W~wo:* ~rw:*");
     }
 
     #[test]
@@ -1550,8 +1698,8 @@ mod tests {
         // Not a mixture: one set of permissions has to cover the whole command.
         assert!(check(&u, &["MGET", "app:x", "cache:x"]).is_err());
         assert_eq!(
-            u.to_acl_string(),
-            "user u on nopass ~app:* resetchannels +@all (~cache:* resetchannels -@all +get)"
+            u.to_acl_line(),
+            b"user u on nopass ~app:* resetchannels +@all (~cache:* resetchannels -@all +get)"
         );
         let mut u = u;
         apply_rule(&mut u, "clearselectors").unwrap();
@@ -1560,10 +1708,11 @@ mod tests {
 
     #[test]
     fn a_selector_split_over_several_arguments_is_put_back_together() {
+        let words = |w: &[&'static str]| w.iter().map(|w| w.as_bytes()).collect::<Vec<_>>();
         let merged =
-            merge_selector_args(["on", "(~k*", "+get", "+set)", "~a"].into_iter()).unwrap();
-        assert_eq!(merged, ["on", "(~k* +get +set)", "~a"]);
-        assert!(merge_selector_args(["(~k*", "+get"].into_iter()).is_err());
+            merge_selector_args(words(&["on", "(~k*", "+get", "+set)", "~a"]).into_iter()).unwrap();
+        assert_eq!(merged, [&b"on"[..], b"(~k* +get +set)", b"~a"]);
+        assert!(merge_selector_args(words(&["(~k*", "+get"]).into_iter()).is_err());
     }
 
     #[test]
@@ -1602,7 +1751,7 @@ mod tests {
     #[test]
     fn a_user_without_a_password_is_not_written_as_nopass() {
         let u = user(&["on", "~*", "+@all"]);
-        assert_eq!(u.to_acl_string(), "user u on ~* resetchannels +@all");
+        assert_eq!(u.to_acl_line(), b"user u on ~* resetchannels +@all");
         assert!(!u.accepts(""));
         assert!(!u.accepts("anything"));
     }
@@ -1620,8 +1769,8 @@ mod tests {
         assert_eq!(users["app"].keys.len(), 2);
         // What is written reads back the same.
         for user in users.values() {
-            let again = parse_acl_file(&user.to_acl_string(), "").unwrap();
-            assert_eq!(again[&user.name].to_acl_string(), user.to_acl_string());
+            let again = parse_acl_file(user.to_acl_line(), "").unwrap();
+            assert_eq!(again[&user.name].to_acl_line(), user.to_acl_line());
         }
     }
 

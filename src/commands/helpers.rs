@@ -1733,10 +1733,6 @@ mod scan_tests {
     }
 }
 
-// The escape of names that are not text lives in `key_bytes` (`text_of`,
-// `bytes_of`): keys use it too, wherever something keeps them as text.
-pub use crate::key_bytes::{bytes_of as name_to_bytes, text_of as name_from_bytes};
-
 #[cfg(test)]
 mod whole_score_tests {
     use super::{format_score, whole_score};

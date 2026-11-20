@@ -1860,7 +1860,7 @@ fn kdb_hashex_with_field_ttls() {
     inner.fields.insert_bytes("b", b"2");
     // Set field "a" to expire 5 minutes from now.
     let at = unix_ms_now() + 300_000;
-    inner.expiries.insert("a".to_string(), at);
+    inner.expiries.insert("a", at);
 
     let v = roundtrip_one("hxttl", KiviDBValue::HashEx(Arc::new(RwLock::new(inner))));
     match v {
@@ -1885,9 +1885,7 @@ fn kdb_hashex_already_expired_ttl_is_dropped_on_load() {
     let mut inner = HashInner::new();
     inner.fields.insert_bytes("a", b"1");
     // An expiry ten seconds in the past.
-    inner
-        .expiries
-        .insert("a".to_string(), unix_ms_now() - 10_000);
+    inner.expiries.insert("a", unix_ms_now() - 10_000);
 
     let mut map = HashMap::new();
     map.insert(
