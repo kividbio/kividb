@@ -26,7 +26,7 @@ permissions:
 jobs:
   compat:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 75
     env:
       REDIS_IMAGE: redis:8.10.3@sha256:1f88291b4c57bdf249f02eb085a8669889b2d2954e91d4de5118a5da6b78dd53
       OUT: ${{ github.workspace }}/compat-results
@@ -52,6 +52,8 @@ jobs:
           echo "KIVIDB_IMAGE=$image" >> "$GITHUB_ENV"
           echo "WORK=$RUNNER_TEMP/compat-work" >> "$GITHUB_ENV"
           docker pull -q "$image"
+          # The harnesses that need scripting (a `kividb-variant` file saying `lua`) run the lua variant of the image.
+          case $image in *-lua | *-full) ;; *) docker pull -q "$image-lua" ;; esac
           docker pull -q "$REDIS_IMAGE"
           printf 'KiviDB `%s` against Redis `%s`\n\n' "$image" "$REDIS_IMAGE" >> "$GITHUB_STEP_SUMMARY"
 
@@ -91,6 +93,44 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 5
         run: benchmarks/ci/run-harness.sh mem0
+
+      # The workloads KiviDB's published claims are about (#849): each runs the application's own
+      # tests, or its own scripts and commands, against both servers. The first four are Ruby, in a
+      # pinned image (they hardcode localhost:6379, so they need the server on that port).
+      - name: stoplight
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: benchmarks/ci/run-harness.sh stoplight
+
+      - name: sidekiq-unique-jobs
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: benchmarks/ci/run-harness.sh sidekiq-unique-jobs
+
+      - name: sidekiq-scheduler
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: benchmarks/ci/run-harness.sh sidekiq-scheduler
+
+      - name: sidekiq-mastodon
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: benchmarks/ci/run-harness.sh sidekiq-mastodon
+
+      - name: sentry-spans
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/ci/run-harness.sh sentry-spans
+
+      - name: client-tracking
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/ci/run-harness.sh client-tracking
+
+      - name: ratelimit-scripts
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/ci/run-harness.sh ratelimit-scripts
 
       - name: Keep the results
         if: ${{ !cancelled() }}

@@ -723,24 +723,30 @@ pub(crate) async fn broadcast_auth_request(
         })
     };
 
-    // An automatic failover's request says which slots this node would
-    // take over, so that a master that knows a newer owner of one refuses
-    // its vote (#524). Not a manual one's, whose fifth field is `force`.
-    let claims =
-        (!force && !test_auth_request_without_claims()).then(|| state.slot_claims_of(master_id));
-    let msg = BusMessage::FailoverAuthRequest {
-        sender_id: state.myself(),
-        sender_ip: state.advertised_ip(&me.ip),
-        sender_client_port: me.client_port,
-        sender_cluster_port: me.cluster_port,
-        request_epoch: epoch,
-        master_id,
-        force,
-        claims,
+    // The request says which slots this node would take over, so that a
+    // master that knows a newer owner of one refuses its vote (#524), and
+    // says who that owner is (`UPDATE`). An automatic failover's in its
+    // fifth field; a manual one's after `force`, in a sixth, and only to a
+    // master that says it reads them: one of an earlier version refuses a
+    // request of six fields, and is asked as before (#742).
+    let request = |peer: &NodeId| {
+        let with_claims =
+            !test_auth_request_without_claims() && (!force || state.decides_on_claims(peer));
+        BusMessage::FailoverAuthRequest {
+            sender_id: state.myself(),
+            sender_ip: state.advertised_ip(&me.ip),
+            sender_client_port: me.client_port,
+            sender_cluster_port: me.cluster_port,
+            request_epoch: epoch,
+            master_id,
+            force,
+            claims: with_claims.then(|| state.slot_claims_of(master_id)),
+            claims_unreadable: false,
+        }
     };
 
     for (peer_id, ip, bus_port) in masters {
-        let msg = msg.clone();
+        let mut msg = request(&peer_id);
         let state = Arc::clone(state);
         tokio::spawn(async move {
             let addr = format!("{ip}:{bus_port}");
@@ -752,39 +758,71 @@ pub(crate) async fn broadcast_auth_request(
             let wait = crate::cluster::ELECTION_LIFETIME.max(Duration::from_millis(
                 state.node_timeout_ms.saturating_mul(2).max(2_000),
             ));
-            match dialer::exchange(&state, &addr, &msg, wait).await {
-                Ok(Some(BusMessage::FailoverAuthAck {
-                    sender_id,
-                    request_epoch,
-                })) => {
-                    if let Some(delay) = test_vote_delay() {
-                        tokio::time::sleep(delay).await;
-                    }
-                    let count = state.record_vote(sender_id, request_epoch);
-                    log_verbose!(
-                        "Cluster: Got vote from {} for epoch {} (total: {})",
-                        node_id_str(&sender_id),
+            // Asked again after each `UPDATE`, with the claims put right; a
+            // few times at most: each one moves slots to a newer owner here.
+            let mut asked = 0;
+            loop {
+                asked += 1;
+                match dialer::exchange(&state, &addr, &msg, wait).await {
+                    Ok(Some(BusMessage::FailoverAuthAck {
+                        sender_id,
                         request_epoch,
-                        count,
-                    );
-                }
-                // No reply is a declined vote, not a failure.
-                Ok(other) => log_info!(
-                    "Cluster: Election: {} gave no vote at epoch {epoch}: {}",
-                    node_id_str(&peer_id),
-                    match other {
-                        None => "no answer".to_string(),
-                        Some(m) => format!("answered {m:?}"),
+                    })) => {
+                        if let Some(delay) = test_vote_delay() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        let count = state.record_vote(sender_id, request_epoch);
+                        log_verbose!(
+                            "Cluster: Got vote from {} for epoch {} (total: {})",
+                            node_id_str(&sender_id),
+                            request_epoch,
+                            count,
+                        );
                     }
-                ),
-                Err(e) => log_warn!(
-                    "Cluster: Election: failed to ask {} ({addr}) for vote: {e}",
-                    node_id_str(&peer_id)
-                ),
+                    Ok(Some(BusMessage::Update { sender_id, owners })) => {
+                        crate::cluster::bus::listener::apply_update(&state, sender_id, owners);
+                        // Still standing at this epoch, for the same master,
+                        // with something left to claim: ask again.
+                        let standing = state.election.lock().as_ref().is_some_and(|e| {
+                            e.epoch == epoch && e.failed_master_id == master_id && !e.completed
+                        }) && state.my_master_id() == Some(master_id);
+                        if !standing || asked >= MAX_ASKS_AFTER_UPDATE {
+                            break;
+                        }
+                        let BusMessage::FailoverAuthRequest { claims, .. } = &mut msg else {
+                            break;
+                        };
+                        let now = state.slot_claims_of(master_id);
+                        if now.is_empty() || claims.as_ref() == Some(&now) {
+                            break;
+                        }
+                        *claims = Some(now);
+                        continue;
+                    }
+                    // No reply is a declined vote, not a failure.
+                    Ok(other) => log_info!(
+                        "Cluster: Election: {} gave no vote at epoch {epoch}: {}",
+                        node_id_str(&peer_id),
+                        match other {
+                            None => "no answer".to_string(),
+                            Some(m) => format!("answered {m:?}"),
+                        }
+                    ),
+                    Err(e) => log_warn!(
+                        "Cluster: Election: failed to ask {} ({addr}) for vote: {e}",
+                        node_id_str(&peer_id)
+                    ),
+                }
+                break;
             }
         });
     }
 }
+
+/// How many times a candidate asks one master for its vote in one election
+/// when each answer is an `UPDATE` (#742): each moves slots this node
+/// claimed to a newer owner, so a few at most are ever needed.
+const MAX_ASKS_AFTER_UPDATE: u32 = 4;
 
 /// For the tests of a cluster of mixed versions, and never set otherwise:
 /// `KIVIDB_TEST_AUTH_REQUEST_WITHOUT_CLAIMS`, set, has this node ask for

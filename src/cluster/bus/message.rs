@@ -20,12 +20,27 @@
 //     See `ClusterState::promotion_to_complete`.
 //
 //   FAILOVER_AUTH_REQUEST <sender_id> <endpoint> <master_id> [force | <slot_claims>]
+//   FAILOVER_AUTH_REQUEST <sender_id> <endpoint> <master_id> force <slot_claims>
 //   FAILOVER_AUTH_ACK <sender_id> <epoch>
 //     Replica election. `force` marks a manual failover. An automatic one
 //     carries instead the slots the candidate's master owns in its view, at
 //     that master's config epoch, as a PING's are (#524). A node of an
 //     earlier version takes any fifth field that is not `force` for an
-//     automatic failover, and reads no further.
+//     automatic failover, and reads no further. A manual one carries them
+//     after `force`, in a sixth field (#742), only to a node that says it
+//     reads them (`vote-claims` in its own PING/PONG flags): a node of an
+//     earlier version refuses a request of six fields. A field that should
+//     be claims and does not read as valid ones has the vote refused.
+//
+//   UPDATE <sender_id> <owner_id> <owner_endpoint> <slot_claims> [<owner_id> ...]
+//     The answer of a voter that refused a candidate because it knows a
+//     newer owner of slots the candidate claimed: each such owner, its
+//     address and config epoch, and its slots at that epoch, as its own
+//     PING would claim them (Redis's UPDATE, #742). The candidate takes
+//     them in as it takes a PING's claims, and asks again. Sent only in
+//     answer to a request that carried claims, which no earlier version
+//     sends: a node of an earlier version, which drops a connection on a
+//     message type it does not know, is never sent one.
 //
 //   FAIL <sender_id> <failed_id>
 //     "A majority of masters agree this node is down."
@@ -120,6 +135,30 @@ impl OwnerReport {
     }
 }
 
+/// One newer owner an `UPDATE` names: see [`BusMessage::Update`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerUpdate {
+    pub id: NodeId,
+    pub ip: String,
+    pub client_port: u16,
+    pub cluster_port: u16,
+    /// Its config epoch in the sender's view.
+    pub config_epoch: u64,
+    /// Its slots in the sender's view, at that epoch.
+    pub claims: Vec<SlotClaim>,
+}
+
+/// Claims as a voter may decide on them: at most one range per slot, each
+/// within the slots and not reversed. A request whose claims are anything
+/// else has its vote refused (#742).
+pub fn valid_claims(claims: &[SlotClaim]) -> bool {
+    let slots = crate::cluster::CLUSTER_SLOTS;
+    claims.len() <= slots
+        && claims
+            .iter()
+            .all(|c| c.start <= c.end && (c.end as usize) < slots)
+}
+
 #[derive(Debug, Clone)]
 pub enum BusMessage {
     Meet {
@@ -194,9 +233,22 @@ pub enum BusMessage {
         force: bool,
         /// The slots the candidate would take over: its master's, in its
         /// view, at the master's config epoch. Sent with an automatic
-        /// failover only; `None` from a node of an earlier version, or
-        /// with `force`. See `ClusterState::cast_vote`.
+        /// failover, and with a manual one to a voter that says it reads
+        /// them (#742); `None` from a node of an earlier version, and with
+        /// `force` to a voter that does not say so. See
+        /// `ClusterState::cast_vote`.
         claims: Option<Vec<SlotClaim>>,
+        /// The field that should hold the claims holds something that does
+        /// not read as valid ones ([`valid_claims`]): the vote is refused,
+        /// rather than decided as if there were none (#742).
+        claims_unreadable: bool,
+    },
+
+    /// The newer owners of slots a candidate claimed, from a voter that
+    /// refused it for that reason: see the module comment.
+    Update {
+        sender_id: NodeId,
+        owners: Vec<OwnerUpdate>,
     },
 
     /// "Yes, you can take over." Sent by a master in response to a valid
@@ -250,6 +302,7 @@ impl BusMessage {
             | BusMessage::Ping { sender_id, .. }
             | BusMessage::Pong { sender_id, .. }
             | BusMessage::FailoverAuthRequest { sender_id, .. }
+            | BusMessage::Update { sender_id, .. }
             | BusMessage::FailoverAuthAck { sender_id, .. }
             | BusMessage::Fail { sender_id, .. }
             | BusMessage::Publish { sender_id, .. }
@@ -380,6 +433,7 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
             master_id,
             force,
             claims,
+            claims_unreadable: _,
         } => {
             let mut fields = vec![
                 resp_bulk_str("FAILOVER_AUTH_REQUEST"),
@@ -393,11 +447,30 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
                 resp_bulk(master_id),
             ];
             // Only present when set, so an ordinary request stays in the
-            // four-field form that nodes running an older build accept.
+            // four-field form that nodes running an older build accept. A
+            // manual failover's claims follow `force`: the sender gives
+            // them only to a voter that reads six fields (#742).
             if *force {
                 fields.push(resp_bulk_str("force"));
-            } else if let Some(claims) = claims {
+            }
+            if let Some(claims) = claims {
                 fields.push(encode_slot_claims(claims));
+            }
+            resp_array(fields)
+        }
+        // Flat, three fields an owner: the parser allows four levels of
+        // arrays, and the claims take two.
+        BusMessage::Update { sender_id, owners } => {
+            let mut fields = vec![resp_bulk_str("UPDATE"), resp_bulk(sender_id)];
+            for o in owners {
+                fields.push(resp_bulk(&o.id));
+                fields.push(resp_bulk_str(&format_endpoint(
+                    &o.ip,
+                    o.client_port,
+                    o.cluster_port,
+                    o.config_epoch,
+                )));
+                fields.push(encode_slot_claims(&o.claims));
             }
             resp_array(fields)
         }
@@ -513,6 +586,10 @@ fn format_flags(f: NodeFlags) -> String {
     if f.contains(NodeFlags::FAIL) {
         parts.push("fail");
     }
+    // A token an earlier version skips, as it does `host=` (#742).
+    if f.contains(NodeFlags::VOTE_CLAIMS) {
+        parts.push("vote-claims");
+    }
     parts.join(",")
 }
 
@@ -617,6 +694,7 @@ fn parse_flags(s: &str) -> NodeFlags {
             "replica" | "slave" => f |= NodeFlags::REPLICA,
             "pfail" | "fail?" => f |= NodeFlags::PFAIL,
             "fail" => f |= NodeFlags::FAIL,
+            "vote-claims" => f |= NodeFlags::VOTE_CLAIMS,
             _ => {}
         }
     }
@@ -721,20 +799,32 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
             Ok(Some((msg, consumed)))
         }
         "FAILOVER_AUTH_REQUEST" => {
-            if parts.len() != 4 && parts.len() != 5 {
+            if !(4..=6).contains(&parts.len()) {
                 return Err(format!(
-                    "FAILOVER_AUTH_REQUEST expects 4 or 5 fields, got {}",
+                    "FAILOVER_AUTH_REQUEST expects 4 to 6 fields, got {}",
                     parts.len()
                 ));
             }
             let force = parts.get(4).is_some_and(|f| f.as_slice() == b"force");
-            // Anything else in the fifth field is the candidate's claims; a
-            // field that does not parse as them is left out, as a node of an
-            // earlier version leaves it.
-            let claims = match parts.get(4) {
-                Some(f) if !force && f.first() == Some(&b'*') => parse_slot_claims(f).ok(),
+            // Anything else in the fifth field is the candidate's claims, as
+            // is the sixth after `force` (#742). A field that should be them
+            // and does not read as valid ones has the vote refused: it used
+            // to be left out, and the vote decided with no check at all.
+            let claims_field = match (parts.len(), force) {
+                (5, false) => parts.get(4),
+                (6, true) => parts.get(5),
+                (6, false) => return Err("FAILOVER_AUTH_REQUEST: six fields without force".into()),
                 _ => None,
             };
+            let mut claims_unreadable = false;
+            let claims = claims_field.and_then(|f| {
+                let read = (f.first() == Some(&b'*'))
+                    .then(|| parse_slot_claims(f).ok())
+                    .flatten()
+                    .filter(|c| valid_claims(c));
+                claims_unreadable = read.is_none();
+                read
+            });
             let sender_id = parse_node_id(&parts[1]).ok_or("bad sender id")?;
             let endpoint = std::str::from_utf8(&parts[2]).map_err(|_| "bad endpoint utf8")?;
             let (ip, cp, busp, ep) = parse_endpoint(endpoint)?;
@@ -749,6 +839,20 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                     master_id,
                     force,
                     claims,
+                    claims_unreadable,
+                },
+                consumed,
+            )))
+        }
+        "UPDATE" => {
+            if parts.len() < 2 {
+                return Err(format!("UPDATE expects 2 fields, got {}", parts.len()));
+            }
+            let sender_id = parse_node_id(&parts[1]).ok_or("bad sender id")?;
+            Ok(Some((
+                BusMessage::Update {
+                    sender_id,
+                    owners: parse_owner_updates(&parts[2..]),
                 },
                 consumed,
             )))
@@ -946,6 +1050,38 @@ fn parse_owner_report(buf: &[u8]) -> Option<OwnerReport> {
         return None;
     }
     OwnerReport::valid(masters, parse_slot_claims(claims).ok()?)
+}
+
+/// The owners of an `UPDATE`, from its fields after the sender's id: three
+/// for each owner, `owner_id endpoint claims`. One that is not that, or whose
+/// claims are not valid ([`valid_claims`], and at least one), is left out,
+/// as are fields left over.
+fn parse_owner_updates(fields: &[Vec<u8>]) -> Vec<OwnerUpdate> {
+    fields
+        .chunks(3)
+        .filter_map(|owner| {
+            let [id, endpoint, claims] = owner else {
+                return None;
+            };
+            let id = parse_node_id(id)?;
+            let (ip, client_port, cluster_port, config_epoch) =
+                parse_endpoint(std::str::from_utf8(endpoint).ok()?).ok()?;
+            if claims.first() != Some(&b'*') {
+                return None;
+            }
+            let claims = parse_slot_claims(claims)
+                .ok()
+                .filter(|c| !c.is_empty() && valid_claims(c))?;
+            Some(OwnerUpdate {
+                id,
+                ip,
+                client_port,
+                cluster_port,
+                config_epoch,
+                claims,
+            })
+        })
+        .collect()
 }
 
 fn parse_slot_claims(buf: &[u8]) -> Result<Vec<SlotClaim>, String> {
@@ -1773,6 +1909,7 @@ mod tests {
             master_id: master,
             force: false,
             claims: None,
+            claims_unreadable: false,
         };
         let bytes = encode(&msg);
         let (decoded, _) = decode(&bytes).unwrap().unwrap();
@@ -1793,9 +1930,12 @@ mod tests {
         }
     }
 
+    /// A manual failover's request without claims, as it is sent to a voter
+    /// that does not say it reads them, keeps the five fields with `force`
+    /// that 1.2 reads. With them (#742), they follow `force` in a sixth.
     #[test]
     fn forced_auth_request_round_trip() {
-        let msg = BusMessage::FailoverAuthRequest {
+        let forced = |claims: Option<Vec<SlotClaim>>| BusMessage::FailoverAuthRequest {
             sender_id: generate_node_id(),
             sender_ip: "127.0.0.1".into(),
             sender_client_port: 6390,
@@ -1803,14 +1943,10 @@ mod tests {
             request_epoch: 9,
             master_id: generate_node_id(),
             force: true,
-            // Not sent with `force`.
-            claims: Some(vec![SlotClaim {
-                start: 0,
-                end: 1,
-                epoch: 1,
-            }]),
+            claims,
+            claims_unreadable: false,
         };
-        let bytes = encode(&msg);
+        let bytes = encode(&forced(None));
         let (decoded, _) = decode(&bytes).unwrap().unwrap();
         assert!(matches!(
             decoded,
@@ -1818,11 +1954,177 @@ mod tests {
                 force: true,
                 request_epoch: 9,
                 claims: None,
+                claims_unreadable: false,
                 ..
             }
         ));
         let (parts, _) = parse_resp_array(&bytes).unwrap().unwrap();
         assert_eq!(parts.len(), 5);
+        assert_eq!(parts[4], b"force");
+
+        let bytes = encode(&forced(Some(vec![SlotClaim {
+            start: 0,
+            end: 1,
+            epoch: 1,
+        }])));
+        match decode(&bytes).unwrap().unwrap().0 {
+            BusMessage::FailoverAuthRequest {
+                force: true,
+                claims: Some(got),
+                claims_unreadable: false,
+                ..
+            } => assert_eq!(
+                got,
+                vec![SlotClaim {
+                    start: 0,
+                    end: 1,
+                    epoch: 1
+                }]
+            ),
+            other => panic!("expected a forced request with claims, got {other:?}"),
+        }
+        let (parts, _) = parse_resp_array(&bytes).unwrap().unwrap();
+        assert_eq!(parts.len(), 6);
+        assert_eq!(parts[4], b"force");
+    }
+
+    /// A request whose claims field does not read as valid claims is marked
+    /// so, and its vote refused (`listener`), rather than read as a request
+    /// without claims and decided with no check (#742). The same for
+    /// the sixth field of a manual failover. Six fields without `force` is
+    /// no request.
+    #[test]
+    fn unreadable_claims_are_marked_not_dropped() {
+        let raw = |fields: &[&[u8]]| {
+            resp_array(
+                fields
+                    .iter()
+                    .map(|f| {
+                        if f.first() == Some(&b'*') {
+                            f.to_vec()
+                        } else {
+                            resp_bulk(f)
+                        }
+                    })
+                    .collect(),
+            )
+        };
+        let id = generate_node_id();
+        let master = generate_node_id();
+        let claim = |s: &str, e: &str| {
+            resp_array(vec![resp_array(vec![
+                resp_bulk_str(s),
+                resp_bulk_str(e),
+                resp_bulk_str("3"),
+            ])])
+        };
+        let reversed = claim("10", "5");
+        let past_end = claim("0", "16384");
+        let not_number = claim("x", "5");
+        let good = claim("0", "5");
+        let unreadable = |msg: Vec<u8>| match decode(&msg).unwrap().unwrap().0 {
+            BusMessage::FailoverAuthRequest {
+                claims,
+                claims_unreadable,
+                ..
+            } => claims.is_none() && claims_unreadable,
+            other => panic!("{other:?}"),
+        };
+        let head: [&[u8]; 4] = [
+            b"FAILOVER_AUTH_REQUEST",
+            &id,
+            b"127.0.0.1:6390:16390:9",
+            &master,
+        ];
+        for bad in [&reversed, &past_end, &not_number] {
+            let mut five = head.to_vec();
+            five.push(bad);
+            assert!(unreadable(raw(&five)));
+            let mut six = head.to_vec();
+            six.push(b"force");
+            six.push(bad);
+            assert!(unreadable(raw(&six)));
+        }
+        let mut text = head.to_vec();
+        text.push(b"claims");
+        assert!(unreadable(raw(&text)));
+        let mut six = head.to_vec();
+        six.push(b"force");
+        six.push(&good);
+        assert!(!unreadable(raw(&six)));
+        let mut wrong = head.to_vec();
+        wrong.push(&good);
+        wrong.push(&good);
+        assert!(decode(&raw(&wrong)).is_err());
+    }
+
+    /// An `UPDATE` round-trips; an entry that is not one, or has no valid
+    /// claims, is left out (#742).
+    #[test]
+    fn update_round_trip_leaves_bad_entries_out() {
+        let owner = OwnerUpdate {
+            id: generate_node_id(),
+            ip: "10.0.0.2".into(),
+            client_port: 7001,
+            cluster_port: 17001,
+            config_epoch: 12,
+            claims: vec![
+                SlotClaim {
+                    start: 0,
+                    end: 100,
+                    epoch: 12,
+                },
+                SlotClaim {
+                    start: 5000,
+                    end: 5460,
+                    epoch: 12,
+                },
+            ],
+        };
+        let sender = generate_node_id();
+        let bytes = encode(&BusMessage::Update {
+            sender_id: sender,
+            owners: vec![owner.clone()],
+        });
+        match decode(&bytes).unwrap().unwrap().0 {
+            BusMessage::Update { sender_id, owners } => {
+                assert_eq!(sender_id, sender);
+                assert_eq!(owners, vec![owner.clone()]);
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut no_claims = owner.clone();
+        no_claims.claims.clear();
+        let mut reversed = owner.clone();
+        reversed.claims[0].start = 200;
+        let bytes = encode(&BusMessage::Update {
+            sender_id: sender,
+            owners: vec![no_claims, reversed, owner.clone()],
+        });
+        match decode(&bytes).unwrap().unwrap().0 {
+            BusMessage::Update { owners, .. } => assert_eq!(owners, vec![owner]),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The `vote-claims` token travels in a PING's flags and is skipped by
+    /// the parsers an earlier version has for the rest of the string, as
+    /// `host=` is (#742).
+    #[test]
+    fn the_vote_claims_token_travels_and_is_skipped() {
+        let s = flags_with_host(
+            NodeFlags::MASTER | NodeFlags::VOTE_CLAIMS,
+            "h",
+            7000,
+            &ClientIps::default(),
+        );
+        assert_eq!(parse_flags(&s), NodeFlags::MASTER | NodeFlags::VOTE_CLAIMS);
+        assert_eq!(host_of(&s), "h");
+        assert_eq!(cport_of(&s), 7000);
+        assert_eq!(
+            parse_flags("master,vote-claims") & !NodeFlags::VOTE_CLAIMS,
+            NodeFlags::MASTER
+        );
     }
 
     /// An automatic failover's request carries the candidate's claims in
@@ -1854,6 +2156,7 @@ mod tests {
             master_id: generate_node_id(),
             force: false,
             claims: Some(claims),
+            claims_unreadable: false,
         };
         let bytes = encode(&msg);
         match decode(&bytes).unwrap().unwrap().0 {
@@ -1884,6 +2187,7 @@ mod tests {
             master_id: generate_node_id(),
             force: false,
             claims: None,
+            claims_unreadable: false,
         };
         let bytes = encode(&without);
         assert_eq!(parse_resp_array(&bytes).unwrap().unwrap().0.len(), 4);

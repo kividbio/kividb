@@ -37,6 +37,12 @@ bitflags! {
         const FAIL      = 1 << 4;  // confirmed failed — quorum agreed
         const HANDSHAKE = 1 << 5;  // mid-MEET, ID not yet known
         const NOADDR    = 1 << 6;  // address unknown
+        /// On the wire only, in a node's own PING and PONG (`vote-claims`):
+        /// it decides a manual failover's vote on the candidate's claims
+        /// and answers a refusal with an `UPDATE` (#742). Never in a node
+        /// table's flags, gossip or nodes.conf: see
+        /// `ClusterState::note_vote_claims`.
+        const VOTE_CLAIMS = 1 << 7;
     }
 }
 
