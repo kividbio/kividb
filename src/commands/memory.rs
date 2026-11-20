@@ -268,7 +268,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             // the key of `expiries`, and the hash is on the list of hashes
             // whose fields expire (`field_expiry`): one entry for the hash.
             let names = layout::sampled(expiring, samples, || {
-                inner.expiries.keys().map(String::capacity)
+                inner.expiries.keys().map(|name| name.len())
             });
             let watched = if expiring == 0 {
                 0
@@ -278,7 +278,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             entry()
                 + layout::arc_of::<RwLock<HashInner>>()
                 + layout::hash_fields(&inner.fields, samples)
-                + layout::std_hash_map::<String, crate::types::FieldDeadline>(
+                + layout::std_hash_map::<Box<[u8]>, crate::types::FieldDeadline>(
                     inner.expiries.capacity(),
                 )
                 + names

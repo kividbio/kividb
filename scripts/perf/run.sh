@@ -44,6 +44,9 @@
 #   ONLY=<regex>        measure only the workloads whose label matches
 #   PROFILE=1           keep the hottest functions of each workload in
 #                       target/perf/out-<tag>/profile-*.txt
+#   WORKLOADS=acl       GET and SET of 100 B as the default user and as a
+#                       user limited to `~key:*` (#510): what matching a
+#                       key against a user's patterns costs a command
 #   WORKLOADS=zrand     ZRANDMEMBER on a sorted set of about 95,000
 #                       members (#862): no count, 1, 10, 1000, -10
 #                       WITHSCORES, -1000, and ZSCORE beside them; run it

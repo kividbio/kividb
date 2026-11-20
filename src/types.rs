@@ -746,7 +746,8 @@ pub fn field_due(at: FieldDeadline, now: FieldDeadline) -> bool {
 /// missed. Read through `Deref`; written only through the methods here,
 /// which keep the bound.
 pub struct Expiries {
-    times: ahash::AHashMap<String, FieldDeadline>,
+    /// By field name: its bytes, as the hash keeps it.
+    times: ahash::AHashMap<Box<[u8]>, FieldDeadline>,
     /// The bound, [`deadline_bound`] of a moment no deadline is earlier
     /// than, shifted up one bit, and in the lowest bit whether some field's
     /// deadline is that moment. One word, so that the two are read and
@@ -786,10 +787,15 @@ impl Expiries {
     }
 
     /// Set `field`'s deadline.
-    pub fn insert(&mut self, field: String, at: FieldDeadline) -> Option<FieldDeadline> {
+    pub fn insert(&mut self, field: impl AsRef<[u8]>, at: FieldDeadline) -> Option<FieldDeadline> {
+        let field = field.as_ref();
         let (bound, exact) = unpack(*self.earliest.get_mut());
         let new = deadline_bound(at);
-        let old = self.times.insert(field, at);
+        // A deadline set again takes no new name.
+        let old = match self.times.get_mut(field) {
+            Some(kept) => Some(std::mem::replace(kept, at)),
+            None => self.times.insert(Box::from(field), at),
+        };
         let moved_the_bound = old.is_some_and(|old| deadline_bound(old) == bound);
         *self.earliest.get_mut() = if new <= bound {
             // Exact unless the deadline is past what the bound holds.
@@ -800,9 +806,21 @@ impl Expiries {
         old
     }
 
+    /// `field`'s deadline, if it has one.
+    #[inline]
+    pub fn get(&self, field: &(impl AsRef<[u8]> + ?Sized)) -> Option<&FieldDeadline> {
+        self.times.get(field.as_ref())
+    }
+
+    /// Whether `field` has a deadline.
+    #[inline]
+    pub fn contains_key(&self, field: &(impl AsRef<[u8]> + ?Sized)) -> bool {
+        self.times.contains_key(field.as_ref())
+    }
+
     /// Take `field`'s deadline away.
-    pub fn remove(&mut self, field: &str) -> Option<FieldDeadline> {
-        let old = self.times.remove(field)?;
+    pub fn remove(&mut self, field: &(impl AsRef<[u8]> + ?Sized)) -> Option<FieldDeadline> {
+        let old = self.times.remove(field.as_ref())?;
         let (bound, exact) = unpack(*self.earliest.get_mut());
         if exact && deadline_bound(old) == bound {
             *self.earliest.get_mut() = pack(bound, false);
@@ -866,10 +884,19 @@ impl Clone for Expiries {
 }
 
 impl std::ops::Deref for Expiries {
-    type Target = ahash::AHashMap<String, FieldDeadline>;
+    type Target = ahash::AHashMap<Box<[u8]>, FieldDeadline>;
 
     fn deref(&self) -> &Self::Target {
         &self.times
+    }
+}
+
+impl std::ops::Index<&str> for Expiries {
+    type Output = FieldDeadline;
+
+    /// The deadline of the field named `field`, which must have one.
+    fn index(&self, field: &str) -> &FieldDeadline {
+        self.get(field).expect("no deadline")
     }
 }
 
@@ -879,11 +906,11 @@ impl std::fmt::Debug for Expiries {
     }
 }
 
-impl FromIterator<(String, FieldDeadline)> for Expiries {
-    fn from_iter<I: IntoIterator<Item = (String, FieldDeadline)>>(iter: I) -> Self {
+impl<F: AsRef<[u8]>> FromIterator<(F, FieldDeadline)> for Expiries {
+    fn from_iter<I: IntoIterator<Item = (F, FieldDeadline)>>(iter: I) -> Self {
         let mut out = Self::new();
         for (field, at) in iter {
-            out.insert(field, at);
+            out.insert(field.as_ref(), at);
         }
         out
     }
@@ -918,8 +945,8 @@ impl HashInner {
     /// (`expiry::fields_held`): the writes that follow were made while the
     /// field lived, and the `HDEL` that follows says when it went.
     #[inline]
-    pub fn is_field_expired(&self, field: &str) -> bool {
-        match self.expiries.get(field) {
+    pub fn is_field_expired(&self, field: &(impl AsRef<[u8]> + ?Sized)) -> bool {
+        match self.expiries.get(field.as_ref()) {
             Some(exp) => {
                 field_due(*exp, field_now())
                     && !crate::expiry::replaying()
@@ -974,24 +1001,28 @@ impl HashInner {
 
     /// Whether [`Self::shown`] leaves `field` out at `now`.
     #[inline]
-    pub fn hides(&self, field: &str, now: FieldDeadline) -> bool {
+    pub fn hides(&self, field: &(impl AsRef<[u8]> + ?Sized), now: FieldDeadline) -> bool {
         self.has_due(now)
             && !crate::field_expiry::due_fields_kept()
             && self
                 .expiries
-                .get(field)
+                .get(field.as_ref())
                 .is_some_and(|at| field_due(*at, now))
     }
 
     /// Remove a field's value AND its expiry entry. Whether the field
     /// existed.
-    pub fn evict_field(&mut self, field: &str) -> bool {
+    pub fn evict_field(&mut self, field: &(impl AsRef<[u8]> + ?Sized)) -> bool {
         self.expiries.remove(field);
         self.fields.remove(field)
     }
 
     /// [`Self::evict_field`], handing the value to `f` on its way out.
-    pub fn take_field_with<R>(&mut self, field: &str, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    pub fn take_field_with<R>(
+        &mut self,
+        field: &(impl AsRef<[u8]> + ?Sized),
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
         self.expiries.remove(field);
         self.fields.take_with(field, f)
     }
@@ -1004,14 +1035,14 @@ impl HashInner {
             return 0;
         }
         let now = field_now();
-        let due: Vec<String> = self
+        let due: Vec<Box<[u8]>> = self
             .expiries
             .iter()
             .filter(|(_, at)| field_due(**at, now))
             .map(|(field, _)| field.clone())
             .collect();
         for field in &due {
-            self.evict_field(field);
+            self.evict_field(&field[..]);
         }
         due.len()
     }
@@ -1524,20 +1555,20 @@ mod expiries_tests {
         let mut times = Expiries::new();
         assert!(!times.has_due(now), "none");
 
-        times.insert("a".into(), later(10_000));
-        times.insert("b".into(), later(20_000));
+        times.insert("a", later(10_000));
+        times.insert("b", later(20_000));
         assert!(!times.has_due(now));
         assert!(!times.has_due(later(10_000)), "lives through its deadline");
         assert!(times.has_due(later(10_001)), "past its deadline");
 
         // Brought nearer, then past.
-        times.insert("b".into(), later(5_000));
+        times.insert("b", later(5_000));
         assert!(times.has_due(later(5_001)));
-        times.insert("b".into(), now - 1);
+        times.insert("b", now - 1);
         assert!(times.has_due(now));
 
         // Put off: the bound is left early, and the next look puts it right.
-        times.insert("b".into(), later(30_000));
+        times.insert("b", later(30_000));
         assert!(!times.has_due(now));
         assert!(!times.has_due(later(10_000)));
         assert!(times.has_due(later(10_001)));
@@ -1550,10 +1581,10 @@ mod expiries_tests {
         assert!(!times.has_due(later(1_000_000)));
 
         // Cleared, then set again (a field's last deadline gone, a new one).
-        times.insert("c".into(), later(1));
+        times.insert("c", later(1));
         times.clear();
         assert!(!times.has_due(later(2)));
-        times.insert("c".into(), later(1));
+        times.insert("c", later(1));
         assert!(times.has_due(later(2)));
 
         // Built from deadlines (a load), one long past and one past what
@@ -1576,7 +1607,7 @@ mod expiries_tests {
     fn a_deadline_is_kept_as_it_was_given() {
         let mut times = Expiries::new();
         for at in [0, 1, NOW, NOW + 1, (1 << 46) - 1, u64::MAX] {
-            times.insert("f".into(), at);
+            times.insert("f", at);
             assert_eq!(times.get("f"), Some(&at));
         }
         assert!(!field_due(NOW, NOW));
@@ -1626,8 +1657,8 @@ mod expiries_tests {
         for i in 0..1_000u64 {
             times.insert(format!("f{i}"), now + (60 + i) * 1_000);
         }
-        times.insert("due".into(), now);
-        times.insert("due".into(), now + 30_000);
+        times.insert("due", now);
+        times.insert("due", now + 30_000);
         let lock = std::sync::Arc::new(parking_lot::RwLock::new(times));
         let readers: Vec<_> = (0..4)
             .map(|_| {

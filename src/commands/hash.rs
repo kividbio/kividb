@@ -30,28 +30,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let key: &[u8] = cmd[1];
 
-            // Collect (field_name, bytes) pairs from the command args
-            // cmd[2], cmd[3] = first pair; cmd[4], cmd[5] = second; ...
-            let pairs: Vec<(String, Arc<[u8]>)> = cmd[2..]
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|chunk| {
-                    let field = crate::commands::helpers::name_from_bytes(chunk[0]).into_owned();
-                    let val: Arc<[u8]> = Arc::from(chunk[1]);
-                    (field, val)
-                })
-                .collect();
+            // The (field, value) pairs of the command: cmd[2], cmd[3] the
+            // first; cmd[4], cmd[5] the second; ... A field is its bytes.
+            let pairs = cmd[2..].as_chunks::<2>().0;
 
             let added = match write_hash(ctx, key, |fields, mut expiries| {
                 let mut new_count = 0i64;
-                for (field, val) in &pairs {
+                for [field, val] in pairs {
                     // HSET removes any field-TTL; matches Redis 7.4 semantics
                     // where setting a field clears its TTL.
                     if let Some(expiries) = expiries.as_deref_mut() {
-                        expiries.remove(field);
+                        expiries.remove(*field);
                     }
-                    if fields.insert(field, val) {
+                    if fields.insert_bytes(*field, val) {
                         new_count += 1;
                     }
                 }
@@ -62,15 +53,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
 
             // Now update any matching vector indexes — outside the shard lock
-            crate::vector::maybe_index(
+            crate::vector::maybe_index_pairs(
                 ctx.index_store,
                 *ctx.selected_db,
                 key,
-                &pairs,
+                pairs,
                 crate::vector::Write::Fields,
             );
             notify(ctx.pubsub, *ctx.selected_db, KS_HASH, "hset", key);
-            let fields = pairs.iter().map(|(f, _)| f.as_bytes());
+            let fields = pairs.iter().map(|[f, _]| *f);
             notify_subkeys(ctx.pubsub, *ctx.selected_db, "hset", key, fields);
             Some(resp_integer(added))
         }
@@ -82,8 +73,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let field = crate::commands::helpers::name_from_bytes(cmd[2]);
-            let field: &str = &field;
+            let field: &[u8] = cmd[2];
 
             match with_hash_fields(ctx, key, |inner| inner.get(field).map(|v| resp_bulk(&v))) {
                 None => {
@@ -118,7 +108,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 if eff == 3 {
                     let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(inner.len() * 2);
                     inner.for_each(|k, v| {
-                        chunks.push(resp_bulk(&crate::commands::helpers::name_to_bytes(k)));
+                        chunks.push(resp_bulk(k));
                         chunks.push(resp_bulk(v.as_ref()));
                     });
                     resp_map(chunks)
@@ -127,7 +117,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let mut buf = Vec::with_capacity(16 + count * 32);
                     push_array_len(&mut buf, count);
                     inner.for_each(|k, v| {
-                        push_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
+                        push_bulk(&mut buf, k);
                         push_bulk(&mut buf, &v);
                     });
                     buf
@@ -181,37 +171,28 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let key: &[u8] = cmd[1];
 
-            let pairs: Vec<(String, Arc<[u8]>)> = cmd[2..]
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|chunk| {
-                    let field = crate::commands::helpers::name_from_bytes(chunk[0]).into_owned();
-                    let val: Arc<[u8]> = Arc::from(chunk[1]);
-                    (field, val)
-                })
-                .collect();
+            let pairs = cmd[2..].as_chunks::<2>().0;
 
             if let Err(e) = write_hash(ctx, key, |fields, mut expiries| {
-                for (field, val) in &pairs {
+                for [field, val] in pairs {
                     if let Some(expiries) = expiries.as_deref_mut() {
-                        expiries.remove(field);
+                        expiries.remove(*field);
                     }
-                    fields.insert(field, val);
+                    fields.insert_bytes(*field, val);
                 }
             }) {
                 return Some(e);
             }
 
-            crate::vector::maybe_index(
+            crate::vector::maybe_index_pairs(
                 ctx.index_store,
                 *ctx.selected_db,
                 key,
-                &pairs,
+                pairs,
                 crate::vector::Write::Fields,
             );
             notify(ctx.pubsub, *ctx.selected_db, KS_HASH, "hset", key);
-            let fields = pairs.iter().map(|(f, _)| f.as_bytes());
+            let fields = pairs.iter().map(|[f, _]| *f);
             notify_subkeys(ctx.pubsub, *ctx.selected_db, "hset", key, fields);
             Some(resp_simple("OK"))
         }
@@ -234,17 +215,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             match with_hash_fields(ctx, key, |inner| {
                 cmd[2..]
                     .iter()
-                    .map(|f| {
-                        let field = crate::commands::helpers::name_from_bytes(f);
-                        match inner.get(field.as_ref()) {
-                            Some(v) => {
-                                crate::stats::record_hit();
-                                resp_bulk(&v)
-                            }
-                            None => {
-                                crate::stats::record_miss();
-                                resp_null_for(resp)
-                            }
+                    .map(|f| match inner.get(f) {
+                        Some(v) => {
+                            crate::stats::record_hit();
+                            resp_bulk(&v)
+                        }
+                        None => {
+                            crate::stats::record_miss();
+                            resp_null_for(resp)
                         }
                     })
                     .collect::<Vec<Vec<u8>>>()
@@ -278,10 +256,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             match with_hash_write(ctx, key, |fields, mut expiries| {
                 let mut removed: Vec<&[u8]> = Vec::new();
                 for f in cmd[2..].iter() {
-                    let field = crate::commands::helpers::name_from_bytes(f);
-                    if fields.remove(field.as_ref()) {
+                    if fields.remove(*f) {
                         if let Some(exps) = expiries.as_mut() {
-                            exps.remove(field.as_ref());
+                            exps.remove(*f);
                         }
                         removed.push(*f);
                     }
@@ -317,8 +294,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let field = crate::commands::helpers::name_from_bytes(cmd[2]);
-            let field: &str = &field;
+            let field: &[u8] = cmd[2];
 
             match with_hash_fields(ctx, key, |inner| {
                 if inner.contains_key(field) {
@@ -382,7 +358,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let mut buf = Vec::with_capacity(16 + inner.len() * 24);
                 push_array_len(&mut buf, inner.len());
                 inner.for_each(|k, _| {
-                    push_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
+                    push_bulk(&mut buf, k);
                 });
                 Some(buf)
             }) {
@@ -442,7 +418,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let field = crate::commands::helpers::name_from_bytes(cmd[2]).into_owned();
+            let field: &[u8] = cmd[2];
             let incr: i64 = match parse_utf8(cmd[3]).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
@@ -455,7 +431,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // at once, and both answered `incr` (#271).
             lazy_expire_key(ctx.store, *ctx.selected_db, key);
             let result = match write_hash(ctx, key, |fields, _expiries| {
-                let current: i64 = match fields.get(&field) {
+                let current: i64 = match fields.get(field) {
                     None => 0,
                     Some(v) => match std::str::from_utf8(&v).ok().and_then(|s| s.parse().ok()) {
                         Some(n) => n,
@@ -467,7 +443,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let Some(next) = current.checked_add(incr) else {
                     return Err(resp_error("ERR increment or decrement would overflow"));
                 };
-                fields.insert_bytes(&field, next.to_string().as_bytes());
+                fields.insert_bytes(field, next.to_string().as_bytes());
                 Ok(resp_integer(next))
             }) {
                 Err(e) | Ok(Err(e)) => Some(e),
@@ -493,7 +469,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let field = crate::commands::helpers::name_from_bytes(cmd[2]).into_owned();
+            let field: &[u8] = cmd[2];
             // In `long double`, as `INCRBYFLOAT` (#387).
             use crate::commands::long_double::{self, Increment, LongDouble, Parsed};
             let incr = match LongDouble::parse(cmd[3]) {
@@ -507,7 +483,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // As `HINCRBY`.
             lazy_expire_key(ctx.store, *ctx.selected_db, key);
             let result = match write_hash(ctx, key, |fields, _expiries| {
-                let current = match fields.get(&field) {
+                let current = match fields.get(field) {
                     None => long_double::ZERO,
                     Some(v) => match LongDouble::parse(&v) {
                         Some(n) => n,
@@ -520,7 +496,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         return Err(resp_error("ERR increment would produce NaN or Infinity"));
                     }
                 };
-                fields.insert_bytes(&field, s.as_bytes());
+                fields.insert_bytes(field, s.as_bytes());
                 Ok(resp_bulk_str(&s))
             }) {
                 Err(e) | Ok(Err(e)) => Some(e),
@@ -547,14 +523,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let field = crate::commands::helpers::name_from_bytes(cmd[2]).into_owned();
-            let val: Arc<[u8]> = Arc::from(cmd[3]);
+            let field: &[u8] = cmd[2];
+            let val: &[u8] = cmd[3];
 
             let was_set = match write_hash(ctx, key, |fields, _expiries| {
-                if fields.contains_key(&field) {
+                if fields.contains_key(field) {
                     false
                 } else {
-                    fields.insert(&field, &val);
+                    fields.insert_bytes(field, val);
                     true
                 }
             }) {
@@ -639,17 +615,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let mut rng = rand::thread_rng();
                     let Some(count) = count else {
                         let (field, _) = inner.random(&mut rng).expect("not empty");
-                        return Some(resp_bulk(&crate::commands::helpers::name_to_bytes(field)));
+                        return Some(resp_bulk(field));
                     };
                     let push =
-                        |result: &mut Vec<Vec<u8>>, f: &str, v: crate::hash_fields::Value<'_>| {
+                        |result: &mut Vec<Vec<u8>>, f: &[u8], v: crate::hash_fields::Value<'_>| {
                             if pairs {
-                                result.push(resp_array(vec![
-                                    resp_bulk(&crate::commands::helpers::name_to_bytes(f)),
-                                    resp_bulk(&v),
-                                ]));
+                                result.push(resp_array(vec![resp_bulk(f), resp_bulk(&v)]));
                             } else {
-                                result.push(resp_bulk(&crate::commands::helpers::name_to_bytes(f)));
+                                result.push(resp_bulk(f));
                                 if with_values {
                                     result.push(resp_bulk(&v));
                                 }
@@ -764,9 +737,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                     pattern.as_ref(),
                                     options.no_values,
                                     |entry| {
-                                        hide && std::str::from_utf8(entry.field).is_ok_and(|f| {
-                                            expiries.get(f).is_some_and(|at| field_due(*at, now))
-                                        })
+                                        hide && expiries
+                                            .get(entry.field)
+                                            .is_some_and(|at| field_due(*at, now))
                                     },
                                 ));
                             }
@@ -797,12 +770,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // `helpers::scan_position`.
                     let (page, next_cursor) = crate::commands::helpers::scan_page(
                         // (Not `helpers::prefetched`: measured slower here.)
-                        inner.iter().map(|(f, v)| {
-                            (
-                                crate::commands::helpers::scan_position(f.as_bytes()),
-                                (f, v),
-                            )
-                        }),
+                        inner
+                            .iter()
+                            .map(|(f, v)| (crate::commands::helpers::scan_position(f), (f, v))),
                         cursor,
                         count,
                         inner.len(),
@@ -810,12 +780,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     );
                     let mut items: Vec<Vec<u8>> = Vec::with_capacity(page.len() * 2);
                     for (f, v) in page {
-                        if pattern.as_ref().is_some_and(|glob| {
-                            !glob.matches(&crate::commands::helpers::name_to_bytes(f))
-                        }) {
+                        if pattern.as_ref().is_some_and(|glob| !glob.matches(f)) {
                             continue;
                         }
-                        items.push(resp_bulk(&crate::commands::helpers::name_to_bytes(f)));
+                        items.push(resp_bulk(f));
                         if !options.no_values {
                             items.push(resp_bulk(&v));
                         }
@@ -1149,7 +1117,7 @@ struct FieldsShown<'a> {
 }
 
 impl<'a> FieldsShown<'a> {
-    fn get(&self, field: &str) -> Option<crate::hash_fields::Value<'a>> {
+    fn get(&self, field: &[u8]) -> Option<crate::hash_fields::Value<'a>> {
         let value = self.fields.get(field)?;
         match self.hide {
             Some((times, now)) if times.get(field).is_some_and(|at| field_due(*at, now)) => None,
@@ -1157,7 +1125,7 @@ impl<'a> FieldsShown<'a> {
         }
     }
 
-    fn contains_key(&self, field: &str) -> bool {
+    fn contains_key(&self, field: &[u8]) -> bool {
         self.get(field).is_some()
     }
 }
@@ -1398,7 +1366,7 @@ impl HfeFlag {
 ///
 /// Returns (flag, fields) on success. On error returns a RESP error to send
 /// straight back to the client.
-fn parse_hfe_tail(cmd: &[Vec<u8>], start_idx: usize) -> Result<(HfeFlag, Vec<String>), Vec<u8>> {
+fn parse_hfe_tail(cmd: &[Vec<u8>], start_idx: usize) -> Result<(HfeFlag, Vec<Vec<u8>>), Vec<u8>> {
     let mut idx = start_idx;
     let mut flag = HfeFlag::None;
 
@@ -1448,10 +1416,7 @@ fn parse_hfe_tail(cmd: &[Vec<u8>], start_idx: usize) -> Result<(HfeFlag, Vec<Str
         ));
     }
 
-    let mut fields = Vec::with_capacity(numfields);
-    for f in &cmd[idx..] {
-        fields.push(crate::commands::helpers::name_from_bytes(f).into_owned());
-    }
+    let fields = cmd[idx..].to_vec();
 
     Ok((flag, fields))
 }
@@ -1498,7 +1463,7 @@ fn should_set_field_expiry(
 fn apply_field_expire(
     ctx: &mut Ctx,
     key: &[u8],
-    fields: &[String],
+    fields: &[impl AsRef<[u8]>],
     new_exp: FieldDeadline,
     flag: HfeFlag,
     is_past: bool,
@@ -1514,7 +1479,7 @@ fn apply_field_expire(
                 .iter()
                 .zip(&results)
                 .filter(|(_, r)| **r == wanted)
-                .map(|(f, _)| f.as_bytes())
+                .map(|(f, _)| f.as_ref())
                 .collect()
         };
         // 1: the TTL was set. 2: the time had already passed, so the field
@@ -1540,7 +1505,7 @@ fn apply_field_expire(
 fn apply_field_expire_inner(
     ctx: &mut Ctx,
     key: &[u8],
-    fields: &[String],
+    fields: &[impl AsRef<[u8]>],
     new_exp: FieldDeadline,
     flag: HfeFlag,
     is_past: bool,
@@ -1584,13 +1549,13 @@ fn apply_field_expire_inner(
             // least one field actually exists (otherwise we'd churn the
             // variant for nothing). Read the plain hash first to check.
             let plain_read = plain.read();
-            let any_exists = fields.iter().any(|f| plain_read.contains_key(f));
+            let any_exists = fields.iter().any(|f| plain_read.contains_key(f.as_ref()));
             if !any_exists {
                 // All fields are missing — return -2 for each, leave variant alone.
                 return fields
                     .iter()
                     .map(|f| {
-                        if plain_read.contains_key(f) {
+                        if plain_read.contains_key(f.as_ref()) {
                             // Unreachable per the any_exists check above, but
                             // kept for symmetry with the non-trivial path.
                             resp_integer(HFE_OK)
@@ -1636,16 +1601,12 @@ fn has_come(at_ms: u64, past: bool) -> bool {
 }
 
 /// Record, as the running command's effect for replicas and the AOF,
-/// `command key [at] FIELDS n field…`, or `HDEL key field…`. `fields` are
-/// names as a hash keeps them. Nothing for no fields.
+/// `command key [at] FIELDS n field…`, or `HDEL key field…`. Nothing for no
+/// fields.
 fn record_field_effect(command: &[u8], key: &[u8], at_ms: Option<u64>, fields: &[&[u8]]) {
     if fields.is_empty() || !crate::replication::script_feed::recording() {
         return;
     }
-    let name = |f: &&[u8]| {
-        crate::commands::helpers::name_to_bytes(std::str::from_utf8(f).unwrap_or_default())
-            .into_owned()
-    };
     let mut parts = vec![command.to_vec(), key.to_vec()];
     if command != b"HDEL" {
         if let Some(at) = at_ms {
@@ -1654,7 +1615,7 @@ fn record_field_effect(command: &[u8], key: &[u8], at_ms: Option<u64>, fields: &
         parts.push(b"FIELDS".to_vec());
         parts.push(fields.len().to_string().into_bytes());
     }
-    parts.extend(fields.iter().map(name));
+    parts.extend(fields.iter().map(|f| f.to_vec()));
     crate::replication::script_feed::effect(parts);
 }
 
@@ -1662,7 +1623,7 @@ fn record_field_effect(command: &[u8], key: &[u8], at_ms: Option<u64>, fields: &
 /// share it.
 fn apply_to_hashex(
     hx: &Arc<parking_lot::RwLock<crate::types::HashInner>>,
-    fields: &[String],
+    fields: &[impl AsRef<[u8]>],
     new_exp: FieldDeadline,
     flag: HfeFlag,
     is_past: bool,
@@ -1671,6 +1632,7 @@ fn apply_to_hashex(
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
 
     for f in fields {
+        let f = f.as_ref();
         if !inner.fields.contains_key(f) {
             out.push(resp_integer(HFE_NO_SUCH_FIELD));
             continue;
@@ -1695,7 +1657,7 @@ fn apply_to_hashex(
             continue;
         }
 
-        inner.expiries.insert(f.clone(), new_exp);
+        inner.expiries.insert(f, new_exp);
         out.push(resp_integer(HFE_OK));
     }
     crate::hash_fields::after_write_ex(hx, &mut inner);
@@ -1719,7 +1681,7 @@ enum HfeReadMode {
 
 /// Parse the `... FIELDS numfields field [field ...]` tail used by all four
 /// readers. No NX/XX/GT/LT for these commands.
-fn parse_hfe_read_tail(cmd: &[&[u8]], start_idx: usize) -> Result<Vec<String>, Vec<u8>> {
+fn parse_hfe_read_tail<'a>(cmd: &[&'a [u8]], start_idx: usize) -> Result<Vec<&'a [u8]>, Vec<u8>> {
     let mut idx = start_idx;
     if idx >= cmd.len() {
         return Err(resp_error("ERR syntax error"));
@@ -1748,11 +1710,7 @@ fn parse_hfe_read_tail(cmd: &[&[u8]], start_idx: usize) -> Result<Vec<String>, V
             "ERR The `numfields` parameter must match the number of arguments",
         ));
     }
-    let mut fields = Vec::with_capacity(numfields);
-    for f in &cmd[idx..] {
-        fields.push(crate::commands::helpers::name_from_bytes(f).into_owned());
-    }
-    Ok(fields)
+    Ok(cmd[idx..].to_vec())
 }
 
 /// Redis's reply to a negative Unix time given to `HEXPIREAT`, `HPEXPIREAT`
@@ -1843,7 +1801,7 @@ fn run_hfe_read(ctx: &mut Ctx, cmd_name: &str, mode: HfeReadMode) -> Option<Vec<
                     if !shown.contains_key(f) {
                         return resp_integer(HFE_NO_SUCH_FIELD);
                     }
-                    match inner.expiries.get(f) {
+                    match inner.expiries.get(*f) {
                         None => resp_integer(-1),
                         Some(at) => resp_integer(deadline_to_hfe_value(*at, now, mode)),
                     }
@@ -1910,8 +1868,8 @@ fn run_hpersist(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     if !inner.fields.contains_key(f) {
                         return resp_integer(HFE_NO_SUCH_FIELD);
                     }
-                    if inner.expiries.remove(f).is_some() {
-                        persisted.push(f.as_bytes());
+                    if inner.expiries.remove(*f).is_some() {
+                        persisted.push(f);
                         resp_integer(1) // TTL removed
                     } else {
                         resp_integer(-1) // existed but had no TTL
@@ -1968,9 +1926,9 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let mut deleted: Vec<&[u8]> = Vec::new();
             let out: Vec<Vec<u8>> = fields
                 .iter()
-                .map(|f| match inner.take_with(f, resp_bulk) {
+                .map(|f| match inner.take_with(*f, resp_bulk) {
                     Some(v) => {
-                        deleted.push(f.as_bytes());
+                        deleted.push(f);
                         v
                     }
                     None => resp_null_for(resp),
@@ -1992,9 +1950,9 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let mut deleted: Vec<&[u8]> = Vec::new();
             let out: Vec<Vec<u8>> = fields
                 .iter()
-                .map(|f| match inner.take_field_with(f, resp_bulk) {
+                .map(|f| match inner.take_field_with(*f, resp_bulk) {
                     Some(v) => {
-                        deleted.push(f.as_bytes());
+                        deleted.push(f);
                         v
                     }
                     None => resp_null_for(resp),
@@ -2159,7 +2117,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 // exists. Otherwise this call is purely a (failing) read.
                 let plain = Arc::clone(plain);
                 let plain_r = plain.read();
-                let any = fields.iter().any(|f| plain_r.contains_key(f));
+                let any = fields.iter().any(|f| plain_r.contains_key(*f));
                 drop(plain_r);
                 if !any {
                     return Some(resp_array(
@@ -2202,7 +2160,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 let inner = h.read();
                 let out: Vec<Vec<u8>> = fields
                     .iter()
-                    .map(|f| match inner.get(f) {
+                    .map(|f| match inner.get(*f) {
                         Some(v) => resp_bulk(&v),
                         None => resp_null_for(resp),
                     })
@@ -2235,7 +2193,7 @@ fn hgetex_apply(
     ctx: &Ctx,
     key: &[u8],
     hx: &Arc<parking_lot::RwLock<crate::types::HashInner>>,
-    fields: &[String],
+    fields: &[&[u8]],
     action: HgetexAction,
     resp: u8,
     now: FieldDeadline,
@@ -2249,7 +2207,7 @@ fn hgetex_apply(
     // The fields the TTL action actually changed.
     let mut affected: Vec<&[u8]> = Vec::new();
 
-    for f in fields {
+    for &f in fields {
         let due = hide && inner.expiries.get(f).is_some_and(|at| field_due(*at, now));
         // The reply, written before the action may remove the field.
         let value = match inner.fields.get(f) {
@@ -2264,18 +2222,18 @@ fn hgetex_apply(
             HgetexAction::None => {}
             HgetexAction::Persist => {
                 if inner.expiries.remove(f).is_some() {
-                    affected.push(f.as_bytes());
+                    affected.push(f);
                 }
             }
             HgetexAction::SetExpiry(exp) => {
-                inner.expiries.insert(f.clone(), exp);
-                affected.push(f.as_bytes());
+                inner.expiries.insert(f, exp);
+                affected.push(f);
             }
             HgetexAction::SetExpiryPast(_) => {
                 // Past time → remove the field immediately. We've already
                 // captured `value` for the response.
                 inner.evict_field(f);
-                affected.push(f.as_bytes());
+                affected.push(f);
             }
         }
         out.push(value);
@@ -2640,14 +2598,8 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ));
     }
 
-    let mut pairs: Vec<(String, Arc<[u8]>)> = Vec::with_capacity(numfields);
-    let mut i = idx;
-    while i < cmd.len() {
-        let field = crate::commands::helpers::name_from_bytes(cmd[i]).into_owned();
-        let val: Arc<[u8]> = Arc::from(cmd[i + 1]);
-        pairs.push((field, val));
-        i += 2;
-    }
+    // The (field, value) pairs, each field its bytes.
+    let pairs = cmd[idx..].as_chunks::<2>().0;
 
     let fields_at = idx;
     let record = crate::replication::script_feed::effects_begin_if_read(ctx);
@@ -2705,30 +2657,30 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }
 
         // FNX / FXX precheck (atomic: all-or-nothing).
-        if fnx && pairs.iter().any(|(f, _)| inner.fields.contains_key(f)) {
+        if fnx && pairs.iter().any(|[f, _]| inner.fields.contains_key(*f)) {
             return Some(resp_integer(0));
         }
-        if fxx && !pairs.iter().all(|(f, _)| inner.fields.contains_key(f)) {
+        if fxx && !pairs.iter().all(|[f, _]| inner.fields.contains_key(*f)) {
             return Some(resp_integer(0));
         }
 
         // Apply all writes.
         let mut expiring: Vec<&[u8]> = Vec::new();
-        for (f, v) in &pairs {
-            inner.fields.insert(f, v);
+        for &[f, v] in pairs {
+            inner.fields.insert_bytes(f, v);
             match ttl {
                 HsetexTtl::Clear => {
                     inner.expiries.remove(f);
                 }
                 HsetexTtl::Keep => {}
                 HsetexTtl::Set(at) => {
-                    inner.expiries.insert(f.clone(), at);
-                    expiring.push(f.as_bytes());
+                    inner.expiries.insert(f, at);
+                    expiring.push(f);
                 }
                 HsetexTtl::KeepOrSet(at) => {
                     if !inner.expiries.contains_key(f) {
-                        inner.expiries.insert(f.clone(), at);
-                        expiring.push(f.as_bytes());
+                        inner.expiries.insert(f, at);
+                        expiring.push(f);
                     }
                 }
                 HsetexTtl::Past(_) => {
@@ -2741,9 +2693,9 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
 
     let db = *ctx.selected_db;
-    let all_fields = || pairs.iter().map(|(f, _)| f.as_bytes());
+    let all_fields = || pairs.iter().map(|[f, _]| *f);
     if record {
-        record_hsetex_effect(&key, &cmd[fields_at..], &pairs, ttl, &expiring);
+        record_hsetex_effect(&key, &cmd[fields_at..], pairs, ttl, &expiring);
     }
     if matches!(ttl, HsetexTtl::Past(_)) {
         // Set and expired in one step: the set, then the deletion, as Redis
@@ -2753,11 +2705,11 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         notify(ctx.pubsub, db, KS_HASH, "hdel", &key);
         notify_subkeys(ctx.pubsub, db, "hdel", &key, all_fields());
     } else {
-        crate::vector::maybe_index(
+        crate::vector::maybe_index_pairs(
             ctx.index_store,
             db,
             &key,
-            &pairs,
+            pairs,
             crate::vector::Write::Fields,
         );
         notify(ctx.pubsub, db, KS_HASH, "hset", &key);
@@ -2777,17 +2729,16 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
 ///
 /// Only when the record is read (`script_feed::effects_begin_if_read`).
 /// `args` are the command's own field-value pairs, as the client sent them:
-/// copied once, straight into the record, not from the names the hash
-/// keeps them under.
+/// copied once, straight into the record.
 fn record_hsetex_effect(
     key: &[u8],
     args: &[&[u8]],
-    pairs: &[(String, Arc<[u8]>)],
+    pairs: &[[&[u8]; 2]],
     ttl: HsetexTtl,
     expiring: &[&[u8]],
 ) {
     if let HsetexTtl::Past(_) = ttl {
-        let names: Vec<&[u8]> = pairs.iter().map(|(f, _)| f.as_bytes()).collect();
+        let names: Vec<&[u8]> = pairs.iter().map(|[f, _]| *f).collect();
         record_field_effect(b"HDEL", key, None, &names);
         return;
     }
@@ -2820,8 +2771,7 @@ fn run_hstrlen(ctx: &mut Ctx) -> Option<Vec<u8>> {
         ));
     }
     let key: &[u8] = cmd[1];
-    let field = crate::commands::helpers::name_from_bytes(cmd[2]);
-    let field: &str = &field;
+    let field: &[u8] = cmd[2];
 
     match with_hash_fields(ctx, key, |fields| {
         fields.get(field).map(|v| v.len() as i64).unwrap_or(0)
