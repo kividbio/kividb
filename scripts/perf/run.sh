@@ -42,7 +42,8 @@
 #                       ZRANGEBYSCORE, ZPOPMIN and ZREMRANGEBYRANK (each
 #                       with a ZADD), ZRANDMEMBER (no count and 10),
 #                       GEOSEARCH, and equal-score rows (see measure.sh;
-#                       SIZES limits the sizes)
+#                       SIZES limits the sizes; at 1M members ZRANK and the
+#                       range from a random rank run NDEEP (600) commands)
 #   WORKLOADS=hashes    hash commands on one hash of each form and size
 #                       (#764 step 3): HGET hit and miss, HSET of a field
 #                       there, HDEL + HSET pairs, HINCRBY, HMGET, HLEN,

@@ -1,6 +1,5 @@
 use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{expire_on_read, is_expired, lazy_expire_on_read, parse_utf8};
-use crate::member_set::Member;
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
@@ -749,9 +748,10 @@ fn steps_for(reach_m: f64, lat: f64) -> u8 {
 }
 
 /// A member found inside the area: borrowed from the set, whose read lock
-/// the search holds until its reply is made.
+/// the search holds until its reply is made (16 bytes, as the `Arc` it
+/// was: the nearest are sorted out of them).
 struct Found<'a> {
-    member: Member<'a>,
+    member: &'a [u8],
     score: f64,
     distance_m: f64,
     lon: f64,
@@ -791,7 +791,7 @@ fn members_in<'a>(zset: &'a SortedSetInner, area: &Area, limit: Option<usize>) -
             let (lon, lat) = decode_geohash(score);
             if let Some(distance_m) = area.contains(lon, lat) {
                 found.push(Found {
-                    member,
+                    member: member.borrowed(),
                     score,
                     distance_m,
                     lon,

@@ -174,9 +174,14 @@ pub fn order(a: f64, a_member: &[u8], b: f64, b_member: &[u8]) -> Ordering {
 /// relies on this to free an entry once the index has handed its reference
 /// back.
 pub unsafe trait ScoreOrder: Default + Send + Sync {
-    /// Members and their scores in order, both ways; borrowed from the
-    /// index.
+    /// Members and their scores in order, both ways, over a range of ranks
+    /// (the whole index, too); borrowed from the index.
     type Iter<'a>: DoubleEndedIterator<Item = (f64, &'a EntryRef)>
+    where
+        Self: 'a;
+
+    /// The same over a range of `(score, member)` keys.
+    type Range<'a>: DoubleEndedIterator<Item = (f64, &'a EntryRef)>
     where
         Self: 'a;
 
@@ -216,7 +221,7 @@ pub unsafe trait ScoreOrder: Default + Send + Sync {
     /// The members from `from` to `to`, each a `(score, member)` bound: a
     /// range of scores (from `(lo, "")` included to `(hi', "")` excluded,
     /// `hi'` the least score past it), or of members within one score.
-    fn range(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> Self::Iter<'_>;
+    fn range(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> Self::Range<'_>;
 
     /// The index of `sorted`: each a different member, in strictly
     /// increasing order.
@@ -315,78 +320,34 @@ fn probe_key(probe: &Probe<'_>, held: &mut Option<Box<[u64]>>) -> Key {
     }
 }
 
-/// [`BTreeIter`]'s walk: the whole tree, lazily from either end, as
-/// `keys()` walks it (a range of ranks), or a range of keys.
-enum Walk<'a> {
-    All(btree_map::Keys<'a, Key, ()>),
-    Range(btree_map::Range<'a, Key, ()>),
-}
+// The two iterators are as lean as walking the tree directly was before
+// the move to the table (a range of `ZRANGE`, the cells of `GEOSEARCH`): one
+// enum of both, or a step that was not inlined into the command, cost up to
+// 76% more instructions on a walk from a random rank, and 10% on GEOSEARCH.
 
-impl<'a> Walk<'a> {
-    #[inline]
-    fn next(&mut self) -> Option<&'a Key> {
-        match self {
-            Walk::All(keys) => keys.next(),
-            Walk::Range(range) => range.next().map(|(key, ())| key),
-        }
-    }
-
-    #[inline]
-    fn next_back(&mut self) -> Option<&'a Key> {
-        match self {
-            Walk::All(keys) => keys.next_back(),
-            Walk::Range(range) => range.next_back().map(|(key, ())| key),
-        }
-    }
-
-    #[inline]
-    fn nth(&mut self, n: usize) -> Option<&'a Key> {
-        match self {
-            Walk::All(keys) => keys.nth(n),
-            Walk::Range(range) => range.nth(n).map(|(key, ())| key),
-        }
-    }
-
-    #[inline]
-    fn nth_back(&mut self, n: usize) -> Option<&'a Key> {
-        match self {
-            Walk::All(keys) => keys.nth_back(n),
-            Walk::Range(range) => range.nth_back(n).map(|(key, ())| key),
-        }
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        match self {
-            Walk::All(keys) => keys.size_hint(),
-            Walk::Range(range) => range.size_hint(),
-        }
-    }
-}
-
-/// [`BTreeOrder`]'s iterator: the tree or a range of it, with the members
-/// outside a range of ranks stepped past on the first step from each end.
+/// [`BTreeOrder`]'s iterator of ranks: the tree walked lazily from either
+/// end, as `keys()` walks it, the members outside the range of ranks stepped
+/// past on the first step from each end.
 pub struct BTreeIter<'a> {
-    keys: Walk<'a>,
+    keys: btree_map::Keys<'a, Key, ()>,
     skip_front: usize,
     skip_back: usize,
-    /// Members left, when known (a range of ranks).
-    left: Option<usize>,
+    left: usize,
 }
 
 impl<'a> Iterator for BTreeIter<'a> {
     type Item = (f64, &'a EntryRef);
 
-    #[inline]
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(left) = &mut self.left {
-            if *left == 0 {
-                return None;
-            }
-            *left -= 1;
+        if self.left == 0 {
+            return None;
         }
+        self.left -= 1;
         if self.skip_front > 0 {
-            self.keys.nth(std::mem::take(&mut self.skip_front) - 1);
+            for _ in 0..std::mem::take(&mut self.skip_front) {
+                self.keys.next()?;
+            }
         }
         let key = self.keys.next()?;
         Some((key.score, &key.entry))
@@ -394,44 +355,65 @@ impl<'a> Iterator for BTreeIter<'a> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match self.left {
-            Some(left) => (left, Some(left)),
-            None => self.keys.size_hint(),
-        }
+        (self.left, Some(self.left))
     }
 }
 
 impl DoubleEndedIterator for BTreeIter<'_> {
-    #[inline]
+    #[inline(always)]
     fn next_back(&mut self) -> Option<Self::Item> {
-        if let Some(left) = &mut self.left {
-            if *left == 0 {
-                return None;
-            }
-            *left -= 1;
+        if self.left == 0 {
+            return None;
         }
+        self.left -= 1;
         if self.skip_back > 0 {
-            self.keys.nth_back(std::mem::take(&mut self.skip_back) - 1);
+            for _ in 0..std::mem::take(&mut self.skip_back) {
+                self.keys.next_back()?;
+            }
         }
         let key = self.keys.next_back()?;
         Some((key.score, &key.entry))
     }
 }
 
+/// [`BTreeOrder`]'s iterator of a range of keys.
+pub struct BTreeRange<'a> {
+    range: btree_map::Range<'a, Key, ()>,
+}
+
+impl<'a> Iterator for BTreeRange<'a> {
+    type Item = (f64, &'a EntryRef);
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.range.next().map(|(key, ())| (key.score, &key.entry))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.range.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for BTreeRange<'_> {
+    #[inline(always)]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.range
+            .next_back()
+            .map(|(key, ())| (key.score, &key.entry))
+    }
+}
+
 impl BTreeOrder {
     #[inline]
-    fn range_between(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> BTreeIter<'_> {
+    fn range_between(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> BTreeRange<'_> {
         let (mut held_from, mut held_to) = (None, None);
         let lo = from.as_ref().map(|p| probe_key(p, &mut held_from));
         let hi = to.as_ref().map(|p| probe_key(p, &mut held_to));
         // The range keeps no bound: the probes' entries can go when this
         // returns.
-        let keys = self.map.range::<Key, _>((lo.as_ref(), hi.as_ref()));
-        BTreeIter {
-            keys: Walk::Range(keys),
-            skip_front: 0,
-            skip_back: 0,
-            left: None,
+        BTreeRange {
+            range: self.map.range::<Key, _>((lo.as_ref(), hi.as_ref())),
         }
     }
 }
@@ -445,6 +427,7 @@ impl BTreeOrder {
 // call's own. Scores are the keys' own.
 unsafe impl ScoreOrder for BTreeOrder {
     type Iter<'a> = BTreeIter<'a>;
+    type Range<'a> = BTreeRange<'a>;
 
     #[inline]
     fn len(&self) -> usize {
@@ -513,15 +496,15 @@ unsafe impl ScoreOrder for BTreeOrder {
         let end = end.min(len);
         let start = start.min(end);
         BTreeIter {
-            keys: Walk::All(self.map.keys()),
+            keys: self.map.keys(),
             skip_front: start,
             skip_back: len - end,
-            left: Some(end - start),
+            left: end - start,
         }
     }
 
     #[inline]
-    fn range(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> BTreeIter<'_> {
+    fn range(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> BTreeRange<'_> {
         self.range_between(from, to)
     }
 

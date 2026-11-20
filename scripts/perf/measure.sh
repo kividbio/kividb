@@ -271,9 +271,15 @@ if [ "${WORKLOADS:-}" = zsets ]; then
         ZRANK-EQ ZRANGEBYSCORE-EQ; do
         load=load; [ "$op" = GEOSEARCH ] && load=geoload
         case $op in *-EQ) load=eqload ;; esac
+        # A rank, and a range from a random rank, walk to it (a few hundred
+        # thousand steps a command at 1,000,000 members, hours under
+        # callgrind at N): NDEEP (600) of them there, the same ones for
+        # every tag (the same seed).
+        n=$N
+        case $op in ZRANK | ZRANK-EQ | ZRANGE-DEEP) [ "$size" -ge 1000000 ] && n=${NDEEP:-600} ;; esac
         { zgen "$size" 1 0 "$load"; zgen "$size" 2 2000 "$op"; } > /tmp/z-warm
-        zgen "$size" 3 "$N" "$op" > /tmp/z
-        PIPEFILE=/tmp/z DSIZE=100 one "$tag" "$op-Z$size"
+        zgen "$size" 3 "$n" "$op" > /tmp/z
+        N=$n PIPEFILE=/tmp/z DSIZE=100 one "$tag" "$op-Z$size"
       done
     done
   done | tee /out/raw.txt
