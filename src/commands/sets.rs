@@ -794,7 +794,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::record_miss();
                     Some(resp_array(vec![resp_bulk_str("0"), resp_array(vec![])]))
                 }
-                Some(value @ ValueRef::Set(s)) => {
+                Some(ValueRef::Set(s)) => {
                     // The options are read once the key is known to be a set,
                     // as Redis does: a missing key is an empty scan whatever
                     // they say.
@@ -820,12 +820,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             pattern.as_ref(),
                         ));
                     }
-                    // A set Redis would encode compactly comes back whole.
-                    let (cursor, count) = if crate::commands::generics::scans_whole(value) {
-                        (0, usize::MAX)
-                    } else {
-                        (cursor, options.count)
-                    };
+                    // An array or a block comes back whole, as Redis returns
+                    // an intset or a listpack. (Not `generics::scans_whole`:
+                    // it takes the set's read lock again, and a second read
+                    // on this thread waits behind a writer queued since the
+                    // first, which waits for the first: a deadlock.)
+                    let (cursor, count) = (0, usize::MAX);
                     // In the order of the members' positions: see
                     // `helpers::scan_position`.
                     let (page, next_cursor) = crate::commands::helpers::scan_page(

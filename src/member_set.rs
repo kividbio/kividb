@@ -615,6 +615,24 @@ impl MemberSet {
         }
     }
 
+    /// Adds a member read from a snapshot, the AOF's base, a replication
+    /// stream or a `RESTORE` payload. A member too long for the table
+    /// ([`crate::collection_table::MAX_LEN`]; a command's argument is far
+    /// shorter) is an error, never dropped: the load fails.
+    pub fn insert_loaded(&mut self, member: &[u8]) -> std::io::Result<bool> {
+        if member.len() > crate::collection_table::MAX_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "a set member of {} bytes: longer than the {} a set holds",
+                    member.len(),
+                    crate::collection_table::MAX_LEN
+                ),
+            ));
+        }
+        Ok(self.insert_bytes(member))
+    }
+
     /// Adds a member of another set.
     #[inline]
     pub fn insert_member(&mut self, member: &Member<'_>) -> bool {
@@ -968,17 +986,43 @@ impl MemberSet {
 
     /// Whether the background has work on this set (a resize to finish, or
     /// a finished one's array to free) that it has not been handed yet; if
-    /// so, it is now marked handed.
+    /// so, it is now marked handed. Near `maxmemory` the work is done here
+    /// instead ([`Self::settle_if_tight`]) and nothing is handed over.
     #[inline]
     fn hand_over(&mut self) -> bool {
-        match &mut self.repr {
-            Repr::Table(t) if !t.queued => {
-                let due = t.members.resizing() || t.members.holds_retired();
-                t.queued = due;
-                due
-            }
-            _ => false,
+        let Repr::Table(t) = &mut self.repr else {
+            return false;
+        };
+        if !(t.members.resizing() || t.members.holds_retired()) {
+            return false;
         }
+        if self.settle_if_tight() {
+            return false;
+        }
+        let Repr::Table(t) = &mut self.repr else {
+            return false;
+        };
+        let due = !t.queued;
+        t.queued = true;
+        due
+    }
+
+    /// Near `maxmemory`, finish a resize in progress and free the old
+    /// arrays now, on this thread, as a table that grows all at once does
+    /// (and as sets did before #764): the arrays a resize holds are there
+    /// only until it ends, and must never be what makes the server refuse a
+    /// write or evict a key. Returns whether it did. See [`tight`].
+    #[cold]
+    fn settle_if_tight(&mut self) -> bool {
+        let Repr::Table(t) = &mut self.repr else {
+            return false;
+        };
+        if !tight(t.members.transient_bytes()) {
+            return false;
+        }
+        while !t.members.step_resize(usize::MAX) {}
+        drop(t.members.take_retired());
+        true
     }
 
     /// One step of the background's work on the set: about `budget` units
@@ -1074,6 +1118,49 @@ pub fn shared(mut set: MemberSet) -> Shared {
     shared
 }
 
+/// Whether the arrays a resize holds (`transient` bytes) could take memory
+/// past `maxmemory`: a limit is set and memory is within that many bytes of
+/// it. Read only when a table holds such arrays.
+fn tight(transient: usize) -> bool {
+    let limit = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed);
+    limit != 0 && crate::memory_use::counted().saturating_add(transient) >= limit
+}
+
+/// The process is over `maxmemory` (a command's check): finish every resize
+/// handed to the background and free what they leave, now, so that only
+/// what the sets settle at is counted when the check is made again. A set
+/// whose lock is held is left (it is never waited for). Returns whether
+/// anything was given back.
+pub fn release_transients() -> bool {
+    let sets = std::mem::take(&mut *HANDED.lock());
+    let mut kept = Vec::with_capacity(sets.len());
+    let mut released = false;
+    for weak in sets {
+        let Some(set) = weak.upgrade() else {
+            continue;
+        };
+        match set.try_write() {
+            Some(mut inner) => {
+                if let Repr::Table(t) = &mut inner.repr {
+                    released |= t.members.transient_bytes() > 0;
+                    while !t.members.step_resize(usize::MAX) {}
+                    drop(t.members.take_retired());
+                    t.queued = false;
+                }
+            }
+            None => kept.push(Arc::downgrade(&set)),
+        }
+        if let Some(last) = Arc::into_inner(set) {
+            crate::lazyfree::free_later(last, 0);
+        }
+    }
+    let mut handed = HANDED.lock();
+    kept.append(&mut handed);
+    *handed = kept;
+    HANDED_COUNT.store(handed.len(), Ordering::Release);
+    released
+}
+
 /// Whether any set waits for the background.
 #[inline]
 pub fn background_pending() -> bool {
@@ -1121,18 +1208,26 @@ pub fn step_background(budget: std::time::Duration) -> BackgroundWork {
             work.longest_hold = work.longest_hold.max(hold.elapsed());
             work.steps += 1;
             if let Some(retired) = retired {
-                crate::lazyfree::free_later(retired, 0);
+                // Near the limit, given back now: `lazyfree` frees it a
+                // moment later, and the next command's check would count it.
+                if tight(retired.bytes()) {
+                    drop(retired);
+                } else {
+                    crate::lazyfree::free_later(retired, 0);
+                }
             }
             if finished {
                 done = true;
                 break;
             }
         }
-        if Arc::strong_count(&set) == 1 {
-            // Its key went while this held it, and nothing else can reach
-            // it (the background alone holds it weakly): the last holder
-            // frees it, and a big set is not freed on this thread.
-            crate::lazyfree::free_later(set, 0);
+        // Let go of it without ever freeing it here. If its key went while
+        // this held it (deleted, flushed, `UNLINK`ed...), this is the last
+        // holder, and the set goes to `lazyfree` whole: `into_inner` tells
+        // that atomically, where a count read first could see another
+        // holder that lets go just after, leaving the free to this thread.
+        if let Some(last) = Arc::into_inner(set) {
+            crate::lazyfree::free_later(last, 0);
             continue;
         }
         if done {

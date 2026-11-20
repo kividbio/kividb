@@ -2432,7 +2432,7 @@ fn read_image_body(
                     let mut hset = crate::member_set::MemberSet::with_capacity(hint(count));
                     for _ in 0..count {
                         let member = read_bytes(&mut r)?;
-                        hset.insert_bytes(&member);
+                        hset.insert_loaded(&member)?;
                     }
                     KiviDBValue::Set(crate::member_set::shared(hset))
                 }
@@ -3947,7 +3947,7 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
             let mut set = crate::member_set::MemberSet::with_capacity(hint(count as usize));
             for _ in 0..count {
                 let member = rdb_read_string(r)?;
-                set.insert_bytes(&member);
+                set.insert_loaded(&member)?;
             }
             Ok(Some(KiviDBValue::Set(crate::member_set::shared(set))))
         }
@@ -6135,7 +6135,7 @@ pub fn deserialize_value(data: &[u8]) -> Option<KiviDBValue> {
             let mut set = crate::member_set::MemberSet::with_capacity(hint(count));
             for _ in 0..count {
                 let (bytes, next) = read_bytes_slice(payload, pos)?;
-                set.insert_bytes(bytes);
+                set.insert_loaded(bytes).ok()?;
                 pos = next;
             }
             Some(KiviDBValue::Set(crate::member_set::shared(set)))

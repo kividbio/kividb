@@ -1066,7 +1066,16 @@ pub(crate) fn client_connection_resp(ctx: &Ctx<'_>) -> u8 {
 /// load when there is no limit; with one, see `memory_use::over`.
 pub fn check_memory_limit() -> bool {
     let limit = crate::RUNTIME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed);
-    limit != 0 && crate::memory_use::over(limit)
+    if limit == 0 || !crate::memory_use::over(limit) {
+        return false;
+    }
+    // Over: the old arrays of large sets' resizes left to the background
+    // are memory only until those end. Ended now, they are not what refuses
+    // a write or evicts a key (#764).
+    if crate::member_set::background_pending() && crate::member_set::release_transients() {
+        return crate::memory_use::over(limit);
+    }
+    true
 }
 
 /// Run one command.

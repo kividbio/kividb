@@ -47,9 +47,12 @@
 //! may miss elements: a write between two of its pages takes a step of the
 //! resize, which can move an element from an old-seed position the scan has
 //! not reached to a new-seed one it has passed. A scan started after the
-//! resize with a new seed has ended has the guarantee again. (One started
-//! while it is in progress also returns every element if nothing is written
-//! between its pages.)
+//! resize with a new seed has ended has the guarantee again. A scan whose
+//! pages span a resize with a new seed has no guarantee whether or not
+//! anything is written between its pages: the server's background
+//! (`member_set::step_background`) takes steps of a resize in progress
+//! between pages too. Only a chain over [`CHAIN_CAP`] starts such a resize,
+//! which random keys do not reach (see above).
 //!
 //! **Resizing.** Above the maximum fill (0.875 of the main slots) the table
 //! doubles, below 1/8 it shrinks towards half full, by at most
@@ -2122,6 +2125,24 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
             if let Some((array, arena)) = rare.retired.as_ref() {
                 bytes += A::charged(Array::layout(array.bits)) + arena.bytes::<A>();
             }
+        }
+        bytes
+    }
+
+    /// The part of [`Self::allocation_size`] that is there only because of
+    /// a resize: the array (and arena) a resize in progress is moving out
+    /// of, and a finished one's kept for [`Self::take_retired`]. 0 when the
+    /// table is settled.
+    pub fn transient_bytes(&self) -> usize {
+        let Some(rare) = self.rare.as_ref() else {
+            return 0;
+        };
+        let mut bytes = 0;
+        if let Some(old) = rare.old.as_ref() {
+            bytes += A::charged(Array::layout(old.array.bits)) + old.arena.bytes::<A>();
+        }
+        if let Some((array, arena)) = rare.retired.as_ref() {
+            bytes += A::charged(Array::layout(array.bits)) + arena.bytes::<A>();
         }
         bytes
     }

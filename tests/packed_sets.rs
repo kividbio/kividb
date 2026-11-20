@@ -867,3 +867,126 @@ fn eviction_counts_the_blocks() {
         }
     }
 }
+
+/// SSCAN of an array or a block, read whole under the set's read lock,
+/// while other clients write the same set: no reply may wait for ever. A
+/// second read of the lock on the scanning thread (the form looked up again
+/// while the first read was held) waited behind a writer queued in between,
+/// which waited for the first read: SSCAN, the writer and every client of
+/// that shard hung.
+#[test]
+fn sscan_of_a_small_set_never_waits_on_its_writers() {
+    for model in io_models() {
+        let dir = temp_dir("sscan-race");
+        let server = Server::start(dir.path(), &["--io-model", model]);
+        let mut c = server.conn();
+        let ints: Vec<String> = (0..10).map(|i| i.to_string()).collect();
+        let strings: Vec<String> = (0..10).map(|i| format!("m{i}")).collect();
+        let ints: Vec<&str> = ints.iter().map(String::as_str).collect();
+        let strings: Vec<&str> = strings.iter().map(String::as_str).collect();
+        c.cmd(&[&["SADD", "si"][..], &ints].concat());
+        c.cmd(&[&["SADD", "sl"][..], &strings].concat());
+        assert_eq!(c.encoding("si"), "intset");
+        assert_eq!(c.encoding("sl"), "listpack");
+        let port = server.port;
+        let until = Instant::now() + Duration::from_secs(3);
+        let mut threads = Vec::new();
+        for (key, extra) in [("si", "10"), ("sl", "m10")] {
+            for _ in 0..3 {
+                threads.push(thread::spawn(move || {
+                    let mut c = Conn::connect(port);
+                    let mut n = 0u64;
+                    while Instant::now() < until {
+                        let reply = c.cmd(&["SSCAN", key, "0", "COUNT", "2"]);
+                        assert_eq!(reply.items()[0].text(), "0");
+                        n += 1;
+                    }
+                    n
+                }));
+            }
+            for _ in 0..2 {
+                threads.push(thread::spawn(move || {
+                    let mut c = Conn::connect(port);
+                    let mut n = 0u64;
+                    while Instant::now() < until {
+                        c.cmd(&["SADD", key, extra]);
+                        c.cmd(&["SREM", key, extra]);
+                        n += 1;
+                    }
+                    n
+                }));
+            }
+        }
+        // A client that waited for ever fails its read after 30 s.
+        for t in threads {
+            let done = t.join();
+            assert!(
+                done.is_ok(),
+                "{model}: a client never got its reply (deadlock)"
+            );
+        }
+        assert_eq!(c.cmd(&["PING"]), Resp::Simple("PONG".into()), "{model}");
+    }
+}
+
+/// `MEMORY USAGE` of `key` once it has stopped changing: a table's resize
+/// finished in the background gives its old array back at its end.
+fn settled_usage(c: &mut Conn, key: &str) -> i64 {
+    let mut last = c.cmd(&["MEMORY", "USAGE", key]).int();
+    let mut same = 0;
+    for _ in 0..200 {
+        thread::sleep(Duration::from_millis(20));
+        let now = c.cmd(&["MEMORY", "USAGE", key]).int();
+        same = if now == last { same + 1 } else { 0 };
+        if same == 5 {
+            break;
+        }
+        last = now;
+    }
+    last
+}
+
+/// A set `SINTERSTORE` or `SDIFFSTORE` makes of two sets of over 65,536
+/// members is the size of the same members added by `SADD`: it is not
+/// sized for its sources (a table made with room for 65,536 members holds
+/// about 1 MiB of groups whatever it is filled with).
+#[test]
+fn a_stored_result_is_sized_for_its_members() {
+    let dir = temp_dir("store-size");
+    let server = Server::start(dir.path(), &[]);
+    let mut c = server.conn();
+    let m = |i: usize| format!("membr:{i:08}");
+    let add = |c: &mut Conn, key: &str, members: &mut dyn Iterator<Item = String>| {
+        let all: Vec<String> = members.collect();
+        for chunk in all.chunks(1000) {
+            let mut args = vec!["SADD", key];
+            args.extend(chunk.iter().map(String::as_str));
+            c.cmd(&args);
+        }
+    };
+    add(&mut c, "a", &mut (0..70_000).map(m));
+    for n in [1_000usize, 9_000] {
+        // b holds n of a's members and 70,000 others; c all of a's but n.
+        let b = format!("b{n}");
+        let other = format!("c{n}");
+        add(
+            &mut c,
+            &b,
+            &mut (0..n).map(m).chain((100_000..170_000).map(m)),
+        );
+        add(&mut c, &other, &mut (n..70_000).map(m));
+        let built = format!("built{n}");
+        add(&mut c, &built, &mut (0..n).map(m));
+        let want = settled_usage(&mut c, &built);
+        for (cmd, from) in [("SINTERSTORE", b.as_str()), ("SDIFFSTORE", other.as_str())] {
+            let dst = format!("{cmd}{n}");
+            assert_eq!(c.cmd(&[cmd, &dst, "a", from]).int(), n as i64, "{cmd} {n}");
+            assert_eq!(c.encoding(&dst), "hashtable");
+            let got = settled_usage(&mut c, &dst);
+            assert!(
+                (got - want).abs() * 100 <= want * 5,
+                "{cmd} of {n} members: MEMORY USAGE {got}, the same set built by SADD {want}"
+            );
+        }
+    }
+}

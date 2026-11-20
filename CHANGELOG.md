@@ -1016,8 +1016,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     this release writes and the other way round. `MEMORY USAGE`, eviction
     and lazy freeing count a block or an array as the one allocation it is.
 
-- **Large sets take about half the memory, never pause a write to grow, and
-  `SSCAN` reads only its page (#764, #770).** A set past the block's and the
+- **Large sets take about half the memory, no write moves every member at
+  once to grow, and `SSCAN` reads only its page (#764, #770).** A set past
+  the block's and the
   array's limits (`OBJECT ENCODING` `hashtable`) is a table of its own,
   where each member is one block of a slab pool kept for collections (16
   bytes for a 14-byte member), or no block at all for a member of up to seven bytes (any

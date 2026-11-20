@@ -2412,19 +2412,11 @@ fn grow_until_refused(
     );
     assert_eq!(c.evicted(), 0);
 
-    // What the key took, measured, and what it reports, once it has settled:
-    // a set's table (#764) that a write began to grow holds its old array
-    // until the growth is finished, by the background when no more writes
-    // come, which gives the old array back (up to 1.5 times the table's
-    // bytes meanwhile, as a Redis dict holds both tables while it rehashes).
-    let mut took = c.used_memory() - before;
-    let mut still = 0;
-    while still < 5 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let now = c.used_memory() - before;
-        still = if now < took { 0 } else { still + 1 };
-        took = took.min(now);
-    }
+    // What the key took, measured, and what it reports. Read at once: near
+    // the limit a set's table (#764) finishes a growth on the write that
+    // began it and frees the old array there, so no array kept only for a
+    // resize is counted, as with a table that grows all at once.
+    let took = c.used_memory() - before;
     let usage = c.cmd(&["MEMORY", "USAGE", key, "SAMPLES", "0"]).i();
     assert!(
         (took * 9 / 10..=took * 11 / 10).contains(&usage),
@@ -2456,6 +2448,65 @@ fn noeviction_refuses_a_growing_set_at_the_limit_and_memory_usage_says_why() {
         cmd_with(c, &["SADD", "set"], &members(from, 100))
     });
     assert!(added > 10_000, "only {added} members in 2 MB");
+}
+
+/// Under an evicting policy, one large set growing through its table's
+/// doublings beside many small keys evicts no more of them than the set's
+/// settled size needs: the arrays a resize holds only until it ends (#764)
+/// are given back before the limit is judged, so memory ends at the limit,
+/// not an old array's size below it. (`volatile-lru`, the small keys with a
+/// TTL: the set itself is never the one evicted and made again.)
+#[test]
+fn a_growing_set_evicts_no_more_than_its_settled_size_needs() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    assert!(
+        c.cmd(&["CONFIG", "SET", "maxmemory-policy", "volatile-lru"])
+            .ok()
+    );
+    let value = "v".repeat(1000);
+    for i in 0..3000 {
+        c.cmd(&["SET", &format!("small:{i}"), &value, "EX", "100000"]);
+    }
+    let limit = c.limit_to(2 * MB);
+    // 105,000 members: past the doublings at 25,088, 50,176 and 100,352,
+    // whose old arrays are 256 KiB, 512 KiB and 1 MiB, and stopped just
+    // after the last, while its growth is still in progress: the writes'
+    // own steps move about 8,000 members a command, and the background
+    // finishes it once they stop. Memory is over the limit from about
+    // 60,000 members on.
+    let mut added = 0;
+    while added < 105_000 {
+        cmd_with(&mut c, &["SADD", "big"], &members(added, 1000));
+        added += 1000;
+    }
+    assert_eq!(
+        c.cmd(&["EXISTS", "big"]).i(),
+        1,
+        "the growing set was evicted"
+    );
+    assert!(
+        c.evicted() > 0,
+        "nothing was evicted: the limit was never reached"
+    );
+    // Whatever a resize still holds is given back within a second.
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    let used = c.used_memory();
+    // Evictions are made before a write, so the last write may leave memory
+    // a little over.
+    assert!(
+        used <= limit + 64 * KB,
+        "used {used} over the limit {limit}"
+    );
+    // Eviction stops as soon as memory is under the limit: what is left
+    // below it is a few small keys, never an old array's 512 KiB or 1 MiB.
+    assert!(
+        limit - used < 256 * KB,
+        "{} bytes under the limit after {} evictions: more was evicted than the set's size needs",
+        limit - used,
+        c.evicted()
+    );
+    c.lift_the_limit();
 }
 
 /// The same for a hash of many short fields.

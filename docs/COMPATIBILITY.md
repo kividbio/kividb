@@ -142,7 +142,10 @@ other files:
   Redis does. A `hashtable` is scanned a page at a time, `COUNT` being a
   hint as in Redis: a page can be shorter than `COUNT`, or empty, before
   the cursor comes back 0. Every member there for the whole scan is
-  returned at least once. A scan begun on 1.2.x or earlier and continued
+  returned at least once, except in one case no ordinary data reaches: if
+  a run of members that all hash alike makes the table rehash its members
+  with a new seed while a scan is in progress, that scan may miss members
+  (it still ends). A scan begun on 1.2.x or earlier and continued
   after an upgrade (or a cursor from another server) still ends without an
   error, but may miss or repeat members: begin it again.
 - `SMEMBERS`, `SSCAN`, `SINTER`, `SUNION`, `SDIFF`, `SPOP` and

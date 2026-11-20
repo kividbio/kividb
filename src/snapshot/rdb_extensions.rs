@@ -146,7 +146,7 @@ pub(super) fn read_dragonfly_value(
                     }
                     None => {}
                 }
-                set.insert(Arc::from(member.as_slice()));
+                set.insert_loaded(&member)?;
             }
             if set.is_empty() {
                 return Ok(None);
