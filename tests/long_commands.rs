@@ -125,6 +125,48 @@ impl Conn {
         }
         assert_eq!(self.cmd(&["HLEN", key]), V::Int(fields as i64));
     }
+
+    /// A set of `members` members at `key`, sent a thousand members a
+    /// command and the commands pipelined.
+    fn big_set(&mut self, key: &str, members: usize) {
+        let mut sent = 0;
+        for start in (0..members).step_by(1000) {
+            let names: Vec<String> = (start..members.min(start + 1000))
+                .map(|i| format!("m{i}"))
+                .collect();
+            let mut args = vec!["SADD", key];
+            for name in &names {
+                args.push(name);
+            }
+            self.send(&args);
+            sent += 1;
+        }
+        for _ in 0..sent {
+            assert!(matches!(self.read(), V::Int(_)));
+        }
+        assert_eq!(self.cmd(&["SCARD", key]), V::Int(members as i64));
+    }
+
+    /// A list of `elements` elements at `key`, sent a thousand elements a
+    /// command and the commands pipelined.
+    fn big_list(&mut self, key: &str, elements: usize) {
+        let mut sent = 0;
+        for start in (0..elements).step_by(1000) {
+            let names: Vec<String> = (start..elements.min(start + 1000))
+                .map(|i| format!("e{i}"))
+                .collect();
+            let mut args = vec!["RPUSH", key];
+            for name in &names {
+                args.push(name);
+            }
+            self.send(&args);
+            sent += 1;
+        }
+        for _ in 0..sent {
+            assert!(matches!(self.read(), V::Int(_)));
+        }
+        assert_eq!(self.cmd(&["LLEN", key]), V::Int(elements as i64));
+    }
 }
 
 fn port_is_free(port: u16) -> bool {
@@ -253,6 +295,30 @@ fn probe_while(
     out
 }
 
+/// As [`assert_not_held_up`], but for a command whose reply is most of its
+/// time: a stalled `PING` waits only for the work, not the write of what it
+/// built, so a wait is bounded absolutely rather than as a share of the
+/// command. Inline, a run's worst wait is hundreds of milliseconds or more;
+/// moved off the runtime it is single milliseconds.
+fn assert_no_ping_waited(what: &str, runs: &[(Duration, Duration)]) {
+    eprintln!("{what}: (took, longest PING) {runs:?}");
+    for &(took, _) in runs {
+        assert!(
+            took >= Duration::from_millis(40),
+            "{what} took {took:?}: too short to tell a stall from noise; runs {runs:?}"
+        );
+    }
+    let worst = runs
+        .iter()
+        .map(|(_, waited)| *waited)
+        .max()
+        .unwrap_or_default();
+    assert!(
+        worst <= Duration::from_millis(100),
+        "a PING on another connection waited {worst:?} while {what} ran; runs {runs:?}"
+    );
+}
+
 /// Every run took long enough to tell, and in none did a `PING` wait as
 /// much as half of it.
 fn assert_not_held_up(what: &str, runs: &[(Duration, Duration)]) {
@@ -316,6 +382,44 @@ fn freeing_a_big_value_after_del_does_not_hold_up_other_connections() {
         assert_eq!(c.cmd(&["EXISTS", "big"]), V::Int(0));
     }
     assert_not_held_up("DEL of a hash of 1,000,000 fields", &timed);
+}
+
+/// Reads that answer with every element — `HGETALL`, `SMEMBERS`, `LRANGE`
+/// of a collection of a million — move off the connection's thread the way
+/// `KEYS` does, or every other connection on the runtime waits through the
+/// walk and the build (#762).
+#[test]
+fn reading_every_element_does_not_hold_up_other_connections() {
+    let _turn = one_at_a_time();
+    let port = start_server();
+    let mut c = Conn::connect(port);
+
+    c.big_hash("h", 1_000_000);
+    let hgetall = probe_while(port, 3, |long| {
+        let V::Array(fields) = long.cmd(&["HGETALL", "h"]) else {
+            panic!("HGETALL answers an array");
+        };
+        assert_eq!(fields.len(), 2_000_000);
+    });
+    assert_no_ping_waited("HGETALL of a hash of 1,000,000 fields", &hgetall);
+
+    c.big_set("s", 1_000_000);
+    let smembers = probe_while(port, 3, |long| {
+        let V::Array(members) = long.cmd(&["SMEMBERS", "s"]) else {
+            panic!("SMEMBERS answers an array");
+        };
+        assert_eq!(members.len(), 1_000_000);
+    });
+    assert_no_ping_waited("SMEMBERS of a set of 1,000,000 members", &smembers);
+
+    c.big_list("l", 1_000_000);
+    let lrange = probe_while(port, 3, |long| {
+        let V::Array(elements) = long.cmd(&["LRANGE", "l", "0", "-1"]) else {
+            panic!("LRANGE answers an array");
+        };
+        assert_eq!(elements.len(), 1_000_000);
+    });
+    assert_no_ping_waited("LRANGE of a list of 1,000,000 elements", &lrange);
 }
 
 /// Each long command hands its worker's tasks to a thread of the runtime's

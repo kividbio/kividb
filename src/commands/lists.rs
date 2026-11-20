@@ -1,6 +1,6 @@
 use crate::commands::blocking;
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::{lazy_expire_key, lazy_expire_on_read, parse_utf8};
+use crate::commands::helpers::{lazy_expire_key, lazy_expire_on_read, long_work, parse_utf8};
 use crate::commands::list_move;
 use crate::keyspace_events::{KS_LIST, notify};
 use crate::list_values::{ListValues, Popped};
@@ -387,21 +387,26 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let stop = stop as usize;
                     let count = stop - start + 1;
 
-                    // Write directly into one pre-allocated buffer instead of
-                    // collecting N separate Vec<u8> allocations and then
-                    // concatenating them in resp_array. For LRANGE 100 this
-                    // cuts allocations from 101 down to 1. Lengths are
-                    // written as digits, not through `write!` (about 200
-                    // instructions an element less).
-                    use crate::resp::write::push_header;
+                    // An answer of `count` elements: past `LONG_WORK` of them
+                    // it runs where the other connections do not wait.
+                    let buf = long_work(count, || {
+                        // Write directly into one pre-allocated buffer instead of
+                        // collecting N separate Vec<u8> allocations and then
+                        // concatenating them in resp_array. For LRANGE 100 this
+                        // cuts allocations from 101 down to 1. Lengths are
+                        // written as digits, not through `write!` (about 200
+                        // instructions an element less).
+                        use crate::resp::write::push_header;
 
-                    let mut buf = Vec::with_capacity(16 + count * 24);
-                    push_header(&mut buf, b'*', count);
-                    inner.for_each_in(start, start + count, |v| {
-                        push_header(&mut buf, b'$', v.len());
-                        buf.extend_from_slice(v);
-                        buf.extend_from_slice(b"\r\n");
-                        true
+                        let mut buf = Vec::with_capacity(16 + count * 24);
+                        push_header(&mut buf, b'*', count);
+                        inner.for_each_in(start, start + count, |v| {
+                            push_header(&mut buf, b'$', v.len());
+                            buf.extend_from_slice(v);
+                            buf.extend_from_slice(b"\r\n");
+                            true
+                        });
+                        buf
                     });
 
                     Some(buf)

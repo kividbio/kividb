@@ -714,6 +714,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `KEYS`, which a script cannot run beside. A `SCAN` loop (`COUNT 1000`)
   stalled nothing over 20 ms before or after.
 
+- **`HGETALL`, `SMEMBERS` and `LRANGE` over many elements no longer hold up
+  every other connection on the Tokio I/O model (#762).** As `KEYS` and
+  `SCAN` since #754: a read that walks a whole collection to build its
+  reply ran inline on the worker that was, often, the one waiting on the
+  sockets for everyone, and a `PING` on another connection waited through
+  it (measured: 1.3 s behind an `HGETALL` of a hash of a million fields).
+  Past `LONG_WORK` elements each now runs with the worker's other tasks
+  handed to another thread; smaller collections run inline as before, so a
+  read costs a comparison more and nothing else. On io_uring a long command
+  still holds up the connections of its own thread, and `SORT`, a `SET`
+  that frees a big value, and a multi-key `DEL` of one are still inline on
+  both models.
+
 - **A write costs a master that keeps its replication backlog, or has a
   replica, a third less (#894).** Each write used to reach the replication
   thread as a message of its own, in an allocation of its own, after its

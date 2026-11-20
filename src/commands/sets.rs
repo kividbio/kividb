@@ -1,5 +1,5 @@
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::{lazy_expire_on_read, parse_utf8};
+use crate::commands::helpers::{lazy_expire_on_read, long_work, parse_utf8};
 use crate::commands::set_card::{collect_set, diff_each, inter_each, sets_at, union_of};
 use crate::keyspace_events::{KS_SET, notify};
 use crate::member_set::{MemberSet, after_write};
@@ -295,17 +295,22 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 Some(ValueRef::Set(s)) => {
                     let inner = s.read();
-                    let mut buf = Vec::with_capacity(16 + inner.len() * 24);
-                    // RESP3 has a real set type (`~`); RESP2 only has arrays.
-                    // Identical payload, one byte of header difference — this
-                    // keeps the single-pass build instead of collecting into a
-                    // Vec just to re-encode it.
-                    push_header(
-                        &mut buf,
-                        if reply_resp(ctx) >= 3 { b'~' } else { b'*' },
-                        inner.len(),
-                    );
-                    inner.for_each(|v| push_bulk(&mut buf, v));
+                    // An answer of every member: past `LONG_WORK` members it
+                    // runs where the other connections do not wait.
+                    let buf = long_work(inner.len(), || {
+                        let mut buf = Vec::with_capacity(16 + inner.len() * 24);
+                        // RESP3 has a real set type (`~`); RESP2 only has arrays.
+                        // Identical payload, one byte of header difference — this
+                        // keeps the single-pass build instead of collecting into a
+                        // Vec just to re-encode it.
+                        push_header(
+                            &mut buf,
+                            if reply_resp(ctx) >= 3 { b'~' } else { b'*' },
+                            inner.len(),
+                        );
+                        inner.for_each(|v| push_bulk(&mut buf, v));
+                        buf
+                    });
                     crate::stats::record_hit();
                     Some(buf)
                 }

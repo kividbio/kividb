@@ -115,23 +115,27 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             match with_hash_read(ctx, key, |inner| {
                 let eff = effective_resp_for_reply(ctx);
-                if eff == 3 {
-                    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(inner.len() * 2);
-                    for (k, v) in inner.iter() {
-                        chunks.push(resp_bulk(&crate::commands::helpers::name_to_bytes(k)));
-                        chunks.push(resp_bulk(v.as_ref()));
+                // An answer of every field the hash has: past `LONG_WORK`
+                // fields it runs where the other connections do not wait.
+                long_work(inner.len(), || {
+                    if eff == 3 {
+                        let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(inner.len() * 2);
+                        for (k, v) in inner.iter() {
+                            chunks.push(resp_bulk(&crate::commands::helpers::name_to_bytes(k)));
+                            chunks.push(resp_bulk(v.as_ref()));
+                        }
+                        Some(resp_map(chunks))
+                    } else {
+                        let count = inner.len() * 2;
+                        let mut buf = Vec::with_capacity(16 + count * 32);
+                        push_array_len(&mut buf, count);
+                        for (k, v) in inner.iter() {
+                            push_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
+                            push_bulk(&mut buf, &v);
+                        }
+                        Some(buf)
                     }
-                    Some(resp_map(chunks))
-                } else {
-                    let count = inner.len() * 2;
-                    let mut buf = Vec::with_capacity(16 + count * 32);
-                    push_array_len(&mut buf, count);
-                    for (k, v) in inner.iter() {
-                        push_bulk(&mut buf, &crate::commands::helpers::name_to_bytes(k));
-                        push_bulk(&mut buf, &v);
-                    }
-                    Some(buf)
-                }
+                })
             }) {
                 None => {
                     crate::stats::record_miss();
