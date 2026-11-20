@@ -11736,7 +11736,10 @@ fn droporphans_leaves_the_keys_of_a_handover_still_being_deleted() {
 /// slots' keys, and in its slot table they are still the source's, which
 /// is up. `CLUSTER DROPORPHANS` used to take that table's word for it and
 /// delete them. It asks the owner now, which says the slots are not its,
-/// and nothing is deleted.
+/// and nothing is deleted. The replica takes no slot-imports markers
+/// (`KIVIDB_TEST_NO_SLOT_IMPORTS_CAPABILITY`, as a replica of 1.2): one
+/// that does is told the claim in the replication stream, and is promoted
+/// with the slots.
 #[test]
 fn droporphans_refuses_when_the_owner_in_its_table_does_not_own_the_slot() {
     let src = Node::start(&[]);
@@ -11749,7 +11752,11 @@ fn droporphans_refuses_when_the_owner_in_its_table_does_not_own_the_slot() {
         "300",
     ]);
     assert!(r.is_ok(), "{r:?}");
-    let replica = add_replica(&nodes, &nodes[1]);
+    let replica = add_replica_with_env(
+        &nodes,
+        &nodes[1],
+        &[("KIVIDB_TEST_NO_SLOT_IMPORTS_CAPABILITY", "1")],
+    );
     wait_cluster_ok(&[&nodes[0], &nodes[1], &nodes[2], &replica], 4);
     let moved = keys_in(0..=1000, "moved", 300);
     let own = keys_in(ranges[1].0..=ranges[1].1, "dst", 100);
