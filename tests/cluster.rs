@@ -8299,6 +8299,90 @@ fn a_transaction_that_reaches_its_gates_during_a_slot_handoff_is_refused() {
     );
 }
 
+/// A transaction waiting, off its thread, for a script running beside
+/// others (#882), while an atomic slot migration takes its keys' slot: it
+/// runs whole here before the handoff, or is sent on whole, and the
+/// destination has its two keys equal either way. The script is held 800 ms
+/// on a tag of a slot that stays (`KIVIDB_TEST_SCRIPT_STALL_MS`), and the
+/// destination's `TAKEOVER` waits 1.5 s, so the handoff holds writes
+/// while the transaction is dispatched again.
+#[cfg(feature = "lua")]
+#[test]
+fn a_transaction_waiting_for_a_script_during_a_slot_handoff_runs_whole_or_not_at_all() {
+    let (nodes, ranges) = form_cluster_of(vec![
+        Node::start_with_env(&[], &[("KIVIDB_TEST_SCRIPT_STALL_MS", "800")]),
+        Node::start_with_env(&[], &[("KIVIDB_TEST_TAKEOVER_DELAY_MS", "1500")]),
+    ]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let r = src.conn().cmd(&[
+        "CONFIG",
+        "SET",
+        "cluster-slot-migration-write-pause-timeout",
+        "10000",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let moving = key_in(0..=1000, "exec");
+    let (a, b) = (format!("{{{moving}}}:a"), format!("{{{moving}}}:b"));
+    let staying = key_in(1001..=ranges[0].1, "script");
+    let held = format!("{{{staying}}}:k");
+    let mut c = src.conn();
+    assert!(c.cmd(&["SET", &a, "5"]).is_ok());
+    assert!(c.cmd(&["SET", &b, "5"]).is_ok());
+    let sha = c
+        .cmd(&[
+            "SCRIPT",
+            "LOAD",
+            "redis.call('SET', KEYS[1], ARGV[1]) redis.call('ECHO', ARGV[2]) return 1",
+        ])
+        .text();
+    for _ in 0..3 {
+        assert_eq!(
+            c.cmd(&["EVALSHA", &sha, "1", &held, "warm", "no-stall"])
+                .int(),
+            1
+        );
+    }
+    let script = commands_in_background(
+        src.port,
+        &[&["EVALSHA", &sha, "1", &held, "held", "script-stall:1"]],
+    );
+    let stall = src.dir.join("script-stall.held");
+    wait_until("the script to be held", Duration::from_secs(10), || {
+        stall.exists()
+    });
+    let exec = commands_in_background(
+        src.port,
+        &[&["MULTI"], &["SET", &a, "6"], &["SET", &b, "6"], &["EXEC"]],
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    assert!(
+        stall.exists(),
+        "the script was not held while the import began"
+    );
+    assert_eq!(script.join().unwrap().int(), 1);
+    let reply = exec.join().unwrap();
+    wait_import_completed(dst, &task_id);
+    let mut d = dst.conn();
+    let (got_a, got_b) = (d.cmd(&["GET", &a]).text(), d.cmd(&["GET", &b]).text());
+    match reply.err() {
+        None => {
+            assert_eq!(reply.array().len(), 2, "{reply:?}");
+            assert_eq!((got_a.as_str(), got_b.as_str()), ("6", "6"));
+        }
+        Some(e) => {
+            assert!(
+                e.starts_with("MOVED") || e.starts_with("ASK") || e.starts_with("TRYAGAIN"),
+                "{e}"
+            );
+            assert_eq!((got_a.as_str(), got_b.as_str()), ("5", "5"));
+        }
+    }
+}
+
 /// A transaction that only reads is not refused during a handoff: it
 /// writes nothing the handoff could miss (#339).
 #[test]

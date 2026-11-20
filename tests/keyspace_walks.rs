@@ -140,6 +140,8 @@ impl Server {
             Command::new(env!("CARGO_BIN_EXE_kividb"))
                 .current_dir(&dir)
                 .env("KIVIDB_TEST_SCRIPT_STALL_MS", STALL_MS.to_string())
+                // A slow run under load must not make the next one run alone.
+                .env("KIVIDB_TEST_KEEP_FAST_SCRIPTS", "1")
                 .args([
                     "--port",
                     &port.to_string(),
@@ -247,35 +249,105 @@ fn quick_script(c: &mut Conn, tags: &[&str]) -> String {
 }
 
 /// Starts the script on `tag`, held part-way through, on a connection of its
-/// own; its reply is what the handle gives.
+/// own, beside others ([`held_beside_others`]); its reply is what the
+/// handle gives.
 fn start_held_script(server: &Server, sha: &str, tag: &str) -> std::thread::JoinHandle<V> {
-    let mut c = server.conn();
-    let keys = keys_of(tag);
-    let mut args = vec!["EVALSHA", sha, "4"];
-    args.extend(keys.iter().map(String::as_str));
-    args.push("script-stall:1");
-    c.send(&args);
-    let handle = std::thread::spawn(move || c.read());
-    server.wait_until_held();
-    handle
+    held_beside_others(
+        server,
+        || {
+            let mut c = server.conn();
+            let keys = keys_of(tag);
+            let mut args = vec!["EVALSHA", sha, "4"];
+            args.extend(keys.iter().map(String::as_str));
+            args.push("script-stall:1");
+            c.send(&args);
+            let handle = std::thread::spawn(move || c.read());
+            server.wait_until_held();
+            handle
+        },
+        || {
+            let mut c = server.conn();
+            for _ in 0..3 {
+                run_script(&mut c, sha, tag, false);
+            }
+        },
+    )
 }
+
+/// `INFO stats`' `scripts_run_beside_others`, from whichever of several new
+/// connections answers first (one on the thread running a held script
+/// waits for it).
+fn scripts_beside_others(server: &Server) -> u64 {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for _ in 0..8 {
+        let mut c = server.conn();
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(beside_others_on(&mut c));
+        });
+    }
+    drop(tx);
+    rx.recv().expect("INFO stats has scripts_run_beside_others")
+}
+
+/// `INFO stats`' `scripts_run_beside_others`, asked on `c`.
+fn beside_others_on(c: &mut Conn) -> u64 {
+    let V::Str(text) = c.cmd(&["INFO", "stats"]) else {
+        panic!("INFO stats")
+    };
+    text.lines()
+        .find_map(|line| line.strip_prefix("scripts_run_beside_others:"))
+        .and_then(|n| n.trim().parse().ok())
+        .expect("INFO stats has scripts_run_beside_others")
+}
+
+/// `start()`'s held script, once it runs beside others. A run that took over
+/// five milliseconds makes the script run alone next time, holding every
+/// thread: a debug build on a loaded machine can take that long for a warm
+/// run. Then it is let finish, made quick again (`warm`), and started again;
+/// five times at most.
+fn held_beside_others<T>(
+    server: &Server,
+    mut start: impl FnMut() -> std::thread::JoinHandle<T>,
+    mut warm: impl FnMut(),
+) -> std::thread::JoinHandle<T> {
+    for _ in 0..5 {
+        let before = scripts_beside_others(server);
+        let held = start();
+        if scripts_beside_others(server) > before {
+            return held;
+        }
+        let _ = held.join();
+        warm();
+    }
+    panic!("the held script never ran beside others");
+}
+
+/// How many new connections a look for one on a free thread opens. On the
+/// io_uring loop the worker held by a script accepts nothing meanwhile,
+/// and the others hand it new connections while it holds fewer than they
+/// do (`run_uring`'s balance): most of a burst can land on it.
+const NEW_CONNS: usize = 32;
 
 /// A new connection on a thread that is not busy running a held script:
 /// the first of several to answer a `PING`, within a quarter of the stall.
 /// (On the io_uring loop the kernel places connections; on Tokio a
 /// connection whose thread is busy waits for it too.)
 fn free_conn(server: &Server) -> Conn {
-    let asked = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel();
-    for _ in 0..8 {
-        let mut c = server.conn();
+    // Each opened on a thread of its own, all at once.
+    let port = server.port;
+    for _ in 0..NEW_CONNS {
         let tx = tx.clone();
         std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
             if c.cmd(&["PING"]) == V::Str("PONG".into()) {
                 let _ = tx.send(c);
             }
         });
     }
+    // From here: starting the threads is not what is timed.
+    let asked = Instant::now();
     let c = rx
         .recv_timeout(Duration::from_millis(STALL_MS / 4))
         .expect("no new connection was answered at once");
@@ -396,7 +468,7 @@ fn a_waiting_walk_holds_back_no_other_command(io: &str) {
     let mut walker = free_conn(&server);
     walker.send(&["KEYS", "*"]);
     std::thread::sleep(Duration::from_millis(50));
-    let others: Vec<std::thread::JoinHandle<Duration>> = (0..8)
+    let others: Vec<std::thread::JoinHandle<Duration>> = (0..NEW_CONNS)
         .map(|_| {
             let mut other = server.conn();
             std::thread::spawn(move || {
@@ -548,14 +620,26 @@ fn quick_six(c: &mut Conn) -> String {
 }
 
 fn held_six(server: &Server, sha: &str) -> std::thread::JoinHandle<V> {
-    let mut c = server.conn();
-    let mut args = vec!["EVALSHA", sha, "6"];
-    args.extend(SIX);
-    args.push("script-stall:1");
-    c.send(&args);
-    let handle = std::thread::spawn(move || c.read());
-    server.wait_until_held();
-    handle
+    held_beside_others(
+        server,
+        || {
+            let mut c = server.conn();
+            let mut args = vec!["EVALSHA", sha, "6"];
+            args.extend(SIX);
+            args.push("script-stall:1");
+            c.send(&args);
+            let handle = std::thread::spawn(move || c.read());
+            server.wait_until_held();
+            handle
+        },
+        || {
+            let mut c = server.conn();
+            for _ in 0..3 {
+                assert_eq!(run_six(&mut c, sha, false), V::Int(1));
+                delete_six(&mut c);
+            }
+        },
+    )
 }
 
 fn count(reply: &V) -> usize {
