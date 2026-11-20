@@ -265,6 +265,9 @@ impl HeldBefore {
 #[derive(Default)]
 pub struct Registry {
     tasks: Mutex<Vec<Task>>,
+    /// The handovers away from this node under way, as listed in
+    /// `<cluster-config-file>.handovers` (#743).
+    handovers: Mutex<Vec<PendingHandover>>,
 }
 
 impl Registry {
@@ -665,8 +668,22 @@ fn command(parts: &[&[u8]]) -> Vec<u8> {
 
 impl Peer {
     fn connect(env: &Env, node: &NodeId) -> Result<Self, String> {
-        let (host, port) = env
-            .address_of(node)
+        Self::connect_to(&env.cluster, &env.repl_state, node)
+    }
+
+    /// [`Self::connect`], from the parts of the server it needs: also for a
+    /// source settling a handover after a restart, which has no `Env`.
+    fn connect_to(
+        cluster: &ClusterState,
+        repl_state: &ReplState,
+        node: &NodeId,
+    ) -> Result<Self, String> {
+        let (host, port) = cluster
+            .nodes
+            .read()
+            .get(node)
+            .filter(|n| !n.ip.is_empty() && n.client_port != 0)
+            .map(|n| (n.ip.clone(), n.client_port))
             .ok_or_else(|| "the other node's address is not known".to_string())?;
         let addr = (host.as_str(), port)
             .to_socket_addrs()
@@ -682,7 +699,7 @@ impl Peer {
             sock,
         };
 
-        let (user, password) = env.repl_state.master_credentials();
+        let (user, password) = repl_state.master_credentials();
         if !password.is_empty() {
             let auth = if user.is_empty() {
                 // As the default user, by name: `AUTH <password>` is refused by a
@@ -2023,6 +2040,17 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
     // its whole worker (#339).
     crate::aof::failpoint("handoff-pausing");
     no_failover_since()?;
+    // On disk before writes are paused (it adds nothing to the pause), and
+    // until this node knows how the handover ended: a restart in between
+    // holds writes until it does (#743).
+    let _record = HandoverRecord::write(
+        &env.cluster,
+        PendingHandover {
+            task_id: task.id.clone(),
+            dest: task.dest,
+            ranges: task.ranges.clone(),
+        },
+    )?;
 
     // ── Handoff ──────────────────────────────────────────────────────────
     // Pause client writes, let the ones in flight finish, send what they
@@ -2206,14 +2234,33 @@ enum Asked {
 /// slots over, telling it the attempt is given up if it has not
 /// (`CLUSTER SYNCSLOTS FAIL`, see [`Registry::fence`]).
 fn ask_destination(env: &Env, task: &Task, why: &str) -> Asked {
+    ask_destination_of(
+        &env.cluster,
+        &env.repl_state,
+        &task.id,
+        &task.dest,
+        &task.ranges,
+        why,
+    )
+}
+
+/// [`ask_destination`], from the parts of the server it needs.
+fn ask_destination_of(
+    cluster: &ClusterState,
+    repl_state: &ReplState,
+    task_id: &str,
+    dest: &NodeId,
+    ranges: &[(u16, u16)],
+    why: &str,
+) -> Asked {
     let mut parts: Vec<Vec<u8>> = vec![
         b"CLUSTER".to_vec(),
         b"SYNCSLOTS".to_vec(),
         b"FAIL".to_vec(),
-        task.id.as_bytes().to_vec(),
+        task_id.as_bytes().to_vec(),
         why.as_bytes().to_vec(),
     ];
-    for (start, end) in &task.ranges {
+    for (start, end) in ranges {
         parts.push(start.to_string().into_bytes());
         parts.push(end.to_string().into_bytes());
     }
@@ -2221,13 +2268,9 @@ fn ask_destination(env: &Env, task: &Task, why: &str) -> Asked {
     // Who asks: the destination heeds it only from the source of its
     // current attempt (#516).
     parts.push(b"FROM".to_vec());
-    parts.push(
-        super::node_id_str(&env.cluster.myself())
-            .as_bytes()
-            .to_vec(),
-    );
+    parts.push(super::node_id_str(&cluster.myself()).as_bytes().to_vec());
     let ask = |parts: &[Vec<u8>]| {
-        let mut peer = Peer::connect(env, &task.dest)?;
+        let mut peer = Peer::connect_to(cluster, repl_state, dest)?;
         let _ = peer.sock.set_read_timeout(Some(Duration::from_secs(5)));
         peer.call(&crate::resp::write::encode_resp_command(parts))
     };
@@ -2308,11 +2351,26 @@ fn await_takeover(env: &Env, task: &Task, error: &str) -> Result<(), String> {
             .read()
             .get(&task.dest)
             .is_none_or(|n| n.flags.contains(super::NodeFlags::FAIL));
-        if failed {
-            let _ = env.cluster.bump_epoch();
-            if let Err(e) = env.cluster.take_over_slots(slots_of(&task.ranges)) {
-                log_warn!("Cluster: Could not save the cluster config: {e}");
+        // A replica of the destination may be elected in its place, and
+        // take the slots over with the rest, if it heard the destination
+        // claim them: wait for that first (#743). A claim of them by it
+        // ends the wait above ("taken over by another node").
+        if failed && env.cluster.destination_may_fail_over(task.dest) {
+            if logged.elapsed() >= LOG_HELD_EVERY {
+                logged = Instant::now();
+                log_warn!(
+                    "Cluster: The handoff of slots {} waits for the failover of {}, which \
+                     failed before it said whether it took them over: a replica of it may \
+                     take them over",
+                    ranges_text(&task.ranges),
+                    super::node_id_str(&task.dest)
+                );
             }
+            std::thread::sleep(ASK_AGAIN);
+            continue;
+        }
+        if failed {
+            claim_back(&env.cluster, &task.ranges);
             return Err(format!(
                 "the destination has failed; it did not answer whether it took the slots over \
                  ({unsure}), and they are claimed here again at epoch {}",
@@ -2337,6 +2395,254 @@ fn await_takeover(env: &Env, task: &Task, error: &str) -> Result<(), String> {
                 held_from.elapsed().as_millis(),
                 if let_go_logged { "let go" } else { "held" },
                 super::node_id_str(&task.dest)
+            );
+        }
+        std::thread::sleep(ASK_AGAIN);
+    }
+}
+
+/// Claim `ranges` again, at an epoch above any a failed destination can
+/// have taken them at: see [`await_takeover`].
+fn claim_back(cluster: &ClusterState, ranges: &[(u16, u16)]) {
+    let _ = cluster.bump_epoch();
+    if let Err(e) = cluster.take_over_slots(slots_of(ranges)) {
+        log_warn!("Cluster: Could not save the cluster config: {e}");
+    }
+}
+
+// ── A handover under way, across a restart of the source (#743) ─────────────
+//
+// From just before the source's handoff pauses writes until it knows how the
+// handover ended, `<cluster-config-file>.handovers` lists it: task id,
+// destination and slots. A source killed in that time comes back owning the
+// slots in its nodes.conf (the handover is saved there only once it knows),
+// and used to take writes to them at once; if the destination had taken
+// them, its claim, newer, took them from the source a heartbeat later, and
+// those writes were lost with them. A source that finds the file at startup
+// holds writes, as the handoff did, until it knows: the slots are no longer
+// its own (the destination's claim, or another's, took them), the
+// destination says it took them (they are handed over here, their keys
+// deleted) or promises it did not (they stay), or it failed and no replica
+// of it took them (they are claimed again, as `await_takeover` does). An
+// earlier version does not read the file, and serves as before.
+
+/// One handover the source may be in the middle of.
+#[derive(Clone, Debug, PartialEq)]
+struct PendingHandover {
+    task_id: String,
+    dest: NodeId,
+    ranges: Ranges,
+}
+
+/// `<cluster-config-file>.handovers`.
+fn handovers_path(cluster: &ClusterState) -> Option<std::path::PathBuf> {
+    cluster.config_path.as_ref().map(|p| {
+        let mut name = p.as_os_str().to_owned();
+        name.push(".handovers");
+        std::path::PathBuf::from(name)
+    })
+}
+
+/// Write the handovers under way down, on disk before it returns, or remove
+/// the file when there are none. One writer at a time.
+fn save_handovers(cluster: &ClusterState) -> std::io::Result<()> {
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _one = WRITING.lock();
+    let Some(path) = handovers_path(cluster) else {
+        return Ok(());
+    };
+    let lines: Vec<String> = cluster
+        .slot_migrations
+        .handovers
+        .lock()
+        .iter()
+        .map(|h| {
+            format!(
+                "{} {} {}",
+                h.task_id,
+                super::node_id_str(&h.dest),
+                ranges_text(&h.ranges)
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    write_synced(&tmp, (lines.join("\n") + "\n").as_bytes())?;
+    std::fs::rename(&tmp, &path)?;
+    if let Some(dir) = path.parent()
+        && let Ok(dir) = std::fs::File::open(dir)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// One line of the file. `None` if it is not one.
+fn parse_handover_line(line: &str) -> Option<PendingHandover> {
+    let mut words = line.split_whitespace();
+    let task_id = words.next()?.to_string();
+    let dest = crate::cluster::node::parse_node_id(words.next()?.as_bytes())?;
+    let parts: Vec<&[u8]> = words
+        .flat_map(|r| r.split('-'))
+        .map(str::as_bytes)
+        .collect();
+    let ranges = parse_ranges(&parts).ok()?;
+    (!ranges.is_empty()).then_some(PendingHandover {
+        task_id,
+        dest,
+        ranges,
+    })
+}
+
+/// A handover listed in the file while it lasts: taken out, and the file
+/// written again, when it is dropped, however the handover ended.
+struct HandoverRecord<'a> {
+    cluster: &'a ClusterState,
+    task_id: String,
+}
+
+impl<'a> HandoverRecord<'a> {
+    /// List it, on disk. Not written, the handover does not begin: a
+    /// restart in it would serve the slots as before.
+    fn write(cluster: &'a ClusterState, handover: PendingHandover) -> Result<Self, String> {
+        let task_id = handover.task_id.clone();
+        cluster.slot_migrations.handovers.lock().push(handover);
+        let record = HandoverRecord { cluster, task_id };
+        save_handovers(cluster)
+            .map_err(|e| format!("could not record the handover under way: {e}"))?;
+        Ok(record)
+    }
+}
+
+impl Drop for HandoverRecord<'_> {
+    fn drop(&mut self) {
+        self.cluster
+            .slot_migrations
+            .handovers
+            .lock()
+            .retain(|h| h.task_id != self.task_id);
+        if let Err(e) = save_handovers(self.cluster) {
+            log_warn!("Cluster: Could not record the end of a handover: {e}");
+        }
+    }
+}
+
+/// At startup, before any client is served: the handovers away from this
+/// node that were under way when it stopped, and that it still owns slots
+/// of. Writes are held, and each is settled on a thread of its own (see
+/// above). The others are forgotten.
+pub(crate) fn settle_unfinished_handovers(
+    cluster: &Arc<ClusterState>,
+    repl_state: &Arc<ReplState>,
+) {
+    let Some(path) = handovers_path(cluster) else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let me = cluster.myself();
+    let unsettled: Vec<PendingHandover> = text
+        .lines()
+        .filter_map(parse_handover_line)
+        .filter(|h| {
+            h.dest != me
+                && cluster.nodes.read().contains_key(&h.dest)
+                && slots_of(&h.ranges).any(|s| cluster.slot_owner(s) == Some(me))
+        })
+        .collect();
+    *cluster.slot_migrations.handovers.lock() = unsettled.clone();
+    if let Err(e) = save_handovers(cluster) {
+        log_warn!("Cluster: Could not rewrite {}: {e}", path.display());
+    }
+    for handover in unsettled {
+        log_warn!(
+            "Cluster: This node stopped during the handover of slots {} to {}: writes are held \
+             until it knows whether that node took them over",
+            ranges_text(&handover.ranges),
+            super::node_id_str(&handover.dest)
+        );
+        cluster.hold_writes_for_handoff();
+        let cluster = Arc::clone(cluster);
+        let repl_state = Arc::clone(repl_state);
+        let spawned = std::thread::Builder::new()
+            .name("kividb-handover-settle".into())
+            .spawn_released(move || {
+                let task_id = handover.task_id.clone();
+                let _record = HandoverRecord {
+                    cluster: &cluster,
+                    task_id,
+                };
+                let outcome = settle_handover(&cluster, &repl_state, &handover);
+                log_warn!(
+                    "Cluster: The handover of slots {} to {}, under way when this node stopped, \
+                     is settled: {outcome}. Writes are let go",
+                    ranges_text(&handover.ranges),
+                    super::node_id_str(&handover.dest)
+                );
+                cluster.end_handoff_hold();
+            });
+        if let Err(e) = spawned {
+            log_warn!("Cluster: Could not start settling a handover: {e}");
+        }
+    }
+}
+
+/// Settle one handover a restarted source may have been in the middle of;
+/// returns how it ended. Waits as [`await_takeover`] does.
+fn settle_handover(cluster: &ClusterState, repl_state: &ReplState, h: &PendingHandover) -> String {
+    let me = cluster.myself();
+    let first = h.ranges[0].0;
+    let why = "the source restarted during the handover";
+    let mut logged = Instant::now();
+    loop {
+        if let Some(owner) = cluster.slot_owner(first)
+            && owner != me
+        {
+            return format!("the slots are {}'s now", super::node_id_str(&owner));
+        }
+        let unsure =
+            match ask_destination_of(cluster, repl_state, &h.task_id, &h.dest, &h.ranges, why) {
+                Asked::Taken => {
+                    let handed = cluster.hand_over_slots(slots_of(&h.ranges), h.dest);
+                    let _ = cluster.save_to_disk();
+                    drop_lost_slots(cluster, handed);
+                    return "the destination took them over; their keys here are deleted".into();
+                }
+                Asked::NotTaken => {
+                    return "the destination did not take them over; they stay".into();
+                }
+                Asked::Unsure(why) => why,
+            };
+        if cluster.slot_owner(first) != Some(me) {
+            continue;
+        }
+        let failed = cluster
+            .nodes
+            .read()
+            .get(&h.dest)
+            .is_none_or(|n| n.flags.contains(super::NodeFlags::FAIL));
+        if failed && !cluster.destination_may_fail_over(h.dest) {
+            claim_back(cluster, &h.ranges);
+            return format!(
+                "the destination has failed, and they are claimed here again at epoch {}",
+                cluster.current_epoch()
+            );
+        }
+        if logged.elapsed() >= LOG_HELD_EVERY {
+            logged = Instant::now();
+            log_warn!(
+                "Cluster: Writes are held: it is not known yet whether {} took slots {} over \
+                 ({unsure})",
+                super::node_id_str(&h.dest),
+                ranges_text(&h.ranges)
             );
         }
         std::thread::sleep(ASK_AGAIN);
@@ -3172,6 +3478,35 @@ mod tests {
     fn ranges(args: &[&str]) -> Result<Ranges, String> {
         let args: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
         parse_ranges(&args)
+    }
+
+    /// The handovers under way are written down and read back as they
+    /// were; a line that does not read is no handover; the file goes when
+    /// the last one ends (#743).
+    #[test]
+    fn handovers_under_way_are_written_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cs = ClusterState::new_enabled(None, 15000);
+        cs.config_path = Some(dir.path().join("nodes.conf"));
+        let dest = crate::cluster::node::generate_node_id();
+        let h = PendingHandover {
+            task_id: "a".repeat(40),
+            dest,
+            ranges: vec![(0, 100), (200, 200)],
+        };
+        let path = handovers_path(&cs).unwrap();
+        {
+            let _record = HandoverRecord::write(&cs, h.clone()).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let read: Vec<PendingHandover> = text.lines().filter_map(parse_handover_line).collect();
+            assert_eq!(read, vec![h.clone()]);
+        }
+        assert!(!path.exists());
+        assert_eq!(parse_handover_line("x"), None);
+        assert_eq!(parse_handover_line("t notanid 0-5"), None);
+        let id = crate::cluster::node::node_id_str(&dest);
+        assert_eq!(parse_handover_line(&format!("t {id} 9-5")), None);
+        assert_eq!(parse_handover_line(&format!("t {id}")), None);
     }
 
     #[test]

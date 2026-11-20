@@ -518,6 +518,39 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Cluster votes tell a refused replica the newer owner, and check manual
+  failovers too (#742).** A master that refuses a replica its vote because
+  it knows a newer owner of slots the replica claims answers with that
+  owner, its config epoch and its slots (an `UPDATE`, as in Redis). The
+  replica takes them in as if the owner had told it, and asks again for the
+  slots its master still has: it is elected in its first election even when
+  it cannot reach the new owner, and if its master has none left it follows
+  the new owner. `CLUSTER FAILOVER` and `CLUSTER FAILOVER FORCE` now send
+  the replica's claims too, to masters that say they read them (a
+  `vote-claims` token in their heartbeats), and are refused and corrected
+  the same way; a master of 1.2 is asked as before. A vote request whose
+  claims are not valid claims is refused.
+- **Cluster: a config epoch collision between a master and the replica that
+  took it over (#743).** A `CLUSTER FAILOVER TAKEOVER` picks its epoch on
+  its own, and can pick the one its master had just taken unannounced (the
+  end of a slot import, `CLUSTER BUMPEPOCH`). When the master comes back,
+  the replica's claim of its slots at that epoch is the one kept: the
+  master, and every node that knew the replica as its replica, take it at
+  the tie, and on the collision the replica is the one that moves to a new
+  epoch, whatever the node ids. Claims in a heartbeat are now taken in
+  before a collision is resolved, as in Redis.
+- **Cluster: a slot handover whose destination failed, or whose source
+  restarted (#743).** A source whose destination was marked FAIL before it
+  answered the takeover waits, while a replica of the destination is up and
+  for as long as an election can take, for that failover: a replica elected
+  with the slots keeps them (with the writes the destination took), and the
+  source gives them up; otherwise the source claims them again as before. A
+  handover under way is listed in `<cluster-config-file>.handovers`; a
+  source that starts again with one listed holds writes until it knows where
+  the slots went (the destination says it took them or not, a claim of them
+  arrives, or the destination failed), instead of serving them at once.
+  CLUSTER docs in COMMANDS.md say what each kind of failover guarantees.
+
 - **A command reads the clock once (#632).** The first time a command
   needs the time, it reads the clock, and every later expiry check in the
   same command uses that reading, as Redis's `commandTimeSnapshot` does:

@@ -8233,6 +8233,599 @@ fn a_replica_that_sends_no_claims_is_elected_as_before() {
     assert!(kept.missing_on(&replica).is_empty());
 }
 
+/// A replica refused votes because the masters know a newer owner of slots
+/// it claims, and that cannot hear that owner itself, is told it by the
+/// masters that refuse it (`UPDATE`), and is elected to what its master
+/// still had (#742). The setup of the test above, but the replica never
+/// takes in the destination's own claims (`KIVIDB_TEST_IGNORE_CLAIMS` stays):
+/// it used to be refused for good, and its master's other slots stayed
+/// down with it.
+#[test]
+fn a_refused_replica_learns_the_newer_owner_from_the_voters_and_is_elected() {
+    let (mut nodes, ranges) = form_cluster(5);
+    let replica = add_replica_with_env(
+        &nodes,
+        &nodes[0],
+        &[("KIVIDB_TEST_IGNORE_CLAIMS", "ignore-claims")],
+    );
+    {
+        let both: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&both, 6);
+    }
+    let replica_id = replica.id();
+    let dst_id = nodes[1].id();
+    std::fs::write(replica.dir.join("ignore-claims"), &dst_id).unwrap();
+    assert!(
+        replica
+            .conn()
+            .cmd(&["CONFIG", "SET", "cluster-replica-validity-factor", "0"])
+            .is_ok()
+    );
+    let kept = Written::on(&nodes[0], 101..=ranges[0].1, "kept", 300);
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+    let task_id = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "100"])
+        .text();
+    wait_import_completed(&nodes[1], &task_id);
+    wait_until(
+        "every master to hear of the new owner",
+        Duration::from_secs(20),
+        || {
+            nodes[1..]
+                .iter()
+                .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str()))
+        },
+    );
+    let src_id = nodes[0].id();
+    assert_eq!(owner_in_view_of(&replica, 50), Some(src_id.clone()));
+    let moved = Written::on(&nodes[1], 0..=100, "moved", 300);
+
+    let killed = Instant::now();
+    nodes[0].kill();
+    wait_until(
+        "the replica to be elected without hearing the new owner",
+        Duration::from_secs(40),
+        || replica.is_master(),
+    );
+    eprintln!("elected {:?} after the kill", killed.elapsed());
+    assert!(
+        replica
+            .log()
+            .contains("answered this node's vote request with the newer owner"),
+        "{}",
+        replica.log()
+    );
+    wait_until(
+        "the cluster to be up again",
+        Duration::from_secs(30),
+        || {
+            nodes[1..]
+                .iter()
+                .chain(std::iter::once(&replica))
+                .all(|n| n.cluster_info("cluster_state") == "ok")
+        },
+    );
+    for n in nodes[1..].iter().chain(std::iter::once(&replica)) {
+        assert_eq!(owner_in_view_of(n, 50).as_deref(), Some(dst_id.as_str()));
+        assert_eq!(
+            owner_in_view_of(n, 101).as_deref(),
+            Some(replica_id.as_str())
+        );
+    }
+    assert!(
+        moved.missing_on(&nodes[1]).is_empty(),
+        "acknowledged writes lost"
+    );
+    assert!(
+        kept.missing_on(&replica).is_empty(),
+        "keys lost on the new master"
+    );
+}
+
+/// A manual failover (`CLUSTER FAILOVER`, `FORCE`) of a replica that has not
+/// heard its master handed slots over takes only the slots its master still
+/// has (#742). Its request carries its claims to the masters that read them,
+/// they refuse it with the newer owner, and it asks again with them put
+/// right. It used to win with no check, and claim the moved slots at the
+/// election's epoch, newer than their owner's: that owner's acknowledged
+/// writes to them were lost.
+fn a_manual_failover_unaware_of_a_handover_takes_only_its_masters_slots(mode: Option<&str>) {
+    let (nodes, ranges) = form_cluster(3);
+    let replica = add_replica_with_env(
+        &nodes,
+        &nodes[0],
+        &[("KIVIDB_TEST_IGNORE_CLAIMS", "ignore-claims")],
+    );
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, 4);
+    }
+    let replica_id = replica.id();
+    let dst_id = nodes[1].id();
+    std::fs::write(replica.dir.join("ignore-claims"), &dst_id).unwrap();
+    let kept = Written::on(&nodes[0], 101..=ranges[0].1, "kept", 200);
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+    let task_id = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "100"])
+        .text();
+    wait_import_completed(&nodes[1], &task_id);
+    wait_until(
+        "every master to hear of the new owner",
+        Duration::from_secs(20),
+        || {
+            nodes
+                .iter()
+                .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str()))
+        },
+    );
+    assert_eq!(owner_in_view_of(&replica, 50), Some(nodes[0].id()));
+    let moved = Written::on(&nodes[1], 0..=100, "moved", 200);
+    // Past the master's grace after a handover, in which it refuses one.
+    std::thread::sleep(Duration::from_secs(4));
+
+    let mut args = vec!["CLUSTER", "FAILOVER"];
+    args.extend(mode);
+    let reply = replica.conn().cmd(&args);
+    assert!(reply.is_ok(), "{reply:?}");
+    wait_until("the replica to take over", Duration::from_secs(30), || {
+        replica.is_master()
+    });
+    let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+    wait_until(
+        "every node to agree on the owners",
+        Duration::from_secs(30),
+        || {
+            all.iter().all(|n| {
+                owner_in_view_of(n, 101).as_deref() == Some(replica_id.as_str())
+                    && n.cluster_info("cluster_state") == "ok"
+            })
+        },
+    );
+    for n in &all {
+        assert_eq!(
+            owner_in_view_of(n, 50).as_deref(),
+            Some(dst_id.as_str()),
+            "node {} gives the moved slot to another",
+            n.port
+        );
+    }
+    assert!(
+        moved.missing_on(&nodes[1]).is_empty(),
+        "acknowledged writes lost"
+    );
+    assert!(
+        kept.missing_on(&replica).is_empty(),
+        "keys lost on the new master"
+    );
+}
+
+#[test]
+fn a_manual_failover_unaware_of_a_handover_takes_only_its_masters_slots_default() {
+    a_manual_failover_unaware_of_a_handover_takes_only_its_masters_slots(None);
+}
+
+#[test]
+fn a_manual_failover_unaware_of_a_handover_takes_only_its_masters_slots_force() {
+    a_manual_failover_unaware_of_a_handover_takes_only_its_masters_slots(Some("FORCE"));
+}
+
+/// Attach `replica`, a node started and in no cluster yet, as a replica of
+/// `master`, as [`add_replica`] does.
+fn attach_replica(cluster: &[Node], master: &Node, replica: Node) -> Node {
+    let r = cluster[0]
+        .conn()
+        .cmd(&["CLUSTER", "MEET", "127.0.0.1", &replica.port.to_string()]);
+    assert!(r.is_ok(), "MEET: {r:?}");
+    let master_id = master.id();
+    wait_until(
+        "replica to learn of its master",
+        Duration::from_secs(15),
+        || {
+            replica
+                .conn()
+                .cmd(&["CLUSTER", "NODES"])
+                .text()
+                .lines()
+                .any(|l| l.starts_with(&master_id))
+        },
+    );
+    let r = replica.conn().cmd(&["CLUSTER", "REPLICATE", &master_id]);
+    assert!(r.is_ok(), "REPLICATE: {r:?}");
+    wait_until("replica to sync", Duration::from_secs(20), || {
+        replica.repl_info("master_link_status").as_deref() == Some("up")
+    });
+    replica
+}
+
+/// A replica's `CLUSTER FAILOVER TAKEOVER` picks its epoch alone. Its
+/// master, cut off, had taken that same epoch unannounced (`BUMPEPOCH`
+/// here; the end of an import does the same) and died. When the master
+/// comes back, the two collide, and the one with the lower id used to move
+/// above the other: if that was the master, its next claim took the slots
+/// back from the replica, and the replica, a replica again, lost the
+/// writes it had taken (#743). Now the replica keeps them on every node,
+/// whichever id is lower: the master gives the slots up at the tie, and
+/// it is the replica that moves.
+fn a_takeover_at_an_epoch_its_master_took_unannounced_keeps_its_slots(master_id_lower: bool) {
+    let (mut nodes, ranges) = form_cluster_with_env(3, &[BUS_CONTROL]);
+    let master_id = nodes[0].id();
+    let replica = loop {
+        let n = Node::start(&[]);
+        if (n.id() > master_id) == master_id_lower {
+            break n;
+        }
+    };
+    let replica = attach_replica(&nodes, &nodes[0], replica);
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, 4);
+    }
+    let replica_id = replica.id();
+    // Another master holds the highest epoch, known to all, so that the
+    // master's bump below is to one above it that nobody hears of.
+    wait_until(
+        "another master to hold the highest epoch, known to all",
+        Duration::from_secs(30),
+        || {
+            let r = nodes[1].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+            assert!(r.starts_with("BUMPED") || r.starts_with("STILL"), "{r}");
+            let highest = nodes[1].cluster_info("cluster_my_epoch");
+            std::thread::sleep(Duration::from_millis(1500));
+            nodes
+                .iter()
+                .chain(std::iter::once(&replica))
+                .all(|n| n.cluster_info("cluster_current_epoch") == highest)
+                && nodes[0].cluster_info("cluster_my_epoch") != highest
+        },
+    );
+    set_bus(&nodes[0], "mute");
+    std::thread::sleep(Duration::from_millis(300));
+    let bumped = nodes[0].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+    let epoch = bumped
+        .strip_prefix("BUMPED ")
+        .unwrap_or_else(|| panic!("{bumped}"))
+        .to_string();
+    nodes[0].kill();
+    let r = replica.conn().cmd(&["CLUSTER", "FAILOVER", "TAKEOVER"]);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(
+        replica.cluster_info("cluster_my_epoch"),
+        epoch,
+        "the takeover is at the epoch the master took unannounced"
+    );
+    let live: Vec<&Node> = nodes[1..].iter().chain(std::iter::once(&replica)).collect();
+    wait_until(
+        "the others to follow the takeover",
+        Duration::from_secs(20),
+        || {
+            live.iter().all(|n| {
+                owner_in_view_of(n, ranges[0].0).as_deref() == Some(replica_id.as_str())
+                    && n.cluster_info("cluster_state") == "ok"
+            })
+        },
+    );
+    let written = Written::on(&replica, ranges[0].0..=ranges[0].1, "taken", 200);
+
+    set_bus(&nodes[0], "run");
+    nodes[0].spawn();
+    let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+    let settled = || {
+        all.iter().all(|n| {
+            owner_in_view_of(n, ranges[0].0).as_deref() == Some(replica_id.as_str())
+                && n.cluster_info("cluster_state") == "ok"
+        }) && !nodes[0].is_master()
+            && nodes[0].my_row()[3] == replica_id
+    };
+    let restarted = Instant::now();
+    wait_until(
+        "the old master to follow the replica",
+        Duration::from_secs(30),
+        settled,
+    );
+    eprintln!("settled {:?} after the restart", restarted.elapsed());
+    // And it stays so.
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        settled(),
+        "{}",
+        all.iter()
+            .map(|n| n.conn().cmd(&["CLUSTER", "NODES"]).text())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    // Every node holds every master at one epoch.
+    let epochs = |n: &Node| -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = n
+            .conn()
+            .cmd(&["CLUSTER", "NODES"])
+            .text()
+            .lines()
+            .map(|l| l.split(' ').map(String::from).collect::<Vec<_>>())
+            .filter(|f| f[2].contains("master"))
+            .map(|f| (f[0].clone(), f[6].clone()))
+            .collect();
+        rows.sort();
+        rows
+    };
+    let first = epochs(all[0]);
+    for n in &all[1..] {
+        assert_eq!(epochs(n), first);
+    }
+    let lost = written.missing_on(&replica);
+    assert!(lost.is_empty(), "{} acknowledged writes lost", lost.len());
+}
+
+#[test]
+fn a_takeover_at_an_epoch_its_master_took_unannounced_keeps_its_slots_master_id_lower() {
+    a_takeover_at_an_epoch_its_master_took_unannounced_keeps_its_slots(true);
+}
+
+#[test]
+fn a_takeover_at_an_epoch_its_master_took_unannounced_keeps_its_slots_master_id_higher() {
+    a_takeover_at_an_epoch_its_master_took_unannounced_keeps_its_slots(false);
+}
+
+/// A destination that took slots over and failed before it answered the
+/// source: its replica, which heard it claim them, is elected and takes
+/// them over with the rest, with the writes the destination took to them,
+/// and the source waits for that instead of claiming them back the moment
+/// the destination is marked FAIL (#743). The source hears none of the
+/// destination's claims (`KIVIDB_TEST_IGNORE_CLAIMS`); the destination
+/// holds its answer back (`KIVIDB_TEST_TAKEOVER_REPLY_DELAY_MS`), takes
+/// writes to the slots, and is killed. The source used to claim them back
+/// at once, and its claim reached the replica before its election: the
+/// writes were lost.
+#[test]
+fn a_source_waits_for_the_failover_of_a_destination_that_failed_mid_handover() {
+    let src = Node::start_with_env(&[], &[("KIVIDB_TEST_IGNORE_CLAIMS", "ignore-claims")]);
+    let dst = Node::start_with_env(&[], &[("KIVIDB_TEST_TAKEOVER_REPLY_DELAY_MS", "60000")]);
+    let third = Node::start(&[]);
+    let (mut nodes, _) = form_cluster_of(vec![src, dst, third]);
+    let dst_replica = add_replica(&nodes, &nodes[1]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&dst_replica)).collect();
+        wait_cluster_ok(&all, 4);
+    }
+    let dst_id = nodes[1].id();
+    std::fs::write(nodes[0].dir.join("ignore-claims"), &dst_id).unwrap();
+    assert!(
+        nodes[0]
+            .conn()
+            .cmd(&[
+                "CONFIG",
+                "SET",
+                "cluster-slot-migration-write-pause-timeout",
+                "60000"
+            ])
+            .is_ok()
+    );
+    assert!(
+        dst_replica
+            .conn()
+            .cmd(&["CONFIG", "SET", "cluster-replica-validity-factor", "0"])
+            .is_ok()
+    );
+    let before = Written::on(&nodes[0], 0..=100, "before", 100);
+    let task_id = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "100"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_until(
+        "the destination to take the slots over and its replica to hear it",
+        Duration::from_secs(30),
+        || owner_in_view_of(&dst_replica, 50).as_deref() == Some(dst_id.as_str()),
+    );
+    assert_eq!(owner_in_view_of(&nodes[0], 50), Some(nodes[0].id()));
+    let after = Written::on(&nodes[1], 0..=100, "after", 100);
+    assert_eq!(nodes[1].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+    nodes[1].kill();
+
+    let replica_id = dst_replica.id();
+    wait_until(
+        "the destination's replica to be elected",
+        Duration::from_secs(40),
+        || dst_replica.is_master(),
+    );
+    let live = [&nodes[0], &nodes[2], &dst_replica];
+    // Settled on one owner of the slots, whichever.
+    let mut owner = None;
+    wait_until(
+        "every node to agree on the slots' owner",
+        Duration::from_secs(40),
+        || {
+            let first = owner_in_view_of(live[0], 50);
+            owner = first.clone();
+            first.is_some()
+                && live.iter().all(|n| {
+                    owner_in_view_of(n, 50) == first && n.cluster_info("cluster_state") == "ok"
+                })
+        },
+    );
+    let owner = owner.unwrap();
+    let owner_node = live.iter().find(|n| n.id() == owner).unwrap();
+    // Every write acknowledged to the slots is on their owner.
+    let lost = after.missing_on(owner_node);
+    assert!(
+        lost.is_empty(),
+        "{} acknowledged writes lost: the slots went to {}, the destination's replica is {}",
+        lost.len(),
+        if owner == nodes[0].id() {
+            "the source"
+        } else {
+            owner.as_str()
+        },
+        replica_id
+    );
+    assert_eq!(
+        owner, replica_id,
+        "the replica elected with the slots keeps them"
+    );
+    let lost = before.missing_on(&dst_replica);
+    assert!(lost.is_empty(), "{} imported keys lost", lost.len());
+    // The source is writable again, and redirects the slots.
+    let mut c = nodes[0].conn();
+    let reply = cmd_when_serving(&mut c, &["SET", &key_in(0..=100, "late"), "v"]);
+    assert!(
+        reply.err().is_some_and(|e| e.starts_with("MOVED")),
+        "{reply:?}"
+    );
+}
+
+/// A source killed while it waited to know whether the destination took
+/// the slots over holds writes after its restart until it knows (#743).
+/// The destination took them, and neither its answer nor its claim went
+/// out for 8 s (`KIVIDB_TEST_TAKEOVER_LOST_MS`). The restarted source used
+/// to own them in its nodes.conf and take writes to them at once; the
+/// destination's claim, newer, took the slots from it 8 s later, and those
+/// writes were lost. Now the source asks the destination first, and a
+/// write sent meanwhile is redirected to it.
+#[test]
+fn a_source_restarted_during_a_handover_holds_writes_until_it_knows_where_the_slots_went() {
+    let src = Node::start(&["--appendonly", "yes"]);
+    let dst = Node::start_with_env(&[], &[("KIVIDB_TEST_TAKEOVER_LOST_MS", "8000")]);
+    let (mut nodes, _) = form_cluster_of(vec![src, dst]);
+    assert!(
+        nodes[0]
+            .conn()
+            .cmd(&[
+                "CONFIG",
+                "SET",
+                "cluster-slot-migration-write-pause-timeout",
+                "60000"
+            ])
+            .is_ok()
+    );
+    let before = Written::on(&nodes[0], 0..=100, "before", 100);
+    let task_id = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "100"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_until(
+        "the destination to take the slots over",
+        Duration::from_secs(30),
+        || {
+            nodes[1]
+                .log()
+                .contains("TAKEOVER's reply and claim are held back")
+        },
+    );
+    let lost_at = Instant::now();
+    nodes[0].kill();
+    let recorded = std::fs::read_to_string(nodes[0].dir.join("nodes.conf.handovers"))
+        .is_ok_and(|t| t.contains(&task_id));
+    eprintln!("the handover under way is recorded: {recorded}");
+    nodes[0].spawn();
+    let key = key_in(0..=100, "written-after-restart");
+    let port = nodes[0].port;
+    let set = {
+        let key = key.clone();
+        std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
+            cmd_when_serving(&mut c, &["SET", &key, "v"])
+        })
+    };
+    let reply = set.join().unwrap();
+    eprintln!(
+        "answered {reply:?}, {:?} after the takeover",
+        lost_at.elapsed()
+    );
+    // Whatever it was answered, once the slots have settled an acknowledged
+    // write is on their owner.
+    let dst_id = nodes[1].id();
+    wait_until(
+        "both to agree the destination owns the slots",
+        Duration::from_secs(30),
+        || {
+            nodes
+                .iter()
+                .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str()))
+        },
+    );
+    if reply.is_ok() {
+        let got = nodes[1].conn().cmd(&["GET", &key]);
+        assert!(
+            matches!(&got, Resp::Bulk(v) if v == b"v"),
+            "a write acknowledged by the restarted source is lost: its owner answers {got:?}"
+        );
+    } else {
+        assert!(
+            reply.err().is_some_and(|e| e.starts_with("MOVED")),
+            "{reply:?}"
+        );
+    }
+    assert!(before.missing_on(&nodes[1]).is_empty());
+    wait_until(
+        "the record of the settled handover to go",
+        Duration::from_secs(10),
+        || !nodes[0].dir.join("nodes.conf.handovers").exists(),
+    );
+}
+
+/// Manual and automatic failovers in a cluster with a master of 1.2
+/// (`KIVIDB_1_2_BIN`): that master is asked as before (a manual one with
+/// five fields, `force`), the others with the claims; the replica is
+/// elected every time (#742).
+#[test]
+#[ignore = "needs a 1.2 binary in KIVIDB_1_2_BIN"]
+fn failovers_beside_a_1_2_master_are_won() {
+    let bin = std::env::var("KIVIDB_1_2_BIN").expect("KIVIDB_1_2_BIN");
+    let old = [("KIVIDB_TEST_NODE_BIN", bin.as_str())];
+    let started = vec![
+        Node::start(&[]),
+        Node::start(&[]),
+        Node::start_with_env(&[], &old),
+    ];
+    let (mut nodes, ranges) = form_cluster_of(started);
+    let version = nodes[2].conn().cmd(&["INFO", "server"]).text();
+    assert!(version.contains("kividb_version:1.2."), "{version}");
+    let replica = add_replica(&nodes, &nodes[0]);
+    let replica2 = add_replica(&nodes, &nodes[1]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain([&replica, &replica2]).collect();
+        wait_cluster_ok(&all, 5);
+    }
+    let kept = Written::on(&nodes[0], ranges[0].0..=ranges[0].1, "kept", 100);
+    assert_eq!(nodes[0].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+    for mode in [None, Some("FORCE")] {
+        let candidate = if replica.is_master() {
+            &nodes[0]
+        } else {
+            &replica
+        };
+        let mut args = vec!["CLUSTER", "FAILOVER"];
+        args.extend(mode);
+        let reply = candidate.conn().cmd(&args);
+        assert!(reply.is_ok(), "{reply:?}");
+        wait_until("the replica to take over", Duration::from_secs(30), || {
+            candidate.is_master()
+        });
+        let id = candidate.id();
+        for n in nodes.iter().chain([&replica, &replica2]) {
+            wait_until("the new owner to be known", Duration::from_secs(20), || {
+                owner_in_view_of(n, ranges[0].0).as_deref() == Some(id.as_str())
+            });
+        }
+        // The next one, past the grace that follows a failover.
+        std::thread::sleep(Duration::from_secs(4));
+    }
+    let owner = if replica.is_master() {
+        &replica
+    } else {
+        &nodes[0]
+    };
+    assert!(kept.missing_on(owner).is_empty());
+    nodes[1].kill();
+    wait_until(
+        "the second replica to be elected",
+        Duration::from_secs(60),
+        || replica2.is_master(),
+    );
+}
+
 /// A write routed here before an atomic slot migration handed its slot
 /// over, and held up before the write gate until the handoff had let writes
 /// go again, is sent on with `-MOVED`. It used to run here, on a slot the

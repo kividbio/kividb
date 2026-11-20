@@ -379,8 +379,20 @@ pub fn process_message(
             master_id,
             force,
             claims,
+            claims_unreadable,
             ..
         } => {
+            // Claims that do not read as claims are not taken for none: the
+            // vote would be decided with no check at all (#742).
+            if claims_unreadable {
+                log_warn!(
+                    "Cluster: Not voting for {} to take over from {}: its request's slot \
+                     claims do not read as valid claims",
+                    node_id_str(&sender_id),
+                    node_id_str(&master_id)
+                );
+                return None;
+            }
             if state.cast_vote(
                 sender_id,
                 master_id,
@@ -420,8 +432,34 @@ pub fn process_message(
                     request_epoch,
                 }))
             } else {
-                None // silently reject
+                // Refused because this node knows a newer owner of slots the
+                // candidate claimed: say which, so that it learns them even
+                // if it cannot hear those owners itself, and stands again
+                // for what its master still has (#742). Only to a candidate
+                // that sent claims, which no earlier version does: one of
+                // those drops a connection on a message it does not know.
+                // Every other refusal is silent, as before.
+                let owners = claims
+                    .as_deref()
+                    .map(|c| state.newer_owners_of_claimed(master_id, c))
+                    .unwrap_or_default();
+                if owners.is_empty() {
+                    return None;
+                }
+                Some(encode(&BusMessage::Update {
+                    sender_id: state.myself(),
+                    owners,
+                }))
             }
+        }
+        // Normally read by the candidate that asked, on the connection it
+        // asked on (`heartbeat::broadcast_auth_request`); taken in the same
+        // way if one comes here.
+        BusMessage::Update { sender_id, owners } => {
+            if sender_is_member(state, &sender_id) {
+                apply_update(state, sender_id, owners);
+            }
+            None
         }
         BusMessage::FailoverAuthAck {
             sender_id,
@@ -594,6 +632,21 @@ fn apply_heartbeat(
     {
         return;
     }
+    // The master the sender replicated here, if this heartbeat is the one
+    // that makes it a master here: its claims of that master's slots at
+    // that master's own epoch are a takeover at a colliding epoch (#743).
+    let former_master = if sender_flags.contains(NodeFlags::MASTER) {
+        state.nodes.read().get(&sender_id).and_then(|n| {
+            n.flags
+                .contains(NodeFlags::REPLICA)
+                .then_some(n.master_id)
+                .flatten()
+        })
+    } else {
+        None
+    };
+    // What it says of itself only, never relayed (#742).
+    state.note_vote_claims(sender_id, sender_flags.contains(NodeFlags::VOTE_CLAIMS));
     // The sender's view of *itself* never includes "I have failed".
     upsert_node(
         state,
@@ -607,9 +660,6 @@ fn apply_heartbeat(
         true,
     );
     state.observe_epoch(config_epoch);
-    if sender_flags.contains(NodeFlags::MASTER) {
-        state.resolve_epoch_collision(sender_id, config_epoch);
-    }
     // What a node says of its own hostname stands, none included.
     state.set_peer_hostname(sender_id, &sender_hostname, true);
     state.set_peer_client_port(sender_id, sender_announced_client_port, true);
@@ -627,8 +677,75 @@ fn apply_heartbeat(
     }
     // A replica announces no slots; claims only ever come from masters.
     if sender_flags.contains(NodeFlags::MASTER) && !test_ignores_claims_of(&sender_id) {
-        state.apply_peer_slot_claims(sender_id, slot_claims);
+        state.apply_peer_slot_claims_from(sender_id, slot_claims, former_master);
     }
+    // After the claims, as Redis does (`clusterHandleConfigEpochCollision`
+    // comes last): a master whose replica took its slots over at its own
+    // epoch has given them up by now, and does not move above it and take
+    // them back (#743).
+    if sender_flags.contains(NodeFlags::MASTER) {
+        state.resolve_epoch_collision(sender_id, config_epoch);
+    }
+    state.save_soon();
+}
+
+/// Take in an `UPDATE` from `sender_id`: the newer owners of slots this
+/// node claimed for its master when it asked for a vote, as the voter knows
+/// them (#742). Each owner's slots are taken in as its own PING's claims
+/// would be (`apply_peer_slot_claims`: a slot moves only to a claim newer
+/// than its owner's here), and its config epoch is raised to the one given,
+/// as gossip raises it; an owner this node does not know yet is added as
+/// gossip adds one. The claims are what that owner itself claimed at that
+/// epoch, relayed: taking them in is taking in that owner's heartbeat late,
+/// which the epochs already make safe. If its master is left with no slots,
+/// this node follows their new owner and stands for nothing more; else it
+/// asks again, for the slots its master still has.
+pub(crate) fn apply_update(
+    state: &ClusterState,
+    sender_id: NodeId,
+    owners: Vec<crate::cluster::bus::OwnerUpdate>,
+) {
+    let forgotten = state.forgotten.read();
+    for owner in owners {
+        if owner.id == state.myself()
+            || forgotten
+                .get(&owner.id)
+                .is_some_and(|until| *until > now_ms())
+        {
+            continue;
+        }
+        upsert_node(
+            state,
+            owner.id,
+            owner.ip,
+            owner.client_port,
+            owner.cluster_port,
+            owner.config_epoch,
+            NodeFlags::MASTER,
+            None,
+            false,
+        );
+        state.observe_epoch(owner.config_epoch);
+        log_info!(
+            "Cluster: {} answered this node's vote request with the newer owner of slots it \
+             claimed: {} owns {} at config epoch {}",
+            node_id_str(&sender_id),
+            node_id_str(&owner.id),
+            owner
+                .claims
+                .iter()
+                .map(|c| if c.start == c.end {
+                    c.start.to_string()
+                } else {
+                    format!("{}-{}", c.start, c.end)
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            owner.config_epoch
+        );
+        state.apply_peer_slot_claims(owner.id, &owner.claims);
+    }
+    drop(forgotten);
     state.save_soon();
 }
 
@@ -829,7 +946,8 @@ fn our_pong(state: &ClusterState, to: Option<NodeId>) -> BusMessage {
         sender_client_port: me.client_port,
         sender_cluster_port: me.cluster_port,
         sender_config_epoch: me.config_epoch,
-        sender_flags: me.flags & (NodeFlags::MASTER | NodeFlags::REPLICA),
+        // A token an earlier version skips: see `ClusterState::note_vote_claims`.
+        sender_flags: me.flags & (NodeFlags::MASTER | NodeFlags::REPLICA) | NodeFlags::VOTE_CLAIMS,
         sender_master_id: me.master_id,
         sender_hostname: me.hostname.clone(),
         sender_announced_client_port: me.announced_client_port,
@@ -946,6 +1064,289 @@ mod tests {
             sender_cluster_port: 17000,
             sender_config_epoch: 0,
         }
+    }
+
+    /// A heartbeat of `sender`, with its role, master, config epoch and
+    /// claims (each range at that epoch).
+    fn heartbeat(
+        sender: NodeId,
+        flags: NodeFlags,
+        master: Option<NodeId>,
+        epoch: u64,
+        claims: &[(u16, u16)],
+    ) -> BusMessage {
+        let mut msg = ping(sender, flags, vec![]);
+        if let BusMessage::Ping {
+            sender_master_id,
+            sender_config_epoch,
+            slot_claims,
+            ..
+        } = &mut msg
+        {
+            *sender_master_id = master;
+            *sender_config_epoch = epoch;
+            *slot_claims = claims
+                .iter()
+                .map(|&(start, end)| SlotClaim { start, end, epoch })
+                .collect();
+        }
+        msg
+    }
+
+    /// A member `id` of `cs`, as a master with `claims` at `epoch`, or as a
+    /// replica of `master`.
+    fn member(
+        cs: &ClusterState,
+        master: Option<NodeId>,
+        epoch: u64,
+        claims: &[(u16, u16)],
+    ) -> NodeId {
+        let id = generate_node_id();
+        process_message(cs, meet(id), peer());
+        let flags = if master.is_some() {
+            NodeFlags::REPLICA
+        } else {
+            NodeFlags::MASTER
+        };
+        process_message(cs, heartbeat(id, flags, master, epoch, claims), peer());
+        id
+    }
+
+    fn set_my_epoch(cs: &ClusterState, epoch: u64) {
+        let me = cs.myself();
+        cs.nodes.write().get_mut(&me).unwrap().config_epoch = epoch;
+        cs.observe_epoch(epoch);
+    }
+
+    /// A replica of this node that took its slots over (`TAKEOVER`) at
+    /// this node's own config epoch (one it took unannounced) keeps them:
+    /// at its first heartbeat as a master, this node gives them up at the
+    /// tie, and does not move to a newer epoch on the collision, which
+    /// would have its next claim take them back whatever the ids (#743).
+    /// It used to: the lower id moved, and if that was this node, the
+    /// replica lost the slots and the writes it took since.
+    #[test]
+    fn a_takeover_at_the_masters_own_epoch_keeps_the_slots_on_the_master() {
+        // Left with none, the master follows it.
+        let cs = ClusterState::new_enabled(None, 15000);
+        cs.claim_slot_range(0, 99).unwrap();
+        set_my_epoch(&cs, 7);
+        let r = member(&cs, Some(cs.myself()), 0, &[]);
+        process_message(
+            &cs,
+            heartbeat(r, NodeFlags::MASTER, None, 7, &[(0, 99)]),
+            peer(),
+        );
+        assert_eq!(cs.slot_owner(50), Some(r));
+        assert_eq!(cs.my_master_id(), Some(r));
+
+        // Left with some, it keeps them, at its epoch, whatever the ids.
+        for _ in 0..8 {
+            let cs = ClusterState::new_enabled(None, 15000);
+            cs.claim_slot_range(0, 199).unwrap();
+            set_my_epoch(&cs, 7);
+            let r = member(&cs, Some(cs.myself()), 0, &[]);
+            for _ in 0..3 {
+                process_message(
+                    &cs,
+                    heartbeat(r, NodeFlags::MASTER, None, 7, &[(0, 99)]),
+                    peer(),
+                );
+            }
+            assert_eq!(cs.slot_owner(50), Some(r));
+            assert_eq!(cs.slot_owner(150), Some(cs.myself()));
+            assert_eq!(cs.my_master_id(), None);
+            assert_eq!(
+                cs.nodes.read()[&cs.myself()].config_epoch,
+                7,
+                "moved above it"
+            );
+        }
+
+        // A master that was never its replica, claiming at the same epoch,
+        // takes nothing: equal epochs keep the owner.
+        let cs = ClusterState::new_enabled(None, 15000);
+        cs.claim_slot_range(0, 99).unwrap();
+        set_my_epoch(&cs, 7);
+        let x = member(&cs, None, 7, &[]);
+        process_message(
+            &cs,
+            heartbeat(x, NodeFlags::MASTER, None, 7, &[(0, 99)]),
+            peer(),
+        );
+        assert_eq!(cs.slot_owner(50), Some(cs.myself()));
+    }
+
+    /// The same at a node that had heard the master take that epoch: the
+    /// replica's first heartbeat as a master takes the slots at the tie.
+    #[test]
+    fn a_takeover_at_the_masters_own_epoch_wins_on_every_node_that_knew_it_as_a_replica() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        cs.claim_slot_range(200, 299).unwrap();
+        set_my_epoch(&cs, 2);
+        let a = member(&cs, None, 7, &[(0, 99)]);
+        let r = member(&cs, Some(a), 0, &[]);
+        assert_eq!(cs.slot_owner(50), Some(a));
+        process_message(
+            &cs,
+            heartbeat(r, NodeFlags::MASTER, None, 7, &[(0, 99)]),
+            peer(),
+        );
+        assert_eq!(cs.slot_owner(50), Some(r));
+        // The old master's own claim at that epoch does not take them back.
+        process_message(
+            &cs,
+            heartbeat(a, NodeFlags::MASTER, None, 7, &[(0, 99)]),
+            peer(),
+        );
+        assert_eq!(cs.slot_owner(50), Some(r));
+    }
+
+    /// A master that refuses a vote because it knows a newer owner of slots
+    /// the candidate claims answers with an `UPDATE` naming that owner, its
+    /// epoch and its slots; the vote is not spent (#742). A request whose
+    /// claims do not read as claims is refused, and nothing is answered.
+    #[test]
+    fn a_vote_refused_for_a_newer_owner_is_answered_with_it() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        cs.claim_slot_range(200, 299).unwrap();
+        set_my_epoch(&cs, 2);
+        let a = member(&cs, None, 3, &[(0, 99)]);
+        let b = member(&cs, None, 9, &[(50, 60), (300, 310)]);
+        let r = member(&cs, Some(a), 0, &[]);
+        cs.nodes.write().get_mut(&a).unwrap().flags |= NodeFlags::FAIL;
+        let request =
+            |claims: Option<Vec<SlotClaim>>, unreadable: bool| BusMessage::FailoverAuthRequest {
+                sender_id: r,
+                sender_ip: "10.0.0.9".into(),
+                sender_client_port: 7000,
+                sender_cluster_port: 17000,
+                request_epoch: 20,
+                master_id: a,
+                force: false,
+                claims,
+                claims_unreadable: unreadable,
+            };
+        let stale = vec![SlotClaim {
+            start: 0,
+            end: 99,
+            epoch: 3,
+        }];
+        let reply = process_message(&cs, request(Some(stale.clone()), false), peer()).unwrap();
+        match crate::cluster::bus::message::decode(&reply)
+            .unwrap()
+            .unwrap()
+            .0
+        {
+            BusMessage::Update { sender_id, owners } => {
+                assert_eq!(sender_id, cs.myself());
+                assert_eq!(owners.len(), 1);
+                assert_eq!(owners[0].id, b);
+                assert_eq!(owners[0].config_epoch, 9);
+                let got: Vec<(u16, u16, u64)> = owners[0]
+                    .claims
+                    .iter()
+                    .map(|c| (c.start, c.end, c.epoch))
+                    .collect();
+                assert_eq!(got, vec![(50, 60, 9), (300, 310, 9)]);
+            }
+            other => panic!("expected an UPDATE, got {other:?}"),
+        }
+        assert_eq!(cs.last_vote_epoch.load(Ordering::SeqCst), 0);
+        // A forced request with the same claims, the same.
+        let mut forced = request(Some(stale), false);
+        if let BusMessage::FailoverAuthRequest { force, .. } = &mut forced {
+            *force = true;
+        }
+        assert!(process_message(&cs, forced, peer()).is_some());
+        assert_eq!(cs.last_vote_epoch.load(Ordering::SeqCst), 0);
+        // Unreadable claims: refused, unanswered.
+        assert!(process_message(&cs, request(None, true), peer()).is_none());
+        assert_eq!(cs.last_vote_epoch.load(Ordering::SeqCst), 0);
+        // Without claims (an earlier version): refused for nothing here,
+        // and never answered with an UPDATE.
+        cs.nodes
+            .write()
+            .get_mut(&a)
+            .unwrap()
+            .flags
+            .remove(NodeFlags::FAIL);
+        assert!(process_message(&cs, request(None, false), peer()).is_none());
+    }
+
+    /// A candidate takes an `UPDATE` in as the owner's own claims: its
+    /// master's slots in its view, and so its next request's claims, are
+    /// what the master still has (#742). An owner it did not know is added.
+    /// Left with nothing, it follows the owner.
+    #[test]
+    fn an_update_puts_the_candidates_claims_right() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let a = member(&cs, None, 3, &[(0, 99)]);
+        cs.set_replica_of(a).unwrap();
+        let b = generate_node_id();
+        let owner = |claims: Vec<(u16, u16)>| crate::cluster::bus::OwnerUpdate {
+            id: b,
+            ip: "10.0.0.7".into(),
+            client_port: 7007,
+            cluster_port: 17007,
+            config_epoch: 9,
+            claims: claims
+                .into_iter()
+                .map(|(start, end)| SlotClaim {
+                    start,
+                    end,
+                    epoch: 9,
+                })
+                .collect(),
+        };
+        let voter = generate_node_id();
+        apply_update(&cs, voter, vec![owner(vec![(50, 60), (300, 310)])]);
+        let left: Vec<(u16, u16)> = cs
+            .slot_claims_of(a)
+            .iter()
+            .map(|c| (c.start, c.end))
+            .collect();
+        assert_eq!(left, vec![(0, 49), (61, 99)]);
+        assert_eq!(cs.nodes.read()[&b].config_epoch, 9);
+        assert_eq!(cs.my_master_id(), Some(a));
+        // An older claim changes nothing.
+        let mut old = owner(vec![(0, 10)]);
+        old.config_epoch = 2;
+        old.claims[0].epoch = 2;
+        apply_update(&cs, voter, vec![old]);
+        assert_eq!(cs.slot_owner(5), Some(a));
+        // The rest: the master has nothing left, and this node follows b.
+        apply_update(&cs, voter, vec![owner(vec![(0, 99)])]);
+        assert_eq!(cs.my_master_id(), Some(b));
+    }
+
+    /// A node advertises `vote-claims` in its own heartbeats, and its peers
+    /// note it from those only (#742).
+    #[test]
+    fn the_vote_claims_capability_is_learnt_from_a_nodes_own_heartbeat() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let x = member(&cs, None, 1, &[]);
+        assert!(!cs.decides_on_claims(&x));
+        process_message(
+            &cs,
+            heartbeat(x, NodeFlags::MASTER | NodeFlags::VOTE_CLAIMS, None, 1, &[]),
+            peer(),
+        );
+        assert!(cs.decides_on_claims(&x));
+        // An earlier version's heartbeat, after a downgrade: forgotten.
+        process_message(&cs, heartbeat(x, NodeFlags::MASTER, None, 1, &[]), peer());
+        assert!(!cs.decides_on_claims(&x));
+        let BusMessage::Pong { sender_flags, .. } = our_pong(&cs, None) else {
+            panic!()
+        };
+        assert!(sender_flags.contains(NodeFlags::VOTE_CLAIMS));
+        // Never in the node table.
+        process_message(
+            &cs,
+            heartbeat(x, NodeFlags::MASTER | NodeFlags::VOTE_CLAIMS, None, 1, &[]),
+            peer(),
+        );
+        assert!(!cs.nodes.read()[&x].flags.contains(NodeFlags::VOTE_CLAIMS));
     }
 
     /// A node that sends no address of its own is recorded at the address it
