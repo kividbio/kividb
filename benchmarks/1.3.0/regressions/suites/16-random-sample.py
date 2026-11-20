@@ -36,6 +36,11 @@ average, nearly all of it for a count of 10) where Redis indexes by rank, so
 they take about a millisecond at 1,000,000 against Redis's 50 us. The gap is
 shown, not gated; it goes away with a storage that can be indexed by
 position.
+
+Since #862 the member table is asked for random buckets and the sorted
+set's rows are as fast as Redis's (57 us for a count of 10 at 1,000,000, run
+`pr-862-d4s_v5-16`); suite 37 holds them to it, with the server's own time.
+The values here were recorded before it, so their `rel` gates are loose.
 """
 import os
 import sys
