@@ -3101,7 +3101,7 @@ mod tests {
         for (field, value, time) in fields {
             inner.fields.insert_bytes(field, value.as_bytes());
             if let Some(time) = time {
-                inner.expiries.insert(field.to_string(), *time);
+                inner.expiries.insert(field, *time);
             }
         }
         KiviDBValue::HashEx(std::sync::Arc::new(parking_lot::RwLock::new(inner)))
