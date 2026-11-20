@@ -1389,6 +1389,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Memory a heavy write load leaves in the allocator goes back to the
+  system once the server is idle, even when nothing was deleted (#245).**
+  The thread that gives freed memory back (#753) acted only on a large
+  fall in what is allocated. Memory allocated and freed on the way, such
+  as what a replica holds while it applies a fast stream (all of it on its
+  one applier thread, so in one arena: 128 MiB, 118 MiB of it free, after
+  2.5M writes of 256 B), shows no such fall and stayed in RSS until a
+  `MEMORY PURGE`. Once a second, while the server is idle, the thread now
+  also compares RSS with `used_memory`, and gives the free pages back when
+  the gap has grown by 16 MiB and by a sixteenth of `used_memory` past
+  what the last trim left. A gap a trim cannot close (slab blocks left
+  empty) is not trimmed for again. After 2.5M `SET`s into 3 masters with a
+  replica each, RSS ten minutes later was 1.16-1.25 times `used_memory` on
+  the masters and up to 1.18 on a replica, against 1.09-1.12 once a
+  `MEMORY PURGE` had run; it is now 1.09-1.13 on every node without one,
+  and a `MEMORY PURGE` gives back at most 2 MiB more.
+  Nothing on the path of a command changes.
+
+- **A node lets go of its startup fingerprint when it becomes a replica.** A
+  master started from its data without a saved stream position fingerprints
+  the dataset, so that a replica holding the same data is continued from
+  the start of its stream rather than sent everything. That holds only
+  while the node stays a master: once it follows another master, it may be
+  sent another dataset and the other master's stream. It now drops the
+  fingerprint when it becomes a replica, and if it is promoted later, a
+  replica that attaches to it holding the data it started with is sent the
+  dataset it holds now. A continuation refused because it asks for the
+  stream from before the node's last full sync is logged as that ("this
+  node holds the stream only from offset N, where it was last synced in
+  full"), and the `VADD` quantization reason only when that is the reason.
+
 - **Search scores, `PHONETIC` and `FT.AGGREGATE` numbers agree with Redis
   8.10.2 for `NOFREQS`, `~` in dialect 1, phonetic fields and the way numbers
   are written (#247).** Checked against a live Redis 8.10.2 on the same
