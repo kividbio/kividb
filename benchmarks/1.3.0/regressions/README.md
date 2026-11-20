@@ -1686,6 +1686,51 @@ limit (v1.2.2 gives the very same values), so the ratio is a lower bound, and
 the floor (1.3x, the issue's) sits well below it: it fails a loss of half of
 the gain, the rate row (10 % under the recorded value) a smaller one.
 
+## Recorded run, suite 42
+
+Recorded 2026-11-20 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C),
+`--only 42 --record`; the candidate is `b0fbbd54` (PR #986),
+`cargo build --release --features lua,tls` by rustc 1.100.0; memtier_benchmark
+2.6.1; Redis 8.10.2 from the VM image. Runs: `pr986-d8s_v5` (recorded) and
+`pr986-d8s_v5-r2` (the noise check: every gate passed, host speed 1.00x, every rate within 2 % of the recorded one). A run takes 2,460 s. The server
+has CPUs 0-3 (KiviDB `--threads 4`, Redis one thread) and memtier 4-7.
+
+Operations a second at 200 / 500 connections, recorded run:
+
+| workload | v1.2.2 | candidate | Redis 8.10.2 | floor (x Redis) |
+|---|---:|---:|---:|---:|
+| `nextcloud` | 260,608 / 272,187 | 325,120 / 319,095 | 158,912 / 161,191 | 1.4x |
+| `nextcloud_noscript` | 313,800 / 307,952 | 313,651 / 309,392 | 166,512 / 164,780 | 1.4x |
+| `cad` | 179,052 / 182,244 | 247,627 / 256,784 | 132,336 / 135,179 | 1.4x |
+| `appwrite` | 103,252 / 101,651 | 136,216 / 135,125 | 98,347 / 100,659 | 1.0x |
+| `cad_tag` | 285,612 / 286,411 | 321,918 / 322,772 | 133,085 / 136,405 | 1.8x |
+| `appwrite_tag` | 209,881 / 214,438 | 246,280 / 249,989 | 98,074 / 100,725 | 1.8x |
+| `superset` | 110,688 / 95,281 | 111,682 / 97,081 | 56,554 / 55,560 | 1.2x |
+
+p99, ms at 200 / 500 connections:
+
+| workload | v1.2.2 | candidate | Redis 8.10.2 |
+|---|---:|---:|---:|
+| `nextcloud` (gated) | 5.21 / 10.81 | 0.967 / 2.69 | 2.45 / 5.89 |
+| `nextcloud_noscript` | 0.943 / 2.43 | 0.943 / 2.48 | 2.35 / 5.82 |
+| `superset` (gated) | 5.86 / 13.05 | 2.75 / 8.83 | 6.72 / 14.78 |
+
+`nextcloud_p99_over_noscript`: 1.03 / 1.08 for the candidate (gate 2.0),
+5.53 / 4.45 for v1.2.2. Before #880 master measured 4.4 / 8.6 ms for the
+mix's p99 on the same machine type (4.7x / 3.5x its no-script mix), which
+fails the gate; v1.2.2's rows here fail it too. Valkey 8.1 with
+`--io-threads 4`, measured in the same harness outside the suite, gives
+0.72 / 2.06 ms for the mix and 0.73 / 1.97 ms with no script (see PR #986).
+
+Every run had no error reply. MONITOR showed one key of the workload's form
+in each call's KEYS, with its ARGV, and more than 90 % distinct keys.
+Compare-and-delete deleted the key in about a third of the mix's calls.
+Alone it deleted about 4 %: once a key is deleted, later calls on it miss.
+
+This suite declares `min_cpus=8`: run it on a Standard_D8s_v5 with
+`run-all.sh --candidate <bin> --candidate-full <bin> --min-cpus-only --label
+<label>-d8s_v5`, or `--only 42` on a machine with 8 CPUs.
+
 ## Not covered
 
 Every row of the gains table in `docs/PERFORMANCE.md` has a suite here (01-13; 14 is #759 and 15 is #758, after that table).
