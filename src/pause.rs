@@ -428,6 +428,8 @@ pub fn test_stall_before_the_gate(cmd: &[&[u8]]) {
         && cmd.iter().skip(1).any(|arg| arg.starts_with(b"stalled:"))
         && !TAKEN.swap(true, Ordering::Relaxed)
     {
+        // Before the gate, so with it open (`command_gate::for_a_run`).
+        crate::command_gate::reopen_for_a_wait();
         crate::cluster::migration::off_the_runtime(|| std::thread::sleep(delay));
     }
 }

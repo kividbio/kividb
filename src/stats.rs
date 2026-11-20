@@ -296,6 +296,7 @@ pub mod scripts {
         }
         HANDED_TO_RUNNER.store(0, Ordering::Relaxed);
         OFFLOADED_TO_POOL.store(0, Ordering::Relaxed);
+        crate::command_gate::reset_run_counts();
     }
 
     /// The lines of `INFO stats`.
@@ -314,6 +315,12 @@ pub mod scripts {
         out.push_str(&format!(
             "scripts_offloaded_to_pool:{}\r\n",
             OFFLOADED_TO_POOL.load(Ordering::Relaxed)
+        ));
+        // The runs of quick scripts that run alone (`command_gate::for_a_run`):
+        // times the gate was closed for one, and the scripts run under those.
+        let (closes, scripts) = crate::command_gate::run_counts();
+        out.push_str(&format!(
+            "scripts_alone_runs:{closes}\r\nscripts_in_alone_runs:{scripts}\r\n"
         ));
     }
 }

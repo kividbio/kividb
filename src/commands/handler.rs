@@ -1600,8 +1600,10 @@ fn checked_in_gate(
     // nothing while it waits, and what it was checked against before
     // its gates (routing, ACL, `lua-parallel-scripts`, whether it runs
     // beside other scripts) is decided again. A script that runs alone
-    // holds the command gate alone, and used to wait the handoff out
-    // here with it: no other command ran on any thread meanwhile.
+    // lets go of the command gate before it waits: waited out here, no
+    // other command would run on any thread meanwhile. So does a run of
+    // scripts that keeps the gate closed between them
+    // (`command_gate::reopen_for_a_wait`).
     Some(if handoff {
         WAIT_OUT_HANDOFF.to_vec()
     } else {
@@ -1628,8 +1630,10 @@ fn sent_back_to_wait(reply: &[u8]) -> bool {
 /// every gate, for the handoff to end or its keys to have moved, then run
 /// it again from the top (`run_command`), as many times as it is sent back.
 /// The wait is on its worker thread, as it was in the gate
-/// (`pause::wait_out_handoff`). The dispatch again is not held at the test
-/// hook `routed` a second time.
+/// (`pause::wait_out_handoff`), with the command gate open: a run of scripts
+/// that held it closed between them opens it first
+/// (`command_gate::reopen_for_a_wait`). The dispatch again is not held at
+/// the test hook `routed` a second time.
 #[cold]
 #[inline(never)]
 fn dispatched_again_after_waiting(
@@ -1639,6 +1643,7 @@ fn dispatched_again_after_waiting(
     mut reply: Vec<u8>,
 ) -> Vec<u8> {
     while sent_back_to_wait(&reply) {
+        crate::command_gate::reopen_for_a_wait();
         #[cfg(debug_assertions)]
         if crate::cluster::routing::test_stalls_on() {
             log_warn!("(test) {name} waits outside its gates");
@@ -1709,6 +1714,9 @@ fn room_on_arrival(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     {
         return None;
     }
+    // Eviction may wait for the order of keys a `MIGRATE` holds: not with
+    // the gate closed for a run of scripts (`command_gate::for_a_run`).
+    crate::command_gate::reopen_for_a_wait();
     room_before_dispatch(ctx, name)
 }
 

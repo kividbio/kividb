@@ -246,30 +246,28 @@ impl Drop for Turn {
         // two the other way round, so one of them sees the other: a script
         // queued as the turn is given up is never left with nobody to run it.
         SCRIPT_RUNNING.store(false, Ordering::SeqCst);
-        // Scripts left, or that arrived as it ended, are the runner's.
-        if let Some(runner) = RUNNER.get()
-            && runner.waiting.load(Ordering::SeqCst) > 0
-        {
+        // Scripts left, or that arrived as it ended, are the runner's. Got
+        // by `runner()`, which waits for a runner being made and sees one
+        // made, not by a look at `RUNNER` that could miss the runner the
+        // first script queued made on another thread as this turn ran.
+        let runner = runner();
+        if runner.waiting.load(Ordering::SeqCst) > 0 {
             runner.thread.unpark();
         }
     }
 }
 
-/// How long whoever has the turn goes on running the scripts that came while
-/// it ran its own, before it lets the gate open: they are run with the gate
-/// closed once for them all, not once for each. Bounded, so that the
-/// commands beside them wait for one run at most; a run that ends with
-/// scripts left wakes the runner thread (`Turn`'s drop). Measured with four
-/// workers on four CPUs (#880): at 50 us runs ended with scripts left too
-/// often, and the runner's wakes, a fifth busy thread, brought the waits
-/// back; 100, 200 and 400 us gave the same latencies.
+/// How long the gate, once closed for a run, stays closed for the scripts
+/// that came while the one that closed it ran: they run under one close, not
+/// one each. Counted from when the gate is had, not from when it was asked
+/// for, and a close always runs at least the script that closed it. Once it
+/// has passed, the gate opens when the script then running has ended; a run
+/// that ends with scripts left wakes the runner thread (`Turn`'s drop).
+/// Measured with four workers on four CPUs (#880): at 50 us runs ended with
+/// scripts left too often, and the runner's wakes, a fifth busy thread,
+/// brought the waits back; 100, 200 and 400 us gave the same latencies.
 #[cfg(feature = "lua")]
 const RUN_FOR: std::time::Duration = std::time::Duration::from_micros(200);
-
-/// How long a run waits for the gate before it asks whether a script running
-/// elsewhere is past its time limit (see `command_gate::enter_unless`).
-#[cfg(feature = "lua")]
-const GATE_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The queue of quick scripts that came while another one was running, and
 /// the thread that runs them when nobody else has the turn: one after
@@ -320,12 +318,20 @@ impl Runner {
         }
     }
 
-    /// Run queued scripts, by the thread that has the turn and holds the gate
-    /// alone for a run (`command_gate::enter_alone_for_a_run`), until none is
-    /// left or `RUN_FOR` has passed since `since`.
+    /// Run queued scripts, by the thread that has the turn, in its run
+    /// (`command_gate::for_a_run`), until none is left, or the gate has been
+    /// closed for the run for `RUN_FOR` (it is then opened again), or — while
+    /// the gate is open — `RUN_FOR` has passed since `since`. The first
+    /// script to find the gate open closes it, so each close runs a script:
+    /// called with the gate open and `since` now, this runs one at least.
     fn run_queued(&self, since: std::time::Instant) {
         use std::sync::atomic::Ordering;
-        while since.elapsed() < RUN_FOR {
+        loop {
+            if crate::command_gate::reopen_between_scripts(RUN_FOR).is_none()
+                && since.elapsed() >= RUN_FOR
+            {
+                break;
+            }
             let next = self.queue.lock().pop_front();
             let Some((job, reply)) = next else { break };
             self.waiting.fetch_sub(1, Ordering::SeqCst);
@@ -350,24 +356,16 @@ impl Runner {
                 std::thread::park();
                 continue;
             };
+            // One run after another, the gate opened between two of them.
+            // Each script closes the gate as it would on its own if it finds
+            // it open, after its checks; one held up by a script elsewhere
+            // past its time limit is told `BUSY`, as it would have been.
+            let run = crate::command_gate::for_a_run();
             while self.waiting.load(Ordering::SeqCst) > 0 {
-                let started = std::time::Instant::now();
-                match crate::command_gate::enter_alone_for_a_run(
-                    GATE_SLICE,
-                    crate::commands::running_script_is_over_its_time_limit,
-                ) {
-                    Some(_run) => self.run_queued(started),
-                    // A script elsewhere is past its time limit and holds the
-                    // gate: the next queued one is run on its own, and told
-                    // `BUSY` as it would have been.
-                    None => {
-                        let next = self.queue.lock().pop_front();
-                        let Some((job, reply)) = next else { break };
-                        self.waiting.fetch_sub(1, Ordering::SeqCst);
-                        let _ = reply.send(job.run());
-                    }
-                }
+                self.run_queued(std::time::Instant::now());
+                crate::command_gate::reopen_between_scripts(std::time::Duration::ZERO);
             }
+            drop(run);
             // Not through `Drop`: that would wake this very thread. A script
             // queued as the turn is given up is found by the look at the top.
             std::mem::forget(turn);
@@ -429,25 +427,21 @@ pub(crate) async fn run_lua_vm_blocking(
         }
         let (resp, sel_out, elapsed_us) = match Turn::take() {
             // No other script is running: run this one here, on the command
-            // where it lies, and then the ones that came meanwhile, with the
-            // gate closed once for them all (`Runner::run_queued`). If a
+            // where it lies, and then the ones that came meanwhile, in a run
+            // (`Runner::run_queued`): the gate this one closes, after its
+            // checks, as it would on its own, stays closed for them. If a
             // script elsewhere is past its time limit and holds the gate,
-            // this one is run on its own, and told `BUSY`.
+            // this one is told `BUSY`, as it would have been.
             Some(turn) => {
                 let started = std::time::Instant::now();
-                let run = crate::command_gate::enter_alone_for_a_run(
-                    GATE_SLICE,
-                    crate::commands::running_script_is_over_its_time_limit,
-                );
+                let run = crate::command_gate::for_a_run();
                 let done = ran_quick(key, sel, || {
                     env.run_execute_borrowed(cmd.to_vec(), sel, aof_enabled, client_resp)
                 });
-                // None queued if there is no runner yet.
-                if run.is_some()
-                    && let Some(runner) = RUNNER.get()
-                {
-                    runner.run_queued(started);
+                if run.is_some() {
+                    runner().run_queued(started);
                 }
+                // The gate opens, and then the turn is given up.
                 drop(run);
                 drop(turn);
                 done
