@@ -30,7 +30,7 @@ pub mod message;
 pub use dialer::send_meet;
 pub use heartbeat::{run_failure_detection_loop, run_heartbeat_loop};
 pub use listener::run_bus_listener;
-pub use message::{BusMessage, GossipEntry, OwnerReport, SlotClaim, decode, encode};
+pub use message::{BusMessage, GossipEntry, OwnerReport, OwnerUpdate, SlotClaim, decode, encode};
 
 use crate::cluster::ClusterState;
 use crate::cpus::BuilderExt as _;

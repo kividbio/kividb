@@ -1381,7 +1381,7 @@ convergence, so even a recovering old master will accept its replacement.
 | Command | Syntax | Notes |
 |---|---|---|
 | `CLUSTER REPLICATE` | `CLUSTER REPLICATE master-id` | Configure this node as a replica. Refuses if the candidate owns slots — `DELSLOTS` first. |
-| `CLUSTER FAILOVER` | `CLUSTER FAILOVER [FORCE \| TAKEOVER]` | Manually promote this replica. By default the master pauses writes and the replica catches up before it stands for election, so nothing acknowledged is lost. `FORCE` skips that handshake (the master may be unreachable) but still wins an election; `TAKEOVER` skips the election too (dangerous). |
+| `CLUSTER FAILOVER` | `CLUSTER FAILOVER [FORCE \| TAKEOVER]` | Manually promote this replica. By default the master pauses writes and the replica catches up before it stands for election, so nothing acknowledged is lost. `FORCE` skips that handshake (the master may be unreachable) but still wins an election; `TAKEOVER` skips the election too (dangerous: see below). |
 
 Automatic failover triggers when a master is `FAIL`-flagged via the failure
 detection algorithm: `node-timeout` (default 15000ms, configurable via
@@ -1402,6 +1402,49 @@ had been sent applied) longer ago than
 either: its data is too old to take over with
 (`cluster-replica-validity-factor 0` lets it stand anyway). The log says why
 a replica does not stand. `CLUSTER FAILOVER` is not subject to either.
+
+**What a vote checks.** A replica standing for election, automatic or by
+`CLUSTER FAILOVER` (with or without `FORCE`), says in its request which slots
+it would take over: those its master owns in its view, at its master's
+config epoch. A master that knows a newer owner of one of them refuses its
+vote, as in Redis, and answers with that owner and the slots it last claimed
+in its own heartbeat to that master, at the epochs it gave (Redis's
+`UPDATE`). The replica takes that in as if the owner had told it itself, and
+asks again for the slots its master still has; so a replica that cannot
+reach the new owner (down, or cut off from it) is still elected within its
+first election, provided the masters it asks have heard that owner directly
+since they last started, and never takes the slots that moved. If its
+master has no slots left, it follows their new owner instead. A request whose
+claims are not valid claims is refused. Masters of 1.2 decide votes as
+before: a manual failover's request reaches them without claims, in the form
+they read.
+
+**What each kind of failover guarantees.** The default `CLUSTER FAILOVER`
+loses nothing the old master acknowledged: the master stops taking writes
+and gives the replica the offset its stream ends at, and the replica stands
+only once it has read that far. If the election is not won in time, the old
+master keeps the slots and serves on, once it has made sure no replica took
+them; the failover either completes or leaves the old master serving.
+`FORCE` does not wait for the master: what the master acknowledged and the
+replica had not received is lost, as in an automatic failover. `TAKEOVER`
+skips the election as well: the replica picks a new epoch on its own and
+claims its master's slots, as it sees them, without asking anyone. It gives
+no guarantee about the old master's writes, and does not check whether its
+master gave slots away that it has not heard of: use it only when no
+majority of masters can vote.
+
+**Config epoch collisions.** Two masters at one config epoch are resolved as
+in Redis: the one with the lower node id moves to a new epoch. A `TAKEOVER`
+can pick the epoch its master had just taken without telling anyone (at the
+end of a slot import, or by `CLUSTER BUMPEPOCH`) before it went down. When
+that master comes back, its replica's claim of its slots at its own epoch is
+taken as the later of the two: the old master gives the slots up and follows
+it, and so does every node that knew the replica as its replica; on the
+collision, it is the replica that moves to a new epoch, whatever the ids, so
+its claim wins on every other node too. Which node took over from which is
+kept across restarts of either: nodes.conf's `vars` line then carries
+`tookOverFrom <id>` and `yieldedTo <id>,...` (an earlier version skips
+them), until the collision is over.
 
 A master that comes back after it has been replaced finds its slots claimed at
 a higher epoch and becomes a replica of the node that took them. While a slot
@@ -1433,10 +1476,22 @@ destination has not answered the takeover within
 `--cluster-slot-migration-write-pause-timeout` (default 10000 ms), the source
 asks it, every 200 ms, whether it took the slots, and keeps writes paused until
 it knows: taken, and they are handed over; not taken, and the attempt is
-abandoned and retried. A destination the cluster has marked FAIL is taken not
-to have them, and the source claims them again at a newer epoch. `CLIENT
+abandoned and retried. A destination the cluster has marked FAIL may have
+taken them and told its replicas, so the source first waits for its failover
+(as long as a replica of it is up, for the time an election can take): a
+replica elected with the slots keeps them, and the source gives them up.
+Otherwise the destination is taken not to have them, and the source claims
+them again at a newer epoch. `CLIENT
 UNPAUSE` ends the pause early. During the pause all client
-writes to the source wait, not only those for the moving slots.
+writes to the source wait, not only those for the moving slots. A source
+that stops during the handover finds it in
+`<cluster-config-file>.handovers` when it starts again, and holds writes
+until it knows where the slots went, in the same way. A node whose
+`.handovers` file cannot be read whole (cut short, a line that does not
+read, not text, a read error) does not start: it logs `cluster handovers
+file '...' is unreadable: ...` and leaves the file as it is. Check the
+slots it lists (`CLUSTER SHARDS` on another node), then remove the file by
+hand to start the node.
 
 Until the takeover, what the destination has received is a copy: the source
 still owns and serves the slots. If the destination goes down before taking
