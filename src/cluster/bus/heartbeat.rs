@@ -761,6 +761,10 @@ pub(crate) async fn broadcast_auth_request(
             // Asked again after each `UPDATE`, with the claims put right; a
             // few times at most: each one moves slots to a newer owner here.
             let mut asked = 0;
+            // Asked again once with its claims as they were, after an
+            // `UPDATE` that named its master: the master refused it for
+            // slots it left out, and this node knows a newer owner of them.
+            let mut asked_unchanged = false;
             loop {
                 asked += 1;
                 match dialer::exchange(&state, &addr, &msg, wait).await {
@@ -780,6 +784,7 @@ pub(crate) async fn broadcast_auth_request(
                         );
                     }
                     Ok(Some(BusMessage::Update { sender_id, owners })) => {
+                        let names_master = owners.iter().any(|o| o.id == master_id);
                         crate::cluster::bus::listener::apply_update(&state, sender_id, owners);
                         // Still standing at this epoch, for the same master,
                         // with something left to claim: ask again.
@@ -793,8 +798,15 @@ pub(crate) async fn broadcast_auth_request(
                             break;
                         };
                         let now = state.slot_claims_of(master_id);
-                        if now.is_empty() || claims.as_ref() == Some(&now) {
+                        if now.is_empty() {
                             break;
+                        }
+                        if claims.as_ref() == Some(&now) {
+                            if !names_master || asked_unchanged {
+                                break;
+                            }
+                            asked_unchanged = true;
+                            continue;
                         }
                         *claims = Some(now);
                         continue;

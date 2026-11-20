@@ -293,6 +293,45 @@ pub(crate) fn encode_marker(kind: &str, listed: &[Listed]) -> Vec<u8> {
     crate::resp::write::encode_resp_command(&parts)
 }
 
+/// A `TAKEN` marker: the master that sends it owns `ranges` at config epoch
+/// `epoch`, what its heartbeats claim. It sends it as it takes slots over,
+/// before it serves any write to them, so that a replica that has applied
+/// such a write knows whose slots they are.
+pub(crate) fn encode_taken(epoch: u64, ranges: &[(u16, u16)]) -> Vec<u8> {
+    crate::resp::write::encode_resp_command(&[
+        SLOT_IMPORTS_MARKER.to_vec(),
+        b"TAKEN".to_vec(),
+        epoch.to_string().into_bytes(),
+        ranges_word(ranges).into_bytes(),
+    ])
+}
+
+/// A `TAKEN` marker read back: its epoch and slots. `None` if it is not one.
+fn parse_taken(args: &[&[u8]]) -> Option<(u64, Ranges)> {
+    let [name, kind, epoch, ranges] = args else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case(SLOT_IMPORTS_MARKER) || !kind.eq_ignore_ascii_case(b"TAKEN") {
+        return None;
+    }
+    let epoch = std::str::from_utf8(epoch).ok()?.parse().ok()?;
+    let ranges = parse_ranges_word(std::str::from_utf8(ranges).ok()?)?;
+    Some((epoch, ranges))
+}
+
+/// Take in a `TAKEN` marker of this node's master: its claim of `ranges` at
+/// `epoch`, as its heartbeat would bring it, applied in the marker's place
+/// in the stream.
+fn take_in_masters_claim(cluster: &ClusterState, epoch: u64, ranges: &[(u16, u16)]) {
+    let Some(master) = cluster.my_master_id() else {
+        return;
+    };
+    if ranges.is_empty() {
+        return;
+    }
+    cluster.take_in_claims_of_master(master, epoch, ranges);
+}
+
 /// A marker read back: whether it is `LIVE`, and what it lists. `None` if
 /// it does not read as one.
 fn parse_marker(args: &[&[u8]]) -> Option<(bool, Vec<Listed>)> {
@@ -426,6 +465,10 @@ pub(crate) fn on_event(
             write_down(cluster, look);
         }
         SlotImportsEvent::Marker(args) => {
+            if let Some((epoch, ranges)) = parse_taken(args) {
+                take_in_masters_claim(cluster, epoch, &ranges);
+                return;
+            }
             let Some((live, listed)) = parse_marker(args) else {
                 log_warn!(
                     "Cluster: the master sent a slot-imports marker this node cannot read; \
@@ -1018,6 +1061,32 @@ mod tests {
         let empty = encode_marker("SYNC", &[]);
         let (_, args) = crate::resp::parse::parse_resp_command(&empty).unwrap();
         assert_eq!(parse_marker(&args), Some((false, vec![])));
+    }
+
+    /// A `TAKEN` marker reads back as its epoch and slots, and is not read
+    /// as a list of imports; one that is not whole, or not valid, is none.
+    #[test]
+    fn a_taken_marker_reads_back() {
+        let bytes = encode_taken(12, &[(0, 100), (5000, 5000)]);
+        let (_, args) = crate::resp::parse::parse_resp_command(&bytes).unwrap();
+        assert_eq!(
+            parse_taken(&args),
+            Some((12, vec![(0, 100), (5000, 5000)]))
+        );
+        assert!(parse_marker(&args).is_none());
+        let words = |w: &[&str]| -> Option<(u64, Ranges)> {
+            let w: Vec<&[u8]> = w.iter().map(|s| s.as_bytes()).collect();
+            parse_taken(&w)
+        };
+        assert_eq!(
+            words(&["KIVIDB.IMPORTS", "TAKEN", "7", "-"]),
+            Some((7, vec![]))
+        );
+        assert_eq!(words(&["KIVIDB.IMPORTS", "TAKEN", "7"]), None);
+        assert_eq!(words(&["KIVIDB.IMPORTS", "TAKEN", "x", "0-1"]), None);
+        assert_eq!(words(&["KIVIDB.IMPORTS", "TAKEN", "7", "5-1"]), None);
+        assert_eq!(words(&["KIVIDB.IMPORTS", "TAKEN", "7", "0-16384"]), None);
+        assert_eq!(words(&["KIVIDB.IMPORTS", "LIVE", "7", "0-1"]), None);
     }
 
     #[test]

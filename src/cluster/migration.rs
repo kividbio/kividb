@@ -3466,15 +3466,27 @@ fn take_over_now(cluster: &ClusterState, task_id: &str, client_id: u64) -> Resul
     }
     // The source keeps client writes paused until it knows how this ends.
     let started = Instant::now();
+    // What arrived is in the AOF as a write acknowledged here would be (in
+    // the file, and synced under `appendfsync always`) before the source is
+    // told: it deletes its copy then, and nothing waits for these records
+    // otherwise.
+    off_the_runtime(crate::aof::written_blocking);
     // Saved before the source is told: it deletes its copy when told, and a
     // restart of this node with the slots not in its config would delete
     // this one (#108). Not saved, not taken over: the slots stay with the
     // source, which keeps serving them. They are taken only once saved, so
     // there is nothing to give back: no write was served to them here, and
-    // no claim of them went out (#337).
-    if let Err(e) =
-        super::persist::with_deferred_sync(|| cluster.take_over_slots(slots_of(&task.ranges)))
-    {
+    // no claim of them went out (#337). Under `appendfsync always` the save
+    // is synced before the slots are taken: a write to them acknowledged
+    // here is on disk, and so is this node's claim of them. Otherwise the
+    // sync follows on another thread.
+    let take = || cluster.take_over_slots(slots_of(&task.ranges));
+    let taken = if crate::aof::syncs_before_acks() {
+        off_the_runtime(take)
+    } else {
+        super::persist::with_deferred_sync(take)
+    };
+    if let Err(e) = taken {
         cluster.slot_migrations.takeover_undone(task_id);
         log_warn!(
             "Cluster: Could not save the cluster config while taking over slots {} ({e}); \

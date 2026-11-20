@@ -669,6 +669,23 @@ impl ReplState {
         }
     }
 
+    /// Master side: this node's claim of its slots, as a
+    /// [`SLOT_IMPORTS_MARKER`] (`TAKEN`), for the replicas that take the
+    /// markers: at once, to those attached, in its place among the writes,
+    /// and to each that attaches from now on, ahead of what it is sent. Sent
+    /// as this node takes slots over, before any write to them is served
+    /// here: a replica that has applied a write to them has the claim too.
+    pub fn send_slot_claims(&self, marker: Vec<u8>) {
+        if !self.sends_slot_imports.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(hub) = self.hub.get().and_then(|w| w.upgrade()) {
+            let _ = hub.send(HubMsg::SlotClaims {
+                marker: Arc::from(marker),
+            });
+        }
+    }
+
     /// The node whose stream this replica's dataset is from, if known.
     pub fn stream_origin(&self) -> Option<String> {
         self.stream_origin.read().clone()
@@ -2311,6 +2328,13 @@ pub enum HubMsg {
         live: ReplPayload,
         sync: ReplPayload,
     },
+    /// This master's claim of its slots changed (it took slots over):
+    /// `marker` goes to each replica that takes [`SLOT_IMPORTS_MARKER`]s,
+    /// here among the writes, and is kept for each that attaches from now
+    /// on, after the imports. Not in the backlog, nor counted in any offset.
+    SlotClaims {
+        marker: ReplPayload,
+    },
 }
 
 /// What a replica answers a node that asks to replicate from it: KiviDB does
@@ -3519,6 +3543,8 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
         // What a replica that takes them is told of this master's slot
         // imports as it attaches (#741): the last `SYNC` form.
         let mut slot_imports_sync: Option<ReplPayload> = None;
+        // And of the slots this master took over: the last `TAKEN` marker.
+        let mut slot_claims_sync: Option<ReplPayload> = None;
         // Queues of replicas let go of for falling too far behind, until
         // their forwarders have let go of what is in them (see
         // `ReplicaQueue::abandon`): memory still held for a replica.
@@ -3782,11 +3808,13 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         // those that ended meanwhile goes, and those begun
                         // meanwhile it did not see begin.
                         let told = !registration.slot_imports
-                            || queue_marker(
+                            || (queue_marker(
                                 &registration.tx,
                                 &registration.pending_bytes,
                                 slot_imports_sync.get_or_insert_with(no_slot_imports),
-                            );
+                            ) && slot_claims_sync.as_ref().is_none_or(|claims| {
+                                queue_marker(&registration.tx, &registration.pending_bytes, claims)
+                            }));
                         let delivered = told
                             && (missed.is_empty() || {
                                 registration.pending_bytes.add(missed.len());
@@ -3946,11 +3974,13 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     // The imports under way as the dataset it is sent has
                     // them, ahead of the writes that follow it (#741).
                     if slot_imports
-                        && !queue_marker(
+                        && !(queue_marker(
                             &tx,
                             &pending_bytes,
                             slot_imports_sync.get_or_insert_with(no_slot_imports),
-                        )
+                        ) && slot_claims_sync
+                            .as_ref()
+                            .is_none_or(|claims| queue_marker(&tx, &pending_bytes, claims)))
                     {
                         forget_replica(&state, replica_id);
                         continue;
@@ -3983,6 +4013,19 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         forget_replica(&state, replica.id);
                         false
                     });
+                }
+
+                HubMsg::SlotClaims { marker } => {
+                    channel_replicas.retain(|replica| {
+                        if !replica.slot_imports
+                            || queue_marker(&replica.tx, &replica.pending_bytes, &marker)
+                        {
+                            return true;
+                        }
+                        forget_replica(&state, replica.id);
+                        false
+                    });
+                    slot_claims_sync = Some(marker);
                 }
 
                 HubMsg::Propagate(payload) => {
