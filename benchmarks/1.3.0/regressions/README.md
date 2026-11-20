@@ -20,7 +20,7 @@ and why.
 | `01-scan-match` | #751 / #769 | full `SCAN` iterations over 2,002,000 keys (`MATCH schedule:*`, no `MATCH`, `*:1*`, `COUNT 10000`), `KEYS schedule:*`; `HSCAN`/`SSCAN`/`ZSCAN` of 200k-element collections as guard rows for #770 |
 | `02-growth-ping` | #752 / #780 | worst `PING` while 8M keys are loaded in 2,000-`SET` pipelines; Tokio, and io_uring with `--threads 1`; `FULL=1` adds 17.5M keys with `EX` |
 | `03-give-back` | #753 / #763 | RSS 1.5, 5 and 15 s after deleting a 3M-field hash, `HDEL` of 1M fields, and a mixed churn |
-| `04-long-commands` | #754 / #757 | `KEYS` over 2M keys, `SCAN COUNT 2000000`, `DEL` of a 3M-field hash, each with 4 `PING` probes; Tokio and io_uring |
+| `04-long-commands` | #754 / #757, #762 | `KEYS` over 2M keys, `SCAN COUNT 2000000`, `DEL` of a 3M-field hash, each with 4 `PING` probes; Tokio and io_uring (`--threads 2`), and io_uring with one ring (`uring1`, `--threads 1`: every probe on the command's thread), which also runs `DEL` of the hash and another key (the command gate held alone) and `HGETALL` of a 1M-field hash, with `GET` and `SET` probes on random keys beside the `PING`s |
 | `05-stream-memory` | #639 / #683 (#713) | `used_memory` per stream entry: 1M one-field entries (and RSS), 200k entries of five shared fields, five unique fields, one 200-byte value; `XADD`/`XRANGE` rates as cost guards |
 | `06-stream-consumers` | #637 / #736 | 200k pending over 50 consumers: `XINFO CONSUMERS`, `XPENDING` summary and per consumer, `XREADGROUP` history; `XADD` rate while `XINFO CONSUMERS` is polled every 50 ms; bytes per pending entry |
 | `07-save-ping` | #605 / #696 | worst `PING` during a `SAVE` of 1.5M keys, Tokio `--threads 1` |
@@ -35,7 +35,7 @@ and why.
 | `16-random-sample` | #839 | `ZRANDMEMBER` / `HRANDFIELD` of a sorted set / hash of 100, 10,000 and 1,000,000 members, with no count, 1, 10, -1, -10, `WITHSCORES` / `WITHVALUES`: microseconds a call (mean of 150-3,000 calls, median of 3 rounds) and the replies checked (length, distinct for a positive count) |
 | `17-set-memory` | #297 (step 1), #764 (step 2) | `used_memory` per set member, 1,000,000 members in sets of 10, 100, 1,000 and 100,000, and one set each of 1M, 3M, 3,211,264 and 3,211,265 members (either side of a doubling of the table): 14-byte strings (`membr:<i>`) and integers (`0`..`n-1`); `OBJECT ENCODING` of each size recorded exactly |
 | `18-mastodon-feed-fanout` | #849 | Mastodon's home-feed fan-out (FeedManager mix: `ZADD`, `ZREMRANGEBYRANK 0 -801`, `ZREVRANGE 40 40 WITHSCORES`, `ZSCORE`, `EXISTS`, `ZREVRANGEBYSCORE ... LIMIT 0 20`, `ZRANGEBYSCORE`) over 20,000 feeds of 800 members with memtier_benchmark at 200 and 500 connections: ops/s and the timeline read's p50 against Redis and v1.2.2, p99 shown beside them; the same mix paced at 200k requests a second, its read p50 against v1.2.2; `used_memory` and bytes per member; recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-18)) |
-| `19-hash-memory` | collection storage step 2 | `used_memory` per hash field, 1,000,000 fields in hashes of 10, 100, 1,000 and 100,000: 14-byte fields (`field:<i>`) with 32-byte values, plain and with one field TTL a hash; `OBJECT ENCODING` of each size recorded exactly (`listpack`, `listpackex`, `hashtable`); the tables (1,000 and 100,000) as guard rows |
+| `19-hash-memory` | collection storage step 2, #764 (step 3) | `used_memory` per hash field, 1,000,000 fields in hashes of 10, 100, 1,000 and 100,000, and one hash each of 3M, 3,211,264 and 3,211,265 fields (either side of a doubling of the table): 14-byte fields (`field:<i>`) with 32-byte values, plain and with one field TTL a hash; `OBJECT ENCODING` of each size recorded exactly (`listpack`, `listpackex`, `hashtable`); recorded on a D8s_v5 (`results/s19-branch-d8s_v5`) |
 | `20-envoy-ratelimit` | #849 | envoyproxy/ratelimit's pipelined `INCRBY` + `EXPIRE` pair on one key (memtier_benchmark, `--pipeline 2 --transaction`, 100,000 keys) at 200 and 500 connections: ops/s against Redis, p99 shown beside it, and keys left without a TTL (must be 0); on Linux the server and the client are pinned to separate halves of the CPUs; recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-20)) |
 | `21-list-memory` | #297 (step 3) | `used_memory` per list element, 1,000,000 32-byte elements in lists of 10, 100, 1,000 and 100,000, packed in chunks; the same made plain (an element over 1,024 bytes pushed and popped first) as guard rows; the same sizes with 6-byte elements (job ids); one list of short elements as a queue leaves it: BullMQ's wait list (ids 1 to 200,000 pushed one `LPUSH` at a time), 200,000 ids after ten full rotations (`LPUSH` one, `RPOP` one), and 1,000,000 drained to 100,000 three times, with `MEMORY USAGE` over the growth of `used_memory` beside each (info); `OBJECT ENCODING` of each size recorded exactly |
 | `22-scan-large-count` | #884 | Argo CD's `SCAN <cursor> MATCH revoked-token\|* COUNT 10000` over 40,000 keys of 50 KB that it never matches (`--threads 4`): microseconds a call, client side and the server's own (`INFO commandstats`), calls and keys returned (exactly 0) for a full iteration, and the p99 of four `PING` probes while four other connections loop the same `SCAN` |
@@ -56,6 +56,7 @@ and why.
 | `37-zrandmember-by-count` | #862 | `ZRANDMEMBER` of a large sorted set (a table and a tree) of 1,000, 100,000 and 1,000,000 members: no count, 1, 10, 1000, -10, -1000, each count with and without `WITHSCORES`; the server's own microseconds a call (`INFO commandstats`, reset before each case) and the client's wall time, median of 3 rounds; replies checked (length, distinct for a positive count). Gates: server time 100 % or 3 us (the same build measured 66 and 110 us on two D4s_v5s), and at 100,000 and 1,000,000 at most 3x Redis for counts of ±10 and ±1000; wall time 50 % or 20 us, and at 100,000 and 1,000,000 60 % of the gain over v1.2.2. See [the run](#recorded-run-suite-37) |
 | `39-bgsave-strings` | #849 | `BGSAVE` while two clients overwrite random keys as fast as they can (kividb.io/blog/redis-bgsave-memory-fork, getsentry/self-hosted#4619): the peak memory from `BGSAVE` to its end (`Pss` summed over the server and the processes it forked, every 50 ms), the memory before, how long the save took and how many writes got through; `small64` is 10,000,000 keys of 64-byte values (about 1 GiB; the published test, 6 million, at the issue's size) and `mixed` is the issue's ~1 GiB of 100 B to 8 KB values. Gates, `small64`: peak at most 0.6x Redis's in the same session, at most 1,536 MiB (the stand-in for "completes in a 1.5 GiB container where Redis fails"; no container is started) and within 15 % of recorded; `mixed`: at most 1.3x Redis's (see [the run](#recorded-run-suite-39-and-40)); the save must succeed. Server on the first half of the CPUs, writers on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` |
 | `40-wp-object-cache` | #849 | a WordPress-shaped object cache (kividb.io/blog/wordpress-redis-object-cache-slow-under-load-how-to-speed-it-up): 1,000,000 string keys of 512 (`d512`) or 2,048 (`d2048`) bytes, `redis-benchmark -c 100 -d D -r 1000000 -t get` and `-t set` with `--threads 4`: requests a second, p50 and p99 against Redis, and the server's RSS and `used_memory` once loaded. Gates: `GET` at 2 KB at least 1.3x Redis in the same session, RSS at most 1.0x Redis's at both sizes, every rate within 10 % of recorded; server on the first half of the CPUs, client on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-39-and-40)) |
+| `41-ft-hnsw-vs-redis` | #760 | #760's own cases against Redis's query engine in the same session: 50,000 384-d (`d384`) and 200,000 64-d (`d64`) random documents (`score` NUMERIC, HNSW `COSINE M 16 EF_CONSTRUCTION 200`) written by one client in `HSET` pipelines of 1,000, documents a second until all are in the graph; then one client, 5 s a case, `KNN 10`: no filter, `@score:[50 100]` (half) and `@score:[0 2]` (3 %) at the default `EF_RUNTIME`, no filter at 50, 100 and 200 and the wide filter at 50 and 100: q/s and recall@10 against exact; `d64` also KNN p99 beside 500 `HSET`s a second; peak RSS. The candidate as it starts on 8 CPUs (`--threads 4`, `search-index-threads auto`: 3 helpers). Gates: 10 % (rates), 2 % (recall), 5 % (RSS); and against Redis this session: build at most 1.6x (`d384`) / 2.0x (`d64`) slower, the rows at the same `EF_RUNTIME` at most 1.1x (no filter) / 1.2x (wide) slower with recall at least Redis's, the narrow filter faster than Redis, the default rows at most 2.2x (no filter) / 1.8x (wide) slower (a KiviDB KNN looks at no fewer than 50 candidates, Redis's default at 10), peak RSS at most Redis's. Needs `REGRESS_REDISEARCH_SO` (as `28`); `min_cpus=8`, recorded on a D8s_v5 (`results/pr-760-d8s_v5`) |
 
 ## Running it
 
@@ -253,6 +254,7 @@ was re-recorded for it:
 | `01`-`06`, `08`-`12`, `14`-`17`, `19` (every configuration that had none) | 2 | recorded before #903 (commits `2468f226`, `d66f0f93`, `9501caa6`, `219b9656`, `f767a149`, `9c466db3`, `8160700c`, `5b4a04a4`, `c7e0b47e`, `36771af1`: none contains it), where the default on 4 vCPUs was 2 (the servers' logs in `raw.tar.gz` say `Worker threads : 2`) |
 | `24-snapshot-size`, `31-zset-memory` | 4 | recorded on branches that had merged #903: the candidate's logs say `Worker threads : 4 (auto: one per available CPU)`. v1.2.2 ran with its default of 2 there and runs with 4 now: `24`'s v1.2.2 values are only used by its same-session `vs_v1_2_2` gates on the `SAVE`/load time, and `31` gates memory |
 | `02 uring1`, `07`, `13` | 1 | as before |
+| `04 uring1` | 1 | one ring, so every probe is on the long command's thread (#762) |
 | `22` | 4 | as before |
 | `23`, `25`, `27` | 2 | as before |
 | `18-mastodon-feed-fanout` | 8 | recorded on a `Standard_D8s_v5` (`min_cpus=8`) with the default of the day: the candidate's log says `Worker threads : 8 (auto: one per available CPU)` |
@@ -692,6 +694,40 @@ against 141.8 on io_uring (0.61x), `keys_schedule_ms` 53.7 ms (recorded
 the same build before the gate was added gave 90.0/87.9 ms (0.61x/0.61x)
 and 97.5/94.3 ms (0.72x/0.67x, before the comparison was inlined). The probes' extra 10 ms on master is the PINGs being served
 meanwhile, which is #757's point: v1.2.2 served none.
+
+### #762: io_uring, the long command's own thread
+
+Suite 04 re-recorded on a `Standard_D8s_v5` (`results/pr-762-d8s_v5-r2`,
+rustc 1.100.0, all three engines, `ALLOW_VM_CHANGE=1`; checked again by
+`results/pr-762-d8s_v5-r2-verify`, verdict ok). It adds the configuration
+`uring1` (one ring: every probe on the command's thread), with `del_multi`
+(`DEL big user:1`, which takes the command gate alone), `hgetall`
+(`HGETALL` of a 1M-field hash) and, beside the 4 `PING` probes, 4 `GET` and
+4 `SET` probes on random keys of the 2M. The worst-PING rows of `uring` are
+gated as Tokio's are (at most 20 ms). Worst request while the command ran,
+median of 3 runs, `PING` / `GET` / `SET`:
+
+| `uring1` | master `f4806977` (`results/master-f4806977-d8s_v5-04`) | #762 | v1.2.2 (`PING`) |
+|---|---:|---:|---:|
+| `KEYS user:99*` over 2M keys | 74.1 / 74.2 / 74.3 ms | 1.1 / 1.1 / 1.1 ms | 131.1 ms |
+| `SCAN ... COUNT 2000000` | 49.6 / 49.7 / 49.6 ms | 0.6 / 0.7 / 0.7 ms | 271.1 ms |
+| `DEL` of a 3M-field hash | 126.5 / 126.7 / 126.7 ms | 0.1 / 0.3 / 0.2 ms | 127.3 ms |
+| `DEL` of the hash and another key | 126.1 / 126.3 / 126.1 ms | 0.07 / 0.08 / 0.10 ms | 127.5 ms |
+| `HGETALL` of 1M fields | 39.0 / 39.0 / 39.0 ms | 8.3 / 8.3 / 8.3 ms (max 10.4) | 61.5 ms |
+
+What is moved to the pool is the work, not its locks. The run of `HGETALL`
+holds its key's shard for reading while it builds the reply, so a `SET` to a
+key of that shard (one of 64 on 8 CPUs) waits for it, and holds up its ring
+thread; the thread also handles the 1M-field reply itself. The two were not
+told apart: the result is 6-10 ms behind an `HGETALL` of 1M fields, against
+39 ms on master. In the recording run, 4 `SET`s of about 8,000 took over
+10 ms in one run, none in the other two (`hgetall_set_over_10ms`); p99.9 of
+the probes over the whole command was 1-3.5 ms. A command that takes the
+command gate alone waits for a `KEYS` or `SCAN` run on the pool in the same
+way (not probed here). The commands take as long as before (`KEYS` 92 ms,
+`SCAN` 66 ms, `DEL` 132-150 ms on `uring1`, with the 12 probes beside them).
+The master run is `--engines candidate` and fails the new gates, as it
+should.
 
 ## Recorded run, suites 05-13
 

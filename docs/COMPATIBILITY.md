@@ -171,11 +171,25 @@ other files:
 - A lowered limit applies to a hash at its next write that sets a field
   (`HSET` and the like); `HDEL` and field expiry never move a hash, as in
   Redis.
-- `HGETALL`, `HKEYS`, `HVALS`, `HSCAN` and `HRANDFIELD` give a hash's fields
-  in the order they were first set, field TTLs or not. Redis keeps a
-  `listpackex` in the order of its deadlines, the fields with one first,
-  soonest first; so once a field of a small hash has a TTL the two orders
-  differ. They agree for a `listpack`.
+- `HGETALL`, `HKEYS`, `HVALS`, `HSCAN` and `HRANDFIELD` give the fields of a
+  `listpack` or a `listpackex` in the order they were first set, field TTLs
+  or not. Redis keeps a `listpackex` in the order of its deadlines, the
+  fields with one first, soonest first; so once a field of a small hash has
+  a TTL the two orders differ. They agree for a `listpack`.
+- A `hashtable` gives its fields in no particular order, as in Redis, and
+  the order is not the one 1.2.x gave (which kept the order fields were
+  first set in, also for a hash that was a `hashtable` only because of one
+  long value).
+- `HSCAN` of a `hashtable` reads a page at a time, `COUNT` being a hint as
+  in Redis: a page can be shorter than `COUNT`, or empty, before the cursor
+  comes back 0. Every field there for the whole scan is returned at least
+  once, except in one case no ordinary data reaches: if a run of fields
+  that all hash alike makes the table rehash its fields with a new seed
+  while a scan is in progress, that scan may miss fields (it still ends). A
+  field whose TTL is due is left out of a page where readers do not see it.
+  A scan begun on 1.2.x or earlier and continued after an upgrade (or a
+  cursor from another server) still ends without an error, but may miss or
+  repeat fields: begin it again.
 
 **Sorted sets**
 - Small sorted sets are kept as Redis keeps them, and `OBJECT ENCODING`

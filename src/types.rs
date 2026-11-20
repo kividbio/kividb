@@ -667,7 +667,7 @@ impl Default for TsInner {
 //
 // Expiry: `field_expiry::expire_due` is the one place a field past its
 //   deadline is removed, and its removal propagated.
-pub use crate::hash_fields::{HASH_ORDERED_FIELDS, HashFields};
+pub use crate::hash_fields::HashFields;
 
 /// A hash field's deadline: milliseconds since the Unix epoch, by the wall
 /// clock, as Redis keeps it and as every file, payload and stream carries it.
@@ -940,8 +940,14 @@ impl HashInner {
     /// is shown of a hash whose due fields are left in place.
     #[cold]
     pub fn live_fields(&self, now: FieldDeadline) -> HashFields {
-        // Room for them all: a table is made a table at once.
-        let mut live = HashFields::with_capacity(self.fields.len());
+        // Room for those that stay, and no more: a table is made a table
+        // at once, and not with room for fields it will not hold.
+        let due = self
+            .expiries
+            .values()
+            .filter(|at| field_due(**at, now))
+            .count();
+        let mut live = HashFields::with_capacity(self.fields.len().saturating_sub(due));
         for (field, value) in self.fields.iter() {
             if self
                 .expiries
@@ -1411,7 +1417,11 @@ impl KiviDBValue {
             // The bytes of a string are never changed in place.
             KiviDBValue::String(bytes) => KiviDBValue::String(bytes.clone()),
             KiviDBValue::List(list) => KiviDBValue::List(fresh(list)),
-            KiviDBValue::Hash(hash) => KiviDBValue::Hash(fresh(hash)),
+            // Through `hash_fields::shared`, as every hash made whole: a
+            // copy's table is handed to the background if it needs it.
+            KiviDBValue::Hash(hash) => {
+                KiviDBValue::Hash(crate::hash_fields::shared(hash.read().clone()))
+            }
             KiviDBValue::Json(json) => KiviDBValue::Json(fresh(json)),
             // Through `member_set::shared`, as every set made whole: a
             // copy's table is handed to the background if it needs it.
@@ -1424,10 +1434,10 @@ impl KiviDBValue {
             KiviDBValue::TimeSeries(series) => KiviDBValue::TimeSeries(fresh(series)),
             KiviDBValue::HashEx(hash) => {
                 let hash = hash.read();
-                KiviDBValue::HashEx(Arc::new(RwLock::new(HashInner {
+                KiviDBValue::HashEx(crate::hash_fields::shared_ex(HashInner {
                     fields: hash.fields.clone(),
                     expiries: hash.expiries.clone(),
-                })))
+                }))
             }
             KiviDBValue::Array(array) => KiviDBValue::Array(fresh(array)),
             // A filter of its own whose layers share their bytes with the

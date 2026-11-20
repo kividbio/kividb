@@ -325,6 +325,8 @@ fn expire_ordered(
         for field in &fields {
             inner.evict_field(field);
         }
+        // A shrink the removals start is the background's to finish.
+        crate::hash_fields::after_write_ex(&hash, &mut inner);
         let next = inner.expiries.values().min().copied();
         let emptied = !fields.is_empty() && inner.fields.is_empty();
         drop(inner);

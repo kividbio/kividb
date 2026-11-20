@@ -153,11 +153,13 @@ score never moves a sorted set); a collection never moves back to a block.
 
 A set past those limits (`OBJECT ENCODING` `hashtable`) is a table of its own: a member of up
 to seven bytes (any integer of up to seven digits) lives in the table's slot, and any other is
-one block of a pool of slabs kept for collections. The table grows and shrinks a few members
+one block of a pool of slabs kept for collections. A hash past its limits is the same kind of
+table, each field and its value side by side in one block of that pool (a value too long for
+the pool's largest block in a block of the system allocator). The table grows and shrinks a few members
 at a time with each write, and a resize that the writes leave part-way is finished in the
 background, so no write pays for moving every member at once. Active defrag does not move a
-set's members: their slabs are not among those it empties, and each slab goes back to the
-system as soon as its last member is removed. `INFO memory` reports those slabs as
+set's members or a hash's fields: their slabs are not among those it empties, and each slab goes back to the
+system as soon as its last member or field is removed. `INFO memory` reports those slabs as
 `value_slab_pool_bytes`, apart from `value_slab_bytes` (the keyspace's slabs, which defrag
 compacts).
 

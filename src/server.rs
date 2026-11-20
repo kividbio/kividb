@@ -1796,48 +1796,57 @@ where
                         tracking_table: &tracking_table,
                         blocking: Some(blocking_slot.prime()),
                     });
-                    if let Some(wait) = blocking_slot.take_parked() {
+                    if let Some(mut wait) = blocking_slot.take_parked() {
+                        // Before its reply: what its client is told of what it did
+                        // before it parked, or stopped to be run again.
+                        crate::tracking::put_what_came_before(&mut combined);
                         if crate::aof::take_wait(&mut aof_wait, &mut aof_refused_from) {
                             crate::aof::written(&aof_tx).await;
                         }
-                        let limit = HardLimit::new(
-                            pubsub.limits(),
-                            subscriptions.is_some(),
-                            combined.len() + carried.len() - carried_from + unpresented,
-                            client_id,
-                        );
-                        // Boxed, and so polled out of line: the wait is cold, and the
-                        // connection's own future stays the size it is without it.
-                        match Box::pin(park_blocking(
-                            wait,
-                            &mut blocking_slot,
-                            &writer,
-                            &mut combined,
-                            subscriptions.as_ref(),
-                            &mut Waiter {
-                                reader: &mut reader,
-                                carried: &mut carried,
-                                carried_from,
-                                held_elsewhere: buffer_len - (parse_offset + consumed),
-                                kill_rx: &mut kill_rx,
-                                client_registry: &client_registry,
+                        // Values the command left to free before its reply: freed
+                        // here, out of its gates, as long work (#762).
+                        if let Some(offload) = wait.take_offload() {
+                            crate::deferred::finish_on_tokio(offload, &mut response);
+                        } else {
+                            let limit = HardLimit::new(
+                                pubsub.limits(),
+                                subscriptions.is_some(),
+                                combined.len() + carried.len() - carried_from + unpresented,
                                 client_id,
-                                interrupted: &mut interrupted,
-                                activity: &activity,
-                                socket_fd,
-                                repl_state: &repl_state,
-                            },
-                            limit,
-                        ))
-                        .await
-                        {
-                            // `parse_offset` deliberately not advanced: the same
-                            // command is re-dispatched, now carrying the delivery.
-                            Ok(()) => {
-                                due |= crate::output_limits::REDISPATCH;
-                                continue;
+                            );
+                            // Boxed, and so polled out of line: the wait is cold, and the
+                            // connection's own future stays the size it is without it.
+                            match Box::pin(park_blocking(
+                                wait,
+                                &mut blocking_slot,
+                                &writer,
+                                &mut combined,
+                                subscriptions.as_ref(),
+                                &mut Waiter {
+                                    reader: &mut reader,
+                                    carried: &mut carried,
+                                    carried_from,
+                                    held_elsewhere: buffer_len - (parse_offset + consumed),
+                                    kill_rx: &mut kill_rx,
+                                    client_registry: &client_registry,
+                                    client_id,
+                                    interrupted: &mut interrupted,
+                                    activity: &activity,
+                                    socket_fd,
+                                    repl_state: &repl_state,
+                                },
+                                limit,
+                            ))
+                            .await
+                            {
+                                // `parse_offset` deliberately not advanced: the same
+                                // command is re-dispatched, now carrying the delivery.
+                                Ok(()) => {
+                                    due |= crate::output_limits::REDISPATCH;
+                                    continue;
+                                }
+                                Err(reply) => response = reply,
                             }
-                            Err(reply) => response = reply,
                         }
                     }
 
@@ -1902,48 +1911,57 @@ where
                     tracking_table: &tracking_table,
                     blocking: Some(blocking_slot.prime()),
                 });
-                if let Some(wait) = blocking_slot.take_parked() {
+                if let Some(mut wait) = blocking_slot.take_parked() {
+                    // Before its reply: what its client is told of what it did
+                    // before it parked, or stopped to be run again.
+                    crate::tracking::put_what_came_before(&mut combined);
                     waited_from = Some(now_us());
                     if crate::aof::take_wait(&mut aof_wait, &mut aof_refused_from) {
                         crate::aof::written(&aof_tx).await;
                     }
-                    let limit = HardLimit::new(
-                        pubsub.limits(),
-                        subscriptions.is_some(),
-                        combined.len() + carried.len() - carried_from + unpresented,
-                        client_id,
-                    );
-                    // Boxed, and so polled out of line: the wait is cold, and the
-                    // connection's own future stays the size it is without it.
-                    match Box::pin(park_blocking(
-                        wait,
-                        &mut blocking_slot,
-                        &writer,
-                        &mut combined,
-                        subscriptions.as_ref(),
-                        &mut Waiter {
-                            reader: &mut reader,
-                            carried: &mut carried,
-                            carried_from,
-                            held_elsewhere: buffer_len - (parse_offset + consumed),
-                            kill_rx: &mut kill_rx,
-                            client_registry: &client_registry,
+                    // Values the command left to free before its reply: freed
+                    // here, out of its gates, as long work (#762).
+                    if let Some(offload) = wait.take_offload() {
+                        crate::deferred::finish_on_tokio(offload, &mut response);
+                    } else {
+                        let limit = HardLimit::new(
+                            pubsub.limits(),
+                            subscriptions.is_some(),
+                            combined.len() + carried.len() - carried_from + unpresented,
                             client_id,
-                            interrupted: &mut interrupted,
-                            activity: &activity,
-                            socket_fd,
-                            repl_state: &repl_state,
-                        },
-                        limit,
-                    ))
-                    .await
-                    {
-                        // See the note at the non-slowlog site above.
-                        Ok(()) => {
-                            due |= crate::output_limits::REDISPATCH;
-                            continue;
+                        );
+                        // Boxed, and so polled out of line: the wait is cold, and the
+                        // connection's own future stays the size it is without it.
+                        match Box::pin(park_blocking(
+                            wait,
+                            &mut blocking_slot,
+                            &writer,
+                            &mut combined,
+                            subscriptions.as_ref(),
+                            &mut Waiter {
+                                reader: &mut reader,
+                                carried: &mut carried,
+                                carried_from,
+                                held_elsewhere: buffer_len - (parse_offset + consumed),
+                                kill_rx: &mut kill_rx,
+                                client_registry: &client_registry,
+                                client_id,
+                                interrupted: &mut interrupted,
+                                activity: &activity,
+                                socket_fd,
+                                repl_state: &repl_state,
+                            },
+                            limit,
+                        ))
+                        .await
+                        {
+                            // See the note at the non-slowlog site above.
+                            Ok(()) => {
+                                due |= crate::output_limits::REDISPATCH;
+                                continue;
+                            }
+                            Err(reply) => response = reply,
                         }
-                        Err(reply) => response = reply,
                     }
                 }
 

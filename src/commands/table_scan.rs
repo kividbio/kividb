@@ -1,9 +1,10 @@
 //! `HSCAN` and `SSCAN` over a hash or set held as a [`CollectionTable`]
 //! (#770, step 4 of the design on #764).
 //!
-//! The packed forms are still returned whole, and the current large forms
-//! still go through `helpers::scan_page`, which reads the whole collection
-//! on every call to find one page. A table gives the cursor itself
+//! The packed forms are still returned whole, as Redis returns a listpack
+//! or an intset; before the large forms were tables they went through
+//! `helpers::scan_page`, which read the whole collection on every call to
+//! find one page. A table gives the cursor itself
 //! ([`CollectionTable::scan`]): a page reads its own groups and no others,
 //! and a resize between two calls misses nothing (a growth repeats nothing
 //! either; a shrink may repeat). So there is no `len / 1024` page floor
@@ -19,17 +20,13 @@
 //!   from another server, is still accepted and goes on from that position,
 //!   but without the guarantee, as a cursor from another Redis would. One
 //!   past 48 bits ends the scan;
-//! - a hash field whose TTL is due is skipped where readers do not see it
-//!   (`hide_due_at`), from the TTL in its entry: the hash is not copied.
+//! - a hash field that readers do not see (one whose TTL is due, where due
+//!   fields are hidden) is skipped by the caller's `hidden`: the hash is
+//!   not copied, so the cursor stays the table's own.
 
-// `SSCAN` calls `sscan_reply` (sets are on the table: #764 step 2); the
-// hash side waits for hashes to move onto it (step 3).
-#![allow(dead_code)]
-
-use crate::collection_table::{CollectionTable, Fields, Members, Memory};
+use crate::collection_table::{CollectionTable, FieldRef, Fields, Members, Memory};
 use crate::commands::glob_redis::Glob;
 use crate::resp::write::{resp_array, resp_bulk, resp_bulk_str};
-use crate::types::{FieldDeadline, field_due};
 
 /// The `SSCAN` reply for a set held as a table: the next cursor, then the
 /// members of the page that match `pattern`.
@@ -48,17 +45,18 @@ pub fn sscan_reply<A: Memory>(
 
 /// The `HSCAN` reply for a hash held as a table: the next cursor, then the
 /// fields of the page that match `pattern`, each followed by its value
-/// unless `no_values`. A field due at `hide_due_at` is left out.
+/// unless `no_values`. A field `hidden` says readers do not see is left
+/// out.
 pub fn hscan_reply<A: Memory>(
     hash: &CollectionTable<Fields, A>,
     cursor: u64,
     count: usize,
     pattern: Option<&Glob>,
     no_values: bool,
-    hide_due_at: Option<FieldDeadline>,
+    hidden: impl Fn(&FieldRef<'_>) -> bool,
 ) -> Vec<u8> {
     let mut items = Vec::new();
-    let next = scan_fields(hash, cursor, count, pattern, hide_due_at, |field, value| {
+    let next = scan_fields(hash, cursor, count, pattern, hidden, |field, value| {
         items.push(resp_bulk(field));
         if !no_values {
             items.push(resp_bulk(value));
@@ -89,19 +87,18 @@ fn scan_members<A: Memory>(
 }
 
 /// One page of `hash` from `cursor`: `out` is given each field that matches
-/// `pattern` and is not due at `hide_due_at`, with its value; returns the
-/// next cursor, 0 when the scan is over.
+/// `pattern` and is not `hidden`, with its value; returns the next cursor,
+/// 0 when the scan is over.
 fn scan_fields<A: Memory>(
     hash: &CollectionTable<Fields, A>,
     cursor: u64,
     count: usize,
     pattern: Option<&Glob>,
-    hide_due_at: Option<FieldDeadline>,
+    hidden: impl Fn(&FieldRef<'_>) -> bool,
     mut out: impl FnMut(&[u8], &[u8]),
 ) -> u64 {
     hash.scan(cursor, count, |entry| {
-        let due = hide_due_at.is_some_and(|now| entry.ttl.is_some_and(|at| field_due(at, now)));
-        if !due && pattern.is_none_or(|glob| glob.matches(entry.field)) {
+        if !hidden(&entry) && pattern.is_none_or(|glob| glob.matches(entry.field)) {
             out(entry.field, entry.value);
         }
     })
@@ -112,7 +109,14 @@ fn scan_fields<A: Memory>(
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::types::{FieldDeadline, field_due};
     use std::collections::{HashMap, HashSet};
+
+    /// Hidden as a reader that hides due fields would: by the deadline in
+    /// the entry, at `now`.
+    fn due_at(now: Option<FieldDeadline>) -> impl Fn(&FieldRef<'_>) -> bool {
+        move |entry| now.is_some_and(|now| entry.ttl.is_some_and(|at| field_due(at, now)))
+    }
 
     type Set = CollectionTable<Members>;
     type Hash = CollectionTable<Fields>;
@@ -303,7 +307,7 @@ mod tests {
     ) -> HashMap<Vec<u8>, Vec<u8>> {
         let (mut seen, mut cursor) = (HashMap::new(), 0);
         loop {
-            cursor = scan_fields(hash, cursor, 10, None, hide_due_at, |f, v| {
+            cursor = scan_fields(hash, cursor, 10, None, due_at(hide_due_at), |f, v| {
                 assert!(seen.insert(f.to_vec(), v.to_vec()).is_none());
             });
             if cursor == 0 {
@@ -340,16 +344,16 @@ mod tests {
         let mut hash = Hash::new();
         hash.insert(b"f", b"v", None).unwrap();
         assert_eq!(
-            hscan_reply(&hash, 0, 10, None, false, None),
+            hscan_reply(&hash, 0, 10, None, false, |_| false),
             b"*2\r\n$1\r\n0\r\n*2\r\n$1\r\nf\r\n$1\r\nv\r\n"
         );
         assert_eq!(
-            hscan_reply(&hash, 0, 10, None, true, None),
+            hscan_reply(&hash, 0, 10, None, true, |_| false),
             b"*2\r\n$1\r\n0\r\n*1\r\n$1\r\nf\r\n"
         );
         let glob = Glob::new(b"x*");
         assert_eq!(
-            hscan_reply(&hash, 0, 10, Some(&glob), false, None),
+            hscan_reply(&hash, 0, 10, Some(&glob), false, |_| false),
             b"*2\r\n$1\r\n0\r\n*0\r\n"
         );
     }

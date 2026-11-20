@@ -386,6 +386,16 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
                     let stop = stop as usize;
                     let count = stop - start + 1;
+                    // Millions of elements, on an io_uring worker: run again
+                    // on a thread of its own, while this one serves its
+                    // other connections (#762). Not in cluster mode
+                    // (`deferred`).
+                    if count >= crate::commands::helpers::LONG_WORK
+                        && !ctx.cluster.enabled
+                        && crate::deferred::run_elsewhere(&mut ctx.blocking, cmd, count)
+                    {
+                        return Some(crate::pause::HELD_IN_GATE.to_vec());
+                    }
 
                     // Write directly into one pre-allocated buffer instead of
                     // collecting N separate Vec<u8> allocations and then
@@ -395,13 +405,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // instructions an element less).
                     use crate::resp::write::push_header;
 
-                    let mut buf = Vec::with_capacity(16 + count * 24);
-                    push_header(&mut buf, b'*', count);
-                    inner.for_each_in(start, start + count, |v| {
-                        push_header(&mut buf, b'$', v.len());
-                        buf.extend_from_slice(v);
-                        buf.extend_from_slice(b"\r\n");
-                        true
+                    // On Tokio, as long work.
+                    let buf = crate::commands::helpers::long_work(count, || {
+                        let mut buf = Vec::with_capacity(16 + count * 24);
+                        push_header(&mut buf, b'*', count);
+                        inner.for_each_in(start, start + count, |v| {
+                            push_header(&mut buf, b'$', v.len());
+                            buf.extend_from_slice(v);
+                            buf.extend_from_slice(b"\r\n");
+                            true
+                        });
+                        buf
                     });
 
                     Some(buf)

@@ -117,19 +117,20 @@ fn rss() -> u64 {
 /// `HSET key` of `fields` fields, 1,000 to an HSET, pipelined a hundred
 /// HSETs at a time.
 fn load_hash(c: &mut Conn, key: &str, fields: usize) {
-    let per = 1000;
-    for batch in 0..fields / per / 100 {
-        for n in 0..100 {
-            let first = (batch * 100 + n) * per;
+    let per = 100;
+    let value = "v".repeat(VALUE);
+    for batch in 0..fields / per / 10 {
+        for n in 0..10 {
+            let first = (batch * 10 + n) * per;
             let names: Vec<String> = (first..first + per).map(|i| format!("f{i}")).collect();
             let mut args = vec!["HSET", key];
             for name in &names {
                 args.push(name);
-                args.push("v");
+                args.push(&value);
             }
             c.send(&args);
         }
-        for _ in 0..100 {
+        for _ in 0..10 {
             c.read();
         }
     }
@@ -164,8 +165,13 @@ fn rss_falls_to(bound: u64) -> u64 {
 }
 
 /// Far more than the 32 MiB fall a trim waits for, so that a hash field
-/// that takes less memory one day does not make the test pass vacuously.
-const FIELDS: usize = 1_500_000;
+/// that takes less memory one day does not make the test pass vacuously:
+/// about 150 MB. Each value is past the largest block of the slab pool a
+/// large hash keeps its fields in (#764: 4 KiB), so the hash's memory is
+/// the allocator's to trim, as before the pool; a field of a few bytes now
+/// takes about 30, in slabs that go back as they empty.
+const FIELDS: usize = 30_000;
+const VALUE: usize = 5_000;
 
 #[test]
 fn memory_of_a_deleted_hash_goes_back_to_the_system() {
