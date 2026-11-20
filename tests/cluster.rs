@@ -8242,8 +8242,7 @@ fn a_replica_that_sends_no_claims_is_elected_as_before() {
 /// masters that refuse it (`UPDATE`), and is elected to what its master
 /// still had (#742). The setup of the test above, but the replica never
 /// takes in the destination's own claims (`KIVIDB_TEST_IGNORE_CLAIMS` stays):
-/// it used to be refused for good, and its master's other slots stayed
-/// down with it.
+/// what the voters tell it is all it learns.
 #[test]
 fn a_refused_replica_learns_the_newer_owner_from_the_voters_and_is_elected() {
     let (mut nodes, ranges) = form_cluster(5);
@@ -8331,9 +8330,8 @@ fn a_refused_replica_learns_the_newer_owner_from_the_voters_and_is_elected() {
 /// heard its master handed slots over takes only the slots its master still
 /// has (#742). Its request carries its claims to the masters that read them,
 /// they refuse it with the newer owner, and it asks again with them put
-/// right. It used to win with no check, and claim the moved slots at the
-/// election's epoch, newer than their owner's: that owner's acknowledged
-/// writes to them were lost.
+/// right. The moved slots stay with their owner, with every write it
+/// acknowledged to them.
 fn a_manual_failover_unaware_of_a_handover_takes_only_its_masters_slots(mode: Option<&str>) {
     let (nodes, ranges) = form_cluster(3);
     let replica = add_replica_with_env(
@@ -8446,12 +8444,9 @@ fn attach_replica(cluster: &[Node], master: &Node, replica: Node) -> Node {
 /// A replica's `CLUSTER FAILOVER TAKEOVER` picks its epoch alone. Its
 /// master, cut off, had taken that same epoch unannounced (`BUMPEPOCH`
 /// here; the end of an import does the same) and died. When the master
-/// comes back, the two collide, and the one with the lower id used to move
-/// above the other: if that was the master, its next claim took the slots
-/// back from the replica, and the replica, a replica again, lost the
-/// writes it had taken (#743). Now the replica keeps them on every node,
-/// whichever id is lower: the master gives the slots up at the tie, and
-/// it is the replica that moves.
+/// comes back, the two collide (#743). The replica keeps the slots, and the
+/// writes it took, on every node, whichever id is lower: the master gives
+/// the slots up at the tie, and it is the replica that moves.
 fn a_takeover_at_an_epoch_its_master_took_unannounced_keeps_its_slots(master_id_lower: bool) {
     let (mut nodes, ranges) = form_cluster_with_env(3, &[BUS_CONTROL]);
     let master_id = nodes[0].id();
@@ -8578,9 +8573,8 @@ fn a_takeover_at_an_epoch_its_master_took_unannounced_keeps_its_slots_master_id_
 /// the destination is marked FAIL (#743). The source hears none of the
 /// destination's claims (`KIVIDB_TEST_IGNORE_CLAIMS`); the destination
 /// holds its answer back (`KIVIDB_TEST_TAKEOVER_REPLY_DELAY_MS`), takes
-/// writes to the slots, and is killed. The source used to claim them back
-/// at once, and its claim reached the replica before its election: the
-/// writes were lost.
+/// writes to the slots, and is killed. Every write the destination
+/// acknowledged is on the slots' owner afterwards.
 #[test]
 fn a_source_waits_for_the_failover_of_a_destination_that_failed_mid_handover() {
     let src = Node::start_with_env(&[], &[("KIVIDB_TEST_IGNORE_CLAIMS", "ignore-claims")]);
@@ -8681,11 +8675,10 @@ fn a_source_waits_for_the_failover_of_a_destination_that_failed_mid_handover() {
 /// A source killed while it waited to know whether the destination took
 /// the slots over holds writes after its restart until it knows (#743).
 /// The destination took them, and neither its answer nor its claim went
-/// out for 8 s (`KIVIDB_TEST_TAKEOVER_LOST_MS`). The restarted source used
-/// to own them in its nodes.conf and take writes to them at once; the
-/// destination's claim, newer, took the slots from it 8 s later, and those
-/// writes were lost. Now the source asks the destination first, and a
-/// write sent meanwhile is redirected to it.
+/// out for 8 s (`KIVIDB_TEST_TAKEOVER_LOST_MS`). The restarted source owns
+/// them in its nodes.conf; it asks the destination before it takes writes,
+/// and a write sent meanwhile is redirected to it, or, if acknowledged, is
+/// on the slots' owner once they settle.
 #[test]
 fn a_source_restarted_during_a_handover_holds_writes_until_it_knows_where_the_slots_went() {
     let src = Node::start(&["--appendonly", "yes"]);

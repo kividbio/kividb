@@ -2415,10 +2415,10 @@ fn claim_back(cluster: &ClusterState, ranges: &[(u16, u16)]) {
 // From just before the source's handoff pauses writes until it knows how the
 // handover ended, `<cluster-config-file>.handovers` lists it: task id,
 // destination and slots. A source killed in that time comes back owning the
-// slots in its nodes.conf (the handover is saved there only once it knows),
-// and used to take writes to them at once; if the destination had taken
-// them, its claim, newer, took them from the source a heartbeat later, and
-// those writes were lost with them. A source that finds the file at startup
+// slots in its nodes.conf (the handover is saved there only once it knows).
+// If the destination had taken them, its claim is newer and takes them from
+// the source a heartbeat later, so the source must not take writes to them
+// before it knows where they went. A source that finds the file at startup
 // holds writes, as the handoff did, until it knows: the slots are no longer
 // its own (the destination's claim, or another's, took them), the
 // destination says it took them (they are handed over here, their keys

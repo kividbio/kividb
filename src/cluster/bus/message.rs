@@ -1989,8 +1989,8 @@ mod tests {
     }
 
     /// A request whose claims field does not read as valid claims is marked
-    /// so, and its vote refused (`listener`), where it used to be read as a
-    /// request without claims and decided with no check (#742). The same for
+    /// so, and its vote refused (`listener`), rather than read as a request
+    /// without claims and decided with no check (#742). The same for
     /// the sixth field of a manual failover. Six fields without `force` is
     /// no request.
     #[test]

@@ -1123,8 +1123,6 @@ mod tests {
     /// at its first heartbeat as a master, this node gives them up at the
     /// tie, and does not move to a newer epoch on the collision, which
     /// would have its next claim take them back whatever the ids (#743).
-    /// It used to: the lower id moved, and if that was this node, the
-    /// replica lost the slots and the writes it took since.
     #[test]
     fn a_takeover_at_the_masters_own_epoch_keeps_the_slots_on_the_master() {
         // Left with none, the master follows it.

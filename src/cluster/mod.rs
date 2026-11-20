@@ -1821,8 +1821,8 @@ impl ClusterState {
     /// `CLUSTER FAILOVER TAKEOVER` picks its epoch alone, and one the master
     /// took unannounced, at the end of an import or by `BUMPEPOCH`, can be
     /// the same), it is always the replica that moves, whatever the ids: the
-    /// master moving above it would have its next claim give it the slots
-    /// back, and the writes the replica took since would be lost (#743). The
+    /// master moving above it would have its next claim take the slots back
+    /// from the replica that serves them (#743). The
     /// replica knows it by [`Self::took_over_from`], the master by
     /// [`Self::yielded_to`] (it gave the replica the slots at the tie:
     /// [`Self::apply_peer_slot_claims_from`]). Both in memory: after a
@@ -3956,8 +3956,8 @@ impl ClusterState {
     /// [`Self::failover_window`] ago. Such a replica, if it heard `dest`'s
     /// claim of the slots, takes them over with the rest at its election's
     /// epoch, with the writes `dest` took to them; this node claiming them
-    /// back meanwhile made two claims of them after `dest` failed, and the
-    /// writes taken under the one that lost were lost with it (#743). So
+    /// back meanwhile would make a second claim of them after `dest`
+    /// failed, and only one of the two can stand (#743). So
     /// this node waits for that failover first, and claims the slots back
     /// only if it ends without them going to the replica.
     pub(crate) fn destination_may_fail_over(&self, dest: NodeId) -> bool {
