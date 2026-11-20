@@ -1439,7 +1439,11 @@ fn script_stream(
     (0..connections)
         .map(|_| {
             let stop = stop.clone();
-            let mut call = vec!["EVALSHA".to_string(), sha.to_string(), keys.len().to_string()];
+            let mut call = vec![
+                "EVALSHA".to_string(),
+                sha.to_string(),
+                keys.len().to_string(),
+            ];
             call.extend(keys.iter().map(|k| k.to_string()));
             std::thread::spawn(move || {
                 let mut c = Conn::connect(port);
@@ -1482,7 +1486,10 @@ fn plain_beside_alone_scripts(io: &str) {
     let streams = script_stream(server.port, &sha, &["n", "n:a", "n:b"], 8, &stop);
     // Under way, and quick: handed from one thread to another.
     wait_until("the scripts to run", 30, || {
-        c.info("stats", "scripts_run_alone_no_tag").parse::<u64>().unwrap() > 2000
+        c.info("stats", "scripts_run_alone_no_tag")
+            .parse::<u64>()
+            .unwrap()
+            > 2000
     });
     let before: u64 = c.info("stats", "scripts_run_alone_no_tag").parse().unwrap();
     let mut probe = server.conn();
@@ -1579,5 +1586,8 @@ fn alone_script_never_half_done(io: &str) {
     };
     assert_eq!(k.parse::<usize>().unwrap(), ran);
     // The readers saw the scripts run, not just before or after all of them.
-    assert!(lasts.iter().any(|&n| n > 0 && (n as usize) < ran), "{lasts:?} of {ran}");
+    assert!(
+        lasts.iter().any(|&n| n > 0 && (n as usize) < ran),
+        "{lasts:?} of {ran}"
+    );
 }

@@ -636,17 +636,16 @@ mod tests {
             })
             .collect();
         for _ in 0..100 {
-            let run = enter_alone_for_a_run(Duration::from_millis(5), || false)
-                .expect("the gate is had");
+            let run =
+                enter_alone_for_a_run(Duration::from_millis(5), || false).expect("the gate is had");
             for _ in 0..5 {
                 assert!(!alone_on_this_thread());
                 assert_eq!(in_flight.load(Ordering::SeqCst), 0);
                 // What a command shared on this thread takes: nothing.
                 drop(enter());
-                let script = enter_alone_unless(Duration::from_millis(5), || {
-                    panic!("it does not wait")
-                })
-                .expect("in the run");
+                let script =
+                    enter_alone_unless(Duration::from_millis(5), || panic!("it does not wait"))
+                        .expect("in the run");
                 assert!(alone_on_this_thread());
                 let inner = enter_alone();
                 drop(inner);
@@ -666,11 +665,10 @@ mod tests {
             w.join().unwrap();
         }
         // And the gate opens again: another thread gets in.
-        let entered = crate::cpus::spawn(|| {
-            enter_unless(Duration::from_millis(5), || false).is_some()
-        })
-        .join()
-        .unwrap();
+        let entered =
+            crate::cpus::spawn(|| enter_unless(Duration::from_millis(5), || false).is_some())
+                .join()
+                .unwrap();
         assert!(entered);
     }
 
