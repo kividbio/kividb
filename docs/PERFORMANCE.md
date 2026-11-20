@@ -438,7 +438,8 @@ over 8 writer connections (3 runs each, the same load):
 So a writer on the loader's worker waits in every build; what one helper
 costs is the other connections' latency. A small server that serves while it
 loads is better off without helpers, so
-`auto` starts none below 8 CPUs (three on 8, seven on 16), and builds there
+`auto` starts none below 8 CPUs (on 8, three link while it serves, seven on 16:
+see below), and builds there
 run at 1.2's speed unless `search-index-threads` is given a number.
 
 Under a CPU quota there are no helpers. In a container with `--cpus 2` on
@@ -452,11 +453,54 @@ was spent. With `--cpus 4`, two helpers: 147-150k at 0.32-0.35 ms against
 2,390-2,410. Without helpers under the quota 1.3.0 measures as 1.2 does
 there (140-143k at 0.35 ms with `--cpus 2`, 148-150k at 0.33 ms with 4).
 
-Left: 64-d documents build at 0.62x Redis's rate. Per document the helpers
-spend 23 % more CPU than one thread linking alone (93.6 against 77.2 CPU
-seconds for 200,000): no lock shows in the profile (`search_layer` 57 %,
-the distance kernel 18 %, the kernel's futex paths about 1 %); four helpers
-and the writer share 4 cores' 8 hyperthreads and their caches.
+### More helpers while the server only loads
+
+On 8 CPUs `auto` starts seven helpers. Three link while the server serves clients.
+All seven link while it does nothing but take the writes that fill the backlogs.
+[CONFIGURATION.md](CONFIGURATION.md#search-index-threads) says how it tells the two
+apart.
+
+Measured on an Azure D8s_v5 (an Ice Lake Xeon 8370C), one client loading in `HSET`
+pipelines of 1,000, the clock running until nothing waits. The table is regression
+suite 41, one session, Redis 8.10.2 with its query engine:
+
+| documents | master (three link) | seven link | Redis 8.10.2 |
+|---|---:|---:|---:|
+| 50,000 × 384 | 6,565 a second (1.24x Redis's time) | 7,479 (1.03x) | 7,699 |
+| 200,000 × 64 | 9,638 (1.67x) | 12,216 (1.34x) | 16,416 |
+
+`FT.CREATE` over 100,000 64-d documents already written, and a replica's full sync of
+them, link on all seven too, but take as long as before (14.5 and 19.6 s against 14.2
+and 19.6). The walk over the keys is their limit, not the linking.
+
+At 64-d the gap left is the cost of each insert once helpers share a core's two
+hyperthreads. The 200,000 documents took 77 CPU seconds with three helpers and 118
+with seven (39 seconds of wall time with one, 20.2 with three, 16.2 with seven). The
+profile shows no lock in either:
+- `search_layer`: 55 % of the samples with three, 60 % with seven;
+- the distance kernel: 19 % with three, 13 % with seven;
+- no `parking_lot` slow path, and the kernel's futex and scheduler paths about 1 %.
+
+The extra time is spent waiting for the neighbours' vectors while the core's other
+hyperthread does the same. At the same `EF_RUNTIME`, one client's KNN q/s and recall
+off a graph built by seven helpers are those off one built by three, within the
+±10 % run-to-run spread of that client.
+
+Clients served during the load see the three helpers. Measured during a 200,000 ×
+64-d load, 3 runs each, medians, master → this behaviour:
+
+| beside the load | p50 | p99 | p99.9 | build |
+|---|---:|---:|---:|---:|
+| one KNN client, plus 500 `HSET`s a second | 0.41 → 0.42 ms | 1.03 → 0.78 ms | 1.48 → 1.06 ms | 28.3 → 28.4 s |
+| memtier GET/SET, 4 threads × 10 connections, 17,000 a second for 15 s | 0.055 → 0.055 ms | 12.5 → 12.0 ms | 14.3 → 13.8 ms | 23.2 → 20.7 s |
+| memtier GET/SET at 200 a second | 0.16 → 0.42 ms | 10.0 → 8.0 ms | 12.1 → 9.6 ms | 21.4 → 16.7 s |
+
+- In the first two rows the helpers stayed at three while the clients ran. Sampled
+  every 0.5 s during the memtier row: 3 for the 13 s memtier ran, then 7.
+- The GET/SET p99 of about 12 ms is the connections that share the loading client's
+  worker and wait behind its pipelines, with either number of helpers.
+- 200 commands a second is below what counts as serving, so those clients see all
+  seven helpers: their median doubles, while their p99 falls with the shorter build.
 
 Suite `28-ft-hnsw` of
 [the regression suite](../benchmarks/1.3.0/regressions/README.md) measures

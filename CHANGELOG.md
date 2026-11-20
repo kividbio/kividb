@@ -901,6 +901,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   range both ways. Regression suite `41-ft-hnsw-vs-redis` gates #760's
   cases against Redis in the same session.
 
+- **`search-index-threads auto` links on more helpers while the server only
+  loads (#760).** On 8 CPUs or more with no CPU quota, `auto` starts one
+  helper fewer than the CPUs (seven on 8). While the server serves clients,
+  (CPUs - 2) / 2 of them link, three on 8, as before. While it does nothing
+  but take the writes that fill the backlogs (a bulk load, `FT.CREATE` over
+  existing keys, a replica's full sync), all of them link.
+  - Nothing is added to the workers' loop. Every 50 ms the helper that has
+    just finished a job reads counters the server keeps anyway: commands
+    served, the process's CPU time, and the helpers' and the writes' time
+    spent linking.
+  - The server counts as serving at 500 commands a second besides those
+    that wrote vectors, or at a CPU's worth of time besides the links. The
+    helpers drop back at the first look that finds clients, and take the
+    others in again after 200 ms without any.
+  - A replica follows the same rule.
+  - A number still starts exactly that many, all of which link.
+  - `CONFIG SET` still refuses the setting.
+  - `FT.INFO` shows `hnsw_index_threads` and `hnsw_index_threads_active`.
+
+  An Azure D8s_v5, one client loading in `HSET` pipelines of 1,000,
+  regression suite 41 in one session against Redis 8.10.2:
+  - 50,000 384-d documents: 7,479 a second against Redis's 7,699, which is
+    1.03x Redis's time (it was 6,565 against 8,152, or 1.24x).
+  - 200,000 64-d documents: 12,216 against 16,416, which is 1.34x (it was
+    9,638 against 16,096, or 1.67x). At 64-d each insert costs more once
+    helpers share a core's two hyperthreads: 118 CPU seconds with seven
+    against 77 with three.
+
+  Recall is unchanged. Peak RSS moves by at most 5 MiB.
+
+  Clients served during a 200,000 × 64-d load see the three helpers, as
+  before; medians of 3 runs, before → after:
+  - One KNN client beside 500 `HSET`s a second: KNN p50 0.41 → 0.42 ms,
+    p99 1.03 → 0.78 ms, p99.9 1.48 → 1.06 ms.
+  - memtier GET/SET at about 17,000 a second from 40 connections: p50
+    0.055 ms either way, p99 12.5 → 12.0 ms. The p99 comes from the
+    connections that share the loading client's worker and wait behind its
+    pipelines.
+  - Clients that send fewer than 500 commands a second do not count as
+    serving, so they see all the helpers. memtier at 200 GET/SET a second:
+    p50 0.16 → 0.42 ms, p99 10.0 → 8.0 ms, build 21.4 → 16.7 s.
+
 - **Writes on a master with a replication backlog and no replica no
   longer wake the replication thread one by one (#894).** A master that
   starts with data (its own snapshot, or any dataset) keeps the backlog for
