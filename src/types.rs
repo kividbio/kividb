@@ -1413,7 +1413,11 @@ impl KiviDBValue {
             KiviDBValue::List(list) => KiviDBValue::List(fresh(list)),
             KiviDBValue::Hash(hash) => KiviDBValue::Hash(fresh(hash)),
             KiviDBValue::Json(json) => KiviDBValue::Json(fresh(json)),
-            KiviDBValue::Set(set) => KiviDBValue::Set(fresh(set)),
+            // Through `member_set::shared`, as every set made whole: a
+            // copy's table is handed to the background if it needs it.
+            KiviDBValue::Set(set) => {
+                KiviDBValue::Set(crate::member_set::shared(set.read().clone()))
+            }
             KiviDBValue::VectorSet(set) => KiviDBValue::VectorSet(fresh(set)),
             KiviDBValue::SortedSet(zset) => KiviDBValue::SortedSet(fresh(zset)),
             KiviDBValue::Stream(stream) => KiviDBValue::Stream(fresh(stream)),

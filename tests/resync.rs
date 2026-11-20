@@ -1366,6 +1366,66 @@ fn a_killed_master_continues_a_replica_that_holds_the_same_data() {
     assert_eq!(m.stat("sync_full"), 1);
 }
 
+/// A master's fingerprint describes its dataset at the start of its own
+/// stream. Once it has followed another master, synced in full from it, and
+/// been promoted, that is no longer anything it can continue a replica
+/// from: a replica that holds the dataset it started with is sent the
+/// dataset it holds now. With the other master at offset 0 when the full
+/// sync was cut (it had just been started from its AOF), nothing else stops
+/// such a replica being continued from offset 1 with its old data.
+#[test]
+fn a_promoted_node_offers_no_fingerprint_of_the_dataset_it_replaced() {
+    a_fingerprint_does_not_outlive_a_full_sync(true);
+}
+
+/// The same with the other master past offset 0: the replica is sent the
+/// dataset, and the log says nothing of a `VADD` there is none of.
+#[test]
+fn a_promoted_node_sends_a_replica_its_dataset_without_blaming_a_vadd() {
+    a_fingerprint_does_not_outlive_a_full_sync(false);
+}
+
+fn a_fingerprint_does_not_outlive_a_full_sync(other_master_at_zero: bool) {
+    // A: the master B will sync from.
+    let mut a = Server::start(&["--aof"]);
+    write_batch(&mut a.conn(), 0, 30);
+    if other_master_at_zero {
+        // Killed and started from its AOF: its stream starts again at 0.
+        std::thread::sleep(Duration::from_millis(1500));
+        a.kill();
+        a.restart();
+    }
+    // B: other data, fingerprinted as it starts.
+    let mut b = Server::start(&["--aof"]);
+    write_batch(&mut b.conn(), 1, 30);
+    std::thread::sleep(Duration::from_millis(1500));
+    b.kill();
+    b.restart();
+    // C: the data B started with.
+    let c = Server::start(&[]);
+    write_batch(&mut c.conn(), 1, 30);
+
+    let (mut ca, mut cb) = (a.conn(), b.conn());
+    assert!(
+        cb.cmd(&["REPLICAOF", "127.0.0.1", &a.port.to_string()])
+            .ok()
+    );
+    wait_link_up(&mut cb);
+    assert_same_dataset(&mut ca, &mut cb);
+    assert!(cb.cmd(&["REPLICAOF", "NO", "ONE"]).ok());
+
+    let mut cc = c.conn();
+    assert!(
+        cc.cmd(&["REPLICAOF", "127.0.0.1", &b.port.to_string()])
+            .ok()
+    );
+    wait_link_up(&mut cc);
+    assert_same_dataset(&mut cb, &mut cc);
+    assert_eq!(cb.stat("sync_full"), 1, "{}", b.log());
+    assert_eq!(cb.stat("sync_partial_ok"), 0, "{}", b.log());
+    assert!(!b.log().contains("VADD"), "{}", b.log());
+}
+
 /// A replica that was killed has an append-only file with more in it than
 /// its last save: the saved position is not where its dataset is, and it
 /// must not be used.

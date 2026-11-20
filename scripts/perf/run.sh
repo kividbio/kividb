@@ -28,6 +28,13 @@
 #                       (#894): SET-100 with no backlog, with a kept one
 #                       (started from a snapshot), with a replica attached,
 #                       with the AOF on; and GET-100
+#   WORKLOADS=sets      set commands on one set of each form and size
+#                       (#764): SADD, SISMEMBER hit and miss, SMISMEMBER,
+#                       SCARD, SRANDMEMBER, SREM + SADD and SPOP + SADD
+#                       pairs at 10, 128 (block), 512 (integer array),
+#                       1k, 100k, 3M (table); SMEMBERS, SUNIONSTORE,
+#                       SINTER and COPY of big sets (see measure.sh;
+#                       SIZES limits the sizes)
 #   ONLY=<regex>        measure only the workloads whose label matches
 #   PROFILE=1           keep the hottest functions of each workload in
 #                       target/perf/out-<tag>/profile-*.txt
@@ -58,7 +65,7 @@ TAG=${1:?usage: run.sh <tag>} MODEL=${MODEL:-uring}
 mkdir -p "$OUT/out-$TAG"
 MSYS_NO_PATHCONV=1 docker run --rm --security-opt seccomp=unconfined ${DNS:+--dns 1.1.1.1} \
   -e MODEL="$MODEL" -e ONLY="${ONLY:-}" -e N="${N:-60000}" -e WORKLOADS="${WORKLOADS:-}" -e LTO="${LTO:-off}" ${OFFLINE+-e OFFLINE="$OFFLINE"} ${PROFILE:+-e PROFILE="$TAG"} \
-  -e FEATURES="${FEATURES:-}" -e NOOP="${NOOP:-}" -e CMP="${CMP:-}" -e EXEC="${EXEC:-}" \
+  -e FEATURES="${FEATURES:-}" -e NOOP="${NOOP:-}" -e CMP="${CMP:-}" -e EXEC="${EXEC:-}" -e SIZES="${SIZES:-}" -e NBIG="${NBIG:-}" \
   -v "$(cygpath -w "$REPO" 2>/dev/null || echo "$REPO"):/src:ro" \
   -v "$(cygpath -w "$HERE" 2>/dev/null || echo "$HERE"):/perf:ro" \
   -v "$(cygpath -w "$OUT/out-$TAG" 2>/dev/null || echo "$OUT/out-$TAG"):/out" \

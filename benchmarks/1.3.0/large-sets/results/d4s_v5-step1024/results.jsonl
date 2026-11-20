@@ -1,0 +1,2 @@
+{"test": "fill", "label": "branch", "pings": 3071921, "ping_p50_ms": 0.033, "ping_p99_ms": 0.054, "ping_p999_ms": 0.069, "ping_max_ms": 9.254, "sadd_avg_ms": 0.034, "sadd_min_ms": 0.008, "sadd_p50_ms": 0.039, "sadd_p95_ms": 0.047, "sadd_p99_ms": 0.055, "sadd_max_ms": 9.071, "members": 2995403, "fill_s": 115.35}
+{"test": "background", "label": "branch", "members": 3211265, "memory_usage_first": 161421932, "memory_usage_settled": 119407540, "settled_after_s": 0.61}

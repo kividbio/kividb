@@ -1252,6 +1252,9 @@ async fn run_replication_session(
         repl_state
             .vset_quant_dropped_until
             .store(master_offset, Ordering::Relaxed);
+        repl_state
+            .full_sync_base
+            .store(master_offset, Ordering::Relaxed);
         repl_state.set_stream_origin(repl_state.cluster_master_node());
         // Every key in it that this master expires is sent as a `DEL`, if
         // it sends them at all: nothing is left for a sweep.

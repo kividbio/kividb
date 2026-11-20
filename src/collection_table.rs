@@ -1,7 +1,7 @@
 //! The large form of hashes and sets (#764): [`CollectionTable`].
 //!
-//! Step 1 of the design on #764: the table alone. Nothing in the server uses
-//! it yet; sets (step 2) and hashes (step 3) move onto it later.
+//! The design is on #764. Large sets are kept in it (`member_set`, step 2);
+//! hashes move onto it later (step 3).
 //!
 //! **Layout.** A power-of-two array of 64-byte groups, one cache line each:
 //! seven control bytes, one meta byte and seven 8-byte slots (`Group`). A
@@ -47,9 +47,12 @@
 //! may miss elements: a write between two of its pages takes a step of the
 //! resize, which can move an element from an old-seed position the scan has
 //! not reached to a new-seed one it has passed. A scan started after the
-//! resize with a new seed has ended has the guarantee again. (One started
-//! while it is in progress also returns every element if nothing is written
-//! between its pages.)
+//! resize with a new seed has ended has the guarantee again. A scan whose
+//! pages span a resize with a new seed has no guarantee whether or not
+//! anything is written between its pages: the server's background
+//! (`member_set::step_background`) takes steps of a resize in progress
+//! between pages too. Only a chain over [`CHAIN_CAP`] starts such a resize,
+//! which random keys do not reach (see above).
 //!
 //! **Resizing.** Above the maximum fill (0.875 of the main slots) the table
 //! doubles, below 1/8 it shrinks towards half full, by at most
@@ -69,7 +72,8 @@
 //! The invariants each relies on are stated where they are, and checked by
 //! `debug_assert!`s and, in tests, by `check()`.
 
-// Nothing in the server uses the table yet (#764 step 1).
+// The hash form and the measurement hooks are not used by the server yet
+// (#764 step 3).
 #![allow(dead_code)]
 
 use std::alloc::Layout;
@@ -1830,6 +1834,14 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
         })
     }
 
+    /// Whether [`Self::take_retired`] has an array to hand over.
+    #[inline]
+    pub fn holds_retired(&self) -> bool {
+        self.rare
+            .as_ref()
+            .is_some_and(|rare| rare.retired.is_some())
+    }
+
     /// Room for `more` elements besides those there before the table grows
     /// again: a growth to that size starts now, or, if a resize is in
     /// progress, when it ends (its moves are not hurried: no call does more
@@ -2113,6 +2125,24 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
             if let Some((array, arena)) = rare.retired.as_ref() {
                 bytes += A::charged(Array::layout(array.bits)) + arena.bytes::<A>();
             }
+        }
+        bytes
+    }
+
+    /// The part of [`Self::allocation_size`] that is there only because of
+    /// a resize: the array (and arena) a resize in progress is moving out
+    /// of, and a finished one's kept for [`Self::take_retired`]. 0 when the
+    /// table is settled.
+    pub fn transient_bytes(&self) -> usize {
+        let Some(rare) = self.rare.as_ref() else {
+            return 0;
+        };
+        let mut bytes = 0;
+        if let Some(old) = rare.old.as_ref() {
+            bytes += A::charged(Array::layout(old.array.bits)) + old.arena.bytes::<A>();
+        }
+        if let Some((array, arena)) = rare.retired.as_ref() {
+            bytes += A::charged(Array::layout(array.bits)) + arena.bytes::<A>();
         }
         bytes
     }
@@ -2707,9 +2737,11 @@ impl<A: Memory> CollectionTable<Members, A> {
     }
 
     /// Every member, in no particular order.
-    pub fn iter(&self) -> impl Iterator<Item = MemberRef<'_>> + '_ {
-        // SAFETY: live elements, unchanged while `self` is borrowed.
-        self.slots().map(|slot| unsafe { member_ref(slot) })
+    pub fn iter(&self) -> MemberIter<'_> {
+        MemberIter {
+            slots: self.slots(),
+            left: self.len,
+        }
     }
 
     /// As [`CollectionTable::<Fields>::scan`], for members.
@@ -2755,6 +2787,34 @@ impl<A: Memory> CollectionTable<Members, A> {
         Some(out)
     }
 }
+
+/// A set's members, in no particular order ([`CollectionTable::iter`]): a
+/// type of its own so that a set's iterator can hold it, and exact about
+/// how many are left.
+pub struct MemberIter<'a> {
+    slots: Slots<'a>,
+    left: usize,
+}
+
+impl<'a> Iterator for MemberIter<'a> {
+    type Item = MemberRef<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<MemberRef<'a>> {
+        let slot = self.slots.next()?;
+        self.left -= 1;
+        // SAFETY: a live element of the table the iterator borrows, which
+        // stays unchanged while it is borrowed.
+        Some(unsafe { member_ref(slot) })
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl ExactSizeIterator for MemberIter<'_> {}
 
 /// The cursor position of `key` in a table: the order `scan` visits in. For
 /// tests of the cursor.

@@ -497,6 +497,9 @@ jobs:
           trivy --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 --format table
 
   docker-manifest:
+    # Its secrets live in the `release` environment: a run waits for a
+    # required reviewer, and only master and v* tags may use it.
+    environment: release
     # Waits for ALL matrix instances of both docker-amd64 and docker-arm64.
     needs: [docker-amd64, docker-arm64]
     runs-on: ubuntu-latest
@@ -624,6 +627,9 @@ jobs:
   # and the tap is what `brew install kividb` gives people. v1.0.6-rc1 went
   # out through it to everybody.
   homebrew-tap-update:
+    # Its secrets live in the `release` environment: a run waits for a
+    # required reviewer, and only master and v* tags may use it.
+    environment: release
     needs: [publish]
     if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') }}
     runs-on: ubuntu-latest
@@ -987,6 +993,9 @@ jobs:
   # this version (a re-run): a version can be published only once. Setup
   # and withdrawal: docs/RELEASING.md.
   crates-io:
+    # Its secrets live in the `release` environment: a run waits for a
+    # required reviewer, and only master and v* tags may use it.
+    environment: release
     needs: [publish]
     if: ${{ !cancelled() && needs.publish.result == 'success' }}
     runs-on: ubuntu-latest

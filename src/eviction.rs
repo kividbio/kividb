@@ -985,6 +985,8 @@ fn freeing_at_least(value: crate::store::ValueRef<'_>) -> usize {
         // one allocation, of a size known exactly.
         V::Hash(hash) => hash.read().freeing_at_least(ELEMENT),
         V::HashEx(hash) => hash.read().fields.freeing_at_least(ELEMENT),
+        // Exact in every form: a large set's table counts what it holds
+        // (#764), and a member of up to seven bytes takes no block at all.
         V::Set(set) => set.read().freeing_at_least(ELEMENT),
         V::SortedSet(zset) => zset.read().freeing_at_least(ELEMENT),
         V::VectorSet(set) => set.read().entries.len() * ELEMENT,

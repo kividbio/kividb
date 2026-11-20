@@ -337,14 +337,17 @@ impl Conn {
             .unwrap()
     }
 
-    /// `used_memory` once two readings 50 ms apart agree (background frees
-    /// done), for at most two seconds.
+    /// `used_memory` once four readings 50 ms apart agree (background frees
+    /// done, and a large set's resize the background finishes: #764), for
+    /// at most four seconds.
     pub fn settled_used_memory(&mut self) -> u64 {
         let mut last = self.used_memory();
-        for _ in 0..40 {
+        let mut same = 0;
+        for _ in 0..80 {
             std::thread::sleep(Duration::from_millis(50));
             let now = self.used_memory();
-            if now == last {
+            same = if now == last { same + 1 } else { 0 };
+            if same == 3 {
                 return now;
             }
             last = now;

@@ -151,6 +151,16 @@ its next write that sets a field, to a set or a sorted set at its next new membe
 score never moves a sorted set); a collection never moves back to a block.
 [COMPATIBILITY.md](COMPATIBILITY.md) has the details for each type.
 
+A set past those limits (`OBJECT ENCODING` `hashtable`) is a table of its own: a member of up
+to seven bytes (any integer of up to seven digits) lives in the table's slot, and any other is
+one block of a pool of slabs kept for collections. The table grows and shrinks a few members
+at a time with each write, and a resize that the writes leave part-way is finished in the
+background, so no write pays for moving every member at once. Active defrag does not move a
+set's members: their slabs are not among those it empties, and each slab goes back to the
+system as soon as its last member is removed. `INFO memory` reports those slabs as
+`value_slab_pool_bytes`, apart from `value_slab_bytes` (the keyspace's slabs, which defrag
+compacts).
+
 Persistence (snapshots and the AOF) is described in [PERSISTENCE.md](PERSISTENCE.md),
 including `rdbcompression` (default `no`; `yes` writes snapshots compressed, which 1.2 cannot read) and the
 `kividb kdb-decompress <in> <out>` and `kividb kdb-compress <in> <out>` tools, which convert a
