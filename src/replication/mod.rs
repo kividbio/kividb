@@ -83,8 +83,13 @@ pub struct ReplState {
     /// mode only. See [`SLOT_IMPORTS_MARKER`].
     pub sends_slot_imports: AtomicBool,
     /// Master offset after the last stripped `VADD`; earlier continuations
-    /// would re-apply its options.
+    /// would re-apply its options. Also set to [`Self::full_sync_base`] at
+    /// each full sync: nothing before it is in this node's numbering.
     pub vset_quant_dropped_until: AtomicU64,
+    /// The master offset this node's last full sync loaded the dataset at:
+    /// its backlog holds nothing of the stream before it. Only says which
+    /// reason a refused continuation is logged with.
+    pub full_sync_base: AtomicU64,
     /// Whether this replica's master sends a `DEL` (or `UNLINK`) for every
     /// key it expires, as KiviDB does since 1.1.3 and Redis always has. Then
     /// the replica deletes no expired key itself and waits for that `DEL`
@@ -563,6 +568,7 @@ impl ReplState {
             master_keeps_vset_quant: AtomicBool::new(false),
             sends_slot_imports: AtomicBool::new(false),
             vset_quant_dropped_until: AtomicU64::new(0),
+            full_sync_base: AtomicU64::new(0),
             master_propagates_expiry: AtomicBool::new(true),
             expiry_sweep_owed: AtomicBool::new(true),
             master_propagates_field_expiry: AtomicBool::new(true),
@@ -1369,6 +1375,13 @@ impl ReplState {
         // again later under the same id, a replica that had followed the old
         // stream could be continued from an offset in another one.
         *self.repl_id.write() = generate_repl_id();
+        // So does what its startup fingerprint describes: the dataset at
+        // offset 0 of a stream this node kept writing. As a replica it may
+        // be sent another dataset, or another master's stream in another
+        // numbering; promoted again, it has no offset 0 that fingerprint is
+        // the dataset of, and a replica holding that old dataset must not be
+        // continued from there. See `digest_offer`.
+        *self.startup_digest.lock() = None;
     }
 
     /// This node's replication id, as a master.
@@ -1490,7 +1503,8 @@ impl ReplState {
     /// The answer to a `PSYNC` that cannot be continued, from a replica that
     /// takes a fingerprint: this node's stream and its dataset's fingerprint
     /// at that stream's start. Offered once per connection; the replica
-    /// compares and asks again.
+    /// compares and asks again. Only by a node that has been a master since
+    /// it took the fingerprint ([`Self::become_slave`] lets go of it).
     pub fn digest_offer(
         &self,
         registry: &crate::client_registry::ClientRegistry,
@@ -4304,12 +4318,24 @@ pub async fn request_continuation(
     }
     let dropped = repl_state.vset_quant_dropped_until.load(Ordering::Relaxed);
     if psync.offset <= dropped {
-        // The backlog holds a `VADD` whose quantization was not applied here.
-        log_info!(
-            "Replication: Not continuing a replica from offset {}: the stream up to {dropped} \
-             holds a VADD whose quantization an older master ignored — syncing it in full",
-            psync.offset
-        );
+        let base = repl_state.full_sync_base.load(Ordering::Relaxed);
+        if psync.offset <= base {
+            // Before the dataset this node was last sent in full.
+            log_info!(
+                "Replication: Not continuing a replica from offset {}: this node holds the \
+                 stream only from offset {base}, where it was last synced in full — syncing \
+                 it in full",
+                psync.offset
+            );
+        } else {
+            // The backlog holds a `VADD` whose quantization was not applied here.
+            log_info!(
+                "Replication: Not continuing a replica from offset {}: the stream up to \
+                 {dropped} holds a VADD whose quantization an older master ignored — syncing \
+                 it in full",
+                psync.offset
+            );
+        }
         repl_state.sync_partial_err.fetch_add(1, Ordering::Relaxed);
         return Err(registration);
     }

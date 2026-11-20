@@ -1649,7 +1649,12 @@ fn promotion_does_not_pass_on_stripped_options() {
     let mut c2 = r2.conn();
     wait_caught_up(&mut c1, &mut c2);
     assert_eq!(c1.info("stats", "sync_full"), "1", "{}", r1.log());
-    assert!(r1.log().contains("syncing it in full"), "{}", r1.log());
+    assert!(
+        r1.log()
+            .contains("holds a VADD whose quantization an older master ignored"),
+        "{}",
+        r1.log()
+    );
     for c in [&mut c2, &mut c3] {
         assert_same_sets(&mut c1, c, &["s", "t"], "under the promoted R1");
         for n in 0..OPTIONS.len() {
