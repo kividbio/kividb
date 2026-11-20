@@ -25,9 +25,31 @@
 //! the pointer, so a command holding the collection, or about to, finds it
 //! unchanged.
 //!
-//! It starts while the slabs take more than `active-defrag-threshold-lower`
-//! per cent above what is in them, and more than `active-defrag-ignore-bytes`,
-//! and stops when the waste is under half of both.
+//! **What it empties.** The sparsest slabs nobody owns: those in their
+//! classes' lists of partial slabs (a quarter of them free and more), and
+//! the full ones with at least `active-defrag-full-slab-free-percent` of
+//! their blocks free (12 %, about an eighth, by default), which nothing else
+//! gets back: a slab is not used for blocks again until a quarter of it is
+//! free, so after a light churn, or the writes whose old values a snapshot
+//! held, most of the free room is in full slabs. A set of them is chosen a
+//! round, and all their values are moved in one look through the keyspace.
+//! What is moved goes first into the room of the class's partial slabs that
+//! are not chosen, then into new slabs, and only those bytes count toward
+//! the round's budget ([`value_slab::plan_evacuation_with_full`]).
+//!
+//! **When.** A pass starts while the slabs take more than
+//! `active-defrag-threshold-lower` per cent above what is in them, and more
+//! than `active-defrag-ignore-bytes`; or while the free room inside them is
+//! more than `active-defrag-slab-waste-percent` per cent of them and more
+//! than `active-defrag-slab-waste-bytes` (10 % and 16 MiB by default). It
+//! stops when the waste is under half of both of either. It does not start
+//! while a snapshot or an AOF rewrite runs (the values it holds cannot
+//! move), nor while what is in the slabs grew by more than one [`REFILL`]th
+//! of them in the last second: the clients are filling the room themselves,
+//! and the slabs a pass empties would only make them take new ones. A pass
+//! the slab-waste trigger started that got little back ([`LITTLE_BACK`])
+//! keeps that trigger off for [`WASTE_BACKOFF`], doubled for each such pass
+//! in a row, up to [`WASTE_BACKOFF_MAX`].
 //!
 //! **A pass that panics** (#358) does not end the thread. Release builds
 //! unwind, and a panic there used to end this thread alone: the server went
@@ -92,10 +114,45 @@ const BACKOFF_MAX: Duration = Duration::from_secs(8);
 /// bug that retrying will not get past.
 const PANICS_TO_TURN_OFF: u32 = 5;
 
+/// What is in the slabs growing by more than one this-many-th of them over
+/// one [`TICK`] keeps a pass from starting: a delete being refilled.
+const REFILL: usize = 32;
+
+/// A round's budget: bytes of the values moved that may go into new slabs,
+/// one this-many-th of the slabs (at least [`BUDGET_MIN`]). They are held
+/// twice until the slabs they left empty.
+const BUDGET_SHARE: usize = 8;
+const BUDGET_MIN: usize = 16 << 20;
+
+/// A pass the slab-waste trigger started gets little back when the slabs it
+/// emptied, less the new ones it took, are under one in this many of those
+/// it emptied (or none): the free room left is in slabs too full to be
+/// worth emptying, or something holds their values.
+const LITTLE_BACK: u64 = 32;
+
+/// How long the slab-waste trigger stays off after a pass that got little
+/// back, doubled for each such pass in a row.
+const WASTE_BACKOFF: Duration = Duration::from_secs(30);
+const WASTE_BACKOFF_MAX: Duration = Duration::from_secs(600);
+
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static IGNORE_BYTES: AtomicU64 = AtomicU64::new(64 << 20);
 static THRESHOLD_LOWER: AtomicU32 = AtomicU32::new(20);
 static CYCLE_MAX: AtomicU32 = AtomicU32::new(10);
+static SLAB_WASTE_PERCENT: AtomicU32 = AtomicU32::new(10);
+static SLAB_WASTE_BYTES: AtomicU64 = AtomicU64::new(16 << 20);
+static FULL_SLAB_FREE_PERCENT: AtomicU32 = AtomicU32::new(12);
+
+/// Passes run (INFO `active_defrag_passes`), the slabs they emptied
+/// (`active_defrag_slabs_emptied`), and how long the last one took
+/// (`active_defrag_last_pass_ms`).
+static PASSES: AtomicU64 = AtomicU64::new(0);
+static SLABS_EMPTIED: AtomicU64 = AtomicU64::new(0);
+static LAST_PASS_MS: AtomicU64 = AtomicU64::new(0);
+
+/// For tests: whether a pass waits out a refill ([`REFILL`]). Tests share
+/// the process's slabs with others, whose writes would look like one.
+static WAIT_FOR_REFILL: AtomicBool = AtomicBool::new(true);
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static HITS: AtomicU64 = AtomicU64::new(0);
@@ -163,6 +220,35 @@ pub fn set_cycle_max(percent: u32) {
     CYCLE_MAX.store(percent.clamp(1, 100), Ordering::Relaxed);
 }
 
+/// `active-defrag-slab-waste-percent`: the free room inside the slabs, as a
+/// percentage of them, over which a pass starts (0: never for this).
+pub fn slab_waste_percent() -> u32 {
+    SLAB_WASTE_PERCENT.load(Ordering::Relaxed)
+}
+
+pub fn set_slab_waste_percent(percent: u32) {
+    SLAB_WASTE_PERCENT.store(percent.min(100), Ordering::Relaxed);
+}
+
+/// `active-defrag-slab-waste-bytes`: and over which, in bytes.
+pub fn slab_waste_bytes() -> u64 {
+    SLAB_WASTE_BYTES.load(Ordering::Relaxed)
+}
+
+pub fn set_slab_waste_bytes(bytes: u64) {
+    SLAB_WASTE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// `active-defrag-full-slab-free-percent`: the share of a full slab's blocks
+/// that must be free for a pass to empty it (0: full slabs are left alone).
+pub fn full_slab_free_percent() -> u32 {
+    FULL_SLAB_FREE_PERCENT.load(Ordering::Relaxed)
+}
+
+pub fn set_full_slab_free_percent(percent: u32) {
+    FULL_SLAB_FREE_PERCENT.store(percent.min(100), Ordering::Relaxed);
+}
+
 /// INFO's `active_defrag_running`.
 pub fn running() -> bool {
     RUNNING.load(Ordering::Relaxed)
@@ -198,6 +284,8 @@ pub fn reset_stats() {
     HITS.store(0, Ordering::Relaxed);
     MISSES.store(0, Ordering::Relaxed);
     PANICS.store(0, Ordering::Relaxed);
+    PASSES.store(0, Ordering::Relaxed);
+    SLABS_EMPTIED.store(0, Ordering::Relaxed);
 }
 
 /// Active defrag's lines of INFO memory.
@@ -207,12 +295,18 @@ pub fn info() -> String {
          active_defrag_hits:{}\r\n\
          active_defrag_misses:{}\r\n\
          active_defrag_panics:{}\r\n\
-         active_defrag_disabled_by_panics:{}\r\n",
+         active_defrag_disabled_by_panics:{}\r\n\
+         active_defrag_passes:{}\r\n\
+         active_defrag_slabs_emptied:{}\r\n\
+         active_defrag_last_pass_ms:{}\r\n",
         u8::from(running()),
         hits(),
         misses(),
         panics(),
         u8::from(off_by_panics()),
+        PASSES.load(Ordering::Relaxed),
+        SLABS_EMPTIED.load(Ordering::Relaxed),
+        LAST_PASS_MS.load(Ordering::Relaxed),
     )
 }
 
@@ -222,14 +316,47 @@ pub fn configure(config: &crate::config::Config) {
     set_ignore_bytes(config.active_defrag_ignore_bytes);
     set_threshold_lower(config.active_defrag_threshold_lower);
     set_cycle_max(config.active_defrag_cycle_max);
+    set_slab_waste_percent(config.active_defrag_slab_waste_percent);
+    set_slab_waste_bytes(config.active_defrag_slab_waste_bytes);
+    set_full_slab_free_percent(config.active_defrag_full_slab_free_percent);
 }
 
-/// Whether the slabs waste enough to compact: more than `ignore` bytes, and
-/// more than `percent` per cent of what is in them.
-fn wasting(ignore: u64, percent: u32) -> bool {
-    let fill = value_slab::fill();
+/// Which trigger found the slabs wasting enough to compact.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Trigger {
+    /// `active-defrag-threshold-lower` and `active-defrag-ignore-bytes`.
+    Ratio,
+    /// `active-defrag-slab-waste-percent` and `active-defrag-slab-waste-bytes`.
+    SlabWaste,
+}
+
+/// Which trigger the slabs' `fill` meets, at half of its thresholds if
+/// `half`, the ratio trigger first; the slab-waste trigger only if
+/// `slab_waste`. The ratio trigger: the waste is over `ignore` bytes and
+/// `percent` per cent of what is in the slabs. The slab-waste trigger: over
+/// its bytes, and its percentage of the slabs (0 is off).
+fn wasting(fill: &value_slab::Fill, half: bool, slab_waste: bool) -> Option<Trigger> {
     let waste = fill.slab_bytes.saturating_sub(fill.live_bytes) as u64;
-    waste > ignore && waste * 100 > fill.live_bytes as u64 * u64::from(percent)
+    let div = if half { 2 } else { 1 };
+    let (ignore, percent) = (ignore_bytes() / div, threshold_lower() / div);
+    if waste > ignore && waste * 100 > fill.live_bytes as u64 * u64::from(percent) {
+        return Some(Trigger::Ratio);
+    }
+    let (bytes, percent) = (slab_waste_bytes() / div, u64::from(slab_waste_percent()));
+    if slab_waste && percent > 0 && waste > bytes && waste * 100 * div > fill.slab_bytes as u64 * percent
+    {
+        return Some(Trigger::SlabWaste);
+    }
+    None
+}
+
+/// Whether a snapshot, an AOF rewrite or a backup is being written: the
+/// values it holds cannot move, and the old values of what is written
+/// meanwhile are freed once it is done.
+fn snapshotting() -> bool {
+    crate::stats::BGSAVE_IN_PROGRESS.load(Ordering::Acquire)
+        || crate::aof::rewrite_in_progress()
+        || crate::commands::backup::in_progress()
 }
 
 /// Start the thread that compacts `store`'s values.
@@ -251,10 +378,20 @@ pub fn spawn(store: Store) {
 /// own: in a process with several stores (the in-process servers of tests),
 /// another store's thread whose passes end does not start this one's count
 /// afresh (#370). Turning active defrag on, which is the process's, does.
+///
+/// Also what the thread keeps between ticks to decide when a pass starts:
+/// what was in the slabs at the last tick, and how long the slab-waste
+/// trigger stays off.
 struct Streak {
     in_a_row: u32,
     /// [`TURNED_ON`] when `in_a_row` was last started afresh.
     turned_on: u64,
+    /// `value_slab_live_bytes` at the last tick.
+    live_before: Option<usize>,
+    /// Until when the slab-waste trigger is off, and how long it was off
+    /// the last time (0: it got enough back since).
+    waste_off_until: Option<Instant>,
+    waste_off: Duration,
 }
 
 impl Streak {
@@ -262,6 +399,26 @@ impl Streak {
         Streak {
             in_a_row: 0,
             turned_on: TURNED_ON.load(Ordering::Relaxed),
+            live_before: None,
+            waste_off_until: None,
+            waste_off: Duration::ZERO,
+        }
+    }
+
+    /// Whether the slab-waste trigger may start a pass now.
+    fn slab_waste_on(&self) -> bool {
+        self.waste_off_until.is_none_or(|until| Instant::now() >= until)
+    }
+
+    /// A pass the slab-waste trigger started ended, getting `back` enough
+    /// or not: the trigger is on again, or off for twice as long as before.
+    fn waste_pass_ended(&mut self, enough: bool) {
+        if enough {
+            self.waste_off = Duration::ZERO;
+            self.waste_off_until = None;
+        } else {
+            self.waste_off = (self.waste_off * 2).clamp(WASTE_BACKOFF, WASTE_BACKOFF_MAX);
+            self.waste_off_until = Some(Instant::now() + self.waste_off);
         }
     }
 
@@ -360,7 +517,7 @@ fn report(panic: &Panicked, in_a_row: u32, outcome: Outcome) -> String {
 /// What the thread does each time it wakes: a pass, if one is due. Returns
 /// how long to sleep before the next.
 fn step(store: &Store, streak: &mut Streak) -> Duration {
-    match pass(store) {
+    match pass(store, streak) {
         Ok(false) => TICK,
         Ok(true) => {
             streak.in_a_row = 0;
@@ -377,11 +534,11 @@ fn step(store: &Store, streak: &mut Streak) -> Duration {
     }
 }
 
-/// A pass of compaction, if active defrag is on and the slabs waste enough:
-/// whether one ran, or how it panicked. A pass that panics leaves no slab
-/// being emptied, unless putting them back panicked too, and
-/// `active_defrag_running` at 0.
-fn pass(store: &Store) -> Result<bool, Failed> {
+/// A pass of compaction, if active defrag is on, the slabs waste enough and
+/// nothing says to wait (see the module's docs): whether one ran, or how it
+/// panicked. A pass that panics leaves no slab being emptied, unless putting
+/// them back panicked too, and `active_defrag_running` at 0.
+fn pass(store: &Store, streak: &mut Streak) -> Result<bool, Failed> {
     // Held while a panic's slabs are put back too: another store's thread
     // would otherwise start a pass, and have its own put back with them.
     let _one = ONE_AT_A_TIME.lock();
@@ -400,11 +557,31 @@ fn pass(store: &Store) -> Result<bool, Failed> {
     }
     let ran = in_pass(|| {
         catch_unwind(AssertUnwindSafe(|| {
-            let due = enabled() && wasting(ignore_bytes(), threshold_lower());
-            if due {
-                compact(store);
+            if !enabled() {
+                streak.live_before = None;
+                return false;
             }
-            due
+            let fill = value_slab::fill();
+            // A delete being refilled: the clients take the room themselves.
+            let refilling = streak.live_before.is_some_and(|before| {
+                fill.live_bytes > before + fill.slab_bytes / REFILL
+            }) && WAIT_FOR_REFILL.load(Ordering::Relaxed);
+            streak.live_before = Some(fill.live_bytes);
+            let Some(trigger) = wasting(&fill, false, streak.slab_waste_on()) else {
+                return false;
+            };
+            if refilling || snapshotting() {
+                return false;
+            }
+            let started = Instant::now();
+            let got = compact(store);
+            PASSES.fetch_add(1, Ordering::Relaxed);
+            LAST_PASS_MS.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            if trigger == Trigger::SlabWaste {
+                streak.waste_pass_ended(got.enough());
+            }
+            streak.live_before = Some(value_slab::fill().live_bytes);
+            true
         }))
     });
     ran.map_err(|panic| {
@@ -413,6 +590,7 @@ fn pass(store: &Store) -> Result<bool, Failed> {
         // is the slabs it chose, listed nowhere. Those this does not reach,
         // if it panics too, stay on the list for the next pass.
         let put_back = in_pass(|| catch_unwind(value_slab::finish_evacuation))
+            .map(|_| ())
             .map_err(|again| described(again.as_ref()));
         RUNNING.store(false, Ordering::Relaxed);
         Failed::Pass(Panicked { message, put_back })
@@ -494,23 +672,50 @@ fn log_error(line: String) {
     LOGGED.lock().push(line);
 }
 
+/// What a pass got back: the slabs it emptied, and the new ones it took for
+/// the values it moved.
+#[derive(Default, Clone, Copy, Debug)]
+struct Got {
+    emptied: u64,
+    fresh: u64,
+}
+
+impl Got {
+    /// Whether it was worth the pass ([`LITTLE_BACK`]).
+    fn enough(self) -> bool {
+        let net = self.emptied.saturating_sub(self.fresh);
+        net > 0 && net * LITTLE_BACK >= self.emptied
+    }
+}
+
 /// Empty the sparsest slabs, a set at a time, until the waste is under half
-/// the thresholds, or a set yields nothing. The caller holds
+/// the thresholds of both triggers, a set yields nothing, or a set run for
+/// the slab-waste trigger alone gets little back. The caller holds
 /// [`ONE_AT_A_TIME`].
-fn compact(store: &Store) {
+fn compact(store: &Store) -> Got {
     RUNNING.store(true, Ordering::Relaxed);
     let mut pacer = Pacer::default();
-    while enabled() && wasting(ignore_bytes() / 2, threshold_lower() / 2) {
-        // A set whose values together are an eighth of the slabs: what is
-        // moved takes new room before the slabs it left are given back.
-        let budget = (value_slab::slab_bytes() / 8).max(16 << 20);
-        if value_slab::plan_evacuation(budget) == 0 {
+    let mut got = Got::default();
+    loop {
+        if !enabled() || snapshotting() {
+            break;
+        }
+        let fill = value_slab::fill();
+        let Some(why) = wasting(&fill, true, true) else {
+            break;
+        };
+        // What may go into new slabs: what is moved takes that new room
+        // before the slabs it left are given back.
+        let budget = (fill.slab_bytes / BUDGET_SHARE).max(BUDGET_MIN);
+        let full = full_slab_free_percent() * 10;
+        if value_slab::plan_evacuation_with_full(budget, full) == 0 {
             break;
         }
         // For tests: a pass that panics with its slabs chosen and nothing
         // moved yet.
         fault_point(Fault::AfterPlan);
         let regions = value_slab::regions_snapshot();
+        let fresh_before = value_slab::fresh_slabs_taken_here();
         // Counted here, not read from `active_defrag_hits`, which a
         // `CONFIG RESETSTAT` can set to 0 while the set runs (#370).
         let mut moved = 0u64;
@@ -522,12 +727,20 @@ fn compact(store: &Store) {
                 }
             }
         }
-        value_slab::finish_evacuation();
-        if moved == 0 {
+        let round = Got {
+            emptied: value_slab::finish_evacuation() as u64,
+            fresh: value_slab::fresh_slabs_taken_here() - fresh_before,
+        };
+        SLABS_EMPTIED.fetch_add(round.emptied, Ordering::Relaxed);
+        got.emptied += round.emptied;
+        got.fresh += round.fresh;
+        // Past the ratio trigger's half, only while a round gets enough back.
+        if moved == 0 || (why == Trigger::SlabWaste && !round.enough()) {
             break;
         }
     }
     RUNNING.store(false, Ordering::Relaxed);
+    got
 }
 
 /// The blocks a chunk's moves left behind, freed when this is dropped: with
@@ -823,6 +1036,7 @@ mod tests {
             set_cycle_max(100);
             set_enabled(false);
             set_enabled(true);
+            WAIT_FOR_REFILL.store(false, Ordering::Relaxed);
             LOGGED.lock().clear();
             Setup { _one: one }
         }
@@ -832,6 +1046,7 @@ mod tests {
         fn drop(&mut self) {
             clear_faults();
             configure(&crate::config::Config::default());
+            WAIT_FOR_REFILL.store(true, Ordering::Relaxed);
         }
     }
 
@@ -1291,6 +1506,238 @@ mod tests {
         );
         assert!(!lines[0].contains("next pass is in"), "{}", lines[0]);
         check(&store, &INLINE);
+    }
+
+    /// A value the stress test can tell is whole: key, version and length,
+    /// then a checksum of everything after it, then bytes that follow from
+    /// the rest.
+    fn stamped(key: u32, version: u32, len: usize) -> Vec<u8> {
+        let len = len.max(20);
+        let mut v = Vec::with_capacity(len);
+        v.extend_from_slice(&key.to_le_bytes());
+        v.extend_from_slice(&version.to_le_bytes());
+        v.extend_from_slice(&(len as u32).to_le_bytes());
+        v.extend_from_slice(&[0; 8]);
+        let mut x = u64::from(key) << 32 | u64::from(version);
+        while v.len() < len {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            v.push((x >> 56) as u8);
+        }
+        let sum = checksum(&v[20..]);
+        v[12..20].copy_from_slice(&sum.to_le_bytes());
+        v
+    }
+
+    fn checksum(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+        })
+    }
+
+    /// Panics unless `bytes` is a whole [`stamped`] value of `key`.
+    fn check_stamped(key: u32, bytes: &[u8]) -> u32 {
+        assert!(bytes.len() >= 20, "key {key}: {} bytes", bytes.len());
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        assert_eq!(word(0), key, "another key's value");
+        assert_eq!(word(8) as usize, bytes.len(), "key {key}: torn length");
+        let sum = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+        assert_eq!(sum, checksum(&bytes[20..]), "key {key}: torn value");
+        assert_eq!(bytes, stamped(key, word(4), bytes.len()), "key {key}");
+        word(4)
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    /// What became of a key, as its writer last left it.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Last {
+        Gone,
+        /// Its value of this version and length, with a time to live or not.
+        Set(u32, usize, bool),
+    }
+
+    /// #240: passes of compaction back to back, choosing full slabs with any
+    /// room, while writers overwrite, delete, re-add and give a short time
+    /// to live to the very keys whose values are being moved (each writer
+    /// its own keys, so that what each key must hold is known), a sweeper
+    /// takes out the keys past their time, the values taken out are freed on
+    /// another thread (as the lazy free pool does), and readers check every
+    /// value they read by its checksum, some of them holding it a while (as a
+    /// reply or a snapshot does), and checking it again once the shard is
+    /// let go of. At the end every key holds what its writer last wrote to it,
+    /// byte for byte, or is gone if it had to be; and the lists check out.
+    #[test]
+    fn values_moved_under_writers_readers_and_expiry_stay_whole() {
+        use std::sync::atomic::AtomicUsize;
+        let _setup = Setup::new();
+        set_full_slab_free_percent(1);
+        const WRITERS: usize = 3;
+        const KEYS_EACH: usize = 6_000;
+        let run = Duration::from_millis(if cfg!(miri) { 300 } else { 3_000 });
+        let store = new_store(1);
+        let key = |i: usize| format!("s:{i}");
+        let stop = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (to_free, freeing) = std::sync::mpsc::channel::<crate::types::KiviDBValue>();
+        let freer = std::thread::spawn(move || {
+            let mut freed = 0usize;
+            for value in freeing {
+                drop(value);
+                freed += 1;
+            }
+            freed
+        });
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let (store, stop, to_free) = (Arc::clone(&store), Arc::clone(&stop), to_free.clone());
+                std::thread::spawn(move || {
+                    let mut last = vec![Last::Gone; KEYS_EACH];
+                    let mut x = 0x240u64 + w as u64;
+                    let mut version = 0u32;
+                    let db = &store[0];
+                    while !stop.load(Ordering::Relaxed) {
+                        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let slot = (x >> 33) as usize % KEYS_EACH;
+                        let i = w * KEYS_EACH + slot;
+                        let k = format!("s:{i}");
+                        let shard = &db[shard_index(db.len(), &k)];
+                        version += 1;
+                        // Mostly the sizes slabs hold, entries and strings of
+                        // their own, now and then one past the largest block.
+                        let len = match (x >> 20) % 16 {
+                            0 => 4_100 + (x >> 40) as usize % 2_000,
+                            1..=6 => 20 + (x >> 40) as usize % 100,
+                            _ => 100 + (x >> 40) as usize % 1_100,
+                        };
+                        let taken = match (x >> 12) % 10 {
+                            0 | 1 => {
+                                last[slot] = Last::Gone;
+                                shard.write().remove(&k)
+                            }
+                            2 => {
+                                last[slot] = Last::Set(version, len, true);
+                                let expires = now_ms() + 1 + (x >> 50) % 20;
+                                shard.write().insert_str_expiring(
+                                    &k,
+                                    stamped(i as u32, version, len),
+                                    Some(expires),
+                                )
+                            }
+                            _ => {
+                                last[slot] = Last::Set(version, len, false);
+                                shard.write().insert_str_expiring(&k, stamped(i as u32, version, len), None)
+                            }
+                        };
+                        if let Some(taken) = taken
+                            && to_free.send(taken.into_value_to_free()).is_err()
+                        {
+                            break;
+                        }
+                    }
+                    last
+                })
+            })
+            .collect();
+        let readers: Vec<_> = (0..2)
+            .map(|r| {
+                let (store, stop, reads) = (Arc::clone(&store), Arc::clone(&stop), Arc::clone(&reads));
+                std::thread::spawn(move || {
+                    let mut x = 0x2400u64 + r as u64;
+                    let db = &store[0];
+                    let mut held = Vec::new();
+                    while !stop.load(Ordering::Relaxed) {
+                        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let i = (x >> 33) as usize % (WRITERS * KEYS_EACH);
+                        let k = format!("s:{i}");
+                        let map = db[shard_index(db.len(), &k)].read();
+                        match map.get(&k) {
+                            Some(ValueRef::String(s)) => {
+                                check_stamped(i as u32, s.as_bytes());
+                                if (x >> 10) % 8 == 0 {
+                                    held.push((i, s.to_shared()));
+                                }
+                            }
+                            None => {}
+                            Some(_) => panic!("key {i} is not a string"),
+                        }
+                        drop(map);
+                        reads.fetch_add(1, Ordering::Relaxed);
+                        if held.len() > 64 {
+                            for (i, bytes) in held.drain(..) {
+                                check_stamped(i as u32, bytes.as_slice());
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        let sweeper = {
+            let (store, stop, to_free) = (Arc::clone(&store), Arc::clone(&stop), to_free.clone());
+            std::thread::spawn(move || {
+                let db = &store[0];
+                let mut x = 0x24000u64;
+                while !stop.load(Ordering::Relaxed) {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let i = (x >> 33) as usize % (WRITERS * KEYS_EACH);
+                    let k = key(i);
+                    let taken = db[shard_index(db.len(), &k)].write().remove_if_due(&k, now_ms());
+                    if let Some(taken) = taken {
+                        let _ = to_free.send(taken.into_value_to_free());
+                    }
+                }
+            })
+        };
+        drop(to_free);
+        // Compaction, back to back, and the lists checked between passes.
+        let mut streak = Streak::new();
+        let (started, hits_before, emptied_before) = (Instant::now(), hits(), SLABS_EMPTIED.load(Ordering::Relaxed));
+        let mut passes = 0;
+        while started.elapsed() < run {
+            stepped(&store, &mut streak);
+            value_slab::check_lists(false).unwrap();
+            passes += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+        sweeper.join().unwrap();
+        let lasts: Vec<Vec<Last>> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert!(freer.join().unwrap() > 0, "nothing freed on the other thread");
+        // One more pass with everyone gone, then every key checked.
+        stepped(&store, &mut streak);
+        let db = &store[0];
+        let now = now_ms();
+        for (w, last) in lasts.iter().enumerate() {
+            for (slot, &last) in last.iter().enumerate() {
+                let i = w * KEYS_EACH + slot;
+                let k = key(i);
+                let map = db[shard_index(db.len(), &k)].read();
+                match (map.get(&k), last) {
+                    (None, Last::Gone) | (None, Last::Set(_, _, true)) => {}
+                    (Some(ValueRef::String(s)), Last::Set(version, len, ttl)) => {
+                        let got = check_stamped(i as u32, s.as_bytes());
+                        assert_eq!((got, s.len()), (version, len.max(20)), "key {i}: not the last write");
+                        // One past its time may not have been swept yet.
+                        assert!(!ttl || map.expires(&k).is_some(), "key {i} lost its time to live");
+                    }
+                    (got, last) => panic!(
+                        "key {i}: {} where its writer left {last:?} (now {now})",
+                        if got.is_some() { "a value" } else { "nothing" }
+                    ),
+                }
+            }
+        }
+        value_slab::check_lists(false).unwrap();
+        let moved = hits() - hits_before;
+        let emptied = SLABS_EMPTIED.load(Ordering::Relaxed) - emptied_before;
+        assert!(passes > 3 && moved > 0 && emptied > 0, "{passes} passes, {moved} moved, {emptied} slabs emptied");
+        assert!(reads.load(Ordering::Relaxed) > 1000);
     }
 
     #[test]

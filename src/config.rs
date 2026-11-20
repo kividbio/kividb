@@ -274,6 +274,23 @@ pub struct Config {
     #[arg(long, default_value_t = 10)]
     pub active_defrag_cycle_max: u32,
 
+    /// The free room inside the slabs, as a percentage of them, over which
+    /// active defrag starts as well (and more than
+    /// `active-defrag-slab-waste-bytes`). 0: only the two settings above
+    /// start it.
+    #[arg(long, default_value_t = 10)]
+    pub active_defrag_slab_waste_percent: u32,
+
+    /// The free room inside the slabs, in bytes, over which active defrag
+    /// starts as well (and over `active-defrag-slab-waste-percent`).
+    #[arg(long, default_value_t = 16 << 20)]
+    pub active_defrag_slab_waste_bytes: u64,
+
+    /// The share of a full slab's blocks, as a percentage, that must be free
+    /// for active defrag to empty it. 0: full slabs are left alone.
+    #[arg(long, default_value_t = 12)]
+    pub active_defrag_full_slab_free_percent: u32,
+
     /// Working directory: where `dump.kdb`, `appendonly.aof`, backups and
     /// `nodes.conf` live (Redis `dir`). Empty = the directory the server was
     /// started in.
@@ -738,6 +755,9 @@ impl Default for Config {
             active_defrag_ignore_bytes: 64 << 20,
             active_defrag_threshold_lower: 20,
             active_defrag_cycle_max: 10,
+            active_defrag_slab_waste_percent: 10,
+            active_defrag_slab_waste_bytes: 16 << 20,
+            active_defrag_full_slab_free_percent: 12,
             dir: String::new(),
             loglevel: "info".into(),
             logfile: String::new(),
@@ -886,6 +906,9 @@ impl Config {
             active_defrag_ignore_bytes: 64 << 20,
             active_defrag_threshold_lower: 20,
             active_defrag_cycle_max: 10,
+            active_defrag_slab_waste_percent: 10,
+            active_defrag_slab_waste_bytes: 16 << 20,
+            active_defrag_full_slab_free_percent: 12,
             dir: String::new(),
             loglevel: "warn".into(),
             logfile: String::new(),
@@ -1329,6 +1352,18 @@ impl Config {
         out.push_str(&format!(
             "active-defrag-cycle-max {}\n",
             self.active_defrag_cycle_max
+        ));
+        out.push_str(&format!(
+            "active-defrag-slab-waste-percent {}\n",
+            self.active_defrag_slab_waste_percent
+        ));
+        out.push_str(&format!(
+            "active-defrag-slab-waste-bytes {}\n",
+            self.active_defrag_slab_waste_bytes
+        ));
+        out.push_str(&format!(
+            "active-defrag-full-slab-free-percent {}\n",
+            self.active_defrag_full_slab_free_percent
         ));
         out.push_str(&format!(
             "key-access-tracking {}\n",
@@ -2123,6 +2158,25 @@ impl Config {
                 set!(active_defrag_threshold_lower, number(key, one()?)?)
             }
             "active-defrag-cycle-max" => set!(active_defrag_cycle_max, number(key, one()?)?),
+            "active-defrag-slab-waste-percent" => {
+                let n: u32 = number(key, one()?)?;
+                if n > 100 {
+                    return Err("'active-defrag-slab-waste-percent' must be between 0 and 100".into());
+                }
+                set!(active_defrag_slab_waste_percent, n)
+            }
+            "active-defrag-slab-waste-bytes" => {
+                set!(active_defrag_slab_waste_bytes, parse_memory(key, one()?)?)
+            }
+            "active-defrag-full-slab-free-percent" => {
+                let n: u32 = number(key, one()?)?;
+                if n > 100 {
+                    return Err(
+                        "'active-defrag-full-slab-free-percent' must be between 0 and 100".into(),
+                    );
+                }
+                set!(active_defrag_full_slab_free_percent, n)
+            }
             "key-access-tracking" => set!(key_access_tracking, yes_no(key, one()?)?),
             "tracking-table-max-keys" => crate::tracking::DEFAULT_MAX_KEYS
                 .store(number(key, one()?)?, std::sync::atomic::Ordering::Relaxed),

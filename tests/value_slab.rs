@@ -292,3 +292,84 @@ fn a_slab_that_empties_between_the_passes_is_left_alone() {
     }
     assert_eq!(value_slab::slabs_in_use(), before);
 }
+
+/// A full slab of `class`, let go of, with `free` of its blocks freed: still
+/// too full for its class's list of partial slabs, so in the list of full
+/// ones. Its blocks still held.
+fn full_with_room(class: usize, free: usize) -> Vec<usize> {
+    let per_slab = SLAB / value_slab::block_size(class);
+    let mut blocks = blocks_of(class, per_slab + 1);
+    let last = blocks.pop().unwrap();
+    assert_ne!(last & !(SLAB - 1), blocks[0] & !(SLAB - 1));
+    free_block(last, class);
+    for block in blocks.drain(..free) {
+        free_block(block, class);
+    }
+    blocks
+}
+
+/// As `a_slab_that_empties_between_the_passes_is_left_alone`, for a full
+/// slab chosen from its class's list of full slabs (#240): the generation
+/// check holds for it as for a partial one. A full slab can be taken by
+/// another thread exactly as a partial one can.
+#[test]
+fn a_full_slab_that_empties_between_the_passes_is_left_alone() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let before = value_slab::slabs_in_use();
+    const CLASS: usize = 21;
+    let per_slab = SLAB / value_slab::block_size(CLASS);
+    // An eighth and a block free: under a quarter, so not listed.
+    let room = per_slab / 8 + 1;
+    let regions = value_slab::regions_snapshot;
+    // Below the threshold, it is left alone; at it, it is chosen.
+    let held = full_with_room(CLASS, room);
+    let slab = held[0] & !(SLAB - 1);
+    assert_eq!(
+        value_slab::plan_evacuation(usize::MAX),
+        0,
+        "a full slab chosen as partial"
+    );
+    assert_eq!(value_slab::plan_evacuation_with_full(usize::MAX, 500), 0);
+    assert!(!value_slab::is_evacuating(held[0] as *const u8, &regions()));
+    assert_eq!(value_slab::plan_evacuation_with_full(usize::MAX, 125), 1);
+    assert!(value_slab::is_evacuating(held[0] as *const u8, &regions()));
+    value_slab::check_lists(true).unwrap();
+    assert_eq!(value_slab::finish_evacuation(), 0);
+    assert!(!value_slab::is_evacuating(held[0] as *const u8, &regions()));
+    value_slab::check_lists(true).unwrap();
+    // Between the passes it empties, another thread takes it for the same
+    // class, fills it and lets go of it, and as many blocks are freed: the
+    // same header in the same list of full slabs, as full, but not the slab
+    // measured. It is left alone.
+    let measured = value_slab::generation_of(slab as *const u8);
+    let again = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let theirs = std::sync::Arc::clone(&again);
+    *BETWEEN.lock().unwrap() = Some(Box::new(move || {
+        for block in held {
+            free_block(block, CLASS);
+        }
+        let blocks = full_with_room(CLASS, room);
+        assert_eq!(blocks[0] & !(SLAB - 1), slab, "the same slab, taken again");
+        *theirs.lock().unwrap() = blocks;
+    }));
+    *value_slab::PAUSE_BETWEEN_PASSES.lock() = Some(between);
+    let chosen = value_slab::plan_evacuation_with_full(usize::MAX, 125);
+    *value_slab::PAUSE_BETWEEN_PASSES.lock() = None;
+    let held = std::mem::take(&mut *again.lock().unwrap());
+    assert_ne!(value_slab::generation_of(slab as *const u8), measured);
+    assert!(
+        !value_slab::is_evacuating(held[0] as *const u8, &regions()),
+        "a full slab chosen that emptied and was let go of again after it was measured"
+    );
+    assert_eq!(chosen, 0);
+    value_slab::finish_evacuation();
+    value_slab::check_lists(true).unwrap();
+    // Chosen, and emptied while chosen: counted as emptied, and given back.
+    assert_eq!(value_slab::plan_evacuation_with_full(usize::MAX, 125), 1);
+    for block in held {
+        free_block(block, CLASS);
+    }
+    assert_eq!(value_slab::finish_evacuation(), 1);
+    value_slab::check_lists(true).unwrap();
+    assert_eq!(value_slab::slabs_in_use(), before);
+}
