@@ -205,6 +205,9 @@ jobs:
 
   # ── Build kividb + vector-db-benchmark, provision both instances, run, compare ─
   benchmark:
+    # Its secrets live in the `benchmark` environment, which only runs from
+    # master may use.
+    environment: benchmark
     needs: launch
     # arm64, native (GA'd 2026-01 for private repos) -- matches the arm64
     # Azure machines `launch` provisions, so `cargo build --release`
