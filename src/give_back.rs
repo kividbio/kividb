@@ -24,7 +24,7 @@
 //! has applied a heavy stream is one: everything it allocates on the way to
 //! applying a write is allocated on its one applier thread, so in one
 //! arena, which after 2.5M writes of 256 B was 128 MiB with 118 MiB of it
-//! free; a master after the same load kept 22 to 38 MiB that a `MEMORY
+//! free; a master after the same load kept 20 to 37 MiB that a `MEMORY
 //! PURGE` gave back. So once a second, while idle, the thread compares RSS
 //! with what is allocated ([`gap_worth_trimming`]). The gap a trim leaves
 //! (slab blocks left empty, what the allocator cannot return) is the floor
