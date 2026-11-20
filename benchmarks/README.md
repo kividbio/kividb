@@ -38,6 +38,9 @@ ci.sh run DIR PORT OUT.xml   run its tests against a server already listening on
 - **`kividb-passes.txt`**, optional, lists checks KiviDB passes, one `classname::name` a line (`#` for
   comments), for a harness whose checks Redis largely fails, so that comparing with Redis alone would
   miss most of them: the job fails if KiviDB stops passing one. Add a check to it once KiviDB passes it.
+- **`kividb-variant`**, optional, one word, `lua`: the harness needs scripting, which the default image
+  does not have, so its KiviDB side runs the `lua` variant of the image (`<image>-lua`, or
+  `KIVIDB_LUA_IMAGE`). A harness that does not need Lua tests the default image, as users run it.
 - No secrets, no model API keys, no network access beyond fetching the framework, its packages and
   its test fixtures.
 
@@ -56,3 +59,10 @@ add a step for it to `compat.yml` with its own `timeout-minutes`.
 | `langgraph` | langgraph-checkpoint-redis 0.6.0 with langgraph 1.2.19, through this folder's own harness (23 checks) | under 10 s in all, the install included |
 | `llamaindex` | llama-index-core 0.14.25 with its Redis stores, through this folder's own harness (54 checks) | under 10 s in all, the install included |
 | `mem0` | mem0ai 2.2.1, through this folder's own harness (24 checks) | under 10 s in all, the install included |
+| `stoplight` | Stoplight 5.8.3 (the version Mastodon uses), its whole rspec suite (765 examples), in a pinned Ruby image; `lua` variant | about 1 min per server after the first run pulls the image and installs the gems |
+| `sidekiq-unique-jobs` | sidekiq-unique-jobs 8.1.0, its whole rspec suite (1,069 examples; 1 fails on Redis and on KiviDB); `lua` variant | under 1 min per server |
+| `sidekiq-scheduler` | sidekiq-scheduler 6.0.2 with Sidekiq 8, its whole rspec suite (274 examples; the same 5 environment failures on Redis and on KiviDB); `lua` variant | about 30 s per server |
+| `sidekiq-mastodon` | Sidekiq 8.1.7 with Mastodon v4.7.6's `config/sidekiq.yml` queues, 10,000 jobs at 25, 100, 500 and 1,000 threads, every job run once, a scheduled job and a retry (26 checks); `lua` variant | under 1 min per server |
+| `sentry-spans` | getsentry/sentry's span buffer script `add-buffer.lua` (pinned commit), run as Sentry runs it, with real keys (13 checks); `lua` variant | seconds |
+| `client-tracking` | `CLIENT TRACKING ON REDIRECT <id> NOLOOP` with invalidations on `__redis__:invalidate`, the way Frappe uses it (17 checks); default image | seconds |
+| `ratelimit-scripts` | the rate limiters' scripts called as their gateways call them: Spring Cloud Gateway v5.1.0 `request_rate_limiter.lua`, Traefik v3.7.17's token bucket, Kong 3.9.4's `incr` + `expire` (18 checks); `lua` variant | seconds |
