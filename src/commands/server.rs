@@ -597,6 +597,33 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                     "ERR CONFIG SET failed (possibly related to argument 'active-defrag-cycle-max') - argument must be between 1 and 99 inclusive",
                 )),
             },
+            "active-defrag-slab-waste-percent" => match value.parse::<u32>() {
+                Ok(percent) if percent <= 100 => {
+                    crate::compaction::set_slab_waste_percent(percent);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'active-defrag-slab-waste-percent') - argument must be between 0 and 100 inclusive",
+                )),
+            },
+            "active-defrag-slab-waste-bytes" => match memory_size(value) {
+                Some(bytes) => {
+                    crate::compaction::set_slab_waste_bytes(bytes as u64);
+                    Some(resp_simple("OK"))
+                }
+                None => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'active-defrag-slab-waste-bytes') - argument must be a memory value",
+                )),
+            },
+            "active-defrag-full-slab-free-percent" => match value.parse::<u32>() {
+                Ok(percent) if percent <= 100 => {
+                    crate::compaction::set_full_slab_free_percent(percent);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error(
+                    "ERR CONFIG SET failed (possibly related to argument 'active-defrag-full-slab-free-percent') - argument must be between 0 and 100 inclusive",
+                )),
+            },
             "requirepass" => {
                 // Update the default user's password in acl_store — this is the
                 // authoritative source for authentication, not config.requirepass.
@@ -2386,6 +2413,18 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         (
             "active-defrag-cycle-max",
             crate::compaction::cycle_max().to_string(),
+        ),
+        (
+            "active-defrag-slab-waste-percent",
+            crate::compaction::slab_waste_percent().to_string(),
+        ),
+        (
+            "active-defrag-slab-waste-bytes",
+            crate::compaction::slab_waste_bytes().to_string(),
+        ),
+        (
+            "active-defrag-full-slab-free-percent",
+            crate::compaction::full_slab_free_percent().to_string(),
         ),
         ("requirepass", requirepass),
         (
@@ -5248,6 +5287,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let fill = crate::value_slab::fill();
                 out.push_str(&format!("value_slab_bytes:{}\r\n", fill.slab_bytes));
                 out.push_str(&format!("value_slab_live_bytes:{}\r\n", fill.live_bytes));
+                // What the slabs too full to be used for blocks again have
+                // free, which only active defrag gets back (#240).
+                out.push_str(&format!(
+                    "value_slab_full_free_bytes:{}\r\n",
+                    fill.full_free_bytes
+                ));
                 // The entry pool's slabs (large hashes' and sets' entries),
                 // which active defrag leaves alone: not in the two above.
                 out.push_str(&format!(
