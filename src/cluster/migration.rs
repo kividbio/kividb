@@ -3648,15 +3648,19 @@ fn take_over_now(
             .read()
             .values()
             .filter(|n| n.master_id == Some(me) && n.flags.contains(super::NodeFlags::REPLICA))
-            .map(|n| (!n.flags.contains(super::NodeFlags::FAIL), (n.id, addresses(n))))
+            .map(|n| {
+                (
+                    !n.flags.contains(super::NodeFlags::FAIL),
+                    (n.id, addresses(n)),
+                )
+            })
             .partition(|(not_failed, _)| *not_failed);
         let replicas: Vec<(super::NodeId, Vec<(String, u16)>)> = required
             .iter()
             .chain(if_attached.iter())
             .map(|(_, r)| r.clone())
             .collect();
-        let required: Vec<Vec<(String, u16)>> =
-            required.into_iter().map(|(_, (_, a))| a).collect();
+        let required: Vec<Vec<(String, u16)>> = required.into_iter().map(|(_, (_, a))| a).collect();
         let if_attached: Vec<Vec<(String, u16)>> =
             if_attached.into_iter().map(|(_, (_, a))| a).collect();
         log_info!(

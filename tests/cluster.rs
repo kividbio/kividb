@@ -9440,11 +9440,14 @@ fn a_link_that_is_no_replica_of_this_node_does_not_hold_the_takeover_up() {
 
 /// Nor does such a link stand in for a replica of the destination that is
 /// down and not yet marked failed: a `PSYNC` from a test acknowledges
-/// everything, the destination's replica is stopped, and the takeover is
-/// refused, naming the replica, until the replica is marked failed.
+/// everything, the destination's replica is stopped while the takeover
+/// waits (the stream held back, `KIVIDB_TEST_STREAM_STALL`), and the
+/// takeover is refused, naming the replica, until the replica is marked
+/// failed.
 #[test]
 fn a_link_that_is_no_replica_of_this_node_does_not_stand_in_for_one() {
-    let (nodes, _) = form_cluster(3);
+    let dst = Node::start_with_env(&[], &[("KIVIDB_TEST_STREAM_STALL", "stream-stall")]);
+    let (nodes, _) = form_cluster_of(vec![Node::start(&[]), dst, Node::start(&[])]);
     let mut replica = add_replica(&nodes, &nodes[1]);
     {
         let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
@@ -9473,17 +9476,26 @@ fn a_link_that_is_no_replica_of_this_node_does_not_stand_in_for_one() {
     };
     let before = Written::on(&nodes[0], 0..=100, "before", 200);
     let replica_port = replica.port;
-    replica.kill();
+    let stall = nodes[1].dir.join("stream-stall");
+    std::fs::write(&stall, "").unwrap();
     let task_id = nodes[1]
         .conn()
         .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "100"])
         .text();
     assert_eq!(task_id.len(), 40, "{task_id}");
-    let refused = format!(":{replica_port} has not acknowledged what arrived in time");
     wait_until(
-        "the takeover to be refused for the stopped replica",
+        "the takeover to wait for the replica",
         Duration::from_secs(30),
-        || nodes[1].log().contains(&refused),
+        || nodes[1].log().contains("Taking slots 0-100 over once"),
+    );
+    replica.kill();
+    let refused = format!(":{replica_port} has not acknowledged what arrived in time");
+    assert!(
+        wait_until_or(Duration::from_secs(30), || nodes[1]
+            .log()
+            .contains(&refused)),
+        "the takeover was not refused for the stopped replica\n{}",
+        nodes[1].log()
     );
     let status = nodes[1]
         .conn()
@@ -9496,6 +9508,7 @@ fn a_link_that_is_no_replica_of_this_node_does_not_stand_in_for_one() {
         "{status:?}"
     );
     // Once the replica is marked failed, the slots are taken over.
+    std::fs::remove_file(&stall).unwrap();
     wait_import_completed(&nodes[1], &task_id);
     let absent = before.missing_on(&nodes[1]);
     assert!(absent.is_empty(), "{} keys not on the owner", absent.len());
