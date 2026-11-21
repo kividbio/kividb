@@ -740,7 +740,7 @@ pub(crate) async fn broadcast_auth_request(
             request_epoch: epoch,
             master_id,
             force,
-            claims: with_claims.then(|| state.slot_claims_of(master_id)),
+            claims: with_claims.then(|| state.held_claims_of_master(master_id)),
             claims_unreadable: false,
         }
     };
@@ -797,7 +797,7 @@ pub(crate) async fn broadcast_auth_request(
                         let BusMessage::FailoverAuthRequest { claims, .. } = &mut msg else {
                             break;
                         };
-                        let now = state.slot_claims_of(master_id);
+                        let now = state.held_claims_of_master(master_id);
                         if now.is_empty() {
                             break;
                         }

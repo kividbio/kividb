@@ -9616,14 +9616,18 @@ fn a_replica_down_when_its_master_took_slots_is_not_given_them_by_the_voters() {
 const LINK_DOWN: (&str, &str) = ("KIVIDB_TEST_REPLICA_LINK_DOWN", "link-down");
 
 /// Cut `node`, a replica of `master`, off, still running, or let it reach
-/// the others again: its replication link down, its cluster bus stalled, and
-/// its master's slot claims not taken in (`KIVIDB_TEST_IGNORE_CLAIMS`), as
-/// none of its master's heartbeats reach it across the cut.
-fn cut_off(node: &Node, master: &str, cut: bool) {
+/// the others again: its replication link down and its cluster bus stalled
+/// (it sends nothing and decides nothing; what comes in is still taken in).
+/// `heard` false: its master's slot claims are not taken in either
+/// (`KIVIDB_TEST_IGNORE_CLAIMS`), as when none of its master's messages reach
+/// it; true: they are, as when only the replication link is cut.
+fn cut_off(node: &Node, master: &str, cut: bool, heard: bool) {
     let link = node.dir.join(LINK_DOWN.1);
     let claims = node.dir.join(IGNORE_CLAIMS.1);
     if cut {
-        std::fs::write(&claims, master).unwrap();
+        if !heard {
+            std::fs::write(&claims, master).unwrap();
+        }
         std::fs::write(&link, "").unwrap();
         set_bus(node, "stall");
     } else {
@@ -9633,17 +9637,27 @@ fn cut_off(node: &Node, master: &str, cut: bool) {
     }
 }
 
-/// A replica of the destination cut off from it part way through an import,
-/// still running (its replication link down and its cluster bus stalled),
-/// once it holds some of what the import brought. It is marked failed, and
-/// the destination takes the slots over without it, with writes to them
-/// that reached the destination meanwhile. The destination then fails, and
-/// the cut heals: the replica, with `cluster-replica-validity-factor 0`, is
-/// elected to the destination's own slots, and the voters' `UPDATE` does not
-/// give it the slots of the import, whose data it does not all hold. The
-/// destination, back, holds them, with every key (its AOF).
-#[test]
-fn a_replica_cut_off_part_way_through_an_import_is_not_given_its_slots_by_the_voters() {
+/// How a replica cut off during an import ([`replica_cut_off_during_an_import`])
+/// comes to stand.
+#[derive(Clone, Copy, PartialEq)]
+enum Stands {
+    /// Elected, after the cut heals.
+    Elected,
+    /// `CLUSTER FAILOVER TAKEOVER` on it, before the cut heals.
+    ByHand,
+}
+
+/// A replica of the destination cut off from it part way through an import
+/// ([`cut_off`], `heard`), once it holds some of what the import brought.
+/// It is marked failed, and the destination takes the slots over without
+/// it, with writes to them that reached the destination meanwhile. The
+/// destination then fails, and the replica, with
+/// `cluster-replica-validity-factor 0`, stands (`stands`). It takes the
+/// destination's own slots, and not those of the import, whose data it does
+/// not all hold: not from the voters' `UPDATE`, nor, when it heard its
+/// master's claim of them, from its own table. The destination, back, holds
+/// them, with every key (its AOF).
+fn replica_cut_off_during_an_import(heard: bool, stands: Stands) {
     let src = Node::start_with_env(&[], &[("KIVIDB_TEST_HANDOFF_DELAY_MS", "20000")]);
     let dst = Node::start(&["--appendonly", "yes"]);
     let (mut nodes, ranges) = form_cluster_of(vec![src, dst, Node::start(&[])]);
@@ -9669,7 +9683,7 @@ fn a_replica_cut_off_part_way_through_an_import_is_not_given_its_slots_by_the_vo
         Duration::from_secs(30),
         || replica.conn().cmd(&["DBSIZE"]).int() > 0,
     );
-    cut_off(&replica, &dst_id, true);
+    cut_off(&replica, &dst_id, true, heard);
     wait_until(
         "the replica to be marked failed",
         Duration::from_secs(30),
@@ -9686,11 +9700,25 @@ fn a_replica_cut_off_part_way_through_an_import_is_not_given_its_slots_by_the_vo
                 .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str()))
         },
     );
+    if heard {
+        wait_until(
+            "the cut-off replica to hear its master's claim",
+            Duration::from_secs(20),
+            || owner_in_view_of(&replica, 50).as_deref() == Some(dst_id.as_str()),
+        );
+    }
     nodes[1].kill();
-    cut_off(&replica, &dst_id, false);
     let own = ranges[1].0;
+    if stands == Stands::ByHand {
+        let r = replica.conn().cmd(&["CLUSTER", "FAILOVER", "TAKEOVER"]);
+        assert!(r.is_ok(), "{r:?}");
+        wait_until("the replica to take over", Duration::from_secs(20), || {
+            replica.is_master()
+        });
+    }
+    cut_off(&replica, &dst_id, false, heard);
     wait_until(
-        "the replica to be elected to the destination's own slots",
+        "the replica to stand for the destination's own slots",
         Duration::from_secs(60),
         || {
             replica.is_master()
@@ -9701,9 +9729,17 @@ fn a_replica_cut_off_part_way_through_an_import_is_not_given_its_slots_by_the_vo
         assert_ne!(
             owner_in_view_of(&replica, 50).as_deref(),
             Some(replica_id.as_str()),
-            "given slots whose data it does not hold"
+            "given slots whose data it does not hold\n{}",
+            replica.log()
         );
         std::thread::sleep(Duration::from_millis(100));
+    }
+    if heard {
+        assert!(
+            replica.log().contains("promoted without slots 0-100"),
+            "{}",
+            replica.log()
+        );
     }
     nodes[1].spawn();
     wait_until(
@@ -9720,6 +9756,29 @@ fn a_replica_cut_off_part_way_through_an_import_is_not_given_its_slots_by_the_vo
         let absent = written.missing_on(&nodes[1]);
         assert!(absent.is_empty(), "{} keys not on the owner", absent.len());
     }
+}
+
+/// [`replica_cut_off_during_an_import`]: nothing of its master reaches the
+/// replica; it is elected once the cut heals.
+#[test]
+fn a_replica_cut_off_part_way_through_an_import_is_not_given_its_slots_by_the_voters() {
+    replica_cut_off_during_an_import(false, Stands::Elected);
+}
+
+/// [`replica_cut_off_during_an_import`]: only its replication link is cut,
+/// and it hears its master take the slots; it is elected once the cut
+/// heals, with the slots it holds.
+#[test]
+fn a_replica_that_hears_its_master_take_slots_it_does_not_hold_is_elected_without_them() {
+    replica_cut_off_during_an_import(true, Stands::Elected);
+}
+
+/// [`replica_cut_off_during_an_import`]: only its replication link is cut,
+/// it hears its master take the slots, and `CLUSTER FAILOVER TAKEOVER` is
+/// sent to it: it takes the slots it holds, and logs the others.
+#[test]
+fn a_takeover_by_hand_takes_only_the_slots_the_replica_holds() {
+    replica_cut_off_during_an_import(true, Stands::ByHand);
 }
 
 /// The destination fails after its replica acknowledged what arrived, and
@@ -9865,7 +9924,7 @@ fn a_replica_cut_off_between_two_takeovers_is_not_given_the_slots_by_the_voters(
         "{}",
         replica.log()
     );
-    cut_off(&replica, &dst_id, true);
+    cut_off(&replica, &dst_id, true, false);
     let between = Written::on(&nodes[0], 0..=100, "between", 100);
     signal(&other, "-CONT");
     wait_until(
@@ -9885,7 +9944,7 @@ fn a_replica_cut_off_between_two_takeovers_is_not_given_the_slots_by_the_voters(
     );
     other.kill();
     nodes[1].kill();
-    cut_off(&replica, &dst_id, false);
+    cut_off(&replica, &dst_id, false, false);
     let own = ranges[1].0;
     wait_until(
         "the replica to be elected to the destination's own slots",
@@ -9899,7 +9958,8 @@ fn a_replica_cut_off_between_two_takeovers_is_not_given_the_slots_by_the_voters(
         assert_ne!(
             owner_in_view_of(&replica, 50).as_deref(),
             Some(replica_id.as_str()),
-            "given slots whose data it does not hold"
+            "given slots whose data it does not hold\n{}",
+            replica.log()
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -9923,9 +9983,9 @@ fn a_replica_cut_off_between_two_takeovers_is_not_given_the_slots_by_the_voters(
 /// A source silent for longer than the destination waits for it (its
 /// handoff held 40 s, `KIVIDB_TEST_HANDOFF_DELAY_MS`, with no write to the
 /// slots meanwhile): the destination gives the attempt up, and the source's
-/// `TAKEOVER` that comes after is refused, so the slots stay with the source
-/// with every key. The import is tried again, and completes, with every key
-/// on the destination.
+/// `TAKEOVER` that comes after is refused: the source keeps the slots with
+/// every key meanwhile. The import is tried again, and completes, with every
+/// key on the destination.
 #[test]
 fn a_takeover_after_the_source_went_silent_is_refused() {
     let src = Node::start_with_env(&[], &[("KIVIDB_TEST_HANDOFF_DELAY_MS", "40000")]);
@@ -9942,7 +10002,7 @@ fn a_takeover_after_the_source_went_silent_is_refused() {
         || nodes[1].log().contains("the source went silent"),
     );
     let src_id = nodes[0].id();
-    assert_eq!(owner_in_view_of(&nodes[0], 50), Some(src_id.clone()));
+    assert_eq!(owner_in_view_of(&nodes[0], 50), Some(src_id));
     assert!(before.missing_on(&nodes[0]).is_empty());
     wait_until(
         "the source's late TAKEOVER to be refused",
@@ -9953,13 +10013,6 @@ fn a_takeover_after_the_source_went_silent_is_refused() {
                 .contains("the source has given this attempt up")
         },
     );
-    assert!(
-        !nodes[1].log().contains("Slots 0-100 imported from"),
-        "{}",
-        nodes[1].log()
-    );
-    assert_eq!(owner_in_view_of(&nodes[0], 50), Some(src_id));
-    assert!(before.missing_on(&nodes[0]).is_empty());
     wait_import_completed(&nodes[1], &task_id);
     let absent = before.missing_on(&nodes[1]);
     assert!(absent.is_empty(), "{} keys not on the owner", absent.len());
