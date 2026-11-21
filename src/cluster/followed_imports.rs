@@ -169,20 +169,61 @@ pub(crate) struct FollowedImports {
     /// look than the last one written (see [`write_down`]).
     looks: std::sync::atomic::AtomicU64,
     written: Mutex<u64>,
-    /// The imports this node saw begin in its master's stream (the marker
-    /// of the moment its master looked at its own keys), in the session it
-    /// is in: forgotten at every session's start, a full sync's or a
-    /// partial one's ([`Self::seen_importing`]). By import id, its slots.
-    seen_live: Mutex<std::collections::HashMap<String, Ranges>>,
+    /// The imports into this node's master whose data this node holds in
+    /// full, as its master's stream told (`ARRIVED` markers, see
+    /// [`encode_arrived`]): what a vote's `UPDATE` may give it of its
+    /// master's claims (see `ClusterState::master_claims_arrived`).
+    arrived: Mutex<Vec<Arrived>>,
 }
 
+/// An `ARRIVED` marker read in the stream of `master`: every record of an
+/// import of `ranges` into it came before, for it to take them over at
+/// config epoch `epoch`.
+///
+/// Forgotten when this node's dataset is no longer that stream's as of the
+/// marker: at a full sync (the dataset is replaced; the marker is not sent
+/// again with it), and when this node follows another master. Kept across a
+/// link drop and a partial resync with the same master: the dataset is the
+/// same stream, continued. Forgotten too once a `TAKEN` of the master at
+/// that epoch or later has been taken in: the slots are the master's here
+/// from then on, which the `UPDATE` filter accepts in any case.
+#[derive(Clone, Debug)]
+struct Arrived {
+    master: String,
+    epoch: u64,
+    ranges: Ranges,
+}
+
+/// At most this many [`Arrived`] are kept, the oldest forgotten first: each
+/// stands for one takeover attempt not yet followed by a claim.
+const ARRIVED_KEPT: usize = 64;
+
 impl FollowedImports {
-    /// The slots of the imports into this node's master that this node saw
-    /// begin in its master's stream, in a session not resynced since: what
-    /// a vote's `UPDATE` may give it of its master's claims (see
-    /// `ClusterState::master_claims_seen`).
-    pub(crate) fn seen_importing(&self) -> Vec<Ranges> {
-        self.seen_live.lock().values().cloned().collect()
+    /// Of the imports into `master` whose data this node holds in full
+    /// ([`Arrived`]): the config epoch each was to be taken over at, and its
+    /// slots.
+    pub(crate) fn arrived_into(&self, master: &str) -> Vec<(u64, Ranges)> {
+        self.arrived
+            .lock()
+            .iter()
+            .filter(|a| a.master == master)
+            .map(|a| (a.epoch, a.ranges.clone()))
+            .collect()
+    }
+
+    /// Note an `ARRIVED` marker of `master`.
+    fn note_arrived(&self, master: String, epoch: u64, ranges: Ranges) {
+        let mut arrived = self.arrived.lock();
+        arrived.retain(|a| !(a.master == master && a.epoch == epoch));
+        arrived.push(Arrived {
+            master,
+            epoch,
+            ranges,
+        });
+        if arrived.len() > ARRIVED_KEPT {
+            let over = arrived.len() - ARRIVED_KEPT;
+            arrived.drain(..over);
+        }
     }
 
     /// The imports known, as they stand.
@@ -332,32 +373,95 @@ fn parse_taken(args: &[&[u8]]) -> Option<(u64, Ranges)> {
     Some((epoch, ranges))
 }
 
-/// Take in a `TAKEN` marker of this node's master: its claim of `ranges` at
-/// `epoch`, as its heartbeat would bring it, applied in the marker's place
-/// in the stream.
-fn take_in_masters_claim(cluster: &ClusterState, epoch: u64, ranges: &[(u16, u16)]) {
-    let Some(master) = cluster.my_master_id() else {
-        return;
+/// An `ARRIVED` marker: every record of an import of `ranges` into the
+/// master that sends it has come before it in the stream, for the master to
+/// take them over at config epoch `epoch`. Sent at the takeover, after the
+/// last record of the import applied, before the master waits for its
+/// replicas to acknowledge what arrived: a replica that has read it holds
+/// every key of the slots. It does not say that the slots were taken: that
+/// is `TAKEN`'s, and a takeover refused leaves them with the source.
+pub(crate) fn encode_arrived(epoch: u64, ranges: &[(u16, u16)]) -> Vec<u8> {
+    crate::resp::write::encode_resp_command(&[
+        SLOT_IMPORTS_MARKER.to_vec(),
+        b"ARRIVED".to_vec(),
+        epoch.to_string().into_bytes(),
+        ranges_word(ranges).into_bytes(),
+    ])
+}
+
+/// An `ARRIVED` marker read back: its epoch and slots. `None` if it is not
+/// one.
+fn parse_arrived(args: &[&[u8]]) -> Option<(u64, Ranges)> {
+    let [name, kind, epoch, ranges] = args else {
+        return None;
     };
-    if ranges.is_empty() || test_ignores_stream_claims() {
-        return;
+    if !name.eq_ignore_ascii_case(SLOT_IMPORTS_MARKER) || !kind.eq_ignore_ascii_case(b"ARRIVED") {
+        return None;
     }
-    // The claim of the master whose stream this is: taken in only while it
-    // is the master this node follows.
+    let epoch = std::str::from_utf8(epoch).ok()?.parse().ok()?;
+    let ranges = parse_ranges_word(std::str::from_utf8(ranges).ok()?)?;
+    Some((epoch, ranges))
+}
+
+/// The master whose stream this is, if it is the one this node follows: a
+/// marker of another is not taken in.
+fn origin_if_followed(cluster: &ClusterState, what: &str) -> Option<NodeId> {
+    let master = cluster.my_master_id()?;
     let origin = cluster
         .hooks
         .get()
         .and_then(|hooks| hooks.replica_starter.repl_state.stream_origin());
     if !origin.as_deref().is_some_and(|o| o == node_id_str(&master)) {
         log_info!(
-            "Cluster: a claim of slots in the replication stream, of {}, is not taken in: \
-             this node follows {} now",
+            "Cluster: {what} in the replication stream, of {}, is not taken in: this node \
+             follows {} now",
             origin.as_deref().unwrap_or("an unknown master"),
             node_id_str(&master)
         );
+        return None;
+    }
+    Some(master)
+}
+
+/// Note an `ARRIVED` marker of this node's master (see [`encode_arrived`]).
+fn note_masters_arrived(cluster: &ClusterState, epoch: u64, ranges: Ranges) {
+    if ranges.is_empty() {
         return;
     }
+    let Some(master) = origin_if_followed(cluster, "an import's arrival") else {
+        return;
+    };
+    log_info!(
+        "Cluster: this node holds what arrived of slots {} on its master, for a takeover at \
+         epoch {epoch}",
+        migration::ranges_text(&ranges)
+    );
+    cluster
+        .followed_imports
+        .note_arrived(node_id_str(&master).to_string(), epoch, ranges);
+}
+
+/// Take in a `TAKEN` marker of this node's master: its claim of `ranges` at
+/// `epoch`, as its heartbeat would bring it, applied in the marker's place
+/// in the stream.
+fn take_in_masters_claim(cluster: &ClusterState, epoch: u64, ranges: &[(u16, u16)]) {
+    if cluster.my_master_id().is_none() || ranges.is_empty() || test_ignores_stream_claims() {
+        return;
+    }
+    // The claim of the master whose stream this is: taken in only while it
+    // is the master this node follows.
+    let Some(master) = origin_if_followed(cluster, "a claim of slots") else {
+        return;
+    };
     cluster.take_in_claims_of_master(master, epoch, ranges);
+    // What arrived for a takeover at this epoch or before is the master's
+    // here now, or was taken from it since by a newer claim.
+    let master = node_id_str(&master);
+    cluster
+        .followed_imports
+        .arrived
+        .lock()
+        .retain(|a| !(a.master == master && a.epoch <= epoch));
 }
 
 /// For the tests of a replica that has not taken in its master's claim:
@@ -481,9 +585,19 @@ pub(crate) fn on_event(
     let followed = &cluster.followed_imports;
     match event {
         SlotImportsEvent::Session { marked, full } => {
-            // A new session: what this node saw begin in the last one is
-            // not known to be in this one's data in full.
-            followed.seen_live.lock().clear();
+            // What arrived (`ARRIVED`) is in this node's dataset while that
+            // is the stream it was read in: not after a full sync, nor once
+            // this node follows another master; still after a partial
+            // resync with the same one.
+            {
+                let master = cluster.my_master_id().map(|m| node_id_str(&m).to_string());
+                let mut arrived = followed.arrived.lock();
+                if full || master.is_none() {
+                    arrived.clear();
+                } else {
+                    arrived.retain(|a| Some(&a.master) == master.as_ref());
+                }
+            }
             let mut imports = followed.imports.lock();
             if (marked && !full) || imports.is_empty() {
                 return;
@@ -508,6 +622,10 @@ pub(crate) fn on_event(
                 take_in_masters_claim(cluster, epoch, &ranges);
                 return;
             }
+            if let Some((epoch, ranges)) = parse_arrived(args) {
+                note_masters_arrived(cluster, epoch, ranges);
+                return;
+            }
             let Some((live, listed)) = parse_marker(args) else {
                 log_warn!(
                     "Cluster: the master sent a slot-imports marker this node cannot read; \
@@ -523,7 +641,6 @@ pub(crate) fn on_event(
             // does, at most `HELD_BEFORE_MAX_KEYS` names or 64 MiB; the
             // replica applies and acknowledges nothing meanwhile.
             let wanted = to_note(&followed.imports.lock(), live, &listed);
-            followed.seen_live.lock().extend(wanted.iter().cloned());
             let noted: Vec<(String, Arc<HeldBefore>)> = wanted
                 .into_iter()
                 .map(|(id, ranges)| (id, Arc::new(HeldBefore::note(store, &ranges))))
@@ -769,6 +886,8 @@ fn load(cluster: &ClusterState) {
 /// replication client, and start the cleanup thread.
 pub(crate) fn start(cluster: &Arc<ClusterState>, repl_state: &crate::replication::ReplState) {
     load(cluster);
+    // Given to a master this node replicates from (`REPLCONF node-id`).
+    repl_state.set_my_node_id(Some(node_id_str(&cluster.myself()).to_string()));
     if !crate::replication::hides_slot_imports_capability() {
         repl_state
             .sends_slot_imports
@@ -1124,6 +1243,42 @@ mod tests {
         assert_eq!(words(&["KIVIDB.IMPORTS", "TAKEN", "7", "5-1"]), None);
         assert_eq!(words(&["KIVIDB.IMPORTS", "TAKEN", "7", "0-16384"]), None);
         assert_eq!(words(&["KIVIDB.IMPORTS", "LIVE", "7", "0-1"]), None);
+    }
+
+    /// An `ARRIVED` marker reads back as its epoch and slots, and is not
+    /// read as a `TAKEN` one, nor a `TAKEN` one as it.
+    #[test]
+    fn an_arrived_marker_reads_back() {
+        let bytes = encode_arrived(9, &[(10, 20), (30, 30)]);
+        let (_, args) = crate::resp::parse::parse_resp_command(&bytes).unwrap();
+        assert_eq!(parse_arrived(&args), Some((9, vec![(10, 20), (30, 30)])));
+        assert_eq!(parse_taken(&args), None);
+        assert!(parse_marker(&args).is_none());
+        let taken = encode_taken(9, &[(10, 20)]);
+        let (_, args) = crate::resp::parse::parse_resp_command(&taken).unwrap();
+        assert_eq!(parse_arrived(&args), None);
+    }
+
+    /// An `ARRIVED` of a master at an epoch is kept once, the newest kept
+    /// when there are too many, and each master's apart.
+    #[test]
+    fn arrived_imports_are_kept_by_master_and_epoch() {
+        let f = FollowedImports::default();
+        f.note_arrived("a".into(), 5, vec![(0, 9)]);
+        f.note_arrived("a".into(), 5, vec![(0, 9)]);
+        f.note_arrived("b".into(), 6, vec![(10, 19)]);
+        assert_eq!(f.arrived_into("a"), vec![(5, vec![(0, 9)])]);
+        assert_eq!(f.arrived_into("b"), vec![(6, vec![(10, 19)])]);
+        for epoch in 0..(ARRIVED_KEPT as u64 + 10) {
+            f.note_arrived("c".into(), 100 + epoch, vec![(20, 29)]);
+        }
+        assert_eq!(f.arrived.lock().len(), ARRIVED_KEPT);
+        assert!(f.arrived_into("a").is_empty());
+        assert!(
+            f.arrived_into("c")
+                .iter()
+                .any(|(e, _)| *e == 100 + ARRIVED_KEPT as u64 + 9)
+        );
     }
 
     #[test]

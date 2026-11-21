@@ -2985,7 +2985,9 @@ impl ClusterState {
             && self.left_out_told.lock().insert(candidate, request_epoch) != Some(request_epoch)
         {
             log_info!(
-                "Cluster: Not voting for {} to take over from {} at epoch {request_epoch} yet:                  its request leaves out slot {slot}, which that master claims at epoch {epoch}                  and owns here; it is told its master's claims",
+                "Cluster: Not voting for {} to take over from {} at epoch {request_epoch} yet: \
+                 its request leaves out slot {slot}, which that master claims at epoch {epoch} \
+                 and owns here; it is told its master's claims",
                 node_id_str(&candidate),
                 node_id_str(&master_id)
             );
@@ -3102,29 +3104,34 @@ impl ClusterState {
 
     /// Of `claims`, which a voter's `UPDATE` relays from `master`, the
     /// master this node follows: what this node takes in. The slots it holds
-    /// as the master's already, and those of imports into the master that
-    /// this node saw begin in its stream, in a session not resynced since
-    /// (`followed_imports::seen_importing`): that session was attached when
-    /// the master took them over, and the master took them only once its
-    /// attached replicas had acknowledged what the import brought (see
-    /// `migration::take_over_now`). The others stay with their owner here.
-    pub(crate) fn master_claims_seen(
+    /// as the master's already, and those of an import into the master whose
+    /// data this node holds in full, as the master's stream told it
+    /// (`ARRIVED`, `followed_imports::encode_arrived`), claimed at the very
+    /// epoch that import was to be taken over at. The marker came after the
+    /// import's last record in the stream, and this node's dataset is still
+    /// that stream, whatever became of its link since. A claim at another
+    /// epoch is not that takeover's: an attempt refused and a later one, at a
+    /// newer epoch, whose data this node may not have. The others stay with
+    /// their owner here.
+    pub(crate) fn master_claims_arrived(
         &self,
         master: NodeId,
         claims: &[crate::cluster::bus::SlotClaim],
     ) -> Vec<crate::cluster::bus::SlotClaim> {
-        let seen = self.followed_imports.seen_importing();
+        let arrived = self.followed_imports.arrived_into(node_id_str(&master));
         let owners = self.slots.read();
-        let ok = |slot: u16| {
+        let ok = |slot: u16, epoch: u64| {
             owners[slot as usize] == Some(master)
-                || seen.iter().any(|r| migration::in_ranges(r, slot))
+                || arrived
+                    .iter()
+                    .any(|(e, r)| *e == epoch && migration::in_ranges(r, slot))
         };
         let mut out = Vec::new();
         for c in claims {
             let end = c.end.min((CLUSTER_SLOTS - 1) as u16);
             let mut run: Option<u16> = None;
             for slot in c.start..=end {
-                match (ok(slot), run) {
+                match (ok(slot, c.epoch), run) {
                     (true, None) => run = Some(slot),
                     (false, Some(start)) => {
                         out.push(crate::cluster::bus::SlotClaim {
@@ -4140,11 +4147,24 @@ impl ClusterState {
     /// nothing changes: no write has been served to them here, and no claim
     /// of them has gone out.
     pub fn take_over_slots(&self, slots: impl Iterator<Item = u16>) -> std::io::Result<()> {
+        let epoch = self.bump_epoch();
+        self.take_over_slots_at(slots, epoch)
+    }
+
+    /// [`Self::take_over_slots`], at config epoch `epoch`, taken with
+    /// [`Self::bump_epoch`] beforehand (the epoch an `ARRIVED` marker named,
+    /// see `migration::take_over_now`). This node's config epoch is raised to
+    /// it, unless it is newer already.
+    pub fn take_over_slots_at(
+        &self,
+        slots: impl Iterator<Item = u16>,
+        epoch: u64,
+    ) -> std::io::Result<()> {
         let t = std::time::Instant::now();
         let mut steps: Vec<(&str, u128)> = Vec::new();
         let slots: Vec<u16> = slots.collect();
         let me = self.myself();
-        let new_epoch = self.bump_epoch();
+        let new_epoch = epoch;
         steps.push(("epoch", t.elapsed().as_millis()));
         if let Some(node) = self.nodes.write().get_mut(&me)
             && new_epoch > node.config_epoch
@@ -4757,6 +4777,12 @@ impl ClusterState {
                 nodes.insert(new_id, me);
             }
             *myself = new_id;
+        }
+        if let Some(hooks) = self.hooks.get() {
+            hooks
+                .replica_starter
+                .repl_state
+                .set_my_node_id(Some(node_id_str(&new_id).to_string()));
         }
         let _ = self.save_to_disk();
         new_id

@@ -295,6 +295,12 @@ pub struct ReplState {
     /// a position in — the master this node followed when its dataset last
     /// became a copy of a master's. `None` when not known.
     stream_origin: RwLock<Option<String>>,
+    /// Replica side, in cluster mode: this node's id, given to its master
+    /// with `REPLCONF node-id`.
+    my_node_id: RwLock<Option<String>>,
+    /// Master side: by replica link, the node id it gave with
+    /// `REPLCONF node-id` (cluster replicas of this release and later).
+    replica_node_ids: parking_lot::Mutex<std::collections::HashMap<u64, String>>,
     /// What the replication client needs to ask of the cluster layer; see
     /// [`ClusterLink`]. Not set outside cluster mode.
     cluster_link: std::sync::OnceLock<ClusterLink>,
@@ -624,6 +630,8 @@ impl ReplState {
             repl_id2: RwLock::new(None),
             hub: std::sync::OnceLock::new(),
             stream_origin: RwLock::new(None),
+            my_node_id: RwLock::new(None),
+            replica_node_ids: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cluster_link: std::sync::OnceLock::new(),
         }
     }
@@ -686,15 +694,55 @@ impl ReplState {
         }
     }
 
+    /// Master side: `marker`, a [`SLOT_IMPORTS_MARKER`], to the replicas
+    /// attached that take the markers, at once, in its place among the
+    /// writes. Not kept: a replica that attaches later is not sent it. Not in
+    /// the backlog, nor counted in any offset.
+    pub fn send_slot_marker(&self, marker: Vec<u8>) {
+        if !self.sends_slot_imports.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(hub) = self.hub.get().and_then(|w| w.upgrade()) {
+            let _ = hub.send(HubMsg::SlotMarker {
+                marker: Arc::from(marker),
+            });
+        }
+    }
+
+    /// Replica side: the cluster node id this node gives its master
+    /// (`REPLCONF node-id`), in cluster mode; `None` otherwise.
+    pub fn set_my_node_id(&self, id: Option<String>) {
+        *self.my_node_id.write() = id;
+    }
+
+    pub fn my_node_id(&self) -> Option<String> {
+        self.my_node_id.read().clone()
+    }
+
+    /// Master side: the node id replica link `replica_id` gave
+    /// (`REPLCONF node-id`). Forgotten with the link (`forget_replica`); an
+    /// id noted for a link that never registered is let go of once there
+    /// are many more than links.
+    pub fn note_replica_node_id(&self, replica_id: u64, node_id: Option<String>) {
+        let Some(node_id) = node_id else {
+            return;
+        };
+        let mut ids = self.replica_node_ids.lock();
+        if ids.len() >= 1024 {
+            let live = self.replica_progress.lock();
+            ids.retain(|id, _| live.contains_key(id));
+        }
+        ids.insert(replica_id, node_id);
+    }
+
     /// On a thread that may block (off the runtime, holding no gate or
-    /// lock): wait until each replica named in `required` (by the addresses
-    /// it may link from: an IP and its `REPLCONF listening-port`) has a link to
-    /// this master, online, that has acknowledged everything written before
-    /// now, and each one named in `if_attached` that has a link has; or
-    /// until `deadline`. If one has not: which (its index in `required`,
-    /// then in `if_attached`), whether a link matched its addresses, and the
-    /// addresses links are attached from. Links of other replicas neither
-    /// count nor hold the wait up.
+    /// lock): wait until each replica in `required` has a link to this
+    /// master, online, that has acknowledged everything written before now,
+    /// and each one in `if_attached` that has a link has; or until
+    /// `deadline`. Which links are a replica's: [`links_of_replicas`]. If one
+    /// has not: which (its index in `required`, then in `if_attached`),
+    /// whether a link was found for it, and where links are attached from.
+    /// Links of other replicas neither count nor hold the wait up.
     ///
     /// A hub barrier first, as `WAIT` takes one: every write handed to the
     /// hub before now has been fanned out, and each link's target is what it
@@ -703,16 +751,32 @@ impl ReplState {
     /// its backlog covers the rest).
     pub fn replicas_have_all_blocking(
         &self,
-        required: &[Vec<(String, u16)>],
-        if_attached: &[Vec<(String, u16)>],
+        required: &[ReplicaWanted],
+        if_attached: &[ReplicaWanted],
         deadline: std::time::Instant,
     ) -> Result<(), ReplicaBehind> {
         let pause = || std::thread::sleep(std::time::Duration::from_millis(1));
-        let attached_from = |links: &[(u64, String, u16)]| {
+        let seen_links = || -> Vec<LinkSeen> {
+            let ids = self.replica_node_ids.lock();
+            self.replica_peers
+                .lock()
+                .iter()
+                .map(|(id, ip, port)| LinkSeen {
+                    id: *id,
+                    ip: ip.clone(),
+                    port: *port,
+                    node_id: ids.get(id).cloned(),
+                })
+                .collect()
+        };
+        let attached_from = |links: &[LinkSeen]| {
             links
                 .iter()
-                .map(|(_, ip, port)| (ip.clone(), *port))
-                .collect::<Vec<(String, u16)>>()
+                .map(|l| match &l.node_id {
+                    Some(n) => format!("{}:{} (node {n})", l.ip, l.port),
+                    None => format!("{}:{}", l.ip, l.port),
+                })
+                .collect::<Vec<String>>()
         };
         if required.is_empty() && if_attached.is_empty() {
             return Ok(());
@@ -729,17 +793,18 @@ impl ReplState {
                         return Err(ReplicaBehind {
                             index: 0,
                             linked: None,
-                            attached_from: attached_from(&self.replica_peers.lock()),
+                            attached_from: attached_from(&seen_links()),
                         });
                     }
                     pause();
                 }
             }
         }
+        let wanted: Vec<ReplicaWanted> = required.iter().chain(if_attached).cloned().collect();
         let mut targets: std::collections::HashMap<u64, (Arc<ReplicaProgress>, u64)> =
             std::collections::HashMap::new();
         loop {
-            let links: Vec<(u64, String, u16)> = self.replica_peers.lock().clone();
+            let mut links = seen_links();
             {
                 let live = self.replica_progress.lock();
                 targets.retain(|id, _| live.contains_key(id));
@@ -749,44 +814,27 @@ impl ReplState {
                         .or_insert_with(|| (Arc::clone(p), p.sent.load(Ordering::Relaxed)));
                 }
             }
+            links.retain(|l| targets.contains_key(&l.id));
             let caught_up = |id: u64| {
                 targets.get(&id).is_some_and(|(p, target)| {
                     p.state() == ReplicaState::Online && p.delivered() >= *target
                 })
             };
-            let links_of = |addrs: &Vec<(String, u16)>| {
-                links
-                    .iter()
-                    .filter(|(id, lip, lport)| {
-                        targets.contains_key(id)
-                            && addrs.iter().any(|(ip, port)| lip == ip && lport == port)
-                    })
-                    .map(|(id, _, _)| *id)
-                    .collect::<Vec<u64>>()
-            };
-            let behind = required
-                .iter()
-                .position(|r| !links_of(r).into_iter().any(caught_up))
+            let of = links_of_replicas(&wanted, &links);
+            let behind = (0..required.len())
+                .find(|&i| !of[i].iter().copied().any(caught_up))
                 .or_else(|| {
-                    if_attached
-                        .iter()
-                        .position(|r| {
-                            let ids = links_of(r);
-                            !ids.is_empty() && !ids.into_iter().any(caught_up)
-                        })
-                        .map(|i| required.len() + i)
+                    (required.len()..wanted.len())
+                        .find(|&i| !of[i].is_empty() && !of[i].iter().copied().any(caught_up))
                 });
             let Some(index) = behind else {
                 return Ok(());
             };
             if self.is_slave() || std::time::Instant::now() >= deadline {
-                let addrs = required
-                    .get(index)
-                    .or_else(|| if_attached.get(index - required.len()));
                 return Err(ReplicaBehind {
                     index,
-                    linked: addrs.map(|a| !links_of(a).is_empty()),
-                    attached_from: attached_from(&links),
+                    linked: Some(!of[index].is_empty()),
+                    attached_from: attached_from(&seen_links()),
                 });
             }
             pause();
@@ -2442,17 +2490,113 @@ pub enum HubMsg {
     SlotClaims {
         marker: ReplPayload,
     },
+    /// `marker` goes to each replica that takes [`SLOT_IMPORTS_MARKER`]s,
+    /// here among the writes, and is not kept (an `ARRIVED`, see
+    /// [`ReplState::send_slot_marker`]).
+    SlotMarker {
+        marker: ReplPayload,
+    },
 }
 
 /// A replica [`ReplState::replicas_have_all_blocking`] did not find caught
-/// up: its index among those it was given, whether a link matched one of its
-/// addresses (`None`: not known, the wait ended before it looked), and the
-/// addresses links to this master are attached from.
+/// up: its index among those it was given, whether a link was found for it
+/// (`None`: not known, the wait ended before it looked), and where the links
+/// to this master are attached from (`ip:port`, and the node id each gave).
 #[derive(Debug, Clone)]
 pub struct ReplicaBehind {
     pub index: usize,
     pub linked: Option<bool>,
-    pub attached_from: Vec<(String, u16)>,
+    pub attached_from: Vec<String>,
+}
+
+/// A replica of this node as the cluster knows it, for
+/// [`ReplState::replicas_have_all_blocking`]: its node id, and the addresses
+/// a link of a replica that gives no node id may come from (the IPs the
+/// cluster has for it, and the ports it may announce with
+/// `REPLCONF listening-port`: its client port, plaintext or TLS, and the one
+/// it announces).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaWanted {
+    pub node_id: String,
+    pub ips: Vec<String>,
+    pub ports: Vec<u16>,
+}
+
+/// A replica link as [`links_of_replicas`] sees it: its id, the IP it is
+/// attached from, the port it announced, and the node id it gave, if any.
+#[derive(Debug, Clone)]
+pub struct LinkSeen {
+    pub id: u64,
+    pub ip: String,
+    pub port: u16,
+    pub node_id: Option<String>,
+}
+
+/// An IP as text, the same for every way of writing it: without brackets,
+/// an IPv4-mapped IPv6 address as the IPv4 one, and in canonical form. A
+/// name that is not an IP, as it is, in lower case.
+pub fn canonical_ip(ip: &str) -> String {
+    let bare = ip
+        .strip_prefix('[')
+        .and_then(|i| i.strip_suffix(']'))
+        .unwrap_or(ip);
+    let bare = bare.split('%').next().unwrap_or(bare);
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(addr) => addr.to_canonical().to_string(),
+        Err(_) => bare.to_ascii_lowercase(),
+    }
+}
+
+/// For each of `wanted`, the links of `links` that are that replica's:
+///
+/// - a link that gave a node id (`REPLCONF node-id`) is the replica's with
+///   that id, and no other's;
+/// - a link that gave none (a replica of an earlier release) is the
+///   replica's whose IPs and ports it comes from, compared as
+///   [`canonical_ip`] has them;
+/// - and, for a replica no link was found for so, one that gave none and
+///   comes from one of its ports, but not from another wanted replica's
+///   address: as the cluster bus matches a replica's link when its IP is
+///   not the one the cluster has (NAT, an announced address).
+pub fn links_of_replicas(wanted: &[ReplicaWanted], links: &[LinkSeen]) -> Vec<Vec<u64>> {
+    let canon: Vec<Vec<String>> = wanted
+        .iter()
+        .map(|w| w.ips.iter().map(|ip| canonical_ip(ip)).collect())
+        .collect();
+    let exact = |i: usize, l: &LinkSeen| {
+        l.node_id.is_none()
+            && wanted[i].ports.contains(&l.port)
+            && canon[i].contains(&canonical_ip(&l.ip))
+    };
+    (0..wanted.len())
+        .map(|i| {
+            let by_id: Vec<u64> = links
+                .iter()
+                .filter(|l| l.node_id.as_deref() == Some(wanted[i].node_id.as_str()))
+                .map(|l| l.id)
+                .collect();
+            if !by_id.is_empty() {
+                return by_id;
+            }
+            let by_address: Vec<u64> = links
+                .iter()
+                .filter(|l| exact(i, l))
+                .map(|l| l.id)
+                .collect();
+            if !by_address.is_empty() {
+                return by_address;
+            }
+            links
+                .iter()
+                .filter(|l| {
+                    l.node_id.is_none()
+                        && wanted[i].ports.contains(&l.port)
+                        && !(0..wanted.len()).any(|j| j != i && exact(j, l))
+                })
+                .map(|l| l.id)
+                .collect()
+        })
+        .collect()
 }
 
 /// What a replica answers a node that asks to replicate from it: KiviDB does
@@ -3668,6 +3812,10 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
         // start, and every one after it (the backlog may be continued from
         // any point in it).
         let mut slot_claims_sync: Vec<(ReplPayload, u64)> = Vec::new();
+        // A replica that asks to continue from before this offset is sent the
+        // dataset: a claim it would have to be sent in its place is no
+        // longer kept (`prune_kept_claims`).
+        let mut claims_floor: u64 = 0;
         // Queues of replicas let go of for falling too far behind, until
         // their forwarders have let go of what is in them (see
         // `ReplicaQueue::abandon`): memory still held for a replica.
@@ -3902,6 +4050,18 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     // it does not, the position is not one in this backlog's
                     // numbering, and a replica sent it would read nothing of
                     // it, ever.
+                    // A claim it would be sent in its place is no longer
+                    // kept (`prune_kept_claims`): the dataset instead.
+                    Some(_) if registration.slot_imports && offset < claims_floor => {
+                        log_info!(
+                            "Replication: Partial resync not possible for {}: offset {offset} \
+                             is before the oldest claim of slots this master keeps to send \
+                             (at {claims_floor}) — sending the dataset",
+                            registration.addr
+                        );
+                        state.sync_partial_err.fetch_add(1, Ordering::Relaxed);
+                        let _ = reply.send(Err(registration));
+                    }
                     Some(missed) if !crate::resp::parse::can_start_command(&missed) => {
                         log_warn!(
                             "Replication: Partial resync refused for {}: offset {offset} is not \
@@ -4059,6 +4219,11 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     forget_replica(&state, replica_id);
                 }
                 HubMsg::DropReplicas => {
+                    // This node's claims as a master are no longer to be
+                    // sent: it follows another's now, and makes new ones if
+                    // promoted again.
+                    slot_claims_sync.clear();
+                    claims_floor = backlog.end;
                     // Dropping each `tx` ends its forwarder, and so its
                     // connection, as an eviction does.
                     for replica in channel_replicas.drain(..) {
@@ -4123,14 +4288,27 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         }
                         *state.repl_id.write() = generate_repl_id();
                         *state.repl_id2.write() = None;
+                        if let Some((claims, _)) = slot_claims_sync.pop() {
+                            slot_claims_sync.clear();
+                            slot_claims_sync.push((claims, base));
+                        }
+                        claims_floor = base;
                     }
+                    let realigned = backlog.end != base;
                     backlog.align(base);
-                    // The dataset sent is at `base`: a claim kept from
-                    // before is in it.
-                    if let Some((claims, at)) = slot_claims_sync.pop() {
-                        slot_claims_sync.clear();
-                        slot_claims_sync.push((claims, at.min(base)));
+                    // The dataset sent is at `base`, and the last claim kept
+                    // is in it: that one it is sent below. The others are
+                    // kept, in their places, for the replicas that continue
+                    // later; unless the backlog starts a new run at `base`,
+                    // where no place before it can be continued from.
+                    if realigned {
+                        if let Some((claims, at)) = slot_claims_sync.pop() {
+                            slot_claims_sync.clear();
+                            slot_claims_sync.push((claims, at.min(base)));
+                        }
+                        claims_floor = base;
                     }
+                    prune_kept_claims(&mut slot_claims_sync, &mut claims_floor, backlog.start());
                     state.backlog_active.store(true, Ordering::Relaxed);
                     // Already done at the cut by `begin_full_sync`; a no-op
                     // then. Done here for registrations that did not come
@@ -4197,16 +4375,19 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         false
                     });
                     slot_claims_sync.push((marker, backlog.end));
-                    // Of those at or before the backlog's start, only the
-                    // last can be sent again.
-                    let start = backlog.start();
-                    let before = slot_claims_sync
-                        .iter()
-                        .filter(|(_, at)| *at <= start)
-                        .count();
-                    if before > 1 {
-                        slot_claims_sync.drain(..before - 1);
-                    }
+                    prune_kept_claims(&mut slot_claims_sync, &mut claims_floor, backlog.start());
+                }
+
+                HubMsg::SlotMarker { marker } => {
+                    channel_replicas.retain(|replica| {
+                        if !replica.slot_imports
+                            || queue_marker(&replica.tx, &replica.pending_bytes, &marker)
+                        {
+                            return true;
+                        }
+                        forget_replica(&state, replica.id);
+                        false
+                    });
                 }
 
                 HubMsg::Propagate(payload) => {
@@ -4606,6 +4787,30 @@ struct ChannelReplica {
 
 /// `KIVIDB.IMPORTS SYNC` with no import: what a replica that takes the
 /// markers is sent on attaching to a master that has never had any.
+/// At most this many claims of slots ([`HubMsg::SlotClaims`]) are kept for
+/// replicas that continue, and at most this many bytes of them.
+const KEPT_CLAIMS_MAX: usize = 256;
+const KEPT_CLAIMS_MAX_BYTES: usize = 16 << 20;
+
+/// Of the claims of slots kept (`kept`, each with its place in the stream),
+/// those a replica may still be sent: the last at or before the backlog's
+/// start (`start`), which one continued from there is sent first, and each
+/// after it. Within [`KEPT_CLAIMS_MAX`] and [`KEPT_CLAIMS_MAX_BYTES`]: beyond,
+/// the oldest are let go of, and a replica that asks to continue from before
+/// the place of the oldest kept is sent the dataset (`floor`).
+fn prune_kept_claims(kept: &mut Vec<(ReplPayload, u64)>, floor: &mut u64, start: u64) {
+    let before = kept.iter().filter(|(_, at)| *at <= start).count();
+    if before > 1 {
+        kept.drain(..before - 1);
+    }
+    let mut bytes: usize = kept.iter().map(|(m, _)| m.len()).sum();
+    while kept.len() > 1 && (kept.len() > KEPT_CLAIMS_MAX || bytes > KEPT_CLAIMS_MAX_BYTES) {
+        let (gone, _) = kept.remove(0);
+        bytes -= gone.len();
+        *floor = (*floor).max(kept[0].1);
+    }
+}
+
 fn no_slot_imports() -> ReplPayload {
     Arc::from(crate::resp::write::encode_resp_command(&[
         SLOT_IMPORTS_MARKER.to_vec(),
@@ -4632,6 +4837,7 @@ fn forget_replica(state: &ReplState, replica_id: u64) {
         .replica_peers
         .lock()
         .retain(|(id, _, _)| *id != replica_id);
+    state.replica_node_ids.lock().remove(&replica_id);
     state.replica_progress.lock().remove(&replica_id);
     if state.replica_acks.lock().remove(&replica_id).is_some() {
         // Pairs with fetch_add on successful RegisterChannel in the hub task.
@@ -7465,6 +7671,152 @@ mod replication_invariants_tests {
         settle(&hub).await;
         assert_eq!(rx.recv().await.unwrap().to_vec(), v(&m2));
         assert_eq!(rx.recv().await.unwrap().to_vec(), v(&imports));
+
+        // A full sync leaves the claims kept in their places for the
+        // replicas that continue later.
+        assert_eq!(
+            continued(7206, 100 + n, true).await,
+            vec![v(&imports), v(&m1), w("b"), v(&m2), w("c")]
+        );
+
+        // A marker that is not kept goes to the replicas attached, and to
+        // none that continues later.
+        let m3: ReplPayload = Arc::from(&b"M3"[..]);
+        hub.send(HubMsg::SlotMarker {
+            marker: Arc::clone(&m3),
+        })
+        .unwrap();
+        settle(&hub).await;
+        assert_eq!(rx.recv().await.unwrap().to_vec(), v(&m3));
+        assert_eq!(
+            continued(7207, 100 + 3 * n, true).await,
+            vec![v(&imports), v(&m2)]
+        );
+
+        // Once this node follows another master, none is kept.
+        hub.send(HubMsg::DropReplicas).unwrap();
+        settle(&hub).await;
+        let (mut r, _rx) = registration(7208, 7208);
+        r.slot_imports = true;
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        hub.send(HubMsg::Continue {
+            registration: r,
+            offset: 100,
+            reply,
+        })
+        .unwrap();
+        assert!(
+            answer.await.unwrap().is_err(),
+            "a claim it would be sent is no longer kept: the dataset instead"
+        );
+    }
+
+    /// The claims kept: the last at or before the backlog's start, and each
+    /// after it, within the bounds; past them the oldest go, and the floor
+    /// below which a replica is not continued rises to the oldest kept.
+    #[test]
+    fn kept_claims_are_pruned_to_what_can_be_sent() {
+        let m = |b: &[u8]| -> ReplPayload { Arc::from(b) };
+        let mut kept = vec![(m(b"a"), 10), (m(b"b"), 20), (m(b"c"), 30), (m(b"d"), 40)];
+        let mut floor = 0;
+        super::prune_kept_claims(&mut kept, &mut floor, 25);
+        let ats: Vec<u64> = kept.iter().map(|(_, at)| *at).collect();
+        assert_eq!(ats, vec![20, 30, 40]);
+        assert_eq!(floor, 0);
+
+        let mut kept: Vec<(ReplPayload, u64)> = (0..(super::KEPT_CLAIMS_MAX as u64 + 5))
+            .map(|i| (m(b"x"), 100 + i))
+            .collect();
+        let mut floor = 0;
+        super::prune_kept_claims(&mut kept, &mut floor, 0);
+        assert_eq!(kept.len(), super::KEPT_CLAIMS_MAX);
+        assert_eq!(floor, kept[0].1);
+        assert_eq!(floor, 105);
+    }
+
+    fn wanted(id: &str, ips: &[&str], ports: &[u16]) -> super::ReplicaWanted {
+        super::ReplicaWanted {
+            node_id: id.to_string(),
+            ips: ips.iter().map(|s| s.to_string()).collect(),
+            ports: ports.to_vec(),
+        }
+    }
+
+    fn link(id: u64, ip: &str, port: u16, node_id: Option<&str>) -> super::LinkSeen {
+        super::LinkSeen {
+            id,
+            ip: ip.to_string(),
+            port,
+            node_id: node_id.map(str::to_string),
+        }
+    }
+
+    /// IPs compare the same however written: brackets, an IPv4-mapped IPv6
+    /// address, a zone, upper case.
+    #[test]
+    fn an_ip_reads_the_same_however_written() {
+        use super::canonical_ip as c;
+        assert_eq!(c("[::1]"), c("::1"));
+        assert_eq!(c("::ffff:10.0.0.5"), "10.0.0.5");
+        assert_eq!(c("[::ffff:10.0.0.5]"), "10.0.0.5");
+        assert_eq!(c("[FE80::1%eth0]"), c("fe80::1"));
+        assert_eq!(c("2001:DB8:0:0::1"), "2001:db8::1");
+        assert_eq!(c("Replica-1.Example"), "replica-1.example");
+    }
+
+    /// A replica's links: by the node id it gave, else by its address
+    /// (canonical IPs; its plaintext, TLS or announced port), else by its
+    /// port alone when no other wanted replica is at that address.
+    #[test]
+    fn a_replica_is_matched_to_its_links() {
+        use super::links_of_replicas as of;
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        // By node id, wherever it comes from and whatever port it says.
+        let w = [wanted(&a, &["10.0.0.1"], &[7001])];
+        assert_eq!(of(&w, &[link(1, "192.168.9.9", 0, Some(&a))]), vec![vec![1]]);
+        // A link that gave another node id is never this replica's, even
+        // from its very address.
+        assert_eq!(
+            of(&w, &[link(1, "10.0.0.1", 7001, Some(&b))]),
+            vec![Vec::<u64>::new()]
+        );
+        // Without a node id: by address, with brackets, mapped IPv4, the TLS
+        // port or the announced one.
+        let w = [wanted(&a, &["::1", "10.0.0.1"], &[7001, 17001, 9000])];
+        assert_eq!(of(&w, &[link(1, "[::1]", 7001, None)]), vec![vec![1]]);
+        assert_eq!(of(&w, &[link(2, "::ffff:10.0.0.1", 17001, None)]), vec![vec![2]]);
+        assert_eq!(of(&w, &[link(3, "10.0.0.1", 9000, None)]), vec![vec![3]]);
+        // NAT: from an address the cluster does not have, by the port.
+        assert_eq!(of(&w, &[link(4, "172.16.0.7", 7001, None)]), vec![vec![4]]);
+        // Listening port 0 (none announced): not by port alone.
+        let w0 = [wanted(&a, &["10.0.0.1"], &[7001])];
+        assert_eq!(
+            of(&w0, &[link(5, "172.16.0.7", 0, None)]),
+            vec![Vec::<u64>::new()]
+        );
+        // By port alone only when that link is no other wanted replica's
+        // address, and an exact match wins over a port-only one.
+        let w2 = [
+            wanted(&a, &["10.0.0.1"], &[7001]),
+            wanted(&b, &["10.0.0.2"], &[7001]),
+        ];
+        assert_eq!(
+            of(&w2, &[link(6, "10.0.0.2", 7001, None)]),
+            vec![Vec::<u64>::new(), vec![6]]
+        );
+        assert_eq!(
+            of(
+                &w2,
+                &[link(7, "10.0.0.1", 7001, None), link(8, "172.16.0.7", 7001, None)]
+            ),
+            vec![vec![7], vec![8]]
+        );
+        // A link with a node id does not stand in for one without.
+        assert_eq!(
+            of(&w2, &[link(9, "172.16.0.7", 7001, Some(&"c".repeat(40)))]),
+            vec![Vec::<u64>::new(), Vec::<u64>::new()]
+        );
     }
 
     /// A replica back by partial resync with an N-byte backlog is counted by

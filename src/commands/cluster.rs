@@ -1819,8 +1819,6 @@ fn cmd_migration(ctx: &mut Ctx) -> Vec<u8> {
                             text(task.state.name()),
                             text("last_error"),
                             text(&task.last_error),
-                            text("takeover_refused"),
-                            text(&task.takeover_refused),
                             text("retries"),
                             number(task.retries),
                             text("create_time"),
@@ -1833,6 +1831,8 @@ fn cmd_migration(ctx: &mut Ctx) -> Vec<u8> {
                             number(task.write_pause_ms),
                             text("capture_pause_ms"),
                             number(task.capture_pause_ms),
+                            text("takeover_refused"),
+                            text(&task.takeover_refused),
                         ],
                     )
                 })
@@ -2823,6 +2823,15 @@ fn cmd_reset(ctx: &mut Ctx) -> Vec<u8> {
         }
     } else {
         return resp_error("ERR wrong number of arguments for 'cluster|reset' command");
+    };
+
+    // No slot takeover is under way, nor begins, while this runs: it would
+    // drop the slots and the config the takeover is saving.
+    let Some(_takeovers_held) = ctx.cluster.slot_migrations.hold_takeovers() else {
+        return resp_error(
+            "ERR a slot takeover is under way on this node; try CLUSTER RESET again once it has \
+             ended",
+        );
     };
 
     // As in FLUSHSLOTS: no write lands between the check for keys below

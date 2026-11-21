@@ -90,6 +90,8 @@ const SOURCE_SILENCE_LIMIT: Duration = Duration::from_secs(30);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// The longest an import waits between attempts after refused takeovers.
 const RETRY_DELAY_MAX: Duration = Duration::from_secs(30);
+/// The longest a takeover waits for the AOF and this node's replicas.
+const TAKEOVER_WAIT_MAX: Duration = Duration::from_secs(2);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// The destination's answers to `CLUSTER SYNCSLOTS FAIL` that are not a
 /// promise that the slots stay with the source (see [`Registry::fence`]).
@@ -277,6 +279,19 @@ pub struct Registry {
     /// The handovers away from this node under way, as listed in
     /// `<cluster-config-file>.handovers` (#743).
     handovers: Mutex<Vec<PendingHandover>>,
+    /// How many [`TakeoversHeld`] there are: no takeover begins meanwhile.
+    /// Changed holding `tasks`, as `begin_takeover` reads it.
+    takeovers_held: std::sync::atomic::AtomicUsize,
+}
+
+/// See [`Registry::hold_takeovers`].
+pub(crate) struct TakeoversHeld<'a>(&'a Registry);
+
+impl Drop for TakeoversHeld<'_> {
+    fn drop(&mut self) {
+        let _tasks = self.0.tasks.lock();
+        self.0.takeovers_held.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Registry {
@@ -377,6 +392,9 @@ impl Registry {
         if task.taking_over {
             return Err("a takeover of this attempt is under way".into());
         }
+        if self.takeovers_held.load(Ordering::SeqCst) > 0 {
+            return Err("this node is being reset".into());
+        }
         task.taking_over = true;
         task.last_activity_ms.store(now_ms(), Ordering::Relaxed);
         Ok(task.clone())
@@ -387,13 +405,6 @@ impl Registry {
         self.update(id, |t| t.taking_over = false);
     }
 
-    /// Whether a takeover of the task with this id is under way: its import
-    /// thread then acts on no cancel, silence or failed attempt, and deletes
-    /// nothing, until the takeover has ended one way or the other.
-    fn taking_over(&self, id: &str) -> bool {
-        self.get(id).is_some_and(|t| t.taking_over)
-    }
-
     /// The last look before a takeover takes the slots, with the tasks
     /// locked: its import is still in progress, its takeover still on, not
     /// canceled, its attempt not given up, and this node not shutting down.
@@ -401,31 +412,104 @@ impl Registry {
     /// while the takeover runs ([`Self::taking_over`]), a fence answers that
     /// the slots are being taken, and the takeover ends with the import
     /// completed.
-    fn may_take_now(&self, id: &str) -> Result<(), String> {
+    ///
+    /// Refused with why, and whether because the import was canceled (no
+    /// refusal of the takeover as such: see `takeover_refusals`).
+    fn may_take_now(&self, id: &str) -> Result<(), (String, bool)> {
         let tasks = self.tasks.lock();
         let Some(t) = tasks
             .iter()
             .rev()
             .find(|t| t.id == id && t.operation == Operation::Import)
         else {
-            return Err("no such import in progress".into());
+            return Err(("no such import in progress".into(), false));
         };
         if t.state != TaskState::InProgress {
-            return Err("the import has ended".into());
+            return Err(("the import has ended".into(), false));
         }
         if !t.taking_over {
-            return Err("the takeover was given up".into());
+            return Err(("the takeover was given up".into(), false));
         }
         if t.cancel.load(Ordering::SeqCst) {
-            return Err("the import was canceled meanwhile".into());
+            return Err(("the import was canceled meanwhile".into(), true));
         }
         if t.attempt_failed.load(Ordering::SeqCst) {
-            return Err("the source has given this attempt up".into());
+            return Err(("the source has given this attempt up".into(), false));
         }
         if crate::shutdown::in_progress() {
-            return Err("this node is shutting down".into());
+            return Err(("this node is shutting down".into(), false));
         }
         Ok(())
+    }
+
+    /// What an import's thread is to do about its current attempt, looked at
+    /// once with the tasks locked: nothing while a takeover is under way (it
+    /// decides); stop on a cancel, or on an attempt given up; and give the
+    /// attempt up itself, there and then, if the source has been silent for
+    /// longer than `silence` (a `TAKEOVER` of it is refused from then on).
+    fn attempt_check(&self, id: &str, silence: Duration) -> AttemptCheck {
+        let mut tasks = self.tasks.lock();
+        let Some(t) = tasks
+            .iter_mut()
+            .rev()
+            .find(|t| t.id == id && t.operation == Operation::Import)
+        else {
+            return AttemptCheck::Ended;
+        };
+        if t.state != TaskState::InProgress {
+            return AttemptCheck::Ended;
+        }
+        if t.taking_over {
+            return AttemptCheck::TakingOver;
+        }
+        if t.cancel.load(Ordering::SeqCst) {
+            return AttemptCheck::Canceled;
+        }
+        if t.attempt_failed.load(Ordering::SeqCst) {
+            return AttemptCheck::GivenUp(t.last_error.clone());
+        }
+        let silent_for = now_ms().saturating_sub(t.last_activity_ms.load(Ordering::Relaxed));
+        if silent_for > silence.as_millis() as u64 {
+            t.attempt_failed.store(true, Ordering::SeqCst);
+            t.last_error = "the source went silent".to_string();
+            return AttemptCheck::GivenUp(t.last_error.clone());
+        }
+        AttemptCheck::Go
+    }
+
+    /// Give the import's current attempt up before what it brought is
+    /// deleted, with the tasks locked, unless a takeover of it is under way:
+    /// whether it was. A `TAKEOVER` of it is refused from then on.
+    fn give_up_attempt(&self, id: &str) -> bool {
+        let tasks = self.tasks.lock();
+        let Some(t) = tasks
+            .iter()
+            .rev()
+            .find(|t| t.id == id && t.operation == Operation::Import)
+        else {
+            return true;
+        };
+        if t.taking_over {
+            return false;
+        }
+        t.attempt_failed.store(true, Ordering::SeqCst);
+        true
+    }
+
+    /// For `CLUSTER RESET`: no takeover begins until the guard is dropped.
+    /// `None` if one is under way (the reset is refused then: it would drop
+    /// the slots and the cluster config the takeover is saving).
+    pub(crate) fn hold_takeovers(&self) -> Option<TakeoversHeld<'_>> {
+        let tasks = self.tasks.lock();
+        if tasks
+            .iter()
+            .any(|t| t.state == TaskState::InProgress && t.taking_over)
+        {
+            return None;
+        }
+        self.takeovers_held.fetch_add(1, Ordering::SeqCst);
+        drop(tasks);
+        Some(TakeoversHeld(self))
     }
 
     /// The destination's side of `CLUSTER SYNCSLOTS FAIL`: the source has
@@ -3191,6 +3275,10 @@ fn run_import(env: Env, task_id: String) {
             continue;
         }
         if task.cancel.load(Ordering::Relaxed) {
+            if !registry.give_up_attempt(&task_id) {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
             delete_unowned(&env, &task);
             registry.finish(&task_id, TaskState::Canceled, None);
             save_imports(&env.cluster);
@@ -3297,6 +3385,17 @@ fn run_import(env: Env, task_id: String) {
             // Taken over, canceled, or otherwise finished by a handler.
             None => return,
             Some(error) => {
+                // Given up first (a `TAKEOVER` of it is refused from here),
+                // or, while one is under way, its outcome waited for.
+                while !registry.give_up_attempt(&task_id) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if registry
+                    .get(&task_id)
+                    .is_none_or(|t| t.state != TaskState::InProgress)
+                {
+                    return;
+                }
                 delete_unowned(&env, &task);
                 let mut refusals = 0;
                 registry.update(&task_id, |t| {
@@ -3332,12 +3431,24 @@ fn run_import(env: Env, task_id: String) {
     }
 }
 
+/// See [`Registry::attempt_check`].
+enum AttemptCheck {
+    /// The task has ended (completed, canceled, failed) or is gone.
+    Ended,
+    /// A takeover is under way: wait for its outcome.
+    TakingOver,
+    Canceled,
+    /// Given up, by the source or for its silence: why.
+    GivenUp(String),
+    Go,
+}
+
 /// How long an import waits before its next attempt, after `refusals`
-/// takeovers refused in a row: [`RETRY_DELAY`], doubled for each, at most
-/// [`RETRY_DELAY_MAX`].
+/// takeovers refused in a row: [`RETRY_DELAY`] after none or one, doubled
+/// for each further one, at most [`RETRY_DELAY_MAX`].
 fn retry_delay(refusals: u32) -> Duration {
     RETRY_DELAY
-        .saturating_mul(1u32 << refusals.min(16))
+        .saturating_mul(1u32 << refusals.saturating_sub(1).min(16))
         .min(RETRY_DELAY_MAX)
 }
 
@@ -3366,15 +3477,15 @@ fn import_attempt(env: &Env, task: &Task, source: NodeId) -> Option<String> {
 
     loop {
         std::thread::sleep(Duration::from_millis(20));
-        match registry.get(&task.id).map(|t| t.state) {
-            Some(TaskState::InProgress) => {}
-            _ => return None,
-        }
-        // A takeover under way decides: a cancel, the source's silence or
-        // its giving the attempt up are acted on once it has been refused,
-        // and are moot once it has taken the slots (the import completed).
-        if registry.taking_over(&task.id) {
-            continue;
+        // One look, with the tasks locked. A takeover under way decides: a
+        // cancel, the source's silence or its giving the attempt up are
+        // acted on once it has been refused, and are moot once it has
+        // taken the slots (the import completed).
+        match registry.attempt_check(&task.id, SOURCE_SILENCE_LIMIT) {
+            AttemptCheck::Ended => return None,
+            AttemptCheck::TakingOver => continue,
+            AttemptCheck::GivenUp(why) => return Some(why),
+            AttemptCheck::Canceled | AttemptCheck::Go => {}
         }
         if task.cancel.load(Ordering::Relaxed) {
             // Stop the source too; it would otherwise keep sending.
@@ -3386,22 +3497,14 @@ fn import_attempt(env: &Env, task: &Task, source: NodeId) -> Option<String> {
                     task.id.as_bytes(),
                 ]));
             }
+            if !registry.give_up_attempt(&task.id) {
+                continue;
+            }
             delete_unowned(env, task);
+            registry.update(&task.id, |t| t.takeover_refusals = 0);
             registry.finish(&task.id, TaskState::Canceled, None);
             save_imports(&env.cluster);
             return None;
-        }
-        if task.attempt_failed.load(Ordering::Relaxed) {
-            return Some(
-                registry
-                    .get(&task.id)
-                    .map(|t| t.last_error)
-                    .unwrap_or_default(),
-            );
-        }
-        let silent_for = now_ms().saturating_sub(task.last_activity_ms.load(Ordering::Relaxed));
-        if silent_for > SOURCE_SILENCE_LIMIT.as_millis() as u64 {
-            return Some("the source went silent".into());
         }
     }
 }
@@ -3538,7 +3641,7 @@ pub fn take_over(
     if lost.is_some() {
         super::bus::heartbeat::set_test_bus_muted(true);
     }
-    let deadline = Instant::now() + Duration::from_millis((pause_ms / 2).max(100));
+    let deadline = Instant::now() + takeover_wait(pause_ms);
     let result = off_the_runtime(|| take_over_now(cluster, task_id, client_id, deadline));
     if let Some(delay) = lost {
         log_warn!("Cluster: (test) the TAKEOVER's reply and claim are held back {delay:?}");
@@ -3552,6 +3655,17 @@ pub fn take_over(
     result
 }
 
+/// How long a takeover waits for the AOF and this node's replicas: half the
+/// source's write pause (`pause_ms`), and no more than [`TAKEOVER_WAIT_MAX`],
+/// so that each attempt holds the source's writes briefly; a replica that is
+/// further behind than that is waited for over the next attempts, later
+/// each time ([`retry_delay`]).
+fn takeover_wait(pause_ms: u64) -> Duration {
+    Duration::from_millis(pause_ms / 2)
+        .min(TAKEOVER_WAIT_MAX)
+        .max(Duration::from_millis(100))
+}
+
 /// [`take_over`], waiting until `deadline` at most.
 fn take_over_now(
     cluster: &ClusterState,
@@ -3561,7 +3675,23 @@ fn take_over_now(
 ) -> Result<(), String> {
     // Refused if the source has given this attempt up meanwhile: it has
     // been told that the slots stay with it, and takes writes again.
-    let task = cluster.slot_migrations.begin_takeover(task_id, client_id)?;
+    let task = match cluster.slot_migrations.begin_takeover(task_id, client_id) {
+        Ok(task) => task,
+        Err(why) => {
+            log_warn!("Cluster: Not taking over the slots of import {task_id}: {why}");
+            return Err(why);
+        }
+    };
+    // However this ends, the takeover is no longer under way afterwards:
+    // also if the code below unwinds, so that the import's thread, the
+    // source's fence and its paused writes are not held for good.
+    struct Underway<'a>(&'a Registry, &'a str);
+    impl Drop for Underway<'_> {
+        fn drop(&mut self) {
+            self.0.takeover_undone(self.1);
+        }
+    }
+    let _underway = Underway(&cluster.slot_migrations, task_id);
     // Only from the master of the slots, as this node sees it (#516). From
     // here a vote for a replica of the source is refused (`fence_imports`).
     let not_from_the_source = |why: String| {
@@ -3583,13 +3713,16 @@ fn take_over_now(
     // The source keeps client writes paused until it knows how this ends.
     let started = Instant::now();
     // Not taken over: the slots stay with the source, which keeps serving
-    // them, and the handoff is tried again (`run_import`), later each time.
-    let not_yet = |why: &str| {
+    // them, and the handoff is tried again (`run_import`), later after each
+    // refusal in a row (`counted`; a cancel is no refusal).
+    let not_yet = |why: &str, counted: bool| {
         cluster.slot_migrations.update(task_id, |t| {
             t.taking_over = false;
             t.last_error = why.to_string();
-            t.takeover_refused = why.to_string();
-            t.takeover_refusals = t.takeover_refusals.saturating_add(1);
+            if counted {
+                t.takeover_refused = why.to_string();
+                t.takeover_refusals = t.takeover_refusals.saturating_add(1);
+            }
         });
         log_warn!(
             "Cluster: Not taking slots {} over from {}: {why}; they stay with it",
@@ -3603,66 +3736,69 @@ fn take_over_now(
     // told: it deletes its copy then, and nothing waits for these records
     // otherwise.
     if !crate::aof::written_blocking(deadline) {
-        return not_yet("what arrived is not in the AOF in time");
+        return not_yet("what arrived is not in the AOF in time", true);
+    }
+    // The config epoch the slots are taken at, chosen now: this node's
+    // replicas are told, in the stream, after the last record of what
+    // arrived, that it has all arrived for a takeover at this epoch
+    // (`ARRIVED`, see `followed_imports::encode_arrived`). A replica that has
+    // read that marker holds every key of the slots, whatever becomes of
+    // its link afterwards. Should the slots be taken at this epoch, a vote's
+    // `UPDATE` may give it them (see `ClusterState::master_claims_arrived`);
+    // should this attempt be refused, a later takeover of them is at a newer
+    // epoch, which the marker does not stand for.
+    let epoch = cluster.bump_epoch();
+    if let Some(hooks) = cluster.hooks.get() {
+        hooks
+            .replica_starter
+            .repl_state
+            .send_slot_marker(super::followed_imports::encode_arrived(epoch, &task.ranges));
     }
     // And on this node's replicas, as the cluster knows them: every one
     // that is not marked failed has a link to this node that has
     // acknowledged what arrived, and so has every one marked failed whose
-    // link is up (matched by the address it announced). A replica in a full
-    // sync, or with its link down, is waited for within the bound, and the
+    // link is up. A link stands for a replica by the node id it gave
+    // (`REPLCONF node-id`), or, from a replica that gives none (1.2), by its
+    // address (`replication::links_of_replica`). A replica in a full sync,
+    // or with its link down, is waited for within the bound, and the
     // takeover refused otherwise: tried again later, each time later, until
     // it has caught up or is marked failed. Other links (not one of this
     // node's replicas as the cluster knows them) neither count nor hold the
-    // takeover up. So a replica attached when the slots are taken holds
+    // takeover up. So every replica attached when the slots are taken holds
     // their keys, and is then told the claim in the stream (`TAKEN`, see
-    // `take_over_slots`) ahead of every write to them. A replica whose link
-    // was down then may lack them: it is told the claim by the heartbeats,
-    // and the voters' `UPDATE` (see `cast_vote`) gives it the slots only if
-    // its own stream showed it the import begin, in a session that has not
-    // been resynced since (`followed_imports::seen_importing`).
+    // `take_over_slots`) ahead of every write to them.
     if let Some(hooks) = cluster.hooks.get() {
         let me = cluster.myself();
-        // The addresses a replica may link from: its IP in the cluster and
-        // the client IPs it announces, with its client port and the one it
-        // announces.
-        let addresses = |n: &super::ClusterNode| {
-            let ips = [
-                n.ip.as_str(),
-                n.client_ips.v4.as_str(),
-                n.client_ips.v6.as_str(),
-            ];
-            let ports = [n.client_port, n.announced_client_port];
-            let mut out: Vec<(String, u16)> = Vec::new();
-            for ip in ips.iter().filter(|ip| !ip.is_empty()) {
-                for port in ports.iter().filter(|port| **port != 0) {
-                    let a = (ip.to_string(), *port);
-                    if !out.contains(&a) {
-                        out.push(a);
-                    }
-                }
-            }
-            out
-        };
         let (required, if_attached): (Vec<_>, Vec<_>) = cluster
             .nodes
             .read()
             .values()
             .filter(|n| n.master_id == Some(me) && n.flags.contains(super::NodeFlags::REPLICA))
             .map(|n| {
+                let mut ips = vec![n.ip.clone()];
+                for ip in [&n.client_ips.v4, &n.client_ips.v6] {
+                    if !ip.is_empty() {
+                        ips.push(ip.clone());
+                    }
+                }
+                let ports: Vec<u16> = [n.client_port, n.announced_client_port]
+                    .into_iter()
+                    .filter(|p| *p != 0)
+                    .collect();
                 (
                     !n.flags.contains(super::NodeFlags::FAIL),
-                    (n.id, addresses(n)),
+                    crate::replication::ReplicaWanted {
+                        node_id: super::node_id_str(&n.id).to_string(),
+                        ips,
+                        ports,
+                    },
                 )
             })
             .partition(|(not_failed, _)| *not_failed);
-        let replicas: Vec<(super::NodeId, Vec<(String, u16)>)> = required
-            .iter()
-            .chain(if_attached.iter())
-            .map(|(_, r)| r.clone())
-            .collect();
-        let required: Vec<Vec<(String, u16)>> = required.into_iter().map(|(_, (_, a))| a).collect();
-        let if_attached: Vec<Vec<(String, u16)>> =
-            if_attached.into_iter().map(|(_, (_, a))| a).collect();
+        let required: Vec<crate::replication::ReplicaWanted> =
+            required.into_iter().map(|(_, r)| r).collect();
+        let if_attached: Vec<crate::replication::ReplicaWanted> =
+            if_attached.into_iter().map(|(_, r)| r).collect();
         log_info!(
             "Cluster: Taking slots {} over once the AOF and {} replica(s) have what arrived",
             ranges_text(&task.ranges),
@@ -3673,48 +3809,53 @@ fn take_over_now(
             &if_attached,
             deadline,
         ) {
-            let text = |addrs: &[(String, u16)]| {
-                addrs
-                    .iter()
-                    .map(|(ip, port)| format!("{ip}:{port}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let (id, addrs) = replicas
-                .get(behind.index)
-                .map(|(id, addrs)| (super::node_id_str(id).to_string(), addrs.clone()))
-                .unwrap_or_default();
-            if behind.linked == Some(false) {
+            let wanted = required.iter().chain(if_attached.iter()).nth(behind.index);
+            let id = wanted.map(|w| w.node_id.as_str()).unwrap_or("?");
+            if behind.linked == Some(false)
+                && let Some(w) = wanted
+            {
                 // As a replica behind NAT, or linking from an address the
                 // cluster does not have for it, would show it.
                 log_warn!(
-                    "Cluster: no replication link to this node comes from replica {id} at any \
-                     of its addresses ({}); links are attached from: {}",
-                    text(&addrs),
+                    "Cluster: no replication link to this node is from replica {id}: none gave \
+                     its node id, and none comes from its addresses (IPs {}, ports {}); links \
+                     are attached from: {}",
+                    w.ips.join(", "),
+                    w.ports
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     if behind.attached_from.is_empty() {
                         "none".to_string()
                     } else {
-                        text(&behind.attached_from)
+                        behind.attached_from.join(", ")
                     }
                 );
             }
-            return not_yet(&format!(
-                "this node's replica {id} at {} has not acknowledged what arrived in time",
-                addrs
-                    .first()
-                    .map(|(ip, port)| format!("{ip}:{port}"))
-                    .unwrap_or_default()
-            ));
+            let at = wanted
+                .and_then(|w| w.ips.first().zip(w.ports.first()))
+                .map(|(ip, port)| format!("{ip}:{port}"))
+                .unwrap_or_default();
+            return not_yet(
+                &format!(
+                    "this node's replica {id} at {at} has not acknowledged what arrived in time"
+                ),
+                true,
+            );
         }
     }
+    // Tests: held here, its replicas having acknowledged what arrived, before
+    // the slots are taken.
+    crate::aof::failpoint("takeover-acknowledged");
     // The source may have changed meanwhile.
     if let Err(why) = source_still_owns(cluster, &task) {
         return not_from_the_source(why);
     }
     // And the import: still on, not canceled, not given up, and this node
     // not shutting down. From here the takeover stands (`may_take_now`).
-    if let Err(why) = cluster.slot_migrations.may_take_now(task_id) {
-        return not_yet(&why);
+    if let Err((why, canceled)) = cluster.slot_migrations.may_take_now(task_id) {
+        return not_yet(&why, !canceled);
     }
     // Saved before the source is told: it deletes its copy when told, and a
     // restart of this node with the slots not in its config would delete
@@ -3725,7 +3866,7 @@ fn take_over_now(
     // is synced before the slots are taken: a write to them acknowledged
     // here is on disk, and so is this node's claim of them. Otherwise the
     // sync follows on another thread.
-    let take = || cluster.take_over_slots(slots_of(&task.ranges));
+    let take = || cluster.take_over_slots_at(slots_of(&task.ranges), epoch);
     let taken = if crate::aof::syncs_before_acks() {
         take()
     } else {
@@ -3741,6 +3882,7 @@ fn take_over_now(
         );
         return Err(format!("could not save the cluster config: {e}"));
     }
+    cluster.slot_migrations.update(task_id, |t| t.takeover_refusals = 0);
     cluster
         .slot_migrations
         .finish(task_id, TaskState::Completed, None);

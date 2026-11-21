@@ -35,6 +35,8 @@ pub async fn handle_replica_connection_uring(
     legacy_sync: bool,
     // The port the replica announced with `REPLCONF listening-port`, if any.
     listening_port: Option<u16>,
+    // The cluster node id it gave with `REPLCONF node-id`, if any.
+    node_id: Option<String>,
     // What the replica asked to continue from (`PSYNC <replid> <offset>`).
     psync: Option<crate::replication::PsyncRequest>,
     // It sent `REPLCONF capa vset-quant`.
@@ -55,6 +57,7 @@ pub async fn handle_replica_connection_uring(
     // ── 1. The stream queue. Unbounded: bounded queues fill before forwarding runs.
     let (replica_tx, replica_rx) = mpsc::unbounded_channel::<crate::replication::ReplPayload>();
     let replica_id = crate::replication::next_replica_id();
+    repl_state.note_replica_node_id(replica_id, node_id);
 
     // Shared with the hub: it increments this on enqueue, the forwarder below
     // decrements it after each successful flush. Lets the hub evict us if we fall
@@ -4088,6 +4091,9 @@ pub async fn handle_client(
                     .get(client_id)
                     .map(|info| info.replica_listening_port)
                     .filter(|p| *p != 0);
+                let node_id = client_registry
+                    .get(client_id)
+                    .and_then(|info| info.replica_node_id);
                 let vset_quant_announced = client_registry
                     .get(client_id)
                     .is_some_and(|info| info.replica_vset_quant == Some(true));
@@ -4112,6 +4118,7 @@ pub async fn handle_client(
                     peer_addr.clone(),
                     legacy_sync,
                     listening_port,
+                    node_id,
                     psync,
                     vset_quant_announced,
                     slot_imports_announced,
