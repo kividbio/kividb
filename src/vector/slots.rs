@@ -547,7 +547,7 @@ fn cut_block(chunks: &mut Vec<Chunk>, size: usize) -> Option<NonNull<u8>> {
 #[cfg(all(target_os = "linux", not(miri)))]
 fn collapse(chunk: &mut Chunk, upto: usize) {
     let end = (upto / HUGE_PAGE) * HUGE_PAGE;
-    if end <= chunk.collapsed {
+    if end <= chunk.collapsed || !huge_pages_allowed() {
         return;
     }
     let from = chunk.collapsed;
@@ -559,6 +559,21 @@ fn collapse(chunk: &mut Chunk, upto: usize) {
         libc::madvise(p, end - from, MADV_COLLAPSE);
     }
     chunk.collapsed = end;
+}
+
+/// Whether transparent huge pages are on (`always` or `madvise`), read once:
+/// `MADV_COLLAPSE` makes huge pages even where they are set to `never`, and
+/// a server whose huge pages are off keeps them off.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn huge_pages_allowed() -> bool {
+    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Not there to read (a sandbox without /sys): the kernel decides.
+    *ALLOWED.get_or_init(|| {
+        match std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled") {
+            Ok(setting) => !setting.contains("[never]"),
+            Err(_) => true,
+        }
+    })
 }
 
 /// `MADV_COLLAPSE` (Linux 6.1): collapse a range into huge pages now.
