@@ -1663,11 +1663,7 @@ fn silent_destination() -> (u16, std::sync::Arc<std::sync::atomic::AtomicBool>) 
 /// `MIGRATE` of `key` to a destination that never answers, on a connection
 /// of its own, timing out after `ms`: its reply and how long it took, once
 /// it has sent the key (so a write to it waits from then on).
-fn migrate_to_nowhere(
-    port: u16,
-    key: &str,
-    ms: u64,
-) -> std::thread::JoinHandle<(V, Duration)> {
+fn migrate_to_nowhere(port: u16, key: &str, ms: u64) -> std::thread::JoinHandle<(V, Duration)> {
     let (destination, sent) = silent_destination();
     let key = key.to_string();
     let migrate = std::thread::spawn(move || {
@@ -1868,7 +1864,10 @@ fn alone_scripts_beside_long_commands(io: &str) {
     };
     assert_eq!(n.parse::<usize>().unwrap(), total);
     // They ran in runs: the gate was closed for them, again and again.
-    assert!(closes > 0 && in_runs > 0, "{in_runs} takes, {closes} closes");
+    assert!(
+        closes > 0 && in_runs > 0,
+        "{in_runs} takes, {closes} closes"
+    );
 }
 
 /// `SCRIPT KILL` of a slow script that has the turn, with quick scripts queued
@@ -2021,9 +2020,7 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
     let (reply, took, got) = a.join().unwrap();
     let (written, waited) = b.join().unwrap();
     let (migrated, _) = migrate.join().unwrap();
-    eprintln!(
-        "{io}: A and its GET answered in {took:?}; B waited {waited:?}"
-    );
+    eprintln!("{io}: A and its GET answered in {took:?}; B waited {waited:?}");
     assert_eq!(reply, V::Int(count as i64));
     assert_eq!(got, V::Str(count.to_string()));
     assert!(
