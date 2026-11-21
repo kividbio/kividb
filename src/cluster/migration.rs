@@ -3964,12 +3964,16 @@ fn source_epoch_now(cluster: &Arc<ClusterState>, task: &Task) -> Option<u64> {
         .spawn_released(move || {
             let asked = cluster.hooks.get().and_then(|hooks| {
                 let mut peer =
-                    Peer::connect_to(&cluster, &hooks.replica_starter.repl_state, &source)
-                        .ok()?;
-                peer.ask(&command(&[b"CLUSTER", b"SYNCSLOTS", b"EPOCH", id.as_bytes()]))
-                    .ok()?
-                    .parse()
-                    .ok()
+                    Peer::connect_to(&cluster, &hooks.replica_starter.repl_state, &source).ok()?;
+                peer.ask(&command(&[
+                    b"CLUSTER",
+                    b"SYNCSLOTS",
+                    b"EPOCH",
+                    id.as_bytes(),
+                ]))
+                .ok()?
+                .parse()
+                .ok()
             });
             let _ = tx.send(asked);
         })
