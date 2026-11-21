@@ -958,6 +958,34 @@ fn test_ft_info_hnsw_stats_and_debug_compact() {
     assert_eq!(find(entry, "live_count").unwrap().as_str(), "3");
     assert_eq!(find(entry, "tombstone_count").unwrap().as_str(), "0");
 
+    // The helper-thread fields come after `hnsw_indexes`: the fields that
+    // were there before them keep their places.
+    let names: Vec<String> = arr
+        .iter()
+        .step_by(2)
+        .map(|v| match v {
+            RespValue::Bulk(b) => String::from_utf8_lossy(b).into_owned(),
+            RespValue::SimpleStr(s) => s.clone(),
+            _ => String::new(),
+        })
+        .filter(|n| n.starts_with("hnsw_"))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "hnsw_live_count",
+            "hnsw_tombstone_count",
+            "hnsw_tombstone_ratio",
+            "hnsw_compaction_in_progress",
+            "hnsw_backlog",
+            "hnsw_backlog_bytes",
+            "hnsw_indexes",
+            "hnsw_index_threads",
+            "hnsw_index_threads_active",
+        ],
+        "FT.INFO's hnsw fields, in order"
+    );
+
     // Delete bumps tombstone count
     c.cmds(&["DEL", "v:2"]);
     let info2 = c.cmds(&["FT.INFO", "idx"]);
