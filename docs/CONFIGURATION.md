@@ -170,7 +170,7 @@ compacts).
 Keys' entries, and string values kept apart from them, whose block (header included) is at
 most 2 KiB live in 64 KiB slabs of one block size each, and those of up to 26,208 bytes in
 1 MiB slabs, whose block sizes are at most 2.5 % apart and each a slab's size over a count of
-blocks (a value of 4,100 bytes takes a block of 4,144, one of 8,000 a block of 8,192); a larger
+blocks, 4,096 among them (a value of 4,088 bytes takes a block of 4,096, one of 4,100 a block of 4,192); a larger
 value is the system allocator's. A slab nobody is filling is used for new blocks again once a quarter of it is free
 (a 1 MiB slab, once a sixteenth is);
 until then its free blocks are memory the process holds. Active defrag (`activedefrag`, on by

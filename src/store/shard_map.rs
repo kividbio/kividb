@@ -2484,7 +2484,13 @@ mod tests {
             Some(ValueRef::String(s)) => s.as_bytes().as_ptr() as usize,
             _ => panic!("no string"),
         };
-        let (a, b) = (vec![1u8; 5_000], vec![2u8; 5_010]);
+        // Two lengths of one slab class's blocks (8 bytes of header each).
+        let top = crate::value_slab::block_size(crate::value_slab::class_of(5_100).unwrap()) - 8;
+        let (a, b) = (vec![1u8; top - 40], vec![2u8; top]);
+        assert_eq!(
+            crate::value_slab::class_of(top - 32),
+            crate::value_slab::class_of(top + 8)
+        );
         assert!(matches!(map.set_str("k", &a), Written::New));
         let at = block(&map);
         assert!(matches!(map.set_str("k", &b), Written::InPlace));
