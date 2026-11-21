@@ -9614,24 +9614,18 @@ fn a_replica_down_when_its_master_took_slots_is_not_given_them_by_the_voters() {
 /// which it has no replication link to its master.
 const LINK_DOWN: (&str, &str) = ("KIVIDB_TEST_REPLICA_LINK_DOWN", "link-down");
 
-/// Cut `node`, a replica of `master`, off, still running, or let it reach
-/// the others again: its replication link down and its cluster bus stalled
-/// (it sends nothing and decides nothing; what comes in is still taken in).
-/// `heard` false: its master's slot claims are not taken in either
-/// (`KIVIDB_TEST_IGNORE_CLAIMS`), as when none of its master's messages reach
-/// it; true: they are, as when only the replication link is cut.
-fn cut_off(node: &Node, master: &str, cut: bool, heard: bool) {
+/// Cut `node` off, still running, or let it reach the others again: its
+/// replication link down, and its cluster bus stalled (`heard` false: it
+/// sends and decides nothing, and takes in what comes only once the cut
+/// heals) or muted (`heard` true: it sends nothing, and takes in what comes,
+/// its master's claims among it, as when only the replication link is cut).
+fn cut_off(node: &Node, cut: bool, heard: bool) {
     let link = node.dir.join(LINK_DOWN.1);
-    let claims = node.dir.join(IGNORE_CLAIMS.1);
     if cut {
-        if !heard {
-            std::fs::write(&claims, master).unwrap();
-        }
         std::fs::write(&link, "").unwrap();
-        set_bus(node, "stall");
+        set_bus(node, if heard { "mute" } else { "stall" });
     } else {
         let _ = std::fs::remove_file(&link);
-        let _ = std::fs::remove_file(&claims);
         set_bus(node, "run");
     }
 }
@@ -9664,7 +9658,7 @@ fn replica_cut_off_during_an_import(heard: bool, stands: Stands) {
         &nodes,
         &nodes[1],
         &["--cluster-replica-validity-factor", "0"],
-        &[LINK_DOWN, BUS_CONTROL, IGNORE_CLAIMS],
+        &[LINK_DOWN, BUS_CONTROL],
     );
     {
         let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
@@ -9682,7 +9676,7 @@ fn replica_cut_off_during_an_import(heard: bool, stands: Stands) {
         Duration::from_secs(30),
         || replica.conn().cmd(&["DBSIZE"]).int() > 0,
     );
-    cut_off(&replica, &dst_id, true, heard);
+    cut_off(&replica, true, heard);
     wait_until(
         "the replica to be marked failed",
         Duration::from_secs(30),
@@ -9715,7 +9709,7 @@ fn replica_cut_off_during_an_import(heard: bool, stands: Stands) {
             replica.is_master()
         });
     }
-    cut_off(&replica, &dst_id, false, heard);
+    cut_off(&replica, false, heard);
     wait_until(
         "the replica to stand for the destination's own slots",
         Duration::from_secs(60),
@@ -9733,12 +9727,10 @@ fn replica_cut_off_during_an_import(heard: bool, stands: Stands) {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    let left = replica.log().contains("promoted without slots 0-100");
+    eprintln!("the replica left slots 0-100 with the destination at its promotion: {left}");
     if heard {
-        assert!(
-            replica.log().contains("promoted without slots 0-100"),
-            "{}",
-            replica.log()
-        );
+        assert!(left, "{}", replica.log());
     }
     nodes[1].spawn();
     wait_until(
@@ -9757,8 +9749,8 @@ fn replica_cut_off_during_an_import(heard: bool, stands: Stands) {
     }
 }
 
-/// [`replica_cut_off_during_an_import`]: nothing of its master reaches the
-/// replica; it is elected once the cut heals.
+/// [`replica_cut_off_during_an_import`]: the replica's bus stalled, what its
+/// master sends reaches it only once the cut heals; it is elected then.
 #[test]
 fn a_replica_cut_off_part_way_through_an_import_is_not_given_its_slots_by_the_voters() {
     replica_cut_off_during_an_import(false, Stands::Elected);
@@ -9894,7 +9886,7 @@ fn a_replica_cut_off_between_two_takeovers_is_not_given_the_slots_by_the_voters(
         &nodes,
         &nodes[1],
         &["--cluster-replica-validity-factor", "0"],
-        &[LINK_DOWN, BUS_CONTROL, IGNORE_CLAIMS],
+        &[LINK_DOWN, BUS_CONTROL],
     );
     let mut other = add_replica(&nodes, &nodes[1]);
     {
@@ -9923,7 +9915,7 @@ fn a_replica_cut_off_between_two_takeovers_is_not_given_the_slots_by_the_voters(
         "{}",
         replica.log()
     );
-    cut_off(&replica, &dst_id, true, false);
+    cut_off(&replica, true, false);
     let between = Written::on(&nodes[0], 0..=100, "between", 100);
     signal(&other, "-CONT");
     wait_until(
@@ -9943,7 +9935,7 @@ fn a_replica_cut_off_between_two_takeovers_is_not_given_the_slots_by_the_voters(
     );
     other.kill();
     nodes[1].kill();
-    cut_off(&replica, &dst_id, false, false);
+    cut_off(&replica, false, false);
     let own = ranges[1].0;
     wait_until(
         "the replica to be elected to the destination's own slots",
