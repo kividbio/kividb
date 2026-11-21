@@ -2501,10 +2501,19 @@ mod tests {
         drop(held);
         // Another class, or no slab's block: a new block.
         let at = block(&map);
-        assert!(matches!(map.set_str("k", vec![3u8; 9_000]), Written::Replaced(_)));
+        assert!(matches!(
+            map.set_str("k", vec![3u8; 9_000]),
+            Written::Replaced(_)
+        ));
         assert_ne!(block(&map), at);
-        assert!(matches!(map.set_str("k", vec![4u8; 40_000]), Written::Replaced(_)));
-        assert!(matches!(map.set_str("k", vec![5u8; 40_000]), Written::Replaced(_)));
+        assert!(matches!(
+            map.set_str("k", vec![4u8; 40_000]),
+            Written::Replaced(_)
+        ));
+        assert!(matches!(
+            map.set_str("k", vec![5u8; 40_000]),
+            Written::Replaced(_)
+        ));
         assert_eq!(text(map.get("k")), Some(vec![5u8; 40_000]));
     }
 

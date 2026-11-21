@@ -1113,7 +1113,10 @@ pub fn fill() -> Fill {
 /// while others take large ones (a megabyte each).
 #[cfg(test)]
 pub(crate) fn small_fill() -> Fill {
-    fill_where(|class| class < SMALL, || IN_USE.load(Ordering::Relaxed) * SLAB)
+    fill_where(
+        |class| class < SMALL,
+        || IN_USE.load(Ordering::Relaxed) * SLAB,
+    )
 }
 
 /// [`fill`] of the keyspace's classes `keep` says.

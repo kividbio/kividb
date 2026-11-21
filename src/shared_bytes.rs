@@ -206,7 +206,11 @@ impl SharedBytes {
         // SAFETY: as the caller says, nothing reads the bytes or the length
         // while they change, and the block has room for `bytes` in its class.
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (block as *mut u8).add(HEADER), bytes.len());
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (block as *mut u8).add(HEADER),
+                bytes.len(),
+            );
             std::ptr::addr_of_mut!((*block).len).write(bytes.len() as u32);
         }
     }

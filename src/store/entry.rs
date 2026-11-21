@@ -509,13 +509,10 @@ impl Entry {
     /// live stays as it is.
     #[inline]
     pub(super) fn fits_in_place(self, vlen: usize) -> bool {
-        if self.holders() != 1 {
-            return false;
-        }
-        if self.form() == WHOLE {
-            return matches!(self.whole(), KiviDBValue::String(b) if b.is_unique() && b.fits(vlen));
-        }
         if self.form() != INLINE {
+            return self.form() == WHOLE && self.own_fits_in_place(vlen);
+        }
+        if self.holders() != 1 {
             return false;
         }
         let klen = self.klen();
@@ -523,6 +520,14 @@ impl Entry {
         let now = inline_size(klen, self.header().vlen as usize, ttl);
         // An inline entry is in a slab: its class is never `None`.
         value_slab::class_of(inline_size(klen, vlen, ttl)) == value_slab::class_of(now)
+    }
+
+    /// [`fits_in_place`](Self::fits_in_place) of a [`WHOLE`] entry: out of
+    /// the inline string's way, which every SET of a short value takes.
+    #[inline(never)]
+    fn own_fits_in_place(self, vlen: usize) -> bool {
+        self.holders() == 1
+            && matches!(self.whole(), KiviDBValue::String(b) if b.is_unique() && b.fits(vlen))
     }
 
     /// Where an inline string's bytes start.
@@ -539,13 +544,8 @@ impl Entry {
     pub(super) unsafe fn write_in_place(self, bytes: &[u8]) {
         debug_assert!(self.fits_in_place(bytes.len()));
         if self.form() == WHOLE {
-            if let KiviDBValue::String(b) = self.whole() {
-                // SAFETY: `fits_in_place`: the entry is the bytes' only
-                // holder, the table the entry's, and the shard is locked for
-                // writing.
-                unsafe { b.write_in_place(bytes) };
-            }
-            return;
+            // SAFETY: as this function's.
+            return unsafe { self.write_own_in_place(bytes) };
         }
         // SAFETY: nothing but the table holds the entry and the shard is
         // locked for writing: nothing reads the bytes or the length while
@@ -554,6 +554,20 @@ impl Entry {
             let base = self.0.as_ptr() as *mut u8;
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(self.inline_at()), bytes.len());
             self.set_vlen(bytes.len());
+        }
+    }
+
+    /// [`write_in_place`](Self::write_in_place) of a [`WHOLE`] entry's
+    /// string of its own.
+    ///
+    /// # Safety
+    /// As `write_in_place`'s.
+    #[inline(never)]
+    unsafe fn write_own_in_place(self, bytes: &[u8]) {
+        if let KiviDBValue::String(b) = self.whole() {
+            // SAFETY: `fits_in_place`: the entry is the bytes' only holder,
+            // the table the entry's, and the shard is locked for writing.
+            unsafe { b.write_in_place(bytes) };
         }
     }
 
