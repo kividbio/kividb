@@ -340,8 +340,8 @@ the first script of the run holds the other commands back where it would on its 
 checks, and they stay held back for the scripts after it until 200 µs have passed since they were
 held back and the script then running has finished. They are held back once for the run, not
 once for each script. A script that has to wait (a slot handoff, a `MIGRATE` of its key) lets
-them in while it waits. `INFO stats` counts the runs (`scripts_alone_runs`) and the scripts in
-them (`scripts_in_alone_runs`).
+them in while it waits. `INFO stats` counts the runs (`scripts_alone_runs`) and the scripts' takes of
+the gate in them (`scripts_in_alone_runs`).
 
 Azure `Standard_D8s_v5`, server on CPUs 0-3 (`--threads 4`, io_uring), memtier_benchmark 2.6.1 on
 CPUs 4-7, 4 threads, one call at a time per connection, `--randomize --distinct-client-seed`,

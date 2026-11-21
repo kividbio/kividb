@@ -1633,7 +1633,9 @@ fn sent_back_to_wait(reply: &[u8]) -> bool {
 /// (`pause::wait_out_handoff`), with the command gate open: a run of scripts
 /// that held it closed between them opens it first
 /// (`command_gate::reopen_for_a_wait`). The dispatch again is not held at
-/// the test hook `routed` a second time.
+/// the test hook `routed` a second time. On a thread that must not wait (a
+/// queued script run on a worker thread, `pause::handing_back_waits`), it
+/// does not: it is answered `pause::HELD_IN_GATE`, not run, and handed back.
 #[cold]
 #[inline(never)]
 fn dispatched_again_after_waiting(
@@ -1644,6 +1646,9 @@ fn dispatched_again_after_waiting(
 ) -> Vec<u8> {
     while sent_back_to_wait(&reply) {
         crate::command_gate::reopen_for_a_wait();
+        if crate::pause::hands_back_a_wait() {
+            return crate::pause::HELD_IN_GATE.to_vec();
+        }
         #[cfg(debug_assertions)]
         if crate::cluster::routing::test_stalls_on() {
             log_warn!("(test) {name} waits outside its gates");

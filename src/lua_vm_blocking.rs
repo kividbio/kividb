@@ -162,10 +162,12 @@ fn resp_error(message: &str) -> Vec<u8> {
 
 #[cfg(feature = "lua")]
 impl Job {
-    fn run(self) -> Done {
+    fn run(&self) -> Done {
         let (key, db, aof_enabled, resp) = (self.key, self.db, self.aof_enabled, self.client_resp);
-        let (env, cmd) = (self.env, self.cmd);
-        ran_quick(key, db, move || env.run_execute(cmd, db, aof_enabled, resp))
+        let cmd: Vec<&[u8]> = self.cmd.iter().map(|c| c.as_slice()).collect();
+        ran_quick(key, db, || {
+            self.env.run_execute_borrowed(cmd, db, aof_enabled, resp)
+        })
     }
 }
 
@@ -323,7 +325,14 @@ impl Runner {
     /// the gate is open — `RUN_FOR` has passed since `since`. The first
     /// script to find the gate open closes it, so each close runs a script:
     /// called with the gate open and `since` now, this runs one at least.
-    fn run_queued(&self, since: std::time::Instant) {
+    ///
+    /// On a worker thread (`on_worker`), which serves other connections, no
+    /// queued script may wait out a handoff or a move of its keys: none is
+    /// taken while either is under way (two relaxed loads), and one that is
+    /// sent back to wait all the same (it began as they did) is not run but
+    /// put back at the front of the queue, and the run ends: the runner
+    /// thread, woken as the turn is given up, runs it and waits there.
+    fn run_queued(&self, since: std::time::Instant, on_worker: bool) {
         use std::sync::atomic::Ordering;
         loop {
             if crate::command_gate::reopen_between_scripts(RUN_FOR).is_none()
@@ -331,9 +340,24 @@ impl Runner {
             {
                 break;
             }
+            if on_worker && (crate::pause::handoff() || crate::pause::keys_moving()) {
+                break;
+            }
             let next = self.queue.lock().pop_front();
             let Some((job, reply)) = next else { break };
             self.waiting.fetch_sub(1, Ordering::SeqCst);
+            if on_worker {
+                let (done, handed_back) = crate::pause::handing_back_waits(|| job.run());
+                if handed_back {
+                    // Not run: it waits on the runner thread, first in line.
+                    crate::command_gate::reopen_for_a_wait();
+                    self.queue.lock().push_front((job, reply));
+                    self.waiting.fetch_add(1, Ordering::SeqCst);
+                    break;
+                }
+                let _ = reply.send(done);
+                continue;
+            }
             // The client may have gone; its script has run all the same.
             let _ = reply.send(job.run());
         }
@@ -361,7 +385,7 @@ impl Runner {
             // past its time limit is told `BUSY`, as it would have been.
             let run = crate::command_gate::for_a_run();
             while self.waiting.load(Ordering::SeqCst) > 0 {
-                self.run_queued(std::time::Instant::now());
+                self.run_queued(std::time::Instant::now(), false);
                 crate::command_gate::reopen_between_scripts(std::time::Duration::ZERO);
             }
             drop(run);
@@ -438,7 +462,7 @@ pub(crate) async fn run_lua_vm_blocking(
                     env.run_execute_borrowed(cmd.to_vec(), sel, aof_enabled, client_resp)
                 });
                 if run.is_some() {
-                    runner().run_queued(started);
+                    runner().run_queued(started, true);
                 }
                 // The gate opens, and then the turn is given up.
                 drop(run);

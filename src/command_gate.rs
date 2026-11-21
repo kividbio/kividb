@@ -203,8 +203,8 @@ struct RunClose {
     at: std::time::Instant,
 }
 
-/// Times the gate was closed for a run, and the scripts that ran alone in
-/// it (`INFO stats`: `scripts_alone_runs`, `scripts_in_alone_runs`).
+/// Times the gate was closed for a run, and the takes of it alone under
+/// those (a script sent back to wait and run again takes it twice) (`INFO stats`: `scripts_alone_runs`, `scripts_in_alone_runs`).
 static RUN_CLOSES: AtomicU64 = AtomicU64::new(0);
 static RUN_SCRIPTS: AtomicU64 = AtomicU64::new(0);
 
@@ -787,8 +787,14 @@ mod tests {
                 // A wait opens the gate, and the next script closes it again.
                 reopen_for_a_wait();
                 assert!(!closed_for_a_run());
+                // Not one 5 ms try: a test beside this one may hold the
+                // process's gate alone for a while.
                 let entered = crate::cpus::spawn(|| {
-                    enter_unless(Duration::from_millis(5), || true).is_some()
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    enter_unless(Duration::from_millis(5), || {
+                        std::time::Instant::now() > deadline
+                    })
+                    .is_some()
                 })
                 .join()
                 .unwrap();

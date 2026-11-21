@@ -254,14 +254,17 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   then running has finished (a run is as long as its last script makes
   it), or once no script is left. Every other command waits once for a
   run, not once for each script in it, and each script is still alone: no
-  command runs beside it or between two of them. A script's own checks
-  (its routing, ACL, `BUSY`) come before it holds the others back, as for
-  any script, and a script that has to wait (for a slot handoff, or for a
-  `MIGRATE` of its key) lets them in while it waits. A server with many
-  such scripts beside plain commands (a lock's compare-and-delete, a rate
-  limiter with no hash tag) answers the plain commands about as fast as
-  with no scripts at all. The script-runner thread runs the ones left over
-  when no script is running.
+  command runs beside it or between two of them. The first script of a run
+  makes its own checks (its routing, ACL, `BUSY`) before it holds the
+  others back, as any script does; the scripts after it in the run make
+  theirs with the others held back already, and a script that has to wait
+  (for a slot handoff, or for a `MIGRATE` of its key) lets them in while
+  it waits; a queued script that has to wait so is left to the
+  script-runner thread, not run by a thread that serves other connections.
+  A server with many such scripts beside plain commands (a lock's
+  compare-and-delete, a rate limiter with no hash tag) answers the plain
+  commands about as fast as with no scripts at all. The script-runner
+  thread runs the ones left over when no script is running.
 
 - **A command from a client waits for a script on its tag.** `GET
   {orders}:waiting` sent while a script on `orders` is running is answered
@@ -372,11 +375,11 @@ that a server running its scripts one at a time shows it without
 | `scripts_run_alone_not_quick` | ran alone because it has not (or not yet) been seen to be quick |
 | `scripts_handed_to_runner` | (alone, and quick) came while another script was running, and was run by the thread running that one, or by the script-runner thread |
 | `scripts_offloaded_to_pool` | (not yet seen to be quick, or seen to be slow) was run on a thread of the blocking pool |
-| `scripts_in_alone_runs` | (alone, and quick) ran in a run of such scripts, the other commands held back once for the run |
+| `scripts_in_alone_runs` | (alone, and quick) took the gate in a run of such scripts, the other commands held back once for the run: counted per take, so a script sent back to wait (a slot handoff, a `MIGRATE` of its key) and run again counts twice |
 
 `scripts_alone_runs` counts the runs: the times the other commands were
 held back for one. `scripts_in_alone_runs` over `scripts_alone_runs` is how
-many scripts a run held, on average; a script alone in its run is a run of
+many takes a run held, on average; a script alone in its run is a run of
 one.
 
 A script that runs alone is counted under the first reason in the table

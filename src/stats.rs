@@ -317,7 +317,7 @@ pub mod scripts {
             OFFLOADED_TO_POOL.load(Ordering::Relaxed)
         ));
         // The runs of quick scripts that run alone (`command_gate::for_a_run`):
-        // times the gate was closed for one, and the scripts run under those.
+        // times the gate was closed for one, and the scripts' takes of it under those.
         let (closes, scripts) = crate::command_gate::run_counts();
         out.push_str(&format!(
             "scripts_alone_runs:{closes}\r\nscripts_in_alone_runs:{scripts}\r\n"

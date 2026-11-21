@@ -349,6 +349,41 @@ pub fn is_held(reply: &[u8]) -> bool {
     reply.first() == Some(&0) && reply == HELD_IN_GATE
 }
 
+thread_local! {
+    /// What a command run on this thread does when it is sent back from its
+    /// gates to wait out a handoff or a move of its keys: 0, it waits here
+    /// (`handler::dispatched_again_after_waiting`); 1, it is handed back
+    /// instead, not run, for a thread that may wait to run it again (a
+    /// queued script run on a worker thread: `lua_vm_blocking`); 2, one
+    /// was.
+    static HAND_BACK: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `run` with every wait out of the gates handed back instead of waited
+/// out on this thread ([`hands_back_a_wait`]); and whether one was.
+#[cfg_attr(not(feature = "lua"), allow(dead_code))]
+pub fn handing_back_waits<T>(run: impl FnOnce() -> T) -> (T, bool) {
+    let before = HAND_BACK.with(|h| h.replace(1));
+    let out = run();
+    let handed = HAND_BACK.with(|h| h.replace(before)) == 2;
+    (out, handed)
+}
+
+/// For a command sent back from its gates to wait: whether it is to be
+/// handed back instead of waiting on this thread ([`handing_back_waits`]).
+/// Its reply is then [`HELD_IN_GATE`], which `execute_command` takes as a
+/// command that has not run.
+#[cold]
+pub fn hands_back_a_wait() -> bool {
+    HAND_BACK.with(|h| {
+        if h.get() == 0 {
+            return false;
+        }
+        h.set(2);
+        true
+    })
+}
+
 /// Whether a write that has just entered the write gate, `cmd` (an `EXEC`
 /// of `queued`), got past a `CLIENT PAUSE` before it was set, and is to step
 /// out of the gate again and be held (see [`pause_clients`]). Asked when
