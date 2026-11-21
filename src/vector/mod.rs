@@ -3649,9 +3649,9 @@ fn insert_unit(
 /// point as the insert found it) said. One such insert at a time: the node
 /// becomes the entry point, with no links, if the entry point is still
 /// `seen`; if a racing insert got there first, this insert starts again and
-/// links to it. Unserialized, inserts racing into an empty graph each became
-/// the entry point in turn, and all but the last were left with no links,
-/// which no later insert would find to link to.
+/// links to it. The turn is what lets a second insert see the first as the
+/// entry point: every node but the first then has links, and is found by
+/// the inserts and searches that come after.
 ///
 /// The graph's read lock is let go before the turn is waited for: the
 /// insert holding the turn may need the write lock (a slot used again).

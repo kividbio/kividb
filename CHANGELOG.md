@@ -1838,11 +1838,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **Vectors written at once into an empty HNSW index all link into its
-  graph.** Inserts that found the graph empty each made their node the
-  entry point, with no links; all but the last were then in no list, and no
-  search found them. They now take turns: the first is the entry point and
-  the others link to it. A vector set's first vectors, linked by several
-  threads at once, met it most often (#710).
+  graph.** Inserts that find the graph empty take turns: the first is the
+  entry point and the others link to it, whether they come from a vector
+  set's linking threads or from several connections writing an index's
+  first documents (#710).
 
 - **Memory a heavy write load leaves in the allocator goes back to the
   system once the server is idle, even when nothing was deleted (#245).**
