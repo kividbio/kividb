@@ -428,7 +428,10 @@ pub fn alone_on_this_thread() -> bool {
 ///   keyspace, in batches of their own (`migration::delete_before_coming`).
 ///   A transaction or script queued behind them would hold every other
 ///   command back for that long. `SETSLOT ... NODE` to another node takes
-///   the gate in its handler, which knows which node it names.
+///   the gate in its handler, which knows which node it names. And the
+///   `CLUSTER SYNCSLOTS TAKEOVER` of an atomic slot migration, which waits
+///   for the AOF and this node's replicas before it takes the slots
+///   (`migration::take_over`), and touches no data.
 #[inline(always)]
 pub fn skips(name: &str, cmd: &[&[u8]]) -> bool {
     let sub = |word: &[u8]| cmd.get(1).is_some_and(|s| s.eq_ignore_ascii_case(word));
@@ -439,6 +442,7 @@ pub fn skips(name: &str, cmd: &[&[u8]]) -> bool {
             sub(b"ADDSLOTS")
                 || sub(b"ADDSLOTSRANGE")
                 || (sub(b"SETSLOT") && (arg(3, b"IMPORTING") || arg(3, b"NODE")))
+                || (sub(b"SYNCSLOTS") && arg(2, b"TAKEOVER"))
         }
         "SCRIPT" => sub(b"KILL"),
         "FUNCTION" => sub(b"KILL") || sub(b"STATS"),

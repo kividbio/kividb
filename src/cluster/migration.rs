@@ -3420,8 +3420,18 @@ pub fn accept_apply(cluster: &ClusterState, task_id: &str, client_id: u64) -> Re
 }
 
 /// `CLUSTER SYNCSLOTS TAKEOVER`, on the destination, from client
-/// `client_id`: everything has arrived; take ownership of the slots.
-pub fn take_over(cluster: &ClusterState, task_id: &str, client_id: u64) -> Result<(), String> {
+/// `client_id`: everything has arrived; take ownership of the slots. It
+/// waits (for the AOF, for this node's replicas, for the saves) for at most
+/// half of `pause_ms`, the handoff's write pause: on a thread that may
+/// block, holding no gate or lock. On an io_uring worker the command is run
+/// on a thread of its own (`deferred::run_elsewhere`), and on Tokio off the
+/// runtime, so that only the connection that sent it waits.
+pub fn take_over(
+    cluster: &ClusterState,
+    task_id: &str,
+    client_id: u64,
+    pause_ms: u64,
+) -> Result<(), String> {
     if let Some(delay) = test_failpoint(&TEST_TAKEOVER_DELAY) {
         log_warn!("Cluster: (test) TAKEOVER waits {delay:?} before it takes the slots");
         test_sleep(delay);
@@ -3432,7 +3442,8 @@ pub fn take_over(cluster: &ClusterState, task_id: &str, client_id: u64) -> Resul
     if lost.is_some() {
         super::bus::heartbeat::set_test_bus_muted(true);
     }
-    let result = take_over_now(cluster, task_id, client_id);
+    let deadline = Instant::now() + Duration::from_millis((pause_ms / 2).max(100));
+    let result = off_the_runtime(|| take_over_now(cluster, task_id, client_id, deadline));
     if let Some(delay) = lost {
         log_warn!("Cluster: (test) the TAKEOVER's reply and claim are held back {delay:?}");
         test_sleep(delay);
@@ -3445,13 +3456,19 @@ pub fn take_over(cluster: &ClusterState, task_id: &str, client_id: u64) -> Resul
     result
 }
 
-fn take_over_now(cluster: &ClusterState, task_id: &str, client_id: u64) -> Result<(), String> {
+/// [`take_over`], waiting until `deadline` at most.
+fn take_over_now(
+    cluster: &ClusterState,
+    task_id: &str,
+    client_id: u64,
+    deadline: Instant,
+) -> Result<(), String> {
     // Refused if the source has given this attempt up meanwhile: it has
     // been told that the slots stay with it, and takes writes again.
     let task = cluster.slot_migrations.begin_takeover(task_id, client_id)?;
     // Only from the master of the slots, as this node sees it (#516). From
     // here a vote for a replica of the source is refused (`fence_imports`).
-    if let Err(why) = source_still_owns(cluster, &task) {
+    let not_from_the_source = |why: String| {
         task.attempt_failed.store(true, Ordering::SeqCst);
         cluster.slot_migrations.takeover_undone(task_id);
         cluster
@@ -3462,15 +3479,69 @@ fn take_over_now(cluster: &ClusterState, task_id: &str, client_id: u64) -> Resul
             ranges_text(&task.ranges),
             super::node_id_str(&task.source)
         );
-        return Err(why);
+        Err(why)
+    };
+    if let Err(why) = source_still_owns(cluster, &task) {
+        return not_from_the_source(why);
     }
     // The source keeps client writes paused until it knows how this ends.
     let started = Instant::now();
+    // Not taken over in time: the slots stay with the source, which keeps
+    // serving them, and tries the handoff again (`run_import`).
+    let not_yet = |why: &str| {
+        cluster.slot_migrations.takeover_undone(task_id);
+        cluster
+            .slot_migrations
+            .update(task_id, |t| t.last_error = why.to_string());
+        log_warn!(
+            "Cluster: Not taking slots {} over from {} yet: {why}; they stay with it",
+            ranges_text(&task.ranges),
+            super::node_id_str(&task.source)
+        );
+        Err(why.to_string())
+    };
     // What arrived is in the AOF as a write acknowledged here would be (in
     // the file, and synced under `appendfsync always`) before the source is
     // told: it deletes its copy then, and nothing waits for these records
     // otherwise.
-    off_the_runtime(crate::aof::written_blocking);
+    if !crate::aof::written_blocking(deadline) {
+        return not_yet("what arrived is not in the AOF in time");
+    }
+    // And on this node's replicas: every one attached has acknowledged what
+    // arrived, and as many as the cluster knows of that are not failed.
+    // Its claim of the slots reaches them after that, in the stream
+    // (`TAKEN`, see `take_over_slots`), ahead of every write to the slots,
+    // and every replica that can be elected in this node's place holds the
+    // slots' keys from here on, whether or not the claim has reached it: one
+    // told the claim later (by a heartbeat, or by the voters, which answer a
+    // request that leaves out slots its master claims with the master's
+    // claims) has the keys of those slots.
+    if let Some(hooks) = cluster.hooks.get() {
+        let me = cluster.myself();
+        let known = cluster
+            .nodes
+            .read()
+            .values()
+            .filter(|n| {
+                n.master_id == Some(me)
+                    && n.flags.contains(super::NodeFlags::REPLICA)
+                    && !n.flags.contains(super::NodeFlags::FAIL)
+            })
+            .count();
+        if !hooks
+            .replica_starter
+            .repl_state
+            .replicas_have_all_blocking(known, deadline)
+        {
+            return not_yet(&format!(
+                "this node's replicas ({known} known) have not acknowledged what arrived in time"
+            ));
+        }
+    }
+    // The source may have changed meanwhile.
+    if let Err(why) = source_still_owns(cluster, &task) {
+        return not_from_the_source(why);
+    }
     // Saved before the source is told: it deletes its copy when told, and a
     // restart of this node with the slots not in its config would delete
     // this one (#108). Not saved, not taken over: the slots stay with the
@@ -3482,7 +3553,7 @@ fn take_over_now(cluster: &ClusterState, task_id: &str, client_id: u64) -> Resul
     // sync follows on another thread.
     let take = || cluster.take_over_slots(slots_of(&task.ranges));
     let taken = if crate::aof::syncs_before_acks() {
-        off_the_runtime(take)
+        take()
     } else {
         super::persist::with_deferred_sync(take)
     };

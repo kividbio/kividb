@@ -1890,6 +1890,11 @@ impl ClusterState {
         self.current_epoch.fetch_max(highest, Ordering::SeqCst);
         let epoch = self.current_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         node.config_epoch = epoch;
+        let master = node.flags.contains(NodeFlags::MASTER);
+        drop(nodes);
+        if master {
+            self.send_claims_to_replicas(&[], epoch);
+        }
         (true, epoch)
     }
 
@@ -2110,11 +2115,20 @@ impl ClusterState {
             return Err("This instance has cluster support disabled".into());
         }
         let me = self.myself();
+        let my_epoch = self
+            .nodes
+            .read()
+            .get(&me)
+            .map(|n| n.config_epoch)
+            .unwrap_or(0);
         // `slots` before `migrations`, as everywhere (see `ClusterState`).
         let mut slots = self.slots.write();
         if let Some(e) = Self::unclaimable(&slots[..], list) {
             return Err(e);
         }
+        // This node's replicas are told first, in the stream, ahead of any
+        // write to the slots (see `take_over_slots`).
+        self.send_claims_with_table(&slots[..], list, my_epoch);
         let mut migrations = self.migrations.write();
         for &slot in list {
             slots[slot as usize] = Some(me);
@@ -2911,7 +2925,8 @@ impl ClusterState {
     /// * the candidate's `claims`, if the request says, leave out none of the
     ///   slots its master claims in its own heartbeat to this node and owns
     ///   here ([`Self::left_out_of_claims`]): a replica that has not heard
-    ///   its master take slots over (an import whose claim it missed) holds
+    ///   its master take slots over (an import whose claim it has not
+    ///   heard) holds
     ///   them as their old owner's, and counts that owner among the masters
     ///   that own slots even if it has no slot left, and no vote. The
     ///   refusal is answered with an `UPDATE` carrying the master's own
@@ -3431,6 +3446,9 @@ impl ClusterState {
         // is won and the cluster has agreed to it: the promotion holds,
         // whether or not it can be saved now.
         self.refresh_state();
+        // Its replicas to come are told its claim as they attach, ahead of
+        // what they are sent (see `take_over_slots`).
+        self.tell_replicas_my_claims();
         claimed
     }
 
@@ -3822,6 +3840,8 @@ impl ClusterState {
         }
         *self.took_over_from.lock() = Some(old_master);
         self.refresh_state();
+        // As after `promote_self`: its replicas to come are told its claim.
+        self.tell_replicas_my_claims();
         Ok(claimed)
     }
 
@@ -4034,12 +4054,21 @@ impl ClusterState {
         // so peers accept the claim.
         if new_owner == self.myself() {
             let new_epoch = self.bump_epoch();
-            let mut nodes = self.nodes.write();
-            if let Some(me) = nodes.get_mut(&self.myself())
-                && new_epoch > me.config_epoch
-            {
-                me.config_epoch = new_epoch;
-            }
+            let epoch = {
+                let mut nodes = self.nodes.write();
+                match nodes.get_mut(&self.myself()) {
+                    Some(me) => {
+                        if new_epoch > me.config_epoch {
+                            me.config_epoch = new_epoch;
+                        }
+                        me.config_epoch
+                    }
+                    None => new_epoch,
+                }
+            };
+            // This node's replicas are told first, in the stream, ahead of
+            // any write to the slot (see `take_over_slots`).
+            self.send_claims_to_replicas(&[slot], epoch);
         }
         {
             let mut owners = self.slots.write();
@@ -4059,12 +4088,9 @@ impl ClusterState {
     ///
     /// Saved in the cluster config before anything else sees it: a client
     /// is not served the slots, nor do they go out in this node's claims,
-    /// until the config says they are this node's. They used to be taken
-    /// first and saved after; when the save failed, the destination of a
-    /// migration gave them back, having served writes to them meanwhile,
-    /// lost when it gave them back, and its claim could have reached the
-    /// source in that time, which then dropped its keys of them, and owned
-    /// them in nobody's view (#337). Not saved, nothing changes.
+    /// until the config says they are this node's (#337). Not saved,
+    /// nothing changes: no write has been served to them here, and no claim
+    /// of them has gone out.
     pub fn take_over_slots(&self, slots: impl Iterator<Item = u16>) -> std::io::Result<()> {
         let t = std::time::Instant::now();
         let mut steps: Vec<(&str, u128)> = Vec::new();
@@ -4110,22 +4136,38 @@ impl ClusterState {
     /// claim. Only to replicas that take the markers; the others hear it
     /// from the heartbeats.
     fn send_claims_to_replicas(&self, taking: &[u16], epoch: u64) {
+        let owners = self.slots.read();
+        self.send_claims_with_table(&owners[..], taking, epoch);
+    }
+
+    /// [`Self::send_claims_to_replicas`], with the slot table `owners` held
+    /// by the caller.
+    fn send_claims_with_table(&self, owners: &[Option<NodeId>], taking: &[u16], epoch: u64) {
         let Some(hooks) = self.hooks.get() else {
             return;
         };
         let me = self.myself();
-        let mine: Vec<u16> = {
-            let mut taken = vec![false; CLUSTER_SLOTS];
-            for &slot in taking {
-                taken[slot as usize] = true;
-            }
-            let owners = self.slots.read();
-            (0..CLUSTER_SLOTS as u16)
-                .filter(|&slot| owners[slot as usize] == Some(me) || taken[slot as usize])
-                .collect()
-        };
+        let mut taken = vec![false; CLUSTER_SLOTS];
+        for &slot in taking {
+            taken[slot as usize] = true;
+        }
+        let mine: Vec<u16> = (0..CLUSTER_SLOTS as u16)
+            .filter(|&slot| owners[slot as usize] == Some(me) || taken[slot as usize])
+            .collect();
         let marker = followed_imports::encode_taken(epoch, &migration::slot_runs(mine));
         hooks.replica_starter.repl_state.send_slot_claims(marker);
+    }
+
+    /// [`Self::send_claims_to_replicas`] of this node's slots as they are, at
+    /// its config epoch: after a promotion, or a new config epoch.
+    pub(crate) fn tell_replicas_my_claims(&self) {
+        let epoch = self
+            .nodes
+            .read()
+            .get(&self.myself())
+            .map(|n| n.config_epoch)
+            .unwrap_or(0);
+        self.send_claims_to_replicas(&[], epoch);
     }
 
     /// A claim of this node's master (`master`): `ranges` at config epoch

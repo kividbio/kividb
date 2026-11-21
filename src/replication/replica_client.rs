@@ -889,13 +889,20 @@ async fn run_replication_session(
     // What this node knew of its master's slot imports holds for this
     // session only if the master tells of them, and the dataset is not
     // replaced (#741).
+    let marked = !crate::replication::hides_slot_imports_capability()
+        && crate::replication::psync_reply_has_slot_imports(&fullresync);
     if cmd0 == "FULLRESYNC" || cmd0 == "CONTINUE" {
         repl_state.slot_imports_event(crate::replication::SlotImportsEvent::Session {
-            marked: !crate::replication::hides_slot_imports_capability()
-                && crate::replication::psync_reply_has_slot_imports(&fullresync),
+            marked,
             full: cmd0 == "FULLRESYNC",
         });
     }
+    // A dataset sent in full by a master that sends the markers is followed
+    // by them: its claim of the slots it took over (if it has one), then
+    // its imports. Nothing is acknowledged until the imports marker has
+    // been read: an acknowledgement of the dataset's writes then comes from
+    // a replica that holds the claim too.
+    let mut ack_held = marked && cmd0 == "FULLRESYNC";
 
     // The stream as it will be read below: what has arrived and is not yet
     // applied, how many bytes have arrived in all, and which database the
@@ -1378,8 +1385,12 @@ async fn run_replication_session(
     }
 
     let ack_interval = Duration::from_secs(1);
-    send_ack(&mut writer, applied, timeout).await?;
+    if !ack_held {
+        send_ack(&mut writer, applied, timeout).await?;
+    }
     let mut last_ack = Instant::now();
+    // An acknowledgement owed since the markers were read.
+    let mut ack_owed = false;
 
     // The link is up from here: synced, and about to stream. Listed among
     // the clients as the master (`flags=M`), as Redis lists it.
@@ -1424,6 +1435,13 @@ async fn run_replication_session(
                  dropping connection"
             );
             return Ok(SessionEnd::Superseded);
+        }
+        // Tests: the stream is not read, applied or acknowledged while the
+        // file `KIVIDB_TEST_STREAM_STALL` names exists.
+        if let Some(path) = test_stream_stall() {
+            while path.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         }
 
         // Whether this turn found the socket drained: the read came back with
@@ -1657,6 +1675,9 @@ async fn run_replication_session(
                     repl_buf.drain(head..head + consumed);
                     offset -= consumed as u64;
                     transaction_scanned = 0;
+                    if std::mem::take(&mut ack_held) {
+                        ack_owed = true;
+                    }
                     continue;
                 }
                 if parse_pos == 0 {
@@ -1714,11 +1735,25 @@ async fn run_replication_session(
         // REPLCONF ACK — heartbeat ~1 Hz when idle; **immediate** after applying commands so the
         // master can unblock WAIT without waiting for more replication traffic (otherwise we sit in
         // `read()` forever after the last propagating write and never hit the timer).
-        if applied_commands || last_ack.elapsed() >= ack_interval {
+        if !ack_held
+            && (applied_commands
+                || std::mem::take(&mut ack_owed)
+                || last_ack.elapsed() >= ack_interval)
+        {
             send_ack(&mut writer, applied, repl_state.repl_timeout()).await?;
             last_ack = Instant::now();
         }
     }
+}
+
+/// `KIVIDB_TEST_STREAM_STALL`, never set otherwise: a file, relative to the
+/// working directory, while which exists this replica reads, applies and
+/// acknowledges nothing of its master's stream, as a replica that falls
+/// behind does.
+fn test_stream_stall() -> Option<&'static std::path::Path> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::env::var_os("KIVIDB_TEST_STREAM_STALL").map(Into::into))
+        .as_deref()
 }
 
 /// Publish `applied` as this node's replication offset, unless the session

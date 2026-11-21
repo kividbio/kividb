@@ -686,6 +686,60 @@ impl ReplState {
         }
     }
 
+    /// On a thread that may block (off the runtime, holding no gate or
+    /// lock): wait until every replica attached has acknowledged everything
+    /// this master has written before now, and at least `known` replicas
+    /// attached and online have, or until `deadline`. Whether they have.
+    ///
+    /// A hub barrier first, as `WAIT` takes one: every write handed to the
+    /// hub before now has been fanned out, and each replica's target is
+    /// what it has been sent. A replica that attaches meanwhile counts once
+    /// it has acknowledged what it had been sent when first seen (its full
+    /// sync or its backlog covers the rest); one that goes is not waited
+    /// for, and no longer counts towards `known`.
+    pub fn replicas_have_all_blocking(&self, known: usize, deadline: std::time::Instant) -> bool {
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(1));
+        if !self.replica_progress.lock().is_empty()
+            && let Some(hub) = self.hub.get().and_then(|w| w.upgrade())
+        {
+            let (barrier_tx, mut barrier_rx) = tokio::sync::oneshot::channel();
+            if hub.send(HubMsg::Barrier(barrier_tx)).is_ok() {
+                while let Err(tokio::sync::oneshot::error::TryRecvError::Empty) =
+                    barrier_rx.try_recv()
+                {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    pause();
+                }
+            }
+        }
+        let mut targets: std::collections::HashMap<u64, (Arc<ReplicaProgress>, u64)> =
+            std::collections::HashMap::new();
+        loop {
+            {
+                let live = self.replica_progress.lock();
+                targets.retain(|id, _| live.contains_key(id));
+                for (id, p) in live.iter() {
+                    targets
+                        .entry(*id)
+                        .or_insert_with(|| (Arc::clone(p), p.sent.load(Ordering::Relaxed)));
+                }
+            }
+            let done = targets
+                .values()
+                .filter(|(p, target)| p.state() == ReplicaState::Online && p.delivered() >= *target)
+                .count();
+            if done == targets.len() && done >= known {
+                return true;
+            }
+            if self.is_slave() || std::time::Instant::now() >= deadline {
+                return false;
+            }
+            pause();
+        }
+    }
+
     /// The node whose stream this replica's dataset is from, if known.
     pub fn stream_origin(&self) -> Option<String> {
         self.stream_origin.read().clone()
@@ -3543,8 +3597,10 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
         // What a replica that takes them is told of this master's slot
         // imports as it attaches (#741): the last `SYNC` form.
         let mut slot_imports_sync: Option<ReplPayload> = None;
-        // And of the slots this master took over: the last `TAKEN` marker.
-        let mut slot_claims_sync: Option<ReplPayload> = None;
+        // And of the slots this master took over: the last `TAKEN` marker,
+        // with the stream's offset where it was sent (it belongs after the
+        // writes before it, and before those after it).
+        let mut slot_claims_sync: Option<(ReplPayload, u64)> = None;
         // Queues of replicas let go of for falling too far behind, until
         // their forwarders have let go of what is in them (see
         // `ReplicaQueue::abandon`): memory still held for a replica.
@@ -3808,18 +3864,41 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         // those that ended meanwhile goes, and those begun
                         // meanwhile it did not see begin.
                         let told = !registration.slot_imports
-                            || (queue_marker(
+                            || queue_marker(
                                 &registration.tx,
                                 &registration.pending_bytes,
                                 slot_imports_sync.get_or_insert_with(no_slot_imports),
-                            ) && slot_claims_sync.as_ref().is_none_or(|claims| {
-                                queue_marker(&registration.tx, &registration.pending_bytes, claims)
-                            }));
+                            );
+                        let send = |bytes: &[u8]| {
+                            bytes.is_empty() || {
+                                registration.pending_bytes.add(bytes.len());
+                                registration.tx.send(Arc::from(bytes)).is_ok()
+                            }
+                        };
+                        // The claim of slots this master took over, in its
+                        // place in what the replica missed: after the
+                        // writes that came before it, before those after
+                        // it. A replica that acknowledges a write after it
+                        // has it, and none acknowledges one before it has
+                        // what came before.
                         let delivered = told
-                            && (missed.is_empty() || {
-                                registration.pending_bytes.add(missed.len());
-                                registration.tx.send(Arc::from(missed)).is_ok()
-                            });
+                            && match slot_claims_sync
+                                .as_ref()
+                                .filter(|_| registration.slot_imports)
+                            {
+                                Some((claims, at)) => {
+                                    let cut =
+                                        (at.saturating_sub(offset) as usize).min(missed.len());
+                                    send(&missed[..cut])
+                                        && queue_marker(
+                                            &registration.tx,
+                                            &registration.pending_bytes,
+                                            claims,
+                                        )
+                                        && send(&missed[cut..])
+                                }
+                                None => send(&missed),
+                            };
                         if !delivered {
                             forget_replica(&state, registration.replica_id);
                             continue;
@@ -3965,6 +4044,11 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         *state.repl_id2.write() = None;
                     }
                     backlog.align(base);
+                    // The dataset sent is at `base`: a claim kept from
+                    // before is in it.
+                    if let Some((_, at)) = slot_claims_sync.as_mut() {
+                        *at = (*at).min(base);
+                    }
                     state.backlog_active.store(true, Ordering::Relaxed);
                     // Already done at the cut by `begin_full_sync`; a no-op
                     // then. Done here for registrations that did not come
@@ -3973,14 +4057,19 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     let _ = progress.queue.set(Arc::clone(&pending_bytes));
                     // The imports under way as the dataset it is sent has
                     // them, ahead of the writes that follow it (#741).
+                    // The claim of slots this master took over first, then
+                    // the imports: a replica sent the markers acknowledges
+                    // nothing of its dataset before it has read the imports
+                    // marker (`replica_client`), so it has the claim too.
                     if slot_imports
-                        && !(queue_marker(
-                            &tx,
-                            &pending_bytes,
-                            slot_imports_sync.get_or_insert_with(no_slot_imports),
-                        ) && slot_claims_sync
+                        && !(slot_claims_sync
                             .as_ref()
-                            .is_none_or(|claims| queue_marker(&tx, &pending_bytes, claims)))
+                            .is_none_or(|(claims, _)| queue_marker(&tx, &pending_bytes, claims))
+                            && queue_marker(
+                                &tx,
+                                &pending_bytes,
+                                slot_imports_sync.get_or_insert_with(no_slot_imports),
+                            ))
                     {
                         forget_replica(&state, replica_id);
                         continue;
@@ -4025,7 +4114,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         forget_replica(&state, replica.id);
                         false
                     });
-                    slot_claims_sync = Some(marker);
+                    slot_claims_sync = Some((marker, backlog.end));
                 }
 
                 HubMsg::Propagate(payload) => {

@@ -329,6 +329,21 @@ fn take_in_masters_claim(cluster: &ClusterState, epoch: u64, ranges: &[(u16, u16
     if ranges.is_empty() {
         return;
     }
+    // The claim of the master whose stream this is: taken in only while it
+    // is the master this node follows.
+    let origin = cluster
+        .hooks
+        .get()
+        .and_then(|hooks| hooks.replica_starter.repl_state.stream_origin());
+    if !origin.as_deref().is_some_and(|o| o == node_id_str(&master)) {
+        log_info!(
+            "Cluster: a claim of slots in the replication stream, of {}, is not taken in: \
+             this node follows {} now",
+            origin.as_deref().unwrap_or("an unknown master"),
+            node_id_str(&master)
+        );
+        return;
+    }
     cluster.take_in_claims_of_master(master, epoch, ranges);
 }
 

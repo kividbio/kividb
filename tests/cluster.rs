@@ -9089,6 +9089,166 @@ fn a_replica_elected_after_its_master_took_slots_unannounced_has_them_with_their
     );
 }
 
+/// A destination whose replica is behind in the stream
+/// (`KIVIDB_TEST_STREAM_STALL`: it reads, applies and acknowledges nothing)
+/// does not take the slots over until the replica has acknowledged what the
+/// import brought: the handoff is refused in the meantime, and the source
+/// keeps the slots and tries again. Once the replica runs, the slots are
+/// taken over; the destination is killed, its replica elected with them,
+/// and every imported key is on it, and on the destination once it comes
+/// back and follows it.
+#[test]
+fn a_destination_takes_slots_over_once_its_replicas_have_what_arrived() {
+    let (mut nodes, _) = form_cluster(3);
+    let replica = add_replica_with_env(
+        &nodes,
+        &nodes[1],
+        &[("KIVIDB_TEST_STREAM_STALL", "stream-stall")],
+    );
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, all.len());
+    }
+    for node in [&nodes[0], &nodes[1]] {
+        let r = node.conn().cmd(&[
+            "CONFIG",
+            "SET",
+            "cluster-slot-migration-write-pause-timeout",
+            "4000",
+        ]);
+        assert!(r.is_ok(), "{r:?}");
+    }
+    assert!(
+        replica
+            .conn()
+            .cmd(&["CONFIG", "SET", "cluster-replica-validity-factor", "0"])
+            .is_ok()
+    );
+    let before = Written::on(&nodes[0], 0..=100, "before", 200);
+    let stall = replica.dir.join("stream-stall");
+    std::fs::write(&stall, "").unwrap();
+    let task_id = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "100"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_until(
+        "the destination to refuse to take the slots over while its replica is behind",
+        Duration::from_secs(30),
+        || {
+            nodes[1]
+                .log()
+                .contains("have not acknowledged what arrived in time")
+        },
+    );
+    let state = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id]);
+    assert!(
+        state
+            .array()
+            .first()
+            .is_some_and(|task| task_field(task, "state").text() != "completed"),
+        "{state:?}"
+    );
+    let src_id = nodes[0].id();
+    assert_eq!(owner_in_view_of(&nodes[0], 50), Some(src_id.clone()));
+    assert!(before.missing_on(&nodes[0]).is_empty());
+
+    std::fs::remove_file(&stall).unwrap();
+    wait_import_completed(&nodes[1], &task_id);
+    let dst_id = nodes[1].id();
+    wait_until(
+        "every node to hold the destination as the owner",
+        Duration::from_secs(20),
+        || {
+            [&nodes[0], &nodes[1], &nodes[2], &replica]
+                .iter()
+                .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str()))
+        },
+    );
+    nodes[1].kill();
+    let replica_id = replica.id();
+    let live = [&nodes[0], &nodes[2], &replica];
+    wait_until(
+        "the destination's replica to be elected with the slots",
+        Duration::from_secs(40),
+        || {
+            replica.is_master()
+                && live.iter().all(|n| {
+                    owner_in_view_of(n, 50).as_deref() == Some(replica_id.as_str())
+                        && n.cluster_info("cluster_state") == "ok"
+                })
+        },
+    );
+    let absent = before.missing_on(&replica);
+    assert!(
+        absent.is_empty(),
+        "{} imported keys not on the owner",
+        absent.len()
+    );
+    nodes[1].spawn();
+    wait_until(
+        "the destination to follow its replica",
+        Duration::from_secs(40),
+        || !nodes[1].is_master() && nodes[1].my_row()[3] == replica_id,
+    );
+    let absent = before.missing_on(&replica);
+    assert!(
+        absent.is_empty(),
+        "{} imported keys not on the owner",
+        absent.len()
+    );
+}
+
+/// A slot moved key by key (`SETSLOT IMPORTING` / `MIGRATING`, `MIGRATE`,
+/// `SETSLOT NODE`): the new owner tells its replicas in the replication
+/// stream that it owns the slot, ahead of any write to it. The replica here
+/// takes in none of its master's heartbeat claims (`KIVIDB_TEST_IGNORE_CLAIMS`),
+/// and holds the slot as its master's all the same.
+#[test]
+fn a_slot_set_to_this_node_is_claimed_to_its_replicas_in_the_stream() {
+    let (nodes, ranges) = form_cluster(3);
+    let replica = add_replica_with_env(&nodes, &nodes[1], &[IGNORE_CLAIMS]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, all.len());
+    }
+    let (src_id, dst_id) = (nodes[0].id(), nodes[1].id());
+    std::fs::write(replica.dir.join(IGNORE_CLAIMS.1), &dst_id).unwrap();
+    let slot = ranges[0].0 + 7;
+    let key = key_in(slot..=slot, "moved");
+    let slot = slot.to_string();
+    let mut s = nodes[0].conn();
+    assert!(s.cmd(&["SET", &key, "v"]).is_ok());
+    assert!(
+        nodes[1]
+            .conn()
+            .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src_id])
+            .is_ok()
+    );
+    assert!(
+        s.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst_id])
+            .is_ok()
+    );
+    let port = nodes[1].port.to_string();
+    let reply = s.cmd(&["MIGRATE", "127.0.0.1", &port, "", "0", "5000", "KEYS", &key]);
+    assert!(reply.is_ok(), "MIGRATE: {reply:?}");
+    for node in [&nodes[1], &nodes[0]] {
+        assert!(
+            node.conn()
+                .cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &dst_id])
+                .is_ok()
+        );
+    }
+    let slot: u16 = slot.parse().unwrap();
+    wait_until(
+        "the replica to hold the slot as its master's",
+        Duration::from_secs(10),
+        || owner_in_view_of(&replica, slot).as_deref() == Some(dst_id.as_str()),
+    );
+}
+
 /// A master that handed its last slots over owns none and does not vote. A
 /// replica of the destination that has not heard the destination take them
 /// still has that master as their owner: it hears none of the destination's
@@ -11734,9 +11894,8 @@ fn droporphans_leaves_the_keys_of_a_handover_still_being_deleted() {
 /// it has taken them; the source learns of the takeover by asking it, and
 /// deletes its copy). The replica, promoted, holds the only copy of those
 /// slots' keys, and in its slot table they are still the source's, which
-/// is up. `CLUSTER DROPORPHANS` used to take that table's word for it and
-/// delete them. It asks the owner now, which says the slots are not its,
-/// and nothing is deleted. The replica takes no slot-imports markers
+/// is up. `CLUSTER DROPORPHANS` asks the owner its table names, which says
+/// the slots are not its, and nothing is deleted. The replica takes no slot-imports markers
 /// (`KIVIDB_TEST_NO_SLOT_IMPORTS_CAPABILITY`, as a replica of 1.2): one
 /// that does is told the claim in the replication stream, and is promoted
 /// with the slots.

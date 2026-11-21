@@ -1892,7 +1892,27 @@ fn cmd_syncslots(ctx: &mut Ctx) -> Vec<u8> {
             ctx.cluster.slot_migrations.cancel(Some(&task_id));
             resp_simple("OK")
         }
-        "TAKEOVER" => done(migration::take_over(ctx.cluster, &task_id, ctx.client_id)),
+        "TAKEOVER" => {
+            // It waits (see `migration::take_over`): on an io_uring worker,
+            // run on a thread of its own, while the worker serves its other
+            // connections.
+            if !crate::deferred::running_elsewhere()
+                && crate::deferred::run_elsewhere(
+                    &mut ctx.blocking,
+                    &ctx.cmd,
+                    crate::commands::helpers::LONG_WORK,
+                )
+            {
+                return crate::pause::HELD_IN_GATE.to_vec();
+            }
+            let pause_ms = migration::write_pause_timeout_ms(ctx.config);
+            done(migration::take_over(
+                ctx.cluster,
+                &task_id,
+                ctx.client_id,
+                pause_ms,
+            ))
+        }
         "FAIL" => {
             let reason = ctx
                 .cmd
