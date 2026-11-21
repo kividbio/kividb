@@ -82,7 +82,23 @@ impl Conn {
         }
     }
 
+    /// One command. A server that answers `LOADING` (its dataset or indexes
+    /// are still being loaded after a start or restart) did not run it, so it
+    /// is asked again, for at most 10 seconds.
     fn cmd<A: AsRef<str>>(&mut self, args: &[A]) -> V {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reply = self.cmd_once(args);
+            match &reply {
+                V::Err(e) if e.starts_with("LOADING") && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => return reply,
+            }
+        }
+    }
+
+    fn cmd_once<A: AsRef<str>>(&mut self, args: &[A]) -> V {
         let mut buf = format!("*{}\r\n", args.len()).into_bytes();
         for a in args {
             let a = a.as_ref();
@@ -94,7 +110,21 @@ impl Conn {
         self.read()
     }
 
+    /// `cmd` for arguments that are not text.
     fn cmd_bytes(&mut self, args: &[&[u8]]) -> V {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reply = self.cmd_bytes_once(args);
+            match &reply {
+                V::Err(e) if e.starts_with("LOADING") && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => return reply,
+            }
+        }
+    }
+
+    fn cmd_bytes_once(&mut self, args: &[&[u8]]) -> V {
         self.writer.write_all(&encode(args)).unwrap();
         self.read()
     }
