@@ -114,6 +114,11 @@ does not hold an import's keys does not take those slots: `CLUSTER INFO` on a
 replica lists the slots of its master it does not hold yet
 (`cluster_slots_not_held`, `cluster_slots_not_held_ranges`).
 
+The source takes no new config epoch while it hands slots over and for three
+heartbeats after: `CLUSTER BUMPEPOCH` on it answers
+`ERR BUMPEPOCH refused for now: …` then (`redis-cli --cluster fix` run right
+after a migration may need to be run again a few seconds later).
+
 ## JSON
 
 The path engine was replaced. Before, a path could be made of names, indexes,
