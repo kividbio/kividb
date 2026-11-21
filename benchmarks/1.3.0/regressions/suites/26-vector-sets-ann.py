@@ -35,10 +35,9 @@ it is named on every VADD. VINFO is kept in `raw` for each server.
 Matched recall, not matched parameters: each server's EF is the first of
 10, 20, 40, ..., 1280 at which recall@10 over the 500 queries (one client) is
 at least 0.95 (`TARGET`), and every q/s and p99 row is measured at that EF.
-KiviDB's VSIM is an exact scan today (#710), over the Q8 vectors: its recall
-is what Q8 leaves (0.98 on glove100, 0.976 on laion768) at any EF, so it
-stops at the first. A server that never gets there is measured at 1280 and
-says so in the row's note.
+KiviDB searches a set of 4,096 elements or more in an HNSW graph (#710), as
+Redis does, so its EF climbs the ladder too. A server that never gets there
+is measured at 1280 and says so in the row's note.
 
 Rows, per configuration:
 
@@ -64,12 +63,15 @@ without it; anything else that is not an executable fails the suite before
 it loads anything.
 
 Gates (candidate): against Redis only where KiviDB is ahead, as #627 asks:
-`vadd_per_s` at least 10x Redis's and `bytes_per_vector` at most 0.8x (no
-graph to build or hold; measured off the VM at 120-180x and 0.23-0.57x).
-recall_at_10 at least TARGET. The q/s rows hold against the
-recorded candidate within 25 % (suite 09's tolerance for VSIM q/s); KiviDB
-loses them to Redis's HNSW search (4-40x at 100,000 vectors, more at 1M:
-#710), which the rows record. p99 is shown.
+`vadd_per_s` at least 3x Redis's and `bytes_per_vector` at most 1.0x. Until
+#710 a set had no graph to build or hold, and these were 10x and 0.8x
+(measured at 92-93x and 0.23-0.57x); every VADD now links its element into
+the graph and a set holds its links, and on a D8s_v5 the graph build is
+5.5x Redis's VADD rate on glove100 and 5.4x on laion768, the bytes 0.63x and
+0.82x Redis's (`44-vector-sets-hnsw` measures the defaults). recall_at_10 at
+least TARGET. The q/s rows hold against the recorded candidate within 25 %
+(suite 09's tolerance for VSIM q/s); recall and q/s against Redis are gated
+by suite 44, at the defaults. p99 is shown.
 
 KiviDB runs with `--threads 4` (all four CPUs of the VM, as auto does since
 #873; v1.2.2 gets the same count); Redis and Garnet use their own threading.
@@ -127,8 +129,8 @@ SECONDS = 10.0
 WARMUP = 2.0
 # Where KiviDB is ahead of Redis (vs_redis: Redis / candidate for a rate,
 # candidate / Redis for memory, at most this).
-VADD_VS_REDIS = 0.1
-MEMORY_VS_REDIS = 0.8
+VADD_VS_REDIS = 1 / 3
+MEMORY_VS_REDIS = 1.0
 
 BIG = os.environ.get("VSET_1M", "0") not in ("", "0")
 S = Suite("26-vector-sets-ann", [Config(n, threads=4) for n, (_, _, big) in CONFIGS.items() if BIG or not big])

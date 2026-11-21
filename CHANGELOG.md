@@ -149,34 +149,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`VSIM` searches an HNSW graph of the vector set (#710).** A set of 4,096
   elements or more gets a graph over its elements (the one `FT.SEARCH`'s
   vector fields use, one per set), and `VSIM` explores `EF` candidates in it
-  (100 unless given, Redis's default) and scores them from the set's own
-  vectors; `TRUTH` scans every element, and a smaller set is always scanned
-  (exact, and at that size as fast). `EF`, `EPSILON`, `FILTER-EF` and `TRUTH`
-  on `VSIM`, and `M` and `EF` on the `VADD` that makes a set, do what they do
-  in Redis, and `VSIM`'s options are checked as Redis checks them. `VINFO`
-  gives Redis's fields (`hnsw-m`, `size`, `max-level`, `attributes-count`,
-  ...) and `VLINKS` the element's links per layer, top layer first. Writes
-  change the graph in their own order, so an element a `VADD` was answered
-  for is found by the next `VSIM`, and a removed one never is. The graph is
-  not saved: it is made again from the vectors after a load, `RESTORE`,
-  `COPY` or full sync, while `VSIM` scans, so snapshots stay readable by 1.2
-  (1,000,000 128-d vectors: loaded in 1.2 s, the graph made 108 s later;
-  Redis loads its saved graph in 9.2 s).
+  (100 unless given, Redis's default); `TRUTH` scans every element, and a
+  smaller set is always scanned (exact, and at that size as fast). A `Q8` or
+  `BIN` set's graph holds each vector as the set stores it and is measured
+  by the same arithmetic as a scan, so scores do not depend on how an
+  element was found, and the vector is kept once, in the graph. `EF`,
+  `EPSILON`, `FILTER-EF` and `TRUTH` on `VSIM`, and `M` and `EF` on the
+  `VADD` that makes a set, do what they do in Redis (another `M` than the
+  set's is refused), and `VSIM`'s options are checked as Redis checks them.
+  `VINFO` gives Redis's fields (`hnsw-m`, `size`, `max-level`,
+  `attributes-count`, ...) and `VLINKS` the element's links per layer, top
+  layer first. Writes change the graph in their own order, so an element a
+  `VADD` was answered for is found by the next `VSIM`, and a removed one
+  never is. The graph is not saved: it is made again from the vectors after
+  a load, `RESTORE`, `COPY` or full sync, while `VSIM` scans, so snapshots
+  stay readable by 1.2 (1,000,000 128-d vectors: loaded in 1.5 s, the graph
+  made 87 s later; Redis loads its saved graph in 9.2 s).
   On a D8s_v5, `Q8`, `COUNT 10` at the defaults, against Redis 8.10.2 in the
-  same session: 100,000 SIFT vectors (128-d) 3,106 / 13,412 / 15,683 queries
-  a second at 1 / 8 / 50 connections (exact scan before: 272 / 1,102 /
-  1,106; Redis 2,661 / 8,769 / 9,416), recall@10 0.976 (Redis 0.973);
-  100,000 glove-100 vectors 2,739 / 12,534 / 14,111 (before 282 / 1,098 /
-  1,092; Redis 1,944 / 7,238 / 7,869), recall 0.895 (Redis 0.871); 100,000
-  LAION vectors (768-d) 1,597 / 6,140 / 6,801 (Redis 1,704 / 6,045 /
-  6,708), recall 0.972 (Redis 0.969); 1,000,000 SIFT vectors 2,085 / 8,876 /
-  10,014 (Redis 1,956 / 6,722 / 7,510), recall 0.959 (Redis 0.951). The
-  graph costs memory: 1,061 bytes a
-  SIFT vector (224 before, Redis 885) and 4,267 a LAION one (Redis 1,525),
-  as it holds each vector again as f32. `VADD` loads 19,695 SIFT vectors a
-  second (280,705 before, Redis 4,706). Regression suite
-  `44-vector-sets-hnsw` measures it. @Parikalp-Bhardwaj pointed this out in
-  #697.
+  same session, queries a second at 1 / 8 / 50 connections and bytes a
+  vector: 100,000 SIFT vectors (128-d) 3,256 / 13,921 / 16,506 and 612 B
+  (exact scan before: 272 / 1,102 / 1,106 and 224 B; Redis 2,262 / 8,086 /
+  8,842 and 885 B), recall@10 0.975 (Redis 0.973); 1,000,000 SIFT vectors
+  2,362 / 9,921 / 11,748 and 754 B (before 9 / 35 / 35; Redis 1,697 / 6,532
+  / 7,245 and 885 B), recall 0.959 (Redis 0.953); 100,000 glove-100 vectors
+  2,906 / 13,015 / 14,290 and 548 B (Redis 1,772 / 6,908 / 7,671 and 869 B),
+  recall 0.896 (Redis 0.874); 100,000 LAION vectors (768-d) 2,132 / 8,805 /
+  9,956 and 1,254 B (Redis 1,597 / 6,015 / 6,626 and 1,525 B), recall 0.969
+  (Redis 0.967). `VADD` links each element into the graph: 18,924 SIFT
+  vectors a second from 4 loading connections (19,294 from one and 18,856
+  from eight: the seven helper threads link them, all busy; before, with
+  no graph, 280,000; Redis 4,263). Regression suite `44-vector-sets-hnsw`
+  measures it. @Parikalp-Bhardwaj pointed this out in #697.
 
 - **`cluster-announce-client-ipv4` and `cluster-announce-client-ipv6` (#847),
   as in Valkey 8.** The address a client is told to reach a node at, where it

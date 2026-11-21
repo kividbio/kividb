@@ -454,7 +454,7 @@ Vector Sets are a standalone data structure (Redis 8+) — vectors stored direct
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `VADD` | `VADD key [REDUCE dim] [DISTANCE L2\|COSINE\|INNERPRODUCT] (FP32 \| VALUES num) vector element [SETATTR json] [NOQUANT\|Q8\|BIN] [EF n] [M n]` | Add or update an element with its vector; `FP32` accepts raw little-endian bytes, `VALUES n` accepts space-separated floats; returns 1 if new, 0 if updated; AOF-logged. `NOQUANT`, `Q8` (int8 with a norm and range, as Redis) or `BIN` (one bit per component) is chosen when the set is made; a set made without one keeps f32 (Redis's default is `Q8`) and accepts any of them later, as 1.2 did; a set made with one refuses another with Redis's `asked quantization mismatch` error; a `VADD` without one is accepted into any set, in its quantization (Redis accepts it only into a `Q8` set). `M` (4 to 4096, default 16) and `EF` (1 to 1,000,000, default 200) set the graph's links per node and the candidates an insert explores, for the set the `VADD` makes; given again for an existing set they are taken and change nothing (Redis refuses an `M` other than the set's). They are not saved: a set loaded from a snapshot, restored or copied has 16 and 200. `CAS` is accepted and changes nothing (see [How VSIM searches](#how-vsim-searches) for how the graph is linked) |
+| `VADD` | `VADD key [REDUCE dim] [DISTANCE L2\|COSINE\|INNERPRODUCT] (FP32 \| VALUES num) vector element [SETATTR json] [NOQUANT\|Q8\|BIN] [EF n] [M n]` | Add or update an element with its vector; `FP32` accepts raw little-endian bytes, `VALUES n` accepts space-separated floats; returns 1 if new, 0 if updated; AOF-logged. `NOQUANT`, `Q8` (int8 with a norm and range, as Redis) or `BIN` (one bit per component) is chosen when the set is made; a set made without one keeps f32 (Redis's default is `Q8`) and accepts any of them later, as 1.2 did; a set made with one refuses another with Redis's `asked quantization mismatch` error; a `VADD` without one is accepted into any set, in its quantization (Redis accepts it only into a `Q8` set). `M` (4 to 4096, default 16) and `EF` (1 to 1,000,000, default 200) set the graph's links per node and the candidates an insert explores, for the set the `VADD` makes; another `M` than the set's (16 when none is given) is refused with Redis's `asked M value mismatch with existing vector set`. They are not saved: a set loaded from a snapshot, restored or copied has 16 and 200, and takes any `M` (replicated and replayed writes take any too). `CAS` is accepted and changes nothing (see [How VSIM searches](#how-vsim-searches) for how the graph is linked) |
 | `VREM` | `VREM key element [element ...]` | Remove one or more elements; returns count removed; AOF-logged |
 | `VCARD` | `VCARD key` | Return the number of elements in the set; 0 if key does not exist |
 | `VDIM` | `VDIM key` | Return the vector dimension; nil if key does not exist |
@@ -479,29 +479,29 @@ Vector Sets are a standalone data structure (Redis 8+) — vectors stored direct
 A vector set of 4,096 elements or more has an HNSW graph over its elements: the graph `FT.SEARCH`'s vector fields use, one per set, with the set's `M` (default 16) and build `EF` (default 200). `VSIM` walks it for `EF` candidates (default 100, at least `COUNT`) and scores them from the set's own stored vectors (`Q8`, `BIN` or f32), so an element's score is the same whether a graph search or a `TRUTH` scan found it. A smaller set is scanned: at 4,096 elements of 128 dimensions a scan and a graph search take about the same time (about 0.15 ms on a D8s_v5), and the scan is exact.
 
 - **Writes.** `VADD` and `VREM` change the graph under the set's own lock, in the same order as the elements. A new or changed vector waits in the graph's backlog, where every `VSIM` measures it, until a helper thread links it (`search-index-threads`, as for `FT.SEARCH`); a removed element leaves the graph before `VREM` replies. So an element `VADD` has answered for is found by the next `VSIM`, and one `VREM` removed is never found again. When no helper can take a vector (the backlog is full, or there are none), the `VADD` links it itself after letting go of the set.
-- **Loading.** The graph is not saved. After a snapshot load, `RESTORE`, `COPY` or a replica's full sync it is made again from the vectors in the background, and until then `VSIM` scans the set (`VINFO` `index-type FLAT`, then `HNSW`). AOF replay and the replication stream make it as the writes come. Measured with `benchmarks/vector-sets/load_time.py` (D8s_v5, `Q8`): 1,000,000 SIFT vectors load in 1.2 s and are searched by graph again 108 s later, `VSIM` scanning meanwhile at about 100 ms a query (0.45 ms once the graph is made); 100,000 LAION vectors load in 0.5 s, graph 17 s later (19 ms a scan, 0.66 ms after). Redis 8.10.2, which saves its graph, loads the same sets in 9.2 s and 1.7 s, answering nothing until then. Saving the graph would change the snapshot format, which 1.2 could then no longer read.
-- **Memory.** The graph holds each vector again as f32 (dequantized for `Q8` and `BIN`), its links and the element's name twice: on top of the set's own vectors. `MEMORY USAGE` and `used_memory` count it.
+- **Loading.** The graph is not saved. After a snapshot load, `RESTORE`, `COPY` or a replica's full sync it is made again from the vectors in the background, and until then `VSIM` scans the set (`VINFO` `index-type FLAT`, then `HNSW`). AOF replay and the replication stream make it as the writes come. Measured with `benchmarks/vector-sets/load_time.py` (D8s_v5, `Q8`): 1,000,000 SIFT vectors load in 1.5 s and are searched by graph again 87 s later, `VSIM` scanning meanwhile at about 106 ms a query (0.69 ms once the graph is made, one client); 100,000 LAION vectors load in 0.4 s, graph 13 s later (19 ms a scan, 0.47 ms after). Redis 8.10.2, which saves its graph, loads the same sets in 9.2 s and 1.7 s, answering nothing until then. Saving the graph would change the snapshot format, which 1.2 could then no longer read.
+- **Memory.** A `Q8` or `BIN` set's graph holds each vector as the set stores it (the same bytes, measured by the same arithmetic, so a graph search scores an element as a scan does), and once the graph has linked an element the set lets go of its own copy: the vector is kept once. `VEMB`, snapshots, `DUMP`, the AOF rewrite and `COPY` read it from the graph and write exactly what was stored. An f32 set (`NOQUANT`, or no option) keeps its vectors and its graph holds a unit-length f32 copy as well. `MEMORY USAGE` and `used_memory` count the graph.
 
 Measured on one Standard_D8s_v5 (server `--threads 4`, clients on the same VM), `Q8`, `VSIM ... COUNT 10` at the defaults, against Redis 8.10.2 in the same session (regression suite `44-vector-sets-hnsw`, script `benchmarks/1.3.0/regressions/suites/44-vector-sets-hnsw.py`):
 
 | Set | Server | VSIM/s, 1 / 8 / 50 connections | p99 ms at 50 | recall@10 | bytes a vector | VADD/s |
 |---|---|---:|---:|---:|---:|---:|
-| SIFT 128-d, 10,000 | KiviDB | 4,107 / 19,225 / 23,822 | 2.68 | 0.982 | 1,152 | 31,945 |
-| | Redis 8.10.2 | 3,319 / 10,371 / 10,797 | 7.94 | 0.982 | 885 | 8,276 |
-| SIFT 128-d, 100,000 | KiviDB | 3,106 / 13,412 / 15,683 | 3.79 | 0.976 | 1,061 | 19,695 |
-| | Redis 8.10.2 | 2,661 / 8,769 / 9,416 | 9.25 | 0.973 | 885 | 4,706 |
-| | KiviDB, exact scan (before) | 272 / 1,102 / 1,106 | 52.24 | 0.977 | 224 | 280,705 |
-| SIFT 128-d, 1,000,000 | KiviDB | 2,085 / 8,876 / 10,014 | 6.97 | 0.959 | 1,202 | 10,561 |
-| | Redis 8.10.2 | 1,956 / 6,722 / 7,510 | 11.52 | 0.951 | 885 | 2,228 |
-| | KiviDB, exact scan (before) | 11 / 42 / 40 | 2,468 | 0.968 | 281 | 297,129 |
-| glove-100, 100,000 | KiviDB | 2,739 / 12,534 / 14,111 | 4.27 | 0.895 | 968 | 14,881 |
-| | Redis 8.10.2 | 1,944 / 7,238 / 7,869 | 11.38 | 0.871 | 869 | 2,628 |
-| | KiviDB, exact scan (before) | 282 / 1,098 / 1,092 | 48.35 | 0.985 | 196 | 310,830 |
-| LAION 768-d, 100,000 | KiviDB | 1,597 / 6,140 / 6,801 | 9.49 | 0.972 | 4,267 | 6,838 |
-| | Redis 8.10.2 | 1,704 / 6,045 / 6,708 | 13.66 | 0.969 | 1,525 | 2,106 |
-| | KiviDB, exact scan (before) | 69 / 286 / 280 | 310.62 | 0.975 | 864 | 119,382 |
+| SIFT 128-d, 10,000 | KiviDB | 4,188 / 20,119 / 23,241 | 2.71 | 0.982 | 712 | 30,537 |
+| | Redis 8.10.2 | 3,034 / 10,086 / 10,547 | 8.00 | 0.981 | 886 | 8,355 |
+| | KiviDB, exact scan (before) | 2,065 / 7,941 / 8,945 | 6.74 | 0.982 | 249 | 168,064 |
+| SIFT 128-d, 100,000 | KiviDB | 3,256 / 13,921 / 16,506 | 3.65 | 0.975 | 612 | 18,924 |
+| | Redis 8.10.2 | 2,262 / 8,086 / 8,842 | 9.79 | 0.973 | 885 | 4,263 |
+| SIFT 128-d, 1,000,000 | KiviDB | 2,362 / 9,921 / 11,748 | 5.14 | 0.959 | 754 | 12,554 |
+| | Redis 8.10.2 | 1,697 / 6,532 / 7,245 | 11.79 | 0.953 | 885 | 2,069 |
+| | KiviDB, exact scan (before) | 9 / 35 / 35 | 2,690 | 0.968 | 281 | 287,811 |
+| glove-100, 100,000 | KiviDB | 2,906 / 13,015 / 14,290 | 4.26 | 0.896 | 548 | 13,791 |
+| | Redis 8.10.2 | 1,772 / 6,908 / 7,671 | 11.32 | 0.874 | 869 | 2,524 |
+| | KiviDB, exact scan (before) | 218 / 872 / 769 | 81.55 | 0.985 | 196 | 302,285 |
+| LAION 768-d, 100,000 | KiviDB | 2,132 / 8,805 / 9,956 | 6.18 | 0.969 | 1,254 | 10,816 |
+| | Redis 8.10.2 | 1,597 / 6,015 / 6,626 | 13.14 | 0.967 | 1,525 | 2,006 |
+| | KiviDB, exact scan (before) | 54 / 229 / 227 | 267.67 | 0.975 | 864 | 108,498 |
 
-Recall is against the exact top 10 of the f32 vectors; a scan of the `Q8` vectors gives what `Q8` leaves (0.97-0.99), a graph search somewhat less, and `EF` above 100 brings it back (`VSIM ... EF 200`). The memory a vector costs is higher than Redis's by the graph's f32 copy of each vector: 1.2-1.4x Redis's at 100-128 dimensions, 2.8x at 768.
+Recall is against the exact top 10 of the f32 vectors; a scan of the `Q8` vectors gives what `Q8` leaves (0.97-0.99), a graph search somewhat less, and `EF` above 100 brings it back (`VSIM ... EF 200`). A vector costs 0.63-0.85x the memory it costs in Redis: the `Q8` bytes once, in the graph, with the graph's links.
 
 ### Inspection and traversal
 

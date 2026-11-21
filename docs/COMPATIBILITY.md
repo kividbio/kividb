@@ -304,9 +304,10 @@ other files:
   after a load, `RESTORE` or `COPY`, in the background, and `VSIM` scans
   the set until it is ([COMMANDS.md](../COMMANDS.md#how-vsim-searches)).
   For the same reason `M` and the build `EF` given to the `VADD` that made a
-  set are not kept across a restart (the set has Redis's 16 and 200 again),
-  and a `VADD` with another `M` than the set's is taken, where Redis
-  refuses it (`asked M value mismatch`). `CAS` is accepted and changes
+  set are not kept across a restart: the set has Redis's 16 and 200 again,
+  and since it no longer knows the `M` it was made with, it takes a `VADD`
+  with any `M`, where Redis refuses one other than the set's (`asked M value
+  mismatch`; KiviDB refuses it too while the set's `M` is known). `CAS` is accepted and changes
   nothing. A filtered `VSIM` that reaches its `FILTER-EF` effort scans the
   set and answers exactly, where Redis answers with what it found so far.
   `VLINKS` of a set under 4,096 elements, which has no graph, answers one
