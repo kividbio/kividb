@@ -130,7 +130,7 @@ const REFILL: usize = 32;
 /// eighth took the peak to 1.27x what was loaded, with a 32nd to 1.18x,
 /// against 1.15x with active defrag off (#240).
 const BUDGET_SHARE: usize = 64;
-const BUDGET_MIN: usize = 4 << 20;
+const BUDGET_MIN: usize = 1 << 20;
 
 /// Whether what is in the slabs moved from `before` to `now` by more than
 /// one [`REFILL`]th of `slabs`, either way.
@@ -596,7 +596,9 @@ fn pass(store: &Store, streak: &mut Streak) -> Result<bool, Failed> {
             let got = compact(store);
             PASSES.fetch_add(1, Ordering::Relaxed);
             LAST_PASS_MS.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-            if trigger == Trigger::SlabWaste {
+            // One that stopped before it looked for slabs (a delete, or a
+            // snapshot, came first) says nothing either way.
+            if trigger == Trigger::SlabWaste && got.planned > 0 {
                 streak.waste_pass_ended(got.enough());
             }
             streak.live_before = Some(value_slab::fill().live_bytes);
@@ -692,11 +694,12 @@ fn log_error(line: String) {
 }
 
 /// What a pass got back: the slabs it emptied, and the new ones it took for
-/// the values it moved.
+/// the values it moved; and how many sets of slabs it looked for.
 #[derive(Default, Clone, Copy, Debug)]
 struct Got {
     emptied: u64,
     fresh: u64,
+    planned: u64,
 }
 
 impl Got {
@@ -733,6 +736,7 @@ fn compact(store: &Store) -> Got {
         // before the slabs it left are given back.
         let budget = (fill.slab_bytes / BUDGET_SHARE).max(BUDGET_MIN);
         let full = full_slab_free_percent() * 10;
+        got.planned += 1;
         if value_slab::plan_evacuation_with_full(budget, full) == 0 {
             break;
         }
@@ -755,6 +759,7 @@ fn compact(store: &Store) -> Got {
         let round = Got {
             emptied: value_slab::finish_evacuation() as u64,
             fresh: value_slab::fresh_slabs_taken_here() - fresh_before,
+            planned: 1,
         };
         SLABS_EMPTIED.fetch_add(round.emptied, Ordering::Relaxed);
         got.emptied += round.emptied;
@@ -879,6 +884,118 @@ impl Pacer {
         }
         self.worked = Duration::ZERO;
         Some(std::mem::take(&mut self.owed)).filter(|rest| !rest.is_zero())
+    }
+}
+
+#[cfg(test)]
+mod trigger_tests {
+    //! When a pass starts and goes on (#240): the two triggers, the back-off
+    //! of the slab-waste one, and what counts as a delete or its refill.
+    use super::*;
+
+    const MIB: usize = 1 << 20;
+
+    fn fill(slab_mib: usize, live_mib: usize) -> value_slab::Fill {
+        value_slab::Fill {
+            slab_bytes: slab_mib * MIB,
+            live_bytes: live_mib * MIB,
+            full_free_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn either_trigger_starts_a_pass_at_its_defaults() {
+        // The settings are the process's: as the other tests here.
+        let _one = value_slab::EVACUATION_TESTS.lock();
+        configure(&crate::config::Config::default());
+        // 9 % of the slabs free (9.9 % of what is in them): neither.
+        assert_eq!(wasting(&fill(1000, 910), false, true), None);
+        // 12 %: the slab-waste trigger; the ratio one wants 20 % of what is in them.
+        assert_eq!(
+            wasting(&fill(1000, 880), false, true),
+            Some(Trigger::SlabWaste)
+        );
+        assert_eq!(wasting(&fill(1000, 880), false, false), None);
+        assert_eq!(wasting(&fill(1000, 800), false, true), Some(Trigger::Ratio));
+        // Small: over 16 MiB and 10 % starts it, under 64 MiB the ratio one does not.
+        assert_eq!(
+            wasting(&fill(100, 80), false, true),
+            Some(Trigger::SlabWaste)
+        );
+        assert_eq!(wasting(&fill(50, 40), false, true), None);
+        // A pass goes on to half of either.
+        assert_eq!(wasting(&fill(1000, 940), false, true), None);
+        assert_eq!(
+            wasting(&fill(1000, 940), true, true),
+            Some(Trigger::SlabWaste)
+        );
+        assert_eq!(wasting(&fill(1000, 960), true, true), None);
+        // 0 turns the slab-waste trigger off, at half too.
+        set_slab_waste_percent(0);
+        assert_eq!(wasting(&fill(1000, 880), false, true), None);
+        assert_eq!(wasting(&fill(1000, 940), true, true), None);
+        configure(&crate::config::Config::default());
+    }
+
+    #[test]
+    fn a_pass_that_gets_little_back_turns_the_slab_waste_trigger_off_for_longer_each_time() {
+        assert!(
+            Got {
+                emptied: 32,
+                fresh: 28,
+                planned: 1
+            }
+            .enough()
+        );
+        assert!(
+            Got {
+                emptied: 64,
+                fresh: 62,
+                planned: 1
+            }
+            .enough()
+        );
+        assert!(
+            !Got {
+                emptied: 100,
+                fresh: 99,
+                planned: 1
+            }
+            .enough()
+        );
+        assert!(
+            !Got {
+                emptied: 10,
+                fresh: 12,
+                planned: 1
+            }
+            .enough()
+        );
+        assert!(!Got::default().enough());
+        let mut streak = Streak::new();
+        assert!(streak.slab_waste_on());
+        let mut offs = Vec::new();
+        for _ in 0..7 {
+            streak.waste_pass_ended(false);
+            assert!(!streak.slab_waste_on());
+            offs.push(streak.waste_off.as_secs());
+        }
+        assert_eq!(offs, [30, 60, 120, 240, 480, 600, 600]);
+        streak.waste_pass_ended(true);
+        assert!(streak.slab_waste_on());
+        streak.waste_pass_ended(false);
+        assert_eq!(streak.waste_off, WASTE_BACKOFF);
+    }
+
+    #[test]
+    fn a_delete_or_its_refill_is_a_change_of_a_32nd_of_the_slabs_either_way() {
+        // Other tests turn the wait off while they hold this.
+        let _one = value_slab::EVACUATION_TESTS.lock();
+        let slabs = 1024 * MIB;
+        assert!(!churning(500 * MIB, 532 * MIB, slabs));
+        assert!(churning(500 * MIB, 533 * MIB, slabs));
+        assert!(churning(533 * MIB, 500 * MIB, slabs));
+        assert!(!churning(500 * MIB, 470 * MIB, slabs));
     }
 }
 

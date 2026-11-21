@@ -10,8 +10,8 @@ inside the slabs as well (`active-defrag-slab-waste-percent` 10 and
 `active-defrag-slab-waste-bytes` 16 MiB), not only on the ratio trigger
 (`active-defrag-threshold-lower` 20 % and `active-defrag-ignore-bytes`
 64 MiB). A slab is not used for blocks again until a quarter of it is free, so
-after a light churn most of the free room is in full slabs, which before #240
-nothing got back.
+after a light churn most of the free room is in full slabs, which only active
+defrag gets back.
 
 Churn configurations (the issue's shapes), each a fresh server:
 
@@ -55,7 +55,7 @@ percentiles:
 
   get_p99_ms / set_p99_ms, get_p999_ms / set_p999_ms
                     the median over the seconds the pass ran of each second's
-                    p99 and p99.9 (Redis runs no pass: its whole run)
+                    p99 and p99.9 (KiviDB only: Redis runs no pass)
   get_p99_idle_ms / set_p99_idle_ms
                     the same over the seconds before it started (info)
   pass_s            how long the pass ran (KiviDB)
@@ -128,7 +128,9 @@ def cpu_split():
 SERVER_CPUS, CLIENT_CPUS = cpu_split()
 THREADS = len(SERVER_CPUS) if SERVER_CPUS else 0
 CONFIGS = [Config("%s-c%d" % (shape, pct), threads=THREADS) for shape in SHAPES for pct in (10, 20)]
-CONFIGS += [Config("snapshot", threads=THREADS), Config("pass-latency", threads=THREADS)]
+CONFIGS += [Config("snapshot", threads=THREADS),
+            # Redis runs no pass here (activedefrag is off by default, and it has no slabs to empty).
+            Config("pass-latency", threads=THREADS, engines=("v1_2_2", "candidate"))]
 S = Suite("43-slab-churn", CONFIGS, min_cpus=8)
 
 

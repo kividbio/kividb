@@ -1550,6 +1550,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   measurable change in `GET`/`SET` p99.9 during the pass.
   Thanks @Parikalp-Bhardwaj.
 
+- **Active defrag gets back the free room inside full slabs, and starts on
+  slab waste (#240).** A slab is used for new blocks again once a quarter of
+  it is free; the free blocks of the slabs fuller than that are what a light
+  delete/refill churn, or the writes whose old values a snapshot held, leave
+  behind. Active defrag now also empties the full slabs with at least `active-defrag-full-slab-free-percent`
+  (12) of their blocks free, sparsest first, from a list of full slabs each
+  size class keeps in the slabs' headers (changed only when a slab's state
+  changes, under the class's lock), and it starts when the free room inside
+  the slabs is more than `active-defrag-slab-waste-percent` (10) of them and
+  more than `active-defrag-slab-waste-bytes` (16 MiB), besides
+  `active-defrag-threshold-lower` and `active-defrag-ignore-bytes`. What it
+  moves goes into the room of the class's partial slabs first; a round's new
+  slabs are kept to a 64th of the slabs; no pass starts, or goes on to
+  another round, while a large delete or its refill runs, and none starts
+  while a snapshot, an AOF rewrite or a backup is written. A pass the
+  slab-waste trigger started that got little back keeps that trigger off
+  for 30 s, doubling up to 10 min. New `INFO memory` fields:
+  `value_slab_full_free_bytes`, `active_defrag_passes`,
+  `active_defrag_slabs_emptied`, `active_defrag_last_pass_ms`. Measured on
+  an Azure D8s_v5 (`benchmarks/1.3.0/regressions/suites/43-slab-churn.py`),
+  RSS 60 s after three cycles of deleting and rewriting a random part of
+  the keys, against what was loaded: 1,000,000 keys of 1 KB, 10 % a cycle,
+  1.05x (1.15x before; Redis 8.10.2 1.00x at 1.25x KiviDB's load); 20 %,
+  1.05x (1.10x), and the peak during the churn 1.15x where it was 1.28x
+  (1.14x with active defrag off); 100-byte values 1.05x (1.16x). The peak
+  stays within 1.5 % of active defrag off. 2,000,000 keys of 1 KB under
+  40,000 SETs a second, after `BGSAVE` and `BGREWRITEAOF`: 2,216 MiB (2,292
+  before, Redis 2,584), and the highest RSS through both 2,605 MiB (2,859).
+  `GET`/`SET` p99 during a pass under reads and overwrites stays as it is
+  (0.51-0.69 ms, 0.49-0.50 ms before the pass; master 0.50-0.66 ms), and a
+  pass over 700,000 keys takes 8 s. Values of 100 B to 16 KB, mostly in the
+  system allocator, are unchanged. Design agreed with @Parikalp-Bhardwaj,
+  whose measurement showed that the free room a `BGSAVE` leaves is in full
+  slabs.
+
 - **`key-access-tracking yes` costs about 1.5% of a pipelined `GET` instead
   of about 10% (#21).** The setting that keeps `OBJECT IDLETIME`, `OBJECT
   FREQ` and `RESTORE ... IDLETIME` working under `noeviction`, as Redis does,
