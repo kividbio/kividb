@@ -3643,7 +3643,7 @@ pub fn accept_apply(cluster: &ClusterState, task_id: &str, client_id: u64) -> Re
 /// on a thread of its own (`deferred::run_elsewhere`), and on Tokio off the
 /// runtime, so that only the connection that sent it waits.
 pub fn take_over(
-    cluster: &ClusterState,
+    cluster: &Arc<ClusterState>,
     task_id: &str,
     client_id: u64,
     pause_ms: u64,
@@ -3685,7 +3685,7 @@ fn takeover_wait(pause_ms: u64) -> Duration {
 
 /// [`take_over`], waiting until `deadline` at most.
 fn take_over_now(
-    cluster: &ClusterState,
+    cluster: &Arc<ClusterState>,
     task_id: &str,
     client_id: u64,
     deadline: Instant,
@@ -3951,21 +3951,35 @@ fn take_over_now(
 
 /// The source's config epoch while it hands `task`'s slots over, as it
 /// answers `CLUSTER SYNCSLOTS EPOCH`; `None` if it does not (an earlier
-/// release, or no answer).
-fn source_epoch_now(cluster: &ClusterState, task: &Task) -> Option<u64> {
-    let hooks = cluster.hooks.get()?;
-    let mut peer =
-        Peer::connect_to(cluster, &hooks.replica_starter.repl_state, &task.source).ok()?;
-    peer.ask(&command(&[
-        b"CLUSTER",
-        b"SYNCSLOTS",
-        b"EPOCH",
-        task.id.as_bytes(),
-    ]))
-    .ok()?
-    .parse()
-    .ok()
+/// release), or not within [`SOURCE_EPOCH_WAIT`]: asked on a thread of its
+/// own, which is left to end on its own, so that a source slow to answer
+/// (its thread for the new connection busy) holds the takeover up no
+/// longer than that.
+fn source_epoch_now(cluster: &Arc<ClusterState>, task: &Task) -> Option<u64> {
+    use crate::cpus::BuilderExt as _;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let (cluster, source, id) = (Arc::clone(cluster), task.source, task.id.clone());
+    std::thread::Builder::new()
+        .name("kividb-epoch".into())
+        .spawn_released(move || {
+            let asked = cluster.hooks.get().and_then(|hooks| {
+                let mut peer =
+                    Peer::connect_to(&cluster, &hooks.replica_starter.repl_state, &source)
+                        .ok()?;
+                peer.ask(&command(&[b"CLUSTER", b"SYNCSLOTS", b"EPOCH", id.as_bytes()]))
+                    .ok()?
+                    .parse()
+                    .ok()
+            });
+            let _ = tx.send(asked);
+        })
+        .ok()?;
+    rx.recv_timeout(SOURCE_EPOCH_WAIT).ok().flatten()
 }
+
+/// How long a destination waits for the source's answer to
+/// `CLUSTER SYNCSLOTS EPOCH` ([`source_epoch_now`]).
+const SOURCE_EPOCH_WAIT: Duration = Duration::from_millis(300);
 
 /// Whether the source of `task` is still the master of its slots, in this
 /// node's view, for the destination to take them over (#516). A replica of
