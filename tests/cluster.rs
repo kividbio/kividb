@@ -9828,14 +9828,28 @@ fn a_takeover_by_hand_takes_only_the_slots_the_replica_holds() {
 #[test]
 fn a_takeover_is_refused_when_another_master_reaches_its_epoch_meanwhile() {
     let dst = Node::start_with_env(&[], &[("KIVIDB_TEST_FAILPOINTS", "takeover-acknowledged")]);
-    let (nodes, _) = form_cluster_of(vec![Node::start(&[]), dst, Node::start(&[])]);
+    let (nodes, _) = form_cluster_of(vec![
+        Node::start(&[]),
+        dst,
+        Node::start(&[]),
+        Node::start(&[]),
+    ]);
     let replica = add_replica(&nodes, &nodes[1]);
     {
         let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
         wait_cluster_ok(&all, all.len());
     }
     set_pause_timeout(&[&nodes[0], &nodes[1]], "30000");
-    let (src_id, dst_id, other_id) = (nodes[0].id(), nodes[1].id(), nodes[2].id());
+    // Of the two other masters, one whose config epoch is not the highest:
+    // its `BUMPEPOCH` takes one above the highest.
+    let epoch_of = |n: &Node| -> u64 { n.cluster_info("cluster_my_epoch").parse().unwrap() };
+    let highest = nodes.iter().map(epoch_of).max().unwrap();
+    let other = if epoch_of(&nodes[2]) == highest {
+        &nodes[3]
+    } else {
+        &nodes[2]
+    };
+    let (src_id, dst_id, other_id) = (nodes[0].id(), nodes[1].id(), other.id());
     let before = Written::on(&nodes[0], 0..=100, "before", 200);
     let task_id = nodes[1]
         .conn()
@@ -9860,7 +9874,7 @@ fn a_takeover_is_refused_when_another_master_reaches_its_epoch_meanwhile() {
         .cluster_info("cluster_current_epoch")
         .parse()
         .unwrap();
-    let bumped = nodes[2].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+    let bumped = other.conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
     let other_epoch: u64 = bumped
         .strip_prefix("BUMPED ")
         .unwrap_or_else(|| panic!("{bumped}"))
@@ -9891,8 +9905,9 @@ fn a_takeover_is_refused_when_another_master_reaches_its_epoch_meanwhile() {
         "every node, the replica too, to hold the destination as the owner",
         Duration::from_secs(20),
         || {
-            [&nodes[0], &nodes[1], &nodes[2], &replica]
+            nodes
                 .iter()
+                .chain(std::iter::once(&replica))
                 .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str()))
         },
     );
