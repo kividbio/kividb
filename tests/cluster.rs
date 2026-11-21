@@ -627,6 +627,18 @@ fn add_replica_with(cluster: &[Node], master: &Node, extra: &[&str], env: &[(&st
     wait_until("replica to sync", Duration::from_secs(20), || {
         replica.repl_info("master_link_status").as_deref() == Some("up")
     });
+    // And its master to know it as its replica (from its heartbeats): a test
+    // that has the master wait for its replicas counts on it.
+    let replica_id = replica.id();
+    wait_until(
+        "the master to know the replica as its own",
+        Duration::from_secs(20),
+        || {
+            row_of(master, &replica_id).is_some_and(|row| {
+                row[2].split(',').any(|f| f == "slave") && row[3] == master_id
+            })
+        },
+    );
     replica
 }
 
@@ -9603,15 +9615,20 @@ fn a_replica_down_when_its_master_took_slots_is_not_given_them_by_the_voters() {
 /// which it has no replication link to its master.
 const LINK_DOWN: (&str, &str) = ("KIVIDB_TEST_REPLICA_LINK_DOWN", "link-down");
 
-/// Cut `node` off, still running (its replication link down and its cluster
-/// bus stalled), or let it reach the others again.
-fn cut_off(node: &Node, cut: bool) {
+/// Cut `node`, a replica of `master`, off, still running, or let it reach
+/// the others again: its replication link down, its cluster bus stalled, and
+/// its master's slot claims not taken in (`KIVIDB_TEST_IGNORE_CLAIMS`), as
+/// none of its master's heartbeats reach it across the cut.
+fn cut_off(node: &Node, master: &str, cut: bool) {
     let link = node.dir.join(LINK_DOWN.1);
+    let claims = node.dir.join(IGNORE_CLAIMS.1);
     if cut {
+        std::fs::write(&claims, master).unwrap();
         std::fs::write(&link, "").unwrap();
         set_bus(node, "stall");
     } else {
         let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&claims);
         set_bus(node, "run");
     }
 }
@@ -9634,7 +9651,7 @@ fn a_replica_cut_off_part_way_through_an_import_is_not_given_its_slots_by_the_vo
         &nodes,
         &nodes[1],
         &["--cluster-replica-validity-factor", "0"],
-        &[LINK_DOWN, BUS_CONTROL],
+        &[LINK_DOWN, BUS_CONTROL, IGNORE_CLAIMS],
     );
     {
         let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
@@ -9652,7 +9669,7 @@ fn a_replica_cut_off_part_way_through_an_import_is_not_given_its_slots_by_the_vo
         Duration::from_secs(30),
         || replica.conn().cmd(&["DBSIZE"]).int() > 0,
     );
-    cut_off(&replica, true);
+    cut_off(&replica, &dst_id, true);
     wait_until(
         "the replica to be marked failed",
         Duration::from_secs(30),
@@ -9670,7 +9687,7 @@ fn a_replica_cut_off_part_way_through_an_import_is_not_given_its_slots_by_the_vo
         },
     );
     nodes[1].kill();
-    cut_off(&replica, false);
+    cut_off(&replica, &dst_id, false);
     let own = ranges[1].0;
     wait_until(
         "the replica to be elected to the destination's own slots",
@@ -9819,7 +9836,7 @@ fn a_replica_cut_off_between_two_takeovers_is_not_given_the_slots_by_the_voters(
         &nodes,
         &nodes[1],
         &["--cluster-replica-validity-factor", "0"],
-        &[LINK_DOWN, BUS_CONTROL],
+        &[LINK_DOWN, BUS_CONTROL, IGNORE_CLAIMS],
     );
     let mut other = add_replica(&nodes, &nodes[1]);
     {
@@ -9848,7 +9865,7 @@ fn a_replica_cut_off_between_two_takeovers_is_not_given_the_slots_by_the_voters(
         "{}",
         replica.log()
     );
-    cut_off(&replica, true);
+    cut_off(&replica, &dst_id, true);
     let between = Written::on(&nodes[0], 0..=100, "between", 100);
     signal(&other, "-CONT");
     wait_until(
@@ -9868,7 +9885,7 @@ fn a_replica_cut_off_between_two_takeovers_is_not_given_the_slots_by_the_voters(
     );
     other.kill();
     nodes[1].kill();
-    cut_off(&replica, false);
+    cut_off(&replica, &dst_id, false);
     let own = ranges[1].0;
     wait_until(
         "the replica to be elected to the destination's own slots",

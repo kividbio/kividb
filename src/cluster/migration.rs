@@ -3385,6 +3385,10 @@ fn run_import(env: Env, task_id: String) {
             // Taken over, canceled, or otherwise finished by a handler.
             None => return,
             Some(error) => {
+                log_warn!(
+                    "Cluster: Import of slots {}: this attempt is given up: {error}",
+                    ranges_text(&task.ranges)
+                );
                 // Given up first (a `TAKEOVER` of it is refused from here),
                 // or, while one is under way, its outcome waited for.
                 while !registry.give_up_attempt(&task_id) {
@@ -3882,7 +3886,9 @@ fn take_over_now(
         );
         return Err(format!("could not save the cluster config: {e}"));
     }
-    cluster.slot_migrations.update(task_id, |t| t.takeover_refusals = 0);
+    cluster
+        .slot_migrations
+        .update(task_id, |t| t.takeover_refusals = 0);
     cluster
         .slot_migrations
         .finish(task_id, TaskState::Completed, None);

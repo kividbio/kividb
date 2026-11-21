@@ -2578,11 +2578,7 @@ pub fn links_of_replicas(wanted: &[ReplicaWanted], links: &[LinkSeen]) -> Vec<Ve
             if !by_id.is_empty() {
                 return by_id;
             }
-            let by_address: Vec<u64> = links
-                .iter()
-                .filter(|l| exact(i, l))
-                .map(|l| l.id)
-                .collect();
+            let by_address: Vec<u64> = links.iter().filter(|l| exact(i, l)).map(|l| l.id).collect();
             if !by_address.is_empty() {
                 return by_address;
             }
@@ -7774,7 +7770,10 @@ mod replication_invariants_tests {
         let b = "b".repeat(40);
         // By node id, wherever it comes from and whatever port it says.
         let w = [wanted(&a, &["10.0.0.1"], &[7001])];
-        assert_eq!(of(&w, &[link(1, "192.168.9.9", 0, Some(&a))]), vec![vec![1]]);
+        assert_eq!(
+            of(&w, &[link(1, "192.168.9.9", 0, Some(&a))]),
+            vec![vec![1]]
+        );
         // A link that gave another node id is never this replica's, even
         // from its very address.
         assert_eq!(
@@ -7785,7 +7784,10 @@ mod replication_invariants_tests {
         // port or the announced one.
         let w = [wanted(&a, &["::1", "10.0.0.1"], &[7001, 17001, 9000])];
         assert_eq!(of(&w, &[link(1, "[::1]", 7001, None)]), vec![vec![1]]);
-        assert_eq!(of(&w, &[link(2, "::ffff:10.0.0.1", 17001, None)]), vec![vec![2]]);
+        assert_eq!(
+            of(&w, &[link(2, "::ffff:10.0.0.1", 17001, None)]),
+            vec![vec![2]]
+        );
         assert_eq!(of(&w, &[link(3, "10.0.0.1", 9000, None)]), vec![vec![3]]);
         // NAT: from an address the cluster does not have, by the port.
         assert_eq!(of(&w, &[link(4, "172.16.0.7", 7001, None)]), vec![vec![4]]);
@@ -7808,7 +7810,10 @@ mod replication_invariants_tests {
         assert_eq!(
             of(
                 &w2,
-                &[link(7, "10.0.0.1", 7001, None), link(8, "172.16.0.7", 7001, None)]
+                &[
+                    link(7, "10.0.0.1", 7001, None),
+                    link(8, "172.16.0.7", 7001, None)
+                ]
             ),
             vec![vec![7], vec![8]]
         );
