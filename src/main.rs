@@ -449,6 +449,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = crate::commands::server::config_set_global("appendfsync", &cfg.appendfsync);
     let threads = cfg.resolve_threads();
+    #[cfg(feature = "lua")]
+    crate::lua_vm_blocking::workers_are(threads);
     crate::vector::backlog::configure(cfg.search_index_threads);
     let config = Arc::new(cfg);
     RUNTIME_MAXMEMORY.store(config.maxmemory, std::sync::atomic::Ordering::Relaxed);

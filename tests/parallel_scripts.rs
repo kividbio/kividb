@@ -111,6 +111,11 @@ struct Server {
     args: Vec<String>,
 }
 
+/// What `extra` may hold besides the server's arguments: the server is
+/// started with `KIVIDB_TEST_LOOK` set, so a queued script's connection looks
+/// for its reply whatever the CPUs of the machine (`lua_vm_blocking`).
+const LOOK: &str = "@look";
+
 /// `kividb` on `port`, in `dir`.
 fn spawn(dir: &std::path::Path, port: u16, extra: &[String]) -> Child {
     let log = std::fs::OpenOptions::new()
@@ -118,7 +123,13 @@ fn spawn(dir: &std::path::Path, port: u16, extra: &[String]) -> Child {
         .append(true)
         .open(dir.join("server.log"))
         .unwrap();
-    Command::new(env!("CARGO_BIN_EXE_kividb"))
+    let look = extra.iter().any(|a| a.as_str() == LOOK);
+    let extra: Vec<&String> = extra.iter().filter(|a| a.as_str() != LOOK).collect();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kividb"));
+    if look {
+        command.env("KIVIDB_TEST_LOOK", "1");
+    }
+    command
         .current_dir(dir)
         .args([
             "--port",
@@ -131,7 +142,7 @@ fn spawn(dir: &std::path::Path, port: u16, extra: &[String]) -> Child {
             "no",
         ])
         .args(
-            (!extra.iter().any(|a| a == "--io-model"))
+            (!extra.iter().any(|a| a.as_str() == "--io-model"))
                 .then_some(["--io-model", "tokio"])
                 .into_iter()
                 .flatten(),
@@ -2001,17 +2012,34 @@ fn kill_in_a_run(io: &str) {
 /// `GET` on each probe are answered at once. On both I/O loops.
 #[test]
 fn a_queued_script_waiting_for_a_migrate_does_not_hold_a_worker() {
-    queued_script_waiting_for_a_migrate("tokio");
+    queued_script_waiting_for_a_migrate("tokio", false);
 }
 
 #[test]
 fn a_queued_script_waiting_for_a_migrate_does_not_hold_a_worker_uring() {
-    queued_script_waiting_for_a_migrate("uring");
+    queued_script_waiting_for_a_migrate("uring", false);
 }
 
-fn queued_script_waiting_for_a_migrate(io: &str) {
+/// The same with the queued scripts' connections looking for their replies
+/// (`KIVIDB_TEST_LOOK`): while keys move, a connection that looks never
+/// takes the turn to run what is queued, so B's script is the runner's.
+#[test]
+fn a_queued_script_waiting_for_a_migrate_is_not_run_by_a_connection_that_looks() {
+    queued_script_waiting_for_a_migrate("tokio", true);
+}
+
+#[test]
+fn a_queued_script_waiting_for_a_migrate_is_not_run_by_a_connection_that_looks_uring() {
+    queued_script_waiting_for_a_migrate("uring", true);
+}
+
+fn queued_script_waiting_for_a_migrate(io: &str, look: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
-    let server = Server::start(&["--io-model", io]);
+    let server = if look {
+        Server::start(&["--io-model", io, LOOK])
+    } else {
+        Server::start(&["--io-model", io])
+    };
     let mut c = server.conn();
     // Counts to ARGV[1], then writes KEYS[1]: quick at 1, slow at a million.
     let counts = "local n = 0 for i = 1, tonumber(ARGV[1]) do n = n + 1 end \
@@ -2181,4 +2209,180 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
     assert!(written.ok(), "{written:?}");
     assert!(waited > Duration::from_millis(2000), "{waited:?}");
     assert_eq!(c.cmd(&["GET", "m"]), V::Str("v1".into()));
+}
+
+// ── A queued script's connection looks for its reply (#900) ──────────────────
+
+/// Untagged: runs alone, and with several connections at it most calls are
+/// queued behind another one's.
+const APPEND: &str = "return redis.call('RPUSH', KEYS[1], ARGV[1])";
+
+/// Untagged scripts appending to one list from 8 connections, pipelined, on
+/// 2 workers (so the queued scripts' connections look for their replies
+/// where the machine has CPUs to spare): each connection's appends are in
+/// the list in the order it sent them, every reply is the list's length
+/// after its own append, and the list is the same on the master, its
+/// replica and after the AOF is replayed. On both I/O loops.
+#[test]
+fn queued_scripts_append_in_order_on_master_replica_and_aof() {
+    queued_appends_end_the_same("tokio");
+}
+
+#[test]
+fn queued_scripts_append_in_order_on_master_replica_and_aof_uring() {
+    queued_appends_end_the_same("uring");
+}
+
+fn queued_appends_end_the_same(io: &str) {
+    let mut master = Server::start(&[
+        "--io-model",
+        io,
+        "--threads",
+        "2",
+        "--aof",
+        "--appendfsync",
+        "always",
+        LOOK,
+    ]);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--io-model", io, "--replicaof", "127.0.0.1", &port]);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    wait_until("the replica's link to come up", 30, || {
+        r.info("replication", "master_link_status") == "up"
+    });
+    let V::Str(sha) = m.cmd(&["SCRIPT", "LOAD", APPEND]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    const CONNS: usize = 8;
+    const CALLS: usize = 600;
+    let mp = master.port;
+    let clients: Vec<_> = (0..CONNS)
+        .map(|client| {
+            let sha = sha.clone();
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(mp);
+                let mut lengths = Vec::new();
+                for batch in 0..CALLS / 20 {
+                    let calls: Vec<Vec<String>> = (0..20)
+                        .map(|i| {
+                            let n = batch * 20 + i;
+                            vec![
+                                "EVALSHA".into(),
+                                sha.clone(),
+                                "1".into(),
+                                "log".into(),
+                                format!("c{client}.{n}"),
+                            ]
+                        })
+                        .collect();
+                    for reply in c.pipeline(&calls) {
+                        let V::Int(len) = reply else {
+                            panic!("{reply:?}")
+                        };
+                        lengths.push(len);
+                    }
+                }
+                lengths
+            })
+        })
+        .collect();
+    let mut all_lengths: Vec<i64> = Vec::new();
+    for c in clients {
+        let lengths = c.join().unwrap();
+        // A connection's appends land in the order it sent them.
+        assert!(lengths.windows(2).all(|w| w[0] < w[1]), "{lengths:?}");
+        all_lengths.extend(lengths);
+    }
+    // Every reply is the length after its own append: each one once.
+    all_lengths.sort_unstable();
+    let want: Vec<i64> = (1..=(CONNS * CALLS) as i64).collect();
+    assert_eq!(all_lengths, want);
+    let V::Arr(on_master) = m.cmd(&["LRANGE", "log", "0", "-1"]) else {
+        panic!("LRANGE")
+    };
+    assert_eq!(on_master.len(), CONNS * CALLS);
+    for client in 0..CONNS {
+        let prefix = format!("c{client}.");
+        let mine: Vec<usize> = on_master
+            .iter()
+            .filter_map(|v| v.s().strip_prefix(&prefix)?.parse().ok())
+            .collect();
+        assert_eq!(mine, (0..CALLS).collect::<Vec<_>>(), "connection {client}");
+    }
+    assert!(m.cmd(&["SET", "last", "1"]).ok());
+    wait_caught_up(&mut m, &mut r);
+    let V::Arr(on_replica) = r.cmd(&["LRANGE", "log", "0", "-1"]) else {
+        panic!("LRANGE")
+    };
+    assert_eq!(on_replica, on_master, "replica");
+    wait_until("the writes to reach the AOF", 10, || {
+        count(&master.aof(), b"$4\r\nlast\r\n") == 1
+    });
+    master.kill_and_restart();
+    let mut m = master.conn();
+    let V::Arr(replayed) = m.cmd(&["LRANGE", "log", "0", "-1"]) else {
+        panic!("LRANGE")
+    };
+    assert_eq!(replayed, on_master, "AOF replay");
+}
+
+/// A connection that goes while its script is queued: its script still runs
+/// (it was read before the connection went), and the other connections'
+/// scripts are all answered. On both I/O loops.
+#[test]
+fn a_connection_gone_while_its_script_is_queued_leaves_the_others_answered() {
+    gone_while_queued("tokio");
+}
+
+#[test]
+fn a_connection_gone_while_its_script_is_queued_leaves_the_others_answered_uring() {
+    gone_while_queued("uring");
+}
+
+fn gone_while_queued(io: &str) {
+    let server = Server::start(&["--io-model", io, "--threads", "2", LOOK]);
+    let mut c = server.conn();
+    let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", APPEND]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    // Seen to be quick, so the next ones run on the workers and queue there.
+    assert!(matches!(
+        c.cmd(&["EVALSHA", &sha, "1", "warm", "x"]),
+        V::Int(1)
+    ));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let V::Str(three) = c.cmd(&["SCRIPT", "LOAD", THREE_KEYS]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    assert!(matches!(
+        c.cmd(&["EVALSHA", &three, "3", "b1", "b2", "b3"]),
+        V::Int(1)
+    ));
+    let streams = script_stream(server.port, &three, &["b1", "b2", "b3"], 4, &stop);
+    // Connections that each send one append and go without reading.
+    const GONE: usize = 40;
+    for i in 0..GONE {
+        let mut g = server.conn();
+        let v = format!("g{i}");
+        let call = format!(
+            "*5\r\n$7\r\nEVALSHA\r\n${}\r\n{}\r\n$1\r\n1\r\n$4\r\ngone\r\n${}\r\n{}\r\n",
+            sha.len(),
+            sha,
+            v.len(),
+            v
+        );
+        g.writer.write_all(call.as_bytes()).unwrap();
+        // Read by the server before the connection goes.
+        std::thread::sleep(Duration::from_millis(2));
+        drop(g);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ran: usize = streams.into_iter().map(|s| s.join().unwrap()).sum();
+    assert!(ran > 0);
+    wait_until("every gone connection's append", 10, || {
+        c.cmd(&["LLEN", "gone"]) == V::Int(GONE as i64)
+    });
+    // Every script of the others ran once, and was answered.
+    assert_eq!(c.cmd(&["GET", "b1"]).s(), (ran + 1).to_string());
 }
