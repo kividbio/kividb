@@ -875,6 +875,9 @@ impl ClusterState {
         // Those of its master, or of its old master, that it knew of (#741).
         followed_imports::start(self, &repl_state);
         migration::save_imports(self);
+        // A master's replicas are told its slots once it starts, so that the
+        // hub keeps a claim to send ahead of every full sync's dataset.
+        self.send_own_claims_to_replicas();
         // Keys of slots this node does not serve are reported, from a
         // moment after startup on (#517).
         orphans::start_watching(self);
@@ -1890,8 +1893,12 @@ impl ClusterState {
         self.current_epoch.fetch_max(highest, Ordering::SeqCst);
         let epoch = self.current_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         node.config_epoch = epoch;
-        // No slot changes hands: the new epoch reaches this node's replicas
-        // with its heartbeats, as it reaches every other node.
+        drop(nodes);
+        // No slot changes hands. Its replicas are told its slots at the new
+        // epoch in the stream (only them: no other node hears of the epoch
+        // before its heartbeats carry it), so that they hold the slots the
+        // heartbeats claim at it.
+        self.send_own_claims_to_replicas();
         (true, epoch)
     }
 
@@ -1940,6 +1947,8 @@ impl ClusterState {
             "Cluster: config epoch collision with {} — moved to {epoch}",
             node_id_str(&sender)
         );
+        // As `CLUSTER BUMPEPOCH`: its replicas are told its slots at it.
+        self.send_own_claims_to_replicas();
         true
     }
 
@@ -2257,6 +2266,21 @@ impl ClusterState {
         out
     }
 
+    /// For `CLUSTER INFO` on a replica: how many slots of its master it does
+    /// not hold ([`followed_imports::FollowedImports::not_held_of`]), and
+    /// which (`-`: none). Elected, it would not take them over.
+    pub fn slots_not_held(&self) -> (usize, String) {
+        let not_held = self
+            .my_master_id()
+            .map(|master| self.followed_imports.not_held_of(master))
+            .unwrap_or_default();
+        if not_held.is_empty() {
+            return (0, "-".to_string());
+        }
+        let n = not_held.len();
+        (n, migration::ranges_text(&migration::slot_runs(not_held)))
+    }
+
     /// Log the slots of `master` a promotion of this node leaves with it
     /// (`left`): this node does not hold them.
     fn log_left_not_held(&self, master: NodeId, left: &[u16]) {
@@ -2442,7 +2466,7 @@ impl ClusterState {
             }
         }
         if !gains.is_empty() {
-            self.followed_imports.note_gains(owner_id, &gains);
+            followed_imports::note_gains(self, owner_id, &gains);
         }
         if shard_lost_slots || !lost.is_empty() {
             // A write routed here before this, and not yet in the write gate,
@@ -3574,7 +3598,7 @@ impl ClusterState {
         *self.took_over_from.lock() = Some(failed_master_id);
         self.yielded_to.lock().clear();
         self.log_left_not_held(failed_master_id, &left);
-        self.followed_imports.forget_not_held();
+        followed_imports::forget_not_held(self);
 
         // Phase 3: persist, by the caller: see `save_promotion`. The election
         // is won and the cluster has agreed to it: the promotion holds,
@@ -3978,7 +4002,7 @@ impl ClusterState {
             log_warn!("{said}");
         }
         *self.took_over_from.lock() = Some(old_master);
-        self.followed_imports.forget_not_held();
+        followed_imports::forget_not_held(self);
         self.refresh_state();
         Ok(claimed)
     }
@@ -4247,13 +4271,40 @@ impl ClusterState {
         let mut steps: Vec<(&str, u128)> = Vec::new();
         let slots: Vec<u16> = slots.collect();
         let me = self.myself();
-        let new_epoch = epoch;
         steps.push(("epoch", t.elapsed().as_millis()));
-        if let Some(node) = self.nodes.write().get_mut(&me)
-            && new_epoch > node.config_epoch
-        {
-            node.config_epoch = new_epoch;
-        }
+        // The epoch was taken before (`bump_epoch`), above every config
+        // epoch known then. Another node's may have come up to it since (the
+        // source's own takeover, `BUMPEPOCH`, a collision): a claim at it
+        // would not win over that node's, wherever the two meet, and the
+        // slots would stay that node's there. Not taken then: the caller
+        // tries again, at a new epoch ([`EpochOvertaken`]).
+        // The claim is at this node's config epoch, raised to `epoch`
+        // unless it is newer already: what its heartbeats claim.
+        let new_epoch = {
+            let mut nodes = self.nodes.write();
+            // Masters only: a replica says its master's epoch.
+            if let Some(other) = nodes
+                .values()
+                .filter(|n| n.id != me && n.flags.contains(NodeFlags::MASTER))
+                .max_by_key(|n| n.config_epoch)
+                .filter(|n| n.config_epoch >= epoch)
+            {
+                return Err(std::io::Error::other(EpochOvertaken {
+                    node: other.id,
+                    its_epoch: other.config_epoch,
+                    epoch,
+                }));
+            }
+            match nodes.get_mut(&me) {
+                Some(node) => {
+                    if epoch > node.config_epoch {
+                        node.config_epoch = epoch;
+                    }
+                    node.config_epoch
+                }
+                None => epoch,
+            }
+        };
         steps.push(("nodes", t.elapsed().as_millis()));
         let saved = persist::save_from_state_then(self, &slots, || {
             // This node's replicas are told the claim first, in the stream,
@@ -4279,6 +4330,27 @@ impl ClusterState {
             log_info!("Cluster: slow takeover, ms at each step: {steps:?}");
         }
         saved
+    }
+
+    /// Tell this node's replicas its own slots at its config epoch, now
+    /// (`TAKEN`, [`Self::send_claims_to_replicas`]): after it took a new
+    /// config epoch without taking slots (`CLUSTER BUMPEPOCH`, an epoch
+    /// collision), and once it starts as a master, so that its replicas hold
+    /// every slot it lists at the epoch its heartbeats claim, and the hub
+    /// keeps a claim to send ahead of every full sync's dataset.
+    pub(crate) fn send_own_claims_to_replicas(&self) {
+        let me = self.myself();
+        let epoch = {
+            let nodes = self.nodes.read();
+            match nodes.get(&me) {
+                Some(n) if n.flags.contains(NodeFlags::MASTER) => n.config_epoch,
+                _ => return,
+            }
+        };
+        if !self.owns_any_slot(me) {
+            return;
+        }
+        self.send_claims_to_replicas(&[], epoch);
     }
 
     /// Tell this node's replicas, in the replication stream, that it owns
@@ -4871,6 +4943,30 @@ impl ClusterState {
         new_id
     }
 }
+
+/// Why [`ClusterState::take_over_slots_at`] did not take the slots: another
+/// node's config epoch came up to the one reserved for the takeover.
+#[derive(Debug)]
+pub struct EpochOvertaken {
+    pub node: NodeId,
+    pub its_epoch: u64,
+    pub epoch: u64,
+}
+
+impl std::fmt::Display for EpochOvertaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is at config epoch {}, at or above the epoch {} this takeover was to take the \
+             slots at",
+            node_id_str(&self.node),
+            self.its_epoch,
+            self.epoch
+        )
+    }
+}
+
+impl std::error::Error for EpochOvertaken {}
 
 /// How long after an atomic slot migration away from a master handed slots
 /// over its replicas may not take them over (`failover_may_begin`), nor

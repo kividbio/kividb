@@ -444,6 +444,23 @@ async fn offloaded(
                 .await
                 .unwrap_or_else(|_| could_not())
         }
+        crate::deferred::Offload::RerunAlone(cmd) => {
+            use crate::cpus::BuilderExt as _;
+            let Some(env) = env else {
+                return could_not();
+            };
+            crate::cmdstats::note_last_command(std::time::Duration::ZERO);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let started = std::thread::Builder::new()
+                .name("kividb-wait".into())
+                .spawn_released(move || {
+                    let _ = tx.send(env.run_sent_here(cmd, db, aof_enabled, resp));
+                });
+            if started.is_err() {
+                return could_not();
+            }
+            rx.await.unwrap_or_else(|_| could_not())
+        }
         crate::deferred::Offload::Free(freeing) => {
             let started = std::time::Instant::now();
             let _ = freeing.free_elsewhere().await;
@@ -2036,7 +2053,11 @@ pub async fn handle_client(
                         // the replies, as when the command ran here; a killed or
                         // reset one is found when the reply is written.
                         if let Some(offload) = wait.take_offload() {
-                            let env = matches!(offload, crate::deferred::Offload::Rerun(_))
+                            let env = matches!(
+                                offload,
+                                crate::deferred::Offload::Rerun(_)
+                                    | crate::deferred::Offload::RerunAlone(_)
+                            )
                                 .then(|| client_env!());
                             // Boxed, as the park below is: cold.
                             let reply = Box::pin(offloaded(
@@ -2169,7 +2190,11 @@ pub async fn handle_client(
                     // the replies, as when the command ran here; a killed or
                     // reset one is found when the reply is written.
                     if let Some(offload) = wait.take_offload() {
-                        let env = matches!(offload, crate::deferred::Offload::Rerun(_))
+                        let env = matches!(
+                                offload,
+                                crate::deferred::Offload::Rerun(_)
+                                    | crate::deferred::Offload::RerunAlone(_)
+                            )
                             .then(|| client_env!());
                         // Boxed, as the park below is: cold.
                         let reply = Box::pin(offloaded(

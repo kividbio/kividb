@@ -216,6 +216,7 @@ fn cmd_info(state: &ClusterState) -> Vec<u8> {
     let (slots_assigned, slots_ok, slots_pfail, slots_fail) = state.slot_health();
     let size = state.voting_master_count();
     let current_epoch = state.current_epoch();
+    let (not_held, not_held_ranges) = state.slots_not_held();
     let nodes = state.nodes.read();
     let known_nodes = nodes.len();
 
@@ -255,6 +256,12 @@ fn cmd_info(state: &ClusterState) -> Vec<u8> {
             .load(std::sync::atomic::Ordering::Relaxed)
     ));
     out.push_str("total_cluster_links_buffer_limit_exceeded:0\r\n");
+    // On a replica: the slots of its master it does not hold yet (see
+    // `ClusterState::slots_not_held`).
+    out.push_str(&format!("cluster_slots_not_held:{not_held}\r\n"));
+    out.push_str(&format!(
+        "cluster_slots_not_held_ranges:{not_held_ranges}\r\n"
+    ));
 
     resp_bulk_str(&out)
 }
@@ -1899,11 +1906,7 @@ fn cmd_syncslots(ctx: &mut Ctx) -> Vec<u8> {
             // run on a thread of its own, while the worker serves its other
             // connections.
             if crate::deferred::on_ring_thread() && !crate::deferred::running_elsewhere() {
-                if crate::deferred::run_elsewhere(
-                    &mut ctx.blocking,
-                    &ctx.cmd,
-                    crate::commands::helpers::LONG_WORK,
-                ) {
+                if crate::deferred::run_alone_elsewhere(&mut ctx.blocking, &ctx.cmd) {
                     return crate::pause::HELD_IN_GATE.to_vec();
                 }
                 // Not where it can wait without holding up the worker's

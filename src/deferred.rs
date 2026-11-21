@@ -180,6 +180,10 @@ pub enum Offload {
     /// Run the command again, whole, on the pool: its reply is that run's.
     /// The command as it was sent.
     Rerun(Vec<Vec<u8>>),
+    /// [`Self::Rerun`], on a thread of its own: a command that waits (a slot
+    /// takeover waits up to seconds for the AOF and the replicas), and is not
+    /// to hold up a thread of the pool, which other commands' work shares.
+    RerunAlone(Vec<Vec<u8>>),
     /// Free these values on the pool: the reply is the command's own.
     Free(Freeing),
 }
@@ -234,7 +238,7 @@ pub fn finish_on_tokio(offload: Offload, response: &mut Vec<u8>) {
             freeing.free_here();
             count_freed(started.elapsed());
         }
-        Offload::Rerun(_) => {
+        Offload::Rerun(_) | Offload::RerunAlone(_) => {
             debug_assert!(false, "a command sent to be run again on Tokio");
             *response = crate::resp::write::resp_error("ERR the command could not be run");
         }
@@ -281,6 +285,25 @@ pub fn run_elsewhere(blocking: &mut Option<&mut BlockingCtl>, cmd: &[&[u8]], uni
     let cmd = cmd.iter().map(|arg| arg.to_vec()).collect();
     slot.parked = Some(crate::commands::blocking::BlockingWait::offload(
         Offload::Rerun(cmd),
+    ));
+    true
+}
+
+/// For a command that waits, from an io_uring worker: whether it is to stop
+/// here, to be run again on a thread of its own ([`Offload::RerunAlone`]),
+/// as [`run_elsewhere`] has a command run again on the pool.
+#[cold]
+#[inline(never)]
+pub fn run_alone_elsewhere(blocking: &mut Option<&mut BlockingCtl>, cmd: &[&[u8]]) -> bool {
+    if !may_run_elsewhere(blocking) {
+        return false;
+    }
+    let Some(slot) = blocking.as_mut() else {
+        return false;
+    };
+    let cmd = cmd.iter().map(|arg| arg.to_vec()).collect();
+    slot.parked = Some(crate::commands::blocking::BlockingWait::offload(
+        Offload::RerunAlone(cmd),
     ));
     true
 }

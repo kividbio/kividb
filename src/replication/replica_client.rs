@@ -921,10 +921,11 @@ async fn run_replication_session(
         });
     }
     // A dataset sent in full by a master that sends the markers is followed
-    // by them: its claim of the slots it took over (if it has one), then
-    // its imports. Nothing is acknowledged until the imports marker has
-    // been read: an acknowledgement of the dataset's writes then comes from
-    // a replica that holds the claim too.
+    // by them: its claim of its slots (if it keeps one), then its imports.
+    // Nothing is acknowledged until the first marker after the dataset has
+    // been read (the claim comes first when there is one): an
+    // acknowledgement of the dataset's writes then comes from a replica that
+    // holds the claim too.
     let mut ack_held = marked && cmd0 == "FULLRESYNC";
 
     // The stream as it will be read below: what has arrived and is not yet

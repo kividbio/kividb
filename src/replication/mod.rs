@@ -822,10 +822,10 @@ impl ReplState {
             };
             let of = links_of_replicas(&wanted, &links);
             let behind = (0..required.len())
-                .find(|&i| !of[i].iter().copied().any(caught_up))
+                .find(|&i| !of[i].caught_up(&caught_up))
                 .or_else(|| {
                     (required.len()..wanted.len())
-                        .find(|&i| !of[i].is_empty() && !of[i].iter().copied().any(caught_up))
+                        .find(|&i| !of[i].ids.is_empty() && !of[i].caught_up(&caught_up))
                 });
             let Some(index) = behind else {
                 return Ok(());
@@ -833,7 +833,7 @@ impl ReplState {
             if self.is_slave() || std::time::Instant::now() >= deadline {
                 return Err(ReplicaBehind {
                     index,
-                    linked: Some(!of[index].is_empty()),
+                    linked: Some(!of[index].ids.is_empty()),
                     attached_from: attached_from(&seen_links()),
                 });
             }
@@ -2557,8 +2557,11 @@ pub fn canonical_ip(ip: &str) -> String {
 /// - and, for a replica no link was found for so, one that gave none and
 ///   comes from one of its ports, but not from another wanted replica's
 ///   address: as the cluster bus matches a replica's link when its IP is
-///   not the one the cluster has (NAT, an announced address).
-pub fn links_of_replicas(wanted: &[ReplicaWanted], links: &[LinkSeen]) -> Vec<Vec<u64>> {
+///   not the one the cluster has (NAT, an announced address). Found by the
+///   port alone, more than one link is no telling which is the replica's
+///   (two replicas of an earlier release behind one NAT, on one port): it
+///   counts as caught up only once every one of them is ([`LinksOf::all`]).
+pub fn links_of_replicas(wanted: &[ReplicaWanted], links: &[LinkSeen]) -> Vec<LinksOf> {
     let canon: Vec<Vec<String>> = wanted
         .iter()
         .map(|w| w.ips.iter().map(|ip| canonical_ip(ip)).collect())
@@ -2576,13 +2579,19 @@ pub fn links_of_replicas(wanted: &[ReplicaWanted], links: &[LinkSeen]) -> Vec<Ve
                 .map(|l| l.id)
                 .collect();
             if !by_id.is_empty() {
-                return by_id;
+                return LinksOf {
+                    ids: by_id,
+                    all: false,
+                };
             }
             let by_address: Vec<u64> = links.iter().filter(|l| exact(i, l)).map(|l| l.id).collect();
             if !by_address.is_empty() {
-                return by_address;
+                return LinksOf {
+                    ids: by_address,
+                    all: false,
+                };
             }
-            links
+            let by_port: Vec<u64> = links
                 .iter()
                 .filter(|l| {
                     l.node_id.is_none()
@@ -2590,9 +2599,33 @@ pub fn links_of_replicas(wanted: &[ReplicaWanted], links: &[LinkSeen]) -> Vec<Ve
                         && !(0..wanted.len()).any(|j| j != i && exact(j, l))
                 })
                 .map(|l| l.id)
-                .collect()
+                .collect();
+            LinksOf {
+                all: by_port.len() > 1,
+                ids: by_port,
+            }
         })
         .collect()
+}
+
+/// The links [`links_of_replicas`] found for a replica, and whether it
+/// counts as caught up only once all of them are (`all`; otherwise once
+/// any is).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinksOf {
+    pub ids: Vec<u64>,
+    pub all: bool,
+}
+
+impl LinksOf {
+    /// Whether the replica has caught up, by `caught_up` of each link.
+    pub fn caught_up(&self, caught_up: impl Fn(u64) -> bool) -> bool {
+        if self.all {
+            !self.ids.is_empty() && self.ids.iter().all(|id| caught_up(*id))
+        } else {
+            self.ids.iter().any(|id| caught_up(*id))
+        }
+    }
 }
 
 /// What a replica answers a node that asks to replicate from it: KiviDB does
@@ -7765,7 +7798,12 @@ mod replication_invariants_tests {
     /// port alone when no other wanted replica is at that address.
     #[test]
     fn a_replica_is_matched_to_its_links() {
-        use super::links_of_replicas as of;
+        let of = |w: &[super::ReplicaWanted], l: &[super::LinkSeen]| -> Vec<Vec<u64>> {
+            super::links_of_replicas(w, l)
+                .into_iter()
+                .map(|f| f.ids)
+                .collect()
+        };
         let a = "a".repeat(40);
         let b = "b".repeat(40);
         // By node id, wherever it comes from and whatever port it says.
@@ -7817,6 +7855,19 @@ mod replication_invariants_tests {
             ),
             vec![vec![7], vec![8]]
         );
+        // Two replicas of an earlier release behind one NAT, on one port:
+        // each link is either's by the port alone, and neither counts until
+        // both links have caught up.
+        let found = super::links_of_replicas(
+            &w2,
+            &[
+                link(10, "172.16.0.7", 7001, None),
+                link(11, "172.16.0.8", 7001, None),
+            ],
+        );
+        assert!(found.iter().all(|f| f.all && f.ids == vec![10, 11]));
+        assert!(!found[0].caught_up(|id| id == 10));
+        assert!(found[0].caught_up(|_| true));
         // A link with a node id does not stand in for one without.
         assert_eq!(
             of(&w2, &[link(9, "172.16.0.7", 7001, Some(&"c".repeat(40)))]),

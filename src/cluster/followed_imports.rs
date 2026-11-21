@@ -196,13 +196,23 @@ pub(crate) struct FollowedImports {
 /// the slots of its master it holds (`ClusterState::held_claims_of_master`),
 /// and a promotion takes only those (`ClusterState::promote_self`).
 ///
-/// At start-up nothing is noted: the slots the table shows as the master's,
-/// read from nodes.conf, are held, as the dataset loaded with it has them,
-/// and what the master gains after that is not held until the stream
-/// confirms it. Nothing of this is saved: a node restarted before the stream
-/// confirmed a gain holds what nodes.conf had, and hears the gain again. A
-/// master whose stream carries no markers (1.2) is as before: every slot of
-/// it in the table is held, once a session with it has said so.
+/// The slots not held are written down, synced, in
+/// `<cluster-config-file>.not-held` whenever they change, before the
+/// cluster config that shows the gain is saved (the table changes first,
+/// its save follows on the save thread). At start-up they are read back:
+/// a replica that heard its master gain slots, and restarted before its
+/// stream confirmed them, does not hold them after the restart either. No
+/// file: every slot of the master in the table, read from nodes.conf, is
+/// held, as the dataset loaded with it has them (nothing was noted, as on a
+/// node of an earlier release). A file that does not read (cut short,
+/// damaged): every slot of the master in the table is taken as not held,
+/// at epoch 0, until the stream confirms it (any `TAKEN` of the master
+/// does). An earlier release that reads the same nodes.conf ignores the
+/// file. What the master gains after a restart is not held until the
+/// stream confirms it. A master whose stream carries no markers (1.2):
+/// every slot of it in the table is held, from the first session with it
+/// (until then, after a restart, its gains are not held either: they are
+/// not in the dataset the node loaded).
 #[derive(Default)]
 struct NotHeld {
     /// The master this is about: everything is forgotten when this node
@@ -266,6 +276,34 @@ impl FollowedImports {
             .filter(|a| a.master == master)
             .map(|a| (a.epoch, a.ranges.clone()))
             .collect()
+    }
+
+    /// What [`NotHeld`] is to be written down as: `None`, nothing (no
+    /// file).
+    fn not_held_text(&self) -> Option<String> {
+        let not_held = self.not_held.lock();
+        let master = not_held.master?;
+        if not_held.plain || not_held.slots.is_empty() {
+            return None;
+        }
+        let mut out = format!("master {}\n", node_id_str(&master));
+        let mut run: Option<(u16, u16, u64)> = None;
+        for (&slot, &epoch) in &not_held.slots {
+            run = match run {
+                Some((a, b, e)) if e == epoch && b + 1 == slot => Some((a, slot, e)),
+                Some((a, b, e)) => {
+                    out.push_str(&format!("{a}-{b} {e}\n"));
+                    Some((slot, slot, epoch))
+                }
+                None => Some((slot, slot, epoch)),
+            };
+        }
+        if let Some((a, b, e)) = run {
+            out.push_str(&format!("{a}-{b} {e}\n"));
+        }
+        out.push_str(NOT_HELD_END);
+        out.push('\n');
+        Some(out)
     }
 
     /// Slots this node's table has just moved to `master`, the master it
@@ -433,6 +471,159 @@ impl FollowedImports {
     }
 }
 
+// ── What a replica does not hold, on disk ────────────────────────────────────
+
+/// The last line of `<cluster-config-file>.not-held`: a file without it was
+/// cut short.
+const NOT_HELD_END: &str = "end";
+
+fn not_held_path(cluster: &ClusterState) -> Option<std::path::PathBuf> {
+    cluster.config_path.as_ref().map(|p| {
+        let mut name = p.as_os_str().to_owned();
+        name.push(".not-held");
+        std::path::PathBuf::from(name)
+    })
+}
+
+/// Write [`NotHeld`] down, synced, if it changed since it was last written
+/// (none: remove the file). One writer at a time, the last state written.
+pub(crate) fn save_not_held(cluster: &ClusterState) {
+    static WRITTEN: Mutex<Option<Option<String>>> = Mutex::new(None);
+    let Some(path) = not_held_path(cluster) else {
+        return;
+    };
+    let mut written = WRITTEN.lock();
+    let text = cluster.followed_imports.not_held_text();
+    if written.as_ref() == Some(&text) {
+        return;
+    }
+    let saved = match &text {
+        None => match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+        Some(text) => {
+            let mut tmp = path.as_os_str().to_owned();
+            tmp.push(".tmp");
+            let tmp = std::path::PathBuf::from(tmp);
+            write_synced(&tmp, text.as_bytes()).and_then(|()| std::fs::rename(&tmp, &path))
+        }
+    };
+    if let Some(dir) = path.parent()
+        && let Ok(dir) = std::fs::File::open(dir)
+    {
+        let _ = dir.sync_all();
+    }
+    match saved {
+        Ok(()) => *written = Some(text),
+        Err(e) => log_warn!(
+            "Cluster: could not write down which slots of its master this node does not hold \
+             ({}): {e}",
+            path.display()
+        ),
+    }
+}
+
+/// [`FollowedImports::note_gains`], written down.
+pub(crate) fn note_gains(cluster: &ClusterState, master: NodeId, gains: &[(u16, u64)]) {
+    cluster.followed_imports.note_gains(master, gains);
+    save_not_held(cluster);
+}
+
+/// [`FollowedImports::forget_not_held`], written down.
+pub(crate) fn forget_not_held(cluster: &ClusterState) {
+    cluster.followed_imports.forget_not_held();
+    save_not_held(cluster);
+}
+
+/// The file read back (see [`NotHeld`]): its master and slots, or `Err` if
+/// it does not read.
+fn parse_not_held(text: &str) -> Result<(NodeId, std::collections::BTreeMap<u16, u64>), ()> {
+    let mut lines = text.lines();
+    let master = lines
+        .next()
+        .and_then(|l| l.strip_prefix("master "))
+        .and_then(|id| super::node::parse_node_id(id.as_bytes()))
+        .ok_or(())?;
+    let mut slots = std::collections::BTreeMap::new();
+    let mut ended = false;
+    for line in lines {
+        if ended {
+            return Err(());
+        }
+        if line == NOT_HELD_END {
+            ended = true;
+            continue;
+        }
+        let (range, epoch) = line.split_once(' ').ok_or(())?;
+        let epoch: u64 = epoch.parse().map_err(|_| ())?;
+        let (a, b) = range.split_once('-').ok_or(())?;
+        let (a, b): (u16, u16) = (a.parse().map_err(|_| ())?, b.parse().map_err(|_| ())?);
+        if a > b || b as usize >= super::CLUSTER_SLOTS {
+            return Err(());
+        }
+        for slot in a..=b {
+            slots.insert(slot, epoch);
+        }
+    }
+    if !ended {
+        return Err(());
+    }
+    Ok((master, slots))
+}
+
+/// At start-up: what this node, a replica, does not hold of its master's
+/// slots, as written down (see [`NotHeld`]).
+fn load_not_held(cluster: &ClusterState) {
+    let Some(path) = not_held_path(cluster) else {
+        return;
+    };
+    let text = match std::fs::read(&path) {
+        Ok(bytes) => String::from_utf8(bytes).ok(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => None,
+    };
+    let Some(master) = cluster.my_master_id() else {
+        return;
+    };
+    let read = text.as_deref().ok_or(()).and_then(parse_not_held);
+    // The master's slots in the table, read before the list is locked (the
+    // order every other path takes the two in).
+    let of_master: Vec<u16> = {
+        let owners = cluster.slots.read();
+        (0..super::CLUSTER_SLOTS as u16)
+            .filter(|&slot| owners[slot as usize] == Some(master))
+            .collect()
+    };
+    let mut not_held = cluster.followed_imports.not_held.lock();
+    not_held.about(master);
+    match read {
+        Ok((of, slots)) if of == master => {
+            not_held.slots = slots
+                .into_iter()
+                .filter(|(slot, _)| of_master.binary_search(slot).is_ok())
+                .collect();
+            if !not_held.slots.is_empty() {
+                log_info!(
+                    "Cluster: this node does not hold slots {} of its master yet: its master \
+                     took them, and its replication stream has not confirmed them",
+                    migration::ranges_text(&slot_runs(not_held.slots.keys().copied().collect()))
+                );
+            }
+        }
+        // Of another master: nothing of this one.
+        Ok(_) => {}
+        Err(()) => {
+            not_held.slots = of_master.iter().map(|&slot| (slot, 0)).collect();
+            log_warn!(
+                "Cluster: {} does not read: every slot of this node's master is taken as not \
+                 held until its replication stream confirms it",
+                path.display()
+            );
+        }
+    }
+}
+
 // ── The marker ───────────────────────────────────────────────────────────────
 
 /// `a-b,c-d`; `-` for none.
@@ -586,6 +777,7 @@ fn note_masters_arrived(cluster: &ClusterState, epoch: u64, ranges: Ranges) {
     cluster
         .followed_imports
         .confirm_held(master, epoch, &ranges, true);
+    save_not_held(cluster);
     cluster
         .followed_imports
         .note_arrived(node_id_str(&master).to_string(), epoch, ranges);
@@ -613,6 +805,7 @@ fn take_in_masters_claim(cluster: &ClusterState, epoch: u64, ranges: &[(u16, u16
     cluster
         .followed_imports
         .confirm_held(master, epoch, ranges, false);
+    save_not_held(cluster);
     if ignored {
         return;
     }
@@ -748,6 +941,7 @@ pub(crate) fn on_event(
     match event {
         SlotImportsEvent::Session { marked, full } => {
             followed.session_with(cluster.my_master_id(), marked, full);
+            save_not_held(cluster);
             // What arrived (`ARRIVED`) is in this node's dataset while that
             // is the stream it was read in: not after a full sync, nor once
             // this node follows another master; still after a partial
@@ -1050,6 +1244,7 @@ fn load(cluster: &ClusterState) {
 /// replication client, and start the cleanup thread.
 pub(crate) fn start(cluster: &Arc<ClusterState>, repl_state: &crate::replication::ReplState) {
     load(cluster);
+    load_not_held(cluster);
     // Given to a master this node replicates from (`REPLCONF node-id`).
     repl_state.set_my_node_id(Some(node_id_str(&cluster.myself()).to_string()));
     if !crate::replication::hides_slot_imports_capability() {
@@ -1504,6 +1699,31 @@ mod tests {
         assert_eq!(f.not_held_of(other), vec![60]);
         f.forget_not_held();
         assert!(f.not_held_of(other).is_empty());
+    }
+
+    /// The slots not held read back as written; a file cut short, or with
+    /// anything after its end, does not read.
+    #[test]
+    fn the_slots_not_held_read_back() {
+        let f = FollowedImports::default();
+        let m = crate::cluster::generate_node_id();
+        f.note_gains(m, &[(10, 5), (11, 5), (12, 6), (20, 6)]);
+        let text = f.not_held_text().unwrap();
+        assert_eq!(
+            text,
+            format!("master {}\n10-11 5\n12-12 6\n20-20 6\nend\n", node_id_str(&m))
+        );
+        let (of, slots) = parse_not_held(&text).unwrap();
+        assert_eq!(of, m);
+        assert_eq!(
+            slots.into_iter().collect::<Vec<_>>(),
+            vec![(10, 5), (11, 5), (12, 6), (20, 6)]
+        );
+        assert!(parse_not_held(&text[..text.len() - 4]).is_err());
+        assert!(parse_not_held(&format!("{text}1-2 3\n")).is_err());
+        assert!(parse_not_held("master x\nend\n").is_err());
+        f.forget_not_held();
+        assert_eq!(f.not_held_text(), None);
     }
 
     #[test]

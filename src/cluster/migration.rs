@@ -87,6 +87,19 @@ const BATCH_BYTES: usize = 4 * 1024 * 1024;
 /// How long the destination waits without hearing from the source before it
 /// gives the attempt up.
 const SOURCE_SILENCE_LIMIT: Duration = Duration::from_secs(30);
+
+/// [`SOURCE_SILENCE_LIMIT`], or, for the tests, what
+/// `KIVIDB_TEST_SOURCE_SILENCE_MS` says (never set otherwise).
+fn source_silence_limit() -> Duration {
+    static LIMIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("KIVIDB_TEST_SOURCE_SILENCE_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(SOURCE_SILENCE_LIMIT)
+    })
+}
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// The longest an import waits between attempts after refused takeovers.
 const RETRY_DELAY_MAX: Duration = Duration::from_secs(30);
@@ -3485,7 +3498,7 @@ fn import_attempt(env: &Env, task: &Task, source: NodeId) -> Option<String> {
         // cancel, the source's silence or its giving the attempt up are
         // acted on once it has been refused, and are moot once it has
         // taken the slots (the import completed).
-        match registry.attempt_check(&task.id, SOURCE_SILENCE_LIMIT) {
+        match registry.attempt_check(&task.id, source_silence_limit()) {
             AttemptCheck::Ended => return None,
             AttemptCheck::TakingOver => continue,
             AttemptCheck::GivenUp(why) => return Some(why),
@@ -3752,6 +3765,16 @@ fn take_over_now(
     // should this attempt be refused, a later takeover of them is at a newer
     // epoch, which the marker does not stand for.
     let epoch = cluster.bump_epoch();
+    // Saved before the marker goes out (synced as every save of the cluster
+    // config is): restarted, this node takes a newer epoch for the next
+    // attempt, which a replica that kept this attempt's marker does not take
+    // for this one's.
+    if let Err(e) = cluster.save_to_disk() {
+        return not_yet(
+            &format!("could not save the config epoch taken for the takeover: {e}"),
+            false,
+        );
+    }
     if let Some(hooks) = cluster.hooks.get() {
         hooks
             .replica_starter
@@ -3851,7 +3874,7 @@ fn take_over_now(
     }
     // Tests: held here, its replicas having acknowledged what arrived, before
     // the slots are taken.
-    crate::aof::failpoint("takeover-acknowledged");
+    crate::aof::failpoint_noting("takeover-acknowledged", task_id);
     // The source may have changed meanwhile.
     if let Err(why) = source_still_owns(cluster, &task) {
         return not_from_the_source(why);
@@ -3877,6 +3900,14 @@ fn take_over_now(
         super::persist::with_deferred_sync(take)
     };
     if let Err(e) = taken {
+        // Another node's config epoch came up to the one taken above: tried
+        // again, at a new epoch, and a new `ARRIVED`.
+        if let Some(over) = e
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<super::EpochOvertaken>())
+        {
+            return not_yet(&over.to_string(), true);
+        }
         cluster.slot_migrations.takeover_undone(task_id);
         log_warn!(
             "Cluster: Could not save the cluster config while taking over slots {} ({e}); \
