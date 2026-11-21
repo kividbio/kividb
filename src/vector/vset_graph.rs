@@ -329,12 +329,16 @@ fn hand_over(graph: &VsetGraph, inner: &VectorSetInner, name: &[u8]) -> Option<P
             ticket,
             metric: inner.metric.clone(),
         })?;
-    // No helper threads (`search-index-threads` 0, or `auto` below 8 CPUs):
-    // the set's own linkers take it, while the backlog has room. A write
-    // that linked its own vector would do so in its command, and the
-    // commands writing one key run one after the other: a set's writes
-    // would then be linked on one thread at a time.
-    if !backlog::helpers_running() && graph.index.backlog.len() <= most {
+    // No helper threads (`search-index-threads auto` below 8 CPUs): the
+    // set's own linkers take it, while the backlog has room. A write that
+    // linked its own vector would do so in its command, and the commands
+    // writing one key run one after the other: a set's writes would then be
+    // linked on one thread at a time. `search-index-threads 0` asks for no
+    // background linking at all: the write links its own, as FT.SEARCH's do.
+    if !backlog::helpers_running()
+        && !backlog::none_configured()
+        && graph.index.backlog.len() <= most
+    {
         linkers::queue(pending);
         return None;
     }
@@ -715,11 +719,23 @@ fn take_in_linked() {
                 break;
             }
             let mut inner = set.write();
-            if !still_ours(&inner, &graph) || !absorb(&graph, &mut inner, 4096) {
+            let batch = absorb_batch(inner.dim);
+            if !still_ours(&inner, &graph) || !absorb(&graph, &mut inner, batch) {
                 break;
             }
         }
     }
+}
+
+/// Bytes of vectors the builder takes in at a time, under the set's write
+/// lock: each is copied out of the graph and compared with the set's.
+const ABSORB_BATCH_BYTES: usize = 1 << 20;
+
+/// Vectors of `dim` floats the builder takes in at a time: about
+/// [`ABSORB_BATCH_BYTES`] of them (256 at 1,024 dimensions), from 16 to
+/// 4,096.
+fn absorb_batch(dim: usize) -> usize {
+    (ABSORB_BATCH_BYTES / (dim * 4).max(1)).clamp(16, 4096)
 }
 
 /// Whether `graph` is still the graph of the set `inner` is.

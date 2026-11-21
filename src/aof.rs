@@ -4670,6 +4670,9 @@ fn preload(
             stats.commands,
             incr.display()
         );
+        // The replay wrote no vector set's graph: they are made now, in the
+        // background, as after `recover_from_aof`'s replay.
+        crate::vector::vset_graph::request_builds(store);
         if stats.truncated_tail {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

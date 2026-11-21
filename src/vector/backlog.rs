@@ -604,6 +604,14 @@ pub fn configure(threads: IndexThreads) {
     *CONFIGURED.lock() = threads;
 }
 
+/// Whether `search-index-threads` is 0: no thread links vectors in the
+/// background, a write links its own (`auto` with no helper still lets a
+/// vector set's own linkers run, see `vset_graph::hand_over`).
+pub(crate) fn none_configured() -> bool {
+    static NONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NONE.get_or_init(|| matches!(*CONFIGURED.lock(), IndexThreads::Count(0)))
+}
+
 /// With fewer CPUs than this, `auto` starts no helper.
 pub const AUTO_FROM_CPUS: usize = 8;
 

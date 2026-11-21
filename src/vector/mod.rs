@@ -3431,23 +3431,10 @@ fn insert_unit(
             match k2id.values().next().copied() {
                 Some(id) => ep = id,
                 None => {
-                    // No live nodes at all — we become the entry point
+                    // No live nodes at all: we become the entry point, unless
+                    // a racing insert already has (see `enter_empty`).
                     drop(k2id);
-                    let mut links: Vec<Vec<u32>> = (0..=level).map(|_| Vec::new()).collect();
-                    let new_id = publish(
-                        index,
-                        slots,
-                        &mut nodes,
-                        key.clone(),
-                        &vector,
-                        level,
-                        doc,
-                        &mut links,
-                    );
-                    index.key_to_id.write().insert(key, new_id);
-                    index.live_count.fetch_add(1, Relaxed);
-                    *index.entry_point.write() = Some(new_id);
-                    return;
+                    return enter_empty(index, slots, nodes, ep_snapshot, key, vector, metric, doc, level);
                 }
             }
         }
@@ -3558,8 +3545,8 @@ fn insert_unit(
 
         per_layer
     } else {
-        // First node ever — empty neighbor lists
-        (0..=level).map(|_| vec![]).collect()
+        // First node ever, unless a racing insert is (see `enter_empty`).
+        return enter_empty(index, slots, nodes, None, key, vector, metric, doc, level);
     };
 
     // Append the node. Nothing finds it until a neighbour links back to it
@@ -3646,6 +3633,43 @@ fn insert_unit(
             }
         }
     }
+}
+
+/// The insert of a node into a graph with no live node, as `seen` (its entry
+/// point as the insert found it) said. One such insert at a time: the node
+/// becomes the entry point, with no links, if the entry point is still
+/// `seen`; if a racing insert got there first, this insert starts again and
+/// links to it. Unserialized, inserts racing into an empty graph each became
+/// the entry point in turn, and all but the last were left with no links,
+/// which no later insert would find to link to.
+///
+/// The graph's read lock is let go before the turn is waited for: the
+/// insert holding the turn may need the write lock (a slot used again).
+#[allow(clippy::too_many_arguments)]
+fn enter_empty(
+    index: &Arc<HnswIndex>,
+    slots: &slots::Slots,
+    nodes: NodesGuard<'_>,
+    seen: Option<usize>,
+    key: String,
+    vector: Vec<f32>,
+    metric: &DistanceMetric,
+    doc: u32,
+    level: usize,
+) {
+    static ENTERING: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+    drop(nodes);
+    let turn = ENTERING.lock();
+    if *index.entry_point.read() != seen {
+        drop(turn);
+        return insert_unit(index, key, vector, metric, doc);
+    }
+    let mut nodes = index.nodes.read();
+    let mut links: Vec<Vec<u32>> = (0..=level).map(|_| Vec::new()).collect();
+    let new_id = publish(index, slots, &mut nodes, key.clone(), &vector, level, doc, &mut links);
+    index.key_to_id.write().insert(key, new_id);
+    index.live_count.fetch_add(1, Relaxed);
+    *index.entry_point.write() = Some(new_id);
 }
 
 /// How many links past its most a node's list may take before it is pruned
@@ -4896,6 +4920,39 @@ mod concurrent_insert_tests {
         }
         let total = THREADS * PER_THREAD;
         assert!(found * 100 >= total * 98, "found {found} of {total}");
+    }
+
+    /// Inserts racing into an empty graph: one becomes the entry point and
+    /// the others link to it, so that no node is left with no links.
+    #[test]
+    fn inserts_racing_into_an_empty_graph_all_link() {
+        const THREADS: usize = 4;
+        let metric = DistanceMetric::Cosine;
+        for round in 0..300u64 {
+            let index = Arc::new(HnswIndex::new(8, 50));
+            let vectors = random_vectors(THREADS * 2, 8, round);
+            let start = std::sync::Barrier::new(THREADS);
+            std::thread::scope(|s| {
+                for t in 0..THREADS {
+                    let (index, metric, start, vectors) = (&index, &metric, &start, &vectors);
+                    s.spawn(move || {
+                        start.wait();
+                        for i in 0..2 {
+                            let v = vectors[t * 2 + i].clone();
+                            hnsw_insert(index, format!("k:{t}:{i}"), v, metric);
+                        }
+                    });
+                }
+            });
+            assert_eq!(index.live_count.load(Relaxed), THREADS * 2);
+            let nodes = index.nodes.read();
+            let mut list = Vec::new();
+            for (id, _) in nodes.iter() {
+                list.clear();
+                index.links(&nodes, id, 0, &mut list);
+                assert!(!list.is_empty(), "round {round}: node {id} has no links");
+            }
+        }
     }
 }
 
