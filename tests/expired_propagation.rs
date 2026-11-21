@@ -1455,3 +1455,37 @@ fn a_write_that_changed_nothing_is_not_sent_on() {
         );
     }
 }
+
+/// SETs over strings at their length, which write each one's block in place
+/// (#240): 20 KB strings in slabs, 40 KB ones in the system allocator's
+/// blocks. The replica, and a replay of the AOF, hold what the master does.
+#[test]
+fn strings_written_in_place_converge_on_the_replica_and_the_aof() {
+    let mut master = Server::with_aof();
+    let replica = Server::replica_of(&master);
+    let (mut m, mut r) = (master.conn(), replica.conn());
+    let value = |len: usize, round: usize, k: usize| -> String {
+        (0..len)
+            .map(|i| (b'a' + ((i * 7 + round * 13 + k) % 26) as u8) as char)
+            .collect()
+    };
+    let keys = 40;
+    for round in 0..10 {
+        for k in 0..keys {
+            let len = if k % 2 == 0 { 20_000 } else { 40_000 };
+            m.ok(&["SET", &format!("big:{k}"), &value(len, round, k)]);
+        }
+    }
+    caught_up(&mut m, &mut r);
+    let want = dataset(&mut m);
+    assert_eq!(want.len(), keys);
+    assert_eq!(dataset(&mut r), want, "the replica");
+    for k in 0..keys {
+        let key = format!("big:{k}");
+        assert_eq!(m.cmd(&["DIGEST", &key]), r.cmd(&["DIGEST", &key]), "{key}");
+    }
+    aof_holds(&master, "SET", keys * 10 + 1);
+    master.restart();
+    let mut m = master.conn();
+    assert_eq!(dataset(&mut m), want, "the AOF replayed");
+}

@@ -93,9 +93,9 @@ const SLABS: usize = REGION / SLAB;
 /// itself unused, whatever the classes; of 1 MiB it holds 40 or more of the
 /// largest blocks, and the classes can be its size over a count of blocks,
 /// so that no slab leaves 16 bytes a block or more unused. The system
-/// allocator's block cost a SET of 13 KB 0.6 us (4.5 %) more of the
-/// server's CPU than a slab's; at 26 KB the two cost the same, so the
-/// largest block is a large slab over 40 blocks, 26,208 bytes.
+/// allocator's block costs a SET of 13 KB 0.6 us (4.5 %) more of the
+/// server's CPU than a slab's, and one of 26 KB no more: so the largest
+/// block is a large slab over 40 blocks, 26,208 bytes.
 pub const LARGE_SLAB: usize = 1 << 20;
 /// Slabs in a region of large slabs: the headers' and fifteen. Only the
 /// headers' slab's first page is ever touched; its other pages are address
@@ -158,8 +158,8 @@ const fn next_blocks(prev: usize) -> usize {
 
 /// The large class after one of `prev` bytes: [`next_blocks`]'s, or a power
 /// of two of 4 KiB and up that lies between (a slab's size over a count of
-/// blocks too). A block of 4,096 bytes is one page; without the class, an
-/// entry of 4,049 to 4,096 bytes took a block of 4,144, over two.
+/// blocks too). A block of 4,096 bytes is one page; the class above it,
+/// 4,192, is over two.
 const fn next_large(prev: usize) -> usize {
     let next = large_size(next_blocks(prev));
     let mut page = 4096;
@@ -474,12 +474,12 @@ fn capacity(class: usize) -> i32 {
 ///
 /// A large slab is used again once a sixteenth of it is free: 64 KiB of
 /// blocks a lock, 2 of the largest and 31 of the smallest, each a copy of
-/// 2 KiB or more. With a quarter, a delete of a tenth of 120,000 values of
-/// 100 bytes to 16 KB and their refill found next to no slab to take again
-/// (the slabs of 40 to 500 blocks were about nine tenths full) and took a
-/// tenth more slabs, which active defrag left (a pass needs an eighth of a
-/// full slab free): RSS stayed 1.11x what it was after the load, where the
-/// system allocator, reusing the blocks freed, had 1.04x.
+/// 2 KiB or more. At a quarter, a delete of a tenth of 120,000 values of
+/// 100 bytes to 16 KB and their refill find next to no slab to take again
+/// (the slabs of 40 to 500 blocks are about nine tenths full) and take a
+/// tenth more slabs, which active defrag leaves (a pass needs an eighth of
+/// a full slab free): RSS stays at 1.11x what it was after the load, where
+/// the system allocator, reusing the blocks freed, has 1.04x.
 #[inline]
 fn listable(class: usize) -> i32 {
     if is_large(class) {

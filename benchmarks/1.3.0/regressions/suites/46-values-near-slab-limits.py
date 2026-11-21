@@ -31,7 +31,9 @@ The pairs are chosen with both requests on one side of a multiple of 4 KiB
 one just over 4,096 bytes costs every server more than one just under, KiviDB
 as Redis (`step_4048_4056`, shown, not gated).
 
-  rss_b_<size>         VmRSS growth over the group's load, per key (info)
+  rss_b_<size>         VmRSS growth over the group's load, per key (info; one
+                       size a configuration within 3 % of its recorded value:
+                       2,100, 4,300 and 25,000 bytes)
   used_b_<size>        used_memory growth, per key (info)
   worst_overhead_pct   the most a size's RSS per key is above the value's size
                        plus the configuration's smallest overhead (RSS per key
@@ -83,6 +85,10 @@ SHAPES = {
     "near-max": (16_000, sorted(set(range(24000, 28001, 1000)) | {26192, 26208}), [(26192, 26208, WITHIN)]),
 }
 GATES = {WITHIN: bound(min=0.97), KEPT: rel(3), SHOWN: info()}
+# One size a configuration whose RSS a key is held to its recorded value
+# (3 %): `worst_overhead_pct` is within its group, and a rise of every size
+# alike would pass it.
+HELD_RSS = {"near-2k": 2100, "near-4k": 4300, "near-max": 25000}
 
 
 def parse_cpus(text):
@@ -228,7 +234,8 @@ def run(ctx):
     overhead = {size: g["rss_b"] - size for size, g in groups.items()}
     least = min(overhead.values())
     for size in sizes:
-        ctx.emit("rss_b_%d" % size, groups[size]["rss_b"], "B", "lower", gate=info())
+        rss_gate = rel(3) if size == HELD_RSS[ctx.config.name] else info()
+        ctx.emit("rss_b_%d" % size, groups[size]["rss_b"], "B", "lower", gate=rss_gate)
         ctx.emit("used_b_%d" % size, groups[size]["used_b"], "B", "lower", gate=info())
         ctx.emit("set_kops_%d" % size, median(rates[size]), "kops", "higher", gate=info(), samples=rates[size])
         ctx.emit("cpu_us_%d" % size, median(cpus[size]), "us", "lower", gate=info(), samples=cpus[size])

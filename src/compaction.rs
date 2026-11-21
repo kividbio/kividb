@@ -96,9 +96,9 @@ const BATCH: usize = 128;
 /// for the shard waits for no more than these copies.
 const MOVES_PER_HOLD: usize = 32;
 
-/// And no more than this many bytes of them (32 blocks of 4 KiB): a block
-/// is up to `value_slab::MAX_BLOCK`, so a hold copies at most six of the
-/// largest.
+/// And no more once this many bytes of them are moved (32 blocks of 4 KiB),
+/// checked before each move: a block is up to `value_slab::MAX_BLOCK`, so a
+/// hold copies up to six of the largest, about 154 KiB.
 const MOVE_BYTES_PER_HOLD: usize = 128 << 10;
 
 /// Work done between two sleeps. Slept after every batch, a pass over a
@@ -1355,7 +1355,7 @@ mod tests {
     //! process's, and so are the settings.
 
     use super::*;
-    use crate::store::{ValueRef, new_store, shard_index};
+    use crate::store::{ValueRef, Written, new_store, shard_index};
     use std::sync::Arc;
 
     /// What a test here holds, with the settings that make any waste worth
@@ -1910,8 +1910,11 @@ mod tests {
     /// another thread (as the lazy free pool does), and readers check every
     /// value they read by its checksum, some of them holding it a while (as a
     /// reply or a snapshot does), and checking it again once the shard is
-    /// let go of. At the end every key holds what its writer last wrote to it,
-    /// byte for byte, or is gone if it had to be; and the lists check out.
+    /// let go of. A fifth of the writes are SETs over a key's string at its
+    /// length, which write it in place, a string of its own included, unless
+    /// a reader holds it. At the end every key holds what its writer last
+    /// wrote to it, byte for byte, or is gone if it had to be; and the lists
+    /// check out.
     #[test]
     fn values_moved_under_writers_readers_and_expiry_stay_whole() {
         use std::sync::atomic::AtomicUsize;
@@ -1926,6 +1929,8 @@ mod tests {
         // it ends once nothing changes.
         let deadline = Instant::now() + run;
         let reads = Arc::new(AtomicUsize::new(0));
+        // SETs written in place over a string of its own.
+        let own_in_place = Arc::new(AtomicUsize::new(0));
         let (to_free, freeing) = std::sync::mpsc::channel::<crate::types::KiviDBValue>();
         let freer = std::thread::spawn(move || {
             let mut freed = 0usize;
@@ -1938,6 +1943,7 @@ mod tests {
         let writers: Vec<_> = (0..WRITERS)
             .map(|w| {
                 let (store, to_free) = (Arc::clone(&store), to_free.clone());
+                let own_in_place = Arc::clone(&own_in_place);
                 std::thread::spawn(move || {
                     let mut last = vec![Last::Gone; KEYS_EACH];
                     let mut x = 0x240u64 + w as u64;
@@ -1960,12 +1966,24 @@ mod tests {
                             1..=6 => 20 + (x >> 40) as usize % 100,
                             _ => 100 + (x >> 40) as usize % 1_100,
                         };
-                        let taken = match (x >> 12) % 10 {
-                            0 | 1 => {
+                        let taken = match ((x >> 12) % 10, last[slot]) {
+                            (0 | 1, _) => {
                                 last[slot] = Last::Gone;
                                 shard.write().remove(&k)
                             }
-                            2 => {
+                            // A SET over the string at its length: in place
+                            // if nothing holds it (no time to live, so that
+                            // the key cannot have gone meanwhile).
+                            (3 | 4, Last::Set(_, l, false)) => {
+                                last[slot] = Last::Set(version, l, false);
+                                let written =
+                                    shard.write().set_str(&k, stamped(i as u32, version, l));
+                                if matches!(written, Written::InPlace) && l > 4_100 {
+                                    own_in_place.fetch_add(1, Ordering::Relaxed);
+                                }
+                                written.replaced()
+                            }
+                            (2, _) => {
                                 last[slot] = Last::Set(version, len, true);
                                 let expires = now_ms() + 1 + (x >> 50) % 20;
                                 shard.write().insert_str_expiring(
@@ -2106,6 +2124,10 @@ mod tests {
             "{passes} passes, {moved} moved, {emptied} slabs emptied"
         );
         assert!(reads.load(Ordering::Relaxed) > 1000);
+        assert!(
+            own_in_place.load(Ordering::Relaxed) > 0,
+            "no string of its own written in place"
+        );
     }
 
     /// A pass that a delete or a refill cuts short (#240 review): it counts

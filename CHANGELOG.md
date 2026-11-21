@@ -1754,11 +1754,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Redis 8.10.2: 180 to 1,134); from 4,100 bytes up a value takes up to
   2.5 % more than the system allocator's block did, the class it is rounded
   up to (24,000 to 28,000 bytes: the value plus 187 to 853 bytes, 1.2.2: 165
-  to 176). After suite 43's churn of 120,000 values of 100 B to 16 KB, RSS
+  to 176), and `used_memory`, `maxmemory` and `MEMORY USAGE` count that
+  block, not the value alone. Slabs come out of reservations of address
+  space that grow to a GiB, two of the kernel's mappings each, so that
+  tens of GiB of values stay far from `vm.max_map_count`. After suite 43's
+  churn of 120,000 values of 100 B to 16 KB, RSS
   is 1.03x and 1.04x what it was after the load (a tenth and a fifth of the
   keys rewritten three times; 1.2.2: 1.03x and 1.06x). Active defrag empties
-  the new slabs as it does the others, moving at most 128 KiB of values
-  under one hold of a shard's lock, and a round looks whether the clients
+  the new slabs as it does the others; a hold of a shard's lock stops
+  moving values once 128 KiB are moved (checked before each move: up to
+  about 154 KiB, six of the largest blocks), and a round looks whether the clients
   started a delete or a refill every 10 ms, or 20 times as long as its last
   look took (a look reads every slab's header). The entries of large sets,
   hashes and sorted sets keep their classes and 64 KiB slabs, and the
