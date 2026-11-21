@@ -634,9 +634,8 @@ fn add_replica_with(cluster: &[Node], master: &Node, extra: &[&str], env: &[(&st
         "the master to know the replica as its own",
         Duration::from_secs(20),
         || {
-            row_of(master, &replica_id).is_some_and(|row| {
-                row[2].split(',').any(|f| f == "slave") && row[3] == master_id
-            })
+            row_of(master, &replica_id)
+                .is_some_and(|row| row[2].split(',').any(|f| f == "slave") && row[3] == master_id)
         },
     );
     replica

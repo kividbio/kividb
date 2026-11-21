@@ -1423,7 +1423,10 @@ mod tests {
     #[test]
     fn a_gain_of_the_master_is_held_once_its_stream_confirms_it() {
         let f = FollowedImports::default();
-        let (m, other) = (crate::cluster::generate_node_id(), crate::cluster::generate_node_id());
+        let (m, other) = (
+            crate::cluster::generate_node_id(),
+            crate::cluster::generate_node_id(),
+        );
         f.note_gains(m, &[(10, 5), (11, 5), (20, 6)]);
         assert_eq!(f.not_held_of(m), vec![10, 11, 20]);
         assert!(f.not_held_of(other).is_empty());
@@ -1432,7 +1435,11 @@ mod tests {
         f.confirm_held(m, 5, &[(10, 10)], false);
         assert_eq!(f.not_held_of(m), vec![11, 20]);
         f.confirm_held(m, 7, &[(20, 20)], true);
-        assert_eq!(f.not_held_of(m), vec![11, 20], "an ARRIVED at another epoch");
+        assert_eq!(
+            f.not_held_of(m),
+            vec![11, 20],
+            "an ARRIVED at another epoch"
+        );
         f.confirm_held(m, 6, &[(20, 20)], true);
         assert_eq!(f.not_held_of(m), vec![11]);
         // A gain an ARRIVED at its epoch covers is held at once.
