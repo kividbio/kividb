@@ -29,7 +29,7 @@ use parking_lot::RwLock;
 use std::sync::{Arc, LazyLock};
 
 /// Field names, in the order `HIMPORT SET` will supply their values.
-type Fieldset = Arc<Vec<String>>;
+type Fieldset = Arc<Vec<Vec<u8>>>;
 
 /// Client id → that connection's fieldsets, by name.
 ///
@@ -78,7 +78,7 @@ pub(crate) fn propagation(client_id: u64, cmd: &[&[u8]]) -> Vec<Vec<Vec<u8>>> {
     hset.push(b"HSET".to_vec());
     hset.push(cmd[2].to_vec());
     for (field, value) in fields.iter().zip(values) {
-        hset.push(field.as_bytes().to_vec());
+        hset.push(field.clone());
         hset.push(value.to_vec());
     }
     vec![vec![b"DEL".to_vec(), cmd[2].to_vec()], hset]
@@ -116,11 +116,8 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let mut fields = Vec::with_capacity(cmd.len() - 3);
             let mut seen = ahash::AHashSet::with_capacity(cmd.len() - 3);
-            // Field names are any bytes, kept in a hash's own spelling of
-            // them (`name_from_bytes`), as HSET keeps them. They were kept
-            // as the text that came, so a name with a character of the
-            // escape's block in it read back as other bytes, on this node
-            // and on its replicas alike.
+            // Field names are any bytes, kept as they came, as HSET keeps
+            // them, and sent on as they came.
             for raw in &cmd[3..] {
                 let raw: &[u8] = raw;
                 if !seen.insert(raw) {
@@ -128,7 +125,7 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         &[&b"ERR duplicate field name '"[..], raw, b"' in fieldset"].concat(),
                     ));
                 }
-                fields.push(crate::commands::helpers::name_from_bytes(raw).into_owned());
+                fields.push(raw.to_vec());
             }
             // Preparing an existing name replaces its definition.
             SESSIONS
@@ -160,12 +157,15 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 )));
             }
 
-            let pairs: Vec<(String, Arc<[u8]>)> = fields
+            let pairs: Vec<[&[u8]; 2]> = fields
                 .iter()
                 .zip(values)
-                .map(|(field, value)| (field.clone(), Arc::from(*value)))
+                .map(|(field, value)| [field.as_slice(), *value])
                 .collect();
-            let hash: crate::types::HashFields = pairs.iter().cloned().collect();
+            let mut hash = crate::types::HashFields::with_capacity(pairs.len());
+            for [field, value] in &pairs {
+                hash.insert_bytes(*field, value);
+            }
 
             // Creates or overwrites: whatever was at `key`, of any type, and
             // its TTL, are replaced.
@@ -183,7 +183,7 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 key,
                 KiviDBValue::Hash(crate::hash_fields::shared(hash)),
             );
-            crate::vector::maybe_index(
+            crate::vector::maybe_index_pairs(
                 ctx.index_store,
                 db,
                 key,
@@ -251,7 +251,7 @@ mod tests {
     fn prepare(client: u64, name: &str, fields: &[&str]) {
         SESSIONS.write().entry(client).or_default().insert(
             name.as_bytes().to_vec(),
-            Arc::new(fields.iter().map(|f| f.to_string()).collect()),
+            Arc::new(fields.iter().map(|f| f.as_bytes().to_vec()).collect()),
         );
     }
 

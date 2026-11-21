@@ -83,6 +83,7 @@ pub mod wait_table;
 pub mod watch;
 pub mod write_gate;
 pub mod write_order;
+mod zset_table;
 
 #[cfg(feature = "tls")]
 mod tls;

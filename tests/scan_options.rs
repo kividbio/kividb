@@ -426,11 +426,8 @@ fn remove(c: &mut Conn, kind: &str, key: &str, names: impl Iterator<Item = Strin
 /// first call to the last is returned, while another connection grows the
 /// collection twentyfold, shrinks it to the members that stay (a table
 /// shrinking, or the collection changing to its compact form), and grows it
-/// again, between pages; and no page is longer than COUNT asks for, or the
-/// floor of a 1,024th of the collection, plus the members at one position
-/// (no collision is likely among these). A page is found keeping only about
-/// twice COUNT elements (`helpers::scan_page`): growth and shrinking move
-/// the cut it makes.
+/// again, between pages; and no page is longer than COUNT asks for, plus
+/// the members of one unit of the table's cursor (see below).
 #[test]
 fn what_stays_is_returned_while_the_collection_grows_and_shrinks() {
     let server = Server::start();
@@ -459,19 +456,15 @@ fn what_stays_is_returned_while_the_collection_grows_and_shrinks() {
                 let mut args = vec![scan, key.as_str(), cursor.as_str(), "COUNT", &count_arg];
                 args.extend(flag);
                 let (next, names) = page(&c.run(&args));
-                // At most 23,040 members here: a floor of 22. (A collection
-                // in its compact form comes back whole, cursor 0.) A set's
-                // or a hash's table (#764) has no floor: a page ends at the first group
+                // (A collection in its compact form comes back whole,
+                // cursor 0.) A set's, a hash's or a sorted set's table
+                // (#764, #875) gives a page that ends at the first group
                 // boundary once COUNT is reached, and while the table
                 // resizes, a group of the smaller array goes with its groups
                 // in the larger (up to four in a shrink), so a page can pass
                 // COUNT by that unit's members: 64 at most, chains and all,
                 // at any fill these sizes reach.
-                let most = if scan == "SSCAN" || scan == "HSCAN" {
-                    count + 64
-                } else {
-                    count.max(22) + 2
-                };
+                let most = count + 64;
                 assert!(
                     next == "0" || names.len() <= most,
                     "{scan} COUNT {count}: a page of {}",

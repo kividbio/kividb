@@ -17,6 +17,27 @@ Lua: the `lua` and `full` variants.
   `busy-reply-threshold`) is not stopped, but every other client is told
   `BUSY` until it ends. `SCRIPT KILL` (or `FUNCTION KILL`) stops it if it
   has not written anything; otherwise only `SHUTDOWN NOSAVE` does.
+- **On a cluster, a script's commands use keys of its own slot**, the slot
+  of its first key in `KEYS` (or of the first key it uses, with none),
+  that this node serves, as in Redis: a command on keys of another slot
+  fails with `ERR Script attempted to access keys that do not hash to the
+  same slot`, unless the script has the flag `allow-cross-slot-keys`.
+- **While its slot is being moved, a script's command on a key it did not
+  declare is routed as a client's command would be.** With the slot
+  `MIGRATING` away from this node or `IMPORTING` into it (`CLUSTER
+  SETSLOT`), a command that a client would be sent elsewhere for (`-ASK`,
+  `-MOVED`) or asked to retry (`-TRYAGAIN`) fails in the script with
+  `ERR Script attempted to access a non local key in a cluster node`, as
+  in Redis: on the node migrating the slot, a key that has left already,
+  or that does not exist; on the node importing it (the script sent with
+  `ASKING`), a command over several keys of which some have not arrived
+  yet. A write to an undeclared key that a `MIGRATE` is moving at that
+  moment fails with `TRYAGAIN a key of the script's command is being
+  migrated`. The keys in `KEYS` are not affected: they were routed with
+  the script, and the script may read, delete and make them again while
+  the slot moves. A script that fails part way has run the commands
+  before the one that failed, and their writes stay, as in Redis: declare
+  every key a script uses in `KEYS` and it never fails this way.
 
 ## Lua 5.4, and how it differs from Redis's Lua 5.1
 
@@ -225,6 +246,26 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   that has no tag, runs alone and may touch what it likes. So do functions
   (`FCALL`), and scripts inside `MULTI`/`EXEC`.
 
+- **Scripts that run alone and come while one is running are run right
+  after it, on the same thread.** Once a script has been seen to be quick,
+  the thread that runs it also runs the quick scripts that came meanwhile,
+  one after another, in a run: the other commands are let in again once
+  200 microseconds have passed since they were held back and the script
+  then running has finished (a run is as long as its last script makes
+  it), or once no script is left. Every other command waits once for a
+  run, not once for each script in it, and each script is still alone: no
+  command runs beside it or between two of them. The first script of a run
+  makes its own checks (its routing, ACL, `BUSY`) before it holds the
+  others back, as any script does; the scripts after it in the run make
+  theirs with the others held back already, and a script that has to wait
+  (for a slot handoff, or for a `MIGRATE` of its key) lets them in while
+  it waits; a queued script that has to wait so is left to the
+  script-runner thread, not run by a thread that serves other connections.
+  A server with many such scripts beside plain commands (a lock's
+  compare-and-delete, a rate limiter with no hash tag) answers the plain
+  commands about as fast as with no scripts at all. The script-runner
+  thread runs the ones left over when no script is running.
+
 - **A command from a client waits for a script on its tag.** `GET
   {orders}:waiting` sent while a script on `orders` is running is answered
   when the script has finished; so is a command naming a key of any of the
@@ -332,8 +373,14 @@ that a server running its scripts one at a time shows it without
 | `scripts_run_alone_no_keys` | ran alone because it has no `KEYS` |
 | `scripts_run_alone_no_tag` | ran alone because a key of its `KEYS` has no hash tag |
 | `scripts_run_alone_not_quick` | ran alone because it has not (or not yet) been seen to be quick |
-| `scripts_handed_to_runner` | (alone, and quick) came while another script was running, and was run by the script-runner thread |
+| `scripts_handed_to_runner` | (alone, and quick) came while another script was running, and was run by the thread running that one, or by the script-runner thread |
 | `scripts_offloaded_to_pool` | (not yet seen to be quick, or seen to be slow) was run on a thread of the blocking pool |
+| `scripts_in_alone_runs` | (alone, and quick) took the gate in a run of such scripts, the other commands held back once for the run: counted per take, so a script sent back to wait (a slot handoff, a `MIGRATE` of its key) and run again counts twice |
+
+`scripts_alone_runs` counts the runs: the times the other commands were
+held back for one. `scripts_in_alone_runs` over `scripts_alone_runs` is how
+many takes a run held, on average; a script alone in its run is a run of
+one.
 
 A script that runs alone is counted under the first reason in the table
 that applies. The `scripts_run_*` counts add up to the script calls that
@@ -343,7 +390,8 @@ then run, is counted each time it got that far. `scripts_handed_to_runner`
 and `scripts_offloaded_to_pool` are a second view of the scripts counted as
 run alone (a script in one of them is also in a `scripts_run_alone_*`
 field): handed to the runner is a quick script that runs alone and came
-while another script was running; offloaded to the pool is one not yet
+while another script was running, run after it by the same thread or by the
+script-runner thread; offloaded to the pool is one not yet
 known to be quick, or demoted as slow.
 Scripts applied by a replica from its master, or replayed from the AOF,
 are not counted. `CONFIG RESETSTAT` sets them all to 0. A build without

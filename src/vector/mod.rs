@@ -2393,7 +2393,7 @@ pub fn maybe_index_json(
         {
             continue;
         }
-        let fields: Vec<(String, Arc<[u8]>)> = project_json(&def.fields, doc).into_iter().collect();
+        let fields = schema_names(project_json(&def.fields, doc));
         index_fields(def, &crate::key_bytes::text_of(key), &fields, Write::Whole);
     }
 }
@@ -2474,7 +2474,12 @@ pub fn reindex_key(
                 let pairs: Vec<(String, Arc<[u8]>)> = hash
                     .read()
                     .iter()
-                    .map(|(field, value)| (field.to_string(), value.to_shared()))
+                    .filter_map(|(field, value)| {
+                        Some((
+                            std::str::from_utf8(field).ok()?.to_owned(),
+                            value.to_shared(),
+                        ))
+                    })
                     .collect();
                 index_fields(def, &crate::key_bytes::text_of(key), &pairs, how);
             }
@@ -2483,13 +2488,17 @@ pub fn reindex_key(
                     .read()
                     .fields
                     .iter()
-                    .map(|(field, value)| (field.to_string(), value.to_shared()))
+                    .filter_map(|(field, value)| {
+                        Some((
+                            std::str::from_utf8(field).ok()?.to_owned(),
+                            value.to_shared(),
+                        ))
+                    })
                     .collect();
                 index_fields(def, &crate::key_bytes::text_of(key), &pairs, how);
             }
             (IndexOn::Json, Some(crate::types::KiviDBValue::Json(doc))) => {
-                let fields: Vec<(String, Arc<[u8]>)> =
-                    project_json(&def.fields, &doc.read()).into_iter().collect();
+                let fields = schema_names(project_json(&def.fields, &doc.read()));
                 index_fields(def, &crate::key_bytes::text_of(key), &fields, how);
             }
             _ => unindex_from(def, &crate::key_bytes::text_of(key)),
@@ -2538,6 +2547,39 @@ pub fn maybe_index(
         }
         index_fields(def, &crate::key_bytes::text_of(key), fields, how);
     }
+}
+
+/// The fields of a JSON document's projection, by the names the schema
+/// gives them, which are text.
+fn schema_names(projected: Fields) -> Vec<(String, Arc<[u8]>)> {
+    projected
+        .into_iter()
+        .filter_map(|(name, value)| Some((String::from_utf8(name).ok()?, value)))
+        .collect()
+}
+
+/// [`maybe_index`] of a command's own `[field, value]` pairs (`HSET`,
+/// `HSETEX`, `HIMPORT SET`), each field its bytes: copied only when an index
+/// may cover the key. A schema names its fields in UTF-8, so a field whose
+/// name is not UTF-8 is no field of any index, and is not passed on.
+pub fn maybe_index_pairs(
+    index_store: &IndexStore,
+    db: usize,
+    key: &(impl AsRef<[u8]> + ?Sized),
+    pairs: &[[&[u8]; 2]],
+    how: Write,
+) {
+    if indexing_deferred() || index_store.none() {
+        return;
+    }
+    let fields: Vec<(String, Arc<[u8]>)> = pairs
+        .iter()
+        .filter_map(|[field, value]| {
+            let name = std::str::from_utf8(field).ok()?;
+            Some((name.to_owned(), Arc::from(*value)))
+        })
+        .collect();
+    maybe_index(index_store, db, key, &fields, how);
 }
 
 /// Index `fields` of the document at `key` in `def`: the words of its TEXT
@@ -2639,6 +2681,9 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
                     {
                         continue;
                     }
+                    // Once per command, whatever it writes to how many
+                    // indexes; the walks over the keys do not come here.
+                    backlog::count_write();
                     backlog::write(idx, key, vec, &metric, doc);
                 }
             }

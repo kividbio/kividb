@@ -2526,7 +2526,12 @@ fn one_owner(nodes: &[&Node], owner: &Node, key: &str) -> Result<(), String> {
 /// Wait until [`one_owner`] holds; on a timeout, say how it did not and
 /// show the logs of `nodes`.
 fn wait_one_owner(nodes: &[&Node], owner: &Node, key: &str) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    wait_one_owner_within(nodes, owner, key, Duration::from_secs(30));
+}
+
+/// [`wait_one_owner`], for up to `limit`.
+fn wait_one_owner_within(nodes: &[&Node], owner: &Node, key: &str, limit: Duration) {
+    let deadline = Instant::now() + limit;
     loop {
         let seen = one_owner(nodes, owner, key);
         let Err(why) = seen else {
@@ -2537,7 +2542,11 @@ fn wait_one_owner(nodes: &[&Node], owner: &Node, key: &str) {
                 .iter()
                 .map(|n| format!("==== node {}\n{}", n.port, n.log()))
                 .collect();
-            panic!("no single owner after 30 s: {why}\n{}", logs.join("\n"));
+            panic!(
+                "no single owner after {} s: {why}\n{}",
+                limit.as_secs(),
+                logs.join("\n")
+            );
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -3174,10 +3183,23 @@ fn as_before_they_joined(node: &Node, gone: &[String], to: &str) {
 /// the node's view; two of seven is not, and it does not complete the
 /// promotion. Once the partition heals, every node has the one elected as
 /// the one owner.
+///
+/// The partition stalls the buses of five nodes for longer than a node
+/// timeout, and the heal wakes them together: until each has heard from the
+/// others again it holds them as unreachable, and between them they can
+/// mark the one elected FAIL for a moment, longer on a busy machine. The
+/// restarted node, which follows the one elected from then on, could be
+/// elected in its place then. So its own bus is stalled through the heal,
+/// until the others agree on the owner; then it runs, and follows it.
 #[test]
 fn a_node_whose_nodes_conf_lists_fewer_masters_counts_the_reported_ones() {
     let (mut nodes, ranges) = form_cluster_with_env(7, &[BUS_CONTROL, IGNORE_CLAIMS]);
-    let mut replica = replica_whose_saves_can_fail(&nodes, &nodes[0]);
+    let mut replica = add_replica_with(
+        &nodes,
+        &nodes[0],
+        &["--aof", "--appendfsync", "always"],
+        &[FAILING_SAVES, BUS_CONTROL],
+    );
     let other = add_replica_with_env(&nodes, &nodes[0], &[BUS_CONTROL]);
     let mut all: Vec<&Node> = nodes.iter().collect();
     all.extend([&replica, &other]);
@@ -3289,6 +3311,11 @@ fn a_node_whose_nodes_conf_lists_fewer_masters_counts_the_reported_ones() {
     assert!(!replica.is_master());
     assert!(!replica.log().contains("Completing the promotion"));
 
+    // The heal, the restarted node's bus stalled through it (see above).
+    set_bus(&replica, "stall");
+    wait_until("the bus to stall", Duration::from_secs(10), || {
+        replica.log().contains("the bus is stalled")
+    });
     for node in nodes[3..].iter().chain([&other]) {
         set_bus(node, "run");
     }
@@ -3296,13 +3323,20 @@ fn a_node_whose_nodes_conf_lists_fewer_masters_counts_the_reported_ones() {
         std::fs::remove_file(node.dir.join(IGNORE_CLAIMS.1)).unwrap();
     }
     let mut live: Vec<&Node> = nodes[1..].iter().collect();
-    live.extend([&replica, &other]);
-    wait_one_owner(&live, &other, &before);
+    live.push(&other);
+    wait_one_owner_within(&live, &other, &before, Duration::from_secs(90));
+    set_bus(&replica, "run");
+    wait_until("the bus to run again", Duration::from_secs(10), || {
+        replica.log().contains("the bus runs again")
+    });
+    live.push(&replica);
+    wait_one_owner_within(&live, &other, &before, Duration::from_secs(90));
     wait_until(
         "the restarted node to follow the one elected",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         || !replica.is_master() && replica.my_row()[3] == other_id,
     );
+    assert!(!replica.log().contains("Completing the promotion"));
 }
 
 /// Between the slots taken and the replication layer made master (held
@@ -9301,7 +9335,7 @@ fn a_transaction_waiting_for_a_script_during_a_slot_handoff_runs_whole_or_not_at
 #[test]
 fn a_script_waiting_out_a_slot_handoff_holds_back_no_other_replies() {
     for model in io_models() {
-        let (slowest, waiting) = script_waiting_out_a_slot_handoff_on(model);
+        let (slowest, waiting) = script_waiting_out_a_slot_handoff_on(model, false);
         eprintln!("{model}: slowest probe while the script waited: {slowest:?}");
         assert!(
             waiting || slowest >= Duration::from_millis(200),
@@ -9314,15 +9348,36 @@ fn a_script_waiting_out_a_slot_handoff_holds_back_no_other_replies() {
     }
 }
 
+/// The same for a script seen to be quick, which runs alone in a run of the
+/// thread that has the turn (`command_gate::for_a_run`, #880): the gate the
+/// run keeps closed between scripts is open while it is held before its
+/// gates and while it waits the handoff out.
+#[cfg(feature = "lua")]
+#[test]
+fn a_quick_script_waiting_out_a_slot_handoff_holds_back_no_other_replies() {
+    for model in io_models() {
+        let (slowest, waiting) = script_waiting_out_a_slot_handoff_on(model, true);
+        eprintln!("{model}: slowest probe while the quick script waited: {slowest:?}");
+        assert!(
+            waiting || slowest >= Duration::from_millis(200),
+            "{model}: the script did not wait"
+        );
+        assert!(
+            slowest < Duration::from_millis(200),
+            "{model}: a probe waited {slowest:?} while the script waited out the handoff"
+        );
+    }
+}
+
 /// [`a_script_waiting_out_a_slot_handoff_holds_back_no_other_replies`] on
-/// `model`: the longest a probe of another thread waited for a `GET` while
+/// `model`, of a script seen to be `quick` first or not: the longest a probe of another thread waited for a `GET` while
 /// the script waited the handoff out, and whether it was still waiting once
 /// every probe had been answered. The import is held before writes are
 /// paused (`handoff-pausing`), the script once it is routed (`routed`),
 /// and the destination's `TAKEOVER` waits 3 s, so the handoff holds writes
 /// when the script reaches its gates, and for long after.
 #[cfg(feature = "lua")]
-fn script_waiting_out_a_slot_handoff_on(model: &str) -> (Duration, bool) {
+fn script_waiting_out_a_slot_handoff_on(model: &str, quick: bool) -> (Duration, bool) {
     let key = key_in(0..=1000, "handoff-script");
     let env = [
         ("KIVIDB_TEST_FAILPOINTS", "routed,handoff-pausing"),
@@ -9346,6 +9401,14 @@ fn script_waiting_out_a_slot_handoff_on(model: &str) -> (Duration, bool) {
     assert!(set.join().unwrap().is_ok());
     let staying = key_in(1001..=ranges[0].1, "probe");
     assert!(src.conn().cmd(&["SET", &staying, "p"]).is_ok());
+    let body = "return redis.call('SET', KEYS[1], ARGV[1])";
+    if quick {
+        // Run on another key until it runs inline: seen to be quick.
+        let mut c = src.conn();
+        for _ in 0..4 {
+            assert!(c.cmd(&["EVAL", body, "1", &staying, "p"]).is_ok());
+        }
+    }
 
     let task_id = dst
         .conn()
@@ -9360,13 +9423,7 @@ fn script_waiting_out_a_slot_handoff_on(model: &str) -> (Duration, bool) {
     let script = patient_commands_in_background(
         src.port,
         Duration::from_secs(30),
-        &[&[
-            "EVAL",
-            "return redis.call('SET', KEYS[1], ARGV[1])",
-            "1",
-            &key,
-            "6",
-        ]],
+        &[&["EVAL", body, "1", &key, "6"]],
     );
     let held = routed_and_held(src, 2);
     // Connections that answer while the script is held at `routed`: on
@@ -9627,6 +9684,304 @@ fn a_script_beside_others_may_not_migrate_and_one_alone_may() {
     assert_eq!(r.text(), "OK", "{r:?}");
     assert!(d.cmd(&["ASKING"]).is_ok());
     assert_eq!(d.cmd(&["GET", &plain]).text(), "w");
+}
+
+/// The error a script's command gets for a key this node does not serve.
+#[cfg(feature = "lua")]
+const NON_LOCAL: &str = "Script attempted to access a non local key in a cluster node";
+
+/// Two masters on `model`, started with `env`, and `n` keys without a hash
+/// tag (so that a script naming them runs alone) in one slot of node 0's,
+/// each set to its own name; node 0 migrating that slot to node 1, which
+/// imports it. The nodes and the keys.
+#[cfg(feature = "lua")]
+fn a_slot_migrating_on(
+    model: &str,
+    env: &[(&str, &str)],
+    prefix: &str,
+    n: usize,
+) -> (Vec<Node>, Vec<String>) {
+    let (nodes, ranges) = form_cluster_of(
+        (0..2)
+            .map(|_| Node::start_with_env(&["--io-model", model], env))
+            .collect(),
+    );
+    let slot_number = slot_of(&key_in(ranges[0].0..=ranges[0].1, prefix));
+    let keys: Vec<String> = (0..)
+        .map(|i| format!("{prefix}:{i}"))
+        .filter(|key| slot_of(key) == slot_number)
+        .take(n)
+        .collect();
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let slot = slot_number.to_string();
+    let mut s = src.conn();
+    for key in &keys {
+        assert!(s.cmd(&["SET", key, key]).is_ok());
+    }
+    let r = dst
+        .conn()
+        .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src.id()]);
+    assert!(r.is_ok(), "SETSLOT IMPORTING: {r:?}");
+    let r = s.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst.id()]);
+    assert!(r.is_ok(), "SETSLOT MIGRATING: {r:?}");
+    (nodes, keys)
+}
+
+/// The end of the move [`a_slot_migrating_on`] began: the keys of the slot
+/// still on node 0 are migrated to node 1, and the slot is node 1's on
+/// both. `hit`: which time node 0 reaches the failpoint
+/// `migrate-before-delete`, when it was started with it.
+#[cfg(feature = "lua")]
+fn finish_the_move(nodes: &[Node], slot: u16, hit: Option<u32>) {
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let slot = slot.to_string();
+    let left = src.conn().cmd(&["CLUSTER", "GETKEYSINSLOT", &slot, "100"]);
+    let left: Vec<String> = left.array().iter().map(Resp::text).collect();
+    if !left.is_empty() {
+        let mut args: Vec<String> = ["MIGRATE", "127.0.0.1", &dst.port.to_string(), "", "0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        args.extend(["5000".to_string(), "KEYS".to_string()]);
+        args.extend(left);
+        let r = match hit {
+            Some(hit) => migrate_with_writes_meanwhile(src, &args, hit, || {}),
+            None => {
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                src.conn().cmd(&refs)
+            }
+        };
+        assert!(r.is_ok(), "MIGRATE of the rest: {r:?}");
+    }
+    for node in [dst, src] {
+        let r = node
+            .conn()
+            .cmd(&["CLUSTER", "SETSLOT", &slot, "NODE", &dst.id()]);
+        assert!(r.is_ok(), "SETSLOT NODE: {r:?}");
+    }
+}
+
+/// A script that runs alone and deletes a key it did not declare while a
+/// `MIGRATE` of that key is on the wire is refused with `TRYAGAIN`: what
+/// the script is told it deleted stays deleted once the slot has moved,
+/// and the key moves whole otherwise. On both I/O models.
+#[cfg(feature = "lua")]
+#[test]
+fn a_scripts_delete_during_a_migrate_stays_deleted() {
+    for model in io_models() {
+        let env = [("KIVIDB_TEST_FAILPOINTS", "migrate-before-delete")];
+        let (nodes, keys) = a_slot_migrating_on(model, &env, "sdel", 2);
+        let (src, dst) = (&nodes[0], &nodes[1]);
+        let (declared, moving) = (&keys[0], &keys[1]);
+        let args: Vec<String> = [
+            "MIGRATE",
+            "127.0.0.1",
+            &dst.port.to_string(),
+            moving,
+            "0",
+            "5000",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // With io_uring, the worker that runs the `MIGRATE` serves no other
+        // connection while it is held at the failpoint. So, while it is
+        // held, connections are made until one answers a `PING`: that one
+        // is on another worker, and the script is sent on it.
+        let mut during: Vec<Resp> = Vec::new();
+        let mut on_the_held_worker: Vec<Conn> = Vec::new();
+        let migrated = migrate_with_writes_meanwhile(src, &args, 1, || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut free = None;
+            while free.is_none() && on_the_held_worker.len() < 64 && Instant::now() < deadline {
+                let mut c = src.conn();
+                c.stream
+                    .set_read_timeout(Some(Duration::from_millis(300)))
+                    .unwrap();
+                c.stream.write_all(b"*1\r\n$4\r\nPING\r\n").unwrap();
+                match c.read() {
+                    Ok(pong) => {
+                        assert_eq!(pong.text(), "PONG", "{model}");
+                        c.stream
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        free = Some(c);
+                    }
+                    Err(_) => on_the_held_worker.push(c),
+                }
+            }
+            if let Some(mut c) = free {
+                during.push(c.cmd(&[
+                    "EVAL",
+                    "return redis.call('DEL', ARGV[1])",
+                    "1",
+                    declared,
+                    moving,
+                ]));
+            }
+        });
+        drop(on_the_held_worker);
+        finish_the_move(&nodes, slot_of(declared), Some(2));
+        let mut d = dst.conn();
+        if during.contains(&Resp::Int(1)) {
+            let now = d.cmd(&["GET", moving]);
+            assert!(
+                matches!(now, Resp::Nil),
+                "{model}: the script was told the key was deleted, and the owner has {now:?} \
+                 (MIGRATE: {migrated:?})"
+            );
+        }
+        assert!(
+            !during.is_empty(),
+            "{model}: no connection was served while the MIGRATE was held"
+        );
+        for deleted in &during {
+            assert!(
+                deleted.err().is_some_and(|e| e.contains("TRYAGAIN")),
+                "{model}: the script's DEL during the MIGRATE: {deleted:?}"
+            );
+        }
+        assert!(migrated.is_ok(), "{model}: MIGRATE: {migrated:?}");
+        assert_eq!(d.cmd(&["GET", moving]).text(), *moving, "{model}");
+        assert_eq!(d.cmd(&["GET", declared]).text(), *declared, "{model}");
+    }
+}
+
+/// While its slot migrates, a script's command on a key it did not declare
+/// is routed as a client's would be: on a key that has left already it is
+/// refused with Redis's error, read or write, and makes nothing here; on a
+/// key still here it is served. The slot then moves whole. On both I/O
+/// models.
+#[cfg(feature = "lua")]
+#[test]
+fn a_scripts_command_on_an_undeclared_key_that_left_is_refused() {
+    for model in io_models() {
+        let (nodes, keys) = a_slot_migrating_on(model, &[], "sleft", 3);
+        let (src, dst) = (&nodes[0], &nodes[1]);
+        let (declared, here, left) = (&keys[0], &keys[1], &keys[2]);
+        let slot = slot_of(declared);
+        let port = dst.port.to_string();
+        let mut s = src.conn();
+        let r = s.cmd(&["MIGRATE", "127.0.0.1", &port, left, "0", "5000"]);
+        assert!(r.is_ok(), "{model}: MIGRATE: {r:?}");
+        for script in [
+            "return redis.call('SET', ARGV[1], 'made here')",
+            "return redis.call('GET', ARGV[1])",
+        ] {
+            let r = s.cmd(&["EVAL", script, "1", declared, left]);
+            assert!(
+                r.err().is_some_and(|e| e.contains(NON_LOCAL)),
+                "{model}: {script}: {r:?}"
+            );
+        }
+        assert_eq!(
+            s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot.to_string()])
+                .int(),
+            2,
+            "{model}: nothing is made here for the key that left"
+        );
+        let r = s.cmd(&[
+            "EVAL",
+            "return redis.call('GET', ARGV[1])",
+            "1",
+            declared,
+            here,
+        ]);
+        assert_eq!(r.text(), *here, "{model}");
+        finish_the_move(&nodes, slot, None);
+        let mut d = dst.conn();
+        for key in &keys {
+            assert_eq!(d.cmd(&["GET", key]).text(), *key, "{model}");
+        }
+    }
+}
+
+/// On the node importing a slot, a script sent with `ASKING` may not run a
+/// command over keys it did not declare of which some have arrived and
+/// others not: it is refused, as a client's would be, and changes nothing.
+/// One over keys that have all arrived is served. On both I/O models.
+#[cfg(feature = "lua")]
+#[test]
+fn a_scripts_command_over_undeclared_keys_partly_arrived_is_refused() {
+    for model in io_models() {
+        let (nodes, keys) = a_slot_migrating_on(model, &[], "spart", 3);
+        let (src, dst) = (&nodes[0], &nodes[1]);
+        let (declared, arrived, not_yet) = (&keys[0], &keys[1], &keys[2]);
+        let slot = slot_of(declared);
+        let port = dst.port.to_string();
+        let r = src.conn().cmd(&[
+            "MIGRATE",
+            "127.0.0.1",
+            &port,
+            "",
+            "0",
+            "5000",
+            "KEYS",
+            declared,
+            arrived,
+        ]);
+        assert!(r.is_ok(), "{model}: MIGRATE: {r:?}");
+        let mut d = dst.conn();
+        assert!(d.cmd(&["ASKING"]).is_ok());
+        let r = d.cmd(&[
+            "EVAL",
+            "return redis.call('DEL', ARGV[1], ARGV[2])",
+            "1",
+            declared,
+            arrived,
+            not_yet,
+        ]);
+        assert!(
+            r.err().is_some_and(|e| e.contains(NON_LOCAL)),
+            "{model}: {r:?}"
+        );
+        assert_eq!(
+            d.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot.to_string()])
+                .int(),
+            2,
+            "{model}: nothing is deleted"
+        );
+        assert!(d.cmd(&["ASKING"]).is_ok());
+        let r = d.cmd(&[
+            "EVAL",
+            "return redis.call('GET', ARGV[1])",
+            "1",
+            declared,
+            arrived,
+        ]);
+        assert_eq!(r.text(), *arrived, "{model}");
+        finish_the_move(&nodes, slot, None);
+        let mut d = dst.conn();
+        for key in &keys {
+            assert_eq!(d.cmd(&["GET", key]).text(), *key, "{model}");
+        }
+    }
+}
+
+/// A script may delete a key it declared and make it again while the key's
+/// slot migrates: its declared keys were routed with it, and its commands
+/// on them are not routed again. On both I/O models.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_makes_again_a_key_it_declared_while_its_slot_migrates() {
+    for model in io_models() {
+        let (nodes, keys) = a_slot_migrating_on(model, &[], "sagain", 1);
+        let key = &keys[0];
+        let r = nodes[0].conn().cmd(&[
+            "EVAL",
+            "redis.call('DEL', KEYS[1]); redis.call('SET', KEYS[1], 'again'); \
+             return redis.call('GET', KEYS[1])",
+            "1",
+            key,
+        ]);
+        assert_eq!(r.text(), "again", "{model}: {r:?}");
+        finish_the_move(&nodes, slot_of(key), None);
+        assert_eq!(
+            nodes[1].conn().cmd(&["GET", key]).text(),
+            "again",
+            "{model}"
+        );
+    }
 }
 
 /// A command an `EVAL_RO` runs is not held at the test hook that holds a

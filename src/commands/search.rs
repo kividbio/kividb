@@ -732,6 +732,15 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     .collect(),
             ),
         );
+        // The helper threads that link them (server-wide), and how many of
+        // them take jobs now: `search-index-threads auto` changes that. After
+        // `hnsw_indexes`, so that the fields before keep their places.
+        let (threads, active) = crate::vector::backlog::threads();
+        put("hnsw_index_threads", resp_bulk_str(&threads.to_string()));
+        put(
+            "hnsw_index_threads_active",
+            resp_bulk_str(&active.to_string()),
+        );
     }
 
     Some(resp_map_for(resp, out))
@@ -2577,7 +2586,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     let nocontent = args.nocontent || args.returns.as_ref().is_some_and(|r| r.is_empty());
 
     // The fields of one hit, as (name, value).
-    let fields_of = |hit: &Hit| -> Vec<(String, Vec<u8>)> {
+    let fields_of = |hit: &Hit| -> Vec<(Vec<u8>, Vec<u8>)> {
         let shown = |source: &str, value: &[u8]| -> Vec<u8> {
             let Some((only, open, close)) = &args.highlight else {
                 return value.to_vec();
@@ -2595,10 +2604,10 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 _ => value.to_vec(),
             }
         };
-        let extras = || -> Vec<(String, Vec<u8>)> {
+        let extras = || -> Vec<(Vec<u8>, Vec<u8>)> {
             hit.extras
                 .iter()
-                .map(|(alias, value)| (alias.clone(), value.clone().into_bytes()))
+                .map(|(alias, value)| (alias.clone().into_bytes(), value.clone().into_bytes()))
                 .collect()
         };
         with_doc(db, &def, &hit.key, now, |fields, json| {
@@ -2609,7 +2618,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                         if let Some((_, value)) =
                             hit.extras.iter().find(|(alias, _)| alias == source)
                         {
-                            return Some((name.clone(), value.clone().into_bytes()));
+                            return Some((name.clone().into_bytes(), value.clone().into_bytes()));
                         }
                         // By the name the schema gives it, or as the document
                         // has it: a hash field's name, a JSON path.
@@ -2620,27 +2629,32 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                             // From the document, not from what the index reads
                             // of it: a vector comes back as the array it is.
                             Some(doc) => crate::vector::json_return_value(doc, stored)
-                                .map(|value| (name.clone(), shown(stored, &value))),
+                                .map(|value| (name.clone().into_bytes(), shown(stored, &value))),
                             None => fields
                                 .get_bytes(stored)
-                                .map(|value| (name.clone(), shown(stored, value))),
+                                .map(|value| (name.clone().into_bytes(), shown(stored, value))),
                         }
                     })
                     .collect(),
                 // A JSON document is returned whole, under `$`.
                 (None, Some(doc)) => {
                     let mut out = extras();
-                    out.push(("$".to_string(), crate::commands::json::json_bytes(doc)));
+                    out.push((b"$".to_vec(), crate::commands::json::json_bytes(doc)));
                     out
                 }
                 (None, None) => {
                     let mut out = extras();
-                    let mut stored: Vec<(&str, crate::hash_fields::Value<'_>)> =
+                    let mut stored: Vec<(&[u8], crate::hash_fields::Value<'_>)> =
                         fields.iter().collect();
                     stored.sort_by(|a, b| a.0.cmp(b.0));
                     for (name, value) in stored {
-                        if !hit.extras.iter().any(|(alias, _)| alias == name) {
-                            out.push((name.to_string(), shown(name, &value)));
+                        if !hit.extras.iter().any(|(alias, _)| alias.as_bytes() == name) {
+                            // Highlighted by the schema's name, which is text.
+                            let value = match std::str::from_utf8(name) {
+                                Ok(text) => shown(text, &value),
+                                Err(_) => value.to_vec(),
+                            };
+                            out.push((name.to_vec(), value));
                         }
                     }
                     out
@@ -2677,7 +2691,8 @@ struct PageHit {
     key: String,
     score: f64,
     sort_key: Option<SortKey>,
-    fields: Vec<(String, Vec<u8>)>,
+    /// Names as bytes: a hash's field names are any bytes.
+    fields: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 fn resp3_score(value: f64) -> Vec<u8> {
@@ -2728,7 +2743,7 @@ fn encode_page(
                         3,
                         fields_of(hit)
                             .into_iter()
-                            .flat_map(|(name, value)| [resp_bulk_str(&name), resp_bulk(&value)])
+                            .flat_map(|(name, value)| [resp_bulk(&name), resp_bulk(&value)])
                             .collect(),
                     ));
                 }
@@ -2775,7 +2790,7 @@ fn encode_page(
             out.push(resp_array(
                 fields_of(hit)
                     .into_iter()
-                    .flat_map(|(name, value)| [resp_bulk_str(&name), resp_bulk(&value)])
+                    .flat_map(|(name, value)| [resp_bulk(&name), resp_bulk(&value)])
                     .collect(),
             ));
         }
@@ -2926,7 +2941,11 @@ fn coordinate(
                     Some(Reply::Array(cells)) => cells
                         .chunks(2)
                         .filter_map(|pair| {
-                            let name = pair.first()?.text()?;
+                            // A field's name is its bytes, as the master sent it.
+                            let name = match pair.first()? {
+                                Reply::Bulk(Some(raw)) => raw.clone(),
+                                other => other.text()?.into_bytes(),
+                            };
                             match pair.get(1)? {
                                 Reply::Bulk(Some(value)) => Some((name, value.clone())),
                                 other => Some((name, other.text()?.into_bytes())),
@@ -3035,9 +3054,7 @@ mod tests {
                 inner.fields.insert(name, value);
             }
             if key == "d347:b" {
-                inner
-                    .expiries
-                    .insert("n".into(), crate::types::field_now() + 1);
+                inner.expiries.insert("n", crate::types::field_now() + 1);
             }
             crate::store::get_shard(&store[0], key).write().insert(
                 key,

@@ -316,14 +316,14 @@ fn expire_ordered(
             _ => return (Expired::default(), None),
         };
         let mut inner = hash.write();
-        let fields: Vec<String> = inner
+        let fields: Vec<Box<[u8]>> = inner
             .expiries
             .iter()
             .filter(|(_, at)| field_due(**at, now))
             .map(|(field, _)| field.clone())
             .collect();
         for field in &fields {
-            inner.evict_field(field);
+            inner.evict_field(&field[..]);
         }
         // A shrink the removals start is the background's to finish.
         crate::hash_fields::after_write_ex(&hash, &mut inner);
@@ -350,19 +350,13 @@ fn expire_ordered(
         if key_removed {
             told.propagate(db, [key]);
         } else {
-            told.propagate_fields(db, key, fields.iter().map(String::as_str));
+            told.propagate_fields(db, key, fields.iter().map(|f| &f[..]));
         }
     }
     if let Some(hub) = crate::keyspace_events::hub_for(store) {
         use crate::keyspace_events::{KS_GENERIC, KS_HASH, notify, notify_subkeys};
         notify(&hub, db, KS_HASH, "hexpired", key);
-        notify_subkeys(
-            &hub,
-            db,
-            "hexpired",
-            key,
-            fields.iter().map(|f| f.as_bytes()),
-        );
+        notify_subkeys(&hub, db, "hexpired", key, fields.iter().map(|f| &f[..]));
         if key_removed {
             notify(&hub, db, KS_GENERIC, "del", key);
         }
@@ -633,7 +627,7 @@ mod tests {
             if let Some(ttl) = ttl {
                 inner
                     .expiries
-                    .insert(name.to_string(), field_now() + ttl.as_millis() as u64);
+                    .insert(name, field_now() + ttl.as_millis() as u64);
             }
         }
         KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner)))
@@ -642,7 +636,12 @@ mod tests {
     fn fields_of(store: &Store, key: &str) -> Option<Vec<String>> {
         match crate::store::get_shard(&store[0], key).read().get(key) {
             Some(ValueRef::HashEx(hash)) => {
-                let mut names: Vec<String> = hash.read().fields.keys().map(str::to_owned).collect();
+                let mut names: Vec<String> = hash
+                    .read()
+                    .fields
+                    .keys()
+                    .map(|f| String::from_utf8(f.to_vec()).unwrap())
+                    .collect();
                 names.sort();
                 Some(names)
             }
@@ -688,7 +687,7 @@ mod tests {
         for (name, value) in &fields {
             inner.fields.insert(name, value);
         }
-        inner.expiries.insert("n".into(), field_now() + 1);
+        inner.expiries.insert("n", field_now() + 1);
         crate::store::get_shard(&store[0], key).write().insert(
             key,
             KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(inner))),
@@ -790,7 +789,7 @@ mod tests {
                     hash_at(&store, KEY)
                         .write()
                         .expiries
-                        .insert("o".into(), field_now() + 60_000);
+                        .insert("o", field_now() + 60_000);
                     track_key(&store, 0, KEY);
                 }));
             });
@@ -1184,7 +1183,7 @@ mod propagation_tests {
                 Some(ValueRef::HashEx(hash)) => Arc::clone(hash),
                 _ => panic!("{key} has no field TTLs"),
             };
-            hash.write().expiries.insert(field.to_string(), at);
+            hash.write().expiries.insert(field, at);
             super::track_key(&self.store, 0, key);
         }
 
@@ -1197,12 +1196,22 @@ mod propagation_tests {
                     .read()
                     .fields
                     .iter()
-                    .map(|(f, v)| (f.to_owned(), String::from_utf8_lossy(&v).into_owned()))
+                    .map(|(f, v)| {
+                        (
+                            String::from_utf8_lossy(f).into_owned(),
+                            String::from_utf8_lossy(&v).into_owned(),
+                        )
+                    })
                     .collect(),
                 ValueRef::Hash(hash) => hash
                     .read()
                     .iter()
-                    .map(|(f, v)| (f.to_owned(), String::from_utf8_lossy(&v).into_owned()))
+                    .map(|(f, v)| {
+                        (
+                            String::from_utf8_lossy(f).into_owned(),
+                            String::from_utf8_lossy(&v).into_owned(),
+                        )
+                    })
                     .collect(),
                 _ => return Some(Vec::new()),
             };

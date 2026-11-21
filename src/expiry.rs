@@ -146,14 +146,10 @@ impl Target {
         &self,
         db: usize,
         key: &[u8],
-        fields: impl IntoIterator<Item = &'a str>,
+        fields: impl IntoIterator<Item = &'a [u8]>,
     ) {
         let mut parts = vec![b"HDEL".to_vec(), key.to_vec()];
-        parts.extend(
-            fields
-                .into_iter()
-                .map(|f| crate::commands::helpers::name_to_bytes(f).into_owned()),
-        );
+        parts.extend(fields.into_iter().map(<[u8]>::to_vec));
         if parts.len() > 2 {
             crate::replication::replicate_expired(&self.repl_state, &self.hub_tx, db, &parts);
         }

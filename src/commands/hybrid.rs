@@ -861,6 +861,9 @@ fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
                     let Ok(value) = std::str::from_utf8(&value) else {
                         continue;
                     };
+                    // A row's names are text (`key_bytes::text_of`).
+                    let name = crate::key_bytes::text_of(name);
+                    let name: &str = &name;
                     let shown = match def.fields.iter().find(|f| json && f.name == name) {
                         Some(f) => f.attribute().to_string(),
                         None => name.to_string(),

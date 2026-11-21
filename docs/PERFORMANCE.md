@@ -198,14 +198,23 @@ Azure `Standard_D4s_v5`:
 | 10 | 118.8 | 29.6 | 24.8 | 118.8 | 37.6 | 28.0 |
 | 100 | 116.4 | 19.3 | 21.0 | 116.4 | 27.3 | 26.2 |
 | 128 | 131.7 | 19.0 | 20.4 | 131.7 | 27.0 | 24.4 |
-| 129 | 130.9 | 131.2 | 78.9 | 130.9 | 131.2 | 78.3 |
-| 1,000 | 132.5 | 132.5 | 67.8 | 132.5 | 132.5 | 68.4 |
+| 129 | 130.9 | 79.1 | 79.1 | 130.9 | 79.1 | 78.8 |
+| 1,000 | 132.5 | 76.4 | 68.0 | 132.5 | 76.4 | 68.0 |
+| 100,000 | 113.7 | 72.1 | 74.2 | 113.7 | 72.1 | 74.2 |
+| 3,000,000 | 115.9 | 71.9 | 75.2 | 115.9 | 71.9 | 75.2 |
 
 Measured a key at a time as #297 measured it (100,000 sets of 10 members of
 8 bytes, scores 0 to 9): 274 bytes of RSS a key (1.2.2: 1,249; Redis: 186),
 236 of `used_memory` (1,108; 176). What is left over Redis is mostly the
-key's own entry and the set's header. Sets past 128 members are a table and
-a tree as before; making those smaller is the next step. Suite
+key's own entry and the set's header. The rows from 129 members on are
+from an Azure `Standard_D8s_v5` (suite 31's recorded run, one set each of
+100,000 and 3,000,000): past 128 members a sorted set is a table of
+members, each member and its score in one block of the collections' pool,
+and an index of their order (a B-tree) that holds each member as the
+address of its block. Of the bytes a member at 3,000,000 (16-byte
+members), the table takes 45.7 and the index 34 when members come in
+order one `ZADD` at a time, 27 at random, 18 for a set built whole (a
+load, `RESTORE`); see `benchmarks/1.3.0/large-zsets`. Suite
 `31-zset-memory` of
 [the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
 the table again and fails a build that loses it.
@@ -315,14 +324,54 @@ path around the call (the connection loop and the script command's way to the VM
 than in the script: the call's own time (`usec_per_call`) is 0.42 µs against Redis's 0.67 for
 `return 1`, and 6.4 against 7.4 µs for Tyk's. The count hook
 behind `SCRIPT KILL` and `lua-time-limit` makes Lua 5.4 trace every instruction, 3-4 % of a
-call. And an untagged script that meets another one running is handed to the script-runner
-thread and back: with two workers busy, Tyk's script cost 9.2 µs of CPU on the runner and
-11.8 µs on the workers a call, against 12.8-13.4 µs on one worker that runs it itself; that is
-how scripts are scheduled, [#880](https://github.com/kividbio/kividb/issues/880).
+call. And an untagged script that meets another one running is queued, and run after it by
+the thread running that one (see "Scripts that run alone, beside plain commands" below).
 
 All of it was measured with a Go client (the scripts above, one command at a time per
 connection), `/proc` for the server's CPU, `INFO commandstats` for the calls, and callgrind
 for the instructions, each tree and 1.2.2 built by the same rustc.
+
+## Scripts that run alone, beside plain commands
+
+A script whose key has no hash tag runs alone: no other command runs while it does
+([SCRIPTS.md](SCRIPTS.md)). A quick one that comes while another is running is run right after
+it, by the thread running that one, in a run ([#880](https://github.com/kividbio/kividb/issues/880)):
+the first script of the run holds the other commands back where it would on its own, after its
+checks, and they stay held back for the scripts after it until 200 µs have passed since they were
+held back and the script then running has finished. They are held back once for the run, not
+once for each script. A script that has to wait (a slot handoff, a `MIGRATE` of its key) lets
+them in while it waits. `INFO stats` counts the runs (`scripts_alone_runs`) and the scripts' takes of
+the gate in them (`scripts_in_alone_runs`).
+
+Azure `Standard_D8s_v5`, server on CPUs 0-3 (`--threads 4`, io_uring), memtier_benchmark 2.6.1 on
+CPUs 4-7, 4 threads, one call at a time per connection, `--randomize --distinct-client-seed`,
+100,000 keys written again before each run; the build before #880 (master `6bcf8afa`) and the
+build with it, both `--features lua,tls` by rustc 1.100.0, run interleaved, 3 rounds of 20 s,
+medians; ops/s, p99 and p99.9 in ms:
+
+| workload, connections | before #880 | with #880 |
+|---|---:|---:|
+| Nextcloud's mix, 500 | 289k, 8.45, 17.5 | 321k, 2.45, 6.1 |
+| Nextcloud's mix, 200 | 284k, 4.38, 9.2 | 326k, 0.90, 2.4 |
+| the same mix with no script, 500 | 297k, 2.53, 5.1 | 298k, 2.53, 5.3 |
+| the same mix with no script, 200 | 307k, 0.96, 1.6 | 308k, 0.96, 1.6 |
+| Superset's mix, 500 | 97.0k, 12.0, 30.0 | 97.2k, 8.5, 12.5 |
+| compare-and-delete alone, untagged, 500 | 259k, 3.25 | 261k, 3.17 |
+| Appwrite's abuse limiter (`EVAL`), untagged, 500 | 135k, 4.13 | 133k, 4.16 |
+| compare-and-delete alone, tagged key, 500 | 326k, 1.83 | 324k, 1.82 |
+| Appwrite's limiter, tagged key, 500 | 250k, 2.27 | 249k, 2.37 |
+
+Nextcloud's mix is `GET` 40, `TTL` 15, `INCRBY` 15, `EXPIRE` 15, `EVALSHA` of its
+compare-and-delete 12 and `SETEX` 3; Superset's is `GET` 85 of 50 KB values, `SETEX` 10,
+`SET NX EX` 3 and its unlock 2. With the script, the mix's p99 is the no-script mix's (2.45
+against 2.53 ms at 500 connections, 0.90 against 0.96 at 200). A script alone runs at the rate
+it did: one thread runs such scripts one after another. A script on a tagged key runs beside
+others and is not affected. For comparison, on the same machine type in another session: Valkey
+8.1 with `--io-threads 4` ran the mix at 333k ops/s with a p99 of 2.06 ms at 500 connections
+(0.72 ms at 200) and the compare-and-delete alone at 302k/s; Redis 8.10.2 ran the mix at 142k
+(p99 6.53 ms). With the Tokio I/O loop (`--io-model tokio`, the same interleaved runs) the mix's p99 at 500
+connections goes from 8.96 to 4.67 ms, against 2.21 ms with no script, and from 3.76 to 1.52 ms
+at 200: less of a gain than on io_uring. Regression suite 42 (`benchmarks/1.3.0/regressions`) keeps these rows.
 
 ## Vector index builds
 
@@ -438,7 +487,8 @@ over 8 writer connections (3 runs each, the same load):
 So a writer on the loader's worker waits in every build; what one helper
 costs is the other connections' latency. A small server that serves while it
 loads is better off without helpers, so
-`auto` starts none below 8 CPUs (three on 8, seven on 16), and builds there
+`auto` starts none below 8 CPUs (on 8, three link while it serves, seven on 16:
+see below), and builds there
 run at 1.2's speed unless `search-index-threads` is given a number.
 
 Under a CPU quota there are no helpers. In a container with `--cpus 2` on
@@ -452,11 +502,69 @@ was spent. With `--cpus 4`, two helpers: 147-150k at 0.32-0.35 ms against
 2,390-2,410. Without helpers under the quota 1.3.0 measures as 1.2 does
 there (140-143k at 0.35 ms with `--cpus 2`, 148-150k at 0.33 ms with 4).
 
-Left: 64-d documents build at 0.62x Redis's rate. Per document the helpers
-spend 23 % more CPU than one thread linking alone (93.6 against 77.2 CPU
-seconds for 200,000): no lock shows in the profile (`search_layer` 57 %,
-the distance kernel 18 %, the kernel's futex paths about 1 %); four helpers
-and the writer share 4 cores' 8 hyperthreads and their caches.
+### More helpers while the server only loads
+
+On 8 CPUs `auto` starts seven helpers. Three link while the server serves clients.
+All seven link while it does nothing but take the writes that fill the backlogs.
+[CONFIGURATION.md](CONFIGURATION.md#search-index-threads) says how it tells the two
+apart.
+
+Measured on an Azure D8s_v5 (an Ice Lake Xeon 8370C), one client loading in `HSET`
+pipelines of 1,000, the clock running until nothing waits. The table is regression
+suite 41, one session, Redis 8.10.2 with its query engine:
+
+| documents | with three helpers | with all seven | Redis 8.10.2 |
+|---|---:|---:|---:|
+| 50,000 × 384 | 6,565 a second (1.24x Redis's time) | 7,479 (1.03x) | 7,699 |
+| 200,000 × 64 | 9,638 (1.67x) | 12,216 (1.34x) | 16,416 |
+
+Several loading connections are not taken for clients: the commands that wrote vectors,
+and an estimate of the CPU time each takes on its worker, are left out of what counts as
+serving. On a D8s_v5 with a Xeon 8573C, the documents sent over 1, 4 and 8 connections
+in `HSET` pipelines of 1,000 (2 runs each), all seven helpers linked for the whole load:
+200,000 × 64-d at 12,400-13,100, 13,500-13,600 and 13,700-13,800 documents a second,
+50,000 × 384-d at 8,000-8,200, 8,700 and 8,800.
+
+`FT.CREATE` over 100,000 64-d documents already written, and a replica's full sync of
+them, link on all seven too, but take as long as before (14.5 and 19.6 s against 14.2
+and 19.6). The walk over the keys is their limit, not the linking.
+
+At 64-d the gap left is the cost of each insert once helpers share a core's two
+hyperthreads. The 200,000 documents took 77 CPU seconds with three helpers and 118
+with seven (39 seconds of wall time with one, 20.2 with three, 16.2 with seven). The
+profile shows no lock in either:
+- `search_layer`: 55 % of the samples with three, 60 % with seven;
+- the distance kernel: 19 % with three, 13 % with seven;
+- no `parking_lot` slow path, and the kernel's futex and scheduler paths about 1 %.
+
+The extra time is spent waiting for the neighbours' vectors while the core's other
+hyperthread does the same. At the same `EF_RUNTIME`, one client's KNN q/s and recall
+off a graph built by seven helpers are those off one built by three, within the
+±10 % run-to-run spread of that client.
+
+Clients served during the load see the three helpers. Measured during a 200,000 ×
+64-d load on a D8s_v5 with a Xeon 8573C, with three helpers (`search-index-threads 3`)
+→ with `auto`, medians:
+
+| beside the load | p50 | p99 | p99.9 | build |
+|---|---:|---:|---:|---:|
+| one KNN client, plus 500 `HSET`s a second (6 runs) | 0.39 → 0.38 ms | 1.00 → 1.10 ms | 1.41 → 1.57 ms | 26.2 → 25.4 s |
+| those `HSET`s, on the connections not on the loader's worker | 0.57 → 0.57 ms | 1.58 → 1.48 ms | 2.10 → 2.05 ms | |
+| memtier GET/SET, 4 threads × 10 connections, 14,000 a second for 15 s (3 runs) | 0.055 → 0.055 ms | 12.9 → 12.9 ms | 14.5 → 14.4 ms | 22.6 → 20.9 s |
+| memtier GET/SET at 200 a second (3 runs) | 0.26 → 0.57 ms | 11.0 → 8.5 ms | 35 → 20 ms | 21.0 → 17.0 s |
+
+- In the first rows the helpers stayed at three while the clients ran: `FT.INFO`
+  sampled every 0.1 s showed 3 in every sample of the KNN runs, and in 95 % of those
+  of the memtier runs, the rest in the last 0.8 s as memtier closed its connections;
+  then 7.
+- The KNN rows are within that client's run-to-run spread either way (p99 0.80-1.25
+  ms with three helpers, 0.92-1.22 with `auto`).
+- A connection that shares the loading client's worker waits behind its pipelines,
+  with either number of helpers: the `HSET` writer did in 1 of 6 runs with three
+  helpers and 2 of 6 with `auto` (p50 12 ms), and memtier's ~13 ms p99 is those of
+  its connections that do.
+- 200 commands a second is below what counts as serving, so those clients see all
+  seven helpers: their median doubles, while their p99 falls with the shorter build.
 
 Suite `28-ft-hnsw` of
 [the regression suite](../benchmarks/1.3.0/regressions/README.md) measures

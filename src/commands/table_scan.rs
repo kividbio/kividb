@@ -1,5 +1,6 @@
-//! `HSCAN` and `SSCAN` over a hash or set held as a [`CollectionTable`]
-//! (#770, step 4 of the design on #764).
+//! `HSCAN`, `SSCAN` and `ZSCAN` over a hash, set or sorted set held as a
+//! [`CollectionTable`] (#770, step 4 of the design on #764; sorted sets
+//! since #875's storage half).
 //!
 //! The packed forms are still returned whole, as Redis returns a listpack
 //! or an intset; before the large forms were tables they went through
@@ -24,7 +25,7 @@
 //!   fields are hidden) is skipped by the caller's `hidden`: the hash is
 //!   not copied, so the cursor stays the table's own.
 
-use crate::collection_table::{CollectionTable, FieldRef, Fields, Members, Memory};
+use crate::collection_table::{CollectionTable, FieldRef, Fields, Members, Memory, Scores};
 use crate::commands::glob_redis::Glob;
 use crate::resp::write::{resp_array, resp_bulk, resp_bulk_str};
 
@@ -60,6 +61,31 @@ pub fn hscan_reply<A: Memory>(
         items.push(resp_bulk(field));
         if !no_values {
             items.push(resp_bulk(value));
+        }
+    });
+    page_reply(next, items)
+}
+
+/// The `ZSCAN` reply for a sorted set held as a table (#875): the next
+/// cursor, then the members of the page that match `pattern`, each followed
+/// by its score (as Redis writes it, a bulk string under RESP3 too) unless
+/// `no_scores`.
+pub fn zscan_reply<A: Memory>(
+    set: &CollectionTable<Scores, A>,
+    cursor: u64,
+    count: usize,
+    pattern: Option<&Glob>,
+    no_scores: bool,
+) -> Vec<u8> {
+    let mut items = Vec::new();
+    let next = set.scan_scored(cursor, count, |member, score| {
+        if pattern.is_none_or(|glob| glob.matches(member)) {
+            items.push(resp_bulk(member));
+            if !no_scores {
+                items.push(resp_bulk_str(&crate::commands::helpers::format_score(
+                    score,
+                )));
+            }
         }
     });
     page_reply(next, items)

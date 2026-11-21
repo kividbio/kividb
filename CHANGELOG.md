@@ -518,6 +518,76 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Plain commands are answered between scripts that run alone (#880).** A quick script that runs alone (its key has no hash tag, or
+  `lua-parallel-scripts no`) and comes while another one is running is run
+  right after it, by the thread running that one, in a run: the first
+  script holds the other commands back where it would on its own, after its
+  checks, and they stay held back for the scripts after it until 200 µs
+  have passed and the script then running has finished. The other commands
+  wait once for a run instead of once for each script; the script-runner
+  thread takes only the scripts left over. A script that has to wait (a
+  slot handoff, a `MIGRATE` of its key) lets the other commands in while it
+  waits. Nextcloud's mix (`GET` 40, `TTL` 15, `INCRBY` 15, `EXPIRE` 15,
+  `EVALSHA` of its compare-and-delete on a key with no tag 12, `SETEX` 3;
+  500 connections, `--threads 4` on 4 CPUs of an Azure `Standard_D8s_v5`,
+  io_uring): 321k ops/s with a p99 of 2.45 ms, against 289k at 8.45 ms for
+  the build before (the same mix with no script: 2.53 ms); at 200
+  connections the p99 is 0.90 ms, against 4.38. Each script is still alone:
+  no other command runs beside it or between two of them, and replicas and
+  the AOF get the scripts in the order they ran. `INFO stats` counts the
+  runs and the scripts' takes of the gate in them (`scripts_alone_runs`,
+  `scripts_in_alone_runs`; a script sent back to wait and run again takes
+  it twice). A script with no hash tag still runs one at a
+  time; see [docs/SCRIPTS.md](docs/SCRIPTS.md) and docs/PERFORMANCE.md.
+
+- **Hash field names are bytes in memory, and ACL key and channel patterns
+  are bytes (#510).** Last of the four steps of #437:
+  - A hash keeps a field as the bytes it was sent as, in a block and in a
+    table alike. `HSCAN MATCH` matches those bytes,
+    `hash-max-listpack-value` and `MEMORY USAGE` count them, and the field
+    events of keyspace notifications (`hexpired`, `hdel`, `hexpire`,
+    `hpersist`) carry them.
+  - KDB snapshots, `DUMP` payloads (and so `MIGRATE` and slot migration),
+    full syncs and `DEBUG DIGEST-VALUE` write a field name as 1.2 wrote it,
+    so a snapshot, an AOF, a payload or a replication stream of either
+    version reads the same on the other, byte for byte.
+  - A Redis, Valkey or KeyDB RDB file's hash fields, with their TTLs, load
+    as their bytes.
+  - `HIMPORT PREPARE` keeps a fieldset's names as their bytes, and
+    `HIMPORT SET` sends them on so.
+  - `ACL SETUSER` takes key and channel patterns (`~`, `%R~`, `%W~`, `&`,
+    in selectors too) and passwords of any bytes, and a pattern matches a
+    key's or channel's bytes exactly. `ACL LIST`, `ACL GETUSER`, `ACL LOG`'s
+    `object` and the ACL file give a pattern's own bytes, as Redis writes
+    them.
+  - The ACL file: a user name is read as written, whatever it begins with,
+    and a file written by an earlier version loads to the same users and
+    rules (a line is split at white space as before; a pattern read from
+    the file may hold a NUL). A rule word that begins with a quote is read
+    as Redis reads a quoted one (`"~app:\xff*"`), and a line that is not
+    UTF-8 is split at ASCII white space.
+  - `ACL SETUSER` refuses white space (any Unicode white space) and NUL in
+    a key or channel pattern, and white space in a user name: what it takes
+    is saved by `ACL SAVE` and reads back the same.
+  - A `RESTORE` payload or a KDB file that names one hash field twice, in
+    two spellings that stand for the same bytes, is refused.
+  - Going back to 1.2.x: an ACL file saved with a pattern that is not UTF-8
+    in it is refused by 1.2.x at startup and by its `ACL LOAD`; remove the
+    pattern (or the user) before the rollback.
+- **A script's command on a key it did not declare is routed while its
+  slot is being moved (#340).** With the script's slot `MIGRATING` or
+  `IMPORTING` on the node, such a command is routed as a client's would
+  be, and one a client would be sent elsewhere for (`-ASK`, `-MOVED`) or
+  asked to retry (`-TRYAGAIN`) fails in the script with `ERR Script
+  attempted to access a non local key in a cluster node`, as in Redis. A
+  write to an undeclared key that a `MIGRATE` is moving at that moment
+  fails with `TRYAGAIN`. The keys a script declares in `KEYS` are not
+  routed again, and a script may delete and make them again while their
+  slot moves. A script that fails part way keeps the writes of the
+  commands it ran before, as in Redis. `MIGRATE`'s `TRYAGAIN` reply names
+  a key deleted at the source while it was being moved apart from one
+  written there. A slot that is not being moved costs scripts nothing
+  more. See [docs/SCRIPTS.md](docs/SCRIPTS.md).
 - **Cluster votes tell a refused replica the newer owner, and check manual
   failovers too (#742).** A master that refuses a replica its vote because
   it knows a newer owner of slots the replica claims answers with that
@@ -886,6 +956,51 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   documents a range matches are the same either way: a test reads every
   range both ways. Regression suite `41-ft-hnsw-vs-redis` gates #760's
   cases against Redis in the same session.
+
+- **`search-index-threads auto` links on more helpers while the server only
+  loads (#760).** On 8 CPUs or more with no CPU quota, `auto` starts one
+  helper fewer than the CPUs (seven on 8). While the server serves clients,
+  (CPUs - 2) / 2 of them link, three on 8, as before. While it does nothing
+  but take the writes that fill the backlogs (a bulk load, `FT.CREATE` over
+  existing keys, a replica's full sync), all of them link.
+  - Nothing is added to the workers' loop. Every 50 ms the helper that has
+    just finished a job reads counters the server keeps anyway: commands
+    served, the process's CPU time, and the helpers' and the writes' time
+    spent linking. The vector code counts the commands that wrote vectors,
+    once each, and times one in 64 of them.
+  - The server counts as serving at 500 commands a second besides those
+    that wrote vectors, or at a CPU's worth of time besides the links and
+    those commands' own time, so several loading connections are not taken
+    for clients. The helpers drop back at the first look that finds
+    clients, and take the others in again after 200 ms without any.
+  - A replica follows the same rule.
+  - A number still starts exactly that many, all of which link.
+  - `CONFIG SET` still refuses the setting.
+  - `FT.INFO` shows `hnsw_index_threads` and `hnsw_index_threads_active`.
+
+  An Azure D8s_v5, one client loading in `HSET` pipelines of 1,000,
+  regression suite 41 in one session against Redis 8.10.2:
+  - 50,000 384-d documents: 7,479 a second against Redis's 7,699, which is
+    1.03x Redis's time (it was 6,565 against 8,152, or 1.24x).
+  - 200,000 64-d documents: 12,216 against 16,416, which is 1.34x (it was
+    9,638 against 16,096, or 1.67x). At 64-d each insert costs more once
+    helpers share a core's two hyperthreads: 118 CPU seconds with seven
+    against 77 with three.
+
+  Recall is unchanged. Peak RSS moves by at most 5 MiB.
+
+  Clients served during a 200,000 × 64-d load see the three helpers, as
+  before; medians, with three helpers (`search-index-threads 3`) → `auto`:
+  - One KNN client beside 500 `HSET`s a second (6 runs): KNN p50 0.39 →
+    0.38 ms, p99 1.00 → 1.10 ms, within that client's run-to-run spread.
+  - memtier GET/SET at about 14,000 a second from 40 connections (3 runs):
+    p50 0.055 ms either way, p99 12.9 ms either way. The p99 comes from the
+    connections that share the loading client's worker and wait behind its
+    pipelines.
+  - Clients that send fewer than 500 commands a second do not count as
+    serving, so they see all the helpers. memtier at 200 GET/SET a second:
+    p50 0.26 → 0.57 ms, p99 11.0 → 8.5 ms, build 21.0 → 17.0 s.
+  - Loads over 4 or 8 connections link on all seven helpers too.
 
 - **Writes on a master with a replication backlog and no replica no
   longer wake the replication thread one by one (#894).** A master that
@@ -1309,6 +1424,67 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `HINCRBY` 6-8 % fewer; `HGETALL` 4 % fewer (a walk of the table that
     reads only each entry's two lengths). Hashes in a block: as before.
 
+- **Large sorted sets take about a third less memory, no write moves every
+  member at once to grow, and `ZSCAN` reads only its page (#875, #825,
+  #770).** A sorted set past the block's limits (`OBJECT ENCODING`
+  `skiplist`) keeps its members in the same table as a large set or hash:
+  each member and its score in one block of the collections' slab pool
+  (`[score][length][member]`, 32 bytes for a 16-byte member), found by name
+  in one probe, its score rewritten in place when it changes. The order of
+  the members is an index that holds each one as the address of its block
+  (a block never moves: a resize moves only the table's 8-byte slots, and
+  active defrag does not move the pool's blocks), so a member's bytes are
+  kept once, where a hash table and a tree each held a 16-byte `Arc` of
+  them. The index is the B-tree the large form had, of 16-byte keys now (24
+  before), and a set built whole (a load, `RESTORE`, a full sync, a `*STORE`
+  result) has it built in one go, its nodes full. Measured on an Azure
+  D8s_v5, `used_memory` a member, before / now / Redis 8.10.2: one set of
+  3,000,000 members of 16 bytes 115.9 / 80.0 / 85.2 added in order, 105.8 /
+  72.8 / 85.2 at random, 115.9 / 63.8 / 79.1 once loaded (8-byte members
+  107.9 / 72.0 / 75.2 in order, 32-byte 131.9 / 96.0 / 107.3); 1,000,000
+  members in sets of 1,000, 16 bytes, 132.5 / 84.4 / 77.9 in order and
+  122.7 / 77.4 / 77.9 at random; Mastodon's home feeds (#825: 20,000 sets of
+  800 status ids) 121.1 / 87.9 / 79.5. Of what is left over Redis, the
+  index is the part still to shrink: 34 bytes a member when members come in
+  order one `ZADD` at a time (the B-tree's nodes half full), 27 at random,
+  18 when built whole, beside 45.7 for the table and its entries (16-byte
+  members, 3,000,000); a counted tree (#875) takes its place.
+  - The table grows and shrinks a few members a write, as a large set's; a
+    resize that the writes leave part-way is finished in the background, a
+    step at a time under the set's own lock, and the old array is freed off
+    the command path. Filling one set to 3,000,000 members one `ZADD` at a
+    time, the slowest `ZADD` took 3.1 ms (126.4 ms before, at a doubling;
+    Redis 8.10.2: 2.3 ms), the 99th percentile 0.055 ms as before.
+  - A set taken from 3,000,000 members down to 1,000 by `ZREM` keeps 0.12
+    MiB of `used_memory` (100 MiB before, its member table at its largest;
+    Redis 36 MiB), and by one `ZREMRANGEBYRANK` 0.09 MiB (0.17 before;
+    Redis 32 MiB). The pool's slabs that still hold one of the members left
+    stay with the process (RSS 58-60 MiB here; 105 and 4 MiB before), as for
+    large sets and hashes: active defrag does not move the pool's blocks.
+  - `ZSCAN` of such a set reads the table's own groups for its page, with
+    `COUNT` a hint as in Redis (a page can be shorter, or empty, before the
+    cursor comes back 0), where it read the whole set on every call: a full
+    scan of 1,000,000 members takes 1.79 / 0.44 / 0.28 s of server CPU at
+    `COUNT` 10 / 100 / 1,000 (20.2 / 20.1 / 19.7 s before; Redis 8.10.2:
+    2.24 / 0.95 / 0.68 s). The page builder is @magic-peach's (#955). A scan
+    begun before an upgrade still ends, but may miss or repeat members.
+  - `MEMORY USAGE` of a sorted set is immediate whatever `SAMPLES` says (the
+    table exact, the index estimated from its length), and eviction's
+    estimate of what a sorted set frees is an exact lower bound. Snapshots, the AOF,
+    replication, `DUMP`/`RESTORE` and `MIGRATE` are unchanged in both
+    directions with 1.2.2, and `DEBUG DIGEST-VALUE` of a set gives the
+    digest it gave before this change.
+  - Instructions per command (callgrind, the shipped build): `ZADD` of a
+    member there and `ZINCRBY` 2-5 % fewer, `ZSCORE` 1.7 % more (one probe
+    of the table), `ZREM` and `ZADD` of a new member, `ZPOPMIN` and
+    `ZRANDMEMBER` within 1 % (with a count of 10 up to 5.6 % fewer), `ZRANK`
+    level, `ZRANGE 0 9` 0.6 % more, a range from a random rank 1.7-2.6 %
+    more, `ZREMRANGEBYRANK` 1.5-3.3 % fewer, `GEOSEARCH` 2-2.4 % more (20 %
+    fewer on a block); `ZRANGEBYSCORE` 2.7-5 % more from 1,000 members on
+    (its two bounds are found in the tree as keys of their own, and a bound
+    at a member's own score reads the member's bytes through its entry).
+    Sorted sets in a block, and `GET`/`SET`, as before.
+
 - **Lists take about half the memory, short elements a fifth (#297).** A
   list's elements are kept end to end in chunks of up to 64, each element
   between two copies of its length (one byte each for an element shorter
@@ -1388,14 +1564,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fractional scores 37.6 and 27.3 (Redis 28.0 and 26.2). Ten 8-byte
   members a key, as #297 measured it, take 274 bytes of RSS a key (1,249
   before; Redis 186). Sorted sets of more than 128 members (or with a
-  member longer than 64 bytes) are unchanged: still a table and a tree,
-  at the same size as before; #825's 800-member feeds among them.
+  member longer than 64 bytes) are the large form (see the entry on large
+  sorted sets); #825's 800-member feeds among them.
   - A score that is an integer of up to 56 bits is kept in one to eight
     bytes (one up to 247), any other as the eight bytes of the float: read
     back, every score is the same float, bit for bit. A member is found by
     scanning one byte a member (a fingerprint), as in small sets and
     hashes; a rank is a position, and a range of scores a binary search.
-  - A sorted set moves to the table and the tree when a write adds a member
+  - A sorted set moves to the large form when a write adds a member
     past 128 or one longer than 64 bytes, or when one `ZADD` (or `GEOADD`)
     gives more than 128 pairs, as Redis moves a listpack to a skiplist;
     never back. A set built whole (a snapshot or AOF load, `RESTORE`,
@@ -1440,6 +1616,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   6 s instead of 13 s and gave memory back in 6 s instead of 12 s, with no
   measurable change in `GET`/`SET` p99.9 during the pass.
   Thanks @Parikalp-Bhardwaj.
+
+- **Active defrag gets back the free room inside full slabs, and starts on
+  slab waste (#240).** A slab is used for new blocks again once a quarter of
+  it is free; the free blocks of the slabs fuller than that are what a light
+  delete/refill churn, or the writes whose old values a snapshot held, leave
+  behind. Active defrag now also empties the full slabs with at least
+  `active-defrag-full-slab-free-percent` (12) of their blocks free, sparsest
+  first, from a list of full slabs each size class keeps in the slabs'
+  headers (changed only when a slab's state changes, under the class's
+  lock), and it starts when the free blocks inside the slabs are more than
+  `active-defrag-slab-waste-percent` (10) of them and more than
+  `active-defrag-slab-waste-bytes` (16 MiB), besides
+  `active-defrag-threshold-lower` and `active-defrag-ignore-bytes`. What it
+  moves goes into the room of the class's partial slabs first; a round's new
+  slabs are kept to a 128th of the slabs, or to what is left below the most
+  the slabs have taken before (up to an eighth). No pass starts until the
+  blocks in the slabs have changed by less than a 32nd of them each second
+  for 5 seconds, and a round that sees such a change ends there; the
+  slab-waste trigger waits while a snapshot, an AOF rewrite or a backup is
+  written, and after a pass that got little back or was cut short it stays
+  off for 10 s, doubling up to a minute. The defrag thread now rests after
+  every 100 us of work instead of every millisecond: with a millisecond,
+  `GET`/`SET` p99.9 during a pass was 1.2-1.3 ms where 1.2.2 had 0.6. New
+  `INFO memory` fields: `value_slab_full_free_bytes`,
+  `active_defrag_passes`, `active_defrag_slabs_emptied`,
+  `active_defrag_last_pass_ms`. Measured on an Azure D8s_v5
+  (`benchmarks/1.3.0/regressions/suites/43-slab-churn.py`), RSS 60 s after
+  three cycles of deleting and rewriting a random part of the keys, against
+  what was loaded: 1,000,000 keys of 1 KB, 10 % a cycle, 1.03x (1.2.2:
+  1.15x; Redis 8.10.2 1.00x at 1.25x KiviDB's load); 20 %, 1.05x (1.10x),
+  with the peak during the churn 1.14x where 1.2.2's own pass took it to
+  1.28x; 100-byte values 1.03x and 1.05x (1.16x and 1.15x). The peak is
+  1.2-2.1 % above the same churn with active defrag off. 2,000,000 keys of
+  1 KB under 40,000 SETs a second, 30 s after `BGSAVE`, `BGREWRITEAOF` and
+  the writes: 2,208 MiB (1.2.2: 2,367; Redis 2,584), the highest RSS through
+  them 2,564 MiB (2,861). During a pass under reads and overwrites, `GET`
+  and `SET` p99 stay at 0.49 ms, as in the seconds before it, and p99.9 is
+  0.63 and 0.67 ms (1.2.2: 0.56 and 0.85, medians of three trials); a pass
+  over 700,000 keys takes about 19 s at the default 10 % of a core. Values
+  of 100 B to 16 KB, mostly in the system allocator, are unchanged. Design
+  agreed with @Parikalp-Bhardwaj, whose measurement showed that the free
+  room a `BGSAVE` leaves is in full slabs.
 
 - **`key-access-tracking yes` costs about 1.5% of a pipelined `GET` instead
   of about 10% (#21).** The setting that keeps `OBJECT IDLETIME`, `OBJECT
@@ -2982,6 +3200,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`FT.AGGREGATE` `timefmt` carries non-ASCII literal text in the format
   through unchanged (#978).** `timefmt(@ts, "%Y年%m月%d日")` answers
   `1970年01月01日` for `ts=0`, as Redis does.
+
+- **The array commands' keyspace events name the key by its bytes.**
+  `ARSET`, `ARMSET`, `ARINSERT`, `ARRING`, `ARSEEK`, `ARDEL` and
+  `ARDELRANGE` publish their events for a key of any bytes, as every other
+  command's events do.
 
 ## [1.2.2] - 2026-11-13
 

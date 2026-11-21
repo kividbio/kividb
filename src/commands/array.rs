@@ -58,7 +58,7 @@ fn notify_array_event(ctx: &Ctx, name: &str, reply: &[u8]) {
     if KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0 || reply.starts_with(b"-") {
         return;
     }
-    let Some(key) = ctx.cmd.get(1).and_then(|k| parse_utf8(k)) else {
+    let Some(&key) = ctx.cmd.get(1) else {
         return;
     };
     let event = match name {

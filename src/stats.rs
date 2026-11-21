@@ -277,8 +277,8 @@ pub mod scripts {
         ALONE[why as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A quick script is handed to the script-runner thread: another script
-    /// was running when it came.
+    /// A quick script is queued for the thread running another script when
+    /// it came, or for the script-runner thread (`lua_vm_blocking`).
     pub fn handed_to_runner() {
         HANDED_TO_RUNNER.fetch_add(1, Ordering::Relaxed);
     }
@@ -296,6 +296,7 @@ pub mod scripts {
         }
         HANDED_TO_RUNNER.store(0, Ordering::Relaxed);
         OFFLOADED_TO_POOL.store(0, Ordering::Relaxed);
+        crate::command_gate::reset_run_counts();
     }
 
     /// The lines of `INFO stats`.
@@ -314,6 +315,12 @@ pub mod scripts {
         out.push_str(&format!(
             "scripts_offloaded_to_pool:{}\r\n",
             OFFLOADED_TO_POOL.load(Ordering::Relaxed)
+        ));
+        // The runs of quick scripts that run alone (`command_gate::for_a_run`):
+        // times the gate was closed for one, and the scripts' takes of it under those.
+        let (closes, scripts) = crate::command_gate::run_counts();
+        out.push_str(&format!(
+            "scripts_alone_runs:{closes}\r\nscripts_in_alone_runs:{scripts}\r\n"
         ));
     }
 }
@@ -367,6 +374,14 @@ pub static LAST_SAMPLE_COMMANDS: AtomicU64 = AtomicU64::new(0);
 #[inline(always)]
 pub fn record_command_processed() {
     tl_bump!(TL_COMMANDS);
+}
+
+/// Commands counted on this thread ([`record_command_processed`]): the same
+/// from a command's start to its end, one more for each command the thread
+/// starts, and 0 on a thread that has run none. `CONFIG RESETSTAT` leaves
+/// it as it is.
+pub fn commands_on_this_thread() -> u64 {
+    TL_COMMANDS.with(|mine| mine.0.load(Ordering::Relaxed))
 }
 
 /// A command counted by [`record_command_processed`] did not run after all:
