@@ -59,7 +59,11 @@ least Redis's this session less 0.01 (`vs_redis(RECALL_X)`: Redis's recall
 divided by 1.0101 is at most 0.01 below it); VSIM q/s within 15 % of the
 recorded value (the asyncio clients share the VM) and at most `QPS_X` times
 slower than Redis this session; VADD/s within 10 % and bytes per vector
-within 5 % of the recorded values. p50, p99 and graph_ready_s are shown.
+within 5 % of the recorded values, and bytes per vector at most Redis's
+this session where both servers store the same (`Q8`, `NOQUANT`); in the
+`_default` configuration they do not (Redis `Q8`, KiviDB f32), and the bytes
+are compared with the recorded value only. p50, p99 and graph_ready_s are
+shown.
 
 KiviDB runs with `--threads 4` on the suite's 8 vCPUs (`search-index-threads
 auto`: seven helpers link while the load is all the server does); Redis with
@@ -324,7 +328,9 @@ def run(ctx):
 
     ctx.emit("vadd_per_s", n / load_s, "VADD/s", "higher", gate=THROUGHPUT)
     ctx.emit("graph_ready_s", ready_s, "s", "lower", gate=info())
-    ctx.emit("bytes_per_vector", (mem1 - mem0) / n, "B", "lower", gate=MEMORY)
+    # Against Redis where both store the vectors alike.
+    bytes_gate = [MEMORY, vs_redis(1.0)] if QUANT else MEMORY
+    ctx.emit("bytes_per_vector", (mem1 - mem0) / n, "B", "lower", gate=bytes_gate)
     ctx.emit("recall_at_10", recall, "ratio", "higher", gate=[rel(2), vs_redis(RECALL_X)])
     for nconns in CLIENTS:
         qps, p50, p99 = query_cell(nconns)
