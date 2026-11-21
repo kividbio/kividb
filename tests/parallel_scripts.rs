@@ -1995,7 +1995,7 @@ fn kill_in_a_run(io: &str) {
 /// by a `FUNCTION STATS`, which a slow script of A's holds back on no other
 /// thread), and is queued. The `MIGRATE` itself waits on its own
 /// thread, so A, B and the probes are connections on the others
-/// (`free_connections`). While B waits out the `MIGRATE`, a `PING` and a
+/// (`free_connections`), and the probes on B's own thread are left out. While B waits out the `MIGRATE`, a `PING` and a
 /// `GET` on each probe are answered at once. On both I/O loops.
 #[test]
 fn a_queued_script_waiting_for_a_migrate_does_not_hold_a_worker() {
@@ -2043,6 +2043,7 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
     let mut free = free_connections(port, 32, Duration::from_secs(1));
     assert!(free.len() >= 12, "only {} connections answered", free.len());
     let probe_conns: Vec<Conn> = free.split_off(9);
+    assert!(probe_conns.len() >= 3, "{} probes", probe_conns.len());
     let candidates: Vec<Conn> = free.split_off(1);
     let mut a = free.pop().unwrap();
     // B: a connection on another thread than A's. While A's slow script
@@ -2074,6 +2075,32 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
     assert!(matches!(reply, V::Int(_)), "{reply:?}");
     let [mut b] = <[Conn; 1]>::try_from(picked)
         .unwrap_or_else(|_| panic!("no connection answered FUNCTION STATS at once"));
+    for _ in 0..4 {
+        assert_eq!(b.cmd(&["EVALSHA", &slow, "1", "b", "1"]), V::Int(1));
+    }
+    // And the probes on B's thread are left out: should B find the turn free
+    // when it comes, it runs on its own thread and waits there, as any
+    // script that is not queued waits for a `MIGRATE` of its key. Found as
+    // B's, by a slow script of B's.
+    let slow_b = slow.clone();
+    let b_slow = std::thread::spawn(move || {
+        let reply = b.cmd(&["EVALSHA", &slow_b, "1", "b", &count.to_string()]);
+        (b, reply)
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let probe_conns: Vec<Conn> = probe_conns
+        .into_iter()
+        .map(|mut p| {
+            std::thread::spawn(move || {
+                let (_, took) = timed(|| p.cmd(&["FUNCTION", "STATS"]));
+                (took < Duration::from_millis(50)).then_some(p)
+            })
+        })
+        .filter_map(|t| t.join().unwrap())
+        .collect();
+    let (mut b, reply) = b_slow.join().unwrap();
+    assert!(matches!(reply, V::Int(_)), "{reply:?}");
+    assert!(probe_conns.len() >= 2, "{} probes left", probe_conns.len());
     for _ in 0..4 {
         assert_eq!(a.cmd(&["EVALSHA", &slow, "1", "a", "1"]), V::Int(1));
     }
