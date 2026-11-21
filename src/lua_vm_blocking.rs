@@ -11,11 +11,10 @@
 //! worker, like any other command, and one run over `DEMOTE_US` there sends it back to the pool.
 //!
 //! Quick scripts that run alone take turns (`Turn`). Whoever has the turn also runs the ones that
-//! came meanwhile (`Runner::run_queued`), one after another, with the command gate closed once
-//! for them all (`command_gate::enter_alone_for_a_run`), for up to `RUN_FOR`; the script-runner
-//! thread takes the ones left when nobody else has the turn. It used to take every one of them:
-//! a fifth busy thread beside four workers on four CPUs, it waited for a CPU while it held the
-//! gate or while scripts queued for it, and the commands of every thread waited with it (#880).
+//! came meanwhile (`Runner::run_queued`), one after another, in a run (`command_gate::for_a_run`):
+//! the first of them to take the command gate alone closes it, and it stays closed for the next
+//! ones until `RUN_FOR` has passed since it was closed and the script then running has ended.
+//! The script-runner thread takes the ones left when nobody else has the turn (#880).
 
 #[cfg(feature = "lua")]
 use crate::commands::ctx::Ctx;
