@@ -1688,44 +1688,47 @@ the gain, the rate row (10 % under the recorded value) a smaller one.
 
 ## Recorded run, suite 42
 
-Recorded 2026-11-20 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C),
-`--only 42 --record`; the candidate is `b0fbbd54` (PR #986),
-`cargo build --release --features lua,tls` by rustc 1.100.0; memtier_benchmark
-2.6.1; Redis 8.10.2 from the VM image. Runs: `pr986-d8s_v5` (recorded) and
-`pr986-d8s_v5-r2` (the noise check: every gate passed, host speed 1.00x, every rate within 2 % of the recorded one). A run takes 2,460 s. The server
-has CPUs 0-3 (KiviDB `--threads 4`, Redis one thread) and memtier 4-7.
+Recorded 2026-11-21 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C),
+`--only 42 --record`; the candidate is `8458c10f` (PR #986 merged with
+master), `cargo build --release --features lua,tls` by rustc 1.100.0;
+memtier_benchmark 2.6.1; Redis 8.10.2 from the VM image. Runs: `pr986-d8s_v5`
+(recorded) and `pr986-d8s_v5-r2` (the noise check: every gate passed, host speed 1.01x, every rate within
+2 % of the recorded one). A run takes
+2,472 s. The server has CPUs 0-3 (KiviDB `--threads 4`, Redis one thread) and
+memtier 4-7.
 
 Operations a second at 200 / 500 connections, recorded run:
 
 | workload | v1.2.2 | candidate | Redis 8.10.2 | floor (x Redis) |
 |---|---:|---:|---:|---:|
-| `nextcloud` | 260,608 / 272,187 | 325,120 / 319,095 | 158,912 / 161,191 | 1.4x |
-| `nextcloud_noscript` | 313,800 / 307,952 | 313,651 / 309,392 | 166,512 / 164,780 | 1.4x |
-| `cad` | 179,052 / 182,244 | 247,627 / 256,784 | 132,336 / 135,179 | 1.4x |
-| `appwrite` | 103,252 / 101,651 | 136,216 / 135,125 | 98,347 / 100,659 | 1.0x |
-| `cad_tag` | 285,612 / 286,411 | 321,918 / 322,772 | 133,085 / 136,405 | 1.8x |
-| `appwrite_tag` | 209,881 / 214,438 | 246,280 / 249,989 | 98,074 / 100,725 | 1.8x |
-| `superset` | 110,688 / 95,281 | 111,682 / 97,081 | 56,554 / 55,560 | 1.2x |
+| `nextcloud` | 245,821 / 251,151 | 323,553 / 313,767 | 159,944 / 154,613 | 1.4x |
+| `nextcloud_noscript` | 298,827 / 291,798 | 305,409 / 291,432 | 161,604 / 161,930 | 1.4x |
+| `cad` | 178,498 / 181,501 | 247,935 / 258,536 | 132,509 / 135,118 | 1.4x |
+| `appwrite` | 101,921 / 100,741 | 135,076 / 134,280 | 97,165 / 100,455 | 1.0x |
+| `cad_tag` | 282,562 / 283,334 | 316,963 / 318,944 | 129,865 / 130,855 | 1.8x |
+| `appwrite_tag` | 204,720 / 209,505 | 245,644 / 247,389 | 96,278 / 96,450 | 1.8x |
+| `superset` | 106,061 / 92,990 | 111,666 / 96,888 | 54,803 / 53,659 | 1.2x |
 
 p99, ms at 200 / 500 connections:
 
 | workload | v1.2.2 | candidate | Redis 8.10.2 |
 |---|---:|---:|---:|
-| `nextcloud` (gated) | 5.21 / 10.81 | 0.967 / 2.69 | 2.45 / 5.89 |
-| `nextcloud_noscript` | 0.943 / 2.43 | 0.943 / 2.48 | 2.35 / 5.82 |
-| `superset` (gated) | 5.86 / 13.05 | 2.75 / 8.83 | 6.72 / 14.78 |
+| `nextcloud` (gated) | 5.70 / 12.03 | 0.887 / 2.46 | 2.43 / 6.01 |
+| `nextcloud_noscript` | 0.983 / 2.58 | 0.967 / 2.58 | 2.42 / 5.92 |
+| `superset` (gated) | 5.92 / 9.98 | 2.67 / 8.51 | 6.91 / 15.10 |
 
-`nextcloud_p99_over_noscript`: 1.03 / 1.08 for the candidate (gate 2.0),
-5.53 / 4.45 for v1.2.2. Before #880 master measured 4.4 / 8.6 ms for the
-mix's p99 on the same machine type (4.7x / 3.5x its no-script mix), which
-fails the gate; v1.2.2's rows here fail it too. Valkey 8.1 with
-`--io-threads 4`, measured in the same harness outside the suite, gives
-0.72 / 2.06 ms for the mix and 0.73 / 1.97 ms with no script (see PR #986).
+`nextcloud_p99_over_noscript`: 0.92 / 0.96 for the candidate (gate 2.0),
+5.79 / 4.67 for v1.2.2. Master before #880 (`6bcf8afa`), run interleaved
+with the PR on the same machine type (docs/PERFORMANCE.md), had a p99 of 4.38
+/ 8.45 ms for the mix, 4.6x / 3.3x its no-script mix: it fails the gate, as
+v1.2.2 does here. Valkey 8.1 with `--io-threads 4`, measured in the same
+harness outside the suite in another session, gives 0.72 / 2.06 ms for the
+mix and 0.73 / 1.97 ms with no script.
 
 Every run had no error reply. MONITOR showed one key of the workload's form
 in each call's KEYS, with its ARGV, and more than 90 % distinct keys.
 Compare-and-delete deleted the key in about a third of the mix's calls.
-Alone it deleted about 4 %: once a key is deleted, later calls on it miss.
+Alone it deleted about 2.5 %: once a key is deleted, later calls on it miss.
 
 This suite declares `min_cpus=8`: run it on a Standard_D8s_v5 with
 `run-all.sh --candidate <bin> --candidate-full <bin> --min-cpus-only --label

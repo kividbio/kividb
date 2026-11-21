@@ -65,8 +65,8 @@ Gates (the candidate):
   * nextcloud's p99 at most 2x nextcloud_noscript's in the same session
     (`nextcloud_p99_over_noscript`, a ratio: never scaled).
   * nextcloud's and superset's p99 at most 0.75x Redis's in the same session
-    (Redis runs every command on one thread; before #880 the candidate's
-    nextcloud p99 was 1.3x Redis's at 500 connections and 1.6x at 200), and
+    (Redis runs every command on one thread; the build before #880 had a
+    nextcloud p99 of 1.4x Redis's at 500 connections and 1.8x at 200), and
     within 50 % (or 1 ms) of recorded (`jitter`: not scaled by host speed).
   * ops/s at least FLOORS times Redis's in the same session, and THROUGHPUT
     against the recorded candidate, for every workload.
@@ -109,9 +109,9 @@ APPWRITE = ("local c = tonumber(redis.call('GET', KEYS[1]) or '0') or 0\n"
 LIMIT, WINDOW = "100000000", "3600"
 
 # ops/s at least this many times Redis's: recorded (4 workers on a
-# Standard_D8s_v5, Redis 8.10.2 from the VM image) nextcloud and its no-script
-# mix 1.9-2.0x, cad 1.9x, appwrite 1.3-1.4x, the tagged ones 2.4-2.5x,
-# superset 1.75-2.0x; the floors are about 70 % of that, rounded down.
+# Standard_D8s_v5, Redis 8.10.2 from the VM image) nextcloud 2.0x, its no-script
+# mix 1.8-1.9x, cad 1.9x, appwrite 1.3-1.4x, the tagged ones 2.4-2.6x,
+# superset 1.8-2.0x; the floors are about 70 % of that, rounded down.
 FLOORS = {"nextcloud": 1.4, "nextcloud_noscript": 1.4, "cad": 1.4, "appwrite": 1.0,
           "cad_tag": 1.8, "appwrite_tag": 1.8, "superset": 1.2}
 # nextcloud's p99: at most this many times Redis's, and this many times the
