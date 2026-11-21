@@ -1621,39 +1621,43 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   slab waste (#240).** A slab is used for new blocks again once a quarter of
   it is free; the free blocks of the slabs fuller than that are what a light
   delete/refill churn, or the writes whose old values a snapshot held, leave
-  behind. Active defrag now also empties the full slabs with at least `active-defrag-full-slab-free-percent`
-  (12) of their blocks free, sparsest first, from a list of full slabs each
-  size class keeps in the slabs' headers (changed only when a slab's state
-  changes, under the class's lock), and it starts when the free room inside
-  the slabs is more than `active-defrag-slab-waste-percent` (10) of them and
-  more than `active-defrag-slab-waste-bytes` (16 MiB), besides
+  behind. Active defrag now also empties the full slabs with at least
+  `active-defrag-full-slab-free-percent` (12) of their blocks free, sparsest
+  first, from a list of full slabs each size class keeps in the slabs'
+  headers (changed only when a slab's state changes, under the class's
+  lock), and it starts when the free blocks inside the slabs are more than
+  `active-defrag-slab-waste-percent` (10) of them and more than
+  `active-defrag-slab-waste-bytes` (16 MiB), besides
   `active-defrag-threshold-lower` and `active-defrag-ignore-bytes`. What it
   moves goes into the room of the class's partial slabs first; a round's new
   slabs are kept to a 128th of the slabs, or to what is left below the most
-  the slabs have taken before (up to an eighth); no pass starts until the values in
-  the slabs have changed by less than a 32nd of them each second for 5
-  seconds, a round ends when a large delete or its refill starts, and no
-  pass starts while a snapshot, an AOF rewrite or a backup is written. A pass the
-  slab-waste trigger started that got little back keeps that trigger off
-  for 10 s, doubling up to a minute. New `INFO memory` fields:
-  `value_slab_full_free_bytes`, `active_defrag_passes`,
-  `active_defrag_slabs_emptied`, `active_defrag_last_pass_ms`. Measured on
-  an Azure D8s_v5 (`benchmarks/1.3.0/regressions/suites/43-slab-churn.py`),
-  RSS 60 s after three cycles of deleting and rewriting a random part of
-  the keys, against what was loaded: 1,000,000 keys of 1 KB, 10 % a cycle,
-  1.03x (1.15x before; Redis 8.10.2 1.00x at 1.25x KiviDB's load); 20 %,
-  1.03x (1.10x), and the peak during the churn 1.14x where it was 1.28x
-  (1.14x with active defrag off); 100-byte values 1.05x (1.16x). The peak
-  stays within 0.8 % of active defrag off. 2,000,000 keys of 1 KB under
-  40,000 SETs a second, 30 s after `BGSAVE`, `BGREWRITEAOF` and the writes:
-  2,239-2,277 MiB (2,292 before, Redis 2,584), and the highest RSS through
-  them 2,565 MiB (2,859). `GET`/`SET` p99 during a pass under reads and
-  overwrites stays as it is (0.50-0.52 ms, as in the seconds before it;
-  master 0.50-0.64 ms during its own pass); a pass over 700,000 keys takes
-  about 20 s at the default 10 % of a core. Values of 100 B to 16 KB, mostly
-  in the system allocator, are unchanged. Design agreed with @Parikalp-Bhardwaj,
-  whose measurement showed that the free room a `BGSAVE` leaves is in full
-  slabs.
+  the slabs have taken before (up to an eighth). No pass starts until the
+  blocks in the slabs have changed by less than a 32nd of them each second
+  for 5 seconds, and a round that sees such a change ends there; the
+  slab-waste trigger waits while a snapshot, an AOF rewrite or a backup is
+  written, and after a pass that got little back or was cut short it stays
+  off for 10 s, doubling up to a minute. The defrag thread now rests after
+  every 100 us of work instead of every millisecond: with a millisecond,
+  `GET`/`SET` p99.9 during a pass was 1.2-1.3 ms where 1.2.2 had 0.6. New
+  `INFO memory` fields: `value_slab_full_free_bytes`,
+  `active_defrag_passes`, `active_defrag_slabs_emptied`,
+  `active_defrag_last_pass_ms`. Measured on an Azure D8s_v5
+  (`benchmarks/1.3.0/regressions/suites/43-slab-churn.py`), RSS 60 s after
+  three cycles of deleting and rewriting a random part of the keys, against
+  what was loaded: 1,000,000 keys of 1 KB, 10 % a cycle, 1.03x (1.2.2:
+  1.15x; Redis 8.10.2 1.00x at 1.25x KiviDB's load); 20 %, 1.05x (1.10x),
+  with the peak during the churn 1.14x where 1.2.2's own pass took it to
+  1.28x; 100-byte values 1.03x and 1.05x (1.16x and 1.15x). The peak is
+  1.2-2.1 % above the same churn with active defrag off. 2,000,000 keys of
+  1 KB under 40,000 SETs a second, 30 s after `BGSAVE`, `BGREWRITEAOF` and
+  the writes: 2,208 MiB (1.2.2: 2,367; Redis 2,584), the highest RSS through
+  them 2,564 MiB (2,861). During a pass under reads and overwrites, `GET`
+  and `SET` p99 stay at 0.49 ms, as in the seconds before it, and p99.9 is
+  0.63 and 0.67 ms (1.2.2: 0.56 and 0.85, medians of three trials); a pass
+  over 700,000 keys takes about 19 s at the default 10 % of a core. Values
+  of 100 B to 16 KB, mostly in the system allocator, are unchanged. Design
+  agreed with @Parikalp-Bhardwaj, whose measurement showed that the free
+  room a `BGSAVE` leaves is in full slabs.
 
 - **`key-access-tracking yes` costs about 1.5% of a pipelined `GET` instead
   of about 10% (#21).** The setting that keeps `OBJECT IDLETIME`, `OBJECT
