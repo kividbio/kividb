@@ -321,12 +321,70 @@ fn hand_over(graph: &VsetGraph, inner: &VectorSetInner, name: &[u8]) -> Option<P
     let vector = inner.entries.get(name)?.vector.as_ref()?;
     let key = key_of(name);
     let vector: Arc<[f32]> = laid_out(graph, inner, vector)?.into();
-    backlog::put_ordered(&graph.index, &key, vector, &inner.metric).map(|ticket| Pending {
-        index: Arc::downgrade(&graph.index),
-        key,
-        ticket,
-        metric: inner.metric.clone(),
-    })
+    let most = backlog::limit(vector.len());
+    let pending = backlog::put_ordered(&graph.index, &key, vector, &inner.metric).map(|ticket| {
+        Pending {
+            index: Arc::downgrade(&graph.index),
+            key,
+            ticket,
+            metric: inner.metric.clone(),
+        }
+    })?;
+    // No helper threads (`search-index-threads` 0, or `auto` below 8 CPUs):
+    // the set's own linkers take it, while the backlog has room. A write
+    // that linked its own vector would do so in its command, and the
+    // commands writing one key run one after the other: a set's writes
+    // would then be linked on one thread at a time.
+    if !backlog::helpers_running() && graph.index.backlog.len() <= most {
+        linkers::queue(pending);
+        return None;
+    }
+    Some(pending)
+}
+
+/// The threads that link a vector set's vectors when there are no helper
+/// threads: half the CPUs, at least one, at most four.
+mod linkers {
+    use super::Pending;
+    use std::collections::VecDeque;
+
+    static QUEUE: parking_lot::Mutex<VecDeque<Pending>> = parking_lot::const_mutex(VecDeque::new());
+    static READY: parking_lot::Condvar = parking_lot::Condvar::new();
+    static START: std::sync::Once = std::sync::Once::new();
+
+    pub(super) fn queue(p: Pending) {
+        START.call_once(|| {
+            use crate::cpus::BuilderExt;
+            let cpus = crate::cpus::available_parallelism().map_or(1, |n| n.get());
+            for n in 0..(cpus / 2).clamp(1, 4) {
+                let started = std::thread::Builder::new()
+                    .name(format!("vset-link-{n}"))
+                    .spawn_released(run);
+                if started.is_err() {
+                    break;
+                }
+            }
+        });
+        QUEUE.lock().push_back(p);
+        READY.notify_one();
+    }
+
+    fn run() {
+        loop {
+            let p = {
+                let mut q = QUEUE.lock();
+                loop {
+                    if let Some(p) = q.pop_front() {
+                        break p;
+                    }
+                    READY.wait(&mut q);
+                }
+            };
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.link())).is_err() {
+                crate::log_warn!("linking a vector set's vector failed");
+            }
+        }
+    }
 }
 
 /// After `name` was added to the set or given a new vector, under the set's

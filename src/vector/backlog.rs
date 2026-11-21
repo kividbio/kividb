@@ -661,6 +661,11 @@ pub fn auto_most(cpus: usize, quota: bool) -> usize {
 /// How many helpers link vectors, started once, on the first call:
 /// `search-index-threads`, or by [`auto_most`] for `auto`, of which
 /// [`auto_helpers`]'s count take jobs while the server serves.
+/// Whether helper threads link vectors (`search-index-threads`).
+pub(crate) fn helpers_running() -> bool {
+    helpers() > 0
+}
+
 fn helpers() -> usize {
     START.call_once(|| {
         // The process's CPUs: the first write may come from a worker bound

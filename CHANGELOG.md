@@ -158,8 +158,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `VADD` that makes a set, do what they do in Redis (another `M` than the
   set's is refused), and `VSIM`'s options are checked as Redis checks them.
   `VINFO` gives Redis's fields (`hnsw-m`, `size`, `max-level`,
-  `attributes-count`, ...) and `VLINKS` the element's links per layer, top
-  layer first. Writes change the graph in their own order, so an element a
+  `attributes-count`, ...; simple-string names, a map in RESP3) and `VLINKS`
+  the element's links per layer, top layer first. Two replies change as
+  Redis has them: `VLINKS ... WITHSCORES` gives each score as a double
+  (RESP3) or Redis's 17-digit string (RESP2), where it was a 6-decimal
+  string, and refuses anything after `WITHSCORES`; `VSIM ... ELE` of an
+  element the set does not hold is `ERR element not found in set` (it was
+  `ERR element not found in vector set`). Writes change the graph in their own order, so an element a
   `VADD` was answered for is found by the next `VSIM`, and a removed one
   never is. The graph is not saved: it is made again from the vectors after
   a load, `RESTORE`, `COPY` or full sync, while `VSIM` scans, so snapshots

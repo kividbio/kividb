@@ -1146,11 +1146,17 @@ fn nearest<'s>(
                 }
             };
             match hits {
-                Some(hits) => {
+                Some(mut hits) => {
                     // A quantized set's graph measures as a scan does; an
                     // f32 one's hits are measured again on their floats, as
-                    // a scan measures them. Taken after the search.
+                    // a scan measures them (taken after the search): the
+                    // nearest `2 * COUNT` of them, the graph's distance
+                    // differing from the scan's in the last bits only.
                     let reader = (!encoding.scores_exact()).then(|| graph.reader());
+                    if reader.is_some() {
+                        hits.sort_unstable_by(|a, b| a.score.total_cmp(&b.score));
+                        hits.truncate(count.saturating_mul(2));
+                    }
                     hits.iter()
                         .filter_map(|hit| {
                             let name = vset_graph::name_of(hit);
