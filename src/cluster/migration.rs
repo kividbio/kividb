@@ -3648,23 +3648,58 @@ fn take_over_now(
             .read()
             .values()
             .filter(|n| n.master_id == Some(me) && n.flags.contains(super::NodeFlags::REPLICA))
-            .map(|n| (!n.flags.contains(super::NodeFlags::FAIL), addresses(n)))
+            .map(|n| (!n.flags.contains(super::NodeFlags::FAIL), (n.id, addresses(n))))
             .partition(|(not_failed, _)| *not_failed);
-        let required: Vec<Vec<(String, u16)>> = required.into_iter().map(|(_, a)| a).collect();
+        let replicas: Vec<(super::NodeId, Vec<(String, u16)>)> = required
+            .iter()
+            .chain(if_attached.iter())
+            .map(|(_, r)| r.clone())
+            .collect();
+        let required: Vec<Vec<(String, u16)>> =
+            required.into_iter().map(|(_, (_, a))| a).collect();
         let if_attached: Vec<Vec<(String, u16)>> =
-            if_attached.into_iter().map(|(_, a)| a).collect();
+            if_attached.into_iter().map(|(_, (_, a))| a).collect();
         log_info!(
             "Cluster: Taking slots {} over once the AOF and {} replica(s) have what arrived",
             ranges_text(&task.ranges),
             required.len()
         );
-        if let Err(missing) = hooks.replica_starter.repl_state.replicas_have_all_blocking(
+        if let Err(behind) = hooks.replica_starter.repl_state.replicas_have_all_blocking(
             &required,
             &if_attached,
             deadline,
         ) {
+            let text = |addrs: &[(String, u16)]| {
+                addrs
+                    .iter()
+                    .map(|(ip, port)| format!("{ip}:{port}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let (id, addrs) = replicas
+                .get(behind.index)
+                .map(|(id, addrs)| (super::node_id_str(id).to_string(), addrs.clone()))
+                .unwrap_or_default();
+            if behind.linked == Some(false) {
+                // As a replica behind NAT, or linking from an address the
+                // cluster does not have for it, would show it.
+                log_warn!(
+                    "Cluster: no replication link to this node comes from replica {id} at any \
+                     of its addresses ({}); links are attached from: {}",
+                    text(&addrs),
+                    if behind.attached_from.is_empty() {
+                        "none".to_string()
+                    } else {
+                        text(&behind.attached_from)
+                    }
+                );
+            }
             return not_yet(&format!(
-                "this node's replica at {missing} has not acknowledged what arrived in time"
+                "this node's replica {id} at {} has not acknowledged what arrived in time",
+                addrs
+                    .first()
+                    .map(|(ip, port)| format!("{ip}:{port}"))
+                    .unwrap_or_default()
             ));
         }
     }

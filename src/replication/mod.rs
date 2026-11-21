@@ -691,8 +691,10 @@ impl ReplState {
     /// it may link from: an IP and its `REPLCONF listening-port`) has a link to
     /// this master, online, that has acknowledged everything written before
     /// now, and each one named in `if_attached` that has a link has; or
-    /// until `deadline`. The first one that has not, if one has not.
-    /// Links of other replicas neither count nor hold the wait up.
+    /// until `deadline`. If one has not: which (its index in `required`,
+    /// then in `if_attached`), whether a link matched its addresses, and the
+    /// addresses links are attached from. Links of other replicas neither
+    /// count nor hold the wait up.
     ///
     /// A hub barrier first, as `WAIT` takes one: every write handed to the
     /// hub before now has been fanned out, and each link's target is what it
@@ -704,13 +706,13 @@ impl ReplState {
         required: &[Vec<(String, u16)>],
         if_attached: &[Vec<(String, u16)>],
         deadline: std::time::Instant,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReplicaBehind> {
         let pause = || std::thread::sleep(std::time::Duration::from_millis(1));
-        let name = |addrs: &Vec<(String, u16)>| {
-            addrs
-                .first()
-                .map(|(ip, port)| format!("{ip}:{port}"))
-                .unwrap_or_default()
+        let attached_from = |links: &[(u64, String, u16)]| {
+            links
+                .iter()
+                .map(|(_, ip, port)| (ip.clone(), *port))
+                .collect::<Vec<(String, u16)>>()
         };
         if required.is_empty() && if_attached.is_empty() {
             return Ok(());
@@ -724,11 +726,11 @@ impl ReplState {
                     barrier_rx.try_recv()
                 {
                     if std::time::Instant::now() >= deadline {
-                        return Err(required
-                            .first()
-                            .or(if_attached.first())
-                            .map(name)
-                            .unwrap_or_default());
+                        return Err(ReplicaBehind {
+                            index: 0,
+                            linked: None,
+                            attached_from: attached_from(&self.replica_peers.lock()),
+                        });
                     }
                     pause();
                 }
@@ -764,18 +766,28 @@ impl ReplState {
             };
             let behind = required
                 .iter()
-                .find(|r| !links_of(r).into_iter().any(caught_up))
+                .position(|r| !links_of(r).into_iter().any(caught_up))
                 .or_else(|| {
-                    if_attached.iter().find(|r| {
-                        let ids = links_of(r);
-                        !ids.is_empty() && !ids.into_iter().any(caught_up)
-                    })
+                    if_attached
+                        .iter()
+                        .position(|r| {
+                            let ids = links_of(r);
+                            !ids.is_empty() && !ids.into_iter().any(caught_up)
+                        })
+                        .map(|i| required.len() + i)
                 });
-            let Some(behind) = behind else {
+            let Some(index) = behind else {
                 return Ok(());
             };
             if self.is_slave() || std::time::Instant::now() >= deadline {
-                return Err(name(behind));
+                let addrs = required
+                    .get(index)
+                    .or_else(|| if_attached.get(index - required.len()));
+                return Err(ReplicaBehind {
+                    index,
+                    linked: addrs.map(|a| !links_of(a).is_empty()),
+                    attached_from: attached_from(&links),
+                });
             }
             pause();
         }
@@ -2430,6 +2442,17 @@ pub enum HubMsg {
     SlotClaims {
         marker: ReplPayload,
     },
+}
+
+/// A replica [`ReplState::replicas_have_all_blocking`] did not find caught
+/// up: its index among those it was given, whether a link matched one of its
+/// addresses (`None`: not known, the wait ended before it looked), and the
+/// addresses links to this master are attached from.
+#[derive(Debug, Clone)]
+pub struct ReplicaBehind {
+    pub index: usize,
+    pub linked: Option<bool>,
+    pub attached_from: Vec<(String, u16)>,
 }
 
 /// What a replica answers a node that asks to replicate from it: KiviDB does
