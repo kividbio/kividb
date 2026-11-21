@@ -14,19 +14,24 @@
 //! holds little more than it needs, and are then all of 1024 slots: at most
 //! one block is partly empty.
 //!
-//! **Huge pages.** A block of 1,024 slots is under 2 MiB below about 1,000
-//! dimensions: in 4 KiB pages, an insert into a graph of 200,000 64-d vectors
-//! walks the page tables for most of the neighbours it measures, and a
-//! quarter of `search_layer`'s time goes to its prefetches of their vectors.
-//! On Linux such blocks are cut, back to back, from chunks of whole huge
-//! pages mapped for the graph ([`Chunk`]), and each huge page of a chunk is
-//! made one (`MADV_COLLAPSE`) once the blocks over it are all in use, which
-//! is when the block after them is made: a graph's blocks are then in huge
-//! pages but for the last one or two. Nothing is in a huge page before it is
-//! used, so a small graph takes no more memory than with blocks of its own:
-//! a block is counted in `used_memory` at its size, and the pages of a chunk
-//! no block has reached are never touched. Where huge pages are off, or the
-//! kernel cannot make one, the pages stay as they are.
+//! **Huge pages.** A block of 1,024 slots is under 2 MiB up to 464
+//! dimensions (at `M` 16): in 4 KiB pages, an insert into a graph of 200,000
+//! 64-d vectors walks the page tables for most of the neighbours it
+//! measures, and a quarter of `search_layer`'s time goes to its prefetches of
+//! their vectors. On Linux such blocks are cut, back to back, from chunks of
+//! whole huge pages mapped for the graph ([`Chunk`]). A chunk is mapped with
+//! huge pages off (`MADV_NOHUGEPAGE`), so that no fault makes one, whatever
+//! transparent huge pages are set to. Once the blocks over one of its huge
+//! pages are all in use, which is when the block after them is made, the
+//! page is handed to a thread of its own that turns huge pages on for it and
+//! makes it one (`MADV_COLLAPSE`): no command, and no insert holding its
+//! graph, waits for that. A graph's blocks are then in huge pages but for the
+//! last one or two, and nothing is in a huge page before it is used: a block
+//! is counted in `used_memory` at its size, and the pages of a chunk no block
+//! has reached are never touched. Where huge pages are set to `never`, or the
+//! kernel cannot make one, the pages stay as they are. A chunk is one
+//! mapping (two while part of it is huge pages); past [`MOST_MAPPINGS`] of
+//! them in the process, new blocks are allocated on their own.
 //!
 //! Layer-0 links are read without a lock: a writer (holding the node's own
 //! lock, [`super::HnswNode`]) stores the ids first and the count after, and a
@@ -83,19 +88,45 @@ struct Block {
 
 /// Whole huge pages mapped for one graph, from which blocks of 1,024 slots
 /// are cut back to back (see the module's comment).
+#[cfg(all(target_os = "linux", not(miri)))]
 struct Chunk {
-    base: NonNull<u8>,
-    /// Bytes mapped.
-    len: usize,
+    map: std::sync::Arc<Mapping>,
     /// Bytes cut into blocks so far.
     used: usize,
-    /// Bytes from `base` already asked to be made huge pages.
+    /// Bytes from the start already handed to be made huge pages.
     collapsed: usize,
 }
 
-// SAFETY: the mapping is only reached through `Slots`, under its `grow`
-// lock (and in `Drop`).
-unsafe impl Send for Chunk {}
+/// Elsewhere, no chunk is ever made.
+#[cfg(not(all(target_os = "linux", not(miri))))]
+struct Chunk;
+
+/// A chunk's mapping, held by its graph's `Slots` and by the collapses
+/// waiting for it ([`Collapse`]): unmapped when the last of them lets go.
+#[cfg(all(target_os = "linux", not(miri)))]
+struct Mapping {
+    base: NonNull<u8>,
+    /// Bytes mapped.
+    len: usize,
+}
+
+// SAFETY: the mapping is memory of its own, reached through the blocks cut
+// from it (whose users `Slots` governs) and by `madvise`, which never
+// changes what it holds.
+#[cfg(all(target_os = "linux", not(miri)))]
+unsafe impl Send for Mapping {}
+#[cfg(all(target_os = "linux", not(miri)))]
+unsafe impl Sync for Mapping {}
+
+#[cfg(all(target_os = "linux", not(miri)))]
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        // SAFETY: our own mapping; no block cut from it is used any more
+        // (its `Slots` is gone) and no collapse holds it.
+        unsafe { libc::munmap(self.base.as_ptr().cast(), self.len) };
+        MAPPINGS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 // The block is shared memory reached only through `Slots`, whose methods
 // say who may write what and when.
@@ -261,13 +292,16 @@ impl Slots {
         if self.blocks.count() > b {
             return;
         }
+        // Huge pages to be made of what the new blocks leave in use: handed
+        // to their own thread once the lock is let go (see `hand_collapses`).
+        let mut collapses = Vec::new();
         let mut chunks = self.grow.lock();
         while self.blocks.count() <= b {
             let next = self.blocks.count();
             let (links_at, flags_at, layout) = self.layout(block_slots(next));
             if next >= GEOMETRIC
                 && layout.align() != HUGE_PAGE
-                && let Some(base) = cut_block(&mut chunks, layout.size())
+                && let Some(base) = cut_block(&mut chunks, layout.size(), &mut collapses)
             {
                 self.blocks.push(Block {
                     base,
@@ -304,6 +338,8 @@ impl Slots {
                 in_chunk: false,
             });
         }
+        drop(chunks);
+        hand_collapses(collapses);
     }
 
     /// Whether slot `id` has been made room for.
@@ -469,9 +505,9 @@ impl Drop for Slots {
                 }
             }
         }
-        for chunk in self.grow.get_mut().drain(..) {
-            unmap_chunk(&chunk);
-        }
+        // The chunks' mappings go with the last of their holders: this, or
+        // a collapse still waiting for its thread.
+        self.grow.get_mut().clear();
     }
 }
 
@@ -479,11 +515,24 @@ impl Drop for Slots {
 const HUGE_PAGE: usize = 2 << 20;
 
 /// The most blocks a chunk holds: chunks grow no larger than about 64 MiB.
+#[cfg(all(target_os = "linux", not(miri)))]
 const CHUNK_MOST_BYTES: usize = 64 << 20;
+
+/// The most chunk mappings the process holds; past them a new block is
+/// allocated on its own, as elsewhere than Linux. A chunk is one mapping, two
+/// while only part of it is huge pages, against `vm.max_map_count` (65,530
+/// by default) for the whole process.
+#[cfg(all(target_os = "linux", not(miri)))]
+const MOST_MAPPINGS: usize = 16 * 1024;
+
+/// Chunk mappings the process holds.
+#[cfg(all(target_os = "linux", not(miri)))]
+static MAPPINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Bytes of a chunk for blocks of `block` bytes: whole huge pages, the
 /// fewest that leave at most 1/32 of them past the last block that fits
 /// (64-d: 5 blocks of 405 KiB in one huge page; 384-d: 6 of 1.6 MiB in 5).
+#[cfg(all(target_os = "linux", not(miri)))]
 fn chunk_bytes(block: usize) -> usize {
     let mut best = HUGE_PAGE.max(block.next_multiple_of(HUGE_PAGE));
     let mut pages = best / HUGE_PAGE;
@@ -498,27 +547,44 @@ fn chunk_bytes(block: usize) -> usize {
     best
 }
 
+/// Huge pages to be made of `[from, to)` of a chunk's mapping, by the
+/// collapse thread ([`hand_collapses`]).
+#[cfg(all(target_os = "linux", not(miri)))]
+struct Collapse {
+    map: std::sync::Arc<Mapping>,
+    from: usize,
+    to: usize,
+}
+
+#[cfg(not(all(target_os = "linux", not(miri))))]
+struct Collapse;
+
 /// A block of `size` bytes cut from the graph's last chunk, or from a new
-/// one: `None` where chunks are not used (not Linux) or a chunk cannot be
-/// mapped (the block is then allocated on its own). Counted in
-/// `used_memory` at `size`, as a block of its own is. The pages of the
-/// chunk that the blocks before this one cover wholly are made huge pages.
-fn cut_block(chunks: &mut Vec<Chunk>, size: usize) -> Option<NonNull<u8>> {
+/// one: `None` where chunks are not used (not Linux), the process holds
+/// [`MOST_MAPPINGS`] already, or a chunk cannot be mapped (the block is then
+/// allocated on its own). Counted in `used_memory` at `size`, as a block of
+/// its own is. The huge pages of the chunk that the blocks before this one
+/// cover wholly are added to `collapses`.
+fn cut_block(
+    chunks: &mut Vec<Chunk>,
+    size: usize,
+    collapses: &mut Vec<Collapse>,
+) -> Option<NonNull<u8>> {
     #[cfg(all(target_os = "linux", not(miri)))]
     {
-        let fits = chunks.last().is_some_and(|c| c.used + size <= c.len);
+        let fits = chunks.last().is_some_and(|c| c.used + size <= c.map.len);
         if !fits {
             // The last chunk's blocks are all in use, and no more are cut
             // from it: all of it can be made huge pages (what is left past
             // its last block is at most 1/32 of it).
             if let Some(last) = chunks.last_mut() {
-                collapse(last, last.len);
+                let len = last.map.len;
+                collapse(last, len, collapses);
             }
             let len = chunk_bytes(size);
-            let base = map_chunk(len)?;
+            let map = map_chunk(len)?;
             chunks.push(Chunk {
-                base,
-                len,
+                map: std::sync::Arc::new(map),
                 used: 0,
                 collapsed: 0,
             });
@@ -526,39 +592,109 @@ fn cut_block(chunks: &mut Vec<Chunk>, size: usize) -> Option<NonNull<u8>> {
         let chunk = chunks.last_mut()?;
         // The blocks before this one are in use.
         let at = chunk.used;
-        collapse(chunk, at);
+        collapse(chunk, at, collapses);
         chunk.used += size;
         crate::memory_use::note(size as isize);
         // SAFETY: `at + size <= len`: within the mapping.
-        Some(unsafe { chunk.base.add(at) })
+        Some(unsafe { chunk.map.base.add(at) })
     }
     #[cfg(not(all(target_os = "linux", not(miri))))]
     {
-        let _ = (chunks, size);
+        let _ = (chunks, size, collapses);
         None
     }
 }
 
-/// Ask the kernel to make the huge pages of `chunk` below `upto` bytes that
-/// have not been asked for yet into huge pages, at once (`MADV_COLLAPSE`,
-/// Linux 6.1 and later), or else later (`MADV_HUGEPAGE`, for khugepaged).
-/// A page that cannot be made one stays as it is: huge pages off, a kernel
-/// without them, or no huge page free.
+/// Note the huge pages of `chunk` below `upto` bytes that have not been
+/// noted yet, to be made huge pages ([`hand_collapses`]). Nothing where
+/// transparent huge pages are set to `never`.
 #[cfg(all(target_os = "linux", not(miri)))]
-fn collapse(chunk: &mut Chunk, upto: usize) {
+fn collapse(chunk: &mut Chunk, upto: usize, collapses: &mut Vec<Collapse>) {
     let end = (upto / HUGE_PAGE) * HUGE_PAGE;
     if end <= chunk.collapsed || !huge_pages_allowed() {
         return;
     }
-    let from = chunk.collapsed;
-    // SAFETY: `[from, end)` is within the chunk's mapping, which is ours;
-    // the advice changes how its pages are backed, never what they hold.
-    unsafe {
-        let p = chunk.base.as_ptr().add(from).cast::<libc::c_void>();
-        libc::madvise(p, end - from, libc::MADV_HUGEPAGE);
-        libc::madvise(p, end - from, MADV_COLLAPSE);
-    }
+    collapses.push(Collapse {
+        map: std::sync::Arc::clone(&chunk.map),
+        from: chunk.collapsed,
+        to: end,
+    });
     chunk.collapsed = end;
+}
+
+/// Hand `collapses` to the collapse thread, started on the first. Called
+/// with no lock held. The thread asks the kernel to make each range huge
+/// pages at once (`MADV_HUGEPAGE`, then `MADV_COLLAPSE`, Linux 6.1 and
+/// later; on an older kernel khugepaged does it later), so that no command,
+/// and no insert that holds its graph, waits for a collapse: one copies up
+/// to 2 MiB, and takes longer where the kernel first has to free a huge
+/// page. A page that cannot be made one stays as it is.
+fn hand_collapses(collapses: Vec<Collapse>) {
+    #[cfg(all(target_os = "linux", not(miri)))]
+    {
+        if collapses.is_empty() {
+            return;
+        }
+        static START: std::sync::Once = std::sync::Once::new();
+        START.call_once(|| {
+            use crate::cpus::BuilderExt;
+            let started = std::thread::Builder::new()
+                .name("hnsw-huge-pages".into())
+                .spawn_released(collapse_thread);
+            if started.is_err() {
+                COLLAPSES.lock().1 = true;
+            }
+        });
+        let mut queue = COLLAPSES.lock();
+        if queue.1 {
+            return; // no thread: the pages stay as they are
+        }
+        queue.0.extend(collapses);
+        drop(queue);
+        COLLAPSE_READY.notify_one();
+    }
+    #[cfg(not(all(target_os = "linux", not(miri))))]
+    let _ = collapses;
+}
+
+/// The collapses waiting for the collapse thread, and whether there is
+/// none (it could not be started).
+#[cfg(all(target_os = "linux", not(miri)))]
+static COLLAPSES: parking_lot::Mutex<(std::collections::VecDeque<Collapse>, bool)> =
+    parking_lot::const_mutex((std::collections::VecDeque::new(), false));
+#[cfg(all(target_os = "linux", not(miri)))]
+static COLLAPSE_READY: parking_lot::Condvar = parking_lot::Condvar::new();
+
+#[cfg(all(target_os = "linux", not(miri)))]
+fn collapse_thread() {
+    loop {
+        let job = {
+            let mut queue = COLLAPSES.lock();
+            loop {
+                if let Some(job) = queue.0.pop_front() {
+                    break job;
+                }
+                COLLAPSE_READY.wait(&mut queue);
+            }
+        };
+        // SAFETY: `[from, to)` is within the mapping, which the job holds;
+        // the advice changes how its pages are backed, never what they hold.
+        unsafe {
+            let p = job.map.base.as_ptr().add(job.from).cast::<libc::c_void>();
+            libc::madvise(p, job.to - job.from, libc::MADV_HUGEPAGE);
+            libc::madvise(p, job.to - job.from, MADV_COLLAPSE);
+        }
+        drop(job);
+    }
+}
+
+/// Tests: wait until the collapse thread has nothing left to do.
+#[cfg(all(test, target_os = "linux", not(miri)))]
+fn collapses_done() {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !COLLAPSES.lock().0.is_empty() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 /// Whether transparent huge pages are on (`always` or `madvise`), read once:
@@ -581,12 +717,20 @@ fn huge_pages_allowed() -> bool {
 const MADV_COLLAPSE: libc::c_int = 25;
 
 /// Map `len` bytes (whole huge pages) on a huge page's boundary, of
-/// zeroes: a fresh anonymous mapping, none of it touched.
+/// zeroes: a fresh anonymous mapping, none of it touched, and none of it to
+/// be made huge pages on a fault (`MADV_NOHUGEPAGE`): where they are set to
+/// `always`, the first touch of a chunk would otherwise take a whole huge
+/// page for a block of 405 KiB. Only the collapses turn huge pages on, for
+/// the pages in use. `None` once the process holds [`MOST_MAPPINGS`].
 #[cfg(all(target_os = "linux", not(miri)))]
-fn map_chunk(len: usize) -> Option<NonNull<u8>> {
+fn map_chunk(len: usize) -> Option<Mapping> {
+    if MAPPINGS.fetch_add(1, Ordering::Relaxed) >= MOST_MAPPINGS {
+        MAPPINGS.fetch_sub(1, Ordering::Relaxed);
+        return None;
+    }
     // SAFETY: an anonymous private mapping of no file; the slack before and
     // after the aligned stretch is unmapped again.
-    unsafe {
+    let base = unsafe {
         let span = len + HUGE_PAGE;
         let at = libc::mmap(
             std::ptr::null_mut(),
@@ -597,6 +741,7 @@ fn map_chunk(len: usize) -> Option<NonNull<u8>> {
             0,
         );
         if at == libc::MAP_FAILED {
+            MAPPINGS.fetch_sub(1, Ordering::Relaxed);
             return None;
         }
         let start = at as usize;
@@ -608,18 +753,16 @@ fn map_chunk(len: usize) -> Option<NonNull<u8>> {
         if tail > 0 {
             libc::munmap((aligned + len) as *mut libc::c_void, tail);
         }
+        libc::madvise(aligned as *mut libc::c_void, len, libc::MADV_NOHUGEPAGE);
         NonNull::new(aligned as *mut u8)
+    };
+    match base {
+        Some(base) => Some(Mapping { base, len }),
+        None => {
+            MAPPINGS.fetch_sub(1, Ordering::Relaxed);
+            None
+        }
     }
-}
-
-fn unmap_chunk(chunk: &Chunk) {
-    #[cfg(all(target_os = "linux", not(miri)))]
-    // SAFETY: the chunk's own mapping, no longer reached by any block.
-    unsafe {
-        libc::munmap(chunk.base.as_ptr().cast(), chunk.len);
-    }
-    #[cfg(not(all(target_os = "linux", not(miri))))]
-    let _ = chunk;
 }
 
 /// Ask the kernel to back `len` bytes at `p` with transparent huge pages.
@@ -791,12 +934,44 @@ mod tests {
                 .sum();
             assert_eq!(slots.bytes(), blocks);
             #[cfg(target_os = "linux")]
-            assert!(!slots.grow.lock().is_empty(), "{dim}-d: no chunk was used");
+            {
+                assert!(!slots.grow.lock().is_empty(), "{dim}-d: no chunk was used");
+                // The collapses run on their own thread, and change nothing
+                // the slots hold.
+                collapses_done();
+                for id in (0..n).step_by(97) {
+                    assert_eq!(slots.vector(id)[0], (id * 7) as f32);
+                }
+            }
         }
     }
 
     /// A chunk is whole huge pages, holds at least one block, and leaves at
     /// most 1/32 of itself past the blocks that fit (up to its most).
+    /// Graphs dropped while their collapses still wait: the mappings go
+    /// once the collapse thread is done with them, and every one does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_graph_dropped_before_its_collapses_lets_its_mappings_go() {
+        for _ in 0..20 {
+            let slots = Slots::new(64, 36);
+            for id in 0..12_000 {
+                slots.reserve(id);
+                unsafe { slots.write_vector(id, &[1.0; 64]) };
+            }
+            drop(slots);
+        }
+        collapses_done();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Other tests may hold chunks meanwhile; these 20 graphs held about
+        // 50 mappings each at the most.
+        while MAPPINGS.load(Ordering::Relaxed) > 200 {
+            assert!(std::time::Instant::now() < until, "mappings kept");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn chunks_are_whole_huge_pages_with_little_left_over() {
         for dim in [1, 16, 64, 100, 128, 384, 512, 768, 1000] {

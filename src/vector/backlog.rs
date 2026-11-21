@@ -848,11 +848,12 @@ static LINK_CPU_NS: Counter = Counter::new();
 /// Commands that wrote a vector: [`count_write`].
 static WRITES: Counter = Counter::new();
 
-/// A counter on a cache line of its own. These are written for every vector
+/// A counter on cache lines of its own (128 bytes, as `CachePadded`: the
+/// adjacent-line prefetcher pairs lines). These are written for every vector
 /// a write or a helper links, and must not share a line with a static that
 /// a search reads (the distance kernels' level, `simd::LEVEL`, is one): a
 /// search on another core would wait for the line after each such write.
-#[repr(align(64))]
+#[repr(align(128))]
 struct Counter(AtomicU64);
 
 impl Counter {

@@ -4006,12 +4006,18 @@ fn search_layer(
                 // only for a node the search would keep: the flag is a byte
                 // on a cache line of its own, apart from the vector asked
                 // for above, and most neighbours are farther than the worst
-                // kept. The graph is held for reading here, so no slot is
-                // filled again meanwhile, and a deleted node's slot still
-                // holds a vector: the nodes kept are those kept if the flag
-                // is read first. Read for every neighbour, the flag is the
-                // costliest load of an insert with seven helpers linking
-                // 64-d vectors.
+                // kept. Reading the vector first is safe: a deleted node's
+                // slot is filled again only under the graph's write lock
+                // (`publish`), which this search's read lock keeps out, so
+                // the slot holds a whole vector, its old one; and a new
+                // node's slot, filled under the read lock, is reached only
+                // through a link stored after its vector was written (the
+                // link count's Release, read with Acquire in `each_link`),
+                // or through the entry point, set after it. So the vector
+                // read is the node's, and the nodes kept are those kept if
+                // the flag is read first. Read for every neighbour, the
+                // flag is the costliest load of an insert with seven
+                // helpers linking 64-d vectors.
                 let nb_dist = measure.dist(query, slots.vector(nb_id as usize));
 
                 let worst = bufs
