@@ -553,6 +553,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Plain commands are answered between scripts that run alone (#880).** A quick script that runs alone (its key has no hash tag, or
+  `lua-parallel-scripts no`) and comes while another one is running is run
+  right after it, by the thread running that one, in a run: the first
+  script holds the other commands back where it would on its own, after its
+  checks, and they stay held back for the scripts after it until 200 µs
+  have passed and the script then running has finished. The other commands
+  wait once for a run instead of once for each script; the script-runner
+  thread takes only the scripts left over. A script that has to wait (a
+  slot handoff, a `MIGRATE` of its key) lets the other commands in while it
+  waits. Nextcloud's mix (`GET` 40, `TTL` 15, `INCRBY` 15, `EXPIRE` 15,
+  `EVALSHA` of its compare-and-delete on a key with no tag 12, `SETEX` 3;
+  500 connections, `--threads 4` on 4 CPUs of an Azure `Standard_D8s_v5`,
+  io_uring): 321k ops/s with a p99 of 2.45 ms, against 289k at 8.45 ms for
+  the build before (the same mix with no script: 2.53 ms); at 200
+  connections the p99 is 0.90 ms, against 4.38. Each script is still alone:
+  no other command runs beside it or between two of them, and replicas and
+  the AOF get the scripts in the order they ran. `INFO stats` counts the
+  runs and the scripts' takes of the gate in them (`scripts_alone_runs`,
+  `scripts_in_alone_runs`; a script sent back to wait and run again takes
+  it twice). A script with no hash tag still runs one at a
+  time; see [docs/SCRIPTS.md](docs/SCRIPTS.md) and docs/PERFORMANCE.md.
+
 - **Hash field names are bytes in memory, and ACL key and channel patterns
   are bytes (#510).** Last of the four steps of #437:
   - A hash keeps a field as the bytes it was sent as, in a block and in a
@@ -1483,7 +1505,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     begun before an upgrade still ends, but may miss or repeat members.
   - `MEMORY USAGE` of a sorted set is immediate whatever `SAMPLES` says (the
     table exact, the index estimated from its length), and eviction's
-    estimate of what a sorted set frees is exact. Snapshots, the AOF,
+    estimate of what a sorted set frees is an exact lower bound. Snapshots, the AOF,
     replication, `DUMP`/`RESTORE` and `MIGRATE` are unchanged in both
     directions with 1.2.2, and `DEBUG DIGEST-VALUE` of a set gives the
     digest it gave before this change.
