@@ -369,7 +369,9 @@ it did: one thread runs such scripts one after another. A script on a tagged key
 others and is not affected. For comparison, on the same machine type in another session: Valkey
 8.1 with `--io-threads 4` ran the mix at 333k ops/s with a p99 of 2.06 ms at 500 connections
 (0.72 ms at 200) and the compare-and-delete alone at 302k/s; Redis 8.10.2 ran the mix at 142k
-(p99 6.53 ms). TOKIO_LINE Regression suite 42 (`benchmarks/1.3.0/regressions`) keeps these rows.
+(p99 6.53 ms). With the Tokio I/O loop (`--io-model tokio`, the same interleaved runs) the mix's p99 at 500
+connections goes from 8.96 to 4.67 ms, against 2.21 ms with no script, and from 3.76 to 1.52 ms
+at 200: less of a gain than on io_uring. Regression suite 42 (`benchmarks/1.3.0/regressions`) keeps these rows.
 
 ## Vector index builds
 
