@@ -822,10 +822,10 @@ impl ReplState {
             };
             let of = links_of_replicas(&wanted, &links);
             let behind = (0..required.len())
-                .find(|&i| !of[i].caught_up(&caught_up))
+                .find(|&i| !of[i].caught_up(caught_up))
                 .or_else(|| {
                     (required.len()..wanted.len())
-                        .find(|&i| !of[i].ids.is_empty() && !of[i].caught_up(&caught_up))
+                        .find(|&i| !of[i].ids.is_empty() && !of[i].caught_up(caught_up))
                 });
             let Some(index) = behind else {
                 return Ok(());
