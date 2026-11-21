@@ -144,7 +144,11 @@ fn script_key(cmd: &[&[u8]]) -> Option<u64> {
 #[cfg(feature = "lua")]
 struct Job {
     env: ClientExecEnv,
-    cmd: Vec<Vec<u8>>,
+    /// The command's arguments, one after another, and where each ends: two
+    /// allocations, made on the connection's thread and freed by the thread
+    /// that runs the script, whatever the number of arguments.
+    args: Vec<u8>,
+    ends: Vec<usize>,
     db: usize,
     aof_enabled: bool,
     client_resp: u8,
@@ -162,9 +166,46 @@ fn resp_error(message: &str) -> Vec<u8> {
 
 #[cfg(feature = "lua")]
 impl Job {
+    /// A job for `cmd`, its arguments copied into one buffer.
+    fn new(
+        env: ClientExecEnv,
+        cmd: &[&[u8]],
+        db: usize,
+        aof_enabled: bool,
+        client_resp: u8,
+        key: u64,
+    ) -> Self {
+        let mut args = Vec::with_capacity(cmd.iter().map(|arg| arg.len()).sum());
+        let ends = cmd
+            .iter()
+            .map(|arg| {
+                args.extend_from_slice(arg);
+                args.len()
+            })
+            .collect();
+        Job {
+            env,
+            args,
+            ends,
+            db,
+            aof_enabled,
+            client_resp,
+            key,
+        }
+    }
+
     fn run(&self) -> Done {
         let (key, db, aof_enabled, resp) = (self.key, self.db, self.aof_enabled, self.client_resp);
-        let cmd: Vec<&[u8]> = self.cmd.iter().map(|c| c.as_slice()).collect();
+        let mut start = 0;
+        let cmd: Vec<&[u8]> = self
+            .ends
+            .iter()
+            .map(|&end| {
+                let arg = &self.args[start..end];
+                start = end;
+                arg
+            })
+            .collect();
         ran_quick(key, db, || {
             self.env.run_execute_borrowed(cmd, db, aof_enabled, resp)
         })
@@ -397,6 +438,92 @@ impl Runner {
     }
 }
 
+/// How long a connection whose script was queued looks for its reply, between
+/// turns of its thread's loop, before it waits to be woken for it.
+#[cfg(feature = "lua")]
+const LOOK_FOR: std::time::Duration = std::time::Duration::from_micros(400);
+
+/// While it looks, on an io_uring thread, how often the thread's ring is given
+/// what it has to send (see `queued_reply`).
+#[cfg(feature = "lua")]
+const SUBMIT_EVERY: std::time::Duration = std::time::Duration::from_micros(20);
+
+/// The reply to a queued script, or `None` if it will not come.
+///
+/// Looked for between turns of the thread's loop for `LOOK_FOR`, and then
+/// waited for. The thread serves its other connections meanwhile and does
+/// not sleep, so whoever runs the script sends the reply to nobody's waker
+/// and the connection finds it at its next look. Waited for with a waker, each
+/// queued script would wake its connection's thread from its sleep: a write
+/// to the thread's eventfd by the thread running the scripts, one at a time,
+/// and a task switch on the thread woken. With one script of a connection in
+/// flight at a time, and the connections on other workers, the scripts' turn
+/// would go unused while that happens (#900).
+///
+/// A look gives the other tasks of the thread their turn. On an io_uring
+/// thread their reads and writes are handed to the kernel only when the
+/// thread is about to sleep, which a task that gives its turn back does not
+/// make it do: every `SUBMIT_EVERY`, the look is a no-op on the ring instead,
+/// which does.
+///
+/// While it looks, if nobody has the turn and scripts are queued, it takes
+/// the turn and runs them, as the thread running one does after its own:
+/// sooner than the runner thread could be woken for them.
+#[cfg(feature = "lua")]
+async fn queued_reply(mut done: tokio::sync::oneshot::Receiver<Done>) -> Option<Done> {
+    use tokio::sync::oneshot::error::TryRecvError;
+    let since = std::time::Instant::now();
+    let ring = crate::deferred::on_ring_thread();
+    let mut submitted = since;
+    loop {
+        match done.try_recv() {
+            Ok(reply) => return Some(reply),
+            Err(TryRecvError::Closed) => return None,
+            Err(TryRecvError::Empty) => {}
+        }
+        if since.elapsed() >= LOOK_FOR {
+            return done.await.ok();
+        }
+        run_the_queue_if_nobody_does();
+        if ring && submitted.elapsed() >= SUBMIT_EVERY {
+            // In a task of its own, which is all the thread holds of the op
+            // across the wait: the connection's future stays `Send`.
+            let _ = tokio_uring::spawn(async {
+                let _ = tokio_uring::no_op().await;
+            })
+            .await;
+            submitted = std::time::Instant::now();
+        } else {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+/// Take the turn, if nobody has it and scripts are queued, and run them, as
+/// the thread that has run its own script does (`Runner::run_queued`, on a
+/// worker: none of them waits here for a handoff or a move of its keys).
+#[cfg(feature = "lua")]
+fn run_the_queue_if_nobody_does() {
+    use std::sync::atomic::Ordering;
+    if SCRIPT_RUNNING.load(Ordering::Relaxed)
+        || runner().waiting.load(Ordering::Relaxed) == 0
+        || crate::pause::handoff()
+        || crate::pause::keys_moving()
+    {
+        return;
+    }
+    let Some(turn) = Turn::take() else {
+        return;
+    };
+    let run = crate::command_gate::for_a_run();
+    if run.is_some() {
+        runner().run_queued(std::time::Instant::now(), true);
+    }
+    // The gate opens, and then the turn is given up.
+    drop(run);
+    drop(turn);
+}
+
 #[cfg(feature = "lua")]
 pub(crate) async fn run_lua_vm_blocking(
     cmd: &[&[u8]],
@@ -474,21 +601,15 @@ pub(crate) async fn run_lua_vm_blocking(
             // for every script, which is what made scripts slow under load.
             // So it is queued: whoever has the turn runs it before giving
             // the turn up, or the runner thread does, and this connection
-            // waits without holding its worker.
+            // waits without holding its worker (`queued_reply`).
             None => {
-                let job = Job {
-                    env: env.clone(),
-                    cmd: owned(),
-                    db: sel,
-                    aof_enabled,
-                    client_resp,
-                    key,
-                };
+                let job = Job::new(env.clone(), cmd, sel, aof_enabled, client_resp, key);
                 let (reply, done) = tokio::sync::oneshot::channel();
                 crate::stats::scripts::handed_to_runner();
                 runner().submit(job, reply);
-                done.await
-                    .unwrap_or_else(|_| (resp_error("ERR the script could not be run"), sel, 0))
+                queued_reply(done)
+                    .await
+                    .unwrap_or_else(|| (resp_error("ERR the script could not be run"), sel, 0))
             }
         };
         *selected_db = sel_out;
