@@ -14,6 +14,20 @@
 //! holds little more than it needs, and are then all of 1024 slots: at most
 //! one block is partly empty.
 //!
+//! **Huge pages.** A block of 1,024 slots is under 2 MiB below about 1,000
+//! dimensions: in 4 KiB pages, an insert into a graph of 200,000 64-d vectors
+//! walks the page tables for most of the neighbours it measures, and a
+//! quarter of `search_layer`'s time goes to its prefetches of their vectors.
+//! On Linux such blocks are cut, back to back, from chunks of whole huge
+//! pages mapped for the graph ([`Chunk`]), and each huge page of a chunk is
+//! made one (`MADV_COLLAPSE`) once the blocks over it are all in use, which
+//! is when the block after them is made: a graph's blocks are then in huge
+//! pages but for the last one or two. Nothing is in a huge page before it is
+//! used, so a small graph takes no more memory than with blocks of its own:
+//! a block is counted in `used_memory` at its size, and the pages of a chunk
+//! no block has reached are never touched. Where huge pages are off, or the
+//! kernel cannot make one, the pages stay as they are.
+//!
 //! Layer-0 links are read without a lock: a writer (holding the node's own
 //! lock, [`super::HnswNode`]) stores the ids first and the count after, and a
 //! reader that races it may see a mix of the old list and the new one. Every
@@ -63,7 +77,25 @@ struct Block {
     /// Byte offsets of the links and of the flags.
     links_at: usize,
     flags_at: usize,
+    /// Cut from a [`Chunk`] (given back with it), not allocated on its own.
+    in_chunk: bool,
 }
+
+/// Whole huge pages mapped for one graph, from which blocks of 1,024 slots
+/// are cut back to back (see the module's comment).
+struct Chunk {
+    base: NonNull<u8>,
+    /// Bytes mapped.
+    len: usize,
+    /// Bytes cut into blocks so far.
+    used: usize,
+    /// Bytes from `base` already asked to be made huge pages.
+    collapsed: usize,
+}
+
+// SAFETY: the mapping is only reached through `Slots`, under its `grow`
+// lock (and in `Drop`).
+unsafe impl Send for Chunk {}
 
 // The block is shared memory reached only through `Slots`, whose methods
 // say who may write what and when.
@@ -79,8 +111,8 @@ pub struct Slots {
     /// u32s in a links slot: the count, then up to `m0` ids.
     links: usize,
     blocks: boxcar::Vec<Block>,
-    /// Held to add a block.
-    grow: parking_lot::Mutex<()>,
+    /// Held to add a block; the chunks blocks are cut from.
+    grow: parking_lot::Mutex<Vec<Chunk>>,
     /// How a vector is laid out in its `dim` floats, and so measured.
     encoding: super::quant::Encoding,
 }
@@ -91,6 +123,36 @@ impl std::fmt::Debug for Slots {
             .field("dim", &self.dim)
             .field("capacity", &self.capacity())
             .finish()
+    }
+}
+
+/// [`Slots::measure`]: how two vectors of the slots are measured.
+#[derive(Clone, Copy)]
+pub struct Measure<'a> {
+    how: How,
+    metric: &'a super::DistanceMetric,
+    kernels: super::simd::Kernels,
+}
+
+#[derive(Clone, Copy)]
+enum How {
+    /// f32 at unit length (cosine) or as given (inner product): 1 − a·b.
+    OneMinusDot,
+    /// f32, L2: Σ (a − b)².
+    L2Sq,
+    /// A vector set's encoding.
+    Encoded(super::quant::Encoding),
+}
+
+impl Measure<'_> {
+    /// The distance between `a` and `b`, as [`Slots::dist`] gives it.
+    #[inline(always)]
+    pub fn dist(&self, a: &[f32], b: &[f32]) -> f32 {
+        match self.how {
+            How::OneMinusDot => 1.0 - self.kernels.dot(a, b),
+            How::L2Sq => self.kernels.l2_sq(a, b),
+            How::Encoded(encoding) => encoded_dist(encoding, self.metric, a, b),
+        }
     }
 }
 
@@ -120,8 +182,26 @@ impl Slots {
             stride: dim.div_ceil(LINE_FLOATS).max(1) * LINE_FLOATS,
             links: m0 + 1,
             blocks: boxcar::Vec::new(),
-            grow: parking_lot::Mutex::new(()),
+            grow: parking_lot::Mutex::new(Vec::new()),
             encoding,
+        }
+    }
+
+    /// [`Slots::dist`] by `metric`, with the kernel looked up once: for a
+    /// loop that measures many vectors (a search, a pruning). The same
+    /// distances, to the bit: the same kernels.
+    #[inline(always)]
+    pub fn measure<'a>(&self, metric: &'a super::DistanceMetric) -> Measure<'a> {
+        use super::DistanceMetric::{Cosine, InnerProduct, L2};
+        let how = match (self.encoding, metric) {
+            (super::quant::Encoding::F32, Cosine | InnerProduct) => How::OneMinusDot,
+            (super::quant::Encoding::F32, L2) => How::L2Sq,
+            (other, _) => How::Encoded(other),
+        };
+        Measure {
+            how,
+            metric,
+            kernels: super::simd::Kernels::here(),
         }
     }
 
@@ -181,10 +261,22 @@ impl Slots {
         if self.blocks.count() > b {
             return;
         }
-        let _grow = self.grow.lock();
+        let mut chunks = self.grow.lock();
         while self.blocks.count() <= b {
             let next = self.blocks.count();
             let (links_at, flags_at, layout) = self.layout(block_slots(next));
+            if next >= GEOMETRIC
+                && layout.align() != HUGE_PAGE
+                && let Some(base) = cut_block(&mut chunks, layout.size())
+            {
+                self.blocks.push(Block {
+                    base,
+                    links_at,
+                    flags_at,
+                    in_chunk: true,
+                });
+                continue;
+            }
             let huge = layout.align() == HUGE_PAGE;
             // SAFETY: the layout's size is never zero (a block has slots).
             // A huge block is advised before it is zeroed: the zeroing
@@ -209,6 +301,7 @@ impl Slots {
                 base,
                 links_at,
                 flags_at,
+                in_chunk: false,
             });
         }
     }
@@ -324,6 +417,18 @@ impl Slots {
         slot[0].store(n as u32, Ordering::Release);
     }
 
+    /// `f` of each of slot `id`'s layer-0 links in turn, read without a
+    /// lock as [`Slots::read_links`] reads them, without copying them out
+    /// first: a search that keeps only the neighbours it has not met.
+    #[inline(always)]
+    pub fn each_link(&self, id: usize, mut f: impl FnMut(u32)) {
+        let slot = self.links(id);
+        let n = (slot[0].load(Ordering::Acquire) as usize).min(self.links - 1);
+        for x in &slot[1..=n] {
+            f(x.load(Ordering::Relaxed));
+        }
+    }
+
     /// Add `x` to slot `id`'s layer-0 links if there is room; false if
     /// they are full. The caller holds the node's lock.
     #[inline]
@@ -356,15 +461,166 @@ impl Drop for Slots {
         for b in 0..self.blocks.count() {
             if let Some(block) = self.blocks.get(b) {
                 let (_, _, layout) = self.layout(block_slots(b));
-                // SAFETY: allocated in `reserve` with this layout.
-                unsafe { dealloc(block.base.as_ptr(), layout) };
+                if block.in_chunk {
+                    crate::memory_use::note(-(layout.size() as isize));
+                } else {
+                    // SAFETY: allocated in `reserve` with this layout.
+                    unsafe { dealloc(block.base.as_ptr(), layout) };
+                }
             }
+        }
+        for chunk in self.grow.get_mut().drain(..) {
+            unmap_chunk(&chunk);
         }
     }
 }
 
 /// The size of a huge page on Linux x86_64 and aarch64 (4 KB base pages).
 const HUGE_PAGE: usize = 2 << 20;
+
+/// The most blocks a chunk holds: chunks grow no larger than about 64 MiB.
+const CHUNK_MOST_BYTES: usize = 64 << 20;
+
+/// Bytes of a chunk for blocks of `block` bytes: whole huge pages, the
+/// fewest that leave at most 1/32 of them past the last block that fits
+/// (64-d: 5 blocks of 405 KiB in one huge page; 384-d: 6 of 1.6 MiB in 5).
+fn chunk_bytes(block: usize) -> usize {
+    let mut best = HUGE_PAGE.max(block.next_multiple_of(HUGE_PAGE));
+    let mut pages = best / HUGE_PAGE;
+    while pages * HUGE_PAGE <= CHUNK_MOST_BYTES {
+        let len = pages * HUGE_PAGE;
+        if len % block <= len / 32 {
+            best = len;
+            break;
+        }
+        pages += 1;
+    }
+    best
+}
+
+/// A block of `size` bytes cut from the graph's last chunk, or from a new
+/// one: `None` where chunks are not used (not Linux) or a chunk cannot be
+/// mapped (the block is then allocated on its own). Counted in
+/// `used_memory` at `size`, as a block of its own is. The pages of the
+/// chunk that the blocks before this one cover wholly are made huge pages.
+fn cut_block(chunks: &mut Vec<Chunk>, size: usize) -> Option<NonNull<u8>> {
+    #[cfg(all(target_os = "linux", not(miri)))]
+    {
+        let fits = chunks.last().is_some_and(|c| c.used + size <= c.len);
+        if !fits {
+            // The last chunk's blocks are all in use, and no more are cut
+            // from it: all of it can be made huge pages (what is left past
+            // its last block is at most 1/32 of it).
+            if let Some(last) = chunks.last_mut() {
+                collapse(last, last.len);
+            }
+            let len = chunk_bytes(size);
+            let base = map_chunk(len)?;
+            chunks.push(Chunk {
+                base,
+                len,
+                used: 0,
+                collapsed: 0,
+            });
+        }
+        let chunk = chunks.last_mut()?;
+        // The blocks before this one are in use.
+        let at = chunk.used;
+        collapse(chunk, at);
+        chunk.used += size;
+        crate::memory_use::note(size as isize);
+        // SAFETY: `at + size <= len`: within the mapping.
+        Some(unsafe { chunk.base.add(at) })
+    }
+    #[cfg(not(all(target_os = "linux", not(miri))))]
+    {
+        let _ = (chunks, size);
+        None
+    }
+}
+
+/// Ask the kernel to make the huge pages of `chunk` below `upto` bytes that
+/// have not been asked for yet into huge pages, at once (`MADV_COLLAPSE`,
+/// Linux 6.1 and later), or else later (`MADV_HUGEPAGE`, for khugepaged).
+/// A page that cannot be made one stays as it is: huge pages off, a kernel
+/// without them, or no huge page free.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn collapse(chunk: &mut Chunk, upto: usize) {
+    let end = (upto / HUGE_PAGE) * HUGE_PAGE;
+    if end <= chunk.collapsed || !huge_pages_allowed() {
+        return;
+    }
+    let from = chunk.collapsed;
+    // SAFETY: `[from, end)` is within the chunk's mapping, which is ours;
+    // the advice changes how its pages are backed, never what they hold.
+    unsafe {
+        let p = chunk.base.as_ptr().add(from).cast::<libc::c_void>();
+        libc::madvise(p, end - from, libc::MADV_HUGEPAGE);
+        libc::madvise(p, end - from, MADV_COLLAPSE);
+    }
+    chunk.collapsed = end;
+}
+
+/// Whether transparent huge pages are on (`always` or `madvise`), read once:
+/// `MADV_COLLAPSE` makes huge pages even where they are set to `never`, and
+/// a server whose huge pages are off keeps them off.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn huge_pages_allowed() -> bool {
+    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Not there to read (a sandbox without /sys): the kernel decides.
+    *ALLOWED.get_or_init(|| {
+        match std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled") {
+            Ok(setting) => !setting.contains("[never]"),
+            Err(_) => true,
+        }
+    })
+}
+
+/// `MADV_COLLAPSE` (Linux 6.1): collapse a range into huge pages now.
+#[cfg(all(target_os = "linux", not(miri)))]
+const MADV_COLLAPSE: libc::c_int = 25;
+
+/// Map `len` bytes (whole huge pages) on a huge page's boundary, of
+/// zeroes: a fresh anonymous mapping, none of it touched.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn map_chunk(len: usize) -> Option<NonNull<u8>> {
+    // SAFETY: an anonymous private mapping of no file; the slack before and
+    // after the aligned stretch is unmapped again.
+    unsafe {
+        let span = len + HUGE_PAGE;
+        let at = libc::mmap(
+            std::ptr::null_mut(),
+            span,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if at == libc::MAP_FAILED {
+            return None;
+        }
+        let start = at as usize;
+        let aligned = start.next_multiple_of(HUGE_PAGE);
+        if aligned > start {
+            libc::munmap(at, aligned - start);
+        }
+        let tail = start + span - (aligned + len);
+        if tail > 0 {
+            libc::munmap((aligned + len) as *mut libc::c_void, tail);
+        }
+        NonNull::new(aligned as *mut u8)
+    }
+}
+
+fn unmap_chunk(chunk: &Chunk) {
+    #[cfg(all(target_os = "linux", not(miri)))]
+    // SAFETY: the chunk's own mapping, no longer reached by any block.
+    unsafe {
+        libc::munmap(chunk.base.as_ptr().cast(), chunk.len);
+    }
+    #[cfg(not(all(target_os = "linux", not(miri))))]
+    let _ = chunk;
+}
 
 /// Ask the kernel to back `len` bytes at `p` with transparent huge pages.
 /// A search reads vectors from all over a large graph: with 4 KB pages
@@ -495,6 +751,69 @@ mod tests {
             assert!(slots.is_live(id));
         }
         assert!(slots.capacity() >= 3000 && slots.capacity() < 3000 + BLOCK);
+    }
+
+    /// Blocks cut from chunks, across several chunks and the huge pages
+    /// made of them, keep every slot's vector, links and flag apart, each
+    /// vector on a cache line, and count what they take at their size.
+    #[test]
+    fn blocks_cut_from_chunks_keep_their_slots() {
+        for dim in [64, 100, 384] {
+            let slots = Slots::new(dim, 36);
+            let n = 14_000;
+            for id in 0..n {
+                slots.reserve(id);
+                assert!(slots.vector(id).iter().all(|x| *x == 0.0), "zeroed");
+                assert!(!slots.is_live(id));
+                let v: Vec<f32> = (0..dim).map(|j| (id * 7 + j) as f32).collect();
+                unsafe { slots.write_vector(id, &v) };
+                slots.write_links(id, (0..(id % 37) as u32).map(|x| x ^ id as u32));
+                slots.flag(id).store(1, Ordering::Release);
+            }
+            let mut out = Vec::new();
+            for id in 0..n {
+                let v = slots.vector(id);
+                assert_eq!(v[0], (id * 7) as f32, "{dim}-d slot {id}");
+                assert_eq!(v[dim - 1], (id * 7 + dim - 1) as f32);
+                assert_eq!(v.as_ptr() as usize % ALIGN, 0);
+                out.clear();
+                slots.read_links(id, &mut out);
+                assert_eq!(out.len(), id % 37);
+                assert!(
+                    out.iter()
+                        .enumerate()
+                        .all(|(x, y)| *y == x as u32 ^ id as u32)
+                );
+                assert!(slots.is_live(id));
+            }
+            let blocks: usize = (0..slots.blocks.count())
+                .map(|b| slots.layout(block_slots(b)).2.size())
+                .sum();
+            assert_eq!(slots.bytes(), blocks);
+            #[cfg(target_os = "linux")]
+            assert!(!slots.grow.lock().is_empty(), "{dim}-d: no chunk was used");
+        }
+    }
+
+    /// A chunk is whole huge pages, holds at least one block, and leaves at
+    /// most 1/32 of itself past the blocks that fit (up to its most).
+    #[test]
+    fn chunks_are_whole_huge_pages_with_little_left_over() {
+        for dim in [1, 16, 64, 100, 128, 384, 512, 768, 1000] {
+            let slots = Slots::new(dim, 36);
+            let block = slots.layout(BLOCK).2.size();
+            if block >= HUGE_PAGE {
+                continue; // allocated on its own, as before
+            }
+            let len = chunk_bytes(block);
+            assert_eq!(len % HUGE_PAGE, 0);
+            assert!(len >= block);
+            assert!(len <= CHUNK_MOST_BYTES.max(block.next_multiple_of(HUGE_PAGE)));
+            assert!(
+                len % block <= len / 32 || len == block.next_multiple_of(HUGE_PAGE),
+                "{dim}-d: {len} for blocks of {block}"
+            );
+        }
     }
 
     #[test]
