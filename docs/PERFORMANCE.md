@@ -643,12 +643,34 @@ What each part of an insert does, and what it took off the 64-d build with seven
 helpers (3 interleaved runs each):
 - **Huge pages** for the slots (vectors, layer-0 links and live flags): 4-5 %. In 4 KiB
   pages a quarter of the search's time went to its prefetches of the neighbours'
-  vectors, most of which cost a page walk. Blocks of 1,024 slots are cut from chunks
-  of whole huge pages, and each huge page is made one (`MADV_COLLAPSE`, Linux 6.1 and
-  later) once the blocks over it are in use; nothing is made a huge page before. So
-  indexes of 1,000 to 20,000 vectors (64-d and 384-d) take the same `used_memory` and
-  RSS as before, within 1 %, and where transparent huge pages are set to `never` no
-  huge page is made.
+  vectors, most of which cost a page walk. Up to 464 dimensions (at `M` 16), blocks of
+  1,024 slots are cut from chunks of whole 2 MiB pages, mapped with huge pages off
+  (`MADV_NOHUGEPAGE`). Once the blocks over one of those pages are all in use, a thread
+  of its own makes it a huge page (`MADV_HUGEPAGE`, then `MADV_COLLAPSE`, Linux 6.1 and
+  later): no command, and no insert holding its graph, waits for it. A collapse took
+  0.5-2 ms (at most 4.8 ms) during a 200,000 × 64-d build, about 40 of them a build,
+  with free memory fragmented too. During such a build, one client's KNN p99 and
+  p99.9 were 0.96-1.0 ms and 1.36-1.43 ms with the collapse done in the insert, and
+  0.98-1.0 ms and 1.38-1.40 ms on the thread; `VSIM` beside a `VADD` load, p99.9
+  4.3-5.3 ms and 4.2-4.7 ms.
+- **Memory:** with transparent huge pages set to `always`, `madvise` or `never`,
+  indexes of 1,500 to 5,000 vectors of 64 and 384 dimensions take the same
+  `used_memory` as before (within 1 %) and at most the same RSS:
+
+  | per index, before → after | `always` RSS | `madvise` RSS | `never` RSS | `used_memory` |
+  |---|---:|---:|---:|---:|
+  | 20 × 1,500 × 64 | 2,735 → 2,495 KiB | 2,670 → 2,461 | 2,672 → 2,448 | 2,402 → 2,400 KiB |
+  | 10 × 5,000 × 64 | 8,237 → 8,120 | 8,171 → 8,026 | 8,130 → 8,020 | 7,445 → 7,446 |
+  | 20 × 1,500 × 384 | 7,359 → 6,460 | 7,218 → 6,320 | 7,223 → 6,315 | 6,843 → 6,852 |
+  | 5 × 5,000 × 384 | 22,010 → 21,736 | 21,402 → 21,242 | 21,398 → 21,165 | 20,091 → 20,096 |
+
+  Where they are set to `never`, no huge page is made, and the 64-d build takes 13.9 s
+  (16.6 s before).
+  A chunk is one mapping (two while only part of it is huge pages), against the
+  process's `vm.max_map_count` (65,530 by default): past 16,384 chunks in the
+  process, new blocks are allocated on their own. 2,000 vector sets of 5,000 64-d
+  vectors, a graph each, added 284-291 mappings (adjacent chunks share one) against
+  148 before.
 - **The live flag read last:** 4 %. The search measures a neighbour, and reads its live
   flag (a byte on a line of its own) only if it would keep it.
 - **The kernel looked up once** a search, selection or pruning, called through one

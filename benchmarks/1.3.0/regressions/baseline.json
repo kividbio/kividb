@@ -21069,7 +21069,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -21127,7 +21127,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -21181,7 +21181,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -21239,7 +21239,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -21297,7 +21297,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -21355,7 +21355,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -21442,7 +21442,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -21500,7 +21500,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -21558,7 +21558,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -21587,7 +21587,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -21696,7 +21696,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -21750,7 +21750,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -21808,7 +21808,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -21866,7 +21866,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -21924,7 +21924,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -22011,7 +22011,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -22069,7 +22069,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8
@@ -22127,7 +22127,7 @@
         "vm": "Standard_D8s_v5",
         "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
         "date": "2026-11-21",
-        "commit": "14b697d5",
+        "commit": "befcd92e",
         "label": "pr-760-insert-d8s_v5",
         "rustc": "1.100.0",
         "nproc": 8

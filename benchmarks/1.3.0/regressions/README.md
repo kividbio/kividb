@@ -1726,7 +1726,8 @@ values of `results/pr-760-d8s_v5`, for two reasons:
 
 Re-recorded 2026-11-21 for #760 on an Azure Standard_D8s_v5 (Xeon Platinum
 8370C), `--only 41 --record` with `REGRESS_REDISEARCH_SO` set
-(`results/pr-760-insert-d8s_v5`). The candidate is commit `14b697d5` (each
+(`results/pr-760-insert-d8s_v5`). The candidate is commit `befcd92e` (built as `14b697d5`, the same code
+before the branch was rebased onto master; each
 HNSW insert costing about Redis's CPU), `cargo build --release` with rustc
 1.100.0; Redis 8.10.2 from the VM image with the query engine module of the
 `redis:8.10.2` image. Two more runs without `--record` (`-verify1`,
@@ -1748,6 +1749,12 @@ the graph is built by several threads and differs from run to run. With
 1,200, the same row was 0.491-0.493 in the candidate's three runs (0.493 on
 master), and no row of the candidate's moved by more than 0.005. The recall
 rows were re-recorded, as their values changed with the queries.
+
+After the review fixes (huge pages collapsed on a thread of their own,
+chunks mapped with huge pages off), three more runs of `53331f9d`
+(`results/pr-760-fix-d8s_v5-run1` to `-run3`): `d384` 0.89x, 0.93x and
+0.91x Redis's time, `d64` 1.01x, 0.99x and 1.00x, recall within the
+recorded spread; no row was recorded again.
 
 Only those 18 rows (2 builds, 16 recalls) were recorded. The others keep the
 values of `results/pr-760-d8s_v5`: the rates move by up to ±10 % from run to
