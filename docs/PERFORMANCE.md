@@ -377,68 +377,87 @@ at 200: less of a gain than on io_uring. Regression suite 42 (`benchmarks/1.3.0/
 
 Centrifuge (the engine of Centrifugo) reads and appends a channel's history with Lua scripts whose 2-3
 keys have no hash tag, so each runs alone, and its client (rueidis) sends them over 4 pipelined
-connections ([#900](https://github.com/kividbio/kividb/issues/900)). With those connections on 4
-workers, nearly every script meets another one running and is queued for the thread running that
-one. A connection has one script in flight at a time: until its reply is back, the server reads
-nothing more from it. Waiting with a waker, its worker, with nothing else to do, sleeps, and the
-thread running the scripts wakes it for each reply (a write to its eventfd, then a task switch). In
-centrifuge's `History_1Ch` list benchmark, master ran 461k scripts with 347k task switches of the
-server (Redis 8.10.2: 4.7k), and 9.0 s of server CPU against Redis's 5.7 s for more calls. The
-scripts themselves cost less than Redis's: under callgrind (`--threads 4`, one pipelined connection,
-so nothing is queued) the whole server spends 41,925 instructions a `broker_history_list.lua` call
-(Redis 64,970), 60,764 a `broker_history_add_list.lua` call (83,294) and 64,987 a stream publish
-(139,581); and with one worker (`--threads 1`, every connection on it) every history row runs
-faster than Redis.
+connections ([#900](https://github.com/kividbio/kividb/issues/900)). With those connections on
+different workers, nearly every script meets another one running and is queued for the thread
+running that one. A connection has one script in flight at a time: until its reply is back, the
+server reads nothing more from it. Waiting with a waker, its worker, with nothing else to do, sleeps,
+and the thread running the scripts wakes it for each reply (a write to its eventfd, then a task
+switch). The scripts themselves cost less than Redis's: under callgrind (one pipelined connection, so
+nothing is queued) the whole server spends 41,925 instructions a `broker_history_list.lua` call
+(Redis 8.10.2: 64,970), 60,764 a `broker_history_add_list.lua` call (83,294) and 64,987 a stream
+publish (139,581); and with one worker every history row runs faster than Redis.
 
-A connection whose script was queued looks for the reply between turns of its thread's loop for up
+A connection whose script was queued looks for the reply between turns of its thread's loop, for up
 to 400 µs, and waits to be woken only after that. Its thread goes on serving its other connections
-and does not sleep, so the reply is sent to nobody's waker and found at the next look; on io_uring,
-every 20 µs the look is a no-op on the ring, which hands the thread's other reads and writes to the
-kernel. While it looks, a connection that finds the turn free and scripts queued takes the turn and
-runs them, as the thread that ran its own script does. A queued script's arguments are copied into
-one buffer, not one allocation each. Each script still runs alone, in the order of the queue, and
-replicas and the AOF get them in the order they ran. Nothing changes for a script that finds the
-turn free or one that runs beside others.
+and does not sleep, so the reply is sent to nobody's waker and found at the next look. On io_uring
+the thread hands its other connections' reads and writes to the kernel only when it is about to
+sleep, which a look does not make it do: once every 20 µs on a thread, however many of its
+connections look, the look is a no-op on the ring, which does. A connection that looks and finds
+nobody running scripts and some queued takes the turn and runs them, as the thread that ran its own
+script does after it; nothing is run so while a slot handoff or a `MIGRATE` is under way. Each
+script still runs alone, in the order of the queue, and replicas and the AOF get them in the order
+they ran.
 
-Azure `Standard_D8s_v5`, server on CPUs 0-3 (`--threads 4`, io_uring), centrifuge v0.40.1's
-`BenchmarkRedis*/rd_single` benchmarks (`-test.benchtime 5s`) on CPUs 4-7, master `a987989e` and the
-change, both `lua,tls` by rustc 1.100.0, Redis 8.10.2, a fresh server for each run, 3 interleaved
-rounds (Redis, master, change), medians in ns/op (lowest-highest), and the ratio to Redis:
+A look keeps its thread busy, so connections look only where the CPUs the process may use (its CPU
+mask and its CPU quota) leave one beyond the workers and the script-runner thread: with 4 workers
+that is 6 CPUs or more. The default worker count, half the CPUs, leaves them on 4 CPUs or more; `--threads 4` on
+4 CPUs does not, and there a queued script's connection waits as before. A thread whose connections
+have looked 8 times in a row without their reply coming within 400 µs stops looking for 1 ms, then
+2, 4, ... up to 100 ms, until a look finds its reply.
+
+Azure `Standard_D8s_v5`, the server on CPUs 0-3 with `--threads 2` (so the workers leave CPUs to
+spare, and connections look), io_uring, centrifuge v0.40.1's `BenchmarkRedis*/rd_single` benchmarks
+(`-test.benchtime 5s`) on CPUs 4-7, master `b4889a5e` and the change, both `lua,tls` by rustc
+1.100.0, Redis 8.10.2, a fresh server for each run, 3 interleaved rounds, medians in ns/op
+(lowest-highest), and the ratio to Redis:
 
 | benchmark, PARALLELISM | Redis 8.10.2 | master | with the change | master / Redis | change / Redis |
 |---|---:|---:|---:|---:|---:|
-| History_1Ch list, 16 | 8,417 (8,325-8,428) | 13,038 (12,974-13,139) | 9,193 (9,163-11,017) | 1.55x | 1.09x |
-| History_1Ch list, 128 | 7,216 (7,200-7,225) | 13,236 (11,684-13,448) | 8,307 (7,139-8,435) | 1.83x | 1.15x |
-| History_1Ch stream, 16 | 16,341 (16,317-16,462) | 17,263 (17,088-17,871) | 12,910 (11,116-13,298) | 1.06x | 0.79x |
-| History_1Ch stream, 128 | 15,265 (15,247-15,283) | 15,394 (15,147-17,429) | 12,727 (12,401-17,406) | 1.01x | 0.83x |
-| Pub_History_ManyCh list, 16 | 11,790 (11,644-12,007) | 17,737 (16,584-18,926) | 13,563 (11,628-17,193) | 1.50x | 1.15x |
-| Pub_History_ManyCh list, 128 | 10,614 (10,546-10,642) | 17,532 (17,248-17,553) | 12,996 (11,415-13,196) | 1.65x | 1.22x |
-| Pub_History_ManyCh stream, 16 | 14,530 (14,492-14,574) | 19,327 (18,606-19,536) | 14,055 (13,962-14,247) | 1.33x | 0.97x |
-| Pub_History_ManyCh stream, 128 | 13,289 (13,285-13,384) | 18,326 (16,234-18,988) | 18,011 (13,863-18,194) | 1.38x | 1.36x |
-| Publish_History_1Ch list, 16 | 11,052 (10,925-11,101) | 17,207 (17,084-17,381) | 13,111 (12,688-16,216) | 1.56x | 1.19x |
-| Publish_History_1Ch list, 128 | 9,687 (9,665-9,732) | 16,959 (16,683-17,594) | 12,308 (12,267-12,481) | 1.75x | 1.27x |
-| Publish_History_1Ch stream, 16 | 14,630 (14,563-14,691) | 17,903 (17,704-17,985) | 13,413 (13,407-13,645) | 1.22x | 0.92x |
-| Publish_History_1Ch stream, 128 | 13,461 (13,434-13,501) | 17,456 (17,404-17,915) | 13,046 (13,046-17,330) | 1.30x | 0.97x |
-| Publish_ManyCh, 16 | 17,101 (16,753-17,252) | 16,124 (15,610-16,154) | 13,608 (12,897-13,835) | 0.94x | 0.80x |
-| Publish_ManyCh, 128 | 888 (885-894) | 952 (943-957) | 931 (930-933) | 1.07x | 1.05x |
-| Recover_1Ch list, 16 | 24,305 | 17,974 | 14,695 | 0.74x | 0.60x |
-| Recover_1Ch list, 128 | 25,120 | 16,945 | 13,570 | 0.67x | 0.54x |
-| Recover_1Ch stream, 16 | 43,612 | 25,795 | 24,344 | 0.59x | 0.56x |
-| Recover_1Ch stream, 128 | 45,045 | 25,586 | 32,072 | 0.57x | 0.71x |
-| Subscribe, 16 | 12,676 | 13,169 | 13,069 | 1.04x | 1.03x |
-| Subscribe, 128 | 1,027 | 1,041 | 1,042 | 1.01x | 1.01x |
+| History_1Ch list, 16 | 8,317 (8,306-8,425) | 10,888 (10,874-11,077) | 7,561 (7,538-7,709) | 1.31x | 0.91x |
+| History_1Ch list, 128 | 7,204 (7,180-7,261) | 9,534 (9,469-11,030) | 6,991 (6,862-7,016) | 1.32x | 0.97x |
+| History_1Ch stream, 16 | 16,424 (16,367-16,537) | 14,891 (13,931-14,953) | 10,771 (10,717-11,052) | 0.91x | 0.66x |
+| History_1Ch stream, 128 | 15,298 (15,214-15,605) | 13,447 (13,256-13,815) | 10,153 (10,148-10,265) | 0.88x | 0.66x |
+| Pub_History_ManyCh list, 16 | 11,743 (11,696-11,804) | 15,693 (14,567-16,372) | 11,187 (10,983-11,258) | 1.34x | 0.95x |
+| Pub_History_ManyCh list, 128 | 10,654 (10,570-10,693) | 15,278 (14,293-15,903) | 10,972 (10,579-11,061) | 1.43x | 1.03x |
+| Pub_History_ManyCh stream, 16 | 14,477 (14,474-14,631) | 16,748 (16,368-17,170) | 11,717 (11,540-12,043) | 1.16x | 0.81x |
+| Pub_History_ManyCh stream, 128 | 13,390 (13,340-13,412) | 16,201 (14,595-16,533) | 11,374 (11,372-11,961) | 1.21x | 0.85x |
+| Publish_History_1Ch list, 16 | 10,942 (10,934-10,979) | 13,912 (13,567-14,725) | 10,618 (10,393-10,644) | 1.27x | 0.97x |
+| Publish_History_1Ch list, 128 | 9,798 (9,600-9,871) | 14,560 (13,257-15,309) | 10,116 (9,988-10,119) | 1.49x | 1.03x |
+| Publish_History_1Ch stream, 16 | 14,523 (14,481-14,595) | 16,369 (15,543-16,629) | 10,931 (10,890-11,294) | 1.13x | 0.75x |
+| Publish_History_1Ch stream, 128 | 13,564 (13,442-13,579) | 15,240 (15,009-16,476) | 10,681 (10,579-11,110) | 1.12x | 0.79x |
 
-With the change, a run of `History_1Ch` list made 57k task switches of the server, where master's
-made 347k. Left: the list publish rows are 1.15-1.27x Redis, and some rows vary by a third between
-runs of one binary (`Pub_History_ManyCh` stream at 128: 13.9k to 18.2k ns/op), with how the 4
-connections fall on the 4 workers. The scripts' own run is part of it: a
-`broker_history_add_list.lua` call takes 8.1-8.5 µs (`INFO commandstats`) with one worker and 11-12
-µs with four, where the thread running the scripts changes from one run to the next, and with it
-the CPU that last touched the keys, the allocations and the gate. With one worker every history row
-is ahead of Redis (`History_1Ch` list 7.2k ns/op, `Publish_History_1Ch` list 10.2k, the stream
-publish rows 10.7-11.1k). Getting there with four takes running the scripts that run alone on one
-thread, together with the connections that send them, which this change does not do. Regression
-suite 45 (`benchmarks/1.3.0/regressions`) runs these scripts against Redis.
+The server's task switches over those runs went from 1.8-2.0 million to 45k-75k (Redis: 1.5k-14k).
+With `--threads 4` on the same 4 CPUs the change does not look, and the rows are master's
+(`History_1Ch` list 12,774 against 12,947 ns/op at 16). Made to look there anyway, it ran the rows
+at 0.67-1.36x Redis, but at saturation it spent 38.6 µs of server CPU a call against master's 18.8
+(memtier, below): the looking threads take the CPUs the scripts need, which is why it does not.
+
+Server CPU a call, centrifuge's history read by `EVALSHA` from memtier_benchmark (4 connections,
+pipeline 16), 15 s, the same placement:
+
+| | at saturation, calls/s | CPU a call | at 35,000 calls/s, CPU a call |
+|---|---:|---:|---:|
+| Redis 8.10.2 | 140,080-141,284 | 7.07-7.12 µs | 7.96-8.02 µs |
+| master, `--threads 2` | 103,072-107,759 | 12.81-13.46 µs | 7.63 µs |
+| the change, `--threads 2` | 149,418-149,758 | 13.06-13.12 µs | 7.87 µs |
+| master, `--threads 4` | 81,335-81,511 | 18.82-18.91 µs | 7.92 µs |
+| the change, `--threads 4` (does not look) | 82,616-84,312 | 18.24-18.52 µs | 8.00 µs |
+
+At a quarter of Redis's rate nothing is queued for long and every server spends the same. Under a
+CPU quota of 2 CPUs (cgroup `cpu.max`) with `--threads 4`, the change does not look either:
+`History_1Ch` list 12,571 against master's 12,430 ns/op, `Publish_History_1Ch` list 16,850 against
+15,729 (3 runs each; master's spread 15,304-16,680). On the Tokio loop (`--io-model tokio`,
+`--threads 2`): `History_1Ch` list 7,231 against master's 10,506 ns/op, `Publish_History_1Ch` list
+10,976 against 15,145, with 39k task switches against 741k and 28 % more server CPU for about 40 %
+more calls.
+
+Plain commands beside them, suite 42's Nextcloud mix (12 % untagged compare-and-delete scripts)
+from memtier at 200 / 500 connections, 3 runs of 15 s, p99 in ms: with `--threads 2`, where
+connections look, 0.975-1.007 / 2.447-2.735 against master's 1.007-1.055 / 2.495-2.575.
+
+Left: with as many workers as CPUs, or fewer CPUs, nothing changes here. Getting the rows ahead of
+Redis there takes running the scripts that run alone on one thread together with the connections
+that send them. Regression suite 38 (`benchmarks/1.3.0/regressions`) runs centrifuge's scripts.
 
 ## Vector index builds
 

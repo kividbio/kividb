@@ -545,20 +545,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   behind another one is waited for by its connection between turns of its
   thread's loop, for up to 400 µs, and only then with a waker: the thread
   serves its other connections meanwhile, and the thread running the
-  scripts does not wake it for each reply (on io_uring the look
-  hands the thread's reads and writes to the kernel every 20 µs). A
-  connection that looks and finds the turn free with scripts queued runs
-  them, as the thread that ran its own script does. A queued script's
-  arguments are copied into one buffer. Each script still runs alone, in
-  the queue's order, and replicas and the AOF get them in the order they
-  ran. centrifuge v0.40.1's Redis broker benchmarks (`rd_single`, 4 pipelined
-  connections, `--threads 4` on 4 CPUs of an Azure `Standard_D8s_v5`, ns/op as
-  a ratio to Redis 8.10.2, PARALLELISM 16 / 128, medians of 3): `History_1Ch`
-  list 1.55x / 1.83x to 1.09x / 1.15x, stream 1.06x / 1.01x to 0.79x / 0.83x;
-  `Publish_History_1Ch` list 1.56x / 1.75x to 1.19x / 1.27x, stream 1.22x /
-  1.30x to 0.92x / 0.97x; `Pub_History_ManyCh` list 1.50x / 1.65x to 1.15x /
-  1.22x, stream 1.33x / 1.38x to 0.97x / 1.36x. Regression suite 45 runs
-  these scripts against Redis; see docs/PERFORMANCE.md.
+  scripts does not wake it for each reply. On io_uring a thread hands its
+  connections' reads and writes to the kernel once every 20 µs while any of
+  them looks. A connection that looks and finds nobody running scripts and
+  some queued runs them, as the thread that ran its own script does (not
+  while a slot handoff or a `MIGRATE` is under way). Connections look only
+  where the CPUs the process may use (its mask and its quota) leave one
+  beyond the workers and the script-runner thread (the default worker
+  count, half the CPUs, does on 4 CPUs or more; `--threads 4` on 4 CPUs
+  does not), and a thread whose looks keep missing (8 in a row) stops
+  looking for 1 ms to 100 ms. A queued script's arguments are copied into
+  one buffer. Each script still runs alone, in the queue's order, and
+  replicas and the AOF get them in the order they ran. centrifuge v0.40.1's
+  Redis broker benchmarks (`rd_single`, 4 pipelined connections, `--threads
+  2` on 4 CPUs of an Azure `Standard_D8s_v5`, ns/op as a ratio to Redis
+  8.10.2, PARALLELISM 16 / 128, medians of 3): `History_1Ch` list 1.31x /
+  1.32x to 0.91x / 0.97x, stream 0.91x / 0.88x to 0.66x / 0.66x;
+  `Publish_History_1Ch` list 1.27x / 1.49x to 0.97x / 1.03x, stream 1.13x /
+  1.12x to 0.75x / 0.79x; `Pub_History_ManyCh` list 1.34x / 1.43x to 0.95x /
+  1.03x, stream 1.16x / 1.21x to 0.81x / 0.85x. See docs/PERFORMANCE.md.
 
 - **Hash field names are bytes in memory, and ACL key and channel patterns
   are bytes (#510).** Last of the four steps of #437:

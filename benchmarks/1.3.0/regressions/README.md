@@ -59,7 +59,6 @@ and why.
 | `41-ft-hnsw-vs-redis` | #760 | #760's own cases against Redis's query engine in the same session: 50,000 384-d (`d384`) and 200,000 64-d (`d64`) random documents (`score` NUMERIC, HNSW `COSINE M 16 EF_CONSTRUCTION 200`) written by one client in `HSET` pipelines of 1,000, documents a second until all are in the graph; then one client, 5 s a case, `KNN 10`: no filter, `@score:[50 100]` (half) and `@score:[0 2]` (3 %) at the default `EF_RUNTIME`, no filter at 50, 100 and 200 and the wide filter at 50 and 100: q/s and recall@10 against exact; `d64` also KNN p99 beside 500 `HSET`s a second; peak RSS. The candidate as it starts on 8 CPUs (`--threads 4`, `search-index-threads auto`: 7 helpers, all of them linking while the load is all the server does, 3 while it serves). Gates: 10 % (rates), 2 % (recall), 5 % (RSS); and against Redis this session: build at most 1.25x (`d384`) / 1.6x (`d64`) slower, the rows at the same `EF_RUNTIME` at most 1.1x (no filter) / 1.2x (wide) slower with recall at least Redis's, the narrow filter faster than Redis, the default rows at most 2.2x (no filter) / 1.8x (wide) slower (a KiviDB KNN looks at no fewer than 50 candidates, Redis's default at 10), peak RSS at most Redis's. Needs `REGRESS_REDISEARCH_SO` (as `28`); `min_cpus=8`, recorded on a D8s_v5 (`results/pr-760-d8s_v5`; the build rows in `results/pr-760-adaptive-d8s_v5`, see [below](#recorded-run-suite-41-build-rows)) |
 | `42-alone-scripts-mix` | #880 | plain commands beside scripts that run alone (a key with no hash tag): Nextcloud's mix (`GET` 40, `TTL` 15, `INCRBY` 15, `EXPIRE` 15, `EVALSHA` of its compare-and-delete 12, `SETEX` 3) and the same mix with no script, the compare-and-delete alone, Appwrite's abuse limiter (`EVAL`), both on a tagged key too, and Superset's cache and lock (`GET` 85 of 50 KB values, `SETEX` 10, `SET NX EX` 3, unlock 2); memtier, 200 and 500 connections, 100,000 keys (written again before every run): ops/s, p50, p99, p99.9. Gates: Nextcloud's p99 at most 2x the same mix's with no script and 0.75x Redis's in the same session; ops/s at least a floor times Redis's and within 10 % of recorded; server on the first half of the CPUs (`--threads 4`), memtier on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-42)) |
 | `43-slab-churn` | #240 | memory after the issue's delete/refill churn (1,000,000 keys of 100 B and of 1 KB, 120,000 of 100 B to 16 KB; 10 % and 20 % of the keys deleted and written anew, 3 cycles, 8 pipelining clients): VmRSS and `used_memory` at load, the peak (50 ms samples) and 60 s after, and the peak against the same churn run again with active defrag off; VmRSS after `BGSAVE` and after `BGREWRITEAOF` under 40,000 SETs a second on 2,000,000 keys of 1 KB; GET/SET p99 and p99.9 (memtier, per second, median of three trials) while active defrag runs a pass under reads and overwrites, against the same trial's seconds before it (`min_cpus=8`) |
-| `45-centrifuge-history-vs-redis` | #900 | centrifuge v0.40.1's history scripts as its Redis broker runs them, against Redis: `broker_history_list.lua`, `broker_history_stream.lua` (History_1Ch), `broker_history_add_list.lua` and the joined `broker_history_add_stream_*.lua` (Publish_History_1Ch, and over 1,024 channels as Pub_History_ManyCh), first by `EVAL` and then by `EVALSHA`, with the broker's arguments; their 2-3 keys have no hash tag, so each runs alone. 4 connections (rueidis's pipelines), each sending a file of 20,000 calls through `redis-cli --pipe` again and again: calls a second counted by the server over 6 s after 2 s, median of 3 rounds; any error reply, or a history of the wrong length afterwards, fails the suite. Gates: calls a second at least a share of Redis's in the same session (`vs_redis`, per row) and within 10 % of recorded; server on the first half of the CPUs (`--threads 4`), the load on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-45)) |
 
 ## Running it
 
@@ -271,7 +270,6 @@ was re-recorded for it:
 | `37-zrandmember-by-count` | 2 | as suite `16`, whose sizes it extends |
 | `39-bgsave-strings`, `40-wp-object-cache`, `43-slab-churn` | the server's pinned CPUs (4) | as suites `20` and `34`: the server is pinned to half the CPUs of a `Standard_D8s_v5` and gets `--threads` to match |
 | `42-alone-scripts-mix` | the server's pinned CPUs (4) | as suites `20`, `34` and `36` |
-| `45-centrifuge-history-vs-redis` | the server's pinned CPUs (4) | as suite `42` |
 | `32-default-threads` | 0 (none) | measures the default on purpose |
 
 Redis ignores the count. The default itself is watched by
@@ -1771,11 +1769,6 @@ This suite declares `min_cpus=8`: run it on a Standard_D8s_v5 with
 `run-all.sh --candidate <bin> --candidate-full <bin> --min-cpus-only --label
 <label>-d8s_v5`, or `--only 42` on a machine with 8 CPUs.
 
-For #900 (a queued script's connection looks for its reply), suite 42 was run
-again on the change (`results/pr900-s42-d8s_v5`, candidate and Redis): verdict
-ok, `nextcloud` 326,150 / 319,563 ops/s with a p99 of 0.919 / 2.59 ms at 200 /
-500 connections, `nextcloud_p99_over_noscript` 0.94 / 1.03.
-
 ## Recorded run, suite 43
 
 Recorded 2026-11-21 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C),
@@ -1811,41 +1804,6 @@ from the VM image. The server has CPUs 0-3 and the clients 4-7. The run took
   `peak_vs_off` at most 1.03; `settled_rss_mib` and `final_rss_mib` +5 %;
   `peak_x_load` +10 %; the pass's p99 at most 1.5x the seconds before it plus
   0.2 ms (`*_p99_excess_ms`), and its p99 and p99.9 within 25 % or 0.2 ms.
-
-## Recorded run, suite 45
-
-Recorded 2026-11-21 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C),
-`--only 45 --record`, label `pr900-d8s_v5`; the candidate is the #900 change
-on master `a987989e`, `cargo build --release --features lua,tls` by rustc
-1.100.0; Redis 8.10.2 from the VM image. The server has CPUs 0-3 (KiviDB
-`--threads 4`, Redis one thread), the 4 `redis-cli --pipe` connections 4-7.
-Master `a987989e` was run as the candidate in the same session
-(`results/pr900-master-d8s_v5`, candidate only): it fails every row's
-`THROUGHPUT` gate. Calls a second, medians of 3 rounds:
-
-| row | v1.2.2 | master | candidate | Redis 8.10.2 | Redis / candidate | gate (`vs_redis`) |
-|---|---:|---:|---:|---:|---:|---:|
-| `history_list` | 53,526 | 84,153 | 111,855 | 149,416 | 1.34x | 1.55x |
-| `history_stream` | 31,739 | 59,407 | 69,053 | 67,551 | 0.98x | 1.15x |
-| `publish_list` | 47,679 | 59,785 | 76,031 | 111,098 | 1.46x | 1.70x |
-| `publish_stream` | 46,868 | 57,989 | 68,536 | 78,458 | 1.14x | 1.35x |
-| `publish_list_many` | 45,528 | 57,308 | 65,222 | 104,893 | 1.61x | 1.85x |
-| `publish_stream_many` | 41,256 | 56,168 | 64,439 | 76,151 | 1.18x | 1.30x |
-
-A first run of the same binaries an hour before gave the candidate 111,363,
-67,439, 75,957, 66,154, 65,433 and 66,744 calls a second: within 4 % of the
-recorded ones. Every round had no error reply, and the histories had 4 entries
-after a read round and 100 after a one-channel publish round.
-
-Redis is further ahead here than in centrifuge's own benchmarks (where, on the
-same machine, the candidate was 1.09-1.27x Redis on the list rows and 0.79-0.97x
-on most stream rows; docs/PERFORMANCE.md, "Centrifuge's history scripts"):
-`redis-cli --pipe` keeps thousands of calls in flight on each connection, and
-Redis answers a connection's whole pipeline in one turn of its loop, where
-KiviDB answers a connection's scripts one at a time and queues each behind the
-scripts of the other connections. The gates sit about 15 % above the recorded
-ratios, to be tightened when the scripts that run alone get one thread of
-their own.
 
 ## Not covered
 
