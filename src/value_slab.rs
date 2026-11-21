@@ -41,13 +41,15 @@
 //! [`finish_evacuation`] puts back those that did not.
 //!
 //! **The lists.** Every slab nobody owns that holds something is in exactly
-//! one of its class's two lists, under the class's lock: a [`PARTIAL`] one
-//! in the list threads take slabs from, a [`FULL`] one in a list of its own,
-//! linked through the slabs' headers (no allocation, and taken out in a few
-//! stores). A slab moves between them, and out of them, only when its state
-//! changes, under that lock, so a block taken or given back that changes no
-//! state touches neither. The FULL list is what lets compaction choose a
-//! full slab that has room (a slab that is three quarters full and more is
+//! one of its class's lists, under the class's lock: a [`PARTIAL`] one in
+//! one of the two lists threads take slabs from (those whose room is all
+//! blocks given back, taken first, and those with room never handed out), a
+//! [`FULL`] one in a list of its own, linked through the slabs' headers (no
+//! allocation, and taken out in a few stores). A slab moves between them,
+//! and out of them, only when its state changes, under that lock, so a
+//! block taken or given back that changes no state touches none. The FULL
+//! list is what lets compaction choose a full slab that has room (a slab
+//! that is three quarters full and more, fifteen sixteenths a large one, is
 //! not used again for blocks, and its free blocks would otherwise stay so),
 //! with the same check of its generation as a partial one
 //! ([`plan_evacuation_with_full`]).
@@ -224,8 +226,8 @@ struct Slab {
     /// Blocks handed out and not given back, but for those the owner took
     /// and gave back itself, which it adds in when it lets the slab go.
     live: AtomicI32,
-    /// Where the slab is in its class's list of partial slabs, while it is
-    /// [`PARTIAL`]. Under the class's lock.
+    /// Where the slab is in the one of its class's lists of partial slabs
+    /// it is in, while it is [`PARTIAL`]. Under the class's lock.
     index: UnsafeCell<u32>,
     /// Blocks other threads have given back, each pointing to the next.
     remote: AtomicPtr<u8>,
@@ -411,8 +413,8 @@ fn capacity(class: usize) -> i32 {
 }
 
 /// The most blocks a slab nobody owns may hold and be in its class's list:
-/// a quarter of it free, or a sixty-fourth (at least one block) while memory
-/// is near `maxmemory`.
+/// a quarter of it free (a sixteenth, a large slab), or a sixty-fourth (at
+/// least one block) while memory is near `maxmemory`.
 ///
 /// Listed with the first block freed, a full slab went to the next thread
 /// that needed one, gave it that block and was full again: under random
@@ -430,11 +432,22 @@ fn capacity(class: usize) -> i32 {
 /// it is free, and the slabs stay within about 1.5% of full. A slab then
 /// gives its owner fewer blocks a lock (8 of 100 bytes, 1 of 1 KB), which
 /// next to the eviction each of those writes makes is nothing.
+///
+/// A large slab is used again once a sixteenth of it is free: 64 KiB of
+/// blocks a lock, 2 of the largest and 31 of the smallest, each a copy of
+/// 2 KiB or more. With a quarter, a delete of a tenth of 120,000 values of
+/// 100 bytes to 16 KB and their refill found next to no slab to take again
+/// (the slabs of 40 to 500 blocks were about nine tenths full) and took a
+/// tenth more slabs, which active defrag left (a pass needs an eighth of a
+/// full slab free): RSS stayed 1.11x what it was after the load, where the
+/// system allocator, reusing the blocks freed, had 1.04x.
 #[inline]
 fn listable(class: usize) -> i32 {
     let capacity = capacity(class);
     let free = if crate::memory_use::near_limit() {
         (capacity / 64).max(1)
+    } else if is_large(class) {
+        capacity / 16
     } else {
         capacity / 4
     };
@@ -450,8 +463,15 @@ unsafe impl Send for SlabPtr {}
 /// being emptied: each in one of the two, as its state says. The lock around
 /// it is the class's lock.
 struct Lists {
-    /// The [`PARTIAL`] slabs, each at its `index`: for threads to take.
+    /// The [`PARTIAL`] slabs with no room left that was never handed out
+    /// (their room is blocks given back), each at its `index`: for threads
+    /// to take first.
     partial: Vec<SlabPtr>,
+    /// The PARTIAL slabs that still have such room, each at its `index`:
+    /// taken when `partial` is empty. A large slab's owner lets go of it for
+    /// one of `partial` rather than write to pages never touched
+    /// ([`take`]).
+    fresh: Vec<SlabPtr>,
     /// The first [`FULL`] slab, the others after it through their `next`.
     full: SlabPtr,
     /// How many FULL slabs there are.
@@ -462,27 +482,61 @@ impl Lists {
     const fn new() -> Self {
         Lists {
             partial: Vec::new(),
+            fresh: Vec::new(),
             full: SlabPtr(ptr::null()),
             full_len: 0,
         }
     }
 
+    /// The list of partial slabs `slab`, which nobody owns, belongs in:
+    /// `fresh` while it has room never handed out. Its room does not change
+    /// while it is listed (only an owner hands blocks out).
+    fn vec_of(&mut self, slab: &Slab) -> &mut Vec<SlabPtr> {
+        if has_fresh_room(slab) {
+            &mut self.fresh
+        } else {
+            &mut self.partial
+        }
+    }
+
     /// Put `slab`, now [`PARTIAL`], in the list threads take slabs from.
     fn list(&mut self, slab: &Slab) {
+        let vec = self.vec_of(slab);
         // SAFETY: under the class's lock (`&mut self`).
-        unsafe { *slab.index.get() = self.partial.len() as u32 };
-        self.partial.push(SlabPtr(slab));
+        unsafe { *slab.index.get() = vec.len() as u32 };
+        vec.push(SlabPtr(slab));
+        self.count_partial(slab);
     }
 
     /// Take `slab`, which is [`PARTIAL`], out of the list threads take slabs
     /// from.
     fn unlist(&mut self, slab: &Slab) {
+        let vec = self.vec_of(slab);
         // SAFETY: under the class's lock.
         let at = unsafe { *slab.index.get() } as usize;
-        self.partial.swap_remove(at);
-        if let Some(moved) = self.partial.get(at) {
+        vec.swap_remove(at);
+        if let Some(moved) = vec.get(at) {
             // SAFETY: under the class's lock.
             unsafe { *(*moved.0).index.get() = at as u32 };
+        }
+        self.count_partial(slab);
+    }
+
+    /// A partial slab for a thread to own: one whose room is blocks given
+    /// back first.
+    fn take_partial(&mut self, class: usize) -> Option<SlabPtr> {
+        let slab = self.partial.pop().or_else(|| self.fresh.pop())?;
+        if class < CLASSES {
+            REUSABLE[class].store(self.partial.len(), Ordering::Relaxed);
+        }
+        Some(slab)
+    }
+
+    /// Keep [`REUSABLE`] of `slab`'s class.
+    fn count_partial(&self, slab: &Slab) {
+        let class = slab.class.load(Ordering::Relaxed) as usize;
+        if class < CLASSES {
+            REUSABLE[class].store(self.partial.len(), Ordering::Relaxed);
         }
     }
 
@@ -545,6 +599,21 @@ impl Lists {
 /// Each class's lists of slabs nobody owns, under its lock: the class's
 /// lock.
 static LISTS: [Mutex<Lists>; ALL_CLASSES] = [const { Mutex::new(Lists::new()) }; ALL_CLASSES];
+
+/// How many slabs each keyspace class has in its `partial` list (blocks
+/// given back, no room never handed out), as last written under its lock:
+/// read without it by [`take`].
+static REUSABLE: [AtomicUsize; CLASSES] = [const { AtomicUsize::new(0) }; CLASSES];
+
+/// Whether `slab` has room never handed out, for a block of its class. Read
+/// by its owner, or under its class's lock while nobody owns it.
+fn has_fresh_room(slab: &Slab) -> bool {
+    let class = slab.class.load(Ordering::Relaxed) as usize;
+    // SAFETY: written only by the slab's owner; read by it, or under the
+    // class's lock, which its last owner let it go under.
+    let bump = unsafe { *slab.bump.get() } as usize;
+    bump + block_size(class) <= slab_size(class)
+}
 
 /// Where [`plan_evacuation_with_full`] is in each class's list of full
 /// slabs: a header of no slab, linked into the list while it walks it, so
@@ -761,7 +830,21 @@ unsafe fn take(slab: &Slab, class: usize) -> Option<*mut u8> {
         } else {
             let bump = &mut *slab.bump.get();
             let size = block_size(class) as u32;
-            if *bump as usize + size as usize > slab_size(class) {
+            let left = slab_size(class) - *bump as usize;
+            if left < size as usize {
+                return None;
+            }
+            // A large slab's room never handed out is pages never touched:
+            // while slabs of the class have blocks given back, the owner
+            // lets go of this one for one of those (it is listed, with a
+            // sixteenth or more of it this room, see `listable`). With 1 MiB
+            // slabs, each thread's own slab of each class kept up to that
+            // much room: a refill after a delete went there, and RSS grew
+            // by the refill while the blocks deleted stayed free.
+            if is_large(class)
+                && REUSABLE[class].load(Ordering::Relaxed) > 0
+                && left / size as usize >= capacity(class) as usize / 16
+            {
                 return None;
             }
             let block = slab.base(slab_size(class)).add(*bump as usize);
@@ -851,7 +934,7 @@ fn put_back(mut lists: parking_lot::MutexGuard<'_, Lists>, slab: &Slab, class: u
 /// the same block. Nothing in it panics but on a broken invariant, and a
 /// failed allocation aborts.
 fn acquire(class: usize, owner: usize) -> *const Slab {
-    if let Some(SlabPtr(slab)) = LISTS[class].lock().partial.pop() {
+    if let Some(SlabPtr(slab)) = LISTS[class].lock().take_partial(class) {
         // SAFETY: a header lives as long as the process.
         let s = unsafe { &*slab };
         s.owner.store(owner, Ordering::Relaxed);
@@ -1134,10 +1217,13 @@ fn plan(budget: usize, full_free_per_mille: u32, classes: std::ops::Range<usize>
                 free_bytes: (blocks - live) * size,
             }
         };
-        for &slab in LISTS[class].lock().partial.iter() {
-            let candidate = measured(slab, PARTIAL);
-            room[class] += candidate.free_bytes;
-            candidates.push(candidate);
+        {
+            let lists = LISTS[class].lock();
+            for &slab in lists.partial.iter().chain(lists.fresh.iter()) {
+                let candidate = measured(slab, PARTIAL);
+                room[class] += candidate.free_bytes;
+                candidates.push(candidate);
+            }
         }
         if (1..1000).contains(&full_free_per_mille) {
             let most = 1000 - (full_free_per_mille.min(1000) as usize);
@@ -1470,10 +1556,19 @@ pub fn check_lists(quiescent: bool) -> Result<(), String> {
             listed.clear();
         }
         let lists = LISTS[class].lock();
-        for (at, slab) in lists.partial.iter().enumerate() {
+        let partial = lists
+            .partial
+            .iter()
+            .enumerate()
+            .map(|(at, s)| (at, s, false));
+        let fresh = lists.fresh.iter().enumerate().map(|(at, s)| (at, s, true));
+        for (at, slab, in_fresh) in partial.chain(fresh) {
             // SAFETY: a header lives as long as the process.
             let s = unsafe { &*slab.0 };
             let what = || format!("class {class}: partial slab {at} ({:p})", slab.0);
+            if has_fresh_room(s) != in_fresh {
+                return Err(format!("{} is in the wrong list of partial slabs", what()));
+            }
             if s.state.load(Ordering::Relaxed) != PARTIAL {
                 return Err(format!(
                     "{} is in state {}",
@@ -1785,10 +1880,19 @@ mod tests {
                 assert_eq!(state, PARTIAL, "slab {base:x}, {n} blocks");
                 // SAFETY: under the class's lock.
                 let at = unsafe { *s.index.get() } as usize;
-                assert!(ptr::eq(lists.partial[at].0, s));
+                let vec = if has_fresh_room(s) {
+                    &lists.fresh
+                } else {
+                    &lists.partial
+                };
+                assert!(ptr::eq(vec[at].0, s));
             }
         }
-        assert_eq!(lists.partial.len() + lists.full_len, listed, "slabs listed");
+        assert_eq!(
+            lists.partial.len() + lists.fresh.len() + lists.full_len,
+            listed,
+            "slabs listed"
+        );
     }
 
     /// The lists through every change of state (#240), against a model:
@@ -1899,7 +2003,8 @@ mod tests {
         check_model(class, &[], &[]);
         assert_eq!(slabs_of_class(class), 0);
         let lists = LISTS[class].lock();
-        assert!(lists.partial.is_empty() && lists.full.0.is_null() && lists.full_len == 0);
+        assert!(lists.partial.is_empty() && lists.fresh.is_empty());
+        assert!(lists.full.0.is_null() && lists.full_len == 0);
     }
 
     /// The walk of a list of full slabs lets go of the class's lock every
