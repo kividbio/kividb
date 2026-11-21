@@ -1607,7 +1607,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   more than `active-defrag-slab-waste-bytes` (16 MiB), besides
   `active-defrag-threshold-lower` and `active-defrag-ignore-bytes`. What it
   moves goes into the room of the class's partial slabs first; a round's new
-  slabs are kept to a 128th of the slabs; no pass starts until the values in
+  slabs are kept to a 128th of the slabs, or to what is left below the most
+  the slabs have taken before (up to an eighth); no pass starts until the values in
   the slabs have changed by less than a 32nd of them each second for 5
   seconds, a round ends when a large delete or its refill starts, and no
   pass starts while a snapshot, an AOF rewrite or a backup is written. A pass the

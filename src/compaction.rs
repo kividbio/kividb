@@ -79,7 +79,7 @@
 use crate::cpus::BuilderExt as _;
 use std::cell::{Cell, RefCell};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::store::{Leftover, Relocated, Shard, Store};
@@ -140,6 +140,24 @@ const CALM_TICKS: u32 = 5;
 /// with active defrag off (#240).
 const BUDGET_SHARE: usize = 128;
 const BUDGET_MIN: usize = 1 << 20;
+
+/// The most the slabs have taken at a tick or at the start of a round since
+/// the process started: a round may take new slabs up to it.
+static SLABS_HIGH: AtomicUsize = AtomicUsize::new(0);
+
+/// A round's budget, the slabs now taking `slabs` bytes: a [`BUDGET_SHARE`]th
+/// of them (at least [`BUDGET_MIN`]), or what is left below the most they have
+/// taken ([`SLABS_HIGH`]) if that is more, up to an eighth of them. Below that
+/// mark a round's new slabs raise no peak: the slabs have held that much
+/// before, and their pages were the process's. So once a pass has got some
+/// back, its rounds grow, and it ends sooner: in rounds of 17 MiB, a pass
+/// after the snapshot case (2,000,000 keys of 1 KB, #240) had not ended 30 s
+/// after the writes stopped.
+fn budget(slabs: usize) -> usize {
+    let high = SLABS_HIGH.fetch_max(slabs, Ordering::Relaxed).max(slabs);
+    let small = (slabs / BUDGET_SHARE).max(BUDGET_MIN);
+    small.max((high - slabs).min(slabs / 8))
+}
 
 /// Whether what is in the slabs moved from `before` to `now` by more than
 /// one [`REFILL`]th of `slabs`, either way.
@@ -642,6 +660,7 @@ fn pass(store: &Store, streak: &mut Streak) -> Result<bool, Failed> {
                 streak.calm.saturating_add(1)
             };
             streak.live_before = Some(fill.live_bytes);
+            SLABS_HIGH.fetch_max(fill.slab_bytes, Ordering::Relaxed);
             let Some(trigger) = wasting(&fill, false, streak.slab_waste_on()) else {
                 return false;
             };
@@ -794,7 +813,7 @@ fn compact(store: &Store) -> Got {
         live_before = Some(fill.live_bytes);
         // What may go into new slabs: what is moved takes that new room
         // before the slabs it left are given back.
-        let budget = (fill.slab_bytes / BUDGET_SHARE).max(BUDGET_MIN);
+        let budget = budget(fill.slab_bytes);
         let full = full_slab_free_percent() * 10;
         got.planned += 1;
         if value_slab::plan_evacuation_with_full(budget, full) == 0 {
@@ -1052,6 +1071,25 @@ mod trigger_tests {
         assert!(streak.slab_waste_on());
         streak.waste_pass_ended(false);
         assert_eq!(streak.waste_off, WASTE_BACKOFF);
+    }
+
+    #[test]
+    fn a_round_takes_a_128th_of_the_slabs_or_what_is_left_below_their_high_mark() {
+        // Passes of other tests move the mark.
+        let _one = value_slab::EVACUATION_TESTS.lock();
+        let high = SLABS_HIGH.swap(0, Ordering::Relaxed);
+        assert_eq!(budget(64 * MIB), MIB);
+        assert_eq!(budget(1024 * MIB), 8 * MIB);
+        // 100 MiB below the mark: that much.
+        SLABS_HIGH.store(1100 * MIB, Ordering::Relaxed);
+        assert_eq!(budget(1000 * MIB), 100 * MIB);
+        // Far below it: an eighth at most.
+        SLABS_HIGH.store(3000 * MIB, Ordering::Relaxed);
+        assert_eq!(budget(1000 * MIB), 125 * MIB);
+        // Above it: the mark follows.
+        assert_eq!(budget(4000 * MIB), 4000 * MIB / 128);
+        assert_eq!(SLABS_HIGH.load(Ordering::Relaxed), 4000 * MIB);
+        SLABS_HIGH.fetch_max(high, Ordering::Relaxed);
     }
 
     #[test]
