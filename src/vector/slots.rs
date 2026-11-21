@@ -94,6 +94,19 @@ impl std::fmt::Debug for Slots {
     }
 }
 
+/// A vector set's distance, kept out of line: inlined into every search
+/// loop, the quantized arms cost FT.SEARCH's f32 graphs up to 13% of their
+/// q/s at 64 dimensions.
+#[inline(never)]
+fn encoded_dist(
+    encoding: super::quant::Encoding,
+    metric: &super::DistanceMetric,
+    a: &[f32],
+    b: &[f32],
+) -> f32 {
+    encoding.distance(metric, a, b)
+}
+
 impl Slots {
     /// Slots for vectors of `dim` floats and up to `m0` layer-0 links.
     pub fn new(dim: usize, m0: usize) -> Self {
@@ -124,7 +137,7 @@ impl Slots {
     pub fn dist(&self, metric: &super::DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
         match self.encoding {
             super::quant::Encoding::F32 => super::distance_prenorm(metric, a, b),
-            other => other.distance(metric, a, b),
+            other => encoded_dist(other, metric, a, b),
         }
     }
 

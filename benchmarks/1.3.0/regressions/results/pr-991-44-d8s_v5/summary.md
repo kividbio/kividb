@@ -4,93 +4,132 @@ Verdict: **ok**
 
 - Machine: Standard_D8s_v5, 8 vCPU, Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz, kernel 7.0.0-1017-azure, glibc 2.39
 - CPU: recorded on INTEL(R) XEON(R) PLATINUM 8573C / Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz; now Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
-- calibration (indicative only): 93.6 ms for a fixed sha256 loop, 8 cores
+- calibration (indicative only): 96.1 ms for a fixed sha256 loop, 8 cores
 - Client: Python 3.12.3, redis-py 5.2.1
 - v1_2_2: `kividb 1.2.2`, sha256 `38fc2cea40c131e041f4914527a98719e5d34dffdfe2abdc1f07ecb86aa6723e`, rustc 1.100.0
-- candidate: `kividb 1.2.1 (default build: no Lua, no TLS)`, sha256 `6bb471c43b2dac0b04519086c4b93994771d8b4bb5ac02a88d953df95db4602b`, rustc 1.100.0
+- candidate: `kividb 1.2.1 (default build: no Lua, no TLS)`, sha256 `17892c3f881f27ede4614aad7b5c23543a635119e9dbba188acbb031daa7577b`, rustc 1.100.0
 - redis: `Redis server v=8.10.2 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=75a9b36b1f0aa00`, sha256 `b0cd304980112fa6cd8dced524fdd6b136fd8efb802f5cf9e81610051a11891c`
 - v1_2_2_full: `kividb 1.2.2`, sha256 `ac5e05fe1274fd1167780e512bc03aa103340f42525a2cef4a2a762e47317ad5`, rustc 1.100.0
-- candidate commit: `2ac7cf91`
+- candidate commit: `7a0d203e`
 - date: 2026-11-21; FULL=1, SCALE=1
-- run time: 44-vector-sets-hnsw 1434s
+- run time: 44-vector-sets-hnsw 2078s
 
-Host speed (this host vs the recorded one; 1.00 = same, below 1 = slower), from v1.2.2 measured in both sessions: global 0.91x over 25 metrics
-- 44-vector-sets-hnsw/glove100_100k: 0.87x (5 metrics)
-- 44-vector-sets-hnsw/laion768_100k: 0.84x (5 metrics)
-- 44-vector-sets-hnsw/sift128_100k: 0.86x (5 metrics)
-- 44-vector-sets-hnsw/sift128_10k: 0.92x (5 metrics)
-- 44-vector-sets-hnsw/sift128_1m: 0.94x (5 metrics)
-- recorded on Standard_D8s_v5 / INTEL(R) XEON(R) PLATINUM 8573C: 0.91x (25 metrics)
+Host speed (this host vs the recorded one; 1.00 = same, below 1 = slower), from v1.2.2 measured in both sessions: global 0.98x over 25 metrics
+- 44-vector-sets-hnsw/glove100_100k: 0.97x (5 metrics)
+- 44-vector-sets-hnsw/laion768_100k: 0.99x (5 metrics)
+- 44-vector-sets-hnsw/sift128_100k: 0.96x (5 metrics)
+- 44-vector-sets-hnsw/sift128_10k: 0.99x (5 metrics)
+- 44-vector-sets-hnsw/sift128_1m: 1.00x (5 metrics)
+- recorded on Standard_D8s_v5 / Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz: 0.98x (25 metrics)
 
 ## 44-vector-sets-hnsw
 
 | config | metric | unit | v1.2.2 | candidate | Redis | recorded | gate | result |
 |---|---|---|---:|---:|---:|---:|---|---|
-| glove100_100k | bytes_per_vector | B | 495.8 | 547.8 | 869.3 | 968.1 | rel: <= 1,017 (5% over 968.1) | pass |
-| glove100_100k | graph_ready_s | s | 0.0001 | 0.209 | 0.0001 | 0.258 | info | info |
-| glove100_100k | recall_at_10 | ratio | 1 | 0.897 | 0.871 | 0.898 | rel: >= 0.88 (2% under 0.898)<br>vs_redis: 0.97x Redis <= 1.0101x | pass<br>pass |
-| glove100_100k | vadd_per_s | VADD/s | 316,804 | 13,743 | 2,356 | 14,095 | rel: >= 10,988 (10% under 12,208, recorded 14,095 scaled by host speed 0.87x (group)) | pass |
-| glove100_100k | vsim_p50_ms_c1 | ms | 12.17 | 0.314 | 0.577 | 0.415 | info | info |
-| glove100_100k | vsim_p50_ms_c50 | ms | 150.6 | 3.42 | 6.57 | 3.9 | info | info |
-| glove100_100k | vsim_p50_ms_c8 | ms | 24.07 | 0.602 | 1.12 | 0.67 | info | info |
-| glove100_100k | vsim_p99_ms_c1 | ms | 12.94 | 0.4 | 0.787 | 0.536 | info | info |
-| glove100_100k | vsim_p99_ms_c50 | ms | 163.5 | 4.09 | 11.68 | 4.59 | info | info |
-| glove100_100k | vsim_p99_ms_c8 | ms | 37.32 | 1.07 | 2.24 | 1.18 | info | info |
-| glove100_100k | vsim_qps_c1 | q/s | 83.09 | 3,184 | 1,726 | 2,410 | rel: >= 1,774 (15% under 2,087, recorded 2,410 scaled by host speed 0.87x (group))<br>vs_redis: 0.54x Redis <= 1.2x | pass<br>pass |
-| glove100_100k | vsim_qps_c50 | q/s | 328.6 | 14,792 | 7,421 | 12,792 | rel: >= 9,418 (15% under 11,080, recorded 12,792 scaled by host speed 0.87x (group))<br>vs_redis: 0.50x Redis <= 1.15x | pass<br>pass |
-| glove100_100k | vsim_qps_c8 | q/s | 331.4 | 12,373 | 6,618 | 11,131 | rel: >= 8,194 (15% under 9,641, recorded 11,131 scaled by host speed 0.87x (group))<br>vs_redis: 0.53x Redis <= 1.15x | pass<br>pass |
-| laion768_100k | bytes_per_vector | B | 3,168 | 1,254 | 1,525 | 4,267 | rel: <= 4,481 (5% over 4,267) | pass |
-| laion768_100k | graph_ready_s | s | 0.0001 | 0.311 | 0.0001 | 0.622 | info | info |
-| laion768_100k | recall_at_10 | ratio | 0.998 | 0.97 | 0.968 | 0.972 | rel: >= 0.952 (2% under 0.972)<br>vs_redis: 1.00x Redis <= 1.0101x | pass<br>pass |
-| laion768_100k | vadd_per_s | VADD/s | 133,962 | 10,379 | 1,813 | 6,912 | rel: >= 5,209 (10% under 5,788, recorded 6,912 scaled by host speed 0.84x (group)) | pass |
-| laion768_100k | vsim_p50_ms_c1 | ms | 40.14 | 0.467 | 0.628 | 0.674 | info | info |
-| laion768_100k | vsim_p50_ms_c50 | ms | 503.3 | 5.08 | 7.33 | 7.1 | info | info |
-| laion768_100k | vsim_p50_ms_c8 | ms | 83.13 | 0.871 | 1.23 | 1.15 | info | info |
-| laion768_100k | vsim_p99_ms_c1 | ms | 42.47 | 0.601 | 0.862 | 0.88 | info | info |
-| laion768_100k | vsim_p99_ms_c50 | ms | 554.0 | 6.15 | 13.11 | 8.34 | info | info |
-| laion768_100k | vsim_p99_ms_c8 | ms | 130.7 | 1.49 | 2.5 | 1.56 | info | info |
-| laion768_100k | vsim_qps_c1 | q/s | 24.83 | 2,155 | 1,587 | 1,497 | rel: >= 1,066 (15% under 1,254, recorded 1,497 scaled by host speed 0.84x (group))<br>vs_redis: 0.74x Redis <= 1.2x | pass<br>pass |
-| laion768_100k | vsim_qps_c50 | q/s | 95.36 | 9,784 | 6,655 | 7,000 | rel: >= 4,983 (15% under 5,862, recorded 7,000 scaled by host speed 0.84x (group))<br>vs_redis: 0.68x Redis <= 1.15x | pass<br>pass |
-| laion768_100k | vsim_qps_c8 | q/s | 95.44 | 8,742 | 5,972 | 6,925 | rel: >= 4,929 (15% under 5,799, recorded 6,925 scaled by host speed 0.84x (group))<br>vs_redis: 0.68x Redis <= 1.15x | pass<br>pass |
-| sift128_100k | bytes_per_vector | B | 607.7 | 612.2 | 885.0 | 1,060 | rel: <= 1,113 (5% over 1,060) | pass |
-| sift128_100k | graph_ready_s | s | 0.0001 | 0.107 | 0.0001 | 0.207 | info | info |
-| sift128_100k | recall_at_10 | ratio | 1 | 0.975 | 0.972 | 0.976 | rel: >= 0.956 (2% under 0.976)<br>vs_redis: 1.00x Redis <= 1.0101x | pass<br>pass |
-| sift128_100k | vadd_per_s | VADD/s | 282,713 | 18,826 | 4,234 | 19,114 | rel: >= 14,739 (10% under 16,376, recorded 19,114 scaled by host speed 0.86x (group)) | pass |
-| sift128_100k | vsim_p50_ms_c1 | ms | 12.10 | 0.284 | 0.441 | 0.341 | info | info |
-| sift128_100k | vsim_p50_ms_c50 | ms | 158.8 | 2.91 | 5.35 | 3.17 | info | info |
-| sift128_100k | vsim_p50_ms_c8 | ms | 24.65 | 0.515 | 0.938 | 0.554 | info | info |
-| sift128_100k | vsim_p99_ms_c1 | ms | 13.13 | 0.33 | 0.543 | 0.446 | info | info |
-| sift128_100k | vsim_p99_ms_c50 | ms | 164.7 | 3.57 | 9.52 | 3.76 | info | info |
-| sift128_100k | vsim_p99_ms_c8 | ms | 38.29 | 0.862 | 1.7 | 0.976 | info | info |
-| sift128_100k | vsim_qps_c1 | q/s | 82.32 | 3,530 | 2,269 | 2,916 | rel: >= 2,124 (15% under 2,499, recorded 2,916 scaled by host speed 0.86x (group))<br>vs_redis: 0.64x Redis <= 1.2x | pass<br>pass |
-| sift128_100k | vsim_qps_c50 | q/s | 323.8 | 17,113 | 9,091 | 15,712 | rel: >= 11,442 (15% under 13,461, recorded 15,712 scaled by host speed 0.86x (group))<br>vs_redis: 0.53x Redis <= 1.15x | pass<br>pass |
-| sift128_100k | vsim_qps_c8 | q/s | 324.2 | 14,506 | 8,154 | 13,519 | rel: >= 9,845 (15% under 11,582, recorded 13,519 scaled by host speed 0.86x (group))<br>vs_redis: 0.56x Redis <= 1.15x | pass<br>pass |
-| sift128_10k | bytes_per_vector | B | 632.4 | 702.3 | 884.7 | 1,160 | rel: <= 1,219 (5% over 1,160) | pass |
-| sift128_10k | graph_ready_s | s | 0.0001 | 0.153 | 0.0001 | 0.154 | info | info |
-| sift128_10k | recall_at_10 | ratio | 1 | 0.982 | 0.981 | 0.982 | rel: >= 0.962 (2% under 0.982)<br>vs_redis: 1.00x Redis <= 1.0101x | pass<br>pass |
-| sift128_10k | vadd_per_s | VADD/s | 180,006 | 32,211 | 8,574 | 33,294 | rel: >= 27,587 (10% under 30,652, recorded 33,294 scaled by host speed 0.92x (group)) | pass |
-| sift128_10k | vsim_p50_ms_c1 | ms | 0.611 | 0.219 | 0.287 | 0.229 | info | info |
-| sift128_10k | vsim_p50_ms_c50 | ms | 7.22 | 2.06 | 4.47 | 2.06 | info | info |
-| sift128_10k | vsim_p50_ms_c8 | ms | 1.22 | 0.36 | 0.768 | 0.36 | info | info |
-| sift128_10k | vsim_p99_ms_c1 | ms | 0.688 | 0.299 | 0.395 | 0.273 | info | info |
-| sift128_10k | vsim_p99_ms_c50 | ms | 8.33 | 2.69 | 7.78 | 2.58 | info | info |
-| sift128_10k | vsim_p99_ms_c8 | ms | 1.46 | 0.471 | 1.34 | 0.676 | info | info |
-| sift128_10k | vsim_qps_c1 | q/s | 1,626 | 4,501 | 3,392 | 4,353 | rel: >= 3,407 (15% under 4,008, recorded 4,353 scaled by host speed 0.92x (group))<br>vs_redis: 0.75x Redis <= 1.2x | pass<br>pass |
-| sift128_10k | vsim_qps_c50 | q/s | 6,801 | 24,083 | 10,867 | 24,168 | rel: >= 18,913 (15% under 22,251, recorded 24,168 scaled by host speed 0.92x (group))<br>vs_redis: 0.45x Redis <= 1.15x | pass<br>pass |
-| sift128_10k | vsim_qps_c8 | q/s | 6,489 | 22,103 | 10,027 | 20,241 | rel: >= 15,840 (15% under 18,635, recorded 20,241 scaled by host speed 0.92x (group))<br>vs_redis: 0.45x Redis <= 1.15x | pass<br>pass |
-| sift128_1m | bytes_per_vector | B | 665.1 | 754.5 | 885.3 | 1,203 | rel: <= 1,263 (5% over 1,203) | pass |
-| sift128_1m | graph_ready_s | s | 0.0001 | 0.0134 | 0.0001 | 0.013 | info | info |
-| sift128_1m | recall_at_10 | ratio | 0.999 | 0.959 | 0.951 | 0.957 | rel: >= 0.938 (2% under 0.957)<br>vs_redis: 0.99x Redis <= 1.0101x | pass<br>pass |
-| sift128_1m | vadd_per_s | VADD/s | 286,911 | 12,661 | 2,133 | 10,185 | rel: >= 8,646 (10% under 9,606, recorded 10,185 scaled by host speed 0.94x (group)) | pass |
-| sift128_1m | vsim_p50_ms_c1 | ms | 142.0 | 0.393 | 0.538 | 0.501 | info | info |
-| sift128_1m | vsim_p50_ms_c50 | ms | 1,785 | 4.29 | 6.59 | 5.23 | info | info |
-| sift128_1m | vsim_p50_ms_c8 | ms | 308.4 | 0.757 | 1.1 | 0.89 | info | info |
-| sift128_1m | vsim_p99_ms_c1 | ms | 150.8 | 0.459 | 0.682 | 0.57 | info | info |
-| sift128_1m | vsim_p99_ms_c50 | ms | 5,048 | 4.88 | 11.83 | 6.21 | info | info |
-| sift128_1m | vsim_p99_ms_c8 | ms | 496.8 | 1.22 | 2.21 | 1.59 | info | info |
-| sift128_1m | vsim_qps_c1 | q/s | 7.02 | 2,564 | 1,862 | 2,023 | rel: >= 1,622 (15% under 1,908, recorded 2,023 scaled by host speed 0.94x (group))<br>vs_redis: 0.73x Redis <= 1.2x | pass<br>pass |
-| sift128_1m | vsim_qps_c50 | q/s | 25.64 | 12,067 | 7,409 | 9,544 | rel: >= 7,651 (15% under 9,002, recorded 9,544 scaled by host speed 0.94x (group))<br>vs_redis: 0.61x Redis <= 1.15x | pass<br>pass |
-| sift128_1m | vsim_qps_c8 | q/s | 25.66 | 10,148 | 6,651 | 8,579 | rel: >= 6,878 (15% under 8,092, recorded 8,579 scaled by host speed 0.94x (group))<br>vs_redis: 0.66x Redis <= 1.15x | pass<br>pass |
+| glove100_100k | bytes_per_vector | B | 495.8 | 547.9 | 869.4 | 547.8 | rel: <= 575.2 (5% over 547.8) | pass |
+| glove100_100k | graph_ready_s | s | 0.0001 | 0.21 | 0.0001 | 0.209 | info | info |
+| glove100_100k | recall_at_10 | ratio | 1 | 0.896 | 0.876 | 0.897 | rel: >= 0.879 (2% under 0.897)<br>vs_redis: 0.98x Redis <= 1.0101x | pass<br>pass |
+| glove100_100k | vadd_per_s | VADD/s | 282,256 | 13,500 | 2,068 | 13,743 | rel: >= 11,967 (10% under 13,297, recorded 13,743 scaled by host speed 0.97x (group)) | pass |
+| glove100_100k | vsim_p50_ms_c1 | ms | 12.38 | 0.347 | 0.625 | 0.314 | info | info |
+| glove100_100k | vsim_p50_ms_c50 | ms | 160.8 | 3.56 | 7.2 | 3.42 | info | info |
+| glove100_100k | vsim_p50_ms_c8 | ms | 24.58 | 0.628 | 1.2 | 0.602 | info | info |
+| glove100_100k | vsim_p99_ms_c1 | ms | 13.48 | 0.454 | 0.867 | 0.4 | info | info |
+| glove100_100k | vsim_p99_ms_c50 | ms | 172.6 | 4.21 | 12.97 | 4.09 | info | info |
+| glove100_100k | vsim_p99_ms_c8 | ms | 38.43 | 1.07 | 2.43 | 1.07 | info | info |
+| glove100_100k | vsim_qps_c1 | q/s | 80.39 | 2,815 | 1,592 | 3,184 | rel: >= 2,618 (15% under 3,080, recorded 3,184 scaled by host speed 0.97x (group))<br>vs_redis: 0.57x Redis <= 1.2x | pass<br>pass |
+| glove100_100k | vsim_qps_c50 | q/s | 316.2 | 14,211 | 6,786 | 14,792 | rel: >= 12,165 (15% under 14,311, recorded 14,792 scaled by host speed 0.97x (group))<br>vs_redis: 0.48x Redis <= 1.15x | pass<br>pass |
+| glove100_100k | vsim_qps_c8 | q/s | 324.0 | 12,097 | 6,134 | 12,373 | rel: >= 10,175 (15% under 11,971, recorded 12,373 scaled by host speed 0.97x (group))<br>vs_redis: 0.51x Redis <= 1.15x | pass<br>pass |
+| laion768_100k | bytes_per_vector | B | 3,168 | 1,253 | 1,525 | 1,254 | rel: <= 1,316 (5% over 1,254) | pass |
+| laion768_100k | graph_ready_s | s | 0.0001 | 0.365 | 0.0001 | 0.311 | info | info |
+| laion768_100k | recall_at_10 | ratio | 0.997 | 0.969 | 0.969 | 0.97 | rel: >= 0.951 (2% under 0.97)<br>vs_redis: 1.00x Redis <= 1.0101x | pass<br>pass |
+| laion768_100k | vadd_per_s | VADD/s | 147,219 | 9,848 | 1,653 | 10,379 | rel: >= 9,285 (10% under 10,317, recorded 10,379 scaled by host speed 0.99x (group)) | pass |
+| laion768_100k | vsim_p50_ms_c1 | ms | 40.44 | 0.492 | 0.724 | 0.467 | info | info |
+| laion768_100k | vsim_p50_ms_c50 | ms | 521.7 | 5.28 | 7.91 | 5.08 | info | info |
+| laion768_100k | vsim_p50_ms_c8 | ms | 86.43 | 0.909 | 1.31 | 0.871 | info | info |
+| laion768_100k | vsim_p99_ms_c1 | ms | 42.88 | 0.629 | 1.04 | 0.601 | info | info |
+| laion768_100k | vsim_p99_ms_c50 | ms | 1,123 | 6.27 | 14.07 | 6.15 | info | info |
+| laion768_100k | vsim_p99_ms_c8 | ms | 133.9 | 1.61 | 2.64 | 1.49 | info | info |
+| laion768_100k | vsim_qps_c1 | q/s | 24.68 | 2,052 | 1,369 | 2,155 | rel: >= 1,821 (15% under 2,142, recorded 2,155 scaled by host speed 0.99x (group))<br>vs_redis: 0.67x Redis <= 1.2x | pass<br>pass |
+| laion768_100k | vsim_qps_c50 | q/s | 92.12 | 9,493 | 6,173 | 9,784 | rel: >= 8,267 (15% under 9,726, recorded 9,784 scaled by host speed 0.99x (group))<br>vs_redis: 0.65x Redis <= 1.15x | pass<br>pass |
+| laion768_100k | vsim_qps_c8 | q/s | 92.27 | 8,305 | 5,638 | 8,742 | rel: >= 7,386 (15% under 8,689, recorded 8,742 scaled by host speed 0.99x (group))<br>vs_redis: 0.68x Redis <= 1.15x | pass<br>pass |
+| laion768_100k_noquant | bytes_per_vector | B | 3,168 | 3,564 | 3,829 | - | rel: rel 5%: nothing recorded<br>vs_redis: 0.93x Redis <= 1x | new<br>pass |
+| laion768_100k_noquant | graph_ready_s | s | 0.0001 | 0.787 | 0.0002 | - | info | info |
+| laion768_100k_noquant | recall_at_10 | ratio | 0.998 | 0.992 | 0.989 | - | rel: rel 2%: nothing recorded<br>vs_redis: 1.00x Redis <= 1.0101x | new<br>pass |
+| laion768_100k_noquant | vadd_per_s | VADD/s | 132,742 | 4,849 | 1,016 | - | rel: rel 10%: nothing recorded | new |
+| laion768_100k_noquant | vsim_p50_ms_c1 | ms | 39.00 | 0.753 | 0.806 | - | info | info |
+| laion768_100k_noquant | vsim_p50_ms_c50 | ms | 497.9 | 8.98 | 9.91 | - | info | info |
+| laion768_100k_noquant | vsim_p50_ms_c8 | ms | 82.27 | 1.49 | 1.63 | - | info | info |
+| laion768_100k_noquant | vsim_p99_ms_c1 | ms | 41.32 | 1.02 | 1.09 | - | info | info |
+| laion768_100k_noquant | vsim_p99_ms_c50 | ms | 540.0 | 10.57 | 17.59 | - | info | info |
+| laion768_100k_noquant | vsim_p99_ms_c8 | ms | 126.7 | 2.68 | 3.13 | - | info | info |
+| laion768_100k_noquant | vsim_qps_c1 | q/s | 25.58 | 1,333 | 1,244 | - | rel: rel 15%: nothing recorded<br>vs_redis: 0.93x Redis <= 1.2x | new<br>pass |
+| laion768_100k_noquant | vsim_qps_c50 | q/s | 97.14 | 5,590 | 4,923 | - | rel: rel 15%: nothing recorded<br>vs_redis: 0.88x Redis <= 1.15x | new<br>pass |
+| laion768_100k_noquant | vsim_qps_c8 | q/s | 97.03 | 5,173 | 4,586 | - | rel: rel 15%: nothing recorded<br>vs_redis: 0.89x Redis <= 1.15x | new<br>pass |
+| sift128_100k | bytes_per_vector | B | 607.7 | 612.2 | 885.6 | 612.2 | rel: <= 642.8 (5% over 612.2) | pass |
+| sift128_100k | graph_ready_s | s | 0.0001 | 0.105 | 0.0001 | 0.107 | info | info |
+| sift128_100k | recall_at_10 | ratio | 1 | 0.976 | 0.972 | 0.975 | rel: >= 0.956 (2% under 0.975)<br>vs_redis: 1.00x Redis <= 1.0101x | pass<br>pass |
+| sift128_100k | vadd_per_s | VADD/s | 259,859 | 18,853 | 3,960 | 18,826 | rel: >= 16,345 (10% under 18,162, recorded 18,826 scaled by host speed 0.96x (group)) | pass |
+| sift128_100k | vsim_p50_ms_c1 | ms | 12.60 | 0.294 | 0.423 | 0.284 | info | info |
+| sift128_100k | vsim_p50_ms_c50 | ms | 163.9 | 2.96 | 5.49 | 2.91 | info | info |
+| sift128_100k | vsim_p50_ms_c8 | ms | 25.51 | 0.522 | 0.966 | 0.515 | info | info |
+| sift128_100k | vsim_p99_ms_c1 | ms | 13.35 | 0.341 | 0.545 | 0.33 | info | info |
+| sift128_100k | vsim_p99_ms_c50 | ms | 169.0 | 3.57 | 10.55 | 3.57 | info | info |
+| sift128_100k | vsim_p99_ms_c8 | ms | 39.34 | 0.698 | 1.8 | 0.862 | info | info |
+| sift128_100k | vsim_qps_c1 | q/s | 79.41 | 3,408 | 2,342 | 3,530 | rel: >= 2,895 (15% under 3,406, recorded 3,530 scaled by host speed 0.96x (group))<br>vs_redis: 0.69x Redis <= 1.2x | pass<br>pass |
+| sift128_100k | vsim_qps_c50 | q/s | 314.0 | 16,855 | 8,794 | 17,113 | rel: >= 14,033 (15% under 16,509, recorded 17,113 scaled by host speed 0.96x (group))<br>vs_redis: 0.52x Redis <= 1.15x | pass<br>pass |
+| sift128_100k | vsim_qps_c8 | q/s | 312.7 | 15,264 | 7,893 | 14,506 | rel: >= 11,895 (15% under 13,994, recorded 14,506 scaled by host speed 0.96x (group))<br>vs_redis: 0.52x Redis <= 1.15x | pass<br>pass |
+| sift128_100k_default | bytes_per_vector | B | 607.7 | 997.3 | 884.9 | - | rel: rel 5%: nothing recorded | new |
+| sift128_100k_default | graph_ready_s | s | 0.0001 | 0.21 | 0.0001 | - | info | info |
+| sift128_100k_default | recall_at_10 | ratio | 1 | 0.998 | 0.973 | - | rel: rel 2%: nothing recorded<br>vs_redis: 0.97x Redis <= 1.0101x | new<br>pass |
+| sift128_100k_default | vadd_per_s | VADD/s | 279,780 | 15,201 | 3,750 | - | rel: rel 10%: nothing recorded | new |
+| sift128_100k_default | vsim_p50_ms_c1 | ms | 12.15 | 0.386 | 0.437 | - | info | info |
+| sift128_100k_default | vsim_p50_ms_c50 | ms | 160.0 | 3.95 | 5.54 | - | info | info |
+| sift128_100k_default | vsim_p50_ms_c8 | ms | 24.80 | 0.69 | 0.975 | - | info | info |
+| sift128_100k_default | vsim_p99_ms_c1 | ms | 13.00 | 0.49 | 0.561 | - | info | info |
+| sift128_100k_default | vsim_p99_ms_c50 | ms | 165.3 | 4.56 | 9.92 | - | info | info |
+| sift128_100k_default | vsim_p99_ms_c8 | ms | 38.21 | 1.14 | 1.8 | - | info | info |
+| sift128_100k_default | vsim_qps_c1 | q/s | 82.28 | 2,603 | 2,277 | - | rel: rel 15%: nothing recorded<br>vs_redis: 0.87x Redis <= 1.2x | new<br>pass |
+| sift128_100k_default | vsim_qps_c50 | q/s | 322.3 | 12,691 | 8,801 | - | rel: rel 15%: nothing recorded<br>vs_redis: 0.69x Redis <= 1.15x | new<br>pass |
+| sift128_100k_default | vsim_qps_c8 | q/s | 322.4 | 10,929 | 7,826 | - | rel: rel 15%: nothing recorded<br>vs_redis: 0.72x Redis <= 1.15x | new<br>pass |
+| sift128_100k_noquant | bytes_per_vector | B | 607.8 | 997.4 | 1,269 | - | rel: rel 5%: nothing recorded<br>vs_redis: 0.79x Redis <= 1x | new<br>pass |
+| sift128_100k_noquant | graph_ready_s | s | 0.0001 | 0.105 | 0.0001 | - | info | info |
+| sift128_100k_noquant | recall_at_10 | ratio | 1 | 0.998 | 0.995 | - | rel: rel 2%: nothing recorded<br>vs_redis: 1.00x Redis <= 1.0101x | new<br>pass |
+| sift128_100k_noquant | vadd_per_s | VADD/s | 255,387 | 14,781 | 3,460 | - | rel: rel 10%: nothing recorded | new |
+| sift128_100k_noquant | vsim_p50_ms_c1 | ms | 12.12 | 0.384 | 0.428 | - | info | info |
+| sift128_100k_noquant | vsim_p50_ms_c50 | ms | 150.9 | 3.89 | 5.84 | - | info | info |
+| sift128_100k_noquant | vsim_p50_ms_c8 | ms | 24.95 | 0.664 | 1.01 | - | info | info |
+| sift128_100k_noquant | vsim_p99_ms_c1 | ms | 12.93 | 0.46 | 0.554 | - | info | info |
+| sift128_100k_noquant | vsim_p99_ms_c50 | ms | 163.6 | 4.59 | 10.32 | - | info | info |
+| sift128_100k_noquant | vsim_p99_ms_c8 | ms | 38.61 | 0.907 | 1.88 | - | info | info |
+| sift128_100k_noquant | vsim_qps_c1 | q/s | 82.34 | 2,625 | 2,314 | - | rel: rel 15%: nothing recorded<br>vs_redis: 0.88x Redis <= 1.2x | new<br>pass |
+| sift128_100k_noquant | vsim_qps_c50 | q/s | 321.0 | 12,843 | 8,333 | - | rel: rel 15%: nothing recorded<br>vs_redis: 0.65x Redis <= 1.15x | new<br>pass |
+| sift128_100k_noquant | vsim_qps_c8 | q/s | 320.2 | 12,003 | 7,542 | - | rel: rel 15%: nothing recorded<br>vs_redis: 0.63x Redis <= 1.15x | new<br>pass |
+| sift128_10k | bytes_per_vector | B | 632.3 | 701.9 | 883.2 | 702.3 | rel: <= 737.5 (5% over 702.3) | pass |
+| sift128_10k | graph_ready_s | s | 0.0001 | 0.153 | 0.0001 | 0.153 | info | info |
+| sift128_10k | recall_at_10 | ratio | 1 | 0.982 | 0.982 | 0.982 | rel: >= 0.962 (2% under 0.982)<br>vs_redis: 1.00x Redis <= 1.0101x | pass<br>pass |
+| sift128_10k | vadd_per_s | VADD/s | 160,808 | 29,779 | 8,243 | 32,211 | rel: >= 28,645 (10% under 31,827, recorded 32,211 scaled by host speed 0.99x (group)) | pass |
+| sift128_10k | vsim_p50_ms_c1 | ms | 0.59 | 0.238 | 0.367 | 0.219 | info | info |
+| sift128_10k | vsim_p50_ms_c50 | ms | 7.5 | 2.17 | 4.63 | 2.06 | info | info |
+| sift128_10k | vsim_p50_ms_c8 | ms | 1.22 | 0.395 | 0.782 | 0.36 | info | info |
+| sift128_10k | vsim_p99_ms_c1 | ms | 0.703 | 0.303 | 0.591 | 0.299 | info | info |
+| sift128_10k | vsim_p99_ms_c50 | ms | 8.36 | 2.73 | 8.99 | 2.69 | info | info |
+| sift128_10k | vsim_p99_ms_c8 | ms | 2.63 | 0.732 | 1.34 | 0.471 | info | info |
+| sift128_10k | vsim_qps_c1 | q/s | 1,672 | 4,166 | 2,667 | 4,501 | rel: >= 3,781 (15% under 4,448, recorded 4,501 scaled by host speed 0.99x (group))<br>vs_redis: 0.64x Redis <= 1.2x | pass<br>pass |
+| sift128_10k | vsim_qps_c50 | q/s | 6,720 | 22,907 | 10,351 | 24,083 | rel: >= 20,227 (15% under 23,796, recorded 24,083 scaled by host speed 0.99x (group))<br>vs_redis: 0.45x Redis <= 1.15x | pass<br>pass |
+| sift128_10k | vsim_qps_c8 | q/s | 6,111 | 18,742 | 9,888 | 22,103 | rel: >= 18,564 (15% under 21,840, recorded 22,103 scaled by host speed 0.99x (group))<br>vs_redis: 0.53x Redis <= 1.15x | pass<br>pass |
+| sift128_1m | bytes_per_vector | B | 665.1 | 754.3 | 885.2 | 754.5 | rel: <= 792.2 (5% over 754.5) | pass |
+| sift128_1m | graph_ready_s | s | 0.0001 | 0.0137 | 0.0002 | 0.0134 | info | info |
+| sift128_1m | recall_at_10 | ratio | 0.999 | 0.957 | 0.952 | 0.959 | rel: >= 0.939 (2% under 0.959)<br>vs_redis: 0.99x Redis <= 1.0101x | pass<br>pass |
+| sift128_1m | vadd_per_s | VADD/s | 291,775 | 12,658 | 2,132 | 12,661 | rel: >= 11,395 (10% under 12,661, host speed 1.00x (group)) | pass |
+| sift128_1m | vsim_p50_ms_c1 | ms | 148.3 | 0.393 | 0.546 | 0.393 | info | info |
+| sift128_1m | vsim_p50_ms_c50 | ms | 1,814 | 4.09 | 6.5 | 4.29 | info | info |
+| sift128_1m | vsim_p50_ms_c8 | ms | 319.7 | 0.72 | 1.11 | 0.757 | info | info |
+| sift128_1m | vsim_p99_ms_c1 | ms | 166.7 | 0.462 | 0.682 | 0.459 | info | info |
+| sift128_1m | vsim_p99_ms_c50 | ms | 4,222 | 4.79 | 11.61 | 4.88 | info | info |
+| sift128_1m | vsim_p99_ms_c8 | ms | 573.4 | 1.25 | 2.19 | 1.22 | info | info |
+| sift128_1m | vsim_qps_c1 | q/s | 6.69 | 2,565 | 1,837 | 2,564 | rel: >= 2,179 (15% under 2,564, host speed 1.00x (group))<br>vs_redis: 0.72x Redis <= 1.2x | pass<br>pass |
+| sift128_1m | vsim_qps_c50 | q/s | 26.18 | 12,248 | 7,506 | 12,067 | rel: >= 10,257 (15% under 12,067, host speed 1.00x (group))<br>vs_redis: 0.61x Redis <= 1.15x | pass<br>pass |
+| sift128_1m | vsim_qps_c8 | q/s | 25.29 | 10,387 | 6,666 | 10,148 | rel: >= 8,626 (15% under 10,148, host speed 1.00x (group))<br>vs_redis: 0.64x Redis <= 1.15x | pass<br>pass |
 
 ## Not run this time
 
