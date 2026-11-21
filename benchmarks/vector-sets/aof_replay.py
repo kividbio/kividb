@@ -3,7 +3,7 @@
 
 Starts the server with the AOF on in an empty directory, loads N vectors of a
 dataset with VADD (Q8 unless --quant), waits for the AOF to be on disk, kills
-the server (no snapshot, no rewrite: the AOF is every VADD), starts it again
+the server (no snapshot, and automatic rewrites off: the AOF is every VADD), starts it again
 on the same files and reports:
 
   replay_s   from the start until the server answers PING: the replay
@@ -50,7 +50,9 @@ def main():
     with h5py.File(os.path.join(d, load_time.FILES[a.ds]), "r") as f:
         load_time.DATA = np.ascontiguousarray(f["train"][:a.n], dtype="<f4")
     work = tempfile.mkdtemp(prefix="vset-aof.")
-    args = [a.bin, "--port", str(a.port), "--bind", "127.0.0.1", "--threads", "4", "--aof"]
+    # No rewrite: the AOF is every VADD, not a snapshot of the set.
+    args = [a.bin, "--port", str(a.port), "--bind", "127.0.0.1", "--threads", "4", "--aof",
+            "--auto-aof-rewrite-percentage", "0"]
     out = {"bin": a.bin, "ds": a.ds, "n": a.n, "quant": a.quant}
 
     def start():
