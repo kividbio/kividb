@@ -735,7 +735,9 @@ fn vinfo(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Some(_) => Some(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )),
-        None => Some(resp_null_for(crate::commands::handler::effective_resp_for_reply(ctx))),
+        None => Some(resp_null_for(
+            crate::commands::handler::effective_resp_for_reply(ctx),
+        )),
     }
 }
 
@@ -771,7 +773,9 @@ fn by_distance_then_name(a: &(f32, &[u8]), b: &(f32, &[u8])) -> std::cmp::Orderi
 fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let cmd = &ctx.cmd;
     // Redis: `key element [WITHSCORES]`, and nothing else.
-    if cmd.len() < 3 || cmd.len() > 4 || (cmd.len() == 4 && !cmd[3].eq_ignore_ascii_case(b"WITHSCORES"))
+    if cmd.len() < 3
+        || cmd.len() > 4
+        || (cmd.len() == 4 && !cmd[3].eq_ignore_ascii_case(b"WITHSCORES"))
     {
         return Some(resp_error(
             "ERR wrong number of arguments for 'vlinks' command",
@@ -1873,7 +1877,10 @@ mod graph_tests {
                     model.remove(&name);
                     let v = random_vector(&mut rng, dim);
                     let got = vsim(&vs, &v, 50, false);
-                    assert!(got.iter().all(|(n, _)| *n != name), "seed {seed}: {name} found after VREM");
+                    assert!(
+                        got.iter().all(|(n, _)| *n != name),
+                        "seed {seed}: {name} found after VREM"
+                    );
                 }
                 // Searches: TRUTH exact, the graph's scores exact and its
                 // recall bounded.
@@ -1885,7 +1892,9 @@ mod graph_tests {
                     let got = vsim(&vs, &v, 10, false);
                     assert_eq!(got.len(), 10);
                     for (n, d) in &got {
-                        let x = model.get(n).unwrap_or_else(|| panic!("{n} is not in the set"));
+                        let x = model
+                            .get(n)
+                            .unwrap_or_else(|| panic!("{n} is not in the set"));
                         let q = StoredVector::quantize(quant, v.clone()).unwrap();
                         let s = StoredVector::quantize(quant, x.clone()).unwrap();
                         assert_eq!(*d, q.distance(&s, &metric, dim), "{n}'s score");
@@ -1909,8 +1918,14 @@ mod graph_tests {
         }
         let during = recall_sum / searches as f64;
         let after = after / 200.0;
-        assert!(during >= 0.9, "seed {seed} {quant:?}: recall {during:.3} during the writes");
-        assert!(after >= 0.9, "seed {seed} {quant:?}: recall {after:.3} once settled");
+        assert!(
+            during >= 0.9,
+            "seed {seed} {quant:?}: recall {during:.3} during the writes"
+        );
+        assert!(
+            after >= 0.9,
+            "seed {seed} {quant:?}: recall {after:.3} once settled"
+        );
     }
 
     /// The graph's answer, checked to be the graph's.
@@ -1972,7 +1987,10 @@ mod graph_tests {
         let mut sum = 0.0;
         for _ in 0..200 {
             let v = random_vector(&mut rng, dim);
-            sum += recall(&vs_graph_only(&vs, &v), &exact(&model, Quant::F32, &metric, dim, &v, 10));
+            sum += recall(
+                &vs_graph_only(&vs, &v),
+                &exact(&model, Quant::F32, &metric, dim, &v, 10),
+            );
         }
         assert!(sum / 200.0 >= 0.9, "recall {}", sum / 200.0);
     }
@@ -1990,7 +2008,11 @@ mod graph_tests {
         let mut rng = StdRng::seed_from_u64(11);
         for i in 0..vset_graph::EXACT_BELOW + 500 {
             let v = random_vector(&mut rng, dim);
-            vadd(db, "vs", addition(&format!("base{i}"), &v, Quant::F32, metric));
+            vadd(
+                db,
+                "vs",
+                addition(&format!("base{i}"), &v, Quant::F32, metric),
+            );
         }
         settled(&set_at(db, "vs").unwrap());
         let stop = &std::sync::atomic::AtomicBool::new(false);
@@ -2051,7 +2073,11 @@ mod graph_tests {
                 drop(old);
                 for i in 0..vset_graph::EXACT_BELOW + 100 {
                     let v = random_vector(&mut rng, dim);
-                    vadd(db, "vs", addition(&format!("again{i}"), &v, Quant::F32, metric));
+                    vadd(
+                        db,
+                        "vs",
+                        addition(&format!("again{i}"), &v, Quant::F32, metric),
+                    );
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -2060,14 +2086,20 @@ mod graph_tests {
             // and build are done.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while gone.iter().any(|g| g.strong_count() > 0) {
-                assert!(std::time::Instant::now() < deadline, "a deleted set's graph was kept");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a deleted set's graph was kept"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         });
         let vs = set_at(db, "vs").unwrap();
         settled(&vs);
         let graph = graph_of(&vs);
-        assert_eq!(graph.index.live_count.load(Relaxed), vs.read().entries.len());
+        assert_eq!(
+            graph.index.live_count.load(Relaxed),
+            vs.read().entries.len()
+        );
     }
 
     /// A copy of a set (`COPY`) has no graph of its own until it makes one,
@@ -2086,7 +2118,9 @@ mod graph_tests {
         let a = set_at(db, "a").unwrap();
         settled(&a);
         let copy = KiviDBValue::VectorSet(Arc::clone(&a)).deep_clone();
-        let KiviDBValue::VectorSet(b) = copy else { unreachable!() };
+        let KiviDBValue::VectorSet(b) = copy else {
+            unreachable!()
+        };
         assert!(b.read().graph.get().is_none());
         // A search asks for its graph; until it is made, it scans.
         let v = random_vector(&mut rng, dim);
@@ -2095,6 +2129,9 @@ mod graph_tests {
         settled(&b);
         assert!(!Arc::ptr_eq(&graph_of(&a), &graph_of(&b)));
         b.write().entries.clear();
-        assert_eq!(graph_of(&a).index.live_count.load(Relaxed), a.read().entries.len());
+        assert_eq!(
+            graph_of(&a).index.live_count.load(Relaxed),
+            a.read().entries.len()
+        );
     }
 }

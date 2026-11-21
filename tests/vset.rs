@@ -1607,7 +1607,10 @@ fn graph_set(c: &mut Conn, key: &str, dim: usize, opts: &[&str]) {
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while vinfo_field(c, key, "index-type").as_str() != "HNSW" {
-        assert!(std::time::Instant::now() < deadline, "{key}'s graph was not made");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{key}'s graph was not made"
+        );
         thread::sleep(Duration::from_millis(20));
     }
 }
@@ -1667,7 +1670,10 @@ fn vsim_searches_the_graph_and_truth_scans() {
     assert_eq!(sim(&mut c, "vs", &v, &["COUNT", "1"]), ["new"]);
     assert_eq!(c.cmd(&[b"VADD", b"vs", b"FP32", &blob, b"e5"]).as_int(), 0);
     let near = sim(&mut c, "vs", &v, &["COUNT", "2"]);
-    assert!(near.contains(&"e5".to_string()) && near.contains(&"new".to_string()), "{near:?}");
+    assert!(
+        near.contains(&"e5".to_string()) && near.contains(&"new".to_string()),
+        "{near:?}"
+    );
     assert_eq!(c.cmds(&["VREM", "vs", "new", "e5"]).as_int(), 2);
     let after = sim(&mut c, "vs", &v, &["COUNT", "50"]);
     assert!(!after.iter().any(|n| n == "new" || n == "e5"), "{after:?}");
@@ -1709,14 +1715,33 @@ fn vsim_options_are_checked_and_honoured_as_redis_does() {
     let all = c.cmds(&["VSIM", "vs", "ELE", "e1", "COUNT", "100000"]);
     assert_eq!(all.as_array().len(), GRAPH_N);
     // EPSILON: only the elements within that distance (one less the score).
-    let near = c.cmds(&["VSIM", "vs", "ELE", "e1", "COUNT", "50", "WITHSCORES", "EPSILON", "0.05"]);
+    let near = c.cmds(&[
+        "VSIM",
+        "vs",
+        "ELE",
+        "e1",
+        "COUNT",
+        "50",
+        "WITHSCORES",
+        "EPSILON",
+        "0.05",
+    ]);
     let items = near.as_array();
     assert!(!items.is_empty());
     assert_eq!(items[0].as_str(), "e1");
     for pair in items.chunks(2) {
         assert!(pair[1].as_f64() >= 0.95, "{:?}", pair);
     }
-    let fewer = c.cmds(&["VSIM", "vs", "ELE", "e1", "COUNT", "50", "EPSILON", "0.0000001"]);
+    let fewer = c.cmds(&[
+        "VSIM",
+        "vs",
+        "ELE",
+        "e1",
+        "COUNT",
+        "50",
+        "EPSILON",
+        "0.0000001",
+    ]);
     assert_eq!(fewer.as_array().len(), 1);
     // NOTHREAD and TRUTH take no value.
     assert_eq!(
@@ -1739,11 +1764,20 @@ fn vsim_filter_on_a_large_set() {
     graph_set(&mut c, "vs", dim, &[]);
     for i in 0..GRAPH_N {
         let attrs = format!(r#"{{"i":{i}}}"#);
-        assert_eq!(c.cmds(&["VSETATTR", "vs", &format!("e{i}"), &attrs]).as_int(), 1);
+        assert_eq!(
+            c.cmds(&["VSETATTR", "vs", &format!("e{i}"), &attrs])
+                .as_int(),
+            1
+        );
     }
     for q in 0..20u64 {
         let v = seeded(5_000 + q, dim);
-        let got = sim(&mut c, "vs", &v, &["COUNT", "10", "FILTER", ".i % 2 == 0", "WITHATTRIBS"]);
+        let got = sim(
+            &mut c,
+            "vs",
+            &v,
+            &["COUNT", "10", "FILTER", ".i % 2 == 0", "WITHATTRIBS"],
+        );
         assert_eq!(got.len(), 20);
         for pair in got.chunks(2) {
             let i: u64 = pair[0][1..].parse().unwrap();
@@ -1752,7 +1786,12 @@ fn vsim_filter_on_a_large_set() {
         }
         // Three elements pass: all three, as a scan finds them.
         let rare = sim(&mut c, "vs", &v, &["COUNT", "10", "FILTER", ".i < 3"]);
-        let exact = sim(&mut c, "vs", &v, &["COUNT", "10", "FILTER", ".i < 3", "TRUTH"]);
+        let exact = sim(
+            &mut c,
+            "vs",
+            &v,
+            &["COUNT", "10", "FILTER", ".i < 3", "TRUTH"],
+        );
         assert_eq!(rare.len(), 3);
         assert_eq!(rare, exact);
     }
@@ -1769,7 +1808,10 @@ fn vlinks_and_vinfo_report_the_graph() {
     graph_set(&mut c, "vs", 8, &["M", "8"]);
     assert_eq!(vinfo_field(&mut c, "vs", "hnsw-m").as_int(), 8);
     let max_level = vinfo_field(&mut c, "vs", "max-level").as_int();
-    assert!(max_level >= 1, "a graph of {GRAPH_N} at M 8 has upper layers");
+    assert!(
+        max_level >= 1,
+        "a graph of {GRAPH_N} at M 8 has upper layers"
+    );
     let mut tallest = 0;
     for i in 0..200 {
         let e = format!("e{i}");
@@ -1779,7 +1821,11 @@ fn vlinks_and_vinfo_report_the_graph() {
         tallest = tallest.max(layers.len());
         // Layer 0 holds up to 2 * M links (and some slack), none to itself.
         let layer0 = layers.last().unwrap().as_array();
-        assert!(!layer0.is_empty() && layer0.len() <= 2 * 8 + 4, "{}", layer0.len());
+        assert!(
+            !layer0.is_empty() && layer0.len() <= 2 * 8 + 4,
+            "{}",
+            layer0.len()
+        );
         assert!(layer0.iter().all(|n| n.as_str() != e));
         let scored = c.cmds(&["VLINKS", "vs", &e, "WITHSCORES"]);
         let scored = scored.as_array();
@@ -1795,7 +1841,10 @@ fn vlinks_and_vinfo_report_the_graph() {
     }
     assert!(tallest >= 2, "no element of 200 is above layer 0");
     assert!(c.cmds(&["VLINKS", "vs", "e1", "FOO"]).is_error());
-    assert!(c.cmds(&["VLINKS", "vs", "e1", "WITHSCORES", "x"]).is_error());
+    assert!(
+        c.cmds(&["VLINKS", "vs", "e1", "WITHSCORES", "x"])
+            .is_error()
+    );
     // A small set has no graph: one layer, its nearest elements.
     for i in 0..5 {
         let b = pack_f32(&seeded(i, 3));

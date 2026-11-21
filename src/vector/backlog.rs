@@ -409,7 +409,12 @@ pub(crate) fn put_ordered(
 
 /// Link the vector [`put_ordered`] left to its caller, if `ticket` is
 /// still the key's.
-pub(crate) fn link_ordered(index: &Arc<HnswIndex>, key: &str, ticket: u64, metric: &DistanceMetric) {
+pub(crate) fn link_ordered(
+    index: &Arc<HnswIndex>,
+    key: &str,
+    ticket: u64,
+    metric: &DistanceMetric,
+) {
     link_own(index, key, ticket, metric);
 }
 

@@ -80,8 +80,7 @@ impl VsetGraph {
         let upper = index.live_count.load(Relaxed) * (index.m * 4 + 24) / index.m.max(2);
         index.slot_bytes()
             + nodes * std::mem::size_of::<super::HnswNode>()
-            + index.key_to_id.read().capacity()
-                * (std::mem::size_of::<(String, usize)>() + 1)
+            + index.key_to_id.read().capacity() * (std::mem::size_of::<(String, usize)>() + 1)
             + 2 * names
             + upper
             + index.backlog.bytes()
@@ -259,7 +258,12 @@ pub fn for_search(
 /// The nearest `ef` candidates of `query` (as given, or the element's own,
 /// as f32) the graph finds, nearest first by the graph's distance: the
 /// caller scores them from the elements.
-pub fn search(graph: &VsetGraph, query: &[f32], ef: usize, metric: &DistanceMetric) -> Vec<KnnResult> {
+pub fn search(
+    graph: &VsetGraph,
+    query: &[f32],
+    ef: usize,
+    metric: &DistanceMetric,
+) -> Vec<KnnResult> {
     super::knn_hnsw(&graph.index, query, ef, ef, metric)
 }
 
@@ -275,8 +279,17 @@ pub fn search_admitting(
 ) -> Option<Vec<KnnResult>> {
     let query = super::as_stored(metric, query.to_vec());
     let mut by_node = |node: &super::HnswNode| admit(&crate::key_bytes::bytes_of(&node.key));
-    super::knn_hnsw_admitting(&graph.index, &query, ef, ef, metric, &mut by_node, budget, None)
-        .map(|(found, _)| found)
+    super::knn_hnsw_admitting(
+        &graph.index,
+        &query,
+        ef,
+        ef,
+        metric,
+        &mut by_node,
+        budget,
+        None,
+    )
+    .map(|(found, _)| found)
 }
 
 /// Element name of a graph's result.

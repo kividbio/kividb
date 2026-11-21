@@ -2887,7 +2887,12 @@ fn churn(c: &mut Conn, round: u64) {
             if n % 3 == 0 {
                 cmds.push(vec!["VREM".to_string(), key.to_string(), format!("e{at}")]);
             } else {
-                cmds.push(vadd_cmd(key, &vector(at + 1_000_000 * (round + 1), GDIM), &format!("e{at}"), &opts));
+                cmds.push(vadd_cmd(
+                    key,
+                    &vector(at + 1_000_000 * (round + 1), GDIM),
+                    &format!("e{at}"),
+                    &opts,
+                ));
             }
         }
         pipelined(c, &cmds);
@@ -2915,7 +2920,12 @@ fn wait_graphs(c: &mut Conn) {
 
 fn big_sim(c: &mut Conn, key: &str, q: u64, extra: &[&str]) -> Vec<V> {
     let v = vector(q + 5_000_000, GDIM);
-    let mut args = vec!["VSIM".to_string(), key.to_string(), "VALUES".to_string(), GDIM.to_string()];
+    let mut args = vec![
+        "VSIM".to_string(),
+        key.to_string(),
+        "VALUES".to_string(),
+        GDIM.to_string(),
+    ];
     args.extend(v.iter().map(|x| x.to_string()));
     args.extend(["COUNT".to_string(), "10".to_string()]);
     args.extend(extra.iter().map(|s| s.to_string()));
@@ -2959,7 +2969,10 @@ fn assert_graph_answers(c: &mut Conn, want: &[Vec<V>], what: &str) {
     wait_graphs(c);
     let recall = graph_recall(c);
     assert!(recall >= 0.9, "{what}: recall {recall}");
-    assert!(exact_answers(c) == want, "{what}: TRUTH differs once the graph is made");
+    assert!(
+        exact_answers(c) == want,
+        "{what}: TRUTH differs once the graph is made"
+    );
 }
 
 #[test]
@@ -3023,7 +3036,9 @@ fn graph_sets_through_dump_restore_copy_and_rename() {
     wait_graphs(&mut c);
     let want = exact_answers(&mut c);
     for (key, _) in BIG_SETS {
-        let V::Bulk(payload) = c.cmd(&["DUMP", key]) else { panic!("DUMP {key}") };
+        let V::Bulk(payload) = c.cmd(&["DUMP", key]) else {
+            panic!("DUMP {key}")
+        };
         c.cmd(&["DEL", key]);
         let r = c.cmd_bytes(&[b"RESTORE", key.as_bytes(), b"0", &payload]);
         assert_eq!(r, V::Str("OK".into()), "RESTORE {key}");
@@ -3032,7 +3047,10 @@ fn graph_sets_through_dump_restore_copy_and_rename() {
     for (key, _) in BIG_SETS {
         assert_eq!(c.cmd(&["COPY", key, &format!("{key}-copy")]), V::Int(1));
         c.cmd(&["DEL", key]);
-        assert_eq!(c.cmd(&["RENAME", &format!("{key}-copy"), key]), V::Str("OK".into()));
+        assert_eq!(
+            c.cmd(&["RENAME", &format!("{key}-copy"), key]),
+            V::Str("OK".into())
+        );
     }
     assert_graph_answers(&mut c, &want, "copied and renamed");
 }
