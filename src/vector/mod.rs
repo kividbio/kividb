@@ -3434,7 +3434,17 @@ fn insert_unit(
                     // No live nodes at all: we become the entry point, unless
                     // a racing insert already has (see `enter_empty`).
                     drop(k2id);
-                    return enter_empty(index, slots, nodes, ep_snapshot, key, vector, metric, doc, level);
+                    return enter_empty(
+                        index,
+                        slots,
+                        nodes,
+                        ep_snapshot,
+                        key,
+                        vector,
+                        metric,
+                        doc,
+                        level,
+                    );
                 }
             }
         }
@@ -3666,7 +3676,16 @@ fn enter_empty(
     }
     let mut nodes = index.nodes.read();
     let mut links: Vec<Vec<u32>> = (0..=level).map(|_| Vec::new()).collect();
-    let new_id = publish(index, slots, &mut nodes, key.clone(), &vector, level, doc, &mut links);
+    let new_id = publish(
+        index,
+        slots,
+        &mut nodes,
+        key.clone(),
+        &vector,
+        level,
+        doc,
+        &mut links,
+    );
     index.key_to_id.write().insert(key, new_id);
     index.live_count.fetch_add(1, Relaxed);
     *index.entry_point.write() = Some(new_id);

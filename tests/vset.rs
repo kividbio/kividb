@@ -1853,7 +1853,10 @@ fn vlinks_and_vinfo_report_the_graph() {
     // linking when max-level was read above, and a node they linked since
     // can be the graph's tallest (nothing is deleted, so it only grows).
     let max_level = vinfo_field(&mut c, "vs", "max-level").as_int();
-    assert!(tallest as i64 <= max_level + 1, "{tallest} layers, max-level {max_level}");
+    assert!(
+        tallest as i64 <= max_level + 1,
+        "{tallest} layers, max-level {max_level}"
+    );
     assert!(c.cmds(&["VLINKS", "vs", "e1", "FOO"]).is_error());
     assert!(
         c.cmds(&["VLINKS", "vs", "e1", "WITHSCORES", "x"])
