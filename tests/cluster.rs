@@ -9840,15 +9840,24 @@ fn a_takeover_is_refused_when_another_master_reaches_its_epoch_meanwhile() {
         wait_cluster_ok(&all, all.len());
     }
     set_pause_timeout(&[&nodes[0], &nodes[1]], "30000");
-    // Of the two other masters, one whose config epoch is not the highest:
-    // its `BUMPEPOCH` takes one above the highest.
-    let epoch_of = |n: &Node| -> u64 { n.cluster_info("cluster_my_epoch").parse().unwrap() };
-    let highest = nodes.iter().map(epoch_of).max().unwrap();
-    let other = if epoch_of(&nodes[2]) == highest {
-        &nodes[3]
-    } else {
-        &nodes[2]
-    };
+    // A third master holds the highest epoch, known to all as the current
+    // one: the epoch reserved for the takeover, and the fourth master's bump
+    // below, are both the one above it.
+    wait_until(
+        "a third master to hold the highest epoch, known to all",
+        Duration::from_secs(30),
+        || {
+            let r = nodes[2].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+            assert!(r.starts_with("BUMPED") || r.starts_with("STILL"), "{r}");
+            let highest = nodes[2].cluster_info("cluster_my_epoch");
+            std::thread::sleep(Duration::from_millis(1500));
+            nodes
+                .iter()
+                .chain(std::iter::once(&replica))
+                .all(|n| n.cluster_info("cluster_current_epoch") == highest)
+        },
+    );
+    let other = &nodes[3];
     let (src_id, dst_id, other_id) = (nodes[0].id(), nodes[1].id(), other.id());
     let before = Written::on(&nodes[0], 0..=100, "before", 200);
     let task_id = nodes[1]
