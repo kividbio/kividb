@@ -100,10 +100,16 @@ const MOVES_PER_HOLD: usize = 32;
 /// million keys of 1 KB slept 18,304 times, 1,920 of them after the empty
 /// shards of the databases not in use; each sleep overshot by about a
 /// millisecond on a VM, and each batch after one found the caches cold, so
-/// the pass took 65 s, of which 5 s working (#240). Sleeping once a
-/// millisecond of work is owed its rest, the thread still works no longer
-/// than this (plus one batch) at a time, and rests as long in all.
-const QUANTUM: Duration = Duration::from_millis(1);
+/// the pass took 65 s, of which 5 s working (#240). Sleeping once this much
+/// work is owed its rest, the thread still works no longer than this (plus
+/// one batch) at a time, and rests as long in all.
+///
+/// But the thread runs on the CPUs the workers do, and while it works they
+/// wait for a CPU or for a shard it holds: with a millisecond of work at a
+/// time, GET and SET p99.9 during a pass were 1.2-1.3 ms where 1.2.2, which
+/// slept after every batch, had 0.62. With 100 us, 0.70; a sleep after
+/// every batch gave no less (0.72), and 100 us still sleeps a tenth as often.
+const QUANTUM: Duration = Duration::from_micros(100);
 
 /// How often the thread looks at the slabs.
 const TICK: Duration = Duration::from_secs(1);
@@ -1222,22 +1228,23 @@ mod pacer_tests {
     #[test]
     fn short_batches_sleep_once_a_quantum_not_once_each() {
         // An empty shard's batch: a lock taken and let go, well under a
-        // microsecond. A thousand of them sleep at most once.
+        // microsecond. A thousand of them sleep once a quantum of them.
         let mut pacer = Pacer::default();
         let sleeps = (0..1000)
             .filter(|_| pacer.worked(Duration::from_nanos(500), 10).is_some())
             .count();
-        assert_eq!(sleeps, 0);
+        assert_eq!(sleeps as u128, 1000 * 500 / QUANTUM.as_nanos());
         // Work of no length owes no rest, and never wakes the thread.
         let mut pacer = Pacer::default();
         assert!((0..100_000).all(|_| pacer.worked(Duration::ZERO, 10).is_none()));
         // 128-bucket batches of 25 us (1 KB values, caches warm): one sleep
-        // per 40 batches where there was one per batch.
+        // a quantum of them where there was one per batch.
         let mut pacer = Pacer::default();
         let sleeps = (0..18_304)
             .filter(|_| pacer.worked(25 * US, 10).is_some())
             .count();
-        assert_eq!(sleeps, 18_304 / 40);
+        let per_sleep = (QUANTUM.as_micros() / 25) as usize;
+        assert_eq!(sleeps, 18_304 / per_sleep);
     }
 
     #[test]

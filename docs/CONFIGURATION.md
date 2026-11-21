@@ -189,21 +189,28 @@ both:
 | `active-defrag-full-slab-free-percent` | `12` | a full slab is emptied when at least this many per cent of its blocks are free (`0` or `100`: full slabs are left alone) |
 | `active-defrag-cycle-max` | `10` | the most of one core it uses, a percentage |
 
-No pass starts while a snapshot (`BGSAVE`), an AOF rewrite or a backup is being written (the
-values it holds cannot move), nor until the values in the slabs have grown or fallen by less
-than a 32nd of the slabs each second for 5 seconds (a large delete, or its refill: the writes
-take the free room themselves), and a round ends early, with its pass, when a delete or a
-refill starts while it runs. A round moves values out
-of a set of slabs in one look through the keys; what it puts in new slabs is held twice until
-the round ends, so a round takes at most a 128th of the slabs' size in new slabs (at least
-1 MiB), or what is left below the most the slabs have taken before, up to an eighth: the
-peak during a churn stays within about 1.5 % of what it is with active defrag off. A pass that the slab-waste trigger started and that got little back (the slabs it
-emptied, less the new ones it took, under one in 32 of those it emptied) keeps that trigger off
-for 10 seconds, then twice as long each time in a row, up to a minute. All of these change
-at run time with `CONFIG SET`.
+The slab-waste trigger counts free blocks only: the end of a slab that no block fits in (3,520
+bytes of a slab of 3,648-byte blocks) is no room any pass gets back.
+
+No pass starts until the bytes of the blocks in the slabs have changed by less than a 32nd of
+the slabs each second for 5 seconds in a row (a large delete, or its refill: the writes take
+the free room themselves), and a round that sees such a change while it runs (it looks every
+10 ms) ends there, with its pass; the next pass then waits for 5 calm seconds again. A round
+moves values out of a set of slabs in one look through the keys; what it puts in new slabs is
+held twice until the round ends, so a round takes at most a 128th of the slabs' size in new
+slabs (at least 1 MiB), or what is left below the most the slabs have taken before, up to an
+eighth (that mark comes down when the slabs fall under half of it, after a `FLUSHALL` for
+example): PEAK_DOC. While a snapshot (`BGSAVE`), an AOF rewrite or a backup is being written,
+the slab-waste trigger waits (the values a snapshot holds cannot move, and the old values of
+what is written meanwhile are freed when it ends); the ratio trigger does not, so a server
+that saves all the time is still compacted. A pass that the slab-waste trigger started and
+that got little back (the slabs it emptied, less the new ones it took, under one in 32 of
+those it emptied), or that a delete cut short, keeps that trigger off for 10 seconds, then
+twice as long each time in a row, up to a minute. All of these change at run time with
+`CONFIG SET`.
 
 `INFO memory` shows the slabs (`value_slab_bytes`), the values in them
-(`value_slab_live_bytes`), what the full slabs have free (`value_slab_full_free_bytes`), and
+(`value_slab_live_bytes`), the free blocks of the full slabs (`value_slab_full_free_bytes`), and
 active defrag's work: `active_defrag_running`, `active_defrag_hits` (values moved),
 `active_defrag_misses` (values left where they were because something else held them, such as a
 snapshot being written), `active_defrag_passes`, `active_defrag_slabs_emptied` and
