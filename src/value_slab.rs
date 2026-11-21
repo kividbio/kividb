@@ -108,7 +108,7 @@ const SMALL: usize = 80;
 /// The classes above 2 KiB, in large slabs: each the largest block, a
 /// multiple of 16, of which a large slab holds a given count, the counts
 /// chosen so that a class is at most [`LARGE_STEP`] thousandths of the one
-/// below it.
+/// below it, and 4,096, 8,192 and 16,384 among them ([`next_large`]).
 const LARGE: usize = large_count();
 const CLASSES: usize = SMALL + LARGE;
 /// The largest block a slab holds. A block larger than this is the system
@@ -148,10 +148,26 @@ const fn next_blocks(prev: usize) -> usize {
     blocks
 }
 
+/// The large class after one of `prev` bytes: [`next_blocks`]'s, or a power
+/// of two of 4 KiB and up that lies between (a slab's size over a count of
+/// blocks too). A block of 4,096 bytes is one page; without the class, an
+/// entry of 4,049 to 4,096 bytes took a block of 4,144, over two.
+const fn next_large(prev: usize) -> usize {
+    let next = large_size(next_blocks(prev));
+    let mut page = 4096;
+    while page < next {
+        if page > prev {
+            return page;
+        }
+        page *= 2;
+    }
+    next
+}
+
 const fn large_count() -> usize {
     let (mut size, mut count) = (2048, 0);
     while size < large_size(LARGE_FEWEST) {
-        size = large_size(next_blocks(size));
+        size = next_large(size);
         count += 1;
     }
     count
@@ -162,7 +178,7 @@ const LARGE_SIZES: [usize; LARGE] = {
     let mut sizes = [0; LARGE];
     let (mut size, mut i) = (2048, 0);
     while i < LARGE {
-        size = large_size(next_blocks(size));
+        size = next_large(size);
         sizes[i] = size;
         i += 1;
     }
