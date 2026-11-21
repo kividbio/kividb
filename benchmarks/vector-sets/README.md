@@ -38,7 +38,8 @@ Ground truth is exact cosine top-10.
   more is searched in an HNSW graph, as Redis does (`EF`, `EPSILON` and `TRUTH` honoured, `M`
   and `EF` on the `VADD` that makes a set): see regression suite `44-vector-sets-hnsw` and
   COMMANDS.md, "How VSIM searches", for the numbers now. `load_time.py` here measures how
-  long a set takes to be searched by graph again after a restart.
+  long a set takes to be searched by graph again after a restart, and `aof_replay.py` how
+  long an AOF of `VADD`s takes to replay.
 - **1M vectors:** only KiviDB's load (5.4 s, 665 B/vector) and its single-client
   query (7.3 ops/s, p50 136 ms) were measured. A full 1M run on both servers is still to do.
 
