@@ -1851,11 +1851,21 @@ pub struct HnswIndex {
     /// Keys written to this graph while it is a compaction's copy in the
     /// making: the copy leaves them as those writes left them.
     touched: parking_lot::Mutex<Option<ahash::AHashSet<String>>>,
+
+    /// How the slots lay out the vectors: f32 for FT.SEARCH, a vector set's
+    /// own quantization for its graph (`quant::Encoding`).
+    pub(crate) encoding: quant::Encoding,
+
+    /// A vector set's graph: the keys whose vectors have been linked since
+    /// the set last looked (see `vset_graph`); None for every other graph.
+    pub(crate) linked: Option<parking_lot::Mutex<Vec<Arc<str>>>>,
 }
 
 impl HnswIndex {
     pub fn new(m: usize, ef_construction: usize) -> Self {
         Self {
+            encoding: quant::Encoding::F32,
+            linked: None,
             backlog: backlog::Backlog::default(),
             shadow: parking_lot::Mutex::new(None),
             touched: parking_lot::Mutex::new(None),
@@ -3272,7 +3282,7 @@ fn select_neighbors_heuristic(
         // to the candidate than q is, the candidate is "dominated" — the
         // result neighbor already covers that direction better.
         for &(_, sel_id) in &result {
-            let d_cand_to_sel = distance_prenorm(metric, cand_vec, slots.vector(sel_id as usize));
+            let d_cand_to_sel = slots.dist(metric, cand_vec, slots.vector(sel_id as usize));
             if d_cand_to_sel < d_to_q {
                 discarded.push((d_to_q, cand_id));
                 continue 'cand;
@@ -3313,7 +3323,7 @@ fn nearest_of(
             if !slots.is_live(id as usize) {
                 continue;
             }
-            scored.push((distance_prenorm(metric, of, slots.vector(id as usize)), id));
+            scored.push((slots.dist(metric, of, slots.vector(id as usize)), id));
         }
         scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         scored.truncate(m_max);
@@ -3382,9 +3392,9 @@ fn insert_unit(
 
     // The first vector sets the graph's dimension; one of another (which
     // the schema rules out) has nowhere to go.
-    let slots = index
-        .slots
-        .get_or_init(|| slots::Slots::new(vector.len(), index.m0 + slack(index.m0)));
+    let slots = index.slots.get_or_init(|| {
+        slots::Slots::with_encoding(vector.len(), index.m0 + slack(index.m0), index.encoding)
+    });
     if vector.len() != slots.dim() {
         return;
     }
@@ -3513,12 +3523,12 @@ fn insert_unit(
                     .filter(|&&id| slots.is_live(id as usize))
                     .map(|&id| {
                         (
-                            distance_prenorm(metric, nb_vec, slots.vector(id as usize)),
+                            slots.dist(metric, nb_vec, slots.vector(id as usize)),
                             id,
                         )
                     })
                     .collect();
-                scored.push((distance_prenorm(metric, nb_vec, &vector), NEW_NODE));
+                scored.push((slots.dist(metric, nb_vec, &vector), NEW_NODE));
                 scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
                 // Bounded Algorithm-4 heuristic: check each candidate
@@ -3532,7 +3542,7 @@ fn insert_unit(
                         if d_j.is_infinite() {
                             continue;
                         }
-                        if distance_prenorm(metric, vec_i, vector_of(id_j)) < d_i {
+                        if slots.dist(metric, vec_i, vector_of(id_j)) < d_i {
                             scored[i].0 = f32::INFINITY;
                             break;
                         }
@@ -3804,7 +3814,7 @@ fn search_layer(
     if !slots.has(ep_id) || !slots.is_live(ep_id) {
         return vec![];
     }
-    let ep_dist = distance_prenorm(metric, query, slots.vector(ep_id));
+    let ep_dist = slots.dist(metric, query, slots.vector(ep_id));
     let (first, next) = (PREFETCH_FIRST, PREFETCH_NEXT);
 
     SEARCH_BUFFERS.with(|cell| {
@@ -3849,7 +3859,7 @@ fn search_layer(
                 if !slots.is_live(nb_id as usize) {
                     continue;
                 }
-                let nb_dist = distance_prenorm(metric, query, slots.vector(nb_id as usize));
+                let nb_dist = slots.dist(metric, query, slots.vector(nb_id as usize));
 
                 let worst = bufs.dynamic.peek().map(|(d, _)| d.0).unwrap_or(f32::MAX);
                 if nb_dist < worst || bufs.dynamic.len() < ef {
@@ -3888,7 +3898,7 @@ fn into_results(
         for r in found.iter_mut() {
             let id = r.1 as usize;
             r.0 = if slots.is_live(id) {
-                distance_prenorm(metric, query, slots.vector(id))
+                slots.dist(metric, query, slots.vector(id))
             } else {
                 f32::INFINITY
             };
@@ -3922,9 +3932,12 @@ pub fn knn_hnsw(
 ) -> Vec<KnnResult> {
     let ef = ef.max(k).max(50);
 
-    // Normalize the query for cosine so distances match the pre-normalized stored vectors.
+    // Normalize the query for cosine so distances match the pre-normalized
+    // stored vectors (a quantized graph's query comes laid out as its own).
     let query_buf: Vec<f32>;
-    let query: &[f32] = if matches!(metric, DistanceMetric::Cosine) {
+    let query: &[f32] = if matches!(metric, DistanceMetric::Cosine)
+        && index.encoding == quant::Encoding::F32
+    {
         query_buf = normalize_to_unit(query.to_vec());
         &query_buf
     } else {
@@ -3947,7 +3960,7 @@ pub fn knn_hnsw(
         return knn_graph(index, query, k, k, ef, metric);
     }
     let found = knn_graph(index, query, k, k.saturating_add(waiting.len()), ef, metric);
-    backlog::merge(&waiting, query, metric, found, k, None)
+    backlog::merge(&waiting, query, metric, index.encoding, found, k, None)
 }
 
 /// [`knn_hnsw`] over the graph alone, `query` as the graph holds vectors:
@@ -3991,7 +4004,7 @@ fn knn_graph(
         let mut scored: Vec<(f32, u32)> = nodes
             .iter()
             .filter(|(i, _)| slots.is_live(*i))
-            .map(|(i, _)| (distance_prenorm(metric, query, slots.vector(i)), i as u32))
+            .map(|(i, _)| (slots.dist(metric, query, slots.vector(i)), i as u32))
             .collect();
         scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         return into_results(index, slots, &nodes, query, metric, scored, keep, reused);
@@ -4076,7 +4089,7 @@ pub fn knn_hnsw_admitting(
         deadline,
     )?;
     Some((
-        backlog::merge(&waiting, query, metric, found, k, Some(admit)),
+        backlog::merge(&waiting, query, metric, index.encoding, found, k, Some(admit)),
         cut,
     ))
 }
@@ -4133,7 +4146,7 @@ fn admitting_graph(
     if !index.is_live(curr as usize) {
         return Some((Vec::new(), false));
     }
-    let d = OrderedFloat(distance_prenorm(metric, query, slots.vector(curr as usize)));
+    let d = OrderedFloat(slots.dist(metric, query, slots.vector(curr as usize)));
     spent += 1;
     visited.insert(curr);
     candidates.push(Reverse((d, curr)));
@@ -4189,7 +4202,7 @@ fn admitting_graph(
             if spent > budget {
                 return None;
             }
-            let dist = distance_prenorm(metric, query, slots.vector(nb as usize));
+            let dist = slots.dist(metric, query, slots.vector(nb as usize));
             if results.len() < ef || dist < bound {
                 candidates.push(Reverse((OrderedFloat(dist), nb)));
                 if let Some(n) = nodes.get(nb as usize)

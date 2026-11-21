@@ -81,12 +81,13 @@ fn add_to_vset(db: &store::Db, key: &[u8], lenient: bool, add: Addition) -> Resu
                 inner.quant_chosen = add.quant.is_some();
                 inner.m = add.m.unwrap_or(vset_graph::DEFAULT_M);
                 inner.ef_construction = add.ef.unwrap_or(vset_graph::DEFAULT_BUILD_EF);
+                inner.m_known = true;
                 // Quantized first, so a rejected vector leaves no empty set.
                 let stored = quantize(inner.quant, add.vector)?;
                 inner.entries.insert(
                     add.element,
                     VSetEntry {
-                        vector: stored,
+                        vector: Some(stored),
                         attrs: add.attrs,
                     },
                 );
@@ -116,9 +117,9 @@ fn add_to_vset(db: &store::Db, key: &[u8], lenient: bool, add: Addition) -> Resu
 }
 
 /// `add` into an existing set, checked against it as Redis checks it. `M`
-/// and `EF` are the set's own from the `VADD` that made it: given again,
-/// they are taken and not compared (Redis refuses an `M` other than the
-/// set's; KiviDB does not save `M`, so a set loaded from a file has 16).
+/// and `EF` are the set's own from the `VADD` that made it; another `M` is
+/// refused, as in Redis, unless the set was loaded from a file, which does
+/// not hold it (the set then has 16 and takes any).
 fn insert_into(
     set: &Arc<RwLock<VectorSetInner>>,
     inner: &mut VectorSetInner,
@@ -141,6 +142,13 @@ fn insert_into(
             "ERR asked distance mismatch with existing vector set",
         ));
     }
+    // Redis refuses another `M` than the set's, the default 16 included
+    // when none is given; a set loaded from a file does not know its own.
+    if inner.m_known && !lenient && add.m.unwrap_or(vset_graph::DEFAULT_M) != inner.m {
+        return Err(resp_error(
+            "ERR asked M value mismatch with existing vector set",
+        ));
+    }
     // Unchosen sets, replays and replicated writes accept any option.
     let strict = inner.quant_chosen && !lenient;
     if strict && add.quant.is_some_and(|q| q != inner.quant) {
@@ -150,7 +158,7 @@ fn insert_into(
     }
     let stored = quantize(inner.quant, add.vector)?;
     let entry = VSetEntry {
-        vector: stored,
+        vector: Some(stored),
         attrs: add.attrs,
     };
     let name = add.element.clone();
@@ -515,14 +523,17 @@ fn vemb(ctx: &mut Ctx) -> Option<Vec<u8>> {
     match map.get(key) {
         Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
-            let entry = match inner.entries.get(element) {
-                None => return Some(resp_null_bulk()),
-                Some(entry) => entry,
+            let Some(vector) = inner
+                .entries
+                .get(element)
+                .and_then(|entry| inner.vector_of(element, entry))
+            else {
+                return Some(resp_null_bulk());
             };
             if raw {
                 // Redis shape: type, stored bytes, norm, and range for int8.
-                let mut out = vec![resp_simple(entry.vector.quant().name())];
-                match &entry.vector {
+                let mut out = vec![resp_simple(vector.quant().name())];
+                match &*vector {
                     StoredVector::F32(v) => {
                         let (norm, unit) = StoredVector::f32_unit(v);
                         let bytes: Vec<u8> = unit.iter().flat_map(|f| f.to_le_bytes()).collect();
@@ -549,7 +560,7 @@ fn vemb(ctx: &mut Ctx) -> Option<Vec<u8>> {
             } else {
                 // Redis replies with doubles, not strings.
                 let mut values = Vec::with_capacity(inner.dim);
-                entry.vector.to_f32(inner.dim, &mut values);
+                vector.to_f32(inner.dim, &mut values);
                 let items: Vec<Vec<u8>> = values
                     .iter()
                     .map(|&f| resp_double_for(resp, f as f64))
@@ -793,15 +804,19 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
     match map.get(key) {
         Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
-            let query_vec = match inner.entries.get(element) {
-                None => return Some(resp_null_bulk()),
-                Some(e) => &e.vector,
+            let Some(query_vec) = inner
+                .entries
+                .get(element)
+                .and_then(|e| inner.vector_of(element, e))
+            else {
+                return Some(resp_null_bulk());
             };
             let score_of = |name: &[u8]| {
-                inner.entries.get(name).map(|e| {
+                let e = inner.entries.get(name)?;
+                inner.with_vector(name, e, |v| {
                     similarity(
                         &inner.metric,
-                        query_vec.distance(&e.vector, &inner.metric, inner.dim),
+                        query_vec.distance(v, &inner.metric, inner.dim),
                     )
                 })
             };
@@ -815,17 +830,8 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 Some(layers) => layers,
                 None => {
                     // What layer 0 would hold: the nearest `M * 2`.
-                    let mut scored: Vec<(f32, &[u8])> = inner
-                        .entries
-                        .iter()
-                        .filter(|(name, _)| *name != element)
-                        .map(|(name, entry)| {
-                            (
-                                query_vec.distance(&entry.vector, &inner.metric, inner.dim),
-                                name.as_bytes(),
-                            )
-                        })
-                        .collect();
+                    let mut scored =
+                        measure_all(&inner, &query_vec, |name, _| name != element);
                     let keep = inner.m * 2;
                     if scored.len() > keep {
                         scored.select_nth_unstable_by(keep, by_distance_then_name);
@@ -1102,26 +1108,15 @@ fn nearest<'s>(
             .is_none_or(|filter| filter.matches(entry.attrs.as_deref()))
     };
     // Every element the filter passes, measured: exact.
-    let scan = || -> Vec<(f32, &[u8])> {
-        inner
-            .entries
-            .iter()
-            .filter(|(_, entry)| passes(entry))
-            .map(|(name, entry)| {
-                (
-                    query.distance(&entry.vector, &inner.metric, inner.dim),
-                    name.as_bytes(),
-                )
-            })
-            .collect()
-    };
+    let scan = || measure_all(inner, query, |_, entry| passes(entry));
 
     let mut scored: Vec<(f32, &[u8])> = match vset_graph::for_search(vs, inner, truth, ef) {
         None => scan(),
         Some(graph) => {
-            // The graph holds f32 vectors: the query as the set holds it.
-            let mut as_f32 = Vec::with_capacity(inner.dim);
-            query.to_f32(inner.dim, &mut as_f32);
+            // The query as the set quantizes it, laid out as the graph holds
+            // vectors.
+            let as_f32 = vset_graph::query_for(&graph, inner, query);
+            let exact = graph.exact();
             let hits = match filter {
                 None => Some(vset_graph::search(&graph, &as_f32, ef, &inner.metric)),
                 Some(_) => {
@@ -1145,12 +1140,17 @@ fn nearest<'s>(
                     .filter_map(|hit| {
                         let name = vset_graph::name_of(hit);
                         let (name, entry) = inner.entries.get_key_value(&*name)?;
-                        passes(entry).then(|| {
-                            (
-                                query.distance(&entry.vector, &inner.metric, inner.dim),
-                                name.as_bytes(),
-                            )
-                        })
+                        if !passes(entry) {
+                            return None;
+                        }
+                        // A quantized set's graph measures as a scan does;
+                        // an f32 one's unit vectors are scored again.
+                        let d = if exact {
+                            hit.score
+                        } else {
+                            query.distance(entry.vector.as_ref()?, &inner.metric, inner.dim)
+                        };
+                        Some((d, name.as_bytes()))
                     })
                     .collect(),
                 None => scan(),
@@ -1170,6 +1170,37 @@ fn nearest<'s>(
     }
 
     scored
+}
+
+/// The distance from `query` (quantized as the set is) to each element
+/// `keep` lets in, measured on the vector the element's entry holds, or the
+/// one the set's graph holds for it, by the same arithmetic.
+fn measure_all<'s>(
+    inner: &'s VectorSetInner,
+    query: &StoredVector,
+    keep: impl Fn(&[u8], &VSetEntry) -> bool,
+) -> Vec<(f32, &'s [u8])> {
+    // Held only while it measures: no graph search runs meanwhile.
+    let graph = inner.graph.get().filter(|g| g.exact());
+    let reader = graph.map(|g| g.reader());
+    let encoded = reader.as_ref().and_then(|r| r.encoding().encode(query));
+    let mut out = Vec::new();
+    for (name, entry) in &inner.entries {
+        let name = name.as_bytes();
+        if !keep(name, entry) {
+            continue;
+        }
+        let d = match (&entry.vector, &reader, &encoded) {
+            (Some(v), _, _) => query.distance(v, &inner.metric, inner.dim),
+            (None, Some(r), Some(q)) => match r.encoded(name) {
+                Some(stored) => r.encoding().distance(&inner.metric, q, stored),
+                None => continue,
+            },
+            _ => continue,
+        };
+        out.push((d, name));
+    }
+    out
 }
 
 fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
@@ -1300,7 +1331,7 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let inner = vs.read();
 
     // Quantize the query like the set, as Redis does, so scores match.
-    let given;
+    let given: StoredVector;
     let query: &StoredVector = match query_vec {
         Ok(v) => {
             if v.len() != inner.dim {
@@ -1316,8 +1347,15 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
             };
             &given
         }
-        Err(elem_name) => match inner.entries.get(elem_name.as_slice()) {
-            Some(e) => &e.vector,
+        Err(elem_name) => match inner
+            .entries
+            .get(elem_name.as_slice())
+            .and_then(|e| inner.vector_of(&elem_name, e))
+        {
+            Some(v) => {
+                given = v.into_owned();
+                &given
+            }
             // Redis's words.
             None => return Some(resp_error("ERR element not found in set")),
         },
@@ -1406,7 +1444,12 @@ mod lock_tests {
     }
 
     fn stored(vs: &Set, element: &str) -> &'static str {
-        match vs.read().entries.get(element.as_bytes()).map(|e| &e.vector) {
+        match vs
+            .read()
+            .entries
+            .get(element.as_bytes())
+            .and_then(|e| e.vector.as_ref())
+        {
             Some(StoredVector::F32(_)) => "f32",
             Some(StoredVector::Q8 { .. }) => "int8",
             Some(StoredVector::Bin { .. }) => "bin",
@@ -2100,6 +2143,59 @@ mod graph_tests {
             graph.index.live_count.load(Relaxed),
             vs.read().entries.len()
         );
+    }
+
+    /// A quantized set keeps each linked vector once, in its graph: the
+    /// entries let theirs go, and every reader gets the same vector back.
+    /// An f32 set keeps its own.
+    #[test]
+    fn a_quantized_sets_vectors_live_in_its_graph() {
+        let dim = 24;
+        let metric = DistanceMetric::Cosine;
+        let st = store::new_store(1);
+        let db = &st[0];
+        let mut rng = StdRng::seed_from_u64(21);
+        let n = vset_graph::EXACT_BELOW + 800;
+        let mut model: HashMap<String, Vec<f32>> = HashMap::new();
+        for quant in [Quant::Q8, Quant::Bin, Quant::F32] {
+            let key = format!("{quant:?}");
+            for i in 0..n {
+                let v = random_vector(&mut rng, dim);
+                let name = format!("e{i}");
+                vadd(db, &key, addition(&name, &v, quant, &metric));
+                model.insert(name, v);
+            }
+            let vs = set_at(db, &key).unwrap();
+            settled(&vs);
+            // One more write takes in what the helpers linked last.
+            let v = random_vector(&mut rng, dim);
+            vadd(db, &key, addition("last", &v, quant, &metric));
+            model.insert("last".into(), v);
+            settled(&vs);
+            let inner = vs.read();
+            let own = inner.entries.values().filter(|e| e.vector.is_some()).count();
+            if quant == Quant::F32 {
+                assert_eq!(own, inner.entries.len(), "an f32 set keeps its vectors");
+            } else {
+                assert!(own * 10 < inner.entries.len(), "{quant:?}: {own} of {} kept", n + 1);
+            }
+            for (name, entry) in &inner.entries {
+                let want =
+                    StoredVector::quantize(quant, model[std::str::from_utf8(name.as_bytes()).unwrap()].clone())
+                        .unwrap();
+                let got = inner.vector_of(name.as_bytes(), entry).expect("a vector");
+                assert_eq!(*got, want, "{quant:?} {name:?}");
+            }
+            // A copy holds every vector itself.
+            let copy = inner.clone();
+            assert!(copy.entries.values().all(|e| e.vector.is_some()));
+            drop(inner);
+            // TRUTH answers from the graph's vectors as from the model.
+            let q = random_vector(&mut rng, dim);
+            let want = exact(&model, quant, &metric, dim, &q, 10);
+            assert_eq!(vsim(&vs, &q, 10, true), want, "{quant:?}");
+            model.clear();
+        }
     }
 
     /// A copy of a set (`COPY`) has no graph of its own until it makes one,

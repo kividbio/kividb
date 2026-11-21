@@ -1,13 +1,17 @@
 //! The HNSW graph of a vector set: the graph FT.SEARCH's vector fields use
 //! ([`HnswIndex`]), one per set, over the set's elements.
 //!
-//! The set's elements (`VectorSetInner::entries`) stay what the set is: what
-//! a snapshot, `DUMP`, `COPY`, replication and the AOF hold, exactly as
-//! before, and what every reply is scored from. The graph is only how `VSIM`
-//! finds the candidates to score: it holds each element's vector as f32
-//! (dequantized for `Q8` and `BIN` sets), and it is made again from the
-//! elements when a set is loaded, restored or copied, so nothing about it is
-//! saved and the files a 1.2 server reads stay the same.
+//! The graph of a `Q8` or `BIN` set holds each element's vector as the set
+//! stores it (`quant::Encoding`: the same bytes, measured by the same
+//! arithmetic as a scan), and once the graph has linked an element the set
+//! lets go of its own copy ([`absorb`]): the vector is then kept once, in the
+//! graph, and read from there (`VectorSetInner::vector_of`) by `VEMB`, a
+//! snapshot, `DUMP`, the AOF rewrite and `COPY`, which write exactly what the
+//! set held. An f32 set's graph holds its own unit-length copy (a cosine
+//! distance on the raw floats is not the scan's to the bit), and the set
+//! keeps its vectors. Nothing about the graph is saved: it is made again from
+//! the vectors when a set is loaded, restored or copied, so the files a 1.2
+//! server reads stay the same.
 //!
 //! Every change to a set's elements is made under the set's lock, and the
 //! change to its graph is made there too, in the same order: the element's
@@ -26,6 +30,7 @@
 //! elements to the graph a few at a time under the set's lock, as writes do;
 //! until it has handed over all of them, `VSIM` scans. `TRUTH` always scans.
 
+use super::quant::{Encoding, StoredVector};
 use super::{DistanceMetric, HnswIndex, KnnResult, backlog};
 use crate::types::VectorSetInner;
 use parking_lot::RwLock;
@@ -57,10 +62,46 @@ pub struct VsetGraph {
 }
 
 impl VsetGraph {
-    fn new(m: usize, ef_construction: usize) -> Self {
+    fn new(m: usize, ef_construction: usize, encoding: Encoding) -> Self {
+        let mut index = HnswIndex::new(m, ef_construction);
+        index.encoding = encoding;
+        if encoding != Encoding::F32 {
+            index.linked = Some(parking_lot::Mutex::new(Vec::new()));
+        }
         Self {
-            index: Arc::new(HnswIndex::new(m, ef_construction)),
+            index: Arc::new(index),
             ready: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the graph's distances are the scan's own (it holds the
+    /// vectors as the set stores them).
+    pub fn exact(&self) -> bool {
+        self.index.encoding != Encoding::F32
+    }
+
+    /// The vector the graph has linked for `name`, as the set stores it
+    /// (None for an f32 set's graph, or a name it has not linked).
+    pub fn stored(&self, name: &[u8]) -> Option<StoredVector> {
+        let encoding = self.index.encoding;
+        if encoding == Encoding::F32 {
+            return None;
+        }
+        let reader = self.reader();
+        encoding.decode(reader.encoded(name)?)
+    }
+
+    /// The graph held for reading, to look many names' vectors up. Nothing
+    /// else of the graph is to be locked while it is held.
+    pub fn reader(&self) -> Reader<'_> {
+        let index = &self.index;
+        // The graph before its map, as inserts and searches take them.
+        let nodes = index.nodes.read();
+        let key_to_id = index.key_to_id.read();
+        Reader {
+            index,
+            key_to_id,
+            nodes,
         }
     }
 
@@ -129,6 +170,26 @@ impl VsetGraph {
     }
 }
 
+/// A set's graph held for reading: the vectors it has linked, by name.
+pub struct Reader<'a> {
+    index: &'a HnswIndex,
+    key_to_id: parking_lot::RwLockReadGuard<'a, ahash::AHashMap<String, usize>>,
+    nodes: parking_lot::RwLockReadGuard<'a, super::HnswNodes>,
+}
+
+impl Reader<'_> {
+    /// `name`'s vector as the graph lays it out, if the graph has linked it.
+    pub fn encoded(&self, name: &[u8]) -> Option<&[f32]> {
+        let key = crate::key_bytes::text_of(name);
+        let id = *self.key_to_id.get(&*key)?;
+        self.index.vector_of(&self.nodes, id, &key)
+    }
+
+    pub fn encoding(&self) -> Encoding {
+        self.index.encoding
+    }
+}
+
 /// Where a set keeps its graph: none until the set first reaches
 /// [`EXACT_BELOW`] elements, then the same one for the rest of the set's
 /// life. A copy of a set (`COPY`, a move between databases) starts with
@@ -154,11 +215,31 @@ fn key_of(name: &[u8]) -> String {
     crate::key_bytes::text_of(name).into_owned()
 }
 
-/// `name`'s vector as the graph stores it.
-fn graph_vector(inner: &VectorSetInner, entry: &crate::types::VSetEntry) -> Arc<[f32]> {
-    let mut v = Vec::with_capacity(inner.dim);
-    entry.vector.to_f32(inner.dim, &mut v);
-    super::as_stored(&inner.metric, v).into()
+/// A vector as `graph` lays it out: an f32 set's at unit length for a
+/// cosine, a quantized set's as it is stored.
+fn laid_out(graph: &VsetGraph, inner: &VectorSetInner, v: &StoredVector) -> Option<Vec<f32>> {
+    match graph.index.encoding {
+        Encoding::F32 => {
+            let mut f = Vec::with_capacity(inner.dim);
+            v.to_f32(inner.dim, &mut f);
+            Some(super::as_stored(&inner.metric, f))
+        }
+        encoding => encoding.encode(v),
+    }
+}
+
+/// The query `VSIM` gives the graph: the set's quantization of it, laid out
+/// as the graph holds vectors (an f32 one as given: the search makes it unit
+/// length itself).
+pub fn query_for(graph: &VsetGraph, inner: &VectorSetInner, query: &StoredVector) -> Vec<f32> {
+    match graph.index.encoding {
+        Encoding::F32 => {
+            let mut f = Vec::with_capacity(inner.dim);
+            query.to_f32(inner.dim, &mut f);
+            f
+        }
+        encoding => encoding.encode(query).unwrap_or_default(),
+    }
 }
 
 /// A vector a write put in the graph's backlog that no helper will link:
@@ -179,9 +260,10 @@ impl Pending {
 /// Hand `name`'s vector, as the set now holds it, to the graph. Under the
 /// set's lock (read or write).
 fn hand_over(graph: &VsetGraph, inner: &VectorSetInner, name: &[u8]) -> Option<Pending> {
-    let entry = inner.entries.get(name)?;
+    // An entry without its own vector is one the graph already holds.
+    let vector = inner.entries.get(name)?.vector.as_ref()?;
     let key = key_of(name);
-    let vector = graph_vector(inner, entry);
+    let vector: Arc<[f32]> = laid_out(graph, inner, vector)?.into();
     backlog::put_ordered(&graph.index, &key, vector, &inner.metric).map(|ticket| Pending {
         index: Arc::clone(&graph.index),
         key,
@@ -198,10 +280,11 @@ pub fn written(
     inner: &mut VectorSetInner,
     name: &[u8],
 ) -> Option<Pending> {
-    match inner.graph.get() {
+    match inner.graph.get().cloned() {
         Some(graph) => {
             backlog::count_write();
-            hand_over(graph, inner, name)
+            absorb(&graph, inner, usize::MAX);
+            hand_over(&graph, inner, name)
         }
         None => {
             // The builder hands this element over with the others.
@@ -227,7 +310,8 @@ pub fn request_build(set: &Arc<RwLock<VectorSetInner>>, inner: &VectorSetInner) 
     let mut made = false;
     let graph = inner.graph.0.get_or_init(|| {
         made = true;
-        Arc::new(VsetGraph::new(inner.m, inner.ef_construction))
+        let encoding = Encoding::of(inner.quant, inner.dim);
+        Arc::new(VsetGraph::new(inner.m, inner.ef_construction, encoding))
     });
     if made {
         queue(Arc::downgrade(set), Arc::clone(graph));
@@ -255,9 +339,10 @@ pub fn for_search(
     (!truth && graph.is_ready() && ef.saturating_mul(2) < n).then(|| Arc::clone(graph))
 }
 
-/// The nearest `ef` candidates of `query` (as given, or the element's own,
-/// as f32) the graph finds, nearest first by the graph's distance: the
-/// caller scores them from the elements.
+/// The nearest `ef` candidates of `query` ([`query_for`]) the graph finds,
+/// nearest first by the graph's distance, which is the scan's own when the
+/// graph is [`VsetGraph::exact`]; otherwise the caller scores them from the
+/// elements.
 pub fn search(
     graph: &VsetGraph,
     query: &[f32],
@@ -277,7 +362,10 @@ pub fn search_admitting(
     admit: &mut dyn FnMut(&[u8]) -> bool,
     budget: usize,
 ) -> Option<Vec<KnnResult>> {
-    let query = super::as_stored(metric, query.to_vec());
+    let query = match graph.index.encoding {
+        Encoding::F32 => super::as_stored(metric, query.to_vec()),
+        _ => query.to_vec(),
+    };
     let mut by_node = |node: &super::HnswNode| admit(&crate::key_bytes::bytes_of(&node.key));
     super::knn_hnsw_admitting(
         &graph.index,
@@ -397,6 +485,75 @@ fn build(job: &Build) {
         }
     }
     job.graph.ready.store(true, Release);
+    // Then the set lets go of its copies of what the helpers have linked,
+    // a few thousand at a time, so that it is not held for long.
+    if !job.graph.exact() {
+        return;
+    }
+    for _ in 0..100_000 {
+        backlog_settled(index);
+        let Some(set) = job.set.upgrade() else { return };
+        let mut inner = set.write();
+        if !still_ours(&inner, &job.graph) {
+            return;
+        }
+        if !absorb(&job.graph, &mut inner, 4096) {
+            return;
+        }
+    }
+}
+
+/// Wait, up to a second, for `index`'s backlog to be linked.
+fn backlog_settled(index: &HnswIndex) {
+    for _ in 0..1000 {
+        if index.backlog.is_empty() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Under the set's write lock: drop the set's own copy of each vector the
+/// graph has linked since the last time (up to `most` of them), where the
+/// graph holds that vector and none of the element's waits to be linked.
+/// Whether some are left for the next time.
+pub fn absorb(graph: &VsetGraph, inner: &mut VectorSetInner, most: usize) -> bool {
+    let Some(linked) = &graph.index.linked else {
+        return false;
+    };
+    let keys: Vec<Arc<str>> = {
+        let mut q = linked.lock();
+        if q.is_empty() {
+            return false;
+        }
+        let take = q.len().min(most);
+        q.drain(..take).collect()
+    };
+    let encoding = graph.index.encoding;
+    let reader = graph.reader();
+    for key in keys {
+        if graph.index.backlog.holds(&key) {
+            continue; // a later vector of it waits: it is linked again later
+        }
+        let name = crate::key_bytes::bytes_of(&key);
+        let Some(entry) = inner.entries.get_mut(&*name) else {
+            continue;
+        };
+        let Some(own) = entry.vector.as_ref() else {
+            continue;
+        };
+        let same = match (encoding.encode(own), reader.encoded(&name)) {
+            (Some(a), Some(b)) => a
+                .iter()
+                .map(|x| x.to_bits())
+                .eq(b.iter().map(|x| x.to_bits())),
+            _ => false,
+        };
+        if same {
+            entry.vector = None;
+        }
+    }
+    !linked.lock().is_empty()
 }
 
 /// Wait (tests) until no build is queued or running and `graph`'s backlog

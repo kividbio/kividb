@@ -204,7 +204,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let elements = layout::sampled(inner.entries.len(), samples, || {
                 inner.entries.iter().map(|(name, entry)| {
                     crate::key_bytes::KeyBytes::heap_bytes_of(name.as_bytes())
-                        + entry.vector.heap_bytes()
+                        + entry.vector.as_ref().map_or(0, |v| v.heap_bytes())
                         + entry.attrs.as_ref().map_or(0, |a| a.len())
                 })
             });

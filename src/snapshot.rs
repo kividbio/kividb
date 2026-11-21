@@ -838,12 +838,28 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
 
             let mut floats = Vec::new();
             let mut buf = Vec::new();
+            // The vectors a quantized set's graph holds in its place.
+            let graph = inner.graph.get().filter(|g| g.exact());
+            let reader = graph.map(|g| g.reader());
             for (name, entry) in inner.entries.iter() {
                 // Element name
                 write_bytes(w, name.as_bytes())?;
 
                 use crate::vector::quant::StoredVector;
-                match (&entry.vector, legacy) {
+                let decoded: StoredVector;
+                let vector = match &entry.vector {
+                    Some(v) => v,
+                    None => {
+                        let found = reader.as_ref().and_then(|r| {
+                            r.encoding().decode(r.encoded(name.as_bytes())?)
+                        });
+                        decoded = found.ok_or_else(|| {
+                            io::Error::other("a vector set element has no vector")
+                        })?;
+                        &decoded
+                    }
+                };
+                match (vector, legacy) {
                     // Legacy layout keeps a per-vector length.
                     (StoredVector::F32(v), true) => {
                         w.write_all(&(v.len() as u32).to_le_bytes())?;
@@ -2746,7 +2762,13 @@ fn read_image_body(
                             None
                         };
 
-                        vs.entries.insert(name, VSetEntry { vector, attrs });
+                        vs.entries.insert(
+                            name,
+                            VSetEntry {
+                                vector: Some(vector),
+                                attrs,
+                            },
+                        );
                     }
 
                     let set = Arc::new(parking_lot::RwLock::new(vs));
@@ -6478,7 +6500,7 @@ mod dump_payload_tests {
         vs.entries.insert(
             "a".into(),
             VSetEntry {
-                vector: vec![1.0, 2.0].into(),
+                vector: Some(vec![1.0, 2.0].into()),
                 attrs: None,
             },
         );
@@ -6523,7 +6545,7 @@ mod dump_payload_tests {
             vs.entries.insert(
                 crate::key_bytes::KeyBytes::from(&[b'e', n, 0xff][..]),
                 VSetEntry {
-                    vector: StoredVector::quantize(quant, v).unwrap(),
+                    vector: Some(StoredVector::quantize(quant, v).unwrap()),
                     attrs: (n == 3).then(|| r#"{"n":3}"#.into()),
                 },
             );

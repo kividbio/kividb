@@ -6416,7 +6416,7 @@ mod vset_quant_marker_tests {
             Some(ValueRef::VectorSet(vs)) => {
                 let vs = vs.read();
                 let name = crate::key_bytes::KeyBytes::from(element.as_bytes());
-                let stored = match vs.entries.get(&name).map(|e| &e.vector) {
+                let stored = match vs.entries.get(&name).and_then(|e| e.vector.as_ref()) {
                     Some(StoredVector::F32(_)) => "f32",
                     Some(StoredVector::Q8 { .. }) => "int8",
                     Some(StoredVector::Bin { .. }) => "bin",

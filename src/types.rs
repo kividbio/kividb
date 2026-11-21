@@ -236,13 +236,15 @@ impl<'a> Ord for ZScoreKey<'a> {
 
 #[derive(Clone)]
 pub struct VSetEntry {
-    pub vector: crate::vector::quant::StoredVector,
+    /// The element's vector, or None while the set's graph holds it, as
+    /// the set stores it (`Q8` and `BIN`): `VectorSetInner::vector_of`
+    /// reads it from either.
+    pub vector: Option<crate::vector::quant::StoredVector>,
     pub attrs: Option<Box<str>>, // JSON string, stored raw
 }
 
 /// The inner data for a VectorSet key.
 /// All vectors must share the same dimension and quantization.
-#[derive(Clone)]
 pub struct VectorSetInner {
     pub dim: usize,
     pub entries: AHashMap<crate::key_bytes::KeyBytes, VSetEntry>,
@@ -255,6 +257,10 @@ pub struct VectorSetInner {
     /// loaded, restored or copied has the defaults.
     pub m: usize,
     pub ef_construction: usize,
+    /// `m` is the one the set was made with (a `VADD` in this process), not
+    /// the default a loaded set takes: a `VADD` asking for another `M` is
+    /// then refused, as Redis refuses it.
+    pub m_known: bool,
     /// The graph `VSIM` searches once the set is large enough
     /// (`vector::vset_graph`): made from the elements, never saved.
     pub graph: crate::vector::vset_graph::GraphCell,
@@ -279,8 +285,73 @@ impl VectorSetInner {
             quant_chosen: false,
             m: crate::vector::vset_graph::DEFAULT_M,
             ef_construction: crate::vector::vset_graph::DEFAULT_BUILD_EF,
+            m_known: false,
             graph: Default::default(),
             uid: UIDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// `name`'s vector (`entry` its entry): the entry's own, or the one the
+    /// set's graph holds for it.
+    pub fn vector_of(
+        &self,
+        name: &[u8],
+        entry: &'_ VSetEntry,
+    ) -> Option<std::borrow::Cow<'_, crate::vector::quant::StoredVector>> {
+        match &entry.vector {
+            Some(v) => Some(std::borrow::Cow::Owned(v.clone())),
+            None => self
+                .graph
+                .get()
+                .and_then(|g| g.stored(name))
+                .map(std::borrow::Cow::Owned),
+        }
+    }
+
+    /// `name`'s vector, by reference when the entry holds it.
+    pub fn with_vector<R>(
+        &self,
+        name: &[u8],
+        entry: &VSetEntry,
+        f: impl FnOnce(&crate::vector::quant::StoredVector) -> R,
+    ) -> Option<R> {
+        match &entry.vector {
+            Some(v) => Some(f(v)),
+            None => self.graph.get().and_then(|g| g.stored(name)).map(|v| f(&v)),
+        }
+    }
+}
+
+/// A copy holds every vector itself (its graph, made again from them, is
+/// its own).
+impl Clone for VectorSetInner {
+    fn clone(&self) -> Self {
+        let entries = self
+            .entries
+            .iter()
+            .map(|(name, entry)| {
+                let vector = match &entry.vector {
+                    Some(v) => Some(v.clone()),
+                    None => self.graph.get().and_then(|g| g.stored(name.as_bytes())),
+                };
+                let entry = VSetEntry {
+                    vector,
+                    attrs: entry.attrs.clone(),
+                };
+                (name.clone(), entry)
+            })
+            .collect();
+        Self {
+            dim: self.dim,
+            entries,
+            metric: self.metric.clone(),
+            quant: self.quant,
+            quant_chosen: self.quant_chosen,
+            m: self.m,
+            ef_construction: self.ef_construction,
+            m_known: self.m_known,
+            graph: Default::default(),
+            uid: self.uid,
         }
     }
 }

@@ -1872,3 +1872,31 @@ fn memory_usage_counts_the_graph() {
     let per = usage as f64 / GRAPH_N as f64;
     assert!(per > 64.0 + 256.0 + 64.0, "{per} bytes an element");
 }
+
+/// Another `M` than the set's is refused, as Redis refuses it (16 when none
+/// is given); the set's own is taken.
+#[test]
+fn vadd_refuses_another_m_than_the_sets() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let add = |c: &mut Conn, e: &str, extra: &[&str]| {
+        let mut args = vec!["VADD", "m", "VALUES", "2", "1", "2", e];
+        args.extend_from_slice(extra);
+        c.cmds(&args)
+    };
+    assert_eq!(add(&mut c, "a", &["M", "32"]).as_int(), 1);
+    assert_eq!(add(&mut c, "b", &["M", "32"]).as_int(), 1);
+    for extra in [&[][..], &["M", "16"]] {
+        match add(&mut c, "c", extra) {
+            RespValue::Error(e) => {
+                assert_eq!(e, "ERR asked M value mismatch with existing vector set")
+            }
+            other => panic!("{extra:?}: {other:?}"),
+        }
+    }
+    assert_eq!(c.cmds(&["VCARD", "m"]).as_int(), 2);
+    // A set made without M has 16: M 16 is its own.
+    assert_eq!(c.cmds(&["VADD", "d", "VALUES", "2", "1", "2", "x"]).as_int(), 1);
+    assert_eq!(c.cmds(&["VADD", "d", "VALUES", "2", "1", "2", "y", "M", "16"]).as_int(), 1);
+}

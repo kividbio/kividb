@@ -38,7 +38,7 @@
 //! as the key does (`backfill_from_db_progress`), as it does for the
 //! writes an AOF replays after its snapshot.
 
-use super::{DistanceMetric, HnswIndex, HnswNode, KnnResult, distance_prenorm};
+use super::{DistanceMetric, HnswIndex, HnswNode, KnnResult};
 use ahash::AHashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -452,6 +452,10 @@ fn insert_then_done(
     #[cfg(test)]
     crate::test_hooks::at("backlog: linked");
     index.backlog.done(key, ticket);
+    // A vector set's graph: the set may now let go of its own copy.
+    if let Some(linked) = &index.linked {
+        linked.lock().push(Arc::from(key));
+    }
 }
 
 /// The `k` nearest of `found` (the graph's, nearest first) and the
@@ -463,6 +467,7 @@ pub(crate) fn merge(
     waiting: &Snapshot,
     query: &[f32],
     metric: &DistanceMetric,
+    encoding: super::quant::Encoding,
     mut found: Vec<KnnResult>,
     k: usize,
     mut admit: Option<&mut dyn FnMut(&HnswNode) -> bool>,
@@ -484,7 +489,7 @@ pub(crate) fn merge(
         if vector.len() != query.len() {
             continue;
         }
-        let d = distance_prenorm(metric, query, vector);
+        let d = encoding.distance(metric, query, vector);
         if near.len() >= k && d.total_cmp(&bound).is_ge() {
             continue;
         }
@@ -1884,7 +1889,7 @@ mod concurrency {
     fn dist(metric: &DistanceMetric, q: &[f32], v: &[f32]) -> f32 {
         let s = super::super::as_stored(metric, v.to_vec());
         let q = super::super::as_stored(metric, q.to_vec());
-        distance_prenorm(metric, &q, &s)
+        crate::vector::distance_prenorm(metric, &q, &s)
     }
 
     /// Per key: every state written to it, in order (None: deleted), and how
