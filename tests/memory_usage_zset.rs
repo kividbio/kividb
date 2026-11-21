@@ -220,7 +220,8 @@ fn a_sorted_set_is_sampled_as_a_set_is() {
     let mut c = server.connect();
     c.pipeline(&[zadd(b"z", (0..1000).map(|i| (scattered(i), member(i))))]);
     let key = [b("z")];
-    let all = usage_of(&mut c, &key, Some("0"))[0];
+    // The set's table settled first: the samples are compared on one layout.
+    let all = c.settled_usage(b"z");
     assert_eq!(usage_of(&mut c, &key, None)[0], all);
     for n in ["1", "5", "999", "1000", "100000"] {
         assert_eq!(usage_of(&mut c, &key, Some(n))[0], all, "SAMPLES {n}");

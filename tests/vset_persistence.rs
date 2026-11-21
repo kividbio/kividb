@@ -82,7 +82,23 @@ impl Conn {
         }
     }
 
+    /// One command. A server that answers `LOADING` (its dataset or indexes
+    /// are still being loaded after a start or restart) did not run it, so it
+    /// is asked again, for at most 10 seconds.
     fn cmd<A: AsRef<str>>(&mut self, args: &[A]) -> V {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reply = self.cmd_once(args);
+            match &reply {
+                V::Err(e) if e.starts_with("LOADING") && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => return reply,
+            }
+        }
+    }
+
+    fn cmd_once<A: AsRef<str>>(&mut self, args: &[A]) -> V {
         let mut buf = format!("*{}\r\n", args.len()).into_bytes();
         for a in args {
             let a = a.as_ref();
@@ -94,7 +110,21 @@ impl Conn {
         self.read()
     }
 
+    /// `cmd` for arguments that are not text.
     fn cmd_bytes(&mut self, args: &[&[u8]]) -> V {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reply = self.cmd_bytes_once(args);
+            match &reply {
+                V::Err(e) if e.starts_with("LOADING") && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => return reply,
+            }
+        }
+    }
+
+    fn cmd_bytes_once(&mut self, args: &[&[u8]]) -> V {
         self.writer.write_all(&encode(args)).unwrap();
         self.read()
     }
@@ -477,7 +507,7 @@ fn capture(c: &mut Conn) -> Snapshot {
         usage: vec![],
     };
     for (key, _, _) in SETS {
-        s.info.push(c.cmd(&["VINFO", key]));
+        s.info.push(stable_vinfo(c, key));
         s.usage
             .push(c.cmd(&["MEMORY", "USAGE", key, "SAMPLES", "0"]).i());
         s.sim
@@ -512,12 +542,25 @@ fn assert_same(a: &Snapshot, b: &Snapshot, what: &str) {
     assert_eq!(a.usage, b.usage, "{what}: MEMORY USAGE");
 }
 
+/// `VINFO` less `vset-uid`, which numbers the sets a process has made: a
+/// restart or another node numbers them otherwise.
+fn stable_vinfo(c: &mut Conn, key: &str) -> V {
+    let info = c.cmd(&["VINFO", key]);
+    let V::Arr(items) = info else { return info };
+    let kept = items
+        .chunks(2)
+        .filter(|p| !matches!(&p[0], V::Str(s) if s == "vset-uid"))
+        .flat_map(|p| p.to_vec())
+        .collect();
+    V::Arr(kept)
+}
+
 fn quant_type(c: &mut Conn, key: &str) -> String {
     let info = c.cmd(&["VINFO", key]);
     let info = info.arr();
     let at = info
         .iter()
-        .position(|v| matches!(v, V::Bulk(b) if b == b"quant-type"))
+        .position(|v| matches!(v, V::Bulk(_) | V::Str(_)) && v.s() == "quant-type")
         .expect("quant-type");
     info[at + 1].s()
 }
@@ -1202,7 +1245,7 @@ fn assert_matches_old(old: &mut Conn, r: &mut Conn, prefixes: &[&str], what: &st
 /// Two 1.3 nodes keep the same bytes, scores and sizes.
 fn assert_same_sets(a: &mut Conn, b: &mut Conn, prefixes: &[&str], what: &str) {
     for key in keys(prefixes) {
-        assert_eq!(a.cmd(&["VINFO", &key]), b.cmd(&["VINFO", &key]), "{what}");
+        assert_eq!(stable_vinfo(a, &key), stable_vinfo(b, &key), "{what}");
         let usage = |c: &mut Conn| c.cmd(&["MEMORY", "USAGE", &key, "SAMPLES", "0"]);
         assert_eq!(usage(a), usage(b), "{what}: {key}");
         let mut names: Vec<String> = a
@@ -2822,4 +2865,371 @@ fn compressed_snapshots_are_refused_by_1_2_and_handed_back_plain() {
             "1.2: {key}"
         );
     }
+}
+
+// â”€â”€ The graph (#710) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//
+// A set of `vset_graph::EXACT_BELOW` (4,096) elements or more is searched in
+// its graph, which is never saved: it is made again from the elements on
+// every load, restore and copy. What the set answers must not change.
+
+const BIG: usize = 4096 + 500;
+const GDIM: usize = 16;
+
+/// Many commands in one write, their replies read after: a set of `BIG`
+/// elements in a few round trips.
+fn pipelined(c: &mut Conn, cmds: &[Vec<String>]) -> Vec<V> {
+    let mut out = Vec::with_capacity(cmds.len());
+    for chunk in cmds.chunks(500) {
+        let mut buf = Vec::new();
+        for cmd in chunk {
+            let args: Vec<&[u8]> = cmd.iter().map(|a| a.as_bytes()).collect();
+            buf.extend_from_slice(&encode(&args));
+        }
+        c.writer.write_all(&buf).unwrap();
+        out.extend(chunk.iter().map(|_| c.read()));
+    }
+    out
+}
+
+fn vadd_cmd(key: &str, v: &[f32], element: &str, opts: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        "VADD".to_string(),
+        key.to_string(),
+        "VALUES".to_string(),
+        v.len().to_string(),
+    ];
+    args.extend(v.iter().map(|x| x.to_string()));
+    args.push(element.to_string());
+    args.extend(opts.iter().map(|s| s.to_string()));
+    args
+}
+
+/// Sets of `BIG` elements: f32 (the default), Q8 and BIN.
+const BIG_SETS: [(&str, &str); 3] = [("g32", ""), ("gq8", "Q8"), ("gbin", "BIN")];
+
+fn fill_big(c: &mut Conn) {
+    for (key, opt) in BIG_SETS {
+        let opts: Vec<&str> = if opt.is_empty() { vec![] } else { vec![opt] };
+        let cmds: Vec<Vec<String>> = (0..BIG as u64)
+            .map(|n| vadd_cmd(key, &vector(n, GDIM), &format!("e{n}"), &opts))
+            .collect();
+        for r in pipelined(c, &cmds) {
+            assert_eq!(r, V::Int(1), "{key}");
+        }
+    }
+}
+
+/// Overwrites and removals, the same on every server they are sent to.
+fn churn(c: &mut Conn, round: u64) {
+    for (key, opt) in BIG_SETS {
+        let opts: Vec<&str> = if opt.is_empty() { vec![] } else { vec![opt] };
+        let mut cmds = Vec::new();
+        for n in 0..300u64 {
+            let at = (n * 7 + round * 13) % BIG as u64;
+            if n % 3 == 0 {
+                cmds.push(vec!["VREM".to_string(), key.to_string(), format!("e{at}")]);
+            } else {
+                cmds.push(vadd_cmd(
+                    key,
+                    &vector(at + 1_000_000 * (round + 1), GDIM),
+                    &format!("e{at}"),
+                    &opts,
+                ));
+            }
+        }
+        pipelined(c, &cmds);
+    }
+}
+
+fn vinfo_of(c: &mut Conn, key: &str, field: &str) -> V {
+    let info = c.cmd(&["VINFO", key]);
+    let items = info.arr();
+    let at = items
+        .iter()
+        .step_by(2)
+        .position(|k| k.s() == field)
+        .unwrap_or_else(|| panic!("no {field}"));
+    items[at * 2 + 1].clone()
+}
+
+fn wait_graphs(c: &mut Conn) {
+    for (key, _) in BIG_SETS {
+        wait_until(&format!("{key}'s graph"), 120, || {
+            vinfo_of(c, key, "index-type").s() == "HNSW"
+        });
+    }
+}
+
+fn big_sim(c: &mut Conn, key: &str, q: u64, extra: &[&str]) -> Vec<V> {
+    let v = vector(q + 5_000_000, GDIM);
+    let mut args = vec![
+        "VSIM".to_string(),
+        key.to_string(),
+        "VALUES".to_string(),
+        GDIM.to_string(),
+    ];
+    args.extend(v.iter().map(|x| x.to_string()));
+    args.extend(["COUNT".to_string(), "10".to_string()]);
+    args.extend(extra.iter().map(|s| s.to_string()));
+    c.cmd(&args).arr().to_vec()
+}
+
+/// What the sets answer exactly (`TRUTH`, with scores), and their sizes.
+fn exact_answers(c: &mut Conn) -> Vec<Vec<V>> {
+    let mut out = Vec::new();
+    for (key, _) in BIG_SETS {
+        out.push(vec![c.cmd(&["VCARD", key])]);
+        for q in 0..20 {
+            out.push(big_sim(c, key, q, &["TRUTH", "WITHSCORES"]));
+        }
+    }
+    out
+}
+
+/// Recall@10 of the graph against `TRUTH`, over each set's first 20 queries.
+fn graph_recall(c: &mut Conn) -> f64 {
+    let mut hits = 0;
+    let mut want = 0;
+    for (key, _) in BIG_SETS {
+        for q in 0..20 {
+            let truth = big_sim(c, key, q, &["TRUTH", "WITHSCORES"]);
+            let bound: f64 = truth[truth.len() - 1].s().parse().unwrap();
+            let got = big_sim(c, key, q, &["WITHSCORES"]);
+            // By score, so that BIN's ties count as found.
+            hits += got
+                .chunks(2)
+                .filter(|p| p[1].s().parse::<f64>().unwrap() >= bound)
+                .count();
+            want += truth.len() / 2;
+        }
+    }
+    hits as f64 / want as f64
+}
+
+fn assert_graph_answers(c: &mut Conn, want: &[Vec<V>], what: &str) {
+    assert!(exact_answers(c) == want, "{what}: TRUTH differs");
+    wait_graphs(c);
+    let recall = graph_recall(c);
+    assert!(recall >= 0.9, "{what}: recall {recall}");
+    assert!(
+        exact_answers(c) == want,
+        "{what}: TRUTH differs once the graph is made"
+    );
+}
+
+#[test]
+fn graph_sets_through_save_restart_and_aof() {
+    let mut server = Server::start(&["--aof"]);
+    let mut c = server.conn();
+    fill_big(&mut c);
+    churn(&mut c, 0);
+    let want = exact_answers(&mut c);
+    assert_graph_answers(&mut c, &want, "as written");
+
+    // A snapshot, and a restart from it.
+    c.cmd(&["SAVE"]);
+    server.shutdown();
+    server.restart_as(this_bin(), &[]);
+    let mut c = server.conn();
+    assert_graph_answers(&mut c, &want, "loaded");
+
+    // The AOF (and its rewrite), after a kill.
+    server.shutdown();
+    server.restart_as(this_bin(), &["--aof"]);
+    let mut c = server.conn();
+    churn(&mut c, 1);
+    let want = exact_answers(&mut c);
+    server.kill();
+    server.restart();
+    let mut c = server.conn();
+    assert_graph_answers(&mut c, &want, "replayed");
+    rewrite(&mut c);
+    server.kill();
+    server.restart();
+    let mut c = server.conn();
+    assert_graph_answers(&mut c, &want, "replayed after a rewrite");
+}
+
+#[test]
+fn graph_sets_on_a_replica() {
+    let master = Server::start(&[]);
+    let mut m = master.conn();
+    fill_big(&mut m);
+    churn(&mut m, 0);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port]);
+    let mut r = replica.conn();
+    wait_caught_up(&mut m, &mut r);
+    // Full sync, then the stream.
+    let want = exact_answers(&mut m);
+    assert_graph_answers(&mut r, &want, "replica after its full sync");
+    churn(&mut m, 1);
+    wait_caught_up(&mut m, &mut r);
+    let want = exact_answers(&mut m);
+    assert_graph_answers(&mut m, &want, "master");
+    assert_graph_answers(&mut r, &want, "replica after the stream");
+}
+
+#[test]
+fn graph_sets_through_dump_restore_copy_and_rename() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    fill_big(&mut c);
+    wait_graphs(&mut c);
+    let want = exact_answers(&mut c);
+    for (key, _) in BIG_SETS {
+        let V::Bulk(payload) = c.cmd(&["DUMP", key]) else {
+            panic!("DUMP {key}")
+        };
+        c.cmd(&["DEL", key]);
+        let r = c.cmd_bytes(&[b"RESTORE", key.as_bytes(), b"0", &payload]);
+        assert_eq!(r, V::Str("OK".into()), "RESTORE {key}");
+    }
+    assert_graph_answers(&mut c, &want, "restored");
+    for (key, _) in BIG_SETS {
+        assert_eq!(c.cmd(&["COPY", key, &format!("{key}-copy")]), V::Int(1));
+        c.cmd(&["DEL", key]);
+        assert_eq!(
+            c.cmd(&["RENAME", &format!("{key}-copy"), key]),
+            V::Str("OK".into())
+        );
+    }
+    assert_graph_answers(&mut c, &want, "copied and renamed");
+}
+
+/// The key deleted, flushed or expired while its graph is made and its
+/// vectors wait to be linked: gone at once, and a new set of the same name
+/// is whole.
+#[test]
+fn graph_sets_deleted_while_linking() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    for round in 0..3 {
+        fill_big(&mut c);
+        match round {
+            0 => {
+                c.cmd(&["FLUSHALL"]);
+            }
+            1 => {
+                for (key, _) in BIG_SETS {
+                    assert_eq!(c.cmd(&["PEXPIRE", key, "1"]), V::Int(1));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                for (key, _) in BIG_SETS {
+                    assert_eq!(c.cmd(&["DEL", key]), V::Int(1));
+                }
+            }
+        }
+        for (key, _) in BIG_SETS {
+            assert_eq!(c.cmd(&["EXISTS", key]), V::Int(0), "round {round}");
+        }
+    }
+    fill_big(&mut c);
+    churn(&mut c, 2);
+    let want = exact_answers(&mut c);
+    assert_graph_answers(&mut c, &want, "made again");
+}
+
+/// A snapshot 1.2.2 wrote of sets this large loads, answers as 1.2.2 did
+/// (an exact scan), and gets its graph; one this build writes loads in
+/// 1.2.2 as it was.
+#[test]
+#[ignore = "needs a 1.2 binary in KIVIDB_1_2_BIN"]
+fn graph_sets_and_1_2_snapshots() {
+    let old = old_bin();
+    let mut server = Server::start_bin(old.clone(), tempfile::tempdir().unwrap(), &[]);
+    let mut c = server.conn();
+    fill_big(&mut c);
+    churn(&mut c, 0);
+    // 1.2 scans: its answers are the exact ones.
+    let mut want = Vec::new();
+    for (key, _) in BIG_SETS {
+        want.push(vec![c.cmd(&["VCARD", key])]);
+        for q in 0..20 {
+            want.push(big_sim(&mut c, key, q, &["WITHSCORES"]));
+        }
+    }
+    c.cmd(&["SAVE"]);
+    server.shutdown();
+    server.restart_as(this_bin(), &[]);
+    let mut c = server.conn();
+    assert_graph_answers(&mut c, &want, "1.2.2's snapshot");
+
+    // Written by this build, read by 1.2.2.
+    churn(&mut c, 1);
+    let want = exact_answers(&mut c);
+    c.cmd(&["SAVE"]);
+    server.shutdown();
+    server.restart_as(old, &[]);
+    let mut c = server.conn();
+    let mut got = Vec::new();
+    for (key, _) in BIG_SETS {
+        got.push(vec![c.cmd(&["VCARD", key])]);
+        for q in 0..20 {
+            got.push(big_sim(&mut c, key, q, &["WITHSCORES"]));
+        }
+    }
+    assert!(got == want, "1.2.2 reads this build's snapshot otherwise");
+}
+
+/// An element whose vector the set's graph holds in its place reads back
+/// as it was stored (`VEMB RAW`, `DUMP`), after an overwrite too: as the
+/// same vector reads in a small set, which holds its vectors itself.
+#[test]
+fn vectors_kept_in_the_graph_read_back_as_stored() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    fill_big(&mut c);
+    wait_graphs(&mut c);
+    // The builder takes in what was linked once it is idle.
+    std::thread::sleep(Duration::from_secs(3));
+    for (key, opt) in BIG_SETS {
+        let opts: Vec<&str> = if opt.is_empty() { vec![] } else { vec![opt] };
+        let small = format!("{key}-small");
+        for (round, seed) in [(0, 1u64), (1, 9_000_001)] {
+            let v = vector(seed, GDIM);
+            if round == 1 {
+                assert_eq!(vadd(&mut c, key, &v, "e1", &opts), V::Int(0));
+            }
+            assert!(!vadd(&mut c, &small, &v, "e1", &opts).is_err());
+            let want = c.cmd(&["VEMB", &small, "e1", "RAW"]);
+            assert_eq!(
+                c.cmd(&["VEMB", key, "e1", "RAW"]),
+                want,
+                "{key} round {round}"
+            );
+            assert_eq!(c.cmd(&["VEMB", key, "e1"]), c.cmd(&["VEMB", &small, "e1"]));
+            let V::Bulk(payload) = c.cmd(&["DUMP", key]) else {
+                panic!("DUMP {key}")
+            };
+            let copy = format!("{key}-restored{round}");
+            let r = c.cmd_bytes(&[b"RESTORE", copy.as_bytes(), b"0", &payload]);
+            assert_eq!(r, V::Str("OK".into()));
+            assert_eq!(c.cmd(&["VEMB", &copy, "e1", "RAW"]), want, "{key} restored");
+            assert_eq!(c.cmd(&["VCARD", &copy]), c.cmd(&["VCARD", key]));
+        }
+    }
+}
+
+/// A snapshot taken while the graphs are made, with some vectors already
+/// in the graph in place of their entries, loads with every set as it was.
+#[test]
+fn a_snapshot_taken_during_the_build_loads_whole() {
+    let mut server = Server::start(&[]);
+    let mut c = server.conn();
+    fill_big(&mut c);
+    churn(&mut c, 0);
+    c.cmd(&["SAVE"]);
+    let want = exact_answers(&mut c);
+    server.shutdown();
+    server.restart();
+    let mut c = server.conn();
+    assert_graph_answers(
+        &mut c,
+        &want,
+        "loaded from a snapshot taken during the build",
+    );
 }

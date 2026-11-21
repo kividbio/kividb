@@ -306,6 +306,13 @@ A number starts exactly that many on any machine, and all of them always link. T
 says how many started, on the first write that needs them; `FT.INFO` shows
 `hnsw_index_threads` (started) and `hnsw_index_threads_active` (linking now).
 
+Vector sets' graphs (`VADD`) use the same helpers. When `auto` starts none, a vector set's
+writes are linked by threads of their own instead (`vset-link-N`, half the CPUs, one to
+four, started on the first such write): the writes of one key run one after another, and
+each linking its own vector would link a set one vector at a time (on a 4-vCPU D4s_v5,
+2,664 `VADD`s a second against 6,608 with them). `0` starts neither: each `VADD` links its
+own vector.
+
 So on a server of fewer than 8 CPUs builds run at 1.2's speed by default, and
 `search-index-threads 1` (or more) trades serving latency for build speed. The helpers take
 CPU time the workers would otherwise have. With every CPU of a 4-vCPU server busy (GET/SET

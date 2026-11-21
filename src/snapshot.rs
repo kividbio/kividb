@@ -838,12 +838,34 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
 
             let mut floats = Vec::new();
             let mut buf = Vec::new();
-            for (name, entry) in inner.entries.iter() {
+            // The vectors the set's graph holds in its place, read a chunk
+            // at a time (see `vset_graph::Reader`: the set's read lock keeps
+            // them as they are between chunks).
+            let graph = inner.graph.get().filter(|g| g.exact());
+            let mut reader = None;
+            for (i, (name, entry)) in inner.entries.iter().enumerate() {
+                if i % crate::vector::vset_graph::READ_CHUNK == 0 {
+                    reader = None;
+                }
                 // Element name
                 write_bytes(w, name.as_bytes())?;
 
                 use crate::vector::quant::StoredVector;
-                match (&entry.vector, legacy) {
+                let decoded: StoredVector;
+                let vector = match &entry.vector {
+                    Some(v) => v,
+                    None => {
+                        let found = graph.and_then(|g| {
+                            let r = reader.get_or_insert_with(|| g.reader());
+                            r.encoding().decode(r.encoded(name.as_bytes())?)
+                        });
+                        decoded = found.ok_or_else(|| {
+                            io::Error::other("a vector set element has no vector")
+                        })?;
+                        &decoded
+                    }
+                };
+                match (vector, legacy) {
                     // Legacy layout keeps a per-vector length.
                     (StoredVector::F32(v), true) => {
                         w.write_all(&(v.len() as u32).to_le_bytes())?;
@@ -2746,10 +2768,20 @@ fn read_image_body(
                             None
                         };
 
-                        vs.entries.insert(name, VSetEntry { vector, attrs });
+                        vs.entries.insert(
+                            name,
+                            VSetEntry {
+                                vector: Some(vector),
+                                attrs,
+                            },
+                        );
                     }
 
-                    KiviDBValue::VectorSet(Arc::new(parking_lot::RwLock::new(vs)))
+                    let set = Arc::new(parking_lot::RwLock::new(vs));
+                    // Its graph is made from the elements, in the background
+                    // (`VSIM` scans until it is): nothing of it is saved.
+                    crate::vector::vset_graph::request_build(&set, &set.read());
+                    KiviDBValue::VectorSet(set)
                 }
                 TAG_HASH_EX => {
                     let mut count_buf = [0u8; 4];
@@ -6474,7 +6506,7 @@ mod dump_payload_tests {
         vs.entries.insert(
             "a".into(),
             VSetEntry {
-                vector: vec![1.0, 2.0].into(),
+                vector: Some(vec![1.0, 2.0].into()),
                 attrs: None,
             },
         );
@@ -6519,7 +6551,7 @@ mod dump_payload_tests {
             vs.entries.insert(
                 crate::key_bytes::KeyBytes::from(&[b'e', n, 0xff][..]),
                 VSetEntry {
-                    vector: StoredVector::quantize(quant, v).unwrap(),
+                    vector: Some(StoredVector::quantize(quant, v).unwrap()),
                     attrs: (n == 3).then(|| r#"{"n":3}"#.into()),
                 },
             );

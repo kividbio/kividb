@@ -79,7 +79,23 @@ impl Conn {
         }
     }
 
+    /// One command. A server that answers `LOADING` (its dataset or indexes
+    /// are still being loaded after a start or restart) did not run it, so it
+    /// is asked again, for at most 10 seconds.
     fn cmd(&mut self, args: &[&str]) -> V {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reply = self.cmd_once(args);
+            match &reply {
+                V::Err(e) if e.starts_with("LOADING") && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => return reply,
+            }
+        }
+    }
+
+    fn cmd_once(&mut self, args: &[&str]) -> V {
         let mut buf = format!("*{}\r\n", args.len()).into_bytes();
         for a in args {
             buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
@@ -90,8 +106,24 @@ impl Conn {
         self.read()
     }
 
-    /// Several commands in one write, and their replies in order.
+    /// Several commands in one write, and their replies in order. Sent again
+    /// when every reply is `LOADING`: none of them ran. A mix means the load
+    /// ended inside the pipeline and the replies stand.
     fn pipeline(&mut self, commands: &[Vec<String>]) -> Vec<V> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let replies = self.pipeline_once(commands);
+            let loading = replies
+                .iter()
+                .all(|r| matches!(r, V::Err(e) if e.starts_with("LOADING")));
+            if !loading || Instant::now() >= deadline {
+                return replies;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn pipeline_once(&mut self, commands: &[Vec<String>]) -> Vec<V> {
         let mut buf = Vec::new();
         for args in commands {
             buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());

@@ -81,6 +81,8 @@ pub struct Slots {
     blocks: boxcar::Vec<Block>,
     /// Held to add a block.
     grow: parking_lot::Mutex<()>,
+    /// How a vector is laid out in its `dim` floats, and so measured.
+    encoding: super::quant::Encoding,
 }
 
 impl std::fmt::Debug for Slots {
@@ -92,15 +94,50 @@ impl std::fmt::Debug for Slots {
     }
 }
 
+/// A vector set's distance, kept out of line: inlined into every search
+/// loop, the quantized arms cost FT.SEARCH's f32 graphs up to 13% of their
+/// q/s at 64 dimensions.
+#[inline(never)]
+fn encoded_dist(
+    encoding: super::quant::Encoding,
+    metric: &super::DistanceMetric,
+    a: &[f32],
+    b: &[f32],
+) -> f32 {
+    encoding.distance(metric, a, b)
+}
+
 impl Slots {
     /// Slots for vectors of `dim` floats and up to `m0` layer-0 links.
     pub fn new(dim: usize, m0: usize) -> Self {
+        Self::with_encoding(dim, m0, super::quant::Encoding::F32)
+    }
+
+    /// Slots for vectors laid out as `encoding` has them, in `dim` floats.
+    pub fn with_encoding(dim: usize, m0: usize, encoding: super::quant::Encoding) -> Self {
         Self {
             dim,
             stride: dim.div_ceil(LINE_FLOATS).max(1) * LINE_FLOATS,
             links: m0 + 1,
             blocks: boxcar::Vec::new(),
             grow: parking_lot::Mutex::new(()),
+            encoding,
+        }
+    }
+
+    /// How the vectors are laid out.
+    #[inline(always)]
+    pub fn encoding(&self) -> super::quant::Encoding {
+        self.encoding
+    }
+
+    /// The distance between two vectors as these slots hold them (`a` and
+    /// `b` from [`Slots::vector`], or a query laid out alike).
+    #[inline(always)]
+    pub fn dist(&self, metric: &super::DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
+        match self.encoding {
+            super::quant::Encoding::F32 => super::distance_prenorm(metric, a, b),
+            other => encoded_dist(other, metric, a, b),
         }
     }
 

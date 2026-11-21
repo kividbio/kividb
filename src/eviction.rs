@@ -989,7 +989,11 @@ fn freeing_at_least(value: crate::store::ValueRef<'_>) -> usize {
         // (#764), and a member of up to seven bytes takes no block at all.
         V::Set(set) => set.read().freeing_at_least(ELEMENT),
         V::SortedSet(zset) => zset.read().freeing_at_least(ELEMENT),
-        V::VectorSet(set) => set.read().entries.len() * ELEMENT,
+        // The graph too: its slots, nodes and links.
+        V::VectorSet(set) => {
+            let set = set.read();
+            set.entries.len() * ELEMENT + set.graph.get().map_or(0, |g| g.bytes(0))
+        }
         V::Json(json) => match &*json.read() {
             serde_json::Value::Array(items) => items.len() * ELEMENT,
             serde_json::Value::Object(fields) => fields.len() * ELEMENT,

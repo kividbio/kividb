@@ -144,7 +144,12 @@ fn script_key(cmd: &[&[u8]]) -> Option<u64> {
 #[cfg(feature = "lua")]
 struct Job {
     env: ClientExecEnv,
-    cmd: Vec<Vec<u8>>,
+    /// The command's arguments, each its length (8 bytes, little-endian) and
+    /// then its bytes: one allocation, made on the connection's thread and
+    /// freed by the thread that runs the script, whatever the number of
+    /// arguments. `run` makes the list of them the command is run with.
+    args: Vec<u8>,
+    count: usize,
     db: usize,
     aof_enabled: bool,
     client_resp: u8,
@@ -162,9 +167,47 @@ fn resp_error(message: &str) -> Vec<u8> {
 
 #[cfg(feature = "lua")]
 impl Job {
+    /// A job for `cmd`, its arguments copied into one buffer.
+    fn new(
+        env: ClientExecEnv,
+        cmd: &[&[u8]],
+        db: usize,
+        aof_enabled: bool,
+        client_resp: u8,
+        key: u64,
+    ) -> Self {
+        let mut args = Vec::with_capacity(cmd.iter().map(|arg| arg.len() + 8).sum());
+        for arg in cmd {
+            args.extend_from_slice(&(arg.len() as u64).to_le_bytes());
+            args.extend_from_slice(arg);
+        }
+        Job {
+            env,
+            args,
+            count: cmd.len(),
+            db,
+            aof_enabled,
+            client_resp,
+            key,
+        }
+    }
+
+    /// The arguments, as `new` was given them.
+    fn cmd(&self) -> Vec<&[u8]> {
+        let mut cmd = Vec::with_capacity(self.count);
+        let mut rest = self.args.as_slice();
+        while let Some((len, tail)) = rest.split_first_chunk::<8>() {
+            let len = u64::from_le_bytes(*len) as usize;
+            let (arg, tail) = tail.split_at(len);
+            cmd.push(arg);
+            rest = tail;
+        }
+        cmd
+    }
+
     fn run(&self) -> Done {
         let (key, db, aof_enabled, resp) = (self.key, self.db, self.aof_enabled, self.client_resp);
-        let cmd: Vec<&[u8]> = self.cmd.iter().map(|c| c.as_slice()).collect();
+        let cmd = self.cmd();
         ran_quick(key, db, || {
             self.env.run_execute_borrowed(cmd, db, aof_enabled, resp)
         })
@@ -270,6 +313,27 @@ impl Drop for Turn {
 #[cfg(feature = "lua")]
 const RUN_FOR: std::time::Duration = std::time::Duration::from_micros(200);
 
+/// `RUN_FOR`, or in debug builds `KIVIDB_TEST_RUN_FOR_US` (never set
+/// otherwise): a tiny one makes nearly every run end with scripts left, for
+/// the tests of what becomes of them.
+#[cfg(feature = "lua")]
+fn run_for() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    {
+        static FOR: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        *FOR.get_or_init(|| {
+            std::env::var("KIVIDB_TEST_RUN_FOR_US")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map_or(RUN_FOR, std::time::Duration::from_micros)
+        })
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        RUN_FOR
+    }
+}
+
 /// The queue of quick scripts that came while another one was running, and
 /// the thread that runs them when nobody else has the turn: one after
 /// another, with nothing to wait for between them.
@@ -335,8 +399,8 @@ impl Runner {
     fn run_queued(&self, since: std::time::Instant, on_worker: bool) {
         use std::sync::atomic::Ordering;
         loop {
-            if crate::command_gate::reopen_between_scripts(RUN_FOR).is_none()
-                && since.elapsed() >= RUN_FOR
+            if crate::command_gate::reopen_between_scripts(run_for()).is_none()
+                && since.elapsed() >= run_for()
             {
                 break;
             }
@@ -394,6 +458,273 @@ impl Runner {
             std::mem::forget(turn);
             SCRIPT_RUNNING.store(false, Ordering::SeqCst);
         }
+    }
+}
+
+/// How long a connection whose script was queued looks for its reply, between
+/// turns of its thread's loop, before it waits to be woken for it.
+#[cfg(feature = "lua")]
+const LOOK_FOR: std::time::Duration = std::time::Duration::from_micros(400);
+
+/// While connections on an io_uring thread look, how often at most the thread
+/// hands the kernel what its ring has to send (see `queued_reply`).
+#[cfg(all(feature = "lua", target_os = "linux"))]
+const SUBMIT_EVERY: std::time::Duration = std::time::Duration::from_micros(20);
+
+/// Looks in a row on one thread that end without a reply before the thread
+/// stops looking for a while (`LOOK_BACKOFF_FIRST`, doubling to
+/// `LOOK_BACKOFF_MAX`; a look that finds its reply ends the back-off).
+#[cfg(feature = "lua")]
+const LOOK_MISSES: u32 = 8;
+#[cfg(feature = "lua")]
+const LOOK_BACKOFF_FIRST: std::time::Duration = std::time::Duration::from_millis(1);
+#[cfg(feature = "lua")]
+const LOOK_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The worker threads the server runs (`--threads`, resolved), told once at
+/// start (`workers_are`).
+#[cfg(feature = "lua")]
+static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Called once at start with the number of worker threads (by `main`:
+/// the library has none).
+#[cfg(feature = "lua")]
+#[allow(dead_code)]
+pub(crate) fn workers_are(workers: usize) {
+    let _ = WORKERS.set(workers);
+}
+
+/// Whether a connection whose script was queued may look for its reply at
+/// all: only when the CPUs the process may use (its mask and its quota,
+/// `cpus::available_parallelism`) leave one beyond the workers and the
+/// script-runner thread. A look keeps its thread busy; on a server whose
+/// workers have the CPUs to themselves, or fewer, a looking thread would take
+/// CPU from the thread running the scripts.
+#[cfg(feature = "lua")]
+fn looking_pays() -> bool {
+    static PAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PAYS.get_or_init(|| {
+        if test_always_looks() {
+            return true;
+        }
+        let Some(&workers) = WORKERS.get() else {
+            return false;
+        };
+        let cpus = crate::cpus::available_parallelism().map_or(1, |n| n.get());
+        workers + 1 < cpus
+    })
+}
+
+/// `KIVIDB_TEST_LOOK`, never set otherwise, and read in debug builds only:
+/// queued scripts' connections look for their replies whatever the CPUs, so
+/// that the tests of a machine with few run the looks too.
+#[cfg(all(feature = "lua", debug_assertions))]
+fn test_always_looks() -> bool {
+    static LOOK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LOOK.get_or_init(|| std::env::var_os("KIVIDB_TEST_LOOK").is_some())
+}
+
+#[cfg(all(feature = "lua", not(debug_assertions)))]
+#[inline(always)]
+fn test_always_looks() -> bool {
+    false
+}
+
+/// A thread's record of its last looks (see `LOOK_MISSES`).
+#[cfg(feature = "lua")]
+#[derive(Clone, Copy)]
+struct Looks {
+    /// Looks in a row that ended without a reply.
+    misses: u32,
+    /// No looks before this.
+    off_until: Option<std::time::Instant>,
+    /// How long the next back-off is.
+    backoff: std::time::Duration,
+}
+
+#[cfg(feature = "lua")]
+thread_local! {
+    static LOOKS: std::cell::Cell<Looks> = const {
+        std::cell::Cell::new(Looks { misses: 0, off_until: None, backoff: LOOK_BACKOFF_FIRST })
+    };
+    /// When the thread last handed its ring's work to the kernel for a look.
+    #[cfg(target_os = "linux")]
+    static SUBMITTED: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "lua")]
+impl Looks {
+    fn looking_now(&self, now: std::time::Instant) -> bool {
+        self.off_until.is_none_or(|until| now >= until)
+    }
+
+    /// After a look: found its reply, or not.
+    fn after(mut self, found: bool, now: std::time::Instant) -> Self {
+        if found {
+            return Looks {
+                misses: 0,
+                off_until: None,
+                backoff: LOOK_BACKOFF_FIRST,
+            };
+        }
+        self.misses += 1;
+        if self.misses >= LOOK_MISSES {
+            self.misses = 0;
+            self.off_until = Some(now + self.backoff);
+            self.backoff = (self.backoff * 2).min(LOOK_BACKOFF_MAX);
+        }
+        self
+    }
+}
+
+/// The reply to a queued script, or `None` if it will not come.
+///
+/// Where it pays (`looking_pays`) and the thread is not backing off (`Looks`),
+/// looked for between turns of the thread's loop for `LOOK_FOR`, and then
+/// waited for; elsewhere waited for at once. The thread serves its other
+/// connections meanwhile and does not sleep, so whoever runs the script sends
+/// the reply to nobody's waker and the connection finds it at its next look.
+/// Waited for with a waker, each queued script wakes its connection's thread
+/// from its sleep: a write to the thread's eventfd by the thread running the
+/// scripts, one at a time, and a task switch on the thread woken. With one
+/// script of a connection in flight at a time, and the connections on other
+/// workers, the scripts' turn goes unused while that happens (#900).
+#[cfg(feature = "lua")]
+async fn queued_reply(done: tokio::sync::oneshot::Receiver<Done>) -> Option<Done> {
+    let now = std::time::Instant::now();
+    let looks = LOOKS.with(|l| l.get());
+    if !(looking_pays() && looks.looking_now(now)) {
+        return done.await.ok();
+    }
+    let (reply, found) = look_then_wait(done, now).await;
+    let after = LOOKS
+        .with(|l| l.get())
+        .after(found, std::time::Instant::now());
+    LOOKS.with(|l| l.set(after));
+    reply
+}
+
+/// `queued_reply`'s look: the reply and whether it came within `LOOK_FOR`.
+///
+/// A look gives the other tasks of the thread their turn. On an io_uring
+/// thread their reads and writes are handed to the kernel only when the
+/// thread is about to sleep, which a task that gives its turn back does not
+/// make it do: once every `SUBMIT_EVERY` on a thread, whatever the number of
+/// connections looking on it, the look is a no-op on the ring instead, which
+/// does.
+#[cfg(feature = "lua")]
+async fn look_then_wait(
+    mut done: tokio::sync::oneshot::Receiver<Done>,
+    since: std::time::Instant,
+) -> (Option<Done>, bool) {
+    use tokio::sync::oneshot::error::TryRecvError;
+    #[cfg(target_os = "linux")]
+    let ring = crate::deferred::on_ring_thread();
+    // Held for the whole look, so that every way out of it wakes the runner
+    // for scripts left with nobody running them: the reply, a closed channel,
+    // the end of the look, and the future dropped at one of its awaits (the
+    // client gone, the connection closed) or unwound by a panic.
+    let looking = StopsLooking;
+    loop {
+        match done.try_recv() {
+            Ok(reply) => return (Some(reply), true),
+            Err(TryRecvError::Closed) => return (None, true),
+            Err(TryRecvError::Empty) => {}
+        }
+        let now = std::time::Instant::now();
+        if now.duration_since(since) >= LOOK_FOR {
+            drop(looking);
+            return (done.await.ok(), false);
+        }
+        run_the_queue_if_nobody_does();
+        #[cfg(target_os = "linux")]
+        if ring
+            && SUBMITTED.with(|s| {
+                s.get()
+                    .is_none_or(|at| now.duration_since(at) >= SUBMIT_EVERY)
+            })
+        {
+            SUBMITTED.with(|s| s.set(Some(now)));
+            // In a task of its own, which is all the thread holds of the op
+            // across the wait: the connection's future stays `Send`.
+            let _ = tokio_uring::spawn(async {
+                let _ = tokio_uring::no_op().await;
+            })
+            .await;
+            continue;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Take the turn, if nobody has it and scripts are queued, and run them, as
+/// the thread that has run its own script does (`Runner::run_queued`, on a
+/// worker: none of them waits here for a handoff or a move of its keys).
+#[cfg(feature = "lua")]
+fn run_the_queue_if_nobody_does() {
+    use std::sync::atomic::Ordering;
+    if SCRIPT_RUNNING.load(Ordering::Relaxed)
+        || runner().waiting.load(Ordering::Relaxed) == 0
+        || crate::pause::handoff()
+        || crate::pause::keys_moving()
+    {
+        return;
+    }
+    let Some(turn) = Turn::take() else {
+        return;
+    };
+    let run = crate::command_gate::for_a_run();
+    if run.is_some() {
+        runner().run_queued(std::time::Instant::now(), true);
+    }
+    drop(run);
+    // Scripts left are run by whoever looks next (this connection, a moment
+    // from now, among them), and the runner thread is not woken for them:
+    // unless a handoff or a move of keys is under way, when only the runner
+    // may run them; and whoever stops looking with scripts left and nobody
+    // running them wakes it (`wake_the_runner_if_left`).
+    if crate::pause::handoff() || crate::pause::keys_moving() {
+        drop(turn);
+    } else {
+        std::mem::forget(turn);
+        SCRIPT_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// A connection's look, from start to end (see `look_then_wait`): its end,
+/// however it comes, leaves scripts queued with nobody running them to the
+/// runner thread.
+///
+/// Why that is enough. Scripts are left queued with the turn free and the
+/// runner not woken only by `run_the_queue_if_nobody_does`, and only a
+/// connection that looks runs it, holding one of these. Its drop reads the
+/// queue and the turn after its own run has given the turn up (both
+/// `SeqCst`). If another looker takes the turn after that read, the drop
+/// sees it taken and wakes nobody; but that looker holds one of these too,
+/// and the same holds when its run ends: the chain of lookers ends with the
+/// last one, whose drop sees the turn free and wakes the runner. A script
+/// queued as the last look ends is woken for by `Runner::submit` itself:
+/// it counts the queue and then looks at the turn (`SeqCst`), and wakes the
+/// runner when the turn is free, as before; and `Turn`'s drop wakes it for a
+/// holder that is not a looker.
+#[cfg(feature = "lua")]
+struct StopsLooking;
+
+#[cfg(feature = "lua")]
+impl Drop for StopsLooking {
+    fn drop(&mut self) {
+        wake_the_runner_if_left();
+    }
+}
+
+/// Scripts queued and nobody running them are the runner's (see
+/// `StopsLooking`).
+#[cfg(feature = "lua")]
+fn wake_the_runner_if_left() {
+    use std::sync::atomic::Ordering;
+    let runner = runner();
+    if runner.waiting.load(Ordering::SeqCst) > 0 && !SCRIPT_RUNNING.load(Ordering::SeqCst) {
+        runner.thread.unpark();
     }
 }
 
@@ -474,21 +805,15 @@ pub(crate) async fn run_lua_vm_blocking(
             // for every script, which is what made scripts slow under load.
             // So it is queued: whoever has the turn runs it before giving
             // the turn up, or the runner thread does, and this connection
-            // waits without holding its worker.
+            // waits without holding its worker (`queued_reply`).
             None => {
-                let job = Job {
-                    env: env.clone(),
-                    cmd: owned(),
-                    db: sel,
-                    aof_enabled,
-                    client_resp,
-                    key,
-                };
+                let job = Job::new(env.clone(), cmd, sel, aof_enabled, client_resp, key);
                 let (reply, done) = tokio::sync::oneshot::channel();
                 crate::stats::scripts::handed_to_runner();
                 runner().submit(job, reply);
-                done.await
-                    .unwrap_or_else(|_| (resp_error("ERR the script could not be run"), sel, 0))
+                queued_reply(done)
+                    .await
+                    .unwrap_or_else(|| (resp_error("ERR the script could not be run"), sel, 0))
             }
         };
         *selected_db = sel_out;
@@ -541,5 +866,81 @@ mod tests {
         );
         assert_eq!(key(&[b"FUNCTION", b"LOAD", b"#!lua name=x"]), None);
         assert_eq!(key(&[b"EVAL"]), None);
+    }
+
+    fn reply(n: u8) -> Done {
+        (vec![b':', b'0' + n, b'\r', b'\n'], 0, 0)
+    }
+
+    #[tokio::test]
+    async fn a_reply_sent_during_the_look_is_found_by_it() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            let _ = tx.send(reply(1));
+        });
+        let (got, found) = look_then_wait(rx, std::time::Instant::now()).await;
+        sender.join().unwrap();
+        assert_eq!(got.map(|r| r.0), Some(reply(1).0));
+        // Unless the machine stalled the sender past the look.
+        let _ = found;
+    }
+
+    #[tokio::test]
+    async fn a_reply_sent_after_the_look_is_waited_for() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(LOOK_FOR * 5);
+            let _ = tx.send(reply(2));
+        });
+        let (got, found) = look_then_wait(rx, std::time::Instant::now()).await;
+        sender.join().unwrap();
+        assert_eq!(got.map(|r| r.0), Some(reply(2).0));
+        assert!(!found, "the reply came after the look");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_sender_ends_the_look_and_the_wait() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Done>();
+        drop(tx);
+        let (got, _) = look_then_wait(rx, std::time::Instant::now()).await;
+        assert!(got.is_none());
+        let (tx, rx) = tokio::sync::oneshot::channel::<Done>();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(LOOK_FOR * 5);
+            drop(tx);
+        });
+        let (got, found) = look_then_wait(rx, std::time::Instant::now()).await;
+        sender.join().unwrap();
+        assert!(got.is_none() && !found);
+    }
+
+    #[test]
+    fn a_thread_backs_off_after_looks_that_miss() {
+        let t0 = std::time::Instant::now();
+        let mut looks = Looks {
+            misses: 0,
+            off_until: None,
+            backoff: LOOK_BACKOFF_FIRST,
+        };
+        for _ in 0..LOOK_MISSES - 1 {
+            looks = looks.after(false, t0);
+            assert!(looks.looking_now(t0));
+        }
+        looks = looks.after(false, t0);
+        assert!(!looks.looking_now(t0));
+        assert!(looks.looking_now(t0 + LOOK_BACKOFF_FIRST));
+        // Each back-off doubles, up to the most.
+        for _ in 0..20 {
+            for _ in 0..LOOK_MISSES {
+                looks = looks.after(false, t0);
+            }
+        }
+        assert_eq!(looks.backoff, LOOK_BACKOFF_MAX);
+        assert!(!looks.looking_now(t0 + LOOK_BACKOFF_MAX - std::time::Duration::from_micros(1)));
+        // One look that finds its reply ends it.
+        looks = looks.after(true, t0);
+        assert!(looks.looking_now(t0));
+        assert_eq!((looks.misses, looks.backoff), (0, LOOK_BACKOFF_FIRST));
     }
 }
