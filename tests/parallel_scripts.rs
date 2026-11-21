@@ -1988,9 +1988,9 @@ fn kill_in_a_run(io: &str) {
 /// A worker thread that has the turn runs the scripts queued meanwhile; one
 /// of them that has to wait for a `MIGRATE` of its key must not wait there,
 /// where the thread's other connections would wait with it: it is left to
-/// the script-runner thread. A pipelines quick scripts that run alone, so
-/// that its thread has the turn nearly all the while and runs what is
-/// queued after each of its own; B's script on the key the `MIGRATE` holds
+/// the script-runner thread. A pipelines about 150 ms of quick scripts that
+/// run alone, so that its thread has the turn nearly all the while and runs
+/// what is queued after each of its own; B's script on the key the `MIGRATE` holds
 /// comes meanwhile, from a connection on another thread (found beforehand
 /// by a `FUNCTION STATS`, which a slow script of A's holds back on no other
 /// thread), and is queued. The `MIGRATE` itself waits on its own
@@ -2104,20 +2104,26 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
     for _ in 0..4 {
         assert_eq!(a.cmd(&["EVALSHA", &slow, "1", "a", "1"]), V::Int(1));
     }
-    // A sends quick scripts, one pipeline of many: its thread has the turn
+    // A sends quick scripts, one pipeline of them: its thread has the turn
     // nearly all the while, and runs what is queued after each of its own.
+    // About 150 ms of them (measured first), so that they are over by the
+    // time the probes ask: a thread serves the rest of one connection's
+    // pipeline before its other connections.
+    let call: Vec<String> = ["EVALSHA", &slow, "1", "a", "1"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let (_, took) = timed(|| a.pipeline(&vec![call.clone(); 1000]));
+    let n = ((1000.0 * 0.15 / took.as_secs_f64().max(0.0001)) as usize).clamp(200, 20_000);
     let a_stream = std::thread::spawn(move || {
-        let call: Vec<String> = ["EVALSHA", &slow, "1", "a", "1"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let replies = a.pipeline(&vec![call; 20_000]);
+        let (replies, took) = timed(|| a.pipeline(&vec![call; n]));
         assert!(replies.iter().all(|r| *r == V::Int(1)));
+        took
     });
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(20));
     // B's script on `m` comes meanwhile, and is queued.
     let b = std::thread::spawn(move || timed(|| b.cmd(&["EVALSHA", &sets, "1", "m", "v1"])));
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(Duration::from_millis(500));
     // While B waits: connections on every thread but the MIGRATE's.
     let probes: Vec<_> = probe_conns
         .into_iter()
@@ -2138,9 +2144,11 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
         .collect();
     let worst: Vec<Duration> = probes.into_iter().map(|p| p.join().unwrap()).collect();
     let (written, waited) = b.join().unwrap();
-    a_stream.join().unwrap();
+    let a_took = a_stream.join().unwrap();
     let (migrated, _) = migrate.join().unwrap();
-    eprintln!("{io}: probes' worst waits {worst:?}; B waited {waited:?}");
+    eprintln!(
+        "{io}: probes' worst waits {worst:?}; B waited {waited:?}; A's {n} scripts took {a_took:?}"
+    );
     assert!(
         worst.iter().all(|w| *w < Duration::from_millis(1000)),
         "connections waited {worst:?} while a queued script waited out the MIGRATE"
