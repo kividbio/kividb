@@ -2499,22 +2499,30 @@ mod tests {
         assert_eq!(held.as_slice(), &b[..]);
         assert_eq!(text(map.get("k")), Some(a.clone()));
         drop(held);
-        // Another class, or no slab's block: a new block.
+        // Another class: a new block.
         let at = block(&map);
         assert!(matches!(
             map.set_str("k", vec![3u8; 9_000]),
             Written::Replaced(_)
         ));
         assert_ne!(block(&map), at);
+        // The system allocator's block: in place at the same length only.
         assert!(matches!(
             map.set_str("k", vec![4u8; 40_000]),
             Written::Replaced(_)
         ));
+        let at = block(&map);
         assert!(matches!(
             map.set_str("k", vec![5u8; 40_000]),
+            Written::InPlace
+        ));
+        assert_eq!(block(&map), at);
+        assert_eq!(text(map.get("k")), Some(vec![5u8; 40_000]));
+        assert!(matches!(
+            map.set_str("k", vec![6u8; 40_001]),
             Written::Replaced(_)
         ));
-        assert_eq!(text(map.get("k")), Some(vec![5u8; 40_000]));
+        assert_eq!(text(map.get("k")), Some(vec![6u8; 40_001]));
     }
 
     #[test]

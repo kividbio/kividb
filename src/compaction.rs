@@ -2222,7 +2222,8 @@ mod tests {
         let class = value_slab::pool_class_of(4032).unwrap();
         let size = value_slab::block_size(class);
         let per_slab = value_slab::SLAB / size;
-        let slabs = 8;
+        // Enough that the slabs other tests take meanwhile are a few of them.
+        let slabs = 32;
         assert_eq!(value_slab::slabs_of_class(class), 0);
         // The classes up to 2 KiB: other tests take large slabs meanwhile.
         let fill_before = value_slab::small_fill();
@@ -2240,8 +2241,8 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(value_slab::slabs_of_class(class), slabs);
-        // Half a megabyte of pool slabs: neither count moved by it (other
-        // tests may move them by a slab or two meanwhile).
+        // Two megabytes of pool slabs: neither count moved by it (other
+        // tests may move them by a few slabs meanwhile).
         let moved = |a: usize, b: usize| a.abs_diff(b) < slabs * value_slab::SLAB / 2;
         let fill = value_slab::small_fill();
         assert!(moved(fill.slab_bytes, fill_before.slab_bytes));

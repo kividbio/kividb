@@ -182,12 +182,16 @@ impl SharedBytes {
         self.header().holders.load(Ordering::Acquire) == 1
     }
 
-    /// Whether `len` bytes would take a block of this one's slab class: a
-    /// write of them can be [`write_in_place`](Self::write_in_place).
+    /// Whether `len` bytes can take these bytes' place in their block
+    /// ([`write_in_place`](Self::write_in_place)): a block of the same slab
+    /// class, or, the system allocator's, of the same length (it is freed by
+    /// its size).
     #[inline]
     pub fn fits(&self, len: usize) -> bool {
-        let now = crate::value_slab::class_of(HEADER + self.len());
-        now.is_some() && crate::value_slab::class_of(HEADER + len) == now
+        match crate::value_slab::class_of(HEADER + self.len()) {
+            Some(now) => crate::value_slab::class_of(HEADER + len) == Some(now),
+            None => len == self.len(),
+        }
     }
 
     /// The bytes made `bytes`, in this block. A SET over a string of its own

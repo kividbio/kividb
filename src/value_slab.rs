@@ -278,9 +278,13 @@ impl Slab {
         let at = self as *const Slab as usize;
         let region = at & !(REGION - 1);
         let index = (at - region) / std::mem::size_of::<Slab>();
-        (region + index * size) as *mut u8
+        // A power of two: a shift, not a multiplication by a variable.
+        (region + (index << size.trailing_zeros())) as *mut u8
     }
 }
+
+// Slabs' sizes are powers of two: an offset over one is a shift.
+const _: () = assert!(SLAB.is_power_of_two() && LARGE_SLAB.is_power_of_two());
 
 // The headers of a region's slabs fit in its first slab.
 const _: () = assert!(SLABS * std::mem::size_of::<Slab>() <= SLAB);
@@ -316,7 +320,8 @@ fn slab_of(block: *const u8) -> &'static Slab {
 fn slab_in(block: *const u8, size: usize) -> &'static Slab {
     let at = block as usize;
     let region = at & !(REGION - 1);
-    let index = (at - region) / size;
+    // A power of two: a shift, not a division by a variable (each free).
+    let index = (at - region) >> size.trailing_zeros();
     // SAFETY: `block` is in a region, whose first bytes are its slabs'
     // headers, written when it was made and never given back.
     unsafe { &*(region as *const Slab).add(index) }

@@ -505,8 +505,9 @@ impl Entry {
     /// in its block: the value is an inline string, the table's is the only
     /// hold, and the block's size stays in its slab class (see the module);
     /// or the value is a string of its own whose only holder is this entry,
-    /// and its block's size stays in its class. Whether the key has a time to
-    /// live stays as it is.
+    /// and its block's size stays in its class (the system allocator's
+    /// block: its length stays). Whether the key has a time to live stays as
+    /// it is.
     #[inline]
     pub(super) fn fits_in_place(self, vlen: usize) -> bool {
         if self.form() != INLINE {
