@@ -1660,6 +1660,32 @@ fn silent_destination() -> (u16, std::sync::Arc<std::sync::atomic::AtomicBool>) 
     (port, sent)
 }
 
+/// Of `n` new connections to `port`, those that answer a `PING` within
+/// `within`: on io_uring, those on a thread a `MIGRATE` waiting for its
+/// destination does not hold (a `MIGRATE` waits on its own thread). The
+/// others are left to be answered when it ends.
+fn free_connections(port: u16, n: usize, within: Duration) -> Vec<Conn> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for _ in 0..n {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
+            if c.cmd(&["PING"]).s() == "PONG" {
+                let _ = tx.send(c);
+            }
+        });
+    }
+    let deadline = Instant::now() + within;
+    let mut free = Vec::new();
+    while let Ok(c) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        free.push(c);
+        if free.len() == n {
+            break;
+        }
+    }
+    free
+}
+
 /// `MIGRATE` of `key` to a destination that never answers, on a connection
 /// of its own, timing out after `ms`: its reply and how long it took, once
 /// it has sent the key (so a write to it waits from then on).
@@ -1961,9 +1987,10 @@ fn kill_in_a_run(io: &str) {
 /// runs a slow one, holding the turn, and B's script on the key the
 /// `MIGRATE` holds comes meanwhile, from a connection on another thread
 /// (found by a `FUNCTION STATS`, which a running script holds back on no
-/// other thread), and is queued.
-/// While B waits out the `MIGRATE`, a `PING` on any of 16 connections, on
-/// every worker thread, is answered at once. On both I/O loops.
+/// other thread), and is queued. The `MIGRATE` itself waits on its own
+/// thread, so A, B and the probes are connections on the others
+/// (`free_connections`). While B waits out the `MIGRATE`, a `PING` and a
+/// `GET` on each probe are answered at once. On both I/O loops.
 #[test]
 fn a_queued_script_waiting_for_a_migrate_does_not_hold_a_worker() {
     queued_script_waiting_for_a_migrate("tokio");
@@ -2010,12 +2037,13 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let streams = script_stream(port, &quick, &["q", "q:a", "q:b"], 6, &stop);
     std::thread::sleep(Duration::from_millis(200));
-    let candidates: Vec<Conn> = (0..8).map(|_| Conn::connect(port)).collect();
+    let mut free = free_connections(port, 32, Duration::from_millis(500));
+    assert!(free.len() >= 16, "only {} connections answered", free.len());
+    let probe_conns: Vec<Conn> = free.split_off(9);
+    let candidates: Vec<Conn> = free.split_off(1);
+    let mut a = free.pop().unwrap();
     // A holds the turn for about 400 ms.
-    let a = std::thread::spawn(move || {
-        let mut a = Conn::connect(port);
-        a.cmd(&["EVALSHA", &slow, "1", "a", &count.to_string()])
-    });
+    let a = std::thread::spawn(move || a.cmd(&["EVALSHA", &slow, "1", "a", &count.to_string()]));
     std::thread::sleep(Duration::from_millis(100));
     // B: the first connection to answer a `FUNCTION STATS` at once, on a
     // thread A's script is not running on.
@@ -2039,11 +2067,11 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
         .collect();
     assert!(matches!(a.join().unwrap(), V::Int(_)));
     std::thread::sleep(Duration::from_millis(300));
-    // While B waits: connections on every thread.
-    let probes: Vec<_> = (0..16)
-        .map(|_| {
+    // While B waits: connections on every thread but the MIGRATE's.
+    let probes: Vec<_> = probe_conns
+        .into_iter()
+        .map(|mut probe| {
             std::thread::spawn(move || {
-                let mut probe = Conn::connect(port);
                 let mut worst = Duration::ZERO;
                 for _ in 0..10 {
                     let (pong, took) = timed(|| probe.cmd(&["PING"]));
