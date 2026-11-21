@@ -4715,6 +4715,9 @@ pub fn recover_from_aof(
         dump_already_loaded,
     ) {
         Ok(stats) => {
+            // The replay wrote no vector set's graph: they are made now, in
+            // the background, as after a snapshot load.
+            crate::vector::vset_graph::request_builds(store);
             let keys: usize = store
                 .iter()
                 .map(|db| {

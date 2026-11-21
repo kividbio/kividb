@@ -19,17 +19,21 @@ SHA-256 checked; suite 26's two files, and SIFT for 128 dimensions):
   sift128   sift-128-euclidean (ann-benchmarks), 128 dimensions, searched by
             cosine here as every set is (Redis's vector sets are cosine only)
 
-Configurations: `glove100_100k` and `laion768_100k` (#627's datasets, where
-the recall gates are), `sift128_10k` and `sift128_100k`, and `sift128_1m`
-with FULL=1 (Redis loads it at about 2,000 VADD/s: allow SUITE_TIMEOUT=3600).
+Configurations, `Q8` on every server: `glove100_100k` and `laion768_100k`
+(#627's datasets), `sift128_10k` and `sift128_100k`, and `sift128_1m` with
+FULL=1 (Redis loads it at about 2,000 VADD/s: allow SUITE_TIMEOUT=3600).
+`NOQUANT` on every server (f32, like for like): `sift128_100k_noquant` and
+`laion768_100k_noquant`. No quantization option (what a client gets without
+asking: Redis's default is `Q8`, KiviDB's f32): `sift128_100k_default`.
 Queries: the first 500 test vectors of the dataset. Ground truth: the exact
 top 10 by cosine over the f32 vectors loaded (numpy, cached beside the file).
 
 Every server gets the same commands:
 
-  VADD vs FP32 <blob> <i> Q8      (Redis's default quantization; KiviDB's
-                                   default is f32, so it is named; pipelined
-                                   500 at a time from 4 client processes)
+  VADD vs FP32 <blob> <i> [Q8 | NOQUANT]
+                                  (the configuration's option, none in the
+                                   `_default` one; pipelined 500 at a time
+                                   from 4 client processes)
   VSIM vs FP32 <blob> COUNT 10    (asyncio, 4 client processes)
 
 Rows, per configuration:
@@ -39,8 +43,9 @@ Rows, per configuration:
                            graph (KiviDB's VINFO index-type HNSW: the builder
                            has handed every element over); 0 for Redis and
                            v1.2.2, which have nothing to wait for
-  bytes_per_vector         INFO used_memory after the load, less before, a
-                           vector: the Q8 vector, the name, and the graph
+  bytes_per_vector         INFO used_memory once it holds still after the
+                           load, less before, a vector: the vector, the name
+                           and the graph
   recall_at_10             at the default EF, over the 500 queries, one client
   vsim_qps_c1/_c8/_c50     VSIM a second at 1, 8 and 50 connections (2 s
                            warm-up, 10 s)
@@ -92,17 +97,21 @@ DATASETS = {
         "sha256": "dd6f0a6ed6b7ebb8934680f861a33ed01ff33991eaee4fd60914d854a0ca5984",
     },
 }
-# name: (dataset, vectors, FULL=1 only)
+# name: (dataset, vectors, FULL=1 only, the VADD's quantization option or
+# None for the server's own default)
 CONFIGS = {
-    "glove100_100k": ("glove100", 100_000, False),
-    "laion768_100k": ("laion768", 100_000, False),
-    "sift128_10k": ("sift128", 10_000, False),
-    "sift128_100k": ("sift128", 100_000, False),
-    "sift128_1m": ("sift128", 1_000_000, True),
+    "glove100_100k": ("glove100", 100_000, False, "Q8"),
+    "laion768_100k": ("laion768", 100_000, False, "Q8"),
+    "sift128_10k": ("sift128", 10_000, False, "Q8"),
+    "sift128_100k": ("sift128", 100_000, False, "Q8"),
+    "sift128_1m": ("sift128", 1_000_000, True, "Q8"),
+    "sift128_100k_noquant": ("sift128", 100_000, False, "NOQUANT"),
+    "laion768_100k_noquant": ("laion768", 100_000, False, "NOQUANT"),
+    "sift128_100k_default": ("sift128", 100_000, False, None),
 }
 K = 10
 NQ = 500
-QUANT = "Q8"
+QUANT = "Q8"  # set per configuration before the loaders fork
 KEY = "vs"
 LOAD_CLIENTS = 4
 BATCH = 500
@@ -119,10 +128,11 @@ RECALL_X = 1.0101
 QPS_X = {"c1": 1.2, "c8": 1.15, "c50": 1.15}
 
 S = Suite("44-vector-sets-hnsw",
-          [Config(n, threads=4, full_only=full) for n, (_, _, full) in CONFIGS.items()],
+          [Config(n, threads=4, full_only=full) for n, (_, _, full, _) in CONFIGS.items()],
           min_cpus=8)
 
 # Set before the client processes fork, so they share them.
+QUANT_ARGS = ()
 DATA = QUERIES = None
 TARGET_PORT = None
 
@@ -191,7 +201,7 @@ def load_worker(rank):
     for s in range(lo, hi, BATCH):
         p = c.pipeline(transaction=False)
         for i in range(s, min(hi, s + BATCH)):
-            p.execute_command("VADD", KEY, "FP32", DATA[i].tobytes(), str(i), QUANT)
+            p.execute_command("VADD", KEY, "FP32", DATA[i].tobytes(), str(i), *QUANT_ARGS)
         for res in p.execute(raise_on_error=False):
             if isinstance(res, Exception):
                 return "VADD: %s" % res
@@ -246,6 +256,21 @@ def query_cell(nconns):
     return len(lat) / secs, float(np.percentile(lat, 50)), float(np.percentile(lat, 99))
 
 
+def settled_memory(c):
+    """used_memory once it holds still: KiviDB's set takes in, after the
+    load, the vectors its graph linked last (a second's samples within
+    0.2 %, 60 s at most)."""
+    time.sleep(2)
+    last = int(c.info("memory")["used_memory"])
+    for _ in range(60):
+        time.sleep(1)
+        now = int(c.info("memory")["used_memory"])
+        if abs(now - last) <= last * 0.002:
+            return now
+        last = now
+    return last
+
+
 def vinfo(c):
     v = c.execute_command("VINFO", KEY)
     if isinstance(v, list):
@@ -256,8 +281,9 @@ def vinfo(c):
 
 @S.run
 def run(ctx):
-    global DATA, QUERIES, TARGET_PORT
-    name, n, _ = CONFIGS[ctx.config.name]
+    global DATA, QUERIES, TARGET_PORT, QUANT, QUANT_ARGS
+    name, n, _, QUANT = CONFIGS[ctx.config.name]
+    QUANT_ARGS = (QUANT,) if QUANT else ()
     n = scaled(n, step=2000)
     DATA, QUERIES, truth = load_data(name, n)
     TARGET_PORT = ctx.port
@@ -286,8 +312,7 @@ def run(ctx):
             raise RuntimeError("the graph was not made in 1800 s")
         time.sleep(0.05)
     ready_s = time.perf_counter() - t1
-    time.sleep(2)
-    mem1 = int(c.info("memory")["used_memory"])
+    mem1 = settled_memory(c)
     ctx.raw["vinfo"] = vinfo(c)
     ctx.raw["load_s"] = round(load_s, 2)
 

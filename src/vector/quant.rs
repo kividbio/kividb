@@ -422,6 +422,9 @@ pub fn hamming(a: &[u64], b: &[u64]) -> u32 {
 //
 //   Q8   [norm, range, the dim int8 values packed four to a float]
 //   BIN  [norm, the 64-bit words as pairs of 32-bit halves, low first]
+//   F32  [1 / norm (0 for a zero vector), the dim floats as given]: the
+//        graph walks by the inverse norm; a reply's score is measured on the
+//        floats as a scan measures them (`Encoding::exact_distance`)
 
 /// How a graph's slots hold its vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -434,13 +437,16 @@ pub enum Encoding {
     Q8 { dim: usize },
     /// [`StoredVector::Bin`] of `dim` components.
     Bin { dim: usize },
+    /// [`StoredVector::F32`] of `dim` components, as given, after the
+    /// inverse of its norm.
+    F32Raw { dim: usize },
 }
 
 impl Encoding {
     /// The encoding of a set quantized as `quant`, of `dim` components.
     pub fn of(quant: Quant, dim: usize) -> Self {
         match quant {
-            Quant::F32 => Encoding::F32,
+            Quant::F32 => Encoding::F32Raw { dim },
             Quant::Q8 => Encoding::Q8 { dim },
             Quant::Bin => Encoding::Bin { dim },
         }
@@ -452,6 +458,23 @@ impl Encoding {
             Encoding::F32 => None,
             Encoding::Q8 { dim } => Some(2 + dim.div_ceil(4)),
             Encoding::Bin { dim } => Some(1 + 2 * bin_words(dim)),
+            Encoding::F32Raw { dim } => Some(1 + dim),
+        }
+    }
+
+    /// Whether [`Encoding::distance`] is the scan's own distance, to the bit
+    /// (an f32 vector's cosine walked by inverse norms is not).
+    pub fn scores_exact(self) -> bool {
+        matches!(self, Encoding::Q8 { .. } | Encoding::Bin { .. })
+    }
+
+    /// The distance between an encoded query and an encoded vector as a
+    /// scan measures it: [`StoredVector::distance`] of the two, to the bit.
+    #[inline]
+    pub fn exact_distance(self, metric: &DistanceMetric, query: &[f32], stored: &[f32]) -> f32 {
+        match self {
+            Encoding::F32Raw { .. } => super::distance(metric, &query[1..], &stored[1..]),
+            other => other.distance(metric, query, stored),
         }
     }
 
@@ -479,6 +502,11 @@ impl Encoding {
                     out[2 + i] = f32::from_bits(u32::from_le_bytes(b));
                 }
             }
+            (Encoding::F32Raw { dim }, StoredVector::F32(v)) if v.len() == dim => {
+                let norm = super::simd::norm_sq(v).sqrt();
+                out[0] = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+                out[1..].copy_from_slice(v);
+            }
             (Encoding::Bin { dim }, StoredVector::Bin { norm, bits })
                 if bits.len() == bin_words(dim) =>
             {
@@ -497,6 +525,7 @@ impl Encoding {
     pub fn decode(self, buf: &[f32]) -> Option<StoredVector> {
         match self {
             Encoding::F32 => None,
+            Encoding::F32Raw { dim } => Some(StoredVector::F32(buf[1..1 + dim].into())),
             Encoding::Q8 { dim } => Some(StoredVector::Q8 {
                 norm: buf[0],
                 range: buf[1],
@@ -536,6 +565,13 @@ impl Encoding {
                 let dot = 1.0 - 2.0 * opposite as f32 / dim.max(1) as f32;
                 from_unit_dot(metric, dot, a[0], b[0])
             }
+            Encoding::F32Raw { .. } => match metric {
+                // A zero vector is at 1, as `dist_cosine` has it.
+                DistanceMetric::Cosine if a[0] == 0.0 || b[0] == 0.0 => 1.0,
+                DistanceMetric::Cosine => 1.0 - super::simd::dot(&a[1..], &b[1..]) * a[0] * b[0],
+                DistanceMetric::L2 => super::dist_l2_sq(&a[1..], &b[1..]),
+                DistanceMetric::InnerProduct => super::dist_ip(&a[1..], &b[1..]),
+            },
         }
     }
 }

@@ -838,10 +838,15 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
 
             let mut floats = Vec::new();
             let mut buf = Vec::new();
-            // The vectors a quantized set's graph holds in its place.
+            // The vectors the set's graph holds in its place, read a chunk
+            // at a time (see `vset_graph::Reader`: the set's read lock keeps
+            // them as they are between chunks).
             let graph = inner.graph.get().filter(|g| g.exact());
-            let reader = graph.map(|g| g.reader());
-            for (name, entry) in inner.entries.iter() {
+            let mut reader = None;
+            for (i, (name, entry)) in inner.entries.iter().enumerate() {
+                if i % crate::vector::vset_graph::READ_CHUNK == 0 {
+                    reader = None;
+                }
                 // Element name
                 write_bytes(w, name.as_bytes())?;
 
@@ -850,9 +855,10 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
                 let vector = match &entry.vector {
                     Some(v) => v,
                     None => {
-                        let found = reader
-                            .as_ref()
-                            .and_then(|r| r.encoding().decode(r.encoded(name.as_bytes())?));
+                        let found = graph.and_then(|g| {
+                            let r = reader.get_or_insert_with(|| g.reader());
+                            r.encoding().decode(r.encoded(name.as_bytes())?)
+                        });
                         decoded = found.ok_or_else(|| {
                             io::Error::other("a vector set element has no vector")
                         })?;

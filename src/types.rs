@@ -276,7 +276,6 @@ impl VectorSetInner {
 
     // Add a constructor that accepts a metric
     pub fn with_metric(dim: usize, metric: DistanceMetric) -> Self {
-        static UIDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Self {
             dim,
             entries: AHashMap::new(),
@@ -287,7 +286,7 @@ impl VectorSetInner {
             ef_construction: crate::vector::vset_graph::DEFAULT_BUILD_EF,
             m_known: false,
             graph: Default::default(),
-            uid: UIDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            uid: next_vset_uid(),
         }
     }
 
@@ -322,6 +321,13 @@ impl VectorSetInner {
     }
 }
 
+/// `VINFO`'s `vset-uid` of the next set made: sets are numbered from 0 as
+/// a process makes them (loads, restores and copies included).
+fn next_vset_uid() -> u64 {
+    static UIDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    UIDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A copy holds every vector itself (its graph, made again from them, is
 /// its own).
 impl Clone for VectorSetInner {
@@ -331,9 +337,14 @@ impl Clone for VectorSetInner {
             .iter()
             .map(|(name, entry)| {
                 let vector = match &entry.vector {
-                    Some(v) => Some(v.clone()),
-                    None => self.graph.get().and_then(|g| g.stored(name.as_bytes())),
+                    Some(v) => v.clone(),
+                    None => self
+                        .graph
+                        .get()
+                        .and_then(|g| g.stored(name.as_bytes()))
+                        .expect("a vector set element is in neither its entry nor its graph"),
                 };
+                let vector = Some(vector);
                 let entry = VSetEntry {
                     vector,
                     attrs: entry.attrs.clone(),
@@ -351,7 +362,8 @@ impl Clone for VectorSetInner {
             ef_construction: self.ef_construction,
             m_known: self.m_known,
             graph: Default::default(),
-            uid: self.uid,
+            // A copy is another set (`COPY`), with a number of its own.
+            uid: next_vset_uid(),
         }
     }
 }

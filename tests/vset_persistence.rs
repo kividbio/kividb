@@ -3144,3 +3144,54 @@ fn graph_sets_and_1_2_snapshots() {
     }
     assert!(got == want, "1.2.2 reads this build's snapshot otherwise");
 }
+
+/// An element whose vector the set's graph holds in its place reads back
+/// as it was stored (`VEMB RAW`, `DUMP`), after an overwrite too: as the
+/// same vector reads in a small set, which holds its vectors itself.
+#[test]
+fn vectors_kept_in_the_graph_read_back_as_stored() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    fill_big(&mut c);
+    wait_graphs(&mut c);
+    // The builder takes in what was linked once it is idle.
+    std::thread::sleep(Duration::from_secs(3));
+    for (key, opt) in BIG_SETS {
+        let opts: Vec<&str> = if opt.is_empty() { vec![] } else { vec![opt] };
+        let small = format!("{key}-small");
+        for (round, seed) in [(0, 1u64), (1, 9_000_001)] {
+            let v = vector(seed, GDIM);
+            if round == 1 {
+                assert_eq!(vadd(&mut c, key, &v, "e1", &opts), V::Int(0));
+            }
+            assert!(!vadd(&mut c, &small, &v, "e1", &opts).is_err());
+            let want = c.cmd(&["VEMB", &small, "e1", "RAW"]);
+            assert_eq!(c.cmd(&["VEMB", key, "e1", "RAW"]), want, "{key} round {round}");
+            assert_eq!(c.cmd(&["VEMB", key, "e1"]), c.cmd(&["VEMB", &small, "e1"]));
+            let V::Bulk(payload) = c.cmd(&["DUMP", key]) else {
+                panic!("DUMP {key}")
+            };
+            let copy = format!("{key}-restored{round}");
+            let r = c.cmd_bytes(&[b"RESTORE", copy.as_bytes(), b"0", &payload]);
+            assert_eq!(r, V::Str("OK".into()));
+            assert_eq!(c.cmd(&["VEMB", &copy, "e1", "RAW"]), want, "{key} restored");
+            assert_eq!(c.cmd(&["VCARD", &copy]), c.cmd(&["VCARD", key]));
+        }
+    }
+}
+
+/// A snapshot taken while the graphs are made, with some vectors already
+/// in the graph in place of their entries, loads with every set as it was.
+#[test]
+fn a_snapshot_taken_during_the_build_loads_whole() {
+    let mut server = Server::start(&[]);
+    let mut c = server.conn();
+    fill_big(&mut c);
+    churn(&mut c, 0);
+    c.cmd(&["SAVE"]);
+    let want = exact_answers(&mut c);
+    server.shutdown();
+    server.restart();
+    let mut c = server.conn();
+    assert_graph_answers(&mut c, &want, "loaded from a snapshot taken during the build");
+}

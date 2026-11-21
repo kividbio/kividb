@@ -54,7 +54,7 @@ struct Addition {
 
 /// What `VADD` answers (1 when the element is new), and a link into the
 /// set's graph to make once the locks are let go.
-type Added = (bool, Option<vset_graph::Pending>);
+type Added = (bool, Option<vset_graph::Pending>, Arc<RwLock<VectorSetInner>>);
 
 fn quantize(quant: Quant, vector: Vec<f32>) -> Result<StoredVector, Vec<u8>> {
     StoredVector::quantize(quant, vector)
@@ -91,8 +91,9 @@ fn add_to_vset(db: &store::Db, key: &[u8], lenient: bool, add: Addition) -> Resu
                         attrs: add.attrs,
                     },
                 );
-                map.insert(key, KiviDBValue::VectorSet(Arc::new(RwLock::new(inner))));
-                return Ok((true, None));
+                let set = Arc::new(RwLock::new(inner));
+                map.insert(key, KiviDBValue::VectorSet(Arc::clone(&set)));
+                return Ok((true, None, set));
             }
         };
         if let Some(mut inner) = vs.try_write() {
@@ -164,7 +165,7 @@ fn insert_into(
     let name = add.element.clone();
     let new = inner.entries.insert(add.element, entry).is_none();
     let pending = vset_graph::written(set, inner, name.as_bytes());
-    Ok((new, pending))
+    Ok((new, pending, Arc::clone(set)))
 }
 
 /// An integer written as Redis reads one: digits with an optional `-`, no
@@ -386,11 +387,12 @@ fn vadd(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
     let db = &ctx.store[*ctx.selected_db];
     match add_to_vset(db, &key, ctx.apply_replication, add) {
-        Ok((is_new, pending)) => {
+        Ok((is_new, pending, set)) => {
             // With the set and its shard let go: a link is a graph search.
             if let Some(pending) = pending {
                 pending.link();
             }
+            vset_graph::after_write(&set);
             Some(resp_integer(is_new as i64))
         }
         Err(e) => Some(e),
@@ -439,6 +441,7 @@ fn vrem(ctx: &mut Ctx) -> Option<Vec<u8>> {
             removed += 1;
         }
     }
+    vset_graph::shrunk(&mut inner);
 
     Some(resp_integer(removed))
 }
@@ -708,12 +711,17 @@ fn vinfo(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let inner = vs.read();
             let count = inner.entries.len();
             let graph = inner.graph.get();
-            let ready = graph.filter(|g| g.is_ready());
+            // What a `VSIM` at the default `EF` would do: search the graph,
+            // or scan (a set under `EXACT_BELOW` elements, one whose graph
+            // is being made, or one too small for the `EF`).
+            let searched = graph.is_some_and(|g| g.is_ready())
+                && count >= vset_graph::EXACT_BELOW
+                && vset_graph::DEFAULT_SEARCH_EF * 2 < count;
             let attributes = inner.entries.values().filter(|e| e.attrs.is_some()).count();
-            // Redis's nine fields, in its order, then KiviDB's: the count
-            // under its earlier name, and whether VSIM searches a graph
-            // (HNSW) or scans (FLAT: a set under `EXACT_BELOW` elements, or
-            // one whose graph is still being made).
+            // Redis's nine fields, in its order, then KiviDB's: the size
+            // again (`vector-count`), `index-type` (`HNSW` when `VSIM`
+            // searches the graph, `FLAT` when it scans) and `graph-state`
+            // (`none`, `building`, `ready` or `failed`).
             let pairs = [
                 ("quant-type", resp_simple(inner.quant.name())),
                 ("hnsw-m", resp_integer(inner.m as i64)),
@@ -733,7 +741,11 @@ fn vinfo(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 ("vector-count", resp_integer(count as i64)),
                 (
                     "index-type",
-                    resp_simple(if ready.is_some() { "HNSW" } else { "FLAT" }),
+                    resp_simple(if searched { "HNSW" } else { "FLAT" }),
+                ),
+                (
+                    "graph-state",
+                    resp_simple(graph.map_or("none", |g| g.state_name())),
                 ),
             ];
             let out = pairs
@@ -1115,7 +1127,7 @@ fn nearest<'s>(
             // The query as the set quantizes it, laid out as the graph holds
             // vectors.
             let as_f32 = vset_graph::query_for(&graph, inner, query);
-            let exact = graph.exact();
+            let encoding = graph.index.encoding;
             let hits = match filter {
                 None => Some(vset_graph::search(&graph, &as_f32, ef, &inner.metric)),
                 Some(_) => {
@@ -1134,24 +1146,31 @@ fn nearest<'s>(
                 }
             };
             match hits {
-                Some(hits) => hits
-                    .iter()
-                    .filter_map(|hit| {
-                        let name = vset_graph::name_of(hit);
-                        let (name, entry) = inner.entries.get_key_value(&*name)?;
-                        if !passes(entry) {
-                            return None;
-                        }
-                        // A quantized set's graph measures as a scan does;
-                        // an f32 one's unit vectors are scored again.
-                        let d = if exact {
-                            hit.score
-                        } else {
-                            query.distance(entry.vector.as_ref()?, &inner.metric, inner.dim)
-                        };
-                        Some((d, name.as_bytes()))
-                    })
-                    .collect(),
+                Some(hits) => {
+                    // A quantized set's graph measures as a scan does; an
+                    // f32 one's hits are measured again on their floats, as
+                    // a scan measures them. Taken after the search.
+                    let reader = (!encoding.scores_exact()).then(|| graph.reader());
+                    hits.iter()
+                        .filter_map(|hit| {
+                            let name = vset_graph::name_of(hit);
+                            let (name, entry) = inner.entries.get_key_value(&*name)?;
+                            if !passes(entry) {
+                                return None;
+                            }
+                            let d = match (&reader, &entry.vector) {
+                                (None, _) => hit.score,
+                                (Some(_), Some(v)) => query.distance(v, &inner.metric, inner.dim),
+                                (Some(r), None) => encoding.exact_distance(
+                                    &inner.metric,
+                                    &as_f32,
+                                    r.encoded(name.as_bytes())?,
+                                ),
+                            };
+                            Some((d, name.as_bytes()))
+                        })
+                        .collect()
+                }
                 None => scan(),
             }
         }
@@ -1179,23 +1198,32 @@ fn measure_all<'s>(
     query: &StoredVector,
     keep: impl Fn(&[u8], &VSetEntry) -> bool,
 ) -> Vec<(f32, &'s [u8])> {
-    // Held only while it measures: no graph search runs meanwhile.
+    // The graph is held for reading a chunk at a time, never across a
+    // graph search; what it holds for the set's elements cannot change
+    // meanwhile, the set being held (see `vset_graph::Reader`).
     let graph = inner.graph.get().filter(|g| g.exact());
-    let reader = graph.map(|g| g.reader());
-    let encoded = reader.as_ref().and_then(|r| r.encoding().encode(query));
+    let encoding = graph.map(|g| g.index.encoding);
+    let encoded = encoding.and_then(|e| e.encode(query));
+    let mut reader = None;
     let mut out = Vec::new();
-    for (name, entry) in &inner.entries {
+    for (i, (name, entry)) in inner.entries.iter().enumerate() {
         let name = name.as_bytes();
+        if i % vset_graph::READ_CHUNK == 0 {
+            reader = None;
+        }
         if !keep(name, entry) {
             continue;
         }
-        let d = match (&entry.vector, &reader, &encoded) {
-            (Some(v), _, _) => query.distance(v, &inner.metric, inner.dim),
-            (None, Some(r), Some(q)) => match r.encoded(name) {
-                Some(stored) => r.encoding().distance(&inner.metric, q, stored),
-                None => continue,
-            },
-            _ => continue,
+        let d = match (&entry.vector, graph, encoding, &encoded) {
+            (Some(v), ..) => query.distance(v, &inner.metric, inner.dim),
+            (None, Some(g), Some(e), Some(q)) => {
+                let r = reader.get_or_insert_with(|| g.reader());
+                let stored = r
+                    .encoded(name)
+                    .expect("a vector set element is in neither its entry nor its graph");
+                e.exact_distance(&inner.metric, q, stored)
+            }
+            _ => panic!("a vector set element is in neither its entry nor its graph"),
         };
         out.push((d, name));
     }
@@ -1416,10 +1444,11 @@ mod lock_tests {
 
     /// `add_to_vset`, its link (if any) made as `VADD` makes it.
     fn vadd_now(db: &store::Db, key: &[u8], lenient: bool, add: Addition) -> Result<bool, Vec<u8>> {
-        add_to_vset(db, key, lenient, add).map(|(new, pending)| {
+        add_to_vset(db, key, lenient, add).map(|(new, pending, set)| {
             if let Some(p) = pending {
                 p.link();
             }
+            vset_graph::after_write(&set);
             new
         })
     }
@@ -1778,10 +1807,11 @@ mod graph_tests {
     }
 
     fn vadd(db: &store::Db, key: &str, add: Addition) -> bool {
-        let (new, pending) = add_to_vset(db, key.as_bytes(), false, add).unwrap();
+        let (new, pending, set) = add_to_vset(db, key.as_bytes(), false, add).unwrap();
         if let Some(p) = pending {
             p.link();
         }
+        vset_graph::after_write(&set);
         new
     }
 
@@ -1990,8 +2020,14 @@ mod graph_tests {
     /// over leave no element where its old vector was.
     #[test]
     fn writes_during_the_build_leave_no_stale_position() {
+        for quant in [Quant::F32, Quant::Q8, Quant::Bin] {
+            writes_during_the_build(quant);
+        }
+    }
+
+    fn writes_during_the_build(quant: Quant) {
         let mut rng = StdRng::seed_from_u64(7);
-        let dim = 16;
+        let dim = 32;
         let metric = DistanceMetric::Cosine;
         let st = store::new_store(1);
         let db = &st[0];
@@ -2000,7 +2036,7 @@ mod graph_tests {
         for i in 0..n {
             let v = random_vector(&mut rng, dim);
             let name = format!("e{i}");
-            vadd(db, "vs", addition(&name, &v, Quant::F32, &metric));
+            vadd(db, "vs", addition(&name, &v, quant, &metric));
             model.insert(name, v);
         }
         let vs = set_at(db, "vs").unwrap();
@@ -2014,7 +2050,7 @@ mod graph_tests {
                 }
             } else {
                 let v = random_vector(&mut rng, dim);
-                vadd(db, "vs", addition(&name, &v, Quant::F32, &metric));
+                vadd(db, "vs", addition(&name, &v, quant, &metric));
                 model.insert(name.clone(), v);
                 moved.push(name);
             }
@@ -2024,14 +2060,20 @@ mod graph_tests {
         for name in &moved {
             let Some(v) = model.get(name) else { continue };
             let got = vs_graph_only(&vs, v);
-            assert_eq!(got[0].0, *name, "{name} is not found at its new vector");
+            // At its new vector, distance 0 (BIN: any element of the same
+            // signs is at 0 too).
+            let at = got.iter().position(|(n, _)| n == name);
+            assert!(
+                at.is_some_and(|i| got[i].1 == got[0].1),
+                "{quant:?}: {name} is not found at its new vector: {got:?}"
+            );
         }
         let mut sum = 0.0;
         for _ in 0..200 {
             let v = random_vector(&mut rng, dim);
             sum += recall(
                 &vs_graph_only(&vs, &v),
-                &exact(&model, Quant::F32, &metric, dim, &v, 10),
+                &exact(&model, quant, &metric, dim, &v, 10),
             );
         }
         assert!(sum / 200.0 >= 0.9, "recall {}", sum / 200.0);
@@ -2042,7 +2084,13 @@ mod graph_tests {
     /// not in the set, and a deleted set's graph is let go.
     #[test]
     fn writers_searches_and_deletes_at_once() {
-        let dim = 8;
+        for quant in [Quant::F32, Quant::Q8, Quant::Bin] {
+            writers_searches_and_deletes(quant);
+        }
+    }
+
+    fn writers_searches_and_deletes(quant: Quant) {
+        let dim = 32;
         let cosine = DistanceMetric::Cosine;
         let metric = &cosine;
         let st = store::new_store(1);
@@ -2053,12 +2101,16 @@ mod graph_tests {
             vadd(
                 db,
                 "vs",
-                addition(&format!("base{i}"), &v, Quant::F32, metric),
+                addition(&format!("base{i}"), &v, quant, metric),
             );
         }
         settled(&set_at(db, "vs").unwrap());
         let stop = &std::sync::atomic::AtomicBool::new(false);
         let deletes = &std::sync::atomic::AtomicUsize::new(0);
+        let (checked, missed) = (
+            &std::sync::atomic::AtomicUsize::new(0),
+            &std::sync::atomic::AtomicUsize::new(0),
+        );
         std::thread::scope(|s| {
             for w in 0..4u64 {
                 s.spawn(move || {
@@ -2072,18 +2124,27 @@ mod graph_tests {
                             vrem(db, "vs", &name);
                             continue;
                         }
-                        vadd(db, "vs", addition(&name, &v, Quant::F32, metric));
+                        vadd(db, "vs", addition(&name, &v, quant, metric));
                         // Only this writer writes `name`: the set holds it
                         // with `v` unless the key was deleted meanwhile.
                         let Some(vs) = set_at(db, "vs") else { continue };
                         let before = deletes.load(Relaxed);
                         let got = vsim(&vs, &v, 10, false);
+                        let truth = vsim(&vs, &v, 10, true);
                         let holds = vs.read().entries.contains_key(name.as_bytes());
                         if holds && deletes.load(Relaxed) == before {
+                            // Exactly: the nearest (others of BIN's same
+                            // signs at its distance too).
+                            let at = truth.iter().position(|(n, _)| *n == name);
                             assert!(
-                                got.iter().any(|(n, _)| *n == name),
-                                "{name}, written and answered, is not found"
+                                at.is_some_and(|i| truth[i].1 <= truth[0].1 + 1e-6),
+                                "{quant:?}: {name}, written and answered, is not in TRUTH: {truth:?}"
                             );
+                            // And by the graph, within its recall: counted.
+                            checked.fetch_add(1, Relaxed);
+                            if !got.iter().any(|(n, _)| *n == name) {
+                                missed.fetch_add(1, Relaxed);
+                            }
                         }
                     }
                 });
@@ -2118,7 +2179,7 @@ mod graph_tests {
                     vadd(
                         db,
                         "vs",
-                        addition(&format!("again{i}"), &v, Quant::F32, metric),
+                        addition(&format!("again{i}"), &v, quant, metric),
                     );
                 }
             }
@@ -2135,6 +2196,11 @@ mod graph_tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         });
+        let (checked, missed) = (checked.load(Relaxed), missed.load(Relaxed));
+        assert!(
+            missed * 100 <= checked,
+            "{quant:?}: the graph missed {missed} of {checked} elements just written"
+        );
         let vs = set_at(db, "vs").unwrap();
         settled(&vs);
         let graph = graph_of(&vs);
@@ -2144,9 +2210,9 @@ mod graph_tests {
         );
     }
 
-    /// A quantized set keeps each linked vector once, in its graph: the
-    /// entries let theirs go, and every reader gets the same vector back.
-    /// An f32 set keeps its own.
+    /// A set keeps each linked vector once, in its graph: the entries let
+    /// theirs go (f32 ones too, as given, bit for bit), and every reader
+    /// gets the same vector back.
     #[test]
     fn a_quantized_sets_vectors_live_in_its_graph() {
         let dim = 24;
@@ -2166,26 +2232,23 @@ mod graph_tests {
             }
             let vs = set_at(db, &key).unwrap();
             settled(&vs);
-            // One more write takes in what the helpers linked last.
+            // One more write, then the builder, idle, takes in the rest.
             let v = random_vector(&mut rng, dim);
             vadd(db, &key, addition("last", &v, quant, &metric));
             model.insert("last".into(), v);
             settled(&vs);
+            taken_in(&vs);
             let inner = vs.read();
             let own = inner
                 .entries
                 .values()
                 .filter(|e| e.vector.is_some())
                 .count();
-            if quant == Quant::F32 {
-                assert_eq!(own, inner.entries.len(), "an f32 set keeps its vectors");
-            } else {
-                assert!(
-                    own * 10 < inner.entries.len(),
-                    "{quant:?}: {own} of {} kept",
-                    n + 1
-                );
-            }
+            assert!(
+                own * 10 < inner.entries.len(),
+                "{quant:?}: {own} of {} kept",
+                n + 1
+            );
             for (name, entry) in &inner.entries {
                 let want = StoredVector::quantize(
                     quant,
@@ -2204,6 +2267,116 @@ mod graph_tests {
             let want = exact(&model, quant, &metric, dim, &q, 10);
             assert_eq!(vsim(&vs, &q, 10, true), want, "{quant:?}");
             model.clear();
+        }
+    }
+
+    /// Until the set has taken in what its graph linked (60 s at most).
+    fn taken_in(vs: &Set) {
+        let graph = graph_of(vs);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while graph.index.linked.as_ref().is_some_and(|q| !q.lock().is_empty())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// A build that panics is tried again, and one that keeps panicking
+    /// leaves its graph failed (`VINFO` says so) while `VSIM` scans, and
+    /// answers exactly.
+    #[test]
+    fn a_build_that_panics_is_tried_again() {
+        let metric = DistanceMetric::Cosine;
+        let st = store::new_store(1);
+        let db = &st[0];
+        let mut rng = StdRng::seed_from_u64(31);
+        // dim 7 and 9: only these sets' builds panic.
+        for (dim, panics, state) in [(7, 1, "ready"), (9, vset_graph::ATTEMPTS, "failed")] {
+            vset_graph::PANIC_BUILDS.lock().push((dim, panics));
+            let key = format!("p{dim}");
+            let mut model = HashMap::new();
+            for i in 0..vset_graph::EXACT_BELOW + 10 {
+                let v = random_vector(&mut rng, dim);
+                vadd(db, &key, addition(&format!("e{i}"), &v, Quant::Q8, &metric));
+                model.insert(format!("e{i}"), v);
+            }
+            let vs = set_at(db, &key).unwrap();
+            let graph = graph_of(&vs);
+            // Other tests' builds may come first: the builder is one thread.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+            while graph.state_name() != state {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "dim {dim}: {} after 180 s",
+                    graph.state_name()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let q = random_vector(&mut rng, dim);
+            let want = exact(&model, Quant::Q8, &metric, dim, &q, 10);
+            assert_eq!(vsim(&vs, &q, 10, false).len(), 10);
+            assert_eq!(vsim(&vs, &q, 10, true), want);
+        }
+    }
+
+    /// A set that shrinks under half the size that gets a graph lets go of
+    /// it, its vectors back in its entries, and gets a new one if it grows.
+    #[test]
+    fn a_shrunk_set_lets_its_graph_go() {
+        let dim = 16;
+        let metric = DistanceMetric::Cosine;
+        let st = store::new_store(1);
+        let db = &st[0];
+        let mut rng = StdRng::seed_from_u64(41);
+        for quant in [Quant::F32, Quant::Q8] {
+            let key = format!("s{quant:?}");
+            let mut model = HashMap::new();
+            let n = vset_graph::EXACT_BELOW + 100;
+            for i in 0..n {
+                let v = random_vector(&mut rng, dim);
+                vadd(db, &key, addition(&format!("e{i}"), &v, quant, &metric));
+                model.insert(format!("e{i}"), v);
+            }
+            let vs = set_at(db, &key).unwrap();
+            settled(&vs);
+            taken_in(&vs);
+            let old = Arc::downgrade(&graph_of(&vs).index);
+            for i in 0..n - vset_graph::EXACT_BELOW / 2 + 1 {
+                assert!(vrem(db, &key, &format!("e{i}")));
+                model.remove(&format!("e{i}"));
+            }
+            {
+                // As VREM leaves it.
+                let mut inner = vs.write();
+                vset_graph::shrunk(&mut inner);
+                assert!(inner.graph.get().is_none());
+                assert!(inner.entries.values().all(|e| e.vector.is_some()));
+                for (name, entry) in &inner.entries {
+                    let want = StoredVector::quantize(
+                        quant,
+                        model[std::str::from_utf8(name.as_bytes()).unwrap()].clone(),
+                    )
+                    .unwrap();
+                    assert_eq!(entry.vector.as_ref(), Some(&want));
+                }
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while old.strong_count() > 0 {
+                assert!(std::time::Instant::now() < deadline, "the graph was kept");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let q = random_vector(&mut rng, dim);
+            assert_eq!(
+                vsim(&vs, &q, 10, false),
+                exact(&model, quant, &metric, dim, &q, 10)
+            );
+            // Grown again: a new graph.
+            for i in 0..vset_graph::EXACT_BELOW {
+                let v = random_vector(&mut rng, dim);
+                vadd(db, &key, addition(&format!("g{i}"), &v, quant, &metric));
+            }
+            settled(&vs);
+            assert!(graph_of(&vs).is_ready());
         }
     }
 

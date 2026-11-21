@@ -310,8 +310,14 @@ other files:
   mismatch`; KiviDB refuses it too while the set's `M` is known). `CAS` is accepted and changes
   nothing. A filtered `VSIM` that reaches its `FILTER-EF` effort scans the
   set and answers exactly, where Redis answers with what it found so far.
-  `VLINKS` of a set under 4,096 elements, which has no graph, answers one
-  layer: the element's nearest `2 * M` elements.
+  `VLINKS` answers one layer, the element's nearest `2 * M` elements, where
+  there are no graph links to give: for a set under 4,096 elements (which
+  has no graph), one whose graph is being made, and an element written and
+  not linked yet. `VINFO`'s `projection-input-dim` is always 0 (`REDUCE` is
+  refused), `hnsw-max-node-uid` is the graph's node slots in use (slots of
+  removed elements are used again), and `vset-uid` numbers the sets a
+  process has made, loaded, restored or copied: a `COPY` has a number of
+  its own. A set that shrinks under 2,048 elements lets go of its graph.
 - Search: `GEO` and `GEOSHAPE` fields, `GEOFILTER` and `INFIELDS` are
   refused. Query `TIMEOUT` (or `search-timeout`) cuts a query short; `ON_TIMEOUT` or
   `search-on-timeout` chooses a partial reply with a warning, or an error. `INT8`

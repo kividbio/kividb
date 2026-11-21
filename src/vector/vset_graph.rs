@@ -35,7 +35,7 @@ use super::{DistanceMetric, HnswIndex, KnnResult, backlog};
 use crate::types::VectorSetInner;
 use parking_lot::RwLock;
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::{Arc, Weak};
 
@@ -53,13 +53,24 @@ pub const DEFAULT_SEARCH_EF: usize = 100;
 /// Elements the builder hands to a graph for each time it takes the set.
 const CHUNK: usize = 64;
 
+/// Elements a long reader (a snapshot of the set, a scan) looks up in the
+/// graph for each time it holds it ([`VsetGraph::reader`]), so that an insert
+/// waiting to write the graph is not kept waiting for the whole set.
+pub const READ_CHUNK: usize = 1024;
+
 /// A set's graph.
 pub struct VsetGraph {
     pub index: Arc<HnswIndex>,
-    /// Every element the set held when the graph was made has been handed
-    /// to it (each later write hands over its own): searches may use it.
-    ready: AtomicBool,
+    /// [`BUILDING`], [`READY`] (every element the set held when the graph
+    /// was made has been handed to it, and each later write hands over its
+    /// own: searches may use it) or [`FAILED`] (its build panicked as often
+    /// as it is tried: `VSIM` scans the set).
+    state: AtomicU8,
 }
+
+const BUILDING: u8 = 0;
+const READY: u8 = 1;
+const FAILED: u8 = 2;
 
 impl VsetGraph {
     fn new(m: usize, ef_construction: usize, encoding: Encoding) -> Self {
@@ -70,7 +81,7 @@ impl VsetGraph {
         }
         Self {
             index: Arc::new(index),
-            ready: AtomicBool::new(false),
+            state: AtomicU8::new(BUILDING),
         }
     }
 
@@ -93,6 +104,15 @@ impl VsetGraph {
 
     /// The graph held for reading, to look many names' vectors up. Nothing
     /// else of the graph is to be locked while it is held.
+    ///
+    /// What it gives for an element whose entry holds no vector is the same
+    /// from one reader to the next while the set is held, for reading or
+    /// writing: such an element's vector is linked and none of its waits
+    /// ([`absorb`] makes sure, under the write lock), so only a write of it
+    /// changes it, and a write takes the set's write lock. Inserts the helpers
+    /// make meanwhile are of other elements, and a slot they fill again was
+    /// a deleted one. So a reader can be let go and taken again between
+    /// chunks of a long walk ([`READ_CHUNK`]).
     pub fn reader(&self) -> Reader<'_> {
         let index = &self.index;
         // The graph before its map, as inserts and searches take them.
@@ -106,7 +126,16 @@ impl VsetGraph {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Acquire)
+        self.state.load(Acquire) == READY
+    }
+
+    /// `VINFO`'s `graph-state`: `building`, `ready` or `failed`.
+    pub fn state_name(&self) -> &'static str {
+        match self.state.load(Acquire) {
+            READY => "ready",
+            FAILED => "failed",
+            _ => "building",
+        }
     }
 
     /// Bytes the graph holds: its slots (vectors, layer-0 links, flags),
@@ -125,6 +154,16 @@ impl VsetGraph {
             + 2 * names
             + upper
             + index.backlog.bytes()
+            + self.linked_bytes()
+    }
+
+    /// Bytes the names linked and not yet taken in by the set hold.
+    fn linked_bytes(&self) -> usize {
+        self.index.linked.as_ref().map_or(0, |q| {
+            let q = q.lock();
+            q.capacity() * std::mem::size_of::<Arc<str>>()
+                + q.iter().map(|k| k.len() + 16).sum::<usize>()
+        })
     }
 
     /// The top layer of the graph (`VINFO`'s `max-level`).
@@ -207,6 +246,10 @@ impl GraphCell {
     pub fn get(&self) -> Option<&Arc<VsetGraph>> {
         self.0.get()
     }
+
+    fn take(&mut self) -> Option<Arc<VsetGraph>> {
+        self.0.take()
+    }
 }
 
 /// The graph's key for element `name`: its bytes as text, any bytes
@@ -245,7 +288,8 @@ pub fn query_for(graph: &VsetGraph, inner: &VectorSetInner, query: &StoredVector
 /// A vector a write put in the graph's backlog that no helper will link:
 /// [`Pending::link`] it once the set's lock (and the shard's) is let go.
 pub struct Pending {
-    index: Arc<HnswIndex>,
+    /// Weak: a set deleted meanwhile takes its graph with it.
+    index: Weak<HnswIndex>,
     key: String,
     ticket: u64,
     metric: DistanceMetric,
@@ -253,7 +297,20 @@ pub struct Pending {
 
 impl Pending {
     pub fn link(self) {
-        backlog::link_ordered(&self.index, &self.key, self.ticket, &self.metric);
+        let Some(index) = self.index.upgrade() else {
+            return;
+        };
+        backlog::link_ordered(&index, &self.key, self.ticket, &self.metric);
+        release(index);
+    }
+}
+
+/// Let go of a graph: if this was the last reference (its set was deleted
+/// meanwhile), it is freed by the lazy-free thread, not by a command's.
+fn release(index: Arc<HnswIndex>) {
+    if Arc::strong_count(&index) == 1 {
+        let objects = index.live_count.load(Relaxed) as u64 + 1;
+        crate::lazyfree::free_later(index, objects);
     }
 }
 
@@ -265,7 +322,7 @@ fn hand_over(graph: &VsetGraph, inner: &VectorSetInner, name: &[u8]) -> Option<P
     let key = key_of(name);
     let vector: Arc<[f32]> = laid_out(graph, inner, vector)?.into();
     backlog::put_ordered(&graph.index, &key, vector, &inner.metric).map(|ticket| Pending {
-        index: Arc::clone(&graph.index),
+        index: Arc::downgrade(&graph.index),
         key,
         ticket,
         metric: inner.metric.clone(),
@@ -283,14 +340,29 @@ pub fn written(
     match inner.graph.get().cloned() {
         Some(graph) => {
             backlog::count_write();
-            absorb(&graph, inner, usize::MAX);
             hand_over(&graph, inner, name)
         }
         None => {
-            // The builder hands this element over with the others.
+            // The builder hands this element over with the others (not
+            // during an AOF replay: [`request_builds`] after it).
             request_build(set, inner);
             None
         }
+    }
+}
+
+/// Most vectors a write takes in after it ([`after_write`]).
+const ABSORB_PER_WRITE: usize = 64;
+
+/// After a write, with the shard let go: the set takes in up to a few of the
+/// vectors its graph has linked since ([`absorb`]), if it can have its lock
+/// at once; the builder takes in the rest when the set is quiet.
+pub fn after_write(set: &Arc<RwLock<VectorSetInner>>) {
+    let Some(mut inner) = set.try_write() else {
+        return;
+    };
+    if let Some(graph) = inner.graph.get().cloned() {
+        absorb(&graph, &mut inner, ABSORB_PER_WRITE);
     }
 }
 
@@ -301,10 +373,64 @@ pub fn removed(inner: &VectorSetInner, name: &[u8]) {
     }
 }
 
+/// A set that has shrunk under half of [`EXACT_BELOW`] lets go of its
+/// graph: each vector the graph held goes back to its entry first, and the
+/// graph's memory is given back (by the lazy-free thread). It gets a new
+/// one if it grows again. Under the set's write lock, after its removals.
+pub fn shrunk(inner: &mut VectorSetInner) {
+    if inner.entries.len() >= EXACT_BELOW / 2 || inner.graph.get().is_none() {
+        return;
+    }
+    let Some(graph) = inner.graph.take() else {
+        return;
+    };
+    if graph.exact() {
+        let reader = graph.reader();
+        let encoding = reader.encoding();
+        for (name, entry) in inner.entries.iter_mut() {
+            if entry.vector.is_none() {
+                entry.vector = reader.encoded(name.as_bytes()).and_then(|e| encoding.decode(e));
+                assert!(
+                    entry.vector.is_some(),
+                    "a vector set element is in neither its entry nor its graph"
+                );
+            }
+        }
+    }
+    let index = Arc::clone(&graph.index);
+    drop(graph);
+    release(index);
+}
+
+/// After an AOF replay, which writes no graph: every set of
+/// [`EXACT_BELOW`] elements or more gets its graph made, in the background.
+pub fn request_builds(store: &crate::store::Store) {
+    for db in store.iter() {
+        for shard in db.iter() {
+            let sets: Vec<Arc<RwLock<VectorSetInner>>> = crate::read_lock!(shard)
+                .values()
+                .filter_map(|value| match value {
+                    crate::store::ValueRef::VectorSet(vs) => Some(Arc::clone(vs)),
+                    _ => None,
+                })
+                .collect();
+            for set in sets {
+                let inner = set.read();
+                request_build(&set, &inner);
+            }
+        }
+    }
+}
+
 /// Give a set of [`EXACT_BELOW`] elements or more a graph, if it has none,
 /// and queue it for the builder. Under the set's lock (read is enough).
 pub fn request_build(set: &Arc<RwLock<VectorSetInner>>, inner: &VectorSetInner) {
     if inner.entries.len() < EXACT_BELOW || inner.graph.get().is_some() {
+        return;
+    }
+    // An AOF replay writes no graph: it links nothing in its writes, and
+    // asks for the graphs once it is done ([`request_builds`]).
+    if super::indexing_deferred() {
         return;
     }
     let mut made = false;
@@ -317,7 +443,16 @@ pub fn request_build(set: &Arc<RwLock<VectorSetInner>>, inner: &VectorSetInner) 
         // The elements there are now, under the lock that gave the set its
         // graph: each written after this hands itself over.
         let names = inner.entries.keys().cloned().collect();
-        queue(Arc::downgrade(set), Arc::downgrade(graph), names);
+        REGISTRY
+            .lock()
+            .push((Arc::downgrade(set), Arc::downgrade(graph)));
+        queue(Build {
+            set: Arc::downgrade(set),
+            graph: Arc::downgrade(graph),
+            names,
+            attempt: 0,
+            not_before: None,
+        });
     }
 }
 
@@ -397,7 +532,14 @@ struct Build {
     set: Weak<RwLock<VectorSetInner>>,
     graph: Weak<VsetGraph>,
     names: Vec<crate::key_bytes::KeyBytes>,
+    /// Builds of this graph that panicked so far.
+    attempt: u32,
+    /// Not tried again before this (a build that panicked waits a while).
+    not_before: Option<std::time::Instant>,
 }
+
+/// Times a build is tried before its graph is left [`FAILED`].
+pub(crate) const ATTEMPTS: u32 = 3;
 
 struct Builds {
     queue: parking_lot::Mutex<VecDeque<Build>>,
@@ -410,11 +552,18 @@ static BUILDS: Builds = Builds {
 };
 static BUILDER: std::sync::Once = std::sync::Once::new();
 
-fn queue(
-    set: Weak<RwLock<VectorSetInner>>,
-    graph: Weak<VsetGraph>,
-    names: Vec<crate::key_bytes::KeyBytes>,
-) {
+/// Every set with a graph, for the builder to take in, when it is idle, what
+/// the helpers linked after the set's last write ([`take_in_linked`]).
+static REGISTRY: parking_lot::Mutex<Vec<(Weak<RwLock<VectorSetInner>>, Weak<VsetGraph>)>> =
+    parking_lot::const_mutex(Vec::new());
+
+/// Builds that panic, in unit tests (`a_build_that_panics_is_tried_again`):
+/// those of sets of this many dimensions, this many times.
+#[cfg(test)]
+pub(crate) static PANIC_BUILDS: parking_lot::Mutex<Vec<(usize, u32)>> =
+    parking_lot::const_mutex(Vec::new());
+
+fn queue(job: Build) {
     BUILDER.call_once(|| {
         use crate::cpus::BuilderExt;
         let started = std::thread::Builder::new()
@@ -424,24 +573,84 @@ fn queue(
             crate::log_warn!("could not start the vector-set graph builder");
         }
     });
-    BUILDS.queue.lock().push_back(Build { set, graph, names });
+    BUILDS.queue.lock().push_back(job);
     BUILDS.ready.notify_one();
 }
 
 fn builder() {
+    let idle = std::time::Duration::from_millis(500);
+    let mut taken_in = std::time::Instant::now();
     loop {
+        // Between builds too: a queue that never empties does not keep the
+        // sets from taking in what their graphs linked.
+        if taken_in.elapsed() >= idle {
+            take_in_linked();
+            taken_in = std::time::Instant::now();
+        }
         let job = {
             let mut q = BUILDS.queue.lock();
-            loop {
-                if let Some(job) = q.pop_front() {
-                    break job;
+            let now = std::time::Instant::now();
+            match q.iter().position(|j| j.not_before.is_none_or(|t| t <= now)) {
+                Some(at) => q.remove(at),
+                None => {
+                    BUILDS.ready.wait_for(&mut q, idle);
+                    continue;
                 }
-                BUILDS.ready.wait(&mut q);
             }
         };
+        let Some(job) = job else { continue };
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&job)));
         if built.is_err() {
-            crate::log_warn!("building a vector set's graph failed; VSIM scans that set");
+            retry(job);
+        }
+    }
+}
+
+/// A build that panicked: tried again a little later, up to [`ATTEMPTS`]
+/// times, then its graph is left [`FAILED`] (`VINFO` `graph-state failed`)
+/// and `VSIM` scans the set. What it handed over stays in the graph, which
+/// holds those vectors for the set.
+fn retry(mut job: Build) {
+    job.attempt += 1;
+    let Some(graph) = job.graph.upgrade() else { return };
+    if job.attempt >= ATTEMPTS {
+        graph.state.store(FAILED, Release);
+        crate::log_warn!(
+            "building a vector set's graph failed {} times; VSIM scans that set",
+            job.attempt
+        );
+        return;
+    }
+    crate::log_warn!("building a vector set's graph failed; trying again");
+    job.not_before =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(1 << job.attempt));
+    drop(graph);
+    queue(job);
+}
+
+/// When there is no build to do: each set takes in, a few thousand at a
+/// time, the vectors its graph linked after the set's last write took some
+/// in ([`after_write`]), so that they are not kept twice, nor their names
+/// queued, while the set is not written.
+fn take_in_linked() {
+    let sets: Vec<(Arc<RwLock<VectorSetInner>>, Arc<VsetGraph>)> = {
+        let mut registry = REGISTRY.lock();
+        registry.retain(|(s, g)| s.strong_count() > 0 && g.strong_count() > 0);
+        registry
+            .iter()
+            .filter_map(|(s, g)| Some((s.upgrade()?, g.upgrade()?)))
+            .collect()
+    };
+    for (set, graph) in sets {
+        loop {
+            let queued = graph.index.linked.as_ref().is_some_and(|q| !q.lock().is_empty());
+            if !queued {
+                break;
+            }
+            let mut inner = set.write();
+            if !still_ours(&inner, &graph) || !absorb(&graph, &mut inner, 4096) {
+                break;
+            }
         }
     }
 }
@@ -455,26 +664,36 @@ fn still_ours(inner: &VectorSetInner, graph: &Arc<VsetGraph>) -> bool {
 /// mark it ready. Each element is handed over under the set's read lock,
 /// with the vector the set holds at that moment: a write of the element after
 /// that (under the write lock) hands over its own vector after this one, and
-/// one before it was already in what this read.
+/// one before it was already in what this read. Neither the set nor its
+/// graph is held between chunks: a set deleted meanwhile is freed then.
 fn build(job: &Build) {
-    let Some(graph) = job.graph.upgrade() else {
-        return;
-    };
-    let index = Arc::clone(&graph.index);
-    // Not held while the builder waits: the set may be deleted meanwhile.
+    #[cfg(test)]
+    {
+        let dim = job.set.upgrade().map(|s| s.read().dim);
+        let mut panics = PANIC_BUILDS.lock();
+        if let Some(p) = panics.iter_mut().find(|(d, n)| Some(*d) == dim && *n > 0) {
+            p.1 -= 1;
+            drop(panics);
+            panic!("a build made to panic (a test)");
+        }
+    }
+    let Some(graph) = job.graph.upgrade() else { return };
+    let index = Arc::downgrade(&graph.index);
     drop(graph);
     let mut pending = Vec::with_capacity(CHUNK);
     for chunk in job.names.chunks(CHUNK) {
         // Room in the backlog for the chunk, so that the helpers, not this
         // thread, do the linking; a full backlog leaves it to this one.
-        let room = backlog::limit(index.slots().map_or(1, |s| s.dim())).saturating_sub(CHUNK);
         let mut waited = 0;
-        while index.backlog.len() > room && waited < 2000 {
+        loop {
+            let Some(index) = index.upgrade() else { return };
+            let room = backlog::limit(index.slots().map_or(1, |s| s.dim())).saturating_sub(CHUNK);
+            if index.backlog.len() <= room || waited >= 2000 {
+                break;
+            }
+            drop(index);
             std::thread::sleep(std::time::Duration::from_micros(500));
             waited += 1;
-            if job.set.strong_count() == 0 {
-                return;
-            }
         }
         {
             let (Some(set), Some(graph)) = (job.set.upgrade(), job.graph.upgrade()) else {
@@ -494,28 +713,13 @@ fn build(job: &Build) {
             p.link();
         }
     }
-    let Some(graph) = job.graph.upgrade() else {
-        return;
-    };
-    graph.ready.store(true, Release);
-    // Then the set lets go of its copies of what the helpers have linked,
-    // a few thousand at a time, so that it is not held for long. Only of
-    // what was linked by then: later writes take in what is linked after
-    // them, and a set being written all the time would keep this here.
-    if !graph.exact() {
-        return;
-    }
+    let Some(graph) = job.graph.upgrade() else { return };
+    graph.state.store(READY, Release);
     drop(graph);
-    backlog_settled(&index);
-    let queued = index.linked.as_ref().map_or(0, |q| q.lock().len());
-    for _ in 0..queued.div_ceil(4096) {
-        let (Some(set), Some(graph)) = (job.set.upgrade(), job.graph.upgrade()) else {
-            return;
-        };
-        let mut inner = set.write();
-        if !still_ours(&inner, &graph) || !absorb(&graph, &mut inner, 4096) {
-            return;
-        }
+    // What the helpers linked is taken in when the builder is next idle
+    // ([`take_in_linked`]).
+    if let Some(index) = index.upgrade() {
+        backlog_settled(&index);
     }
 }
 
@@ -577,7 +781,7 @@ pub fn absorb(graph: &VsetGraph, inner: &mut VectorSetInner, most: usize) -> boo
 #[cfg(test)]
 pub fn settle(graph: &VsetGraph) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while !graph.is_ready() && std::time::Instant::now() < deadline {
+    while graph.state.load(Acquire) == BUILDING && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     backlog::settle(&graph.index, std::time::Duration::from_secs(60));

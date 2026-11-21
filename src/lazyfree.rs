@@ -138,7 +138,12 @@ pub fn effort(value: &KiviDBValue) -> u64 {
         // An array or a block of members (#297) is one allocation, as
         // Redis counts an intset or a listpack.
         KiviDBValue::Set(set) => set.read().free_effort(),
-        KiviDBValue::VectorSet(set) => set.read().entries.len(),
+        // The elements, and the nodes of the set's graph (a node is its key
+        // and its links above layer 0).
+        KiviDBValue::VectorSet(set) => {
+            let set = set.read();
+            set.entries.len() + set.graph.get().map_or(0, |g| g.node_slots())
+        }
         // A block of entries (#297) is one allocation.
         KiviDBValue::SortedSet(zset) => zset.read().free_effort(),
         KiviDBValue::Stream(stream) => {
