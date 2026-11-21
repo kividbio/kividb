@@ -44,7 +44,8 @@
 //! value, the time to live) is never written while anybody but the table
 //! holds it: a time to
 //! live, or an inline string, is changed in place only when the table's is
-//! the only hold, and otherwise in a new entry. The position is the table's
+//! the only hold, and otherwise in a new entry; a string of its own, only
+//! when the entry is also its bytes' only holder. The position is the table's
 //! own, written only with the shard locked for writing, and read by nothing
 //! else. Compaction moves a block whole, and only when the table's is the
 //! only hold.
@@ -53,9 +54,13 @@
 //! shrunk in its own block when the new length keeps the block's size in
 //! the same slab class: the block is freed by its size, which says its
 //! class, so a length that would say another one needs a new block. The
-//! slot's size hint does not change either: a class never spans two
-//! counts of cache lines (its sizes are within one 16-, 32- or 64-byte
-//! step, and lines are 64 bytes).
+//! slot's size hint does not change either: up to 2 KiB a class never
+//! spans two counts of cache lines (its sizes are within one 16- or
+//! 32-byte step, and lines are 64 bytes), and above, where a class is up
+//! to 2.5 % of its size, the hint is past the 8 lines asked for ahead
+//! ([`PREFETCH_LINES`]). A SET over a string of its own writes its block
+//! in place the same way (`SharedBytes::write_in_place`), the entry left
+//! as it is.
 //!
 //! **The access word is the exception.** When a key was last used, or how
 //! often (Redis's `robj.lru`), is written in place with the shard locked
@@ -496,13 +501,21 @@ impl Entry {
         (self.form() == INLINE).then(|| self.header().vlen as usize)
     }
 
-    /// Whether an inline string of `vlen` bytes can take this entry's value's
-    /// place in its own block: the value is an inline string, the table's is
-    /// the only hold, and the block's size stays in its slab class (see the
-    /// module). Whether the key has a time to live stays as it is.
+    /// Whether a string of `vlen` bytes can take this entry's value's place
+    /// in its block: the value is an inline string, the table's is the only
+    /// hold, and the block's size stays in its slab class (see the module);
+    /// or the value is a string of its own whose only holder is this entry,
+    /// and its block's size stays in its class. Whether the key has a time to
+    /// live stays as it is.
     #[inline]
     pub(super) fn fits_in_place(self, vlen: usize) -> bool {
-        if self.form() != INLINE || self.holders() != 1 {
+        if self.holders() != 1 {
+            return false;
+        }
+        if self.form() == WHOLE {
+            return matches!(self.whole(), KiviDBValue::String(b) if b.is_unique() && b.fits(vlen));
+        }
+        if self.form() != INLINE {
             return false;
         }
         let klen = self.klen();
@@ -518,12 +531,22 @@ impl Entry {
         key_at(self.klen(), self.has_ttl()) + self.klen()
     }
 
-    /// The inline string made `bytes`, in this block.
+    /// The string made `bytes`, in this block, or in its own block if it has
+    /// one.
     ///
     /// # Safety
     /// The caller holds the shard for writing, and `fits_in_place(bytes.len())`.
     pub(super) unsafe fn write_in_place(self, bytes: &[u8]) {
         debug_assert!(self.fits_in_place(bytes.len()));
+        if self.form() == WHOLE {
+            if let KiviDBValue::String(b) = self.whole() {
+                // SAFETY: `fits_in_place`: the entry is the bytes' only
+                // holder, the table the entry's, and the shard is locked for
+                // writing.
+                unsafe { b.write_in_place(bytes) };
+            }
+            return;
+        }
         // SAFETY: nothing but the table holds the entry and the shard is
         // locked for writing: nothing reads the bytes or the length while
         // they change, and the block has room up to its class's size.

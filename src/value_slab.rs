@@ -1106,6 +1106,18 @@ pub struct Fill {
 
 /// How full the slabs are, from every slab's header: a few thousand loads.
 pub fn fill() -> Fill {
+    fill_where(|_| true, slab_bytes)
+}
+
+/// [`fill`] of the classes up to 2 KiB alone: for tests that count slabs
+/// while others take large ones (a megabyte each).
+#[cfg(test)]
+pub(crate) fn small_fill() -> Fill {
+    fill_where(|class| class < SMALL, || IN_USE.load(Ordering::Relaxed) * SLAB)
+}
+
+/// [`fill`] of the keyspace's classes `keep` says.
+fn fill_where(keep: impl Fn(usize) -> bool, slab_bytes: fn() -> usize) -> Fill {
     let regions = REGION_LIST.lock().clone();
     let mine = MINE.try_with(|m| m as *const Mine as usize).unwrap_or(0);
     let (mut live_bytes, mut full_free_bytes) = (0usize, 0usize);
@@ -1118,6 +1130,9 @@ pub fn fill() -> Fill {
             let class = slab.class.load(Ordering::Relaxed) as usize;
             if state == EMPTY || class >= CLASSES {
                 // Nothing, or the entry pool's.
+                continue;
+            }
+            if !keep(class) {
                 continue;
             }
             if state == OWNED {

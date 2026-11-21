@@ -2224,7 +2224,8 @@ mod tests {
         let per_slab = value_slab::SLAB / size;
         let slabs = 8;
         assert_eq!(value_slab::slabs_of_class(class), 0);
-        let (fill_before, bytes_before) = (value_slab::fill(), value_slab::slab_bytes());
+        // The classes up to 2 KiB: other tests take large slabs meanwhile.
+        let fill_before = value_slab::small_fill();
         // Made on a thread that has ended: nobody owns the slabs.
         let blocks: Vec<usize> = crate::cpus::spawn(move || {
             (0..slabs * per_slab)
@@ -2242,8 +2243,7 @@ mod tests {
         // Half a megabyte of pool slabs: neither count moved by it (other
         // tests may move them by a slab or two meanwhile).
         let moved = |a: usize, b: usize| a.abs_diff(b) < slabs * value_slab::SLAB / 2;
-        assert!(moved(value_slab::slab_bytes(), bytes_before));
-        let fill = value_slab::fill();
+        let fill = value_slab::small_fill();
         assert!(moved(fill.slab_bytes, fill_before.slab_bytes));
         assert!(moved(fill.live_bytes, fill_before.live_bytes));
         // An eighth kept: the sparsest slabs there are.

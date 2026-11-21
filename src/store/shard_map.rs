@@ -2474,6 +2474,40 @@ mod tests {
         assert!(matches!(map.lookup("none"), Lookup::Absent));
     }
 
+    /// A SET over a string of its own writes its block when nothing but the
+    /// entry holds it and the new length keeps the block's class; a holder
+    /// of the bytes (a GET's reply on its way out) keeps them as they were.
+    #[test]
+    fn a_string_of_its_own_is_written_in_place_while_nothing_else_holds_it() {
+        let mut map = ShardMap::new();
+        let block = |map: &ShardMap| match map.get("k") {
+            Some(ValueRef::String(s)) => s.as_bytes().as_ptr() as usize,
+            _ => panic!("no string"),
+        };
+        let (a, b) = (vec![1u8; 5_000], vec![2u8; 5_010]);
+        assert!(matches!(map.set_str("k", &a), Written::New));
+        let at = block(&map);
+        assert!(matches!(map.set_str("k", &b), Written::InPlace));
+        assert_eq!(text(map.get("k")), Some(b.clone()));
+        assert_eq!(block(&map), at);
+        // Held: a new block, and the holder still reads what it held.
+        let held = match map.get("k") {
+            Some(ValueRef::String(s)) => s.to_shared(),
+            _ => panic!("no string"),
+        };
+        assert!(matches!(map.set_str("k", &a), Written::Replaced(_)));
+        assert_eq!(held.as_slice(), &b[..]);
+        assert_eq!(text(map.get("k")), Some(a.clone()));
+        drop(held);
+        // Another class, or no slab's block: a new block.
+        let at = block(&map);
+        assert!(matches!(map.set_str("k", vec![3u8; 9_000]), Written::Replaced(_)));
+        assert_ne!(block(&map), at);
+        assert!(matches!(map.set_str("k", vec![4u8; 40_000]), Written::Replaced(_)));
+        assert!(matches!(map.set_str("k", vec![5u8; 40_000]), Written::Replaced(_)));
+        assert_eq!(text(map.get("k")), Some(vec![5u8; 40_000]));
+    }
+
     #[test]
     fn a_key_past_its_time_is_not_written_in_place() {
         let mut map = ShardMap::new();
