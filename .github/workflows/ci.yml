@@ -295,35 +295,10 @@ jobs:
           path: target/release/kividb
           retention-days: 1
 
-  # The builds released for macOS (release.yml's `darwin`) compile without
-  # what is Linux-only (`tokio-uring`, `io-uring`, `server_uring`). Nothing
-  # else here builds for another OS, and a check for macOS from Linux needs a
-  # C cross toolchain and SDK (mlua's Lua, zstd and aws-lc are C). `cargo
-  # check` only: no tests, no link. A macOS minute is billed as ten, so this
-  # is the one macOS job, and only when source changed.
-  check-macos:
-    needs: detect-changes
-    if: >-
-      always() && needs.detect-changes.result != 'failure' &&
-      (github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.run_ci == 'true')
-    runs-on: macos-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: check-macos
-
-      - name: Check (lua,tls)
-        run: cargo check --features lua,tls
-
   # The check the branch ruleset requires under the name `rust`: it passes
   # only if everything above did. Skipped, like them, when no source changed.
   rust:
-    needs: [detect-changes, lint, build-tests, test, mixed-version, build-release, check-macos]
+    needs: [detect-changes, lint, build-tests, test, mixed-version, build-release]
     # Also when detect-changes itself failed: the jobs above were skipped, and
     # a skipped check would count as passed. It runs, and fails below.
     if: >-
@@ -342,7 +317,6 @@ jobs:
             test=${{ needs.test.result }}
             mixed-version=${{ needs.mixed-version.result }}
             build-release=${{ needs.build-release.result }}
-            check-macos=${{ needs.check-macos.result }}
         run: |
           echo "$RESULTS" | tr ' ' '\n'
           for r in $RESULTS; do

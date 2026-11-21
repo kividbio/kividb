@@ -111,10 +111,13 @@ struct Server {
     args: Vec<String>,
 }
 
-/// What `extra` may hold besides the server's arguments: the server is
-/// started with `KIVIDB_TEST_LOOK` set, so a queued script's connection looks
-/// for its reply whatever the CPUs of the machine (`lua_vm_blocking`).
-const LOOK: &str = "@look";
+/// What `extra` may hold besides the server's arguments: `@env:NAME=VALUE`
+/// starts the server with that variable set. `LOOK`: a queued script's
+/// connection looks for its reply whatever the CPUs of the machine;
+/// `TINY_RUNS`: a run of queued scripts ends after each one, nearly always
+/// with scripts left (`lua_vm_blocking`, debug builds).
+const LOOK: &str = "@env:KIVIDB_TEST_LOOK=1";
+const TINY_RUNS: &str = "@env:KIVIDB_TEST_RUN_FOR_US=1";
 
 /// `kividb` on `port`, in `dir`.
 fn spawn(dir: &std::path::Path, port: u16, extra: &[String]) -> Child {
@@ -123,12 +126,12 @@ fn spawn(dir: &std::path::Path, port: u16, extra: &[String]) -> Child {
         .append(true)
         .open(dir.join("server.log"))
         .unwrap();
-    let look = extra.iter().any(|a| a.as_str() == LOOK);
-    let extra: Vec<&String> = extra.iter().filter(|a| a.as_str() != LOOK).collect();
     let mut command = Command::new(env!("CARGO_BIN_EXE_kividb"));
-    if look {
-        command.env("KIVIDB_TEST_LOOK", "1");
+    for var in extra.iter().filter_map(|a| a.strip_prefix("@env:")) {
+        let (name, value) = var.split_once('=').expect("@env:NAME=VALUE");
+        command.env(name, value);
     }
+    let extra: Vec<&String> = extra.iter().filter(|a| !a.starts_with("@env:")).collect();
     command
         .current_dir(dir)
         .args([
@@ -2417,4 +2420,104 @@ fn gone_while_queued(io: &str) {
     });
     // Every script of the others ran once, and was answered.
     assert_eq!(c.cmd(&["GET", "b1"]).s(), (ran + 1).to_string());
+}
+
+/// A connection that looks, runs queued scripts and leaves some (every run
+/// ends after one script here), and goes while it looks: killed by
+/// `CLIENT KILL`, or gone by itself. The scripts it left are still run, and
+/// the other connections' scripts are each answered within a bound. 50
+/// connections go so, one after another, while 3 others stream scripts. On
+/// both I/O loops.
+#[test]
+fn scripts_left_by_a_looking_connection_that_goes_are_run() {
+    left_by_one_that_goes("tokio");
+}
+
+#[test]
+fn scripts_left_by_a_looking_connection_that_goes_are_run_uring() {
+    left_by_one_that_goes("uring");
+}
+
+fn left_by_one_that_goes(io: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let server = Server::start(&["--io-model", io, "--threads", "2", LOOK, TINY_RUNS]);
+    let mut c = server.conn();
+    let V::Str(three) = c.cmd(&["SCRIPT", "LOAD", THREE_KEYS]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    for _ in 0..4 {
+        assert!(matches!(
+            c.cmd(&["EVALSHA", &three, "3", "g1", "g2", "g3"]),
+            V::Int(_)
+        ));
+    }
+    let port = server.port;
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    // Each round of each stream is answered within the bound, or it waits
+    // until the read times out and fails.
+    let streams: Vec<_> = (0..3)
+        .map(|_| {
+            let stop = stop.clone();
+            let call: Vec<String> = ["EVALSHA", &three, "3", "g1", "g2", "g3"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                c.reader
+                    .get_ref()
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let calls = vec![call; 8];
+                let (mut ran, mut worst) = (0usize, Duration::ZERO);
+                while !stop.load(Ordering::Relaxed) {
+                    let (replies, took) = timed(|| c.pipeline(&calls));
+                    assert!(
+                        replies.iter().all(|r| matches!(r, V::Int(_))),
+                        "{replies:?}"
+                    );
+                    ran += replies.len();
+                    worst = worst.max(took);
+                }
+                (ran, worst)
+            })
+        })
+        .collect();
+    let mut killer = server.conn();
+    for i in 0..50 {
+        let mut g = server.conn();
+        let V::Int(id) = g.cmd(&["CLIENT", "ID"]) else {
+            panic!("CLIENT ID")
+        };
+        let call = format!(
+            "*6\r\n$7\r\nEVALSHA\r\n${}\r\n{}\r\n$1\r\n3\r\n$2\r\ng1\r\n$2\r\ng2\r\n$2\r\ng3\r\n",
+            three.len(),
+            three
+        );
+        // A pipeline of scripts, queued behind the streams' as they come.
+        g.writer.write_all(call.repeat(16).as_bytes()).unwrap();
+        std::thread::sleep(Duration::from_micros(300));
+        if i % 2 == 0 {
+            assert_eq!(
+                killer.cmd(&["CLIENT", "KILL", "ID", &id.to_string()]),
+                V::Int(1)
+            );
+        } else {
+            let _ = g.writer.shutdown(std::net::Shutdown::Both);
+        }
+        drop(g);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    stop.store(true, Ordering::Relaxed);
+    let results: Vec<(usize, Duration)> = streams.into_iter().map(|s| s.join().unwrap()).collect();
+    let worst = results.iter().map(|r| r.1).max().unwrap();
+    assert!(results.iter().all(|r| r.0 > 0), "{results:?}");
+    assert!(worst < Duration::from_secs(2), "a round waited {worst:?}");
+    // Nothing is left queued: a script now is answered at once.
+    let (reply, took) = timed(|| c.cmd(&["EVALSHA", &three, "3", "g1", "g2", "g3"]));
+    assert!(matches!(reply, V::Int(_)), "{reply:?}");
+    assert!(took < Duration::from_secs(1), "{took:?}");
+    let info = c.cmd(&["INFO", "stats"]);
+    let V::Str(info) = info else { panic!("INFO") };
+    assert!(info.contains("scripts_handed_to_runner:"), "{info}");
 }

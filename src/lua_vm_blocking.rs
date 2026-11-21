@@ -313,6 +313,27 @@ impl Drop for Turn {
 #[cfg(feature = "lua")]
 const RUN_FOR: std::time::Duration = std::time::Duration::from_micros(200);
 
+/// `RUN_FOR`, or in debug builds `KIVIDB_TEST_RUN_FOR_US` (never set
+/// otherwise): a tiny one makes nearly every run end with scripts left, for
+/// the tests of what becomes of them.
+#[cfg(feature = "lua")]
+fn run_for() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    {
+        static FOR: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        *FOR.get_or_init(|| {
+            std::env::var("KIVIDB_TEST_RUN_FOR_US")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map_or(RUN_FOR, std::time::Duration::from_micros)
+        })
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        RUN_FOR
+    }
+}
+
 /// The queue of quick scripts that came while another one was running, and
 /// the thread that runs them when nobody else has the turn: one after
 /// another, with nothing to wait for between them.
@@ -378,8 +399,8 @@ impl Runner {
     fn run_queued(&self, since: std::time::Instant, on_worker: bool) {
         use std::sync::atomic::Ordering;
         loop {
-            if crate::command_gate::reopen_between_scripts(RUN_FOR).is_none()
-                && since.elapsed() >= RUN_FOR
+            if crate::command_gate::reopen_between_scripts(run_for()).is_none()
+                && since.elapsed() >= run_for()
             {
                 break;
             }
@@ -599,21 +620,20 @@ async fn look_then_wait(
     use tokio::sync::oneshot::error::TryRecvError;
     #[cfg(target_os = "linux")]
     let ring = crate::deferred::on_ring_thread();
+    // Held for the whole look, so that every way out of it wakes the runner
+    // for scripts left with nobody running them: the reply, a closed channel,
+    // the end of the look, and the future dropped at one of its awaits (the
+    // client gone, the connection closed) or unwound by a panic.
+    let looking = StopsLooking;
     loop {
         match done.try_recv() {
-            Ok(reply) => {
-                wake_the_runner_if_left();
-                return (Some(reply), true);
-            }
-            Err(TryRecvError::Closed) => {
-                wake_the_runner_if_left();
-                return (None, true);
-            }
+            Ok(reply) => return (Some(reply), true),
+            Err(TryRecvError::Closed) => return (None, true),
             Err(TryRecvError::Empty) => {}
         }
         let now = std::time::Instant::now();
         if now.duration_since(since) >= LOOK_FOR {
-            wake_the_runner_if_left();
+            drop(looking);
             return (done.await.ok(), false);
         }
         run_the_queue_if_nobody_does();
@@ -671,8 +691,34 @@ fn run_the_queue_if_nobody_does() {
     }
 }
 
-/// On the way out of a look: scripts queued and nobody running them are the
-/// runner's (see `run_the_queue_if_nobody_does`).
+/// A connection's look, from start to end (see `look_then_wait`): its end,
+/// however it comes, leaves scripts queued with nobody running them to the
+/// runner thread.
+///
+/// Why that is enough. Scripts are left queued with the turn free and the
+/// runner not woken only by `run_the_queue_if_nobody_does`, and only a
+/// connection that looks runs it, holding one of these. Its drop reads the
+/// queue and the turn after its own run has given the turn up (both
+/// `SeqCst`). If another looker takes the turn after that read, the drop
+/// sees it taken and wakes nobody; but that looker holds one of these too,
+/// and the same holds when its run ends: the chain of lookers ends with the
+/// last one, whose drop sees the turn free and wakes the runner. A script
+/// queued as the last look ends is woken for by `Runner::submit` itself:
+/// it counts the queue and then looks at the turn (`SeqCst`), and wakes the
+/// runner when the turn is free, as before; and `Turn`'s drop wakes it for a
+/// holder that is not a looker.
+#[cfg(feature = "lua")]
+struct StopsLooking;
+
+#[cfg(feature = "lua")]
+impl Drop for StopsLooking {
+    fn drop(&mut self) {
+        wake_the_runner_if_left();
+    }
+}
+
+/// Scripts queued and nobody running them are the runner's (see
+/// `StopsLooking`).
 #[cfg(feature = "lua")]
 fn wake_the_runner_if_left() {
     use std::sync::atomic::Ordering;
