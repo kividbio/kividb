@@ -253,6 +253,16 @@ pub enum Leftover {
     Bytes(SharedBytes),
 }
 
+impl Leftover {
+    /// The bytes the move copied.
+    pub fn bytes(&self) -> usize {
+        match self {
+            Leftover::Entry(left) => left.size(),
+            Leftover::Bytes(bytes) => bytes.heap_size(),
+        }
+    }
+}
+
 /// What a write of a key's value did ([`ShardMap::set_str`]).
 pub enum Written {
     /// The key was not there.

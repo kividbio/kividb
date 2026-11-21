@@ -168,7 +168,10 @@ compacts).
 ### Active defrag
 
 Keys' entries, and string values kept apart from them, whose block (header included) is at
-most 4 KiB live in 64 KiB slabs of one block size each. A slab nobody is filling is used for new blocks again once a quarter of it is free;
+most 2 KiB live in 64 KiB slabs of one block size each, and those of up to 26,208 bytes in
+1 MiB slabs, whose block sizes are at most 2.5 % apart and each a slab's size over a count of
+blocks (a value of 4,100 bytes takes a block of 4,144, one of 8,000 a block of 8,192); a larger
+value is the system allocator's. A slab nobody is filling is used for new blocks again once a quarter of it is free;
 until then its free blocks are memory the process holds. Active defrag (`activedefrag`, on by
 default) moves values out of the sparsest slabs so that they empty and their pages go back to
 the system: the slabs a quarter free and more, and the full ones with at least
@@ -190,13 +193,13 @@ both:
 | `active-defrag-full-slab-free-percent` | `12` | a full slab is emptied when at least this many per cent of its blocks are free (`0` or `100`: full slabs are left alone) |
 | `active-defrag-cycle-max` | `10` | the most of one core it uses, a percentage |
 
-The slab-waste trigger counts free blocks only: the end of a slab that no block fits in (3,520
-bytes of a slab of 3,648-byte blocks) is no room any pass gets back.
+The slab-waste trigger counts free blocks only: the end of a slab that no block fits in (1,120
+bytes of a slab of 1,952-byte blocks) is no room any pass gets back.
 
 No pass starts until the bytes of the blocks in the slabs have changed by less than a 32nd of
 the slabs each second for 5 seconds in a row (a large delete, or its refill: the writes take
 the free room themselves), and a round that sees such a change while it runs (it looks every
-10 ms) ends there, with its pass; the next pass then waits for 5 calm seconds again. A round
+10 ms, or every 20 times as long as its last look took, if longer) ends there, with its pass; the next pass then waits for 5 calm seconds again. A round
 moves values out of a set of slabs in one look through the keys; what it puts in new slabs is
 held twice until the round ends, so a round takes at most a 128th of the slabs' size in new
 slabs (at least 1 MiB), or what is left below the most the slabs have taken before, up to an

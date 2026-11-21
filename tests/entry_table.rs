@@ -720,7 +720,7 @@ fn growing_and_shrinking_keep_every_entry() {
 }
 
 #[test]
-fn every_size_up_to_4_kib_has_the_smallest_class_that_holds_it() {
+fn every_size_up_to_the_largest_block_has_the_smallest_class_that_holds_it() {
     let mut last = None;
     for size in 1..=value_slab::MAX_BLOCK {
         let class = value_slab::class_of(size).expect("a slab's");

@@ -125,9 +125,10 @@ const LONG_KEY: u8 = u8::MAX;
 /// are asked to be.
 const ALIGN: usize = 16;
 
-/// The longest entry a string's bytes are kept inline in: the largest block
-/// a slab holds.
-pub const INLINE_MAX: usize = value_slab::MAX_BLOCK;
+/// The longest entry a string's bytes are kept inline in. A longer string
+/// has a block of its own (`SharedBytes`), in a slab up to
+/// `value_slab::MAX_BLOCK`; the entry stays small.
+pub const INLINE_MAX: usize = 4096;
 
 /// Where a long key's length is, in an entry with (`ttl`) or without a time
 /// to live.
@@ -810,6 +811,13 @@ impl Drop for Moving {
 
 /// An entry's block left behind by compaction, freed when dropped.
 pub struct Left(NonNull<u8>, usize);
+
+impl Left {
+    /// The size of the block left.
+    pub fn size(&self) -> usize {
+        self.1
+    }
+}
 
 // SAFETY: nothing but this knows the block.
 unsafe impl Send for Left {}

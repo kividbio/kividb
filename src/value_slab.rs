@@ -15,13 +15,17 @@
 //! rounded it up, so a value of 100 bytes (a block of 108) took 128.
 //!
 //! **Layout.** Memory is taken from the system a [`REGION`] at a time,
-//! aligned to its size. A region's first [`SLAB`] bytes hold the headers of
-//! its slabs and nothing else, and are never given back, so a header
-//! outlives the memory it describes: a free that comes late still finds it.
-//! Each of the other slabs holds blocks of one class (the keyspace's are
-//! sixteen bytes apart in size, the entry pool's eight apart below 64, see
-//! below). Masking a block's address finds its region, and its offset its
-//! slab.
+//! aligned to its size. A region is of slabs of [`SLAB`] bytes, for the
+//! classes up to 2 KiB and the entry pool's, or of [`LARGE_SLAB`] bytes, for
+//! the keyspace's classes above 2 KiB, whose sizes are each a large slab
+//! over a count of blocks and at most 2.5 % apart: about 1 % lost on
+//! average to the class a block is rounded up to, and less than 16 bytes a
+//! block at a slab's end. A region's first slab holds the headers of its
+//! slabs and nothing else (the first of them says which kind the region is),
+//! and is never given back, so a header outlives the memory it describes: a
+//! free that comes late still finds it. Each of the other slabs holds blocks
+//! of one class. Masking a block's address finds its region, the region's
+//! first header its slabs' size, and the block's offset its slab.
 //!
 //! **Ownership.** A slab with room is used by at most one thread at a time,
 //! its owner, which takes blocks from it and gives its own back to it
@@ -66,34 +70,130 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicI32, AtomicPtr, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering,
+};
 
 use parking_lot::Mutex;
 
 /// What memory is taken from the system in, and aligned to.
 pub const REGION: usize = 2 << 20;
-/// A slab: blocks of one size class.
+/// A slab of the classes up to 2 KiB: blocks of one size class.
 pub const SLAB: usize = 64 << 10;
-/// Slabs in a region, the first of them the headers.
+/// Slabs in a region of them, the first of them the headers.
 const SLABS: usize = REGION / SLAB;
+/// A slab of the keyspace's classes above 2 KiB ([`LARGE`]). Of 64 KiB, a
+/// slab holds 16 blocks of 3,841 to 4,096 bytes and leaves up to 3 KiB of
+/// itself unused, whatever the classes; of 1 MiB it holds 40 or more of the
+/// largest blocks, and the classes can be its size over a count of blocks,
+/// so that no slab leaves 16 bytes a block or more unused. The system
+/// allocator's block cost a SET of 13 KB 0.6 us (4.5 %) more of the
+/// server's CPU than a slab's; at 26 KB the two cost the same, so the
+/// largest block is a large slab over 40 blocks, 26,208 bytes.
+pub const LARGE_SLAB: usize = 1 << 20;
+/// Slabs in a region of large slabs: the headers' and one. All of the
+/// headers' slab but its first page is unmapped as the region is made.
+const LARGE_SLABS: usize = REGION / LARGE_SLAB;
+/// The fewest blocks a large slab holds: its largest class, and the largest
+/// block a slab holds ([`MAX_BLOCK`]), is a slab over this many.
+const LARGE_FEWEST: usize = 40;
+/// Two large classes in a row are at most this many thousandths apart.
+const LARGE_STEP: usize = 1025;
+/// The classes up to 2 KiB: 16 bytes apart to 512, then 32 apart: 32 and
+/// 48 classes. A key of 15 bytes and a value of 1,024 make an entry of 1,051
+/// bytes, in the class of 1,056.
+const SMALL: usize = 80;
+/// The classes above 2 KiB, in large slabs: each the largest block, a
+/// multiple of 16, of which a large slab holds a given count, the counts
+/// chosen so that a class is at most [`LARGE_STEP`] thousandths of the one
+/// below it.
+const LARGE: usize = large_count();
+const CLASSES: usize = SMALL + LARGE;
 /// The largest block a slab holds. A block larger than this is the system
 /// allocator's.
-///
-/// Up to 512 bytes the classes are 16 bytes apart, then 32 bytes apart to
-/// 2 KiB and 64 to 4 KiB: 32, 48 and 32 classes. A key of 15 bytes and a
-/// value of 1,024 make an entry of 1,051 bytes, in the class of 1,056.
-pub const MAX_BLOCK: usize = 4096;
-const CLASSES: usize = 112;
+pub const MAX_BLOCK: usize = large_size(LARGE_FEWEST);
 const _: () = assert!(block_size(CLASSES - 1) == MAX_BLOCK);
-/// The entry pool's classes ([`pool_class_of`]), numbered after the
-/// keyspace's: 8 bytes apart to 64, 16 apart to 512, then the keyspace's
-/// sizes (8 + 28 + 48 + 32).
+/// The largest block of the entry pool ([`pool_class_of`]), which keeps the
+/// classes and the 64 KiB slabs it had.
+pub const POOL_MAX_BLOCK: usize = 4096;
+/// The entry pool's classes, numbered after the keyspace's: 8 bytes apart
+/// to 64, 16 apart to 512, 32 apart to 2 KiB and 64 apart to 4 KiB
+/// (8 + 28 + 48 + 32).
 const POOL_CLASSES: usize = 116;
 /// Every class: the keyspace's, then the entry pool's.
 const ALL_CLASSES: usize = CLASSES + POOL_CLASSES;
-const _: () = assert!(block_size(ALL_CLASSES - 1) == MAX_BLOCK);
-// A slab's class is kept in a byte.
-const _: () = assert!(ALL_CLASSES <= 256);
+const _: () = assert!(block_size(ALL_CLASSES - 1) == POOL_MAX_BLOCK);
+// A slab's class is kept in two bytes.
+const _: () = assert!(ALL_CLASSES <= u16::MAX as usize);
+
+/// The largest multiple of 16 of which a large slab holds `blocks`.
+const fn large_size(blocks: usize) -> usize {
+    (LARGE_SLAB / blocks) & !15
+}
+
+/// The count of blocks of the large class after one of `prev` bytes: the
+/// largest block of the family at most [`LARGE_STEP`] thousandths of it,
+/// or the next one up if none is.
+const fn next_blocks(prev: usize) -> usize {
+    let cap = prev * LARGE_STEP / 1000;
+    let mut blocks = LARGE_FEWEST;
+    while large_size(blocks) > cap {
+        blocks += 1;
+    }
+    if large_size(blocks) <= prev {
+        blocks -= 1;
+    }
+    blocks
+}
+
+const fn large_count() -> usize {
+    let (mut size, mut count) = (2048, 0);
+    while size < large_size(LARGE_FEWEST) {
+        size = large_size(next_blocks(size));
+        count += 1;
+    }
+    count
+}
+
+/// The large classes' block sizes.
+const LARGE_SIZES: [usize; LARGE] = {
+    let mut sizes = [0; LARGE];
+    let (mut size, mut i) = (2048, 0);
+    while i < LARGE {
+        size = large_size(next_blocks(size));
+        sizes[i] = size;
+        i += 1;
+    }
+    sizes
+};
+
+/// The class of each 16 bytes of sizes above 2 KiB: entry `i` holds the
+/// sizes 2,049 + 16 i to 2,064 + 16 i, all in one class as the large
+/// classes are multiples of 16.
+const LARGE_CLASS: [u16; (MAX_BLOCK - 2048) / 16] = {
+    let mut classes = [0; (MAX_BLOCK - 2048) / 16];
+    let (mut i, mut class) = (0, 0);
+    while i < classes.len() {
+        while LARGE_SIZES[class] < 2064 + 16 * i {
+            class += 1;
+        }
+        classes[i] = (SMALL + class) as u16;
+        i += 1;
+    }
+    classes
+};
+
+/// Whether `class`'s slabs are large.
+#[inline]
+const fn is_large(class: usize) -> bool {
+    class >= SMALL && class < CLASSES
+}
+
+/// The size of a slab of `class`.
+#[inline]
+const fn slab_size(class: usize) -> usize {
+    if is_large(class) { LARGE_SLAB } else { SLAB }
+}
 
 // What a slab is doing.
 /// A thread's, which takes blocks from it.
@@ -111,7 +211,9 @@ const EVACUATING: u8 = 4;
 #[repr(C, align(64))]
 struct Slab {
     state: AtomicU8,
-    class: AtomicU8,
+    /// Its class; in a region's first header (that of the slab that holds
+    /// the headers, never a slab itself), 1 for a region of large slabs.
+    class: AtomicU16,
     /// One more each time the slab empties. A free that saw an older one
     /// leaves the slab alone: it has emptied since, and may be another
     /// class's by now.
@@ -154,7 +256,7 @@ impl Slab {
     const fn new() -> Self {
         Slab {
             state: AtomicU8::new(EMPTY),
-            class: AtomicU8::new(0),
+            class: AtomicU16::new(0),
             generation: AtomicU32::new(0),
             owner: AtomicUsize::new(0),
             live: AtomicI32::new(0),
@@ -168,25 +270,51 @@ impl Slab {
         }
     }
 
-    /// Where the slab's blocks are.
+    /// Where the slab's blocks are, `size` bytes each slab of its region.
     #[inline]
-    fn base(&self) -> *mut u8 {
+    fn base(&self, size: usize) -> *mut u8 {
         let at = self as *const Slab as usize;
         let region = at & !(REGION - 1);
         let index = (at - region) / std::mem::size_of::<Slab>();
-        (region + index * SLAB) as *mut u8
+        (region + index * size) as *mut u8
     }
 }
 
 // The headers of a region's slabs fit in its first slab.
 const _: () = assert!(SLABS * std::mem::size_of::<Slab>() <= SLAB);
+const _: () = assert!(LARGE_SLABS >= 2);
+
+/// Whether the region at `region` is one of large slabs.
+#[inline]
+fn region_is_large(region: usize) -> bool {
+    // SAFETY: a region's first header is written when it is made and never
+    // given back; its class says the kind, written before the region is
+    // listed or any of its slabs handed out.
+    unsafe { &*(region as *const Slab) }
+        .class
+        .load(Ordering::Relaxed)
+        == 1
+}
 
 /// The header of the slab `block` is in.
 #[inline]
 fn slab_of(block: *const u8) -> &'static Slab {
+    let region = block as usize & !(REGION - 1);
+    let size = if region_is_large(region) {
+        LARGE_SLAB
+    } else {
+        SLAB
+    };
+    slab_in(block, size)
+}
+
+/// The header of the slab `block`, of a slab of `size` bytes, is in: where
+/// the class is known, as a free knows it.
+#[inline]
+fn slab_in(block: *const u8, size: usize) -> &'static Slab {
     let at = block as usize;
     let region = at & !(REGION - 1);
-    let index = (at - region) / SLAB;
+    let index = (at - region) / size;
     // SAFETY: `block` is in a region, whose first bytes are its slabs'
     // headers, written when it was made and never given back.
     unsafe { &*(region as *const Slab).add(index) }
@@ -201,7 +329,7 @@ pub fn class_of(size: usize) -> Option<usize> {
     } else if size <= 2048 {
         32 + (size - 513) / 32
     } else if size <= MAX_BLOCK {
-        80 + (size - 2049) / 64
+        LARGE_CLASS[(size - 2049) / 16] as usize
     } else {
         return None;
     })
@@ -218,8 +346,12 @@ pub fn pool_class_of(size: usize) -> Option<usize> {
                 (size - 1) / 8
             } else if size <= 512 {
                 8 + (size - 65) / 16
-            } else {
+            } else if size <= 2048 {
                 class_of(size)? + 4
+            } else if size <= POOL_MAX_BLOCK {
+                84 + (size - 2049) / 64
+            } else {
+                return None;
             },
     )
 }
@@ -246,19 +378,19 @@ const fn size_of_class(class: usize) -> usize {
         let pool = class - CLASSES;
         return if pool < 8 {
             (pool + 1) * 8
-        } else if pool < 36 {
-            64 + (pool - 7) * 16
-        } else {
-            // From 544 bytes, the keyspace's classes from its 32nd.
+        } else if pool < 84 {
+            // From 544 bytes to 2 KiB, the keyspace's classes from its 32nd.
             size_of_class(pool - 4)
+        } else {
+            2048 + (pool - 83) * 64
         };
     }
     if class < 32 {
         (class + 1) * 16
-    } else if class < 80 {
+    } else if class < SMALL {
         512 + (class - 31) * 32
     } else {
-        2048 + (class - 79) * 64
+        LARGE_SIZES[class - SMALL]
     }
 }
 
@@ -267,7 +399,7 @@ const CAPACITY: [i32; ALL_CLASSES] = {
     let mut capacity = [0; ALL_CLASSES];
     let mut class = 0;
     while class < ALL_CLASSES {
-        capacity[class] = (SLAB / size_of_class(class)) as i32;
+        capacity[class] = (slab_size(class) / size_of_class(class)) as i32;
         class += 1;
     }
     capacity
@@ -425,18 +557,22 @@ const WALK: usize = 256;
 
 /// One planning at a time: each class has one marker.
 static PLANNING: Mutex<()> = Mutex::new(());
-/// Slabs that hold nothing.
-static EMPTY_SLABS: Mutex<Vec<SlabPtr>> = Mutex::new(Vec::new());
-/// Slabs of the keyspace's classes that are not [`EMPTY`].
+/// Slabs that hold nothing: of 64 KiB, and large ones.
+static EMPTY_SLABS: [Mutex<Vec<SlabPtr>>; 2] = [const { Mutex::new(Vec::new()) }; 2];
+/// Slabs of the keyspace's classes up to 2 KiB that are not [`EMPTY`].
 static IN_USE: AtomicUsize = AtomicUsize::new(0);
+/// Large slabs (the keyspace's classes above 2 KiB) that are not [`EMPTY`].
+static LARGE_IN_USE: AtomicUsize = AtomicUsize::new(0);
 /// Slabs of the entry pool's classes that are not [`EMPTY`].
 static POOL_IN_USE: AtomicUsize = AtomicUsize::new(0);
 
 /// The count of slabs in use that a slab of `class` is in.
 #[inline]
 fn in_use(class: usize) -> &'static AtomicUsize {
-    if class < CLASSES {
+    if class < SMALL {
         &IN_USE
+    } else if class < CLASSES {
+        &LARGE_IN_USE
     } else {
         &POOL_IN_USE
     }
@@ -548,7 +684,7 @@ pub fn alloc(class: usize) -> NonNull<u8> {
 pub unsafe fn free(block: NonNull<u8>, class: usize) {
     crate::memory_use::note(-(block_size(class) as isize));
     let block = block.as_ptr();
-    let slab = slab_of(block);
+    let slab = slab_in(block, slab_size(class));
     debug_assert_eq!(slab.class.load(Ordering::Relaxed) as usize, class);
     debug_assert_ne!(slab.state.load(Ordering::Relaxed), EMPTY);
     let own = MINE
@@ -625,10 +761,10 @@ unsafe fn take(slab: &Slab, class: usize) -> Option<*mut u8> {
         } else {
             let bump = &mut *slab.bump.get();
             let size = block_size(class) as u32;
-            if *bump as usize + size as usize > SLAB {
+            if *bump as usize + size as usize > slab_size(class) {
                 return None;
             }
-            let block = slab.base().add(*bump as usize);
+            let block = slab.base(slab_size(class)).add(*bump as usize);
             *bump += size;
             block
         };
@@ -686,8 +822,10 @@ fn settle(mut lists: parking_lot::MutexGuard<'_, Lists>, slab: &Slab, class: usi
         slab.state.store(EMPTY, Ordering::Relaxed);
         drop(lists);
         in_use(class).fetch_sub(1, Ordering::Relaxed);
-        give_back(slab.base());
-        EMPTY_SLABS.lock().push(SlabPtr(slab));
+        give_back(slab.base(slab_size(class)), slab_size(class));
+        EMPTY_SLABS[is_large(class) as usize]
+            .lock()
+            .push(SlabPtr(slab));
     } else if state == FULL && live <= listable(class) {
         lists.unlink_full(slab);
         lists.list(slab);
@@ -720,7 +858,7 @@ fn acquire(class: usize, owner: usize) -> *const Slab {
         s.state.store(OWNED, Ordering::Relaxed);
         return slab;
     }
-    let slab = empty_slab();
+    let slab = empty_slab(is_large(class));
     // No destructor: there to read on a thread on its way out too.
     let _ = FRESH_HERE.try_with(|taken| taken.set(taken.get() + 1));
     // SAFETY: an empty slab is nobody's: nothing else reads or writes it.
@@ -730,7 +868,7 @@ fn acquire(class: usize, owner: usize) -> *const Slab {
         *s.bump.get() = 0;
         *s.pending.get() = 0;
     }
-    s.class.store(class as u8, Ordering::Relaxed);
+    s.class.store(class as u16, Ordering::Relaxed);
     s.live.store(0, Ordering::Relaxed);
     s.remote.store(ptr::null_mut(), Ordering::Relaxed);
     s.owner.store(owner, Ordering::Relaxed);
@@ -739,25 +877,49 @@ fn acquire(class: usize, owner: usize) -> *const Slab {
     slab
 }
 
-/// A slab that holds nothing: one given back before, or one of a new region.
-fn empty_slab() -> *const Slab {
-    let mut empty = EMPTY_SLABS.lock();
+/// A slab that holds nothing, large or not: one given back before, or one of
+/// a new region.
+fn empty_slab(large: bool) -> *const Slab {
+    let mut empty = EMPTY_SLABS[large as usize].lock();
     if let Some(SlabPtr(slab)) = empty.pop() {
         return slab;
     }
     let region = new_region();
     let headers = region as *mut Slab;
-    for index in 0..SLABS {
+    let count = slabs_in(large);
+    for index in 0..count {
         // SAFETY: the region's first slab is for the headers.
         unsafe { headers.add(index).write(Slab::new()) };
+    }
+    // The kind, in the headers' own header, before the region is listed.
+    // SAFETY: written just above.
+    unsafe { &*headers }
+        .class
+        .store(large as u16, Ordering::Relaxed);
+    if large {
+        trim_headers(region);
     }
     REGIONS.fetch_add(1, Ordering::Relaxed);
     REGION_LIST.lock().push(region);
     // Slab 0 is the headers'.
-    for index in (2..SLABS).rev() {
+    for index in (2..count).rev() {
         empty.push(SlabPtr(unsafe { headers.add(index) }));
     }
     unsafe { headers.add(1) }
+}
+
+/// Slabs, the headers' included, in a region of large slabs or not.
+#[inline]
+fn slabs_in(large: bool) -> usize {
+    if large { LARGE_SLABS } else { SLABS }
+}
+
+/// The headers of the slabs of the region at `region`, but the headers'
+/// own: every slab of it.
+fn headers_of(region: usize) -> impl Iterator<Item = &'static Slab> {
+    // SAFETY: a region's headers live as long as the process.
+    (1..slabs_in(region_is_large(region)))
+        .map(move |index| unsafe { &*(region as *const Slab).add(index) })
 }
 
 #[cfg(all(unix, not(miri)))]
@@ -792,6 +954,23 @@ fn new_region() -> usize {
     }
 }
 
+/// Unmap a region of large slabs' headers' slab but for the pages its
+/// headers are on: a large slab of address space each region, else.
+#[cfg(all(unix, not(miri)))]
+fn trim_headers(region: usize) {
+    // SAFETY: sysconf has no preconditions.
+    let page = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize).max(4096);
+    let kept = (LARGE_SLABS * std::mem::size_of::<Slab>()).next_multiple_of(page);
+    if kept < LARGE_SLAB {
+        // SAFETY: the stretch is the region's, after its headers, and nothing
+        // is ever put there.
+        unsafe { libc::munmap((region + kept) as *mut libc::c_void, LARGE_SLAB - kept) };
+    }
+}
+
+#[cfg(not(all(unix, not(miri))))]
+fn trim_headers(_region: usize) {}
+
 #[cfg(not(all(unix, not(miri))))]
 fn new_region() -> usize {
     use std::alloc::GlobalAlloc;
@@ -809,13 +988,13 @@ fn new_region() -> usize {
 /// Hand an empty slab's pages back to the kernel. They come back, zeroed,
 /// when the slab is next written.
 #[cfg(all(unix, not(miri)))]
-fn give_back(base: *mut u8) {
+fn give_back(base: *mut u8, len: usize) {
     // SAFETY: the slab is mapped, and holds nothing anybody reads.
-    unsafe { libc::madvise(base as *mut libc::c_void, SLAB, libc::MADV_DONTNEED) };
+    unsafe { libc::madvise(base as *mut libc::c_void, len, libc::MADV_DONTNEED) };
 }
 
 #[cfg(not(all(unix, not(miri))))]
-fn give_back(_base: *mut u8) {}
+fn give_back(_base: *mut u8, _len: usize) {}
 
 /// What the keyspace's slabs take, and what is in them: the entry pool's are
 /// left out, as compaction does not empty them.
@@ -829,7 +1008,7 @@ pub struct Fill {
     /// What the [`FULL`] slabs have free: the slabs too full to be used for
     /// blocks again, whose room only compaction gets back (INFO
     /// `value_slab_full_free_bytes`). Free blocks only: the end of a slab no
-    /// block fits in (3,520 bytes of a slab of 3,648-byte blocks) is no room.
+    /// block fits in (1,120 bytes of a slab of 1,952-byte blocks) is no room.
     pub full_free_bytes: usize,
     /// The free blocks of the slabs nobody owns, [`FULL`] and [`PARTIAL`]:
     /// the room the slab-waste trigger looks at.
@@ -849,9 +1028,7 @@ pub fn fill() -> Fill {
     let (mut live_bytes, mut full_free_bytes) = (0usize, 0usize);
     let (mut free_bytes, mut mine_bytes) = (0usize, 0usize);
     for region in regions {
-        for index in 1..SLABS {
-            // SAFETY: a region's headers live as long as the process.
-            let slab = unsafe { &*(region as *const Slab).add(index) };
+        for slab in headers_of(region) {
             // The state first: a slab taken empty gets its class before its
             // state says it is in use (`acquire`'s release store).
             let state = slab.state.load(Ordering::Acquire);
@@ -861,9 +1038,9 @@ pub fn fill() -> Fill {
                 continue;
             }
             if state == OWNED {
-                live_bytes += SLAB;
+                live_bytes += slab_size(class);
                 if mine != 0 && slab.owner.load(Ordering::Relaxed) == mine {
-                    mine_bytes += SLAB;
+                    mine_bytes += slab_size(class);
                 }
                 continue;
             }
@@ -1147,7 +1324,7 @@ pub fn is_evacuating(block: *const u8, regions: &[usize]) -> bool {
 /// Bytes of the keyspace's slabs that hold something (INFO
 /// `value_slab_bytes`).
 pub fn slab_bytes() -> usize {
-    IN_USE.load(Ordering::Relaxed) * SLAB
+    IN_USE.load(Ordering::Relaxed) * SLAB + LARGE_IN_USE.load(Ordering::Relaxed) * LARGE_SLAB
 }
 
 /// Bytes of the entry pool's slabs that hold something (INFO
@@ -1160,7 +1337,7 @@ pub fn pool_slab_bytes() -> usize {
 // The library's, for tests; the server does not ask.
 #[allow(dead_code)]
 pub fn slabs_in_use() -> usize {
-    IN_USE.load(Ordering::Relaxed)
+    IN_USE.load(Ordering::Relaxed) + LARGE_IN_USE.load(Ordering::Relaxed)
 }
 
 /// Regions taken from the system so far.
@@ -1191,10 +1368,8 @@ pub(crate) fn slabs_of_class(class: usize) -> usize {
     regions
         .iter()
         .map(|&region| {
-            (1..SLABS)
-                .filter(|&index| {
-                    // SAFETY: a region's headers live as long as the process.
-                    let slab = unsafe { &*(region as *const Slab).add(index) };
+            headers_of(region)
+                .filter(|slab| {
                     slab.state.load(Ordering::Acquire) != EMPTY
                         && slab.class.load(Ordering::Relaxed) as usize == class
                 })
@@ -1210,12 +1385,8 @@ pub(crate) fn evacuating_slabs() -> usize {
     regions
         .iter()
         .map(|&region| {
-            (1..SLABS)
-                .filter(|&index| {
-                    // SAFETY: a region's headers live as long as the process.
-                    let slab = unsafe { &*(region as *const Slab).add(index) };
-                    slab.state.load(Ordering::Relaxed) == EVACUATING
-                })
+            headers_of(region)
+                .filter(|slab| slab.state.load(Ordering::Relaxed) == EVACUATING)
                 .count()
         })
         .sum()
@@ -1290,12 +1461,7 @@ impl Drop for OnlyEvacuating {
 #[allow(dead_code)]
 pub fn check_lists(quiescent: bool) -> Result<(), String> {
     let regions = REGION_LIST.lock().clone();
-    let headers = || {
-        regions.iter().flat_map(|&region| {
-            // SAFETY: a region's headers live as long as the process.
-            (1..SLABS).map(move |index| unsafe { &*(region as *const Slab).add(index) })
-        })
-    };
+    let headers = || regions.iter().flat_map(|&region| headers_of(region));
     // Every slab listed, while `quiescent`; otherwise a class's alone, as a
     // slab may empty and be listed in another class meanwhile.
     let mut listed = std::collections::HashSet::new();
@@ -1404,20 +1570,16 @@ pub fn check_lists(quiescent: bool) -> Result<(), String> {
                 ));
             }
         }
-        if in_use != IN_USE.load(Ordering::Relaxed)
-            || pool_in_use != POOL_IN_USE.load(Ordering::Relaxed)
-        {
+        if in_use != slabs_in_use() || pool_in_use != POOL_IN_USE.load(Ordering::Relaxed) {
             return Err(format!(
                 "{in_use} slabs in use ({} counted), {pool_in_use} of the pool ({} counted)",
-                IN_USE.load(Ordering::Relaxed),
+                slabs_in_use(),
                 POOL_IN_USE.load(Ordering::Relaxed)
             ));
         }
-        if empty != EMPTY_SLABS.lock().len() {
-            return Err(format!(
-                "{empty} empty slabs, {} in the list",
-                EMPTY_SLABS.lock().len()
-            ));
+        let listed_empty = EMPTY_SLABS[0].lock().len() + EMPTY_SLABS[1].lock().len();
+        if empty != listed_empty {
+            return Err(format!("{empty} empty slabs, {listed_empty} in the lists"));
         }
     }
     Ok(())
@@ -1427,26 +1589,49 @@ pub fn check_lists(quiescent: bool) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Up to 2 KiB, 16 and 32 bytes apart in 64 KiB slabs; above, in large
+    /// slabs, each class a slab over a count of blocks, at most 2.5 % above
+    /// the class below (and the last step, to the largest, at most 1/40 of
+    /// it), no slab leaving more than 15 bytes a block unused, and no size
+    /// skipping the class that fits it best (#240).
     #[test]
-    fn keyspace_classes_are_as_they_were() {
+    fn keyspace_classes_fit_their_slabs() {
         for size in 1..=MAX_BLOCK {
             let class = class_of(size).unwrap();
-            assert!(class < CLASSES);
-            let step = if size <= 512 {
-                16
-            } else if size <= 2048 {
-                32
+            assert!(class < CLASSES, "{size}");
+            let block = block_size(class);
+            assert!(block >= size, "{size}");
+            if class > 0 {
+                assert!(
+                    block_size(class - 1) < size.max(1),
+                    "{size}: a class skipped"
+                );
+            }
+            if size <= 2048 {
+                let step = if size <= 512 { 16 } else { 32 };
+                assert_eq!(block, size.div_ceil(step) * step, "{size}");
+                assert_eq!(slab_size(class), SLAB);
             } else {
-                64
-            };
-            assert_eq!(block_size(class), size.div_ceil(step) * step, "{size}");
+                assert_eq!(slab_size(class), LARGE_SLAB);
+                assert_eq!(block % 16, 0);
+                let blocks = LARGE_SLAB / block;
+                assert!(LARGE_SLAB - blocks * block < 16 * blocks, "{size}: a tail");
+            }
+        }
+        for class in SMALL..CLASSES {
+            let (below, block) = (block_size(class - 1), block_size(class));
+            assert!(
+                block * 1000 <= below * LARGE_STEP || LARGE_SLAB / block == LARGE_SLAB / below - 1,
+                "{below} to {block}"
+            );
         }
         assert_eq!(class_of(MAX_BLOCK + 1), None);
+        assert_eq!(MAX_BLOCK, (LARGE_SLAB / LARGE_FEWEST) & !15);
     }
 
     #[test]
     fn pool_classes_fit_tightly() {
-        for size in 1..=MAX_BLOCK {
+        for size in 1..=POOL_MAX_BLOCK {
             let class = pool_class_of(size).unwrap();
             assert!((CLASSES..ALL_CLASSES).contains(&class), "{size}");
             let block = block_size(class);
@@ -1468,7 +1653,9 @@ mod tests {
             // Room for the free list's pointer.
             assert!(block >= std::mem::size_of::<*mut u8>());
         }
-        assert_eq!(pool_class_of(MAX_BLOCK + 1), None);
+        assert_eq!(pool_class_of(POOL_MAX_BLOCK + 1), None);
+        // The pool keeps 64 KiB slabs.
+        assert!((CLASSES..ALL_CLASSES).all(|class| slab_size(class) == SLAB));
         assert_eq!(block_size(pool_class_of(11).unwrap()), 16);
         assert_eq!(block_size(pool_class_of(20).unwrap()), 24);
     }
@@ -1485,7 +1672,7 @@ mod tests {
         // empty one, so a test that allocated in the same class meanwhile
         // could take the very slabs this one asserts on (the small classes
         // are the tables' and `table_scan`'s, from many threads at once).
-        let class = pool_class_of(MAX_BLOCK).unwrap();
+        let class = pool_class_of(POOL_MAX_BLOCK).unwrap();
         let per_slab = capacity(class) as usize;
         let slabs = if cfg!(miri) { 2 } else { 3 };
         // Whole slabs and one block more: the slabs before the last are let
@@ -1563,10 +1750,10 @@ mod tests {
     }
 
     /// The slabs `blocks` are in, and how many of them each holds.
-    fn per_slab(blocks: &[usize]) -> std::collections::BTreeMap<usize, usize> {
+    fn per_slab(blocks: &[usize], size: usize) -> std::collections::BTreeMap<usize, usize> {
         let mut slabs = std::collections::BTreeMap::new();
         for &b in blocks {
-            *slabs.entry(b & !(SLAB - 1)).or_insert(0) += 1;
+            *slabs.entry(b & !(size - 1)).or_insert(0) += 1;
         }
         slabs
     }
@@ -1578,7 +1765,7 @@ mod tests {
     /// check out ([`check_lists`]).
     fn check_model(class: usize, blocks: &[usize], evacuating: &[usize]) {
         check_lists(false).unwrap();
-        let slabs = per_slab(blocks);
+        let slabs = per_slab(blocks, slab_size(class));
         let lists = LISTS[class].lock();
         let mut listed = 0;
         for (&base, &n) in &slabs {
@@ -1616,7 +1803,21 @@ mod tests {
         // A class no other test allocates (the pool's of 3,841-3,904 bytes,
         // 16 a slab; the tables' tests and the other pool tests have the
         // three above it), which `plan` takes like any when asked.
-        let class = model_class();
+        model_run(model_class());
+    }
+
+    /// The same for a class of large slabs: the largest, which no other
+    /// test allocates.
+    #[test]
+    fn the_lists_follow_every_large_slab_through_its_states() {
+        let _one = EVACUATION_TESTS.lock();
+        let class = class_of(MAX_BLOCK).unwrap();
+        assert_eq!(slab_size(class), LARGE_SLAB);
+        model_run(class);
+    }
+
+    fn model_run(class: usize) {
+        let size = slab_size(class);
         assert!(check_lists(false).is_ok());
         let blocks_a_slab = capacity(class) as usize;
         let mut rng = Lcg(240);
@@ -1648,12 +1849,12 @@ mod tests {
                 }
                 3 => {
                     // Every block of one slab: it empties.
-                    let Some((&base, _)) = per_slab(&blocks).iter().nth(rng.next(4)) else {
+                    let Some((&base, _)) = per_slab(&blocks, size).iter().nth(rng.next(4)) else {
                         continue;
                     };
                     let (gone, kept): (Vec<usize>, Vec<usize>) = std::mem::take(&mut blocks)
                         .into_iter()
-                        .partition(|&b| b & !(SLAB - 1) == base);
+                        .partition(|&b| b & !(size - 1) == base);
                     blocks = kept;
                     let generation = generation_of(base as *const u8);
                     gone.into_iter().for_each(free_one);
@@ -1664,7 +1865,7 @@ mod tests {
                     let most = 1000 - threshold;
                     // Which slabs it chooses, with no budget: every partial
                     // one, and every full one with room enough.
-                    let expected: Vec<usize> = per_slab(&blocks)
+                    let expected: Vec<usize> = per_slab(&blocks, size)
                         .into_iter()
                         .filter(|&(_, n)| {
                             n as i32 <= listable(class)
@@ -1673,7 +1874,7 @@ mod tests {
                         .map(|(base, _)| base)
                         .collect();
                     plan(usize::MAX, threshold as u32, class..class + 1);
-                    let chosen: Vec<usize> = per_slab(&blocks)
+                    let chosen: Vec<usize> = per_slab(&blocks, size)
                         .into_keys()
                         .filter(|&base| {
                             slab_of(base as *const u8).state.load(Ordering::Relaxed) == EVACUATING
@@ -1686,7 +1887,7 @@ mod tests {
                         let b = blocks.swap_remove(rng.next(blocks.len()));
                         free_one(b);
                     }
-                    let left: Vec<usize> = per_slab(&blocks).into_keys().collect();
+                    let left: Vec<usize> = per_slab(&blocks, size).into_keys().collect();
                     let emptied = chosen.iter().filter(|b| !left.contains(b)).count();
                     check_model(class, &blocks, &chosen);
                     assert_eq!(finish_evacuation(), emptied);

@@ -1659,6 +1659,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   agreed with @Parikalp-Bhardwaj, whose measurement showed that the free
   room a `BGSAVE` leaves is in full slabs.
 
+- **String values of 2 KiB to 26 KB are in slabs, at most 2.5 % over their
+  size (#240).** Entries and string values whose block is over 2 KiB and up
+  to 26,208 bytes are now in 1 MiB slabs whose block sizes are at most 2.5 %
+  apart, each a slab's size over a count of blocks (a slab's end leaves less
+  than 16 bytes a block unused); only larger values are the system
+  allocator's. These blocks were in 64 KiB slabs up to 4 KiB, which left up
+  to 3 KiB of a slab unused, and the system allocator's above, whose block
+  costs a SET 0.6 to 0.8 us more of the server's CPU than a slab's up to
+  about 13 KB, and nothing measurable at 26 KB. Measured on an Azure
+  D8s_v5 (`redis-benchmark -t set -P 16`, 4 threads, the server on
+  4 vCPUs, 60,000 random keys, medians of three runs), against the same
+  build with the 64 KiB slabs alone: a SET of 4,100 bytes takes 5.0 us of
+  server CPU, as one of 4,088 does (5.7 and 4.8), one of 13,104 bytes
+  13.2 us and of 13,096 13.1 (13.7 and 13.7), and one of 26,208 bytes (the
+  system allocator's) 22.7 us as one of 26,192 (a slab's); RSS per key over
+  3,500 to 4,500 bytes is the value plus 89 to 153 bytes (up to 291, for
+  3,832 bytes; Redis 8.10.2: up to 1,128). Active
+  defrag empties the new slabs as it does the others, moving at most
+  128 KiB of values under one hold of a shard's lock, and a round looks
+  whether the clients started a delete or a refill every 10 ms, or 20 times
+  as long as its last look took (a look reads every slab's header). The
+  entries of large sets, hashes and sorted sets keep their classes and
+  64 KiB slabs, and the formats of snapshots, the AOF and replication do
+  not change.
+
 - **`key-access-tracking yes` costs about 1.5% of a pipelined `GET` instead
   of about 10% (#21).** The setting that keeps `OBJECT IDLETIME`, `OBJECT
   FREQ` and `RESTORE ... IDLETIME` working under `noeviction`, as Redis does,
