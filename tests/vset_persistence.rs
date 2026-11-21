@@ -477,7 +477,7 @@ fn capture(c: &mut Conn) -> Snapshot {
         usage: vec![],
     };
     for (key, _, _) in SETS {
-        s.info.push(c.cmd(&["VINFO", key]));
+        s.info.push(stable_vinfo(c, key));
         s.usage
             .push(c.cmd(&["MEMORY", "USAGE", key, "SAMPLES", "0"]).i());
         s.sim
@@ -512,12 +512,25 @@ fn assert_same(a: &Snapshot, b: &Snapshot, what: &str) {
     assert_eq!(a.usage, b.usage, "{what}: MEMORY USAGE");
 }
 
+/// `VINFO` less `vset-uid`, which numbers the sets a process has made: a
+/// restart or another node numbers them otherwise.
+fn stable_vinfo(c: &mut Conn, key: &str) -> V {
+    let info = c.cmd(&["VINFO", key]);
+    let V::Arr(items) = info else { return info };
+    let kept = items
+        .chunks(2)
+        .filter(|p| !matches!(&p[0], V::Str(s) if s == "vset-uid"))
+        .flat_map(|p| p.to_vec())
+        .collect();
+    V::Arr(kept)
+}
+
 fn quant_type(c: &mut Conn, key: &str) -> String {
     let info = c.cmd(&["VINFO", key]);
     let info = info.arr();
     let at = info
         .iter()
-        .position(|v| matches!(v, V::Bulk(b) if b == b"quant-type"))
+        .position(|v| matches!(v, V::Bulk(_) | V::Str(_)) && v.s() == "quant-type")
         .expect("quant-type");
     info[at + 1].s()
 }
@@ -1202,7 +1215,7 @@ fn assert_matches_old(old: &mut Conn, r: &mut Conn, prefixes: &[&str], what: &st
 /// Two 1.3 nodes keep the same bytes, scores and sizes.
 fn assert_same_sets(a: &mut Conn, b: &mut Conn, prefixes: &[&str], what: &str) {
     for key in keys(prefixes) {
-        assert_eq!(a.cmd(&["VINFO", &key]), b.cmd(&["VINFO", &key]), "{what}");
+        assert_eq!(stable_vinfo(a, &key), stable_vinfo(b, &key), "{what}");
         let usage = |c: &mut Conn| c.cmd(&["MEMORY", "USAGE", &key, "SAMPLES", "0"]);
         assert_eq!(usage(a), usage(b), "{what}: {key}");
         let mut names: Vec<String> = a
