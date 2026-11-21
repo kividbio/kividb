@@ -1995,41 +1995,62 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
         assert_eq!(c.cmd(&["EVALSHA", &slow, "1", "a", "1"]), V::Int(1));
     }
     let port = server.port;
-    let migrate = migrate_to_nowhere(port, "m", 4000);
-    // A takes the turn, and runs for about 300 ms; its `GET`, sent with it,
-    // is served by the same thread right after it.
-    let a = std::thread::spawn(move || {
-        let mut a = Conn::connect(port);
-        let calls = vec![
-            ["EVALSHA", &slow, "1", "a", &count.to_string()]
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>(),
-            vec!["GET".to_string(), "a".to_string()],
-        ];
-        let (mut replies, took) = timed(|| a.pipeline(&calls));
-        let got = replies.pop().unwrap();
-        (replies.pop().unwrap(), took, got)
-    });
-    std::thread::sleep(Duration::from_millis(100));
-    // B's script on `m` comes while A's runs: queued behind it.
-    let b = std::thread::spawn(move || {
-        let mut b = Conn::connect(port);
-        timed(|| b.cmd(&["EVALSHA", &sets, "1", "m", "v1"]))
-    });
-    let (reply, took, got) = a.join().unwrap();
-    let (written, waited) = b.join().unwrap();
-    let (migrated, _) = migrate.join().unwrap();
-    eprintln!("{io}: A and its GET answered in {took:?}; B waited {waited:?}");
-    assert_eq!(reply, V::Int(count as i64));
-    assert_eq!(got, V::Str(count.to_string()));
-    assert!(
-        took < Duration::from_millis(2000),
-        "A's script and GET took {took:?} while B waited out the MIGRATE"
-    );
-    // B did wait for the MIGRATE, which gave up, and then ran.
-    assert!(migrated.is_err(), "{migrated:?}");
-    assert!(written.ok(), "{written:?}");
-    assert!(waited > Duration::from_millis(2000), "{waited:?}");
-    assert_eq!(c.cmd(&["GET", "m"]), V::Str("v1".into()));
+    // B's connection may land on A's thread: B's script then comes after
+    // A's, takes the turn itself, and waits on its own thread, as any
+    // script waits for a `MIGRATE` of its key; A's `GET` behind it too. That
+    // is not what this is about, and B was not queued: tried again.
+    for attempt in 1..=5 {
+        // Seen to be quick again (a slow run sends it back to the pool).
+        for _ in 0..4 {
+            assert_eq!(c.cmd(&["EVALSHA", &slow, "1", "a", "1"]), V::Int(1));
+        }
+        let handed = script_counts(&mut c)["scripts_handed_to_runner"];
+        let migrate = migrate_to_nowhere(port, "m", 4000);
+        // A takes the turn, and runs for about 300 ms; its `GET`, sent with
+        // it, is served by the same thread right after it.
+        let (slow_a, sets_b) = (slow.clone(), sets.clone());
+        let a = std::thread::spawn(move || {
+            let mut a = Conn::connect(port);
+            let calls = vec![
+                ["EVALSHA", &slow_a, "1", "a", &count.to_string()]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(),
+                vec!["GET".to_string(), "a".to_string()],
+            ];
+            let (mut replies, took) = timed(|| a.pipeline(&calls));
+            let got = replies.pop().unwrap();
+            (replies.pop().unwrap(), took, got)
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        // B's script on `m` comes while A's runs: queued behind it.
+        let b = std::thread::spawn(move || {
+            let mut b = Conn::connect(port);
+            timed(|| b.cmd(&["EVALSHA", &sets_b, "1", "m", "v1"]))
+        });
+        let (reply, took, got) = a.join().unwrap();
+        let (written, waited) = b.join().unwrap();
+        let (migrated, _) = migrate.join().unwrap();
+        let queued = script_counts(&mut c)["scripts_handed_to_runner"] > handed;
+        eprintln!(
+            "{io}, attempt {attempt}: A and its GET answered in {took:?}; B waited \
+             {waited:?}, queued: {queued}"
+        );
+        assert_eq!(reply, V::Int(count as i64));
+        assert_eq!(got, V::Str(count.to_string()));
+        // B did wait for the MIGRATE, which gave up, and then ran.
+        assert!(migrated.is_err(), "{migrated:?}");
+        assert!(written.ok(), "{written:?}");
+        assert!(waited > Duration::from_millis(2000), "{waited:?}");
+        assert_eq!(c.cmd(&["GET", "m"]), V::Str("v1".into()));
+        if !queued {
+            continue;
+        }
+        assert!(
+            took < Duration::from_millis(2000),
+            "A's script and GET took {took:?} while B, queued behind it, waited out the MIGRATE"
+        );
+        return;
+    }
+    panic!("B's connection was on A's thread every time");
 }
