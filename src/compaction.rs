@@ -138,6 +138,40 @@ fn churning(before: usize, now: usize, slabs: usize) -> bool {
     WAIT_FOR_REFILL.load(Ordering::Relaxed) && now.abs_diff(before) > slabs / REFILL
 }
 
+/// What a round watches while it runs: the bytes the process has allocated
+/// (`used_memory`'s count, which the round's own moves leave as it was)
+/// when it started. A delete or a refill that starts meanwhile moves it by
+/// more than one [`REFILL`]th of the slabs, and the round ends there: the
+/// partial slabs it chose go back to their list for the writes to fill, and
+/// it takes no more new slabs on top of theirs.
+struct Calm {
+    allocated: usize,
+    within: usize,
+    broken: Cell<bool>,
+}
+
+impl Calm {
+    fn new(slab_bytes: usize) -> Self {
+        Calm {
+            allocated: crate::memory_use::allocated(),
+            within: slab_bytes / REFILL,
+            broken: Cell::new(false),
+        }
+    }
+
+    /// Whether the clients started deleting or refilling since the round
+    /// began; once so, so for the rest of the round.
+    fn broken(&self) -> bool {
+        if !self.broken.get()
+            && WAIT_FOR_REFILL.load(Ordering::Relaxed)
+            && crate::memory_use::allocated().abs_diff(self.allocated) > self.within
+        {
+            self.broken.set(true);
+        }
+        self.broken.get()
+    }
+}
+
 /// A pass the slab-waste trigger started gets little back when the slabs it
 /// emptied, less the new ones it took, are under one in this many of those
 /// it emptied (or none): the free room left is in slabs too full to be
@@ -596,9 +630,9 @@ fn pass(store: &Store, streak: &mut Streak) -> Result<bool, Failed> {
             let got = compact(store);
             PASSES.fetch_add(1, Ordering::Relaxed);
             LAST_PASS_MS.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-            // One that stopped before it looked for slabs (a delete, or a
-            // snapshot, came first) says nothing either way.
-            if trigger == Trigger::SlabWaste && got.planned > 0 {
+            // One that stopped before it looked for slabs, or that a delete
+            // or a refill cut short, says nothing either way.
+            if trigger == Trigger::SlabWaste && got.planned > 0 && !got.cut {
                 streak.waste_pass_ended(got.enough());
             }
             streak.live_before = Some(value_slab::fill().live_bytes);
@@ -694,12 +728,14 @@ fn log_error(line: String) {
 }
 
 /// What a pass got back: the slabs it emptied, and the new ones it took for
-/// the values it moved; and how many sets of slabs it looked for.
+/// the values it moved; how many sets of slabs it looked for, and whether a
+/// delete or a refill cut it short.
 #[derive(Default, Clone, Copy, Debug)]
 struct Got {
     emptied: u64,
     fresh: u64,
     planned: u64,
+    cut: bool,
 }
 
 impl Got {
@@ -729,6 +765,7 @@ fn compact(store: &Store) -> Got {
         };
         // The clients deleting or refilling meanwhile: until they are done.
         if live_before.is_some_and(|before| churning(before, fill.live_bytes, fill.slab_bytes)) {
+            got.cut = true;
             break;
         }
         live_before = Some(fill.live_bytes);
@@ -745,13 +782,14 @@ fn compact(store: &Store) -> Got {
         fault_point(Fault::AfterPlan);
         let regions = value_slab::regions_snapshot();
         let fresh_before = value_slab::fresh_slabs_taken_here();
+        let calm = Calm::new(fill.slab_bytes);
         // Counted here, not read from `active_defrag_hits`, which a
         // `CONFIG RESETSTAT` can set to 0 while the set runs (#370).
         let mut moved = 0u64;
         'all: for db in store.iter() {
             for shard in db.iter() {
-                moved += compact_shard(shard, &regions, &mut pacer);
-                if !enabled() {
+                moved += compact_shard(shard, &regions, &mut pacer, &calm);
+                if !enabled() || calm.broken() {
                     break 'all;
                 }
             }
@@ -760,12 +798,14 @@ fn compact(store: &Store) -> Got {
             emptied: value_slab::finish_evacuation() as u64,
             fresh: value_slab::fresh_slabs_taken_here() - fresh_before,
             planned: 1,
+            cut: calm.broken(),
         };
         SLABS_EMPTIED.fetch_add(round.emptied, Ordering::Relaxed);
         got.emptied += round.emptied;
         got.fresh += round.fresh;
+        got.cut |= round.cut;
         // Past the ratio trigger's half, only while a round gets enough back.
-        if moved == 0 || (why == Trigger::SlabWaste && !round.enough()) {
+        if moved == 0 || calm.broken() || (why == Trigger::SlabWaste && !round.enough()) {
             break;
         }
     }
@@ -786,9 +826,9 @@ impl Drop for Leftovers {
 }
 
 /// Move the values of `shard` that are in slabs being emptied, [`BATCH`]
-/// buckets at a time. Returns how many moved, or early if active defrag is
-/// switched off.
-fn compact_shard(shard: &Shard, regions: &[usize], pacer: &mut Pacer) -> u64 {
+/// buckets at a time. Returns how many moved, early if active defrag is
+/// switched off or the clients start a delete or a refill (`calm`).
+fn compact_shard(shard: &Shard, regions: &[usize], pacer: &mut Pacer, calm: &Calm) -> u64 {
     let mut moved = 0u64;
     // A bucket index: entries keep their buckets while others come and go;
     // only a resize moves them, and then some are looked at twice or missed
@@ -852,7 +892,7 @@ fn compact_shard(shard: &Shard, regions: &[usize], pacer: &mut Pacer) -> u64 {
                 return moved;
             }
         }
-        if at >= buckets {
+        if at >= buckets || calm.broken() {
             return moved;
         }
     }
@@ -943,7 +983,8 @@ mod trigger_tests {
             Got {
                 emptied: 32,
                 fresh: 28,
-                planned: 1
+                planned: 1,
+                cut: false
             }
             .enough()
         );
@@ -951,7 +992,8 @@ mod trigger_tests {
             Got {
                 emptied: 64,
                 fresh: 62,
-                planned: 1
+                planned: 1,
+                cut: false
             }
             .enough()
         );
@@ -959,7 +1001,8 @@ mod trigger_tests {
             !Got {
                 emptied: 100,
                 fresh: 99,
-                planned: 1
+                planned: 1,
+                cut: false
             }
             .enough()
         );
@@ -967,7 +1010,8 @@ mod trigger_tests {
             !Got {
                 emptied: 10,
                 fresh: 12,
-                planned: 1
+                planned: 1,
+                cut: false
             }
             .enough()
         );
