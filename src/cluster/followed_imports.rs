@@ -1489,7 +1489,11 @@ mod tests {
         f.session_with(Some(m), true, true);
         f.sync_claim_read();
         f.confirm_held(m, 3, &[(43, 43)], false);
-        assert_eq!(f.not_held_of(m), vec![43], "the claim came after the imports marker");
+        assert_eq!(
+            f.not_held_of(m),
+            vec![43],
+            "the claim came after the imports marker"
+        );
         f.session_with(Some(m), true, false);
         f.note_gains(m, &[(50, 9)]);
         f.note_gains(other, &[(60, 3)]);
