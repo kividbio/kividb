@@ -146,6 +146,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`VSIM` searches an HNSW graph of the vector set (#710).** A set of 4,096
+  elements or more gets a graph over its elements (the one `FT.SEARCH`'s
+  vector fields use, one per set), and `VSIM` explores `EF` candidates in it
+  (100 unless given, Redis's default) and scores them from the set's own
+  vectors; `TRUTH` scans every element, and a smaller set is always scanned
+  (exact, and at that size as fast). `EF`, `EPSILON`, `FILTER-EF` and `TRUTH`
+  on `VSIM`, and `M` and `EF` on the `VADD` that makes a set, do what they do
+  in Redis, and `VSIM`'s options are checked as Redis checks them. `VINFO`
+  gives Redis's fields (`hnsw-m`, `size`, `max-level`, `attributes-count`,
+  ...) and `VLINKS` the element's links per layer, top layer first. Writes
+  change the graph in their own order, so an element a `VADD` was answered
+  for is found by the next `VSIM`, and a removed one never is. The graph is
+  not saved: it is made again from the vectors after a load, `RESTORE`,
+  `COPY` or full sync, while `VSIM` scans, so snapshots stay readable by 1.2.
+  On a D8s_v5, `Q8`, `COUNT 10` at the defaults, against Redis 8.10.2 in the
+  same session: 100,000 SIFT vectors (128-d) 3,106 / 13,412 / 15,683 queries
+  a second at 1 / 8 / 50 connections (exact scan before: 272 / 1,102 /
+  1,106; Redis 2,661 / 8,769 / 9,416), recall@10 0.976 (Redis 0.973);
+  100,000 glove-100 vectors 2,739 / 12,534 / 14,111 (before 282 / 1,098 /
+  1,092; Redis 1,944 / 7,238 / 7,869), recall 0.895 (Redis 0.871); 100,000
+  LAION vectors (768-d) 1,597 / 6,140 / 6,801 (Redis 1,704 / 6,045 /
+  6,708), recall 0.972 (Redis 0.969); 1,000,000 SIFT vectors 2,085 / 8,876 /
+  10,014 (Redis 1,956 / 6,722 / 7,510), recall 0.959 (Redis 0.951). The
+  graph costs memory: 1,061 bytes a
+  SIFT vector (224 before, Redis 885) and 4,267 a LAION one (Redis 1,525),
+  as it holds each vector again as f32. `VADD` loads 19,695 SIFT vectors a
+  second (280,705 before, Redis 4,706). Regression suite
+  `44-vector-sets-hnsw` measures it. @Parikalp-Bhardwaj pointed this out in
+  #697.
+
 - **`cluster-announce-client-ipv4` and `cluster-announce-client-ipv6` (#847),
   as in Valkey 8.** The address a client is told to reach a node at, where it
   is not the one nodes use between themselves: a client connected over IPv6

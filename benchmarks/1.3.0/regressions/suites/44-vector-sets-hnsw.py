@@ -112,8 +112,11 @@ SECONDS = 10.0
 WARMUP = 2.0
 # Redis's recall / candidate's at most this: the candidate at most 0.01 below.
 RECALL_X = 1.0101
-# VSIM q/s: the candidate at most this many times slower than Redis.
-QPS_X = {"c1": 1.25, "c8": 1.25, "c50": 1.25}
+# VSIM q/s: the candidate at most this many times slower than Redis. Measured
+# (D8s_v5, 2026-11-21): 1.07-1.41x Redis's q/s at 1 connection on SIFT and
+# glove, 0.94x on LAION's 768 dimensions; 1.0-1.85x at 8 and 50. The room is
+# for LAION's single connection and a run's noise.
+QPS_X = {"c1": 1.2, "c8": 1.15, "c50": 1.15}
 
 S = Suite("44-vector-sets-hnsw",
           [Config(n, threads=4, full_only=full) for n, (_, _, full) in CONFIGS.items()],
@@ -276,8 +279,9 @@ def run(ctx):
     t1 = time.perf_counter()
     deadline = t1 + 1800
     # A KiviDB set searched by scan (index-type FLAT) until its graph has
-    # every element; v1.2.2 and Redis have no such field to wait for.
-    while vinfo(c).get("index-type", "HNSW") != "HNSW" and n >= 4096:
+    # every element. v1.2.2 always scans (FLAT, and no hnsw-m) and Redis has
+    # no index-type: nothing to wait for.
+    while "hnsw-m" in (vi := vinfo(c)) and vi.get("index-type", "HNSW") != "HNSW" and n >= 4096:
         if time.perf_counter() > deadline:
             raise RuntimeError("the graph was not made in 1800 s")
         time.sleep(0.05)

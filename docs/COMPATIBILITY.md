@@ -297,6 +297,20 @@ other files:
   itself. A vector set made
   `NOQUANT` arrives as a set made without an option, so it then accepts a
   `VADD` with any quantization option, the same as after a snapshot reload.
+- Vector sets: a set of 4,096 elements or more is searched in an HNSW graph,
+  as in Redis, and a smaller one is scanned (exact, and at that size no
+  slower). The graph is not saved in snapshots, `DUMP` payloads or full
+  syncs, so files stay readable by 1.2: it is made again from the vectors
+  after a load, `RESTORE` or `COPY`, in the background, and `VSIM` scans
+  the set until it is ([COMMANDS.md](../COMMANDS.md#how-vsim-searches)).
+  For the same reason `M` and the build `EF` given to the `VADD` that made a
+  set are not kept across a restart (the set has Redis's 16 and 200 again),
+  and a `VADD` with another `M` than the set's is taken, where Redis
+  refuses it (`asked M value mismatch`). `CAS` is accepted and changes
+  nothing. A filtered `VSIM` that reaches its `FILTER-EF` effort scans the
+  set and answers exactly, where Redis answers with what it found so far.
+  `VLINKS` of a set under 4,096 elements, which has no graph, answers one
+  layer: the element's nearest `2 * M` elements.
 - Search: `GEO` and `GEOSHAPE` fields, `GEOFILTER` and `INFIELDS` are
   refused. Query `TIMEOUT` (or `search-timeout`) cuts a query short; `ON_TIMEOUT` or
   `search-on-timeout` chooses a partial reply with a warning, or an error. `INT8`
