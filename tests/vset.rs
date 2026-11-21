@@ -1817,7 +1817,7 @@ fn vlinks_and_vinfo_report_the_graph() {
         let e = format!("e{i}");
         let layers = c.cmds(&["VLINKS", "vs", &e]);
         let layers = layers.as_array();
-        assert!(!layers.is_empty() && layers.len() as i64 <= max_level + 1);
+        assert!(!layers.is_empty());
         tallest = tallest.max(layers.len());
         // Layer 0 holds up to 2 * M links (and some slack), none to itself.
         let layer0 = layers.last().unwrap().as_array();
@@ -1849,6 +1849,11 @@ fn vlinks_and_vinfo_report_the_graph() {
         }
     }
     assert!(tallest >= 2, "no element of 200 is above layer 0");
+    // The graph's top layer as it is now: the helpers may still have been
+    // linking when max-level was read above, and a node they linked since
+    // can be the graph's tallest (nothing is deleted, so it only grows).
+    let max_level = vinfo_field(&mut c, "vs", "max-level").as_int();
+    assert!(tallest as i64 <= max_level + 1, "{tallest} layers, max-level {max_level}");
     assert!(c.cmds(&["VLINKS", "vs", "e1", "FOO"]).is_error());
     assert!(
         c.cmds(&["VLINKS", "vs", "e1", "WITHSCORES", "x"])
