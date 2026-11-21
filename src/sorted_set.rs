@@ -201,7 +201,7 @@ impl SortedSetInner {
     /// allocation, room to spare included; for the large form its box, the
     /// table exactly as `used_memory` counts it (group arrays, overflow
     /// groups, the members' entries at their pool class's size) and the
-    /// index's estimate (`memory_layout::score_index`). For `MEMORY USAGE`.
+    /// index's nodes, as it counts them. For `MEMORY USAGE`.
     pub fn allocation_size(&self) -> usize {
         match &self.repr {
             Repr::Packed(block) => block.allocation_size(),
