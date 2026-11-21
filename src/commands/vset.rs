@@ -203,9 +203,8 @@ fn parse_values_vector(args: &[&[u8]], start: usize) -> Result<(Vec<f32>, usize)
 // and KiviDB's own `DISTANCE COSINE | L2 | IP` (before the vector, or among
 // the options), which Redis 8.10 does not have: its sets are cosine only.
 //
-// Redis uses HNSW internally for VectorSets. We store vectors in
-// VectorSetInner.entries and do brute-force VSIM (same trade-off as FLAT).
-// HNSW for VectorSets is a natural next step.
+// The vectors are kept in VectorSetInner.entries; a set large enough to
+// have a graph (`vector::vset_graph`) gets each write there too.
 //
 // Returns: 1 if added, 0 if updated.
 

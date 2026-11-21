@@ -159,7 +159,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   change the graph in their own order, so an element a `VADD` was answered
   for is found by the next `VSIM`, and a removed one never is. The graph is
   not saved: it is made again from the vectors after a load, `RESTORE`,
-  `COPY` or full sync, while `VSIM` scans, so snapshots stay readable by 1.2.
+  `COPY` or full sync, while `VSIM` scans, so snapshots stay readable by 1.2
+  (1,000,000 128-d vectors: loaded in 1.2 s, the graph made 108 s later;
+  Redis loads its saved graph in 9.2 s).
   On a D8s_v5, `Q8`, `COUNT 10` at the defaults, against Redis 8.10.2 in the
   same session: 100,000 SIFT vectors (128-d) 3,106 / 13,412 / 15,683 queries
   a second at 1 / 8 / 50 connections (exact scan before: 272 / 1,102 /
