@@ -20,7 +20,8 @@
 # WORKLOADS=tags runs what the hash-tag locks of a build with Lua cost a
 # command (#889; `tag_locks`, on with lua-parallel-scripts): GET and SET of
 # keys without a tag and of keys with one ({t}:<n>), a 10-key MGET, a
-# one-key EVALSHA on a tagged key, and MULTI + 2 SET + EXEC (per
+# one-key EVALSHA on a tagged key and on an untagged one (which runs alone,
+# #880), and MULTI + 2 SET + EXEC (per
 # transaction: N transactions of four commands). Run it on a build with
 # FEATURES=lua,tls and on the default one (where EVALSHA is refused).
 # CMP=plain preloads plaincmp.c's memcmp and bcmp into the server: counts
@@ -187,6 +188,8 @@ if [ "${WORKLOADS:-}" = tags ]; then
     DSIZE=100 one "$tag" MGET10 MGET $K $K $K $K $K $K $K $K $K $K
     PRELOAD="SET {t}:__rand_int__ $V100" SETUP="SCRIPT LOAD $SCRIPT" DSIZE=100 \
       one "$tag" EVALSHA-TAG EVALSHA "$SHA" 1 "{t}:__rand_int__"
+    # The same script on a key without a tag, which runs alone (#880).
+    SETUP="SCRIPT LOAD $SCRIPT" DSIZE=100 one "$tag" EVALSHA-ALONE EVALSHA "$SHA" 1 "$K"
     PIPEFILE=/tmp/multi DSIZE=100 one "$tag" MULTI-2SET
   done | tee /out/raw.txt
   echo done

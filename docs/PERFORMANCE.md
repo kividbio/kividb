@@ -324,14 +324,54 @@ path around the call (the connection loop and the script command's way to the VM
 than in the script: the call's own time (`usec_per_call`) is 0.42 µs against Redis's 0.67 for
 `return 1`, and 6.4 against 7.4 µs for Tyk's. The count hook
 behind `SCRIPT KILL` and `lua-time-limit` makes Lua 5.4 trace every instruction, 3-4 % of a
-call. And an untagged script that meets another one running is handed to the script-runner
-thread and back: with two workers busy, Tyk's script cost 9.2 µs of CPU on the runner and
-11.8 µs on the workers a call, against 12.8-13.4 µs on one worker that runs it itself; that is
-how scripts are scheduled, [#880](https://github.com/kividbio/kividb/issues/880).
+call. And an untagged script that meets another one running is queued, and run after it by
+the thread running that one (see "Scripts that run alone, beside plain commands" below).
 
 All of it was measured with a Go client (the scripts above, one command at a time per
 connection), `/proc` for the server's CPU, `INFO commandstats` for the calls, and callgrind
 for the instructions, each tree and 1.2.2 built by the same rustc.
+
+## Scripts that run alone, beside plain commands
+
+A script whose key has no hash tag runs alone: no other command runs while it does
+([SCRIPTS.md](SCRIPTS.md)). A quick one that comes while another is running is run right after
+it, by the thread running that one, in a run ([#880](https://github.com/kividbio/kividb/issues/880)):
+the first script of the run holds the other commands back where it would on its own, after its
+checks, and they stay held back for the scripts after it until 200 µs have passed since they were
+held back and the script then running has finished. They are held back once for the run, not
+once for each script. A script that has to wait (a slot handoff, a `MIGRATE` of its key) lets
+them in while it waits. `INFO stats` counts the runs (`scripts_alone_runs`) and the scripts' takes of
+the gate in them (`scripts_in_alone_runs`).
+
+Azure `Standard_D8s_v5`, server on CPUs 0-3 (`--threads 4`, io_uring), memtier_benchmark 2.6.1 on
+CPUs 4-7, 4 threads, one call at a time per connection, `--randomize --distinct-client-seed`,
+100,000 keys written again before each run; the build before #880 (master `6bcf8afa`) and the
+build with it, both `--features lua,tls` by rustc 1.100.0, run interleaved, 3 rounds of 20 s,
+medians; ops/s, p99 and p99.9 in ms:
+
+| workload, connections | before #880 | with #880 |
+|---|---:|---:|
+| Nextcloud's mix, 500 | 289k, 8.45, 17.5 | 321k, 2.45, 6.1 |
+| Nextcloud's mix, 200 | 284k, 4.38, 9.2 | 326k, 0.90, 2.4 |
+| the same mix with no script, 500 | 297k, 2.53, 5.1 | 298k, 2.53, 5.3 |
+| the same mix with no script, 200 | 307k, 0.96, 1.6 | 308k, 0.96, 1.6 |
+| Superset's mix, 500 | 97.0k, 12.0, 30.0 | 97.2k, 8.5, 12.5 |
+| compare-and-delete alone, untagged, 500 | 259k, 3.25 | 261k, 3.17 |
+| Appwrite's abuse limiter (`EVAL`), untagged, 500 | 135k, 4.13 | 133k, 4.16 |
+| compare-and-delete alone, tagged key, 500 | 326k, 1.83 | 324k, 1.82 |
+| Appwrite's limiter, tagged key, 500 | 250k, 2.27 | 249k, 2.37 |
+
+Nextcloud's mix is `GET` 40, `TTL` 15, `INCRBY` 15, `EXPIRE` 15, `EVALSHA` of its
+compare-and-delete 12 and `SETEX` 3; Superset's is `GET` 85 of 50 KB values, `SETEX` 10,
+`SET NX EX` 3 and its unlock 2. With the script, the mix's p99 is the no-script mix's (2.45
+against 2.53 ms at 500 connections, 0.90 against 0.96 at 200). A script alone runs at the rate
+it did: one thread runs such scripts one after another. A script on a tagged key runs beside
+others and is not affected. For comparison, on the same machine type in another session: Valkey
+8.1 with `--io-threads 4` ran the mix at 333k ops/s with a p99 of 2.06 ms at 500 connections
+(0.72 ms at 200) and the compare-and-delete alone at 302k/s; Redis 8.10.2 ran the mix at 142k
+(p99 6.53 ms). With the Tokio I/O loop (`--io-model tokio`, the same interleaved runs) the mix's p99 at 500
+connections goes from 8.96 to 4.67 ms, against 2.21 ms with no script, and from 3.76 to 1.52 ms
+at 200: less of a gain than on io_uring. Regression suite 42 (`benchmarks/1.3.0/regressions`) keeps these rows.
 
 ## Vector index builds
 

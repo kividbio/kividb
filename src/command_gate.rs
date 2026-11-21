@@ -41,15 +41,28 @@
 // it. Slots only ever get added, at most `SLOTS` of them, so the counting
 // ends.
 //
+// A thread that runs scripts one after another — the one whose turn it is to
+// run the quick scripts that run alone (`lua_vm_blocking`) — may keep the
+// gate closed from one of them to the next (`for_a_run`). The first of them
+// to take the gate alone closes it, where it would have closed it on its
+// own; it stays closed after that script, and the next one's take of it
+// takes nothing more. Each script is still alone, and nothing runs between
+// two of them. What that saves is, for every script after the first, the
+// wait for the commands in flight on every thread to end, and the wake of
+// each thread kept out once it is let in again. The gate opens again at the
+// end of the run, and before anything on the thread waits outside the
+// gate: a script sent back to wait out a handoff or a move of its keys,
+// room made before the gates (`reopen_for_a_wait`).
+//
 // It is a different gate from `write_gate`, which exists so that a snapshot
 // can be cut between two whole writes. A cut can last as long as the dataset
 // takes to write out, and must not stop reads; this gate is held alone only
 // for as long as a transaction or a script runs, and has to.
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// More slots than worker threads on any machine this runs on; threads beyond
 /// that share slots, which is correct, just slightly less cache-friendly.
@@ -169,7 +182,31 @@ thread_local! {
     static DEPTH: Cell<u32> = const { Cell::new(0) };
     /// This thread holds the gate alone.
     static ALONE: Cell<bool> = const { Cell::new(false) };
+    /// This thread runs scripts for a run ([`for_a_run`]): the gate, once
+    /// one of them has closed it, stays closed for the next.
+    static ARMED: Cell<bool> = const { Cell::new(false) };
+    /// This thread holds the gate closed for a run (`RUN_CLOSE` is `Some`):
+    /// between two of its scripts, it holds the gate, at a depth of one, and
+    /// `ALONE` is not set.
+    static IN_A_RUN: Cell<bool> = const { Cell::new(false) };
+    /// What holds the gate closed for a run, and since when.
+    static RUN_CLOSE: RefCell<Option<RunClose>> = const { RefCell::new(None) };
 }
+
+/// The gate closed for a run of scripts ([`for_a_run`]).
+#[cfg_attr(not(feature = "lua"), allow(dead_code))]
+struct RunClose {
+    // Let go of in this order: the slots, and then being counted a taker.
+    _slots: Vec<RwLockWriteGuard<'static, ()>>,
+    _taking: Taking,
+    /// When the gate was had.
+    at: std::time::Instant,
+}
+
+/// Times the gate was closed for a run, and the takes of it alone under
+/// those (a script sent back to wait and run again takes it twice) (`INFO stats`: `scripts_alone_runs`, `scripts_in_alone_runs`).
+static RUN_CLOSES: AtomicU64 = AtomicU64::new(0);
+static RUN_SCRIPTS: AtomicU64 = AtomicU64::new(0);
 
 /// Held by a command for as long as it runs.
 pub struct Guard {
@@ -304,17 +341,30 @@ impl Drop for AloneGuard {
 /// From inside a command on this thread — a script queued in a transaction,
 /// a script calling a script — it takes nothing: the thread cannot wait for
 /// itself, and whatever the outer command holds is what orders it.
+///
+/// Nor does it in a run of scripts ([`for_a_run`]) once the gate is closed
+/// for it, where the script that asks is the outermost command: it holds the
+/// gate alone, as it would had it closed it. The first of a run to ask
+/// closes the gate for the run.
 pub fn enter_alone() -> AloneGuard {
+    if ARMED.with(|a| a.get()) && DEPTH.with(|d| d.get() == 0) {
+        close_for_the_run(None);
+    }
     let nested = DEPTH.with(|d| {
         let depth = d.get();
         d.set(depth + 1);
         depth > 0
     });
     if nested {
+        let in_a_run = IN_A_RUN.with(|r| r.get()) && !alone_on_this_thread();
+        if in_a_run {
+            ALONE.with(|a| a.set(true));
+            RUN_SCRIPTS.fetch_add(1, Ordering::Relaxed);
+        }
         return AloneGuard {
             _slots: Vec::new(),
             _taking: None,
-            outermost: false,
+            outermost: in_a_run,
             _not_send: PhantomData,
         };
     }
@@ -339,6 +389,11 @@ pub fn enter_alone_unless(
     if DEPTH.with(|d| d.get() > 0) {
         return Some(enter_alone());
     }
+    if ARMED.with(|a| a.get()) {
+        // The first script of a run, or the first since the gate opened
+        // again: it closes the gate for the run, as it would for itself.
+        return close_for_the_run(Some((slice, &mut give_up))).then(enter_alone);
+    }
     let taking = Taking::begin();
     // On giving up, the slots taken so far are let go of inside.
     let slots = close(Some((slice, &mut give_up)))?;
@@ -350,6 +405,136 @@ pub fn enter_alone_unless(
         outermost: true,
         _not_send: PhantomData,
     })
+}
+
+/// A run of commands that each take the gate alone, run by this thread one
+/// after another (the quick scripts that run alone, by whoever's turn it is:
+/// `lua_vm_blocking`), until this is dropped ([`for_a_run`]).
+#[cfg_attr(not(feature = "lua"), allow(dead_code))]
+pub struct Run {
+    _not_send: PhantomData<*const ()>,
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        let _ = end_the_close();
+        ARMED.with(|a| a.set(false));
+    }
+}
+
+/// Start a run on this thread: the first of its commands to take the gate
+/// alone ([`enter_alone_unless`]) closes it, as it would for itself, and the
+/// gate then stays closed after it. Each later one's take then takes
+/// nothing, and holds the gate alone; between two of them the thread holds
+/// the gate but is not alone in it ([`alone_on_this_thread`] is false), as
+/// before the first, so each finds what it would have found on its own — but
+/// no other command, from any thread, comes between them. A command that
+/// takes the gate shared on this thread meanwhile takes nothing.
+///
+/// What a command does before it takes the gate, it does with the gate open
+/// if it is the one to close it, and closed if a command before it in the run
+/// closed it. Closed, that is only what neither waits nor depends on any
+/// other command: its arity, routing, `BUSY`, `READONLY`, `NOREPLICAS`,
+/// `LOADING` and ACL checks, each a look at a flag, a setting, the client's
+/// own state or a lock held only for a look (a shard's, the ACL users'). A
+/// wait before the gate (the room made for a command over `maxmemory`, the
+/// test stalls) and the wait of a command sent back from the gate to wait out
+/// a handoff or a move of its keys open the gate first
+/// ([`reopen_for_a_wait`]); the next command to take the gate alone closes it
+/// again. The gate opens when the run is dropped, and when
+/// [`reopen_between_scripts`] says.
+///
+/// `None` if the thread is inside a command, or a run, already.
+#[cfg_attr(not(feature = "lua"), allow(dead_code))]
+pub fn for_a_run() -> Option<Run> {
+    if DEPTH.with(|d| d.get() > 0) || ARMED.with(|a| a.get()) {
+        return None;
+    }
+    ARMED.with(|a| a.set(true));
+    Some(Run {
+        _not_send: PhantomData,
+    })
+}
+
+/// For [`enter_alone_unless`] and [`enter_alone`] in a run, at a depth of
+/// none: close the gate for the run. False if `patience`'s `give_up` said yes.
+fn close_for_the_run(patience: Option<(std::time::Duration, &mut dyn FnMut() -> bool)>) -> bool {
+    // Said first, and the slots counted after: see the top.
+    let taking = Taking::begin();
+    let Some(slots) = close(patience) else {
+        return false;
+    };
+    let close = RunClose {
+        _slots: slots,
+        _taking: taking,
+        at: std::time::Instant::now(),
+    };
+    RUN_CLOSE.with(|r| *r.borrow_mut() = Some(close));
+    IN_A_RUN.with(|r| r.set(true));
+    DEPTH.with(|d| d.set(d.get() + 1));
+    RUN_CLOSES.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Open the gate a run holds closed, if this thread holds it so and is
+/// between two commands of the run (at the depth of the close alone).
+/// Whether it opened it.
+fn end_the_close() -> bool {
+    if !IN_A_RUN.with(|r| r.get()) || alone_on_this_thread() || DEPTH.with(|d| d.get() != 1) {
+        return false;
+    }
+    IN_A_RUN.with(|r| r.set(false));
+    DEPTH.with(|d| d.set(0));
+    // The slots, and then the count of takers.
+    drop(RUN_CLOSE.with(|r| r.borrow_mut().take()));
+    true
+}
+
+/// Before this thread waits outside the gate — a command sent back from it
+/// to wait out a handoff or a move of its keys, room made for one before
+/// its gates, a test's stall — in a run ([`for_a_run`]) that holds the gate
+/// closed: open it. Nothing otherwise, and nothing inside a command that
+/// holds the gate alone.
+#[inline]
+pub fn reopen_for_a_wait() {
+    if IN_A_RUN.with(|r| r.get()) {
+        let _ = end_the_close();
+    }
+}
+
+/// In a run, between two of its commands: open the gate if it has been
+/// closed for `budget` or more (not from inside a command). Whether the gate
+/// is closed for the run afterwards, and since when: `None` if it is open.
+#[cfg_attr(not(feature = "lua"), allow(dead_code))]
+pub fn reopen_between_scripts(budget: std::time::Duration) -> Option<std::time::Instant> {
+    let at = RUN_CLOSE.with(|r| r.borrow().as_ref().map(|close| close.at))?;
+    if at.elapsed() >= budget && end_the_close() {
+        return None;
+    }
+    Some(at)
+}
+
+/// Whether this thread holds the gate closed for a run.
+#[cfg(test)]
+fn closed_for_a_run() -> bool {
+    IN_A_RUN.with(|r| r.get())
+}
+
+/// The times the gate was closed for a run, and the commands that took it
+/// alone under those closes (for `INFO stats`).
+#[cfg_attr(not(feature = "lua"), allow(dead_code))]
+pub fn run_counts() -> (u64, u64) {
+    (
+        RUN_CLOSES.load(Ordering::Relaxed),
+        RUN_SCRIPTS.load(Ordering::Relaxed),
+    )
+}
+
+/// `CONFIG RESETSTAT`.
+#[cfg_attr(not(feature = "lua"), allow(dead_code))]
+pub fn reset_run_counts() {
+    RUN_CLOSES.store(0, Ordering::Relaxed);
+    RUN_SCRIPTS.store(0, Ordering::Relaxed);
 }
 
 /// Take every slot in use, in index order, and then `LATE`; count again and
@@ -546,6 +731,110 @@ mod tests {
             }
         }
         panic!("a command never got in beside another");
+    }
+
+    /// A run of alone takes under one close: nothing else runs from its start
+    /// to its end, each take in it holds the gate alone, the thread is not
+    /// alone between two of them, and the gate opens when the run ends.
+    #[test]
+    fn nothing_else_runs_during_a_run_of_alone_takes() {
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let workers: Vec<_> = (0..6)
+            .map(|_| {
+                let in_flight = Arc::clone(&in_flight);
+                let stop = Arc::clone(&stop);
+                crate::cpus::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _guard = enter();
+                        in_flight.fetch_add(1, Ordering::SeqCst);
+                        std::thread::yield_now();
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        let (closes_before, scripts_before) = run_counts();
+        for round in 0..100 {
+            let run = for_a_run().expect("a run");
+            assert!(for_a_run().is_none(), "one run at a time");
+            // Open until its first script closes it.
+            assert!(!closed_for_a_run());
+            for i in 0..5 {
+                assert!(!alone_on_this_thread());
+                if i > 0 {
+                    assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+                    // What a command shared on this thread takes: nothing.
+                    drop(enter());
+                }
+                let script = if i == 0 {
+                    enter_alone_unless(Duration::from_millis(5), || false).expect("the gate")
+                } else {
+                    enter_alone_unless(Duration::from_millis(5), || panic!("it does not wait"))
+                        .expect("in the run")
+                };
+                assert!(alone_on_this_thread());
+                assert!(closed_for_a_run());
+                // Inside the script: nothing opens the gate.
+                reopen_for_a_wait();
+                assert!(reopen_between_scripts(Duration::ZERO).is_some());
+                assert!(closed_for_a_run());
+                let inner = enter_alone();
+                drop(inner);
+                assert!(alone_on_this_thread(), "still the script's");
+                assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+                drop(script);
+                assert!(closed_for_a_run(), "closed for the next");
+            }
+            assert!(!alone_on_this_thread());
+            if round % 2 == 0 {
+                // A wait opens the gate, and the next script closes it again.
+                reopen_for_a_wait();
+                assert!(!closed_for_a_run());
+                // Not one 5 ms try: a test beside this one may hold the
+                // process's gate alone for a while.
+                let entered = crate::cpus::spawn(|| {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    enter_unless(Duration::from_millis(5), || {
+                        std::time::Instant::now() > deadline
+                    })
+                    .is_some()
+                })
+                .join()
+                .unwrap();
+                assert!(entered, "the gate is open while the run waits");
+                let script = enter_alone_unless(Duration::from_millis(5), || false).unwrap();
+                assert!(closed_for_a_run());
+                drop(script);
+                // So does a budget spent.
+                assert!(reopen_between_scripts(Duration::from_secs(60)).is_some());
+                assert!(reopen_between_scripts(Duration::ZERO).is_none());
+                assert!(!closed_for_a_run());
+            }
+            drop(run);
+            assert!(!closed_for_a_run());
+        }
+        let (closes, scripts) = run_counts();
+        // One close for each round's five, and one more after each wait.
+        assert!(closes - closes_before >= 150, "{closes} {closes_before}");
+        assert!(
+            scripts - scripts_before >= 550,
+            "{scripts} {scripts_before}"
+        );
+        // Inside a command, there is no run to start.
+        let command = enter();
+        assert!(for_a_run().is_none());
+        drop(command);
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            w.join().unwrap();
+        }
+        // And the gate opens again: another thread gets in.
+        let entered =
+            crate::cpus::spawn(|| enter_unless(Duration::from_millis(5), || false).is_some())
+                .join()
+                .unwrap();
+        assert!(entered);
     }
 
     #[test]
