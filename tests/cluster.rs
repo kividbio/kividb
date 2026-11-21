@@ -9719,16 +9719,21 @@ fn replica_cut_off_during_an_import(heard: bool, stands: Stands, restarted: bool
             || owner_in_view_of(&replica, 50).as_deref() == Some(dst_id.as_str()),
         );
         // It says which of its master's slots it does not hold.
-        assert_eq!(replica.cluster_info("cluster_slots_not_held_ranges"), "0-100");
+        assert_eq!(
+            replica.cluster_info("cluster_slots_not_held_ranges"),
+            "0-100"
+        );
         assert_eq!(replica.cluster_info("cluster_slots_not_held"), "101");
     }
     if restarted {
         // Its nodes.conf has the slots as its master's, as it heard; that
         // it does not hold them is kept over the restart.
         replica.restart();
-        wait_until("the replica to serve again", Duration::from_secs(20), || {
-            replica.cluster_info("cluster_slots_not_held_ranges") == "0-100"
-        });
+        wait_until(
+            "the replica to serve again",
+            Duration::from_secs(20),
+            || replica.cluster_info("cluster_slots_not_held_ranges") == "0-100",
+        );
     }
     nodes[1].kill();
     let own = ranges[1].0;
@@ -9874,9 +9879,11 @@ fn a_takeover_is_refused_when_another_master_reaches_its_epoch_meanwhile() {
     );
     assert_eq!(owner_in_view_of(&nodes[0], 50), Some(src_id.clone()));
     let again = nodes[1].dir.join("failpoint.takeover-acknowledged.2");
-    wait_until("the next attempt to be held", Duration::from_secs(30), || {
-        again.exists()
-    });
+    wait_until(
+        "the next attempt to be held",
+        Duration::from_secs(30),
+        || again.exists(),
+    );
     std::fs::remove_file(&again).unwrap();
     wait_import_completed(&nodes[1], &task_id);
     wait_until(
@@ -9921,14 +9928,20 @@ fn a_replica_holds_the_slots_of_two_takeovers_that_end_in_the_other_order() {
     let (b0, b1) = (ranges[2].0, ranges[2].0 + 100);
     let first = Written::on(&nodes[0], 0..=100, "first", 100);
     let second = Written::on(&nodes[2], b0..=b1, "second", 100);
-    let held = |n: u32| nodes[1].dir.join(format!("failpoint.takeover-acknowledged.{n}"));
+    let held = |n: u32| {
+        nodes[1]
+            .dir
+            .join(format!("failpoint.takeover-acknowledged.{n}"))
+    };
     let task_a = nodes[1]
         .conn()
         .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "100"])
         .text();
-    wait_until("the first takeover to be held", Duration::from_secs(30), || {
-        held(1).exists()
-    });
+    wait_until(
+        "the first takeover to be held",
+        Duration::from_secs(30),
+        || held(1).exists(),
+    );
     assert_eq!(std::fs::read_to_string(held(1)).unwrap(), task_a);
     let task_b = nodes[1]
         .conn()
@@ -9940,9 +9953,11 @@ fn a_replica_holds_the_slots_of_two_takeovers_that_end_in_the_other_order() {
             &b1.to_string(),
         ])
         .text();
-    wait_until("the second takeover to be held", Duration::from_secs(30), || {
-        held(2).exists()
-    });
+    wait_until(
+        "the second takeover to be held",
+        Duration::from_secs(30),
+        || held(2).exists(),
+    );
     std::fs::remove_file(held(2)).unwrap();
     wait_import_completed(&nodes[1], &task_b);
     wait_until(
@@ -9958,7 +9973,10 @@ fn a_replica_holds_the_slots_of_two_takeovers_that_end_in_the_other_order() {
         Duration::from_secs(20),
         || owner_in_view_of(&replica, 50).as_deref() == Some(dst_id.as_str()),
     );
-    assert_eq!(replica.cluster_info("cluster_slots_not_held_ranges"), "0-100");
+    assert_eq!(
+        replica.cluster_info("cluster_slots_not_held_ranges"),
+        "0-100"
+    );
     std::fs::remove_file(nodes[1].dir.join("stream-stall")).unwrap();
     wait_until(
         "the replica to hold both imports' slots",
@@ -10013,9 +10031,11 @@ fn a_replica_holds_a_slot_its_master_added_and_then_bumped_the_epoch_of() {
         || nodes[1].cluster_info("cluster_current_epoch") == highest,
     );
     std::fs::write(replica.dir.join(LINK_DOWN.1), "").unwrap();
-    wait_until("the replica's link to be down", Duration::from_secs(20), || {
-        replica.repl_info("master_link_status").as_deref() == Some("down")
-    });
+    wait_until(
+        "the replica's link to be down",
+        Duration::from_secs(20),
+        || replica.repl_info("master_link_status").as_deref() == Some("down"),
+    );
     assert!(
         nodes[1]
             .conn()
@@ -10080,7 +10100,10 @@ fn a_replica_holds_its_masters_slots_after_a_full_sync_from_a_restarted_master()
         Duration::from_secs(20),
         || owner_in_view_of(&replica, 50).as_deref() == Some(dst_id.as_str()),
     );
-    assert_eq!(replica.cluster_info("cluster_slots_not_held_ranges"), "0-100");
+    assert_eq!(
+        replica.cluster_info("cluster_slots_not_held_ranges"),
+        "0-100"
+    );
     nodes[1].kill();
     nodes[1].spawn();
     cut_off(&replica, false, true);

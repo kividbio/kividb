@@ -2058,7 +2058,7 @@ pub async fn handle_client(
                                 crate::deferred::Offload::Rerun(_)
                                     | crate::deferred::Offload::RerunAlone(_)
                             )
-                                .then(|| client_env!());
+                            .then(|| client_env!());
                             // Boxed, as the park below is: cold.
                             let reply = Box::pin(offloaded(
                                 offload,
@@ -2191,11 +2191,11 @@ pub async fn handle_client(
                     // reset one is found when the reply is written.
                     if let Some(offload) = wait.take_offload() {
                         let env = matches!(
-                                offload,
-                                crate::deferred::Offload::Rerun(_)
-                                    | crate::deferred::Offload::RerunAlone(_)
-                            )
-                            .then(|| client_env!());
+                            offload,
+                            crate::deferred::Offload::Rerun(_)
+                                | crate::deferred::Offload::RerunAlone(_)
+                        )
+                        .then(|| client_env!());
                         // Boxed, as the park below is: cold.
                         let reply = Box::pin(offloaded(
                             offload,

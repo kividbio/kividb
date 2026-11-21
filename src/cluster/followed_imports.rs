@@ -1711,7 +1711,10 @@ mod tests {
         let text = f.not_held_text().unwrap();
         assert_eq!(
             text,
-            format!("master {}\n10-11 5\n12-12 6\n20-20 6\nend\n", node_id_str(&m))
+            format!(
+                "master {}\n10-11 5\n12-12 6\n20-20 6\nend\n",
+                node_id_str(&m)
+            )
         );
         let (of, slots) = parse_not_held(&text).unwrap();
         assert_eq!(of, m);
