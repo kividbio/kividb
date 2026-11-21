@@ -2526,7 +2526,12 @@ fn one_owner(nodes: &[&Node], owner: &Node, key: &str) -> Result<(), String> {
 /// Wait until [`one_owner`] holds; on a timeout, say how it did not and
 /// show the logs of `nodes`.
 fn wait_one_owner(nodes: &[&Node], owner: &Node, key: &str) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    wait_one_owner_within(nodes, owner, key, Duration::from_secs(30));
+}
+
+/// [`wait_one_owner`], for up to `limit`.
+fn wait_one_owner_within(nodes: &[&Node], owner: &Node, key: &str, limit: Duration) {
+    let deadline = Instant::now() + limit;
     loop {
         let seen = one_owner(nodes, owner, key);
         let Err(why) = seen else {
@@ -2537,7 +2542,11 @@ fn wait_one_owner(nodes: &[&Node], owner: &Node, key: &str) {
                 .iter()
                 .map(|n| format!("==== node {}\n{}", n.port, n.log()))
                 .collect();
-            panic!("no single owner after 30 s: {why}\n{}", logs.join("\n"));
+            panic!(
+                "no single owner after {} s: {why}\n{}",
+                limit.as_secs(),
+                logs.join("\n")
+            );
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -3174,10 +3183,23 @@ fn as_before_they_joined(node: &Node, gone: &[String], to: &str) {
 /// the node's view; two of seven is not, and it does not complete the
 /// promotion. Once the partition heals, every node has the one elected as
 /// the one owner.
+///
+/// The partition stalls the buses of five nodes for longer than a node
+/// timeout, and the heal wakes them together: until each has heard from the
+/// others again it holds them as unreachable, and between them they can
+/// mark the one elected FAIL for a moment, longer on a busy machine. The
+/// restarted node, which follows the one elected from then on, could be
+/// elected in its place then. So its own bus is stalled through the heal,
+/// until the others agree on the owner; then it runs, and follows it.
 #[test]
 fn a_node_whose_nodes_conf_lists_fewer_masters_counts_the_reported_ones() {
     let (mut nodes, ranges) = form_cluster_with_env(7, &[BUS_CONTROL, IGNORE_CLAIMS]);
-    let mut replica = replica_whose_saves_can_fail(&nodes, &nodes[0]);
+    let mut replica = add_replica_with(
+        &nodes,
+        &nodes[0],
+        &["--aof", "--appendfsync", "always"],
+        &[FAILING_SAVES, BUS_CONTROL],
+    );
     let other = add_replica_with_env(&nodes, &nodes[0], &[BUS_CONTROL]);
     let mut all: Vec<&Node> = nodes.iter().collect();
     all.extend([&replica, &other]);
@@ -3289,6 +3311,11 @@ fn a_node_whose_nodes_conf_lists_fewer_masters_counts_the_reported_ones() {
     assert!(!replica.is_master());
     assert!(!replica.log().contains("Completing the promotion"));
 
+    // The heal, the restarted node's bus stalled through it (see above).
+    set_bus(&replica, "stall");
+    wait_until("the bus to stall", Duration::from_secs(10), || {
+        replica.log().contains("the bus is stalled")
+    });
     for node in nodes[3..].iter().chain([&other]) {
         set_bus(node, "run");
     }
@@ -3296,13 +3323,20 @@ fn a_node_whose_nodes_conf_lists_fewer_masters_counts_the_reported_ones() {
         std::fs::remove_file(node.dir.join(IGNORE_CLAIMS.1)).unwrap();
     }
     let mut live: Vec<&Node> = nodes[1..].iter().collect();
-    live.extend([&replica, &other]);
-    wait_one_owner(&live, &other, &before);
+    live.push(&other);
+    wait_one_owner_within(&live, &other, &before, Duration::from_secs(90));
+    set_bus(&replica, "run");
+    wait_until("the bus to run again", Duration::from_secs(10), || {
+        replica.log().contains("the bus runs again")
+    });
+    live.push(&replica);
+    wait_one_owner_within(&live, &other, &before, Duration::from_secs(90));
     wait_until(
         "the restarted node to follow the one elected",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         || !replica.is_master() && replica.my_row()[3] == other_id,
     );
+    assert!(!replica.log().contains("Completing the promotion"));
 }
 
 /// Between the slots taken and the replication layer made master (held
