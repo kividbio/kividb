@@ -189,8 +189,11 @@ const LITTLE_BACK: u64 = 32;
 
 /// How long the slab-waste trigger stays off after a pass that got little
 /// back, doubled for each such pass in a row.
-const WASTE_BACKOFF: Duration = Duration::from_secs(30);
-const WASTE_BACKOFF_MAX: Duration = Duration::from_secs(600);
+/// Short: under writes a pass gets little back (they make new room as fast
+/// as it is taken), and once they stop, the next pass should not be long in
+/// coming. At most one pass a minute that gets nothing.
+const WASTE_BACKOFF: Duration = Duration::from_secs(10);
+const WASTE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static IGNORE_BYTES: AtomicU64 = AtomicU64::new(64 << 20);
@@ -1044,7 +1047,7 @@ mod trigger_tests {
             assert!(!streak.slab_waste_on());
             offs.push(streak.waste_off.as_secs());
         }
-        assert_eq!(offs, [30, 60, 120, 240, 480, 600, 600]);
+        assert_eq!(offs, [10, 20, 40, 60, 60, 60, 60]);
         streak.waste_pass_ended(true);
         assert!(streak.slab_waste_on());
         streak.waste_pass_ended(false);

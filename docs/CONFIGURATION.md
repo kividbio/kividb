@@ -199,7 +199,7 @@ the round ends, so a round takes at most a 128th of the slabs' size in new slabs
 1 MiB), which keeps the peak during a churn within about 1 % of what it is with active
 defrag off. A pass that the slab-waste trigger started and that got little back (the slabs it
 emptied, less the new ones it took, under one in 32 of those it emptied) keeps that trigger off
-for 30 seconds, then twice as long each time in a row, up to 10 minutes. All of these change
+for 10 seconds, then twice as long each time in a row, up to a minute. All of these change
 at run time with `CONFIG SET`.
 
 `INFO memory` shows the slabs (`value_slab_bytes`), the values in them

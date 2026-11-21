@@ -1612,7 +1612,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   seconds, a round ends when a large delete or its refill starts, and no
   pass starts while a snapshot, an AOF rewrite or a backup is written. A pass the
   slab-waste trigger started that got little back keeps that trigger off
-  for 30 s, doubling up to 10 min. New `INFO memory` fields:
+  for 10 s, doubling up to a minute. New `INFO memory` fields:
   `value_slab_full_free_bytes`, `active_defrag_passes`,
   `active_defrag_slabs_emptied`, `active_defrag_last_pass_ms`. Measured on
   an Azure D8s_v5 (`benchmarks/1.3.0/regressions/suites/43-slab-churn.py`),
