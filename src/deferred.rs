@@ -64,7 +64,7 @@ pub fn mark_ring_thread() {
     RING.with(|ring| ring.set(true));
 }
 
-fn on_ring_thread() -> bool {
+pub fn on_ring_thread() -> bool {
     RING.with(|ring| ring.get())
 }
 

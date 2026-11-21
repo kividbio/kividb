@@ -169,9 +169,22 @@ pub(crate) struct FollowedImports {
     /// look than the last one written (see [`write_down`]).
     looks: std::sync::atomic::AtomicU64,
     written: Mutex<u64>,
+    /// The imports this node saw begin in its master's stream (the marker
+    /// of the moment its master looked at its own keys), in the session it
+    /// is in: forgotten at every session's start, a full sync's or a
+    /// partial one's ([`Self::seen_importing`]). By import id, its slots.
+    seen_live: Mutex<std::collections::HashMap<String, Ranges>>,
 }
 
 impl FollowedImports {
+    /// The slots of the imports into this node's master that this node saw
+    /// begin in its master's stream, in a session not resynced since: what
+    /// a vote's `UPDATE` may give it of its master's claims (see
+    /// `ClusterState::master_claims_seen`).
+    pub(crate) fn seen_importing(&self) -> Vec<Ranges> {
+        self.seen_live.lock().values().cloned().collect()
+    }
+
     /// The imports known, as they stand.
     pub(crate) fn list(&self) -> Vec<Followed> {
         self.imports.lock().clone()
@@ -326,7 +339,7 @@ fn take_in_masters_claim(cluster: &ClusterState, epoch: u64, ranges: &[(u16, u16
     let Some(master) = cluster.my_master_id() else {
         return;
     };
-    if ranges.is_empty() {
+    if ranges.is_empty() || test_ignores_stream_claims() {
         return;
     }
     // The claim of the master whose stream this is: taken in only while it
@@ -345,6 +358,14 @@ fn take_in_masters_claim(cluster: &ClusterState, epoch: u64, ranges: &[(u16, u16
         return;
     }
     cluster.take_in_claims_of_master(master, epoch, ranges);
+}
+
+/// For the tests of a replica that has not taken in its master's claim:
+/// `KIVIDB_TEST_IGNORE_STREAM_CLAIMS`, set, has this node take in no `TAKEN`
+/// marker. Never set otherwise.
+fn test_ignores_stream_claims() -> bool {
+    static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| std::env::var_os("KIVIDB_TEST_IGNORE_STREAM_CLAIMS").is_some())
 }
 
 /// A marker read back: whether it is `LIVE`, and what it lists. `None` if
@@ -460,6 +481,9 @@ pub(crate) fn on_event(
     let followed = &cluster.followed_imports;
     match event {
         SlotImportsEvent::Session { marked, full } => {
+            // A new session: what this node saw begin in the last one is
+            // not known to be in this one's data in full.
+            followed.seen_live.lock().clear();
             let mut imports = followed.imports.lock();
             if (marked && !full) || imports.is_empty() {
                 return;
@@ -499,6 +523,7 @@ pub(crate) fn on_event(
             // does, at most `HELD_BEFORE_MAX_KEYS` names or 64 MiB; the
             // replica applies and acknowledges nothing meanwhile.
             let wanted = to_note(&followed.imports.lock(), live, &listed);
+            followed.seen_live.lock().extend(wanted.iter().cloned());
             let noted: Vec<(String, Arc<HeldBefore>)> = wanted
                 .into_iter()
                 .map(|(id, ranges)| (id, Arc::new(HeldBefore::note(store, &ranges))))

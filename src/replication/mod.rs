@@ -687,18 +687,34 @@ impl ReplState {
     }
 
     /// On a thread that may block (off the runtime, holding no gate or
-    /// lock): wait until every replica attached has acknowledged everything
-    /// this master has written before now, and at least `known` replicas
-    /// attached and online have, or until `deadline`. Whether they have.
+    /// lock): wait until each replica named in `required` (by the addresses
+    /// it may link from: an IP and its `REPLCONF listening-port`) has a link to
+    /// this master, online, that has acknowledged everything written before
+    /// now, and each one named in `if_attached` that has a link has; or
+    /// until `deadline`. The first one that has not, if one has not.
+    /// Links of other replicas neither count nor hold the wait up.
     ///
     /// A hub barrier first, as `WAIT` takes one: every write handed to the
-    /// hub before now has been fanned out, and each replica's target is
-    /// what it has been sent. A replica that attaches meanwhile counts once
-    /// it has acknowledged what it had been sent when first seen (its full
-    /// sync or its backlog covers the rest); one that goes is not waited
-    /// for, and does not count towards `known`.
-    pub fn replicas_have_all_blocking(&self, known: usize, deadline: std::time::Instant) -> bool {
+    /// hub before now has been fanned out, and each link's target is what it
+    /// has been sent. A link that attaches meanwhile counts once it has
+    /// acknowledged what it had been sent when first seen (its full sync or
+    /// its backlog covers the rest).
+    pub fn replicas_have_all_blocking(
+        &self,
+        required: &[Vec<(String, u16)>],
+        if_attached: &[Vec<(String, u16)>],
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
         let pause = || std::thread::sleep(std::time::Duration::from_millis(1));
+        let name = |addrs: &Vec<(String, u16)>| {
+            addrs
+                .first()
+                .map(|(ip, port)| format!("{ip}:{port}"))
+                .unwrap_or_default()
+        };
+        if required.is_empty() && if_attached.is_empty() {
+            return Ok(());
+        }
         if !self.replica_progress.lock().is_empty()
             && let Some(hub) = self.hub.get().and_then(|w| w.upgrade())
         {
@@ -708,7 +724,7 @@ impl ReplState {
                     barrier_rx.try_recv()
                 {
                     if std::time::Instant::now() >= deadline {
-                        return false;
+                        return Err(required.first().or(if_attached.first()).map(name).unwrap_or_default());
                     }
                     pause();
                 }
@@ -717,6 +733,7 @@ impl ReplState {
         let mut targets: std::collections::HashMap<u64, (Arc<ReplicaProgress>, u64)> =
             std::collections::HashMap::new();
         loop {
+            let links: Vec<(u64, String, u16)> = self.replica_peers.lock().clone();
             {
                 let live = self.replica_progress.lock();
                 targets.retain(|id, _| live.contains_key(id));
@@ -726,15 +743,35 @@ impl ReplState {
                         .or_insert_with(|| (Arc::clone(p), p.sent.load(Ordering::Relaxed)));
                 }
             }
-            let done = targets
-                .values()
-                .filter(|(p, target)| p.state() == ReplicaState::Online && p.delivered() >= *target)
-                .count();
-            if done == targets.len() && done >= known {
-                return true;
-            }
+            let caught_up = |id: u64| {
+                targets.get(&id).is_some_and(|(p, target)| {
+                    p.state() == ReplicaState::Online && p.delivered() >= *target
+                })
+            };
+            let links_of = |addrs: &Vec<(String, u16)>| {
+                links
+                    .iter()
+                    .filter(|(id, lip, lport)| {
+                        targets.contains_key(id)
+                            && addrs.iter().any(|(ip, port)| lip == ip && lport == port)
+                    })
+                    .map(|(id, _, _)| *id)
+                    .collect::<Vec<u64>>()
+            };
+            let behind = required
+                .iter()
+                .find(|r| !links_of(r).into_iter().any(caught_up))
+                .or_else(|| {
+                    if_attached.iter().find(|r| {
+                        let ids = links_of(r);
+                        !ids.is_empty() && !ids.into_iter().any(caught_up)
+                    })
+                });
+            let Some(behind) = behind else {
+                return Ok(());
+            };
             if self.is_slave() || std::time::Instant::now() >= deadline {
-                return false;
+                return Err(name(behind));
             }
             pause();
         }
@@ -3600,7 +3637,10 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
         // And of the slots this master took over: the last `TAKEN` marker,
         // with the stream's offset where it was sent (it belongs after the
         // writes before it, and before those after it).
-        let mut slot_claims_sync: Option<(ReplPayload, u64)> = None;
+        // In the stream's order: the last one at or before the backlog's
+        // start, and every one after it (the backlog may be continued from
+        // any point in it).
+        let mut slot_claims_sync: Vec<(ReplPayload, u64)> = Vec::new();
         // Queues of replicas let go of for falling too far behind, until
         // their forwarders have let go of what is in them (see
         // `ReplicaQueue::abandon`): memory still held for a replica.
@@ -3881,24 +3921,39 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         // it. A replica that acknowledges a write after it
                         // has it, and none acknowledges one before it has
                         // what came before.
-                        let delivered = told
-                            && match slot_claims_sync
-                                .as_ref()
-                                .filter(|_| registration.slot_imports)
-                            {
-                                Some((claims, at)) => {
-                                    let cut =
-                                        (at.saturating_sub(offset) as usize).min(missed.len());
-                                    send(&missed[..cut])
-                                        && queue_marker(
-                                            &registration.tx,
-                                            &registration.pending_bytes,
-                                            claims,
-                                        )
-                                        && send(&missed[cut..])
-                                }
-                                None => send(&missed),
+                        let delivered = told && {
+                            let kept: &[(ReplPayload, u64)] = if registration.slot_imports {
+                                &slot_claims_sync
+                            } else {
+                                &[]
                             };
+                            // The last claim at or before its position first,
+                            // then each later one in its place.
+                            let mut ok = kept
+                                .iter()
+                                .rev()
+                                .find(|(_, at)| *at <= offset)
+                                .is_none_or(|(claims, _)| {
+                                    queue_marker(
+                                        &registration.tx,
+                                        &registration.pending_bytes,
+                                        claims,
+                                    )
+                                });
+                            let mut from = 0usize;
+                            for (claims, at) in kept.iter().filter(|(_, at)| *at > offset) {
+                                let cut = ((at - offset) as usize).min(missed.len());
+                                ok = ok
+                                    && send(&missed[from..cut])
+                                    && queue_marker(
+                                        &registration.tx,
+                                        &registration.pending_bytes,
+                                        claims,
+                                    );
+                                from = cut;
+                            }
+                            ok && send(&missed[from..])
+                        };
                         if !delivered {
                             forget_replica(&state, registration.replica_id);
                             continue;
@@ -4046,8 +4101,9 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     backlog.align(base);
                     // The dataset sent is at `base`: a claim kept from
                     // before is in it.
-                    if let Some((_, at)) = slot_claims_sync.as_mut() {
-                        *at = (*at).min(base);
+                    if let Some((claims, at)) = slot_claims_sync.pop() {
+                        slot_claims_sync.clear();
+                        slot_claims_sync.push((claims, at.min(base)));
                     }
                     state.backlog_active.store(true, Ordering::Relaxed);
                     // Already done at the cut by `begin_full_sync`; a no-op
@@ -4063,7 +4119,7 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     // marker (`replica_client`), so it has the claim too.
                     if slot_imports
                         && !(slot_claims_sync
-                            .as_ref()
+                            .last()
                             .is_none_or(|(claims, _)| queue_marker(&tx, &pending_bytes, claims))
                             && queue_marker(
                                 &tx,
@@ -4114,7 +4170,14 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                         forget_replica(&state, replica.id);
                         false
                     });
-                    slot_claims_sync = Some((marker, backlog.end));
+                    slot_claims_sync.push((marker, backlog.end));
+                    // Of those at or before the backlog's start, only the
+                    // last can be sent again.
+                    let start = backlog.start();
+                    let before = slot_claims_sync.iter().filter(|(_, at)| *at <= start).count();
+                    if before > 1 {
+                        slot_claims_sync.drain(..before - 1);
+                    }
                 }
 
                 HubMsg::Propagate(payload) => {
@@ -7288,6 +7351,91 @@ mod replication_invariants_tests {
             },
             QueueRx::new(rx, queue),
         )
+    }
+
+    /// The claims of slots this master took over (`TAKEN` markers, kept with
+    /// their place in the stream) reach a replica continued from the
+    /// backlog in their places in what it missed, after the writes before
+    /// each and before those after; the last one at or before its position
+    /// comes first. A replica sent the dataset in full gets the last claim
+    /// before the imports marker. A replica that takes no markers gets none.
+    #[tokio::test]
+    async fn kept_claims_reach_a_replica_in_their_places() {
+        let state = Arc::new(ReplState::new_master());
+        let hub = start_hub(Arc::clone(&state));
+        hub.send(HubMsg::Resume { offset: 100 }).unwrap();
+        let w = |k: &str| format!("*3\r\n$3\r\nSET\r\n$1\r\n{k}\r\n$1\r\nv\r\n").into_bytes();
+        let n = w("a").len() as u64;
+        let m1: ReplPayload = Arc::from(&b"M1"[..]);
+        let m2: ReplPayload = Arc::from(&b"M2"[..]);
+        propagate(&hub, w("a"));
+        hub.send(HubMsg::SlotClaims {
+            marker: Arc::clone(&m1),
+        })
+        .unwrap();
+        propagate(&hub, w("b"));
+        hub.send(HubMsg::SlotClaims {
+            marker: Arc::clone(&m2),
+        })
+        .unwrap();
+        propagate(&hub, w("c"));
+        settle(&hub).await;
+        let imports = no_slot_imports();
+
+        let continued = |id: u64, offset: u64, markers: bool| {
+            let hub = hub.clone();
+            async move {
+                let (mut r, mut rx) = registration(id, id as u16);
+                r.slot_imports = markers;
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                hub.send(HubMsg::Continue {
+                    registration: r,
+                    offset,
+                    reply,
+                })
+                .unwrap();
+                assert!(answer.await.unwrap().is_ok());
+                settle(&hub).await;
+                let mut got: Vec<Vec<u8>> = Vec::new();
+                while let Ok(Some(p)) =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+                {
+                    got.push(p.to_vec());
+                }
+                got
+            }
+        };
+        let v = |b: &ReplPayload| b.to_vec();
+        assert_eq!(
+            continued(7201, 100, true).await,
+            vec![v(&imports), w("a"), v(&m1), w("b"), v(&m2), w("c")]
+        );
+        assert_eq!(
+            continued(7202, 100 + n, true).await,
+            vec![v(&imports), v(&m1), w("b"), v(&m2), w("c")]
+        );
+        assert_eq!(
+            continued(7203, 100 + 2 * n, true).await,
+            vec![v(&imports), v(&m2), w("c")]
+        );
+        let without: Vec<u8> = [w("a"), w("b"), w("c")].concat();
+        assert_eq!(continued(7204, 100, false).await.concat(), without);
+
+        let (r, mut rx) = registration(7205, 7205);
+        hub.send(HubMsg::RegisterChannel {
+            addr: r.addr,
+            peer_ip: r.peer_ip,
+            peer_port: r.peer_port,
+            tx: r.tx,
+            replica_id: 7205,
+            pending_bytes: r.pending_bytes,
+            base: 100 + 3 * n,
+            slot_imports: true,
+        })
+        .unwrap();
+        settle(&hub).await;
+        assert_eq!(rx.recv().await.unwrap().to_vec(), v(&m2));
+        assert_eq!(rx.recv().await.unwrap().to_vec(), v(&imports));
     }
 
     /// A replica back by partial resync with an N-byte backlog is counted by

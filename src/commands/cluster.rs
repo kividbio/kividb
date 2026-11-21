@@ -1819,6 +1819,8 @@ fn cmd_migration(ctx: &mut Ctx) -> Vec<u8> {
                             text(task.state.name()),
                             text("last_error"),
                             text(&task.last_error),
+                            text("takeover_refused"),
+                            text(&task.takeover_refused),
                             text("retries"),
                             number(task.retries),
                             text("create_time"),
@@ -1896,14 +1898,21 @@ fn cmd_syncslots(ctx: &mut Ctx) -> Vec<u8> {
             // It waits (see `migration::take_over`): on an io_uring worker,
             // run on a thread of its own, while the worker serves its other
             // connections.
-            if !crate::deferred::running_elsewhere()
-                && crate::deferred::run_elsewhere(
+            if crate::deferred::on_ring_thread() && !crate::deferred::running_elsewhere() {
+                if crate::deferred::run_elsewhere(
                     &mut ctx.blocking,
                     &ctx.cmd,
                     crate::commands::helpers::LONG_WORK,
-                )
-            {
-                return crate::pause::HELD_IN_GATE.to_vec();
+                ) {
+                    return crate::pause::HELD_IN_GATE.to_vec();
+                }
+                // Not where it can wait without holding up the worker's
+                // other connections: refused, and the source keeps the
+                // slots (it asks, and is told they were not taken).
+                return resp_error(
+                    "ERR the takeover cannot wait on this connection: the slots stay with \
+                     the source",
+                );
             }
             let pause_ms = migration::write_pause_timeout_ms(ctx.config);
             done(migration::take_over(

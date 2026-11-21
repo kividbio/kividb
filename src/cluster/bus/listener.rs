@@ -761,7 +761,15 @@ pub(crate) fn apply_update(
                 .join(","),
             owner.config_epoch
         );
-        state.apply_peer_slot_claims(owner.id, &owner.claims);
+        // Of this node's own master, only the slots it owns here already,
+        // and those this node saw it begin to import (`master_claims_seen`):
+        // a replica that did not may not hold their keys.
+        if state.my_master_id() == Some(owner.id) {
+            let claims = state.master_claims_seen(owner.id, &owner.claims);
+            state.apply_peer_slot_claims(owner.id, &claims);
+        } else {
+            state.apply_peer_slot_claims(owner.id, &owner.claims);
+        }
     }
     drop(forgotten);
     state.save_soon();
