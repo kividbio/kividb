@@ -259,6 +259,15 @@ impl Backlog {
         Some((w.ticket, Arc::clone(&w.vector), w.doc))
     }
 
+    /// `key`'s vector, if `ticket` is still its own, has no job queued:
+    /// its writer links it ([`put_ordered`]).
+    fn unqueue(&self, key: &str, ticket: u64) {
+        let mut waiting = self.waiting.write();
+        if let Some(w) = waiting.get_mut(key).filter(|w| w.ticket == ticket) {
+            w.queued = false;
+        }
+    }
+
     /// Take `key`'s vector out if `ticket` is still its own: it is linked.
     fn done(&self, key: &str, ticket: u64) {
         let mut waiting = self.waiting.write();
@@ -354,6 +363,54 @@ pub(super) fn write_one(
     });
     drop(jobs);
     POOL.ready.notify_one();
+}
+
+/// A vector set's write of `vector` (as the graph stores it) for `key`,
+/// made under the set's own lock, which orders the writes of every element
+/// of the set: the vector waits in the backlog from here on, so a search
+/// finds it, and a helper links it. `Some(ticket)` when no helper will (none
+/// runs, the backlog is full, or the graph has no slots yet): the caller
+/// links it with [`link_ordered`] once it has let go of the set's lock, so
+/// that a long link never holds the set. A later write of the key that
+/// comes in between makes the ticket stale, and that write links its own.
+pub(crate) fn put_ordered(
+    index: &Arc<HnswIndex>,
+    key: &str,
+    vector: Arc<[f32]>,
+    metric: &DistanceMetric,
+) -> Option<u64> {
+    let most = limit(vector.len());
+    let first = index.slots().is_none_or(|s| s.dim() != vector.len());
+    let (ticket, waiting, job) = index.backlog.put(key, vector, super::postings::NO_DOC);
+    let own = first
+        || helpers() == 0
+        || waiting > most
+        || (job.is_some() && index.backlog.queued() >= 2 * most);
+    if own {
+        if job.is_some() {
+            // No job goes into the queue for it: the next write of the key
+            // queues one of its own.
+            index.backlog.unqueue(key, ticket);
+        }
+        return Some(ticket);
+    }
+    let key = job?; // else the key's queued job takes this vector
+    index.backlog.jobs.fetch_add(1, AcqRel);
+    let mut jobs = POOL.jobs.lock();
+    jobs.push_back(Job {
+        index: Arc::downgrade(index),
+        key,
+        metric: metric.clone(),
+    });
+    drop(jobs);
+    POOL.ready.notify_one();
+    None
+}
+
+/// Link the vector [`put_ordered`] left to its caller, if `ticket` is
+/// still the key's.
+pub(crate) fn link_ordered(index: &Arc<HnswIndex>, key: &str, ticket: u64, metric: &DistanceMetric) {
+    link_own(index, key, ticket, metric);
 }
 
 /// Link `key`'s waiting vector into the graph if `ticket` is still its own:

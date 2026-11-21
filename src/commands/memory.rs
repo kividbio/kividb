@@ -208,12 +208,21 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
                         + entry.attrs.as_ref().map_or(0, |a| a.len())
                 })
             });
+            // The graph, once the set has one: f32 vectors and links, and
+            // each name twice more (the name's heap bytes, sampled).
+            let graph = inner.graph.get().map_or(0, |graph| {
+                let names = layout::sampled(inner.entries.len(), samples, || {
+                    inner.entries.keys().map(|name| name.as_bytes().len())
+                });
+                graph.bytes(names)
+            });
             entry()
                 + layout::arc_of::<RwLock<crate::types::VectorSetInner>>()
                 + layout::std_hash_map::<crate::key_bytes::KeyBytes, crate::types::VSetEntry>(
                     inner.entries.capacity(),
                 )
                 + elements
+                + graph
         }
 
         ValueRef::Array(arc) => {

@@ -2749,7 +2749,11 @@ fn read_image_body(
                         vs.entries.insert(name, VSetEntry { vector, attrs });
                     }
 
-                    KiviDBValue::VectorSet(Arc::new(parking_lot::RwLock::new(vs)))
+                    let set = Arc::new(parking_lot::RwLock::new(vs));
+                    // Its graph is made from the elements, in the background
+                    // (`VSIM` scans until it is): nothing of it is saved.
+                    crate::vector::vset_graph::request_build(&set, &set.read());
+                    KiviDBValue::VectorSet(set)
                 }
                 TAG_HASH_EX => {
                     let mut count_buf = [0u8; 4];

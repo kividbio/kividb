@@ -9,6 +9,7 @@ pub mod simd;
 pub mod slots;
 pub mod stem;
 pub mod text;
+pub mod vset_graph;
 use crate::cpus::BuilderExt as _;
 use crate::store::ValueRef;
 use ahash::AHashMap;

@@ -250,6 +250,17 @@ pub struct VectorSetInner {
     pub quant: crate::vector::quant::Quant,
     /// Unchosen and legacy sets accept any quantization option and stay f32.
     pub quant_chosen: bool,
+    /// The graph's `M` and the `EF` its inserts explore, from the `VADD`
+    /// that made the set (Redis's 16 and 200 otherwise). Not saved: a set
+    /// loaded, restored or copied has the defaults.
+    pub m: usize,
+    pub ef_construction: usize,
+    /// The graph `VSIM` searches once the set is large enough
+    /// (`vector::vset_graph`): made from the elements, never saved.
+    pub graph: crate::vector::vset_graph::GraphCell,
+    /// `VINFO`'s `vset-uid`: this set's number among those made since the
+    /// server started.
+    pub uid: u64,
 }
 
 impl VectorSetInner {
@@ -259,12 +270,17 @@ impl VectorSetInner {
 
     // Add a constructor that accepts a metric
     pub fn with_metric(dim: usize, metric: DistanceMetric) -> Self {
+        static UIDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Self {
             dim,
             entries: AHashMap::new(),
             metric,
             quant: crate::vector::quant::Quant::F32,
             quant_chosen: false,
+            m: crate::vector::vset_graph::DEFAULT_M,
+            ef_construction: crate::vector::vset_graph::DEFAULT_BUILD_EF,
+            graph: Default::default(),
+            uid: UIDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
