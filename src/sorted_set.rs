@@ -1772,9 +1772,10 @@ mod tests {
         assert_eq!(order(&repeated), order(&once));
         assert_eq!(repeated.capacity(), once.capacity());
         // Each table has its own random seed, so their overflow groups
-        // differ a little.
+        // differ a little (a handful of groups in some eighteen kilobytes); a
+        // table sized for the hundred thousand arguments would be megabytes.
         let (a, b) = (repeated.allocation_size(), once.allocation_size());
-        assert!(a.abs_diff(b) * 20 <= b, "{a} against {b}");
+        assert!(a.abs_diff(b) * 4 <= b, "{a} against {b}");
         own_limits(None);
     }
 

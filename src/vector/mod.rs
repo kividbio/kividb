@@ -2681,6 +2681,9 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
                     {
                         continue;
                     }
+                    // Once per command, whatever it writes to how many
+                    // indexes; the walks over the keys do not come here.
+                    backlog::count_write();
                     backlog::write(idx, key, vec, &metric, doc);
                 }
             }
