@@ -938,6 +938,15 @@ impl SortedSetInner {
         matches!(&self.repr, Repr::Large(large) if large.queued)
     }
 
+    /// The large form, if the set is in it (tests).
+    #[cfg(test)]
+    pub(crate) fn large(&self) -> Option<&Large> {
+        match &self.repr {
+            Repr::Large(large) => Some(large),
+            Repr::Packed(_) => None,
+        }
+    }
+
     /// Finish whatever resize is in progress now, and free what it leaves
     /// (tests).
     #[cfg(test)]

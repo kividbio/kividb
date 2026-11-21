@@ -1049,6 +1049,12 @@ impl<O: ScoreOrder, A: Memory> Large<O, A> {
         let back = self.index.iter().rev().count();
         assert_eq!(back, n);
     }
+
+    /// The addresses of the entries the index holds, in its order (tests).
+    #[cfg(test)]
+    pub(crate) fn index_addrs(&self) -> Vec<usize> {
+        self.index.iter().map(|(_, entry)| entry.addr()).collect()
+    }
 }
 
 impl<O: ScoreOrder, A: Memory> Clone for Large<O, A> {
