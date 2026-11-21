@@ -314,7 +314,10 @@ pub fn request_build(set: &Arc<RwLock<VectorSetInner>>, inner: &VectorSetInner) 
         Arc::new(VsetGraph::new(inner.m, inner.ef_construction, encoding))
     });
     if made {
-        queue(Arc::downgrade(set), Arc::clone(graph));
+        // The elements there are now, under the lock that gave the set its
+        // graph: each written after this hands itself over.
+        let names = inner.entries.keys().cloned().collect();
+        queue(Arc::downgrade(set), Arc::downgrade(graph), names);
     }
 }
 
@@ -387,9 +390,13 @@ pub fn name_of(hit: &KnnResult) -> std::borrow::Cow<'_, [u8]> {
 
 // ── The builder ──────────────────────────────────────────────────────────────
 
+/// A set to build the graph of. Weak, both: a set deleted (`DEL`,
+/// `FLUSHALL`, its expiry) while its build waits in the queue is freed at
+/// once, graph and all.
 struct Build {
     set: Weak<RwLock<VectorSetInner>>,
-    graph: Arc<VsetGraph>,
+    graph: Weak<VsetGraph>,
+    names: Vec<crate::key_bytes::KeyBytes>,
 }
 
 struct Builds {
@@ -403,7 +410,11 @@ static BUILDS: Builds = Builds {
 };
 static BUILDER: std::sync::Once = std::sync::Once::new();
 
-fn queue(set: Weak<RwLock<VectorSetInner>>, graph: Arc<VsetGraph>) {
+fn queue(
+    set: Weak<RwLock<VectorSetInner>>,
+    graph: Weak<VsetGraph>,
+    names: Vec<crate::key_bytes::KeyBytes>,
+) {
     BUILDER.call_once(|| {
         use crate::cpus::BuilderExt;
         let started = std::thread::Builder::new()
@@ -413,7 +424,7 @@ fn queue(set: Weak<RwLock<VectorSetInner>>, graph: Arc<VsetGraph>) {
             crate::log_warn!("could not start the vector-set graph builder");
         }
     });
-    BUILDS.queue.lock().push_back(Build { set, graph });
+    BUILDS.queue.lock().push_back(Build { set, graph, names });
     BUILDS.ready.notify_one();
 }
 
@@ -440,23 +451,20 @@ fn still_ours(inner: &VectorSetInner, graph: &Arc<VsetGraph>) -> bool {
     inner.graph.get().is_some_and(|g| Arc::ptr_eq(g, graph))
 }
 
-/// Hand every element of the set to the graph, then mark it ready. Each
-/// element is handed over under the set's read lock, with the vector the set
-/// holds at that moment: a write of the element after that (under the write
-/// lock) hands over its own vector after this one, and one before it was
-/// already in what this read.
+/// Hand every element the set held when it got its graph to the graph, then
+/// mark it ready. Each element is handed over under the set's read lock,
+/// with the vector the set holds at that moment: a write of the element after
+/// that (under the write lock) hands over its own vector after this one, and
+/// one before it was already in what this read.
 fn build(job: &Build) {
-    let names: Vec<crate::key_bytes::KeyBytes> = {
-        let Some(set) = job.set.upgrade() else { return };
-        let inner = set.read();
-        if !still_ours(&inner, &job.graph) {
-            return;
-        }
-        inner.entries.keys().cloned().collect()
+    let Some(graph) = job.graph.upgrade() else {
+        return;
     };
-    let index = &job.graph.index;
+    let index = Arc::clone(&graph.index);
+    // Not held while the builder waits: the set may be deleted meanwhile.
+    drop(graph);
     let mut pending = Vec::with_capacity(CHUNK);
-    for chunk in names.chunks(CHUNK) {
+    for chunk in job.names.chunks(CHUNK) {
         // Room in the backlog for the chunk, so that the helpers, not this
         // thread, do the linking; a full backlog leaves it to this one.
         let room = backlog::limit(index.slots().map_or(1, |s| s.dim())).saturating_sub(CHUNK);
@@ -469,13 +477,15 @@ fn build(job: &Build) {
             }
         }
         {
-            let Some(set) = job.set.upgrade() else { return };
+            let (Some(set), Some(graph)) = (job.set.upgrade(), job.graph.upgrade()) else {
+                return;
+            };
             let inner = set.read();
-            if !still_ours(&inner, &job.graph) {
+            if !still_ours(&inner, &graph) {
                 return;
             }
             for name in chunk {
-                if let Some(p) = hand_over(&job.graph, &inner, name.as_bytes()) {
+                if let Some(p) = hand_over(&graph, &inner, name.as_bytes()) {
                     pending.push(p);
                 }
             }
@@ -484,20 +494,26 @@ fn build(job: &Build) {
             p.link();
         }
     }
-    job.graph.ready.store(true, Release);
+    let Some(graph) = job.graph.upgrade() else {
+        return;
+    };
+    graph.ready.store(true, Release);
     // Then the set lets go of its copies of what the helpers have linked,
-    // a few thousand at a time, so that it is not held for long.
-    if !job.graph.exact() {
+    // a few thousand at a time, so that it is not held for long. Only of
+    // what was linked by then: later writes take in what is linked after
+    // them, and a set being written all the time would keep this here.
+    if !graph.exact() {
         return;
     }
-    for _ in 0..100_000 {
-        backlog_settled(index);
-        let Some(set) = job.set.upgrade() else { return };
-        let mut inner = set.write();
-        if !still_ours(&inner, &job.graph) {
+    drop(graph);
+    backlog_settled(&index);
+    let queued = index.linked.as_ref().map_or(0, |q| q.lock().len());
+    for _ in 0..queued.div_ceil(4096) {
+        let (Some(set), Some(graph)) = (job.set.upgrade(), job.graph.upgrade()) else {
             return;
-        }
-        if !absorb(&job.graph, &mut inner, 4096) {
+        };
+        let mut inner = set.write();
+        if !still_ours(&inner, &graph) || !absorb(&graph, &mut inner, 4096) {
             return;
         }
     }

@@ -850,9 +850,9 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
                 let vector = match &entry.vector {
                     Some(v) => v,
                     None => {
-                        let found = reader.as_ref().and_then(|r| {
-                            r.encoding().decode(r.encoded(name.as_bytes())?)
-                        });
+                        let found = reader
+                            .as_ref()
+                            .and_then(|r| r.encoding().decode(r.encoded(name.as_bytes())?));
                         decoded = found.ok_or_else(|| {
                             io::Error::other("a vector set element has no vector")
                         })?;

@@ -1829,7 +1829,14 @@ fn vlinks_and_vinfo_report_the_graph() {
         assert!(layer0.iter().all(|n| n.as_str() != e));
         let scored = c.cmds(&["VLINKS", "vs", &e, "WITHSCORES"]);
         let scored = scored.as_array();
-        assert_eq!(scored.len(), layers.len());
+        // The same layers, unless the element was still waiting to be
+        // linked at one of the calls (one layer, its nearest elements).
+        assert!(
+            scored.len() == layers.len() || scored.len() == 1 || layers.len() == 1,
+            "{} and {} layers",
+            scored.len(),
+            layers.len()
+        );
         for (plain, with) in layers.iter().zip(scored) {
             let with = with.as_array();
             // Helpers may still prune links between the two calls: the
@@ -1897,6 +1904,14 @@ fn vadd_refuses_another_m_than_the_sets() {
     }
     assert_eq!(c.cmds(&["VCARD", "m"]).as_int(), 2);
     // A set made without M has 16: M 16 is its own.
-    assert_eq!(c.cmds(&["VADD", "d", "VALUES", "2", "1", "2", "x"]).as_int(), 1);
-    assert_eq!(c.cmds(&["VADD", "d", "VALUES", "2", "1", "2", "y", "M", "16"]).as_int(), 1);
+    assert_eq!(
+        c.cmds(&["VADD", "d", "VALUES", "2", "1", "2", "x"])
+            .as_int(),
+        1
+    );
+    assert_eq!(
+        c.cmds(&["VADD", "d", "VALUES", "2", "1", "2", "y", "M", "16"])
+            .as_int(),
+        1
+    );
 }

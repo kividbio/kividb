@@ -168,7 +168,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   On a D8s_v5, `Q8`, `COUNT 10` at the defaults, against Redis 8.10.2 in the
   same session, queries a second at 1 / 8 / 50 connections and bytes a
   vector: 100,000 SIFT vectors (128-d) 3,256 / 13,921 / 16,506 and 612 B
-  (exact scan before: 272 / 1,102 / 1,106 and 224 B; Redis 2,262 / 8,086 /
+  (exact scan before: 148 / 589 / 550 and 224 B; Redis 2,262 / 8,086 /
   8,842 and 885 B), recall@10 0.975 (Redis 0.973); 1,000,000 SIFT vectors
   2,362 / 9,921 / 11,748 and 754 B (before 9 / 35 / 35; Redis 1,697 / 6,532
   / 7,245 and 885 B), recall 0.959 (Redis 0.953); 100,000 glove-100 vectors
@@ -178,7 +178,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (Redis 0.967). `VADD` links each element into the graph: 18,924 SIFT
   vectors a second from 4 loading connections (19,294 from one and 18,856
   from eight: the seven helper threads link them, all busy; before, with
-  no graph, 280,000; Redis 4,263). Regression suite `44-vector-sets-hnsw`
+  no graph, 248,544; Redis 4,263). Regression suite `44-vector-sets-hnsw`
   measures it. @Parikalp-Bhardwaj pointed this out in #697.
 
 - **`cluster-announce-client-ipv4` and `cluster-announce-client-ipv6` (#847),

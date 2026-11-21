@@ -759,11 +759,17 @@ fn kdb_vectorset_basic() {
             assert_eq!(inner.entries.len(), 2);
 
             let a = inner.entries.get(&b"vec_a"[..]).unwrap();
-            assert_eq!(a.vector.as_ref().unwrap().as_f32().unwrap(), [1.0f32, 2.0, 3.0]);
+            assert_eq!(
+                a.vector.as_ref().unwrap().as_f32().unwrap(),
+                [1.0f32, 2.0, 3.0]
+            );
             assert!(a.attrs.is_none());
 
             let b = inner.entries.get(&b"vec_b"[..]).unwrap();
-            assert_eq!(b.vector.as_ref().unwrap().as_f32().unwrap(), [4.0f32, 5.0, 6.0]);
+            assert_eq!(
+                b.vector.as_ref().unwrap().as_f32().unwrap(),
+                [4.0f32, 5.0, 6.0]
+            );
             assert_eq!(b.attrs.as_deref().unwrap(), r#"{"label":"b"}"#);
         }
         _ => panic!("wrong type"),
@@ -1082,7 +1088,12 @@ fn kdb_vectorset_high_dim() {
         KiviDBValue::VectorSet(vs) => {
             let inner = vs.read();
             assert_eq!(inner.dim, dim);
-            let loaded_vec = inner.entries[&b"embedding"[..]].vector.as_ref().unwrap().as_f32().unwrap();
+            let loaded_vec = inner.entries[&b"embedding"[..]]
+                .vector
+                .as_ref()
+                .unwrap()
+                .as_f32()
+                .unwrap();
             assert_eq!(loaded_vec.len(), dim);
             // f32 bit-exact check
             for (orig, loaded) in vec.iter().zip(loaded_vec.iter()) {
@@ -1112,7 +1123,12 @@ fn kdb_vectorset_f32_precision() {
     match v {
         KiviDBValue::VectorSet(vs) => {
             let inner = vs.read();
-            let vec = inner.entries[&b"edge"[..]].vector.as_ref().unwrap().as_f32().unwrap();
+            let vec = inner.entries[&b"edge"[..]]
+                .vector
+                .as_ref()
+                .unwrap()
+                .as_f32()
+                .unwrap();
             assert!(vec[0].is_infinite() && vec[0] > 0.0);
             assert!(vec[1].is_infinite() && vec[1] < 0.0);
             assert_eq!(vec[2].to_bits(), f32::MIN.to_bits());

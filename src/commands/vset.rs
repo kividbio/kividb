@@ -830,8 +830,7 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 Some(layers) => layers,
                 None => {
                     // What layer 0 would hold: the nearest `M * 2`.
-                    let mut scored =
-                        measure_all(&inner, &query_vec, |name, _| name != element);
+                    let mut scored = measure_all(&inner, &query_vec, |name, _| name != element);
                     let keep = inner.m * 2;
                     if scored.len() > keep {
                         scored.select_nth_unstable_by(keep, by_distance_then_name);
@@ -2173,16 +2172,26 @@ mod graph_tests {
             model.insert("last".into(), v);
             settled(&vs);
             let inner = vs.read();
-            let own = inner.entries.values().filter(|e| e.vector.is_some()).count();
+            let own = inner
+                .entries
+                .values()
+                .filter(|e| e.vector.is_some())
+                .count();
             if quant == Quant::F32 {
                 assert_eq!(own, inner.entries.len(), "an f32 set keeps its vectors");
             } else {
-                assert!(own * 10 < inner.entries.len(), "{quant:?}: {own} of {} kept", n + 1);
+                assert!(
+                    own * 10 < inner.entries.len(),
+                    "{quant:?}: {own} of {} kept",
+                    n + 1
+                );
             }
             for (name, entry) in &inner.entries {
-                let want =
-                    StoredVector::quantize(quant, model[std::str::from_utf8(name.as_bytes()).unwrap()].clone())
-                        .unwrap();
+                let want = StoredVector::quantize(
+                    quant,
+                    model[std::str::from_utf8(name.as_bytes()).unwrap()].clone(),
+                )
+                .unwrap();
                 let got = inner.vector_of(name.as_bytes(), entry).expect("a vector");
                 assert_eq!(*got, want, "{quant:?} {name:?}");
             }

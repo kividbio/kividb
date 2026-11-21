@@ -3521,12 +3521,7 @@ fn insert_unit(
                 let mut scored: Vec<(f32, u32)> = seen
                     .iter()
                     .filter(|&&id| slots.is_live(id as usize))
-                    .map(|&id| {
-                        (
-                            slots.dist(metric, nb_vec, slots.vector(id as usize)),
-                            id,
-                        )
-                    })
+                    .map(|&id| (slots.dist(metric, nb_vec, slots.vector(id as usize)), id))
                     .collect();
                 scored.push((slots.dist(metric, nb_vec, &vector), NEW_NODE));
                 scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
@@ -3935,14 +3930,13 @@ pub fn knn_hnsw(
     // Normalize the query for cosine so distances match the pre-normalized
     // stored vectors (a quantized graph's query comes laid out as its own).
     let query_buf: Vec<f32>;
-    let query: &[f32] = if matches!(metric, DistanceMetric::Cosine)
-        && index.encoding == quant::Encoding::F32
-    {
-        query_buf = normalize_to_unit(query.to_vec());
-        &query_buf
-    } else {
-        query
-    };
+    let query: &[f32] =
+        if matches!(metric, DistanceMetric::Cosine) && index.encoding == quant::Encoding::F32 {
+            query_buf = normalize_to_unit(query.to_vec());
+            &query_buf
+        } else {
+            query
+        };
 
     // Vectors written and not linked yet are measured too, each in place of
     // what the graph holds for its key; the graph is asked for as many more
@@ -4089,7 +4083,15 @@ pub fn knn_hnsw_admitting(
         deadline,
     )?;
     Some((
-        backlog::merge(&waiting, query, metric, index.encoding, found, k, Some(admit)),
+        backlog::merge(
+            &waiting,
+            query,
+            metric,
+            index.encoding,
+            found,
+            k,
+            Some(admit),
+        ),
         cut,
     ))
 }
