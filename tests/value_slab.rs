@@ -373,3 +373,40 @@ fn a_full_slab_that_empties_between_the_passes_is_left_alone() {
     value_slab::check_lists(true).unwrap();
     assert_eq!(value_slab::slabs_in_use(), before);
 }
+
+/// The kernel's mappings a GiB of values of `len` bytes takes: what
+/// `/proc/self/maps` gained over 256 MiB of them, times four ([`blocks_of`]),
+/// freed after.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn mappings_a_gib(len: usize) -> usize {
+    let maps = || {
+        std::fs::read_to_string("/proc/self/maps")
+            .expect("/proc/self/maps")
+            .lines()
+            .count()
+    };
+    let class = value_slab::class_of(len).expect("a slab's");
+    let n = (256 << 20) / value_slab::block_size(class);
+    let before = maps();
+    let blocks = blocks_of(class, n);
+    let after = maps();
+    for b in blocks {
+        free_block(b, class);
+    }
+    after.saturating_sub(before) * 4
+}
+
+/// Slabs come out of reservations of address space, a few mappings each,
+/// not a mapping a region: with `vm.max_map_count` at 65,530 a region a
+/// mapping (or two, around a hole) ran out at some tens of GiB of values.
+/// A GiB of 8 KB values, and of 100-byte ones, takes a handful of mappings
+/// (the other tests' threads and the allocator's arenas add a few).
+#[cfg(all(target_os = "linux", not(miri)))]
+#[test]
+fn a_gib_of_values_takes_a_handful_of_mappings() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for len in [8_000, 100] {
+        let a_gib = mappings_a_gib(len);
+        assert!(a_gib <= 32, "{a_gib} mappings a GiB of {len}-byte blocks");
+    }
+}

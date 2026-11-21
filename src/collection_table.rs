@@ -238,7 +238,8 @@ unsafe impl Memory for EntryPool {
     #[inline]
     fn alloc_entry(size: usize) -> NonNull<u8> {
         match crate::value_slab::pool_class_of(size) {
-            Some(class) => crate::value_slab::alloc(class),
+            // The pool's slabs are all 64 KiB.
+            Some(class) => crate::value_slab::alloc_small(class),
             None => SystemMemory::alloc(entry_layout(size), false),
         }
     }
@@ -246,8 +247,8 @@ unsafe impl Memory for EntryPool {
     #[inline]
     unsafe fn free_entry(block: NonNull<u8>, size: usize) {
         match crate::value_slab::pool_class_of(size) {
-            // SAFETY: `alloc_entry` took it from this class.
-            Some(class) => unsafe { crate::value_slab::free(block, class) },
+            // SAFETY: `alloc_entry` took it from this class, of 64 KiB slabs.
+            Some(class) => unsafe { crate::value_slab::free_small(block, class) },
             // SAFETY: the caller's promise.
             None => unsafe { SystemMemory::free(block, entry_layout(size)) },
         }

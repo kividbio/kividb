@@ -15,7 +15,9 @@
 //! rounded it up, so a value of 100 bytes (a block of 108) took 128.
 //!
 //! **Layout.** Memory is taken from the system a [`REGION`] at a time,
-//! aligned to its size. A region is of slabs of [`SLAB`] bytes, for the
+//! aligned to its size, one after another out of reservations of address
+//! space that grow to a GiB (a reservation is two of the kernel's mappings
+//! however many regions it holds). A region is of slabs of [`SLAB`] bytes, for the
 //! classes up to 2 KiB and the entry pool's, or of [`LARGE_SLAB`] bytes, for
 //! the keyspace's classes above 2 KiB, whose sizes are each a large slab
 //! over a count of blocks and at most 2.5 % apart: about 1 % lost on
@@ -78,8 +80,10 @@ use std::sync::atomic::{
 
 use parking_lot::Mutex;
 
-/// What memory is taken from the system in, and aligned to.
-pub const REGION: usize = 2 << 20;
+/// What slabs are carved from, aligned to its size: a region holds slabs of
+/// one size, its first slab their headers. Regions come one after another
+/// out of reservations of address space ([`new_region`]).
+pub const REGION: usize = 16 << 20;
 /// A slab of the classes up to 2 KiB: blocks of one size class.
 pub const SLAB: usize = 64 << 10;
 /// Slabs in a region of them, the first of them the headers.
@@ -93,14 +97,18 @@ const SLABS: usize = REGION / SLAB;
 /// server's CPU than a slab's; at 26 KB the two cost the same, so the
 /// largest block is a large slab over 40 blocks, 26,208 bytes.
 pub const LARGE_SLAB: usize = 1 << 20;
-/// Slabs in a region of large slabs: the headers' and one. All of the
-/// headers' slab but its first page is unmapped as the region is made.
+/// Slabs in a region of large slabs: the headers' and fifteen. Only the
+/// headers' slab's first page is ever touched; its other pages are address
+/// space (and, under `vm.overcommit_memory=2`, commit: a sixteenth).
 const LARGE_SLABS: usize = REGION / LARGE_SLAB;
 /// The fewest blocks a large slab holds: its largest class, and the largest
 /// block a slab holds ([`MAX_BLOCK`]), is a slab over this many.
 const LARGE_FEWEST: usize = 40;
 /// Two large classes in a row are at most this many thousandths apart.
 const LARGE_STEP: usize = 1025;
+/// The largest block of a 64 KiB slab of the keyspace's classes: a block of
+/// up to this many bytes is [`alloc_small`]'s and [`free_small`]'s.
+pub const SMALL_MAX_BLOCK: usize = 2048;
 /// The classes up to 2 KiB: 16 bytes apart to 512, then 32 apart: 32 and
 /// 48 classes. A key of 15 bytes and a value of 1,024 make an entry of 1,051
 /// bytes, in the class of 1,056.
@@ -334,10 +342,20 @@ fn slab_of(block: *const u8) -> &'static Slab {
 /// the class is known, as a free knows it.
 #[inline]
 fn slab_in(block: *const u8, size: usize) -> &'static Slab {
+    if size == LARGE_SLAB {
+        slab_in_kind::<true>(block)
+    } else {
+        slab_in_kind::<false>(block)
+    }
+}
+
+/// [`slab_in`] of a block of a large slab (`BIG`) or of a 64 KiB one: a
+/// division by a constant.
+#[inline(always)]
+fn slab_in_kind<const BIG: bool>(block: *const u8) -> &'static Slab {
     let at = block as usize;
     let region = at & !(REGION - 1);
-    // A power of two: a shift, not a division by a variable (each free).
-    let index = (at - region) >> size.trailing_zeros();
+    let index = (at - region) / if BIG { LARGE_SLAB } else { SLAB };
     // SAFETY: `block` is in a region, whose first bytes are its slabs'
     // headers, written when it was made and never given back.
     unsafe { &*(region as *const Slab).add(index) }
@@ -349,7 +367,7 @@ pub fn class_of(size: usize) -> Option<usize> {
     let size = size.max(1);
     Some(if size <= 512 {
         (size - 1) / 16
-    } else if size <= 2048 {
+    } else if size <= SMALL_MAX_BLOCK {
         32 + (size - 513) / 32
     } else if size <= MAX_BLOCK {
         LARGE_CLASS[(size - 2049) / 16] as usize
@@ -464,10 +482,20 @@ fn capacity(class: usize) -> i32 {
 /// system allocator, reusing the blocks freed, had 1.04x.
 #[inline]
 fn listable(class: usize) -> i32 {
+    if is_large(class) {
+        listable_in::<true>(class)
+    } else {
+        listable_in::<false>(class)
+    }
+}
+
+/// [`listable`] of a class known to be large (`BIG`) or not.
+#[inline(always)]
+fn listable_in<const BIG: bool>(class: usize) -> i32 {
     let capacity = capacity(class);
     let free = if crate::memory_use::near_limit() {
         (capacity / 64).max(1)
-    } else if is_large(class) {
+    } else if BIG {
         capacity / 16
     } else {
         capacity / 4
@@ -547,16 +575,16 @@ impl Lists {
     /// back first.
     fn take_partial(&mut self, class: usize) -> Option<SlabPtr> {
         let slab = self.partial.pop().or_else(|| self.fresh.pop())?;
-        if class < CLASSES {
+        if is_large(class) {
             REUSABLE[class].store(self.partial.len(), Ordering::Relaxed);
         }
         Some(slab)
     }
 
-    /// Keep [`REUSABLE`] of `slab`'s class.
+    /// Keep [`REUSABLE`] of `slab`'s class, a large one's.
     fn count_partial(&self, slab: &Slab) {
         let class = slab.class.load(Ordering::Relaxed) as usize;
-        if class < CLASSES {
+        if is_large(class) {
             REUSABLE[class].store(self.partial.len(), Ordering::Relaxed);
         }
     }
@@ -626,14 +654,16 @@ static LISTS: [Mutex<Lists>; ALL_CLASSES] = [const { Mutex::new(Lists::new()) };
 /// read without it by [`take`].
 static REUSABLE: [AtomicUsize; CLASSES] = [const { AtomicUsize::new(0) }; CLASSES];
 
-/// Whether `slab` has room never handed out, for a block of its class. Read
-/// by its owner, or under its class's lock while nobody owns it.
+/// Whether `slab` is a large slab with room never handed out, for a block of
+/// its class: one for its class's `fresh` list. A 64 KiB slab's partial
+/// list is one list, last listed first taken. Read by its owner, or under
+/// its class's lock while nobody owns it.
 fn has_fresh_room(slab: &Slab) -> bool {
     let class = slab.class.load(Ordering::Relaxed) as usize;
     // SAFETY: written only by the slab's owner; read by it, or under the
     // class's lock, which its last owner let it go under.
     let bump = unsafe { *slab.bump.get() } as usize;
-    bump + block_size(class) <= slab_size(class)
+    is_large(class) && bump + block_size(class) <= LARGE_SLAB
 }
 
 /// Where [`plan_evacuation_with_full`] is in each class's list of full
@@ -726,7 +756,32 @@ static NOBODY: u8 = 0;
 /// thread, or the lists, believing what is no longer so: two values given
 /// the same block. Nothing in it panics but on a broken invariant, and a
 /// failed allocation aborts.
+#[inline(always)]
 pub fn alloc(class: usize) -> NonNull<u8> {
+    if class.wrapping_sub(SMALL) < LARGE {
+        alloc_large(class)
+    } else {
+        alloc_small(class)
+    }
+}
+
+/// [`alloc`] of a class of 64 KiB slabs (up to 2 KiB, or the entry pool's),
+/// for a caller that knows it is one.
+#[inline]
+pub fn alloc_small(class: usize) -> NonNull<u8> {
+    debug_assert!(!is_large(class));
+    alloc_in::<false>(class)
+}
+
+/// [`alloc`] of a large class.
+#[inline(never)]
+fn alloc_large(class: usize) -> NonNull<u8> {
+    debug_assert!(is_large(class));
+    alloc_in::<true>(class)
+}
+
+#[inline(always)]
+fn alloc_in<const BIG: bool>(class: usize) -> NonNull<u8> {
     debug_assert!(class < ALL_CLASSES);
     let block = MINE
         .try_with(|mine| {
@@ -737,7 +792,7 @@ pub fn alloc(class: usize) -> NonNull<u8> {
                 if !slab.is_null() {
                     // SAFETY: this thread owns it.
                     unsafe {
-                        if let Some(block) = take(&*slab, class) {
+                        if let Some(block) = take::<BIG>(&*slab, class) {
                             return block;
                         }
                         let_go(&*slab, class);
@@ -750,7 +805,7 @@ pub fn alloc(class: usize) -> NonNull<u8> {
             let slab = acquire(class, &NOBODY as *const u8 as usize);
             // SAFETY: owned here until it is let go of, just after.
             unsafe {
-                let block = take(&*slab, class).expect("a slab just taken has room");
+                let block = take::<BIG>(&*slab, class).expect("a slab just taken has room");
                 let_go(&*slab, class);
                 block
             }
@@ -771,10 +826,47 @@ pub fn alloc(class: usize) -> NonNull<u8> {
 /// thread, or the lists, believing what is no longer so: two values given
 /// the same block. Nothing in it panics but on a broken invariant, and a
 /// failed allocation aborts.
+#[inline(always)]
 pub unsafe fn free(block: NonNull<u8>, class: usize) {
+    // SAFETY: the caller's promise.
+    unsafe {
+        if class.wrapping_sub(SMALL) < LARGE {
+            free_large(block, class)
+        } else {
+            free_small(block, class)
+        }
+    }
+}
+
+/// [`free`] of a block of a class of 64 KiB slabs.
+///
+/// # Safety
+/// As [`free`]'s.
+#[inline]
+pub unsafe fn free_small(block: NonNull<u8>, class: usize) {
+    debug_assert!(!is_large(class));
+    // SAFETY: the caller's promise.
+    unsafe { free_in::<false>(block, class) }
+}
+
+/// [`free`] of a block of a large class.
+///
+/// # Safety
+/// As [`free`]'s.
+#[inline(never)]
+unsafe fn free_large(block: NonNull<u8>, class: usize) {
+    debug_assert!(is_large(class));
+    // SAFETY: the caller's promise.
+    unsafe { free_in::<true>(block, class) }
+}
+
+/// # Safety
+/// As [`free`]'s, and the class is large if and only if `BIG`.
+#[inline(always)]
+unsafe fn free_in<const BIG: bool>(block: NonNull<u8>, class: usize) {
     crate::memory_use::note(-(block_size(class) as isize));
     let block = block.as_ptr();
-    let slab = slab_in(block, slab_size(class));
+    let slab = slab_in_kind::<BIG>(block);
     debug_assert_eq!(slab.class.load(Ordering::Relaxed) as usize, class);
     debug_assert_ne!(slab.state.load(Ordering::Relaxed), EMPTY);
     let own = MINE
@@ -822,7 +914,7 @@ pub unsafe fn free(block: NonNull<u8>, class: usize) {
     // free that brings it to [`listable`]: that moves with `maxmemory`, and a
     // slab already below it is listed by its next free. An owned one is
     // settled when its owner lets go of it.
-    if now == 0 || now <= listable(class) {
+    if now == 0 || now <= listable_in::<BIG>(class) {
         let state = slab.state.load(Ordering::SeqCst);
         if state != OWNED && (now == 0 || state == FULL) {
             let lists = LISTS[class].lock();
@@ -837,8 +929,8 @@ pub unsafe fn free(block: NonNull<u8>, class: usize) {
 ///
 /// # Safety
 /// The calling thread owns `slab`, of class `class`.
-#[inline]
-unsafe fn take(slab: &Slab, class: usize) -> Option<*mut u8> {
+#[inline(always)]
+unsafe fn take<const BIG: bool>(slab: &Slab, class: usize) -> Option<*mut u8> {
     unsafe {
         let local = &mut *slab.local.get();
         if local.is_null() {
@@ -848,31 +940,48 @@ unsafe fn take(slab: &Slab, class: usize) -> Option<*mut u8> {
             let block = *local;
             *local = (block as *const *mut u8).read();
             block
+        } else if BIG {
+            take_fresh_large(slab, class)?
         } else {
             let bump = &mut *slab.bump.get();
             let size = block_size(class) as u32;
-            let left = slab_size(class) - *bump as usize;
-            if left < size as usize {
+            if *bump as usize + size as usize > SLAB {
                 return None;
             }
-            // A large slab's room never handed out is pages never touched:
-            // while slabs of the class have blocks given back, the owner
-            // lets go of this one for one of those (it is listed, with a
-            // sixteenth or more of it this room, see `listable`). With 1 MiB
-            // slabs, each thread's own slab of each class kept up to that
-            // much room: a refill after a delete went there, and RSS grew
-            // by the refill while the blocks deleted stayed free.
-            if is_large(class)
-                && REUSABLE[class].load(Ordering::Relaxed) > 0
-                && left / size as usize >= capacity(class) as usize / 16
-            {
-                return None;
-            }
-            let block = slab.base(slab_size(class)).add(*bump as usize);
+            let block = slab.base(SLAB).add(*bump as usize);
             *bump += size;
             block
         };
         *slab.pending.get() += 1;
+        Some(block)
+    }
+}
+
+/// A block of a large slab's room never handed out, if it has room and
+/// should hand it out. That room is pages never touched: while slabs of
+/// the class have blocks given back, the owner lets go of this one for one
+/// of those (it is listed, with a sixteenth or more of it this room, see
+/// `listable`), so that a refill after a delete takes the blocks the delete
+/// freed rather than up to a slab of new pages a thread a class.
+///
+/// # Safety
+/// The calling thread owns `slab`, of large class `class`.
+#[inline(never)]
+unsafe fn take_fresh_large(slab: &Slab, class: usize) -> Option<*mut u8> {
+    unsafe {
+        let bump = &mut *slab.bump.get();
+        let size = block_size(class) as u32;
+        let left = LARGE_SLAB - *bump as usize;
+        if left < size as usize {
+            return None;
+        }
+        if REUSABLE[class].load(Ordering::Relaxed) > 0
+            && left / size as usize >= capacity(class) as usize / 16
+        {
+            return None;
+        }
+        let block = slab.base(LARGE_SLAB).add(*bump as usize);
+        *bump += size;
         Some(block)
     }
 }
@@ -1000,9 +1109,6 @@ fn empty_slab(large: bool) -> *const Slab {
     unsafe { &*headers }
         .class
         .store(large as u16, Ordering::Relaxed);
-    if large {
-        trim_headers(region);
-    }
     REGIONS.fetch_add(1, Ordering::Relaxed);
     REGION_LIST.lock().push(region);
     // Slab 0 is the headers'.
@@ -1026,54 +1132,121 @@ fn headers_of(region: usize) -> impl Iterator<Item = &'static Slab> {
         .map(move |index| unsafe { &*(region as *const Slab).add(index) })
 }
 
+/// The address space regions are carved from: reservations of growing size
+/// ([`FIRST_RESERVATION`] doubling up to [`MOST_RESERVATION`]), mapped with
+/// no access, whose regions are made readable and writable one after
+/// another. The kernel keeps a reservation as two mappings, the regions
+/// handed out (adjacent, with the same access, they merge) and the rest;
+/// regions mapped one by one were a mapping each, and with
+/// `vm.max_map_count` at its default of 65,530 a server holding some tens
+/// of GiB of values ran out of mappings, and aborted. Nothing in a
+/// reservation is ever unmapped: an empty slab's pages go back with
+/// `madvise`, which splits no mapping.
+#[cfg(all(unix, not(miri)))]
+struct Reservation {
+    /// The next region to hand out, and where the reservation ends.
+    next: usize,
+    end: usize,
+    /// The size of the last reservation.
+    size: usize,
+}
+
+#[cfg(all(unix, not(miri)))]
+static RESERVATION: Mutex<Reservation> = Mutex::new(Reservation {
+    next: 0,
+    end: 0,
+    size: 0,
+});
+
+/// The first reservation of address space: four regions.
+#[cfg(all(unix, not(miri)))]
+const FIRST_RESERVATION: usize = 4 * REGION;
+/// The largest reservation: a GiB, so that a server of a few hundred GiB
+/// holds a few hundred mappings for its slabs.
+#[cfg(all(unix, not(miri)))]
+const MOST_RESERVATION: usize = 1 << 30;
+
 #[cfg(all(unix, not(miri)))]
 fn new_region() -> usize {
-    // Twice the size, to find a stretch aligned to it, and the rest unmapped.
-    // SAFETY: an anonymous private mapping of no file.
-    unsafe {
-        let at = libc::mmap(
-            ptr::null_mut(),
-            2 * REGION,
+    let layout = std::alloc::Layout::from_size_align(REGION, REGION).expect("a region's layout");
+    let mut reservation = RESERVATION.lock();
+    if reservation.next == reservation.end {
+        let size = match reservation.size {
+            0 => FIRST_RESERVATION,
+            last => (last * 2).min(MOST_RESERVATION),
+        };
+        let Some(start) = reserve(size) else {
+            std::alloc::handle_alloc_error(layout);
+        };
+        *reservation = Reservation {
+            next: start,
+            end: start + size,
+            size,
+        };
+    }
+    let region = reservation.next;
+    // Readable and writable: what the kernel counts as committed under
+    // `vm.overcommit_memory=2`, a region at a time. No page is touched.
+    // SAFETY: the stretch is the reservation's, and nothing is in it yet.
+    let made = unsafe {
+        libc::mprotect(
+            region as *mut libc::c_void,
+            REGION,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+        )
+    };
+    if made != 0 {
+        // Out of memory to commit: as the system allocator's failure is
+        // (the process aborts, as it did with a region of its own mapping).
+        std::alloc::handle_alloc_error(layout);
+    }
+    reservation.next += REGION;
+    region
+}
+
+/// `size` bytes of address space, aligned to [`REGION`], with no access and
+/// no huge pages; `None` if the kernel gives none.
+#[cfg(all(unix, not(miri)))]
+fn reserve(size: usize) -> Option<usize> {
+    // A region more, to find a stretch aligned to one; the rest unmapped
+    // at once (the ends, never a hole inside).
+    // SAFETY: an anonymous private mapping of no file.
+    let at = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            size + REGION,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
             -1,
             0,
-        );
-        if at == libc::MAP_FAILED {
-            std::alloc::handle_alloc_error(
-                std::alloc::Layout::from_size_align(REGION, REGION).expect("a region's layout"),
-            );
-        }
-        let start = at as usize;
-        let aligned = (start + REGION - 1) & !(REGION - 1);
+        )
+    };
+    if at == libc::MAP_FAILED {
+        return None;
+    }
+    let start = at as usize;
+    let aligned = (start + REGION - 1) & !(REGION - 1);
+    let end = aligned + size;
+    let mapped_end = start + size + REGION;
+    // SAFETY: the ends of the mapping just made, which nothing uses. A
+    // failure leaves address space reserved and unused, nothing worse.
+    unsafe {
         if aligned > start {
-            libc::munmap(at, aligned - start);
+            let undone = libc::munmap(at, aligned - start);
+            debug_assert_eq!(undone, 0);
         }
-        let end = aligned + REGION;
-        let mapped_end = start + 2 * REGION;
         if mapped_end > end {
-            libc::munmap(end as *mut libc::c_void, mapped_end - end);
+            let undone = libc::munmap(end as *mut libc::c_void, mapped_end - end);
+            debug_assert_eq!(undone, 0);
         }
-        aligned
+        // No transparent huge pages: a slab gives back its pages 64 KiB or
+        // 1 MiB at a time, and under `enabled=always` the first write to a
+        // region would take 2 MiB of RSS. A kernel without them refuses the
+        // advice, and there is nothing to keep off.
+        libc::madvise(aligned as *mut libc::c_void, size, libc::MADV_NOHUGEPAGE);
     }
+    Some(aligned)
 }
-
-/// Unmap a region of large slabs' headers' slab but for the pages its
-/// headers are on: a large slab of address space each region, else.
-#[cfg(all(unix, not(miri)))]
-fn trim_headers(region: usize) {
-    // SAFETY: sysconf has no preconditions.
-    let page = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize).max(4096);
-    let kept = (LARGE_SLABS * std::mem::size_of::<Slab>()).next_multiple_of(page);
-    if kept < LARGE_SLAB {
-        // SAFETY: the stretch is the region's, after its headers, and nothing
-        // is ever put there.
-        unsafe { libc::munmap((region + kept) as *mut libc::c_void, LARGE_SLAB - kept) };
-    }
-}
-
-#[cfg(not(all(unix, not(miri))))]
-fn trim_headers(_region: usize) {}
 
 #[cfg(not(all(unix, not(miri))))]
 fn new_region() -> usize {
@@ -1093,8 +1266,13 @@ fn new_region() -> usize {
 /// when the slab is next written.
 #[cfg(all(unix, not(miri)))]
 fn give_back(base: *mut u8, len: usize) {
+    // DONTNEED, not FREE: the pages leave RSS now, not when the kernel is
+    // short of memory, and RSS is what the slab-waste numbers and INFO are
+    // read against. It splits no mapping.
     // SAFETY: the slab is mapped, and holds nothing anybody reads.
-    unsafe { libc::madvise(base as *mut libc::c_void, len, libc::MADV_DONTNEED) };
+    let given = unsafe { libc::madvise(base as *mut libc::c_void, len, libc::MADV_DONTNEED) };
+    // Only a range not mapped fails it, which a slab's never is.
+    debug_assert_eq!(given, 0);
 }
 
 #[cfg(not(all(unix, not(miri))))]

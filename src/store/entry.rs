@@ -173,6 +173,7 @@ fn fits_inline(klen: usize, vlen: usize, ttl: bool) -> bool {
 
 fn allocate(size: usize) -> NonNull<u8> {
     match value_slab::class_of(size) {
+        Some(class) if size <= value_slab::SMALL_MAX_BLOCK => value_slab::alloc_small(class),
         Some(class) => value_slab::alloc(class),
         None => {
             let layout = Layout::from_size_align(size, ALIGN).expect("an entry's layout");
@@ -195,6 +196,10 @@ fn allocated_size(size: usize) -> usize {
 /// `at` came from [`allocate`] of `size`, and is not used again.
 unsafe fn deallocate(at: NonNull<u8>, size: usize) {
     match value_slab::class_of(size) {
+        // SAFETY: as the caller promises.
+        Some(class) if size <= value_slab::SMALL_MAX_BLOCK => unsafe {
+            value_slab::free_small(at, class)
+        },
         // SAFETY: as the caller promises.
         Some(class) => unsafe { value_slab::free(at, class) },
         None => unsafe {
