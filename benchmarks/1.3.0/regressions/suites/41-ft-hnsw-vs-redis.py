@@ -14,7 +14,9 @@ DIALECT 2`, one client, 5 s a case, 300 queries (seed 761).
 Configurations, the issue's two datasets: `d384` (50,000 x 384) and `d64`
 (200,000 x 64). The candidate runs as it starts (`--threads 4`, the default
 on the suite's 8-vCPU machine, and `search-index-threads auto`, which starts
-three helpers there): the issue compared default settings.
+seven helpers there and lets all of them link while the load is all the
+server does, three while it serves clients): the issue compared default
+settings.
 
 Cases: no filter (`*`), a wide filter `@score:[50 100]` (half the documents)
 and a narrow one `@score:[0 2]` (3 %), at the default EF_RUNTIME; no filter
@@ -60,9 +62,12 @@ M, EFC, BATCH, SECS, NQ = 16, 200, 1000, 5.0, 300
 WIDE, NARROW = (50, 100), (0, 2)
 WRITES_PER_S = 500
 # The candidate at most this many times slower than Redis this session.
-# Build: what this suite recorded, with room for a run's noise (d384 1.37x,
-# d64 1.73x on the D8s_v5 it was recorded on; see the PR of #760).
-BUILD_X = {"d384": 1.6, "d64": 2.0}
+# Build: what this suite recorded, with room for a run's noise and for the
+# two CPUs a D8s_v5 comes with (Xeon 8370C or 8573C). With
+# `search-index-threads auto` linking on all seven helpers during the load,
+# d384 1.01-1.05x and d64 1.26-1.34x in three runs on an 8370C (they were
+# 1.37x and 1.73x with three helpers; see the PRs of #760).
+BUILD_X = {"d384": 1.25, "d64": 1.6}
 # The same EF_RUNTIME on both: the same work. Without a filter KiviDB was
 # from 0.96x to 1.22x Redis's q/s; with the wide one from 0.93x (d384, EF 100)
 # to 1.35x, its recall higher in every case.

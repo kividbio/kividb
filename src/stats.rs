@@ -376,6 +376,14 @@ pub fn record_command_processed() {
     tl_bump!(TL_COMMANDS);
 }
 
+/// Commands counted on this thread ([`record_command_processed`]): the same
+/// from a command's start to its end, one more for each command the thread
+/// starts, and 0 on a thread that has run none. `CONFIG RESETSTAT` leaves
+/// it as it is.
+pub fn commands_on_this_thread() -> u64 {
+    TL_COMMANDS.with(|mine| mine.0.load(Ordering::Relaxed))
+}
+
 /// A command counted by [`record_command_processed`] did not run after all:
 /// it is dispatched again (a write a `CLIENT PAUSE` sent back to be held),
 /// and counted then. On the thread that counted it.
