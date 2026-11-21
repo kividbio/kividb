@@ -58,6 +58,7 @@ and why.
 | `40-wp-object-cache` | #849 | a WordPress-shaped object cache (kividb.io/blog/wordpress-redis-object-cache-slow-under-load-how-to-speed-it-up): 1,000,000 string keys of 512 (`d512`) or 2,048 (`d2048`) bytes, `redis-benchmark -c 100 -d D -r 1000000 -t get` and `-t set` with `--threads 4`: requests a second, p50 and p99 against Redis, and the server's RSS and `used_memory` once loaded. Gates: `GET` at 2 KB at least 1.3x Redis in the same session, RSS at most 1.0x Redis's at both sizes, every rate within 10 % of recorded; server on the first half of the CPUs, client on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-39-and-40)) |
 | `41-ft-hnsw-vs-redis` | #760 | #760's own cases against Redis's query engine in the same session: 50,000 384-d (`d384`) and 200,000 64-d (`d64`) random documents (`score` NUMERIC, HNSW `COSINE M 16 EF_CONSTRUCTION 200`) written by one client in `HSET` pipelines of 1,000, documents a second until all are in the graph; then one client, 5 s a case, `KNN 10`: no filter, `@score:[50 100]` (half) and `@score:[0 2]` (3 %) at the default `EF_RUNTIME`, no filter at 50, 100 and 200 and the wide filter at 50 and 100: q/s and recall@10 against exact; `d64` also KNN p99 beside 500 `HSET`s a second; peak RSS. The candidate as it starts on 8 CPUs (`--threads 4`, `search-index-threads auto`: 7 helpers, all of them linking while the load is all the server does, 3 while it serves). Gates: 10 % (rates), 2 % (recall), 5 % (RSS); and against Redis this session: build at most 1.25x (`d384`) / 1.6x (`d64`) slower, the rows at the same `EF_RUNTIME` at most 1.1x (no filter) / 1.2x (wide) slower with recall at least Redis's, the narrow filter faster than Redis, the default rows at most 2.2x (no filter) / 1.8x (wide) slower (a KiviDB KNN looks at no fewer than 50 candidates, Redis's default at 10), peak RSS at most Redis's. Needs `REGRESS_REDISEARCH_SO` (as `28`); `min_cpus=8`, recorded on a D8s_v5 (`results/pr-760-d8s_v5`; the build rows in `results/pr-760-adaptive-d8s_v5`, see [below](#recorded-run-suite-41-build-rows)) |
 | `42-alone-scripts-mix` | #880 | plain commands beside scripts that run alone (a key with no hash tag): Nextcloud's mix (`GET` 40, `TTL` 15, `INCRBY` 15, `EXPIRE` 15, `EVALSHA` of its compare-and-delete 12, `SETEX` 3) and the same mix with no script, the compare-and-delete alone, Appwrite's abuse limiter (`EVAL`), both on a tagged key too, and Superset's cache and lock (`GET` 85 of 50 KB values, `SETEX` 10, `SET NX EX` 3, unlock 2); memtier, 200 and 500 connections, 100,000 keys (written again before every run): ops/s, p50, p99, p99.9. Gates: Nextcloud's p99 at most 2x the same mix's with no script and 0.75x Redis's in the same session; ops/s at least a floor times Redis's and within 10 % of recorded; server on the first half of the CPUs (`--threads 4`), memtier on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-42)) |
+| `43-slab-churn` | #240 | memory after the issue's delete/refill churn (1,000,000 keys of 100 B and of 1 KB, 120,000 of 100 B to 16 KB; 10 % and 20 % of the keys deleted and written anew, 3 cycles, 8 pipelining clients): VmRSS and `used_memory` at load, the peak (50 ms samples) and 60 s after, and the peak against the same churn run again with active defrag off; VmRSS after `BGSAVE` and after `BGREWRITEAOF` under 40,000 SETs a second on 2,000,000 keys of 1 KB; GET/SET p99 and p99.9 (memtier, per second, median of three trials) while active defrag runs a pass under reads and overwrites, against the same trial's seconds before it (`min_cpus=8`) |
 | `44-vector-sets-hnsw` | #710 | `VSIM` through a vector set's HNSW graph at the defaults every client gets (no `EF` on `VSIM` or `VADD`: Redis's `M` 16, build `EF` 200, search `EF` 100), against Redis 8.10.2's vector sets in the same session: `Q8` on both servers for SIFT (128-d) at 10,000 and 100,000 vectors (1,000,000 with `FULL=1`) and glove-100 and LAION (768-d) at 100,000 (#627's datasets, as suite 26); `NOQUANT` on both for SIFT and LAION at 100,000; and no option (each server's default: Redis `Q8`, KiviDB f32) for SIFT at 100,000: `VADD` a second (pipelined, 4 clients), seconds until the graph serves `VSIM` (`VINFO` `index-type HNSW`), `used_memory` a vector, recall@10 against exact at the default `EF`, and `VSIM ... COUNT 10` q/s, p50 and p99 at 1, 8 and 50 connections. Gates: recall within 2 % of recorded and at most 0.01 below Redis's this session; q/s within 15 % and at most 1.2x (1 connection) / 1.15x (8, 50) slower than Redis; `VADD` 10 %, bytes 5 % and at most Redis's where both store alike. v1.2.2 (an exact scan) shown. `load_time.py` and `aof_replay.py` in `benchmarks/vector-sets/` measure the graph's rebuild after a restart and an AOF replay. `min_cpus=8`, recorded on a D8s_v5 with `FULL=1` (`results/pr-991-44-d8s_v5`; suite 41 on the same build: `results/pr-991-41-d8s_v5`) |
 
 ## Running it
@@ -268,7 +269,7 @@ was re-recorded for it:
 | `35-tokio-pipelined-reads` | 1 | as recorded: one worker on its own CPU, the client on the other three |
 | `36-litellm-ratelimit` | the server's pinned CPUs (4) | as suites `20` and `34` |
 | `37-zrandmember-by-count` | 2 | as suite `16`, whose sizes it extends |
-| `39-bgsave-strings`, `40-wp-object-cache` | the server's pinned CPUs (4) | as suites `20` and `34`: the server is pinned to half the CPUs of a `Standard_D8s_v5` and gets `--threads` to match |
+| `39-bgsave-strings`, `40-wp-object-cache`, `43-slab-churn` | the server's pinned CPUs (4) | as suites `20` and `34`: the server is pinned to half the CPUs of a `Standard_D8s_v5` and gets `--threads` to match |
 | `42-alone-scripts-mix` | the server's pinned CPUs (4) | as suites `20`, `34` and `36` |
 | `32-default-threads` | 0 (none) | measures the default on purpose |
 
@@ -1768,6 +1769,42 @@ Alone it deleted about 2.5 %: once a key is deleted, later calls on it miss.
 This suite declares `min_cpus=8`: run it on a Standard_D8s_v5 with
 `run-all.sh --candidate <bin> --candidate-full <bin> --min-cpus-only --label
 <label>-d8s_v5`, or `--only 42` on a machine with 8 CPUs.
+
+## Recorded run, suite 43
+
+Recorded 2026-11-21 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C),
+`--only 43 --record` (`results/pr990-41910e65-d8s_v5`); the candidate is
+`41910e65` (#240), `cargo build --release` with rustc 1.100.0; Redis 8.10.2
+from the VM image. The server has CPUs 0-3 and the clients 4-7. The run took
+39 minutes.
+
+| MiB | v1.2.2 | candidate | Redis 8.10.2 |
+|---|---:|---:|---:|
+| 1 KB, 10 %: loaded / peak / 60 s after | 1,043 / 1,194 / 1,194 | 1,045 / 1,206 / **1,079** | 1,302 / 1,303 / 1,299 |
+| 1 KB, 20 % | 1,043 / 1,340 / 1,147 | 1,045 / **1,193** / **1,099** | 1,302 / 1,304 / 1,300 |
+| 100 B, 10 % | 155.1 / 179.2 / 179.2 | 156.5 / 182.9 / **160.8** | 178.8 / 178.8 / 174.0 |
+| 100 B, 20 % | 155.6 / 183.7 / 179.4 | 157.5 / 184.5 / **165.1** | 176.8 / 178.5 / 174.5 |
+| 100 B-16 KB, 10 % / 20 %, 60 s after | 1,005 / 1,052 | 1,009 / 993 | 1,056 / 1,056 |
+| snapshot: after `BGSAVE` / after the rewrite / 30 s after the writes / highest | 2,287 / 2,367 / 2,367 / 2,861 | 2,289 / 2,210 / **2,208** / **2,564** | 2,584 / 2,586 / 2,584 / 2,644 |
+
+- After the churn the candidate holds 1.03x to 1.05x what it held loaded,
+  against 1.10x to 1.16x. `peak_vs_off`, its peak over the same churn's peak
+  with active defrag off on the same server: 1.012 to 1.021 (v1.2.2's pass,
+  started by the ratio trigger in the 1 KB 20 % churn: 1.14).
+- 100 B to 16 KB: three quarters of the values are above 4 KiB, in the
+  system allocator; the rows move within glibc's spread.
+- Snapshot: after `BGSAVE` the free room inside the slabs (in full slabs, 9.7 %
+  of them) is just under the slab-waste trigger; the writers (40,000 `SET`s a
+  second over every key) make new room about as fast as a pass at 10 % of a
+  core takes it back, and the pass after the writes stop brings it to 2,208.
+- `pass-latency`, medians of three trials (each trial's value in
+  `summary.json`): `GET`/`SET` p99 during the pass 0.487/0.487 ms (the
+  seconds before it 0.479/0.479), p99.9 0.627/0.671 (v1.2.2 0.559/0.847);
+  the pass took 18.9 s (v1.2.2 7.4 s: it moves the values of full slabs too).
+- Gates: `settled_x_load` at most 1.07x (1 KB) and 1.08x (100 B) and +5 %;
+  `peak_vs_off` at most 1.03; `settled_rss_mib` and `final_rss_mib` +5 %;
+  `peak_x_load` +10 %; the pass's p99 at most 1.5x the seconds before it plus
+  0.2 ms (`*_p99_excess_ms`), and its p99 and p99.9 within 25 % or 0.2 ms.
 
 ## Not covered
 
