@@ -88,6 +88,32 @@ Differences from Redis worth knowing:
 * A script that is running across the handoff is not waited for; keep scripts
   short on a node whose slots are moving.
 
+### The takeover waits for the destination's AOF and replicas
+
+At the handoff the destination takes the slots only once what the import
+brought is in its AOF (synced under `appendfsync always`) and every replica
+of the destination that the cluster has not marked failed, and every one
+marked failed whose replication link is up, has acknowledged it. The wait
+ends after half the destination's `cluster-slot-migration-write-pause-timeout`
+(at least 100 ms, at most 2 s); the source's writes stay paused meanwhile.
+
+If the wait runs out, the takeover is refused: the source keeps the slots and
+serves them, and the destination tries again after 1 s, then 2, 4, 8, 16 and
+30 s after each further refusal in a row. So a replica that is not marked
+failed and cannot catch up within the wait (one in a full sync, or with its
+link down) holds up imports into its master until it catches up or the cluster
+marks it failed. Each attempt pauses the source's writes for up to 2 s plus
+the time to send the last writes: about 12 s over the first minute of a replica
+that stays behind, then about 2 s every 32 s.
+
+`CLUSTER MIGRATION STATUS` on the destination says why the last takeover was
+refused (`takeover_refused`, for example `this node's replica <id> at
+<ip:port> has not acknowledged what arrived in time`), and the destination's
+log says so at each refusal. A replica of the destination elected while it
+does not hold an import's keys does not take those slots: `CLUSTER INFO` on a
+replica lists the slots of its master it does not hold yet
+(`cluster_slots_not_held`, `cluster_slots_not_held_ranges`).
+
 ## JSON
 
 The path engine was replaced. Before, a path could be made of names, indexes,

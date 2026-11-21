@@ -9819,9 +9819,10 @@ fn a_takeover_by_hand_takes_only_the_slots_the_replica_holds() {
 /// A takeover whose reserved epoch another master reaches while it waits:
 /// held after its replica acknowledged what arrived (failpoint
 /// `takeover-acknowledged`), the source takes a newer config epoch
-/// (`CLUSTER BUMPEPOCH`), and the destination hears of it. The takeover is
-/// refused, the source keeps the slots, and the next attempt takes them at
-/// a newer epoch than the source's, with every key, on every node and on the
+/// (`CLUSTER BUMPEPOCH`: the same one, as no node hears of an epoch taken
+/// for a takeover before a claim at it), and the destination hears of it.
+/// The takeover is refused, the source keeps the slots, and the next attempt
+/// takes them at a newer epoch than the source's, with every key, on every node and on the
 /// destination's replica.
 #[test]
 fn a_takeover_is_refused_when_another_master_reaches_its_epoch_meanwhile() {
@@ -9844,28 +9845,21 @@ fn a_takeover_is_refused_when_another_master_reaches_its_epoch_meanwhile() {
     wait_until("the takeover to be held", Duration::from_secs(30), || {
         held.exists()
     });
-    // The epoch the destination took for the takeover is its current one.
+    // The epoch the destination took for the takeover is its current one,
+    // one above every config epoch it knew. No other node hears of it
+    // before a claim at it: the source's bump, from what it knows, takes
+    // that same epoch.
     let reserved: u64 = nodes[1]
         .cluster_info("cluster_current_epoch")
         .parse()
         .unwrap();
-    wait_until(
-        "the source to know of the reserved epoch",
-        Duration::from_secs(10),
-        || {
-            nodes[0]
-                .cluster_info("cluster_current_epoch")
-                .parse::<u64>()
-                .is_ok_and(|e| e >= reserved)
-        },
-    );
     let bumped = nodes[0].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
     let src_epoch: u64 = bumped
         .strip_prefix("BUMPED ")
         .unwrap_or_else(|| panic!("{bumped}"))
         .parse()
         .unwrap();
-    assert!(src_epoch > reserved, "{src_epoch} {reserved}");
+    assert!(src_epoch >= reserved, "{src_epoch} {reserved}");
     wait_until(
         "the destination to hear the source's new epoch",
         Duration::from_secs(10),
@@ -10051,7 +10045,7 @@ fn a_replica_holds_a_slot_its_master_added_and_then_bumped_the_epoch_of() {
     );
     assert_eq!(
         replica.cluster_info("cluster_slots_not_held_ranges"),
-        spare_s
+        format!("{spare}-{spare}")
     );
     std::fs::remove_file(replica.dir.join(LINK_DOWN.1)).unwrap();
     wait_until(
