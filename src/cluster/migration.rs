@@ -3626,7 +3626,11 @@ fn take_over_now(
         // the client IPs it announces, with its client port and the one it
         // announces.
         let addresses = |n: &super::ClusterNode| {
-            let ips = [n.ip.as_str(), n.client_ips.v4.as_str(), n.client_ips.v6.as_str()];
+            let ips = [
+                n.ip.as_str(),
+                n.client_ips.v4.as_str(),
+                n.client_ips.v6.as_str(),
+            ];
             let ports = [n.client_port, n.announced_client_port];
             let mut out: Vec<(String, u16)> = Vec::new();
             for ip in ips.iter().filter(|ip| !ip.is_empty()) {
@@ -3654,11 +3658,11 @@ fn take_over_now(
             ranges_text(&task.ranges),
             required.len()
         );
-        if let Err(missing) = hooks
-            .replica_starter
-            .repl_state
-            .replicas_have_all_blocking(&required, &if_attached, deadline)
-        {
+        if let Err(missing) = hooks.replica_starter.repl_state.replicas_have_all_blocking(
+            &required,
+            &if_attached,
+            deadline,
+        ) {
             return not_yet(&format!(
                 "this node's replica at {missing} has not acknowledged what arrived in time"
             ));

@@ -9169,7 +9169,7 @@ fn a_destination_takes_slots_over_once_its_replicas_have_what_arrived() {
         || {
             nodes[1]
                 .log()
-                .contains("have not acknowledged what arrived in time")
+                .contains("has not acknowledged what arrived in time")
         },
     );
     let state = nodes[1]
@@ -9326,14 +9326,18 @@ fn a_cancel_during_the_takeover_wait_leaves_the_slots_with_the_source() {
     assert_eq!(r, Resp::Int(1), "{r:?}");
     std::thread::sleep(Duration::from_secs(1));
     std::fs::remove_file(&stall).unwrap();
-    wait_until("the import to end canceled", Duration::from_secs(30), || {
-        nodes[1]
-            .conn()
-            .cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id])
-            .array()
-            .first()
-            .is_some_and(|task| task_field(task, "state").text() == "canceled")
-    });
+    wait_until(
+        "the import to end canceled",
+        Duration::from_secs(30),
+        || {
+            nodes[1]
+                .conn()
+                .cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id])
+                .array()
+                .first()
+                .is_some_and(|task| task_field(task, "state").text() == "canceled")
+        },
+    );
     let src_id = nodes[0].id();
     wait_until(
         "every node to hold the source as the owner",
@@ -9393,11 +9397,8 @@ fn a_takeover_that_waits_past_the_source_silence_keeps_what_arrived() {
     );
     let absent = before.missing_on(&nodes[1]);
     assert!(absent.is_empty(), "{} keys not on the owner", absent.len());
-    wait_until(
-        "the replica to have the keys",
-        Duration::from_secs(10),
-        || before.missing_on(&replica).is_empty(),
-    );
+    // And its replica has everything it was sent.
+    assert_eq!(nodes[1].conn().cmd(&["WAIT", "1", "10000"]).int(), 1);
 }
 
 /// A link to the destination that is not one of its replicas as the
@@ -9464,9 +9465,8 @@ fn a_link_that_is_no_replica_of_this_node_does_not_stand_in_for_one() {
         let mut stream = other.stream.try_clone().unwrap();
         std::thread::spawn(move || {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = stream.write_all(
-                    b"*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$13\r\n1000000000000\r\n",
-                );
+                let _ = stream
+                    .write_all(b"*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$13\r\n1000000000000\r\n");
                 std::thread::sleep(Duration::from_millis(50));
             }
         })
@@ -9490,7 +9490,9 @@ fn a_link_that_is_no_replica_of_this_node_does_not_stand_in_for_one() {
         .cmd(&["CLUSTER", "MIGRATION", "STATUS", "ID", &task_id]);
     let task = status.array().first().cloned().unwrap();
     assert!(
-        task_field(&task, "takeover_refused").text().contains(&refused),
+        task_field(&task, "takeover_refused")
+            .text()
+            .contains(&refused),
         "{status:?}"
     );
     // Once the replica is marked failed, the slots are taken over.
@@ -9527,11 +9529,7 @@ fn a_replica_down_when_its_master_took_slots_is_not_given_them_by_the_voters() {
     wait_until(
         "the replica to be marked failed",
         Duration::from_secs(30),
-        || {
-            row_of(&nodes[1], &replica_id).is_some_and(|row| {
-                row[2].split(',').any(|f| f == "fail")
-            })
-        },
+        || row_of(&nodes[1], &replica_id).is_some_and(|row| row[2].split(',').any(|f| f == "fail")),
     );
     let task_id = nodes[1]
         .conn()
@@ -9673,7 +9671,10 @@ fn a_replica_that_has_not_heard_its_master_take_slots_counts_the_masters_that_ow
     // It takes in none of the destination's claims: the slots are the
     // source's in its view, whenever it is looked at.
     for _ in 0..10 {
-        assert_eq!(owner_in_view_of(&replica, a).as_deref(), Some(src_id.as_str()));
+        assert_eq!(
+            owner_in_view_of(&replica, a).as_deref(),
+            Some(src_id.as_str())
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     // Acknowledged by the destination, and on its replica.

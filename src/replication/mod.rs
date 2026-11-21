@@ -724,7 +724,11 @@ impl ReplState {
                     barrier_rx.try_recv()
                 {
                     if std::time::Instant::now() >= deadline {
-                        return Err(required.first().or(if_attached.first()).map(name).unwrap_or_default());
+                        return Err(required
+                            .first()
+                            .or(if_attached.first())
+                            .map(name)
+                            .unwrap_or_default());
                     }
                     pause();
                 }
@@ -3929,17 +3933,16 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                             };
                             // The last claim at or before its position first,
                             // then each later one in its place.
-                            let mut ok = kept
-                                .iter()
-                                .rev()
-                                .find(|(_, at)| *at <= offset)
-                                .is_none_or(|(claims, _)| {
-                                    queue_marker(
-                                        &registration.tx,
-                                        &registration.pending_bytes,
-                                        claims,
-                                    )
-                                });
+                            let mut ok =
+                                kept.iter().rev().find(|(_, at)| *at <= offset).is_none_or(
+                                    |(claims, _)| {
+                                        queue_marker(
+                                            &registration.tx,
+                                            &registration.pending_bytes,
+                                            claims,
+                                        )
+                                    },
+                                );
                             let mut from = 0usize;
                             for (claims, at) in kept.iter().filter(|(_, at)| *at > offset) {
                                 let cut = ((at - offset) as usize).min(missed.len());
@@ -4174,7 +4177,10 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     // Of those at or before the backlog's start, only the
                     // last can be sent again.
                     let start = backlog.start();
-                    let before = slot_claims_sync.iter().filter(|(_, at)| *at <= start).count();
+                    let before = slot_claims_sync
+                        .iter()
+                        .filter(|(_, at)| *at <= start)
+                        .count();
                     if before > 1 {
                         slot_claims_sync.drain(..before - 1);
                     }
@@ -7380,7 +7386,7 @@ mod replication_invariants_tests {
         .unwrap();
         propagate(&hub, w("c"));
         settle(&hub).await;
-        let imports = no_slot_imports();
+        let imports = super::no_slot_imports();
 
         let continued = |id: u64, offset: u64, markers: bool| {
             let hub = hub.clone();

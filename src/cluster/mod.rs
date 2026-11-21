@@ -4206,7 +4206,6 @@ impl ClusterState {
         hooks.replica_starter.repl_state.send_slot_claims(marker);
     }
 
-
     /// A claim of this node's master (`master`): `ranges` at config epoch
     /// `epoch`, from its replication stream ([`Self::send_claims_to_replicas`]).
     /// Taken in as the same claim in its heartbeat is: its config epoch
