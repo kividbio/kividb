@@ -1995,7 +1995,9 @@ fn kill_in_a_run(io: &str) {
 /// by a `FUNCTION STATS`, which a slow script of A's holds back on no other
 /// thread), and is queued. The `MIGRATE` itself waits on its own
 /// thread, so A, B and the probes are connections on the others
-/// (`free_connections`), and the probes on B's own thread are left out. While B waits out the `MIGRATE`, a `PING` and a
+/// (`free_connections`), and the probes on B's own thread are left out.
+/// On io_uring, where a connection stays on its thread, the probes that tell
+/// are those on A's thread, the one that would have run B. While B waits out the `MIGRATE`, a `PING` and a
 /// `GET` on each probe are answered at once. On both I/O loops.
 #[test]
 fn a_queued_script_waiting_for_a_migrate_does_not_hold_a_worker() {
@@ -2040,7 +2042,7 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
     assert!(c.cmd(&["SET", "other", "o"]).ok());
     let port = server.port;
     let migrate = migrate_to_nowhere(port, "m", 4000);
-    let mut free = free_connections(port, 32, Duration::from_secs(1));
+    let mut free = free_connections(port, 40, Duration::from_secs(1));
     assert!(free.len() >= 12, "only {} connections answered", free.len());
     let probe_conns: Vec<Conn> = free.split_off(9);
     assert!(probe_conns.len() >= 3, "{} probes", probe_conns.len());
@@ -2055,6 +2057,16 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
         (a, reply)
     });
     std::thread::sleep(Duration::from_millis(100));
+    // Meanwhile, which probes are on A's thread: those A's script holds back.
+    let probing: Vec<_> = probe_conns
+        .into_iter()
+        .map(|mut p| {
+            std::thread::spawn(move || {
+                let (_, took) = timed(|| p.cmd(&["FUNCTION", "STATS"]));
+                (p, took >= Duration::from_millis(50))
+            })
+        })
+        .collect();
     let chosen = std::sync::Arc::new(AtomicBool::new(false));
     let picked: Vec<Conn> = candidates
         .into_iter()
@@ -2071,6 +2083,7 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
         })
         .filter_map(|t| t.join().unwrap())
         .collect();
+    let probe_conns: Vec<(Conn, bool)> = probing.into_iter().map(|t| t.join().unwrap()).collect();
     let (mut a, reply) = a_slow.join().unwrap();
     assert!(matches!(reply, V::Int(_)), "{reply:?}");
     let [mut b] = <[Conn; 1]>::try_from(picked)
@@ -2088,12 +2101,12 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
         (b, reply)
     });
     std::thread::sleep(Duration::from_millis(100));
-    let probe_conns: Vec<Conn> = probe_conns
+    let probe_conns: Vec<(Conn, bool)> = probe_conns
         .into_iter()
-        .map(|mut p| {
+        .map(|(mut p, on_a)| {
             std::thread::spawn(move || {
                 let (_, took) = timed(|| p.cmd(&["FUNCTION", "STATS"]));
-                (took < Duration::from_millis(50)).then_some(p)
+                (took < Duration::from_millis(50)).then_some((p, on_a))
             })
         })
         .filter_map(|t| t.join().unwrap())
@@ -2127,7 +2140,7 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
     // While B waits: connections on every thread but the MIGRATE's.
     let probes: Vec<_> = probe_conns
         .into_iter()
-        .map(|mut probe| {
+        .map(|(mut probe, on_a)| {
             std::thread::spawn(move || {
                 let mut worst = Duration::ZERO;
                 for _ in 0..10 {
@@ -2138,20 +2151,30 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
                     assert_eq!(got, V::Str("o".into()));
                     worst = worst.max(took);
                 }
-                worst
+                (worst, on_a)
             })
         })
         .collect();
-    let worst: Vec<Duration> = probes.into_iter().map(|p| p.join().unwrap()).collect();
+    let worst: Vec<(Duration, bool)> = probes.into_iter().map(|p| p.join().unwrap()).collect();
     let (written, waited) = b.join().unwrap();
     let a_took = a_stream.join().unwrap();
     let (migrated, _) = migrate.join().unwrap();
     eprintln!(
         "{io}: probes' worst waits {worst:?}; B waited {waited:?}; A's {n} scripts took {a_took:?}"
     );
+    // On io_uring a connection stays on its thread: A's thread is the one
+    // that would have run B, and its probes are the ones that tell. With
+    // Tokio a thread's connections move: every probe.
+    let telling: Vec<Duration> = worst
+        .iter()
+        .filter(|(_, on_a)| io != "uring" || *on_a)
+        .map(|(w, _)| *w)
+        .collect();
+    assert!(!telling.is_empty(), "no probe on A's thread: {worst:?}");
     assert!(
-        worst.iter().all(|w| *w < Duration::from_millis(1000)),
-        "connections waited {worst:?} while a queued script waited out the MIGRATE"
+        telling.iter().all(|w| *w < Duration::from_millis(1000)),
+        "connections waited {worst:?} (true: on A's thread) while a queued script waited out \
+         the MIGRATE"
     );
     // B did wait for the MIGRATE, which gave up, and then ran.
     assert!(migrated.is_err(), "{migrated:?}");
