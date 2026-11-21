@@ -10123,16 +10123,16 @@ fn a_replica_that_has_not_heard_its_master_take_slots_counts_the_masters_that_ow
         "the replica was not elected in 30 s\n{}",
         logs()
     );
-    wait_until(
-        "every node to have it as the owner of both its master's slots and the ones it took",
-        Duration::from_secs(30),
-        || {
+    assert!(
+        wait_until_or(Duration::from_secs(30), || {
             live.iter().all(|n| {
                 owner_in_view_of(n, a).as_deref() == Some(replica_id.as_str())
                     && owner_in_view_of(n, ranges[1].0).as_deref() == Some(replica_id.as_str())
                     && n.cluster_info("cluster_state") == "ok"
             })
-        },
+        }),
+        "not every node has it as the owner of both sets of slots in 30 s\n{}",
+        logs()
     );
     let absent = after.missing_on(&replica);
     assert!(

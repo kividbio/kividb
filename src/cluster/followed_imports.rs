@@ -213,6 +213,13 @@ struct NotHeld {
     /// The slots not held, with the epoch of the claim that gave each one to
     /// the master here.
     slots: std::collections::BTreeMap<u16, u64>,
+    /// A full sync began, and the claim the master sends ahead of the
+    /// dataset (the last `TAKEN` it keeps) is still to be read: every slot it
+    /// lists is held, at whatever epoch this node heard the master gain it,
+    /// since the dataset has every write to those slots up to it. Ended by
+    /// the first marker after the dataset (that `TAKEN`, or the imports
+    /// marker, which the master sends after it).
+    sync_claim_due: bool,
 }
 
 impl NotHeld {
@@ -288,13 +295,19 @@ impl FollowedImports {
     }
 
     /// The stream of `master` confirmed `ranges`: a `TAKEN` at `epoch`
-    /// (`exact` false: every gain at that epoch or before), or an `ARRIVED`
-    /// at it (`exact`: gains at that very epoch).
+    /// (`exact` false: every gain at that epoch or before; the one sent ahead
+    /// of a full sync's dataset, every gain of its slots), or an `ARRIVED` at
+    /// it (`exact`: gains at that very epoch).
     fn confirm_held(&self, master: NodeId, epoch: u64, ranges: &[(u16, u16)], exact: bool) {
         let mut not_held = self.not_held.lock();
         if not_held.master != Some(master) {
             return;
         }
+        let epoch = if !exact && std::mem::take(&mut not_held.sync_claim_due) {
+            u64::MAX
+        } else {
+            epoch
+        };
         not_held.slots.retain(|slot, gained_at| {
             !(in_ranges(ranges, *slot)
                 && if exact {
@@ -320,10 +333,16 @@ impl FollowedImports {
         *self.not_held.lock() = NotHeld::default();
     }
 
-    /// A session with `master` began; its stream carries markers
-    /// (`marked`), or not (1.2: every slot of it in the table is held, as
-    /// before).
-    fn session_with(&self, master: Option<NodeId>, marked: bool) {
+    /// The imports marker was read: the claim sent ahead of a full sync's
+    /// dataset, if any, came before it.
+    fn sync_claim_read(&self) {
+        self.not_held.lock().sync_claim_due = false;
+    }
+
+    /// A session with `master` began, a full sync (`full`) or not; its
+    /// stream carries markers (`marked`), or not (1.2: every slot of it in
+    /// the table is held, as before).
+    fn session_with(&self, master: Option<NodeId>, marked: bool, full: bool) {
         let mut not_held = self.not_held.lock();
         match master {
             Some(master) => not_held.about(master),
@@ -333,6 +352,7 @@ impl FollowedImports {
             }
         }
         not_held.plain = !marked;
+        not_held.sync_claim_due = marked && full;
         if not_held.plain {
             not_held.slots.clear();
         }
@@ -575,7 +595,7 @@ fn note_masters_arrived(cluster: &ClusterState, epoch: u64, ranges: Ranges) {
 /// `epoch`, as its heartbeat would bring it, applied in the marker's place
 /// in the stream.
 fn take_in_masters_claim(cluster: &ClusterState, epoch: u64, ranges: &[(u16, u16)]) {
-    if cluster.my_master_id().is_none() || ranges.is_empty() || test_ignores_stream_claims() {
+    if cluster.my_master_id().is_none() || ranges.is_empty() {
         return;
     }
     // The claim of the master whose stream this is: taken in only while it
@@ -583,11 +603,16 @@ fn take_in_masters_claim(cluster: &ClusterState, epoch: u64, ranges: &[(u16, u16
     let Some(master) = origin_if_followed(cluster, "a claim of slots") else {
         return;
     };
-    cluster.take_in_claims_of_master(master, epoch, ranges);
-    // Its slots are held: the stream confirmed them.
+    // Its slots are held: the stream confirmed them. (Also for a test of a
+    // replica that takes the claim itself into its table only from the
+    // heartbeats.)
     cluster
         .followed_imports
         .confirm_held(master, epoch, ranges, false);
+    if test_ignores_stream_claims() {
+        return;
+    }
+    cluster.take_in_claims_of_master(master, epoch, ranges);
     // What arrived for a takeover at this epoch or before is the master's
     // here now, or was taken from it since by a newer claim.
     let master = node_id_str(&master);
@@ -719,7 +744,7 @@ pub(crate) fn on_event(
     let followed = &cluster.followed_imports;
     match event {
         SlotImportsEvent::Session { marked, full } => {
-            followed.session_with(cluster.my_master_id(), marked);
+            followed.session_with(cluster.my_master_id(), marked, full);
             // What arrived (`ARRIVED`) is in this node's dataset while that
             // is the stream it was read in: not after a full sync, nor once
             // this node follows another master; still after a partial
@@ -761,6 +786,7 @@ pub(crate) fn on_event(
                 note_masters_arrived(cluster, epoch, ranges);
                 return;
             }
+            followed.sync_claim_read();
             let Some((live, listed)) = parse_marker(args) else {
                 log_warn!(
                     "Cluster: the master sent a slot-imports marker this node cannot read; \
@@ -1447,12 +1473,24 @@ mod tests {
         f.note_gains(m, &[(30, 8), (31, 9)]);
         assert_eq!(f.not_held_of(m), vec![11, 31]);
         // A session with a master without markers: everything held.
-        f.session_with(Some(m), false);
+        f.session_with(Some(m), false, false);
         assert!(f.not_held_of(m).is_empty());
         f.note_gains(m, &[(40, 9)]);
         assert!(f.not_held_of(m).is_empty());
         // Another master: what was noted of the first is forgotten.
-        f.session_with(Some(m), true);
+        // A full sync: the claim sent ahead of the dataset confirms the
+        // slots it lists at any epoch; the next one by the epoch rule.
+        f.session_with(Some(m), true, true);
+        f.note_gains(m, &[(41, 12), (42, 12), (43, 12)]);
+        f.confirm_held(m, 3, &[(41, 42)], false);
+        assert_eq!(f.not_held_of(m), vec![43]);
+        f.confirm_held(m, 3, &[(43, 43)], false);
+        assert_eq!(f.not_held_of(m), vec![43]);
+        f.session_with(Some(m), true, true);
+        f.sync_claim_read();
+        f.confirm_held(m, 3, &[(43, 43)], false);
+        assert_eq!(f.not_held_of(m), vec![43], "the claim came after the imports marker");
+        f.session_with(Some(m), true, false);
         f.note_gains(m, &[(50, 9)]);
         f.note_gains(other, &[(60, 3)]);
         assert!(f.not_held_of(m).is_empty());
