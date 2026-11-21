@@ -146,6 +146,53 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`VSIM` searches an HNSW graph of the vector set (#710).** A set of 4,096
+  elements or more gets a graph over its elements (the one `FT.SEARCH`'s
+  vector fields use, one per set), and `VSIM` explores `EF` candidates in it
+  (100 unless given, Redis's default); `TRUTH` scans every element, and a
+  smaller set is always scanned (exact, and at that size as fast). A set's
+  graph holds each vector as the set stores it (`Q8` or `BIN` bytes, or an
+  f32 set's floats bit for bit), and the vector is kept once, in the graph;
+  scores do not depend on how an element was found. With no helper threads
+  (`search-index-threads` 0, or `auto` below 8 CPUs) a set's vectors are
+  linked by threads of its own (half the CPUs, at most four). `EF`,
+  `EPSILON`, `FILTER-EF` and `TRUTH` on `VSIM`, and `M` and `EF` on the
+  `VADD` that makes a set, do what they do in Redis (another `M` than the
+  set's is refused), and `VSIM`'s options are checked as Redis checks them.
+  `VINFO` gives Redis's fields (`hnsw-m`, `size`, `max-level`,
+  `attributes-count`, ...; simple-string names, a map in RESP3) and `VLINKS`
+  the element's links per layer, top layer first. Two replies change as
+  Redis has them: `VLINKS ... WITHSCORES` gives each score as a double
+  (RESP3) or Redis's 17-digit string (RESP2), where it was a 6-decimal
+  string, and refuses anything after `WITHSCORES`; `VSIM ... ELE` of an
+  element the set does not hold is `ERR element not found in set` (it was
+  `ERR element not found in vector set`). Writes change the graph in their own order, so an element a
+  `VADD` was answered for is found by the next `VSIM`, and a removed one
+  never is. The graph is not saved: it is made again from the vectors after
+  a load, `RESTORE`, `COPY` or full sync, while `VSIM` scans, so snapshots
+  stay readable by 1.2 (1,000,000 128-d vectors: loaded in 0.8 s, the graph
+  made 89 s later; Redis loads its saved graph in 9.2 s). An AOF replay
+  writes no graph either: 1,000,000 `VADD`s replay in 4.2 s (3.6 s with no
+  graph at all) and the graph follows in the background.
+  On a D8s_v5, `Q8`, `COUNT 10` at the defaults, against Redis 8.10.2 in the
+  same session, queries a second at 1 / 8 / 50 connections and bytes a
+  vector: 100,000 SIFT vectors (128-d) 3,256 / 13,921 / 16,506 and 612 B
+  (exact scan before: 148 / 589 / 550 and 224 B; Redis 2,262 / 8,086 /
+  8,842 and 885 B), recall@10 0.975 (Redis 0.973); 1,000,000 SIFT vectors
+  2,362 / 9,921 / 11,748 and 754 B (before 9 / 35 / 35; Redis 1,697 / 6,532
+  / 7,245 and 885 B), recall 0.959 (Redis 0.953); 100,000 glove-100 vectors
+  2,906 / 13,015 / 14,290 and 548 B (Redis 1,772 / 6,908 / 7,671 and 869 B),
+  recall 0.896 (Redis 0.874); 100,000 LAION vectors (768-d) 2,132 / 8,805 /
+  9,956 and 1,254 B (Redis 1,597 / 6,015 / 6,626 and 1,525 B), recall 0.969
+  (Redis 0.967); `NOQUANT` on both, 100,000 SIFT vectors 2,552 / 11,472 /
+  12,606 and 997 B (Redis 2,080 / 7,519 / 8,235 and 1,269 B), 100,000 LAION
+  vectors 1,306 / 5,017 / 5,439 and 3,564 B (Redis 1,160 / 4,505 / 4,848 and
+  3,829 B). `VADD` links each element into the graph: 18,924 SIFT
+  vectors a second from 4 loading connections (19,294 from one and 18,856
+  from eight: the seven helper threads link them, all busy; before, with
+  no graph, 248,544; Redis 4,263). Regression suite `44-vector-sets-hnsw`
+  measures it. @Parikalp-Bhardwaj pointed this out in #697.
+
 - **`cluster-announce-client-ipv4` and `cluster-announce-client-ipv6` (#847),
   as in Valkey 8.** The address a client is told to reach a node at, where it
   is not the one nodes use between themselves: a client connected over IPv6
@@ -1814,6 +1861,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   move (callgrind, 0.1%).
 
 ### Fixed
+
+- **Vectors written at once into an empty HNSW index all link into its
+  graph.** Inserts that find the graph empty take turns: the first is the
+  entry point and the others link to it, whether they come from a vector
+  set's linking threads or from several connections writing an index's
+  first documents (#710).
 
 - **Memory a heavy write load leaves in the allocator goes back to the
   system once the server is idle, even when nothing was deleted (#245).**
