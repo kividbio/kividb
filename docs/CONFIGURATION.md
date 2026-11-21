@@ -165,6 +165,46 @@ system as soon as its last member or field is removed. `INFO memory` reports tho
 `value_slab_pool_bytes`, apart from `value_slab_bytes` (the keyspace's slabs, which defrag
 compacts).
 
+### Active defrag
+
+Keys' entries, and string values kept apart from them, whose block (header included) is at
+most 4 KiB live in 64 KiB slabs of one block size each. A slab nobody is filling is used for new blocks again once a quarter of it is free;
+until then its free blocks are memory the process holds. Active defrag (`activedefrag`, on by
+default) moves values out of the sparsest slabs so that they empty and their pages go back to
+the system: the slabs a quarter free and more, and the full ones with at least
+`active-defrag-full-slab-free-percent` of their blocks free. What it moves goes into the room
+of the other slabs of its size first, and only then into new slabs. It runs on a thread of its
+own, at most `active-defrag-cycle-max` per cent of one core, and lets go of a shard between
+batches, so a command waits for at most one batch of moves.
+
+A pass starts when either of two triggers is met, and stops when the waste is under half of
+both:
+
+| setting | default | |
+|---|---|---|
+| `active-defrag-threshold-lower` | `20` | the slabs hold this many per cent more than the values in them ... |
+| `active-defrag-ignore-bytes` | `64mb` | ... and that is more than this many bytes (both as in Redis) |
+| `active-defrag-slab-waste-percent` | `10` | or the free room inside the slabs is more than this many per cent of them ... (`0` turns this trigger off) |
+| `active-defrag-slab-waste-bytes` | `16mb` | ... and more than this many bytes |
+| `active-defrag-full-slab-free-percent` | `12` | a full slab is emptied when at least this many per cent of its blocks are free (`0`: full slabs are left alone) |
+| `active-defrag-cycle-max` | `10` | the most of one core it uses, a percentage |
+
+No pass starts while a snapshot (`BGSAVE`), an AOF rewrite or a backup is being written (the
+values it holds cannot move), or while the values in the slabs grew by more than a 32nd of
+them in the last second (a large delete being refilled: the writes take the free room
+themselves). A pass that the slab-waste trigger started and that got little back (the slabs it
+emptied, less the new ones it took, under one in 32 of those it emptied) keeps that trigger off
+for 30 seconds, then twice as long each time in a row, up to 10 minutes. All of these change
+at run time with `CONFIG SET`.
+
+`INFO memory` shows the slabs (`value_slab_bytes`), the values in them
+(`value_slab_live_bytes`), what the full slabs have free (`value_slab_full_free_bytes`), and
+active defrag's work: `active_defrag_running`, `active_defrag_hits` (values moved),
+`active_defrag_misses` (values left where they were because something else held them, such as a
+snapshot being written), `active_defrag_passes`, `active_defrag_slabs_emptied` and
+`active_defrag_last_pass_ms` (how long the last pass took). `CONFIG RESETSTAT` sets the counts
+to 0.
+
 Persistence (snapshots and the AOF) is described in [PERSISTENCE.md](PERSISTENCE.md),
 including `rdbcompression` (default `no`; `yes` writes snapshots compressed, which 1.2 cannot read) and the
 `kividb kdb-decompress <in> <out>` and `kividb kdb-compress <in> <out>` tools, which convert a

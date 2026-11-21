@@ -877,6 +877,8 @@ pub static PAUSE_BETWEEN_PASSES: Mutex<Option<fn()>> = Mutex::new(None);
 /// slabs (see [`plan_evacuation_with_full`]). Returns how many it chose. Only
 /// the keyspace's classes: never a slab of the entry pool, whose blocks
 /// compaction cannot move.
+// The library's, for tests; the server asks for full slabs too.
+#[allow(dead_code)]
 pub fn plan_evacuation(budget: usize) -> usize {
     plan(budget, 0, 0..CLASSES)
 }
@@ -1259,6 +1261,8 @@ impl Drop for OnlyEvacuating {
 /// slab is in its class's list, and every slab is counted in use or empty.
 /// The first thing wrong, if any. For tests: it takes every class's lock.
 #[doc(hidden)]
+// The library's, for tests; the server does not ask.
+#[allow(dead_code)]
 pub fn check_lists(quiescent: bool) -> Result<(), String> {
     let regions = REGION_LIST.lock().clone();
     let headers = || {
@@ -1280,10 +1284,16 @@ pub fn check_lists(quiescent: bool) -> Result<(), String> {
             let s = unsafe { &*slab.0 };
             let what = format!("class {class}: partial slab {at} ({:p})", slab.0);
             if s.state.load(Ordering::Relaxed) != PARTIAL {
-                return Err(format!("{what} is in state {}", s.state.load(Ordering::Relaxed)));
+                return Err(format!(
+                    "{what} is in state {}",
+                    s.state.load(Ordering::Relaxed)
+                ));
             }
             if s.class.load(Ordering::Relaxed) as usize != class {
-                return Err(format!("{what} is of class {}", s.class.load(Ordering::Relaxed)));
+                return Err(format!(
+                    "{what} is of class {}",
+                    s.class.load(Ordering::Relaxed)
+                ));
             }
             // SAFETY: under the class's lock.
             if unsafe { *s.index.get() } as usize != at {
@@ -1309,23 +1319,35 @@ pub fn check_lists(quiescent: bool) -> Result<(), String> {
                 return Err(format!("{what} is the marker, left in the list"));
             }
             if s.state.load(Ordering::Relaxed) != FULL {
-                return Err(format!("{what} is in state {}", s.state.load(Ordering::Relaxed)));
+                return Err(format!(
+                    "{what} is in state {}",
+                    s.state.load(Ordering::Relaxed)
+                ));
             }
             if s.class.load(Ordering::Relaxed) as usize != class {
-                return Err(format!("{what} is of class {}", s.class.load(Ordering::Relaxed)));
+                return Err(format!(
+                    "{what} is of class {}",
+                    s.class.load(Ordering::Relaxed)
+                ));
             }
             if !listed.insert(at as usize) {
                 return Err(format!("{what} is listed twice"));
             }
             count += 1;
             if count > lists.full_len {
-                return Err(format!("class {class}: more full slabs than {}", lists.full_len));
+                return Err(format!(
+                    "class {class}: more full slabs than {}",
+                    lists.full_len
+                ));
             }
             prev = at;
             at = unsafe { *s.next.get() };
         }
         if count != lists.full_len {
-            return Err(format!("class {class}: {count} full slabs, counted {}", lists.full_len));
+            return Err(format!(
+                "class {class}: {count} full slabs, counted {}",
+                lists.full_len
+            ));
         }
     }
     if quiescent {
@@ -1338,14 +1360,22 @@ pub fn check_lists(quiescent: bool) -> Result<(), String> {
                 _ if class < CLASSES => in_use += 1,
                 _ => pool_in_use += 1,
             }
-            if (state == PARTIAL || state == FULL) && !listed.contains(&(s as *const Slab as usize)) {
-                return Err(format!("a slab of class {class} in state {state} is in no list"));
+            if (state == PARTIAL || state == FULL) && !listed.contains(&(s as *const Slab as usize))
+            {
+                return Err(format!(
+                    "a slab of class {class} in state {state} is in no list"
+                ));
             }
-            if (state != PARTIAL && state != FULL) && listed.contains(&(s as *const Slab as usize)) {
-                return Err(format!("a slab of class {class} in state {state} is listed"));
+            if (state != PARTIAL && state != FULL) && listed.contains(&(s as *const Slab as usize))
+            {
+                return Err(format!(
+                    "a slab of class {class} in state {state} is listed"
+                ));
             }
         }
-        if in_use != IN_USE.load(Ordering::Relaxed) || pool_in_use != POOL_IN_USE.load(Ordering::Relaxed) {
+        if in_use != IN_USE.load(Ordering::Relaxed)
+            || pool_in_use != POOL_IN_USE.load(Ordering::Relaxed)
+        {
             return Err(format!(
                 "{in_use} slabs in use ({} counted), {pool_in_use} of the pool ({} counted)",
                 IN_USE.load(Ordering::Relaxed),
@@ -1353,7 +1383,10 @@ pub fn check_lists(quiescent: bool) -> Result<(), String> {
             ));
         }
         if empty != EMPTY_SLABS.lock().len() {
-            return Err(format!("{empty} empty slabs, {} in the list", EMPTY_SLABS.lock().len()));
+            return Err(format!(
+                "{empty} empty slabs, {} in the list",
+                EMPTY_SLABS.lock().len()
+            ));
         }
     }
     Ok(())
@@ -1605,7 +1638,9 @@ mod tests {
                     plan(usize::MAX, threshold as u32, class..class + 1);
                     let chosen: Vec<usize> = per_slab(&blocks)
                         .into_keys()
-                        .filter(|&base| slab_of(base as *const u8).state.load(Ordering::Relaxed) == EVACUATING)
+                        .filter(|&base| {
+                            slab_of(base as *const u8).state.load(Ordering::Relaxed) == EVACUATING
+                        })
                         .collect();
                     assert_eq!(chosen, expected, "threshold {threshold}");
                     check_model(class, &blocks, &chosen);
@@ -1669,7 +1704,10 @@ mod tests {
                 drop(lists);
                 turns += 1;
             }
-            extra.iter().map(|s| s.as_ref() as *const Slab as usize).collect::<Vec<_>>()
+            extra
+                .iter()
+                .map(|s| s.as_ref() as *const Slab as usize)
+                .collect::<Vec<_>>()
         });
         let mut seen = Vec::new();
         for _ in 0..if cfg!(miri) { 1 } else { 20 } {
@@ -1678,9 +1716,15 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         let extra = churn.join().unwrap();
-        let all: std::collections::HashSet<usize> =
-            slabs.iter().map(|s| s.as_ref() as *const Slab as usize).collect();
-        let stayed: Vec<usize> = seen.iter().copied().filter(|s| !extra.contains(s)).collect();
+        let all: std::collections::HashSet<usize> = slabs
+            .iter()
+            .map(|s| s.as_ref() as *const Slab as usize)
+            .collect();
+        let stayed: Vec<usize> = seen
+            .iter()
+            .copied()
+            .filter(|s| !extra.contains(s))
+            .collect();
         let unique: std::collections::HashSet<usize> = stayed.iter().copied().collect();
         assert_eq!(unique.len(), stayed.len(), "a slab seen twice");
         assert_eq!(unique, all, "a slab that stayed in the list not seen");

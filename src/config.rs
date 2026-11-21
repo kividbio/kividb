@@ -2161,7 +2161,9 @@ impl Config {
             "active-defrag-slab-waste-percent" => {
                 let n: u32 = number(key, one()?)?;
                 if n > 100 {
-                    return Err("'active-defrag-slab-waste-percent' must be between 0 and 100".into());
+                    return Err(
+                        "'active-defrag-slab-waste-percent' must be between 0 and 100".into(),
+                    );
                 }
                 set!(active_defrag_slab_waste_percent, n)
             }
