@@ -1619,16 +1619,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   an Azure D8s_v5 (`benchmarks/1.3.0/regressions/suites/43-slab-churn.py`),
   RSS 60 s after three cycles of deleting and rewriting a random part of
   the keys, against what was loaded: 1,000,000 keys of 1 KB, 10 % a cycle,
-  1.05x (1.15x before; Redis 8.10.2 1.00x at 1.25x KiviDB's load); 20 %,
-  1.05x (1.10x), and the peak during the churn 1.15x where it was 1.28x
+  1.03x (1.15x before; Redis 8.10.2 1.00x at 1.25x KiviDB's load); 20 %,
+  1.03x (1.10x), and the peak during the churn 1.14x where it was 1.28x
   (1.14x with active defrag off); 100-byte values 1.05x (1.16x). The peak
-  stays within 1.5 % of active defrag off. 2,000,000 keys of 1 KB under
-  40,000 SETs a second, after `BGSAVE` and `BGREWRITEAOF`: 2,216 MiB (2,292
-  before, Redis 2,584), and the highest RSS through both 2,605 MiB (2,859).
-  `GET`/`SET` p99 during a pass under reads and overwrites stays as it is
-  (0.51-0.69 ms, 0.49-0.50 ms before the pass; master 0.50-0.66 ms), and a
-  pass over 700,000 keys takes 8 s. Values of 100 B to 16 KB, mostly in the
-  system allocator, are unchanged. Design agreed with @Parikalp-Bhardwaj,
+  stays within 0.8 % of active defrag off. 2,000,000 keys of 1 KB under
+  40,000 SETs a second, 30 s after `BGSAVE`, `BGREWRITEAOF` and the writes:
+  2,239-2,277 MiB (2,292 before, Redis 2,584), and the highest RSS through
+  them 2,565 MiB (2,859). `GET`/`SET` p99 during a pass under reads and
+  overwrites stays as it is (0.50-0.52 ms, as in the seconds before it;
+  master 0.50-0.64 ms during its own pass); a pass over 700,000 keys takes
+  about 20 s at the default 10 % of a core. Values of 100 B to 16 KB, mostly
+  in the system allocator, are unchanged. Design agreed with @Parikalp-Bhardwaj,
   whose measurement showed that the free room a `BGSAVE` leaves is in full
   slabs.
 

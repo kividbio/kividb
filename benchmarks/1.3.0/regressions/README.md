@@ -1719,6 +1719,41 @@ values of `results/pr-760-d8s_v5`, for two reasons:
   the default `EF_RUNTIME` and at 50 (the same search), 0.488 against 0.494;
   master's `d384` no filter at the default and at 50, 0.36 against 0.364.
 
+## Recorded run, suite 43
+
+Recorded 2026-11-21 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C),
+`--only 43 --record` (`results/pr990-10c80218-d8s_v5`); the candidate is
+`10c80218` (#240), `cargo build --release` with rustc 1.100.0; Redis 8.10.2
+from the VM image. The server has CPUs 0-3 and the clients 4-7. The run took
+30 minutes. Master `c6ad09bb` was measured on the same VM the same day with
+the suite's configurations one at a time, as was the candidate with
+`activedefrag no` (the peak it is compared with):
+
+| MiB | v1.2.2 | master | candidate | candidate, defrag off | Redis 8.10.2 |
+|---|---:|---:|---:|---:|---:|
+| 1 KB, 10 %: loaded / peak / 60 s after | 1,044 / 1,197 / 1,197 | 1,045 / 1,199 / 1,199 | 1,045 / 1,206 / **1,080** | 1,045 / 1,197 / 1,197 | 1,302 / 1,303 / 1,299 |
+| 1 KB, 20 % | 1,044 / 1,340 / 1,147 | 1,046 / 1,342 / 1,149 | 1,045 / 1,194 / **1,079** | 1,046 / 1,190 / 1,181 | 1,302 / 1,304 / 1,300 |
+| 100 B, 10 % | 155.4 / 179.8 / 179.8 | 157.1 / 181.8 / 181.8 | 156.8 / 182.5 / **165.0** | 157.4 / 181.7 / 181.7 | 178.9 / 178.9 / 174.1 |
+| 100 B, 20 % | 156.2 / 180.5 / 180.5 | 156.6 / 181.5 / 181.5 | 155.8 / 182.9 / **163.4** | 157.0 / 181.8 / 181.8 | 179.0 / 180.3 / 174.8 |
+| 100 B-16 KB, 10 % / 20 %, 60 s after | 1,005 / 1,008 | 992 / 1,009 | 992 / 996 | | 1,056 / 1,056 |
+| snapshot: after `BGSAVE` / after the rewrite / 30 s after the writes / highest | 2,287 / 2,288 / 2,288 / 3,084 | 2,288 / 2,291 / 2,292 / 2,859 | 2,289 / 2,279 / 2,277 / **2,565** | | 2,584 / 2,586 / 2,584 / 2,674 |
+
+- After the churn the candidate holds 1.03x (1 KB) and 1.05x (100 B) what it
+  held loaded, against 1.10x to 1.16x; its peak is within 0.8 % of the same
+  build's with active defrag off, where v1.2.2 and master peak at 1.28x in the
+  1 KB 20 % case (their pass runs during the churn).
+- 100 B to 16 KB: three quarters of the values are above 4 KiB, in the
+  system allocator; the rows move within glibc's spread.
+- Snapshot: after `BGSAVE`, 215 of the 217 MiB free inside the slabs were in
+  full slabs, 9.7 % of them, just under the slab-waste trigger. The writers
+  (40,000 `SET`s a second over every key) make new room about as fast as a
+  pass at 10 % of a core takes it back, so the marks under writes move little;
+  the highest RSS is lower as no pass runs during the save or the rewrite.
+- Gates: `settled_x_load` at most 1.07x (100 B and 1 KB) and +5 %;
+  `settled_rss_mib` and `final_rss_mib` +5 %; `peak_x_load` +10 %; the
+  pass's p99 at most 1.5x the seconds before it plus 0.2 ms
+  (`*_p99_excess_ms`), and its p99 and p99.9 within 25 % or 0.2 ms.
+
 ## Not covered
 
 Every row of the gains table in `docs/PERFORMANCE.md` has a suite here (01-13; 14 is #759 and 15 is #758, after that table).
