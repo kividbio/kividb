@@ -603,16 +603,19 @@ fn take_in_masters_claim(cluster: &ClusterState, epoch: u64, ranges: &[(u16, u16
     let Some(master) = origin_if_followed(cluster, "a claim of slots") else {
         return;
     };
-    // Its slots are held: the stream confirmed them. (Also for a test of a
-    // replica that takes the claim itself into its table only from the
-    // heartbeats.)
+    // Taken into the table first, then its slots held: the stream confirmed
+    // them. (Held also for a test of a replica that takes the claim into its
+    // table only from the heartbeats.)
+    let ignored = test_ignores_stream_claims();
+    if !ignored {
+        cluster.take_in_claims_of_master(master, epoch, ranges);
+    }
     cluster
         .followed_imports
         .confirm_held(master, epoch, ranges, false);
-    if test_ignores_stream_claims() {
+    if ignored {
         return;
     }
-    cluster.take_in_claims_of_master(master, epoch, ranges);
     // What arrived for a takeover at this epoch or before is the master's
     // here now, or was taken from it since by a newer claim.
     let master = node_id_str(&master);
