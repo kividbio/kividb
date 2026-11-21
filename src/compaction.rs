@@ -134,10 +134,11 @@ const CALM_TICKS: u32 = 5;
 /// A round's budget: bytes of the values moved that may go into new slabs,
 /// one this-many-th of the slabs (at least [`BUDGET_MIN`]). They are held
 /// twice until the slabs they left empty, at the end of the round: what a
-/// pass adds to the peak. During a churn of 1 KB values, a pass with an
-/// eighth took the peak to 1.27x what was loaded, with a 32nd to 1.18x,
-/// against 1.15x with active defrag off (#240).
-const BUDGET_SHARE: usize = 64;
+/// pass adds to the peak, over what the slabs were when it started. During a
+/// churn of 1 KB values, a pass with an eighth took the peak to 1.27x what
+/// was loaded, with a 32nd to 1.18x, with a 64th to 1.16x, against 1.15x
+/// with active defrag off (#240).
+const BUDGET_SHARE: usize = 128;
 const BUDGET_MIN: usize = 1 << 20;
 
 /// Whether what is in the slabs moved from `before` to `now` by more than
