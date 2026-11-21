@@ -1890,11 +1890,8 @@ impl ClusterState {
         self.current_epoch.fetch_max(highest, Ordering::SeqCst);
         let epoch = self.current_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         node.config_epoch = epoch;
-        let master = node.flags.contains(NodeFlags::MASTER);
-        drop(nodes);
-        if master {
-            self.send_claims_to_replicas(&[], epoch);
-        }
+        // No slot changes hands: the new epoch reaches this node's replicas
+        // with its heartbeats, as it reaches every other node.
         (true, epoch)
     }
 
