@@ -153,7 +153,15 @@ static SLABS_HIGH: AtomicUsize = AtomicUsize::new(0);
 /// back, its rounds grow, and it ends sooner: in rounds of 17 MiB, a pass
 /// after the snapshot case (2,000,000 keys of 1 KB, #240) had not ended 30 s
 /// after the writes stopped.
+///
+/// The mark comes down to the slabs when they fall under half of it (a
+/// `FLUSHALL`, a delete of half the keys): their pages went back to the
+/// kernel then, and taking that much again would be a new peak for what the
+/// process holds now, not an old one.
 fn budget(slabs: usize) -> usize {
+    if slabs < SLABS_HIGH.load(Ordering::Relaxed) / 2 {
+        SLABS_HIGH.store(slabs, Ordering::Relaxed);
+    }
     let high = SLABS_HIGH.fetch_max(slabs, Ordering::Relaxed).max(slabs);
     let small = (slabs / BUDGET_SHARE).max(BUDGET_MIN);
     small.max((high - slabs).min(slabs / 8))
@@ -165,23 +173,31 @@ fn churning(before: usize, now: usize, slabs: usize) -> bool {
     WAIT_FOR_REFILL.load(Ordering::Relaxed) && now.abs_diff(before) > slabs / REFILL
 }
 
-/// What a round watches while it runs: the bytes the process has allocated
-/// (`used_memory`'s count, which the round's own moves leave as it was)
-/// when it started. A delete or a refill that starts meanwhile moves it by
-/// more than one [`REFILL`]th of the slabs, and the round ends there: the
-/// partial slabs it chose go back to their list for the writes to fill, and
-/// it takes no more new slabs on top of theirs.
+/// What a round watches while it runs: the bytes of the blocks handed out of
+/// the slabs, but for this thread's own (`Fill::others_bytes`), when it
+/// started: the measure the calm before a pass is judged on, which neither
+/// the round's own moves nor the clients' buffers, the AOF's or a replica's
+/// move. A delete or a refill that starts meanwhile moves it by more than
+/// one [`REFILL`]th of the slabs, and the round ends there: the partial
+/// slabs it chose go back to their list for the writes to fill, and it takes
+/// no more new slabs on top of theirs. Looked at every [`CALM_EVERY`] at
+/// most: a look reads every slab's header.
 struct Calm {
-    allocated: usize,
+    others: usize,
     within: usize,
+    looked: Cell<Instant>,
     broken: Cell<bool>,
 }
 
+/// How often a round looks whether the clients started a delete or a refill.
+const CALM_EVERY: Duration = Duration::from_millis(10);
+
 impl Calm {
-    fn new(slab_bytes: usize) -> Self {
+    fn new(fill: &value_slab::Fill) -> Self {
         Calm {
-            allocated: crate::memory_use::allocated(),
-            within: slab_bytes / REFILL,
+            others: fill.others_bytes,
+            within: fill.slab_bytes / REFILL,
+            looked: Cell::new(Instant::now()),
             broken: Cell::new(false),
         }
     }
@@ -189,15 +205,22 @@ impl Calm {
     /// Whether the clients started deleting or refilling since the round
     /// began; once so, so for the rest of the round.
     fn broken(&self) -> bool {
-        if !self.broken.get()
-            && WAIT_FOR_REFILL.load(Ordering::Relaxed)
-            && crate::memory_use::allocated().abs_diff(self.allocated) > self.within
-        {
-            self.broken.set(true);
+        if self.broken.get() || !WAIT_FOR_REFILL.load(Ordering::Relaxed) {
+            return self.broken.get() || CUT_ROUNDS.load(Ordering::Relaxed);
+        }
+        if self.looked.get().elapsed() >= CALM_EVERY {
+            self.looked.set(Instant::now());
+            if value_slab::fill().others_bytes.abs_diff(self.others) > self.within {
+                self.broken.set(true);
+            }
         }
         self.broken.get()
     }
 }
+
+/// For tests: every round is cut short as by a delete, whether or not the
+/// pass waits out deletes and refills.
+static CUT_ROUNDS: AtomicBool = AtomicBool::new(false);
 
 /// A pass the slab-waste trigger started gets little back when the slabs it
 /// emptied, less the new ones it took, are under one in this many of those
@@ -420,11 +443,14 @@ fn wasting(fill: &value_slab::Fill, half: bool, slab_waste: bool) -> Option<Trig
     if waste > ignore && waste * 100 > fill.live_bytes as u64 * u64::from(percent) {
         return Some(Trigger::Ratio);
     }
+    // The free blocks: not a slab's end that no block fits in, which no pass
+    // gets back.
+    let free = fill.free_bytes as u64;
     let (bytes, percent) = (slab_waste_bytes() / div, u64::from(slab_waste_percent()));
     if slab_waste
         && percent > 0
-        && waste > bytes
-        && waste * 100 * div > fill.slab_bytes as u64 * percent
+        && free > bytes
+        && free * 100 * div > fill.slab_bytes as u64 * percent
     {
         return Some(Trigger::SlabWaste);
     }
@@ -653,31 +679,40 @@ fn pass(store: &Store, streak: &mut Streak) -> Result<bool, Failed> {
             // otherwise cut each pass short, the new slabs it took kept.
             let churned = streak
                 .live_before
-                .is_none_or(|before| churning(before, fill.live_bytes, fill.slab_bytes));
+                .is_none_or(|before| churning(before, fill.others_bytes, fill.slab_bytes));
             streak.calm = if churned {
                 0
             } else {
                 streak.calm.saturating_add(1)
             };
-            streak.live_before = Some(fill.live_bytes);
+            streak.live_before = Some(fill.others_bytes);
             SLABS_HIGH.fetch_max(fill.slab_bytes, Ordering::Relaxed);
             let Some(trigger) = wasting(&fill, false, streak.slab_waste_on()) else {
                 return false;
             };
             let waiting = WAIT_FOR_REFILL.load(Ordering::Relaxed) && streak.calm < CALM_TICKS;
-            if waiting || snapshotting() {
+            // The ratio trigger runs beside a snapshot, as it always has, so
+            // that a server that saves all the time is still compacted; the
+            // slab-waste one waits for the snapshot's old values to be freed.
+            if waiting || (trigger == Trigger::SlabWaste && snapshotting()) {
                 return false;
             }
             let started = Instant::now();
             let got = compact(store);
             PASSES.fetch_add(1, Ordering::Relaxed);
             LAST_PASS_MS.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-            // One that stopped before it looked for slabs, or that a delete
-            // or a refill cut short, says nothing either way.
-            if trigger == Trigger::SlabWaste && got.planned > 0 && !got.cut {
-                streak.waste_pass_ended(got.enough());
+            // One that stopped before it looked for slabs says nothing either
+            // way; one that a delete or a refill cut short got little back,
+            // and the next waits for five calm ticks again: with clients
+            // whose writes come and go in bursts, passes would otherwise be
+            // cut and started again every tick.
+            if trigger == Trigger::SlabWaste && got.planned > 0 {
+                streak.waste_pass_ended(got.enough() && !got.cut);
             }
-            streak.live_before = Some(value_slab::fill().live_bytes);
+            if got.cut {
+                streak.calm = 0;
+            }
+            streak.live_before = Some(value_slab::fill().others_bytes);
             true
         }))
     });
@@ -798,23 +833,31 @@ fn compact(store: &Store) -> Got {
     let mut got = Got::default();
     let mut live_before: Option<usize> = None;
     loop {
-        if !enabled() || snapshotting() {
+        if !enabled() {
             break;
         }
         let fill = value_slab::fill();
         let Some(why) = wasting(&fill, true, true) else {
             break;
         };
+        // Past the ratio trigger's half, not beside a snapshot.
+        if why == Trigger::SlabWaste && snapshotting() {
+            break;
+        }
         // The clients deleting or refilling meanwhile: until they are done.
-        if live_before.is_some_and(|before| churning(before, fill.live_bytes, fill.slab_bytes)) {
+        if live_before.is_some_and(|before| churning(before, fill.others_bytes, fill.slab_bytes)) {
             got.cut = true;
             break;
         }
-        live_before = Some(fill.live_bytes);
+        live_before = Some(fill.others_bytes);
         // What may go into new slabs: what is moved takes that new room
         // before the slabs it left are given back.
         let budget = budget(fill.slab_bytes);
-        let full = full_slab_free_percent() * 10;
+        // 100 % free is an empty slab, which is in no list: no full slab.
+        let full = match full_slab_free_percent() {
+            percent @ 1..=99 => percent * 10,
+            _ => 0,
+        };
         got.planned += 1;
         if value_slab::plan_evacuation_with_full(budget, full) == 0 {
             break;
@@ -824,7 +867,7 @@ fn compact(store: &Store) -> Got {
         fault_point(Fault::AfterPlan);
         let regions = value_slab::regions_snapshot();
         let fresh_before = value_slab::fresh_slabs_taken_here();
-        let calm = Calm::new(fill.slab_bytes);
+        let calm = Calm::new(&fill);
         // Counted here, not read from `active_defrag_hits`, which a
         // `CONFIG RESETSTAT` can set to 0 while the set runs (#370).
         let mut moved = 0u64;
@@ -982,6 +1025,9 @@ mod trigger_tests {
             slab_bytes: slab_mib * MIB,
             live_bytes: live_mib * MIB,
             full_free_bytes: 0,
+            // All of the room in free blocks, no slab's end left over.
+            free_bytes: (slab_mib - live_mib) * MIB,
+            others_bytes: live_mib * MIB,
         }
     }
 
@@ -1084,8 +1130,12 @@ mod trigger_tests {
         SLABS_HIGH.store(1100 * MIB, Ordering::Relaxed);
         assert_eq!(budget(1000 * MIB), 100 * MIB);
         // Far below it: an eighth at most.
-        SLABS_HIGH.store(3000 * MIB, Ordering::Relaxed);
+        SLABS_HIGH.store(1900 * MIB, Ordering::Relaxed);
         assert_eq!(budget(1000 * MIB), 125 * MIB);
+        // Under half of it (a FLUSHALL): the mark comes down.
+        SLABS_HIGH.store(3000 * MIB, Ordering::Relaxed);
+        assert_eq!(budget(1000 * MIB), 1000 * MIB / 128);
+        assert_eq!(SLABS_HIGH.load(Ordering::Relaxed), 1000 * MIB);
         // Above it: the mark follows.
         assert_eq!(budget(4000 * MIB), 4000 * MIB / 128);
         assert_eq!(SLABS_HIGH.load(Ordering::Relaxed), 4000 * MIB);
@@ -1301,6 +1351,7 @@ mod tests {
         FAULTS_AFTER_PLAN.store(0, Ordering::Relaxed);
         FAULTS_AFTER_CHUNK.store(0, Ordering::Relaxed);
         FAULT_TURNS_OFF.store(false, Ordering::Relaxed);
+        CUT_ROUNDS.store(false, Ordering::Relaxed);
         value_slab::FAULTS_IN_FINISH.store(0, Ordering::Relaxed);
     }
 
@@ -2013,6 +2064,70 @@ mod tests {
             "{passes} passes, {moved} moved, {emptied} slabs emptied"
         );
         assert!(reads.load(Ordering::Relaxed) > 1000);
+    }
+
+    /// A pass that a delete or a refill cuts short (#240 review): it counts
+    /// as one that got little back, and the next waits for calm ticks again,
+    /// so passes are not cut and started again every tick.
+    #[test]
+    fn a_pass_cut_short_waits_for_calm_and_backs_off() {
+        let _setup = Setup::new();
+        let store = sparse_store(&INLINE);
+        // The slab-waste trigger only.
+        set_threshold_lower(1000);
+        set_slab_waste_percent(1);
+        set_slab_waste_bytes(0);
+        let mut streak = Streak::new();
+        streak.calm = CALM_TICKS;
+        CUT_ROUNDS.store(true, Ordering::Relaxed);
+        let passes = PASSES.load(Ordering::Relaxed);
+        stepped(&store, &mut streak);
+        CUT_ROUNDS.store(false, Ordering::Relaxed);
+        assert_eq!(PASSES.load(Ordering::Relaxed), passes + 1, "no pass ran");
+        assert_eq!(streak.calm, 0, "calm kept after a pass cut short");
+        assert!(
+            !streak.slab_waste_on(),
+            "no back-off after a pass cut short"
+        );
+        // Waiting out deletes again: the next tick runs no pass, however calm.
+        WAIT_FOR_REFILL.store(true, Ordering::Relaxed);
+        streak.waste_off_until = None;
+        stepped(&store, &mut streak);
+        WAIT_FOR_REFILL.store(false, Ordering::Relaxed);
+        assert_eq!(
+            PASSES.load(Ordering::Relaxed),
+            passes + 1,
+            "a pass ran a tick after one cut short"
+        );
+        assert!(streak.calm < CALM_TICKS);
+        check(&store, &INLINE);
+    }
+
+    /// The free room the slab-waste trigger counts leaves out a slab's end
+    /// that no block fits in: slabs of 3,648-byte blocks, all full, have none.
+    #[test]
+    fn a_slabs_unusable_end_is_no_free_room() {
+        let _one = value_slab::EVACUATION_TESTS.lock();
+        let class = value_slab::class_of(3648).unwrap();
+        assert_eq!(value_slab::SLAB % value_slab::block_size(class), 3520);
+        let before = value_slab::fill();
+        let per = value_slab::SLAB / value_slab::block_size(class);
+        // Whole slabs, let go of full by a thread that ends.
+        let blocks: Vec<usize> = crate::cpus::spawn(move || {
+            (0..per * 8)
+                .map(|_| value_slab::alloc(class).as_ptr() as usize)
+                .collect()
+        })
+        .join()
+        .unwrap();
+        let after = value_slab::fill();
+        // Eight more slabs, as many bytes in use, no more free room (other
+        // tests may move it by a block or two meanwhile).
+        assert!(after.free_bytes < before.free_bytes + 2 * value_slab::block_size(class));
+        for b in blocks {
+            // SAFETY: allocated above, freed once.
+            unsafe { value_slab::free(std::ptr::NonNull::new(b as *mut u8).unwrap(), class) };
+        }
     }
 
     #[test]

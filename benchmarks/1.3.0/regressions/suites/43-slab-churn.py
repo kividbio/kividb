@@ -50,8 +50,9 @@ free room a `BGSAVE` left was in full slabs.
 active defrag is off, then memtier_benchmark (4 threads x 25 connections,
 GET:SET 1:1 over the keys that were loaded, 1,000-byte values, `--randomize
 --distinct-client-seed`, 40 s) with active defrag turned on 5 s in: the pass
-runs while the clients read and overwrite. From memtier's per-second
-percentiles:
+runs while the clients read and overwrite. Three trials on the same server,
+each from an empty one; every metric is the median of the three (kept as its
+samples). From memtier's per-second percentiles:
 
   get_p99_ms / set_p99_ms, get_p999_ms / set_p999_ms
                     the median over the seconds the pass ran of each second's
@@ -60,11 +61,19 @@ percentiles:
                     the same over the seconds before it started (info)
   pass_s            how long the pass ran (KiviDB)
 
-Gates (the candidate): `settled_x_load` at most 1.07 on the 100-byte and 1 KB
-shapes (the issue asked for "within about 5 % of the post-load RSS"; 1.047 to
-1.054 measured, against 1.10 to 1.16 before #240) and the recorded value + 5 %
-on all; `settled_rss_mib` the recorded value + 5 %; `peak_x_load`
-+10 %, as the peak is sampled; `final_rss_mib` +5 % of recorded; the pass's
+On the 100-byte and 1 KB shapes the same churn then runs again on the same
+server, emptied (`FLUSHALL`), with active defrag off (Redis: off both times):
+
+  peak_x_load_off   that run's peak over its load
+  peak_vs_off       peak_x_load / peak_x_load_off: what active defrag adds to
+                    the peak
+
+Gates (the candidate): `settled_x_load` at most 1.07 (1 KB) and 1.08 (100 B)
+(the issue asked for "within about 5 % of the post-load RSS"; 1.03 and 1.05
+measured, against 1.10 to 1.16 before #240) and the recorded value + 5 % on
+all; `peak_vs_off` at most 1.03 (the issue: a peak within 2 % of defrag off
+counts as equal, and the peak is sampled every 50 ms); `settled_rss_mib` the
+recorded value + 5 %; `peak_x_load` +10 %, as the peak is sampled; `final_rss_mib` +5 % of recorded; the pass's
 p99 and p99.9 within 25 % (and 0.2 ms) of recorded, and the pass's GET and SET
 p99 at most 1.5x the same run's idle seconds plus 0.2 ms (the pass must not
 cost latency). v1.2.2 and Redis are shown, not gated.
@@ -261,9 +270,12 @@ def sizes_for(shape, rnd, n):
     return [lo if lo == hi else rnd.randint(lo, hi) for _ in range(n)]
 
 
-def run_churn(ctx, c, shape, pct):
+def churn_once(ctx, c, shape, pct, settle):
+    """Load, three cycles of churn, and (if `settle`) the wait after: (load,
+    cycles, settled, sampler)."""
     keys = scaled(SHAPES[shape][0], step=1000)
     rnd = random.Random(240)
+    settled = None
     with multiprocessing.Pool(PROCS) as pool:
         live = list(range(keys))
         parallel(pool, ctx.port, "set", list(zip(live, sizes_for(shape, rnd, keys))))
@@ -286,21 +298,40 @@ def run_churn(ctx, c, shape, pct):
                 time.sleep(2)
                 cycles.append(memory(c, ctx.pid))
             assert c.dbsize() == len(live), (c.dbsize(), len(live))
-            time.sleep(SETTLE_S)
-            settled = memory(c, ctx.pid)
+            if settle:
+                time.sleep(SETTLE_S)
+                settled = memory(c, ctx.pid)
         finally:
             sampler.finish()
+    return load, cycles, settled, sampler
+
+
+def run_churn(ctx, c, shape, pct):
+    load, cycles, settled, sampler = churn_once(ctx, c, shape, pct, settle=True)
     ctx.raw["load"], ctx.raw["cycles"], ctx.raw["settled"] = load, cycles, settled
     ctx.raw["rss_timeline"] = sampler.timeline[::4]
     tight = shape in ("b100", "kb1")
     kividb = ctx.kind != "redis"
+    if tight:
+        # The same churn again on the same server, emptied, with active defrag
+        # off: the peak a pass must not raise (Redis: off in both).
+        c.flushall()
+        time.sleep(15)
+        c.config_set("activedefrag", "no")
+        off_load, off_cycles, _, off_sampler = churn_once(ctx, c, shape, pct, settle=False)
+        ctx.raw["off"] = {"load": off_load, "cycles": off_cycles, "peak_rss_mib": off_sampler.peak}
+        off_x = off_sampler.peak / off_load["rss_mib"]
+        ctx.emit("peak_x_load_off", off_x, "x", "lower", gate=info())
+        ctx.emit("peak_vs_off", (sampler.peak / load["rss_mib"]) / off_x, "x", "lower",
+                 gate=[bound(max=1.03)] if kividb else info())
     ctx.emit("load_rss_mib", load["rss_mib"], "MiB", "lower", gate=info())
     ctx.emit("load_used_mib", load["used_mib"], "MiB", "lower", gate=info())
     ctx.emit("peak_rss_mib", sampler.peak, "MiB", "lower", gate=info())
     ctx.emit("settled_rss_mib", settled["rss_mib"], "MiB", "lower", gate=[rel(5)] if kividb else info())
     ctx.emit("settled_used_mib", settled["used_mib"], "MiB", "lower", gate=info())
-    # 1.047-1.054 measured (#240, 2026-11-21; master 1.10-1.16): the issue's "about 5 %", with room.
-    gx = [rel(5)] + ([bound(max=1.07)] if tight else [])
+    # 1 KB 1.03, 100 B 1.05 measured (#240, 2026-11-21; master 1.10-1.16): the issue's "about 5 %",
+    # with room.
+    gx = [rel(5)] + ([bound(max=1.07 if shape == "kb1" else 1.08)] if tight else [])
     ctx.emit("settled_x_load", settled["rss_mib"] / load["rss_mib"], "x", "lower", gate=gx if kividb else info())
     ctx.emit("peak_x_load", sampler.peak / load["rss_mib"], "x", "lower", gate=[rel(10)] if kividb else info())
 
@@ -391,9 +422,15 @@ def series(d, op):
     return {int(k): v for k, v in ts.items()}
 
 
-def run_latency(ctx, c):
+LAT_TRIALS = 3
+
+
+def latency_trial(ctx, c, trial):
+    """One load, delete and memtier run with a pass in it: ({metric: value}, raw data)."""
     keys = scaled(LAT_KEYS, step=1000)
     kividb = ctx.kind != "redis"
+    c.flushall()
+    time.sleep(5)
     if kividb:
         c.config_set("activedefrag", "no")
     rnd = random.Random(2401)
@@ -402,7 +439,7 @@ def run_latency(ctx, c):
         gone = rnd.sample(range(keys), int(keys * LAT_DELETE))
         parallel(pool, ctx.port, "del", gone)
     time.sleep(2)
-    out = os.path.join(ctx.out, "raw", S.name, "memtier-%s.json" % ctx.engine)
+    out = os.path.join(ctx.out, "raw", S.name, "memtier-%s-%s-%d.json" % (ctx.config.name, ctx.engine, trial))
     os.makedirs(os.path.dirname(out), exist_ok=True)
     memtier = os.environ.get("MEMTIER", "memtier_benchmark")
     cmd = [memtier, "-s", "127.0.0.1", "-p", str(ctx.port), "--protocol=redis", "-t", "4", "-c", "25",
@@ -437,32 +474,49 @@ def run_latency(ctx, c):
         idle = [s for s in range(1, int(LAT_ON_AT))]
     else:
         busy, idle, pass_s = list(range(1, LAT_TIME - 1)), list(range(1, int(LAT_ON_AT))), None
-    m = memory(c, ctx.pid)
-    ctx.raw["memory_after"], ctx.raw["defrag_on_at"] = m, turned_on
-    ctx.raw["running"] = running[::5]
-    ctx.raw["busy_seconds"], ctx.raw["idle_seconds"] = busy, idle
-    res = {}
+    v = {}
     for op, name in (("Gets", "get"), ("Sets", "set")):
         ts = series(d, op)
-        res[name] = ts
         for pct, label in (("p99.00", "p99"), ("p99.90", "p999")):
-            during = median([ts[s][pct] for s in busy if s in ts])
-            before = median([ts[s][pct] for s in idle if s in ts])
-            gate = [rel(25, abs=0.2)] if kividb else info()
-            ctx.emit("%s_%s_ms" % (name, label), during, "ms", "lower", gate=jitter(gate) if kividb else gate)
+            v["%s_%s_ms" % (name, label)] = median([ts[s][pct] for s in busy if s in ts])
             if label == "p99":
-                ctx.emit("%s_p99_idle_ms" % name, before, "ms", "lower", gate=info())
-                if kividb and during is not None and before is not None:
-                    # The pass must not cost latency: its seconds against the same run's idle ones.
-                    ctx.emit("%s_p99_pass_over_idle" % name, during / max(before, 0.001), "x", "lower",
-                             gate=info(), note="gated through %s_p99_excess_ms" % name)
-                    ctx.emit("%s_p99_excess_ms" % name, during - 1.5 * before, "ms", "lower",
-                             gate=jitter(bound(max=0.2)))
-        ops = median([ts[s]["Count"] for s in busy if s in ts])
-        ctx.emit("%s_ops_per_s_pass" % name, ops, "ops/s", "higher", gate=info())
-    ctx.raw["memtier_series"] = {k: {str(s): v for s, v in ts.items()} for k, ts in res.items()}
+                v["%s_p99_idle_ms" % name] = median([ts[s][pct] for s in idle if s in ts])
+        v["%s_ops_per_s_pass" % name] = median([ts[s]["Count"] for s in busy if s in ts])
+    v["pass_s"] = pass_s
+    raw = {"memory_after": memory(c, ctx.pid), "defrag_on_at": turned_on, "running": running[::5],
+           "busy_seconds": busy, "idle_seconds": idle}
+    return v, raw
+
+
+def run_latency(ctx, c):
+    """LAT_TRIALS trials on the same server, each from an empty one; every
+    metric is the median of the trials, which are kept as its samples."""
+    kividb = ctx.kind != "redis"
+    trials = []
+    for trial in range(LAT_TRIALS):
+        v, raw = latency_trial(ctx, c, trial)
+        trials.append(v)
+        ctx.raw["trial%d" % trial] = raw
+        ctx.log("trial %d: %s" % (trial, v))
+
+    def emit(metric, unit, better, gate):
+        xs = [t[metric] for t in trials if t.get(metric) is not None]
+        ctx.emit(metric, median(xs), unit, better, gate=gate, samples=xs)
+
+    for name in ("get", "set"):
+        for label in ("p99", "p999"):
+            emit("%s_%s_ms" % (name, label), "ms", "lower", jitter([rel(25, abs=0.2)]) if kividb else info())
+        emit("%s_p99_idle_ms" % name, "ms", "lower", info())
+        if kividb:
+            for t in trials:
+                t["%s_p99_excess_ms" % name] = t["%s_p99_ms" % name] - 1.5 * t["%s_p99_idle_ms" % name]
+                t["%s_p99_pass_over_idle" % name] = t["%s_p99_ms" % name] / max(t["%s_p99_idle_ms" % name], 0.001)
+            emit("%s_p99_pass_over_idle" % name, "x", "lower", info())
+            # The pass must not cost latency: its seconds against the same trial's idle ones.
+            emit("%s_p99_excess_ms" % name, "ms", "lower", jitter(bound(max=0.2)))
+        emit("%s_ops_per_s_pass" % name, "ops/s", "higher", info())
     if kividb:
-        ctx.emit("pass_s", pass_s, "s", "lower", gate=jitter(info()))
+        emit("pass_s", "s", "lower", jitter(info()))
 
 
 @S.run

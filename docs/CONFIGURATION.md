@@ -186,7 +186,7 @@ both:
 | `active-defrag-ignore-bytes` | `64mb` | ... and that is more than this many bytes (both as in Redis) |
 | `active-defrag-slab-waste-percent` | `10` | or the free room inside the slabs is more than this many per cent of them ... (`0` turns this trigger off) |
 | `active-defrag-slab-waste-bytes` | `16mb` | ... and more than this many bytes |
-| `active-defrag-full-slab-free-percent` | `12` | a full slab is emptied when at least this many per cent of its blocks are free (`0`: full slabs are left alone) |
+| `active-defrag-full-slab-free-percent` | `12` | a full slab is emptied when at least this many per cent of its blocks are free (`0` or `100`: full slabs are left alone) |
 | `active-defrag-cycle-max` | `10` | the most of one core it uses, a percentage |
 
 No pass starts while a snapshot (`BGSAVE`), an AOF rewrite or a backup is being written (the

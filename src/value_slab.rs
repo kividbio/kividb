@@ -828,14 +828,26 @@ pub struct Fill {
     pub live_bytes: usize,
     /// What the [`FULL`] slabs have free: the slabs too full to be used for
     /// blocks again, whose room only compaction gets back (INFO
-    /// `value_slab_full_free_bytes`).
+    /// `value_slab_full_free_bytes`). Free blocks only: the end of a slab no
+    /// block fits in (3,520 bytes of a slab of 3,648-byte blocks) is no room.
     pub full_free_bytes: usize,
+    /// The free blocks of the slabs nobody owns, [`FULL`] and [`PARTIAL`]:
+    /// the room the slab-waste trigger looks at.
+    pub free_bytes: usize,
+    /// The bytes of the blocks handed out of the slabs, but for those of the
+    /// slabs the calling thread owns (counted as `SLAB` each in
+    /// `live_bytes`): what only other threads' allocations and frees move.
+    /// Compaction's own slabs, which it fills with what it moves, then do
+    /// not look like the clients' writes.
+    pub others_bytes: usize,
 }
 
 /// How full the slabs are, from every slab's header: a few thousand loads.
 pub fn fill() -> Fill {
     let regions = REGION_LIST.lock().clone();
+    let mine = MINE.try_with(|m| m as *const Mine as usize).unwrap_or(0);
     let (mut live_bytes, mut full_free_bytes) = (0usize, 0usize);
+    let (mut free_bytes, mut mine_bytes) = (0usize, 0usize);
     for region in regions {
         for index in 1..SLABS {
             // SAFETY: a region's headers live as long as the process.
@@ -850,12 +862,19 @@ pub fn fill() -> Fill {
             }
             if state == OWNED {
                 live_bytes += SLAB;
+                if mine != 0 && slab.owner.load(Ordering::Relaxed) == mine {
+                    mine_bytes += SLAB;
+                }
                 continue;
             }
             let live = slab.live.load(Ordering::Relaxed).max(0) as usize * block_size(class);
             live_bytes += live;
+            let free = (capacity(class) as usize * block_size(class)).saturating_sub(live);
             if state == FULL {
-                full_free_bytes += SLAB.saturating_sub(live);
+                full_free_bytes += free;
+            }
+            if state == FULL || state == PARTIAL {
+                free_bytes += free;
             }
         }
     }
@@ -863,6 +882,8 @@ pub fn fill() -> Fill {
         slab_bytes: slab_bytes(),
         live_bytes,
         full_free_bytes,
+        free_bytes,
+        others_bytes: live_bytes - mine_bytes,
     }
 }
 
@@ -941,7 +962,7 @@ fn plan(budget: usize, full_free_per_mille: u32, classes: std::ops::Range<usize>
             room[class] += candidate.free_bytes;
             candidates.push(candidate);
         }
-        if full_free_per_mille > 0 {
+        if (1..1000).contains(&full_free_per_mille) {
             let most = 1000 - (full_free_per_mille.min(1000) as usize);
             walk_full(class, |slab| {
                 let candidate = measured(slab, FULL);
@@ -1045,6 +1066,10 @@ fn walk_full(class: usize, mut each: impl FnMut(SlabPtr)) {
             lists.insert_after(next, marker);
             each(SlabPtr(next));
         }
+        // Handed to a thread waiting for the class (one letting go of a slab,
+        // or taking one), where a plain unlock let this one take it back at
+        // once, hold after hold.
+        parking_lot::MutexGuard::unlock_fair(lists);
     }
 }
 
@@ -1282,28 +1307,32 @@ pub fn check_lists(quiescent: bool) -> Result<(), String> {
         for (at, slab) in lists.partial.iter().enumerate() {
             // SAFETY: a header lives as long as the process.
             let s = unsafe { &*slab.0 };
-            let what = format!("class {class}: partial slab {at} ({:p})", slab.0);
+            let what = || format!("class {class}: partial slab {at} ({:p})", slab.0);
             if s.state.load(Ordering::Relaxed) != PARTIAL {
                 return Err(format!(
-                    "{what} is in state {}",
+                    "{} is in state {}",
+                    what(),
                     s.state.load(Ordering::Relaxed)
                 ));
             }
             if s.class.load(Ordering::Relaxed) as usize != class {
                 return Err(format!(
-                    "{what} is of class {}",
+                    "{} is of class {}",
+                    what(),
                     s.class.load(Ordering::Relaxed)
                 ));
             }
             // SAFETY: under the class's lock.
             if unsafe { *s.index.get() } as usize != at {
-                return Err(format!("{what} has index {}", unsafe { *s.index.get() }));
+                return Err(format!("{} has index {}", what(), unsafe {
+                    *s.index.get()
+                }));
             }
             if lists.has(s) {
-                return Err(format!("{what} is in the list of full slabs too"));
+                return Err(format!("{} is in the list of full slabs too", what()));
             }
             if !listed.insert(slab.0 as usize) {
-                return Err(format!("{what} is listed twice"));
+                return Err(format!("{} is listed twice", what()));
             }
         }
         let (mut at, mut prev, mut count) = (lists.full.0, ptr::null::<Slab>(), 0usize);
@@ -1311,27 +1340,29 @@ pub fn check_lists(quiescent: bool) -> Result<(), String> {
             // SAFETY: a header lives as long as the process; its links are
             // read under the class's lock.
             let s = unsafe { &*at };
-            let what = format!("class {class}: full slab {count} ({at:p})");
+            let what = || format!("class {class}: full slab {count} ({at:p})");
             if unsafe { *s.prev.get() } != prev {
-                return Err(format!("{what} links back to another"));
+                return Err(format!("{} links back to another", what()));
             }
             if ptr::eq(s, &MARKERS[class]) {
-                return Err(format!("{what} is the marker, left in the list"));
+                return Err(format!("{} is the marker, left in the list", what()));
             }
             if s.state.load(Ordering::Relaxed) != FULL {
                 return Err(format!(
-                    "{what} is in state {}",
+                    "{} is in state {}",
+                    what(),
                     s.state.load(Ordering::Relaxed)
                 ));
             }
             if s.class.load(Ordering::Relaxed) as usize != class {
                 return Err(format!(
-                    "{what} is of class {}",
+                    "{} is of class {}",
+                    what(),
                     s.class.load(Ordering::Relaxed)
                 ));
             }
             if !listed.insert(at as usize) {
-                return Err(format!("{what} is listed twice"));
+                return Err(format!("{} is listed twice", what()));
             }
             count += 1;
             if count > lists.full_len {
