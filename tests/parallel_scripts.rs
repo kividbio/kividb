@@ -890,7 +890,9 @@ fn info_counts_how_scripts_were_run() {
     assert_eq!(
         counts.keys().map(String::as_str).collect::<Vec<_>>(),
         [
+            "scripts_alone_runs",
             "scripts_handed_to_runner",
+            "scripts_in_alone_runs",
             "scripts_offloaded_to_pool",
             "scripts_run_alone_function",
             "scripts_run_alone_in_transaction",
@@ -947,7 +949,15 @@ fn info_counts_how_scripts_were_run() {
         one(&["scripts_offloaded_to_pool", "scripts_run_alone_no_keys"])
     );
     let mut runs = 0;
-    while moved(&mut c, no_keys) != one(&["scripts_run_alone_no_keys"]) {
+    // Inline, it runs alone in a run of its own (`command_gate::for_a_run`):
+    // the gate closed once, and one script under it.
+    while moved(&mut c, no_keys)
+        != one(&[
+            "scripts_alone_runs",
+            "scripts_in_alone_runs",
+            "scripts_run_alone_no_keys",
+        ])
+    {
         runs += 1;
         assert!(runs < 20, "the script was never run inline");
     }
@@ -956,7 +966,11 @@ fn info_counts_how_scripts_were_run() {
         moved(&mut c, |c| {
             c.cmd(&["EVALSHA", &sha, "1", "plain", "{q}:a"]);
         }),
-        one(&["scripts_run_alone_no_tag"])
+        one(&[
+            "scripts_alone_runs",
+            "scripts_in_alone_runs",
+            "scripts_run_alone_no_tag"
+        ])
     );
     assert_eq!(
         moved(&mut c, |c| {
@@ -1000,7 +1014,11 @@ fn info_counts_how_scripts_were_run() {
     assert!(c.cmd(&["CONFIG", "SET", "lua-parallel-scripts", "no"]).ok());
     assert_eq!(
         moved(&mut c, tagged),
-        one(&["scripts_run_alone_parallel_off"])
+        one(&[
+            "scripts_alone_runs",
+            "scripts_in_alone_runs",
+            "scripts_run_alone_parallel_off"
+        ])
     );
     assert!(
         c.cmd(&["CONFIG", "SET", "lua-parallel-scripts", "yes"])
@@ -1040,6 +1058,14 @@ fn info_counts_how_scripts_were_run() {
         match name.as_str() {
             "scripts_run_alone_no_keys" => assert_eq!(n - was, sent, "{name}"),
             "scripts_handed_to_runner" => assert!(*n > 0 && n - was <= sent, "{name}"),
+            // Those run inline or handed on run in runs, a close of the gate
+            // for one or more of them; not those offloaded.
+            "scripts_in_alone_runs" => assert!(*n > was && n - was <= sent, "{name}"),
+            "scripts_alone_runs" => assert!(
+                *n > was
+                    && n - was <= after["scripts_in_alone_runs"] - before["scripts_in_alone_runs"],
+                "{name}"
+            ),
             // A run stretched past the demotion limit on a busy machine is
             // offloaded until it is seen to be quick again.
             "scripts_offloaded_to_pool" => assert!(n - was <= sent, "{name}"),
@@ -1401,4 +1427,758 @@ fn overlapping_tags_end_the_same(io: &str) {
     for (i, k) in keys.iter().enumerate() {
         assert_eq!(replayed[i], before[i], "AOF replay: {k}");
     }
+}
+
+// ── Plain commands beside scripts that run alone (#880) ──────────────────────
+
+impl Conn {
+    /// `calls`, sent at once, and their replies, in order.
+    fn pipeline(&mut self, calls: &[Vec<String>]) -> Vec<V> {
+        let mut buf = Vec::new();
+        for args in calls {
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(a.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+        }
+        self.writer.write_all(&buf).unwrap();
+        calls.iter().map(|_| self.read()).collect()
+    }
+}
+
+/// Untagged keys: the script runs alone, and every other command waits for it.
+/// It writes three keys, one `redis.call` at a time.
+const THREE_KEYS: &str = "local n = redis.call('INCR', KEYS[1]) \
+     redis.call('SET', KEYS[2], n) redis.call('SET', KEYS[3], n) return n";
+
+/// `connections` connections, each sending `EVALSHA` of `sha` on `keys` in
+/// pipelines of 16 until `stop`: the scripts they ran.
+fn script_stream(
+    port: u16,
+    sha: &str,
+    keys: &[&str],
+    connections: usize,
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<std::thread::JoinHandle<usize>> {
+    (0..connections)
+        .map(|_| {
+            let stop = stop.clone();
+            let mut call = vec![
+                "EVALSHA".to_string(),
+                sha.to_string(),
+                keys.len().to_string(),
+            ];
+            call.extend(keys.iter().map(|k| k.to_string()));
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let calls = vec![call; 16];
+                let mut ran = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for reply in c.pipeline(&calls) {
+                        assert!(matches!(reply, V::Int(_)), "{reply:?}");
+                        ran += 1;
+                    }
+                }
+                ran
+            })
+        })
+        .collect()
+}
+
+/// While connections send script after script that runs alone (its key has no
+/// tag), a plain command on another connection is answered within a bound
+/// each time, and the scripts go on running meanwhile: neither keeps the
+/// other out. On both I/O loops.
+#[test]
+fn a_plain_command_is_answered_beside_a_stream_of_alone_scripts() {
+    plain_beside_alone_scripts("tokio");
+}
+
+#[test]
+fn a_plain_command_is_answered_beside_a_stream_of_alone_scripts_uring() {
+    plain_beside_alone_scripts("uring");
+}
+
+fn plain_beside_alone_scripts(io: &str) {
+    let server = Server::start(&["--io-model", io]);
+    let mut c = server.conn();
+    let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", THREE_KEYS]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    assert!(c.cmd(&["SET", "plain", "v"]).ok());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let streams = script_stream(server.port, &sha, &["n", "n:a", "n:b"], 8, &stop);
+    // Under way, and quick: handed from one thread to another.
+    wait_until("the scripts to run", 30, || {
+        c.info("stats", "scripts_run_alone_no_tag")
+            .parse::<u64>()
+            .unwrap()
+            > 2000
+    });
+    let before: u64 = c.info("stats", "scripts_run_alone_no_tag").parse().unwrap();
+    let mut probe = server.conn();
+    let mut worst = Duration::ZERO;
+    let mut waits = Vec::new();
+    for _ in 0..2000 {
+        let t = Instant::now();
+        assert_eq!(probe.cmd(&["GET", "plain"]), V::Str("v".into()));
+        let took = t.elapsed();
+        worst = worst.max(took);
+        waits.push(took);
+    }
+    let after: u64 = c.info("stats", "scripts_run_alone_no_tag").parse().unwrap();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ran: usize = streams.into_iter().map(|s| s.join().unwrap()).sum();
+    waits.sort();
+    let p99 = waits[waits.len() * 99 / 100];
+    eprintln!(
+        "{io}: GET beside alone scripts: p50 {:?}, p99 {p99:?}, worst {worst:?}; {} scripts \
+         meanwhile, {ran} in all",
+        waits[waits.len() / 2],
+        after - before
+    );
+    // A debug build on a loaded test machine: bounds far above a wait for a
+    // few scripts, far below a command kept out until the stream ends.
+    assert!(
+        worst < Duration::from_secs(2) && p99 < Duration::from_millis(250),
+        "a GET waited {worst:?} (p99 {p99:?}) beside the scripts"
+    );
+    assert!(
+        after > before + 1000,
+        "the scripts stopped while the GETs ran: {before} -> {after}"
+    );
+    assert!(ran > 2000);
+    // They ran in runs: more scripts than closes of the gate, a close for
+    // more than one of them.
+    let counts = script_counts(&mut c);
+    let (closes, in_runs) = (
+        counts["scripts_alone_runs"],
+        counts["scripts_in_alone_runs"],
+    );
+    eprintln!("{io}: {in_runs} scripts under {closes} closes of the gate");
+    assert!(
+        closes > 0 && in_runs > closes,
+        "{in_runs} scripts, {closes} closes"
+    );
+}
+
+/// A script that runs alone is never seen half done, however many of them
+/// run back to back from many connections: each `MGET` of its three keys
+/// finds them all equal (none of them written yet, or all by the same run).
+/// On both I/O loops.
+#[test]
+fn a_reader_never_sees_an_alone_script_half_done() {
+    alone_script_never_half_done("tokio");
+}
+
+#[test]
+fn a_reader_never_sees_an_alone_script_half_done_uring() {
+    alone_script_never_half_done("uring");
+}
+
+fn alone_script_never_half_done(io: &str) {
+    let server = Server::start(&["--io-model", io]);
+    let mut c = server.conn();
+    let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", THREE_KEYS]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let streams = script_stream(server.port, &sha, &["k", "k:a", "k:b"], 6, &stop);
+    let port = server.port;
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let mut r = Conn::connect(port);
+                let (mut reads, mut last) = (0u64, 0i64);
+                while reads < 20_000 {
+                    let V::Arr(values) = r.cmd(&["MGET", "k", "k:a", "k:b"]) else {
+                        panic!("MGET did not answer with an array")
+                    };
+                    let seen: Vec<Option<i64>> = values
+                        .iter()
+                        .map(|v| match v {
+                            V::Nil => None,
+                            v => Some(v.s().parse().unwrap()),
+                        })
+                        .collect();
+                    assert!(
+                        seen.iter().all(|v| *v == seen[0]),
+                        "a script seen half done: {seen:?}"
+                    );
+                    let n = seen[0].unwrap_or(0);
+                    assert!(n >= last, "went back from {last} to {n}");
+                    last = n;
+                    reads += 1;
+                }
+                last
+            })
+        })
+        .collect();
+    let lasts: Vec<i64> = readers.into_iter().map(|r| r.join().unwrap()).collect();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ran: usize = streams.into_iter().map(|s| s.join().unwrap()).sum();
+    let V::Str(k) = c.cmd(&["GET", "k"]) else {
+        panic!("no k")
+    };
+    assert_eq!(k.parse::<usize>().unwrap(), ran);
+    // The readers saw the scripts run, not just before or after all of them.
+    assert!(
+        lasts.iter().any(|&n| n > 0 && (n as usize) < ran),
+        "{lasts:?} of {ran}"
+    );
+}
+
+// ── A run of alone scripts, and what waits beside it (#880) ──────────────────
+
+/// Writes ARGV[1] to KEYS[1].
+const SETS_A_KEY: &str = "return redis.call('SET', KEYS[1], ARGV[1])";
+
+/// A destination that takes connections, reads what it is sent, and never
+/// answers: a `MIGRATE` to it waits for its timeout. Its port, and whether
+/// anything has been sent to it: a `MIGRATE` sends its keys once it has
+/// marked them as moving (`key_moves`), so from then on a write to them
+/// waits.
+fn silent_destination() -> (u16, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = sent.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while matches!(stream.read(&mut buf), Ok(n) if n > 0) {
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    (port, sent)
+}
+
+/// Of `n` new connections to `port`, those that answer a `PING` within
+/// `within`: on io_uring, those on a thread a `MIGRATE` waiting for its
+/// destination does not hold (a `MIGRATE` waits on its own thread). The
+/// others are left to be answered when it ends.
+fn free_connections(port: u16, n: usize, within: Duration) -> Vec<Conn> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for _ in 0..n {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
+            // Read by hand: one never answered is left when the server
+            // stops, and must not panic then.
+            let mut line = String::new();
+            if c.writer.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok()
+                && c.reader.read_line(&mut line).is_ok()
+                && line == "+PONG\r\n"
+            {
+                let _ = tx.send(c);
+            }
+        });
+    }
+    let deadline = Instant::now() + within;
+    let mut free = Vec::new();
+    while let Ok(c) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        free.push(c);
+        if free.len() == n {
+            break;
+        }
+    }
+    free
+}
+
+/// `MIGRATE` of `key` to a destination that never answers, on a connection
+/// of its own, timing out after `ms`: its reply and how long it took, once
+/// it has sent the key (so a write to it waits from then on).
+fn migrate_to_nowhere(port: u16, key: &str, ms: u64) -> std::thread::JoinHandle<(V, Duration)> {
+    let (destination, sent) = silent_destination();
+    let key = key.to_string();
+    let migrate = std::thread::spawn(move || {
+        let mut m = Conn::connect(port);
+        timed(|| {
+            m.cmd(&[
+                "MIGRATE",
+                "127.0.0.1",
+                &destination.to_string(),
+                &key,
+                "0",
+                &ms.to_string(),
+            ])
+        })
+    });
+    wait_until("the MIGRATE to send its key", 30, || {
+        sent.load(std::sync::atomic::Ordering::SeqCst)
+    });
+    migrate
+}
+
+/// What `run` gave, and how long it took.
+fn timed<T>(run: impl FnOnce() -> T) -> (T, Duration) {
+    let t = Instant::now();
+    let out = run();
+    (out, t.elapsed())
+}
+
+/// While a `MIGRATE` holds a key for its timeout, a quick script that runs
+/// alone and declares that key waits for it, with the command gate open:
+/// other clients' `PING` and `GET` of another key are answered at once, but
+/// on the worker thread the script waits on. On both I/O loops.
+#[test]
+fn a_script_waiting_for_a_migrate_leaves_the_gate_open() {
+    script_waiting_for_a_migrate("tokio");
+}
+
+#[test]
+fn a_script_waiting_for_a_migrate_leaves_the_gate_open_uring() {
+    script_waiting_for_a_migrate("uring");
+}
+
+fn script_waiting_for_a_migrate(io: &str) {
+    let server = Server::start(&["--io-model", io]);
+    let mut c = server.conn();
+    let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", SETS_A_KEY]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    // Seen to be quick: run alone, inline, by whoever has the turn.
+    for _ in 0..4 {
+        assert!(c.cmd(&["EVALSHA", &sha, "1", "moving", "v0"]).ok());
+    }
+    assert!(c.cmd(&["SET", "other", "o"]).ok());
+    let port = server.port;
+    let migrate = migrate_to_nowhere(port, "moving", 4000);
+    let writer = std::thread::spawn(move || {
+        let mut b = Conn::connect(port);
+        timed(|| b.cmd(&["EVALSHA", &sha, "1", "moving", "v1"]))
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    // Connections on every worker thread: each one's worst wait.
+    let probes: Vec<_> = (0..16)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let mut probe = Conn::connect(port);
+                let mut worst = Duration::ZERO;
+                for _ in 0..20 {
+                    let (pong, took) = timed(|| probe.cmd(&["PING"]));
+                    assert_eq!(pong.s(), "PONG");
+                    worst = worst.max(took);
+                    let (got, took) = timed(|| probe.cmd(&["GET", "other"]));
+                    assert_eq!(got, V::Str("o".into()));
+                    worst = worst.max(took);
+                }
+                worst
+            })
+        })
+        .collect();
+    let worst: Vec<Duration> = probes.into_iter().map(|p| p.join().unwrap()).collect();
+    let (written, waited) = writer.join().unwrap();
+    let (migrated, migrate_took) = migrate.join().unwrap();
+    eprintln!(
+        "{io}: worst waits beside the waiting script {worst:?}; it waited {waited:?}; \
+         MIGRATE took {migrate_took:?}: {migrated:?}"
+    );
+    // With the gate closed, every one of them would have waited as long as
+    // the script did. Those on the thread the script waits on, or on the
+    // one the MIGRATE waits on, do.
+    let quick = worst
+        .iter()
+        .filter(|w| **w < Duration::from_millis(1000))
+        .count();
+    assert!(
+        quick >= 3,
+        "commands waited {worst:?} while a script waited for the MIGRATE"
+    );
+    // It did wait for the MIGRATE, which gave up, and then ran here.
+    assert!(migrated.is_err(), "{migrated:?}");
+    assert!(written.ok(), "{written:?}");
+    assert!(waited > Duration::from_millis(2000), "{waited:?}");
+    assert_eq!(c.cmd(&["GET", "moving"]), V::Str("v1".into()));
+}
+
+/// While other connections keep the gate busy with commands that hold it for
+/// milliseconds each (`LRANGE` of a long list), so that closing it for a run
+/// takes longer than a run lasts, queued alone scripts are still all
+/// answered, none of their pipelines waits long, and every one ran (the
+/// count the scripts keep matches). On both I/O loops.
+#[test]
+fn alone_scripts_go_on_while_the_gate_is_slow_to_close() {
+    alone_scripts_beside_long_commands("tokio");
+}
+
+#[test]
+fn alone_scripts_go_on_while_the_gate_is_slow_to_close_uring() {
+    alone_scripts_beside_long_commands("uring");
+}
+
+fn alone_scripts_beside_long_commands(io: &str) {
+    let server = Server::start(&["--io-model", io]);
+    let mut c = server.conn();
+    let V::Str(sha) = c.cmd(&["SCRIPT", "LOAD", THREE_KEYS]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    let elements: Vec<String> = (0..1000).map(|i| format!("element-{i}")).collect();
+    for _ in 0..100 {
+        let mut push = vec!["RPUSH", "long"];
+        push.extend(elements.iter().map(String::as_str));
+        assert!(matches!(c.cmd(&push), V::Int(_)));
+    }
+    let (_, lrange) = timed(|| c.cmd(&["LRANGE", "long", "0", "-1"]));
+    eprintln!("{io}: one LRANGE of the list takes {lrange:?}");
+    let before = script_counts(&mut c);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let port = server.port;
+    let long: Vec<_> = (0..3)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut l = Conn::connect(port);
+                let mut n = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    assert!(matches!(l.cmd(&["LRANGE", "long", "0", "-1"]), V::Arr(_)));
+                    n += 1;
+                }
+                n
+            })
+        })
+        .collect();
+    // Each connection's scripts, and its longest wait for the replies of
+    // one pipeline of 16.
+    let streams: Vec<_> = (0..6)
+        .map(|_| {
+            let (stop, sha) = (stop.clone(), sha.clone());
+            std::thread::spawn(move || {
+                let mut s = Conn::connect(port);
+                let call: Vec<String> = ["EVALSHA", &sha, "3", "s", "s:a", "s:b"]
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect();
+                let calls = vec![call; 16];
+                let (mut ran, mut worst) = (0usize, Duration::ZERO);
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let (replies, took) = timed(|| s.pipeline(&calls));
+                    for reply in replies {
+                        assert!(matches!(reply, V::Int(_)), "{reply:?}");
+                        ran += 1;
+                    }
+                    worst = worst.max(took);
+                }
+                (ran, worst)
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_secs(4));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ranges: usize = long.into_iter().map(|l| l.join().unwrap()).sum();
+    let streams: Vec<(usize, Duration)> = streams.into_iter().map(|s| s.join().unwrap()).collect();
+    let ran: Vec<usize> = streams.iter().map(|(n, _)| *n).collect();
+    let worst = streams.iter().map(|(_, w)| *w).max().unwrap();
+    let after = script_counts(&mut c);
+    let closes = after["scripts_alone_runs"] - before["scripts_alone_runs"];
+    let in_runs = after["scripts_in_alone_runs"] - before["scripts_in_alone_runs"];
+    eprintln!(
+        "{io}: {ranges} LRANGEs; scripts per connection {ran:?}, longest wait for a \
+         pipeline {worst:?}; {in_runs} takes under {closes} closes"
+    );
+    assert!(ranges > 3, "{ranges}");
+    // Every reply came, an `Int` each, and no pipeline of 16 waited long:
+    // the scripts went on beside the long commands.
+    assert!(
+        worst < Duration::from_secs(3),
+        "a pipeline of scripts waited {worst:?}"
+    );
+    let total: usize = ran.iter().sum();
+    let V::Str(n) = c.cmd(&["GET", "s"]) else {
+        panic!("no s")
+    };
+    assert_eq!(n.parse::<usize>().unwrap(), total);
+    // They ran in runs: the gate was closed for them, again and again.
+    assert!(
+        closes > 0 && in_runs > 0,
+        "{in_runs} takes, {closes} closes"
+    );
+}
+
+/// `SCRIPT KILL` of a slow script that has the turn, with quick scripts queued
+/// behind it: the slow one is told it was killed, and the queued ones are
+/// answered afterwards. On both I/O loops.
+#[test]
+fn script_kill_in_a_run_lets_the_queued_scripts_run() {
+    kill_in_a_run("tokio");
+}
+
+#[test]
+fn script_kill_in_a_run_lets_the_queued_scripts_run_uring() {
+    kill_in_a_run("uring");
+}
+
+fn kill_in_a_run(io: &str) {
+    let server = Server::start(&["--io-model", io]);
+    let mut c = server.conn();
+    // Counts to ARGV[1], and writes only at the end: killable while it counts.
+    let counts = "local n = 0 for i = 1, tonumber(ARGV[1]) do n = n + 1 end \
+                  redis.call('SET', KEYS[1], n) return n";
+    let V::Str(slow) = c.cmd(&["SCRIPT", "LOAD", counts]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    let V::Str(quick) = c.cmd(&["SCRIPT", "LOAD", THREE_KEYS]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    // Both seen to be quick, so that both run inline, taking turns.
+    for _ in 0..4 {
+        assert_eq!(c.cmd(&["EVALSHA", &slow, "1", "counted", "1"]), V::Int(1));
+        assert!(matches!(
+            c.cmd(&["EVALSHA", &quick, "3", "q", "q:a", "q:b"]),
+            V::Int(_)
+        ));
+    }
+    let was: i64 = c.cmd(&["GET", "q"]).s().parse().unwrap();
+    let handed_before = script_counts(&mut c)["scripts_handed_to_runner"];
+    let port = server.port;
+    // Seen to be quick, so run inline with the turn, counting for far longer
+    // than the test.
+    let killed = std::thread::spawn(move || {
+        let mut a = Conn::connect(port);
+        a.cmd(&["EVALSHA", &slow, "1", "counted", "100000000000"])
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let queued: Vec<_> = (0..6)
+        .map(|_| {
+            let quick = quick.clone();
+            std::thread::spawn(move || {
+                let mut q = Conn::connect(port);
+                timed(|| q.cmd(&["EVALSHA", &quick, "3", "q", "q:a", "q:b"]))
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(500));
+    // From several connections at once: one on the thread the slow script
+    // holds is answered only once it has been killed (`NOTBUSY`).
+    let kills: Vec<_> = (0..8)
+        .map(|_| std::thread::spawn(move || Conn::connect(port).cmd(&["SCRIPT", "KILL"])))
+        .collect();
+    let kills: Vec<V> = kills.into_iter().map(|k| k.join().unwrap()).collect();
+    assert!(kills.iter().any(V::ok), "{kills:?}");
+    let reply = killed.join().unwrap();
+    assert!(reply.is_err(), "{reply:?}");
+    let mut values = Vec::new();
+    for q in queued {
+        let (reply, took) = q.join().unwrap();
+        let V::Int(n) = reply else {
+            panic!("a queued script: {reply:?}")
+        };
+        assert!(took < Duration::from_secs(15), "{took:?}");
+        values.push(n);
+    }
+    values.sort();
+    let expected: Vec<i64> = (was + 1..=was + 6).collect();
+    assert_eq!(values, expected);
+    let handed = script_counts(&mut c)["scripts_handed_to_runner"];
+    eprintln!(
+        "{io}: {} of the 6 queued behind the killed script",
+        handed - handed_before
+    );
+    assert_eq!(c.cmd(&["PING"]).s(), "PONG");
+    assert_eq!(c.cmd(&["GET", "q"]), V::Str((was + 6).to_string()));
+}
+
+/// A worker thread that has the turn runs the scripts queued meanwhile; one
+/// of them that has to wait for a `MIGRATE` of its key must not wait there,
+/// where the thread's other connections would wait with it: it is left to
+/// the script-runner thread. A pipelines about 150 ms of quick scripts that
+/// run alone, so that its thread has the turn nearly all the while and runs
+/// what is queued after each of its own; B's script on the key the `MIGRATE` holds
+/// comes meanwhile, from a connection on another thread (found beforehand
+/// by a `FUNCTION STATS`, which a slow script of A's holds back on no other
+/// thread), and is queued. The `MIGRATE` itself waits on its own
+/// thread, so A, B and the probes are connections on the others
+/// (`free_connections`), and the probes on B's own thread are left out.
+/// On io_uring, where a connection stays on its thread, the probes that tell
+/// are those on A's thread, the one that would have run B. While B waits out the `MIGRATE`, a `PING` and a
+/// `GET` on each probe are answered at once. On both I/O loops.
+#[test]
+fn a_queued_script_waiting_for_a_migrate_does_not_hold_a_worker() {
+    queued_script_waiting_for_a_migrate("tokio");
+}
+
+#[test]
+fn a_queued_script_waiting_for_a_migrate_does_not_hold_a_worker_uring() {
+    queued_script_waiting_for_a_migrate("uring");
+}
+
+fn queued_script_waiting_for_a_migrate(io: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let server = Server::start(&["--io-model", io]);
+    let mut c = server.conn();
+    // Counts to ARGV[1], then writes KEYS[1]: quick at 1, slow at a million.
+    let counts = "local n = 0 for i = 1, tonumber(ARGV[1]) do n = n + 1 end \
+                  redis.call('SET', KEYS[1], n) return n";
+    let V::Str(slow) = c.cmd(&["SCRIPT", "LOAD", counts]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    let V::Str(sets) = c.cmd(&["SCRIPT", "LOAD", SETS_A_KEY]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    let V::Str(quick) = c.cmd(&["SCRIPT", "LOAD", THREE_KEYS]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    for _ in 0..4 {
+        assert!(c.cmd(&["EVALSHA", &sets, "1", "m", "v0"]).ok());
+        assert!(matches!(
+            c.cmd(&["EVALSHA", &quick, "3", "q", "q:a", "q:b"]),
+            V::Int(_)
+        ));
+    }
+    // How many counts take about 400 ms here.
+    let (_, took) = timed(|| c.cmd(&["EVALSHA", &slow, "1", "a", "1000000"]));
+    let count = ((1_000_000.0 * 0.4 / took.as_secs_f64().max(0.0001)) as u64).max(1);
+    // That run was slow, and sent the script back to the pool: quick again.
+    for _ in 0..4 {
+        assert_eq!(c.cmd(&["EVALSHA", &slow, "1", "a", "1"]), V::Int(1));
+    }
+    assert!(c.cmd(&["SET", "other", "o"]).ok());
+    let port = server.port;
+    let migrate = migrate_to_nowhere(port, "m", 4000);
+    let mut free = free_connections(port, 40, Duration::from_secs(1));
+    assert!(free.len() >= 12, "only {} connections answered", free.len());
+    let probe_conns: Vec<Conn> = free.split_off(9);
+    assert!(probe_conns.len() >= 3, "{} probes", probe_conns.len());
+    let candidates: Vec<Conn> = free.split_off(1);
+    let mut a = free.pop().unwrap();
+    // B: a connection on another thread than A's. While A's slow script
+    // runs (about 400 ms), the first of the candidates to answer a
+    // `FUNCTION STATS` at once.
+    let slow_a = slow.clone();
+    let a_slow = std::thread::spawn(move || {
+        let reply = a.cmd(&["EVALSHA", &slow_a, "1", "a", &count.to_string()]);
+        (a, reply)
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    // Meanwhile, which probes are on A's thread: those A's script holds back.
+    let probing: Vec<_> = probe_conns
+        .into_iter()
+        .map(|mut p| {
+            std::thread::spawn(move || {
+                let (_, took) = timed(|| p.cmd(&["FUNCTION", "STATS"]));
+                (p, took >= Duration::from_millis(50))
+            })
+        })
+        .collect();
+    let chosen = std::sync::Arc::new(AtomicBool::new(false));
+    let picked: Vec<Conn> = candidates
+        .into_iter()
+        .map(|mut b| {
+            let chosen = chosen.clone();
+            std::thread::spawn(move || {
+                let (_, took) = timed(|| b.cmd(&["FUNCTION", "STATS"]));
+                (took < Duration::from_millis(50)
+                    && chosen
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok())
+                .then_some(b)
+            })
+        })
+        .filter_map(|t| t.join().unwrap())
+        .collect();
+    let probe_conns: Vec<(Conn, bool)> = probing.into_iter().map(|t| t.join().unwrap()).collect();
+    let (mut a, reply) = a_slow.join().unwrap();
+    assert!(matches!(reply, V::Int(_)), "{reply:?}");
+    let [mut b] = <[Conn; 1]>::try_from(picked)
+        .unwrap_or_else(|_| panic!("no connection answered FUNCTION STATS at once"));
+    for _ in 0..4 {
+        assert_eq!(b.cmd(&["EVALSHA", &slow, "1", "b", "1"]), V::Int(1));
+    }
+    // And the probes on B's thread are left out: should B find the turn free
+    // when it comes, it runs on its own thread and waits there, as any
+    // script that is not queued waits for a `MIGRATE` of its key. Found as
+    // B's, by a slow script of B's.
+    let slow_b = slow.clone();
+    let b_slow = std::thread::spawn(move || {
+        let reply = b.cmd(&["EVALSHA", &slow_b, "1", "b", &count.to_string()]);
+        (b, reply)
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let probe_conns: Vec<(Conn, bool)> = probe_conns
+        .into_iter()
+        .map(|(mut p, on_a)| {
+            std::thread::spawn(move || {
+                let (_, took) = timed(|| p.cmd(&["FUNCTION", "STATS"]));
+                (took < Duration::from_millis(50)).then_some((p, on_a))
+            })
+        })
+        .filter_map(|t| t.join().unwrap())
+        .collect();
+    let (mut b, reply) = b_slow.join().unwrap();
+    assert!(matches!(reply, V::Int(_)), "{reply:?}");
+    assert!(probe_conns.len() >= 2, "{} probes left", probe_conns.len());
+    for _ in 0..4 {
+        assert_eq!(a.cmd(&["EVALSHA", &slow, "1", "a", "1"]), V::Int(1));
+    }
+    // A sends quick scripts, one pipeline of them: its thread has the turn
+    // nearly all the while, and runs what is queued after each of its own.
+    // About 150 ms of them (measured first), so that they are over by the
+    // time the probes ask: a thread serves the rest of one connection's
+    // pipeline before its other connections.
+    let call: Vec<String> = ["EVALSHA", &slow, "1", "a", "1"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let (_, took) = timed(|| a.pipeline(&vec![call.clone(); 1000]));
+    let n = ((1000.0 * 0.15 / took.as_secs_f64().max(0.0001)) as usize).clamp(200, 20_000);
+    let a_stream = std::thread::spawn(move || {
+        let (replies, took) = timed(|| a.pipeline(&vec![call; n]));
+        assert!(replies.iter().all(|r| *r == V::Int(1)));
+        took
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    // B's script on `m` comes meanwhile, and is queued.
+    let b = std::thread::spawn(move || timed(|| b.cmd(&["EVALSHA", &sets, "1", "m", "v1"])));
+    std::thread::sleep(Duration::from_millis(500));
+    // While B waits: connections on every thread but the MIGRATE's.
+    let probes: Vec<_> = probe_conns
+        .into_iter()
+        .map(|(mut probe, on_a)| {
+            std::thread::spawn(move || {
+                let mut worst = Duration::ZERO;
+                for _ in 0..10 {
+                    let (pong, took) = timed(|| probe.cmd(&["PING"]));
+                    assert_eq!(pong.s(), "PONG");
+                    worst = worst.max(took);
+                    let (got, took) = timed(|| probe.cmd(&["GET", "other"]));
+                    assert_eq!(got, V::Str("o".into()));
+                    worst = worst.max(took);
+                }
+                (worst, on_a)
+            })
+        })
+        .collect();
+    let worst: Vec<(Duration, bool)> = probes.into_iter().map(|p| p.join().unwrap()).collect();
+    let (written, waited) = b.join().unwrap();
+    let a_took = a_stream.join().unwrap();
+    let (migrated, _) = migrate.join().unwrap();
+    eprintln!(
+        "{io}: probes' worst waits {worst:?}; B waited {waited:?}; A's {n} scripts took {a_took:?}"
+    );
+    // On io_uring a connection stays on its thread: A's thread is the one
+    // that would have run B, and its probes are the ones that tell. With
+    // Tokio a thread's connections move: every probe.
+    let telling: Vec<Duration> = worst
+        .iter()
+        .filter(|(_, on_a)| io != "uring" || *on_a)
+        .map(|(w, _)| *w)
+        .collect();
+    assert!(!telling.is_empty(), "no probe on A's thread: {worst:?}");
+    assert!(
+        telling.iter().all(|w| *w < Duration::from_millis(1000)),
+        "connections waited {worst:?} (true: on A's thread) while a queued script waited out \
+         the MIGRATE"
+    );
+    // B did wait for the MIGRATE, which gave up, and then ran.
+    assert!(migrated.is_err(), "{migrated:?}");
+    assert!(written.ok(), "{written:?}");
+    assert!(waited > Duration::from_millis(2000), "{waited:?}");
+    assert_eq!(c.cmd(&["GET", "m"]), V::Str("v1".into()));
 }

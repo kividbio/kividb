@@ -57,6 +57,7 @@ and why.
 | `39-bgsave-strings` | #849 | `BGSAVE` while two clients overwrite random keys as fast as they can (kividb.io/blog/redis-bgsave-memory-fork, getsentry/self-hosted#4619): the peak memory from `BGSAVE` to its end (`Pss` summed over the server and the processes it forked, every 50 ms), the memory before, how long the save took and how many writes got through; `small64` is 10,000,000 keys of 64-byte values (about 1 GiB; the published test, 6 million, at the issue's size) and `mixed` is the issue's ~1 GiB of 100 B to 8 KB values. Gates, `small64`: peak at most 0.6x Redis's in the same session, at most 1,536 MiB (the stand-in for "completes in a 1.5 GiB container where Redis fails"; no container is started) and within 15 % of recorded; `mixed`: at most 1.3x Redis's (see [the run](#recorded-run-suite-39-and-40)); the save must succeed. Server on the first half of the CPUs, writers on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` |
 | `40-wp-object-cache` | #849 | a WordPress-shaped object cache (kividb.io/blog/wordpress-redis-object-cache-slow-under-load-how-to-speed-it-up): 1,000,000 string keys of 512 (`d512`) or 2,048 (`d2048`) bytes, `redis-benchmark -c 100 -d D -r 1000000 -t get` and `-t set` with `--threads 4`: requests a second, p50 and p99 against Redis, and the server's RSS and `used_memory` once loaded. Gates: `GET` at 2 KB at least 1.3x Redis in the same session, RSS at most 1.0x Redis's at both sizes, every rate within 10 % of recorded; server on the first half of the CPUs, client on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-39-and-40)) |
 | `41-ft-hnsw-vs-redis` | #760 | #760's own cases against Redis's query engine in the same session: 50,000 384-d (`d384`) and 200,000 64-d (`d64`) random documents (`score` NUMERIC, HNSW `COSINE M 16 EF_CONSTRUCTION 200`) written by one client in `HSET` pipelines of 1,000, documents a second until all are in the graph; then one client, 5 s a case, `KNN 10`: no filter, `@score:[50 100]` (half) and `@score:[0 2]` (3 %) at the default `EF_RUNTIME`, no filter at 50, 100 and 200 and the wide filter at 50 and 100: q/s and recall@10 against exact; `d64` also KNN p99 beside 500 `HSET`s a second; peak RSS. The candidate as it starts on 8 CPUs (`--threads 4`, `search-index-threads auto`: 7 helpers, all of them linking while the load is all the server does, 3 while it serves). Gates: 10 % (rates), 2 % (recall), 5 % (RSS); and against Redis this session: build at most 1.25x (`d384`) / 1.6x (`d64`) slower, the rows at the same `EF_RUNTIME` at most 1.1x (no filter) / 1.2x (wide) slower with recall at least Redis's, the narrow filter faster than Redis, the default rows at most 2.2x (no filter) / 1.8x (wide) slower (a KiviDB KNN looks at no fewer than 50 candidates, Redis's default at 10), peak RSS at most Redis's. Needs `REGRESS_REDISEARCH_SO` (as `28`); `min_cpus=8`, recorded on a D8s_v5 (`results/pr-760-d8s_v5`; the build rows in `results/pr-760-adaptive-d8s_v5`, see [below](#recorded-run-suite-41-build-rows)) |
+| `42-alone-scripts-mix` | #880 | plain commands beside scripts that run alone (a key with no hash tag): Nextcloud's mix (`GET` 40, `TTL` 15, `INCRBY` 15, `EXPIRE` 15, `EVALSHA` of its compare-and-delete 12, `SETEX` 3) and the same mix with no script, the compare-and-delete alone, Appwrite's abuse limiter (`EVAL`), both on a tagged key too, and Superset's cache and lock (`GET` 85 of 50 KB values, `SETEX` 10, `SET NX EX` 3, unlock 2); memtier, 200 and 500 connections, 100,000 keys (written again before every run): ops/s, p50, p99, p99.9. Gates: Nextcloud's p99 at most 2x the same mix's with no script and 0.75x Redis's in the same session; ops/s at least a floor times Redis's and within 10 % of recorded; server on the first half of the CPUs (`--threads 4`), memtier on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-42)) |
 
 ## Running it
 
@@ -267,6 +268,7 @@ was re-recorded for it:
 | `36-litellm-ratelimit` | the server's pinned CPUs (4) | as suites `20` and `34` |
 | `37-zrandmember-by-count` | 2 | as suite `16`, whose sizes it extends |
 | `39-bgsave-strings`, `40-wp-object-cache` | the server's pinned CPUs (4) | as suites `20` and `34`: the server is pinned to half the CPUs of a `Standard_D8s_v5` and gets `--threads` to match |
+| `42-alone-scripts-mix` | the server's pinned CPUs (4) | as suites `20`, `34` and `36` |
 | `32-default-threads` | 0 (none) | measures the default on purpose |
 
 Redis ignores the count. The default itself is watched by
@@ -1717,6 +1719,54 @@ values of `results/pr-760-d8s_v5`, for two reasons:
   master's run, a recall case fell below its 2 % gate: `d384` wide filter at
   the default `EF_RUNTIME` and at 50 (the same search), 0.488 against 0.494;
   master's `d384` no filter at the default and at 50, 0.36 against 0.364.
+
+## Recorded run, suite 42
+
+Recorded 2026-11-21 on an Azure Standard_D8s_v5 (Xeon Platinum 8370C),
+`--only 42 --record`; the candidate is `8458c10f` (PR #986 merged with
+master), `cargo build --release --features lua,tls` by rustc 1.100.0;
+memtier_benchmark 2.6.1; Redis 8.10.2 from the VM image. Runs: `pr986-d8s_v5`
+(recorded) and `pr986-d8s_v5-r2` (the noise check: every gate passed, host speed 1.01x, every rate within
+2 % of the recorded one). A run takes
+2,472 s. The server has CPUs 0-3 (KiviDB `--threads 4`, Redis one thread) and
+memtier 4-7.
+
+Operations a second at 200 / 500 connections, recorded run:
+
+| workload | v1.2.2 | candidate | Redis 8.10.2 | floor (x Redis) |
+|---|---:|---:|---:|---:|
+| `nextcloud` | 245,821 / 251,151 | 323,553 / 313,767 | 159,944 / 154,613 | 1.4x |
+| `nextcloud_noscript` | 298,827 / 291,798 | 305,409 / 291,432 | 161,604 / 161,930 | 1.4x |
+| `cad` | 178,498 / 181,501 | 247,935 / 258,536 | 132,509 / 135,118 | 1.4x |
+| `appwrite` | 101,921 / 100,741 | 135,076 / 134,280 | 97,165 / 100,455 | 1.0x |
+| `cad_tag` | 282,562 / 283,334 | 316,963 / 318,944 | 129,865 / 130,855 | 1.8x |
+| `appwrite_tag` | 204,720 / 209,505 | 245,644 / 247,389 | 96,278 / 96,450 | 1.8x |
+| `superset` | 106,061 / 92,990 | 111,666 / 96,888 | 54,803 / 53,659 | 1.2x |
+
+p99, ms at 200 / 500 connections:
+
+| workload | v1.2.2 | candidate | Redis 8.10.2 |
+|---|---:|---:|---:|
+| `nextcloud` (gated) | 5.70 / 12.03 | 0.887 / 2.46 | 2.43 / 6.01 |
+| `nextcloud_noscript` | 0.983 / 2.58 | 0.967 / 2.58 | 2.42 / 5.92 |
+| `superset` (gated) | 5.92 / 9.98 | 2.67 / 8.51 | 6.91 / 15.10 |
+
+`nextcloud_p99_over_noscript`: 0.92 / 0.96 for the candidate (gate 2.0),
+5.79 / 4.67 for v1.2.2. Master before #880 (`6bcf8afa`), run interleaved
+with the PR on the same machine type (docs/PERFORMANCE.md), had a p99 of 4.38
+/ 8.45 ms for the mix, 4.6x / 3.3x its no-script mix: it fails the gate, as
+v1.2.2 does here. Valkey 8.1 with `--io-threads 4`, measured in the same
+harness outside the suite in another session, gives 0.72 / 2.06 ms for the
+mix and 0.73 / 1.97 ms with no script.
+
+Every run had no error reply. MONITOR showed one key of the workload's form
+in each call's KEYS, with its ARGV, and more than 90 % distinct keys.
+Compare-and-delete deleted the key in about a third of the mix's calls.
+Alone it deleted about 2.5 %: once a key is deleted, later calls on it miss.
+
+This suite declares `min_cpus=8`: run it on a Standard_D8s_v5 with
+`run-all.sh --candidate <bin> --candidate-full <bin> --min-cpus-only --label
+<label>-d8s_v5`, or `--only 42` on a machine with 8 CPUs.
 
 ## Not covered
 
