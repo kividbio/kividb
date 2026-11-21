@@ -3755,6 +3755,12 @@ fn take_over_now(
     if !crate::aof::written_blocking(deadline) {
         return not_yet("what arrived is not in the AOF in time", true);
     }
+    // Not while slots handed over from this node may not be known as moved
+    // everywhere: the epoch taken below would be this node's
+    // (`ClusterState::epoch_may_change`).
+    if let Err(why) = cluster.epoch_may_change() {
+        return not_yet(&why, true);
+    }
     // The config epoch the slots are taken at, chosen now: this node's
     // replicas are told, in the stream, after the last record of what
     // arrived, that it has all arrived for a takeover at this epoch

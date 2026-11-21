@@ -1095,6 +1095,11 @@ fn cmd_bumpepoch(state: &ClusterState) -> Vec<u8> {
     if let Some(err) = require_cluster_mode(state) {
         return err;
     }
+    // Not while slots handed over from here may not be known as moved
+    // everywhere (`ClusterState::epoch_may_change`).
+    if let Err(why) = state.epoch_may_change() {
+        return resp_error(&format!("ERR BUMPEPOCH refused for now: {why}"));
+    }
     let (bumped, epoch) = state.bump_config_epoch_without_consensus();
     if !bumped {
         return resp_simple(&format!("STILL {epoch}"));

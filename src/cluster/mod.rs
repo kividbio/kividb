@@ -1939,6 +1939,12 @@ impl ClusterState {
         if !colliding {
             return false;
         }
+        // Not while slots handed over from here may not be known as moved
+        // everywhere (see `epoch_may_change`): the collision is seen again
+        // at the next heartbeat, and resolved then.
+        if self.epoch_may_change().is_err() {
+            return false;
+        }
         let epoch = self.bump_epoch();
         if let Some(node) = self.nodes.write().get_mut(&me) {
             node.config_epoch = epoch;
@@ -4661,6 +4667,34 @@ impl ClusterState {
     /// handover gives it up ([`Self::begin_handover`]), and the imports into
     /// this node give their attempt up: a replica that takes over has only
     /// what the stream has brought, and is no destination of theirs.
+    /// Whether this node may take a new config epoch now (`CLUSTER
+    /// BUMPEPOCH`, the move on an epoch collision, a takeover of slots
+    /// imported here). Not while an atomic slot migration away from this
+    /// node is handing its slots over, nor for [`HANDOVER_FAILOVER_GRACE`]
+    /// after one ended: the destination claims the slots at an epoch it took
+    /// for the takeover, above every one known then; were this node's epoch
+    /// to reach it before every node has heard that claim, those that still
+    /// have the slots as this node's would keep them so (a claim takes a
+    /// slot only from an owner at an older epoch), and a replica of this
+    /// node elected later would take them back from the destination.
+    pub(crate) fn epoch_may_change(&self) -> Result<(), String> {
+        if self.handovers.load(Ordering::SeqCst) > 0 {
+            return Err(
+                "an atomic slot migration away from this node is handing its slots over".into(),
+            );
+        }
+        if let Some(at) = *self.last_handover_end.lock()
+            && at.elapsed() < HANDOVER_FAILOVER_GRACE
+        {
+            return Err(format!(
+                "an atomic slot migration away from this node ended {} ms ago, and the \
+                 destination's claim may not have reached every node yet",
+                at.elapsed().as_millis()
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn failover_may_begin(&self) -> Result<(), String> {
         let _holds = self.handoff_holds.lock();
         if self.handovers.load(Ordering::SeqCst) > 0 {
