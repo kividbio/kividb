@@ -607,7 +607,7 @@ fn load_not_held(cluster: &ClusterState) {
                 log_info!(
                     "Cluster: this node does not hold slots {} of its master yet: its master \
                      took them, and its replication stream has not confirmed them",
-                    migration::ranges_text(&slot_runs(not_held.slots.keys().copied().collect()))
+                    migration::ranges_text(&slot_runs(not_held.slots.keys().copied()))
                 );
             }
         }
