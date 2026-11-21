@@ -3107,7 +3107,7 @@ fn graph_sets_deleted_while_linking() {
 /// (an exact scan), and gets its graph; one this build writes loads in
 /// 1.2.2 as it was.
 #[test]
-#[ignore = "needs KIVIDB_1_2_BIN"]
+#[ignore = "needs a 1.2 binary in KIVIDB_1_2_BIN"]
 fn graph_sets_and_1_2_snapshots() {
     let old = old_bin();
     let mut server = Server::start_bin(old.clone(), tempfile::tempdir().unwrap(), &[]);
