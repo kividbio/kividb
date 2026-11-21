@@ -201,7 +201,7 @@ impl SortedSetInner {
     /// allocation, room to spare included; for the large form its box, the
     /// table exactly as `used_memory` counts it (group arrays, overflow
     /// groups, the members' entries at their pool class's size) and the
-    /// index's estimate (`memory_layout::score_index`). For `MEMORY USAGE`.
+    /// index's nodes, as it counts them. For `MEMORY USAGE`.
     pub fn allocation_size(&self) -> usize {
         match &self.repr {
             Repr::Packed(block) => block.allocation_size(),
@@ -936,6 +936,15 @@ impl SortedSetInner {
     #[cfg(test)]
     pub(crate) fn is_queued(&self) -> bool {
         matches!(&self.repr, Repr::Large(large) if large.queued)
+    }
+
+    /// The large form, if the set is in it (tests).
+    #[cfg(test)]
+    pub(crate) fn large(&self) -> Option<&Large> {
+        match &self.repr {
+            Repr::Large(large) => Some(large),
+            Repr::Packed(_) => None,
+        }
     }
 
     /// Finish whatever resize is in progress now, and free what it leaves
