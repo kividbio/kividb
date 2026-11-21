@@ -696,7 +696,7 @@ impl ReplState {
     /// what it has been sent. A replica that attaches meanwhile counts once
     /// it has acknowledged what it had been sent when first seen (its full
     /// sync or its backlog covers the rest); one that goes is not waited
-    /// for, and no longer counts towards `known`.
+    /// for, and does not count towards `known`.
     pub fn replicas_have_all_blocking(&self, known: usize, deadline: std::time::Instant) -> bool {
         let pause = || std::thread::sleep(std::time::Duration::from_millis(1));
         if !self.replica_progress.lock().is_empty()
