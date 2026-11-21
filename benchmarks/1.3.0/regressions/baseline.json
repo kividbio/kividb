@@ -22142,6 +22142,1706 @@
           "max_x": 1.0
         }
       ]
+    },
+    "44-vector-sets-hnsw/glove100_100k/bytes_per_vector": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "glove100_100k",
+      "metric": "bytes_per_vector",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 495.7478,
+        "candidate": 968.0997,
+        "redis": 869.297,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/glove100_100k/graph_ready_s": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "glove100_100k",
+      "metric": "graph_ready_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.0001,
+        "candidate": 0.2583,
+        "redis": 0.0001,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/glove100_100k/recall_at_10": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "glove100_100k",
+      "metric": "recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1.0,
+        "candidate": 0.8984,
+        "redis": 0.8732,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0101
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/glove100_100k/vadd_per_s": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "glove100_100k",
+      "metric": "vadd_per_s",
+      "unit": "VADD/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 334577.7025,
+        "candidate": 14095.2266,
+        "redis": 2326.6886,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/glove100_100k/vsim_p50_ms_c1": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "glove100_100k",
+      "metric": "vsim_p50_ms_c1",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 10.433,
+        "candidate": 0.4152,
+        "redis": 0.5241,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/glove100_100k/vsim_p50_ms_c50": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "glove100_100k",
+      "metric": "vsim_p50_ms_c50",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 128.7284,
+        "candidate": 3.9039,
+        "redis": 6.0558,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/glove100_100k/vsim_p50_ms_c8": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "glove100_100k",
+      "metric": "vsim_p50_ms_c8",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 20.7116,
+        "candidate": 0.6699,
+        "redis": 1.0463,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/glove100_100k/vsim_p99_ms_c1": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "glove100_100k",
+      "metric": "vsim_p99_ms_c1",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 11.8293,
+        "candidate": 0.5356,
+        "redis": 0.6892,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/glove100_100k/vsim_p99_ms_c50": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "glove100_100k",
+      "metric": "vsim_p99_ms_c50",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 144.2679,
+        "candidate": 4.5925,
+        "redis": 10.9426,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/glove100_100k/vsim_p99_ms_c8": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "glove100_100k",
+      "metric": "vsim_p99_ms_c8",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 32.9822,
+        "candidate": 1.1844,
+        "redis": 2.0699,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/glove100_100k/vsim_qps_c1": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "glove100_100k",
+      "metric": "vsim_qps_c1",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 95.9344,
+        "candidate": 2409.5496,
+        "redis": 1907.3625,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.2
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/glove100_100k/vsim_qps_c50": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "glove100_100k",
+      "metric": "vsim_qps_c50",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 385.6883,
+        "candidate": 12792.458,
+        "redis": 8017.7074,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.15
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/glove100_100k/vsim_qps_c8": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "glove100_100k",
+      "metric": "vsim_qps_c8",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 385.8197,
+        "candidate": 11130.5614,
+        "redis": 7120.0908,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.15
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/laion768_100k/bytes_per_vector": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "laion768_100k",
+      "metric": "bytes_per_vector",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3167.758,
+        "candidate": 4267.2984,
+        "redis": 1525.4762,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/laion768_100k/graph_ready_s": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "laion768_100k",
+      "metric": "graph_ready_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.0001,
+        "candidate": 0.6224,
+        "redis": 0.0001,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/laion768_100k/recall_at_10": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "laion768_100k",
+      "metric": "recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.9982,
+        "candidate": 0.9718,
+        "redis": 0.9672,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0101
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/laion768_100k/vadd_per_s": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "laion768_100k",
+      "metric": "vadd_per_s",
+      "unit": "VADD/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 142574.022,
+        "candidate": 6911.9458,
+        "redis": 1943.5971,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/laion768_100k/vsim_p50_ms_c1": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "laion768_100k",
+      "metric": "vsim_p50_ms_c1",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 33.7131,
+        "candidate": 0.674,
+        "redis": 0.5758,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/laion768_100k/vsim_p50_ms_c50": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "laion768_100k",
+      "metric": "vsim_p50_ms_c50",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 422.577,
+        "candidate": 7.1048,
+        "redis": 7.2725,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/laion768_100k/vsim_p50_ms_c8": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "laion768_100k",
+      "metric": "vsim_p50_ms_c8",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 66.1047,
+        "candidate": 1.1549,
+        "redis": 1.2014,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/laion768_100k/vsim_p99_ms_c1": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "laion768_100k",
+      "metric": "vsim_p99_ms_c1",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 34.957,
+        "candidate": 0.8796,
+        "redis": 0.778,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/laion768_100k/vsim_p99_ms_c50": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "laion768_100k",
+      "metric": "vsim_p99_ms_c50",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 432.719,
+        "candidate": 8.339,
+        "redis": 13.0701,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/laion768_100k/vsim_p99_ms_c8": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "laion768_100k",
+      "metric": "vsim_p99_ms_c8",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 100.6366,
+        "candidate": 1.5631,
+        "redis": 2.4065,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/laion768_100k/vsim_qps_c1": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "laion768_100k",
+      "metric": "vsim_qps_c1",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 29.6513,
+        "candidate": 1497.0831,
+        "redis": 1733.2543,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.2
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/laion768_100k/vsim_qps_c50": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "laion768_100k",
+      "metric": "vsim_qps_c50",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 121.5348,
+        "candidate": 7000.4714,
+        "redis": 6714.2182,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.15
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/laion768_100k/vsim_qps_c8": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "laion768_100k",
+      "metric": "vsim_qps_c8",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 120.8971,
+        "candidate": 6925.3985,
+        "redis": 6139.4292,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.15
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_100k/bytes_per_vector": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_100k",
+      "metric": "bytes_per_vector",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 607.7478,
+        "candidate": 1060.3938,
+        "redis": 885.4467,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_100k/graph_ready_s": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_100k",
+      "metric": "graph_ready_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.0001,
+        "candidate": 0.2072,
+        "redis": 0.0001,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_100k/recall_at_10": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_100k",
+      "metric": "recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1.0,
+        "candidate": 0.9758,
+        "redis": 0.9726,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0101
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_100k/vadd_per_s": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_100k",
+      "metric": "vadd_per_s",
+      "unit": "VADD/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 301476.8367,
+        "candidate": 19114.2717,
+        "redis": 4511.7988,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_100k/vsim_p50_ms_c1": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_100k",
+      "metric": "vsim_p50_ms_c1",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 10.3721,
+        "candidate": 0.3408,
+        "redis": 0.3575,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_100k/vsim_p50_ms_c50": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_100k",
+      "metric": "vsim_p50_ms_c50",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 125.4186,
+        "candidate": 3.1695,
+        "redis": 4.978,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_100k/vsim_p50_ms_c8": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_100k",
+      "metric": "vsim_p50_ms_c8",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 20.1003,
+        "candidate": 0.5538,
+        "redis": 0.855,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_100k/vsim_p99_ms_c1": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_100k",
+      "metric": "vsim_p99_ms_c1",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 11.2703,
+        "candidate": 0.4463,
+        "redis": 0.4881,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_100k/vsim_p99_ms_c50": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_100k",
+      "metric": "vsim_p99_ms_c50",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 141.3831,
+        "candidate": 3.762,
+        "redis": 8.7584,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_100k/vsim_p99_ms_c8": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_100k",
+      "metric": "vsim_p99_ms_c8",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 32.479,
+        "candidate": 0.9763,
+        "redis": 1.5121,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_100k/vsim_qps_c1": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_100k",
+      "metric": "vsim_qps_c1",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 96.0859,
+        "candidate": 2916.3961,
+        "redis": 2753.5141,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.2
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_100k/vsim_qps_c50": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_100k",
+      "metric": "vsim_qps_c50",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 394.9946,
+        "candidate": 15711.7144,
+        "redis": 9768.1927,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.15
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_100k/vsim_qps_c8": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_100k",
+      "metric": "vsim_qps_c8",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 396.8059,
+        "candidate": 13518.693,
+        "redis": 8946.4587,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.15
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_10k/bytes_per_vector": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_10k",
+      "metric": "bytes_per_vector",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 632.3636,
+        "candidate": 1160.4782,
+        "redis": 884.4768,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_10k/graph_ready_s": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_10k",
+      "metric": "graph_ready_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.0001,
+        "candidate": 0.1536,
+        "redis": 0.0001,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_10k/recall_at_10": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_10k",
+      "metric": "recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1.0,
+        "candidate": 0.9818,
+        "redis": 0.9814,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0101
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_10k/vadd_per_s": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_10k",
+      "metric": "vadd_per_s",
+      "unit": "VADD/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 181011.355,
+        "candidate": 33293.6561,
+        "redis": 8326.0445,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_10k/vsim_p50_ms_c1": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_10k",
+      "metric": "vsim_p50_ms_c1",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.5339,
+        "candidate": 0.2292,
+        "redis": 0.3013,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_10k/vsim_p50_ms_c50": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_10k",
+      "metric": "vsim_p50_ms_c50",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 6.4468,
+        "candidate": 2.0614,
+        "redis": 4.3769,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_10k/vsim_p50_ms_c8": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_10k",
+      "metric": "vsim_p50_ms_c8",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.0793,
+        "candidate": 0.3603,
+        "redis": 0.7383,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_10k/vsim_p99_ms_c1": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_10k",
+      "metric": "vsim_p99_ms_c1",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.579,
+        "candidate": 0.2732,
+        "redis": 0.4178,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_10k/vsim_p99_ms_c50": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_10k",
+      "metric": "vsim_p99_ms_c50",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 7.195,
+        "candidate": 2.5795,
+        "redis": 7.6628,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_10k/vsim_p99_ms_c8": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_10k",
+      "metric": "vsim_p99_ms_c8",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.7306,
+        "candidate": 0.6759,
+        "redis": 1.2633,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_10k/vsim_qps_c1": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_10k",
+      "metric": "vsim_qps_c1",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1868.1755,
+        "candidate": 4353.0831,
+        "redis": 3268.0201,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.2
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_10k/vsim_qps_c50": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_10k",
+      "metric": "vsim_qps_c50",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 7801.6017,
+        "candidate": 24167.8789,
+        "redis": 11071.5275,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.15
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_10k/vsim_qps_c8": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_10k",
+      "metric": "vsim_qps_c8",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 7048.3937,
+        "candidate": 20240.7572,
+        "redis": 10450.9844,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.15
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_1m/bytes_per_vector": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_1m",
+      "metric": "bytes_per_vector",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 665.0995,
+        "candidate": 1202.5771,
+        "redis": 885.3651,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_1m/graph_ready_s": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_1m",
+      "metric": "graph_ready_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.0001,
+        "candidate": 0.013,
+        "redis": 0.0001,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_1m/recall_at_10": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_1m",
+      "metric": "recall_at_10",
+      "unit": "ratio",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.9992,
+        "candidate": 0.9574,
+        "redis": 0.952,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.0101
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_1m/vadd_per_s": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_1m",
+      "metric": "vadd_per_s",
+      "unit": "VADD/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 342900.8972,
+        "candidate": 10184.8637,
+        "redis": 2106.825,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_1m/vsim_p50_ms_c1": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_1m",
+      "metric": "vsim_p50_ms_c1",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 134.203,
+        "candidate": 0.501,
+        "redis": 0.5082,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_1m/vsim_p50_ms_c50": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_1m",
+      "metric": "vsim_p50_ms_c50",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1629.3029,
+        "candidate": 5.234,
+        "redis": 6.3435,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_1m/vsim_p50_ms_c8": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_1m",
+      "metric": "vsim_p50_ms_c8",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 291.1801,
+        "candidate": 0.8902,
+        "redis": 1.0745,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_1m/vsim_p99_ms_c1": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_1m",
+      "metric": "vsim_p99_ms_c1",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 138.1286,
+        "candidate": 0.5704,
+        "redis": 0.6368,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_1m/vsim_p99_ms_c50": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_1m",
+      "metric": "vsim_p99_ms_c50",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3942.9354,
+        "candidate": 6.2112,
+        "redis": 11.3166,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_1m/vsim_p99_ms_c8": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_1m",
+      "metric": "vsim_p99_ms_c8",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 490.3645,
+        "candidate": 1.5888,
+        "redis": 2.1586,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info",
+          "speed": false
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_1m/vsim_qps_c1": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_1m",
+      "metric": "vsim_qps_c1",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 7.438,
+        "candidate": 2023.0865,
+        "redis": 1973.2812,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.2
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_1m/vsim_qps_c50": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_1m",
+      "metric": "vsim_qps_c50",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 28.3319,
+        "candidate": 9543.5799,
+        "redis": 7690.1185,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.15
+        }
+      ]
+    },
+    "44-vector-sets-hnsw/sift128_1m/vsim_qps_c8": {
+      "suite": "44-vector-sets-hnsw",
+      "config": "sift128_1m",
+      "metric": "vsim_qps_c8",
+      "unit": "q/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 27.183,
+        "candidate": 8578.838,
+        "redis": 6826.2242,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-21",
+        "commit": "3d05f524",
+        "label": "pr-991-44-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 15
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 1.15
+        }
+      ]
     }
   }
 }
