@@ -15,9 +15,9 @@
 //! one block is partly empty.
 //!
 //! **Huge pages.** A block of 1,024 slots is under 2 MiB below about 1,000
-//! dimensions, so in 4 KiB pages: one insert into a graph of 200,000 64-d
-//! vectors walked the page tables for most of the neighbours it measured
-//! (`search_layer`'s prefetches of their vectors were a quarter of its time).
+//! dimensions: in 4 KiB pages, an insert into a graph of 200,000 64-d vectors
+//! walks the page tables for most of the neighbours it measures, and a
+//! quarter of `search_layer`'s time goes to its prefetches of their vectors.
 //! On Linux such blocks are cut, back to back, from chunks of whole huge
 //! pages mapped for the graph ([`Chunk`]), and each huge page of a chunk is
 //! made one (`MADV_COLLAPSE`) once the blocks over it are all in use, which

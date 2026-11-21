@@ -604,6 +604,9 @@ suite 41, one session, Redis 8.10.2 with its query engine:
 | 50,000 × 384 | 6,565 a second (1.24x Redis's time) | 7,479 (1.03x) | 7,699 |
 | 200,000 × 64 | 9,638 (1.67x) | 12,216 (1.34x) | 16,416 |
 
+Each insert has cost less CPU since; [What one insert costs](#what-one-insert-costs)
+has the builds as they are now.
+
 Several loading connections are not taken for clients: the commands that wrote vectors,
 and an estimate of the CPU time each takes on its worker, are left out of what counts as
 serving. On a D8s_v5 with a Xeon 8573C, the documents sent over 1, 4 and 8 connections
@@ -615,18 +618,49 @@ in `HSET` pipelines of 1,000 (2 runs each), all seven helpers linked for the who
 them, link on all seven too, but take as long as before (14.5 and 19.6 s against 14.2
 and 19.6). The walk over the keys is their limit, not the linking.
 
-At 64-d the gap left is the cost of each insert once helpers share a core's two
-hyperthreads. The 200,000 documents took 77 CPU seconds with three helpers and 118
-with seven (39 seconds of wall time with one, 20.2 with three, 16.2 with seven). The
-profile shows no lock in either:
-- `search_layer`: 55 % of the samples with three, 60 % with seven;
-- the distance kernel: 19 % with three, 13 % with seven;
-- no `parking_lot` slow path, and the kernel's futex and scheduler paths about 1 %.
+At the same `EF_RUNTIME`, one client's KNN q/s and recall off a graph built by seven
+helpers are those off one built by three, within the ±10 % run-to-run spread of that
+client.
 
-The extra time is spent waiting for the neighbours' vectors while the core's other
-hyperthread does the same. At the same `EF_RUNTIME`, one client's KNN q/s and recall
-off a graph built by seven helpers are those off one built by three, within the
-±10 % run-to-run spread of that client.
+### What one insert costs
+
+An insert does about as many distances as Redis's. Counted over 50,000 64-d inserts
+on one thread: 6,361 an insert (4,462 in the search, 872 choosing the neighbours,
+1,027 pruning the neighbours' lists); Redis 8.10.2's kernel was called 6,779 times an
+insert (a `bpftrace` uprobe on `FP32_InnerProductSIMD16_AVX512`). What an insert costs
+is then each distance's: the memory it waits for and what is done around it.
+
+One client loading 200,000 64-d documents in `HSET` pipelines of 1,000 on a D8s_v5
+(Xeon 8370C), the clock running until nothing waits; three runs, each interleaved
+with Redis 8.10.2 on the same machine:
+
+| | build | CPU seconds | Redis's build, the same runs |
+|---|---:|---:|---:|
+| 200,000 × 64, `auto` (seven helpers) | 12.8-12.9 s (0.97-0.98x) | 92 | 13.0-13.2 s, 90-92 CPU s |
+| 50,000 × 384, `auto` | 6.2 s (0.89x) | 44 | 6.9-7.0 s, 50-51 CPU s |
+
+What each part of an insert does, and what it took off the 64-d build with seven
+helpers (3 interleaved runs each):
+- **Huge pages** for the slots (vectors, layer-0 links and live flags): 4-5 %. In 4 KiB
+  pages a quarter of the search's time went to its prefetches of the neighbours'
+  vectors, most of which cost a page walk. Blocks of 1,024 slots are cut from chunks
+  of whole huge pages, and each huge page is made one (`MADV_COLLAPSE`, Linux 6.1 and
+  later) once the blocks over it are in use; nothing is made a huge page before. So
+  indexes of 1,000 to 20,000 vectors (64-d and 384-d) take the same `used_memory` and
+  RSS as before, within 1 %, and where transparent huge pages are set to `never` no
+  huge page is made.
+- **The live flag read last:** 4 %. The search measures a neighbour, and reads its live
+  flag (a byte on a line of its own) only if it would keep it.
+- **The kernel looked up once** a search, selection or pruning, called through one
+  function pointer, with the counters written on every link each on a cache line of
+  its own, apart from the kernels' level: 8-10 %.
+- **Integer heap keys** (the distances as `OrderedFloat` orders them): 3 %.
+- **The entry point** looked at under its read lock, and one list for the pruning's
+  scores: 5 %.
+
+Prefetching fewer or more lines of each neighbour up front, a larger backlog, 5 to 10
+helpers, and prefetching the links of each node kept for later made no difference
+beyond the ±3 % run-to-run spread.
 
 Clients served during the load see the three helpers. Measured during a 200,000 ×
 64-d load on a D8s_v5 with a Xeon 8573C, with three helpers (`search-index-threads 3`)

@@ -850,9 +850,8 @@ static WRITES: Counter = Counter::new();
 
 /// A counter on a cache line of its own. These are written for every vector
 /// a write or a helper links, and must not share a line with a static that
-/// a search reads: the distance kernels' level (`simd::LEVEL`) was on
-/// `LINK_CPU_NS`'s line, and while a writer linked its own vectors every
-/// distance a helper measured waited for that line.
+/// a search reads (the distance kernels' level, `simd::LEVEL`, is one): a
+/// search on another core would wait for the line after each such write.
 #[repr(align(64))]
 struct Counter(AtomicU64);
 

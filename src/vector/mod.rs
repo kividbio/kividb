@@ -4008,8 +4008,8 @@ fn search_layer(
                 // for above, and most neighbours are farther than the worst
                 // kept. The graph is held for reading here, so no slot is
                 // filled again meanwhile, and a deleted node's slot still
-                // holds a vector: the nodes kept are those kept when the
-                // flag was read first. Reading every flag first was the
+                // holds a vector: the nodes kept are those kept if the flag
+                // is read first. Read for every neighbour, the flag is the
                 // costliest load of an insert with seven helpers linking
                 // 64-d vectors.
                 let nb_dist = measure.dist(query, slots.vector(nb_id as usize));
