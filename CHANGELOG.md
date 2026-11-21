@@ -1562,9 +1562,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   more than `active-defrag-slab-waste-bytes` (16 MiB), besides
   `active-defrag-threshold-lower` and `active-defrag-ignore-bytes`. What it
   moves goes into the room of the class's partial slabs first; a round's new
-  slabs are kept to a 64th of the slabs; no pass starts, or goes on to
-  another round, while a large delete or its refill runs, and none starts
-  while a snapshot, an AOF rewrite or a backup is written. A pass the
+  slabs are kept to a 64th of the slabs; no pass starts until the values in
+  the slabs have changed by less than a 32nd of them each second for 5
+  seconds, a round ends when a large delete or its refill starts, and no
+  pass starts while a snapshot, an AOF rewrite or a backup is written. A pass the
   slab-waste trigger started that got little back keeps that trigger off
   for 30 s, doubling up to 10 min. New `INFO memory` fields:
   `value_slab_full_free_bytes`, `active_defrag_passes`,

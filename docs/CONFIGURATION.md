@@ -190,9 +190,10 @@ both:
 | `active-defrag-cycle-max` | `10` | the most of one core it uses, a percentage |
 
 No pass starts while a snapshot (`BGSAVE`), an AOF rewrite or a backup is being written (the
-values it holds cannot move), or while the values in the slabs grew or fell by more than a
-32nd of the slabs in the last second (a large delete, or its refill: the writes take the free
-room themselves), and a pass stops between two rounds for the same. A round moves values out
+values it holds cannot move), nor until the values in the slabs have grown or fallen by less
+than a 32nd of the slabs each second for 5 seconds (a large delete, or its refill: the writes
+take the free room themselves), and a round ends early, with its pass, when a delete or a
+refill starts while it runs. A round moves values out
 of a set of slabs in one look through the keys; what it puts in new slabs is held twice until
 the round ends, so a round takes at most a 64th of the slabs' size in new slabs (at least
 1 MiB), which keeps the peak during a churn within about 1.5 % of what it is with active

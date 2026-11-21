@@ -44,11 +44,12 @@
 //! than `active-defrag-slab-waste-bytes` (10 % and 16 MiB by default). It
 //! stops when the waste is under half of both of either. It does not start
 //! while a snapshot or an AOF rewrite runs (the values it holds cannot
-//! move), nor while what is in the slabs grew or fell by more than one
-//! [`REFILL`]th of them in the last second: a large delete, and the writes
-//! that fill its room again, take that room themselves, and the new slabs a
-//! pass takes meanwhile would come on top of theirs. A pass stops between
-//! two rounds for the same. A round's new slabs are what the process holds
+//! move), nor until what is in the slabs has grown or fallen by less than
+//! one [`REFILL`]th of them each second for [`CALM_TICKS`] seconds: a large
+//! delete, and the writes that fill its room again, take that room
+//! themselves, and the new slabs a pass takes meanwhile would come on top
+//! of theirs. A round ends early, and the pass with it, when a delete or a
+//! refill starts while it runs ([`Calm`]). A round's new slabs are what the process holds
 //! twice until the round ends, so a round is kept small ([`BUDGET_SHARE`]).
 //! A pass
 //! the slab-waste trigger started that got little back ([`LITTLE_BACK`])
@@ -122,6 +123,13 @@ const PANICS_TO_TURN_OFF: u32 = 5;
 /// them over one [`TICK`] (or one round) keeps a pass from starting (or
 /// going on): a large delete, or the writes that fill its room again.
 const REFILL: usize = 32;
+
+/// Ticks in a row with no such change before a pass starts. With 1 KB
+/// values deleted and written anew a fifth at a time, 2 s apart, passes that
+/// started in the gaps and were cut short by the next delete kept the slabs
+/// they had taken: the peak was 1.18x what was loaded, against 1.14x with
+/// active defrag off.
+const CALM_TICKS: u32 = 5;
 
 /// A round's budget: bytes of the values moved that may go into new slabs,
 /// one this-many-th of the slabs (at least [`BUDGET_MIN`]). They are held
@@ -437,8 +445,10 @@ struct Streak {
     in_a_row: u32,
     /// [`TURNED_ON`] when `in_a_row` was last started afresh.
     turned_on: u64,
-    /// `value_slab_live_bytes` at the last tick.
+    /// `value_slab_live_bytes` at the last tick, and how many ticks in a
+    /// row it has moved by less than [`churning`] counts.
     live_before: Option<usize>,
+    calm: u32,
     /// Until when the slab-waste trigger is off, and how long it was off
     /// the last time (0: it got enough back since).
     waste_off_until: Option<Instant>,
@@ -451,6 +461,7 @@ impl Streak {
             in_a_row: 0,
             turned_on: TURNED_ON.load(Ordering::Relaxed),
             live_before: None,
+            calm: 0,
             waste_off_until: None,
             waste_off: Duration::ZERO,
         }
@@ -615,15 +626,23 @@ fn pass(store: &Store, streak: &mut Streak) -> Result<bool, Failed> {
             }
             let fill = value_slab::fill();
             // A large delete, or its room being filled again: the clients
-            // take the room themselves.
-            let refilling = streak
+            // take the room themselves. Calm for [`CALM_TICKS`] in a row
+            // first: a churn that comes in cycles a few seconds apart would
+            // otherwise cut each pass short, the new slabs it took kept.
+            let churned = streak
                 .live_before
-                .is_some_and(|before| churning(before, fill.live_bytes, fill.slab_bytes));
+                .is_none_or(|before| churning(before, fill.live_bytes, fill.slab_bytes));
+            streak.calm = if churned {
+                0
+            } else {
+                streak.calm.saturating_add(1)
+            };
             streak.live_before = Some(fill.live_bytes);
             let Some(trigger) = wasting(&fill, false, streak.slab_waste_on()) else {
                 return false;
             };
-            if refilling || snapshotting() {
+            let waiting = WAIT_FOR_REFILL.load(Ordering::Relaxed) && streak.calm < CALM_TICKS;
+            if waiting || snapshotting() {
                 return false;
             }
             let started = Instant::now();
