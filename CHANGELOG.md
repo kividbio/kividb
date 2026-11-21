@@ -540,6 +540,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it twice). A script with no hash tag still runs one at a
   time; see [docs/SCRIPTS.md](docs/SCRIPTS.md) and docs/PERFORMANCE.md.
 
+- **A queued script's connection looks for its reply instead of sleeping
+  until woken (#900).** A quick script that runs alone and was queued
+  behind another one is waited for by its connection between turns of its
+  thread's loop, for up to 400 µs, and only then with a waker: the thread
+  serves its other connections meanwhile, and the thread running the
+  scripts does not wake it for each reply (on io_uring the look
+  hands the thread's reads and writes to the kernel every 20 µs). A
+  connection that looks and finds the turn free with scripts queued runs
+  them, as the thread that ran its own script does. A queued script's
+  arguments are copied into one buffer. Each script still runs alone, in
+  the queue's order, and replicas and the AOF get them in the order they
+  ran. centrifuge v0.40.1's Redis broker benchmarks (`rd_single`, 4 pipelined
+  connections, `--threads 4` on 4 CPUs of an Azure `Standard_D8s_v5`, ns/op as
+  a ratio to Redis 8.10.2, PARALLELISM 16 / 128, medians of 3): `History_1Ch`
+  list 1.55x / 1.83x to 1.09x / 1.15x, stream 1.06x / 1.01x to 0.79x / 0.83x;
+  `Publish_History_1Ch` list 1.56x / 1.75x to 1.19x / 1.27x, stream 1.22x /
+  1.30x to 0.92x / 0.97x; `Pub_History_ManyCh` list 1.50x / 1.65x to 1.15x /
+  1.22x, stream 1.33x / 1.38x to 0.97x / 1.36x. Regression suite 45 runs
+  these scripts against Redis; see docs/PERFORMANCE.md.
+
 - **Hash field names are bytes in memory, and ACL key and channel patterns
   are bytes (#510).** Last of the four steps of #437:
   - A hash keeps a field as the bytes it was sent as, in a block and in a
