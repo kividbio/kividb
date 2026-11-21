@@ -9848,7 +9848,8 @@ fn a_takeover_is_refused_when_another_master_reaches_its_epoch_meanwhile() {
     });
     let r = nodes[0].conn().cmd(&["CLUSTER", "BUMPEPOCH"]);
     assert!(
-        r.err().is_some_and(|e| e.contains("handing its slots over")),
+        r.err()
+            .is_some_and(|e| e.contains("handing its slots over")),
         "{r:?}"
     );
     // The epoch the destination took for the takeover is its current one,
