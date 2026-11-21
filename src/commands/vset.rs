@@ -54,7 +54,11 @@ struct Addition {
 
 /// What `VADD` answers (1 when the element is new), and a link into the
 /// set's graph to make once the locks are let go.
-type Added = (bool, Option<vset_graph::Pending>, Arc<RwLock<VectorSetInner>>);
+type Added = (
+    bool,
+    Option<vset_graph::Pending>,
+    Arc<RwLock<VectorSetInner>>,
+);
 
 fn quantize(quant: Quant, vector: Vec<f32>) -> Result<StoredVector, Vec<u8>> {
     StoredVector::quantize(quant, vector)
@@ -2104,11 +2108,7 @@ mod graph_tests {
         let mut rng = StdRng::seed_from_u64(11);
         for i in 0..vset_graph::EXACT_BELOW + 500 {
             let v = random_vector(&mut rng, dim);
-            vadd(
-                db,
-                "vs",
-                addition(&format!("base{i}"), &v, quant, metric),
-            );
+            vadd(db, "vs", addition(&format!("base{i}"), &v, quant, metric));
         }
         settled(&set_at(db, "vs").unwrap());
         let stop = &std::sync::atomic::AtomicBool::new(false);
@@ -2182,11 +2182,7 @@ mod graph_tests {
                 drop(old);
                 for i in 0..vset_graph::EXACT_BELOW + 100 {
                     let v = random_vector(&mut rng, dim);
-                    vadd(
-                        db,
-                        "vs",
-                        addition(&format!("again{i}"), &v, quant, metric),
-                    );
+                    vadd(db, "vs", addition(&format!("again{i}"), &v, quant, metric));
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -2280,7 +2276,11 @@ mod graph_tests {
     fn taken_in(vs: &Set) {
         let graph = graph_of(vs);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while graph.index.linked.as_ref().is_some_and(|q| !q.lock().is_empty())
+        while graph
+            .index
+            .linked
+            .as_ref()
+            .is_some_and(|q| !q.lock().is_empty())
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(std::time::Duration::from_millis(20));

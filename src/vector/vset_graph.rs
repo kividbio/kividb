@@ -322,14 +322,13 @@ fn hand_over(graph: &VsetGraph, inner: &VectorSetInner, name: &[u8]) -> Option<P
     let key = key_of(name);
     let vector: Arc<[f32]> = laid_out(graph, inner, vector)?.into();
     let most = backlog::limit(vector.len());
-    let pending = backlog::put_ordered(&graph.index, &key, vector, &inner.metric).map(|ticket| {
-        Pending {
+    let pending =
+        backlog::put_ordered(&graph.index, &key, vector, &inner.metric).map(|ticket| Pending {
             index: Arc::downgrade(&graph.index),
             key,
             ticket,
             metric: inner.metric.clone(),
-        }
-    })?;
+        })?;
     // No helper threads (`search-index-threads` 0, or `auto` below 8 CPUs):
     // the set's own linkers take it, while the backlog has room. A write
     // that linked its own vector would do so in its command, and the
@@ -447,7 +446,9 @@ pub fn shrunk(inner: &mut VectorSetInner) {
         let encoding = reader.encoding();
         for (name, entry) in inner.entries.iter_mut() {
             if entry.vector.is_none() {
-                entry.vector = reader.encoded(name.as_bytes()).and_then(|e| encoding.decode(e));
+                entry.vector = reader
+                    .encoded(name.as_bytes())
+                    .and_then(|e| encoding.decode(e));
                 assert!(
                     entry.vector.is_some(),
                     "a vector set element is in neither its entry nor its graph"
@@ -672,7 +673,9 @@ fn builder() {
 /// holds those vectors for the set.
 fn retry(mut job: Build) {
     job.attempt += 1;
-    let Some(graph) = job.graph.upgrade() else { return };
+    let Some(graph) = job.graph.upgrade() else {
+        return;
+    };
     if job.attempt >= ATTEMPTS {
         graph.state.store(FAILED, Release);
         crate::log_warn!(
@@ -703,7 +706,11 @@ fn take_in_linked() {
     };
     for (set, graph) in sets {
         loop {
-            let queued = graph.index.linked.as_ref().is_some_and(|q| !q.lock().is_empty());
+            let queued = graph
+                .index
+                .linked
+                .as_ref()
+                .is_some_and(|q| !q.lock().is_empty());
             if !queued {
                 break;
             }
@@ -737,7 +744,9 @@ fn build(job: &Build) {
             panic!("a build made to panic (a test)");
         }
     }
-    let Some(graph) = job.graph.upgrade() else { return };
+    let Some(graph) = job.graph.upgrade() else {
+        return;
+    };
     let index = Arc::downgrade(&graph.index);
     drop(graph);
     let mut pending = Vec::with_capacity(CHUNK);
@@ -773,7 +782,9 @@ fn build(job: &Build) {
             p.link();
         }
     }
-    let Some(graph) = job.graph.upgrade() else { return };
+    let Some(graph) = job.graph.upgrade() else {
+        return;
+    };
     graph.state.store(READY, Release);
     drop(graph);
     // What the helpers linked is taken in when the builder is next idle

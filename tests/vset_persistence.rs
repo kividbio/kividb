@@ -3166,7 +3166,11 @@ fn vectors_kept_in_the_graph_read_back_as_stored() {
             }
             assert!(!vadd(&mut c, &small, &v, "e1", &opts).is_err());
             let want = c.cmd(&["VEMB", &small, "e1", "RAW"]);
-            assert_eq!(c.cmd(&["VEMB", key, "e1", "RAW"]), want, "{key} round {round}");
+            assert_eq!(
+                c.cmd(&["VEMB", key, "e1", "RAW"]),
+                want,
+                "{key} round {round}"
+            );
             assert_eq!(c.cmd(&["VEMB", key, "e1"]), c.cmd(&["VEMB", &small, "e1"]));
             let V::Bulk(payload) = c.cmd(&["DUMP", key]) else {
                 panic!("DUMP {key}")
@@ -3193,5 +3197,9 @@ fn a_snapshot_taken_during_the_build_loads_whole() {
     server.shutdown();
     server.restart();
     let mut c = server.conn();
-    assert_graph_answers(&mut c, &want, "loaded from a snapshot taken during the build");
+    assert_graph_answers(
+        &mut c,
+        &want,
+        "loaded from a snapshot taken during the build",
+    );
 }
