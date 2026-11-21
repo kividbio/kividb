@@ -520,22 +520,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Plain commands no longer wait behind a stream of scripts that run alone
   (#880).** A quick script that runs alone (its key has no hash tag, or
-  `lua-parallel-scripts no`) and comes while another one is running is now
-  run right after it, by the thread running that one, with the other
-  commands held back once for the run (up to 200 µs) instead of once for
-  each script; the script-runner thread takes only the ones left over.
-  It used to take all of them: a fifth busy thread beside four workers on
-  four CPUs, it waited for a CPU while it held the command gate, and the
-  commands on every thread waited with it. Nextcloud's mix (`GET` 40,
-  `TTL` 15, `INCRBY` 15, `EXPIRE` 15, `EVALSHA` of its compare-and-delete
-  on a key with no tag 12, `SETEX` 3; 500 connections, `--threads 4` on 4
-  CPUs of an Azure `Standard_D8s_v5`, io_uring): 313k ops/s with a p99 of 2.6 ms, was 299k
-  at 8.6 ms (the same mix with no script: 2.5 ms; Valkey 8.1 with 4 I/O
-  threads: 333k at 2.1 ms); at 200 connections the p99 is 0.94 ms, was 4.4. Each script is
-  still alone: no other command runs beside it or between two of them, and
-  replicas and the AOF get the scripts in the order they ran. A script with
-  no hash tag still runs one at a time; see
-  [docs/SCRIPTS.md](docs/SCRIPTS.md) and docs/PERFORMANCE.md.
+  `lua-parallel-scripts no`) and comes while another one is running is run
+  right after it, by the thread running that one, in a run: the first
+  script holds the other commands back where it would on its own, after its
+  checks, and they stay held back for the scripts after it until 200 µs
+  have passed and the script then running has finished. The other commands
+  wait once for a run instead of once for each script; the script-runner
+  thread takes only the scripts left over. A script that has to wait (a
+  slot handoff, a `MIGRATE` of its key) lets the other commands in while it
+  waits. Nextcloud's mix (`GET` 40, `TTL` 15, `INCRBY` 15, `EXPIRE` 15,
+  `EVALSHA` of its compare-and-delete on a key with no tag 12, `SETEX` 3;
+  500 connections, `--threads 4` on 4 CPUs of an Azure `Standard_D8s_v5`,
+  io_uring): 321k ops/s with a p99 of 2.45 ms, against 289k at 8.45 ms for
+  the build before (the same mix with no script: 2.53 ms); at 200
+  connections the p99 is 0.90 ms, against 4.38. Each script is still alone:
+  no other command runs beside it or between two of them, and replicas and
+  the AOF get the scripts in the order they ran. `INFO stats` counts the
+  runs and the scripts in them (`scripts_alone_runs`,
+  `scripts_in_alone_runs`). A script with no hash tag still runs one at a
+  time; see [docs/SCRIPTS.md](docs/SCRIPTS.md) and docs/PERFORMANCE.md.
 
 - **Hash field names are bytes in memory, and ACL key and channel patterns
   are bytes (#510).** Last of the four steps of #437:

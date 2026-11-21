@@ -2,9 +2,10 @@
 """#880: plain commands beside scripts that run alone. A script whose key has
 no hash tag runs alone: no other command runs while it does. Nextcloud's
 lock release and Appwrite's abuse limiter are such scripts, sent beside
-plain commands. Before #880, the plain commands of such a mix waited behind
-the scripts: Nextcloud's mix had a p99 of 8.0 ms at 500 connections against
-2.5 ms for the same mix with no script (Valkey 8.1 with 4 I/O threads: 1.9).
+plain commands. The build before #880 (master 6bcf8afa, Standard_D8s_v5,
+interleaved with the build with it) ran Nextcloud's mix with a p99 of 8.45 ms
+at 500 connections and 4.38 ms at 200, against 2.53 and 0.96 ms for the same
+mix with no script; with #880, 2.45 and 0.90 ms.
 
 Scripts, verbatim:
 

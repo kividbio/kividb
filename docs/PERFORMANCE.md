@@ -334,35 +334,42 @@ for the instructions, each tree and 1.2.2 built by the same rustc.
 ## Scripts that run alone, beside plain commands
 
 A script whose key has no hash tag runs alone: no other command runs while it does
-([SCRIPTS.md](SCRIPTS.md)). Since [#880](https://github.com/kividbio/kividb/issues/880), a quick
-one that comes while another is running is run right after it by the thread running that one,
-with the other commands held back once for the run (up to 200 µs), not once for each script.
-It used to go to the script-runner thread, which closed the command gate for each script and,
-as a fifth busy thread beside four workers on four CPUs, waited for a CPU while it held the
-gate: the plain commands of every worker waited with it.
+([SCRIPTS.md](SCRIPTS.md)). A quick one that comes while another is running is run right after
+it, by the thread running that one, in a run ([#880](https://github.com/kividbio/kividb/issues/880)):
+the first script of the run holds the other commands back where it would on its own, after its
+checks, and they stay held back for the scripts after it until 200 µs have passed since they were
+held back and the script then running has finished. They are held back once for the run, not
+once for each script. A script that has to wait (a slot handoff, a `MIGRATE` of its key) lets
+them in while it waits. `INFO stats` counts the runs (`scripts_alone_runs`) and the scripts in
+them (`scripts_in_alone_runs`).
 
-Azure `Standard_D8s_v5`, server on CPUs 0-3 (`--threads 4`, io_uring; Valkey 8.1 with
-`--io-threads 4`; Redis 8.10.2), memtier_benchmark 2.6.1 on CPUs 4-7, 4 threads, one call at a
-time per connection, 100,000 keys written again before each run, medians of 3 runs of 20 s;
-ops/s, p99 and p99.9 in ms:
+Azure `Standard_D8s_v5`, server on CPUs 0-3 (`--threads 4`, io_uring), memtier_benchmark 2.6.1 on
+CPUs 4-7, 4 threads, one call at a time per connection, `--randomize --distinct-client-seed`,
+100,000 keys written again before each run; the build before #880 (master `6bcf8afa`) and the
+build with it, both `--features lua,tls` by rustc 1.100.0, run interleaved, 3 rounds of 20 s,
+medians; ops/s, p99 and p99.9 in ms:
 
-| workload, connections | before | now | Valkey 8.1 | Redis 8.10 |
-|---|---:|---:|---:|---:|
-| Nextcloud's mix, 500 | 299k, 8.57, 15.7 | 313k, 2.64, 9.0 | 333k, 2.06, 5.3 | 142k, 6.53, 7.8 |
-| Nextcloud's mix, 200 | 290k, 4.38, 9.2 | 319k, 0.94, 3.3 | 342k, 0.72, 1.4 | 145k, 2.69, 2.9 |
-| the same mix with no script, 500 | 310k, 2.43, 5.2 | 306k, 2.48, 5.3 | 339k, 1.97, 4.9 | 146k, 6.33, 7.2 |
-| the same mix with no script, 200 | 315k, 0.94, 1.6 | 313k, 0.95, 1.6 | 342k, 0.73, 1.9 | 147k, 2.64, 2.8 |
-| Superset's mix, 500 | 96.5k, 12.3, 30.3 | 97.3k, 8.6, 12.9 | 97.2k, 9.66, 13.3 | 52k, 15.4, 20.1 |
+| workload, connections | before #880 | with #880 |
+|---|---:|---:|
+| Nextcloud's mix, 500 | 289k, 8.45, 17.5 | 321k, 2.45, 6.1 |
+| Nextcloud's mix, 200 | 284k, 4.38, 9.2 | 326k, 0.90, 2.4 |
+| the same mix with no script, 500 | 297k, 2.53, 5.1 | 298k, 2.53, 5.3 |
+| the same mix with no script, 200 | 307k, 0.96, 1.6 | 308k, 0.96, 1.6 |
+| Superset's mix, 500 | 97.0k, 12.0, 30.0 | 97.2k, 8.5, 12.5 |
+| compare-and-delete alone, untagged, 500 | 259k, 3.25 | 261k, 3.17 |
+| Appwrite's abuse limiter (`EVAL`), untagged, 500 | 135k, 4.13 | 133k, 4.16 |
+| compare-and-delete alone, tagged key, 500 | 326k, 1.83 | 324k, 1.82 |
+| Appwrite's limiter, tagged key, 500 | 250k, 2.27 | 249k, 2.37 |
 
 Nextcloud's mix is `GET` 40, `TTL` 15, `INCRBY` 15, `EXPIRE` 15, `EVALSHA` of its
 compare-and-delete 12 and `SETEX` 3; Superset's is `GET` 85 of 50 KB values, `SETEX` 10,
-`SET NX EX` 3 and its unlock 2. A script alone is where it was: the compare-and-delete at
-264k/s (Valkey 302k, Redis 123k), Appwrite's abuse limiter (`EVAL`) at 137k/s (Valkey 131k,
-Redis 88k), at 500 connections; a script on a tagged key runs beside others and is not
-affected. (Superset's row and the alone rows were run interleaved with the build before, three
-runs each; the others are from one session, one server after another.) With the Tokio I/O loop
-(`--io-model tokio`) the mix's p99 at 500 connections went from 9.0 to 5.4 ms, against 2.2 ms
-with no script: less of a gain than on io_uring, not yet explained. Regression suite 42 (`benchmarks/1.3.0/regressions`) keeps these rows.
+`SET NX EX` 3 and its unlock 2. With the script, the mix's p99 is the no-script mix's (2.45
+against 2.53 ms at 500 connections, 0.90 against 0.96 at 200). A script alone runs at the rate
+it did: one thread runs such scripts one after another. A script on a tagged key runs beside
+others and is not affected. For comparison, on the same machine type in another session: Valkey
+8.1 with `--io-threads 4` ran the mix at 333k ops/s with a p99 of 2.06 ms at 500 connections
+(0.72 ms at 200) and the compare-and-delete alone at 302k/s; Redis 8.10.2 ran the mix at 142k
+(p99 6.53 ms). TOKIO_LINE Regression suite 42 (`benchmarks/1.3.0/regressions`) keeps these rows.
 
 ## Vector index builds
 
