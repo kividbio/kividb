@@ -1883,7 +1883,9 @@ mod tests {
         let mut next = xorshift(0x9e37_79b9_7f4a_7c15);
         let mut tree = Tree::default();
         let mut model = Model::new();
-        for step in 0..60_000 {
+        // The model's answers walk it: under Miri, fewer steps, still three levels.
+        let steps = if cfg!(miri) { 3_000 } else { 60_000 };
+        for step in 0..steps {
             let key = draw(&mut next);
             let len = model.len();
             match next(100) {
@@ -1928,6 +1930,7 @@ mod tests {
         // Random order leaves leaves about ln 2 full.
         let fill = tree.len() as f64 / (tree.census.leaves * CAP) as f64;
         assert!((0.6..0.8).contains(&fill), "fill {fill}");
+        assert!(tree.height() >= 3, "height {}", tree.height());
     }
 
     /// Random operations, with ties and score changes, checked against a BTreeSet.
@@ -1936,9 +1939,15 @@ mod tests {
         let mut next = xorshift(0x9e37_79b9_7f4a_7c15);
         let mut tree = Tree::default();
         let mut model = Model::new();
-        for step in 0..60_000 {
+        // Under Miri, phases of fewer steps, still three levels.
+        let (steps, phase) = if cfg!(miri) {
+            (4_500, 1_500)
+        } else {
+            (60_000, 20_000)
+        };
+        for step in 0..steps {
             // Grow, shrink, grow: splits and merges on every level.
-            let inserts = if (step / 20_000) % 2 == 0 { 60 } else { 10 };
+            let inserts = if (step / phase) % 2 == 0 { 60 } else { 10 };
             let key = draw(&mut next);
             let len = model.len();
             match next(100) {
@@ -1989,6 +1998,7 @@ mod tests {
             entries(&tree, 0, usize::MAX),
             model_range(&model, 0, usize::MAX)
         );
+        assert!(tree.height() >= 3, "height {}", tree.height());
         for (score, member) in &model {
             assert!(take(&mut tree, score.0, member));
         }
@@ -2289,11 +2299,15 @@ mod tests {
         let mut next = xorshift(0x5851_f42d_4c95_7f2d);
         let mut tree = Tree::default();
         let mut model = Model::new();
-        while model.len() < 5_000 {
+        // Each removal is checked over the whole tree: under Miri, fewer
+        // members, still three levels.
+        let n = if cfg!(miri) { 1_100 } else { 5_000 };
+        while model.len() < n {
             let member: Vec<u8> = (0..next(9)).map(|_| [0, 1, b'a', 0xff][next(4)]).collect();
             let added = add(&mut tree, 3.0, &member);
             assert_eq!(added, model.insert((OrderedFloat(3.0), member)));
         }
+        assert!(tree.height() >= 3, "height {}", tree.height());
         agrees(&tree, &model);
         while let Some(key) = model.iter().nth(next(model.len().max(1))).cloned() {
             if next(2) == 0 {
@@ -2510,8 +2524,15 @@ mod tests {
         let mut next = xorshift(0x0123_4567_89ab_cdef);
         let mut tree = Tree::default();
         let mut model = Model::new();
-        for step in 0..20_000 {
-            let growing = (step / 2_500) % 2 == 0;
+        // Under Miri, one growth to three levels and one shrink.
+        let (steps, phase) = if cfg!(miri) {
+            (4_000, 2_000)
+        } else {
+            (20_000, 2_500)
+        };
+        let mut deepest = 0;
+        for step in 0..steps {
+            let growing = (step / phase) % 2 == 0;
             let key = (
                 OrderedFloat(next(300) as f64),
                 vec![[0, b'a', 0xff][next(3)]; next(4)],
@@ -2538,7 +2559,9 @@ mod tests {
             if step % 1_000 == 999 {
                 agrees(&tree, &model);
             }
+            deepest = deepest.max(tree.height());
         }
+        assert!(deepest >= 3, "height {deepest}");
     }
 
     /// Sizes with an 8-byte reference, as the table's entry reference is.
@@ -2630,9 +2653,17 @@ mod tests {
     #[test]
     fn key_and_score_bounds_agree_with_a_model() {
         let mut next = xorshift(0x510e_527f_ade6_82d1);
+        // Each probe is counted over the whole model: under Miri, one tree of
+        // three levels and fewer probes (every key's up to `every_key` keys,
+        // else `sampled` keys', and `ranges` ranges).
+        let (sizes, every_key, sampled, ranges): (&[usize], _, _, _) = if cfg!(miri) {
+            (&[0, 1, 2, 31, 32, 33, 1_100], 33, 16, 25)
+        } else {
+            (&[0, 1, 2, 31, 32, 33, 600, 3_000], 600, 100, 100)
+        };
         // Distinct scores: one run, runs across leaves, then mostly unique.
         for scores in [1, 4, 50, 1 << 20] {
-            for size in [0usize, 1, 2, 31, 32, 33, 600, 3_000] {
+            for &size in sizes {
                 let mut tree = Tree::default();
                 let mut model = Model::new();
                 while model.len() < size {
@@ -2640,6 +2671,11 @@ mod tests {
                     assert_eq!(add(&mut tree, key.0.0, &key.1), model.insert(key));
                 }
                 tree.check();
+                assert!(
+                    size < 1_000 || tree.height() >= 3,
+                    "height {}",
+                    tree.height()
+                );
                 // Ends and absent scores, then keys held and their neighbours.
                 let mut probes: Vec<(f64, Vec<u8>)> = vec![
                     (f64::NEG_INFINITY, Vec::new()),
@@ -2649,9 +2685,9 @@ mod tests {
                     (f64::NAN, Vec::new()),
                 ];
                 let all: Vec<_> = model.iter().cloned().collect();
-                let sample = if size <= 600 { size } else { 100 };
+                let sample = if size <= every_key { size } else { sampled };
                 for i in 0..sample {
-                    let at = if size <= 600 { i } else { next(size) };
+                    let at = if size <= every_key { i } else { next(size) };
                     let (score, member) = all[at].clone();
                     let mut longer = member.clone();
                     longer.push(0);
@@ -2671,7 +2707,7 @@ mod tests {
                 for (score, member) in &probes {
                     bounds_agree(&tree, &model, *score, member);
                 }
-                for _ in 0..100 {
+                for _ in 0..ranges {
                     let a = &probes[next(probes.len())];
                     let b = &probes[next(probes.len())];
                     range_agrees(&tree, &model, bound(next(5), a), bound(next(5), b));
@@ -2824,10 +2860,16 @@ mod tests {
     fn bulk_builds_agree_with_a_model() {
         let mut next = xorshift(0x6c62_272e_07bb_0142);
         let (leaf, inner) = sizes();
-        let sizes = [
-            0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 1_000, 10_000, 100_000,
-        ];
-        for size in sizes {
+        // Each probe is counted over the whole model: under Miri, one past a
+        // root of full leaves (three levels) for the large builds.
+        let sizes: &[usize] = if cfg!(miri) {
+            &[0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, CAP * CAP + 1]
+        } else {
+            &[
+                0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 1_000, 10_000, 100_000,
+            ]
+        };
+        for &size in sizes {
             // Distinct scores, one score for all, then runs of about 40.
             for scores in [1 << 40, 1, size / 40 + 1] {
                 let mut model = Model::new();
@@ -2916,14 +2958,21 @@ mod tests {
     #[test]
     fn bulk_built_trees_take_inserts_and_removals() {
         let mut next = xorshift(0x8422_2325_cbf2_9ce4);
-        for size in [33, 1_000, 5_000] {
+        // Each change is checked over the whole tree: under Miri, the largest
+        // build one past a root of full leaves (three levels), fewer steps.
+        let (sizes, steps): (&[usize], _) = if cfg!(miri) {
+            (&[33, 1_000, CAP * CAP + 1], 600)
+        } else {
+            (&[33, 1_000, 5_000], 3_000)
+        };
+        for &size in sizes {
             let scores = size / 30 + 2;
             let mut model = Model::new();
             while model.len() < size {
                 model.insert((OrderedFloat(next(scores) as f64), binary(&mut next)));
             }
             let mut tree = built(&model);
-            for step in 0..3_000 {
+            for step in 0..steps {
                 let key = (OrderedFloat(next(scores) as f64), binary(&mut next));
                 let changed = if next(2) == 0 {
                     let added = add(&mut tree, key.0.0, &key.1);
@@ -3094,9 +3143,17 @@ mod tests {
     #[test]
     fn appends_fill_every_node_but_the_last_two() {
         let mut next = xorshift(0x5be0_cd19_137e_2179);
+        // Each append is checked over the whole tree: under Miri, only as
+        // nodes change, and the first two runs past three of the leaves'
+        // parents, one filled by lending.
+        let (long, extending) = if cfg!(miri) {
+            (2_100, 300)
+        } else {
+            (3_000, 600)
+        };
         for run in 0..3 {
             // Rising scores; one score, rising members; members that extend the last.
-            let n = if run == 2 { 600 } else { 3_000 };
+            let n = if run == 2 { extending } else { long };
             let keys: Vec<_> = (0..n)
                 .map(|i| match run {
                     0 => (OrderedFloat(i as f64 - 1_000.5), binary(&mut next)),
@@ -3107,8 +3164,9 @@ mod tests {
             let mut tree = Tree::default();
             let mut model = Model::new();
             for key in keys {
-                append(&mut tree, &mut model, key);
-                tree.check();
+                if append(&mut tree, &mut model, key) || !cfg!(miri) {
+                    tree.check();
+                }
                 full_behind_the_edge(&tree);
             }
             assert_eq!(tree.census.leaves, 2 + (n - 33) / CAP, "run {run}");
@@ -3235,12 +3293,17 @@ mod tests {
                 depths.push(depth);
             }
         };
+        // Each check walks the whole tree: under Miri, checked only as
+        // internal nodes come and go (the root's first child, halved when the
+        // root splits, fills again only past about 48,000 appends).
+        let mut inners = tree.census.inners;
         for i in 0..60_000u32 {
             // Runs of 40 a score cross leaves of 32: separators tie.
             let key = (OrderedFloat(f64::from(i / 40)), i.to_be_bytes().to_vec());
-            if append(&mut tree, &mut model, key) {
+            if append(&mut tree, &mut model, key) && (!cfg!(miri) || tree.census.inners != inners) {
                 tree.check();
             }
+            inners = tree.census.inners;
             track(&tree);
         }
         full_behind_the_edge(&tree);
@@ -3252,7 +3315,12 @@ mod tests {
         let mut census = (tree.census.leaves, tree.census.inners);
         while pop(&mut tree, &mut model, high) {
             let after = (tree.census.leaves, tree.census.inners);
-            if after != census || tree.len().is_multiple_of(997) {
+            let changed = if cfg!(miri) {
+                after.1 != census.1
+            } else {
+                after != census || tree.len().is_multiple_of(997)
+            };
+            if changed {
                 tree.check();
             }
             census = after;
@@ -3313,18 +3381,29 @@ mod tests {
         let mut next = xorshift(0x1f83_d9ab_fb41_bd6b);
         let mut tree = Tree::default();
         let mut model = Model::new();
-        for i in 0..6_000u32 {
+        // Each change is checked over the whole tree: under Miri, a shorter
+        // run, still three levels, and fewer changes.
+        let (run, steps) = if cfg!(miri) {
+            (1_200u32, 600)
+        } else {
+            (6_000, 4_000)
+        };
+        for i in 0..run {
             // Even scores, three a score: odd ones and new members fall between.
             let key = (OrderedFloat(f64::from(i / 3 * 2)), i.to_be_bytes().to_vec());
             append(&mut tree, &mut model, key);
         }
         full_behind_the_edge(&tree);
+        assert!(tree.height() >= 3, "height {}", tree.height());
         agrees(&tree, &model);
-        for step in 0..4_000 {
+        for step in 0..steps {
             match next(6) {
                 // Anywhere, ties included, a few past the largest.
                 0 | 1 => {
-                    let key = (OrderedFloat(next(4_200) as f64), binary(&mut next));
+                    let key = (
+                        OrderedFloat(next(run as usize * 7 / 10) as f64),
+                        binary(&mut next),
+                    );
                     assert_eq!(add(&mut tree, key.0.0, &key.1), model.insert(key));
                 }
                 2 if !model.is_empty() => {
@@ -3680,12 +3759,21 @@ mod tests {
         let mut next = xorshift(0x243f_6a88_85a3_08d3);
         let mut tree = Tree::default();
         let mut model = Model::new();
-        while model.len() < 1_500 {
+        // Each rescore is checked against the whole model: under Miri, fewer
+        // members, still three levels, and fewer rescores, each checked over
+        // the tree and every `every`th against the model.
+        let (n, rescores, every) = if cfg!(miri) {
+            (1_100, 160, 8)
+        } else {
+            (1_500, 800, 1)
+        };
+        while model.len() < n {
             let mut member = binary(&mut next);
             member.extend_from_slice(&(next(1 << 16) as u32).to_be_bytes()[2..]);
             let key = (OrderedFloat(f64::from(next(3) as u32 + 1)), member);
             assert_eq!(add(&mut tree, key.0.0, &key.1), model.insert(key));
         }
+        assert!(tree.height() >= 3, "height {}", tree.height());
         // Each run's first to the score before, its last to the score after:
         // its member against the next run's decides.
         for score in [1.0, 2.0, 3.0] {
@@ -3705,7 +3793,7 @@ mod tests {
         }
         let scores = [0.5, 1.0, 2.0, 3.0, 3.5, f64::NEG_INFINITY, f64::INFINITY];
         let mut made = [0, 0];
-        for _ in 0..800 {
+        for i in 0..rescores {
             let key = key_at(&model, next(model.len()));
             let new = scores[next(scores.len())];
             match rescore_both(&mut tree, &mut model, &key, new) {
@@ -3713,9 +3801,13 @@ mod tests {
                 Some(Rescore::Moved) => made[1] += 1,
                 None => panic!("{key:?} is held"),
             }
-            agrees_at(&tree, &model, &(new, key.1.clone()), &(key.0.0, key.1));
+            if i % every == 0 {
+                agrees_at(&tree, &model, &(new, key.1.clone()), &(key.0.0, key.1));
+            } else {
+                tree.check();
+            }
         }
-        assert!(made.iter().all(|&made| made > 50), "{made:?}");
+        assert!(made.iter().all(|&made| made > rescores / 16), "{made:?}");
     }
 
     /// One member, rescored again and again, near its place and far from it.
@@ -3760,7 +3852,13 @@ mod tests {
         let mut model = Model::new();
         let tied = [f64::NEG_INFINITY, -2.5, 0.0, -0.0, 1.0, f64::INFINITY];
         let mut made = [0, 0, 0];
-        for _ in 0..5_000 {
+        // Each step is checked over the whole tree, each rescore against the
+        // whole model: under Miri, fewer steps, the tree checked as its nodes
+        // come and go and every `every`th rescore against the model.
+        let (steps, every) = if cfg!(miri) { (3_600, 64) } else { (5_000, 1) };
+        let mut rescores = 0;
+        for _ in 0..steps {
+            let census = (tree.census.leaves, tree.census.inners);
             match next(5) {
                 0 | 1 => {
                     let key = (OrderedFloat(next(400) as f64 - 200.0), binary(&mut next));
@@ -3788,12 +3886,18 @@ mod tests {
                         Some(Rescore::Moved) => made[1] += 1,
                         None => made[2] += 1,
                     }
-                    agrees_at(&tree, &model, &(new, key.1.clone()), &(key.0.0, key.1));
+                    if rescores % every == 0 {
+                        agrees_at(&tree, &model, &(new, key.1.clone()), &(key.0.0, key.1));
+                    }
+                    rescores += 1;
                 }
             }
-            tree.check();
+            if !cfg!(miri) || (tree.census.leaves, tree.census.inners) != census {
+                tree.check();
+            }
         }
-        assert!(made.iter().all(|&made| made > 50), "{made:?}");
+        assert!(tree.height() >= 3, "height {}", tree.height());
+        assert!(made.iter().all(|&made| made > steps / 100), "{made:?}");
     }
 
     /// Rescores, in place and moved, allocate and free exactly the nodes counted.
