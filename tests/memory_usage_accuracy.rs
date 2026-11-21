@@ -238,6 +238,8 @@ fn samples_are_read_as_redis_reads_them() {
     // sample than the set is all of it.
     let members: Vec<Vec<u8>> = (0..1000).map(|i| b(format!("m{i:05}"))).collect();
     c.pipeline(&[sadd(b"s", members.into_iter())]);
+    // The set's table settled first: the samples are compared on one layout.
+    c.settled_usage(b"s");
     let usage = |c: &mut Conn, samples: Option<&[u8]>| -> i64 {
         let mut cmd: Vec<&[u8]> = vec![b"MEMORY", b"USAGE", b"s"];
         if let Some(n) = samples {
@@ -274,6 +276,10 @@ fn samples_are_read_as_redis_reads_them() {
 /// keys come and go. Without the cap, a 65-member set read 13,088 bytes
 /// instead of 3,875 after a million other keys were deleted.
 const SHARE_MOVES: i64 = 64;
+
+/// The most a key's estimate counts of its shard's table: a key alone in
+/// the smallest table (see [`SHARE_MOVES`]).
+const SHARE_MAX: i64 = 52;
 
 /// Sets and hashes keep their `MEMORY USAGE` while many other keys are
 /// added and deleted, before and after the shards' tables are shrunk, and
@@ -383,14 +389,22 @@ fn memory_usage_of_a_key_stays_put_when_other_keys_come_and_go() {
     stays_put("the tables shrunk", &usage(&mut c));
 
     // Deleting the keys themselves gives back what they report, less their
-    // shares of the tables (which stay): within 2%.
+    // shares of the tables, which stay (a table is not shrunk below its
+    // smallest size): within 2%, and at most `SHARE_MAX` a key less. The
+    // shares are what the shard count makes them, 8 shards a CPU: with 8
+    // CPUs the 128 keys are about two to a shard's smallest table, and the
+    // tables kept 3,608 bytes of the 122,456 they reported; with 4 CPUs
+    // under 2%.
     let reported: i64 = usage(&mut c).iter().sum();
+    // The pipeline's read buffer given back now, not while the keys go.
+    c.small_reads();
     let held = c.settled_used_memory();
     let dels: Vec<Cmd> = names.iter().map(|k| vec![b("DEL"), k.clone()]).collect();
     c.pipeline(&dels);
     let freed = (held - c.settled_used_memory()) as i64;
+    let shares = names.len() as i64 * SHARE_MAX;
     assert!(
-        (freed - reported).abs() <= reported / 50,
-        "deleting the keys gave back {freed}, they reported {reported}"
+        freed <= reported + reported / 50 && freed >= reported - shares - reported / 50,
+        "deleting the keys gave back {freed}, they reported {reported} (shares up to {shares})"
     );
 }
