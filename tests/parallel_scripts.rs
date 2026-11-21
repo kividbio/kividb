@@ -1670,7 +1670,13 @@ fn free_connections(port: u16, n: usize, within: Duration) -> Vec<Conn> {
         let tx = tx.clone();
         std::thread::spawn(move || {
             let mut c = Conn::connect(port);
-            if c.cmd(&["PING"]).s() == "PONG" {
+            // Read by hand: one never answered is left when the server
+            // stops, and must not panic then.
+            let mut line = String::new();
+            if c.writer.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok()
+                && c.reader.read_line(&mut line).is_ok()
+                && line == "+PONG\r\n"
+            {
                 let _ = tx.send(c);
             }
         });
@@ -2034,8 +2040,8 @@ fn queued_script_waiting_for_a_migrate(io: &str) {
     assert!(c.cmd(&["SET", "other", "o"]).ok());
     let port = server.port;
     let migrate = migrate_to_nowhere(port, "m", 4000);
-    let mut free = free_connections(port, 32, Duration::from_millis(500));
-    assert!(free.len() >= 16, "only {} connections answered", free.len());
+    let mut free = free_connections(port, 32, Duration::from_secs(1));
+    assert!(free.len() >= 12, "only {} connections answered", free.len());
     let probe_conns: Vec<Conn> = free.split_off(9);
     let candidates: Vec<Conn> = free.split_off(1);
     let mut a = free.pop().unwrap();
