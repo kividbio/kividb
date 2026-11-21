@@ -9,6 +9,7 @@ pub mod simd;
 pub mod slots;
 pub mod stem;
 pub mod text;
+pub mod vset_graph;
 use crate::cpus::BuilderExt as _;
 use crate::store::ValueRef;
 use ahash::AHashMap;
@@ -1850,11 +1851,21 @@ pub struct HnswIndex {
     /// Keys written to this graph while it is a compaction's copy in the
     /// making: the copy leaves them as those writes left them.
     touched: parking_lot::Mutex<Option<ahash::AHashSet<String>>>,
+
+    /// How the slots lay out the vectors: f32 for FT.SEARCH, a vector set's
+    /// own quantization for its graph (`quant::Encoding`).
+    pub(crate) encoding: quant::Encoding,
+
+    /// A vector set's graph: the keys whose vectors have been linked since
+    /// the set last looked (see `vset_graph`); None for every other graph.
+    pub(crate) linked: Option<parking_lot::Mutex<Vec<Arc<str>>>>,
 }
 
 impl HnswIndex {
     pub fn new(m: usize, ef_construction: usize) -> Self {
         Self {
+            encoding: quant::Encoding::F32,
+            linked: None,
             backlog: backlog::Backlog::default(),
             shadow: parking_lot::Mutex::new(None),
             touched: parking_lot::Mutex::new(None),
@@ -3271,7 +3282,7 @@ fn select_neighbors_heuristic(
         // to the candidate than q is, the candidate is "dominated" — the
         // result neighbor already covers that direction better.
         for &(_, sel_id) in &result {
-            let d_cand_to_sel = distance_prenorm(metric, cand_vec, slots.vector(sel_id as usize));
+            let d_cand_to_sel = slots.dist(metric, cand_vec, slots.vector(sel_id as usize));
             if d_cand_to_sel < d_to_q {
                 discarded.push((d_to_q, cand_id));
                 continue 'cand;
@@ -3312,7 +3323,7 @@ fn nearest_of(
             if !slots.is_live(id as usize) {
                 continue;
             }
-            scored.push((distance_prenorm(metric, of, slots.vector(id as usize)), id));
+            scored.push((slots.dist(metric, of, slots.vector(id as usize)), id));
         }
         scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         scored.truncate(m_max);
@@ -3381,9 +3392,9 @@ fn insert_unit(
 
     // The first vector sets the graph's dimension; one of another (which
     // the schema rules out) has nowhere to go.
-    let slots = index
-        .slots
-        .get_or_init(|| slots::Slots::new(vector.len(), index.m0 + slack(index.m0)));
+    let slots = index.slots.get_or_init(|| {
+        slots::Slots::with_encoding(vector.len(), index.m0 + slack(index.m0), index.encoding)
+    });
     if vector.len() != slots.dim() {
         return;
     }
@@ -3420,23 +3431,20 @@ fn insert_unit(
             match k2id.values().next().copied() {
                 Some(id) => ep = id,
                 None => {
-                    // No live nodes at all — we become the entry point
+                    // No live nodes at all: we become the entry point, unless
+                    // a racing insert already has (see `enter_empty`).
                     drop(k2id);
-                    let mut links: Vec<Vec<u32>> = (0..=level).map(|_| Vec::new()).collect();
-                    let new_id = publish(
+                    return enter_empty(
                         index,
                         slots,
-                        &mut nodes,
-                        key.clone(),
-                        &vector,
-                        level,
+                        nodes,
+                        ep_snapshot,
+                        key,
+                        vector,
+                        metric,
                         doc,
-                        &mut links,
+                        level,
                     );
-                    index.key_to_id.write().insert(key, new_id);
-                    index.live_count.fetch_add(1, Relaxed);
-                    *index.entry_point.write() = Some(new_id);
-                    return;
                 }
             }
         }
@@ -3510,14 +3518,9 @@ fn insert_unit(
                 let mut scored: Vec<(f32, u32)> = seen
                     .iter()
                     .filter(|&&id| slots.is_live(id as usize))
-                    .map(|&id| {
-                        (
-                            distance_prenorm(metric, nb_vec, slots.vector(id as usize)),
-                            id,
-                        )
-                    })
+                    .map(|&id| (slots.dist(metric, nb_vec, slots.vector(id as usize)), id))
                     .collect();
-                scored.push((distance_prenorm(metric, nb_vec, &vector), NEW_NODE));
+                scored.push((slots.dist(metric, nb_vec, &vector), NEW_NODE));
                 scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
                 // Bounded Algorithm-4 heuristic: check each candidate
@@ -3531,7 +3534,7 @@ fn insert_unit(
                         if d_j.is_infinite() {
                             continue;
                         }
-                        if distance_prenorm(metric, vec_i, vector_of(id_j)) < d_i {
+                        if slots.dist(metric, vec_i, vector_of(id_j)) < d_i {
                             scored[i].0 = f32::INFINITY;
                             break;
                         }
@@ -3552,8 +3555,8 @@ fn insert_unit(
 
         per_layer
     } else {
-        // First node ever — empty neighbor lists
-        (0..=level).map(|_| vec![]).collect()
+        // First node ever, unless a racing insert is (see `enter_empty`).
+        return enter_empty(index, slots, nodes, None, key, vector, metric, doc, level);
     };
 
     // Append the node. Nothing finds it until a neighbour links back to it
@@ -3640,6 +3643,52 @@ fn insert_unit(
             }
         }
     }
+}
+
+/// The insert of a node into a graph with no live node, as `seen` (its entry
+/// point as the insert found it) said. One such insert at a time: the node
+/// becomes the entry point, with no links, if the entry point is still
+/// `seen`; if a racing insert got there first, this insert starts again and
+/// links to it. The turn is what lets a second insert see the first as the
+/// entry point: every node but the first then has links, and is found by
+/// the inserts and searches that come after.
+///
+/// The graph's read lock is let go before the turn is waited for: the
+/// insert holding the turn may need the write lock (a slot used again).
+#[allow(clippy::too_many_arguments)]
+fn enter_empty(
+    index: &Arc<HnswIndex>,
+    slots: &slots::Slots,
+    nodes: NodesGuard<'_>,
+    seen: Option<usize>,
+    key: String,
+    vector: Vec<f32>,
+    metric: &DistanceMetric,
+    doc: u32,
+    level: usize,
+) {
+    static ENTERING: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+    drop(nodes);
+    let turn = ENTERING.lock();
+    if *index.entry_point.read() != seen {
+        drop(turn);
+        return insert_unit(index, key, vector, metric, doc);
+    }
+    let mut nodes = index.nodes.read();
+    let mut links: Vec<Vec<u32>> = (0..=level).map(|_| Vec::new()).collect();
+    let new_id = publish(
+        index,
+        slots,
+        &mut nodes,
+        key.clone(),
+        &vector,
+        level,
+        doc,
+        &mut links,
+    );
+    index.key_to_id.write().insert(key, new_id);
+    index.live_count.fetch_add(1, Relaxed);
+    *index.entry_point.write() = Some(new_id);
 }
 
 /// How many links past its most a node's list may take before it is pruned
@@ -3803,7 +3852,7 @@ fn search_layer(
     if !slots.has(ep_id) || !slots.is_live(ep_id) {
         return vec![];
     }
-    let ep_dist = distance_prenorm(metric, query, slots.vector(ep_id));
+    let ep_dist = slots.dist(metric, query, slots.vector(ep_id));
     let (first, next) = (PREFETCH_FIRST, PREFETCH_NEXT);
 
     SEARCH_BUFFERS.with(|cell| {
@@ -3848,7 +3897,7 @@ fn search_layer(
                 if !slots.is_live(nb_id as usize) {
                     continue;
                 }
-                let nb_dist = distance_prenorm(metric, query, slots.vector(nb_id as usize));
+                let nb_dist = slots.dist(metric, query, slots.vector(nb_id as usize));
 
                 let worst = bufs.dynamic.peek().map(|(d, _)| d.0).unwrap_or(f32::MAX);
                 if nb_dist < worst || bufs.dynamic.len() < ef {
@@ -3887,7 +3936,7 @@ fn into_results(
         for r in found.iter_mut() {
             let id = r.1 as usize;
             r.0 = if slots.is_live(id) {
-                distance_prenorm(metric, query, slots.vector(id))
+                slots.dist(metric, query, slots.vector(id))
             } else {
                 f32::INFINITY
             };
@@ -3921,14 +3970,16 @@ pub fn knn_hnsw(
 ) -> Vec<KnnResult> {
     let ef = ef.max(k).max(50);
 
-    // Normalize the query for cosine so distances match the pre-normalized stored vectors.
+    // Normalize the query for cosine so distances match the pre-normalized
+    // stored vectors (a quantized graph's query comes laid out as its own).
     let query_buf: Vec<f32>;
-    let query: &[f32] = if matches!(metric, DistanceMetric::Cosine) {
-        query_buf = normalize_to_unit(query.to_vec());
-        &query_buf
-    } else {
-        query
-    };
+    let query: &[f32] =
+        if matches!(metric, DistanceMetric::Cosine) && index.encoding == quant::Encoding::F32 {
+            query_buf = normalize_to_unit(query.to_vec());
+            &query_buf
+        } else {
+            query
+        };
 
     // Vectors written and not linked yet are measured too, each in place of
     // what the graph holds for its key; the graph is asked for as many more
@@ -3946,7 +3997,7 @@ pub fn knn_hnsw(
         return knn_graph(index, query, k, k, ef, metric);
     }
     let found = knn_graph(index, query, k, k.saturating_add(waiting.len()), ef, metric);
-    backlog::merge(&waiting, query, metric, found, k, None)
+    backlog::merge(&waiting, query, metric, index.encoding, found, k, None)
 }
 
 /// [`knn_hnsw`] over the graph alone, `query` as the graph holds vectors:
@@ -3990,7 +4041,7 @@ fn knn_graph(
         let mut scored: Vec<(f32, u32)> = nodes
             .iter()
             .filter(|(i, _)| slots.is_live(*i))
-            .map(|(i, _)| (distance_prenorm(metric, query, slots.vector(i)), i as u32))
+            .map(|(i, _)| (slots.dist(metric, query, slots.vector(i)), i as u32))
             .collect();
         scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         return into_results(index, slots, &nodes, query, metric, scored, keep, reused);
@@ -4075,7 +4126,15 @@ pub fn knn_hnsw_admitting(
         deadline,
     )?;
     Some((
-        backlog::merge(&waiting, query, metric, found, k, Some(admit)),
+        backlog::merge(
+            &waiting,
+            query,
+            metric,
+            index.encoding,
+            found,
+            k,
+            Some(admit),
+        ),
         cut,
     ))
 }
@@ -4132,7 +4191,7 @@ fn admitting_graph(
     if !index.is_live(curr as usize) {
         return Some((Vec::new(), false));
     }
-    let d = OrderedFloat(distance_prenorm(metric, query, slots.vector(curr as usize)));
+    let d = OrderedFloat(slots.dist(metric, query, slots.vector(curr as usize)));
     spent += 1;
     visited.insert(curr);
     candidates.push(Reverse((d, curr)));
@@ -4188,7 +4247,7 @@ fn admitting_graph(
             if spent > budget {
                 return None;
             }
-            let dist = distance_prenorm(metric, query, slots.vector(nb as usize));
+            let dist = slots.dist(metric, query, slots.vector(nb as usize));
             if results.len() < ef || dist < bound {
                 candidates.push(Reverse((OrderedFloat(dist), nb)));
                 if let Some(n) = nodes.get(nb as usize)
@@ -4880,6 +4939,39 @@ mod concurrent_insert_tests {
         }
         let total = THREADS * PER_THREAD;
         assert!(found * 100 >= total * 98, "found {found} of {total}");
+    }
+
+    /// Inserts racing into an empty graph: one becomes the entry point and
+    /// the others link to it, so that no node is left with no links.
+    #[test]
+    fn inserts_racing_into_an_empty_graph_all_link() {
+        const THREADS: usize = 4;
+        let metric = DistanceMetric::Cosine;
+        for round in 0..300u64 {
+            let index = Arc::new(HnswIndex::new(8, 50));
+            let vectors = random_vectors(THREADS * 2, 8, round);
+            let start = std::sync::Barrier::new(THREADS);
+            std::thread::scope(|s| {
+                for t in 0..THREADS {
+                    let (index, metric, start, vectors) = (&index, &metric, &start, &vectors);
+                    s.spawn(move || {
+                        start.wait();
+                        for i in 0..2 {
+                            let v = vectors[t * 2 + i].clone();
+                            hnsw_insert(index, format!("k:{t}:{i}"), v, metric);
+                        }
+                    });
+                }
+            });
+            assert_eq!(index.live_count.load(Relaxed), THREADS * 2);
+            let nodes = index.nodes.read();
+            let mut list = Vec::new();
+            for (id, _) in nodes.iter() {
+                list.clear();
+                index.links(&nodes, id, 0, &mut list);
+                assert!(!list.is_empty(), "round {round}: node {id} has no links");
+            }
+        }
     }
 }
 

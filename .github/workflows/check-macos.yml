@@ -1,0 +1,32 @@
+name: Check macOS
+
+# The builds released for macOS (release.yml's `darwin` job, which builds
+# every variant and so checks them) compile without what is Linux-only
+# (`tokio-uring`, `io-uring`, `server_uring`). Nothing in CI builds for
+# another OS, and a check for macOS from Linux needs a C cross toolchain and
+# SDK (mlua's vendored Lua, zstd and aws-lc are C). So a weekly check here,
+# that the release is not the first place a break on macOS shows. A macOS
+# minute is billed as ten: weekly, and by hand from the Actions tab.
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check-macos
+
+      - name: Check (lua,tls)
+        run: cargo check --features lua,tls
