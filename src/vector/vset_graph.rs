@@ -612,8 +612,10 @@ static BUILDER: std::sync::Once = std::sync::Once::new();
 
 /// Every set with a graph, for the builder to take in, when it is idle, what
 /// the helpers linked after the set's last write ([`take_in_linked`]).
-static REGISTRY: parking_lot::Mutex<Vec<(Weak<RwLock<VectorSetInner>>, Weak<VsetGraph>)>> =
-    parking_lot::const_mutex(Vec::new());
+static REGISTRY: parking_lot::Mutex<Vec<Registered>> = parking_lot::const_mutex(Vec::new());
+
+/// A set with a graph, and the graph, in [`REGISTRY`].
+type Registered = (Weak<RwLock<VectorSetInner>>, Weak<VsetGraph>);
 
 /// Builds that panic, in unit tests (`a_build_that_panics_is_tried_again`):
 /// those of sets of this many dimensions, this many times.
