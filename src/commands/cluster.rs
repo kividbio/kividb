@@ -1906,6 +1906,13 @@ fn cmd_syncslots(ctx: &mut Ctx) -> Vec<u8> {
             ctx.cluster.slot_migrations.cancel(Some(&task_id));
             resp_simple("OK")
         }
+        // CLUSTER SYNCSLOTS EPOCH <task-id>: destination → source, before it
+        // takes an epoch for the takeover: the source's config epoch, which
+        // it keeps while it hands the slots over.
+        "EPOCH" => match ctx.cluster.epoch_while_handing_over() {
+            Some(epoch) => resp_simple(&epoch.to_string()),
+            None => resp_error("ERR no handover is under way on this node"),
+        },
         "TAKEOVER" => {
             // It waits (see `migration::take_over`): on an io_uring worker,
             // run on a thread of its own, while the worker serves its other

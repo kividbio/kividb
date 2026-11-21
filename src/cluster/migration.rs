@@ -3770,6 +3770,16 @@ fn take_over_now(
     // `UPDATE` may give it them (see `ClusterState::master_claims_arrived`);
     // should this attempt be refused, a later takeover of them is at a newer
     // epoch, which the marker does not stand for.
+    //
+    // Above the source's config epoch, as the source has it while it hands
+    // the slots over (it takes no new one then, nor for a few heartbeats
+    // after: `ClusterState::epoch_may_change`): asked, as this node may not
+    // have heard yet of a new epoch the source took just before the
+    // migration began. A source of an earlier release does not answer:
+    // what this node knows of it, then.
+    if let Some(source_epoch) = source_epoch_now(cluster, &task) {
+        cluster.observe_epoch(source_epoch);
+    }
     let epoch = cluster.bump_epoch();
     // Saved before the marker goes out (synced as every save of the cluster
     // config is): restarted, this node takes a newer epoch for the next
@@ -3937,6 +3947,24 @@ fn take_over_now(
         started.elapsed().as_millis()
     );
     Ok(())
+}
+
+/// The source's config epoch while it hands `task`'s slots over, as it
+/// answers `CLUSTER SYNCSLOTS EPOCH`; `None` if it does not (an earlier
+/// release, or no answer).
+fn source_epoch_now(cluster: &ClusterState, task: &Task) -> Option<u64> {
+    let hooks = cluster.hooks.get()?;
+    let mut peer =
+        Peer::connect_to(cluster, &hooks.replica_starter.repl_state, &task.source).ok()?;
+    peer.ask(&command(&[
+        b"CLUSTER",
+        b"SYNCSLOTS",
+        b"EPOCH",
+        task.id.as_bytes(),
+    ]))
+    .ok()?
+    .parse()
+    .ok()
 }
 
 /// Whether the source of `task` is still the master of its slots, in this

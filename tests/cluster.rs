@@ -9818,12 +9818,13 @@ fn a_takeover_by_hand_takes_only_the_slots_the_replica_holds() {
 
 /// A takeover whose reserved epoch another master reaches while it waits:
 /// held after its replica acknowledged what arrived (failpoint
-/// `takeover-acknowledged`), the source takes a newer config epoch
-/// (`CLUSTER BUMPEPOCH`: the same one, as no node hears of an epoch taken
-/// for a takeover before a claim at it), and the destination hears of it.
-/// The takeover is refused, the source keeps the slots, and the next attempt
-/// takes them at a newer epoch than the source's, with every key, on every node and on the
-/// destination's replica.
+/// `takeover-acknowledged`). The source takes no new config epoch while it
+/// hands the slots over (its `CLUSTER BUMPEPOCH` is refused); another master
+/// takes the very epoch reserved (`CLUSTER BUMPEPOCH`: no node hears of an
+/// epoch taken for a takeover before a claim at it), and the destination
+/// hears of it. The takeover is refused, the source keeps the slots, and the
+/// next attempt takes them at a newer epoch, with every key, on every node and
+/// on the destination's replica.
 #[test]
 fn a_takeover_is_refused_when_another_master_reaches_its_epoch_meanwhile() {
     let dst = Node::start_with_env(&[], &[("KIVIDB_TEST_FAILPOINTS", "takeover-acknowledged")]);
@@ -9834,7 +9835,7 @@ fn a_takeover_is_refused_when_another_master_reaches_its_epoch_meanwhile() {
         wait_cluster_ok(&all, all.len());
     }
     set_pause_timeout(&[&nodes[0], &nodes[1]], "30000");
-    let (src_id, dst_id) = (nodes[0].id(), nodes[1].id());
+    let (src_id, dst_id, other_id) = (nodes[0].id(), nodes[1].id(), nodes[2].id());
     let before = Written::on(&nodes[0], 0..=100, "before", 200);
     let task_id = nodes[1]
         .conn()
@@ -9845,29 +9846,34 @@ fn a_takeover_is_refused_when_another_master_reaches_its_epoch_meanwhile() {
     wait_until("the takeover to be held", Duration::from_secs(30), || {
         held.exists()
     });
+    let r = nodes[0].conn().cmd(&["CLUSTER", "BUMPEPOCH"]);
+    assert!(
+        r.err().is_some_and(|e| e.contains("handing its slots over")),
+        "{r:?}"
+    );
     // The epoch the destination took for the takeover is its current one,
-    // one above every config epoch it knew. No other node hears of it
-    // before a claim at it: the source's bump, from what it knows, takes
-    // that same epoch.
+    // one above every config epoch it knew. No other node hears of it before
+    // a claim at it: another master's bump, from what it knows, takes that
+    // same epoch.
     let reserved: u64 = nodes[1]
         .cluster_info("cluster_current_epoch")
         .parse()
         .unwrap();
-    let bumped = nodes[0].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
-    let src_epoch: u64 = bumped
+    let bumped = nodes[2].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+    let other_epoch: u64 = bumped
         .strip_prefix("BUMPED ")
         .unwrap_or_else(|| panic!("{bumped}"))
         .parse()
         .unwrap();
-    assert!(src_epoch >= reserved, "{src_epoch} {reserved}");
+    assert!(other_epoch >= reserved, "{other_epoch} {reserved}");
     wait_until(
-        "the destination to hear the source's new epoch",
+        "the destination to hear the other master's new epoch",
         Duration::from_secs(10),
-        || row_of(&nodes[1], &src_id).is_some_and(|row| row[6] == src_epoch.to_string()),
+        || row_of(&nodes[1], &other_id).is_some_and(|row| row[6] == other_epoch.to_string()),
     );
     std::fs::remove_file(&held).unwrap();
     wait_until(
-        "the takeover to be refused for the source's epoch",
+        "the takeover to be refused for the other master's epoch",
         Duration::from_secs(20),
         || nodes[1].log().contains("at or above the epoch"),
     );
@@ -9890,7 +9896,7 @@ fn a_takeover_is_refused_when_another_master_reaches_its_epoch_meanwhile() {
         },
     );
     let dst_epoch: u64 = nodes[1].cluster_info("cluster_my_epoch").parse().unwrap();
-    assert!(dst_epoch > src_epoch, "{dst_epoch} {src_epoch}");
+    assert!(dst_epoch > other_epoch, "{dst_epoch} {other_epoch}");
     let absent = before.missing_on(&nodes[1]);
     assert!(absent.is_empty(), "{} keys not on the owner", absent.len());
 }

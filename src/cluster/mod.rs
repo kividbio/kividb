@@ -4695,6 +4695,19 @@ impl ClusterState {
         Ok(())
     }
 
+    /// This node's config epoch, while it hands slots over in an atomic
+    /// slot migration (`CLUSTER SYNCSLOTS EPOCH`, which the destination asks
+    /// before it takes an epoch for the takeover): it takes no new one until
+    /// [`HANDOVER_FAILOVER_GRACE`] after the handover ([`Self::epoch_may_change`]).
+    /// `None` when no handover is under way.
+    pub(crate) fn epoch_while_handing_over(&self) -> Option<u64> {
+        if self.handovers.load(Ordering::SeqCst) == 0 {
+            return None;
+        }
+        let me = self.myself();
+        self.nodes.read().get(&me).map(|n| n.config_epoch)
+    }
+
     pub(crate) fn failover_may_begin(&self) -> Result<(), String> {
         let _holds = self.handoff_holds.lock();
         if self.handovers.load(Ordering::SeqCst) > 0 {
