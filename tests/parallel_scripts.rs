@@ -2521,3 +2521,108 @@ fn left_by_one_that_goes(io: &str) {
     let V::Str(info) = info else { panic!("INFO") };
     assert!(info.contains("scripts_handed_to_runner:"), "{info}");
 }
+
+/// The same, with nobody else sending. A script runs about 3 ms on one
+/// connection; 100 others each queue one script meanwhile and, their look
+/// over, wait to be woken; a last one queues its script behind theirs as the
+/// long one ends, and looks: it takes the turn and runs what is ahead of its
+/// own, one script a run (every run ends after one here), and goes, killed
+/// or by itself, before its own comes. The 100 are each answered within 2 s:
+/// what it left is not left queued with the turn free and the runner asleep.
+/// 20 rounds, on both I/O loops.
+#[test]
+fn scripts_left_by_a_looking_connection_that_goes_are_run_when_nobody_sends() {
+    left_by_one_that_goes_idle("tokio");
+}
+
+#[test]
+fn scripts_left_by_a_looking_connection_that_goes_are_run_when_nobody_sends_uring() {
+    left_by_one_that_goes_idle("uring");
+}
+
+fn left_by_one_that_goes_idle(io: &str) {
+    const WAITERS: usize = 100;
+    let server = Server::start(&["--io-model", io, LOOK, TINY_RUNS]);
+    let mut c = server.conn();
+    let counts = "local n = 0 for i = 1, tonumber(ARGV[1]) do n = n + 1 end \
+                  redis.call('SET', KEYS[1], n) return n";
+    let V::Str(slow) = c.cmd(&["SCRIPT", "LOAD", counts]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    let V::Str(three) = c.cmd(&["SCRIPT", "LOAD", THREE_KEYS]) else {
+        panic!("SCRIPT LOAD did not answer with a digest")
+    };
+    for _ in 0..4 {
+        assert_eq!(c.cmd(&["EVALSHA", &slow, "1", "s", "1"]), V::Int(1));
+        assert!(matches!(
+            c.cmd(&["EVALSHA", &three, "3", "i1", "i2", "i3"]),
+            V::Int(_)
+        ));
+    }
+    // How many counts take about 3 ms: a quick script stays quick up to 5.
+    let (_, took) = timed(|| c.cmd(&["EVALSHA", &slow, "1", "s", "100000"]));
+    let count =
+        ((100_000.0 * 0.003 / took.as_secs_f64().max(0.000_001)) as u64).clamp(1, 10_000_000);
+    let port = server.port;
+    let mut waiters: Vec<Conn> = (0..WAITERS).map(|_| Conn::connect(port)).collect();
+    for w in &waiters {
+        w.reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+    }
+    let mut a = Conn::connect(port);
+    let mut killer = Conn::connect(port);
+    let one = format!(
+        "*6\r\n$7\r\nEVALSHA\r\n${}\r\n{}\r\n$1\r\n3\r\n$2\r\ni1\r\n$2\r\ni2\r\n$2\r\ni3\r\n",
+        three.len(),
+        three
+    );
+    let long = format!(
+        "*5\r\n$7\r\nEVALSHA\r\n${}\r\n{}\r\n$1\r\n1\r\n$1\r\ns\r\n${}\r\n{}\r\n",
+        slow.len(),
+        slow,
+        count.to_string().len(),
+        count
+    );
+    for round in 0..20 {
+        let mut v = Conn::connect(port);
+        let V::Int(id) = v.cmd(&["CLIENT", "ID"]) else {
+            panic!("CLIENT ID")
+        };
+        let started = Instant::now();
+        a.writer.write_all(long.as_bytes()).unwrap();
+        std::thread::sleep(Duration::from_micros(200));
+        for w in &mut waiters {
+            w.writer.write_all(one.as_bytes()).unwrap();
+        }
+        // Its script behind theirs, as the long one ends.
+        let end = Duration::from_micros(2_700);
+        if let Some(rest) = end.checked_sub(started.elapsed()) {
+            std::thread::sleep(rest);
+        }
+        v.writer.write_all(one.as_bytes()).unwrap();
+        std::thread::sleep(Duration::from_micros(700));
+        if round % 2 == 0 {
+            assert_eq!(
+                killer.cmd(&["CLIENT", "KILL", "ID", &id.to_string()]),
+                V::Int(1)
+            );
+        } else {
+            let _ = v.writer.shutdown(std::net::Shutdown::Both);
+        }
+        drop(v);
+        assert!(matches!(a.read(), V::Int(_)));
+        for (i, w) in waiters.iter_mut().enumerate() {
+            let (reply, took) = timed(|| w.read());
+            assert!(
+                matches!(reply, V::Int(_)),
+                "round {round}, waiter {i}: {reply:?}"
+            );
+            assert!(
+                took < Duration::from_secs(2),
+                "round {round}, waiter {i}: {took:?}"
+            );
+        }
+    }
+}
