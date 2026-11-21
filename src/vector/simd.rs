@@ -181,6 +181,70 @@ pub fn l2_sq_at(level: Level, a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// A kernel of two vectors of the same length, as [`Kernels`] holds it.
+pub type Kernel = unsafe fn(&[f32], &[f32]) -> f32;
+
+/// [`dot`] and [`l2_sq`] of this machine's level, as plain function
+/// pointers: for a loop that measures thousands of vectors, one call each,
+/// where `dot` and `l2_sq` look the level up and call the kernel through a
+/// second call every time. Building a 64-d graph measured that dispatch at
+/// 2-4 % of its time.
+#[derive(Clone, Copy)]
+pub struct Kernels {
+    dot: Kernel,
+    l2_sq: Kernel,
+}
+
+impl Kernels {
+    /// The kernels of the level this machine runs ([`level`]).
+    pub fn here() -> Self {
+        Self::at(level())
+    }
+
+    /// The kernels of `level`. Panics if this machine cannot run it.
+    pub fn at(level: Level) -> Self {
+        match level {
+            #[cfg(target_arch = "x86_64")]
+            Level::Avx512 if has(level) => Self {
+                dot: x86::dot_avx512,
+                l2_sq: x86::l2_avx512,
+            },
+            #[cfg(target_arch = "x86_64")]
+            Level::Avx2 if has(level) => Self {
+                dot: x86::dot_avx2,
+                l2_sq: x86::l2_avx2,
+            },
+            #[cfg(target_arch = "aarch64")]
+            Level::Neon => Self {
+                dot: neon::dot,
+                l2_sq: neon::l2,
+            },
+            Level::Portable => Self {
+                dot: portable::dot,
+                l2_sq: portable::l2,
+            },
+            other => unsupported(other),
+        }
+    }
+
+    /// Σ a·b, as [`dot`].
+    #[inline(always)]
+    pub fn dot(&self, a: &[f32], b: &[f32]) -> f32 {
+        let (a, b) = same_len(a, b);
+        // SAFETY: the kernel is of a level this CPU has (checked in `at`),
+        // and the slices are of the same length.
+        unsafe { (self.dot)(a, b) }
+    }
+
+    /// Σ (a − b)², as [`l2_sq`].
+    #[inline(always)]
+    pub fn l2_sq(&self, a: &[f32], b: &[f32]) -> f32 {
+        let (a, b) = same_len(a, b);
+        // SAFETY: as in `dot`.
+        unsafe { (self.l2_sq)(a, b) }
+    }
+}
+
 /// [`dot_norms`] at a given level. Panics if this machine cannot run `level`.
 pub fn dot_norms_at(level: Level, a: &[f32], b: &[f32]) -> (f32, f32, f32) {
     let (a, b) = same_len(a, b);

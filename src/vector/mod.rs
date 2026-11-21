@@ -3261,6 +3261,7 @@ fn select_neighbors_heuristic(
     let mut result: Vec<(f32, u32)> = Vec::with_capacity(m_max);
     let mut discarded: Vec<(f32, u32)> = Vec::new();
     let next_lines = PREFETCH_NEXT;
+    let measure = slots.measure(metric);
 
     'cand: for (i, &(d_to_q, cand_id)) in candidates.iter().enumerate() {
         if result.len() >= m_max {
@@ -3282,7 +3283,7 @@ fn select_neighbors_heuristic(
         // to the candidate than q is, the candidate is "dominated" — the
         // result neighbor already covers that direction better.
         for &(_, sel_id) in &result {
-            let d_cand_to_sel = slots.dist(metric, cand_vec, slots.vector(sel_id as usize));
+            let d_cand_to_sel = measure.dist(cand_vec, slots.vector(sel_id as usize));
             if d_cand_to_sel < d_to_q {
                 discarded.push((d_to_q, cand_id));
                 continue 'cand;
@@ -3495,6 +3496,9 @@ fn insert_unit(
         // pruned list in. Pruning reads up to M x 4 vectors from all over the
         // graph, for some 32 neighbours an insert.
         let mut seen: Vec<u32> = Vec::with_capacity(index.m0);
+        let measure = slots.measure(metric);
+        // One list for every neighbour's scores, not one allocation each.
+        let mut scored: Vec<(f32, u32)> = Vec::with_capacity(index.m0 + 8);
         for (lc, forward_neighbors) in per_layer.iter().enumerate() {
             let m_max = if lc == 0 { index.m0 } else { index.m };
             for &nb_id in forward_neighbors {
@@ -3515,12 +3519,13 @@ fn insert_unit(
                         slots.vector(id as usize)
                     }
                 };
-                let mut scored: Vec<(f32, u32)> = seen
-                    .iter()
-                    .filter(|&&id| slots.is_live(id as usize))
-                    .map(|&id| (slots.dist(metric, nb_vec, slots.vector(id as usize)), id))
-                    .collect();
-                scored.push((slots.dist(metric, nb_vec, &vector), NEW_NODE));
+                scored.clear();
+                scored.extend(
+                    seen.iter()
+                        .filter(|&&id| slots.is_live(id as usize))
+                        .map(|&id| (measure.dist(nb_vec, slots.vector(id as usize)), id)),
+                );
+                scored.push((measure.dist(nb_vec, &vector), NEW_NODE));
                 scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
                 // Bounded Algorithm-4 heuristic: check each candidate
@@ -3534,7 +3539,7 @@ fn insert_unit(
                         if d_j.is_infinite() {
                             continue;
                         }
-                        if slots.dist(metric, vec_i, vector_of(id_j)) < d_i {
+                        if measure.dist(vec_i, vector_of(id_j)) < d_i {
                             scored[i].0 = f32::INFINITY;
                             break;
                         }
@@ -3574,16 +3579,22 @@ fn insert_unit(
     index.key_to_id.write().insert(key, new_id);
     index.live_count.fetch_add(1, Relaxed);
 
-    // Entry point bump if the new node has higher level.
+    // Entry point bump if the new node has higher level. Looked at under the
+    // read lock first, and taken for writing (and looked at again) only to
+    // change it: nearly every insert leaves it as it is, and with seven
+    // helpers each insert's write lock had them queue on its cache line.
     {
-        let mut ep = index.entry_point.write();
-        match *ep {
-            None => *ep = Some(new_id),
+        let bump = |ep: Option<usize>| match ep {
+            None => true,
             Some(current_ep) => {
                 let current_level = nodes.get(current_ep).map_or(0, |n| n.level);
-                if level > current_level || !index.is_live(current_ep) {
-                    *ep = Some(new_id);
-                }
+                level > current_level || !index.is_live(current_ep)
+            }
+        };
+        if bump(*index.entry_point.read()) {
+            let mut ep = index.entry_point.write();
+            if bump(*ep) {
+                *ep = Some(new_id);
             }
         }
     }
@@ -3769,9 +3780,87 @@ thread_local! {
         std::cell::RefCell::new(Vec::with_capacity(64));
 }
 
-type MinHeap =
-    std::collections::BinaryHeap<std::cmp::Reverse<(ordered_float::OrderedFloat<f32>, u32)>>;
-type MaxHeap = std::collections::BinaryHeap<(ordered_float::OrderedFloat<f32>, u32)>;
+type MinHeap = std::collections::BinaryHeap<std::cmp::Reverse<(DistKey, u32)>>;
+type MaxHeap = std::collections::BinaryHeap<(DistKey, u32)>;
+
+/// A distance as a search's heaps order it: in the order and with the ties
+/// of `OrderedFloat` (-0 as 0, NaN after everything), compared as one
+/// integer where `OrderedFloat` takes branches for NaN. Measured on 200,000
+/// 64-d inserts with seven helpers: 3 % of the build.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct DistKey(u32);
+
+impl DistKey {
+    #[inline(always)]
+    fn of(d: f32) -> Self {
+        if d.is_nan() {
+            return DistKey(u32::MAX);
+        }
+        let b = (d + 0.0).to_bits();
+        DistKey(if b >> 31 == 1 { !b } else { b | 0x8000_0000 })
+    }
+
+    #[inline(always)]
+    fn get(self) -> f32 {
+        if self.0 & 0x8000_0000 != 0 {
+            f32::from_bits(self.0 & 0x7FFF_FFFF)
+        } else {
+            f32::from_bits(!self.0)
+        }
+    }
+}
+
+#[cfg(test)]
+mod dist_key_tests {
+    use super::DistKey;
+    use ordered_float::OrderedFloat;
+
+    /// Keys order and tie as `OrderedFloat` does, and give the distance
+    /// back (-0 as 0, NaN as a NaN).
+    #[test]
+    fn keys_order_as_ordered_floats() {
+        let mut xs = vec![
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x8000_0001),
+            f32::MAX,
+            f32::MIN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            2.0,
+            1.0 - 1.0,
+        ];
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..2000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            xs.push(f32::from_bits(x as u32));
+            xs.push((x % 20_001) as f32 / 10_000.0 - 0.5);
+        }
+        for &a in &xs {
+            let back = DistKey::of(a).get();
+            assert!(
+                back.is_nan() == a.is_nan() && (a.is_nan() || back == a),
+                "{a}"
+            );
+            for &b in xs.iter().take(200) {
+                assert_eq!(
+                    DistKey::of(a).cmp(&DistKey::of(b)),
+                    OrderedFloat(a).cmp(&OrderedFloat(b)),
+                    "{a} {b}"
+                );
+            }
+        }
+    }
+}
 
 /// Per-thread scratch buffers for HNSW search.
 /// Allocated once per thread, reused across every search call.
@@ -3846,13 +3935,13 @@ fn search_layer(
     layer: usize,
     metric: &DistanceMetric,
 ) -> Vec<(f32, u32)> {
-    use ordered_float::OrderedFloat;
     use std::cmp::Reverse;
     let ep_id = ep as usize;
     if !slots.has(ep_id) || !slots.is_live(ep_id) {
         return vec![];
     }
-    let ep_dist = slots.dist(metric, query, slots.vector(ep_id));
+    let measure = slots.measure(metric);
+    let ep_dist = measure.dist(query, slots.vector(ep_id));
     let (first, next) = (PREFETCH_FIRST, PREFETCH_NEXT);
 
     SEARCH_BUFFERS.with(|cell| {
@@ -3860,15 +3949,19 @@ fn search_layer(
         let bufs = &mut *guard;
         bufs.clear(nodes.count());
 
-        let of_ep = OrderedFloat(ep_dist);
+        let of_ep = DistKey::of(ep_dist);
         bufs.visited.insert(ep);
         bufs.candidates.push(Reverse((of_ep, ep)));
         bufs.dynamic.push((of_ep, ep));
 
         let mut expanded = 0usize;
         while let Some(Reverse((c_dist, c_id))) = bufs.candidates.pop() {
-            let worst = bufs.dynamic.peek().map(|(d, _)| d.0).unwrap_or(f32::MAX);
-            if bufs.dynamic.len() >= ef && c_dist.0 > worst {
+            let worst = bufs
+                .dynamic
+                .peek()
+                .map(|(d, _)| d.get())
+                .unwrap_or(f32::MAX);
+            if bufs.dynamic.len() >= ef && c_dist.get() > worst {
                 break;
             }
             expanded += 1;
@@ -3877,31 +3970,60 @@ fn search_layer(
             }
 
             // The neighbours not met yet, each asked for ahead of its turn.
+            // Layer 0's are read off the slot as they are looked at.
             bufs.neighbor_scratch.clear();
-            index.links(nodes, c_id as usize, layer, &mut bufs.neighbor_scratch);
-            let mut fresh = 0;
-            for i in 0..bufs.neighbor_scratch.len() {
-                let id = bufs.neighbor_scratch[i];
-                if bufs.visited.insert(id) {
-                    bufs.neighbor_scratch[fresh] = id;
-                    fresh += 1;
-                    slots.prefetch(id as usize, first);
+            let fresh = if layer == 0 {
+                if slots.has(c_id as usize) {
+                    let (visited, scratch) = (&mut bufs.visited, &mut bufs.neighbor_scratch);
+                    slots.each_link(c_id as usize, |id| {
+                        if visited.insert(id) {
+                            scratch.push(id);
+                            slots.prefetch(id as usize, first);
+                        }
+                    });
                 }
-            }
+                bufs.neighbor_scratch.len()
+            } else {
+                index.links(nodes, c_id as usize, layer, &mut bufs.neighbor_scratch);
+                let mut fresh = 0;
+                for i in 0..bufs.neighbor_scratch.len() {
+                    let id = bufs.neighbor_scratch[i];
+                    if bufs.visited.insert(id) {
+                        bufs.neighbor_scratch[fresh] = id;
+                        fresh += 1;
+                        slots.prefetch(id as usize, first);
+                    }
+                }
+                fresh
+            };
 
             for i in 0..fresh {
                 if i + 1 < fresh {
                     slots.prefetch(bufs.neighbor_scratch[i + 1] as usize, next);
                 }
                 let nb_id = bufs.neighbor_scratch[i];
-                if !slots.is_live(nb_id as usize) {
-                    continue;
-                }
-                let nb_dist = slots.dist(metric, query, slots.vector(nb_id as usize));
+                // Measured before its live flag is read, and the flag read
+                // only for a node the search would keep: the flag is a byte
+                // on a cache line of its own, apart from the vector asked
+                // for above, and most neighbours are farther than the worst
+                // kept. The graph is held for reading here, so no slot is
+                // filled again meanwhile, and a deleted node's slot still
+                // holds a vector: the nodes kept are those kept when the
+                // flag was read first. Reading every flag first was the
+                // costliest load of an insert with seven helpers linking
+                // 64-d vectors.
+                let nb_dist = measure.dist(query, slots.vector(nb_id as usize));
 
-                let worst = bufs.dynamic.peek().map(|(d, _)| d.0).unwrap_or(f32::MAX);
+                let worst = bufs
+                    .dynamic
+                    .peek()
+                    .map(|(d, _)| d.get())
+                    .unwrap_or(f32::MAX);
                 if nb_dist < worst || bufs.dynamic.len() < ef {
-                    let of = OrderedFloat(nb_dist);
+                    if !slots.is_live(nb_id as usize) {
+                        continue;
+                    }
+                    let of = DistKey::of(nb_dist);
                     bufs.candidates.push(Reverse((of, nb_id)));
                     bufs.dynamic.push((of, nb_id));
                     if bufs.dynamic.len() > ef {
@@ -3911,7 +4033,8 @@ fn search_layer(
             }
         }
 
-        let mut result: Vec<(f32, u32)> = bufs.dynamic.drain().map(|(d, id)| (d.0, id)).collect();
+        let mut result: Vec<(f32, u32)> =
+            bufs.dynamic.drain().map(|(d, id)| (d.get(), id)).collect();
         result.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         result
     })

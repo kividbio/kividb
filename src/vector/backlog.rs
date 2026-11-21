@@ -841,17 +841,40 @@ static HELPER_CLOCKS: parking_lot::Mutex<Vec<libc::clockid_t>> =
 /// job's time per helper, about 0.6 ms at 384-d, against a look's 50 ms)
 /// and the next look counts it.
 #[cfg(not(target_os = "linux"))]
-static HELPER_CPU_NS: AtomicU64 = AtomicU64::new(0);
+static HELPER_CPU_NS: Counter = Counter::new();
 /// CPU time writes spent linking their own vectors (a full backlog, a small
 /// graph, a walk over the keys).
-static LINK_CPU_NS: AtomicU64 = AtomicU64::new(0);
+static LINK_CPU_NS: Counter = Counter::new();
 /// Commands that wrote a vector: [`count_write`].
-static WRITES: AtomicU64 = AtomicU64::new(0);
+static WRITES: Counter = Counter::new();
+
+/// A counter on a cache line of its own. These are written for every vector
+/// a write or a helper links, and must not share a line with a static that
+/// a search reads: the distance kernels' level (`simd::LEVEL`) was on
+/// `LINK_CPU_NS`'s line, and while a writer linked its own vectors every
+/// distance a helper measured waited for that line.
+#[repr(align(64))]
+struct Counter(AtomicU64);
+
+impl Counter {
+    const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+}
+
+impl std::ops::Deref for Counter {
+    type Target = AtomicU64;
+
+    fn deref(&self) -> &AtomicU64 {
+        &self.0
+    }
+}
+
 /// What a command that writes a vector costs the thread that runs it,
 /// besides linking its own vectors: reading it, storing the document,
 /// indexing it, replying. A running estimate in nanoseconds, from one such
 /// command in [`SAMPLE_EVERY`] on each thread ([`count_write`]).
-static WRITE_CPU_NS: AtomicU64 = AtomicU64::new(0);
+static WRITE_CPU_NS: Counter = Counter::new();
 /// One in this many commands that write a vector, on each thread, is timed.
 const SAMPLE_EVERY: u32 = 64;
 
