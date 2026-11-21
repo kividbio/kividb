@@ -241,14 +241,13 @@ fn hash_with_ttls(fields: Vec<(Vec<u8>, Vec<u8>, Option<u64>)>) -> io::Result<Op
         crate::types::HashInner::from_fields(crate::types::HashFields::with_capacity(fields.len()));
     let mut names = std::collections::HashSet::with_capacity(fields.len());
     for (field, value, expires_at) in fields {
-        let field = String::from_utf8_lossy(&field).into_owned();
         if !names.insert(field.clone()) {
             return Err(rdb_invalid("duplicate hash fields"));
         }
         if let Some(at) = expires_at {
-            inner.expiries.insert(field.clone(), field_deadline(at));
+            inner.expiries.insert(&field, field_deadline(at));
         }
-        inner.fields.insert_loaded(field, &value)?;
+        inner.fields.insert_loaded(&field, &value)?;
     }
     if inner.fields.is_empty() {
         return Ok(None);
@@ -288,7 +287,7 @@ pub(super) fn apply_keydb_subexpiry(
         .and_then(|t| t.trim().parse::<i64>().ok())
         .map(|at| at.max(0) as u64)
         .ok_or_else(|| rdb_invalid(format!("bad KeyDB member expiry for {key}")))?;
-    let field = String::from_utf8_lossy(member).into_owned();
+    let field: &[u8] = member;
     let inner = match value {
         KiviDBValue::Hash(h) => {
             let fields = std::mem::take(&mut *h.write());
@@ -315,7 +314,7 @@ pub(super) fn apply_keydb_subexpiry(
         }
     };
     let mut inner = inner;
-    if inner.fields.contains_key(field.as_str()) {
+    if inner.fields.contains_key(field) {
         inner.expiries.insert(field, field_deadline(at));
     }
     let emptied = inner.fields.is_empty();

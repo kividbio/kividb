@@ -142,7 +142,7 @@ Redis, in the file or with `CONFIG SET`, and reported by `CONFIG GET` and `OBJEC
 (64) for sets; `hash-max-listpack-entries` (512) and `hash-max-listpack-value` (64) for hashes;
 `zset-max-listpack-entries` (128) and `zset-max-listpack-value` (64) for sorted sets (a sorted
 set of up to that many members, none longer than that many bytes, is one block; past either it
-is a hash table and an ordered tree). The `*-max-ziplist-*` names of the hash and sorted-set
+is a table of members and an ordered index of them). The `*-max-ziplist-*` names of the hash and sorted-set
 settings are the same settings. A limit goes no higher than what one block holds (128 members
 of 64 bytes for sets and sorted sets, 512 fields for hashes): a larger value is taken as that
 maximum, `CONFIG GET` reports what was kept, and a warning naming the maximum is logged. `0`
@@ -155,10 +155,12 @@ A set past those limits (`OBJECT ENCODING` `hashtable`) is a table of its own: a
 to seven bytes (any integer of up to seven digits) lives in the table's slot, and any other is
 one block of a pool of slabs kept for collections. A hash past its limits is the same kind of
 table, each field and its value side by side in one block of that pool (a value too long for
-the pool's largest block in a block of the system allocator). The table grows and shrinks a few members
+the pool's largest block in a block of the system allocator). A sorted set past its limits
+(`skiplist`) is the same kind of table, each member and its score in one block of that pool,
+with an index of the members' order beside it. The table grows and shrinks a few members
 at a time with each write, and a resize that the writes leave part-way is finished in the
 background, so no write pays for moving every member at once. Active defrag does not move a
-set's members or a hash's fields: their slabs are not among those it empties, and each slab goes back to the
+set's or a sorted set's members or a hash's fields: their slabs are not among those it empties, and each slab goes back to the
 system as soon as its last member or field is removed. `INFO memory` reports those slabs as
 `value_slab_pool_bytes`, apart from `value_slab_bytes` (the keyspace's slabs, which defrag
 compacts).
@@ -215,9 +217,36 @@ of the node: give it a limit, or `--threads`.
 threads link the vectors written to HNSW indexes into their graphs, so that one client
 loading documents does not build the graph on one CPU. `0` starts none: each write links
 its own vector, as up to 1.2. `auto`, the default, starts none under a CPU quota (Docker's
-`--cpus`, a Kubernetes CPU limit) or with fewer than 8 CPUs, and otherwise (CPUs - 2) / 2:
-three on 8, seven on 16. A number starts that many on any machine. The log says how many
-started, on the first write that needs them.
+`--cpus`, a Kubernetes CPU limit) or with fewer than 8 CPUs. Otherwise it starts one fewer
+than the CPUs (seven on 8, fifteen on 16) and changes how many of them link as the load
+changes:
+- while the server serves clients, (CPUs - 2) / 2 of them link (three on 8, seven on 16)
+  and the rest wait;
+- while it does nothing but take the writes that fill the backlogs (a bulk load,
+  `FT.CREATE` over existing keys, a replica's full sync, which follows the same rule),
+  all of them link.
+
+Nothing is added to the workers' loop to tell the two apart. Every 50 ms the helper that
+has just finished a job reads counters the server keeps anyway: the commands served, the
+process's CPU time, the helpers' own CPU time and that of links made in writes. The vector
+code also counts the commands that wrote vectors (once each, however many indexes and
+fields they write) and times one in 64 of them on its thread's CPU clock. The server
+counts as serving when, besides the commands that wrote vectors, it served 500 commands a
+second, or its threads used a CPU's worth of time besides the links and what those
+commands cost (the timed ones' average times their number), so that loading connections
+are not taken for clients. The count goes down at
+the first look that finds clients. It goes up again only after four quiet looks in a row
+(200 ms). A look more than 200 ms after the last one (the helpers had nothing to do
+meanwhile) starts from the serving count. Each extra helper's thread costs its stack and
+its search buffers: with seven, the peak RSS of a 200,000 × 64-d build was at most 5 MiB
+more than with three. On an Azure D8s_v5, all seven bring a one-client load of 50,000
+384-d documents to 1.03x Redis 8.10's time (1.24x with three) and of 200,000 64-d
+documents to 1.34x (1.67x); clients served meanwhile see the three, as before
+([PERFORMANCE.md](PERFORMANCE.md#vector-index-builds) has the latencies).
+
+A number starts exactly that many on any machine, and all of them always link. The log
+says how many started, on the first write that needs them; `FT.INFO` shows
+`hnsw_index_threads` (started) and `hnsw_index_threads_active` (linking now).
 
 So on a server of fewer than 8 CPUs builds run at 1.2's speed by default, and
 `search-index-threads 1` (or more) trades serving latency for build speed. The helpers take

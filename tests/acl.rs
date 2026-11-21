@@ -232,9 +232,9 @@ fn start_server_with_pass(port: u16, pass: &'static str) {
 /// different code path than `ACL SETUSER` on a live connection: the
 /// connection-open-time seeding of the restriction counters, not the
 /// AUTH-time seeding.
-fn start_server_with_aclfile(port: u16, acl_contents: &str) -> std::path::PathBuf {
+fn start_server_with_aclfile(port: u16, acl_contents: impl AsRef<[u8]>) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("kividb_test_default_acl_{port}.acl"));
-    std::fs::write(&path, acl_contents).expect("write test aclfile");
+    std::fs::write(&path, acl_contents.as_ref()).expect("write test aclfile");
     let path_str = path.to_string_lossy().to_string();
     thread::spawn(move || {
         let config = kividb::config::Config {
@@ -1686,7 +1686,7 @@ fn test_default_password_from_acl_file_is_enforced() {
     let port = free_port();
     start_server_with_aclfile(
         port,
-        &format!("user default on #{} ~* &* +@all\n", sha256("secret")),
+        format!("user default on #{} ~* &* +@all\n", sha256("secret")),
     );
 
     let mut c = Conn::connect(port);
@@ -1765,7 +1765,7 @@ fn test_a_user_keeps_every_key_pattern() {
     let port = free_port();
     start_server_with_aclfile(
         port,
-        &format!(
+        format!(
             "user default on nopass ~* &* +@all\nuser app on #{} ~app:* ~session:* &* +@all\n",
             sha256("apppw")
         ),
@@ -1807,7 +1807,7 @@ fn test_acl_load_replaces_the_users() {
     let port = free_port();
     let path = start_server_with_aclfile(
         port,
-        &format!(
+        format!(
             "user default on nopass ~* &* +@all\n\
              user app on #{pw1} ~app:* ~session:* &* +@all\n\
              user gone on #{pw1} ~* &* +@all\n",
@@ -2595,4 +2595,200 @@ fn test_connection_category_is_redis_s() {
     assert!(reply.error_str().starts_with("NOPERM"), "{reply:?}");
     let reply = user.cmds(&["CONFIG", "GET", "maxmemory"]);
     assert!(reply.error_str().starts_with("NOPERM"), "{reply:?}");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Key and channel patterns of any bytes (#510)
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn noperm(reply: &RespValue) -> bool {
+    matches!(reply, RespValue::Error(e) if e.starts_with("NOPERM"))
+}
+
+/// A pattern is its bytes, and is matched byte for byte: a user limited to
+/// `~app:\xff*` cannot reach `app:` followed by U+FFFD (what a lossy copy of
+/// `\xff` would be), and a user limited to that cannot reach `\xff`.
+#[test]
+fn binary_key_and_channel_patterns_match_bytes_exactly() {
+    let port = free_port();
+    start_server(port);
+    let mut admin = Conn::connect(port);
+    for rules in [
+        &[
+            &b"bin"[..],
+            b"on",
+            b"nopass",
+            b"~app:\xff*",
+            b"&news:\xff*",
+            b"+@all",
+        ][..],
+        &[
+            b"rep",
+            b"on",
+            b"nopass",
+            b"~app:\xef\xbf\xbd*",
+            b"&news:\xef\xbf\xbd*",
+            b"+@all",
+        ],
+        &[b"ro", b"on", b"nopass", b"%R~ro:\x80*", b"+@all"],
+        &[
+            b"sel",
+            b"on",
+            b"nopass",
+            b"resetkeys",
+            b"+@all",
+            b"(~s:\xfe* +get)",
+        ],
+    ] {
+        let mut args: Vec<&[u8]> = vec![b"ACL", b"SETUSER"];
+        args.extend_from_slice(rules);
+        assert!(admin.cmd(&args).is_ok(), "{rules:?}");
+    }
+
+    let mut bin = Conn::connect(port);
+    assert!(bin.cmds(&["AUTH", "bin", "x"]).is_ok());
+    assert!(bin.cmd(&[b"GET", b"app:\xff1"]).is_nil());
+    assert!(bin.cmd(&[b"SET", b"app:\xff\x00k", b"v"]).is_ok());
+    assert!(noperm(&bin.cmd(&[b"GET", b"app:\xef\xbf\xbd1"])));
+    assert!(noperm(&bin.cmd(&[b"GET", b"app:\xfe"])));
+    assert!(noperm(&bin.cmd(&[b"GET", b"app:"])));
+    assert!(!bin.cmd(&[b"PUBLISH", b"news:\xff!", b"m"]).is_error());
+    assert!(noperm(&bin.cmd(&[b"PUBLISH", b"news:\xef\xbf\xbd", b"m"])));
+
+    let mut rep = Conn::connect(port);
+    assert!(rep.cmds(&["AUTH", "rep", "x"]).is_ok());
+    assert!(rep.cmd(&[b"GET", b"app:\xef\xbf\xbd1"]).is_nil());
+    assert!(noperm(&rep.cmd(&[b"GET", b"app:\xff1"])));
+    assert!(noperm(&rep.cmd(&[b"GET", b"app:\xff\x00k"])));
+    assert!(noperm(&rep.cmd(&[b"PUBLISH", b"news:\xff", b"m"])));
+
+    let mut ro = Conn::connect(port);
+    assert!(ro.cmds(&["AUTH", "ro", "x"]).is_ok());
+    assert!(ro.cmd(&[b"GET", b"ro:\x80a"]).is_nil());
+    assert!(noperm(&ro.cmd(&[b"SET", b"ro:\x80a", b"v"])));
+    assert!(noperm(&ro.cmd(&[b"GET", b"ro:\xc2\x80a"])));
+
+    let mut sel = Conn::connect(port);
+    assert!(sel.cmds(&["AUTH", "sel", "x"]).is_ok());
+    assert!(sel.cmd(&[b"GET", b"s:\xfe"]).is_nil());
+    assert!(noperm(&sel.cmd(&[b"SET", b"s:\xfe", b"v"])));
+    assert!(noperm(&sel.cmd(&[b"GET", b"s:x"])));
+
+    // ACL DRYRUN says the same.
+    assert!(
+        admin
+            .cmd(&[b"ACL", b"DRYRUN", b"bin", b"GET", b"app:\xffz"])
+            .is_ok()
+    );
+    assert!(
+        !admin
+            .cmd(&[b"ACL", b"DRYRUN", b"bin", b"GET", b"app:\xef\xbf\xbdz"])
+            .is_ok()
+    );
+
+    // GETUSER and LIST give the patterns' bytes, as Redis does.
+    let user = admin.cmds(&["ACL", "GETUSER", "bin"]);
+    let fields = user.as_array();
+    let field = |name: &str| {
+        let at = fields
+            .iter()
+            .position(|f| matches!(f, RespValue::Bulk(b) if b == name.as_bytes()))
+            .unwrap();
+        &fields[at + 1]
+    };
+    assert_eq!(field("keys"), &RespValue::Bulk(b"~app:\xff*".to_vec()));
+    assert_eq!(field("channels"), &RespValue::Bulk(b"&news:\xff*".to_vec()));
+    let list = admin.cmds(&["ACL", "LIST"]);
+    assert!(
+        list.as_array().contains(&RespValue::Bulk(
+            b"user bin on nopass ~app:\xff* &news:\xff* +@all".to_vec()
+        )),
+        "{list:?}"
+    );
+    assert!(
+        list.as_array().contains(&RespValue::Bulk(
+            b"user sel on nopass resetkeys resetchannels +@all (~s:\xfe* resetchannels -@all +get)"
+                .to_vec()
+        ))
+    );
+
+    // The ACL log names the key and the channel by their bytes.
+    assert!(admin.cmds(&["ACL", "LOG", "RESET"]).is_ok());
+    assert!(noperm(&bin.cmd(&[b"GET", b"app:\xfe\x00"])));
+    assert!(noperm(&bin.cmd(&[b"PUBLISH", b"news:\xfe", b"m"])));
+    let log = admin.cmds(&["ACL", "LOG"]);
+    let objects: Vec<&RespValue> = log
+        .as_array()
+        .iter()
+        .map(|entry| {
+            let entry = entry.as_array();
+            let at = entry
+                .iter()
+                .position(|f| matches!(f, RespValue::Bulk(b) if b == b"object"))
+                .unwrap();
+            &entry[at + 1]
+        })
+        .collect();
+    assert_eq!(
+        objects,
+        [
+            &RespValue::Bulk(b"news:\xfe".to_vec()),
+            &RespValue::Bulk(b"app:\xfe\x00".to_vec())
+        ]
+    );
+
+    // White space and NUL are refused in a pattern, as by Redis: the ACL
+    // file could not hold it.
+    for bad in [&b"~a b"[..], b"~a\x00", b"%R~a\tb", b"&c d", b"&\x00"] {
+        let reply = admin.cmd(&[b"ACL", b"SETUSER", b"bad", bad]);
+        assert!(reply.is_error(), "{bad:?}: {reply:?}");
+    }
+}
+
+/// The ACL file holds a pattern's own bytes, as Redis writes it, and reads a
+/// file Redis wrote, or one with quoted words, the same.
+#[test]
+fn acl_files_keep_patterns_as_their_bytes() {
+    let port = free_port();
+    let path = start_server_with_aclfile(
+        port,
+        &b"user default on nopass ~* &* +@all\n\
+           user bin on nopass ~app:\xff* &ch:\xfe +@all\n\
+           user q on nopass \"~quoted:\\xff*\" '%R~single:\xfe*' +@all\n\
+           user lit on nopass ~a\"b* +@all\n"[..],
+    );
+    let mut admin = Conn::connect(port);
+    let mut bin = Conn::connect(port);
+    assert!(bin.cmds(&["AUTH", "bin", "x"]).is_ok());
+    assert!(bin.cmd(&[b"GET", b"app:\xffx"]).is_nil());
+    assert!(noperm(&bin.cmd(&[b"GET", b"app:\xef\xbf\xbdx"])));
+    let mut q = Conn::connect(port);
+    assert!(q.cmds(&["AUTH", "q", "x"]).is_ok());
+    assert!(q.cmd(&[b"GET", b"quoted:\xffx"]).is_nil());
+    assert!(q.cmd(&[b"GET", b"single:\xfex"]).is_nil());
+    assert!(noperm(&q.cmd(&[b"SET", b"single:\xfex", b"v"])));
+    assert!(noperm(&q.cmd(&[b"GET", b"quoted:\\xffx"])));
+    // A quote inside a word is part of it, as KiviDB always read it.
+    let mut lit = Conn::connect(port);
+    assert!(lit.cmds(&["AUTH", "lit", "x"]).is_ok());
+    assert!(lit.cmd(&[b"GET", b"a\"bc"]).is_nil());
+    assert!(noperm(&lit.cmd(&[b"GET", b"abc"])));
+
+    // Saved as Redis saves it: the bytes themselves, no quotes.
+    let before = admin.cmds(&["ACL", "LIST"]);
+    assert!(admin.cmds(&["ACL", "SAVE"]).is_ok());
+    let saved = std::fs::read(&path).unwrap();
+    let lines: Vec<&[u8]> = saved.split(|&b| b == b'\n').collect();
+    assert!(
+        lines.contains(&&b"user bin on nopass ~app:\xff* &ch:\xfe +@all"[..]),
+        "{saved:?}"
+    );
+    assert!(
+        lines.contains(&&b"user q on nopass ~quoted:\xff* %R~single:\xfe* resetchannels +@all"[..])
+    );
+    assert!(lines.contains(&&b"user lit on nopass ~a\"b* resetchannels +@all"[..]));
+    // And read back to the same users.
+    assert!(admin.cmds(&["ACL", "LOAD"]).is_ok());
+    assert_eq!(admin.cmds(&["ACL", "LIST"]), before);
+    let _ = std::fs::remove_file(&path);
 }

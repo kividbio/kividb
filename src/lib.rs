@@ -80,6 +80,7 @@ pub mod wait_table;
 pub mod watch;
 pub mod write_gate;
 pub mod write_order;
+pub mod zset_table;
 use crate::replication::{ReplState, start_hub};
 pub mod client_registry;
 pub mod keyspace_events;

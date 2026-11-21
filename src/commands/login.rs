@@ -48,7 +48,7 @@ impl Login<'_> {
             None => {
                 self.acl_log.record(
                     "auth",
-                    &String::from_utf8_lossy(command),
+                    command,
                     &String::from_utf8_lossy(username),
                     &crate::acl::log_client_info(
                         self.client_registry,

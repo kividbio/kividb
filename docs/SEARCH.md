@@ -31,10 +31,22 @@ The full command surface, filters, hybrid search and edge cases are in **[COMMAN
   `search-index-threads` says (`--search-index-threads`, or in the configuration file;
   read at startup, `CONFIG GET` shows it): a number, 0 meaning each write links its own
   vector as 1.2 did, or `auto`, the default. `auto` starts none under a CPU quota (a
-  container's `--cpus`, a Kubernetes CPU limit) or on fewer than 8 CPUs, otherwise
-  (CPUs - 2) / 2: three on 8, seven on 16. They start on the first write that needs them
-  and run as `SCHED_IDLE` on Linux, taking CPU time the workers leave; the log says how
-  many there are.
+  container's `--cpus`, a Kubernetes CPU limit) or on fewer than 8 CPUs. Otherwise it
+  starts one fewer than the CPUs (seven on 8, fifteen on 16), and how many of them link
+  depends on what the server is doing:
+  - while it serves clients, (CPUs - 2) / 2 of them: three on 8, seven on 16;
+  - while it does nothing but take the writes that fill the backlogs (a bulk load,
+    `FT.CREATE` over existing keys, a replica's full sync), all of them.
+
+  The server counts as serving when, besides the commands that wrote vectors, it served
+  500 commands a second, or its threads used a CPU's worth of time besides the links and
+  the commands that wrote vectors.
+  The helpers look every 50 ms. They go back to the serving count at the first look that
+  finds clients. They take the others in again after 200 ms without any. A number starts
+  exactly that many, all of which always link. They start on the first write that needs
+  them and run as `SCHED_IDLE` on Linux, taking CPU time the workers leave; the log says
+  how many there are, and `FT.INFO` shows `hnsw_index_threads` (started) and
+  `hnsw_index_threads_active` (linking now).
   - **On a server of fewer than 8 CPUs, builds run at 1.2's speed by default.**
     `search-index-threads 1` (or more) trades serving latency for build speed there.
     Measured with every CPU of a 4-vCPU server busy (memtier GET/SET, one client loading

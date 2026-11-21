@@ -252,7 +252,23 @@ pub enum Member<'a> {
     Int(IntText),
 }
 
-impl Member<'_> {
+impl<'a> Member<'a> {
+    /// The bytes of a member a collection holds as they are (a sorted
+    /// set's, a block's, a table entry's): borrowed for as long as the
+    /// collection is. A member copied out of its slot or written from an
+    /// integer has no such bytes: `Inline` and `Int` are not given by a
+    /// sorted set, and are not taken here.
+    #[inline]
+    pub fn borrowed(&self) -> &'a [u8] {
+        match *self {
+            Member::Shared(bytes) => &bytes[..],
+            Member::Bytes(bytes) => bytes,
+            Member::Inline(..) | Member::Int(_) => {
+                unreachable!("a member copied out of its collection")
+            }
+        }
+    }
+
     /// The member as shared bytes: the sorted set's own, or a new copy.
     pub fn to_shared(&self) -> Arc<[u8]> {
         match self {

@@ -1,7 +1,7 @@
 //! A small hash, fields and values, in one block of memory.
 //!
 //! The hash's counterpart of [`crate::packed_set`]: a hash of a few short
-//! fields does not need a table that pays a `String` and an `Arc<[u8]>`
+//! fields does not need a table that pays a header and an `Arc<[u8]>`
 //! (two allocations, 40 bytes of headers) and a slot for every field. Here
 //! each field lies next to its value, all of them end to end in one buffer,
 //! and a field is found by scanning one byte a field: its *fingerprint*
@@ -122,7 +122,7 @@ impl PackedHash {
 
     /// Field `i` and its value. `i < len()`.
     #[inline]
-    pub fn entry(&self, i: usize) -> (&str, &[u8]) {
+    pub fn entry(&self, i: usize) -> (&[u8], &[u8]) {
         debug_assert!(i < self.len());
         let start = self.data_start();
         let o = &self.offsets()[2 * i..2 * i + 3];
@@ -131,15 +131,12 @@ impl PackedHash {
             u16::from_le_bytes(o[1]) as usize,
             u16::from_le_bytes(o[2]) as usize,
         );
-        let (field, value) = self.buf[start + from..start + to].split_at(mid - from);
-        // SAFETY: a field enters the block only as a `&str` (`set`, `push`)
-        // and its bytes are never changed, only moved whole.
-        (unsafe { std::str::from_utf8_unchecked(field) }, value)
+        self.buf[start + from..start + to].split_at(mid - from)
     }
 
     /// Field `i`, in the order fields were first set. `i < len()`.
     #[inline]
-    pub fn field(&self, i: usize) -> &str {
+    pub fn field(&self, i: usize) -> &[u8] {
         self.entry(i).0
     }
 
@@ -158,8 +155,8 @@ impl PackedHash {
 
     /// Where `field` is, if the hash has it.
     #[inline]
-    pub fn find(&self, field: &str) -> Option<usize> {
-        let field = field.as_bytes();
+    pub fn find(&self, field: &(impl AsRef<[u8]> + ?Sized)) -> Option<usize> {
+        let field = field.as_ref();
         if self.len == 0 || field.len() > MAX_LEN {
             return None;
         }
@@ -170,8 +167,8 @@ impl PackedHash {
     /// for [`push_fingerprinted`](Self::push_fingerprinted): a write looks
     /// for a field and adds it with one fingerprint computed.
     #[inline]
-    pub fn locate(&self, field: &str) -> Result<usize, u8> {
-        let field = field.as_bytes();
+    pub fn locate(&self, field: &(impl AsRef<[u8]> + ?Sized)) -> Result<usize, u8> {
+        let field = field.as_ref();
         if field.len() > MAX_LEN {
             return Err(0);
         }
@@ -184,12 +181,12 @@ impl PackedHash {
 
     /// The value of `field`, if the hash has it.
     #[inline(never)]
-    pub fn get(&self, field: &str) -> Option<&[u8]> {
+    pub fn get(&self, field: &[u8]) -> Option<&[u8]> {
         self.find(field).map(|i| self.value(i))
     }
 
     #[inline(never)]
-    pub fn contains(&self, field: &str) -> bool {
+    pub fn contains(&self, field: &[u8]) -> bool {
         self.find(field).is_some()
     }
 
@@ -218,7 +215,8 @@ impl PackedHash {
     }
 
     /// Give `field` the value `value`, adding the field if it is new.
-    pub fn set(&mut self, field: &str, value: &[u8]) -> Set {
+    pub fn set(&mut self, field: &(impl AsRef<[u8]> + ?Sized), value: &[u8]) -> Set {
+        let field = field.as_ref();
         match self.locate(field) {
             Ok(i) => {
                 if self.set_value_at(i, value) {
@@ -239,14 +237,15 @@ impl PackedHash {
 
     /// Add a field known not to be there, if it and its value fit.
     /// `false`, and nothing changed, if they do not.
-    pub fn push_new(&mut self, field: &str, value: &[u8]) -> bool {
+    pub fn push_new(&mut self, field: &(impl AsRef<[u8]> + ?Sized), value: &[u8]) -> bool {
+        let field = field.as_ref();
         debug_assert!(self.find(field).is_none());
-        self.push_fingerprinted(field, value, fingerprint(field.as_bytes()))
+        self.push_fingerprinted(field, value, fingerprint(field))
     }
 
     /// [`push_new`](Self::push_new) of a field whose fingerprint is known
     /// ([`locate`](Self::locate) gave it).
-    pub fn push_fingerprinted(&mut self, field: &str, value: &[u8], f: u8) -> bool {
+    pub fn push_fingerprinted(&mut self, field: &[u8], value: &[u8], f: u8) -> bool {
         debug_assert!(self.find(field).is_none());
         let n = self.len();
         if field.len() > MAX_LEN || value.len() > MAX_LEN || n >= MAX_ENTRIES {
@@ -261,7 +260,7 @@ impl PackedHash {
             self.grow();
         }
         self.reserve(more);
-        self.buf.extend_from_slice(field.as_bytes());
+        self.buf.extend_from_slice(field);
         self.buf.extend_from_slice(value);
         self.buf[n] = f;
         let o = &mut self.offsets_mut()[2 * n + 1..2 * n + 3];
@@ -373,7 +372,7 @@ impl PackedHash {
     }
 
     /// Remove `field` if the hash has it.
-    pub fn remove(&mut self, field: &str) -> bool {
+    pub fn remove(&mut self, field: &(impl AsRef<[u8]> + ?Sized)) -> bool {
         match self.find(field) {
             Some(i) => {
                 self.remove_at(i);
@@ -384,7 +383,7 @@ impl PackedHash {
     }
 
     /// Keep the fields `keep` says to.
-    pub fn retain(&mut self, mut keep: impl FnMut(&str, &[u8]) -> bool) {
+    pub fn retain(&mut self, mut keep: impl FnMut(&[u8], &[u8]) -> bool) {
         let mut i = 0;
         while i < self.len() {
             let (field, value) = self.entry(i);
@@ -436,7 +435,7 @@ pub struct Iter<'a> {
 }
 
 impl<'a> Iterator for Iter<'a> {
-    type Item = (&'a str, &'a [u8]);
+    type Item = (&'a [u8], &'a [u8]);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -451,8 +450,7 @@ impl<'a> Iterator for Iter<'a> {
         let (field, value) = self.data[self.at..to].split_at(mid - self.at);
         self.at = to;
         self.next += 1;
-        // SAFETY: as in `entry`: fields enter only as `&str`.
-        Some((unsafe { std::str::from_utf8_unchecked(field) }, value))
+        Some((field, value))
     }
 
     #[inline]
@@ -467,10 +465,12 @@ impl ExactSizeIterator for Iter<'_> {}
 impl std::fmt::Debug for PackedHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map()
-            .entries(
-                self.iter()
-                    .map(|(field, value)| (field, String::from_utf8_lossy(value))),
-            )
+            .entries(self.iter().map(|(field, value)| {
+                (
+                    String::from_utf8_lossy(field),
+                    String::from_utf8_lossy(value),
+                )
+            }))
             .finish()
     }
 }
@@ -509,13 +509,13 @@ mod tests {
         assert_eq!(hash.len(), model.0.len());
         let held: Vec<(String, Vec<u8>)> = hash
             .iter()
-            .map(|(f, v)| (f.to_string(), v.to_vec()))
+            .map(|(f, v)| (String::from_utf8(f.to_vec()).unwrap(), v.to_vec()))
             .collect();
         assert_eq!(held, model.0);
         for (i, (f, v)) in model.0.iter().enumerate() {
             assert_eq!(hash.find(f), Some(i), "{f}");
-            assert_eq!(hash.get(f), Some(v.as_slice()), "{f}");
-            assert_eq!(hash.entry(i), (f.as_str(), v.as_slice()));
+            assert_eq!(hash.get(f.as_bytes()), Some(v.as_slice()), "{f}");
+            assert_eq!(hash.entry(i), (f.as_bytes(), v.as_slice()));
         }
         let bytes: usize = model.0.iter().map(|(f, v)| f.len() + v.len()).sum();
         assert_eq!(hash.data_len(), bytes);
@@ -525,7 +525,7 @@ mod tests {
     fn it_is_a_hash() {
         let mut hash = PackedHash::new();
         assert!(hash.is_empty());
-        assert_eq!(hash.get("a"), None);
+        assert_eq!(hash.get(b"a"), None);
         assert_eq!(hash.allocation_size(), 0);
         assert_eq!(hash.data_len(), 0);
         assert_eq!(hash.set("a", b"1"), Set::Added);
@@ -533,15 +533,15 @@ mod tests {
         assert_eq!(hash.set("", b""), Set::Added);
         assert_eq!(hash.set("", b"empty"), Set::Replaced);
         assert_eq!(hash.len(), 2);
-        assert_eq!(hash.get("a"), Some(&b"2"[..]));
-        assert_eq!(hash.get(""), Some(&b"empty"[..]));
-        assert_eq!(hash.get("b"), None);
+        assert_eq!(hash.get(b"a"), Some(&b"2"[..]));
+        assert_eq!(hash.get(b""), Some(&b"empty"[..]));
+        assert_eq!(hash.get(b"b"), None);
         assert!(hash.remove("a"));
         assert!(!hash.remove("a"));
         assert_eq!(hash.len(), 1);
-        assert_eq!(hash.entry(0), ("", &b"empty"[..]));
+        assert_eq!(hash.entry(0), (&b""[..], &b"empty"[..]));
         hash.clear();
-        assert!(hash.is_empty() && !hash.contains(""));
+        assert!(hash.is_empty() && !hash.contains(b""));
         assert_eq!(hash.allocation_size(), 0);
     }
 
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(hash.set(&field(0), b"back"), Set::Added);
         model.set(&field(0), b"back");
         assert_same(&hash, &model);
-        assert_eq!(hash.field(hash.len() - 1), field(0));
+        assert_eq!(hash.field(hash.len() - 1), field(0).as_bytes());
     }
 
     #[test]
@@ -611,7 +611,7 @@ mod tests {
         assert_eq!(hash.set(&long, b"v"), Set::NoRoom);
         assert_eq!(hash.set("f", long.as_bytes()), Set::NoRoom);
         assert!(hash.is_empty());
-        assert_eq!(hash.get(&long), None);
+        assert_eq!(hash.get(long.as_bytes()), None);
         assert_eq!(hash.set(&longest, longest.as_bytes()), Set::Added);
         model.set(&longest, longest.as_bytes());
         assert_eq!(hash.set("f", b"v"), Set::Added);
@@ -684,7 +684,7 @@ mod tests {
                 5..=6 => assert_eq!(hash.remove(&name), model.remove(&name), "step {step}"),
                 _ => {
                     let cut = (r >> 40) % 4;
-                    hash.retain(|f, _| f.as_bytes()[f.len() - 1] as u64 % 4 != cut);
+                    hash.retain(|f, _| f[f.len() - 1] as u64 % 4 != cut);
                     model
                         .0
                         .retain(|(f, _)| f.as_bytes()[f.len() - 1] as u64 % 4 != cut);
@@ -708,10 +708,13 @@ mod tests {
             );
         }
         for i in 0..400 {
-            assert_eq!(hash.get(&format!("{i}")), Some(format!("{i}").as_bytes()));
+            assert_eq!(
+                hash.get(format!("{i}").as_bytes()),
+                Some(format!("{i}").as_bytes())
+            );
         }
         for i in 400..2_000 {
-            assert_eq!(hash.get(&format!("{i}")), None);
+            assert_eq!(hash.get(format!("{i}").as_bytes()), None);
         }
     }
 
