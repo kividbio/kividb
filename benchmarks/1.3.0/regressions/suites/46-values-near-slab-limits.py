@@ -31,7 +31,7 @@ loaded one group after the other by 8 processes in pipelines of 100:
                        size: at most 3 (the class a block is rounded up to)
   set_kops_<size>      thousands of SETs a second, 8 processes overwriting
                        random keys of the group in pipelines of 100 for 3 s;
-                       the median of 3 trials, the sizes taken in turn (info)
+                       the median of 5 trials, the sizes taken in turn (info)
   cpu_us_<size>        the server's CPU time a SET in those trials (info)
   step_<a>_<b>         set_kops of b over a, across the boundary: at least 0.97
                        (each trial's pair is taken back to back; the median)
@@ -59,7 +59,7 @@ from rss import vmrss_mib  # noqa: E402
 PROCS = 8
 PIPE = 100
 TRIAL_S = 3
-TRIALS = 3
+TRIALS = 5
 MIB = 1048576.0
 SHAPES = {
     "near-2k": (20_000, [1996, 2012], [(1996, 2012)]),
