@@ -337,6 +337,40 @@ impl Conn {
             .unwrap()
     }
 
+    /// `MEMORY USAGE key SAMPLES 0` once four readings 50 ms apart agree,
+    /// for at most four seconds. A set, hash or sorted set that a write left
+    /// part-way through a resize of its table (or holding the old array of
+    /// one it finished) holds both arrays until the background finishes it
+    /// (#764), and its usage counts both, as Redis's counts both tables of a
+    /// dictionary being rehashed: a 1,000-member set read 30,588 bytes, then
+    /// 18,052 once the background was done.
+    pub fn settled_usage(&mut self, key: &[u8]) -> i64 {
+        let cmd: [&[u8]; 5] = [b"MEMORY", b"USAGE", key, b"SAMPLES", b"0"];
+        let mut last = self.int(&cmd);
+        let mut same = 0;
+        for _ in 0..80 {
+            std::thread::sleep(Duration::from_millis(50));
+            let now = self.int(&cmd);
+            same = if now == last { same + 1 } else { 0 };
+            if same == 3 {
+                return now;
+            }
+            last = now;
+        }
+        last
+    }
+
+    /// Five `PING`s, one at a time. The Tokio loop gives a read buffer that
+    /// a long pipeline grew (32 KiB) back after four reads in a row that
+    /// were small, as it waits for the next one: a count of `used_memory`
+    /// taken after a pipeline and compared with one taken after the next
+    /// commands sees the buffer go, 28 KiB, unless it has gone already.
+    pub fn small_reads(&mut self) {
+        for _ in 0..5 {
+            assert!(matches!(self.cmd(&[b"PING"]), Reply::Simple));
+        }
+    }
+
     /// `used_memory` once four readings 50 ms apart agree (background frees
     /// done, and a large set's resize the background finishes: #764), for
     /// at most four seconds.

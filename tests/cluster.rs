@@ -6544,7 +6544,23 @@ fn vsets_and_series(c: &mut Conn, k: &dyn Fn(&str) -> String) -> Vec<Resp> {
     let mut out = Vec::new();
     for (name, _) in MOVED_VSETS {
         let key = k(name);
-        out.push(c.cmd(&["VINFO", &key]));
+        // Less `vset-uid`: each node numbers the sets it makes.
+        out.push(match c.cmd(&["VINFO", &key]) {
+            Resp::Array(items) => Resp::Array(
+                items
+                    .chunks(2)
+                    .filter(|p| !matches!(&p[0], Resp::Simple(s) if s == "vset-uid"))
+                    .flat_map(|p| p.to_vec())
+                    .collect(),
+            ),
+            Resp::Map(pairs) => Resp::Map(
+                pairs
+                    .into_iter()
+                    .filter(|(k, _)| !matches!(k, Resp::Simple(s) if s == "vset-uid"))
+                    .collect(),
+            ),
+            other => other,
+        });
         out.push(c.cmd(&["VCARD", &key]));
         out.push(c.cmd(&["VSIM", &key, "ELE", "e1", "COUNT", "4", "WITHSCORES"]));
         for n in 0..8 {

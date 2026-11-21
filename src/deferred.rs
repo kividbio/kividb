@@ -64,7 +64,8 @@ pub fn mark_ring_thread() {
     RING.with(|ring| ring.set(true));
 }
 
-pub fn on_ring_thread() -> bool {
+/// Whether this thread is an io_uring worker ([`mark_ring_thread`]).
+pub(crate) fn on_ring_thread() -> bool {
     RING.with(|ring| ring.get())
 }
 

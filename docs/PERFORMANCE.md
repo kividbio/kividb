@@ -373,6 +373,92 @@ others and is not affected. For comparison, on the same machine type in another 
 connections goes from 8.96 to 4.67 ms, against 2.21 ms with no script, and from 3.76 to 1.52 ms
 at 200: less of a gain than on io_uring. Regression suite 42 (`benchmarks/1.3.0/regressions`) keeps these rows.
 
+### Centrifuge's history scripts
+
+Centrifuge (the engine of Centrifugo) reads and appends a channel's history with Lua scripts whose 2-3
+keys have no hash tag, so each runs alone, and its client (rueidis) sends them over 4 pipelined
+connections ([#900](https://github.com/kividbio/kividb/issues/900)). With those connections on
+different workers, nearly every script meets another one running and is queued for the thread
+running that one. A connection has one script in flight at a time: until its reply is back, the
+server reads nothing more from it. Waiting with a waker, its worker, with nothing else to do, sleeps,
+and the thread running the scripts wakes it for each reply (a write to its eventfd, then a task
+switch). The scripts themselves cost less than Redis's: under callgrind (one pipelined connection, so
+nothing is queued) the whole server spends 41,925 instructions a `broker_history_list.lua` call
+(Redis 8.10.2: 64,970), 60,764 a `broker_history_add_list.lua` call (83,294) and 64,987 a stream
+publish (139,581); and with one worker every history row runs faster than Redis.
+
+A connection whose script was queued looks for the reply between turns of its thread's loop, for up
+to 400 µs, and waits to be woken only after that. Its thread goes on serving its other connections
+and does not sleep, so the reply is sent to nobody's waker and found at the next look. On io_uring
+the thread hands its other connections' reads and writes to the kernel only when it is about to
+sleep, which a look does not make it do: once every 20 µs on a thread, however many of its
+connections look, the look is a no-op on the ring, which does. A connection that looks and finds
+nobody running scripts and some queued takes the turn and runs them, as the thread that ran its own
+script does after it; nothing is run so while a slot handoff or a `MIGRATE` is under way. Each
+script still runs alone, in the order of the queue, and replicas and the AOF get them in the order
+they ran.
+
+A look keeps its thread busy, so connections look only where the CPUs the process may use (its CPU
+mask and its CPU quota) leave one beyond the workers and the script-runner thread: with 4 workers
+that is 6 CPUs or more. The default worker count, half the CPUs, leaves them on 4 CPUs or more; `--threads 4` on
+4 CPUs does not, and there a queued script's connection waits as before. A thread whose connections
+have looked 8 times in a row without their reply coming within 400 µs stops looking for 1 ms, then
+2, 4, ... up to 100 ms, until a look finds its reply.
+
+Azure `Standard_D8s_v5`, the server on CPUs 0-3 with `--threads 2` (so the workers leave CPUs to
+spare, and connections look), io_uring, centrifuge v0.40.1's `BenchmarkRedis*/rd_single` benchmarks
+(`-test.benchtime 5s`) on CPUs 4-7, master `b4889a5e` and the change, both `lua,tls` by rustc
+1.100.0, Redis 8.10.2, a fresh server for each run, 3 interleaved rounds, medians in ns/op
+(lowest-highest), and the ratio to Redis:
+
+| benchmark, PARALLELISM | Redis 8.10.2 | master | with the change | master / Redis | change / Redis |
+|---|---:|---:|---:|---:|---:|
+| History_1Ch list, 16 | 8,317 (8,306-8,425) | 10,888 (10,874-11,077) | 7,561 (7,538-7,709) | 1.31x | 0.91x |
+| History_1Ch list, 128 | 7,204 (7,180-7,261) | 9,534 (9,469-11,030) | 6,991 (6,862-7,016) | 1.32x | 0.97x |
+| History_1Ch stream, 16 | 16,424 (16,367-16,537) | 14,891 (13,931-14,953) | 10,771 (10,717-11,052) | 0.91x | 0.66x |
+| History_1Ch stream, 128 | 15,298 (15,214-15,605) | 13,447 (13,256-13,815) | 10,153 (10,148-10,265) | 0.88x | 0.66x |
+| Pub_History_ManyCh list, 16 | 11,743 (11,696-11,804) | 15,693 (14,567-16,372) | 11,187 (10,983-11,258) | 1.34x | 0.95x |
+| Pub_History_ManyCh list, 128 | 10,654 (10,570-10,693) | 15,278 (14,293-15,903) | 10,972 (10,579-11,061) | 1.43x | 1.03x |
+| Pub_History_ManyCh stream, 16 | 14,477 (14,474-14,631) | 16,748 (16,368-17,170) | 11,717 (11,540-12,043) | 1.16x | 0.81x |
+| Pub_History_ManyCh stream, 128 | 13,390 (13,340-13,412) | 16,201 (14,595-16,533) | 11,374 (11,372-11,961) | 1.21x | 0.85x |
+| Publish_History_1Ch list, 16 | 10,942 (10,934-10,979) | 13,912 (13,567-14,725) | 10,618 (10,393-10,644) | 1.27x | 0.97x |
+| Publish_History_1Ch list, 128 | 9,798 (9,600-9,871) | 14,560 (13,257-15,309) | 10,116 (9,988-10,119) | 1.49x | 1.03x |
+| Publish_History_1Ch stream, 16 | 14,523 (14,481-14,595) | 16,369 (15,543-16,629) | 10,931 (10,890-11,294) | 1.13x | 0.75x |
+| Publish_History_1Ch stream, 128 | 13,564 (13,442-13,579) | 15,240 (15,009-16,476) | 10,681 (10,579-11,110) | 1.12x | 0.79x |
+
+The server's task switches over those runs went from 1.8-2.0 million to 45k-75k (Redis: 1.5k-14k).
+With `--threads 4` on the same 4 CPUs the change does not look, and the rows are master's
+(`History_1Ch` list 12,774 against 12,947 ns/op at 16). Made to look there anyway, it ran the rows
+at 0.67-1.36x Redis, but at saturation it spent 38.6 µs of server CPU a call against master's 18.8
+(memtier, below): the looking threads take the CPUs the scripts need, which is why it does not.
+
+Server CPU a call, centrifuge's history read by `EVALSHA` from memtier_benchmark (4 connections,
+pipeline 16), 15 s, the same placement:
+
+| | at saturation, calls/s | CPU a call | at 35,000 calls/s, CPU a call |
+|---|---:|---:|---:|
+| Redis 8.10.2 | 140,080-141,284 | 7.07-7.12 µs | 7.96-8.02 µs |
+| master, `--threads 2` | 103,072-107,759 | 12.81-13.46 µs | 7.63 µs |
+| the change, `--threads 2` | 149,418-149,758 | 13.06-13.12 µs | 7.87 µs |
+| master, `--threads 4` | 81,335-81,511 | 18.82-18.91 µs | 7.92 µs |
+| the change, `--threads 4` (does not look) | 82,616-84,312 | 18.24-18.52 µs | 8.00 µs |
+
+At a quarter of Redis's rate nothing is queued for long and every server spends the same. Under a
+CPU quota of 2 CPUs (cgroup `cpu.max`) with `--threads 4`, the change does not look either:
+`History_1Ch` list 12,571 against master's 12,430 ns/op, `Publish_History_1Ch` list 16,850 against
+15,729 (3 runs each; master's spread 15,304-16,680). On the Tokio loop (`--io-model tokio`,
+`--threads 2`): `History_1Ch` list 7,231 against master's 10,506 ns/op, `Publish_History_1Ch` list
+10,976 against 15,145, with 39k task switches against 741k and 28 % more server CPU for about 40 %
+more calls.
+
+Plain commands beside them, suite 42's Nextcloud mix (12 % untagged compare-and-delete scripts)
+from memtier at 200 / 500 connections, 3 runs of 15 s, p99 in ms: with `--threads 2`, where
+connections look, 0.975-1.007 / 2.447-2.735 against master's 1.007-1.055 / 2.495-2.575.
+
+Left: with as many workers as CPUs, or fewer CPUs, nothing changes here. Getting the rows ahead of
+Redis there takes running the scripts that run alone on one thread together with the connections
+that send them. Regression suite 38 (`benchmarks/1.3.0/regressions`) runs centrifuge's scripts.
+
 ## Vector index builds
 
 Since 1.3.0 helper threads link the vectors written to an HNSW index into
