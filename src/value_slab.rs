@@ -1514,6 +1514,11 @@ mod tests {
         }
     }
 
+    /// The class the model tests use: one no other test allocates.
+    fn model_class() -> usize {
+        pool_class_of(3904).unwrap()
+    }
+
     /// A small, reproducible sequence.
     struct Lcg(u64);
     impl Lcg {
@@ -1577,9 +1582,10 @@ mod tests {
     #[test]
     fn the_lists_follow_every_slab_through_its_states() {
         let _one = EVACUATION_TESTS.lock();
-        // A class no other test allocates (blocks of 3,905-3,968 bytes, 16 a
-        // slab): the pool's, which `plan` takes like any when asked.
-        let class = pool_class_of(3968).unwrap();
+        // A class no other test allocates (the pool's of 3,841-3,904 bytes,
+        // 16 a slab; the tables' tests and the other pool tests have the
+        // three above it), which `plan` takes like any when asked.
+        let class = model_class();
         assert!(check_lists(false).is_ok());
         let blocks_a_slab = capacity(class) as usize;
         let mut rng = Lcg(240);
@@ -1673,7 +1679,7 @@ mod tests {
     fn a_walk_sees_every_full_slab_once_however_the_list_changes() {
         let _one = EVACUATION_TESTS.lock();
         let _planning = PLANNING.lock();
-        let class = pool_class_of(3968).unwrap();
+        let class = model_class();
         // Headers of no region: only their links are used.
         let slabs: Vec<Box<Slab>> = (0..WALK * 40 + 7).map(|_| Box::new(Slab::new())).collect();
         let mut lists = LISTS[class].lock();

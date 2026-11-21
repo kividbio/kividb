@@ -44,9 +44,13 @@
 //! than `active-defrag-slab-waste-bytes` (10 % and 16 MiB by default). It
 //! stops when the waste is under half of both of either. It does not start
 //! while a snapshot or an AOF rewrite runs (the values it holds cannot
-//! move), nor while what is in the slabs grew by more than one [`REFILL`]th
-//! of them in the last second: the clients are filling the room themselves,
-//! and the slabs a pass empties would only make them take new ones. A pass
+//! move), nor while what is in the slabs grew or fell by more than one
+//! [`REFILL`]th of them in the last second: a large delete, and the writes
+//! that fill its room again, take that room themselves, and the new slabs a
+//! pass takes meanwhile would come on top of theirs. A pass stops between
+//! two rounds for the same. A round's new slabs are what the process holds
+//! twice until the round ends, so a round is kept small ([`BUDGET_SHARE`]).
+//! A pass
 //! the slab-waste trigger started that got little back ([`LITTLE_BACK`])
 //! keeps that trigger off for [`WASTE_BACKOFF`], doubled for each such pass
 //! in a row, up to [`WASTE_BACKOFF_MAX`].
@@ -114,15 +118,25 @@ const BACKOFF_MAX: Duration = Duration::from_secs(8);
 /// bug that retrying will not get past.
 const PANICS_TO_TURN_OFF: u32 = 5;
 
-/// What is in the slabs growing by more than one this-many-th of them over
-/// one [`TICK`] keeps a pass from starting: a delete being refilled.
+/// What is in the slabs growing or falling by more than one this-many-th of
+/// them over one [`TICK`] (or one round) keeps a pass from starting (or
+/// going on): a large delete, or the writes that fill its room again.
 const REFILL: usize = 32;
 
 /// A round's budget: bytes of the values moved that may go into new slabs,
 /// one this-many-th of the slabs (at least [`BUDGET_MIN`]). They are held
-/// twice until the slabs they left empty.
-const BUDGET_SHARE: usize = 8;
-const BUDGET_MIN: usize = 16 << 20;
+/// twice until the slabs they left empty, at the end of the round: what a
+/// pass adds to the peak. During a churn of 1 KB values, a pass with an
+/// eighth took the peak to 1.27x what was loaded, with a 32nd to 1.18x,
+/// against 1.15x with active defrag off (#240).
+const BUDGET_SHARE: usize = 64;
+const BUDGET_MIN: usize = 4 << 20;
+
+/// Whether what is in the slabs moved from `before` to `now` by more than
+/// one [`REFILL`]th of `slabs`, either way.
+fn churning(before: usize, now: usize, slabs: usize) -> bool {
+    WAIT_FOR_REFILL.load(Ordering::Relaxed) && now.abs_diff(before) > slabs / REFILL
+}
 
 /// A pass the slab-waste trigger started gets little back when the slabs it
 /// emptied, less the new ones it took, are under one in this many of those
@@ -566,11 +580,11 @@ fn pass(store: &Store, streak: &mut Streak) -> Result<bool, Failed> {
                 return false;
             }
             let fill = value_slab::fill();
-            // A delete being refilled: the clients take the room themselves.
+            // A large delete, or its room being filled again: the clients
+            // take the room themselves.
             let refilling = streak
                 .live_before
-                .is_some_and(|before| fill.live_bytes > before + fill.slab_bytes / REFILL)
-                && WAIT_FOR_REFILL.load(Ordering::Relaxed);
+                .is_some_and(|before| churning(before, fill.live_bytes, fill.slab_bytes));
             streak.live_before = Some(fill.live_bytes);
             let Some(trigger) = wasting(&fill, false, streak.slab_waste_on()) else {
                 return false;
@@ -701,6 +715,7 @@ fn compact(store: &Store) -> Got {
     RUNNING.store(true, Ordering::Relaxed);
     let mut pacer = Pacer::default();
     let mut got = Got::default();
+    let mut live_before: Option<usize> = None;
     loop {
         if !enabled() || snapshotting() {
             break;
@@ -709,6 +724,11 @@ fn compact(store: &Store) -> Got {
         let Some(why) = wasting(&fill, true, true) else {
             break;
         };
+        // The clients deleting or refilling meanwhile: until they are done.
+        if live_before.is_some_and(|before| churning(before, fill.live_bytes, fill.slab_bytes)) {
+            break;
+        }
+        live_before = Some(fill.live_bytes);
         // What may go into new slabs: what is moved takes that new room
         // before the slabs it left are given back.
         let budget = (fill.slab_bytes / BUDGET_SHARE).max(BUDGET_MIN);
