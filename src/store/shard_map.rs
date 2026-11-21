@@ -2550,9 +2550,9 @@ mod tests {
             Some(ValueRef::String(s)) => s.as_bytes().as_ptr(),
             _ => panic!("no string"),
         };
-        let evacuating = value_slab::evacuate_only(block).expect("a slab nobody owns");
+        let evacuating = crate::value_slab::evacuate_only(block).expect("a slab nobody owns");
         assert!(matches!(map.set_str("k", vec![2u8; len]), Written::InPlace));
-        let regions = value_slab::regions_snapshot();
+        let regions = crate::value_slab::regions_snapshot();
         let index = (0..map.buckets())
             .find(|&i| map.table.get_bucket(i).is_some())
             .unwrap();
@@ -2584,7 +2584,10 @@ mod tests {
             map.set_str("k", vec![1u8; len]);
             let snapshot = map.entries().next().expect("one entry").hold();
             let reply = map.get_ref("k").expect("the key");
-            assert!(matches!(map.set_str("k", vec![2u8; len]), Written::Replaced(_)));
+            assert!(matches!(
+                map.set_str("k", vec![2u8; len]),
+                Written::Replaced(_)
+            ));
             for held in [&snapshot, &reply] {
                 match held.value() {
                     ValueRef::String(s) => assert_eq!(s.as_bytes(), &vec![1u8; len][..], "{len}"),
