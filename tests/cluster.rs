@@ -9090,21 +9090,18 @@ fn a_replica_elected_after_its_master_took_slots_unannounced_has_them_with_their
 }
 
 /// A destination whose replica is behind in the stream
-/// (`KIVIDB_TEST_STREAM_STALL`: it reads, applies and acknowledges nothing)
-/// does not take the slots over until the replica has acknowledged what the
-/// import brought: the handoff is refused in the meantime, and the source
+/// (`KIVIDB_TEST_STREAM_STALL`: the destination sends it nothing of the
+/// stream, which stays queued there) does not take the slots over until
+/// the replica has acknowledged what the import brought: the handoff is refused in the meantime, and the source
 /// keeps the slots and tries again. Once the replica runs, the slots are
 /// taken over; the destination is killed, its replica elected with them,
 /// and every imported key is on it, and on the destination once it comes
 /// back and follows it.
 #[test]
 fn a_destination_takes_slots_over_once_its_replicas_have_what_arrived() {
-    let (mut nodes, _) = form_cluster(3);
-    let replica = add_replica_with_env(
-        &nodes,
-        &nodes[1],
-        &[("KIVIDB_TEST_STREAM_STALL", "stream-stall")],
-    );
+    let dst = Node::start_with_env(&[], &[("KIVIDB_TEST_STREAM_STALL", "stream-stall")]);
+    let (mut nodes, _) = form_cluster_of(vec![Node::start(&[]), dst, Node::start(&[])]);
+    let replica = add_replica(&nodes, &nodes[1]);
     {
         let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
         wait_cluster_ok(&all, all.len());
@@ -9125,7 +9122,7 @@ fn a_destination_takes_slots_over_once_its_replicas_have_what_arrived() {
             .is_ok()
     );
     let before = Written::on(&nodes[0], 0..=100, "before", 200);
-    let stall = replica.dir.join("stream-stall");
+    let stall = nodes[1].dir.join("stream-stall");
     std::fs::write(&stall, "").unwrap();
     let task_id = nodes[1]
         .conn()

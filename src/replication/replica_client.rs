@@ -1436,13 +1436,6 @@ async fn run_replication_session(
             );
             return Ok(SessionEnd::Superseded);
         }
-        // Tests: the stream is not read, applied or acknowledged while the
-        // file `KIVIDB_TEST_STREAM_STALL` names exists.
-        if let Some(path) = test_stream_stall() {
-            while path.exists() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
 
         // Whether this turn found the socket drained: the read came back with
         // less than it could hold, or with nothing for a while. Once what was
@@ -1747,9 +1740,9 @@ async fn run_replication_session(
 }
 
 /// `KIVIDB_TEST_STREAM_STALL`, never set otherwise: a file, relative to the
-/// working directory, while which exists this replica reads, applies and
-/// acknowledges nothing of its master's stream, as a replica that falls
-/// behind does.
+/// working directory, while which exists this master sends its replicas
+/// nothing of the stream (it stays queued here), as with a replica that
+/// falls behind.
 fn test_stream_stall() -> Option<&'static std::path::Path> {
     static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     PATH.get_or_init(|| std::env::var_os("KIVIDB_TEST_STREAM_STALL").map(Into::into))
@@ -2613,6 +2606,13 @@ where
                 Some(p) => p,
                 None => break,
             };
+            // Tests: held here while the file `KIVIDB_TEST_STREAM_STALL`
+            // names exists.
+            if let Some(path) = test_stream_stall() {
+                while path.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
             if pending_bytes_fwd.abandoned() {
                 // Let go of for falling too far behind: what is queued is
                 // freed now, as `replica_rx` is dropped, not sent (see
