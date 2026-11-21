@@ -46,6 +46,12 @@ pub fn with_no_touch(resp: u8, on: bool) -> u8 {
 /// is counted in `aof::AOF_LOST_RECORDS` and logged once rather than ignored.
 pub trait AofSender: Send + Sync {
     fn send_aof(&self, data: Vec<u8>);
+
+    /// [`Self::send_aof`], saying whether the record was queued.
+    fn try_send_aof(&self, data: Vec<u8>) -> bool {
+        self.send_aof(data);
+        true
+    }
 }
 
 impl AofSender for tokio::sync::mpsc::UnboundedSender<Vec<u8>> {
@@ -55,6 +61,10 @@ impl AofSender for tokio::sync::mpsc::UnboundedSender<Vec<u8>> {
         } else {
             crate::aof::records_queued();
         }
+    }
+
+    fn try_send_aof(&self, data: Vec<u8>) -> bool {
+        self.send(data).is_ok()
     }
 }
 

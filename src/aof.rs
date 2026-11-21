@@ -1459,6 +1459,69 @@ pub async fn written(tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
     }
 }
 
+/// On a thread that may block (off the runtime, holding no gate or lock):
+/// wait until every record queued on the AOF before now, by anyone, is in
+/// the file, and under `appendfsync always` synced. Whatever
+/// `aof-ack-after-write` says: for records whose only other copy is about
+/// to go (an atomic slot migration's, applied on the destination, before
+/// the source deletes its own), which no reply waits for and which are
+/// otherwise written with the next reply's, or by the writer's next sync.
+///
+/// `true` once they are; `true` at once with the AOF off. `false` if they
+/// are not by `deadline` (or [`ACK_WAIT_LIMIT`] from now without
+/// `appendfsync always`), if the record that marks them could not be
+/// queued, or if the AOF is turned off or its writer stops meanwhile: the
+/// caller does not go on as if they were.
+pub fn written_blocking(deadline: std::time::Instant) -> bool {
+    let running = || AOF_ENABLED.load(Ordering::Relaxed) && WRITER_RUNNING.load(Ordering::Acquire);
+    if !running() {
+        return true;
+    }
+    let Some(tx) = GLOBAL_AOF_TX.get() else {
+        return true;
+    };
+    let id = NEXT_BARRIER.fetch_add(1, Ordering::Relaxed);
+    let (done, mut wait) = tokio::sync::oneshot::channel();
+    BARRIERS.lock().insert(id, done);
+    let mut mark = BARRIER_MARK.to_vec();
+    mark.extend_from_slice(&id.to_le_bytes());
+    if !tx.try_send_aof(mark) {
+        BARRIERS.lock().remove(&id);
+        return false;
+    }
+    if write_what_is_queued(false).is_none() {
+        QUEUED.notify_one();
+    }
+    let deadline = if fsync_always() {
+        deadline
+    } else {
+        deadline.min(std::time::Instant::now() + ACK_WAIT_LIMIT)
+    };
+    loop {
+        match wait.try_recv() {
+            Ok(()) => return true,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => return false,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        }
+        if !running() || std::time::Instant::now() >= deadline {
+            BARRIERS.lock().remove(&id);
+            log_throttled!(
+                10,
+                crate::loglevel::WARN,
+                "AOF: what was queued did not reach {AOF_PATH} in time"
+            );
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Whether a reply to a write waits for its record to be synced to disk:
+/// the AOF is on, with `appendfsync always`.
+pub fn syncs_before_acks() -> bool {
+    AOF_ENABLED.load(Ordering::Relaxed) && fsync_always()
+}
+
 /// Answer the barriers taken: what came before them has been written.
 fn release_barriers(barriers: &mut Vec<u64>) {
     if barriers.is_empty() {
