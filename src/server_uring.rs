@@ -159,6 +159,13 @@ pub async fn handle_replica_connection_uring(
                 Some(p) => p,
                 None => break,
             };
+            // Tests: held here while the file `KIVIDB_TEST_STREAM_STALL`
+            // names exists (see `replica_client::test_stream_stall`).
+            if let Some(path) = crate::replication::replica_client::test_stream_stall() {
+                while path.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
             if pending_bytes.abandoned() {
                 // Let go of for falling too far behind: what is queued is
                 // freed now, as `replica_rx` is dropped, not sent (see

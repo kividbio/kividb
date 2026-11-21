@@ -1743,7 +1743,7 @@ async fn run_replication_session(
 /// working directory, while which exists this master sends its replicas
 /// nothing of the stream (it stays queued here), as with a replica that
 /// falls behind.
-fn test_stream_stall() -> Option<&'static std::path::Path> {
+pub(crate) fn test_stream_stall() -> Option<&'static std::path::Path> {
     static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     PATH.get_or_init(|| std::env::var_os("KIVIDB_TEST_STREAM_STALL").map(Into::into))
         .as_deref()
