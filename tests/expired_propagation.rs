@@ -81,13 +81,45 @@ impl Conn {
         buf
     }
 
+    /// One command. A server that answers `LOADING` (its dataset or indexes
+    /// are still being loaded after a start or restart) did not run it, so it
+    /// is asked again, for at most 10 seconds.
     fn cmd(&mut self, args: &[&str]) -> V {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reply = self.cmd_once(args);
+            match &reply {
+                V::Error(e) if e.starts_with("LOADING") && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => return reply,
+            }
+        }
+    }
+
+    fn cmd_once(&mut self, args: &[&str]) -> V {
         self.stream.write_all(&Self::encode(args)).unwrap();
         self.read()
     }
 
-    /// Several commands in one write, and their replies.
+    /// Several commands in one write, and their replies. Sent again when
+    /// every reply is `LOADING`: none of them ran. A mix means the load
+    /// ended inside the pipeline and the replies stand.
     fn pipeline(&mut self, commands: &[Vec<&str>]) -> Vec<V> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let replies = self.pipeline_once(commands);
+            let loading = replies
+                .iter()
+                .all(|r| matches!(r, V::Error(e) if e.starts_with("LOADING")));
+            if !loading || Instant::now() >= deadline {
+                return replies;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn pipeline_once(&mut self, commands: &[Vec<&str>]) -> Vec<V> {
         let mut buf = Vec::new();
         for args in commands {
             buf.extend_from_slice(&Self::encode(args));
