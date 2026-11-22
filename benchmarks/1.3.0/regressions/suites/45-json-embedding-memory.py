@@ -29,7 +29,10 @@ Per document: the growth of INFO used_memory over the load (settled, as
 `31-zset-memory` reads it), of VmRSS, and of used_memory_peak (what the
 load needed at its worst); MEMORY USAGE of 50 documents (`SAMPLES 0`, every
 element counted) and JSON.DEBUG MEMORY of their `$.embedding`. `get_same`
-is 1 when JSON.GET of a document returns the text it was written with.
+is how many of those 50 JSON.GET returns as the very text they were written
+with (both engines write small magnitudes as `0.0000643...` where Python
+wrote `6.43...e-05`, so not all 50; the first difference is kept in the raw
+data).
 `knn_hits` (index configurations) is the number of results of one KNN 10
 query, which must be 10. `plain` also keeps, in the raw data, what JSON.GET
 returns of a list of numbers written in different textual forms (`1` and
@@ -66,7 +69,8 @@ BATCH = 50
 SAMPLE = 50
 # Textual forms a number can be written in, for JSON.GET to print back.
 NUMBER_FORMS = ("[1,1.0,1.50,-0.0,0,1e5,1E5,1.5e-7,0.1,100000000000000000000,12345678901234567890,"
-                "-0.12345678901234567890,3.4028234663852886e38,1.0000000000000002,5e-324]")
+                "-0.12345678901234567890,3.4028234663852886e38,1.0000000000000002,5e-324,"
+                "6.437301635742188e-05,1e-05,1.5e-06,123e-9,1e21]")
 
 
 def field(info_reply, name):
@@ -175,13 +179,15 @@ def run(ctx):
         p0 = c.info("memory").get("used_memory_peak", 0)
 
         rng = np.random.default_rng(1001)
-        first_text = None
+        keys = ["doc:%d" % (i * docs // SAMPLE) for i in range(SAMPLE)]
+        sampled = {i * docs // SAMPLE for i in range(SAMPLE)}
+        sent = {}
         t = time.perf_counter()
         p = c.pipeline(transaction=False)
         for i in range(docs):
             text = doc_text(i, rng)
-            if i == 0:
-                first_text = text
+            if i in sampled:
+                sent["doc:%d" % i] = text
             p.execute_command("JSON.SET", "doc:%d" % i, "$", text)
             if (i + 1) % BATCH == 0:
                 p.execute()
@@ -199,19 +205,25 @@ def run(ctx):
         ctx.emit("rss_per_doc", (r1 - r0) * MIB / docs, "B", "lower", gate=info())
         ctx.emit("peak_per_doc", (max(peak, u1) - u0) / docs, "B", "lower", gate=info())
 
-        keys = ["doc:%d" % (i * docs // SAMPLE) for i in range(SAMPLE)]
         usage = [int(c.execute_command("MEMORY", "USAGE", k, "SAMPLES", "0")) for k in keys]
         ctx.emit("memory_usage_per_doc", sum(usage) / len(usage), "B", "lower", gate=info())
         dbg = [debug_memory(c, k) for k in keys]
         ctx.emit("json_debug_memory_embedding", sum(dbg) / len(dbg), "B", "lower", gate=info())
 
-        got = c.execute_command("JSON.GET", "doc:0")
-        got = got.decode() if isinstance(got, bytes) else got
-        ctx.emit("get_same", 1 if got == first_text else 0, "bool", "higher", gate=info())
-        if got != first_text:
-            at = next((k for k, (a, b) in enumerate(zip(got, first_text)) if a != b), min(len(got), len(first_text)))
-            ctx.raw["get_first_difference"] = {"at": at, "sent": first_text[max(0, at - 40):at + 40],
-                                               "got": got[max(0, at - 40):at + 40]}
+        same = 0
+        for k in keys:
+            got = c.execute_command("JSON.GET", k)
+            got = got.decode() if isinstance(got, bytes) else got
+            want = sent[k]
+            if got == want:
+                same += 1
+            elif "get_first_difference" not in ctx.raw:
+                at = next((j for j, (a, b) in enumerate(zip(got, want)) if a != b), min(len(got), len(want)))
+                ctx.raw["get_first_difference"] = {"key": k, "at": at, "sent": want[max(0, at - 40):at + 40],
+                                                   "got": got[max(0, at - 40):at + 40]}
+        ctx.emit("get_same", same, "docs", "higher", gate=info(),
+                 note="of %d sampled documents, JSON.GET returned the text written" % SAMPLE)
+        first_text = sent["doc:0"]
 
         if cfg != "plain":
             q = (rng.random(DIM, dtype=np.float32) * 2 - 1).tobytes()
