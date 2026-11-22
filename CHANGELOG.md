@@ -1532,6 +1532,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     at a member's own score reads the member's bytes through its entry).
     Sorted sets in a block, and `GET`/`SET`, as before.
 
+- **A large sorted set's order is a B+tree that counts its members
+  (#875).** The index of a sorted set past the block's limits, which holds
+  each member as the address of its entry in the set's table
+  (`CollectionTable`), is a B+tree of up to 32 members a leaf whose
+  internal nodes keep the number of members under each child, in place of
+  the `BTreeMap` it was. A member's rank (`ZRANK`, `ZREVRANK`) and the
+  members from a rank (`ZRANGE` by index, `ZREMRANGEBYRANK`) are found down
+  one path of the tree, where the members before them were counted one by
+  one. Members that come in order, one `ZADD` at a time, fill every node
+  but the last two of each level. `MEMORY USAGE` counts the index's nodes
+  exactly, where it estimated them from the index's length. Replies,
+  snapshots, the AOF and replication are as before.
+
 - **Lists take about half the memory, short elements a fifth (#297).** A
   list's elements are kept end to end in chunks of up to 64, each element
   between two copies of its length (one byte each for an element shorter
