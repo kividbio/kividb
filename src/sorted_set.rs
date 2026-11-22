@@ -451,6 +451,22 @@ impl SortedSetInner {
         }
     }
 
+    /// How many members `range_by_score` gives for `range` (`ZCOUNT`),
+    /// none of them read: a block's two indexes apart, or the large form's
+    /// count from its index.
+    pub fn count_by_score<R>(&self, range: R) -> usize
+    where
+        R: RangeBounds<(OrderedFloat<f64>, ZMember)>,
+    {
+        match &self.repr {
+            Repr::Packed(block) => {
+                let (from, to) = Self::packed_bounds(block, &range);
+                to.saturating_sub(from)
+            }
+            Repr::Large(large) => large.count(probe(range.start_bound()), probe(range.end_bound())),
+        }
+    }
+
     /// The indexes of a block that a range of keys covers: `from..to`.
     fn packed_bounds<R>(block: &PackedZset, range: &R) -> (usize, usize)
     where
@@ -1475,6 +1491,62 @@ mod tests {
             became_large[0] > 0 && became_large[1] > 0,
             "{became_large:?}"
         );
+    }
+
+    /// `count_by_score` is how many members `range_by_score` gives, in a
+    /// block and in the large form as the set grows past the block's limit:
+    /// each pair of the bounds `ZCOUNT` makes (a score's first key, open or
+    /// closed, or none) and some within one score; runs of a score across
+    /// leaves, infinities, signed zeros, empty and crossed ranges.
+    #[test]
+    fn counts_by_score_are_their_ranges_lengths() {
+        own_limits(Some([128, 64]));
+        let scores = [
+            f64::NEG_INFINITY,
+            -f64::MAX,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            f64::MAX,
+            f64::INFINITY,
+        ];
+        let key = |score: f64, member: &[u8]| (OrderedFloat(score), ZMember::from(member));
+        let mut keys: Vec<_> = scores.iter().map(|&s| key(s, b"")).collect();
+        keys.extend([-0.5, 0.5, 2.0].map(|s| key(s, b"")));
+        // A member held at 1, and a key past every member at 1.
+        keys.extend([key(1.0, b"5-m00007"), key(1.0, b"~")]);
+        let mut bounds = vec![Bound::Unbounded];
+        for key in &keys {
+            bounds.extend([Bound::Included(key.clone()), Bound::Excluded(key.clone())]);
+        }
+        let agree = |set: &SortedSetInner| {
+            for from in &bounds {
+                for to in &bounds {
+                    let range = (from.clone(), to.clone());
+                    assert_eq!(
+                        set.count_by_score(range.clone()),
+                        set.range_by_score(range).count(),
+                        "{from:?} to {to:?}, {} members",
+                        set.len()
+                    );
+                }
+            }
+        };
+        let n = if cfg!(miri) { 170 } else { 2_000 };
+        let mut set = SortedSetInner::new();
+        for i in 0..n {
+            let at = i % scores.len();
+            let member = format!("{at}-m{:05}", i / scores.len());
+            assert!(set.insert_bytes(member.as_bytes(), scores[at]));
+            let len = set.len();
+            let packed = set.encoding() == Encoding::Listpack;
+            assert_eq!(packed, len <= 128, "{len} members");
+            if len <= 2 || len.abs_diff(128) <= 1 || len.is_multiple_of(500) || len == n {
+                agree(&set);
+            }
+        }
+        own_limits(None);
     }
 
     #[test]

@@ -953,6 +953,13 @@ impl<O: ScoreOrder, A: Memory> Large<O, A> {
             .map(|(score, entry)| (entry.member(), score))
     }
 
+    /// How many members `range` hands out from `from` to `to`, counted by
+    /// the index's own range: no member is read.
+    #[inline]
+    pub fn count(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> usize {
+        self.index.range(from, to).count()
+    }
+
     /// Members and scores in no particular order: one walk of the table.
     #[inline]
     pub fn iter_unordered(&self) -> impl ExactSizeIterator<Item = (&[u8], f64)> {
@@ -2170,6 +2177,85 @@ mod tests {
         };
         let space = fill as u64 + fill as u64 / 5;
         differential(0x1405_7B7E_F767_814F, fill, space, steps, 5_000);
+    }
+
+    /// `count` is how many members `range` hands out, in both indexes, for
+    /// each pair of the bounds `ZCOUNT` makes (a score's first key, open or
+    /// closed, or none) and some within one score: runs of a score across
+    /// leaves, infinities, signed zeros, the largest finite scores, empty
+    /// and crossed ranges, and three levels of the counted index.
+    #[test]
+    fn a_count_is_its_ranges_length() {
+        let per = if cfg!(miri) { 12 } else { 100 };
+        let scores = [
+            f64::NEG_INFINITY,
+            -f64::MAX,
+            -2.0,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            2.0,
+            f64::MAX,
+            f64::INFINITY,
+        ];
+        // A run of `per` members to each score, added in a random order.
+        let mut keys: Vec<(f64, Vec<u8>)> = (0..scores.len())
+            .flat_map(|s| (0..per).map(move |i| (s, i)))
+            .map(|(s, i)| (scores[s], format!("{s}-m{i:03}").into_bytes()))
+            .collect();
+        let mut rng = Rng(19);
+        for i in (1..keys.len()).rev() {
+            keys.swap(i, rng.below(i as u64 + 1) as usize);
+        }
+        let mut a = Large::<BTreeOrder>::with_capacity(0);
+        let mut b = Large::<CountedOrder>::with_capacity(0);
+        for (score, member) in &keys {
+            assert!(a.insert(member, *score));
+            assert!(b.insert(member, *score));
+        }
+        same(&a, &b);
+        if !cfg!(miri) {
+            assert!(b.index.0.height() >= 3, "height {}", b.index.0.height());
+        }
+        // Each score and some between, at their first key; a member held
+        // within the run of 1, and a key past that run's members.
+        let held = format!("6-m{:03}", per / 2).into_bytes();
+        let none: &[u8] = b"";
+        let mut probes: Vec<(f64, &[u8])> = scores.iter().map(|&s| (s, none)).collect();
+        probes.extend([(-1.5, none), (0.5, none), (1.5, none), (3.0, none)]);
+        probes.extend([(1.0, &held[..]), (1.0, &b"~"[..])]);
+        let mut bounds = vec![Bound::Unbounded];
+        for &(score, member) in &probes {
+            let probe = Probe { score, member };
+            bounds.extend([Bound::Included(probe), Bound::Excluded(probe)]);
+        }
+        for &from in &bounds {
+            for &to in &bounds {
+                let counted = b.count(from, to);
+                assert_eq!(counted, b.range(from, to).count(), "{from:?} to {to:?}");
+                let crossed = match (from, to) {
+                    (
+                        Bound::Included(lo) | Bound::Excluded(lo),
+                        Bound::Included(hi) | Bound::Excluded(hi),
+                    ) => match order(lo.score, lo.member, hi.score, hi.member) {
+                        Ordering::Greater => true,
+                        Ordering::Equal => {
+                            matches!((from, to), (Bound::Excluded(_), Bound::Excluded(_)))
+                        }
+                        Ordering::Less => false,
+                    },
+                    _ => false,
+                };
+                if crossed {
+                    // A `BTreeMap` refuses such a range; nothing is in it.
+                    assert_eq!(counted, 0, "{from:?} to {to:?}");
+                } else {
+                    assert_eq!(a.count(from, to), a.range(from, to).count());
+                    assert_eq!(a.count(from, to), counted, "{from:?} to {to:?}");
+                }
+            }
+        }
     }
 
     /// Every member at one score: their bytes, read through the entries, are

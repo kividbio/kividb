@@ -1772,6 +1772,43 @@ fn assert_zset_holds(c: &mut Conn, key: &str, want: &[(f64, String)], gone: &[St
     }
 }
 
+/// The scores of the bound grids: infinite, signed zeros, the largest
+/// finite scores.
+const GRID_SCORES: [f64; 10] = [
+    f64::NEG_INFINITY,
+    -f64::MAX,
+    -2.0,
+    -1.0,
+    -0.0,
+    0.0,
+    1.0,
+    2.0,
+    f64::MAX,
+    f64::INFINITY,
+];
+
+/// The ends of the bound grids, open and closed, at those scores and
+/// between them.
+const GRID_ENDS: [&str; 17] = [
+    "-inf",
+    "(-inf",
+    "-1.7976931348623157e308",
+    "(-1.7976931348623157e308",
+    "-1",
+    "(-1",
+    "-0",
+    "(-0",
+    "0",
+    "(0",
+    "0.5",
+    "1",
+    "(1",
+    "1.7976931348623157e308",
+    "(1.7976931348623157e308",
+    "+inf",
+    "(+inf",
+];
+
 /// ZCOUNT and ZREMRANGEBYSCORE agree with a full scan for every pair of a
 /// set of bounds: open and closed, infinite, signed zeros, the largest
 /// finite scores, several members to a score.
@@ -1780,43 +1817,14 @@ fn zcount_and_zremrangebyscore_match_a_full_scan_at_every_bound() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
-    let scores = [
-        f64::NEG_INFINITY,
-        -f64::MAX,
-        -2.0,
-        -1.0,
-        -0.0,
-        0.0,
-        1.0,
-        2.0,
-        f64::MAX,
-        f64::INFINITY,
-    ];
+    let scores = GRID_SCORES;
     let mut all: Vec<(f64, String)> = Vec::new();
     for (i, score) in scores.iter().enumerate() {
         for which in ["a", "b", "c"] {
             all.push((*score, format!("{which}{i}")));
         }
     }
-    let ends = [
-        "-inf",
-        "(-inf",
-        "-1.7976931348623157e308",
-        "(-1.7976931348623157e308",
-        "-1",
-        "(-1",
-        "-0",
-        "(-0",
-        "0",
-        "(0",
-        "0.5",
-        "1",
-        "(1",
-        "1.7976931348623157e308",
-        "(1.7976931348623157e308",
-        "+inf",
-        "(+inf",
-    ];
+    let ends = GRID_ENDS;
     load_zset(&mut c, "src", &all);
     assert_eq!(
         c.cmds(&["ZCOUNT", "src", "-inf", "+inf"]).as_int(),
@@ -1843,6 +1851,48 @@ fn zcount_and_zremrangebyscore_match_a_full_scan_at_every_bound() {
             assert_zset_holds(&mut c, "z", &outside, &removed);
         }
     }
+}
+
+/// ZCOUNT at the same bounds in a block and in the large form: 40 members
+/// to a score (runs of a score across the large form's leaves of 32),
+/// counted at 120 members and again past the block's 128.
+#[test]
+fn zcount_matches_a_full_scan_at_every_bound_in_the_large_form() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    // A member to each score at a time: the first 120 hold every score.
+    let mut all: Vec<(f64, String)> = Vec::new();
+    for j in 0..40 {
+        for (i, score) in GRID_SCORES.iter().enumerate() {
+            all.push((*score, format!("m{j:02}-{i}")));
+        }
+    }
+    let grid = |c: &mut Conn, members: &[(f64, String)]| {
+        for min in GRID_ENDS {
+            for max in GRID_ENDS {
+                let inside = members
+                    .iter()
+                    .filter(|(score, _)| score_in(*score, min, max))
+                    .count();
+                assert_eq!(
+                    c.cmds(&["ZCOUNT", "z", min, max]).as_int() as usize,
+                    inside,
+                    "ZCOUNT {min} {max}, {} members",
+                    members.len()
+                );
+            }
+        }
+    };
+    load_zset(&mut c, "z", &all[..120]);
+    assert_eq!(c.cmds(&["OBJECT", "ENCODING", "z"]).as_str(), "listpack");
+    grid(&mut c, &all[..120]);
+    for (score, member) in &all[120..] {
+        c.cmds(&["ZADD", "z", &score.to_string(), member]);
+    }
+    assert_eq!(c.cmds(&["OBJECT", "ENCODING", "z"]).as_str(), "skiplist");
+    assert_eq!(c.cmds(&["ZCARD", "z"]).as_int(), 400);
+    grid(&mut c, &all);
 }
 
 #[test]
