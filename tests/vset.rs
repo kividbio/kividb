@@ -1390,7 +1390,7 @@ fn test_vsim_filter_reduce_and_quantization() {
     let info = info.as_array();
     let at = info
         .iter()
-        .position(|v| matches!(v, RespValue::Bulk(b) if b == b"quant-type"))
+        .position(|v| v.as_str() == "quant-type")
         .expect("quant-type");
     assert_eq!(info[at + 1].as_str(), "int8");
 }
@@ -1559,4 +1559,367 @@ fn vset_arguments_are_checked_as_the_module_checks_them() {
     );
     assert!(!c.cmds(&["VEMB", "v", "e", "RAW"]).is_error());
     assert_eq!(c.cmds(&["VEMB", "v", "e"]).as_array().len(), 2);
+}
+
+// â”€â”€ The graph (#710) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/// More elements than a set scans (`vset_graph::EXACT_BELOW`, 4,096): such a
+/// set is searched in its graph once the graph is made.
+const GRAPH_N: usize = 4096 + 600;
+
+/// A deterministic vector of `dim` components in [-1, 1).
+fn seeded(seed: u64, dim: usize) -> Vec<f32> {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    (0..dim)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        })
+        .collect()
+}
+
+fn vinfo_field(c: &mut Conn, key: &str, field: &str) -> RespValue {
+    let info = c.cmds(&["VINFO", key]);
+    let items = info.as_array();
+    let at = items
+        .iter()
+        .step_by(2)
+        .position(|k| k.as_str() == field)
+        .unwrap_or_else(|| panic!("no {field} in VINFO"));
+    match &items[at * 2 + 1] {
+        RespValue::Int(n) => RespValue::Int(*n),
+        RespValue::SimpleStr(s) => RespValue::SimpleStr(s.clone()),
+        RespValue::Bulk(b) => RespValue::Bulk(b.clone()),
+        other => panic!("{field}: {other:?}"),
+    }
+}
+
+/// A set of `GRAPH_N` elements `e<i>` of `dim` components, its graph made.
+fn graph_set(c: &mut Conn, key: &str, dim: usize, opts: &[&str]) {
+    for i in 0..GRAPH_N as u64 {
+        let blob = pack_f32(&seeded(i, dim));
+        let name = format!("e{i}");
+        let mut args: Vec<&[u8]> = vec![b"VADD", key.as_bytes(), b"FP32", &blob, name.as_bytes()];
+        args.extend(opts.iter().map(|o| o.as_bytes()));
+        assert_eq!(c.cmd(&args).as_int(), 1);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while vinfo_field(c, key, "index-type").as_str() != "HNSW" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{key}'s graph was not made"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn sim(c: &mut Conn, key: &str, v: &[f32], extra: &[&str]) -> Vec<String> {
+    let blob = pack_f32(v);
+    let mut args: Vec<&[u8]> = vec![b"VSIM", key.as_bytes(), b"FP32", &blob];
+    args.extend(extra.iter().map(|o| o.as_bytes()));
+    c.cmd(&args)
+        .as_array()
+        .iter()
+        .map(|v| v.as_str().to_string())
+        .collect()
+}
+
+/// `VSIM` of a large set searches its graph; `TRUTH` scans. Each finds what
+/// the other does, mostly, and scores an element alike.
+#[test]
+fn vsim_searches_the_graph_and_truth_scans() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let dim = 24;
+    graph_set(&mut c, "vs", dim, &[]);
+    assert_eq!(vinfo_field(&mut c, "vs", "size").as_int(), GRAPH_N as i64);
+    assert_eq!(vinfo_field(&mut c, "vs", "hnsw-m").as_int(), 16);
+    // Node slots used so far: the helpers may still be linking.
+    assert!(vinfo_field(&mut c, "vs", "hnsw-max-node-uid").as_int() > 0);
+
+    let mut found = 0;
+    for q in 0..50u64 {
+        let v = seeded(1_000_000 + q, dim);
+        let truth = sim(&mut c, "vs", &v, &["TRUTH", "COUNT", "10"]);
+        let graph = sim(&mut c, "vs", &v, &["COUNT", "10"]);
+        assert_eq!(truth.len(), 10);
+        assert_eq!(graph.len(), 10);
+        found += graph.iter().filter(|n| truth.contains(n)).count();
+        // A name and its score: the same whichever way it was found.
+        let t = sim(&mut c, "vs", &v, &["TRUTH", "COUNT", "10", "WITHSCORES"]);
+        let g = sim(&mut c, "vs", &v, &["COUNT", "10", "WITHSCORES"]);
+        let scores: std::collections::HashMap<&String, &String> =
+            t.chunks(2).map(|p| (&p[0], &p[1])).collect();
+        for pair in g.chunks(2) {
+            if let Some(s) = scores.get(&pair[0]) {
+                assert_eq!(*s, &pair[1], "query {q}: {}'s score", pair[0]);
+            }
+        }
+    }
+    let recall = found as f64 / 500.0;
+    assert!(recall >= 0.9, "recall@10 {recall}");
+
+    // An element added now is found by the next search of its vector, and
+    // one removed is not; a new vector is found where it now is.
+    let v = seeded(9_999_999, dim);
+    let blob = pack_f32(&v);
+    assert_eq!(c.cmd(&[b"VADD", b"vs", b"FP32", &blob, b"new"]).as_int(), 1);
+    assert_eq!(sim(&mut c, "vs", &v, &["COUNT", "1"]), ["new"]);
+    assert_eq!(c.cmd(&[b"VADD", b"vs", b"FP32", &blob, b"e5"]).as_int(), 0);
+    let near = sim(&mut c, "vs", &v, &["COUNT", "2"]);
+    assert!(
+        near.contains(&"e5".to_string()) && near.contains(&"new".to_string()),
+        "{near:?}"
+    );
+    assert_eq!(c.cmds(&["VREM", "vs", "new", "e5"]).as_int(), 2);
+    let after = sim(&mut c, "vs", &v, &["COUNT", "50"]);
+    assert!(!after.iter().any(|n| n == "new" || n == "e5"), "{after:?}");
+    let old5 = seeded(5, dim);
+    assert!(!sim(&mut c, "vs", &old5, &["COUNT", "50"]).contains(&"e5".to_string()));
+}
+
+/// The options Redis checks, checked as it checks them, and what they do.
+#[test]
+fn vsim_options_are_checked_and_honoured_as_redis_does() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    graph_set(&mut c, "vs", 8, &[]);
+    let err = |c: &mut Conn, args: &[&str]| match c.cmds(args) {
+        RespValue::Error(e) => e,
+        other => panic!("{args:?}: {other:?}"),
+    };
+    let base = ["VSIM", "vs", "ELE", "e1"];
+    for (extra, want) in [
+        (&["COUNT", "0"][..], "ERR invalid COUNT"),
+        (&["COUNT", "x"], "ERR invalid COUNT"),
+        (&["EF", "0"], "ERR invalid EF"),
+        (&["EF", "1000001"], "ERR invalid EF"),
+        (&["EPSILON", "0"], "ERR invalid EPSILON"),
+        (&["EPSILON", "x"], "ERR invalid EPSILON"),
+        (&["FILTER-EF", "0"], "ERR invalid FILTER-EF"),
+        (&["FOO"], "ERR syntax error in VSIM command"),
+        (&["COUNT"], "ERR syntax error in VSIM command"),
+    ] {
+        let args: Vec<&str> = base.iter().chain(extra).copied().collect();
+        assert_eq!(err(&mut c, &args), want, "{extra:?}");
+    }
+    assert_eq!(
+        err(&mut c, &["VSIM", "vs", "ELE", "nope"]),
+        "ERR element not found in set"
+    );
+    // COUNT past the set's size: all of it, by a scan.
+    let all = c.cmds(&["VSIM", "vs", "ELE", "e1", "COUNT", "100000"]);
+    assert_eq!(all.as_array().len(), GRAPH_N);
+    // EPSILON: only the elements within that distance (one less the score).
+    let near = c.cmds(&[
+        "VSIM",
+        "vs",
+        "ELE",
+        "e1",
+        "COUNT",
+        "50",
+        "WITHSCORES",
+        "EPSILON",
+        "0.05",
+    ]);
+    let items = near.as_array();
+    assert!(!items.is_empty());
+    assert_eq!(items[0].as_str(), "e1");
+    for pair in items.chunks(2) {
+        assert!(pair[1].as_f64() >= 0.95, "{:?}", pair);
+    }
+    let fewer = c.cmds(&[
+        "VSIM",
+        "vs",
+        "ELE",
+        "e1",
+        "COUNT",
+        "50",
+        "EPSILON",
+        "0.0000001",
+    ]);
+    assert_eq!(fewer.as_array().len(), 1);
+    // NOTHREAD and TRUTH take no value.
+    assert_eq!(
+        c.cmds(&["VSIM", "vs", "ELE", "e1", "NOTHREAD", "TRUTH", "COUNT", "1"])
+            .as_array()[0]
+            .as_str(),
+        "e1"
+    );
+}
+
+/// FILTER through the graph: only elements that pass, and with a filter
+/// that passes few, the graph walk gives up and the set is scanned: the
+/// answer is the exact one.
+#[test]
+fn vsim_filter_on_a_large_set() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let dim = 8;
+    graph_set(&mut c, "vs", dim, &[]);
+    for i in 0..GRAPH_N {
+        let attrs = format!(r#"{{"i":{i}}}"#);
+        assert_eq!(
+            c.cmds(&["VSETATTR", "vs", &format!("e{i}"), &attrs])
+                .as_int(),
+            1
+        );
+    }
+    for q in 0..20u64 {
+        let v = seeded(5_000 + q, dim);
+        let got = sim(
+            &mut c,
+            "vs",
+            &v,
+            &["COUNT", "10", "FILTER", ".i % 2 == 0", "WITHATTRIBS"],
+        );
+        assert_eq!(got.len(), 20);
+        for pair in got.chunks(2) {
+            let i: u64 = pair[0][1..].parse().unwrap();
+            assert_eq!(i % 2, 0, "{pair:?}");
+            assert_eq!(pair[1], format!(r#"{{"i":{i}}}"#));
+        }
+        // Three elements pass: all three, as a scan finds them.
+        let rare = sim(&mut c, "vs", &v, &["COUNT", "10", "FILTER", ".i < 3"]);
+        let exact = sim(
+            &mut c,
+            "vs",
+            &v,
+            &["COUNT", "10", "FILTER", ".i < 3", "TRUTH"],
+        );
+        assert_eq!(rare.len(), 3);
+        assert_eq!(rare, exact);
+    }
+}
+
+/// VLINKS reports the graph: a layer per level, the top one first, each
+/// neighbour with its score under WITHSCORES; VINFO's max-level is the
+/// graph's top layer. Only `WITHSCORES` may follow the element.
+#[test]
+fn vlinks_and_vinfo_report_the_graph() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    graph_set(&mut c, "vs", 8, &["M", "8"]);
+    assert_eq!(vinfo_field(&mut c, "vs", "hnsw-m").as_int(), 8);
+    let max_level = vinfo_field(&mut c, "vs", "max-level").as_int();
+    assert!(
+        max_level >= 1,
+        "a graph of {GRAPH_N} at M 8 has upper layers"
+    );
+    let mut tallest = 0;
+    for i in 0..200 {
+        let e = format!("e{i}");
+        let layers = c.cmds(&["VLINKS", "vs", &e]);
+        let layers = layers.as_array();
+        assert!(!layers.is_empty());
+        tallest = tallest.max(layers.len());
+        // Layer 0 holds up to 2 * M links (and some slack), none to itself.
+        let layer0 = layers.last().unwrap().as_array();
+        assert!(
+            !layer0.is_empty() && layer0.len() <= 2 * 8 + 4,
+            "{}",
+            layer0.len()
+        );
+        assert!(layer0.iter().all(|n| n.as_str() != e));
+        let scored = c.cmds(&["VLINKS", "vs", &e, "WITHSCORES"]);
+        let scored = scored.as_array();
+        // The same layers, unless the element was still waiting to be
+        // linked at one of the calls (one layer, its nearest elements).
+        assert!(
+            scored.len() == layers.len() || scored.len() == 1 || layers.len() == 1,
+            "{} and {} layers",
+            scored.len(),
+            layers.len()
+        );
+        for (plain, with) in layers.iter().zip(scored) {
+            let with = with.as_array();
+            // Helpers may still prune links between the two calls: the
+            // same shape, not the same list.
+            assert!(with.len().is_multiple_of(2), "{}", plain.as_array().len());
+            for pair in with.chunks(2) {
+                let s = pair[1].as_f64();
+                assert!((0.0..=1.0).contains(&s), "{s}");
+            }
+        }
+    }
+    assert!(tallest >= 2, "no element of 200 is above layer 0");
+    // The graph's top layer as it is now: the helpers may still have been
+    // linking when max-level was read above, and a node they linked since
+    // can be the graph's tallest (nothing is deleted, so it only grows).
+    let max_level = vinfo_field(&mut c, "vs", "max-level").as_int();
+    assert!(
+        tallest as i64 <= max_level + 1,
+        "{tallest} layers, max-level {max_level}"
+    );
+    assert!(c.cmds(&["VLINKS", "vs", "e1", "FOO"]).is_error());
+    assert!(
+        c.cmds(&["VLINKS", "vs", "e1", "WITHSCORES", "x"])
+            .is_error()
+    );
+    // A small set has no graph: one layer, its nearest elements.
+    for i in 0..5 {
+        let b = pack_f32(&seeded(i, 3));
+        c.cmd(&[b"VADD", b"small", b"FP32", &b, format!("s{i}").as_bytes()]);
+    }
+    assert_eq!(vinfo_field(&mut c, "small", "index-type").as_str(), "FLAT");
+    let one = c.cmds(&["VLINKS", "small", "s0"]);
+    assert_eq!(one.as_array().len(), 1);
+    assert_eq!(one.as_array()[0].as_array().len(), 4);
+}
+
+/// MEMORY USAGE counts the graph once the set has one.
+#[test]
+fn memory_usage_counts_the_graph() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let dim = 64;
+    graph_set(&mut c, "vs", dim, &["Q8"]);
+    let usage = c.cmds(&["MEMORY", "USAGE", "vs", "SAMPLES", "0"]).as_int();
+    // The int8 vectors alone are 64 bytes an element; the graph's f32 copy
+    // (256) and its links come on top.
+    let per = usage as f64 / GRAPH_N as f64;
+    assert!(per > 64.0 + 256.0 + 64.0, "{per} bytes an element");
+}
+
+/// Another `M` than the set's is refused, as Redis refuses it (16 when none
+/// is given); the set's own is taken.
+#[test]
+fn vadd_refuses_another_m_than_the_sets() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let add = |c: &mut Conn, e: &str, extra: &[&str]| {
+        let mut args = vec!["VADD", "m", "VALUES", "2", "1", "2", e];
+        args.extend_from_slice(extra);
+        c.cmds(&args)
+    };
+    assert_eq!(add(&mut c, "a", &["M", "32"]).as_int(), 1);
+    assert_eq!(add(&mut c, "b", &["M", "32"]).as_int(), 1);
+    for extra in [&[][..], &["M", "16"]] {
+        match add(&mut c, "c", extra) {
+            RespValue::Error(e) => {
+                assert_eq!(e, "ERR asked M value mismatch with existing vector set")
+            }
+            other => panic!("{extra:?}: {other:?}"),
+        }
+    }
+    assert_eq!(c.cmds(&["VCARD", "m"]).as_int(), 2);
+    // A set made without M has 16: M 16 is its own.
+    assert_eq!(
+        c.cmds(&["VADD", "d", "VALUES", "2", "1", "2", "x"])
+            .as_int(),
+        1
+    );
+    assert_eq!(
+        c.cmds(&["VADD", "d", "VALUES", "2", "1", "2", "y", "M", "16"])
+            .as_int(),
+        1
+    );
 }

@@ -38,7 +38,7 @@
 //! as the key does (`backfill_from_db_progress`), as it does for the
 //! writes an AOF replays after its snapshot.
 
-use super::{DistanceMetric, HnswIndex, HnswNode, KnnResult, distance_prenorm};
+use super::{DistanceMetric, HnswIndex, HnswNode, KnnResult};
 use ahash::AHashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -259,6 +259,15 @@ impl Backlog {
         Some((w.ticket, Arc::clone(&w.vector), w.doc))
     }
 
+    /// `key`'s vector, if `ticket` is still its own, has no job queued:
+    /// its writer links it ([`put_ordered`]).
+    fn unqueue(&self, key: &str, ticket: u64) {
+        let mut waiting = self.waiting.write();
+        if let Some(w) = waiting.get_mut(key).filter(|w| w.ticket == ticket) {
+            w.queued = false;
+        }
+    }
+
     /// Take `key`'s vector out if `ticket` is still its own: it is linked.
     fn done(&self, key: &str, ticket: u64) {
         let mut waiting = self.waiting.write();
@@ -356,6 +365,59 @@ pub(super) fn write_one(
     POOL.ready.notify_one();
 }
 
+/// A vector set's write of `vector` (as the graph stores it) for `key`,
+/// made under the set's own lock, which orders the writes of every element
+/// of the set: the vector waits in the backlog from here on, so a search
+/// finds it, and a helper links it. `Some(ticket)` when no helper will (none
+/// runs, the backlog is full, or the graph has no slots yet): the caller
+/// links it with [`link_ordered`] once it has let go of the set's lock, so
+/// that a long link never holds the set. A later write of the key that
+/// comes in between makes the ticket stale, and that write links its own.
+pub(crate) fn put_ordered(
+    index: &Arc<HnswIndex>,
+    key: &str,
+    vector: Arc<[f32]>,
+    metric: &DistanceMetric,
+) -> Option<u64> {
+    let most = limit(vector.len());
+    let first = index.slots().is_none_or(|s| s.dim() != vector.len());
+    let (ticket, waiting, job) = index.backlog.put(key, vector, super::postings::NO_DOC);
+    let own = first
+        || helpers() == 0
+        || waiting > most
+        || (job.is_some() && index.backlog.queued() >= 2 * most);
+    if own {
+        if job.is_some() {
+            // No job goes into the queue for it: the next write of the key
+            // queues one of its own.
+            index.backlog.unqueue(key, ticket);
+        }
+        return Some(ticket);
+    }
+    let key = job?; // else the key's queued job takes this vector
+    index.backlog.jobs.fetch_add(1, AcqRel);
+    let mut jobs = POOL.jobs.lock();
+    jobs.push_back(Job {
+        index: Arc::downgrade(index),
+        key,
+        metric: metric.clone(),
+    });
+    drop(jobs);
+    POOL.ready.notify_one();
+    None
+}
+
+/// Link the vector [`put_ordered`] left to its caller, if `ticket` is
+/// still the key's.
+pub(crate) fn link_ordered(
+    index: &Arc<HnswIndex>,
+    key: &str,
+    ticket: u64,
+    metric: &DistanceMetric,
+) {
+    link_own(index, key, ticket, metric);
+}
+
 /// Link `key`'s waiting vector into the graph if `ticket` is still its own:
 /// a write that found the backlog full links its own vector.
 fn link_own(index: &Arc<HnswIndex>, key: &str, ticket: u64, metric: &DistanceMetric) {
@@ -390,6 +452,10 @@ fn insert_then_done(
     #[cfg(test)]
     crate::test_hooks::at("backlog: linked");
     index.backlog.done(key, ticket);
+    // A vector set's graph: the set may now let go of its own copy.
+    if let Some(linked) = &index.linked {
+        linked.lock().push(Arc::from(key));
+    }
 }
 
 /// The `k` nearest of `found` (the graph's, nearest first) and the
@@ -401,6 +467,7 @@ pub(crate) fn merge(
     waiting: &Snapshot,
     query: &[f32],
     metric: &DistanceMetric,
+    encoding: super::quant::Encoding,
     mut found: Vec<KnnResult>,
     k: usize,
     mut admit: Option<&mut dyn FnMut(&HnswNode) -> bool>,
@@ -422,7 +489,7 @@ pub(crate) fn merge(
         if vector.len() != query.len() {
             continue;
         }
-        let d = distance_prenorm(metric, query, vector);
+        let d = encoding.distance(metric, query, vector);
         if near.len() >= k && d.total_cmp(&bound).is_ge() {
             continue;
         }
@@ -537,6 +604,14 @@ pub fn configure(threads: IndexThreads) {
     *CONFIGURED.lock() = threads;
 }
 
+/// Whether `search-index-threads` is 0: no thread links vectors in the
+/// background, a write links its own (`auto` with no helper still lets a
+/// vector set's own linkers run, see `vset_graph::hand_over`).
+pub(crate) fn none_configured() -> bool {
+    static NONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NONE.get_or_init(|| matches!(*CONFIGURED.lock(), IndexThreads::Count(0)))
+}
+
 /// With fewer CPUs than this, `auto` starts no helper.
 pub const AUTO_FROM_CPUS: usize = 8;
 
@@ -594,6 +669,11 @@ pub fn auto_most(cpus: usize, quota: bool) -> usize {
 /// How many helpers link vectors, started once, on the first call:
 /// `search-index-threads`, or by [`auto_most`] for `auto`, of which
 /// [`auto_helpers`]'s count take jobs while the server serves.
+/// Whether helper threads link vectors (`search-index-threads`).
+pub(crate) fn helpers_running() -> bool {
+    helpers() > 0
+}
+
 fn helpers() -> usize {
     START.call_once(|| {
         // The process's CPUs: the first write may come from a worker bound
@@ -1822,7 +1902,7 @@ mod concurrency {
     fn dist(metric: &DistanceMetric, q: &[f32], v: &[f32]) -> f32 {
         let s = super::super::as_stored(metric, v.to_vec());
         let q = super::super::as_stored(metric, q.to_vec());
-        distance_prenorm(metric, &q, &s)
+        crate::vector::distance_prenorm(metric, &q, &s)
     }
 
     /// Per key: every state written to it, in order (None: deleted), and how

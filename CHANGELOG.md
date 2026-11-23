@@ -146,6 +146,53 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`VSIM` searches an HNSW graph of the vector set (#710).** A set of 4,096
+  elements or more gets a graph over its elements (the one `FT.SEARCH`'s
+  vector fields use, one per set), and `VSIM` explores `EF` candidates in it
+  (100 unless given, Redis's default); `TRUTH` scans every element, and a
+  smaller set is always scanned (exact, and at that size as fast). A set's
+  graph holds each vector as the set stores it (`Q8` or `BIN` bytes, or an
+  f32 set's floats bit for bit), and the vector is kept once, in the graph;
+  scores do not depend on how an element was found. With no helper threads
+  (`search-index-threads` 0, or `auto` below 8 CPUs) a set's vectors are
+  linked by threads of its own (half the CPUs, at most four). `EF`,
+  `EPSILON`, `FILTER-EF` and `TRUTH` on `VSIM`, and `M` and `EF` on the
+  `VADD` that makes a set, do what they do in Redis (another `M` than the
+  set's is refused), and `VSIM`'s options are checked as Redis checks them.
+  `VINFO` gives Redis's fields (`hnsw-m`, `size`, `max-level`,
+  `attributes-count`, ...; simple-string names, a map in RESP3) and `VLINKS`
+  the element's links per layer, top layer first. Two replies change as
+  Redis has them: `VLINKS ... WITHSCORES` gives each score as a double
+  (RESP3) or Redis's 17-digit string (RESP2), where it was a 6-decimal
+  string, and refuses anything after `WITHSCORES`; `VSIM ... ELE` of an
+  element the set does not hold is `ERR element not found in set` (it was
+  `ERR element not found in vector set`). Writes change the graph in their own order, so an element a
+  `VADD` was answered for is found by the next `VSIM`, and a removed one
+  never is. The graph is not saved: it is made again from the vectors after
+  a load, `RESTORE`, `COPY` or full sync, while `VSIM` scans, so snapshots
+  stay readable by 1.2 (1,000,000 128-d vectors: loaded in 0.8 s, the graph
+  made 89 s later; Redis loads its saved graph in 9.2 s). An AOF replay
+  writes no graph either: 1,000,000 `VADD`s replay in 4.2 s (3.6 s with no
+  graph at all) and the graph follows in the background.
+  On a D8s_v5, `Q8`, `COUNT 10` at the defaults, against Redis 8.10.2 in the
+  same session, queries a second at 1 / 8 / 50 connections and bytes a
+  vector: 100,000 SIFT vectors (128-d) 3,256 / 13,921 / 16,506 and 612 B
+  (exact scan before: 148 / 589 / 550 and 224 B; Redis 2,262 / 8,086 /
+  8,842 and 885 B), recall@10 0.975 (Redis 0.973); 1,000,000 SIFT vectors
+  2,362 / 9,921 / 11,748 and 754 B (before 9 / 35 / 35; Redis 1,697 / 6,532
+  / 7,245 and 885 B), recall 0.959 (Redis 0.953); 100,000 glove-100 vectors
+  2,906 / 13,015 / 14,290 and 548 B (Redis 1,772 / 6,908 / 7,671 and 869 B),
+  recall 0.896 (Redis 0.874); 100,000 LAION vectors (768-d) 2,132 / 8,805 /
+  9,956 and 1,254 B (Redis 1,597 / 6,015 / 6,626 and 1,525 B), recall 0.969
+  (Redis 0.967); `NOQUANT` on both, 100,000 SIFT vectors 2,552 / 11,472 /
+  12,606 and 997 B (Redis 2,080 / 7,519 / 8,235 and 1,269 B), 100,000 LAION
+  vectors 1,306 / 5,017 / 5,439 and 3,564 B (Redis 1,160 / 4,505 / 4,848 and
+  3,829 B). `VADD` links each element into the graph: 18,924 SIFT
+  vectors a second from 4 loading connections (19,294 from one and 18,856
+  from eight: the seven helper threads link them, all busy; before, with
+  no graph, 248,544; Redis 4,263). Regression suite `44-vector-sets-hnsw`
+  measures it. @Parikalp-Bhardwaj pointed this out in #697.
+
 - **`cluster-announce-client-ipv4` and `cluster-announce-client-ipv6` (#847),
   as in Valkey 8.** The address a client is told to reach a node at, where it
   is not the one nodes use between themselves: a client connected over IPv6
@@ -517,6 +564,53 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dataset digest lets the replica continue without a full sync.
 
 ### Changed
+
+- **Plain commands are answered between scripts that run alone (#880).** A quick script that runs alone (its key has no hash tag, or
+  `lua-parallel-scripts no`) and comes while another one is running is run
+  right after it, by the thread running that one, in a run: the first
+  script holds the other commands back where it would on its own, after its
+  checks, and they stay held back for the scripts after it until 200 µs
+  have passed and the script then running has finished. The other commands
+  wait once for a run instead of once for each script; the script-runner
+  thread takes only the scripts left over. A script that has to wait (a
+  slot handoff, a `MIGRATE` of its key) lets the other commands in while it
+  waits. Nextcloud's mix (`GET` 40, `TTL` 15, `INCRBY` 15, `EXPIRE` 15,
+  `EVALSHA` of its compare-and-delete on a key with no tag 12, `SETEX` 3;
+  500 connections, `--threads 4` on 4 CPUs of an Azure `Standard_D8s_v5`,
+  io_uring): 321k ops/s with a p99 of 2.45 ms, against 289k at 8.45 ms for
+  the build before (the same mix with no script: 2.53 ms); at 200
+  connections the p99 is 0.90 ms, against 4.38. Each script is still alone:
+  no other command runs beside it or between two of them, and replicas and
+  the AOF get the scripts in the order they ran. `INFO stats` counts the
+  runs and the scripts' takes of the gate in them (`scripts_alone_runs`,
+  `scripts_in_alone_runs`; a script sent back to wait and run again takes
+  it twice). A script with no hash tag still runs one at a
+  time; see [docs/SCRIPTS.md](docs/SCRIPTS.md) and docs/PERFORMANCE.md.
+
+- **A queued script's connection looks for its reply instead of sleeping
+  until woken (#900).** A quick script that runs alone and was queued
+  behind another one is waited for by its connection between turns of its
+  thread's loop, for up to 400 µs, and only then with a waker: the thread
+  serves its other connections meanwhile, and the thread running the
+  scripts does not wake it for each reply. On io_uring a thread hands its
+  connections' reads and writes to the kernel once every 20 µs while any of
+  them looks. A connection that looks and finds nobody running scripts and
+  some queued runs them, as the thread that ran its own script does (not
+  while a slot handoff or a `MIGRATE` is under way). Connections look only
+  where the CPUs the process may use (its mask and its quota) leave one
+  beyond the workers and the script-runner thread (the default worker
+  count, half the CPUs, does on 4 CPUs or more; `--threads 4` on 4 CPUs
+  does not), and a thread whose looks keep missing (8 in a row) stops
+  looking for 1 ms to 100 ms. A queued script's arguments are copied into
+  one buffer. Each script still runs alone, in the queue's order, and
+  replicas and the AOF get them in the order they ran. centrifuge v0.40.1's
+  Redis broker benchmarks (`rd_single`, 4 pipelined connections, `--threads
+  2` on 4 CPUs of an Azure `Standard_D8s_v5`, ns/op as a ratio to Redis
+  8.10.2, PARALLELISM 16 / 128, medians of 3): `History_1Ch` list 1.31x /
+  1.32x to 0.91x / 0.97x, stream 0.91x / 0.88x to 0.66x / 0.66x;
+  `Publish_History_1Ch` list 1.27x / 1.49x to 0.97x / 1.03x, stream 1.13x /
+  1.12x to 0.75x / 0.79x; `Pub_History_ManyCh` list 1.34x / 1.43x to 0.95x /
+  1.03x, stream 1.16x / 1.21x to 0.81x / 0.85x. See docs/PERFORMANCE.md.
 
 - **Hash field names are bytes in memory, and ACL key and channel patterns
   are bytes (#510).** Last of the four steps of #437:
@@ -1448,7 +1542,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     begun before an upgrade still ends, but may miss or repeat members.
   - `MEMORY USAGE` of a sorted set is immediate whatever `SAMPLES` says (the
     table exact, the index estimated from its length), and eviction's
-    estimate of what a sorted set frees is exact. Snapshots, the AOF,
+    estimate of what a sorted set frees is an exact lower bound. Snapshots, the AOF,
     replication, `DUMP`/`RESTORE` and `MIGRATE` are unchanged in both
     directions with 1.2.2, and `DEBUG DIGEST-VALUE` of a set gives the
     digest it gave before this change.
@@ -1595,6 +1689,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   measurable change in `GET`/`SET` p99.9 during the pass.
   Thanks @Parikalp-Bhardwaj.
 
+- **Active defrag gets back the free room inside full slabs, and starts on
+  slab waste (#240).** A slab is used for new blocks again once a quarter of
+  it is free; the free blocks of the slabs fuller than that are what a light
+  delete/refill churn, or the writes whose old values a snapshot held, leave
+  behind. Active defrag now also empties the full slabs with at least
+  `active-defrag-full-slab-free-percent` (12) of their blocks free, sparsest
+  first, from a list of full slabs each size class keeps in the slabs'
+  headers (changed only when a slab's state changes, under the class's
+  lock), and it starts when the free blocks inside the slabs are more than
+  `active-defrag-slab-waste-percent` (10) of them and more than
+  `active-defrag-slab-waste-bytes` (16 MiB), besides
+  `active-defrag-threshold-lower` and `active-defrag-ignore-bytes`. What it
+  moves goes into the room of the class's partial slabs first; a round's new
+  slabs are kept to a 128th of the slabs, or to what is left below the most
+  the slabs have taken before (up to an eighth). No pass starts until the
+  blocks in the slabs have changed by less than a 32nd of them each second
+  for 5 seconds, and a round that sees such a change ends there; the
+  slab-waste trigger waits while a snapshot, an AOF rewrite or a backup is
+  written, and after a pass that got little back or was cut short it stays
+  off for 10 s, doubling up to a minute. The defrag thread now rests after
+  every 100 us of work instead of every millisecond: with a millisecond,
+  `GET`/`SET` p99.9 during a pass was 1.2-1.3 ms where 1.2.2 had 0.6. New
+  `INFO memory` fields: `value_slab_full_free_bytes`,
+  `active_defrag_passes`, `active_defrag_slabs_emptied`,
+  `active_defrag_last_pass_ms`. Measured on an Azure D8s_v5
+  (`benchmarks/1.3.0/regressions/suites/43-slab-churn.py`), RSS 60 s after
+  three cycles of deleting and rewriting a random part of the keys, against
+  what was loaded: 1,000,000 keys of 1 KB, 10 % a cycle, 1.03x (1.2.2:
+  1.15x; Redis 8.10.2 1.00x at 1.25x KiviDB's load); 20 %, 1.05x (1.10x),
+  with the peak during the churn 1.14x where 1.2.2's own pass took it to
+  1.28x; 100-byte values 1.03x and 1.05x (1.16x and 1.15x). The peak is
+  1.2-2.1 % above the same churn with active defrag off. 2,000,000 keys of
+  1 KB under 40,000 SETs a second, 30 s after `BGSAVE`, `BGREWRITEAOF` and
+  the writes: 2,208 MiB (1.2.2: 2,367; Redis 2,584), the highest RSS through
+  them 2,564 MiB (2,861). During a pass under reads and overwrites, `GET`
+  and `SET` p99 stay at 0.49 ms, as in the seconds before it, and p99.9 is
+  0.63 and 0.67 ms (1.2.2: 0.56 and 0.85, medians of three trials); a pass
+  over 700,000 keys takes about 19 s at the default 10 % of a core. Values
+  of 100 B to 16 KB, mostly in the system allocator, are unchanged. Design
+  agreed with @Parikalp-Bhardwaj, whose measurement showed that the free
+  room a `BGSAVE` leaves is in full slabs.
+
 - **`key-access-tracking yes` costs about 1.5% of a pipelined `GET` instead
   of about 10% (#21).** The setting that keeps `OBJECT IDLETIME`, `OBJECT
   FREQ` and `RESTORE ... IDLETIME` working under `noeviction`, as Redis does,
@@ -1725,6 +1861,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   move (callgrind, 0.1%).
 
 ### Fixed
+
+- **Vectors written at once into an empty HNSW index all link into its
+  graph.** Inserts that find the graph empty take turns: the first is the
+  entry point and the others link to it, whether they come from a vector
+  set's linking threads or from several connections writing an index's
+  first documents (#710).
 
 - **Memory a heavy write load leaves in the allocator goes back to the
   system once the server is idle, even when nothing was deleted (#245).**

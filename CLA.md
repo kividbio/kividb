@@ -1,10 +1,5 @@
 # KiviDB Contributor License Agreement
 
-> **Template — not yet reviewed by counsel.** This agreement is a template modelled on the
-> Apache Software Foundation's Individual and Corporate Contributor License Agreements.
-> KIVIDB PRIVATE LIMITED should have it reviewed by its legal counsel before relying on it.
-> Until that review is done, its wording may change.
-
 This document contains two agreements:
 
 - **Part A: Individual Contributor License Agreement**, for anyone who submits a

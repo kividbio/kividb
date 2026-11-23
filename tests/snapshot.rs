@@ -739,14 +739,14 @@ fn kdb_vectorset_basic() {
     vs.entries.insert(
         "vec_a".into(),
         VSetEntry {
-            vector: vec![1.0f32, 2.0, 3.0].into(),
+            vector: Some(vec![1.0f32, 2.0, 3.0].into()),
             attrs: None,
         },
     );
     vs.entries.insert(
         "vec_b".into(),
         VSetEntry {
-            vector: vec![4.0f32, 5.0, 6.0].into(),
+            vector: Some(vec![4.0f32, 5.0, 6.0].into()),
             attrs: Some(r#"{"label":"b"}"#.into()),
         },
     );
@@ -759,11 +759,17 @@ fn kdb_vectorset_basic() {
             assert_eq!(inner.entries.len(), 2);
 
             let a = inner.entries.get(&b"vec_a"[..]).unwrap();
-            assert_eq!(a.vector.as_f32().unwrap(), [1.0f32, 2.0, 3.0]);
+            assert_eq!(
+                a.vector.as_ref().unwrap().as_f32().unwrap(),
+                [1.0f32, 2.0, 3.0]
+            );
             assert!(a.attrs.is_none());
 
             let b = inner.entries.get(&b"vec_b"[..]).unwrap();
-            assert_eq!(b.vector.as_f32().unwrap(), [4.0f32, 5.0, 6.0]);
+            assert_eq!(
+                b.vector.as_ref().unwrap().as_f32().unwrap(),
+                [4.0f32, 5.0, 6.0]
+            );
             assert_eq!(b.attrs.as_deref().unwrap(), r#"{"label":"b"}"#);
         }
         _ => panic!("wrong type"),
@@ -783,7 +789,7 @@ fn quantized_set(quant: kividb::vector::quant::Quant, chosen: bool) -> VectorSet
         vs.entries.insert(
             format!("e{n}").as_str().into(),
             VSetEntry {
-                vector: StoredVector::quantize(quant, v).unwrap(),
+                vector: Some(StoredVector::quantize(quant, v).unwrap()),
                 attrs: (n == 2).then(|| "{}".into()),
             },
         );
@@ -892,7 +898,7 @@ fn kdb_vectorset_legacy_wrong_length_is_refused() {
         set.entries.insert(
             (*name).into(),
             VSetEntry {
-                vector: vector(n).into(),
+                vector: Some(vector(n).into()),
                 attrs: Some(format!("{{\"n\":{n}}}").into()),
             },
         );
@@ -1001,7 +1007,7 @@ fn kdb_vectorset_impossible_metadata_is_refused() {
         let v: Vec<f32> = (0..dim)
             .map(|i| if i % 2 == 0 { 1.0 } else { -2.0 })
             .collect();
-        let vector = StoredVector::quantize(quant, v).unwrap();
+        let vector = Some(StoredVector::quantize(quant, v).unwrap());
         set.entries.insert(
             "a".into(),
             VSetEntry {
@@ -1072,7 +1078,7 @@ fn kdb_vectorset_high_dim() {
     vs.entries.insert(
         "embedding".into(),
         VSetEntry {
-            vector: vec.clone().into(),
+            vector: Some(vec.clone().into()),
             attrs: None,
         },
     );
@@ -1082,7 +1088,12 @@ fn kdb_vectorset_high_dim() {
         KiviDBValue::VectorSet(vs) => {
             let inner = vs.read();
             assert_eq!(inner.dim, dim);
-            let loaded_vec = inner.entries[&b"embedding"[..]].vector.as_f32().unwrap();
+            let loaded_vec = inner.entries[&b"embedding"[..]]
+                .vector
+                .as_ref()
+                .unwrap()
+                .as_f32()
+                .unwrap();
             assert_eq!(loaded_vec.len(), dim);
             // f32 bit-exact check
             for (orig, loaded) in vec.iter().zip(loaded_vec.iter()) {
@@ -1100,7 +1111,7 @@ fn kdb_vectorset_f32_precision() {
     vs.entries.insert(
         "edge".into(),
         VSetEntry {
-            vector: vec![f32::INFINITY, f32::NEG_INFINITY, f32::MIN, f32::MAX].into(),
+            vector: Some(vec![f32::INFINITY, f32::NEG_INFINITY, f32::MIN, f32::MAX].into()),
             attrs: None,
         },
     );
@@ -1112,7 +1123,12 @@ fn kdb_vectorset_f32_precision() {
     match v {
         KiviDBValue::VectorSet(vs) => {
             let inner = vs.read();
-            let vec = inner.entries[&b"edge"[..]].vector.as_f32().unwrap();
+            let vec = inner.entries[&b"edge"[..]]
+                .vector
+                .as_ref()
+                .unwrap()
+                .as_f32()
+                .unwrap();
             assert!(vec[0].is_infinite() && vec[0] > 0.0);
             assert!(vec[1].is_infinite() && vec[1] < 0.0);
             assert_eq!(vec[2].to_bits(), f32::MIN.to_bits());
@@ -1269,7 +1285,7 @@ fn kdb_all_types_together() {
     vs.entries.insert(
         "e".into(),
         VSetEntry {
-            vector: vec![1.0, 2.0].into(),
+            vector: Some(vec![1.0, 2.0].into()),
             attrs: None,
         },
     );

@@ -165,6 +165,60 @@ system as soon as its last member or field is removed. `INFO memory` reports tho
 `value_slab_pool_bytes`, apart from `value_slab_bytes` (the keyspace's slabs, which defrag
 compacts).
 
+### Active defrag
+
+Keys' entries, and string values kept apart from them, whose block (header included) is at
+most 4 KiB live in 64 KiB slabs of one block size each. A slab nobody is filling is used for new blocks again once a quarter of it is free;
+until then its free blocks are memory the process holds. Active defrag (`activedefrag`, on by
+default) moves values out of the sparsest slabs so that they empty and their pages go back to
+the system: the slabs a quarter free and more, and the full ones with at least
+`active-defrag-full-slab-free-percent` of their blocks free. What it moves goes into the room
+of the other slabs of its size first, and only then into new slabs. It runs on a thread of its
+own, at most `active-defrag-cycle-max` per cent of one core, resting after every 100 us of
+work, and lets go of a shard between batches, so a command waits for at most one batch of
+moves.
+
+A pass starts when either of two triggers is met, and stops when the waste is under half of
+both:
+
+| setting | default | |
+|---|---|---|
+| `active-defrag-threshold-lower` | `20` | the slabs hold this many per cent more than the values in them ... |
+| `active-defrag-ignore-bytes` | `64mb` | ... and that is more than this many bytes (both as in Redis) |
+| `active-defrag-slab-waste-percent` | `10` | or the free room inside the slabs is more than this many per cent of them ... (`0` turns this trigger off) |
+| `active-defrag-slab-waste-bytes` | `16mb` | ... and more than this many bytes |
+| `active-defrag-full-slab-free-percent` | `12` | a full slab is emptied when at least this many per cent of its blocks are free (`0` or `100`: full slabs are left alone) |
+| `active-defrag-cycle-max` | `10` | the most of one core it uses, a percentage |
+
+The slab-waste trigger counts free blocks only: the end of a slab that no block fits in (3,520
+bytes of a slab of 3,648-byte blocks) is no room any pass gets back.
+
+No pass starts until the bytes of the blocks in the slabs have changed by less than a 32nd of
+the slabs each second for 5 seconds in a row (a large delete, or its refill: the writes take
+the free room themselves), and a round that sees such a change while it runs (it looks every
+10 ms) ends there, with its pass; the next pass then waits for 5 calm seconds again. A round
+moves values out of a set of slabs in one look through the keys; what it puts in new slabs is
+held twice until the round ends, so a round takes at most a 128th of the slabs' size in new
+slabs (at least 1 MiB), or what is left below the most the slabs have taken before, up to an
+eighth (that mark comes down when the slabs fall under half of it, after a `FLUSHALL` for
+example): in the recorded runs the peak during a churn is 1.2-2.1 % above the same churn with
+active defrag off. While a snapshot (`BGSAVE`), an AOF rewrite or a backup is being written,
+the slab-waste trigger waits (the values a snapshot holds cannot move, and the old values of
+what is written meanwhile are freed when it ends); the ratio trigger does not, so a server
+that saves all the time is still compacted. A pass that the slab-waste trigger started and
+that got little back (the slabs it emptied, less the new ones it took, under one in 32 of
+those it emptied), or that a delete cut short, keeps that trigger off for 10 seconds, then
+twice as long each time in a row, up to a minute. All of these change at run time with
+`CONFIG SET`.
+
+`INFO memory` shows the slabs (`value_slab_bytes`), the values in them
+(`value_slab_live_bytes`), the free blocks of the full slabs (`value_slab_full_free_bytes`), and
+active defrag's work: `active_defrag_running`, `active_defrag_hits` (values moved),
+`active_defrag_misses` (values left where they were because something else held them, such as a
+snapshot being written), `active_defrag_passes`, `active_defrag_slabs_emptied` and
+`active_defrag_last_pass_ms` (how long the last pass took). `CONFIG RESETSTAT` sets the counts
+to 0.
+
 Persistence (snapshots and the AOF) is described in [PERSISTENCE.md](PERSISTENCE.md),
 including `rdbcompression` (default `no`; `yes` writes snapshots compressed, which 1.2 cannot read) and the
 `kividb kdb-decompress <in> <out>` and `kividb kdb-compress <in> <out>` tools, which convert a
@@ -247,6 +301,13 @@ documents to 1.34x (1.67x); clients served meanwhile see the three, as before
 A number starts exactly that many on any machine, and all of them always link. The log
 says how many started, on the first write that needs them; `FT.INFO` shows
 `hnsw_index_threads` (started) and `hnsw_index_threads_active` (linking now).
+
+Vector sets' graphs (`VADD`) use the same helpers. When `auto` starts none, a vector set's
+writes are linked by threads of their own instead (`vset-link-N`, half the CPUs, one to
+four, started on the first such write): the writes of one key run one after another, and
+each linking its own vector would link a set one vector at a time (on a 4-vCPU D4s_v5,
+2,664 `VADD`s a second against 6,608 with them). `0` starts neither: each `VADD` links its
+own vector.
 
 So on a server of fewer than 8 CPUs builds run at 1.2's speed by default, and
 `search-index-threads 1` (or more) trades serving latency for build speed. The helpers take

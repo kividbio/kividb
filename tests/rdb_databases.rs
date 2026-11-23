@@ -171,8 +171,22 @@ impl Conn {
     }
 
     /// A command, and its reply as text: a bulk string's bytes, a simple
-    /// string or error line, an integer; nil as `(nil)`.
+    /// string or error line, an integer; nil as `(nil)`. A server that
+    /// answers `LOADING` (its dataset or indexes are still being loaded
+    /// after a start or restart) did not run it, so it is asked again, for
+    /// at most 10 seconds.
     fn cmd(&mut self, args: &[&str]) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reply = self.cmd_once(args);
+            if !reply.starts_with("LOADING") || Instant::now() >= deadline {
+                return reply;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn cmd_once(&mut self, args: &[&str]) -> String {
         let mut out = format!("*{}\r\n", args.len());
         for arg in args {
             out.push_str(&format!("${}\r\n{arg}\r\n", arg.len()));

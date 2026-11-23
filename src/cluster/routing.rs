@@ -381,7 +381,9 @@ fn stall_if_named(keys: &[Vec<u8>], name: &str, cmd: &[&[u8]]) {
     }
     // Leaving the worker's other tasks to another thread of the
     // multi-threaded runtime, as `pause::wait_out_handoff` does: the test's
-    // `MIGRATE` comes on a connection of its own.
+    // `MIGRATE` comes on a connection of its own. Before the gate, so with
+    // it open, in a run of scripts too (`command_gate::for_a_run`).
+    crate::command_gate::reopen_for_a_wait();
     let stall = || crate::aof::failpoint("routed");
     let on_multi_thread_runtime = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
         runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
