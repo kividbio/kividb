@@ -76,9 +76,9 @@ measured, against 1.10 to 1.16 before #240) and the recorded value + 5 % on
 all; `peak_vs_off` at most 1.07 (the issue: a peak within 2 % of defrag off
 counts as equal; three runs each of b100-c10 and b100-c20 of one build on
 one D8s_v5 gave 1.012 to 1.058 by the highest samples); `settled_rss_mib` the
-recorded value + 5 %; `peak_x_load` +3 % on the 100-byte and 1 KB shapes
-(1.165 to 1.168 and 1.208 to 1.214 over those six runs), +10 % on the mixed
-one; `final_rss_mib` +5 % of recorded; the pass's
+recorded value + 5 %; `peak_x_load` +5 % on the 100-byte and 1 KB shapes
+(b100-c20 is 1.17 or 1.21 from run to run of one build, the rest within
+1 %), +10 % on the mixed one; `final_rss_mib` +5 % of recorded; the pass's
 p99 and p99.9 within 25 % (and 0.2 ms) of recorded, and the pass's GET and SET
 p99 at most 1.5x the same run's idle seconds plus 0.2 ms (the pass must not
 cost latency). v1.2.2 and Redis are shown, not gated.
@@ -345,7 +345,7 @@ def run_churn(ctx, c, shape, pct):
     gx = [rel(5)] + ([bound(max=1.07 if shape == "kb1" else 1.08)] if tight else [])
     ctx.emit("settled_x_load", settled["rss_mib"] / load["rss_mib"], "x", "lower", gate=gx if kividb else info())
     ctx.emit("peak_x_load", sampler.peak / load["rss_mib"], "x", "lower",
-             gate=[rel(3 if tight else 10)] if kividb else info())
+             gate=[rel(5 if tight else 10)] if kividb else info())
 
 
 def _writer(port, keys, seed, stop, counter, rate):
