@@ -1960,9 +1960,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   behind it. In a test with the
   destination's `TAKEOVER` held 3 s, a `GET` on another thread waited
   about 2.6 s; it now waits under 1 ms.
-  Dispatched again, it keeps what its first dispatch used up: `ASKING`, and
-  a quick script's leave to run beside others, without which it ran alone
-  for that run.
+  Dispatched again, it is routed with the `ASKING` it came with, and a
+  quick script on a hash tag runs beside other scripts, as it would have
+  the first time.
 - **A command that waits for a script on its hash tag no longer holds up
   its thread (#882).** With `lua-parallel-scripts` on, a client's command
   on a key whose tag a script running beside others held waited on the
