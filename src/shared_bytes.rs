@@ -43,7 +43,9 @@ pub struct SharedBytes {
     to: NonNull<Header>,
 }
 
-// The bytes are never written after they are made, and the count is atomic.
+// The bytes are written after they are made only by their one holder, with
+// nothing else able to reach them ([`SharedBytes::write_in_place`]), and the
+// count is atomic.
 unsafe impl Send for SharedBytes {}
 unsafe impl Sync for SharedBytes {}
 
@@ -128,8 +130,8 @@ impl SharedBytes {
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
         let len = self.header().len as usize;
-        // SAFETY: `len` initialized bytes follow the header, and are not
-        // written again.
+        // SAFETY: `len` initialized bytes follow the header, written again
+        // only by a sole holder that nothing else can reach.
         unsafe { std::slice::from_raw_parts((self.to.as_ptr() as *const u8).add(HEADER), len) }
     }
 
@@ -178,6 +180,43 @@ impl SharedBytes {
     #[inline]
     pub fn is_unique(&self) -> bool {
         self.header().holders.load(Ordering::Acquire) == 1
+    }
+
+    /// Whether `len` bytes can take these bytes' place in their block
+    /// ([`write_in_place`](Self::write_in_place)): a block of the same slab
+    /// class, or, the system allocator's, of the same length (it is freed by
+    /// its size).
+    #[inline]
+    pub fn fits(&self, len: usize) -> bool {
+        match crate::value_slab::class_of(HEADER + self.len()) {
+            Some(now) => crate::value_slab::class_of(HEADER + len) == Some(now),
+            None => len == self.len(),
+        }
+    }
+
+    /// The bytes made `bytes`, in this block. A SET over a string of its own
+    /// otherwise takes a new block and lets go of the old one: two blocks'
+    /// first lines, not in the cache, about a tenth of the server's CPU for
+    /// a SET of 4,072 bytes.
+    ///
+    /// # Safety
+    /// This is the bytes' only holder ([`is_unique`](Self::is_unique)),
+    /// nothing can get to them but through it until this returns (the
+    /// caller holds what it is kept in for writing), and
+    /// [`fits`](Self::fits)`(bytes.len())`.
+    pub unsafe fn write_in_place(&self, bytes: &[u8]) {
+        debug_assert!(self.is_unique() && self.fits(bytes.len()));
+        let block = self.to.as_ptr();
+        // SAFETY: as the caller says, nothing reads the bytes or the length
+        // while they change, and the block has room for `bytes` in its class.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (block as *mut u8).add(HEADER),
+                bytes.len(),
+            );
+            std::ptr::addr_of_mut!((*block).len).write(bytes.len() as u32);
+        }
     }
 
     /// The bytes this takes on the heap, header and all.

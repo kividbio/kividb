@@ -253,6 +253,16 @@ pub enum Leftover {
     Bytes(SharedBytes),
 }
 
+impl Leftover {
+    /// The bytes the move copied.
+    pub fn bytes(&self) -> usize {
+        match self {
+            Leftover::Entry(left) => left.size(),
+            Leftover::Bytes(bytes) => bytes.heap_size(),
+        }
+    }
+}
+
 /// What a write of a key's value did ([`ShardMap::set_str`]).
 pub enum Written {
     /// The key was not there.
@@ -2462,6 +2472,134 @@ mod tests {
         map.use_key(b"live");
         assert_eq!(map.access("live"), Some(stamp));
         assert!(matches!(map.lookup("none"), Lookup::Absent));
+    }
+
+    /// A SET over a string of its own writes its block when nothing but the
+    /// entry holds it and the new length keeps the block's class; a holder
+    /// of the bytes (a GET's reply on its way out) keeps them as they were.
+    #[test]
+    fn a_string_of_its_own_is_written_in_place_while_nothing_else_holds_it() {
+        let mut map = ShardMap::new();
+        let block = |map: &ShardMap| match map.get("k") {
+            Some(ValueRef::String(s)) => s.as_bytes().as_ptr() as usize,
+            _ => panic!("no string"),
+        };
+        // Two lengths of one slab class's blocks (8 bytes of header each).
+        let top = crate::value_slab::block_size(crate::value_slab::class_of(5_100).unwrap()) - 8;
+        let (a, b) = (vec![1u8; top - 40], vec![2u8; top]);
+        assert_eq!(
+            crate::value_slab::class_of(top - 32),
+            crate::value_slab::class_of(top + 8)
+        );
+        assert!(matches!(map.set_str("k", &a), Written::New));
+        let at = block(&map);
+        assert!(matches!(map.set_str("k", &b), Written::InPlace));
+        assert_eq!(text(map.get("k")), Some(b.clone()));
+        assert_eq!(block(&map), at);
+        // Held: a new block, and the holder still reads what it held.
+        let held = match map.get("k") {
+            Some(ValueRef::String(s)) => s.to_shared(),
+            _ => panic!("no string"),
+        };
+        assert!(matches!(map.set_str("k", &a), Written::Replaced(_)));
+        assert_eq!(held.as_slice(), &b[..]);
+        assert_eq!(text(map.get("k")), Some(a.clone()));
+        drop(held);
+        // Another class: a new block.
+        let at = block(&map);
+        assert!(matches!(
+            map.set_str("k", vec![3u8; 9_000]),
+            Written::Replaced(_)
+        ));
+        assert_ne!(block(&map), at);
+        // The system allocator's block: in place at the same length only.
+        assert!(matches!(
+            map.set_str("k", vec![4u8; 40_000]),
+            Written::Replaced(_)
+        ));
+        let at = block(&map);
+        assert!(matches!(
+            map.set_str("k", vec![5u8; 40_000]),
+            Written::InPlace
+        ));
+        assert_eq!(block(&map), at);
+        assert_eq!(text(map.get("k")), Some(vec![5u8; 40_000]));
+        assert!(matches!(
+            map.set_str("k", vec![6u8; 40_001]),
+            Written::Replaced(_)
+        ));
+        assert_eq!(text(map.get("k")), Some(vec![6u8; 40_001]));
+    }
+
+    /// A SET at a string's length while compaction empties the slab of its
+    /// block (#240 review): written in place, in the slab being emptied,
+    /// then moved out of it whole, the new bytes.
+    #[test]
+    fn a_string_written_in_place_while_its_slab_is_emptied_moves_whole() {
+        // A class no other test allocates (21 KB: nothing else here is), on
+        // a thread that ends, so that nobody owns its slab.
+        let len = 21_000;
+        let mut map = std::thread::spawn(move || {
+            let mut map = ShardMap::new();
+            assert!(matches!(map.set_str("k", vec![1u8; len]), Written::New));
+            map
+        })
+        .join()
+        .unwrap();
+        let block = match map.get("k") {
+            Some(ValueRef::String(s)) => s.as_bytes().as_ptr(),
+            _ => panic!("no string"),
+        };
+        let evacuating = crate::value_slab::evacuate_only(block).expect("a slab nobody owns");
+        assert!(matches!(map.set_str("k", vec![2u8; len]), Written::InPlace));
+        let regions = crate::value_slab::regions_snapshot();
+        let index = (0..map.buckets())
+            .find(|&i| map.table.get_bucket(i).is_some())
+            .unwrap();
+        assert!(map.evacuating_at(index, &regions));
+        match map.relocate_at(index, &regions) {
+            Relocated::Moved(left) => drop(left),
+            _ => panic!("not moved"),
+        }
+        drop(evacuating);
+        let moved = match map.get("k") {
+            Some(ValueRef::String(s)) => s.as_bytes().as_ptr(),
+            _ => panic!("no string"),
+        };
+        assert_ne!(moved, block, "still in the slab being emptied");
+        assert_eq!(text(map.get("k")), Some(vec![2u8; len]));
+        // In place again where it is now.
+        assert!(matches!(map.set_str("k", vec![3u8; len]), Written::InPlace));
+        assert_eq!(text(map.get("k")), Some(vec![3u8; len]));
+    }
+
+    /// A snapshot's hold of an entry ([`EntryView::hold`]) and a reply's
+    /// ([`ShardMap::get_ref`]) taken before a SET at the string's length:
+    /// the SET makes a new entry and block, and both still read the old
+    /// bytes, an inline string and a string of its own alike.
+    #[test]
+    fn a_held_entry_keeps_its_bytes_across_a_set_at_their_length() {
+        for len in [100, 5_000] {
+            let mut map = ShardMap::new();
+            map.set_str("k", vec![1u8; len]);
+            let snapshot = map.entries().next().expect("one entry").hold();
+            let reply = map.get_ref("k").expect("the key");
+            assert!(matches!(
+                map.set_str("k", vec![2u8; len]),
+                Written::Replaced(_)
+            ));
+            for held in [&snapshot, &reply] {
+                match held.value() {
+                    ValueRef::String(s) => assert_eq!(s.as_bytes(), &vec![1u8; len][..], "{len}"),
+                    _ => panic!("not a string"),
+                }
+            }
+            assert_eq!(text(map.get("k")), Some(vec![2u8; len]));
+            drop((snapshot, reply));
+            // Nothing holds it now: in place.
+            assert!(matches!(map.set_str("k", vec![3u8; len]), Written::InPlace));
+            assert_eq!(text(map.get("k")), Some(vec![3u8; len]));
+        }
     }
 
     #[test]

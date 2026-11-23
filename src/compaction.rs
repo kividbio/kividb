@@ -96,6 +96,11 @@ const BATCH: usize = 128;
 /// for the shard waits for no more than these copies.
 const MOVES_PER_HOLD: usize = 32;
 
+/// And no more once this many bytes of them are moved (32 blocks of 4 KiB),
+/// checked before each move: a block is up to `value_slab::MAX_BLOCK`, so a
+/// hold copies up to six of the largest, about 154 KiB.
+const MOVE_BYTES_PER_HOLD: usize = 128 << 10;
+
 /// Work done between two sleeps. Slept after every batch, a pass over a
 /// million keys of 1 KB slept 18,304 times, 1,920 of them after the empty
 /// shards of the databases not in use; each sleep overshot by about a
@@ -192,18 +197,29 @@ struct Calm {
     others: usize,
     within: usize,
     looked: Cell<Instant>,
+    /// How long until the next look: [`CALM_EVERY`], or [`CALM_COST`] times
+    /// what the last look took, if more. A look reads every slab's header
+    /// (about a million of them at 64 GiB of slabs), and the thread is not
+    /// to spend its share of a core measuring.
+    every: Cell<Duration>,
     broken: Cell<bool>,
 }
 
-/// How often a round looks whether the clients started a delete or a refill.
+/// How often a round looks whether the clients started a delete or a
+/// refill, at most.
 const CALM_EVERY: Duration = Duration::from_millis(10);
 
+/// A look at the slabs is at most one this-many-th of a round's time.
+const CALM_COST: u32 = 20;
+
 impl Calm {
-    fn new(fill: &value_slab::Fill) -> Self {
+    /// `fill`, read in `took`, as the round starts.
+    fn new(fill: &value_slab::Fill, took: Duration) -> Self {
         Calm {
             others: fill.others_bytes,
             within: fill.slab_bytes / REFILL,
             looked: Cell::new(Instant::now()),
+            every: Cell::new(CALM_EVERY.max(took * CALM_COST)),
             broken: Cell::new(false),
         }
     }
@@ -214,9 +230,13 @@ impl Calm {
         if self.broken.get() || !WAIT_FOR_REFILL.load(Ordering::Relaxed) {
             return self.broken.get() || CUT_ROUNDS.load(Ordering::Relaxed);
         }
-        if self.looked.get().elapsed() >= CALM_EVERY {
+        if self.looked.get().elapsed() >= self.every.get() {
+            let started = Instant::now();
+            let others = value_slab::fill().others_bytes;
+            let took = started.elapsed();
             self.looked.set(Instant::now());
-            if value_slab::fill().others_bytes.abs_diff(self.others) > self.within {
+            self.every.set(CALM_EVERY.max(took * CALM_COST));
+            if others.abs_diff(self.others) > self.within {
                 self.broken.set(true);
             }
         }
@@ -842,7 +862,9 @@ fn compact(store: &Store) -> Got {
         if !enabled() {
             break;
         }
+        let read_at = Instant::now();
         let fill = value_slab::fill();
+        let read_took = read_at.elapsed();
         let Some(why) = wasting(&fill, true, true) else {
             break;
         };
@@ -873,7 +895,7 @@ fn compact(store: &Store) -> Got {
         fault_point(Fault::AfterPlan);
         let regions = value_slab::regions_snapshot();
         let fresh_before = value_slab::fresh_slabs_taken_here();
-        let calm = Calm::new(&fill);
+        let calm = Calm::new(&fill, read_took);
         // Counted here, not read from `active_defrag_hits`, which a
         // `CONFIG RESETSTAT` can set to 0 while the set runs (#370).
         let mut moved = 0u64;
@@ -941,19 +963,31 @@ fn compact_shard(shard: &Shard, regions: &[usize], pacer: &mut Pacer, calm: &Cal
             map.evacuating_in(at, end, regions)
         };
         at += looked;
-        for chunk in moving.chunks(MOVES_PER_HOLD) {
+        let mut next = 0;
+        while next < moving.len() {
+            let chunk = &moving[next..(next + MOVES_PER_HOLD).min(moving.len())];
             // Its room is taken here: a push below cannot panic. Should a
             // panic come anyway, what it holds is dropped with the lock let
             // go, as below: each block is one its key no longer points to.
             let mut old = Leftovers(Vec::with_capacity(chunk.len()));
             {
                 let mut map = shard.write();
+                // At most MOVES_PER_HOLD copies, and MOVE_BYTES_PER_HOLD
+                // bytes: blocks are up to `value_slab::MAX_BLOCK`.
+                let mut bytes = 0;
                 for (i, &index) in chunk.iter().enumerate() {
-                    if let Some(&next) = chunk.get(i + 1) {
-                        map.prefetch_bucket(next);
+                    if bytes >= MOVE_BYTES_PER_HOLD {
+                        break;
+                    }
+                    next += 1;
+                    if let Some(&ahead) = chunk.get(i + 1) {
+                        map.prefetch_bucket(ahead);
                     }
                     match map.relocate_at(index, regions) {
-                        Relocated::Moved(was) => old.0.push(was),
+                        Relocated::Moved(was) => {
+                            bytes += was.bytes();
+                            old.0.push(was)
+                        }
                         Relocated::Held => {
                             MISSES.fetch_add(1, Ordering::Relaxed);
                         }
@@ -1321,7 +1355,7 @@ mod tests {
     //! process's, and so are the settings.
 
     use super::*;
-    use crate::store::{ValueRef, new_store, shard_index};
+    use crate::store::{ValueRef, Written, new_store, shard_index};
     use std::sync::Arc;
 
     /// What a test here holds, with the settings that make any waste worth
@@ -1386,7 +1420,7 @@ mod tests {
     /// `Leftover::Bytes`.
     const OWN_BYTES: Data = Data {
         keys: 4_000,
-        key: |i| format!("{i:0>4200}"),
+        key: |i| format!("{i:0>w$}", w = value_slab::MAX_BLOCK + 100),
         value: |i| format!("{i:0>1000}").into_bytes(),
     };
 
@@ -1876,8 +1910,11 @@ mod tests {
     /// another thread (as the lazy free pool does), and readers check every
     /// value they read by its checksum, some of them holding it a while (as a
     /// reply or a snapshot does), and checking it again once the shard is
-    /// let go of. At the end every key holds what its writer last wrote to it,
-    /// byte for byte, or is gone if it had to be; and the lists check out.
+    /// let go of. A fifth of the writes are SETs over a key's string at its
+    /// length, which write it in place, a string of its own included, unless
+    /// a reader holds it. At the end every key holds what its writer last
+    /// wrote to it, byte for byte, or is gone if it had to be; and the lists
+    /// check out.
     #[test]
     fn values_moved_under_writers_readers_and_expiry_stay_whole() {
         use std::sync::atomic::AtomicUsize;
@@ -1892,6 +1929,8 @@ mod tests {
         // it ends once nothing changes.
         let deadline = Instant::now() + run;
         let reads = Arc::new(AtomicUsize::new(0));
+        // SETs written in place over a string of its own.
+        let own_in_place = Arc::new(AtomicUsize::new(0));
         let (to_free, freeing) = std::sync::mpsc::channel::<crate::types::KiviDBValue>();
         let freer = std::thread::spawn(move || {
             let mut freed = 0usize;
@@ -1904,6 +1943,7 @@ mod tests {
         let writers: Vec<_> = (0..WRITERS)
             .map(|w| {
                 let (store, to_free) = (Arc::clone(&store), to_free.clone());
+                let own_in_place = Arc::clone(&own_in_place);
                 std::thread::spawn(move || {
                     let mut last = vec![Last::Gone; KEYS_EACH];
                     let mut x = 0x240u64 + w as u64;
@@ -1919,18 +1959,31 @@ mod tests {
                         let shard = &db[shard_index(db.len(), &k)];
                         version += 1;
                         // Mostly the sizes slabs hold, entries and strings of
-                        // their own, now and then one past the largest block.
+                        // their own, now and then one in a large slab or past
+                        // the largest block.
                         let len = match (x >> 20) % 16 {
-                            0 => 4_100 + (x >> 40) as usize % 2_000,
+                            0 => 4_100 + (x >> 40) as usize % 26_000,
                             1..=6 => 20 + (x >> 40) as usize % 100,
                             _ => 100 + (x >> 40) as usize % 1_100,
                         };
-                        let taken = match (x >> 12) % 10 {
-                            0 | 1 => {
+                        let taken = match ((x >> 12) % 10, last[slot]) {
+                            (0 | 1, _) => {
                                 last[slot] = Last::Gone;
                                 shard.write().remove(&k)
                             }
-                            2 => {
+                            // A SET over the string at its length: in place
+                            // if nothing holds it (no time to live, so that
+                            // the key cannot have gone meanwhile).
+                            (3 | 4, Last::Set(_, l, false)) => {
+                                last[slot] = Last::Set(version, l, false);
+                                let written =
+                                    shard.write().set_str(&k, stamped(i as u32, version, l));
+                                if matches!(written, Written::InPlace) && l > 4_100 {
+                                    own_in_place.fetch_add(1, Ordering::Relaxed);
+                                }
+                                written.replaced()
+                            }
+                            (2, _) => {
                                 last[slot] = Last::Set(version, len, true);
                                 let expires = now_ms() + 1 + (x >> 50) % 20;
                                 shard.write().insert_str_expiring(
@@ -2071,6 +2124,10 @@ mod tests {
             "{passes} passes, {moved} moved, {emptied} slabs emptied"
         );
         assert!(reads.load(Ordering::Relaxed) > 1000);
+        assert!(
+            own_in_place.load(Ordering::Relaxed) > 0,
+            "no string of its own written in place"
+        );
     }
 
     /// A pass that a delete or a refill cuts short (#240 review): it counts
@@ -2111,12 +2168,12 @@ mod tests {
     }
 
     /// The free room the slab-waste trigger counts leaves out a slab's end
-    /// that no block fits in: slabs of 3,648-byte blocks, all full, have none.
+    /// that no block fits in: slabs of 1,952-byte blocks, all full, have none.
     #[test]
     fn a_slabs_unusable_end_is_no_free_room() {
         let _one = value_slab::EVACUATION_TESTS.lock();
-        let class = value_slab::class_of(3648).unwrap();
-        assert_eq!(value_slab::SLAB % value_slab::block_size(class), 3520);
+        let class = value_slab::class_of(1952).unwrap();
+        assert_eq!(value_slab::SLAB % value_slab::block_size(class), 1120);
         let before = value_slab::fill();
         let per = value_slab::SLAB / value_slab::block_size(class);
         // Whole slabs, let go of full by a thread that ends.
@@ -2187,9 +2244,11 @@ mod tests {
         let class = value_slab::pool_class_of(4032).unwrap();
         let size = value_slab::block_size(class);
         let per_slab = value_slab::SLAB / size;
-        let slabs = 8;
+        // Enough that the slabs other tests take meanwhile are a few of them.
+        let slabs = 32;
         assert_eq!(value_slab::slabs_of_class(class), 0);
-        let (fill_before, bytes_before) = (value_slab::fill(), value_slab::slab_bytes());
+        // The classes up to 2 KiB: other tests take large slabs meanwhile.
+        let fill_before = value_slab::small_fill();
         // Made on a thread that has ended: nobody owns the slabs.
         let blocks: Vec<usize> = crate::cpus::spawn(move || {
             (0..slabs * per_slab)
@@ -2204,11 +2263,10 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(value_slab::slabs_of_class(class), slabs);
-        // Half a megabyte of pool slabs: neither count moved by it (other
-        // tests may move them by a slab or two meanwhile).
+        // Two megabytes of pool slabs: neither count moved by it (other
+        // tests may move them by a few slabs meanwhile).
         let moved = |a: usize, b: usize| a.abs_diff(b) < slabs * value_slab::SLAB / 2;
-        assert!(moved(value_slab::slab_bytes(), bytes_before));
-        let fill = value_slab::fill();
+        let fill = value_slab::small_fill();
         assert!(moved(fill.slab_bytes, fill_before.slab_bytes));
         assert!(moved(fill.live_bytes, fill_before.live_bytes));
         // An eighth kept: the sparsest slabs there are.
