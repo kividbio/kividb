@@ -5350,6 +5350,190 @@ impl Write for CapturedBuf {
     }
 }
 
+/// What one capture thread may keep in memory of the values it lays out
+/// for `dump.kdb` (#825): past it, they go to a spill file of its own. With
+/// at most 8 threads, at most 64 MiB a capture, whatever the dataset. They
+/// were all kept in memory until the dump was written: the size of every
+/// collection's part of the dump over again (480 MB for 20,000 sorted sets
+/// of 800 members).
+const SPILL_BUDGET: usize = 8 << 20;
+
+/// The parts a spill file is written and read back in.
+const SPILL_PART: usize = 1 << 20;
+
+/// Where and past what a capture for `dump.kdb` spills ([`SPILL_BUDGET`]).
+struct Spill {
+    /// The dump's directory: the same filesystem and permissions as the
+    /// dump's temporary file.
+    dir: std::path::PathBuf,
+    budget: usize,
+}
+
+/// A spill file: in `dir`, with no name, so that nothing is left in the
+/// directory however the save ends. `O_TMPFILE` where the filesystem has it;
+/// elsewhere a file named as a dump's temporary file (which a start
+/// removes, should the process die between the two steps), removed as soon
+/// as it is open.
+fn open_spill(dir: &std::path::Path) -> io::Result<File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_TMPFILE)
+            .open(dir)
+        {
+            Ok(file) => return Ok(file),
+            // A filesystem without it, or a kernel before 3.11 (which reads
+            // the flag as `O_DIRECTORY`).
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::EOPNOTSUPP | libc::EISDIR | libc::EINVAL)
+                ) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let path = dir.join(crate::aof::temp_dump_name());
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    std::fs::remove_file(&path)?;
+    Ok(file)
+}
+
+/// What a capture thread laid out of the values that are not strings: the
+/// bytes it spilled, in order, then the rest, in memory. Together they are
+/// the bytes a [`CapturedBuf`] would have held: the image does not change.
+#[derive(Default)]
+struct EncodedPart {
+    spilled: Option<(File, u64)>,
+    held: Vec<u8>,
+}
+
+impl EncodedPart {
+    fn len(&self) -> usize {
+        self.spilled
+            .as_ref()
+            .map_or(0, |(_, len)| *len as usize)
+            .saturating_add(self.held.len())
+    }
+
+    /// Write the part out: the spilled bytes, read back in parts of
+    /// [`SPILL_PART`], then the held ones.
+    fn write_to(&mut self, out: &mut impl Write) -> io::Result<()> {
+        if let Some((file, len)) = &mut self.spilled {
+            use std::io::{Seek, SeekFrom};
+            file.seek(SeekFrom::Start(0))?;
+            let mut part = vec![0u8; SPILL_PART.min(*len as usize)];
+            let mut left = *len as usize;
+            while left > 0 {
+                let n = left.min(part.len());
+                file.read_exact(&mut part[..n])?;
+                out.write_all(&part[..n])?;
+                left -= n;
+            }
+        }
+        out.write_all(&self.held)
+    }
+}
+
+/// A [`CapturedBuf`] that, given a [`Spill`], keeps at most its budget in
+/// memory: before what it holds would pass the budget, it is written to
+/// the spill file, in parts of [`SPILL_PART`] (a value larger than the
+/// budget goes straight there). The bytes are laid out with writes held,
+/// as before, so the dump is still the dataset of that instant. Without a
+/// `Spill` (a full sync's or a backup's image, which is made in memory
+/// anyway), it is a `CapturedBuf`.
+struct SpillingBuf<'a> {
+    held: CapturedBuf,
+    spill: Option<&'a Spill>,
+    file: Option<File>,
+    spilled: u64,
+}
+
+impl<'a> SpillingBuf<'a> {
+    fn new(spill: Option<&'a Spill>) -> Self {
+        Self {
+            held: CapturedBuf::default(),
+            spill,
+            file: None,
+            spilled: 0,
+        }
+    }
+
+    /// Write `bytes` to the spill file, opened on the first spill.
+    fn spill_out(&mut self, spill: &Spill, bytes: &[u8]) -> io::Result<()> {
+        if crate::aof::injected_failure("snapshot-spill-fails") {
+            return Err(io::Error::other("a spill write failed (test failpoint)"));
+        }
+        let file = match &mut self.file {
+            Some(file) => file,
+            None => self.file.insert(open_spill(&spill.dir)?),
+        };
+        for part in bytes.chunks(SPILL_PART) {
+            file.write_all(part)?;
+        }
+        self.spilled += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Spill what is held, if anything.
+    fn spill_held(&mut self, spill: &Spill) -> io::Result<()> {
+        if self.held.buf.is_empty() {
+            return Ok(());
+        }
+        let held = std::mem::take(&mut self.held.buf);
+        let spilled = self.spill_out(spill, &held);
+        // The buffer is kept, empty, for what comes next: its capacity is
+        // within the budget and still counted.
+        self.held.buf = held;
+        self.held.buf.clear();
+        spilled
+    }
+
+    /// The part, and the count of what it holds in memory.
+    fn finish(self) -> (EncodedPart, crate::memory_use::NotCounted) {
+        let (held, counted) = self.held.finish();
+        let spilled = self.file.map(|file| (file, self.spilled));
+        (EncodedPart { spilled, held }, counted)
+    }
+}
+
+impl Write for SpillingBuf<'_> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.write_all(data)?;
+        Ok(data.len())
+    }
+
+    #[inline]
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        if let Some(spill) = self.spill {
+            if self.held.buf.len() + data.len() > spill.budget {
+                self.spill_held(spill)?;
+                if data.len() > spill.budget {
+                    return self.spill_out(spill, data);
+                }
+            }
+            // Grown as a `Vec` grows, but never past the budget: doubling
+            // from where it started, it could reach nearly twice that.
+            let need = self.held.buf.len() + data.len();
+            if need > self.held.buf.capacity() {
+                let to = need.max(self.held.buf.capacity() * 2).min(spill.budget);
+                self.held.buf.reserve_exact(to - self.held.buf.len());
+            }
+        }
+        self.held.write_all(data)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A writer that counts what goes through it: the size of a plain image
 /// as it is written (`INFO persistence`).
 struct CountingWriter<W: Write> {
@@ -5382,7 +5566,7 @@ impl<W: Write> Write for CountingWriter<W> {
 /// and the count of what those take, which is not to be evicted for.
 struct FrozenPart {
     strings: Vec<store::EntryRef>,
-    encoded: Vec<u8>,
+    encoded: EncodedPart,
     sketches: Vec<(Key, crate::sketch::Sketch)>,
     timed: Vec<(Key, u64)>,
     counted: crate::memory_use::NotCounted,
@@ -5404,8 +5588,9 @@ fn part_bytes(
 struct FrozenDb {
     /// One part per thread of the capture (see [`freeze`]).
     strings: Vec<Vec<store::EntryRef>>,
-    /// Complete KDB entries for every non-string key, likewise.
-    encoded: Vec<Vec<u8>>,
+    /// Complete KDB entries for every non-string key, likewise: for
+    /// `dump.kdb`, past a budget a thread, in a spill file (#825).
+    encoded: Vec<EncodedPart>,
     /// The probabilistic values, as copies that share their bytes with the
     /// store's (`sketch::bloom::LayerBytes`): taken in no time while writes
     /// are held, and laid out once they go on again. A write meanwhile
@@ -5422,22 +5607,30 @@ pub fn freeze_dataset(
     store: &crate::store::Store,
     index_store: Option<&crate::vector::IndexStore>,
 ) -> std::io::Result<FrozenDataset> {
-    freeze(store, index_store, false)
+    freeze(store, index_store, false, None)
 }
 
 /// [`freeze_dataset`] for `dump.kdb`: with the vector indexes' graphs, which
 /// a replica rebuilds but a restart should not have to.
+///
+/// What a capture thread lays out past [`SPILL_BUDGET`] goes to a spill
+/// file in the working directory, the dump's (#825).
 pub fn freeze_dataset_for_disk(
     store: &crate::store::Store,
     index_store: Option<&crate::vector::IndexStore>,
 ) -> std::io::Result<FrozenDataset> {
-    freeze(store, index_store, true)
+    let spill = Spill {
+        dir: std::path::PathBuf::from("."),
+        budget: SPILL_BUDGET,
+    };
+    freeze(store, index_store, true, Some(&spill))
 }
 
 fn freeze(
     store: &crate::store::Store,
     index_store: Option<&crate::vector::IndexStore>,
     with_graphs: bool,
+    spill: Option<&Spill>,
 ) -> std::io::Result<FrozenDataset> {
     // Writes are held for all of this, and it is a pass over every key: it
     // is spread over several threads, a run of shards each, and a key is
@@ -5465,7 +5658,7 @@ fn freeze(
                 .map(|run| {
                     scope.spawn_released(move || {
                         let mut strings = Vec::new();
-                        let mut encoded = CapturedBuf::default();
+                        let mut encoded = SpillingBuf::new(spill);
                         let mut sketches = Vec::new();
                         let mut timed = Vec::new();
                         let mut counted = crate::memory_use::NotCounted::default();
@@ -5619,7 +5812,7 @@ impl FrozenDataset {
             .dbs
             .iter()
             .flat_map(|db| db.encoded.iter())
-            .map(Vec::len)
+            .map(EncodedPart::len)
             .sum();
         let sketch_bytes: u64 = self
             .dbs
@@ -5725,8 +5918,11 @@ impl FrozenDataset {
                 self.not_counted.release(held);
             }
             timed_strings.push(timed);
-            for encoded in &db.encoded {
-                out.write_all(encoded)?;
+            // Each part's memory goes as soon as it is written, and its
+            // spill file with it (#825).
+            for mut encoded in std::mem::take(&mut db.encoded) {
+                encoded.write_to(out)?;
+                self.not_counted.release(encoded.held.capacity());
             }
             // Each copy goes as soon as it is written, as each string's
             // hold does.
@@ -8284,6 +8480,79 @@ mod empty_key_tests {
         let mut fields = crate::types::HashFields::default();
         fields.insert_bytes(field, value.as_bytes());
         KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(fields)))
+    }
+
+    /// A capture for `dump.kdb` that spills past its budget (#825) lays out
+    /// the image byte for byte as one that keeps everything in memory: over
+    /// 100,000 keys, so that several capture threads spill, with strings,
+    /// times to live and a value larger than the budget among them. Nothing
+    /// is left in the directory, while the capture lives or after.
+    #[test]
+    fn a_capture_that_spills_lays_out_the_same_image() {
+        let far = unix_ms_now() + 3_600_000;
+        let store = crate::store::new_store(2);
+        let mut db0: HashMap<Key, KiviDBValue> = HashMap::new();
+        let mut timed: HashMap<Key, u64> = HashMap::new();
+        for i in 0..120_000u64 {
+            let key = Key::from(format!("h:{i}").as_bytes());
+            db0.insert(key.clone(), hash(&format!("f{i}"), &"v".repeat(40)));
+            if i % 7 == 0 {
+                timed.insert(key, far + i);
+            }
+        }
+        for i in 0..1_000u64 {
+            db0.insert(Key::from(format!("s:{i}").as_bytes()), string("x"));
+        }
+        let mut big = crate::types::HashFields::default();
+        for i in 0..20_000u64 {
+            big.insert_bytes(&format!("field:{i}"), "w".repeat(20).as_bytes());
+        }
+        let db1 = HashMap::from([(
+            Key::from(&b"big"[..]),
+            KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(big))),
+        )]);
+        restore_into_store(vec![db0, db1], &store);
+        restore_expiries_into_store(vec![timed, HashMap::new()], &store);
+
+        let dir = tempfile::tempdir().unwrap();
+        let spill = Spill {
+            dir: dir.path().to_path_buf(),
+            budget: 64 << 10,
+        };
+        let spilling = freeze(&store, None, true, Some(&spill)).unwrap();
+        let parts = |db: usize| {
+            spilling.dbs[db]
+                .encoded
+                .iter()
+                .filter(|part| part.spilled.is_some())
+                .count()
+        };
+        let threads = crate::cpus::available_parallelism().map_or(1, |n| n.get());
+        assert!(
+            parts(0) >= threads.clamp(1, 8).min(2),
+            "{} of database 0's parts spilled",
+            parts(0)
+        );
+        assert_eq!(parts(1), 1, "the hash larger than the budget");
+        for part in spilling.dbs.iter().flat_map(|db| &db.encoded) {
+            assert!(
+                part.held.capacity() <= spill.budget,
+                "{}",
+                part.held.capacity()
+            );
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let kept = freeze(&store, None, true, None)
+            .unwrap()
+            .into_payload()
+            .unwrap();
+        let image = spilling.into_payload().unwrap();
+        assert_eq!(image.len(), kept.len());
+        assert!(image == kept, "the images differ");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let loaded = load_snapshot_from(image.as_slice()).unwrap();
+        assert_eq!(loaded.dbs[0].len(), 121_000);
     }
 
     /// What the server writes (a capture of the keyspace, for `SAVE`, the

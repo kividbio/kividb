@@ -1710,7 +1710,9 @@ fn writes_during_an_aof_rewrite_evict_nothing_that_fits() {
 /// the size of the encoded collections. Here the capture is held once it
 /// has laid everything out (`snapshot-captured`), with a list of about
 /// 36 MB in the dataset: the two numbers have moved together, and once the
-/// snapshot is written nothing is left uncounted.
+/// snapshot is written nothing is left uncounted. Since #825 the capture
+/// keeps at most 8 MiB of the list in memory and spills the rest, so what
+/// it holds is that much, not the list over.
 #[test]
 fn what_a_capture_lays_out_is_not_counted_as_it_is_made() {
     let dir = tempfile::tempdir().unwrap().keep();
@@ -1735,10 +1737,11 @@ fn what_a_capture_lays_out_is_not_counted_as_it_is_made() {
     let used = c.used_memory();
     let not_counted = c.not_counted();
     let counted = used - not_counted;
-    // What the capture holds is in `used_memory` and in the other number.
+    // What the capture holds is in `used_memory` and in the other number:
+    // the part of the list it has not spilled, at most 8 MiB (#825).
     assert!(
-        not_counted > 30 * MB,
-        "the capture holds about 36 MB of the list: {not_counted} bytes are not counted"
+        (MB..=8 * MB + 64 * KB).contains(&not_counted),
+        "the capture holds up to 8 MiB of the list: {not_counted} bytes are not counted"
     );
     // What is counted is what it was: the list, once, and no more than a
     // little besides. Before, it read the encoded list over.
@@ -1760,6 +1763,136 @@ fn what_a_capture_lays_out_is_not_counted_as_it_is_made() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(c.cmd(&["LLEN", "big"]).i(), 300_000);
+}
+
+/// The sorted sets of `feeds` of 800 members each (Mastodon's home feeds,
+/// #825).
+fn load_feeds(c: &mut Conn, feeds: std::ops::Range<usize>) {
+    for feed in feeds {
+        let key = format!("feed:{feed}");
+        let ids: Vec<String> = (0..800)
+            .map(|m| (110_000_000_000_000_000u64 + (feed * 800 + m) as u64).to_string())
+            .collect();
+        let mut args = vec!["ZADD", key.as_str()];
+        for id in &ids {
+            args.push(id);
+            args.push(id);
+        }
+        assert_eq!(c.cmd(&args).i(), 800);
+    }
+}
+
+/// #825. A save laid out every value that is not a string in memory, with
+/// writes held, and kept it until the dump was written: the size of the
+/// collections' part of the dump over again (480 MB for 20,000 feeds of 800
+/// members), and more for a larger dataset. Each capture thread now keeps
+/// at most 8 MiB and spills the rest. Held once the capture is done
+/// (`snapshot-captured`), the capture holds at most that at 200 feeds
+/// (under the budget: nothing spilled) and at 2,000 (a 48 MB dump), and
+/// the dump it writes is whole.
+#[test]
+fn a_capture_holds_at_most_its_budget_however_large_the_dataset() {
+    for feeds in [200, 2_000] {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let server =
+            Server::start_in_env(dir, &[], &[("KIVIDB_TEST_FAILPOINTS", "snapshot-captured")]);
+        let mut c = server.conn();
+        load_feeds(&mut c, 0..feeds);
+        let last_key = format!("feed:{}", feeds - 1);
+        let last = (110_000_000_000_000_000u64 + (feeds * 800 - 1) as u64).to_string();
+        let score = c.cmd(&["ZSCORE", &last_key, &last]).s().to_string();
+        assert_eq!(c.not_counted(), 0);
+        assert_eq!(c.cmd(&["BGSAVE"]).s(), "Background saving started");
+        let held = server.dir.join("failpoint.snapshot-captured.1");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !held.exists() {
+            assert!(Instant::now() < deadline, "no capture reached {held:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let not_counted = c.not_counted();
+        assert!(
+            not_counted <= 8 * MB + 64 * KB,
+            "{feeds} feeds: the capture holds {not_counted} bytes"
+        );
+        std::fs::remove_file(held).unwrap();
+        c.wait_for("persistence", "rdb_bgsave_in_progress", "0");
+        assert_eq!(c.info("persistence", "rdb_last_bgsave_status"), "ok");
+        let dump = std::fs::metadata(server.dir.join("dump.kdb"))
+            .unwrap()
+            .len() as i64;
+        if feeds == 2_000 {
+            assert!(dump > 40 * MB, "a dump of {dump} bytes");
+        }
+        // Loaded again, it has every feed and every member.
+        drop(c);
+        let dir = server.kill_keeping_its_files();
+        let server = Server::start_in(dir, &[]);
+        let mut c = server.conn();
+        assert_eq!(c.cmd(&["DBSIZE"]).i(), feeds as i64);
+        assert_eq!(c.cmd(&["ZCARD", &last_key]).i(), 800);
+        assert_eq!(c.cmd(&["ZSCORE", &last_key, &last]).s(), score);
+    }
+}
+
+/// #825. A save whose spill write fails (`snapshot-spill-fails`: the disk
+/// is full, say) fails: writes go on at once, the dump saved before is left
+/// as it was, and nothing is left in the directory. So with the AOF on,
+/// for its checkpoint.
+#[test]
+fn a_save_whose_spill_write_fails_leaves_the_dump_before_it() {
+    for aof in [false, true] {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let extra: &[&str] = if aof { &["--appendonly", "yes"] } else { &[] };
+        let server = Server::start_in_env(
+            dir,
+            extra,
+            &[("KIVIDB_TEST_FAILPOINTS", "snapshot-spill-fails")],
+        );
+        let mut c = server.conn();
+        // Under the budget: nothing is spilled, and the save works.
+        load_feeds(&mut c, 0..10);
+        assert!(c.cmd(&["SAVE"]).ok(), "aof {aof}: the first save");
+        let saved = std::fs::read(server.dir.join("dump.kdb")).unwrap();
+        let listing = || {
+            let mut names: Vec<String> = std::fs::read_dir(&server.dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name != "server.log")
+                .collect();
+            names.sort();
+            names
+        };
+        let before = listing();
+
+        load_feeds(&mut c, 10..500);
+        let failed = c.cmd(&["SAVE"]);
+        assert!(
+            failed.is_err(),
+            "aof {aof}: SAVE past the budget: {failed:?}"
+        );
+        let started = Instant::now();
+        assert!(c.cmd(&["SET", "after", "1"]).ok());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "aof {aof}: a write waited {:?} after the failed save",
+            started.elapsed()
+        );
+        if !aof {
+            assert_eq!(c.cmd(&["BGSAVE"]).s(), "Background saving started");
+            c.wait_for("persistence", "rdb_bgsave_in_progress", "0");
+            assert_eq!(c.info("persistence", "rdb_last_bgsave_status"), "err");
+        }
+        assert!(
+            std::fs::read(server.dir.join("dump.kdb")).unwrap() == saved,
+            "aof {aof}: the dump saved before was changed"
+        );
+        assert_eq!(
+            listing(),
+            before,
+            "aof {aof}: what is left in the directory"
+        );
+        assert_eq!(c.cmd(&["ZCARD", "feed:499"]).i(), 800);
+    }
 }
 
 /// Memory that evicting keys does not give back, here what a snapshot

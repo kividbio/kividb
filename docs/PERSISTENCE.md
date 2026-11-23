@@ -43,6 +43,22 @@ over: with about 9 million keys, under 100 ms. The snapshot is written
 after, while writes continue. Because the cut between the two files is made
 with writes held, a write is in exactly one of them.
 
+What a snapshot adds to memory while it is written: strings are only held
+(a string written over or deleted meanwhile is freed once it has been
+written), but the other values (lists, sets, sorted sets, hashes, streams)
+change in place, so they are laid out when the dataset is captured. Each
+capture thread keeps at most 8 MiB of that and writes the rest to a spill
+file in the data directory, copied into `dump.kdb` as the snapshot is
+written: at most 64 MiB a save for the collections, whatever their size
+(#825). The spill files have no name (`O_TMPFILE` where the filesystem has
+it, otherwise a temporary file removed as soon as it is open), so nothing is
+left in the directory however the save ends; they take as much disk as the
+collections' part of the dump until the snapshot is written. A save that
+cannot write them (a full disk) fails, writes go on, and the previous
+`dump.kdb` stays. Before, every collection was kept in memory until the
+snapshot was written: for 20,000 sorted sets of 800 members, 480 MB. A
+replica's full sync and an online backup still make their image in memory.
+
 If a checkpoint is stopped part way (a crash, a kill), the previous log is
 kept as `appendonly.aof.prev`. At the next start it is replayed, and then
 the new log, on top of the snapshot the checkpoint started from.
