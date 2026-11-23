@@ -2028,8 +2028,11 @@ fn kill_in_a_run(io: &str) {
 ///
 /// Which connection is on which thread is found by a script of about a
 /// second run by A, then by B (`threads_held_back`): a connection on the
-/// thread running it waits, at some point, for most of that second; one on
-/// another thread never waits long. One between the two is left out. So are
+/// thread running it waits, at some point, for most of that run (half of it
+/// at least, however long it took); one on another thread never waits long.
+/// (It runs on the connection's thread only as a quick script, and a run that
+/// long sends it back to the pool: it is made quick again before each run.)
+/// One between the two is left out. So are
 /// the connections of the thread the `MIGRATE` waits on (`free_connections`)
 /// and those of B's thread: a B that finds the turn free runs its script
 /// there, and waits there, as any script that is not queued does. On both
@@ -2089,6 +2092,13 @@ fn threads_held_back(
     (conn, reply, others)
 }
 
+/// For a slow script that ran for `took` (`threads_held_back`): how long a
+/// connection waited at least to be on the thread that ran it, which held it
+/// for most of the run, and at most to be on another, which no script held.
+fn held_and_not(took: Duration) -> (Duration, Duration) {
+    (took / 2, (took / 4).min(Duration::from_millis(150)))
+}
+
 /// A script `sha` called as `args` (its first run) until it has run inline,
 /// not on the blocking pool: seen to be quick.
 fn made_quick(c: &mut Conn, args: &[&str]) {
@@ -2121,8 +2131,8 @@ fn queued_script_waiting_for_a_migrate(io: &str, look: bool) {
     made_quick(&mut c, &["EVALSHA", &sets, "1", "m", "v0"]);
     // How many counts take about a second here.
     let (_, took) = timed(|| c.cmd(&["EVALSHA", &slow, "1", "a", "1000000"]));
-    let count = ((1_000_000.0 / took.as_secs_f64().max(0.0001)) as u64).max(1);
-    let slow_call = |key: &str| -> Vec<String> {
+    let mut count = ((1_000_000.0 / took.as_secs_f64().max(0.0001)) as u64).max(1);
+    let slow_call = |key: &str, count: u64| -> Vec<String> {
         ["EVALSHA", &slow, "1", key, &count.to_string()]
             .iter()
             .map(|s| s.to_string())
@@ -2134,10 +2144,6 @@ fn queued_script_waiting_for_a_migrate(io: &str, look: bool) {
     let mut free = free_connections(port, 40, Duration::from_secs(1));
     assert!(free.len() >= 12, "only {} connections answered", free.len());
     let mut a = free.pop().unwrap();
-    // A's thread.
-    made_quick(&mut a, &["EVALSHA", &slow, "1", "a", "1"]);
-    let held = Duration::from_millis(500);
-    let not_held = Duration::from_millis(150);
     let mut on_a = Vec::new();
     let mut elsewhere = Vec::new();
     // Where the kernel puts a connection (SO_REUSEPORT) is a hash of its
@@ -2153,9 +2159,17 @@ fn queued_script_waiting_for_a_migrate(io: &str, look: bool) {
         }
     };
     for round in 0.. {
-        let (a_back, reply, others) = threads_held_back(a, slow_call("a"), free);
+        // A's thread. A's slow script holds it only if it runs there, as a
+        // quick script: a run of it as long as this one sends it back to the
+        // pool, where it holds no worker. So it is made quick before each.
+        made_quick(&mut a, &["EVALSHA", &slow, "1", "a", "1"]);
+        let ((a_back, reply, others), took) =
+            timed(|| threads_held_back(a, slow_call("a", count), free));
         a = a_back;
         assert!(matches!(reply, V::Int(_)), "{reply:?}");
+        // Told apart by how long this run took, which on a busy machine may
+        // be far from the second measured before.
+        let (held, not_held) = held_and_not(took);
         for (conn, longest) in others {
             if longest >= held {
                 on_a.push(conn);
@@ -2172,6 +2186,8 @@ fn queued_script_waiting_for_a_migrate(io: &str, look: bool) {
             on_a.len(),
             elsewhere.len()
         );
+        // A run that was short makes the next one longer.
+        count = (count as f64 / took.as_secs_f64().clamp(0.25, 1.0)) as u64;
         free = free_connections(port, 40, Duration::from_secs(1));
     }
     // B: a connection on another thread than A's; and B's own thread, whose
@@ -2181,13 +2197,16 @@ fn queued_script_waiting_for_a_migrate(io: &str, look: bool) {
     let mut probes: Vec<(Conn, bool)> = on_a.into_iter().map(|p| (p, true)).collect();
     probes.extend(elsewhere.into_iter().map(|p| (p, false)));
     let flags: Vec<bool> = probes.iter().map(|(_, on_a)| *on_a).collect();
-    let (b, reply, others) = threads_held_back(
-        b,
-        slow_call("b"),
-        probes.into_iter().map(|(p, _)| p).collect(),
-    );
+    let ((b, reply, others), took) = timed(|| {
+        threads_held_back(
+            b,
+            slow_call("b", count),
+            probes.into_iter().map(|(p, _)| p).collect(),
+        )
+    });
     let mut b = b;
     assert!(matches!(reply, V::Int(_)), "{reply:?}");
+    let (held, not_held) = held_and_not(took);
     let probes: Vec<(Conn, bool)> = others
         .into_iter()
         .zip(flags)

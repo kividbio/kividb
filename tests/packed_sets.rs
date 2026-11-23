@@ -930,15 +930,18 @@ fn sscan_of_a_small_set_never_waits_on_its_writers() {
 }
 
 /// `MEMORY USAGE` of `key` once it has stopped changing: a table's resize
-/// finished in the background gives its old array back at its end.
+/// finished in the background gives its old array back at its end. While
+/// the resize runs the count does not move (both arrays are counted), and on
+/// a busy machine the thread finishing it may not run for a while: a whole
+/// second unchanged.
 fn settled_usage(c: &mut Conn, key: &str) -> i64 {
     let mut last = c.cmd(&["MEMORY", "USAGE", key]).int();
     let mut same = 0;
-    for _ in 0..200 {
+    for _ in 0..1000 {
         thread::sleep(Duration::from_millis(20));
         let now = c.cmd(&["MEMORY", "USAGE", key]).int();
         same = if now == last { same + 1 } else { 0 };
-        if same == 5 {
+        if same == 50 {
             break;
         }
         last = now;
@@ -949,7 +952,10 @@ fn settled_usage(c: &mut Conn, key: &str) -> i64 {
 /// A set `SINTERSTORE` or `SDIFFSTORE` makes of two sets of over 65,536
 /// members is the size of the same members added by `SADD`: it is not
 /// sized for its sources (a table made with room for 65,536 members holds
-/// about 1 MiB of groups whatever it is filled with).
+/// about 1 MiB of groups whatever it is filled with, some 30 times these).
+/// Within 12 % either way: where members land differs from one table to
+/// another (random seeds), and either side comes out at 33,300 to 35,092
+/// bytes for 1,000 members, up to 5.4 % apart.
 #[test]
 fn a_stored_result_is_sized_for_its_members() {
     let dir = temp_dir("store-size");
@@ -984,7 +990,7 @@ fn a_stored_result_is_sized_for_its_members() {
             assert_eq!(c.encoding(&dst), "hashtable");
             let got = settled_usage(&mut c, &dst);
             assert!(
-                (got - want).abs() * 100 <= want * 5,
+                (got - want).abs() * 100 <= want * 12,
                 "{cmd} of {n} members: MEMORY USAGE {got}, the same set built by SADD {want}"
             );
         }
