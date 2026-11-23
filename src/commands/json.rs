@@ -802,6 +802,37 @@ fn value_heap(value: &Value) -> usize {
     }
 }
 
+pub(crate) fn allocated_heap(value: &Value) -> usize {
+    use crate::commands::memory_layout as layout;
+    const VALUE: usize = std::mem::size_of::<Value>();
+    const ENTRY: usize = std::mem::size_of::<usize>() + std::mem::size_of::<String>() + VALUE;
+    match value {
+        Value::String(s) => s.capacity(),
+        Value::Array(items) => {
+            items.capacity() * VALUE + items.iter().map(allocated_heap).sum::<usize>()
+        }
+        Value::Object(members) => {
+            let len = members.len();
+            let room = match layout::buckets_for(len) {
+                0 => 0,
+                buckets @ 1..=7 => buckets - 1,
+                buckets => buckets / 8 * 7,
+            };
+            room * ENTRY
+                + layout::hash_table(
+                    len,
+                    std::mem::size_of::<usize>(),
+                    std::mem::align_of::<usize>(),
+                )
+                + members
+                    .iter()
+                    .map(|(key, member)| key.capacity() + allocated_heap(member))
+                    .sum::<usize>()
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+    }
+}
+
 fn not_an_array<T>() -> Result<T, &'static str> {
     Err("ERR path is not an array")
 }

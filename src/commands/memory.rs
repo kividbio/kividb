@@ -188,8 +188,9 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }
 
         ValueRef::Json(arc) => {
-            let s = arc.read().to_string();
-            key_overhead + s.len() + 64
+            entry()
+                + layout::arc_of::<RwLock<serde_json::Value>>()
+                + crate::commands::json::allocated_heap(&arc.read())
         }
 
         ValueRef::TimeSeries(arc) => {
