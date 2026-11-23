@@ -1556,6 +1556,7 @@ fn checked_in_gate(
     name: &str,
     routed: &crate::cluster::routing::Routed,
     write_gate: &mut Option<crate::write_gate::WriteGuard>,
+    beside_others: bool,
 ) -> Option<Vec<u8>> {
     // While the AOF cannot be written, what would be logged is refused, as
     // Redis refuses it (`MISCONF`): a write, or a script that may make some,
@@ -1604,6 +1605,20 @@ fn checked_in_gate(
     // other command would run on any thread meanwhile. So does a run of
     // scripts that keeps the gate closed between them
     // (`command_gate::reopen_for_a_wait`).
+    //
+    // What its first dispatch used up is given back to the next, as the
+    // pause's branch above does: `ASKING`, and a quick script's leave to run
+    // beside others (`tag_locks::allow_next_script`), which is one-shot and
+    // would otherwise make it run alone, holding every other command back
+    // for that run. A leave the next dispatch does not take is cleared by
+    // the caller that gave it (`lua_vm_blocking`).
+    if routed.asking() {
+        ctx.client_registry
+            .update(ctx.client_id, |info| info.asking = true);
+    }
+    if beside_others {
+        crate::tag_locks::allow_next_script();
+    }
     Some(if handoff {
         WAIT_OUT_HANDOFF.to_vec()
     } else {
@@ -2255,7 +2270,7 @@ fn run_command(ctx: &mut Ctx, name: &str, started: std::time::Instant) -> Vec<u8
         && !nested
         && !ctx.apply_replication
         && crate::pause::writes_must_check(routed.at())
-        && let Some(reply) = checked_in_gate(ctx, name, &routed, &mut _write_gate)
+        && let Some(reply) = checked_in_gate(ctx, name, &routed, &mut _write_gate, beside_others)
     {
         return reply;
     }
