@@ -872,6 +872,16 @@ mod tests {
         (vec![b':', b'0' + n, b'\r', b'\n'], 0, 0)
     }
 
+    /// A `since` whose look is over at its first turn: what the sender does
+    /// later is then after the look however long the machine takes over a
+    /// turn of it.
+    fn look_over() -> std::time::Instant {
+        std::time::Instant::now() - LOOK_FOR
+    }
+
+    /// Long after the first turn of a look.
+    const LATER: std::time::Duration = std::time::Duration::from_millis(50);
+
     #[tokio::test]
     async fn a_reply_sent_during_the_look_is_found_by_it() {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -890,10 +900,10 @@ mod tests {
     async fn a_reply_sent_after_the_look_is_waited_for() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let sender = std::thread::spawn(move || {
-            std::thread::sleep(LOOK_FOR * 5);
+            std::thread::sleep(LATER);
             let _ = tx.send(reply(2));
         });
-        let (got, found) = look_then_wait(rx, std::time::Instant::now()).await;
+        let (got, found) = look_then_wait(rx, look_over()).await;
         sender.join().unwrap();
         assert_eq!(got.map(|r| r.0), Some(reply(2).0));
         assert!(!found, "the reply came after the look");
@@ -907,10 +917,10 @@ mod tests {
         assert!(got.is_none());
         let (tx, rx) = tokio::sync::oneshot::channel::<Done>();
         let sender = std::thread::spawn(move || {
-            std::thread::sleep(LOOK_FOR * 5);
+            std::thread::sleep(LATER);
             drop(tx);
         });
-        let (got, found) = look_then_wait(rx, std::time::Instant::now()).await;
+        let (got, found) = look_then_wait(rx, look_over()).await;
         sender.join().unwrap();
         assert!(got.is_none() && !found);
     }
