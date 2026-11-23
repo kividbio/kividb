@@ -216,6 +216,7 @@ fn cmd_info(state: &ClusterState) -> Vec<u8> {
     let (slots_assigned, slots_ok, slots_pfail, slots_fail) = state.slot_health();
     let size = state.voting_master_count();
     let current_epoch = state.current_epoch();
+    let (not_held, not_held_ranges) = state.slots_not_held();
     let nodes = state.nodes.read();
     let known_nodes = nodes.len();
 
@@ -255,6 +256,12 @@ fn cmd_info(state: &ClusterState) -> Vec<u8> {
             .load(std::sync::atomic::Ordering::Relaxed)
     ));
     out.push_str("total_cluster_links_buffer_limit_exceeded:0\r\n");
+    // On a replica: the slots of its master it does not hold yet (see
+    // `ClusterState::slots_not_held`).
+    out.push_str(&format!("cluster_slots_not_held:{not_held}\r\n"));
+    out.push_str(&format!(
+        "cluster_slots_not_held_ranges:{not_held_ranges}\r\n"
+    ));
 
     resp_bulk_str(&out)
 }
@@ -1088,7 +1095,14 @@ fn cmd_bumpepoch(state: &ClusterState) -> Vec<u8> {
     if let Some(err) = require_cluster_mode(state) {
         return err;
     }
-    let (bumped, epoch) = state.bump_config_epoch_without_consensus();
+    // Not while slots handed over from here may not be known as moved
+    // everywhere (`ClusterState::epoch_may_change`), checked with the bump
+    // under one hold.
+    let (bumped, epoch) =
+        match state.change_epoch_if_it_may(|| state.bump_config_epoch_without_consensus()) {
+            Ok(bumped) => bumped,
+            Err(why) => return resp_error(&format!("ERR BUMPEPOCH refused for now: {why}")),
+        };
     if !bumped {
         return resp_simple(&format!("STILL {epoch}"));
     }
@@ -1831,6 +1845,8 @@ fn cmd_migration(ctx: &mut Ctx) -> Vec<u8> {
                             number(task.write_pause_ms),
                             text("capture_pause_ms"),
                             number(task.capture_pause_ms),
+                            text("takeover_refused"),
+                            text(&task.takeover_refused),
                         ],
                     )
                 })
@@ -1892,7 +1908,38 @@ fn cmd_syncslots(ctx: &mut Ctx) -> Vec<u8> {
             ctx.cluster.slot_migrations.cancel(Some(&task_id));
             resp_simple("OK")
         }
-        "TAKEOVER" => done(migration::take_over(ctx.cluster, &task_id, ctx.client_id)),
+        "TAKEOVER" => {
+            // It waits (see `migration::take_over`): on an io_uring worker,
+            // run on a thread of its own, while the worker serves its other
+            // connections.
+            if crate::deferred::on_ring_thread() && !crate::deferred::running_elsewhere() {
+                if crate::deferred::run_alone_elsewhere(&mut ctx.blocking, &ctx.cmd) {
+                    return crate::pause::HELD_IN_GATE.to_vec();
+                }
+                // Not where it can wait without holding up the worker's
+                // other connections: refused, and the source keeps the
+                // slots (it asks, and is told they were not taken).
+                return resp_error(
+                    "ERR the takeover cannot wait on this connection: the slots stay with \
+                     the source",
+                );
+            }
+            let pause_ms = migration::write_pause_timeout_ms(ctx.config);
+            // The source's config epoch, from a source of this release:
+            // `TAKEOVER <task-id> <epoch>`.
+            let source_epoch = ctx
+                .cmd
+                .get(4)
+                .and_then(|e| std::str::from_utf8(e).ok())
+                .and_then(|e| e.parse().ok());
+            done(migration::take_over(
+                ctx.cluster,
+                &task_id,
+                ctx.client_id,
+                pause_ms,
+                source_epoch,
+            ))
+        }
         "FAIL" => {
             let reason = ctx
                 .cmd
@@ -2794,6 +2841,15 @@ fn cmd_reset(ctx: &mut Ctx) -> Vec<u8> {
         }
     } else {
         return resp_error("ERR wrong number of arguments for 'cluster|reset' command");
+    };
+
+    // No slot takeover is under way, nor begins, while this runs: it would
+    // drop the slots and the config the takeover is saving.
+    let Some(_takeovers_held) = ctx.cluster.slot_migrations.hold_takeovers() else {
+        return resp_error(
+            "ERR a slot takeover is under way on this node; try CLUSTER RESET again once it has \
+             ended",
+        );
     };
 
     // As in FLUSHSLOTS: no write lands between the check for keys below

@@ -488,6 +488,12 @@ async fn run_replication_session(
         ..
     } = starter;
 
+    if test_link_down() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        return Err(SessionError::Link(
+            "no link to the master (KIVIDB_TEST_REPLICA_LINK_DOWN)".into(),
+        ));
+    }
     let timeout = repl_state.repl_timeout();
     let upstream = SlaveUpstreamGuard::connect(repl_state, my_generation);
 
@@ -625,6 +631,23 @@ async fn run_replication_session(
         my_generation,
     )
     .await?;
+
+    // ── Phase 2b: REPLCONF node-id ──────────────────────────────────────
+    // In cluster mode, this node's cluster id: the master tells its replicas'
+    // links apart by it, whatever address and port they come from (NAT, an
+    // announced address, TLS). Any answer is taken: a master of an earlier
+    // release answers +OK to every option, and matches links by address.
+    if let Some(node_id) = repl_state.my_node_id() {
+        send_command(&mut writer, &["REPLCONF", "node-id", &node_id]).await?;
+        guarded(
+            read_line(&mut reader),
+            timeout,
+            repl_state,
+            my_generation,
+            "REPLCONF node-id",
+        )
+        .await?;
+    }
 
     // ── Phase 3: REPLCONF capa psync2 ───────────────────────────────────
     send_command(&mut writer, &["REPLCONF", "capa", "psync2"]).await?;
@@ -889,13 +912,21 @@ async fn run_replication_session(
     // What this node knew of its master's slot imports holds for this
     // session only if the master tells of them, and the dataset is not
     // replaced (#741).
+    let marked = !crate::replication::hides_slot_imports_capability()
+        && crate::replication::psync_reply_has_slot_imports(&fullresync);
     if cmd0 == "FULLRESYNC" || cmd0 == "CONTINUE" {
         repl_state.slot_imports_event(crate::replication::SlotImportsEvent::Session {
-            marked: !crate::replication::hides_slot_imports_capability()
-                && crate::replication::psync_reply_has_slot_imports(&fullresync),
+            marked,
             full: cmd0 == "FULLRESYNC",
         });
     }
+    // A dataset sent in full by a master that sends the markers is followed
+    // by them: its claim of its slots (if it keeps one), then its imports.
+    // Nothing is acknowledged until the first marker after the dataset has
+    // been read (the claim comes first when there is one): an
+    // acknowledgement of the dataset's writes then comes from a replica that
+    // holds the claim too.
+    let mut ack_held = marked && cmd0 == "FULLRESYNC";
 
     // The stream as it will be read below: what has arrived and is not yet
     // applied, how many bytes have arrived in all, and which database the
@@ -1378,8 +1409,12 @@ async fn run_replication_session(
     }
 
     let ack_interval = Duration::from_secs(1);
-    send_ack(&mut writer, applied, timeout).await?;
+    if !ack_held {
+        send_ack(&mut writer, applied, timeout).await?;
+    }
     let mut last_ack = Instant::now();
+    // An acknowledgement owed since the markers were read.
+    let mut ack_owed = false;
 
     // The link is up from here: synced, and about to stream. Listed among
     // the clients as the master (`flags=M`), as Redis lists it.
@@ -1410,6 +1445,11 @@ async fn run_replication_session(
     let mut transaction_scanned = 0usize;
 
     loop {
+        if test_link_down() {
+            return Err(SessionError::Link(
+                "the link to the master is cut (KIVIDB_TEST_REPLICA_LINK_DOWN)".into(),
+            ));
+        }
         // Nothing is written to `repl_offset` on the way out, here or below:
         // every batch has already published its position, and a session that
         // has been superseded has no position to publish. A promoted node's
@@ -1657,6 +1697,9 @@ async fn run_replication_session(
                     repl_buf.drain(head..head + consumed);
                     offset -= consumed as u64;
                     transaction_scanned = 0;
+                    if std::mem::take(&mut ack_held) {
+                        ack_owed = true;
+                    }
                     continue;
                 }
                 if parse_pos == 0 {
@@ -1714,11 +1757,36 @@ async fn run_replication_session(
         // REPLCONF ACK — heartbeat ~1 Hz when idle; **immediate** after applying commands so the
         // master can unblock WAIT without waiting for more replication traffic (otherwise we sit in
         // `read()` forever after the last propagating write and never hit the timer).
-        if applied_commands || last_ack.elapsed() >= ack_interval {
+        if !ack_held
+            && (applied_commands
+                || std::mem::take(&mut ack_owed)
+                || last_ack.elapsed() >= ack_interval)
+        {
             send_ack(&mut writer, applied, repl_state.repl_timeout()).await?;
             last_ack = Instant::now();
         }
     }
+}
+
+/// `KIVIDB_TEST_STREAM_STALL`, never set otherwise: a file, relative to the
+/// working directory, while which exists this master sends its replicas
+/// nothing of the stream (it stays queued here), as with a replica that
+/// falls behind.
+pub(crate) fn test_stream_stall() -> Option<&'static std::path::Path> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::env::var_os("KIVIDB_TEST_STREAM_STALL").map(Into::into))
+        .as_deref()
+}
+
+/// `KIVIDB_TEST_REPLICA_LINK_DOWN`, never set otherwise: a file, relative to
+/// the working directory, while which exists this replica has no link to its
+/// master: the session under way ends, and none begins, as when the network
+/// between the two is cut. Nothing else of the node changes.
+fn test_link_down() -> bool {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::env::var_os("KIVIDB_TEST_REPLICA_LINK_DOWN").map(Into::into))
+        .as_deref()
+        .is_some_and(|p| p.exists())
 }
 
 /// Publish `applied` as this node's replication offset, unless the session
@@ -2517,6 +2585,8 @@ pub async fn handle_replica_connection<R, W>(
     _leftover: Vec<u8>,
     // The port the replica announced with `REPLCONF listening-port`, if any.
     listening_port: Option<u16>,
+    // The cluster node id it gave with `REPLCONF node-id`, if any.
+    node_id: Option<String>,
     // What the replica asked to continue from (`PSYNC <replid> <offset>`).
     psync: Option<crate::replication::PsyncRequest>,
     // It sent `REPLCONF capa vset-quant`.
@@ -2537,6 +2607,7 @@ where
     };
 
     let replica_id = crate::replication::next_replica_id();
+    repl_state.note_replica_node_id(replica_id, node_id);
 
     // ── 1. The stream queue. The hub starts filling it at the cut below.
     // Must be **unbounded**: the forwarding task doesn't drain until the payload is sent; a bounded
@@ -2578,6 +2649,13 @@ where
                 Some(p) => p,
                 None => break,
             };
+            // Tests: held here while the file `KIVIDB_TEST_STREAM_STALL`
+            // names exists.
+            if let Some(path) = test_stream_stall() {
+                while path.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
             if pending_bytes_fwd.abandoned() {
                 // Let go of for falling too far behind: what is queued is
                 // freed now, as `replica_rx` is dropped, not sent (see
