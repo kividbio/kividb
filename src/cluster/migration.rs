@@ -3790,22 +3790,11 @@ fn take_over_now(
         cluster.observe_epoch(source_epoch);
     }
     let epoch = cluster.bump_epoch();
-    // Saved before the marker goes out: restarted, this node takes a newer
-    // epoch for the next attempt, which a replica that kept this attempt's
-    // marker does not take for this one's. Synced before the marker under
-    // `appendfsync always`, as the save that takes the slots is; otherwise
-    // the sync follows on another thread, as that save's does. Only a power
-    // loss in between can then bring an old epoch back after a restart, and
-    // a replica that kept the marker would have to continue from this
-    // node's stream after it (not resync in full), be cut off during the
-    // next attempt, and be elected after this node failed again: a power
-    // loss under `everysec` can already cost the last second of writes.
-    let saved = if crate::aof::syncs_before_acks() {
-        cluster.save_to_disk()
-    } else {
-        super::persist::with_deferred_sync(|| cluster.save_to_disk())
-    };
-    if let Err(e) = saved {
+    // Saved before the marker goes out (synced as every save of the cluster
+    // config is): restarted, this node takes a newer epoch for the next
+    // attempt, which a replica that kept this attempt's marker does not take
+    // for this one's.
+    if let Err(e) = cluster.save_to_disk() {
         return not_yet(
             &format!("could not save the config epoch taken for the takeover: {e}"),
             false,
