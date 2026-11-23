@@ -1745,16 +1745,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   block's class, as one over an inline string writes the entry. Measured on
   an Azure D8s_v5 (`benchmarks/1.3.0/regressions/suites/46-values-near-slab-limits.py`:
   a server for each size, 8 clients overwriting random keys in pipelines of
-  100, the server on 4 vCPUs): a SET of 4,100 bytes takes 3.51 us of the
-  server's CPU (1.2.2: 3.87), one of 4,072 bytes, a string of its own,
-  3.33 us where an inline one of 4,064 takes 3.20 (1.2.2: 3.85 and 3.33),
-  and one of 26,208 bytes, the system allocator's, 15.97 us as one of
-  26,192, a slab's, 16.00 (1.2.2: 16.49 and 16.65). RSS per key over 3,500
-  to 4,500 bytes is the value plus 90 to 210 bytes (1.2.2: 78 to 300;
-  Redis 8.10.2: 180 to 1,134); from 4,100 bytes up a value takes up to
+  100, the server on 4 vCPUs): a SET of 4,100 bytes takes 3.49 us of the
+  server's CPU (1.2.2: 3.70), one of 4,072 bytes, a string of its own,
+  3.31 us where an inline one of 4,064 takes 3.19 (1.2.2: 3.58 and 3.15),
+  and one of 26,208 bytes, the system allocator's, 15.01 us as one of
+  26,192, a slab's, 15.03 (1.2.2: 16.04 and 16.15). RSS per key over 3,500
+  to 4,500 bytes is the value plus 77 to 193 bytes (1.2.2: 77 to 300;
+  Redis 8.10.2: 181 to 1,133); from 4,100 bytes up a value takes up to
   2.5 % more than the system allocator's block did, the class it is rounded
-  up to (24,000 to 28,000 bytes: the value plus 187 to 853 bytes, 1.2.2: 165
-  to 176), and `used_memory`, `maxmemory` and `MEMORY USAGE` count that
+  up to (24,000 to 28,000 bytes: the value plus 174 to 764 bytes, 1.2.2: 164
+  to 179), and `used_memory`, `maxmemory` and `MEMORY USAGE` count that
   block, not the value alone. Slabs come out of reservations of address
   space that grow to a GiB, two of the kernel's mappings each, so that
   tens of GiB of values stay far from `vm.max_map_count`. After suite 43's
