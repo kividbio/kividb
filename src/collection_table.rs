@@ -1169,6 +1169,9 @@ const RANDOM_PICKS: usize = 128;
 /// Header flag: a chain passed [`CHAIN_CAP`] while a resize was in
 /// progress; a resize with a new seed starts when that one ends.
 const RESEED_DUE: u8 = 1;
+/// Keep a finished resize's old array for `take_retired`, without allocating
+/// resize state just to remember the policy.
+const DEFER_FREE: u8 = 1 << 1;
 
 /// Resizes with a new seed in a row, with no growth between them, after
 /// which a long chain starts none until the table grows: a chain that stays
@@ -1226,7 +1229,7 @@ pub struct CollectionTable<K: Kind, A: Memory = EntryPool> {
     groups: NonNull<Group>,
     bits: u8,
     offset: u8,
-    /// [`RESEED_DUE`].
+    /// [`RESEED_DUE`] and [`DEFER_FREE`].
     flags: u8,
     len: usize,
     /// The length past which `main` doubles.
@@ -1247,7 +1250,6 @@ struct Rare {
     /// The array (and arena) of a finished resize, kept for the caller to
     /// free elsewhere ([`CollectionTable::defer_free`]).
     retired: Option<(Array, Arena)>,
-    defer_free: bool,
     /// Resizes with a new seed so far.
     reseeds: u32,
     /// Resizes with a new seed since the main array last grew.
@@ -1264,7 +1266,6 @@ impl Rare {
             arena: Arena::new(),
             old: None,
             retired: None,
-            defer_free: false,
             reseeds: 0,
             reseeds_in_a_row: 0,
             reserve_bits: 0,
@@ -1386,17 +1387,36 @@ fn rare_reseed_due(depth: usize, reseeds_in_a_row: u8) -> bool {
 /// with `A`; the element is in no array.
 unsafe fn place<A: Memory>(array: Array, arena: &mut Arena, h: u64, slot: *mut u8) -> usize {
     let fp = fingerprint(h);
-    let mut group = array.group(array.home(h));
+    let group = array.group(array.home(h));
+    // SAFETY: the home group is part of the live array.
+    unsafe {
+        let empty = (*group).empty();
+        if empty != 0 {
+            (*group).put(first(empty), fp, slot);
+            return 1;
+        }
+        place_full::<A>(array, arena, group, fp, slot)
+    }
+}
+
+/// Continue placement after finding the full home group. Keeping that first
+/// look separate lets a table insert into its main array without an arena.
+///
+/// # Safety
+/// `group` is the full home group of `array`; the remaining requirements are
+/// those of `place`.
+unsafe fn place_full<A: Memory>(
+    array: Array,
+    arena: &mut Arena,
+    mut group: *mut Group,
+    fp: u8,
+    slot: *mut u8,
+) -> usize {
     let mut depth = 1;
     // SAFETY: every group reached is the array's or a live overflow group of
     // its chains (links point only to those).
     unsafe {
         loop {
-            let empty = (*group).empty();
-            if empty != 0 {
-                (*group).put(first(empty), fp, slot);
-                return depth;
-            }
             let next = (*group).link();
             if next.is_null() {
                 // Full with no link: slot 6's element moves to a new
@@ -1412,6 +1432,11 @@ unsafe fn place<A: Memory>(array: Array, arena: &mut Arena, h: u64, slot: *mut u
             }
             group = next;
             depth += 1;
+            let empty = (*group).empty();
+            if empty != 0 {
+                (*group).put(first(empty), fp, slot);
+                return depth;
+            }
         }
     }
 }
@@ -1423,6 +1448,11 @@ impl<K: Kind, A: Memory> Default for CollectionTable<K, A> {
 }
 
 impl<K: Kind, A: Memory> CollectionTable<K, A> {
+    /// Only writers that need overflow or resize state create it.
+    fn rare_mut(&mut self) -> &mut Rare {
+        self.rare.get_or_insert_with(|| Box::new(Rare::new()))
+    }
+
     pub fn new() -> Self {
         Self::with_capacity(0)
     }
@@ -1599,10 +1629,28 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
             self.start_resize(self.main().bits + 1, false);
         }
         let main = self.main();
-        let rare = self.rare.get_or_insert_with(|| Box::new(Rare::new()));
-        // SAFETY: the main array and its arena; the element is new.
-        let depth = unsafe { place::<A>(main, &mut rare.arena, h, slot) };
-        if rare.reseed_due(depth) {
+        let group = main.group(main.home(h));
+        // SAFETY: the home group is live and the element is new. An arena is
+        // needed only after the home group is full.
+        let depth = unsafe {
+            let empty = (*group).empty();
+            if empty != 0 {
+                (*group).put(first(empty), fingerprint(h), slot);
+                1
+            } else {
+                place_full::<A>(
+                    main,
+                    &mut self.rare_mut().arena,
+                    group,
+                    fingerprint(h),
+                    slot,
+                )
+            }
+        };
+        if rare_reseed_due(
+            depth,
+            self.rare.as_ref().map_or(0, |rare| rare.reseeds_in_a_row),
+        ) {
             self.flags |= RESEED_DUE;
         }
         self.len += 1;
@@ -1731,10 +1779,12 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
         let new = Array::alloc::<A>(bits);
         let main = self.main();
         let hasher = reseed.then(|| std::mem::replace(&mut self.hasher, reseed_hasher()));
-        let rare = self.rare.get_or_insert_with(|| Box::new(Rare::new()));
+        if reseed {
+            self.flags &= !RESEED_DUE;
+        }
+        let rare = self.rare_mut();
         if reseed {
             rare.reseeds += 1;
-            self.flags &= !RESEED_DUE;
         }
         if bits > main.bits {
             rare.reseeds_in_a_row = 0;
@@ -1765,6 +1815,7 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
     /// table still sparse ([`MAX_SHRINK_BITS`]).
     pub fn step_resize(&mut self, budget: usize) -> bool {
         let main = self.main();
+        let defer_free = self.flags & DEFER_FREE != 0;
         let Some(rare) = self.rare.as_mut() else {
             return true;
         };
@@ -1772,7 +1823,6 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
             arena,
             old,
             retired,
-            defer_free,
             reseeds_in_a_row,
             ..
         } = &mut **rare;
@@ -1821,7 +1871,7 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
         let o = old.take().expect("a resize in progress");
         let shrank = o.array.bits > main.bits;
         // Every element has moved out of it; nothing points into it.
-        let done = if *defer_free {
+        let done = if defer_free {
             // One not taken since an earlier resize is freed now.
             retired.replace((o.array, o.arena))
         } else {
@@ -1852,9 +1902,10 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
     /// [`Self::take_retired`] instead of freeing them on the write that
     /// finished it. One not taken is freed when the next resize finishes.
     pub fn defer_free(&mut self, defer: bool) {
-        let rare = self.rare.get_or_insert_with(|| Box::new(Rare::new()));
-        rare.defer_free = defer;
-        if !defer {
+        if defer {
+            self.flags |= DEFER_FREE;
+        } else {
+            self.flags &= !DEFER_FREE;
             drop(self.take_retired());
         }
     }
@@ -1899,7 +1950,7 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
 
     /// Remove every element; the table keeps no memory but an empty group.
     pub fn clear(&mut self) {
-        let defer = self.rare.as_ref().is_some_and(|rare| rare.defer_free);
+        let defer = self.flags & DEFER_FREE != 0;
         let empty = Self::build(0, ahash::RandomState::new(), self.max_fill);
         drop(std::mem::replace(self, empty));
         if defer {
@@ -3297,6 +3348,64 @@ mod tests {
     }
 
     type HashT = CollectionTable<Fields, Counted>;
+
+    #[test]
+    fn one_group_table_needs_no_rare() {
+        let mut table = HashT::with_capacity_and_seed(6, 1);
+        for field in [
+            b"name".as_slice(),
+            b"data",
+            b"opts",
+            b"timestamp",
+            b"delay",
+            b"priority",
+        ] {
+            table.insert(field, b"value", None).unwrap();
+        }
+        assert_eq!(table.stats().groups, 1);
+        assert_eq!(table.stats().overflow_groups, 0);
+        assert!(!table.resizing());
+        assert!(table.rare.is_none(), "a one-group table has no rare work");
+        table.check();
+    }
+
+    #[test]
+    fn deferred_free_policy_needs_no_rare() {
+        let mut table = HashT::with_capacity_and_seed(6, 2);
+        table.defer_free(true);
+        assert!(table.rare.is_none(), "a policy alone needs no allocation");
+        for i in 0..6 {
+            table
+                .insert(format!("f{i}").as_bytes(), b"value", None)
+                .unwrap();
+        }
+        assert!(table.rare.is_none());
+        table.reserve(12);
+        assert!(table.resizing());
+        while !table.step_resize(1) {}
+        assert!(table.holds_retired());
+        assert!(table.take_retired().is_some());
+        table.clear();
+        assert!(table.rare.is_none());
+        // clear preserves the policy even though there is still no Rare.
+        table.reserve(12);
+        while !table.step_resize(1) {}
+        assert!(table.take_retired().is_some());
+        table.check();
+    }
+
+    #[test]
+    fn one_group_job_hash_needs_no_rare() {
+        let mut hash = crate::hash_fields::HashFields::new();
+        hash.insert_bytes(&b"name"[..], b"step");
+        hash.insert_bytes(&b"data"[..], &[b'x'; 1800]);
+        for field in [b"opts".as_slice(), b"timestamp", b"delay", b"priority"] {
+            hash.insert_bytes(field, b"value");
+        }
+        let table = hash.table().unwrap();
+        assert_eq!(table.stats().groups, 1);
+        assert!(table.rare.is_none());
+    }
     type SetT = CollectionTable<Members, Counted>;
 
     /// Scale a test down under Miri.
