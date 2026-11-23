@@ -1751,10 +1751,13 @@ master), and no row of the candidate's moved by more than 0.005. The recall
 rows were re-recorded, as their values changed with the queries.
 
 After the review fixes (huge pages collapsed on a thread of their own,
-chunks mapped with huge pages off), three more runs of `53331f9d`
-(`results/pr-760-fix-d8s_v5-run1` to `-run3`): `d384` 0.89x, 0.93x and
-0.91x Redis's time, `d64` 1.01x, 0.99x and 1.00x, recall within the
-recorded spread; no row was recorded again.
+chunks mapped with huge pages off), four more runs of `53331f9d`
+(`results/pr-760-fix-d8s_v5-run1` to `-run4`): `d384` 0.89x, 0.93x, 0.91x
+and 0.85x Redis's time, `d64` 1.01x, 0.99x, 1.00x and 0.96x, recall within the
+recorded spread; no row was recorded again. Master in the same session as
+`-run4` (`results/master-50b8bdbe-41-d8s_v5-r2`) had the same
+`narrow_default_qps` (d64 1,028 against 1,058) and a d64 build at 1.24x
+Redis's time.
 
 Only those 18 rows (2 builds, 16 recalls) were recorded. The others keep the
 values of `results/pr-760-d8s_v5`: the rates move by up to ±10 % from run to

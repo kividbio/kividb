@@ -668,9 +668,10 @@ helpers (3 interleaved runs each):
   (16.6 s before).
   A chunk is one mapping (two while only part of it is huge pages), against the
   process's `vm.max_map_count` (65,530 by default): past 16,384 chunks in the
-  process, new blocks are allocated on their own. 2,000 vector sets of 5,000 64-d
-  vectors, a graph each, added 284-291 mappings (adjacent chunks share one) against
-  148 before.
+  process, new blocks are allocated on their own. 300 vector sets of 5,000 64-d
+  vectors, a graph each, took the same `used_memory` once every graph was built
+  (1,225 MB) and less RSS (1.36 against 1.41 GB), in 419 more mappings against 66; 2,000
+  such sets added 284-291 mappings (adjacent chunks share one) against 148.
 - **The live flag read last:** 4 %. The search measures a neighbour, and reads its live
   flag (a byte on a line of its own) only if it would keep it.
 - **The kernel looked up once** a search, selection or pruning, called through one
