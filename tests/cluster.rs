@@ -9937,7 +9937,11 @@ fn importing_and_handing_over_at_once(takeover_first: bool) {
     let absent = coming.missing_on(&nodes[1]);
     assert!(absent.is_empty(), "{} keys not on the node", absent.len());
     let absent = going.missing_on(&nodes[2]);
-    assert!(absent.is_empty(), "{} keys not on the new owner", absent.len());
+    assert!(
+        absent.is_empty(),
+        "{} keys not on the new owner",
+        absent.len()
+    );
 }
 
 /// [`importing_and_handing_over_at_once`]: the handover first.
@@ -9971,11 +9975,15 @@ fn an_import_from_a_1_2_source_is_taken_over() {
     assert_eq!(task_id.len(), 40, "{task_id}");
     wait_import_completed(&nodes[1], &task_id);
     let dst_id = nodes[1].id();
-    wait_until("both to hold the destination as the owner", Duration::from_secs(20), || {
-        nodes
-            .iter()
-            .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str()))
-    });
+    wait_until(
+        "both to hold the destination as the owner",
+        Duration::from_secs(20),
+        || {
+            nodes
+                .iter()
+                .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str()))
+        },
+    );
     let absent = before.missing_on(&nodes[1]);
     assert!(absent.is_empty(), "{} keys not on the owner", absent.len());
 }
@@ -9999,11 +10007,15 @@ fn an_import_into_a_1_2_destination_is_taken_over() {
     assert_eq!(task_id.len(), 40, "{task_id}");
     wait_import_completed(&nodes[1], &task_id);
     let dst_id = nodes[1].id();
-    wait_until("both to hold the destination as the owner", Duration::from_secs(20), || {
-        nodes
-            .iter()
-            .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str()))
-    });
+    wait_until(
+        "both to hold the destination as the owner",
+        Duration::from_secs(20),
+        || {
+            nodes
+                .iter()
+                .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str()))
+        },
+    );
     let absent = before.missing_on(&nodes[1]);
     assert!(absent.is_empty(), "{} keys not on the owner", absent.len());
 }

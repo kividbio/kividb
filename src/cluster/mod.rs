@@ -4714,7 +4714,10 @@ impl ClusterState {
     /// a handover away from this node begins either before (the change is
     /// refused) or after (its check of this node's epoch sees the change,
     /// [`Self::begin_handover`], and it is refused).
-    pub(crate) fn change_epoch_if_it_may<R>(&self, change: impl FnOnce() -> R) -> Result<R, String> {
+    pub(crate) fn change_epoch_if_it_may<R>(
+        &self,
+        change: impl FnOnce() -> R,
+    ) -> Result<R, String> {
         let _holds = self.handoff_holds.lock();
         self.epoch_may_change()?;
         Ok(change())

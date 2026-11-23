@@ -3666,9 +3666,8 @@ pub fn take_over(
         super::bus::heartbeat::set_test_bus_muted(true);
     }
     let deadline = Instant::now() + takeover_wait(pause_ms);
-    let result = off_the_runtime(|| {
-        take_over_now(cluster, task_id, client_id, deadline, source_epoch)
-    });
+    let result =
+        off_the_runtime(|| take_over_now(cluster, task_id, client_id, deadline, source_epoch));
     if let Some(delay) = lost {
         log_warn!("Cluster: (test) the TAKEOVER's reply and claim are held back {delay:?}");
         test_sleep(delay);
