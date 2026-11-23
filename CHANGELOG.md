@@ -1074,6 +1074,34 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     p50 0.26 → 0.57 ms, p99 11.0 → 8.5 ms, build 21.0 → 17.0 s.
   - Loads over 4 or 8 connections link on all seven helpers too.
 
+- **An HNSW insert costs as much CPU as Redis's (#760).** One client loading
+  200,000 64-d documents in `HSET` pipelines of 1,000 on an Azure D8s_v5
+  (three interleaved runs against Redis 8.10.2 on the same machine) took
+  12.8-12.9 s, 0.97-0.98x Redis's time (before: 17.1-17.6 s, 1.29-1.32x),
+  with 92 CPU seconds against Redis's 90-92 (before: 123-125). 50,000 384-d
+  documents took 6.2 s, 0.89x Redis's time (before: 7.1-7.3 s, 1.02-1.05x).
+  Recall and KNN rates are unchanged: the graph is the same.
+  - **Huge pages.** Up to 464 dimensions (at `M` 16), a graph's blocks of
+    1,024 slots are cut from chunks of whole 2 MiB pages, mapped with huge
+    pages off. Once the blocks over one of those pages are all in use, a
+    thread of its own makes it a huge page (`MADV_COLLAPSE`, Linux 6.1 and
+    later), so that the neighbours an insert measures cost no page walks;
+    no command waits for it (each took 0.5-2 ms, at most 4.8 ms, also on a
+    VM whose free memory was fragmented). Nothing is made a huge page before
+    it is used: with transparent huge pages set to `always`, `madvise` or
+    `never`, indexes of 1,500 to 5,000 vectors of 64 and 384 dimensions
+    take the same `used_memory` as before and at most the same RSS. Where
+    they are set to `never`, none are made. A chunk is one mapping (two
+    while part of it is huge pages); past 16,384 chunks in the process, new
+    blocks are allocated on their own.
+  - **The distance kernel is looked up once** per search, neighbour
+    selection and pruning, not on every distance; the search reads a
+    neighbour's live flag only if it would keep the neighbour; its heaps
+    compare distances as integers; and an insert takes the entry point's
+    lock for writing only to change it.
+  - **The counters written on every link are each on a cache line of their
+    own,** apart from what the searches read.
+
 - **Writes on a master with a replication backlog and no replica no
   longer wake the replication thread one by one (#894).** A master that
   starts with data (its own snapshot, or any dataset) keeps the backlog for
