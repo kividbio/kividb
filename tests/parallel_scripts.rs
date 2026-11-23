@@ -2143,7 +2143,15 @@ fn queued_script_waiting_for_a_migrate(io: &str, look: bool) {
     // Where the kernel puts a connection (SO_REUSEPORT) is a hash of its
     // addresses: a set of them may have none on A's thread, or none
     // elsewhere. More connections are opened, and told apart by another of
-    // A's slow scripts, until there are some of each (at most 8 rounds).
+    // A's slow scripts, until there are some of each (at most 8 rounds). With
+    // Tokio a thread's connections move, and only those elsewhere count.
+    let enough = |on_a: usize, elsewhere: usize| {
+        if io == "uring" {
+            on_a >= 3 && elsewhere >= 3
+        } else {
+            elsewhere >= 1
+        }
+    };
     for round in 0.. {
         let (a_back, reply, others) = threads_held_back(a, slow_call("a"), free);
         a = a_back;
@@ -2155,7 +2163,7 @@ fn queued_script_waiting_for_a_migrate(io: &str, look: bool) {
                 elsewhere.push(conn);
             }
         }
-        if on_a.len() >= 3 && elsewhere.len() >= 3 {
+        if enough(on_a.len(), elsewhere.len()) {
             break;
         }
         assert!(
@@ -2183,7 +2191,10 @@ fn queued_script_waiting_for_a_migrate(io: &str, look: bool) {
     let probes: Vec<(Conn, bool)> = others
         .into_iter()
         .zip(flags)
-        .filter(|((_, longest), _)| *longest < not_held)
+        // Left out: those B's script held, on B's thread. On io_uring a
+        // connection stays where it is, and one that a loaded machine slowed
+        // but B's script did not hold stays a probe.
+        .filter(|((_, longest), _)| *longest < if io == "uring" { held } else { not_held })
         .map(|((p, _), on_a)| (p, on_a))
         .collect();
     made_quick(&mut a, &["EVALSHA", &slow, "1", "a", "1"]);
