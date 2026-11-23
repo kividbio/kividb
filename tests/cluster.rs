@@ -11176,6 +11176,290 @@ fn script_waiting_out_a_slot_handoff_on(model: &str, quick: bool) -> (Duration, 
     (slowest, waiting)
 }
 
+/// A quick script on a hash tag, which runs beside other scripts, keeps
+/// that leave when it waits out a handoff outside its gates and is
+/// dispatched again (#340): the leave is one-shot
+/// (`tag_locks::allow_next_script`), its first dispatch had used it up, and
+/// it ran alone, holding every other command back for that run. The import
+/// is canceled while the destination's `TAKEOVER` is held, so the slots
+/// stay and the script runs here when it is dispatched again: counted
+/// beside others both times, never alone for not being quick.
+#[cfg(feature = "lua")]
+#[test]
+fn a_quick_tagged_script_dispatched_again_after_a_handoff_runs_beside_others() {
+    let key = format!("{{{}}}:k", key_in(0..=1000, "handoff-tag"));
+    let env = [
+        ("KIVIDB_TEST_FAILPOINTS", "routed,handoff-pausing"),
+        ("KIVIDB_TEST_STALL_KEYS", key.as_str()),
+    ];
+    // Tokio: on io_uring the destination's held `TAKEOVER` blocks its
+    // worker, and the `CANCEL` below could land behind it. The test is
+    // about the leave, not the loop.
+    let tokio = ["--io-model", "tokio"];
+    let (nodes, ranges) = form_cluster_of(vec![
+        Node::start_with_env(&tokio, &env),
+        Node::start_with_env(&tokio, &[("KIVIDB_TEST_TAKEOVER_DELAY_MS", "3000")]),
+    ]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let r = src.conn().cmd(&[
+        "CONFIG",
+        "SET",
+        "cluster-slot-migration-write-pause-timeout",
+        "10000",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let set = commands_in_background(src.port, &[&["SET", &key, "5"]]);
+    std::fs::remove_file(routed_and_held(src, 1)).unwrap();
+    assert!(set.join().unwrap().is_ok());
+    // Run on another tag until it runs inline, beside others: quick.
+    let body = "return redis.call('SET', KEYS[1], ARGV[1])";
+    let warm = format!("{{{}}}:w", key_in(1001..=ranges[0].1, "warm-tag"));
+    let mut c = src.conn();
+    for _ in 0..4 {
+        assert!(c.cmd(&["EVAL", body, "1", &warm, "w"]).is_ok());
+    }
+    let count = |field: &str| -> i64 {
+        let info = src.conn().cmd(&["INFO", "everything"]).text();
+        info.lines()
+            .find_map(|line| line.strip_prefix(&format!("{field}:")))
+            .unwrap_or_else(|| panic!("no {field} in INFO"))
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let beside = count("scripts_run_beside_others");
+    let not_quick = count("scripts_run_alone_not_quick");
+
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    let pausing = src.dir.join("failpoint.handoff-pausing.1");
+    wait_until(
+        "the handoff to be about to pause writes",
+        Duration::from_secs(60),
+        || pausing.exists(),
+    );
+    let script = patient_commands_in_background(
+        src.port,
+        Duration::from_secs(30),
+        &[&["EVAL", body, "1", &key, "6"]],
+    );
+    let held = routed_and_held(src, 2);
+    std::fs::remove_file(pausing).unwrap();
+    wait_until(
+        "the handoff to hold writes for the TAKEOVER",
+        Duration::from_secs(60),
+        || dst.log().contains("(test) TAKEOVER waits"),
+    );
+    std::fs::remove_file(held).unwrap();
+    wait_until(
+        "the script to wait out the handoff outside its gates",
+        Duration::from_secs(10),
+        || src.log().contains("(test) EVAL waits outside its gates"),
+    );
+    let canceled = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "CANCEL", "ID", &task_id]);
+    assert_eq!(canceled.int(), 1, "{canceled:?}");
+
+    let reply = script.join().unwrap();
+    assert!(reply.is_ok(), "the script, here after all: {reply:?}");
+    // Held at `routed` too, as it names the key: the third such command.
+    assert_eq!(run_past_the_stall(src, 3, &["GET", &key]).text(), "6");
+    assert_eq!(count("scripts_run_beside_others") - beside, 2);
+    assert_eq!(
+        count("scripts_run_alone_not_quick") - not_quick,
+        0,
+        "dispatched again, the quick script ran alone"
+    );
+}
+
+/// A write sent with `ASKING` to a node importing its slot, that meets a
+/// handoff of other slots of that node, keeps its `ASKING` when it waits the
+/// handoff out and is dispatched again (#340): routing used it up the first
+/// time, and dispatched again without it, it was sent back with `-MOVED` to
+/// the slot's owner instead of being served here.
+#[test]
+fn an_asking_write_dispatched_again_after_a_handoff_is_served() {
+    // Of a slot node 0 serves: found before the nodes start, as node 1's
+    // stall names it.
+    let per = 16384 / 3;
+    let key = key_in(0..=(per - 1) as u16, "asked");
+    let tokio = ["--io-model", "tokio"];
+    let env = [
+        ("KIVIDB_TEST_FAILPOINTS", "routed,handoff-pausing"),
+        ("KIVIDB_TEST_STALL_KEYS", key.as_str()),
+    ];
+    let (nodes, ranges) = form_cluster_of(vec![
+        Node::start_with_env(&tokio, &[]),
+        Node::start_with_env(&tokio, &env),
+        Node::start_with_env(&tokio, &[("KIVIDB_TEST_TAKEOVER_DELAY_MS", "3000")]),
+    ]);
+    let (owner, src, dst) = (&nodes[0], &nodes[1], &nodes[2]);
+    assert!((ranges[0].0..=ranges[0].1).contains(&slot_of(&key)));
+    let slot = slot_of(&key).to_string();
+    let r = src
+        .conn()
+        .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &owner.id()]);
+    assert!(r.is_ok(), "SETSLOT IMPORTING: {r:?}");
+    let r = owner
+        .conn()
+        .cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &src.id()]);
+    assert!(r.is_ok(), "SETSLOT MIGRATING: {r:?}");
+    let r = src.conn().cmd(&[
+        "CONFIG",
+        "SET",
+        "cluster-slot-migration-write-pause-timeout",
+        "10000",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+
+    // Node 2 takes some of node 1's own slots, not the one it imports.
+    let (lo, hi) = (ranges[1].0.to_string(), (ranges[1].0 + 100).to_string());
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", &lo, &hi])
+        .text();
+    let pausing = src.dir.join("failpoint.handoff-pausing.1");
+    wait_until(
+        "the handoff to be about to pause writes",
+        Duration::from_secs(60),
+        || pausing.exists(),
+    );
+    let write = patient_commands_in_background(
+        src.port,
+        Duration::from_secs(30),
+        &[&["ASKING"], &["SET", &key, "asked"]],
+    );
+    let held = routed_and_held(src, 1);
+    std::fs::remove_file(pausing).unwrap();
+    wait_until(
+        "the handoff to hold writes for the TAKEOVER",
+        Duration::from_secs(60),
+        || dst.log().contains("(test) TAKEOVER waits"),
+    );
+    std::fs::remove_file(held).unwrap();
+    wait_until(
+        "the write to wait out the handoff outside its gates",
+        Duration::from_secs(10),
+        || src.log().contains("(test) SET waits outside its gates"),
+    );
+    let reply = write.join().unwrap();
+    assert!(
+        reply.is_ok(),
+        "the ASKING write, dispatched again: {reply:?}"
+    );
+    wait_import_completed(dst, &task_id);
+    // Written here, in the slot it imports.
+    assert_eq!(
+        src.conn().cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(),
+        1
+    );
+}
+
+/// A script whose key a `MIGRATE` has on the wire waits, outside its
+/// gates, until the key has moved (`WAIT_UNTIL_MOVED`, #340): connections
+/// of the other threads keep getting replies meanwhile, and the script is
+/// then dispatched again and sent on with `-ASK`, where it runs on the
+/// moved key. It runs alone (its first run), so in its gates it would hold
+/// every other command back for the whole round trip.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_waiting_for_a_migrate_of_its_key_holds_back_no_other_replies() {
+    for model in io_models() {
+        // `KIVIDB_TEST_STALL_KEYS` names a key nothing uses: it only turns
+        // on the log line of a command waiting outside its gates.
+        let env = [
+            ("KIVIDB_TEST_FAILPOINTS", "migrate-before-delete"),
+            ("KIVIDB_TEST_STALL_KEYS", "never-named"),
+        ];
+        let args = ["--io-model", *model, "--threads", "4"];
+        let (nodes, ranges) = form_cluster_of(vec![
+            Node::start_with_env(&args, &env),
+            Node::start_with_env(&args, &[]),
+        ]);
+        let (src, dst) = (&nodes[0], &nodes[1]);
+        // No hash tag: a build with Lua locks a tagged key's tag for the
+        // whole of a MIGRATE that names it, and the script would wait there.
+        let key = key_in(ranges[0].0..=ranges[0].1, "moving");
+        let staying = (0..)
+            .map(|i| format!("probe:{i}"))
+            .find(|k| {
+                (ranges[0].0..=ranges[0].1).contains(&slot_of(k)) && slot_of(k) != slot_of(&key)
+            })
+            .unwrap();
+        let slot = slot_of(&key).to_string();
+        let mut s = src.conn();
+        assert!(s.cmd(&["SET", &key, "1"]).is_ok());
+        assert!(s.cmd(&["SET", &staying, "p"]).is_ok());
+        let r = dst
+            .conn()
+            .cmd(&["CLUSTER", "SETSLOT", &slot, "IMPORTING", &src.id()]);
+        assert!(r.is_ok(), "SETSLOT IMPORTING: {r:?}");
+        let r = s.cmd(&["CLUSTER", "SETSLOT", &slot, "MIGRATING", &dst.id()]);
+        assert!(r.is_ok(), "SETSLOT MIGRATING: {r:?}");
+
+        let port = dst.port.to_string();
+        let migrate: Vec<String> = ["MIGRATE", "127.0.0.1", &port, &key, "0", "5000"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let mut script = None;
+        let mut slowest = Duration::ZERO;
+        let reply = migrate_with_writes_meanwhile(src, &migrate, 1, || {
+            let mut probes = answering_conns(src.port, 17);
+            assert!(probes.len() >= 5, "only {} probes answered", probes.len());
+            // On a connection that answered: with io_uring, one made now can
+            // land on the worker held at the failpoint and never be read.
+            let mut on_a_free_worker = probes.pop().unwrap();
+            on_a_free_worker
+                .stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let moving = key.clone();
+            let eval = std::thread::spawn(move || {
+                on_a_free_worker.cmd(&["EVAL", "return redis.call('INCR', KEYS[1])", "1", &moving])
+            });
+            wait_until(
+                "the script to wait for the move outside its gates",
+                Duration::from_secs(10),
+                || src.log().contains("(test) EVAL waits outside its gates"),
+            );
+            for probe in &mut probes {
+                let asked = Instant::now();
+                assert_eq!(probe.cmd(&["GET", &staying]).text(), "p");
+                slowest = slowest.max(asked.elapsed());
+            }
+            assert!(
+                !eval.is_finished(),
+                "{model}: the script waits for the move"
+            );
+            script = Some(eval);
+        });
+        assert!(reply.is_ok(), "{model}: MIGRATE: {reply:?}");
+        eprintln!("{model}: slowest probe while the script waited: {slowest:?}");
+        assert!(
+            slowest < Duration::from_millis(200),
+            "{model}: a probe waited {slowest:?} while the script waited for the move"
+        );
+        let reply = script.unwrap().join().unwrap();
+        let ask = format!("ASK {slot} 127.0.0.1:{}", dst.port);
+        assert!(
+            reply.err().is_some_and(|e| e.starts_with(&ask)),
+            "{model}: the script is sent on: {reply:?}"
+        );
+        let mut d = dst.conn();
+        assert!(d.cmd(&["ASKING"]).is_ok());
+        assert_eq!(
+            d.cmd(&["EVAL", "return redis.call('INCR', KEYS[1])", "1", &key])
+                .int(),
+            2
+        );
+        assert_eq!(s.cmd(&["CLUSTER", "COUNTKEYSINSLOT", &slot]).int(), 0);
+    }
+}
+
 /// Of `want * 2` new connections to `port`, those that answer a `PING`
 /// within a second: connections on threads that are not held.
 #[cfg(feature = "lua")]
