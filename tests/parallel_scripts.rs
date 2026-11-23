@@ -2136,25 +2136,38 @@ fn queued_script_waiting_for_a_migrate(io: &str, look: bool) {
     let mut a = free.pop().unwrap();
     // A's thread.
     made_quick(&mut a, &["EVALSHA", &slow, "1", "a", "1"]);
-    let (mut a, reply, others) = threads_held_back(a, slow_call("a"), free);
-    assert!(matches!(reply, V::Int(_)), "{reply:?}");
     let held = Duration::from_millis(500);
     let not_held = Duration::from_millis(150);
     let mut on_a = Vec::new();
     let mut elsewhere = Vec::new();
-    for (conn, longest) in others {
-        if longest >= held {
-            on_a.push(conn);
-        } else if longest < not_held {
-            elsewhere.push(conn);
+    // Where the kernel puts a connection (SO_REUSEPORT) is a hash of its
+    // addresses: a set of them may have none on A's thread, or none
+    // elsewhere. More connections are opened, and told apart by another of
+    // A's slow scripts, until there are some of each (at most 8 rounds).
+    for round in 0.. {
+        let (a_back, reply, others) = threads_held_back(a, slow_call("a"), free);
+        a = a_back;
+        assert!(matches!(reply, V::Int(_)), "{reply:?}");
+        for (conn, longest) in others {
+            if longest >= held {
+                on_a.push(conn);
+            } else if longest < not_held {
+                elsewhere.push(conn);
+            }
         }
+        if on_a.len() >= 3 && elsewhere.len() >= 3 {
+            break;
+        }
+        assert!(
+            round < 8,
+            "after {round} rounds, {} connections on A's thread and {} elsewhere",
+            on_a.len(),
+            elsewhere.len()
+        );
+        free = free_connections(port, 40, Duration::from_secs(1));
     }
     // B: a connection on another thread than A's; and B's own thread, whose
     // connections are left out.
-    assert!(
-        !elsewhere.is_empty(),
-        "no connection on another thread than A's"
-    );
     let mut b = elsewhere.swap_remove(0);
     made_quick(&mut b, &["EVALSHA", &slow, "1", "b", "1"]);
     let mut probes: Vec<(Conn, bool)> = on_a.into_iter().map(|p| (p, true)).collect();
