@@ -4670,6 +4670,9 @@ fn preload(
             stats.commands,
             incr.display()
         );
+        // The replay wrote no vector set's graph: they are made now, in the
+        // background, as after `recover_from_aof`'s replay.
+        crate::vector::vset_graph::request_builds(store);
         if stats.truncated_tail {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -4715,6 +4718,9 @@ pub fn recover_from_aof(
         dump_already_loaded,
     ) {
         Ok(stats) => {
+            // The replay wrote no vector set's graph: they are made now, in
+            // the background, as after a snapshot load.
+            crate::vector::vset_graph::request_builds(store);
             let keys: usize = store
                 .iter()
                 .map(|db| {
@@ -6416,7 +6422,7 @@ mod vset_quant_marker_tests {
             Some(ValueRef::VectorSet(vs)) => {
                 let vs = vs.read();
                 let name = crate::key_bytes::KeyBytes::from(element.as_bytes());
-                let stored = match vs.entries.get(&name).map(|e| &e.vector) {
+                let stored = match vs.entries.get(&name).and_then(|e| e.vector.as_ref()) {
                     Some(StoredVector::F32(_)) => "f32",
                     Some(StoredVector::Q8 { .. }) => "int8",
                     Some(StoredVector::Bin { .. }) => "bin",

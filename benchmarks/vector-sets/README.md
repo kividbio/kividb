@@ -33,13 +33,13 @@ Ground truth is exact cosine top-10.
 - **Random uniform vectors are very hard for HNSW:** Redis's recall@10 at default EF on
   100k is 0.31. Real embedding datasets (glove, dbpedia, as in #627) give much higher
   recall at the same EF, so always compare with recall next to throughput.
-- **KiviDB (1.2.x/master) ignores the quantization and HNSW options:**
-  - it accepts `Q8`, `NOQUANT`, `BIN`, `M` and `EF` on `VADD` and stores f32
-    (`VINFO`: `quant-type f32`, `index-type FLAT`);
-  - it accepts `EF`, `EPSILON` and `TRUTH` on `VSIM` and runs an exact scan.
-
-  So its recall is always 1.0, and its query time grows linearly with the set size
-  (#710). Quantized storage is #697.
+- **The results below predate #710**, when KiviDB's `VSIM` was an exact scan whose time grew
+  with the set (recall 1.0, `VINFO` `index-type FLAT`). Since #710 a set of 4,096 elements or
+  more is searched in an HNSW graph, as Redis does (`EF`, `EPSILON` and `TRUTH` honoured, `M`
+  and `EF` on the `VADD` that makes a set): see regression suite `44-vector-sets-hnsw` and
+  COMMANDS.md, "How VSIM searches", for the numbers now. `load_time.py` here measures how
+  long a set takes to be searched by graph again after a restart, and `aof_replay.py` how
+  long an AOF of `VADD`s takes to replay.
 - **1M vectors:** only KiviDB's load (5.4 s, 665 B/vector) and its single-client
   query (7.3 ops/s, p50 136 ms) were measured. A full 1M run on both servers is still to do.
 

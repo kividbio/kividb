@@ -204,9 +204,17 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let elements = layout::sampled(inner.entries.len(), samples, || {
                 inner.entries.iter().map(|(name, entry)| {
                     crate::key_bytes::KeyBytes::heap_bytes_of(name.as_bytes())
-                        + entry.vector.heap_bytes()
+                        + entry.vector.as_ref().map_or(0, |v| v.heap_bytes())
                         + entry.attrs.as_ref().map_or(0, |a| a.len())
                 })
+            });
+            // The graph, once the set has one: f32 vectors and links, and
+            // each name twice more (the name's heap bytes, sampled).
+            let graph = inner.graph.get().map_or(0, |graph| {
+                let names = layout::sampled(inner.entries.len(), samples, || {
+                    inner.entries.keys().map(|name| name.as_bytes().len())
+                });
+                graph.bytes(names)
             });
             entry()
                 + layout::arc_of::<RwLock<crate::types::VectorSetInner>>()
@@ -214,6 +222,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     inner.entries.capacity(),
                 )
                 + elements
+                + graph
         }
 
         ValueRef::Array(arc) => {
