@@ -66,9 +66,6 @@ impl SharedBytes {
     unsafe fn make(len: usize, fill: impl FnOnce(*mut u8)) -> Self {
         let layout = Self::layout(len);
         let to = match crate::value_slab::class_of(layout.size()) {
-            Some(class) if layout.size() <= crate::value_slab::SMALL_MAX_BLOCK => {
-                crate::value_slab::alloc_small(class).cast::<Header>()
-            }
             Some(class) => crate::value_slab::alloc(class).cast::<Header>(),
             None => {
                 // SAFETY: the layout is never of size zero, for the header.
@@ -255,10 +252,6 @@ impl Drop for SharedBytes {
         match crate::value_slab::class_of(layout.size()) {
             // SAFETY: this was the last holder, and a block of this size
             // came from this class.
-            Some(class) if layout.size() <= crate::value_slab::SMALL_MAX_BLOCK => unsafe {
-                crate::value_slab::free_small(self.to.cast(), class)
-            },
-            // SAFETY: as above.
             Some(class) => unsafe { crate::value_slab::free(self.to.cast(), class) },
             // SAFETY: this was the last holder, and the block was allocated
             // with this layout.

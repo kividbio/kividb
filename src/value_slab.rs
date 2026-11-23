@@ -106,9 +106,8 @@ const LARGE_SLABS: usize = REGION / LARGE_SLAB;
 const LARGE_FEWEST: usize = 40;
 /// Two large classes in a row are at most this many thousandths apart.
 const LARGE_STEP: usize = 1025;
-/// The largest block of a 64 KiB slab of the keyspace's classes: a block of
-/// up to this many bytes is [`alloc_small`]'s and [`free_small`]'s.
-pub const SMALL_MAX_BLOCK: usize = 2048;
+/// The largest block of a 64 KiB slab of the keyspace's classes.
+const SMALL_MAX_BLOCK: usize = 2048;
 /// The classes up to 2 KiB: 16 bytes apart to 512, then 32 apart: 32 and
 /// 48 classes. A key of 15 bytes and a value of 1,024 make an entry of 1,051
 /// bytes, in the class of 1,056.
@@ -765,10 +764,12 @@ pub fn alloc(class: usize) -> NonNull<u8> {
     }
 }
 
-/// [`alloc`] of a class of 64 KiB slabs (up to 2 KiB, or the entry pool's),
-/// for a caller that knows it is one.
+/// [`alloc`] of a class of 64 KiB slabs (up to 2 KiB, or the entry pool's).
+/// Callers go through [`alloc`]: calling this directly where the class is
+/// known measured slower (random GETs over 100M keys, 10 %), as it changed
+/// what is inlined into the command path.
 #[inline]
-pub fn alloc_small(class: usize) -> NonNull<u8> {
+fn alloc_small(class: usize) -> NonNull<u8> {
     debug_assert!(!is_large(class));
     alloc_in::<false>(class)
 }
@@ -843,7 +844,7 @@ pub unsafe fn free(block: NonNull<u8>, class: usize) {
 /// # Safety
 /// As [`free`]'s.
 #[inline]
-pub unsafe fn free_small(block: NonNull<u8>, class: usize) {
+unsafe fn free_small(block: NonNull<u8>, class: usize) {
     debug_assert!(!is_large(class));
     // SAFETY: the caller's promise.
     unsafe { free_in::<false>(block, class) }
