@@ -196,10 +196,11 @@ pub(crate) struct FollowedImports {
 /// the slots of its master it holds (`ClusterState::held_claims_of_master`),
 /// and a promotion takes only those (`ClusterState::promote_self`).
 ///
-/// The slots not held are written down, synced, in
-/// `<cluster-config-file>.not-held` whenever they change, before the
-/// cluster config that shows the gain is saved (the table changes first,
-/// its save follows on the save thread). At start-up they are read back:
+/// A gain is noted here together with the table change, under the slot
+/// table's lock, and the slots not held are written down, synced, in
+/// `<cluster-config-file>.not-held` before every save of the cluster config
+/// (`persist::save_then`; nothing is written when they have not changed):
+/// no save of nodes.conf shows a gain the file does not have. At start-up they are read back:
 /// a replica that heard its master gain slots, and restarted before its
 /// stream confirmed them, does not hold them after the restart either. No
 /// file: every slot of the master in the table, read from nodes.conf, is
@@ -522,12 +523,6 @@ pub(crate) fn save_not_held(cluster: &ClusterState) {
             path.display()
         ),
     }
-}
-
-/// [`FollowedImports::note_gains`], written down.
-pub(crate) fn note_gains(cluster: &ClusterState, master: NodeId, gains: &[(u16, u64)]) {
-    cluster.followed_imports.note_gains(master, gains);
-    save_not_held(cluster);
 }
 
 /// [`FollowedImports::forget_not_held`], written down.

@@ -1942,13 +1942,16 @@ impl ClusterState {
         // Not while slots handed over from here may not be known as moved
         // everywhere (see `epoch_may_change`): the collision is seen again
         // at the next heartbeat, and resolved then.
-        if self.epoch_may_change().is_err() {
+        let moved = self.change_epoch_if_it_may(|| {
+            let epoch = self.bump_epoch();
+            if let Some(node) = self.nodes.write().get_mut(&me) {
+                node.config_epoch = epoch;
+            }
+            epoch
+        });
+        let Ok(epoch) = moved else {
             return false;
-        }
-        let epoch = self.bump_epoch();
-        if let Some(node) = self.nodes.write().get_mut(&me) {
-            node.config_epoch = epoch;
-        }
+        };
         log_info!(
             "Cluster: config epoch collision with {} — moved to {epoch}",
             node_id_str(&sender)
@@ -2470,9 +2473,12 @@ impl ClusterState {
                     }
                 }
             }
-        }
-        if !gains.is_empty() {
-            followed_imports::note_gains(self, owner_id, &gains);
+            // Noted with the table change, under its lock: no save of the
+            // cluster config shows the gain without it (the slots not held
+            // are written down before every save, `persist::save_then`).
+            if !gains.is_empty() {
+                self.followed_imports.note_gains(owner_id, &gains);
+            }
         }
         if shard_lost_slots || !lost.is_empty() {
             // A write routed here before this, and not yet in the write gate,
@@ -4261,7 +4267,21 @@ impl ClusterState {
     /// of them has gone out.
     pub fn take_over_slots(&self, slots: impl Iterator<Item = u16>) -> std::io::Result<()> {
         let epoch = self.bump_epoch();
-        self.take_over_slots_at(slots, epoch)
+        self.take_over_slots_at(slots, epoch, false)
+    }
+
+    /// [`Self::take_over_slots_at`] for an atomic import into this node:
+    /// refused too while a handover away from this node is under way, or
+    /// for a few heartbeats after one ([`HandingOver`],
+    /// [`Self::epoch_may_change`]), checked with `handoff_holds` held until
+    /// this node's config epoch is raised: a handover that begins after it
+    /// sees the new epoch and is refused ([`Self::begin_handover`]).
+    pub fn take_over_imported_slots(
+        &self,
+        slots: impl Iterator<Item = u16>,
+        epoch: u64,
+    ) -> std::io::Result<()> {
+        self.take_over_slots_at(slots, epoch, true)
     }
 
     /// [`Self::take_over_slots`], at config epoch `epoch`, taken with
@@ -4272,6 +4292,7 @@ impl ClusterState {
         &self,
         slots: impl Iterator<Item = u16>,
         epoch: u64,
+        not_while_handing_over: bool,
     ) -> std::io::Result<()> {
         let t = std::time::Instant::now();
         let mut steps: Vec<(&str, u128)> = Vec::new();
@@ -4287,6 +4308,11 @@ impl ClusterState {
         // The claim is at this node's config epoch, raised to `epoch`
         // unless it is newer already: what its heartbeats claim.
         let new_epoch = {
+            // Before `nodes`, as `begin_handover` takes it.
+            let _holds = not_while_handing_over.then(|| self.handoff_holds.lock());
+            if not_while_handing_over && let Err(why) = self.epoch_may_change() {
+                return Err(std::io::Error::other(HandingOver(why)));
+            }
             let mut nodes = self.nodes.write();
             // Masters only: a replica says its master's epoch.
             if let Some(other) = nodes
@@ -4655,18 +4681,6 @@ impl ClusterState {
         *self.last_handover_end.lock() = Some(std::time::Instant::now());
     }
 
-    /// Whether a replica of this master may take its slots over now, as it
-    /// asks with `CLUSTER FAILOVER` or for this node's vote (#516). Not while
-    /// an atomic slot migration away from this node is handing slots over,
-    /// nor for [`HANDOVER_FAILOVER_GRACE`] after one ended: a promoted
-    /// replica claims the slots it sees this node own, and until it has
-    /// heard of the destination's claim, those include the ones that moved.
-    /// Nor while an import into this node is taking slots over.
-    ///
-    /// If it may, a migration away from this node that has not reached its
-    /// handover gives it up ([`Self::begin_handover`]), and the imports into
-    /// this node give their attempt up: a replica that takes over has only
-    /// what the stream has brought, and is no destination of theirs.
     /// Whether this node may take a new config epoch now (`CLUSTER
     /// BUMPEPOCH`, the move on an epoch collision, a takeover of slots
     /// imported here). Not while an atomic slot migration away from this
@@ -4695,19 +4709,29 @@ impl ClusterState {
         Ok(())
     }
 
-    /// This node's config epoch, while it hands slots over in an atomic
-    /// slot migration (`CLUSTER SYNCSLOTS EPOCH`, which the destination asks
-    /// before it takes an epoch for the takeover): it takes no new one until
-    /// [`HANDOVER_FAILOVER_GRACE`] after the handover ([`Self::epoch_may_change`]).
-    /// `None` when no handover is under way.
-    pub(crate) fn epoch_while_handing_over(&self) -> Option<u64> {
-        if self.handovers.load(Ordering::SeqCst) == 0 {
-            return None;
-        }
-        let me = self.myself();
-        self.nodes.read().get(&me).map(|n| n.config_epoch)
+    /// `change`, a change of this node's config epoch, if it may change now
+    /// ([`Self::epoch_may_change`]), with `handoff_holds` held throughout:
+    /// a handover away from this node begins either before (the change is
+    /// refused) or after (its check of this node's epoch sees the change,
+    /// [`Self::begin_handover`], and it is refused).
+    pub(crate) fn change_epoch_if_it_may<R>(&self, change: impl FnOnce() -> R) -> Result<R, String> {
+        let _holds = self.handoff_holds.lock();
+        self.epoch_may_change()?;
+        Ok(change())
     }
 
+    /// Whether a replica of this master may take its slots over now, as it
+    /// asks with `CLUSTER FAILOVER` or for this node's vote (#516). Not while
+    /// an atomic slot migration away from this node is handing slots over,
+    /// nor for [`HANDOVER_FAILOVER_GRACE`] after one ended: a promoted
+    /// replica claims the slots it sees this node own, and until it has
+    /// heard of the destination's claim, those include the ones that moved.
+    /// Nor while an import into this node is taking slots over.
+    ///
+    /// If it may, a migration away from this node that has not reached its
+    /// handover gives it up ([`Self::begin_handover`]), and the imports into
+    /// this node give their attempt up: a replica that takes over has only
+    /// what the stream has brought, and is no destination of theirs.
     pub(crate) fn failover_may_begin(&self) -> Result<(), String> {
         let _holds = self.handoff_holds.lock();
         if self.handovers.load(Ordering::SeqCst) > 0 {
@@ -5014,6 +5038,19 @@ impl std::fmt::Display for EpochOvertaken {
 }
 
 impl std::error::Error for EpochOvertaken {}
+
+/// Why [`ClusterState::take_over_imported_slots`] did not take the slots: a
+/// handover away from this node is under way, or ended a moment ago.
+#[derive(Debug)]
+pub struct HandingOver(pub String);
+
+impl std::fmt::Display for HandingOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HandingOver {}
 
 /// How long after an atomic slot migration away from a master handed slots
 /// over its replicas may not take them over (`failover_may_begin`), nor

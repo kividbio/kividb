@@ -1096,11 +1096,13 @@ fn cmd_bumpepoch(state: &ClusterState) -> Vec<u8> {
         return err;
     }
     // Not while slots handed over from here may not be known as moved
-    // everywhere (`ClusterState::epoch_may_change`).
-    if let Err(why) = state.epoch_may_change() {
-        return resp_error(&format!("ERR BUMPEPOCH refused for now: {why}"));
-    }
-    let (bumped, epoch) = state.bump_config_epoch_without_consensus();
+    // everywhere (`ClusterState::epoch_may_change`), checked with the bump
+    // under one hold.
+    let (bumped, epoch) =
+        match state.change_epoch_if_it_may(|| state.bump_config_epoch_without_consensus()) {
+            Ok(bumped) => bumped,
+            Err(why) => return resp_error(&format!("ERR BUMPEPOCH refused for now: {why}")),
+        };
     if !bumped {
         return resp_simple(&format!("STILL {epoch}"));
     }
@@ -1906,13 +1908,6 @@ fn cmd_syncslots(ctx: &mut Ctx) -> Vec<u8> {
             ctx.cluster.slot_migrations.cancel(Some(&task_id));
             resp_simple("OK")
         }
-        // CLUSTER SYNCSLOTS EPOCH <task-id>: destination → source, before it
-        // takes an epoch for the takeover: the source's config epoch, which
-        // it keeps while it hands the slots over.
-        "EPOCH" => match ctx.cluster.epoch_while_handing_over() {
-            Some(epoch) => resp_simple(&epoch.to_string()),
-            None => resp_error("ERR no handover is under way on this node"),
-        },
         "TAKEOVER" => {
             // It waits (see `migration::take_over`): on an io_uring worker,
             // run on a thread of its own, while the worker serves its other
@@ -1930,11 +1925,19 @@ fn cmd_syncslots(ctx: &mut Ctx) -> Vec<u8> {
                 );
             }
             let pause_ms = migration::write_pause_timeout_ms(ctx.config);
+            // The source's config epoch, from a source of this release:
+            // `TAKEOVER <task-id> <epoch>`.
+            let source_epoch = ctx
+                .cmd
+                .get(4)
+                .and_then(|e| std::str::from_utf8(e).ok())
+                .and_then(|e| e.parse().ok());
             done(migration::take_over(
                 ctx.cluster,
                 &task_id,
                 ctx.client_id,
                 pause_ms,
+                source_epoch,
             ))
         }
         "FAIL" => {

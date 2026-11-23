@@ -9832,6 +9832,182 @@ fn a_takeover_by_hand_takes_only_the_slots_the_replica_holds() {
     replica_cut_off_during_an_import(true, Stands::ByHand, false);
 }
 
+/// A node that imports slots and hands others over at once: its takeover
+/// and its handover never overlap, nor does its takeover come within a few
+/// heartbeats after its handover, so that the two claims are at epochs that
+/// order them. `takeover_first` false: the takeover is held after its
+/// replica acknowledged (failpoint `takeover-acknowledged`), the handover
+/// away from the node runs and ends, and the takeover is refused, then
+/// taken once the handover's grace is over. True: the handover is held
+/// before it pauses writes (`handoff-pausing`), the takeover raises the
+/// node's config epoch, and the handover is given up for it, then made at
+/// the next attempt. Either way every node ends with each slot's owner, and
+/// every key on it.
+fn importing_and_handing_over_at_once(takeover_first: bool) {
+    let dst = Node::start_with_env(
+        &[],
+        &[(
+            "KIVIDB_TEST_FAILPOINTS",
+            "takeover-acknowledged,handoff-pausing",
+        )],
+    );
+    let (nodes, ranges) = form_cluster_of(vec![Node::start(&[]), dst, Node::start(&[])]);
+    let replica = add_replica(&nodes, &nodes[1]);
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, all.len());
+    }
+    set_pause_timeout(&[&nodes[0], &nodes[1], &nodes[2]], "30000");
+    let (d_id, e_id) = (nodes[1].id(), nodes[2].id());
+    let (a, b) = (ranges[1].0, ranges[1].0 + 100);
+    let coming = Written::on(&nodes[0], 0..=100, "coming", 100);
+    let going = Written::on(&nodes[1], a..=b, "going", 100);
+    let failpoint = |name: &str, n: u32| nodes[1].dir.join(format!("failpoint.{name}.{n}"));
+    let wait_for = |what: &str, file: &std::path::Path| {
+        wait_until(what, Duration::from_secs(30), || file.exists());
+    };
+    let task_in = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "100"])
+        .text();
+    wait_for(
+        "the takeover into the node to be held",
+        &failpoint("takeover-acknowledged", 1),
+    );
+    let task_out = nodes[2]
+        .conn()
+        .cmd(&[
+            "CLUSTER",
+            "MIGRATION",
+            "IMPORT",
+            &a.to_string(),
+            &b.to_string(),
+        ])
+        .text();
+    wait_for(
+        "the handover away from the node to be held",
+        &failpoint("handoff-pausing", 1),
+    );
+    if takeover_first {
+        std::fs::remove_file(failpoint("takeover-acknowledged", 1)).unwrap();
+        wait_import_completed(&nodes[1], &task_in);
+        std::fs::remove_file(failpoint("handoff-pausing", 1)).unwrap();
+        wait_until(
+            "the handover to be given up for the node's new epoch",
+            Duration::from_secs(20),
+            || nodes[1].log().contains("config epoch went from"),
+        );
+        wait_for(
+            "the next attempt of the handover",
+            &failpoint("handoff-pausing", 2),
+        );
+        std::fs::remove_file(failpoint("handoff-pausing", 2)).unwrap();
+        wait_import_completed(&nodes[2], &task_out);
+    } else {
+        std::fs::remove_file(failpoint("handoff-pausing", 1)).unwrap();
+        wait_import_completed(&nodes[2], &task_out);
+        std::fs::remove_file(failpoint("takeover-acknowledged", 1)).unwrap();
+        wait_until(
+            "the takeover to be refused for the handover",
+            Duration::from_secs(20),
+            || {
+                let log = nodes[1].log();
+                log.contains("handing its slots over")
+                    || log.contains("destination's claim may not have reached every node")
+            },
+        );
+        wait_for(
+            "the next attempt of the takeover",
+            &failpoint("takeover-acknowledged", 2),
+        );
+        std::fs::remove_file(failpoint("takeover-acknowledged", 2)).unwrap();
+        wait_import_completed(&nodes[1], &task_in);
+    }
+    wait_until(
+        "every node to hold the owner of both moves",
+        Duration::from_secs(30),
+        || {
+            nodes.iter().chain(std::iter::once(&replica)).all(|n| {
+                owner_in_view_of(n, 50).as_deref() == Some(d_id.as_str())
+                    && owner_in_view_of(n, a).as_deref() == Some(e_id.as_str())
+                    && n.cluster_info("cluster_state") == "ok"
+            })
+        },
+    );
+    let absent = coming.missing_on(&nodes[1]);
+    assert!(absent.is_empty(), "{} keys not on the node", absent.len());
+    let absent = going.missing_on(&nodes[2]);
+    assert!(absent.is_empty(), "{} keys not on the new owner", absent.len());
+}
+
+/// [`importing_and_handing_over_at_once`]: the handover first.
+#[test]
+fn a_takeover_into_a_node_that_just_handed_slots_over_waits_for_the_grace() {
+    importing_and_handing_over_at_once(false);
+}
+
+/// [`importing_and_handing_over_at_once`]: the takeover first.
+#[test]
+fn a_handover_away_from_a_node_that_just_took_slots_over_is_made_again() {
+    importing_and_handing_over_at_once(true);
+}
+
+/// A KiviDB 1.2 source (`KIVIDB_1_2_BIN`), whose `TAKEOVER` does not say its
+/// config epoch: the destination takes the slots over at an epoch above the
+/// ones it knows, with every key.
+#[test]
+#[ignore = "needs a 1.2 binary in KIVIDB_1_2_BIN"]
+fn an_import_from_a_1_2_source_is_taken_over() {
+    let bin = std::env::var("KIVIDB_1_2_BIN").expect("KIVIDB_1_2_BIN");
+    let src = Node::start_with_env(&[], &[("KIVIDB_TEST_NODE_BIN", bin.as_str())]);
+    let (nodes, _) = form_cluster_of(vec![src, Node::start(&[])]);
+    let version = nodes[0].conn().cmd(&["INFO", "server"]).text();
+    assert!(version.contains("kividb_version:1.2."), "{version}");
+    let before = Written::on(&nodes[0], 0..=100, "before", 200);
+    let task_id = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "100"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_import_completed(&nodes[1], &task_id);
+    let dst_id = nodes[1].id();
+    wait_until("both to hold the destination as the owner", Duration::from_secs(20), || {
+        nodes
+            .iter()
+            .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str()))
+    });
+    let absent = before.missing_on(&nodes[1]);
+    assert!(absent.is_empty(), "{} keys not on the owner", absent.len());
+}
+
+/// A KiviDB 1.2 destination (`KIVIDB_1_2_BIN`), which reads no more of a
+/// `TAKEOVER` than its task id: the source of this release, which sends its
+/// config epoch after it, hands the slots over all the same, with every key.
+#[test]
+#[ignore = "needs a 1.2 binary in KIVIDB_1_2_BIN"]
+fn an_import_into_a_1_2_destination_is_taken_over() {
+    let bin = std::env::var("KIVIDB_1_2_BIN").expect("KIVIDB_1_2_BIN");
+    let dst = Node::start_with_env(&[], &[("KIVIDB_TEST_NODE_BIN", bin.as_str())]);
+    let (nodes, _) = form_cluster_of(vec![Node::start(&[]), dst]);
+    let version = nodes[1].conn().cmd(&["INFO", "server"]).text();
+    assert!(version.contains("kividb_version:1.2."), "{version}");
+    let before = Written::on(&nodes[0], 0..=100, "before", 200);
+    let task_id = nodes[1]
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "100"])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    wait_import_completed(&nodes[1], &task_id);
+    let dst_id = nodes[1].id();
+    wait_until("both to hold the destination as the owner", Duration::from_secs(20), || {
+        nodes
+            .iter()
+            .all(|n| owner_in_view_of(n, 50).as_deref() == Some(dst_id.as_str()))
+    });
+    let absent = before.missing_on(&nodes[1]);
+    assert!(absent.is_empty(), "{} keys not on the owner", absent.len());
+}
+
 /// A takeover whose reserved epoch another master reaches while it waits:
 /// held after its replica acknowledged what arrived (failpoint
 /// `takeover-acknowledged`). The source takes no new config epoch while it

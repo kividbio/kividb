@@ -2297,11 +2297,17 @@ fn migrate_out(env: &Env, task: &Task) -> Result<u64, String> {
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(100)),
     ));
+    // With this node's config epoch, which it keeps until a few heartbeats
+    // after the handover (`ClusterState::epoch_may_change`): the
+    // destination takes the slots at an epoch above it. A destination of an
+    // earlier release takes no more than the task id, and reads no further.
+    let epoch_now = config_epoch().unwrap_or(0).to_string();
     let takeover = peer.call(&command(&[
         b"CLUSTER",
         b"SYNCSLOTS",
         b"TAKEOVER",
         task.id.as_bytes(),
+        epoch_now.as_bytes(),
     ]));
     if let Err(error) = takeover {
         // No answer is not a refusal, nor is an error: the destination may
@@ -3643,10 +3649,11 @@ pub fn accept_apply(cluster: &ClusterState, task_id: &str, client_id: u64) -> Re
 /// on a thread of its own (`deferred::run_elsewhere`), and on Tokio off the
 /// runtime, so that only the connection that sent it waits.
 pub fn take_over(
-    cluster: &Arc<ClusterState>,
+    cluster: &ClusterState,
     task_id: &str,
     client_id: u64,
     pause_ms: u64,
+    source_epoch: Option<u64>,
 ) -> Result<(), String> {
     if let Some(delay) = test_failpoint(&TEST_TAKEOVER_DELAY) {
         log_warn!("Cluster: (test) TAKEOVER waits {delay:?} before it takes the slots");
@@ -3659,7 +3666,9 @@ pub fn take_over(
         super::bus::heartbeat::set_test_bus_muted(true);
     }
     let deadline = Instant::now() + takeover_wait(pause_ms);
-    let result = off_the_runtime(|| take_over_now(cluster, task_id, client_id, deadline));
+    let result = off_the_runtime(|| {
+        take_over_now(cluster, task_id, client_id, deadline, source_epoch)
+    });
     if let Some(delay) = lost {
         log_warn!("Cluster: (test) the TAKEOVER's reply and claim are held back {delay:?}");
         test_sleep(delay);
@@ -3685,10 +3694,11 @@ fn takeover_wait(pause_ms: u64) -> Duration {
 
 /// [`take_over`], waiting until `deadline` at most.
 fn take_over_now(
-    cluster: &Arc<ClusterState>,
+    cluster: &ClusterState,
     task_id: &str,
     client_id: u64,
     deadline: Instant,
+    source_epoch: Option<u64>,
 ) -> Result<(), String> {
     // Refused if the source has given this attempt up meanwhile: it has
     // been told that the slots stay with it, and takes writes again.
@@ -3771,13 +3781,13 @@ fn take_over_now(
     // should this attempt be refused, a later takeover of them is at a newer
     // epoch, which the marker does not stand for.
     //
-    // Above the source's config epoch, as the source has it while it hands
-    // the slots over (it takes no new one then, nor for a few heartbeats
-    // after: `ClusterState::epoch_may_change`): asked, as this node may not
-    // have heard yet of a new epoch the source took just before the
-    // migration began. A source of an earlier release does not answer:
-    // what this node knows of it, then.
-    if let Some(source_epoch) = source_epoch_now(cluster, &task) {
+    // Above the source's config epoch, which its `TAKEOVER` says (this node
+    // may not have heard yet of a new epoch the source took just before the
+    // migration began): the source takes no new one while it hands the
+    // slots over, nor for a few heartbeats after
+    // (`ClusterState::epoch_may_change`). A source of an earlier release
+    // does not say: what this node knows of it, then.
+    if let Some(source_epoch) = source_epoch {
         cluster.observe_epoch(source_epoch);
     }
     let epoch = cluster.bump_epoch();
@@ -3909,20 +3919,27 @@ fn take_over_now(
     // is synced before the slots are taken: a write to them acknowledged
     // here is on disk, and so is this node's claim of them. Otherwise the
     // sync follows on another thread.
-    let take = || cluster.take_over_slots_at(slots_of(&task.ranges), epoch);
+    let take = || cluster.take_over_imported_slots(slots_of(&task.ranges), epoch);
     let taken = if crate::aof::syncs_before_acks() {
         take()
     } else {
         super::persist::with_deferred_sync(take)
     };
     if let Err(e) = taken {
-        // Another node's config epoch came up to the one taken above: tried
-        // again, at a new epoch, and a new `ARRIVED`.
+        // Another node's config epoch came up to the one taken above, or a
+        // handover away from this node began meanwhile: tried again, at a
+        // new epoch, and a new `ARRIVED`.
         if let Some(over) = e
             .get_ref()
             .and_then(|e| e.downcast_ref::<super::EpochOvertaken>())
         {
             return not_yet(&over.to_string(), true);
+        }
+        if let Some(why) = e
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<super::HandingOver>())
+        {
+            return not_yet(&why.0, true);
         }
         cluster.slot_migrations.takeover_undone(task_id);
         log_warn!(
@@ -3948,42 +3965,6 @@ fn take_over_now(
     );
     Ok(())
 }
-
-/// The source's config epoch while it hands `task`'s slots over, as it
-/// answers `CLUSTER SYNCSLOTS EPOCH`; `None` if it does not (an earlier
-/// release), or not within [`SOURCE_EPOCH_WAIT`]: asked on a thread of its
-/// own, which is left to end on its own, so that a source slow to answer
-/// (its thread for the new connection busy) holds the takeover up no
-/// longer than that.
-fn source_epoch_now(cluster: &Arc<ClusterState>, task: &Task) -> Option<u64> {
-    use crate::cpus::BuilderExt as _;
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let (cluster, source, id) = (Arc::clone(cluster), task.source, task.id.clone());
-    std::thread::Builder::new()
-        .name("kividb-epoch".into())
-        .spawn_released(move || {
-            let asked = cluster.hooks.get().and_then(|hooks| {
-                let mut peer =
-                    Peer::connect_to(&cluster, &hooks.replica_starter.repl_state, &source).ok()?;
-                peer.ask(&command(&[
-                    b"CLUSTER",
-                    b"SYNCSLOTS",
-                    b"EPOCH",
-                    id.as_bytes(),
-                ]))
-                .ok()?
-                .parse()
-                .ok()
-            });
-            let _ = tx.send(asked);
-        })
-        .ok()?;
-    rx.recv_timeout(SOURCE_EPOCH_WAIT).ok().flatten()
-}
-
-/// How long a destination waits for the source's answer to
-/// `CLUSTER SYNCSLOTS EPOCH` ([`source_epoch_now`]).
-const SOURCE_EPOCH_WAIT: Duration = Duration::from_millis(300);
 
 /// Whether the source of `task` is still the master of its slots, in this
 /// node's view, for the destination to take them over (#516). A replica of
