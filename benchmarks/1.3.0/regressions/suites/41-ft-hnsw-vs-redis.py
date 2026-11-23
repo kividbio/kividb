@@ -9,7 +9,8 @@ client in HSET pipelines of 1,000, the clock running until every document is
 in the index and nothing waits to be linked (KiviDB's FT.INFO `hnsw_backlog`;
 Redis's tiered buffer, `_FT.DEBUG VECSIM_INFO`). Then `FT.SEARCH idx
 "(<filter>)=>[KNN 10 @v $vec]" PARAMS 2 vec <blob> NOCONTENT LIMIT 0 10
-DIALECT 2`, one client, 5 s a case, 300 queries (seed 761).
+DIALECT 2`, one client, 5 s a case over 300 queries (seed 761); recall over
+1,200 (the same seed: the 300 and 900 more).
 
 Configurations, the issue's two datasets: `d384` (50,000 x 384) and `d64`
 (200,000 x 64). The candidate runs as it starts (`--threads 4`, the default
@@ -59,15 +60,20 @@ S = Suite("41-ft-hnsw-vs-redis",
           [Config(name, threads=4, engines=ENGINES, self_hosted=True) for name in DATASETS],
           min_cpus=8)
 M, EFC, BATCH, SECS, NQ = 16, 200, 1000, 5.0, 300
+# Queries recall is measured over. The graph is built by several threads, so
+# it differs from run to run, and with 300 queries a recall row moved by up
+# to 4 % between runs of the same build (d384 wide_default 0.488-0.508):
+# more than its 2 % gate. With 1,200, d384 wide_default was 0.491-0.493 in
+# three runs, and no row moved by more than 0.005.
+NQ_RECALL = 1200
 WIDE, NARROW = (50, 100), (0, 2)
 WRITES_PER_S = 500
 # The candidate at most this many times slower than Redis this session.
 # Build: what this suite recorded, with room for a run's noise and for the
 # two CPUs a D8s_v5 comes with (Xeon 8370C or 8573C). With
-# `search-index-threads auto` linking on all seven helpers during the load,
-# d384 1.01-1.05x and d64 1.26-1.34x in three runs on an 8370C (they were
-# 1.37x and 1.73x with three helpers; see the PRs of #760).
-BUILD_X = {"d384": 1.25, "d64": 1.6}
+# each insert costing as much CPU as Redis's: d384 0.81-0.89x and d64
+# 0.98-1.02x in three runs on an 8370C (see the PRs of #760).
+BUILD_X = {"d384": 1.05, "d64": 1.15}
 # The same EF_RUNTIME on both: the same work. Without a filter KiviDB was
 # from 0.96x to 1.22x Redis's q/s; with the wide one from 0.93x (d384, EF 100)
 # to 1.35x, its recall higher in every case.
@@ -143,7 +149,8 @@ def run(ctx):
         c = node.client(protocol=2)
         vecs = np.random.default_rng(760).random((n, dim), dtype=np.float32)
         scores = np.arange(n) % 101
-        queries = np.random.default_rng(761).random((NQ, dim), dtype=np.float32)
+        # The first NQ are those the rates are measured over.
+        queries = np.random.default_rng(761).random((NQ_RECALL, dim), dtype=np.float32)
         c.execute_command("FT.CREATE", "idx", "ON", "HASH", "PREFIX", "1", "doc:", "SCHEMA",
                           "score", "NUMERIC", "v", "VECTOR", "HNSW", "10", "TYPE", "FLOAT32",
                           "DIM", dim, "DISTANCE_METRIC", "COSINE", "M", M, "EF_CONSTRUCTION", EFC)
@@ -164,8 +171,21 @@ def run(ctx):
 
         vn = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
         qn = queries / np.linalg.norm(queries, axis=1, keepdims=True)
-        sims = qn @ vn.T
         blobs = [q.tobytes() for q in queries]
+
+        def exact(where):
+            """The exact 10 nearest of each query among the documents
+            `where` admits, 100 queries at a time (all 1,200 against 200,000
+            documents at once would take a GB)."""
+            admit = None if where is None else (scores >= where[0]) & (scores <= where[1])
+            out = []
+            for at in range(0, NQ_RECALL, 100):
+                s = qn[at:at + 100] @ vn.T
+                if admit is not None:
+                    s = np.where(admit[None, :], s, -np.inf)
+                top = np.argpartition(-s, 10, axis=1)[:, :10]
+                out.extend(set(row.tolist()) for row in top)
+            return out
 
         def search(q, blob):
             return c.execute_command("FT.SEARCH", "idx", q, "PARAMS", "2", "vec", blob,
@@ -174,14 +194,13 @@ def run(ctx):
         def case(label, where, ef, qps_gate, recall_gate):
             clause = "KNN 10 @v $vec" + ("" if ef is None else " EF_RUNTIME %d" % ef)
             q = "*=>[%s]" % clause if where is None else "(@score:[%d %d])=>[%s]" % (where + (clause,))
-            s = sims if where is None else np.where(
-                ((scores >= where[0]) & (scores <= where[1]))[None, :], sims, -np.inf)
-            truth = np.argsort(-s, axis=1)[:, :10]
+            truth = exact(where)
             hits = 0
             for i, blob in enumerate(blobs):
                 got = {int(k.decode().split(":")[1]) for k in search(q, blob)[1:]}
-                hits += len(got & set(truth[i].tolist()))
-            ctx.emit("%s_recall_at_10" % label, hits / (10.0 * NQ), "ratio", "higher", gate=recall_gate)
+                hits += len(got & truth[i])
+            ctx.emit("%s_recall_at_10" % label, hits / (10.0 * NQ_RECALL), "ratio", "higher",
+                     gate=recall_gate)
             done = 0
             end = time.perf_counter() + SECS
             while time.perf_counter() < end:

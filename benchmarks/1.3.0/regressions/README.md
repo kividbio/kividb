@@ -54,9 +54,10 @@ and why.
 | `35-tokio-pipelined-reads` | #432 / #891 | the Tokio loop (`--io-model tokio --threads 1`, the server on the first CPU, `redis-benchmark --threads 3` on the next three, 50 connections): `SET` of 1,024-byte values at pipeline 16 and of 4,096-byte values at pipeline 32, a second from the server's own `total_commands_processed` (median of 3); and one connection with a 64 KiB receive buffer that sends 400,000 `SET`s of 20-byte values (19 MB) in one write before reading a reply: 1 if it is written within 20 s and every reply arrives. Gates: the rates 10 % and 60 % of the gain over v1.2.2 in the same session; the pipeline `>= 1` (v1.2.2 stalls). Recorded on a D4s_v5 (`results/pr-891-d4s_v5`) |
 | `36-litellm-ratelimit` | #871 | LiteLLM's proxy rate limiter: its five Lua scripts byte for byte (`litellm/rust/crates/redis-store/src/rate_limits/lua.rs`, main @ 4b12a405; SHA-1s checked against `SCRIPT LOAD`), called as one request calls them, by `EVALSHA`, from memtier_benchmark (`--transaction`: one key and its team a call) at 200 and 500 connections over 50,000 keys: `BATCH_RATE_LIMITER` for one descriptor (one hash tag) and for key + team (two), `CHECK_AND_INCREMENT_BY_N` and `PARALLEL_ACQUIRE` for key + team, and the 13-command per-request mix. A 22-call transcript checked exactly first (window reset, all-or-nothing over the limit, the reconcile, acquire and release, TTLs), and every script call's keys under MONITOR; the candidate must run at least 90 % of its scripts beside others (`INFO stats` `scripts_run_beside_others`), or the suite fails. ops/s against Redis (a floor per workload, see the docstring), p99 shown, keys left without a TTL (must be 0). Needs 8 vCPUs and the `lua,tls` builds (`--candidate-full`) |
 | `37-zrandmember-by-count` | #862 | `ZRANDMEMBER` of a large sorted set (a table and a tree) of 1,000, 100,000 and 1,000,000 members: no count, 1, 10, 1000, -10, -1000, each count with and without `WITHSCORES`; the server's own microseconds a call (`INFO commandstats`, reset before each case) and the client's wall time, median of 3 rounds; replies checked (length, distinct for a positive count). Gates: server time 100 % or 3 us (the same build measured 66 and 110 us on two D4s_v5s), and at 100,000 and 1,000,000 at most 3x Redis for counts of ±10 and ±1000; wall time 50 % or 20 us, and at 100,000 and 1,000,000 60 % of the gain over v1.2.2. See [the run](#recorded-run-suite-37) |
+| `38-centrifuge-history` | #900 | Centrifuge v0.40.1's untagged list and stream history Lua scripts: reads and appends on one channel and on 16 distinct channels from 16 connections; stream reads take the `XRANGE` and `XREVRANGE` `COUNT 4` arms; 16 idle `SUBSCRIBE` connections remain live. Both explicit `--threads 4` and the server default are recorded, with the server pinned to four CPUs and the clients to the other four on a D8s_v5. Rates are the server's `EVALSHA` calls/s, median of two five-second rounds; current master is the 10 % regression baseline and Redis 8.10.2 is shown beside it. Needs the `lua,tls` builds and 8 vCPUs. |
 | `39-bgsave-strings` | #849 | `BGSAVE` while two clients overwrite random keys as fast as they can (kividb.io/blog/redis-bgsave-memory-fork, getsentry/self-hosted#4619): the peak memory from `BGSAVE` to its end (`Pss` summed over the server and the processes it forked, every 50 ms), the memory before, how long the save took and how many writes got through; `small64` is 10,000,000 keys of 64-byte values (about 1 GiB; the published test, 6 million, at the issue's size) and `mixed` is the issue's ~1 GiB of 100 B to 8 KB values. Gates, `small64`: peak at most 0.6x Redis's in the same session, at most 1,536 MiB (the stand-in for "completes in a 1.5 GiB container where Redis fails"; no container is started) and within 15 % of recorded; `mixed`: at most 1.3x Redis's (see [the run](#recorded-run-suite-39-and-40)); the save must succeed. Server on the first half of the CPUs, writers on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` |
 | `40-wp-object-cache` | #849 | a WordPress-shaped object cache (kividb.io/blog/wordpress-redis-object-cache-slow-under-load-how-to-speed-it-up): 1,000,000 string keys of 512 (`d512`) or 2,048 (`d2048`) bytes, `redis-benchmark -c 100 -d D -r 1000000 -t get` and `-t set` with `--threads 4`: requests a second, p50 and p99 against Redis, and the server's RSS and `used_memory` once loaded. Gates: `GET` at 2 KB at least 1.3x Redis in the same session, RSS at most 1.0x Redis's at both sizes, every rate within 10 % of recorded; server on the first half of the CPUs, client on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-39-and-40)) |
-| `41-ft-hnsw-vs-redis` | #760 | #760's own cases against Redis's query engine in the same session: 50,000 384-d (`d384`) and 200,000 64-d (`d64`) random documents (`score` NUMERIC, HNSW `COSINE M 16 EF_CONSTRUCTION 200`) written by one client in `HSET` pipelines of 1,000, documents a second until all are in the graph; then one client, 5 s a case, `KNN 10`: no filter, `@score:[50 100]` (half) and `@score:[0 2]` (3 %) at the default `EF_RUNTIME`, no filter at 50, 100 and 200 and the wide filter at 50 and 100: q/s and recall@10 against exact; `d64` also KNN p99 beside 500 `HSET`s a second; peak RSS. The candidate as it starts on 8 CPUs (`--threads 4`, `search-index-threads auto`: 7 helpers, all of them linking while the load is all the server does, 3 while it serves). Gates: 10 % (rates), 2 % (recall), 5 % (RSS); and against Redis this session: build at most 1.25x (`d384`) / 1.6x (`d64`) slower, the rows at the same `EF_RUNTIME` at most 1.1x (no filter) / 1.2x (wide) slower with recall at least Redis's, the narrow filter faster than Redis, the default rows at most 2.2x (no filter) / 1.8x (wide) slower (a KiviDB KNN looks at no fewer than 50 candidates, Redis's default at 10), peak RSS at most Redis's. Needs `REGRESS_REDISEARCH_SO` (as `28`); `min_cpus=8`, recorded on a D8s_v5 (`results/pr-760-d8s_v5`; the build rows in `results/pr-760-adaptive-d8s_v5`, see [below](#recorded-run-suite-41-build-rows)) |
+| `41-ft-hnsw-vs-redis` | #760 | #760's own cases against Redis's query engine in the same session: 50,000 384-d (`d384`) and 200,000 64-d (`d64`) random documents (`score` NUMERIC, HNSW `COSINE M 16 EF_CONSTRUCTION 200`) written by one client in `HSET` pipelines of 1,000, documents a second until all are in the graph; then one client, 5 s a case, `KNN 10`: no filter, `@score:[50 100]` (half) and `@score:[0 2]` (3 %) at the default `EF_RUNTIME`, no filter at 50, 100 and 200 and the wide filter at 50 and 100: q/s and recall@10 against exact; `d64` also KNN p99 beside 500 `HSET`s a second; peak RSS. The candidate as it starts on 8 CPUs (`--threads 4`, `search-index-threads auto`: 7 helpers, all of them linking while the load is all the server does, 3 while it serves). Gates: 10 % (rates), 2 % (recall), 5 % (RSS); and against Redis this session: build at most 1.05x (`d384`) / 1.15x (`d64`) slower, the rows at the same `EF_RUNTIME` at most 1.1x (no filter) / 1.2x (wide) slower with recall at least Redis's, the narrow filter faster than Redis, the default rows at most 2.2x (no filter) / 1.8x (wide) slower (a KiviDB KNN looks at no fewer than 50 candidates, Redis's default at 10), peak RSS at most Redis's. Needs `REGRESS_REDISEARCH_SO` (as `28`); `min_cpus=8`, recall@10 over 1,200 queries (the rates over the first 300); recorded on a D8s_v5 (`results/pr-760-d8s_v5`; the build and recall rows in `results/pr-760-insert-d8s_v5`, see [below](#recorded-run-suite-41-build-and-recall-rows)) |
 | `42-alone-scripts-mix` | #880 | plain commands beside scripts that run alone (a key with no hash tag): Nextcloud's mix (`GET` 40, `TTL` 15, `INCRBY` 15, `EXPIRE` 15, `EVALSHA` of its compare-and-delete 12, `SETEX` 3) and the same mix with no script, the compare-and-delete alone, Appwrite's abuse limiter (`EVAL`), both on a tagged key too, and Superset's cache and lock (`GET` 85 of 50 KB values, `SETEX` 10, `SET NX EX` 3, unlock 2); memtier, 200 and 500 connections, 100,000 keys (written again before every run): ops/s, p50, p99, p99.9. Gates: Nextcloud's p99 at most 2x the same mix's with no script and 0.75x Redis's in the same session; ops/s at least a floor times Redis's and within 10 % of recorded; server on the first half of the CPUs (`--threads 4`), memtier on the other; `min_cpus=8`, recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-42)) |
 | `43-slab-churn` | #240 | memory after the issue's delete/refill churn (1,000,000 keys of 100 B and of 1 KB, 120,000 of 100 B to 16 KB; 10 % and 20 % of the keys deleted and written anew, 3 cycles, 8 pipelining clients): VmRSS and `used_memory` at load, the peak (50 ms samples) and 60 s after, and the peak against the same churn run again with active defrag off; VmRSS after `BGSAVE` and after `BGREWRITEAOF` under 40,000 SETs a second on 2,000,000 keys of 1 KB; GET/SET p99 and p99.9 (memtier, per second, median of three trials) while active defrag runs a pass under reads and overwrites, against the same trial's seconds before it (`min_cpus=8`) |
 | `44-vector-sets-hnsw` | #710 | `VSIM` through a vector set's HNSW graph at the defaults every client gets (no `EF` on `VSIM` or `VADD`: Redis's `M` 16, build `EF` 200, search `EF` 100), against Redis 8.10.2's vector sets in the same session: `Q8` on both servers for SIFT (128-d) at 10,000 and 100,000 vectors (1,000,000 with `FULL=1`) and glove-100 and LAION (768-d) at 100,000 (#627's datasets, as suite 26); `NOQUANT` on both for SIFT and LAION at 100,000; and no option (each server's default: Redis `Q8`, KiviDB f32) for SIFT at 100,000: `VADD` a second (pipelined, 4 clients), seconds until the graph serves `VSIM` (`VINFO` `index-type HNSW`), `used_memory` a vector, recall@10 against exact at the default `EF`, and `VSIM ... COUNT 10` q/s, p50 and p99 at 1, 8 and 50 connections. Gates: recall within 2 % of recorded and at most 0.01 below Redis's this session; q/s within 15 % and at most 1.2x (1 connection) / 1.15x (8, 50) slower than Redis; `VADD` 10 %, bytes 5 % and at most Redis's where both store alike. v1.2.2 (an exact scan) shown. `load_time.py` and `aof_replay.py` in `benchmarks/vector-sets/` measure the graph's rebuild after a restart and an AOF replay. `min_cpus=8`, recorded on a D8s_v5 with `FULL=1` (`results/pr-991-44-d8s_v5`; suite 41 on the final build, whose out-of-line quantized distances leave these rows as they were: `results/pr-991-41-d8s_v5`) |
@@ -269,13 +270,14 @@ was re-recorded for it:
 | `35-tokio-pipelined-reads` | 1 | as recorded: one worker on its own CPU, the client on the other three |
 | `36-litellm-ratelimit` | the server's pinned CPUs (4) | as suites `20` and `34` |
 | `37-zrandmember-by-count` | 2 | as suite `16`, whose sizes it extends |
+| `38-centrifuge-history` | 4 and 0 (default) | #900 explicitly compares `--threads 4` with the current default; both use a D8s_v5 split into four server and four client CPUs |
 | `39-bgsave-strings`, `40-wp-object-cache`, `43-slab-churn` | the server's pinned CPUs (4) | as suites `20` and `34`: the server is pinned to half the CPUs of a `Standard_D8s_v5` and gets `--threads` to match |
 | `42-alone-scripts-mix` | the server's pinned CPUs (4) | as suites `20`, `34` and `36` |
 | `32-default-threads` | 0 (none) | measures the default on purpose |
 
 Redis ignores the count. The default itself is watched by
-`32-default-threads` alone: a change of the default policy shows there, and
-nowhere else.
+`32-default-threads`; suite `38` records it as well because #900 explicitly
+requires a side-by-side default-worker result.
 
 ## Tolerances (gates)
 
@@ -1721,6 +1723,49 @@ values of `results/pr-760-d8s_v5`, for two reasons:
   master's run, a recall case fell below its 2 % gate: `d384` wide filter at
   the default `EF_RUNTIME` and at 50 (the same search), 0.488 against 0.494;
   master's `d384` no filter at the default and at 50, 0.36 against 0.364.
+
+## Recorded run, suite 41 (build and recall rows)
+
+Re-recorded 2026-11-21 for #760 on an Azure Standard_D8s_v5 (Xeon Platinum
+8370C), `--only 41 --record` with `REGRESS_REDISEARCH_SO` set
+(`results/pr-760-insert-d8s_v5`). The candidate is commit `befcd92e` (built as `14b697d5`, the same code
+before the branch was rebased onto master; each
+HNSW insert costing about Redis's CPU), `cargo build --release` with rustc
+1.100.0; Redis 8.10.2 from the VM image with the query engine module of the
+`redis:8.10.2` image. Two more runs without `--record` (`-verify1`,
+`-verify2`) and master `ff49a8f7` in the same session
+(`results/master-ff49a8f7-41-d8s_v5`):
+
+| documents a second | master | recorded | verify1 | verify2 |
+|---|---:|---:|---:|---:|
+| `d384` candidate / Redis | 7,522 / 7,598 (1.01x Redis's time) | 8,199 / 7,032 (0.86x) | 8,020 / 7,163 (0.89x) | 8,986 / 7,253 (0.81x) |
+| `d64` candidate / Redis | 11,919 / 15,787 (1.32x) | 15,276 / 14,962 (0.98x) | 15,530 / 15,883 (1.02x) | 15,647 / 15,409 (0.98x) |
+
+The build gates against Redis are now 1.05x (`d384`) and 1.15x (`d64`); they
+were 1.25x and 1.6x.
+
+Recall is measured over 1,200 queries (seed 761: the 300 the rates use, then
+900 more). With 300, a recall row moved by up to 4 % between runs of one
+build (`d384` wide filter 0.488-0.508 in four runs), more than its 2 % gate:
+the graph is built by several threads and differs from run to run. With
+1,200, the same row was 0.491-0.493 in the candidate's three runs (0.493 on
+master), and no row of the candidate's moved by more than 0.005. The recall
+rows were re-recorded, as their values changed with the queries.
+
+After the review fixes (huge pages collapsed on a thread of their own,
+chunks mapped with huge pages off), four more runs of `53331f9d`
+(`results/pr-760-fix-d8s_v5-run1` to `-run4`): `d384` 0.89x, 0.93x, 0.91x
+and 0.85x Redis's time, `d64` 1.01x, 0.99x, 1.00x and 0.96x, recall within the
+recorded spread; no row was recorded again. Master in the same session as
+`-run4` (`results/master-50b8bdbe-41-d8s_v5-r2`) had the same
+`narrow_default_qps` (d64 1,028 against 1,058) and a d64 build at 1.24x
+Redis's time.
+
+Only those 18 rows (2 builds, 16 recalls) were recorded. The others keep the
+values of `results/pr-760-d8s_v5`: the rates move by up to ±10 % from run to
+run on this VM, master's included (one rate row was below its gate in each
+verify run), and `d64/peak_rss_mib` fails on master too since #976 (335-338
+MiB against the recorded 315; this change moves it by at most 2 MiB).
 
 ## Recorded run, suite 42
 

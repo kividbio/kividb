@@ -293,10 +293,10 @@ the first look that finds clients. It goes up again only after four quiet looks 
 (200 ms). A look more than 200 ms after the last one (the helpers had nothing to do
 meanwhile) starts from the serving count. Each extra helper's thread costs its stack and
 its search buffers: with seven, the peak RSS of a 200,000 × 64-d build was at most 5 MiB
-more than with three. On an Azure D8s_v5, all seven bring a one-client load of 50,000
-384-d documents to 1.03x Redis 8.10's time (1.24x with three) and of 200,000 64-d
-documents to 1.34x (1.67x); clients served meanwhile see the three, as before
-([PERFORMANCE.md](PERFORMANCE.md#vector-index-builds) has the latencies).
+more than with three. On an Azure D8s_v5, with all seven a one-client load of 50,000
+384-d documents takes 0.89x Redis 8.10's time and one of 200,000 64-d documents
+0.97-0.98x; clients served meanwhile see the three, as before
+([PERFORMANCE.md](PERFORMANCE.md#vector-index-builds) has the builds and the latencies).
 
 A number starts exactly that many on any machine, and all of them always link. The log
 says how many started, on the first write that needs them; `FT.INFO` shows
