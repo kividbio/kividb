@@ -565,6 +565,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A save of large collections no longer holds them in memory over again
+  (#825).** A save lays out the values that are not strings (lists, sets,
+  sorted sets, hashes, streams) when it captures the dataset, with writes
+  held, and kept all of it in memory until the dump was written: the size of
+  the collections' part of the dump over again (480 MB for 20,000 sorted
+  sets of 800 members, and 1 GiB of `used_memory` for 20,000 hashes of 800
+  fields). Each capture thread now keeps at most 8 MiB and writes the rest to
+  a spill file in the data directory, with no name, copied into `dump.kdb`
+  as the snapshot is written: at most 64 MiB a save. The dump is the same,
+  byte for byte. A save that cannot write a spill file fails, writes go on,
+  and the previous dump stays; a failed checkpoint no longer leaves its
+  prepared `appendonly.aof.rewrite.tmp` behind. A replica's full sync and an
+  online backup still make their image in memory.
 - **Plain commands are answered between scripts that run alone (#880).** A quick script that runs alone (its key has no hash tag, or
   `lua-parallel-scripts no`) and comes while another one is running is run
   right after it, by the thread running that one, in a run: the first

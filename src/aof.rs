@@ -2885,7 +2885,18 @@ fn checkpoint_inner(
     };
     drop(cut);
     let held = started.elapsed();
-    let frozen = frozen?;
+    let frozen = match frozen {
+        Ok(frozen) => frozen,
+        Err(e) => {
+            // Nothing turned over to the log prepared for it, which holds
+            // only its header: removed, so that a capture that failed (a
+            // spill write, #825) leaves nothing in the directory.
+            if aof_on {
+                let _ = remove_if_there(TURN_OVER_TMP);
+            }
+            return Err(e);
+        }
+    };
     if let Some(turned) = turn_over
         && let Err(e) = turned()
     {
