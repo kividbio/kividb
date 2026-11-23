@@ -37,7 +37,8 @@ data).
 query, which must be 10. `plain` also keeps, in the raw data, what JSON.GET
 returns of a list of numbers written in different textual forms (`1` and
 `1.0`, exponents, digits past a double's precision), for comparing how each
-engine prints numbers back.
+engine prints numbers back, and of two arrays holding one kind of number
+each (floats with `-0.0` and `1.0` among them; integers to i64's ends).
 
 Engines: v1.2.2 and the candidate; Redis 8.10.x when REGRESS_REDISJSON_SO
 and REGRESS_REDISEARCH_SO name `rejson.so` and `redisearch.so` of the
@@ -71,6 +72,10 @@ SAMPLE = 50
 NUMBER_FORMS = ("[1,1.0,1.50,-0.0,0,1e5,1E5,1.5e-7,0.1,100000000000000000000,12345678901234567890,"
                 "-0.12345678901234567890,3.4028234663852886e38,1.0000000000000002,5e-324,"
                 "6.437301635742188e-05,1e-05,1.5e-06,123e-9,1e21]")
+# Arrays of one kind (what a packed array would hold): floats with -0.0 and
+# integer-valued floats among them, and integers up to i64's ends.
+NUMBER_ARRAYS = {"floats": "[0.5,1.0,-0.0,2.0,0.25,-1.0,3.0,1e5,0.1,-0.0]",
+                 "ints": "[0,1,-1,2,9007199254740993,-9223372036854775808,9223372036854775807,42]"}
 
 
 def field(info_reply, name):
@@ -235,6 +240,11 @@ def run(ctx):
             back = c.execute_command("JSON.GET", "numbers")
             ctx.raw["number_forms"] = {"sent": NUMBER_FORMS,
                                        "got": back.decode() if isinstance(back, bytes) else back}
+            for name, text in NUMBER_ARRAYS.items():
+                c.execute_command("JSON.SET", "numbers:" + name, "$", text)
+                back = c.execute_command("JSON.GET", "numbers:" + name)
+                ctx.raw["number_forms_" + name] = {"sent": text,
+                                                   "got": back.decode() if isinstance(back, bytes) else back}
 
         ctx.raw["memory"] = {"used_memory_before": u0, "used_memory_after": u1, "rss_mib_before": r0,
                              "rss_mib_after": r1, "used_memory_peak": peak, "peak_before": p0,
