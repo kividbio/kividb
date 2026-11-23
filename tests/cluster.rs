@@ -9745,10 +9745,13 @@ fn replica_cut_off_during_an_import(heard: bool, stands: Stands, restarted: bool
         // Its nodes.conf has the slots as its master's, as it heard; that
         // it does not hold them is kept over the restart.
         replica.restart();
-        wait_until(
-            "the replica to serve again",
-            Duration::from_secs(20),
-            || replica.cluster_info("cluster_slots_not_held_ranges") == "0-100",
+        assert!(
+            wait_until_or(Duration::from_secs(20), || {
+                replica.cluster_info("cluster_slots_not_held_ranges") == "0-100"
+            }),
+            "the replica does not say it holds none of slots 0-100 after its restart: {}\n{}",
+            replica.cluster_info("cluster_slots_not_held_ranges"),
+            replica.log()
         );
     }
     nodes[1].kill();

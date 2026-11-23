@@ -117,7 +117,10 @@ replica lists the slots of its master it does not hold yet
 The source takes no new config epoch while it hands slots over and for three
 heartbeats after: `CLUSTER BUMPEPOCH` on it answers
 `ERR BUMPEPOCH refused for now: …` then (`redis-cli --cluster fix` run right
-after a migration may need to be run again a few seconds later).
+after a migration may need to be run again a few seconds later), and an
+import into it is refused then too (tried again later, as any refused
+takeover). It sends its config epoch with the `TAKEOVER`, and the
+destination takes the slots at an epoch above it.
 
 ## JSON
 

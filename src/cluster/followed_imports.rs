@@ -177,6 +177,10 @@ pub(crate) struct FollowedImports {
     /// Of the slots this node's table shows as its master's, those it does
     /// not hold: see [`NotHeld`].
     not_held: Mutex<NotHeld>,
+    /// The file of [`NotHeld`] has been read at start-up: saves of the
+    /// cluster config made before (at start-up, before the cluster starts)
+    /// do not write it, which would remove it unread.
+    not_held_loaded: std::sync::atomic::AtomicBool,
 }
 
 /// What this node, a replica, does not hold of the slots its table shows as
@@ -493,6 +497,13 @@ pub(crate) fn save_not_held(cluster: &ClusterState) {
     let Some(path) = not_held_path(cluster) else {
         return;
     };
+    if !cluster
+        .followed_imports
+        .not_held_loaded
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
     let mut written = WRITTEN.lock();
     let text = cluster.followed_imports.not_held_text();
     if written.as_ref() == Some(&text) {
@@ -570,6 +581,16 @@ fn parse_not_held(text: &str) -> Result<(NodeId, std::collections::BTreeMap<u16,
 /// At start-up: what this node, a replica, does not hold of its master's
 /// slots, as written down (see [`NotHeld`]).
 fn load_not_held(cluster: &ClusterState) {
+    struct Loaded<'a>(&'a ClusterState);
+    impl Drop for Loaded<'_> {
+        fn drop(&mut self) {
+            self.0
+                .followed_imports
+                .not_held_loaded
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _loaded = Loaded(cluster);
     let Some(path) = not_held_path(cluster) else {
         return;
     };
