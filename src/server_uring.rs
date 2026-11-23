@@ -35,6 +35,8 @@ pub async fn handle_replica_connection_uring(
     legacy_sync: bool,
     // The port the replica announced with `REPLCONF listening-port`, if any.
     listening_port: Option<u16>,
+    // The cluster node id it gave with `REPLCONF node-id`, if any.
+    node_id: Option<String>,
     // What the replica asked to continue from (`PSYNC <replid> <offset>`).
     psync: Option<crate::replication::PsyncRequest>,
     // It sent `REPLCONF capa vset-quant`.
@@ -55,6 +57,7 @@ pub async fn handle_replica_connection_uring(
     // ── 1. The stream queue. Unbounded: bounded queues fill before forwarding runs.
     let (replica_tx, replica_rx) = mpsc::unbounded_channel::<crate::replication::ReplPayload>();
     let replica_id = crate::replication::next_replica_id();
+    repl_state.note_replica_node_id(replica_id, node_id);
 
     // Shared with the hub: it increments this on enqueue, the forwarder below
     // decrements it after each successful flush. Lets the hub evict us if we fall
@@ -159,6 +162,13 @@ pub async fn handle_replica_connection_uring(
                 Some(p) => p,
                 None => break,
             };
+            // Tests: held here while the file `KIVIDB_TEST_STREAM_STALL`
+            // names exists (see `replica_client::test_stream_stall`).
+            if let Some(path) = crate::replication::replica_client::test_stream_stall() {
+                while path.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
             if pending_bytes.abandoned() {
                 // Let go of for falling too far behind: what is queued is
                 // freed now, as `replica_rx` is dropped, not sent (see
@@ -433,6 +443,23 @@ async fn offloaded(
             crate::deferred::spawn(move || env.run_sent_here(cmd, db, aof_enabled, resp))
                 .await
                 .unwrap_or_else(|_| could_not())
+        }
+        crate::deferred::Offload::RerunAlone(cmd) => {
+            use crate::cpus::BuilderExt as _;
+            let Some(env) = env else {
+                return could_not();
+            };
+            crate::cmdstats::note_last_command(std::time::Duration::ZERO);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let started = std::thread::Builder::new()
+                .name("kividb-wait".into())
+                .spawn_released(move || {
+                    let _ = tx.send(env.run_sent_here(cmd, db, aof_enabled, resp));
+                });
+            if started.is_err() {
+                return could_not();
+            }
+            rx.await.unwrap_or_else(|_| could_not())
         }
         crate::deferred::Offload::Free(freeing) => {
             let started = std::time::Instant::now();
@@ -2026,8 +2053,12 @@ pub async fn handle_client(
                         // the replies, as when the command ran here; a killed or
                         // reset one is found when the reply is written.
                         if let Some(offload) = wait.take_offload() {
-                            let env = matches!(offload, crate::deferred::Offload::Rerun(_))
-                                .then(|| client_env!());
+                            let env = matches!(
+                                offload,
+                                crate::deferred::Offload::Rerun(_)
+                                    | crate::deferred::Offload::RerunAlone(_)
+                            )
+                            .then(|| client_env!());
                             // Boxed, as the park below is: cold.
                             let reply = Box::pin(offloaded(
                                 offload,
@@ -2159,8 +2190,12 @@ pub async fn handle_client(
                     // the replies, as when the command ran here; a killed or
                     // reset one is found when the reply is written.
                     if let Some(offload) = wait.take_offload() {
-                        let env = matches!(offload, crate::deferred::Offload::Rerun(_))
-                            .then(|| client_env!());
+                        let env = matches!(
+                            offload,
+                            crate::deferred::Offload::Rerun(_)
+                                | crate::deferred::Offload::RerunAlone(_)
+                        )
+                        .then(|| client_env!());
                         // Boxed, as the park below is: cold.
                         let reply = Box::pin(offloaded(
                             offload,
@@ -4081,6 +4116,9 @@ pub async fn handle_client(
                     .get(client_id)
                     .map(|info| info.replica_listening_port)
                     .filter(|p| *p != 0);
+                let node_id = client_registry
+                    .get(client_id)
+                    .and_then(|info| info.replica_node_id);
                 let vset_quant_announced = client_registry
                     .get(client_id)
                     .is_some_and(|info| info.replica_vset_quant == Some(true));
@@ -4105,6 +4143,7 @@ pub async fn handle_client(
                     peer_addr.clone(),
                     legacy_sync,
                     listening_port,
+                    node_id,
                     psync,
                     vset_quant_announced,
                     slot_imports_announced,

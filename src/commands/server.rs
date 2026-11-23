@@ -6137,6 +6137,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         info.replica_listening_port = port;
                     });
                 }
+                // A cluster replica's node id: its link is told apart by it
+                // (`replication::links_of_replicas`).
+                if cmd[i].eq_ignore_ascii_case(b"node-id")
+                    && let Ok(id) = std::str::from_utf8(cmd[i + 1])
+                    && id.len() == 40
+                    && id.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    let id = id.to_ascii_lowercase();
+                    ctx.client_registry.update(ctx.client_id, |info| {
+                        info.replica_node_id = Some(id);
+                    });
+                }
                 if cmd[i].eq_ignore_ascii_case(b"capa")
                     && cmd[i + 1].eq_ignore_ascii_case(b"dataset-digest")
                 {

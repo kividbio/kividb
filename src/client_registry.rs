@@ -614,6 +614,9 @@ pub struct ClientInfo {
     /// connection turns into a replica link, so the master can list the
     /// replica by the port it serves clients on.
     pub replica_listening_port: u16,
+    /// The cluster node id given with `REPLCONF node-id`, if any: read when
+    /// the connection turns into a replica link.
+    pub replica_node_id: Option<String>,
     /// A replica that said `REPLCONF capa dataset-digest`, and has not yet
     /// been offered the fingerprint: see `replication::digest`.
     pub replica_takes_digest: bool,
@@ -672,6 +675,7 @@ impl ClientInfo {
             lib_ver: String::new(),
             resp: 2,
             replica_listening_port: 0,
+            replica_node_id: None,
             replica_takes_digest: false,
             replica_lost_data: 0,
             replica_vset_quant: None,
@@ -1245,6 +1249,7 @@ impl ClientRegistryInner {
                 lib_ver: c.lib_ver.clone(),
                 resp: c.resp,
                 replica_listening_port: c.replica_listening_port,
+                replica_node_id: c.replica_node_id.clone(),
                 replica_takes_digest: c.replica_takes_digest,
                 replica_lost_data: c.replica_lost_data,
                 replica_vset_quant: c.replica_vset_quant,
@@ -1289,6 +1294,7 @@ impl ClientRegistryInner {
             lib_ver: c.lib_ver.clone(),
             resp: c.resp,
             replica_listening_port: c.replica_listening_port,
+            replica_node_id: c.replica_node_id.clone(),
             replica_takes_digest: c.replica_takes_digest,
             replica_lost_data: c.replica_lost_data,
             replica_vset_quant: c.replica_vset_quant,

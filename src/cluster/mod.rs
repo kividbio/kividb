@@ -568,6 +568,12 @@ pub struct ClusterState {
     /// epoch here can be newer (gossip raises it) than what this node
     /// knows of its slots.
     own_claims: RwLock<AHashMap<NodeId, Vec<crate::cluster::bus::SlotClaim>>>,
+    /// Per candidate, the election epoch at which this node last refused it
+    /// its vote for leaving out of its claims slots its master claims
+    /// ([`Self::left_out_of_claims`]): once per election, so that a
+    /// candidate that knows better (the slots moved on since) is asked once
+    /// and then decided on the rest.
+    left_out_told: parking_lot::Mutex<AHashMap<NodeId, u64>>,
 }
 
 impl ClusterState {
@@ -651,6 +657,7 @@ impl ClusterState {
             took_over_from: parking_lot::Mutex::new(None),
             yielded_to: parking_lot::Mutex::new(ahash::AHashSet::new()),
             own_claims: RwLock::new(AHashMap::new()),
+            left_out_told: parking_lot::Mutex::new(AHashMap::new()),
         };
         state.refresh_state();
         state
@@ -868,6 +875,9 @@ impl ClusterState {
         // Those of its master, or of its old master, that it knew of (#741).
         followed_imports::start(self, &repl_state);
         migration::save_imports(self);
+        // A master's replicas are told its slots once it starts, so that the
+        // hub keeps a claim to send ahead of every full sync's dataset.
+        self.send_own_claims_to_replicas();
         // Keys of slots this node does not serve are reported, from a
         // moment after startup on (#517).
         orphans::start_watching(self);
@@ -1883,6 +1893,12 @@ impl ClusterState {
         self.current_epoch.fetch_max(highest, Ordering::SeqCst);
         let epoch = self.current_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         node.config_epoch = epoch;
+        drop(nodes);
+        // No slot changes hands. Its replicas are told its slots at the new
+        // epoch in the stream (only them: no other node hears of the epoch
+        // before its heartbeats carry it), so that they hold the slots the
+        // heartbeats claim at it.
+        self.send_own_claims_to_replicas();
         (true, epoch)
     }
 
@@ -1923,14 +1939,25 @@ impl ClusterState {
         if !colliding {
             return false;
         }
-        let epoch = self.bump_epoch();
-        if let Some(node) = self.nodes.write().get_mut(&me) {
-            node.config_epoch = epoch;
-        }
+        // Not while slots handed over from here may not be known as moved
+        // everywhere (see `epoch_may_change`): the collision is seen again
+        // at the next heartbeat, and resolved then.
+        let moved = self.change_epoch_if_it_may(|| {
+            let epoch = self.bump_epoch();
+            if let Some(node) = self.nodes.write().get_mut(&me) {
+                node.config_epoch = epoch;
+            }
+            epoch
+        });
+        let Ok(epoch) = moved else {
+            return false;
+        };
         log_info!(
             "Cluster: config epoch collision with {} — moved to {epoch}",
             node_id_str(&sender)
         );
+        // As `CLUSTER BUMPEPOCH`: its replicas are told its slots at it.
+        self.send_own_claims_to_replicas();
         true
     }
 
@@ -2103,11 +2130,20 @@ impl ClusterState {
             return Err("This instance has cluster support disabled".into());
         }
         let me = self.myself();
+        let my_epoch = self
+            .nodes
+            .read()
+            .get(&me)
+            .map(|n| n.config_epoch)
+            .unwrap_or(0);
         // `slots` before `migrations`, as everywhere (see `ClusterState`).
         let mut slots = self.slots.write();
         if let Some(e) = Self::unclaimable(&slots[..], list) {
             return Err(e);
         }
+        // This node's replicas are told first, in the stream, ahead of any
+        // write to the slots (see `take_over_slots`).
+        self.send_claims_with_table(&slots[..], list, my_epoch);
         let mut migrations = self.migrations.write();
         for &slot in list {
             slots[slot as usize] = Some(me);
@@ -2198,6 +2234,77 @@ impl ClusterState {
     /// paired with its config epoch in this node's view: this node's own
     /// claims ([`Self::my_slot_claims`]), or what a replica standing for
     /// election claims for its master (#524, [`Self::cast_vote`]).
+    /// What this node, a replica of `master` standing for election, claims
+    /// for it: the slots `master` owns in this node's view that this node
+    /// holds ([`followed_imports::FollowedImports::not_held_of`]), as
+    /// [`Self::slot_claims_of`] has them. A master that knows `master`
+    /// claims more refuses its vote once and tells it the master's claims;
+    /// asked again with the same claims, it decides on the rest.
+    pub fn held_claims_of_master(&self, master: NodeId) -> Vec<crate::cluster::bus::SlotClaim> {
+        let claims = self.slot_claims_of(master);
+        let not_held = self.followed_imports.not_held_of(master);
+        if not_held.is_empty() {
+            return claims;
+        }
+        let mut out = Vec::new();
+        for c in claims {
+            let mut run: Option<u16> = None;
+            for slot in c.start..=c.end {
+                let held = not_held.binary_search(&slot).is_err();
+                match (held, run) {
+                    (true, None) => run = Some(slot),
+                    (false, Some(start)) => {
+                        out.push(crate::cluster::bus::SlotClaim {
+                            start,
+                            end: slot - 1,
+                            epoch: c.epoch,
+                        });
+                        run = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(start) = run {
+                out.push(crate::cluster::bus::SlotClaim {
+                    start,
+                    end: c.end,
+                    epoch: c.epoch,
+                });
+            }
+        }
+        out
+    }
+
+    /// For `CLUSTER INFO` on a replica: how many slots of its master it does
+    /// not hold ([`followed_imports::FollowedImports::not_held_of`]), and
+    /// which (`-`: none). Elected, it would not take them over.
+    pub fn slots_not_held(&self) -> (usize, String) {
+        let not_held = self
+            .my_master_id()
+            .map(|master| self.followed_imports.not_held_of(master))
+            .unwrap_or_default();
+        if not_held.is_empty() {
+            return (0, "-".to_string());
+        }
+        let n = not_held.len();
+        (n, migration::ranges_text(&migration::slot_runs(not_held)))
+    }
+
+    /// Log the slots of `master` a promotion of this node leaves with it
+    /// (`left`): this node does not hold them.
+    fn log_left_not_held(&self, master: NodeId, left: &[u16]) {
+        if left.is_empty() {
+            return;
+        }
+        log_warn!(
+            "Cluster: promoted without slots {} of {}: the cluster says it took them, but this \
+             node's replication stream has not confirmed that this node holds their keys; they \
+             stay with it",
+            migration::ranges_text(&migration::slot_runs(left.to_vec())),
+            node_id_str(&master)
+        );
+    }
+
     pub fn slot_claims_of(&self, owner: NodeId) -> Vec<crate::cluster::bus::SlotClaim> {
         if !self.enabled {
             return vec![];
@@ -2299,6 +2406,9 @@ impl ClusterState {
 
         let mut changed = false;
         let mut shard_lost_slots = false;
+        // Slots this node's master gained, with the claim's epoch: not held
+        // until its stream confirms them (`followed_imports::NotHeld`).
+        let mut gains: Vec<(u16, u64)> = Vec::new();
         // Slots this node itself was serving and has just lost.
         let mut lost: Vec<u16> = Vec::new();
         // Some of them to a replica of this node at this node's own epoch.
@@ -2355,10 +2465,19 @@ impl ClusterState {
                         if slots[i] == Some(me) {
                             lost.push(slot);
                         }
+                        if owner_id == my_shard_master {
+                            gains.push((slot, claim.epoch));
+                        }
                         slots[i] = Some(owner_id);
                         changed = true;
                     }
                 }
+            }
+            // Noted with the table change, under its lock: no save of the
+            // cluster config shows the gain without it (the slots not held
+            // are written down before every save, `persist::save_then`).
+            if !gains.is_empty() {
+                self.followed_imports.note_gains(owner_id, &gains);
             }
         }
         if shard_lost_slots || !lost.is_empty() {
@@ -2769,6 +2888,7 @@ impl ClusterState {
             self.clear_failure_reports(id);
             // Nothing of it to relay, nor a collision with it to settle.
             self.own_claims.write().remove(&id);
+            self.left_out_told.lock().remove(&id);
             if *self.took_over_from.lock() == Some(id) {
                 *self.took_over_from.lock() = None;
             }
@@ -2899,7 +3019,19 @@ impl ClusterState {
     ///   newer than the owner's, and the owner's acknowledged writes to it
     ///   would be lost. The refusal is answered with an `UPDATE` that names
     ///   those owners ([`Self::newer_owners_of_claimed`]), and the
-    ///   candidate asks again with its claims put right.
+    ///   candidate asks again with its claims put right;
+    /// * the candidate's `claims`, if the request says, leave out none of the
+    ///   slots its master claims in its own heartbeat to this node and owns
+    ///   here ([`Self::left_out_of_claims`]): a replica that has not heard
+    ///   its master take slots over (an import whose claim it has not
+    ///   heard) holds
+    ///   them as their old owner's, and counts that owner among the masters
+    ///   that own slots even if it has no slot left, and no vote. The
+    ///   refusal is answered with an `UPDATE` carrying the master's own
+    ///   claims ([`Self::master_update_for_left_out`]); the candidate asks
+    ///   again with them, and stands for every slot of its master. Refused
+    ///   once per election: asked again with the same claims, the vote is
+    ///   decided on the rest.
     pub fn cast_vote(
         &self,
         candidate: NodeId,
@@ -2944,6 +3076,19 @@ impl ClusterState {
         {
             log_info!(
                 "Cluster: Not voting for {} to take over from {}: {why}",
+                node_id_str(&candidate),
+                node_id_str(&master_id)
+            );
+            return false;
+        }
+        if let Some(claims) = claims
+            && let Some((slot, epoch)) = self.left_out_of_claims(master_id, claims)
+            && self.left_out_told.lock().insert(candidate, request_epoch) != Some(request_epoch)
+        {
+            log_info!(
+                "Cluster: Not voting for {} to take over from {} at epoch {request_epoch} yet: \
+                 its request leaves out slot {slot}, which that master claims at epoch {epoch} \
+                 and owns here; it is told its master's claims",
                 node_id_str(&candidate),
                 node_id_str(&master_id)
             );
@@ -3031,6 +3176,110 @@ impl ClusterState {
                 return true;
             }
         }
+    }
+
+    /// The first slot, with its epoch, that `master_id` claims in its own
+    /// heartbeat to this node ([`Self::note_own_claims`]) and owns in this
+    /// node's view, that a candidate's `claims` for it leave out: see
+    /// [`Self::cast_vote`]. `None` if there is none, or this node has not
+    /// heard the master's own claims.
+    pub(crate) fn left_out_of_claims(
+        &self,
+        master_id: NodeId,
+        claims: &[crate::cluster::bus::SlotClaim],
+    ) -> Option<(u16, u64)> {
+        let own = self.own_claims.read().get(&master_id).cloned()?;
+        let slots = self.slots.read();
+        for c in &own {
+            let end = c.end.min((CLUSTER_SLOTS - 1) as u16);
+            for slot in c.start..=end {
+                if slots[slot as usize] == Some(master_id)
+                    && !claims.iter().any(|k| k.start <= slot && slot <= k.end)
+                {
+                    return Some((slot, c.epoch));
+                }
+            }
+        }
+        None
+    }
+
+    /// Of `claims`, which a voter's `UPDATE` relays from `master`, the
+    /// master this node follows: what this node takes in. The slots it holds
+    /// as the master's already, and those of an import into the master whose
+    /// data this node holds in full, as the master's stream told it
+    /// (`ARRIVED`, `followed_imports::encode_arrived`), claimed at the very
+    /// epoch that import was to be taken over at. The marker came after the
+    /// import's last record in the stream, and this node's dataset is still
+    /// that stream, whatever became of its link since. A claim at another
+    /// epoch is not that takeover's: an attempt refused and a later one, at a
+    /// newer epoch, whose data this node may not have. The others stay with
+    /// their owner here.
+    pub(crate) fn master_claims_arrived(
+        &self,
+        master: NodeId,
+        claims: &[crate::cluster::bus::SlotClaim],
+    ) -> Vec<crate::cluster::bus::SlotClaim> {
+        let arrived = self.followed_imports.arrived_into(node_id_str(&master));
+        let owners = self.slots.read();
+        let ok = |slot: u16, epoch: u64| {
+            owners[slot as usize] == Some(master)
+                || arrived
+                    .iter()
+                    .any(|(e, r)| *e == epoch && migration::in_ranges(r, slot))
+        };
+        let mut out = Vec::new();
+        for c in claims {
+            let end = c.end.min((CLUSTER_SLOTS - 1) as u16);
+            let mut run: Option<u16> = None;
+            for slot in c.start..=end {
+                match (ok(slot, c.epoch), run) {
+                    (true, None) => run = Some(slot),
+                    (false, Some(start)) => {
+                        out.push(crate::cluster::bus::SlotClaim {
+                            start,
+                            end: slot - 1,
+                            epoch: c.epoch,
+                        });
+                        run = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(start) = run {
+                out.push(crate::cluster::bus::SlotClaim {
+                    start,
+                    end,
+                    epoch: c.epoch,
+                });
+            }
+        }
+        out
+    }
+
+    /// For the `UPDATE` that answers a vote refused for slots a candidate's
+    /// `claims` left out ([`Self::left_out_of_claims`]): its master's own
+    /// claims, as the master last made them to this node, at their epochs.
+    pub fn master_update_for_left_out(
+        &self,
+        master_id: NodeId,
+        claims: &[crate::cluster::bus::SlotClaim],
+    ) -> Option<crate::cluster::bus::OwnerUpdate> {
+        self.left_out_of_claims(master_id, claims)?;
+        let own = self.own_claims.read().get(&master_id).cloned()?;
+        let (ip, client_port, cluster_port) = {
+            let nodes = self.nodes.read();
+            let n = nodes.get(&master_id)?;
+            (n.ip.clone(), n.client_port, n.cluster_port)
+        };
+        let config_epoch = own.iter().map(|c| c.epoch).max()?;
+        Some(crate::cluster::bus::OwnerUpdate {
+            id: master_id,
+            ip,
+            client_port,
+            cluster_port,
+            config_epoch,
+            claims: own,
+        })
     }
 
     /// Of the slots a candidate `claims` for `master_id`, the first that
@@ -3311,16 +3560,31 @@ impl ClusterState {
             return Vec::new();
         }
 
-        // Phase 1: claim the failed master's slots.
+        // Phase 1: claim the failed master's slots. Its replicas to come
+        // are told the claim first, ahead of any write to them (see
+        // `take_over_slots`).
+        // Only those this node holds (`followed_imports::NotHeld`): the
+        // others stay with the failed master.
+        let not_held = self.followed_imports.not_held_of(failed_master_id);
+        let mut left = Vec::new();
         let mut claimed = Vec::new();
         {
             let me = self.myself();
             let mut slots = self.slots.write();
-            for (slot, owner) in slots.iter_mut().enumerate() {
-                if matches!(*owner, Some(o) if o == failed_master_id) {
-                    *owner = Some(me);
-                    claimed.push(slot as u16);
-                }
+            let taking: Vec<u16> = (0..CLUSTER_SLOTS as u16)
+                .filter(|&slot| slots[slot as usize] == Some(failed_master_id))
+                .filter(|slot| {
+                    let held = not_held.binary_search(slot).is_err();
+                    if !held {
+                        left.push(*slot);
+                    }
+                    held
+                })
+                .collect();
+            self.send_claims_with_table(&slots[..], &taking, election_epoch);
+            for slot in taking {
+                slots[slot as usize] = Some(me);
+                claimed.push(slot);
             }
             self.slot_deletions.came_here(claimed.iter().copied());
         }
@@ -3345,6 +3609,8 @@ impl ClusterState {
         // yielded to no one as the new master it now is.
         *self.took_over_from.lock() = Some(failed_master_id);
         self.yielded_to.lock().clear();
+        self.log_left_not_held(failed_master_id, &left);
+        followed_imports::forget_not_held(self);
 
         // Phase 3: persist, by the caller: see `save_promotion`. The election
         // is won and the cluster has agreed to it: the promotion holds,
@@ -3716,12 +3982,20 @@ impl ClusterState {
                 // Up before any of the slots is this node's here, so that
                 // routing never sees it the owner unfenced.
                 fenced = self.fence_completion(&nodes, me, old_master);
-                for &(start, end) in ranges {
-                    for slot in start..=end {
-                        slots[slot as usize] = Some(me);
-                        claimed.push(slot);
-                    }
+                // Its replicas to come are told the claim first (see
+                // `promote_self`). Only the slots this node holds
+                // (`followed_imports::NotHeld`).
+                let not_held = self.followed_imports.not_held_of(old_master);
+                let (taking, left): (Vec<u16>, Vec<u16>) = ranges
+                    .iter()
+                    .flat_map(|&(a, b)| a..=b)
+                    .partition(|slot| not_held.binary_search(slot).is_err());
+                self.send_claims_with_table(&slots[..], &taking, epoch);
+                for &slot in &taking {
+                    slots[slot as usize] = Some(me);
+                    claimed.push(slot);
                 }
+                self.log_left_not_held(old_master, &left);
                 self.slot_deletions.came_here(claimed.iter().copied());
             }
             if let Some(node) = nodes.get_mut(&me) {
@@ -3740,6 +4014,7 @@ impl ClusterState {
             log_warn!("{said}");
         }
         *self.took_over_from.lock() = Some(old_master);
+        followed_imports::forget_not_held(self);
         self.refresh_state();
         Ok(claimed)
     }
@@ -3953,12 +4228,21 @@ impl ClusterState {
         // so peers accept the claim.
         if new_owner == self.myself() {
             let new_epoch = self.bump_epoch();
-            let mut nodes = self.nodes.write();
-            if let Some(me) = nodes.get_mut(&self.myself())
-                && new_epoch > me.config_epoch
-            {
-                me.config_epoch = new_epoch;
-            }
+            let epoch = {
+                let mut nodes = self.nodes.write();
+                match nodes.get_mut(&self.myself()) {
+                    Some(me) => {
+                        if new_epoch > me.config_epoch {
+                            me.config_epoch = new_epoch;
+                        }
+                        me.config_epoch
+                    }
+                    None => new_epoch,
+                }
+            };
+            // This node's replicas are told first, in the stream, ahead of
+            // any write to the slot (see `take_over_slots`).
+            self.send_claims_to_replicas(&[slot], epoch);
         }
         {
             let mut owners = self.slots.write();
@@ -3978,26 +4262,89 @@ impl ClusterState {
     ///
     /// Saved in the cluster config before anything else sees it: a client
     /// is not served the slots, nor do they go out in this node's claims,
-    /// until the config says they are this node's. They used to be taken
-    /// first and saved after; when the save failed, the destination of a
-    /// migration gave them back, having served writes to them meanwhile,
-    /// lost when it gave them back, and its claim could have reached the
-    /// source in that time, which then dropped its keys of them, and owned
-    /// them in nobody's view (#337). Not saved, nothing changes.
+    /// until the config says they are this node's (#337). Not saved,
+    /// nothing changes: no write has been served to them here, and no claim
+    /// of them has gone out.
     pub fn take_over_slots(&self, slots: impl Iterator<Item = u16>) -> std::io::Result<()> {
+        let epoch = self.bump_epoch();
+        self.take_over_slots_at(slots, epoch, false)
+    }
+
+    /// [`Self::take_over_slots_at`] for an atomic import into this node:
+    /// refused too while a handover away from this node is under way, or
+    /// for a few heartbeats after one ([`HandingOver`],
+    /// [`Self::epoch_may_change`]), checked with `handoff_holds` held until
+    /// this node's config epoch is raised: a handover that begins after it
+    /// sees the new epoch and is refused ([`Self::begin_handover`]).
+    pub fn take_over_imported_slots(
+        &self,
+        slots: impl Iterator<Item = u16>,
+        epoch: u64,
+    ) -> std::io::Result<()> {
+        self.take_over_slots_at(slots, epoch, true)
+    }
+
+    /// [`Self::take_over_slots`], at config epoch `epoch`, taken with
+    /// [`Self::bump_epoch`] beforehand (the epoch an `ARRIVED` marker named,
+    /// see `migration::take_over_now`). This node's config epoch is raised to
+    /// it, unless it is newer already.
+    pub fn take_over_slots_at(
+        &self,
+        slots: impl Iterator<Item = u16>,
+        epoch: u64,
+        not_while_handing_over: bool,
+    ) -> std::io::Result<()> {
         let t = std::time::Instant::now();
         let mut steps: Vec<(&str, u128)> = Vec::new();
         let slots: Vec<u16> = slots.collect();
         let me = self.myself();
-        let new_epoch = self.bump_epoch();
         steps.push(("epoch", t.elapsed().as_millis()));
-        if let Some(node) = self.nodes.write().get_mut(&me)
-            && new_epoch > node.config_epoch
-        {
-            node.config_epoch = new_epoch;
-        }
+        // The epoch was taken before (`bump_epoch`), above every config
+        // epoch known then. Another node's may have come up to it since (the
+        // source's own takeover, `BUMPEPOCH`, a collision): a claim at it
+        // would not win over that node's, wherever the two meet, and the
+        // slots would stay that node's there. Not taken then: the caller
+        // tries again, at a new epoch ([`EpochOvertaken`]).
+        // The claim is at this node's config epoch, raised to `epoch`
+        // unless it is newer already: what its heartbeats claim.
+        let new_epoch = {
+            // Before `nodes`, as `begin_handover` takes it.
+            let _holds = not_while_handing_over.then(|| self.handoff_holds.lock());
+            if not_while_handing_over && let Err(why) = self.epoch_may_change() {
+                return Err(std::io::Error::other(HandingOver(why)));
+            }
+            let mut nodes = self.nodes.write();
+            // Masters only: a replica says its master's epoch.
+            if let Some(other) = nodes
+                .values()
+                .filter(|n| n.id != me && n.flags.contains(NodeFlags::MASTER))
+                .max_by_key(|n| n.config_epoch)
+                .filter(|n| n.config_epoch >= epoch)
+            {
+                return Err(std::io::Error::other(EpochOvertaken {
+                    node: other.id,
+                    its_epoch: other.config_epoch,
+                    epoch,
+                }));
+            }
+            match nodes.get_mut(&me) {
+                Some(node) => {
+                    if epoch > node.config_epoch {
+                        node.config_epoch = epoch;
+                    }
+                    node.config_epoch
+                }
+                None => epoch,
+            }
+        };
         steps.push(("nodes", t.elapsed().as_millis()));
         let saved = persist::save_from_state_then(self, &slots, || {
+            // This node's replicas are told the claim first, in the stream,
+            // ahead of every write to the slots: one that has applied such a
+            // write, and that `WAIT` counts, holds the slots as this node's,
+            // and is elected with them if this node fails before any other
+            // node has heard the claim.
+            self.send_claims_to_replicas(&slots, new_epoch);
             let mut owners = self.slots.write();
             let mut migrations = self.migrations.write();
             for &slot in &slots {
@@ -4015,6 +4362,84 @@ impl ClusterState {
             log_info!("Cluster: slow takeover, ms at each step: {steps:?}");
         }
         saved
+    }
+
+    /// Tell this node's replicas its own slots at its config epoch, now
+    /// (`TAKEN`, [`Self::send_claims_to_replicas`]): after it took a new
+    /// config epoch without taking slots (`CLUSTER BUMPEPOCH`, an epoch
+    /// collision), and once it starts as a master, so that its replicas hold
+    /// every slot it lists at the epoch its heartbeats claim, and the hub
+    /// keeps a claim to send ahead of every full sync's dataset.
+    pub(crate) fn send_own_claims_to_replicas(&self) {
+        let me = self.myself();
+        let epoch = {
+            let nodes = self.nodes.read();
+            match nodes.get(&me) {
+                Some(n) if n.flags.contains(NodeFlags::MASTER) => n.config_epoch,
+                _ => return,
+            }
+        };
+        if !self.owns_any_slot(me) {
+            return;
+        }
+        self.send_claims_to_replicas(&[], epoch);
+    }
+
+    /// Tell this node's replicas, in the replication stream, that it owns
+    /// its slots and `taking` too, at config epoch `epoch` (a `TAKEN`
+    /// marker, [`followed_imports::encode_taken`]): what its heartbeats will
+    /// claim. Only to replicas that take the markers; the others hear it
+    /// from the heartbeats.
+    fn send_claims_to_replicas(&self, taking: &[u16], epoch: u64) {
+        let owners = self.slots.read();
+        self.send_claims_with_table(&owners[..], taking, epoch);
+    }
+
+    /// [`Self::send_claims_to_replicas`], with the slot table `owners` held
+    /// by the caller.
+    fn send_claims_with_table(&self, owners: &[Option<NodeId>], taking: &[u16], epoch: u64) {
+        let Some(hooks) = self.hooks.get() else {
+            return;
+        };
+        let me = self.myself();
+        let mut taken = vec![false; CLUSTER_SLOTS];
+        for &slot in taking {
+            taken[slot as usize] = true;
+        }
+        let mine: Vec<u16> = (0..CLUSTER_SLOTS as u16)
+            .filter(|&slot| owners[slot as usize] == Some(me) || taken[slot as usize])
+            .collect();
+        let marker = followed_imports::encode_taken(epoch, &migration::slot_runs(mine));
+        hooks.replica_starter.repl_state.send_slot_claims(marker);
+    }
+
+    /// A claim of this node's master (`master`): `ranges` at config epoch
+    /// `epoch`, from its replication stream ([`Self::send_claims_to_replicas`]).
+    /// Taken in as the same claim in its heartbeat is: its config epoch
+    /// raised to `epoch`, and each slot moved to it only from an owner at an
+    /// older epoch. The master's own word, sent before the writes that
+    /// follow it in the stream.
+    pub(crate) fn take_in_claims_of_master(
+        &self,
+        master: NodeId,
+        epoch: u64,
+        ranges: &[(u16, u16)],
+    ) {
+        {
+            let mut nodes = self.nodes.write();
+            if let Some(node) = nodes.get_mut(&master)
+                && epoch > node.config_epoch
+            {
+                node.config_epoch = epoch;
+            }
+        }
+        self.observe_epoch(epoch);
+        let claims: Vec<crate::cluster::bus::SlotClaim> = ranges
+            .iter()
+            .map(|&(start, end)| crate::cluster::bus::SlotClaim { start, end, epoch })
+            .collect();
+        self.apply_peer_slot_claims(master, &claims);
+        self.save_soon();
     }
 
     /// Record that `slots` now belong to `new_owner`, at the end of an atomic
@@ -4256,6 +4681,48 @@ impl ClusterState {
         *self.last_handover_end.lock() = Some(std::time::Instant::now());
     }
 
+    /// Whether this node may take a new config epoch now (`CLUSTER
+    /// BUMPEPOCH`, the move on an epoch collision, a takeover of slots
+    /// imported here). Not while an atomic slot migration away from this
+    /// node is handing its slots over, nor for [`HANDOVER_FAILOVER_GRACE`]
+    /// after one ended: the destination claims the slots at an epoch it took
+    /// for the takeover, above every one known then; were this node's epoch
+    /// to reach it before every node has heard that claim, those that still
+    /// have the slots as this node's would keep them so (a claim takes a
+    /// slot only from an owner at an older epoch), and a replica of this
+    /// node elected later would take them back from the destination.
+    pub(crate) fn epoch_may_change(&self) -> Result<(), String> {
+        if self.handovers.load(Ordering::SeqCst) > 0 {
+            return Err(
+                "an atomic slot migration away from this node is handing its slots over".into(),
+            );
+        }
+        if let Some(at) = *self.last_handover_end.lock()
+            && at.elapsed() < HANDOVER_FAILOVER_GRACE
+        {
+            return Err(format!(
+                "an atomic slot migration away from this node ended {} ms ago, and the \
+                 destination's claim may not have reached every node yet",
+                at.elapsed().as_millis()
+            ));
+        }
+        Ok(())
+    }
+
+    /// `change`, a change of this node's config epoch, if it may change now
+    /// ([`Self::epoch_may_change`]), with `handoff_holds` held throughout:
+    /// a handover away from this node begins either before (the change is
+    /// refused) or after (its check of this node's epoch sees the change,
+    /// [`Self::begin_handover`], and it is refused).
+    pub(crate) fn change_epoch_if_it_may<R>(
+        &self,
+        change: impl FnOnce() -> R,
+    ) -> Result<R, String> {
+        let _holds = self.handoff_holds.lock();
+        self.epoch_may_change()?;
+        Ok(change())
+    }
+
     /// Whether a replica of this master may take its slots over now, as it
     /// asks with `CLUSTER FAILOVER` or for this node's vote (#516). Not while
     /// an atomic slot migration away from this node is handing slots over,
@@ -4467,6 +4934,7 @@ impl ClusterState {
         }
         self.forget_takeover_links();
         self.own_claims.write().clear();
+        self.left_out_told.lock().clear();
         // Serialize with heartbeat merges and temporarily ban the old peers.
         // An in-flight heartbeat may already have passed its membership check;
         // without this guard it can repopulate slots after the reset returns.
@@ -4539,10 +5007,53 @@ impl ClusterState {
             }
             *myself = new_id;
         }
+        if let Some(hooks) = self.hooks.get() {
+            hooks
+                .replica_starter
+                .repl_state
+                .set_my_node_id(Some(node_id_str(&new_id).to_string()));
+        }
         let _ = self.save_to_disk();
         new_id
     }
 }
+
+/// Why [`ClusterState::take_over_slots_at`] did not take the slots: another
+/// node's config epoch came up to the one reserved for the takeover.
+#[derive(Debug)]
+pub struct EpochOvertaken {
+    pub node: NodeId,
+    pub its_epoch: u64,
+    pub epoch: u64,
+}
+
+impl std::fmt::Display for EpochOvertaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is at config epoch {}, at or above the epoch {} this takeover was to take the \
+             slots at",
+            node_id_str(&self.node),
+            self.its_epoch,
+            self.epoch
+        )
+    }
+}
+
+impl std::error::Error for EpochOvertaken {}
+
+/// Why [`ClusterState::take_over_imported_slots`] did not take the slots: a
+/// handover away from this node is under way, or ended a moment ago.
+#[derive(Debug)]
+pub struct HandingOver(pub String);
+
+impl std::fmt::Display for HandingOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HandingOver {}
 
 /// How long after an atomic slot migration away from a master handed slots
 /// over its replicas may not take them over (`failover_may_begin`), nor
@@ -5667,6 +6178,89 @@ mod tests {
         }
         cs.slots.write()[5461] = Some(b);
         assert!(cs.cast_vote(replica, a, 10, false, None));
+    }
+
+    /// A candidate whose claims leave out slots its master claims in its
+    /// own heartbeat to this node, and owns here (it took them from `b` in
+    /// an import the candidate did not hear of), is refused once per
+    /// election and told the master's own claims; asked again at the same
+    /// epoch it is decided on the rest, and a request that claims them all
+    /// is not refused for it. Nothing is refused for slots not heard from
+    /// the master itself, nor for a request without claims.
+    #[test]
+    fn a_candidate_that_leaves_out_slots_its_master_claims_is_told_them_once() {
+        let claim = |start, end, epoch| crate::cluster::bus::SlotClaim { start, end, epoch };
+        let (cs, a, b) = three_master_cluster();
+        let replica = add_replica(&cs, a);
+        {
+            let mut nodes = cs.nodes.write();
+            nodes.get_mut(&a).unwrap().mark_failed(now_ms());
+            nodes.get_mut(&a).unwrap().config_epoch = 9;
+            nodes.get_mut(&b).unwrap().config_epoch = 7;
+        }
+        for slot in 10923..=10930 {
+            cs.slots.write()[slot] = Some(a);
+        }
+        let stale = [claim(5461, 10922, 3)];
+        // Not heard from `a` itself: decided as before.
+        assert_eq!(cs.left_out_of_claims(a, &stale), None);
+        assert!(cs.master_update_for_left_out(a, &stale).is_none());
+        let own = [claim(5461, 10930, 9)];
+        cs.note_own_claims(a, &own);
+        assert_eq!(cs.left_out_of_claims(a, &stale), Some((10923, 9)));
+        assert!(!cs.cast_vote(replica, a, 10, false, Some(&stale)));
+        let update = cs.master_update_for_left_out(a, &stale).unwrap();
+        assert_eq!(update.id, a);
+        assert_eq!(update.config_epoch, 9);
+        assert_eq!(update.claims, own.to_vec());
+        // Once per election: asked again with the same claims, it has the
+        // vote (nothing else stands in its way).
+        assert!(cs.cast_vote(replica, a, 10, false, Some(&stale)));
+        // Every slot of its master claimed: nothing left out.
+        let (cs, a, _b) = three_master_cluster();
+        let replica = add_replica(&cs, a);
+        cs.nodes.write().get_mut(&a).unwrap().mark_failed(now_ms());
+        cs.note_own_claims(a, &[claim(5461, 10922, 0)]);
+        assert_eq!(cs.left_out_of_claims(a, &[claim(5461, 10922, 0)]), None);
+        assert!(cs.cast_vote(replica, a, 10, false, Some(&[claim(5461, 10922, 0)])));
+        // Without claims, as an earlier version asks.
+        let (cs, a, _b) = three_master_cluster();
+        let replica = add_replica(&cs, a);
+        cs.nodes.write().get_mut(&a).unwrap().mark_failed(now_ms());
+        cs.note_own_claims(a, &[claim(5461, 10922, 0)]);
+        assert!(cs.cast_vote(replica, a, 10, false, None));
+    }
+
+    /// A `TAKEN` marker of this node's master moves the slots to it from an
+    /// owner at an older epoch, and raises its config epoch, as its heartbeat
+    /// would; a claim at an epoch no newer than the owner's moves nothing.
+    #[test]
+    fn a_claim_from_the_masters_stream_is_taken_in_as_its_heartbeat_is() {
+        let cs = ClusterState::new_enabled(None, 15000);
+        let a = add_master(&cs, 0..=8191);
+        let b = add_master(&cs, 8192..=16383);
+        {
+            let mut nodes = cs.nodes.write();
+            nodes.get_mut(&a).unwrap().config_epoch = 3;
+            nodes.get_mut(&b).unwrap().config_epoch = 5;
+        }
+        cs.set_replica_of(a).unwrap();
+        cs.take_in_claims_of_master(a, 4, &[(8192, 8199)]);
+        assert_eq!(cs.slot_owner(8192), Some(b), "not newer than b's");
+        cs.take_in_claims_of_master(a, 8, &[(0, 8199)]);
+        assert!((8192..=8199).all(|s| cs.slot_owner(s) == Some(a)));
+        assert_eq!(cs.slot_owner(8200), Some(b));
+        assert_eq!(cs.nodes.read()[&a].config_epoch, 8);
+        assert!(cs.current_epoch() >= 8);
+        assert_eq!(
+            cs.slot_claims_of(a),
+            vec![claim_at(0, 8199, 8)],
+            "what it would claim for its master"
+        );
+    }
+
+    fn claim_at(start: u16, end: u16, epoch: u64) -> crate::cluster::bus::SlotClaim {
+        crate::cluster::bus::SlotClaim { start, end, epoch }
     }
 
     /// What an `UPDATE` names for a refused candidate: each newer owner of

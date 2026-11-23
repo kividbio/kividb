@@ -795,6 +795,9 @@ fn save_then(
     mine: &[u16],
     publish: Option<impl FnOnce()>,
 ) -> std::io::Result<()> {
+    // What a replica does not hold of its master's slots is on disk before
+    // the table that shows them as its master's is (`followed_imports::NotHeld`).
+    crate::cluster::followed_imports::save_not_held(state);
     let path = match state.config_path.as_ref() {
         Some(p) => p,
         None => {
