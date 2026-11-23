@@ -216,7 +216,7 @@ unsafe impl Memory for SlabMemory {
 /// nobody owns gives its pages back as soon as it empties (one a thread
 /// owns, when the thread lets go of it: INFO `value_slab_pool_bytes` counts
 /// them). Entries over
-/// `value_slab::MAX_BLOCK`, the group arrays and the arena chunks come from
+/// `value_slab::POOL_MAX_BLOCK`, the group arrays and the arena chunks come from
 /// the system allocator.
 pub struct EntryPool;
 

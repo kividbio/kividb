@@ -28399,6 +28399,3112 @@
           "max_x": 1.15
         }
       ]
+    },
+    "46-values-near-slab-limits/near-2k/cpu_step_2016_2028": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "cpu_step_2016_2028",
+      "unit": "x",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.0179,
+        "candidate": 1.0144,
+        "redis": 0.9982,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/cpu_us_1900": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "cpu_us_1900",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.8039,
+        "candidate": 1.774,
+        "redis": 1.6796,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/cpu_us_2000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "cpu_us_2000",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.8058,
+        "candidate": 1.7861,
+        "redis": 1.6766,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/cpu_us_2016": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "cpu_us_2016",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.7969,
+        "candidate": 1.7859,
+        "redis": 1.7766,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/cpu_us_2028": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "cpu_us_2028",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.8337,
+        "candidate": 1.8131,
+        "redis": 1.7819,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/cpu_us_2100": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "cpu_us_2100",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.8326,
+        "candidate": 1.8274,
+        "redis": 1.8075,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/cpu_us_2200": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "cpu_us_2200",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.9496,
+        "candidate": 1.9358,
+        "redis": 1.8763,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/rss_b_1900": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "rss_b_1900",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2036.3264,
+        "candidate": 2035.4048,
+        "redis": 2189.824,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/rss_b_2000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "rss_b_2000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2103.808,
+        "candidate": 2105.7536,
+        "redis": 2190.1312,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/rss_b_2016": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "rss_b_2016",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2097.4592,
+        "candidate": 2104.7296,
+        "redis": 2190.7456,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/rss_b_2028": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "rss_b_2028",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2163.8144,
+        "candidate": 2151.7312,
+        "redis": 2190.9504,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/rss_b_2100": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "rss_b_2100",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2238.3616,
+        "candidate": 2200.8832,
+        "redis": 2658.2016,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 3
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/rss_b_2200": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "rss_b_2200",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2310.2464,
+        "candidate": 2297.2416,
+        "redis": 2658.0992,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/set_kops_1900": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "set_kops_1900",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1852.1309,
+        "candidate": 1868.2365,
+        "redis": 595.1351,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/set_kops_2000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "set_kops_2000",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1767.2646,
+        "candidate": 1786.2529,
+        "redis": 596.1412,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/set_kops_2016": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "set_kops_2016",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1710.8403,
+        "candidate": 1763.3906,
+        "redis": 562.6307,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/set_kops_2028": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "set_kops_2028",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1742.9831,
+        "candidate": 1769.8454,
+        "redis": 560.8566,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/set_kops_2100": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "set_kops_2100",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1706.2168,
+        "candidate": 1787.7307,
+        "redis": 553.9747,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/set_kops_2200": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "set_kops_2200",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1595.89,
+        "candidate": 1628.8623,
+        "redis": 534.5349,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/step_2016_2028": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "step_2016_2028",
+      "unit": "x",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1.0057,
+        "candidate": 1.0065,
+        "redis": 1.0016,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "min": 0.97
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/used_b_1900": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "used_b_1900",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1966.9821,
+        "candidate": 1967.0157,
+        "redis": 2106.0798,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/used_b_2000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "used_b_2000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2062.9821,
+        "candidate": 2063.0157,
+        "redis": 2106.0382,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/used_b_2016": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "used_b_2016",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2062.9821,
+        "candidate": 2063.0157,
+        "redis": 2106.0744,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/used_b_2028": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "used_b_2028",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2126.9821,
+        "candidate": 2110.9677,
+        "redis": 2106.0692,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/used_b_2100": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "used_b_2100",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2190.9821,
+        "candidate": 2158.9677,
+        "redis": 2618.062,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/used_b_2200": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "used_b_2200",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2254.9987,
+        "candidate": 2254.9677,
+        "redis": 2617.9852,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-2k/worst_overhead_pct": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-2k",
+      "metric": "worst_overhead_pct",
+      "unit": "%",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.8877,
+        "candidate": 2.4566,
+        "redis": 18.8215,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 3
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_step_4048_4056": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_step_4048_4056",
+      "unit": "x",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.0636,
+        "candidate": 1.0839,
+        "redis": 1.0335,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_step_4064_4072": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_step_4064_4072",
+      "unit": "x",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.1263,
+        "candidate": 1.0568,
+        "redis": 1.0063,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_step_4088_4100": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_step_4088_4100",
+      "unit": "x",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 1.0129,
+        "candidate": 1.0222,
+        "redis": 1.012,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_3500": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_3500",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.6515,
+        "candidate": 2.5777,
+        "redis": 2.6054,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_3600": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_3600",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.7697,
+        "candidate": 2.6685,
+        "redis": 2.5832,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_3700": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_3700",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.8204,
+        "candidate": 2.6669,
+        "redis": 2.5705,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_3800": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_3800",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.7555,
+        "candidate": 2.6833,
+        "redis": 2.5543,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_3900": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_3900",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.8887,
+        "candidate": 2.7352,
+        "redis": 2.6261,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_4000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_4000",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.904,
+        "candidate": 2.7627,
+        "redis": 2.6546,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_4048": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_4048",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.8345,
+        "candidate": 2.6527,
+        "redis": 2.7056,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_4056": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_4056",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.0052,
+        "candidate": 2.8672,
+        "redis": 2.793,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_4064": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_4064",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.0018,
+        "candidate": 2.8364,
+        "redis": 2.9423,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_4072": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_4072",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.378,
+        "candidate": 2.9836,
+        "redis": 2.8847,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_4088": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_4088",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.4249,
+        "candidate": 2.9334,
+        "redis": 2.9765,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_4100": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_4100",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.4464,
+        "candidate": 2.9933,
+        "redis": 3.006,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_4200": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_4200",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.4426,
+        "candidate": 3.0546,
+        "redis": 3.1175,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_4300": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_4300",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.4759,
+        "candidate": 3.0804,
+        "redis": 2.8531,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_4400": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_4400",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.4524,
+        "candidate": 3.0726,
+        "redis": 2.2148,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/cpu_us_4500": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "cpu_us_4500",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.5487,
+        "candidate": 3.115,
+        "redis": 2.151,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_3500": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_3500",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3687.0554,
+        "candidate": 3589.079,
+        "redis": 3680.5018,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_3600": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_3600",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3899.8835,
+        "candidate": 3748.905,
+        "redis": 4298.2605,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_3700": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_3700",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3900.1293,
+        "candidate": 3832.3814,
+        "redis": 4298.8339,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_3800": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_3800",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3901.0304,
+        "candidate": 3914.8749,
+        "redis": 4299.5712,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_3900": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_3900",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4140.5645,
+        "candidate": 4002.857,
+        "redis": 4299.1616,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_4000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_4000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4141.8752,
+        "candidate": 4093.8701,
+        "redis": 4299.2435,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_4048": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_4048",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4139.4176,
+        "candidate": 4139.5814,
+        "redis": 4299.3254,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_4056": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_4056",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4142.2029,
+        "candidate": 4138.8442,
+        "redis": 4299.5712,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_4064": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_4064",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4143.9232,
+        "candidate": 4141.6294,
+        "redis": 4299.4893,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_4072": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_4072",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4188.3238,
+        "candidate": 4189.6346,
+        "redis": 4300.3085,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_4088": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_4088",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4189.3888,
+        "candidate": 4183.5725,
+        "redis": 4298.752,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_4100": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_4100",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4212.1626,
+        "candidate": 4286.9555,
+        "redis": 5233.623,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_4200": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_4200",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4306.6163,
+        "candidate": 4392.8781,
+        "redis": 5233.2134,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_4300": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_4300",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4402.7085,
+        "candidate": 4483.8093,
+        "redis": 5231.4931,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 3
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_4400": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_4400",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4499.2102,
+        "candidate": 4572.6925,
+        "redis": 5231.9027,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/rss_b_4500": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "rss_b_4500",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4612.7514,
+        "candidate": 4695.081,
+        "redis": 5231.4931,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_3500": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_3500",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1208.3782,
+        "candidate": 1269.4772,
+        "redis": 384.9303,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_3600": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_3600",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1139.0971,
+        "candidate": 1178.4632,
+        "redis": 388.2025,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_3700": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_3700",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1138.5424,
+        "candidate": 1169.1614,
+        "redis": 388.8167,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_3800": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_3800",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1124.5801,
+        "candidate": 1172.1831,
+        "redis": 391.3464,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_3900": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_3900",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1119.793,
+        "candidate": 1170.833,
+        "redis": 380.4519,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_4000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_4000",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1119.1295,
+        "candidate": 1165.0259,
+        "redis": 376.4767,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_4048": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_4048",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1124.7961,
+        "candidate": 1172.7645,
+        "redis": 369.3665,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_4056": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_4056",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1041.7763,
+        "candidate": 1097.8893,
+        "redis": 357.808,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_4064": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_4064",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1039.8401,
+        "candidate": 1091.4618,
+        "redis": 340.7994,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_4072": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_4072",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1033.731,
+        "candidate": 1086.5008,
+        "redis": 345.3028,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_4088": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_4088",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1028.7646,
+        "candidate": 1074.7414,
+        "redis": 335.7505,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_4100": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_4100",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1027.9813,
+        "candidate": 1073.6962,
+        "redis": 332.3663,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_4200": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_4200",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1025.014,
+        "candidate": 1084.8835,
+        "redis": 319.5211,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_4300": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_4300",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1027.5619,
+        "candidate": 1067.2362,
+        "redis": 350.2389,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_4400": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_4400",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1016.0458,
+        "candidate": 1073.9171,
+        "redis": 449.5901,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/set_kops_4500": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "set_kops_4500",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 977.5736,
+        "candidate": 1051.3685,
+        "redis": 464.2885,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/step_4048_4056": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "step_4048_4056",
+      "unit": "x",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.9245,
+        "candidate": 0.9355,
+        "redis": 0.9679,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/step_4064_4072": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "step_4064_4072",
+      "unit": "x",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 0.9968,
+        "candidate": 0.9999,
+        "redis": 0.9969,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 3
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/step_4088_4100": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "step_4088_4100",
+      "unit": "x",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1.0007,
+        "candidate": 0.9884,
+        "redis": 0.9872,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "min": 0.97
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_3500": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_3500",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3596.0092,
+        "candidate": 3547.9754,
+        "redis": 3640.0272,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_3600": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_3600",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3659.9959,
+        "candidate": 3707.9754,
+        "redis": 4152.001,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_3700": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_3700",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3787.9959,
+        "candidate": 3787.9754,
+        "redis": 4151.9715,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_3800": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_3800",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3851.9959,
+        "candidate": 3867.9754,
+        "redis": 4152.0269,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_3900": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_3900",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3980.0092,
+        "candidate": 3963.9754,
+        "redis": 4152.0118,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_4000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_4000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4044.0092,
+        "candidate": 4059.9754,
+        "redis": 4151.9949,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_4048": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_4048",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4107.9959,
+        "candidate": 4107.9887,
+        "redis": 4152.0214,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_4056": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_4056",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4107.9959,
+        "candidate": 4107.9887,
+        "redis": 4152.0365,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_4064": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_4064",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4107.9959,
+        "candidate": 4107.9887,
+        "redis": 4151.988,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_4072": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_4072",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4155.9959,
+        "candidate": 4156.0297,
+        "redis": 4152.0104,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_4088": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_4088",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4156.0092,
+        "candidate": 4156.0164,
+        "redis": 4151.9778,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_4100": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_4100",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4167.9761,
+        "candidate": 4252.0164,
+        "redis": 5176.0088,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_4200": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_4200",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4267.9761,
+        "candidate": 4348.0297,
+        "redis": 5176.0224,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_4300": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_4300",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4367.9761,
+        "candidate": 4444.0164,
+        "redis": 5176.0694,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_4400": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_4400",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4467.9761,
+        "candidate": 4540.0164,
+        "redis": 5176.0816,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/used_b_4500": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "used_b_4500",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 4567.955,
+        "candidate": 4652.0164,
+        "redis": 5176.0507,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-4k/worst_overhead_pct": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-4k",
+      "metric": "worst_overhead_pct",
+      "unit": "%",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 6.11,
+        "candidate": 2.744,
+        "redis": 23.2469,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 3
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/cpu_step_26192_26208": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "cpu_step_26192_26208",
+      "unit": "x",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.9912,
+        "candidate": 0.9734,
+        "redis": 1.0093,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/cpu_us_24000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "cpu_us_24000",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 19.1186,
+        "candidate": 18.8877,
+        "redis": 8.0754,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/cpu_us_25000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "cpu_us_25000",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 14.2172,
+        "candidate": 13.92,
+        "redis": 8.3426,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/cpu_us_26000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "cpu_us_26000",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 14.6269,
+        "candidate": 14.863,
+        "redis": 8.5568,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/cpu_us_26192": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "cpu_us_26192",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 14.7568,
+        "candidate": 14.5106,
+        "redis": 8.5828,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/cpu_us_26208": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "cpu_us_26208",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 14.8041,
+        "candidate": 14.0818,
+        "redis": 8.7083,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/cpu_us_27000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "cpu_us_27000",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 14.9428,
+        "candidate": 14.3919,
+        "redis": 8.7373,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/cpu_us_28000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "cpu_us_28000",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 14.7156,
+        "candidate": 14.1774,
+        "redis": 10.1483,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/rss_b_24000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "rss_b_24000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 24157.952,
+        "candidate": 24555.264,
+        "redis": 24869.376,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/rss_b_25000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "rss_b_25000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 25174.272,
+        "candidate": 25760.768,
+        "redis": 28985.088,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 3
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/rss_b_26000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "rss_b_26000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 26169.6,
+        "candidate": 26390.272,
+        "redis": 28987.136,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/rss_b_26192": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "rss_b_26192",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 26356.736,
+        "candidate": 26411.264,
+        "redis": 28983.552,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/rss_b_26208": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "rss_b_26208",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 26379.52,
+        "candidate": 26400.0,
+        "redis": 28984.832,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/rss_b_27000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "rss_b_27000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 27174.912,
+        "candidate": 27191.04,
+        "redis": 28984.576,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/rss_b_28000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "rss_b_28000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 28167.68,
+        "candidate": 28197.376,
+        "redis": 28986.368,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/set_kops_24000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "set_kops_24000",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 207.7321,
+        "candidate": 210.0796,
+        "redis": 123.6498,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/set_kops_25000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "set_kops_25000",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 277.4624,
+        "candidate": 282.2916,
+        "redis": 119.705,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/set_kops_26000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "set_kops_26000",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 270.4294,
+        "candidate": 261.3042,
+        "redis": 116.6994,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/set_kops_26192": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "set_kops_26192",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 267.6091,
+        "candidate": 270.8167,
+        "redis": 116.7046,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/set_kops_26208": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "set_kops_26208",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 265.22,
+        "candidate": 279.9421,
+        "redis": 114.6533,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/set_kops_27000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "set_kops_27000",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 264.8911,
+        "candidate": 273.9056,
+        "redis": 114.6505,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/set_kops_28000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "set_kops_28000",
+      "unit": "kops",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 263.3496,
+        "candidate": 272.1208,
+        "redis": 98.5603,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/step_26192_26208": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "step_26192_26208",
+      "unit": "x",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 1.0055,
+        "candidate": 1.0252,
+        "redis": 0.9898,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "min": 0.97
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/used_b_24000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "used_b_24000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 24074.9932,
+        "candidate": 24451.1273,
+        "redis": 24632.136,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/used_b_25000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "used_b_25000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 25074.9273,
+        "candidate": 25635.1273,
+        "redis": 28728.173,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/used_b_26000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "used_b_26000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 26075.0347,
+        "candidate": 26275.1688,
+        "redis": 28728.221,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/used_b_26192": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "used_b_26192",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 26266.9932,
+        "candidate": 26275.1273,
+        "redis": 28728.242,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/used_b_26208": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "used_b_26208",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 26282.9932,
+        "candidate": 26283.1053,
+        "redis": 28728.241,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/used_b_27000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "used_b_27000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 27075.0347,
+        "candidate": 27075.1053,
+        "redis": 28728.272,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/used_b_28000": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "used_b_28000",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 28074.9932,
+        "candidate": 28075.1053,
+        "redis": 28728.2205,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "46-values-near-slab-limits/near-max/worst_overhead_pct": {
+      "suite": "46-values-near-slab-limits",
+      "config": "near-max",
+      "metric": "worst_overhead_pct",
+      "unit": "%",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.0653,
+        "candidate": 2.2789,
+        "redis": 12.4628,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-23",
+        "commit": "eca5923e",
+        "label": "pr240-46-eca5923e-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "max": 3
+        }
+      ]
     }
   }
 }

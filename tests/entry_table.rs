@@ -279,7 +279,8 @@ fn strings_are_written_in_place_when_the_block_still_fits() {
             Written::Replaced(_)
         ));
         assert_eq!(text(map.get("k")), Some(bytes(90, 7)));
-        // Not over a value of another kind, or one too long to be inline.
+        // Not over a value of another kind. A string too long to be inline
+        // has a block of its own, written in place the same way.
         map.insert("l", list(&[b"x"]));
         assert!(matches!(map.set_str("l", b"v"), Written::Replaced(_)));
         assert!(matches!(
@@ -288,7 +289,7 @@ fn strings_are_written_in_place_when_the_block_still_fits() {
         ));
         assert!(matches!(
             map.set_str("l", bytes(5_000, 2)),
-            Written::Replaced(_)
+            Written::InPlace
         ));
         assert_eq!(text(map.get("l")), Some(bytes(5_000, 2)));
 
@@ -720,7 +721,7 @@ fn growing_and_shrinking_keep_every_entry() {
 }
 
 #[test]
-fn every_size_up_to_4_kib_has_the_smallest_class_that_holds_it() {
+fn every_size_up_to_the_largest_block_has_the_smallest_class_that_holds_it() {
     let mut last = None;
     for size in 1..=value_slab::MAX_BLOCK {
         let class = value_slab::class_of(size).expect("a slab's");

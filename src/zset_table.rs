@@ -26,7 +26,7 @@
 //!   overflow group holds slot words too. Active defrag never moves a pool
 //!   entry: `value_slab::plan_evacuation` only picks slabs of the keyspace's
 //!   classes, and an entry is a block of a pool class or, past
-//!   `value_slab::MAX_BLOCK`, of the system allocator. So an entry's address
+//!   `value_slab::POOL_MAX_BLOCK`, of the system allocator. So an entry's address
 //!   is fixed from the insert that makes it to the removal that frees it.
 //! - **Only this module changes the table or the index.** [`Large`] owns
 //!   both, privately; every write goes through its methods, and an
