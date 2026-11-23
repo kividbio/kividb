@@ -1270,12 +1270,6 @@ impl Rare {
             reserve_bits: 0,
         }
     }
-
-    /// Whether a chain of `depth` groups makes a resize with a new seed due.
-    #[inline]
-    fn reseed_due(&self, depth: usize) -> bool {
-        rare_reseed_due(depth, self.reseeds_in_a_row)
-    }
 }
 
 /// The group array and overflow arena a finished resize left behind:
@@ -1370,10 +1364,28 @@ fn shrink_bits(n: usize) -> u8 {
     bits
 }
 
-/// [`Rare::reseed_due`], for a caller that has the count borrowed apart.
+/// Whether a chain of `depth` groups makes a resize with a new seed due.
 #[inline]
 fn rare_reseed_due(depth: usize, reseeds_in_a_row: u8) -> bool {
     depth > chain_cap() && reseeds_in_a_row < MAX_RESEEDS_IN_A_ROW
+}
+
+/// Put an element in its home group if there is a free slot. Returns false
+/// when the home group is full and placement must continue in its chain.
+///
+/// # Safety
+/// `group` is a live home group; the element is in no array.
+#[inline]
+unsafe fn place_in_home(group: *mut Group, fp: u8, slot: *mut u8) -> bool {
+    // SAFETY: the caller's promise; `empty` identifies only free slots.
+    unsafe {
+        let empty = (*group).empty();
+        if empty != 0 {
+            (*group).put(first(empty), fp, slot);
+            return true;
+        }
+    }
+    false
 }
 
 /// Put an element (`slot`, hash `h`) in `array`'s chain for it, taking an
@@ -1389,9 +1401,7 @@ unsafe fn place<A: Memory>(array: Array, arena: &mut Arena, h: u64, slot: *mut u
     let group = array.group(array.home(h));
     // SAFETY: the home group is part of the live array.
     unsafe {
-        let empty = (*group).empty();
-        if empty != 0 {
-            (*group).put(first(empty), fp, slot);
+        if place_in_home(group, fp, slot) {
             return 1;
         }
         place_full::<A>(array, arena, group, fp, slot)
@@ -1629,21 +1639,14 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
         }
         let main = self.main();
         let group = main.group(main.home(h));
+        let fp = fingerprint(h);
         // SAFETY: the home group is live and the element is new. An arena is
         // needed only after the home group is full.
         let depth = unsafe {
-            let empty = (*group).empty();
-            if empty != 0 {
-                (*group).put(first(empty), fingerprint(h), slot);
+            if place_in_home(group, fp, slot) {
                 1
             } else {
-                place_full::<A>(
-                    main,
-                    &mut self.rare_mut().arena,
-                    group,
-                    fingerprint(h),
-                    slot,
-                )
+                place_full::<A>(main, &mut self.rare_mut().arena, group, fp, slot)
             }
         };
         if rare_reseed_due(
@@ -3406,6 +3409,119 @@ mod tests {
         assert!(table.rare.is_none());
     }
     type SetT = CollectionTable<Members, Counted>;
+
+    #[test]
+    fn rare_is_created_only_when_a_home_group_overflows() {
+        let seed = 3;
+        // Leave room in the main array so its growth cannot create Rare
+        // before the colliding fields need an overflow group.
+        let mut table = HashT::with_capacity_and_seed(32, seed);
+        let bits = table.bits;
+        let fields = colliding(seed, SLOTS + 1, u32::from(bits));
+        assert!(table.rare.is_none());
+        for field in &fields[..SLOTS] {
+            assert!(table.insert(field, b"value", None).unwrap());
+            assert!(table.rare.is_none(), "a free home slot needs no Rare");
+        }
+        assert!(table.insert(&fields[SLOTS], b"value", None).unwrap());
+        assert!(table.rare.is_some(), "the first overflow needs Rare");
+        assert_eq!(table.bits, bits, "the main array did not grow");
+        assert!(!table.resizing());
+        assert_eq!(table.stats().overflow_groups, 1);
+        for field in &fields {
+            assert_eq!(table.get(field).unwrap().value, b"value");
+        }
+        table.check();
+    }
+
+    #[test]
+    fn cloning_a_table_without_rare_needs_no_rare() {
+        let mut table = HashT::with_capacity_and_seed(6, 1);
+        let fields = [
+            b"name".as_slice(),
+            b"data",
+            b"opts",
+            b"timestamp",
+            b"delay",
+            b"priority",
+        ];
+        table.defer_free(true);
+        for field in fields {
+            table.insert(field, b"value", None).unwrap();
+        }
+        assert!(table.rare.is_none());
+        let mut copy = table.clone();
+        assert!(copy.rare.is_none(), "cloning a small table needs no Rare");
+        assert_eq!(copy.stats().groups, 1);
+        assert_eq!(copy.len(), table.len());
+        for field in fields {
+            assert_eq!(copy.get(field), table.get(field));
+        }
+        copy.insert(b"name", b"copy", None).unwrap();
+        assert_eq!(table.get(b"name").unwrap().value, b"value");
+        assert_eq!(copy.get(b"name").unwrap().value, b"copy");
+        assert!(copy.rare.is_none());
+        table.check();
+        copy.check();
+    }
+
+    #[test]
+    fn allocation_size_is_exact_without_rare() {
+        let fields = [
+            b"name".as_slice(),
+            b"data",
+            b"opts",
+            b"timestamp",
+            b"delay",
+            b"priority",
+        ];
+        let members = [
+            b"inline".as_slice(),
+            b"member-with-an-entry-1",
+            b"two",
+            b"member-with-an-entry-2",
+            b"three",
+            b"member-with-an-entry-3",
+        ];
+        let Some(before) = crate::memory_use::allocated_by_this_thread() else {
+            return;
+        };
+        let mut hash = CollectionTable::<Fields, SystemMemory>::with_capacity_and_seed(6, 4);
+        let mut set = CollectionTable::<Members, SystemMemory>::with_capacity_and_seed(6, 4);
+        hash.defer_free(true);
+        set.defer_free(true);
+        for n in 0..=fields.len() {
+            if n > 0 {
+                hash.insert(fields[n - 1], b"value", None).unwrap();
+                set.insert(members[n - 1]).unwrap();
+            }
+            assert!(hash.rare.is_none());
+            assert!(set.rare.is_none());
+            let now = crate::memory_use::allocated_by_this_thread().unwrap();
+            assert_eq!(
+                (now - before) as usize,
+                hash.allocation_size() + set.allocation_size()
+            );
+        }
+        for (field, member) in fields.into_iter().zip(members) {
+            assert!(hash.remove(field));
+            assert!(set.remove(member));
+            assert!(hash.rare.is_none());
+            assert!(set.rare.is_none());
+            let now = crate::memory_use::allocated_by_this_thread().unwrap();
+            assert_eq!(
+                (now - before) as usize,
+                hash.allocation_size() + set.allocation_size()
+            );
+        }
+        hash.check();
+        set.check();
+        drop((hash, set));
+        assert_eq!(
+            crate::memory_use::allocated_by_this_thread().unwrap(),
+            before
+        );
+    }
 
     /// Scale a test down under Miri.
     fn scale(n: usize) -> usize {
