@@ -3741,6 +3741,9 @@ where
                     .get(client_id)
                     .map(|info| info.replica_listening_port)
                     .filter(|p| *p != 0);
+                let node_id = client_registry
+                    .get(client_id)
+                    .and_then(|info| info.replica_node_id);
                 let vset_quant_announced = client_registry
                     .get(client_id)
                     .is_some_and(|info| info.replica_vset_quant == Some(true));
@@ -3779,6 +3782,7 @@ where
                     legacy_sync,
                     buffer,
                     listening_port,
+                    node_id,
                     psync,
                     vset_quant_announced,
                     slot_imports_announced,

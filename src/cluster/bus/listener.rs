@@ -439,10 +439,20 @@ pub fn process_message(
                 // that sent claims, which no earlier version does: one of
                 // those drops a connection on a message it does not know.
                 // Every other refusal is silent, as before.
-                let owners = claims
+                let mut owners = claims
                     .as_deref()
                     .map(|c| state.newer_owners_of_claimed(master_id, c))
                     .unwrap_or_default();
+                // And its master's own claims, if its request left out some
+                // of them: it stands for those too, and counts the masters
+                // that own slots as this node does.
+                if let Some(master) = claims
+                    .as_deref()
+                    .and_then(|c| state.master_update_for_left_out(master_id, c))
+                    && !owners.iter().any(|o| o.id == master.id)
+                {
+                    owners.push(master);
+                }
                 if owners.is_empty() {
                     return None;
                 }
@@ -751,7 +761,16 @@ pub(crate) fn apply_update(
                 .join(","),
             owner.config_epoch
         );
-        state.apply_peer_slot_claims(owner.id, &owner.claims);
+        // Of this node's own master, only the slots it owns here already,
+        // and those of an import whose data this node holds in full
+        // (`master_claims_arrived`): a replica that does not hold it may not
+        // hold their keys.
+        if state.my_master_id() == Some(owner.id) {
+            let claims = state.master_claims_arrived(owner.id, &owner.claims);
+            state.apply_peer_slot_claims(owner.id, &claims);
+        } else {
+            state.apply_peer_slot_claims(owner.id, &owner.claims);
+        }
     }
     drop(forgotten);
     state.save_soon();
