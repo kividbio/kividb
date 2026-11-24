@@ -474,7 +474,6 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         notify(ctx.pubsub, db, KS_LIST, "lmovem", &src);
                         notify(ctx.pubsub, db, KS_LIST, "lmovem", &dst);
                         tell_source_deleted(ctx, &moved, &src);
-                        crate::stats::record_hit();
                         Some(elements_reply(moved.elements))
                     }
                     Ok(None) => None,

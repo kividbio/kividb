@@ -47,6 +47,9 @@ pub const CHUNK_ENTRIES: usize = 64;
 /// An element shorter than this has one-byte lengths, a longer one
 /// two-byte lengths (see [`write_frame`]).
 const SHORT: usize = 128;
+/// The most room a chunk opened in front is given beyond a quarter of the
+/// chunk it follows (see `new_chunk_room`).
+const FRONT_ROOM: usize = 1024;
 /// The least a buffer that holds something grows by: a few elements' room,
 /// so that a list pushed to one element at a time is not reallocated at
 /// every push.
@@ -1045,6 +1048,29 @@ impl PackedList {
         }
     }
 
+    /// The room a chunk opened in front by a push of `element_len` bytes
+    /// starts with, beside a full chunk holding `live` bytes of frames: a
+    /// quarter of it, so that a steady stack does not regrow the chunk at
+    /// every push. A list of at least 192 elements gets room for a whole
+    /// chunk of frames like this one when that is no more than 1 KiB or the
+    /// quarter (whichever is more): short elements, then, whose chunk is
+    /// allocated once, at one size, and filled without moving. The chunks of
+    /// lists that push at the front and trim at the back (a timeline:
+    /// `LPUSH`, `LTRIM`) come and go in one size, which an allocator reuses,
+    /// instead of in the ten sizes a chunk passes through as it grows by a
+    /// quarter; a list of larger elements keeps the quarter. Chunks opened
+    /// at the back keep the quarter: a list loaded by `RPUSH` ends in a chunk
+    /// that is not full, and the room it was given would not be used.
+    fn new_chunk_room(&self, element_len: usize, live: usize) -> usize {
+        let frame = frame_len(element_len);
+        let quarter = frame.max(live / 4);
+        if self.len() >= 192 {
+            quarter.max((CHUNK_ENTRIES * frame).min(FRONT_ROOM.max(quarter)))
+        } else {
+            quarter
+        }
+    }
+
     /// A new chunk after the last, with room for `bytes` of frames. The
     /// chunk that was last has one on each side from then on, unless it is
     /// also the first, and gives back its room.
@@ -1219,7 +1245,8 @@ impl PackedList {
         if first.count() < CHUNK_ENTRIES {
             first.push_front(element);
         } else {
-            let room = frame_len(element.len()).max(first.live() / 4);
+            let live = first.live();
+            let room = self.new_chunk_room(element.len(), live);
             self.open_front(room);
             self.first_mut().push_front(element);
         }

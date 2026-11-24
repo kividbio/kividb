@@ -585,6 +585,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A FLAT vector index keeps its vectors in fixed blocks by slot, and a
+  filtered KNN goes from each matching document id to its vector (#1020).**
+  The vectors of a FLAT index are in blocks of slots that never move, each
+  on a cache line, in huge pages where the kernel gives them (the blocks an
+  HNSW graph keeps, without links), with the slot of each key and, in an
+  index with TAG, NUMERIC or TEXT fields, the slot of each document id. A
+  KNN of the whole index reads the blocks in order; one whose filter the
+  postings answer goes from each id the filter matched to its slot and
+  measures the vector there, and copies a key only for a vector among the
+  nearest so far. Each vector was a separate allocation found by its key: a
+  key, a hash and a jump to a 6 KB block (at 1536 dimensions) for each
+  matching document. An `HSET` of an indexed document writes its vector over
+  the one in its slot (decoded there, with no allocation), a delete gives
+  the slot back to the next document, and a scan lets the index's lock go
+  to a waiting writer every 256 vectors, as the filtered KNN let it go
+  every 256 keys. A KNN finds the same hits at the same distances; of
+  vectors at the same distance, a KNN of the whole index keeps and lists
+  them in slot order. A hit of a filtered KNN is tried against the filter
+  on its own document when the postings gave an id back while the query
+  ran (an id given back is given to the next document). A FLAT index
+  keeps its blocks while it lives: after many deletes its memory stays at
+  its peak, the slots given back taken by the next documents, until the
+  index is dropped. Nothing changes on disk or on the replication stream:
+  the index is built from the documents at load, as before. On an Azure
+  `Standard_D8s_v5` (Xeon 8370C), the server on vCPUs 0-3 (`--threads 4`;
+  Redis 8.12 `--io-threads 4 --search-workers 4`), a closed-loop client on
+  4-7, 100,000 HASH documents with a 1536-dimension FLOAT32 COSINE vector,
+  `KNN 5` with #1020's TAG filter of about 10,090 documents: 798 lookups a
+  second at 8 connections and 806 at 64 (p99 11.5 / 90 ms), against 502 /
+  510 for master before it, 486 / 482 for v1.2.2 and 488 / 500 for Redis
+  (p99 29 / 232 ms). A filter of 100 documents: 27,480 / 30,555 (median of
+  5; master 24,893 / 26,384, v1.2.2 25,076 / 27,003, Redis 12,168 /
+  14,556). No filter: 77 / 76 (master 58 / 50, v1.2.2 57 / 58, Redis 46 /
+  124). `HSET`s of a vector into the index (`redis-benchmark`, 16
+  connections, pipeline 16): 389,900 a second (master 380,600); the index
+  built again at load from 100,000 documents in 0.97 s (master 0.95 s,
+  median of 6 starts, which spread over 6 %). `used_memory` for the index,
+  a vector: 6,321 bytes at 100,000 x 1536 with a TAG field (master 6,325),
+  384 at 1,000 x 64 (443); a small index starts with blocks of 8 slots,
+  doubling, and at 100 x 64 takes 466 (425). Suite `51-filtered-flat-knn`
+  of `benchmarks/1.3.0/regressions` measures it; see docs/PERFORMANCE.md,
+  "Filtered KNN on a FLAT index".
 - **`KEYS` reads its entries ahead and lets writes in between parts of a
   shard (#1018).** `KEYS` goes through a shard's buckets in parts of 4,096
   and asks for the lines of each entry's header and key as it finds the
@@ -610,6 +652,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   under 2 ms); since #762 it runs on a thread of its own, and no probe
   connection saw more than 4.3 ms. Suite `50-keys-wildcard` of
   `benchmarks/1.3.0` measures it.
+- **`keyspace_hits` and `keyspace_misses` count a key a read command looks
+  up as Redis does (#1022).** A hit when the key is there, whatever its
+  type and whether or not the member, field or index asked for is in it
+  (`HGET`, `SISMEMBER`, `ZSCORE`, `LINDEX` of a key that is there are
+  hits; `WRONGTYPE` replies count a hit), a miss when it is not there.
+  `LRANGE`, `STRLEN`, `SCARD`, `EXISTS`, `TYPE`, `TTL`, `PTTL`,
+  `EXPIRETIME`, `TOUCH`, `DUMP`, `OBJECT ENCODING`, `COPY`, `SET ... GET`,
+  the sorted-set reads (`ZRANGE` and its relatives, `ZCARD`, `ZCOUNT`,
+  `ZLEXCOUNT`, `ZMSCORE`, `ZREVRANK`, `ZRANDMEMBER`, `ZSCAN`), `HRANDFIELD`
+  and the sources of the set and sorted-set algebra commands (each key
+  named counts) are counted; `HMGET` and `MGET` count each key once;
+  commands that write (`LPOP`, `LMPOP`, `BLPOP`, `LPUSHX`, `HDEL`,
+  `HGETDEL`, `HGETEX`, `SREM`, `SPOP`, `SMOVE`) count nothing, as in Redis.
+  `ZINTER`, `ZINTERSTORE`, `ZINTERCARD`, `ZDIFF` and `ZDIFFSTORE` look every
+  key up, as Redis does, and stop only at a key of another type: `ZINTER 2
+  nokey s` with `s` a string answers `WRONGTYPE` (it answered an empty array),
+  and `ZDIFF` counts each key once.
+  `tests/stats_keyspace.rs` holds the counts Redis 8.12.0 gives for 159
+  commands, including the set and sorted-set algebra and STORE forms, a script, a
+  transaction, expired keys and a blocking pop served at once and later. The bit commands, `PFCOUNT`, `XLEN`, `GEOPOS`, `LCS`, `SORT` and
+  the field-expiry reads (`HTTL` and its relatives) do not count yet. Redis
+  counts a key looked up before an argument is found not to be a number
+  (`LINDEX l notanint`) or a `WEIGHTS`, `AGGREGATE` or `LIMIT` is found not to
+  parse (`ZUNION`, `ZINTER`, `ZINTERCARD`); those commands read their
+  arguments first and count nothing.
+
 - **io_uring workers finish a waiting socket read without interrupting the
   worker (#1015).** Each worker's ring is made with
   `IORING_SETUP_COOP_TASKRUN` (Linux 5.19 and later; on an older kernel the
@@ -1804,6 +1872,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to a tenth of its length gives back the room it kept for the rest.
 
   Suite `21-list-memory` of the 1.3.0 regression suite measures this again.
+
+  Misskey's home timelines (#1022), 10,000 lists of 300 ten-byte ids on a
+  `Standard_D4s_v5`, `--threads 4`, bytes of `used_memory` / of RSS an
+  element, default build: loaded with `RPUSH` one element a command, 59.7 /
+  76.1 in 1.2.2, 14.1 / 14.9 now, 13.9 / 14.3 in Redis 8.10.2; one `RPUSH`
+  of 300 a list, 48.4 / 64.5, 13.4 / 13.9, 13.9 / 14.4. After every list
+  has taken 3,000 `LPUSH` + `LTRIM key 0 299` pairs: 64.4 / 96.6 in 1.2.2,
+  14.2 / 27.0 now, 13.9 / 14.3 in Redis (on the `lua,tls` builds, which use
+  mimalloc, the RSS is 17.7 to 20.6, where it was 23.0 to 25.7 before the
+  chunks of a list of at least 192 elements were opened at the front with
+  room for a whole chunk). 32-byte elements 35.4 / 35.9 (Redis 34.8 / 35.6),
+  64-byte 67.4 / 67.9 (69.0 / 70.6), lists of 30 ten-byte elements 16.9 /
+  18.8 (14.8 / 15.1). Suite `52-small-lists-memory`
+  measures these and fails a build that measures above these numbers.
   - A push or a pop at either end moves nothing in its chunk: each chunk
     has room at both ends. Element `i` is found by arithmetic while the
     chunks between the ends are full; an `LINSERT` or `LREM` in the middle
