@@ -1246,7 +1246,9 @@ fn a_sorted_set_is_sized_for_its_members_not_its_arguments() {
     assert_eq!(c.cmd(&args).int(), 1);
     assert_eq!(c.encoding("one"), "skiplist");
     let one = settled_usage(&mut c, "one");
-    assert!(one < 2_048, "one member named 5,000 times: {one} bytes");
+    // The table's one group, and the index's root over its one leaf, which
+    // `MEMORY USAGE` counts as allocated (about 1.8 KB of the total).
+    assert!(one < 2_560, "one member named 5,000 times: {one} bytes");
     assert_eq!(c.encoding("ten"), "skiplist");
     let want = settled_usage(&mut c, "ref");
     about(

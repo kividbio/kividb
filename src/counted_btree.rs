@@ -708,16 +708,29 @@ impl<R: Member> Leaf<R> {
 impl<R: Member + PartialEq> Leaf<R> {
     fn remove(&mut self, target: Target<'_, R>) -> Option<Taken<R>> {
         let i = match target {
-            Target::Entry(score, r) => {
-                let i = self.search(score, r).ok()?;
-                // Equal bytes are not enough: it must be the reference held.
-                (self.refs[i].as_ref() == Some(r)).then_some(i)?
-            }
+            Target::Entry(score, r) => self.find(score, r)?,
             Target::Rank(rank) => rank as usize,
         };
         let first = self.next_first(i);
         let (score, r) = self.take(i)?;
         Some(Taken { score, r, first })
+    }
+
+    /// Where the entry of `score` holding `r` itself is. The first entry of
+    /// the score is compared by reference first: a member's bytes are read
+    /// only where the score has more than one entry here, or none.
+    fn find(&self, score: f64, r: &R) -> Option<usize> {
+        let n = self.len();
+        if !score.is_nan() {
+            // As in `equal_run`: plain comparisons, for a score not NaN.
+            let lo = self.scores[..n].partition_point(|&s| s < score);
+            if lo < n && self.scores[lo] == score && self.refs[lo].as_ref() == Some(r) {
+                return Some(lo);
+            }
+        }
+        let i = self.search(score, r).ok()?;
+        // Equal bytes are not enough: it must be the reference held.
+        (self.refs[i].as_ref() == Some(r)).then_some(i)
     }
 
     /// If entry `i` is the first, the next one's score and (if it ties with
@@ -743,11 +756,8 @@ impl<R: Member + PartialEq> Leaf<R> {
         before: Option<Child<'_, R>>,
         after: Option<Child<'_, R>>,
     ) -> Option<Rescoring<R>> {
+        let i = self.find(old, r)?;
         let member = r.member();
-        let i = self.search(old, member).ok()?;
-        if self.refs[i].as_ref() != Some(r) {
-            return None;
-        }
         let (at_start, at_end) = (i == 0, i + 1 == self.len());
         let below = if at_start {
             before.and_then(|side| side.end_leaf(true)?.last())
@@ -935,7 +945,9 @@ impl<R> Inner<R> {
 
 impl<R: Member> Inner<R> {
     /// The child whose keys `(score, key)` falls among. The key's member is
-    /// read only if a separator has its score.
+    /// read only if a separator has its score. Inlined: every level of
+    /// every walk down calls it.
+    #[inline(always)]
     fn route<K: Member + ?Sized>(&self, score: f64, key: &K) -> usize {
         let seps = &self.keys.seps[..self.keys.len().saturating_sub(1)];
         let (lo, hi) = equal_run(seps, score);
@@ -943,7 +955,8 @@ impl<R: Member> Inner<R> {
             return lo;
         }
         let member = key.member();
-        let mine = lead_bytes(member);
+        // Leads compare as big-endian numbers: in their bytes' order.
+        let mine = u128::from_be_bytes(lead_bytes(member));
         // Past an untied separator; past a tied one unless below its child:
         // by the leads, and where they are equal (or one is not known) by
         // the member itself.
@@ -951,7 +964,7 @@ impl<R: Member> Inner<R> {
             if !self.keys.tied(s) {
                 return true;
             }
-            match self.keys.leads[s].map(|lead| mine.cmp(&lead)) {
+            match self.keys.leads[s].map(|lead| mine.cmp(&u128::from_be_bytes(lead))) {
                 Some(Ordering::Greater) => true,
                 Some(Ordering::Less) => false,
                 _ => member >= self.children.first_member(s + 1),
@@ -1028,6 +1041,16 @@ impl<R: Member + PartialEq> Inner<R> {
             Target::Entry(score, r) => (self.route(score, r), Target::Entry(score, r)),
             Target::Rank(mut rank) => (self.child_holding(&mut rank)?, Target::Rank(rank)),
         };
+        self.remove_in(c, target, census)
+    }
+
+    /// `remove` below child `c`, which holds the target.
+    fn remove_in(
+        &mut self,
+        c: usize,
+        target: Target<'_, R>,
+        census: &mut Census,
+    ) -> Option<Taken<R>> {
         let keys = &mut self.keys;
         let taken = match &mut self.children {
             Children::Leaves(kids) => {
@@ -1061,6 +1084,17 @@ impl<R: Member + PartialEq> Inner<R> {
     ) -> Option<Rescoring<R>> {
         let c = self.route(old, r);
         let n = self.keys.len();
+        // A separator lies above its child's keys and at or below the next
+        // child's first score. So a new score above the separator after the
+        // next child, or below the one before the child before, passes that
+        // child's entries: the entry moves, taken out as a removal takes it,
+        // with no neighbour read.
+        let seps = &self.keys.seps;
+        if (c + 2 < n && new > seps[c + 1]) || (c >= 2 && new < seps[c - 2]) {
+            return self
+                .remove_in(c, Target::Entry(old, r), census)
+                .map(Rescoring::Taken);
+        }
         let keys = &mut self.keys;
         // The child's siblings are borrowed beside it: the nearest neighbours.
         let step = match &mut self.children {
@@ -1388,6 +1422,7 @@ impl Keys {
 
 /// Counts the new entry under child `c`, and takes in the child's upper half.
 /// A full node first moves its own upper half out, and gives it back.
+#[inline]
 fn adopt<N>(
     keys: &mut Keys,
     kids: &mut Slots<Box<N>>,
@@ -1395,7 +1430,17 @@ fn adopt<N>(
     split: Option<Split<N>>,
 ) -> Option<(Sep, Keys, Slots<Box<N>>)> {
     keys.counts[c] += 1;
-    let split = split?;
+    adopt_split(keys, kids, c, split?)
+}
+
+/// `adopt` of a child that split.
+#[inline(never)]
+fn adopt_split<N>(
+    keys: &mut Keys,
+    kids: &mut Slots<Box<N>>,
+    c: usize,
+    split: Split<N>,
+) -> Option<(Sep, Keys, Slots<Box<N>>)> {
     keys.counts[c] -= split.count;
     if keys.len() < CAP {
         place(keys, kids, c, split);
@@ -1463,13 +1508,21 @@ fn place<N>(keys: &mut Keys, kids: &mut Slots<Box<N>>, c: usize, split: Split<N>
 
 /// Brings child `c` back to `MIN` from a sibling above it, else merges a pair.
 /// True if a node was freed.
+#[inline]
 fn refill<N: Node>(keys: &mut Keys, kids: &mut Slots<Box<N>>, c: usize) -> bool {
-    let n = keys.len();
-    let fill = |i: usize| kids.get(i).and_then(Option::as_deref).map(N::fill);
     // Most removals leave the child at MIN or more: its siblings are not read.
-    if fill(c).is_none_or(|here| here >= MIN) {
+    let short = kids.get(c).and_then(Option::as_deref);
+    if short.is_none_or(|here| here.fill() >= MIN) {
         return false;
     }
+    refill_short(keys, kids, c)
+}
+
+/// `refill` of a child below `MIN`.
+#[inline(never)]
+fn refill_short<N: Node>(keys: &mut Keys, kids: &mut Slots<Box<N>>, c: usize) -> bool {
+    let n = keys.len();
+    let fill = |i: usize| kids.get(i).and_then(Option::as_deref).map(N::fill);
     let (left, right) = (c.checked_sub(1).and_then(fill), fill(c + 1));
     if left.is_some_and(|left| left > MIN) {
         if let Some((left, child)) = pair(kids, c - 1)
@@ -1680,7 +1733,11 @@ fn equal_run(scores: &[f64], score: f64) -> (usize, usize) {
     if rest.first().is_none_or(|&s| s != score) {
         return (lo, lo);
     }
-    (lo, lo + 1 + rest[1..].partition_point(|&s| s == score))
+    // Most runs are of one score: the next one ends it.
+    if rest.get(1).is_none_or(|&s| s != score) {
+        return (lo, lo + 1);
+    }
+    (lo, lo + 2 + rest[2..].partition_point(|&s| s == score))
 }
 
 /// [`equal_run`] of NaN, which sorts above every score (callers never give
