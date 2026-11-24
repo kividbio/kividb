@@ -189,7 +189,7 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
         ValueRef::Json(arc) => {
             entry()
-                + layout::arc_of::<RwLock<serde_json::Value>>()
+                + layout::arc_of::<RwLock<crate::json_tree::Value>>()
                 + crate::commands::json::allocated_heap(&arc.read())
         }
 

@@ -1,13 +1,14 @@
 use crate::commands::ctx::Ctx;
 use crate::commands::helpers::*;
 use crate::commands::json_path::{self, Location, Query, Step};
+use crate::json_tree::{Array, Number, Value};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
 use crate::types::KiviDBValue;
 use crate::{read_lock, write_lock};
 use parking_lot::RwLock;
-use serde_json::{Number, Value};
+use std::borrow::Cow;
 use std::sync::Arc;
 
 // ── Paths and replies ────────────────────────────────────────────────────────
@@ -75,7 +76,10 @@ pub(crate) fn value_depth(value: &Value) -> usize {
                 if budget == 0 {
                     return 1;
                 }
-                1 + items.iter().map(|v| go(v, budget - 1)).max().unwrap_or(0)
+                // A packed array holds numbers only: 1.
+                1 + items.items().map_or(0, |items| {
+                    items.iter().map(|v| go(v, budget - 1)).max().unwrap_or(0)
+                })
             }
             Value::Object(members) => {
                 if budget == 0 {
@@ -111,7 +115,7 @@ fn append_too_deep(query: &Query, root: &Value, added: usize) -> Option<Vec<u8>>
         &locations[..]
     };
     for location in targets {
-        if matches!(json_path::get(root, location), Some(Value::Array(_)))
+        if json_path::get(root, location).is_some_and(|value| value.is_array())
             && too_deep(location.len() + 1, added)
         {
             return Some(resp_error(RECURSION_LIMIT));
@@ -259,9 +263,9 @@ fn each_node(
     if query.is_legacy() {
         return match locations
             .first()
-            .and_then(|location| json_path::get_mut(root, location))
+            .and_then(|location| json_path::slot(root, location))
         {
-            Some(node) => f(node).unwrap_or_else(resp_error),
+            Some(slot) => slot.update(&mut f).unwrap_or_else(resp_error),
             None => resp_null_bulk(),
         };
     }
@@ -269,7 +273,7 @@ fn each_node(
         .iter()
         .rev()
         .map(
-            |location| match json_path::get_mut(root, location).map(&mut f) {
+            |location| match json_path::slot(root, location).map(|slot| slot.update(&mut f)) {
                 Some(Ok(reply)) => reply,
                 _ => resp_null_for(resp),
             },
@@ -314,7 +318,7 @@ impl Format<'_> {
                         out.push(',');
                     }
                     self.line(depth + 1, out);
-                    self.write(item, depth + 1, out);
+                    self.write(&item, depth + 1, out);
                 }
                 self.line(depth, out);
                 out.push(']');
@@ -343,18 +347,19 @@ impl Format<'_> {
 
 /// Set `value` at `query` inside an existing document. `Ok(true)` if anything
 /// was set, `Ok(false)` if NX/XX or a path that leads nowhere left the
-/// document as it was.
+/// document as it was. Where it goes in several places, all but the first
+/// get a copy.
 fn set_in(
     root: &mut Value,
     query: &Query,
-    value: &Value,
+    value: Value,
     nx: bool,
     xx: bool,
 ) -> Result<bool, Vec<u8>> {
     if !query.selects() {
         return Err(resp_error(NOT_A_SELECTION));
     }
-    let depth = value_depth(value);
+    let depth = value_depth(&value);
     if query.is_root() {
         if nx {
             return Ok(false);
@@ -362,7 +367,7 @@ fn set_in(
         if too_deep(0, depth) {
             return Err(resp_error(RECURSION_LIMIT));
         }
-        *root = value.clone();
+        *root = value;
         return Ok(true);
     }
     let locations = query.locations(root);
@@ -376,10 +381,14 @@ fn set_in(
         {
             return Err(resp_error(RECURSION_LIMIT));
         }
-        for location in locations.iter().rev() {
-            if let Some(node) = json_path::get_mut(root, location) {
-                *node = value.clone();
+        // Last to first, as everywhere: the first gets the value itself.
+        for location in locations.iter().skip(1).rev() {
+            if let Some(slot) = json_path::slot(root, location) {
+                slot.set(value.clone());
             }
+        }
+        if let Some(slot) = json_path::slot(root, &locations[0]) {
+            slot.set(value);
         }
         return Ok(true);
     }
@@ -395,9 +404,15 @@ fn set_in(
             {
                 return Err(resp_error(RECURSION_LIMIT));
             }
-            for parent in &parents {
+            let mut value = Some(value);
+            for (i, parent) in parents.iter().enumerate() {
                 if let Some(Value::Object(members)) = json_path::get_mut(root, parent) {
-                    members.insert(name.clone(), value.clone());
+                    let member = if i + 1 == parents.len() {
+                        value.take().unwrap_or_default()
+                    } else {
+                        value.clone().unwrap_or_default()
+                    };
+                    members.insert(name.clone(), member);
                 }
             }
             Ok(true)
@@ -412,7 +427,7 @@ fn set_key(
     ctx: &Ctx,
     key: &[u8],
     query: &Query,
-    value: &Value,
+    value: Value,
     nx: bool,
     xx: bool,
 ) -> Result<bool, Vec<u8>> {
@@ -425,7 +440,7 @@ fn set_key(
         None if !query.is_root() => Err(resp_error(NEW_AT_ROOT)),
         None if xx => Ok(false),
         None => {
-            map.insert(key, KiviDBValue::Json(Arc::new(RwLock::new(value.clone()))));
+            map.insert(key, KiviDBValue::Json(Arc::new(RwLock::new(value))));
             Ok(true)
         }
     }
@@ -470,7 +485,7 @@ fn check_set_in(root: &Value, query: &Query, value: &Value) -> Result<(), Vec<u8
 /// that is not there.
 fn set_doc(doc: &mut Option<Value>, query: &Query, value: &Value) -> Result<(), Vec<u8>> {
     match doc {
-        Some(root) => set_in(root, query, value, false, false).map(drop),
+        Some(root) => set_in(root, query, value.clone(), false, false).map(drop),
         None if !query.is_root() => Err(resp_error(NEW_AT_ROOT)),
         None => {
             *doc = Some(value.clone());
@@ -534,7 +549,7 @@ fn mset(ctx: &Ctx, writes: &[(&[u8], Query, Value)]) -> Result<(), Vec<u8>> {
         let map = shards.map(key);
         match map.get(*key) {
             Some(ValueRef::Json(tree)) => {
-                let set = set_in(&mut tree.write(), query, value, false, false);
+                let set = set_in(&mut tree.write(), query, value.clone(), false, false);
                 debug_assert!(set.is_ok(), "JSON.MSET: a checked triple failed");
             }
             _ => {
@@ -587,12 +602,12 @@ fn merge(target: &mut Value, patch: &Value) {
         return;
     };
     if !target.is_object() {
-        *target = Value::Object(serde_json::Map::new());
+        *target = Value::object();
     }
     let Value::Object(members) = target else {
         return;
     };
-    for (key, value) in patch {
+    for (key, value) in patch.iter() {
         if value.is_null() {
             members.shift_remove(key);
         } else {
@@ -684,7 +699,7 @@ fn number_command(ctx: &Ctx, resp: u8, op: NumOp, name: &str) -> Vec<u8> {
         // out of range fails the command and leaves the document alone.
         let mut results: Vec<Option<Number>> = Vec::with_capacity(locations.len());
         for location in &locations {
-            match json_path::get(root, location) {
+            match json_path::get(root, location).as_deref() {
                 Some(Value::Number(current)) => match arithmetic(current, &operand, op) {
                     Ok(next) => results.push(Some(next)),
                     Err(error) => return resp_error(error),
@@ -692,9 +707,13 @@ fn number_command(ctx: &Ctx, resp: u8, op: NumOp, name: &str) -> Vec<u8> {
                 _ => results.push(None),
             }
         }
+        // An element of a packed array stays in it if the result is of its
+        // kind (`Slot::set`).
         for (location, result) in locations.iter().zip(&results) {
-            if let (Some(node), Some(next)) = (json_path::get_mut(root, location), result) {
-                *node = Value::Number(next.clone());
+            if let Some(next) = result
+                && let Some(slot) = json_path::slot(root, location)
+            {
+                slot.set(Value::Number(next.clone()));
             }
         }
         // RESP2: the last new value, alone. RESP3: every match, as for a
@@ -725,7 +744,7 @@ fn number_command(ctx: &Ctx, resp: u8, op: NumOp, name: &str) -> Vec<u8> {
             .into_iter()
             .map(|result| result.map_or(Value::Null, Value::Number))
             .collect();
-        resp_bulk_str(&json_text(&Value::Array(values)))
+        resp_bulk_str(&json_text(&Value::Array(Array::from(values))))
     })
 }
 
@@ -748,12 +767,12 @@ fn as_resp(resp: u8, value: &Value) -> Vec<u8> {
         Value::String(s) => resp_bulk_str(s),
         Value::Array(items) => {
             let mut out = vec![resp_simple("[")];
-            out.extend(items.iter().map(|item| as_resp(resp, item)));
+            out.extend(items.iter().map(|item| as_resp(resp, &item)));
             resp_array(out)
         }
         Value::Object(members) => {
             let mut out = vec![resp_simple("{")];
-            for (key, member) in members {
+            for (key, member) in members.iter() {
                 out.push(resp_bulk_str(key));
                 out.push(as_resp(resp, member));
             }
@@ -775,7 +794,7 @@ fn clamp_index(index: i64, len: usize) -> usize {
 /// heap, its children included. What `JSON.DEBUG MEMORY` reports, as
 /// RedisJSON reports it of its own representation. An object's members are
 /// counted as an `IndexMap` holds them: the key, the value, the hash and a
-/// slot of the index table each.
+/// slot of the index table each; a packed array as its buffer.
 fn value_memory(value: &Value) -> usize {
     std::mem::size_of::<Value>() + value_heap(value)
 }
@@ -784,32 +803,43 @@ fn value_heap(value: &Value) -> usize {
     const VALUE: usize = std::mem::size_of::<Value>();
     match value {
         Value::String(s) => s.capacity(),
-        Value::Array(items) => {
+        Value::Array(Array::Items(items)) => {
             items.capacity() * VALUE + items.iter().map(value_heap).sum::<usize>()
         }
-        Value::Object(members) => members
-            .iter()
-            .map(|(key, member)| {
-                std::mem::size_of::<String>()
-                    + VALUE
-                    + 2 * std::mem::size_of::<usize>()
-                    + 1
-                    + key.capacity()
-                    + value_heap(member)
-            })
-            .sum(),
+        Value::Array(Array::Packed(packed)) => {
+            std::mem::size_of::<crate::json_tree::Packed>() + packed.buffer_bytes()
+        }
+        Value::Object(members) => {
+            std::mem::size_of::<crate::json_tree::Map>()
+                + members
+                    .iter()
+                    .map(|(key, member)| {
+                        std::mem::size_of::<String>()
+                            + VALUE
+                            + 2 * std::mem::size_of::<usize>()
+                            + 1
+                            + key.capacity()
+                            + value_heap(member)
+                    })
+                    .sum::<usize>()
+        }
         Value::Null | Value::Bool(_) | Value::Number(_) => 0,
     }
 }
 
+/// The bytes `value`'s tree has allocated, as `MEMORY USAGE` counts them:
+/// what each node owns, at the capacity it was given.
 pub(crate) fn allocated_heap(value: &Value) -> usize {
     use crate::commands::memory_layout as layout;
     const VALUE: usize = std::mem::size_of::<Value>();
     const ENTRY: usize = std::mem::size_of::<usize>() + std::mem::size_of::<String>() + VALUE;
     match value {
         Value::String(s) => s.capacity(),
-        Value::Array(items) => {
+        Value::Array(Array::Items(items)) => {
             items.capacity() * VALUE + items.iter().map(allocated_heap).sum::<usize>()
+        }
+        Value::Array(Array::Packed(packed)) => {
+            std::mem::size_of::<crate::json_tree::Packed>() + packed.buffer_bytes()
         }
         Value::Object(members) => {
             let len = members.len();
@@ -818,7 +848,8 @@ pub(crate) fn allocated_heap(value: &Value) -> usize {
                 buckets @ 1..=7 => buckets - 1,
                 buckets => buckets / 8 * 7,
             };
-            room * ENTRY
+            std::mem::size_of::<crate::json_tree::Map>()
+                + room * ENTRY
                 + layout::hash_table(
                     len,
                     std::mem::size_of::<usize>(),
@@ -915,7 +946,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     return Some(resp_error("ERR syntax error"));
                 }
             }
-            match set_key(ctx, key, &query, &value, nx, xx) {
+            match set_key(ctx, key, &query, value, nx, xx) {
                 Ok(true) => resp_simple("OK"),
                 Ok(false) => resp_null_bulk(),
                 Err(e) => e,
@@ -996,24 +1027,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         .map(std::borrow::Cow::into_owned)
                         .collect();
                     if all {
-                        return Ok(Value::Array(values));
+                        return Ok(Value::Array(Array::from(values)));
                     }
                     if values.is_empty() {
                         return Err(resp_error(&format!("ERR Path '{path}' does not exist")));
                     }
                     Ok(values.swap_remove(0))
                 };
+                // The whole document is printed where it is, not copied.
                 let reply = match paths.as_slice() {
-                    [] => Ok(root.clone()),
-                    [(path, query)] => matched(path, query, !query.is_legacy()),
+                    [] => Ok(Cow::Borrowed(root)),
+                    [(path, query)] => matched(path, query, !query.is_legacy()).map(Cow::Owned),
                     several => {
                         // One JSONPath among them and every member is a list.
                         let all = several.iter().any(|(_, query)| !query.is_legacy());
                         several
                             .iter()
                             .map(|(path, query)| Ok((path.to_string(), matched(path, query, all)?)))
-                            .collect::<Result<serde_json::Map<String, Value>, Vec<u8>>>()
-                            .map(Value::Object)
+                            .collect::<Result<crate::json_tree::Map, Vec<u8>>>()
+                            .map(|members| Cow::Owned(Value::Object(Box::new(members))))
                     }
                 };
                 match reply {
@@ -1247,7 +1279,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 each_node(resp, &query, root, |node| match node {
                     Value::Array(items) => {
-                        items.extend(values.iter().cloned());
+                        items.append(&values);
                         Ok(resp_integer(items.len() as i64))
                     }
                     _ => not_an_array(),
@@ -1285,8 +1317,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         if !(0..=len).contains(&at) {
                             return Err("ERR index out of bounds");
                         }
-                        let at = at as usize;
-                        items.splice(at..at, values.iter().cloned());
+                        items.insert(at as usize, &values);
                         Ok(resp_integer(items.len() as i64))
                     }
                     _ => not_an_array(),
@@ -1347,8 +1378,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         if from >= to {
                             items.clear();
                         } else {
-                            items.truncate(to);
-                            items.drain(..from);
+                            items.keep(from, to);
                         }
                         Ok(resp_integer(items.len() as i64))
                     }
@@ -1382,12 +1412,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         clamp_index(stop, items.len())
                     };
                     let found = items
-                        .get(from..to.max(from))
-                        .and_then(|window| {
-                            window
-                                .iter()
-                                .position(|item| json_path::deep_eq(item, &needle))
-                        })
+                        .iter()
+                        .skip(from)
+                        .take(to.max(from) - from)
+                        .position(|item| json_path::deep_eq(&item, &needle))
                         .map_or(-1, |at| (at + from) as i64);
                     Some(found)
                 };
@@ -1415,25 +1443,27 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 let mut cleared = 0;
                 for location in query.locations(root).iter().rev() {
-                    let Some(node) = json_path::get_mut(root, location) else {
+                    let Some(slot) = json_path::slot(root, location) else {
                         continue;
                     };
-                    let changed = match node {
-                        Value::Array(items) if !items.is_empty() => {
-                            items.clear();
-                            true
-                        }
-                        Value::Object(members) if !members.is_empty() => {
-                            members.clear();
-                            true
-                        }
-                        Value::Number(n) if n.as_f64() != Some(0.0) => {
-                            *node = Value::Number(0.into());
-                            true
-                        }
-                        _ => false,
-                    };
-                    cleared += changed as i64;
+                    let changed = slot.update(|node| {
+                        Ok::<bool, ()>(match node {
+                            Value::Array(items) if !items.is_empty() => {
+                                items.clear();
+                                true
+                            }
+                            Value::Object(members) if !members.is_empty() => {
+                                members.clear();
+                                true
+                            }
+                            Value::Number(n) if n.as_f64() != Some(0.0) => {
+                                *node = Value::Number(0.into());
+                                true
+                            }
+                            _ => false,
+                        })
+                    });
+                    cleared += changed.unwrap_or(false) as i64;
                 }
                 resp_integer(cleared)
             })
@@ -1460,7 +1490,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // A new document is the patch applied to nothing.
                     let mut document = Value::Null;
                     merge(&mut document, &patch);
-                    return Some(match set_key(ctx, key, &query, &document, false, false) {
+                    return Some(match set_key(ctx, key, &query, document, false, false) {
                         Ok(_) => resp_simple("OK"),
                         Err(e) => e,
                     });
@@ -1503,7 +1533,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 if !patch.is_null() {
                     for location in &locations {
-                        let existing = json_path::get(root, location).map(value_depth).unwrap_or(0);
+                        let existing = json_path::get(root, location)
+                            .map(|value| value_depth(&value))
+                            .unwrap_or(0);
                         if too_deep(location.len(), existing.max(patch_depth)) {
                             return resp_error(RECURSION_LIMIT);
                         }
@@ -1512,8 +1544,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 for location in locations.iter().rev() {
                     if patch.is_null() {
                         remove_at(root, location);
-                    } else if let Some(node) = json_path::get_mut(root, location) {
-                        merge(node, &patch);
+                    } else if let Some(slot) = json_path::slot(root, location) {
+                        let _ = slot.update(|node| {
+                            merge(node, &patch);
+                            Ok::<(), ()>(())
+                        });
                     }
                 }
                 resp_simple("OK")
@@ -1639,7 +1674,7 @@ mod tests {
                     continue;
                 };
                 let mut root = before.clone();
-                let set = set_in(&mut root, &query, &value, false, false);
+                let set = set_in(&mut root, &query, value.clone(), false, false);
                 let checked = check_set_in(&before, &query, &value);
                 assert_eq!(
                     checked.is_err(),
@@ -1671,7 +1706,7 @@ mod tests {
             let before: Value = serde_json::from_str(&doc).unwrap();
             let query = Query::parse(&path).unwrap();
             let mut root = before.clone();
-            let set = set_in(&mut root, &query, &value, false, false);
+            let set = set_in(&mut root, &query, value.clone(), false, false);
             let checked = check_set_in(&before, &query, &value);
             assert!(set.is_err(), "set_in at the limit must fail");
             assert_eq!(checked.err(), set.err(), "the same error");
@@ -1686,7 +1721,12 @@ mod tests {
         assert!(set_doc(&mut doc, &Query::parse("$.x").unwrap(), &value).is_err());
         assert_eq!(doc, None);
         set_doc(&mut doc, &Query::parse("$").unwrap(), &value).unwrap();
-        set_doc(&mut doc, &Query::parse("$.y").unwrap(), &Value::from(2)).unwrap();
-        assert_eq!(doc, Some(serde_json::json!({"x": 1, "y": 2})));
+        set_doc(
+            &mut doc,
+            &Query::parse("$.y").unwrap(),
+            &Value::Number(2.into()),
+        )
+        .unwrap();
+        assert_eq!(doc, Some(Value::from(serde_json::json!({"x": 1, "y": 2}))));
     }
 }

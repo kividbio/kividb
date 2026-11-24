@@ -994,9 +994,13 @@ fn freeing_at_least(value: crate::store::ValueRef<'_>) -> usize {
             let set = set.read();
             set.entries.len() * ELEMENT + set.graph.get().map_or(0, |g| g.bytes(0))
         }
+        // A packed array is one buffer, of a size known exactly.
         V::Json(json) => match &*json.read() {
-            serde_json::Value::Array(items) => items.len() * ELEMENT,
-            serde_json::Value::Object(fields) => fields.len() * ELEMENT,
+            crate::json_tree::Value::Array(items) => match items.packed() {
+                Some(packed) => packed.buffer_bytes(),
+                None => items.len() * ELEMENT,
+            },
+            crate::json_tree::Value::Object(fields) => fields.len() * ELEMENT,
             _ => 0,
         },
         V::Stream(stream) => stream.read().entries.heap_bytes(),

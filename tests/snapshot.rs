@@ -613,7 +613,7 @@ fn kdb_json_basic() {
     });
     let v = roundtrip_one(
         "doc",
-        KiviDBValue::Json(Arc::new(RwLock::new(json.clone()))),
+        KiviDBValue::Json(Arc::new(RwLock::new(json.clone().into()))),
     );
     match v {
         KiviDBValue::Json(j) => {
@@ -628,7 +628,7 @@ fn kdb_json_basic() {
 fn kdb_json_null() {
     let v = roundtrip_one(
         "null_doc",
-        KiviDBValue::Json(Arc::new(RwLock::new(serde_json::Value::Null))),
+        KiviDBValue::Json(Arc::new(RwLock::new(serde_json::Value::Null.into()))),
     );
     match v {
         KiviDBValue::Json(j) => assert_eq!(*j.read(), serde_json::Value::Null),
@@ -645,7 +645,7 @@ fn kdb_json_deeply_nested() {
     }
     let v = roundtrip_one(
         "deep",
-        KiviDBValue::Json(Arc::new(RwLock::new(obj.clone()))),
+        KiviDBValue::Json(Arc::new(RwLock::new(obj.clone().into()))),
     );
     match v {
         KiviDBValue::Json(j) => assert_eq!(*j.read(), obj),
@@ -1260,7 +1260,7 @@ fn kdb_all_types_together() {
 
     map.insert(
         "json".to_string(),
-        KiviDBValue::Json(Arc::new(RwLock::new(serde_json::json!({"x": 1})))),
+        KiviDBValue::Json(Arc::new(RwLock::new(serde_json::json!({"x": 1}).into()))),
     );
 
     let mut ts = TsInner::new();

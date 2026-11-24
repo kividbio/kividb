@@ -100,7 +100,7 @@ pub(super) fn read_dragonfly_value(
         // RDB_TYPE_JSON: the document, as JSON text.
         30 => {
             let text = rdb_read_string(r)?;
-            let json = serde_json::from_slice(&text)
+            let json: crate::json_tree::Value = serde_json::from_slice(&text)
                 .map_err(|e| rdb_invalid(format!("Dragonfly JSON{}: {e}", named())))?;
             if crate::commands::json::value_depth(&json) >= crate::commands::json::MAX_DEPTH {
                 return Err(rdb_invalid(format!(

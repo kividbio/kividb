@@ -130,9 +130,10 @@ pub fn effort(value: &KiviDBValue) -> u64 {
         KiviDBValue::List(list) => list.read().free_effort(),
         // A block of fields is one allocation, as Redis counts a listpack.
         KiviDBValue::Hash(hash) => hash.read().free_effort(),
+        // An array counts its elements whether or not they are packed.
         KiviDBValue::Json(json) => match &*json.read() {
-            serde_json::Value::Array(items) => items.len(),
-            serde_json::Value::Object(fields) => fields.len(),
+            crate::json_tree::Value::Array(items) => items.len(),
+            crate::json_tree::Value::Object(fields) => fields.len(),
             _ => 1,
         },
         // An array or a block of members (#297) is one allocation, as
