@@ -184,6 +184,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let key: &[u8] = cmd[1];
 
             if lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
+                crate::stats::record_miss();
                 return Some(resp_integer(0));
             }
 
@@ -192,11 +193,20 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let map = read_lock!(shard);
 
             match map.get(key) {
-                None => Some(resp_integer(0)),
-                Some(ValueRef::Set(s)) => Some(resp_integer(s.read().len() as i64)),
-                Some(_) => Some(resp_error(
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                )),
+                None => {
+                    crate::stats::record_miss();
+                    Some(resp_integer(0))
+                }
+                Some(ValueRef::Set(s)) => {
+                    crate::stats::record_hit();
+                    Some(resp_integer(s.read().len() as i64))
+                }
+                Some(_) => {
+                    crate::stats::record_hit();
+                    Some(resp_error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ))
+                }
             }
         }
 
@@ -221,15 +231,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(ValueRef::Set(s)) => {
                     let inner = s.read();
                     let found = inner.contains(member);
-                    if found {
-                        crate::stats::record_hit();
-                    } else {
-                        crate::stats::record_miss();
-                    }
+                    crate::stats::record_hit();
                     Some(resp_integer(found as i64))
                 }
                 Some(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -267,7 +273,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(resp_array(results))
                 }
                 Some(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -321,7 +327,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(buf)
                 }
                 Some(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -341,10 +347,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let map = read_lock!(shard);
 
             match map.get(key) {
-                None => {
-                    crate::stats::record_miss();
-                    Some(resp_integer(0))
-                }
+                None => Some(resp_integer(0)),
                 Some(ValueRef::Set(s)) => {
                     let mut inner = s.write();
                     let mut removed = 0i64;
@@ -356,18 +359,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
                     after_write(s, &mut inner);
                     drop(inner);
-                    crate::stats::record_hit();
                     if removed > 0 {
                         notify(ctx.pubsub, *ctx.selected_db, KS_SET, "srem", key);
                     }
                     Some(resp_integer(removed))
                 }
-                Some(_) => {
-                    crate::stats::record_miss();
-                    Some(resp_error(
-                        "WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ))
-                }
+                Some(_) => Some(resp_error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                )),
             }
         }
         "SPOP" => {
@@ -395,10 +394,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             match map.get(key) {
                 None => match count {
-                    None => {
-                        crate::stats::record_miss();
-                        Some(resp_null_bulk())
-                    }
+                    None => Some(resp_null_bulk()),
                     // With a count, a missing key is an empty set under RESP3.
                     Some(_) => Some(resp_set_for(resp, vec![])),
                 },
@@ -421,10 +417,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
                     after_write(s, &mut inner);
                     drop(inner);
-                    if popped.is_empty() {
-                        crate::stats::record_miss();
-                    } else {
-                        crate::stats::record_hit();
+                    if !popped.is_empty() {
                         notify(ctx.pubsub, *ctx.selected_db, KS_SET, "spop", key);
                     }
                     match count {
@@ -437,12 +430,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         Some(_) => Some(resp_set_for(resp, popped)),
                     }
                 }
-                Some(_) => {
-                    crate::stats::record_miss();
-                    Some(resp_error(
-                        "WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ))
-                }
+                Some(_) => Some(resp_error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                )),
             }
         }
 
@@ -473,7 +463,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         crate::stats::record_miss();
                         Some(resp_null_bulk())
                     }
-                    Some(_) => Some(resp_array(vec![])),
+                    Some(_) => {
+                        crate::stats::record_miss();
+                        Some(resp_array(vec![]))
+                    }
                 },
                 Some(ValueRef::Set(s)) => {
                     let inner = s.read(); // read-only — no removal
@@ -507,7 +500,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
                 }
                 Some(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -543,7 +536,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Some(_) => return Some(resp_error(WRONGTYPE)),
             }
             let Some(source) = source else {
-                crate::stats::record_miss();
                 return Some(resp_integer(0));
             };
             if src_key == dst_key {
@@ -555,7 +547,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let removed = inner.remove(member);
                 after_write(&source, &mut inner);
                 if !removed {
-                    crate::stats::record_miss();
                     return Some(resp_integer(0));
                 }
             }
@@ -582,7 +573,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             };
 
-            crate::stats::record_hit();
             notify(ctx.pubsub, db, KS_SET, "srem", &src_key);
             if added {
                 notify(ctx.pubsub, db, KS_SET, "sadd", &dst_key);
@@ -599,7 +589,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'sdiff' command",
                 ));
             }
-            crate::stats::record_hit();
             let resp = reply_resp(ctx);
             let sets = match sets_at(ctx, &cmd[1..]) {
                 Ok(sets) => sets,
@@ -636,7 +625,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if absent {
                 crate::watch::unchanged(*ctx.selected_db, &dst_key);
             }
-            crate::stats::record_hit();
             notify(ctx.pubsub, *ctx.selected_db, KS_SET, "sdiffstore", &dst_key);
             Some(resp_integer(len))
         }
@@ -647,7 +635,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'sinter' command",
                 ));
             }
-            crate::stats::record_hit();
             let resp = reply_resp(ctx);
             let sets = match sets_at(ctx, &cmd[1..]) {
                 Ok(sets) => sets,
@@ -683,7 +670,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if absent {
                 crate::watch::unchanged(*ctx.selected_db, &dst_key);
             }
-            crate::stats::record_hit();
             notify(
                 ctx.pubsub,
                 *ctx.selected_db,
@@ -725,7 +711,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 Err(e) => return Some(e),
             };
             let count = inter_each(&sets, limit, |_| {});
-            crate::stats::record_hit();
             Some(resp_integer(count as i64))
         }
 
@@ -735,7 +720,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "ERR wrong number of arguments for 'sunion' command",
                 ));
             }
-            crate::stats::record_hit();
             let resp = reply_resp(ctx);
             let union = match set_union(ctx, &cmd[1..]) {
                 Ok(union) => union,
@@ -772,7 +756,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if absent {
                 crate::watch::unchanged(*ctx.selected_db, &dst_key);
             }
-            crate::stats::record_hit();
             notify(
                 ctx.pubsub,
                 *ctx.selected_db,
@@ -861,7 +844,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     ]))
                 }
                 Some(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))

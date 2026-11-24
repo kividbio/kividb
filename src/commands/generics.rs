@@ -378,7 +378,12 @@ fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
     let mut tried = false;
     loop {
         let map = read_lock!(shard);
-        return match (map.peek(&key), field) {
+        let found = map.peek(&key);
+        if !tried {
+            // A key a pattern names is a read, counted as Redis counts it.
+            crate::stats::record_lookup(found.is_some());
+        }
+        return match (found, field) {
             (Some(ValueRef::String(s)), None) => Some(s.to_vec()),
             (Some(ValueRef::Hash(h)), Some(field)) => h.read().get_bytes(field).map(|v| v.to_vec()),
             // A field past its deadline is what a hash command makes of it
@@ -617,8 +622,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let gone = lazy_expire_on_read(ctx.store, db, key);
                     let map = read_lock!(store::get_shard(&ctx.store[db], key));
                     Some(match map.get(key).filter(|_| !gone) {
-                        Some(value) => resp_bulk_str(encoding_of(value)),
-                        None => resp_null_bulk(),
+                        Some(value) => {
+                            crate::stats::record_hit();
+                            resp_bulk_str(encoding_of(value))
+                        }
+                        None => {
+                            crate::stats::record_miss();
+                            resp_null_bulk()
+                        }
                     })
                 }
                 // What is known of a key's use is known while an eviction
@@ -641,8 +652,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         read_lock!(store::get_shard(&ctx.store[db], key)).access(key)
                     };
                     let Some(word) = word else {
+                        crate::stats::record_miss();
                         return Some(resp_null_bulk());
                     };
+                    crate::stats::record_hit();
                     let lfu = crate::eviction::policy().is_lfu();
                     let recording = crate::eviction::recording();
                     Some(match (subcommand.as_str(), lfu) {
@@ -699,12 +712,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let key: &[u8] = cmd[2];
                     if is_expired(ctx.store, *ctx.selected_db, key) {
                         expire_on_read(ctx.store, *ctx.selected_db, key);
+                        crate::stats::record_miss();
                         return Some(resp_null_bulk());
                     }
                     let db = &ctx.store[*ctx.selected_db];
                     let shard = store::get_shard(db, key);
                     let map = read_lock!(shard);
-                    if map.contains_key(key) {
+                    let found = map.contains_key(key);
+                    crate::stats::record_lookup(found);
+                    if found {
                         Some(resp_integer(1))
                     } else {
                         Some(resp_null_bulk())
@@ -724,14 +740,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_integer(-2));
             }
 
             let db_ref = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db_ref, key);
             let expires = match read_lock!(shard).get_expiring(key) {
-                None => return Some(resp_integer(-2)), // key does not exist
-                Some((_, expires)) => expires,
+                None => {
+                    crate::stats::record_miss();
+                    return Some(resp_integer(-2)); // key does not exist
+                }
+                Some((_, expires)) => {
+                    crate::stats::record_hit();
+                    expires
+                }
             };
             match expires {
                 None => Some(resp_integer(-1)), // key exists but no TTL
@@ -766,6 +789,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Expired keys are invisible — report as "none"
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_simple("none"));
             }
 
@@ -773,8 +797,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
             match map.get(key) {
-                Some(v) => Some(resp_simple(v.type_name())),
-                None => Some(resp_simple("none")),
+                Some(v) => {
+                    crate::stats::record_hit();
+                    Some(resp_simple(v.type_name()))
+                }
+                None => {
+                    crate::stats::record_miss();
+                    Some(resp_simple("none"))
+                }
             }
         }
 
@@ -885,14 +915,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_integer(-2));
             }
 
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let expires = match read_lock!(shard).get_expiring(key) {
-                None => return Some(resp_integer(-2)),
-                Some((_, expires)) => expires,
+                None => {
+                    crate::stats::record_miss();
+                    return Some(resp_integer(-2));
+                }
+                Some((_, expires)) => {
+                    crate::stats::record_hit();
+                    expires
+                }
             };
             match expires {
                 None => Some(resp_integer(-1)),
@@ -1063,8 +1100,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 match map.get_expiring(src_key.as_slice()) {
                     // A copy of its own, not another name for the same
                     // value. See `deep_clone`.
-                    Some((v, expiry)) => (v.deep_clone(), expiry),
-                    None => return Some(resp_integer(0)),
+                    Some((v, expiry)) => {
+                        crate::stats::record_hit();
+                        (v.deep_clone(), expiry)
+                    }
+                    None => {
+                        crate::stats::record_miss();
+                        return Some(resp_integer(0));
+                    }
                 }
             };
 
@@ -1335,11 +1378,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let key: &[u8] = raw_key;
                 if is_expired(ctx.store, *ctx.selected_db, key) {
                     expire_on_read(ctx.store, *ctx.selected_db, key);
+                    crate::stats::record_miss();
                     continue;
                 }
                 let shard = store::get_shard(db, key);
                 if read_lock!(shard).contains_key(key) {
+                    crate::stats::record_hit();
                     count += 1;
+                } else {
+                    crate::stats::record_miss();
                 }
             }
             Some(resp_integer(count))
@@ -1358,14 +1405,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let key: &[u8] = cmd[1];
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_null_bulk());
             }
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
             let value = match map.get(key) {
-                Some(v) => v.to_value(),
-                None => return Some(resp_null_bulk()),
+                Some(v) => {
+                    crate::stats::record_hit();
+                    v.to_value()
+                }
+                None => {
+                    crate::stats::record_miss();
+                    return Some(resp_null_bulk());
+                }
             };
             drop(map);
 
@@ -1667,6 +1721,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             }
 
+            // Counted here, after the move to a thread of its own, which runs
+            // the command again.
+            crate::stats::record_lookup(!missing);
             let mut elements: Vec<Arc<[u8]>> = match map.get(key) {
                 None => vec![], // ← don't return, just give empty vec
                 Some(ValueRef::List(l)) => l.read().iter().map(|e| e.to_shared()).collect(),
@@ -1896,15 +1953,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Lazy-evict expired keys, same as TTL/PTTL do.
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_integer(-2));
             }
 
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let exp = match read_lock!(shard).get_expiring(key) {
-                None => return Some(resp_integer(-2)),
-                Some((_, None)) => return Some(resp_integer(-1)),
-                Some((_, Some(at))) => from_unix_ms(at),
+                None => {
+                    crate::stats::record_miss();
+                    return Some(resp_integer(-2));
+                }
+                Some((_, None)) => {
+                    crate::stats::record_hit();
+                    return Some(resp_integer(-1));
+                }
+                Some((_, Some(at))) => {
+                    crate::stats::record_hit();
+                    from_unix_ms(at)
+                }
             };
 
             Some(resp_integer(system_time_to_unix(exp, TimeUnit::Secs)))
@@ -1922,15 +1989,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_integer(-2));
             }
 
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let exp = match read_lock!(shard).get_expiring(key) {
-                None => return Some(resp_integer(-2)),
-                Some((_, None)) => return Some(resp_integer(-1)),
-                Some((_, Some(at))) => from_unix_ms(at),
+                None => {
+                    crate::stats::record_miss();
+                    return Some(resp_integer(-2));
+                }
+                Some((_, None)) => {
+                    crate::stats::record_hit();
+                    return Some(resp_integer(-1));
+                }
+                Some((_, Some(at))) => {
+                    crate::stats::record_hit();
+                    from_unix_ms(at)
+                }
             };
 
             Some(resp_integer(system_time_to_unix(exp, TimeUnit::Millis)))

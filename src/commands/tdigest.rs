@@ -168,6 +168,7 @@ fn sketch_at(
     ctx: &Ctx,
     key: &[u8],
     write: bool,
+    counted: bool,
 ) -> Result<Arc<parking_lot::RwLock<Sketch>>, Vec<u8>> {
     let gone = if write {
         crate::commands::helpers::lazy_expire_key(ctx.store, *ctx.selected_db, key);
@@ -176,20 +177,49 @@ fn sketch_at(
         crate::commands::helpers::lazy_expire_on_read(ctx.store, *ctx.selected_db, key)
     };
     if gone {
+        if counted {
+            crate::stats::record_miss();
+        }
         return Err(resp_error(NO_KEY));
     }
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let map = read_lock!(shard);
-    match map.get(key) {
+    let found = map.get(key);
+    if counted {
+        crate::stats::record_lookup(found.is_some());
+    }
+    match found {
         None => Err(resp_error(NO_KEY)),
         Some(ValueRef::Sketch(sketch)) => Ok(Arc::clone(sketch)),
         Some(_) => Err(resp_error(WRONGTYPE)),
     }
 }
 
+/// Whether `key` holds a digest, or the error it gets: the look a command
+/// takes before it reads its arguments. Counted in `keyspace_hits` /
+/// `keyspace_misses` only when it ends the command (a key that is not there
+/// is a miss, one of another type a hit); else the read after it counts.
+fn probe_digest(ctx: &Ctx, key: &[u8]) -> Result<(), Vec<u8>> {
+    let sketch = match sketch_at(ctx, key, false, false) {
+        Ok(sketch) => sketch,
+        Err(e) => {
+            crate::stats::record_lookup(e != resp_error(NO_KEY));
+            return Err(e);
+        }
+    };
+    match &*sketch.read() {
+        Sketch::TDigest(_) => Ok(()),
+        #[allow(unreachable_patterns)]
+        _ => {
+            crate::stats::record_hit();
+            Err(resp_error(WRONGTYPE))
+        }
+    }
+}
+
 /// Run `f` on the digest at `key`, for reading, under one hold of it.
 fn with_digest<T>(ctx: &Ctx, key: &[u8], f: impl FnOnce(&TDigest) -> T) -> Result<T, Vec<u8>> {
-    let sketch = sketch_at(ctx, key, false)?;
+    let sketch = sketch_at(ctx, key, false, true)?;
     match &*sketch.read() {
         Sketch::TDigest(t) => Ok(f(t)),
         #[allow(unreachable_patterns)]
@@ -203,7 +233,7 @@ fn with_digest_mut<T>(
     key: &[u8],
     f: impl FnOnce(&mut TDigest) -> T,
 ) -> Result<T, Vec<u8>> {
-    let sketch = sketch_at(ctx, key, true)?;
+    let sketch = sketch_at(ctx, key, true, false)?;
     match &mut *sketch.write() {
         Sketch::TDigest(t) => Ok(f(t)),
         #[allow(unreachable_patterns)]
@@ -486,7 +516,7 @@ fn quantile(ctx: &mut Ctx) -> Vec<u8> {
     }
     let resp = resp(ctx);
     let key = ctx.cmd[1];
-    let probe = with_digest(ctx, key, |_| ());
+    let probe = probe_digest(ctx, key);
     if let Err(e) = probe {
         return e;
     }
@@ -512,7 +542,7 @@ fn cdf(ctx: &mut Ctx) -> Vec<u8> {
     }
     let resp = resp(ctx);
     let key = ctx.cmd[1];
-    if let Err(e) = with_digest(ctx, key, |_| ()) {
+    if let Err(e) = probe_digest(ctx, key) {
         return e;
     }
     let xs = match query_values(ctx, "cdf", |_| None) {
@@ -541,7 +571,7 @@ fn rank(ctx: &mut Ctx, rev: bool) -> Vec<u8> {
         return wrong_args(name);
     }
     let key = ctx.cmd[1];
-    if let Err(e) = with_digest(ctx, key, |_| ()) {
+    if let Err(e) = probe_digest(ctx, key) {
         return e;
     }
     let xs = match query_values(ctx, "value", |_| None) {
@@ -597,7 +627,7 @@ fn byrank(ctx: &mut Ctx, rev: bool) -> Vec<u8> {
     }
     let resp = resp(ctx);
     let key = ctx.cmd[1];
-    if let Err(e) = with_digest(ctx, key, |_| ()) {
+    if let Err(e) = probe_digest(ctx, key) {
         return e;
     }
     let mut ranks = Vec::with_capacity(ctx.cmd.len() - 2);
@@ -653,7 +683,7 @@ fn trimmed_mean(ctx: &mut Ctx) -> Vec<u8> {
     }
     let resp = resp(ctx);
     let key = ctx.cmd[1];
-    if let Err(e) = with_digest(ctx, key, |_| ()) {
+    if let Err(e) = probe_digest(ctx, key) {
         return e;
     }
     let Some(lo) = parse_double(ctx.cmd[2]) else {

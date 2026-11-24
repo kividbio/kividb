@@ -10,6 +10,9 @@
 //! node expanded. A search of a 1536-dimension graph reads some thousands of
 //! 6 KB vectors from memory, and spent most of its time waiting for them.
 //!
+//! A FLAT index keeps its vectors in slots of its own, with no links
+//! ([`Slots::vectors_only`], see `super::flat`).
+//!
 //! Blocks start small (8 slots, doubling up to 1024) so that a small graph
 //! holds little more than it needs, and are then all of 1024 slots: at most
 //! one block is partly empty.
@@ -146,6 +149,12 @@ pub struct Slots {
     grow: parking_lot::Mutex<Vec<Chunk>>,
     /// How a vector is laid out in its `dim` floats, and so measured.
     encoding: super::quant::Encoding,
+    /// Whether the vectors of a block are zeroed when it is made: not those
+    /// of a FLAT index ([`Slots::vectors_only`]), each written before it is
+    /// read. A block of a huge page or more is zeroed by hand (see
+    /// `reserve`): at 1536 dimensions, 600 MB more to write for 100,000
+    /// vectors than the vectors themselves.
+    zero_vectors: bool,
 }
 
 impl std::fmt::Debug for Slots {
@@ -206,6 +215,17 @@ impl Slots {
         Self::with_encoding(dim, m0, super::quant::Encoding::F32)
     }
 
+    /// Slots for vectors of `dim` floats and no links: a FLAT index's
+    /// (`super::flat`). Their links are never read or written; their live
+    /// flags are not used. A slot's vector is not zeroed when its block is
+    /// made: it is to be written ([`Slots::fill_vector`]) before it is read.
+    pub fn vectors_only(dim: usize) -> Self {
+        let mut slots = Self::new(dim, 0);
+        slots.links = 0;
+        slots.zero_vectors = false;
+        slots
+    }
+
     /// Slots for vectors laid out as `encoding` has them, in `dim` floats.
     pub fn with_encoding(dim: usize, m0: usize, encoding: super::quant::Encoding) -> Self {
         Self {
@@ -215,6 +235,7 @@ impl Slots {
             blocks: boxcar::Vec::new(),
             grow: parking_lot::Mutex::new(Vec::new()),
             encoding,
+            zero_vectors: true,
         }
     }
 
@@ -258,7 +279,7 @@ impl Slots {
 
     /// The most layer-0 links a slot holds.
     pub fn max_links(&self) -> usize {
-        self.links - 1
+        self.links.saturating_sub(1)
     }
 
     /// Byte offsets of the links and of the flags in a block of `slots`,
@@ -328,8 +349,11 @@ impl Slots {
             };
             if huge {
                 advise_huge(ptr, layout.size());
+                // Its links and flags, and its vectors unless they are each
+                // written before they are read.
+                let from = if self.zero_vectors { 0 } else { links_at };
                 // SAFETY: the allocation is `layout.size()` bytes.
-                unsafe { ptr.write_bytes(0, layout.size()) };
+                unsafe { ptr.add(from).write_bytes(0, layout.size() - from) };
             }
             self.blocks.push(Block {
                 base,
@@ -369,7 +393,8 @@ impl Slots {
     }
 
     /// The vector in slot `id`. Only to be read while nothing writes it:
-    /// see [`Slots::write_vector`].
+    /// see [`Slots::write_vector`]; of [`Slots::vectors_only`], only once
+    /// written.
     #[inline(always)]
     pub fn vector(&self, id: usize) -> &[f32] {
         // SAFETY: the slot holds `dim` initialised floats (zeroed or
@@ -388,6 +413,23 @@ impl Slots {
         let n = v.len().min(self.dim);
         // SAFETY: the slot has room for `dim` floats; no one reads it.
         unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), self.vector_ptr(id), n) };
+    }
+
+    /// `f` of slot `id`'s vector, to write it in place: `f` writes each of
+    /// its `dim` floats.
+    ///
+    /// # Safety
+    /// As [`Slots::write_vector`]: no one reads the slot meanwhile.
+    pub unsafe fn fill_vector(&self, id: usize, f: impl FnOnce(&mut [std::mem::MaybeUninit<f32>])) {
+        // SAFETY: the slot has room for `dim` floats, in a block that lives
+        // as long as `self`, which may not be written yet (`MaybeUninit`); no
+        // one else reads or writes it meanwhile.
+        f(unsafe {
+            std::slice::from_raw_parts_mut(
+                self.vector_ptr(id).cast::<std::mem::MaybeUninit<f32>>(),
+                self.dim,
+            )
+        })
     }
 
     /// Slot `id`'s layer-0 links: the count, then the ids.

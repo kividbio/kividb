@@ -467,7 +467,9 @@ fn vcard(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         Some(ValueRef::VectorSet(vs)) => Some(resp_integer(vs.read().entries.len() as i64)),
         Some(_) => Some(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -493,7 +495,9 @@ fn vdim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         Some(ValueRef::VectorSet(vs)) => Some(resp_integer(vs.read().dim as i64)),
         Some(_) => Some(resp_error(
             "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -527,7 +531,9 @@ fn vemb(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             let Some(vector) = inner
@@ -601,7 +607,9 @@ fn vismember(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         Some(ValueRef::VectorSet(vs)) => {
             let found = vs.read().entries.contains_key(element);
             Some(resp_integer(found as i64))
@@ -632,7 +640,9 @@ fn vgetattr(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             match inner.entries.get(element) {
@@ -710,7 +720,9 @@ fn vinfo(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             let count = inner.entries.len();
@@ -817,7 +829,9 @@ fn vlinks(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             let Some(query_vec) = inner
@@ -907,7 +921,9 @@ fn vrandmember(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             let names: Vec<&[u8]> = inner.entries.keys().map(|s| s.as_bytes()).collect();
@@ -1012,7 +1028,9 @@ fn vrange(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         Some(ValueRef::VectorSet(vs)) => {
             let inner = vs.read();
             let mut names: Vec<&[u8]> = inner.entries.keys().map(|s| s.as_bytes()).collect();
@@ -1354,7 +1372,9 @@ fn vsim(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let shard = store::get_shard(db_ref, &key);
     let map = read_lock!(shard);
 
-    let vs = match map.get(key.as_slice()) {
+    let found = map.get(key.as_slice());
+    crate::stats::record_lookup(found.is_some());
+    let vs = match found {
         Some(ValueRef::VectorSet(vs)) => Arc::clone(vs),
         Some(_) => {
             return Some(resp_error(

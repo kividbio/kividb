@@ -404,6 +404,17 @@ pub fn record_miss() {
     tl_bump!(TL_MISSES);
 }
 
+/// One read of a key, as Redis's `lookupKeyRead` counts it: a hit when the
+/// key is there, whatever its type, a miss when it is not.
+#[inline(always)]
+pub fn record_lookup(found: bool) {
+    if found {
+        record_hit();
+    } else {
+        record_miss();
+    }
+}
+
 /// One read from a client's connection.
 #[inline(always)]
 pub fn record_read() {

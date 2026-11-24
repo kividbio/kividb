@@ -38,7 +38,258 @@
 //! The list refuses an element longer than [`MAX_LEN`]: whoever holds it
 //! then keeps the elements apart, as before.
 
+use std::alloc::Layout;
 use std::collections::VecDeque;
+use std::ops::{Deref, DerefMut, Range};
+use std::ptr::NonNull;
+
+use crate::value_slab;
+
+/// The bytes of a chunk, kept as a `Vec<u8>` keeps them (a length within a
+/// capacity), in a block of the slabs of the entry pool's kind
+/// ([`value_slab::chunk_class_of`]) while the chunk takes at most
+/// [`value_slab::CHUNK_MAX_BLOCK`] bytes, and in one of the system
+/// allocator's above that (a full chunk of elements of 127 bytes or more).
+///
+/// A list that is pushed at one end and trimmed at the other (a timeline:
+/// `LPUSH`, `LTRIM`) gives up a chunk at its tail and takes a new one at its
+/// head every 64 pushes. In the system allocator (glibc), the new chunk
+/// comes from the arena of the thread that runs the push, and the old one
+/// goes back to the arena of the thread that loaded the list, where the
+/// list's other blocks stay in use between the holes: 10,000 timelines of
+/// 300 short elements on four threads take 27 bytes an element resident
+/// there for 14 in use. A slab holds blocks of one size only, takes back a
+/// block freed on any thread, is handed to any thread once it has room, and
+/// gives its pages back as soon as it is empty: 16.7 bytes resident.
+struct Buf {
+    ptr: NonNull<u8>,
+    len: u32,
+    cap: u32,
+}
+
+// SAFETY: a `Buf` is the only owner of its block, as a `Vec<u8>` is of its
+// own; slab blocks and the system allocator's are given back on any thread
+// (`value_slab::free` puts another thread's block on its slab's remote list).
+unsafe impl Send for Buf {}
+// SAFETY: `&Buf` gives only `&[u8]`.
+unsafe impl Sync for Buf {}
+
+impl Default for Buf {
+    fn default() -> Self {
+        Buf {
+            ptr: NonNull::dangling(),
+            len: 0,
+            cap: 0,
+        }
+    }
+}
+
+/// The bytes a block for `n` bytes of frames holds: its class's size, or `n`
+/// above the largest class ([`value_slab::chunk_class_of`]).
+#[inline]
+pub fn block_bytes(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    value_slab::chunk_class_of(n).map_or(n, value_slab::block_size)
+}
+
+impl Buf {
+    /// A block of at least `n` bytes (`n > 0`), with what it holds.
+    #[inline]
+    fn block(n: usize) -> (NonNull<u8>, usize) {
+        debug_assert!(n > 0);
+        match value_slab::chunk_class_of(n) {
+            Some(class) => (value_slab::alloc(class), value_slab::block_size(class)),
+            None => {
+                let layout = Layout::array::<u8>(n).expect("a chunk is at most 64 frames");
+                // SAFETY: `n > 0`.
+                let p = unsafe { std::alloc::alloc(layout) };
+                let p = NonNull::new(p).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+                (p, n)
+            }
+        }
+    }
+
+    /// Give back `ptr`, the block of `cap` bytes [`block`](Self::block)
+    /// gave: a class's size is that class's, any larger the system's.
+    ///
+    /// # Safety
+    /// As said, and the block is not used again.
+    #[inline]
+    unsafe fn release(ptr: NonNull<u8>, cap: usize) {
+        if cap == 0 {
+            return;
+        }
+        match value_slab::chunk_class_of(cap) {
+            // SAFETY: a block of this size came from this class (see the
+            // test `a_chunk_block_size_names_its_class`).
+            Some(class) => unsafe { value_slab::free(ptr, class) },
+            // SAFETY: the system's, of `cap` bytes, aligned to 1.
+            None => unsafe {
+                std::alloc::dealloc(ptr.as_ptr(), Layout::from_size_align_unchecked(cap, 1))
+            },
+        }
+    }
+
+    fn with_capacity(n: usize) -> Buf {
+        if n == 0 {
+            return Buf::default();
+        }
+        let (ptr, cap) = Self::block(n);
+        Buf {
+            ptr,
+            len: 0,
+            cap: cap as u32,
+        }
+    }
+
+    /// `n` zero bytes.
+    fn zeroed(n: usize) -> Buf {
+        let mut buf = Self::with_capacity(n);
+        buf.resize(n, 0);
+        buf
+    }
+
+    fn from_slice(bytes: &[u8]) -> Buf {
+        let mut buf = Self::with_capacity(bytes.len());
+        buf.extend_from_slice(bytes);
+        buf
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline(always)]
+    fn capacity(&self) -> usize {
+        self.cap as usize
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    #[inline]
+    fn truncate(&mut self, n: usize) {
+        if n < self.len() {
+            self.len = n as u32;
+        }
+    }
+
+    /// Into a block of at least `want` bytes, `want >= len()`; none for 0.
+    fn move_to(&mut self, want: usize) {
+        debug_assert!(want >= self.len());
+        let (old, old_cap) = (self.ptr, self.capacity());
+        #[cfg(test)]
+        crossings::note(old_cap, want);
+        if want == 0 {
+            self.ptr = NonNull::dangling();
+            self.cap = 0;
+        } else if old_cap > value_slab::CHUNK_MAX_BLOCK && want > value_slab::CHUNK_MAX_BLOCK {
+            // The system's on both sides: its own `realloc`.
+            // SAFETY: `old` is the system's, of `old_cap` bytes; `want > 0`.
+            let p = unsafe {
+                std::alloc::realloc(
+                    old.as_ptr(),
+                    Layout::from_size_align_unchecked(old_cap, 1),
+                    want,
+                )
+            };
+            self.ptr = NonNull::new(p).unwrap_or_else(|| {
+                std::alloc::handle_alloc_error(Layout::array::<u8>(want).unwrap())
+            });
+            self.cap = want as u32;
+            return;
+        } else {
+            let (ptr, cap) = Self::block(want);
+            // SAFETY: both blocks hold `len()` bytes at least, and are apart.
+            unsafe { std::ptr::copy_nonoverlapping(old.as_ptr(), ptr.as_ptr(), self.len()) };
+            self.ptr = ptr;
+            self.cap = cap as u32;
+        }
+        // SAFETY: `old` was this buffer's block, and is not used again.
+        unsafe { Self::release(old, old_cap) };
+    }
+
+    /// Room for at least `more` bytes after the `len()`: a block of exactly
+    /// that, rounded up to its class, as `Vec::reserve_exact`.
+    #[inline]
+    fn reserve_exact(&mut self, more: usize) {
+        if self.capacity() - self.len() < more {
+            self.move_to(self.len() + more);
+        }
+    }
+
+    /// Into the smallest block that holds what is there.
+    fn shrink_to_fit(&mut self) {
+        if block_bytes(self.len()) < self.capacity() {
+            self.move_to(self.len());
+        }
+    }
+
+    fn resize(&mut self, n: usize, value: u8) {
+        let len = self.len();
+        if n > len {
+            self.reserve_exact(n - len);
+            // SAFETY: within the block, after `reserve_exact`.
+            unsafe { std::ptr::write_bytes(self.ptr.as_ptr().add(len), value, n - len) };
+        }
+        self.len = n as u32;
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.reserve_exact(bytes.len());
+        let len = self.len();
+        // SAFETY: room for them, after `reserve_exact`; `bytes` is not in
+        // this buffer's room.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.as_ptr().add(len), bytes.len())
+        };
+        self.len = (len + bytes.len()) as u32;
+    }
+
+    /// The bytes of `range`, copied after the last.
+    fn extend_from_within(&mut self, range: Range<usize>) {
+        let len = self.len();
+        assert!(range.start <= range.end && range.end <= len);
+        let n = range.end - range.start;
+        self.reserve_exact(n);
+        // SAFETY: the source is within `len()`, the destination after it.
+        unsafe {
+            let p = self.ptr.as_ptr();
+            std::ptr::copy_nonoverlapping(p.add(range.start), p.add(len), n)
+        };
+        self.len = (len + n) as u32;
+    }
+}
+
+impl Deref for Buf {
+    type Target = [u8];
+
+    #[inline(always)]
+    fn deref(&self) -> &[u8] {
+        // SAFETY: the first `len` bytes of the block are written.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len()) }
+    }
+}
+
+impl DerefMut for Buf {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as `deref`, and the block is this buffer's alone.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len()) }
+    }
+}
+
+impl Drop for Buf {
+    fn drop(&mut self) {
+        // SAFETY: the block is this buffer's, and goes with it.
+        unsafe { Self::release(self.ptr, self.capacity()) }
+    }
+}
 
 /// The longest element a packed list holds.
 pub const MAX_LEN: usize = 1024;
@@ -156,7 +407,7 @@ fn write_frame(buf: &mut [u8], at: usize, element: &[u8]) {
 /// Up to [`CHUNK_ENTRIES`] elements in one buffer.
 #[derive(Default)]
 struct Chunk {
-    buf: Vec<u8>,
+    buf: Buf,
     /// Where the first element's frame begins in `buf`.
     start: u32,
     /// Elements held.
@@ -172,7 +423,7 @@ struct Chunk {
 impl Clone for Chunk {
     fn clone(&self) -> Self {
         Chunk {
-            buf: self.buf[self.start as usize..].to_vec(),
+            buf: Buf::from_slice(&self.buf[self.start as usize..]),
             start: 0,
             count: self.count,
             mixed: self.mixed,
@@ -354,7 +605,7 @@ impl Chunk {
             self.buf.copy_within(start..end, start + room);
             self.start = (start + room) as u32;
         } else {
-            let mut buf = Vec::with_capacity(room + end - start);
+            let mut buf = Buf::with_capacity(room + end - start);
             buf.resize(room, 0);
             buf.extend_from_slice(&self.buf[start..]);
             self.buf = buf;
@@ -713,7 +964,7 @@ impl Chunk {
         debug_assert!(i > 0 && i < self.count());
         let (at, _) = self.at(i);
         let rest = Chunk {
-            buf: self.buf[at..].to_vec(),
+            buf: Buf::from_slice(&self.buf[at..]),
             start: 0,
             count: self.count - i as u16,
             mixed: self.mixed,
@@ -1055,7 +1306,7 @@ impl PackedList {
             m.chunks[last].tighten();
         }
         m.chunks.push_back(Chunk {
-            buf: Vec::with_capacity(bytes),
+            buf: Buf::with_capacity(bytes),
             start: 0,
             count: 0,
             mixed: false,
@@ -1070,7 +1321,7 @@ impl PackedList {
             m.chunks[0].tighten();
         }
         m.chunks.push_front(Chunk {
-            buf: vec![0; bytes],
+            buf: Buf::zeroed(bytes),
             start: bytes as u32,
             count: 0,
             mixed: false,
@@ -1219,6 +1470,11 @@ impl PackedList {
         if first.count() < CHUNK_ENTRIES {
             first.push_front(element);
         } else {
+            // As at the back: room for a quarter of the full chunk. A chunk
+            // grows through several sizes as it fills; each is a slab class
+            // (`Buf`), whose blocks other chunks growing take again, so the
+            // sizes cost no resident memory, and a chunk holds no more room
+            // than a quarter of what it holds.
             let room = frame_len(element.len()).max(first.live() / 4);
             self.open_front(room);
             self.first_mut().push_front(element);
@@ -1975,7 +2231,7 @@ impl Builder {
             return;
         }
         self.chunks.push_back(Chunk {
-            buf: self.frames.as_slice().to_vec(),
+            buf: Buf::from_slice(&self.frames),
             start: 0,
             count: self.count,
             mixed: self.mixed,
@@ -2088,6 +2344,33 @@ impl std::fmt::Debug for PackedList {
     }
 }
 
+/// Moves of a chunk's bytes between a slab block and the system
+/// allocator's (`Buf::move_to`), counted on the thread for the tests: the
+/// model tests check that both happen.
+#[cfg(test)]
+pub(crate) mod crossings {
+    use std::cell::Cell;
+
+    thread_local! {
+        static UP: Cell<usize> = const { Cell::new(0) };
+        static DOWN: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note(old_cap: usize, want: usize) {
+        let max = crate::value_slab::CHUNK_MAX_BLOCK;
+        if old_cap > 0 && old_cap <= max && want > max {
+            UP.with(|n| n.set(n.get() + 1));
+        } else if old_cap > max && want > 0 && want <= max {
+            DOWN.with(|n| n.set(n.get() + 1));
+        }
+    }
+
+    /// (into the system allocator's, back into a slab block) so far.
+    pub(crate) fn counts() -> (usize, usize) {
+        (UP.with(Cell::get), DOWN.with(Cell::get))
+    }
+}
+
 /// What the chunk repair of `remove_matching` did, counted for the tests
 /// (nothing of it is built outside them): chunk slots visited or moved. A
 /// count, where a timing would depend on the machine and the build.
@@ -2188,6 +2471,44 @@ mod tests {
                 "an empty chunk is kept"
             );
         }
+    }
+
+    #[test]
+    fn a_chunk_block_size_names_its_class() {
+        // `Buf::release` finds a block's class from its size alone.
+        for n in 1..=value_slab::CHUNK_MAX_BLOCK {
+            let class = value_slab::chunk_class_of(n).unwrap();
+            let size = value_slab::block_size(class);
+            assert!(size >= n, "{n} bytes in a block of {size}");
+            assert_eq!(value_slab::chunk_class_of(size), Some(class), "{n}");
+            assert_eq!(block_bytes(n), size);
+        }
+        assert_eq!(
+            value_slab::chunk_class_of(value_slab::CHUNK_MAX_BLOCK + 1),
+            None
+        );
+        assert_eq!(
+            block_bytes(value_slab::CHUNK_MAX_BLOCK + 1),
+            value_slab::CHUNK_MAX_BLOCK + 1
+        );
+        // A buffer moves between the two kinds of block both ways.
+        let mut buf = Buf::from_slice(b"abc");
+        assert_eq!(buf.capacity(), block_bytes(3));
+        buf.resize(value_slab::CHUNK_MAX_BLOCK + 10, 7);
+        assert_eq!(buf.capacity(), value_slab::CHUNK_MAX_BLOCK + 10);
+        buf.reserve_exact(100);
+        assert_eq!(buf.capacity(), value_slab::CHUNK_MAX_BLOCK + 110);
+        assert_eq!(&buf[..4], b"abc\x07");
+        buf.truncate(5);
+        buf.shrink_to_fit();
+        assert_eq!(buf.capacity(), block_bytes(5));
+        assert_eq!(&buf[..], b"abc\x07\x07");
+        buf.extend_from_within(1..3);
+        assert_eq!(&buf[..], b"abc\x07\x07bc");
+        buf.clear();
+        buf.shrink_to_fit();
+        assert_eq!(buf.capacity(), 0);
+        assert_eq!(Buf::zeroed(9).iter().filter(|&&b| b == 0).count(), 9);
     }
 
     #[test]

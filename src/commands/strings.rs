@@ -318,14 +318,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // GET: capture old value before any mutation (nil if absent/wrong-type)
             let old_val: Option<SharedBytes> = if want_get {
                 match existing {
-                    Some(ValueRef::String(v)) => Some(v.to_shared()),
+                    Some(ValueRef::String(v)) => {
+                        crate::stats::record_hit();
+                        Some(v.to_shared())
+                    }
                     Some(_) => {
+                        crate::stats::record_hit();
                         // Redis returns WRONGTYPE if GET is used on a non-string key
                         return Some(resp_error(
                             "WRONGTYPE Operation against a key holding the wrong kind of value",
                         ));
                     }
-                    None => None,
+                    None => {
+                        crate::stats::record_miss();
+                        None
+                    }
                 }
             } else {
                 None
@@ -473,7 +480,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     resp_bulk(&v)
                 }
                 store::Lookup::Live(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
                 }
                 store::Lookup::Absent => {
@@ -561,13 +568,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let key: &[u8] = k;
                 if is_expired(ctx.store, *ctx.selected_db, key) {
                     expire_on_read(ctx.store, *ctx.selected_db, key);
+                    crate::stats::record_miss();
                     continue;
                 }
                 let shard = store::get_shard(db, key);
                 let map = read_lock!(shard);
 
                 if map.contains_key(key) {
+                    crate::stats::record_hit();
                     count += 1;
+                } else {
+                    crate::stats::record_miss();
                 }
             }
 
@@ -635,17 +646,27 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let key: &[u8] = cmd[1];
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_integer(0));
             }
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
             match map.get(key) {
-                Some(ValueRef::String(v)) => Some(resp_integer(v.len() as i64)),
-                Some(_) => Some(resp_error(
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                )),
-                None => Some(resp_integer(0)),
+                Some(ValueRef::String(v)) => {
+                    crate::stats::record_hit();
+                    Some(resp_integer(v.len() as i64))
+                }
+                Some(_) => {
+                    crate::stats::record_hit();
+                    Some(resp_error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ))
+                }
+                None => {
+                    crate::stats::record_miss();
+                    Some(resp_integer(0))
+                }
             }
         }
 
@@ -737,7 +758,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 store::Removal::Kept => {
                     drop(map);
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -773,7 +794,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     resp_bulk(&v)
                 }
                 Some(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     return Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ));
@@ -903,6 +924,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(store::Lookup::Live(ValueRef::String(v))) => {
                         crate::stats::record_hit();
                         resp_bulk(v.as_bytes())
+                    }
+                    Some(store::Lookup::Live(_)) => {
+                        crate::stats::record_hit();
+                        nil.clone()
                     }
                     _ => {
                         crate::stats::record_miss();
@@ -1147,14 +1172,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_bulk(b""));
             }
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
             match map.get(key) {
-                None => Some(resp_bulk(b"")),
+                None => {
+                    crate::stats::record_miss();
+                    Some(resp_bulk(b""))
+                }
                 Some(ValueRef::String(_)) if start < 0 && end < 0 && start > end => {
+                    crate::stats::record_hit();
                     Some(resp_bulk(b""))
                 }
                 Some(ValueRef::String(v)) => {
@@ -1170,16 +1200,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     } else {
                         end.min(len - 1)
                     } as usize;
+                    crate::stats::record_hit();
                     if s > e || len == 0 {
-                        crate::stats::record_miss();
                         Some(resp_bulk(b""))
                     } else {
-                        crate::stats::record_hit();
                         Some(resp_bulk(&v[s..=e]))
                     }
                 }
                 Some(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -1313,7 +1342,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         Some(v.to_shared())
                     }
                     Some(_) => {
-                        crate::stats::record_miss();
+                        crate::stats::record_hit();
                         return Some(resp_error(
                             "WRONGTYPE Operation against a key holding the wrong kind of value",
                         ));
@@ -1427,20 +1456,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Fetch both values under their respective shard read locks.
             // We read key1 first, drop lock, then read key2. This avoids holding
             // two shard locks simultaneously (deadlock risk if same shard).
+            // Both keys are looked up (and counted) before either's type
+            // is refused, as Redis does.
+            let mut wrong_type = false;
             let s1: SharedBytes = {
                 if is_expired(ctx.store, *ctx.selected_db, key1) {
                     expire_on_read(ctx.store, *ctx.selected_db, key1);
+                    crate::stats::record_miss();
                     SharedBytes::from(&[][..])
                 } else {
                     let db = &ctx.store[*ctx.selected_db];
                     let shard = store::get_shard(db, key1);
                     let map = read_lock!(shard);
-                    match map.get(key1) {
+                    let found = map.get(key1);
+                    crate::stats::record_lookup(found.is_some());
+                    match found {
                         Some(ValueRef::String(v)) => v.to_shared(),
                         Some(_) => {
-                            return Some(resp_error(
-                                "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            ));
+                            wrong_type = true;
+                            SharedBytes::from(&[][..])
                         }
                         None => SharedBytes::from(&[][..]),
                     }
@@ -1450,22 +1484,29 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let s2: SharedBytes = {
                 if is_expired(ctx.store, *ctx.selected_db, key2) {
                     expire_on_read(ctx.store, *ctx.selected_db, key2);
+                    crate::stats::record_miss();
                     SharedBytes::from(&[][..])
                 } else {
                     let db = &ctx.store[*ctx.selected_db];
                     let shard = store::get_shard(db, key2);
                     let map = read_lock!(shard);
-                    match map.get(key2) {
+                    let found = map.get(key2);
+                    crate::stats::record_lookup(found.is_some());
+                    match found {
                         Some(ValueRef::String(v)) => v.to_shared(),
                         Some(_) => {
-                            return Some(resp_error(
-                                "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            ));
+                            wrong_type = true;
+                            SharedBytes::from(&[][..])
                         }
                         None => SharedBytes::from(&[][..]),
                     }
                 }
             };
+            if wrong_type {
+                return Some(resp_error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                ));
+            }
 
             // ── LCS DP core ──────────────────────────────────────────────────────────
             // Standard O(N*M) DP. We use a flat Vec<u32> as the DP table to avoid
@@ -1631,12 +1672,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let key: &[u8] = cmd[1];
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_null_bulk());
             }
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
-            match map.get(key) {
+            let found = map.get(key);
+            crate::stats::record_lookup(found.is_some());
+            match found {
                 None => Some(resp_null_bulk()),
                 Some(ValueRef::String(v)) => {
                     let hex = value_digest(&v);
