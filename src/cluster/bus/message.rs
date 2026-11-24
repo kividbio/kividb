@@ -251,6 +251,17 @@ pub enum BusMessage {
         owners: Vec<OwnerUpdate>,
     },
 
+    /// An [`BusMessage::Update`] that also says which of the slots the
+    /// candidate claimed for its master came to the master after the epoch
+    /// it claimed them at (`moved`, each at the epoch it came at:
+    /// `came_at`). On the wire, `UPDATE` with one field more after the
+    /// owners, which a node that does not know it leaves over.
+    UpdateMoved {
+        sender_id: NodeId,
+        owners: Vec<OwnerUpdate>,
+        moved: Vec<SlotClaim>,
+    },
+
     /// "Yes, you can take over." Sent by a master in response to a valid
     /// FailoverAuthRequest. The replying master records the epoch as its
     /// last_vote_epoch to prevent voting twice in the same epoch.
@@ -303,6 +314,7 @@ impl BusMessage {
             | BusMessage::Pong { sender_id, .. }
             | BusMessage::FailoverAuthRequest { sender_id, .. }
             | BusMessage::Update { sender_id, .. }
+            | BusMessage::UpdateMoved { sender_id, .. }
             | BusMessage::FailoverAuthAck { sender_id, .. }
             | BusMessage::Fail { sender_id, .. }
             | BusMessage::Publish { sender_id, .. }
@@ -460,18 +472,14 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
         }
         // Flat, three fields an owner: the parser allows four levels of
         // arrays, and the claims take two.
-        BusMessage::Update { sender_id, owners } => {
-            let mut fields = vec![resp_bulk_str("UPDATE"), resp_bulk(sender_id)];
-            for o in owners {
-                fields.push(resp_bulk(&o.id));
-                fields.push(resp_bulk_str(&format_endpoint(
-                    &o.ip,
-                    o.client_port,
-                    o.cluster_port,
-                    o.config_epoch,
-                )));
-                fields.push(encode_slot_claims(&o.claims));
-            }
+        BusMessage::Update { sender_id, owners } => resp_array(update_fields(sender_id, owners)),
+        BusMessage::UpdateMoved {
+            sender_id,
+            owners,
+            moved,
+        } => {
+            let mut fields = update_fields(sender_id, owners);
+            fields.push(encode_slot_claims(moved));
             resp_array(fields)
         }
         BusMessage::FailoverAuthAck {
@@ -849,10 +857,29 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                 return Err(format!("UPDATE expects 2 fields, got {}", parts.len()));
             }
             let sender_id = parse_node_id(&parts[1]).ok_or("bad sender id")?;
+            // One field more than three an owner: the slots that came to
+            // the candidate's master after its claim (`UpdateMoved`).
+            let rest = &parts[2..];
+            if rest.len() % 3 == 1
+                && let Some(last) = rest.last()
+                && last.first() == Some(&b'*')
+                && let Ok(moved) = parse_slot_claims(last)
+                && !moved.is_empty()
+                && valid_claims(&moved)
+            {
+                return Ok(Some((
+                    BusMessage::UpdateMoved {
+                        sender_id,
+                        owners: parse_owner_updates(&rest[..rest.len() - 1]),
+                        moved,
+                    },
+                    consumed,
+                )));
+            }
             Ok(Some((
                 BusMessage::Update {
                     sender_id,
-                    owners: parse_owner_updates(&parts[2..]),
+                    owners: parse_owner_updates(rest),
                 },
                 consumed,
             )))
@@ -1050,6 +1077,23 @@ fn parse_owner_report(buf: &[u8]) -> Option<OwnerReport> {
         return None;
     }
     OwnerReport::valid(masters, parse_slot_claims(claims).ok()?)
+}
+
+/// The fields of an `UPDATE`: its name, the sender, and three an owner.
+/// Flat: the parser allows four levels of arrays, and the claims take two.
+fn update_fields(sender_id: &NodeId, owners: &[OwnerUpdate]) -> Vec<Vec<u8>> {
+    let mut fields = vec![resp_bulk_str("UPDATE"), resp_bulk(sender_id)];
+    for o in owners {
+        fields.push(resp_bulk(&o.id));
+        fields.push(resp_bulk_str(&format_endpoint(
+            &o.ip,
+            o.client_port,
+            o.cluster_port,
+            o.config_epoch,
+        )));
+        fields.push(encode_slot_claims(&o.claims));
+    }
+    fields
 }
 
 /// The owners of an `UPDATE`, from its fields after the sender's id: three

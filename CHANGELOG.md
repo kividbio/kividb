@@ -9,6 +9,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrading
 
+- **Cluster: masters vote on when the slots a replica claims came to its
+  master.** A replica is elected only for slots whose writes it holds while
+  the masters of this release are a majority of the masters that own slots:
+  a master of 1.2 votes without the check. Upgrade the masters before
+  relying on it. Each master keeps `<cluster-config-file>.came-at` beside
+  `nodes.conf`; one that starts without it takes each slot to have come at
+  its owner's config epoch. `CLUSTER FAILOVER TAKEOVER` asks no one: it can
+  make a replica the owner of slots whatever it holds of them.
+
 - **A query that names no `DIALECT` is read in dialect 1 (#247).** It is
   read in the default dialect, as in Redis: 1, which `search-default-dialect`
   (`CONFIG SET`, the configuration file) or `FT.CONFIG SET DEFAULT_DIALECT`
@@ -145,6 +154,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CLUSTER SLOTS` until it comes back.
 
 ### Added
+
+- **Cluster: a master refuses its vote for slots that came to the
+  candidate's master after the claim the candidate read.** A replica claims
+  its master's slots, when it stands for election (automatic, or `CLUSTER
+  FAILOVER [FORCE]`), at the epoch of the newest claim of its master it read
+  in its replication stream (`TAKEN`), or of an import whose data it read
+  (`ARRIVED`) at a newer one; that epoch is written down with the slots it
+  does not hold (`<cluster-config-file>.not-held`) and read back at
+  start-up. Each master keeps, per slot, the epoch of the claim that gave
+  the slot to its owner (`<cluster-config-file>.came-at`, written, synced,
+  before every save of `nodes.conf`). A slot claimed at an older epoch than
+  that is refused, and the refusal (`UPDATE`, with one field more) says when
+  each came: the replica holds those only through a `TAKEN` at that epoch
+  or later that lists them, or an `ARRIVED` at that very epoch, and asks
+  again for the others. So a replica cut off while slots of its master went
+  to another master, took writes there and came back is elected only for
+  the slots whose writes it holds, and the master keeps the others.
 
 - **`search-resp3-reply`: the shape of the search commands' RESP3 replies (#1021).**
   `auto` (the default) answers `FT.SEARCH`, `FT.AGGREGATE` (and its cursor), `FT.HYBRID`,

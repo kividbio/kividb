@@ -798,6 +798,9 @@ fn save_then(
     // What a replica does not hold of its master's slots is on disk before
     // the table that shows them as its master's is (`followed_imports::NotHeld`).
     crate::cluster::followed_imports::save_not_held(state);
+    // And when each slot came to its owner (`came_at`), which a vote is
+    // decided on: on disk before the table that shows the owners is.
+    crate::cluster::came_at::save(state);
     let path = match state.config_path.as_ref() {
         Some(p) => p,
         None => {

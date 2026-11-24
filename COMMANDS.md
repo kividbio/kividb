@@ -1386,6 +1386,14 @@ in the clear, as in Redis: keep the bus on a private network, or turn on
 `tls-cluster` (builds with TLS). A `nodes.conf` that exists but cannot be read is
 fatal at startup rather than silently replaced by a new identity.
 
+Beside `nodes.conf`, a node keeps, in the same directory and named after it:
+`<cluster-config-file>.handovers` (a slot handover from this node under
+way), `.followed-imports` (the imports into its master it knew of),
+`.not-held` (a replica: the slots of its master it does not hold yet, and
+the epoch of the newest claim of its master it read) and `.came-at` (when
+each slot came to its owner, which votes are decided on). Each is written,
+synced, before the `nodes.conf` save it belongs with.
+
 A cluster node has one keyspace: `SELECT` of any database but 0 is refused.
 
 | Command | Syntax | Notes |
@@ -1456,8 +1464,10 @@ a replica does not stand. `CLUSTER FAILOVER` is not subject to either.
 
 **What a vote checks.** A replica standing for election, automatic or by
 `CLUSTER FAILOVER` (with or without `FORCE`), says in its request which slots
-it would take over: those its master owns in its view, at its master's
-config epoch. A master that knows a newer owner of one of them refuses its
+it would take over: those its master owns in its view that it holds, each at
+the epoch it holds it as of: the config epoch of the newest claim of its
+master it read in its replication stream (`KIVIDB.IMPORTS TAKEN`), or of an
+import whose data it read (`ARRIVED`) at a newer one. A master that knows a newer owner of one of them refuses its
 vote, as in Redis, and answers with that owner and the slots it last claimed
 in its own heartbeat to that master, at the epochs it gave (Redis's
 `UPDATE`). The replica takes that in as if the owner had told it itself, and
@@ -1470,6 +1480,42 @@ claims are not valid claims is refused. Masters of 1.2 decide votes as
 before: a manual failover's request reaches them without claims, in the form
 they read.
 
+**When a slot came to its master.** Each master keeps, per slot, the config
+epoch of the claim that gave the slot to its current owner in its table (a
+peer's claim it took in, or its own takeover: an import, `CLUSTER SETSLOT
+<slot> NODE` to itself, `CLUSTER ADDSLOTS`, a promotion). It refuses its vote
+to a replica that claims a slot of its master at an older epoch than the
+one the slot came to the master at: the slot went away and came back since
+the replica's stream last told it, with keys the replica may not hold. The
+refusal says which slots and when each came (`UPDATE`); the replica holds
+those only if its stream confirms them (a `TAKEN` at that epoch or later
+that lists them, or an `ARRIVED` at that very epoch), and asks again for the
+others. So a replica cut off while slots of its master went to another
+master, took writes there and came back is elected only for the slots whose
+writes it holds; the others stay with its master, which keeps them on disk.
+
+A master writes these epochs down, synced, in `<cluster-config-file>.came-at`
+before every save of `nodes.conf`, and reads them back when it starts. One
+that starts without the file (a node of an earlier release, or a file that
+does not read) takes each slot to have come at its owner's config epoch in
+`nodes.conf`: it refuses only a replica whose newest claim read is older
+than its master's epoch, and elects one that read its master's newest claim.
+A replica writes the epoch of the newest claim of its master it read in
+`<cluster-config-file>.not-held`, so that it claims at that epoch after a
+restart. Before it has read any claim of a master that sends them (one it
+has just begun to follow), it claims at epoch 0, which every master that
+knows when the slots came refuses; a replica started without the file claims
+at its master's config epoch in `nodes.conf`, and one of a master of 1.2,
+which sends no claims in its stream, at its master's config epoch, as
+before.
+
+The check is made by the masters that vote. A master of 1.2 does not make
+it: a replica is elected only for slots whose writes it holds while the
+masters of this release are a majority of the masters that own slots (each
+quorum then has one of them, which gives its vote only once the replica's
+claims leave out the slots that came after them). Upgrade the masters before
+relying on it.
+
 **What each kind of failover guarantees.** The default `CLUSTER FAILOVER`
 loses nothing the old master acknowledged: the master stops taking writes
 and gives the replica the offset its stream ends at, and the replica stands
@@ -1481,8 +1527,10 @@ replica had not received is lost, as in an automatic failover. `TAKEOVER`
 skips the election as well: the replica picks a new epoch on its own and
 claims its master's slots, as it sees them, without asking anyone. It gives
 no guarantee about the old master's writes, and does not check whether its
-master gave slots away that it has not heard of: use it only when no
-majority of masters can vote.
+master gave slots away that it has not heard of, nor when the slots came to
+its master: it can make the replica the owner of slots whatever it holds of
+them. It is an operator's override: use it only when no majority of masters
+can vote.
 
 **Config epoch collisions.** Two masters at one config epoch are resolved as
 in Redis: the one with the lower node id moves to a new epoch. A `TAKEOVER`
