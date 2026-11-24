@@ -11198,6 +11198,19 @@ fn import_until_taken(node: &Node, a: u16, b: u16) {
     wait_import_completed(node, &task_id);
 }
 
+/// The node that owns `slot` in `node`'s nodes.conf on disk.
+fn owner_in_conf_of(node: &Node, slot: u16) -> Option<String> {
+    let conf = std::fs::read_to_string(node.dir.join("nodes.conf")).ok()?;
+    conf.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let owns = fields.iter().skip(8).any(|range| {
+            let (a, b) = range.split_once('-').unwrap_or((range, range));
+            matches!((a.parse::<u16>(), b.parse::<u16>()), (Ok(a), Ok(b)) if a <= slot && slot <= b)
+        });
+        owns.then(|| fields[0].to_string())
+    })
+}
+
 /// Which slots leave the destination and come back while its replica is
 /// cut off, in [`replica_stopped_while_slots_leave_and_come_back`].
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -11339,6 +11352,18 @@ fn replica_stopped_while_slots_leave_and_come_back(moved: Moved, voters: Voters,
                 .all(|n| owner_in_view_of(n, a).as_deref() == Some(dst_id.as_str()))
         },
     );
+    if matches!(
+        voters,
+        Voters::SourceSkipsThirdRestarted | Voters::SourceSkipsThirdRestartedWithoutFile
+    ) {
+        // Restarted once its nodes.conf has the destination as the owner
+        // again: the restart is to start from that view.
+        wait_until(
+            "the third master's nodes.conf to have the destination as the owner",
+            Duration::from_secs(10),
+            || owner_in_conf_of(&nodes[2], a).as_deref() == Some(dst_id.as_str()),
+        );
+    }
     match voters {
         Voters::SourceSkipsThirdRestarted => {
             nodes[2].kill();
