@@ -1244,6 +1244,7 @@ fn reserve(size: usize) -> Option<usize> {
         // 1 MiB at a time, and under `enabled=always` the first write to a
         // region would take 2 MiB of RSS. A kernel without them refuses the
         // advice, and there is nothing to keep off.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         libc::madvise(aligned as *mut libc::c_void, size, libc::MADV_NOHUGEPAGE);
     }
     Some(aligned)

@@ -161,10 +161,11 @@ fn ft_list(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // The selected database's indexes, not the aliases that point at them.
     // Those of every database used to be listed (#447).
     let db = *ctx.selected_db;
+    let valkey = crate::commands::search::valkey_shape(ctx);
     let items: Vec<Vec<u8>> = store
         .iter()
         .filter(|(key, def)| !crate::vector::is_alias(key, def) && def.db_index == db)
-        .map(|(key, _)| resp_bulk_str(key))
+        .map(|(key, _)| crate::commands::search::reply_name(key, valkey))
         .collect();
     Some(resp_array(items))
 }
@@ -1147,7 +1148,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // `WITHCURSOR`: the first rows now, the rest as they are asked for.
     if let Some((count, max_idle)) = cursor {
         return Some(crate::commands::search_tools::open_cursor(
-            crate::commands::handler::effective_resp_for_reply(ctx),
+            crate::commands::search::search_shape(ctx),
             &index_name,
             rows_out,
             count,
@@ -1159,11 +1160,9 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     // A grouped aggregation reports how many groups there were, not how many
     // are on this page; any other reports the page.
     let total = groups.unwrap_or(rows_out.len());
+    let (resp, valkey) = crate::commands::search::search_shape(ctx);
     Some(crate::commands::search_tools::rows_reply(
-        crate::commands::handler::effective_resp_for_reply(ctx),
-        total,
-        &rows_out,
-        timed_out,
+        resp, valkey, total, &rows_out, timed_out,
     ))
 }
 // ── FT.TAGVALS ────────────────────────────────────────────────────────────────

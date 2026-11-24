@@ -146,6 +146,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`search-resp3-reply`: the shape of the search commands' RESP3 replies (#1021).**
+  `auto` (the default) answers `FT.SEARCH`, `FT.AGGREGATE` (and its cursor), `FT.HYBRID`,
+  `FT.INFO` and `FT._LIST` over RESP3 as Redis 8 does, a map, and a valkey-glide client
+  (`CLIENT SETINFO LIB-NAME` begins with `Glide`) as valkey-search does: the RESP2 layout on a
+  RESP3 connection for `FT.SEARCH`, `FT.AGGREGATE`, `FT.CURSOR READ`, `FT._LIST` and `FT.INFO`, and
+  for `FT.HYBRID` the count, then each row as a flat array (no `warnings`, no `execution_time`).
+  That is the reply GLIDE converts. The `ON_TIMEOUT` warning is not in it, and a KNN `WITHSCORES`
+  gives the distance where valkey-search gives 0. `FT.PROFILE` and the other search commands keep
+  the Redis shape in every mode. `redis` and `valkey` give every connection one or the other. It is
+  set in the configuration file, on the command line, and with `CONFIG SET`, which acts on
+  connections already open; it belongs to the node, so in a cluster set every node alike. RESP2
+  replies, a script's, and what the masters of a cluster tell one another are the same in each.
+
 - **`FT.SEARCH … INFIELDS n field …` (part of #1004).** The query's text
   clauses look only in the fields named (by the name `AS` gave them), as in
   Redis: a clause's own fields are narrowed too (`@title:x` with `INFIELDS 1
@@ -609,6 +622,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   doubling, and at 100 x 64 takes 466 (425). Suite `51-filtered-flat-knn`
   of `benchmarks/1.3.0/regressions` measures it; see docs/PERFORMANCE.md,
   "Filtered KNN on a FLAT index".
+- **`KEYS` reads its entries ahead and lets writes in between parts of a
+  shard (#1018).** `KEYS` goes through a shard's buckets in parts of 4,096
+  and asks for the lines of each entry's header and key as it finds the
+  entry, visiting the entries 16 at a time, as a `SCAN` page does (#884):
+  the walk waited for memory at nearly every key. Between two parts it
+  looks whether a write waits for the shard and, if one does, lets it in;
+  with nobody waiting it keeps the lock. A key there, unchanged, for the
+  whole `KEYS` is in the reply, no key is in it twice, and a key written or
+  deleted meanwhile may be in it or not (a shard whose table is resized
+  between two parts is gone through again). Plane invalidates its cache
+  with `KEYS *<path>*`: over 500,000 keys of 2 KB with 5 that match, on an
+  Azure `Standard_D8s_v5` with the server on vCPUs 0-3 (`--threads 4`,
+  Redis 8.10.3 and Valkey 9.2.0 `--io-threads 4`) and the clients on 4-7,
+  `KEYS` alone takes 17.7 ms (master before it 43-46 ms, v1.2.2 202 ms,
+  Redis 183 ms, Valkey 128 ms), 35 ns a key. memtier_benchmark `GET`s from
+  500 connections with a `KEYS` every 250 ms: p99.9 6.5 ms (master 6.0,
+  v1.2.2 340, Redis 189, Valkey 158), 338k a second (master 339k, v1.2.2
+  329k, Redis 85k, Valkey 112k; 341k with no `KEYS`). With `SET`:`GET` 1:4
+  of 2 KB values beside the scans, the `SET` p99.9 is 5.3 ms against
+  master's 10.3, and 335k commands a second against 300k. On v1.2.2 the
+  `KEYS` runs on the io_uring worker that read it and only that worker's
+  connections wait (24 of 64 probe connections saw 249-514 ms, the others
+  under 2 ms); since #762 it runs on a thread of its own, and no probe
+  connection saw more than 4.3 ms. Suite `50-keys-wildcard` of
+  `benchmarks/1.3.0` measures it.
 - **io_uring workers finish a waiting socket read without interrupting the
   worker (#1015).** Each worker's ring is made with
   `IORING_SETUP_COOP_TASKRUN` (Linux 5.19 and later; on an older kernel the
@@ -633,6 +671,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   also what runs under Docker's default seccomp profile (it refuses
   io_uring), is unchanged. See docs/PERFORMANCE.md, "Request-response from
   many connections"; suite 49 of `benchmarks/1.3.0/regressions` measures it.
+- **A `SETBIT` that leaves the bit as it is, and a `BITFIELD` or
+  `BITFIELD_RO` that writes nothing, read a long string where it is kept
+  (part of #1016).** `SETBIT` reads the bit where the string is kept and
+  copies the string only when it writes. `BITFIELD` and `BITFIELD_RO` read
+  a string of 4 KiB or more where it is kept and copy it only for a write
+  that succeeds; a shorter one kept in its key's entry is copied once to
+  be read. The time these commands take is the same whatever the string's
+  length. Server time a call on a 64 MiB string: on an Azure
+  `Standard_D4s_v5` (Xeon 8473C), a `SETBIT` that changes nothing 1.52 µs
+  (master before this change: 63,313 µs), a `BITFIELD` with one `GET`
+  0.24 µs (132,208 µs), a `BITFIELD` whose `OVERFLOW FAIL` write fails
+  0.46 µs (132,012 µs); on an Apple M3 Pro (`--threads 4`, median of 3),
+  0.41 µs (1,785 µs) and 0.17 µs (2,849 µs) for the first two. Four
+  connections sending that `SETBIT` to one 64 MiB key: 141,627 calls/s
+  (16), with another connection's `SET` every millisecond at a p99 of
+  102 µs (267 ms).
 - **A save keeps about 8 MiB of collections in memory a capture thread
   while the disk keeps up (#825).** A save lays out the values that are not strings when it
   captures the dataset, with writes held. For `dump.kdb` each capture thread
