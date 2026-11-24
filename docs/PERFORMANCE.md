@@ -776,6 +776,68 @@ Suite `28-ft-hnsw` of
 the 50,000 × 384-d build and KNN against 1.2.2 (and Redis, given its query
 engine module) and fails a build that loses it.
 
+## Filtered KNN on a FLAT index
+
+Since 1.3.0 a FLAT index keeps its vectors in fixed blocks of slots, each
+vector on a cache line, in huge pages where the kernel gives them, and a KNN
+whose filter the postings answer goes from each matching document id to its
+slot ([#1020](https://github.com/kividbio/kividb/issues/1020)). In 1.2 each
+vector was an allocation of its own, found by the document's key: with
+10,000 matching documents of 1536 dimensions, a query read 60 MB scattered
+in 6 KB pieces, and the four worker threads waited on memory (78 % of the
+time in the distance kernel, 15 % in the lookups). The scan now reads the
+blocks one after the other, as far as the documents' slots follow each
+other; the processor fetches the next lines on its own (asking for each next
+vector ahead made it slower, by 3-9 % here and 30 % without a filter).
+
+An Azure `Standard_D8s_v5` (Xeon Platinum 8370C), the server on vCPUs 0-3
+(`--threads 4`; Redis 8.12 `--io-threads 4 --search-workers 4`), a compiled
+closed-loop client on 4-7; 100,000 HASH documents, FLAT FLOAT32 COSINE 1536,
+`FT.SEARCH idx "(@user_id:{user\-<u>|__shared__})=>[KNN 5 @embedding $vector
+AS vector_distance]" ... RETURN 1 vector_distance DIALECT 2` (#1020's query;
+about 10,090 documents match, the last 10,000 written one after the other),
+lookups a second (p99 ms):
+
+| layout | connections | 1.2.2 | master before | 1.3.0 | Redis 8.12 |
+|---|---:|---:|---:|---:|---:|
+| ~10,090 matches | 8 | 486 (17.8) | 502 (17.4) | **798** (11.5) | 488 (28.7) |
+| ~10,090 matches | 64 | 482 (140) | 510 (138) | **806** (90) | 500 (232) |
+| 100 matches (median of 5) | 8 | 25,076 | 24,893 | **27,480** | 12,168 |
+| 100 matches (median of 5) | 64 | 27,003 | 26,384 | **30,555** | 14,556 |
+| no filter | 8 | 57 | 58 | **77** | 46 |
+| no filter | 64 | 58 | 50 | 76 | 124 |
+
+Every engine returned the exact top 5 (numpy) on 20 of 20 sampled queries of
+each layout. Without a filter Redis answers more queries at 64 connections
+than at 8 (124 against 46); KiviDB measures all of a query's vectors on the
+thread that took it, at 8 connections as at 64.
+
+Writes: `HSET`s of a vector into the index (`redis-benchmark`,
+16 connections, pipeline 16, over 100,000 documents) 389,900 a second
+against master's 380,600, the vector decoded into its slot with no
+allocation; the index built again at load from 100,000 documents in 0.97 s
+(master 0.95 s; median of 6 starts, which spread over 6 %).
+
+What the index holds, `used_memory` a vector (the document's own hash
+not counted):
+
+| index | master before | 1.3.0 |
+|---|---:|---:|
+| 100,000 × 1536, with a TAG field | 6,325 | 6,321 |
+| 100,000 × 1536, no other field | 6,237 | 6,228 |
+| 1,000 × 64, with a TAG field | 443 | 384 |
+| 100 × 64, with a TAG field | 425 | 466 |
+
+Blocks start at 8 slots and double up to 1,024, so a small index holds
+little more than its vectors; at 100 × 64 the last block (64 of the 120
+slots made) is a third empty. A delete gives the slot to the next
+document; the blocks are given back with the index (`FT.DROPINDEX`,
+`FLUSHALL`), so after many deletes the index holds what it held at its
+peak until then. Suite `51-filtered-flat-knn` of
+[`benchmarks/1.3.0/regressions`](../benchmarks/1.3.0/regressions/README.md)
+measures the two layouts against 1.2.2 and Redis (given its query engine module) and
+fails a build that loses the gain.
+
 ## Worker threads
 
 How many workers to start on a CPU allowance ([#873](https://github.com/kividbio/kividb/issues/873)),

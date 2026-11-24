@@ -873,7 +873,10 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Some(plan) => {
             let mut seen = 0u32;
             let mut cut = false;
-            for key in crate::commands::search::keys_of(&def, &plan.ids) {
+            // Each document tried against the filter where the ids are not
+            // exactly the matches (any more: see `search::plan_keys`).
+            let (keys, exact) = crate::commands::search::plan_keys(&def, &plan);
+            for key in keys {
                 if crate::commands::search::deadline_due(deadline, &mut seen) {
                     cut = true;
                     break;
@@ -882,7 +885,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     continue;
                 }
                 crate::commands::search::with_doc(db_ref, &def, &key, now, |inner, json| {
-                    if plan.exact || crate::vector::filter::eval(&filter, inner) {
+                    if exact || crate::vector::filter::eval(&filter, inner) {
                         add_row(&key, inner, json);
                     }
                 });
@@ -1835,6 +1838,8 @@ pub(crate) struct FilteredKnn<'a> {
     live: &'a LiveIndex,
     query: crate::vector::PreparedQuery<'a>,
     best: Best,
+    /// The nearest of a FLAT index, from [`FilteredKnn::offer_every`].
+    found: Option<Vec<crate::vector::KnnResult>>,
 }
 
 impl<'a> FilteredKnn<'a> {
@@ -1848,6 +1853,7 @@ impl<'a> FilteredKnn<'a> {
             live,
             query: crate::vector::PreparedQuery::new(metric, query),
             best: Best::new(k),
+            found: None,
         }
     }
 
@@ -1857,9 +1863,8 @@ impl<'a> FilteredKnn<'a> {
         let dim = self.query.vector().len();
         let distance = match self.live {
             LiveIndex::Flat(idx) => {
-                let vectors = idx.vectors.read();
-                match vectors.get(key) {
-                    Some(v) if v.len() == dim => self.query.to_raw(v),
+                match idx.with_vector(key, |v| (v.len() == dim).then(|| self.query.to_raw(v))) {
+                    Some(Some(d)) => d,
                     _ => return,
                 }
             }
@@ -1898,15 +1903,10 @@ impl<'a> FilteredKnn<'a> {
         let mut seen = 0u32;
         match self.live {
             LiveIndex::Flat(idx) => {
-                let vectors = idx.vectors.read();
-                for (key, v) in vectors.iter() {
-                    if crate::commands::search::deadline_due(deadline, &mut seen) {
-                        return true;
-                    }
-                    if v.len() == dim {
-                        self.best.offer(self.query.to_raw(v), key);
-                    }
-                }
+                // The blocks in order, the lock let go between runs.
+                let (found, cut) = idx.nearest(&self.query, self.best.k, deadline);
+                self.found = Some(found);
+                return cut;
             }
             LiveIndex::Hnsw(idx) => {
                 // `nodes` before `key_to_id`, as the graph search and
@@ -1931,7 +1931,10 @@ impl<'a> FilteredKnn<'a> {
 
     /// The nearest, nearest first.
     pub(crate) fn nearest(self) -> Vec<crate::vector::KnnResult> {
-        self.best.into_sorted()
+        match self.found {
+            Some(found) => found,
+            None => self.best.into_sorted(),
+        }
     }
 }
 
@@ -1963,7 +1966,7 @@ impl Ord for Far {
 }
 
 impl Best {
-    fn new(k: usize) -> Self {
+    pub(crate) fn new(k: usize) -> Self {
         Self {
             k,
             heap: std::collections::BinaryHeap::with_capacity(k.min(4096) + 1),
@@ -1971,7 +1974,7 @@ impl Best {
     }
 
     #[inline]
-    fn offer(&mut self, distance: f32, key: &str) {
+    pub(crate) fn offer(&mut self, distance: f32, key: &str) {
         if self.heap.len() < self.k {
             self.heap.push(Far(distance, key.to_string()));
         } else if let Some(mut top) = self.heap.peek_mut()
@@ -1984,7 +1987,7 @@ impl Best {
         }
     }
 
-    fn into_sorted(self) -> Vec<crate::vector::KnnResult> {
+    pub(crate) fn into_sorted(self) -> Vec<crate::vector::KnnResult> {
         self.heap
             .into_sorted_vec()
             .into_iter()
@@ -2050,6 +2053,8 @@ pub(crate) fn knn_planned(
     };
     let live = def.indexes.get(&knn.field)?;
     let mut plan = crate::commands::search::plan(ctx, def, filter, only, now)?;
+    #[cfg(test)]
+    crate::test_hooks::at("knn_planned: planned");
     if !plan.exact {
         return None;
     }
@@ -2085,12 +2090,30 @@ pub(crate) fn knn_planned(
             .filter(|r| crate::commands::search::field_hidden(db, &r.key, &knn.field, now))
             .map(|r| r.key.clone())
             .collect();
-        if (gone.is_empty() && hidden.is_empty()) || cut {
+        // Ids given back while the query ran may have been given out again,
+        // to documents the filter was not worked out for: then each hit is
+        // tried against the filter on its own document, and one that does
+        // not match is left out of the plan. Otherwise this is one compare.
+        let others: Vec<String> = if def.postings.peek().given_back() == plan.given_back {
+            Vec::new()
+        } else {
+            nearest
+                .iter()
+                .filter(|r| {
+                    only.is_some_and(|only| !only.contains(&r.key))
+                        || crate::commands::search::with_doc(db, def, &r.key, now, |fields, _| {
+                            crate::vector::filter::eval(filter, fields)
+                        }) == Some(false)
+                })
+                .map(|r| r.key.clone())
+                .collect()
+        };
+        if (gone.is_empty() && hidden.is_empty() && others.is_empty()) || cut {
             let mut nearest = nearest;
-            nearest.retain(|r| !hidden.contains(&r.key));
+            nearest.retain(|r| !hidden.contains(&r.key) && !others.contains(&r.key));
             return Some((nearest, cut));
         }
-        for key in &hidden {
+        for key in hidden.iter().chain(&others) {
             if let Some(id) = def.postings.peek().id(key) {
                 plan.ids.unset(id);
             }
@@ -2179,8 +2202,16 @@ pub(crate) fn knn_measured(
     metric: &crate::vector::DistanceMetric,
     deadline: Option<std::time::Instant>,
 ) -> (Vec<crate::vector::KnnResult>, bool) {
-    let keys = crate::commands::search::keys_of(def, ids);
     let query = crate::vector::PreparedQuery::new(metric, &knn.vector);
+    let graph = match live {
+        // From each id to its slot, in the order of the ids, as the keys
+        // were before: see `vector::flat`.
+        LiveIndex::Flat(idx) => {
+            return idx.nearest_of_docs(&query, knn.k, ids, &def.postings, deadline);
+        }
+        LiveIndex::Hnsw(graph) => graph,
+    };
+    let keys = crate::commands::search::keys_of(def, ids);
     let dim = knn.vector.len();
     let mut best = Best::new(knn.k);
     // The index's locks are let go between runs, for writers.
@@ -2191,50 +2222,35 @@ pub(crate) fn knn_measured(
             cut = true;
             break;
         }
-        match live {
-            LiveIndex::Flat(idx) => {
-                let vectors = idx.vectors.read();
-                for key in run {
-                    if let Some(v) = vectors.get(&**key)
-                        && v.len() == dim
-                    {
-                        best.offer(query.to_raw(v), key);
+        // A vector waiting to be linked is the key's latest: it is measured
+        // where it waits, and the graph not asked.
+        let mut run: Vec<&Arc<str>> = run.iter().collect();
+        if !graph.backlog.is_empty() {
+            let waiting = graph.backlog.read();
+            run.retain(|key| match waiting.get(&***key) {
+                Some(w) => {
+                    if w.vector.len() == dim {
+                        best.offer(query.to_unit(&w.vector), key);
                     }
+                    false
                 }
-            }
-            LiveIndex::Hnsw(graph) => {
-                // A vector waiting to be linked is the key's latest: it is
-                // measured where it waits, and the graph not asked.
-                let mut run: Vec<&Arc<str>> = run.iter().collect();
-                if !graph.backlog.is_empty() {
-                    let waiting = graph.backlog.read();
-                    run.retain(|key| match waiting.get(&***key) {
-                        Some(w) => {
-                            if w.vector.len() == dim {
-                                best.offer(query.to_unit(&w.vector), key);
-                            }
-                            false
-                        }
-                        None => true,
-                    });
-                }
-                // The two locks one after the other, never together: an
-                // insert takes the ids' for writing while it holds the
-                // nodes'.
-                let found: Vec<(usize, &Arc<str>)> = {
-                    let key_to_id = graph.key_to_id.read();
-                    run.into_iter()
-                        .filter_map(|key| key_to_id.get(&**key).map(|&id| (id, key)))
-                        .collect()
-                };
-                let nodes = graph.nodes.read();
-                for (id, key) in found {
-                    if let Some(v) = graph.vector_of(&nodes, id, key)
-                        && v.len() == dim
-                    {
-                        best.offer(query.to_unit(v), key);
-                    }
-                }
+                None => true,
+            });
+        }
+        // The two locks one after the other, never together: an insert
+        // takes the ids' for writing while it holds the nodes'.
+        let found: Vec<(usize, &Arc<str>)> = {
+            let key_to_id = graph.key_to_id.read();
+            run.into_iter()
+                .filter_map(|key| key_to_id.get(&**key).map(|&id| (id, key)))
+                .collect()
+        };
+        let nodes = graph.nodes.read();
+        for (id, key) in found {
+            if let Some(v) = graph.vector_of(&nodes, id, key)
+                && v.len() == dim
+            {
+                best.offer(query.to_unit(v), key);
             }
         }
     }
@@ -2350,6 +2366,8 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
         if keeps_keys {
             def.docs.add(key);
         }
+        // The id a FLAT index records for the document's slot.
+        let mut doc = None;
         for w in &work {
             let raw_bytes = match inner.get_bytes(&w.name) {
                 Some(b) => b,
@@ -2360,7 +2378,19 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
             };
 
             match &w.live {
-                LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
+                LiveIndex::Flat(idx) => {
+                    let doc = *doc.get_or_insert_with(|| {
+                        if keeps_keys {
+                            crate::vector::postings::NO_DOC
+                        } else {
+                            def.postings
+                                .peek()
+                                .id(key)
+                                .unwrap_or(crate::vector::postings::NO_DOC)
+                        }
+                    });
+                    idx.insert_doc(key, &vec, doc);
+                }
                 LiveIndex::Hnsw(idx) => {
                     crate::vector::hnsw_insert(idx, key.to_string(), vec, &w.metric);
                 }
@@ -3016,5 +3046,151 @@ mod nearest_shown_tests {
             |key| key_number(key) != 7 && key_number(key) < 90,
         );
         assert_eq!(keys(&found), [7, 90, 91, 92]);
+    }
+}
+
+/// A document deleted, and another written, between a filtered KNN's plan
+/// and its search: the new one takes the id the old one gave back (postings
+/// give the last id given back first), and the slot. It does not match the
+/// filter, and it is the nearest of all: it must not be among the hits.
+#[cfg(test)]
+mod id_given_back_tests {
+    use crate::commands::ctx::{Ctx, NoopAofSender};
+    use std::sync::Arc;
+
+    #[test]
+    fn a_document_that_took_a_given_back_id_is_not_a_hit_of_the_filter() {
+        let _pause = crate::pause::TEST_LOCK.lock();
+        fn leak<T>(value: T) -> &'static T {
+            Box::leak(Box::new(value))
+        }
+        let store = leak(crate::store::new_store(1));
+        let lastsave = leak(Arc::new(parking_lot::RwLock::new(0i64)));
+        let hub = leak(crate::replication::HubTx::channel());
+        let config = leak(Arc::new(crate::config::Config::default()));
+        let started_at = leak(std::time::Instant::now());
+        let index_store = leak(crate::vector::new_index_store());
+        // As a server pairs them: a key that leaves its shard leaves its indexes.
+        crate::vector::register_index_store(store, index_store);
+        let dict_store = leak(crate::vector::new_dict_store());
+        let wait_table = leak(Arc::new(crate::wait_table::WaitTable::new()));
+        let ts_index = leak(crate::store::new_ts_index());
+        let pubsub = leak(crate::pubsub::PubSubHub::new());
+        let repl_state = leak(Arc::new(crate::replication::ReplState::new_master()));
+        let acl_store = leak(crate::acl::new_acl_store(""));
+        let acl_log = leak(crate::acl::new_acl_log());
+        let slowlog = leak(crate::slowlog::new_slowlog(u64::MAX, 0));
+        let latency = leak(crate::latency::new_latency_tracker());
+        let compaction = leak(crate::vector::new_compaction_channel());
+        let cluster = leak(Arc::new(crate::cluster::ClusterState::new_disabled()));
+        let client_registry = leak(crate::client_registry::new_client_registry());
+        let monitor_registry = leak(crate::monitor::new_monitor_registry());
+        let tracking_table = leak(crate::tracking::new_tracking_table());
+        let run: &'static dyn Fn(&[&[u8]]) -> Vec<u8> = leak(move |args: &[&[u8]]| {
+            let mut selected_db = 0usize;
+            crate::commands::execute_command(Ctx {
+                cmd: args.to_vec(),
+                store,
+                lastsave,
+                selected_db: &mut selected_db,
+                aof_tx: &NoopAofSender,
+                aof_enabled: false,
+                config,
+                started_at,
+                index_store,
+                dict_store,
+                wait_table,
+                ts_index,
+                pubsub,
+                hub_tx: &hub.0,
+                repl_state,
+                watch_registry: &crate::watch::NoopWatchRegistry,
+                client_id: 0,
+                client_registry,
+                resp: 2,
+                acl_store,
+                acl_log,
+                slowlog,
+                latency,
+                compaction_tx: &compaction.0,
+                cluster,
+                bypass_cluster_check: false,
+                apply_replication: false,
+                skip_write_side_effects: false,
+                peer_addr: "127.0.0.1:1",
+                peer_ipv6: false,
+                monitor_registry,
+                authenticated_user: "default",
+                tracking_table,
+                blocking: None,
+            })
+        });
+        let blob = |v: [f32; 4]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let ok = run(&[
+            b"FT.CREATE",
+            b"reuse",
+            b"ON",
+            b"HASH",
+            b"PREFIX",
+            b"1",
+            b"d:",
+            b"SCHEMA",
+            b"t",
+            b"TAG",
+            b"v",
+            b"VECTOR",
+            b"FLAT",
+            b"6",
+            b"TYPE",
+            b"FLOAT32",
+            b"DIM",
+            b"4",
+            b"DISTANCE_METRIC",
+            b"L2",
+        ]);
+        assert_eq!(ok, b"+OK\r\n");
+        for i in 0..10u8 {
+            let key = format!("d:a:{i}");
+            let v = blob([1.0 + f32::from(i); 4]);
+            run(&[b"HSET", key.as_bytes(), b"t", b"a", b"v", &v]);
+        }
+        let q = blob([0.0; 4]);
+        let search = || -> String {
+            let reply = run(&[
+                b"FT.SEARCH",
+                b"reuse",
+                b"(@t:{a})=>[KNN 3 @v $q]",
+                b"PARAMS",
+                b"2",
+                b"q",
+                &q,
+                b"NOCONTENT",
+                b"DIALECT",
+                b"2",
+            ]);
+            String::from_utf8_lossy(&reply).into_owned()
+        };
+        assert!(search().contains("d:a:0"));
+        // Between the plan and the search: d:a:9 leaves, and d:new:9, t=b,
+        // at the query's own vector, takes its id and its slot.
+        let at_q = q.clone();
+        crate::test_hooks::set("knn_planned: planned", move || {
+            run(&[b"DEL", b"d:a:9"]);
+            run(&[b"HSET", b"d:new:9", b"t", b"b", b"v", &at_q]);
+            // What the postings queued meanwhile (their merging thread can
+            // hold their lock), applied.
+            let def = index_store.read().get("reuse").cloned().unwrap();
+            let postings = def.postings.write();
+            def.postings.done(postings);
+        });
+        let reply = search();
+        crate::test_hooks::clear("knn_planned: planned");
+        assert!(
+            !reply.contains("d:new:"),
+            "a hit (@t:{{a}}) does not match: {reply:?}"
+        );
+        for i in 0..3 {
+            assert!(reply.contains(&format!("d:a:{i}\r\n")), "{reply:?}");
+        }
     }
 }
