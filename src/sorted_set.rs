@@ -467,6 +467,67 @@ impl SortedSetInner {
         }
     }
 
+    /// The ranks `start..end` (`start <= end`) of the members from `from`
+    /// to `to`, each a `(score, member)` bound: a block's two binary
+    /// searches, the large form's two walks down its index. No member
+    /// between them is read, so a `LIMIT` offset is added to `start`, not
+    /// stepped over.
+    pub fn rank_range(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> (usize, usize) {
+        match &self.repr {
+            Repr::Packed(block) => {
+                let start = match from {
+                    Bound::Unbounded => 0,
+                    Bound::Included(p) => block.lower_bound(p.score, p.member, false),
+                    Bound::Excluded(p) => block.lower_bound(p.score, p.member, true),
+                };
+                let end = match to {
+                    Bound::Unbounded => block.len(),
+                    Bound::Included(p) => block.lower_bound(p.score, p.member, true),
+                    Bound::Excluded(p) => block.lower_bound(p.score, p.member, false),
+                };
+                (start, end.max(start))
+            }
+            Repr::Large(large) => large.rank_range(from, to),
+        }
+    }
+
+    /// [`rank_range`](Self::rank_range) of a range of keys as
+    /// `range_by_score` takes it.
+    pub fn rank_range_by_score<R>(&self, range: R) -> (usize, usize)
+    where
+        R: RangeBounds<(OrderedFloat<f64>, ZMember)>,
+    {
+        self.rank_range(probe(range.start_bound()), probe(range.end_bound()))
+    }
+
+    /// Like `iter`, limited to ranks `start..end` (`end` not included;
+    /// both cut to the set).
+    pub fn ranks(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> impl DoubleEndedIterator<Item = (Member<'_>, f64)> {
+        let end = end.min(self.len());
+        let start = start.min(end);
+        match &self.repr {
+            Repr::Packed(block) => Either::A(Packed(block.range(start, end))),
+            Repr::Large(large) => Either::B(
+                large
+                    .range_by_rank(start, end)
+                    .map(|(member, score)| (Member::Bytes(member), score)),
+            ),
+        }
+    }
+
+    /// The lowest and the highest score, `None` if the set is empty: the
+    /// scores are all one when the two are equal.
+    pub fn score_ends(&self) -> Option<(f64, f64)> {
+        let mut all = self.iter();
+        let (_, low) = all.next()?;
+        let high = all.next_back().map_or(low, |(_, high)| high);
+        Some((low, high))
+    }
+
     /// The indexes of a block that a range of keys covers: `from..to`.
     fn packed_bounds<R>(block: &PackedZset, range: &R) -> (usize, usize)
     where

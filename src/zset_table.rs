@@ -240,6 +240,18 @@ pub unsafe trait ScoreOrder: Default + Send + Sync {
     /// `hi'` the least score past it), or of members within one score.
     fn range(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> Self::Range<'_>;
 
+    /// The ranks `start..end` that `range` covers from `from` to `to`
+    /// (`start <= end`): what a `LIMIT` offset is added to. By default
+    /// counted through `range`; an index that knows its ranks finds them.
+    fn rank_range(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> (usize, usize) {
+        let before = match from {
+            Bound::Unbounded => 0,
+            Bound::Included(probe) => self.range(Bound::Unbounded, Bound::Excluded(probe)).count(),
+            Bound::Excluded(probe) => self.range(Bound::Unbounded, Bound::Included(probe)).count(),
+        };
+        (before, before + self.range(from, to).count())
+    }
+
     /// The index of `sorted`: each a different member, in strictly
     /// increasing order.
     fn from_sorted(sorted: Vec<(f64, EntryRef)>) -> Self;
@@ -662,10 +674,15 @@ unsafe impl ScoreOrder for CountedOrder {
     }
 
     fn range(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> Self::Range<'_> {
+        let (start, end) = self.rank_range(from, to);
+        self.0.range_by_rank(start, end)
+    }
+
+    #[inline]
+    fn rank_range(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> (usize, usize) {
         let from = from.map(|probe| (probe.score, probe.member));
         let to = to.map(|probe| (probe.score, probe.member));
-        let (start, end) = self.0.rank_range(from, to);
-        self.0.range_by_rank(start, end)
+        self.0.rank_range(from, to)
     }
 
     fn from_sorted(sorted: Vec<(f64, EntryRef)>) -> Self {
@@ -992,6 +1009,13 @@ impl<O: ScoreOrder, A: Memory> Large<O, A> {
     #[inline]
     pub fn count(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> usize {
         self.index.range(from, to).count()
+    }
+
+    /// The ranks `start..end` of the members from `from` to `to`: one walk
+    /// down for each end, no member between them read.
+    #[inline]
+    pub fn rank_range(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> (usize, usize) {
+        self.index.rank_range(from, to)
     }
 
     /// Members and scores in no particular order: one walk of the table.
