@@ -669,14 +669,42 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   key up, as Redis does, and stop only at a key of another type: `ZINTER 2
   nokey s` with `s` a string answers `WRONGTYPE` (it answered an empty array),
   and `ZDIFF` counts each key once.
+  The other read commands count too, each where it looks its key up:
+  `GETBIT`, `BITCOUNT`, `BITPOS`, `BITFIELD_RO` and `BITFIELD` with only
+  `GET`s, `BITOP`'s sources, `PFCOUNT`, `PFMERGE` (its destination and each
+  source, as Redis reads them), `LCS` (both keys, before either's type is
+  refused), `HTTL`, `HPTTL`, `HEXPIRETIME`, `HPEXPIRETIME`, `XLEN`,
+  `XRANGE`, `XREVRANGE`, `XINFO`, `XPENDING`, `XACK`, `XCLAIM`,
+  `XAUTOCLAIM`, `XREAD` and `XREADGROUP` (each stream twice, as Redis looks
+  it up once for the IDs and once for the entries; a `BLOCK` that times
+  out adds nothing, one a write ends counts again, as in Redis), `GEOPOS`, `GEODIST`,
+  `GEOHASH`, `GEOSEARCH`, `GEOSEARCHSTORE`, `GEORADIUS`,
+  `GEORADIUSBYMEMBER` and their `_RO` forms, `OBJECT REFCOUNT`, `SORT` and
+  `SORT_RO` (and each key a `BY` or `GET` pattern names: `SORT l BY w_* GET
+  o_*` of three elements with no `w_` or `o_` keys is 1 hit and 6 misses),
+  `DIGEST`, the JSON reads (`JSON.GET`, `JSON.MGET`, `JSON.TYPE`,
+  `JSON.STRLEN`, `JSON.OBJLEN`, `JSON.ARRLEN`, `JSON.OBJKEYS`,
+  `JSON.ARRINDEX`, `JSON.RESP`, `JSON.DEBUG MEMORY`), `TS.GET`, `TS.RANGE`,
+  `TS.REVRANGE`, the vector-set reads (`VCARD`, `VDIM`, `VEMB`, `VSIM`,
+  `VINFO`, `VISMEMBER`, `VRANDMEMBER`, `VLINKS`, `VGETATTR`, `VRANGE`), and
+  the reads of Bloom and cuckoo filters, count-min sketches, top-k and
+  t-digests (`BF.EXISTS`, `BF.MEXISTS`, `BF.INFO`, `BF.CARD`, `BF.SCANDUMP`,
+  `BF.DEBUG`, `CF.EXISTS`, `CF.MEXISTS`, `CF.COUNT`, `CF.INFO`,
+  `CF.SCANDUMP`, `CF.DEBUG`, `CMS.QUERY`, `CMS.INFO`, `TOPK.QUERY`,
+  `TOPK.COUNT`, `TOPK.LIST`, `TOPK.INFO`, and `TDIGEST`'s `MIN`, `MAX`,
+  `QUANTILE`, `CDF`, `RANK`, `REVRANK`, `BYRANK`, `BYREVRANK`,
+  `TRIMMED_MEAN` and `INFO`). The plain `GET` and `SET` code is unchanged.
   `tests/stats_keyspace.rs` holds the counts Redis 8.12.0 gives for 159
   commands, including the set and sorted-set algebra and STORE forms, a script, a
-  transaction, expired keys and a blocking pop served at once and later. The bit commands, `PFCOUNT`, `XLEN`, `GEOPOS`, `LCS`, `SORT` and
-  the field-expiry reads (`HTTL` and its relatives) do not count yet. Redis
-  counts a key looked up before an argument is found not to be a number
-  (`LINDEX l notanint`) or a `WEIGHTS`, `AGGREGATE` or `LIMIT` is found not to
-  parse (`ZUNION`, `ZINTER`, `ZINTERCARD`); those commands read their
-  arguments first and count nothing.
+  transaction, expired keys and a blocking pop served at once and later,
+  and for 332 more on fresh keys of every type (a key that is there, one
+  that is not, one of another type). A probe of 588 such rows against Redis
+  8.12 differs in `TS.MGET` and `TS.MRANGE` only, which count 2 hits for
+  each series a filter matches in Redis and nothing here. Redis also counts
+  a key looked up before an argument is found not to be a number (`LINDEX l
+  notanint`) or a `WEIGHTS`, `AGGREGATE` or `LIMIT` is found not to parse
+  (`ZUNION`, `ZINTER`, `ZINTERCARD`); those commands read their arguments
+  first and count nothing.
 
 - **io_uring workers finish a waiting socket read without interrupting the
   worker (#1015).** Each worker's ring is made with
@@ -1876,16 +1904,44 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Misskey's home timelines (#1022), 10,000 lists of 300 ten-byte ids on a
   `Standard_D4s_v5`, `--threads 4`, bytes of `used_memory` / of RSS an
   element, default build: loaded with `RPUSH` one element a command, 59.7 /
-  76.1 in 1.2.2, 14.1 / 14.9 now, 13.9 / 14.3 in Redis 8.10.2; one `RPUSH`
-  of 300 a list, 48.4 / 64.5, 13.4 / 13.9, 13.9 / 14.4. After every list
+  76.1 in 1.2.2, 13.8 / 14.1 now, 13.9 / 14.3 in Redis 8.10.2; one `RPUSH`
+  of 300 a list, 48.4 / 64.5, 13.3 / 13.5, 13.9 / 14.4. After every list
   has taken 3,000 `LPUSH` + `LTRIM key 0 299` pairs: 64.4 / 96.6 in 1.2.2,
-  14.2 / 27.0 now, 13.9 / 14.3 in Redis (on the `lua,tls` builds, which use
-  mimalloc, the RSS is 17.7 to 20.6, where it was 23.0 to 25.7 before the
-  chunks of a list of at least 192 elements were opened at the front with
-  room for a whole chunk). 32-byte elements 35.4 / 35.9 (Redis 34.8 / 35.6),
-  64-byte 67.4 / 67.9 (69.0 / 70.6), lists of 30 ten-byte elements 16.9 /
-  18.8 (14.8 / 15.1). Suite `52-small-lists-memory`
-  measures these and fails a build that measures above these numbers.
+  13.8 / 16.7 now, 13.9 / 14.4 in Redis (16.9 on the `lua,tls` builds;
+  Redis 8.12: 13.9 / 14.5). 32-byte elements 35.2 / 35.6 (Redis 34.8 /
+  35.6), 64-byte 67.3 / 69.6 (69.0 / 70.6), and loaded one element a
+  command 68.6 / 71.2 (`lua,tls`: 71.4; Redis 8.12 69.0 / 70.7), lists of
+  30 ten-byte elements 17.3 / 18.2 (14.8 / 15.1). Suite
+  `52-small-lists-memory` measures these and fails a build that measures
+  above these numbers, or whose timeline holds more than 1.4x Redis's RSS.
+  - A chunk's bytes are a block of slabs of their own size classes
+    (`value_slab::chunk_class_of`: the entry pool's sizes up to 4 KiB, then
+    128 bytes apart up to 8 KiB; above that, a full chunk of elements of
+    127 bytes or more, the system allocator's). A slab takes back a block
+    freed on any thread, is handed to any thread once it has room and goes
+    back to the system once it is empty, so the chunks a timeline gives up
+    at its tail are what it takes at its head. In the system allocator the
+    timeline above held 27.0 bytes an element resident on the default build
+    (glibc: the arena of the thread that loaded the lists kept the chunks
+    the timeline gave up, in 19,915 pieces between the lists' other blocks,
+    and `malloc_trim` gave none of it back) and 18.4 to 19.7 on the `lua,tls`
+    builds (mimalloc); 64-byte elements loaded one a command held 72.0 and
+    90.4, the same timeline of 64-byte elements 98.4 to 106.1 (88.1 now;
+    Redis 8.12 77.8 to 88.9). The slabs are counted in INFO
+    `value_slab_pool_bytes`, and compaction leaves them alone, as the entry
+    pool's.
+  - A chunk opened at either end gets room for a quarter of the full chunk
+    beside it: a list of 200 ten-byte elements takes 2,948 bytes after one
+    `LPUSH` (3,596 with the whole chunk's room a chunk opened at the front
+    got, for lists of 192 elements or more, before the chunks were in
+    slabs). The worst room a list holds, its chunks' bytes over its frames'
+    (the deque of chunks included), over a load one element a command, a
+    load in one `RPUSH`, one `LPUSH`, and 192 `LPUSH` + `LTRIM` pairs, is
+    at a point of the pairs for each of these (in brackets: before this
+    change, the same measurement): 200 x 10 B 1,104 bytes, 31.5 % of the list's allocations
+    (1,744, 42.1 %); 300 x 10 B 1,056, 22.7 % (1,312, 26.7 %); 300 x 64 B
+    3,672, 15.6 % (3,686, 15.7 %); 300 x 100 B 5,480, 15.2 % (5,531,
+    15.3 %).
   - A push or a pop at either end moves nothing in its chunk: each chunk
     has room at both ends. Element `i` is found by arithmetic while the
     chunks between the ends are full; an `LINSERT` or `LREM` in the middle

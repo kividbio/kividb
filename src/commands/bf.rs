@@ -411,7 +411,7 @@ fn probes(ctx: &Ctx) -> Probes {
 /// growth, or, if there is none, the filter `make` would make.
 fn bytes_to_add(ctx: &Ctx, key: &[u8], make: Option<&Params>, items: usize) -> u64 {
     let items = items as u64;
-    match with_filter(ctx, key, |chain| chain.bytes_to_add(items)) {
+    match peek_filter(ctx, key, |chain| chain.bytes_to_add(items)) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => make.map_or(0, |p| BloomChain::bytes_to_make(p, items)),
         Err(()) => 0,
@@ -490,12 +490,41 @@ fn with_filter<T>(
     key: &[u8],
     f: impl FnOnce(&BloomChain) -> T,
 ) -> Result<Option<T>, ()> {
+    look_at_filter(ctx, key, true, f)
+}
+
+/// [`with_filter`] for a command that writes and looks first (`BF.ADD`'s
+/// room, `BF.LOADCHUNK`): not counted in `keyspace_hits` / `keyspace_misses`,
+/// which count reads.
+fn peek_filter<T>(
+    ctx: &Ctx,
+    key: &[u8],
+    f: impl FnOnce(&BloomChain) -> T,
+) -> Result<Option<T>, ()> {
+    look_at_filter(ctx, key, false, f)
+}
+
+/// The filter at `key` handed to `f`; a read counted (`counted`) as Redis
+/// counts one: a hit when the key is there, whatever its type.
+fn look_at_filter<T>(
+    ctx: &Ctx,
+    key: &[u8],
+    counted: bool,
+    f: impl FnOnce(&BloomChain) -> T,
+) -> Result<Option<T>, ()> {
     if crate::commands::helpers::lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
+        if counted {
+            crate::stats::record_miss();
+        }
         return Ok(None);
     }
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let map = read_lock!(shard);
-    match map.get(key) {
+    let found = map.get(key);
+    if counted {
+        crate::stats::record_lookup(found.is_some());
+    }
+    match found {
         None => Ok(None),
         Some(ValueRef::Sketch(sketch)) => match &*sketch.read() {
             Sketch::Bloom(chain) => Ok(Some(f(chain))),
@@ -1074,7 +1103,7 @@ fn loadchunk(ctx: &mut Ctx) -> Vec<u8> {
         if iter == 1 {
             BloomChain::header_bytes(data)
         } else {
-            with_filter(ctx, key, |chain| chain.chunk_copy_bytes(iter, data.len()))
+            peek_filter(ctx, key, |chain| chain.chunk_copy_bytes(iter, data.len()))
                 .ok()
                 .flatten()
                 .unwrap_or(0)

@@ -687,8 +687,10 @@ mod tests {
     #[test]
     fn the_handle_is_no_bigger_than_a_chunk_and_a_tag() {
         // A list of several chunks keeps its length and its run behind a
-        // box: the list is one chunk's size, and the two forms one word more.
-        assert_eq!(std::mem::size_of::<PackedList>(), 32);
+        // box: the list is one chunk's size (a chunk's buffer keeps its
+        // length and capacity in 32 bits each), and the two forms one word
+        // more than the larger.
+        assert_eq!(std::mem::size_of::<PackedList>(), 24);
         assert!(std::mem::size_of::<ListValues>() <= 40);
     }
 
@@ -834,11 +836,13 @@ mod tests {
                 }
                 assert_same(&back, &model_back, &format!("back {start} {n}"));
                 assert_same(&front, &model_front, &format!("front {start} {n}"));
-                // Exact buffers for a batch that fills its chunks.
+                // Buffers of exactly the frames (in their block's class) for a
+                // batch that fills its chunks.
                 if start == 0 && n == 64 {
                     let frames: usize = batch.iter().map(|e| e.len() + 2).sum();
-                    assert_eq!(back.packed_bytes(), Some(frames));
-                    assert_eq!(front.packed_bytes(), Some(frames));
+                    let block = crate::packed_list::block_bytes(frames);
+                    assert_eq!(back.packed_bytes(), Some(block));
+                    assert_eq!(front.packed_bytes(), Some(block));
                 }
             }
         }
@@ -1085,5 +1089,180 @@ mod tests {
             }
             assert_same(&list, &model, &format!("seed {seed} end"));
         }
+    }
+
+    /// The list commands' operations at random against a `VecDeque`, with
+    /// elements of 1 to 200 bytes: one- and two-byte lengths, chunks in slab
+    /// blocks of both kinds and in the system allocator's (`Buf`), in phases
+    /// that cross the chunk-count boundaries both ways, and a timeline
+    /// (`LPUSH`, then `LTRIM 0 cap-1`) between them.
+    #[test]
+    fn it_matches_a_model_with_elements_of_1_to_200_bytes() {
+        for seed in 0..12u64 {
+            let mut state = 0x2545_F491_4F6C_DD1Du64 ^ (seed.wrapping_mul(0x9E37_79B9) + 1);
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let mut list = ListValues::new();
+            let mut model: VecDeque<Vec<u8>> = VecDeque::new();
+            let cap = CHUNK_ENTRIES * (1 + seed as usize % 5) + 7;
+            for step in 0..5_000u64 {
+                let r = next();
+                let len = 1 + (r >> 8) as usize % 200;
+                let mut value: Vec<u8> = (0..len)
+                    .map(|i| b'a' + ((r >> 20) as usize + i) as u8 % 7)
+                    .collect();
+                // Now and then an element the list holds, for LREM and LPOS.
+                if !model.is_empty() && (r >> 40) % 4 == 0 {
+                    value = model[(r >> 44) as usize % model.len()].clone();
+                }
+                let what = format!("seed {seed} step {step}");
+                // Phases of 500 steps: growing, shrinking, a timeline.
+                let phase = (step / 500) % 3;
+                if phase == 2 {
+                    list.push_front(&value);
+                    model.push_front(value);
+                    if model.len() > cap {
+                        list.retain_range(0, cap);
+                        model.truncate(cap);
+                    }
+                } else {
+                    match r % 16 {
+                        0..=3 if phase == 0 => {
+                            list.push_back(&value);
+                            model.push_back(value);
+                        }
+                        4..=5 if phase == 0 || r % 5 == 0 => {
+                            list.push_front(&value);
+                            model.push_front(value);
+                        }
+                        0..=5 => {
+                            let got = list.pop_back_with(|p| p.to_vec());
+                            assert_eq!(got, model.pop_back(), "{what}");
+                        }
+                        6..=7 => {
+                            let got = list.pop_front_with(|p| p.to_vec());
+                            assert_eq!(got, model.pop_front(), "{what}");
+                        }
+                        8 if !model.is_empty() => {
+                            let i = (r >> 32) as usize % model.len();
+                            assert!(list.set(i, &value), "{what}");
+                            model[i] = value;
+                        }
+                        9 => {
+                            let i = (r >> 32) as usize % (model.len() + 1);
+                            assert!(list.insert(i, &value), "{what}");
+                            model.insert(i, value);
+                        }
+                        10 => {
+                            let count = ((r >> 32) % 5) as i64 - 2;
+                            let removed = list.remove_matching(&value, count);
+                            let limit = if count == 0 {
+                                usize::MAX
+                            } else {
+                                count.unsigned_abs() as usize
+                            };
+                            let mut want = 0;
+                            if count >= 0 {
+                                let mut i = 0;
+                                while i < model.len() && want < limit {
+                                    if model[i] == value {
+                                        model.remove(i);
+                                        want += 1;
+                                    } else {
+                                        i += 1;
+                                    }
+                                }
+                            } else {
+                                let mut i = model.len();
+                                while i > 0 && want < limit {
+                                    i -= 1;
+                                    if model[i] == value {
+                                        model.remove(i);
+                                        want += 1;
+                                    }
+                                }
+                            }
+                            assert_eq!(removed, want, "{what}");
+                        }
+                        11 if !model.is_empty() => {
+                            let n = model.len();
+                            let from = (r >> 32) as usize % (n / 6 + 1);
+                            let to = (n - (r >> 48) as usize % (n / 6 + 1)).max(from);
+                            list.retain_range(from, to);
+                            model = model.range(from..to).cloned().collect();
+                        }
+                        12 => {
+                            let (from_left, to_left) = ((r >> 33) & 1 == 1, (r >> 34) & 1 == 1);
+                            let got = list.rotate(from_left, to_left, |v| v.to_vec());
+                            let want = if from_left {
+                                model.pop_front()
+                            } else {
+                                model.pop_back()
+                            };
+                            assert_eq!(got, want, "{what}");
+                            if let Some(e) = want {
+                                if to_left {
+                                    model.push_front(e);
+                                } else {
+                                    model.push_back(e);
+                                }
+                            }
+                        }
+                        13 => {
+                            assert_eq!(
+                                list.position(&value),
+                                model.iter().position(|e| *e == value),
+                                "{what}"
+                            );
+                        }
+                        14 if !model.is_empty() => {
+                            let n = model.len();
+                            let from = (r >> 32) as usize % n;
+                            let to = from + (r >> 48) as usize % (n - from + 1);
+                            let got: Vec<&[u8]> = list.range(from, to).map(Value::bytes).collect();
+                            let want: Vec<&[u8]> =
+                                model.range(from..to).map(Vec::as_slice).collect();
+                            assert_eq!(got, want, "{what}");
+                        }
+                        _ => {
+                            if !model.is_empty() {
+                                let i = (r >> 32) as usize % model.len();
+                                assert_eq!(
+                                    list.get(i).map(Value::bytes),
+                                    Some(model[i].as_slice()),
+                                    "{what}"
+                                );
+                            }
+                        }
+                    }
+                }
+                if model.is_empty() && list.is_empty() && r % 3 == 0 {
+                    list = ListValues::new();
+                }
+                list.check_shape();
+                if step % 61 == 0 {
+                    assert_same(&list, &model, &what);
+                    // A copy (`COPY`, a snapshot's fork) is the same list.
+                    assert_same(&list.clone(), &model, &what);
+                }
+            }
+            assert_same(&list, &model, &format!("seed {seed} end"));
+            assert!(
+                list.is_packed(),
+                "seed {seed}: elements of 200 bytes are packed"
+            );
+        }
+        // Chunks crossed 8 KiB both ways: from a slab block into the system
+        // allocator's as they grew, and back as `LTRIM` and `LREM` gave
+        // their room back.
+        let (up, down) = crate::packed_list::crossings::counts();
+        assert!(
+            up > 0 && down > 0,
+            "crossings of 8 KiB: {up} up, {down} down"
+        );
     }
 }

@@ -296,6 +296,474 @@ const EXPIRED: &[(&[&str], u64, u64)] = &[
     (&["TTL", "e1"], 0, 1),
 ];
 
+/// Keys of every type, made again (after `FLUSHALL`) for each row of
+/// [`FRESH`]: `s` a string, `b` one with bit 7 set, `p` a HyperLogLog, `h` a
+/// hash of `f` and `g` (`g` with a time to live), `st`, `st2`, `z`, `z2`, `l`
+/// and `l2` as above (`l2` of numbers), `x` a stream with group `g` that
+/// consumer `c1` has read, `geo` two places, `j` a JSON document, `ts` a time
+/// series labelled `a=b`, `vs` a vector set of `e1` and `e2`, `bf`, `cf`,
+/// `cms`, `tk` and `td` a Bloom filter, a cuckoo filter, a count-min sketch,
+/// a top-k and a t-digest.
+#[rustfmt::skip]
+const FIXTURES: &[&[&str]] = &[
+    &["SET", "s", "hello"], &["SET", "n", "5"], &["SETBIT", "b", "7", "1"], &["PFADD", "p", "a", "b"],
+    &["HSET", "h", "f", "1", "g", "2"], &["HEXPIRE", "h", "1000", "FIELDS", "1", "g"],
+    &["SADD", "st", "a", "b"], &["SADD", "st2", "b", "c"],
+    &["ZADD", "z", "1", "a", "2", "b"], &["ZADD", "z2", "1", "b", "2", "c"],
+    &["RPUSH", "l", "c", "a", "b"], &["RPUSH", "l2", "3", "1", "2"],
+    &["XADD", "x", "1-1", "f", "v"], &["XGROUP", "CREATE", "x", "g", "0"],
+    &["XREADGROUP", "GROUP", "g", "c1", "COUNT", "1", "STREAMS", "x", ">"],
+    &["GEOADD", "geo", "13.361389", "38.115556", "Palermo", "15.087269", "37.502669", "Catania"],
+    &["JSON.SET", "j", "$", r#"{"a":1,"arr":[1,2],"o":{"k":"v"},"str":"abc"}"#],
+    &["TS.CREATE", "ts", "LABELS", "a", "b"], &["TS.ADD", "ts", "1", "1"],
+    &["VADD", "vs", "VALUES", "2", "1", "0", "e1"], &["VADD", "vs", "VALUES", "2", "0", "1", "e2"],
+    &["BF.ADD", "bf", "a"], &["CF.ADD", "cf", "a"], &["CMS.INITBYDIM", "cms", "10", "2"],
+    &["TOPK.RESERVE", "tk", "3"], &["TOPK.ADD", "tk", "a"],
+    &["TDIGEST.CREATE", "td"], &["TDIGEST.ADD", "td", "1", "2"],
+];
+
+/// (command, hits, misses) from Redis 8.12.0, each row on fresh
+/// [`FIXTURES`] after `CONFIG RESETSTAT`: a key that is there (`hit`), one
+/// that is not (`nokey`) and one of another type, for the bit commands,
+/// `PFCOUNT` and `PFMERGE`, `LCS`, the field-expiry reads, the streams',
+/// the geo commands', `OBJECT REFCOUNT`, `SORT` and `SORT_RO` (the keys its
+/// patterns name count too), `DIGEST`, and JSON's, time series', vector
+/// sets' and the probabilistic types' reads. Writes that read another key
+/// first count that key (`BITOP`, `PFMERGE`, `GEOSEARCHSTORE`), and
+/// `XREAD` and `XREADGROUP` count a stream twice.
+#[rustfmt::skip]
+const FRESH: &[(&[&str], u64, u64)] = &[
+    (&["GETBIT", "b", "7"], 1, 0),
+    (&["GETBIT", "nokey", "7"], 0, 1),
+    (&["GETBIT", "h", "7"], 1, 0),
+    (&["BITCOUNT", "b"], 1, 0),
+    (&["BITCOUNT", "nokey"], 0, 1),
+    (&["BITCOUNT", "h"], 1, 0),
+    (&["BITCOUNT", "b", "0", "-1"], 1, 0),
+    (&["BITCOUNT", "nokey", "0", "-1"], 0, 1),
+    (&["BITCOUNT", "h", "0", "-1"], 1, 0),
+    (&["BITPOS", "b", "1"], 1, 0),
+    (&["BITPOS", "nokey", "1"], 0, 1),
+    (&["BITPOS", "h", "1"], 1, 0),
+    (&["BITPOS", "b", "0", "0", "-1"], 1, 0),
+    (&["BITPOS", "nokey", "0", "0", "-1"], 0, 1),
+    (&["BITPOS", "h", "0", "0", "-1"], 1, 0),
+    (&["BITFIELD_RO", "b", "GET", "u8", "0"], 1, 0),
+    (&["BITFIELD_RO", "nokey", "GET", "u8", "0"], 0, 1),
+    (&["BITFIELD_RO", "h", "GET", "u8", "0"], 1, 0),
+    (&["BITFIELD", "b", "GET", "u8", "0"], 1, 0),
+    (&["BITFIELD", "nokey", "GET", "u8", "0"], 0, 1),
+    (&["BITFIELD", "h", "GET", "u8", "0"], 1, 0),
+    (&["LCS", "s", "s"], 2, 0),
+    (&["LCS", "nokey", "s"], 1, 1),
+    (&["LCS", "h", "s"], 2, 0),
+    (&["LCS", "nokey", "nokey"], 0, 2),
+    (&["LCS", "h", "h"], 2, 0),
+    (&["LCS", "s", "s", "LEN"], 2, 0),
+    (&["LCS", "nokey", "s", "LEN"], 1, 1),
+    (&["LCS", "h", "s", "LEN"], 2, 0),
+    (&["PFCOUNT", "p"], 1, 0),
+    (&["PFCOUNT", "nokey"], 0, 1),
+    (&["PFCOUNT", "h"], 1, 0),
+    (&["PFCOUNT", "p", "p"], 2, 0),
+    (&["PFCOUNT", "nokey", "p"], 1, 1),
+    (&["PFCOUNT", "h", "p"], 1, 0),
+    (&["HTTL", "h", "FIELDS", "2", "f", "g"], 1, 0),
+    (&["HTTL", "nokey", "FIELDS", "2", "f", "g"], 0, 1),
+    (&["HTTL", "s", "FIELDS", "2", "f", "g"], 1, 0),
+    (&["HPTTL", "h", "FIELDS", "1", "g"], 1, 0),
+    (&["HPTTL", "nokey", "FIELDS", "1", "g"], 0, 1),
+    (&["HPTTL", "s", "FIELDS", "1", "g"], 1, 0),
+    (&["HEXPIRETIME", "h", "FIELDS", "1", "g"], 1, 0),
+    (&["HEXPIRETIME", "nokey", "FIELDS", "1", "g"], 0, 1),
+    (&["HEXPIRETIME", "s", "FIELDS", "1", "g"], 1, 0),
+    (&["HPEXPIRETIME", "h", "FIELDS", "1", "f"], 1, 0),
+    (&["HPEXPIRETIME", "nokey", "FIELDS", "1", "f"], 0, 1),
+    (&["HPEXPIRETIME", "s", "FIELDS", "1", "f"], 1, 0),
+    (&["XLEN", "x"], 1, 0),
+    (&["XLEN", "nokey"], 0, 1),
+    (&["XLEN", "s"], 1, 0),
+    (&["XRANGE", "x", "-", "+"], 1, 0),
+    (&["XRANGE", "nokey", "-", "+"], 0, 1),
+    (&["XRANGE", "s", "-", "+"], 1, 0),
+    (&["XREVRANGE", "x", "+", "-"], 1, 0),
+    (&["XREVRANGE", "nokey", "+", "-"], 0, 1),
+    (&["XREVRANGE", "s", "+", "-"], 1, 0),
+    (&["XREAD", "STREAMS", "x", "0"], 2, 0),
+    (&["XREAD", "STREAMS", "nokey", "0"], 0, 2),
+    (&["XREAD", "STREAMS", "s", "0"], 1, 0),
+    (&["XREAD", "COUNT", "1", "STREAMS", "x", "0"], 2, 0),
+    (&["XREAD", "COUNT", "1", "STREAMS", "nokey", "0"], 0, 2),
+    (&["XREAD", "COUNT", "1", "STREAMS", "s", "0"], 1, 0),
+    (&["XINFO", "STREAM", "x"], 1, 0),
+    (&["XINFO", "STREAM", "nokey"], 0, 1),
+    (&["XINFO", "STREAM", "s"], 1, 0),
+    (&["XINFO", "GROUPS", "x"], 1, 0),
+    (&["XINFO", "GROUPS", "nokey"], 0, 1),
+    (&["XINFO", "GROUPS", "s"], 1, 0),
+    (&["XINFO", "CONSUMERS", "x", "g"], 1, 0),
+    (&["XINFO", "CONSUMERS", "nokey", "g"], 0, 1),
+    (&["XINFO", "CONSUMERS", "s", "g"], 1, 0),
+    (&["XPENDING", "x", "g"], 1, 0),
+    (&["XPENDING", "nokey", "g"], 0, 1),
+    (&["XPENDING", "s", "g"], 1, 0),
+    (&["XPENDING", "x", "g", "-", "+", "10"], 1, 0),
+    (&["XPENDING", "nokey", "g", "-", "+", "10"], 0, 1),
+    (&["XPENDING", "s", "g", "-", "+", "10"], 1, 0),
+    (&["GEOPOS", "geo", "Palermo"], 1, 0),
+    (&["GEOPOS", "nokey", "Palermo"], 0, 1),
+    (&["GEOPOS", "s", "Palermo"], 1, 0),
+    (&["GEOPOS", "geo", "Palermo", "nomember"], 1, 0),
+    (&["GEOPOS", "nokey", "Palermo", "nomember"], 0, 1),
+    (&["GEOPOS", "s", "Palermo", "nomember"], 1, 0),
+    (&["GEODIST", "geo", "Palermo", "Catania"], 1, 0),
+    (&["GEODIST", "nokey", "Palermo", "Catania"], 0, 1),
+    (&["GEODIST", "s", "Palermo", "Catania"], 1, 0),
+    (&["GEOHASH", "geo", "Palermo"], 1, 0),
+    (&["GEOHASH", "nokey", "Palermo"], 0, 1),
+    (&["GEOHASH", "s", "Palermo"], 1, 0),
+    (&["GEORADIUS_RO", "geo", "15", "37", "200", "km"], 1, 0),
+    (&["GEORADIUS_RO", "nokey", "15", "37", "200", "km"], 0, 1),
+    (&["GEORADIUS_RO", "s", "15", "37", "200", "km"], 1, 0),
+    (&["GEORADIUSBYMEMBER_RO", "geo", "Palermo", "200", "km"], 1, 0),
+    (&["GEORADIUSBYMEMBER_RO", "nokey", "Palermo", "200", "km"], 0, 1),
+    (&["GEORADIUSBYMEMBER_RO", "s", "Palermo", "200", "km"], 1, 0),
+    (&["GEOSEARCH", "geo", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"], 1, 0),
+    (&["GEOSEARCH", "nokey", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"], 0, 1),
+    (&["GEOSEARCH", "s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"], 1, 0),
+    (&["GEOSEARCH", "geo", "FROMMEMBER", "Palermo", "BYRADIUS", "200", "km"], 1, 0),
+    (&["GEOSEARCH", "nokey", "FROMMEMBER", "Palermo", "BYRADIUS", "200", "km"], 0, 1),
+    (&["GEOSEARCH", "s", "FROMMEMBER", "Palermo", "BYRADIUS", "200", "km"], 1, 0),
+    (&["OBJECT", "REFCOUNT", "s"], 1, 0),
+    (&["OBJECT", "REFCOUNT", "nokey"], 0, 1),
+    (&["OBJECT", "REFCOUNT", "h"], 1, 0),
+    (&["SORT", "l2"], 1, 0),
+    (&["SORT", "nokey"], 0, 1),
+    (&["SORT", "s"], 1, 0),
+    (&["SORT", "l", "ALPHA"], 1, 0),
+    (&["SORT", "nokey", "ALPHA"], 0, 1),
+    (&["SORT", "s", "ALPHA"], 1, 0),
+    (&["SORT_RO", "l2"], 1, 0),
+    (&["SORT_RO", "nokey"], 0, 1),
+    (&["SORT_RO", "s"], 1, 0),
+    (&["SORT", "l2", "BY", "nosort"], 1, 0),
+    (&["SORT", "nokey", "BY", "nosort"], 0, 1),
+    (&["SORT", "s", "BY", "nosort"], 1, 0),
+    (&["SORT", "l2", "BY", "w_*", "GET", "o_*"], 1, 6),
+    (&["SORT", "nokey", "BY", "w_*", "GET", "o_*"], 0, 1),
+    (&["SORT", "s", "BY", "w_*", "GET", "o_*"], 1, 0),
+    (&["SORT", "l", "ALPHA", "STORE", "sortdst"], 1, 0),
+    (&["SORT", "nokey", "ALPHA", "STORE", "sortdst"], 0, 1),
+    (&["SORT", "s", "ALPHA", "STORE", "sortdst"], 1, 0),
+    (&["JSON.GET", "j"], 1, 0),
+    (&["JSON.GET", "nokey"], 0, 1),
+    (&["JSON.GET", "s"], 1, 0),
+    (&["JSON.GET", "j", "$.a"], 1, 0),
+    (&["JSON.GET", "nokey", "$.a"], 0, 1),
+    (&["JSON.GET", "s", "$.a"], 1, 0),
+    (&["JSON.MGET", "j", "$.a"], 1, 0),
+    (&["JSON.MGET", "nokey", "$.a"], 0, 1),
+    (&["JSON.MGET", "s", "$.a"], 1, 0),
+    (&["JSON.TYPE", "j"], 1, 0),
+    (&["JSON.TYPE", "nokey"], 0, 1),
+    (&["JSON.TYPE", "s"], 1, 0),
+    (&["JSON.STRLEN", "j", "$.str"], 1, 0),
+    (&["JSON.STRLEN", "nokey", "$.str"], 0, 1),
+    (&["JSON.STRLEN", "s", "$.str"], 1, 0),
+    (&["JSON.ARRLEN", "j", "$.arr"], 1, 0),
+    (&["JSON.ARRLEN", "nokey", "$.arr"], 0, 1),
+    (&["JSON.ARRLEN", "s", "$.arr"], 1, 0),
+    (&["JSON.OBJKEYS", "j"], 1, 0),
+    (&["JSON.OBJKEYS", "nokey"], 0, 1),
+    (&["JSON.OBJKEYS", "s"], 1, 0),
+    (&["JSON.OBJLEN", "j"], 1, 0),
+    (&["JSON.OBJLEN", "nokey"], 0, 1),
+    (&["JSON.OBJLEN", "s"], 1, 0),
+    (&["JSON.RESP", "j"], 1, 0),
+    (&["JSON.RESP", "nokey"], 0, 1),
+    (&["JSON.RESP", "s"], 1, 0),
+    (&["JSON.DEBUG", "MEMORY", "j"], 1, 0),
+    (&["JSON.DEBUG", "MEMORY", "nokey"], 0, 1),
+    (&["JSON.DEBUG", "MEMORY", "s"], 1, 0),
+    (&["TS.GET", "ts"], 1, 0),
+    (&["TS.GET", "nokey"], 0, 1),
+    (&["TS.GET", "s"], 1, 0),
+    (&["TS.RANGE", "ts", "-", "+"], 1, 0),
+    (&["TS.RANGE", "nokey", "-", "+"], 0, 1),
+    (&["TS.RANGE", "s", "-", "+"], 1, 0),
+    (&["TS.REVRANGE", "ts", "-", "+"], 1, 0),
+    (&["TS.REVRANGE", "nokey", "-", "+"], 0, 1),
+    (&["TS.REVRANGE", "s", "-", "+"], 1, 0),
+    (&["VCARD", "vs"], 1, 0),
+    (&["VCARD", "nokey"], 0, 1),
+    (&["VCARD", "s"], 1, 0),
+    (&["VDIM", "vs"], 1, 0),
+    (&["VDIM", "nokey"], 0, 1),
+    (&["VDIM", "s"], 1, 0),
+    (&["VEMB", "vs", "e1"], 1, 0),
+    (&["VEMB", "nokey", "e1"], 0, 1),
+    (&["VEMB", "s", "e1"], 1, 0),
+    (&["VSIM", "vs", "ELE", "e1"], 1, 0),
+    (&["VSIM", "nokey", "ELE", "e1"], 0, 1),
+    (&["VSIM", "s", "ELE", "e1"], 1, 0),
+    (&["VINFO", "vs"], 1, 0),
+    (&["VINFO", "nokey"], 0, 1),
+    (&["VINFO", "s"], 1, 0),
+    (&["VISMEMBER", "vs", "e1"], 1, 0),
+    (&["VISMEMBER", "nokey", "e1"], 0, 1),
+    (&["VISMEMBER", "s", "e1"], 1, 0),
+    (&["VRANDMEMBER", "vs"], 1, 0),
+    (&["VRANDMEMBER", "nokey"], 0, 1),
+    (&["VRANDMEMBER", "s"], 1, 0),
+    (&["VLINKS", "vs", "e1"], 1, 0),
+    (&["VLINKS", "nokey", "e1"], 0, 1),
+    (&["VLINKS", "s", "e1"], 1, 0),
+    (&["VGETATTR", "vs", "e1"], 1, 0),
+    (&["VGETATTR", "nokey", "e1"], 0, 1),
+    (&["VGETATTR", "s", "e1"], 1, 0),
+    (&["BF.EXISTS", "bf", "a"], 1, 0),
+    (&["BF.EXISTS", "nokey", "a"], 0, 1),
+    (&["BF.EXISTS", "s", "a"], 1, 0),
+    (&["BF.MEXISTS", "bf", "a", "b"], 1, 0),
+    (&["BF.MEXISTS", "nokey", "a", "b"], 0, 1),
+    (&["BF.MEXISTS", "s", "a", "b"], 1, 0),
+    (&["BF.INFO", "bf"], 1, 0),
+    (&["BF.INFO", "nokey"], 0, 1),
+    (&["BF.INFO", "s"], 1, 0),
+    (&["BF.CARD", "bf"], 1, 0),
+    (&["BF.CARD", "nokey"], 0, 1),
+    (&["BF.CARD", "s"], 1, 0),
+    (&["CF.EXISTS", "cf", "a"], 1, 0),
+    (&["CF.EXISTS", "nokey", "a"], 0, 1),
+    (&["CF.EXISTS", "s", "a"], 1, 0),
+    (&["CF.COUNT", "cf", "a"], 1, 0),
+    (&["CF.COUNT", "nokey", "a"], 0, 1),
+    (&["CF.COUNT", "s", "a"], 1, 0),
+    (&["CF.INFO", "cf"], 1, 0),
+    (&["CF.INFO", "nokey"], 0, 1),
+    (&["CF.INFO", "s"], 1, 0),
+    (&["CMS.QUERY", "cms", "a"], 1, 0),
+    (&["CMS.QUERY", "nokey", "a"], 0, 1),
+    (&["CMS.QUERY", "s", "a"], 1, 0),
+    (&["CMS.INFO", "cms"], 1, 0),
+    (&["CMS.INFO", "nokey"], 0, 1),
+    (&["CMS.INFO", "s"], 1, 0),
+    (&["TOPK.QUERY", "tk", "a"], 1, 0),
+    (&["TOPK.QUERY", "nokey", "a"], 0, 1),
+    (&["TOPK.QUERY", "s", "a"], 1, 0),
+    (&["TOPK.LIST", "tk"], 1, 0),
+    (&["TOPK.LIST", "nokey"], 0, 1),
+    (&["TOPK.LIST", "s"], 1, 0),
+    (&["TOPK.INFO", "tk"], 1, 0),
+    (&["TOPK.INFO", "nokey"], 0, 1),
+    (&["TOPK.INFO", "s"], 1, 0),
+    (&["TDIGEST.QUANTILE", "td", "0.5"], 1, 0),
+    (&["TDIGEST.QUANTILE", "nokey", "0.5"], 0, 1),
+    (&["TDIGEST.QUANTILE", "s", "0.5"], 1, 0),
+    (&["TDIGEST.INFO", "td"], 1, 0),
+    (&["TDIGEST.INFO", "nokey"], 0, 1),
+    (&["TDIGEST.INFO", "s"], 1, 0),
+    (&["TDIGEST.MIN", "td"], 1, 0),
+    (&["TDIGEST.MIN", "nokey"], 0, 1),
+    (&["TDIGEST.MIN", "s"], 1, 0),
+    (&["TDIGEST.MAX", "td"], 1, 0),
+    (&["TDIGEST.MAX", "nokey"], 0, 1),
+    (&["TDIGEST.MAX", "s"], 1, 0),
+    (&["TDIGEST.CDF", "td", "1"], 1, 0),
+    (&["TDIGEST.CDF", "nokey", "1"], 0, 1),
+    (&["TDIGEST.CDF", "s", "1"], 1, 0),
+    (&["TDIGEST.RANK", "td", "1"], 1, 0),
+    (&["TDIGEST.RANK", "nokey", "1"], 0, 1),
+    (&["TDIGEST.RANK", "s", "1"], 1, 0),
+    (&["TDIGEST.REVRANK", "td", "1"], 1, 0),
+    (&["TDIGEST.REVRANK", "nokey", "1"], 0, 1),
+    (&["TDIGEST.REVRANK", "s", "1"], 1, 0),
+    (&["TDIGEST.BYRANK", "td", "0"], 1, 0),
+    (&["TDIGEST.BYRANK", "nokey", "0"], 0, 1),
+    (&["TDIGEST.BYRANK", "s", "0"], 1, 0),
+    (&["TDIGEST.BYREVRANK", "td", "0"], 1, 0),
+    (&["TDIGEST.BYREVRANK", "nokey", "0"], 0, 1),
+    (&["TDIGEST.BYREVRANK", "s", "0"], 1, 0),
+    (&["TDIGEST.TRIMMED_MEAN", "td", "0.1", "0.9"], 1, 0),
+    (&["TDIGEST.TRIMMED_MEAN", "nokey", "0.1", "0.9"], 0, 1),
+    (&["TDIGEST.TRIMMED_MEAN", "s", "0.1", "0.9"], 1, 0),
+    (&["TOPK.COUNT", "tk", "a"], 1, 0),
+    (&["TOPK.COUNT", "nokey", "a"], 0, 1),
+    (&["TOPK.COUNT", "s", "a"], 1, 0),
+    (&["CF.MEXISTS", "cf", "a", "b"], 1, 0),
+    (&["CF.MEXISTS", "nokey", "a", "b"], 0, 1),
+    (&["CF.MEXISTS", "s", "a", "b"], 1, 0),
+    (&["BF.SCANDUMP", "bf", "0"], 1, 0),
+    (&["BF.SCANDUMP", "nokey", "0"], 0, 1),
+    (&["BF.SCANDUMP", "s", "0"], 1, 0),
+    (&["BF.DEBUG", "bf"], 1, 0),
+    (&["BF.DEBUG", "nokey"], 0, 1),
+    (&["BF.DEBUG", "s"], 1, 0),
+    (&["CF.SCANDUMP", "cf", "0"], 1, 0),
+    (&["CF.SCANDUMP", "nokey", "0"], 0, 1),
+    (&["CF.SCANDUMP", "s", "0"], 1, 0),
+    (&["CF.DEBUG", "cf"], 1, 0),
+    (&["CF.DEBUG", "nokey"], 0, 1),
+    (&["CF.DEBUG", "s"], 1, 0),
+    (&["JSON.ARRINDEX", "j", "$.arr", "1"], 1, 0),
+    (&["JSON.ARRINDEX", "nokey", "$.arr", "1"], 0, 1),
+    (&["JSON.ARRINDEX", "s", "$.arr", "1"], 1, 0),
+    (&["VRANGE", "vs", "-", "+", "10"], 1, 0),
+    (&["VRANGE", "nokey", "-", "+", "10"], 0, 1),
+    (&["VRANGE", "s", "-", "+", "10"], 1, 0),
+    (&["BITOP", "AND", "bdst", "b", "b"], 2, 0),
+    (&["BITOP", "AND", "bdst", "nokey", "b"], 1, 1),
+    (&["BITOP", "AND", "bdst", "h", "b"], 1, 0),
+    (&["BITOP", "NOT", "bdst", "b"], 1, 0),
+    (&["BITOP", "NOT", "bdst", "nokey"], 0, 1),
+    (&["BITOP", "NOT", "bdst", "h"], 1, 0),
+    (&["PFMERGE", "pdst", "p", "p"], 2, 1),
+    (&["PFMERGE", "pdst", "nokey", "p"], 1, 2),
+    (&["PFMERGE", "pdst", "h", "p"], 1, 1),
+    (&["PFMERGE", "p", "p"], 2, 0),
+    (&["PFMERGE", "nokey", "p"], 1, 1),
+    (&["PFMERGE", "h", "p"], 1, 0),
+    (&["GEORADIUS", "geo", "15", "37", "200", "km"], 1, 0),
+    (&["GEORADIUS", "nokey", "15", "37", "200", "km"], 0, 1),
+    (&["GEORADIUS", "s", "15", "37", "200", "km"], 1, 0),
+    (&["GEORADIUS", "geo", "15", "37", "200", "km", "STORE", "gdst"], 1, 0),
+    (&["GEORADIUS", "nokey", "15", "37", "200", "km", "STORE", "gdst"], 0, 1),
+    (&["GEORADIUS", "s", "15", "37", "200", "km", "STORE", "gdst"], 1, 0),
+    (&["GEOSEARCHSTORE", "gdst", "geo", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"], 1, 0),
+    (&["GEOSEARCHSTORE", "gdst", "nokey", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"], 0, 1),
+    (&["GEOSEARCHSTORE", "gdst", "s", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"], 1, 0),
+    (&["GEORADIUSBYMEMBER", "geo", "Palermo", "200", "km"], 1, 0),
+    (&["GEORADIUSBYMEMBER", "nokey", "Palermo", "200", "km"], 0, 1),
+    (&["GEORADIUSBYMEMBER", "s", "Palermo", "200", "km"], 1, 0),
+    (&["XREADGROUP", "GROUP", "g", "c2", "STREAMS", "x", ">"], 2, 0),
+    (&["XREADGROUP", "GROUP", "g", "c2", "STREAMS", "nokey", ">"], 0, 1),
+    (&["XREADGROUP", "GROUP", "g", "c2", "STREAMS", "s", ">"], 1, 0),
+    (&["XREADGROUP", "GROUP", "g", "c2", "STREAMS", "x", "0"], 2, 0),
+    (&["XREADGROUP", "GROUP", "g", "c2", "STREAMS", "nokey", "0"], 0, 1),
+    (&["XREADGROUP", "GROUP", "g", "c2", "STREAMS", "s", "0"], 1, 0),
+    (&["SORT", "l2", "BY", "nosort", "GET", "#"], 1, 0),
+    (&["SORT", "nokey", "BY", "nosort", "GET", "#"], 0, 1),
+    (&["SORT", "s", "BY", "nosort", "GET", "#"], 1, 0),
+    (&["SORT", "l2", "BY", "h->f"], 1, 0),
+    (&["SORT", "nokey", "BY", "h->f"], 0, 1),
+    (&["SORT", "s", "BY", "h->f"], 1, 0),
+    (&["SORT", "l2", "GET", "h_*->f"], 1, 3),
+    (&["SORT", "nokey", "GET", "h_*->f"], 0, 1),
+    (&["SORT", "s", "GET", "h_*->f"], 1, 0),
+    (&["SORT_RO", "l2", "BY", "w_*"], 1, 3),
+    (&["SORT_RO", "nokey", "BY", "w_*"], 0, 1),
+    (&["SORT_RO", "s", "BY", "w_*"], 1, 0),
+    (&["DIGEST", "s"], 1, 0),
+    (&["DIGEST", "nokey"], 0, 1),
+    (&["DIGEST", "h"], 1, 0),
+    (&["XAUTOCLAIM", "x", "g", "c1", "0", "0"], 1, 0),
+    (&["XAUTOCLAIM", "nokey", "g", "c1", "0", "0"], 0, 1),
+    (&["XAUTOCLAIM", "s", "g", "c1", "0", "0"], 1, 0),
+    (&["XCLAIM", "x", "g", "c1", "0", "1-1"], 1, 0),
+    (&["XCLAIM", "nokey", "g", "c1", "0", "1-1"], 0, 1),
+    (&["XCLAIM", "s", "g", "c1", "0", "1-1"], 1, 0),
+    (&["XACK", "x", "g", "1-1"], 1, 0),
+    (&["XACK", "nokey", "g", "1-1"], 0, 1),
+    (&["XACK", "s", "g", "1-1"], 1, 0),
+];
+
+/// A row of [`BLOCKING`].
+type BlockingRow = (
+    &'static [&'static str],
+    Option<&'static [&'static str]>,
+    u64,
+    u64,
+);
+
+/// Blocking reads, from Redis 8.12.0, each on fresh keys (`x` a stream whose
+/// group `g` has read it all, `xe` one past its time, `l` a list of `a` and
+/// `b`, `z` a sorted set of `a` and `b`): (command, a write another
+/// connection sends 300 ms later, hits, misses). A stream read counts its
+/// lookups once a run: a wait that times out adds nothing (Redis answers it
+/// without running the command again), one a write ends runs it again. The
+/// blocking pops count nothing, as they write.
+#[rustfmt::skip]
+const BLOCKING: &[BlockingRow] = &[
+    (&["XREAD", "BLOCK", "200", "STREAMS", "x", "$"], None, 2, 0),
+    (&["XREAD", "BLOCK", "200", "STREAMS", "nokey", "$"], None, 0, 2),
+    (&["XREAD", "BLOCK", "1000", "STREAMS", "x", "0"], None, 2, 0),
+    (&["XREAD", "BLOCK", "5000", "STREAMS", "x", "$"], Some(&["XADD", "x", "*", "f", "w"]), 4, 0),
+    (&["XREAD", "STREAMS", "xe", "0"], None, 0, 2),
+    (&["XREADGROUP", "GROUP", "g", "c1", "BLOCK", "200", "STREAMS", "x", ">"], None, 2, 0),
+    (&["XREADGROUP", "GROUP", "g", "c1", "BLOCK", "1000", "STREAMS", "x", "0"], None, 2, 0),
+    (&["XREADGROUP", "GROUP", "g", "c1", "BLOCK", "5000", "STREAMS", "x", ">"], Some(&["XADD", "x", "*", "f", "w"]), 4, 0),
+    (&["BLPOP", "nokey", "0.2"], None, 0, 0),
+    (&["BLMOVE", "l", "d", "LEFT", "RIGHT", "1"], None, 0, 0),
+    (&["BLMOVE", "nl", "d", "LEFT", "RIGHT", "5"], Some(&["RPUSH", "nl", "q"]), 0, 0),
+    (&["BLMPOP", "0.2", "1", "nokey", "LEFT"], None, 0, 0),
+    (&["BZPOPMIN", "z", "1"], None, 0, 0),
+    (&["BZPOPMIN", "nz", "5"], Some(&["ZADD", "nz", "1", "q"]), 0, 0),
+    (&["BZMPOP", "0.2", "1", "nokey", "MIN"], None, 0, 0),
+];
+
+/// Runs each of [`BLOCKING`] on fresh keys, its write sent by another
+/// connection, and says which differ.
+fn check_blocking(c: &mut Conn, port: u16) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (args, write, want_hits, want_misses) in BLOCKING {
+        c.cmd(&["FLUSHALL"]);
+        for setup in [
+            &["XADD", "x", "1-1", "f", "v"][..],
+            &["XGROUP", "CREATE", "x", "g", "$"],
+            &["RPUSH", "l", "a", "b"],
+            &["ZADD", "z", "1", "a", "2", "b"],
+            &["XADD", "xe", "1-1", "f", "v"],
+            &["PEXPIRE", "xe", "1"],
+        ] {
+            c.cmd(setup);
+        }
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(c.cmd(&["CONFIG", "RESETSTAT"]), "+OK");
+        let writer = write.map(|write| {
+            let write: Vec<String> = write.iter().map(|a| a.to_string()).collect();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(300));
+                let mut other = Conn::connect(port);
+                let args: Vec<&str> = write.iter().map(String::as_str).collect();
+                other.cmd(&args);
+            })
+        });
+        c.cmd(args);
+        if let Some(writer) = writer {
+            writer.join().unwrap();
+        }
+        let (h, m) = (c.stat("keyspace_hits"), c.stat("keyspace_misses"));
+        if (h, m) != (*want_hits, *want_misses) {
+            wrong.push(format!(
+                "{} (blocking): {h} hits and {m} misses, Redis 8.12 {want_hits} and {want_misses}",
+                args.join(" ")
+            ));
+        }
+    }
+    wrong
+}
+
+/// Runs each of `rows` on fresh [`FIXTURES`], and says which differ.
+fn check_fresh(c: &mut Conn, rows: &[(&[&str], u64, u64)]) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (args, want_hits, want_misses) in rows {
+        c.cmd(&["FLUSHALL"]);
+        for setup in FIXTURES {
+            c.cmd(setup);
+        }
+        assert_eq!(c.cmd(&["CONFIG", "RESETSTAT"]), "+OK");
+        c.cmd(args);
+        let (h, m) = (c.stat("keyspace_hits"), c.stat("keyspace_misses"));
+        if (h, m) != (*want_hits, *want_misses) {
+            wrong.push(format!(
+                "{} (fresh keys): {h} hits and {m} misses, Redis 8.12 {want_hits} and {want_misses}",
+                args.join(" ")
+            ));
+        }
+    }
+    wrong
+}
+
 /// Runs `rows` on `c`, an INFO after each, and says which differ.
 fn check(c: &mut Conn, rows: &[(&[&str], u64, u64)], lua: bool) -> Vec<String> {
     let (mut hits, mut misses) = (c.stat("keyspace_hits"), c.stat("keyspace_misses"));
@@ -406,5 +874,11 @@ fn keyspace_hits_and_misses_are_counted_as_redis_counts_them() {
         thread::sleep(Duration::from_millis(2));
     }
     wrong.extend(check(&mut c, EXPIRED, lua));
+
+    // The other read commands, each on fresh keys of every type.
+    wrong.extend(check_fresh(&mut c, FRESH));
+
+    // Blocking reads: served at once, served later, timed out.
+    wrong.extend(check_blocking(&mut c, port));
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

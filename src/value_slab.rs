@@ -129,9 +129,21 @@ pub const POOL_MAX_BLOCK: usize = 4096;
 /// to 64, 16 apart to 512, 32 apart to 2 KiB and 64 apart to 4 KiB
 /// (8 + 28 + 48 + 32).
 const POOL_CLASSES: usize = 116;
-/// Every class: the keyspace's, then the entry pool's.
-const ALL_CLASSES: usize = CLASSES + POOL_CLASSES;
-const _: () = assert!(block_size(ALL_CLASSES - 1) == POOL_MAX_BLOCK);
+/// The largest block of a list chunk's classes ([`chunk_class_of`]): classes
+/// of their own, of the entry pool's kind (64 KiB slabs, never emptied by
+/// compaction, given back as soon as they are empty), numbered after the
+/// pool's: the pool's sizes up to 4 KiB, then 128 bytes apart. A chunk of 64
+/// elements of 64 bytes takes 4,224 bytes, of 100 bytes 6,528. Classes of
+/// their own keep a list's chunks and a collection's entries in different
+/// slabs, as they come and go at different times.
+pub const CHUNK_MAX_BLOCK: usize = 8192;
+/// The chunks' classes: as many as the pool's, then those above 4 KiB.
+const CHUNK_CLASSES: usize = POOL_CLASSES + (CHUNK_MAX_BLOCK - POOL_MAX_BLOCK) / 128;
+/// Every class: the keyspace's, the entry pool's, then the chunks'.
+const ALL_CLASSES: usize = CLASSES + POOL_CLASSES + CHUNK_CLASSES;
+const _: () = assert!(block_size(CLASSES + POOL_CLASSES - 1) == POOL_MAX_BLOCK);
+const _: () = assert!(block_size(CLASSES + 2 * POOL_CLASSES - 1) == POOL_MAX_BLOCK);
+const _: () = assert!(block_size(ALL_CLASSES - 1) == CHUNK_MAX_BLOCK);
 // A slab's class is kept in two bytes.
 const _: () = assert!(ALL_CLASSES <= u16::MAX as usize);
 
@@ -396,6 +408,20 @@ pub fn pool_class_of(size: usize) -> Option<usize> {
     )
 }
 
+/// The class of a list chunk's block of `size` bytes, if a slab holds it
+/// (see [`CHUNK_MAX_BLOCK`]): the size of the entry pool's class up to
+/// [`POOL_MAX_BLOCK`], then 128 bytes apart.
+#[inline]
+pub fn chunk_class_of(size: usize) -> Option<usize> {
+    if size <= POOL_MAX_BLOCK {
+        Some(pool_class_of(size)? + POOL_CLASSES)
+    } else if size <= CHUNK_MAX_BLOCK {
+        Some(CLASSES + 2 * POOL_CLASSES + (size - POOL_MAX_BLOCK - 1) / 128)
+    } else {
+        None
+    }
+}
+
 /// Each class's block size, looked up: on every block given and taken.
 const SIZES: [u16; ALL_CLASSES] = {
     let mut sizes = [0; ALL_CLASSES];
@@ -421,8 +447,14 @@ const fn size_of_class(class: usize) -> usize {
         } else if pool < 84 {
             // From 544 bytes to 2 KiB, the keyspace's classes from its 32nd.
             size_of_class(pool - 4)
-        } else {
+        } else if pool < POOL_CLASSES {
             2048 + (pool - 83) * 64
+        } else if pool < 2 * POOL_CLASSES {
+            // The chunks' classes (`chunk_class_of`): the pool's sizes...
+            size_of_class(class - POOL_CLASSES)
+        } else {
+            // ... then 128 bytes apart.
+            POOL_MAX_BLOCK + (pool - 2 * POOL_CLASSES + 1) * 128
         };
     }
     if class < 32 {

@@ -57,6 +57,7 @@ fn cmd_getbit(ctx: &mut Ctx) -> Vec<u8> {
 
     if is_expired(ctx.store, *ctx.selected_db, key) {
         expire_on_read(ctx.store, *ctx.selected_db, key);
+        crate::stats::record_miss();
         return resp_integer(0);
     }
 
@@ -64,7 +65,9 @@ fn cmd_getbit(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         Some(ValueRef::String(bytes)) => {
             let (byte_idx, mask) = bit_byte_and_mask(offset);
             if byte_idx >= bytes.len() {
@@ -171,12 +174,15 @@ fn cmd_bitcount(ctx: &mut Ctx) -> Vec<u8> {
     if cmd.len() == 2 {
         if is_expired(ctx.store, *ctx.selected_db, key) {
             expire_on_read(ctx.store, *ctx.selected_db, key);
+            crate::stats::record_miss();
             return resp_integer(0);
         }
         let db = &ctx.store[*ctx.selected_db];
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
-        match map.get(key) {
+        let found = map.get(key);
+        crate::stats::record_lookup(found.is_some());
+        match found {
             Some(ValueRef::String(b)) => resp_integer(popcount(&b) as i64),
             None => resp_integer(0),
             _ => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -218,7 +224,9 @@ fn cmd_bitcount(ctx: &mut Ctx) -> Vec<u8> {
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
 
-        let bytes: SharedBytes = match map.get(key).filter(|_| !gone) {
+        let found = map.get(key).filter(|_| !gone);
+        crate::stats::record_lookup(found.is_some());
+        let bytes: SharedBytes = match found {
             Some(ValueRef::String(b)) => b.to_shared(),
             None => SharedBytes::from(&[][..]),
             _ => {
@@ -357,6 +365,7 @@ fn cmd_bitpos(ctx: &mut Ctx) -> Vec<u8> {
 
     if is_expired(ctx.store, *ctx.selected_db, key) {
         expire_on_read(ctx.store, *ctx.selected_db, key);
+        crate::stats::record_miss();
         return resp_integer(if search_bit == 0 { 0 } else { -1 });
     }
 
@@ -364,7 +373,9 @@ fn cmd_bitpos(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
 
-    let bytes = match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    let bytes = match found {
         Some(ValueRef::String(b)) => b.to_shared(),
         None => {
             return resp_integer(if search_bit == 0 { 0 } else { -1 });
@@ -473,12 +484,15 @@ fn cmd_bitop(ctx: &mut Ctx) -> Vec<u8> {
         let key: &[u8] = src_raw;
         if is_expired(ctx.store, *ctx.selected_db, key) {
             delete_key_if_expired(ctx.store, *ctx.selected_db, key);
+            crate::stats::record_miss();
             sources.push(vec![]);
             continue;
         }
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
-        match map.get(key) {
+        let found = map.get(key);
+        crate::stats::record_lookup(found.is_some());
+        match found {
             Some(ValueRef::String(b)) => sources.push(b.to_vec()),
             None => sources.push(vec![]),
             _ => {
@@ -592,13 +606,23 @@ fn cmd_bitfield(ctx: &mut Ctx, readonly: bool) -> Vec<u8> {
     let shard = store::get_shard(db, key);
 
     // A second hold on the stored bytes, read with the shard let go.
-    let held: Option<SharedBytes> = match read_lock!(shard).get(key) {
+    let map = read_lock!(shard);
+    let found = map.get(key);
+    // Only GETs (or `BITFIELD_RO`): a read, counted as Redis counts one.
+    let writes = cmd[2..]
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case(b"SET") || a.eq_ignore_ascii_case(b"INCRBY"));
+    if readonly || !writes {
+        crate::stats::record_lookup(found.is_some());
+    }
+    let held: Option<SharedBytes> = match found {
         Some(ValueRef::String(b)) => Some(b.to_shared()),
         None => None,
         _ => {
             return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
         }
     };
+    drop(map);
     let stored: &[u8] = held.as_deref().unwrap_or(&[]);
     // The writable copy, made by the first successful write.
     let mut written: Option<Vec<u8>> = None;
