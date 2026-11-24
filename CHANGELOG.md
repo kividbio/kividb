@@ -600,9 +600,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the one in its slot (decoded there, with no allocation), a delete gives
   the slot back to the next document, and a scan lets the index's lock go
   to a waiting writer every 256 vectors, as the filtered KNN let it go
-  every 256 keys. Replies are the same; of vectors at the same distance,
-  which a KNN of the whole index keeps follows the slots (it followed a
-  hash map's order). Nothing changes on disk or on the replication stream:
+  every 256 keys. A KNN finds the same hits at the same distances; of
+  vectors at the same distance, a KNN of the whole index keeps and lists
+  them in slot order. A hit of a filtered KNN is tried against the filter
+  on its own document when the postings gave an id back while the query
+  ran (an id given back is given to the next document). A FLAT index
+  keeps its blocks while it lives: after many deletes its memory stays at
+  its peak, the slots given back taken by the next documents, until the
+  index is dropped. Nothing changes on disk or on the replication stream:
   the index is built from the documents at load, as before. On an Azure
   `Standard_D8s_v5` (Xeon 8370C), the server on vCPUs 0-3 (`--threads 4`;
   Redis 8.12 `--io-threads 4 --search-workers 4`), a closed-loop client on

@@ -36,7 +36,11 @@
 //! filtered query that meets the id later finds the slot by its key, and
 //! records it. A document keeps its id while it is in the postings, and
 //! leaves this index before it leaves them (`vector::unindex_from`), so an
-//! id recorded here is that document's for as long as it is recorded.
+//! id recorded here is that document's for as long as it is recorded. A
+//! query's own set of ids is read before the scan, and an id given back and
+//! given out again meanwhile names the new document here: a filtered KNN
+//! whose postings gave back an id while it ran tries each hit against the
+//! filter (`commands::vector::knn_planned`).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -732,8 +736,11 @@ mod tests {
     /// run. Each vector holds its key's number and the write's version in
     /// every place: a vector read half written would mix two versions, and
     /// a slot read as the document it held before would carry another
-    /// key's number. Keys
-    /// that are never deleted are always found.
+    /// key's number. Keys that are never deleted are always found. A scan
+    /// by ids meets only the documents the ids named when they were taken,
+    /// or documents written while it ran (one of which may have taken an id
+    /// given back meanwhile: `knn_planned` then tries its hits against the
+    /// filter).
     #[test]
     fn scans_never_see_a_vector_half_written_or_a_slot_of_another_document() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -752,9 +759,20 @@ mod tests {
         }
         let stop = Arc::new(AtomicBool::new(false));
         let checked = Arc::new(AtomicUsize::new(0));
+        // By key: writes begun to it so far.
+        let written: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new(
+            (0..KEYS)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+        );
         let mut threads = Vec::new();
         for w in 0..3u64 {
-            let (flat, postings, stop) = (flat.clone(), postings.clone(), stop.clone());
+            let (flat, postings, stop, written) = (
+                flat.clone(),
+                postings.clone(),
+                stop.clone(),
+                written.clone(),
+            );
             threads.push(std::thread::spawn(move || {
                 let mut seed = 0x1234_5678 + w;
                 let mut version: u32 = 1;
@@ -762,6 +780,7 @@ mod tests {
                     let n = (rng(&mut seed) % u64::from(KEYS)) as u32;
                     let key = format!("doc:{n}");
                     version += 1;
+                    written[n as usize].fetch_add(1, Ordering::SeqCst);
                     if n >= STEADY && rng(&mut seed).is_multiple_of(3) {
                         flat.remove(&key);
                         postings.write().remove(&key);
@@ -778,11 +797,12 @@ mod tests {
             }));
         }
         for r in 0..3u64 {
-            let (flat, postings, stop, checked) = (
+            let (flat, postings, stop, checked, written) = (
                 flat.clone(),
                 postings.clone(),
                 stop.clone(),
                 checked.clone(),
+                written.clone(),
             );
             threads.push(std::thread::spawn(move || {
                 let check = |v: &[f32], key: &str| {
@@ -795,8 +815,27 @@ mod tests {
                 while !stop.load(Ordering::Relaxed) {
                     let hold = r == 0;
                     flat.each(hold, None, &mut |v, key| check(v, key));
-                    let ids = postings.peek().live().clone();
-                    flat.each_doc(&ids, &postings, hold, None, &mut |v, key| check(v, key));
+                    // The ids, the keys they named then, and the writes so far.
+                    let (ids, named) = {
+                        let p = postings.peek();
+                        let ids = p.live().clone();
+                        let named: ahash::AHashSet<String> =
+                            ids.iter().filter_map(|id| p.key(id).map(|k| k.to_string())).collect();
+                        (ids, named)
+                    };
+                    let before: Vec<u64> =
+                        written.iter().map(|w| w.load(Ordering::SeqCst)).collect();
+                    let met_by_ids = |key: &str| {
+                        let n: usize = key["doc:".len()..].parse().unwrap();
+                        assert!(
+                            named.contains(key) || written[n].load(Ordering::SeqCst) != before[n],
+                            "{key}: neither named by the ids nor written meanwhile"
+                        );
+                    };
+                    flat.each_doc(&ids, &postings, hold, None, &mut |v, key| {
+                        check(v, key);
+                        met_by_ids(key);
+                    });
                     // The nearest to 0 are the lowest numbers, which stay.
                     let (got, _) = flat.nearest(&prepared, 10, None);
                     let names: Vec<&str> = got.iter().map(|h| h.key.as_str()).collect();
@@ -808,6 +847,9 @@ mod tests {
                     let (got, _) = flat.nearest_of_docs(&prepared, 10, &ids, &postings, None);
                     assert!(!twice(&got));
                     assert_eq!(got.len(), 10);
+                    for hit in &got {
+                        met_by_ids(&hit.key);
+                    }
                     checked.fetch_add(1, Ordering::Relaxed);
                 }
             }));

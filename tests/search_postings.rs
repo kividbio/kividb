@@ -1971,3 +1971,109 @@ fn writes_racing_queries_are_seen_by_the_next_query() {
         assert_eq!(scanned, whole, "{args:?}");
     }
 }
+
+/// A filtered FLAT KNN while documents leave and others take their ids:
+/// 10,000 documents `t=a`; one client loops `FT.SEARCH "(@t:{a})=>[KNN 5
+/// @v $q]"` while another deletes `d:a:<i>` and writes `d:new:<i>` with
+/// `t=b` and the query's own vector (the nearest there is, were it
+/// measured), then the other way round. Postings give the last id given back
+/// to the next document, so the new one takes the id the filter matched for
+/// the one just deleted; every hit must be a document the filter matches:
+/// never a `d:new:` key. Runs for `KNN_REUSE_SECS` seconds (2 by default).
+#[test]
+fn a_filtered_flat_knn_returns_only_documents_the_filter_matches() {
+    let mut c = conn();
+    let reply = c.cmd(&[
+        "FT.CREATE",
+        "reuse",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "d:",
+        "SCHEMA",
+        "t",
+        "TAG",
+        "v",
+        "VECTOR",
+        "FLAT",
+        "6",
+        "TYPE",
+        "FLOAT32",
+        "DIM",
+        "8",
+        "DISTANCE_METRIC",
+        "L2",
+    ]);
+    assert!(reply.ok(), "{reply:?}");
+    const N: usize = 10_000;
+    let mut rng = Rng(0x1020_1020);
+    let vector = |rng: &mut Rng| -> Vec<f32> { (0..DIM).map(|_| rng.unit() + 1.0).collect() };
+    for i in 0..N {
+        let v = blob(&vector(&mut rng));
+        let key = format!("d:a:{i}");
+        c.send(&[b"HSET", key.as_bytes(), b"t", b"a", b"v", &v]);
+    }
+    for _ in 0..N {
+        assert!(matches!(c.read(), V::Int(_)));
+    }
+    let q = blob(&[0.0; DIM]);
+    let secs: u64 = std::env::var("KNN_REUSE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = stop.clone();
+        let q = q.clone();
+        thread::spawn(move || {
+            let mut w = conn();
+            let mut rng = Rng(0x0bad_f00d);
+            let mut writes = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                for i in 0..N {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let (old, new) = (format!("d:a:{i}"), format!("d:new:{i}"));
+                    w.cmd(&["DEL", &old]);
+                    let r = w.raw(&[b"HSET", new.as_bytes(), b"t", b"b", b"v", &q]);
+                    assert!(matches!(r, V::Int(_)), "{r:?}");
+                    w.cmd(&["DEL", &new]);
+                    let v = blob(&vector(&mut rng));
+                    let r = w.raw(&[b"HSET", old.as_bytes(), b"t", b"a", b"v", &v]);
+                    assert!(matches!(r, V::Int(_)), "{r:?}");
+                    writes += 4;
+                }
+            }
+            writes
+        })
+    };
+    let until = Instant::now() + Duration::from_secs(secs);
+    let mut queries = 0u64;
+    while Instant::now() < until {
+        let reply = c.raw(&[
+            b"FT.SEARCH",
+            b"reuse",
+            b"(@t:{a})=>[KNN 5 @v $q]",
+            b"PARAMS",
+            b"2",
+            b"q",
+            &q,
+            b"NOCONTENT",
+            b"DIALECT",
+            b"2",
+        ]);
+        assert!(matches!(reply, V::Arr(_)), "{reply:?}");
+        for key in reply.ordered_keys() {
+            assert!(
+                key.starts_with("d:a:"),
+                "query {queries}: {key} does not match (@t:{{a}})"
+            );
+        }
+        queries += 1;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let writes = writer.join().unwrap();
+    assert!(queries > 10 && writes > 100, "{queries} queries, {writes} writes");
+}

@@ -873,7 +873,10 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Some(plan) => {
             let mut seen = 0u32;
             let mut cut = false;
-            for key in crate::commands::search::keys_of(&def, &plan.ids) {
+            // Each document tried against the filter where the ids are not
+            // exactly the matches (any more: see `search::plan_keys`).
+            let (keys, exact) = crate::commands::search::plan_keys(&def, &plan);
+            for key in keys {
                 if crate::commands::search::deadline_due(deadline, &mut seen) {
                     cut = true;
                     break;
@@ -882,7 +885,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
                     continue;
                 }
                 crate::commands::search::with_doc(db_ref, &def, &key, now, |inner, json| {
-                    if plan.exact || crate::vector::filter::eval(&filter, inner) {
+                    if exact || crate::vector::filter::eval(&filter, inner) {
                         add_row(&key, inner, json);
                     }
                 });
@@ -2085,12 +2088,30 @@ pub(crate) fn knn_planned(
             .filter(|r| crate::commands::search::field_hidden(db, &r.key, &knn.field, now))
             .map(|r| r.key.clone())
             .collect();
-        if (gone.is_empty() && hidden.is_empty()) || cut {
+        // Ids given back while the query ran may have been given out again,
+        // to documents the filter was not worked out for: then each hit is
+        // tried against the filter on its own document, and one that does
+        // not match is left out of the plan. Otherwise this is one compare.
+        let others: Vec<String> = if def.postings.peek().given_back() == plan.given_back {
+            Vec::new()
+        } else {
+            nearest
+                .iter()
+                .filter(|r| {
+                    only.is_some_and(|only| !only.contains(&r.key))
+                        || crate::commands::search::with_doc(db, def, &r.key, now, |fields, _| {
+                            crate::vector::filter::eval(filter, fields)
+                        }) == Some(false)
+                })
+                .map(|r| r.key.clone())
+                .collect()
+        };
+        if (gone.is_empty() && hidden.is_empty() && others.is_empty()) || cut {
             let mut nearest = nearest;
-            nearest.retain(|r| !hidden.contains(&r.key));
+            nearest.retain(|r| !hidden.contains(&r.key) && !others.contains(&r.key));
             return Some((nearest, cut));
         }
-        for key in &hidden {
+        for key in hidden.iter().chain(&others) {
             if let Some(id) = def.postings.peek().id(key) {
                 plan.ids.unset(id);
             }

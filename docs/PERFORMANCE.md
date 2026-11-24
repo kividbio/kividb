@@ -807,7 +807,8 @@ Blocks start at 8 slots and double up to 1,024, so a small index holds
 little more than its vectors; at 100 × 64 the last block (64 of the 120
 slots made) is a third empty. A delete gives the slot to the next
 document; the blocks are given back with the index (`FT.DROPINDEX`,
-`FLUSHALL`). Suite `51-filtered-flat-knn` of
+`FLUSHALL`), so after many deletes the index holds what it held at its
+peak until then. Suite `51-filtered-flat-knn` of
 [`benchmarks/1.3.0/regressions`](../benchmarks/1.3.0/regressions/README.md)
 measures the two layouts against 1.2.2 and Redis (given its query engine module) and
 fails a build that loses the gain.

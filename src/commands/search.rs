@@ -1110,6 +1110,12 @@ pub(crate) struct Plan {
     /// their postings hold may be behind them (whether they match was tried
     /// on them).
     pub volatile: bool,
+    /// [`Postings::given_back`] as the ids were read. Once it has moved, an
+    /// id may have been given to another document since: its document is
+    /// tried against the filter, as where the ids are not exact.
+    ///
+    /// [`Postings::given_back`]: crate::vector::postings::Postings::given_back
+    pub given_back: u64,
 }
 
 /// The documents of `def` that `filter` may match, among `only` if given,
@@ -1151,11 +1157,12 @@ fn plan_in(
         .iter()
         .map(|key| crate::key_bytes::text_of(key).into_owned())
         .collect();
-    let (mut ids, exact, volatile) = {
+    let (mut ids, exact, volatile, given_back) = {
         let p = def.postings.read();
         if !p.enabled() || p.unused {
             return None;
         }
+        let given_back = p.given_back();
         let (mut ids, exact) = match resolve(filter, def, &p) {
             Cand::Exact(ids) => (ids, true),
             Cand::Superset(ids) => (ids, false),
@@ -1182,7 +1189,7 @@ fn plan_in(
             .filter(|key| only.is_none_or(|only| only.contains(key)))
             .filter_map(|key| p.id(&key).map(|id| (key, id)))
             .collect();
-        (ids, exact, volatile)
+        (ids, exact, volatile, given_back)
     };
     let store = &store[db];
     let any_volatile = !volatile.is_empty();
@@ -1204,6 +1211,7 @@ fn plan_in(
         ids,
         exact,
         volatile: any_volatile,
+        given_back,
     })
 }
 
@@ -1211,6 +1219,15 @@ fn plan_in(
 pub(crate) fn keys_of(def: &IndexDef, ids: &Bits) -> Vec<Arc<str>> {
     let p = def.postings.peek();
     ids.iter().filter_map(|id| p.key(id).cloned()).collect()
+}
+
+/// The keys of `plan`'s ids, and whether they are exactly the matches: not
+/// once an id has been given back since the plan read them (see
+/// [`Plan::given_back`]), when each is to be tried against the filter.
+pub(crate) fn plan_keys(def: &IndexDef, plan: &Plan) -> (Vec<Arc<str>>, bool) {
+    let p = def.postings.peek();
+    let keys = plan.ids.iter().filter_map(|id| p.key(id).cloned()).collect();
+    (keys, plan.exact && p.given_back() == plan.given_back)
 }
 
 /// Relevance of the document at `key`, whose fields are `fields`, for the
@@ -1281,12 +1298,13 @@ pub(crate) fn filter_each(
     // read only to hand it over, or to try it where they are not exact.
     if let Some(plan) = plan(ctx, def, filter, only, now) {
         let mut seen = 0u32;
-        for key in keys_of(def, &plan.ids) {
+        let (keys, exact) = plan_keys(def, &plan);
+        for key in keys {
             if deadline_due(deadline, &mut seen) {
                 return true;
             }
             with_doc(db, def, &key, now, |fields, json| {
-                if plan.exact || filter::eval(filter, fields) {
+                if exact || filter::eval(filter, fields) {
                     accept(&key, fields, json);
                 }
             });
