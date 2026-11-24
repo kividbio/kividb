@@ -5304,6 +5304,9 @@ pub struct FrozenDataset {
     /// (#848), and given back as it is freed. Its holds on strings are
     /// counted as the table lets go of them (`store::entry`).
     not_counted: crate::memory_use::NotCounted,
+    /// For `dump.kdb`: the spill of each capture thread (#825), read back
+    /// as the image is written.
+    spills: Vec<SpillStream>,
 }
 
 /// A buffer the capture lays values out in, which counts what it holds as
@@ -5350,6 +5353,605 @@ impl Write for CapturedBuf {
     }
 }
 
+/// The parts a capture for `dump.kdb` lays the values that are not strings
+/// out in (#825): each, once full, goes to a writer thread that writes it to
+/// a spill file, and is copied from there into the dump as it is written.
+const SPILL_PART: usize = 1 << 20;
+
+/// How many full parts a capture thread may have waiting for its writer,
+/// besides the one it fills and the one being written: 8 MiB a capture
+/// thread while the disk keeps up, at most 64 MiB a save.
+const SPILL_QUEUE: usize = 6;
+
+/// Where and in what parts a capture for `dump.kdb` spills.
+#[derive(Clone)]
+struct Spill {
+    /// The dump's directory: the same filesystem and permissions as the
+    /// dump's temporary file.
+    dir: std::path::PathBuf,
+    part: usize,
+    queue: usize,
+    /// The named file even where `O_TMPFILE` works (tests:
+    /// `snapshot-spill-named`).
+    named: bool,
+    /// A full part waits for room in the queue instead of being held
+    /// (tests: `snapshot-spill-waits`, for a bound that does not depend on
+    /// how fast the disk is).
+    waits: bool,
+    /// While set, the writers write nothing, as with a disk that does not
+    /// keep up (tests).
+    stalled: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Spill {
+    fn new(dir: std::path::PathBuf) -> Self {
+        Self {
+            dir,
+            part: SPILL_PART,
+            queue: SPILL_QUEUE,
+            named: crate::aof::injected("snapshot-spill-named"),
+            waits: crate::aof::injected("snapshot-spill-waits"),
+            stalled: None,
+        }
+    }
+}
+
+/// A spill file: in `dir`, with no name, so that nothing is left in the
+/// directory however the save ends. `O_TMPFILE` where the filesystem has it
+/// (unless `named`); elsewhere a file named as a dump's temporary file
+/// (which a start removes, should the process die between the two steps),
+/// removed as soon as it is open.
+fn open_spill(dir: &std::path::Path, named: bool) -> io::Result<File> {
+    #[cfg(target_os = "linux")]
+    if !named {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_TMPFILE)
+            .open(dir)
+        {
+            Ok(file) => return Ok(file),
+            // A filesystem without it, or a kernel before 3.11 (which reads
+            // the flag as `O_DIRECTORY`).
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::EOPNOTSUPP | libc::EISDIR | libc::EINVAL)
+                ) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = named;
+    let path = dir.join(crate::aof::temp_dump_name());
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    std::fs::remove_file(&path)?;
+    Ok(file)
+}
+
+/// A spill file its writer is done with, and the xxh3 of each part it
+/// wrote, in the order they were sent: what is read back is checked
+/// against it.
+struct SpillFile {
+    file: File,
+    hashes: Vec<u64>,
+}
+
+/// A spill writer's thread: it opens the file, writes the parts in the
+/// order they are sent, and hands each buffer back for the next part. It,
+/// not a capture thread, waits for the disk, and closes the file.
+fn write_spill(
+    spill: Spill,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    parts: std::sync::mpsc::Receiver<Vec<u8>>,
+    back: std::sync::mpsc::Sender<Vec<u8>>,
+) -> io::Result<SpillFile> {
+    use std::sync::atomic::Ordering;
+    if let Some(stalled) = &spill.stalled {
+        while stalled.load(Ordering::Acquire) && !cancel.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    if crate::aof::injected_failure("snapshot-spill-open-fails") {
+        return Err(io::Error::other(
+            "a spill file could not be opened (test failpoint)",
+        ));
+    }
+    let mut file = open_spill(&spill.dir, spill.named)?;
+    let mut hashes = Vec::new();
+    for mut part in parts {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::other("the save was given up"));
+        }
+        // With the file open and a part written.
+        if !hashes.is_empty() && crate::aof::injected_failure("snapshot-spill-fails") {
+            return Err(io::Error::other("a spill write failed (test failpoint)"));
+        }
+        hashes.push(xxhash_rust::xxh3::xxh3_64(&part));
+        file.write_all(&part)?;
+        part.clear();
+        // Once the capture is over nobody takes it: it is freed here.
+        let _ = back.send(part);
+    }
+    Ok(SpillFile { file, hashes })
+}
+
+/// A spill writer, as a capture thread sees it.
+struct SpillWriter {
+    parts: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    back: std::sync::mpsc::Receiver<Vec<u8>>,
+    thread: Option<std::thread::JoinHandle<io::Result<SpillFile>>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SpillWriter {
+    fn start(spill: &Spill, index: usize) -> io::Result<Self> {
+        use crate::cpus::BuilderExt as _;
+        let (parts, received) = std::sync::mpsc::sync_channel(spill.queue);
+        let (back, returned) = std::sync::mpsc::channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (theirs, stop) = (spill.clone(), cancel.clone());
+        let thread = std::thread::Builder::new()
+            .name(format!("kividb-spill-{index}"))
+            .spawn_released(move || write_spill(theirs, stop, received, back))?;
+        Ok(Self {
+            parts: Some(parts),
+            back: returned,
+            thread: Some(thread),
+            cancel,
+        })
+    }
+}
+
+impl Drop for SpillWriter {
+    /// A save given up before its writer was waited for: the writer stops
+    /// at its next part and closes the file itself. Closing a large file
+    /// with no name frees its blocks there and then (on ext4, before
+    /// `close` returns): that is not done here, where writes may be held.
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.parts = None;
+    }
+}
+
+/// What a capture thread spills: its writer, and the buffers it lays values
+/// out in. The capture threads of the same index in each database use it in
+/// turn, so that a save has at most one spill file a capture thread (8).
+#[derive(Default)]
+struct SpillStream {
+    /// Started when the first part is sent.
+    writer: Option<SpillWriter>,
+    /// An empty buffer, for the next capture thread.
+    spare: Option<Vec<u8>>,
+    /// Where the next part sent goes in the file, and its number.
+    offset: u64,
+    sent: usize,
+    /// The buffers made and not freed, but for those parts hold: what they
+    /// take is counted here (#848).
+    buffers: usize,
+    counted: crate::memory_use::NotCounted,
+    /// Once the writer is done: the file, or why there is none.
+    written: Option<io::Result<SpillFile>>,
+}
+
+impl SpillStream {
+    /// A buffer for a part: the spare, one the writer is done with, or a
+    /// new one.
+    fn buffer(&mut self, spill: &Spill) -> Vec<u8> {
+        if let Some(buffer) = self.spare.take() {
+            return buffer;
+        }
+        if let Some(writer) = &self.writer
+            && let Ok(buffer) = writer.back.try_recv()
+        {
+            // Parts held while the writer was behind come back too, once
+            // they are sent: past what the queue needs, they are freed.
+            while self.buffers > spill.queue + 2 {
+                let Ok(extra) = writer.back.try_recv() else {
+                    break;
+                };
+                drop(extra);
+                self.buffers -= 1;
+                self.counted.release(spill.part);
+            }
+            return buffer;
+        }
+        self.buffers += 1;
+        self.counted.add(spill.part);
+        Vec::with_capacity(spill.part)
+    }
+
+    /// Send `part` to the writer, started on the first: the piece of the
+    /// file it is to be, or `part` back when the queue is full.
+    fn send(
+        &mut self,
+        spill: &Spill,
+        index: usize,
+        part: Vec<u8>,
+    ) -> io::Result<Result<Piece, Vec<u8>>> {
+        use std::sync::mpsc::TrySendError;
+        if self.writer.is_none() {
+            self.writer = Some(SpillWriter::start(spill, index)?);
+        }
+        let len = part.len();
+        let to = self
+            .writer
+            .as_ref()
+            .and_then(|writer| writer.parts.as_ref())
+            .ok_or_else(|| io::Error::other("the spill writer is closed"))?;
+        let sent = if spill.waits {
+            to.send(part)
+                .map_err(|refused| TrySendError::Disconnected(refused.0))
+        } else {
+            to.try_send(part)
+        };
+        match sent {
+            Ok(()) => {
+                let piece = Piece::Spilled {
+                    stream: index,
+                    seq: self.sent,
+                    offset: self.offset,
+                    len,
+                };
+                self.sent += 1;
+                self.offset += len as u64;
+                Ok(Ok(piece))
+            }
+            Err(TrySendError::Full(part)) => Ok(Err(part)),
+            // The writer stopped: it failed, and says why.
+            Err(TrySendError::Disconnected(_)) => Err(match self.file() {
+                Err(e) => e,
+                Ok(_) => io::Error::other("the spill writer stopped"),
+            }),
+        }
+    }
+
+    /// The capture is over: the spare is freed, and the writer told that
+    /// nothing more comes.
+    fn captured(&mut self, spill: &Spill) {
+        if self.spare.take().is_some() {
+            self.buffers -= 1;
+            self.counted.release(spill.part);
+        }
+        if let Some(writer) = &mut self.writer {
+            writer.parts = None;
+        }
+    }
+
+    /// The spill file once its writer has written everything sent to it (it
+    /// is waited for here, after the capture), and the buffers it handed
+    /// back freed.
+    fn file(&mut self) -> io::Result<&SpillFile> {
+        if self.written.is_none() {
+            let thread = self.writer.as_mut().and_then(|writer| {
+                writer.parts = None;
+                writer.thread.take()
+            });
+            let written = match thread {
+                Some(thread) => thread
+                    .join()
+                    .unwrap_or_else(|_| Err(io::Error::other("a spill writer panicked"))),
+                None => Err(io::Error::other("nothing was spilled here")),
+            };
+            self.writer = None;
+            self.spare = None;
+            self.buffers = 0;
+            self.counted.set(0);
+            self.written = Some(written);
+        }
+        match self.written.as_ref() {
+            Some(Ok(file)) => Ok(file),
+            Some(Err(e)) => Err(io::Error::new(e.kind(), e.to_string())),
+            None => unreachable!("set above"),
+        }
+    }
+}
+
+/// A piece of what a capture thread laid out: in memory, or written to its
+/// spill file at `offset`, the `seq`th part sent there.
+enum Piece {
+    Held(Vec<u8>),
+    Spilled {
+        stream: usize,
+        seq: usize,
+        offset: u64,
+        len: usize,
+    },
+}
+
+/// What a capture thread laid out of the values that are not strings, in
+/// order: together the pieces are the bytes a [`CapturedBuf`] would have
+/// held, so the image does not change.
+#[derive(Default)]
+struct EncodedPart {
+    pieces: Vec<Piece>,
+}
+
+impl EncodedPart {
+    fn len(&self) -> usize {
+        self.pieces
+            .iter()
+            .map(|piece| match piece {
+                Piece::Held(bytes) => bytes.len(),
+                Piece::Spilled { len, .. } => *len,
+            })
+            .sum()
+    }
+
+    /// Write the part out, piece by piece: a spilled one is read back from
+    /// its file (into `read`), checked against the xxh3 its writer took of
+    /// it, and its blocks given back once copied. A piece read back
+    /// otherwise than it was written fails the save.
+    fn write_to(
+        self,
+        out: &mut impl Write,
+        spills: &mut [SpillStream],
+        not_counted: &mut crate::memory_use::NotCounted,
+        read: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        for piece in self.pieces {
+            match piece {
+                Piece::Held(bytes) => {
+                    out.write_all(&bytes)?;
+                    not_counted.release(bytes.capacity());
+                }
+                Piece::Spilled {
+                    stream,
+                    seq,
+                    offset,
+                    len,
+                } => {
+                    let spilled = spills
+                        .get_mut(stream)
+                        .ok_or_else(|| io::Error::other("a spill file that is not there"))?
+                        .file()?;
+                    if read.len() < len {
+                        read.resize(len, 0);
+                    }
+                    let bytes = &mut read[..len];
+                    read_spilled(&spilled.file, bytes, offset)?;
+                    if crate::aof::injected_failure("snapshot-spill-read-fails") {
+                        return Err(io::Error::other(
+                            "a spill file could not be read (test failpoint)",
+                        ));
+                    }
+                    if crate::aof::injected("snapshot-spill-reads-wrong") {
+                        bytes[len / 2] ^= 1;
+                    }
+                    if spilled.hashes.get(seq) != Some(&xxhash_rust::xxh3::xxh3_64(bytes)) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "the spill file reads back otherwise than it was written \
+                                 ({len} bytes at {offset})"
+                            ),
+                        ));
+                    }
+                    out.write_all(bytes)?;
+                    give_back(&spilled.file, offset, len);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `len` bytes of a spill file at `offset`.
+fn read_spilled(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(bytes, offset)
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{Seek, SeekFrom};
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(bytes)
+    }
+}
+
+/// The blocks of a piece of a spill file copied into the dump, given back
+/// (Linux, `FALLOC_FL_PUNCH_HOLE`): the spill files then take what is still
+/// to be copied, not the collections' part of the dump whole. Best effort:
+/// on a filesystem without it the blocks go when the file is closed.
+fn give_back(file: &File, offset: u64, len: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let (Ok(offset), Ok(len)) = (libc::off_t::try_from(offset), libc::off_t::try_from(len))
+        else {
+            return;
+        };
+        // SAFETY: `fallocate` on an open descriptor this `File` owns, with
+        // no pointers; whatever it returns is ignored.
+        unsafe {
+            libc::fallocate(
+                file.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                offset,
+                len,
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (file, offset, len);
+}
+
+/// What a capture thread lays the values that are not strings out in.
+/// Without a [`Spill`] (a full sync's or a backup's image, made in memory
+/// anyway), one buffer that grows as a `Vec` does, counted as it grows, as
+/// a [`CapturedBuf`] is. With one, parts of [`Spill::part`], each sent to
+/// the thread's spill writer as it fills. It runs with writes held, so it
+/// never waits for the disk: when the writer is behind (the queue is full),
+/// a part is held in memory, as without a spill, and sent once there is
+/// room again.
+struct SpillingBuf<'a> {
+    spill: Option<(&'a Spill, usize, &'a mut SpillStream)>,
+    /// The part being filled: no buffer until the first byte. What a write
+    /// that fits in it costs is a copy and a comparison, as a `Vec`'s.
+    current: Vec<u8>,
+    pieces: Vec<Piece>,
+    /// The pieces held because the writer was behind, oldest first.
+    waiting: VecDeque<usize>,
+    /// What those take (#848); without a spill, what `current` takes.
+    counted: crate::memory_use::NotCounted,
+}
+
+impl<'a> SpillingBuf<'a> {
+    fn new(spill: Option<(&'a Spill, usize, &'a mut SpillStream)>) -> Self {
+        Self {
+            spill,
+            current: Vec::new(),
+            pieces: Vec::new(),
+            waiting: VecDeque::new(),
+            counted: crate::memory_use::NotCounted::default(),
+        }
+    }
+
+    /// The full part is sent, after the parts held before it; it is held
+    /// too if the writer is behind.
+    fn ship(&mut self) -> io::Result<()> {
+        let Some((spill, index, stream)) = &mut self.spill else {
+            return Ok(());
+        };
+        let (spill, index) = (*spill, *index);
+        let full = std::mem::take(&mut self.current);
+        while let Some(&at) = self.waiting.front() {
+            let Piece::Held(bytes) =
+                std::mem::replace(&mut self.pieces[at], Piece::Held(Vec::new()))
+            else {
+                unreachable!("only held pieces wait");
+            };
+            match stream.send(spill, index, bytes)? {
+                Ok(piece) => {
+                    self.pieces[at] = piece;
+                    self.waiting.pop_front();
+                    // Its buffer comes back to the stream.
+                    self.counted.release(spill.part);
+                    stream.buffers += 1;
+                    stream.counted.add(spill.part);
+                }
+                Err(bytes) => {
+                    self.pieces[at] = Piece::Held(bytes);
+                    break;
+                }
+            }
+        }
+        let sent = if self.waiting.is_empty() {
+            stream.send(spill, index, full)?
+        } else {
+            Err(full)
+        };
+        match sent {
+            Ok(piece) => self.pieces.push(piece),
+            Err(full) => {
+                self.waiting.push_back(self.pieces.len());
+                self.pieces.push(Piece::Held(full));
+                stream.buffers -= 1;
+                stream.counted.release(spill.part);
+                self.counted.add(spill.part);
+            }
+        }
+        Ok(())
+    }
+
+    /// The part, and the count of what it holds in memory.
+    fn finish(mut self) -> io::Result<(EncodedPart, crate::memory_use::NotCounted)> {
+        if self.spill.is_none() {
+            let pieces = vec![Piece::Held(self.current)];
+            return Ok((EncodedPart { pieces }, self.counted));
+        }
+        let Some((spill, _, stream)) = &mut self.spill else {
+            unreachable!("handled above");
+        };
+        let spilling = stream.writer.is_some();
+        if self.current.is_empty() {
+            if self.current.capacity() > 0 {
+                stream.spare = Some(std::mem::take(&mut self.current));
+            }
+        } else if spilling {
+            self.ship()?;
+        } else {
+            // Less than a part, and nothing spilled yet: kept in memory, as
+            // without a spill, rather than a writer started for it.
+            let mut rest = std::mem::take(&mut self.current);
+            rest.shrink_to_fit();
+            stream.buffers -= 1;
+            stream.counted.release(spill.part);
+            self.counted.add(rest.capacity());
+            self.pieces.push(Piece::Held(rest));
+        }
+        Ok((
+            EncodedPart {
+                pieces: self.pieces,
+            },
+            self.counted,
+        ))
+    }
+}
+
+impl SpillingBuf<'_> {
+    /// What does not fit in `current`: it grows (no spill), or it is sent
+    /// and the rest goes into the next part.
+    #[inline(never)]
+    fn write_on(&mut self, mut data: &[u8]) -> io::Result<()> {
+        let Some((spill, _, stream)) = &mut self.spill else {
+            self.current.extend_from_slice(data);
+            let capacity = self.current.capacity();
+            if capacity != self.counted.bytes() {
+                self.counted.set(capacity);
+            }
+            return Ok(());
+        };
+        let part = spill.part;
+        if self.current.capacity() == 0 {
+            self.current = stream.buffer(spill);
+        }
+        loop {
+            let room = part.saturating_sub(self.current.len());
+            if data.len() <= room {
+                self.current.extend_from_slice(data);
+                return Ok(());
+            }
+            let (now, rest) = data.split_at(room);
+            self.current.extend_from_slice(now);
+            data = rest;
+            self.ship()?;
+            if let Some((spill, _, stream)) = &mut self.spill {
+                self.current = stream.buffer(spill);
+            }
+        }
+    }
+}
+
+impl Write for SpillingBuf<'_> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.write_all(data)?;
+        Ok(data.len())
+    }
+
+    #[inline(always)]
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        if data.len() <= self.current.capacity() - self.current.len() {
+            self.current.extend_from_slice(data);
+            return Ok(());
+        }
+        self.write_on(data)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A writer that counts what goes through it: the size of a plain image
 /// as it is written (`INFO persistence`).
 struct CountingWriter<W: Write> {
@@ -5382,7 +5984,7 @@ impl<W: Write> Write for CountingWriter<W> {
 /// and the count of what those take, which is not to be evicted for.
 struct FrozenPart {
     strings: Vec<store::EntryRef>,
-    encoded: Vec<u8>,
+    encoded: EncodedPart,
     sketches: Vec<(Key, crate::sketch::Sketch)>,
     timed: Vec<(Key, u64)>,
     counted: crate::memory_use::NotCounted,
@@ -5404,8 +6006,9 @@ fn part_bytes(
 struct FrozenDb {
     /// One part per thread of the capture (see [`freeze`]).
     strings: Vec<Vec<store::EntryRef>>,
-    /// Complete KDB entries for every non-string key, likewise.
-    encoded: Vec<Vec<u8>>,
+    /// Complete KDB entries for every non-string key, likewise: for
+    /// `dump.kdb`, mostly in the capture threads' spill files (#825).
+    encoded: Vec<EncodedPart>,
     /// The probabilistic values, as copies that share their bytes with the
     /// store's (`sketch::bloom::LayerBytes`): taken in no time while writes
     /// are held, and laid out once they go on again. A write meanwhile
@@ -5422,22 +6025,32 @@ pub fn freeze_dataset(
     store: &crate::store::Store,
     index_store: Option<&crate::vector::IndexStore>,
 ) -> std::io::Result<FrozenDataset> {
-    freeze(store, index_store, false)
+    freeze(store, index_store, false, None)
 }
 
 /// [`freeze_dataset`] for `dump.kdb`: with the vector indexes' graphs, which
 /// a replica rebuilds but a restart should not have to.
+///
+/// What a capture thread lays out goes, [`SPILL_PART`] at a time, to a
+/// spill file in the working directory, the dump's (#825); in a unit test,
+/// the system's temporary directory.
 pub fn freeze_dataset_for_disk(
     store: &crate::store::Store,
     index_store: Option<&crate::vector::IndexStore>,
 ) -> std::io::Result<FrozenDataset> {
-    freeze(store, index_store, true)
+    let dir = if cfg!(test) {
+        std::env::temp_dir()
+    } else {
+        std::path::PathBuf::from(".")
+    };
+    freeze(store, index_store, true, Some(&Spill::new(dir)))
 }
 
 fn freeze(
     store: &crate::store::Store,
     index_store: Option<&crate::vector::IndexStore>,
     with_graphs: bool,
+    spill: Option<&Spill>,
 ) -> std::io::Result<FrozenDataset> {
     // Writes are held for all of this, and it is a pass over every key: it
     // is spread over several threads, a run of shards each, and a key is
@@ -5451,6 +6064,14 @@ fn freeze(
     let mut dbs = Vec::with_capacity(store.len());
     // What the capture lays out, counted as each thread makes it (#848).
     let mut not_counted = crate::memory_use::NotCounted::default();
+    // One spill a capture thread, used by that thread of each database.
+    let mut spills: Vec<SpillStream> = match spill {
+        Some(_) => (0..threads).map(|_| SpillStream::default()).collect(),
+        None => Vec::new(),
+    };
+    // Set by a capture thread that fails: the others stop at their next
+    // shard, and writes are held only as long as it takes to find out.
+    let failed = std::sync::atomic::AtomicBool::new(false);
     for db in store.iter() {
         let shards: Vec<_> = db.iter().collect();
         let keys: usize = shards.iter().map(|shard| read_lock!(shard).len()).sum();
@@ -5459,55 +6080,21 @@ fn freeze(
         } else {
             shards.len().div_ceil(threads).max(1)
         };
+        let failed = &failed;
+        let mut streams = spills.iter_mut().enumerate();
         let parts: Vec<std::io::Result<FrozenPart>> = std::thread::scope(|scope| {
             let handles: Vec<_> = shards
                 .chunks(per)
                 .map(|run| {
+                    let out = spill
+                        .zip(streams.next())
+                        .map(|(spill, (index, stream))| (spill, index, stream));
                     scope.spawn_released(move || {
-                        let mut strings = Vec::new();
-                        let mut encoded = CapturedBuf::default();
-                        let mut sketches = Vec::new();
-                        let mut timed = Vec::new();
-                        let mut counted = crate::memory_use::NotCounted::default();
-                        for shard in run {
-                            let map = read_lock!(shard);
-                            strings.reserve(map.len());
-                            // The strings' holds are all of a shard's keys
-                            // at most: counted here, not for each key.
-                            counted.set(part_bytes(&strings, &sketches, &timed));
-                            for entry in map.entries() {
-                                match entry.value() {
-                                    // Eight bytes and a count: no copy of
-                                    // the key, nor of the bytes, nor of
-                                    // its time to live.
-                                    ValueRef::String(_) => strings.push(entry.hold()),
-                                    ValueRef::Sketch(sketch) => {
-                                        let copy = sketch.read().clone();
-                                        sketches.push((Key::from(entry.key()), copy));
-                                        if let Some(at) = entry.expires() {
-                                            timed.push((Key::from(entry.key()), at));
-                                        }
-                                        counted.set(part_bytes(&strings, &sketches, &timed));
-                                    }
-                                    other => {
-                                        write_kdb_entry(&mut encoded, entry.key(), other)?;
-                                        if let Some(at) = entry.expires() {
-                                            timed.push((Key::from(entry.key()), at));
-                                            counted.set(part_bytes(&strings, &sketches, &timed));
-                                        }
-                                    }
-                                }
-                            }
+                        let captured = capture_run(run, out, failed);
+                        if captured.is_err() {
+                            failed.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
-                        let (encoded, encoded_counted) = encoded.finish();
-                        counted.absorb(encoded_counted);
-                        Ok(FrozenPart {
-                            strings,
-                            encoded,
-                            sketches,
-                            timed,
-                            counted,
-                        })
+                        captured
                     })
                 })
                 .collect();
@@ -5520,15 +6107,36 @@ fn freeze(
                 .collect()
         });
         let mut frozen = FrozenDb::default();
+        // The first error that is not another thread stopping for it.
+        let mut error: Option<std::io::Error> = None;
         for part in parts {
-            let part = part?;
+            let part = match part {
+                Ok(part) => part,
+                Err(e) => {
+                    if error.as_ref().is_none_or(|first| {
+                        first.kind() == std::io::ErrorKind::Interrupted
+                            && e.kind() != std::io::ErrorKind::Interrupted
+                    }) {
+                        error = Some(e);
+                    }
+                    continue;
+                }
+            };
             not_counted.absorb(part.counted);
             frozen.strings.push(part.strings);
             frozen.encoded.push(part.encoded);
             frozen.sketches.push(part.sketches);
             frozen.timed.push(part.timed);
         }
+        if let Some(e) = error {
+            return Err(e);
+        }
         dbs.push(frozen);
+    }
+    for stream in &mut spills {
+        if let Some(spill) = spill {
+            stream.captured(spill);
+        }
     }
 
     // For a replica, schemas only: HNSW graphs are large and a replica
@@ -5571,6 +6179,65 @@ fn freeze(
         score_section,
         nofreqs_section,
         not_counted,
+        spills,
+    })
+}
+
+/// One capture thread's run of shards: [`freeze`]'s, with writes held.
+/// It stops at the next shard once another thread has failed (`failed`).
+fn capture_run(
+    run: &[&store::Shard],
+    spill: Option<(&Spill, usize, &mut SpillStream)>,
+    failed: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<FrozenPart> {
+    let mut strings = Vec::new();
+    let mut encoded = SpillingBuf::new(spill);
+    let mut sketches = Vec::new();
+    let mut timed = Vec::new();
+    let mut counted = crate::memory_use::NotCounted::default();
+    for shard in run {
+        if failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "another capture thread failed",
+            ));
+        }
+        let map = read_lock!(shard);
+        strings.reserve(map.len());
+        // The strings' holds are all of a shard's keys at most: counted
+        // here, not for each key.
+        counted.set(part_bytes(&strings, &sketches, &timed));
+        for entry in map.entries() {
+            match entry.value() {
+                // Eight bytes and a count: no copy of the key, nor of the
+                // bytes, nor of its time to live.
+                ValueRef::String(_) => strings.push(entry.hold()),
+                ValueRef::Sketch(sketch) => {
+                    let copy = sketch.read().clone();
+                    sketches.push((Key::from(entry.key()), copy));
+                    if let Some(at) = entry.expires() {
+                        timed.push((Key::from(entry.key()), at));
+                    }
+                    counted.set(part_bytes(&strings, &sketches, &timed));
+                }
+                other => {
+                    write_kdb_entry(&mut encoded, entry.key(), other)?;
+                    if let Some(at) = entry.expires() {
+                        timed.push((Key::from(entry.key()), at));
+                        counted.set(part_bytes(&strings, &sketches, &timed));
+                    }
+                }
+            }
+        }
+    }
+    let (encoded, encoded_counted) = encoded.finish()?;
+    counted.absorb(encoded_counted);
+    Ok(FrozenPart {
+        strings,
+        encoded,
+        sketches,
+        timed,
+        counted,
     })
 }
 
@@ -5619,7 +6286,7 @@ impl FrozenDataset {
             .dbs
             .iter()
             .flat_map(|db| db.encoded.iter())
-            .map(Vec::len)
+            .map(EncodedPart::len)
             .sum();
         let sketch_bytes: u64 = self
             .dbs
@@ -5701,6 +6368,9 @@ impl FrozenDataset {
         // that a key written over or deleted since the capture is freed
         // then, not when the whole image is (#284).
         let mut timed_strings: Vec<Vec<(Key, u64)>> = Vec::with_capacity(self.dbs.len());
+        // What a spilled piece is read back into, [`SPILL_PART`] at most.
+        let mut spills = std::mem::take(&mut self.spills);
+        let mut read = Vec::new();
         for db in &mut self.dbs {
             let mut timed = Vec::new();
             // What `timed` takes, counted as it grows: it is made here
@@ -5725,8 +6395,10 @@ impl FrozenDataset {
                 self.not_counted.release(held);
             }
             timed_strings.push(timed);
-            for encoded in &db.encoded {
-                out.write_all(encoded)?;
+            // Each piece held in memory goes as soon as it is written, and
+            // each spilled one's blocks (#825).
+            for encoded in std::mem::take(&mut db.encoded) {
+                encoded.write_to(out, &mut spills, &mut self.not_counted, &mut read)?;
             }
             // Each copy goes as soon as it is written, as each string's
             // hold does.
@@ -9083,5 +9755,230 @@ pub(crate) mod readings_tests {
         }
         assert_eq!(verify_snapshot(&image).unwrap(), 32);
         assert_eq!(load_snapshot_bytes(&image).unwrap().dbs.len(), 16);
+    }
+}
+
+/// A capture for `dump.kdb` that spills (#825): the image is the one laid
+/// out in memory, byte for byte, whatever was spilled, held or read back.
+#[cfg(test)]
+mod spill_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn string(v: &str) -> KiviDBValue {
+        KiviDBValue::String(SharedBytes::from(v.as_bytes()))
+    }
+
+    fn hash(field: &str, value: &str) -> KiviDBValue {
+        let mut fields = crate::types::HashFields::default();
+        fields.insert_bytes(field, value.as_bytes());
+        KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(fields)))
+    }
+
+    /// Database 0: 120,000 hashes (so that several capture threads lay it
+    /// out), some with a time to live, strings, and lists with one element
+    /// larger than several parts between them. Database 1: one large hash.
+    /// Database 2: strings only.
+    fn dataset() -> crate::store::Store {
+        let far = unix_ms_now() + 3_600_000;
+        let store = crate::store::new_store(3);
+        let mut db0: HashMap<Key, KiviDBValue> = HashMap::new();
+        let mut timed: HashMap<Key, u64> = HashMap::new();
+        let large = vec![b'l'; 200 << 10];
+        for i in 0..120_000u64 {
+            let key = Key::from(format!("h:{i}").as_bytes());
+            db0.insert(key.clone(), hash(&format!("f{i}"), &"v".repeat(40)));
+            if i % 7 == 0 {
+                timed.insert(key, far + i);
+            }
+            if i % 30_000 == 0 {
+                let list: ListValues = [&b"a"[..], large.as_slice(), &b"z"[..]]
+                    .into_iter()
+                    .collect();
+                db0.insert(
+                    Key::from(format!("l:{i}").as_bytes()),
+                    KiviDBValue::List(Arc::new(parking_lot::RwLock::new(list))),
+                );
+            }
+        }
+        for i in 0..1_000u64 {
+            db0.insert(Key::from(format!("s:{i}").as_bytes()), string("x"));
+        }
+        let mut big = crate::types::HashFields::default();
+        for i in 0..20_000u64 {
+            big.insert_bytes(&format!("field:{i}"), "w".repeat(20).as_bytes());
+        }
+        let db1 = HashMap::from([(
+            Key::from(&b"big"[..]),
+            KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(big))),
+        )]);
+        let db2: HashMap<Key, KiviDBValue> = (0..100u64)
+            .map(|i| (Key::from(format!("t:{i}").as_bytes()), string("y")))
+            .collect();
+        restore_into_store(vec![db0, db1, db2], &store);
+        restore_expiries_into_store(vec![timed, HashMap::new(), HashMap::new()], &store);
+        store
+    }
+
+    /// Parts of 16 KiB, two queued at most; a full part waits for room
+    /// (`waits`), so that what is spilled does not depend on the disk.
+    fn spill(dir: &std::path::Path) -> Spill {
+        Spill {
+            dir: dir.to_path_buf(),
+            part: 16 << 10,
+            queue: 2,
+            named: false,
+            waits: true,
+            stalled: None,
+        }
+    }
+
+    /// The image laid out with no spill.
+    fn kept(store: &crate::store::Store) -> Vec<u8> {
+        freeze(store, None, true, None)
+            .unwrap()
+            .into_payload()
+            .unwrap()
+    }
+
+    fn pieces(frozen: &FrozenDataset, db: usize) -> impl Iterator<Item = &Piece> {
+        frozen.dbs[db]
+            .encoded
+            .iter()
+            .flat_map(|part| part.pieces.iter())
+    }
+
+    fn listing(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir).unwrap().count()
+    }
+
+    /// Several capture threads spill, the spill of each thread is used by
+    /// that thread of every database (one file a thread, whatever the
+    /// databases), and a value larger than several parts is spilled across
+    /// them. Nothing is left in the directory.
+    #[test]
+    fn a_capture_that_spills_lays_out_the_same_image() {
+        let store = dataset();
+        let dir = tempfile::tempdir().unwrap();
+        let spill = spill(dir.path());
+        let spilling = freeze(&store, None, true, Some(&spill)).unwrap();
+        let threads = crate::cpus::available_parallelism()
+            .map_or(1, |n| n.get())
+            .clamp(1, 8);
+        assert_eq!(spilling.spills.len(), threads);
+        let streams = |db: usize| {
+            let mut streams: Vec<usize> = pieces(&spilling, db)
+                .map(|piece| match piece {
+                    Piece::Spilled { stream, .. } => *stream,
+                    Piece::Held(_) => panic!("database {db}: a piece held with `waits`"),
+                })
+                .collect();
+            streams.dedup();
+            streams
+        };
+        let first = streams(0);
+        assert!(
+            first.len() >= threads.min(2),
+            "database 0 spilled through {first:?}"
+        );
+        assert!(first.iter().all(|&stream| stream < threads));
+        // Under 100,000 keys: one capture thread, the first one's spill.
+        assert_eq!(streams(1), vec![0], "database 1");
+        assert!(streams(2).is_empty(), "database 2 has strings only");
+        assert_eq!(listing(dir.path()), 0);
+
+        let image = spilling.into_payload().unwrap();
+        let kept = kept(&store);
+        assert_eq!(image.len(), kept.len());
+        assert!(image == kept, "the images differ");
+        assert_eq!(listing(dir.path()), 0);
+        let loaded = load_snapshot_from(image.as_slice()).unwrap();
+        assert_eq!(loaded.dbs[0].len(), 121_004);
+        assert_eq!(loaded.dbs[1].len(), 1);
+        assert_eq!(loaded.dbs[2].len(), 100);
+    }
+
+    /// A writer that does not keep up (here: writes nothing until the
+    /// capture is over): a capture thread does not wait for it, it holds
+    /// the parts that do not fit in the queue in memory. The image is the
+    /// same.
+    #[test]
+    fn a_capture_whose_writer_is_behind_holds_the_rest() {
+        let store = dataset();
+        let dir = tempfile::tempdir().unwrap();
+        let stalled = Arc::new(AtomicBool::new(true));
+        let spill = Spill {
+            waits: false,
+            stalled: Some(stalled.clone()),
+            ..spill(dir.path())
+        };
+        let spilling = freeze(&store, None, true, Some(&spill)).unwrap();
+        let (mut held, mut spilled) = (0, 0);
+        for db in 0..3 {
+            for piece in pieces(&spilling, db) {
+                match piece {
+                    Piece::Held(_) => held += 1,
+                    Piece::Spilled { .. } => spilled += 1,
+                }
+            }
+        }
+        assert!(spilled > 0, "nothing was queued");
+        assert!(
+            spilled <= spilling.spills.len() * spill.queue,
+            "{spilled} parts queued to writers that took none"
+        );
+        assert!(held > spilled, "{held} held, {spilled} queued");
+        stalled.store(false, Ordering::Release);
+        let image = spilling.into_payload().unwrap();
+        assert!(image == kept(&store), "the images differ");
+        assert_eq!(listing(dir.path()), 0);
+    }
+
+    /// The named file, where there is no `O_TMPFILE`: removed once open.
+    #[test]
+    fn a_capture_spills_to_a_named_file_where_it_must() {
+        let store = dataset();
+        let dir = tempfile::tempdir().unwrap();
+        let spill = Spill {
+            named: true,
+            ..spill(dir.path())
+        };
+        let spilling = freeze(&store, None, true, Some(&spill)).unwrap();
+        let image = spilling.into_payload().unwrap();
+        assert!(image == kept(&store), "the images differ");
+        assert_eq!(listing(dir.path()), 0);
+    }
+
+    /// A spill file that reads back otherwise than it was written fails
+    /// the image, rather than putting other bytes in it.
+    #[cfg(unix)]
+    #[test]
+    fn a_spill_file_read_back_differently_fails_the_image() {
+        use std::os::unix::fs::FileExt;
+        let store = dataset();
+        let dir = tempfile::tempdir().unwrap();
+        let mut spilling = freeze(&store, None, true, Some(&spill(dir.path()))).unwrap();
+        let written = spilling.spills[0].file().unwrap();
+        let mut byte = [0u8; 1];
+        written.file.read_exact_at(&mut byte, 100).unwrap();
+        byte[0] ^= 0x20;
+        written.file.write_all_at(&byte, 100).unwrap();
+        let failed = spilling.into_payload().unwrap_err();
+        assert_eq!(failed.kind(), io::ErrorKind::InvalidData, "{failed}");
+    }
+
+    /// A spill file that cannot be made (here: its directory is not there)
+    /// fails the capture or the image, whichever comes to it first.
+    #[test]
+    fn a_spill_that_cannot_be_made_fails_the_save() {
+        let store = dataset();
+        let dir = tempfile::tempdir().unwrap();
+        let spill = Spill {
+            waits: false,
+            ..spill(&dir.path().join("not-there"))
+        };
+        let image = freeze(&store, None, true, Some(&spill)).and_then(FrozenDataset::into_payload);
+        assert!(image.is_err());
+        assert_eq!(listing(dir.path()), 0);
     }
 }

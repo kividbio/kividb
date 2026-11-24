@@ -43,6 +43,34 @@ over: with about 9 million keys, under 100 ms. The snapshot is written
 after, while writes continue. Because the cut between the two files is made
 with writes held, a write is in exactly one of them.
 
+What a snapshot adds to memory while it is written: strings are only held
+(a string written over or deleted meanwhile is freed once it has been
+written), but the other values (lists, sets, sorted sets, hashes, streams)
+change in place, so they are laid out when the dataset is captured, with
+writes held. Each capture thread lays them out in 1 MiB buffers and hands
+each one, once full, to a writer thread that writes it to a spill file in
+the data directory; the snapshot copies them into `dump.kdb` as it is
+written. A capture thread does not wait for that writer: when the disk is
+behind, a full buffer stays in memory until the writer has room, so the
+disk's speed adds nothing to the time writes are held, and a save holds
+about 8 MiB a capture thread while the disk keeps up (#825). For 20,000
+sorted sets of 800 members (a 480 MB dump), a save under a writer adds
+12 MiB to the server's `Pss` (1.2.2: 461 MiB; regression suite 47). There
+is one spill file a capture
+thread, with no name (`O_TMPFILE` where
+the filesystem has it, otherwise a temporary file removed as soon as it is
+open), so nothing is left in the directory however the save ends (the
+fallback's file, should the process die before it is removed, is removed at
+the next start). Each part is checked against the xxh3 its writer took as it
+is read back, and its blocks are given back once copied
+(`FALLOC_FL_PUNCH_HOLE`, on Linux), so the spill files take what is still to
+be copied: a save needs room for about one dump beside the previous
+`dump.kdb` (on a filesystem without hole punching, the collections' part of
+the dump more, until the snapshot is written). A save whose spill fails (a full disk, bytes read back otherwise
+than they were written) fails, writes go on, and the previous `dump.kdb`
+stays. A replica's full sync and an online backup make their image in
+memory.
+
 If a checkpoint is stopped part way (a crash, a kill), the previous log is
 kept as `appendonly.aof.prev`. At the next start it is replayed, and then
 the new log, on top of the snapshot the checkpoint started from.

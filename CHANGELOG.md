@@ -565,6 +565,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A save keeps about 8 MiB of collections in memory a capture thread
+  while the disk keeps up (#825).** A save lays out the values that are not strings when it
+  captures the dataset, with writes held. For `dump.kdb` each capture thread
+  lays them out in 1 MiB buffers and hands each one, once full, to a writer
+  thread of its own, which writes it to a spill file in the data directory
+  (one a capture thread, with no name: `O_TMPFILE`, or a file removed once
+  open); the snapshot copies them into `dump.kdb` as it is written, checks
+  each against the xxh3 its writer took, and gives the spill file's blocks
+  back as it goes. A capture thread never waits for the disk: when its
+  writer is behind, a full buffer stays in memory until there is room, so
+  the disk's speed adds nothing to the time writes are held. Without
+  `FALLOC_FL_PUNCH_HOLE` (other systems than Linux, or a filesystem
+  that lacks it) a save needs room for the collections' part of the dump
+  beside the dump. Measured on an Azure D4s_v5
+  under a writer (regression suite 47, server on 2 CPUs): for 20,000 sorted
+  sets of 800 members (a 480 MB dump), `Pss` grows by 12 MiB during the
+  save (1.2.2: 461 MiB) and the slowest write meanwhile takes 358 ms (1.2.2:
+  384 ms); for 20,000 hashes of 800 fields (672 MB), 2.5 MiB (1.2.2: 642
+  MiB). On a disk that does not keep up the buffers wait in memory, and the
+  save holds up to what 1.2.2 holds. The dump is the same, byte for byte.
+  A save whose spill
+  fails (a full disk, bytes read back otherwise than written) fails, writes
+  go on, and the previous dump stays. A checkpoint whose capture fails
+  removes the `appendonly.aof.rewrite.tmp` it prepared. A replica's full
+  sync and an online backup make their image in memory.
 - **Plain commands are answered between scripts that run alone (#880).** A quick script that runs alone (its key has no hash tag, or
   `lua-parallel-scripts no`) and comes while another one is running is run
   right after it, by the thread running that one, in a run: the first
