@@ -1278,7 +1278,7 @@ fn ts_get(ctx: &mut Ctx) -> Option<Vec<u8>> {
         Some(arg) if arg.eq_ignore_ascii_case(b"LATEST") && cmd.len() == 3 => true,
         Some(_) => return Some(resp_error("ERR syntax error")),
     };
-    let inner = match ts_query::series_at(ctx, key) {
+    let inner = match ts_query::series_read(ctx, key) {
         Ok(Some(inner)) => inner,
         Ok(None) => return Some(resp_null_bulk()),
         Err(e) => return Some(e),

@@ -728,7 +728,9 @@ pub fn xlen(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key).filter(|_| !gone) {
+    let found = map.get(key).filter(|_| !gone);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         None => resp_integer(0),
         Some(ValueRef::Stream(s)) => resp_integer(s.read().entries.len() as i64),
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -777,7 +779,9 @@ pub fn xrange(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         None => resp_array(vec![]),
         Some(ValueRef::Stream(s)) => {
             let inner = s.read();
@@ -833,7 +837,9 @@ pub fn xrevrange(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         None => resp_array(vec![]),
         Some(ValueRef::Stream(s)) => {
             let inner = s.read();
@@ -899,6 +905,24 @@ fn read_streams(
         }
     }
     results
+}
+
+/// `XREAD`'s lookups in `keyspace_hits` / `keyspace_misses`, as Redis counts
+/// them: every key twice, once as the IDs are read and once as the entries
+/// are, unless a key holds another type, which ends the command at its first
+/// look (`XREAD STREAMS x 0`: 2 hits; of a key that is not there, 2 misses).
+fn count_stream_reads(ctx: &Ctx, keys: &[&[u8]]) {
+    let db_ref = &ctx.store[*ctx.selected_db];
+    for pass in 0..2 {
+        for key in keys {
+            let map = read_lock!(store::get_shard(db_ref, key));
+            let found = map.get(key);
+            crate::stats::record_lookup(found.is_some());
+            if pass == 0 && !matches!(found, None | Some(ValueRef::Stream(_))) {
+                return;
+            }
+        }
+    }
 }
 
 pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
@@ -1023,6 +1047,7 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
             .collect(),
     };
 
+    count_stream_reads(ctx, &keys);
     let results = read_streams(ctx, resp, &keys, &resolved_ids, count, caps);
 
     if results.is_empty() {
@@ -2023,7 +2048,9 @@ fn run_xreadgroup_delivery(
         let db_ref = &ctx.store[*ctx.selected_db];
         let shard = store::get_shard(db_ref, key.as_slice());
         let map = read_lock!(shard);
-        match map.get(key.as_slice()) {
+        let found = map.get(key.as_slice());
+        crate::stats::record_lookup(found.is_some());
+        match found {
             Some(ValueRef::Stream(s)) => {
                 if !s.read().groups.contains_key(spec.group) {
                     return Err(nogroup_error(key, spec.group));
@@ -2037,6 +2064,11 @@ fn run_xreadgroup_delivery(
             }
             None => return Err(nogroup_error(key, spec.group)),
         }
+    }
+    // Redis looks every stream up again as it delivers from it: a second
+    // hit each in `keyspace_hits`, as there.
+    for _ in keys {
+        crate::stats::record_hit();
     }
 
     let mut budget = spec.caps.budget();
@@ -2252,7 +2284,9 @@ pub fn xack(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         None => resp_integer(0),
         Some(ValueRef::Stream(s)) => {
             let mut inner = s.write();
@@ -2284,7 +2318,9 @@ pub fn xpending(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         None => resp_error("ERR no such key"),
         Some(ValueRef::Stream(s)) => {
             let inner = s.read();
@@ -2508,7 +2544,9 @@ pub fn xclaim(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         None => resp_error_bytes(
             &[
                 &b"NOGROUP No such key '"[..],
@@ -2674,7 +2712,9 @@ pub fn xautoclaim(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         None => resp_error_bytes(
             &[
                 &b"NOGROUP No such key '"[..],
@@ -2839,7 +2879,9 @@ fn xinfo_stream(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         None => resp_error("ERR no such key"),
         Some(ValueRef::Stream(s)) => {
             let inner = s.read();
@@ -3112,7 +3154,9 @@ fn xinfo_groups(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         None => resp_error("ERR no such key"),
         Some(ValueRef::Stream(s)) => {
             let inner = s.read();
@@ -3159,7 +3203,9 @@ fn xinfo_consumers(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         None => resp_error("ERR no such key"),
         Some(ValueRef::Stream(s)) => {
             let inner = s.read();

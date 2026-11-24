@@ -420,6 +420,7 @@ fn cmd_geodist(ctx: &mut Ctx) -> Vec<u8> {
 
     if is_expired(ctx.store, *ctx.selected_db, key) {
         expire_on_read(ctx.store, *ctx.selected_db, key);
+        crate::stats::record_miss();
         return resp_null_bulk();
     }
 
@@ -427,7 +428,9 @@ fn cmd_geodist(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    let zs = match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    let zs = match found {
         Some(ValueRef::SortedSet(z)) => z.clone(),
         None => return resp_null_bulk(),
         _ => {
@@ -475,6 +478,7 @@ fn cmd_geopos(ctx: &mut Ctx) -> Vec<u8> {
 
     if is_expired(ctx.store, *ctx.selected_db, key) {
         expire_on_read(ctx.store, *ctx.selected_db, key);
+        crate::stats::record_miss();
         let nils = vec![resp_null_for(resp); cmd.len() - 2];
         return resp_array(nils);
     }
@@ -483,7 +487,9 @@ fn cmd_geopos(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    let zs = match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    let zs = match found {
         Some(ValueRef::SortedSet(z)) => z.clone(),
         None => {
             let nils = vec![resp_null_for(resp); cmd.len() - 2];
@@ -527,6 +533,7 @@ fn cmd_geohash(ctx: &mut Ctx) -> Vec<u8> {
 
     if is_expired(ctx.store, *ctx.selected_db, key) {
         expire_on_read(ctx.store, *ctx.selected_db, key);
+        crate::stats::record_miss();
         let nils = vec![resp_null_for(resp); cmd.len() - 2];
         return resp_array(nils);
     }
@@ -535,7 +542,9 @@ fn cmd_geohash(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    let zs = match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    let zs = match found {
         Some(ValueRef::SortedSet(z)) => z.clone(),
         None => {
             let nils = vec![resp_null_for(resp); cmd.len() - 2];
@@ -838,7 +847,9 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
     let zset = {
         let shard = store::get_shard(&ctx.store[*ctx.selected_db], &key);
         let map = read_lock!(shard);
-        match map.get(key.as_slice()).filter(|_| !gone) {
+        let found = map.get(key.as_slice()).filter(|_| !gone);
+        crate::stats::record_lookup(found.is_some());
+        match found {
             Some(ValueRef::SortedSet(zset)) => Some(Arc::clone(zset)),
             Some(_) => {
                 return resp_error(

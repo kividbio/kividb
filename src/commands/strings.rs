@@ -1456,20 +1456,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Fetch both values under their respective shard read locks.
             // We read key1 first, drop lock, then read key2. This avoids holding
             // two shard locks simultaneously (deadlock risk if same shard).
+            // Both keys are looked up (and counted) before either's type
+            // is refused, as Redis does.
+            let mut wrong_type = false;
             let s1: SharedBytes = {
                 if is_expired(ctx.store, *ctx.selected_db, key1) {
                     expire_on_read(ctx.store, *ctx.selected_db, key1);
+                    crate::stats::record_miss();
                     SharedBytes::from(&[][..])
                 } else {
                     let db = &ctx.store[*ctx.selected_db];
                     let shard = store::get_shard(db, key1);
                     let map = read_lock!(shard);
-                    match map.get(key1) {
+                    let found = map.get(key1);
+                    crate::stats::record_lookup(found.is_some());
+                    match found {
                         Some(ValueRef::String(v)) => v.to_shared(),
                         Some(_) => {
-                            return Some(resp_error(
-                                "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            ));
+                            wrong_type = true;
+                            SharedBytes::from(&[][..])
                         }
                         None => SharedBytes::from(&[][..]),
                     }
@@ -1479,22 +1484,29 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let s2: SharedBytes = {
                 if is_expired(ctx.store, *ctx.selected_db, key2) {
                     expire_on_read(ctx.store, *ctx.selected_db, key2);
+                    crate::stats::record_miss();
                     SharedBytes::from(&[][..])
                 } else {
                     let db = &ctx.store[*ctx.selected_db];
                     let shard = store::get_shard(db, key2);
                     let map = read_lock!(shard);
-                    match map.get(key2) {
+                    let found = map.get(key2);
+                    crate::stats::record_lookup(found.is_some());
+                    match found {
                         Some(ValueRef::String(v)) => v.to_shared(),
                         Some(_) => {
-                            return Some(resp_error(
-                                "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            ));
+                            wrong_type = true;
+                            SharedBytes::from(&[][..])
                         }
                         None => SharedBytes::from(&[][..]),
                     }
                 }
             };
+            if wrong_type {
+                return Some(resp_error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                ));
+            }
 
             // ── LCS DP core ──────────────────────────────────────────────────────────
             // Standard O(N*M) DP. We use a flat Vec<u32> as the DP table to avoid
@@ -1660,12 +1672,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let key: &[u8] = cmd[1];
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_null_bulk());
             }
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
-            match map.get(key) {
+            let found = map.get(key);
+            crate::stats::record_lookup(found.is_some());
+            match found {
                 None => Some(resp_null_bulk()),
                 Some(ValueRef::String(v)) => {
                     let hex = value_digest(&v);
