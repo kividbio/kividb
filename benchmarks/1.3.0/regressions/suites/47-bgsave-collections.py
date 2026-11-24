@@ -54,10 +54,11 @@ Gates (the candidate): `growth_mib` at most 128 MiB (8 MiB of buffers a
 capture thread, and as much again for the writes and the allocator) and
 within 25 % or 16 MiB of recorded; `peak_x_idle` within 5 %;
 `worst_write_ms` within 50 % or 10 ms of recorded (scheduling jitter), and
-for `zset` at most 1.3x v1.2.2's this session (the pause is what a spill
-could lengthen; for `hash` the capture itself takes about 2.4x v1.2.2's,
-spill or not: 1,029 ms on master 68a8a6be against 420 ms, so v1.2.2 is
-shown there); the save must succeed. v1.2.2 and Redis are shown: v1.2.2 grows
+at most 1.3x v1.2.2's this session (the pause is what a spill could
+lengthen, and for `hash` also the walk of each table-backed hash, whose
+fields are each a block of their own: the capture asks for a few groups'
+fields ahead, and writes an ASCII field name as it is); the save must
+succeed. v1.2.2 and Redis are shown: v1.2.2 grows
 by about the dump's size, Redis's fork by the pages the writer changes.
 
 Distinct from `39-bgsave-strings` (string values, which a capture only
@@ -302,10 +303,8 @@ def run(ctx):
     ctx.emit("peak_x_idle", peak / idle, "x", "lower", gate=[rel(5)])
     if ctx.kind == "redis":
         pause_gate = info()
-    elif kind == "zset":
-        pause_gate = [rel(50, abs=10), vs_v1_2_2(1.3)]
     else:
-        pause_gate = [rel(50, abs=10)]
+        pause_gate = [rel(50, abs=10), vs_v1_2_2(1.3)]
     ctx.emit("worst_write_ms", worst_ms, "ms", "lower", gate=jitter(pause_gate))
     ctx.emit("dump_mib", max([os.path.getsize(f) for f in dumps] or [0]) / 1048576.0, "MiB", "lower",
              gate=info())

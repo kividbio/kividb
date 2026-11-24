@@ -800,7 +800,7 @@ impl MemberSet {
     #[inline]
     pub fn for_each(&self, mut f: impl FnMut(&[u8])) {
         match &self.repr {
-            Repr::Table(t) => t.members.iter().for_each(|m| f(&m)),
+            Repr::Table(t) => t.members.for_each_member(f),
             Repr::Small(Small::Packed(block)) => block.iter().for_each(f),
             Repr::Small(Small::Ints(ints, _)) => {
                 each_width!(ints, v => v.iter().for_each(|&n| f(IntText::new(wide(n)).as_bytes())))
