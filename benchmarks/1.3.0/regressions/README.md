@@ -65,6 +65,7 @@ and why.
 | `46-values-near-slab-limits` | #240 | string values on both sides of each size where their memory changes kind, each size's keys in a server of their own: 1,900 to 2,200 B with 2,016 / 2,028 (an entry in a 64 KiB slab, then a 1 MiB one); 3,500 to 4,500 B with 4,064 / 4,072 (inline, then a block of its own), 4,088 / 4,100 and, shown, 4,048 / 4,056 (the request crosses 4,096 bytes); 24,000 to 28,000 B with 26,192 / 26,208 (the largest slab block, then the system allocator's). VmRSS and `used_memory` per key, SETs a second (8 pipelining clients overwriting random keys, 3 s, median of 7 trials) and server CPU a SET at each size; gates: RSS per key within 3 % of the value plus the smallest overhead, each boundary's SET rate within 3 % (4,064 / 4,072: within 3 % of its recorded value) (`min_cpus=8`) |
 | `47-bgsave-collections` | #825 | `BGSAVE` of large collections under writes: `zset` is #825's 20,000 Mastodon home feeds (sorted sets of 800 18-digit status ids; the writer adds a status to a random feed and trims it to 800), `hash` 20,000 hashes of 800 fields (the writer sets a field anew); one writer, pipelines of 40, from 2 s before `BGSAVE` to 1 s after it. The memory before, the peak from `BGSAVE` to its end and the growth (`Pss` summed over the server and the processes it forked, every 50 ms, as suite 39), the slowest `SET` of a probe process sending one every 1 ms during the save (writes are held for the capture), the growth of the server cgroup's `memory.current` and the peak of `Dirty:` in `/proc/meminfo` (the page cache of the spill files and the dump, shown), the dump's size and the save's time. Gates: growth at most 128 MiB (a capture thread hands what it lays out to a spill writer in 1 MiB buffers, 8 MiB of them a thread, #825) and within 25 % or 16 MiB of recorded, peak over idle 5 %, the slowest `SET` within 50 % or 10 ms of recorded and at most 1.3x v1.2.2's this session; the save must succeed. v1.2.2 (grows by about the dump: +0.45 GiB for `zset`) and Redis shown. Server on the first half of the CPUs, clients on the other; `min_cpus=4`, recorded on a `Standard_D4s_v5` (`results/pr-1009-47-d4s_v5`) |
 | `48-zset-rank-range` | #875 | one sorted set of 1,000, 100,000 and 1,000,000 members (`membr:<i>`, score i, `--threads 2`): `ZRANK` and `ZREVRANK` of a member in the middle half, `ZRANGE` of 10 from such a rank, `ZRANGEBYSCORE -inf +inf LIMIT <rank> 10`, `ZCOUNT` over a quarter of the set, `ZRANGEBYSCORE <score> +inf LIMIT 0 10`, and the writes `ZADD` of a new member at a random score with its `ZREM`, and a `ZINCRBY` that moves a member past the highest score and back: the server's own microseconds a call (`INFO commandstats`) and the client's wall time (reads), median of 3 rounds (writes: 2,000 pairs a round, 7 rounds: the server counts each call in whole microseconds, and a write takes one or two); replies checked in the timed rounds (a rank, a count, a range's first member) and, outside the timing, the first 100 calls of each case compared whole with replies worked out from the dataset (every member and score of a range, each write's reply) (`bad_replies` exactly 0). Gates: `bad_replies` exactly 0; `ZRANK`, `ZREVRANK`, `ZRANGE` from a rank, `ZCOUNT` and `ZRANGEBYSCORE ... LIMIT <rank> 10` at 100,000 and 1,000,000 members on the client's wall time a call against v1.2.2's in the same session, with a fixed floor of how many times faster (no recorded value): 1x (not slower) at 100,000 for `ZRANK`, `ZREVRANK`, `ZRANGE` and `ZCOUNT`, 3x for the `LIMIT` range; at 1,000,000 7x for `ZRANK`, `ZREVRANK` and `ZRANGE`, 3x for `ZCOUNT`, 40x for the `LIMIT` range (a third of the smallest gain seen in three runs, rounded down: a call's wall time carries about 45 us of round trip). Shown, not gated: every server-time row (the candidate's calls take under 5 us against a server clock in whole microseconds), every row at 1,000 members, `ZRANGEBYSCORE <score> +inf LIMIT 0 10` and the writes; their cost is held by the instruction-count rows of `scripts/perf`. Recorded on a D4s_v5 (`results/pr-875-d4s_v5`) |
+| `49-request-response` | #1015 | @keyv/redis's benchmark shape: 200,000 keys of 1 KB with a TTL, each connection one `SET ... PX` of a key of its share then nine `GET`s, every reply awaited and checked, from this suite's own client (one Python asyncio process a client CPU, at most 4), which is itself the limit, as Node's is in the issue; 1, 4, 16, 48 and 500 connections, `--threads 4` (Redis `--io-threads 4`) on the first half of the CPUs, the client on the other: operations a second, p50 and p99, the server's and the client's CPUs, median of 3 rounds. Gates at 48 connections: at most 1.03x worse than Redis and at least 1.01x better than v1.2.2 in the same session, and within 10 % of recorded; at 500, at most 1.08x worse than Redis; the rest shown. `min_cpus=8`, recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-49)) |
 
 ## Running it
 
@@ -278,6 +279,7 @@ was re-recorded for it:
 | `39-bgsave-strings`, `40-wp-object-cache`, `43-slab-churn`, `46-values-near-slab-limits` | the server's pinned CPUs (4) | as suites `20` and `34`: the server is pinned to half the CPUs of a `Standard_D8s_v5` and gets `--threads` to match |
 | `42-alone-scripts-mix` | the server's pinned CPUs (4) | as suites `20`, `34` and `36` |
 | `47-bgsave-collections` | the server's pinned CPUs (2) | as suite `39`, on the `Standard_D4s_v5` it is recorded on |
+| `49-request-response` | 4 | the issue's: the server pinned to half the CPUs of a `Standard_D8s_v5`, Redis with `--io-threads 4` |
 | `32-default-threads` | 0 (none) | measures the default on purpose |
 
 Redis ignores the count. The default itself is watched by
@@ -1855,6 +1857,32 @@ from the VM image. The server has CPUs 0-3 and the clients 4-7. The run took
   `peak_vs_off` at most 1.03; `settled_rss_mib` and `final_rss_mib` +5 %;
   `peak_x_load` +10 %; the pass's p99 at most 1.5x the seconds before it plus
   0.2 ms (`*_p99_excess_ms`), and its p99 and p99.9 within 25 % or 0.2 ms.
+
+## Recorded run, suite 49
+
+Run 2026-11-24 on an Azure `Standard_D8s_v5` (Xeon Platinum 8370C),
+`run-all.sh --only 49 --record` (`results/pr-1015-49-d8s_v5`) and once more
+without `--record` (`results/pr-1015-49-d8s_v5-r2`), the candidate built
+with rustc 1.100.0 (master `43157786` with the change of #1015). The server
+on vCPUs 0-3, the suite's client processes on 4-7; operations a second,
+median of 3 rounds (p50 / p99 in microseconds, first run):
+
+| connections | v1.2.2 | candidate | Redis 8.10.2 `--io-threads 4` |
+|---:|---:|---:|---:|
+| 1 | 20,366 / 19,564 (45 / 62) | 20,221 / 20,206 (46 / 62) | 13,561 / 13,700 (68 / 96) |
+| 4 | 57,769 / 55,696 (64 / 84) | 57,595 / 57,513 (64 / 83) | 45,620 / 45,726 (82 / 107) |
+| 16 | 107,354 / 105,874 (144 / 170) | 110,606 / 109,359 (140 / 166) | 108,689 / 110,693 (142 / 176) |
+| 48 | 117,298 / 116,848 (405 / 439) | 120,845 / 120,789 (393 / 433) | 122,569 / 123,535 (384 / 454) |
+| 500 | 121,406 / 120,469 (4,115 / 4,558) | 124,811 / 121,719 (3,995 / 4,483) | 125,313 / 129,045 (3,988 / 4,499) |
+
+The client used 4.0 of its 4 CPUs at 16 connections and more, with every
+engine: it is the limit, as Node's is in the issue, and the rows measure what
+the server costs it. The second run failed the 500-connection row's first gate,
+1.03x Redis (1.06x: Redis's own samples there
+were 122,031 / 129,688 / 129,045), so that gate is 1.08x; the 48-connection
+gates passed in both runs. The Node client of the issue measures the same
+order on this VM (docs/PERFORMANCE.md, "Request-response from many
+connections"). A run takes about 7 minutes.
 
 ## Not covered
 
