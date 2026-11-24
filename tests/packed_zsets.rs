@@ -1010,12 +1010,15 @@ fn eviction_counts_the_blocks() {
     );
     let pairs = members(10, "member");
     // What a set adds, over 2,000 of them, against what MEMORY USAGE says
-    // of one.
-    let before: i64 = c.info("memory", "used_memory").parse().unwrap();
+    // of one. Both readings are taken once `used_memory` has settled: the
+    // connections the harness opened to see the server up are closed, and
+    // each gives back its buffers (some 170 KB) when the server gets to see
+    // it closed, which on a busy machine can be after the first reading.
+    let before = settled_used(&mut c);
     for i in 0..2000 {
         c.zadd(&format!("probe{i}"), &pairs);
     }
-    let after: i64 = c.info("memory", "used_memory").parse().unwrap();
+    let after = settled_used(&mut c);
     let added = (after - before) / 2000;
     assert_eq!(c.encoding("probe7"), "listpack");
     let each = c.cmd(&["MEMORY", "USAGE", "probe7"]).int();
@@ -1195,6 +1198,25 @@ fn settled_usage(c: &mut Conn, key: &str) -> i64 {
     for _ in 0..3000 {
         thread::sleep(Duration::from_millis(20));
         let now = c.cmd(&["MEMORY", "USAGE", key]).int();
+        same = if now == last { same + 1 } else { 0 };
+        if same == 50 {
+            break;
+        }
+        last = now;
+    }
+    last
+}
+
+/// `used_memory` once it has stopped changing for a second: what a closed
+/// connection held is given back when the server sees it closed, and a
+/// reading taken before that counts it.
+fn settled_used(c: &mut Conn) -> i64 {
+    let read = |c: &mut Conn| -> i64 { c.info("memory", "used_memory").parse().unwrap() };
+    let mut last = read(c);
+    let mut same = 0;
+    for _ in 0..3000 {
+        thread::sleep(Duration::from_millis(20));
+        let now = read(c);
         same = if now == last { same + 1 } else { 0 };
         if same == 50 {
             break;
