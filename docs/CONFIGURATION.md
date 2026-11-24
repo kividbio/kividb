@@ -176,7 +176,28 @@ blocks, 4,096 among them (a value of 4,088 bytes takes a block of 4,096, one of 
 value is the system allocator's. `used_memory`, `maxmemory` and `MEMORY USAGE` count a value at its block's
 size: up to 2.5 % over the value from 2 KiB to 26 KB. A slab nobody is filling is used for new blocks again once a quarter of it is free
 (a 1 MiB slab, once a sixteenth is);
-until then its free blocks are memory the process holds. Active defrag (`activedefrag`, on by
+until then its free blocks are memory the process holds.
+
+**Room an `APPEND` keeps.** A string of the system allocator's (a block over 26,208 bytes)
+that `APPEND` grows gets room for the next appends: a quarter of its length more, at most
+16 MiB, and none past 512 MiB. The appends after it are written into that room, in place,
+and one that finds no room left grows the block with `realloc` by a quarter again (the
+allocator extends a large block where it is, or remaps its pages, rather than copying it), so
+a string built by many small appends costs about the same a call whatever its length. That
+room is allocated memory: `used_memory`, `maxmemory` and `MEMORY USAGE` count it, at most a
+fifth of the block (25 % of the string's length, 16 MiB at most); pages of it not yet written
+are usually address space only, not RSS. Nothing else sees it: replies, `STRLEN`, `DUMP`, `COPY`,
+`DEBUG DIGEST-VALUE`, snapshots, the AOF and replication all use the string's length, and a
+string loaded from a snapshot, an AOF or a replica's full sync has none. A string that stops
+being appended to keeps its room until it is written again: a `SET` of another length gives
+it back, and active defrag does not move such blocks (they are not in the slabs). A string up to
+26,208 bytes gets no room beyond its block's size: appends move it from one block size to the
+next, at most 2.5 % apart, copying at most 26 KB. A string held elsewhere (shared with another
+key since a `COPY`, being read by a `GETEX` or `DUMP`, or captured by a `BGSAVE`, an AOF rewrite
+or a replica's full sync) is copied once by the next `APPEND`, into a block with that room, and
+the holder keeps the bytes from before.
+
+Active defrag (`activedefrag`, on by
 default) moves values out of the sparsest slabs so that they empty and their pages go back to
 the system: the slabs a quarter free and more, and the full ones with at least
 `active-defrag-full-slab-free-percent` of their blocks free. What it moves goes into the room
