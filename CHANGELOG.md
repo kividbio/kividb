@@ -1585,18 +1585,47 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     at a member's own score reads the member's bytes through its entry).
     Sorted sets in a block, and `GET`/`SET`, as before.
 
-- **A large sorted set's order is a B+tree that counts its members
-  (#875).** The index of a sorted set past the block's limits, which holds
-  each member as the address of its entry in the set's table
+- **A large sorted set's rank and range-by-rank commands walk one path of
+  its index (#875).** The index of a sorted set past the block's limits,
+  which holds each member as the address of its entry in the set's table
   (`CollectionTable`), is a B+tree of up to 32 members a leaf whose
-  internal nodes keep the number of members under each child, in place of
-  the `BTreeMap` it was. A member's rank (`ZRANK`, `ZREVRANK`) and the
-  members from a rank (`ZRANGE` by index, `ZREMRANGEBYRANK`) are found down
-  one path of the tree, where the members before them were counted one by
-  one. Members that come in order, one `ZADD` at a time, fill every node
-  but the last two of each level. `MEMORY USAGE` counts the index's nodes
-  exactly, where it estimated them from the index's length. Replies,
-  snapshots, the AOF and replication are as before.
+  internal nodes keep the number of members under each child
+  (`src/counted_btree.rs`, built on @Parikalp-Bhardwaj's #998). A
+  member's rank (`ZRANK`, `ZREVRANK`), the members from a rank (`ZRANGE`
+  by index, `ZREMRANGEBYRANK`) and the number of members between two
+  scores (`ZCOUNT`) are found down one path of the tree. A score change
+  that keeps the member's rank is written in place; one that moves it
+  takes the entry out and puts it back, and if the new key is refused, or
+  a member read panics, the entry is back at its own score, in order.
+  Members that come in order, one `ZADD` at a time, leave every node but
+  the last two of each level 28 of 32 full. `MEMORY USAGE` counts the
+  index's nodes as allocated. Replies, snapshots, the AOF and replication
+  are as before.
+  - Instructions per command (callgrind, fat LTO, `CMP=plain`, whole
+    server, pipeline 16), master before this change / now, at 1,000,000
+    members: `ZRANK` of a member 6,105,833 / 4,434, `ZREVRANK` 6,105,677 /
+    4,146, `ZRANGE` of 10 from a random rank 5,626,799 / 7,058, `ZCOUNT`
+    over 10,000 scores 171,006 / 5,835, `ZRANGEBYSCORE -inf +inf LIMIT
+    <offset> 10` 11,335,309 / 3,730,346; at 100,000 members 611,304 /
+    3,947, 617,443 / 4,114, 574,912 / 6,651, 163,243 / 5,626 and
+    1,147,412 / 1,984,706 (the `LIMIT` offset is stepped over one member
+    at a time, as before, and a step costs more than one of master's
+    `BTreeMap`). `ZRANGEBYLEX` and `ZLEXCOUNT` among equal scores walk the
+    members from the first, as before: 1.04x and 0.87x at 100,000
+    members, 1.80x and 1.06x at 1,000,000. Writes at 1,000,000 members:
+    `ZADD` that moves a member 1.03x, `ZREM` 0.99x, `ZINCRBY` 0.91x, a
+    new member in order 0.92x, at random 1.01x, `ZREM` + `ZADD` with every
+    score equal 0.89x; at 1,000 members `ZADD` that moves a member 1.06x
+    and `ZINCRBY` 1.04x. `ZSCORE`, `ZRANDMEMBER`, `ZPOPMIN` within 1 %,
+    `GEOSEARCH` 1.00-1.02x. `GET`/`SET` as before (100-byte rows equal,
+    1 KB `SET` +1 instruction).
+  - `used_memory` a member, one set of 1,000,000 14-byte members, v1.2.2 /
+    master before this change / now: added in order 133.4 / 75.8 / 61.8,
+    at random 123.3 / 68.6 / 67.5, built whole (`RESTORE`) 133.4 / 59.7 /
+    59.1, and once every other member of the set added in order is
+    removed 179.3 / 88.7 / 91.7 (a removal merges a node only once it is
+    below half full). The index alone, its nodes as allocated: 20.3
+    bytes a member added in order, 25.8 at random, 17.6 built whole.
 
 - **Lists take about half the memory, short elements a fifth (#297).** A
   list's elements are kept end to end in chunks of up to 64, each element
