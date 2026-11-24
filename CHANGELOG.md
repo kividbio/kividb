@@ -572,6 +572,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`keyspace_hits` and `keyspace_misses` count a key a read command looks
+  up as Redis does (#1022).** A hit when the key is there, whatever its
+  type and whether or not the member, field or index asked for is in it
+  (`HGET`, `SISMEMBER`, `ZSCORE`, `LINDEX` of a key that is there are
+  hits; `WRONGTYPE` replies count a hit), a miss when it is not there.
+  `LRANGE`, `STRLEN`, `SCARD`, `EXISTS`, `TYPE`, `TTL`, `PTTL`,
+  `EXPIRETIME`, `TOUCH`, `DUMP`, `OBJECT ENCODING`, `COPY`, `SET ... GET`,
+  the sorted-set reads (`ZRANGE` and its relatives, `ZCARD`, `ZCOUNT`,
+  `ZLEXCOUNT`, `ZMSCORE`, `ZREVRANK`, `ZRANDMEMBER`, `ZSCAN`), `HRANDFIELD`
+  and the sources of the set and sorted-set algebra commands (each key
+  named counts) are counted; `HMGET` and `MGET` count each key once;
+  commands that write (`LPOP`, `LMPOP`, `BLPOP`, `LPUSHX`, `HDEL`, `SREM`,
+  `SPOP`, `SMOVE`) count nothing, as in Redis. `tests/stats_keyspace.rs`
+  holds the counts Redis 8.12.0 gives for 99 commands. The bit commands,
+  `PFCOUNT`, `XLEN`, `GEOPOS`, `LCS` and `SORT` do not count yet.
+
 - **io_uring workers finish a waiting socket read without interrupting the
   worker (#1015).** Each worker's ring is made with
   `IORING_SETUP_COOP_TASKRUN` (Linux 5.19 and later; on an older kernel the
@@ -1750,6 +1766,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to a tenth of its length gives back the room it kept for the rest.
 
   Suite `21-list-memory` of the 1.3.0 regression suite measures this again.
+
+  Misskey's home timelines (#1022), 10,000 lists of 300 ten-byte ids on a
+  `Standard_D4s_v5`, `--threads 4`, bytes of `used_memory` / of RSS an
+  element: loaded with `RPUSH` one element a command, 59.7 / 59.6 in
+  1.2.2, 14.8 / 17.0 now, 13.9 / 14.4 in Redis 8.10.2; one `RPUSH` of 300
+  a list, 48.4 / 51.2, 13.4 / 14.1, 13.9 / 14.4. After every list has
+  taken 3,000 `LPUSH` + `LTRIM key 0 299` pairs: 64.4 / 69.4 in 1.2.2,
+  14.2 / 17.7 now (23.0 before the chunks of a list of over 192 elements
+  were opened at one size), 13.9 / 14.4 in Redis. 32-byte elements 35.4 /
+  41.4 (Redis 34.8 / 35.6), 64-byte 67.4 / 85.5 (69.0 / 70.6), lists of 30
+  ten-byte elements 16.9 / 22.8 (14.8 / 15.0). Suite `52-small-lists-memory`
+  measures these and fails a build that loses them.
   - A push or a pop at either end moves nothing in its chunk: each chunk
     has room at both ends. Element `i` is found by arithmetic while the
     chunks between the ends are full; an `LINSERT` or `LREM` in the middle
