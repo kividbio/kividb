@@ -45,8 +45,12 @@ and REGRESS_REDISEARCH_SO name `rejson.so` and `redisearch.so` of the
 redis:8.10 image (the VM's source-built Redis has neither): it is started
 with `--loadmodule` for both, so the configurations are self-hosted.
 
-Gates: none that hold the line yet (this suite records where the bytes go
-before the representation changes); `bytes_per_doc` within 5 % of recorded.
+Gates: `bytes_per_doc` within 5 % of recorded, keeping 60 % of the gain
+over v1.2.2 (#1001 packs the embedding into one buffer of float32s), and at
+most Redis's in each configuration when Redis runs; `memory_usage_per_doc`
+within 5 % of recorded; `get_same` as recorded; and `number_forms_kept` 1:
+JSON.GET returns each list of NUMBER_FORMS and NUMBER_ARRAYS as KiviDB has
+printed it since #473 (EXPECTED_FORMS), whatever form the array is held in.
 """
 import json
 import os
@@ -54,7 +58,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from suite import Suite, Config, MEMORY, EXACT, info, scaled  # noqa: E402
+from suite import Suite, Config, MEMORY, EXACT, KEEP_IMPROVEMENT, info, scaled, vs_redis  # noqa: E402
 from nodes import Nodes  # noqa: E402
 from rss import vmrss_mib, MIB  # noqa: E402
 
@@ -76,6 +80,12 @@ NUMBER_FORMS = ("[1,1.0,1.50,-0.0,0,1e5,1E5,1.5e-7,0.1,100000000000000000000,123
 # integer-valued floats among them, and integers up to i64's ends.
 NUMBER_ARRAYS = {"floats": "[0.5,1.0,-0.0,2.0,0.25,-1.0,3.0,1e5,0.1,-0.0]",
                  "ints": "[0,1,-1,2,9007199254740993,-9223372036854775808,9223372036854775807,42]"}
+# What KiviDB's JSON.GET returns of each (master before #1001, and after).
+EXPECTED_FORMS = {
+    "forms": "[1,1.0,1.5,-0.0,0,100000.0,100000.0,1.5e-7,0.1,1e20,12345678901234567890,-0.12345678901234568,3.4028234663852886e38,1.0000000000000002,5e-324,0.00006437301635742188,0.00001,1.5e-6,1.23e-7,1e21]",
+    "floats": "[0.5,1.0,-0.0,2.0,0.25,-1.0,3.0,100000.0,0.1,-0.0]",
+    "ints": "[0,1,-1,2,9007199254740993,-9223372036854775808,9223372036854775807,42]",
+}
 
 
 def field(info_reply, name):
@@ -206,12 +216,13 @@ def run(ctx):
         r1 = vmrss_mib(node.pid)
         mem = c.info("memory")
         peak = mem.get("used_memory_peak", 0)
-        ctx.emit("bytes_per_doc", (u1 - u0) / docs, "B", "lower", gate=[MEMORY])
+        ctx.emit("bytes_per_doc", (u1 - u0) / docs, "B", "lower",
+                 gate=[MEMORY, KEEP_IMPROVEMENT, vs_redis(1.0)])
         ctx.emit("rss_per_doc", (r1 - r0) * MIB / docs, "B", "lower", gate=info())
         ctx.emit("peak_per_doc", (max(peak, u1) - u0) / docs, "B", "lower", gate=info())
 
         usage = [int(c.execute_command("MEMORY", "USAGE", k, "SAMPLES", "0")) for k in keys]
-        ctx.emit("memory_usage_per_doc", sum(usage) / len(usage), "B", "lower", gate=info())
+        ctx.emit("memory_usage_per_doc", sum(usage) / len(usage), "B", "lower", gate=[MEMORY])
         dbg = [debug_memory(c, k) for k in keys]
         ctx.emit("json_debug_memory_embedding", sum(dbg) / len(dbg), "B", "lower", gate=info())
 
@@ -226,7 +237,7 @@ def run(ctx):
                 at = next((j for j, (a, b) in enumerate(zip(got, want)) if a != b), min(len(got), len(want)))
                 ctx.raw["get_first_difference"] = {"key": k, "at": at, "sent": want[max(0, at - 40):at + 40],
                                                    "got": got[max(0, at - 40):at + 40]}
-        ctx.emit("get_same", same, "docs", "higher", gate=info(),
+        ctx.emit("get_same", same, "docs", "higher", gate=EXACT,
                  note="of %d sampled documents, JSON.GET returned the text written" % SAMPLE)
         first_text = sent["doc:0"]
 
@@ -238,13 +249,17 @@ def run(ctx):
         else:
             c.execute_command("JSON.SET", "numbers", "$", NUMBER_FORMS)
             back = c.execute_command("JSON.GET", "numbers")
-            ctx.raw["number_forms"] = {"sent": NUMBER_FORMS,
-                                       "got": back.decode() if isinstance(back, bytes) else back}
+            back = back.decode() if isinstance(back, bytes) else back
+            ctx.raw["number_forms"] = {"sent": NUMBER_FORMS, "got": back}
+            kept = back == EXPECTED_FORMS["forms"]
             for name, text in NUMBER_ARRAYS.items():
                 c.execute_command("JSON.SET", "numbers:" + name, "$", text)
                 back = c.execute_command("JSON.GET", "numbers:" + name)
-                ctx.raw["number_forms_" + name] = {"sent": text,
-                                                   "got": back.decode() if isinstance(back, bytes) else back}
+                back = back.decode() if isinstance(back, bytes) else back
+                ctx.raw["number_forms_" + name] = {"sent": text, "got": back}
+                kept = kept and back == EXPECTED_FORMS[name]
+            ctx.emit("number_forms_kept", int(kept), "", "higher", gate=EXACT,
+                     note="1: JSON.GET printed every number list as EXPECTED_FORMS")
 
         ctx.raw["memory"] = {"used_memory_before": u0, "used_memory_after": u1, "rss_mib_before": r0,
                              "rss_mib_after": r1, "used_memory_peak": peak, "peak_before": p0,
