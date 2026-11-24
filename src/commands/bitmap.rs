@@ -106,17 +106,16 @@ fn cmd_setbit(ctx: &mut Ctx) -> Vec<u8> {
         _ => return resp_error("ERR bit is not an integer or out of range"),
     };
 
-    let key_owned = key.to_vec();
     let (byte_idx, mask) = bit_byte_and_mask(offset);
 
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let mut map = write_lock!(shard);
 
-    // Get existing bytes or start empty
-    let existing: Vec<u8> = match map.get(key) {
-        Some(ValueRef::String(b)) => b.to_vec(), // Arc<[u8]> → Vec<u8> (clone)
-        None => vec![],
+    // Borrow the stored bytes; copy them only if the bit changes.
+    let existing: &[u8] = match map.get(key) {
+        Some(ValueRef::String(b)) => b.as_bytes(),
+        None => &[],
         _ => {
             return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
         }
@@ -140,7 +139,7 @@ fn cmd_setbit(ctx: &mut Ctx) -> Vec<u8> {
     }
 
     // Extend with zeros if needed, then set/clear the bit
-    let mut new_bytes = existing;
+    let mut new_bytes = existing.to_vec();
     if byte_idx >= new_bytes.len() {
         new_bytes.resize(byte_idx + 1, 0u8);
     }
@@ -150,7 +149,7 @@ fn cmd_setbit(ctx: &mut Ctx) -> Vec<u8> {
         new_bytes[byte_idx] &= !mask;
     }
 
-    map.insert_str(key_owned, new_bytes.as_slice());
+    map.insert_str(key, new_bytes.as_slice());
 
     resp_integer(old_bit)
 }
@@ -583,32 +582,30 @@ fn cmd_bitfield(ctx: &mut Ctx, readonly: bool) -> Vec<u8> {
     if cmd.len() < 2 {
         return resp_error("ERR wrong number of arguments for 'bitfield' command");
     }
-    let key: Vec<u8> = cmd[1].to_vec();
+    let key: &[u8] = cmd[1];
 
     // We'll accumulate results for each subcommand
     let mut results: Vec<Vec<u8>> = Vec::new();
     let mut i = 2usize;
 
-    // Read current bytes (we may need to mutate)
     let db = &ctx.store[*ctx.selected_db];
-    let shard = store::get_shard(db, &key);
+    let shard = store::get_shard(db, key);
 
-    let mut current_bytes: Vec<u8> = {
-        let map = read_lock!(shard);
-        match map.get(key.as_slice()) {
-            Some(ValueRef::String(b)) => b.to_vec(),
-            None => vec![],
-            _ => {
-                return resp_error(
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                );
-            }
+    // A second hold on the stored bytes, read with the shard let go.
+    let held: Option<SharedBytes> = match read_lock!(shard).get(key) {
+        Some(ValueRef::String(b)) => Some(b.to_shared()),
+        None => None,
+        _ => {
+            return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
         }
     };
-    let snapshot_before = current_bytes.clone();
+    let stored: &[u8] = held.as_deref().unwrap_or(&[]);
+    // The writable copy, made by the first successful write.
+    let mut written: Option<Vec<u8>> = None;
+    // Byte range the writes touched: only it can differ from `stored`.
+    let (mut touched_from, mut touched_to) = (usize::MAX, 0usize);
 
     let mut overflow_mode = "WRAP"; // WRAP | SAT | FAIL
-    let mut modified = false;
 
     while i < cmd.len() {
         let sub = std::str::from_utf8(cmd[i])
@@ -654,7 +651,7 @@ fn cmd_bitfield(ctx: &mut Ctx, readonly: bool) -> Vec<u8> {
                     }
                 };
                 i += 1;
-                let val = bitfield_get(&current_bytes, &encoding, offset);
+                let val = bitfield_get(written.as_deref().unwrap_or(stored), &encoding, offset);
                 results.push(match val {
                     Some(v) => resp_integer(v),
                     None => resp_null_for(resp),
@@ -690,7 +687,7 @@ fn cmd_bitfield(ctx: &mut Ctx, readonly: bool) -> Vec<u8> {
                     .unwrap_or(0);
                 i += 1;
 
-                let old_val = bitfield_get(&current_bytes, &encoding, offset);
+                let old_val = bitfield_get(written.as_deref().unwrap_or(stored), &encoding, offset);
                 let new_val: i128 = if op == "SET" {
                     value
                 } else {
@@ -699,8 +696,10 @@ fn cmd_bitfield(ctx: &mut Ctx, readonly: bool) -> Vec<u8> {
                 let clamped = bitfield_clamp(&encoding, new_val, overflow_mode);
                 match clamped {
                     Some(v) => {
-                        bitfield_set(&mut current_bytes, &encoding, offset, v as i64);
-                        modified = true;
+                        let bytes = written.get_or_insert_with(|| stored.to_vec());
+                        bitfield_set(bytes, &encoding, offset, v as i64);
+                        touched_from = touched_from.min(offset / 8);
+                        touched_to = touched_to.max((offset + enc_bits as usize).div_ceil(8));
                         if op == "SET" {
                             results.push(resp_integer(old_val.unwrap_or(0)));
                         } else {
@@ -721,12 +720,14 @@ fn cmd_bitfield(ctx: &mut Ctx, readonly: bool) -> Vec<u8> {
         }
     }
 
-    if modified && current_bytes == snapshot_before {
-        modified = false;
-    }
-    if modified {
+    // Stored only if the bytes changed on the whole.
+    let changed = written.filter(|bytes| {
+        bytes.len() != stored.len()
+            || bytes.get(touched_from..touched_to) != stored.get(touched_from..touched_to)
+    });
+    if let Some(bytes) = changed {
         let mut map = write_lock!(shard);
-        map.insert_str(key, current_bytes.as_slice());
+        map.insert_str(key, bytes.as_slice());
     } else {
         ctx.skip_write_side_effects = true;
     }
@@ -854,5 +855,370 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         "BITFIELD" => Some(cmd_bitfield(ctx, false)),
         "BITFIELD_RO" => Some(cmd_bitfield(ctx, true)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::ctx::NoopAofSender;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// A string kept in its entry, in a slab, and in allocations of its own.
+    const SIZES: [usize; 4] = [1000, 16 << 10, 64 << 10, 1 << 20];
+
+    /// What a command that copies no value may allocate: its reply.
+    const SMALL: isize = 512;
+
+    /// `line`, split at spaces, run by the bitmap handler on `store`'s
+    /// database 0: the reply, whether the write is left unpropagated, and
+    /// the most the handler allocated at once, if this thread counts it.
+    fn run(store: &store::Store, line: &str) -> (Vec<u8>, bool, Option<isize>) {
+        let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
+        let (hub_tx, _hub_rx) = crate::replication::HubTx::channel();
+        let repl_state = Arc::new(crate::replication::ReplState::new_master());
+        let config = Arc::new(crate::config::Config::default());
+        let started_at = Instant::now();
+        let index_store = crate::vector::new_index_store();
+        let dict_store = crate::vector::new_dict_store();
+        let wait_table = Arc::new(crate::wait_table::WaitTable::new());
+        let ts_index = crate::store::new_ts_index();
+        let pubsub = crate::pubsub::PubSubHub::new();
+        let acl_store = crate::acl::new_acl_store("");
+        let acl_log = crate::acl::new_acl_log();
+        let slowlog = crate::slowlog::new_slowlog(u64::MAX, 0);
+        let latency = crate::latency::new_latency_tracker();
+        let (compaction_tx, _compaction_rx) = crate::vector::new_compaction_channel();
+        let cluster = Arc::new(crate::cluster::ClusterState::new_disabled());
+        let client_registry = crate::client_registry::new_client_registry();
+        let monitor_registry = crate::monitor::new_monitor_registry();
+        let tracking_table = crate::tracking::new_tracking_table();
+        let mut selected_db = 0usize;
+        let mut ctx = Ctx {
+            cmd: line.split(' ').map(str::as_bytes).collect(),
+            store,
+            lastsave: &lastsave,
+            selected_db: &mut selected_db,
+            aof_tx: &NoopAofSender,
+            aof_enabled: false,
+            config: &config,
+            started_at: &started_at,
+            index_store: &index_store,
+            dict_store: &dict_store,
+            wait_table: &wait_table,
+            ts_index: &ts_index,
+            pubsub: &pubsub,
+            hub_tx: &hub_tx,
+            repl_state: &repl_state,
+            watch_registry: &crate::watch::NoopWatchRegistry,
+            client_id: 0,
+            client_registry: &client_registry,
+            resp: 2,
+            acl_store: &acl_store,
+            acl_log: &acl_log,
+            slowlog: &slowlog,
+            latency: &latency,
+            compaction_tx: &compaction_tx,
+            cluster: &cluster,
+            bypass_cluster_check: false,
+            apply_replication: false,
+            skip_write_side_effects: false,
+            peer_addr: "127.0.0.1:1",
+            peer_ipv6: false,
+            monitor_registry: &monitor_registry,
+            authenticated_user: "default",
+            tracking_table: &tracking_table,
+            blocking: None,
+        };
+        let name = line.split(' ').next().unwrap();
+        let (reply, peak) = crate::memory_use::peak_during(|| handle(&mut ctx, name));
+        (reply.unwrap(), ctx.skip_write_side_effects, peak)
+    }
+
+    /// [`run`] in a test that counts allocations (see [`counting`]).
+    fn counted(store: &store::Store, line: &str) -> (Vec<u8>, bool, isize) {
+        let (reply, skipped, peak) = run(store, line);
+        (
+            reply,
+            skipped,
+            peak.expect("a thread that counts its own allocations"),
+        )
+    }
+
+    /// Runs `test` on this thread if it counts its own allocations, else in
+    /// a process of its own, where it does (see `memory_use`).
+    fn counting(name: &str, test: impl FnOnce()) {
+        const CHILD: &str = "KIVIDB_BITMAP_TEST_CHILD";
+        if crate::memory_use::allocated_by_this_thread().is_some() {
+            return test();
+        }
+        assert!(std::env::var_os(CHILD).is_none(), "no counter in a child");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--test-threads", "1"])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{name} failed in a process of its own");
+    }
+
+    fn put(store: &store::Store, key: &[u8], value: &[u8]) {
+        drop(
+            store::get_shard(&store[0], key)
+                .write()
+                .insert_str(key, value),
+        );
+    }
+
+    /// `key`'s bytes, and where they are.
+    fn stored(store: &store::Store, key: &[u8]) -> Option<(Vec<u8>, usize)> {
+        let map = store::get_shard(&store[0], key).read();
+        match map.get(key) {
+            Some(ValueRef::String(b)) => Some((b.to_vec(), b.as_ptr() as usize)),
+            _ => None,
+        }
+    }
+
+    /// Whether `key`'s bytes are in its entry: a second hold is then a copy.
+    fn in_entry(store: &store::Store, key: &[u8]) -> bool {
+        let map = store::get_shard(&store[0], key).read();
+        matches!(map.get(key), Some(ValueRef::String(b)) if !b.is(&b.to_shared()))
+    }
+
+    /// `BITFIELD`'s reply of `values`, a nil for each `None`.
+    fn ints(values: &[Option<i64>]) -> Vec<u8> {
+        let each = values
+            .iter()
+            .map(|v| v.map_or_else(|| resp_null_for(2), resp_integer));
+        resp_array(each.collect())
+    }
+
+    #[test]
+    fn the_larger_sizes_are_in_a_slab_and_on_their_own() {
+        assert!(crate::value_slab::class_of(SIZES[1] + 8).is_some());
+        assert!(crate::value_slab::class_of(SIZES[2] + 8).is_none());
+        // Only the first is in its entry.
+        for len in SIZES {
+            let store = store::new_store(1);
+            put(&store, b"k", &vec![0; len]);
+            assert_eq!(in_entry(&store, b"k"), len == SIZES[0], "{len}");
+        }
+    }
+
+    /// A `SETBIT` that finds the bit as asked copies nothing and writes
+    /// nothing; one that changes it copies the value and stores it.
+    #[test]
+    fn a_setbit_that_changes_nothing_copies_nothing() {
+        counting(
+            "commands::bitmap::tests::a_setbit_that_changes_nothing_copies_nothing",
+            || {
+                for len in SIZES {
+                    let store = store::new_store(1);
+                    let mut value = vec![0xAAu8; len];
+                    put(&store, b"k", &value);
+                    let (_, at) = stored(&store, b"k").unwrap();
+                    let last = (len - 1) * 8;
+                    for (line, old) in [
+                        (format!("SETBIT k {last} 1"), 1),
+                        (format!("SETBIT k {} 0", last + 1), 0),
+                    ] {
+                        let (reply, skipped, peak) = counted(&store, &line);
+                        assert_eq!(reply, resp_integer(old), "{len} {line}");
+                        assert!(skipped, "{len} {line}");
+                        assert!(peak < SMALL, "{len} {line}: {peak} bytes");
+                        assert_eq!(stored(&store, b"k"), Some((value.clone(), at)), "{len}");
+                    }
+                    let (reply, skipped, peak) = counted(&store, &format!("SETBIT k {last} 0"));
+                    assert_eq!((reply, skipped), (resp_integer(1), false), "{len}");
+                    assert!(peak >= len as isize, "{len}: {peak} bytes");
+                    value[len - 1] = 0x2A;
+                    assert_eq!(stored(&store, b"k").unwrap().0, value, "{len}");
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn setbit_past_the_end_or_on_a_new_key_writes() {
+        let store = store::new_store(1);
+        put(&store, b"k", b"\x80");
+        // A clear bit past the end still lengthens the string.
+        for (line, key, want) in [
+            ("SETBIT k 15 0", b"k", &b"\x80\x00"[..]),
+            ("SETBIT n 3 0", b"n", b"\x00"),
+            ("SETBIT o 9 1", b"o", b"\x00\x40"),
+        ] {
+            let (reply, skipped, _) = run(&store, line);
+            assert_eq!((reply, skipped), (resp_integer(0), false), "{line}");
+            assert_eq!(stored(&store, key).unwrap().0, want, "{line}");
+        }
+        // Refused arguments touch nothing.
+        for line in [
+            "SETBIT k x 1",
+            "SETBIT k 4294967296 1",
+            "SETBIT k 0 2",
+            "SETBIT k 0",
+        ] {
+            assert!(run(&store, line).0.starts_with(b"-ERR"), "{line}");
+        }
+        assert_eq!(stored(&store, b"k").unwrap().0, b"\x80\x00");
+    }
+
+    /// `BITFIELD` that only reads, `BITFIELD_RO`, and `OVERFLOW FAIL`
+    /// writes that all fail copy no bytes of their own block; bytes in the
+    /// entry are copied once, to be read with the shard let go.
+    #[test]
+    fn a_bitfield_that_writes_nothing_copies_only_bytes_in_the_entry() {
+        counting(
+            "commands::bitmap::tests::a_bitfield_that_writes_nothing_copies_only_bytes_in_the_entry",
+            || {
+                for len in SIZES {
+                    let store = store::new_store(1);
+                    let value = vec![0xAAu8; len];
+                    put(&store, b"k", &value);
+                    let (_, at) = stored(&store, b"k").unwrap();
+                    let mut most = SMALL;
+                    if in_entry(&store, b"k") {
+                        most += len as isize;
+                    }
+                    let last = (len - 1) * 8;
+                    for (line, want) in [
+                        (
+                            format!("BITFIELD k GET u8 {last} GET i8 #0"),
+                            &[Some(170), Some(-86)][..],
+                        ),
+                        (
+                            format!("BITFIELD_RO k GET u8 0 GET u4 {last}"),
+                            &[Some(170), Some(10)],
+                        ),
+                        (
+                            format!("BITFIELD k OVERFLOW FAIL INCRBY u8 {last} 100"),
+                            &[None],
+                        ),
+                        (
+                            "BITFIELD k OVERFLOW FAIL SET i8 0 128 GET u8 0 INCRBY i8 8 -100"
+                                .into(),
+                            &[None, Some(170), None],
+                        ),
+                    ] {
+                        let (reply, skipped, peak) = counted(&store, &line);
+                        assert_eq!(reply, ints(want), "{len} {line}");
+                        assert!(skipped, "{len} {line}");
+                        assert!(peak < most, "{len} {line}: {peak} bytes");
+                        assert_eq!(stored(&store, b"k"), Some((value.clone(), at)), "{len}");
+                    }
+                }
+            },
+        );
+    }
+
+    /// A write is made in one copy of the value, which later subcommands
+    /// read; the copy is stored once they are done.
+    #[test]
+    fn a_bitfield_write_copies_the_value_once() {
+        counting(
+            "commands::bitmap::tests::a_bitfield_write_copies_the_value_once",
+            || {
+                for len in SIZES {
+                    let store = store::new_store(1);
+                    let mut value = vec![0xAAu8; len];
+                    put(&store, b"k", &value);
+                    let last = (len - 1) * 8;
+                    let (reply, skipped, peak) = counted(
+                        &store,
+                        &format!(
+                            "BITFIELD k GET u8 0 OVERFLOW FAIL INCRBY u8 0 100 SET u8 0 1 GET u8 0 \
+                         INCRBY u8 0 255 INCRBY u8 {last} 2 GET u8 0"
+                        ),
+                    );
+                    let want = [
+                        Some(170),
+                        None,
+                        Some(170),
+                        Some(1),
+                        None,
+                        Some(172),
+                        Some(1),
+                    ];
+                    assert_eq!((reply, skipped), (ints(&want), false), "{len}");
+                    // The copy and the value stored from it; no third.
+                    assert!(peak >= len as isize, "{len}: {peak} bytes");
+                    if len >= 64 << 10 {
+                        assert!(peak < (len * 5 / 2) as isize, "{len}: {peak} bytes");
+                    }
+                    value[0] = 1;
+                    value[len - 1] = 172;
+                    assert_eq!(stored(&store, b"k").unwrap().0, value, "{len}");
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn bitfield_writes_and_failures_in_either_order() {
+        let store = store::new_store(1);
+        put(&store, b"k", b"\x01\x02\x03");
+        let bitfield = |subcommands: &str| {
+            let (reply, skipped, _) = run(&store, &format!("BITFIELD k {subcommands}"));
+            (reply, skipped)
+        };
+        // A write, then a failure: the write is kept; and the other way round.
+        assert_eq!(
+            bitfield("SET u8 0 7 OVERFLOW FAIL INCRBY u8 0 255"),
+            (ints(&[Some(1), None]), false)
+        );
+        assert_eq!(
+            bitfield("OVERFLOW FAIL INCRBY u8 8 255 SET u8 8 9"),
+            (ints(&[None, Some(2)]), false)
+        );
+        assert_eq!(stored(&store, b"k").unwrap().0, b"\x07\x09\x03");
+        // Bytes put back at one end and changed at the other are a change.
+        assert_eq!(
+            bitfield("SET u8 0 0 SET u8 0 7 INCRBY u8 16 1"),
+            (ints(&[Some(7), Some(0), Some(4)]), false)
+        );
+        assert_eq!(stored(&store, b"k").unwrap().0, b"\x07\x09\x04");
+        // A zero written past the end lengthens the string.
+        assert_eq!(bitfield("SET u8 24 0"), (ints(&[Some(0)]), false));
+        assert_eq!(stored(&store, b"k").unwrap().0, b"\x07\x09\x04\x00");
+        // An error after a write keeps nothing.
+        for subcommands in [
+            "SET u8 0 99 GET",
+            "SET u8 0 99 GET u99 0",
+            "SET u8 0 99 GET u8 -1",
+            "SET u8 0 99 OVERFLOW NOPE",
+            "SET u8 0 99 BOGUS",
+        ] {
+            assert!(
+                bitfield(subcommands).0.starts_with(b"-ERR"),
+                "{subcommands}"
+            );
+        }
+        assert_eq!(
+            run(&store, "BITFIELD_RO k GET u8 0 SET u8 0 99").0,
+            resp_error("ERR BITFIELD_RO only supports the GET subcommand")
+        );
+        assert_eq!(stored(&store, b"k").unwrap().0, b"\x07\x09\x04\x00");
+        // A field across two bytes, changed in the second only, is a change.
+        assert_eq!(bitfield("SET u4 14 7"), (ints(&[Some(4)]), false));
+        assert_eq!(stored(&store, b"k").unwrap().0, b"\x07\x09\xC4\x00");
+    }
+
+    #[test]
+    fn bitfield_on_a_missing_key() {
+        let store = store::new_store(1);
+        for line in [
+            "BITFIELD k GET u8 0",
+            "BITFIELD_RO k GET u8 0",
+            "BITFIELD k OVERFLOW FAIL INCRBY u8 0 256",
+        ] {
+            let (reply, skipped, _) = run(&store, line);
+            let want = if line.contains("FAIL") { None } else { Some(0) };
+            assert_eq!((reply, skipped), (ints(&[want]), true), "{line}");
+        }
+        assert_eq!(stored(&store, b"k"), None);
+        let (reply, skipped, _) = run(&store, "BITFIELD k SET u4 4 3");
+        assert_eq!((reply, skipped), (ints(&[Some(0)]), false));
+        assert_eq!(stored(&store, b"k").unwrap().0, b"\x03");
     }
 }
