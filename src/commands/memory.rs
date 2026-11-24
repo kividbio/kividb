@@ -120,7 +120,9 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
         // key and the value, as the allocator rounds it. Redis's suite
         // holds it to that (at least the three, at most twice them or 64),
         // which a share of the table's entries does not fit.
-        ValueRef::String(b) => size_class(16 + key.len() + 2 + b.len() + 2),
+        // A long string an APPEND grew counts the room it keeps for the
+        // next appends too: memory it holds.
+        ValueRef::String(b) => size_class(16 + key.len() + 2 + b.len() + 2) + b.spare(),
 
         // Chunks of packed elements are counted as allocated, room to spare
         // included.

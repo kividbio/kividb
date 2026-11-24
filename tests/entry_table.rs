@@ -333,14 +333,25 @@ fn a_held_string_is_never_written_in_place() {
             map.set_str("k", bytes(100, 2)),
             Written::Replaced(_)
         ));
-        assert_eq!(map.append_in_place("k", b"x"), Some(101), "the new entry");
+        assert!(
+            matches!(
+                map.append_str("k", b"x", usize::MAX),
+                Ok((101, Written::InPlace))
+            ),
+            "the new entry"
+        );
         let held2 = map.get_ref("k").unwrap();
-        assert_eq!(map.append_in_place("k", b"y"), None);
         assert_eq!(map.set_range_in_place("k", 0, b"zz"), None);
+        // Held: a copy, the holder keeping the bytes from before.
+        assert!(matches!(
+            map.append_str("k", b"y", usize::MAX),
+            Ok((102, Written::Replaced(_)))
+        ));
         assert!(matches!(held.value(), ValueRef::String(b) if b.as_bytes() == &bytes(100, 1)[..]));
         let mut was = bytes(100, 2);
         was.push(b'x');
         assert!(matches!(held2.value(), ValueRef::String(b) if b.as_bytes() == &was[..]));
+        was.push(b'y');
         assert_eq!(text(map.get("k")), Some(was));
     });
 }
@@ -351,10 +362,16 @@ fn appends_and_ranges_in_place() {
     let _one = one_at_a_time();
     on_a_thread(|| {
         let mut map = ShardMap::new();
-        assert_eq!(map.append_in_place("k", b"x"), None, "no such key");
+        assert!(
+            matches!(map.append_str("k", b"x", usize::MAX), Ok((1, Written::New))),
+            "no such key: made"
+        );
         map.set_str("k", b"hello");
         // "k" and 5 bytes: an 18-byte block, in the class of 17 to 32.
-        assert_eq!(map.append_in_place("k", b" world"), Some(11));
+        assert!(matches!(
+            map.append_str("k", b" world", usize::MAX),
+            Ok((11, Written::InPlace))
+        ));
         assert_eq!(text(map.get("k")), Some(b"hello world".to_vec()));
         assert_eq!(map.set_range_in_place("k", 6, b"WORLD"), Some(11));
         assert_eq!(text(map.get("k")), Some(b"hello WORLD".to_vec()));
@@ -362,15 +379,27 @@ fn appends_and_ranges_in_place() {
         assert_eq!(map.set_range_in_place("k", 13, b"!"), Some(14));
         assert_eq!(text(map.get("k")), Some(b"hello WORLD\0\0!".to_vec()));
         // Out of the class: left as it was.
-        assert_eq!(map.append_in_place("k", &[b'.'; 10]), None);
         assert_eq!(map.set_range_in_place("k", 100, b"!"), None);
         assert_eq!(map.set_range_in_place("k", usize::MAX, b"!"), None);
         assert_eq!(text(map.get("k")), Some(b"hello WORLD\0\0!".to_vec()));
+        // An APPEND out of the class: a new entry.
+        assert!(matches!(
+            map.append_str("k", &[b'.'; 10], usize::MAX),
+            Ok((24, Written::Replaced(_)))
+        ));
+        assert_eq!(
+            text(map.get("k")),
+            Some(b"hello WORLD\0\0!..........".to_vec())
+        );
         // Not a string kept inline.
         map.insert("l", list(&[b"x"]));
-        assert_eq!(map.append_in_place("l", b"x"), None);
+        assert!(map.append_str("l", b"x", usize::MAX).is_err());
         map.set_str("big", bytes(5_000, 1));
-        assert_eq!(map.append_in_place("big", b"x"), None);
+        // Bytes of their own: in their block.
+        assert!(matches!(
+            map.append_str("big", b"x", usize::MAX),
+            Ok((5_001, Written::InPlace))
+        ));
         assert_eq!(map.set_range_in_place("big", 0, b"x"), None);
     });
 }
@@ -411,7 +440,7 @@ fn writes_in_place_beside_holders_on_other_threads() {
                 Written::New => panic!("the key is there"),
             }
             if i % 7 == 0 {
-                m.append_in_place("k", b"z");
+                let _ = m.append_str("k", b"z", usize::MAX);
             }
         }
         for r in readers {
@@ -470,7 +499,10 @@ fn lookups_write_a_keys_use_inside_an_access_scope() {
             assert!(map.set_expires("k", u64::MAX / 2));
             let _ = map.get_expiring("k");
             assert_eq!(map.access("k"), Some(next));
-            assert_eq!(map.append_in_place("x", b"y"), None);
+            assert!(matches!(
+                map.append_str("x", b"y", usize::MAX),
+                Ok((1, Written::New))
+            ));
         }
     });
 }
