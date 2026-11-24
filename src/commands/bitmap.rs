@@ -1152,21 +1152,18 @@ mod tests {
     fn setbit_keeps_a_time_to_live_and_leaves_other_types() {
         let store = store::new_store(1);
         let later = crate::commands::helpers::now_ms() + 3_600_000;
-        for (key, len) in [
-            (&b"inline"[..], 100),
-            (b"slab", 16 << 10),
-            (b"own", 64 << 10),
-        ] {
+        for (name, len) in [("inline", 100), ("slab", 16 << 10), ("own", 64 << 10)] {
+            let key = name.as_bytes();
             let shard = store::get_shard(&store[0], key);
             drop(
                 shard
                     .write()
                     .insert_str_expiring(key, vec![0u8; len], Some(later)),
             );
-            let line = format!("SETBIT {} 0 1", std::str::from_utf8(key).unwrap());
+            let line = format!("SETBIT {name} 0 1");
             assert_eq!(run(&store, &line).0, resp_integer(0));
             let held = shard.read().get_ref(key);
-            let line = format!("SETBIT {} 1 1", std::str::from_utf8(key).unwrap());
+            let line = format!("SETBIT {name} 1 1");
             assert_eq!(run(&store, &line).0, resp_integer(0));
             drop(held);
             assert_eq!(shard.read().expires(key), Some(later), "{len}");
