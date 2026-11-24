@@ -163,8 +163,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`ARRIVED`) at a newer one; that epoch is written down with the slots it
   does not hold (`<cluster-config-file>.not-held`) and read back at
   start-up. Each master keeps, per slot, the epoch of the claim that gave
-  the slot to its owner (`<cluster-config-file>.came-at`, written, synced,
-  before every save of `nodes.conf`). A slot claimed at an older epoch than
+  the slot to its owner (`<cluster-config-file>.came-at`, with each slot's
+  owner, written, synced, before the saves of `nodes.conf`; a slot it does
+  not have with that owner is taken to have come at the owner's config
+  epoch). A slot claimed at an older epoch than
   that is refused, and the refusal (`UPDATE`, with one field more) says when
   each came: the replica holds those only through a `TAKEN` at that epoch
   or later that lists them, or an `ARRIVED` at that very epoch, and asks

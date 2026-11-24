@@ -1392,7 +1392,8 @@ way), `.followed-imports` (the imports into its master it knew of),
 `.not-held` (a replica: the slots of its master it does not hold yet, and
 the epoch of the newest claim of its master it read) and `.came-at` (when
 each slot came to its owner, which votes are decided on). Each is written,
-synced, before the `nodes.conf` save it belongs with.
+synced, before the `nodes.conf` save it belongs with (`.came-at`: see "When a
+slot came to its master").
 
 A cluster node has one keyspace: `SELECT` of any database but 0 is refused.
 
@@ -1494,12 +1495,15 @@ others. So a replica cut off while slots of its master went to another
 master, took writes there and came back is elected only for the slots whose
 writes it holds; the others stay with its master, which keeps them on disk.
 
-A master writes these epochs down, synced, in `<cluster-config-file>.came-at`
-before every save of `nodes.conf`, and reads them back when it starts. One
-that starts without the file (a node of an earlier release, or a file that
-does not read) takes each slot to have come at its owner's config epoch in
-`nodes.conf`: it refuses only a replica whose newest claim read is older
-than its master's epoch, and elects one that read its master's newest claim.
+A master writes these epochs down, synced, with each slot's owner, in
+`<cluster-config-file>.came-at` before its saves of `nodes.conf` (not the
+save that takes slots over at the end of an import, which the source's
+writes wait for), and reads them back when it starts. A slot the file does
+not have with the owner `nodes.conf` has (no file: a node of an earlier
+release; a file that does not read; one written before the save that moved
+the slot) is taken to have come at its owner's config epoch in `nodes.conf`:
+such a master refuses only a replica whose newest claim read is older than
+its master's epoch, and elects one that read its master's newest claim.
 A replica writes the epoch of the newest claim of its master it read in
 `<cluster-config-file>.not-held`, so that it claims at that epoch after a
 restart. Before it has read any claim of a master that sends them (one it

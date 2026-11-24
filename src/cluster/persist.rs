@@ -798,9 +798,14 @@ fn save_then(
     // What a replica does not hold of its master's slots is on disk before
     // the table that shows them as its master's is (`followed_imports::NotHeld`).
     crate::cluster::followed_imports::save_not_held(state);
-    // And when each slot came to its owner (`came_at`), which a vote is
-    // decided on: on disk before the table that shows the owners is.
-    crate::cluster::came_at::save(state);
+    // And when each slot came to its owner (`came_at`), which votes are
+    // decided on; not by a save with a publish step (a takeover's, whose
+    // source holds writes meanwhile): the file names each slot's owner, and
+    // one written before a save that moved a slot reads back for it at the
+    // owner's config epoch (`came_at::load`).
+    if publish.is_none() {
+        crate::cluster::came_at::save(state);
+    }
     let path = match state.config_path.as_ref() {
         Some(p) => p,
         None => {
