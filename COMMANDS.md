@@ -1532,9 +1532,9 @@ skips the election as well: the replica picks a new epoch on its own and
 claims its master's slots, as it sees them, without asking anyone. It gives
 no guarantee about the old master's writes, and does not check whether its
 master gave slots away that it has not heard of, nor when the slots came to
-its master: it can make the replica the owner of slots whatever it holds of
-them. It is an operator's override: use it only when no majority of masters
-can vote.
+its master: it takes its master's slots without asking the other masters,
+whatever this replica holds of them. Use `FORCE` where the vote should
+decide; `TAKEOVER` only when no majority of masters can vote.
 
 **Config epoch collisions.** Two masters at one config epoch are resolved as
 in Redis: the one with the lower node id moves to a new epoch. A `TAKEOVER`

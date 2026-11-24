@@ -15,8 +15,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a master of 1.2 votes without the check. Upgrade the masters before
   relying on it. Each master keeps `<cluster-config-file>.came-at` beside
   `nodes.conf`; one that starts without it takes each slot to have come at
-  its owner's config epoch. `CLUSTER FAILOVER TAKEOVER` asks no one: it can
-  make a replica the owner of slots whatever it holds of them.
+  its owner's config epoch. `CLUSTER FAILOVER TAKEOVER` takes the master's
+  slots without asking the other masters, whatever the replica holds of
+  them: use `FORCE` where the vote should decide.
 
 - **A query that names no `DIALECT` is read in dialect 1 (#247).** It is
   read in the default dialect, as in Redis: 1, which `search-default-dialect`

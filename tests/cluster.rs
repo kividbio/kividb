@@ -2137,16 +2137,22 @@ fn a_slot_move_killed_after_any_step_restarts_with_one_owner() {
         stop_all(nodes, Stop::Kill);
         for node in nodes.iter_mut() {
             node.spawn();
-            // Spares (`nodes.conf.spare-<n>`) are removed at startup, and
-            // the save the node makes as it starts may leave one.
+            // Beside nodes.conf, only the files a node keeps: spares
+            // (`nodes.conf.spare-<n>`, removed at startup; the save the node
+            // makes as it starts may leave one) and when each slot came to
+            // its owner (`nodes.conf.came-at`). Everything else, a temporary
+            // file (`nodes.conf.came-at.tmp` among them) included, is
+            // refused.
             let left: Vec<String> = std::fs::read_dir(&node.dir)
                 .unwrap()
                 .flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .filter(|n| n.starts_with("nodes.conf."))
                 .collect();
+            let spare = |n: &String| n.starts_with("nodes.conf.spare-") && !n.ends_with(".tmp");
             assert!(
-                left.len() <= 2 && left.iter().all(|n| n.starts_with("nodes.conf.spare-")),
+                left.iter().filter(|n| spare(n)).count() <= 2
+                    && left.iter().all(|n| spare(n) || n == "nodes.conf.came-at"),
                 "after {step}: {left:?}"
             );
         }
@@ -11239,6 +11245,22 @@ enum Voters {
     SourceSkipsThirdRestartedWithoutFile,
 }
 
+/// How the replica is kept away while the slots leave and come back, in
+/// [`replica_stopped_while_slots_leave_and_come_back`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Away {
+    /// Stopped (its process down, its AOF keeping what it had): it hears
+    /// nothing of the slots' moves, its table still has them as its
+    /// master's, and it claims them; the voters refuse them for when they
+    /// came (`came_at`).
+    Stopped,
+    /// Cut off (`cut_off`: replication link down, bus held): the claims sent
+    /// to it meanwhile are taken in when the cut heals, the slots' coming
+    /// back among them, a gain its stream has not confirmed: it does not
+    /// hold them, and does not claim them (`followed_imports::NotHeld`).
+    Cut,
+}
+
 /// How the replica stands, in
 /// [`replica_stopped_while_slots_leave_and_come_back`].
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -11261,7 +11283,12 @@ enum Standing {
 /// The voters, which know R came to D at a newer epoch since, refuse it and
 /// say so (`came_at`, `UPDATE`): it is elected only for D's other slots,
 /// whose writes it holds. D, back, owns R with every write, S's included.
-fn replica_stopped_while_slots_leave_and_come_back(moved: Moved, voters: Voters, stands: Standing) {
+fn replica_stopped_while_slots_leave_and_come_back(
+    moved: Moved,
+    voters: Voters,
+    stands: Standing,
+    away: Away,
+) {
     let skips: &[(&str, &str)] = match voters {
         Voters::Checking => &[],
         _ => &[("KIVIDB_TEST_VOTER_SKIPS_CAME_AT", "1")],
@@ -11275,6 +11302,10 @@ fn replica_stopped_while_slots_leave_and_come_back(moved: Moved, voters: Voters,
         Standing::Elected => "0",
         Standing::Force => "1",
     };
+    let env: &[(&str, &str)] = match away {
+        Away::Stopped => &[],
+        Away::Cut => &[LINK_DOWN, BUS_CONTROL],
+    };
     let mut replica = add_replica_with(
         &nodes,
         &nodes[1],
@@ -11284,7 +11315,7 @@ fn replica_stopped_while_slots_leave_and_come_back(moved: Moved, voters: Voters,
             "--appendonly",
             "yes",
         ],
-        &[],
+        env,
     );
     {
         let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
@@ -11322,11 +11353,16 @@ fn replica_stopped_while_slots_leave_and_come_back(moved: Moved, voters: Voters,
     );
     let first = Written::on(&nodes[1], a..=b, "first", 100);
     assert_eq!(nodes[1].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
-    // Its AOF has the writes before it is stopped.
-    std::thread::sleep(Duration::from_millis(1500));
-    replica.kill();
+    match away {
+        Away::Stopped => {
+            // Its AOF has the writes before it is stopped.
+            std::thread::sleep(Duration::from_millis(1500));
+            replica.kill();
+        }
+        Away::Cut => cut_off(&replica, true, false),
+    }
     wait_until(
-        "the stopped replica to be marked failed",
+        "the replica to be marked failed",
         Duration::from_secs(30),
         || flags_of(&nodes[1], &replica_id).contains("fail"),
     );
@@ -11389,7 +11425,10 @@ fn replica_stopped_while_slots_leave_and_come_back(moved: Moved, voters: Voters,
     // Started again, it has not been in step with its master since: with
     // `cluster-replica-validity-factor 1` it does not stand of its own
     // accord, and is asked to by `CLUSTER FAILOVER FORCE`.
-    replica.spawn();
+    match away {
+        Away::Stopped => replica.spawn(),
+        Away::Cut => cut_off(&replica, false, false),
+    }
     if stands == Standing::Force {
         wait_until(
             "the destination to be marked failed",
@@ -11438,11 +11477,13 @@ fn replica_stopped_while_slots_leave_and_come_back(moved: Moved, voters: Voters,
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        assert!(
-            replica.log().contains("came to its master after the epoch"),
-            "{}",
-            replica.log()
-        );
+        if away == Away::Stopped {
+            assert!(
+                replica.log().contains("came to its master after the epoch"),
+                "{}",
+                replica.log()
+            );
+        }
     }
     nodes[1].spawn();
     wait_until(
@@ -11461,59 +11502,93 @@ fn replica_stopped_while_slots_leave_and_come_back(moved: Moved, voters: Voters,
     }
 }
 
+/// The replica is stopped rather than cut off: a cut's claims, queued meanwhile, would
+/// reach it when the cut heals and tell it the slots moved (that route is
+/// `a_replica_cut_off_while_imported_slots_leave_and_come_back_is_elected_only_for_the_others`);
+/// stopped, it hears nothing, and what refuses the slots is the voters' check (`Away`).
 #[test]
 fn a_replica_stopped_while_imported_slots_leave_and_come_back_is_elected_only_for_the_others() {
     replica_stopped_while_slots_leave_and_come_back(
         Moved::Imported,
         Voters::Checking,
         Standing::Elected,
+        Away::Stopped,
     );
 }
 
+/// As the test before, the replica cut off rather than stopped: the claims
+/// sent to it meanwhile reach it when the cut heals, and it takes the
+/// slots' coming back to its master as a gain its stream has not
+/// confirmed. It does not claim them, and is elected only for the others.
+#[test]
+fn a_replica_cut_off_while_imported_slots_leave_and_come_back_is_elected_only_for_the_others() {
+    replica_stopped_while_slots_leave_and_come_back(
+        Moved::Imported,
+        Voters::Checking,
+        Standing::Elected,
+        Away::Cut,
+    );
+}
+
+/// The replica is stopped rather than cut off: a cut's claims, queued meanwhile, would
+/// reach it when the cut heals and tell it the slots moved (that route is
+/// `a_replica_cut_off_while_imported_slots_leave_and_come_back_is_elected_only_for_the_others`);
+/// stopped, it hears nothing, and what refuses the slots is the voters' check (`Away`).
 #[test]
 fn a_replica_stopped_while_its_masters_own_slots_leave_and_come_back_is_elected_only_for_the_others()
  {
     replica_stopped_while_slots_leave_and_come_back(
         Moved::Own,
         Voters::Checking,
-        Standing::Elected,
-    );
+        Standing::Elected, Away::Stopped);
 }
 
+/// The replica is stopped rather than cut off: a cut's claims, queued meanwhile, would
+/// reach it when the cut heals and tell it the slots moved (that route is
+/// `a_replica_cut_off_while_imported_slots_leave_and_come_back_is_elected_only_for_the_others`);
+/// stopped, it hears nothing, and what refuses the slots is the voters' check (`Away`).
 #[test]
 fn a_voter_restarted_with_its_came_at_file_refuses_slots_that_came_after_the_claim() {
     replica_stopped_while_slots_leave_and_come_back(
         Moved::Imported,
         Voters::SourceSkipsThirdRestarted,
-        Standing::Elected,
-    );
+        Standing::Elected, Away::Stopped);
 }
 
+/// The replica is stopped rather than cut off: a cut's claims, queued meanwhile, would
+/// reach it when the cut heals and tell it the slots moved (that route is
+/// `a_replica_cut_off_while_imported_slots_leave_and_come_back_is_elected_only_for_the_others`);
+/// stopped, it hears nothing, and what refuses the slots is the voters' check (`Away`).
 #[test]
 fn a_voter_restarted_without_its_came_at_file_refuses_a_claim_older_than_the_owners_epoch() {
     replica_stopped_while_slots_leave_and_come_back(
         Moved::Imported,
         Voters::SourceSkipsThirdRestartedWithoutFile,
-        Standing::Elected,
-    );
+        Standing::Elected, Away::Stopped);
 }
 
+/// The replica is stopped rather than cut off: a cut's claims, queued meanwhile, would
+/// reach it when the cut heals and tell it the slots moved (that route is
+/// `a_replica_cut_off_while_imported_slots_leave_and_come_back_is_elected_only_for_the_others`);
+/// stopped, it hears nothing, and what refuses the slots is the voters' check (`Away`).
 #[test]
 fn a_voter_that_does_not_check_when_slots_came_is_outvoted_by_one_that_does() {
     replica_stopped_while_slots_leave_and_come_back(
         Moved::Imported,
         Voters::SourceSkips,
-        Standing::Elected,
-    );
+        Standing::Elected, Away::Stopped);
 }
 
+/// The replica is stopped rather than cut off: a cut's claims, queued meanwhile, would
+/// reach it when the cut heals and tell it the slots moved (that route is
+/// `a_replica_cut_off_while_imported_slots_leave_and_come_back_is_elected_only_for_the_others`);
+/// stopped, it hears nothing, and what refuses the slots is the voters' check (`Away`).
 #[test]
 fn a_forced_failover_is_refused_slots_that_came_after_the_claim() {
     replica_stopped_while_slots_leave_and_come_back(
         Moved::Imported,
         Voters::Checking,
-        Standing::Force,
-    );
+        Standing::Force, Away::Stopped);
 }
 
 /// The other half of a voter restarted without its `.came-at`: it takes
