@@ -334,7 +334,10 @@ fn a_held_string_is_never_written_in_place() {
             Written::Replaced(_)
         ));
         assert!(
-            matches!(map.append_str("k", b"x", usize::MAX), Ok((101, Written::InPlace))),
+            matches!(
+                map.append_str("k", b"x", usize::MAX),
+                Ok((101, Written::InPlace))
+            ),
             "the new entry"
         );
         let held2 = map.get_ref("k").unwrap();
@@ -384,7 +387,10 @@ fn appends_and_ranges_in_place() {
             map.append_str("k", &[b'.'; 10], usize::MAX),
             Ok((24, Written::Replaced(_)))
         ));
-        assert_eq!(text(map.get("k")), Some(b"hello WORLD\0\0!..........".to_vec()));
+        assert_eq!(
+            text(map.get("k")),
+            Some(b"hello WORLD\0\0!..........".to_vec())
+        );
         // Not a string kept inline.
         map.insert("l", list(&[b"x"]));
         assert!(map.append_str("l", b"x", usize::MAX).is_err());
@@ -493,7 +499,10 @@ fn lookups_write_a_keys_use_inside_an_access_scope() {
             assert!(map.set_expires("k", u64::MAX / 2));
             let _ = map.get_expiring("k");
             assert_eq!(map.access("k"), Some(next));
-            assert!(matches!(map.append_str("x", b"y", usize::MAX), Ok((1, Written::New))));
+            assert!(matches!(
+                map.append_str("x", b"y", usize::MAX),
+                Ok((1, Written::New))
+            ));
         }
     });
 }

@@ -3500,13 +3500,19 @@ mod tests {
         map.set_str("k", pattern(100_000));
         let grown = grow(&mut map, 4);
         let at = bytes_at(&map, "k");
-        assert!(matches!(map.set_str("k", vec![7u8; grown]), Written::InPlace));
+        assert!(matches!(
+            map.set_str("k", vec![7u8; grown]),
+            Written::InPlace
+        ));
         assert_eq!(bytes_at(&map, "k"), at);
         assert_eq!(spare(&map), room_for_append(grown) - grown);
         assert_eq!(text(map.get("k")), Some(vec![7u8; grown]));
         // Shorter, longer, and just past the slabs: large, no room.
         for (n, fill) in [(grown - 1, 1u8), (grown + 1, 2), (slab + 1, 3)] {
-            assert!(matches!(map.set_str("k", vec![fill; n]), Written::Replaced(_)), "{n}");
+            assert!(
+                matches!(map.set_str("k", vec![fill; n]), Written::Replaced(_)),
+                "{n}"
+            );
             assert_eq!(spare(&map), 0, "{n}");
             assert_eq!(text(map.get("k")), Some(vec![fill; n]), "{n}");
         }
@@ -3514,7 +3520,10 @@ mod tests {
         // class, a `value_slab` test's), and up again.
         grow(&mut map, 1000);
         for (n, fill) in [(20_000, 4u8), (50_000, 6), (10_000, 8)] {
-            assert!(matches!(map.set_str("k", vec![fill; n]), Written::Replaced(_)), "{n}");
+            assert!(
+                matches!(map.set_str("k", vec![fill; n]), Written::Replaced(_)),
+                "{n}"
+            );
             assert_eq!(spare(&map), 0, "{n}");
             assert_eq!(text(map.get("k")), Some(vec![fill; n]), "{n}");
             if n == 50_000 {
