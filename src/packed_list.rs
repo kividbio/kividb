@@ -1045,6 +1045,26 @@ impl PackedList {
         }
     }
 
+    /// The room a chunk opened at an end by a push of `element_len` bytes
+    /// starts with, beside a full chunk holding `live` bytes of frames: a
+    /// quarter of it, so that a steady queue does not regrow the chunk at
+    /// every push. A list of four chunks or more (over 192 elements) of short
+    /// elements gets room for a whole chunk of frames like this one: the
+    /// chunk is then allocated once, at one size, and filled without
+    /// moving, and the chunks of lists that push at one end and trim at the
+    /// other (a timeline: `LPUSH`, `LTRIM`) come and go in one size, which
+    /// an allocator reuses, instead of in the ten sizes a chunk passes
+    /// through as it grows by a quarter.
+    fn new_chunk_room(&self, element_len: usize, live: usize) -> usize {
+        let frame = frame_len(element_len);
+        let quarter = frame.max(live / 4);
+        if frame <= SHORT && self.chunk_count() >= 4 {
+            quarter.max(CHUNK_ENTRIES * frame)
+        } else {
+            quarter
+        }
+    }
+
     /// A new chunk after the last, with room for `bytes` of frames. The
     /// chunk that was last has one on each side from then on, unless it is
     /// also the first, and gives back its room.
@@ -1201,7 +1221,8 @@ impl PackedList {
             // A list that filled a chunk at this end is growing here: the
             // new chunk gets room for a quarter of the full one, so that a
             // steady queue does not regrow it at every push.
-            let room = frame_len(element.len()).max(last.live() / 4);
+            let live = last.live();
+            let room = self.new_chunk_room(element.len(), live);
             self.open_back(room);
             self.last_mut().push_back(element);
         }
@@ -1219,7 +1240,8 @@ impl PackedList {
         if first.count() < CHUNK_ENTRIES {
             first.push_front(element);
         } else {
-            let room = frame_len(element.len()).max(first.live() / 4);
+            let live = first.live();
+            let room = self.new_chunk_room(element.len(), live);
             self.open_front(room);
             self.first_mut().push_front(element);
         }

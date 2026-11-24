@@ -1079,7 +1079,6 @@ pub fn wait_for_keys(
         (Some(reply), _) => Ok(reply),
         (None, Some(remaining)) if !timed_out => Err(remaining),
         (None, _) => {
-            crate::stats::record_miss();
             TOOK_NOTHING.with(|took| took.set(true));
             // A wait that ran out is answered with a null array. A caller
             // that cannot wait (`MULTI`, a script, the replica applier) whose
@@ -1125,7 +1124,6 @@ pub fn wait_for_keys(
         }
         // It never stood in line (`may_park` above).
         ParkOutcome::CannotWait => {
-            crate::stats::record_miss();
             TOOK_NOTHING.with(|took| took.set(true));
             empty()
         }

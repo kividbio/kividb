@@ -81,7 +81,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(resp_null_bulk())
                 }
                 Some(Err(e)) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(e)
                 }
                 Some(Ok(Some(v))) => {
@@ -89,7 +89,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(v)
                 }
                 Some(Ok(None)) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_null_bulk())
                 }
             }
@@ -150,7 +150,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(resp_map_for(effective_resp_for_reply(ctx), vec![]))
                 }
                 Some(Err(e)) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(e)
                 }
                 Some(Ok(arr)) => {
@@ -216,14 +216,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 cmd[2..]
                     .iter()
                     .map(|f| match inner.get(f) {
-                        Some(v) => {
-                            crate::stats::record_hit();
-                            resp_bulk(&v)
-                        }
-                        None => {
-                            crate::stats::record_miss();
-                            resp_null_for(resp)
-                        }
+                        Some(v) => resp_bulk(&v),
+                        None => resp_null_for(resp),
                     })
                     .collect::<Vec<Vec<u8>>>()
             }) {
@@ -233,7 +227,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(resp_array(nils))
                 }
                 Some(Err(e)) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(e)
                 }
                 Some(Ok(items)) => {
@@ -265,16 +259,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 removed
             }) {
-                None => {
-                    crate::stats::record_miss();
-                    Some(resp_integer(0))
-                }
-                Some(Err(e)) => {
-                    crate::stats::record_miss();
-                    Some(e)
-                }
+                None => Some(resp_integer(0)),
+                Some(Err(e)) => Some(e),
                 Some(Ok(removed)) => {
-                    crate::stats::record_hit();
                     if !removed.is_empty() {
                         notify(ctx.pubsub, *ctx.selected_db, KS_HASH, "hdel", key);
                     }
@@ -308,7 +295,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(resp_integer(0))
                 }
                 Some(Err(e)) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(e)
                 }
                 Some(Ok(n)) => {
@@ -334,7 +321,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(resp_integer(0))
                 }
                 Some(Err(e)) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(e)
                 }
                 Some(Ok(n)) => {
@@ -367,7 +354,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(resp_array(vec![]))
                 }
                 Some(Err(e)) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(e)
                 }
                 Some(Ok(buf)) => {
@@ -398,7 +385,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(resp_array(vec![]))
                 }
                 Some(Err(e)) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(e)
                 }
                 Some(Ok(buf)) => {
@@ -607,6 +594,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         }
                         _ => unreachable!(),
                     };
+                    crate::stats::record_hit();
                     if inner.is_empty() {
                         return Some(none);
                     }
@@ -658,11 +646,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         }
                     }
 
-                    crate::stats::record_hit();
                     Some(resp_array(result))
                 }
                 Some(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -796,7 +783,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     ]))
                 }
                 Some(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -1969,7 +1956,7 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
             Some(resp_array(out))
         }
         Some(_) => {
-            crate::stats::record_miss();
+            crate::stats::record_hit();
             Some(resp_error(
                 "WRONGTYPE Operation against a key holding the wrong kind of value",
             ))
@@ -2177,7 +2164,7 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 )))
             }
             Some(_) => {
-                crate::stats::record_miss();
+                crate::stats::record_hit();
                 Some(resp_error(
                     "WRONGTYPE Operation against a key holding the wrong kind of value",
                 ))
@@ -2781,7 +2768,7 @@ fn run_hstrlen(ctx: &mut Ctx) -> Option<Vec<u8>> {
             Some(resp_integer(0))
         }
         Some(Err(e)) => {
-            crate::stats::record_miss();
+            crate::stats::record_hit();
             Some(e)
         }
         Some(Ok(n)) => {

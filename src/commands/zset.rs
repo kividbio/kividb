@@ -731,6 +731,7 @@ fn zcard(ctx: &mut Ctx) -> Vec<u8> {
     let key: &[u8] = cmd[1];
 
     if crate::commands::helpers::lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
+        crate::stats::record_miss();
         return resp_integer(0);
     }
 
@@ -739,9 +740,18 @@ fn zcard(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_integer(0),
-        Some(ValueRef::SortedSet(zs)) => resp_integer(zs.read().len() as i64),
-        Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        None => {
+            crate::stats::record_miss();
+            resp_integer(0)
+        }
+        Some(ValueRef::SortedSet(zs)) => {
+            crate::stats::record_hit();
+            resp_integer(zs.read().len() as i64)
+        }
+        Some(_) => {
+            crate::stats::record_hit();
+            resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }
     }
 }
 
@@ -763,17 +773,17 @@ fn zscore(ctx: &mut Ctx) -> Vec<u8> {
             crate::stats::record_miss();
             resp_null_bulk()
         }
-        Some(ValueRef::SortedSet(zs)) => match zs.read().score(cmd[2]) {
-            Some(score) => {
-                crate::stats::record_hit();
-                score_reply(resp, score)
+        Some(ValueRef::SortedSet(zs)) => {
+            crate::stats::record_hit();
+            match zs.read().score(cmd[2]) {
+                Some(score) => score_reply(resp, score),
+                None => resp_null_bulk(),
             }
-            None => {
-                crate::stats::record_miss();
-                resp_null_bulk()
-            }
-        },
-        Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        }
+        Some(_) => {
+            crate::stats::record_hit();
+            resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }
     }
 }
 
@@ -797,11 +807,13 @@ fn zmscore(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => {
+            crate::stats::record_miss();
             // Key missing → all nils
             let nils = vec![resp_null_for(resp); cmd.len() - 2];
             resp_array(nils)
         }
         Some(ValueRef::SortedSet(zs)) => {
+            crate::stats::record_hit();
             let inner = zs.read();
             let results = cmd[2..]
                 .iter()
@@ -812,7 +824,10 @@ fn zmscore(ctx: &mut Ctx) -> Vec<u8> {
                 .collect();
             resp_array(results)
         }
-        Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        Some(_) => {
+            crate::stats::record_hit();
+            resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }
     }
 }
 
@@ -848,16 +863,13 @@ fn zrank(ctx: &mut Ctx) -> Vec<u8> {
             none()
         }
         Some(ValueRef::SortedSet(zs)) => {
+            crate::stats::record_hit();
             let inner = zs.read();
             let member = cmd[2];
 
             match inner.rank(member) {
-                None => {
-                    crate::stats::record_miss();
-                    none()
-                }
+                None => none(),
                 Some((rank, score)) => {
-                    crate::stats::record_hit();
                     let rank = rank as i64;
 
                     if with_score {
@@ -871,7 +883,10 @@ fn zrank(ctx: &mut Ctx) -> Vec<u8> {
                 }
             }
         }
-        Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        Some(_) => {
+            crate::stats::record_hit();
+            resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }
     }
 }
 
@@ -904,8 +919,12 @@ fn zrevrank(ctx: &mut Ctx) -> Vec<u8> {
         }
     };
     match map.get(key) {
-        None => none(),
+        None => {
+            crate::stats::record_miss();
+            none()
+        }
         Some(ValueRef::SortedSet(zs)) => {
+            crate::stats::record_hit();
             let inner = zs.read();
             let member = cmd[2];
 
@@ -925,7 +944,10 @@ fn zrevrank(ctx: &mut Ctx) -> Vec<u8> {
                 }
             }
         }
-        Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        Some(_) => {
+            crate::stats::record_hit();
+            resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }
     }
 }
 
@@ -1347,8 +1369,12 @@ fn zcount(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_integer(0),
+        None => {
+            crate::stats::record_miss();
+            resp_integer(0)
+        }
         Some(ValueRef::SortedSet(zs)) => {
+            crate::stats::record_hit();
             let inner = zs.read();
             let count = match score_range(min, max) {
                 None => 0,
@@ -1357,7 +1383,10 @@ fn zcount(ctx: &mut Ctx) -> Vec<u8> {
             };
             resp_integer(count as i64)
         }
-        Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        Some(_) => {
+            crate::stats::record_hit();
+            resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }
     }
 }
 
@@ -1460,13 +1489,20 @@ fn zrange(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_array(vec![]),
+        None => {
+            crate::stats::record_miss();
+            resp_array(vec![])
+        }
         Some(ValueRef::SortedSet(zs)) => {
+            crate::stats::record_hit();
             let inner = zs.read();
             let pairs = zrange_pairs(&inner, &params);
             range_reply(&pairs, resp, with_scores)
         }
-        Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        Some(_) => {
+            crate::stats::record_hit();
+            resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }
     }
 }
 
@@ -1547,8 +1583,12 @@ fn zscan(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_array(vec![resp_bulk_str("0"), resp_array(vec![])]),
+        None => {
+            crate::stats::record_miss();
+            resp_array(vec![resp_bulk_str("0"), resp_array(vec![])])
+        }
         Some(ValueRef::SortedSet(zs)) => {
+            crate::stats::record_hit();
             // The options are read once the key is known to be a sorted set,
             // as Redis does: a missing key is an empty scan whatever they say.
             let options = match crate::commands::helpers::scan_options(cmd, 3, &["NOSCORES"]) {
@@ -1600,7 +1640,10 @@ fn zscan(ctx: &mut Ctx) -> Vec<u8> {
                 resp_array(items),
             ])
         }
-        Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        Some(_) => {
+            crate::stats::record_hit();
+            resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }
     }
 }
 
@@ -2104,6 +2147,7 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
 
     match map.get(key) {
         None => {
+            crate::stats::record_miss();
             if cmd.len() > 2 {
                 resp_array(vec![])
             } else {
@@ -2111,6 +2155,7 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
             }
         }
         Some(ValueRef::SortedSet(zs)) => {
+            crate::stats::record_hit();
             let inner = zs.read();
             let len = inner.len();
 
@@ -2159,7 +2204,10 @@ fn zrandmember(ctx: &mut Ctx) -> Vec<u8> {
                 out
             }
         }
-        Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        Some(_) => {
+            crate::stats::record_hit();
+            resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }
     }
 }
 
@@ -2180,12 +2228,19 @@ fn zlexcount(ctx: &mut Ctx) -> Vec<u8> {
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_integer(0),
+        None => {
+            crate::stats::record_miss();
+            resp_integer(0)
+        }
         Some(ValueRef::SortedSet(zs)) => {
+            crate::stats::record_hit();
             let count = lex_count(&zs.read(), &min, &max);
             resp_integer(count as i64)
         }
-        Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        Some(_) => {
+            crate::stats::record_hit();
+            resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }
     }
 }
 
@@ -2247,12 +2302,17 @@ fn zrangestore(ctx: &mut Ctx) -> Vec<u8> {
         let map = read_lock!(shard);
 
         match map.get(src) {
-            None => SortedSetInner::new(),
+            None => {
+                crate::stats::record_miss();
+                SortedSetInner::new()
+            }
             Some(ValueRef::SortedSet(zs)) => {
+                crate::stats::record_hit();
                 let inner = zs.read();
                 SortedSetInner::from_pairs(zrange_pairs(&inner, &params))
             }
             Some(_) => {
+                crate::stats::record_hit();
                 return resp_error(
                     "WRONGTYPE Operation against a key holding the wrong kind of value",
                 );
@@ -2278,8 +2338,12 @@ fn read_zset_snapshot(
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => Ok(None),
+        None => {
+            crate::stats::record_miss();
+            Ok(None)
+        }
         Some(ValueRef::SortedSet(zs)) => {
+            crate::stats::record_hit();
             // Clone member→score into a plain BTreeMap for manipulation.
             // We use Vec<u8> keys here (not Arc) since we're working with owned
             // data outside the lock — the lock is dropped after this block.
@@ -2290,15 +2354,17 @@ fn read_zset_snapshot(
                 .collect();
             Ok(Some(snapshot))
         }
-        Some(ValueRef::Set(set)) => Ok(Some(
+        Some(ValueRef::Set(set)) => Ok(Some({
+            crate::stats::record_hit();
             set.read()
                 .iter()
                 .map(|member| (member.as_ref().to_vec(), 1.0))
-                .collect(),
-        )),
-        Some(_) => Err(resp_error(
-            "WRONGTYPE Operation against a key holding the wrong kind of value",
-        )),
+                .collect()
+        })),
+        Some(_) => Err({
+            crate::stats::record_hit();
+            resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }),
     }
 }
 
@@ -2686,13 +2752,20 @@ fn execute_range(ctx: &Ctx, key: &[u8], params: &RangeParams, with_scores: bool)
     let map = read_lock!(shard);
 
     match map.get(key) {
-        None => resp_array(vec![]),
+        None => {
+            crate::stats::record_miss();
+            resp_array(vec![])
+        }
         Some(ValueRef::SortedSet(zs)) => {
+            crate::stats::record_hit();
             let inner = zs.read();
             let pairs = zrange_pairs(&inner, params);
             range_reply(&pairs, resp, with_scores)
         }
-        Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        Some(_) => {
+            crate::stats::record_hit();
+            resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        }
     }
 }
 
