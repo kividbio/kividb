@@ -318,7 +318,7 @@ if [ "${WORKLOADS:-}" = zsets ]; then
         n=$N
         case $op in ZRANK | ZRANK-EQ | ZRANGE-DEEP) [ "$size" -ge 1000000 ] && n=${NDEEP:-600} ;; esac
         # The same for the rows that walk on a set of 100,000 or more.
-        case $op in ZREVRANK | ZCOUNT | ZRANGEBYSCORE-OFFSET | ZLEXCOUNT-EQ) [ "$size" -ge 100000 ] && n=${NDEEP:-600} ;; esac
+        case $op in ZREVRANK | ZCOUNT | ZRANGEBYSCORE-OFFSET | ZRANGEBYLEX-EQ | ZLEXCOUNT-EQ) [ "$size" -ge 100000 ] && n=${NDEEP:-600} ;; esac
         { zgen "$size" 1 0 "$load"; zgen "$size" 2 2000 "$op"; } > /tmp/z-warm
         zgen "$size" 3 "$n" "$op" > /tmp/z
         N=$n PIPEFILE=/tmp/z DSIZE=100 one "$tag" "$op-Z$size"
