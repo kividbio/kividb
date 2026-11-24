@@ -676,7 +676,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refused), `HTTL`, `HPTTL`, `HEXPIRETIME`, `HPEXPIRETIME`, `XLEN`,
   `XRANGE`, `XREVRANGE`, `XINFO`, `XPENDING`, `XACK`, `XCLAIM`,
   `XAUTOCLAIM`, `XREAD` and `XREADGROUP` (each stream twice, as Redis looks
-  it up once for the IDs and once for the entries), `GEOPOS`, `GEODIST`,
+  it up once for the IDs and once for the entries; a `BLOCK` that times
+  out adds nothing, one a write ends counts again, as in Redis), `GEOPOS`, `GEODIST`,
   `GEOHASH`, `GEOSEARCH`, `GEOSEARCHSTORE`, `GEORADIUS`,
   `GEORADIUSBYMEMBER` and their `_RO` forms, `OBJECT REFCOUNT`, `SORT` and
   `SORT_RO` (and each key a `BY` or `GET` pattern names: `SORT l BY w_* GET
