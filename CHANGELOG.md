@@ -575,7 +575,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   each against the xxh3 its writer took, and gives the spill file's blocks
   back as it goes. A capture thread never waits for the disk: when its
   writer is behind, a full buffer stays in memory until there is room, so
-  the disk's speed adds nothing to the time writes are held. Without
+  the disk's speed adds nothing to the time writes are held. A writer hands
+  what it writes to the disk 8 MiB at a time and waits for the piece before,
+  as the snapshot does, so the spill does not queue ahead of the AOF's sync
+  (#243). Without
   `FALLOC_FL_PUNCH_HOLE` (other systems than Linux, or a filesystem
   that lacks it) a save needs room for the collections' part of the dump
   beside the dump. Measured on an Azure D4s_v5

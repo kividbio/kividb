@@ -50,7 +50,9 @@ change in place, so they are laid out when the dataset is captured, with
 writes held. Each capture thread lays them out in 1 MiB buffers and hands
 each one, once full, to a writer thread that writes it to a spill file in
 the data directory; the snapshot copies them into `dump.kdb` as it is
-written. A capture thread does not wait for that writer: when the disk is
+written. A writer hands what it writes to the disk 8 MiB at a time and waits
+for the piece before, as the snapshot does, so a spill does not queue ahead
+of the AOF's sync (#243). A capture thread does not wait for that writer: when the disk is
 behind, a full buffer stays in memory until the writer has room, so the
 disk's speed adds nothing to the time writes are held, and a save holds
 about 8 MiB a capture thread while the disk keeps up (#825). For 20,000
@@ -764,8 +766,8 @@ keeps up the counter stays at 0. If it grows, give the AOF a faster disk
 rather than a small standard one), or write less to it.
 
 A checkpoint does not hold writes back while it waits for the disk: its
-snapshot goes to the disk a few megabytes at a time rather than all at once
-when it is synced, and the old log is synced after it is turned over, not
+snapshot, and its spill files, go to the disk a few megabytes at a time
+rather than all at once when they are synced, and the old log is synced after it is turned over, not
 with the log locked. Before 1.2.0 the checkpoint after a bulk load stalled
 writes for seconds at a time on a slow cloud disk (#243).
 

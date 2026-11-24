@@ -246,6 +246,10 @@ pub(crate) struct PacedFile {
     started: u64,
     /// Up to here, on the disk.
     done: u64,
+    /// Whether what is on the disk stays in the page cache: a spill file's
+    /// pieces are read back soon, and dropped they would be read from the
+    /// disk again (see [`PacedFile::keeping_cache`]).
+    keep_cache: bool,
 }
 
 /// How much of a snapshot is written before it is handed to the disk.
@@ -258,7 +262,26 @@ impl PacedFile {
             written: 0,
             started: 0,
             done: 0,
+            keep_cache: false,
         }
+    }
+
+    /// One for a spill file (#825): paced as a dump is, so that its writer
+    /// does not queue the collections' part of the dump at the disk at once,
+    /// ahead of the AOF's sync and the journal (#243), but what is on the
+    /// disk is left in the page cache, clean, for the dump to read back: the
+    /// kernel takes it back when it needs to, and the copy punches the
+    /// blocks out once read.
+    fn keeping_cache(file: File) -> Self {
+        PacedFile {
+            keep_cache: true,
+            ..Self::new(file)
+        }
+    }
+
+    /// The file, once written.
+    fn into_inner(self) -> File {
+        self.file
     }
 
     pub(crate) fn sync_all(&self) -> io::Result<()> {
@@ -292,7 +315,7 @@ impl PacedFile {
                             | libc::SYNC_FILE_RANGE_WRITE
                             | libc::SYNC_FILE_RANGE_WAIT_AFTER,
                     );
-                    if waited == 0 {
+                    if waited == 0 && !self.keep_cache {
                         libc::posix_fadvise(
                             fd,
                             self.done as libc::off_t,
@@ -303,6 +326,9 @@ impl PacedFile {
                 }
             }
         }
+        // Elsewhere nothing is handed to the disk, and nothing dropped.
+        #[cfg(not(target_os = "linux"))]
+        let _ = self.keep_cache;
         self.done = self.started;
         self.started = self.written;
     }
@@ -5462,7 +5488,9 @@ fn write_spill(
             "a spill file could not be opened (test failpoint)",
         ));
     }
-    let mut file = open_spill(&spill.dir, spill.named)?;
+    // Paced (#243): with writes going on again, a writer that queued all it
+    // has at the disk at once held the AOF's sync up behind it.
+    let mut file = PacedFile::keeping_cache(open_spill(&spill.dir, spill.named)?);
     let mut hashes = Vec::new();
     for mut part in parts {
         if cancel.load(Ordering::Relaxed) {
@@ -5478,7 +5506,10 @@ fn write_spill(
         // Once the capture is over nobody takes it: it is freed here.
         let _ = back.send(part);
     }
-    Ok(SpillFile { file, hashes })
+    Ok(SpillFile {
+        file: file.into_inner(),
+        hashes,
+    })
 }
 
 /// A spill writer, as a capture thread sees it.
@@ -9764,6 +9795,28 @@ pub(crate) mod readings_tests {
 mod spill_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A spill file is paced as a dump is (#243): written 1 MiB at a time,
+    /// each 8 MiB is handed to the disk and the 8 MiB before it waited for,
+    /// so its writer never has more than two pieces queued at the disk; what
+    /// it wrote reads back as it was.
+    #[test]
+    fn a_spill_file_is_paced_as_a_dump_is() {
+        let file = tempfile::tempfile().unwrap();
+        let mut paced = PacedFile::keeping_cache(file);
+        assert!(paced.keep_cache);
+        let part: Vec<u8> = (0..1u32 << 20).map(|i| (i % 251) as u8).collect();
+        for _ in 0..20 {
+            paced.write_all(&part).unwrap();
+        }
+        assert_eq!(paced.written, 20 << 20);
+        assert_eq!(paced.started, 16 << 20, "handed to the disk");
+        assert_eq!(paced.done, 8 << 20, "waited for");
+        let file = paced.into_inner();
+        let mut back = vec![0u8; 1 << 20];
+        read_spilled(&file, &mut back, 19 << 20).unwrap();
+        assert!(back == part);
+    }
 
     fn string(v: &str) -> KiviDBValue {
         KiviDBValue::String(SharedBytes::from(v.as_bytes()))
