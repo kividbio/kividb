@@ -2167,13 +2167,13 @@ pub enum DocFields<'a> {
     Shown(Fields),
     Json {
         fields: Fields,
-        doc: parking_lot::RwLockReadGuard<'a, serde_json::Value>,
+        doc: parking_lot::RwLockReadGuard<'a, crate::json_tree::Value>,
     },
 }
 
 impl DocFields<'_> {
     /// The document itself, for a JSON document.
-    pub fn json(&self) -> Option<&serde_json::Value> {
+    pub fn json(&self) -> Option<&crate::json_tree::Value> {
         match self {
             DocFields::Json { doc, .. } => Some(doc),
             _ => None,
@@ -2278,7 +2278,7 @@ fn json_path(path: &str) -> Option<Arc<crate::commands::json_path::Query>> {
 
 /// What a JSON document holds for each field of `schema`, keyed by the
 /// field's path.
-pub fn project_json(schema: &[SchemaField], doc: &serde_json::Value) -> Fields {
+pub fn project_json(schema: &[SchemaField], doc: &crate::json_tree::Value) -> Fields {
     // A table from the start: a vector field is longer than a block takes,
     // and a block would be filled only to be moved.
     let mut fields = Fields::table_with_capacity(schema.len());
@@ -2296,10 +2296,10 @@ pub fn project_json(schema: &[SchemaField], doc: &serde_json::Value) -> Fields {
 
 /// The strings among `values`, with those inside arrays.
 fn json_strings<'a>(
-    values: &'a [std::borrow::Cow<'a, serde_json::Value>],
+    values: &'a [std::borrow::Cow<'a, crate::json_tree::Value>],
     booleans: bool,
 ) -> Vec<std::borrow::Cow<'a, str>> {
-    use serde_json::Value;
+    use crate::json_tree::Value;
     use std::borrow::Cow;
     let mut out = Vec::new();
     let mut take = |value: &'a Value| match value {
@@ -2309,7 +2309,8 @@ fn json_strings<'a>(
     };
     for value in values {
         match value.as_ref() {
-            Value::Array(items) => items.iter().for_each(&mut take),
+            // A packed array holds numbers only, none of which is taken.
+            Value::Array(items) => items.items().unwrap_or_default().iter().for_each(&mut take),
             other => take(other),
         }
     }
@@ -2318,9 +2319,9 @@ fn json_strings<'a>(
 
 fn json_field_bytes(
     field: &SchemaField,
-    values: &[std::borrow::Cow<'_, serde_json::Value>],
+    values: &[std::borrow::Cow<'_, crate::json_tree::Value>],
 ) -> Option<Arc<[u8]>> {
-    use serde_json::Value;
+    use crate::json_tree::{Array, Value};
     let first = values.first()?;
     match &field.field_type {
         FieldType::Text => {
@@ -2335,11 +2336,14 @@ fn json_field_bytes(
         FieldType::Numeric => {
             // The first number the path selects.
             let number = values.iter().find_map(|value| match value.as_ref() {
-                Value::Number(n) => Some(n),
-                Value::Array(items) => items.iter().find_map(|item| match item {
-                    Value::Number(n) => Some(n),
+                Value::Number(n) => Some(n.clone()),
+                Value::Array(Array::Items(items)) => items.iter().find_map(|item| match item {
+                    Value::Number(n) => Some(n.clone()),
                     _ => None,
                 }),
+                Value::Array(Array::Packed(packed)) => {
+                    (!packed.is_empty()).then(|| packed.number(0))
+                }
                 _ => None,
             })?;
             Some(Arc::from(number.to_string().into_bytes()))
@@ -2354,8 +2358,18 @@ fn json_field_bytes(
                 return None;
             }
             let mut bytes = Vec::with_capacity(dim * data_type.size());
-            for item in items {
-                data_type.encode(item.as_f64()?, &mut bytes);
+            match items {
+                // Read from the buffer: no node is made for an element.
+                Array::Packed(packed) => {
+                    for at in 0..packed.len() {
+                        data_type.encode(packed.f64_at(at), &mut bytes);
+                    }
+                }
+                Array::Items(items) => {
+                    for item in items {
+                        data_type.encode(item.as_f64()?, &mut bytes);
+                    }
+                }
             }
             Some(Arc::from(bytes))
         }
@@ -2363,10 +2377,10 @@ fn json_field_bytes(
 }
 
 /// The number at `path` in a JSON document, as `SCORE_FIELD` reads it.
-pub(crate) fn json_score_field_number(path: &str, doc: &serde_json::Value) -> Option<f64> {
+pub(crate) fn json_score_field_number(path: &str, doc: &crate::json_tree::Value) -> Option<f64> {
     let query = json_path(path)?;
     let values = query.values(doc);
-    let serde_json::Value::Number(number) = values.first()?.as_ref() else {
+    let crate::json_tree::Value::Number(number) = values.first()?.as_ref() else {
         return None;
     };
     number.as_f64()
@@ -2374,11 +2388,11 @@ pub(crate) fn json_score_field_number(path: &str, doc: &serde_json::Value) -> Op
 
 /// What `FT.SEARCH … RETURN` shows for `path` of a JSON document: a string
 /// as it is, anything else as JSON. `None` if the path selects nothing.
-pub fn json_return_value(doc: &serde_json::Value, path: &str) -> Option<Vec<u8>> {
+pub fn json_return_value(doc: &crate::json_tree::Value, path: &str) -> Option<Vec<u8>> {
     let query = json_path(path)?;
     let values = query.values(doc);
     Some(match values.first()?.as_ref() {
-        serde_json::Value::String(s) => s.clone().into_bytes(),
+        crate::json_tree::Value::String(s) => s.clone().into_bytes(),
         other => crate::commands::json::json_bytes(other),
     })
 }
@@ -2389,7 +2403,7 @@ pub fn maybe_index_json(
     index_store: &IndexStore,
     db: usize,
     key: &(impl AsRef<[u8]> + ?Sized),
-    doc: &serde_json::Value,
+    doc: &crate::json_tree::Value,
 ) {
     let key = key.as_ref();
     if indexing_deferred() || index_store.none() {

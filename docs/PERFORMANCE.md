@@ -10,6 +10,7 @@
 - [The full suite, on Azure VMs](#the-full-suite-on-azure-vms)
 - [Memory of small sets](#memory-of-small-sets)
 - [Memory of small hashes](#memory-of-small-hashes)
+- [Memory of JSON documents](#memory-of-json-documents)
 - [Worker threads](#worker-threads)
 - [Worker CPU affinity](#worker-cpu-affinity)
 - [Earlier runs](#earlier-runs)
@@ -222,6 +223,38 @@ removed; see `benchmarks/1.3.0/large-zsets`. Suite
 `31-zset-memory` of
 [the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
 the table again and fails a build that loses it.
+
+## Memory of JSON documents
+
+Since 1.3.0 a JSON document is a tree of 32-byte nodes (72 in 1.2, whose
+every number and string took the size of an object's member table), and an
+array of 8 or more numbers, all integers or all floats, is one buffer of
+them: 8 bytes an element, 4 for floats that are exactly `float32` values,
+which is what an embedding written as doubles is. Replies, snapshots and
+replication are the same as before
+([#1001](https://github.com/kividbio/kividb/issues/1001)). 5,000
+documents of langgraph-redis's and spring-ai's shape (a 1,536-float
+embedding, about 30 KB of text, and five short fields), bytes a document,
+on an Azure `Standard_D4s_v5`:
+
+| | 1.2.2 | 1.3.0 | Redis 8.10.2 |
+|---|---:|---:|---:|
+| `used_memory`, no index | 111,651 | **6,993** | 19,779 |
+| `used_memory`, FLAT vector index `ON JSON` | 118,385 | **13,539** | 27,651 |
+| `used_memory`, HNSW vector index `ON JSON` | 118,798 | **13,954** | 27,967 |
+| RSS, no index | 112,085 | **7,414** | 16,550 |
+| `MEMORY USAGE` of a document | 30,627 | 6,992 | 16,352 |
+
+`MEMORY USAGE` of a JSON key counts the tree it holds (1.2 counted the
+length of its text). The index's own copy of each vector (6 KB of
+`float32`s) is the difference between the rows with an index and the one
+without. Commands on documents cost fewer instructions: `JSON.SET` of such
+a document 18 % fewer, `JSON.GET` 13 %, into a FLAT index 17 %; of a small
+document of seven members `JSON.SET` 28 % and `JSON.GET` 54 % fewer
+(`scripts/perf/run.sh` with `WORKLOADS=json`). Suite
+`45-json-embedding-memory` of
+[the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
+it again and fails a build that loses it, or prints a number otherwise.
 
 ## Snapshot size
 

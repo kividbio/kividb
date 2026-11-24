@@ -971,7 +971,18 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .flatten()
         .and_then(|def| {
             let options = query_options(&cmd[at - 1..]).unwrap_or_default();
-            filter::parse_query_with(text(cmd[at + 1]), &params_of(cmd), &def, options).ok()
+            let mut query =
+                filter::parse_query_with(text(cmd[at + 1]), &params_of(cmd), &def, options).ok()?;
+            // The plan of the query as FT.SEARCH runs it: narrowed by
+            // `INFIELDS`.
+            if kind == "SEARCH"
+                && let Some(names) = crate::commands::search::infields_arg(cmd, at + 2)
+            {
+                query.filter = query
+                    .filter
+                    .in_fields(&filter::text_fields_named(&def, &names));
+            }
+            Some(query)
         });
     let parsing = parse_started.elapsed();
 

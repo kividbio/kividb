@@ -146,6 +146,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`FT.SEARCH … INFIELDS n field …` (part of #1004).** The query's text
+  clauses look only in the fields named (by the name `AS` gave them), as in
+  Redis: a clause's own fields are narrowed too (`@title:x` with `INFIELDS 1
+  body` matches nothing), a name that is not a TEXT field of the index is no
+  field to look in rather than an error, `INFIELDS 0` is every field, and the
+  last `INFIELDS` given is the one that counts. Tag, numeric and vector
+  clauses are not affected. It was refused with an error.
 - **`VSIM` searches an HNSW graph of the vector set (#710).** A set of 4,096
   elements or more gets a graph over its elements (the one `FT.SEARCH`'s
   vector fields use, one per set), and `VSIM` explores `EF` candidates in it
@@ -565,6 +572,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A save keeps about 8 MiB of collections in memory a capture thread
+  while the disk keeps up (#825).** A save lays out the values that are not strings when it
+  captures the dataset, with writes held. For `dump.kdb` each capture thread
+  lays them out in 1 MiB buffers and hands each one, once full, to a writer
+  thread of its own, which writes it to a spill file in the data directory
+  (one a capture thread, with no name: `O_TMPFILE`, or a file removed once
+  open); the snapshot copies them into `dump.kdb` as it is written, checks
+  each against the xxh3 its writer took, and gives the spill file's blocks
+  back as it goes. A capture thread never waits for the disk: when its
+  writer is behind, a full buffer stays in memory until there is room, so
+  the disk's speed adds nothing to the time writes are held. Without
+  `FALLOC_FL_PUNCH_HOLE` (other systems than Linux, or a filesystem
+  that lacks it) a save needs room for the collections' part of the dump
+  beside the dump. Measured on an Azure D4s_v5
+  under a writer (regression suite 47, server on 2 CPUs): for 20,000 sorted
+  sets of 800 members (a 480 MB dump), `Pss` grows by 12 MiB during the
+  save (1.2.2: 461 MiB) and the slowest write meanwhile takes 358 ms (1.2.2:
+  384 ms); for 20,000 hashes of 800 fields (672 MB), 2.5 MiB (1.2.2: 642
+  MiB). On a disk that does not keep up the buffers wait in memory, and the
+  save holds up to what 1.2.2 holds. The dump is the same, byte for byte.
+  A save whose spill
+  fails (a full disk, bytes read back otherwise than written) fails, writes
+  go on, and the previous dump stays. A checkpoint whose capture fails
+  removes the `appendonly.aof.rewrite.tmp` it prepared. A replica's full
+  sync and an online backup make their image in memory.
 - **Plain commands are answered between scripts that run alone (#880).** A quick script that runs alone (its key has no hash tag, or
   `lua-parallel-scripts no`) and comes while another one is running is run
   right after it, by the thread running that one, in a run: the first
@@ -1317,6 +1349,43 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `MGET` about 140 fewer, a `GET` or `SET` of a key with a tag about 90 and
   98 fewer (5 % and 4 %); a tagged `EVALSHA` 0 to 27 fewer, `MULTI` with
   two `SET`s and `EXEC` 8 more. The build without Lua is unchanged.
+
+- **JSON documents take an eighth to a sixteenth of the memory (#1001).** A
+  document is a tree of 32-byte nodes, where it was 72 bytes a node: an
+  object's member table is boxed instead of setting the size of every
+  number and string. An array of 8 or more numbers that are all integers
+  fitting an `i64`, or all floats, is one buffer of them, 8 bytes an
+  element, and 4 for floats that are exactly `float32` values, as an
+  embedding written as doubles is. 5,000 documents holding a 1,536-float
+  embedding and five short fields (langgraph-redis's and spring-ai's
+  shape), on an Azure `Standard_D4s_v5`: 6,993 bytes of `used_memory` a
+  document with no index (1.2.2: 111,651; Redis 8.10.2: 19,779), 13,539 with
+  a FLAT vector index `ON JSON` (118,385; 27,651) and 13,954 with an HNSW one
+  (118,798; 27,967).
+  - Replies are what they were, byte for byte: a packed array holds one
+    kind of number, so integers stay integers and floats floats (`1.0`,
+    `-0.0`), and a `float32` is widened to the very double it came from
+    before it is printed. The text a document is saved, dumped, rewritten
+    or synced as is the same too, so 1.2.2 reads what this release writes
+    and the other way round.
+  - An array is packed where it is set whole (`JSON.SET`, `JSON.MSET`,
+    `JSON.MERGE`, a value given to `JSON.ARRAPPEND` or `JSON.ARRINSERT`,
+    a snapshot or AOF load). An edit that keeps it numbers of its kind is
+    made in the buffer: `JSON.SET`, `JSON.NUMINCRBY` or `JSON.NUMMULTBY`
+    of an element, `JSON.ARRAPPEND`, `JSON.ARRINSERT`, `JSON.ARRPOP`,
+    `JSON.ARRTRIM`, `JSON.DEL` of elements (a float that is not a
+    `float32` value widens the buffer to doubles). Any other edit makes
+    it an array of nodes, until the whole array is set again.
+  - Commands cost fewer instructions: `JSON.SET` of the embedding
+    document 18 % fewer, `JSON.GET` 13 %, `JSON.SET` into a FLAT index
+    17 %; of a small document of seven members, `JSON.SET` 28 % and
+    `JSON.GET` 54 %. `JSON.SET` keeps the value it parsed instead of a
+    copy of it, and `JSON.GET` of a whole document prints it where it is.
+    An `ON JSON` index reads a packed vector straight from its buffer.
+  - `MEMORY USAGE` of a JSON key counts the tree it holds (6,992 bytes
+    for the document above, where 1.2.2 reported 30,627, the length of
+    its text), and `JSON.DEBUG MEMORY` reports the new sizes. The
+    analysis of where the bytes went, and suite 45, are IIITManjeet's.
 
 - **Small hashes take less than half the memory.** A hash of up to 512
   fields, no field or value longer than 64 bytes, is kept in one block, each

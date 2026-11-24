@@ -1206,7 +1206,7 @@ pub(crate) fn relevance(
     key: &str,
     fields: &Fields,
     scoring: &crate::vector::score::Scoring,
-    json: Option<&serde_json::Value>,
+    json: Option<&crate::json_tree::Value>,
 ) -> f64 {
     scoring.score(def, key, fields, json)
 }
@@ -1258,7 +1258,7 @@ pub(crate) fn filter_each(
     only: Option<&AHashSet<String>>,
     deadline: Option<Instant>,
     now: &crate::types::QueryClock,
-    mut accept: impl FnMut(&str, &Fields, Option<&serde_json::Value>),
+    mut accept: impl FnMut(&str, &Fields, Option<&crate::json_tree::Value>),
 ) -> bool {
     let db = &ctx.store[*ctx.selected_db];
     let mut timed_out = false;
@@ -1280,7 +1280,7 @@ pub(crate) fn filter_each(
         return false;
     }
 
-    let mut consider = |key: &str, fields: &Fields, json: Option<&serde_json::Value>| {
+    let mut consider = |key: &str, fields: &Fields, json: Option<&crate::json_tree::Value>| {
         if filter::eval(filter, fields) {
             accept(key, fields, json);
         }
@@ -1446,7 +1446,7 @@ pub(crate) fn with_doc<R>(
     def: &IndexDef,
     key: &str,
     now: &crate::types::QueryClock,
-    f: impl FnOnce(&Fields, Option<&serde_json::Value>) -> R,
+    f: impl FnOnce(&Fields, Option<&crate::json_tree::Value>) -> R,
 ) -> Option<R> {
     // Out of the shard, so that its lock is not held while `f` runs. A key
     // whose time to live has ended is no document, though nothing has
@@ -1888,6 +1888,9 @@ struct SearchArgs {
     /// `FILTER field min max`.
     numeric_filters: Vec<(String, String, String)>,
     inkeys: Option<AHashSet<String>>,
+    /// `INFIELDS`: the fields (as the schema names them, `AS` if given) the
+    /// query's text clauses look in. `None`: every TEXT field.
+    infields: Option<Vec<String>>,
     /// `HIGHLIGHT`: the fields (empty: every TEXT field) and the two tags.
     highlight: Option<(Vec<String>, String, String)>,
     /// Command `TIMEOUT` in milliseconds. `None` uses `FT.CONFIG TIMEOUT`.
@@ -1896,6 +1899,12 @@ struct SearchArgs {
     query: filter::QueryOptions,
     /// `SCORER`; `FT.CONFIG DEFAULT_SCORER` if not given.
     scorer: Option<crate::vector::score::Scorer>,
+}
+
+/// The fields `INFIELDS` names among FT.SEARCH's arguments from `start`
+/// (the ones after the query), if it is given: for `FT.PROFILE`'s plan.
+pub(crate) fn infields_arg(cmd: &[&[u8]], start: usize) -> Option<Vec<String>> {
+    parse_search_args(cmd, start).ok()?.infields
 }
 
 fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> {
@@ -2064,6 +2073,21 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
                 );
                 i += 2 + n;
             }
+            "INFIELDS" => {
+                let n = number(i + 1, "INFIELDS")?;
+                if n > cmd.len().saturating_sub(i + 2) {
+                    return Err("Bad arguments for INFIELDS: not enough fields".into());
+                }
+                // As in Redis: the last `INFIELDS` given is the one that
+                // counts, and `INFIELDS 0` leaves every field.
+                args.infields = (n > 0).then(|| {
+                    cmd[i + 2..i + 2 + n]
+                        .iter()
+                        .map(|a| text(a).to_string())
+                        .collect()
+                });
+                i += 2 + n;
+            }
             "HIGHLIGHT" => {
                 i += 1;
                 let mut fields = Vec::new();
@@ -2109,7 +2133,7 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
             }
             // These would change which documents match, and are not
             // implemented. Ignoring them would return the wrong documents.
-            "INFIELDS" | "GEOFILTER" | "EXPLAINSCORE" => {
+            "GEOFILTER" | "EXPLAINSCORE" => {
                 return Err(format!("{word} is not supported"));
             }
             _ => {
@@ -2289,10 +2313,17 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
         .ok_or_else(|| no_such_index(index_name))?;
     let mut options = args.query;
     options.dialect = crate::commands::search_tools::dialect_or_default(options.dialect);
-    let query = filter::parse_query_with(query_text, &args.params, &def, options)?;
-    // Ordered by distance rather than relevance.
+    let mut query = filter::parse_query_with(query_text, &args.params, &def, options)?;
+    // Ordered by distance rather than relevance. Judged by the query as it
+    // is written: a text clause `INFIELDS` leaves no field to look in still
+    // orders by relevance, as in Redis 8.10.
     let by_distance =
         query.knn.is_some() || (query.filter.vector_range().is_some() && !query.filter.has_text());
+    if let Some(names) = &args.infields {
+        query.filter = query
+            .filter
+            .in_fields(&filter::text_fields_named(&def, names));
+    }
     // Asked by a coordinator, or answering this node's part for one.
     let shard = SHARD.with(|s| s.get()) || crate::cluster::search::is_forwarded(ctx);
     if !shard && crate::cluster::search::coordinates(ctx) {
@@ -2448,7 +2479,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 Some(Filter::VectorRange { yield_as, .. }) => yield_as.clone(),
                 _ => None,
             };
-            let by_distance = filter.vector_range().is_some() && !filter.has_text();
+            // `by_distance` as judged before `INFIELDS` narrowed the query.
             let scorer = args
                 .scorer
                 .unwrap_or_else(crate::vector::score::Scorer::default_scorer);
@@ -3383,6 +3414,15 @@ mod tests {
         assert_eq!(parse(&["TIMEOUT", "50"]).unwrap().timeout_ms, Some(50));
         assert_eq!(parse(&["TIMEOUT", "0"]).unwrap().timeout_ms, Some(0));
         assert!(parse(&["TIMEOUT", "soon"]).is_err());
+        // `INFIELDS`: the last one counts, and 0 is every field.
+        let fields = |words: &[&str]| parse(words).unwrap().infields;
+        assert_eq!(fields(&["INFIELDS", "1", "t"]), Some(vec!["t".to_string()]));
+        assert_eq!(
+            fields(&["INFIELDS", "1", "t", "INFIELDS", "2", "a", "b"]),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(fields(&["INFIELDS", "0"]), None);
+        assert_eq!(fields(&["INFIELDS", "1", "t", "INFIELDS", "0"]), None);
 
         for bad in [
             &["BOGUS"][..],
@@ -3392,7 +3432,10 @@ mod tests {
             &["PARAMS", "4", "a", "b"],
             &["RETURN", "2", "a"],
             &["DIALECT", "9"],
-            &["INFIELDS", "1", "f"],
+            &["INFIELDS", "2", "f"],
+            &["INFIELDS", "x", "f"],
+            &["INFIELDS", "-1", "f"],
+            &["INFIELDS"],
         ] {
             assert!(parse(bad).is_err(), "{bad:?} was accepted");
         }

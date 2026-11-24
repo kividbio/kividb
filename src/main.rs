@@ -35,6 +35,7 @@ pub mod expiry;
 pub mod field_expiry;
 mod give_back;
 mod hash_fields;
+mod json_tree;
 pub mod key_bytes;
 pub mod key_moves;
 pub mod keyspace_events;
