@@ -1213,6 +1213,15 @@ fn about(got: i64, want: i64, what: &str) {
     );
 }
 
+/// At most 5 % over: a set built whole has its index's nodes full, so it can
+/// take less than the same members added one `ZADD` at a time.
+fn at_most(got: i64, want: i64, what: &str) {
+    assert!(
+        (got - want) * 100 <= want * 5,
+        "{what}: {got} bytes, against {want}"
+    );
+}
+
 /// A sorted set is sized for the members it holds, not for the arguments it
 /// was given or the pairs a command went through: a `ZADD` naming members
 /// many times, the `*STORE` commands' results (of sets that overlap, so the
@@ -1271,7 +1280,7 @@ fn a_sorted_set_is_sized_for_its_members_not_its_arguments() {
         assert_eq!(c.cmd(&args).int(), 1_000, "{cmd}");
         let key = args[1];
         assert_eq!(c.encoding(key), "skiplist", "{cmd}");
-        about(settled_usage(&mut c, key), want, cmd);
+        at_most(settled_usage(&mut c, key), want, cmd);
     }
     // GEOADD of 1,000 points, each named five times in one command, against
     // the same points once.
