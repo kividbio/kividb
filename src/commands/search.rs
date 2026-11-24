@@ -567,13 +567,16 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
         definition.push(resp_bulk_str("score_field"));
         definition.push(resp_bulk_str(field));
     }
-    put("index_definition", resp_map_for(resp, definition));
+    put(
+        "index_definition",
+        resp_map_for(resp, simple_names(definition, valkey)),
+    );
     put(
         "attributes",
         resp_array(
             def.fields
                 .iter()
-                .map(|field| resp_array(describe_field(field)))
+                .map(|field| resp_array(simple_names(describe_field(field), valkey)))
                 .collect(),
         ),
     );
@@ -715,24 +718,27 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 graphs
                     .iter()
                     .map(|(field, graph)| {
-                        resp_array(vec![
-                            resp_bulk_str("field"),
-                            resp_bulk_str(field),
-                            resp_bulk_str("live_count"),
-                            resp_bulk_str(&graph.live_count.load(Relaxed).to_string()),
-                            resp_bulk_str("tombstone_count"),
-                            resp_bulk_str(&graph.tombstone_count.load(Relaxed).to_string()),
-                            resp_bulk_str("tombstone_ratio"),
-                            resp_bulk_str(&format!("{:.4}", graph.tombstone_ratio())),
-                            resp_bulk_str("compaction_in_progress"),
-                            resp_bulk_str(if graph.compaction_in_progress.load(Relaxed) {
-                                "1"
-                            } else {
-                                "0"
-                            }),
-                            resp_bulk_str("backlog"),
-                            resp_bulk_str(&graph.backlog.len().to_string()),
-                        ])
+                        resp_array(simple_names(
+                            vec![
+                                resp_bulk_str("field"),
+                                resp_bulk_str(field),
+                                resp_bulk_str("live_count"),
+                                resp_bulk_str(&graph.live_count.load(Relaxed).to_string()),
+                                resp_bulk_str("tombstone_count"),
+                                resp_bulk_str(&graph.tombstone_count.load(Relaxed).to_string()),
+                                resp_bulk_str("tombstone_ratio"),
+                                resp_bulk_str(&format!("{:.4}", graph.tombstone_ratio())),
+                                resp_bulk_str("compaction_in_progress"),
+                                resp_bulk_str(if graph.compaction_in_progress.load(Relaxed) {
+                                    "1"
+                                } else {
+                                    "0"
+                                }),
+                                resp_bulk_str("backlog"),
+                                resp_bulk_str(&graph.backlog.len().to_string()),
+                            ],
+                            valkey,
+                        ))
                     })
                     .collect(),
             ),
@@ -2844,6 +2850,26 @@ fn encode_page(
 thread_local! {
     /// Set while a coordinator runs its own part of a search.
     static SHARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while `FT.PROFILE` runs the query it profiles: valkey-search has
+    /// no `FT.PROFILE`, so its reply, and the one inside it, keep the Redis
+    /// shape in every mode.
+    static PROFILING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Holds `PROFILING` for as long as it lives, however the search ends.
+pub(crate) struct Profiling;
+
+impl Profiling {
+    pub(crate) fn start() -> Self {
+        PROFILING.with(|p| p.set(true));
+        Profiling
+    }
+}
+
+impl Drop for Profiling {
+    fn drop(&mut self) {
+        PROFILING.with(|p| p.set(false));
+    }
 }
 
 /// The protocol a reply is written in: a script's own (`redis.setresp`)
@@ -2901,7 +2927,10 @@ pub(crate) fn resp3_reply() -> &'static str {
 /// test.
 #[inline]
 pub(crate) fn valkey_shape(ctx: &Ctx) -> bool {
-    if ctx.resp & crate::commands::ctx::RESP_VERSION != 3 || SHARD.with(|s| s.get()) {
+    if ctx.resp & crate::commands::ctx::RESP_VERSION != 3
+        || SHARD.with(|s| s.get())
+        || PROFILING.with(|p| p.get())
+    {
         return false;
     }
     #[cfg(feature = "lua")]
@@ -2925,6 +2954,34 @@ pub(crate) fn search_shape(ctx: &Ctx) -> (u8, bool) {
     } else {
         (search_resp(ctx), false)
     }
+}
+
+/// A flat list of names and values with each name, at the even places, a
+/// simple string, as valkey-search writes them (a name with a line break
+/// stays a bulk string). Unchanged for the Redis shape.
+pub(crate) fn simple_names(items: Vec<Vec<u8>>, valkey: bool) -> Vec<Vec<u8>> {
+    if !valkey {
+        return items;
+    }
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| {
+            if i % 2 == 0
+                && item.first() == Some(&b'$')
+                && let Some(at) = item.windows(2).position(|w| w == b"\r\n")
+            {
+                let name = &item[at + 2..item.len() - 2];
+                if !name.contains(&b'\r') && !name.contains(&b'\n') {
+                    let mut out = vec![b'+'];
+                    out.extend_from_slice(name);
+                    out.extend_from_slice(b"\r\n");
+                    return out;
+                }
+            }
+            item
+        })
+        .collect()
 }
 
 /// A name in a reply: a simple string in valkey-search's replies, a bulk

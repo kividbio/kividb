@@ -149,11 +149,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`search-resp3-reply`: the shape of the search commands' RESP3 replies (#1021).**
   `auto` (the default) answers `FT.SEARCH`, `FT.AGGREGATE` (and its cursor), `FT.HYBRID`,
   `FT.INFO` and `FT._LIST` over RESP3 as Redis 8 does, a map, and a valkey-glide client
-  (`CLIENT SETINFO LIB-NAME` begins with `Glide`) as valkey-search does: the count, then each key
-  and its fields, or each row, as a flat array, which is the reply GLIDE converts. `redis` and
-  `valkey` give every connection one or the other. It is set in the configuration file, on the
-  command line, and with `CONFIG SET`, which acts on connections already open. RESP2 replies, a
-  script's, and what the masters of a cluster tell one another are the same in each.
+  (`CLIENT SETINFO LIB-NAME` begins with `Glide`) as valkey-search does: the RESP2 layout on a
+  RESP3 connection for `FT.SEARCH`, `FT.AGGREGATE`, `FT.CURSOR READ`, `FT._LIST` and `FT.INFO`, and
+  for `FT.HYBRID` the count, then each row as a flat array (no `warnings`, no `execution_time`).
+  That is the reply GLIDE converts. The `ON_TIMEOUT` warning is not in it, and a KNN `WITHSCORES`
+  gives the distance where valkey-search gives 0. `FT.PROFILE` and the other search commands keep
+  the Redis shape in every mode. `redis` and `valkey` give every connection one or the other. It is
+  set in the configuration file, on the command line, and with `CONFIG SET`, which acts on
+  connections already open; it belongs to the node, so in a cluster set every node alike. RESP2
+  replies, a script's, and what the masters of a cluster tell one another are the same in each.
 
 - **`FT.SEARCH … INFIELDS n field …` (part of #1004).** The query's text
   clauses look only in the fields named (by the name `AS` gave them), as in

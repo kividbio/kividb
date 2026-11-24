@@ -1005,11 +1005,13 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .chain(saved[at + 1..].iter().copied())
         .collect();
     let started = Instant::now();
+    let profiling = crate::commands::search::Profiling::start();
     let reply = match kind.as_str() {
         "SEARCH" => crate::commands::search::ft_search(ctx),
         "AGGREGATE" => crate::commands::vector::ft_aggregate(ctx),
         _ => crate::commands::hybrid::ft_hybrid(ctx),
     };
+    drop(profiling);
     let total = started.elapsed();
     ctx.cmd = saved;
     let reply = reply?;

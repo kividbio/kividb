@@ -287,10 +287,14 @@ fn masked(name: &str, node: Node) -> Node {
     }
     fn walk(name: &str, node: Node) -> Node {
         match node {
-            Node::Double(_) if name.starts_with("hybrid") => Node::Double("0".into()),
+            Node::Double(d) if name.starts_with("hybrid") => {
+                assert!(d.parse::<f64>().is_ok(), "{d}");
+                Node::Double("0".into())
+            }
             Node::Array(mut items) => {
                 for i in 0..items.len() {
                     if name == "hybrid_key" && is_score(&items[i]) && i + 1 < items.len() {
+                        assert!(matches!(items[i + 1], Node::Bulk(_)), "{:?}", items[i + 1]);
                         items[i + 1] = Node::Bulk(b"0".to_vec());
                     }
                 }
@@ -301,6 +305,7 @@ fn masked(name: &str, node: Node) -> Node {
                     .into_iter()
                     .map(|(k, v)| {
                         let v = if name == "hybrid_key" && is_score(&k) {
+                            assert!(matches!(v, Node::Bulk(_)), "{v:?}");
                             Node::Bulk(b"0".to_vec())
                         } else {
                             v
@@ -319,6 +324,7 @@ fn masked(name: &str, node: Node) -> Node {
         && let Node::Array(items) = &mut node
     {
         for i in (2..items.len()).step_by(3) {
+            assert!(matches!(items[i], Node::Bulk(_)), "{:?}", items[i]);
             items[i] = Node::Bulk(b"0".to_vec());
         }
     }
@@ -326,6 +332,7 @@ fn masked(name: &str, node: Node) -> Node {
         && let Node::Array(items) = &mut node
         && let Some(last) = items.last_mut()
     {
+        assert!(matches!(last, Node::Int(id) if *id > 0), "{last:?}");
         *last = Node::Int(0);
     }
     node
@@ -708,7 +715,146 @@ fn valkey_mode_answers_as_valkey_search_does() {
     );
     assert!(text.contains("|+num_docs|:3|"), "{text}");
     assert!(!text.contains("fields"), "{text}");
+    // The names of every list in it, as valkey-search writes them.
+    let Node::Array(items) = parse(&info) else {
+        panic!()
+    };
+    let simple_names = |list: &[Node], what: &str| {
+        for pair in list.chunks(2) {
+            assert!(matches!(pair[0], Node::Simple(_)), "{what}: {:?}", pair[0]);
+        }
+    };
+    simple_names(&items, "FT.INFO");
+    let mut checked = 0;
+    for pair in items.chunks(2) {
+        let Node::Simple(name) = &pair[0] else {
+            panic!()
+        };
+        match (name.as_slice(), &pair[1]) {
+            (b"index_definition", Node::Array(list)) => {
+                simple_names(list, "index_definition");
+                checked += 1;
+            }
+            (b"attributes" | b"hnsw_indexes", Node::Array(lists)) => {
+                for list in lists {
+                    let Node::Array(list) = list else { panic!() };
+                    simple_names(list, "attribute");
+                    checked += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(checked >= 5, "{checked}");
     assert!(text.contains("|+attributes|*3|"), "{text}");
+}
+
+/// FT.PROFILE has no valkey-search shape: its reply, and the reply it holds,
+/// are Redis's in every mode, and for a GLIDE client.
+#[test]
+fn profile_keeps_the_redis_shape_in_every_mode() {
+    // Times are not the shape.
+    fn untimed(node: Node) -> Node {
+        match node {
+            Node::Double(_) => Node::Double("0".into()),
+            Node::Array(items) => Node::Array(items.into_iter().map(untimed).collect()),
+            Node::Map(pairs) => Node::Map(
+                pairs
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let timed = matches!(&k, Node::Bulk(b) if b.ends_with(b" time"));
+                        (
+                            k,
+                            if timed {
+                                Node::Bulk(Vec::new())
+                            } else {
+                                untimed(v)
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+    let profiles = |c: &mut Conn| -> Vec<Vec<u8>> {
+        vec![
+            c.cmd(&["FT.PROFILE", "idx", "SEARCH", "QUERY", "*"]),
+            c.cmd(&[
+                "FT.PROFILE",
+                "idx",
+                "AGGREGATE",
+                "QUERY",
+                "@n:[1 3]",
+                "LOAD",
+                "1",
+                "@n",
+            ]),
+        ]
+    };
+    let server = Server::start(&["--search-resp3-reply", "redis"]);
+    let mut c = prepared(&server, "3");
+    let want = profiles(&mut c);
+    for reply in &want {
+        assert!(is_map(reply), "{}", show(reply));
+    }
+    // The search inside is a map too.
+    assert!(
+        show(&want[0]).contains("$7|results|*3|%"),
+        "{}",
+        show(&want[0])
+    );
+    for (mode, glide) in [("valkey", false), ("auto", true)] {
+        let server = Server::start(&["--search-resp3-reply", mode]);
+        let mut c = prepared(&server, "3");
+        if glide {
+            c.ok(&["CLIENT", "SETINFO", "LIB-NAME", "GlidePy"]);
+        }
+        // The same command is a flat array for the commands that have a shape.
+        assert!(is_array(&knn(&mut c)), "{mode}");
+        let got = profiles(&mut c);
+        for (got, want) in got.iter().zip(&want) {
+            assert_eq!(
+                untimed(parse(got)),
+                untimed(parse(want)),
+                "{mode}\n{}",
+                show(got)
+            );
+        }
+    }
+}
+
+/// A `CONFIG SET` of several settings that is refused on a later one puts
+/// `search-resp3-reply` back.
+#[test]
+fn a_refused_config_set_leaves_the_setting_as_it_was() {
+    let server = Server::start(&[]);
+    let mut c = prepared(&server, "3");
+    c.ok(&["CLIENT", "SETINFO", "LIB-NAME", "GlidePy"]);
+    let bad = c.cmd(&[
+        "CONFIG",
+        "SET",
+        "search-resp3-reply",
+        "redis",
+        "search-default-dialect",
+        "9",
+    ]);
+    assert!(bad.starts_with(b"-ERR CONFIG SET failed"), "{}", show(&bad));
+    let got = c.cmd(&["CONFIG", "GET", "search-resp3-reply"]);
+    assert!(show(&got).contains("$4|auto"), "{}", show(&got));
+    assert!(is_array(&knn(&mut c)));
+    // And when it is the setting that is refused, the one before stays unset.
+    let bad = c.cmd(&[
+        "CONFIG",
+        "SET",
+        "search-default-dialect",
+        "2",
+        "search-resp3-reply",
+        "both",
+    ]);
+    assert!(bad.starts_with(b"-ERR CONFIG SET failed"), "{}", show(&bad));
+    let got = c.cmd(&["CONFIG", "GET", "search-default-dialect"]);
+    assert!(show(&got).contains("$1|1"), "{}", show(&got));
 }
 
 /// `redis` and `auto` for a client that is not GLIDE: what the build before
