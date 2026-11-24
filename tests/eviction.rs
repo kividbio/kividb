@@ -1710,13 +1710,22 @@ fn writes_during_an_aof_rewrite_evict_nothing_that_fits() {
 /// the size of the encoded collections. Here the capture is held once it
 /// has laid everything out (`snapshot-captured`), with a list of about
 /// 36 MB in the dataset: the two numbers have moved together, and once the
-/// snapshot is written nothing is left uncounted. Since #825 the capture
-/// keeps at most 8 MiB of the list in memory and spills the rest, so what
-/// it holds is that much, not the list over.
+/// snapshot is written nothing is left uncounted. A capture for `dump.kdb`
+/// hands the list to its spill writer 1 MiB at a time (#825), so what it
+/// holds is its 8 MiB of buffers, not the list over (`snapshot-spill-waits`:
+/// a full buffer waits for the writer rather than being held, so that the
+/// bound does not depend on the disk).
 #[test]
 fn what_a_capture_lays_out_is_not_counted_as_it_is_made() {
     let dir = tempfile::tempdir().unwrap().keep();
-    let server = Server::start_in_env(dir, &[], &[("KIVIDB_TEST_FAILPOINTS", "snapshot-captured")]);
+    let server = Server::start_in_env(
+        dir,
+        &[],
+        &[(
+            "KIVIDB_TEST_FAILPOINTS",
+            "snapshot-captured,snapshot-spill-waits",
+        )],
+    );
     let mut c = server.conn();
     let element = "e".repeat(100);
     for batch in 1..=300 {
@@ -1738,7 +1747,7 @@ fn what_a_capture_lays_out_is_not_counted_as_it_is_made() {
     let not_counted = c.not_counted();
     let counted = used - not_counted;
     // What the capture holds is in `used_memory` and in the other number:
-    // the part of the list it has not spilled, at most 8 MiB (#825).
+    // its spill buffers, at most 8 MiB (#825).
     assert!(
         (MB..=8 * MB + 64 * KB).contains(&not_counted),
         "the capture holds up to 8 MiB of the list: {not_counted} bytes are not counted"
@@ -1782,20 +1791,24 @@ fn load_feeds(c: &mut Conn, feeds: std::ops::Range<usize>) {
     }
 }
 
-/// #825. A save laid out every value that is not a string in memory, with
-/// writes held, and kept it until the dump was written: the size of the
-/// collections' part of the dump over again (480 MB for 20,000 feeds of 800
-/// members), and more for a larger dataset. Each capture thread now keeps
-/// at most 8 MiB and spills the rest. Held once the capture is done
-/// (`snapshot-captured`), the capture holds at most that at 200 feeds
-/// (under the budget: nothing spilled) and at 2,000 (a 48 MB dump), and
-/// the dump it writes is whole.
+/// #825. A capture for `dump.kdb` lays the values that are not strings out
+/// in 1 MiB buffers, each handed to a spill writer once full: 8 MiB of
+/// buffers a capture thread. Held once the capture is done
+/// (`snapshot-captured`; `snapshot-spill-waits` makes a full buffer wait
+/// for the writer, so that the bound does not depend on the disk), the
+/// capture holds at most that at 200 feeds and at 2,000 (a 48 MB dump),
+/// and the dump it writes is whole. At 2,000, through the named spill file
+/// (`snapshot-spill-named`), as where there is no `O_TMPFILE`.
 #[test]
 fn a_capture_holds_at_most_its_budget_however_large_the_dataset() {
     for feeds in [200, 2_000] {
         let dir = tempfile::tempdir().unwrap().keep();
-        let server =
-            Server::start_in_env(dir, &[], &[("KIVIDB_TEST_FAILPOINTS", "snapshot-captured")]);
+        let points = if feeds == 2_000 {
+            "snapshot-captured,snapshot-spill-waits,snapshot-spill-named"
+        } else {
+            "snapshot-captured,snapshot-spill-waits"
+        };
+        let server = Server::start_in_env(dir, &[], &[("KIVIDB_TEST_FAILPOINTS", points)]);
         let mut c = server.conn();
         load_feeds(&mut c, 0..feeds);
         let last_key = format!("feed:{}", feeds - 1);
@@ -1834,64 +1847,112 @@ fn a_capture_holds_at_most_its_budget_however_large_the_dataset() {
     }
 }
 
-/// #825. A save whose spill write fails (`snapshot-spill-fails`: the disk
-/// is full, say) fails: writes go on at once, the dump saved before is left
-/// as it was, and nothing is left in the directory. So with the AOF on,
-/// for its checkpoint.
-#[test]
-fn a_save_whose_spill_write_fails_leaves_the_dump_before_it() {
-    for aof in [false, true] {
-        let dir = tempfile::tempdir().unwrap().keep();
-        let extra: &[&str] = if aof { &["--appendonly", "yes"] } else { &[] };
-        let server = Server::start_in_env(
-            dir,
-            extra,
-            &[("KIVIDB_TEST_FAILPOINTS", "snapshot-spill-fails")],
-        );
-        let mut c = server.conn();
-        // Under the budget: nothing is spilled, and the save works.
-        load_feeds(&mut c, 0..10);
-        assert!(c.cmd(&["SAVE"]).ok(), "aof {aof}: the first save");
-        let saved = std::fs::read(server.dir.join("dump.kdb")).unwrap();
-        let listing = || {
-            let mut names: Vec<String> = std::fs::read_dir(&server.dir)
-                .unwrap()
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .filter(|name| name != "server.log")
-                .collect();
-            names.sort();
-            names
-        };
-        let before = listing();
+/// The files under `dir` the server has open with no name left (a spill
+/// file), on Linux; empty elsewhere.
+fn unnamed_files_open(server: &Server, dir: &std::path::Path) -> Vec<String> {
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{}/fd", server.child.id())) else {
+        return Vec::new();
+    };
+    let dir = dir.to_string_lossy().into_owned();
+    fds.filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
+        .map(|target| target.to_string_lossy().into_owned())
+        .filter(|target| target.starts_with(&dir) && target.ends_with(" (deleted)"))
+        .collect()
+}
 
-        load_feeds(&mut c, 10..500);
-        let failed = c.cmd(&["SAVE"]);
-        assert!(
-            failed.is_err(),
-            "aof {aof}: SAVE past the budget: {failed:?}"
-        );
-        let started = Instant::now();
-        assert!(c.cmd(&["SET", "after", "1"]).ok());
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "aof {aof}: a write waited {:?} after the failed save",
-            started.elapsed()
-        );
-        if !aof {
-            assert_eq!(c.cmd(&["BGSAVE"]).s(), "Background saving started");
-            c.wait_for("persistence", "rdb_bgsave_in_progress", "0");
-            assert_eq!(c.info("persistence", "rdb_last_bgsave_status"), "err");
+/// #825. A save whose spill fails, at whichever step: the file cannot be
+/// made (`snapshot-spill-open-fails`), a write fails once the file is open
+/// and partly written (`snapshot-spill-fails`: the disk is full, say), it
+/// cannot be read back when the dump is written (`snapshot-spill-read-fails`)
+/// or reads back otherwise than it was written (`snapshot-spill-reads-wrong`,
+/// caught by the xxh3 of each part). The save fails, writes go on at once,
+/// the dump saved before is left as it was, nothing is left in the
+/// directory, and the spill files are closed. So with the AOF on, for its
+/// checkpoint: one that fails once the log is turned over keeps the log
+/// before as `appendonly.aof.prev`, as any checkpoint whose snapshot is not
+/// written does, and a restart has every write.
+#[test]
+fn a_save_whose_spill_fails_leaves_the_dump_before_it() {
+    for point in [
+        "snapshot-spill-open-fails",
+        "snapshot-spill-fails",
+        "snapshot-spill-read-fails",
+        "snapshot-spill-reads-wrong",
+    ] {
+        for aof in [false, true] {
+            let dir = tempfile::tempdir().unwrap().keep();
+            let extra: &[&str] = if aof { &["--appendonly", "yes"] } else { &[] };
+            let server = Server::start_in_env(dir, extra, &[("KIVIDB_TEST_FAILPOINTS", point)]);
+            let mut c = server.conn();
+            // Under one buffer: nothing is spilled, and the save works.
+            load_feeds(&mut c, 0..10);
+            assert!(c.cmd(&["SAVE"]).ok(), "{point}, aof {aof}: the first save");
+            let saved = std::fs::read(server.dir.join("dump.kdb")).unwrap();
+            let listing = || {
+                let mut names: Vec<String> = std::fs::read_dir(&server.dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .filter(|name| name != "server.log")
+                    .collect();
+                names.sort();
+                names
+            };
+            let before = listing();
+
+            load_feeds(&mut c, 10..500);
+            let failed = c.cmd(&["SAVE"]);
+            assert!(
+                failed.is_err(),
+                "{point}, aof {aof}: SAVE of 12 MB of feeds: {failed:?}"
+            );
+            let started = Instant::now();
+            assert!(c.cmd(&["SET", "after", "1"]).ok());
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "{point}, aof {aof}: a write waited {:?} after the failed save",
+                started.elapsed()
+            );
+            if !aof {
+                assert_eq!(c.cmd(&["BGSAVE"]).s(), "Background saving started");
+                c.wait_for("persistence", "rdb_bgsave_in_progress", "0");
+                assert_eq!(c.info("persistence", "rdb_last_bgsave_status"), "err");
+            }
+            assert!(
+                std::fs::read(server.dir.join("dump.kdb")).unwrap() == saved,
+                "{point}, aof {aof}: the dump saved before was changed"
+            );
+            let mut left = listing();
+            if aof {
+                left.retain(|name| name != "appendonly.aof.prev");
+            }
+            assert_eq!(
+                left, before,
+                "{point}, aof {aof}: what is left in the directory"
+            );
+            // A writer that a failed capture left closes its file itself.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let open = unnamed_files_open(&server, &server.dir);
+                if open.is_empty() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{point}, aof {aof}: spill files still open: {open:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(c.cmd(&["ZCARD", "feed:499"]).i(), 800);
+            if aof {
+                drop(c);
+                let dir = server.kill_keeping_its_files();
+                let server = Server::start_in(dir, &["--appendonly", "yes"]);
+                let mut c = server.conn();
+                assert_eq!(c.cmd(&["DBSIZE"]).i(), 501, "{point}: after a restart");
+                assert_eq!(c.cmd(&["ZCARD", "feed:499"]).i(), 800);
+                assert_eq!(c.cmd(&["GET", "after"]).s(), "1");
+            }
         }
-        assert!(
-            std::fs::read(server.dir.join("dump.kdb")).unwrap() == saved,
-            "aof {aof}: the dump saved before was changed"
-        );
-        assert_eq!(
-            listing(),
-            before,
-            "aof {aof}: what is left in the directory"
-        );
-        assert_eq!(c.cmd(&["ZCARD", "feed:499"]).i(), 800);
     }
 }
 
