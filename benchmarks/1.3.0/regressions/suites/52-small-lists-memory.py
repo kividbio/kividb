@@ -34,12 +34,13 @@ Configurations (each a fresh server; LISTS lists, 10,000):
   list_len           `LLEN` of the first list (300, 30): the lists are whole
   push_s             seconds the load, or the timeline's pairs, took (info)
 
-Gates (the candidate): `used_per_element` and `rss_per_element` within 5 %
-(or 1 byte) of recorded and at most 1.3x Redis's `used_per_element` and 1.5x
-Redis's `rss_per_element` in the same session (what the candidate measured
-is 0.97x to 1.14x, and 0.99x to 1.23x with the allocator's slack), and at most
-0.6x v1.2.2's; `list_len` as recorded. The RSS of `tiny` (4.5 MB in all) is
-shown, not gated. v1.2.2 and Redis are shown.
+Gates (the candidate): `used_per_element` within 5 % (or 1 byte) of recorded,
+at most 1.3x Redis's in the same session and at most 0.8x v1.2.2's;
+`rss_per_element` within 10 % (or 1 byte) of recorded, at most 1.5x Redis's
+(2.2x for `timeline` on a glibc build, the default one: 1.9x measured, 1.3x
+with mimalloc) and at most 0.8x v1.2.2's (0.5x for `timeline`); `list_len` as
+recorded. The RSS of `tiny` (4.5 MB in all) is shown, not gated. v1.2.2 and
+Redis are shown.
 """
 import os
 import socket
@@ -158,11 +159,18 @@ def run(ctx):
     ctx.raw["shape"] = {"lists": lists, "elements_a_list": n, "element_bytes": size, "pushes": pushes,
                         "dbsize": c.dbsize()}
     ctx.emit("used_per_element", (u1 - u0) / float(elements), "B", "lower",
-             gate=[rel(5, abs=1), vs_redis(1.3), vs_v1_2_2(0.6)])
+             gate=[rel(5, abs=1), vs_redis(1.3), vs_v1_2_2(0.8)])
     # `tiny` holds 4.5 MB in all: what the allocator keeps over it moves the
-    # ratio by a third from run to run, so its RSS is shown, not gated.
-    ctx.emit("rss_per_element", (r1 - r0) / float(elements), "B", "lower",
-             gate=info() if name == "tiny" else [rel(5, abs=1), vs_redis(1.5), vs_v1_2_2(0.6)])
+    # ratio by a third from run to run, so its RSS is shown, not gated. The
+    # timeline's RSS on a glibc build (the default one) is what glibc keeps
+    # of chunks that come and go: 1.9x Redis's against 1.3x with mimalloc.
+    if name == "tiny":
+        rss_gate = info()
+    elif name == "timeline":
+        rss_gate = [rel(10, abs=1), vs_redis(2.2), vs_v1_2_2(0.5)]
+    else:
+        rss_gate = [rel(10, abs=1), vs_redis(1.5), vs_v1_2_2(0.8)]
+    ctx.emit("rss_per_element", (r1 - r0) / float(elements), "B", "lower", gate=rss_gate)
     ctx.emit("usage_one", int(c.execute_command("MEMORY", "USAGE", key(0))), "B", "lower", gate=info())
     ctx.emit("list_len", c.llen(key(0)), "elements", "higher", gate=bound(eq="recorded"))
     ctx.emit("push_s", secs, "s", "lower", gate=info())

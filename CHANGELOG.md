@@ -1817,14 +1817,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Misskey's home timelines (#1022), 10,000 lists of 300 ten-byte ids on a
   `Standard_D4s_v5`, `--threads 4`, bytes of `used_memory` / of RSS an
-  element: loaded with `RPUSH` one element a command, 59.7 / 59.6 in
-  1.2.2, 14.1 / 16.3 now, 13.9 / 14.3 in Redis 8.10.2; one `RPUSH` of 300
-  a list, 48.4 / 51.2, 13.4 / 14.2, 13.9 / 14.4. After every list has
-  taken 3,000 `LPUSH` + `LTRIM key 0 299` pairs: 64.4 / 70.4 in 1.2.2,
-  14.2 / 17.7 now (23.0 before the chunks of a list of over 192 elements
-  were opened at the front at one size), 13.9 / 14.3 in Redis. 32-byte
-  elements 35.4 / 42.1 (Redis 34.8 / 35.6), 64-byte 67.4 / 85.5 (69.0 /
-  70.6), lists of 30 ten-byte elements 16.9 / 15.7 (14.8 / 15.3). Suite `52-small-lists-memory`
+  element, default build: loaded with `RPUSH` one element a command, 59.7 /
+  76.1 in 1.2.2, 14.1 / 14.9 now, 13.9 / 14.3 in Redis 8.10.2; one `RPUSH`
+  of 300 a list, 48.4 / 64.5, 13.4 / 13.9, 13.9 / 14.4. After every list
+  has taken 3,000 `LPUSH` + `LTRIM key 0 299` pairs: 64.4 / 96.6 in 1.2.2,
+  14.2 / 27.0 now, 13.9 / 14.3 in Redis (on the `lua,tls` builds, which use
+  mimalloc, the RSS is 17.7 to 20.6, where it was 23.0 to 25.7 before the
+  chunks of a list of at least 192 elements were opened at the front with
+  room for a whole chunk). 32-byte elements 35.4 / 35.9 (Redis 34.8 / 35.6),
+  64-byte 67.4 / 67.9 (69.0 / 70.6), lists of 30 ten-byte elements 16.9 /
+  18.8 (14.8 / 15.1). Suite `52-small-lists-memory`
   measures these and fails a build that measures above these numbers.
   - A push or a pop at either end moves nothing in its chunk: each chunk
     has room at both ends. Element `i` is found by arithmetic while the
