@@ -139,8 +139,10 @@ fn btree_leaf<K>() -> Layout {
     Layout::new::<(*const (), u16, u16, [K; BTREE_KEYS])>()
 }
 
-/// A sorted set's score index (`BTreeMap<K, ()>`) of `len` keys: one leaf
-/// up to eleven of them, and past that leaves and the nodes above them.
+/// The reference score index's (`zset_table::BTreeOrder`, a `BTreeMap<K,
+/// ()>`) size at `len` keys: one leaf up to eleven of them, and past that
+/// leaves and the nodes above them. The large form's own index counts its
+/// nodes exactly.
 ///
 /// How full the nodes are is not seen from outside the map (and is not
 /// worth a walk of it): it depends on the order the keys came in. Keys that

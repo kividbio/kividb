@@ -2318,4 +2318,292 @@ mod tests {
             "empty slabs given back"
         );
     }
+
+    /// A large sorted set's members (#875) are entry-pool blocks its index
+    /// holds by address (`zset_table::EntryRef`). With the set's slabs full
+    /// but for an eighth, and as full a keyspace class's beside them, a
+    /// round choosing full slabs (#240) at the pass's threshold empties the
+    /// keyspace's and chooses none of the set's, and a real pass after it
+    /// moves none of the set's entries: the set reads as it did, and its
+    /// slabs are given back once it is dropped.
+    #[test]
+    fn a_large_sorted_sets_full_pool_slabs_are_never_chosen() {
+        use crate::sorted_set::SortedSetInner;
+        use crate::types::KiviDBValue;
+        use crate::zset_table::Large;
+        use parking_lot::RwLock;
+        use std::collections::BTreeMap;
+
+        /// Which of `0..n` are in which slab, by where `at` says each is.
+        fn by_slab(n: usize, at: impl Fn(usize) -> usize) -> BTreeMap<usize, Vec<usize>> {
+            let mut slabs: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+            for i in 0..n {
+                slabs
+                    .entry(at(i) & !(value_slab::SLAB - 1))
+                    .or_default()
+                    .push(i);
+            }
+            slabs
+        }
+
+        let _setup = Setup::new();
+        // Members of 3,940 bytes, entries of 3,953 (score, length, bytes): a
+        // pool class no other test allocates (blocks of 3,905-3,968 bytes, 16
+        // a slab). Strings of 3,920 bytes kept in their keys' entries: the
+        // keyspace's class of that size.
+        let member = |i: usize| format!("{i:0>3940}").into_bytes();
+        // Runs of equal scores: the index orders their members by their
+        // bytes, read through the entries it holds.
+        let score = |i: usize| (i % 3) as f64;
+        let key = |i: usize| format!("full:{i:0>4}");
+        let value = |i: usize| format!("{i:0>3920}").into_bytes();
+        let pool = value_slab::pool_class_of(3953).unwrap();
+        let keyspace = value_slab::class_of(3953).unwrap();
+        assert_eq!(
+            value_slab::block_size(keyspace),
+            value_slab::block_size(pool)
+        );
+        let per_slab = value_slab::SLAB / value_slab::block_size(pool);
+        let slabs = 4;
+        let n = slabs * per_slab;
+        assert_eq!(value_slab::slabs_of_class(pool), 0);
+        assert_eq!(value_slab::slabs_of_class(keyspace), 0);
+
+        // Made on a thread that has ended: nobody owns the slabs, each used
+        // whole, so full.
+        let store = new_store(1);
+        let filling = Arc::clone(&store);
+        let mut set = crate::cpus::spawn(move || {
+            let mut set = SortedSetInner::new();
+            for i in 0..n {
+                assert!(set.insert_bytes(&member(i), score(i)));
+            }
+            let db = &filling[0];
+            for i in 0..n {
+                let k = key(i);
+                let was =
+                    db[shard_index(db.len(), &k)]
+                        .write()
+                        .insert_str_expiring(&k, value(i), None);
+                assert!(was.is_none());
+            }
+            set
+        })
+        .join()
+        .unwrap();
+        let db = &store[0];
+        let entry_at = |large: &Large, i: usize| {
+            let entry = large.table().entry(&member(i)).expect("a member");
+            entry.as_ptr().addr()
+        };
+        let string_at = |i: usize| {
+            let k = key(i);
+            let map = db[shard_index(db.len(), &k)].read();
+            let Some(ValueRef::String(s)) = map.get(&k) else {
+                panic!("key {i} is gone");
+            };
+            assert_eq!(s.as_bytes(), value(i).as_slice(), "key {i}");
+            s.as_bytes().as_ptr().addr()
+        };
+        let pool_slabs = by_slab(n, |i| entry_at(set.large().expect("the large form"), i));
+        let string_slabs = by_slab(n, string_at);
+        for of in [&pool_slabs, &string_slabs] {
+            assert_eq!(of.len(), slabs);
+            assert!(of.values().all(|blocks| blocks.len() == per_slab));
+        }
+        // The allocator's slabs of each class are these, and no others.
+        assert_eq!(value_slab::slabs_of_class(pool), slabs);
+        assert_eq!(value_slab::slabs_of_class(keyspace), slabs);
+
+        // An eighth of each slab freed, from another thread than the one
+        // that took it: more than the pass's share for a full slab, less
+        // than the quarter that lists a slab for blocks again. Full still,
+        // with room enough to be chosen.
+        let free = per_slab / 8;
+        let full = full_slab_free_percent() * 10;
+        assert!((1..1000).contains(&full), "the pass chooses full slabs");
+        assert!((per_slab - free) * 1000 / per_slab <= 1000 - full as usize);
+        assert!(free < per_slab / 4);
+        let gone: Vec<usize> = pool_slabs
+            .values()
+            .flat_map(|members| members[..free].iter().copied())
+            .collect();
+        for &i in &gone {
+            assert!(set.remove(&member(i)));
+        }
+        for strings in string_slabs.values() {
+            for &i in &strings[..free] {
+                let k = key(i);
+                assert!(db[shard_index(db.len(), &k)].write().remove(&k).is_some());
+            }
+        }
+        let kept: Vec<usize> = (0..n).filter(|i| !gone.contains(i)).collect();
+        let kept_strings: Vec<usize> = string_slabs
+            .values()
+            .flat_map(|strings| strings[free..].iter().copied())
+            .collect();
+        for members in pool_slabs.values() {
+            let at = entry_at(set.large().unwrap(), members[free]);
+            assert!(value_slab::is_full(at as *const u8), "a pool slab not full");
+        }
+        for strings in string_slabs.values() {
+            let at = string_at(strings[free]);
+            assert!(
+                value_slab::is_full(at as *const u8),
+                "a keyspace slab not full"
+            );
+        }
+
+        // Where the set is, and what it holds in order.
+        let entries: Vec<usize> = kept
+            .iter()
+            .map(|&i| entry_at(set.large().unwrap(), i))
+            .collect();
+        let references = set.large().unwrap().index_addrs();
+        let generations: Vec<u32> = pool_slabs
+            .keys()
+            .map(|&base| value_slab::generation_of(base as *const u8))
+            .collect();
+        let mut want: Vec<(Vec<u8>, f64)> = kept.iter().map(|&i| (member(i), score(i))).collect();
+        want.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let zset = Arc::new(RwLock::new(set));
+        db[shard_index(db.len(), "zset")]
+            .write()
+            .insert("zset", KiviDBValue::SortedSet(Arc::clone(&zset)));
+        // Every entry where it was, the index's references as they were,
+        // each slab of the set's as it was and full, and the set's order,
+        // ranks and members those of the model.
+        let unmoved = |zset: &RwLock<SortedSetInner>| {
+            let set = zset.read();
+            let large = set.large().expect("the large form");
+            large.check();
+            assert_eq!(large.index_addrs(), references, "the index's references");
+            for (&i, &at) in kept.iter().zip(&entries) {
+                assert_eq!(entry_at(large, i), at, "member {i}'s entry moved");
+            }
+            for ((&base, members), &generation) in pool_slabs.iter().zip(&generations) {
+                assert_eq!(
+                    value_slab::generation_of(base as *const u8),
+                    generation,
+                    "a pool slab emptied"
+                );
+                let at = entry_at(large, members[free]);
+                assert!(value_slab::is_full(at as *const u8), "a pool slab not full");
+            }
+            assert_eq!(value_slab::slabs_of_class(pool), slabs);
+            let got: Vec<(Vec<u8>, f64)> = set
+                .iter()
+                .map(|(m, s)| (m.borrowed().to_vec(), s))
+                .collect();
+            assert_eq!(got, want, "the set's order");
+            for (rank, (m, s)) in want.iter().enumerate() {
+                assert_eq!(set.rank(m), Some((rank, *s)), "a rank");
+            }
+            for &i in &gone {
+                assert_eq!(set.score(&member(i)), None, "member {i} is back");
+            }
+        };
+        unmoved(&zset);
+
+        let regions = value_slab::regions_snapshot;
+        let chosen = |at: usize| value_slab::is_evacuating(at as *const u8, &regions());
+        // Partial slabs alone: none of these, all full.
+        value_slab::plan_evacuation(usize::MAX);
+        assert!(!kept_strings.iter().any(|&i| chosen(string_at(i))));
+        assert!(!entries.iter().any(|&at| chosen(at)));
+        value_slab::finish_evacuation();
+        // Full ones too, at the pass's threshold, with no limit: every one of
+        // the keyspace's, and none of the set's.
+        value_slab::plan_evacuation_with_full(usize::MAX, full);
+        for strings in string_slabs.values() {
+            assert!(
+                chosen(string_at(strings[free])),
+                "a full keyspace slab left"
+            );
+        }
+        assert!(
+            !entries.iter().any(|&at| chosen(at)),
+            "a full pool slab chosen"
+        );
+        // The round's moves, on a thread of its own as the pass's are: every
+        // string kept moves, and the slabs they were in empty.
+        let strings: Vec<usize> = kept_strings.iter().map(|&i| string_at(i)).collect();
+        let string_generations: Vec<u32> = string_slabs
+            .keys()
+            .map(|&base| value_slab::generation_of(base as *const u8))
+            .collect();
+        let hits_before = hits();
+        let moving = Arc::clone(&store);
+        let moved = crate::cpus::spawn(move || {
+            let regions = value_slab::regions_snapshot();
+            let calm = Calm::new(&value_slab::fill());
+            let mut pacer = Pacer::default();
+            let mut moved = 0;
+            for db in moving.iter() {
+                for shard in db.iter() {
+                    moved += compact_shard(shard, &regions, &mut pacer, &calm);
+                }
+            }
+            moved
+        })
+        .join()
+        .unwrap();
+        let emptied = value_slab::finish_evacuation();
+        assert!(moved >= kept_strings.len() as u64);
+        assert!(hits() - hits_before >= kept_strings.len() as u64);
+        assert!(emptied >= slabs);
+        for (&i, &at) in kept_strings.iter().zip(&strings) {
+            assert_ne!(string_at(i), at, "key {i} did not move");
+        }
+        for (&base, &generation) in string_slabs.keys().zip(&string_generations) {
+            assert_ne!(
+                value_slab::generation_of(base as *const u8),
+                generation,
+                "a full keyspace slab did not empty"
+            );
+        }
+        unmoved(&zset);
+        // Out of the store: the strings' moved entries freed once, their
+        // slabs given back.
+        for &i in &kept_strings {
+            let k = key(i);
+            assert!(db[shard_index(db.len(), &k)].write().remove(&k).is_some());
+        }
+        assert!(
+            db[shard_index(db.len(), "zset")]
+                .write()
+                .remove("zset")
+                .is_some()
+        );
+        drop(store);
+        assert_eq!(value_slab::slabs_of_class(keyspace), 0);
+
+        // A real pass, beside a sparse keyspace that gives it work: it moves
+        // values, and none of the set's entries.
+        let sparse = sparse_store(&INLINE);
+        let db = &sparse[0];
+        db[shard_index(db.len(), "zset")]
+            .write()
+            .insert("zset", KiviDBValue::SortedSet(Arc::clone(&zset)));
+        let hits_before = hits();
+        stepped(&sparse, &mut Streak::new());
+        assert!(hits() > hits_before, "the pass moved nothing");
+        unmoved(&zset);
+        assert!(
+            db[shard_index(db.len(), "zset")]
+                .write()
+                .remove("zset")
+                .is_some()
+        );
+        check(&sparse, &INLINE);
+
+        // Dropped: every entry freed once, and each slab of the set's empties
+        // and is given back.
+        assert_eq!(Arc::strong_count(&zset), 1);
+        drop(zset);
+        assert_eq!(value_slab::slabs_of_class(pool), 0, "the set's slabs kept");
+        for (&base, &generation) in pool_slabs.keys().zip(&generations) {
+            assert_ne!(value_slab::generation_of(base as *const u8), generation);
+        }
+    }
 }

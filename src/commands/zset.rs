@@ -1293,7 +1293,7 @@ fn zcount(ctx: &mut Ctx) -> Vec<u8> {
             let count = match score_range(min, max) {
                 None => 0,
                 Some((Bound::Unbounded, Bound::Unbounded)) => inner.len(),
-                Some(range) => inner.range_by_score(range).count(),
+                Some(range) => inner.count_by_score(range),
             };
             resp_integer(count as i64)
         }
