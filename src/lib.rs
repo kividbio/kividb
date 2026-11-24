@@ -32,6 +32,7 @@ pub mod element;
 pub mod eviction;
 pub mod expiry;
 pub mod field_expiry;
+pub mod geohash;
 pub mod give_back;
 pub mod hash_fields;
 pub mod json_tree;

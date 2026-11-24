@@ -498,9 +498,19 @@ impl NumericPostings {
 
     fn set(&mut self, doc: u32, value: Option<&[u8]>) {
         self.clear(doc);
-        let Some(v) = Self::parse(value) else {
-            return;
-        };
+        if let Some(v) = Self::parse(value) {
+            self.put(doc, v);
+        }
+    }
+
+    /// [`Self::set`] of a number already read: a GEO field's geohash.
+    fn set_number(&mut self, doc: u32, v: f64) {
+        self.clear(doc);
+        self.put(doc, v);
+    }
+
+    /// The document's value, cleared before.
+    fn put(&mut self, doc: u32, v: f64) {
         let at = doc as usize;
         if at >= self.values.len() {
             self.values.resize(at + 1, 0.0);
@@ -1421,6 +1431,103 @@ impl KeyIds {
 enum Kind {
     Tag(TagPostings),
     Numeric(NumericPostings),
+    Geo(GeoPostings),
+}
+
+/// A GEO field's postings (#1004): each point's 52-bit geohash, as `GEOADD`
+/// scores it. A document of one point (every HASH, most JSON documents) is
+/// kept as a NUMERIC field keeps a number, its geohash the value: the same
+/// sorted list, the same merging off the write path. One of several points
+/// (a JSON array) has them in `many`, a B-tree of (geohash, document).
+#[derive(Debug, Clone, Default)]
+struct GeoPostings {
+    /// The index is on JSON, whose fields hold arrays of points.
+    json: bool,
+    one: NumericPostings,
+    many: BTreeSet<(u64, u32)>,
+    /// By document, the geohashes it has in `many`.
+    many_points: ahash::AHashMap<u32, Vec<u64>>,
+}
+
+impl GeoPostings {
+    fn new(json: bool) -> Self {
+        Self {
+            json,
+            ..Self::default()
+        }
+    }
+
+    /// What the document holds now. A value that is not a point never gets
+    /// here: the document is refused before (`IndexDef::refuse`).
+    fn set(&mut self, doc: u32, value: Option<&[u8]>) {
+        self.clear(doc);
+        let Some(Ok(points)) = value.map(|raw| super::geo::points(raw, self.json)) else {
+            return;
+        };
+        let hashes: Vec<u64> = points
+            .iter()
+            .map(|&(lon, lat)| crate::geohash::geohash_bits(lon, lat))
+            .collect();
+        match hashes.as_slice() {
+            [] => {}
+            // A 52-bit integer is exact in an f64.
+            [one] => self.one.set_number(doc, *one as f64),
+            _ => {
+                for &hash in &hashes {
+                    self.many.insert((hash, doc));
+                }
+                self.many_points.insert(doc, hashes);
+            }
+        }
+    }
+
+    fn clear(&mut self, doc: u32) {
+        self.one.clear(doc);
+        if let Some(hashes) = self.many_points.remove(&doc) {
+            for hash in hashes {
+                self.many.remove(&(hash, doc));
+            }
+        }
+    }
+
+    /// The documents with a point within `radius_m` of (`lon`, `lat`): the
+    /// geohash ranges of at most nine cells read off, as `GEOSEARCH` reads a
+    /// sorted set, and each point found measured as `GEOSEARCH` measures it.
+    fn within(&self, lon: f64, lat: f64, radius_m: f64, out: &mut Bits) {
+        use crate::geohash::{Cover, hash_within, radius_cover};
+        let inside = |hash: u64| hash_within(hash, lon, lat, radius_m);
+        let mut found = Bits::new();
+        match radius_cover(lon, lat, radius_m) {
+            Cover::Everything => {
+                out.or_with(&self.one.has);
+                for &doc in self.many_points.keys() {
+                    out.set(doc);
+                }
+                return;
+            }
+            Cover::Nothing => return,
+            Cover::Ranges(ranges) => {
+                for (from, to) in ranges {
+                    self.one
+                        .range(from as f64, false, to as f64, true, &mut found);
+                    for &(hash, doc) in self.many.range((from, 0)..(to, 0)) {
+                        if inside(hash) {
+                            out.set(doc);
+                        }
+                    }
+                }
+            }
+        }
+        for doc in found.iter() {
+            if inside(self.one.values[doc as usize] as u64) {
+                out.set(doc);
+            }
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.one.bytes() + self.many.len() * 16 + self.many_points.len() * 40
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1458,6 +1565,8 @@ pub struct Postings {
     /// only the documents of the slots its node serves without hashing
     /// every key it matches.
     slots: Vec<u16>,
+    /// The index is on JSON: its GEO fields hold arrays of points.
+    json: bool,
 }
 
 /// How long writes have to pause before what is left unmerged (a few runs,
@@ -1768,7 +1877,16 @@ fn tidy(shared: &SharedPostings) {
 impl Postings {
     /// Postings for the TAG and NUMERIC fields of `schema`.
     pub fn new(schema: &[SchemaField]) -> Self {
-        let mut postings = Self::default();
+        Self::new_for(schema, false)
+    }
+
+    /// [`Postings::new`] for an index on JSON if `json`, whose GEO fields
+    /// hold arrays of points.
+    pub fn new_for(schema: &[SchemaField], json: bool) -> Self {
+        let mut postings = Self {
+            json,
+            ..Self::default()
+        };
         postings.add_fields(schema);
         postings
     }
@@ -1783,6 +1901,7 @@ impl Postings {
                     field.options.case_sensitive,
                 )),
                 FieldType::Numeric => Kind::Numeric(NumericPostings::default()),
+                FieldType::Geo => Kind::Geo(GeoPostings::new(self.json)),
                 _ => continue,
             };
             self.fields.push(FieldPostings {
@@ -1863,6 +1982,7 @@ impl Postings {
         self.order.behind()
             || self.fields.iter().any(|f| match &f.kind {
                 Kind::Numeric(n) => n.behind(),
+                Kind::Geo(g) => g.one.behind(),
                 Kind::Tag(_) => false,
             })
     }
@@ -1872,6 +1992,7 @@ impl Postings {
         self.order.unsettled()
             || self.fields.iter().any(|f| match &f.kind {
                 Kind::Numeric(n) => !n.recent.is_empty() || n.merging.is_some(),
+                Kind::Geo(g) => !g.one.recent.is_empty() || g.one.merging.is_some(),
                 Kind::Tag(_) => false,
             })
     }
@@ -1880,8 +2001,11 @@ impl Postings {
     pub fn settle_all(&mut self) {
         self.order.settle = true;
         for field in &mut self.fields {
-            if let Kind::Numeric(numbers) = &mut field.kind {
-                numbers.settle = true;
+            match &mut field.kind {
+                Kind::Numeric(numbers) | Kind::Geo(GeoPostings { one: numbers, .. }) => {
+                    numbers.settle = true;
+                }
+                Kind::Tag(_) => {}
             }
         }
     }
@@ -1896,8 +2020,11 @@ impl Postings {
     pub fn tidy_step_with(&mut self, spare: &mut Option<Vec<u32>>, trash: &mut Trash) -> bool {
         let mut did = self.order.step(&self.keys, spare, trash);
         for field in &mut self.fields {
-            if let Kind::Numeric(numbers) = &mut field.kind {
-                did |= numbers.step(trash);
+            match &mut field.kind {
+                Kind::Numeric(numbers) | Kind::Geo(GeoPostings { one: numbers, .. }) => {
+                    did |= numbers.step(trash);
+                }
+                Kind::Tag(_) => {}
             }
         }
         did
@@ -1949,6 +2076,7 @@ impl Postings {
             match &mut field.kind {
                 Kind::Tag(tags) => tags.set(id, value, slots),
                 Kind::Numeric(numbers) => numbers.set(id, value),
+                Kind::Geo(points) => points.set(id, value),
             }
         }
         id
@@ -1964,6 +2092,7 @@ impl Postings {
             match &mut field.kind {
                 Kind::Tag(tags) => tags.set(id, value, slots),
                 Kind::Numeric(numbers) => numbers.set(id, value),
+                Kind::Geo(points) => points.set(id, value),
             }
         }
         id
@@ -1980,6 +2109,7 @@ impl Postings {
             match &mut field.kind {
                 Kind::Tag(tags) => tags.clear(id, slots),
                 Kind::Numeric(numbers) => numbers.clear(id),
+                Kind::Geo(points) => points.clear(id),
             }
         }
         self.keys[id as usize] = None;
@@ -1993,6 +2123,7 @@ impl Postings {
         let mut fresh = Postings {
             unused: self.unused,
             read_all: self.read_all,
+            json: self.json,
             ..Postings::default()
         };
         for field in &self.fields {
@@ -2001,6 +2132,7 @@ impl Postings {
                 kind: match &field.kind {
                     Kind::Tag(t) => Kind::Tag(TagPostings::new(t.separator, t.case_sensitive)),
                     Kind::Numeric(_) => Kind::Numeric(NumericPostings::default()),
+                    Kind::Geo(g) => Kind::Geo(GeoPostings::new(g.json)),
                 },
             });
         }
@@ -2089,6 +2221,19 @@ impl Postings {
         Some(out)
     }
 
+    /// The documents a `@field:[lon lat radius unit]` clause (or a
+    /// `GEOFILTER`) matches: those with a point of GEO field `field` within
+    /// `radius_m` of (`lon`, `lat`).
+    pub fn geo_within(&self, field: &str, lon: f64, lat: f64, radius_m: f64) -> Option<Bits> {
+        let geo = self.fields.iter().find_map(|f| match &f.kind {
+            Kind::Geo(g) if f.name == field => Some(g),
+            _ => None,
+        })?;
+        let mut out = Bits::new();
+        geo.within(lon, lat, radius_m, &mut out);
+        Some(out)
+    }
+
     /// The documents a `@field != value` clause matches: those with a number
     /// there (NaN too, which equals nothing) but not `value`.
     pub fn not_equal(&self, field: &str, value: f64) -> Option<Bits> {
@@ -2124,6 +2269,7 @@ impl Postings {
                     tag_values += t.numbers.len();
                 }
                 Kind::Numeric(n) => numbers += n.bytes(),
+                Kind::Geo(g) => numbers += g.bytes(),
             }
         }
         PostingsBytes {

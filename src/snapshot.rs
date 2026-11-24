@@ -92,6 +92,15 @@ const SCHEMA_FIELD_TEXT: u8 = 0;
 const SCHEMA_FIELD_TAG: u8 = 1;
 const SCHEMA_FIELD_NUMERIC: u8 = 2;
 const SCHEMA_FIELD_VECTOR: u8 = 3;
+/// A GEO field (#1004). Every reader before it takes a type byte it does not
+/// know for TEXT, so the field-options section also carries
+/// [`GEO_FIELD_MARKER`] for each GEO field: an option those readers do not
+/// know, which makes them refuse the image rather than load the field as
+/// TEXT.
+const SCHEMA_FIELD_GEO: u8 = 4;
+/// The first option word, after `AS name`, of a GEO field in the
+/// field-options section (see [`SCHEMA_FIELD_GEO`]).
+const GEO_FIELD_MARKER: &str = "GEO";
 
 const VECTOR_ALGO_FLAT: u8 = 0;
 const VECTOR_ALGO_HNSW: u8 = 1;
@@ -1618,7 +1627,13 @@ fn write_kdb_field_options_section(
         .iter()
         .filter(|(key, def)| !crate::vector::is_alias(key, def))
         .map(|(_, def)| def)
-        .filter(|def| def.stopwords.is_some() || def.fields.iter().any(|f| f.options != plain))
+        .filter(|def| {
+            def.stopwords.is_some()
+                || def
+                    .fields
+                    .iter()
+                    .any(|f| f.options != plain || matches!(f.field_type, FieldType::Geo))
+        })
         .collect();
     if defs.is_empty() {
         return Ok(());
@@ -1641,6 +1656,9 @@ fn write_kdb_field_options_section(
         for field in &def.fields {
             write_bytes(w, field.name.as_bytes())?;
             let mut words = field.options.words(&field.field_type);
+            if matches!(field.field_type, FieldType::Geo) {
+                words.insert(0, GEO_FIELD_MARKER.to_string());
+            }
             if let Some(alias) = &field.options.alias {
                 words.insert(0, alias.clone());
                 words.insert(0, "AS".to_string());
@@ -1696,6 +1714,20 @@ fn read_field_options_section(r: &mut impl Read, schemas: &mut [IndexSchema]) ->
             if words.first().is_some_and(|w| *w == b"AS") && words.len() >= 2 {
                 options.alias = Some(String::from_utf8_lossy(words[1]).into_owned());
                 words.drain(..2);
+            }
+            // A GEO field's marker: what a reader that does not know GEO
+            // fields refuses the image at (see `SCHEMA_FIELD_GEO`).
+            if matches!(field.field_type, FieldType::Geo) {
+                if words
+                    .first()
+                    .is_some_and(|w| *w == GEO_FIELD_MARKER.as_bytes())
+                {
+                    words.remove(0);
+                } else {
+                    return Err(bad(format!(
+                        "GEO field `{field_name}` without its marker in the field options"
+                    )));
+                }
             }
             let mut at = 0usize;
             options
@@ -1800,6 +1832,7 @@ fn write_index_schema(w: &mut impl Write, def: &crate::vector::IndexDef) -> io::
             FieldType::Text => w.write_all(&[SCHEMA_FIELD_TEXT])?,
             FieldType::Tag => w.write_all(&[SCHEMA_FIELD_TAG])?,
             FieldType::Numeric => w.write_all(&[SCHEMA_FIELD_NUMERIC])?,
+            FieldType::Geo => w.write_all(&[SCHEMA_FIELD_GEO])?,
             // The type is in the vector types section.
             FieldType::Vector {
                 algo, dim, metric, ..
@@ -3155,6 +3188,7 @@ fn read_one_index_schema(r: &mut impl Read) -> io::Result<IndexSchema> {
         let field_type = match type_buf[0] {
             SCHEMA_FIELD_TAG => FieldType::Tag,
             SCHEMA_FIELD_NUMERIC => FieldType::Numeric,
+            SCHEMA_FIELD_GEO => FieldType::Geo,
             SCHEMA_FIELD_VECTOR => {
                 let mut algo_buf = [0u8];
                 r.read_exact(&mut algo_buf)?;
@@ -8076,6 +8110,87 @@ mod field_option_tests {
             .unwrap();
         assert_eq!(bare.fields[0].options, FieldOptions::default());
         assert_eq!(bare.stopwords, None);
+    }
+
+    /// A GEO field (#1004) comes back as one, `AS` name and options too, and
+    /// an image that holds one is refused by a reader that does not know
+    /// GEO fields: every reader before them reads the type byte as TEXT,
+    /// then meets the marker as an option TEXT does not take. Here that
+    /// reading is made by turning the type byte into TEXT's.
+    #[test]
+    fn a_geo_field_survives_a_snapshot_and_older_readers_refuse_it() {
+        let mut geo = SchemaField {
+            name: "loc".into(),
+            field_type: FieldType::Geo,
+            options: FieldOptions::default(),
+        };
+        geo.options.alias = Some("where".into());
+        geo.options.sortable = true;
+        let plain = SchemaField {
+            name: "at".into(),
+            field_type: FieldType::Geo,
+            options: FieldOptions::default(),
+        };
+        let def = IndexSchema {
+            name: "places".into(),
+            db_index: 0,
+            on: IndexOn::Hash,
+            prefixes: vec![],
+            fields: vec![geo, plain],
+            aliases: Vec::new(),
+            stopwords: None,
+            synonyms: Default::default(),
+            language: Default::default(),
+            default_score: 1.0,
+            score_field: None,
+            nofreqs: false,
+        }
+        .into_def();
+        let store = crate::vector::new_index_store();
+        store.write().insert("places".into(), def);
+        let mut image = Vec::new();
+        write_kdb_image(
+            &mut image,
+            &[HashMap::<Key, KiviDBValue>::new()],
+            Some(&store),
+        )
+        .unwrap();
+
+        let loaded = load_snapshot_from(image.as_slice()).unwrap();
+        let schema = &loaded.index_schemas[0];
+        for field in &schema.fields {
+            assert!(matches!(field.field_type, FieldType::Geo), "{}", field.name);
+        }
+        assert_eq!(schema.fields[0].options.alias.as_deref(), Some("where"));
+        assert!(schema.fields[0].options.sortable);
+        assert_eq!(schema.fields[1].options, FieldOptions::default());
+
+        // As a reader that does not know GEO fields reads it.
+        let mut older = image.clone();
+        for name in ["loc", "at"] {
+            let mut pattern = (name.len() as u32).to_le_bytes().to_vec();
+            pattern.extend_from_slice(name.as_bytes());
+            pattern.push(SCHEMA_FIELD_GEO);
+            let at = older
+                .windows(pattern.len())
+                .position(|w| w == pattern.as_slice())
+                .unwrap_or_else(|| panic!("no type byte for {name}"));
+            older[at + pattern.len() - 1] = SCHEMA_FIELD_TEXT;
+        }
+        let Err(refused) = load_snapshot_from(older.as_slice()) else {
+            panic!("an older reader loaded an image with a GEO field");
+        };
+        let refused = refused.to_string();
+        assert!(refused.contains("unknown option `GEO`"), "{refused}");
+
+        // And a GEO field's options without the marker are refused too.
+        let at = image
+            .windows(GEO_FIELD_MARKER.len())
+            .rposition(|w| w == GEO_FIELD_MARKER.as_bytes())
+            .unwrap();
+        let mut unmarked = image.clone();
+        unmarked[at..at + 3].copy_from_slice(b"XYZ");
+        assert!(load_snapshot_from(unmarked.as_slice()).is_err());
     }
 
     /// `LANGUAGE` and `LANGUAGE_FIELD` come back with the index; an index

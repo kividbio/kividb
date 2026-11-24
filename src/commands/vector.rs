@@ -506,7 +506,12 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut newly_added_text_fields: Vec<String> = Vec::new();
     let added_filter_fields: Vec<crate::vector::SchemaField> = new_fields
         .iter()
-        .filter(|f| matches!(f.field_type, FieldType::Tag | FieldType::Numeric))
+        .filter(|f| {
+            matches!(
+                f.field_type,
+                FieldType::Tag | FieldType::Numeric | FieldType::Geo
+            )
+        })
         .cloned()
         .collect();
     for field in &new_fields {
@@ -889,7 +894,9 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             cut
         }
         None => crate::commands::search::scan_docs(db_ref, deadline, |key, value| {
-            if !def.covers(&crate::key_bytes::bytes_of(key)) {
+            // A document the index left out (a GEO field holding no point)
+            // is not one of its rows.
+            if !def.covers(&crate::key_bytes::bytes_of(key)) || def.refusals.refused(key) {
                 return;
             }
             if not_served(key) {

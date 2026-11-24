@@ -318,7 +318,12 @@ other files:
   removed elements are used again), and `vset-uid` numbers the sets a
   process has made, loaded, restored or copied: a `COPY` has a number of
   its own. A set that shrinks under 2,048 elements lets go of its graph.
-- Search: `GEO` and `GEOSHAPE` fields and `GEOFILTER` are refused. Query
+- Search: `GEOSHAPE` fields are refused, and so is `SORTBY` on a `GEO` field
+  (Redis orders by the geohash). `GEO` fields, `@field:[lon lat radius unit]`
+  and `GEOFILTER` answer as in Redis 8.10, a document whose `GEO` field holds
+  no point being left out of the index and counted in
+  `hash_indexing_failures`; FT.INFO reports the failures under `Index
+  Errors`, not per field (`field statistics`). Query
   `TIMEOUT` (or `search-timeout`) cuts a query short; `ON_TIMEOUT` or
   `search-on-timeout` chooses a partial reply with a warning, or an error. `INT8`
   and `UINT8` vectors aren't supported. Scores, `NOFREQS`, `PHONETIC`

@@ -1,6 +1,7 @@
 pub mod backlog;
 pub mod doc_keys;
 pub mod filter;
+pub mod geo;
 pub mod phonetic;
 pub mod postings;
 pub mod quant;
@@ -173,6 +174,8 @@ pub enum FieldType {
     Text,
     Tag,
     Numeric,
+    /// A point, `"lon,lat"` (#1004): on JSON, a string or an array of them.
+    Geo,
     Vector {
         algo: VectorAlgo,
         dim: usize,
@@ -202,6 +205,7 @@ impl SchemaField {
             FieldType::Text => "TEXT",
             FieldType::Tag => "TAG",
             FieldType::Numeric => "NUMERIC",
+            FieldType::Geo => "GEO",
             FieldType::Vector { .. } => "VECTOR",
         }
     }
@@ -343,7 +347,7 @@ impl FieldOptions {
                     out.push("CASESENSITIVE".into());
                 }
             }
-            FieldType::Numeric | FieldType::Vector { .. } => {}
+            FieldType::Numeric | FieldType::Geo | FieldType::Vector { .. } => {}
         }
         if self.with_suffix_trie {
             out.push("WITHSUFFIXTRIE".into());
@@ -698,6 +702,63 @@ pub struct IndexDef {
     /// ([`IndexDef::gives_ids`]) are under: how it knows how many it holds
     /// (see [`doc_keys`]).
     pub docs: Arc<doc_keys::DocKeys>,
+    /// The documents left out of the index because a field's value could
+    /// not be indexed (a GEO field that holds no point, #1004), and the
+    /// indexing failures counted, for FT.INFO.
+    pub refusals: Arc<Refusals>,
+}
+
+/// What [`IndexDef::refusals`] keeps. As Redis 8.10 counts them: each write
+/// of a document that is refused is a failure, the document's first and
+/// every one after, until a write makes it one the index can hold.
+#[derive(Debug, Default)]
+pub struct Refusals {
+    /// By key, why the document is left out.
+    keys: parking_lot::Mutex<AHashMap<String, String>>,
+    failures: std::sync::atomic::AtomicU64,
+    /// The last failure's error and key.
+    last: parking_lot::Mutex<Option<(String, String)>>,
+}
+
+impl Refusals {
+    /// Whether the document at `key` is left out.
+    pub fn refused(&self, key: &str) -> bool {
+        let keys = self.keys.lock();
+        !keys.is_empty() && keys.contains_key(key)
+    }
+
+    /// A write of only some fields of the document at `key`, which is left
+    /// out: refused again, for the reason it was.
+    pub fn refuse_again(&self, key: &str) {
+        let why = self.keys.lock().get(key).cloned();
+        if let Some(why) = why {
+            self.refuse(key, why);
+        }
+    }
+
+    /// A write of the document at `key` was refused, for `why`.
+    pub fn refuse(&self, key: &str, why: String) {
+        self.keys.lock().insert(key.to_string(), why.clone());
+        self.failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self.last.lock() = Some((why, key.to_string()));
+    }
+
+    /// The document at `key` is indexed, or gone: no longer left out.
+    pub fn admit(&self, key: &str) {
+        let mut keys = self.keys.lock();
+        if !keys.is_empty() {
+            keys.remove(key);
+        }
+    }
+
+    /// The failures counted, and the last one's error and key.
+    pub fn report(&self) -> (u64, Option<(String, String)>) {
+        (
+            self.failures.load(std::sync::atomic::Ordering::Relaxed),
+            self.last.lock().clone(),
+        )
+    }
 }
 
 impl IndexDef {
@@ -731,7 +792,7 @@ impl IndexDef {
     #[inline]
     pub fn gives_ids(&self) -> bool {
         self.fields.iter().any(|f| match f.field_type {
-            FieldType::Tag | FieldType::Numeric => true,
+            FieldType::Tag | FieldType::Numeric | FieldType::Geo => true,
             FieldType::Text => !f.options.noindex,
             _ => false,
         })
@@ -1264,7 +1325,10 @@ impl IndexSchema {
                 indexes.insert(f.name.clone(), live);
             }
         }
-        let postings = postings::PostingsLock::new(postings::Postings::new(&self.fields));
+        let postings = postings::PostingsLock::new(postings::Postings::new_for(
+            &self.fields,
+            matches!(self.on, IndexOn::Json),
+        ));
         IndexDef {
             name: self.name,
             db_index: self.db_index,
@@ -1282,6 +1346,7 @@ impl IndexSchema {
             text: Arc::new(RwLock::new(text::TextIndex::new())),
             postings,
             docs: Arc::default(),
+            refusals: Arc::default(),
         }
     }
 }
@@ -1324,7 +1389,21 @@ pub fn backfill_text_fields(db: &crate::store::Db, def: &IndexDef, fields: &[Str
 /// field `added`, for an index that gave its documents no ids until now.
 pub fn backfill_postings(db: &crate::store::Db, def: &IndexDef, added: &[SchemaField], scan: bool) {
     def.postings.write().add_fields(added);
+    let json = matches!(def.on, IndexOn::Json);
     walk_documents(db, def, |key, inner| {
+        // A GEO field added whose value is no point: the document leaves the
+        // index, as one written with it would (see `index_fields`).
+        if scan {
+            let refused = added
+                .iter()
+                .filter(|f| matches!(f.field_type, FieldType::Geo))
+                .find_map(|f| geo::points(inner.get_bytes(&f.name)?, json).err());
+            if let Some(why) = refused {
+                unindex_from(def, key);
+                def.refusals.refuse(key, why);
+                return;
+            }
+        }
         let mut postings = def.postings.write();
         if scan {
             postings.write_doc(key, &inner);
@@ -1508,6 +1587,12 @@ pub fn backfill_from_db_progress(
 
     let text_fields: Vec<&SchemaField> = def.text_fields().collect();
     let gives_ids = def.gives_ids();
+    let geo_fields: Vec<&SchemaField> = def
+        .fields
+        .iter()
+        .filter(|f| matches!(f.field_type, FieldType::Geo))
+        .collect();
+    let json = matches!(def.on, IndexOn::Json);
 
     let mut keys_matched: usize = 0;
 
@@ -1522,6 +1607,15 @@ pub fn backfill_from_db_progress(
                 def.name,
                 keys_matched
             );
+        }
+        // A GEO field whose value is no point: the document is left out, as
+        // one written with it is (see `index_fields`).
+        if let Some(why) = geo_fields
+            .iter()
+            .find_map(|f| geo::points(inner.get_bytes(&f.name)?, json).err())
+        {
+            def.refusals.refuse(key, why);
+            return;
         }
         let doc = if gives_ids {
             let mut postings = def.postings.write();
@@ -2348,6 +2442,7 @@ fn json_field_bytes(
             })?;
             Some(Arc::from(number.to_string().into_bytes()))
         }
+        FieldType::Geo => geo::json_bytes(values),
         // The blob a hash would hold, in the field's type, so that one
         // decoder reads both.
         FieldType::Vector { dim, data_type, .. } => {
@@ -2583,18 +2678,50 @@ fn schema_names(projected: Fields) -> Vec<(String, Arc<[u8]>)> {
         .collect()
 }
 
+/// Whether an `ON HASH` index of database `db` left the document at `key`
+/// out, and `pairs` write one of that index's GEO fields.
+fn refused_given_geo(
+    index_store: &IndexStore,
+    db: usize,
+    key: &[u8],
+    pairs: &[[&[u8]; 2]],
+) -> bool {
+    let indexes = index_store.read();
+    let text = crate::key_bytes::text_of(key);
+    indexes.iter().any(|(name, def)| {
+        !is_alias(name, def)
+            && def.db_index == db
+            && def.covers(key)
+            && def.refusals.refused(&text)
+            && def
+                .fields
+                .iter()
+                .filter(|f| matches!(f.field_type, FieldType::Geo))
+                .any(|f| pairs.iter().any(|[field, _]| *field == f.name.as_bytes()))
+    })
+}
+
 /// [`maybe_index`] of a command's own `[field, value]` pairs (`HSET`,
 /// `HSETEX`, `HIMPORT SET`), each field its bytes: copied only when an index
 /// may cover the key. A schema names its fields in UTF-8, so a field whose
 /// name is not UTF-8 is no field of any index, and is not passed on.
 pub fn maybe_index_pairs(
     index_store: &IndexStore,
+    store: &crate::store::Store,
     db: usize,
     key: &(impl AsRef<[u8]> + ?Sized),
     pairs: &[[&[u8]; 2]],
     how: Write,
 ) {
     if indexing_deferred() || index_store.none() {
+        return;
+    }
+    // A document an index left out (a GEO field that held no point), given
+    // a value for that field: it may be one the index can hold now, and
+    // then all its fields are to be indexed, not only those written. So the
+    // whole document is read, for every index of its key.
+    if how == Write::Fields && refused_given_geo(index_store, db, key.as_ref(), pairs) {
+        reindex_key(index_store, store, db, key, Write::Whole);
         return;
     }
     let fields: Vec<(String, Arc<[u8]>)> = pairs
@@ -2613,6 +2740,28 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
     #[cfg(test)]
     crate::test_hooks::at("index_fields: fields read");
     let whole = how != Write::Fields;
+
+    // ── A document the index cannot hold ────────────────────────────────────
+    //
+    // A GEO field whose value is no point keeps the whole document out, as
+    // in Redis: it is taken out of everything and counted as a failure. A
+    // document left out stays out until a write makes it whole again; a
+    // write of its other fields alone is refused again, and counted
+    // (`maybe_index_pairs` indexes the whole document when a write gives it
+    // a GEO field's value). The check is general: a NUMERIC field could be
+    // made to refuse its document the same way.
+    if let Some(why) = refusal(def, fields) {
+        unindex_from(def, key);
+        def.refusals.refuse(key, why);
+        return;
+    }
+    if def.refusals.refused(key) {
+        if !whole {
+            def.refusals.refuse_again(key);
+            return;
+        }
+        def.refusals.admit(key);
+    }
 
     // ── The words of the TEXT fields written ────────────────────────────────
     //
@@ -2769,6 +2918,19 @@ fn unindex_vector(live: &LiveIndex, key: &str) {
     }
 }
 
+/// Why `fields` keep their document out of `def`, if they do: a GEO field
+/// whose value is no point (`geo::points`).
+fn refusal(def: &IndexDef, fields: &[(String, Arc<[u8]>)]) -> Option<String> {
+    let json = matches!(def.on, IndexOn::Json);
+    def.fields
+        .iter()
+        .filter(|f| matches!(f.field_type, FieldType::Geo))
+        .find_map(|f| {
+            let (_, raw) = fields.iter().find(|(name, _)| name == &f.name)?;
+            geo::points(raw, json).err()
+        })
+}
+
 /// The document at `key` has left `def`: its vectors, then its words, then
 /// its postings and its id (the order a filtered search relies on: see
 /// [`HnswNode::doc`]; the words are in terms of the id).
@@ -2783,6 +2945,7 @@ fn unindex_from(def: &IndexDef, key: &str) {
         def.docs.remove(key);
     }
     def.forget_language(key);
+    def.refusals.admit(key);
 }
 
 // ── Keys that expire on being read ───────────────────────────────────────────

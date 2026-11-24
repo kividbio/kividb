@@ -740,6 +740,18 @@ fn explain_filter(filter: &Filter, text_fields: usize, depth: usize, out: &mut V
             if *hi_exclusive { "<" } else { "<=" },
             bound(*hi)
         )),
+        // As Redis writes it, the radius in the unit it was given in.
+        Filter::Geo {
+            field,
+            lon,
+            lat,
+            radius_m,
+            unit,
+            ..
+        } => out.push(format!(
+            "{pad}GEO {field}:{{{lon:.6},{lat:.6} --> {:.6} {unit}}}",
+            crate::geohash::from_meters(*radius_m, unit)
+        )),
         Filter::NumericNot { field, value } => {
             out.push(format!("{pad}NOT{{"));
             out.push(format!(
@@ -920,6 +932,9 @@ fn iterator_profile(filter: &Filter, reads: i64) -> Vec<u8> {
             node("NUMERIC", Some(format!("!= {}", bound(*value))), vec![])
         }
         Filter::VectorRange { .. } => node("VECTOR", None, vec![]),
+        Filter::Geo { lon, lat, .. } => {
+            node("GEO", Some(format!("{lon},{lat} - {lon},{lat}")), vec![])
+        }
         Filter::MatchAll => node("WILDCARD", None, vec![]),
         Filter::MatchNone => node("EMPTY", None, vec![]),
     }

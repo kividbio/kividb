@@ -9,6 +9,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrading
 
+- **A `GEO` field is known only from this release on (#1004).** Create one
+  once every node runs this release, replicas first:
+  - a snapshot (or a full sync) that holds an index with a `GEO` field is
+    refused by an earlier version, whole, rather than loaded with the field
+    read as TEXT;
+  - an earlier replica refuses the `FT.CREATE … GEO` it is sent, and
+    answers without that index while the master has it;
+  - an earlier version replaying an AOF skips the refused `FT.CREATE`, as
+    it skips any record it cannot apply: the data is all there, the index
+    is not;
+  - in a cluster with an earlier master, a query with a `GEO` clause or
+    `GEOFILTER` is an error (that master refuses its part), not a partial
+    reply.
+
 - **A query that names no `DIALECT` is read in dialect 1 (#247).** It is
   read in the default dialect, as in Redis: 1, which `search-default-dialect`
   (`CONFIG SET`, the configuration file) or `FT.CONFIG SET DEFAULT_DIALECT`
@@ -146,6 +160,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`GEO` fields in `FT.CREATE`, `@field:[lon lat radius unit]` and
+  `GEOFILTER` (part of #1004).** As in Redis 8.10: a HASH field holds
+  `"lon,lat"`, a JSON one a string of that form or an array of them; the
+  radius is in `m`, `km`, `mi` or `ft`, and several `GEOFILTER`s narrow the
+  query together. A point is found as `GEOSEARCH … BYRADIUS` finds a member:
+  the cells around the centre are read off postings kept as a NUMERIC
+  field's are, with the geohash as the value, and each point is measured by
+  the centre of its geohash's cell. A document whose `GEO` field holds no
+  point is left out of the index, every field of it, and each such write is
+  counted in FT.INFO's `hash_indexing_failures`, with the last error and key
+  under `Index Errors`. `SORTBY` on a `GEO` field and `GEOSHAPE` fields are
+  still refused.
 - **`FT.SEARCH … INFIELDS n field …` (part of #1004).** The query's text
   clauses look only in the fields named (by the name `AS` gave them), as in
   Redis: a clause's own fields are narrowed too (`@title:x` with `INFIELDS 1

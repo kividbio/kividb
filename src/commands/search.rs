@@ -153,7 +153,8 @@ pub(crate) fn parse_schema_fields(
             "TAG" => FieldType::Tag,
             "NUMERIC" => FieldType::Numeric,
             "VECTOR" => parse_vector_spec(&name, cmd, i)?,
-            "GEO" | "GEOSHAPE" => {
+            "GEO" => FieldType::Geo,
+            "GEOSHAPE" => {
                 return Err(format!(
                     "Field `{name}`: {type_word} fields are not supported"
                 ));
@@ -493,8 +494,10 @@ pub(crate) fn count_docs(def: &IndexDef, cluster: Option<&crate::cluster::Cluste
 
 /// Whether the index covers the document named `key` (a name: see
 /// `key_bytes::text_of`).
+/// Whether the document at `key` is one of `def`'s: its key is covered,
+/// and the index did not leave it out (a GEO field that holds no point).
 fn covers(def: &IndexDef, key: &str) -> bool {
-    def.covers(&crate::key_bytes::bytes_of(key))
+    def.covers(&crate::key_bytes::bytes_of(key)) && !def.refusals.refused(key)
 }
 
 pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
@@ -513,6 +516,8 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let cluster = ctx.cluster.enabled.then_some(&**ctx.cluster);
     // The index's own database, whichever the client has selected.
     let mut num_docs = count_docs(def, cluster);
+    // The other masters' indexing failures (#1004), as their documents.
+    let mut other_failures = 0u64;
     // In a cluster, the documents of every master.
     if crate::cluster::search::coordinates(ctx) {
         let owned: Vec<Vec<u8>> = ctx.cmd.iter().map(|a| a.to_vec()).collect();
@@ -527,6 +532,14 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                             at.and_then(|at| items.get(at + 1))
                         {
                             num_docs += (*n).max(0) as usize;
+                        }
+                        let at = items.iter().position(|item| {
+                            item.text().as_deref() == Some("hash_indexing_failures")
+                        });
+                        if let Some(crate::cluster::search::Reply::Int(n)) =
+                            at.and_then(|at| items.get(at + 1))
+                        {
+                            other_failures += (*n).max(0) as u64;
                         }
                     }
                 }
@@ -604,7 +617,25 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     put("indexing", resp_integer(0));
     put("percent_indexed", resp_bulk_str("1"));
-    put("hash_indexing_failures", resp_integer(0));
+    // As Redis 8.10 counts them: a document's write that was refused (a GEO
+    // field holding no point) is a failure, and it is left out of the index.
+    let (failures, last) = def.refusals.report();
+    let failures = failures + other_failures;
+    put("hash_indexing_failures", resp_integer(failures as i64));
+    let (last_error, last_key) = last.unwrap_or_else(|| ("N/A".into(), "N/A".into()));
+    put(
+        "Index Errors",
+        resp_array(vec![
+            resp_bulk_str("indexing failures"),
+            resp_integer(failures as i64),
+            resp_bulk_str("last indexing error"),
+            resp_bulk_str(&last_error),
+            resp_bulk_str("last indexing error key"),
+            resp_bulk_str(&last_key),
+            resp_bulk_str("background indexing status"),
+            resp_bulk_str("OK"),
+        ]),
+    );
     if let Some(words) = &def.stopwords {
         put(
             "stopwords_list",
@@ -1046,6 +1077,13 @@ fn resolve(filter: &Filter, def: &IndexDef, p: &Postings) -> Cand {
             hi_exclusive,
         } => known(p.range(field, *lo, *lo_exclusive, *hi, *hi_exclusive)),
         Filter::NumericNot { field, value } => known(p.not_equal(field, *value)),
+        Filter::Geo {
+            field,
+            lon,
+            lat,
+            radius_m,
+            ..
+        } => known(p.geo_within(field, *lon, *lat, *radius_m)),
         Filter::Text { .. } | Filter::Phrase { .. } => match candidates(filter, def) {
             Some((ids, true)) => Cand::Exact(ids),
             Some((ids, false)) => Cand::Superset(ids),
@@ -1887,6 +1925,8 @@ struct SearchArgs {
     count: usize,
     /// `FILTER field min max`.
     numeric_filters: Vec<(String, String, String)>,
+    /// `GEOFILTER field lon lat radius unit` (#1004).
+    geo_filters: Vec<GeoFilterArg>,
     inkeys: Option<AHashSet<String>>,
     /// `INFIELDS`: the fields (as the schema names them, `AS` if given) the
     /// query's text clauses look in. `None`: every TEXT field.
@@ -1905,6 +1945,17 @@ struct SearchArgs {
 /// (the ones after the query), if it is given: for `FT.PROFILE`'s plan.
 pub(crate) fn infields_arg(cmd: &[&[u8]], start: usize) -> Option<Vec<String>> {
     parse_search_args(cmd, start).ok()?.infields
+}
+
+/// A `GEOFILTER` of FT.SEARCH, as read.
+#[derive(Debug, Clone)]
+struct GeoFilterArg {
+    field: String,
+    /// `None`: a NaN, which no point is near.
+    centre: Option<(f64, f64)>,
+    radius_m: f64,
+    /// As given, lower case: for `FT.EXPLAIN`.
+    unit: String,
 }
 
 fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> {
@@ -2133,7 +2184,42 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
             }
             // These would change which documents match, and are not
             // implemented. Ignoring them would return the wrong documents.
-            "GEOFILTER" | "EXPLAINSCORE" => {
+            "GEOFILTER" => {
+                if cmd.len() < i + 6 {
+                    return Err("GEOFILTER requires 5 arguments".into());
+                }
+                let field = arg(i + 1, "GEOFILTER")?.to_string();
+                let number = |at: usize, what: &str| -> Result<f64, String> {
+                    arg(at, "GEOFILTER")?.parse::<f64>().map_err(|_| {
+                        format!("Bad arguments for GEOFILTER {what}: expected a number")
+                    })
+                };
+                let (lon, lat) = (number(i + 2, "<lon>")?, number(i + 3, "<lat>")?);
+                let radius = number(i + 4, "<radius>")?;
+                // As Redis 8.10 reads it: an infinite radius is no number.
+                if !radius.is_finite() {
+                    return Err("Bad arguments for GEOFILTER <radius>: expected a number".into());
+                }
+                let unit = cmd.get(i + 5).map(|a| text(a)).unwrap_or_default();
+                let radius_m = crate::geohash::to_meters(radius, unit)
+                    .ok_or_else(|| format!("Unknown distance unit {unit}"))?;
+                if radius <= 0.0 {
+                    return Err("Invalid GeoFilter radius".into());
+                }
+                let centre = if lon.is_nan() || lat.is_nan() {
+                    None
+                } else {
+                    Some(filter::geo_lon_lat(lon, lat)?)
+                };
+                args.geo_filters.push(GeoFilterArg {
+                    field,
+                    centre,
+                    radius_m,
+                    unit: unit.to_ascii_lowercase(),
+                });
+                i += 6;
+            }
+            "EXPLAINSCORE" => {
                 return Err(format!("{word} is not supported"));
             }
             _ => {
@@ -2313,6 +2399,14 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
         .ok_or_else(|| no_such_index(index_name))?;
     let mut options = args.query;
     options.dialect = crate::commands::search_tools::dialect_or_default(options.dialect);
+    // Redis orders by a GEO field's geohash; not done here yet (#1004).
+    if let Some((name, _)) = &args.sortby
+        && def
+            .field_by_attribute(name)
+            .is_some_and(|f| matches!(f.field_type, FieldType::Geo))
+    {
+        return Err(format!("SORTBY on GEO field `{name}` is not supported"));
+    }
     let mut query = filter::parse_query_with(query_text, &args.params, &def, options)?;
     // Ordered by distance rather than relevance. Judged by the query as it
     // is written: a text clause `INFIELDS` leaves no field to look in still
@@ -2359,6 +2453,34 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             lo_exclusive,
             hi,
             hi_exclusive,
+        };
+        filter = match filter {
+            Filter::MatchAll => clause,
+            other => Filter::And(Box::new(other), Box::new(clause)),
+        };
+    }
+    // Each `GEOFILTER` narrows the query further; on a field that is not
+    // GEO, or with a NaN centre, nothing is near (as in Redis, not an error).
+    for GeoFilterArg {
+        field: name,
+        centre,
+        radius_m,
+        unit,
+    } in &args.geo_filters
+    {
+        let field = def
+            .field_by_attribute(name)
+            .filter(|f| matches!(f.field_type, FieldType::Geo));
+        let clause = match (field, centre) {
+            (Some(field), Some((lon, lat))) => Filter::Geo {
+                field: field.name.clone(),
+                lon: *lon,
+                lat: *lat,
+                radius_m: *radius_m,
+                json: matches!(def.on, crate::vector::IndexOn::Json),
+                unit: unit.clone(),
+            },
+            _ => Filter::MatchNone,
         };
         filter = match filter {
             Filter::MatchAll => clause,
@@ -3319,7 +3441,12 @@ mod tests {
                 .unwrap_err()
                 .contains("single")
         );
-        assert!(words(&["f", "GEO"]).unwrap_err().contains("not supported"));
+        assert!(
+            words(&["f", "GEOSHAPE"])
+                .unwrap_err()
+                .contains("not supported")
+        );
+        assert!(words(&["f", "GEO"]).is_ok());
     }
 
     #[test]
