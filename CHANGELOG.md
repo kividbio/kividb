@@ -654,11 +654,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (part of #1016).** When nothing but its key holds the string, and the
   string, grown or not, still fits where it is kept, the bit and any zero
   bytes it grows by are written in place: the string is not copied. A
-  string held elsewhere is copied once, where before this change every
-  `SETBIT` that changed a bit copied it twice, and the copy written: one
-  another key shares since a `COPY`, one a `DUMP` is still reading, and
-  one a `BGSAVE`, AOF rewrite or replica's full sync has captured, which
-  keeps the bytes from before. Replies, time to live, `WATCH`, keyspace
+  string held elsewhere (shared with another key since a `COPY`, being
+  read by a `DUMP`, or captured by a `BGSAVE`, an AOF rewrite or a
+  replica's full sync) is copied once and the copy written; the holder
+  keeps the bytes from before. Before this change every `SETBIT` that
+  changed a bit copied the string twice. Replies, time to live, `WATCH`, keyspace
   events, the AOF and replication are as before. Counted in a test build,
   the most a `SETBIT` that changes a bit of a 64 MiB string allocates
   while it runs (not the memory the string itself takes) was 128 MiB, two
