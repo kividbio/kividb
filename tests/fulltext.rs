@@ -1390,3 +1390,243 @@ fn test_reused_document_numbers_hold_only_their_own_words() {
     assert!(keys(&mut c, "orchard").is_empty());
     assert!(keys(&mut c, "orch*").is_empty());
 }
+
+/// `INFIELDS n field …` (#1004): the query's text clauses look only in those
+/// fields. Every reply below is the one Redis 8.10.3 gives for the same
+/// documents and query.
+#[test]
+fn infields_limits_text_clauses_to_the_fields_named() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&[
+        "FT.CREATE",
+        "idx",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "d",
+        "SCHEMA",
+        "title",
+        "TEXT",
+        "body",
+        "TEXT",
+        "tag",
+        "TAG",
+        "n",
+        "NUMERIC",
+        "head",
+        "AS",
+        "headline",
+        "TEXT",
+    ]);
+    for (key, title, body, tag, n) in [
+        ("d1", "hello world", "red apple", "x", "1"),
+        ("d2", "red car", "hello there", "y", "2"),
+        ("d3", "nothing here", "nothing", "x", "3"),
+        ("d4", "hello", "hello", "y", "4"),
+        ("d5", "helium", "help me", "x", "5"),
+    ] {
+        c.cmds(&[
+            "HSET", key, "title", title, "body", body, "tag", tag, "n", n,
+        ]);
+    }
+    c.cmds(&["HSET", "d6", "head", "hello", "body", "nothing"]);
+    thread::sleep(Duration::from_millis(50));
+
+    let keys = |c: &mut Conn, query: &str, infields: &[&str]| -> Vec<String> {
+        let mut args = vec!["FT.SEARCH", "idx", query];
+        args.extend_from_slice(infields);
+        args.extend(["NOCONTENT", "DIALECT", "2"]);
+        let r = c.cmds(&args);
+        let mut keys: Vec<String> = r.as_array()[1..]
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            r.ft_search_total(),
+            keys.len() as i64,
+            "{query} {infields:?}"
+        );
+        keys
+    };
+    let title = ["INFIELDS", "1", "title"];
+    let body = ["INFIELDS", "1", "body"];
+    assert_eq!(keys(&mut c, "hello", &title), ["d1", "d4"]);
+    assert_eq!(keys(&mut c, "hello", &body), ["d2", "d4"]);
+    assert_eq!(
+        keys(&mut c, "hello", &["INFIELDS", "2", "title", "body"]),
+        ["d1", "d2", "d4"]
+    );
+    assert!(keys(&mut c, "hello red", &title).is_empty());
+    assert_eq!(keys(&mut c, "hello | red", &title), ["d1", "d2", "d4"]);
+    // A clause's own fields are narrowed too: none left, no match.
+    assert!(keys(&mut c, "@title:hello", &body).is_empty());
+    assert_eq!(keys(&mut c, "@title|body:hello", &body), ["d2", "d4"]);
+    // Not a TEXT field, or not a field: nowhere to look, and no error.
+    for named in ["nosuch", "tag", "n", "TITLE"] {
+        assert!(
+            keys(&mut c, "hello", &["INFIELDS", "1", named]).is_empty(),
+            "{named}"
+        );
+    }
+    // By the name `AS` gave it, not the hash field it is read from.
+    assert_eq!(
+        keys(&mut c, "hello", &["INFIELDS", "1", "headline"]),
+        ["d6"]
+    );
+    assert!(keys(&mut c, "hello", &["INFIELDS", "1", "head"]).is_empty());
+    // A name given many times is one field.
+    let mut many = vec!["INFIELDS", "500"];
+    many.extend(std::iter::repeat_n("title", 500));
+    assert_eq!(keys(&mut c, "hello", &many), ["d1", "d4"]);
+    // 0 is every field; the last INFIELDS is the one that counts.
+    assert_eq!(
+        keys(&mut c, "hello", &["INFIELDS", "0"]),
+        ["d1", "d2", "d4", "d6"]
+    );
+    assert_eq!(
+        keys(
+            &mut c,
+            "hello",
+            &["INFIELDS", "1", "title", "INFIELDS", "1", "body"]
+        ),
+        ["d2", "d4"]
+    );
+    // Tag and numeric clauses are not text clauses.
+    assert_eq!(keys(&mut c, "@tag:{x}", &body), ["d1", "d3", "d5"]);
+    assert_eq!(keys(&mut c, "hello @tag:{x}", &title), ["d1"]);
+    assert_eq!(keys(&mut c, "hello @n:[1 3]", &body), ["d2"]);
+    // Negation, prefixes, fuzzy words and phrases, in the fields named.
+    assert_eq!(keys(&mut c, "-hello", &title), ["d2", "d3", "d5", "d6"]);
+    assert_eq!(keys(&mut c, "hel*", &body), ["d2", "d4", "d5"]);
+    assert_eq!(keys(&mut c, "%helo%", &title), ["d1", "d4"]);
+    assert_eq!(keys(&mut c, "\"hello world\"", &title), ["d1"]);
+    assert!(keys(&mut c, "\"hello world\"", &body).is_empty());
+
+    // Scored as the same words in that field alone.
+    let scored = |c: &mut Conn, args: &[&str]| -> Vec<String> {
+        let r = c.cmds(args);
+        r.as_array()[1..]
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect()
+    };
+    assert_eq!(
+        scored(
+            &mut c,
+            &[
+                "FT.SEARCH",
+                "idx",
+                "hello",
+                "INFIELDS",
+                "1",
+                "title",
+                "WITHSCORES",
+                "NOCONTENT"
+            ]
+        ),
+        scored(
+            &mut c,
+            &[
+                "FT.SEARCH",
+                "idx",
+                "@title:hello",
+                "WITHSCORES",
+                "NOCONTENT"
+            ]
+        )
+    );
+
+    for bad in [
+        &["INFIELDS", "x", "title"][..],
+        &["INFIELDS", "-1", "title"],
+        &["INFIELDS", "3", "title"],
+        &["INFIELDS"],
+    ] {
+        let mut args = vec!["FT.SEARCH", "idx", "hello"];
+        args.extend_from_slice(bad);
+        let r = c.cmds(&args);
+        assert!(
+            matches!(r, RespValue::Error(ref e) if e.contains("Bad arguments for INFIELDS")),
+            "{bad:?}: {r:?}"
+        );
+    }
+}
+
+/// A query with a `VECTOR_RANGE` and a text clause is ordered by relevance,
+/// not distance, even when `INFIELDS` leaves the text clause no field to look
+/// in (#1004): as Redis 8.10.3 orders it (every score 0 there, so the
+/// documents in the order they were written).
+#[test]
+fn infields_leaving_text_no_field_keeps_relevance_order() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&[
+        "FT.CREATE",
+        "vx",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "v",
+        "SCHEMA",
+        "title",
+        "TEXT",
+        "body",
+        "TEXT",
+        "v",
+        "VECTOR",
+        "FLAT",
+        "6",
+        "TYPE",
+        "FLOAT32",
+        "DIM",
+        "2",
+        "DISTANCE_METRIC",
+        "L2",
+    ]);
+    // Little-endian f32 pairs whose bytes are valid UTF-8, for `cmds`.
+    let vector = |x: f32| {
+        let mut bytes = x.to_le_bytes().to_vec();
+        bytes.extend(0f32.to_le_bytes());
+        String::from_utf8(bytes).unwrap()
+    };
+    let (far, near, middle, origin) = (vector(3.0), vector(0.5), vector(2.0), vector(0.0));
+    c.cmds(&[
+        "HSET",
+        "v1",
+        "title",
+        "hello hello hello",
+        "body",
+        "x",
+        "v",
+        &far,
+    ]);
+    c.cmds(&["HSET", "v2", "title", "nothing", "body", "x", "v", &near]);
+    c.cmds(&["HSET", "v3", "title", "x", "body", "hello", "v", &middle]);
+    thread::sleep(Duration::from_millis(50));
+    let query = "~hello @v:[VECTOR_RANGE 10 $q]=>{$YIELD_DISTANCE_AS: d}";
+    let order = |c: &mut Conn, infields: &[&str]| -> Vec<String> {
+        let mut args = vec!["FT.SEARCH", "vx", query, "PARAMS", "2", "q", &origin];
+        args.extend_from_slice(infields);
+        args.extend(["NOCONTENT", "DIALECT", "2"]);
+        let r = c.cmds(&args);
+        r.as_array()[1..]
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect()
+    };
+    assert_eq!(order(&mut c, &[]), ["v1", "v3", "v2"]);
+    assert_eq!(
+        order(&mut c, &["INFIELDS", "1", "title"]),
+        ["v1", "v2", "v3"]
+    );
+    assert_eq!(
+        order(&mut c, &["INFIELDS", "1", "nosuch"]),
+        ["v1", "v2", "v3"]
+    );
+}
