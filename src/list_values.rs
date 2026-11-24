@@ -1251,7 +1251,10 @@ mod tests {
                 }
             }
             assert_same(&list, &model, &format!("seed {seed} end"));
-            assert!(list.is_packed(), "seed {seed}: elements of 200 bytes are packed");
+            assert!(
+                list.is_packed(),
+                "seed {seed}: elements of 200 bytes are packed"
+            );
         }
     }
 }

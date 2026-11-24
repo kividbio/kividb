@@ -2454,7 +2454,10 @@ mod tests {
             assert_eq!(value_slab::chunk_class_of(size), Some(class), "{n}");
             assert_eq!(block_bytes(n), size);
         }
-        assert_eq!(value_slab::chunk_class_of(value_slab::CHUNK_MAX_BLOCK + 1), None);
+        assert_eq!(
+            value_slab::chunk_class_of(value_slab::CHUNK_MAX_BLOCK + 1),
+            None
+        );
         assert_eq!(
             block_bytes(value_slab::CHUNK_MAX_BLOCK + 1),
             value_slab::CHUNK_MAX_BLOCK + 1
