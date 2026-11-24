@@ -60,7 +60,7 @@ use crate::value_slab;
 /// 300 short elements on four threads take 27 bytes an element resident
 /// there for 14 in use. A slab holds blocks of one size only, takes back a
 /// block freed on any thread, is handed to any thread once it has room, and
-/// gives its pages back as soon as it is empty: 16.8 bytes resident.
+/// gives its pages back as soon as it is empty: 16.7 bytes resident.
 struct Buf {
     ptr: NonNull<u8>,
     len: u32,
