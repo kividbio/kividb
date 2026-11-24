@@ -2206,6 +2206,108 @@ mod tests {
         assert!(map.is_empty());
     }
 
+    /// As `moving_a_sets_entry_leaves_its_array_in_place`, for a large
+    /// sorted set (#875): its key's entry, which holds the set's `Arc`,
+    /// moves; the set, its members' entries in the entry pool and the
+    /// index's references to them stay where they are.
+    #[test]
+    fn moving_a_sorted_sets_entry_leaves_its_members_in_place() {
+        use crate::sorted_set::SortedSetInner;
+        use crate::value_slab;
+        // Slab evacuation state is shared across the whole process.
+        // Serialize tests that plan or finish evacuation so they
+        // cannot take each other's slabs or affect global counts.
+        let _one = value_slab::EVACUATION_TESTS.lock();
+        // A length no other test's keys have: a slab class of its own.
+        let key = |i: usize| format!("{i:0>2800}");
+        // Members too long for a block, so the large form; runs of equal
+        // scores, ordered by the members' bytes.
+        let members: Vec<(Vec<u8>, f64)> = (0..200)
+            .map(|i| (format!("{i:0>80}").into_bytes(), (i % 7) as f64))
+            .collect();
+        // Made on a thread that ends, so that its slabs are nobody's.
+        let setup = members.clone();
+        let mut map = crate::cpus::spawn(move || {
+            let mut map = ShardMap::new();
+            for i in 0..64 {
+                let mut set = SortedSetInner::new();
+                for (member, score) in &setup {
+                    assert!(set.insert_bytes(member, *score));
+                }
+                map.insert(key(i), KiviDBValue::SortedSet(Arc::new(RwLock::new(set))));
+            }
+            map
+        })
+        .join()
+        .unwrap();
+        for i in 1..64 {
+            map.remove(&key(i));
+        }
+        let index = (0..map.buckets())
+            .find(|&i| map.table.get_bucket(i).is_some())
+            .unwrap();
+        let old = map.table.get_bucket(index).unwrap().entry();
+        let generation = value_slab::generation_of(old.base());
+        let zset_at = |map: &ShardMap| match map.get(&key(0)) {
+            Some(ValueRef::SortedSet(zset)) => Arc::as_ptr(zset),
+            _ => panic!("not a sorted set"),
+        };
+        // Each member's entry, and the index's references in its order.
+        let places = |map: &ShardMap| {
+            let Some(ValueRef::SortedSet(zset)) = map.get(&key(0)) else {
+                panic!("not a sorted set")
+            };
+            let set = zset.read();
+            let large = set.large().expect("the large form");
+            large.check();
+            let entries: Vec<usize> = members
+                .iter()
+                .map(|(member, _)| large.table().entry(member).expect("a member"))
+                .map(|entry| entry.as_ptr().addr())
+                .collect();
+            (entries, large.index_addrs())
+        };
+        let before = zset_at(&map);
+        let placed = places(&map);
+
+        let evacuating = value_slab::evacuate_only(old.base()).expect("a slab nobody owns");
+        assert_eq!(evacuating.live(), 1, "the key's slab is shared");
+        let regions = value_slab::regions_snapshot();
+        assert!(map.evacuating_at(index, &regions));
+        match map.relocate_at(index, &regions) {
+            Relocated::Moved(left) => drop(left),
+            _ => panic!("not moved"),
+        }
+        drop(evacuating);
+        assert!(map.table.get_bucket(index).unwrap().entry() != old);
+        // The old block freed: its slab emptied, and the set did not need it.
+        assert_ne!(value_slab::generation_of(old.base()), generation);
+
+        // The same set, at the same address, held only by its key, its
+        // members where they were.
+        assert_eq!(zset_at(&map), before);
+        assert_eq!(places(&map), placed, "a member's entry moved");
+        let Some(ValueRef::SortedSet(zset)) = map.get(&key(0)) else {
+            panic!("not a sorted set")
+        };
+        assert_eq!(Arc::strong_count(zset), 1);
+        let set = zset.read();
+        let mut want = members;
+        want.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let got: Vec<(Vec<u8>, f64)> = set
+            .iter()
+            .map(|(member, score)| (member.borrowed().to_vec(), score))
+            .collect();
+        assert_eq!(got, want);
+        for (rank, (member, score)) in want.iter().enumerate() {
+            assert_eq!(set.rank(member), Some((rank, *score)));
+        }
+        drop(set);
+        // Dropped once, from the copy.
+        drop(map.remove(&key(0)).expect("the key"));
+        assert!(map.is_empty());
+    }
+
     #[test]
     fn a_panic_moving_a_key_with_no_ttl_frees_only_the_copy() {
         relocation_unwinds_at(1, false, Then::Remove);

@@ -26,6 +26,7 @@ pub mod command_gate;
 mod commands;
 mod compaction;
 mod config;
+mod counted_btree;
 mod cpus;
 mod deferred;
 mod element;

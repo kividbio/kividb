@@ -9,6 +9,7 @@ use crate::resp::write::*;
 use crate::store;
 use crate::store::ValueRef;
 use crate::types::{KiviDBValue, SortedSetInner, ZMember};
+use crate::zset_table::Probe;
 use crate::{read_lock, write_lock};
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
@@ -446,14 +447,15 @@ fn zrange_pairs<'a>(inner: &'a SortedSetInner, p: &RangeParams) -> Vec<(Member<'
         let Some(range) = score_range(min, max) else {
             return vec![];
         };
-        // Those `LIMIT` skips are stepped over, not read.
-        // Pushed one by one, as a rank walk's: `collect` left the walk out
-        // of line (#920).
-        let within = inner.range_by_score(range);
+        // The range's ranks, then the `LIMIT` window of them: the offset is
+        // added to a rank, not stepped over (#875). Pushed one by one, as a
+        // rank walk's: `collect` left the walk out of line (#920).
+        let (lo, hi) = inner.rank_range_by_score(range);
+        let (start, end) = limit_window(lo, hi, p.limit_offset, p.limit_count, p.rev);
         if p.rev {
-            push_members(within.rev().skip(p.limit_offset).take(p.limit_count))
+            push_members(inner.ranks(start, end).rev())
         } else {
-            push_members(within.skip(p.limit_offset).take(p.limit_count))
+            push_members(inner.ranks(start, end))
         }
     } else if p.by_lex {
         // REV swaps the bounds
@@ -465,6 +467,20 @@ fn zrange_pairs<'a>(inner: &'a SortedSetInner, p: &RangeParams) -> Vec<(Member<'
         let (Ok(min), Ok(max)) = (parse_lex_bound(min_raw), parse_lex_bound(max_raw)) else {
             return vec![];
         };
+        // Every member at one score: the order is the members' own, and the
+        // range is ranks found by a walk down for each end (#875).
+        if let Some(bounds) = one_score_lex_bounds(inner, &min, &max) {
+            let (lo, hi) = match bounds {
+                Some((from, to)) => inner.rank_range(from, to),
+                None => return vec![],
+            };
+            let (start, end) = limit_window(lo, hi, p.limit_offset, p.limit_count, p.rev);
+            return if p.rev {
+                push_members(inner.ranks(start, end).rev())
+            } else {
+                push_members(inner.ranks(start, end))
+            };
+        }
         let lex_in_range = move |member: &[u8]| lex_in_range(member, &min, &max);
 
         if p.rev {
@@ -1049,6 +1065,50 @@ fn lex_in_range(member: &[u8], min: &LexBound, max: &LexBound) -> bool {
     above && below
 }
 
+/// Ranks `start..end` that `LIMIT offset count` leaves of ranks `lo..hi`
+/// (`lo <= hi`): counted from `lo`, or for `rev` from `hi` down. A count of
+/// `usize::MAX` is no limit; an offset of `usize::MAX` (a negative one)
+/// leaves nothing.
+fn limit_window(lo: usize, hi: usize, offset: usize, count: usize, rev: bool) -> (usize, usize) {
+    if rev {
+        let end = hi.saturating_sub(offset).max(lo);
+        (end.saturating_sub(count).max(lo), end)
+    } else {
+        let start = lo.saturating_add(offset).min(hi);
+        (start, start.saturating_add(count).min(hi))
+    }
+}
+
+/// The `(score, member)` bounds of `min ..= max` in a set whose members are
+/// all at one score: `Some(None)` if the range holds nothing (`+` as the
+/// lower end, `-` as the upper). `None` if the set is empty or its scores
+/// differ: then each member is compared with the bounds, in the order of
+/// the set.
+fn one_score_lex_bounds<'b>(
+    inner: &SortedSetInner,
+    min: &'b LexBound,
+    max: &'b LexBound,
+) -> Option<Option<(Bound<Probe<'b>>, Bound<Probe<'b>>)>> {
+    let (low, high) = inner.score_ends()?;
+    if low != high {
+        return None;
+    }
+    let at = |member: &'b [u8]| Probe { score: low, member };
+    let from = match min {
+        LexBound::Lowest => Bound::Unbounded,
+        LexBound::Highest => return Some(None),
+        LexBound::Inclusive(bound) => Bound::Included(at(bound)),
+        LexBound::Exclusive(bound) => Bound::Excluded(at(bound)),
+    };
+    let to = match max {
+        LexBound::Highest => Bound::Unbounded,
+        LexBound::Lowest => return Some(None),
+        LexBound::Inclusive(bound) => Bound::Included(at(bound)),
+        LexBound::Exclusive(bound) => Bound::Excluded(at(bound)),
+    };
+    Some(Some((from, to)))
+}
+
 /// The error for a range whose ends cannot be read, if they cannot. Asked
 /// before the key is looked at: a bad range is an error whether or not the
 /// key exists.
@@ -1293,7 +1353,7 @@ fn zcount(ctx: &mut Ctx) -> Vec<u8> {
             let count = match score_range(min, max) {
                 None => 0,
                 Some((Bound::Unbounded, Bound::Unbounded)) => inner.len(),
-                Some(range) => inner.range_by_score(range).count(),
+                Some(range) => inner.count_by_score(range),
             };
             resp_integer(count as i64)
         }
@@ -2122,14 +2182,26 @@ fn zlexcount(ctx: &mut Ctx) -> Vec<u8> {
     match map.get(key) {
         None => resp_integer(0),
         Some(ValueRef::SortedSet(zs)) => {
-            let inner = zs.read();
-            let count = inner
-                .iter()
-                .filter(|(member, _)| lex_in_range(member.as_ref(), &min, &max))
-                .count() as i64;
-            resp_integer(count)
+            let count = lex_count(&zs.read(), &min, &max);
+            resp_integer(count as i64)
         }
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
+    }
+}
+
+/// How many members are in `min ..= max` (`ZLEXCOUNT`): of a set at one
+/// score, two ranks apart; else each member compared.
+fn lex_count(inner: &SortedSetInner, min: &LexBound, max: &LexBound) -> usize {
+    match one_score_lex_bounds(inner, min, max) {
+        Some(Some((from, to))) => {
+            let (lo, hi) = inner.rank_range(from, to);
+            hi - lo
+        }
+        Some(None) => 0,
+        None => inner
+            .iter()
+            .filter(|(member, _)| lex_in_range(member.as_ref(), min, max))
+            .count(),
     }
 }
 
@@ -3010,5 +3082,215 @@ mod score_range_tests {
                 assert_eq!(by_range(&zs, lo, hi), by_scan(&zs, lo, hi), "{lo:?} {hi:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod limit_and_lex_tests {
+    //! `LIMIT` windows of score ranges and lex ranges against a reference:
+    //! a `BTreeMap` of `(score, member)`, filtered member by member and the
+    //! window stepped through, as the commands' replies are defined.
+    use super::*;
+    use std::collections::BTreeMap;
+
+    type Model = BTreeMap<(OrderedFloat<f64>, Vec<u8>), ()>;
+
+    /// Fixed-seed xorshift, so a failure can be run again.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    const SCORES: [f64; 7] = [f64::NEG_INFINITY, -2.5, 0.0, 1.0, 1.5, 7.0, f64::INFINITY];
+
+    fn score_text(score: f64, excl: bool) -> Vec<u8> {
+        let text = if score == f64::INFINITY {
+            "+inf".to_string()
+        } else if score == f64::NEG_INFINITY {
+            "-inf".to_string()
+        } else {
+            format!("{score}")
+        };
+        format!("{}{text}", if excl { "(" } else { "" }).into_bytes()
+    }
+
+    fn name(i: u64) -> Vec<u8> {
+        format!("m{i:03}").into_bytes()
+    }
+
+    /// A lex bound near the set's members: `-`, `+`, a member, a prefix of
+    /// one, the empty member, one past every member.
+    fn lex_bound(rng: &mut Rng, n: u64) -> Vec<u8> {
+        let body = match rng.below(6) {
+            0 => return b"-".to_vec(),
+            1 => return b"+".to_vec(),
+            2 => Vec::new(),
+            3 => name(rng.below(n + 1))[..3].to_vec(),
+            4 => b"n".to_vec(),
+            _ => name(rng.below(n + 2)),
+        };
+        let mut out = vec![if rng.below(2) == 0 { b'[' } else { b'(' }];
+        out.extend(body);
+        out
+    }
+
+    /// An offset or a count: 0, within the set, past its end, or negative
+    /// (`usize::MAX`, as `parse_limit` reads it).
+    fn limit_number(rng: &mut Rng, n: u64) -> usize {
+        match rng.below(6) {
+            0 => 0,
+            1 => usize::MAX,
+            2 => (n + 1 + rng.below(5)) as usize,
+            _ => rng.below(n + 1) as usize,
+        }
+    }
+
+    fn window(
+        mut found: Vec<(Vec<u8>, f64)>,
+        rev: bool,
+        offset: usize,
+        count: usize,
+    ) -> Vec<(Vec<u8>, f64)> {
+        if rev {
+            found.reverse();
+        }
+        found.into_iter().skip(offset).take(count).collect()
+    }
+
+    fn by_model(model: &Model, keep: impl Fn(f64, &[u8]) -> bool) -> Vec<(Vec<u8>, f64)> {
+        model
+            .keys()
+            .filter(|key| keep(key.0.0, &key.1))
+            .map(|key| (key.1.clone(), key.0.0))
+            .collect()
+    }
+
+    fn pairs(inner: &SortedSetInner, p: &RangeParams) -> Vec<(Vec<u8>, f64)> {
+        zrange_pairs(inner, p)
+            .into_iter()
+            .map(|(member, score)| (member.as_ref().to_vec(), score))
+            .collect()
+    }
+
+    fn score_in(score: f64, (min, min_excl): (f64, bool), (max, max_excl): (f64, bool)) -> bool {
+        let above = if min_excl { score > min } else { score >= min };
+        let below = if max_excl { score < max } else { score <= max };
+        above && below
+    }
+
+    /// Sets of up to 300 members (the block and the large form), every
+    /// member at one score or at a few: score ranges and lex ranges with
+    /// every bound form, `LIMIT` at 0, inside, past the end and negative,
+    /// both ways, and `ZLEXCOUNT`, each against the model.
+    #[test]
+    fn limits_and_lex_ranges_match_a_model() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for round in 0..240 {
+            let n = match round % 4 {
+                0 => rng.below(8),
+                1 => rng.below(129),
+                _ => 129 + rng.below(172),
+            };
+            let one_score = round % 3 != 0;
+            let mut inner = SortedSetInner::new();
+            let mut model = Model::new();
+            let shared = SCORES[rng.below(SCORES.len() as u64) as usize];
+            for i in 0..n {
+                // Members in a random order, so the form and the index see
+                // inserts all over.
+                let i = (i * 7919 + round) % n.max(1);
+                let score = if one_score {
+                    shared
+                } else {
+                    SCORES[rng.below(SCORES.len() as u64) as usize]
+                };
+                let member = name(i);
+                if inner.insert_bytes(&member, score) {
+                    model.insert((OrderedFloat(score), member), ());
+                } else {
+                    model.retain(|(_, m), _| *m != member);
+                    model.insert((OrderedFloat(score), member), ());
+                }
+            }
+            assert_eq!(inner.len(), model.len());
+            for _ in 0..40 {
+                let rev = rng.below(2) == 0;
+                let (offset, count) = if rng.below(4) == 0 {
+                    (0, usize::MAX)
+                } else {
+                    (limit_number(&mut rng, n), limit_number(&mut rng, n))
+                };
+                // A score range.
+                let min = (SCORES[rng.below(7) as usize], rng.below(3) == 0);
+                let max = (SCORES[rng.below(7) as usize], rng.below(3) == 0);
+                let (min_raw, max_raw) = (score_text(min.0, min.1), score_text(max.0, max.1));
+                let p = RangeParams {
+                    start: if rev { &max_raw } else { &min_raw },
+                    stop: if rev { &min_raw } else { &max_raw },
+                    by_score: true,
+                    by_lex: false,
+                    rev,
+                    limit_offset: offset,
+                    limit_count: count,
+                };
+                let want = window(
+                    by_model(&model, |s, _| score_in(s, min, max)),
+                    rev,
+                    offset,
+                    count,
+                );
+                assert_eq!(
+                    pairs(&inner, &p),
+                    want,
+                    "score {min:?} {max:?} rev={rev} {offset} {count} n={n}"
+                );
+                // A lex range.
+                let (lo_raw, hi_raw) = (lex_bound(&mut rng, n), lex_bound(&mut rng, n));
+                let (lo, hi) = (
+                    parse_lex_bound(&lo_raw).unwrap(),
+                    parse_lex_bound(&hi_raw).unwrap(),
+                );
+                let p = RangeParams {
+                    start: if rev { &hi_raw } else { &lo_raw },
+                    stop: if rev { &lo_raw } else { &hi_raw },
+                    by_score: false,
+                    by_lex: true,
+                    rev,
+                    limit_offset: offset,
+                    limit_count: count,
+                };
+                let all = by_model(&model, |_, m| lex_in_range(m, &lo, &hi));
+                let what = format!(
+                    "lex {} {} rev={rev} {offset} {count} n={n} one_score={one_score}",
+                    String::from_utf8_lossy(&lo_raw),
+                    String::from_utf8_lossy(&hi_raw)
+                );
+                assert_eq!(lex_count(&inner, &lo, &hi), all.len(), "{what}");
+                assert_eq!(pairs(&inner, &p), window(all, rev, offset, count), "{what}");
+            }
+        }
+    }
+
+    /// The window arithmetic at its edges.
+    #[test]
+    fn limit_windows() {
+        assert_eq!(limit_window(3, 10, 0, usize::MAX, false), (3, 10));
+        assert_eq!(limit_window(3, 10, 2, 3, false), (5, 8));
+        assert_eq!(limit_window(3, 10, 7, 3, false), (10, 10));
+        assert_eq!(limit_window(3, 10, usize::MAX, 3, false), (10, 10));
+        assert_eq!(limit_window(3, 10, 2, 3, true), (5, 8));
+        assert_eq!(limit_window(3, 10, 6, 3, true), (3, 4));
+        assert_eq!(limit_window(3, 10, usize::MAX, 3, true), (3, 3));
+        assert_eq!(limit_window(3, 10, 0, usize::MAX, true), (3, 10));
+        assert_eq!(limit_window(4, 4, 0, 5, true), (4, 4));
     }
 }

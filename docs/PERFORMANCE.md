@@ -211,11 +211,15 @@ key's own entry and the set's header. The rows from 129 members on are
 from an Azure `Standard_D8s_v5` (suite 31's recorded run, one set each of
 100,000 and 3,000,000): past 128 members a sorted set is a table of
 members, each member and its score in one block of the collections' pool,
-and an index of their order (a B-tree) that holds each member as the
-address of its block. Of the bytes a member at 3,000,000 (16-byte
-members), the table takes 45.7 and the index 34 when members come in
-order one `ZADD` at a time, 27 at random, 18 for a set built whole (a
-load, `RESTORE`); see `benchmarks/1.3.0/large-zsets`. Suite
+and an index of their order (a B+tree of up to 32 members a leaf that
+counts the members under each node, so a rank is one walk down) that holds
+each member as the address of its block. Of the bytes a member at
+3,000,000 (16-byte members), the table takes 45.7; the index, its nodes as
+allocated (measured at 100,000 members; the bytes a member do not depend
+on the member's length), takes 20.3 when members come in order one `ZADD`
+at a time, 25.8 at random and 17.6 for a set built whole (a load,
+`RESTORE`), and 32.7 / 30.1 / 35.2 once every other member of those is
+removed; see `benchmarks/1.3.0/large-zsets`. Suite
 `31-zset-memory` of
 [the regression suite](../benchmarks/1.3.0/regressions/README.md) measures
 the table again and fails a build that loses it.

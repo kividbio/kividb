@@ -201,7 +201,7 @@ impl SortedSetInner {
     /// allocation, room to spare included; for the large form its box, the
     /// table exactly as `used_memory` counts it (group arrays, overflow
     /// groups, the members' entries at their pool class's size) and the
-    /// index's estimate (`memory_layout::score_index`). For `MEMORY USAGE`.
+    /// index's nodes, as it counts them. For `MEMORY USAGE`.
     pub fn allocation_size(&self) -> usize {
         match &self.repr {
             Repr::Packed(block) => block.allocation_size(),
@@ -449,6 +449,83 @@ impl SortedSetInner {
                     .map(|(member, score)| (Member::Bytes(member), score)),
             ),
         }
+    }
+
+    /// How many members `range_by_score` gives for `range` (`ZCOUNT`),
+    /// none of them read: a block's two indexes apart, or the large form's
+    /// count from its index.
+    pub fn count_by_score<R>(&self, range: R) -> usize
+    where
+        R: RangeBounds<(OrderedFloat<f64>, ZMember)>,
+    {
+        match &self.repr {
+            Repr::Packed(block) => {
+                let (from, to) = Self::packed_bounds(block, &range);
+                to.saturating_sub(from)
+            }
+            Repr::Large(large) => large.count(probe(range.start_bound()), probe(range.end_bound())),
+        }
+    }
+
+    /// The ranks `start..end` (`start <= end`) of the members from `from`
+    /// to `to`, each a `(score, member)` bound: a block's two binary
+    /// searches, the large form's two walks down its index. No member
+    /// between them is read, so a `LIMIT` offset is added to `start`, not
+    /// stepped over.
+    pub fn rank_range(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> (usize, usize) {
+        match &self.repr {
+            Repr::Packed(block) => {
+                let start = match from {
+                    Bound::Unbounded => 0,
+                    Bound::Included(p) => block.lower_bound(p.score, p.member, false),
+                    Bound::Excluded(p) => block.lower_bound(p.score, p.member, true),
+                };
+                let end = match to {
+                    Bound::Unbounded => block.len(),
+                    Bound::Included(p) => block.lower_bound(p.score, p.member, true),
+                    Bound::Excluded(p) => block.lower_bound(p.score, p.member, false),
+                };
+                (start, end.max(start))
+            }
+            Repr::Large(large) => large.rank_range(from, to),
+        }
+    }
+
+    /// [`rank_range`](Self::rank_range) of a range of keys as
+    /// `range_by_score` takes it.
+    pub fn rank_range_by_score<R>(&self, range: R) -> (usize, usize)
+    where
+        R: RangeBounds<(OrderedFloat<f64>, ZMember)>,
+    {
+        self.rank_range(probe(range.start_bound()), probe(range.end_bound()))
+    }
+
+    /// Like `iter`, limited to ranks `start..end` (`end` not included;
+    /// both cut to the set).
+    pub fn ranks(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> impl DoubleEndedIterator<Item = (Member<'_>, f64)> {
+        let end = end.min(self.len());
+        let start = start.min(end);
+        match &self.repr {
+            Repr::Packed(block) => Either::A(Packed(block.range(start, end))),
+            Repr::Large(large) => Either::B(
+                large
+                    .range_by_rank(start, end)
+                    .map(|(member, score)| (Member::Bytes(member), score)),
+            ),
+        }
+    }
+
+    /// The lowest and the highest score, `None` if the set is empty: the
+    /// scores are all one when the two are equal.
+    pub fn score_ends(&self) -> Option<(f64, f64)> {
+        let mut all = self.iter();
+        let (_, low) = all.next()?;
+        let high = all.next_back().map_or(low, |(_, high)| high);
+        Some((low, high))
     }
 
     /// The indexes of a block that a range of keys covers: `from..to`.
@@ -936,6 +1013,15 @@ impl SortedSetInner {
     #[cfg(test)]
     pub(crate) fn is_queued(&self) -> bool {
         matches!(&self.repr, Repr::Large(large) if large.queued)
+    }
+
+    /// The large form, if the set is in it (tests).
+    #[cfg(test)]
+    pub(crate) fn large(&self) -> Option<&Large> {
+        match &self.repr {
+            Repr::Large(large) => Some(large),
+            Repr::Packed(_) => None,
+        }
     }
 
     /// Finish whatever resize is in progress now, and free what it leaves
@@ -1466,6 +1552,62 @@ mod tests {
             became_large[0] > 0 && became_large[1] > 0,
             "{became_large:?}"
         );
+    }
+
+    /// `count_by_score` is how many members `range_by_score` gives, in a
+    /// block and in the large form as the set grows past the block's limit:
+    /// each pair of the bounds `ZCOUNT` makes (a score's first key, open or
+    /// closed, or none) and some within one score; runs of a score across
+    /// leaves, infinities, signed zeros, empty and crossed ranges.
+    #[test]
+    fn counts_by_score_are_their_ranges_lengths() {
+        own_limits(Some([128, 64]));
+        let scores = [
+            f64::NEG_INFINITY,
+            -f64::MAX,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            f64::MAX,
+            f64::INFINITY,
+        ];
+        let key = |score: f64, member: &[u8]| (OrderedFloat(score), ZMember::from(member));
+        let mut keys: Vec<_> = scores.iter().map(|&s| key(s, b"")).collect();
+        keys.extend([-0.5, 0.5, 2.0].map(|s| key(s, b"")));
+        // A member held at 1, and a key past every member at 1.
+        keys.extend([key(1.0, b"5-m00007"), key(1.0, b"~")]);
+        let mut bounds = vec![Bound::Unbounded];
+        for key in &keys {
+            bounds.extend([Bound::Included(key.clone()), Bound::Excluded(key.clone())]);
+        }
+        let agree = |set: &SortedSetInner| {
+            for from in &bounds {
+                for to in &bounds {
+                    let range = (from.clone(), to.clone());
+                    assert_eq!(
+                        set.count_by_score(range.clone()),
+                        set.range_by_score(range).count(),
+                        "{from:?} to {to:?}, {} members",
+                        set.len()
+                    );
+                }
+            }
+        };
+        let n = if cfg!(miri) { 170 } else { 2_000 };
+        let mut set = SortedSetInner::new();
+        for i in 0..n {
+            let at = i % scores.len();
+            let member = format!("{at}-m{:05}", i / scores.len());
+            assert!(set.insert_bytes(member.as_bytes(), scores[at]));
+            let len = set.len();
+            let packed = set.encoding() == Encoding::Listpack;
+            assert_eq!(packed, len <= 128, "{len} members");
+            if len <= 2 || len.abs_diff(128) <= 1 || len.is_multiple_of(500) || len == n {
+                agree(&set);
+            }
+        }
+        own_limits(None);
     }
 
     #[test]
