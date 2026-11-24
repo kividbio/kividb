@@ -171,7 +171,9 @@ fn parse(text: &str) -> Result<Vec<Option<(u64, NodeId)>>, ()> {
         if a > b || b >= CLUSTER_SLOTS {
             return Err(());
         }
-        came[a..=b].iter_mut().for_each(|c| *c = Some((epoch, owner)));
+        came[a..=b]
+            .iter_mut()
+            .for_each(|c| *c = Some((epoch, owner)));
     }
     if !ended {
         return Err(());
