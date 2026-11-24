@@ -450,6 +450,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let _ = crate::commands::server::config_set_global("appendfsync", &cfg.appendfsync);
+    crate::commands::search::set_resp3_reply(&cfg.search_resp3_reply);
     let threads = cfg.resolve_threads();
     #[cfg(feature = "lua")]
     crate::lua_vm_blocking::workers_are(threads);

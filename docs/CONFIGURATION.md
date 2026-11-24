@@ -89,6 +89,7 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--threads` | `0` (auto) | Worker threads; auto is half the CPUs the process may use, rounded up (see [Worker threads](#worker-threads)) |
 | `--worker-cpu-affinity <off\|auto>` | `off` | `auto` binds each io_uring worker to a CPU of its own when they are as many as the process's CPUs (see [Worker CPU affinity](#worker-cpu-affinity)) |
 | `--search-index-threads <auto\|N>` | `auto` | Helper threads that link vectors written to HNSW indexes; startup only (see [Search index threads](#search-index-threads)) |
+| `--search-resp3-reply <auto\|redis\|valkey>` | `auto` | The shape of the search commands' replies over RESP3 (see [Search reply shape over RESP3](#search-reply-shape-over-resp3)) |
 | `--databases` | `16` | Number of databases |
 | `--dir <path>` | start directory | Where `dump.kdb`, `appendonly.aof` and `nodes.conf` live |
 | `--aof` | off | Append-only file persistence |
@@ -268,6 +269,56 @@ which is:
 
 A Kubernetes pod with a CPU request but no CPU limit has no quota, so the server sees every CPU
 of the node: give it a limit, or `--threads`.
+
+### Search reply shape over RESP3
+
+`--search-resp3-reply` (`search-resp3-reply` in the configuration file; `CONFIG GET` and
+`CONFIG SET` take it, and it applies to connections that are already open) is the shape of
+the replies of `FT.SEARCH`, `FT.AGGREGATE` (and its cursor), `FT.HYBRID`, `FT.INFO` and
+`FT._LIST` to a connection that has sent `HELLO 3`:
+
+| Value | Reply over RESP3 |
+|-------|------------------|
+| `auto` (default) | Redis 8's, a map, except to a client that named itself valkey-glide with `CLIENT SETINFO LIB-NAME`: valkey-search's |
+| `redis` | Redis 8's for every connection |
+| `valkey` | valkey-search's for every connection |
+
+valkey-search answers a RESP3 connection with the arrays it answers RESP2 with, and
+valkey-glide converts that reply itself: it reads `[total, key, [field, value, ...], ...]` and
+refuses a map. In the valkey shape, then, `FT.SEARCH`, `FT.AGGREGATE`, `FT.CURSOR READ`,
+`FT._LIST` and `FT.INFO` are the RESP2 layout on a RESP3 connection:
+
+- `FT.SEARCH`: the count, then each key and its fields as a flat array (a key alone with
+  `NOCONTENT`). The count is an integer; values, scores and distances are bulk strings, a vector
+  blob included.
+- `FT.AGGREGATE` and `FT.CURSOR READ` (`[rows, cursor]`): the count, then each row as a flat array
+  whose names are simple strings.
+- `FT._LIST`: an array of simple strings.
+- `FT.INFO`: a flat array with a simple string for each name, in every list in it, and without the
+  `fields` list of strings that the Redis shape keeps for older readers. Its fields are KiviDB's,
+  not valkey-search's.
+
+`FT.HYBRID` is not RESP2's layout (RESP2 gets Redis 8's reply, as a flat list of `total_results`,
+`results`, `warnings` and `execution_time`). In the valkey shape it is valkey-search's: the count,
+then each row as a flat array whose names are simple strings, a row being `__key` and `__score`
+or the fields `LOAD`ed. `warnings` and `execution_time` are not in it.
+
+Not in the valkey layout either, because valkey-search has no equivalent: the warning that a
+query cut short by `ON_TIMEOUT` carries in RESP3's `warning` (the client gets the partial result
+with no signal, as over RESP2). A `WITHSCORES` on a KNN query gives each document's distance as
+its score, as Redis does; valkey-search gives `0`.
+
+`FT.PROFILE` has no valkey-search counterpart, and keeps the Redis shape, as do `FT.SPELLCHECK`,
+`FT.CONFIG GET`, `FT.TAGVALS`, the alias list and every other search command, in every mode.
+
+A client is valkey-glide when its library name begins with `Glide`, in any case (`GlidePy`,
+`GlidePySync`, `GlideJS`, `GlideJava`, `GlideGo`, `GlideFFI`, and any of them followed by a tag in
+brackets). RESP2 replies are the same in every mode, as are a script's (`redis.call` reads RESP2
+unless the script says `redis.setresp(3)`) and the parts that the masters of a cluster give one
+another.
+
+The setting belongs to the node: in a cluster, the node that is asked writes the reply, so set
+every node alike.
 
 ### Search index threads
 

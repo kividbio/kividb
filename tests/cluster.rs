@@ -18506,3 +18506,171 @@ fn a_query_is_read_in_the_dialect_of_the_node_asked_on_every_master() {
     // Another node, whose default is 1, reads it in 1.
     assert_eq!(found(&mut nodes[1].conn(), &[]), first);
 }
+
+/// The shape of a search reply over RESP3 is the client's, whatever the
+/// masters answer one another in: the node that is asked gathers the parts
+/// as RESP2 and writes the reply as `search-resp3-reply` says (a GLIDE client
+/// gets valkey-search's), and the nodes that were asked for their part are
+/// not changed by it.
+#[test]
+fn search_replies_over_resp3_take_the_clients_shape() {
+    let (nodes, ranges) = form_cluster(3);
+    let owner = |key: &str| {
+        let slot = slot_of(key);
+        ranges
+            .iter()
+            .position(|(a, b)| (*a..=*b).contains(&slot))
+            .unwrap()
+    };
+    let r = nodes[0].conn().cmd(&[
+        "FT.CREATE",
+        "shapes",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "sh:",
+        "SCHEMA",
+        "color",
+        "TAG",
+        "vec",
+        "VECTOR",
+        "FLAT",
+        "6",
+        "TYPE",
+        "FLOAT32",
+        "DIM",
+        "2",
+        "DISTANCE_METRIC",
+        "L2",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let colors = ["red", "green", "blue"];
+    let mut on = [0usize; 3];
+    for i in 0..30u32 {
+        let key = format!("sh:{i}");
+        let node = owner(&key);
+        on[node] += 1;
+        let blob: Vec<u8> = [i as f32, 0.0f32]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let r = nodes[node].conn().cmd_bytes(&[
+            b"HSET",
+            key.as_bytes(),
+            b"color",
+            colors[(i % 3) as usize].as_bytes(),
+            b"vec",
+            &blob,
+        ]);
+        assert!(matches!(r, Resp::Int(2)), "{r:?}");
+    }
+    assert!(on.iter().all(|n| *n > 3), "{on:?}");
+    let blob: Vec<u8> = [0.0f32, 0.0f32]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let search = |c: &mut Conn| {
+        c.cmd_bytes(&[
+            b"FT.SEARCH",
+            b"shapes",
+            b"*=>[KNN 5 @vec $B AS d]",
+            b"RETURN",
+            b"1",
+            b"d",
+            b"PARAMS",
+            b"2",
+            b"B",
+            &blob,
+            b"DIALECT",
+            b"2",
+        ])
+    };
+    let expected: Vec<String> = (0..5).map(|i| format!("sh:{i}")).collect();
+    // Key names of a reply in the Redis shape (a map) and in valkey-search's
+    // (an array of the count, then each key and its fields).
+    let redis_keys = |reply: &Resp| -> Vec<String> {
+        let results = reply
+            .map()
+            .iter()
+            .find(|(k, _)| k.text() == "results")
+            .map(|(_, v)| v)
+            .unwrap();
+        results
+            .array()
+            .iter()
+            .map(|hit| {
+                hit.map()
+                    .iter()
+                    .find(|(k, _)| k.text() == "id")
+                    .map(|(_, v)| v.text())
+                    .unwrap()
+            })
+            .collect()
+    };
+    let valkey_keys = |reply: &Resp| -> Vec<String> {
+        let items = reply.array();
+        assert!(matches!(items[0], Resp::Int(5)), "{reply:?}");
+        items[1..]
+            .chunks(2)
+            .map(|pair| {
+                assert!(matches!(pair[1], Resp::Array(_)), "{reply:?}");
+                pair[0].text()
+            })
+            .collect()
+    };
+    for node in &nodes {
+        let mut plain = node.conn();
+        plain.cmd(&["HELLO", "3"]);
+        assert_eq!(redis_keys(&search(&mut plain)), expected);
+
+        let mut glide = node.conn();
+        glide.cmd(&["HELLO", "3"]);
+        assert!(
+            glide
+                .cmd(&["CLIENT", "SETINFO", "LIB-NAME", "GlideGo"])
+                .is_ok()
+        );
+        assert_eq!(valkey_keys(&search(&mut glide)), expected);
+        // The aggregation, grouped, and the index, as valkey-search writes them.
+        let agg = glide.cmd(&[
+            "FT.AGGREGATE",
+            "shapes",
+            "*",
+            "GROUPBY",
+            "1",
+            "@color",
+            "REDUCE",
+            "COUNT",
+            "0",
+            "AS",
+            "n",
+        ]);
+        assert!(matches!(agg.array()[0], Resp::Int(3)), "{agg:?}");
+        assert_eq!(agg.array().len(), 4, "{agg:?}");
+        let info = glide.cmd(&["FT.INFO", "shapes"]);
+        let at = info
+            .array()
+            .iter()
+            .position(|r| matches!(r, Resp::Simple(n) if n == "num_docs"))
+            .unwrap();
+        assert!(matches!(info.array()[at + 1], Resp::Int(30)), "{info:?}");
+    }
+    // `valkey` on the node that is asked only: the others still give their
+    // parts to it as before.
+    assert!(
+        nodes[0]
+            .conn()
+            .cmd(&["CONFIG", "SET", "search-resp3-reply", "valkey"])
+            .is_ok()
+    );
+    let mut plain = nodes[0].conn();
+    plain.cmd(&["HELLO", "3"]);
+    assert_eq!(valkey_keys(&search(&mut plain)), expected);
+    let mut other = nodes[1].conn();
+    other.cmd(&["HELLO", "3"]);
+    assert_eq!(redis_keys(&search(&mut other)), expected);
+    // RESP2 is the same.
+    let two = search(&mut nodes[0].conn());
+    assert_eq!(valkey_keys(&two), expected);
+}
