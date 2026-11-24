@@ -31,7 +31,16 @@ pub(crate) type ShownRow = Vec<(String, String)>;
 
 /// The reply of an aggregation: `total`, then the rows. `timed_out` is
 /// whether the scan stopped because `TIMEOUT` ran out (`ON_TIMEOUT return`).
-pub(crate) fn rows_reply(resp: u8, total: usize, rows: &[ShownRow], timed_out: bool) -> Vec<u8> {
+///
+/// `valkey`: valkey-search's reply, which is RESP2's layout with a name a
+/// simple string (`resp` is 2 then).
+pub(crate) fn rows_reply(
+    resp: u8,
+    valkey: bool,
+    total: usize,
+    rows: &[ShownRow],
+    timed_out: bool,
+) -> Vec<u8> {
     let fields = |row: &ShownRow| -> Vec<Vec<u8>> {
         row.iter()
             .flat_map(|(name, value)| {
@@ -42,7 +51,7 @@ pub(crate) fn rows_reply(resp: u8, total: usize, rows: &[ShownRow], timed_out: b
                 } else {
                     value_reply(value, resp)
                 };
-                [resp_bulk_str(name), value]
+                [crate::commands::search::reply_name(name, valkey), value]
             })
             .collect()
     };
@@ -124,13 +133,14 @@ const DEFAULT_COUNT: usize = 1000;
 /// `[rows, cursor]`.
 fn cursor_reply(
     resp: u8,
+    valkey: bool,
     total: usize,
     rows: &[ShownRow],
     cursor: u64,
     timed_out: bool,
 ) -> Vec<u8> {
     resp_array(vec![
-        rows_reply(resp, total, rows, timed_out),
+        rows_reply(resp, valkey, total, rows, timed_out),
         resp_integer(cursor as i64),
     ])
 }
@@ -173,7 +183,7 @@ pub(crate) fn cursor_options(cmd: &[&[u8]]) -> Result<Option<(usize, Duration)>,
 
 /// Answer with the first rows, and keep the rest under a cursor.
 pub(crate) fn open_cursor(
-    resp: u8,
+    (resp, valkey): (u8, bool),
     index: &str,
     rows: Vec<ShownRow>,
     count: usize,
@@ -185,7 +195,7 @@ pub(crate) fn open_cursor(
     let first: Vec<ShownRow> = rows.drain(..count.min(rows.len())).collect();
     let total = groups.unwrap_or(first.len());
     if rows.is_empty() {
-        return cursor_reply(resp, total, &first, 0, timed_out);
+        return cursor_reply(resp, valkey, total, &first, 0, timed_out);
     }
     let mut cursors = CURSORS.lock();
     forget_idle(&mut cursors);
@@ -211,7 +221,7 @@ pub(crate) fn open_cursor(
             grouped: groups.is_some(),
         },
     );
-    cursor_reply(resp, total, &first, id, timed_out)
+    cursor_reply(resp, valkey, total, &first, id, timed_out)
 }
 
 /// `FT.CURSOR READ index cursor [COUNT n]` / `FT.CURSOR DEL index cursor`.
@@ -296,8 +306,10 @@ pub(crate) fn ft_cursor(ctx: &mut Ctx) -> Option<Vec<u8>> {
     if !left {
         cursors.remove(&id);
     }
+    let (resp, valkey) = crate::commands::search::search_shape(ctx);
     Some(cursor_reply(
-        crate::commands::handler::effective_resp_for_reply(ctx),
+        resp,
+        valkey,
         total,
         &rows,
         if left { id } else { 0 },
@@ -993,11 +1005,13 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .chain(saved[at + 1..].iter().copied())
         .collect();
     let started = Instant::now();
+    let profiling = crate::commands::search::Profiling::start();
     let reply = match kind.as_str() {
         "SEARCH" => crate::commands::search::ft_search(ctx),
         "AGGREGATE" => crate::commands::vector::ft_aggregate(ctx),
         _ => crate::commands::hybrid::ft_hybrid(ctx),
     };
+    drop(profiling);
     let total = started.elapsed();
     ctx.cmd = saved;
     let reply = reply?;
@@ -1168,7 +1182,7 @@ mod tests {
             .map(|n| vec![("n".to_string(), n.to_string())])
             .collect();
         let first = open_cursor(
-            2,
+            (2, false),
             "cursor-test-index",
             rows.clone(),
             2,
@@ -1182,7 +1196,7 @@ mod tests {
 
         // Everything in one go: no cursor is left open.
         let all = open_cursor(
-            2,
+            (2, false),
             "cursor-test-index",
             rows,
             10,
