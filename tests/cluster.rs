@@ -8132,7 +8132,21 @@ impl Written {
 
 /// The node that owns `slot` in `node`'s `CLUSTER NODES`.
 fn owner_in_view_of(node: &Node, slot: u16) -> Option<String> {
-    let nodes = node.conn().cmd(&["CLUSTER", "NODES"]).text();
+    // `None` is "no owner" only from a `CLUSTER NODES` that answered: an
+    // error reply is asked again for a while, then fails the test with it.
+    let mut tries = 0;
+    let nodes = loop {
+        let reply = node.conn().cmd(&["CLUSTER", "NODES"]);
+        match reply.err() {
+            None => break reply.text(),
+            Some(e) if tries < 50 => {
+                tries += 1;
+                eprintln!("CLUSTER NODES on {} answered {e}; asked again", node.port);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Some(e) => panic!("CLUSTER NODES on {} answered {e}", node.port),
+        }
+    };
     nodes.lines().find_map(|line| {
         let fields: Vec<&str> = line.split(' ').collect();
         let owns = fields.iter().skip(8).any(|range| {
@@ -10382,6 +10396,23 @@ fn a_replica_that_holds_what_arrived_is_given_the_slots_its_master_took_before_f
     }
     set_pause_timeout(&[&nodes[0], &nodes[1]], "30000");
     let (src_id, dst_id, replica_id) = (nodes[0].id(), nodes[1].id(), replica.id());
+    // The third master holds the highest epoch, known to all as the
+    // current one, and every config epoch differs: no collision moves the
+    // destination's epoch between what arrived and the kill (checked below).
+    wait_until(
+        "a master to hold the highest epoch, known to all",
+        Duration::from_secs(30),
+        || {
+            let r = nodes[2].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+            assert!(r.starts_with("BUMPED") || r.starts_with("STILL"), "{r}");
+            let highest = nodes[2].cluster_info("cluster_my_epoch");
+            std::thread::sleep(Duration::from_millis(1500));
+            nodes
+                .iter()
+                .chain(std::iter::once(&replica))
+                .all(|n| n.cluster_info("cluster_current_epoch") == highest)
+        },
+    );
     let before = Written::on(&nodes[0], 0..=100, "before", 200);
     let task_id = nodes[1]
         .conn()
@@ -10394,14 +10425,15 @@ fn a_replica_that_holds_what_arrived_is_given_the_slots_its_master_took_before_f
         Duration::from_secs(30),
         || held.exists(),
     );
+    let reserved = nodes[1].cluster_info("cluster_current_epoch");
+    let arrived = format!(
+        "this node holds what arrived of slots 0-100 on its master, for a takeover at epoch \
+         {reserved}"
+    );
     wait_until(
         "the replica to hold what arrived",
         Duration::from_secs(10),
-        || {
-            replica
-                .log()
-                .contains("this node holds what arrived of slots 0-100")
-        },
+        || replica.log().contains(&arrived),
     );
     std::fs::write(nodes[1].dir.join("stream-stall"), "").unwrap();
     std::fs::write(replica.dir.join(IGNORE_CLAIMS.1), &dst_id).unwrap();
@@ -10421,6 +10453,8 @@ fn a_replica_that_holds_what_arrived_is_given_the_slots_its_master_took_before_f
         Some(src_id.as_str()),
         "the replica took in its master's claim"
     );
+    // The destination's epoch is still the one what arrived was for.
+    assert_eq!(nodes[1].cluster_info("cluster_my_epoch"), reserved);
     nodes[1].kill();
     let live = [&nodes[0], &nodes[2], &replica];
     let logs = || -> String {
@@ -10965,21 +10999,22 @@ fn a_replica_holds_the_slots_its_master_took_when_bumpepoch_moved_its_epoch() {
     replica_follows_its_masters_claim_after_its_epoch_moved(EpochMoves::BumpEpoch);
 }
 
-/// The other side of the tests above: a claim at a newer epoch than the
-/// last one the replica read in its stream is of slots whose data it may
-/// not hold. Four masters, the source's slots all imported into the
-/// destination; its replica (taking in none of the destination's claims,
-/// `KIVIDB_TEST_IGNORE_CLAIMS`, `KIVIDB_TEST_IGNORE_STREAM_CLAIMS`) reads
-/// the takeover's `ARRIVED` and `TAKEN`, and acknowledges writes after it.
-/// Then it is cut off (`cut_off`) and marked failed; the slots go back to
-/// the source, take writes there, and are imported into the destination
-/// again, at a newer epoch. The destination fails and the cut heals: the
-/// voters tell the replica the destination's claims at that newer epoch,
-/// which it does not take, and it is not elected (the source, which owns no
-/// slots, has no vote, and the replica still counts it). The destination,
-/// back, owns the slots with every key and acknowledged write.
+/// The other side of the tests above, for a replica that has not taken its
+/// master's `TAKEN` into its table (`KIVIDB_TEST_IGNORE_CLAIMS`,
+/// `KIVIDB_TEST_IGNORE_STREAM_CLAIMS`): a claim the voters relay at a newer
+/// epoch than the last `TAKEN` it read is not taken in from the `UPDATE`
+/// (`master_claims_arrived`). Four masters, the source's slots all imported
+/// into the destination; the replica reads the takeover's `ARRIVED` and
+/// `TAKEN`, and acknowledges writes after it. Then it is cut off
+/// (`cut_off`) and marked failed; the slots go back to the source, take
+/// writes there, and are imported into the destination again, at a newer
+/// epoch. The destination fails and the cut heals: the voters tell the
+/// replica the destination's claims at that newer epoch, which it does not
+/// take, and it is not elected (the source, which owns no slots, has no
+/// vote, and the replica still counts it). The destination, back, owns the
+/// slots with every key and acknowledged write.
 #[test]
-fn a_replica_is_not_given_slots_its_master_took_again_while_it_was_cut_off() {
+fn an_update_at_a_newer_epoch_than_the_streams_claim_is_not_taken_in_by_a_replica_without_it() {
     let (mut nodes, ranges) = form_cluster_of(vec![
         Node::start(&[]),
         Node::start(&["--appendonly", "yes"]),
