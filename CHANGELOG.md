@@ -572,6 +572,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **io_uring workers finish a waiting socket read without interrupting the
+  worker (#1015).** Each worker's ring is made with
+  `IORING_SETUP_COOP_TASKRUN` (Linux 5.19 and later; on an older kernel the
+  ring is made without it): when the request for a read that waited
+  arrives, the kernel finishes the read at the worker's next system call,
+  which it makes on every turn of its loop, rather than interrupting a
+  running worker (an inter-processor interrupt, sent by the CPU that took
+  the request in, usually the client's); a sleeping worker is woken as
+  before. With one request in flight a connection that was 0.46 interrupts
+  a command. A client that waits for every reply, and is itself the limit,
+  gets more done: on an Azure `Standard_D8s_v5`, the server on vCPUs 0-3
+  (`--threads 4`; Redis 8.10.2 `--io-threads 4`), @keyv/redis's benchmark
+  shape (200,000 keys of 1 KB with a TTL, one `SET ... PX` then nine
+  `GET`s, each reply awaited) from 4 Node 24 threads on vCPUs 4-7, median of
+  5: 135.3k operations a second at 48 connections (master before it 129.5k,
+  v1.2.2 128.6k, Redis 136.3k), 137.6k at 16 (132.2k, 131.8k, Redis 133.1k);
+  the client's CPUs spend 4.3 µs a command in interrupts against 5.4 µs.
+  memtier_benchmark `SET`:`GET` 1:9 of 1 KB: 241.5k against 221.7k at
+  pipeline 1 and 50 connections, 1.64M against 1.45M at pipeline 16; every
+  pipelined row is level or ahead. The server's CPU at rest (0.003) and
+  under that load is unchanged: nothing spins. The tokio loop, which is
+  also what runs under Docker's default seccomp profile (it refuses
+  io_uring), is unchanged. See docs/PERFORMANCE.md, "Request-response from
+  many connections"; suite 49 of `benchmarks/1.3.0/regressions` measures it.
 - **A save keeps about 8 MiB of collections in memory a capture thread
   while the disk keeps up (#825).** A save lays out the values that are not strings when it
   captures the dataset, with writes held. For `dump.kdb` each capture thread

@@ -875,6 +875,74 @@ unpipelined `GET` from 50 connections fell by a third, from 91k a second (off) t
 rate limiter's p99 at rest went from 1.3 to 3.0 ms (at 100,000 background, 24.5k checks a
 second at 5.9 ms against 19.6k at 6.9 ms).
 
+## Request-response from many connections
+
+A client that waits for every reply before it sends the next command
+([#1015](https://github.com/kividbio/kividb/issues/1015)): @keyv/redis's own benchmark
+shape (jaredwray/keyv `storage/redis/benchmark`): 200,000 keys of 1 KB with a TTL, each
+connection one `SET ... PX` then nine `GET`s of its own share of the keys, every reply
+awaited and checked, from 4 Node 24 worker threads (`@keyv/redis` 6.1.0). Measured in
+November 2026 on one Azure `Standard_D8s_v5` (8 vCPUs, 4 cores of two hyper-threads):
+the server on vCPUs 0-3 (`--threads 4`, io_uring; Redis 8.10.2 and Valkey 9.1.3 with
+`--io-threads 4`), the client on 4-7, every KiviDB built with rustc 1.100.0 as releases
+are; operations a second, median of 5 runs of 10 s (range), and the p50 / p99 of one
+operation in microseconds:
+
+| connections | Redis 8.10.2 | Valkey 9.1.3 | v1.2.2 | master (43157786) | with this change |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 14.1k, 66 / 100 | 21.1k, 43 / 70 | 21.2k, 43 / 70 | 21.5k, 42 / 70 | 21.2k, 43 / 70 |
+| 4 | 47.4k, 77 / 146 | 63.9k, 55 / 116 | 60.1k, 60 / 117 | 60.0k, 60 / 116 | 59.5k, 61 / 116 |
+| 16 | 133.1k, 107 / 242 | 142.4k, 103 / 221 | 131.8k, 109 / 255 | 132.2k, 109 / 253 | **137.6k**, 104 / 248 |
+| 48 | 136.3k (134.5-137.5k), 362 / 988 | 143.6k, 273 / 1,057 | 128.6k (125.5-129.8k), 311 / 994 | 129.5k (125.3-130.1k), 308 / 990 | **135.3k** (133.0-135.6k), 293 / 970 |
+| 500 | 117.4k, 3,741 / 13,101 | 122.8k, 3,666 / 11,250 | 108.3k, 4,100 / 12,558 | 111.1k, 4,089 / 13,070 | 114.5k, 3,771 / 11,888 |
+
+At 500 connections every engine's runs spread by 10-30 %. The client is the limit
+throughout: its four CPUs are 99.5 % busy with every server, and the server is half idle
+(2.2 of its 4 CPUs at 48 connections, KiviDB and Redis alike; Valkey's I/O threads spin and
+use 3.5). So what the server costs the *client's* CPUs a request decides the rate. Counted
+over 6 s at 48 connections (`perf stat`, `/proc/interrupts`, `/proc/stat`):
+
+| per command | Redis | master | with this change | tokio loop (master) |
+|---|---:|---:|---:|---:|
+| client CPUs: user / system / irq + softirq, µs | 17.9 / 6.6 / 3.8 | 18.0 / 6.6 / **5.4** | 17.3 / 6.5 / **4.3** | 17.9 / 6.4 / 3.2 |
+| rescheduling interrupts on the server's CPUs | 0 | **0.46** | 0 | 0 |
+| server: `epoll_wait` + `io_uring_enter` | 0.90 + 0 | 1.38 + 1.38 | 1.29 + 1.29 | 0.35 + 0 |
+
+An io_uring read that finds no request waits in the kernel; when the request arrives, the
+kernel finishes it on the worker's own thread, and by default interrupts that thread at
+once if it is running (an inter-processor interrupt, about 0.46 a command here, sent from
+the CPU that took the request in: the client's, on loopback). On a VM an interrupt costs
+the sender several microseconds. KiviDB's workers now make their rings with
+`IORING_SETUP_COOP_TASKRUN` (Linux 5.19 and later): the read finishes at the worker's next
+system call, which it makes on every turn of its loop, and a sleeping worker is still
+woken. On an older kernel the ring is made without it.
+
+The tokio loop is unchanged; it is also what KiviDB runs under Docker's default seccomp
+profile, which refuses io_uring (the issue's own run was in Docker), and there it measured
+137.6-138.2k at 48 connections against Redis's 133.3-133.6k, each in a container on one
+bridge network.
+
+**Pipelined and memtier load.** memtier_benchmark (4 threads, or 2 at 50 connections, on
+vCPUs 4-7), `SET`:`GET` 1:9 of 1 KB over 200,000 keys, operations a second from the
+server's `total_commands_processed`, median of 5 runs of 10 s:
+
+| | master | with this change |
+|---|---:|---:|
+| pipeline 1, 50 connections | 221.7k | 241.5k |
+| pipeline 1, 500 connections | 246.3k | 270.6k |
+| pipeline 16, 50 connections | 1.45M | 1.64M |
+| pipeline 16, 500 connections | 1.41M | 1.48M |
+
+**CPU.** At rest the server uses 0.003 CPU with or without the change (30 s, no client);
+at 48 connections above, 1.87 CPUs (master) and 1.86 (with it). Nothing spins.
+
+A server that spins, as Valkey's I/O threads do, is answered faster still (143.6k at 48
+connections) because the client never has to wake it, at 3.5 CPUs for the same load.
+KiviDB does not spin by default.
+
+Suite `49-request-response` of `benchmarks/1.3.0/regressions` measures the same shape with a Python client of
+its own (see its [recorded run](../benchmarks/1.3.0/regressions/README.md#recorded-run-suite-49)).
+
 ## Probabilistic types on one key
 
 A type's commands on one key, `redis-benchmark -P 16 -c 50 -n 1000000` on one
