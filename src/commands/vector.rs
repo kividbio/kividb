@@ -1836,6 +1836,8 @@ pub(crate) struct FilteredKnn<'a> {
     live: &'a LiveIndex,
     query: crate::vector::PreparedQuery<'a>,
     best: Best,
+    /// The nearest of a FLAT index, from [`FilteredKnn::offer_every`].
+    found: Option<Vec<crate::vector::KnnResult>>,
 }
 
 impl<'a> FilteredKnn<'a> {
@@ -1849,6 +1851,7 @@ impl<'a> FilteredKnn<'a> {
             live,
             query: crate::vector::PreparedQuery::new(metric, query),
             best: Best::new(k),
+            found: None,
         }
     }
 
@@ -1858,9 +1861,8 @@ impl<'a> FilteredKnn<'a> {
         let dim = self.query.vector().len();
         let distance = match self.live {
             LiveIndex::Flat(idx) => {
-                let vectors = idx.vectors.read();
-                match vectors.get(key) {
-                    Some(v) if v.len() == dim => self.query.to_raw(v),
+                match idx.with_vector(key, |v| (v.len() == dim).then(|| self.query.to_raw(v))) {
+                    Some(Some(d)) => d,
                     _ => return,
                 }
             }
@@ -1899,15 +1901,10 @@ impl<'a> FilteredKnn<'a> {
         let mut seen = 0u32;
         match self.live {
             LiveIndex::Flat(idx) => {
-                let vectors = idx.vectors.read();
-                for (key, v) in vectors.iter() {
-                    if crate::commands::search::deadline_due(deadline, &mut seen) {
-                        return true;
-                    }
-                    if v.len() == dim {
-                        self.best.offer(self.query.to_raw(v), key);
-                    }
-                }
+                // The blocks in order, the lock let go between runs.
+                let (found, cut) = idx.nearest(&self.query, self.best.k, deadline);
+                self.found = Some(found);
+                return cut;
             }
             LiveIndex::Hnsw(idx) => {
                 // `nodes` before `key_to_id`, as the graph search and
@@ -1932,7 +1929,10 @@ impl<'a> FilteredKnn<'a> {
 
     /// The nearest, nearest first.
     pub(crate) fn nearest(self) -> Vec<crate::vector::KnnResult> {
-        self.best.into_sorted()
+        match self.found {
+            Some(found) => found,
+            None => self.best.into_sorted(),
+        }
     }
 }
 
@@ -1964,7 +1964,7 @@ impl Ord for Far {
 }
 
 impl Best {
-    fn new(k: usize) -> Self {
+    pub(crate) fn new(k: usize) -> Self {
         Self {
             k,
             heap: std::collections::BinaryHeap::with_capacity(k.min(4096) + 1),
@@ -1972,7 +1972,7 @@ impl Best {
     }
 
     #[inline]
-    fn offer(&mut self, distance: f32, key: &str) {
+    pub(crate) fn offer(&mut self, distance: f32, key: &str) {
         if self.heap.len() < self.k {
             self.heap.push(Far(distance, key.to_string()));
         } else if let Some(mut top) = self.heap.peek_mut()
@@ -1985,7 +1985,7 @@ impl Best {
         }
     }
 
-    fn into_sorted(self) -> Vec<crate::vector::KnnResult> {
+    pub(crate) fn into_sorted(self) -> Vec<crate::vector::KnnResult> {
         self.heap
             .into_sorted_vec()
             .into_iter()
@@ -2180,8 +2180,16 @@ pub(crate) fn knn_measured(
     metric: &crate::vector::DistanceMetric,
     deadline: Option<std::time::Instant>,
 ) -> (Vec<crate::vector::KnnResult>, bool) {
-    let keys = crate::commands::search::keys_of(def, ids);
     let query = crate::vector::PreparedQuery::new(metric, &knn.vector);
+    let graph = match live {
+        // From each id to its slot, in the order of the ids, as the keys
+        // were before: see `vector::flat`.
+        LiveIndex::Flat(idx) => {
+            return idx.nearest_of_docs(&query, knn.k, ids, &def.postings, deadline);
+        }
+        LiveIndex::Hnsw(graph) => graph,
+    };
+    let keys = crate::commands::search::keys_of(def, ids);
     let dim = knn.vector.len();
     let mut best = Best::new(knn.k);
     // The index's locks are let go between runs, for writers.
@@ -2192,50 +2200,35 @@ pub(crate) fn knn_measured(
             cut = true;
             break;
         }
-        match live {
-            LiveIndex::Flat(idx) => {
-                let vectors = idx.vectors.read();
-                for key in run {
-                    if let Some(v) = vectors.get(&**key)
-                        && v.len() == dim
-                    {
-                        best.offer(query.to_raw(v), key);
+        // A vector waiting to be linked is the key's latest: it is measured
+        // where it waits, and the graph not asked.
+        let mut run: Vec<&Arc<str>> = run.iter().collect();
+        if !graph.backlog.is_empty() {
+            let waiting = graph.backlog.read();
+            run.retain(|key| match waiting.get(&***key) {
+                Some(w) => {
+                    if w.vector.len() == dim {
+                        best.offer(query.to_unit(&w.vector), key);
                     }
+                    false
                 }
-            }
-            LiveIndex::Hnsw(graph) => {
-                // A vector waiting to be linked is the key's latest: it is
-                // measured where it waits, and the graph not asked.
-                let mut run: Vec<&Arc<str>> = run.iter().collect();
-                if !graph.backlog.is_empty() {
-                    let waiting = graph.backlog.read();
-                    run.retain(|key| match waiting.get(&***key) {
-                        Some(w) => {
-                            if w.vector.len() == dim {
-                                best.offer(query.to_unit(&w.vector), key);
-                            }
-                            false
-                        }
-                        None => true,
-                    });
-                }
-                // The two locks one after the other, never together: an
-                // insert takes the ids' for writing while it holds the
-                // nodes'.
-                let found: Vec<(usize, &Arc<str>)> = {
-                    let key_to_id = graph.key_to_id.read();
-                    run.into_iter()
-                        .filter_map(|key| key_to_id.get(&**key).map(|&id| (id, key)))
-                        .collect()
-                };
-                let nodes = graph.nodes.read();
-                for (id, key) in found {
-                    if let Some(v) = graph.vector_of(&nodes, id, key)
-                        && v.len() == dim
-                    {
-                        best.offer(query.to_unit(v), key);
-                    }
-                }
+                None => true,
+            });
+        }
+        // The two locks one after the other, never together: an insert
+        // takes the ids' for writing while it holds the nodes'.
+        let found: Vec<(usize, &Arc<str>)> = {
+            let key_to_id = graph.key_to_id.read();
+            run.into_iter()
+                .filter_map(|key| key_to_id.get(&**key).map(|&id| (id, key)))
+                .collect()
+        };
+        let nodes = graph.nodes.read();
+        for (id, key) in found {
+            if let Some(v) = graph.vector_of(&nodes, id, key)
+                && v.len() == dim
+            {
+                best.offer(query.to_unit(v), key);
             }
         }
     }
@@ -2351,6 +2344,8 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
         if keeps_keys {
             def.docs.add(key);
         }
+        // The id a FLAT index records for the document's slot.
+        let mut doc = None;
         for w in &work {
             let raw_bytes = match inner.get_bytes(&w.name) {
                 Some(b) => b,
@@ -2361,7 +2356,19 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
             };
 
             match &w.live {
-                LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
+                LiveIndex::Flat(idx) => {
+                    let doc = *doc.get_or_insert_with(|| {
+                        if keeps_keys {
+                            crate::vector::postings::NO_DOC
+                        } else {
+                            def.postings
+                                .peek()
+                                .id(key)
+                                .unwrap_or(crate::vector::postings::NO_DOC)
+                        }
+                    });
+                    idx.insert_doc(key, &vec, doc);
+                }
                 LiveIndex::Hnsw(idx) => {
                     crate::vector::hnsw_insert(idx, key.to_string(), vec, &w.metric);
                 }
