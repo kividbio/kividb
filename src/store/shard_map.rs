@@ -1080,12 +1080,13 @@ impl ShardMap {
     }
 
     /// `patch` written over `key`'s string from `offset`, the string grown
-    /// with zero bytes to reach it. In place when nothing but the table
-    /// holds the entry or its bytes, and the new length keeps their block
-    /// (`Entry::fits_in_place`); else a new string, the old bytes copied
-    /// once, with the key's time to live kept. A key not there, or past its
-    /// time, is an empty string. `None` leaves everything as it was: the
-    /// key holds another type, or the string would pass `MAX_LEN`.
+    /// with zero bytes to reach it. In place only when the table alone holds
+    /// both the entry and, for a string with a block of its own, its bytes,
+    /// and the new length keeps their block (`Entry::fits_in_place`). Else
+    /// a new string, the old bytes copied once, with the key's time to live
+    /// kept. A key not there, or past its time, is an empty string. `None`
+    /// leaves everything as it was: the key holds another type, or the
+    /// string would pass `MAX_LEN`.
     ///
     /// Nothing but byte copies runs between the first byte written in
     /// place and the last: no allocation, and nothing that can fail.
