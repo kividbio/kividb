@@ -11,8 +11,8 @@
 //! byte, then the shorter first, as Redis compares them), read through the
 //! entry. The index is [`CountedOrder`], a B+tree counted for rank
 //! (`counted_btree`): a rank, and a range by rank, are one walk down.
-//! [`BTreeOrder`], the `BTreeMap` the large form had, is the reference the
-//! tests compare it with.
+//! [`BTreeOrder`], a `BTreeMap` of `(score, entry)`, is the reference the
+//! tests compare it with (test builds only).
 //!
 //! # The one unsafe rule
 //!
@@ -51,16 +51,19 @@
 #![allow(dead_code)]
 
 use std::cmp::Ordering;
+#[cfg(test)]
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::collections::btree_map;
 use std::ops::Bound;
 use std::ptr::NonNull;
 
 use ordered_float::OrderedFloat;
 
+#[cfg(test)]
+use crate::collection_table::detached_scored_entry;
 use crate::collection_table::{
-    CollectionTable, EntryPool, Memory, Retired, Scores, TooLong, detached_scored_entry,
-    scored_member, scored_score,
+    CollectionTable, EntryPool, Memory, Retired, Scores, TooLong, scored_member, scored_score,
 };
 use crate::counted_btree::{self, CountedTree};
 
@@ -173,8 +176,8 @@ pub fn order(a: f64, a_member: &[u8], b: f64, b_member: &[u8]) -> Ordering {
 /// - An implementation holds each [`EntryRef`] from the `insert` that takes
 ///   it, or the `from_sorted` that gives it, to the `remove`, `pop_first`,
 ///   `pop_last` or refused `insert` that hands it back, or to its own drop,
-///   and no longer.
-/// - What it hands back it no longer holds: the reference given, or one it
+///   and not after.
+/// - It does not hold what it hands back: the reference given, or one it
 ///   held. It keeps no reference elsewhere; one made for a lookup is gone
 ///   when the call returns.
 /// - It reads a member's bytes only through references it holds, or that a
@@ -246,15 +249,17 @@ pub unsafe trait ScoreOrder: Default + Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// The reference index: the B-tree the large form had
+// The reference index, for the tests: a B-tree
 // ---------------------------------------------------------------------------
 
 /// A key of [`BTreeOrder`]: the member's score, and its entry (16 bytes).
+#[cfg(test)]
 struct Key {
     score: f64,
     entry: EntryRef,
 }
 
+#[cfg(test)]
 impl Ord for Key {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
@@ -271,6 +276,7 @@ impl Ord for Key {
     }
 }
 
+#[cfg(test)]
 impl PartialOrd for Key {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -278,6 +284,7 @@ impl PartialOrd for Key {
     }
 }
 
+#[cfg(test)]
 impl PartialEq for Key {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
@@ -285,18 +292,20 @@ impl PartialEq for Key {
     }
 }
 
+#[cfg(test)]
 impl Eq for Key {}
 
-/// [`ScoreOrder`] as a `BTreeMap` of `(score, entry)`: what the large form
-/// has had (a tree of `(score, member)`), with an 8-byte reference in place
-/// of the member's 16-byte `Arc`. Rank is a walk to the member (as before);
-/// a range by rank walks to its start from the nearer end. The tests check
-/// [`CountedOrder`] against it.
+/// [`ScoreOrder`] as a `BTreeMap` of `(score, entry)`, an 8-byte reference
+/// to each member. Rank is a walk to the member; a range by rank walks to
+/// its start from the nearer end. The tests check [`CountedOrder`] against
+/// it.
+#[cfg(test)]
 #[derive(Default)]
 pub struct BTreeOrder {
     map: BTreeMap<Key, ()>,
 }
 
+#[cfg(test)]
 impl BTreeOrder {
     /// A key to find `entry` at `score` by: a second reference, dropped
     /// when the call that uses it returns.
@@ -321,6 +330,7 @@ static EMPTY_MEMBER: [u64; 2] = [0, 0];
 /// keys as it compares two of them, with no call through a trait object.
 /// Its address is no table entry's, so it is never taken for one of them.
 #[inline]
+#[cfg(test)]
 fn probe_key(probe: &Probe<'_>, held: &mut Option<Box<[u64]>>) -> Key {
     let entry = if probe.member.is_empty() {
         NonNull::from(&EMPTY_MEMBER).cast::<u8>()
@@ -343,6 +353,7 @@ fn probe_key(probe: &Probe<'_>, held: &mut Option<Box<[u64]>>) -> Key {
 /// [`BTreeOrder`]'s iterator of ranks: the tree walked lazily from either
 /// end, as `keys()` walks it, the members outside the range of ranks stepped
 /// past on the first step from each end.
+#[cfg(test)]
 pub struct BTreeIter<'a> {
     keys: btree_map::Keys<'a, Key, ()>,
     skip_front: usize,
@@ -350,6 +361,7 @@ pub struct BTreeIter<'a> {
     left: usize,
 }
 
+#[cfg(test)]
 impl<'a> Iterator for BTreeIter<'a> {
     type Item = (f64, &'a EntryRef);
 
@@ -374,6 +386,7 @@ impl<'a> Iterator for BTreeIter<'a> {
     }
 }
 
+#[cfg(test)]
 impl DoubleEndedIterator for BTreeIter<'_> {
     #[inline(always)]
     fn next_back(&mut self) -> Option<Self::Item> {
@@ -392,10 +405,12 @@ impl DoubleEndedIterator for BTreeIter<'_> {
 }
 
 /// [`BTreeOrder`]'s iterator of a range of keys.
+#[cfg(test)]
 pub struct BTreeRange<'a> {
     range: btree_map::Range<'a, Key, ()>,
 }
 
+#[cfg(test)]
 impl<'a> Iterator for BTreeRange<'a> {
     type Item = (f64, &'a EntryRef);
 
@@ -410,6 +425,7 @@ impl<'a> Iterator for BTreeRange<'a> {
     }
 }
 
+#[cfg(test)]
 impl DoubleEndedIterator for BTreeRange<'_> {
     #[inline(always)]
     fn next_back(&mut self) -> Option<Self::Item> {
@@ -419,6 +435,7 @@ impl DoubleEndedIterator for BTreeRange<'_> {
     }
 }
 
+#[cfg(test)]
 impl BTreeOrder {
     #[inline]
     fn range_between(&self, from: Bound<Probe<'_>>, to: Bound<Probe<'_>>) -> BTreeRange<'_> {
@@ -442,6 +459,7 @@ impl BTreeOrder {
 // their own, never a table's), are dropped when the call returns. Members'
 // bytes are read only through keys in the map or the call's own. Scores are
 // the keys' own.
+#[cfg(test)]
 unsafe impl ScoreOrder for BTreeOrder {
     type Iter<'a> = BTreeIter<'a>;
     type Range<'a> = BTreeRange<'a>;
@@ -478,7 +496,7 @@ unsafe impl ScoreOrder for BTreeOrder {
         };
         // An equal key at `new`: back to its own, just freed.
         if self.insert(old, held).is_err() {
-            disagree("a member's own key was taken: the index lost it");
+            disagree("a member's own key was taken: the index is without it");
         }
         false
     }
@@ -580,7 +598,7 @@ pub struct CountedOrder(CountedTree<EntryRef>);
 //   tree is safe Rust, generic over a reference it can neither clone nor
 //   make: `EntryRef` is not `Clone`, and only this module makes one. So it
 //   moves, hands back or drops each reference, and never copies one.
-// - What it hands back it no longer holds: a refused insert returns the
+// - It does not hold what it hands back: a refused insert returns the
 //   reference untouched; a removal or pop takes it out of its leaf, and a
 //   removal's is the very reference asked for (compared by address).
 // - A build refuses only a member given twice, then dropped: never held.
@@ -675,8 +693,15 @@ unsafe impl ScoreOrder for CountedOrder {
 // The large form
 // ---------------------------------------------------------------------------
 
-/// The index broke its contract, a bug: called once the set is left safe.
+/// The index broke its contract: called once the set is left safe (no entry
+/// freed that the index may hold, no score written that it does not keep).
 /// Debug builds stop; release builds log it and go on.
+///
+/// A command has its reply, and what it propagates, from what the table
+/// says before the index is asked (a member is new, removed, or takes this
+/// score), so a refusal here does not change them. An index that keeps its
+/// contract, as both here do, never refuses a member the table holds once:
+/// the table holds each member once, so its key is never held twice.
 #[cold]
 fn disagree(what: &str) {
     #[cfg(test)]
@@ -689,6 +714,29 @@ fn disagree(what: &str) {
 thread_local! {
     /// How often this thread's sets found their index broken.
     static DISAGREED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Takes `entry`, at `score`, out of `index`: true if the index handed that
+/// very reference back, so the table may free the entry.
+#[inline]
+fn handed_back<O: ScoreOrder>(index: &mut O, score: f64, entry: NonNull<u8>) -> bool {
+    match index.remove(score, &EntryRef::new(entry)) {
+        Some(EntryRef(held)) if held == entry => true,
+        Some(other) => {
+            // Another member's, still in the table: back at its score.
+            let out = index.insert(other.score_in_entry(), other).is_err();
+            disagree(if out {
+                "the index handed back another member, then refused it: it is out"
+            } else {
+                "the index handed back another member: the one asked for is kept"
+            });
+            false
+        }
+        None => {
+            disagree("the index does not hold a member being removed: it is kept");
+            false
+        }
+    }
 }
 
 /// A large sorted set: the table of members and scores, and the index of
@@ -821,42 +869,28 @@ impl<O: ScoreOrder, A: Memory> Large<O, A> {
         }
     }
 
-    /// Remove a member; true if it was one.
+    /// Remove a member; true if it was one. One hash and one probe of the
+    /// table: the entry found is freed there once the index hands it back.
     pub fn remove(&mut self, member: &[u8]) -> bool {
-        let Some(entry) = self.table.entry(member) else {
-            return false;
-        };
-        // SAFETY: a live entry of the table.
-        let score = unsafe { scored_score(entry.as_ptr()) };
-        let removed = self.remove_held(score, entry);
+        let index = &mut self.index;
+        let removed = self.table.remove_scored_if(member, |entry| {
+            // SAFETY: a live entry of the table.
+            let score = unsafe { scored_score(entry.as_ptr()) };
+            handed_back(index, score, entry)
+        }) == Some(true);
         self.debug_check();
         removed
     }
 
     /// Out of the index, then freed, only if the index hands this entry back.
     fn remove_held(&mut self, score: f64, entry: NonNull<u8>) -> bool {
-        match self.index.remove(score, &EntryRef::new(entry)) {
-            Some(EntryRef(held)) if held == entry => {
-                // SAFETY: a live entry of the table; the index handed its
-                // reference back, and no other is left.
-                unsafe { self.table.remove_entry(entry) };
-                true
-            }
-            Some(other) => {
-                // Another member's, still in the table: back at its score.
-                let lost = self.index.insert(other.score_in_entry(), other).is_err();
-                disagree(if lost {
-                    "the index handed back another member, then refused it: it is out"
-                } else {
-                    "the index handed back another member: the one removed is kept"
-                });
-                false
-            }
-            None => {
-                disagree("the index does not hold a member removed: it is kept");
-                false
-            }
+        if !handed_back(&mut self.index, score, entry) {
+            return false;
         }
+        // SAFETY: a live entry of the table; the index handed its reference
+        // back, and no other is left.
+        unsafe { self.table.remove_entry(entry) };
+        true
     }
 
     /// Take out the member with the lowest score (`max`: the highest),
@@ -1713,7 +1747,7 @@ mod tests {
     // SAFETY: `O`'s, which each fault keeps: a refused insert hands back the
     // reference given; a refused rescore and a missed removal change
     // nothing; a member handed back in place of another is popped first, so
-    // no longer held.
+    // not held.
     unsafe impl<O: ScoreOrder> ScoreOrder for Faulty<O> {
         type Iter<'a>
             = O::Iter<'a>

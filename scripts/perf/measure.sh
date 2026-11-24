@@ -279,6 +279,28 @@ if [ "${WORKLOADS:-}" = zsets ]; then
           else if (op == "ZRANGEBYSCORE-EQ") {
             a[1] = "ZRANGEBYSCORE"; a[2] = "z"; a[3] = "0"; a[4] = "0"; a[5] = "LIMIT"; a[6] = "0"; a[7] = "10"; out(7)
           }
+          else if (op == "ZREVRANK") c(3, "ZREVRANK", "z", m(r))
+          else if (op == "ZCOUNT") c(4, "ZCOUNT", "z", sprintf("%d", r), sprintf("%d", r + 10000))
+          else if (op == "ZRANGEBYSCORE-LIMIT") {
+            a[1] = "ZRANGEBYSCORE"; a[2] = "z"; a[3] = sprintf("%d", r); a[4] = "+inf"; a[5] = "LIMIT"; a[6] = "0"; a[7] = "10"; out(7)
+          }
+          else if (op == "ZRANGEBYSCORE-OFFSET") {
+            a[1] = "ZRANGEBYSCORE"; a[2] = "z"; a[3] = "-inf"; a[4] = "+inf"; a[5] = "LIMIT"; a[6] = sprintf("%d", r); a[7] = "10"; out(7)
+          }
+          # New members, the set growing by n: past the highest score, and
+          # at a random score (a random place in the order).
+          else if (op == "ZADD-NEW-SEQ") { c(4, "ZADD", "z", sprintf("%d", top), m(top)); top++ }
+          else if (op == "ZADD-NEW-RAND") c(4, "ZADD", "z", sprintf("%.4f", rand() * size), sprintf("new:%d:%08d", seed, q))
+          # Members out of the set, each once (as many as it holds).
+          else if (op == "ZREM") c(3, "ZREM", "z", m((q * 7919 + seed * 104729) % size))
+          # A member moved from where it is to past the highest score.
+          else if (op == "ZINCRBY-MOVE") c(4, "ZINCRBY", "z", sprintf("%d", size * 4), m(r))
+          else if (op == "ZADD-NEW-EQ") c(4, "ZADD", "z", "0", sprintf("new:%d:%08d", seed, q))
+          else if (op == "ZREM-ZADD-EQ") { c(3, "ZREM", "z", m(r)); c(4, "ZADD", "z", "0", m(r)) }
+          else if (op == "ZRANGEBYLEX-EQ") {
+            a[1] = "ZRANGEBYLEX"; a[2] = "z"; a[3] = "[" m(r); a[4] = "+"; a[5] = "LIMIT"; a[6] = "0"; a[7] = "10"; out(7)
+          }
+          else if (op == "ZLEXCOUNT-EQ") c(4, "ZLEXCOUNT", "z", "[" m(r), "(" m(r + 10000))
         }
       }'
   }
@@ -286,7 +308,7 @@ if [ "${WORKLOADS:-}" = zsets ]; then
     for size in ${SIZES:-128 1000 100000 1000000}; do
       for op in ZADD-EXISTING ZREM-ZADD ZINCRBY ZSCORE ZRANK ZRANGE-0-9 ZRANGE-DEEP ZRANGEBYSCORE \
         ZPOPMIN-ZADD ZADD-ZREMRANGEBYRANK ZRANDMEMBER ZRANDMEMBER-10 GEOSEARCH ZADD-EXISTING-EQ \
-        ZRANK-EQ ZRANGEBYSCORE-EQ; do
+        ZRANK-EQ ZRANGEBYSCORE-EQ ZREVRANK ZCOUNT ZRANGEBYSCORE-LIMIT ZRANGEBYSCORE-OFFSET         ZADD-NEW-SEQ ZADD-NEW-RAND ZREM ZINCRBY-MOVE ZADD-NEW-EQ ZREM-ZADD-EQ ZRANGEBYLEX-EQ         ZLEXCOUNT-EQ; do
         load=load; [ "$op" = GEOSEARCH ] && load=geoload
         case $op in *-EQ) load=eqload ;; esac
         # A rank, and a range from a random rank, walk to it (a few hundred
@@ -295,6 +317,8 @@ if [ "${WORKLOADS:-}" = zsets ]; then
         # every tag (the same seed).
         n=$N
         case $op in ZRANK | ZRANK-EQ | ZRANGE-DEEP) [ "$size" -ge 1000000 ] && n=${NDEEP:-600} ;; esac
+        # The same for the rows that walk on a set of 100,000 or more.
+        case $op in ZREVRANK | ZCOUNT | ZRANGEBYSCORE-OFFSET | ZLEXCOUNT-EQ) [ "$size" -ge 100000 ] && n=${NDEEP:-600} ;; esac
         { zgen "$size" 1 0 "$load"; zgen "$size" 2 2000 "$op"; } > /tmp/z-warm
         zgen "$size" 3 "$n" "$op" > /tmp/z
         N=$n PIPEFILE=/tmp/z DSIZE=100 one "$tag" "$op-Z$size"

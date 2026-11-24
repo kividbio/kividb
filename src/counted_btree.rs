@@ -8,6 +8,7 @@
 
 use std::cmp::Ordering;
 use std::ops::Bound;
+use std::panic::{self, AssertUnwindSafe};
 
 use ordered_float::OrderedFloat;
 
@@ -15,6 +16,10 @@ use ordered_float::OrderedFloat;
 const CAP: usize = 32;
 /// A split leaves halves of at least this many.
 const MIN: usize = CAP / 2;
+/// What keys that come in order (each past every other, or before) leave in
+/// each node behind them: four short of full, so that the first keys to come
+/// between them later go in without a split.
+const PACK: usize = CAP - 4;
 
 /// Entries under a child: u64, so the tree sets no member limit.
 type Count = u64;
@@ -22,16 +27,40 @@ type Count = u64;
 /// Slots in use first, then empty ones.
 type Slots<T> = [Option<T>; CAP];
 
-/// A separator's score, and whether it is tied.
-type Sep = (f64, bool);
+/// A separator's score, whether it is tied, and for a tied one the lead of
+/// its next child's first member, if known.
+type Sep = (f64, bool, Lead);
 
-/// A missing slot reads as no member; `check` proves slots in use are full.
+/// A member's first 16 bytes, zeros after a shorter one's: leads order as
+/// their members do where they differ, and say nothing where they are equal.
+/// `None`: not known (an untied separator's, or one a removal's rebalancing
+/// made tied: it reads no member, so that a panic in a read cannot come
+/// after an entry is out); routing then reads the member.
+type Lead = Option<[u8; 16]>;
+
+/// An empty slot reads as no member; `check` proves slots in use are full.
 const EMPTY: &[u8] = &[];
 
 /// What the tree reads through a reference it holds.
 pub(crate) trait Member {
     /// The member's bytes: equal scores order by them.
     fn member(&self) -> &[u8];
+}
+
+/// Bytes a lookup is given are the member it looks for.
+impl Member for [u8] {
+    #[inline]
+    fn member(&self) -> &[u8] {
+        self
+    }
+}
+
+/// An entry on its way in, in the slot that holds it until it is placed.
+impl<R: Member> Member for Option<R> {
+    #[inline]
+    fn member(&self) -> &[u8] {
+        bytes(self)
+    }
 }
 
 /// Entries in (score, member) order, counted for rank.
@@ -70,6 +99,10 @@ struct Keys {
     counts: [Count; CAP],
     /// `seps[s]` lies between child `s` and child `s + 1`.
     seps: [f64; CAP - 1],
+    /// `leads[s]`: for a tied separator, its next child's first member's
+    /// lead, so routing among equal scores walks down to read a member only
+    /// where the leads are equal, or the lead is not known.
+    leads: [Lead; CAP - 1],
 }
 
 /// One tag for all of a node's children, which share a level.
@@ -90,6 +123,8 @@ struct Built<N> {
     node: Box<N>,
     count: Count,
     first: f64,
+    /// The first member's lead.
+    lead: Lead,
     last: f64,
 }
 
@@ -121,7 +156,7 @@ enum Target<'a, R> {
 struct Taken<R> {
     score: f64,
     r: R,
-    first: Option<f64>,
+    first: Option<(f64, Lead)>,
 }
 
 /// How a score change was made.
@@ -134,15 +169,16 @@ pub(crate) enum Rescore {
 }
 
 /// What a score change below asks of the nodes above.
-enum Rescoring {
+enum Rescoring<R> {
     /// Made in place. If the subtree's first or last entry changed, the score
     /// beside it, for the separator between them further up.
     InPlace {
-        first: Option<f64>,
-        last: Option<f64>,
+        first: Option<(f64, Lead)>,
+        last: Option<(f64, Lead)>,
     },
-    /// The new key passes a neighbour: the entry must move.
-    Moves,
+    /// The new key passes a neighbour: the entry is taken out, in the same
+    /// walk, to go back in at its new rank.
+    Taken(Taken<R>),
 }
 
 /// Entries of a range of ranks, in order, from either end.
@@ -165,8 +201,18 @@ trait Node {
     /// Moves `left`'s last entry or child here: its count, and the new separator.
     fn take_last_of(&mut self, left: &mut Self, between: Sep) -> Option<(Count, Sep)>;
     /// Moves `right`'s first `k` entries or children here, and `right` keeps one:
-    /// their count, and the new separator.
-    fn take_front_of(&mut self, right: &mut Self, k: usize, between: Sep) -> Option<(Count, Sep)>;
+    /// their count, and the new separator. `read`: a new separator between
+    /// entries may read a member for its lead (never during a removal).
+    fn take_front_of(
+        &mut self,
+        right: &mut Self,
+        k: usize,
+        between: Sep,
+        read: bool,
+    ) -> Option<(Count, Sep)>;
+    /// Moves `left`'s last `k` entries or children to the front here, and
+    /// `left` keeps one: their count, and the new separator.
+    fn take_back_of(&mut self, left: &mut Self, k: usize, between: Sep) -> Option<(Count, Sep)>;
     /// Moves all of `right` onto the end; false if nothing moved.
     fn absorb(&mut self, right: &mut Self, between: Sep) -> bool;
 }
@@ -327,24 +373,31 @@ impl<R> ExactSizeIterator for Iter<'_, R> {}
 impl<R: Member> CountedTree<R> {
     /// Adds the entry; if an equal one is present, `r` comes back.
     pub(crate) fn insert(&mut self, score: f64, r: R) -> Result<(), R> {
+        let mut slot = Some(r);
+        if self.place(score, &mut slot) {
+            return Ok(());
+        }
+        slot.map_or(Ok(()), Err)
+    }
+
+    /// Adds the entry in `slot`, taking it from there; false, the entry left
+    /// in `slot`, if an equal one is present. The root stays in place: a
+    /// split puts a new root over it.
+    ///
+    /// Each level reads the members it compares before it changes anything,
+    /// and finishes each change it starts, so a member read that panics
+    /// leaves every node whole, `len` right, and the entry in `slot`.
+    fn place(&mut self, score: f64, slot: &mut Option<R>) -> bool {
         let census = &mut self.census;
-        let mut root = match self.root.take() {
-            Some(root) => root,
-            None => Inner::first(census),
+        let root = self.root.get_or_insert_with(|| Inner::first(census));
+        let Some(split) = root.insert(score, slot, (true, true), census) else {
+            return false;
         };
-        let split = match root.insert(score, r, true, census) {
-            Ok(split) => split,
-            Err(r) => {
-                self.root = Some(root);
-                return Err(r);
-            }
-        };
-        self.root = Some(match split {
-            None => root,
-            Some(split) => Inner::above(root, split, census),
-        });
+        if let Some(split) = split {
+            Inner::grow(root, split, census);
+        }
         self.len += 1;
-        Ok(())
+        true
     }
 
     /// The tree of `sorted`, each key above the one before; else `sorted` comes back.
@@ -376,10 +429,12 @@ impl<R: Member> CountedTree<R> {
             }
             let (first, last) = (leaf.scores[0], leaf.scores[leaf.len() - 1]);
             let count = leaf.len() as Count;
+            let lead = lead(leaf.member(0));
             leaves.push(Built {
                 node: leaf,
                 count,
                 first,
+                lead,
                 last,
             });
         }
@@ -466,21 +521,41 @@ impl<R: Member + PartialEq> CountedTree<R> {
     }
 
     /// Moves the entry of `old` holding `r` itself to `new`: in place if it
-    /// keeps its rank, else out and back in. `None`, with nothing changed, if
-    /// no such entry is held or another holds `new` and the same member.
+    /// keeps its rank, else taken out on the way down and put back in at
+    /// `new`, two walks. `None` if no such entry is held, or if another
+    /// holds `new` and the same member: the entry is then at `old`, where
+    /// it was, in the same order.
     pub(crate) fn rescore(&mut self, old: f64, new: f64, r: &R) -> Option<Rescore> {
         let root = self.root.as_deref_mut()?;
-        match root.rescore((old, new), r, None, None)? {
-            Rescoring::InPlace { .. } => Some(Rescore::InPlace),
-            Rescoring::Moves => {
-                // Refused before anything moves, so a refusal changes nothing.
-                if self.rank(new, r.member()).is_ok() {
-                    return None;
-                }
-                let held = self.remove(old, r)?;
-                // The new key was free, so the reference goes back in.
-                self.insert(new, held).ok().map(|()| Rescore::Moved)
+        let held = match root.rescore((old, new), r, None, None, &mut self.census)? {
+            Rescoring::InPlace { .. } => return Some(Rescore::InPlace),
+            Rescoring::Taken(taken) => taken.r,
+        };
+        self.len -= 1;
+        self.shrink_root();
+        let mut slot = Some(held);
+        // A member read that panics leaves the entry in `slot`: it goes back
+        // to `old` before the panic goes on.
+        match panic::catch_unwind(AssertUnwindSafe(|| self.place(new, &mut slot))) {
+            Ok(true) => Some(Rescore::Moved),
+            Ok(false) => {
+                self.restore(old, &mut slot);
+                None
             }
+            Err(payload) => {
+                self.restore(old, &mut slot);
+                panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    /// Puts an entry taken out for a move back at `old`, its own key, which
+    /// its removal left free.
+    #[cold]
+    fn restore(&mut self, old: f64, slot: &mut Option<R>) {
+        if slot.is_some() {
+            let placed = self.place(old, slot);
+            debug_assert!(placed, "an entry's own key was taken");
         }
     }
 
@@ -548,7 +623,7 @@ impl<R> Leaf<R> {
         let r = self.refs[i].take()?;
         let score = self.scores[i];
         self.scores.copy_within(i + 1..n, i);
-        self.refs[i..n].rotate_left(1);
+        close(&mut self.refs[i..n], 1);
         self.len -= 1;
         Some((score, r))
     }
@@ -570,38 +645,60 @@ impl<R: Member> Leaf<R> {
         self.refs.get(i).map_or(EMPTY, bytes)
     }
 
-    /// True if `(score, member)` sorts after every entry here.
-    fn ends_before(&self, score: f64, member: &[u8]) -> bool {
+    /// True if `(score, key)` sorts after every entry here.
+    fn ends_before<K: Member + ?Sized>(&self, score: f64, key: &K) -> bool {
         self.last()
-            .is_some_and(|last| against(score, member, last).is_gt())
+            .is_some_and(|last| against(score, key, last).is_gt())
     }
 
-    fn search(&self, score: f64, member: &[u8]) -> Result<usize, usize> {
+    /// True if `(score, key)` sorts before every entry here.
+    fn starts_after<K: Member + ?Sized>(&self, score: f64, key: &K) -> bool {
+        self.get(0)
+            .is_some_and(|first| against(score, key, first).is_lt())
+    }
+
+    /// Where `(score, key)` is, or would go. The key's member is read only
+    /// if an entry here has its score.
+    fn search<K: Member + ?Sized>(&self, score: f64, key: &K) -> Result<usize, usize> {
         let (lo, hi) = equal_run(&self.scores[..self.len()], score);
+        if lo == hi {
+            return Err(lo);
+        }
+        let member = key.member();
         self.refs[lo..hi]
             .binary_search_by(|r| bytes(r).cmp(member))
             .map(|i| lo + i)
             .map_err(|i| lo + i)
     }
 
-    /// Adds the entry in order; a full leaf splits, giving its upper half.
-    fn insert(&mut self, score: f64, r: R) -> Result<Option<Split<Self>>, R> {
-        let i = match self.search(score, r.member()) {
-            Ok(_) => return Err(r),
-            Err(i) => i,
-        };
+    /// Adds the entry in `slot` in order, taking it from there; a full leaf
+    /// splits, giving its upper half. `None`, the entry left in `slot`, if an
+    /// equal one is here.
+    fn insert(&mut self, score: f64, slot: &mut Option<R>) -> Option<Option<Split<Self>>> {
+        let i = self.search(score, &*slot).err()?;
         if self.len() < CAP {
+            let r = slot.take()?;
             self.put(i, score, r);
-            return Ok(None);
+            return Some(None);
         }
+        // A split's upper half starts at entry MIN, whichever half the new
+        // one joins; its lead is read before anything changes.
+        let next = self.scores[MIN];
+        let tie = |s: f64| OrderedFloat(s) == OrderedFloat(next);
+        let next_lead = if tie(self.scores[MIN - 1]) || tie(score) {
+            lead(self.member(MIN))
+        } else {
+            NO_LEAD
+        };
+        let r = slot.take()?;
         let mut right = self.split_off();
         if i <= MIN {
             self.put(i, score, r);
         } else {
             right.put(i - MIN, score, r);
         }
-        Ok(Some(Split {
-            sep: sep_between(self.scores[self.len() - 1], right.scores[0]),
+        Some(Some(Split {
+            sep: sep_between(self.scores[self.len() - 1], right.scores[0], || next_lead),
             count: right.len() as Count,
             right,
         }))
@@ -612,27 +709,40 @@ impl<R: Member + PartialEq> Leaf<R> {
     fn remove(&mut self, target: Target<'_, R>) -> Option<Taken<R>> {
         let i = match target {
             Target::Entry(score, r) => {
-                let i = self.search(score, r.member()).ok()?;
+                let i = self.search(score, r).ok()?;
                 // Equal bytes are not enough: it must be the reference held.
                 (self.refs[i].as_ref() == Some(r)).then_some(i)?
             }
             Target::Rank(rank) => rank as usize,
         };
+        let first = self.next_first(i);
         let (score, r) = self.take(i)?;
-        let first = (i == 0 && self.len > 0).then(|| self.scores[0]);
         Some(Taken { score, r, first })
+    }
+
+    /// If entry `i` is the first, the next one's score and (if it ties with
+    /// the first, so a tied separator stays tied) its lead: what the leaf
+    /// starts with once `i` is out. Read before it goes.
+    fn next_first(&self, i: usize) -> Option<(f64, Lead)> {
+        if i != 0 || self.len() < 2 {
+            return None;
+        }
+        let (first, next) = (self.scores[0], self.scores[1]);
+        let tied = OrderedFloat(first) == OrderedFloat(next);
+        Some((next, if tied { lead(self.member(1)) } else { NO_LEAD }))
     }
 
     /// Writes `new` over the score of the entry of `old` holding `r`, if the
     /// new key stays between the entry's neighbours in the whole tree:
-    /// `before` and `after` are the subtrees beside this leaf.
+    /// `before` and `after` are the subtrees beside this leaf. Else takes
+    /// the entry out, for the caller to put back in at `new`.
     fn rescore(
         &mut self,
         (old, new): (f64, f64),
         r: &R,
         before: Option<Child<'_, R>>,
         after: Option<Child<'_, R>>,
-    ) -> Option<Rescoring> {
+    ) -> Option<Rescoring<R>> {
         let member = r.member();
         let i = self.search(old, member).ok()?;
         if self.refs[i].as_ref() != Some(r) {
@@ -651,42 +761,92 @@ impl<R: Member + PartialEq> Leaf<R> {
         };
         let past_below = below.is_none_or(|e| against(new, member, e).is_gt());
         if !past_below || above.is_some_and(|e| against(new, member, e).is_ge()) {
-            return Some(Rescoring::Moves);
+            let first = self.next_first(i);
+            let (score, r) = self.take(i)?;
+            return Some(Rescoring::Taken(Taken { score, r, first }));
         }
-        // Separators above see this leaf's first and last scores.
-        let first = below.filter(|_| at_start).map(|(score, _)| score);
-        let last = above.filter(|_| at_end).map(|(score, _)| score);
+        // Separators above see this leaf's first and last scores, and the
+        // leads they may need, read before the score is written.
+        let first = below.filter(|_| at_start).map(|(score, _)| {
+            let tied = OrderedFloat(score) == OrderedFloat(new);
+            (score, if tied { lead(member) } else { NO_LEAD })
+        });
+        // The next entry's member's lead, if a separator before it ties.
+        let last = above.filter(|_| at_end).map(|(score, e)| {
+            let tied = OrderedFloat(score) == OrderedFloat(new);
+            (score, if tied { lead(e.member()) } else { NO_LEAD })
+        });
         self.scores[i] = new;
         Some(Rescoring::InPlace { first, last })
     }
 }
 
-impl<R> Node for Leaf<R> {
+impl<R: Member> Node for Leaf<R> {
     fn fill(&self) -> usize {
         self.len()
     }
 
     fn take_last_of(&mut self, left: &mut Self, _: Sep) -> Option<(Count, Sep)> {
-        // `left` held more than MIN, so it keeps a last entry.
+        // `left` held more than MIN, so it keeps a last entry. A removal's:
+        // no member is read, so a tied separator's lead is not known.
         let (score, r) = left.take(left.len().checked_sub(1)?)?;
         self.put(0, score, r);
-        Some((1, sep_between(left.scores[left.len() - 1], score)))
+        Some((
+            1,
+            sep_between(left.scores[left.len() - 1], score, || NO_LEAD),
+        ))
     }
 
-    fn take_front_of(&mut self, right: &mut Self, k: usize, _: Sep) -> Option<(Count, Sep)> {
+    fn take_front_of(
+        &mut self,
+        right: &mut Self,
+        k: usize,
+        _: Sep,
+        read: bool,
+    ) -> Option<(Count, Sep)> {
         let (n, m) = (self.len(), right.len());
         if k == 0 || k >= m || n + k > CAP {
             return None;
         }
+        let tied = OrderedFloat(right.scores[k - 1]) == OrderedFloat(right.scores[k]);
+        let next_lead = if read && tied {
+            lead(right.member(k))
+        } else {
+            NO_LEAD
+        };
         self.scores[n..n + k].copy_from_slice(&right.scores[..k]);
         shift(&mut self.refs[n..n + k], &mut right.refs[..k]);
         right.scores.copy_within(k..m, 0);
-        right.refs[..m].rotate_left(k);
+        close(&mut right.refs[..m], k);
         self.len += k as u8;
         right.len -= k as u8;
         Some((
             k as Count,
-            sep_between(self.scores[n + k - 1], right.scores[0]),
+            sep_between(self.scores[n + k - 1], right.scores[0], || next_lead),
+        ))
+    }
+
+    fn take_back_of(&mut self, left: &mut Self, k: usize, _: Sep) -> Option<(Count, Sep)> {
+        let (n, m) = (self.len(), left.len());
+        if k == 0 || k >= m || n + k > CAP {
+            return None;
+        }
+        // An insert's: the lead is read before anything moves.
+        let tied = OrderedFloat(left.scores[m - k - 1]) == OrderedFloat(left.scores[m - k]);
+        let next_lead = if tied {
+            lead(left.member(m - k))
+        } else {
+            NO_LEAD
+        };
+        self.scores.copy_within(0..n, k);
+        open(&mut self.refs[..n + k], k);
+        self.scores[..k].copy_from_slice(&left.scores[m - k..m]);
+        shift(&mut self.refs[..k], &mut left.refs[m - k..m]);
+        self.len += k as u8;
+        left.len -= k as u8;
+        Some((
+            k as Count,
+            sep_between(left.scores[m - k - 1], self.scores[0], || next_lead),
         ))
     }
 
@@ -716,23 +876,26 @@ impl<R> Inner<R> {
         })
     }
 
-    /// A new root over the old one and its new upper half.
-    fn above(left: Box<Self>, split: Split<Self>, census: &mut Census) -> Box<Self> {
+    /// Puts a new root over `root` and its new upper half, where `root` was.
+    fn grow(root: &mut Box<Self>, split: Split<Self>, census: &mut Census) {
         census.inners += 1;
         let mut keys = Keys {
             len: 2,
             ..Keys::default()
         };
-        keys.counts[0] = left.keys.total();
+        keys.counts[0] = root.keys.total();
         keys.counts[1] = split.count;
         keys.set_sep(0, split.sep);
         let mut kids = [const { None }; CAP];
-        kids[0] = Some(left);
         kids[1] = Some(split.right);
-        Box::new(Inner {
+        let above = Box::new(Inner {
             keys,
             children: Children::Inners(kids),
-        })
+        });
+        let left = std::mem::replace(root, above);
+        if let Children::Inners(kids) = &mut root.children {
+            kids[0] = Some(left);
+        }
     }
 
     fn child(&self, c: usize) -> Option<Child<'_, R>> {
@@ -771,63 +934,86 @@ impl<R> Inner<R> {
 }
 
 impl<R: Member> Inner<R> {
-    /// The child whose keys `(score, member)` falls among.
-    fn route(&self, score: f64, member: &[u8]) -> usize {
+    /// The child whose keys `(score, key)` falls among. The key's member is
+    /// read only if a separator has its score.
+    fn route<K: Member + ?Sized>(&self, score: f64, key: &K) -> usize {
         let seps = &self.keys.seps[..self.keys.len().saturating_sub(1)];
         let (lo, hi) = equal_run(seps, score);
-        // Past an untied separator; past a tied one unless below its child.
+        if lo == hi {
+            return lo;
+        }
+        let member = key.member();
+        let mine = lead_bytes(member);
+        // Past an untied separator; past a tied one unless below its child:
+        // by the leads, and where they are equal (or one is not known) by
+        // the member itself.
         partition(lo, hi, |s| {
-            !self.keys.tied(s) || member >= self.children.first_member(s + 1)
+            if !self.keys.tied(s) {
+                return true;
+            }
+            match self.keys.leads[s].map(|lead| mine.cmp(&lead)) {
+                Some(Ordering::Greater) => true,
+                Some(Ordering::Less) => false,
+                _ => member >= self.children.first_member(s + 1),
+            }
         })
     }
 
-    /// Adds the entry below; a full node splits, giving its upper half.
-    /// `edge`: this node is last at every level above it.
+    /// Adds the entry in `slot` below, taking it from there; a full node
+    /// splits, giving its upper half. `None`, the entry left in `slot`, if
+    /// an equal one is held. `edges`: this node is first, and last, at every
+    /// level above it.
     fn insert(
         &mut self,
         score: f64,
-        r: R,
-        edge: bool,
+        slot: &mut Option<R>,
+        (first, last): (bool, bool),
         census: &mut Census,
-    ) -> Result<Option<Split<Self>>, R> {
-        let c = self.route(score, r.member());
-        // A key past every other goes to the last child at every level.
-        let edge = edge && c + 1 == self.keys.len();
+    ) -> Option<Option<Split<Self>>> {
+        let c = self.route(score, &*slot);
+        // A key past every other goes to the last child at every level, and
+        // one before every other to the first.
+        let (first, last) = (first && c == 0, last && c + 1 == self.keys.len());
         let keys = &mut self.keys;
         let half = match &mut self.children {
             Children::Leaves(kids) => {
-                if edge {
-                    lend(keys, kids, c, |leaf| leaf.ends_before(score, r.member()));
+                if last {
+                    lend(keys, kids, c, |leaf| leaf.ends_before(score, &*slot));
                 }
-                let Some(leaf) = kids.get_mut(c).and_then(Option::as_mut) else {
-                    return Err(r);
-                };
-                let split = leaf.insert(score, r)?;
+                if first {
+                    lend_back(keys, kids, |leaf| leaf.starts_after(score, &*slot));
+                }
+                let leaf = kids.get_mut(c)?.as_mut()?;
+                let split = leaf.insert(score, slot)?;
                 census.leaves += usize::from(split.is_some());
                 adopt(keys, kids, c, split)
                     .map(|(sep, right, kids)| (sep, right, Children::Leaves(kids)))
             }
             Children::Inners(kids) => {
-                if edge {
+                if last {
                     lend(keys, kids, c, |inner| {
-                        let last = inner.end_leaf(true);
-                        last.is_some_and(|leaf| leaf.ends_before(score, r.member()))
+                        let end = inner.end_leaf(true);
+                        end.is_some_and(|leaf| leaf.ends_before(score, &*slot))
                     });
                 }
-                let Some(inner) = kids.get_mut(c).and_then(Option::as_mut) else {
-                    return Err(r);
-                };
-                let split = inner.insert(score, r, edge, census)?;
+                if first {
+                    lend_back(keys, kids, |inner| {
+                        let end = inner.end_leaf(false);
+                        end.is_some_and(|leaf| leaf.starts_after(score, &*slot))
+                    });
+                }
+                let inner = kids.get_mut(c)?.as_mut()?;
+                let split = inner.insert(score, slot, (first, last), census)?;
                 adopt(keys, kids, c, split)
                     .map(|(sep, right, kids)| (sep, right, Children::Inners(kids)))
             }
         };
         let Some((sep, keys, children)) = half else {
-            return Ok(None);
+            return Some(None);
         };
         census.inners += 1;
         let right = Box::new(Inner { keys, children });
-        Ok(Some(Split {
+        Some(Some(Split {
             sep,
             count: right.keys.total(),
             right,
@@ -839,7 +1025,7 @@ impl<R: Member + PartialEq> Inner<R> {
     /// Takes the target out below, then refills the child it left short.
     fn remove(&mut self, target: Target<'_, R>, census: &mut Census) -> Option<Taken<R>> {
         let (c, target) = match target {
-            Target::Entry(score, r) => (self.route(score, r.member()), Target::Entry(score, r)),
+            Target::Entry(score, r) => (self.route(score, r), Target::Entry(score, r)),
             Target::Rank(mut rank) => (self.child_holding(&mut rank)?, Target::Rank(rank)),
         };
         let keys = &mut self.keys;
@@ -863,45 +1049,74 @@ impl<R: Member + PartialEq> Inner<R> {
     }
 
     /// Moves the entry of `old` holding `r` to `new` below, in place if it
-    /// keeps its rank; `before` and `after`: the subtrees beside this one.
+    /// keeps its rank, else takes it out as `remove` does; `before` and
+    /// `after`: the subtrees beside this one.
     fn rescore(
         &mut self,
         (old, new): (f64, f64),
         r: &R,
         before: Option<Child<'_, R>>,
         after: Option<Child<'_, R>>,
-    ) -> Option<Rescoring> {
-        let c = self.route(old, r.member());
+        census: &mut Census,
+    ) -> Option<Rescoring<R>> {
+        let c = self.route(old, r);
         let n = self.keys.len();
+        let keys = &mut self.keys;
         // The child's siblings are borrowed beside it: the nearest neighbours.
-        let mut step = match &mut self.children {
+        let step = match &mut self.children {
             Children::Leaves(kids) => {
-                let (left, child, right) = beside(kids, c)?;
-                let before = left.map(Child::Leaf).or(before);
-                let after = right.map(Child::Leaf).or(after);
-                child.rescore((old, new), r, before, after)?
+                let step = {
+                    let (left, child, right) = beside(kids, c)?;
+                    let before = left.map(Child::Leaf).or(before);
+                    let after = right.map(Child::Leaf).or(after);
+                    child.rescore((old, new), r, before, after)?
+                };
+                if let Rescoring::Taken(taken) = &step {
+                    keys.removed(c, taken.first);
+                    census.leaves -= usize::from(refill(keys, kids, c));
+                }
+                step
             }
             Children::Inners(kids) => {
-                let (left, child, right) = beside(kids, c)?;
-                let before = left.map(Child::Inner).or(before);
-                let after = right.map(Child::Inner).or(after);
-                child.rescore((old, new), r, before, after)?
+                let step = {
+                    let (left, child, right) = beside(kids, c)?;
+                    let before = left.map(Child::Inner).or(before);
+                    let after = right.map(Child::Inner).or(after);
+                    child.rescore((old, new), r, before, after, census)?
+                };
+                if let Rescoring::Taken(taken) = &step {
+                    keys.removed(c, taken.first);
+                    census.inners -= usize::from(refill(keys, kids, c));
+                }
+                step
             }
         };
-        // The separator beside a changed first or last entry is the nearest one.
-        if let Rescoring::InPlace { first, last } = &mut step {
-            if c > 0
-                && let Some(below) = first.take()
-            {
-                self.keys.set_sep(c - 1, sep_between(below, new));
+        match step {
+            // The separator beside a changed first or last entry is the nearest one.
+            Rescoring::InPlace {
+                mut first,
+                mut last,
+            } => {
+                if c > 0
+                    && let Some(below) = first.take()
+                {
+                    let (score, lead) = below;
+                    keys.set_sep(c - 1, sep_between(score, new, || lead));
+                }
+                if c + 1 < n
+                    && let Some(above) = last.take()
+                {
+                    let (score, next) = above;
+                    keys.set_sep(c, sep_between(new, score, || next));
+                }
+                Some(Rescoring::InPlace { first, last })
             }
-            if c + 1 < n
-                && let Some(above) = last.take()
-            {
-                self.keys.set_sep(c, sep_between(new, above));
+            // This subtree's first entry changed only if its first child's did.
+            Rescoring::Taken(taken) => {
+                let first = taken.first.filter(|_| c == 0);
+                Some(Rescoring::Taken(Taken { first, ..taken }))
             }
         }
-        Some(step)
     }
 }
 
@@ -920,7 +1135,13 @@ impl<R> Node for Inner<R> {
         Some((count, up))
     }
 
-    fn take_front_of(&mut self, right: &mut Self, k: usize, between: Sep) -> Option<(Count, Sep)> {
+    fn take_front_of(
+        &mut self,
+        right: &mut Self,
+        k: usize,
+        between: Sep,
+        _: bool,
+    ) -> Option<(Count, Sep)> {
         let (n, rn) = (self.keys.len(), right.keys.len());
         if n == 0 || k == 0 || k >= rn || n + k > CAP {
             return None;
@@ -929,6 +1150,17 @@ impl<R> Node for Inner<R> {
             return None;
         }
         Some(self.keys.take_front(&mut right.keys, k, between))
+    }
+
+    fn take_back_of(&mut self, left: &mut Self, k: usize, between: Sep) -> Option<(Count, Sep)> {
+        let (n, ln) = (self.keys.len(), left.keys.len());
+        if n == 0 || k == 0 || k >= ln || n + k > CAP {
+            return None;
+        }
+        if !self.children.take_back(n, &mut left.children, k, ln) {
+            return None;
+        }
+        Some(self.keys.take_back(&mut left.keys, k, between))
     }
 
     fn absorb(&mut self, right: &mut Self, between: Sep) -> bool {
@@ -969,11 +1201,30 @@ impl<R> Children<R> {
         match (self, from) {
             (Children::Leaves(to), Children::Leaves(from)) => {
                 shift(&mut to[n..n + k], &mut from[..k]);
-                from[..from_n].rotate_left(k);
+                close(&mut from[..from_n], k);
             }
             (Children::Inners(to), Children::Inners(from)) => {
                 shift(&mut to[n..n + k], &mut from[..k]);
-                from[..from_n].rotate_left(k);
+                close(&mut from[..from_n], k);
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
+impl<R> Children<R> {
+    /// Moves the last `k` of `from`'s first `from_n` children before this
+    /// node's first `n`.
+    fn take_back(&mut self, n: usize, from: &mut Self, k: usize, from_n: usize) -> bool {
+        match (self, from) {
+            (Children::Leaves(to), Children::Leaves(from)) => {
+                open(&mut to[..n + k], k);
+                shift(&mut to[..k], &mut from[from_n - k..from_n]);
+            }
+            (Children::Inners(to), Children::Inners(from)) => {
+                open(&mut to[..n + k], k);
+                shift(&mut to[..k], &mut from[from_n - k..from_n]);
             }
             _ => return false,
         }
@@ -1007,11 +1258,12 @@ impl Keys {
     }
 
     fn sep(&self, s: usize) -> Sep {
-        (self.seps[s], self.tied(s))
+        (self.seps[s], self.tied(s), self.leads[s])
     }
 
-    fn set_sep(&mut self, s: usize, (score, tied): Sep) {
+    fn set_sep(&mut self, s: usize, (score, tied, lead): Sep) {
         self.seps[s] = score;
+        self.leads[s] = lead;
         self.ties = (self.ties & !(1 << s)) | (u32::from(tied) << s);
     }
 
@@ -1020,12 +1272,14 @@ impl Keys {
     }
 
     /// Adds a child's count at `i` and a separator at `s`; there is room.
-    fn insert(&mut self, i: usize, count: Count, s: usize, (score, tied): Sep) {
+    fn insert(&mut self, i: usize, count: Count, s: usize, (score, tied, lead): Sep) {
         let n = self.len();
         self.counts.copy_within(i..n, i + 1);
         self.counts[i] = count;
         self.seps.copy_within(s..n - 1, s + 1);
         self.seps[s] = score;
+        self.leads.copy_within(s..n - 1, s + 1);
+        self.leads[s] = lead;
         let below = self.ties & ((1 << s) - 1);
         self.ties = below | (u32::from(tied) << s) | ((self.ties ^ below) << 1);
         self.len += 1;
@@ -1037,6 +1291,7 @@ impl Keys {
         let (count, sep) = (self.counts[i], self.sep(s));
         self.counts.copy_within(i + 1..n, i);
         self.seps.copy_within(s + 1..n - 1, s);
+        self.leads.copy_within(s + 1..n - 1, s);
         let below = self.ties & ((1 << s) - 1);
         self.ties = below | ((self.ties >> (s + 1)) << s);
         self.len -= 1;
@@ -1048,6 +1303,7 @@ impl Keys {
         let (n, m) = (self.len(), right.len());
         self.counts[n..n + m].copy_from_slice(&right.counts[..m]);
         self.seps[n..n + m - 1].copy_from_slice(&right.seps[..m - 1]);
+        self.leads[n..n + m - 1].copy_from_slice(&right.leads[..m - 1]);
         self.set_sep(n - 1, between);
         self.ties |= right.ties << n;
         self.len += right.len;
@@ -1059,27 +1315,56 @@ impl Keys {
         let (n, m) = (self.len(), right.len());
         self.counts[n..n + k].copy_from_slice(&right.counts[..k]);
         self.seps[n..n + k - 1].copy_from_slice(&right.seps[..k - 1]);
+        self.leads[n..n + k - 1].copy_from_slice(&right.leads[..k - 1]);
         self.set_sep(n - 1, between);
         self.ties |= (right.ties & ((1 << (k - 1)) - 1)) << n;
         let up = right.sep(k - 1);
         right.counts.copy_within(k..m, 0);
         right.seps.copy_within(k..m - 1, 0);
+        right.leads.copy_within(k..m - 1, 0);
         right.ties >>= k;
         self.len += k as u8;
         right.len -= k as u8;
         (self.counts[n..n + k].iter().sum(), up)
     }
 
-    /// Counts an entry gone from child `c`, whose first score may now be `first`.
-    fn removed(&mut self, c: usize, first: Option<f64>) {
+    /// Takes in the keys of `left`'s last `k` children before these, `between`
+    /// after them. Gives their count, and the separator now after `left`.
+    fn take_back(&mut self, left: &mut Keys, k: usize, between: Sep) -> (Count, Sep) {
+        let (n, m) = (self.len(), left.len());
+        self.counts.copy_within(0..n, k);
+        self.counts[..k].copy_from_slice(&left.counts[m - k..m]);
+        self.seps.copy_within(0..n - 1, k);
+        self.seps[..k - 1].copy_from_slice(&left.seps[m - k..m - 1]);
+        self.leads.copy_within(0..n - 1, k);
+        self.leads[..k - 1].copy_from_slice(&left.leads[m - k..m - 1]);
+        let moved = (left.ties >> (m - k)) & ((1 << (k - 1)) - 1);
+        self.ties = (self.ties << k) | moved;
+        self.set_sep(k - 1, between);
+        let up = left.sep(m - k - 1);
+        left.ties &= (1 << (m - k - 1)) - 1;
+        left.len -= k as u8;
+        self.len += k as u8;
+        (self.counts[..k].iter().sum(), up)
+    }
+
+    /// Counts an entry gone from child `c`, whose first score may now be
+    /// `first`, with its lead if that ties with the one before.
+    fn removed(&mut self, c: usize, first: Option<(f64, Lead)>) {
         self.counts[c] -= 1;
-        // A tied separator must stay its next child's first score.
-        if let (Some(s), Some(first)) = (c.checked_sub(1), first)
-            && self.tied(s)
-            && OrderedFloat(self.seps[s]) != OrderedFloat(first)
-        {
-            // The scores before it are at most the old one, so below `first`.
-            self.set_sep(s, (first, false));
+        let (Some(s), Some((first, lead))) = (c.checked_sub(1), first) else {
+            return;
+        };
+        if !self.tied(s) {
+            return;
+        }
+        if OrderedFloat(self.seps[s]) != OrderedFloat(first) {
+            // A tied separator must stay its next child's first score. The
+            // scores before it are at most the old one, so below `first`.
+            self.set_sep(s, (first, false, NO_LEAD));
+        } else {
+            // Tied still, before another member.
+            self.leads[s] = lead;
         }
     }
 
@@ -1093,6 +1378,7 @@ impl Keys {
         };
         right.counts[..n - MIN].copy_from_slice(&self.counts[MIN..n]);
         right.seps[..n - MIN - 1].copy_from_slice(&self.seps[MIN..n - 1]);
+        right.leads[..n - MIN - 1].copy_from_slice(&self.leads[MIN..n - 1]);
         let between = self.sep(MIN - 1);
         self.ties &= (1 << (MIN - 1)) - 1;
         self.len = MIN as u8;
@@ -1126,7 +1412,7 @@ fn adopt<N>(
 }
 
 /// Before an append to full child `c`, fills the child before it from `c`'s front.
-/// Nodes left behind the right edge end full; halving would leave them half full.
+/// Nodes left behind the right edge end `PACK` full; halving would leave them half full.
 fn lend<N: Node>(
     keys: &mut Keys,
     kids: &mut Slots<Box<N>>,
@@ -1139,15 +1425,33 @@ fn lend<N: Node>(
     let Some((left, right)) = pair(kids, b) else {
         return;
     };
-    let room = CAP.saturating_sub(left.fill());
+    let room = PACK.saturating_sub(left.fill());
     if room == 0 || right.fill() < CAP || !past(right) {
         return;
     }
-    // `left` holds at least MIN, so `right` keeps at least MIN.
-    if let Some((count, sep)) = left.take_front_of(right, room, keys.sep(b)) {
+    // `left` holds at least MIN, so `right` keeps more than MIN.
+    if let Some((count, sep)) = left.take_front_of(right, room, keys.sep(b), true) {
         keys.counts[b] += count;
         keys.counts[c] -= count;
         keys.set_sep(b, sep);
+    }
+}
+
+/// Before an insert at the front of full child 0, fills child 1 from 0's back,
+/// so nodes left behind the left edge end `PACK` full too.
+fn lend_back<N: Node>(keys: &mut Keys, kids: &mut Slots<Box<N>>, before: impl FnOnce(&N) -> bool) {
+    let Some((left, right)) = pair(kids, 0) else {
+        return;
+    };
+    let room = PACK.saturating_sub(right.fill());
+    if room == 0 || left.fill() < CAP || !before(left) {
+        return;
+    }
+    // `right` holds at least MIN, so `left` keeps more than MIN.
+    if let Some((count, sep)) = right.take_back_of(left, room, keys.sep(0)) {
+        keys.counts[0] -= count;
+        keys.counts[1] += count;
+        keys.set_sep(0, sep);
     }
 }
 
@@ -1162,10 +1466,11 @@ fn place<N>(keys: &mut Keys, kids: &mut Slots<Box<N>>, c: usize, split: Split<N>
 fn refill<N: Node>(keys: &mut Keys, kids: &mut Slots<Box<N>>, c: usize) -> bool {
     let n = keys.len();
     let fill = |i: usize| kids.get(i).and_then(Option::as_deref).map(N::fill);
-    let (here, left, right) = (fill(c), c.checked_sub(1).and_then(fill), fill(c + 1));
-    if here.is_none_or(|here| here >= MIN) {
+    // Most removals leave the child at MIN or more: its siblings are not read.
+    if fill(c).is_none_or(|here| here >= MIN) {
         return false;
     }
+    let (left, right) = (c.checked_sub(1).and_then(fill), fill(c + 1));
     if left.is_some_and(|left| left > MIN) {
         if let Some((left, child)) = pair(kids, c - 1)
             && let Some((count, sep)) = child.take_last_of(left, keys.sep(c - 1))
@@ -1178,7 +1483,7 @@ fn refill<N: Node>(keys: &mut Keys, kids: &mut Slots<Box<N>>, c: usize) -> bool 
     }
     if right.is_some_and(|right| right > MIN) {
         if let Some((child, right)) = pair(kids, c)
-            && let Some((count, sep)) = child.take_front_of(right, 1, keys.sep(c))
+            && let Some((count, sep)) = child.take_front_of(right, 1, keys.sep(c), false)
         {
             keys.counts[c] += count;
             keys.counts[c + 1] -= count;
@@ -1200,8 +1505,8 @@ fn refill<N: Node>(keys: &mut Keys, kids: &mut Slots<Box<N>>, c: usize) -> bool 
     }
     let (count, _) = keys.remove(a + 1, a);
     keys.counts[a] += count;
-    kids[a + 1..n].rotate_left(1);
-    kids[n - 1] = None;
+    kids[a + 1] = None;
+    close(&mut kids[a + 1..n], 1);
     true
 }
 
@@ -1214,11 +1519,11 @@ fn pair<N>(kids: &mut Slots<Box<N>>, a: usize) -> Option<(&mut N, &mut N)> {
     ))
 }
 
-/// How `(score, member)` sorts against the entry `(s, r)`, whose member is
-/// read only if the scores tie.
-fn against<R: Member>(score: f64, member: &[u8], (s, r): (f64, &R)) -> Ordering {
+/// How `(score, key)` sorts against the entry `(s, r)`: members are read
+/// only if the scores tie.
+fn against<K: Member + ?Sized, R: Member>(score: f64, key: &K, (s, r): (f64, &R)) -> Ordering {
     let scores = OrderedFloat(score).cmp(&OrderedFloat(s));
-    scores.then_with(|| member.cmp(r.member()))
+    scores.then_with(|| key.member().cmp(r.member()))
 }
 
 /// Child `c` to change, and the siblings either side of it to read.
@@ -1230,9 +1535,31 @@ fn beside<N>(kids: &mut Slots<Box<N>>, c: usize) -> Option<(Option<&N>, &mut N, 
     Some((left, here.as_deref_mut()?, right))
 }
 
-/// The separator before `first`, tied if `last` before it has its score.
-fn sep_between(last: f64, first: f64) -> Sep {
-    (first, OrderedFloat(last) == OrderedFloat(first))
+/// The separator before `first`, tied if `last` before it has its score;
+/// `lead` is asked only then.
+fn sep_between(last: f64, first: f64, lead: impl FnOnce() -> Lead) -> Sep {
+    if OrderedFloat(last) == OrderedFloat(first) {
+        (first, true, lead())
+    } else {
+        (first, false, NO_LEAD)
+    }
+}
+
+/// No lead: an untied separator's, or one not known.
+const NO_LEAD: Lead = None;
+
+/// `member`'s first 16 bytes, zeros after.
+#[inline]
+fn lead(member: &[u8]) -> Lead {
+    Some(lead_bytes(member))
+}
+
+#[inline]
+fn lead_bytes(member: &[u8]) -> [u8; 16] {
+    let mut lead = [0; 16];
+    let n = member.len().min(lead.len());
+    lead[..n].copy_from_slice(&member[..n]);
+    lead
 }
 
 /// Sizes of the fewest nodes that hold `n`, as even as can be.
@@ -1254,12 +1581,12 @@ fn group<N, R>(
     for size in spread(n) {
         let mut keys = Keys::default();
         let mut slots = [const { None }; CAP];
-        let (mut first, mut last) = (0.0, 0.0);
+        let (mut first, mut lead, mut last) = (0.0, NO_LEAD, 0.0);
         for (c, kid) in (0..size).zip(&mut kids) {
             if c == 0 {
-                first = kid.first;
+                (first, lead) = (kid.first, kid.lead);
             } else {
-                keys.set_sep(c - 1, sep_between(last, kid.first));
+                keys.set_sep(c - 1, sep_between(last, kid.first, || kid.lead));
             }
             last = kid.last;
             keys.counts[c] = kid.count;
@@ -1276,6 +1603,7 @@ fn group<N, R>(
             node,
             count,
             first,
+            lead,
             last,
         });
     }
@@ -1284,8 +1612,24 @@ fn group<N, R>(
 
 /// Puts `item` at `at` among the first `n` slots, which have room.
 fn put<T>(slots: &mut Slots<T>, at: usize, n: usize, item: T) {
-    slots[at..=n].rotate_right(1);
+    open(&mut slots[at..=n], 1);
     slots[at] = Some(item);
+}
+
+/// Moves each slot from `k` on back by `k`, over the first `k`, which are
+/// empty. One at a time: `rotate_left` walks a short slice in cycles, a few
+/// times the instructions.
+fn close<T>(slots: &mut [Option<T>], k: usize) {
+    for i in k..slots.len() {
+        slots[i - k] = slots[i].take();
+    }
+}
+
+/// Moves each slot up by `k`, over the last `k`, which are empty.
+fn open<T>(slots: &mut [Option<T>], k: usize) {
+    for i in (k..slots.len()).rev() {
+        slots[i] = slots[i - k].take();
+    }
 }
 
 /// Moves slot `from_at` of `from`'s first `from_n` to `at` of `to`'s first `n`.
@@ -1300,7 +1644,7 @@ fn move_slot<T>(
     let Some(item) = from[from_at].take() else {
         return false;
     };
-    from[from_at..from_n].rotate_left(1);
+    close(&mut from[from_at..from_n], 1);
     put(to, at, n, item);
     true
 }
@@ -1324,11 +1668,27 @@ fn bytes<R: Member>(slot: &Option<R>) -> &[u8] {
 }
 
 /// The run of `scores` equal to `score`, as its start and end.
+#[inline]
 fn equal_run(scores: &[f64], score: f64) -> (usize, usize) {
-    let score = OrderedFloat(score);
-    let lo = scores.partition_point(|&s| OrderedFloat(s) < score);
-    let hi = lo + scores[lo..].partition_point(|&s| OrderedFloat(s) == score);
-    (lo, hi)
+    if score.is_nan() {
+        return nan_run(scores);
+    }
+    // Plain comparisons order as `OrderedFloat` does against a score that
+    // is not NaN: -0 equals 0, and a NaN compares as neither below nor equal.
+    let lo = scores.partition_point(|&s| s < score);
+    let rest = &scores[lo..];
+    if rest.first().is_none_or(|&s| s != score) {
+        return (lo, lo);
+    }
+    (lo, lo + 1 + rest[1..].partition_point(|&s| s == score))
+}
+
+/// [`equal_run`] of NaN, which sorts above every score (callers never give
+/// one; the tests do).
+#[cold]
+fn nan_run(scores: &[f64]) -> (usize, usize) {
+    let lo = scores.partition_point(|s| !s.is_nan());
+    (lo, scores.len())
 }
 
 /// The first of `lo..hi` where `pred` fails: it holds before, fails after.
@@ -1445,6 +1805,9 @@ impl<R: Member> Inner<R> {
             let (low, high) = (OrderedFloat(last.0), OrderedFloat(first.0));
             if keys.tied(s) {
                 assert_eq!(sep, high, "tied separator {s} is the next first score");
+                if let Some(lead) = keys.leads[s] {
+                    assert_eq!(lead, lead_bytes(first.1), "lead of tied separator {s}");
+                }
             } else {
                 assert!(low < sep && sep <= high, "separator {s} between the scores");
             }
@@ -1470,7 +1833,7 @@ mod tests {
     type Tree = CountedTree<Box<[u8]>>;
     type Model = BTreeSet<(OrderedFloat<f64>, Vec<u8>)>;
 
-    /// Past 4 KiB, as the earlier tree's long members were.
+    /// Past 4 KiB: longer than a page.
     const LONG: usize = 4_089;
 
     impl Member for Box<[u8]> {
@@ -1860,9 +2223,8 @@ mod tests {
                     .collect();
                 assert_eq!(got, want, "run {run}, ranks from {start}");
             }
-            // Appends fill each leaf they pass; descending splits leave halves.
-            let kept = if run == 1 { MIN } else { CAP };
-            assert_eq!(tree.census.leaves, 2 + (N - 33) / kept, "run {run}");
+            // Appends, and keys before every other, pack each leaf they pass.
+            assert_eq!(tree.census.leaves, 2 + (N - 33) / PACK, "run {run}");
             // First half removed in insertion order, the rest in reverse.
             for i in (0..N / 2).chain((N / 2..N).rev()) {
                 let (score, member) = key(i);
@@ -2435,9 +2797,13 @@ mod tests {
             let mut tree = Tree::default();
             let mut model = Model::new();
             // One past a full root of half-full leaves: the root splits.
-            // The largest key goes first, so no insert appends.
-            let largest = if descending { 0 } else { 528 };
-            for i in std::iter::once(largest).chain((0..529).filter(|&i| i != largest)) {
+            // The largest key and the smallest go first, so no insert
+            // appends or goes before every other.
+            let ends = if descending { [0, 528] } else { [528, 0] };
+            for i in ends
+                .into_iter()
+                .chain((1..528).filter(|i| !ends.contains(i)))
+            {
                 let key = key(i);
                 assert!(add(&mut tree, key.0.0, &key.1));
                 model.insert(key);
@@ -2570,7 +2936,7 @@ mod tests {
         type Ref = NonNull<u8>;
         assert_eq!(size_of::<Option<Ref>>(), 8);
         assert_eq!(size_of::<Leaf<Ref>>(), 520);
-        assert_eq!(size_of::<Inner<Ref>>(), 776);
+        assert_eq!(size_of::<Inner<Ref>>(), 1304);
     }
 
     /// Heap bytes are the nodes allocated: one root, then splits.
@@ -2588,12 +2954,14 @@ mod tests {
             add_next(&mut tree);
         }
         assert_eq!(tree.heap_bytes(), 2 * leaf + inner, "the first leaf split");
-        // In order, the root fills with 32 full leaves at 1,024 entries.
-        while tree.len() < CAP * CAP {
+        // In order, the root fills with 32 leaves, all but the last two packed.
+        while tree.root.as_deref().map_or(0, |root| root.keys.len()) < CAP {
             add_next(&mut tree);
         }
         assert_eq!(tree.heap_bytes(), CAP * leaf + inner);
-        add_next(&mut tree);
+        while tree.census.inners == 1 {
+            add_next(&mut tree);
+        }
         assert_eq!(tree.heap_bytes(), 33 * leaf + 3 * inner, "the root split");
         tree.check();
     }
@@ -3036,7 +3404,7 @@ mod tests {
     #[test]
     fn bulk_built_bytes_per_member_with_an_eight_byte_reference() {
         let (leaf, inner) = (size_of::<Leaf<Raw>>(), size_of::<Inner<Raw>>());
-        assert_eq!((leaf, inner), (520, 776));
+        assert_eq!((leaf, inner), (520, 1304));
         for n in [1_000, 10_000, 100_000, 1_000_000] {
             let sorted = (0..n)
                 .map(|i| (i as f64, Raw(NonNull::dangling())))
@@ -3050,7 +3418,7 @@ mod tests {
             assert_eq!(last, Some(((n - 1) as f64, NonNull::dangling())));
             // 520 bytes a 32-entry leaf, and a little for the levels above.
             let per_member = tree.heap_bytes() as f64 / n as f64;
-            assert!((16.25..17.5).contains(&per_member), "{n}: {per_member}");
+            assert!((16.25..18.0).contains(&per_member), "{n}: {per_member}");
         }
     }
 
@@ -3078,12 +3446,12 @@ mod tests {
         levels
     }
 
-    /// Below the root, every node is full but the last two of its level.
+    /// Below the root, every node is `PACK` full but the last two of its level.
     fn full_behind_the_edge<R>(tree: &CountedTree<R>) {
         for (depth, fills) in levels(tree).iter().enumerate().skip(1) {
             let behind = &fills[..fills.len().saturating_sub(2)];
             assert!(
-                behind.iter().all(|&fill| fill == CAP),
+                behind.iter().all(|&fill| fill == PACK),
                 "level {depth}: {fills:?}"
             );
         }
@@ -3169,8 +3537,7 @@ mod tests {
                 }
                 full_behind_the_edge(&tree);
             }
-            assert_eq!(tree.census.leaves, 2 + (n - 33) / CAP, "run {run}");
-            assert_eq!(tree.census.leaves, n.div_ceil(CAP), "as few as hold them");
+            assert_eq!(tree.census.leaves, 2 + (n - 33) / PACK, "run {run}");
             agrees(&tree, &model);
             let all: Vec<_> = model.iter().map(|(s, m)| (s.0, m.clone())).collect();
             for _ in 0..60 {
@@ -3182,7 +3549,7 @@ mod tests {
         }
     }
 
-    /// Only a key past the largest fills the leaf behind; others split as before.
+    /// Only a key past the largest fills the leaf behind; others split it in halves.
     #[test]
     fn only_a_key_past_the_largest_lends() {
         let (leaf, inner) = sizes();
@@ -3206,8 +3573,8 @@ mod tests {
             let cases = [
                 ((largest, member.clone()), false, vec![16, 32]),
                 (below, true, vec![16, 16, 17]),
-                ((largest, [&member[..], &[0]].concat()), true, vec![32, 17]),
-                ((largest + 0.5, Vec::new()), true, vec![32, 17]),
+                ((largest, [&member[..], &[0]].concat()), true, vec![28, 21]),
+                ((largest + 0.5, Vec::new()), true, vec![28, 21]),
                 ((-1.0, b"a".to_vec()), true, vec![17, 32]),
             ];
             for ((score, member), added, want) in cases {
@@ -3221,7 +3588,7 @@ mod tests {
         }
     }
 
-    /// Past a full leaf's last key, but not the largest: the leaf splits as before.
+    /// Past a full leaf's last key, but not the largest: the leaf splits in halves.
     #[test]
     fn a_key_past_a_full_middle_leaf_splits_it() {
         let mut tree = Tree::default();
@@ -3270,12 +3637,13 @@ mod tests {
             (census.0 + 1, census.1 + 1)
         );
         tree.check();
-        // Past it: the root's children rotate, then the leaves; nothing is allocated.
+        // Past it: the root's children rotate, then the leaves; nothing is
+        // allocated. The first child takes 12, to `PACK`.
         let (mut tree, largest) = start();
         assert!(add(&mut tree, largest + 2.0, b"m"));
         assert_eq!(
             (fills(&tree), spine(&tree)),
-            (vec![32, 16], vec![2, 16, 17])
+            (vec![PACK, 20], vec![2, 20, 21])
         );
         assert_eq!((tree.census.leaves, tree.census.inners), census);
         tree.check();
@@ -3307,8 +3675,8 @@ mod tests {
             track(&tree);
         }
         full_behind_the_edge(&tree);
-        assert_eq!(levels(&tree)[1][0], CAP, "the root's first child filled");
-        assert_eq!(tree.census.leaves, 60_000usize.div_ceil(CAP));
+        assert_eq!(levels(&tree)[1][0], PACK, "the root's first child filled");
+        assert_eq!(tree.census.leaves, 2 + (60_000 - 33) / PACK);
         agrees(&tree, &model);
         // Highest and lowest by turns: the root collapses a level at a time.
         let mut high = true;
@@ -3458,7 +3826,7 @@ mod tests {
         tree.check();
         full_behind_the_edge(&tree);
         let (leaves, inners) = (tree.census.leaves, tree.census.inners);
-        assert_eq!(leaves, (n as usize).div_ceil(CAP));
+        assert_eq!(leaves, 2 + (n as usize - 33) / PACK);
         assert_eq!(tree.heap_bytes(), leaves * leaf + inners * inner);
         for _ in 0..10_000 {
             // A few past the largest, appended.
@@ -3664,10 +4032,15 @@ mod tests {
             ((score, member.clone()), score.0 - 5.0),
             ((score, member.clone()), score.0 + 5.0),
         ];
-        for (key, new) in absent {
+        for (i, (key, new)) in absent.into_iter().enumerate() {
             let held = (nodes(&tree), tree.heap_bytes());
             assert_eq!(rescore_both(&mut tree, &mut model, &key, new), None);
-            assert_eq!((nodes(&tree), tree.heap_bytes()), held, "{key:?} untouched");
+            // Not held: nothing changes. Held, its new key taken: back at its own.
+            if i < 2 {
+                assert_eq!((nodes(&tree), tree.heap_bytes()), held, "{key:?} untouched");
+            }
+            tree.check();
+            agrees(&tree, &model);
         }
         agrees(&tree, &model);
         // Equal bytes are not the reference held.
@@ -3983,5 +4356,232 @@ mod tests {
         let all: Vec<_> = tree.iter().map(|(score, id)| (score, id.0)).collect();
         let want: Vec<_> = (0..n).map(|i| (scores[i], id(i).0)).collect();
         assert_eq!(all, want);
+    }
+
+    thread_local! {
+        /// Member reads left before one panics; `usize::MAX`: none does.
+        static READS_LEFT: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+
+    /// A member whose read panics when `READS_LEFT` runs out, once.
+    #[derive(PartialEq)]
+    struct Fragile(Box<[u8]>);
+
+    impl Member for Fragile {
+        fn member(&self) -> &[u8] {
+            READS_LEFT.with(|left| match left.get() {
+                usize::MAX => {}
+                0 => {
+                    left.set(usize::MAX);
+                    panic!("a member read panics");
+                }
+                n => left.set(n - 1),
+            });
+            &self.0
+        }
+    }
+
+    /// A panic in a member read, during an insert, a removal or a move,
+    /// leaves the tree whole: every node checks, `len` is what iteration
+    /// reaches, and every entry is in place but the one being added.
+    #[test]
+    fn a_member_read_that_panics_leaves_the_tree_whole() {
+        let steps = if cfg!(miri) { 300 } else { 6_000 };
+        let mut next = xorshift(0x9b05_688c_2b3e_6c1f);
+        let mut tree: CountedTree<Fragile> = CountedTree::default();
+        // Each member's score: few scores, so most keys tie and are read.
+        let mut held: std::collections::HashMap<Vec<u8>, f64> = Default::default();
+        let (mut panics, mut moves) = ([0usize; 3], 0);
+        for step in 0..steps {
+            let member = format!("m{:04}", next(600)).into_bytes();
+            let score = next(6) as f64;
+            let fragile = || Fragile(member.clone().into());
+            // Half the steps, a read panics: often before a move is made.
+            let reads = if next(2) == 0 { next(12) } else { usize::MAX };
+            READS_LEFT.with(|left| left.set(reads));
+            let (kind, done) = match held.get(&member).copied() {
+                None => {
+                    let added = panic::catch_unwind(AssertUnwindSafe(|| {
+                        tree.insert(score, fragile()).is_ok()
+                    }));
+                    if matches!(added, Ok(true)) {
+                        held.insert(member.clone(), score);
+                    }
+                    (0, added.is_ok())
+                }
+                Some(old) if step % 3 == 0 => {
+                    let gone = panic::catch_unwind(AssertUnwindSafe(|| {
+                        tree.remove(old, &fragile()).is_some()
+                    }));
+                    if matches!(gone, Ok(true)) {
+                        held.remove(&member);
+                    }
+                    (1, gone.is_ok())
+                }
+                Some(old) => {
+                    let made = panic::catch_unwind(AssertUnwindSafe(|| {
+                        tree.rescore(old, score, &fragile())
+                    }));
+                    if let Ok(made) = made {
+                        assert!(made.is_some(), "a held member is moved");
+                        moves += usize::from(made == Some(Rescore::Moved));
+                        held.insert(member.clone(), score);
+                    }
+                    (2, made.is_ok())
+                }
+            };
+            panics[kind] += usize::from(!done);
+            READS_LEFT.with(|left| left.set(usize::MAX));
+            assert_eq!(tree.len(), held.len(), "step {step}");
+            assert_eq!(tree.iter().count(), tree.len(), "step {step}");
+            if step % 50 == 0 || !done {
+                tree.check();
+                let mut want: Vec<(OrderedFloat<f64>, &[u8])> = held
+                    .iter()
+                    .map(|(m, &s)| (OrderedFloat(s), &m[..]))
+                    .collect();
+                want.sort();
+                let got: Vec<(OrderedFloat<f64>, &[u8])> = tree
+                    .iter()
+                    .map(|(s, r)| (OrderedFloat(s), &r.0[..]))
+                    .collect();
+                assert_eq!(got, want, "step {step}");
+            }
+        }
+        assert!(panics.iter().all(|&n| n > 0), "panics {panics:?}");
+        assert!(moves > 0);
+    }
+
+    /// Inserts, removals and rescores among few scores, the infinities and
+    /// both zeros, a rescore to its own score too, each against a model.
+    #[test]
+    fn rescores_to_every_kind_of_score_agree_with_a_model() {
+        let steps = if cfg!(miri) { 400 } else { 20_000 };
+        let scores = [f64::NEG_INFINITY, -1.0, -0.0, 0.0, 0.5, 1.0, f64::INFINITY];
+        let mut next = xorshift(0x1f83_d9ab_fb41_bd6b);
+        let mut tree = Tree::default();
+        let mut model = Model::new();
+        for step in 0..steps {
+            let member = format!("m{:03}", next(400)).into_bytes();
+            let held = model.iter().find(|(_, m)| *m == member).cloned();
+            match held {
+                None => {
+                    let score = scores[next(scores.len())] + 0.0;
+                    assert!(add(&mut tree, score, &member));
+                    model.insert((OrderedFloat(score), member));
+                }
+                Some(key) if next(5) == 0 => {
+                    assert!(remove(&mut tree, key.0.0, &member));
+                    model.remove(&key);
+                }
+                Some(key) => {
+                    let new = match next(3) {
+                        0 => key.0.0,
+                        _ => scores[next(scores.len())] + 0.0,
+                    };
+                    let made = rescore_both(&mut tree, &mut model, &key, new);
+                    assert!(made.is_some(), "{key:?} to {new}");
+                    if new.to_bits() == key.0.0.to_bits() {
+                        assert_eq!(made, Some(Rescore::InPlace), "to its own score");
+                    }
+                }
+            }
+            if step % 500 == 0 {
+                tree.check();
+                agrees(&tree, &model);
+            }
+        }
+        tree.check();
+        agrees(&tree, &model);
+    }
+
+    /// Below the root, every node is `PACK` full but the first two of its level.
+    fn full_before_the_edge<R>(tree: &CountedTree<R>) {
+        for (depth, fills) in levels(tree).iter().enumerate().skip(1) {
+            let behind = &fills[fills.len().min(2)..];
+            assert!(
+                behind.iter().all(|&fill| fill == PACK),
+                "level {depth}: {fills:?}"
+            );
+        }
+    }
+
+    /// Keys before every other fill every node they pass, as appends do:
+    /// falling scores, and one score with falling members.
+    #[test]
+    fn prepends_fill_every_node_but_the_first_two() {
+        let (leaf, inner) = sizes();
+        let n: usize = if cfg!(miri) { 1_100 } else { 40_000 };
+        for tied in [false, true] {
+            let mut tree = Tree::default();
+            let mut model = Model::new();
+            for i in (0..n).rev() {
+                let key = if tied {
+                    (OrderedFloat(3.0), (i as u32).to_be_bytes().to_vec())
+                } else {
+                    (OrderedFloat(i as f64 - 500.5), b"m".to_vec())
+                };
+                assert!(add(&mut tree, key.0.0, &key.1));
+                model.insert(key);
+                if i % 997 == 0 || cfg!(miri) && i % 97 == 0 {
+                    tree.check();
+                    full_before_the_edge(&tree);
+                }
+            }
+            tree.check();
+            full_before_the_edge(&tree);
+            agrees(&tree, &model);
+            let leaves = tree.census.leaves;
+            assert!(leaves <= 2 + n / PACK, "tied {tied}: {leaves} leaves");
+            let bytes = leaves * leaf + tree.census.inners * inner;
+            assert_eq!(tree.heap_bytes(), bytes);
+            let per_member = bytes as f64 / n as f64;
+            // A packed leaf's share, and a little for the levels above.
+            let full = leaf as f64 / PACK as f64;
+            assert!(per_member < full * 1.08, "tied {tied}: {per_member}");
+        }
+    }
+
+    /// Five levels (past 32^4 entries): ranks, removals and the checks.
+    /// About a minute in a release build: `cargo test --release -- --ignored`.
+    #[test]
+    #[ignore]
+    fn a_five_level_tree_agrees_with_its_ranks() {
+        let n = 1_100_000;
+        let mut tree: CountedTree<Id> = CountedTree::default();
+        let id = |i: usize| Id((i as u64).to_be_bytes());
+        let mut next = xorshift(0x6a09_e667_f3bc_c908);
+        for i in 0..n {
+            assert!(tree.insert(f64::from((i / 3) as u32), id(i)).is_ok());
+        }
+        assert_eq!(tree.height(), 5);
+        tree.check();
+        for _ in 0..2_000 {
+            let rank = next(n);
+            let (score, r) = tree.nth(rank).map(|(s, r)| (s, r.0)).unwrap();
+            assert_eq!(r, id(rank).0);
+            assert_eq!(tree.rank(score, &r), Ok(rank));
+        }
+        // A quarter out from the middle, then the rest from the front.
+        let mut left: Vec<usize> = (0..n).collect();
+        for _ in 0..n / 4 {
+            let at = n / 2 - n / 8 + next(n / 4);
+            if let Some((score, r)) = tree.nth(at).map(|(s, r)| (s, r.0)) {
+                assert!(tree.remove(score, &Id(r)).is_some());
+                let i = u64::from_be_bytes(r) as usize;
+                left[i] = usize::MAX;
+            }
+        }
+        tree.check();
+        let rest: Vec<usize> = left.into_iter().filter(|&i| i != usize::MAX).collect();
+        assert_eq!(tree.len(), rest.len());
+        let got: Vec<usize> = tree
+            .iter()
+            .map(|(_, r)| u64::from_be_bytes(r.0) as usize)
+            .collect();
+        assert_eq!(got, rest);
+        while tree.remove_at(0).is_some() {}
+        tree.check();
+        assert_eq!((tree.len(), tree.heap_bytes()), (0, 0));
     }
 }

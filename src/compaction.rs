@@ -2347,18 +2347,19 @@ mod tests {
         }
 
         let _setup = Setup::new();
-        // Members of 3,940 bytes, entries of 3,953 (score, length, bytes): a
-        // pool class no other test allocates (blocks of 3,905-3,968 bytes, 16
-        // a slab). Strings of 3,920 bytes kept in their keys' entries: the
+        // Members of 1,990 bytes, entries of 2,003 (score, length, bytes): a
+        // pool class no other test allocates (blocks of 1,985-2,016 bytes, 32
+        // a slab), as big as a keyspace class's (both in 64 KiB slabs up to
+        // 2 KiB). Strings of 1,970 bytes kept in their keys' entries: the
         // keyspace's class of that size.
-        let member = |i: usize| format!("{i:0>3940}").into_bytes();
+        let member = |i: usize| format!("{i:0>1990}").into_bytes();
         // Runs of equal scores: the index orders their members by their
         // bytes, read through the entries it holds.
         let score = |i: usize| (i % 3) as f64;
         let key = |i: usize| format!("full:{i:0>4}");
-        let value = |i: usize| format!("{i:0>3920}").into_bytes();
-        let pool = value_slab::pool_class_of(3953).unwrap();
-        let keyspace = value_slab::class_of(3953).unwrap();
+        let value = |i: usize| format!("{i:0>1970}").into_bytes();
+        let pool = value_slab::pool_class_of(2003).unwrap();
+        let keyspace = value_slab::class_of(2003).unwrap();
         assert_eq!(
             value_slab::block_size(keyspace),
             value_slab::block_size(pool)
@@ -2536,7 +2537,7 @@ mod tests {
         let moving = Arc::clone(&store);
         let moved = crate::cpus::spawn(move || {
             let regions = value_slab::regions_snapshot();
-            let calm = Calm::new(&value_slab::fill());
+            let calm = Calm::new(&value_slab::fill(), Duration::ZERO);
             let mut pacer = Pacer::default();
             let mut moved = 0;
             for db in moving.iter() {
