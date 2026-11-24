@@ -824,14 +824,16 @@ mod tests {
                     let (ids, named) = {
                         let p = postings.peek();
                         let ids = p.live().clone();
-                        let named: ahash::AHashSet<String> =
-                            ids.iter().filter_map(|id| p.key(id).map(|k| k.to_string())).collect();
+                        let named: ahash::AHashSet<String> = ids
+                            .iter()
+                            .filter_map(|id| p.key(id).map(|k| k.to_string()))
+                            .collect();
                         (ids, named)
                     };
                     let met_by_ids = |key: &str| {
                         let n: usize = key["doc:".len()..].parse().unwrap();
-                        let meanwhile = before[n] % 2 == 1
-                            || written[n].load(Ordering::SeqCst) != before[n];
+                        let meanwhile =
+                            before[n] % 2 == 1 || written[n].load(Ordering::SeqCst) != before[n];
                         assert!(
                             named.contains(key) || meanwhile,
                             "{key}: neither named by the ids nor written meanwhile"

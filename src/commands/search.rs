@@ -1226,7 +1226,11 @@ pub(crate) fn keys_of(def: &IndexDef, ids: &Bits) -> Vec<Arc<str>> {
 /// [`Plan::given_back`]), when each is to be tried against the filter.
 pub(crate) fn plan_keys(def: &IndexDef, plan: &Plan) -> (Vec<Arc<str>>, bool) {
     let p = def.postings.peek();
-    let keys = plan.ids.iter().filter_map(|id| p.key(id).cloned()).collect();
+    let keys = plan
+        .ids
+        .iter()
+        .filter_map(|id| p.key(id).cloned())
+        .collect();
     (keys, plan.exact && p.given_back() == plan.given_back)
 }
 

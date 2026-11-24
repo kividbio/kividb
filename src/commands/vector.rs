@@ -3127,9 +3127,26 @@ mod id_given_back_tests {
         });
         let blob = |v: [f32; 4]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let ok = run(&[
-            b"FT.CREATE", b"reuse", b"ON", b"HASH", b"PREFIX", b"1", b"d:", b"SCHEMA", b"t",
-            b"TAG", b"v", b"VECTOR", b"FLAT", b"6", b"TYPE", b"FLOAT32", b"DIM", b"4",
-            b"DISTANCE_METRIC", b"L2",
+            b"FT.CREATE",
+            b"reuse",
+            b"ON",
+            b"HASH",
+            b"PREFIX",
+            b"1",
+            b"d:",
+            b"SCHEMA",
+            b"t",
+            b"TAG",
+            b"v",
+            b"VECTOR",
+            b"FLAT",
+            b"6",
+            b"TYPE",
+            b"FLOAT32",
+            b"DIM",
+            b"4",
+            b"DISTANCE_METRIC",
+            b"L2",
         ]);
         assert_eq!(ok, b"+OK\r\n");
         for i in 0..10u8 {
@@ -3140,8 +3157,16 @@ mod id_given_back_tests {
         let q = blob([0.0; 4]);
         let search = || -> String {
             let reply = run(&[
-                b"FT.SEARCH", b"reuse", b"(@t:{a})=>[KNN 3 @v $q]", b"PARAMS", b"2", b"q", &q,
-                b"NOCONTENT", b"DIALECT", b"2",
+                b"FT.SEARCH",
+                b"reuse",
+                b"(@t:{a})=>[KNN 3 @v $q]",
+                b"PARAMS",
+                b"2",
+                b"q",
+                &q,
+                b"NOCONTENT",
+                b"DIALECT",
+                b"2",
             ]);
             String::from_utf8_lossy(&reply).into_owned()
         };
@@ -3160,7 +3185,10 @@ mod id_given_back_tests {
         });
         let reply = search();
         crate::test_hooks::clear("knn_planned: planned");
-        assert!(!reply.contains("d:new:"), "a hit (@t:{{a}}) does not match: {reply:?}");
+        assert!(
+            !reply.contains("d:new:"),
+            "a hit (@t:{{a}}) does not match: {reply:?}"
+        );
         for i in 0..3 {
             assert!(reply.contains(&format!("d:a:{i}\r\n")), "{reply:?}");
         }

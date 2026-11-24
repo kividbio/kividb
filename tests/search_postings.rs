@@ -2088,5 +2088,8 @@ fn a_filtered_flat_knn_returns_only_documents_the_filter_matches() {
         strays.len(),
         &strays[..strays.len().min(5)]
     );
-    assert!(queries > 10 && writes > 100, "{queries} queries, {writes} writes");
+    assert!(
+        queries > 10 && writes > 100,
+        "{queries} queries, {writes} writes"
+    );
 }
