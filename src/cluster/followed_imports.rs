@@ -193,7 +193,13 @@ pub(crate) struct FollowedImports {
 /// confirmed it: a `TAKEN` of the master at that claim's epoch or later
 /// (the claim it sends before any write to the slots, and the one kept and
 /// sent ahead of a full sync's dataset), or an `ARRIVED` at that very epoch
-/// (every record of the import came before it). A gain learned only from a
+/// (every record of the import came before it). The `TAKEN` confirms the
+/// gain whether this node reads it before it hears of the gain or after:
+/// the last one read is kept ([`NotHeld::stream_claim`]), and a gain of a
+/// slot it lists, at its epoch or before, is held at once. So a replica
+/// whose master's config epoch moved after a takeover (a collision,
+/// `CLUSTER BUMPEPOCH`: each sends a `TAKEN` at the new epoch) holds the
+/// slots at the newer epoch it hears them claimed at. A gain learned only from a
 /// heartbeat of the master, or from a vote's `UPDATE`, is not held: across
 /// a cut of the replication link alone, the bus still brings the master's
 /// claims while the stream brings none of the keys. A candidate claims only
@@ -235,6 +241,14 @@ struct NotHeld {
     /// the first marker after the dataset (that `TAKEN`, or the imports
     /// marker, which the master sends after it).
     sync_claim_due: bool,
+    /// The last claim of the master read in its stream (a `TAKEN`: every
+    /// slot it owned then, at its config epoch then), while this node's
+    /// dataset is that stream's: forgotten at a full sync (the claim sent
+    /// ahead of the dataset sets it again) and when this node follows
+    /// another master, kept across a partial resync (the stream continues).
+    /// In memory only: after a restart, the stream's claims set it again.
+    /// See [`NotHeld::stream_holds`].
+    stream_claim: Option<(u64, Ranges)>,
 }
 
 impl NotHeld {
@@ -246,6 +260,33 @@ impl NotHeld {
             };
         }
     }
+
+    /// Whether this node holds `slot` as of a claim of it by its master at
+    /// `epoch`: the last claim read in the master's stream lists it, at
+    /// `epoch` or later ([`claim_holds`]).
+    fn stream_holds(&self, slot: u16, epoch: u64) -> bool {
+        self.stream_claim
+            .as_ref()
+            .is_some_and(|claim| claim_holds(claim, slot, epoch))
+    }
+}
+
+/// Whether `claim`, the last claim of this node's master read in its stream
+/// (`TAKEN`, at its epoch, of its slots), stands for a claim of `slot` by
+/// the master at `epoch`: it lists the slot, at `epoch` or later.
+///
+/// Every write to the slot before the `TAKEN` came before it in the stream,
+/// which this node applied, whatever became of its link since. The master's
+/// config epoch only grows, and every way it takes a slot whose keys come
+/// from another node takes an epoch above every one it knows (an import's
+/// takeover, `CLUSTER SETSLOT <slot> NODE` to itself, a claim back after a
+/// failed destination, a promotion). So a claim of the slot at the
+/// `TAKEN`'s epoch or before is of the slot as the stream had it: the
+/// takeover the stream confirmed, then only the master's own writes. A claim
+/// at a newer epoch may be of a later takeover, whose keys this node may not
+/// have (its link down meanwhile): not held.
+pub(crate) fn claim_holds(claim: &(u64, Ranges), slot: u16, epoch: u64) -> bool {
+    epoch <= claim.0 && in_ranges(&claim.1, slot)
 }
 
 /// An `ARRIVED` marker read in the stream of `master`: every record of an
@@ -283,6 +324,16 @@ impl FollowedImports {
             .collect()
     }
 
+    /// The last claim of `master` read in its stream, while this node follows
+    /// it ([`NotHeld::stream_claim`]).
+    pub(crate) fn stream_claim_of(&self, master: NodeId) -> Option<(u64, Ranges)> {
+        let not_held = self.not_held.lock();
+        if not_held.master != Some(master) {
+            return None;
+        }
+        not_held.stream_claim.clone()
+    }
+
     /// What [`NotHeld`] is to be written down as: `None`, nothing (no
     /// file).
     fn not_held_text(&self) -> Option<String> {
@@ -313,8 +364,9 @@ impl FollowedImports {
 
     /// Slots this node's table has just moved to `master`, the master it
     /// follows, each with the epoch of the claim (`gains`), from a claim not
-    /// of its stream: not held, unless an `ARRIVED` of the master at that
-    /// epoch covers them (see [`NotHeld`]).
+    /// of its stream: not held, unless the last claim read in the stream
+    /// lists them at that epoch or later, or an `ARRIVED` of the master at
+    /// that very epoch covers them (see [`NotHeld`]).
     pub(crate) fn note_gains(&self, master: NodeId, gains: &[(u16, u64)]) {
         if gains.is_empty() {
             return;
@@ -326,9 +378,10 @@ impl FollowedImports {
             return;
         }
         for &(slot, epoch) in gains {
-            if arrived
-                .iter()
-                .any(|(e, r)| *e == epoch && in_ranges(r, slot))
+            if not_held.stream_holds(slot, epoch)
+                || arrived
+                    .iter()
+                    .any(|(e, r)| *e == epoch && in_ranges(r, slot))
             {
                 not_held.slots.remove(&slot);
             } else {
@@ -345,6 +398,9 @@ impl FollowedImports {
         let mut not_held = self.not_held.lock();
         if not_held.master != Some(master) {
             return;
+        }
+        if !exact {
+            not_held.stream_claim = Some((epoch, ranges.to_vec()));
         }
         let epoch = if !exact && std::mem::take(&mut not_held.sync_claim_due) {
             u64::MAX
@@ -396,6 +452,9 @@ impl FollowedImports {
         }
         not_held.plain = !marked;
         not_held.sync_claim_due = marked && full;
+        if full || !marked {
+            not_held.stream_claim = None;
+        }
         if not_held.plain {
             not_held.slots.clear();
         }
@@ -1715,6 +1774,55 @@ mod tests {
         assert_eq!(f.not_held_of(other), vec![60]);
         f.forget_not_held();
         assert!(f.not_held_of(other).is_empty());
+    }
+
+    /// The last claim read in the stream holds a gain of a slot it lists at
+    /// its epoch or before, heard after the claim: not one at a newer epoch,
+    /// nor of a slot it does not list. Kept across a partial resync,
+    /// forgotten at a full sync until the claim sent ahead of the dataset,
+    /// and for another master.
+    #[test]
+    fn a_gain_heard_after_the_streams_claim_is_held_by_it() {
+        let f = FollowedImports::default();
+        let (m, other) = (
+            crate::cluster::generate_node_id(),
+            crate::cluster::generate_node_id(),
+        );
+        f.session_with(Some(m), true, false);
+        // A takeover at 4, then the master's epoch moved to 5.
+        f.note_arrived(node_id_str(&m).to_string(), 4, vec![(0, 99)]);
+        f.confirm_held(m, 4, &[(0, 99), (500, 599)], false);
+        f.confirm_held(m, 5, &[(0, 99), (500, 599)], false);
+        assert_eq!(f.stream_claim_of(m), Some((5, vec![(0, 99), (500, 599)])));
+        assert_eq!(f.stream_claim_of(other), None);
+        f.note_gains(m, &[(10, 5), (11, 4), (12, 6), (200, 5), (501, 3)]);
+        assert_eq!(
+            f.not_held_of(m),
+            vec![12, 200],
+            "a newer epoch, or unlisted"
+        );
+        // A partial resync: kept.
+        f.session_with(Some(m), true, false);
+        f.note_gains(m, &[(20, 5)]);
+        assert_eq!(f.not_held_of(m), vec![12, 200]);
+        // A full sync: forgotten, until the claim sent ahead of the dataset.
+        f.session_with(Some(m), true, true);
+        assert_eq!(f.stream_claim_of(m), None);
+        f.note_gains(m, &[(30, 5)]);
+        assert_eq!(f.not_held_of(m), vec![12, 30, 200]);
+        f.confirm_held(m, 7, &[(0, 99)], false);
+        assert_eq!(f.not_held_of(m), vec![200]);
+        f.note_gains(m, &[(40, 7), (41, 8)]);
+        assert_eq!(f.not_held_of(m), vec![41, 200]);
+        // A master without markers: none.
+        f.session_with(Some(m), false, false);
+        assert_eq!(f.stream_claim_of(m), None);
+        // Another master: forgotten.
+        f.session_with(Some(m), true, false);
+        f.confirm_held(m, 9, &[(0, 99)], false);
+        f.note_gains(other, &[(50, 1)]);
+        assert_eq!(f.stream_claim_of(m), None);
+        assert_eq!(f.not_held_of(other), vec![50]);
     }
 
     /// The slots not held read back as written; a file cut short, or with

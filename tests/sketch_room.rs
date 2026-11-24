@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod common;
-use common::start_verified;
+use common::{start_verified, start_verified_cluster};
 
 // ── A client that keeps replies as bytes ─────────────────────────────────
 
@@ -164,7 +164,7 @@ impl Child {
     }
 
     fn spawn_in(dir: std::path::PathBuf, args: Vec<String>, env: Vec<(String, String)>) -> Child {
-        let (child, port) = start_verified(|port| {
+        let spawn = |port: u16| {
             std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
                 .current_dir(&dir)
                 .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -178,7 +178,13 @@ impl Child {
                 .stdout(std::process::Stdio::null())
                 .spawn()
                 .expect("could not start kividb")
-        });
+        };
+        // A cluster node needs its bus port too (see `start_verified_cluster`).
+        let (child, port) = if args.iter().any(|a| a == "--cluster-enabled") {
+            start_verified_cluster(spawn)
+        } else {
+            start_verified(spawn)
+        };
         let child = Child {
             port,
             child,

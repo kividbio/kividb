@@ -189,6 +189,72 @@ pub fn start_verified(spawn: impl FnMut(u16) -> Child) -> (Child, u16) {
     (child, port)
 }
 
+/// A port whose cluster bus port (`+10000`) is free too, and neither of them
+/// one the system hands out to outgoing connections: 10000-19999, so the bus
+/// is 20000-29999. A port from [`free_port`] can have its bus port in the
+/// ephemeral range (Linux hands out 32768 and up), where any outgoing
+/// connection of any process may hold it when the node binds it.
+pub fn free_cluster_port() -> u16 {
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    loop {
+        let step = NEXT.fetch_add(1, Ordering::Relaxed);
+        let from = (std::process::id() as u16).wrapping_mul(31);
+        let port = 10_000 + from.wrapping_add(step) % 10_000;
+        if port_is_free(port) && port_is_free(port + 10_000) {
+            return port;
+        }
+    }
+}
+
+/// [`start_verified`] for a node with `cluster-enabled yes`: on a port from
+/// [`free_cluster_port`], and accepted only once the child answers on it and
+/// its cluster bus listens on the port `+10000`. A node whose bus port was
+/// taken serves clients but meets no other node; it is started again on
+/// another port, up to 10 times.
+pub fn start_verified_cluster(mut spawn: impl FnMut(u16) -> Child) -> (Child, u16) {
+    for _ in 0..10 {
+        let port = free_cluster_port();
+        let mut child = spawn(port);
+        match confirm(&mut child, port, Duration::from_secs(60)) {
+            Started::Ours => {
+                if bus_listens(&mut child, port + 10_000) {
+                    return (child, port);
+                }
+                eprintln!(
+                    "the server on {port} has no cluster bus on {}: the port was taken",
+                    port + 10_000
+                );
+            }
+            Started::Foreign(pid) => {
+                eprintln!(
+                    "port {port} is answered by process {pid}, not by the server started on it"
+                )
+            }
+            Started::Exited => eprintln!("the server could not take port {port}"),
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    panic!("no port could be had for the cluster node");
+}
+
+/// Whether `child`'s cluster bus comes to listen on `bus` within 10 s (it
+/// binds it once the client port listens). The port was free when it was
+/// picked, and only test servers bind ports in its range.
+fn bus_listens(child: &mut Child, bus: u16) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            return false;
+        }
+        if TcpStream::connect(("127.0.0.1", bus)).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 /// Like `restart_verified`, but the port cannot change (a cluster node's
 /// address is in its `nodes.conf` and in its peers'): if another process has
 /// taken it, or the child cannot listen on it, panics with that said.

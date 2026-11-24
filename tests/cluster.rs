@@ -2836,6 +2836,25 @@ fn a_majority_holding_a_node_as_owner_at_an_older_epoch_is_not_followed() {
         Duration::from_secs(30),
         || new_master.is_master() && nodes[0].my_row()[3] == new_id,
     );
+    // Killed once its nodes.conf has it as the new master's replica: the
+    // restart is to start from that view, not from one saved before the
+    // failover (it would then start as a master and follow the new one's
+    // claim, with nothing to refuse).
+    wait_until(
+        "the old master's nodes.conf to have it as the new master's replica",
+        Duration::from_secs(10),
+        || {
+            std::fs::read_to_string(nodes[0].dir.join("nodes.conf")).is_ok_and(|conf| {
+                conf.lines().any(|l| {
+                    let f: Vec<&str> = l.split(' ').collect();
+                    f.len() > 3
+                        && f[2].contains("myself")
+                        && f[2].contains("slave")
+                        && f[3] == new_id
+                })
+            })
+        },
+    );
     nodes[0].kill();
     let from = nodes[0].log().len();
     nodes[0].spawn();
@@ -8132,7 +8151,21 @@ impl Written {
 
 /// The node that owns `slot` in `node`'s `CLUSTER NODES`.
 fn owner_in_view_of(node: &Node, slot: u16) -> Option<String> {
-    let nodes = node.conn().cmd(&["CLUSTER", "NODES"]).text();
+    // `None` is "no owner" only from a `CLUSTER NODES` that answered: an
+    // error reply is asked again for a while, then fails the test with it.
+    let mut tries = 0;
+    let nodes = loop {
+        let reply = node.conn().cmd(&["CLUSTER", "NODES"]);
+        match reply.err() {
+            None => break reply.text(),
+            Some(e) if tries < 50 => {
+                tries += 1;
+                eprintln!("CLUSTER NODES on {} answered {e}; asked again", node.port);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Some(e) => panic!("CLUSTER NODES on {} answered {e}", node.port),
+        }
+    };
     nodes.lines().find_map(|line| {
         let fields: Vec<&str> = line.split(' ').collect();
         let owns = fields.iter().skip(8).any(|range| {
@@ -10382,6 +10415,23 @@ fn a_replica_that_holds_what_arrived_is_given_the_slots_its_master_took_before_f
     }
     set_pause_timeout(&[&nodes[0], &nodes[1]], "30000");
     let (src_id, dst_id, replica_id) = (nodes[0].id(), nodes[1].id(), replica.id());
+    // The third master holds the highest epoch, known to all as the
+    // current one, and every config epoch differs: no collision moves the
+    // destination's epoch between what arrived and the kill (checked below).
+    wait_until(
+        "a master to hold the highest epoch, known to all",
+        Duration::from_secs(30),
+        || {
+            let r = nodes[2].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+            assert!(r.starts_with("BUMPED") || r.starts_with("STILL"), "{r}");
+            let highest = nodes[2].cluster_info("cluster_my_epoch");
+            std::thread::sleep(Duration::from_millis(1500));
+            nodes
+                .iter()
+                .chain(std::iter::once(&replica))
+                .all(|n| n.cluster_info("cluster_current_epoch") == highest)
+        },
+    );
     let before = Written::on(&nodes[0], 0..=100, "before", 200);
     let task_id = nodes[1]
         .conn()
@@ -10394,14 +10444,15 @@ fn a_replica_that_holds_what_arrived_is_given_the_slots_its_master_took_before_f
         Duration::from_secs(30),
         || held.exists(),
     );
+    let reserved = nodes[1].cluster_info("cluster_current_epoch");
+    let arrived = format!(
+        "this node holds what arrived of slots 0-100 on its master, for a takeover at epoch \
+         {reserved}"
+    );
     wait_until(
         "the replica to hold what arrived",
         Duration::from_secs(10),
-        || {
-            replica
-                .log()
-                .contains("this node holds what arrived of slots 0-100")
-        },
+        || replica.log().contains(&arrived),
     );
     std::fs::write(nodes[1].dir.join("stream-stall"), "").unwrap();
     std::fs::write(replica.dir.join(IGNORE_CLAIMS.1), &dst_id).unwrap();
@@ -10421,6 +10472,8 @@ fn a_replica_that_holds_what_arrived_is_given_the_slots_its_master_took_before_f
         Some(src_id.as_str()),
         "the replica took in its master's claim"
     );
+    // The destination's epoch is still the one what arrived was for.
+    assert_eq!(nodes[1].cluster_info("cluster_my_epoch"), reserved);
     nodes[1].kill();
     let live = [&nodes[0], &nodes[2], &replica];
     let logs = || -> String {
@@ -10728,6 +10781,405 @@ fn a_replica_that_has_not_heard_its_master_take_slots_counts_the_masters_that_ow
         "{} imported keys not on the owner",
         absent.len()
     );
+}
+
+/// How the destination's config epoch moves after its takeover, in
+/// [`replica_follows_its_masters_claim_after_its_epoch_moved`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum EpochMoves {
+    /// A config epoch collision with another master that took the
+    /// takeover's very epoch meanwhile, unheard (its cluster bus held,
+    /// `KIVIDB_TEST_BUS_CONTROL`): of two
+    /// masters at one epoch the one with the lower node id moves, and the
+    /// destination is given the lowest.
+    Collision,
+    /// `CLUSTER BUMPEPOCH` on the destination.
+    BumpEpoch,
+}
+
+/// [`a_replica_that_has_not_heard_its_master_take_slots_counts_the_masters_that_own_slots`],
+/// with the destination's config epoch moved after its takeover (`moves`):
+/// the masters the replica asks for its vote tell it the destination's
+/// claims at that newer epoch, not at the one its stream told it what
+/// arrived for (`ARRIVED`). Its stream carried the destination's claim at
+/// the newer epoch too (`TAKEN`, which a collision and `BUMPEPOCH` send),
+/// ahead of the writes that follow it: the replica holds the slots as of
+/// that claim, and is elected with them in the normal time, with every
+/// acknowledged write and imported key.
+fn replica_follows_its_masters_claim_after_its_epoch_moved(moves: EpochMoves) {
+    let env = [
+        ("KIVIDB_TEST_FAILPOINTS", "takeover-acknowledged"),
+        BUS_CONTROL,
+    ];
+    let started: Vec<Node> = (0..4).map(|_| Node::start_with_env(&[], &env)).collect();
+    let (mut nodes, ranges) = form_cluster_of(started);
+    // By node id: the destination the lowest, the master that collides with
+    // it the highest, the source and a master that holds the highest epoch
+    // between them.
+    let mut by_id: Vec<usize> = (0..nodes.len()).collect();
+    by_id.sort_by_cached_key(|&i| nodes[i].id());
+    let (d, y, s, x) = (by_id[0], by_id[1], by_id[2], by_id[3]);
+    let replica = add_replica_with_env(
+        &nodes,
+        &nodes[d],
+        &[IGNORE_CLAIMS, ("KIVIDB_TEST_IGNORE_STREAM_CLAIMS", "1")],
+    );
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, all.len());
+    }
+    assert!(
+        replica
+            .conn()
+            .cmd(&["CONFIG", "SET", "cluster-replica-validity-factor", "0"])
+            .is_ok()
+    );
+    set_pause_timeout(&[&nodes[s], &nodes[d]], "30000");
+    let (src_id, dst_id, x_id, replica_id) =
+        (nodes[s].id(), nodes[d].id(), nodes[x].id(), replica.id());
+    std::fs::write(replica.dir.join(IGNORE_CLAIMS.1), &dst_id).unwrap();
+    // A master between them holds the highest epoch, known to all as the
+    // current one: the epoch reserved for the takeover, and the colliding
+    // master's bump below, are both the one above it.
+    wait_until(
+        "a master to hold the highest epoch, known to all",
+        Duration::from_secs(30),
+        || {
+            let r = nodes[y].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+            assert!(r.starts_with("BUMPED") || r.starts_with("STILL"), "{r}");
+            let highest = nodes[y].cluster_info("cluster_my_epoch");
+            std::thread::sleep(Duration::from_millis(1500));
+            nodes
+                .iter()
+                .chain(std::iter::once(&replica))
+                .all(|n| n.cluster_info("cluster_current_epoch") == highest)
+        },
+    );
+    let (a, b) = ranges[s];
+    let before = Written::on(&nodes[s], a..=b, "before", 100);
+    let task_id = nodes[d]
+        .conn()
+        .cmd(&[
+            "CLUSTER",
+            "MIGRATION",
+            "IMPORT",
+            &a.to_string(),
+            &b.to_string(),
+        ])
+        .text();
+    assert_eq!(task_id.len(), 40, "{task_id}");
+    let held = nodes[d].dir.join("failpoint.takeover-acknowledged.1");
+    wait_until(
+        "the takeover to be held once its replica has acknowledged what arrived",
+        Duration::from_secs(30),
+        || held.exists(),
+    );
+    let reserved: u64 = nodes[d]
+        .cluster_info("cluster_current_epoch")
+        .parse()
+        .unwrap();
+    let arrived = format!(
+        "this node holds what arrived of slots {a}-{b} on its master, for a takeover at epoch \
+         {reserved}"
+    );
+    wait_until(
+        "the replica to hold what arrived",
+        Duration::from_secs(10),
+        || replica.log().contains(&arrived),
+    );
+    if moves == EpochMoves::Collision {
+        // It takes the reserved epoch without the destination hearing of
+        // it before the takeover.
+        set_bus(&nodes[x], "stall");
+        wait_until(
+            "the colliding master's bus to be held",
+            Duration::from_secs(10),
+            || nodes[x].log().contains("(test) the bus is stalled"),
+        );
+        let bumped = nodes[x].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+        assert_eq!(bumped, format!("BUMPED {reserved}"));
+    }
+    std::fs::remove_file(&held).unwrap();
+    wait_import_completed(&nodes[d], &task_id);
+    assert_eq!(
+        nodes[d].cluster_info("cluster_my_epoch"),
+        reserved.to_string(),
+        "the takeover's epoch"
+    );
+    let moved = match moves {
+        EpochMoves::Collision => {
+            set_bus(&nodes[x], "run");
+            wait_until(
+                "the destination to move on the collision",
+                Duration::from_secs(20),
+                || nodes[d].cluster_info("cluster_my_epoch") != reserved.to_string(),
+            );
+            let moved = nodes[d].cluster_info("cluster_my_epoch");
+            let collided = format!("config epoch collision with {x_id} — moved to {moved}");
+            assert!(nodes[d].log().contains(&collided), "{}", nodes[d].log());
+            moved
+        }
+        EpochMoves::BumpEpoch => {
+            // Another master above it first: BUMPEPOCH moves only a master
+            // that does not hold the highest epoch.
+            wait_until(
+                "the other master to know the takeover's epoch",
+                Duration::from_secs(10),
+                || row_of(&nodes[y], &dst_id).is_some_and(|row| row[6] == reserved.to_string()),
+            );
+            let r = nodes[y].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+            let above: u64 = r
+                .strip_prefix("BUMPED ")
+                .unwrap_or_else(|| panic!("{r}"))
+                .parse()
+                .unwrap();
+            wait_until(
+                "the destination to know the other master's epoch",
+                Duration::from_secs(10),
+                || nodes[d].cluster_info("cluster_current_epoch") == above.to_string(),
+            );
+            let r = nodes[d].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+            r.strip_prefix("BUMPED ")
+                .unwrap_or_else(|| panic!("{r}"))
+                .to_string()
+        }
+    };
+    let moved: u64 = moved.parse().unwrap();
+    assert!(moved > reserved, "{moved} {reserved}");
+    wait_until(
+        "the other masters to hear the destination claim the slots at its new epoch",
+        Duration::from_secs(20),
+        || {
+            [y, s, x].iter().all(|&i| {
+                owner_in_view_of(&nodes[i], a).as_deref() == Some(dst_id.as_str())
+                    && row_of(&nodes[i], &dst_id).is_some_and(|row| row[6] == moved.to_string())
+            })
+        },
+    );
+    // It takes in none of the destination's claims: the slots are the
+    // source's in its view.
+    assert_eq!(
+        owner_in_view_of(&replica, a).as_deref(),
+        Some(src_id.as_str())
+    );
+    // Acknowledged by the destination, and on its replica.
+    let after = Written::on(&nodes[d], a..=b, "after", 100);
+    assert_eq!(nodes[d].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+    nodes[d].kill();
+
+    let live: Vec<&Node> = [y, s, x]
+        .iter()
+        .map(|&i| &nodes[i])
+        .chain(std::iter::once(&replica))
+        .collect();
+    let logs = || -> String {
+        live.iter()
+            .map(|n| format!("==== node {}\n{}", n.port, n.log()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        wait_until_or(Duration::from_secs(30), || replica.is_master()),
+        "the replica was not elected in 30 s ({moves:?}, epoch {reserved} moved to {moved})\n{}",
+        logs()
+    );
+    assert!(
+        wait_until_or(Duration::from_secs(30), || {
+            live.iter().all(|n| {
+                owner_in_view_of(n, a).as_deref() == Some(replica_id.as_str())
+                    && owner_in_view_of(n, ranges[d].0).as_deref() == Some(replica_id.as_str())
+                    && n.cluster_info("cluster_state") == "ok"
+            })
+        }),
+        "not every node has it as the owner of both sets of slots in 30 s\n{}",
+        logs()
+    );
+    let absent = after.missing_on(&replica);
+    assert!(
+        absent.is_empty(),
+        "{} acknowledged writes not on the owner",
+        absent.len()
+    );
+    let absent = before.missing_on(&replica);
+    assert!(
+        absent.is_empty(),
+        "{} imported keys not on the owner",
+        absent.len()
+    );
+}
+
+#[test]
+fn a_replica_holds_the_slots_its_master_took_when_a_collision_moved_its_epoch() {
+    replica_follows_its_masters_claim_after_its_epoch_moved(EpochMoves::Collision);
+}
+
+#[test]
+fn a_replica_holds_the_slots_its_master_took_when_bumpepoch_moved_its_epoch() {
+    replica_follows_its_masters_claim_after_its_epoch_moved(EpochMoves::BumpEpoch);
+}
+
+/// The other side of the tests above, for a replica that has not taken its
+/// master's `TAKEN` into its table (`KIVIDB_TEST_IGNORE_CLAIMS`,
+/// `KIVIDB_TEST_IGNORE_STREAM_CLAIMS`): a claim the voters relay at a newer
+/// epoch than the last `TAKEN` it read is not taken in from the `UPDATE`
+/// (`master_claims_arrived`). Four masters, the source's slots all imported
+/// into the destination; the replica reads the takeover's `ARRIVED` and
+/// `TAKEN`, and acknowledges writes after it. Then it is cut off
+/// (`cut_off`) and marked failed; the slots go back to the source, take
+/// writes there, and are imported into the destination again, at a newer
+/// epoch. The destination fails and the cut heals: the voters tell the
+/// replica the destination's claims at that newer epoch, which it does not
+/// take, and it is not elected (the source, which owns no slots, has no
+/// vote, and the replica still counts it). The destination, back, owns the
+/// slots with every key and acknowledged write.
+#[test]
+fn an_update_at_a_newer_epoch_than_the_streams_claim_is_not_taken_in_by_a_replica_without_it() {
+    let (mut nodes, ranges) = form_cluster_of(vec![
+        Node::start(&[]),
+        Node::start(&["--appendonly", "yes"]),
+        Node::start(&[]),
+        Node::start(&[]),
+    ]);
+    let replica = add_replica_with(
+        &nodes,
+        &nodes[1],
+        &["--cluster-replica-validity-factor", "0"],
+        &[
+            IGNORE_CLAIMS,
+            ("KIVIDB_TEST_IGNORE_STREAM_CLAIMS", "1"),
+            LINK_DOWN,
+            BUS_CONTROL,
+        ],
+    );
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, all.len());
+    }
+    let (src_id, dst_id, replica_id) = (nodes[3].id(), nodes[1].id(), replica.id());
+    std::fs::write(replica.dir.join(IGNORE_CLAIMS.1), &dst_id).unwrap();
+    let (a, b) = ranges[3];
+    let (a_s, b_s) = (a.to_string(), b.to_string());
+    let import = ["CLUSTER", "MIGRATION", "IMPORT", a_s.as_str(), b_s.as_str()];
+    // Sent until it is taken: the source of the import before may still be
+    // finishing its side.
+    let import_into = |n: &Node| -> String {
+        let mut task_id = String::new();
+        wait_until("the import to be taken", Duration::from_secs(30), || {
+            task_id = n.conn().cmd(&import).text();
+            task_id.len() == 40
+        });
+        task_id
+    };
+    let owned_by = |id: &str, on: &[usize]| {
+        let id = id.to_string();
+        let on = on.to_vec();
+        move |nodes: &[Node]| {
+            on.iter()
+                .all(|&i| owner_in_view_of(&nodes[i], a).as_deref() == Some(id.as_str()))
+        }
+    };
+    let before = Written::on(&nodes[3], a..=b, "before", 100);
+    let task_id = import_into(&nodes[1]);
+    wait_import_completed(&nodes[1], &task_id);
+    let to_dst = owned_by(&dst_id, &[0, 2, 3]);
+    wait_until(
+        "the other masters to hear of the new owner",
+        Duration::from_secs(20),
+        || to_dst(&nodes),
+    );
+    assert!(
+        replica
+            .log()
+            .contains(&format!("this node holds what arrived of slots {a}-{b}")),
+        "{}",
+        replica.log()
+    );
+    let first = Written::on(&nodes[1], a..=b, "first", 100);
+    assert_eq!(nodes[1].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+    let first_epoch: u64 = nodes[1].cluster_info("cluster_my_epoch").parse().unwrap();
+
+    cut_off(&replica, true, false);
+    wait_until(
+        "the cut-off replica to be marked failed",
+        Duration::from_secs(30),
+        || flags_of(&nodes[1], &replica_id).contains("fail"),
+    );
+    // Back to the source, with writes there.
+    let task_id = import_into(&nodes[3]);
+    wait_import_completed(&nodes[3], &task_id);
+    let to_src = owned_by(&src_id, &[0, 1, 2]);
+    wait_until(
+        "the other masters to hear the source own the slots again",
+        Duration::from_secs(20),
+        || to_src(&nodes),
+    );
+    let between = Written::on(&nodes[3], a..=b, "between", 100);
+    // And into the destination again: a takeover whose data the replica
+    // does not hold.
+    let task_id = import_into(&nodes[1]);
+    wait_import_completed(&nodes[1], &task_id);
+    wait_until(
+        "the other masters to hear of the new owner again",
+        Duration::from_secs(20),
+        || to_dst(&nodes),
+    );
+    let again_epoch: u64 = nodes[1].cluster_info("cluster_my_epoch").parse().unwrap();
+    assert!(again_epoch > first_epoch, "{again_epoch} {first_epoch}");
+    nodes[1].kill();
+    cut_off(&replica, false, false);
+
+    wait_until(
+        "the replica to stand for election",
+        Duration::from_secs(30),
+        || replica.log().contains("Starting election"),
+    );
+    for _ in 0..150 {
+        assert!(
+            !replica.is_master(),
+            "elected while it does not hold the slots' writes\n{}",
+            replica.log()
+        );
+        for n in [&nodes[0], &nodes[2], &nodes[3], &replica] {
+            assert_ne!(
+                owner_in_view_of(n, a).as_deref(),
+                Some(replica_id.as_str()),
+                "given slots whose data it does not hold\n{}",
+                replica.log()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // It was told the destination's claim at the newer epoch, and did not
+    // take it.
+    let log = replica.log();
+    assert!(
+        log.lines()
+            .any(|l| l.contains("answered this node's vote request")
+                && l.contains(&format!("{a}-{b} at config epoch"))),
+        "{log}"
+    );
+    assert_eq!(
+        owner_in_view_of(&replica, a).as_deref(),
+        Some(src_id.as_str())
+    );
+
+    nodes[1].spawn();
+    wait_until(
+        "the destination, back, to own the slots again",
+        Duration::from_secs(60),
+        || {
+            [&nodes[0], &nodes[1], &nodes[2], &nodes[3]]
+                .iter()
+                .all(|n| {
+                    owner_in_view_of(n, a).as_deref() == Some(dst_id.as_str())
+                        && n.cluster_info("cluster_state") == "ok"
+                })
+        },
+    );
+    for written in [&before, &first, &between] {
+        let absent = written.missing_on(&nodes[1]);
+        assert!(absent.is_empty(), "{} keys not on the owner", absent.len());
+    }
 }
 
 /// A source killed while it waited to know whether the destination took

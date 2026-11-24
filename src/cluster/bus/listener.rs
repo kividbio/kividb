@@ -762,9 +762,9 @@ pub(crate) fn apply_update(
             owner.config_epoch
         );
         // Of this node's own master, only the slots it owns here already,
-        // and those of an import whose data this node holds in full
-        // (`master_claims_arrived`): a replica that does not hold it may not
-        // hold their keys.
+        // and those whose data this node holds as of the claim, as its
+        // master's stream told it (`master_claims_arrived`): a replica that
+        // does not hold them may not hold their keys.
         if state.my_master_id() == Some(owner.id) {
             let claims = state.master_claims_arrived(owner.id, &owner.claims);
             state.apply_peer_slot_claims(owner.id, &claims);

@@ -3205,24 +3205,33 @@ impl ClusterState {
 
     /// Of `claims`, which a voter's `UPDATE` relays from `master`, the
     /// master this node follows: what this node takes in. The slots it holds
-    /// as the master's already, and those of an import into the master whose
-    /// data this node holds in full, as the master's stream told it
+    /// as the master's already; those the last claim of the master read in
+    /// its stream lists (`TAKEN`), claimed at that claim's epoch or before
+    /// (`followed_imports::claim_holds`): the master's epoch moved after it
+    /// took them (a collision, `CLUSTER BUMPEPOCH`) and its claim at the new
+    /// epoch came in the stream; and those of an import into the master
+    /// whose data this node holds in full, as the master's stream told it
     /// (`ARRIVED`, `followed_imports::encode_arrived`), claimed at the very
-    /// epoch that import was to be taken over at. The marker came after the
-    /// import's last record in the stream, and this node's dataset is still
-    /// that stream, whatever became of its link since. A claim at another
-    /// epoch is not that takeover's: an attempt refused and a later one, at a
-    /// newer epoch, whose data this node may not have. The others stay with
-    /// their owner here.
+    /// epoch that import was to be taken over at. Either marker came after
+    /// every record of the slots before it in the stream, and this node's
+    /// dataset is still that stream, whatever became of its link since. A
+    /// claim at a newer epoch than the stream's claim, or at another epoch
+    /// than an `ARRIVED`'s, may be a later takeover's (an attempt refused
+    /// and a later one, the slots handed away and imported again), whose
+    /// data this node may not have. The others stay with their owner here.
     pub(crate) fn master_claims_arrived(
         &self,
         master: NodeId,
         claims: &[crate::cluster::bus::SlotClaim],
     ) -> Vec<crate::cluster::bus::SlotClaim> {
         let arrived = self.followed_imports.arrived_into(node_id_str(&master));
+        let stream = self.followed_imports.stream_claim_of(master);
         let owners = self.slots.read();
         let ok = |slot: u16, epoch: u64| {
             owners[slot as usize] == Some(master)
+                || stream
+                    .as_ref()
+                    .is_some_and(|claim| followed_imports::claim_holds(claim, slot, epoch))
                 || arrived
                     .iter()
                     .any(|(e, r)| *e == epoch && migration::in_ranges(r, slot))
