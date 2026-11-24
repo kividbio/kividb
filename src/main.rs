@@ -1308,7 +1308,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                     }
                 }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    tokio_uring::start(async move {
+                    server_uring::worker_runtime().start(async move {
                         // Port 0: none, until `CONFIG SET port` opens one.
                         let listener = (addr.port() != 0).then(|| {
                             let socket =
