@@ -1,6 +1,7 @@
 pub mod backlog;
 pub mod doc_keys;
 pub mod filter;
+pub mod flat;
 pub mod phonetic;
 pub mod postings;
 pub mod quant;
@@ -149,6 +150,43 @@ impl VectorType {
                 .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
                 .collect(),
         })
+    }
+
+    /// [`VectorType::decode`] of `blob` into `out`, the same floats, each
+    /// of `out` written, for a blob of `out.len()` elements (see
+    /// [`VectorType::fits`]): a FLAT index decodes a vector into its slot.
+    pub fn decode_into(self, blob: &[u8], out: &mut [std::mem::MaybeUninit<f32>]) {
+        assert!(self.fits(blob, out.len()), "a blob of another length");
+        match self {
+            Self::Float32 => {
+                for (o, b) in out.iter_mut().zip(blob.as_chunks::<4>().0) {
+                    o.write(f32::from_le_bytes(*b));
+                }
+            }
+            Self::Float64 => {
+                for (o, b) in out.iter_mut().zip(blob.as_chunks::<8>().0) {
+                    o.write(f64::from_le_bytes(*b) as f32);
+                }
+            }
+            Self::Float16 => {
+                for (o, b) in out.iter_mut().zip(blob.as_chunks::<2>().0) {
+                    o.write(crate::commands::json_fpha::f16_bits_to_f32(
+                        u16::from_le_bytes(*b),
+                    ));
+                }
+            }
+            Self::BFloat16 => {
+                for (o, b) in out.iter_mut().zip(blob.as_chunks::<2>().0) {
+                    o.write(f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16));
+                }
+            }
+        }
+    }
+
+    /// Whether `blob` is `dim` elements: what [`VectorType::decode`] takes.
+    #[inline]
+    pub fn fits(self, blob: &[u8], dim: usize) -> bool {
+        blob.len() == dim * self.size()
     }
 
     /// One element as this type's little-endian bytes: a JSON document's
@@ -1538,20 +1576,28 @@ pub fn backfill_from_db_progress(
                 Some(b) => b,
                 None => continue,
             };
+            if !w.data_type.fits(raw_bytes, w.dim) {
+                continue;
+            }
+            let idx = match &w.live {
+                LiveIndex::Flat(idx) => {
+                    // Decoded into its slot.
+                    idx.insert_with(key, w.dim, doc, |slot| {
+                        w.data_type.decode_into(raw_bytes, slot)
+                    });
+                    continue;
+                }
+                LiveIndex::Hnsw(idx) => idx,
+            };
             let Some(vec) = w.data_type.decode(raw_bytes, w.dim) else {
                 continue;
             };
-            match &w.live {
-                LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
-                LiveIndex::Hnsw(idx) => {
-                    if w.loaded && holds_vector(idx, key, &vec, &w.metric) {
-                        continue;
-                    }
-                    // Linked by the helpers, as a write's is: the walk holds
-                    // the key's order, so what it read is the key's latest.
-                    backlog::write(idx, key, vec, &w.metric, doc);
-                }
+            if w.loaded && holds_vector(idx, key, &vec, &w.metric) {
+                continue;
             }
+            // Linked by the helpers, as a write's is: the walk holds the
+            // key's order, so what it read is the key's latest.
+            backlog::write(idx, key, vec, &w.metric, doc);
         }
 
         if text_fields.is_empty() {
@@ -1724,22 +1770,8 @@ pub fn drop_all_dicts(dict_store: &DictStore) {
     *g = AHashMap::new();
 }
 
-#[derive(Debug, Default)]
-pub struct VectorIndex {
-    pub vectors: RwLock<AHashMap<String, Vec<f32>>>,
-}
-
-impl VectorIndex {
-    pub fn new() -> Self {
-        Self {
-            vectors: RwLock::new(AHashMap::new()),
-        }
-    }
-
-    pub fn insert(&self, key: String, vec: Vec<f32>) {
-        self.vectors.write().insert(key, vec);
-    }
-}
+/// A FLAT index's vectors: see [`flat`].
+pub use flat::VectorIndex;
 
 /// One node in the HNSW graph: its key, its document id, and its links
 /// above layer 0. Its vector, its layer-0 links and whether it is live are
@@ -2687,31 +2719,38 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
             let Some(live) = def.indexes.get(&f.name) else {
                 continue;
             };
-            let vec = fields
+            let blob = fields
                 .iter()
                 .find(|(n, _)| n == &f.name)
-                .and_then(|(_, b)| data_type.decode(b, dim));
-            let Some(vec) = vec else {
+                .map(|(_, b)| &**b)
+                .filter(|b| data_type.fits(b, dim));
+            let Some(blob) = blob else {
                 // The document holds no vector there (any more).
                 if whole {
                     unindex_vector(live, key);
                 }
                 continue;
             };
-            match live {
-                LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
-                LiveIndex::Hnsw(idx) => {
-                    if how == Write::Refresh
-                        && (idx.backlog.holds(key) || idx.key_to_id.read().contains_key(key))
-                    {
-                        continue;
-                    }
-                    // Once per command, whatever it writes to how many
-                    // indexes; the walks over the keys do not come here.
-                    backlog::count_write();
-                    backlog::write(idx, key, vec, &metric, doc);
+            let idx = match live {
+                LiveIndex::Flat(idx) => {
+                    // Decoded into its slot.
+                    idx.insert_with(key, dim, doc, |slot| data_type.decode_into(blob, slot));
+                    continue;
                 }
+                LiveIndex::Hnsw(idx) => idx,
+            };
+            let Some(vec) = data_type.decode(blob, dim) else {
+                continue;
+            };
+            if how == Write::Refresh
+                && (idx.backlog.holds(key) || idx.key_to_id.read().contains_key(key))
+            {
+                continue;
             }
+            // Once per command, whatever it writes to how many indexes; the
+            // walks over the keys do not come here.
+            backlog::count_write();
+            backlog::write(idx, key, vec, &metric, doc);
         }
     }
 }
@@ -2757,9 +2796,7 @@ fn restem(
 /// FLAT index, at once; from a graph, by deleting its node in place.
 fn unindex_vector(live: &LiveIndex, key: &str) {
     match live {
-        LiveIndex::Flat(idx) => {
-            idx.vectors.write().remove(key);
-        }
+        LiveIndex::Flat(idx) => idx.remove(key),
         LiveIndex::Hnsw(idx) => {
             idx.unlink(key);
             if let Some(shadow) = idx.shadow() {
@@ -3217,36 +3254,11 @@ pub fn knn_flat(
     k: usize,
     metric: &DistanceMetric,
 ) -> Vec<KnnResult> {
-    // Collect all distances first, then partial-sort.
-    // Avoids the heap tie-breaking problem entirely.
-    let vectors = index.vectors.read();
+    // The blocks read in order, the nearest `k` kept as they come: see
+    // `flat`. Which of equal distances are kept, and their order, follow
+    // the slots; before the slots, a hash map's order decided.
     let prepared = PreparedQuery::new(metric, query);
-
-    let mut scored: Vec<(f32, &str)> = vectors
-        .iter()
-        .filter(|(_, vec)| vec.len() == query.len())
-        .map(|(key, vec)| (prepared.to_raw(vec), key.as_str()))
-        .collect();
-
-    // partial_sort_unstable would be ideal but isn't in std.
-    // select_nth_unstable partitions so that element k is in its sorted position
-    // and everything before it is <= it — O(n) average, no full sort needed.
-    // This is the standard competitive KNN trick for FLAT search.
-    if scored.len() > k {
-        scored.select_nth_unstable_by(k, |a, b| a.0.total_cmp(&b.0));
-        scored.truncate(k);
-    }
-
-    // Now sort the kept k results ascending by distance
-    scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-
-    scored
-        .into_iter()
-        .map(|(score, key)| KnnResult {
-            key: key.to_string(),
-            score,
-        })
-        .collect()
+    index.nearest(&prepared, k, None).0
 }
 
 /// Algorithm 4 from the HNSW paper — heuristic neighbor selection.

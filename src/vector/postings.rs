@@ -1454,6 +1454,8 @@ pub struct Postings {
     order: KeyOrder,
     /// Writes so far: the thread settles what is left once it stops moving.
     writes: u64,
+    /// Ids given back so far ([`Postings::given_back`]).
+    given_back: u64,
     /// By id: its key's cluster hash slot, for a query in a cluster to keep
     /// only the documents of the slots its node serves without hashing
     /// every key it matches.
@@ -1827,6 +1829,14 @@ impl Postings {
         self.ids.len()
     }
 
+    /// How many times an id has been given back (a document left, or every
+    /// one did: [`Postings::clear`]). Ids are given out again, so a set of
+    /// ids read before this moved may name, by an id given back and out
+    /// again, a document it was not worked out for.
+    pub fn given_back(&self) -> u64 {
+        self.given_back
+    }
+
     pub fn is_empty(&self) -> bool {
         self.ids.len() == 0
     }
@@ -1985,6 +1995,7 @@ impl Postings {
         self.keys[id as usize] = None;
         self.live.unset(id);
         self.free.push(id);
+        self.given_back += 1;
         self.order.removed(id);
     }
 
@@ -1993,6 +2004,7 @@ impl Postings {
         let mut fresh = Postings {
             unused: self.unused,
             read_all: self.read_all,
+            given_back: self.given_back + 1,
             ..Postings::default()
         };
         for field in &self.fields {
