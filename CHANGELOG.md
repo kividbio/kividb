@@ -596,6 +596,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   also what runs under Docker's default seccomp profile (it refuses
   io_uring), is unchanged. See docs/PERFORMANCE.md, "Request-response from
   many connections"; suite 49 of `benchmarks/1.3.0/regressions` measures it.
+- **A `SETBIT` that leaves the bit as it is, and a `BITFIELD` or
+  `BITFIELD_RO` that writes nothing, no longer copy a long string (part of
+  #1016).** `SETBIT` reads the bit where the string is kept and copies the
+  string only when it writes. `BITFIELD` and `BITFIELD_RO` read a string of
+  4 KiB or more where it is kept and copy it only for a write that
+  succeeds; a shorter one kept in its key's entry is still copied once to
+  be read. The time these commands take no longer grows in proportion to
+  the string's length: on a 64 MiB string, on an Apple M3 Pro
+  (`--threads 4`, server time, median of 3), a `SETBIT` that changes
+  nothing takes 0.41 µs (master 1,785 µs) and a `BITFIELD` with one `GET`
+  0.17 µs (master 2,849 µs).
 - **A save keeps about 8 MiB of collections in memory a capture thread
   while the disk keeps up (#825).** A save lays out the values that are not strings when it
   captures the dataset, with writes held. For `dump.kdb` each capture thread
