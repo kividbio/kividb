@@ -397,8 +397,12 @@ fn used_memory_counts_the_room_an_append_keeps() {
         "{after} after appends in the room"
     );
     c.cmd(&[b"DEL", b"big"]);
-    std::thread::sleep(Duration::from_millis(200));
-    assert!(used(&mut c) < before - (len as i64) / 2, "the block went");
+    // Freed on the lazy-free thread: wait for the reading to settle there.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while used(&mut c) >= before - (len as i64) / 2 {
+        assert!(Instant::now() < deadline, "the block never went");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// A `BGSAVE` holds each string it captured until it has written it:

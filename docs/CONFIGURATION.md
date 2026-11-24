@@ -186,9 +186,11 @@ allocator can often extend a large block where it is, or remap its pages, rather
 a string built by many small appends costs about the same a call whatever its length. That
 room is allocated memory: `used_memory`, `maxmemory` and `MEMORY USAGE` count it, at most a
 fifth of the block (25 % of the string's length, 16 MiB at most); pages of it not yet written
-are usually address space only, not RSS. Nothing else sees it: replies, `STRLEN`, `DUMP`, `COPY`,
+are usually address space only, not RSS. Nothing else sees it: replies, `STRLEN`, `DUMP`,
 `DEBUG DIGEST-VALUE`, snapshots, the AOF and replication all use the string's length, and a
-string loaded from a snapshot, an AOF or a replica's full sync has none. A string that stops
+string loaded from a snapshot, an AOF or a replica's full sync has none. A `COPY` shares the
+block, room included, with the new key; the next write to either key copies it, an `APPEND` into
+a block with room and any other write at the string's exact length. A string that stops
 being appended to keeps its room until it is written again: a `SET` of another length gives
 it back, and active defrag does not move such blocks (they are not in the slabs). A string up to
 26,208 bytes gets no room beyond its block's size: appends move it from one block size to the

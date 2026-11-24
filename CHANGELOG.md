@@ -767,8 +767,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Standard_D4s_v5` (Xeon 8370C, Linux, release build, default threads, one
   connection, a bit set and cleared by turns, 2,000 calls), server time a
   call on a string of 64 KiB, 1 MiB and 64 MiB: 1.01, 1.13 and 1.01 µs
-  (master before this change: 4.08, 131 and 70,684 µs; Redis 8.12.0: 0.33,
-  0.37 and 0.48 µs); the client's time a call, round trip included, 29.6,
+  (master before this change: 4.08, 131 and 70,684 µs; Redis 8.12.0, run by
+  hand on the same machine: 0.33, 0.37 and 0.48 µs); the client's time a call, round trip included, 29.6,
   31.0 and 28.3 µs (33.2, 175 and 70,802 µs; Redis 28.2, 28.2 and 32.1 µs).
 - **An `APPEND` writes where the string is kept, and a long string keeps
   room for the next appends (part of #1016).** When nothing but its key
@@ -788,16 +788,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   once, into a block with that room, and the holder keeps the bytes from
   before. The room is allocated memory: `used_memory`, `maxmemory` and
   `MEMORY USAGE` count it, at most a fifth of the block. Replies, `STRLEN`,
-  `DUMP`, `COPY`, `DEBUG DIGEST-VALUE`, snapshots, the AOF and replication
-  use the string's length, and a string loaded from a snapshot or a full
-  sync has no room; a string that stops being appended to keeps its room
+  `DUMP`, `DEBUG DIGEST-VALUE`, snapshots, the AOF and replication use the
+  string's length, and a string loaded from a snapshot or a full sync has
+  no room. A `COPY` shares the block, room included, with the new key; the
+  next write to either key copies it, an `APPEND` into a block with room and
+  any other write at the string's exact length. A string that stops being appended to keeps its room
   until a `SET` of another length writes it. Replies, time to live, `WATCH`,
   keyspace events, the dirty count, the AOF and replication are as before,
   an empty `APPEND` included (it counts as a write, as in Redis). Inline,
   slab and entry layouts and the string header are unchanged: a block of
   the system allocator's has a size word in front of its header. On an
   Azure `Standard_D4s_v5` (Xeon 8370C, Linux, release build, default
-  threads, one connection), server time a call (`INFO commandstats`) of an
+  threads, one connection; Redis 8.12.0 in this entry is a run made by hand
+  on the same machine, beside the suite's pinned Redis 8.10.2), server time a call (`INFO commandstats`) of an
   `APPEND` of 3 bytes onto a string of 64 KiB, 1 MiB and 64 MiB: 0.88, 0.50
   and 0.33 µs (master before this change: 2.83, 70.1 and 37,767 µs; Redis
   8.12.0: 0.70, 0.34 and 0.50 µs); of 1 KiB: 1.00, 0.68 and 1.48 µs (86.0,

@@ -279,6 +279,8 @@ impl SharedBytes {
     /// [`fits`](Self::fits)`(bytes.len())`.
     pub unsafe fn write_in_place(&self, bytes: &[u8]) {
         debug_assert!(self.is_unique() && self.fits(bytes.len()));
+        // The length says how the block is freed: it keeps its kind.
+        debug_assert_eq!(is_big(self.len()), is_big(bytes.len()));
         let block = self.to.as_ptr();
         // SAFETY: as the caller says, nothing reads the bytes or the length
         // while they change, and the block has room for `bytes` in its class.
@@ -302,6 +304,7 @@ impl SharedBytes {
         let len = self.header().len as usize;
         let end = len.max(offset + patch.len());
         debug_assert!(self.is_unique() && self.fits(end));
+        debug_assert_eq!(is_big(len), is_big(end));
         let block = self.to.as_ptr();
         // SAFETY: as in `write_in_place`; the block has room for `end` bytes.
         unsafe {
@@ -679,16 +682,27 @@ mod tests {
     /// else a slab's block replaced and a large one grown by a quarter.
     /// The allocator counts each block at its whole size, room included,
     /// and a block is freed with the size it was allocated with.
+    ///
+    /// Each start is run twice and only the second run's counts are held to
+    /// the blocks' sizes: the first slab of a class, or a new region, a
+    /// process takes grows the slabs' own lists (`value_slab`'s `Vec`s of
+    /// slabs and regions), which the allocator counts too, on the thread
+    /// that took it. In a process of its own (nextest) that is this test's
+    /// first run; the steps where it happened are printed.
     #[test]
     fn appends_write_in_the_room_and_grow_a_large_block_by_a_quarter() {
         let slab = crate::value_slab::MAX_BLOCK - HEADER;
         let largest = crate::value_slab::class_of(crate::value_slab::MAX_BLOCK);
-        for start in [0, 100, 4000, 20_000, slab + 1, 1 << 20] {
+        for (run, start) in [0, 100, 4000, 20_000, slab + 1, 1 << 20]
+            .into_iter()
+            .flat_map(|start| [(0, start), (1, start)])
+        {
             let mut model: Vec<u8> = (0..start).map(|i| (i % 251) as u8).collect();
             model.reserve(4 << 20);
             let extras: Vec<Vec<u8>> = (0..400)
                 .map(|i| vec![(i % 7) as u8 + 1; [3, 1000, 9000][i % 3]])
                 .collect();
+            let regions_before = crate::value_slab::regions();
             let made = counted(|| {
                 let mut bytes = SharedBytes::from(&model[..]);
                 assert_eq!(bytes.spare(), 0);
@@ -730,7 +744,17 @@ mod tests {
                             as isize
                     };
                     if let Some(delta) = delta {
-                        assert_eq!(delta, counted_as(bytes.heap_size()) - counted_as(heap));
+                        let want = counted_as(bytes.heap_size()) - counted_as(heap);
+                        if run == 1 {
+                            assert_eq!(delta, want, "{start}: {len}");
+                        } else if delta != want {
+                            let regions = crate::value_slab::regions() - regions_before;
+                            eprintln!(
+                                "first run, start {start}: {len} bytes counted {delta}, \
+                                 the blocks {want} ({} more; {regions} regions so far)",
+                                delta - want
+                            );
+                        }
                     }
                 }
                 // About 2 MiB in quarters from a few KiB: a few dozen growths.
@@ -738,10 +762,13 @@ mod tests {
                 drop(bytes);
             });
             if let Some(made) = made {
-                assert_eq!(
-                    made, 0,
-                    "{start}: freed with another size than it was allocated with"
-                );
+                eprintln!("run {run}, start {start}: {made} bytes still counted after the drop");
+                if run == 1 {
+                    assert_eq!(
+                        made, 0,
+                        "{start}: freed with another size than it was allocated with"
+                    );
+                }
             }
         }
     }

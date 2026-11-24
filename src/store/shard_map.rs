@@ -35,7 +35,7 @@
 //! **Writes in place.** A string written over a string kept inline goes
 //! into the same block when the table alone holds the entry, the key is not
 //! past its time, and the new length keeps the block in its slab class
-//! ([`ShardMap::set_str`], `append_in_place`, `set_range_in_place`,
+//! ([`ShardMap::set_str`], `append_str`, `set_range_in_place`,
 //! `edit_str_in_place`): nothing is allocated or freed, and the entry
 //! stays where it is. A string of its own is written in its block the
 //! same way when the entry is also its bytes' only holder. Anything else,
@@ -1048,29 +1048,6 @@ impl ShardMap {
         )
     }
 
-    /// `extra` added to the end of `key`'s string, in its own entry, if that
-    /// can be done (see the module). Returns the string's new length if it
-    /// was; `None` leaves everything as it was, for the caller to write a
-    /// new value.
-    pub fn append_in_place(
-        &mut self,
-        key: &(impl AsRef<[u8]> + ?Sized),
-        extra: &[u8],
-    ) -> Option<usize> {
-        let key = key.as_ref();
-        let hash = self.hash_of(key);
-        let map = self.id();
-        let entry = self.find_live(hash, key)?.entry();
-        let len = entry.inline_len()? + extra.len();
-        if !entry.fits_in_place(len) {
-            return None;
-        }
-        // SAFETY: locked for writing, held by the table alone, and in class.
-        unsafe { entry.write_at_in_place(len - extra.len(), extra) };
-        used(entry, hash, map);
-        Some(len)
-    }
-
     /// Redis's `APPEND`: `extra` added to the end of `key`'s string, the key
     /// made if it is not there (or is past its time). Returns the string's
     /// new length, and what was written: [`Written::Replaced`]'s entry is
@@ -1153,7 +1130,7 @@ impl ShardMap {
         if !entry.fits_in_place(len) {
             return None;
         }
-        // SAFETY: as in `append_in_place`.
+        // SAFETY: locked for writing, held by the table alone, and in class.
         unsafe { entry.write_at_in_place(offset, patch) };
         used(entry, hash, map);
         Some(len)
@@ -2884,19 +2861,31 @@ mod tests {
         assert!(matches!(map.set_str("set", "6"), Written::Replaced(_)));
         assert_eq!(text(map.get("set")), Some(b"6".to_vec()));
         assert_eq!(map.expires("set"), None);
-        // APPEND and SETRANGE leave it to the caller's write of a new value.
+        // APPEND writes a new key over it, which is announced; SETRANGE
+        // leaves it to the caller's write of a new value.
         map.insert_str_expiring("app", "5", Some(1));
-        assert_eq!(map.append_in_place("app", b"6"), None);
+        assert!(matches!(
+            map.append_str("app", b"6", usize::MAX),
+            Ok((1, Written::Replaced(_)))
+        ));
+        assert_eq!(text(map.get("app")), Some(b"6".to_vec()));
+        assert_eq!(map.expires("app"), None);
         map.insert_str_expiring("rng", "5", Some(1));
         assert_eq!(map.set_range_in_place("rng", 0, b"6"), None);
         assert_eq!(
             map.take_left(),
-            vec![(ToSay::PastItsTime, crate::store::Key::from("set"))]
+            vec![
+                (ToSay::PastItsTime, crate::store::Key::from("set")),
+                (ToSay::PastItsTime, crate::store::Key::from("app")),
+            ]
         );
         // A live key is still written in place.
         map.insert_str_expiring("live", "5", Some(u64::MAX - 1));
         assert!(matches!(map.set_str("live", "6"), Written::InPlace));
-        assert_eq!(map.append_in_place("live", b"7"), Some(2));
+        assert!(matches!(
+            map.append_str("live", b"7", usize::MAX),
+            Ok((2, Written::InPlace))
+        ));
         assert_eq!(map.expires("live"), Some(u64::MAX - 1));
     }
 
@@ -3288,8 +3277,18 @@ mod tests {
     /// room; a block grown or made by an append has the room
     /// `room_for_append` says; each holder and each neighbouring string keeps
     /// its bytes.
+    ///
+    /// Strings step through the largest slab class too, which a
+    /// `value_slab` test owns: the run holds that test's lock, on a thread
+    /// that ends before the lock goes, so no slab of the class is left
+    /// owned by it.
     #[test]
     fn appends_in_place_and_copied_agree_with_a_model() {
+        let _one = crate::value_slab::EVACUATION_TESTS.lock();
+        std::thread::spawn(appends_model_run).join().unwrap();
+    }
+
+    fn appends_model_run() {
         use crate::shared_bytes::room_for_append;
         use rand::{Rng, SeedableRng};
         const SEED: u64 = 0x0a99_e4d0;
@@ -3297,8 +3296,7 @@ mod tests {
         let class = |len: usize| crate::value_slab::class_of(len + 8);
         let inline = crate::store::entry::INLINE_MAX;
         let slab = crate::value_slab::MAX_BLOCK - 8;
-        // The largest class is a `value_slab` test's alone: no length lands
-        // in it.
+        // The largest slab class: lengths past `below`, up to `slab`.
         let below = crate::value_slab::block_size(class(slab).unwrap() - 1) - 8;
         let largest = |len: usize| len > below && len <= slab;
         let shared = |map: &ShardMap| match map.get("k") {
@@ -3311,14 +3309,17 @@ mod tests {
             bytes
         };
         let mut reached = std::collections::BTreeSet::new();
+        // How appends took bytes in the largest class to the system allocator.
+        let mut top_to_system = std::collections::BTreeSet::new();
         for case in 0..300 {
-            let len = match rng.gen_range(0..6) {
+            let len = match rng.gen_range(0..7) {
                 0 => rng.gen_range(0..=64),
                 1 => rng.gen_range(inline - 64..=inline + 64),
                 2 => rng.gen_range(inline + 1..=below),
                 3 => rng.gen_range(slab + 1..=96 << 10),
                 4 => rng.gen_range(1 << 20..=3 << 20),
-                _ => rng.gen_range(below - 2000..=below),
+                5 => rng.gen_range(below - 2000..=below),
+                _ => rng.gen_range(below + 1..=slab),
             };
             let mut model = random(&mut rng, len);
             let ttl = rng.gen_bool(0.5).then_some(u64::MAX - 1);
@@ -3342,7 +3343,7 @@ mod tests {
                     _ if len < 6 << 20 => rng.gen_range(5001..=2 << 20),
                     _ => 100,
                 };
-                if largest(len + extra_len) {
+                if largest(len + extra_len) && rng.gen_bool(0.5) {
                     // Past the largest class instead, to the system allocator.
                     extra_len = slab + 1 - len + rng.gen_range(0..64);
                 }
@@ -3400,6 +3401,9 @@ mod tests {
                         other => panic!("{what}: map {i}: {:?}", other.as_ref().err()),
                     };
                     reached.insert((before[i].0, class(len).is_some(), how));
+                    if before[i].0 && largest(len) && class(grown).is_none() {
+                        top_to_system.insert(how);
+                    }
                     assert!(text(map.get("k")) == Some(model.clone()), "{what}: map {i}");
                     assert_eq!(map.expires("k"), ttl, "{what}: map {i}");
                     if i == 1 && held && extra_len > 0 {
@@ -3465,6 +3469,58 @@ mod tests {
                 "{want:?} never reached: {reached:?}"
             );
         }
+        // From the largest slab class to a block of the system allocator's:
+        // the entry kept (and the room set), and copied when held.
+        for want in [Appended::Grown, Appended::Copied] {
+            assert!(
+                top_to_system.contains(&want),
+                "the largest class to a system block {want:?}: {top_to_system:?}"
+            );
+        }
+    }
+
+    /// A `SET` onto a string an `APPEND` grew: the same length is written in
+    /// place and keeps the room; any other length, large or across 26,208
+    /// bytes either way, is a new block of exactly its length.
+    #[test]
+    fn a_set_onto_a_block_an_append_grew() {
+        use crate::shared_bytes::room_for_append;
+        let spare = |map: &ShardMap| match map.get("k") {
+            Some(ValueRef::String(s)) => s.spare(),
+            _ => panic!("no string"),
+        };
+        let slab = crate::value_slab::MAX_BLOCK - 8;
+        let mut map = ShardMap::new();
+        let grow = |map: &mut ShardMap, extra: usize| {
+            let (n, written) = map.append_str("k", &vec![5u8; extra], usize::MAX).unwrap();
+            assert!(matches!(written, Written::InPlace), "{n}");
+            assert_eq!(spare(map), room_for_append(n) - n, "{n}");
+            n
+        };
+        map.set_str("k", pattern(100_000));
+        let grown = grow(&mut map, 4);
+        let at = bytes_at(&map, "k");
+        assert!(matches!(map.set_str("k", vec![7u8; grown]), Written::InPlace));
+        assert_eq!(bytes_at(&map, "k"), at);
+        assert_eq!(spare(&map), room_for_append(grown) - grown);
+        assert_eq!(text(map.get("k")), Some(vec![7u8; grown]));
+        // Shorter, longer, and just past the slabs: large, no room.
+        for (n, fill) in [(grown - 1, 1u8), (grown + 1, 2), (slab + 1, 3)] {
+            assert!(matches!(map.set_str("k", vec![fill; n]), Written::Replaced(_)), "{n}");
+            assert_eq!(spare(&map), 0, "{n}");
+            assert_eq!(text(map.get("k")), Some(vec![fill; n]), "{n}");
+        }
+        // Down across 26,208 bytes to a slab's block (not the largest
+        // class, a `value_slab` test's), and up again.
+        grow(&mut map, 1000);
+        for (n, fill) in [(20_000, 4u8), (50_000, 6), (10_000, 8)] {
+            assert!(matches!(map.set_str("k", vec![fill; n]), Written::Replaced(_)), "{n}");
+            assert_eq!(spare(&map), 0, "{n}");
+            assert_eq!(text(map.get("k")), Some(vec![fill; n]), "{n}");
+            if n == 50_000 {
+                grow(&mut map, 10);
+            }
+        }
     }
 
     /// An append onto a string a `COPY` shares copies it once, with room;
@@ -3495,6 +3551,26 @@ mod tests {
         let mut want = pattern(len);
         want.push(b'!');
         assert_eq!(text(map.get("b")), Some(want));
+        // A COPY of a string with room shares the block, room and all; a
+        // write other than an APPEND to either copies it at its length.
+        let spare = |map: &ShardMap, key: &str| match map.get(key) {
+            Some(ValueRef::String(s)) => s.spare(),
+            _ => panic!("no string"),
+        };
+        let room = spare(&map, "a");
+        assert!(room > 0);
+        let value = map.get("a").expect("a").to_value();
+        drop(map.insert("c", value));
+        assert_eq!(bytes_at(&map, "c"), bytes_at(&map, "a"));
+        assert_eq!(spare(&map, "c"), room);
+        assert!(matches!(
+            map.edit_str_in_place("c", 0, b"Z"),
+            Some(Written::Replaced(_))
+        ));
+        assert_eq!(spare(&map, "c"), 0);
+        assert_eq!(spare(&map, "a"), room);
+        assert_eq!(text(map.get("a")).unwrap()[0], pattern(1)[0]);
+        assert_eq!(text(map.get("c")).unwrap()[0], b'Z');
     }
 
     /// `APPEND`'s refusals write nothing; a key not there is made, an empty

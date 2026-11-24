@@ -667,7 +667,15 @@ impl Entry {
     /// The caller holds the shard for writing, the table holds the entry,
     /// and the string's length after it is at most `shared_bytes::MAX_LEN`.
     pub(super) unsafe fn append_own(self, extra: &[u8]) -> Option<bool> {
+        // Both counts read through the shared view first: on the copy path
+        // (`None`) no `&mut` to the value is ever made, while the caller
+        // still borrows its bytes.
         if self.form() != WHOLE || self.holders() != 1 {
+            return None;
+        }
+        // Every new holder of the bytes starts from one that exists, and
+        // this entry is the only one: none can start before this ends.
+        if !matches!(self.whole(), KiviDBValue::String(bytes) if bytes.is_unique()) {
             return None;
         }
         // SAFETY: the only hold is the table's and the shard is locked for
@@ -676,15 +684,13 @@ impl Entry {
         let value = unsafe {
             &mut *(self.base().add(whole_at(self.klen(), self.has_ttl())) as *mut KiviDBValue)
         };
-        match value {
-            // Every new holder of the bytes starts from one that exists, and
-            // this entry is the only one: none can start before this ends.
-            // SAFETY: the bytes' only holder, out of everybody else's reach,
-            // and nothing keeps their address: a reply copies them, and
-            // whatever keeps them holds them.
-            KiviDBValue::String(bytes) if bytes.is_unique() => Some(unsafe { bytes.append(extra) }),
-            _ => None,
-        }
+        let KiviDBValue::String(bytes) = value else {
+            unreachable!("a string, as read just above")
+        };
+        // SAFETY: the bytes' only holder, out of everybody else's reach, and
+        // nothing keeps their address: a reply copies them, and whatever
+        // keeps them holds them.
+        Some(unsafe { bytes.append(extra) })
     }
 
     /// # Safety
