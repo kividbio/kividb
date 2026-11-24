@@ -46,18 +46,29 @@ with writes held, a write is in exactly one of them.
 What a snapshot adds to memory while it is written: strings are only held
 (a string written over or deleted meanwhile is freed once it has been
 written), but the other values (lists, sets, sorted sets, hashes, streams)
-change in place, so they are laid out when the dataset is captured. Each
-capture thread keeps at most 8 MiB of that and writes the rest to a spill
-file in the data directory, copied into `dump.kdb` as the snapshot is
-written: at most 64 MiB a save for the collections, whatever their size
-(#825). The spill files have no name (`O_TMPFILE` where the filesystem has
-it, otherwise a temporary file removed as soon as it is open), so nothing is
-left in the directory however the save ends; they take as much disk as the
-collections' part of the dump until the snapshot is written. A save that
-cannot write them (a full disk) fails, writes go on, and the previous
-`dump.kdb` stays. Before, every collection was kept in memory until the
-snapshot was written: for 20,000 sorted sets of 800 members, 480 MB. A
-replica's full sync and an online backup still make their image in memory.
+change in place, so they are laid out when the dataset is captured, with
+writes held. Each capture thread lays them out in 1 MiB buffers and hands
+each one, once full, to a writer thread that writes it to a spill file in
+the data directory; the snapshot copies them into `dump.kdb` as it is
+written. A capture thread does not wait for that writer: when the disk is
+behind, a full buffer stays in memory until the writer has room, so writes
+are held about as long as in 1.2.2, and a save holds about 8 MiB a capture
+thread (at most 64 MiB) while the disk keeps up (#825). For 20,000 sorted
+sets of 800 members (a 480 MB dump), a save adds 30 to 55 MB to
+`used_memory` (1.2.2: about 540 MB). There is one spill file a capture
+thread, with no name (`O_TMPFILE` where
+the filesystem has it, otherwise a temporary file removed as soon as it is
+open), so nothing is left in the directory however the save ends (the
+fallback's file, should the process die before it is removed, is removed at
+the next start). Each part is checked against the xxh3 its writer took as it
+is read back, and its blocks are given back once copied
+(`FALLOC_FL_PUNCH_HOLE`, on Linux), so the spill files take what is still to
+be copied: a save needs room for about one dump beside the previous
+`dump.kdb` (on a filesystem without hole punching, the collections' part of
+the dump more, until the snapshot is written). A save whose spill fails (a full disk, bytes read back otherwise
+than they were written) fails, writes go on, and the previous `dump.kdb`
+stays. A replica's full sync and an online backup make their image in
+memory.
 
 If a checkpoint is stopped part way (a crash, a kill), the previous log is
 kept as `appendonly.aof.prev`. At the next start it is replayed, and then

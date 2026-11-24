@@ -6070,7 +6070,7 @@ fn freeze(
         None => Vec::new(),
     };
     // Set by a capture thread that fails: the others stop at their next
-    // shard, and writes are held no longer than it takes to find out.
+    // shard, and writes are held only as long as it takes to find out.
     let failed = std::sync::atomic::AtomicBool::new(false);
     for db in store.iter() {
         let shards: Vec<_> = db.iter().collect();
