@@ -590,7 +590,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sets of 800 members (a 480 MB dump), `Pss` grows by 12 MiB during the
   save (1.2.2: 461 MiB) and the slowest write meanwhile takes 358 ms (1.2.2:
   384 ms); for 20,000 hashes of 800 fields (672 MB), 2.5 MiB (1.2.2: 642
-  MiB). On a disk that does not keep up the buffers wait in memory, and the
+  MiB) and the slowest write 511 ms (1.2.2: 498 ms). The capture walks a
+  hash or set kept as a table asking for its entries a few groups ahead
+  of the one it reads, and writes a field name of ASCII bytes as it is.
+  On a disk that does not keep up the buffers wait in memory, and the
   save holds up to what 1.2.2 holds. The dump is the same, byte for byte.
   A save whose spill
   fails (a full disk, bytes read back otherwise than written) fails, writes
