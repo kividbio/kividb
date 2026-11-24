@@ -370,6 +370,9 @@ fn create(ctx: &mut Ctx) -> Result<(), String> {
                     .trim_matches(|c: char| c.is_ascii_whitespace())
                     .parse::<f64>()
                     .map_err(|_| "Invalid score".to_string())?;
+                // Not `!(0.0..=1.0).contains(&score)`: that refuses NaN,
+                // which Redis 8.10 takes (`SCORE nan` is `OK` there).
+                #[allow(clippy::manual_range_contains)]
                 if score > 1.0 || score < 0.0 {
                     return Err("Invalid score".into());
                 }
