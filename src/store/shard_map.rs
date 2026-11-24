@@ -3017,6 +3017,173 @@ mod tests {
         assert_eq!(text(map.get("k")), Some(b"abc".to_vec()));
     }
 
+    /// Seeded random edits, each made on two maps: on one nothing else holds
+    /// the string, on the other a holder may make the edit copy it. Both
+    /// end as a model says; in place exactly when the block has room;
+    /// each holder and each neighbouring string keeps its bytes.
+    #[test]
+    fn edits_in_place_and_copied_agree_with_a_model() {
+        use rand::{Rng, SeedableRng};
+        const SEED: u64 = 0x5e7_b175;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
+        // The slab class of bytes of their own, after their 8-byte header.
+        let class = |len: usize| crate::value_slab::class_of(len + 8);
+        let top = |len: usize| class(len).map(|c| crate::value_slab::block_size(c) - 8);
+        let inline = crate::store::entry::INLINE_MAX;
+        let slab = crate::value_slab::MAX_BLOCK - 8;
+        // The largest class is a `value_slab` test's alone: kept out of it.
+        let below = crate::value_slab::block_size(class(slab).unwrap() - 1) - 8;
+        let largest = |len: usize| len > below && len <= slab;
+        assert!(class(below) != class(slab) && class(below + 1) == class(slab));
+        // Bytes of their own: a second hold shares them, not a copy.
+        let own = |map: &ShardMap| match map.get("k") {
+            Some(ValueRef::String(s)) => s.to_shared().as_ptr() == s.as_bytes().as_ptr(),
+            _ => panic!("no string"),
+        };
+        let random = |rng: &mut rand::rngs::StdRng, len: usize| {
+            let mut bytes = vec![0u8; len];
+            rng.fill(&mut bytes[..]);
+            bytes
+        };
+        // Each form of string the cases wrote in place, and copied.
+        let mut reached = std::collections::BTreeSet::new();
+        for case in 0..400 {
+            let len = match rng.gen_range(0..6) {
+                0 => rng.gen_range(0..=64),
+                1 => rng.gen_range(inline - 64..=inline + 64),
+                2 => rng.gen_range(inline + 1..=below),
+                3 => top(rng.gen_range(inline + 1..=below)).unwrap(),
+                4 => [below - rng.gen_range(0..=32), slab + rng.gen_range(1..=32)]
+                    [rng.gen_range(0..2)],
+                _ => rng.gen_range(slab + 1..=96 << 10),
+            };
+            let mut model = random(&mut rng, len);
+            let ttl = rng.gen_bool(0.5).then_some(u64::MAX - 1);
+            let neighbours: Vec<Vec<u8>> = (0..3).map(|_| random(&mut rng, len)).collect();
+            let mut maps = [ShardMap::new(), ShardMap::new()];
+            for map in &mut maps {
+                // Strings of the same length, in blocks beside the edited one.
+                map.set_str("n0", &neighbours[0]);
+                map.set_str("n1", &neighbours[1]);
+                map.insert_str_expiring("k", &model, ttl);
+                map.set_str("n2", &neighbours[2]);
+            }
+            for step in 0..8 {
+                let len = model.len();
+                let patch_len = match rng.gen_range(0..8) {
+                    0 => 0,
+                    1..=5 => rng.gen_range(1..=8),
+                    6 => rng.gen_range(9..=300),
+                    _ => rng.gen_range(301..=5000),
+                };
+                let patch = random(&mut rng, patch_len);
+                // Where the patch ends: in the string, past it, or at a limit
+                // of the block, the entry or the slabs, and one byte past.
+                let end = match rng.gen_range(0..5) {
+                    0 if len > 0 => rng.gen_range(1..=len),
+                    0 | 1 => len + rng.gen_range(0..=64),
+                    2 => top(len).filter(|_| own(&maps[0])).unwrap_or(len),
+                    3 => [inline, below][rng.gen_range(0..2)],
+                    _ => len + 1,
+                } + rng.gen_range(0..=1);
+                // Past the largest class instead, to the system allocator.
+                let end = if largest(len.max(end)) { slab + 1 } else { end };
+                let offset = end.saturating_sub(patch.len());
+                let end = offset + patch.len();
+                let grown = len.max(end);
+                assert!(!largest(grown), "{grown}");
+                let at = maps.each_ref().map(|map| bytes_at(map, "k"));
+                let owns = maps.each_ref().map(own);
+                // 0: nothing; 1: the entry (a snapshot); 2: its bytes (a
+                // reply); 3: a second entry sharing them; 4: let go before.
+                let holder = rng.gen_range(0..5);
+                let entry = (holder == 1).then(|| maps[1].get_ref("k").expect("k"));
+                let bytes = (holder == 2).then(|| match maps[1].get("k") {
+                    Some(ValueRef::String(s)) => s.to_shared(),
+                    _ => panic!("no string"),
+                });
+                if holder == 3 {
+                    let value = maps[1].get("k").expect("k").to_value();
+                    drop(maps[1].insert("twin", value));
+                }
+                if holder == 4 {
+                    drop(maps[1].get_ref("k"));
+                }
+                // Whether the bytes are shared, not copied for the holder.
+                let shared = match holder {
+                    2 => bytes.as_ref().is_some_and(|b| b.as_ptr() as usize == at[1]),
+                    3 => bytes_at(&maps[1], "twin") == at[1],
+                    _ => false,
+                };
+                let written = [
+                    maps[0].edit_str_in_place("k", offset, &patch),
+                    maps[1].edit_str_in_place("k", offset, &patch),
+                ];
+                let old = model.clone();
+                model.resize(grown, 0);
+                model[offset..end].copy_from_slice(&patch);
+                let what = format!(
+                    "seed {SEED:#x}, case {case}, step {step}: {len} bytes, own {owns:?}, \
+                     {} written at {offset}, holder {holder}",
+                    patch.len()
+                );
+                if holder == 2 {
+                    // A reply shares bytes of their own, and copies an entry's.
+                    assert_eq!(shared, owns[1], "{what}");
+                }
+                for (i, map) in maps.iter().enumerate() {
+                    let in_place = match &written[i] {
+                        Some(Written::InPlace) => true,
+                        Some(Written::Replaced(_)) => false,
+                        _ => panic!("{what}: map {i} not written"),
+                    };
+                    assert_eq!(bytes_at(map, "k") == at[i], in_place, "{what}: map {i}");
+                    if i == 0 {
+                        reached.insert((owns[0], class(len).is_some(), in_place));
+                    }
+                    assert!(text(map.get("k")) == Some(model.clone()), "{what}: map {i}");
+                    assert_eq!(map.expires("k"), ttl, "{what}: map {i}");
+                    // Only bytes of their own can tell: an entry's room
+                    // depends on its key and header too.
+                    if i == 1 && (holder == 1 || shared) {
+                        assert!(!in_place, "{what}: map {i} held");
+                    } else if owns[i] {
+                        let room = match class(len) {
+                            Some(c) => class(grown) == Some(c),
+                            None => grown == len,
+                        };
+                        assert_eq!(in_place, room, "{what}: map {i}");
+                    }
+                }
+                if let Some(entry) = entry {
+                    match entry.value() {
+                        ValueRef::String(s) => assert!(s.as_bytes() == old, "{what}: entry"),
+                        _ => panic!("{what}: not a string"),
+                    }
+                }
+                if let Some(bytes) = bytes {
+                    assert!(bytes[..] == old[..], "{what}: bytes");
+                }
+                if holder == 3 {
+                    assert!(text(maps[1].get("twin")) == Some(old), "{what}: twin");
+                    drop(maps[1].remove("twin"));
+                }
+            }
+            for map in &maps {
+                for (n, want) in neighbours.iter().enumerate() {
+                    let key = format!("n{n}");
+                    let got = text(map.get(&key));
+                    assert!(
+                        got.as_ref() == Some(want),
+                        "seed {SEED:#x}, case {case}: {key}"
+                    );
+                }
+            }
+        }
+        // In the entry, a slab block and a block of its own: each both ways.
+        assert_eq!(reached.len(), 6, "{reached:?}");
+    }
+
     #[test]
     fn a_command_sees_one_time_across_its_write_locks() {
         let shard = crate::store::ShardLock::default();

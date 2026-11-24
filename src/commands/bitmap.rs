@@ -870,6 +870,36 @@ mod tests {
     /// database 0: the reply, whether the write is left unpropagated, and
     /// the most the handler allocated at once, if this thread counts it.
     fn run(store: &store::Store, line: &str) -> (Vec<u8>, bool, Option<isize>) {
+        with_ctx(store, line, &crate::watch::NoopWatchRegistry, |mut ctx| {
+            let name = line.split(' ').next().unwrap();
+            let (reply, peak) = crate::memory_use::peak_during(|| handle(&mut ctx, name));
+            (reply.unwrap(), ctx.skip_write_side_effects, peak)
+        })
+    }
+
+    /// `line` run as a client's command is, by the dispatcher, which tells
+    /// `watches` and the keyspace events of what it writes.
+    fn dispatched(
+        store: &store::Store,
+        line: &str,
+        watches: &dyn crate::watch::WatchNotifier,
+    ) -> Vec<u8> {
+        with_ctx(
+            store,
+            line,
+            watches,
+            crate::commands::handler::execute_command,
+        )
+    }
+
+    /// `f` given a context for `line`, split at spaces, on `store`'s
+    /// database 0.
+    fn with_ctx<R>(
+        store: &store::Store,
+        line: &str,
+        watches: &dyn crate::watch::WatchNotifier,
+        f: impl FnOnce(Ctx) -> R,
+    ) -> R {
         let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
         let (hub_tx, _hub_rx) = crate::replication::HubTx::channel();
         let repl_state = Arc::new(crate::replication::ReplState::new_master());
@@ -890,7 +920,7 @@ mod tests {
         let monitor_registry = crate::monitor::new_monitor_registry();
         let tracking_table = crate::tracking::new_tracking_table();
         let mut selected_db = 0usize;
-        let mut ctx = Ctx {
+        f(Ctx {
             cmd: line.split(' ').map(str::as_bytes).collect(),
             store,
             lastsave: &lastsave,
@@ -906,7 +936,7 @@ mod tests {
             pubsub: &pubsub,
             hub_tx: &hub_tx,
             repl_state: &repl_state,
-            watch_registry: &crate::watch::NoopWatchRegistry,
+            watch_registry: watches,
             client_id: 0,
             client_registry: &client_registry,
             resp: 2,
@@ -925,10 +955,7 @@ mod tests {
             authenticated_user: "default",
             tracking_table: &tracking_table,
             blocking: None,
-        };
-        let name = line.split(' ').next().unwrap();
-        let (reply, peak) = crate::memory_use::peak_during(|| handle(&mut ctx, name));
-        (reply.unwrap(), ctx.skip_write_side_effects, peak)
+        })
     }
 
     /// [`run`] in a test that counts allocations (see [`counting`]).
@@ -949,9 +976,24 @@ mod tests {
             return test();
         }
         assert!(std::env::var_os(CHILD).is_none(), "no counter in a child");
+        in_a_process_of_its_own(name, CHILD);
+    }
+
+    /// Runs `test` in a process of its own: it sets what the whole process
+    /// shares.
+    fn alone(name: &str, test: impl FnOnce()) {
+        const CHILD: &str = "KIVIDB_BITMAP_TEST_ALONE";
+        if std::env::var_os(CHILD).is_some() {
+            return test();
+        }
+        in_a_process_of_its_own(name, CHILD);
+    }
+
+    /// The test `name` run again in a new process, with `child` set there.
+    fn in_a_process_of_its_own(name: &str, child: &str) {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([name, "--exact", "--test-threads", "1"])
-            .env(CHILD, "1")
+            .env(child, "1")
             .status()
             .unwrap();
         assert!(status.success(), "{name} failed in a process of its own");
@@ -1189,6 +1231,58 @@ mod tests {
         assert!(reply.starts_with(b"-WRONGTYPE"));
         let map = store::get_shard(&store[0], b"set").read();
         assert!(matches!(map.get(b"set"), Some(ValueRef::Set(_))));
+    }
+
+    /// A `SETBIT` written in place breaks a `WATCH` on its key and announces
+    /// `setbit`, as one that copies a held value does. One that changes
+    /// nothing breaks no watch, and is announced as well (see
+    /// `keyspace_events_new.rs`). Alone: the event flags are the process's.
+    #[test]
+    fn a_setbit_written_in_place_breaks_a_watch_and_announces_itself() {
+        alone(
+            "commands::bitmap::tests::a_setbit_written_in_place_breaks_a_watch_and_announces_itself",
+            || {
+                use crate::keyspace_events as events;
+                use crate::watch::WatchNotifier;
+                use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+                events::KS_FLAGS.store(events::parse_ks_flags("KE$"), Relaxed);
+                let store = store::new_store(1);
+                let watches = crate::watch::WatchRegistryInner::new();
+                for (name, len) in [("inline", 100), ("slab", 16 << 10), ("own", 64 << 10)] {
+                    let key = name.as_bytes();
+                    put(&store, key, &vec![0; len]);
+                    // The bit, whether the value is held, whether it changes.
+                    for (bit, held, changes) in
+                        [(0, false, true), (0, false, false), (9, true, true)]
+                    {
+                        let shard = store::get_shard(&store[0], key);
+                        let held = held.then(|| shard.read().get_ref(key));
+                        let at = stored(&store, key).unwrap().1;
+                        let broken = Arc::new(AtomicBool::new(false));
+                        watches.watch(0, key, Arc::clone(&broken), false);
+                        events::hold();
+                        let line = format!("SETBIT {name} {bit} 1");
+                        let reply = dispatched(&store, &line, &watches);
+                        let announced = events::release();
+                        let case = format!("{line}, held: {}", held.is_some());
+                        assert_eq!(reply, resp_integer(i64::from(!changes)), "{case}");
+                        let in_place = stored(&store, key).unwrap().1 == at;
+                        assert_eq!(in_place, held.is_none(), "{case}");
+                        assert_eq!(broken.load(Relaxed), changes, "{case}: the watch");
+                        let mut space = b"__keyspace@0__:".to_vec();
+                        space.extend_from_slice(key);
+                        let event = b"__keyevent@0__:setbit".to_vec();
+                        let want: Vec<(Vec<u8>, Arc<[u8]>)> =
+                            vec![(space, Arc::from(&b"setbit"[..])), (event, Arc::from(key))];
+                        assert_eq!(announced, want, "{case}: the events");
+                        drop(held);
+                    }
+                    let mut want = vec![0; len];
+                    (want[0], want[1]) = (0x80, 0x40);
+                    assert_eq!(stored(&store, key).unwrap().0, want, "{name}");
+                }
+            },
+        );
     }
 
     /// A capture of the dataset holds each string's entry: what `BGSAVE`, a
