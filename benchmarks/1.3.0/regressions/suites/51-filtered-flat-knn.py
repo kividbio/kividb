@@ -21,14 +21,16 @@ second and p99. One server an engine, `--threads 4` (Redis `--io-threads 4
 --search-workers 4`), pinned to the first half of the CPUs, the client to
 the other half (`REGRESS_SERVER_CPUS` / `REGRESS_CLIENT_CPUS`). Before the
 rounds, the top 5 of 10 queries of each layout are checked against numpy
-(`wrong_top5`, exactly 0).
+(`wrong_top5`, exactly 0; the five keys, in any order: Redis returns
+them in no particular order without `SORTBY`).
 
 What #1020 changed: a FLAT index keeps its vectors in fixed blocks by slot,
 and a filtered query goes from each matching document id to its slot's
 vector; each vector was a separate allocation found by its key, and the
-large filter waits on memory (the profile of the issue). On a
-Standard_D8s_v5 the big layout went from 533 lookups a second (v1.2.2) to
-about 800-950, against Redis's 545.
+large filter waits on memory (the profile of the issue). In the recorded run
+(a Standard_D8s_v5, default builds, Redis 8.10.2) the big layout went from
+424 / 421 lookups a second (v1.2.2, 8 / 64 connections) to 834 / 844,
+against Redis's 477 / 495.
 
 Gates: `big` at 8 and 64 connections at least 1.25x v1.2.2's and 1.15x
 Redis's in the same session, and within 10 % of the recorded value;
@@ -62,9 +64,10 @@ ROUNDS = 3
 CLIENT_PROCS = 4
 POINTS = (8, 64)
 QUERIES = 256
-# The candidate measured 1.5-1.8x v1.2.2 and 1.5-1.7x Redis 8.12 on the big
-# layout (see the PR of #1020): these keep most of that, with room for a
-# run's noise.
+# The candidate measured 2.0x v1.2.2 and 1.7-1.75x Redis 8.10.2 on the big
+# layout in the recorded run (1.6x both with the lua,tls builds against
+# Redis 8.12, the issue's): these keep most of that, with room for a run's
+# noise.
 BIG_GATES = [vs_v1_2_2(0.8), vs_redis(0.87), THROUGHPUT]
 
 
@@ -241,7 +244,8 @@ def run(ctx):
                 want = [int(x) for x in ids[np.argsort(1 - vecs[ids] @ q)[:K]]]
                 res = search(c, layout, u, q.tobytes())
                 got = [int(res[i].decode().split(":")[1]) for i in range(1, len(res), 2)]
-                wrong += got != want
+                # As a set: with no SORTBY, Redis returns the hits in no particular order.
+                wrong += sorted(got) != sorted(want)
         ctx.emit("wrong_top5", wrong, "queries", "lower", gate=bound(max=0))
         del vecs
 

@@ -572,6 +572,43 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A FLAT vector index keeps its vectors in fixed blocks by slot, and a
+  filtered KNN goes from each matching document id to its vector (#1020).**
+  The vectors of a FLAT index are in blocks of slots that never move, each
+  on a cache line, in huge pages where the kernel gives them (the blocks an
+  HNSW graph keeps, without links), with the slot of each key and, in an
+  index with TAG, NUMERIC or TEXT fields, the slot of each document id. A
+  KNN of the whole index reads the blocks in order; one whose filter the
+  postings answer goes from each id the filter matched to its slot and
+  measures the vector there, and copies a key only for a vector among the
+  nearest so far. Each vector was a separate allocation found by its key: a
+  key, a hash and a jump to a 6 KB block (at 1536 dimensions) for each
+  matching document. An `HSET` of an indexed document writes its vector over
+  the one in its slot (decoded there, with no allocation), a delete gives
+  the slot back to the next document, and a scan lets the index's lock go
+  to a waiting writer every 256 vectors, as the filtered KNN let it go
+  every 256 keys. Replies are the same; of vectors at the same distance,
+  which a KNN of the whole index keeps follows the slots (it followed a
+  hash map's order). Nothing changes on disk or on the replication stream:
+  the index is built from the documents at load, as before. On an Azure
+  `Standard_D8s_v5` (Xeon 8370C), the server on vCPUs 0-3 (`--threads 4`;
+  Redis 8.12 `--io-threads 4 --search-workers 4`), a closed-loop client on
+  4-7, 100,000 HASH documents with a 1536-dimension FLOAT32 COSINE vector,
+  `KNN 5` with #1020's TAG filter of about 10,090 documents: 798 lookups a
+  second at 8 connections and 806 at 64 (p99 11.5 / 90 ms), against 502 /
+  510 for master before it, 486 / 482 for v1.2.2 and 488 / 500 for Redis
+  (p99 29 / 232 ms). A filter of 100 documents: 27,480 / 30,555 (median of
+  5; master 24,893 / 26,384, v1.2.2 25,076 / 27,003, Redis 12,168 /
+  14,556). No filter: 77 / 76 (master 58 / 50, v1.2.2 57 / 58, Redis 46 /
+  124). `HSET`s of a vector into the index (`redis-benchmark`, 16
+  connections, pipeline 16): 389,900 a second (master 380,600); the index
+  built again at load from 100,000 documents in 0.97 s (master 0.95 s,
+  median of 6 starts, which spread over 6 %). `used_memory` for the index,
+  a vector: 6,321 bytes at 100,000 x 1536 with a TAG field (master 6,325),
+  384 at 1,000 x 64 (443); a small index starts with blocks of 8 slots,
+  doubling, and at 100 x 64 takes 466 (425). Suite `51-filtered-flat-knn`
+  of `benchmarks/1.3.0/regressions` measures it; see docs/PERFORMANCE.md,
+  "Filtered KNN on a FLAT index".
 - **io_uring workers finish a waiting socket read without interrupting the
   worker (#1015).** Each worker's ring is made with
   `IORING_SETUP_COOP_TASKRUN` (Linux 5.19 and later; on an older kernel the

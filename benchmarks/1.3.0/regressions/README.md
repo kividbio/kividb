@@ -66,6 +66,7 @@ and why.
 | `47-bgsave-collections` | #825 | `BGSAVE` of large collections under writes: `zset` is #825's 20,000 Mastodon home feeds (sorted sets of 800 18-digit status ids; the writer adds a status to a random feed and trims it to 800), `hash` 20,000 hashes of 800 fields (the writer sets a field anew); one writer, pipelines of 40, from 2 s before `BGSAVE` to 1 s after it. The memory before, the peak from `BGSAVE` to its end and the growth (`Pss` summed over the server and the processes it forked, every 50 ms, as suite 39), the slowest `SET` of a probe process sending one every 1 ms during the save (writes are held for the capture), the growth of the server cgroup's `memory.current` and the peak of `Dirty:` in `/proc/meminfo` (the page cache of the spill files and the dump, shown), the dump's size and the save's time. Gates: growth at most 128 MiB (a capture thread hands what it lays out to a spill writer in 1 MiB buffers, 8 MiB of them a thread, #825) and within 25 % or 16 MiB of recorded, peak over idle 5 %, the slowest `SET` within 50 % or 10 ms of recorded and, in both configurations, at most 1.3x v1.2.2's this session; the save must succeed. v1.2.2 (grows by about the dump: +0.45 GiB for `zset`) and Redis shown. Server on the first half of the CPUs, clients on the other; `min_cpus=4`, recorded on a `Standard_D4s_v5` (`results/pr-1009-47-d4s_v5`; the `hash` rows in `results/hash-capture-47-d4s_v5`) |
 | `48-zset-rank-range` | #875 | one sorted set of 1,000, 100,000 and 1,000,000 members (`membr:<i>`, score i, `--threads 2`): `ZRANK` and `ZREVRANK` of a member in the middle half, `ZRANGE` of 10 from such a rank, `ZRANGEBYSCORE -inf +inf LIMIT <rank> 10`, `ZCOUNT` over a quarter of the set, `ZRANGEBYSCORE <score> +inf LIMIT 0 10`, and the writes `ZADD` of a new member at a random score with its `ZREM`, and a `ZINCRBY` that moves a member past the highest score and back: the server's own microseconds a call (`INFO commandstats`) and the client's wall time (reads), median of 3 rounds (writes: 2,000 pairs a round, 7 rounds: the server counts each call in whole microseconds, and a write takes one or two); replies checked in the timed rounds (a rank, a count, a range's first member) and, outside the timing, the first 100 calls of each case compared whole with replies worked out from the dataset (every member and score of a range, each write's reply) (`bad_replies` exactly 0). Gates: `bad_replies` exactly 0; `ZRANK`, `ZREVRANK`, `ZRANGE` from a rank, `ZCOUNT` and `ZRANGEBYSCORE ... LIMIT <rank> 10` at 100,000 and 1,000,000 members on the client's wall time a call against v1.2.2's in the same session, with a fixed floor of how many times faster (no recorded value): 1x (not slower) at 100,000 for `ZRANK`, `ZREVRANK`, `ZRANGE` and `ZCOUNT`, 3x for the `LIMIT` range; at 1,000,000 7x for `ZRANK`, `ZREVRANK` and `ZRANGE`, 3x for `ZCOUNT`, 40x for the `LIMIT` range (a third of the smallest gain seen in three runs, rounded down: a call's wall time carries about 45 us of round trip). Shown, not gated: every server-time row (the candidate's calls take under 5 us against a server clock in whole microseconds), every row at 1,000 members, `ZRANGEBYSCORE <score> +inf LIMIT 0 10` and the writes; their cost is held by the instruction-count rows of `scripts/perf`. Recorded on a D4s_v5 (`results/pr-875-d4s_v5`) |
 | `49-request-response` | #1015 | @keyv/redis's benchmark shape: 200,000 keys of 1 KB with a TTL, each connection one `SET ... PX` of a key of its share then nine `GET`s, every reply awaited and checked, from this suite's own client (one Python asyncio process a client CPU, at most 4), which is itself the limit, as Node's is in the issue; 1, 4, 16, 48 and 500 connections, `--threads 4` (Redis `--io-threads 4`) on the first half of the CPUs, the client on the other: operations a second, p50 and p99, the server's and the client's CPUs, median of 3 rounds. Gates at 48 connections: at most 1.03x worse than Redis and at least 1.01x better than v1.2.2 in the same session, and within 10 % of recorded; at 500, at most 1.08x worse than Redis; the rest shown. `min_cpus=8`, recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-49)) |
+| `51-filtered-flat-knn` | #1020 | KNN 5 on a FLAT FLOAT32 COSINE index of 100,000 1536-d HASH documents (numpy seed 1020) with #1020's TAG filter, `(@user_id:{user\-<u>|__shared__})`, about 10,090 matching documents (`big`), a second TAG field matching 100 (`small`) and no filter (`none`), one random user of 1,000 and query of 256 each time, `RETURN 1 vector_distance`: lookups a second and p99 from a closed loop of 8 and 64 connections (threads of 4 client processes on the client's CPUs), median of 3 rounds of 10 s; `--threads 4` (Redis `--io-threads 4 --search-workers 4`) on the first half of the CPUs; the exact top 5 of 10 queries of each layout checked against numpy (`wrong_top5`, exactly 0); `used_memory` a document and the load rate. Gates: `big` at 8 and 64 connections at least 1.25x v1.2.2's and 1.15x Redis's in the same session and within 10 % of recorded; `used_memory` a document 5 %; `small` (the Python client is the limit there), `none`, p99s and the load shown. Needs `REGRESS_REDISEARCH_SO` for Redis (as `28`); `min_cpus=8`, recorded on a `Standard_D8s_v5` (see [the run](#recorded-run-suite-51)) |
 
 ## Running it
 
@@ -280,6 +281,7 @@ was re-recorded for it:
 | `42-alone-scripts-mix` | the server's pinned CPUs (4) | as suites `20`, `34` and `36` |
 | `47-bgsave-collections` | the server's pinned CPUs (2) | as suite `39`, on the `Standard_D4s_v5` it is recorded on |
 | `49-request-response` | 4 | the issue's: the server pinned to half the CPUs of a `Standard_D8s_v5`, Redis with `--io-threads 4` |
+| `51-filtered-flat-knn` | 4 | #1020's: the server pinned to half the CPUs of a `Standard_D8s_v5`, Redis with `--io-threads 4 --search-workers 4` |
 | `32-default-threads` | 0 (none) | measures the default on purpose |
 
 Redis ignores the count. The default itself is watched by
@@ -1883,6 +1885,30 @@ were 122,031 / 129,688 / 129,045), so that gate is 1.08x; the 48-connection
 gates passed in both runs. The Node client of the issue measures the same
 order on this VM (docs/PERFORMANCE.md, "Request-response from many
 connections"). A run takes about 7 minutes.
+
+## Recorded run, suite 51
+
+Run 2026-11-24 on an Azure `Standard_D8s_v5` (Xeon Platinum 8370C),
+`run-all.sh --only 51` (`results/pr-1020-51-d8s_v5`), the candidate the
+default build of the branch of #1020 by rustc 1.100.0, Redis 8.10.2 with the
+query engine module of the `redis:8.10.2` image; its values spliced into
+`baseline.json`. The server on vCPUs 0-3, the suite's client processes on
+4-7; lookups a second, median of 3 rounds:
+
+| layout | connections | v1.2.2 | candidate | Redis 8.10.2 |
+|---|---:|---:|---:|---:|
+| big (~10,090 matches) | 8 | 423.6 | 834.2 | 476.6 |
+| big (~10,090 matches) | 64 | 421.2 | 844.1 | 494.9 |
+| small (100 matches) | 8 | 19,845 | 24,517 | 10,398 |
+| small (100 matches) | 64 | 23,345 | 29,616 | 13,908 |
+| none | 8 | 48.0 | 83.2 | 48.0 |
+
+`used_memory` a document (its hash and the index): 12,992 / 12,892 / 14,780
+bytes. Every engine returned the exact top 5 of the 20 checked queries. The
+big rows are 2.0x v1.2.2's and 1.7x Redis's: their gates (1.25x and 1.15x)
+keep most of that. Measured with the `lua,tls` builds, Redis 8.12 and the
+issue's compiled client: docs/PERFORMANCE.md, "Filtered KNN on a FLAT
+index". A run takes about 12 minutes.
 
 ## Not covered
 

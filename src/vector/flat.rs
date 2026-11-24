@@ -757,7 +757,7 @@ mod tests {
             let (flat, postings, stop) = (flat.clone(), postings.clone(), stop.clone());
             threads.push(std::thread::spawn(move || {
                 let mut seed = 0x1234_5678 + w;
-                let mut version = 1;
+                let mut version: u32 = 1;
                 while !stop.load(Ordering::Relaxed) {
                     let n = (rng(&mut seed) % u64::from(KEYS)) as u32;
                     let key = format!("doc:{n}");
