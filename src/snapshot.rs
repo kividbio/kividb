@@ -5916,7 +5916,7 @@ impl SpillingBuf<'_> {
             self.current = stream.buffer(spill);
         }
         loop {
-            let room = part - self.current.len();
+            let room = part.saturating_sub(self.current.len());
             if data.len() <= room {
                 self.current.extend_from_slice(data);
                 return Ok(());

@@ -565,8 +565,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **A save keeps at most 8 MiB of collections in memory a capture thread
-  (#825).** A save lays out the values that are not strings when it
+- **A save keeps about 8 MiB of collections in memory a capture thread
+  while the disk keeps up (#825).** A save lays out the values that are not strings when it
   captures the dataset, with writes held. For `dump.kdb` each capture thread
   lays them out in 1 MiB buffers and hands each one, once full, to a writer
   thread of its own, which writes it to a spill file in the data directory
@@ -575,7 +575,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   each against the xxh3 its writer took, and gives the spill file's blocks
   back as it goes. A capture thread never waits for the disk: when its
   writer is behind, a full buffer stays in memory until there is room, so
-  writes are held about as long as in 1.2.2. Measured on an Azure D4s_v5
+  the disk's speed adds nothing to the time writes are held. Without
+  `FALLOC_FL_PUNCH_HOLE` (other systems than Linux, or a filesystem
+  that lacks it) a save needs room for the collections' part of the dump
+  beside the dump. Measured on an Azure D4s_v5
   under a writer (regression suite 47, server on 2 CPUs): for 20,000 sorted
   sets of 800 members (a 480 MB dump), `Pss` grows by 12 MiB during the
   save (1.2.2: 461 MiB) and the slowest write meanwhile takes 358 ms (1.2.2:

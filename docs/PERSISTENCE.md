@@ -51,11 +51,12 @@ writes held. Each capture thread lays them out in 1 MiB buffers and hands
 each one, once full, to a writer thread that writes it to a spill file in
 the data directory; the snapshot copies them into `dump.kdb` as it is
 written. A capture thread does not wait for that writer: when the disk is
-behind, a full buffer stays in memory until the writer has room, so writes
-are held about as long as in 1.2.2, and a save holds about 8 MiB a capture
-thread (at most 64 MiB) while the disk keeps up (#825). For 20,000 sorted
-sets of 800 members (a 480 MB dump), a save adds 30 to 55 MB to
-`used_memory` (1.2.2: about 540 MB). There is one spill file a capture
+behind, a full buffer stays in memory until the writer has room, so the
+disk's speed adds nothing to the time writes are held, and a save holds
+about 8 MiB a capture thread while the disk keeps up (#825). For 20,000
+sorted sets of 800 members (a 480 MB dump), a save under a writer adds
+12 MiB to the server's `Pss` (1.2.2: 461 MiB; regression suite 47). There
+is one spill file a capture
 thread, with no name (`O_TMPFILE` where
 the filesystem has it, otherwise a temporary file removed as soon as it is
 open), so nothing is left in the directory however the save ends (the
