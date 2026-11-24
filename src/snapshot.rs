@@ -328,6 +328,22 @@ fn write_bytes(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
     w.write_all(data)
 }
 
+/// A hash's field count, then each field's saved name and its value, in
+/// [`crate::types::HashFields::iter`]'s order: what a KDB entry and a
+/// `DUMP` payload of a hash hold. One walk of the hash, which reads no
+/// field's TTL ([`crate::types::HashFields::for_each`]).
+fn write_hash_fields(w: &mut impl Write, fields: &crate::types::HashFields) -> io::Result<()> {
+    w.write_all(&(fields.len() as u32).to_le_bytes())?;
+    let mut written = Ok(());
+    fields.for_each(|field, value| {
+        if written.is_ok() {
+            written = write_bytes(w, &crate::hash_fields::saved_name(field))
+                .and_then(|()| write_bytes(w, &value));
+        }
+    });
+    written
+}
+
 /// `buf` is reused across vectors to avoid one allocation per vector.
 fn write_f32s(w: &mut impl Write, v: &[f32], buf: &mut Vec<u8>) -> io::Result<()> {
     buf.clear();
@@ -705,12 +721,7 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
 
         ValueRef::Hash(arc) => {
             w.write_all(&[TAG_HASH])?;
-            let inner = arc.read();
-            w.write_all(&(inner.len() as u32).to_le_bytes())?;
-            for (field, val) in inner.iter() {
-                write_bytes(w, &crate::hash_fields::saved_name(field))?;
-                write_bytes(w, &val)?;
-            }
+            write_hash_fields(w, &arc.read())?;
         }
 
         ValueRef::Set(arc) => {
@@ -916,11 +927,7 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
         ValueRef::HashEx(arc) => {
             w.write_all(&[TAG_HASH_EX])?;
             let inner = arc.read();
-            w.write_all(&(inner.fields.len() as u32).to_le_bytes())?;
-            for (field, val) in inner.fields.iter() {
-                write_bytes(w, &crate::hash_fields::saved_name(field))?;
-                write_bytes(w, &val)?;
-            }
+            write_hash_fields(w, &inner.fields)?;
             // Expiries: u32 count followed by (field, unix_ms) pairs, the
             // deadlines as they are kept (#594).
             w.write_all(&(inner.expiries.len() as u32).to_le_bytes())?;
@@ -6736,12 +6743,7 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
         }
         KiviDBValue::Hash(arc) => {
             out.write_all(&[TAG_HASH])?;
-            let inner = arc.read();
-            out.write_all(&(inner.len() as u32).to_le_bytes())?;
-            for (field, val) in inner.iter() {
-                write_bytes_vec(out, &crate::hash_fields::saved_name(field))?;
-                write_bytes_vec(out, &val)?;
-            }
+            write_hash_fields(out, &arc.read())?;
         }
         KiviDBValue::Set(arc) => {
             out.write_all(&[TAG_SET])?;
@@ -6802,11 +6804,7 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
         KiviDBValue::HashEx(arc) => {
             out.write_all(&[TAG_HASH_EX])?;
             let inner = arc.read();
-            out.write_all(&(inner.fields.len() as u32).to_le_bytes())?;
-            for (field, val) in inner.fields.iter() {
-                write_bytes_vec(out, &crate::hash_fields::saved_name(field))?;
-                write_bytes_vec(out, &val)?;
-            }
+            write_hash_fields(out, &inner.fields)?;
             out.write_all(&(inner.expiries.len() as u32).to_le_bytes())?;
             for (field, at) in inner.expiries.iter() {
                 write_bytes_vec(out, &crate::hash_fields::saved_name(field))?;

@@ -2421,6 +2421,52 @@ pub enum Updated {
     Replaced { moved: bool },
 }
 
+impl<K: Kind, A: Memory> CollectionTable<K, A> {
+    /// Every element's slot, in [`Self::slots`]' order (main array, chains,
+    /// then the old array of a resize in progress), given to `f`: a plain
+    /// walk of the groups, for the walks of a whole collection (`HGETALL`,
+    /// `SMEMBERS`, a save, which writes every collection with writes held).
+    ///
+    /// An entry is a block of its own, so such a walk is a cache miss an
+    /// element: the entries of the home group [`WALK_AHEAD`] on are asked
+    /// for before this one's are read, and their misses overlap. `inline`:
+    /// whether a slot may hold an inline member, which has no entry.
+    #[inline]
+    fn walk(&self, inline: bool, mut f: impl FnMut(*mut u8)) {
+        let old = self
+            .rare
+            .as_ref()
+            .and_then(|rare| rare.old.as_ref())
+            .map(|o| (o.array, o.next));
+        for (array, from) in [Some((self.main(), 0)), old].into_iter().flatten() {
+            for index in from..array.len().min(from + WALK_AHEAD) {
+                // SAFETY: a group of the array, as below.
+                unsafe { prefetch_entries(array.group(index), inline) };
+            }
+            for index in from..array.len() {
+                if index + WALK_AHEAD < array.len() {
+                    // SAFETY: a group of the array, as below.
+                    unsafe { prefetch_entries(array.group(index + WALK_AHEAD), inline) };
+                }
+                let mut group: *const Group = array.group(index);
+                while !group.is_null() {
+                    // SAFETY: a live group of the table, unchanged while
+                    // `self` is borrowed; its full slots hold live elements.
+                    unsafe {
+                        let mut mask = (*group).full();
+                        while mask != 0 {
+                            let slot = (*group).slots[first(mask)];
+                            mask &= mask - 1;
+                            f(slot);
+                        }
+                        group = (*group).link();
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl<A: Memory> CollectionTable<Fields, A> {
     #[inline]
     fn find_field(&self, h: u64, field: &[u8]) -> Option<Found> {
@@ -2677,33 +2723,17 @@ impl<A: Memory> CollectionTable<Fields, A> {
     /// Every field and its value, in no particular order, given to `f`:
     /// a plain walk of the groups (main array, chains, then the old array
     /// of a resize in progress) that reads only an entry's two lengths, not
-    /// its TTL, for the commands that return a whole hash (`HGETALL`).
+    /// its TTL, for the commands that return a whole hash (`HGETALL`) and
+    /// for a save, which writes every hash with writes held
+    /// ([`CollectionTable::walk`]).
     #[inline]
     pub fn for_each_field(&self, mut f: impl FnMut(&[u8], &[u8])) {
-        let old = self
-            .rare
-            .as_ref()
-            .and_then(|rare| rare.old.as_ref())
-            .map(|o| (o.array, o.next));
-        for (array, from) in [Some((self.main(), 0)), old].into_iter().flatten() {
-            for index in from..array.len() {
-                let mut group: *const Group = array.group(index);
-                while !group.is_null() {
-                    // SAFETY: a live group of the table, unchanged while
-                    // `self` is borrowed; its full slots hold live entries.
-                    unsafe {
-                        let mut mask = (*group).full();
-                        while mask != 0 {
-                            let entry = (*group).slots[first(mask)];
-                            mask &= mask - 1;
-                            let (field, value) = field_and_value(entry);
-                            f(field, value);
-                        }
-                        group = (*group).link();
-                    }
-                }
-            }
-        }
+        self.walk(false, |entry| {
+            // SAFETY: a live entry of the table, unchanged while `self` is
+            // borrowed.
+            let (field, value) = unsafe { field_and_value(entry) };
+            f(field, value);
+        });
     }
 
     /// Calls `f` with every field whose position is at or after `cursor`, a
@@ -2867,6 +2897,15 @@ impl<A: Memory> CollectionTable<Members, A> {
         }
     }
 
+    /// Every member, in [`Self::iter`]'s order, given to `f`
+    /// ([`CollectionTable::walk`]: `SMEMBERS`, a save).
+    #[inline]
+    pub fn for_each_member(&self, mut f: impl FnMut(&[u8])) {
+        // SAFETY: a live element of the table, unchanged while `self` is
+        // borrowed.
+        self.walk(true, |slot| f(&unsafe { member_ref(slot) }));
+    }
+
     /// As [`CollectionTable::<Fields>::scan`], for members.
     pub fn scan(&self, cursor: u64, count: usize, mut f: impl FnMut(MemberRef<'_>)) -> u64 {
         // SAFETY: as in `iter`.
@@ -2938,6 +2977,50 @@ impl<'a> Iterator for MemberIter<'a> {
 }
 
 impl ExactSizeIterator for MemberIter<'_> {}
+
+/// How many home groups ahead [`CollectionTable::walk`] asks for entries.
+const WALK_AHEAD: usize = 4;
+
+/// Ask for the first cache line of each entry in `group`'s full slots; with
+/// `inline`, not for an inline member's slot, which has none. A hint: no
+/// entry is read.
+///
+/// # Safety
+/// `group` is a live group of a table.
+#[inline(always)]
+unsafe fn prefetch_entries(group: *const Group, inline: bool) {
+    // SAFETY: the caller's promise.
+    let (mut mask, slots) = unsafe { ((*group).full(), &(*group).slots) };
+    while mask != 0 {
+        let slot = slots[first(mask)];
+        if !(inline && is_inline(slot)) {
+            prefetch_line(slot);
+        }
+        mask &= mask - 1;
+    }
+}
+
+/// Ask for the cache line at `at`. A hint: nothing is read, and an address
+/// that is not one faults on nothing.
+#[inline(always)]
+fn prefetch_line(at: *const u8) {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    // SAFETY: a prefetch reads nothing and faults on nothing.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(at as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    };
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    // SAFETY: as above.
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{0}]",
+            in(reg) at,
+            options(nostack, readonly, preserves_flags)
+        )
+    };
+    #[cfg(any(miri, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    let _ = at;
+}
 
 /// A hash's fields, in no particular order ([`CollectionTable::iter`]): a
 /// type of its own so that a hash's iterator can hold it, and exact about
@@ -4326,6 +4409,49 @@ mod tests {
             }
         }
         assert!(seen_resizing);
+    }
+
+    /// The walks (`for_each_field`, `for_each_member`) hand out the
+    /// elements in `iter`'s order, element for element, a resize in
+    /// progress or not: a save writes a collection in that order.
+    #[test]
+    fn walks_are_in_iter_order() {
+        let mut fields = CollectionTable::<Fields>::with_capacity(0);
+        let mut members = CollectionTable::<Members>::with_capacity(0);
+        let (mut fields_resizing, mut members_resizing) = (false, false);
+        for i in 0..20_000u32 {
+            let name = if i % 5 == 0 {
+                format!("{i}")
+            } else {
+                format!("member-{i:012}")
+            };
+            fields
+                .insert(
+                    name.as_bytes(),
+                    name.as_bytes(),
+                    (i % 3 == 0).then_some(u64::from(i)),
+                )
+                .unwrap();
+            members.insert(name.as_bytes()).unwrap();
+            if i % 997 == 0 || (fields.resizing() && !fields_resizing) {
+                fields_resizing |= fields.resizing();
+                let mut walked: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                fields.for_each_field(|f, v| walked.push((f.to_vec(), v.to_vec())));
+                let iterated: Vec<(Vec<u8>, Vec<u8>)> = fields
+                    .iter()
+                    .map(|e| (e.field.to_vec(), e.value.to_vec()))
+                    .collect();
+                assert_eq!(walked, iterated, "fields, after {i}");
+            }
+            if i % 997 == 0 || (members.resizing() && !members_resizing) {
+                members_resizing |= members.resizing();
+                let mut walked: Vec<Vec<u8>> = Vec::new();
+                members.for_each_member(|m| walked.push(m.to_vec()));
+                let iterated: Vec<Vec<u8>> = members.iter().map(|m| m.to_vec()).collect();
+                assert_eq!(walked, iterated, "members, after {i}");
+            }
+        }
+        assert!(fields_resizing && members_resizing);
     }
 
     #[test]

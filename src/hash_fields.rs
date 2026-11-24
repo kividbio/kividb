@@ -117,8 +117,21 @@ pub fn set_packed_value(limit: usize) -> usize {
 /// its bytes. So a file or a payload written here reads the same on a 1.2
 /// server, and one written there reads the same here ([`loaded_name`]),
 /// both ways, byte for byte.
+///
+/// A name of ASCII bytes only, as nearly every name is, is itself without
+/// more ado: it is UTF-8, and every byte of the block's characters is 0x80
+/// or above. A save asks this of every field of every hash it writes.
 #[inline]
 pub fn saved_name(field: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if field.is_ascii() {
+        return std::borrow::Cow::Borrowed(field);
+    }
+    saved_text_name(field)
+}
+
+/// [`saved_name`] of a name with a byte of 0x80 or above.
+#[inline(never)]
+fn saved_text_name(field: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     match crate::key_bytes::text_of(field) {
         std::borrow::Cow::Borrowed(text) => std::borrow::Cow::Borrowed(text.as_bytes()),
         std::borrow::Cow::Owned(text) => std::borrow::Cow::Owned(text.into_bytes()),
@@ -1021,6 +1034,83 @@ impl std::fmt::Debug for HashFields {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`saved_name`] as it was written before its ASCII path: every name
+    /// through [`crate::key_bytes::text_of`].
+    fn saved_name_reference(field: &[u8]) -> Vec<u8> {
+        crate::key_bytes::text_of(field).into_owned().into_bytes()
+    }
+
+    #[test]
+    fn saved_name_is_the_reference_for_every_kind_of_name() {
+        let mut names: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"f000000000000001".to_vec(),
+            vec![0x7f, 0x00, b'a'],
+            "caf\u{e9}".as_bytes().to_vec(),
+            "\u{1F600} \u{4E2D}".as_bytes().to_vec(),
+            "\u{F780}".as_bytes().to_vec(),
+            "a\u{F7FF}b\u{F77F}c\u{F800}".as_bytes().to_vec(),
+            vec![0xEF, 0x9E],
+            vec![0xff],
+            b"abc\xc3".to_vec(),
+            b"\xe2\x82 tail".to_vec(),
+            (0u8..=255).collect(),
+        ];
+        // Pseudo-random names of each kind: ASCII, UTF-8, UTF-8 with the
+        // block's characters, and bytes that are not UTF-8.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let pool = [
+            'a',
+            '~',
+            '\u{e9}',
+            '\u{F780}',
+            '\u{F7C0}',
+            '\u{F7FF}',
+            '\u{10FFFF}',
+        ];
+        for i in 0..20_000usize {
+            let len = (next() % 40) as usize;
+            let name: Vec<u8> = match i % 4 {
+                0 => (0..len).map(|_| (next() % 128) as u8).collect(),
+                1 => (0..len)
+                    .map(|_| char::from_u32((next() % 0xD000) as u32).unwrap_or('x'))
+                    .collect::<String>()
+                    .into_bytes(),
+                2 => (0..len)
+                    .map(|_| pool[(next() % pool.len() as u64) as usize])
+                    .collect::<String>()
+                    .into_bytes(),
+                _ => (0..len).map(|_| next() as u8).collect(),
+            };
+            names.push(name);
+        }
+        let mut kinds = [0usize; 4];
+        for name in &names {
+            let saved = saved_name(name);
+            assert_eq!(*saved, *saved_name_reference(name), "{name:?}");
+            assert_eq!(
+                matches!(saved, std::borrow::Cow::Borrowed(_)),
+                *saved == **name,
+                "{name:?}"
+            );
+            assert_eq!(loaded_name(&saved).as_deref(), Some(&name[..]), "{name:?}");
+            let kind = match std::str::from_utf8(name) {
+                Ok(_) if name.is_ascii() => 0,
+                Ok(text) if text.chars().any(|c| ('\u{F780}'..='\u{F7FF}').contains(&c)) => 2,
+                Ok(_) => 1,
+                Err(_) => 3,
+            };
+            kinds[kind] += 1;
+        }
+        assert!(kinds.iter().all(|&n| n > 1000), "{kinds:?}");
+    }
 
     /// What the hash should hold: the fields in the order first set.
     #[derive(Default)]
