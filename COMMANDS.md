@@ -94,7 +94,7 @@ checks respect lazy expiry — an expired key is treated as absent.
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| `KEYS` | `KEYS pattern` | Return all keys matching a glob pattern; O(N) over the full keyspace — avoid in production hot paths |
+| `KEYS` | `KEYS pattern` | Return all keys matching a glob pattern; O(N) over the full keyspace — avoid in production hot paths. Other commands do not wait for it: past 65,536 keys it runs on a thread of its own, and it lets a write that waits for a shard in between parts of the shard. So unlike Redis's it is not the keyspace at one instant: a key there, unchanged, for the whole command is listed, no key is listed twice, and a key written or deleted meanwhile may be listed or not |
 | `SCAN` | `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]` | Cursor-based incremental key iteration; cursor `0` starts and ends a full cycle; `MATCH` filters by glob pattern (Redis's matching rules); `COUNT` is a hint for page size (default 10); `TYPE` returns only keys of that type; returns `[next-cursor, [keys...]]`. A cursor is a position in a stable order of key hashes, so a key present for the whole scan is returned whatever is added or removed meanwhile. Cursors from 1.0.4 or earlier are not valid |
 
 ### Key introspection
