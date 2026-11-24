@@ -621,6 +621,22 @@ pub(super) fn series_at(ctx: &Ctx, key: &[u8]) -> Result<Option<Arc<RwLock<TsInn
     }
 }
 
+/// [`series_at`] for a command that reads the series named (`TS.GET`,
+/// `TS.RANGE`, `TS.REVRANGE`): counted in `keyspace_hits` /
+/// `keyspace_misses` as Redis counts it, a hit when the key is there,
+/// whatever its type (`TS.INFO` counts nothing there).
+pub(super) fn series_read(ctx: &Ctx, key: &[u8]) -> Result<Option<Arc<RwLock<TsInner>>>, Vec<u8>> {
+    let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
+    let map = read_lock!(shard);
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
+        None => Ok(None),
+        Some(ValueRef::TimeSeries(inner)) => Ok(Some(Arc::clone(inner))),
+        Some(_) => Err(resp_error(WRONGTYPE)),
+    }
+}
+
 // ── TS.RANGE / TS.REVRANGE ───────────────────────────────────────────────────
 
 pub(super) fn ts_range(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
@@ -649,7 +665,7 @@ pub(super) fn ts_range(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
         Err(e) => return Some(e),
     };
 
-    let series = match series_at(ctx, key) {
+    let series = match series_read(ctx, key) {
         Ok(Some(series)) => series,
         Ok(None) => return Some(resp_error(NO_KEY)),
         Err(e) => return Some(e),

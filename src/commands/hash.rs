@@ -1756,7 +1756,9 @@ fn run_hfe_read(ctx: &mut Ctx, cmd_name: &str, mode: HfeReadMode) -> Option<Vec<
     let shard = store::get_shard(db_ref, &key);
     let map = read_lock!(shard);
 
-    match map.get(key.as_slice()) {
+    let found = map.get(key.as_slice());
+    crate::stats::record_lookup(found.is_some());
+    match found {
         None => Some(resp_array(
             fields
                 .iter()

@@ -461,10 +461,16 @@ other files:
 - `keyspace_hits` and `keyspace_misses` of `INFO stats` count a key a read
   command looks up as Redis does: a hit when the key is there (whatever its
   type, and whether or not the member, field or index asked for is in it), a
-  miss when it is not; commands that write count neither. The bit commands
-  (`GETBIT`, `BITCOUNT`, `BITPOS`), `PFCOUNT`, `XLEN`, `GEOPOS`, `LCS`,
-  `SORT` and the field-expiry reads (`HTTL` and its relatives) do not count a
-  lookup yet.
+  miss when it is not; commands that write count neither, except for the
+  keys they read first, as in Redis (`BITOP`'s sources, `PFMERGE`'s keys,
+  the source of `GEOSEARCHSTORE`, `SORT ... STORE`, the set and sorted-set
+  `STORE` forms). `XREAD` and `XREADGROUP` count each stream twice, as Redis
+  does; the keys `SORT`'s `BY` and `GET` patterns name count too. Known
+  differences from Redis 8.12: `TS.MGET`, `TS.MRANGE` and `TS.MREVRANGE`
+  count nothing (Redis counts 2 hits for each series a filter matches);
+  `LINDEX l notanint`, and a `WEIGHTS`, `AGGREGATE` or `LIMIT` that does not
+  parse in `ZUNION`, `ZINTER` or `ZINTERCARD`, count nothing, where Redis
+  counts the key it looked up before it refused the argument.
 - `OBJECT IDLETIME` is `0` unless a `maxmemory-policy` that uses it is set,
   or `key-access-tracking yes` is (Redis always keeps it; the setting costs
   about 50 instructions a command, 1 to 1.5% of a pipelined `GET` or `SET`).

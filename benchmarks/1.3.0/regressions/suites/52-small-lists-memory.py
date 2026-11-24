@@ -37,8 +37,10 @@ Configurations (each a fresh server; LISTS lists, 10,000):
 Gates (the candidate): `used_per_element` within 5 % (or 1 byte) of recorded,
 at most 1.3x Redis's in the same session and at most 0.8x v1.2.2's;
 `rss_per_element` within 10 % (or 1 byte) of recorded, at most 1.5x Redis's
-(2.2x for `timeline` on a glibc build, the default one: 1.9x measured, 1.3x
-with mimalloc) and at most 0.8x v1.2.2's (0.5x for `timeline`); `list_len` as
+(1.4x for `timeline`: a list's chunks are in slab blocks, which any thread
+reuses and which go back to the system when their slab empties; 1.2x
+measured on the default build, glibc, and on the `lua,tls` builds,
+mimalloc) and at most 0.8x v1.2.2's (0.5x for `timeline`); `list_len` as
 recorded. The RSS of `tiny` (4.5 MB in all) is shown, not gated. v1.2.2 and
 Redis are shown.
 """
@@ -162,12 +164,13 @@ def run(ctx):
              gate=[rel(5, abs=1), vs_redis(1.3), vs_v1_2_2(0.8)])
     # `tiny` holds 4.5 MB in all: what the allocator keeps over it moves the
     # ratio by a third from run to run, so its RSS is shown, not gated. The
-    # timeline's RSS on a glibc build (the default one) is what glibc keeps
-    # of chunks that come and go: 1.9x Redis's against 1.3x with mimalloc.
+    # timeline's chunks come and go in slab blocks (1.2x Redis's RSS on the
+    # default build and on the `lua,tls` builds; 1.9x on glibc when they were
+    # the system allocator's).
     if name == "tiny":
         rss_gate = info()
     elif name == "timeline":
-        rss_gate = [rel(10, abs=1), vs_redis(2.2), vs_v1_2_2(0.5)]
+        rss_gate = [rel(10, abs=1), vs_redis(1.4), vs_v1_2_2(0.5)]
     else:
         rss_gate = [rel(10, abs=1), vs_redis(1.5), vs_v1_2_2(0.8)]
     ctx.emit("rss_per_element", (r1 - r0) / float(elements), "B", "lower", gate=rss_gate)

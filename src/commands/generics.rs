@@ -378,7 +378,12 @@ fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
     let mut tried = false;
     loop {
         let map = read_lock!(shard);
-        return match (map.peek(&key), field) {
+        let found = map.peek(&key);
+        if !tried {
+            // A key a pattern names is a read, counted as Redis counts it.
+            crate::stats::record_lookup(found.is_some());
+        }
+        return match (found, field) {
             (Some(ValueRef::String(s)), None) => Some(s.to_vec()),
             (Some(ValueRef::Hash(h)), Some(field)) => h.read().get_bytes(field).map(|v| v.to_vec()),
             // A field past its deadline is what a hash command makes of it
@@ -707,12 +712,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let key: &[u8] = cmd[2];
                     if is_expired(ctx.store, *ctx.selected_db, key) {
                         expire_on_read(ctx.store, *ctx.selected_db, key);
+                        crate::stats::record_miss();
                         return Some(resp_null_bulk());
                     }
                     let db = &ctx.store[*ctx.selected_db];
                     let shard = store::get_shard(db, key);
                     let map = read_lock!(shard);
-                    if map.contains_key(key) {
+                    let found = map.contains_key(key);
+                    crate::stats::record_lookup(found);
+                    if found {
                         Some(resp_integer(1))
                     } else {
                         Some(resp_null_bulk())
@@ -1713,6 +1721,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             }
 
+            // Counted here, after the move to a thread of its own, which runs
+            // the command again.
+            crate::stats::record_lookup(!missing);
             let mut elements: Vec<Arc<[u8]>> = match map.get(key) {
                 None => vec![], // ← don't return, just give empty vec
                 Some(ValueRef::List(l)) => l.read().iter().map(|e| e.to_shared()).collect(),

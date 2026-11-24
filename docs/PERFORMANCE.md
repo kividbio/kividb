@@ -183,23 +183,43 @@ default build (glibc) and Redis 8.10.2, one run through the regression suite:
 
 | | 1.2.2 | 1.3.0 | Redis 8.10.2 |
 |---|---:|---:|---:|
-| loaded by `RPUSH`, one element a command | 59.7 / 76.1 | 14.1 / 14.9 | 13.9 / 14.3 |
-| loaded by one `RPUSH` of 300 a list | 48.4 / 64.5 | 13.4 / 13.9 | 13.9 / 14.4 |
-| after 3,000 `LPUSH` + `LTRIM` each | 64.4 / 96.6 | 14.2 / 27.0 | 13.9 / 14.3 |
-| 32-byte elements, one `RPUSH` of 300 a list | 64.4 / 80.5 | 35.4 / 35.9 | 34.8 / 35.6 |
-| 64-byte elements, one `RPUSH` of 300 a list | 96.4 / 112.5 | 67.4 / 67.9 | 69.0 / 70.6 |
-| lists of 30 ten-byte elements | 53.0 / 71.2 | 16.9 / 18.8 | 14.8 / 15.1 |
+| loaded by `RPUSH`, one element a command | 59.7 / 76.1 | 13.8 / 14.1 | 13.9 / 14.3 |
+| loaded by one `RPUSH` of 300 a list | 48.4 / 64.5 | 13.3 / 13.5 | 13.9 / 14.4 |
+| after 3,000 `LPUSH` + `LTRIM` each | 64.4 / 96.6 | 13.8 / 16.7 | 13.9 / 14.4 |
+| 32-byte elements, one `RPUSH` of 300 a list | 64.4 / 80.5 | 35.2 / 35.6 | 34.8 / 35.6 |
+| 64-byte elements, one `RPUSH` of 300 a list | 96.4 / 112.5 | 67.3 / 69.6 | 69.0 / 70.6 |
+| lists of 30 ten-byte elements | 53.0 / 71.3 | 17.3 / 18.2 | 14.8 / 15.1 |
 
-A list of at least 192 short elements opens the chunk at its front with room
-for a whole chunk of them (up to 1 KiB, or a quarter of the chunk before it
-if that is more), so a list that is pushed at the front and trimmed at the
-back cycles chunks of one size. What an allocator keeps of them differs:
-the RSS after the timeline is 27.0 bytes an element on the default build
-(glibc; 1.9x Redis), and 17.7 to 20.6 on the `lua,tls` builds (mimalloc;
-1.3x), where it was 23.0 to 25.7 before. A list of 200 ten-byte elements
-takes 3,603 bytes of `used_memory` after one `LPUSH` (3,027 before): the
-chunk it opens holds 768 bytes of room. Suite
-`52-small-lists-memory` of the regression suite measures this again.
+A list's chunks are blocks of slabs of their own size classes (the entry
+pool's sizes up to 4 KiB, then 128 bytes apart up to 8 KiB; a full chunk of
+elements of 127 bytes or more is the system allocator's). A slab takes back
+a block freed on any thread, is handed to any thread once it has room, and
+goes back to the system once it is empty. That is what a timeline needs:
+it gives up a chunk at its tail and opens one at its head every 64 pushes,
+and with the chunks in the system allocator the new chunk came from the
+arena of the thread that ran the push while the old one went back to the
+arena of the thread that loaded the list, between the list's other blocks:
+glibc kept 27.0 bytes an element resident there after the timeline above
+(1.9x Redis; its loading arena held 41 MB with 37 MB of it free in 19,915
+pieces, and `malloc_trim` gave none of it back), mimalloc 18.4 to 19.7. In slabs the
+timeline holds 16.7 bytes an element on the default build and 16.9 on the
+`lua,tls` builds, against Redis 8.12's 14.5, in `used_memory` 13.8 (14.2
+before, Redis 13.9). 64-byte elements loaded one a command: 68.6 / 71.2
+(default build) and 68.6 / 71.4 (`lua,tls`), where they were 71.5 / 72.0 and
+71.5 / 90.4, against Redis's 69.0 / 70.7. The same timeline with 64-byte
+elements: 70.6 / 88.1 (it was 70.7 / 98.4 to 106.1; Redis 69.0 / 77.8 to
+88.9, two runs).
+
+A chunk opened at either end gets room for a quarter of the full chunk
+beside it and grows by a quarter: through several sizes, each a slab class
+whose blocks other chunks growing take again. Each thread keeps one partly
+used 64 KiB slab for each chunk size it has used, whose free blocks go to
+its next chunks of that size. A list of 200 ten-byte
+elements (100,000 of them, one `RPUSH` each) takes 2,660 bytes of
+`used_memory`, and 2,948 after one `LPUSH` (2,700 and 3,596 when the chunk
+opened at the front held a whole chunk's room). Suite
+`52-small-lists-memory` of the regression suite measures this again, and
+fails a build whose timeline holds more than 1.4x Redis's RSS.
 
 At 10 elements most of what is left over Redis is the key's own: its entry
 and the list's header. A list that has had an element longer than 1,024

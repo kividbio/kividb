@@ -219,10 +219,58 @@ impl SharedBytes {
         }
     }
 
+    /// `patch` written over the bytes from `offset`, in this block: as
+    /// [`write_at`] leaves them, with the length grown to the patch's end.
+    ///
+    /// # Safety
+    /// As [`write_in_place`](Self::write_in_place)'s, for the length after
+    /// it: `fits(max(len, offset + patch.len()))`. `patch` is not in the block.
+    pub(crate) unsafe fn write_at_in_place(&self, offset: usize, patch: &[u8]) {
+        let len = self.header().len as usize;
+        let end = len.max(offset + patch.len());
+        debug_assert!(self.is_unique() && self.fits(end));
+        let block = self.to.as_ptr();
+        // SAFETY: as in `write_in_place`; the block has room for `end` bytes.
+        unsafe {
+            write_at((block as *mut u8).add(HEADER), len, offset, patch);
+            std::ptr::addr_of_mut!((*block).len).write(end as u32);
+        }
+    }
+
+    /// `old` in a new block, with `patch` written from `offset` as
+    /// [`write_at`] does: the old bytes copied once.
+    pub(crate) fn written_at(old: &[u8], offset: usize, patch: &[u8]) -> Self {
+        // Too long for `layout`, rather than wrapped, if the end overflows.
+        let len = old.len().max(offset.saturating_add(patch.len()));
+        // SAFETY: `old` and `write_at` initialize all `len` bytes.
+        unsafe {
+            Self::make(len, |at| {
+                std::ptr::copy_nonoverlapping(old.as_ptr(), at, old.len());
+                write_at(at, old.len(), offset, patch);
+            })
+        }
+    }
+
     /// The bytes this takes on the heap, header and all.
     #[inline]
     pub fn heap_size(&self) -> usize {
         HEADER + self.len()
+    }
+}
+
+/// `patch` written at `offset` of the `len` bytes at `to`. Bytes between
+/// `len` and `offset` become zero, as Redis grows a string.
+///
+/// # Safety
+/// `to` is writable for `max(len, offset + patch.len())` bytes, its first
+/// `len` initialized, and `patch` is not among them.
+pub(crate) unsafe fn write_at(to: *mut u8, len: usize, offset: usize, patch: &[u8]) {
+    // SAFETY: as the caller promises.
+    unsafe {
+        if offset > len {
+            std::ptr::write_bytes(to.add(len), 0, offset - len);
+        }
+        std::ptr::copy_nonoverlapping(patch.as_ptr(), to.add(offset), patch.len());
     }
 }
 

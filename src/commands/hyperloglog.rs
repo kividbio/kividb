@@ -552,7 +552,9 @@ fn get_optional_hll(ctx: &Ctx, key: &[u8]) -> Result<Option<SharedBytes>, Vec<u8
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         Some(ValueRef::String(b)) => Ok(Some(b.to_shared())),
         None => Ok(None),
         _ => Err(wrongtype()),
@@ -710,6 +712,7 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
 
         if is_expired(ctx.store, *ctx.selected_db, key) {
             expire_on_read(ctx.store, *ctx.selected_db, key);
+            crate::stats::record_miss();
             return resp_integer(0);
         }
 
@@ -717,7 +720,9 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
 
-        let counted = match map.get(key) {
+        let found = map.get(key);
+        crate::stats::record_lookup(found.is_some());
+        let counted = match found {
             None => return resp_integer(0),
             Some(ValueRef::String(b)) => {
                 let format = match classify_for_reply(&b) {
@@ -773,6 +778,7 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
 
         if is_expired(ctx.store, *ctx.selected_db, key) {
             expire_on_read(ctx.store, *ctx.selected_db, key);
+            crate::stats::record_miss();
             continue;
         }
 
@@ -780,7 +786,9 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
 
-        match map.get(key) {
+        let found = map.get(key);
+        crate::stats::record_lookup(found.is_some());
+        match found {
             Some(ValueRef::String(b)) => {
                 let format = match classify_for_reply(&b) {
                     Ok(format) => format,

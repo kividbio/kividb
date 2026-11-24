@@ -146,11 +146,14 @@ fn sketch_at(ctx: &Ctx, key: &[u8]) -> Result<Option<CountMin>, ()> {
 /// Run `f` on the sketch at `key` under its lock, for reading.
 fn with_sketch<T>(ctx: &Ctx, key: &[u8], f: impl FnOnce(&CountMin) -> T) -> Result<T, Vec<u8>> {
     if crate::commands::helpers::lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
+        crate::stats::record_miss();
         return Err(resp_error(NO_KEY));
     }
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let map = read_lock!(shard);
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         None => Err(resp_error(NO_KEY)),
         Some(ValueRef::Sketch(sketch)) => match &*sketch.read() {
             Sketch::CountMin(cms) => Ok(f(cms)),
