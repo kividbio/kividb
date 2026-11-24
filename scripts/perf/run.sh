@@ -60,7 +60,12 @@
 #                       members (#862): no count, 1, 10, 1000, -10
 #                       WITHSCORES, -1000, and ZSCORE beside them; run it
 #                       with N=2000 (a walk of the table is dear)
-#   DNS=1 OFFLINE=      let cargo fetch a new dependency (the image's DNS is
+#   WORKLOADS=json      JSON.SET and JSON.GET of a document holding a
+#                       1,536-float embedding (#1001; NJSON of them, 300 by
+#                       default) and of a small document (N), JSON.SET of
+#                       the embedding document into an `ON JSON` FLAT vector
+#                       index, and GET-100 and SET-100 (see measure.sh)
+#   DNS=1 OFFLINE=    let cargo fetch a new dependency (the image's DNS is
 #                       not always usable; this points it at 1.1.1.1)
 #   FEATURES=lua,tls    build that variant instead of the default one
 #   NOOP=1              add a no-op line to `run_command` first (see
@@ -83,7 +88,7 @@ TAG=${1:?usage: run.sh <tag>} MODEL=${MODEL:-uring}
 mkdir -p "$OUT/out-$TAG"
 MSYS_NO_PATHCONV=1 docker run --rm --security-opt seccomp=unconfined ${DNS:+--dns 1.1.1.1} \
   -e MODEL="$MODEL" -e ONLY="${ONLY:-}" -e N="${N:-60000}" -e WORKLOADS="${WORKLOADS:-}" -e LTO="${LTO:-off}" ${OFFLINE+-e OFFLINE="$OFFLINE"} ${PROFILE:+-e PROFILE="$TAG"} \
-  -e FEATURES="${FEATURES:-}" -e NOOP="${NOOP:-}" -e CMP="${CMP:-}" -e EXEC="${EXEC:-}" -e SIZES="${SIZES:-}" -e NBIG="${NBIG:-}" \
+  -e FEATURES="${FEATURES:-}" -e NOOP="${NOOP:-}" -e CMP="${CMP:-}" -e EXEC="${EXEC:-}" -e SIZES="${SIZES:-}" -e NBIG="${NBIG:-}" -e NJSON="${NJSON:-}" \
   -v "$(cygpath -w "$REPO" 2>/dev/null || echo "$REPO"):/src:ro" \
   -v "$(cygpath -w "$HERE" 2>/dev/null || echo "$HERE"):/perf:ro" \
   -v "$(cygpath -w "$OUT/out-$TAG" 2>/dev/null || echo "$OUT/out-$TAG"):/out" \
