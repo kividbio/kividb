@@ -1390,3 +1390,164 @@ fn test_reused_document_numbers_hold_only_their_own_words() {
     assert!(keys(&mut c, "orchard").is_empty());
     assert!(keys(&mut c, "orch*").is_empty());
 }
+
+/// `INFIELDS n field …` (#1004): the query's text clauses look only in those
+/// fields. Every reply below is the one Redis 8.10.3 gives for the same
+/// documents and query.
+#[test]
+fn infields_limits_text_clauses_to_the_fields_named() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&[
+        "FT.CREATE",
+        "idx",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "d",
+        "SCHEMA",
+        "title",
+        "TEXT",
+        "body",
+        "TEXT",
+        "tag",
+        "TAG",
+        "n",
+        "NUMERIC",
+        "head",
+        "AS",
+        "headline",
+        "TEXT",
+    ]);
+    for (key, title, body, tag, n) in [
+        ("d1", "hello world", "red apple", "x", "1"),
+        ("d2", "red car", "hello there", "y", "2"),
+        ("d3", "nothing here", "nothing", "x", "3"),
+        ("d4", "hello", "hello", "y", "4"),
+        ("d5", "helium", "help me", "x", "5"),
+    ] {
+        c.cmds(&[
+            "HSET", key, "title", title, "body", body, "tag", tag, "n", n,
+        ]);
+    }
+    c.cmds(&["HSET", "d6", "head", "hello", "body", "nothing"]);
+    thread::sleep(Duration::from_millis(50));
+
+    let keys = |c: &mut Conn, query: &str, infields: &[&str]| -> Vec<String> {
+        let mut args = vec!["FT.SEARCH", "idx", query];
+        args.extend_from_slice(infields);
+        args.extend(["NOCONTENT", "DIALECT", "2"]);
+        let r = c.cmds(&args);
+        let mut keys: Vec<String> = r.as_array()[1..]
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            r.ft_search_total(),
+            keys.len() as i64,
+            "{query} {infields:?}"
+        );
+        keys
+    };
+    let title = ["INFIELDS", "1", "title"];
+    let body = ["INFIELDS", "1", "body"];
+    assert_eq!(keys(&mut c, "hello", &title), ["d1", "d4"]);
+    assert_eq!(keys(&mut c, "hello", &body), ["d2", "d4"]);
+    assert_eq!(
+        keys(&mut c, "hello", &["INFIELDS", "2", "title", "body"]),
+        ["d1", "d2", "d4"]
+    );
+    assert!(keys(&mut c, "hello red", &title).is_empty());
+    assert_eq!(keys(&mut c, "hello | red", &title), ["d1", "d2", "d4"]);
+    // A clause's own fields are narrowed too: none left, no match.
+    assert!(keys(&mut c, "@title:hello", &body).is_empty());
+    assert_eq!(keys(&mut c, "@title|body:hello", &body), ["d2", "d4"]);
+    // Not a TEXT field, or not a field: nowhere to look, and no error.
+    for named in ["nosuch", "tag", "n", "TITLE"] {
+        assert!(
+            keys(&mut c, "hello", &["INFIELDS", "1", named]).is_empty(),
+            "{named}"
+        );
+    }
+    // By the name `AS` gave it, not the hash field it is read from.
+    assert_eq!(
+        keys(&mut c, "hello", &["INFIELDS", "1", "headline"]),
+        ["d6"]
+    );
+    assert!(keys(&mut c, "hello", &["INFIELDS", "1", "head"]).is_empty());
+    // 0 is every field; the last INFIELDS is the one that counts.
+    assert_eq!(
+        keys(&mut c, "hello", &["INFIELDS", "0"]),
+        ["d1", "d2", "d4", "d6"]
+    );
+    assert_eq!(
+        keys(
+            &mut c,
+            "hello",
+            &["INFIELDS", "1", "title", "INFIELDS", "1", "body"]
+        ),
+        ["d2", "d4"]
+    );
+    // Tag and numeric clauses are not text clauses.
+    assert_eq!(keys(&mut c, "@tag:{x}", &body), ["d1", "d3", "d5"]);
+    assert_eq!(keys(&mut c, "hello @tag:{x}", &title), ["d1"]);
+    assert_eq!(keys(&mut c, "hello @n:[1 3]", &body), ["d2"]);
+    // Negation, prefixes, fuzzy words and phrases, in the fields named.
+    assert_eq!(keys(&mut c, "-hello", &title), ["d2", "d3", "d5", "d6"]);
+    assert_eq!(keys(&mut c, "hel*", &body), ["d2", "d4", "d5"]);
+    assert_eq!(keys(&mut c, "%helo%", &title), ["d1", "d4"]);
+    assert_eq!(keys(&mut c, "\"hello world\"", &title), ["d1"]);
+    assert!(keys(&mut c, "\"hello world\"", &body).is_empty());
+
+    // Scored as the same words in that field alone.
+    let scored = |c: &mut Conn, args: &[&str]| -> Vec<String> {
+        let r = c.cmds(args);
+        r.as_array()[1..]
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect()
+    };
+    assert_eq!(
+        scored(
+            &mut c,
+            &[
+                "FT.SEARCH",
+                "idx",
+                "hello",
+                "INFIELDS",
+                "1",
+                "title",
+                "WITHSCORES",
+                "NOCONTENT"
+            ]
+        ),
+        scored(
+            &mut c,
+            &[
+                "FT.SEARCH",
+                "idx",
+                "@title:hello",
+                "WITHSCORES",
+                "NOCONTENT"
+            ]
+        )
+    );
+
+    for bad in [
+        &["INFIELDS", "x", "title"][..],
+        &["INFIELDS", "-1", "title"],
+        &["INFIELDS", "3", "title"],
+        &["INFIELDS"],
+    ] {
+        let mut args = vec!["FT.SEARCH", "idx", "hello"];
+        args.extend_from_slice(bad);
+        let r = c.cmds(&args);
+        assert!(
+            matches!(r, RespValue::Error(ref e) if e.contains("Bad arguments for INFIELDS")),
+            "{bad:?}: {r:?}"
+        );
+    }
+}

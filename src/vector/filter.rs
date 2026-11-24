@@ -187,6 +187,47 @@ impl Filter {
         }
     }
 
+    /// `INFIELDS` of FT.SEARCH: each text clause looks only in those of its
+    /// fields that are among `fields` (TEXT fields, by the names clauses hold
+    /// them under), and one left with none matches nothing. As in Redis,
+    /// where the option narrows every clause's field mask: `@title:x`
+    /// with `INFIELDS 1 body` matches nothing, and `-x` with `INFIELDS 1
+    /// title` is every document without `x` in its title. Tag, numeric and
+    /// vector clauses are left as they are.
+    pub fn in_fields(self, fields: &[String]) -> Filter {
+        let narrowed = |mut own: Vec<String>| {
+            own.retain(|f| fields.contains(f));
+            own
+        };
+        match self {
+            Filter::Text { fields: own, term } => {
+                let own = narrowed(own);
+                if own.is_empty() {
+                    Filter::MatchNone
+                } else {
+                    Filter::Text { fields: own, term }
+                }
+            }
+            Filter::Phrase { fields: own, terms } => {
+                let own = narrowed(own);
+                if own.is_empty() {
+                    Filter::MatchNone
+                } else {
+                    Filter::Phrase { fields: own, terms }
+                }
+            }
+            Filter::And(l, r) => {
+                Filter::And(Box::new(l.in_fields(fields)), Box::new(r.in_fields(fields)))
+            }
+            Filter::Or(l, r) => {
+                Filter::Or(Box::new(l.in_fields(fields)), Box::new(r.in_fields(fields)))
+            }
+            Filter::Not(inner) => Filter::Not(Box::new(inner.in_fields(fields))),
+            Filter::Optional(inner) => Filter::Optional(Box::new(inner.in_fields(fields))),
+            other => other,
+        }
+    }
+
     /// Whether any clause is a text clause — whether relevance means anything
     /// for this query.
     pub fn has_text(&self) -> bool {

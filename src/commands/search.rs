@@ -1888,6 +1888,9 @@ struct SearchArgs {
     /// `FILTER field min max`.
     numeric_filters: Vec<(String, String, String)>,
     inkeys: Option<AHashSet<String>>,
+    /// `INFIELDS`: the fields (as the schema names them, `AS` if given) the
+    /// query's text clauses look in. `None`: every TEXT field.
+    infields: Option<Vec<String>>,
     /// `HIGHLIGHT`: the fields (empty: every TEXT field) and the two tags.
     highlight: Option<(Vec<String>, String, String)>,
     /// Command `TIMEOUT` in milliseconds. `None` uses `FT.CONFIG TIMEOUT`.
@@ -2064,6 +2067,21 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
                 );
                 i += 2 + n;
             }
+            "INFIELDS" => {
+                let n = number(i + 1, "INFIELDS")?;
+                if n > cmd.len().saturating_sub(i + 2) {
+                    return Err("Bad arguments for INFIELDS: not enough fields".into());
+                }
+                // As in Redis: the last `INFIELDS` given is the one that
+                // counts, and `INFIELDS 0` leaves every field.
+                args.infields = (n > 0).then(|| {
+                    cmd[i + 2..i + 2 + n]
+                        .iter()
+                        .map(|a| text(a).to_string())
+                        .collect()
+                });
+                i += 2 + n;
+            }
             "HIGHLIGHT" => {
                 i += 1;
                 let mut fields = Vec::new();
@@ -2109,7 +2127,7 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
             }
             // These would change which documents match, and are not
             // implemented. Ignoring them would return the wrong documents.
-            "INFIELDS" | "GEOFILTER" | "EXPLAINSCORE" => {
+            "GEOFILTER" | "EXPLAINSCORE" => {
                 return Err(format!("{word} is not supported"));
             }
             _ => {
@@ -2289,7 +2307,18 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
         .ok_or_else(|| no_such_index(index_name))?;
     let mut options = args.query;
     options.dialect = crate::commands::search_tools::dialect_or_default(options.dialect);
-    let query = filter::parse_query_with(query_text, &args.params, &def, options)?;
+    let mut query = filter::parse_query_with(query_text, &args.params, &def, options)?;
+    if let Some(names) = &args.infields {
+        // A name that is not a TEXT field of the index (or is not one at
+        // all) is no field to look in, as in Redis, not an error.
+        let fields: Vec<String> = names
+            .iter()
+            .filter_map(|name| def.field_by_attribute(name))
+            .filter(|f| matches!(f.field_type, FieldType::Text))
+            .map(|f| f.name.clone())
+            .collect();
+        query.filter = query.filter.in_fields(&fields);
+    }
     // Ordered by distance rather than relevance.
     let by_distance =
         query.knn.is_some() || (query.filter.vector_range().is_some() && !query.filter.has_text());
@@ -3383,6 +3412,15 @@ mod tests {
         assert_eq!(parse(&["TIMEOUT", "50"]).unwrap().timeout_ms, Some(50));
         assert_eq!(parse(&["TIMEOUT", "0"]).unwrap().timeout_ms, Some(0));
         assert!(parse(&["TIMEOUT", "soon"]).is_err());
+        // `INFIELDS`: the last one counts, and 0 is every field.
+        let fields = |words: &[&str]| parse(words).unwrap().infields;
+        assert_eq!(fields(&["INFIELDS", "1", "t"]), Some(vec!["t".to_string()]));
+        assert_eq!(
+            fields(&["INFIELDS", "1", "t", "INFIELDS", "2", "a", "b"]),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(fields(&["INFIELDS", "0"]), None);
+        assert_eq!(fields(&["INFIELDS", "1", "t", "INFIELDS", "0"]), None);
 
         for bad in [
             &["BOGUS"][..],
@@ -3392,7 +3430,10 @@ mod tests {
             &["PARAMS", "4", "a", "b"],
             &["RETURN", "2", "a"],
             &["DIALECT", "9"],
-            &["INFIELDS", "1", "f"],
+            &["INFIELDS", "2", "f"],
+            &["INFIELDS", "x", "f"],
+            &["INFIELDS", "-1", "f"],
+            &["INFIELDS"],
         ] {
             assert!(parse(bad).is_err(), "{bad:?} was accepted");
         }

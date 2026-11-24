@@ -146,6 +146,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`FT.SEARCH … INFIELDS n field …` (part of #1004).** The query's text
+  clauses look only in the fields named (by the name `AS` gave them), as in
+  Redis: a clause's own fields are narrowed too (`@title:x` with `INFIELDS 1
+  body` matches nothing), a name that is not a TEXT field of the index is no
+  field to look in rather than an error, `INFIELDS 0` is every field, and the
+  last `INFIELDS` given is the one that counts. Tag, numeric and vector
+  clauses are not affected. It was refused with an error.
 - **`VSIM` searches an HNSW graph of the vector set (#710).** A set of 4,096
   elements or more gets a graph over its elements (the one `FT.SEARCH`'s
   vector fields use, one per set), and `VSIM` explores `EF` candidates in it

@@ -318,8 +318,7 @@ other files:
   removed elements are used again), and `vset-uid` numbers the sets a
   process has made, loaded, restored or copied: a `COPY` has a number of
   its own. A set that shrinks under 2,048 elements lets go of its graph.
-- Search: `GEO` and `GEOSHAPE` fields, `GEOFILTER` and `INFIELDS` are
-  refused. Query `TIMEOUT` (or `search-timeout`) cuts a query short; `ON_TIMEOUT` or
+- Search: `GEO` and `GEOSHAPE` fields and `GEOFILTER` are refused. Query `TIMEOUT` (or `search-timeout`) cuts a query short; `ON_TIMEOUT` or
   `search-on-timeout` chooses a partial reply with a warning, or an error. `INT8`
   and `UINT8` vectors aren't supported. Scores, `NOFREQS`, `PHONETIC`
   (`dm:en`, `dm:fr`, `dm:pt`, `dm:es`: the codes and the scores), the `~` and
