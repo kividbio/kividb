@@ -1666,6 +1666,17 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                      - argument must be between 1 and 4 inclusive",
                 )),
             },
+            // The shape of the search commands' RESP3 replies.
+            "search-resp3-reply" => {
+                if crate::commands::search::set_resp3_reply(value) {
+                    Some(resp_simple("OK"))
+                } else {
+                    Some(resp_error(
+                        "ERR CONFIG SET failed (possibly related to argument 'search-resp3-reply') \
+                         - argument(s) must be one of the following: auto, redis, valkey",
+                    ))
+                }
+            }
             "search-on-timeout" => {
                 let policy = value.to_ascii_lowercase();
                 if matches!(
@@ -2525,6 +2536,10 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         (
             "search-on-timeout",
             crate::commands::search_tools::config_value("ON_TIMEOUT").to_ascii_lowercase(),
+        ),
+        (
+            "search-resp3-reply",
+            crate::commands::search::resp3_reply().to_string(),
         ),
         (
             "search-default-dialect",
@@ -6718,6 +6733,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     match field.as_str() {
                         "LIB-NAME" => {
                             ctx.client_registry.update(ctx.client_id, |info| {
+                                info.glide = crate::client_registry::is_glide_lib_name(&value);
                                 info.lib_name = value;
                             });
                             Some(resp_simple("OK"))
