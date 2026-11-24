@@ -725,6 +725,10 @@ pub struct Config {
     /// HLL write format during rolling upgrade: "legacy" or "redis".
     #[arg(long, default_value = "legacy")]
     pub hll_write_format: String,
+    /// The shape of the search commands' RESP3 replies: "auto" (Redis's, but
+    /// valkey-search's for a valkey-glide client), "redis" or "valkey".
+    #[arg(long, default_value = "auto")]
+    pub search_resp3_reply: String,
 }
 
 impl Default for Config {
@@ -835,6 +839,7 @@ impl Default for Config {
             cluster_slot_migration_handoff_max_lag_bytes: 1024 * 1024,
             cluster_slot_migration_write_pause_timeout: 10_000,
             hll_write_format: "legacy".into(),
+            search_resp3_reply: "auto".into(),
             appendfsync: "everysec".into(),
         }
     }
@@ -986,6 +991,7 @@ impl Config {
             cluster_slot_migration_handoff_max_lag_bytes: 1024 * 1024,
             cluster_slot_migration_write_pause_timeout: 10_000,
             hll_write_format: "legacy".into(),
+            search_resp3_reply: "auto".into(),
             appendfsync: "everysec".into(),
         }
     }
@@ -1152,6 +1158,15 @@ impl Config {
             return Err(format!(
                 "invalid hll-write-format '{}' (expected legacy or redis)",
                 self.hll_write_format
+            ));
+        }
+        if !matches!(
+            self.search_resp3_reply.to_ascii_lowercase().as_str(),
+            "auto" | "redis" | "valkey"
+        ) {
+            return Err(format!(
+                "invalid search-resp3-reply '{}' (expected auto, redis or valkey)",
+                self.search_resp3_reply
             ));
         }
         if !matches!(
@@ -1429,6 +1444,10 @@ impl Config {
         out.push_str(&format!("repl-backlog-ttl {}\n", self.repl_backlog_ttl));
         out.push_str(&format!("repl-diskless-load {}\n", self.repl_diskless_load));
         out.push_str(&format!("hll-write-format {}\n", self.hll_write_format));
+        out.push_str(&format!(
+            "search-resp3-reply {}\n",
+            self.search_resp3_reply.to_ascii_lowercase()
+        ));
         out.push_str(&format!("appendfsync {}\n", self.appendfsync));
         out.push_str(&format!("repl-timeout {}\n", self.repl_timeout));
         out.push_str(&format!("shutdown-timeout {}\n", self.shutdown_timeout));
@@ -1785,6 +1804,17 @@ impl Config {
                     }
                 };
                 set!(hll_write_format, value)
+            }
+            "search-resp3-reply" => {
+                let value = match one()?.to_ascii_lowercase().as_str() {
+                    value @ ("auto" | "redis" | "valkey") => value.to_string(),
+                    other => {
+                        return Err(format!(
+                            "invalid value '{other}' for 'search-resp3-reply': expected auto, redis or valkey"
+                        ));
+                    }
+                };
+                set!(search_resp3_reply, value)
             }
             "lua-parallel-scripts" => set!(lua_parallel_scripts, yes_no(key, one()?)?),
             "aof-rewrite-percentage" | "auto-aof-rewrite-percentage" => {
@@ -2520,6 +2550,39 @@ mod config_file_tests {
                 .validate(false)
                 .unwrap_err()
                 .contains("hll-write-format")
+        );
+    }
+
+    #[test]
+    fn search_resp3_reply_is_auto_until_set_and_is_validated() {
+        use clap::Parser;
+        assert_eq!(Config::default().search_resp3_reply, "auto");
+        let config = Config::try_parse_from(["kividb", "--search-resp3-reply", "valkey"]).unwrap();
+        assert_eq!(config.search_resp3_reply, "valkey");
+        assert!(config.validate(false).is_ok());
+        let invalid = Config::try_parse_from(["kividb", "--search-resp3-reply", "both"]).unwrap();
+        assert!(
+            invalid
+                .validate(false)
+                .unwrap_err()
+                .contains("search-resp3-reply")
+        );
+        assert_eq!(
+            load(
+                "search-resp3-reply Redis
+"
+            )
+            .unwrap()
+            .0
+            .search_resp3_reply,
+            "redis"
+        );
+        assert!(
+            load(
+                "search-resp3-reply both
+"
+            )
+            .is_err()
         );
     }
 
