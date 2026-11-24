@@ -378,4 +378,86 @@ mod tests {
             }
         }
     }
+
+    /// Random keys (binary, not UTF-8, empty) against random patterns built
+    /// of plain bytes, `*`, `?`, classes (`[a-z]`, `[^x]`, escapes inside)
+    /// and `\\` escapes, and against the shapes `KEYS` sends most
+    /// (`*a*`, `a*`, `*a`, `a*b`, `a`) made of bytes of the key itself: the
+    /// made-ready pattern answers as the matcher does (#1018).
+    #[test]
+    fn made_ready_patterns_answer_as_the_matcher_does_on_random_keys() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |below: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % below as u64) as usize
+        };
+        const BYTES: &[u8] = b"ab:/-*?[]^\\\x00\xff\xc3";
+        fn key(next: &mut dyn FnMut(usize) -> usize) -> Vec<u8> {
+            let len = next(12);
+            (0..len).map(|_| BYTES[next(BYTES.len())]).collect()
+        }
+        let mut checked = 0usize;
+        for _ in 0..4_000 {
+            let mut pattern = Vec::new();
+            for _ in 0..next(7) {
+                match next(9) {
+                    0 | 1 => pattern.push(b'*'),
+                    2 => pattern.push(b'?'),
+                    3 => pattern.extend_from_slice(b"[a-z]"),
+                    4 => {
+                        pattern.extend_from_slice(b"[^");
+                        pattern.push(BYTES[next(BYTES.len())]);
+                        pattern.push(b']');
+                    }
+                    5 => {
+                        pattern.push(b'\\');
+                        pattern.push(BYTES[next(BYTES.len())]);
+                    }
+                    _ => pattern.push(BYTES[next(BYTES.len())]),
+                }
+            }
+            let glob = super::Glob::new(&pattern);
+            for _ in 0..40 {
+                let text = key(&mut next);
+                assert_eq!(
+                    glob.matches(&text),
+                    matches(&pattern, &text),
+                    "{pattern:?} against {text:?}"
+                );
+                checked += 1;
+            }
+        }
+        // The plain shapes, from bytes of the key, so that many match.
+        for _ in 0..20_000 {
+            let text = key(&mut next);
+            let (a, b) = (next(text.len() + 1), next(text.len() + 1));
+            let (from, to) = (a.min(b), a.max(b));
+            let part: Vec<u8> = text[from..to]
+                .iter()
+                .flat_map(|&byte| match byte {
+                    b'*' | b'?' | b'[' | b'\\' => vec![b'\\', byte],
+                    _ => vec![byte],
+                })
+                .collect();
+            let other = key(&mut next);
+            for pattern in [
+                [&b"*"[..], &part, b"*"].concat(),
+                [&part[..], b"*"].concat(),
+                [&b"*"[..], &part].concat(),
+                [&part[..], b"*", &other].concat(),
+                part.clone(),
+            ] {
+                let glob = super::Glob::new(&pattern);
+                assert_eq!(
+                    glob.matches(&text),
+                    matches(&pattern, &text),
+                    "{pattern:?} against {text:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 260_000);
+    }
 }

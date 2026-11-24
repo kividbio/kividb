@@ -34610,6 +34610,214 @@
           "kind": "info"
         }
       ]
+    },
+    "50-keys-wildcard/uring4/get_max_scan_ms": {
+      "suite": "50-keys-wildcard",
+      "config": "uring4",
+      "metric": "get_max_scan_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 999.999,
+        "candidate": 6.075,
+        "redis": 192.202,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-24",
+        "commit": "perf-keys-wildcard",
+        "label": "pr-1018-50-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 0.25
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 0.25
+        }
+      ]
+    },
+    "50-keys-wildcard/uring4/get_ops_noscan": {
+      "suite": "50-keys-wildcard",
+      "config": "uring4",
+      "metric": "get_ops_noscan",
+      "unit": "ops/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 162405.8,
+        "candidate": 179084.3,
+        "redis": 186320.4,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-24",
+        "commit": "perf-keys-wildcard",
+        "label": "pr-1018-50-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "50-keys-wildcard/uring4/get_ops_scan": {
+      "suite": "50-keys-wildcard",
+      "config": "uring4",
+      "metric": "get_ops_scan",
+      "unit": "ops/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 166958.0,
+        "candidate": 182456.6,
+        "redis": 48552.3,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-24",
+        "commit": "perf-keys-wildcard",
+        "label": "pr-1018-50-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "50-keys-wildcard/uring4/get_p999_noscan_ms": {
+      "suite": "50-keys-wildcard",
+      "config": "uring4",
+      "metric": "get_p999_noscan_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.752,
+        "candidate": 3.12,
+        "redis": 3.071,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-24",
+        "commit": "perf-keys-wildcard",
+        "label": "pr-1018-50-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "50-keys-wildcard/uring4/get_p999_scan_ms": {
+      "suite": "50-keys-wildcard",
+      "config": "uring4",
+      "metric": "get_p999_scan_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 310.899,
+        "candidate": 3.58,
+        "redis": 190.555,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-24",
+        "commit": "perf-keys-wildcard",
+        "label": "pr-1018-50-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 0.25
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 0.25
+        }
+      ]
+    },
+    "50-keys-wildcard/uring4/get_p99_scan_ms": {
+      "suite": "50-keys-wildcard",
+      "config": "uring4",
+      "metric": "get_p99_scan_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.393,
+        "candidate": 2.969,
+        "redis": 188.889,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-24",
+        "commit": "perf-keys-wildcard",
+        "label": "pr-1018-50-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "50-keys-wildcard/uring4/keys_ms": {
+      "suite": "50-keys-wildcard",
+      "config": "uring4",
+      "metric": "keys_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 201.987,
+        "candidate": 17.6368,
+        "redis": 183.8846,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-24",
+        "commit": "perf-keys-wildcard",
+        "label": "pr-1018-50-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 0.2
+        },
+        {
+          "kind": "vs_redis",
+          "max_x": 0.2
+        }
+      ]
+    },
+    "50-keys-wildcard/uring4/keys_scan_ms": {
+      "suite": "50-keys-wildcard",
+      "config": "uring4",
+      "metric": "keys_scan_ms",
+      "unit": "ms",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 310.6304,
+        "candidate": 26.2495,
+        "redis": 186.6572,
+        "vm": "Standard_D8s_v5",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "date": "2026-11-24",
+        "commit": "perf-keys-wildcard",
+        "label": "pr-1018-50-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
     }
   }
 }

@@ -1476,6 +1476,43 @@ impl ShardMap {
         }
     }
 
+    /// Every entry in buckets `from..to` of [`ShardMap::buckets`], given to
+    /// `visit` in bucket order: a walk over a shard in parts, the lock let
+    /// go of between parts if a writer waits (`KEYS`, #1018).
+    ///
+    /// Each entry is somewhere else in memory: visited one after the other
+    /// as the walk finds them, a `KEYS` over 500,000 keys of 2 KB waited
+    /// for memory at nearly every entry. As [`ShardMap::scan`] does for a
+    /// page (#884), the lines of an entry's header and key are asked for as
+    /// the walk finds it, and the entries of a full batch are visited
+    /// together, by then on their way.
+    #[inline(always)]
+    pub fn visit_buckets(&self, from: usize, to: usize, visit: &mut impl FnMut(EntryView<'_>)) {
+        let mut batch = [Slot::NONE; SCAN_BATCH];
+        let mut held = 0usize;
+        let new = self.table.num_buckets();
+        let to = to.min(self.buckets());
+        let parts = [
+            (&self.table, from.min(new), to.min(new)),
+            (&self.old, from.max(new) - new, to.max(new) - new),
+        ];
+        for (table, start, end) in parts {
+            for index in start..end {
+                let Some(&slot) = table.get_bucket(index) else {
+                    continue;
+                };
+                slot.prefetch_key();
+                batch[held] = slot;
+                held += 1;
+                if held == SCAN_BATCH {
+                    Self::visit_batch(&batch, false, visit);
+                    held = 0;
+                }
+            }
+        }
+        Self::visit_batch(&batch[..held], false, visit);
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
         self.slots().map(|s| s.entry().key())
     }
