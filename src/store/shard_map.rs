@@ -133,7 +133,7 @@ pub enum ValueRef<'a> {
     String(StrRef<'a>),
     List(&'a Arc<RwLock<crate::list_values::ListValues>>),
     Hash(&'a Arc<RwLock<HashFields>>),
-    Json(&'a Arc<RwLock<serde_json::Value>>),
+    Json(&'a Arc<RwLock<crate::json_tree::Value>>),
     Set(&'a Arc<RwLock<crate::member_set::MemberSet>>),
     VectorSet(&'a Arc<RwLock<VectorSetInner>>),
     SortedSet(&'a Arc<RwLock<SortedSetInner>>),

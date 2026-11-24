@@ -1350,6 +1350,43 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   98 fewer (5 % and 4 %); a tagged `EVALSHA` 0 to 27 fewer, `MULTI` with
   two `SET`s and `EXEC` 8 more. The build without Lua is unchanged.
 
+- **JSON documents take an eighth to a sixteenth of the memory (#1001).** A
+  document is a tree of 32-byte nodes, where it was 72 bytes a node: an
+  object's member table is boxed instead of setting the size of every
+  number and string. An array of 8 or more numbers that are all integers
+  fitting an `i64`, or all floats, is one buffer of them, 8 bytes an
+  element, and 4 for floats that are exactly `float32` values, as an
+  embedding written as doubles is. 5,000 documents holding a 1,536-float
+  embedding and five short fields (langgraph-redis's and spring-ai's
+  shape), on an Azure `Standard_D4s_v5`: 6,993 bytes of `used_memory` a
+  document with no index (1.2.2: 111,651; Redis 8.10.2: 19,779), 13,539 with
+  a FLAT vector index `ON JSON` (118,385; 27,651) and 13,954 with an HNSW one
+  (118,798; 27,967).
+  - Replies are what they were, byte for byte: a packed array holds one
+    kind of number, so integers stay integers and floats floats (`1.0`,
+    `-0.0`), and a `float32` is widened to the very double it came from
+    before it is printed. The text a document is saved, dumped, rewritten
+    or synced as is the same too, so 1.2.2 reads what this release writes
+    and the other way round.
+  - An array is packed where it is set whole (`JSON.SET`, `JSON.MSET`,
+    `JSON.MERGE`, a value given to `JSON.ARRAPPEND` or `JSON.ARRINSERT`,
+    a snapshot or AOF load). An edit that keeps it numbers of its kind is
+    made in the buffer: `JSON.SET`, `JSON.NUMINCRBY` or `JSON.NUMMULTBY`
+    of an element, `JSON.ARRAPPEND`, `JSON.ARRINSERT`, `JSON.ARRPOP`,
+    `JSON.ARRTRIM`, `JSON.DEL` of elements (a float that is not a
+    `float32` value widens the buffer to doubles). Any other edit makes
+    it an array of nodes, until the whole array is set again.
+  - Commands cost fewer instructions: `JSON.SET` of the embedding
+    document 18 % fewer, `JSON.GET` 13 %, `JSON.SET` into a FLAT index
+    17 %; of a small document of seven members, `JSON.SET` 28 % and
+    `JSON.GET` 54 %. `JSON.SET` keeps the value it parsed instead of a
+    copy of it, and `JSON.GET` of a whole document prints it where it is.
+    An `ON JSON` index reads a packed vector straight from its buffer.
+  - `MEMORY USAGE` of a JSON key counts the tree it holds (6,992 bytes
+    for the document above, where 1.2.2 reported 30,627, the length of
+    its text), and `JSON.DEBUG MEMORY` reports the new sizes. The
+    analysis of where the bytes went, and suite 45, are IIITManjeet's.
+
 - **Small hashes take less than half the memory.** A hash of up to 512
   fields, no field or value longer than 64 bytes, is kept in one block, each
   field next to its value, where it was a table with two allocations for

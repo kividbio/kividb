@@ -423,6 +423,14 @@ other files:
   `[9223372036854775807]` succeeds), it gives a float for some integers
   above `i64::MAX`, losing precision, and it can leave a multi-match path
   half done ([#536](https://github.com/kividbio/kividb/issues/536)).
+- A JSON array of 8 or more numbers, all integers that fit an `i64` or all
+  floats, is held packed, as Redis packs such arrays: 8 bytes an element,
+  4 for floats that are exactly `float32` values (an embedding written as
+  doubles). Replies are the same whichever way an array is held, and
+  `JSON.DEBUG MEMORY` and `MEMORY USAGE` report the bytes it takes held so.
+  Redis also holds small integers in fewer bytes; KiviDB holds every
+  integer of a packed array in 8
+  ([#1001](https://github.com/kividbio/kividb/issues/1001)).
 
 **Server and introspection**
 - `HELLO` and `INFO`'s `redis_version` report the Redis release KiviDB

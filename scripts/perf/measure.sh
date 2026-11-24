@@ -136,6 +136,28 @@ if [ "${WORKLOADS:-}" = acl ]; then
   echo done
   exit 0
 fi
+if [ "${WORKLOADS:-}" = json ]; then
+  # JSON documents (#1001): JSON.SET and JSON.GET of a document holding a
+  # 1,536-float embedding (about 30 KB of text; NJSON of them, 300 by
+  # default) and of a small document of seven members (N), and JSON.SET of
+  # the embedding document into an `ON JSON` index with a FLAT vector field
+  # (the index's ingest). See json_gen.py. GET-100 and SET-100 beside them.
+  mkdir -p /tmp/json
+  python3 "$(dirname "$0")/json_gen.py" /tmp/json "$N" "${NJSON:-300}"
+  FLAT="FT.CREATE idx ON JSON PREFIX 1 emb: SCHEMA \$.embedding AS e VECTOR FLAT 6 TYPE FLOAT32 DIM 1536 DISTANCE_METRIC COSINE"
+  for tag in "$@"; do
+    DSIZE=100; one "$tag" GET-100 -d 100 -t get
+    DSIZE=100; one "$tag" SET-100 -d 100 -t set
+    PRELOAD="-t ping" N=${NJSON:-300} PIPEFILE=/tmp/json/emb-set DSIZE=100 one "$tag" JSON-SET-EMB
+    PRELOAD="-t ping" N=${NJSON:-300} PIPEFILE=/tmp/json/emb-get DSIZE=100 one "$tag" JSON-GET-EMB
+    PRELOAD="-t ping" SETUP=$FLAT N=${NJSON:-300} PIPEFILE=/tmp/json/emb-set DSIZE=100 \
+      one "$tag" JSON-SET-EMB-FLAT
+    PRELOAD="-t ping" PIPEFILE=/tmp/json/small-set DSIZE=100 one "$tag" JSON-SET-SMALL
+    PRELOAD="-t ping" PIPEFILE=/tmp/json/small-get DSIZE=100 one "$tag" JSON-GET-SMALL
+  done | tee /out/raw.txt
+  echo done
+  exit 0
+fi
 LRU="--maxmemory 64gb --maxmemory-policy allkeys-lru"
 LFU="--maxmemory 64gb --maxmemory-policy allkeys-lfu"
 if [ "${WORKLOADS:-}" = stream ]; then

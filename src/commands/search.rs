@@ -1206,7 +1206,7 @@ pub(crate) fn relevance(
     key: &str,
     fields: &Fields,
     scoring: &crate::vector::score::Scoring,
-    json: Option<&serde_json::Value>,
+    json: Option<&crate::json_tree::Value>,
 ) -> f64 {
     scoring.score(def, key, fields, json)
 }
@@ -1258,7 +1258,7 @@ pub(crate) fn filter_each(
     only: Option<&AHashSet<String>>,
     deadline: Option<Instant>,
     now: &crate::types::QueryClock,
-    mut accept: impl FnMut(&str, &Fields, Option<&serde_json::Value>),
+    mut accept: impl FnMut(&str, &Fields, Option<&crate::json_tree::Value>),
 ) -> bool {
     let db = &ctx.store[*ctx.selected_db];
     let mut timed_out = false;
@@ -1280,7 +1280,7 @@ pub(crate) fn filter_each(
         return false;
     }
 
-    let mut consider = |key: &str, fields: &Fields, json: Option<&serde_json::Value>| {
+    let mut consider = |key: &str, fields: &Fields, json: Option<&crate::json_tree::Value>| {
         if filter::eval(filter, fields) {
             accept(key, fields, json);
         }
@@ -1446,7 +1446,7 @@ pub(crate) fn with_doc<R>(
     def: &IndexDef,
     key: &str,
     now: &crate::types::QueryClock,
-    f: impl FnOnce(&Fields, Option<&serde_json::Value>) -> R,
+    f: impl FnOnce(&Fields, Option<&crate::json_tree::Value>) -> R,
 ) -> Option<R> {
     // Out of the shard, so that its lock is not held while `f` runs. A key
     // whose time to live has ended is no document, though nothing has

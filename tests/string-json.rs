@@ -3062,7 +3062,7 @@ fn a_snapshot_keeps_json_numbers_exactly() {
     let mut db = HashMap::new();
     db.insert(
         "doc".to_string(),
-        KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(value))),
+        KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(value.into()))),
     );
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("dump.kdb");
