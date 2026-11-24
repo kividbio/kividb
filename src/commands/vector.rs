@@ -790,7 +790,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     };
     let mut add_row = |key: &str,
                        inner: &crate::vector::Fields,
-                       json_doc: Option<&serde_json::Value>| {
+                       json_doc: Option<&crate::json_tree::Value>| {
         if let Some(stream) = stream.as_mut() {
             // What the row would hold: each field that is text, and the
             // key as `__key` unless the hash has a field of that name.

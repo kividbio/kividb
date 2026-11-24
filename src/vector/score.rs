@@ -439,7 +439,7 @@ impl<'q> Scoring<'q> {
         def: &IndexDef,
         key: &str,
         doc: &dyn Doc,
-        json: Option<&serde_json::Value>,
+        json: Option<&crate::json_tree::Value>,
     ) -> f64 {
         if matches!(self.scorer, Scorer::DocScore | Scorer::Hamming) {
             return self.score_id(def, None, doc, json);
@@ -451,7 +451,11 @@ impl<'q> Scoring<'q> {
     /// The document score `SCORE_FIELD` gives a document, or `SCORE` when it
     /// holds no number there. A JSON document's number is read from the
     /// document itself, not from what the schema projects of it.
-    fn document_score(def: &IndexDef, doc: &dyn Doc, json: Option<&serde_json::Value>) -> f64 {
+    fn document_score(
+        def: &IndexDef,
+        doc: &dyn Doc,
+        json: Option<&crate::json_tree::Value>,
+    ) -> f64 {
         let default_score = f64::from(def.default_score as f32);
         let Some(field) = &def.score_field else {
             return default_score;
@@ -488,7 +492,7 @@ impl<'q> Scoring<'q> {
         def: &IndexDef,
         id: Option<u32>,
         doc: &dyn Doc,
-        json: Option<&serde_json::Value>,
+        json: Option<&crate::json_tree::Value>,
     ) -> f64 {
         let document_score = Self::document_score(def, doc, json);
         match self.scorer {

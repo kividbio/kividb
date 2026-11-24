@@ -13,11 +13,12 @@
 //! * an element too large for the type fails the whole command with
 //!   `value out of range`, leaving the document untouched.
 //!
-//! Redis additionally stores such arrays in a packed binary form. That is an
-//! internal memory optimisation with no effect on replies; the document here
-//! stays an ordinary JSON tree.
+//! Redis additionally stores such arrays in a packed binary form of the
+//! type. Here a converted array is packed as any all-float array is
+//! (`json_tree::Packed`): as `f32`s where every element is exactly one, as
+//! `f64`s otherwise.
 
-use serde_json::{Number, Value};
+use crate::json_tree::{Array, Number, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FpType {
@@ -70,14 +71,19 @@ impl FpType {
 pub(super) fn apply(value: &mut Value, ty: FpType) -> Result<(), ()> {
     match value {
         Value::Array(items) => {
-            if !items.is_empty() && items.iter().all(Value::is_number) {
-                for item in items.iter_mut() {
-                    let rounded = item.as_f64().and_then(|n| ty.round(n)).ok_or(())?;
-                    *item = Value::Number(Number::from_f64(rounded).ok_or(())?);
+            if !items.is_empty() && items.iter().all(|item| item.is_number()) {
+                let mut rounded = Vec::with_capacity(items.len());
+                for item in items.iter() {
+                    let n = item.as_f64().and_then(|n| ty.round(n)).ok_or(())?;
+                    rounded.push(Value::Number(Number::from_f64(n).ok_or(())?));
                 }
+                *items = Array::packing(rounded);
                 Ok(())
             } else {
-                items.iter_mut().try_for_each(|item| apply(item, ty))
+                items
+                    .items_mut()
+                    .iter_mut()
+                    .try_for_each(|item| apply(item, ty))
             }
         }
         Value::Object(fields) => fields.values_mut().try_for_each(|item| apply(item, ty)),
@@ -163,7 +169,17 @@ pub(crate) fn f32_to_bf16(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+
+    /// `serde_json::json!`, as a stored document.
+    macro_rules! json {
+        ($($json:tt)+) => {
+            Value::from(serde_json::json!($($json)+))
+        };
+    }
+
+    fn member<'a>(value: &'a Value, name: &str) -> &'a Value {
+        &value.as_object().unwrap()[name]
+    }
 
     fn half(v: f32) -> f32 {
         f16_bits_to_f32(f32_to_f16_bits(v))
@@ -204,16 +220,21 @@ mod tests {
         let mut v = json!([[1, 2, 3, 4e3], [5, 6.0, 7, 8]]);
         apply(&mut v, FpType::Fp16).unwrap();
         assert_eq!(v.to_string(), "[[1.0,2.0,3.0,4000.0],[5.0,6.0,7.0,8.0]]");
+        // Packed or not, the same text.
+        let mut v = json!([1, 2, 3, 4, 5, 6, 7, 8.5, 0.1]);
+        apply(&mut v, FpType::Fp32).unwrap();
+        assert!(v.as_array().unwrap().packed().is_some());
+        assert_eq!(v.to_string(), "[1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.5,0.1]");
     }
 
     #[test]
     fn only_all_numeric_arrays_are_touched() {
         let mut v = json!({"emb": [1, 2], "mixed": [1, "a"], "n": 7, "deep": {"e": [3]}});
         apply(&mut v, FpType::Fp32).unwrap();
-        assert_eq!(v["emb"].to_string(), "[1.0,2.0]");
-        assert_eq!(v["mixed"].to_string(), r#"[1,"a"]"#);
-        assert_eq!(v["n"].to_string(), "7");
-        assert_eq!(v["deep"]["e"].to_string(), "[3.0]");
+        assert_eq!(member(&v, "emb").to_string(), "[1.0,2.0]");
+        assert_eq!(member(&v, "mixed").to_string(), r#"[1,"a"]"#);
+        assert_eq!(member(&v, "n").to_string(), "7");
+        assert_eq!(member(member(&v, "deep"), "e").to_string(), "[3.0]");
     }
 
     #[test]

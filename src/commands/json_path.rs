@@ -44,7 +44,7 @@
 //! `["a"]`): the same syntax rooted at the document, for which the commands
 //! report the first match instead of all of them.
 
-use serde_json::{Number, Value};
+use crate::json_tree::{Array, Number, Value};
 use std::borrow::Cow;
 
 // ── Locations ────────────────────────────────────────────────────────────────
@@ -59,26 +59,85 @@ pub enum Step {
 /// Where a node is: the steps that lead to it from the root.
 pub type Location = Vec<Step>;
 
-pub fn get<'a>(root: &'a Value, location: &[Step]) -> Option<&'a Value> {
+/// The node at `location`: borrowed from the document, or, for an element
+/// of a packed array, made from it (a number, so always the last step).
+pub fn get<'a>(root: &'a Value, location: &[Step]) -> Option<Cow<'a, Value>> {
     let mut node = root;
-    for step in location {
+    for (at, step) in location.iter().enumerate() {
         node = match step {
             Step::Key(key) => node.as_object()?.get(key)?,
-            Step::Index(index) => node.as_array()?.get(*index)?,
+            Step::Index(index) => match node.as_array()?.get(*index)? {
+                Cow::Borrowed(item) => item,
+                made => return (at + 1 == location.len()).then_some(made),
+            },
         };
     }
-    Some(node)
+    Some(Cow::Borrowed(node))
 }
 
+/// The node at `location`, to change. A packed array on the way is turned
+/// into generic nodes; [`slot`] changes a packed element where it is.
 pub fn get_mut<'a>(root: &'a mut Value, location: &[Step]) -> Option<&'a mut Value> {
     let mut node = root;
     for step in location {
         node = match step {
             Step::Key(key) => node.as_object_mut()?.get_mut(key)?,
-            Step::Index(index) => node.as_array_mut()?.get_mut(*index)?,
+            Step::Index(index) => node.as_array_mut()?.items_mut().get_mut(*index)?,
         };
     }
     Some(node)
+}
+
+/// Where a write goes: a node, or an element of a packed array.
+pub enum Slot<'a> {
+    Node(&'a mut Value),
+    Element(&'a mut Array, usize),
+}
+
+/// The [`Slot`] at `location`.
+pub fn slot<'a>(root: &'a mut Value, location: &[Step]) -> Option<Slot<'a>> {
+    let Some((last, parents)) = location.split_last() else {
+        return Some(Slot::Node(root));
+    };
+    let parent = get_mut(root, parents)?;
+    match last {
+        Step::Key(key) => parent.as_object_mut()?.get_mut(key).map(Slot::Node),
+        Step::Index(index) => {
+            let array = parent.as_array_mut()?;
+            if *index >= array.len() {
+                return None;
+            }
+            if array.packed().is_some() {
+                return Some(Slot::Element(array, *index));
+            }
+            array.items_mut().get_mut(*index).map(Slot::Node)
+        }
+    }
+}
+
+impl Slot<'_> {
+    /// Replace what is there with `value`. A packed array keeps its form if
+    /// `value` is a number of its kind, and is unpacked if not.
+    pub fn set(self, value: Value) {
+        match self {
+            Slot::Node(node) => *node = value,
+            Slot::Element(array, index) => array.set(index, value),
+        }
+    }
+
+    /// `f` on what is there. A packed element is a number: `f` works on a
+    /// copy, which is put back (as [`Slot::set`] does) if `f` succeeds.
+    pub fn update<R, E>(self, f: impl FnOnce(&mut Value) -> Result<R, E>) -> Result<R, E> {
+        match self {
+            Slot::Node(node) => f(node),
+            Slot::Element(array, index) => {
+                let mut value = array.get(index).unwrap_or_default().into_owned();
+                let result = f(&mut value)?;
+                array.set(index, value);
+                Ok(result)
+            }
+        }
+    }
 }
 
 // ── Syntax tree ──────────────────────────────────────────────────────────────
@@ -778,23 +837,23 @@ impl Parser {
                 let mut items = Vec::new();
                 self.skip_ws();
                 if self.eat(']') {
-                    return Ok(Value::Array(items));
+                    return Ok(Value::Array(Array::from(items)));
                 }
                 loop {
                     items.push(self.literal()?);
                     self.skip_ws();
                     if self.eat(']') {
-                        return Ok(Value::Array(items));
+                        return Ok(Value::Array(Array::from(items)));
                     }
                     self.expect(',')?;
                 }
             }
             Some('{') => {
                 self.pos += 1;
-                let mut members = serde_json::Map::new();
+                let mut members = crate::json_tree::Map::new();
                 self.skip_ws();
                 if self.eat('}') {
-                    return Ok(Value::Object(members));
+                    return Ok(Value::Object(Box::new(members)));
                 }
                 loop {
                     self.skip_ws();
@@ -804,7 +863,7 @@ impl Parser {
                     members.insert(key, self.literal()?);
                     self.skip_ws();
                     if self.eat('}') {
-                        return Ok(Value::Object(members));
+                        return Ok(Value::Object(Box::new(members)));
                     }
                     self.expect(',')?;
                 }
@@ -921,10 +980,15 @@ impl<'a> Val<'a> {
 
     /// This as an array: the elements of an array value, or the nodes of a
     /// node list.
-    fn elements(&self) -> Option<Vec<&Value>> {
+    fn elements(&self) -> Option<Vec<Cow<'_, Value>>> {
         match self {
             Val::One(value) => value.as_array().map(|items| items.iter().collect()),
-            Val::Nodes(nodes) => Some(nodes.iter().map(|node| node.as_ref()).collect()),
+            Val::Nodes(nodes) => Some(
+                nodes
+                    .iter()
+                    .map(|node| Cow::Borrowed(node.as_ref()))
+                    .collect(),
+            ),
             _ => None,
         }
     }
@@ -983,7 +1047,7 @@ pub fn deep_eq(a: &Value, b: &Value) -> bool {
             _ => a == b,
         },
         (Value::Array(x), Value::Array(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| deep_eq(x, y))
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(x, y)| deep_eq(&x, &y))
         }
         (Value::Object(x), Value::Object(y)) => {
             x.len() == y.len()
@@ -1026,13 +1090,15 @@ fn regex_search(text: &Value, pattern: &Value, whole: bool) -> bool {
     regex_lite::Regex::new(&pattern).is_ok_and(|re| re.is_match(text))
 }
 
-fn contains(haystack: &[&Value], needle: &Value) -> bool {
+fn contains(haystack: &[Cow<'_, Value>], needle: &Value) -> bool {
     haystack.iter().any(|item| deep_eq(item, needle))
 }
 
+/// A node a path selects: borrowed from the document, or made from an
+/// element of a packed array (a number, with nothing beneath it).
 struct Node<'a> {
     location: Location,
-    value: &'a Value,
+    value: Cow<'a, Value>,
 }
 
 /// Evaluates against one document. `track` is whether nodes carry their
@@ -1045,7 +1111,7 @@ impl<'a> Evaluator<'a> {
     fn child(
         parent: &Node<'a>,
         step: impl FnOnce() -> Step,
-        value: &'a Value,
+        value: Cow<'a, Value>,
         track: bool,
     ) -> Node<'a> {
         let location = if track {
@@ -1059,10 +1125,10 @@ impl<'a> Evaluator<'a> {
         Node { location, value }
     }
 
-    fn select(&self, path: &'a Path, current: &'a Value, track: bool) -> Vec<Node<'a>> {
+    fn select(&self, path: &'a Path, current: &Cow<'a, Value>, track: bool) -> Vec<Node<'a>> {
         let start = match path.origin {
-            Origin::Root => self.root,
-            Origin::Current => current,
+            Origin::Root => Cow::Borrowed(self.root),
+            Origin::Current => current.clone(),
         };
         let mut nodes = vec![Node {
             location: Vec::new(),
@@ -1086,7 +1152,10 @@ impl<'a> Evaluator<'a> {
     /// order.
     fn descend(&self, node: &Node<'a>, segment: &'a Segment, track: bool, out: &mut Vec<Node<'a>>) {
         self.apply(node, segment, track, out);
-        match node.value {
+        let &Cow::Borrowed(value) = &node.value else {
+            return;
+        };
+        match value {
             Value::Array(items) => {
                 for (index, item) in items.iter().enumerate() {
                     let child = Self::child(node, || Step::Index(index), item, track);
@@ -1094,8 +1163,9 @@ impl<'a> Evaluator<'a> {
                 }
             }
             Value::Object(members) => {
-                for (key, value) in members {
-                    let child = Self::child(node, || Step::Key(key.clone()), value, track);
+                for (key, value) in members.iter() {
+                    let child =
+                        Self::child(node, || Step::Key(key.clone()), Cow::Borrowed(value), track);
                     self.descend(&child, segment, track, out);
                 }
             }
@@ -1104,11 +1174,20 @@ impl<'a> Evaluator<'a> {
     }
 
     fn apply(&self, node: &Node<'a>, segment: &'a Segment, track: bool, out: &mut Vec<Node<'a>>) {
+        // A made node is a number: no children to select.
+        let &Cow::Borrowed(value) = &node.value else {
+            return;
+        };
         for selector in &segment.selectors {
-            match (selector, node.value) {
+            match (selector, value) {
                 (Selector::Name(name), Value::Object(members)) => {
                     if let Some(value) = members.get(name) {
-                        out.push(Self::child(node, || Step::Key(name.clone()), value, track));
+                        out.push(Self::child(
+                            node,
+                            || Step::Key(name.clone()),
+                            Cow::Borrowed(value),
+                            track,
+                        ));
                     }
                 }
                 (Selector::Index(index), Value::Array(items)) => {
@@ -1116,12 +1195,16 @@ impl<'a> Evaluator<'a> {
                     let at = if *index < 0 { len + index } else { *index };
                     if (0..len).contains(&at) {
                         let at = at as usize;
-                        out.push(Self::child(node, || Step::Index(at), &items[at], track));
+                        if let Some(item) = items.get(at) {
+                            out.push(Self::child(node, || Step::Index(at), item, track));
+                        }
                     }
                 }
                 (Selector::Slice(start, end, step), Value::Array(items)) => {
                     for at in slice_indexes(items.len(), *start, *end, *step) {
-                        out.push(Self::child(node, || Step::Index(at), &items[at], track));
+                        if let Some(item) = items.get(at) {
+                            out.push(Self::child(node, || Step::Index(at), item, track));
+                        }
                     }
                 }
                 (Selector::Wildcard, Value::Array(items)) => {
@@ -1130,20 +1213,26 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 (Selector::Wildcard, Value::Object(members)) => {
-                    for (key, value) in members {
-                        out.push(Self::child(node, || Step::Key(key.clone()), value, track));
+                    for (key, value) in members.iter() {
+                        out.push(Self::child(
+                            node,
+                            || Step::Key(key.clone()),
+                            Cow::Borrowed(value),
+                            track,
+                        ));
                     }
                 }
                 (Selector::Filter(condition), Value::Array(items)) => {
                     for (at, item) in items.iter().enumerate() {
-                        if self.eval(condition, item).truthy() {
+                        if self.eval(condition, &item).truthy() {
                             out.push(Self::child(node, || Step::Index(at), item, track));
                         }
                     }
                 }
                 (Selector::Filter(condition), Value::Object(members)) => {
-                    for (key, value) in members {
-                        if self.eval(condition, value).truthy() {
+                    for (key, value) in members.iter() {
+                        let value = Cow::Borrowed(value);
+                        if self.eval(condition, &value).truthy() {
                             out.push(Self::child(node, || Step::Key(key.clone()), value, track));
                         }
                     }
@@ -1153,18 +1242,18 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn eval(&self, expr: &'a Expr, current: &'a Value) -> Val<'a> {
+    fn eval(&self, expr: &'a Expr, current: &Cow<'a, Value>) -> Val<'a> {
         match expr {
             Expr::Literal(value) => Val::One(Cow::Borrowed(value)),
             Expr::Path(path) => {
                 let mut nodes = self.select(path, current, false);
                 if path.is_singular() {
                     match nodes.pop() {
-                        Some(node) => Val::One(Cow::Borrowed(node.value)),
+                        Some(node) => Val::One(node.value),
                         None => Val::Nothing,
                     }
                 } else {
-                    Val::Nodes(nodes.into_iter().map(|n| Cow::Borrowed(n.value)).collect())
+                    Val::Nodes(nodes.into_iter().map(|n| n.value).collect())
                 }
             }
             Expr::Keys(inner) => keys_of(&self.eval(inner, current)),
@@ -1419,7 +1508,7 @@ fn call<'a>(func: Func, args: &[Val<'a>]) -> Val<'a> {
                 },
             };
             if (0..len).contains(&at) {
-                Val::owned(items[at as usize].clone())
+                Val::owned(items[at as usize].as_ref().clone())
             } else {
                 Val::Nothing
             }
@@ -1469,15 +1558,15 @@ fn call<'a>(func: Func, args: &[Val<'a>]) -> Val<'a> {
             };
             let mut out: Vec<Cow<'a, Value>> = items
                 .into_iter()
-                .map(|item| Cow::Owned(item.clone()))
+                .map(|item| Cow::Owned(item.into_owned()))
                 .collect();
             for arg in &args[1..] {
                 // Several values are added as one element, not spread.
                 let added = match arg {
                     Val::Nothing => return Val::Nothing,
-                    Val::Nodes(nodes) if nodes.len() != 1 => {
-                        Value::Array(nodes.iter().map(|n| n.as_ref().clone()).collect())
-                    }
+                    Val::Nodes(nodes) if nodes.len() != 1 => Value::Array(Array::from(
+                        nodes.iter().map(|n| n.as_ref().clone()).collect::<Vec<_>>(),
+                    )),
                     other => match other.single() {
                         Some(value) => value.clone(),
                         None => return Val::Nothing,
@@ -1555,7 +1644,7 @@ impl Query {
         let Expr::Path(path) = &self.expr else {
             return Vec::new();
         };
-        let nodes = Evaluator { root }.select(path, root, true);
+        let nodes = Evaluator { root }.select(path, &Cow::Borrowed(root), true);
         let mut seen = std::collections::HashSet::with_capacity(nodes.len());
         let mut out = Vec::with_capacity(nodes.len());
         for node in nodes {
@@ -1571,12 +1660,12 @@ impl Query {
         let evaluator = Evaluator { root };
         match &self.expr {
             Expr::Path(path) => evaluator
-                .select(path, root, false)
+                .select(path, &Cow::Borrowed(root), false)
                 .into_iter()
-                .map(|node| Cow::Borrowed(node.value))
+                .map(|node| node.value)
                 .collect(),
             expr => evaluator
-                .eval(expr, root)
+                .eval(expr, &Cow::Borrowed(root))
                 .into_values()
                 .into_iter()
                 .map(Cow::Owned)
@@ -1603,7 +1692,7 @@ impl Query {
             segments: parents.to_vec(),
         };
         let locations: Vec<Location> = Evaluator { root }
-            .select(&parent, root, true)
+            .select(&parent, &Cow::Borrowed(root), true)
             .into_iter()
             .filter(|node| node.value.is_object())
             .map(|node| node.location)
@@ -1619,11 +1708,23 @@ impl Query {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+
+    /// `serde_json::json!`, as a stored document.
+    macro_rules! json {
+        ($($json:tt)+) => {
+            Value::from(serde_json::json!($($json)+))
+        };
+    }
 
     fn values(doc: &Value, path: &str) -> Value {
         let query = Query::parse(path).unwrap_or_else(|e| panic!("{path}: {e}"));
-        Value::Array(query.values(doc).into_iter().map(Cow::into_owned).collect())
+        Value::Array(Array::from(
+            query
+                .values(doc)
+                .into_iter()
+                .map(Cow::into_owned)
+                .collect::<Vec<_>>(),
+        ))
     }
 
     fn bikes() -> Value {
@@ -2000,7 +2101,10 @@ mod tests {
                 Step::Key("p".into())
             ]]
         );
-        assert_eq!(get(&doc, &query.locations(&doc)[0]), Some(&json!(2)));
+        assert_eq!(
+            get(&doc, &query.locations(&doc)[0]).as_deref(),
+            Some(&json!(2))
+        );
         // A union naming the same node twice still names one place.
         assert_eq!(Query::parse("$.a[0,0]").unwrap().locations(&doc).len(), 1);
 
@@ -2029,7 +2133,14 @@ mod tests {
 
         let mut doc = doc;
         *get_mut(&mut doc, &[Step::Key("a".into()), Step::Index(0)]).unwrap() = json!(7);
-        assert_eq!(doc["a"][0], json!(7));
+        assert_eq!(
+            doc.as_object().unwrap()["a"]
+                .as_array()
+                .unwrap()
+                .get(0)
+                .as_deref(),
+            Some(&json!(7))
+        );
     }
 
     #[test]
