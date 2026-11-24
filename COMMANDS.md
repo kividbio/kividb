@@ -1968,7 +1968,7 @@ names; with no session running the cost to a command is one atomic load.
 
 | Compact hash encoding (Redis 8.10) | `HIMPORT` is implemented and creates ordinary hashes; there is no separate memory-saving encoding for hashes that share field names |
 | Stemming in Armenian, Basque, Catalan, Chinese, Hindi, Indonesian, Irish, Lithuanian, Malay, Nepali, Serbian, Tagalog and Yiddish; phonetic matching | These languages are accepted and their words are not stemmed (the other 18 Redis languages are stemmed); `PHONETIC` is accepted in a schema and changes nothing. `LANGUAGE_FIELD` is read from hashes, not JSON documents |
-| `GEO` and `GEOSHAPE` fields, `GEOFILTER`, `INFIELDS`, `EXPLAINSCORE` | Refused with an error — ignoring them would return the wrong documents. `SUMMARIZE` is accepted and returns fields whole |
+| `GEO` and `GEOSHAPE` fields, `GEOFILTER`, `EXPLAINSCORE` | Refused with an error — ignoring them would return the wrong documents. `SUMMARIZE` is accepted and returns fields whole |
 | `search-global-timeout` (Redis 8.10) | Not implemented. Query `TIMEOUT`, `search-timeout` and `search-on-timeout` cut a query short; `search-timeout` is `0`, no limit, by default (Redis: 500) |
 | `FT.HYBRID` `EXPLAINSCORE` and `WITHCURSOR` (Redis 8.10) | Refused with an error. `SHARD_K_RATIO` is accepted and changes nothing on one node |
 | Per-client and server parse-batch metrics in `CLIENT LIST` / `INFO` (Redis 8.8) | Not reported |

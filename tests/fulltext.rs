@@ -1478,6 +1478,10 @@ fn infields_limits_text_clauses_to_the_fields_named() {
         ["d6"]
     );
     assert!(keys(&mut c, "hello", &["INFIELDS", "1", "head"]).is_empty());
+    // A name given many times is one field.
+    let mut many = vec!["INFIELDS", "500"];
+    many.extend(std::iter::repeat_n("title", 500));
+    assert_eq!(keys(&mut c, "hello", &many), ["d1", "d4"]);
     // 0 is every field; the last INFIELDS is the one that counts.
     assert_eq!(
         keys(&mut c, "hello", &["INFIELDS", "0"]),
@@ -1550,4 +1554,79 @@ fn infields_limits_text_clauses_to_the_fields_named() {
             "{bad:?}: {r:?}"
         );
     }
+}
+
+/// A query with a `VECTOR_RANGE` and a text clause is ordered by relevance,
+/// not distance, even when `INFIELDS` leaves the text clause no field to look
+/// in (#1004): as Redis 8.10.3 orders it (every score 0 there, so the
+/// documents in the order they were written).
+#[test]
+fn infields_leaving_text_no_field_keeps_relevance_order() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&[
+        "FT.CREATE",
+        "vx",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "v",
+        "SCHEMA",
+        "title",
+        "TEXT",
+        "body",
+        "TEXT",
+        "v",
+        "VECTOR",
+        "FLAT",
+        "6",
+        "TYPE",
+        "FLOAT32",
+        "DIM",
+        "2",
+        "DISTANCE_METRIC",
+        "L2",
+    ]);
+    // Little-endian f32 pairs whose bytes are valid UTF-8, for `cmds`.
+    let vector = |x: f32| {
+        let mut bytes = x.to_le_bytes().to_vec();
+        bytes.extend(0f32.to_le_bytes());
+        String::from_utf8(bytes).unwrap()
+    };
+    let (far, near, middle, origin) = (vector(3.0), vector(0.5), vector(2.0), vector(0.0));
+    c.cmds(&[
+        "HSET",
+        "v1",
+        "title",
+        "hello hello hello",
+        "body",
+        "x",
+        "v",
+        &far,
+    ]);
+    c.cmds(&["HSET", "v2", "title", "nothing", "body", "x", "v", &near]);
+    c.cmds(&["HSET", "v3", "title", "x", "body", "hello", "v", &middle]);
+    thread::sleep(Duration::from_millis(50));
+    let query = "~hello @v:[VECTOR_RANGE 10 $q]=>{$YIELD_DISTANCE_AS: d}";
+    let order = |c: &mut Conn, infields: &[&str]| -> Vec<String> {
+        let mut args = vec!["FT.SEARCH", "vx", query, "PARAMS", "2", "q", &origin];
+        args.extend_from_slice(infields);
+        args.extend(["NOCONTENT", "DIALECT", "2"]);
+        let r = c.cmds(&args);
+        r.as_array()[1..]
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect()
+    };
+    assert_eq!(order(&mut c, &[]), ["v1", "v3", "v2"]);
+    assert_eq!(
+        order(&mut c, &["INFIELDS", "1", "title"]),
+        ["v1", "v2", "v3"]
+    );
+    assert_eq!(
+        order(&mut c, &["INFIELDS", "1", "nosuch"]),
+        ["v1", "v2", "v3"]
+    );
 }

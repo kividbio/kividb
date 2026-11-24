@@ -1901,6 +1901,12 @@ struct SearchArgs {
     scorer: Option<crate::vector::score::Scorer>,
 }
 
+/// The fields `INFIELDS` names among FT.SEARCH's arguments from `start`
+/// (the ones after the query), if it is given: for `FT.PROFILE`'s plan.
+pub(crate) fn infields_arg(cmd: &[&[u8]], start: usize) -> Option<Vec<String>> {
+    parse_search_args(cmd, start).ok()?.infields
+}
+
 fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> {
     let mut args = SearchArgs {
         count: 10,
@@ -2308,20 +2314,16 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
     let mut options = args.query;
     options.dialect = crate::commands::search_tools::dialect_or_default(options.dialect);
     let mut query = filter::parse_query_with(query_text, &args.params, &def, options)?;
-    if let Some(names) = &args.infields {
-        // A name that is not a TEXT field of the index (or is not one at
-        // all) is no field to look in, as in Redis, not an error.
-        let fields: Vec<String> = names
-            .iter()
-            .filter_map(|name| def.field_by_attribute(name))
-            .filter(|f| matches!(f.field_type, FieldType::Text))
-            .map(|f| f.name.clone())
-            .collect();
-        query.filter = query.filter.in_fields(&fields);
-    }
-    // Ordered by distance rather than relevance.
+    // Ordered by distance rather than relevance. Judged by the query as it
+    // is written: a text clause `INFIELDS` leaves no field to look in still
+    // orders by relevance, as in Redis 8.10.
     let by_distance =
         query.knn.is_some() || (query.filter.vector_range().is_some() && !query.filter.has_text());
+    if let Some(names) = &args.infields {
+        query.filter = query
+            .filter
+            .in_fields(&filter::text_fields_named(&def, names));
+    }
     // Asked by a coordinator, or answering this node's part for one.
     let shard = SHARD.with(|s| s.get()) || crate::cluster::search::is_forwarded(ctx);
     if !shard && crate::cluster::search::coordinates(ctx) {
@@ -2477,7 +2479,7 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 Some(Filter::VectorRange { yield_as, .. }) => yield_as.clone(),
                 _ => None,
             };
-            let by_distance = filter.vector_range().is_some() && !filter.has_text();
+            // `by_distance` as judged before `INFIELDS` narrowed the query.
             let scorer = args
                 .scorer
                 .unwrap_or_else(crate::vector::score::Scorer::default_scorer);

@@ -188,8 +188,9 @@ impl Filter {
     }
 
     /// `INFIELDS` of FT.SEARCH: each text clause looks only in those of its
-    /// fields that are among `fields` (TEXT fields, by the names clauses hold
-    /// them under), and one left with none matches nothing. As in Redis,
+    /// fields that are among `fields` ([`text_fields_named`]: TEXT fields, by
+    /// the names clauses hold them under), and one left with none matches
+    /// nothing. As in Redis,
     /// where the option narrows every clause's field mask: `@title:x`
     /// with `INFIELDS 1 body` matches nothing, and `-x` with `INFIELDS 1
     /// title` is every document without `x` in its title. Tag, numeric and
@@ -238,6 +239,20 @@ impl Filter {
             _ => false,
         }
     }
+}
+
+/// The TEXT fields of `def` that `INFIELDS` names (by attribute, the name
+/// `AS` gave a field), by the names text clauses hold them under: read from
+/// the schema, so each is there once and the list is never longer than the
+/// schema, however many names are given. A name that is no TEXT field of
+/// the index is no field to look in.
+pub fn text_fields_named(def: &IndexDef, names: &[String]) -> Vec<String> {
+    let names: ahash::AHashSet<&str> = names.iter().map(String::as_str).collect();
+    def.fields
+        .iter()
+        .filter(|f| matches!(f.field_type, FieldType::Text) && names.contains(f.attribute()))
+        .map(|f| f.name.clone())
+        .collect()
 }
 
 /// `=>[KNN k @field $vec …]`, with everything resolved.
@@ -1613,6 +1628,21 @@ mod tests {
             nofreqs: false,
         }
         .into_def()
+    }
+
+    /// `INFIELDS`' names, read against the schema: by attribute, TEXT only,
+    /// each field once however often it is named.
+    #[test]
+    fn infields_names_resolve_against_the_schema() {
+        let def = schema();
+        let named = |names: &[&str]| {
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            text_fields_named(&def, &names)
+        };
+        assert_eq!(named(&["title"; 1000]), ["title"]);
+        assert_eq!(named(&["body", "title", "body"]), ["title", "body"]);
+        assert_eq!(named(&["alias"]), ["stored_as"]);
+        assert!(named(&["stored_as", "k", "n", "v", "nosuch", "TITLE"]).is_empty());
     }
 
     fn doc(pairs: &[(&str, &str)]) -> AHashMap<String, Vec<u8>> {
