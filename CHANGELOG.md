@@ -746,6 +746,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   connections sending that `SETBIT` to one 64 MiB key: 141,627 calls/s
   (16), with another connection's `SET` every millisecond at a p99 of
   102 µs (267 ms).
+- **A `SETBIT` that changes a bit writes it where the string is kept
+  (part of #1016).** When nothing but its key holds the string, and the
+  string, grown or not, still fits where it is kept, the bit and any zero
+  bytes it grows by are written in place: the string is not copied. A
+  string held elsewhere (shared with another key since a `COPY`, being
+  read by a `DUMP`, or captured by a `BGSAVE`, an AOF rewrite or a
+  replica's full sync) is copied once and the copy written; the holder
+  keeps the bytes from before. Before this change every `SETBIT` that
+  changed a bit copied the string twice. Replies, time to live, `WATCH`, keyspace
+  events, the AOF and replication are as before. Counted in a test build,
+  the most a `SETBIT` that changes a bit of a 64 MiB string allocates
+  while it runs (not the memory the string itself takes) was 128 MiB, two
+  copies of the string; it is now 24 bytes, or one copy when the string
+  is held. Server time a call, from `INFO commandstats`, on that string on
+  an Apple M3 Pro (release build, tokio, `--threads 4`, one connection,
+  median of 3 runs; preliminary, from one machine): 0.64 µs (before this
+  change: 2,643 µs), 1,348 µs (2,626 µs) when a `COPY` shares its bytes,
+  and 1,286 µs (13,629 µs) when each call grows it by a byte.
 - **A save keeps about 8 MiB of collections in memory a capture thread
   while the disk keeps up (#825).** A save lays out the values that are not strings when it
   captures the dataset, with writes held. For `dump.kdb` each capture thread

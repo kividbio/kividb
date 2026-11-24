@@ -1544,7 +1544,8 @@ impl KiviDBValue {
             Arc::new(RwLock::new(shared.read().clone()))
         }
         match self {
-            // The bytes of a string are never changed in place.
+            // Shared: bytes are written in place only by their one holder
+            // (`SharedBytes::is_unique`), so a write to either key copies them.
             KiviDBValue::String(bytes) => KiviDBValue::String(bytes.clone()),
             KiviDBValue::List(list) => KiviDBValue::List(fresh(list)),
             // Through `hash_fields::shared`, as every hash made whole: a

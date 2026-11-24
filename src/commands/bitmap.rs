@@ -11,10 +11,8 @@ use crate::{read_lock, write_lock};
 // Redis bitmaps are just strings. Bit `offset` lives in byte `offset / 8`,
 // at bit position `7 - (offset % 8)` within that byte (big-endian bit order).
 //
-// IMPORTANT Rust lesson: when you do `string[byte_idx] |= mask`, you need a
-// mutable reference. Since KiviDBValue::String wraps an `Arc<[u8]>`, which is
-// immutable, we need to copy-on-write: get the existing bytes, clone into a
-// Vec<u8>, mutate, then store back as a new Arc<[u8]>.
+// SETBIT changes its byte where the string is kept when nothing else holds
+// it, and copies the string otherwise; BITFIELD copies it for any write.
 
 /// Returns (byte_index, bit_mask) for a given bit offset.
 /// Redis uses big-endian bit ordering within each byte.
@@ -82,12 +80,8 @@ fn cmd_getbit(ctx: &mut Ctx) -> Vec<u8> {
 }
 
 // ── SETBIT ────────────────────────────────────────────────────────────────────
-// Rust lesson: Arc<[u8]> is immutable. To mutate, we must:
-//   1. Read the existing bytes (or empty)
-//   2. Clone into a Vec<u8>
-//   3. Extend if needed (Redis auto-extends with zeros)
-//   4. Mutate the specific byte
-//   5. Store back as a new Arc<[u8]>
+// The changed byte is written where the string is when nothing else holds it
+// (`ShardMap::edit_str_in_place`); otherwise the string is copied once.
 fn cmd_setbit(ctx: &mut Ctx) -> Vec<u8> {
     let cmd = &ctx.cmd;
     if cmd.len() != 4 {
@@ -115,7 +109,7 @@ fn cmd_setbit(ctx: &mut Ctx) -> Vec<u8> {
     let shard = store::get_shard(db, key);
     let mut map = write_lock!(shard);
 
-    // Borrow the stored bytes; copy them only if the bit changes.
+    // Read the bit where the stored bytes are, without copying them.
     let existing: &[u8] = match map.get(key) {
         Some(ValueRef::String(b)) => b.as_bytes(),
         None => &[],
@@ -141,19 +135,20 @@ fn cmd_setbit(ctx: &mut Ctx) -> Vec<u8> {
         }
     }
 
-    // Extend with zeros if needed, then set/clear the bit
-    let mut new_bytes = existing.to_vec();
-    if byte_idx >= new_bytes.len() {
-        new_bytes.resize(byte_idx + 1, 0u8);
-    }
-    if bit_val == 1 {
-        new_bytes[byte_idx] |= mask;
+    // A byte past the end is zero, as are those the string grows by.
+    let byte = existing.get(byte_idx).copied().unwrap_or(0);
+    let byte = if bit_val == 1 {
+        byte | mask
     } else {
-        new_bytes[byte_idx] &= !mask;
-    }
-
-    map.insert_str(key, new_bytes.as_slice());
-
+        byte & !mask
+    };
+    let Some(written) = map.edit_str_in_place(key, byte_idx, &[byte]) else {
+        // Not reached: the key was a string or absent under this lock.
+        return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
+    };
+    drop(map);
+    // A copied string's old entry is freed with the shard unlocked.
+    drop(written);
     resp_integer(old_bit)
 }
 
@@ -899,6 +894,36 @@ mod tests {
     /// database 0: the reply, whether the write is left unpropagated, and
     /// the most the handler allocated at once, if this thread counts it.
     fn run(store: &store::Store, line: &str) -> (Vec<u8>, bool, Option<isize>) {
+        with_ctx(store, line, &crate::watch::NoopWatchRegistry, |mut ctx| {
+            let name = line.split(' ').next().unwrap();
+            let (reply, peak) = crate::memory_use::peak_during(|| handle(&mut ctx, name));
+            (reply.unwrap(), ctx.skip_write_side_effects, peak)
+        })
+    }
+
+    /// `line` run as a client's command is, by the dispatcher, which tells
+    /// `watches` and the keyspace events of what it writes.
+    fn dispatched(
+        store: &store::Store,
+        line: &str,
+        watches: &dyn crate::watch::WatchNotifier,
+    ) -> Vec<u8> {
+        with_ctx(
+            store,
+            line,
+            watches,
+            crate::commands::handler::execute_command,
+        )
+    }
+
+    /// `f` given a context for `line`, split at spaces, on `store`'s
+    /// database 0.
+    fn with_ctx<R>(
+        store: &store::Store,
+        line: &str,
+        watches: &dyn crate::watch::WatchNotifier,
+        f: impl FnOnce(Ctx) -> R,
+    ) -> R {
         let lastsave = Arc::new(parking_lot::RwLock::new(0i64));
         let (hub_tx, _hub_rx) = crate::replication::HubTx::channel();
         let repl_state = Arc::new(crate::replication::ReplState::new_master());
@@ -919,7 +944,7 @@ mod tests {
         let monitor_registry = crate::monitor::new_monitor_registry();
         let tracking_table = crate::tracking::new_tracking_table();
         let mut selected_db = 0usize;
-        let mut ctx = Ctx {
+        f(Ctx {
             cmd: line.split(' ').map(str::as_bytes).collect(),
             store,
             lastsave: &lastsave,
@@ -935,7 +960,7 @@ mod tests {
             pubsub: &pubsub,
             hub_tx: &hub_tx,
             repl_state: &repl_state,
-            watch_registry: &crate::watch::NoopWatchRegistry,
+            watch_registry: watches,
             client_id: 0,
             client_registry: &client_registry,
             resp: 2,
@@ -954,10 +979,7 @@ mod tests {
             authenticated_user: "default",
             tracking_table: &tracking_table,
             blocking: None,
-        };
-        let name = line.split(' ').next().unwrap();
-        let (reply, peak) = crate::memory_use::peak_during(|| handle(&mut ctx, name));
-        (reply.unwrap(), ctx.skip_write_side_effects, peak)
+        })
     }
 
     /// [`run`] in a test that counts allocations (see [`counting`]).
@@ -978,9 +1000,24 @@ mod tests {
             return test();
         }
         assert!(std::env::var_os(CHILD).is_none(), "no counter in a child");
+        in_a_process_of_its_own(name, CHILD);
+    }
+
+    /// Runs `test` in a process of its own: it sets what the whole process
+    /// shares.
+    fn alone(name: &str, test: impl FnOnce()) {
+        const CHILD: &str = "KIVIDB_BITMAP_TEST_ALONE";
+        if std::env::var_os(CHILD).is_some() {
+            return test();
+        }
+        in_a_process_of_its_own(name, CHILD);
+    }
+
+    /// The test `name` run again in a new process, with `child` set there.
+    fn in_a_process_of_its_own(name: &str, child: &str) {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([name, "--exact", "--test-threads", "1"])
-            .env(CHILD, "1")
+            .env(child, "1")
             .status()
             .unwrap();
         assert!(status.success(), "{name} failed in a process of its own");
@@ -1030,7 +1067,7 @@ mod tests {
     }
 
     /// A `SETBIT` that finds the bit as asked copies nothing and writes
-    /// nothing; one that changes it copies the value and stores it.
+    /// nothing; one that changes it writes the byte where it is.
     #[test]
     fn a_setbit_that_changes_nothing_copies_nothing() {
         counting(
@@ -1054,12 +1091,255 @@ mod tests {
                     }
                     let (reply, skipped, peak) = counted(&store, &format!("SETBIT k {last} 0"));
                     assert_eq!((reply, skipped), (resp_integer(1), false), "{len}");
-                    assert!(peak >= len as isize, "{len}: {peak} bytes");
+                    assert!(peak < SMALL, "{len}: {peak} bytes");
                     value[len - 1] = 0x2A;
-                    assert_eq!(stored(&store, b"k").unwrap().0, value, "{len}");
+                    assert_eq!(stored(&store, b"k"), Some((value, at)), "{len}");
                 }
             },
         );
+    }
+
+    /// What holds a value besides its key while a `SETBIT` runs.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Holder {
+        Nothing,
+        /// The entry, as a snapshot being written does.
+        Entry,
+        /// The bytes, as a `DUMP` being encoded does: a copy if in the entry.
+        Bytes,
+    }
+
+    /// A `SETBIT` that changes a bit of a value nothing else holds writes
+    /// it where it is, at every size up to 64 MiB. Held, the value is
+    /// copied once, and the holder keeps reading the bytes it held.
+    #[test]
+    fn a_setbit_that_changes_a_bit_copies_only_a_held_value() {
+        counting(
+            "commands::bitmap::tests::a_setbit_that_changes_a_bit_copies_only_a_held_value",
+            || {
+                for len in SIZES.into_iter().chain([64 << 20]) {
+                    let store = store::new_store(1);
+                    let mut value = vec![0xAAu8; len];
+                    put(&store, b"k", &value);
+                    let inline = in_entry(&store, b"k");
+                    let holders = [Holder::Nothing, Holder::Entry, Holder::Bytes];
+                    for (holder, offset) in holders.into_iter().zip([0, 2, 4]) {
+                        let (old, at) = stored(&store, b"k").unwrap();
+                        let shard = store::get_shard(&store[0], b"k");
+                        let entry = (holder == Holder::Entry).then(|| shard.read().get_ref(b"k"));
+                        let bytes =
+                            (holder == Holder::Bytes).then(|| match shard.read().get(b"k") {
+                                Some(ValueRef::String(b)) => b.to_shared(),
+                                _ => panic!("no string"),
+                            });
+                        let (reply, skipped, peak) =
+                            counted(&store, &format!("SETBIT k {offset} 0"));
+                        assert_eq!(
+                            (reply, skipped),
+                            (resp_integer(1), false),
+                            "{len} {holder:?}"
+                        );
+                        value[0] &= !(0x80 >> offset);
+                        let (now, moved_to) = stored(&store, b"k").unwrap();
+                        assert_eq!(now, value, "{len} {holder:?}");
+                        let copied = holder == Holder::Entry || holder == Holder::Bytes && !inline;
+                        assert_eq!(moved_to != at, copied, "{len} {holder:?}");
+                        if copied {
+                            // One copy, not the two or three of a copy made
+                            // to change and then stored.
+                            let most = (len + len / 2) as isize + SMALL;
+                            assert!(
+                                peak >= len as isize && peak < most,
+                                "{len} {holder:?}: {peak}"
+                            );
+                        } else {
+                            assert!(peak < SMALL, "{len} {holder:?}: {peak} bytes");
+                        }
+                        if let Some(Some(entry)) = &entry {
+                            assert!(
+                                matches!(entry.value(), ValueRef::String(b) if b[..] == old[..])
+                            );
+                        }
+                        if let Some(bytes) = &bytes {
+                            assert_eq!(bytes[..], old[..], "{len} {holder:?}");
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    /// Growth stays where the value is while its block keeps its class:
+    /// the entry's, or a slab block's. A system allocation, or growth past
+    /// the class, copies the value once into a new block.
+    #[test]
+    fn a_setbit_that_grows_a_value_copies_it_only_past_its_block() {
+        counting(
+            "commands::bitmap::tests::a_setbit_that_grows_a_value_copies_it_only_past_its_block",
+            || {
+                let slab = |len: usize| crate::value_slab::class_of(len + 8);
+                // A slab value with room in its class, then at its class's top.
+                let top = crate::value_slab::block_size(slab(16 << 10).unwrap()) - 8;
+                assert!(top > (16 << 10) + 1, "no room in the class");
+                for (len, grow_to, stays) in [
+                    (100, 101, true),
+                    (16 << 10, top, true),
+                    (top, top + 1, false),
+                    (64 << 10, (64 << 10) + 1, false),
+                    (1 << 20, (1 << 20) + 1, false),
+                ] {
+                    let store = store::new_store(1);
+                    let mut value = vec![0xAAu8; len];
+                    put(&store, b"k", &value);
+                    let (_, at) = stored(&store, b"k").unwrap();
+                    let line = format!("SETBIT k {} 1", grow_to * 8 - 1);
+                    let (reply, skipped, peak) = counted(&store, &line);
+                    assert_eq!((reply, skipped), (resp_integer(0), false), "{len}");
+                    value.resize(grow_to, 0);
+                    value[grow_to - 1] = 1;
+                    let (now, moved_to) = stored(&store, b"k").unwrap();
+                    assert_eq!(now, value, "{len}");
+                    assert_eq!(moved_to == at, stays, "{len}");
+                    if stays {
+                        assert!(peak < SMALL, "{len}: {peak} bytes");
+                    } else {
+                        let most = (len + len / 2) as isize + SMALL;
+                        assert!(peak >= len as isize && peak < most, "{len}: {peak}");
+                    }
+                }
+            },
+        );
+    }
+
+    /// A key's time to live stays across a `SETBIT`, in place or copied;
+    /// a key past it is written as a new one, without one. Another type is
+    /// left as it was.
+    #[test]
+    fn setbit_keeps_a_time_to_live_and_leaves_other_types() {
+        let store = store::new_store(1);
+        let later = crate::commands::helpers::now_ms() + 3_600_000;
+        for (name, len) in [("inline", 100), ("slab", 16 << 10), ("own", 64 << 10)] {
+            let key = name.as_bytes();
+            let shard = store::get_shard(&store[0], key);
+            drop(
+                shard
+                    .write()
+                    .insert_str_expiring(key, vec![0u8; len], Some(later)),
+            );
+            let line = format!("SETBIT {name} 0 1");
+            assert_eq!(run(&store, &line).0, resp_integer(0));
+            let held = shard.read().get_ref(key);
+            let line = format!("SETBIT {name} 1 1");
+            assert_eq!(run(&store, &line).0, resp_integer(0));
+            drop(held);
+            assert_eq!(shard.read().expires(key), Some(later), "{len}");
+            assert_eq!(stored(&store, key).unwrap().0[0], 0xC0, "{len}");
+        }
+        let shard = store::get_shard(&store[0], b"past");
+        drop(
+            shard
+                .write()
+                .insert_str_expiring(b"past", b"\xFF\xFF", Some(1)),
+        );
+        assert_eq!(run(&store, "SETBIT past 15 1").0, resp_integer(0));
+        assert_eq!(stored(&store, b"past").unwrap().0, b"\x00\x01");
+        assert_eq!(shard.read().expires(b"past"), None);
+        let set = crate::member_set::MemberSet::new();
+        let set = crate::types::KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(set)));
+        drop(
+            store::get_shard(&store[0], b"set")
+                .write()
+                .insert(b"set", set),
+        );
+        let reply = run(&store, "SETBIT set 0 1").0;
+        assert!(reply.starts_with(b"-WRONGTYPE"));
+        let map = store::get_shard(&store[0], b"set").read();
+        assert!(matches!(map.get(b"set"), Some(ValueRef::Set(_))));
+    }
+
+    /// A `SETBIT` written in place breaks a `WATCH` on its key and announces
+    /// `setbit`, as one that copies a held value does. One that changes
+    /// nothing breaks no watch, and is announced as well (see
+    /// `keyspace_events_new.rs`). Alone: the event flags are the process's.
+    #[test]
+    fn a_setbit_written_in_place_breaks_a_watch_and_announces_itself() {
+        alone(
+            "commands::bitmap::tests::a_setbit_written_in_place_breaks_a_watch_and_announces_itself",
+            || {
+                use crate::keyspace_events as events;
+                use crate::watch::WatchNotifier;
+                use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+                events::KS_FLAGS.store(events::parse_ks_flags("KE$"), Relaxed);
+                let store = store::new_store(1);
+                let watches = crate::watch::WatchRegistryInner::new();
+                for (name, len) in [("inline", 100), ("slab", 16 << 10), ("own", 64 << 10)] {
+                    let key = name.as_bytes();
+                    put(&store, key, &vec![0; len]);
+                    // The bit, whether the value is held, whether it changes.
+                    for (bit, held, changes) in
+                        [(0, false, true), (0, false, false), (9, true, true)]
+                    {
+                        let shard = store::get_shard(&store[0], key);
+                        let held = held.then(|| shard.read().get_ref(key));
+                        let at = stored(&store, key).unwrap().1;
+                        let broken = Arc::new(AtomicBool::new(false));
+                        watches.watch(0, key, Arc::clone(&broken), false);
+                        events::hold();
+                        let line = format!("SETBIT {name} {bit} 1");
+                        let reply = dispatched(&store, &line, &watches);
+                        let announced = events::release();
+                        let case = format!("{line}, held: {}", held.is_some());
+                        assert_eq!(reply, resp_integer(i64::from(!changes)), "{case}");
+                        let in_place = stored(&store, key).unwrap().1 == at;
+                        assert_eq!(in_place, held.is_none(), "{case}");
+                        assert_eq!(broken.load(Relaxed), changes, "{case}: the watch");
+                        let mut space = b"__keyspace@0__:".to_vec();
+                        space.extend_from_slice(key);
+                        let event = b"__keyevent@0__:setbit".to_vec();
+                        let want: Vec<(Vec<u8>, Arc<[u8]>)> =
+                            vec![(space, Arc::from(&b"setbit"[..])), (event, Arc::from(key))];
+                        assert_eq!(announced, want, "{case}: the events");
+                        drop(held);
+                    }
+                    let mut want = vec![0; len];
+                    (want[0], want[1]) = (0x80, 0x40);
+                    assert_eq!(stored(&store, key).unwrap().0, want, "{name}");
+                }
+            },
+        );
+    }
+
+    /// A capture of the dataset holds each string's entry: what `BGSAVE`, a
+    /// full sync, an AOF rewrite and `BACKUP` write out. `SETBIT`s after it
+    /// change the live value only, and the image has the bytes from before.
+    #[test]
+    fn a_capture_keeps_the_bytes_from_before_a_setbit() {
+        let store = store::new_store(1);
+        let keys = ["inline", "slab", "own"];
+        for (key, len) in keys.into_iter().zip([100, 16 << 10, 1 << 20]) {
+            put(&store, key.as_bytes(), &vec![0xAA; len]);
+        }
+        let frozen = crate::snapshot::freeze_dataset(&store, None).unwrap();
+        for key in keys {
+            // The first copies the value; the second finds it unheld.
+            for line in [format!("SETBIT {key} 0 0"), format!("SETBIT {key} 2 0")] {
+                assert_eq!(run(&store, &line).0, resp_integer(1), "{line}");
+            }
+            assert_eq!(stored(&store, key.as_bytes()).unwrap().0[0], 0x0A, "{key}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.kdb");
+        let path = path.to_str().unwrap();
+        frozen.write_file(path).unwrap();
+        let loaded = crate::snapshot::load_snapshot(path).unwrap();
+        for key in keys {
+            match loaded.dbs[0].get(&store::Key::from(key)) {
+                Some(crate::types::KiviDBValue::String(b)) => {
+                    assert!(b.iter().all(|&byte| byte == 0xAA), "{key}")
+                }
+                _ => panic!("{key} not in the image"),
+            }
+        }
     }
 
     #[test]
