@@ -13,7 +13,8 @@ Dataset, one server per configuration: a sorted set `z` of N members
 (`membr:<8 digits>`, score i for member i, loaded by ZADDs of 1,000),
 N = 1,000, 100,000 and 1,000,000.
 
-Commands, each timed over one connection (3 rounds, median of the rounds),
+Commands, each timed over one connection, one call at a time (reads: 3
+rounds; writes: 2,000 pairs a round, 7 rounds; the median of the rounds),
 after a warm-up; a member or a rank picked from the middle half, the same
 ones on every engine:
 
@@ -30,14 +31,26 @@ Each emits `<case>_srv_us`, the server's own microseconds a call (INFO
 commandstats, reset before each round), which is what the suite is about,
 and `<case>_us`, the client's wall time a call (round trip included, shown
 for the reads). `bad_replies` counts replies that are not what the dataset
-makes them (a rank, a range's first member, a count): it must be 0.
+makes them: in the timed rounds a rank, a range's first member, a count;
+and, after each case's rounds and outside the timing, the first 100 calls
+of the case once more, each reply compared whole with one the suite works
+out from the dataset (every member of a range, and its scores, the range
+asked again `WITHSCORES`; `ZADD` and `ZREM` of a new member 1; each
+`ZINCRBY`'s new score): it must be 0.
 
 Gates: server time 100 % or 3 us of the recorded value (suite 37 measured
 the same build 1.7x apart on two D4s_v5s), and at 100,000 and 1,000,000
 members the reads keep 60 % of their gain over v1.2.2 in the same session,
 and the writes (`zadd_new`, `zrem`, `zincrby_move`) are at most 1.25x
-v1.2.2's server time (a microsecond and a half or two a call: the ratio of
-two such medians moves by a tenth between rounds).
+v1.2.2's server time. A write takes about a microsecond, and the server
+adds each call's time in whole microseconds, so a write's mean moves with
+how many calls cross a microsecond: on a D4s_v5 some rounds ran at 1.0-1.5
+us a call and others at 2-3.5, on v1.2.2 and on the candidate (and
+master) alike, while callgrind counts the candidate's `ZINCRBY` that moves
+a member within 1 % of master's and below v1.2.2's. 2,000 pairs a round
+and 7 rounds (300 and 3 before) narrow that; they do not remove it, and a
+write gate past 1.25x is to be read against `scripts/perf/run.sh`'s
+counts before it is taken as a cost.
 """
 import os
 import random
@@ -56,6 +69,9 @@ SIZES = {"n1k": 1000, "n100k": 100_000, "n1m": 1_000_000}
 # Calls a timed round: v1.2.2's reads at a million members cost milliseconds.
 CALLS = {"n1k": 1000, "n100k": 300, "n1m": 100}
 ROUNDS = 3
+# Writes: pairs a round, and rounds (see the notes above).
+WRITE_CALLS = 2000
+WRITE_ROUNDS = 7
 READS = ["zrank", "zrevrank", "zrange_deep", "zrangebyscore_off", "zcount", "zrangebyscore_10"]
 WRITES = ["zadd_new", "zrem", "zincrby_move"]
 SERVER = rel(100, abs=3)
@@ -125,6 +141,68 @@ def commands(case, n, picks, rng):
     raise ValueError(case)
 
 
+def text(value):
+    return value.decode() if isinstance(value, bytes) else value
+
+
+def range_pairs(reply):
+    """A range reply `WITHSCORES` as [(member, score)]: flat (RESP2) or in
+    pairs (RESP3)."""
+    if reply and isinstance(reply[0], (list, tuple)):
+        return [(text(m), float(text(sc))) for m, sc in reply]
+    return [(text(reply[k]), float(text(reply[k + 1]))) for k in range(0, len(reply), 2)]
+
+
+def reference(args, n, scores):
+    """The whole reply `args` gets from the dataset (score i for member i),
+    and, for a range, the same range asked `WITHSCORES` and its pairs.
+    `scores` holds the scores `ZINCRBY` has moved members to."""
+    name = args[0]
+    if name in ("ZRANK", "ZREVRANK"):
+        i = int(args[2][6:])
+        return i if name == "ZRANK" else n - 1 - i, None
+    if name == "ZCOUNT":
+        lo, hi = int(args[2]), int(args[3])
+        return min(hi, n - 1) - lo + 1, None
+    if name in ("ZRANGE", "ZRANGEBYSCORE"):
+        if name == "ZRANGE":
+            first, last = int(args[2]), int(args[3])
+            scored = args + ["WITHSCORES"]
+        else:
+            first = int(args[5]) if args[2] == "-inf" else int(args[2]) + int(args[5])
+            last = first + int(args[6]) - 1
+            scored = args[:4] + ["WITHSCORES"] + args[4:]
+        ranks = range(first, min(last, n - 1) + 1)
+        return [member(i) for i in ranks], (scored, [(member(i), float(i)) for i in ranks])
+    if name in ("ZADD", "ZREM"):
+        return 1, None
+    if name == "ZINCRBY":
+        m = args[3]
+        scores[m] = scores.get(m, float(int(m[6:]))) + float(args[2])
+        return scores[m], None
+    raise ValueError(name)
+
+
+def validate(c, cmds, n):
+    """The first 100 calls of a case once, each reply compared whole with
+    `reference`: how many differ. Not timed; leaves the set as it was."""
+    bad, scores = 0, {}
+    for args, _ in cmds[:100]:
+        args = list(args)
+        want, scored = reference(args, n, scores)
+        got = c.execute_command(*args)
+        if isinstance(got, list):
+            ok = [text(m) for m in got] == want
+        elif args[0] == "ZINCRBY":
+            ok = float(text(got)) == want
+        else:
+            ok = got == want
+        if ok and scored:
+            ok = range_pairs(c.execute_command(*scored[0])) == scored[1]
+        bad += not ok
+    return bad
+
+
 def check(reply, want):
     if want is None:
         return False
@@ -151,14 +229,18 @@ def run(ctx):
     rng = random.Random(875)
     # Ranks in the middle half, the same ones on every engine.
     picks = [n // 4 + rng.randrange(max(n // 2, 1)) for _ in range(calls)]
+    wrng = random.Random(1875)
+    wcalls = WRITE_CALLS if n == SIZES[cfg] else 100
+    wpicks = [n // 4 + wrng.randrange(max(n // 2, 1)) for _ in range(wcalls)]
     bad = 0
     ctx.raw["cases"] = {}
     for case in READS + WRITES:
-        cmds, names = commands(case, n, picks, rng)
+        write = case in WRITES
+        cmds, names = commands(case, n, wpicks if write else picks, rng)
         for args, _ in cmds[:min(len(cmds), 50)]:
             c.execute_command(*args)
         rounds, server = [], []
-        for _ in range(ROUNDS):
+        for _ in range(WRITE_ROUNDS if write else ROUNDS):
             c.config_resetstat()
             t = time.perf_counter()
             for args, want in cmds:
@@ -167,7 +249,9 @@ def run(ctx):
             rounds.append((time.perf_counter() - t) / len(cmds) * 1e6)
             done, usec = server_usec(c, *names)
             server.append(usec / done if done else 0.0)
-        ctx.raw["cases"][case] = {"wall_us": rounds, "server_us": server}
+        wrong = validate(c, cmds, n)
+        bad += wrong
+        ctx.raw["cases"][case] = {"wall_us": rounds, "server_us": server, "validated_bad": wrong}
         if case in READS:
             ctx.emit(case + "_us", median(rounds), "us", "lower", gate=gates_for(cfg, case, False),
                      samples=rounds)

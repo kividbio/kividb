@@ -1672,22 +1672,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are as before.
   - Instructions per command (callgrind, fat LTO, `CMP=plain`, whole
     server, pipeline 16), master before this change / now, at 1,000,000
-    members: `ZRANK` of a member 6,105,833 / 4,434, `ZREVRANK` 6,105,677 /
-    4,146, `ZRANGE` of 10 from a random rank 5,626,799 / 7,058, `ZCOUNT`
-    over 10,000 scores 171,006 / 5,835, `ZRANGEBYSCORE -inf +inf LIMIT
-    <offset> 10` 11,335,309 / 3,730,346; at 100,000 members 611,304 /
-    3,947, 617,443 / 4,114, 574,912 / 6,651, 163,243 / 5,626 and
-    1,147,412 / 1,984,706 (the `LIMIT` offset is stepped over one member
-    at a time, as before, and a step costs more than one of master's
-    `BTreeMap`). `ZRANGEBYLEX` and `ZLEXCOUNT` among equal scores walk the
-    members from the first, as before: 1.04x and 0.87x at 100,000
-    members, 1.80x and 1.06x at 1,000,000. Writes at 1,000,000 members:
-    `ZADD` that moves a member 1.03x, `ZREM` 0.99x, `ZINCRBY` 0.91x, a
-    new member in order 0.92x, at random 1.01x, `ZREM` + `ZADD` with every
-    score equal 0.89x; at 1,000 members `ZADD` that moves a member 1.06x
-    and `ZINCRBY` 1.04x. `ZSCORE`, `ZRANDMEMBER`, `ZPOPMIN` within 1 %,
-    `GEOSEARCH` 1.00-1.02x. `GET`/`SET` as before (100-byte rows equal,
-    1 KB `SET` +1 instruction).
+    members: `ZRANK` of a member 1,318,622 / 4,399, `ZREVRANK` 2,985,870 /
+    4,224, `ZRANGE` of 10 from a random rank 1,096,589 / 7,150, `ZCOUNT`
+    over 10,000 scores 171,397 / 5,867, `ZRANGEBYSCORE -inf +inf LIMIT
+    <offset> 10` 3,792,743 / 9,054; at 100,000 members 611,304 / 3,970,
+    610,613 / 3,930, 574,912 / 6,700, 163,154 / 5,573 and 1,136,667 /
+    8,921. A `LIMIT` offset (`ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZRANGE
+    ... BYSCORE`, `ZRANGESTORE`) is added to the rank of the range's first
+    member, and only the members it leaves are read. `ZRANGEBYLEX`,
+    `ZREVRANGEBYLEX`, `ZRANGE ... BYLEX` and `ZLEXCOUNT` on a set whose
+    members all have one score find both bounds by a walk down the index
+    (in a block, two binary searches): `ZRANGEBYLEX [<member> + LIMIT 0
+    10` 9,100,706 / 11,245 and `ZLEXCOUNT` over 10,000 members 8,375,684 /
+    9,527 at 1,000,000 members, 4,123,278 / 10,768 and 7,222,976 / 8,690
+    at 100,000, 108,645 / 9,291 and 254,912 / 6,949 at 1,000. On a set
+    with several scores each member is compared with the bounds, in the
+    set's order, as before: the replies are the same. Writes at 1,000,000
+    members: `ZADD` that moves a member 1.03x, `ZREM` 0.99x, `ZINCRBY`
+    0.91x, a new member in order 0.92x, at random 1.01x, `ZREM` + `ZADD`
+    with every score equal 0.89x; at 1,000 members `ZADD` that moves a
+    member 1.06x and `ZINCRBY` 1.03x (the tree's walks; a set of up to 128
+    members is a block and has no tree). `ZSCORE`, `ZRANDMEMBER`,
+    `ZPOPMIN` within 1 %, `GEOSEARCH` 1.00-1.01x. `GET`/`SET` as before
+    (within 4 instructions a command).
   - `used_memory` a member, one set of 1,000,000 14-byte members, v1.2.2 /
     master before this change / now: added in order 133.4 / 75.8 / 61.8,
     at random 123.3 / 68.6 / 67.5, built whole (`RESTORE`) 133.4 / 59.7 /
