@@ -623,9 +623,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   named counts) are counted; `HMGET` and `MGET` count each key once;
   commands that write (`LPOP`, `LMPOP`, `BLPOP`, `LPUSHX`, `HDEL`,
   `HGETDEL`, `HGETEX`, `SREM`, `SPOP`, `SMOVE`) count nothing, as in Redis.
-  `tests/stats_keyspace.rs` holds the counts Redis 8.12.0 gives for 101
-  commands. The bit commands, `PFCOUNT`, `XLEN`, `GEOPOS`, `LCS`, `SORT` and
-  the field-expiry reads (`HTTL` and its relatives) do not count yet.
+  `ZINTER`, `ZINTERSTORE`, `ZINTERCARD`, `ZDIFF` and `ZDIFFSTORE` look every
+  key up, as Redis does, and stop only at a key of another type: `ZINTER 2
+  nokey s` with `s` a string answers `WRONGTYPE` (it answered an empty array),
+  and `ZDIFF` counts each key once.
+  `tests/stats_keyspace.rs` holds the counts Redis 8.12.0 gives for 159
+  commands, including the set and sorted-set algebra and STORE forms, a script, a
+  transaction, expired keys and a blocking pop served at once and later. The bit commands, `PFCOUNT`, `XLEN`, `GEOPOS`, `LCS`, `SORT` and
+  the field-expiry reads (`HTTL` and its relatives) do not count yet. Redis
+  counts a key looked up before an argument is found not to be a number
+  (`LINDEX l notanint`) or a `WEIGHTS`, `AGGREGATE` or `LIMIT` is found not to
+  parse (`ZUNION`, `ZINTER`, `ZINTERCARD`); those commands read their
+  arguments first and count nothing.
 
 - **io_uring workers finish a waiting socket read without interrupting the
   worker (#1015).** Each worker's ring is made with
@@ -1816,7 +1825,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   were opened at the front at one size), 13.9 / 14.3 in Redis. 32-byte
   elements 35.4 / 42.1 (Redis 34.8 / 35.6), 64-byte 67.4 / 85.5 (69.0 /
   70.6), lists of 30 ten-byte elements 16.9 / 15.7 (14.8 / 15.3). Suite `52-small-lists-memory`
-  measures these and fails a build that loses them.
+  measures these and fails a build that measures above these numbers.
   - A push or a pop at either end moves nothing in its chunk: each chunk
     has room at both ends. Element `i` is found by arithmetic while the
     chunks between the ends are full; an `LINSERT` or `LREM` in the middle

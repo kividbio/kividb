@@ -1770,13 +1770,18 @@ fn zinter(ctx: &mut Ctx) -> Vec<u8> {
 
     // Load all snapshots first
     let mut snapshots: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = Vec::new();
+    let mut absent = false;
     for key_bytes in &cmd[2..2 + num_keys] {
         let key: &[u8] = key_bytes;
         match read_zset_snapshot(ctx, key) {
             Ok(Some(s)) => snapshots.push(s),
-            Ok(None) => return resp_array(vec![]), // any missing key → empty intersection
+            Ok(None) => absent = true,
             Err(e) => return e,
         }
+    }
+    // Every key is looked up; a key that is not there empties the intersection.
+    if absent {
+        return resp_array(vec![]);
     }
 
     if snapshots.is_empty() {
@@ -1816,17 +1821,19 @@ fn zinterstore(ctx: &mut Ctx) -> Vec<u8> {
     };
 
     let mut snapshots: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = Vec::new();
+    let mut absent = false;
     for key_bytes in &cmd[3..3 + num_keys] {
         let key: &[u8] = key_bytes;
         match read_zset_snapshot(ctx, key) {
             Ok(Some(s)) => snapshots.push(s),
-            Ok(None) => {
-                // Empty intersection — store empty zset, return 0
-                store_zset(ctx, &dst, ahash::AHashMap::new());
-                return resp_integer(0);
-            }
+            Ok(None) => absent = true,
             Err(e) => return e,
         }
+    }
+    if absent {
+        // Empty intersection — store empty zset, return 0
+        store_zset(ctx, &dst, ahash::AHashMap::new());
+        return resp_integer(0);
     }
 
     if snapshots.is_empty() {
@@ -1867,13 +1874,17 @@ fn zintercard(ctx: &mut Ctx) -> Vec<u8> {
     }
 
     let mut snapshots: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = Vec::new();
+    let mut absent = false;
     for key_bytes in &cmd[2..2 + num_keys] {
         let key: &[u8] = key_bytes;
         match read_zset_snapshot(ctx, key) {
             Ok(Some(s)) => snapshots.push(s),
-            Ok(None) => return resp_integer(0), // any missing = empty intersection
+            Ok(None) => absent = true,
             Err(e) => return e,
         }
+    }
+    if absent {
+        return resp_integer(0);
     }
 
     if snapshots.is_empty() {
@@ -1922,20 +1933,14 @@ fn zdiff(ctx: &mut Ctx) -> Vec<u8> {
         }
     }
 
-    // First set is the base; anything missing = empty result
-    let base = match snapshots.into_iter().next().flatten() {
+    // First set is the base; anything missing = empty result. The rest are
+    // membership sets, read once with it (each key is one lookup).
+    let mut snapshots = snapshots.into_iter();
+    let base = match snapshots.next().flatten() {
         Some(s) => s,
         None => return resp_array(vec![]),
     };
-
-    // Load the rest as membership sets (we only need to check presence)
-    let mut others: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = Vec::new();
-    for key_bytes in &cmd[3..2 + num_keys] {
-        let key: &[u8] = key_bytes;
-        if let Ok(Some(s)) = read_zset_snapshot(ctx, key) {
-            others.push(s);
-        }
-    }
+    let others: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = snapshots.flatten().collect();
 
     let mut result: Vec<(Vec<u8>, f64)> = base
         .into_iter()
@@ -1968,22 +1973,24 @@ fn zdiffstore(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR syntax error");
     }
 
-    let base = match read_zset_snapshot(ctx, cmd[3]) {
-        Ok(Some(s)) => s,
-        Ok(None) => {
+    // Every key is one lookup, the first included.
+    let mut snapshots: Vec<Option<std::collections::BTreeMap<Vec<u8>, f64>>> = Vec::new();
+    for key_bytes in &cmd[3..3 + num_keys] {
+        let key: &[u8] = key_bytes;
+        match read_zset_snapshot(ctx, key) {
+            Ok(s) => snapshots.push(s),
+            Err(e) => return e,
+        }
+    }
+    let mut snapshots = snapshots.into_iter();
+    let base = match snapshots.next().flatten() {
+        Some(s) => s,
+        None => {
             store_zset(ctx, &dst, ahash::AHashMap::new());
             return resp_integer(0);
         }
-        Err(e) => return e,
     };
-
-    let mut others: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = Vec::new();
-    for key_bytes in &cmd[4..3 + num_keys] {
-        let key: &[u8] = key_bytes;
-        if let Ok(Some(s)) = read_zset_snapshot(ctx, key) {
-            others.push(s);
-        }
-    }
+    let others: Vec<std::collections::BTreeMap<Vec<u8>, f64>> = snapshots.flatten().collect();
 
     let result: ahash::AHashMap<Vec<u8>, f64> = base
         .into_iter()

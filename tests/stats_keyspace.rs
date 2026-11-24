@@ -90,12 +90,16 @@ impl Conn {
         }
     }
 
-    fn cmd(&mut self, args: &[&str]) -> String {
+    fn send(&mut self, args: &[&str]) {
         let mut buf = format!("*{}\r\n", args.len());
         for arg in args {
             buf.push_str(&format!("${}\r\n{arg}\r\n", arg.len()));
         }
         self.writer.write_all(buf.as_bytes()).unwrap();
+    }
+
+    fn cmd(&mut self, args: &[&str]) -> String {
+        self.send(args);
         self.read_reply()
     }
 
@@ -218,6 +222,103 @@ const EXPECTED: &[(&[&str], u64, u64)] = &[
     (&["HGETEX", "nokey", "EX", "100", "FIELDS", "1", "f"], 0, 0),
 ];
 
+/// The same for keys made again after `FLUSHALL`: `s`, `g`, `gd` and `sg`
+/// strings, `st` a set of `a` and `b`, `st2` one of `b` and `c`, `z` a
+/// sorted set of `a` and `b`, `z2` one of `b` and `c`, `h` and `l` as above.
+/// The commands that combine keys look every key up, the one that is not
+/// there included, and stop at a key of another type. The rows that run a
+/// script are left out of a build without Lua.
+#[rustfmt::skip]
+const COMBINING: &[(&[&str], u64, u64)] = &[
+    (&["ZDIFF", "2", "z", "z2"], 2, 0),
+    (&["ZDIFF", "2", "z", "nokey"], 1, 1),
+    (&["ZDIFF", "2", "nokey", "z"], 1, 1),
+    (&["ZDIFF", "2", "s", "z"], 1, 0),
+    (&["ZDIFFSTORE", "d", "2", "z", "z2"], 2, 0),
+    (&["ZDIFFSTORE", "d", "2", "z", "nokey"], 1, 1),
+    (&["ZDIFFSTORE", "d", "2", "nokey", "z"], 1, 1),
+    (&["ZINTER", "2", "z", "z2"], 2, 0),
+    (&["ZINTER", "2", "nokey", "z"], 1, 1),
+    (&["ZINTER", "2", "z", "nokey"], 1, 1),
+    (&["ZINTER", "3", "nokey", "nokey", "z"], 1, 2),
+    (&["ZINTERSTORE", "d", "2", "z", "z2"], 2, 0),
+    (&["ZINTERSTORE", "d", "2", "nokey", "z"], 1, 1),
+    (&["ZINTERCARD", "2", "z", "z2"], 2, 0),
+    (&["ZINTERCARD", "2", "nokey", "z"], 1, 1),
+    (&["ZINTERCARD", "2", "z", "nokey"], 1, 1),
+    (&["ZUNION", "2", "z", "z2"], 2, 0),
+    (&["ZUNION", "2", "z", "nokey"], 1, 1),
+    (&["ZUNIONSTORE", "d", "2", "z", "z2"], 2, 0),
+    (&["ZUNIONSTORE", "d", "2", "nokey", "z"], 1, 1),
+    (&["ZUNIONSTORE", "d", "2", "s", "z"], 1, 0),
+    (&["SINTER", "st", "st2"], 2, 0),
+    (&["SINTER", "nokey", "st"], 1, 1),
+    (&["SINTER", "st", "nokey"], 1, 1),
+    (&["SINTERSTORE", "d", "st", "st2"], 2, 0),
+    (&["SINTERSTORE", "d", "nokey", "st"], 1, 1),
+    (&["SINTERCARD", "2", "st", "st2"], 2, 0),
+    (&["SINTERCARD", "2", "nokey", "st"], 1, 1),
+    (&["SUNION", "st", "st2"], 2, 0),
+    (&["SUNION", "st", "nokey"], 1, 1),
+    (&["SUNIONSTORE", "d", "st", "st2"], 2, 0),
+    (&["SUNIONSTORE", "d", "nokey", "st"], 1, 1),
+    (&["SDIFF", "st", "st2"], 2, 0),
+    (&["SDIFF", "st", "nokey"], 1, 1),
+    (&["SDIFFSTORE", "d", "st", "st2"], 2, 0),
+    (&["SDIFFSTORE", "d", "nokey", "st"], 1, 1),
+    (&["COPY", "s", "s2"], 1, 0),
+    (&["COPY", "nokey", "s3"], 0, 1),
+    (&["DUMP", "s"], 1, 0),
+    (&["DUMP", "nokey"], 0, 1),
+    (&["GETEX", "g", "EX", "100"], 1, 0),
+    (&["GETEX", "nokey", "EX", "100"], 0, 1),
+    (&["GETDEL", "gd"], 1, 0),
+    (&["GETDEL", "nokey"], 0, 1),
+    (&["SET", "sg", "w", "GET"], 1, 0),
+    (&["SET", "nokey2", "w", "GET"], 0, 1),
+    (&["SET", "sg", "w", "NX", "GET"], 1, 0),
+    (&["EVAL", "return redis.call('GET',KEYS[1])", "1", "s"], 1, 0),
+    (&["EVAL", "return redis.call('GET',KEYS[1])", "1", "nokey"], 0, 1),
+    (&["EVAL", "return redis.call('HGET',KEYS[1],'f')", "1", "h"], 1, 0),
+    (&["EVAL", "return redis.call('SET',KEYS[1],'x')", "1", "s"], 0, 0),
+    (&["BLPOP", "l", "0"], 0, 0),
+    (&["BLPOP", "nokey", "0.01"], 0, 0),
+    (&["BRPOP", "nokey", "0.01"], 0, 0),
+];
+
+/// Keys that have passed their time (`PEXPIRE 1`, then a wait until `EXISTS`
+/// says 0 for one of them): the other is as much a miss.
+#[rustfmt::skip]
+const EXPIRED: &[(&[&str], u64, u64)] = &[
+    (&["GET", "e1"], 0, 1),
+    (&["HGET", "e1", "f"], 0, 1),
+    (&["EXISTS", "e1"], 0, 1),
+    (&["TTL", "e1"], 0, 1),
+];
+
+/// Runs `rows` on `c`, an INFO after each, and says which differ.
+fn check(c: &mut Conn, rows: &[(&[&str], u64, u64)], lua: bool) -> Vec<String> {
+    let (mut hits, mut misses) = (c.stat("keyspace_hits"), c.stat("keyspace_misses"));
+    let mut wrong = Vec::new();
+    for (args, want_hits, want_misses) in rows {
+        if !lua && args[0] == "EVAL" {
+            continue;
+        }
+        c.cmd(args);
+        let (h, m) = (c.stat("keyspace_hits"), c.stat("keyspace_misses"));
+        if (h - hits, m - misses) != (*want_hits, *want_misses) {
+            wrong.push(format!(
+                "{}: {} hits and {} misses, Redis 8.12 {want_hits} and {want_misses}",
+                args.join(" "),
+                h - hits,
+                m - misses
+            ));
+        }
+        (hits, misses) = (h, m);
+    }
+    wrong
+}
+
 #[test]
 fn keyspace_hits_and_misses_are_counted_as_redis_counts_them() {
     let port = free_port();
@@ -244,22 +345,66 @@ fn keyspace_hits_and_misses_are_counted_as_redis_counts_them() {
         c.cmd(setup);
     }
     assert_eq!(c.cmd(&["CONFIG", "RESETSTAT"]), "+OK");
-    let (mut hits, mut misses) = (c.stat("keyspace_hits"), c.stat("keyspace_misses"));
+    let (hits, misses) = (c.stat("keyspace_hits"), c.stat("keyspace_misses"));
     assert_eq!((hits, misses), (0, 0));
+    let lua = !c.cmd(&["EVAL", "return 1", "0"]).starts_with('-');
+    let mut wrong = check(&mut c, EXPECTED, lua);
 
-    let mut wrong = Vec::new();
-    for (args, want_hits, want_misses) in EXPECTED {
-        c.cmd(args);
-        let (h, m) = (c.stat("keyspace_hits"), c.stat("keyspace_misses"));
-        if (h - hits, m - misses) != (*want_hits, *want_misses) {
-            wrong.push(format!(
-                "{}: {} hits and {} misses, Redis 8.12 {want_hits} and {want_misses}",
-                args.join(" "),
-                h - hits,
-                m - misses
-            ));
-        }
-        (hits, misses) = (h, m);
+    // Keys made again, and the commands that combine them.
+    c.cmd(&["FLUSHALL"]);
+    for setup in [
+        &["SET", "s", "v"][..],
+        &["SET", "g", "v"],
+        &["SET", "gd", "v"],
+        &["SET", "sg", "v"],
+        &["HSET", "h", "f", "1"],
+        &["SADD", "st", "a", "b"],
+        &["SADD", "st2", "b", "c"],
+        &["ZADD", "z", "1", "a", "2", "b"],
+        &["ZADD", "z2", "1", "b", "2", "c"],
+        &["RPUSH", "l", "a", "b", "c"],
+    ] {
+        c.cmd(setup);
     }
+    assert_eq!(c.cmd(&["CONFIG", "RESETSTAT"]), "+OK");
+    wrong.extend(check(&mut c, COMBINING, lua));
+
+    // A transaction counts its commands as they run, at EXEC (the INFO that
+    // reads the counters goes on another connection: on this one it would
+    // be queued).
+    let mut other = Conn::connect(port);
+    let before = (other.stat("keyspace_hits"), other.stat("keyspace_misses"));
+    for args in [&["MULTI"][..], &["GET", "s"], &["GET", "nokey"], &["EXEC"]] {
+        c.cmd(args);
+    }
+    let after = (other.stat("keyspace_hits"), other.stat("keyspace_misses"));
+    if (after.0 - before.0, after.1 - before.1) != (1, 1) {
+        wrong.push(format!(
+            "MULTI GET s, GET nokey EXEC: {after:?} after {before:?}, Redis 8.12 1 hit and 1 miss"
+        ));
+    }
+
+    // A blocking pop served later, by a push from another connection.
+    c.send(&["BLPOP", "bl", "5"]);
+    thread::sleep(Duration::from_millis(300));
+    let before = (other.stat("keyspace_hits"), other.stat("keyspace_misses"));
+    other.cmd(&["LPUSH", "bl", "x"]);
+    assert_eq!(c.read_reply(), "*2");
+    let after = (other.stat("keyspace_hits"), other.stat("keyspace_misses"));
+    if after != before {
+        wrong.push(format!(
+            "BLPOP served later: {after:?} after {before:?}, Redis 8.12 counts nothing"
+        ));
+    }
+
+    // Keys that have passed their time.
+    for key in ["e1", "e2"] {
+        c.cmd(&["SET", key, "v"]);
+        c.cmd(&["PEXPIRE", key, "1"]);
+    }
+    while c.cmd(&["EXISTS", "e2"]) != ":0" {
+        thread::sleep(Duration::from_millis(2));
+    }
+    wrong.extend(check(&mut c, EXPIRED, lua));
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
