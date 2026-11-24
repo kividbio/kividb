@@ -1947,7 +1947,6 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .collect();
             crate::hash_fields::after_write_ex(&hx, &mut inner);
             drop(inner);
-            crate::stats::record_hit();
             if !deleted.is_empty() {
                 let db = *ctx.selected_db;
                 notify(ctx.pubsub, db, KS_HASH, "hdel", &key);
@@ -1955,12 +1954,9 @@ fn run_hgetdel(ctx: &mut Ctx) -> Option<Vec<u8>> {
             }
             Some(resp_array(out))
         }
-        Some(_) => {
-            crate::stats::record_hit();
-            Some(resp_error(
-                "WRONGTYPE Operation against a key holding the wrong kind of value",
-            ))
-        }
+        Some(_) => Some(resp_error(
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
+        )),
     }
 }
 
@@ -2152,23 +2148,18 @@ fn run_hgetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
                         None => resp_null_for(resp),
                     })
                     .collect();
-                crate::stats::record_hit();
                 Some(resp_array(out))
             }
             Some(ValueRef::HashEx(hx)) => {
                 let hx = Arc::clone(hx);
                 drop(map);
-                crate::stats::record_hit();
                 Some(resp_array(hgetex_apply(
                     ctx, &key, &hx, &fields, action, resp, now,
                 )))
             }
-            Some(_) => {
-                crate::stats::record_hit();
-                Some(resp_error(
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                ))
-            }
+            Some(_) => Some(resp_error(
+                "WRONGTYPE Operation against a key holding the wrong kind of value",
+            )),
         }
     }
 }

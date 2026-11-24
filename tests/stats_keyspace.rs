@@ -214,6 +214,8 @@ const EXPECTED: &[(&[&str], u64, u64)] = &[
     (&["SADD", "st", "c"], 0, 0),
     (&["ZADD", "z", "3", "c"], 0, 0),
     (&["HSET", "h", "g", "2"], 0, 0),
+    (&["HGETDEL", "h", "FIELDS", "1", "nof"], 0, 0),
+    (&["HGETEX", "nokey", "EX", "100", "FIELDS", "1", "f"], 0, 0),
 ];
 
 #[test]

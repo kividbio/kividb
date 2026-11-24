@@ -1045,16 +1045,18 @@ impl PackedList {
         }
     }
 
-    /// The room a chunk opened at an end by a push of `element_len` bytes
+    /// The room a chunk opened in front by a push of `element_len` bytes
     /// starts with, beside a full chunk holding `live` bytes of frames: a
-    /// quarter of it, so that a steady queue does not regrow the chunk at
+    /// quarter of it, so that a steady stack does not regrow the chunk at
     /// every push. A list of four chunks or more (over 192 elements) of short
     /// elements gets room for a whole chunk of frames like this one: the
     /// chunk is then allocated once, at one size, and filled without
-    /// moving, and the chunks of lists that push at one end and trim at the
-    /// other (a timeline: `LPUSH`, `LTRIM`) come and go in one size, which
+    /// moving, and the chunks of lists that push at the front and trim at
+    /// the back (a timeline: `LPUSH`, `LTRIM`) come and go in one size, which
     /// an allocator reuses, instead of in the ten sizes a chunk passes
-    /// through as it grows by a quarter.
+    /// through as it grows by a quarter. Chunks opened at the back keep the
+    /// quarter: a list loaded by `RPUSH` ends in a chunk that is not full,
+    /// and the room it was given is not used.
     fn new_chunk_room(&self, element_len: usize, live: usize) -> usize {
         let frame = frame_len(element_len);
         let quarter = frame.max(live / 4);
@@ -1221,8 +1223,7 @@ impl PackedList {
             // A list that filled a chunk at this end is growing here: the
             // new chunk gets room for a quarter of the full one, so that a
             // steady queue does not regrow it at every push.
-            let live = last.live();
-            let room = self.new_chunk_room(element.len(), live);
+            let room = frame_len(element.len()).max(last.live() / 4);
             self.open_back(room);
             self.last_mut().push_back(element);
         }

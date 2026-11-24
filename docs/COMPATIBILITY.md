@@ -462,8 +462,9 @@ other files:
   command looks up as Redis does: a hit when the key is there (whatever its
   type, and whether or not the member, field or index asked for is in it), a
   miss when it is not; commands that write count neither. The bit commands
-  (`GETBIT`, `BITCOUNT`, `BITPOS`), `PFCOUNT`, `XLEN`, `GEOPOS`, `LCS` and
-  `SORT` do not count a lookup yet.
+  (`GETBIT`, `BITCOUNT`, `BITPOS`), `PFCOUNT`, `XLEN`, `GEOPOS`, `LCS`,
+  `SORT` and the field-expiry reads (`HTTL` and its relatives) do not count a
+  lookup yet.
 - `OBJECT IDLETIME` is `0` unless a `maxmemory-policy` that uses it is set,
   or `key-access-tracking yes` is (Redis always keeps it; the setting costs
   about 50 instructions a command, 1 to 1.5% of a pipelined `GET` or `SET`).

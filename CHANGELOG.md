@@ -621,10 +621,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ZLEXCOUNT`, `ZMSCORE`, `ZREVRANK`, `ZRANDMEMBER`, `ZSCAN`), `HRANDFIELD`
   and the sources of the set and sorted-set algebra commands (each key
   named counts) are counted; `HMGET` and `MGET` count each key once;
-  commands that write (`LPOP`, `LMPOP`, `BLPOP`, `LPUSHX`, `HDEL`, `SREM`,
-  `SPOP`, `SMOVE`) count nothing, as in Redis. `tests/stats_keyspace.rs`
-  holds the counts Redis 8.12.0 gives for 99 commands. The bit commands,
-  `PFCOUNT`, `XLEN`, `GEOPOS`, `LCS` and `SORT` do not count yet.
+  commands that write (`LPOP`, `LMPOP`, `BLPOP`, `LPUSHX`, `HDEL`,
+  `HGETDEL`, `HGETEX`, `SREM`, `SPOP`, `SMOVE`) count nothing, as in Redis.
+  `tests/stats_keyspace.rs` holds the counts Redis 8.12.0 gives for 101
+  commands. The bit commands, `PFCOUNT`, `XLEN`, `GEOPOS`, `LCS`, `SORT` and
+  the field-expiry reads (`HTTL` and its relatives) do not count yet.
 
 - **io_uring workers finish a waiting socket read without interrupting the
   worker (#1015).** Each worker's ring is made with
