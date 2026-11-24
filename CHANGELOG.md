@@ -580,8 +580,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which it makes on every turn of its loop, rather than interrupting a
   running worker (an inter-processor interrupt, sent by the CPU that took
   the request in, usually the client's); a sleeping worker is woken as
-  before. With one request in flight a connection that was 0.46 interrupts
-  a command. A client that waits for every reply, and is itself the limit,
+  before. With one request in flight a connection, master sends 0.46 such
+  interrupts a command; with the flag, none. A client that waits for every reply, and is itself the limit,
   gets more done: on an Azure `Standard_D8s_v5`, the server on vCPUs 0-3
   (`--threads 4`; Redis 8.10.2 `--io-threads 4`), @keyv/redis's benchmark
   shape (200,000 keys of 1 KB with a TTL, one `SET ... PX` then nine

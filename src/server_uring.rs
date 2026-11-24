@@ -21,7 +21,7 @@ use tokio_uring::net::TcpStream;
 /// default it interrupts that thread at once if it is running (an
 /// inter-processor interrupt), and the CPU that took the request in, which
 /// is often the client's, pays for sending it: with one request in flight
-/// a connection, about one a request (#1015). Without the interrupt the
+/// a connection, about one every two requests (#1015). Without the interrupt the
 /// read finishes at the worker's next system call, which it makes on every
 /// turn of its loop anyway, and a worker that sleeps is still woken for it.
 /// An older kernel refuses the flag, and the ring is then made without it.
