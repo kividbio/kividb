@@ -1260,6 +1260,9 @@ mod tests {
         // allocator's as they grew, and back as `LTRIM` and `LREM` gave
         // their room back.
         let (up, down) = crate::packed_list::crossings::counts();
-        assert!(up > 0 && down > 0, "crossings of 8 KiB: {up} up, {down} down");
+        assert!(
+            up > 0 && down > 0,
+            "crossings of 8 KiB: {up} up, {down} down"
+        );
     }
 }

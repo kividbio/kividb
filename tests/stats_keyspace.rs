@@ -667,6 +667,82 @@ const FRESH: &[(&[&str], u64, u64)] = &[
     (&["XACK", "s", "g", "1-1"], 1, 0),
 ];
 
+/// A row of [`BLOCKING`].
+type BlockingRow = (
+    &'static [&'static str],
+    Option<&'static [&'static str]>,
+    u64,
+    u64,
+);
+
+/// Blocking reads, from Redis 8.12.0, each on fresh keys (`x` a stream whose
+/// group `g` has read it all, `xe` one past its time, `l` a list of `a` and
+/// `b`, `z` a sorted set of `a` and `b`): (command, a write another
+/// connection sends 300 ms later, hits, misses). A stream read counts its
+/// lookups once a run: a wait that times out adds nothing (Redis answers it
+/// without running the command again), one a write ends runs it again. The
+/// blocking pops count nothing, as they write.
+#[rustfmt::skip]
+const BLOCKING: &[BlockingRow] = &[
+    (&["XREAD", "BLOCK", "200", "STREAMS", "x", "$"], None, 2, 0),
+    (&["XREAD", "BLOCK", "200", "STREAMS", "nokey", "$"], None, 0, 2),
+    (&["XREAD", "BLOCK", "1000", "STREAMS", "x", "0"], None, 2, 0),
+    (&["XREAD", "BLOCK", "5000", "STREAMS", "x", "$"], Some(&["XADD", "x", "*", "f", "w"]), 4, 0),
+    (&["XREAD", "STREAMS", "xe", "0"], None, 0, 2),
+    (&["XREADGROUP", "GROUP", "g", "c1", "BLOCK", "200", "STREAMS", "x", ">"], None, 2, 0),
+    (&["XREADGROUP", "GROUP", "g", "c1", "BLOCK", "1000", "STREAMS", "x", "0"], None, 2, 0),
+    (&["XREADGROUP", "GROUP", "g", "c1", "BLOCK", "5000", "STREAMS", "x", ">"], Some(&["XADD", "x", "*", "f", "w"]), 4, 0),
+    (&["BLPOP", "nokey", "0.2"], None, 0, 0),
+    (&["BLMOVE", "l", "d", "LEFT", "RIGHT", "1"], None, 0, 0),
+    (&["BLMOVE", "nl", "d", "LEFT", "RIGHT", "5"], Some(&["RPUSH", "nl", "q"]), 0, 0),
+    (&["BLMPOP", "0.2", "1", "nokey", "LEFT"], None, 0, 0),
+    (&["BZPOPMIN", "z", "1"], None, 0, 0),
+    (&["BZPOPMIN", "nz", "5"], Some(&["ZADD", "nz", "1", "q"]), 0, 0),
+    (&["BZMPOP", "0.2", "1", "nokey", "MIN"], None, 0, 0),
+];
+
+/// Runs each of [`BLOCKING`] on fresh keys, its write sent by another
+/// connection, and says which differ.
+fn check_blocking(c: &mut Conn, port: u16) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (args, write, want_hits, want_misses) in BLOCKING {
+        c.cmd(&["FLUSHALL"]);
+        for setup in [
+            &["XADD", "x", "1-1", "f", "v"][..],
+            &["XGROUP", "CREATE", "x", "g", "$"],
+            &["RPUSH", "l", "a", "b"],
+            &["ZADD", "z", "1", "a", "2", "b"],
+            &["XADD", "xe", "1-1", "f", "v"],
+            &["PEXPIRE", "xe", "1"],
+        ] {
+            c.cmd(setup);
+        }
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(c.cmd(&["CONFIG", "RESETSTAT"]), "+OK");
+        let writer = write.map(|write| {
+            let write: Vec<String> = write.iter().map(|a| a.to_string()).collect();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(300));
+                let mut other = Conn::connect(port);
+                let args: Vec<&str> = write.iter().map(String::as_str).collect();
+                other.cmd(&args);
+            })
+        });
+        c.cmd(args);
+        if let Some(writer) = writer {
+            writer.join().unwrap();
+        }
+        let (h, m) = (c.stat("keyspace_hits"), c.stat("keyspace_misses"));
+        if (h, m) != (*want_hits, *want_misses) {
+            wrong.push(format!(
+                "{} (blocking): {h} hits and {m} misses, Redis 8.12 {want_hits} and {want_misses}",
+                args.join(" ")
+            ));
+        }
+    }
+    wrong
+}
+
 /// Runs each of `rows` on fresh [`FIXTURES`], and says which differ.
 fn check_fresh(c: &mut Conn, rows: &[(&[&str], u64, u64)]) -> Vec<String> {
     let mut wrong = Vec::new();
@@ -801,5 +877,8 @@ fn keyspace_hits_and_misses_are_counted_as_redis_counts_them() {
 
     // The other read commands, each on fresh keys of every type.
     wrong.extend(check_fresh(&mut c, FRESH));
+
+    // Blocking reads: served at once, served later, timed out.
+    wrong.extend(check_blocking(&mut c, port));
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
