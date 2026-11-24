@@ -672,8 +672,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
         // ── APPEND ────────────────────────────────────────────────────────────────────
         // Appends bytes to the existing string, creating it if absent.
-        // Returns the new length. Because Arc<[u8]> is immutable, we must allocate
-        // a new buffer with the concatenated bytes — this is the only way.
+        // Returns the new length. Written where the string is kept when
+        // nothing but its key holds it, a long one in a block with room to
+        // spare for the next appends; else copied once (`append_str`).
         "APPEND" => {
             if cmd.len() != 3 {
                 return Some(resp_error(
@@ -688,34 +689,22 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            // At the end of the string, in its own entry, when it has room.
-            if let Some(len) = map.append_in_place(key, suffix) {
-                drop(map);
-                notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "append", key);
-                return Some(resp_integer(len as i64));
+            // As Redis: a string does not grow past 512 MB.
+            match map.append_str(key, suffix, MAX_STRING_LEN) {
+                Ok((len, written)) => {
+                    drop(map);
+                    // The entry it replaced, if any, freed unlocked.
+                    drop(written);
+                    notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "append", key);
+                    Some(resp_integer(len as i64))
+                }
+                Err(store::AppendRefused::TooLong) => Some(resp_error(
+                    "ERR string exceeds maximum allowed size (proto-max-bulk-len)",
+                )),
+                Err(store::AppendRefused::WrongType) => Some(resp_error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                )),
             }
-            let new_val: SharedBytes = match map.get(key) {
-                None => SharedBytes::from(*suffix),
-                Some(ValueRef::String(existing)) => {
-                    // As Redis: a string does not grow past 512 MB.
-                    if existing.len() + suffix.len() > MAX_STRING_LEN {
-                        return Some(resp_error(
-                            "ERR string exceeds maximum allowed size (proto-max-bulk-len)",
-                        ));
-                    }
-                    SharedBytes::concat(&[&existing, suffix])
-                }
-                Some(_) => {
-                    return Some(resp_error(
-                        "WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ));
-                }
-            };
-            let len = new_val.len() as i64;
-            map.insert(key, KiviDBValue::String(new_val));
-            drop(map);
-            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "append", key);
-            Some(resp_integer(len))
         }
 
         // ── GETDEL ────────────────────────────────────────────────────────────────────
