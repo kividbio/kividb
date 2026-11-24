@@ -89,6 +89,7 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--threads` | `0` (auto) | Worker threads; auto is half the CPUs the process may use, rounded up (see [Worker threads](#worker-threads)) |
 | `--worker-cpu-affinity <off\|auto>` | `off` | `auto` binds each io_uring worker to a CPU of its own when they are as many as the process's CPUs (see [Worker CPU affinity](#worker-cpu-affinity)) |
 | `--search-index-threads <auto\|N>` | `auto` | Helper threads that link vectors written to HNSW indexes; startup only (see [Search index threads](#search-index-threads)) |
+| `--search-resp3-reply <auto\|redis\|valkey>` | `auto` | The shape of the search commands' replies over RESP3 (see [Search reply shape over RESP3](#search-reply-shape-over-resp3)) |
 | `--databases` | `16` | Number of databases |
 | `--dir <path>` | start directory | Where `dump.kdb`, `appendonly.aof` and `nodes.conf` live |
 | `--aof` | off | Append-only file persistence |
@@ -268,6 +269,31 @@ which is:
 
 A Kubernetes pod with a CPU request but no CPU limit has no quota, so the server sees every CPU
 of the node: give it a limit, or `--threads`.
+
+### Search reply shape over RESP3
+
+`--search-resp3-reply` (`search-resp3-reply` in the configuration file; `CONFIG GET` and
+`CONFIG SET` take it, and it applies to connections that are already open) is the shape of
+the replies of `FT.SEARCH`, `FT.AGGREGATE` (and its cursor), `FT.HYBRID`, `FT.INFO` and
+`FT._LIST` to a connection that has sent `HELLO 3`:
+
+| Value | Reply over RESP3 |
+|-------|------------------|
+| `auto` (default) | Redis 8's, a map, except to a client that named itself valkey-glide with `CLIENT SETINFO LIB-NAME`: valkey-search's |
+| `redis` | Redis 8's for every connection |
+| `valkey` | valkey-search's for every connection |
+
+valkey-search answers a RESP3 connection with the arrays it answers RESP2 with, and
+valkey-glide converts that reply itself: it reads `[total, key, [field, value, ...], ...]` and
+refuses a map. In the valkey shape `FT.SEARCH` is the count, then each key and its fields as a
+flat array (a key alone with `NOCONTENT`); `FT.AGGREGATE`, a cursor and `FT.HYBRID` the count,
+then each row as a flat array with the name of each column a simple string; `FT.INFO` a flat
+array with a simple string for each name; `FT._LIST` an array of simple strings. A client is
+valkey-glide when its library name begins with `Glide`, in any case (`GlidePy`, `GlidePySync`,
+`GlideJS`, `GlideJava`, `GlideGo`, `GlideFFI`, and any of them followed by a tag in brackets).
+RESP2 replies are the same in every mode, as are a script's (`redis.call` reads RESP2 unless
+the script says `redis.setresp(3)`) and the parts that the masters of a cluster give one
+another.
 
 ### Search index threads
 

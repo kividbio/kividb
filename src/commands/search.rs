@@ -509,7 +509,7 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error(&no_such_index(name)));
     };
     let def = &def;
-    let resp = search_resp(ctx);
+    let (resp, valkey) = search_shape(ctx);
     let cluster = ctx.cluster.enabled.then_some(&**ctx.cluster);
     // The index's own database, whichever the client has selected.
     let mut num_docs = count_docs(def, cluster);
@@ -537,7 +537,7 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     let mut out: Vec<Vec<u8>> = Vec::new();
     let mut put = |key: &str, value: Vec<u8>| {
-        out.push(resp_bulk_str(key));
+        out.push(reply_name(key, valkey));
         out.push(value);
     };
     put("index_name", resp_bulk_str(&def.name));
@@ -550,12 +550,12 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }),
     );
     let mut definition = vec![
-        resp_bulk_str("key_type"),
+        reply_name("key_type", valkey),
         resp_bulk_str(match def.on {
             IndexOn::Hash => "HASH",
             IndexOn::Json => "JSON",
         }),
-        resp_bulk_str("prefixes"),
+        reply_name("prefixes", valkey),
         resp_array(def.prefixes.iter().map(|p| resp_bulk_str(p)).collect()),
     ];
     definition.extend(language_definition(&def.language));
@@ -613,55 +613,60 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
 
     // What this reply had before it was given Redis's shape. Kept, for
-    // anything that reads it.
-    put("index_on", {
-        resp_bulk_str(match def.on {
-            IndexOn::Hash => "hash",
-            IndexOn::Json => "json",
-        })
-    });
-    put(
-        "prefixes",
-        resp_array(def.prefixes.iter().map(|p| resp_bulk_str(p)).collect()),
-    );
-    put("num_fields", resp_bulk_str(&def.fields.len().to_string()));
-    put(
-        "fields",
-        resp_array(
-            def.fields
-                .iter()
-                .map(|f| {
-                    let label = match &f.field_type {
-                        FieldType::Vector {
-                            algo,
-                            dim,
-                            metric,
-                            data_type,
-                        } => {
-                            let algo = match algo {
-                                VectorAlgo::Flat => "FLAT".to_string(),
-                                VectorAlgo::Hnsw {
-                                    m, ef_construction, ..
-                                } => format!("HNSW(M={m},ef={ef_construction})"),
-                            };
-                            let metric = match metric {
-                                DistanceMetric::L2 => "L2",
-                                DistanceMetric::Cosine => "COSINE",
-                                DistanceMetric::InnerProduct => "IP",
-                            };
-                            // As it was for FLOAT32, which was all there was.
-                            match data_type {
-                                VectorType::Float32 => format!("VECTOR {algo} DIM={dim} {metric}"),
-                                ty => format!("VECTOR {algo} {} DIM={dim} {metric}", ty.name()),
+    // anything that reads it. valkey-search's reply has none of it, and
+    // valkey-glide reads a `fields` that holds strings as an error.
+    if !valkey {
+        put("index_on", {
+            resp_bulk_str(match def.on {
+                IndexOn::Hash => "hash",
+                IndexOn::Json => "json",
+            })
+        });
+        put(
+            "prefixes",
+            resp_array(def.prefixes.iter().map(|p| resp_bulk_str(p)).collect()),
+        );
+        put("num_fields", resp_bulk_str(&def.fields.len().to_string()));
+        put(
+            "fields",
+            resp_array(
+                def.fields
+                    .iter()
+                    .map(|f| {
+                        let label = match &f.field_type {
+                            FieldType::Vector {
+                                algo,
+                                dim,
+                                metric,
+                                data_type,
+                            } => {
+                                let algo = match algo {
+                                    VectorAlgo::Flat => "FLAT".to_string(),
+                                    VectorAlgo::Hnsw {
+                                        m, ef_construction, ..
+                                    } => format!("HNSW(M={m},ef={ef_construction})"),
+                                };
+                                let metric = match metric {
+                                    DistanceMetric::L2 => "L2",
+                                    DistanceMetric::Cosine => "COSINE",
+                                    DistanceMetric::InnerProduct => "IP",
+                                };
+                                // As it was for FLOAT32, which was all there was.
+                                match data_type {
+                                    VectorType::Float32 => {
+                                        format!("VECTOR {algo} DIM={dim} {metric}")
+                                    }
+                                    ty => format!("VECTOR {algo} {} DIM={dim} {metric}", ty.name()),
+                                }
                             }
-                        }
-                        _ => f.type_name().to_string(),
-                    };
-                    resp_bulk_str(&format!("{} ({})", f.name, label))
-                })
-                .collect(),
-        ),
-    );
+                            _ => f.type_name().to_string(),
+                        };
+                        resp_bulk_str(&format!("{} ({})", f.name, label))
+                    })
+                    .collect(),
+            ),
+        );
+    }
 
     // ── HNSW stats: one entry per HNSW field, and flat keys for the first.
     use std::sync::atomic::Ordering::Relaxed;
@@ -2707,7 +2712,14 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             },
         })
         .collect();
-    let page = encode_page(search_resp(ctx), &page, total, &args, nocontent, timed_out);
+    let page = encode_page(
+        search_shape(ctx).0,
+        &page,
+        total,
+        &args,
+        nocontent,
+        timed_out,
+    );
     // A coordinator that asks for it is told whether this part timed out;
     // one from before there was a timeout gets the page as it expects it.
     if shard && crate::cluster::search::wants_timeout_flag(&ctx.cmd) {
@@ -2843,6 +2855,86 @@ fn search_resp(ctx: &Ctx) -> u8 {
         2
     } else {
         crate::commands::handler::effective_resp_for_reply(ctx)
+    }
+}
+
+// ── `search-resp3-reply` ─────────────────────────────────────────────────────
+//
+// Over RESP3 the search commands answer as Redis 8 does: a map. valkey-search
+// answers a RESP3 connection with the arrays it answers RESP2 with, and its
+// clients (valkey-glide) read nothing else. `auto`, the default, gives a
+// connection that named itself a GLIDE client (`CLIENT SETINFO LIB-NAME`) the
+// valkey-search shape and every other the Redis one; `redis` and `valkey`
+// give every connection that one. RESP2 is the same in each.
+
+const RESP3_AUTO: u8 = 0;
+const RESP3_REDIS: u8 = 1;
+const RESP3_VALKEY: u8 = 2;
+
+static RESP3_REPLY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(RESP3_AUTO);
+
+/// `search-resp3-reply`: `auto`, `redis` or `valkey`. False for any other.
+pub(crate) fn set_resp3_reply(value: &str) -> bool {
+    let mode = match value.to_ascii_lowercase().as_str() {
+        "auto" => RESP3_AUTO,
+        "redis" => RESP3_REDIS,
+        "valkey" => RESP3_VALKEY,
+        _ => return false,
+    };
+    RESP3_REPLY.store(mode, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// The value of `search-resp3-reply`.
+pub(crate) fn resp3_reply() -> &'static str {
+    match RESP3_REPLY.load(std::sync::atomic::Ordering::Relaxed) {
+        RESP3_REDIS => "redis",
+        RESP3_VALKEY => "valkey",
+        _ => "auto",
+    }
+}
+
+/// Whether this reply takes valkey-search's shape: the connection speaks
+/// RESP3, outside a script (which has its own protocol) and not as a shard
+/// answering its coordinator, and the setting, or the client, asks for it.
+/// The one place the decision is made; a RESP2 connection stops at the first
+/// test.
+#[inline]
+pub(crate) fn valkey_shape(ctx: &Ctx) -> bool {
+    if ctx.resp & crate::commands::ctx::RESP_VERSION != 3 || SHARD.with(|s| s.get()) {
+        return false;
+    }
+    #[cfg(feature = "lua")]
+    if crate::commands::lua::script_eval_script_resp().is_some() {
+        return false;
+    }
+    match RESP3_REPLY.load(std::sync::atomic::Ordering::Relaxed) {
+        RESP3_REDIS => false,
+        RESP3_VALKEY => true,
+        _ => ctx.client_registry.get_glide(ctx.client_id),
+    }
+}
+
+/// The protocol a search reply is written in, and whether it takes
+/// valkey-search's details on top of RESP2's layout (a name is a simple
+/// string).
+#[inline]
+pub(crate) fn search_shape(ctx: &Ctx) -> (u8, bool) {
+    if valkey_shape(ctx) {
+        (2, true)
+    } else {
+        (search_resp(ctx), false)
+    }
+}
+
+/// A name in a reply: a simple string in valkey-search's replies, a bulk
+/// string in Redis's.
+#[inline]
+pub(crate) fn reply_name(name: &str, valkey: bool) -> Vec<u8> {
+    if valkey && !name.contains(['\r', '\n']) {
+        resp_simple(name)
+    } else {
+        resp_bulk_str(name)
     }
 }
 
@@ -3030,7 +3122,7 @@ fn coordinate(
         return Err("Timeout limit was reached".into());
     }
     Ok(encode_page(
-        search_resp(ctx),
+        search_shape(ctx).0,
         &page,
         total,
         args,

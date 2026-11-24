@@ -98,6 +98,11 @@ other files:
 - `@upstash/ratelimit` 2.0 through the Serverless Redis HTTP proxy (KiviDB has no REST API; the `lua`
   build), with its own test suite: [benchmarks/upstash-ratelimit-compat/](../benchmarks/upstash-ratelimit-compat/)
   and [docs/integrations/upstash-ratelimit.md](integrations/upstash-ratelimit.md).
+- valkey-glide (Python, Node.js, Java, Go): `FT.SEARCH`, `FT.AGGREGATE`, `FT.INFO` and the commands
+  around them, through `custom_command` and GLIDE's own search API. GLIDE speaks RESP3 and converts
+  these replies itself, from valkey-search's shape, so a connection that names itself GLIDE
+  (`CLIENT SETINFO LIB-NAME`) is answered in that shape; `search-resp3-reply valkey` does it for every
+  connection: [docs/CONFIGURATION.md](CONFIGURATION.md#search-reply-shape-over-resp3).
 - Not compatible: Haystack's Valkey document store, which needs valkey-search's reply formats (it fails on
   Redis 8 too): [docs/integrations/haystack.md](integrations/haystack.md).
 - `redis-py` throughout the end-to-end tests (`tests/e2e/`).

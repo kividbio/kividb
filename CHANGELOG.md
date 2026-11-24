@@ -146,6 +146,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`search-resp3-reply`: the shape of the search commands' RESP3 replies (#1021).**
+  `auto` (the default) answers `FT.SEARCH`, `FT.AGGREGATE` (and its cursor), `FT.HYBRID`,
+  `FT.INFO` and `FT._LIST` over RESP3 as Redis 8 does, a map, and a valkey-glide client
+  (`CLIENT SETINFO LIB-NAME` begins with `Glide`) as valkey-search does: the count, then each key
+  and its fields, or each row, as a flat array, which is the reply GLIDE converts. `redis` and
+  `valkey` give every connection one or the other. It is set in the configuration file, on the
+  command line, and with `CONFIG SET`, which acts on connections already open. RESP2 replies, a
+  script's, and what the masters of a cluster tell one another are the same in each.
+
 - **`FT.SEARCH … INFIELDS n field …` (part of #1004).** The query's text
   clauses look only in the fields named (by the name `AS` gave them), as in
   Redis: a clause's own fields are narrowed too (`@title:x` with `INFIELDS 1
