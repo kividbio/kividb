@@ -660,6 +660,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   also what runs under Docker's default seccomp profile (it refuses
   io_uring), is unchanged. See docs/PERFORMANCE.md, "Request-response from
   many connections"; suite 49 of `benchmarks/1.3.0/regressions` measures it.
+- **A `SETBIT` that leaves the bit as it is, and a `BITFIELD` or
+  `BITFIELD_RO` that writes nothing, read a long string where it is kept
+  (part of #1016).** `SETBIT` reads the bit where the string is kept and
+  copies the string only when it writes. `BITFIELD` and `BITFIELD_RO` read
+  a string of 4 KiB or more where it is kept and copy it only for a write
+  that succeeds; a shorter one kept in its key's entry is copied once to
+  be read. The time these commands take is the same whatever the string's
+  length. Server time a call on a 64 MiB string: on an Azure
+  `Standard_D4s_v5` (Xeon 8473C), a `SETBIT` that changes nothing 1.52 µs
+  (master before this change: 63,313 µs), a `BITFIELD` with one `GET`
+  0.24 µs (132,208 µs), a `BITFIELD` whose `OVERFLOW FAIL` write fails
+  0.46 µs (132,012 µs); on an Apple M3 Pro (`--threads 4`, median of 3),
+  0.41 µs (1,785 µs) and 0.17 µs (2,849 µs) for the first two. Four
+  connections sending that `SETBIT` to one 64 MiB key: 141,627 calls/s
+  (16), with another connection's `SET` every millisecond at a p99 of
+  102 µs (267 ms).
 - **A save keeps about 8 MiB of collections in memory a capture thread
   while the disk keeps up (#825).** A save lays out the values that are not strings when it
   captures the dataset, with writes held. For `dump.kdb` each capture thread
