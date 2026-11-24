@@ -267,6 +267,19 @@ fn overwritten_type_changed_and_array_events() {
     assert_eq!(event(&mut sub), "setrange num");
     c.cmd(&["SETBIT", "bits", "1", "1"]);
     assert_eq!(event(&mut sub), "setbit bits");
+    // A bit already as asked is announced as well (Redis announces a change
+    // only), on a string in its entry and on one of its own alike.
+    c.cmd(&["SETRANGE", "big", "65535", "x"]);
+    assert_eq!(event(&mut sub), "setrange big");
+    for (key, offset, bit, old) in [
+        ("bits", "1", "1", 1),
+        ("big", "0", "0", 0),
+        ("bits", "1", "0", 1),
+        ("big", "0", "1", 0),
+    ] {
+        assert_eq!(c.cmd(&["SETBIT", key, offset, bit]), V::Int(old));
+        assert_eq!(event(&mut sub), format!("setbit {key}"), "{key} {bit}");
+    }
     c.cmd(&["PFADD", "hll", "a"]);
     assert_eq!(event(&mut sub), "pfadd hll");
     c.cmd(&["GEOADD", "g", "13.36", "38.11", "p"]);

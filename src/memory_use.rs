@@ -75,9 +75,42 @@ fn count(delta: isize) {
             counter.load(Ordering::Relaxed).wrapping_add(delta),
             Ordering::Relaxed,
         );
+        #[cfg(test)]
+        note_peak(counter.load(Ordering::Relaxed));
     } else {
         counter.fetch_add(delta, Ordering::Relaxed);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    // The most this thread's counter has been: see `peak_during`. As
+    // `MINE`, it allocates nothing to be read.
+    static PEAK: Cell<isize> = const { Cell::new(isize::MIN) };
+}
+
+#[cfg(test)]
+#[inline]
+fn note_peak(now: isize) {
+    let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+}
+
+/// `f`'s result, and the most the calling thread had allocated at once
+/// while `f` ran, over what it had when `f` began: `None` when the thread
+/// has no counter of its own (see [`allocated_by_this_thread`]).
+#[cfg(test)]
+pub fn peak_during<R>(f: impl FnOnce() -> R) -> (R, Option<isize>) {
+    let before = allocated_by_this_thread();
+    if let Some(before) = before {
+        PEAK.with(|peak| peak.set(before));
+    }
+    let out = f();
+    let peak = PEAK.with(Cell::get);
+    // Counted on a counter of its own throughout.
+    let rise = before
+        .filter(|_| allocated_by_this_thread().is_some())
+        .map(|before| peak - before);
+    (out, rise)
 }
 
 /// The allocator, counting. Installed as the global allocator by the
