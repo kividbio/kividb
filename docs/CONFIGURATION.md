@@ -182,7 +182,7 @@ until then its free blocks are memory the process holds.
 that `APPEND` grows gets room for the next appends: a quarter of its length more, at most
 16 MiB, and none past 512 MiB. The appends after it are written into that room, in place,
 and one that finds no room left grows the block with `realloc` by a quarter again (the
-allocator extends a large block where it is, or remaps its pages, rather than copying it), so
+allocator can often extend a large block where it is, or remap its pages, rather than copy it), so
 a string built by many small appends costs about the same a call whatever its length. That
 room is allocated memory: `used_memory`, `maxmemory` and `MEMORY USAGE` count it, at most a
 fifth of the block (25 % of the string's length, 16 MiB at most); pages of it not yet written

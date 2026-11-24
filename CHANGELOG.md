@@ -763,7 +763,58 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   an Apple M3 Pro (release build, tokio, `--threads 4`, one connection,
   median of 3 runs; preliminary, from one machine): 0.64 µs (before this
   change: 2,643 µs), 1,348 µs (2,626 µs) when a `COPY` shares its bytes,
-  and 1,286 µs (13,629 µs) when each call grows it by a byte.
+  and 1,286 µs (13,629 µs) when each call grows it by a byte. On an Azure
+  `Standard_D4s_v5` (Xeon 8370C, Linux, release build, default threads, one
+  connection, a bit set and cleared by turns, 2,000 calls), server time a
+  call on a string of 64 KiB, 1 MiB and 64 MiB: 1.01, 1.13 and 1.01 µs
+  (master before this change: 4.08, 131 and 70,684 µs; Redis 8.12.0: 0.33,
+  0.37 and 0.48 µs); the client's time a call, round trip included, 29.6,
+  31.0 and 28.3 µs (33.2, 175 and 70,802 µs; Redis 28.2, 28.2 and 32.1 µs).
+- **An `APPEND` writes where the string is kept, and a long string keeps
+  room for the next appends (part of #1016).** When nothing but its key
+  holds the string, `APPEND` writes the new bytes in place: in the key's
+  entry or its slab block while the string keeps its block size, and in a
+  string of more than 26,208 bytes (the system allocator's) into the room
+  its block keeps. A block an `APPEND` makes or grows has room for a
+  quarter of the string's length more, at most 16 MiB and none past
+  512 MiB; one with no room left is grown with `realloc` by a quarter again,
+  which the allocator can often do where the block is, or by remapping its
+  pages, rather than by copying it.
+  A run of appends then costs the same a call whatever the string's length.
+  Before this change an `APPEND` onto a string not kept in its key's entry
+  (about 4 KiB and longer) copied it whole. A string held elsewhere (shared
+  with another key since a `COPY`, being read by a `GETEX` or `DUMP`, or
+  captured by a `BGSAVE`, an AOF rewrite or a replica's full sync) is copied
+  once, into a block with that room, and the holder keeps the bytes from
+  before. The room is allocated memory: `used_memory`, `maxmemory` and
+  `MEMORY USAGE` count it, at most a fifth of the block. Replies, `STRLEN`,
+  `DUMP`, `COPY`, `DEBUG DIGEST-VALUE`, snapshots, the AOF and replication
+  use the string's length, and a string loaded from a snapshot or a full
+  sync has no room; a string that stops being appended to keeps its room
+  until a `SET` of another length writes it. Replies, time to live, `WATCH`,
+  keyspace events, the dirty count, the AOF and replication are as before,
+  an empty `APPEND` included (it counts as a write, as in Redis). Inline,
+  slab and entry layouts and the string header are unchanged: a block of
+  the system allocator's has a size word in front of its header. On an
+  Azure `Standard_D4s_v5` (Xeon 8370C, Linux, release build, default
+  threads, one connection), server time a call (`INFO commandstats`) of an
+  `APPEND` of 3 bytes onto a string of 64 KiB, 1 MiB and 64 MiB: 0.88, 0.50
+  and 0.33 µs (master before this change: 2.83, 70.1 and 37,767 µs; Redis
+  8.12.0: 0.70, 0.34 and 0.50 µs); of 1 KiB: 1.00, 0.68 and 1.48 µs (86.0,
+  84.2 and 37,669 µs; Redis 0.98, 2.18 and 0.83 µs). A loop appending
+  100 bytes until the string is 256 MiB (2,684,355 calls): 0.16 µs a call,
+  no call over 1 ms (the slowest 0.68 ms at the client), a peak RSS of
+  275 MiB (Redis: 0.75 µs a call, the slowest 151 ms, a peak RSS of
+  538 MiB); to 8 MiB, 0.10 µs a call (master: 457 µs, 42 s in all against
+  2.4 s). After it the string holds 14.8 MB of room (5.5 % of its length;
+  Redis 67 MB, 25 %); a 1 MiB string after one append of 100 bytes holds
+  262,169 bytes (25 %). 10,000 strings each built by 100 appends of 100
+  bytes take 10,143 bytes of `used_memory` and 13,611 of RSS each (master:
+  10,143 and 13,897; Redis: 14,390 and 19,582). An `APPEND` onto a 64 MiB
+  string a `COPY` shares copies it once (34.9 ms), and the next ones are in
+  place (master: 37,467 µs every call). Suite 53 of
+  `benchmarks/1.3.0/regressions` gates these and the `SETBIT` and
+  `BITFIELD` rows at 64 MiB against v1.2.2 (38,110 µs an `APPEND` there).
 - **A save keeps about 8 MiB of collections in memory a capture thread
   while the disk keeps up (#825).** A save lays out the values that are not strings when it
   captures the dataset, with writes held. For `dump.kdb` each capture thread
