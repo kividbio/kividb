@@ -2836,6 +2836,25 @@ fn a_majority_holding_a_node_as_owner_at_an_older_epoch_is_not_followed() {
         Duration::from_secs(30),
         || new_master.is_master() && nodes[0].my_row()[3] == new_id,
     );
+    // Killed once its nodes.conf has it as the new master's replica: the
+    // restart is to start from that view, not from one saved before the
+    // failover (it would then start as a master and follow the new one's
+    // claim, with nothing to refuse).
+    wait_until(
+        "the old master's nodes.conf to have it as the new master's replica",
+        Duration::from_secs(10),
+        || {
+            std::fs::read_to_string(nodes[0].dir.join("nodes.conf")).is_ok_and(|conf| {
+                conf.lines().any(|l| {
+                    let f: Vec<&str> = l.split(' ').collect();
+                    f.len() > 3
+                        && f[2].contains("myself")
+                        && f[2].contains("slave")
+                        && f[3] == new_id
+                })
+            })
+        },
+    );
     nodes[0].kill();
     let from = nodes[0].log().len();
     nodes[0].spawn();
