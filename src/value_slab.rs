@@ -1696,6 +1696,13 @@ pub(crate) fn evacuating_slabs() -> usize {
         .sum()
 }
 
+/// For tests: whether the slab `block` is in is [`FULL`]: nobody's, too
+/// full to be listed for blocks, and in its class's list of full slabs.
+#[cfg(test)]
+pub(crate) fn is_full(block: *const u8) -> bool {
+    slab_of(block).state.load(Ordering::Acquire) == FULL
+}
+
 /// For tests: empty only the slab `block` is in, as [`plan_evacuation`]
 /// would, until the guard is dropped, panic or not. No other slab changes,
 /// and [`finish_evacuation`] does not see it. `None` unless nobody owns the

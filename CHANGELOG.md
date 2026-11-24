@@ -572,6 +572,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **io_uring workers finish a waiting socket read without interrupting the
+  worker (#1015).** Each worker's ring is made with
+  `IORING_SETUP_COOP_TASKRUN` (Linux 5.19 and later; on an older kernel the
+  ring is made without it): when the request for a read that waited
+  arrives, the kernel finishes the read at the worker's next system call,
+  which it makes on every turn of its loop, rather than interrupting a
+  running worker (an inter-processor interrupt, sent by the CPU that took
+  the request in, usually the client's); a sleeping worker is woken as
+  before. With one request in flight a connection, master sends 0.46 such
+  interrupts a command; with the flag, none. A client that waits for every reply, and is itself the limit,
+  gets more done: on an Azure `Standard_D8s_v5`, the server on vCPUs 0-3
+  (`--threads 4`; Redis 8.10.2 `--io-threads 4`), @keyv/redis's benchmark
+  shape (200,000 keys of 1 KB with a TTL, one `SET ... PX` then nine
+  `GET`s, each reply awaited) from 4 Node 24 threads on vCPUs 4-7, median of
+  5: 135.3k operations a second at 48 connections (master before it 129.5k,
+  v1.2.2 128.6k, Redis 136.3k), 137.6k at 16 (132.2k, 131.8k, Redis 133.1k);
+  the client's CPUs spend 4.3 µs a command in interrupts against 5.4 µs.
+  memtier_benchmark `SET`:`GET` 1:9 of 1 KB: 241.5k against 221.7k at
+  pipeline 1 and 50 connections, 1.64M against 1.45M at pipeline 16; every
+  pipelined row is level or ahead. The server's CPU at rest (0.003) and
+  under that load is unchanged: nothing spins. The tokio loop, which is
+  also what runs under Docker's default seccomp profile (it refuses
+  io_uring), is unchanged. See docs/PERFORMANCE.md, "Request-response from
+  many connections"; suite 49 of `benchmarks/1.3.0/regressions` measures it.
 - **A save keeps about 8 MiB of collections in memory a capture thread
   while the disk keeps up (#825).** A save lays out the values that are not strings when it
   captures the dataset, with writes held. For `dump.kdb` each capture thread
@@ -1656,6 +1680,55 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (its two bounds are found in the tree as keys of their own, and a bound
     at a member's own score reads the member's bytes through its entry).
     Sorted sets in a block, and `GET`/`SET`, as before.
+
+- **A large sorted set's rank and range-by-rank commands walk one path of
+  its index (#875).** The index of a sorted set past the block's limits,
+  which holds each member as the address of its entry in the set's table
+  (`CollectionTable`), is a B+tree of up to 32 members a leaf whose
+  internal nodes keep the number of members under each child
+  (`src/counted_btree.rs`, built on @Parikalp-Bhardwaj's #998). A
+  member's rank (`ZRANK`, `ZREVRANK`), the members from a rank (`ZRANGE`
+  by index, `ZREMRANGEBYRANK`) and the number of members between two
+  scores (`ZCOUNT`) are found down one path of the tree. A score change
+  that keeps the member's rank is written in place; one that moves it
+  takes the entry out and puts it back, and if the new key is refused, or
+  a member read panics, the entry is back at its own score, in order.
+  Members that come in order, one `ZADD` at a time, leave every node but
+  the last two of each level 28 of 32 full. `MEMORY USAGE` counts the
+  index's nodes as allocated. Replies, snapshots, the AOF and replication
+  are as before.
+  - Instructions per command (callgrind, fat LTO, `CMP=plain`, whole
+    server, pipeline 16), master before this change / now, at 1,000,000
+    members: `ZRANK` of a member 1,318,622 / 4,399, `ZREVRANK` 2,985,870 /
+    4,224, `ZRANGE` of 10 from a random rank 1,096,589 / 7,150, `ZCOUNT`
+    over 10,000 scores 171,397 / 5,867, `ZRANGEBYSCORE -inf +inf LIMIT
+    <offset> 10` 3,792,743 / 9,054; at 100,000 members 611,304 / 3,970,
+    610,613 / 3,930, 574,912 / 6,700, 163,154 / 5,573 and 1,136,667 /
+    8,921. A `LIMIT` offset (`ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZRANGE
+    ... BYSCORE`, `ZRANGESTORE`) is added to the rank of the range's first
+    member, and only the members it leaves are read. `ZRANGEBYLEX`,
+    `ZREVRANGEBYLEX`, `ZRANGE ... BYLEX` and `ZLEXCOUNT` on a set whose
+    members all have one score find both bounds by a walk down the index
+    (in a block, two binary searches): `ZRANGEBYLEX [<member> + LIMIT 0
+    10` 9,100,706 / 11,245 and `ZLEXCOUNT` over 10,000 members 8,375,684 /
+    9,527 at 1,000,000 members, 4,123,278 / 10,768 and 7,222,976 / 8,690
+    at 100,000, 108,645 / 9,291 and 254,912 / 6,949 at 1,000. On a set
+    with several scores each member is compared with the bounds, in the
+    set's order, as before: the replies are the same. Writes at 1,000,000
+    members: `ZADD` that moves a member 1.03x, `ZREM` 0.99x, `ZINCRBY`
+    0.91x, a new member in order 0.92x, at random 1.01x, `ZREM` + `ZADD`
+    with every score equal 0.89x; at 1,000 members `ZADD` that moves a
+    member 1.06x and `ZINCRBY` 1.03x (the tree's walks; a set of up to 128
+    members is a block and has no tree). `ZSCORE`, `ZRANDMEMBER`,
+    `ZPOPMIN` within 1 %, `GEOSEARCH` 1.00-1.01x. `GET`/`SET` as before
+    (within 4 instructions a command).
+  - `used_memory` a member, one set of 1,000,000 14-byte members, v1.2.2 /
+    master before this change / now: added in order 133.4 / 75.8 / 61.8,
+    at random 123.3 / 68.6 / 67.5, built whole (`RESTORE`) 133.4 / 59.7 /
+    59.1, and once every other member of the set added in order is
+    removed 179.3 / 88.7 / 91.7 (a removal merges a node only once it is
+    below half full). The index alone, its nodes as allocated: 20.3
+    bytes a member added in order, 25.8 at random, 17.6 built whole.
 
 - **Lists take about half the memory, short elements a fifth (#297).** A
   list's elements are kept end to end in chunks of up to 64, each element

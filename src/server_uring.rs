@@ -12,6 +12,34 @@ use std::time::Instant;
 use tokio_uring::buf::BoundedBuf;
 use tokio_uring::net::TcpStream;
 
+/// The runtime a worker runs its connections on: tokio-uring's, with a
+/// ring that completes socket operations without interrupting the worker
+/// (`IORING_SETUP_COOP_TASKRUN`, Linux 5.19) where the kernel offers it.
+///
+/// A socket read that found nothing waits in the kernel; when the request
+/// arrives, the kernel finishes the read on the worker's own thread. By
+/// default it interrupts that thread at once if it is running (an
+/// inter-processor interrupt), and the CPU that took the request in, which
+/// is often the client's, pays for sending it: with one request in flight
+/// a connection, about one every two requests (#1015). Without the interrupt the
+/// read finishes at the worker's next system call, which it makes on every
+/// turn of its loop anyway, and a worker that sleeps is still woken for it.
+/// An older kernel refuses the flag, and the ring is then made without it.
+pub fn worker_runtime() -> tokio_uring::Builder {
+    static COOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let coop = *COOP.get_or_init(|| {
+        tokio_uring::uring_builder()
+            .setup_coop_taskrun()
+            .build(2)
+            .is_ok()
+    });
+    let mut runtime = tokio_uring::builder();
+    if coop {
+        runtime.uring_builder(tokio_uring::uring_builder().setup_coop_taskrun());
+    }
+    runtime
+}
+
 /// Called when a replica sends PSYNC on the io_uring path.
 ///
 /// The outbound (hub → replica) and inbound (REPLCONF ACK) directions run as two
@@ -4164,4 +4192,58 @@ pub async fn handle_client(
     }
     // What was kept for tracking goes with `_guard`.
     Ok(())
+}
+
+#[cfg(test)]
+mod worker_runtime_tests {
+    use std::future::Future;
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    /// A read that waits in the kernel completes on a worker's ring, both when
+    /// the request arrives while the worker sleeps and while it is busy
+    /// without a system call (the read then finishes at its next one).
+    #[test]
+    fn a_waiting_read_completes_asleep_and_busy() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            for i in 0..2u8 {
+                std::thread::sleep(Duration::from_millis(20));
+                s.write_all(&[i]).unwrap();
+                let mut echo = [0u8; 1];
+                s.read_exact(&mut echo).unwrap();
+                assert_eq!(echo[0], i);
+            }
+        });
+        super::worker_runtime().start(async move {
+            let stream = tokio_uring::net::TcpStream::connect(addr).await.unwrap();
+            for busy in [false, true] {
+                let mut read = std::pin::pin!(stream.read(vec![0u8; 1]));
+                // Polled once: the read is queued, and goes in when the worker
+                // next parks (the sleep).
+                std::future::poll_fn(|cx| {
+                    assert!(read.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                if busy {
+                    // The request arrives (after 20 ms) while this spins.
+                    let until = Instant::now() + Duration::from_millis(60);
+                    while Instant::now() < until {
+                        std::hint::spin_loop();
+                    }
+                }
+                let (n, buf) = tokio::time::timeout(Duration::from_secs(10), read)
+                    .await
+                    .expect("the read completes");
+                assert_eq!(n.unwrap(), 1);
+                let (sent, _) = stream.write(buf).submit().await;
+                assert_eq!(sent.unwrap(), 1);
+            }
+        });
+        peer.join().unwrap();
+    }
 }

@@ -3190,21 +3190,26 @@ impl<A: Memory> CollectionTable<Scores, A> {
         unsafe { entry.as_ptr().cast::<u64>().write(score.to_bits()) }
     }
 
-    /// Remove the member, showing `f` its entry before the entry is freed;
-    /// `None` if it was not there.
-    pub fn remove_scored<R>(
+    /// Find the member and show `f` its entry, live and in the table; if
+    /// `f` says so, remove the member and free the entry. One hash and one
+    /// probe; `None` if it was not there, else what `f` said.
+    pub fn remove_scored_if(
         &mut self,
         member: &[u8],
-        f: impl FnOnce(NonNull<u8>) -> R,
-    ) -> Option<R> {
+        f: impl FnOnce(NonNull<u8>) -> bool,
+    ) -> Option<bool> {
         let found = self.find_scored(self.hash(member), member)?;
+        // SAFETY: an element's slot is its entry's address, never null.
+        let entry = unsafe { NonNull::new_unchecked(found.value()) };
+        if !f(entry) {
+            return Some(false);
+        }
+        // `f` changed nothing of the table's, so `found` is where it was.
         let slot = self.take_out(found);
-        // SAFETY: out of the table, not yet freed; a slot is never null.
-        let out = f(unsafe { NonNull::new_unchecked(slot) });
         // SAFETY: out of the table.
         unsafe { self.free_element(slot) };
         self.after_remove();
-        Some(out)
+        Some(true)
     }
 
     /// Remove the member whose entry is `entry` (found by its address, one
