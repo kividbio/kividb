@@ -915,8 +915,10 @@ fn count_stream_reads(ctx: &Ctx, keys: &[&[u8]]) {
     let db_ref = &ctx.store[*ctx.selected_db];
     for pass in 0..2 {
         for key in keys {
+            // A stream past its time is a miss, removed or not yet.
+            let expired = crate::commands::helpers::is_expired(ctx.store, *ctx.selected_db, key);
             let map = read_lock!(store::get_shard(db_ref, key));
-            let found = map.get(key);
+            let found = map.get(key).filter(|_| !expired);
             crate::stats::record_lookup(found.is_some());
             if pass == 0 && !matches!(found, None | Some(ValueRef::Stream(_))) {
                 return;
@@ -1047,7 +1049,11 @@ pub fn xread(ctx: &mut Ctx) -> Vec<u8> {
             .collect(),
     };
 
-    count_stream_reads(ctx, &keys);
+    // Not on the wake of a wait that timed out: Redis answers that without
+    // running the command again.
+    if !timed_out {
+        count_stream_reads(ctx, &keys);
+    }
     let results = read_streams(ctx, resp, &keys, &resolved_ids, count, caps);
 
     if results.is_empty() {
@@ -1888,7 +1894,10 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
         return done(ctx, resp_null_array());
     }
 
-    let results = match run_xreadgroup_delivery(ctx, &keys, &ids, &spec) {
+    // Counted once a run, as Redis counts its one run of the command: not
+    // on the wake of a wait that timed out, which Redis answers without
+    // running the command again, nor on the second check below.
+    let results = match run_xreadgroup_delivery(ctx, &keys, &ids, &spec, !timed_out) {
         Ok(results) => results,
         Err(e) => return done(ctx, e),
     };
@@ -1931,7 +1940,7 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
     // Second check: data may have arrived between the first read and standing
     // in line. Re-run the full delivery path inline — we need group mutation,
     // not just a read.
-    let second_check = match run_xreadgroup_delivery(ctx, &keys, &ids, &spec) {
+    let second_check = match run_xreadgroup_delivery(ctx, &keys, &ids, &spec, false) {
         Ok(results) => results,
         Err(e) => {
             drop(rxs);
@@ -2033,6 +2042,7 @@ fn run_xreadgroup_delivery(
     keys: &[Vec<u8>],
     ids: &[&str],
     spec: &GroupRead,
+    count: bool,
 ) -> Result<Vec<Vec<u8>>, Vec<u8>> {
     // Returns the flat item list; the caller frames it with
     // `stream_results_reply`, so both protocols share this code path.
@@ -2049,7 +2059,9 @@ fn run_xreadgroup_delivery(
         let shard = store::get_shard(db_ref, key.as_slice());
         let map = read_lock!(shard);
         let found = map.get(key.as_slice());
-        crate::stats::record_lookup(found.is_some());
+        if count {
+            crate::stats::record_lookup(found.is_some());
+        }
         match found {
             Some(ValueRef::Stream(s)) => {
                 if !s.read().groups.contains_key(spec.group) {
@@ -2067,8 +2079,10 @@ fn run_xreadgroup_delivery(
     }
     // Redis looks every stream up again as it delivers from it: a second
     // hit each in `keyspace_hits`, as there.
-    for _ in keys {
-        crate::stats::record_hit();
+    if count {
+        for _ in keys {
+            crate::stats::record_hit();
+        }
     }
 
     let mut budget = spec.caps.budget();

@@ -183,6 +183,8 @@ impl Buf {
     fn move_to(&mut self, want: usize) {
         debug_assert!(want >= self.len());
         let (old, old_cap) = (self.ptr, self.capacity());
+        #[cfg(test)]
+        crossings::note(old_cap, want);
         if want == 0 {
             self.ptr = NonNull::dangling();
             self.cap = 0;
@@ -2339,6 +2341,33 @@ impl std::fmt::Debug for PackedList {
         f.debug_list()
             .entries(self.iter().map(String::from_utf8_lossy))
             .finish()
+    }
+}
+
+/// Moves of a chunk's bytes between a slab block and the system
+/// allocator's (`Buf::move_to`), counted on the thread for the tests: the
+/// model tests check that both happen.
+#[cfg(test)]
+pub(crate) mod crossings {
+    use std::cell::Cell;
+
+    thread_local! {
+        static UP: Cell<usize> = const { Cell::new(0) };
+        static DOWN: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note(old_cap: usize, want: usize) {
+        let max = crate::value_slab::CHUNK_MAX_BLOCK;
+        if old_cap > 0 && old_cap <= max && want > max {
+            UP.with(|n| n.set(n.get() + 1));
+        } else if old_cap > max && want > 0 && want <= max {
+            DOWN.with(|n| n.set(n.get() + 1));
+        }
+    }
+
+    /// (into the system allocator's, back into a slab block) so far.
+    pub(crate) fn counts() -> (usize, usize) {
+        (UP.with(Cell::get), DOWN.with(Cell::get))
     }
 }
 

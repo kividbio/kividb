@@ -1936,8 +1936,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     slabs). The worst room a list holds, its chunks' bytes over its frames'
     (the deque of chunks included), over a load one element a command, a
     load in one `RPUSH`, one `LPUSH`, and 192 `LPUSH` + `LTRIM` pairs, is
-    at a point of the pairs for each of these, against master before this
-    change: 200 x 10 B 1,104 bytes, 31.5 % of the list's allocations
+    at a point of the pairs for each of these (in brackets: before this
+    change, the same measurement): 200 x 10 B 1,104 bytes, 31.5 % of the list's allocations
     (1,744, 42.1 %); 300 x 10 B 1,056, 22.7 % (1,312, 26.7 %); 300 x 64 B
     3,672, 15.6 % (3,686, 15.7 %); 300 x 100 B 5,480, 15.2 % (5,531,
     15.3 %).

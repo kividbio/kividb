@@ -212,7 +212,9 @@ elements: 70.6 / 88.1 (it was 70.7 / 98.4 to 106.1; Redis 69.0 / 77.8 to
 
 A chunk opened at either end gets room for a quarter of the full chunk
 beside it and grows by a quarter: through several sizes, each a slab class
-whose blocks other chunks growing take again. A list of 200 ten-byte
+whose blocks other chunks growing take again. Each thread keeps one partly
+used 64 KiB slab for each chunk size it has used, whose free blocks go to
+its next chunks of that size. A list of 200 ten-byte
 elements (100,000 of them, one `RPUSH` each) takes 2,660 bytes of
 `used_memory`, and 2,948 after one `LPUSH` (2,700 and 3,596 when the chunk
 opened at the front held a whole chunk's room). Suite

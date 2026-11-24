@@ -35164,7 +35164,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35189,7 +35189,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35213,7 +35213,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35247,7 +35247,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35271,7 +35271,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35305,7 +35305,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35330,7 +35330,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35354,7 +35354,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35388,7 +35388,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35412,7 +35412,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35446,7 +35446,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35471,7 +35471,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35495,7 +35495,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35529,7 +35529,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35553,7 +35553,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35587,7 +35587,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35612,7 +35612,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35636,7 +35636,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35670,7 +35670,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35694,7 +35694,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35728,7 +35728,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35753,7 +35753,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35777,7 +35777,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35811,7 +35811,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35835,7 +35835,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35869,7 +35869,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35894,7 +35894,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35918,7 +35918,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35942,7 +35942,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4
@@ -35966,7 +35966,7 @@
         "vm": "Standard_D4s_v5",
         "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
         "date": "2026-11-24",
-        "commit": "kividb 1.2.1 (default build: no Lua, no TLS)",
+        "commit": "5062311c",
         "label": "pr-1022-52-d4s_v5",
         "rustc": "1.100.0",
         "nproc": 4

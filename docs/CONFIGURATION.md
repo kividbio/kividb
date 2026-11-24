@@ -162,8 +162,9 @@ with an index of the members' order beside it. The table grows and shrinks a few
 at a time with each write, and a resize that the writes leave part-way is finished in the
 background, so no write pays for moving every member at once. Active defrag does not move a
 set's or a sorted set's members or a hash's fields: their slabs are not among those it empties, and each slab goes back to the
-system as soon as its last member or field is removed. `INFO memory` reports those slabs as
-`value_slab_pool_bytes`, apart from `value_slab_bytes` (the keyspace's slabs, which defrag
+system as soon as its last member or field is removed. A list's chunks are blocks of slabs of the same kind, in size classes of
+their own. `INFO memory` reports those slabs (the sets', sorted sets',
+hashes' and lists') as `value_slab_pool_bytes`, apart from `value_slab_bytes` (the keyspace's slabs, which defrag
 compacts).
 
 ### Active defrag
