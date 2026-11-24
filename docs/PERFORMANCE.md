@@ -176,6 +176,31 @@ keeps such numbers as integers: 5.0), and BullMQ's wait list of 200,000 ids
 it as compact as a bulk load, and a list drained to a tenth gives back the
 room it kept for the rest (9.3 bytes an element left, where 1.2.2 kept 192).
 
+A timeline keeps short lists the way Misskey's does (#1022): one list a user,
+300 ten-byte ids, `LPUSH` and `LTRIM key 0 299`. 10,000 such lists, bytes of
+`used_memory` and of RSS an element, on an Azure `Standard_D4s_v5`, the
+default build (glibc) and Redis 8.10.2, one run through the regression suite:
+
+| | 1.2.2 | 1.3.0 | Redis 8.10.2 |
+|---|---:|---:|---:|
+| loaded by `RPUSH`, one element a command | 59.7 / 76.1 | 14.1 / 14.9 | 13.9 / 14.3 |
+| loaded by one `RPUSH` of 300 a list | 48.4 / 64.5 | 13.4 / 13.9 | 13.9 / 14.4 |
+| after 3,000 `LPUSH` + `LTRIM` each | 64.4 / 96.6 | 14.2 / 27.0 | 13.9 / 14.3 |
+| 32-byte elements, one `RPUSH` of 300 a list | 64.4 / 80.5 | 35.4 / 35.9 | 34.8 / 35.6 |
+| 64-byte elements, one `RPUSH` of 300 a list | 96.4 / 112.5 | 67.4 / 67.9 | 69.0 / 70.6 |
+| lists of 30 ten-byte elements | 53.0 / 71.2 | 16.9 / 18.8 | 14.8 / 15.1 |
+
+A list of at least 192 short elements opens the chunk at its front with room
+for a whole chunk of them (up to 1 KiB, or a quarter of the chunk before it
+if that is more), so a list that is pushed at the front and trimmed at the
+back cycles chunks of one size. What an allocator keeps of them differs:
+the RSS after the timeline is 27.0 bytes an element on the default build
+(glibc; 1.9x Redis), and 17.7 to 20.6 on the `lua,tls` builds (mimalloc;
+1.3x), where it was 23.0 to 25.7 before. A list of 200 ten-byte elements
+takes 3,603 bytes of `used_memory` after one `LPUSH` (3,027 before): the
+chunk it opens holds 768 bytes of room. Suite
+`52-small-lists-memory` of the regression suite measures this again.
+
 At 10 elements most of what is left over Redis is the key's own: its entry
 and the list's header. A list that has had an element longer than 1,024
 bytes keeps its elements apart, as 1.2 did, and takes what 1.2 took. Suite

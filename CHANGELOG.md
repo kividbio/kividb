@@ -610,6 +610,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   under 2 ms); since #762 it runs on a thread of its own, and no probe
   connection saw more than 4.3 ms. Suite `50-keys-wildcard` of
   `benchmarks/1.3.0` measures it.
+- **`keyspace_hits` and `keyspace_misses` count a key a read command looks
+  up as Redis does (#1022).** A hit when the key is there, whatever its
+  type and whether or not the member, field or index asked for is in it
+  (`HGET`, `SISMEMBER`, `ZSCORE`, `LINDEX` of a key that is there are
+  hits; `WRONGTYPE` replies count a hit), a miss when it is not there.
+  `LRANGE`, `STRLEN`, `SCARD`, `EXISTS`, `TYPE`, `TTL`, `PTTL`,
+  `EXPIRETIME`, `TOUCH`, `DUMP`, `OBJECT ENCODING`, `COPY`, `SET ... GET`,
+  the sorted-set reads (`ZRANGE` and its relatives, `ZCARD`, `ZCOUNT`,
+  `ZLEXCOUNT`, `ZMSCORE`, `ZREVRANK`, `ZRANDMEMBER`, `ZSCAN`), `HRANDFIELD`
+  and the sources of the set and sorted-set algebra commands (each key
+  named counts) are counted; `HMGET` and `MGET` count each key once;
+  commands that write (`LPOP`, `LMPOP`, `BLPOP`, `LPUSHX`, `HDEL`,
+  `HGETDEL`, `HGETEX`, `SREM`, `SPOP`, `SMOVE`) count nothing, as in Redis.
+  `ZINTER`, `ZINTERSTORE`, `ZINTERCARD`, `ZDIFF` and `ZDIFFSTORE` look every
+  key up, as Redis does, and stop only at a key of another type: `ZINTER 2
+  nokey s` with `s` a string answers `WRONGTYPE` (it answered an empty array),
+  and `ZDIFF` counts each key once.
+  `tests/stats_keyspace.rs` holds the counts Redis 8.12.0 gives for 159
+  commands, including the set and sorted-set algebra and STORE forms, a script, a
+  transaction, expired keys and a blocking pop served at once and later. The bit commands, `PFCOUNT`, `XLEN`, `GEOPOS`, `LCS`, `SORT` and
+  the field-expiry reads (`HTTL` and its relatives) do not count yet. Redis
+  counts a key looked up before an argument is found not to be a number
+  (`LINDEX l notanint`) or a `WEIGHTS`, `AGGREGATE` or `LIMIT` is found not to
+  parse (`ZUNION`, `ZINTER`, `ZINTERCARD`); those commands read their
+  arguments first and count nothing.
+
 - **io_uring workers finish a waiting socket read without interrupting the
   worker (#1015).** Each worker's ring is made with
   `IORING_SETUP_COOP_TASKRUN` (Linux 5.19 and later; on an older kernel the
@@ -1804,6 +1830,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to a tenth of its length gives back the room it kept for the rest.
 
   Suite `21-list-memory` of the 1.3.0 regression suite measures this again.
+
+  Misskey's home timelines (#1022), 10,000 lists of 300 ten-byte ids on a
+  `Standard_D4s_v5`, `--threads 4`, bytes of `used_memory` / of RSS an
+  element, default build: loaded with `RPUSH` one element a command, 59.7 /
+  76.1 in 1.2.2, 14.1 / 14.9 now, 13.9 / 14.3 in Redis 8.10.2; one `RPUSH`
+  of 300 a list, 48.4 / 64.5, 13.4 / 13.9, 13.9 / 14.4. After every list
+  has taken 3,000 `LPUSH` + `LTRIM key 0 299` pairs: 64.4 / 96.6 in 1.2.2,
+  14.2 / 27.0 now, 13.9 / 14.3 in Redis (on the `lua,tls` builds, which use
+  mimalloc, the RSS is 17.7 to 20.6, where it was 23.0 to 25.7 before the
+  chunks of a list of at least 192 elements were opened at the front with
+  room for a whole chunk). 32-byte elements 35.4 / 35.9 (Redis 34.8 / 35.6),
+  64-byte 67.4 / 67.9 (69.0 / 70.6), lists of 30 ten-byte elements 16.9 /
+  18.8 (14.8 / 15.1). Suite `52-small-lists-memory`
+  measures these and fails a build that measures above these numbers.
   - A push or a pop at either end moves nothing in its chunk: each chunk
     has room at both ends. Element `i` is found by arithmetic while the
     chunks between the ends are full; an `LINSERT` or `LREM` in the middle
