@@ -35,8 +35,10 @@
 //! **Writes in place.** A string written over a string kept inline goes
 //! into the same block when the table alone holds the entry, the key is not
 //! past its time, and the new length keeps the block in its slab class
-//! ([`ShardMap::set_str`], `append_in_place`, `set_range_in_place`): nothing
-//! is allocated or freed, and the entry stays where it is. Anything else,
+//! ([`ShardMap::set_str`], `append_in_place`, `set_range_in_place`,
+//! `edit_str_in_place`): nothing is allocated or freed, and the entry
+//! stays where it is. A string of its own is written in its block the
+//! same way when the entry is also its bytes' only holder. Anything else,
 //! and every entry somebody else holds (a snapshot being written), gets a
 //! new entry, as before.
 
@@ -1075,6 +1077,52 @@ impl ShardMap {
         unsafe { entry.write_at_in_place(offset, patch) };
         used(entry, hash, map);
         Some(len)
+    }
+
+    /// `patch` written over `key`'s string from `offset`, the string grown
+    /// with zero bytes to reach it. In place when nothing but the table
+    /// holds the entry or its bytes, and the new length keeps their block
+    /// (`Entry::fits_in_place`); else a new string, the old bytes copied
+    /// once, with the key's time to live kept. A key not there, or past its
+    /// time, is an empty string. `None` leaves everything as it was: the
+    /// key holds another type, or the string would pass `MAX_LEN`.
+    ///
+    /// Nothing but byte copies runs between the first byte written in
+    /// place and the last: no allocation, and nothing that can fail.
+    pub fn edit_str_in_place(
+        &mut self,
+        key: &(impl AsRef<[u8]> + ?Sized),
+        offset: usize,
+        patch: &[u8],
+    ) -> Option<Written> {
+        let key = key.as_ref();
+        let end = offset
+            .checked_add(patch.len())
+            .filter(|&end| end <= crate::shared_bytes::MAX_LEN)?;
+        let hash = self.hash_of(key);
+        let found = self.find_live(hash, key).map(|slot| slot.entry());
+        let old: &[u8] = match found.map(Entry::value) {
+            Some(ValueRef::String(bytes)) => bytes.as_bytes(),
+            Some(_) => return None,
+            None => &[],
+        };
+        // Both holds are counted under this write lock, and a new one
+        // needs the lock or an existing hold: none can start before the
+        // write ends.
+        if let Some(entry) = found
+            && entry.fits_in_place(old.len().max(end))
+        {
+            // SAFETY: locked for writing, held by the table alone, any bytes
+            // of its own by the entry alone, and in class.
+            unsafe { entry.write_at_in_place(offset, patch) };
+            used(entry, hash, self.id());
+            return Some(Written::InPlace);
+        }
+        // `old` is in the entry `put` replaces, which lives until the
+        // caller drops what it gives back.
+        Some(self.put(key, Ttl::Keep, None, |key, expires| {
+            Entry::string_written_at(key, old, offset, patch, expires)
+        }))
     }
 
     /// [`ShardMap::insert_str`], the key's time to live set to `expires`, or
@@ -2672,7 +2720,7 @@ mod tests {
 
     /// A SET at a string's length while compaction empties the slab of its
     /// block (#240 review): written in place, in the slab being emptied,
-    /// then moved out of it whole, the new bytes.
+    /// then moved out of it whole, the new bytes. An edit does the same.
     #[test]
     fn a_string_written_in_place_while_its_slab_is_emptied_moves_whole() {
         // A class no other test allocates (21 KB: nothing else here is), on
@@ -2691,6 +2739,12 @@ mod tests {
         };
         let evacuating = crate::value_slab::evacuate_only(block).expect("a slab nobody owns");
         assert!(matches!(map.set_str("k", vec![2u8; len]), Written::InPlace));
+        let mut want = vec![2u8; len];
+        want[len - 1] = 7;
+        assert!(matches!(
+            map.edit_str_in_place("k", len - 1, &[7]),
+            Some(Written::InPlace)
+        ));
         let regions = crate::value_slab::regions_snapshot();
         let index = (0..map.buckets())
             .find(|&i| map.table.get_bucket(i).is_some())
@@ -2706,7 +2760,7 @@ mod tests {
             _ => panic!("no string"),
         };
         assert_ne!(moved, block, "still in the slab being emptied");
-        assert_eq!(text(map.get("k")), Some(vec![2u8; len]));
+        assert_eq!(text(map.get("k")), Some(want));
         // In place again where it is now.
         assert!(matches!(map.set_str("k", vec![3u8; len]), Written::InPlace));
         assert_eq!(text(map.get("k")), Some(vec![3u8; len]));
@@ -2763,6 +2817,204 @@ mod tests {
         assert!(matches!(map.set_str("live", "6"), Written::InPlace));
         assert_eq!(map.append_in_place("live", b"7"), Some(2));
         assert_eq!(map.expires("live"), Some(u64::MAX - 1));
+    }
+
+    /// Where `key`'s string's bytes are.
+    fn bytes_at(map: &ShardMap, key: &str) -> usize {
+        match map.get(key) {
+            Some(ValueRef::String(s)) => s.as_bytes().as_ptr() as usize,
+            _ => panic!("no string"),
+        }
+    }
+
+    /// `len` bytes that differ from their neighbours.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// An edit of a string nothing else holds is written where it is, in
+    /// the entry, in a slab block or in the system allocator's block, its
+    /// time to live kept; only the byte written changes.
+    #[test]
+    fn an_edit_nothing_else_holds_is_written_where_it_is() {
+        for len in [100, 10_000, 64 << 10, 1 << 20] {
+            let mut map = ShardMap::new();
+            let mut want = pattern(len);
+            map.insert_str_expiring("k", &want, Some(u64::MAX - 1));
+            let at = bytes_at(&map, "k");
+            for offset in [0, len / 2, len - 1] {
+                let written = map.edit_str_in_place("k", offset, &[0xFF]);
+                assert!(matches!(written, Some(Written::InPlace)), "{len} {offset}");
+                want[offset] = 0xFF;
+            }
+            assert_eq!(text(map.get("k")), Some(want), "{len}");
+            assert_eq!(bytes_at(&map, "k"), at, "{len}");
+            assert_eq!(map.expires("k"), Some(u64::MAX - 1), "{len}");
+        }
+    }
+
+    /// Growth stays in place while the block keeps its class, zero-filled;
+    /// past it, or for the system allocator's block, it takes a new one.
+    #[test]
+    fn an_edit_grows_in_place_only_within_the_blocks_class() {
+        // In the entry: some of a byte at a time stay, one moves.
+        let mut map = ShardMap::new();
+        let mut want = pattern(100);
+        map.set_str("k", &want);
+        let (mut stayed, mut moved) = (0, 0);
+        for len in 101..=200 {
+            let at = bytes_at(&map, "k");
+            let in_place = match map.edit_str_in_place("k", len - 1, &[7]) {
+                Some(Written::InPlace) => true,
+                Some(Written::Replaced(_)) => false,
+                _ => panic!("not written"),
+            };
+            assert_eq!(bytes_at(&map, "k") == at, in_place, "{len}");
+            if in_place {
+                stayed += 1;
+            } else {
+                moved += 1;
+            }
+            want.push(7);
+        }
+        assert!(stayed > 0 && moved > 0, "{stayed} in place, {moved} moved");
+        assert_eq!(text(map.get("k")), Some(want));
+        // A slab block grown to its class's top, zeros between, then past it.
+        let top = crate::value_slab::block_size(crate::value_slab::class_of(10_008).unwrap()) - 8;
+        assert!(top > 10_001, "no room in the class of 10,000 bytes");
+        let mut want = pattern(10_000);
+        map.set_str("s", &want);
+        let at = bytes_at(&map, "s");
+        let written = map.edit_str_in_place("s", top - 1, &[7]);
+        assert!(matches!(written, Some(Written::InPlace)), "{top}");
+        want.resize(top - 1, 0);
+        want.push(7);
+        assert_eq!(
+            (text(map.get("s")), bytes_at(&map, "s")),
+            (Some(want.clone()), at)
+        );
+        let written = map.edit_str_in_place("s", top, &[8]);
+        assert!(matches!(written, Some(Written::Replaced(_))));
+        assert_ne!(bytes_at(&map, "s"), at);
+        want.push(8);
+        assert_eq!(text(map.get("s")), Some(want));
+        // The system allocator's block keeps its length to stay.
+        let mut want = pattern(64 << 10);
+        map.set_str("b", &want);
+        let at = bytes_at(&map, "b");
+        let written = map.edit_str_in_place("b", want.len() + 2, &[9]);
+        assert!(matches!(written, Some(Written::Replaced(_))));
+        assert_ne!(bytes_at(&map, "b"), at);
+        want.extend([0, 0, 9]);
+        assert_eq!(text(map.get("b")), Some(want));
+    }
+
+    /// A hold on the entry (a snapshot's) or on its bytes (a reply's) makes
+    /// an edit copy the string once; the holder keeps reading what it held,
+    /// and once it lets go, edits are in place again.
+    #[test]
+    fn an_edit_of_a_held_string_copies_it_and_the_holder_keeps_its_bytes() {
+        for len in [100, 10_000, 64 << 10] {
+            let mut map = ShardMap::new();
+            let old = pattern(len);
+            map.set_str("k", &old);
+            let mut want = old.clone();
+            want[len / 2] ^= 1;
+            // A snapshot holds the entry.
+            let snapshot = map.entries().next().expect("one entry").hold();
+            let at = bytes_at(&map, "k");
+            let written = map.edit_str_in_place("k", len / 2, &want[len / 2..len / 2 + 1]);
+            assert!(matches!(written, Some(Written::Replaced(_))), "{len}");
+            drop(written);
+            match snapshot.value() {
+                ValueRef::String(s) => assert_eq!(s.as_bytes(), &old[..], "{len}"),
+                _ => panic!("not a string"),
+            }
+            assert_eq!(text(map.get("k")), Some(want.clone()), "{len}");
+            assert_ne!(bytes_at(&map, "k"), at, "{len}");
+            drop(snapshot);
+            // A reply holds the bytes: a copy of them, when in the entry.
+            let reply = match map.get("k") {
+                Some(ValueRef::String(s)) => s.to_shared(),
+                _ => panic!("no string"),
+            };
+            let in_entry = reply.as_ptr() as usize != bytes_at(&map, "k");
+            let written = map.edit_str_in_place("k", 0, &[!want[0]]);
+            assert_eq!(matches!(written, Some(Written::InPlace)), in_entry, "{len}");
+            assert_eq!(&reply[..], &want[..], "{len}");
+            want[0] = !want[0];
+            assert_eq!(text(map.get("k")), Some(want.clone()), "{len}");
+            drop((written, reply));
+            // Nothing holds it now.
+            assert!(matches!(
+                map.edit_str_in_place("k", 1, &[0]),
+                Some(Written::InPlace)
+            ));
+        }
+    }
+
+    /// Entries each held by the table alone can share their bytes (`COPY`,
+    /// or a time to live given while a snapshot holds the entry): an edit
+    /// of either copies them, and the other keeps them as they were.
+    #[test]
+    fn an_edit_of_bytes_two_entries_share_copies_them() {
+        let mut map = ShardMap::new();
+        let old = pattern(10_000);
+        map.set_str("a", &old);
+        let value = map.get("a").expect("a").to_value();
+        map.insert("b", value);
+        let written = map.edit_str_in_place("a", 0, &[0xFF]);
+        assert!(matches!(written, Some(Written::Replaced(_))));
+        drop(written);
+        assert_eq!(text(map.get("b")), Some(old.clone()));
+        // Each has bytes of its own now.
+        for key in ["a", "b"] {
+            let written = map.edit_str_in_place(key, 1, &[0xFF]);
+            assert!(matches!(written, Some(Written::InPlace)), "{key}");
+        }
+        // A time to live given while a snapshot holds the entry remakes it,
+        // the bytes shared with the held one.
+        let snapshot = map.get_ref("b").expect("b");
+        assert!(map.set_expires("b", u64::MAX - 1));
+        assert!(!map.holds("b", &snapshot));
+        let written = map.edit_str_in_place("b", 2, &[0xFF]);
+        assert!(matches!(written, Some(Written::Replaced(_))));
+        match snapshot.value() {
+            ValueRef::String(s) => assert_eq!(s[2], old[2]),
+            _ => panic!("not a string"),
+        }
+        assert_eq!(map.expires("b"), Some(u64::MAX - 1));
+    }
+
+    /// A key not there, or past its time, is an empty string; another type,
+    /// or a length past `MAX_LEN`, leaves everything as it was.
+    #[test]
+    fn an_edit_of_a_missing_expired_or_other_key() {
+        let mut map = ShardMap::new();
+        assert!(matches!(
+            map.edit_str_in_place("new", 2, b"x"),
+            Some(Written::New)
+        ));
+        assert_eq!(text(map.get("new")), Some(b"\0\0x".to_vec()));
+        map.insert_str_expiring("past", "abc", Some(1));
+        let written = map.edit_str_in_place("past", 1, b"z");
+        assert!(matches!(written, Some(Written::Replaced(_))));
+        assert_eq!(text(map.get("past")), Some(b"\0z".to_vec()));
+        assert_eq!(map.expires("past"), None);
+        assert_eq!(
+            map.take_left(),
+            vec![(ToSay::PastItsTime, crate::store::Key::from("past"))]
+        );
+        let set = crate::member_set::MemberSet::new();
+        map.insert("set", KiviDBValue::Set(Arc::new(RwLock::new(set))));
+        assert!(map.edit_str_in_place("set", 0, b"x").is_none());
+        assert!(matches!(map.get("set"), Some(ValueRef::Set(_))));
+        map.set_str("k", "abc");
+        let max = crate::shared_bytes::MAX_LEN;
+        for (offset, patch) in [(max, &b"x"[..]), (usize::MAX, b"x"), (max - 1, b"xy")] {
+            assert!(map.edit_str_in_place("k", offset, patch).is_none());
+        }
+        assert_eq!(text(map.get("k")), Some(b"abc".to_vec()));
     }
 
     #[test]
