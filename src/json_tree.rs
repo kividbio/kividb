@@ -7,13 +7,15 @@
 //!   is 72: an object's member table is boxed, and so does not set the
 //!   size of every number and string in the document;
 //! * an array whose elements are all numbers of one kind is held as one
-//!   buffer of them ([`Packed`]): integers as `i64`, floats as `f64`. An
-//!   embedding of 1,536 floats takes 12 KB this way, against 110 KB as
+//!   buffer of them ([`Packed`]): integers as `i64`, floats as `f64`, and
+//!   floats that are exactly `f32` values as `f32`. An embedding of 1,536
+//!   floats written as doubles takes 6 KB this way, against 110 KB as
 //!   generic nodes.
 //!
 //! What a document reads back is what it was given, whatever form an array is
 //! held in: a packed array holds only one kind of number, so integers stay
-//! integers and floats floats (`1.0` stays `1.0`). Text goes in
+//! integers and floats floats (`1.0` stays `1.0`), and an `f32` is widened
+//! back to the very `f64` it came from before it is printed. Text goes in
 //! through serde_json's parser ([`Deserialize`]) and out through its
 //! serializer ([`Serialize`]), as it did when the tree was serde_json's own:
 //! the bytes a document is written as (`JSON.GET`, a snapshot, `DUMP`, an AOF
@@ -22,7 +24,8 @@
 //! An array is packed when it is built from parsed text: a whole array given
 //! to `JSON.SET`, `JSON.MSET`, `JSON.MERGE`, `JSON.ARRAPPEND` or
 //! `JSON.ARRINSERT`, or read from a snapshot. An edit of a packed array that
-//! keeps it all numbers of its kind is made in the buffer; any other edit turns
+//! keeps it all numbers of its kind is made in the buffer (a float that is
+//! not an `f32` value widens an `f32` buffer to `f64`); any other edit turns
 //! it into generic nodes first, and it stays so until the whole array is set
 //! again.
 
@@ -66,6 +69,8 @@ pub enum Packed {
     I64(Vec<i64>),
     /// Floats.
     F64(Vec<f64>),
+    /// Floats each of which is exactly an `f32` value.
+    F32(Vec<f32>),
 }
 
 /// Whether arrays are packed. Off only in tests that compare the two forms
@@ -76,10 +81,27 @@ fn packing_enabled() -> bool {
     !*OFF.get_or_init(|| std::env::var_os("KIVIDB_TEST_JSON_UNPACKED").is_some())
 }
 
+/// Whether `value` is exactly an `f32` value, so that holding it as one and
+/// widening it back gives the same bits: `-0.0` stays `-0.0`.
+fn is_f32(value: f64) -> bool {
+    f64::from(value as f32).to_bits() == value.to_bits()
+}
+
 fn float(value: f64) -> Number {
     // A packed float came from a finite `Number`, and arithmetic stores only
     // finite results.
     Number::from_f64(value).unwrap_or_else(|| Number::from(0))
+}
+
+/// How a number would go into a packed array.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Fit {
+    /// As it is.
+    Fits,
+    /// Into an `f32` buffer once it is widened to `f64`.
+    Widen,
+    /// Not at all: the array has to be unpacked.
+    No,
 }
 
 impl Packed {
@@ -94,14 +116,28 @@ impl Packed {
             return None;
         };
         if first.is_f64() {
-            let mut floats = Vec::with_capacity(items.len());
+            let mut narrow = true;
             for item in items {
                 match item {
-                    Value::Number(n) if n.is_f64() => floats.push(n.as_f64()?),
+                    Value::Number(n) if n.is_f64() => {
+                        narrow = narrow && n.as_f64().is_some_and(is_f32);
+                    }
                     _ => return None,
                 }
             }
-            Some(Packed::F64(floats))
+            // Every item is a float here. Allocated at the exact length: a
+            // collected `filter_map` would round its buffer up to a power
+            // of two.
+            let floats = items.iter().map(|item| item.as_f64().unwrap_or(0.0));
+            Some(if narrow {
+                let mut buffer = Vec::with_capacity(items.len());
+                buffer.extend(floats.map(|f| f as f32));
+                Packed::F32(buffer)
+            } else {
+                let mut buffer = Vec::with_capacity(items.len());
+                buffer.extend(floats);
+                Packed::F64(buffer)
+            })
         } else {
             let mut ints = Vec::with_capacity(items.len());
             for item in items {
@@ -118,6 +154,7 @@ impl Packed {
         match self {
             Packed::I64(v) => v.len(),
             Packed::F64(v) => v.len(),
+            Packed::F32(v) => v.len(),
         }
     }
 
@@ -130,6 +167,7 @@ impl Packed {
         match self {
             Packed::I64(v) => Number::from(v[index]),
             Packed::F64(v) => float(v[index]),
+            Packed::F32(v) => float(f64::from(v[index])),
         }
     }
 
@@ -138,30 +176,52 @@ impl Packed {
         match self {
             Packed::I64(v) => v[index] as f64,
             Packed::F64(v) => v[index],
+            Packed::F32(v) => f64::from(v[index]),
         }
     }
 
-    /// The buffer's capacity in bytes.
+    /// The buffer's capacity in bytes, and the size of one element.
     pub fn buffer_bytes(&self) -> usize {
         match self {
             Packed::I64(v) => v.capacity() * 8,
             Packed::F64(v) => v.capacity() * 8,
+            Packed::F32(v) => v.capacity() * 4,
         }
     }
 
-    fn fits(&self, value: &Value) -> bool {
+    fn fit(&self, value: &Value) -> Fit {
         let Value::Number(n) = value else {
-            return false;
+            return Fit::No;
         };
         match self {
-            Packed::I64(_) => !n.is_f64() && n.as_i64().is_some(),
-            Packed::F64(_) => n.is_f64(),
+            Packed::I64(_) if !n.is_f64() && n.as_i64().is_some() => Fit::Fits,
+            Packed::F64(_) if n.is_f64() => Fit::Fits,
+            Packed::F32(_) if n.is_f64() => {
+                if n.as_f64().is_some_and(is_f32) {
+                    Fit::Fits
+                } else {
+                    Fit::Widen
+                }
+            }
+            _ => Fit::No,
         }
     }
 
-    /// Whether every one of `values` goes in.
+    /// Ready to take every one of `values`: widened if one of them needs
+    /// it. `false`, with nothing changed, if any does not go in.
     fn make_room_for<'v>(&mut self, values: impl IntoIterator<Item = &'v Value>) -> bool {
-        values.into_iter().all(|value| self.fits(value))
+        let mut widen = false;
+        for value in values {
+            match self.fit(value) {
+                Fit::Fits => {}
+                Fit::Widen => widen = true,
+                Fit::No => return false,
+            }
+        }
+        if widen && let Packed::F32(narrow) = self {
+            *self = Packed::F64(narrow.iter().map(|&f| f64::from(f)).collect());
+        }
+        true
     }
 
     /// Put `value` at `index`, or insert it there. Only for a value
@@ -180,6 +240,7 @@ impl Packed {
         match self {
             Packed::I64(v) => put(v, index, n.as_i64().unwrap_or(0), insert),
             Packed::F64(v) => put(v, index, n.as_f64().unwrap_or(0.0), insert),
+            Packed::F32(v) => put(v, index, n.as_f64().unwrap_or(0.0) as f32, insert),
         }
     }
 
@@ -188,6 +249,7 @@ impl Packed {
         match self {
             Packed::I64(v) => drop(v.remove(index)),
             Packed::F64(v) => drop(v.remove(index)),
+            Packed::F32(v) => drop(v.remove(index)),
         }
         n
     }
@@ -200,6 +262,7 @@ impl Packed {
         match self {
             Packed::I64(v) => cut(v, from, to),
             Packed::F64(v) => cut(v, from, to),
+            Packed::F32(v) => cut(v, from, to),
         }
     }
 
@@ -207,6 +270,7 @@ impl Packed {
         match self {
             Packed::I64(v) => v.clear(),
             Packed::F64(v) => v.clear(),
+            Packed::F32(v) => v.clear(),
         }
     }
 
@@ -607,6 +671,11 @@ impl Serialize for Array {
                         seq.serialize_element(&f)?;
                     }
                 }
+                Packed::F32(v) => {
+                    for &f in v {
+                        seq.serialize_element(&f64::from(f))?;
+                    }
+                }
             },
         }
         seq.end()
@@ -727,19 +796,32 @@ mod tests {
             Value::Array(Array::Packed(p)) => match *p {
                 Packed::I64(_) => "i64",
                 Packed::F64(_) => "f64",
+                Packed::F32(_) => "f32",
             },
             Value::Array(Array::Items(_)) => "items",
             _ => "other",
         };
         assert_eq!(kind("[1,2,3,4,5,6,7,8]"), "i64");
         assert_eq!(kind("[1,2,3,4,5,6,7]"), "items");
-        assert_eq!(kind("[0.5,1.5,2.5,3.5,4.5,5.5,6.5,-0.0]"), "f64");
+        assert_eq!(kind("[0.5,1.5,2.5,3.5,4.5,5.5,6.5,-0.0]"), "f32");
         assert_eq!(kind("[0.1,1.5,2.5,3.5,4.5,5.5,6.5,7.5]"), "f64");
         assert_eq!(kind("[1.0,1,2,3,4,5,6,7]"), "items");
         assert_eq!(kind("[1,2,3,4,5,6,7,18446744073709551615]"), "items");
         assert_eq!(kind("[1,2,3,4,5,6,7,\"8\"]"), "items");
         assert_eq!(kind("[1e300,1,2,3,4,5,6,7.5]"), "items");
         assert_eq!(kind("[1e300,1.5,2.5,3.5,4.5,5.5,6.5,7.5]"), "f64");
+        // A parsed array's buffer is as long as the array.
+        for (element, size) in [("0.5", 4), ("0.1", 8), ("7", 8)] {
+            let text = format!("[{}]", vec![element; 1536].join(","));
+            let Value::Array(array) = parse(&text) else {
+                unreachable!()
+            };
+            assert_eq!(
+                array.packed().unwrap().buffer_bytes(),
+                1536 * size,
+                "{element}"
+            );
+        }
     }
 
     #[test]
@@ -778,7 +860,7 @@ mod tests {
             unreachable!()
         };
         array.set(0, Value::Number(Number::from_f64(0.25).unwrap()));
-        assert!(matches!(array.packed(), Some(Packed::F64(_))));
+        assert!(matches!(array.packed(), Some(Packed::F32(_))));
         array.append(&[Value::Number(Number::from_f64(0.1).unwrap())]);
         assert!(matches!(array.packed(), Some(Packed::F64(_))));
         array.insert(1, &[Value::Number(Number::from_f64(-0.0).unwrap())]);

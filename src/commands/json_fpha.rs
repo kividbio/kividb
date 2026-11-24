@@ -15,7 +15,8 @@
 //!
 //! Redis additionally stores such arrays in a packed binary form of the
 //! type. Here a converted array is packed as any all-float array is
-//! (`json_tree::Packed`), as `f64`s.
+//! (`json_tree::Packed`): as `f32`s where every element is exactly one, as
+//! `f64`s otherwise.
 
 use crate::json_tree::{Array, Number, Value};
 
