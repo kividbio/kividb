@@ -37,7 +37,7 @@ Configurations (each a fresh server; LISTS lists, 10,000):
 Gates (the candidate): `used_per_element` and `rss_per_element` within 5 %
 (or 1 byte) of recorded and at most 1.3x Redis's `used_per_element` and 1.5x
 Redis's `rss_per_element` in the same session (what the candidate measured
-is 0.97x to 1.14x, and 0.98x to 1.23x with the allocator's slack), and at most
+is 0.97x to 1.14x, and 0.99x to 1.23x with the allocator's slack), and at most
 0.6x v1.2.2's; `list_len` as recorded. The RSS of `tiny` (4.5 MB in all) is
 shown, not gated. v1.2.2 and Redis are shown.
 """

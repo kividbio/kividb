@@ -182,17 +182,17 @@ A timeline keeps short lists the way Misskey's does (#1022): one list a user,
 
 | | 1.2.2 | 1.3.0 | Redis 8.10.2 |
 |---|---:|---:|---:|
-| loaded by `RPUSH`, one element a command | 59.7 / 59.6 | 14.8 / 17.0 | 13.9 / 14.4 |
-| loaded by one `RPUSH` of 300 a list | 48.4 / 51.2 | 13.4 / 14.1 | 13.9 / 14.4 |
-| after 3,000 `LPUSH` + `LTRIM` each | 64.4 / 69.4 | 14.2 / 17.7 | 13.9 / 14.4 |
-| 32-byte elements | 64.4 / 82.7 | 35.4 / 41.4 | 34.8 / 35.6 |
+| loaded by `RPUSH`, one element a command | 59.7 / 59.6 | 14.1 / 16.3 | 13.9 / 14.3 |
+| loaded by one `RPUSH` of 300 a list | 48.4 / 51.2 | 13.4 / 14.2 | 13.9 / 14.4 |
+| after 3,000 `LPUSH` + `LTRIM` each | 64.4 / 70.4 | 14.2 / 17.7 | 13.9 / 14.3 |
+| 32-byte elements | 64.4 / 82.7 | 35.4 / 42.1 | 34.8 / 35.6 |
 | 64-byte elements | 96.4 / 114.8 | 67.4 / 85.5 | 69.0 / 70.6 |
-| lists of 30 ten-byte elements | 53.0 / 50.9 | 16.9 / 22.8 | 14.8 / 15.0 |
+| lists of 30 ten-byte elements | 53.0 / 57.9 | 16.9 / 15.7 | 14.8 / 15.3 |
 
-A list of over 192 short elements opens the chunk at the end it is pushed at
-with room for a whole chunk of them, so a list that is pushed at the front
-and trimmed at the back cycles chunks of one size (RSS after the timeline:
-23.0 bytes an element when the chunks were grown a quarter at a time). Suite
+A list of over 192 short elements opens the chunk at its front with room for
+a whole chunk of them, so a list that is pushed at the front and trimmed at
+the back cycles chunks of one size (RSS after the timeline: 23.0 bytes an
+element when the chunks were grown a quarter at a time). Suite
 `52-small-lists-memory` of the regression suite measures this again.
 
 At 10 elements most of what is left over Redis is the key's own: its entry
