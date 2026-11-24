@@ -63,9 +63,12 @@ const APPEND_MAX: usize = 512 << 20;
 /// The room an append that makes a value of `len` bytes leaves in a block
 /// of the system allocator's: a quarter of `len` more, at most
 /// [`MAX_SPARE`], and none past [`APPEND_MAX`]. Appends grow such a value
-/// by a quarter at a time, so each byte appended is copied, on average, a
-/// few times at most (four, if every growth moves the block), however long
-/// the value gets; the room left is at most a fifth of the block.
+/// by a quarter at a time up to 64 MiB, so each byte appended is copied, on
+/// average, at most four times there even if every growth moves the block;
+/// past it the block grows 16 MiB at a time (about nine copies a byte at
+/// 256 MiB if every growth moved it, though a block that large is one the
+/// allocator grows by remapping its pages). The room left is at most a
+/// fifth of the block.
 #[inline]
 pub fn room_for_append(len: usize) -> usize {
     let room = len + (len / 4).min(MAX_SPARE);
