@@ -2053,6 +2053,8 @@ pub(crate) fn knn_planned(
     };
     let live = def.indexes.get(&knn.field)?;
     let mut plan = crate::commands::search::plan(ctx, def, filter, only, now)?;
+    #[cfg(test)]
+    crate::test_hooks::at("knn_planned: planned");
     if !plan.exact {
         return None;
     }
@@ -3044,5 +3046,123 @@ mod nearest_shown_tests {
             |key| key_number(key) != 7 && key_number(key) < 90,
         );
         assert_eq!(keys(&found), [7, 90, 91, 92]);
+    }
+}
+
+/// A document deleted, and another written, between a filtered KNN's plan
+/// and its search: the new one takes the id the old one gave back (postings
+/// give the last id given back first), and the slot. It does not match the
+/// filter, and it is the nearest of all: it must not be among the hits.
+#[cfg(test)]
+mod id_given_back_tests {
+    use crate::commands::ctx::{Ctx, NoopAofSender};
+    use std::sync::Arc;
+
+    #[test]
+    fn a_document_that_took_a_given_back_id_is_not_a_hit_of_the_filter() {
+        let _pause = crate::pause::TEST_LOCK.lock();
+        fn leak<T>(value: T) -> &'static T {
+            Box::leak(Box::new(value))
+        }
+        let store = leak(crate::store::new_store(1));
+        let lastsave = leak(Arc::new(parking_lot::RwLock::new(0i64)));
+        let hub = leak(crate::replication::HubTx::channel());
+        let config = leak(Arc::new(crate::config::Config::default()));
+        let started_at = leak(std::time::Instant::now());
+        let index_store = leak(crate::vector::new_index_store());
+        // As a server pairs them: a key that leaves its shard leaves its indexes.
+        crate::vector::register_index_store(store, index_store);
+        let dict_store = leak(crate::vector::new_dict_store());
+        let wait_table = leak(Arc::new(crate::wait_table::WaitTable::new()));
+        let ts_index = leak(crate::store::new_ts_index());
+        let pubsub = leak(crate::pubsub::PubSubHub::new());
+        let repl_state = leak(Arc::new(crate::replication::ReplState::new_master()));
+        let acl_store = leak(crate::acl::new_acl_store(""));
+        let acl_log = leak(crate::acl::new_acl_log());
+        let slowlog = leak(crate::slowlog::new_slowlog(u64::MAX, 0));
+        let latency = leak(crate::latency::new_latency_tracker());
+        let compaction = leak(crate::vector::new_compaction_channel());
+        let cluster = leak(Arc::new(crate::cluster::ClusterState::new_disabled()));
+        let client_registry = leak(crate::client_registry::new_client_registry());
+        let monitor_registry = leak(crate::monitor::new_monitor_registry());
+        let tracking_table = leak(crate::tracking::new_tracking_table());
+        let run: &'static dyn Fn(&[&[u8]]) -> Vec<u8> = leak(move |args: &[&[u8]]| {
+            let mut selected_db = 0usize;
+            crate::commands::execute_command(Ctx {
+                cmd: args.to_vec(),
+                store,
+                lastsave,
+                selected_db: &mut selected_db,
+                aof_tx: &NoopAofSender,
+                aof_enabled: false,
+                config,
+                started_at,
+                index_store,
+                dict_store,
+                wait_table,
+                ts_index,
+                pubsub,
+                hub_tx: &hub.0,
+                repl_state,
+                watch_registry: &crate::watch::NoopWatchRegistry,
+                client_id: 0,
+                client_registry,
+                resp: 2,
+                acl_store,
+                acl_log,
+                slowlog,
+                latency,
+                compaction_tx: &compaction.0,
+                cluster,
+                bypass_cluster_check: false,
+                apply_replication: false,
+                skip_write_side_effects: false,
+                peer_addr: "127.0.0.1:1",
+                peer_ipv6: false,
+                monitor_registry,
+                authenticated_user: "default",
+                tracking_table,
+                blocking: None,
+            })
+        });
+        let blob = |v: [f32; 4]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let ok = run(&[
+            b"FT.CREATE", b"reuse", b"ON", b"HASH", b"PREFIX", b"1", b"d:", b"SCHEMA", b"t",
+            b"TAG", b"v", b"VECTOR", b"FLAT", b"6", b"TYPE", b"FLOAT32", b"DIM", b"4",
+            b"DISTANCE_METRIC", b"L2",
+        ]);
+        assert_eq!(ok, b"+OK\r\n");
+        for i in 0..10u8 {
+            let key = format!("d:a:{i}");
+            let v = blob([1.0 + f32::from(i); 4]);
+            run(&[b"HSET", key.as_bytes(), b"t", b"a", b"v", &v]);
+        }
+        let q = blob([0.0; 4]);
+        let search = || -> String {
+            let reply = run(&[
+                b"FT.SEARCH", b"reuse", b"(@t:{a})=>[KNN 3 @v $q]", b"PARAMS", b"2", b"q", &q,
+                b"NOCONTENT", b"DIALECT", b"2",
+            ]);
+            String::from_utf8_lossy(&reply).into_owned()
+        };
+        assert!(search().contains("d:a:0"));
+        // Between the plan and the search: d:a:9 leaves, and d:new:9, t=b,
+        // at the query's own vector, takes its id and its slot.
+        let at_q = q.clone();
+        crate::test_hooks::set("knn_planned: planned", move || {
+            run(&[b"DEL", b"d:a:9"]);
+            run(&[b"HSET", b"d:new:9", b"t", b"b", b"v", &at_q]);
+            // What the postings queued meanwhile (their merging thread can
+            // hold their lock), applied.
+            let def = index_store.read().get("reuse").cloned().unwrap();
+            let postings = def.postings.write();
+            def.postings.done(postings);
+        });
+        let reply = search();
+        crate::test_hooks::clear("knn_planned: planned");
+        assert!(!reply.contains("d:new:"), "a hit (@t:{{a}}) does not match: {reply:?}");
+        for i in 0..3 {
+            assert!(reply.contains(&format!("d:a:{i}\r\n")), "{reply:?}");
+        }
     }
 }

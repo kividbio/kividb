@@ -759,7 +759,8 @@ mod tests {
         }
         let stop = Arc::new(AtomicBool::new(false));
         let checked = Arc::new(AtomicUsize::new(0));
-        // By key: writes begun to it so far.
+        // By key: twice the writes to it so far, and one more while one is
+        // under way.
         let written: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new(
             (0..KEYS)
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
@@ -777,7 +778,8 @@ mod tests {
                 let mut seed = 0x1234_5678 + w;
                 let mut version: u32 = 1;
                 while !stop.load(Ordering::Relaxed) {
-                    let n = (rng(&mut seed) % u64::from(KEYS)) as u32;
+                    // Each writer its own keys, as a server orders the writes to a key.
+                    let n = (rng(&mut seed) % u64::from(KEYS / 3)) as u32 * 3 + w as u32;
                     let key = format!("doc:{n}");
                     version += 1;
                     written[n as usize].fetch_add(1, Ordering::SeqCst);
@@ -793,6 +795,7 @@ mod tests {
                         };
                         flat.insert_doc(&key, &vector(n, version), doc);
                     }
+                    written[n as usize].fetch_add(1, Ordering::SeqCst);
                 }
             }));
         }
@@ -815,7 +818,9 @@ mod tests {
                 while !stop.load(Ordering::Relaxed) {
                     let hold = r == 0;
                     flat.each(hold, None, &mut |v, key| check(v, key));
-                    // The ids, the keys they named then, and the writes so far.
+                    // The writes so far, then the ids and the keys they named.
+                    let before: Vec<u64> =
+                        written.iter().map(|w| w.load(Ordering::SeqCst)).collect();
                     let (ids, named) = {
                         let p = postings.peek();
                         let ids = p.live().clone();
@@ -823,12 +828,12 @@ mod tests {
                             ids.iter().filter_map(|id| p.key(id).map(|k| k.to_string())).collect();
                         (ids, named)
                     };
-                    let before: Vec<u64> =
-                        written.iter().map(|w| w.load(Ordering::SeqCst)).collect();
                     let met_by_ids = |key: &str| {
                         let n: usize = key["doc:".len()..].parse().unwrap();
+                        let meanwhile = before[n] % 2 == 1
+                            || written[n].load(Ordering::SeqCst) != before[n];
                         assert!(
-                            named.contains(key) || written[n].load(Ordering::SeqCst) != before[n],
+                            named.contains(key) || meanwhile,
                             "{key}: neither named by the ids nor written meanwhile"
                         );
                     };

@@ -1973,15 +1973,18 @@ fn writes_racing_queries_are_seen_by_the_next_query() {
 }
 
 /// A filtered FLAT KNN while documents leave and others take their ids:
-/// 10,000 documents `t=a`; one client loops `FT.SEARCH "(@t:{a})=>[KNN 5
-/// @v $q]"` while another deletes `d:a:<i>` and writes `d:new:<i>` with
-/// `t=b` and the query's own vector (the nearest there is, were it
-/// measured), then the other way round. Postings give the last id given back
-/// to the next document, so the new one takes the id the filter matched for
-/// the one just deleted; every hit must be a document the filter matches:
-/// never a `d:new:` key. Runs for `KNN_REUSE_SECS` seconds (2 by default).
+/// 10,000 documents `t=a` of 256 dimensions; one client loops `FT.SEARCH
+/// "(@t:{a})=>[KNN 5 @v $q]"` while three others each delete `d:a:<i>` and
+/// write `d:new:<i>` with `t=b` and the query's own vector (the nearest
+/// there is, were it measured), then the other way round, over keys of
+/// their own. Postings give the last id given back to the next document, so
+/// the new one takes the id the filter matched for the one just deleted;
+/// every hit must be a document the filter matches: never a `d:new:` key.
+/// Runs for `KNN_REUSE_SECS` seconds (2 by default).
 #[test]
 fn a_filtered_flat_knn_returns_only_documents_the_filter_matches() {
+    const D: usize = 256;
+    const WRITERS: usize = 3;
     let mut c = conn();
     let reply = c.cmd(&[
         "FT.CREATE",
@@ -2001,14 +2004,14 @@ fn a_filtered_flat_knn_returns_only_documents_the_filter_matches() {
         "TYPE",
         "FLOAT32",
         "DIM",
-        "8",
+        "256",
         "DISTANCE_METRIC",
         "L2",
     ]);
     assert!(reply.ok(), "{reply:?}");
     const N: usize = 10_000;
     let mut rng = Rng(0x1020_1020);
-    let vector = |rng: &mut Rng| -> Vec<f32> { (0..DIM).map(|_| rng.unit() + 1.0).collect() };
+    let vector = |rng: &mut Rng| -> Vec<f32> { (0..D).map(|_| rng.unit() + 1.0).collect() };
     for i in 0..N {
         let v = blob(&vector(&mut rng));
         let key = format!("d:a:{i}");
@@ -2017,40 +2020,43 @@ fn a_filtered_flat_knn_returns_only_documents_the_filter_matches() {
     for _ in 0..N {
         assert!(matches!(c.read(), V::Int(_)));
     }
-    let q = blob(&[0.0; DIM]);
+    let q = blob(&[0.0; D]);
     let secs: u64 = std::env::var("KNN_REUSE_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let writer = {
-        let stop = stop.clone();
-        let q = q.clone();
-        thread::spawn(move || {
-            let mut w = conn();
-            let mut rng = Rng(0x0bad_f00d);
-            let mut writes = 0u64;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                for i in 0..N {
-                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|w| {
+            let stop = stop.clone();
+            let q = q.clone();
+            thread::spawn(move || {
+                let mut c = conn();
+                let mut rng = Rng(0x0bad_f00d + w as u64);
+                let mut writes = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for i in (w..N).step_by(WRITERS) {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        let (old, new) = (format!("d:a:{i}"), format!("d:new:{i}"));
+                        c.cmd(&["DEL", &old]);
+                        let r = c.raw(&[b"HSET", new.as_bytes(), b"t", b"b", b"v", &q]);
+                        assert!(matches!(r, V::Int(_)), "{r:?}");
+                        c.cmd(&["DEL", &new]);
+                        let v = blob(&vector(&mut rng));
+                        let r = c.raw(&[b"HSET", old.as_bytes(), b"t", b"a", b"v", &v]);
+                        assert!(matches!(r, V::Int(_)), "{r:?}");
+                        writes += 4;
                     }
-                    let (old, new) = (format!("d:a:{i}"), format!("d:new:{i}"));
-                    w.cmd(&["DEL", &old]);
-                    let r = w.raw(&[b"HSET", new.as_bytes(), b"t", b"b", b"v", &q]);
-                    assert!(matches!(r, V::Int(_)), "{r:?}");
-                    w.cmd(&["DEL", &new]);
-                    let v = blob(&vector(&mut rng));
-                    let r = w.raw(&[b"HSET", old.as_bytes(), b"t", b"a", b"v", &v]);
-                    assert!(matches!(r, V::Int(_)), "{r:?}");
-                    writes += 4;
                 }
-            }
-            writes
+                writes
+            })
         })
-    };
+        .collect();
     let until = Instant::now() + Duration::from_secs(secs);
     let mut queries = 0u64;
+    let mut strays = Vec::new();
     while Instant::now() < until {
         let reply = c.raw(&[
             b"FT.SEARCH",
@@ -2065,15 +2071,22 @@ fn a_filtered_flat_knn_returns_only_documents_the_filter_matches() {
             b"2",
         ]);
         assert!(matches!(reply, V::Arr(_)), "{reply:?}");
-        for key in reply.ordered_keys() {
-            assert!(
-                key.starts_with("d:a:"),
-                "query {queries}: {key} does not match (@t:{{a}})"
-            );
-        }
+        strays.extend(
+            reply
+                .ordered_keys()
+                .into_iter()
+                .filter(|key| !key.starts_with("d:a:"))
+                .map(|key| format!("query {queries}: {key}")),
+        );
         queries += 1;
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let writes = writer.join().unwrap();
+    let writes: u64 = writers.into_iter().map(|w| w.join().unwrap()).sum();
+    assert!(
+        strays.is_empty(),
+        "{} hits the filter (@t:{{a}}) does not match, in {queries} queries: {:?}",
+        strays.len(),
+        &strays[..strays.len().min(5)]
+    );
     assert!(queries > 10 && writes > 100, "{queries} queries, {writes} writes");
 }
