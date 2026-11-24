@@ -131,16 +131,20 @@ pub fn hash_fields(fields: &HashFields, samples: usize) -> usize {
 
 /// Keys a node of the standard library's `BTreeMap` has room for (its B is
 /// 6): a leaf is made with room for this many, however many it holds.
+#[cfg(test)]
 const BTREE_KEYS: usize = 11;
 
 /// A leaf of a `BTreeMap<K, ()>`: its parent, its place in the parent and
 /// its length, and room for its keys.
+#[cfg(test)]
 fn btree_leaf<K>() -> Layout {
     Layout::new::<(*const (), u16, u16, [K; BTREE_KEYS])>()
 }
 
-/// A sorted set's score index (`BTreeMap<K, ()>`) of `len` keys: one leaf
-/// up to eleven of them, and past that leaves and the nodes above them.
+/// The reference score index's (`zset_table::BTreeOrder`, a `BTreeMap<K,
+/// ()>`) size at `len` keys: one leaf up to eleven of them, and past that
+/// leaves and the nodes above them. The large form's own index counts its
+/// nodes exactly.
 ///
 /// How full the nodes are is not seen from outside the map (and is not
 /// worth a walk of it): it depends on the order the keys came in. Keys that
@@ -153,6 +157,7 @@ fn btree_leaf<K>() -> Layout {
 /// keys, at random). A sorted set built whole (a load, `RESTORE`, a block
 /// made large, a `*STORE` result) has its index built in one go, its nodes
 /// full: this counts about 40% more than it holds then.
+#[cfg(test)]
 pub fn score_index<K>(len: usize) -> usize {
     const CHILDREN: f64 = 7.75;
     let leaf = btree_leaf::<K>();
@@ -422,5 +427,110 @@ mod tests {
                 }
             },
         );
+    }
+
+    /// The counted score index allocates what it counts (`heap_bytes`), and
+    /// no more a member than a `BTreeMap` of 16-byte keys (the reference
+    /// index's): inserted in order, in reverse, at random, built whole, and
+    /// after every other key is removed. Run with `--nocapture` for the
+    /// bytes a member.
+    #[test]
+    fn a_counted_score_index_allocates_what_it_counts() {
+        use crate::counted_btree::{CountedTree, Member};
+        use ordered_float::OrderedFloat;
+        use std::collections::BTreeMap;
+
+        /// An 8-byte reference never 0, as `EntryRef` is; scores never tie.
+        #[derive(PartialEq)]
+        struct Id(std::num::NonZeroU64);
+        let id = |k: u64| Id(std::num::NonZeroU64::new(k + 1).unwrap());
+        impl Member for Id {
+            fn member(&self) -> &[u8] {
+                &[]
+            }
+        }
+        type Map = BTreeMap<(OrderedFloat<f64>, u64), ()>;
+
+        with_own_counter("a_counted_score_index_allocates_what_it_counts", || {
+            let mut seed = 0x2545_F491_4F6C_DD1Du64;
+            let mut random = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed >> 12
+            };
+            for len in [1_000usize, 10_000, 100_000] {
+                let mut ascending: Vec<u64> = (0..len as u64).collect();
+                let orders: [(&str, Vec<u64>); 4] = [
+                    ("ascending", ascending.clone()),
+                    ("descending", (0..len as u64).rev().collect()),
+                    ("random", (0..len).map(|_| random()).collect()),
+                    ("built whole", Vec::new()),
+                ];
+                for (order, keys) in orders {
+                    let whole = keys.is_empty();
+                    let keys = if whole {
+                        std::mem::take(&mut ascending)
+                    } else {
+                        keys
+                    };
+                    let (mut tree, counted) = allocated(|| {
+                        if whole {
+                            let sorted = keys.iter().map(|&k| (k as f64, id(k))).collect();
+                            let Ok(tree) = CountedTree::from_sorted(sorted) else {
+                                panic!("keys in order");
+                            };
+                            return tree;
+                        }
+                        let mut tree = CountedTree::default();
+                        for &k in &keys {
+                            let _ = tree.insert(k as f64, id(k));
+                        }
+                        tree
+                    });
+                    let (mut map, mapped) = allocated(|| {
+                        let key = |k: u64| ((OrderedFloat(k as f64), k), ());
+                        if whole {
+                            return keys.iter().map(|&k| key(k)).collect::<Map>();
+                        }
+                        let mut map = Map::new();
+                        for &k in &keys {
+                            map.extend([key(k)]);
+                        }
+                        map
+                    });
+                    let n = map.len();
+                    assert_eq!(tree.len(), n);
+                    assert_eq!(counted, tree.heap_bytes(), "{len}, {order}");
+                    let (_, freed) = allocated(|| {
+                        for &k in keys.iter().step_by(2) {
+                            assert!(tree.remove(k as f64, &id(k)).is_some());
+                        }
+                    });
+                    let (_, map_freed) = allocated(|| {
+                        for &k in keys.iter().step_by(2) {
+                            map.remove(&(OrderedFloat(k as f64), k));
+                        }
+                    });
+                    let half = (counted as isize + freed as isize) as usize;
+                    let map_half = (mapped as isize + map_freed as isize) as usize;
+                    assert_eq!(half, tree.heap_bytes(), "{len}, {order}, half gone");
+                    let per = |bytes: usize, n: usize| bytes as f64 / n as f64;
+                    let left = map.len();
+                    eprintln!(
+                        "{len} {order}: counted {:.1} B a member, BTreeMap {:.1}; \
+                         half gone: {:.1}, {:.1}",
+                        per(counted, n),
+                        per(mapped, n),
+                        per(half, left),
+                        per(map_half, left)
+                    );
+                    assert!(counted <= mapped, "{len}, {order}: {counted} > {mapped}");
+                    // Every node at least half full: a 520-byte leaf to 16
+                    // members, and the levels above.
+                    assert!(per(half, left) < 36.0, "{len}, {order}, half gone");
+                }
+            }
+        });
     }
 }
