@@ -526,10 +526,13 @@ is still written as before):
 | field options section (`KIVIFO1\0`) | each index's `STOPWORDS` and each field's options (`AS`, `SORTABLE`, `WEIGHT`, `SEPARATOR`, `CASESENSITIVE`, …), as the words `FT.CREATE` takes |
 | synonyms and dictionaries section (`KIVISD1\0`) | each index's synonym groups (`FT.SYNUPDATE`) and every dictionary (`FT.DICTADD`) |
 | function libraries section (`KIVIFN1\0`), written last | every library loaded with `FUNCTION LOAD`, as a `FUNCTION DUMP` payload, so that libraries survive a restart and reach a replica in a full sync. A build without Lua loads the rest of the snapshot and leaves them out |
+| document order section (`KIVIDO1\0`), after every other section | for each index with TAG, NUMERIC or TEXT fields, its documents' keys in the order they were written: the order `SORTBY` gives documents with equal values, and a query without `SORTBY` matches that score the same. A snapshot without it (1.2's) gives the documents the order of their keys; documents written after the snapshot, replayed from the AOF, come after those it lists, in the order of their writes |
 
 An older release stops reading at the first section it does not know, so
 these come after everything it does. A snapshot written by this version
-cannot be read by an older one once it contains any of these.
+cannot be read by an older one once it contains any of these, but for the
+document order section: an older release reads everything before it, and
+gives the documents its own order.
 
 ## Compressed snapshots
 
