@@ -2687,11 +2687,43 @@ pub fn maybe_index(
     }
 }
 
+thread_local! {
+    /// The numbers the document under the old name of a `RENAME` had, by
+    /// its indexes' postings ([`renaming`]), for [`renamed`] to give the
+    /// document under the new name. Set and taken by one command on its
+    /// thread.
+    static RENAMING: std::cell::RefCell<Vec<(postings::SharedPostings, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A `RENAME` is about to take the document at `from` (database `db`) out:
+/// the number it has in each index is kept for [`renamed`]. Called by the
+/// command, which holds the order of both keys, before it moves the value.
+pub fn renaming(index_store: &IndexStore, db: usize, from: &[u8]) {
+    RENAMING.with(|numbers| numbers.borrow_mut().clear());
+    if indexing_deferred() || index_store.none() {
+        return;
+    }
+    let text = crate::key_bytes::text_of(from);
+    let store = index_store.read();
+    let mut numbers = Vec::new();
+    for (name, def) in store.iter() {
+        if is_alias(name, def) || def.db_index != db || !def.gives_ids() || !def.covers(from) {
+            continue;
+        }
+        if let Some(number) = def.postings.read().number_of(&text) {
+            numbers.push((Arc::clone(&def.postings), number));
+        }
+    }
+    RENAMING.with(|kept| *kept.borrow_mut() = numbers);
+}
+
 /// `from` was renamed to `to` in database `db` (`RENAME`): each index of
-/// the new key gives its document the place in its order the old key's
-/// had (see `postings::Postings::carry`), or, in a replay that puts
-/// indexing off, has the walk after it do so.
+/// the new key gives its document the number the old key's had there
+/// ([`renaming`]), so that it keeps its place in the index's order; in a
+/// replay that puts indexing off, the walk after it does so.
 pub fn renamed(index_store: &IndexStore, db: usize, from: &[u8], to: &[u8]) {
+    let numbers = RENAMING.with(|kept| std::mem::take(&mut *kept.borrow_mut()));
     if index_store.none() {
         return;
     }
@@ -2705,13 +2737,18 @@ pub fn renamed(index_store: &IndexStore, db: usize, from: &[u8], to: &[u8]) {
         if is_alias(name, def) || def.db_index != db || !def.gives_ids() || !def.covers(to) {
             continue;
         }
-        let mut postings = def.postings.write();
         if deferred {
+            let mut postings = def.postings.write();
             postings.replayed_rename(&from, &to_text);
-        } else {
-            postings.carry(&from, &to_text);
+            def.postings.done(postings);
+        } else if let Some((_, number)) = numbers
+            .iter()
+            .find(|(postings, _)| Arc::ptr_eq(postings, &def.postings))
+        {
+            let mut postings = def.postings.write();
+            postings.carry(&to_text, *number);
+            def.postings.done(postings);
         }
-        def.postings.done(postings);
     }
 }
 

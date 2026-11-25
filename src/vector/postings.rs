@@ -801,14 +801,14 @@ fn merged<'a>(
 // step, at any size.
 //
 // An id that left, went to another key, or was written again, keeps its old
-// entry, which no longer matches its place, and is passed over until a merge
+// entry, which does not match its place, and is passed over until a merge
 // drops it.
 //
 // A write numbers its document after every other, so the documents written
 // since the index was walked come in the order of their writes: they are
 // kept apart, in `tail`, one entry appended a write, and never sorted or
 // merged. A document written again is appended again, its old entry left
-// behind (its number no longer matches); once most entries are such, the
+// behind (its number does not match); once most entries are such, the
 // tail is copied without them, a part at a time.
 
 const NO_PLACE: u32 = u32::MAX;
@@ -1013,7 +1013,7 @@ impl KeyOrder {
         }
     }
 
-    /// Its entry in the tail, if it has one, is no longer its own.
+    /// Its entry in the tail, if it has one, stops being its own.
     fn leaves_tail(&mut self, id: u32) {
         if self.place_of(id) == TAIL {
             self.tail.live -= 1;
@@ -1069,6 +1069,14 @@ impl KeyOrder {
         if end < self.tail.ids.len() {
             self.tail.copy = Some(copy);
             return;
+        }
+        // From the first entry kept: an old one left behind does not hold
+        // the offsets of the new ones back.
+        if let Some(&shift) = copy.offsets.first() {
+            for offset in &mut copy.offsets {
+                *offset -= shift;
+            }
+            self.tail.base += u64::from(shift);
         }
         trash.push(Box::new(std::mem::replace(&mut self.tail.ids, copy.ids)));
         trash.push(Box::new(std::mem::replace(
@@ -1680,13 +1688,16 @@ pub struct Postings {
     /// Keys a replay renamed whose document was not written in it: the new
     /// key, and the key the snapshot gave its place under.
     renamed: ahash::AHashMap<Box<str>, Box<str>>,
-    /// The last documents that left, with their numbers: a `RENAME` gives
-    /// its new key the number of the old ([`Postings::carry`]).
-    left: std::collections::VecDeque<(Arc<str>, u64)>,
+    /// Snapshots writing their document order section
+    /// ([`Postings::order_capture`]): each is told the keys of the
+    /// documents that leave while it is written.
+    captures: Vec<CaptureLog>,
 }
 
-/// How many documents that left [`Postings::carry`] looks among.
-const LEFT_KEPT: usize = 16;
+/// The documents that left an index since a snapshot copied its numbers
+/// ([`Postings::order_capture`]), by id, with their keys: the snapshot
+/// lists them under the keys they had, not under those their ids go to.
+pub type CaptureLog = Arc<parking_lot::Mutex<ahash::AHashMap<u32, Arc<str>>>>;
 
 /// Keys one after the other in one buffer, each one's end beside: a
 /// snapshot's order of the documents, read without an allocation a key.
@@ -2283,6 +2294,13 @@ impl Postings {
     /// The number a walk gives the document at `key` if it puts it in: as
     /// the replay wrote it, after everything before the walk; else its place
     /// in the snapshot's order, before everything; else the walk's own.
+    ///
+    /// A snapshot's order is set ([`Postings::set_loaded_order`]) only for
+    /// the walk that rebuilds an index from a loaded dataset: at start-up,
+    /// while the server answers `LOADING`, and on a replica after a full
+    /// sync, before it applies its master's stream. No write numbers a
+    /// document meanwhile, so a document written during that walk is not
+    /// given a snapshot place before it.
     fn walk_number(&self, key: &str) -> Option<u64> {
         let (base, _) = self.walk?;
         if let Some(n) = self.replayed.get(key) {
@@ -2327,18 +2345,16 @@ impl Postings {
     /// `from` was renamed to `to` (`RENAME`): the document under `to` takes
     /// the number the one under `from` had, if it left a moment ago and
     /// `to` is a document of the index.
-    pub fn carry(&mut self, from: &str, to: &str) {
-        if self.ids.get(&self.keys, from).is_some() {
-            return;
-        }
-        let Some(at) = self.left.iter().rposition(|(key, _)| &**key == from) else {
-            return;
-        };
-        let (_, number) = self.left.remove(at).unwrap_or((Arc::from(""), 0));
+    pub fn carry(&mut self, to: &str, number: u64) {
         if let Some(id) = self.ids.get(&self.keys, to) {
             self.written[id as usize] = number;
             self.order.added(id);
         }
+    }
+
+    /// The number of the last write of the document at `key`, if it is one.
+    pub fn number_of(&self, key: &str) -> Option<u64> {
+        self.ids.get(&self.keys, key).map(|id| self.written(id))
     }
 
     /// Whether a walk of the keyspace is under way.
@@ -2348,9 +2364,25 @@ impl Postings {
 
     /// What the document order section is made of, copied with writes held
     /// (a snapshot reads the keys and orders them after): each id's number,
-    /// and the ids in use.
-    pub fn order_capture(&self) -> (Vec<u64>, Bits) {
-        (self.written.clone(), self.live.clone())
+    /// the ids in use, and the log of the documents that leave from now on,
+    /// which the snapshot reads their keys from.
+    pub fn order_capture(&mut self) -> (Vec<u64>, Bits, CaptureLog) {
+        self.captures.retain(|log| Arc::strong_count(log) > 1);
+        let log = CaptureLog::default();
+        self.captures.push(Arc::clone(&log));
+        (self.written.clone(), self.live.clone(), log)
+    }
+
+    /// Tell the snapshots being written that document `id` (under `key`)
+    /// leaves.
+    fn leaves_captures(&mut self, id: u32, key: &Arc<str>) {
+        if self.captures.is_empty() {
+            return;
+        }
+        self.captures.retain(|log| Arc::strong_count(log) > 1);
+        for log in &self.captures {
+            log.lock().entry(id).or_insert_with(|| Arc::clone(key));
+        }
     }
 
     fn behind(&self) -> bool {
@@ -2499,10 +2531,7 @@ impl Postings {
             }
         }
         if let Some(key) = self.keys[id as usize].take() {
-            if self.left.len() == LEFT_KEPT {
-                self.left.pop_front();
-            }
-            self.left.push_back((key, self.written[id as usize]));
+            self.leaves_captures(id, &key);
         }
         self.live.unset(id);
         self.free.push(id);
@@ -2512,12 +2541,21 @@ impl Postings {
 
     /// Forget every document (the index is being filled again).
     pub fn clear(&mut self) {
+        // Every document leaves, as far as a snapshot being written knows.
+        if !self.captures.is_empty() {
+            for id in self.live.iter().collect::<Vec<u32>>() {
+                if let Some(key) = self.keys[id as usize].clone() {
+                    self.leaves_captures(id, &key);
+                }
+            }
+        }
         let mut fresh = Postings {
             unused: self.unused,
             read_all: self.read_all,
             given_back: self.given_back + 1,
             next_written: self.next_written,
             walk: self.walk,
+            captures: std::mem::take(&mut self.captures),
             ..Postings::default()
         };
         for field in &self.fields {
@@ -2794,17 +2832,66 @@ mod tests {
         for key in ["a", "b", "c"] {
             put(&mut p, key, "x", "1");
         }
-        let before = p.written(p.id("b").unwrap());
+        let before = p.number_of("b").unwrap();
         p.remove("b");
+        // Others leave and come between: the number goes with the command.
+        for i in 0..100 {
+            put(&mut p, &format!("d{i}"), "x", "1");
+            p.remove(&format!("d{i}"));
+        }
         put(&mut p, "z", "x", "1");
-        p.carry("b", "z");
-        assert_eq!(p.written(p.id("z").unwrap()), before);
-        // Only once, and not for a key that is still there.
-        put(&mut p, "y", "x", "1");
-        let y = p.written(p.id("y").unwrap());
-        p.carry("b", "y");
-        p.carry("a", "y");
-        assert_eq!(p.written(p.id("y").unwrap()), y);
+        p.carry("z", before);
+        assert_eq!(p.number_of("z"), Some(before));
+        while p.tidy_step() {}
+        let all = p.live().clone();
+        let order: Vec<String> = p
+            .first_written(&all, 3, 3, false, &mut || false)
+            .into_iter()
+            .map(|id| p.key(id).unwrap().to_string())
+            .collect();
+        assert_eq!(order, ["a", "z", "c"]);
+    }
+
+    #[test]
+    fn the_tail_drops_what_is_left_behind_and_keeps_its_order() {
+        let mut p = Postings::new(&schema());
+        for i in 0..100 {
+            put(&mut p, &format!("k{i}"), "x", "1");
+        }
+        let base = p.order.tail.base;
+        // Written again and again: most entries are left behind, and the
+        // copy runs a step at a time, read between steps.
+        let mut rounds = 0;
+        while p.order.tail.copy.is_none() && !p.order.tail_due() {
+            for i in 0..100 {
+                put(&mut p, &format!("k{i}"), "x", "1");
+            }
+            rounds += 1;
+        }
+        assert!(rounds > 0 && p.order.tail.ids.len() >= TAIL_COPY_AT);
+        let want = |p: &Postings| {
+            let mut ids: Vec<u32> = p.live().iter().collect();
+            ids.sort_by_key(|&id| p.written(id));
+            ids
+        };
+        let whole = want(&p);
+        let mut steps = 0;
+        loop {
+            let all = p.live().clone();
+            let first = p.first_written(&all, 100, 100, false, &mut || false);
+            assert_eq!(first, whole, "after {steps} steps");
+            let last = p.first_written(&all, 100, 100, true, &mut || false);
+            assert_eq!(last, whole.iter().rev().copied().collect::<Vec<u32>>());
+            if !p.tidy_step() {
+                break;
+            }
+            steps += 1;
+        }
+        // Only the entries of the documents as they are, from a later base.
+        assert_eq!(p.order.tail.ids.len(), 100);
+        assert_eq!(p.order.tail.live, 100);
+        assert!(p.order.tail.base > base, "the offsets start again");
+        assert_eq!(p.order.tail.offsets[0], 0);
     }
 
     #[test]

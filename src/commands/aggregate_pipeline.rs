@@ -802,6 +802,10 @@ struct StreamGroup {
     key: Box<[Box<str>]>,
     members: usize,
     running: Box<[Running]>,
+    /// The least number (`Postings::written`) of its documents: the groups
+    /// come out in that order, that of their first documents written,
+    /// whatever the order the documents are read in.
+    first: u64,
 }
 
 /// A query's first `GROUPBY`, run as the documents are read: see above.
@@ -851,28 +855,18 @@ impl StreamGroups {
         self
     }
 
-    /// Whether the rows of the steps from `cmd[start]` on go into a `GROUPBY`
-    /// whose reducers keep a running value (`COUNT`, `SUM`, `MIN`, …), with
-    /// nothing before it but steps that take or change rows one at a time
-    /// (`LOAD`, `APPLY`, `FILTER`): what it gives is the same in whatever
-    /// order the rows come, and they are read in any.
-    pub fn order_free(cmd: &[&[u8]], start: usize) -> bool {
-        let mut i = start;
-        while i < cmd.len() {
-            let word = cmd[i].to_ascii_uppercase();
-            match word.as_slice() {
-                b"GROUPBY" => {
-                    let (_, props, reducers) = parse_groupby(cmd, i);
-                    return !props.is_empty()
-                        && reducers.iter().all(|r| Running::new(&r.func).is_some());
-                }
-                b"LOAD" | b"PARAMS" | b"DIALECT" | b"SCORER" | b"TIMEOUT" | b"LANGUAGE"
-                | b"WITHCURSOR" | b"APPLY" | b"FILTER" => i = clause_end(cmd, i),
-                b"SORTBY" | b"LIMIT" => return false,
-                _ => i += 1,
-            }
-        }
-        false
+    /// Whether what the groups hold is the same in whatever order their
+    /// documents are added: `COUNT`, `MIN`, `MAX` and `COUNT_DISTINCT` only
+    /// (a `SUM` or `AVG` adds numbers that round in the order they come).
+    /// The groups' order is that of their first documents written either
+    /// way (see [`StreamGroup::first`]).
+    pub fn order_free(&self) -> bool {
+        self.reducers.iter().all(|r| {
+            matches!(
+                Running::new(&r.func),
+                Some(Running::Count | Running::Min(_) | Running::Max(_) | Running::Distinct(_))
+            )
+        })
     }
 
     /// The first `GROUPBY` of the steps from `cmd[start]` on, if it can run
@@ -924,9 +918,9 @@ impl StreamGroups {
     }
 
     /// A document into its group: `value(name)` is what its row would hold
-    /// under `name`.
+    /// under `name`, and `number` the number of its last write.
     #[inline]
-    pub fn add<'a>(&mut self, value: impl Fn(&str) -> Option<&'a str>) {
+    pub fn add<'a>(&mut self, number: u64, value: impl Fn(&str) -> Option<&'a str>) {
         let Self {
             props,
             reducers,
@@ -990,6 +984,7 @@ impl StreamGroups {
                         .iter()
                         .map(|r| Running::new(&r.func).unwrap_or(Running::Count))
                         .collect(),
+                    first: number,
                 });
                 let g = (groups.len() - 1) as u32;
                 index.insert_unique(hash, g, |&g| {
@@ -1000,6 +995,7 @@ impl StreamGroups {
         };
         let group = &mut groups[at];
         group.members += 1;
+        group.first = group.first.min(number);
         for (at, (reducer, running)) in reducers.iter().zip(group.running.iter_mut()).enumerate() {
             if matches!(running, Running::Count) {
                 continue;
@@ -1026,9 +1022,12 @@ impl StreamGroups {
         let Self {
             props,
             reducers,
-            groups,
+            mut groups,
             ..
         } = self;
+        // In the order of their first documents written (stable: groups of
+        // documents numbered alike keep the order they were met in).
+        groups.sort_by_key(|group| group.first);
         groups
             .into_iter()
             .map(|group| {
@@ -1438,8 +1437,8 @@ mod tests {
             let (expect, cut, groups) = run_counted(docs.clone(), &cmd, 3, None);
             assert!(!cut);
             let mut stream = StreamGroups::plan(&cmd, 3).expect(line);
-            for doc in &docs {
-                stream.add(|name| doc.get(name).map(String::as_str));
+            for (number, doc) in docs.iter().enumerate() {
+                stream.add(number as u64, |name| doc.get(name).map(String::as_str));
             }
             let end = stream.end();
             let made = stream.finish();
@@ -1464,6 +1463,46 @@ mod tests {
 
     /// Past the deadline a pipeline stops, keeping only rows it finished;
     /// under DEADLINE_EVERY rows, or with time left, it runs to the end.
+    #[test]
+    fn groups_made_as_read_come_in_the_order_of_their_first_documents() {
+        for (line, free) in [
+            ("FT.AGGREGATE idx * GROUPBY 1 @g REDUCE COUNT 0 AS n", true),
+            (
+                "FT.AGGREGATE idx * GROUPBY 1 @g REDUCE MIN 1 @v REDUCE MAX 1 @v",
+                true,
+            ),
+            (
+                "FT.AGGREGATE idx * GROUPBY 1 @g REDUCE COUNT_DISTINCT 1 @v",
+                true,
+            ),
+            ("FT.AGGREGATE idx * GROUPBY 1 @g REDUCE SUM 1 @v", false),
+            (
+                "FT.AGGREGATE idx * GROUPBY 1 @g REDUCE COUNT 0 REDUCE AVG 1 @v",
+                false,
+            ),
+        ] {
+            let cmd = words(line);
+            let mut stream = StreamGroups::plan(&cmd, 3).expect(line);
+            assert_eq!(stream.order_free(), free, "{line}");
+            // Read in another order than written: by number, g is b, a, c.
+            for (number, g) in [(7, "c"), (3, "a"), (1, "b"), (9, "a"), (5, "c")] {
+                let doc: Row = [
+                    ("g".to_string(), g.to_string()),
+                    ("v".to_string(), "1".into()),
+                ]
+                .into_iter()
+                .collect();
+                stream.add(number, |name| doc.get(name).map(String::as_str));
+            }
+            let groups: Vec<String> = stream
+                .finish()
+                .into_iter()
+                .map(|row| row["g"].clone())
+                .collect();
+            assert_eq!(groups, ["b", "a", "c"], "{line}");
+        }
+    }
+
     #[test]
     fn a_pipeline_keeps_the_deadline() {
         let gone = Some(Instant::now() - Duration::from_secs(1));

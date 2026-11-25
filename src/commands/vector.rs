@@ -623,9 +623,14 @@ fn row_key(row: &Row) -> &str {
 
 /// Rows of the documents of `def`, in the order the documents were written
 /// (as Redis gives them, by its document ids); by key where they are
-/// numbered alike. An index that numbers none leaves them as they are.
+/// numbered alike, and for an index that numbers none (of vector fields
+/// only).
 fn rows_as_written(def: &crate::vector::IndexDef, rows: &mut Vec<Row>) {
-    if rows.len() < 2 || !def.gives_ids() {
+    if rows.len() < 2 {
+        return;
+    }
+    if !def.gives_ids() {
+        rows.sort_unstable_by(|a, b| row_key(a).cmp(row_key(b)));
         return;
     }
     // Each row's number, and its place: sorted, then the rows moved there.
@@ -840,30 +845,42 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             }
         })
         .collect();
+    // From postings, if they narrow the filter (see `search::plan`); else
+    // every document is read.
+    let plan = crate::commands::search::plan(ctx, &def, &filter, None, now);
+    // A GROUPBY that takes the documents as they are read needs each one's
+    // number (its groups come out in the order of their first documents
+    // written): an index that numbers its documents. Reading every document
+    // (no postings to plan from) meets them in no order, which only a
+    // GROUPBY whose groups add up the same in any order takes.
     let mut stream = if knn.is_none()
         && !addscores
         && !json
+        && def.gives_ids()
         && !crate::cluster::search::is_forwarded(ctx)
         && !crate::cluster::search::coordinates(ctx)
     {
         crate::commands::aggregate_pipeline::StreamGroups::plan(cmd, 3)
             .map(|stream| stream.with_numeric(&numeric))
+            .filter(|stream| plan.is_some() || stream.order_free())
     } else {
         None
     };
     // Rows the steps read in their order: in the order their documents were
-    // written. Rows that go into a GROUPBY of running values only (`COUNT`,
-    // `SUM`, `MIN`, …), which no order changes, are read in any (by id),
-    // whether it groups them as they are read or not.
-    let in_order =
-        knn.is_some() || !crate::commands::aggregate_pipeline::StreamGroups::order_free(cmd, 3);
+    // written. A GROUPBY that groups them as they are read, of values that
+    // add up the same in any order (`COUNT`, `MIN`, `MAX`,
+    // `COUNT_DISTINCT`), reads them in any (by id): its groups come out in
+    // the order of their first documents written all the same.
+    let in_order = !stream.as_ref().is_some_and(|stream| stream.order_free());
+    let numbered = stream.is_some();
     let mut add_row = |key: &str,
+                       number: u64,
                        inner: &crate::vector::Fields,
                        json_doc: Option<&crate::json_tree::Value>| {
         if let Some(stream) = stream.as_mut() {
             // What the row would hold: each field that is text, and the
             // key as `__key` unless the hash has a field of that name.
-            stream.add(|name| {
+            stream.add(number, |name| {
                 match inner
                     .get_bytes(name)
                     .and_then(|v| std::str::from_utf8(v).ok())
@@ -935,10 +952,10 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
         rows.push(row);
     };
-    // From postings, if they narrow the filter (see `search::plan`); else
-    // every document, the deadline kept between runs of them (`scan_docs`).
+    // From postings, if they narrow the filter; else every document, the
+    // deadline kept between runs of them (`scan_docs`).
     let mut scanned = false;
-    let timed_out_scan = match crate::commands::search::plan(ctx, &def, &filter, None, now) {
+    let timed_out_scan = match plan {
         Some(plan) => {
             let mut seen = 0u32;
             // Each document tried against the filter where the ids are not
@@ -946,7 +963,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             // the order they were written, as Redis gives its rows.
             let (keys, exact, mut cut) =
                 crate::commands::search::plan_keys_for(&def, &plan, in_order, deadline);
-            for key in keys {
+            for (key, number) in keys {
                 if crate::commands::search::deadline_due(deadline, &mut seen) {
                     cut = true;
                     break;
@@ -956,7 +973,7 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 }
                 crate::commands::search::with_doc(db_ref, &def, &key, now, |inner, json| {
                     if exact || crate::vector::filter::eval(&filter, inner) {
-                        add_row(&key, inner, json);
+                        add_row(&key, number, inner, json);
                     }
                 });
             }
@@ -979,7 +996,14 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 // strings.
                 if crate::vector::filter::eval(&filter, &*inner) {
                     let json = inner.json();
-                    add_row(key, &inner, json);
+                    // A GROUPBY's groups go by their first documents' numbers.
+                    let number = if numbered {
+                        let p = def.postings.peek();
+                        p.id(key).map_or(u64::MAX, |id| p.written(id))
+                    } else {
+                        0
+                    };
+                    add_row(key, number, &inner, json);
                 }
             })
         }

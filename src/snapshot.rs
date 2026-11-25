@@ -1209,7 +1209,11 @@ fn write_kdb_order_section(
     w: &mut impl Write,
     index_store: Option<&crate::vector::IndexStore>,
 ) -> io::Result<()> {
-    OrderCapture::take(index_store).write(w)
+    let mut held = crate::memory_use::NotCounted::default();
+    let written = OrderCapture::take(index_store).write(w, &mut held);
+    let bytes = held.bytes();
+    held.release(bytes);
+    written
 }
 
 /// What the document order section is made of, as [`OrderCapture::take`]
@@ -1225,12 +1229,14 @@ struct OrderCapture {
 const KEYS_A_PART: usize = 1 << 14;
 
 /// One index's part of an [`OrderCapture`]: its name, each id's number, the
-/// ids in use, and its postings, which the keys are read from after.
+/// ids in use, its postings, which the keys are read from after, and the
+/// keys of the documents that left since (`Postings::order_capture`).
 type IndexOrder = (
     String,
     Vec<u64>,
     crate::vector::postings::Bits,
     crate::vector::postings::SharedPostings,
+    crate::vector::postings::CaptureLog,
 );
 
 impl OrderCapture {
@@ -1248,16 +1254,18 @@ impl OrderCapture {
             if crate::vector::is_alias(name, def) || !def.gives_ids() {
                 continue;
             }
-            let postings = def.postings.read();
+            let mut postings = def.postings.write();
             if postings.is_empty() || postings.walking() {
                 continue;
             }
-            let (written, live) = postings.order_capture();
+            let (written, live, left) = postings.order_capture();
+            drop(postings);
             capture.indexes.push((
                 def.name.clone(),
                 written,
                 live,
                 std::sync::Arc::clone(&def.postings),
+                left,
             ));
         }
         capture
@@ -1267,39 +1275,61 @@ impl OrderCapture {
     fn bytes(&self) -> usize {
         self.indexes
             .iter()
-            .map(|(_, written, live, _)| written.capacity() * 8 + live.bytes())
+            .map(|(_, written, live, _, _)| written.capacity() * 8 + live.bytes())
             .sum()
     }
 
-    /// The section: each index's documents, first written first (by key
-    /// where they share a number).
-    fn write(mut self, w: &mut impl Write) -> io::Result<()> {
+    /// The section: each index's documents as the capture found them, first
+    /// written first (by key where they share a number). What it lays out
+    /// is counted in `held` while it is, and let go of after each index.
+    fn write(
+        mut self,
+        w: &mut impl Write,
+        held: &mut crate::memory_use::NotCounted,
+    ) -> io::Result<()> {
         if self.indexes.is_empty() {
             return Ok(());
         }
         self.indexes.sort_by(|a, b| a.0.cmp(&b.0));
         w.write_all(KDB_ORDER_MAGIC)?;
         w.write_all(&(self.indexes.len() as u32).to_le_bytes())?;
-        for (name, written, live, postings) in self.indexes {
+        for (name, written, live, postings, left) in self.indexes {
             // The keys, read from the postings a part at a time: writes go
-            // on meanwhile, and wait for no more than one part. An id that
-            // left since the capture is passed over.
-            let ids: Vec<u32> = live.iter().collect();
-            let mut keyed: Vec<(u64, std::sync::Arc<str>)> = Vec::with_capacity(ids.len());
-            for part in ids.chunks(KEYS_A_PART) {
+            // on meanwhile, and wait for no more than one part. A document
+            // that left since the capture goes by the key it had (`left`),
+            // whatever its id is given to.
+            let mut keyed: Vec<(u64, std::sync::Arc<str>)> = Vec::with_capacity(live.count());
+            let laid_out = keyed.capacity() * std::mem::size_of::<(u64, std::sync::Arc<str>)>();
+            held.add(laid_out);
+            let number = |id: u32| written.get(id as usize).copied().unwrap_or(u64::MAX);
+            let mut ids = live.iter().peekable();
+            while ids.peek().is_some() {
                 let p = postings.peek();
-                keyed.extend(part.iter().filter_map(|&id| {
-                    let number = written.get(id as usize).copied().unwrap_or(u64::MAX);
-                    p.key(id).map(|key| (number, std::sync::Arc::clone(key)))
-                }));
+                let gone = left.lock();
+                for id in ids.by_ref().take(KEYS_A_PART) {
+                    let key = gone.get(&id).or_else(|| p.key(id));
+                    if let Some(key) = key {
+                        keyed.push((number(id), std::sync::Arc::clone(key)));
+                    }
+                }
             }
-            drop(ids);
+            // The keys of the documents that left are held here, not by the
+            // index: counted too.
+            let gone: usize = {
+                let gone = left.lock();
+                gone.len() * 48 + gone.values().map(|key| key.len()).sum::<usize>()
+            };
+            held.add(gone);
             keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            crate::aof::failpoint("snapshot-order-section");
             write_bytes(w, name.as_bytes())?;
             w.write_all(&(keyed.len() as u64).to_le_bytes())?;
-            for (_, key) in keyed {
+            for (_, key) in &keyed {
                 write_bytes(w, key.as_bytes())?;
             }
+            drop(keyed);
+            drop(left);
+            held.release(laid_out + gone);
         }
         Ok(())
     }
@@ -6601,7 +6631,7 @@ impl FrozenDataset {
         out.write_all(&self.score_section)?;
         out.write_all(&self.nofreqs_section)?;
         let held = self.order_section.bytes();
-        std::mem::take(&mut self.order_section).write(out)?;
+        std::mem::take(&mut self.order_section).write(out, &mut self.not_counted)?;
         self.not_counted.release(held);
         Ok(())
     }

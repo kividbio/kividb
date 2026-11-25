@@ -1774,6 +1774,92 @@ fn what_a_capture_lays_out_is_not_counted_as_it_is_made() {
     assert_eq!(c.cmd(&["LLEN", "big"]).i(), 300_000);
 }
 
+/// The document order section of a snapshot (an index's documents' keys,
+/// first written first) is laid out after the capture, as it is written:
+/// what it holds, the numbers and ids copied at the capture and the list
+/// of keys it sorts, is counted as not to be evicted for while it is, and
+/// given back once it is written (`snapshot-order-section` holds the save
+/// with the list made).
+#[test]
+fn the_document_order_a_save_lays_out_is_not_counted() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let server = Server::start_in_env(
+        dir,
+        &[],
+        &[("KIVIDB_TEST_FAILPOINTS", "snapshot-order-section")],
+    );
+    let mut c = server.conn();
+    c.cmd(&[
+        "FT.CREATE",
+        "ix",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "d:",
+        "SCHEMA",
+        "t",
+        "NUMERIC",
+        "SORTABLE",
+    ]);
+    const DOCS: i64 = 200_000;
+    for batch in 0..DOCS / 1000 {
+        let mut buf = Vec::new();
+        for i in 0..1000 {
+            let key = format!("d:{}", batch * 1000 + i);
+            buf.extend_from_slice(
+                format!(
+                    "*4\r\n$4\r\nHSET\r\n${}\r\n{key}\r\n$1\r\nt\r\n$1\r\n5\r\n",
+                    key.len()
+                )
+                .as_bytes(),
+            );
+        }
+        c.writer.write_all(&buf).unwrap();
+        for _ in 0..1000 {
+            c.read();
+        }
+    }
+    assert_eq!(c.not_counted(), 0);
+    let before = c.used_memory() - c.not_counted();
+
+    assert_eq!(c.cmd(&["BGSAVE"]).s(), "Background saving started");
+    let held = server.dir.join("failpoint.snapshot-order-section.1");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !held.exists() {
+        assert!(Instant::now() < deadline, "no save reached {held:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Deleted meanwhile: the save keeps their keys, and counts them.
+    for i in 0..1000 {
+        c.cmd(&["DEL", &format!("d:{i}")]);
+    }
+    let used = c.used_memory();
+    let not_counted = c.not_counted();
+    // At least the sorted list: a number and a key's pointer a document.
+    assert!(
+        not_counted >= DOCS * 24,
+        "{not_counted} bytes not counted while the order section is written"
+    );
+    assert!(
+        used - not_counted < before + 2 * MB,
+        "counted {} bytes while the order section is written, {before} before",
+        used - not_counted
+    );
+    std::fs::remove_file(held).unwrap();
+    c.wait_for("persistence", "rdb_bgsave_in_progress", "0");
+    assert_eq!(c.info("persistence", "rdb_last_bgsave_status"), "ok");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while c.not_counted() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "{} bytes are still not counted",
+            c.not_counted()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The sorted sets of `feeds` of 800 members each (Mastodon's home feeds,
 /// #825).
 fn load_feeds(c: &mut Conn, feeds: std::ops::Range<usize>) {

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 // tests/search_tie_order.rs
 //
 // Documents a query finds level come in the order they were written, as in
@@ -1117,5 +1118,190 @@ fn a_snapshot_of_1_2_2_loads_its_documents_in_key_order() {
         tied(&mut c, "ix", &["SORTBY", "t", "ASC", "LIMIT", "0", "6"]),
         then
     );
+    server.stop();
+}
+
+/// Groups come in the order of their first documents written, whether the
+/// GROUPBY reads the documents in any order (`COUNT`, `MIN`, `MAX`,
+/// `COUNT_DISTINCT`) or in the order they were written (`SUM`, after an
+/// `APPLY`). Ids given back and given out again put the documents in
+/// another order by id.
+#[test]
+fn groups_come_in_the_order_of_their_first_documents_written() {
+    let server = server();
+    let mut c = server.conn();
+    c.ok(&[
+        "FT.CREATE",
+        "ix",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "ga:",
+        "SCHEMA",
+        "p",
+        "TAG",
+        "g",
+        "TAG",
+        "x",
+        "NUMERIC",
+    ]);
+    for (i, g) in ["b", "a", "c", "a", "b", "c"].iter().enumerate() {
+        c.ok(&[
+            "HSET",
+            &key("ga:", i),
+            "i",
+            &i.to_string(),
+            "p",
+            "pp",
+            "g",
+            g,
+            "x",
+            "1",
+        ]);
+    }
+    c.ok(&["DEL", &key("ga:", 0), &key("ga:", 1)]);
+    // Given the ids 0 and 1 back, first by id, last written.
+    c.ok(&[
+        "HSET",
+        &key("ga:", 6),
+        "i",
+        "6",
+        "p",
+        "pp",
+        "g",
+        "z",
+        "x",
+        "1",
+    ]);
+    c.ok(&[
+        "HSET",
+        &key("ga:", 7),
+        "i",
+        "7",
+        "p",
+        "pp",
+        "g",
+        "a",
+        "x",
+        "1",
+    ]);
+    let groups = |c: &mut Conn, tail: &[&str]| -> Vec<String> {
+        let mut args = vec!["FT.AGGREGATE", "ix", "@p:{pp}"];
+        args.extend_from_slice(tail);
+        args.extend_from_slice(&["DIALECT", "2"]);
+        let reply = c.ok(&args);
+        reply.arr()[1..]
+            .iter()
+            .map(|row| field(row.arr(), "g"))
+            .collect()
+    };
+    let written = ["c", "a", "b", "z"];
+    for tail in [
+        &["GROUPBY", "1", "@g", "REDUCE", "COUNT", "0", "AS", "n"][..],
+        &["GROUPBY", "1", "@g", "REDUCE", "MAX", "1", "@x", "AS", "m"][..],
+        &[
+            "GROUPBY",
+            "1",
+            "@g",
+            "REDUCE",
+            "COUNT_DISTINCT",
+            "1",
+            "@x",
+            "AS",
+            "d",
+        ][..],
+        &["GROUPBY", "1", "@g", "REDUCE", "SUM", "1", "@x", "AS", "s"][..],
+        &[
+            "APPLY", "@x*2", "AS", "y", "GROUPBY", "1", "@g", "REDUCE", "COUNT", "0", "AS", "n",
+        ][..],
+    ] {
+        assert_eq!(groups(&mut c, tail), written, "{tail:?}");
+        let mut limited = tail.to_vec();
+        limited.extend_from_slice(&["LIMIT", "0", "2"]);
+        assert_eq!(groups(&mut c, &limited), written[..2], "{limited:?}");
+    }
+    // A SORTBY after: level groups keep that order.
+    let sorted = groups(
+        &mut c,
+        &[
+            "GROUPBY", "1", "@g", "REDUCE", "COUNT", "0", "AS", "n", "SORTBY", "2", "@n", "ASC",
+        ],
+    );
+    assert_eq!(sorted, ["b", "z", "c", "a"]);
+    server.stop();
+}
+
+/// An index of vector fields only numbers no documents: its rows go by key.
+#[test]
+fn rows_of_an_index_of_vectors_only_go_by_key() {
+    let server = server();
+    let mut c = server.conn();
+    c.ok(&[
+        "FT.CREATE",
+        "vx",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "vo:",
+        "SCHEMA",
+        "v",
+        "VECTOR",
+        "FLAT",
+        "6",
+        "TYPE",
+        "FLOAT32",
+        "DIM",
+        "2",
+        "DISTANCE_METRIC",
+        "L2",
+    ]);
+    for i in 0..8 {
+        c.ok(&["HSET", &key("vo:", i), "i", &i.to_string(), "v", "AAAABBBB"]);
+    }
+    let mut by_key: Vec<(String, usize)> = (0..8).map(|i| (key("vo:", i), i)).collect();
+    by_key.sort();
+    let want: Vec<String> = by_key.into_iter().map(|(_, i)| i.to_string()).collect();
+    for _ in 0..3 {
+        let got = c.aggregate(&["vx", "*", "LOAD", "1", "@i"]);
+        assert_eq!(got, want);
+    }
+    server.stop();
+}
+
+/// A RENAME keeps its document's place while other documents of the index
+/// leave at the same time, from other connections.
+#[test]
+fn a_rename_keeps_its_place_beside_deletes() {
+    let server = server();
+    let mut c = server.conn();
+    index_with(&mut c, "ix", "rd:", 8);
+    for i in 0..2000 {
+        c.ok(&["HSET", &format!("rd:other:{i}"), "p", "oo", "t", "5"]);
+    }
+    let port = server.port;
+    let deleters: Vec<_> = (0..4)
+        .map(|d| {
+            thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                for i in (d..2000).step_by(4) {
+                    c.ok(&["DEL", &format!("rd:other:{i}")]);
+                }
+            })
+        })
+        .collect();
+    for i in 0..8 {
+        if i % 2 == 1 {
+            let (from, to) = (key("rd:", i), format!("{}-renamed", key("rd:", i)));
+            c.ok(&["RENAME", &from, &to]);
+            c.ok(&["RENAME", &to, &from]);
+        }
+    }
+    for deleter in deleters {
+        deleter.join().unwrap();
+    }
+    let asc = tied(&mut c, "ix", &["SORTBY", "t", "ASC", "LIMIT", "0", "8"]);
+    assert_eq!(asc, numbers(0..8));
     server.stop();
 }

@@ -979,6 +979,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 });
             }
 
+            // The number src's document has in each index, for dst's to
+            // keep its place (`vector::renamed`).
+            crate::vector::renaming(ctx.index_store, db, &src);
             // Read + remove from src, with its time to live
             let (value, expiry) = {
                 let shard = store::get_shard(db_ref, &src);
@@ -1039,7 +1042,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             }
 
-            // Remove src, write dst
+            // Remove src, write dst; the number src's document has in each
+            // index goes to dst's (`vector::renamed`).
+            crate::vector::renaming(ctx.index_store, db, &src);
             {
                 let shard = store::get_shard(db_ref, &src);
                 write_lock!(shard).remove(src.as_slice());
