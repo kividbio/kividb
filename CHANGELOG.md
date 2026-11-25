@@ -835,8 +835,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   under a writer (regression suite 47, server on 2 CPUs): for 20,000 sorted
   sets of 800 members (a 480 MB dump), `Pss` grows by 12 MiB during the
   save (1.2.2: 461 MiB) and the slowest write meanwhile takes 358 ms (1.2.2:
-  384 ms); for 20,000 hashes of 800 fields (672 MB), 2.5 MiB (1.2.2: 642
-  MiB) and the slowest write 511 ms (1.2.2: 498 ms). The capture walks a
+  384 ms), on a Xeon Platinum 8370C; for 20,000 hashes of 800 fields (672
+  MB), 2.5 MiB (1.2.2: 642 MiB) and the slowest write 511 ms (1.2.2: 498
+  ms), on a Xeon Platinum 8473C (the same suite there gives the sorted sets
+  413.5 ms, 1.2.2: 448.8 ms: the two CPU models are not the same speed). The capture walks a
   hash or set kept as a table asking for its entries a few groups ahead
   of the one it reads, and writes a field name of ASCII bytes as it is.
   On a disk that does not keep up the buffers wait in memory, and the
@@ -1937,10 +1939,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     at 100,000, 108,645 / 9,291 and 254,912 / 6,949 at 1,000. On a set
     with several scores each member is compared with the bounds, in the
     set's order, as before: the replies are the same. Writes at 1,000,000
-    members: `ZADD` that moves a member 1.03x, `ZREM` 0.99x, `ZINCRBY`
-    0.91x, a new member in order 0.92x, at random 1.01x, `ZREM` + `ZADD`
-    with every score equal 0.89x; at 1,000 members `ZADD` that moves a
-    member 1.06x and `ZINCRBY` 1.03x (the tree's walks; a set of up to 128
+    members, the instructions a command takes now against master before
+    this change (lower is fewer): `ZADD` that moves a member 1.03x, `ZREM`
+    0.99x, `ZINCRBY` 0.91x, a new member in order 0.92x, at random 1.01x,
+    `ZREM` + `ZADD` with every score equal 0.89x; at 1,000 members `ZADD`
+    that moves a member 1.06x and `ZINCRBY` 1.03x (the tree's walks; a set of up to 128
     members is a block and has no tree). `ZSCORE`, `ZRANDMEMBER`,
     `ZPOPMIN` within 1 %, `GEOSEARCH` 1.00-1.01x. `GET`/`SET` as before
     (within 4 instructions a command).

@@ -938,7 +938,13 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     crate::tracking::register_for(&store, &tracking_table, &client_registry, &acl_store);
 
     log_info!("Shards per DB  : {}", store::num_shards());
-    log_info!("I/O model      : io_uring");
+    if server_uring::coop_taskrun() {
+        log_info!(
+            "I/O model      : io_uring (completions taken at the worker's next system call)"
+        );
+    } else {
+        log_info!("I/O model      : io_uring");
+    }
 
     // Local recovery runs on replicas too. A full resync loads into a staging
     // store and swaps it in, so there is nothing to merge with; and a replica

@@ -32,6 +32,14 @@ pub(crate) struct KeysFound {
     pub(crate) past: Vec<store::Key>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Called by the walk, with the shard held, just before it looks whether
+    /// a writer waits for the shard (tests).
+    static BEFORE_LOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The keys of one shard that match `glob`, added to `found`: `KEYS`'s walk.
 ///
 /// The shard is gone through [`KEYS_PART`] buckets at a time. Between two
@@ -46,7 +54,9 @@ pub(crate) struct KeysFound {
 /// place, shrinks or takes a step of a growth, and each of those changes
 /// `ShardMap::layout`: found changed once the lock is back, the shard is
 /// gone through again from its start, what it had found taken back (after
-/// two such tries, in one hold). Otherwise a key there, unchanged, the whole
+/// two such tries, in one hold). While a table grows, every write changes the
+/// layout, so the walk starts that shard again, and after two retries holds
+/// it for one pass. Otherwise a key there, unchanged, the whole
 /// time is found once, in its bucket. A key deleted and written again
 /// while the lock was let go of can come back in a bucket not yet gone
 /// through, so a shard whose walk let go of the lock is listed with each
@@ -90,6 +100,12 @@ pub(crate) fn keys_of_shard(
             if at >= layout.0 {
                 break;
             }
+            #[cfg(test)]
+            BEFORE_LOOK.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook();
+                }
+            });
             if always_let_go || shard.try_read().is_none() {
                 drop(map);
                 between();
@@ -2298,33 +2314,56 @@ mod keys_walk_tests {
     }
 
     /// A writer that comes while the walk holds the shard gets it between
-    /// two parts: if it wrote before the walk ended, the walk let go.
+    /// two parts. The walk is held between the first two parts, with the
+    /// shard, until the writer waits for it: then it lets go, and the writer
+    /// writes before the walk ends.
     #[test]
     fn a_waiting_writer_gets_the_shard_between_parts() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
         let shard = shard_of((0..200_000).map(|i| format!("k{i}")));
-        let walking = std::sync::atomic::AtomicBool::new(false);
+        let walking = Arc::new(AtomicBool::new(false));
+        let wrote = Arc::new(AtomicBool::new(false));
+        let (held, flag) = (Arc::clone(&shard), Arc::clone(&walking));
+        let mut first = true;
+        BEFORE_LOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if !std::mem::take(&mut first) {
+                    return;
+                }
+                flag.store(true, SeqCst);
+                // A reader is refused once a writer waits.
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while held.try_read().is_some() {
+                    assert!(std::time::Instant::now() < until, "the writer never waited");
+                    std::thread::yield_now();
+                }
+            }));
+        });
         let mut let_go = 0;
         let mut found = KeysFound::default();
-        let (wrote_at, walked_at) = std::thread::scope(|s| {
+        std::thread::scope(|s| {
             let writer = s.spawn(|| {
-                while !walking.load(std::sync::atomic::Ordering::SeqCst) {
+                while !walking.load(SeqCst) {
                     std::hint::spin_loop();
                 }
-                // The walk of 200,000 keys has the shard by then.
-                std::thread::sleep(std::time::Duration::from_millis(5));
                 let _ = shard.write().set_str("late", "x");
-                std::time::Instant::now()
+                wrote.store(true, SeqCst);
             });
-            walking.store(true, std::sync::atomic::Ordering::SeqCst);
             keys_of_shard(&shard, &Glob::new(b"k*"), &mut found, false, &mut || {
-                let_go += 1
+                let_go += 1;
+                // With no lock held: the writer, which was waiting, has the
+                // shard and writes before the walk goes on.
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !wrote.load(SeqCst) {
+                    assert!(std::time::Instant::now() < until, "the writer was not served");
+                    std::thread::yield_now();
+                }
             });
-            let walked_at = std::time::Instant::now();
-            (writer.join().unwrap(), walked_at)
+            writer.join().unwrap();
         });
-        if wrote_at < walked_at {
-            assert!(let_go > 0);
-        }
+        BEFORE_LOOK.with(|hook| *hook.borrow_mut() = None);
+        assert!(let_go > 0);
+        assert!(shard.read().contains_key("late"));
         let keys = listed(&found);
         assert!(keys.values().all(|&n| n == 1));
         assert!((0..200_000).all(|i| keys.contains_key(&format!("k{i}"))));
