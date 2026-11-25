@@ -155,6 +155,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Redis Sentinel, tested (`scripts/sentinel/run.sh`, the Sentinel
+  workflow).** Three KiviDB nodes run under three Redis 8.10.3 Sentinels,
+  each with a password. The master is killed (with each of redis-py,
+  ioredis and Lettuce), failed over with `SENTINEL FAILOVER`, and paused
+  until a replica is promoted. Each time a replica takes over, the client
+  goes on writing to it, the old master comes back as its replica, and the
+  config files name the new master. The workflow runs on each release and
+  by hand, never on pull requests. `docs/SENTINEL.md` covers setting it up.
+
 - **Cluster: a master refuses its vote for slots that came to the
   candidate's master after the claim the candidate read.** A replica claims
   its master's slots, when it stands for election (automatic, or `CLUSTER
@@ -2370,6 +2379,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   move (callgrind, 0.1%).
 
 ### Fixed
+
+- **`CONFIG REWRITE` writes every setting the server runs with, and no
+  `replicaof` after `REPLICAOF NO ONE`.** It writes each setting
+  `CONFIG GET` lists, `dir`, `io-model`, `replica-announced-port`,
+  `preload-file`, the TLS settings, `maxclients`, `hz`, `rdbcompression`
+  and the search, stream and probabilistic settings among them, except the
+  ones `config::NOT_REWRITTEN` gives a reason for (older names, and file
+  names that cannot change); a setting KiviDB keeps without acting on only
+  when it is not at its default; and the certificate and key lines only
+  where they are set, so a build without TLS reads its own file back. A
+  server restarted from the file opens the same data directory, serves
+  TLS as it did and has the role it had: Redis Sentinel sends
+  `CONFIG REWRITE` after every `REPLICAOF` it gives.
 
 - **Vectors written at once into an empty HNSW index all link into its
   graph.** Inserts that find the graph empty take turns: the first is the

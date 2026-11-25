@@ -1,0 +1,51 @@
+name: Sentinel
+# Redis Sentinel managing KiviDB (scripts/sentinel/run.sh): three KiviDB nodes and three Sentinels,
+# each with a password. The master is killed (with each of redis-py, ioredis and Lettuce), failed
+# over with SENTINEL FAILOVER, and paused until a replica is promoted. Each time, the client goes on
+# writing to the new master, the old master comes back as a replica, and the config files agree.
+#
+# Actions minutes cost money, so: never on push or pull_request, as compat.yml. KiviDB comes from the
+# release's image (or the image given to a run by hand: the latest release by default), Sentinel from
+# a Redis image pinned by digest, and each client at the version its file in scripts/sentinel pins.
+
+on:
+  release:
+    types: [published] # release.yml publishes the release after its images are pushed
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "KiviDB image to test (default: docker.io/kividb/kividb at the latest release)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  sentinel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      REDIS_IMAGE: redis:8.10.3@sha256:1f88291b4c57bdf249f02eb085a8669889b2d2954e91d4de5118a5da6b78dd53
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick and pull the images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_IMAGE: ${{ inputs.image }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          image=$INPUT_IMAGE
+          if [ -z "$image" ]; then
+            tag=${RELEASE_TAG:-$(gh api repos/kividbio/kividb/releases/latest --jq .tag_name)}
+            image=docker.io/kividb/kividb:$tag
+          fi
+          echo "KIVIDB_IMAGE=$image" >> "$GITHUB_ENV"
+          docker pull -q "$image"
+          docker pull -q "$REDIS_IMAGE"
+
+      - name: Fail over under Sentinel, with each client
+        run: |
+          python3 --version; node --version; java -version 2>&1 | head -n 1; mvn -v | head -n 1
+          WORK=$RUNNER_TEMP/sentinel scripts/sentinel/run.sh
