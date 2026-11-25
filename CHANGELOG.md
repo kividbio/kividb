@@ -994,13 +994,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   other commands. Every key a command names is then locked, tagged or not,
   wherever it comes among them. Once no such script has run for a minute,
   or with `lua-parallel-scripts tags` or `no`, those locks are let go of
-  again, at a moment the command gate can be held alone for at most 2 ms;
+  again, at a moment the command gate can be held alone, tried for a few
+  milliseconds at a time;
   `INFO stats` says whether they are taken (`untagged_key_locks`), how often
   that was switched (`untagged_key_locks_on`, `untagged_key_locks_off`) and
   how often the switch off waited for a later moment
   (`untagged_key_locks_off_later`). Eviction and active expiry leave a key
   whose lock a script running beside others holds until it is done;
-  eviction never leaves a key because a client's command is at it. See "Scripts that keep to their keys" in
+  eviction never leaves a key because a client's command is at it. See
+  "Scripts that keep to their keys" in
   [docs/SCRIPTS.md](docs/SCRIPTS.md); regression suite 54 records
   yii2-redis's `Mutex` cycle.
 - **`lua-parallel-scripts` takes `yes`, `tags` or `no` (#1049).** `tags`

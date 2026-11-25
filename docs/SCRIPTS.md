@@ -432,13 +432,18 @@ minute, or once `lua-parallel-scripts` is set to `tags` or `no`, the locks
 are let go of again, at a moment the command gate can be held alone and no
 such script is running beside others: scripts on tagged keys running
 beside others do not hold that back. A thread looks for that moment every
-15 seconds; it tries for the gate for 2 ms at most, and does not try while
-clients are paused (`CLIENT PAUSE`) or a slot handoff holds writes, so it
-never holds commands back for longer than that. `INFO stats` says whether
-the locks are taken (`untagged_key_locks:1`), how many times they were
-switched on (`untagged_key_locks_on`) and off (`untagged_key_locks_off`),
-and how many times the switch off was left for later because the gate was
-busy (`untagged_key_locks_off_later`).
+15 seconds. It gives up on the gate after a few milliseconds (2 ms of
+trying, then at most the wait it is in and a last count of the gate's
+slots: under 5 ms in all), and does not try while clients are paused
+(`CLIENT PAUSE`) or a slot handoff holds writes, so it holds other commands
+back for no longer than that. After a switch from `yes` to `tags` or `no`
+made while such a script is running, the locks are let go of at that
+thread's next look, or at the next script that runs alone. `INFO stats`
+says whether the locks are taken (`untagged_key_locks:1`), how many times
+they were switched on (`untagged_key_locks_on`) and off
+(`untagged_key_locks_off`), and how many looks gave up on a busy gate
+(`untagged_key_locks_off_later`; a look left out for a pause is not
+counted).
 
 #### What `yes` costs other commands
 
