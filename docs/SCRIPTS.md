@@ -398,12 +398,18 @@ that run is alone, and it switches the locks on with every other command
 held back, so no command is between its look at whether to lock its keys
 and its end. From then on a command on a key without a tag takes that key's
 lock, as a command on a tagged key takes its tag's; until then it looks at
-the key for a `{` and makes one load more (13 to 16 instructions a command
+the key for a `{` and makes one load more (14 to 17 instructions a command
 in all, `GET` and `SET` of 100 B and 1 KB, measured with
 `LTO=fat EXEC=1 CMP=plain FEATURES=lua,tls scripts/perf/run.sh`). With the
 locks on, plain `GET`/`SET` from memtier (50 connections one command at a
 time, and 48 with pipelines of 16) ran at the same rate as with them off,
-within the 2 % the runs spread by. Switching `lua-parallel-scripts` off
+within the 2 % the runs spread by; a command naming several keys takes a
+lock for each: `MGET` of 10 random keys (redis-benchmark, 48 connections,
+pipelines of 16) ran at 777,000 a second against 955,000 with them off, of
+100 keys at the same rate.
+
+A client's command holds these locks shared, on a tagged key too: commands
+wait for a script on their keys, not for each other. Switching `lua-parallel-scripts` off
 switches those locks off too, until the next such script.
 
 While keys can be evicted (`maxmemory` set, with a policy other than
@@ -420,10 +426,10 @@ the servers in turn (median):
 
 | | ops/s | `EVAL` p50 / p99 (µs) | `SET` p50 / p99 (µs) |
 |---|---:|---:|---:|
-| this build | 299,300 | 102 / 251 | 97 / 244 |
-| the build before | 158,900 | 204 / 434 | 185 / 399 |
-| Redis 8.12 | 211,700 | 146 / 284 | 142 / 280 |
-| Valkey 8.1 | 235,600 | 128 / 282 | 131 / 283 |
+| this build | 286,200 | 106 / 279 | 100 / 269 |
+| the build before | 151,200 | 214 / 458 | 194 / 416 |
+| Redis 8.12 | 208,200 | 148 / 293 | 144 / 290 |
+| Valkey 8.1 | 232,000 | 130 / 296 | 132 / 297 |
 
 The build before ran each release alone, the other commands held back
 around it; its four worker threads were 70 % busy. This build runs them

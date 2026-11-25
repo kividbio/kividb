@@ -943,16 +943,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and Sidekiq's scripts are of that kind). From the first run of such a
   script, which is alone, a command on a key without a tag takes that key's
   lock, as a command on a tagged key takes its tag's; until then that
-  command makes one load more, and `GET` and `SET` cost 13 to 16
+  command makes one load more, and `GET` and `SET` cost 14 to 17
   instructions more than in the build before (`scripts/perf/run.sh`, fat
-  LTO). While keys can be evicted (`maxmemory` with an evicting policy) such
-  scripts run alone. yii2-redis's `Mutex` cycle (`SET NX PX`, then the
+  LTO). A client's command holds those locks, and a tag's, shared: it
+  waits for a script on its keys, not for other commands. While keys can be
+  evicted (`maxmemory` with an evicting policy) such scripts run alone. yii2-redis's `Mutex` cycle (`SET NX PX`, then the
   compare-and-delete release by `EVAL` with its text; 32 connections, each
   its own lock; the server on 4 vCPUs of an Azure `Standard_D8s_v5`,
   `--threads 4`, Redis 8.12 and Valkey 8.1 with `--io-threads 4`, the load
-  on the other 4; median of 3 runs): 299,300 ops/s with an `EVAL` p50/p99 of
-  102/251 µs, against 158,900 and 204/434 µs for the build before, Redis
-  211,700 and 146/284 µs, Valkey 235,600 and 128/282 µs. Regression suite
+  on the other 4; median of 3 runs): 286,200 ops/s with an `EVAL` p50/p99 of
+  106/279 µs, against 151,200 and 214/458 µs for the build before, Redis
+  208,200 and 148/293 µs, Valkey 232,000 and 130/296 µs. Regression suite
   54 records the cycle. See "Scripts that keep to their keys" in
   [docs/SCRIPTS.md](docs/SCRIPTS.md).
 - **Plain commands are answered between scripts that run alone (#880).** A quick script that runs alone (its key has no hash tag, or

@@ -35,9 +35,10 @@
 //   script is to its tags, each key standing for its own tag, and runs
 //   beside others under their locks — once keys without a tag are locked
 //   too. That starts with the first such script, run alone
-//   ([`lock_untagged_keys_for`]); until then a command looks at a key
-//   without a `{` for nothing more. Not while keys can be evicted
-//   (`maxmemory` with a policy that evicts): those run alone.
+//   ([`lock_untagged_keys_for`]); until then a command on a key without a
+//   `{` makes one load more. Not while keys can be evicted (`maxmemory`
+//   with a policy that evicts), nor for `EVAL_RO`/`EVALSHA_RO`: those run
+//   alone.
 // * A command from a client takes the lock of every tagged key it names, so
 //   it finds a script's keys as they were before the script or as they are
 //   after it, never between. Keys without a tag belong to no script and
@@ -77,7 +78,7 @@
 // waited for the tag, and a checkpoint, holding the read's slot already,
 // waited for theirs.
 
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -216,10 +217,53 @@ fn keys_only_script_may_run_beside(cmd: &[&[u8]]) -> bool {
 /// A power of two.
 const STRIPES: usize = 1024;
 
+/// Held whole by a script (and by active expiry), shared by a client's
+/// command: commands do not wait for each other here, only for a script on
+/// the stripe. What orders two commands on one key is the key's shard and
+/// its order (`write_order`), as for keys no script holds.
 #[repr(align(64))]
-struct Stripe(Mutex<()>);
+struct Stripe(RwLock<()>);
 
-static STRIPE: [Stripe; STRIPES] = [const { Stripe(parking_lot::const_mutex(())) }; STRIPES];
+static STRIPE: [Stripe; STRIPES] = [const { Stripe(parking_lot::const_rwlock(())) }; STRIPES];
+
+/// A stripe a client's command holds: shared ([`lock_found_keys`],
+/// [`try_lock_found_keys`]), or whole ([`lock_keys`]).
+enum StripeHold {
+    Shared(#[allow(dead_code)] RwLockReadGuard<'static, ()>),
+    Whole(#[allow(dead_code)] RwLockWriteGuard<'static, ()>),
+}
+
+impl StripeHold {
+    fn take(stripe: usize, shared: bool) -> Self {
+        let lock = &STRIPE[stripe].0;
+        if shared {
+            StripeHold::Shared(lock.read())
+        } else {
+            StripeHold::Whole(lock.write())
+        }
+    }
+
+    fn try_take(stripe: usize, shared: bool) -> Option<Self> {
+        let lock = &STRIPE[stripe].0;
+        if shared {
+            lock.try_read().map(StripeHold::Shared)
+        } else {
+            lock.try_write().map(StripeHold::Whole)
+        }
+    }
+
+    #[cfg(feature = "lua")]
+    fn try_take_for(stripe: usize, shared: bool, wait: Duration) -> Option<Self> {
+        let lock = &STRIPE[stripe].0;
+        if shared {
+            lock.try_read_for(wait).map(StripeHold::Shared)
+        } else {
+            lock.try_write_for(wait).map(StripeHold::Whole)
+        }
+    }
+}
+
+
 
 /// The hash tag of `key`: what is between the first `{` and the next `}`,
 /// if that is not empty. (As a cluster reads it, except that a key without
@@ -497,8 +541,8 @@ struct Held {
 /// several, taken lowest first.
 enum Stripes {
     None,
-    One { _held: MutexGuard<'static, ()> },
-    Several { _held: Vec<MutexGuard<'static, ()>> },
+    One { _held: RwLockWriteGuard<'static, ()> },
+    Several { _held: Vec<RwLockWriteGuard<'static, ()>> },
 }
 
 impl Drop for ScriptGuard {
@@ -557,13 +601,13 @@ pub fn lock_for_script(tags: &ScriptTags) -> ScriptGuard {
     let gate = crate::write_gate::enter();
     let stripes = match tags {
         ScriptTags::One(tag) | ScriptTags::Key(tag) => Stripes::One {
-            _held: STRIPE[stripe_of(tag)].0.lock(),
+            _held: STRIPE[stripe_of(tag)].0.write(),
         },
         ScriptTags::Several(_) | ScriptTags::Keys(_) => Stripes::Several {
             _held: tags
                 .stripes()
                 .into_iter()
-                .map(|stripe| STRIPE[stripe].0.lock())
+                .map(|stripe| STRIPE[stripe].0.write())
                 .collect(),
         },
     };
@@ -663,11 +707,12 @@ pub fn script_tags_for_message() -> String {
     })
 }
 
-/// Held by a command from a client: the lock of every tagged key it names,
-/// and the write gate, entered before them and let go of after them.
+/// Held by a command from a client: the lock of every tagged key it names
+/// (shared: see [`Stripe`]), and the write gate, entered before them and let
+/// go of after them.
 pub struct KeysGuard {
-    _one: Option<MutexGuard<'static, ()>>,
-    _more: Vec<MutexGuard<'static, ()>>,
+    _one: Option<StripeHold>,
+    _more: Vec<StripeHold>,
     _gate: crate::write_gate::WriteGuard,
 }
 
@@ -678,12 +723,17 @@ pub struct KeysGuard {
 /// past its time deletes it under the gate, and must not enter it with a
 /// tag held. A write holds the gate already, and this costs it a count.
 pub fn lock_keys<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Option<KeysGuard> {
-    lock_keys_as(keys, untagged_keys_locked())
+    lock_keys_as(keys, untagged_keys_locked(), false)
 }
 
 /// [`lock_keys`], told whether keys without a tag are locked
-/// ([`lock_name_as`]).
-fn lock_keys_as<'a>(keys: impl Iterator<Item = &'a [u8]>, untagged: bool) -> Option<KeysGuard> {
+/// ([`lock_name_as`]) and whether the stripes are held shared, as a
+/// client's command holds them.
+fn lock_keys_as<'a>(
+    keys: impl Iterator<Item = &'a [u8]>,
+    untagged: bool,
+    shared: bool,
+) -> Option<KeysGuard> {
     let mut first: Option<usize> = None;
     let mut more: Vec<usize> = Vec::new();
     for key in keys {
@@ -699,7 +749,7 @@ fn lock_keys_as<'a>(keys: impl Iterator<Item = &'a [u8]>, untagged: bool) -> Opt
     let gate = crate::write_gate::enter();
     if more.is_empty() {
         return Some(KeysGuard {
-            _one: Some(STRIPE[first].0.lock()),
+            _one: Some(StripeHold::take(first, shared)),
             _more: Vec::new(),
             _gate: gate,
         });
@@ -713,7 +763,7 @@ fn lock_keys_as<'a>(keys: impl Iterator<Item = &'a [u8]>, untagged: bool) -> Opt
         _one: None,
         _more: more
             .into_iter()
-            .map(|stripe| STRIPE[stripe].0.lock())
+            .map(|stripe| StripeHold::take(stripe, shared))
             .collect(),
         _gate: gate,
     })
@@ -929,7 +979,7 @@ pub fn lock_found_keys(keys: NamedKeys, cmd: &[&[u8]]) -> Option<KeysGuard> {
         },
         NamedKeys::Other(keys) => keys.iter(),
     };
-    lock_keys_as(at.map(|at| cmd[at]), command_locks_untagged_keys(cmd))
+    lock_keys_as(at.map(|at| cmd[at]), command_locks_untagged_keys(cmd), true)
 }
 
 /// The stripes of a client's command that a script holds, or has its turn
@@ -983,7 +1033,7 @@ pub fn try_lock_found_keys(
         };
         let stripe = stripe_of(tag);
         let gate = crate::write_gate::enter();
-        if let Some(held) = STRIPE[stripe].0.try_lock() {
+        if let Some(held) = StripeHold::try_take(stripe, true) {
             return Ok(Some(KeysGuard {
                 _one: Some(held),
                 _more: Vec::new(),
@@ -1017,7 +1067,7 @@ pub fn try_lock_found_keys(
     };
     let gate = crate::write_gate::enter();
     if more.is_empty()
-        && let Some(held) = STRIPE[first].0.try_lock()
+        && let Some(held) = StripeHold::try_take(first, true)
     {
         return Ok(Some(KeysGuard {
             _one: Some(held),
@@ -1046,7 +1096,7 @@ fn lock_unless_a_script_has_them(
     let mut held = Vec::with_capacity(stripes.len());
     for &stripe in &stripes {
         loop {
-            if let Some(guard) = STRIPE[stripe].0.try_lock_for(SPELL) {
+            if let Some(guard) = StripeHold::try_take_for(stripe, true, SPELL) {
                 held.push(guard);
                 break;
             }
@@ -1124,7 +1174,7 @@ impl TagTurns {
 /// What active expiry holds of the tags of a batch of keys: the locks it
 /// could take, and which it could not ([`try_lock_keys`]).
 pub struct TriedKeys {
-    _held: Vec<MutexGuard<'static, ()>>,
+    _held: Vec<RwLockWriteGuard<'static, ()>>,
     /// The stripes that were busy: their keys are left for another time.
     busy: Vec<usize>,
 }
@@ -1186,9 +1236,9 @@ pub fn try_lock_keys<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Option<TriedKe
             let missed = &misses[stripe];
             let lock = &STRIPE[stripe].0;
             let guard = if missed.get() >= PATIENT_AFTER {
-                lock.try_lock_for(PATIENCE)
+                lock.try_write_for(PATIENCE)
             } else {
-                lock.try_lock()
+                lock.try_write()
             };
             match guard {
                 Some(guard) => {
