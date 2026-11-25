@@ -1019,18 +1019,67 @@ pub fn script_tags_for_message() -> String {
 /// Held by a command from a client: the lock of every tagged key it names
 /// (and of each of its keys without a tag, once those are locked), and the
 /// write gate, entered before them and let go of after them.
+///
+/// What it holds is let go of out of line ([`Drop`]), as a [`ScriptGuard`]'s
+/// is: the guard is an `Option` in the way of every command
+/// (`handler::run_command`), and letting go of its locks has no business
+/// there.
 pub struct KeysGuard {
-    held: Ids,
+    held: std::mem::ManuallyDrop<KeysHeld>,
+}
+
+/// What a [`KeysGuard`] holds: its locks, let go of first, then the gate.
+struct KeysHeld {
+    locks: Locks,
     _gate: crate::write_gate::WriteGuard,
 }
 
-impl Drop for KeysGuard {
-    fn drop(&mut self) {
-        for &id in self.held.as_slice() {
-            // SAFETY: each taken once by whoever made this guard, and not
-            // let go of since.
-            unsafe { release(id as usize) }
+/// A command's locks: one, as nearly every command on a tagged key holds,
+/// or a list of them.
+enum Locks {
+    One(u16),
+    Many(Ids),
+}
+
+impl KeysGuard {
+    #[inline]
+    fn new(ids: Ids, gate: crate::write_gate::WriteGuard) -> Self {
+        KeysGuard {
+            held: std::mem::ManuallyDrop::new(KeysHeld {
+                locks: Locks::Many(ids),
+                _gate: gate,
+            }),
         }
+    }
+
+    #[cfg(feature = "lua")]
+    #[inline]
+    fn one(id: usize, gate: crate::write_gate::WriteGuard) -> Self {
+        KeysGuard {
+            held: std::mem::ManuallyDrop::new(KeysHeld {
+                locks: Locks::One(id as u16),
+                _gate: gate,
+            }),
+        }
+    }
+}
+
+impl Drop for KeysGuard {
+    #[inline(never)]
+    fn drop(&mut self) {
+        match &self.held.locks {
+            // SAFETY: taken once by whoever made this guard, and not let go
+            // of since; the same for each of a list.
+            Locks::One(id) => unsafe { release(*id as usize) },
+            Locks::Many(ids) => {
+                for &id in ids.as_slice() {
+                    // SAFETY: as above.
+                    unsafe { release(id as usize) }
+                }
+            }
+        }
+        // SAFETY: dropped here once; the field is not used again.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.held) }
     }
 }
 
@@ -1063,10 +1112,7 @@ fn lock_keys_as<'a>(keys: impl Iterator<Item = &'a [u8]>, untagged: bool) -> Opt
     for &id in ids.as_slice() {
         take(id as usize);
     }
-    Some(KeysGuard {
-        held: ids,
-        _gate: gate,
-    })
+    Some(KeysGuard::new(ids, gate))
 }
 
 /// Whether `key` may carry a hash tag: whether it has a `{` at all. One
@@ -1336,24 +1382,24 @@ pub fn try_lock_found_keys(
     cmd: &[&[u8]],
     mine: &[usize],
 ) -> Result<Option<KeysGuard>, TagsBusy> {
-    let untagged = command_locks_untagged_keys(cmd);
     // One key, as most commands on a tagged key name (`GET {t}:k`): the
     // same steps as below for one stripe, without the walk over positions.
     if let NamedKeys::Regular { from, last, .. } = keys
         && from == last
     {
-        let Some(id) = lock_id(cmd[from], untagged) else {
-            return Ok(None);
+        let key = cmd[from];
+        let id = match tag_of(key) {
+            Some(tag) => stripe_of(tag),
+            None if command_locks_untagged_keys(cmd) => STRIPES + stripe_of(key),
+            None => return Ok(None),
         };
         let gate = crate::write_gate::enter();
         if try_take(id) {
-            return Ok(Some(KeysGuard {
-                held: Ids::one(id),
-                _gate: gate,
-            }));
+            return Ok(Some(KeysGuard::one(id, gate)));
         }
         return lock_unless_a_script_has_them(Ids::one(id), gate, mine);
     }
+    let untagged = command_locks_untagged_keys(cmd);
     let at = match &keys {
         NamedKeys::Regular { from, last, step } => crate::keyspec::KeyIter::Range {
             next: *from,
@@ -1375,10 +1421,7 @@ pub fn try_lock_found_keys(
     if let [id] = ids.as_slice()
         && try_take(*id as usize)
     {
-        return Ok(Some(KeysGuard {
-            held: ids,
-            _gate: gate,
-        }));
+        return Ok(Some(KeysGuard::new(ids, gate)));
     }
     ids.sorted();
     lock_unless_a_script_has_them(ids, gate, mine)
@@ -1423,10 +1466,7 @@ fn lock_unless_a_script_has_them(
             }
         }
     }
-    Ok(Some(KeysGuard {
-        held: ids,
-        _gate: gate,
-    }))
+    Ok(Some(KeysGuard::new(ids, gate)))
 }
 
 /// Whether a script holds lock `id`'s turn ([`script_turn`]), or a command

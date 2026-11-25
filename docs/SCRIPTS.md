@@ -392,29 +392,27 @@ runs, before it starts, never part-way through.
 Such a script's keys are locked as tags are: each key stands for its own
 tag. A command from a client on one of them waits for the script, as a
 command on a script's tag does, and a script of the same key waits for it.
+These locks are taken shared by everything but such a script: commands,
+active expiry and eviction wait for a script on the key, not for each
+other. Eviction and active expiry leave a key a script holds until the
+script is done.
+
 So that a command on a key without a tag finds it locked when it needs to,
-commands lock keys without a tag too from the first run of such a script on:
-that run is alone, and it switches the locks on with every other command
-held back, so no command is between its look at whether to lock its keys
-and its end. From then on a command on a key without a tag takes that key's
-lock, as a command on a tagged key takes its tag's; until then it looks at
-the key for a `{` and makes one load more (14 to 17 instructions a command
-in all, `GET` and `SET` of 100 B and 1 KB, measured with
-`LTO=fat EXEC=1 CMP=plain FEATURES=lua,tls scripts/perf/run.sh`). With the
-locks on, plain `GET`/`SET` from memtier (50 connections one command at a
-time, and 48 with pipelines of 16) ran at the same rate as with them off,
-within the 2 % the runs spread by; a command naming several keys takes a
-lock for each: `MGET` of 10 random keys (redis-benchmark, 48 connections,
-pipelines of 16) ran at 777,000 a second against 955,000 with them off, of
-100 keys at the same rate.
+commands lock keys without a tag too from the first run of such a script on.
+That run is alone, and it switches the locks on with every other command
+held back; a command asks whether to lock its keys only once it is in the
+command gate, so every command after the switch finds it made. Until then a
+command on a key without a tag makes one load more. Once no such script has
+run for a minute, or once `lua-parallel-scripts` is switched off, the next
+moment the gate is held alone and no script is running beside others, the
+locks are let go of again; `INFO stats` says whether they are taken
+(`untagged_key_locks:1`) and how many times they were switched on
+(`untagged_key_locks_on`) and off (`untagged_key_locks_off`).
 
-A client's command holds these locks shared, on a tagged key too: commands
-wait for a script on their keys, not for each other. Switching `lua-parallel-scripts` off
-switches those locks off too, until the next such script.
-
-While keys can be evicted (`maxmemory` set, with a policy other than
-`noeviction`), such scripts run alone, as other scripts with a key without a
-tag do: making room evicts keys from inside a write, a script's included.
+In a build with Lua a command takes the lock of each tagged key it names
+whatever `lua-parallel-scripts` says. The setting decides whether a script
+may run beside others; a script that started by the setting before a
+`CONFIG SET` finds the tags it holds locked all the same.
 
 Measured on an Azure `Standard_D8s_v5` (Intel Xeon Platinum 8370C; the
 server pinned to 4 vCPUs with `taskset`, `--threads 4`; Redis 8.12 and
@@ -474,7 +472,7 @@ that a server running its scripts one at a time shows it without
 | `scripts_run_alone_in_transaction` | ran alone inside `MULTI`/`EXEC` |
 | `scripts_run_alone_function` | ran alone because it is a function |
 | `scripts_run_alone_no_keys` | ran alone because it has no `KEYS` |
-| `scripts_run_alone_no_tag` | ran alone because a key of its `KEYS` has no hash tag, and it is not a script that keeps to its keys (or keys can be evicted; or it is the run that switches on the locks of keys without a tag) |
+| `scripts_run_alone_no_tag` | ran alone because a key of its `KEYS` has no hash tag, and it is not a script that keeps to its keys (or it is the run that switches on the locks of keys without a tag) |
 | `scripts_run_alone_not_quick` | ran alone because it has not (or not yet) been seen to be quick |
 | `scripts_handed_to_runner` | (alone, and quick) came while another script was running, and was run by the thread running that one, or by the script-runner thread |
 | `scripts_offloaded_to_pool` | (not yet seen to be quick, or seen to be slow) was run on a thread of the blocking pool |
