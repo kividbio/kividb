@@ -11540,7 +11540,9 @@ fn a_replica_stopped_while_its_masters_own_slots_leave_and_come_back_is_elected_
     replica_stopped_while_slots_leave_and_come_back(
         Moved::Own,
         Voters::Checking,
-        Standing::Elected, Away::Stopped);
+        Standing::Elected,
+        Away::Stopped,
+    );
 }
 
 /// The replica is stopped rather than cut off: a cut's claims, queued meanwhile, would
@@ -11552,7 +11554,9 @@ fn a_voter_restarted_with_its_came_at_file_refuses_slots_that_came_after_the_cla
     replica_stopped_while_slots_leave_and_come_back(
         Moved::Imported,
         Voters::SourceSkipsThirdRestarted,
-        Standing::Elected, Away::Stopped);
+        Standing::Elected,
+        Away::Stopped,
+    );
 }
 
 /// The replica is stopped rather than cut off: a cut's claims, queued meanwhile, would
@@ -11564,7 +11568,9 @@ fn a_voter_restarted_without_its_came_at_file_refuses_a_claim_older_than_the_own
     replica_stopped_while_slots_leave_and_come_back(
         Moved::Imported,
         Voters::SourceSkipsThirdRestartedWithoutFile,
-        Standing::Elected, Away::Stopped);
+        Standing::Elected,
+        Away::Stopped,
+    );
 }
 
 /// The replica is stopped rather than cut off: a cut's claims, queued meanwhile, would
@@ -11576,7 +11582,9 @@ fn a_voter_that_does_not_check_when_slots_came_is_outvoted_by_one_that_does() {
     replica_stopped_while_slots_leave_and_come_back(
         Moved::Imported,
         Voters::SourceSkips,
-        Standing::Elected, Away::Stopped);
+        Standing::Elected,
+        Away::Stopped,
+    );
 }
 
 /// The replica is stopped rather than cut off: a cut's claims, queued meanwhile, would
@@ -11588,7 +11596,9 @@ fn a_forced_failover_is_refused_slots_that_came_after_the_claim() {
     replica_stopped_while_slots_leave_and_come_back(
         Moved::Imported,
         Voters::Checking,
-        Standing::Force, Away::Stopped);
+        Standing::Force,
+        Away::Stopped,
+    );
 }
 
 /// The other half of a voter restarted without its `.came-at`: it takes
