@@ -9,6 +9,7 @@
 !scripts/key_utf8_allowlist.txt
 !benchmarks/**/requirements.txt
 !benchmarks/*-compat/kividb-passes.txt
+!scripts/sentinel/requirements.txt
 ./*.py
 *.kdb
 # Test fixtures are committed.

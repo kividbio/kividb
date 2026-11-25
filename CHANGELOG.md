@@ -146,6 +146,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Redis Sentinel, tested (`scripts/sentinel/run.sh`, the Sentinel
+  workflow).** Three KiviDB nodes run under three Redis 8.10.3 Sentinels.
+  For each of redis-py, ioredis and Lettuce, the master is killed, a
+  replica is promoted, the client goes on writing to the new master, and
+  the old master comes back as its replica. The workflow runs on each
+  release and by hand, never on pull requests. `docs/SENTINEL.md` covers
+  setting it up.
+
 - **`search-resp3-reply`: the shape of the search commands' RESP3 replies (#1021).**
   `auto` (the default) answers `FT.SEARCH`, `FT.AGGREGATE` (and its cursor), `FT.HYBRID`,
   `FT.INFO` and `FT._LIST` over RESP3 as Redis 8 does, a map, and a valkey-glide client

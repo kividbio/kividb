@@ -24,7 +24,7 @@ other files:
 | Persistence | Snapshots (`dump.kdb`, compressed with `rdbcompression yes`, which is off by default) and an append-only file. Reads a Redis `dump.rdb`. ([PERSISTENCE.md](PERSISTENCE.md)) |
 | Replication | `REPLICAOF`, partial resync, and replicating from a Redis primary. |
 | Cluster | Redis's cluster protocol: hash slots, `CLUSTER` commands, gossip, failover, atomic slot migration. |
-| Sentinel | Not implemented. |
+| Sentinel | No Sentinel of its own. Redis Sentinel manages KiviDB nodes: fails over, and redis-py, ioredis and Lettuce follow it ([SENTINEL.md](SENTINEL.md)). |
 | Modules | `MODULE LOAD` is not supported; the Redis 8 modules' commands are built in. |
 
 ## Tested with
