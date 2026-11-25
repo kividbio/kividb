@@ -332,8 +332,19 @@ query cut short by `ON_TIMEOUT` carries in RESP3's `warning` (the client gets th
 with no signal, as over RESP2). A `WITHSCORES` on a KNN query gives each document's distance as
 its score, as Redis does; valkey-search gives `0`.
 
-`FT.PROFILE` has no valkey-search counterpart, and keeps the Redis shape, as do `FT.SPELLCHECK`,
-`FT.CONFIG GET`, `FT.TAGVALS`, the alias list and every other search command, in every mode.
+`FT.INFO` lists a vector field's `dimensions`, `distance_metric`, `data_type` and `algorithm` in an
+`index` list in the valkey shape, as valkey-search does (Open WebUI reads the dimensions from there).
+
+valkey-search 1.2 has no `FT.PROFILE`. In the valkey shape it is the array valkey-glide converts: the
+search's reply in that shape, then a flat list of simple-string names and numbers (`parse.time`,
+`total.time` in milliseconds, `all.count`). `FT.SPELLCHECK`, `FT.CONFIG GET`, `FT.TAGVALS`, the alias
+list and every other search command keep the Redis shape in every mode.
+
+The text of the error for an index that does not exist follows the same setting, on RESP2 and RESP3:
+in the valkey shape (`valkey`, or `auto` and a GLIDE client) it is valkey-search's, `Index with name
+'<name>' not found in database <n>`, for every `FT.*` command that takes an index name; otherwise it is
+Redis 8.10's, `SEARCH_INDEX_NOT_FOUND Index not found: <name>`. valkey-glide's callers look for `not
+found in database` (Open WebUI's Valkey vector store), and Redis's clients for `Index not found`.
 
 A client is valkey-glide when its library name begins with `Glide`, in any case (`GlidePy`,
 `GlidePySync`, `GlideJS`, `GlideJava`, `GlideGo`, `GlideFFI`, and any of them followed by a tag in

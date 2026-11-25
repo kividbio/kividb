@@ -326,6 +326,15 @@ const NOT_MEMORY_OR_PERCENT: &str = "ERR argument must be a memory or percent va
 /// for a `server` of `redis` at 7.4 or later (#451).
 pub(crate) const REDIS_VERSION: &str = "8.10.0";
 
+/// The Valkey release whose search and hash commands this server answers:
+/// `INFO`'s `valkey_version`. Clients that take a server for Valkey read it
+/// (Open WebUI's Valkey vector store asks for 9.0.1 or later before it uses
+/// valkey-search's commands). It is 9.0.1, the lowest release those clients
+/// accept, and not valkey-bundle 9.2.0's: the hash field commands of Valkey 9
+/// and valkey-search 1.2's search commands are answered, not every command of
+/// 9.x (`COMMANDLOG`, `DELIFEQ`, `CLUSTER MIGRATESLOTS`).
+pub(crate) const VALKEY_VERSION: &str = "9.0.1";
+
 /// The reply to a script command in a build without Lua. Job queues such as
 /// BullMQ and Sidekiq show it to their users, so it names the build to use.
 #[cfg(not(feature = "lua"))]
@@ -4649,6 +4658,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // The Redis release whose commands and replies this server
                 // follows. Clients read it to decide what they may send.
                 out.push_str(&format!("redis_version:{REDIS_VERSION}\r\n"));
+                out.push_str(&format!("valkey_version:{VALKEY_VERSION}\r\n"));
                 // There is no Redis build behind that version: these are
                 // the fields a Redis build fills in, for the clients and
                 // tools that read them.
