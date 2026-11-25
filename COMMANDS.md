@@ -1488,12 +1488,18 @@ peer's claim it took in, or its own takeover: an import, `CLUSTER SETSLOT
 to a replica that claims a slot of its master at an older epoch than the
 one the slot came to the master at (the slot went away and came back since
 the replica's stream last told it), and says which slots and when each came
-(`UPDATE`). The replica keeps claiming a refused slot while enough masters
-that have not refused it remain for a quorum; once the refusals leave too
-few, it gives the slot up, holds it only if its stream confirms it (a
-`TAKEN` at that epoch or later that lists it, or an `ARRIVED` at that very
-epoch), and asks again for the others. A slot it does not claim stays with
-its master, which keeps it on disk.
+(`UPDATE`), each as the master knows it: from a claim it took in or a
+slot it gave to its owner, or from the owner's config epoch when it has no
+entry for the slot (below). The replica gives a slot up at a refusal of the
+first kind; at refusals of the second kind, once they leave too few masters,
+of those not marked failing, for a quorum. It then holds the slot only if
+its stream confirms it (a `TAKEN` at that epoch or later that lists it, or
+an `ARRIVED` at that very epoch), and asks again for the others. A slot it
+does not claim stays with its master, which keeps it on disk. A master that
+first hears a claim of a slot from its owner after the owner's config epoch
+rose (a `CLUSTER BUMPEPOCH` or a collision on the owner) notes the slot at
+that later epoch: a replica that has not read its master's claim at that
+epoch is not elected for the slot.
 
 A master writes these epochs down, synced, with each slot's owner, in
 `<cluster-config-file>.came-at` before its saves of `nodes.conf` (not the
@@ -1515,11 +1521,6 @@ has just begun to follow), it claims at epoch 0, which every master that
 knows when the slots came refuses; a replica started without the file claims
 at its master's config epoch in `nodes.conf`, and one of a master whose
 stream carries no claims at its master's config epoch.
-
-The check is made by masters of 1.3.0 and later: a replica is elected only
-for slots whose writes it holds while those masters are a majority of the
-masters that own slots (each quorum then has one of them, which gives its
-vote only to claims without the slots that came after them).
 
 **What each kind of failover guarantees.** The default `CLUSTER FAILOVER`
 loses nothing the old master acknowledged: the master stops taking writes

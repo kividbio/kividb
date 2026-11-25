@@ -5,61 +5,90 @@
 // table. A master asked for its vote compares it with the epoch a candidate
 // claims a slot of its master at (the epoch of the last claim of its master
 // the candidate read in its replication stream, `followed_imports`): a slot
-// that came to the master after that epoch came with keys the candidate may
-// not hold (the slot was handed away and imported back while the candidate
-// was cut off), and the vote is refused for it (`ClusterState::cast_vote`).
+// that came to the master after that epoch (it was handed away and imported
+// back since) is refused (`ClusterState::cast_vote`).
 //
-// Set wherever this node's table gives a slot an owner: a peer's claim taken
-// in (`apply_peer_slot_claims_from`, the claim's epoch), and this node's own
-// takeovers (an import's, `CLUSTER SETSLOT <slot> NODE` to itself, `CLUSTER
-// ADDSLOTS`, a promotion: the epoch it takes them at). A slot given to
-// another node here by hand or by the end of a handover from this node
-// (`CLUSTER SETSLOT <slot> NODE <other>`, `hand_over_slots`) is noted at the
-// owner's config epoch known then, provisionally: the owner's own claim of
-// it, when it comes, sets it.
+// Each entry has a class ([`Class`]):
+//
+// * `Heard`: set from a claim this node took in (`apply_peer_slot_claims_from`,
+//   the claim's epoch), or by this node's own takeovers (an import's,
+//   `CLUSTER SETSLOT <slot> NODE` to itself, `CLUSTER ADDSLOTS`, a promotion:
+//   the epoch it takes them at).
+// * `Lower`: a slot given to another node here by hand or by the end of a
+//   handover from this node (`CLUSTER SETSLOT <slot> NODE <other>`,
+//   `hand_over_slots`): noted at a lower bound of the epoch the new owner
+//   claims it at ([`provisional_epoch`]).
+// * `Fallback`: read back at start-up without an entry for the slot with its
+//   current owner (no file; a file that does not read; one written before
+//   the save that moved the slot): its owner's config epoch in nodes.conf.
+//
+// The owner's own claim of a `Lower` or `Fallback` slot makes it `Heard`, at
+// that claim's epoch ([`CameAt::owner_claimed`]). A refusal for a `Heard` or
+// `Lower` entry is decisive for the candidate; one for a `Fallback` entry
+// counts toward a quorum only (`ClusterState::moved_refusals_give_up`).
 //
 // Written down, synced, in `<cluster-config-file>.came-at`, with each slot's
-// owner, before the saves of the cluster config (`persist::save_then`, as
-// `.not-held`; not by a takeover's own save, whose source holds writes
-// meanwhile), and read back at start-up. A slot the file does not have with
-// the owner nodes.conf has (no file; a file
-// that does not read; one written before the save that moved the slot) is
-// taken to have come at its owner's config epoch in nodes.conf: no earlier
-// than it did, so a candidate that read its master's newest claim is not
-// refused, and one whose last claim read is older than its master's epoch
-// is.
+// owner and class, before the saves of the cluster config
+// (`persist::save_then`, as `.not-held`; not by the saves of a takeover,
+// whose source holds writes meanwhile), and read back at start-up.
 
-use super::{CLUSTER_SLOTS, ClusterState, NodeId, migration, node_id_str};
+use super::{CLUSTER_SLOTS, ClusterState, NodeFlags, NodeId, migration, node_id_str};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+/// How this node came to know when a slot came to its owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Class {
+    /// From a claim of the slot this node took in, or its own takeover.
+    Heard,
+    /// A lower bound noted when the slot was given to its owner here.
+    Lower,
+    /// Its owner's config epoch, read back with no entry for the slot.
+    Fallback,
+}
+
+impl Class {
+    /// A refusal for it is decisive for the candidate.
+    pub(crate) fn decisive(self) -> bool {
+        self != Class::Fallback
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Class::Heard => "",
+            Class::Lower => " provisional",
+            Class::Fallback => " fallback",
+        }
+    }
+}
+
 pub(crate) struct CameAt {
     inner: Mutex<Inner>,
-    /// How many slots are provisional: none, and a claim of slots their
-    /// owner holds here takes no lock ([`Self::owner_claimed`]).
-    provisional_count: AtomicUsize,
+    /// How many slots are `Lower` or `Fallback`: none, and a claim of slots
+    /// their owner holds here takes no lock ([`Self::owner_claimed`]).
+    settling: AtomicUsize,
     /// Read at start-up: saves made before do not write the file.
     loaded: AtomicBool,
 }
 
 struct Inner {
     epochs: Vec<u64>,
-    /// Noted at a lower bound of the epoch the slot came at (it was given
-    /// to its owner here, by hand or at the end of a handover from this
-    /// node, or read back without the file having it), until the owner's
-    /// own claim of it says when.
-    provisional: Vec<bool>,
+    class: Vec<Class>,
 }
 
 impl Inner {
-    fn set_provisional(&mut self, i: usize, value: bool, count: &AtomicUsize) {
-        if self.provisional[i] != value {
-            self.provisional[i] = value;
-            if value {
+    fn set_class(&mut self, i: usize, class: Class, count: &AtomicUsize) {
+        let was = self.class[i] != Class::Heard;
+        let is = class != Class::Heard;
+        self.class[i] = class;
+        match (was, is) {
+            (false, true) => {
                 count.fetch_add(1, Ordering::SeqCst);
-            } else {
+            }
+            (true, false) => {
                 count.fetch_sub(1, Ordering::SeqCst);
             }
+            _ => {}
         }
     }
 }
@@ -69,9 +98,9 @@ impl Default for CameAt {
         CameAt {
             inner: Mutex::new(Inner {
                 epochs: vec![0; CLUSTER_SLOTS],
-                provisional: vec![false; CLUSTER_SLOTS],
+                class: vec![Class::Heard; CLUSTER_SLOTS],
             }),
-            provisional_count: AtomicUsize::new(0),
+            settling: AtomicUsize::new(0),
             loaded: AtomicBool::new(false),
         }
     }
@@ -81,14 +110,14 @@ impl Default for CameAt {
 const END: &str = "end";
 
 impl CameAt {
-    /// `slots` came to their owner at `epoch`.
+    /// `slots` came to their owner at `epoch`, as this node heard it.
     pub(crate) fn set(&self, slots: impl IntoIterator<Item = u16>, epoch: u64) {
         let mut inner = self.inner.lock();
         for slot in slots {
             let i = slot as usize;
             if i < CLUSTER_SLOTS {
                 inner.epochs[i] = epoch;
-                inner.set_provisional(i, false, &self.provisional_count);
+                inner.set_class(i, Class::Heard, &self.settling);
             }
         }
     }
@@ -101,15 +130,19 @@ impl CameAt {
         let i = slot as usize;
         if i < CLUSTER_SLOTS {
             inner.epochs[i] = epoch;
-            inner.set_provisional(i, true, &self.provisional_count);
+            inner.set_class(i, Class::Lower, &self.settling);
         }
     }
 
     /// The owner of the slots `start..=end` that `owners` gives it claims
-    /// them at `epoch`: each provisional one came at the claim's epoch (no
-    /// earlier than the lower bound noted: a claim of the slot made after
-    /// it came is at that epoch or later). One lock for the range, none
-    /// while no slot is provisional.
+    /// them at `epoch`: each `Lower` or `Fallback` one came at that claim's
+    /// epoch, and is `Heard` from now on. Any claim of the slot by its owner
+    /// will do: the owner claims it at its config epoch, which only grows
+    /// and is at or above the epoch it took the slot at; and a claim of the
+    /// slot by the owner reaches this node only once the owner has it (its
+    /// claims of the time before do not list the slot, the slot having
+    /// another owner then). One lock for the range, none while no slot is
+    /// `Lower` or `Fallback`.
     pub(crate) fn owner_claimed(
         &self,
         owners: &[Option<NodeId>],
@@ -118,62 +151,59 @@ impl CameAt {
         end: u16,
         epoch: u64,
     ) {
-        if self.provisional_count.load(Ordering::SeqCst) == 0 {
+        if self.settling.load(Ordering::SeqCst) == 0 {
             return;
         }
         let mut inner = self.inner.lock();
         let end = (end as usize).min(CLUSTER_SLOTS - 1);
         for i in start as usize..=end {
-            if inner.provisional[i] && owners[i] == Some(owner) {
-                inner.epochs[i] = inner.epochs[i].max(epoch);
-                inner.set_provisional(i, false, &self.provisional_count);
+            if inner.class[i] != Class::Heard && owners[i] == Some(owner) {
+                inner.epochs[i] = epoch;
+                inner.set_class(i, Class::Heard, &self.settling);
             }
         }
     }
 
-    pub(crate) fn get(&self, slot: u16) -> u64 {
-        self.inner
-            .lock()
-            .epochs
-            .get(slot as usize)
-            .copied()
-            .unwrap_or(0)
+    /// When `slot` came to its owner here, and how this node knows it.
+    pub(crate) fn get(&self, slot: u16) -> (u64, Class) {
+        let inner = self.inner.lock();
+        let i = (slot as usize).min(CLUSTER_SLOTS - 1);
+        (inner.epochs[i], inner.class[i])
     }
 
     /// `CLUSTER RESET`.
     pub(crate) fn clear(&self) {
         let mut inner = self.inner.lock();
         inner.epochs.iter_mut().for_each(|e| *e = 0);
-        inner.provisional.iter_mut().for_each(|p| *p = false);
-        self.provisional_count.store(0, Ordering::SeqCst);
+        inner.class.iter_mut().for_each(|c| *c = Class::Heard);
+        self.settling.store(0, Ordering::SeqCst);
     }
 
     /// The file's text, with `owners` the slot table: runs of
-    /// `a-b epoch owner` for the owned slots, `a-b epoch owner provisional`
-    /// for a provisional run, then `end`.
+    /// `a-b epoch owner`, `a-b epoch owner provisional` (a `Lower` run) or
+    /// `a-b epoch owner fallback`, for the owned slots, then `end`.
     fn text(&self, owners: &[Option<NodeId>]) -> String {
         let inner = self.inner.lock();
         let mut out = String::new();
-        type Run = (usize, usize, u64, NodeId, bool);
+        type Run = (usize, usize, u64, NodeId, Class);
         let flush = |run: Option<Run>, out: &mut String| {
-            if let Some((a, b, e, o, p)) = run {
-                let tail = if p { " provisional" } else { "" };
-                out.push_str(&format!("{a}-{b} {e} {}{tail}\n", node_id_str(&o)));
+            if let Some((a, b, e, o, c)) = run {
+                out.push_str(&format!("{a}-{b} {e} {}{}\n", node_id_str(&o), c.word()));
             }
         };
         let mut run: Option<Run> = None;
         for (slot, owner) in owners.iter().enumerate().take(CLUSTER_SLOTS) {
             let epoch = inner.epochs[slot];
-            let prov = inner.provisional[slot];
+            let class = inner.class[slot];
             run = match (run, owner) {
-                (Some((a, b, e, o, p)), Some(owner))
-                    if e == epoch && o == *owner && p == prov && b + 1 == slot =>
+                (Some((a, b, e, o, c)), Some(owner))
+                    if e == epoch && o == *owner && c == class && b + 1 == slot =>
                 {
-                    Some((a, slot, e, o, p))
+                    Some((a, slot, e, o, c))
                 }
                 (prev, Some(owner)) => {
                     flush(prev, &mut out);
-                    Some((slot, slot, epoch, *owner, prov))
+                    Some((slot, slot, epoch, *owner, class))
                 }
                 (prev, None) => {
                     flush(prev, &mut out);
@@ -188,8 +218,8 @@ impl CameAt {
     }
 }
 
-/// When a slot came, to which owner, and whether that is provisional.
-type Came = (u64, NodeId, bool);
+/// When a slot came, to which owner, and how this node knew it.
+type Came = (u64, NodeId, Class);
 
 /// The file read back: for each slot, when it came and to which owner, or
 /// `Err` if it does not read.
@@ -205,7 +235,7 @@ fn parse(text: &str) -> Result<Vec<Option<Came>>, ()> {
             continue;
         }
         let mut words = line.split(' ');
-        let (Some(range), Some(epoch), Some(owner), prov, None) = (
+        let (Some(range), Some(epoch), Some(owner), class, None) = (
             words.next(),
             words.next(),
             words.next(),
@@ -214,9 +244,10 @@ fn parse(text: &str) -> Result<Vec<Option<Came>>, ()> {
         ) else {
             return Err(());
         };
-        let prov = match prov {
-            None => false,
-            Some("provisional") => true,
+        let class = match class {
+            None => Class::Heard,
+            Some("provisional") => Class::Lower,
+            Some("fallback") => Class::Fallback,
             Some(_) => return Err(()),
         };
         let epoch: u64 = epoch.parse().map_err(|_| ())?;
@@ -228,7 +259,7 @@ fn parse(text: &str) -> Result<Vec<Option<Came>>, ()> {
         }
         came[a..=b]
             .iter_mut()
-            .for_each(|c| *c = Some((epoch, owner, prov)));
+            .for_each(|c| *c = Some((epoch, owner, class)));
     }
     if !ended {
         return Err(());
@@ -250,6 +281,11 @@ static WRITTEN: Mutex<Option<String>> = Mutex::new(None);
 
 /// One writer of the file at a time (a save of the bus's, a command's).
 static WRITING: Mutex<()> = Mutex::new(());
+
+/// A write failed, and the file in place could be neither emptied, removed
+/// nor moved aside: it holds a history older than this node's. Every save
+/// tries again, and says so, until a write succeeds.
+static STALE_IN_PLACE: AtomicBool = AtomicBool::new(false);
 
 /// The file written before it is put in place.
 fn tmp_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -275,25 +311,46 @@ pub(crate) fn save(cluster: &ClusterState) {
         return;
     }
     match write_file(&path, &text) {
-        Ok(()) => *WRITTEN.lock() = Some(text),
-        Err(e) => {
-            // The file in place is older than what is noted here: no
-            // longer to be read back as this node's history.
+        Ok(()) => {
+            *WRITTEN.lock() = Some(text);
+            STALE_IN_PLACE.store(false, Ordering::SeqCst);
+        }
+        Err((e, left)) => {
+            // What is in place is older than what this node has: the next
+            // save writes again, whatever it compares with.
             *WRITTEN.lock() = None;
+            if left == Left::Readable {
+                STALE_IN_PLACE.store(true, Ordering::SeqCst);
+            }
             log_warn!(
-                "Cluster: could not write down when each slot came to its owner ({}): {e}; \
-                 the file in place is emptied, and read back as none",
-                path.display()
+                "Cluster: could not write down when each slot came to its owner ({}): {e}; {}",
+                path.display(),
+                match left {
+                    Left::Readable => {
+                        "the file in place could be neither emptied, removed nor moved aside, \
+                         and holds an older history: remove it before this node next starts"
+                    }
+                    Left::Unreadable => "the file in place reads back as none",
+                }
             );
         }
     }
 }
 
+/// What a failed write leaves in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Left {
+    /// Nothing that reads: emptied, removed, or moved aside.
+    Unreadable,
+    /// The file as it was.
+    Readable,
+}
+
 /// Write `text` to `path`, synced, by way of a temporary file. If that
-/// fails, the file in place is emptied (best effort): one that does not
-/// read is read back as no file, each slot at its owner's config epoch,
-/// never as a history older than this node's.
-fn write_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+/// fails, the file in place is emptied, or else removed, or else moved
+/// aside (best effort, in that order): one that does not read is read back
+/// as no file, each slot at its owner's config epoch (`Fallback`).
+fn write_file(path: &std::path::Path, text: &str) -> Result<(), (std::io::Error, Left)> {
     let tmp = tmp_path(path);
     let saved = (|| {
         use std::io::Write;
@@ -302,20 +359,36 @@ fn write_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
         file.sync_all()?;
         std::fs::rename(&tmp, path)
     })();
-    if saved.is_err()
-        && let Ok(file) = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(path)
-    {
-        let _ = file.sync_all();
-    }
+    let left = match &saved {
+        Ok(()) => Left::Unreadable,
+        Err(_) => {
+            let emptied = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .and_then(|f| f.sync_all());
+            let gone = || match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            };
+            let aside = || {
+                let mut name = path.as_os_str().to_owned();
+                name.push(".unread");
+                std::fs::rename(path, std::path::PathBuf::from(name))
+            };
+            if emptied.is_ok() || gone().is_ok() || aside().is_ok() {
+                Left::Unreadable
+            } else {
+                Left::Readable
+            }
+        }
+    };
     if let Some(dir) = path.parent()
         && let Ok(dir) = std::fs::File::open(dir)
     {
         let _ = dir.sync_all();
     }
-    saved
+    saved.map_err(|e| (e, left))
 }
 
 /// The lower bound noted for a slot given here to `new_owner` from
@@ -323,7 +396,11 @@ fn write_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
 /// this node), with `epochs` each node's config epoch here: the new owner's
 /// claim of it is at its config epoch, which is no older than this node
 /// knows, and above the previous owner's (a claim is taken in only over an
-/// owner at an older epoch).
+/// owner at an older epoch). It can be above the epoch the new owner claims
+/// the slot at when the new owner took it without raising its epoch above
+/// the previous owner's here (`CLUSTER SETSLOT <slot> NODE` given on a
+/// third node before the new owner's own): the new owner's first claim of
+/// the slot settles it ([`CameAt::owner_claimed`]).
 pub(crate) fn provisional_epoch(
     epochs: &ahash::AHashMap<NodeId, u64>,
     new_owner: NodeId,
@@ -337,11 +414,11 @@ pub(crate) fn provisional_epoch(
     new.max(above_previous)
 }
 
-/// At start-up, once nodes.conf is read: each slot at the epoch the file
-/// has for it, if the file has it with the owner nodes.conf has; else (no
-/// file, one that does not read, or another owner: the file was written
-/// before a save of nodes.conf that moved the slot) at its owner's config
-/// epoch in nodes.conf, which is no earlier than it came.
+/// At start-up, once nodes.conf is read: each slot as the file has it, if
+/// the file has it with the owner nodes.conf has; else (no file, one that
+/// does not read, or another owner: the file was written before a save of
+/// nodes.conf that moved the slot) at its owner's config epoch in
+/// nodes.conf, which is no earlier than it came, as `Fallback`.
 pub(crate) fn load(cluster: &ClusterState) {
     // A file being written when the node stopped is not the file: it is
     // removed, as a spare of nodes.conf is.
@@ -367,10 +444,7 @@ pub(crate) fn load(cluster: &ClusterState) {
         }
         Err(_) => None,
     });
-    // A slot the file does not have with its owner here is noted at that
-    // owner's config epoch, provisionally: the owner's own claim of it says
-    // when it came.
-    let came: Vec<(u64, bool)> = {
+    let came: Vec<(u64, Class)> = {
         let owners: Vec<Option<NodeId>> = cluster.slots.read().to_vec();
         let nodes = cluster.nodes.read();
         owners
@@ -378,11 +452,14 @@ pub(crate) fn load(cluster: &ClusterState) {
             .enumerate()
             .map(|(slot, o)| {
                 let Some(owner) = o else {
-                    return (0, false);
+                    return (0, Class::Heard);
                 };
                 match read.as_ref().and_then(|came| came[slot]) {
-                    Some((epoch, of, prov)) if of == *owner => (epoch, prov),
-                    _ => (nodes.get(owner).map_or(0, |n| n.config_epoch), true),
+                    Some((epoch, of, class)) if of == *owner => (epoch, class),
+                    _ => (
+                        nodes.get(owner).map_or(0, |n| n.config_epoch),
+                        Class::Fallback,
+                    ),
                 }
             })
             .collect()
@@ -390,11 +467,11 @@ pub(crate) fn load(cluster: &ClusterState) {
     {
         let mut inner = cluster.came_at.inner.lock();
         inner.epochs = came.iter().map(|(e, _)| *e).collect();
-        inner.provisional = came.iter().map(|(_, p)| *p).collect();
-        cluster
-            .came_at
-            .provisional_count
-            .store(came.iter().filter(|(_, p)| *p).count(), Ordering::SeqCst);
+        inner.class = came.iter().map(|(_, c)| *c).collect();
+        cluster.came_at.settling.store(
+            came.iter().filter(|(_, c)| *c != Class::Heard).count(),
+            Ordering::SeqCst,
+        );
     }
     cluster.came_at.loaded.store(true, Ordering::SeqCst);
 }
@@ -408,7 +485,7 @@ pub(crate) fn test_voter_skips() -> bool {
 }
 
 /// The refusals this node, a candidate, has had in its election under way
-/// for slots that came to its master after the epoch it claimed them at:
+/// for slots a master took to have come at its owner's epoch (`Fallback`):
 /// per slot, the masters that refused it.
 #[derive(Default)]
 pub(crate) struct Refusals {
@@ -416,17 +493,53 @@ pub(crate) struct Refusals {
     by_slot: ahash::AHashMap<u16, ahash::AHashSet<NodeId>>,
 }
 
+/// The slots a master refused for when they came, as its `UPDATE` says:
+/// those it knows the coming of (`Heard`, `Lower`: decisive) and those it
+/// takes to have come at their owner's epoch (`Fallback`), each at that
+/// epoch.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Moved {
+    pub(crate) decisive: Vec<crate::cluster::bus::SlotClaim>,
+    pub(crate) fallback: Vec<crate::cluster::bus::SlotClaim>,
+}
+
+impl Moved {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.decisive.is_empty() && self.fallback.is_empty()
+    }
+}
+
+/// `slots` (each with its epoch) as claims, in runs.
+fn runs(mut slots: Vec<(u16, u64)>) -> Vec<crate::cluster::bus::SlotClaim> {
+    slots.sort_unstable();
+    slots.dedup();
+    let mut out: Vec<crate::cluster::bus::SlotClaim> = Vec::new();
+    for (slot, epoch) in slots {
+        match out.last_mut() {
+            Some(last) if last.epoch == epoch && last.end + 1 == slot => last.end = slot,
+            _ => out.push(crate::cluster::bus::SlotClaim {
+                start: slot,
+                end: slot,
+                epoch,
+            }),
+        }
+    }
+    out
+}
+
 impl ClusterState {
     /// `voter` refused the slots `moved` (each with the epoch it says the
-    /// slot came at), which this node claimed for its master in the
-    /// election under way: of them, those this node gives up, the masters
-    /// that refused them leaving too few others to make a quorum. A slot is
-    /// kept while enough masters that have not refused it remain: one
-    /// master's view (an over-estimate after it started without its file)
-    /// does not take a slot from a replica the others grant it to. Every
-    /// request this node sends still claims a slot it keeps, so a vote it
-    /// counts for the slot is one given with the slot claimed. Outside an
-    /// election, every slot given is given up.
+    /// slot came at) for when they came, taking each to have come at its
+    /// owner's config epoch (`Fallback`): of them, those this node, a
+    /// candidate in the election under way, gives up, the masters that
+    /// refused them so leaving too few others to make a quorum. Counted
+    /// among the others: the masters that own slots here, but the failed
+    /// one and those marked failing or failed. A master without the history
+    /// of a slot refuses whatever one with it refuses, and more; such a
+    /// refusal alone does not take the slot from a replica the others grant
+    /// it to. Every request this node sends still claims a slot it keeps, so
+    /// a vote it counts for the slot is one given with the slot claimed.
+    /// Outside an election, every slot given is given up.
     pub(crate) fn moved_refusals_give_up(
         &self,
         voter: NodeId,
@@ -442,9 +555,19 @@ impl ClusterState {
         else {
             return moved.to_vec();
         };
-        // The masters that can vote: every master that owns slots here but
-        // the failed one; a quorum of all of them is needed.
-        let available = self.voting_master_count().saturating_sub(1);
+        let owners: ahash::AHashSet<NodeId> = self.slots.read().iter().flatten().copied().collect();
+        let available = {
+            let nodes = self.nodes.read();
+            owners
+                .iter()
+                .filter(|id| {
+                    **id != master
+                        && nodes
+                            .get(id)
+                            .is_some_and(|n| !n.flags.intersects(NodeFlags::PFAIL | NodeFlags::FAIL))
+                })
+                .count()
+        };
         let quorum = self.election_quorum(master);
         let mut refusals = self.moved_refusals.lock();
         if refusals.epoch != epoch {
@@ -477,7 +600,7 @@ impl ClusterState {
             let end = c.end.min((CLUSTER_SLOTS - 1) as u16);
             for slot in c.start..=end {
                 if slots[slot as usize] == Some(master_id) {
-                    let came = self.came_at.get(slot);
+                    let (came, _) = self.came_at.get(slot);
                     if came > c.epoch {
                         return Some((slot, came, c.epoch));
                     }
@@ -488,39 +611,34 @@ impl ClusterState {
     }
 
     /// Those slots ([`Self::moved_after_claimed`]), each at the epoch it came
-    /// at: what the `UPDATE` that answers the refusal tells the candidate.
+    /// at, decisive or not: what the `UPDATE` that answers the refusal tells
+    /// the candidate.
     pub(crate) fn moved_claims_of(
         &self,
         master_id: NodeId,
         claims: &[crate::cluster::bus::SlotClaim],
-    ) -> Vec<crate::cluster::bus::SlotClaim> {
+    ) -> Moved {
         let slots = self.slots.read();
-        let mut moved: Vec<(u16, u64)> = Vec::new();
+        let (mut decisive, mut fallback): (Vec<(u16, u64)>, Vec<(u16, u64)>) = Default::default();
         for c in claims {
             let end = c.end.min((CLUSTER_SLOTS - 1) as u16);
             for slot in c.start..=end {
                 if slots[slot as usize] == Some(master_id) {
-                    let came = self.came_at.get(slot);
+                    let (came, class) = self.came_at.get(slot);
                     if came > c.epoch {
-                        moved.push((slot, came));
+                        if class.decisive() {
+                            decisive.push((slot, came));
+                        } else {
+                            fallback.push((slot, came));
+                        }
                     }
                 }
             }
         }
-        moved.sort_unstable();
-        moved.dedup();
-        let mut out: Vec<crate::cluster::bus::SlotClaim> = Vec::new();
-        for (slot, epoch) in moved {
-            match out.last_mut() {
-                Some(last) if last.epoch == epoch && last.end + 1 == slot => last.end = slot,
-                _ => out.push(crate::cluster::bus::SlotClaim {
-                    start: slot,
-                    end: slot,
-                    epoch,
-                }),
-            }
+        Moved {
+            decisive: runs(decisive),
+            fallback: runs(fallback),
         }
-        out
     }
 }
 
@@ -533,8 +651,8 @@ pub(crate) fn claims_text(claims: &[crate::cluster::bus::SlotClaim]) -> String {
 mod tests {
     use super::*;
 
-    /// The file reads back as written, with each slot's owner; one cut
-    /// short, or with anything after its end, does not read.
+    /// The file reads back as written, with each slot's owner and class;
+    /// one cut short, or with anything after its end, does not read.
     #[test]
     fn when_slots_came_reads_back() {
         let c = CameAt::default();
@@ -548,33 +666,43 @@ mod tests {
         }
         owners[30] = Some(a);
         owners[40] = Some(b);
+        owners[41] = Some(b);
         c.set(10..=20, 5);
         c.set([30], 7);
         c.set_provisional(40, 3);
         c.set([50], 9);
+        {
+            let mut inner = c.inner.lock();
+            inner.epochs[41] = 6;
+            inner.set_class(41, Class::Fallback, &c.settling);
+        }
         let text = c.text(&owners);
         assert_eq!(
             text,
             format!(
-                "10-20 5 {a}\n30-30 7 {a}\n40-40 3 {b} provisional\nend\n",
+                "10-20 5 {a}\n30-30 7 {a}\n40-40 3 {b} provisional\n41-41 6 {b} fallback\nend\n",
                 a = node_id_str(&a),
                 b = node_id_str(&b)
             )
         );
         let came = parse(&text).unwrap();
-        assert_eq!(came[15], Some((5, a, false)));
-        assert_eq!(came[30], Some((7, a, false)));
-        assert_eq!(came[40], Some((3, b, true)));
+        assert_eq!(came[15], Some((5, a, Class::Heard)));
+        assert_eq!(came[30], Some((7, a, Class::Heard)));
+        assert_eq!(came[40], Some((3, b, Class::Lower)));
+        assert_eq!(came[41], Some((6, b, Class::Fallback)));
         assert!(parse(&format!("1-2 3 {} other\nend\n", node_id_str(&a))).is_err());
         assert_eq!(came[50], None, "no owner, not written");
         assert!(parse(&text[..text.len() - 4]).is_err());
         assert!(parse(&format!("{text}1-2 3 {}\n", node_id_str(&a))).is_err());
         assert!(parse(&format!("1-16384 3 {}\nend\n", node_id_str(&a))).is_err());
         assert!(parse("1-2 3\nend\n").is_err());
+        assert!(Class::Heard.decisive() && Class::Lower.decisive());
+        assert!(!Class::Fallback.decisive());
     }
 
-    /// A provisional note is set by the owner's own claim, once, and only
-    /// for slots of that owner; a set one is not; the count follows.
+    /// A `Lower` or `Fallback` note is set by the owner's own claim, to its
+    /// epoch (above or below the note), once, and only for slots of that
+    /// owner; it is `Heard` from then on; the count follows.
     #[test]
     fn a_provisional_note_is_set_by_the_owners_claim() {
         let c = CameAt::default();
@@ -586,20 +714,26 @@ mod tests {
         owners[1] = Some(a);
         owners[2] = Some(a);
         owners[3] = Some(b);
+        owners[4] = Some(a);
         c.set_provisional(1, 4);
         c.set_provisional(3, 4);
-        assert_eq!(c.provisional_count.load(Ordering::SeqCst), 2);
-        c.owner_claimed(&owners, a, 0, 10, 9);
-        assert_eq!((c.get(1), c.get(3)), (9, 4), "only the owner's");
+        c.set_provisional(4, 9);
+        assert_eq!(c.settling.load(Ordering::SeqCst), 3);
+        c.owner_claimed(&owners, a, 0, 10, 7);
+        assert_eq!(
+            (c.get(1), c.get(3), c.get(4)),
+            ((7, Class::Heard), (4, Class::Lower), (7, Class::Heard)),
+            "only the owner's, to its claim's epoch"
+        );
         c.owner_claimed(&owners, a, 0, 10, 12);
-        assert_eq!(c.get(1), 9, "once");
+        assert_eq!(c.get(1), (7, Class::Heard), "once");
         c.set([2], 5);
         c.owner_claimed(&owners, a, 2, 2, 8);
-        assert_eq!(c.get(2), 5);
-        assert_eq!(c.provisional_count.load(Ordering::SeqCst), 1);
+        assert_eq!(c.get(2), (5, Class::Heard));
+        assert_eq!(c.settling.load(Ordering::SeqCst), 1);
         c.clear();
-        assert_eq!(c.get(1), 0);
-        assert_eq!(c.provisional_count.load(Ordering::SeqCst), 0);
+        assert_eq!(c.get(1), (0, Class::Heard));
+        assert_eq!(c.settling.load(Ordering::SeqCst), 0);
     }
 
     /// A slot given to another owner here is noted no earlier than that
@@ -618,8 +752,8 @@ mod tests {
         assert_eq!(provisional_epoch(&epochs, a, None), 3);
     }
 
-    /// A write that fails empties the file in place, which then does not
-    /// read: it is read back as no file, never as an older history.
+    /// A write that fails leaves no file that reads: it is emptied, else
+    /// removed, else moved aside.
     #[test]
     fn a_failed_write_leaves_no_file_that_reads() {
         let dir = tempfile::tempdir().unwrap();
@@ -630,7 +764,8 @@ mod tests {
         assert!(parse(&std::fs::read_to_string(&path).unwrap()).is_ok());
         // The temporary file cannot be made: a directory has its name.
         std::fs::create_dir(tmp_path(&path)).unwrap();
-        assert!(write_file(&path, &text.replace(" 5 ", " 6 ")).is_err());
+        let (_, left) = write_file(&path, &text.replace(" 5 ", " 6 ")).unwrap_err();
+        assert_eq!(left, Left::Unreadable);
         assert!(parse(&std::fs::read_to_string(&path).unwrap()).is_err());
     }
 }

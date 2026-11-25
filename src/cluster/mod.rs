@@ -3121,7 +3121,17 @@ impl ClusterState {
                  the slots it claims came ({})",
                 node_id_str(&candidate),
                 node_id_str(&master_id),
-                came_at::claims_text(&self.moved_claims_of(master_id, claims))
+                {
+                    let moved = self.moved_claims_of(master_id, claims);
+                    came_at::claims_text(
+                        &moved
+                            .decisive
+                            .iter()
+                            .chain(&moved.fallback)
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    )
+                }
             );
             return false;
         }

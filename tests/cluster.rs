@@ -11860,7 +11860,8 @@ fn a_replica_that_has_not_heard_its_master_take_slots_is_elected_with_them_after
 }
 
 /// Restart every master but `except` with its `<cluster-config-file>.came-at`
-/// moved aside, as after an upgrade from a node that keeps none, and wait
+/// moved aside (each then takes a slot to have come at its owner's config
+/// epoch), and wait
 /// for the cluster (`all`, `known` nodes) to be whole again.
 fn restart_without_came_at(nodes: &mut [Node], except: usize) {
     for (i, node) in nodes.iter_mut().enumerate() {
@@ -12227,6 +12228,217 @@ fn a_source_restarted_after_a_handover_refuses_a_replica_that_claims_the_slots_a
         let absent = written.missing_on(&nodes[1]);
         assert!(absent.is_empty(), "{} keys not on the owner", absent.len());
     }
+}
+
+/// A master that knows a slot came back refuses it decisively, whatever
+/// the others grant. Five masters: slots of D's go to the source S, take
+/// writes there, and come back to D; the three other masters take in none
+/// of S's claims (`KIVIDB_TEST_IGNORE_CLAIMS`, as a master does that heard
+/// D's epoch pass S's first), so they still have the slots as D's from
+/// before, and D's claim of them changes nothing there. D's replica, stopped
+/// after it read D's claim from before, is started again once D fails, and
+/// claims them at that older epoch. S refuses them for when they came; the
+/// replica gives them up at that refusal and is elected for D's other slots
+/// only, with the votes of the others. D, back, owns the slots with every
+/// write, S's included.
+#[test]
+fn a_refusal_from_a_master_that_saw_the_slots_come_back_gives_them_up_whatever_the_others_grant()
+ {
+    let (mut nodes, ranges) = form_cluster_of(vec![
+        Node::start(&[]),
+        Node::start(&["--appendonly", "yes"]),
+        Node::start_with_env(&[], &[IGNORE_CLAIMS]),
+        Node::start_with_env(&[], &[IGNORE_CLAIMS]),
+        Node::start_with_env(&[], &[IGNORE_CLAIMS]),
+    ]);
+    let mut replica = add_replica_with(
+        &nodes,
+        &nodes[1],
+        &[
+            "--cluster-replica-validity-factor",
+            "0",
+            "--appendonly",
+            "yes",
+        ],
+        &[],
+    );
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, all.len());
+    }
+    let (src_id, dst_id, replica_id) = (nodes[0].id(), nodes[1].id(), replica.id());
+    let (a, b) = (ranges[1].0, ranges[1].0 + 100);
+    let own = ranges[1].1;
+    let first = Written::on(&nodes[1], a..=b, "first", 100);
+    assert_eq!(nodes[1].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+    // Its AOF has the writes before it is stopped.
+    std::thread::sleep(Duration::from_millis(1500));
+    replica.kill();
+    for node in &nodes[2..] {
+        std::fs::write(node.dir.join(IGNORE_CLAIMS.1), &src_id).unwrap();
+    }
+    import_until_taken(&nodes[0], a, b);
+    let between = Written::on(&nodes[0], a..=b, "between", 100);
+    import_until_taken(&nodes[1], a, b);
+    wait_until(
+        "S to have the slots as D's again",
+        Duration::from_secs(20),
+        || owner_in_view_of(&nodes[0], a).as_deref() == Some(dst_id.as_str()),
+    );
+    for node in &nodes[2..] {
+        assert_eq!(owner_in_view_of(node, a).as_deref(), Some(dst_id.as_str()));
+    }
+    nodes[1].kill();
+    replica.spawn();
+    let live = [&nodes[0], &nodes[2], &nodes[3], &nodes[4], &replica];
+    let logs = || -> String {
+        live.iter()
+            .map(|n| format!("==== node {}\n{}", n.port, n.log()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        wait_until_or(Duration::from_secs(90), || {
+            replica.is_master()
+                && owner_in_view_of(&nodes[0], own).as_deref() == Some(replica_id.as_str())
+        }),
+        "the replica is to be elected for D's other slots\n{}",
+        logs()
+    );
+    for _ in 0..20 {
+        for n in live {
+            assert_ne!(
+                owner_in_view_of(n, a).as_deref(),
+                Some(replica_id.as_str()),
+                "slots that came to the master after the claim the replica read stay with the master\n{}",
+                logs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for node in &nodes[2..] {
+        std::fs::write(node.dir.join(IGNORE_CLAIMS.1), "").unwrap();
+    }
+    nodes[1].spawn();
+    wait_until(
+        "D, back, to own the slots that came back to it",
+        Duration::from_secs(60),
+        || {
+            nodes
+                .iter()
+                .all(|n| owner_in_view_of(n, a).as_deref() == Some(dst_id.as_str()))
+        },
+    );
+    for written in [&first, &between] {
+        let absent = written.missing_on(&nodes[1]);
+        assert!(absent.is_empty(), "{} keys not on the owner", absent.len());
+    }
+}
+
+/// Refusals from a master that takes the slots to have come at their
+/// owner's epoch are counted against the masters that can still vote: those
+/// not marked failing or failed. Five masters; D's replica, its stream held
+/// back before `CLUSTER BUMPEPOCH` on D, did not read D's claim at its new
+/// epoch; one master starts again without its `.came-at` (it takes D's slots
+/// to have come at that epoch), and another is stopped. D fails: that one
+/// master's refusals leave the replica too few masters for a quorum, and it
+/// gives D's slots up at once, without being elected for any. D, back, owns
+/// them with every write.
+#[test]
+fn a_replica_gives_up_slots_that_refusals_leave_no_quorum_for_among_the_masters_up() {
+    let dst = Node::start_with_env(&["--appendonly", "yes"], &[STREAM_STALL]);
+    let (mut nodes, ranges) = form_cluster_of(vec![
+        Node::start(&[]),
+        dst,
+        Node::start(&[]),
+        Node::start(&[]),
+        Node::start(&[]),
+    ]);
+    let replica = add_replica_with(
+        &nodes,
+        &nodes[1],
+        &["--cluster-replica-validity-factor", "0"],
+        &[],
+    );
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, all.len());
+    }
+    let (dst_id, down_id) = (nodes[1].id(), nodes[4].id());
+    let (a, b) = ranges[1];
+    let written = Written::on(&nodes[1], a..=b, "written", 100);
+    assert_eq!(nodes[1].conn().cmd(&["WAIT", "1", "5000"]).int(), 1);
+    wait_until(
+        "another master to hold the highest epoch, known to all",
+        Duration::from_secs(30),
+        || {
+            let r = nodes[2].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+            assert!(r.starts_with("BUMPED") || r.starts_with("STILL"), "{r}");
+            let highest = nodes[2].cluster_info("cluster_my_epoch");
+            std::thread::sleep(Duration::from_millis(1500));
+            nodes
+                .iter()
+                .all(|n| n.cluster_info("cluster_current_epoch") == highest)
+        },
+    );
+    std::fs::write(nodes[1].dir.join(STREAM_STALL.1), "").unwrap();
+    let r = nodes[1].conn().cmd(&["CLUSTER", "BUMPEPOCH"]).text();
+    let bumped = r
+        .strip_prefix("BUMPED ")
+        .unwrap_or_else(|| panic!("{r}"))
+        .to_string();
+    wait_until(
+        "every master to know D's new epoch",
+        Duration::from_secs(20),
+        || {
+            [0, 2, 3, 4]
+                .iter()
+                .all(|&i| row_of(&nodes[i], &dst_id).is_some_and(|row| row[6] == bumped))
+        },
+    );
+    nodes[0].kill();
+    let file = nodes[0].dir.join("nodes.conf.came-at");
+    assert!(file.exists(), "no {}", file.display());
+    std::fs::rename(&file, nodes[0].dir.join("came-at.aside")).unwrap();
+    nodes[0].spawn();
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, all.len());
+    }
+    nodes[4].kill();
+    wait_until(
+        "the replica to have the stopped master as failing",
+        Duration::from_secs(30),
+        || row_of(&replica, &down_id).is_some_and(|row| row[2].contains("fail")),
+    );
+    nodes[1].kill();
+    let given_up = format!("{a}-{b} given up");
+    assert!(
+        wait_until_or(Duration::from_secs(60), || replica.log().contains(&given_up)),
+        "the replica is to give D's slots up\n{}",
+        replica.log()
+    );
+    for _ in 0..30 {
+        assert!(
+            !replica.is_master(),
+            "no slot is left for the replica to be elected for\n{}",
+            replica.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    nodes[4].spawn();
+    nodes[1].spawn();
+    wait_until(
+        "D, back, to own its slots",
+        Duration::from_secs(60),
+        || {
+            nodes
+                .iter()
+                .all(|n| owner_in_view_of(n, a).as_deref() == Some(dst_id.as_str()))
+        },
+    );
+    let absent = written.missing_on(&nodes[1]);
+    assert!(absent.is_empty(), "{} writes not on the owner", absent.len());
 }
 
 /// A source killed while it waited to know whether the destination took
