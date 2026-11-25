@@ -1,10 +1,11 @@
 #![allow(clippy::disallowed_methods)]
 // tests/append_in_place.rs
 //
-// An APPEND writes where the string is kept unless something else holds
-// it, as a snapshot or a full sync being written does; a long string keeps
-// room to spare for the next appends. Whatever held it keeps the bytes it
-// had, and nothing that saves, sends or copies a string sees the room.
+// An APPEND or a SETRANGE writes where the string is kept unless something
+// else holds it, as a snapshot or a full sync being written does; a long
+// string keeps room to spare for the next appends. Whatever held it keeps
+// the bytes it had, and nothing that saves, sends or copies a string sees
+// the room.
 // Real `kividb` processes; a server started with `held` stops each
 // snapshot once it has captured the dataset
 // (`failpoint.snapshot-writing.<n>` in its directory), for as long as the
@@ -754,4 +755,187 @@ fn readers_and_dumps_see_each_value_at_one_moment_across_appends() {
             );
         }
     }
+}
+
+// ── SETRANGE ────────────────────────────────────────────────────────────────
+
+fn setrange(c: &mut Conn, key: &str, offset: usize, patch: &[u8]) -> V {
+    let offset = offset.to_string();
+    c.cmd(&[b"SETRANGE", key.as_bytes(), offset.as_bytes(), patch])
+}
+
+/// `bytes` with `patch` written from `offset`, zero-filled up to it. An
+/// empty patch leaves them as they are, however far the offset.
+fn patched(mut bytes: Vec<u8>, offset: usize, patch: &[u8]) -> Vec<u8> {
+    if patch.is_empty() {
+        return bytes;
+    }
+    if bytes.len() < offset + patch.len() {
+        bytes.resize(offset + patch.len(), 0);
+    }
+    bytes[offset..offset + patch.len()].copy_from_slice(patch);
+    bytes
+}
+
+/// A `BGSAVE` holds each string it captured until it has written it: a
+/// `SETRANGE` meanwhile copies the value, and the holder keeps its bytes.
+/// The dump has the bytes from before; the live value has every write.
+#[test]
+fn a_bgsave_writes_the_bytes_from_before_a_setrange() {
+    let server = Server::start(&[], true);
+    let mut c = server.conn();
+    fill(&mut c, &SIZES);
+    assert_eq!(
+        c.cmd(&[b"BGSAVE"]),
+        V::Str(b"Background saving started".to_vec())
+    );
+    let held = server.snapshot_held(1);
+    for len in SIZES {
+        let k = key(len);
+        assert_eq!(setrange(&mut c, &k, 1, b"ab"), V::Int(len as i64), "{len}");
+        let grown = setrange(&mut c, &k, len + 2, b"cd");
+        assert_eq!(grown, V::Int(len as i64 + 4), "{len}");
+    }
+    std::fs::remove_file(held).unwrap();
+    c.wait_for("rdb_bgsave_in_progress", "0");
+    assert_eq!(c.info("rdb_last_bgsave_status"), "ok");
+    for len in SIZES {
+        let want = patched(patched(pattern(len), 1, b"ab"), len + 2, b"cd");
+        assert!(c.get(&key(len)) == V::Str(want), "{len}");
+    }
+    let server = server.restart(&[]);
+    let mut c = server.conn();
+    for len in SIZES {
+        assert!(
+            c.get(&key(len)) == V::Str(pattern(len)),
+            "{len} in the dump"
+        );
+    }
+}
+
+/// A replica's full sync captures the values; `SETRANGE`s on the master
+/// while it is held, and after (in place, empty, grown), reach the
+/// replica, which ends with the master's bytes. An empty one on a missing
+/// key makes it on neither.
+#[test]
+fn a_replica_synced_across_setranges_ends_with_the_masters_bytes() {
+    let master = Server::start(&[], true);
+    let mut m = master.conn();
+    let sizes = &SIZES[..3];
+    fill(&mut m, sizes);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port], false);
+    let held = master.snapshot_held(1);
+    for &len in sizes {
+        setrange(&mut m, &key(len), 1, b"ab");
+        setrange(&mut m, &key(len), 5, b"cd");
+    }
+    std::fs::remove_file(held).unwrap();
+    let mut r = replica.conn();
+    r.wait_for("master_link_status", "up");
+    for &len in sizes {
+        setrange(&mut m, &key(len), len / 2, b"ef");
+        setrange(&mut m, &key(len), len + 100, b"");
+        setrange(&mut m, &key(len), len + 3, b"gh");
+    }
+    assert_eq!(setrange(&mut m, "missing", 7, b""), V::Int(0));
+    m.cmd(&[b"SET", b"marker", b"1"]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    for &len in sizes {
+        let want = m.get(&key(len));
+        let mut now = patched(patched(pattern(len), 1, b"ab"), 5, b"cd");
+        // Every call the master took, the empty one past the end included.
+        now = patched(patched(now, len / 2, b"ef"), len + 100, b"");
+        assert_eq!(now.len(), len, "{len}: an empty patch grows nothing");
+        now = patched(now, len + 3, b"gh");
+        assert!(want == V::Str(now), "{len} on the master");
+        while r.get(&key(len)) != want {
+            assert!(Instant::now() < deadline, "{len}: the replica differs");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let digest = |c: &mut Conn| c.cmd(&[b"DEBUG", b"DIGEST-VALUE", key(len).as_bytes()]);
+        assert_eq!(digest(&mut m), digest(&mut r), "{len}");
+    }
+    while r.get("marker") != V::Str(b"1".to_vec()) {
+        assert!(Instant::now() < deadline, "the marker never arrived");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for c in [&mut m, &mut r] {
+        assert_eq!(c.cmd(&[b"EXISTS", b"missing"]), V::Int(0));
+    }
+}
+
+/// A `SETRANGE` on a missing key makes it, kept inline, in a slab or on its
+/// own: zeros up to the offset, then the patch byte for byte (NULs and
+/// bytes that are not UTF-8 included), and no time to live.
+#[test]
+fn a_setrange_on_a_missing_key_makes_it_zero_filled() {
+    let server = Server::start(&[], false);
+    let mut c = server.conn();
+    let patch = b"\x00\xff\xfe\x00a\x80";
+    for (k, offset) in [
+        ("at0", 0),
+        ("inline", 5),
+        ("slab", 16 << 10),
+        ("own", 1 << 20),
+    ] {
+        let len = (offset + patch.len()) as i64;
+        assert_eq!(setrange(&mut c, k, offset, patch), V::Int(len), "{k}");
+        let mut want = vec![0u8; offset];
+        want.extend_from_slice(patch);
+        assert!(c.get(k) == V::Str(want), "{k}");
+        assert_eq!(c.cmd(&[b"STRLEN", k.as_bytes()]), V::Int(len), "{k}");
+        assert_eq!(c.cmd(&[b"TTL", k.as_bytes()]), V::Int(-1), "{k}");
+    }
+}
+
+/// `SETRANGE`s written in place, copied and grown are logged and replayed.
+/// An empty one is still counted as a change and logged, as before (Redis
+/// does neither), and replays as nothing: a missing key is not made.
+#[test]
+fn aof_replays_setranges_written_in_place() {
+    let aof = ["--appendonly", "yes", "--appendfsync", "always"];
+    let server = Server::start(&aof, false);
+    let mut c = server.conn();
+    let len = 1 << 20;
+    fill(&mut c, &[len]);
+    let before: i64 = c.info("rdb_changes_since_last_save").parse().unwrap();
+    let mut want = pattern(len);
+    let edits: [(usize, &[u8]); 5] = [
+        (0, b"ab"),
+        (10, b"cd"),
+        (5, b""),
+        (len + 3, b"ef"),
+        (len / 2, b"gh"),
+    ];
+    for (offset, patch) in edits {
+        setrange(&mut c, &key(len), offset, patch);
+        want = patched(want, offset, patch);
+    }
+    assert_eq!(setrange(&mut c, "missing", 7, b""), V::Int(0));
+    let after: i64 = c.info("rdb_changes_since_last_save").parse().unwrap();
+    assert_eq!(after - before, 6, "dirty, the empty ones included");
+    let server = server.restart(&aof);
+    let mut c = server.conn();
+    assert!(c.get(&key(len)) == V::Str(want), "replayed");
+    assert_eq!(c.cmd(&[b"EXISTS", b"missing"]), V::Int(0));
+}
+
+/// `SETRANGE`s in place allocate nothing: `used_memory` and `MEMORY USAGE`
+/// stay where they were.
+#[test]
+fn used_memory_stays_across_setranges_in_place() {
+    let server = Server::start(&[], false);
+    let mut c = server.conn();
+    let used = |c: &mut Conn| c.info("used_memory").parse::<i64>().unwrap();
+    let len = 8 << 20;
+    c.cmd(&[b"SET", b"big", &pattern(len)]);
+    let usage = c.usage("big");
+    let before = used(&mut c);
+    for i in 0..1000 {
+        setrange(&mut c, "big", i * 8000, b"0123456789");
+    }
+    let after = used(&mut c);
+    assert!((after - before).abs() < 256 << 10, "{before} -> {after}");
+    assert_eq!(c.usage("big"), usage);
 }

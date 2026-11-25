@@ -35,12 +35,11 @@
 //! **Writes in place.** A string written over a string kept inline goes
 //! into the same block when the table alone holds the entry, the key is not
 //! past its time, and the new length keeps the block in its slab class
-//! ([`ShardMap::set_str`], `append_str`, `set_range_in_place`,
-//! `edit_str_in_place`): nothing is allocated or freed, and the entry
-//! stays where it is. A string of its own is written in its block the
-//! same way when the entry is also its bytes' only holder. Anything else,
-//! and every entry somebody else holds (a snapshot being written), gets a
-//! new entry, as before.
+//! ([`ShardMap::set_str`], `append_str`, `edit_str_in_place`): nothing is
+//! allocated or freed, and the entry stays where it is. A string of its own
+//! is written in its block the same way when the entry is also its bytes'
+//! only holder. Anything else, and every entry somebody else holds (a
+//! snapshot being written), gets a new entry, as before.
 
 use std::sync::Arc;
 
@@ -1110,30 +1109,6 @@ impl ShardMap {
             Entry::string_appended(key, old, extra, expires)
         });
         Ok((len, written))
-    }
-
-    /// `patch` written over `key`'s string from `offset`, the string grown
-    /// with zero bytes to reach it, in its own entry if that can be done
-    /// (see the module). Returns the string's new length if it was; `None`
-    /// leaves everything as it was.
-    pub fn set_range_in_place(
-        &mut self,
-        key: &(impl AsRef<[u8]> + ?Sized),
-        offset: usize,
-        patch: &[u8],
-    ) -> Option<usize> {
-        let key = key.as_ref();
-        let hash = self.hash_of(key);
-        let map = self.id();
-        let entry = self.find_live(hash, key)?.entry();
-        let len = entry.inline_len()?.max(offset.checked_add(patch.len())?);
-        if !entry.fits_in_place(len) {
-            return None;
-        }
-        // SAFETY: locked for writing, held by the table alone, and in class.
-        unsafe { entry.write_at_in_place(offset, patch) };
-        used(entry, hash, map);
-        Some(len)
     }
 
     /// `patch` written over `key`'s string from `offset`, the string grown
@@ -2856,13 +2831,13 @@ mod tests {
     #[test]
     fn a_key_past_its_time_is_not_written_in_place() {
         let mut map = ShardMap::new();
-        // SET k v KEEPTTL, INCR, SETRANGE's fallback: a new key, no time to live.
+        // SET k v KEEPTTL, INCR: a new key, no time to live.
         map.insert_str_expiring("set", "5", Some(1));
         assert!(matches!(map.set_str("set", "6"), Written::Replaced(_)));
         assert_eq!(text(map.get("set")), Some(b"6".to_vec()));
         assert_eq!(map.expires("set"), None);
-        // APPEND writes a new key over it, which is announced; SETRANGE
-        // leaves it to the caller's write of a new value.
+        // APPEND and SETRANGE's edit write a new key over it, which is
+        // announced.
         map.insert_str_expiring("app", "5", Some(1));
         assert!(matches!(
             map.append_str("app", b"6", usize::MAX),
@@ -2871,12 +2846,18 @@ mod tests {
         assert_eq!(text(map.get("app")), Some(b"6".to_vec()));
         assert_eq!(map.expires("app"), None);
         map.insert_str_expiring("rng", "5", Some(1));
-        assert_eq!(map.set_range_in_place("rng", 0, b"6"), None);
+        assert!(matches!(
+            map.edit_str_in_place("rng", 0, b"6"),
+            Some(Written::Replaced(_))
+        ));
+        assert_eq!(text(map.get("rng")), Some(b"6".to_vec()));
+        assert_eq!(map.expires("rng"), None);
         assert_eq!(
             map.take_left(),
             vec![
                 (ToSay::PastItsTime, crate::store::Key::from("set")),
                 (ToSay::PastItsTime, crate::store::Key::from("app")),
+                (ToSay::PastItsTime, crate::store::Key::from("rng")),
             ]
         );
         // A live key is still written in place.

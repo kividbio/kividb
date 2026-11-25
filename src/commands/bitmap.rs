@@ -878,17 +878,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::commands::ctx::NoopAofSender;
     use std::sync::Arc;
     use std::time::Instant;
 
     /// A string kept in its entry, in a slab, and in allocations of its own.
-    const SIZES: [usize; 4] = [1000, 16 << 10, 64 << 10, 1 << 20];
+    pub(crate) const SIZES: [usize; 4] = [1000, 16 << 10, 64 << 10, 1 << 20];
 
     /// What a command that copies no value may allocate: its reply.
-    const SMALL: isize = 512;
+    pub(crate) const SMALL: isize = 512;
 
     /// `line`, split at spaces, run by the bitmap handler on `store`'s
     /// database 0: the reply, whether the write is left unpropagated, and
@@ -903,7 +903,7 @@ mod tests {
 
     /// `line` run as a client's command is, by the dispatcher, which tells
     /// `watches` and the keyspace events of what it writes.
-    fn dispatched(
+    pub(crate) fn dispatched(
         store: &store::Store,
         line: &str,
         watches: &dyn crate::watch::WatchNotifier,
@@ -918,7 +918,7 @@ mod tests {
 
     /// `f` given a context for `line`, split at spaces, on `store`'s
     /// database 0.
-    fn with_ctx<R>(
+    pub(crate) fn with_ctx<R>(
         store: &store::Store,
         line: &str,
         watches: &dyn crate::watch::WatchNotifier,
@@ -994,7 +994,7 @@ mod tests {
 
     /// Runs `test` on this thread if it counts its own allocations, else in
     /// a process of its own, where it does (see `memory_use`).
-    fn counting(name: &str, test: impl FnOnce()) {
+    pub(crate) fn counting(name: &str, test: impl FnOnce()) {
         const CHILD: &str = "KIVIDB_BITMAP_TEST_CHILD";
         if crate::memory_use::allocated_by_this_thread().is_some() {
             return test();
@@ -1005,7 +1005,7 @@ mod tests {
 
     /// Runs `test` in a process of its own: it sets what the whole process
     /// shares.
-    fn alone(name: &str, test: impl FnOnce()) {
+    pub(crate) fn alone(name: &str, test: impl FnOnce()) {
         const CHILD: &str = "KIVIDB_BITMAP_TEST_ALONE";
         if std::env::var_os(CHILD).is_some() {
             return test();
@@ -1023,7 +1023,7 @@ mod tests {
         assert!(status.success(), "{name} failed in a process of its own");
     }
 
-    fn put(store: &store::Store, key: &[u8], value: &[u8]) {
+    pub(crate) fn put(store: &store::Store, key: &[u8], value: &[u8]) {
         drop(
             store::get_shard(&store[0], key)
                 .write()
@@ -1032,7 +1032,7 @@ mod tests {
     }
 
     /// `key`'s bytes, and where they are.
-    fn stored(store: &store::Store, key: &[u8]) -> Option<(Vec<u8>, usize)> {
+    pub(crate) fn stored(store: &store::Store, key: &[u8]) -> Option<(Vec<u8>, usize)> {
         let map = store::get_shard(&store[0], key).read();
         match map.get(key) {
             Some(ValueRef::String(b)) => Some((b.to_vec(), b.as_ptr() as usize)),
@@ -1041,7 +1041,7 @@ mod tests {
     }
 
     /// Whether `key`'s bytes are in its entry: a second hold is then a copy.
-    fn in_entry(store: &store::Store, key: &[u8]) -> bool {
+    pub(crate) fn in_entry(store: &store::Store, key: &[u8]) -> bool {
         let map = store::get_shard(&store[0], key).read();
         matches!(map.get(key), Some(ValueRef::String(b)) if !b.is(&b.to_shared()))
     }
@@ -1101,7 +1101,7 @@ mod tests {
 
     /// What holds a value besides its key while a `SETBIT` runs.
     #[derive(Debug, Clone, Copy, PartialEq)]
-    enum Holder {
+    pub(crate) enum Holder {
         Nothing,
         /// The entry, as a snapshot being written does.
         Entry,
