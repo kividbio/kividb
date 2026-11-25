@@ -11882,7 +11882,7 @@ fn restart_without_came_at(nodes: &mut [Node], except: usize) {
 /// its owner's config epoch) and D's config epoch then moves (`moves`: a
 /// collision, `CLUSTER BUMPEPOCH`, or not at all): every change of D's
 /// epoch reaches the replica in its stream (`TAKEN`), and it claims at it.
-fn replica_in_step_after_the_voters_lost_their_history(moves: Option<EpochMoves>) {
+fn replica_in_step_after_the_voters_started_without_their_came_at(moves: Option<EpochMoves>) {
     let env = [BUS_CONTROL];
     let started: Vec<Node> = (0..4).map(|_| Node::start_with_env(&[], &env)).collect();
     let (mut nodes, ranges) = form_cluster_of(started);
@@ -12003,27 +12003,27 @@ fn replica_in_step_after_the_voters_lost_their_history(moves: Option<EpochMoves>
 #[test]
 fn a_replica_in_step_is_elected_for_every_slot_after_every_voter_started_without_its_came_at_file()
 {
-    replica_in_step_after_the_voters_lost_their_history(None);
+    replica_in_step_after_the_voters_started_without_their_came_at(None);
 }
 
 #[test]
 fn a_replica_in_step_is_elected_for_every_slot_after_a_collision_moved_its_masters_epoch_past_the_voters_history()
  {
-    replica_in_step_after_the_voters_lost_their_history(Some(EpochMoves::Collision));
+    replica_in_step_after_the_voters_started_without_their_came_at(Some(EpochMoves::Collision));
 }
 
 #[test]
 fn a_replica_in_step_is_elected_for_every_slot_after_bumpepoch_moved_its_masters_epoch_past_the_voters_history()
  {
-    replica_in_step_after_the_voters_lost_their_history(Some(EpochMoves::BumpEpoch));
+    replica_in_step_after_the_voters_started_without_their_came_at(Some(EpochMoves::BumpEpoch));
 }
 
 /// One master asked for its vote takes the master's slots to have come
 /// later than they did (it started without its `.came-at` after the
 /// master's epoch moved), the others know when they came: the replica,
 /// which holds every acknowledged write of its master but did not read the
-/// claim at the master's newest epoch (its stream held back,
-/// `KIVIDB_TEST_STREAM_STALL`, before `CLUSTER BUMPEPOCH` on the master), is
+/// claim at the master's newest epoch (its stream held back by the test hook
+/// before `CLUSTER BUMPEPOCH` on the master), is
 /// refused its slots by that one and keeps them, as the others are a
 /// quorum: it is elected for every slot of its master. Five masters.
 #[test]
