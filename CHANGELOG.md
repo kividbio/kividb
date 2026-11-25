@@ -9,6 +9,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrading
 
+- **Cluster: masters vote on when the slots a replica claims came to its
+  master.** Asked for its vote, a master refuses it to a replica that claims
+  a slot of its master at an older epoch than the slot came to the master
+  at; the replica stands again without that slot. Each master keeps
+  `<cluster-config-file>.came-at` beside `nodes.conf`; one that starts
+  without it takes each slot to have come at its owner's config epoch. `CLUSTER FAILOVER TAKEOVER` takes the master's
+  slots without asking the other masters, whatever the replica holds of
+  them: use `FORCE` where the vote should decide.
+
 - **A query that names no `DIALECT` is read in dialect 1 (#247).** It is
   read in the default dialect, as in Redis: 1, which `search-default-dialect`
   (`CONFIG SET`, the configuration file) or `FT.CONFIG SET DEFAULT_DIALECT`
@@ -154,6 +163,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   goes on writing to it, the old master comes back as its replica, and the
   config files name the new master. The workflow runs on each release and
   by hand, never on pull requests. `docs/SENTINEL.md` covers setting it up.
+
+- **Cluster: a master refuses its vote for slots that came to the
+  candidate's master after the claim the candidate read.** A replica claims
+  its master's slots, when it stands for election (automatic, or `CLUSTER
+  FAILOVER [FORCE]`), at the epoch of the newest claim of its master it read
+  in its replication stream (`TAKEN`), or of an import whose data it read
+  (`ARRIVED`) at a newer one; that epoch is written down with the slots it
+  does not hold (`<cluster-config-file>.not-held`) and read back at
+  start-up. Each master keeps, per slot, the epoch of the claim that gave
+  the slot to its owner (`<cluster-config-file>.came-at`, with each slot's
+  owner, written, synced, before the saves of `nodes.conf`; a slot it does
+  not have with that owner is taken to have come at the owner's config
+  epoch). Asked for its vote, a master refuses it to a replica that claims
+  a slot of its master at an older epoch than the slot came to the master
+  at, and says when each such slot came (`UPDATE`, with one field more, or
+  two), and whether it knows that from a claim it took in or a slot it gave
+  to its owner, or takes it from the owner's config epoch. The replica gives
+  a slot up at a refusal of the first kind, and at refusals of the second
+  kind once they leave too few masters, of those not marked failing, for a
+  quorum; it then holds the slot only through a `TAKEN` at that epoch or
+  later that lists it, or an `ARRIVED` at that very epoch, and asks again
+  for the others.
 
 - **`search-resp3-reply`: the shape of the search commands' RESP3 replies (#1021).**
   `auto` (the default) answers `FT.SEARCH`, `FT.AGGREGATE` (and its cursor), `FT.HYBRID`,

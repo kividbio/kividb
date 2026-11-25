@@ -249,6 +249,18 @@ struct NotHeld {
     /// In memory only: after a restart, the stream's claims set it again.
     /// See [`NotHeld::stream_holds`].
     stream_claim: Option<(u64, Ranges)>,
+    /// The epoch of the newest claim of the master read in its stream
+    /// (`TAKEN`), kept across a full sync and a restart (written down with
+    /// the slots not held): the epoch this node holds the master's slots as
+    /// of, and claims them at when it stands for election
+    /// ([`FollowedImports::claim_epochs`]). `None` before the first one.
+    confirmed: Option<u64>,
+    /// Started without the file (none was written: a node of an earlier
+    /// release, or no claim read before it stopped), or with one that has
+    /// no confirmed epoch: until a claim is read, the master's slots are
+    /// claimed at its config epoch in nodes.conf, the view the dataset
+    /// loaded with it has, as every slot of it is held then.
+    baseline: bool,
 }
 
 impl NotHeld {
@@ -261,6 +273,29 @@ impl NotHeld {
         }
     }
 
+    /// The epoch to claim a slot of the master at, standing for election.
+    fn claim_epochs(
+        &self,
+        master: NodeId,
+        view_epoch: u64,
+        arrived: Vec<(u64, Ranges)>,
+    ) -> ClaimEpochs {
+        if self.master != Some(master) || self.plain {
+            return ClaimEpochs::at(view_epoch);
+        }
+        match self.confirmed {
+            Some(confirmed) => ClaimEpochs {
+                base: confirmed,
+                arrived: arrived
+                    .into_iter()
+                    .filter(|(e, _)| *e > confirmed)
+                    .collect(),
+            },
+            None if self.baseline => ClaimEpochs::at(view_epoch),
+            None => ClaimEpochs { base: 0, arrived },
+        }
+    }
+
     /// Whether this node holds `slot` as of a claim of it by its master at
     /// `epoch`: the last claim read in the master's stream lists it, at
     /// `epoch` or later ([`claim_holds`]).
@@ -268,6 +303,34 @@ impl NotHeld {
         self.stream_claim
             .as_ref()
             .is_some_and(|claim| claim_holds(claim, slot, epoch))
+    }
+}
+
+/// The epochs a replica claims its master's slots at when it stands for
+/// election ([`FollowedImports::claim_epochs`]).
+pub(crate) struct ClaimEpochs {
+    /// The epoch of the newest claim of the master read in its stream.
+    base: u64,
+    /// `ARRIVED` markers at newer epochs: a slot one covers is claimed at
+    /// its epoch, as this node holds it as of a takeover at that epoch.
+    arrived: Vec<(u64, Ranges)>,
+}
+
+impl ClaimEpochs {
+    fn at(epoch: u64) -> Self {
+        ClaimEpochs {
+            base: epoch,
+            arrived: Vec::new(),
+        }
+    }
+
+    /// The epoch to claim `slot` at.
+    pub(crate) fn epoch(&self, slot: u16) -> u64 {
+        self.arrived
+            .iter()
+            .filter(|(_, r)| in_ranges(r, slot))
+            .map(|(e, _)| *e)
+            .fold(self.base, u64::max)
     }
 }
 
@@ -334,12 +397,28 @@ impl FollowedImports {
         not_held.stream_claim.clone()
     }
 
+    /// The epochs a replica of `master` claims its slots at when it stands
+    /// for election, `view_epoch` being the master's config epoch here: the
+    /// epoch of the newest claim of it read in its stream (`confirmed`),
+    /// and for a slot an `ARRIVED` at a newer epoch covers, that epoch. For
+    /// a master whose stream carries no markers, or that this node has
+    /// no session with yet, `view_epoch`. Before the first claim read: `view_epoch` if this node
+    /// started holding every slot of its master as nodes.conf has them (no
+    /// file, see [`NotHeld::baseline`]); else 0, which a voter that knows
+    /// when the master's slots came to it refuses for each of them.
+    pub(crate) fn claim_epochs(&self, master: NodeId, view_epoch: u64) -> ClaimEpochs {
+        let arrived = self.arrived_into(node_id_str(&master));
+        self.not_held
+            .lock()
+            .claim_epochs(master, view_epoch, arrived)
+    }
+
     /// What [`NotHeld`] is to be written down as: `None`, nothing (no
     /// file).
     fn not_held_text(&self) -> Option<String> {
         let not_held = self.not_held.lock();
         let master = not_held.master?;
-        if not_held.plain || not_held.slots.is_empty() {
+        if not_held.plain || (not_held.slots.is_empty() && not_held.confirmed.is_none()) {
             return None;
         }
         let mut out = format!("master {}\n", node_id_str(&master));
@@ -356,6 +435,9 @@ impl FollowedImports {
         }
         if let Some((a, b, e)) = run {
             out.push_str(&format!("{a}-{b} {e}\n"));
+        }
+        if let Some(confirmed) = not_held.confirmed {
+            out.push_str(&format!("{CONFIRMED} {confirmed}\n"));
         }
         out.push_str(NOT_HELD_END);
         out.push('\n');
@@ -401,6 +483,7 @@ impl FollowedImports {
         }
         if !exact {
             not_held.stream_claim = Some((epoch, ranges.to_vec()));
+            not_held.confirmed = Some(not_held.confirmed.map_or(epoch, |c| c.max(epoch)));
         }
         let epoch = if !exact && std::mem::take(&mut not_held.sync_claim_due) {
             u64::MAX
@@ -620,6 +703,9 @@ fn parse_not_held(text: &str) -> Result<(NodeId, std::collections::BTreeMap<u16,
             ended = true;
             continue;
         }
+        if line.starts_with(CONFIRMED) {
+            continue;
+        }
         let (range, epoch) = line.split_once(' ').ok_or(())?;
         let epoch: u64 = epoch.parse().map_err(|_| ())?;
         let (a, b) = range.split_once('-').ok_or(())?;
@@ -635,6 +721,16 @@ fn parse_not_held(text: &str) -> Result<(NodeId, std::collections::BTreeMap<u16,
         return Err(());
     }
     Ok((master, slots))
+}
+
+/// The line of `<cluster-config-file>.not-held` that gives
+/// [`NotHeld::confirmed`].
+const CONFIRMED: &str = "confirmed";
+
+/// [`NotHeld::confirmed`] as written down in `text`, if it is.
+fn parse_confirmed(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(CONFIRMED)?.strip_prefix(' ')?.parse().ok())
 }
 
 /// At start-up: what this node, a replica, does not hold of its master's
@@ -655,7 +751,16 @@ fn load_not_held(cluster: &ClusterState) {
     };
     let text = match std::fs::read(&path) {
         Ok(bytes) => String::from_utf8(bytes).ok(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No file: every slot of the master is held as nodes.conf has
+            // them, and claimed at its epoch there (`NotHeld::baseline`).
+            if let Some(master) = cluster.my_master_id() {
+                let mut not_held = cluster.followed_imports.not_held.lock();
+                not_held.about(master);
+                not_held.baseline = true;
+            }
+            return;
+        }
         Err(_) => None,
     };
     let Some(master) = cluster.my_master_id() else {
@@ -678,6 +783,8 @@ fn load_not_held(cluster: &ClusterState) {
                 .into_iter()
                 .filter(|(slot, _)| of_master.binary_search(slot).is_ok())
                 .collect();
+            not_held.confirmed = text.as_deref().and_then(parse_confirmed);
+            not_held.baseline = not_held.confirmed.is_none();
             if !not_held.slots.is_empty() {
                 log_info!(
                     "Cluster: this node does not hold slots {} of its master yet: its master \
@@ -1823,6 +1930,58 @@ mod tests {
         f.note_gains(other, &[(50, 1)]);
         assert_eq!(f.stream_claim_of(m), None);
         assert_eq!(f.not_held_of(other), vec![50]);
+    }
+
+    /// The newest claim read is the epoch a replica claims its master's
+    /// slots at, written down and read back with the slots not held; an
+    /// `ARRIVED` at a newer epoch is the epoch of the slots it covers.
+    /// Before any claim: 0, or the master's epoch in nodes.conf for a node
+    /// that started without the file; the master's epoch here for a master
+    /// without markers, or one this node has no session with.
+    #[test]
+    fn a_replica_claims_its_masters_slots_at_the_newest_claim_it_read() {
+        let f = FollowedImports::default();
+        let (m, other) = (
+            crate::cluster::generate_node_id(),
+            crate::cluster::generate_node_id(),
+        );
+        assert_eq!(f.claim_epochs(m, 9).epoch(1), 9, "no session");
+        f.session_with(Some(m), true, false);
+        assert_eq!(f.claim_epochs(m, 9).epoch(1), 0, "no claim read");
+        f.confirm_held(m, 5, &[(0, 99)], false);
+        f.confirm_held(m, 4, &[(0, 99)], false);
+        assert_eq!(f.claim_epochs(m, 9).epoch(1), 5);
+        f.note_arrived(node_id_str(&m).to_string(), 7, vec![(200, 299)]);
+        f.note_arrived(node_id_str(&m).to_string(), 3, vec![(300, 399)]);
+        let epochs = f.claim_epochs(m, 9);
+        assert_eq!(
+            (epochs.epoch(1), epochs.epoch(250), epochs.epoch(350)),
+            (5, 7, 5)
+        );
+        assert_eq!(f.claim_epochs(other, 9).epoch(1), 9);
+        let text = f.not_held_text().unwrap();
+        assert_eq!(
+            text,
+            format!("master {}\nconfirmed 5\nend\n", node_id_str(&m))
+        );
+        assert_eq!(parse_confirmed(&text), Some(5));
+        let (of, slots) = parse_not_held(&text).unwrap();
+        assert_eq!((of, slots.len()), (m, 0));
+        // A full sync keeps it; a master without markers: its config epoch.
+        f.session_with(Some(m), true, true);
+        assert_eq!(f.claim_epochs(m, 9).epoch(1), 5);
+        f.session_with(Some(m), false, false);
+        assert_eq!(f.claim_epochs(m, 9).epoch(1), 9);
+        // Started without the file: the master's epoch in nodes.conf.
+        let f = FollowedImports::default();
+        {
+            let mut not_held = f.not_held.lock();
+            not_held.about(m);
+            not_held.baseline = true;
+        }
+        assert_eq!(f.claim_epochs(m, 6).epoch(1), 6);
+        f.confirm_held(m, 4, &[(0, 99)], false);
+        assert_eq!(f.claim_epochs(m, 6).epoch(1), 4);
     }
 
     /// The slots not held read back as written; a file cut short, or with
