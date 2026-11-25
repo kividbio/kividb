@@ -196,7 +196,12 @@ fn misplaced_option(option: &str, owner: &str, previous: Option<&SchemaField>) -
 }
 
 /// A field as `FT.INFO` describes it, and as `FT.CREATE` would be given it.
-fn describe_field(field: &SchemaField) -> Vec<Vec<u8>> {
+///
+/// `valkey`: valkey-search's layout of a vector field, which keeps what the
+/// index holds in an `index` list (`dimensions`, `distance_metric`,
+/// `data_type` and `algorithm`) where Redis lists them one after another.
+/// valkey-glide's callers (Open WebUI) read the dimensions from there.
+fn describe_field(field: &SchemaField, valkey: bool) -> Vec<Vec<u8>> {
     let mut out = vec![
         resp_bulk_str("identifier"),
         resp_bulk_str(&field.name),
@@ -205,7 +210,47 @@ fn describe_field(field: &SchemaField) -> Vec<Vec<u8>> {
         resp_bulk_str("type"),
         resp_bulk_str(field.type_name()),
     ];
-    if let FieldType::Vector {
+    if valkey
+        && let FieldType::Vector {
+            algo,
+            dim,
+            metric,
+            data_type,
+        } = &field.field_type
+    {
+        let algorithm = match algo {
+            VectorAlgo::Flat => vec![resp_simple("name"), resp_simple("FLAT")],
+            VectorAlgo::Hnsw {
+                m,
+                ef_construction,
+                ef_runtime,
+            } => vec![
+                resp_simple("name"),
+                resp_simple("HNSW"),
+                resp_simple("m"),
+                resp_integer(*m as i64),
+                resp_simple("ef_construction"),
+                resp_integer(*ef_construction as i64),
+                resp_simple("ef_runtime"),
+                resp_integer(*ef_runtime as i64),
+            ],
+        };
+        out.push(resp_simple("index"));
+        out.push(resp_array(vec![
+            resp_simple("dimensions"),
+            resp_integer(*dim as i64),
+            resp_simple("distance_metric"),
+            resp_simple(match metric {
+                DistanceMetric::L2 => "L2",
+                DistanceMetric::Cosine => "COSINE",
+                DistanceMetric::InnerProduct => "IP",
+            }),
+            resp_simple("data_type"),
+            resp_simple(data_type.name()),
+            resp_simple("algorithm"),
+            resp_array(algorithm),
+        ]));
+    } else if let FieldType::Vector {
         algo,
         dim,
         metric,
@@ -579,7 +624,7 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
         resp_array(
             def.fields
                 .iter()
-                .map(|field| resp_array(simple_names(describe_field(field), valkey)))
+                .map(|field| resp_array(simple_names(describe_field(field, valkey), valkey)))
                 .collect(),
         ),
     );
@@ -772,7 +817,63 @@ pub(crate) fn no_such_index(name: &str) -> String {
 /// before it.
 pub(crate) fn is_no_such_index(error: &str) -> bool {
     let error = error.trim_end();
-    error.starts_with("SEARCH_INDEX_NOT_FOUND ") || error.ends_with("no such index")
+    error.starts_with("SEARCH_INDEX_NOT_FOUND ")
+        || error.ends_with("no such index")
+        || (error.starts_with("Index with name '") && error.contains("' not found in database "))
+}
+
+/// Whether the error text for a missing index is valkey-search's for this
+/// connection: `search-resp3-reply valkey`, or `auto` and a connection that
+/// named itself a GLIDE client. Like the shape of a RESP3 reply, but on
+/// every protocol. Not for a node answering a coordinator of its cluster
+/// (a forwarded search or schema command), and not inside a script, which
+/// reads the Redis text whoever calls it.
+pub(crate) fn valkey_wording(ctx: &Ctx) -> bool {
+    let setting = RESP3_REPLY.load(std::sync::atomic::Ordering::Relaxed);
+    if setting == RESP3_REDIS {
+        return false;
+    }
+    let glide = setting == RESP3_AUTO && ctx.client_registry.get_glide(ctx.client_id);
+    let forwarded =
+        crate::cluster::search::is_forwarded(ctx) || crate::cluster::ddl::is_forwarded(ctx);
+    #[cfg(feature = "lua")]
+    let in_script = crate::commands::lua::script_eval_script_resp().is_some();
+    #[cfg(not(feature = "lua"))]
+    let in_script = false;
+    wording_is_valkey(setting, glide, forwarded, in_script)
+}
+
+/// The decision of [`valkey_wording`]: `setting` is the value of
+/// `search-resp3-reply`, `glide` whether an `auto` connection is a GLIDE
+/// client's.
+fn wording_is_valkey(setting: u8, glide: bool, forwarded: bool, in_script: bool) -> bool {
+    if forwarded || in_script {
+        return false;
+    }
+    match setting {
+        RESP3_REDIS => false,
+        RESP3_VALKEY => true,
+        _ => glide,
+    }
+}
+
+/// `reply`, if it is the error [`no_such_index`] makes, worded as
+/// valkey-search words it: `Index with name '<name>' not found in database
+/// <db>`. Any other reply is returned as it is.
+pub(crate) fn valkey_missing_index(reply: Vec<u8>, db: usize) -> Vec<u8> {
+    const HEAD: &[u8] = b"-SEARCH_INDEX_NOT_FOUND Index not found: ";
+    if let Some(name) = reply
+        .strip_prefix(HEAD)
+        .and_then(|rest| rest.strip_suffix(b"\r\n"))
+        && !name.contains(&b'\r')
+        && !name.contains(&b'\n')
+    {
+        let mut out = b"-Index with name '".to_vec();
+        out.extend_from_slice(name);
+        out.extend_from_slice(format!("' not found in database {db}\r\n").as_bytes());
+        return out;
+    }
+    reply
 }
 
 // ── Running a filter ──────────────────────────────────────────────────────────
@@ -2875,9 +2976,11 @@ fn encode_page(
 thread_local! {
     /// Set while a coordinator runs its own part of a search.
     static SHARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Set while `FT.PROFILE` runs the query it profiles: valkey-search has
-    /// no `FT.PROFILE`, so its reply, and the one inside it, keep the Redis
-    /// shape in every mode.
+    /// Set while `FT.PROFILE` runs the query it profiles for a connection that
+    /// gets the Redis shape, so that the reply inside the profile is Redis's
+    /// too. A connection that takes valkey-search's shape does not set it: its
+    /// profile is the array valkey-glide converts, with the search's reply in
+    /// that shape.
     static PROFILING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -3763,5 +3866,62 @@ mod tests {
         assert!(!no_time_for(None, usize::MAX));
         let later = Some(Instant::now() + Duration::from_secs(60));
         assert!(!no_time_for(later, usize::MAX));
+    }
+
+    #[test]
+    fn a_missing_index_is_worded_as_valkey_search_words_it() {
+        let redis = format!("-{}\r\n", no_such_index("idx:a b"));
+        assert_eq!(
+            redis,
+            "-SEARCH_INDEX_NOT_FOUND Index not found: idx:a b\r\n"
+        );
+        assert_eq!(
+            valkey_missing_index(redis.into_bytes(), 3),
+            b"-Index with name 'idx:a b' not found in database 3\r\n"
+        );
+        // Another reply is returned as it is.
+        for other in [
+            "-ERR wrong number of arguments for 'FT.INFO' command\r\n",
+            "+OK\r\n",
+            "-SEARCH_INDEX_NOT_FOUND Index not found: a\r\nb\r\n",
+        ] {
+            assert_eq!(
+                valkey_missing_index(other.as_bytes().to_vec(), 0),
+                other.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn the_wording_follows_the_setting_except_for_a_forwarded_command_or_a_script() {
+        // (setting, glide, forwarded, in a script) -> valkey's words
+        for (setting, glide, forwarded, script, want) in [
+            (RESP3_AUTO, false, false, false, false),
+            (RESP3_AUTO, true, false, false, true),
+            (RESP3_REDIS, true, false, false, false),
+            (RESP3_VALKEY, false, false, false, true),
+            // A node answering its cluster's coordinator speaks Redis's words.
+            (RESP3_VALKEY, false, true, false, false),
+            (RESP3_AUTO, true, true, false, false),
+            // A script reads the Redis text whoever runs it.
+            (RESP3_VALKEY, false, false, true, false),
+            (RESP3_AUTO, true, false, true, false),
+        ] {
+            assert_eq!(
+                wording_is_valkey(setting, glide, forwarded, script),
+                want,
+                "{setting} {glide} {forwarded} {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_wordings_of_a_missing_index_are_known_to_a_coordinator() {
+        assert!(is_no_such_index(&no_such_index("idx")));
+        assert!(is_no_such_index(
+            "Index with name 'idx' not found in database 0\r\n"
+        ));
+        assert!(is_no_such_index("ERR no such index"));
+        assert!(!is_no_such_index("ERR wrong number of arguments"));
     }
 }

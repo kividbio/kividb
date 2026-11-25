@@ -67,6 +67,15 @@ pub fn should_forward(reply: &[u8]) -> bool {
     }
 }
 
+/// Whether this command is a copy another master forwarded.
+pub fn is_forwarded(ctx: &crate::commands::ctx::Ctx) -> bool {
+    ctx.cluster.enabled
+        && ctx
+            .client_registry
+            .get(ctx.client_id)
+            .is_some_and(|c| c.name == FORWARDED)
+}
+
 /// Send the command in `ctx`, which this node answered with `reply`, to the
 /// other masters, and give the client `reply` — or, if some of them did not
 /// take it, an error that says so.
@@ -81,10 +90,7 @@ pub fn spread(ctx: &crate::commands::ctx::Ctx, reply: Vec<u8>) -> Vec<u8> {
         || !should_forward(&reply)
         || crate::write_gate::held_by_this_thread()
         || crate::command_gate::alone_on_this_thread()
-        || ctx
-            .client_registry
-            .get(ctx.client_id)
-            .is_some_and(|c| c.name == FORWARDED)
+        || is_forwarded(ctx)
     {
         return reply;
     }
