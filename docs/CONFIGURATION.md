@@ -174,7 +174,9 @@ is read as a line of an ACL file (the rules of `ACL SETUSER`, a quoted word
 read with `\"`, `\\` and `\xHH`), and defines that user at startup. A
 `user default` line wins over `requirepass`. With no `aclfile` set,
 `CONFIG REWRITE` writes one such line for each user, `default` first, the
-passwords as `#<sha256>` hashes, and `requirepass` beside it as it is set.
+passwords as `#<sha256>` hashes, and `requirepass` beside it as it is set;
+the default user has a line only when it is not the user `requirepass`
+gives by itself. A file with `user` lines is read by 1.3.0 and later.
 `user` lines and `aclfile` together are refused at startup; with an
 `aclfile`, `ACL SAVE` writes the users there. `CONFIG GET` lists no users.
 

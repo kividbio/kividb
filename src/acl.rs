@@ -684,13 +684,21 @@ pub fn load_config_users(
 /// written in double quotes, with `\"`, `\\` and `\xHH`, as an ACL file's
 /// quoted words are read ([`file_words`]). So the file stays one line per
 /// user, and UTF-8.
-pub fn config_lines(store: &AclStore) -> Vec<String> {
+///
+/// The default user has a line only when it is not the user `requirepass`
+/// (the value written beside these lines) gives by itself: a start from
+/// the file makes that user from `requirepass` when no line names it, so
+/// the line would add nothing, and a file without `user` lines is one
+/// every version reads.
+pub fn config_lines(store: &AclStore, requirepass: &str) -> Vec<String> {
     let map = store.read();
+    let from_requirepass = AclUser::default_user(requirepass).to_acl_line();
     let mut names: Vec<&String> = map.keys().collect();
     names.sort_by_key(|n| (n.as_str() != "default", n.as_str()));
     names
         .into_iter()
         .filter_map(|name| map.get(name))
+        .filter(|user| user.name != "default" || user.to_acl_line() != from_requirepass)
         .map(|user| {
             let line = user.to_acl_line();
             let rest = &line[format!("user {} ", user.name).len()..];
@@ -1704,7 +1712,11 @@ mod tests {
             }
             map.insert("q".into(), user);
         }
-        let lines = super::config_lines(&store);
+        // The default user as `requirepass` gives it has no line.
+        let lines = super::config_lines(&store, "");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("user q "), "{lines:?}");
+        let lines = super::config_lines(&store, "another");
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("user default "), "{lines:?}");
         assert!(lines.iter().all(|l| !l.contains(['\n', '\r'])), "{lines:?}");

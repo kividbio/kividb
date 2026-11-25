@@ -5753,7 +5753,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     use crate::config::RewriteError;
                     let rows = config_rows_with_secrets(ctx);
                     let mut config = ctx.config.with_values(&rows);
-                    config.users = crate::acl::config_lines(ctx.acl_store);
+                    config.users = crate::acl::config_lines(ctx.acl_store, &config.requirepass);
                     match config.rewrite_with(&rows) {
                         Ok(()) => Some(resp_simple("OK")),
                         Err(RewriteError::NoConfigFile) => Some(resp_error(

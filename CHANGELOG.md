@@ -160,7 +160,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   <rule>...` line in the config file is read as a line of an ACL file is,
   and defines that user at startup; a `user default` line wins over
   `requirepass`, as in Redis. `CONFIG REWRITE` writes one `user` line for
-  each user, `default` first, the passwords as `#<sha256>` hashes. With an
+  each user, `default` first, the passwords as `#<sha256>` hashes; the
+  default user has a line only when it is not the user `requirepass`
+  gives by itself. With an
   `aclfile`, the users stay in it (`ACL SAVE`), and a config file with
   `user` lines and `aclfile` both is refused at startup, as Redis refuses
   it. `CONFIG GET` lists no users.
