@@ -10738,12 +10738,18 @@ fn a_replica_that_has_not_heard_its_master_take_slots_counts_the_masters_that_ow
                 .all(|n| owner_in_view_of(n, a).as_deref() == Some(dst_id.as_str()))
         },
     );
-    // It takes in none of the destination's claims: the slots are the
-    // source's in its view, whenever it is looked at.
+    // It takes in none of the destination's claims: the slots are not the
+    // destination's in its view, whenever it is looked at. They are the
+    // source's in its table; `CLUSTER NODES` lists them on the source's
+    // line while the source is a master, and on no line once the source,
+    // left with no slots, follows the destination as a replica (when the
+    // destination's claim reaches it before its own handover ends; see
+    // `a_replica_that_has_not_heard_its_master_take_slots_is_elected_with_them_after_the_source_follows_its_master`).
     for _ in 0..10 {
-        assert_eq!(
-            owner_in_view_of(&replica, a).as_deref(),
-            Some(src_id.as_str())
+        let owner = owner_in_view_of(&replica, a);
+        assert!(
+            owner.as_deref() == Some(src_id.as_str()) || owner.is_none(),
+            "{owner:?}"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -11732,6 +11738,122 @@ fn a_replica_restarted_before_the_election_claims_at_the_epoch_it_read() {
         let absent = written.missing_on(&replica);
         assert!(absent.is_empty(), "{} keys not on the owner", absent.len());
     }
+}
+
+/// [`a_replica_that_has_not_heard_its_master_take_slots_counts_the_masters_that_own_slots`],
+/// with the source left with no slots following the destination as a
+/// replica: the destination answers its `TAKEOVER` late
+/// (`KIVIDB_TEST_TAKEOVER_REPLY_DELAY_MS`), so its claim reaches the source
+/// first. The destination's replica, which takes in none of the
+/// destination's claims, still has the slots as the source's in its table
+/// (`CLUSTER NODES` lists them on no line, the source being a replica now).
+/// Once the destination and the source (its replica now) are stopped,
+/// the masters it asks tell it the
+/// destination's claims; it holds what arrived, takes them in, and is
+/// elected with the imported slots and every acknowledged write.
+#[test]
+fn a_replica_that_has_not_heard_its_master_take_slots_is_elected_with_them_after_the_source_follows_its_master()
+ {
+    let dst = Node::start_with_env(&[], &[("KIVIDB_TEST_TAKEOVER_REPLY_DELAY_MS", "3000")]);
+    let (mut nodes, ranges) = form_cluster_of(vec![
+        Node::start(&[]),
+        dst,
+        Node::start(&[]),
+        Node::start(&[]),
+    ]);
+    let replica = add_replica_with_env(
+        &nodes,
+        &nodes[1],
+        &[IGNORE_CLAIMS, ("KIVIDB_TEST_IGNORE_STREAM_CLAIMS", "1")],
+    );
+    {
+        let all: Vec<&Node> = nodes.iter().chain(std::iter::once(&replica)).collect();
+        wait_cluster_ok(&all, 5);
+    }
+    assert!(
+        replica
+            .conn()
+            .cmd(&["CONFIG", "SET", "cluster-replica-validity-factor", "0"])
+            .is_ok()
+    );
+    let dst_id = nodes[1].id();
+    std::fs::write(replica.dir.join(IGNORE_CLAIMS.1), &dst_id).unwrap();
+    let (a, b) = ranges[3];
+    let before = Written::on(&nodes[3], a..=b, "before", 100);
+    import_until_taken(&nodes[1], a, b);
+    wait_until(
+        "the source, left with no slots, to follow the destination",
+        Duration::from_secs(30),
+        || !nodes[3].is_master() && nodes[3].my_row()[3] == dst_id,
+    );
+    wait_until(
+        "the other masters to hear of the new owner",
+        Duration::from_secs(20),
+        || {
+            [&nodes[0], &nodes[2]]
+                .iter()
+                .all(|n| owner_in_view_of(n, a).as_deref() == Some(dst_id.as_str()))
+        },
+    );
+    let src_id = nodes[3].id();
+    wait_until(
+        "the destination's replica to know the source as a replica",
+        Duration::from_secs(20),
+        || row_of(&replica, &src_id).is_some_and(|row| row[2].contains("slave")),
+    );
+    for _ in 0..10 {
+        assert_eq!(owner_in_view_of(&replica, a), None);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let after = Written::on(&nodes[1], a..=b, "after", 100);
+    assert_eq!(nodes[1].conn().cmd(&["WAIT", "2", "5000"]).int(), 2);
+    // The source, a replica of the destination now, is stopped too: the
+    // replica that stands is the one whose table has the slots as the
+    // source's.
+    nodes[3].kill();
+    nodes[1].kill();
+    let replica_id = replica.id();
+    let live = [&nodes[0], &nodes[2], &replica];
+    let logs = || -> String {
+        live.iter()
+            .map(|n| {
+                format!(
+                    "==== node {}
+{}",
+                    n.port,
+                    n.log()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            )
+    };
+    assert!(
+        wait_until_or(Duration::from_secs(30), || {
+            replica.is_master()
+                && live.iter().all(|n| {
+                    owner_in_view_of(n, a).as_deref() == Some(replica_id.as_str())
+                        && owner_in_view_of(n, ranges[1].0).as_deref() == Some(replica_id.as_str())
+                })
+        }),
+        "the replica was not elected with both sets of slots in 30 s
+{}",
+        logs()
+    );
+    let absent = after.missing_on(&replica);
+    assert!(
+        absent.is_empty(),
+        "{} acknowledged writes not on the owner",
+        absent.len()
+    );
+    let absent = before.missing_on(&replica);
+    assert!(
+        absent.is_empty(),
+        "{} imported keys not on the owner",
+        absent.len()
+    );
 }
 
 /// A source killed while it waited to know whether the destination took
