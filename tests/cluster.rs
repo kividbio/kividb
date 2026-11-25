@@ -2564,11 +2564,10 @@ fn wait_one_owner_within(nodes: &[&Node], owner: &Node, key: &str, limit: Durati
 }
 
 /// Wait until `replica` has been promoted, every node in `others`
-/// redirects the slot of `key` to it, it has logged that the promotion is
-/// announced before it is on disk, and it takes a write of `after` there;
-/// then kill it. Its saves fail all along (the caller made them fail): the
-/// promotion was announced, and is not in its nodes.conf, which still has
-/// it a replica.
+/// redirects the slot of `key` to it, and it takes a write of `after`
+/// there; then kill it. Its saves fail all along (the caller made them
+/// fail): the promotion was announced, and is not in its nodes.conf, which
+/// still has it a replica.
 fn promote_then_kill_unsaved(replica: &mut Node, others: &[&Node], key: &str, after: &str) {
     wait_until(
         "the replica to be promoted",
@@ -2585,16 +2584,11 @@ fn promote_then_kill_unsaved(replica: &mut Node, others: &[&Node], key: &str, af
                 .all(|n| n.conn().cmd(&["GET", key]).err() == Some(moved.as_str()))
         },
     );
-    // The others can take the promotion in from the node's PONGs before
-    // the save it waits for has failed and it has said so.
-    let warned = wait_until_or(Duration::from_secs(10), || {
+    assert!(
         replica
             .log()
-            .contains("the promotion is announced before it is on disk")
-    });
-    assert!(
-        warned,
-        "no warning that the promotion is announced before it is on disk:\n{}",
+            .contains("the promotion is announced before it is on disk"),
+        "{}",
         replica.log()
     );
     let r = cmd_when_serving(&mut replica.conn(), &["SET", after, "after-promotion"]);
