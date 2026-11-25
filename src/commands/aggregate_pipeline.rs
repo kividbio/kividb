@@ -460,6 +460,12 @@ pub fn run_from(
                 if no_time_for(deadline, rows.len()) {
                     cut = true;
                 } else {
+                    // Rows level on every key keep their order so far (that
+                    // of their documents' writes, before a GROUPBY), or its
+                    // reverse where the last key is descending, as in Redis.
+                    if sort_keys.last().is_some_and(|(_, ascending)| !ascending) {
+                        rows.reverse();
+                    }
                     rows.sort_by(|a, b| compare_rows(a, b, &sort_keys));
                 }
 

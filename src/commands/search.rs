@@ -1234,6 +1234,23 @@ pub(crate) fn plan_keys(def: &IndexDef, plan: &Plan) -> (Vec<Arc<str>>, bool) {
     (keys, plan.exact && p.given_back() == plan.given_back)
 }
 
+/// [`plan_keys`], in the order the documents were written (by key where
+/// they are numbered alike).
+pub(crate) fn plan_keys_written(def: &IndexDef, plan: &Plan) -> (Vec<Arc<str>>, bool) {
+    let p = def.postings.peek();
+    let mut ids: Vec<u32> = plan.ids.iter().collect();
+    ids.sort_unstable_by(|&a, &b| {
+        p.written(a)
+            .cmp(&p.written(b))
+            .then_with(|| key_of(&p, a).cmp(key_of(&p, b)))
+    });
+    let keys = ids
+        .into_iter()
+        .filter_map(|id| p.key(id).cloned())
+        .collect();
+    (keys, plan.exact && p.given_back() == plan.given_back)
+}
+
 /// Relevance of the document at `key`, whose fields are `fields`, for the
 /// query `scoring` was made for: as Redis 8 scores it (see `vector::score`).
 pub(crate) fn relevance(
@@ -1555,9 +1572,11 @@ struct Posted {
 /// What a page picked from postings is in the order of.
 #[derive(Clone, Copy)]
 enum PageOrder<'a> {
-    /// The key: what relevance comes down to when every match scores the same.
-    Key,
-    /// The number in the NUMERIC field read from `field`, then the key.
+    /// The order the documents were written in (`Postings::first_written`):
+    /// what relevance comes down to when every match scores the same.
+    Written,
+    /// The number in the NUMERIC field read from `field`, then the order the
+    /// documents were written in; descending, the reverse of the two.
     Number { field: &'a str, ascending: bool },
 }
 
@@ -1589,7 +1608,8 @@ impl Clock {
 }
 
 /// Whether every document `filter` matches has the same relevance, so that
-/// without SORTBY the order is the key's alone (the full path's tie-break).
+/// without SORTBY the order is the one they were written in (the full
+/// path's, for matches that score the same).
 /// Scored as `vector::score` scores (Redis 8's way): a word by its
 /// frequency; a TAG value by how many documents hold it, against the
 /// document's TEXT length, and `*` against that length too; a NUMERIC
@@ -1627,6 +1647,45 @@ fn every_match_scores_the_same(
     }
 }
 
+/// Each run of `items` that `level` finds level, in the order its documents
+/// were written in `def` (as Redis orders them, by its document ids), or the
+/// reverse with `descending`. `items` are in order otherwise, each run by
+/// key: documents numbered alike (put in by one walk), and those of an index
+/// that numbers none (of vectors alone), stay by key, or by key reversed.
+/// Nothing is looked up where no two are level.
+pub(crate) fn level_in_written_order<T>(
+    def: &IndexDef,
+    items: &mut [T],
+    key: impl Fn(&T) -> &str,
+    level: impl Fn(&T, &T) -> bool,
+    descending: bool,
+) {
+    let mut postings = None;
+    let mut start = 0;
+    while start < items.len() {
+        let mut end = start + 1;
+        while end < items.len() && level(&items[start], &items[end]) {
+            end += 1;
+        }
+        if end - start > 1 {
+            let run = &mut items[start..end];
+            if descending {
+                run.reverse();
+            }
+            if def.gives_ids() {
+                let p = postings.get_or_insert_with(|| def.postings.read());
+                let written = |item: &T| {
+                    let n = p.id(key(item)).map_or(u64::MAX, |id| p.written(id));
+                    if descending { !n } else { n }
+                };
+                // Stable: those numbered alike keep their keys' order.
+                run.sort_by_cached_key(written);
+            }
+        }
+        start = end;
+    }
+}
+
 /// FT.SEARCH's page and count from postings, reading only the documents of
 /// the page: see above. `None` where the full path is to answer.
 fn page_from_postings(
@@ -1653,7 +1712,7 @@ fn page_from_postings(
     let (order, numeric) = match &args.sortby {
         // Only the count (LIMIT 0 0): no order to keep.
         None if args.count == 0 || every_match_scores_the_same(def, filter, scorer) => {
-            (PageOrder::Key, None)
+            (PageOrder::Written, None)
         }
         None => return None,
         Some((name, ascending)) => {
@@ -1745,7 +1804,7 @@ fn page_from_postings(
         let need = need.min(total);
         let mut clock = Clock::new(deadline);
         let first: Vec<(u32, Option<f64>)> = match order {
-            PageOrder::Key => first_by_key(&p, &ids, need, total, &mut clock)
+            PageOrder::Written => first_written(&p, &ids, need, total, false, &mut clock)
                 .into_iter()
                 .map(|id| (id, None))
                 .collect(),
@@ -1811,18 +1870,28 @@ fn key_of(p: &Postings, id: u32) -> &str {
     p.key(id).map_or("", |key| &**key)
 }
 
-/// The first `need` of `ids` (`of` of them) in the order of their keys,
-/// from the postings' order of them (`Postings::first_by_key`). Cut short
-/// when `clock` runs out: then the first of those found.
-fn first_by_key(p: &Postings, ids: &Bits, need: usize, of: usize, clock: &mut Clock) -> Vec<u32> {
-    p.first_by_key(ids, need, of, &mut || clock.ran_out())
+/// The first `need` of `ids` (`of` of them) in the order their documents
+/// were written, or the last ones, last first, with `descending`
+/// (`Postings::first_written`). Cut short when `clock` runs out: then the
+/// first of those found.
+fn first_written(
+    p: &Postings,
+    ids: &Bits,
+    need: usize,
+    of: usize,
+    descending: bool,
+    clock: &mut Clock,
+) -> Vec<u32> {
+    p.first_written(ids, need, of, descending, &mut || clock.ran_out())
 }
 
 /// The first `need` of `ids` in the order SORTBY gives the NUMERIC field
-/// read from `field`: by the number (`f64::total_cmp`), ascending or not,
-/// then by key; those without a number last, by key. Each with its number.
-/// `None` if a document holds NaN, which has no place in the postings'
-/// order. Cut short when `clock` runs out.
+/// read from `field`: by the number (`f64::total_cmp`), then by the order
+/// the documents were written in (as Redis, by its document ids), and
+/// descending the reverse of both; those without a number last, in the
+/// order they were written in, or its reverse. Each with its number. `None`
+/// if a document holds NaN, which has no place in the postings' order. Cut
+/// short when `clock` runs out.
 fn first_by_number(
     p: &Postings,
     field: &str,
@@ -1843,9 +1912,11 @@ fn first_by_number(
     if want > 0 {
         let value = |id: u32| numbers.value(id).unwrap_or(0.0);
         let cmp = |a: &(f64, u32), b: &(f64, u32)| {
-            let order = a.0.total_cmp(&b.0);
-            let order = if ascending { order } else { order.reverse() };
-            order.then_with(|| key_of(p, a.1).cmp(key_of(p, b.1)))
+            let order =
+                a.0.total_cmp(&b.0)
+                    .then_with(|| p.written(a.1).cmp(&p.written(b.1)))
+                    .then_with(|| key_of(p, a.1).cmp(key_of(p, b.1)));
+            if ascending { order } else { order.reverse() }
         };
         // Going through the numbers in order meets the `want` first after
         // about want * ordered / with_number of them; taking the number of
@@ -1857,8 +1928,8 @@ fn first_by_number(
         let mut gave_up = false;
         if walked < with_number as u128 {
             let mut budget = (walked * 4).max(4096);
-            // Those equal to the last one wanted are taken too: their keys
-            // decide which of them are on the page.
+            // Those equal to the last one wanted are taken too: the order
+            // they were written in decides which of them are on the page.
             let mut last: Option<u64> = None;
             numbers.walk(ascending, |place, id| {
                 if clock.ran_out() || last.is_some_and(|last| last != place) {
@@ -1900,7 +1971,7 @@ fn first_by_number(
         let mut rest = ids.clone();
         rest.and_not(numbers.has());
         let of = rest.count();
-        let more = first_by_key(p, &rest, need - with_number, of, clock);
+        let more = first_written(p, &rest, need - with_number, of, !ascending, clock);
         first.extend(more.into_iter().map(|id| (id, None)));
     }
     Some(first)
@@ -2500,6 +2571,15 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 );
                 scorer.nearest()
             };
+            let mut nearest = nearest;
+            // As near, in the order they were written.
+            level_in_written_order(
+                &def,
+                &mut nearest,
+                |found| &found.key,
+                |a, b| a.score.to_bits() == b.score.to_bits(),
+                false,
+            );
             nearest
                 .into_iter()
                 .map(|found| Hit {
@@ -2535,16 +2615,31 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             if no_time_for(deadline, matches.len()) {
                 timed_out = true;
             } else if by_distance {
-                // Nearest first.
+                // Nearest first; as near, in the order they were written.
+                let distance = |m: &Match| m.distance.unwrap_or(f32::MAX);
                 matches.sort_by(|a, b| {
-                    a.distance
-                        .unwrap_or(f32::MAX)
-                        .total_cmp(&b.distance.unwrap_or(f32::MAX))
+                    distance(a)
+                        .total_cmp(&distance(b))
                         .then_with(|| a.key.cmp(&b.key))
                 });
+                level_in_written_order(
+                    &def,
+                    &mut matches,
+                    |m| &m.key,
+                    |a, b| distance(a).to_bits() == distance(b).to_bits(),
+                    false,
+                );
             } else {
-                // Most relevant first.
+                // Most relevant first; as relevant, in the order they were
+                // written.
                 matches.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.key.cmp(&b.key)));
+                level_in_written_order(
+                    &def,
+                    &mut matches,
+                    |m| &m.key,
+                    |a, b| a.score.to_bits() == b.score.to_bits(),
+                    false,
+                );
             }
             matches
                 .into_iter()
@@ -2627,6 +2722,20 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 let order = if *ascending { order } else { order.reverse() };
                 order.then_with(|| a.key.cmp(&b.key))
             });
+            // Level values (and those without one), in the order the
+            // documents were written, or its reverse.
+            level_in_written_order(
+                &def,
+                &mut hits,
+                |hit| &hit.key,
+                |a, b| match (&a.sort_key, &b.sort_key) {
+                    (Some(SortKey::Number(x)), Some(SortKey::Number(y))) => x.total_cmp(y).is_eq(),
+                    (Some(SortKey::Text(x)), Some(SortKey::Text(y))) => x == y,
+                    (None, None) => true,
+                    _ => false,
+                },
+                !*ascending,
+            );
         }
     }
     // ── The page ─────────────────────────────────────────────────────────────
@@ -3098,6 +3207,11 @@ fn coordinate(
     use crate::cluster::search::Reply;
     let mut total = 0usize;
     let mut hits: Vec<PageHit> = Vec::new();
+    // Each hit's place in its master's order: of hits that are level, the
+    // one earlier in its master's order first, and of two at the same place,
+    // the one whose key sorts first. So each master's order of its own is
+    // kept, and the order is the same whichever node coordinates.
+    let mut places: Vec<usize> = Vec::new();
     let mut timed_out = false;
     for reply in replies {
         let (reply, shard_timed_out) = crate::cluster::search::decode_search(reply)?;
@@ -3109,6 +3223,7 @@ fn coordinate(
         if let Some(Reply::Int(n)) = items.next() {
             total += n.max(0) as usize;
         }
+        let mut place = 0;
         while let Some(key) = items.next() {
             // A master sends the key's bytes (`bytes_of` of its name): it is
             // a name again by `text_of`, as `encode_page` expects. It was
@@ -3166,13 +3281,19 @@ fn coordinate(
                 sort_key,
                 fields,
             });
+            places.push(place);
+            place += 1;
         }
     }
 
     // One order over all of them, as one node orders its own.
     use std::cmp::Ordering;
+    let mut placed: Vec<(usize, PageHit)> = places.into_iter().zip(hits).collect();
+    let level = |a: &(usize, PageHit), b: &(usize, PageHit)| {
+        a.0.cmp(&b.0).then_with(|| a.1.key.cmp(&b.1.key))
+    };
     match &args.sortby {
-        Some((_, ascending)) => hits.sort_by(|a, b| {
+        Some((_, ascending)) => placed.sort_by(|(pa, a), (pb, b)| {
             let order = match (&a.sort_key, &b.sort_key) {
                 (Some(SortKey::Number(x)), Some(SortKey::Number(y))) => x.total_cmp(y),
                 (Some(SortKey::Text(x)), Some(SortKey::Text(y))) => x.cmp(y),
@@ -3183,13 +3304,16 @@ fn coordinate(
                 (None, None) => Ordering::Equal,
             };
             let order = if *ascending { order } else { order.reverse() };
-            order.then_with(|| a.key.cmp(&b.key))
+            order
+                .then_with(|| pa.cmp(pb))
+                .then_with(|| a.key.cmp(&b.key))
         }),
         None if by_distance => {
-            hits.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.key.cmp(&b.key)))
+            placed.sort_by(|a, b| a.1.score.total_cmp(&b.1.score).then_with(|| level(a, b)))
         }
-        None => hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.key.cmp(&b.key))),
+        None => placed.sort_by(|a, b| b.1.score.total_cmp(&a.1.score).then_with(|| level(a, b))),
     }
+    let mut hits: Vec<PageHit> = placed.into_iter().map(|(_, hit)| hit).collect();
     // KNN k: the k nearest of the cluster, not k from each master.
     if let Some(k) = nearest {
         hits.truncate(k);
@@ -3638,20 +3762,20 @@ mod tests {
         p
     }
 
-    /// `ids` in the full path's SORTBY order: every one sorted.
+    /// `ids` in the full path's SORTBY order: every one sorted. By the
+    /// number, then the order written, both reversed descending; those
+    /// without a number last, in the order written or its reverse.
     fn sorted_whole(p: &Postings, ids: &Bits, ascending: bool) -> Vec<u32> {
         use std::cmp::Ordering;
         let numbers = p.numbers("n").unwrap();
+        let written = |id: u32| (p.written(id), key_of(p, id));
+        let way = |order: Ordering| if ascending { order } else { order.reverse() };
         let mut all: Vec<u32> = ids.iter().collect();
-        all.sort_by(|&a, &b| {
-            let order = match (numbers.value(a), numbers.value(b)) {
-                (Some(x), Some(y)) if ascending => x.total_cmp(&y),
-                (Some(x), Some(y)) => y.total_cmp(&x),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            };
-            order.then_with(|| key_of(p, a).cmp(key_of(p, b)))
+        all.sort_by(|&a, &b| match (numbers.value(a), numbers.value(b)) {
+            (Some(x), Some(y)) => way(x.total_cmp(&y).then_with(|| written(a).cmp(&written(b)))),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => way(written(a).cmp(&written(b))),
         });
         all
     }
@@ -3700,14 +3824,18 @@ mod tests {
                     assert!(!clock.out);
                 }
             }
-            let mut by_key: Vec<u32> = ids.iter().collect();
-            by_key.sort_by(|&a, &b| key_of(&p, a).cmp(key_of(&p, b)));
+            let mut written: Vec<u32> = ids.iter().collect();
+            written.sort_by_key(|&id| (p.written(id), key_of(&p, id)));
+            let mut last_first = written.clone();
+            last_first.reverse();
             for need in [0, 1, 3, of / 5, of / 3, of]
                 .into_iter()
                 .filter(|&n| n <= of)
             {
-                let first = first_by_key(&p, &ids, need, of, &mut Clock::new(None));
-                assert_eq!(first.as_slice(), &by_key[..need], "round {round}");
+                let first = first_written(&p, &ids, need, of, false, &mut Clock::new(None));
+                assert_eq!(first.as_slice(), &written[..need], "round {round}");
+                let last = first_written(&p, &ids, need, of, true, &mut Clock::new(None));
+                assert_eq!(last.as_slice(), &last_first[..need], "round {round}");
             }
         }
         // A NaN anywhere in the field: no order from the postings.
@@ -3723,7 +3851,7 @@ mod tests {
         };
         // The clock is read after 1024 documents: the first of those.
         let mut clock = Clock::new(Some(past));
-        let first = first_by_key(&p, p.live(), 3000, 5000, &mut clock);
+        let first = first_written(&p, p.live(), 3000, 5000, false, &mut clock);
         assert!(clock.out);
         assert!(first.len() < 3000, "{}", first.len());
         let mut clock = Clock::new(Some(past));

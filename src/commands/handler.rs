@@ -3672,14 +3672,23 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
             reindex_copied(ctx, name);
         }
         "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "HSETNX" | "HGETDEL" => {
+            // The fields it wrote: one of an index's makes the document the
+            // last written there (`vector::reindex_key_naming`).
+            let args = ctx.cmd.get(2..).unwrap_or_default();
+            let named: &[&[u8]] = match name {
+                "HDEL" => args,
+                "HGETDEL" => args.get(2..).unwrap_or_default(),
+                _ => args.get(..1).unwrap_or_default(),
+            };
             for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
                 let db = *ctx.selected_db;
-                crate::vector::reindex_key(
+                crate::vector::reindex_key_naming(
                     ctx.index_store,
                     ctx.store,
                     db,
                     ctx.cmd[pos],
                     Write::Refresh,
+                    named,
                 );
             }
         }

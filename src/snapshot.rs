@@ -47,6 +47,10 @@ pub struct LoadedSnapshot {
     /// image that holds none, or one written before they were kept. Loaded
     /// with [`restore_functions`].
     pub functions: Option<Vec<u8>>,
+    /// The order of each index's documents: the index, and its documents'
+    /// keys, first written first. Empty for an image written before it was
+    /// kept. Given to the indexes with `vector::restore_document_orders`.
+    pub document_orders: Vec<(String, Vec<Box<str>>)>,
 }
 
 /// Per-database key expiries as absolute Unix milliseconds.
@@ -86,6 +90,12 @@ const KDB_SCORE_MAGIC: &[u8; 8] = b"KIVISR1\0";
 /// the same reason as the score: an older release reads everything else, and
 /// stops here.
 const KDB_NOFREQS_MAGIC: &[u8; 8] = b"KIVINF1\0";
+/// The order of each index's documents, which `SORTBY` gives documents it
+/// finds level in, and a query without it (see `vector::postings`): a count,
+/// then each index's name, a count, and its documents' keys, first written
+/// first. Last, for the same reason as `NOFREQS`: an older release reads
+/// everything else, and stops here.
+const KDB_ORDER_MAGIC: &[u8; 8] = b"KIVIDO1\0";
 
 // Field-type tags used inside the index schema section.
 const SCHEMA_FIELD_TEXT: u8 = 0;
@@ -1090,7 +1100,8 @@ pub fn write_kdb_image<K: AsRef<[u8]>>(
     write_kdb_alias_section(w, index_store)?;
     write_kdb_language_section(w, index_store)?;
     write_kdb_score_section(w, index_store)?;
-    write_kdb_nofreqs_section(w, index_store)
+    write_kdb_nofreqs_section(w, index_store)?;
+    write_kdb_order_section(w, index_store)
 }
 
 /// The language section: `index`, its language, its language field (empty
@@ -1189,6 +1200,80 @@ fn write_kdb_nofreqs_section(
         write_bytes(w, name.as_bytes())?;
     }
     Ok(())
+}
+
+/// The document order section: the order of the documents of each index
+/// that numbers them, as its postings keep it (`Postings::written_order`).
+/// Absent when no index holds a document.
+fn write_kdb_order_section(
+    w: &mut impl Write,
+    index_store: Option<&crate::vector::IndexStore>,
+) -> io::Result<()> {
+    let Some(store) = index_store else {
+        return Ok(());
+    };
+    let mut orders: Vec<(String, Vec<std::sync::Arc<str>>)> = Vec::new();
+    {
+        let guard = store.read();
+        for (name, def) in guard.iter() {
+            if crate::vector::is_alias(name, def) || !def.gives_ids() {
+                continue;
+            }
+            let postings = def.postings.read();
+            let keys: Vec<std::sync::Arc<str>> = postings
+                .written_order()
+                .into_iter()
+                .filter_map(|id| postings.key(id).cloned())
+                .collect();
+            if !keys.is_empty() {
+                orders.push((def.name.clone(), keys));
+            }
+        }
+    }
+    if orders.is_empty() {
+        return Ok(());
+    }
+    orders.sort_by(|a, b| a.0.cmp(&b.0));
+    w.write_all(KDB_ORDER_MAGIC)?;
+    w.write_all(&(orders.len() as u32).to_le_bytes())?;
+    for (name, keys) in orders {
+        write_bytes(w, name.as_bytes())?;
+        w.write_all(&(keys.len() as u64).to_le_bytes())?;
+        for key in keys {
+            write_bytes(w, key.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+/// Body of the document order section; the magic has already been
+/// consumed. With `keep` unset nothing of it is kept.
+fn read_order_section(r: &mut impl Read, keep: bool) -> io::Result<Vec<(String, Vec<Box<str>>)>> {
+    let text = |bytes: Vec<u8>, what: &str| {
+        String::from_utf8(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("a document order {what} that is not UTF-8"),
+            )
+        })
+    };
+    let mut orders = Vec::new();
+    for _ in 0..read_u32_le(r)? {
+        let index = text(read_bytes(r)?, "index name")?;
+        let count = read_u64_le(r)?;
+        let mut keys = Vec::with_capacity(if keep { hint(count as usize) } else { 0 });
+        for _ in 0..count {
+            if keep {
+                keys.push(text(read_bytes(r)?, "key")?.into_boxed_str());
+            } else {
+                skip_bytes(r)?;
+            }
+        }
+        if keep {
+            orders.push((index, keys));
+        }
+    }
+    Ok(orders)
 }
 
 /// Body of the `NOFREQS` section; the magic has already been consumed.
@@ -2921,6 +3006,7 @@ fn read_image_body(
     let mut dictionaries = Vec::new();
     let mut expiries: ExpiryMaps = (0..result.len()).map(|_| HashMap::new()).collect();
     let mut functions = None;
+    let mut document_orders = Vec::new();
     loop {
         let mut magic = [0u8; 8];
         let from = match next_byte.take() {
@@ -2991,6 +3077,8 @@ fn read_image_body(
             whole_section("score", read_score_section(&mut r, &mut index_schemas))?;
         } else if &magic == KDB_NOFREQS_MAGIC {
             whole_section("NOFREQS", read_nofreqs_section(&mut r, &mut index_schemas))?;
+        } else if &magic == KDB_ORDER_MAGIC {
+            document_orders = whole_section("document order", read_order_section(&mut r, keep))?;
         } else if strict {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -3048,6 +3136,7 @@ fn read_image_body(
             hnsw_graphs,
             expiries,
             functions,
+            document_orders,
         },
         keys_read,
     ))
@@ -5305,6 +5394,8 @@ pub struct FrozenDataset {
     score_section: Vec<u8>,
     /// The indexes made with `NOFREQS` (see [`write_kdb_nofreqs_section`]).
     nofreqs_section: Vec<u8>,
+    /// The order of each index's documents (see [`write_kdb_order_section`]).
+    order_section: Vec<u8>,
     /// What all of the above takes, which is no key's and which deleting
     /// keys does not give back: not counted against `maxmemory` while the
     /// capture lives (#284). Counted as it is laid out, not at the end
@@ -6161,8 +6252,10 @@ fn freeze(
     let functions = function_libraries();
     let mut score_section = CapturedBuf::default();
     let mut nofreqs_section = CapturedBuf::default();
+    let mut order_section = CapturedBuf::default();
     write_kdb_score_section(&mut score_section, index_store)?;
     write_kdb_nofreqs_section(&mut nofreqs_section, index_store)?;
+    write_kdb_order_section(&mut order_section, index_store)?;
     not_counted.add(functions.as_ref().map_or(0, |f| f.len()));
     let mut settle = |section: CapturedBuf| {
         let (bytes, counted) = section.finish();
@@ -6174,6 +6267,7 @@ fn freeze(
     let language_section = settle(language_section);
     let score_section = settle(score_section);
     let nofreqs_section = settle(nofreqs_section);
+    let order_section = settle(order_section);
     // Everything is laid out, and counted: a test reads memory here.
     crate::aof::failpoint("snapshot-captured");
 
@@ -6185,6 +6279,7 @@ fn freeze(
         language_section,
         score_section,
         nofreqs_section,
+        order_section,
         not_counted,
         spills,
     })
@@ -6431,7 +6526,8 @@ impl FrozenDataset {
         out.write_all(&self.alias_section)?;
         out.write_all(&self.language_section)?;
         out.write_all(&self.score_section)?;
-        out.write_all(&self.nofreqs_section)
+        out.write_all(&self.nofreqs_section)?;
+        out.write_all(&self.order_section)
     }
 }
 
@@ -8177,7 +8273,7 @@ mod field_option_tests {
     }
 
     /// The magic of every section an image can carry, and its name.
-    const EVERY_SECTION: [(&str, &[u8; 8]); 11] = [
+    const EVERY_SECTION: [(&str, &[u8; 8]); 12] = [
         ("index", KDB_INDEX_MAGIC),
         ("HNSW", KDB_HNSW_MAGIC),
         ("expiry", KDB_EXPIRY_MAGIC),
@@ -8189,11 +8285,13 @@ mod field_option_tests {
         ("language", KDB_LANGUAGE_MAGIC),
         ("score", KDB_SCORE_MAGIC),
         ("NOFREQS", KDB_NOFREQS_MAGIC),
+        ("document order", KDB_ORDER_MAGIC),
     ];
 
     /// An image that holds every section an image can carry: one key with a
     /// time to live, indexes with an HNSW field, an alias, field options,
-    /// synonyms, a language and a score, and function libraries.
+    /// synonyms, a language and a score, function libraries, and documents
+    /// in an index.
     fn image_with_every_section() -> Vec<u8> {
         let index = score_index;
         let mut synonyms = crate::vector::SynonymGroups::new();
@@ -8243,6 +8341,11 @@ mod field_option_tests {
             store.insert("scored-alias".into(), scored);
             store.insert("plain".into(), index("plain", 1.0, None));
             store.insert("empty".into(), index("empty", 1.0, Some("")));
+            let fields = [("t".to_string(), std::sync::Arc::from(&b"words"[..]))];
+            let mut postings = store.get("plain").unwrap().postings.write();
+            for key in ["plain:b", "plain:a"] {
+                postings.write(key, &fields, true);
+            }
         }
 
         let db = crate::store::new_store(1);
@@ -8268,7 +8371,7 @@ mod field_option_tests {
             .windows(8)
             .position(|w| w == KDB_SCORE_MAGIC)
             .expect("score section");
-        for &(name, magic) in &EVERY_SECTION[..EVERY_SECTION.len() - 2] {
+        for &(name, magic) in &EVERY_SECTION[..EVERY_SECTION.len() - 3] {
             let at = image
                 .windows(8)
                 .position(|w| w == magic)
@@ -8278,18 +8381,29 @@ mod field_option_tests {
                 "{name} section comes after the score section"
             );
         }
-        // The `NOFREQS` section is the last: a release that does not know it
-        // stops there and reads everything before it.
         let nofreqs_at = image
             .windows(8)
             .position(|w| w == KDB_NOFREQS_MAGIC)
             .expect("NOFREQS section");
         assert!(score_at < nofreqs_at);
-        for &(name, magic) in &EVERY_SECTION[..EVERY_SECTION.len() - 1] {
+        for &(name, magic) in &EVERY_SECTION[..EVERY_SECTION.len() - 2] {
             let at = image.windows(8).position(|w| w == magic).unwrap();
             assert!(
                 at < nofreqs_at,
                 "{name} section comes after the NOFREQS section"
+            );
+        }
+        // The document order section is the last: a release that does not
+        // know it stops there and reads everything before it.
+        let order_at = image
+            .windows(8)
+            .position(|w| w == KDB_ORDER_MAGIC)
+            .expect("document order section");
+        for &(name, magic) in &EVERY_SECTION[..EVERY_SECTION.len() - 1] {
+            let at = image.windows(8).position(|w| w == magic).unwrap();
+            assert!(
+                at < order_at,
+                "{name} section comes after the document order section"
             );
         }
 
@@ -8309,6 +8423,13 @@ mod field_option_tests {
         assert_eq!(of("empty").score_field.as_deref(), Some(""));
         assert!(of("scored").nofreqs);
         assert!(!of("plain").nofreqs && !of("empty").nofreqs);
+        let plain: Vec<&str> = loaded
+            .document_orders
+            .iter()
+            .find(|(name, _)| name == "plain")
+            .map(|(_, keys)| keys.iter().map(|key| &**key).collect())
+            .unwrap();
+        assert_eq!(plain, ["plain:b", "plain:a"], "first written first");
 
         // Without the section (an image of an older release), the defaults.
         let mut bare = Vec::new();

@@ -341,8 +341,8 @@ other files:
     Redis adds the terms in); `TFIDF`, `TFIDF.DOCNORM` and `BM25` of three or
     more words, one of which has a stem, can differ in the proximity factor;
     a fuzzy term scores one of the document's words it matches, which one
-    can differ (see `vector/score.rs`); documents with the same score come
-    in key order, Redis's in the order they were indexed.
+    can differ (see `vector/score.rs`). Documents with the same score come
+    in the order they were written, as in Redis.
   - Dialect 1: a field modifier applies to the bare words that follow it
     (`@title:a b` is `@title:(a b)`) in Redis, to the first only here;
     `=> {$weight: …}` on a clause is accepted but does not weigh it (and is

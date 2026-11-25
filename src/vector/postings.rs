@@ -771,18 +771,25 @@ fn merged<'a>(
     })
 }
 
-// ── The order of the keys ────────────────────────────────────────────────────
+// ── The order of the documents ───────────────────────────────────────────────
 //
-// A page ordered by key (FT.SEARCH without SORTBY or words to score) is read
-// off the ids in their keys' order, kept here: the first ten of 500,000
-// matches are the first ten matches met walking down a list, not the least of
-// 500,000 keys compared, each a cache miss away.
+// A page in the order the documents were written (FT.SEARCH without SORTBY or
+// words to score, and the documents a SORTBY finds level) is read off the ids
+// in that order, kept here: the first ten of 500,000 matches are the first
+// ten matches met walking down a list, not the least of 500,000 compared.
+//
+// That order is the number of each document's last write (see
+// [`Postings::written`]), then its key, as Redis gives its documents in the
+// order of their ids, and a write gives a document a new one. The documents a
+// walk of the keyspace puts in the index (`FT.CREATE` over keys already
+// there, a snapshot that does not say their order) share one number, and go
+// by their keys: the same order on every node that walks the same keys.
 //
 // The order is in four parts, each always whole to a query:
-// * `sorted`, most of the ids in key order, with each one's place (`place`);
-// * a few `runs`, each in key order, of ids given out since: sealed ones at
-//   level 0, and eight of a level merged into one of the next (so an id is
-//   copied once a level, not once a merge);
+// * `sorted`, most of the ids in order, with each one's place (`place`);
+// * a few `runs`, each in order, of ids given out or written since: sealed
+//   ones at level 0, and eight of a level merged into one of the next (so an
+//   id is copied once a level, not once a merge);
 // * `waiting`, the latest ids, in no order: a few thousand at most, as a rule;
 // * a merge under way, of runs together, or of the runs into `sorted`.
 // A write only adds its id to `waiting`. The rest is done a step at a time,
@@ -793,8 +800,9 @@ fn merged<'a>(
 // noted are looked at again. So no write and no query waits on more than one
 // step, at any size.
 //
-// An id that left, or went to another key, keeps its old entry, which no
-// longer matches its place, and is passed over until a merge drops it.
+// An id that left, went to another key, or was written again, keeps its old
+// entry, which no longer matches its place, and is passed over until a merge
+// drops it.
 
 const NO_PLACE: u32 = u32::MAX;
 /// The place of an id in `waiting`.
@@ -840,9 +848,9 @@ struct KeyMerge {
     /// place changed meanwhile.
     place: Vec<u32>,
     touched: Vec<u32>,
-    /// For each input, the entry its head was last read at and the first
-    /// bytes of its key: most comparisons are of these.
-    heads: Vec<(usize, u128)>,
+    /// For each input, the entry its head was last read at, and its write's
+    /// number with the first bytes of its key: most comparisons are of these.
+    heads: Vec<(usize, (u64, u128))>,
 }
 
 #[derive(Debug, Default)]
@@ -877,15 +885,52 @@ fn key_prefix(key: &str) -> u128 {
     u128::from_be_bytes(bytes)
 }
 
-/// `ids` in the order of their keys.
-fn sort_by_key(ids: &mut [u32], keys: &[Option<Arc<str>>]) {
-    // By the first bytes of the keys, in a list of their own, then by the
-    // whole keys where those are equal: sorting by the keys themselves would
-    // go to each, at random, at each comparison.
-    let mut tagged: Vec<(u128, u32)> = ids
-        .iter()
-        .map(|&id| (key_prefix(key_text(keys, id)), id))
-        .collect();
+/// What the order of the documents goes by: the number of each one's last
+/// write, then its key.
+#[derive(Clone, Copy)]
+struct OrderOf<'a> {
+    keys: &'a [Option<Arc<str>>],
+    written: &'a [u64],
+}
+
+impl OrderOf<'_> {
+    /// How many ids there are.
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    #[inline]
+    fn key(&self, id: u32) -> &str {
+        key_text(self.keys, id)
+    }
+
+    #[inline]
+    fn written(&self, id: u32) -> u64 {
+        self.written.get(id as usize).copied().unwrap_or(u64::MAX)
+    }
+
+    /// The number and the first bytes of the key: two ids whose heads
+    /// differ are in that order, and two whose heads are equal are left to
+    /// their whole keys.
+    #[inline]
+    fn head(&self, id: u32) -> (u64, u128) {
+        (self.written(id), key_prefix(self.key(id)))
+    }
+
+    #[inline]
+    fn cmp(&self, a: u32, b: u32) -> std::cmp::Ordering {
+        self.written(a)
+            .cmp(&self.written(b))
+            .then_with(|| self.key(a).cmp(self.key(b)))
+    }
+}
+
+/// `ids` in the order of their documents.
+fn sort_in_order(ids: &mut [u32], order: OrderOf<'_>) {
+    // By the numbers and the first bytes of the keys, in a list of their
+    // own, then by the whole keys where those are equal: sorting by the keys
+    // themselves would go to each, at random, at each comparison.
+    let mut tagged: Vec<((u64, u128), u32)> = ids.iter().map(|&id| (order.head(id), id)).collect();
     tagged.sort_unstable();
     let mut start = 0;
     while start < tagged.len() {
@@ -894,8 +939,7 @@ fn sort_by_key(ids: &mut [u32], keys: &[Option<Arc<str>>]) {
             end += 1;
         }
         if end - start > 1 {
-            tagged[start..end]
-                .sort_unstable_by(|a, b| key_text(keys, a.1).cmp(key_text(keys, b.1)));
+            tagged[start..end].sort_unstable_by(|a, b| order.key(a.1).cmp(order.key(b.1)));
         }
         start = end;
     }
@@ -995,16 +1039,16 @@ impl KeyOrder {
     /// A step of the work, if there is any: true if there was.
     fn step(
         &mut self,
-        keys: &[Option<Arc<str>>],
+        order: OrderOf<'_>,
         spare: &mut Option<Vec<u32>>,
         trash: &mut Trash,
     ) -> bool {
         if self.waiting.len() >= SEAL_AT || (self.settle && !self.waiting.is_empty()) {
-            self.seal(keys);
+            self.seal(order);
             return true;
         }
         if self.merging.is_some() {
-            self.merge_step(keys, trash);
+            self.merge_step(order, trash);
             return true;
         }
         if let Some((start, inputs)) = self.runs_due().filter(|_| !self.settle) {
@@ -1015,7 +1059,7 @@ impl KeyOrder {
                 inputs,
                 level,
                 at: vec![0; inputs],
-                heads: vec![(usize::MAX, 0); inputs],
+                heads: vec![(usize::MAX, (0, 0)); inputs],
                 tag,
                 ..KeyMerge::default()
             });
@@ -1031,14 +1075,14 @@ impl KeyOrder {
             // Made by the thread before it took the lock, if it could: all
             // `NO_PLACE`, long enough or nearly.
             let mut place = spare.take().unwrap_or_default();
-            if place.len() < keys.len() {
-                place.resize(keys.len(), NO_PLACE);
+            if place.len() < order.len() {
+                place.resize(order.len(), NO_PLACE);
             }
             self.merging = Some(KeyMerge {
                 into_sorted: true,
                 inputs,
                 at: vec![0; inputs + 1],
-                heads: vec![(usize::MAX, 0); inputs + 1],
+                heads: vec![(usize::MAX, (0, 0)); inputs + 1],
                 out: Vec::with_capacity(self.sorted.len() + self.runs_len()),
                 place,
                 touched,
@@ -1051,7 +1095,7 @@ impl KeyOrder {
     }
 
     /// Up to `SEAL_STEP` waiting ids into a run of their own.
-    fn seal(&mut self, keys: &[Option<Arc<str>>]) {
+    fn seal(&mut self, order: OrderOf<'_>) {
         let take = self.waiting.len().min(SEAL_STEP);
         let mut ids: Vec<u32> = self.waiting.drain(..take).collect();
         ids.sort_unstable();
@@ -1060,7 +1104,7 @@ impl KeyOrder {
         if ids.is_empty() {
             return;
         }
-        sort_by_key(&mut ids, keys);
+        sort_in_order(&mut ids, order);
         let tag = self.new_tag();
         for &id in &ids {
             self.set_place(id, tag);
@@ -1081,14 +1125,14 @@ impl KeyOrder {
     }
 
     /// Up to `KEY_STEP` entries of the merge under way, and its end.
-    fn merge_step(&mut self, keys: &[Option<Arc<str>>], trash: &mut Trash) {
+    fn merge_step(&mut self, order: OrderOf<'_>, trash: &mut Trash) {
         let Some(mut merge) = self.merging.take() else {
             return;
         };
         let inputs = merge.at.len();
         let mut looked = 0;
         while looked < KEY_STEP {
-            // The least key among the next live entry of each input.
+            // The first in order among the next live entry of each input.
             let mut least: Option<(usize, u32)> = None;
             for i in 0..inputs {
                 let (ids, tag) = self.input(&merge, i);
@@ -1107,16 +1151,15 @@ impl KeyOrder {
                     continue;
                 };
                 if merge.heads[i].0 != merge.at[i] {
-                    merge.heads[i] = (merge.at[i], key_prefix(key_text(keys, id)));
+                    merge.heads[i] = (merge.at[i], order.head(id));
                 }
-                let prefix = merge.heads[i].1;
+                let head = merge.heads[i].1;
                 let before = match least {
                     None => true,
                     Some((l, other)) => {
-                        let other_prefix = merge.heads[l].1;
-                        prefix < other_prefix
-                            || (prefix == other_prefix
-                                && key_text(keys, id) < key_text(keys, other))
+                        let other_head = merge.heads[l].1;
+                        head < other_head
+                            || (head == other_head && order.key(id) < order.key(other))
                     }
                 };
                 if before {
@@ -1124,7 +1167,7 @@ impl KeyOrder {
                 }
             }
             let Some((i, id)) = least else {
-                self.finish(merge, keys, trash);
+                self.finish(merge, order, trash);
                 return;
             };
             merge.at[i] += 1;
@@ -1140,12 +1183,12 @@ impl KeyOrder {
         self.merging = Some(merge);
     }
 
-    fn finish(&mut self, merge: KeyMerge, keys: &[Option<Arc<str>>], trash: &mut Trash) {
+    fn finish(&mut self, merge: KeyMerge, order: OrderOf<'_>, trash: &mut Trash) {
         let inputs = merge.inputs;
         if merge.into_sorted {
             self.runs.drain(..inputs);
             let mut place = merge.place;
-            place.resize(keys.len().max(self.place.len()), NO_PLACE);
+            place.resize(order.len().max(self.place.len()), NO_PLACE);
             // Whatever an id written meanwhile has now is its place: the
             // entry the merge took for it, if any, is not.
             for id in merge.touched {
@@ -1185,20 +1228,22 @@ impl KeyOrder {
             * 4
     }
 
-    /// The first `need` of `ids` (`of` of them) in the order of their keys:
-    /// see [`Postings::first_by_key`].
+    /// The first `need` of `ids` (`of` of them) in the order of their
+    /// documents, or the last ones from the end with `descending`: see
+    /// [`Postings::first_written`].
     fn first(
         &self,
-        keys: &[Option<Arc<str>>],
+        order: OrderOf<'_>,
         ids: &Bits,
         need: usize,
         of: usize,
+        descending: bool,
         ran_out: &mut dyn FnMut() -> bool,
     ) -> Vec<u32> {
-        // Lists in key order, each of the first `need` of `ids` in a part,
-        // then merged.
+        // Lists in order (from the end with `descending`), each of the first
+        // `need` of `ids` in a part, then merged.
         let mut lists: Vec<Vec<u32>> = Vec::new();
-        // Ids in no order yet: picked by their keys.
+        // Ids in no order yet: picked by their order.
         let mut late: Vec<u32> = Vec::new();
         // Walking a list meets the `need` first after about need * len / of
         // of its entries, if `ids` are spread through it; looking up the place
@@ -1212,7 +1257,9 @@ impl KeyOrder {
         let walk =
             |list: &[u32], live: &dyn Fn(usize, u32) -> bool, ran_out: &mut dyn FnMut() -> bool| {
                 let mut found = Vec::new();
-                for (at, &id) in list.iter().enumerate() {
+                for i in 0..list.len() {
+                    let at = if descending { list.len() - 1 - i } else { i };
+                    let id = list[at];
                     if ran_out() {
                         break;
                     }
@@ -1293,20 +1340,30 @@ impl KeyOrder {
                     _ => late.push(id),
                 }
             }
+            let by_place = |a: &(u32, u32), b: &(u32, u32)| {
+                if descending { b.cmp(a) } else { a.cmp(b) }
+            };
             if need < ranked.len() {
-                ranked.select_nth_unstable(need);
+                ranked.select_nth_unstable_by(need, by_place);
                 ranked.truncate(need);
             }
-            ranked.sort_unstable();
+            ranked.sort_unstable_by(by_place);
             lists.push(ranked.into_iter().map(|(_, id)| id).collect());
         }
-        let key = |id: u32| key_text(keys, id);
+        let in_order = |a: &u32, b: &u32| {
+            let ordering = order.cmp(*a, *b);
+            if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        };
         if !late.is_empty() {
             if need < late.len() {
-                late.select_nth_unstable_by(need, |&a, &b| key(a).cmp(key(b)));
+                late.select_nth_unstable_by(need, in_order);
                 late.truncate(need);
             }
-            late.sort_unstable_by(|&a, &b| key(a).cmp(key(b)));
+            late.sort_unstable_by(in_order);
             lists.push(late);
         }
         lists.retain(|list| !list.is_empty());
@@ -1318,21 +1375,25 @@ impl KeyOrder {
                 only
             }
             _ => {
-                use std::cmp::Reverse;
-                let mut heads: std::collections::BinaryHeap<Reverse<(&str, usize, usize)>> = lists
-                    .iter()
-                    .enumerate()
-                    .map(|(l, list)| Reverse((key(list[0]), l, 0)))
-                    .collect();
+                // A few lists: the next of all of them is the first of their
+                // heads.
+                let mut at = vec![0usize; lists.len()];
                 let mut out = Vec::with_capacity(need);
                 while out.len() < need {
-                    let Some(Reverse((_, l, at))) = heads.pop() else {
+                    let mut next: Option<(usize, u32)> = None;
+                    for (l, list) in lists.iter().enumerate() {
+                        let Some(&id) = list.get(at[l]) else {
+                            continue;
+                        };
+                        if next.is_none_or(|(_, other)| in_order(&id, &other).is_lt()) {
+                            next = Some((l, id));
+                        }
+                    }
+                    let Some((l, id)) = next else {
                         break;
                     };
-                    out.push(lists[l][at]);
-                    if let Some(&next) = lists[l].get(at + 1) {
-                        heads.push(Reverse((key(next), l, at + 1)));
-                    }
+                    out.push(id);
+                    at[l] += 1;
                 }
                 out
             }
@@ -1460,6 +1521,23 @@ pub struct Postings {
     /// only the documents of the slots its node serves without hashing
     /// every key it matches.
     slots: Vec<u16>,
+    /// By id: the number of its document's last write ([`Postings::written`]),
+    /// which the order of the documents goes by (see `KeyOrder`).
+    written: Vec<u64>,
+    /// The number the next write is given.
+    next_written: u64,
+    /// A walk of the keyspace under way ([`Postings::begin_walk`]): the
+    /// number it gives the documents it puts in, and how many walks there
+    /// are besides the first.
+    walk: Option<(u64, u32)>,
+    /// From a snapshot, until the first walk: the keys of the documents in
+    /// their order ([`Postings::set_loaded_order`]).
+    loaded_order: Vec<Box<str>>,
+    /// The documents written while an AOF replay put indexing off, each
+    /// with the count of such writes at its last one ([`Postings::replayed`]):
+    /// the walk after the replay puts them in in that order.
+    replayed: ahash::AHashMap<Box<str>, u64>,
+    replays: u64,
 }
 
 /// How long writes have to pause before what is left unmerged (a few runs,
@@ -1502,6 +1580,7 @@ enum Pending {
         key: Box<str>,
         fields: Vec<(String, Arc<[u8]>)>,
         whole: bool,
+        moves: bool,
         then: Option<WithId>,
     },
     Remove {
@@ -1593,19 +1672,20 @@ impl PostingsLock {
     }
 
     /// What the document at `key` holds now, from `fields` (see
-    /// [`Postings::write`]), and `then` run with its id: applied at once if
-    /// the lock is free, queued if not. Its id, or [`NO_DOC`] if it was
-    /// queued.
+    /// [`Postings::write_moving`]), and `then` run with its id: applied at
+    /// once if the lock is free, queued if not. Its id, or [`NO_DOC`] if it
+    /// was queued.
     pub fn write_fields(
         self: &Arc<Self>,
         key: &str,
         fields: &[(String, Arc<[u8]>)],
         whole: bool,
+        moves: bool,
         then: Option<WithId>,
     ) -> u32 {
         if let Some(mut postings) = self.lock.try_write() {
             self.apply(&mut postings);
-            let doc = postings.write(key, fields, whole);
+            let doc = postings.write_moving(key, fields, whole, moves);
             if let Some(then) = then {
                 then(doc);
             }
@@ -1616,6 +1696,7 @@ impl PostingsLock {
             key: key.into(),
             fields: fields.to_vec(),
             whole,
+            moves,
             then,
         });
         NO_DOC
@@ -1686,9 +1767,10 @@ impl PostingsLock {
                     key,
                     fields,
                     whole,
+                    moves,
                     then,
                 } => {
-                    let doc = postings.write(&key, &fields, whole);
+                    let doc = postings.write_moving(&key, &fields, whole, moves);
                     if let Some(then) = then {
                         then(doc);
                     }
@@ -1841,10 +1923,25 @@ impl Postings {
         self.ids.len() == 0
     }
 
-    /// The document at `key`'s id, given it one if it has none.
+    /// The document at `key`'s id, given it one if it has none: numbered as
+    /// the next write, or as the walk under way puts documents in.
     pub fn ensure(&mut self, key: &str) -> u32 {
+        let number = self.walk_number(key);
+        self.ensure_as(key, number).0
+    }
+
+    /// The number the next write is given, taken.
+    fn take_number(&mut self) -> u64 {
+        let n = self.next_written;
+        self.next_written += 1;
+        n
+    }
+
+    /// [`Postings::ensure`]: a new id's document numbered `number`, or as the
+    /// next write. Whether the id is new.
+    fn ensure_as(&mut self, key: &str, number: Option<u64>) -> (u32, bool) {
         if let Some(id) = self.ids.get(&self.keys, key) {
-            return id;
+            return (id, false);
         }
         let key: Arc<str> = Arc::from(key);
         let id = match self.free.pop() {
@@ -1863,10 +1960,99 @@ impl Postings {
         }
         // Of the key's own bytes, not of its name (`key_bytes::text_of`).
         self.slots[at] = crate::cluster::key_hash_slot(&crate::key_bytes::bytes_of(&key));
+        let number = number.unwrap_or_else(|| self.take_number());
+        if at >= self.written.len() {
+            self.written.resize(at + 1, 0);
+        }
+        self.written[at] = number;
         self.ids.insert(&self.keys, &key, id);
         self.live.set(id);
         self.order.added(id);
-        id
+        (id, true)
+    }
+
+    /// The document `id` was written again: it is now the last written.
+    fn rewritten(&mut self, id: u32) {
+        let number = self.take_number();
+        self.written[id as usize] = number;
+        self.order.added(id);
+    }
+
+    /// The number of the last write of document `id`: documents written
+    /// later have larger ones. Those a walk put in share one (see `KeyOrder`).
+    #[inline]
+    pub fn written(&self, id: u32) -> u64 {
+        self.written.get(id as usize).copied().unwrap_or(u64::MAX)
+    }
+
+    /// The documents are about to be walked ([`Postings::write_doc`] of each):
+    /// those the walk puts in are put in after every document written so
+    /// far, all with one number, so that they go by their keys. Walks under
+    /// way at once share it. Ended by [`Postings::end_walk`].
+    pub fn begin_walk(&mut self) {
+        match &mut self.walk {
+            Some((_, more)) => *more += 1,
+            None => {
+                let base = self.next_written;
+                // Those an AOF replay wrote after it, in the replay's order.
+                self.next_written = base + 1 + self.replays;
+                self.walk = Some((base, 0));
+            }
+        }
+    }
+
+    /// A walk is over. Once the last is, the documents a snapshot gave the
+    /// order of ([`Postings::set_loaded_order`]) that the walk put in take
+    /// that order, before all others; what the replay wrote is forgotten.
+    pub fn end_walk(&mut self) {
+        let Some((base, more)) = self.walk else {
+            return;
+        };
+        if more > 0 {
+            self.walk = Some((base, more - 1));
+            return;
+        }
+        self.walk = None;
+        let loaded = std::mem::take(&mut self.loaded_order);
+        for (rank, key) in loaded.iter().enumerate() {
+            // Not one written since it was loaded: that one is later.
+            if let Some(id) = self.id(key)
+                && self.written[id as usize] == base
+            {
+                self.written[id as usize] = rank as u64;
+                self.order.added(id);
+            }
+        }
+        self.replayed = Default::default();
+        self.replays = 0;
+    }
+
+    /// The number a walk gives the document at `key` if it puts it in.
+    fn walk_number(&self, key: &str) -> Option<u64> {
+        let (base, _) = self.walk?;
+        Some(base + self.replayed.get(key).copied().unwrap_or(0))
+    }
+
+    /// The order of the documents, from a snapshot: their keys, first
+    /// written first. The walk that puts them in gives them that order
+    /// ([`Postings::end_walk`]). Before any document is in.
+    pub fn set_loaded_order(&mut self, keys: Vec<Box<str>>) {
+        self.next_written = self.next_written.max(keys.len() as u64 + 1);
+        self.loaded_order = keys;
+    }
+
+    /// The document at `key` was written by an AOF replay that put indexing
+    /// off: the walk after it puts it in in the order of these writes.
+    pub fn replayed(&mut self, key: &str) {
+        self.replays += 1;
+        let n = self.replays;
+        self.replayed.insert(key.into(), n);
+    }
+
+    /// Every document's id, first written first.
+    pub fn written_order(&self) -> Vec<u32> {
+        let all = self.live.count();
+        self.first_written(&self.live, all, all, false, &mut || false)
     }
 
     fn behind(&self) -> bool {
@@ -1904,7 +2090,11 @@ impl Postings {
     /// [`Postings::tidy_step`], with a list of places made beforehand (see
     /// [`Postings::spare_wanted`]), and what it replaces left in `trash`.
     pub fn tidy_step_with(&mut self, spare: &mut Option<Vec<u32>>, trash: &mut Trash) -> bool {
-        let mut did = self.order.step(&self.keys, spare, trash);
+        let order = OrderOf {
+            keys: &self.keys,
+            written: &self.written,
+        };
+        let mut did = self.order.step(order, spare, trash);
         for field in &mut self.fields {
             if let Kind::Numeric(numbers) = &mut field.kind {
                 did |= numbers.step(trash);
@@ -1943,10 +2133,25 @@ impl Postings {
     /// Record what the document at `key` holds now, from `fields`, which are
     /// the fields that were written. With `whole`, they are all it has: a
     /// field kept here that is not among them is one it no longer holds.
-    /// Returns its id.
+    /// The document is now the last written. Returns its id.
     pub fn write(&mut self, key: &str, fields: &[(String, Arc<[u8]>)], whole: bool) -> u32 {
+        self.write_moving(key, fields, whole, true)
+    }
+
+    /// [`Postings::write`]; a document the index has already is the last
+    /// written only if `moves` (the write named a field of the index).
+    pub fn write_moving(
+        &mut self,
+        key: &str,
+        fields: &[(String, Arc<[u8]>)],
+        whole: bool,
+        moves: bool,
+    ) -> u32 {
         self.writes += 1;
-        let id = self.ensure(key);
+        let (id, new) = self.ensure_as(key, None);
+        if moves && !new {
+            self.rewritten(id);
+        }
         let slots = self.keys.len();
         for field in &mut self.fields {
             let value = fields
@@ -1964,10 +2169,13 @@ impl Postings {
         id
     }
 
-    /// [`Postings::write`] of a document's fields as an index reads them.
+    /// [`Postings::write`] of a document's fields as an index reads them, by
+    /// a walk of the keyspace: one it puts in takes the walk's number (see
+    /// [`Postings::begin_walk`]), one the index has keeps its own.
     pub fn write_doc(&mut self, key: &str, doc: &super::Fields) -> u32 {
         self.writes += 1;
-        let id = self.ensure(key);
+        let number = self.walk_number(key);
+        let (id, _) = self.ensure_as(key, number);
         let slots = self.keys.len();
         for field in &mut self.fields {
             let value = doc.get_bytes(&field.name);
@@ -2005,6 +2213,8 @@ impl Postings {
             unused: self.unused,
             read_all: self.read_all,
             given_back: self.given_back + 1,
+            next_written: self.next_written,
+            walk: self.walk,
             ..Postings::default()
         };
         for field in &self.fields {
@@ -2065,20 +2275,26 @@ impl Postings {
         })
     }
 
-    /// The first `need` of `ids` (`of` of them) in the order of their keys.
-    /// `ran_out` is asked at each step of the walk that finds them, and once
-    /// it says so they are the first of those found.
-    pub fn first_by_key(
+    /// The first `need` of `ids` (`of` of them) in the order their documents
+    /// were written (see `KeyOrder`), or with `descending` the last ones,
+    /// last first. `ran_out` is asked at each step of the walk that finds
+    /// them, and once it says so they are the first of those found.
+    pub fn first_written(
         &self,
         ids: &Bits,
         need: usize,
         of: usize,
+        descending: bool,
         ran_out: &mut dyn FnMut() -> bool,
     ) -> Vec<u32> {
         if need == 0 {
             return Vec::new();
         }
-        self.order.first(&self.keys, ids, need, of, ran_out)
+        let order = OrderOf {
+            keys: &self.keys,
+            written: &self.written,
+        };
+        self.order.first(order, ids, need, of, descending, ran_out)
     }
 
     /// The postings of the NUMERIC field read from `field`, to order by.
@@ -2124,6 +2340,7 @@ impl Postings {
                 .sum::<usize>()
             + self.free.capacity() * 4
             + self.slots.capacity() * 2
+            + self.written.capacity() * 8
             + self.live.bytes()
             + self.order.bytes();
         let mut tags = 0;
@@ -2410,20 +2627,29 @@ mod tests {
             }
             let of = ids.count();
             let mut whole: Vec<u32> = ids.iter().collect();
-            whole.sort_by(|&a, &b| p.key(a).unwrap().cmp(p.key(b).unwrap()));
+            whole.sort_by_key(|&id| (p.written(id), p.key(id).unwrap().to_string()));
+            let mut last_first = whole.clone();
+            last_first.reverse();
             for need in [1, 2, 10, of / 3, of] {
                 let need = need.min(of);
-                let first = p.first_by_key(&ids, need, of, &mut ran_out);
+                let first = p.first_written(&ids, need, of, false, &mut ran_out);
                 assert_eq!(
                     first.as_slice(),
                     &whole[..need],
                     "round {round}, {need} of {of}"
                 );
+                let last = p.first_written(&ids, need, of, true, &mut ran_out);
+                assert_eq!(
+                    last.as_slice(),
+                    &last_first[..need],
+                    "round {round}, the last {need} of {of}"
+                );
             }
         }
         // Keys alike in their first sixteen bytes, and one a prefix of
-        // another.
+        // another, put in by one walk: they share a number and go by key.
         let mut p = Postings::new(&schema());
+        p.begin_walk();
         for key in [
             "same-sixteen-byteZ",
             "same-sixteen-byte",
@@ -2431,12 +2657,13 @@ mod tests {
             "s",
             "",
         ] {
-            put(&mut p, key, "", "1");
+            p.write_doc(key, &crate::types::HashFields::default());
         }
+        p.end_walk();
         while p.tidy_step() {}
         let all = p.live().clone();
         let first: Vec<String> = p
-            .first_by_key(&all, 5, 5, &mut ran_out)
+            .first_written(&all, 5, 5, false, &mut ran_out)
             .into_iter()
             .map(|id| p.key(id).unwrap().to_string())
             .collect();
@@ -2606,7 +2833,7 @@ mod tests {
                     while !stop.load(SeqCst) {
                         let p = shared.read();
                         let all = p.live().clone();
-                        let first = p.first_by_key(&all, 10, all.count(), &mut || false);
+                        let first = p.first_written(&all, 10, all.count(), false, &mut || false);
                         assert!(first.len() <= 10);
                         std::thread::sleep(std::time::Duration::from_micros(300));
                     }
@@ -2651,7 +2878,7 @@ mod tests {
                                 assert_eq!(was, to, "id {id} given out while it names {was}");
                             }
                         });
-                        if shared.write_fields(&key, &fields, true, Some(then)) == NO_DOC {
+                        if shared.write_fields(&key, &fields, true, true, Some(then)) == NO_DOC {
                             queued += 1;
                         }
                         let p = shared.read();
@@ -2712,11 +2939,16 @@ mod tests {
         }
         let all = p.live().clone();
         let first: Vec<String> = p
-            .first_by_key(&all, live.len(), live.len(), &mut || false)
+            .first_written(&all, live.len(), live.len(), false, &mut || false)
             .into_iter()
             .map(|id| p.key(id).unwrap().to_string())
             .collect();
-        let want: Vec<String> = live.iter().map(|(key, _)| key.to_string()).collect();
+        let mut ids: Vec<u32> = all.iter().collect();
+        ids.sort_by_key(|&id| p.written(id));
+        let want: Vec<String> = ids
+            .iter()
+            .map(|&id| p.key(id).unwrap().to_string())
+            .collect();
         assert_eq!(first, want);
     }
 }

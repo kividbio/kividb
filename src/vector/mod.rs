@@ -1400,11 +1400,27 @@ pub fn backfill_postings(db: &crate::store::Db, def: &IndexDef, added: &[SchemaF
 pub fn walk_documents(
     db: &crate::store::Db,
     def: &IndexDef,
-    mut visit: impl FnMut(&str, DocFields<'_>),
+    visit: impl FnMut(&str, DocFields<'_>),
 ) {
     if indexing_deferred() {
         return;
     }
+    // The documents the walk puts in come after those written before it,
+    // in the order of their keys (see `postings::Postings::begin_walk`).
+    let numbered = def.gives_ids();
+    if numbered {
+        def.postings.write().begin_walk();
+    }
+    walk_keys(db, def, visit);
+    if numbered {
+        let mut postings = def.postings.write();
+        postings.end_walk();
+        def.postings.done(postings);
+    }
+}
+
+/// [`walk_documents`]'s walk.
+fn walk_keys(db: &crate::store::Db, def: &IndexDef, mut visit: impl FnMut(&str, DocFields<'_>)) {
     for shard in db.iter() {
         // The keys themselves, for their order and for reading them; the
         // visit is given the document's name (`key_bytes::text_of`).
@@ -2174,6 +2190,25 @@ pub fn register_index_schemas(
     }
 }
 
+/// The order of the documents of each index, from a snapshot (its document
+/// order section): index name, then the documents' keys, first written
+/// first. The walk that puts them in gives them that order. After
+/// [`register_index_schemas`].
+pub fn restore_document_orders(index_store: &IndexStore, orders: Vec<(String, Vec<Box<str>>)>) {
+    if orders.is_empty() {
+        return;
+    }
+    let idx = index_store.read();
+    for (name, keys) in orders {
+        if let Some(def) = idx.get(&name)
+            && !is_alias(&name, def)
+            && def.gives_ids()
+        {
+            def.postings.write().set_loaded_order(keys);
+        }
+    }
+}
+
 // ── Documents ─────────────────────────────────────────────────────────────────
 //
 // An index is `ON HASH` or `ON JSON`. Everything that reads a document for
@@ -2438,7 +2473,11 @@ pub fn maybe_index_json(
     doc: &crate::json_tree::Value,
 ) {
     let key = key.as_ref();
-    if indexing_deferred() || index_store.none() {
+    if index_store.none() {
+        return;
+    }
+    if indexing_deferred() {
+        note_replayed(index_store, db, key, IndexOn::Json, |_| true);
         return;
     }
     let store = index_store.read();
@@ -2451,7 +2490,13 @@ pub fn maybe_index_json(
             continue;
         }
         let fields = schema_names(project_json(&def.fields, doc));
-        index_fields(def, &crate::key_bytes::text_of(key), &fields, Write::Whole);
+        index_fields(
+            def,
+            &crate::key_bytes::text_of(key),
+            &fields,
+            Write::Whole,
+            &[],
+        );
     }
 }
 
@@ -2468,13 +2513,16 @@ pub fn reindex_json_key(
     key: &(impl AsRef<[u8]> + ?Sized),
 ) {
     let key = key.as_ref();
-    if indexing_deferred()
-        || index_store.none()
+    if index_store.none()
         || !index_store
             .read()
             .values()
             .any(|def| matches!(def.on, IndexOn::Json))
     {
+        return;
+    }
+    if indexing_deferred() {
+        note_replayed(index_store, db, key, IndexOn::Json, |_| true);
         return;
     }
     let Some(db_ref) = store.get(db) else {
@@ -2504,8 +2552,28 @@ pub fn reindex_key(
     key: &(impl AsRef<[u8]> + ?Sized),
     how: Write,
 ) {
-    let key = key.as_ref();
-    if indexing_deferred() || index_store.none() {
+    reindex_key_naming(index_store, store, db, key.as_ref(), how, &[]);
+}
+
+/// [`reindex_key`] after a command that wrote the fields `named` of the hash
+/// (`HDEL`, `HINCRBY`, a field that expired): one of an index's makes the
+/// document the last written in its order (see [`moves`]).
+pub fn reindex_key_naming(
+    index_store: &IndexStore,
+    store: &crate::store::Store,
+    db: usize,
+    key: &[u8],
+    how: Write,
+    named: &[&[u8]],
+) {
+    if index_store.none() {
+        return;
+    }
+    if indexing_deferred() {
+        note_replayed(index_store, db, key, IndexOn::Hash, |def| {
+            moves(def, &[], how, named)
+        });
+        note_replayed(index_store, db, key, IndexOn::Json, |_| how == Write::Whole);
         return;
     }
     let indexes = index_store.read();
@@ -2538,7 +2606,7 @@ pub fn reindex_key(
                         ))
                     })
                     .collect();
-                index_fields(def, &crate::key_bytes::text_of(key), &pairs, how);
+                index_fields(def, &crate::key_bytes::text_of(key), &pairs, how, named);
             }
             (IndexOn::Hash, Some(crate::types::KiviDBValue::HashEx(hash))) => {
                 let pairs: Vec<(String, Arc<[u8]>)> = hash
@@ -2552,11 +2620,11 @@ pub fn reindex_key(
                         ))
                     })
                     .collect();
-                index_fields(def, &crate::key_bytes::text_of(key), &pairs, how);
+                index_fields(def, &crate::key_bytes::text_of(key), &pairs, how, named);
             }
             (IndexOn::Json, Some(crate::types::KiviDBValue::Json(doc))) => {
                 let fields = schema_names(project_json(&def.fields, &doc.read()));
-                index_fields(def, &crate::key_bytes::text_of(key), &fields, how);
+                index_fields(def, &crate::key_bytes::text_of(key), &fields, how, named);
             }
             _ => unindex_from(def, &crate::key_bytes::text_of(key)),
         }
@@ -2589,7 +2657,13 @@ pub fn maybe_index(
     how: Write,
 ) {
     let key = key.as_ref();
-    if indexing_deferred() || index_store.none() {
+    if index_store.none() {
+        return;
+    }
+    if indexing_deferred() {
+        note_replayed(index_store, db, key, IndexOn::Hash, |def| {
+            moves(def, fields, how, &[])
+        });
         return;
     }
     let store = index_store.read();
@@ -2602,7 +2676,51 @@ pub fn maybe_index(
         {
             continue;
         }
-        index_fields(def, &crate::key_bytes::text_of(key), fields, how);
+        index_fields(def, &crate::key_bytes::text_of(key), fields, how, &[]);
+    }
+}
+
+/// Whether a write makes the document the last written in `def`'s order of
+/// its documents (see `postings::KeyOrder`), as in Redis: one put under its
+/// key whole, or one that names a field of the index (`fields` written, or
+/// `named` by the command), even with the value it had. A write of other
+/// fields of a hash leaves it where it is.
+fn moves(def: &IndexDef, fields: &[(String, Arc<[u8]>)], how: Write, named: &[&[u8]]) -> bool {
+    match how {
+        Write::Whole => true,
+        Write::Fields => fields
+            .iter()
+            .any(|(name, _)| def.fields.iter().any(|f| f.name == *name)),
+        Write::Refresh => named
+            .iter()
+            .any(|name| def.fields.iter().any(|f| f.name.as_bytes() == *name)),
+    }
+}
+
+/// A replay that puts indexing off wrote the document at `key` (of an index
+/// `on`): each index of it that the write `moves` in notes it, for the walk
+/// after the replay to put the documents in in the order of their writes.
+fn note_replayed(
+    index_store: &IndexStore,
+    db: usize,
+    key: &[u8],
+    on: IndexOn,
+    moves: impl Fn(&IndexDef) -> bool,
+) {
+    let store = index_store.read();
+    for (name, def) in store.iter() {
+        if is_alias(name, def)
+            || def.on != on
+            || def.db_index != db
+            || !def.gives_ids()
+            || !def.covers(key)
+            || !moves(def)
+        {
+            continue;
+        }
+        def.postings
+            .write()
+            .replayed(&crate::key_bytes::text_of(key));
     }
 }
 
@@ -2626,7 +2744,7 @@ pub fn maybe_index_pairs(
     pairs: &[[&[u8]; 2]],
     how: Write,
 ) {
-    if indexing_deferred() || index_store.none() {
+    if index_store.none() {
         return;
     }
     let fields: Vec<(String, Arc<[u8]>)> = pairs
@@ -2640,8 +2758,15 @@ pub fn maybe_index_pairs(
 }
 
 /// Index `fields` of the document at `key` in `def`: the words of its TEXT
-/// fields, its TAG and NUMERIC values, and its vectors.
-fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: Write) {
+/// fields, its TAG and NUMERIC values, and its vectors. `named`: the fields
+/// a [`Write::Refresh`] names (see [`moves`]).
+fn index_fields(
+    def: &IndexDef,
+    key: &str,
+    fields: &[(String, Arc<[u8]>)],
+    how: Write,
+    named: &[&[u8]],
+) {
     #[cfg(test)]
     crate::test_hooks::at("index_fields: fields read");
     let whole = how != Write::Fields;
@@ -2694,7 +2819,8 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
     // lock, at once or when the queue is applied (see `postings::WithId`).
     let doc = if def.gives_ids() {
         let words = def.text_write(changes, restemmed, language);
-        def.postings.write_fields(key, fields, whole, words)
+        let moves = moves(def, fields, how, named);
+        def.postings.write_fields(key, fields, whole, moves, words)
     } else {
         def.docs.add(key);
         postings::NO_DOC

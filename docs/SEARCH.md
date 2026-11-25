@@ -87,4 +87,5 @@ The full command surface, filters, hybrid search and edge cases are in **[COMMAN
 
 - Native snapshots (**`dump.kdb`**) store the **keys**, the **index schemas**, and, when you **`SAVE` / `BGSAVE`** with indexes populated, the **HNSW graph** of each vector field, so search quality after a restart matches the graph you had before shutdown.
 - While search indexes are being rebuilt at startup, most commands return **`LOADING`** until the rebuild finishes; **`PING`**, **`INFO`** and a few other commands still work.
+- Documents that a query finds level (equal `SORTBY` values, the same score, vectors as near) come in the order they were written, as in Redis: `SORTBY … ASC` first written first, `DESC` the reverse. A write that names a field of the index makes its document the last written. Snapshots keep that order (their document order section), the AOF replays it, and a replica has its master's.
 - After a large ingest, run **`SAVE`** (or schedule **`BGSAVE`**) so the next start reloads the graph from disk instead of rebuilding it from the hashes.
