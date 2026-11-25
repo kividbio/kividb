@@ -898,6 +898,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   place (master: 37,467 µs every call). Suite 53 of
   `benchmarks/1.3.0/regressions` gates these and the `SETBIT` and
   `BITFIELD` rows at 64 MiB against v1.2.2 (38,110 µs an `APPEND` there).
+- **`SETRANGE` and `BITFIELD` write where the string is kept (part of
+  #1016).** Both go through the same in-place string edit as `SETBIT`:
+  when nothing but its key holds the string and the result still fits
+  where it is kept, the new bytes are written there and the string is not
+  copied. Otherwise (a `SETRANGE` that outgrows the string's block, or a
+  string shared with another key since a `COPY`, being read by a `DUMP`,
+  or captured by a `BGSAVE`, an AOF rewrite or a replica's full sync) it
+  is copied once, and a holder keeps the bytes from before. The time to
+  live is kept. A `SETRANGE` with an empty value writes nothing, does not
+  create a missing key, and is not a write: it is not logged, replicated
+  or counted, and fails no `WATCH`, as in Redis.
+  `BITFIELD` runs its operations in order on the stored bytes, with the
+  key's shard locked from the first to the last, each reading and writing
+  only its field's bytes. It grows a string as an `APPEND` does, in its
+  block when there is room, else into a block with room for more,
+  zero-filled to the field. An `OVERFLOW FAIL` write that is refused
+  writes nothing and grows nothing. A `BITFIELD` is a write when an
+  applied `SET` or `INCRBY` changes its field or grows the string, also
+  when a later one puts the bits back, as in Redis 8; one that changes
+  nothing is not logged, replicated or announced, and fails no `WATCH`.
+  A write counts one change, as any write command does. A signed
+  `INCRBY` that wraps past the field's largest value replies with the
+  value it stores (`127 + 1` on an `i8` is `-128`), as Redis does.
 - **A save keeps about 8 MiB of collections in memory a capture thread
   while the disk keeps up (#825).** A save lays out the values that are not strings when it
   captures the dataset, with writes held. For `dump.kdb` each capture thread
