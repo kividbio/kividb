@@ -189,9 +189,19 @@ fn path(cluster: &ClusterState) -> Option<std::path::PathBuf> {
     })
 }
 
+/// The text last written, or read back at start-up: a save that would write
+/// the same writes nothing.
+static WRITTEN: Mutex<Option<String>> = Mutex::new(None);
+
+/// The file written before it is put in place.
+fn tmp_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    std::path::PathBuf::from(tmp)
+}
+
 /// Write the file down, synced, if it changed since it was last written.
 pub(crate) fn save(cluster: &ClusterState) {
-    static WRITTEN: Mutex<Option<String>> = Mutex::new(None);
     let Some(path) = path(cluster) else {
         return;
     };
@@ -206,9 +216,7 @@ pub(crate) fn save(cluster: &ClusterState) {
     if written.as_deref() == Some(text.as_str()) {
         return;
     }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
+    let tmp = tmp_path(&path);
     let saved = (|| {
         use std::io::Write;
         let mut file = std::fs::File::create(&tmp)?;
@@ -236,12 +244,19 @@ pub(crate) fn save(cluster: &ClusterState) {
 /// before a save of nodes.conf that moved the slot) at its owner's config
 /// epoch in nodes.conf, which is no earlier than it came.
 pub(crate) fn load(cluster: &ClusterState) {
+    // A file being written when the node stopped is not the file: it is
+    // removed, as a spare of nodes.conf is.
+    if let Some(path) = path(cluster) {
+        let _ = std::fs::remove_file(tmp_path(&path));
+    }
     let read = path(cluster).and_then(|path| match std::fs::read(&path) {
         Ok(bytes) => {
-            let parsed = String::from_utf8(bytes)
-                .ok()
-                .ok_or(())
-                .and_then(|t| parse(&t));
+            let text = String::from_utf8(bytes).ok();
+            let parsed = text.as_deref().ok_or(()).and_then(parse);
+            if parsed.is_ok() {
+                // What it holds is what a save of the same state writes.
+                *WRITTEN.lock() = text.clone();
+            }
             if parsed.is_err() {
                 log_warn!(
                     "Cluster: {} does not read: each slot is taken to have come to its owner at \
