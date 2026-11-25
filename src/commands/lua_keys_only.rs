@@ -588,8 +588,12 @@ mod tests {
             "return redis.call('GET', KEYS[1]) .. 'x\\z   y\\65\\x41\\u{48}'"
         ));
         assert!(!keeps("return redis.call('GET', KEYS[1]) .. 'x\\z \n y'"));
-        assert!(keeps("return redis.call('GET', KEYS[1]) .. \"redis.call('SET','o','1')\""));
-        assert!(!keeps("return redis.call('GET', KEYS[1]) .. 'a' redis.call('SET','o','1')"));
+        assert!(keeps(
+            "return redis.call('GET', KEYS[1]) .. \"redis.call('SET','o','1')\""
+        ));
+        assert!(!keeps(
+            "return redis.call('GET', KEYS[1]) .. 'a' redis.call('SET','o','1')"
+        ));
         // Long strings over line ends of every kind, of any level.
         assert!(keeps(
             "local s = [==[ ]] \r redis.call('SET','o','1') \n ]==] return redis.call('GET', KEYS[1])"

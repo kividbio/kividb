@@ -101,13 +101,21 @@ static PARALLEL: AtomicBool = AtomicBool::new(false);
 
 /// Whether a client's command locks the hash tags of the keys it names (and,
 /// once those are locked, its keys without one): always in a build with Lua,
-/// whatever `lua-parallel-scripts` says, and never in one without, which
-/// runs no script beside others. A command asks this before it is in the
-/// command gate (`handler::run_command`), where a setting could change
-/// before it gets in; a constant cannot.
+/// whatever `lua-parallel-scripts` says. A command asks this before it is in
+/// the command gate (`handler::run_command`), where a setting could change
+/// before it gets in; a constant cannot. A build without Lua runs no script
+/// beside others, and goes by the setting as it always has: keys without a
+/// tag are never locked there.
 #[inline(always)]
 pub fn enabled() -> bool {
-    cfg!(feature = "lua")
+    #[cfg(feature = "lua")]
+    {
+        true
+    }
+    #[cfg(not(feature = "lua"))]
+    {
+        PARALLEL.load(Ordering::Relaxed)
+    }
 }
 
 /// `lua-parallel-scripts`, as it is now: whether a script may run beside
@@ -127,8 +135,8 @@ pub fn parallel_scripts() -> bool {
 /// runs beside others then finds the tags of its keys locked by every
 /// command all the same ([`enabled`]), and keys without a tag stay locked
 /// until no script runs beside others ([`try_clear_untagged`], tried here
-/// and again later). In a build without Lua the setting is kept, for
-/// `CONFIG GET`, and changes nothing.
+/// and again later). In a build without Lua it switches the locks of tags,
+/// as it always has; keys without a tag are never locked there.
 pub fn set_enabled(on: bool) {
     PARALLEL.store(on, Ordering::SeqCst);
     #[cfg(feature = "lua")]
@@ -421,7 +429,11 @@ fn try_take(id: usize) -> bool {
     } else {
         #[cfg(feature = "lua")]
         {
-            KEY_STRIPE[id - STRIPES].0.try_read().map(std::mem::forget).is_some()
+            KEY_STRIPE[id - STRIPES]
+                .0
+                .try_read()
+                .map(std::mem::forget)
+                .is_some()
         }
         #[cfg(not(feature = "lua"))]
         {
@@ -434,7 +446,11 @@ fn try_take(id: usize) -> bool {
 #[cfg(feature = "lua")]
 fn try_take_for(id: usize, wait: Duration) -> bool {
     if id < STRIPES {
-        STRIPE[id].0.try_lock_for(wait).map(std::mem::forget).is_some()
+        STRIPE[id]
+            .0
+            .try_lock_for(wait)
+            .map(std::mem::forget)
+            .is_some()
     } else {
         KEY_STRIPE[id - STRIPES]
             .0
@@ -1037,6 +1053,7 @@ struct KeysHeld {
 /// A command's locks: one, as nearly every command on a tagged key holds,
 /// or a list of them.
 enum Locks {
+    #[cfg_attr(not(feature = "lua"), allow(dead_code))]
     One(u16),
     Many(Ids),
 }
@@ -2237,16 +2254,15 @@ pub fn is_switch(name: &str, cmd: &[&[u8]]) -> bool {
 mod tests {
     use super::*;
 
-    /// In a build without Lua, `lua-parallel-scripts` is kept for `CONFIG GET`
-    /// and changes nothing: no command locks a key.
+    /// In a build without Lua, keys without a tag are never locked, whatever
+    /// `lua-parallel-scripts` says.
     #[cfg(not(feature = "lua"))]
     #[test]
-    fn without_lua_the_setting_changes_nothing() {
+    fn without_lua_keys_without_a_tag_are_never_locked() {
         set_enabled(true);
-        assert!(parallel_scripts());
-        assert!(!enabled());
         assert!(!untagged_keys_locked());
-        assert!(try_hold_for_eviction(b"{t}:k").is_some_and(|hold| hold.0.is_none()));
+        assert!(lock_keys([b"plain".as_slice()].into_iter()).is_none());
+        assert!(try_hold_for_eviction(b"plain").is_some_and(|hold| hold.0.is_none()));
         set_enabled(false);
     }
 

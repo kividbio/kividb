@@ -3215,12 +3215,7 @@ fn every_key(c: &mut Conn) -> Vec<(String, V)> {
 /// `clients` connections running `HALF` on keys `h0`..`h3` for `secs`, and
 /// readers of those keys: returns how many reads found a script half done
 /// (must be 0) and how many scripts ran.
-fn half_scripts_and_readers(
-    port: u16,
-    clients: usize,
-    readers: usize,
-    secs: f64,
-) -> (u64, u64) {
+fn half_scripts_and_readers(port: u16, clients: usize, readers: usize, secs: f64) -> (u64, u64) {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writers: Vec<_> = (0..clients)
         .map(|client| {
@@ -3257,10 +3252,7 @@ fn half_scripts_and_readers(
                     let V::Arr(both) = c.cmd(&["MGET", "h0", "h1", "h2", "h3"]) else {
                         panic!("MGET")
                     };
-                    half += both
-                        .iter()
-                        .filter(|v| **v == V::Str("tmp".into()))
-                        .count() as u64;
+                    half += both.iter().filter(|v| **v == V::Str("tmp".into())).count() as u64;
                     n += 1;
                 }
                 half
@@ -3303,12 +3295,15 @@ fn setting_flips_under_load(io: &str) {
             std::thread::sleep(Duration::from_millis(500));
             let mut flips = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let to = if flips % 2 == 0 { "no" } else { "yes" };
+                let to = if flips.is_multiple_of(2) { "no" } else { "yes" };
                 assert!(c.cmd(&["CONFIG", "SET", "lua-parallel-scripts", to]).ok());
                 flips += 1;
                 std::thread::sleep(Duration::from_millis(3));
             }
-            assert!(c.cmd(&["CONFIG", "SET", "lua-parallel-scripts", "yes"]).ok());
+            assert!(
+                c.cmd(&["CONFIG", "SET", "lua-parallel-scripts", "yes"])
+                    .ok()
+            );
             flips
         })
     };
@@ -3366,7 +3361,7 @@ fn switching_eviction_under_keys_only_scripts_ends_the_same_on_replica_and_aof()
             let mut c = Conn::connect(mp);
             let mut i = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let limit = if i % 2 == 0 {
+                let limit = if i.is_multiple_of(2) {
                     (used - used / 50).to_string()
                 } else {
                     "0".to_string()
@@ -3427,7 +3422,10 @@ fn nothing_finds_a_key_a_script_makes_and_drops() {
                 let mut c = Conn::connect(port);
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     if n % 2 == 0 {
-                        assert_eq!(c.cmd(&["EVAL", MAKES_AND_DROPS, "1", "s:gone", "300"]), V::Int(1));
+                        assert_eq!(
+                            c.cmd(&["EVAL", MAKES_AND_DROPS, "1", "s:gone", "300"]),
+                            V::Int(1)
+                        );
                     } else {
                         assert_eq!(c.cmd(&["EVAL", WEIGHT, "1", "w_1"]), V::Int(1));
                     }
@@ -3477,7 +3475,9 @@ fn a_key_expiring_during_a_script_beside_others_is_there_for_it() {
         let counted = moved(&mut c, |c| assert_eq!(c.cmd(&args), V::Str("v".into())));
         assert_eq!(counted, one(&["scripts_run_beside_others"]));
     }
-    wait_until("the key to expire", 10, || c.cmd(&["EXISTS", "brief"]) == V::Int(0));
+    wait_until("the key to expire", 10, || {
+        c.cmd(&["EXISTS", "brief"]) == V::Int(0)
+    });
 }
 
 /// A `BLPOP` on a key without a tag is woken by a script that runs beside
@@ -3540,7 +3540,11 @@ fn keys_named_twice_on_one_lock_and_in_both_orders_do_not_wait_for_ever() {
             std::thread::spawn(move || {
                 let mut c = Conn::connect(port);
                 for _ in 0..300 {
-                    let (a, b) = if n % 2 == 0 { ("x:a", "x:b") } else { ("x:b", "x:a") };
+                    let (a, b) = if n % 2 == 0 {
+                        ("x:a", "x:b")
+                    } else {
+                        ("x:b", "x:a")
+                    };
                     assert!(matches!(c.cmd(&["EVAL", BOTH_UP, "2", a, b]), V::Int(_)));
                 }
             })
@@ -3565,13 +3569,28 @@ fn a_search_never_finds_a_hash_a_script_is_part_way_through() {
     let server = Server::start(&[KEEP_FAST]);
     let mut c = server.conn();
     assert!(
-        c.cmd(&["FT.CREATE", "idx", "ON", "HASH", "PREFIX", "1", "doc:", "SCHEMA", "n", "NUMERIC"])
-            .ok()
+        c.cmd(&[
+            "FT.CREATE",
+            "idx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "doc:",
+            "SCHEMA",
+            "n",
+            "NUMERIC"
+        ])
+        .ok()
     );
     let script = "redis.call('HSET', KEYS[1], 'n', '-1') \
                   for i = 1, tonumber(ARGV[1]) do end \
                   return redis.call('HSET', KEYS[1], 'n', ARGV[2])";
-    until_beside_others(&mut c, &["EVAL", script, "1", "doc:1", "300", "1"], &mut |_| {});
+    until_beside_others(
+        &mut c,
+        &["EVAL", script, "1", "doc:1", "300", "1"],
+        &mut |_| {},
+    );
     let port = server.port;
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer = {
@@ -3581,7 +3600,14 @@ fn a_search_never_finds_a_hash_a_script_is_part_way_through() {
             let mut i = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 i += 1;
-                c.cmd(&["EVAL", script, "1", &format!("doc:{}", i % 3), "300", &i.to_string()]);
+                c.cmd(&[
+                    "EVAL",
+                    script,
+                    "1",
+                    &format!("doc:{}", i % 3),
+                    "300",
+                    &i.to_string(),
+                ]);
             }
         })
     };
@@ -3606,25 +3632,43 @@ fn a_search_never_finds_a_hash_a_script_is_part_way_through() {
 fn a_script_beside_others_notifies_and_invalidates() {
     let server = Server::start(&[KEEP_FAST]);
     let mut c = server.conn();
-    assert!(c.cmd(&["CONFIG", "SET", "notify-keyspace-events", "KA"]).ok());
+    assert!(
+        c.cmd(&["CONFIG", "SET", "notify-keyspace-events", "KA"])
+            .ok()
+    );
     let set = ["EVAL", SETS_A_KEY_DIRECT, "1", "watched", "1"];
     until_beside_others(&mut c, &set, &mut |_| {});
     let mut sub = server.conn();
-    assert!(matches!(sub.cmd(&["SUBSCRIBE", "__keyspace@0__:watched"]), V::Arr(_)));
+    assert!(matches!(
+        sub.cmd(&["SUBSCRIBE", "__keyspace@0__:watched"]),
+        V::Arr(_)
+    ));
     let mut inval = server.conn();
     let V::Int(inval_id) = inval.cmd(&["CLIENT", "ID"]) else {
         panic!("CLIENT ID")
     };
-    assert!(matches!(inval.cmd(&["SUBSCRIBE", "__redis__:invalidate"]), V::Arr(_)));
+    assert!(matches!(
+        inval.cmd(&["SUBSCRIBE", "__redis__:invalidate"]),
+        V::Arr(_)
+    ));
     let mut tracked = server.conn();
     assert!(
         tracked
-            .cmd(&["CLIENT", "TRACKING", "ON", "REDIRECT", &inval_id.to_string()])
+            .cmd(&[
+                "CLIENT",
+                "TRACKING",
+                "ON",
+                "REDIRECT",
+                &inval_id.to_string()
+            ])
             .ok()
     );
     assert_eq!(tracked.cmd(&["GET", "watched"]), V::Str("1".into()));
     let counted = moved(&mut c, |c| {
-        assert!(c.cmd(&["EVAL", SETS_A_KEY_DIRECT, "1", "watched", "2"]).ok())
+        assert!(
+            c.cmd(&["EVAL", SETS_A_KEY_DIRECT, "1", "watched", "2"])
+                .ok()
+        )
     });
     assert_eq!(counted, one(&["scripts_run_beside_others"]));
     assert_eq!(
@@ -3648,8 +3692,16 @@ fn a_script_beside_others_notifies_and_invalidates() {
 fn scripts_written_with_keys_n_only_run_beside_others() {
     let server = Server::start(&[KEEP_FAST]);
     let mut c = server.conn();
-    until_beside_others(&mut c, &["EVAL", THREE_KEYS_DIRECT, "3", "n", "n:a", "n:b"], &mut |_| {});
-    until_beside_others(&mut c, &["EVAL", SETS_A_KEY_DIRECT, "1", "m", "v"], &mut |_| {});
+    until_beside_others(
+        &mut c,
+        &["EVAL", THREE_KEYS_DIRECT, "3", "n", "n:a", "n:b"],
+        &mut |_| {},
+    );
+    until_beside_others(
+        &mut c,
+        &["EVAL", SETS_A_KEY_DIRECT, "1", "m", "v"],
+        &mut |_| {},
+    );
 }
 
 /// Keys without a tag stop being locked once no script that keeps to its
@@ -3676,7 +3728,10 @@ fn keys_without_a_tag_stop_being_locked_after_a_quiet_time() {
         ])
     );
     assert_eq!(stat(&mut c, "untagged_key_locks_on"), 2);
-    assert_eq!(moved(&mut c, |c| assert!(c.cmd(&set).ok())), one(&["scripts_run_beside_others"]));
+    assert_eq!(
+        moved(&mut c, |c| assert!(c.cmd(&set).ok())),
+        one(&["scripts_run_beside_others"])
+    );
 }
 
 /// A `MIGRATE` in a cluster of a key without a tag, back and forth between
@@ -3689,7 +3744,9 @@ fn a_migrate_of_a_key_scripts_check_and_set_loses_no_set() {
     let mut ca = a.conn();
     assert!(ca.cmd(&["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]).ok());
     wait_until("the slots to be served", 30, || {
-        ca.cmd(&["CLUSTER", "INFO"]).s().contains("cluster_state:ok")
+        ca.cmd(&["CLUSTER", "INFO"])
+            .s()
+            .contains("cluster_state:ok")
     });
     assert!(ca.cmd(&["SET", "moved", "0"]).ok());
     let cas = |c: &mut Conn| -> Option<bool> {
@@ -3701,11 +3758,19 @@ fn a_migrate_of_a_key_scripts_check_and_set_loses_no_set() {
         match c.cmd(&["EVAL", CHECK_THEN_SET, "1", "moved", &now, &next]) {
             V::Int(1) => Some(true),
             V::Int(0) => Some(false),
-            V::Err(e) if e.starts_with("ASK") || e.starts_with("MOVED") || e.starts_with("TRYAGAIN") => None,
+            V::Err(e)
+                if e.starts_with("ASK") || e.starts_with("MOVED") || e.starts_with("TRYAGAIN") =>
+            {
+                None
+            }
             other => panic!("check-then-set: {other:?}"),
         }
     };
-    until_beside_others(&mut ca, &["EVAL", CHECK_THEN_SET, "1", "warm", "x", "y"], &mut |_| {});
+    until_beside_others(
+        &mut ca,
+        &["EVAL", CHECK_THEN_SET, "1", "warm", "x", "y"],
+        &mut |_| {},
+    );
     let (pa, pb) = (a.port, b.port);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let setters: Vec<_> = (0..4)
@@ -3726,14 +3791,32 @@ fn a_migrate_of_a_key_scripts_check_and_set_loses_no_set() {
     let mut cb = b.conn();
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(20));
-        let there = ca.cmd(&["MIGRATE", "127.0.0.1", &pb.to_string(), "moved", "0", "5000"]);
+        let there = ca.cmd(&[
+            "MIGRATE",
+            "127.0.0.1",
+            &pb.to_string(),
+            "moved",
+            "0",
+            "5000",
+        ]);
         assert!(there.ok(), "{there:?}");
         std::thread::sleep(Duration::from_millis(5));
-        let back = cb.cmd(&["MIGRATE", "127.0.0.1", &pa.to_string(), "moved", "0", "5000"]);
+        let back = cb.cmd(&[
+            "MIGRATE",
+            "127.0.0.1",
+            &pa.to_string(),
+            "moved",
+            "0",
+            "5000",
+        ]);
         assert!(back.ok(), "{back:?}");
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let took: u64 = setters.into_iter().map(|s| s.join().unwrap()).sum();
     assert!(took > 0);
-    assert_eq!(ca.cmd(&["GET", "moved"]), V::Str(took.to_string()), "a set was lost");
+    assert_eq!(
+        ca.cmd(&["GET", "moved"]),
+        V::Str(took.to_string()),
+        "a set was lost"
+    );
 }
