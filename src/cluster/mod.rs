@@ -572,6 +572,9 @@ pub struct ClusterState {
     /// When each slot came to its owner here (`came_at::CameAt`): what a
     /// vote is refused for when a candidate claims a slot at an older epoch.
     pub(crate) came_at: came_at::CameAt,
+    /// This node's election under way: which masters refused which slots it
+    /// claimed for when they came (`came_at::Refusals`).
+    pub(crate) moved_refusals: parking_lot::Mutex<came_at::Refusals>,
     /// Per candidate, the election epoch at which this node last refused it
     /// its vote for leaving out of its claims slots its master claims
     /// ([`Self::left_out_of_claims`]): once per election, so that a
@@ -662,6 +665,7 @@ impl ClusterState {
             yielded_to: parking_lot::Mutex::new(ahash::AHashSet::new()),
             own_claims: RwLock::new(AHashMap::new()),
             came_at: came_at::CameAt::default(),
+            moved_refusals: parking_lot::Mutex::new(came_at::Refusals::default()),
             left_out_told: parking_lot::Mutex::new(AHashMap::new()),
         };
         state.refresh_state();
@@ -1074,6 +1078,14 @@ impl ClusterState {
         // mutator having to remember to.
         self.refresh_state();
         persist::save_from_state(self)
+    }
+
+    /// [`Self::save_to_disk`], without `<cluster-config-file>.came-at`
+    /// (`persist::save_from_state_without_came_at`): the save of the config
+    /// epoch a takeover takes.
+    pub(crate) fn save_epoch_to_disk(&self) -> std::io::Result<()> {
+        self.refresh_state();
+        persist::save_from_state_without_came_at(self)
     }
 
     /// Set the bind address and port on our own node entry. Called from
@@ -2429,15 +2441,14 @@ impl ClusterState {
             let migrations = self.migrations.read();
             let by_hand = self.by_hand.lock();
             for claim in claims {
+                // Of the slots it owns here already, one noted provisionally
+                // when it was given to it here: its own claim says when it
+                // came (`came_at`).
+                self.came_at
+                    .owner_claimed(&slots[..], owner_id, claim.start, claim.end, claim.epoch);
                 for slot in claim.start..=claim.end {
                     let i = slot as usize;
-                    if i >= CLUSTER_SLOTS {
-                        continue;
-                    }
-                    if slots[i] == Some(owner_id) {
-                        // Noted provisionally when it was given to it here:
-                        // its own claim says when it came.
-                        self.came_at.owner_claimed(slot, claim.epoch);
+                    if i >= CLUSTER_SLOTS || slots[i] == Some(owner_id) {
                         continue;
                     }
                     // Just assigned or removed here by hand: see `note_by_hand`.
@@ -4282,24 +4293,29 @@ impl ClusterState {
             self.send_claims_to_replicas(&[slot], epoch);
         }
         // When it came (`came_at`): at this node's config epoch, just
-        // raised, when it is the new owner; else at the new owner's known
-        // here, until its own claim. Read before `slots`, as `nodes` is
+        // raised, when it is the new owner; else, until the new owner's own
+        // claim, at a lower bound of the epoch it claims it at
+        // (`came_at::provisional_epoch`). Read before `slots`, as `nodes` is
         // taken first elsewhere.
-        let epoch = self
+        let epochs: AHashMap<NodeId, u64> = self
             .nodes
             .read()
-            .get(&new_owner)
-            .map_or(0, |n| n.config_epoch);
+            .iter()
+            .map(|(id, n)| (*id, n.config_epoch))
+            .collect();
         {
             let mut owners = self.slots.write();
+            let previous = owners[slot as usize];
             owners[slot as usize] = Some(new_owner);
             if new_owner == self.myself() {
                 self.slot_deletions.came_here([slot]);
-            }
-            if new_owner == self.myself() {
-                self.came_at.set([slot], epoch);
+                self.came_at
+                    .set([slot], epochs.get(&new_owner).copied().unwrap_or(0));
             } else {
-                self.came_at.set_provisional(slot, epoch);
+                self.came_at.set_provisional(
+                    slot,
+                    came_at::provisional_epoch(&epochs, new_owner, previous),
+                );
             }
         }
         self.migrations.write().remove(&slot);
@@ -4512,12 +4528,18 @@ impl ClusterState {
         let me = self.myself();
         let mut handed = Vec::new();
         // The destination's claim, at the epoch it took them at, sets when
-        // they came (`came_at`): its config epoch known here until then.
-        let new_owner_epoch = self
-            .nodes
-            .read()
-            .get(&new_owner)
-            .map_or(0, |n| n.config_epoch);
+        // they came (`came_at`); until then a lower bound of it: above this
+        // node's config epoch, which the destination took them above
+        // (`came_at::provisional_epoch`).
+        let new_owner_epoch = {
+            let epochs: AHashMap<NodeId, u64> = self
+                .nodes
+                .read()
+                .iter()
+                .map(|(id, n)| (*id, n.config_epoch))
+                .collect();
+            came_at::provisional_epoch(&epochs, new_owner, Some(me))
+        };
         {
             let mut owners = self.slots.write();
             let mut migrations = self.migrations.write();

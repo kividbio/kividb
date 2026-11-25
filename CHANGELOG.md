@@ -10,12 +10,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Upgrading
 
 - **Cluster: masters vote on when the slots a replica claims came to its
-  master.** A replica is elected only for slots whose writes it holds while
-  the masters of this release are a majority of the masters that own slots:
-  a master of 1.2 votes without the check. Upgrade the masters before
-  relying on it. Each master keeps `<cluster-config-file>.came-at` beside
-  `nodes.conf`; one that starts without it takes each slot to have come at
-  its owner's config epoch. `CLUSTER FAILOVER TAKEOVER` takes the master's
+  master.** The check is made by masters of 1.3.0 and later; a replica is
+  elected only for slots whose writes it holds while those masters are a
+  majority of the masters that own slots. Each master keeps
+  `<cluster-config-file>.came-at` beside `nodes.conf`; one that starts
+  without it takes each slot to have come at its owner's config epoch. `CLUSTER FAILOVER TAKEOVER` takes the master's
   slots without asking the other masters, whatever the replica holds of
   them: use `FORCE` where the vote should decide.
 
@@ -167,13 +166,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the slot to its owner (`<cluster-config-file>.came-at`, with each slot's
   owner, written, synced, before the saves of `nodes.conf`; a slot it does
   not have with that owner is taken to have come at the owner's config
-  epoch). A slot claimed at an older epoch than
-  that is refused, and the refusal (`UPDATE`, with one field more) says when
-  each came: the replica holds those only through a `TAKEN` at that epoch
-  or later that lists them, or an `ARRIVED` at that very epoch, and asks
-  again for the others. So a replica cut off while slots of its master went
-  to another master, took writes there and came back is elected only for
-  the slots whose writes it holds, and the master keeps the others.
+  epoch). Asked for its vote, a master refuses it to a replica that claims
+  a slot of its master at an older epoch than the slot came to the master
+  at, and says when each such slot came (`UPDATE`, with one field more). The
+  replica gives a slot up once the masters that refused it leave too few
+  others for a quorum, and then holds it only through a `TAKEN` at that
+  epoch or later that lists it, or an `ARRIVED` at that very epoch; it
+  asks again for the others.
 
 - **`search-resp3-reply`: the shape of the search commands' RESP3 replies (#1021).**
   `auto` (the default) answers `FT.SEARCH`, `FT.AGGREGATE` (and its cursor), `FT.HYBRID`,

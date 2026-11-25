@@ -634,7 +634,18 @@ fn topology_fingerprint(
 /// identical file a dozen times a second per node was most of this module's
 /// actual work.
 pub fn save_from_state(state: &crate::cluster::ClusterState) -> std::io::Result<()> {
-    save_then(state, &[], None::<fn()>)
+    save_then(state, &[], None::<fn()>, true)
+}
+
+/// [`save_from_state`], without `<cluster-config-file>.came-at`: the save
+/// of the config epoch a takeover takes, which the source's writes wait
+/// for. The file names each slot's owner, and one older than a save of
+/// nodes.conf that moved a slot reads back for it at the owner's config
+/// epoch (`came_at::load`): leaving it to the next save is safe.
+pub fn save_from_state_without_came_at(
+    state: &crate::cluster::ClusterState,
+) -> std::io::Result<()> {
+    save_then(state, &[], None::<fn()>, false)
 }
 
 /// [`save_from_state`], with `mine` saved as this node's slots, and then,
@@ -650,7 +661,7 @@ pub fn save_from_state_then(
     mine: &[u16],
     publish: impl FnOnce(),
 ) -> std::io::Result<()> {
-    save_then(state, mine, Some(publish))
+    save_then(state, mine, Some(publish), false)
 }
 
 /// Sync the file at `path`.
@@ -794,16 +805,17 @@ fn save_then(
     state: &crate::cluster::ClusterState,
     mine: &[u16],
     publish: Option<impl FnOnce()>,
+    with_came_at: bool,
 ) -> std::io::Result<()> {
     // What a replica does not hold of its master's slots is on disk before
     // the table that shows them as its master's is (`followed_imports::NotHeld`).
     crate::cluster::followed_imports::save_not_held(state);
     // And when each slot came to its owner (`came_at`), which votes are
-    // decided on; not by a save with a publish step (a takeover's, whose
-    // source holds writes meanwhile): the file names each slot's owner, and
-    // one written before a save that moved a slot reads back for it at the
-    // owner's config epoch (`came_at::load`).
-    if publish.is_none() {
+    // decided on; not by the saves of a takeover (its epoch's, and the one
+    // that takes the slots), which the source's writes wait for: the file
+    // names each slot's owner, and one written before a save that moved a
+    // slot reads back for it at the owner's config epoch (`came_at::load`).
+    if with_came_at {
         crate::cluster::came_at::save(state);
     }
     let path = match state.config_path.as_ref() {

@@ -807,12 +807,12 @@ pub(crate) fn apply_update(
 
 /// Take in the slots of this node's master that a voter says came to it
 /// after the epoch this node claimed them at (`moved`, each at the epoch
-/// it came at, `came_at`): each is a gain of the master at that epoch, held
-/// only if the master's stream confirmed it (a `TAKEN` at that epoch or
-/// later that lists it, or an `ARRIVED` at that very epoch;
-/// `followed_imports::FollowedImports::note_gains`). The slot came with
-/// keys of another node's, which this node may not have: it was cut off
-/// while the slot went away and came back.
+/// it came at, `came_at`). Those the refusals leave this node no quorum
+/// for (`ClusterState::moved_refusals_give_up`) are each a gain of the
+/// master at that epoch, held only if the master's stream confirms it (a
+/// `TAKEN` at that epoch or later that lists it, or an `ARRIVED` at that
+/// very epoch; `followed_imports::FollowedImports::note_gains`); this node
+/// stands for the others.
 pub(crate) fn apply_moved(
     state: &ClusterState,
     sender_id: NodeId,
@@ -835,14 +835,25 @@ pub(crate) fn apply_moved(
     if gains.is_empty() {
         return;
     }
+    let given_up = state.moved_refusals_give_up(sender_id, master, &gains);
     log_info!(
         "Cluster: {} answered this node's vote request: slots {} came to its master after the \
-         epoch this node claimed them at; held only if its master's stream confirms them",
+         epoch this node claimed them at; {} given up, held only if its master's stream \
+         confirms them",
         node_id_str(&sender_id),
-        crate::cluster::came_at::claims_text(moved)
+        crate::cluster::came_at::claims_text(moved),
+        if given_up.is_empty() {
+            "none".to_string()
+        } else {
+            crate::cluster::migration::ranges_text(&crate::cluster::migration::slot_runs(
+                given_up.iter().map(|(s, _)| *s),
+            ))
+        }
     );
-    state.followed_imports.note_gains(master, &gains);
-    state.save_soon();
+    if !given_up.is_empty() {
+        state.followed_imports.note_gains(master, &given_up);
+        state.save_soon();
+    }
 }
 
 /// For the tests of a node that has not heard of a slot's new owner, and

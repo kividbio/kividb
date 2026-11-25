@@ -401,9 +401,8 @@ impl FollowedImports {
     /// for election, `view_epoch` being the master's config epoch here: the
     /// epoch of the newest claim of it read in its stream (`confirmed`),
     /// and for a slot an `ARRIVED` at a newer epoch covers, that epoch. For
-    /// a master whose stream carries no markers (1.2), or that this node has
-    /// no session with yet, `view_epoch`, as for a node of an earlier
-    /// release. Before the first claim read: `view_epoch` if this node
+    /// a master whose stream carries no markers, or that this node has
+    /// no session with yet, `view_epoch`. Before the first claim read: `view_epoch` if this node
     /// started holding every slot of its master as nodes.conf has them (no
     /// file, see [`NotHeld::baseline`]); else 0, which a voter that knows
     /// when the master's slots came to it refuses for each of them.
@@ -1968,7 +1967,7 @@ mod tests {
         assert_eq!(parse_confirmed(&text), Some(5));
         let (of, slots) = parse_not_held(&text).unwrap();
         assert_eq!((of, slots.len()), (m, 0));
-        // A full sync keeps it; a master without markers: as before.
+        // A full sync keeps it; a master without markers: its config epoch.
         f.session_with(Some(m), true, true);
         assert_eq!(f.claim_epochs(m, 9).epoch(1), 5);
         f.session_with(Some(m), false, false);

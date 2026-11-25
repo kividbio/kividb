@@ -3794,7 +3794,7 @@ fn take_over_now(
     // config is): restarted, this node takes a newer epoch for the next
     // attempt, which a replica that kept this attempt's marker does not take
     // for this one's.
-    if let Err(e) = cluster.save_to_disk() {
+    if let Err(e) = cluster.save_epoch_to_disk() {
         return not_yet(
             &format!("could not save the config epoch taken for the takeover: {e}"),
             false,
