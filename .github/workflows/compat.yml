@@ -32,6 +32,8 @@ jobs:
       OUT: ${{ github.workspace }}/compat-results
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false # the harnesses run code fetched from other projects; nothing here pushes
 
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:

@@ -110,8 +110,8 @@ other files:
   '<name>' not found in database <n>`) there and in Redis's elsewhere; the setting is per node, so in
   a cluster set every node alike:
   [docs/CONFIGURATION.md](CONFIGURATION.md#search-reply-shape-over-resp3).
-- Open WebUI's Valkey vector store (`VECTOR_DB=valkey`, valkey-glide-sync), as shipped: its own
-  `ValkeyClient` through insert, search, filtered search, query, get, upsert, delete and reset, 17
+- From 1.3.0, Open WebUI's Valkey vector store (`VECTOR_DB=valkey`, valkey-glide-sync), with its client
+  unpatched: its own `ValkeyClient` through insert, search, filtered search, query, get, upsert, delete and reset, 17
   checks, passing on KiviDB and on valkey/valkey-bundle 9.2.0. `INFO` reports `valkey_version:9.0.1`,
   which its version gate reads: [docs/integrations/open-webui.md](integrations/open-webui.md).
 - Not compatible: Haystack's Valkey document store, which needs valkey-search's reply formats (it fails on

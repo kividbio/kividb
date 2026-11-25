@@ -1204,3 +1204,52 @@ fn the_valkey_text_names_the_database() {
         show(&reply)
     );
 }
+
+/// An index name that is not text names no index: `FT.HYBRID` says so, and
+/// before it reads the rest, as it does for a name that is text.
+#[test]
+fn a_name_that_is_not_text_names_no_index() {
+    let server = Server::start(&[]);
+    let mut c = server.conn();
+    for args in [
+        vec![&b"FT.HYBRID"[..], b"\xff\xfe", b"SEARCH", b"*"],
+        vec![b"FT.INFO", b"\xff\xfe"],
+        vec![b"FT.SEARCH", b"\xff\xfe", b"*"],
+    ] {
+        let reply = c.raw(&args);
+        assert!(
+            reply.starts_with(b"-SEARCH_INDEX_NOT_FOUND Index not found: "),
+            "{args:?}: {}",
+            show(&reply)
+        );
+    }
+    let server = Server::start(&["--search-resp3-reply", "valkey"]);
+    let mut c = server.conn();
+    let reply = c.raw(&[b"FT.HYBRID", b"\xff\xfe", b"SEARCH", b"*"]);
+    assert!(
+        reply.starts_with(b"-Index with name '")
+            && reply.ends_with(b"' not found in database 0\r\n"),
+        "{}",
+        show(&reply)
+    );
+}
+
+/// A script's `pcall` reads Redis's text whoever calls it, as it reads
+/// Redis's shape.
+#[cfg(feature = "lua")]
+#[test]
+fn a_script_reads_redis_words_for_a_missing_index() {
+    let server = Server::start(&["--search-resp3-reply", "valkey"]);
+    let mut c = server.conn();
+    c.ok(&["CLIENT", "SETINFO", "LIB-NAME", "GlidePy"]);
+    let script = "local r = redis.pcall('FT.INFO', 'nx'); return r['err']";
+    let reply = c.cmd(&["EVAL", script, "0"]);
+    assert!(
+        show(&reply).contains("SEARCH_INDEX_NOT_FOUND Index not found: nx"),
+        "{}",
+        show(&reply)
+    );
+    // The same connection, outside a script, is answered in valkey-search's.
+    let reply = c.cmd(&["FT.INFO", "nx"]);
+    assert_eq!(reply, b"-Index with name 'nx' not found in database 0\r\n");
+}

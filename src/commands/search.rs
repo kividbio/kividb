@@ -825,15 +825,35 @@ pub(crate) fn is_no_such_index(error: &str) -> bool {
 /// Whether the error text for a missing index is valkey-search's for this
 /// connection: `search-resp3-reply valkey`, or `auto` and a connection that
 /// named itself a GLIDE client. Like the shape of a RESP3 reply, but on
-/// every protocol, and not for a shard answering its coordinator.
+/// every protocol. Not for a node answering a coordinator of its cluster
+/// (a forwarded search or schema command), and not inside a script, which
+/// reads the Redis text whoever calls it.
 pub(crate) fn valkey_wording(ctx: &Ctx) -> bool {
-    if SHARD.with(|s| s.get()) {
+    let setting = RESP3_REPLY.load(std::sync::atomic::Ordering::Relaxed);
+    if setting == RESP3_REDIS {
         return false;
     }
-    match RESP3_REPLY.load(std::sync::atomic::Ordering::Relaxed) {
+    let glide = setting == RESP3_AUTO && ctx.client_registry.get_glide(ctx.client_id);
+    let forwarded =
+        crate::cluster::search::is_forwarded(ctx) || crate::cluster::ddl::is_forwarded(ctx);
+    #[cfg(feature = "lua")]
+    let in_script = crate::commands::lua::script_eval_script_resp().is_some();
+    #[cfg(not(feature = "lua"))]
+    let in_script = false;
+    wording_is_valkey(setting, glide, forwarded, in_script)
+}
+
+/// The decision of [`valkey_wording`]: `setting` is the value of
+/// `search-resp3-reply`, `glide` whether an `auto` connection is a GLIDE
+/// client's.
+fn wording_is_valkey(setting: u8, glide: bool, forwarded: bool, in_script: bool) -> bool {
+    if forwarded || in_script {
+        return false;
+    }
+    match setting {
         RESP3_REDIS => false,
         RESP3_VALKEY => true,
-        _ => ctx.client_registry.get_glide(ctx.client_id),
+        _ => glide,
     }
 }
 
@@ -2956,9 +2976,11 @@ fn encode_page(
 thread_local! {
     /// Set while a coordinator runs its own part of a search.
     static SHARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Set while `FT.PROFILE` runs the query it profiles: valkey-search has
-    /// no `FT.PROFILE`, so its reply, and the one inside it, keep the Redis
-    /// shape in every mode.
+    /// Set while `FT.PROFILE` runs the query it profiles for a connection that
+    /// gets the Redis shape, so that the reply inside the profile is Redis's
+    /// too. A connection that takes valkey-search's shape does not set it: its
+    /// profile is the array valkey-glide converts, with the search's reply in
+    /// that shape.
     static PROFILING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -3866,6 +3888,29 @@ mod tests {
             assert_eq!(
                 valkey_missing_index(other.as_bytes().to_vec(), 0),
                 other.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn the_wording_follows_the_setting_except_for_a_forwarded_command_or_a_script() {
+        // (setting, glide, forwarded, in a script) -> valkey's words
+        for (setting, glide, forwarded, script, want) in [
+            (RESP3_AUTO, false, false, false, false),
+            (RESP3_AUTO, true, false, false, true),
+            (RESP3_REDIS, true, false, false, false),
+            (RESP3_VALKEY, false, false, false, true),
+            // A node answering its cluster's coordinator speaks Redis's words.
+            (RESP3_VALKEY, false, true, false, false),
+            (RESP3_AUTO, true, true, false, false),
+            // A script reads the Redis text whoever runs it.
+            (RESP3_VALKEY, false, false, true, false),
+            (RESP3_AUTO, true, false, true, false),
+        ] {
+            assert_eq!(
+                wording_is_valkey(setting, glide, forwarded, script),
+                want,
+                "{setting} {glide} {forwarded} {script}"
             );
         }
     }

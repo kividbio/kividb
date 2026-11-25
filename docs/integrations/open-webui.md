@@ -1,7 +1,8 @@
 # Open WebUI
 
-Open WebUI's Valkey vector store (`VECTOR_DB=valkey`, `backend/open_webui/retrieval/vector/dbs/valkey.py`, on
-`valkey-glide-sync`) runs on KiviDB as shipped, with nothing patched. Point `VALKEY_URL` at KiviDB
+From 1.3.0, Open WebUI's Valkey vector store (`VECTOR_DB=valkey`,
+`backend/open_webui/retrieval/vector/dbs/valkey.py`, on `valkey-glide-sync`) passes the 17 checks below on
+KiviDB, with its client unpatched. Point `VALKEY_URL` at KiviDB
 (`valkey://host:6380`). Its HNSW index with TAG filters on `file_id` is the filtered nearest-neighbour
 query KiviDB is built for. The default image is enough; this path runs no Lua.
 
