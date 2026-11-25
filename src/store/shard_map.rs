@@ -39,7 +39,7 @@
 //! allocated or freed, and the entry stays where it is. A string of its own
 //! is written in its block the same way when the entry is also its bytes'
 //! only holder. Anything else, and every entry somebody else holds (a
-//! snapshot being written), gets a new entry, as before.
+//! snapshot being written), gets a new entry.
 
 use std::sync::Arc;
 
@@ -1069,7 +1069,34 @@ impl ShardMap {
         extra: &[u8],
         max_len: usize,
     ) -> Result<(usize, Written), AppendRefused> {
-        let key = key.as_ref();
+        self.append_after(key.as_ref(), 0, extra, max_len)
+    }
+
+    /// [`append_str`](Self::append_str) of `n` zero bytes: the string grown
+    /// as an `APPEND` grows it, in place or copied once with room to spare.
+    /// Refused as `append_str` refuses, and also when the key is not there
+    /// and `n` passes `max_len`.
+    pub fn append_zeros(
+        &mut self,
+        key: &(impl AsRef<[u8]> + ?Sized),
+        n: usize,
+        max_len: usize,
+    ) -> Result<(usize, Written), AppendRefused> {
+        if n > max_len.min(crate::shared_bytes::MAX_LEN) {
+            return Err(AppendRefused::TooLong);
+        }
+        self.append_after(key.as_ref(), n, &[], max_len)
+    }
+
+    /// `gap` zero bytes and then `extra` added to `key`'s string, as
+    /// [`append_str`](Self::append_str) adds `extra` alone.
+    fn append_after(
+        &mut self,
+        key: &[u8],
+        gap: usize,
+        extra: &[u8],
+        max_len: usize,
+    ) -> Result<(usize, Written), AppendRefused> {
         let hash = self.hash_of(key);
         let found = self.find_live(hash, key).map(|slot| slot.entry());
         let old: &[u8] = match found.map(Entry::value) {
@@ -1077,26 +1104,26 @@ impl ShardMap {
             Some(_) => return Err(AppendRefused::WrongType),
             None => &[],
         };
-        let len = old.len() + extra.len();
+        let len = old.len().saturating_add(gap).saturating_add(extra.len());
         if let Some(entry) = found {
             if len > max_len.min(crate::shared_bytes::MAX_LEN) {
                 return Err(AppendRefused::TooLong);
             }
-            let in_place = if extra.is_empty() {
+            let in_place = if len == old.len() {
                 true
             } else if entry.inline_len().is_some() {
                 let fits = entry.fits_in_place(len);
                 if fits {
                     // SAFETY: locked for writing, held by the table alone,
                     // and in class.
-                    unsafe { entry.write_at_in_place(old.len(), extra) };
+                    unsafe { entry.write_at_in_place(old.len() + gap, extra) };
                 }
                 fits
             } else {
                 // SAFETY: locked for writing (`&mut self`), the table holds
                 // the entry, and the length is in bounds. `old` is not used
                 // again: the bytes may move.
-                unsafe { entry.append_own(extra) }.is_some()
+                unsafe { entry.append_own(gap, extra) }.is_some()
             };
             if in_place {
                 used(entry, hash, self.id());
@@ -1106,7 +1133,7 @@ impl ShardMap {
         // `old` is in the entry `put` replaces, which lives until the
         // caller drops what it gives back.
         let written = self.put(key, Ttl::Keep, None, |key, expires| {
-            Entry::string_appended(key, old, extra, expires)
+            Entry::string_appended(key, old, gap, extra, expires)
         });
         Ok((len, written))
     }
@@ -3561,6 +3588,97 @@ mod tests {
         assert_eq!(spare(&map, "a"), room);
         assert_eq!(text(map.get("a")).unwrap()[0], pattern(1)[0]);
         assert_eq!(text(map.get("c")).unwrap()[0], b'Z');
+    }
+
+    /// `append_zeros` grows a string as an append does, the new bytes zero
+    /// whatever its block held past the old length: in place when the
+    /// table alone holds the entry and the entry alone its bytes, else in a
+    /// copy with room, the holder keeping what it had; its time to live
+    /// kept. A key not there is made of the zeros; past `max_len` nothing
+    /// is.
+    #[test]
+    fn append_zeros_grows_a_string_with_zeros_as_an_append_grows_it() {
+        use crate::shared_bytes::room_for_append;
+        let spare = |map: &ShardMap, key: &str| match map.get(key) {
+            Some(ValueRef::String(s)) => s.spare(),
+            _ => panic!("no string"),
+        };
+        let mut map = ShardMap::new();
+        // Inline, in a slab's block, in the system allocator's: each set
+        // shorter where it is, over longer bytes, and grown in place over
+        // them. The large block has no room until an append leaves it.
+        for (key, long, short, n) in [
+            ("i", 40, 36, 2),
+            ("s", 20_000, 19_990, 5),
+            ("b", 1 << 20, 1 << 20, 1000),
+        ] {
+            map.insert_str_expiring(key, vec![0xFFu8; long], Some(u64::MAX));
+            map.set_str(key, vec![1u8; short]);
+            let mut want = vec![1u8; short];
+            want.resize(short + n, 0);
+            let (len, written) = map.append_zeros(key, n, usize::MAX).unwrap();
+            assert_eq!(len, short + n, "{key}");
+            assert_eq!(text(map.get(key)), Some(want.clone()), "{key}");
+            assert_eq!(map.expires(key), Some(u64::MAX), "{key}");
+            if key == "b" {
+                // No room yet: grown to the room an append leaves.
+                assert_eq!(spare(&map, key), room_for_append(len) - len);
+                let at = bytes_at(&map, key);
+                assert!(matches!(
+                    map.append_zeros(key, 7, usize::MAX),
+                    Ok((_, Written::InPlace))
+                ));
+                assert_eq!(bytes_at(&map, key), at);
+                want.resize(len + 7, 0);
+                assert_eq!(text(map.get(key)), Some(want), "{key}");
+            } else {
+                assert!(matches!(written, Written::InPlace), "{key}");
+            }
+        }
+        // Held, entry or bytes: copied with room, the holder unchanged.
+        let len = 1 << 20;
+        map.set_str("h", pattern(len));
+        let entry = map.get_ref("h").unwrap();
+        let (n, written) = map.append_zeros("h", 10, usize::MAX).unwrap();
+        assert!(matches!(written, Written::Replaced(_)));
+        assert_eq!(spare(&map, "h"), room_for_append(n) - n);
+        assert!(matches!(entry.value(), ValueRef::String(b) if b[..] == pattern(len)[..]));
+        drop(entry);
+        let bytes = match map.get("h") {
+            Some(ValueRef::String(b)) => b.to_shared(),
+            _ => panic!("no string"),
+        };
+        let (n, written) = map.append_zeros("h", 10, usize::MAX).unwrap();
+        assert!(matches!(written, Written::Replaced(_)));
+        assert_eq!(bytes.len(), len + 10);
+        let mut want = pattern(len);
+        want.resize(n, 0);
+        assert_eq!(text(map.get("h")), Some(want));
+        // Nothing to add; a key not there; refusals.
+        assert!(matches!(
+            map.append_zeros("h", 0, usize::MAX),
+            Ok((_, Written::InPlace))
+        ));
+        assert!(matches!(
+            map.append_zeros("new", 3, 3),
+            Ok((3, Written::New))
+        ));
+        assert_eq!(text(map.get("new")), Some(vec![0; 3]));
+        assert_eq!(
+            map.append_zeros("none", 4, 3).err(),
+            Some(AppendRefused::TooLong)
+        );
+        assert!(map.get("none").is_none());
+        assert_eq!(
+            map.append_zeros("new", 1, 3).err(),
+            Some(AppendRefused::TooLong)
+        );
+        assert_eq!(text(map.get("new")), Some(vec![0; 3]));
+        map.insert("list", KiviDBValue::List(Default::default()));
+        assert_eq!(
+            map.append_zeros("list", 1, usize::MAX).err(),
+            Some(AppendRefused::WrongType)
+        );
     }
 
     /// `APPEND`'s refusals write nothing; a key not there is made, an empty

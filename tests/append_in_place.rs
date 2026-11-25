@@ -890,8 +890,8 @@ fn a_setrange_on_a_missing_key_makes_it_zero_filled() {
 }
 
 /// `SETRANGE`s written in place, copied and grown are logged and replayed.
-/// An empty one is still counted as a change and logged, as before (Redis
-/// does neither), and replays as nothing: a missing key is not made.
+/// An empty one is neither counted as a change nor logged, as in Redis,
+/// and a missing key is not made.
 #[test]
 fn aof_replays_setranges_written_in_place() {
     let aof = ["--appendonly", "yes", "--appendfsync", "always"];
@@ -914,11 +914,33 @@ fn aof_replays_setranges_written_in_place() {
     }
     assert_eq!(setrange(&mut c, "missing", 7, b""), V::Int(0));
     let after: i64 = c.info("rdb_changes_since_last_save").parse().unwrap();
-    assert_eq!(after - before, 6, "dirty, the empty ones included");
+    assert_eq!(after - before, 4, "dirty");
+    assert_eq!(logged(&server.dir, b"SETRANGE"), 4, "SETRANGEs in the AOF");
     let server = server.restart(&aof);
     let mut c = server.conn();
     assert!(c.get(&key(len)) == V::Str(want), "replayed");
     assert_eq!(c.cmd(&[b"EXISTS", b"missing"]), V::Int(0));
+}
+
+/// How many times the AOF files under `dir` name `command`.
+fn logged(dir: &Path, command: &[u8]) -> usize {
+    let mut count = 0;
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.to_string_lossy().contains(".aof") {
+                let bytes = std::fs::read(&path).unwrap();
+                count += bytes
+                    .windows(command.len())
+                    .filter(|w| w.eq_ignore_ascii_case(command))
+                    .count();
+            }
+        }
+    }
+    count
 }
 
 /// `SETRANGE`s in place allocate nothing: `used_memory` and `MEMORY USAGE`

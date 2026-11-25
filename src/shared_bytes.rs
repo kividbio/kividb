@@ -377,27 +377,29 @@ impl SharedBytes {
         }
     }
 
-    /// The bytes of `old` and then `extra`, in a new block, with the room an
-    /// append leaves ([`room_for_append`]) if the block is the system
-    /// allocator's.
-    pub fn appended(old: &[u8], extra: &[u8]) -> Self {
-        let len = old.len() + extra.len();
-        // SAFETY: the two are `len` bytes together, and both are copied.
+    /// The bytes of `old`, `gap` zero bytes and then `extra`, in a new
+    /// block, with the room an append leaves ([`room_for_append`]) if the
+    /// block is the system allocator's.
+    pub fn appended(old: &[u8], gap: usize, extra: &[u8]) -> Self {
+        // Past `MAX_LEN` (`layout` refuses it) rather than wrapped.
+        let len = old.len().saturating_add(gap).saturating_add(extra.len());
+        // SAFETY: `old`, the gap and `extra` are `len` bytes together, and
+        // `write_at` zeroes the gap and copies `extra`.
         unsafe {
             Self::make_with_room(len, room_for_append(len), |at| {
                 std::ptr::copy_nonoverlapping(old.as_ptr(), at, old.len());
-                std::ptr::copy_nonoverlapping(extra.as_ptr(), at.add(old.len()), extra.len());
+                write_at(at, old.len(), old.len() + gap, extra);
             })
         }
     }
 
-    /// `extra` added to the end of the bytes. In this block when it has
-    /// room ([`has_room`](Self::has_room)); else a block of the system
-    /// allocator's is grown with `realloc` to the room an append leaves
-    /// ([`room_for_append`]), which the allocator may do where the block
-    /// is or by moving it, and a slab's block is replaced by a new one
-    /// ([`appended`](Self::appended)), the old one freed. Returns whether
-    /// the bytes stayed where they were.
+    /// `gap` zero bytes and then `extra` added to the end of the bytes. In
+    /// this block when it has room ([`has_room`](Self::has_room)); else a
+    /// block of the system allocator's is grown with `realloc` to the room
+    /// an append leaves ([`room_for_append`]), which the allocator may do
+    /// where the block is or by moving it, and a slab's block is replaced
+    /// by a new one ([`appended`](Self::appended)), the old one freed.
+    /// Returns whether the bytes stayed where they were.
     ///
     /// # Safety
     /// This is the bytes' only holder ([`is_unique`](Self::is_unique)),
@@ -405,15 +407,15 @@ impl SharedBytes {
     /// caller holds what it is kept in for writing), and nothing keeps
     /// their address across it: the block may move. `extra` is not in the
     /// block, and the length after it is at most [`MAX_LEN`].
-    pub(crate) unsafe fn append(&mut self, extra: &[u8]) -> bool {
+    pub(crate) unsafe fn append(&mut self, gap: usize, extra: &[u8]) -> bool {
         debug_assert!(self.is_unique());
         let len = self.len();
-        let new = len + extra.len();
+        let new = len.saturating_add(gap).saturating_add(extra.len());
         assert!(new <= MAX_LEN, "a value of {new} bytes");
         let mut stays = true;
         if !self.has_room(new) {
             if !is_big(len) {
-                *self = Self::appended(self.as_slice(), extra);
+                *self = Self::appended(self.as_slice(), gap, extra);
                 return false;
             }
             let size = self.big_size();
@@ -439,11 +441,7 @@ impl SharedBytes {
         // SAFETY: the block has room for `new` bytes, and as the caller
         // says, nothing reads the bytes or the length while they change.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                extra.as_ptr(),
-                (block as *mut u8).add(HEADER + len),
-                extra.len(),
-            );
+            write_at((block as *mut u8).add(HEADER), len, len + gap, extra);
             std::ptr::addr_of_mut!((*block).len).write(new as u32);
         }
         stays
@@ -678,8 +676,9 @@ mod tests {
         Some(after? - before?)
     }
 
-    /// Appends onto bytes of every size: in their block while it has room,
-    /// else a slab's block replaced and a large one grown by a quarter.
+    /// Appends onto bytes of every size, some after a gap of zeros: in
+    /// their block while it has room, else a slab's block replaced and a
+    /// large one grown by a quarter.
     /// The allocator counts each block at its whole size, room included,
     /// and a block is freed with the size it was allocated with.
     ///
@@ -699,16 +698,23 @@ mod tests {
         {
             let mut model: Vec<u8> = (0..start).map(|i| (i % 251) as u8).collect();
             model.reserve(4 << 20);
-            let extras: Vec<Vec<u8>> = (0..400)
-                .map(|i| vec![(i % 7) as u8 + 1; [3, 1000, 9000][i % 3]])
+            // Some after a gap of zeros, over room the allocator may have
+            // left with other bytes in it.
+            let extras: Vec<(usize, Vec<u8>)> = (0..400)
+                .map(|i| {
+                    (
+                        [0, 0, 1500, 0, 7][i % 5],
+                        vec![(i % 7) as u8 + 1; [3, 1000, 9000][i % 3]],
+                    )
+                })
                 .collect();
             let regions_before = crate::value_slab::regions();
             let made = counted(|| {
                 let mut bytes = SharedBytes::from(&model[..]);
                 assert_eq!(bytes.spare(), 0);
                 let mut grown = 0;
-                for extra in &extras {
-                    let len = bytes.len() + extra.len();
+                for (gap, extra) in &extras {
+                    let len = bytes.len() + gap + extra.len();
                     // The largest slab class is a `value_slab` test's alone.
                     if crate::value_slab::class_of(HEADER + len) == largest {
                         continue;
@@ -718,7 +724,8 @@ mod tests {
                     let at = bytes.as_ptr();
                     let mut stayed = false;
                     // SAFETY: the only holder, kept by this test alone.
-                    let delta = counted(|| stayed = unsafe { bytes.append(extra) });
+                    let delta = counted(|| stayed = unsafe { bytes.append(*gap, extra) });
+                    model.resize(model.len() + gap, 0);
                     model.extend_from_slice(extra);
                     assert!(bytes[..] == model[..], "{start}: {len}");
                     if room {
@@ -730,7 +737,11 @@ mod tests {
                         grown += 1;
                     }
                     if is_big(len) {
-                        let want = if room { spare - extra.len() } else { len / 4 };
+                        let want = if room {
+                            spare - gap - extra.len()
+                        } else {
+                            len / 4
+                        };
                         assert_eq!(bytes.spare(), want, "{start}: {len}");
                         assert_eq!(bytes.heap_size(), SIZE_WORD + HEADER + len + want);
                     } else {

@@ -5,7 +5,6 @@ use crate::store;
 use crate::store::ValueRef;
 use crate::types::SharedBytes;
 use crate::{read_lock, write_lock};
-use std::collections::BTreeMap;
 
 // ── Bitmap helpers ────────────────────────────────────────────────────────────
 //
@@ -584,6 +583,7 @@ fn cmd_bitop(ctx: &mut Ctx) -> Vec<u8> {
 // Full BITFIELD is complex. We implement GET, SET, INCRBY with u/i encodings.
 // This teaches you: parsing subcommands in a loop, signed/unsigned bit fields.
 fn cmd_bitfield(ctx: &mut Ctx, readonly: bool) -> Vec<u8> {
+    const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
     // BITFIELD returns one result slot per subcommand; a failed GET or an
     // OVERFLOW FAIL yields a nil *inside* that array, which the dispatcher's
     // top-level null normalisation cannot reach.
@@ -593,92 +593,171 @@ fn cmd_bitfield(ctx: &mut Ctx, readonly: bool) -> Vec<u8> {
         return resp_error("ERR wrong number of arguments for 'bitfield' command");
     }
     let key: &[u8] = cmd[1];
-
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
-
-    // A hold on the key's entry, read with the shard let go.
-    let map = read_lock!(shard);
-    let found = map.get(key);
+    // Parsed before the key is locked; another type is still refused before
+    // a malformed operation is.
+    let ops = parse_bitfield(cmd, readonly);
     // Only GETs (or `BITFIELD_RO`): a read, counted as Redis counts one.
     let writes = cmd[2..]
         .iter()
         .any(|a| a.eq_ignore_ascii_case(b"SET") || a.eq_ignore_ascii_case(b"INCRBY"));
     if readonly || !writes {
+        let map = read_lock!(shard);
+        let found = map.get(key);
         crate::stats::record_lookup(found.is_some());
+        let bytes = match found {
+            Some(ValueRef::String(bytes)) => bytes.as_bytes(),
+            None => &[],
+            Some(_) => return resp_error(WRONGTYPE),
+        };
+        let ops = match ops {
+            Ok(ops) => ops,
+            Err(reply) => return reply,
+        };
+        let replies = ops
+            .iter()
+            .map(|op| resp_integer(op.get(&field_bytes(bytes, op.first(), op.end()))))
+            .collect();
+        drop(map);
+        ctx.skip_write_side_effects = true;
+        return resp_array(replies);
     }
-    let held: Option<store::EntryRef> = match found {
-        Some(ValueRef::String(_)) => map.get_ref(key),
-        None => None,
-        _ => {
-            return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
-        }
+
+    // The operations run in order on the live bytes, with the shard locked
+    // from the type check to the last write: nothing sees them half done.
+    let mut map = write_lock!(shard);
+    let start = match map.get(key) {
+        Some(ValueRef::String(bytes)) => bytes.len(),
+        None => 0,
+        Some(_) => return resp_error(WRONGTYPE),
     };
-    drop(map);
-    let ops = match parse_bitfield(cmd, readonly) {
+    let ops = match ops {
         Ok(ops) => ops,
         Err(reply) => return reply,
     };
-    let stored: &[u8] = match held.as_ref().map(store::EntryRef::value) {
-        Some(ValueRef::String(bytes)) => bytes.as_bytes(),
-        _ => &[],
-    };
-    let simulated = simulate_bitfield(stored, &ops, resp);
-    if ops.iter().all(|op| op.write.is_none()) {
-        ctx.skip_write_side_effects = true;
-        return resp_array(simulated.replies);
+    // An entry a write replaced, freed once the shard is unlocked (see
+    // `keep`).
+    let mut replaced: Option<store::Taken> = None;
+    // Grown once, before the operations, to the end of the furthest write
+    // applied whatever the field holds. A write OVERFLOW FAIL may refuse
+    // grows the string only once it is applied.
+    let mut len = start;
+    let always = ops
+        .iter()
+        .filter(|op| op.always_applies())
+        .map(FieldOp::end)
+        .max()
+        .unwrap_or(0);
+    if always > len {
+        grow_zeroed(&mut map, key, always - len, &mut replaced);
+        len = always;
     }
-    #[cfg(test)]
-    bitfield_seams::after_simulating();
+    // Redis 8's rule: the command writes if an applied SET or INCRBY grows
+    // the string or changes its field, even when a later one puts the bits
+    // back. One that finds the bits as asked within the string does not,
+    // nor does one OVERFLOW FAIL refuses. A write adds one to the dirty
+    // count, as any write command does.
+    let mut wrote = len > start;
+    let mut replies = Vec::with_capacity(ops.len());
+    for op in &ops {
+        let (first, end) = (op.first(), op.end());
+        let mut field = [0; 9];
+        if first < len
+            && let Some(ValueRef::String(bytes)) = map.peek(key)
+        {
+            field = field_bytes(bytes.as_bytes(), first, end);
+        }
+        let field = &mut field[..end - first];
+        let old = op.get(field);
+        let Some(write) = &op.write else {
+            replies.push(resp_integer(old));
+            continue;
+        };
+        let target = if write.incrby {
+            i128::from(old).saturating_add(write.value)
+        } else {
+            write.value
+        };
+        let Some(new) = bitfield_clamp(op.encoding, target, write.overflow.name()) else {
+            // Overflow FAIL yields a nil in this slot of the results array —
+            // nested, so it needs the protocol's own null encoding.
+            replies.push(resp_null_for(resp));
+            continue;
+        };
+        if end > len {
+            grow_zeroed(&mut map, key, end - len, &mut replaced);
+            len = end;
+            wrote = true;
+        }
+        let mask = u64::MAX >> (64 - op.bits);
+        if (new as i64 as u64 ^ old as u64) & mask != 0 {
+            bitfield_set(field, op.encoding, op.offset % 8, new as i64);
+            let Some(written) = map.edit_str_in_place(key, first, field) else {
+                unreachable!("a string under this lock, and no field ends past MAX_LEN");
+            };
+            keep(&mut replaced, written);
+            wrote = true;
+        }
+        replies.push(resp_integer(if write.incrby { new as i64 } else { old }));
+    }
+    drop(map);
+    drop(replaced);
+    if !wrote {
+        ctx.skip_write_side_effects = true;
+    }
+    resp_array(replies)
+}
 
-    // The simulation stands only if the key still has the entry it read.
-    let mut map = write_lock!(shard);
-    let same = match &held {
-        Some(held) => map.holds(key, held),
-        None => map.get(key).is_none(),
+/// `n` zero bytes added to `key`'s string, which is not another type, as
+/// an `APPEND` adds bytes: in place when nothing else holds it and its
+/// block has room, else into a block with room for more, copied once.
+fn grow_zeroed(
+    map: &mut store::ShardMap,
+    key: &[u8],
+    n: usize,
+    replaced: &mut Option<store::Taken>,
+) {
+    let Ok((_, written)) = map.append_zeros(key, n, crate::shared_bytes::MAX_LEN) else {
+        unreachable!("a string under this lock, and no field ends past MAX_LEN");
     };
-    // Released before the edit, which writes in place only while the table
-    // alone holds the entry; a replaced entry is dropped once unlocked.
-    let replaced = if same {
-        drop(held);
-        None
-    } else {
-        held
+    keep(replaced, written);
+}
+
+/// Keeps the entry `written` replaced, to be freed once the shard is
+/// unlocked, or frees one of two here: an inline one, which is small. The
+/// first replaced is the key's own, which a save or a sync may hold; after
+/// it the key's entry is one this command made, held by nothing else, and
+/// only an inline one of those is replaced (grown past its block).
+fn keep(replaced: &mut Option<store::Taken>, written: store::Written) {
+    let Some(old) = written.replaced() else {
+        return;
     };
-    let simulated = if same {
-        simulated
-    } else {
-        match map.get(key) {
-            Some(ValueRef::String(now)) => simulate_bitfield(now.as_bytes(), &ops, resp),
-            None => simulate_bitfield(&[], &ops, resp),
-            Some(_) => {
-                drop(map);
-                drop(replaced);
-                return resp_error(
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                );
-            }
+    let freed = match replaced.take() {
+        Some(kept) if kept.is_inline() => {
+            *replaced = Some(old);
+            kept
+        }
+        Some(kept) => {
+            *replaced = Some(kept);
+            old
+        }
+        None => {
+            *replaced = Some(old);
+            return;
         }
     };
-    let written = match simulated.patch {
-        Some((offset, patch)) => match map.edit_str_in_place(key, offset, &patch) {
-            Some(written) => Some(written),
-            // Checked above: the key is a string, and no field ends past
-            // `MAX_LEN`. `None` wrote nothing.
-            None => {
-                drop(map);
-                drop(replaced);
-                return resp_error("ERR string exceeds maximum allowed size");
-            }
-        },
-        None => None,
-    };
-    drop(map);
-    drop((written, replaced));
-    if !simulated.wrote {
-        ctx.skip_write_side_effects = true;
+    drop(freed);
+}
+
+/// Bytes `first..end` of `bytes`, zeros past its end: a field of up to 64
+/// bits, from any bit, is in nine.
+fn field_bytes(bytes: &[u8], first: usize, end: usize) -> [u8; 9] {
+    let mut field = [0; 9];
+    if let Some(have) = bytes.get(first..end.min(bytes.len())) {
+        field[..have.len()].copy_from_slice(have);
     }
-    resp_array(simulated.replies)
+    field
 }
 
 /// One BITFIELD operation: a GET when `write` is `None`.
@@ -700,14 +779,22 @@ impl FieldOp<'_> {
         self.offset.saturating_add(self.bits as usize).div_ceil(8)
     }
 
-    /// A write that can succeed: not a SET whose value OVERFLOW FAIL
-    /// refuses whatever the field holds.
-    fn may_write(&self) -> bool {
-        self.write.as_ref().is_some_and(|write| {
-            write.incrby
-                || !matches!(write.overflow, Overflow::Fail)
-                || bitfield_clamp(self.encoding, write.value, "FAIL").is_some()
-        })
+    /// The field's value, in its bytes from `first()`.
+    fn get(&self, field: &[u8]) -> i64 {
+        bitfield_get(field, self.encoding, self.offset % 8).unwrap_or(0)
+    }
+
+    /// A write applied whatever the field holds: all but an OVERFLOW FAIL
+    /// SET of a value out of range, and an OVERFLOW FAIL INCRBY of other
+    /// than 0.
+    fn always_applies(&self) -> bool {
+        self.write
+            .as_ref()
+            .is_some_and(|write| match write.overflow {
+                Overflow::Fail if write.incrby => write.value == 0,
+                Overflow::Fail => bitfield_clamp(self.encoding, write.value, "FAIL").is_some(),
+                Overflow::Wrap | Overflow::Sat => true,
+            })
     }
 }
 
@@ -816,222 +903,6 @@ fn parse_bitfield<'a>(cmd: &[&'a [u8]], readonly: bool) -> Result<Vec<FieldOp<'a
     Ok(ops)
 }
 
-/// What BITFIELD's operations did, run in order on a value.
-struct Simulated {
-    replies: Vec<Vec<u8>>,
-    /// An operation changed bits, or grew the string.
-    wrote: bool,
-    /// Where and what to write to make the stored bytes the operations';
-    /// `None` when they end as they were.
-    patch: Option<(usize, Vec<u8>)>,
-}
-
-/// The operations run on `stored`, written over a [`Scratch`] made only
-/// when one changes bits or grows the string.
-fn simulate_bitfield(stored: &[u8], ops: &[FieldOp], resp: u8) -> Simulated {
-    let mut replies = Vec::with_capacity(ops.len());
-    let mut scratch = Scratch::Clean;
-    let mut len = stored.len();
-    // Bytes of the writes that changed bits or grew the string.
-    let (mut from, mut to) = (usize::MAX, 0usize);
-    // The field's bytes; reused.
-    let mut field = Vec::with_capacity(9);
-    for (at, op) in ops.iter().enumerate() {
-        field.clear();
-        let (first, end) = (op.first(), op.end());
-        field.extend((first..end).map(|i| scratch.byte(stored, i)));
-        let shift = op.offset % 8;
-        let old = bitfield_get(&field, op.encoding, shift);
-        let Some(write) = &op.write else {
-            replies.push(match old {
-                Some(v) => resp_integer(v),
-                None => resp_null_for(resp),
-            });
-            continue;
-        };
-        let new_val: i128 = if write.incrby {
-            old.unwrap_or(0) as i128 + write.value // no pre-wrap; clamp decides
-        } else {
-            write.value
-        };
-        let Some(v) = bitfield_clamp(op.encoding, new_val, write.overflow.name()) else {
-            // Overflow FAIL yields a nil in this slot of the results array —
-            // nested, so it needs the protocol's own null encoding.
-            replies.push(resp_null_for(resp));
-            continue;
-        };
-        let mask = u64::MAX >> (64 - op.bits);
-        let changes = (v as i64 as u64 ^ old.unwrap_or(0) as u64) & mask != 0;
-        if changes || end > len {
-            if let Scratch::Clean = scratch {
-                scratch = Scratch::for_writes(stored, &ops[at..]);
-            }
-            if changes {
-                bitfield_set(&mut field, op.encoding, shift, v as i64);
-                for (i, &b) in (first..end).zip(&field) {
-                    scratch.set(i, b);
-                }
-            }
-            len = len.max(end);
-            from = from.min(first);
-            to = to.max(end);
-        }
-        replies.push(resp_integer(if write.incrby {
-            v as i64
-        } else {
-            old.unwrap_or(0)
-        }));
-    }
-    let wrote = !matches!(scratch, Scratch::Clean);
-    let patch = scratch.into_patch(stored, from, to);
-    Simulated {
-        replies,
-        wrote,
-        patch,
-    }
-}
-
-/// Bytes the operations wrote, over the stored ones.
-enum Scratch {
-    /// Nothing written.
-    Clean,
-    /// A copy of `from..from + bytes.len()`, zeros past the stored end,
-    /// spanning every write that can succeed from the one that made it.
-    Dense { from: usize, bytes: Vec<u8> },
-    /// Each written byte, by index: for writes too far apart.
-    Tree(BTreeMap<usize, u8>),
-}
-
-impl Scratch {
-    /// For the writes in `ops`, the first of which is the one to make it.
-    fn for_writes(stored: &[u8], ops: &[FieldOp]) -> Scratch {
-        let (mut from, mut to, mut writes) = (usize::MAX, 0usize, 0usize);
-        for op in ops.iter().filter(|op| op.may_write()) {
-            from = from.min(op.first());
-            to = to.max(op.end());
-            writes += 1;
-        }
-        let span = to.saturating_sub(from);
-        if span > dense_limit(writes) {
-            #[cfg(test)]
-            bitfield_seams::made(1);
-            return Scratch::Tree(BTreeMap::new());
-        }
-        #[cfg(test)]
-        bitfield_seams::made(0);
-        Scratch::Dense {
-            from,
-            bytes: copied(stored, from, to),
-        }
-    }
-
-    /// Byte `i` as the operations so far left it.
-    fn byte(&self, stored: &[u8], i: usize) -> u8 {
-        let written = match self {
-            Scratch::Clean => None,
-            Scratch::Dense { from, bytes } => i.checked_sub(*from).and_then(|at| bytes.get(at)),
-            Scratch::Tree(map) => map.get(&i),
-        };
-        written.or_else(|| stored.get(i)).copied().unwrap_or(0)
-    }
-
-    /// A dense scratch spans `i`: every write that can succeed after it was
-    /// made.
-    fn set(&mut self, i: usize, byte: u8) {
-        match self {
-            Scratch::Clean => unreachable!("made by the first write"),
-            Scratch::Dense { from, bytes } => bytes[i - *from] = byte,
-            Scratch::Tree(map) => {
-                map.insert(i, byte);
-            }
-        }
-    }
-
-    /// Bytes `from..to` as written, unless they and the length are as
-    /// stored. `from..to` spans every write that changed bits or grew the
-    /// string, and the length is `to` if it grew.
-    fn into_patch(self, stored: &[u8], from: usize, to: usize) -> Option<(usize, Vec<u8>)> {
-        let grew = to > stored.len();
-        match self {
-            Scratch::Clean => None,
-            Scratch::Dense {
-                from: at,
-                mut bytes,
-            } => {
-                if !grew && bytes[from - at..to - at] == stored[from..to] {
-                    return None;
-                }
-                bytes.truncate(to - at);
-                bytes.drain(..from - at);
-                Some((from, bytes))
-            }
-            Scratch::Tree(map) => {
-                if !grew && map.iter().all(|(&i, &b)| b == stored[i]) {
-                    return None;
-                }
-                let mut patch = copied(stored, from, to);
-                for (&i, &b) in &map {
-                    patch[i - from] = b;
-                }
-                Some((from, patch))
-            }
-        }
-    }
-}
-
-/// Bytes `from..to` of `stored`, zeros past its end: one pass, not zeroed
-/// first.
-fn copied(stored: &[u8], from: usize, to: usize) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(to - from);
-    bytes.extend_from_slice(stored.get(from..stored.len().min(to)).unwrap_or(&[]));
-    bytes.resize(to - from, 0);
-    bytes
-}
-
-/// The largest dense scratch for `writes` operations, in bytes; past it,
-/// a tree. Benchmark-derived.
-fn dense_limit(writes: usize) -> usize {
-    const BASE: usize = 64 << 10;
-    const PER_WRITE: usize = 8 << 10;
-    const MAX: usize = 32 << 20;
-    #[cfg(test)]
-    if let Some(limit) = bitfield_seams::DENSE_LIMIT.get() {
-        return limit;
-    }
-    PER_WRITE
-        .saturating_mul(writes)
-        .saturating_add(BASE)
-        .min(MAX)
-}
-
-/// What a test sets and sees of BITFIELD, on its own thread.
-#[cfg(test)]
-pub(crate) mod bitfield_seams {
-    use std::cell::{Cell, RefCell};
-
-    thread_local! {
-        /// Run once, between the simulation and the write lock.
-        pub(crate) static AFTER_SIMULATING: RefCell<Option<Box<dyn FnOnce()>>> =
-            const { RefCell::new(None) };
-        /// In place of [`super::dense_limit`]'s.
-        pub(crate) static DENSE_LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
-        /// Scratches made: dense, tree.
-        pub(crate) static MADE: Cell<[usize; 2]> = const { Cell::new([0; 2]) };
-    }
-
-    pub(super) fn after_simulating() {
-        if let Some(step) = AFTER_SIMULATING.take() {
-            step();
-        }
-    }
-
-    pub(super) fn made(kind: usize) {
-        let mut made = MADE.get();
-        made[kind] += 1;
-        MADE.set(made);
-    }
-}
-
 // ── Bitfield encoding helpers ─────────────────────────────────────────────────
 // encoding: "u8", "i16", "u32", etc. — u = unsigned, i = signed
 
@@ -1090,16 +961,13 @@ fn bitfield_get(bytes: &[u8], encoding: &str, bit_offset: usize) -> Option<i64> 
     }
 }
 
-fn bitfield_set(bytes: &mut Vec<u8>, encoding: &str, bit_offset: usize, value: i64) {
+fn bitfield_set(bytes: &mut [u8], encoding: &str, bit_offset: usize, value: i64) {
     let (_, bits) = match parse_encoding(encoding) {
         Some(e) => e,
         None => return,
     };
     let val = value as u64;
-    let needed_bytes = (bit_offset + bits as usize).div_ceil(8);
-    if bytes.len() < needed_bytes {
-        bytes.resize(needed_bytes, 0);
-    }
+    debug_assert!(bytes.len() >= (bit_offset + bits as usize).div_ceil(8));
     for i in 0..bits as usize {
         let global_bit = bit_offset + i;
         let byte_i = global_bit / 8;
@@ -1135,6 +1003,8 @@ fn bitfield_clamp(encoding: &str, value: i128, overflow: &str) -> Option<i128> {
             let mut v = value % range;
             if v < min {
                 v += range;
+            } else if v > max {
+                v -= range;
             }
             Some(v)
         }
@@ -1652,8 +1522,7 @@ pub(crate) mod tests {
     }
 
     /// `BITFIELD` that only reads, `BITFIELD_RO`, and `OVERFLOW FAIL`
-    /// writes that all fail copy no bytes: the entry is held, and read with
-    /// the shard let go.
+    /// writes that all fail copy no bytes and leave the value where it is.
     #[test]
     fn a_bitfield_that_writes_nothing_copies_nothing() {
         counting(
@@ -1696,18 +1565,18 @@ pub(crate) mod tests {
         );
     }
 
-    /// Writes at both ends of the value are made in one patch of all of it,
-    /// which later subcommands read, written over the value where it is:
-    /// no second copy.
+    /// Writes at both ends of the value, which later operations read, are
+    /// made where it is: nothing copied.
     #[test]
-    fn a_bitfield_write_copies_the_value_once() {
+    fn bitfield_writes_at_both_ends_go_in_place() {
         counting(
-            "commands::bitmap::tests::a_bitfield_write_copies_the_value_once",
+            "commands::bitmap::tests::bitfield_writes_at_both_ends_go_in_place",
             || {
                 for len in SIZES {
                     let store = store::new_store(1);
                     let mut value = vec![0xAAu8; len];
                     put(&store, b"k", &value);
+                    let (_, at) = stored(&store, b"k").unwrap();
                     let last = (len - 1) * 8;
                     let (reply, skipped, peak) = counted(
                         &store,
@@ -1726,11 +1595,11 @@ pub(crate) mod tests {
                         Some(1),
                     ];
                     assert_eq!((reply, skipped), (ints(&want), false), "{len}");
-                    assert!(peak >= len as isize, "{len}: {peak} bytes");
-                    assert!(peak < (len * 3 / 2) as isize + SMALL, "{len}: {peak} bytes");
+                    // The operations and their replies only.
+                    assert!(peak < 7 * 160, "{len}: {peak} bytes");
                     value[0] = 1;
                     value[len - 1] = 172;
-                    assert_eq!(stored(&store, b"k").unwrap().0, value, "{len}");
+                    assert_eq!(stored(&store, b"k"), Some((value, at)), "{len}");
                 }
             },
         );
@@ -1833,12 +1702,13 @@ pub(crate) mod tests {
         );
     }
 
-    /// A write past the end that the block cannot take copies the value
-    /// once, into the new one.
+    /// A write past the end grows the value as an `APPEND` does: in its
+    /// block if it has room, else in one with room for more, the value
+    /// copied at most once.
     #[test]
-    fn a_bitfield_that_grows_the_value_copies_it_once() {
+    fn a_bitfield_that_grows_the_value_copies_it_at_most_once() {
         counting(
-            "commands::bitmap::tests::a_bitfield_that_grows_the_value_copies_it_once",
+            "commands::bitmap::tests::a_bitfield_that_grows_the_value_copies_it_at_most_once",
             || {
                 for len in SIZES {
                     let store = store::new_store(1);
@@ -1879,12 +1749,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// Writes that fail, or change no bits, make no scratch however many
-    /// they are, and copy nothing.
+    /// Writes that fail, or change no bits, copy nothing however many they
+    /// are.
     #[test]
-    fn bitfield_writes_that_change_nothing_make_no_scratch() {
+    fn bitfield_writes_that_change_nothing_copy_nothing() {
         counting(
-            "commands::bitmap::tests::bitfield_writes_that_change_nothing_make_no_scratch",
+            "commands::bitmap::tests::bitfield_writes_that_change_nothing_copy_nothing",
             || {
                 let len = 8 << 20;
                 let store = store::new_store(1);
@@ -1896,11 +1766,9 @@ pub(crate) mod tests {
                         .collect();
                     let same: String = (0..n).map(|k| format!(" SET u8 {} 170", at(k))).collect();
                     for (what, ops) in [("fail", format!("OVERFLOW FAIL{fail}")), ("same", same)] {
-                        bitfield_seams::MADE.set([0; 2]);
                         let line = format!("BITFIELD k {}", ops.trim_start());
                         let (_, skipped, peak) = counted(&store, &line);
                         assert!(skipped, "{what} {n}");
-                        assert_eq!(bitfield_seams::MADE.get(), [0; 2], "{what} {n}");
                         // The operations and their replies only.
                         assert!(peak < n as isize * 160, "{what} {n}: {peak} bytes");
                     }
@@ -1910,54 +1778,14 @@ pub(crate) mod tests {
         );
     }
 
-    /// One write, then INCRBYs spread past the dense limit that fail on the
-    /// bytes they find: the write is kept in a tree, and nothing the size of
-    /// the spread is made. Within the limit, a dense scratch no larger than
-    /// it.
+    /// SETs that OVERFLOW FAIL refuses whatever the field holds grow
+    /// nothing and allocate nothing, however many and however far. One that
+    /// can succeed, under FAIL in range or under WRAP or SAT, grows the
+    /// string to its field.
     #[test]
-    fn bitfield_writes_far_apart_are_kept_in_a_tree() {
+    fn bitfield_sets_that_must_fail_grow_nothing() {
         counting(
-            "commands::bitmap::tests::bitfield_writes_far_apart_are_kept_in_a_tree",
-            || {
-                let store = store::new_store(1);
-                for (n, reach, made) in [
-                    (2usize, (1usize << 32) - 8, [0, 1]),
-                    (10_000, (1 << 32) - 8, [0, 1]),
-                    (1_000, 4 << 23, [1, 0]),
-                ] {
-                    put(&store, b"k", &[0u8; 100]);
-                    // Each would succeed on a byte above zero.
-                    let fail: String = (1..n)
-                        .map(|k| format!(" INCRBY i8 {} -129", reach / 8 * k / (n - 1) * 8))
-                        .collect();
-                    bitfield_seams::MADE.set([0; 2]);
-                    let line = format!("BITFIELD k SET u8 0 1 OVERFLOW FAIL{fail}");
-                    let (reply, skipped, peak) = counted(&store, &line);
-                    let mut want = vec![None; n];
-                    want[0] = Some(0);
-                    assert_eq!((reply, skipped), (ints(&want), false), "{n}");
-                    assert_eq!(bitfield_seams::MADE.get(), made, "{n}");
-                    let most = if made[0] == 1 { dense_limit(n) } else { 0 };
-                    assert!(
-                        peak < (most + n * 160) as isize + SMALL,
-                        "{n}: {peak} bytes"
-                    );
-                    let mut now = vec![0u8; 100];
-                    now[0] = 1;
-                    assert_eq!(stored(&store, b"k").unwrap().0, now, "{n}");
-                }
-            },
-        );
-    }
-
-    /// SETs that OVERFLOW FAIL refuses whatever the field holds are left
-    /// out of the scratch: one write, then any number of them however far
-    /// apart, makes a scratch of the write's bytes only. Those under WRAP or
-    /// SAT, or in range, are still counted.
-    #[test]
-    fn bitfield_sets_that_must_fail_leave_the_scratch_small() {
-        counting(
-            "commands::bitmap::tests::bitfield_sets_that_must_fail_leave_the_scratch_small",
+            "commands::bitmap::tests::bitfield_sets_that_must_fail_grow_nothing",
             || {
                 let store = store::new_store(1);
                 let refused = [
@@ -1979,21 +1807,19 @@ pub(crate) mod tests {
                             format!(" SET {encoding} {at} {value}")
                         })
                         .collect();
-                    bitfield_seams::MADE.set([0; 2]);
                     let line = format!("BITFIELD k SET u8 8 1 OVERFLOW FAIL{fail}");
                     let (reply, skipped, peak) = counted(&store, &line);
                     let mut want = vec![None; n];
                     want[0] = Some(0);
                     assert_eq!((reply, skipped), (ints(&want), false), "{n}");
-                    assert_eq!(bitfield_seams::MADE.get(), [1, 0], "{n}");
                     // The operations and their replies only.
                     assert!(peak < (n * 160) as isize + SMALL, "{n}: {peak} bytes");
                     let mut now = vec![0u8; 100];
                     now[1] = 1;
                     assert_eq!(stored(&store, b"k").unwrap().0, now, "{n}");
                 }
-                // A far SET that can succeed is counted, past the limit: under
-                // FAIL in range, or out of range under WRAP or SAT.
+                // A far SET that can succeed: under FAIL in range, or out of
+                // range under WRAP or SAT.
                 let far = 4 << 23;
                 for tail in [
                     format!("OVERFLOW FAIL SET u8 {far} 255"),
@@ -2001,7 +1827,6 @@ pub(crate) mod tests {
                     format!("OVERFLOW SAT SET u8 {far} 256"),
                 ] {
                     put(&store, b"k", &[0u8; 100]);
-                    bitfield_seams::MADE.set([0; 2]);
                     let line = format!("BITFIELD k SET u8 8 1 {tail}");
                     let (reply, skipped, peak) = counted(&store, &line);
                     assert_eq!(
@@ -2009,7 +1834,6 @@ pub(crate) mod tests {
                         (ints(&[Some(0), Some(0)]), false),
                         "{tail}"
                     );
-                    assert_eq!(bitfield_seams::MADE.get(), [0, 1], "{tail}");
                     assert!(peak >= far as isize / 8, "{tail}: {peak} bytes");
                     let now = stored(&store, b"k").unwrap().0;
                     assert_eq!((now.len(), now[1]), (far / 8 + 1, 1), "{tail}");
@@ -2018,219 +1842,7 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn the_dense_limit_is_bounded() {
-        assert_eq!(dense_limit(1), 72 << 10);
-        assert_eq!(dense_limit(1_000), (64 << 10) + (8_000 << 10));
-        assert_eq!(dense_limit(10_000), 32 << 20);
-        assert_eq!(dense_limit(usize::MAX), 32 << 20);
-    }
-
-    /// `line`, with `between` run once its operations are simulated and
-    /// before the write lock is taken: as a writer the key's order does not
-    /// hold back can.
-    fn racing(
-        store: &store::Store,
-        line: &str,
-        between: impl FnOnce() + 'static,
-    ) -> (Vec<u8>, bool) {
-        bitfield_seams::AFTER_SIMULATING.set(Some(Box::new(between)));
-        let (reply, skipped, _) = run(store, line);
-        assert!(
-            bitfield_seams::AFTER_SIMULATING.take().is_none(),
-            "{line}: not raced"
-        );
-        (reply, skipped)
-    }
-
-    /// For [`racing`]: `k` made to hold `bytes`, with `expires`.
-    fn replace_with(
-        store: &store::Store,
-        bytes: &'static [u8],
-        expires: Option<u64>,
-    ) -> impl FnOnce() + 'static {
-        let store = store.clone();
-        move || {
-            let shard = store::get_shard(&store[0], b"k");
-            drop(shard.write().insert_str_expiring(b"k", bytes, expires));
-        }
-    }
-
-    /// For [`racing`]: `k` made a set.
-    fn replace_with_a_set(store: &store::Store) -> impl FnOnce() + 'static {
-        let store = store.clone();
-        move || {
-            let set = crate::member_set::MemberSet::new();
-            let set = crate::types::KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(set)));
-            drop(store::get_shard(&store[0], b"k").write().insert(b"k", set));
-        }
-    }
-
-    /// The key's entry replaced while the operations were simulated: they
-    /// run again, once, on what it holds, under the write lock.
-    #[test]
-    fn a_bitfield_whose_key_is_replaced_runs_on_the_new_value() {
-        let store = store::new_store(1);
-        let shard = store::get_shard(&store[0], b"k");
-        let later = crate::commands::helpers::now_ms() + 3_600_000;
-        type Case = (
-            &'static [u8],
-            &'static str,
-            &'static [u8],
-            Option<u64>,
-            &'static [Option<i64>],
-            bool,
-            &'static [u8],
-        );
-        let cases: [Case; 6] = [
-            // Other bytes, the same length.
-            (
-                b"\x01\x02",
-                "INCRBY u8 0 1 GET u8 8",
-                b"\x10\x20",
-                None,
-                &[Some(17), Some(32)],
-                false,
-                b"\x11\x20",
-            ),
-            // The same bytes in a new entry, as DEBUG POPULATE can make one.
-            (
-                b"\x01\x02",
-                "SET u8 0 9",
-                b"\x01\x02",
-                Some(later),
-                &[Some(1)],
-                false,
-                b"\x09\x02",
-            ),
-            // Simulated as changing nothing; a write on the new value.
-            (
-                b"\x05",
-                "SET u8 0 5",
-                b"\x07",
-                None,
-                &[Some(7)],
-                false,
-                b"\x05",
-            ),
-            // Simulated as failing; a write on the new value.
-            (
-                b"\x05",
-                "OVERFLOW FAIL INCRBY u8 0 251",
-                b"\x04",
-                None,
-                &[Some(255)],
-                false,
-                b"\xff",
-            ),
-            // Simulated as a write; changes nothing on the new value.
-            (
-                b"\x01",
-                "SET u8 0 2",
-                b"\x02",
-                None,
-                &[Some(2)],
-                true,
-                b"\x02",
-            ),
-            // Simulated as putting bytes back; a change on the new value.
-            (
-                b"\x01\x02\x03",
-                "SET u8 0 7 SET u8 0 1",
-                b"\x09\x09",
-                None,
-                &[Some(9), Some(7)],
-                false,
-                b"\x01\x09",
-            ),
-        ];
-        for (initial, ops, replacement, expires, replies, skipped, after) in cases {
-            put(&store, b"k", initial);
-            let line = format!("BITFIELD k {ops}");
-            assert_eq!(
-                racing(&store, &line, replace_with(&store, replacement, expires)),
-                (ints(replies), skipped),
-                "{ops}"
-            );
-            assert_eq!(stored(&store, b"k").unwrap().0, after, "{ops}");
-            assert_eq!(shard.read().expires(b"k"), expires, "{ops}");
-        }
-        // Taken away: run on no key, which the write makes.
-        put(&store, b"k", b"\x05");
-        let gone = {
-            let store = store.clone();
-            move || drop(store::get_shard(&store[0], b"k").write().remove(b"k"))
-        };
-        assert_eq!(
-            racing(&store, "BITFIELD k INCRBY u8 0 1", gone),
-            (ints(&[Some(1)]), false)
-        );
-        assert_eq!(stored(&store, b"k").unwrap().0, b"\x01");
-        // Another type: WRONGTYPE, and it is left as it is.
-        let (reply, _) = racing(&store, "BITFIELD k SET u8 0 1", replace_with_a_set(&store));
-        assert!(reply.starts_with(b"-WRONGTYPE"));
-        assert!(matches!(shard.read().get(b"k"), Some(ValueRef::Set(_))));
-    }
-
-    /// A key missing when read, made while the operations were simulated:
-    /// they run again on it. Still missing: they stand.
-    #[test]
-    fn a_bitfield_on_a_missing_key_made_meanwhile_runs_on_it() {
-        let store = store::new_store(1);
-        let shard = store::get_shard(&store[0], b"k");
-        for (ops, made, replies, skipped, after) in [
-            ("INCRBY u8 0 1", b"\x10", [Some(17)], false, b"\x11"),
-            // Simulated as failing.
-            (
-                "OVERFLOW FAIL INCRBY u8 0 -1",
-                b"\x05",
-                [Some(4)],
-                false,
-                b"\x04",
-            ),
-            // Simulated as making `\0`, the length it is made with.
-            ("SET u8 0 0", b"\x00", [Some(0)], true, b"\x00"),
-        ] {
-            drop(shard.write().remove(b"k"));
-            let line = format!("BITFIELD k {ops}");
-            assert_eq!(
-                racing(&store, &line, replace_with(&store, made, None)),
-                (ints(&replies), skipped),
-                "{ops}"
-            );
-            assert_eq!(stored(&store, b"k").unwrap().0, after, "{ops}");
-        }
-        drop(shard.write().remove(b"k"));
-        let (reply, _) = racing(&store, "BITFIELD k SET u8 0 1", replace_with_a_set(&store));
-        assert!(reply.starts_with(b"-WRONGTYPE"));
-        assert!(matches!(shard.read().get(b"k"), Some(ValueRef::Set(_))));
-        // Another key written meanwhile: the simulation stands.
-        drop(shard.write().remove(b"k"));
-        let other = {
-            let store = store.clone();
-            move || put(&store, b"other", b"x")
-        };
-        assert_eq!(
-            racing(&store, "BITFIELD k SET u4 4 3", other),
-            (ints(&[Some(0)]), false)
-        );
-        assert_eq!(stored(&store, b"k").unwrap().0, b"\x03");
-    }
-
-    /// Reads answer from the entry as read: no write lock, nothing raced.
-    #[test]
-    fn a_bitfield_that_only_reads_is_not_raced() {
-        let store = store::new_store(1);
-        put(&store, b"k", b"\x05");
-        for line in ["BITFIELD k GET u8 0", "BITFIELD_RO k GET u8 0 GET i4 4"] {
-            bitfield_seams::AFTER_SIMULATING.set(Some(Box::new(|| panic!("raced"))));
-            let (reply, skipped, _) = run(&store, line);
-            assert!(bitfield_seams::AFTER_SIMULATING.take().is_some(), "{line}");
-            assert!(skipped && !reply.starts_with(b"-"), "{line}");
-        }
-    }
-
-    // ── BITFIELD semantics, pinned before its writes change ─────────────────
+    // ── BITFIELD semantics ───────────────────────────────────────────────────
 
     /// `BITFIELD key subcommands`: its reply, and whether it was skipped as
     /// a command that wrote nothing.
@@ -2424,6 +2036,22 @@ pub(crate) mod tests {
             (ints(&[None, Some(44)]), true)
         );
         assert_eq!(stored(&store, b"k").unwrap().0, b"\x2C");
+        // An INCRBY past the end that FAIL may refuse, by what it finds there:
+        // refused, it grows nothing; applied, the string grows to its field.
+        assert_eq!(
+            bitfield(&store, "k", "OVERFLOW FAIL INCRBY i8 800 -129 GET u8 800"),
+            (ints(&[None, Some(0)]), true)
+        );
+        assert_eq!(stored(&store, b"k").unwrap().0, b"\x2C");
+        assert_eq!(
+            bitfield(
+                &store,
+                "k",
+                "OVERFLOW FAIL INCRBY u8 40 5 INCRBY i8 800 -129"
+            ),
+            (ints(&[Some(5), None]), false)
+        );
+        assert_eq!(stored(&store, b"k").unwrap().0, b"\x2C\0\0\0\0\x05");
     }
 
     /// An operation that cannot be parsed fails the whole command: nothing
@@ -2597,6 +2225,473 @@ pub(crate) mod tests {
         assert!(matches!(map.get(b"set"), Some(ValueRef::Set(_))));
     }
 
+    /// A signed INCRBY under WRAP answers what the field holds after it: the
+    /// sum taken modulo the field's range, however many ranges past either
+    /// end it is. Replies from Redis 8.10.3.
+    #[test]
+    fn a_signed_incrby_wraps_into_the_field() {
+        let store = store::new_store(1);
+        let cases: [(&str, i64, i64, i64); 17] = [
+            ("i8", 0, 1000, -24),
+            ("i8", 0, -1000, 24),
+            ("i8", -24, 1000, -48),
+            ("i8", 100, 300, -112),
+            ("i8", 127, 1, -128),
+            ("i8", -128, -1, 127),
+            ("i8", 5, 256, 5),
+            ("i8", 5, -256, 5),
+            ("i16", 32767, 1, -32768),
+            ("i16", -32768, -1, 32767),
+            ("i16", 0, 100000, -31072),
+            ("i16", 0, -100000, 31072),
+            ("i64", i64::MAX, 1, i64::MIN),
+            ("i64", i64::MIN, -1, i64::MAX),
+            ("i64", i64::MAX, i64::MAX, -2),
+            ("i64", i64::MIN, i64::MIN, 0),
+            ("i64", -1, i64::MIN, i64::MAX),
+        ];
+        for (at, (encoding, start, by, want)) in cases.into_iter().enumerate() {
+            // From bit 3: the field across a byte more than its width.
+            let ops = format!("SET {encoding} 3 {start} INCRBY {encoding} 3 {by} GET {encoding} 3");
+            let (reply, _) = bitfield(&store, &format!("w{at}"), &ops);
+            assert_eq!(reply, ints(&[Some(0), Some(want), Some(want)]), "{ops}");
+        }
+    }
+
+    /// `i64` and `u63` at their limits under each OVERFLOW mode, run in
+    /// turn on one key: the replies Redis 8.10.3 gives, and a write only
+    /// where a field changes or the string grows.
+    #[test]
+    fn i64_and_u63_fields_at_their_limits() {
+        let store = store::new_store(1);
+        let (max, min) = (Some(i64::MAX), Some(i64::MIN));
+        let cases: [(&str, &[Option<i64>], bool); 12] = [
+            (
+                "SET i64 0 9223372036854775807 GET i64 0",
+                &[Some(0), max],
+                true,
+            ),
+            ("OVERFLOW SAT INCRBY i64 0 1", &[max], false),
+            ("OVERFLOW FAIL INCRBY i64 0 1", &[None], false),
+            ("INCRBY i64 0 1", &[min], true),
+            ("OVERFLOW SAT INCRBY i64 0 -1", &[min], false),
+            (
+                "OVERFLOW FAIL INCRBY i64 0 -9223372036854775808",
+                &[None],
+                false,
+            ),
+            ("INCRBY i64 0 -1", &[max], true),
+            ("INCRBY i64 0 9223372036854775807", &[Some(-2)], true),
+            (
+                "SET i64 0 -9223372036854775808 INCRBY i64 0 -9223372036854775808",
+                &[Some(-2), Some(0)],
+                true,
+            ),
+            // The largest u63 plus one wraps to 0: bits changed and put back.
+            (
+                "SET u63 0 9223372036854775807 INCRBY u63 0 1",
+                &[Some(0), Some(0)],
+                true,
+            ),
+            (
+                "OVERFLOW SAT SET u63 0 9223372036854775807 INCRBY u63 0 1",
+                &[Some(0), max],
+                true,
+            ),
+            (
+                "OVERFLOW FAIL INCRBY u63 0 1 OVERFLOW SAT INCRBY u63 0 -9223372036854775808",
+                &[None, Some(0)],
+                true,
+            ),
+        ];
+        for (ops, replies, writes) in cases {
+            assert_eq!(
+                bitfield(&store, "k", ops),
+                (ints(replies), !writes),
+                "{ops}"
+            );
+        }
+        assert_eq!(stored(&store, b"k").unwrap().0, [0; 8]);
+        // An i64 from bit 5: the ninth byte holds its last five bits.
+        assert_eq!(
+            bitfield(
+                &store,
+                "n",
+                "SET i64 5 -1 GET i64 5 GET u8 0 GET u8 64 GET u8 8"
+            ),
+            (
+                ints(&[Some(0), Some(-1), Some(7), Some(248), Some(255)]),
+                false
+            )
+        );
+        assert_eq!(stored(&store, b"n").unwrap().0.len(), 9);
+    }
+
+    /// `key`'s length and its last `n` bytes: a long string is not copied
+    /// to be looked at.
+    fn length_and_last(store: &store::Store, key: &[u8], n: usize) -> (usize, Vec<u8>) {
+        let map = store::get_shard(&store[0], key).read();
+        match map.get(key) {
+            Some(ValueRef::String(b)) => (b.len(), b[b.len() - n..].to_vec()),
+            _ => panic!("no string"),
+        }
+    }
+
+    /// Fields at the last bit offsets there are, below 2^32, grow the
+    /// string to their last byte: past 512 MiB, by eight bytes, for an i64
+    /// from the last bit, which the room an append leaves does not cap.
+    /// Replies and lengths from Redis 8.10.3. Alone, and one string grown
+    /// once: about 512 MiB.
+    #[test]
+    fn fields_at_the_last_bit_offsets_grow_the_string_to_them() {
+        alone(
+            "commands::bitmap::tests::fields_at_the_last_bit_offsets_grow_the_string_to_them",
+            || {
+                let store = store::new_store(1);
+                let top = 1usize << 29;
+                // The u8 sets the last bit below 2^32; the i64 from it, read
+                // as its sign, puts 1 there instead: bit 6 of the last byte.
+                assert_eq!(
+                    bitfield(
+                        &store,
+                        "a",
+                        "SET u8 4294967288 1 SET i64 4294967295 1 GET u8 4294967288 \
+                         GET i64 4294967295"
+                    ),
+                    (ints(&[Some(0), Some(i64::MIN), Some(0), Some(1)]), false)
+                );
+                assert_eq!(
+                    length_and_last(&store, b"a", 9),
+                    (top + 8, vec![0, 0, 0, 0, 0, 0, 0, 0, 0x02])
+                );
+                // The last i64 field (`#N`) ends at 512 MiB.
+                assert_eq!(
+                    bitfield(
+                        &store,
+                        "a",
+                        "SET i64 #67108863 -1 GET u8 4294967288 GET i64 4294967295"
+                    ),
+                    (ints(&[Some(0), Some(255), Some(i64::MIN + 1)]), false)
+                );
+                assert_eq!(
+                    length_and_last(&store, b"a", 9),
+                    (top + 8, vec![255, 0, 0, 0, 0, 0, 0, 0, 0x02])
+                );
+            },
+        );
+    }
+
+    /// At the last bit offsets, operations that write nothing allocate
+    /// nothing: reads past the end are zeros, and writes OVERFLOW FAIL
+    /// refuses grow nothing. An offset from 2^32 is refused.
+    #[test]
+    fn fields_at_the_last_bit_offsets_that_write_nothing_allocate_nothing() {
+        counting(
+            "commands::bitmap::tests::fields_at_the_last_bit_offsets_that_write_nothing_allocate_nothing",
+            || {
+                let store = store::new_store(1);
+                put(&store, b"k", b"abc");
+                for (line, want) in [
+                    (
+                        "BITFIELD k GET i64 4294967295 GET u8 #536870911",
+                        &[Some(0), Some(0)][..],
+                    ),
+                    ("BITFIELD_RO k GET u1 4294967295", &[Some(0)]),
+                    (
+                        "BITFIELD k OVERFLOW FAIL INCRBY u8 4294967288 256 \
+                         GET i64 #67108863 SET u1 4294967295 2",
+                        &[None, Some(0), None],
+                    ),
+                    ("BITFIELD m GET i64 4294967295", &[Some(0)]),
+                ] {
+                    let (reply, skipped, peak) = counted(&store, line);
+                    assert_eq!((reply, skipped), (ints(want), true), "{line}");
+                    assert!(peak < SMALL, "{line}: {peak} bytes");
+                }
+                for line in [
+                    "BITFIELD k SET u8 4294967296 1",
+                    "BITFIELD k GET i64 #67108864",
+                    "BITFIELD k INCRBY u1 4294967296 1",
+                ] {
+                    let (reply, _, peak) = counted(&store, line);
+                    assert_eq!(
+                        reply,
+                        resp_error("ERR bit offset is not an integer or out of range"),
+                        "{line}"
+                    );
+                    assert!(peak < SMALL, "{line}: {peak} bytes");
+                }
+                assert_eq!(stored(&store, b"k").unwrap().0, b"abc");
+                assert_eq!(stored(&store, b"m"), None);
+            },
+        );
+    }
+
+    /// Two writes 60 MiB apart on a 64 MiB string: where it is, nothing
+    /// allocated, when nothing else holds it. Held, as a snapshot or a
+    /// `DUMP` holds it, the value is copied once, and the holder keeps the
+    /// bytes it had.
+    #[test]
+    fn two_writes_far_apart_on_a_64_mib_string_copy_it_at_most_once() {
+        counting(
+            "commands::bitmap::tests::two_writes_far_apart_on_a_64_mib_string_copy_it_at_most_once",
+            || {
+                let len = 64 << 20;
+                let (near, far) = (2 << 20, 62 << 20);
+                for holder in [Holder::Nothing, Holder::Entry, Holder::Bytes] {
+                    let store = store::new_store(1);
+                    let mut value = vec![0xAAu8; len];
+                    put(&store, b"k", &value);
+                    let (_, at) = stored(&store, b"k").unwrap();
+                    let shard = store::get_shard(&store[0], b"k");
+                    let entry = (holder == Holder::Entry).then(|| shard.read().get_ref(b"k"));
+                    let bytes = (holder == Holder::Bytes).then(|| match shard.read().get(b"k") {
+                        Some(ValueRef::String(b)) => b.to_shared(),
+                        _ => panic!("no string"),
+                    });
+                    let line = format!("BITFIELD k SET u8 {} 1 INCRBY u16 {} 1", near * 8, far * 8);
+                    let (reply, skipped, peak) = counted(&store, &line);
+                    assert_eq!(
+                        (reply, skipped),
+                        (ints(&[Some(170), Some(0xAAAB)]), false),
+                        "{holder:?}"
+                    );
+                    value[near] = 1;
+                    value[far + 1] = 0xAB;
+                    let (now, moved_to) = stored(&store, b"k").unwrap();
+                    assert!(now == value, "{holder:?}");
+                    let held = holder != Holder::Nothing;
+                    assert_eq!(moved_to != at, held, "{holder:?}");
+                    if held {
+                        let most = (len + len / 2) as isize;
+                        assert!(peak >= len as isize && peak < most, "{holder:?}: {peak}");
+                    } else {
+                        assert!(peak < SMALL, "{holder:?}: {peak} bytes");
+                    }
+                    if let Some(Some(entry)) = &entry {
+                        let kept = matches!(entry.value(), ValueRef::String(b) if b.iter().all(|&b| b == 0xAA));
+                        assert!(kept, "the entry held");
+                    }
+                    if let Some(bytes) = &bytes {
+                        assert!(bytes.iter().all(|&b| b == 0xAA), "the bytes held");
+                    }
+                }
+            },
+        );
+    }
+
+    /// `key`'s string's room past its length.
+    fn spare(store: &store::Store, key: &[u8]) -> usize {
+        match store::get_shard(&store[0], key).read().get(key) {
+            Some(ValueRef::String(b)) => b.to_shared().spare(),
+            _ => panic!("no string"),
+        }
+    }
+
+    /// Writes that grow a string use the room an `APPEND` leaves. INCRBYs
+    /// OVERFLOW FAIL could refuse grow it as they are applied: the first
+    /// moves or copies it once, into a block with that room, and the rest
+    /// go into the room. Writes applied whatever the field holds grow it
+    /// once, before the first, to the furthest. Held, it is copied once.
+    #[test]
+    fn growing_writes_use_the_room_an_append_leaves() {
+        counting(
+            "commands::bitmap::tests::growing_writes_use_the_room_an_append_leaves",
+            || {
+                use crate::shared_bytes::room_for_append;
+                let (len, n) = (1 << 20, 1000);
+                for (mode, held) in [
+                    ("FAIL", false),
+                    ("FAIL", true),
+                    ("WRAP", false),
+                    ("WRAP", true),
+                ] {
+                    let store = store::new_store(1);
+                    let mut value = vec![0xAAu8; len];
+                    put(&store, b"k", &value);
+                    let shard = store::get_shard(&store[0], b"k");
+                    let held = held.then(|| shard.read().get_ref(b"k"));
+                    let ops: String = (0..n)
+                        .map(|i| format!(" INCRBY u8 #{} 1", len + i))
+                        .collect();
+                    let line = format!("BITFIELD k OVERFLOW {mode}{ops}");
+                    let (reply, skipped, peak) = counted(&store, &line);
+                    let case = format!("{mode}, held: {}", held.is_some());
+                    assert_eq!((reply, skipped), (ints(&vec![Some(1); n]), false), "{case}");
+                    value.resize(len + n, 1);
+                    assert!(stored(&store, b"k").unwrap().0 == value, "{case}");
+                    let room = if mode == "FAIL" {
+                        room_for_append(len + 1)
+                    } else {
+                        room_for_append(len + n)
+                    };
+                    assert_eq!(spare(&store, b"k"), room - (len + n), "{case}");
+                    // The new block, or what the old one grew by; and the
+                    // operations and their replies.
+                    let most = if held.is_some() { room } else { room - len } + n * 160;
+                    assert!(peak < most as isize, "{case}: {peak} bytes");
+                    if let Some(Some(held)) = &held {
+                        let kept = matches!(held.value(), ValueRef::String(b) if b.len() == len);
+                        assert!(kept, "{case}: the entry held");
+                    }
+                }
+            },
+        );
+    }
+
+    /// A held value copied by a field's write, then grown by INCRBYs that
+    /// OVERFLOW FAIL could refuse: grown where the copy is, or past an
+    /// inline entry's block into new ones, which nothing else held. The
+    /// holder keeps the bytes it had. At 64 MiB, one copy and the room an
+    /// append leaves.
+    #[test]
+    fn a_held_value_copied_then_grown_by_a_bitfield() {
+        counting(
+            "commands::bitmap::tests::a_held_value_copied_then_grown_by_a_bitfield",
+            || {
+                for len in [1000, 64 << 20] {
+                    let store = store::new_store(1);
+                    let mut value = vec![0xAAu8; len];
+                    put(&store, b"k", &value);
+                    let shard = store::get_shard(&store[0], b"k");
+                    let held = shard.read().get_ref(b"k").unwrap();
+                    let ends = [len, len + 2000, len + 5000];
+                    let line = format!(
+                        "BITFIELD k SET u8 0 1 OVERFLOW FAIL INCRBY u8 #{} 1 INCRBY u8 #{} 1 \
+                         INCRBY u8 #{} 1",
+                        ends[0], ends[1], ends[2]
+                    );
+                    let (reply, skipped, peak) = counted(&store, &line);
+                    let want = [Some(170), Some(1), Some(1), Some(1)];
+                    assert_eq!((reply, skipped), (ints(&want), false), "{len}");
+                    value[0] = 1;
+                    value.resize(ends[2] + 1, 0);
+                    for end in ends {
+                        value[end] = 1;
+                    }
+                    assert!(stored(&store, b"k").unwrap().0 == value, "{len}");
+                    let kept = matches!(held.value(), ValueRef::String(b) if b.len() == len && b[0] == 0xAA);
+                    assert!(kept, "{len}: the entry held");
+                    if len == 64 << 20 {
+                        let room = crate::shared_bytes::room_for_append(len + 1);
+                        assert_eq!(spare(&store, b"k"), room - (ends[2] + 1));
+                        assert!(
+                            peak >= len as isize && peak < (room + len / 8) as isize,
+                            "{peak}"
+                        );
+                    }
+                }
+            },
+        );
+    }
+
+    /// Through the dispatcher, a BITFIELD that writes breaks a `WATCH` on
+    /// its key and announces `setbit`, once: a change, a change put back,
+    /// a zero written past the end. One that finds the bits as asked, or
+    /// whose writes OVERFLOW FAIL refuses, does neither. Alone: the event
+    /// flags are the process's.
+    #[test]
+    fn a_bitfield_announces_itself_only_when_it_writes() {
+        alone(
+            "commands::bitmap::tests::a_bitfield_announces_itself_only_when_it_writes",
+            || {
+                use crate::keyspace_events as events;
+                use crate::watch::WatchNotifier;
+                use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+                events::KS_FLAGS.store(events::parse_ks_flags("KE$"), Relaxed);
+                let store = store::new_store(1);
+                let watches = crate::watch::WatchRegistryInner::new();
+                put(&store, b"k", b"\x01\x02");
+                for (ops, writes) in [
+                    ("SET u8 0 1", false),
+                    ("INCRBY u8 8 0 GET u8 0", false),
+                    ("OVERFLOW FAIL INCRBY u8 0 255 SET u8 80 256", false),
+                    ("SET u8 0 7", true),
+                    ("SET u8 0 1 SET u8 0 7", true),
+                    ("SET u8 16 0", true),
+                ] {
+                    let broken = Arc::new(AtomicBool::new(false));
+                    watches.watch(0, b"k", Arc::clone(&broken), false);
+                    events::hold();
+                    let reply = dispatched(&store, &format!("BITFIELD k {ops}"), &watches);
+                    let announced = events::release();
+                    assert!(reply.starts_with(b"*"), "{ops}: {reply:?}");
+                    assert_eq!(broken.load(Relaxed), writes, "{ops}: the watch");
+                    let want: Vec<(Vec<u8>, Arc<[u8]>)> = if writes {
+                        vec![
+                            (b"__keyspace@0__:k".to_vec(), Arc::from(&b"setbit"[..])),
+                            (b"__keyevent@0__:setbit".to_vec(), Arc::from(&b"k"[..])),
+                        ]
+                    } else {
+                        vec![]
+                    };
+                    assert_eq!(announced, want, "{ops}: the events");
+                }
+                assert_eq!(stored(&store, b"k").unwrap().0, b"\x07\x02\x00");
+                // A SETBIT that finds the bit as asked is announced, as it was.
+                events::hold();
+                dispatched(&store, "SETBIT k 0 0", &watches);
+                assert_eq!(events::release().len(), 2, "SETBIT");
+            },
+        );
+    }
+
+    /// BITFIELDs run whole, each under the key's lock: increments of two
+    /// fields in one command are never seen apart by a reader, and none is
+    /// lost beside other writers, readers and a holder that makes each
+    /// write copy the value now and then.
+    #[test]
+    fn bitfields_run_whole_beside_readers_writers_and_holders() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let store = store::new_store(1);
+        put(&store, b"k", &[0u8; 64 << 10]);
+        let (writers, each) = (4, 500);
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let writing: Vec<_> = (0..writers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        for _ in 0..each {
+                            let (reply, _) =
+                                bitfield(&store, "k", "INCRBY u32 0 1 INCRBY u32 #2047 1");
+                            assert!(reply.starts_with(b"*2"), "{reply:?}");
+                        }
+                    })
+                })
+                .collect();
+            scope.spawn(|| {
+                while !done.load(Relaxed) {
+                    let (reply, skipped, _) = run(&store, "BITFIELD_RO k GET u32 0 GET u32 #2047");
+                    let got = parse_ints(&reply).unwrap();
+                    assert!(skipped && got[0] == got[1], "{got:?}");
+                }
+            });
+            scope.spawn(|| {
+                while !done.load(Relaxed) {
+                    let held = store::get_shard(&store[0], b"k").read().get_ref(b"k");
+                    std::thread::yield_now();
+                    drop(held);
+                }
+            });
+            scope.spawn(|| {
+                while !done.load(Relaxed) {
+                    bitfield(&store, "other", "INCRBY u8 0 1");
+                }
+            });
+            let ended: Vec<_> = writing.into_iter().map(|writer| writer.join()).collect();
+            done.store(true, Relaxed);
+            for writer in ended {
+                writer.unwrap();
+            }
+        });
+        let want = Some((writers * each) as i64);
+        assert_eq!(
+            bitfield(&store, "k", "GET u32 0 GET u32 #2047").0,
+            ints(&[want, want])
+        );
+        assert_eq!(stored(&store, b"k").unwrap().0.len(), 64 << 10);
+    }
+
     // ── BITFIELD against a copying model ────────────────────────────────────
 
     /// Randomised commands, the same every run.
@@ -2615,12 +2710,9 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// What the model run found, and where KiviDB answers otherwise today.
+    /// What the model run found.
     #[derive(Debug, Default)]
     struct Tally {
-        /// Scratches made, dense and tree.
-        dense: usize,
-        tree: usize,
         cases: usize,
         errors: usize,
         /// Commands that changed the bytes, or made the key.
@@ -2631,17 +2723,14 @@ pub(crate) mod tests {
         /// Commands whose writes all failed under OVERFLOW FAIL.
         only_failed: usize,
         grown: usize,
-        /// Replies to a signed INCRBY that wrapped past its largest value:
-        /// KiviDB answers it 2^bits too high (the bits stored are the same).
-        signed_wrap_replies: usize,
     }
 
-    /// The model's run of the commands, beside KiviDB's: replies, bytes,
-    /// length, and whether it wrote. `limit` is the dense scratch's.
-    fn against_the_model(limit: Option<usize>) -> Tally {
+    /// A command is a write if any one operation changed bits or grew the
+    /// string. The model's run of the commands, beside KiviDB's: replies,
+    /// bytes, length, and whether it wrote.
+    #[test]
+    fn bitfield_matches_a_copying_model() {
         use bitfield_model as model;
-        bitfield_seams::DENSE_LIMIT.set(limit);
-        bitfield_seams::MADE.set([0; 2]);
         let store = store::new_store(1);
         let mut rng = model::Rng(0x9E37_79B9_7F4A_7C15);
         let mut tally = Tally::default();
@@ -2663,18 +2752,7 @@ pub(crate) mod tests {
                 continue;
             }
             let got = parse_ints(&reply).unwrap_or_else(|| panic!("{line}: {reply:?}"));
-            assert_eq!(got.len(), want.replies.len(), "{line}");
-            for (at, (is, should)) in got.iter().zip(&want.replies).enumerate() {
-                if is == should {
-                    continue;
-                }
-                let past = want.signed_wrap[at]
-                    .zip(*is)
-                    .zip(*should)
-                    .is_some_and(|((bits, is), should)| is as i128 - should as i128 == 1 << bits);
-                assert!(past, "{line}: reply {at} is {is:?}, not {should:?}");
-                tally.signed_wrap_replies += 1;
-            }
+            assert_eq!(got, want.replies, "{line}");
             assert!(want.wrote || !want.changed, "{line}");
             assert_eq!(!skipped, want.wrote, "{line}: from {initial:?}");
             tally.changed += usize::from(want.changed);
@@ -2682,35 +2760,12 @@ pub(crate) mod tests {
             tally.only_failed += usize::from(want.only_failed);
             tally.grown += usize::from(want.grew);
         }
-        [tally.dense, tally.tree] = bitfield_seams::MADE.get();
-        bitfield_seams::DENSE_LIMIT.set(None);
         eprintln!("{tally:?}");
         // The run reaches what it is for.
         assert!(tally.errors > 100, "{tally:?}");
         assert!(tally.put_back > 100, "{tally:?}");
         assert!(tally.only_failed > 100, "{tally:?}");
         assert!(tally.grown > 1000, "{tally:?}");
-        tally
-    }
-
-    /// A command is a write if any one operation changed bits or grew the
-    /// string.
-    #[test]
-    fn bitfield_matches_a_copying_model() {
-        let tally = against_the_model(None);
-        assert!(tally.dense > 10_000, "{tally:?}");
-    }
-
-    #[test]
-    fn bitfield_matches_the_model_on_a_dense_scratch() {
-        let tally = against_the_model(Some(usize::MAX));
-        assert!(tally.dense > 10_000 && tally.tree == 0, "{tally:?}");
-    }
-
-    #[test]
-    fn bitfield_matches_the_model_on_a_tree_scratch() {
-        let tally = against_the_model(Some(0));
-        assert!(tally.dense == 0 && tally.tree > 10_000, "{tally:?}");
     }
 
     /// `BITFIELD` as intended, on a plain byte vector grown with zeros: an
@@ -2746,9 +2801,6 @@ pub(crate) mod tests {
         pub struct Outcome {
             pub error: bool,
             pub replies: Vec<Option<i64>>,
-            /// For each reply: the field's width, where it answers a signed
-            /// INCRBY that wrapped past the field's largest value.
-            pub signed_wrap: Vec<Option<u32>>,
             /// The key's bytes after; None for no key.
             pub bytes: Option<Vec<u8>>,
             /// An operation changed bits, or grew the string.
@@ -2839,7 +2891,6 @@ pub(crate) mod tests {
                 return Outcome {
                     error: true,
                     replies: Vec::new(),
-                    signed_wrap: Vec::new(),
                     bytes: initial.map(<[u8]>::to_vec),
                     wrote: false,
                     changed: false,
@@ -2849,7 +2900,7 @@ pub(crate) mod tests {
             }
             let mut bytes = initial.map(<[u8]>::to_vec).unwrap_or_default();
             let mut mode = Mode::Wrap;
-            let (mut replies, mut signed_wrap) = (Vec::new(), Vec::new());
+            let mut replies = Vec::new();
             let (mut wrote, mut grew, mut tried, mut succeeded) = (false, false, false, false);
             for op in ops {
                 let (field, target) = match *op {
@@ -2859,7 +2910,6 @@ pub(crate) mod tests {
                     }
                     Op::Get(field) => {
                         replies.push(Some(field.value(field.read(&bytes))));
-                        signed_wrap.push(None);
                         continue;
                     }
                     Op::Set(field, to) => (field, i128::from(to)),
@@ -2886,7 +2936,6 @@ pub(crate) mod tests {
                     Mode::Sat => target.clamp(min, max),
                     Mode::Fail => {
                         replies.push(None);
-                        signed_wrap.push(None);
                         continue;
                     }
                 };
@@ -2898,16 +2947,12 @@ pub(crate) mod tests {
                 field.write(&mut bytes, raw);
                 let incrby = matches!(op, Op::Incrby(..));
                 replies.push(Some(if incrby { new as i64 } else { field.value(old) }));
-                let wrapped_high = incrby && field.signed && field.bits < 64 && target > max;
-                signed_wrap
-                    .push((wrapped_high && matches!(mode, Mode::Wrap)).then_some(field.bits));
             }
             let bytes = (initial.is_some() || succeeded).then_some(bytes);
             Outcome {
                 error: false,
                 changed: bytes.as_deref() != initial,
                 replies,
-                signed_wrap,
                 bytes,
                 wrote,
                 grew,

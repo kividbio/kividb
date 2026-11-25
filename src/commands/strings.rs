@@ -1252,8 +1252,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
             // Nothing to write: the string is as it was, and a key that was
             // not there is not created. Checked here because the helper
-            // grows the string to `offset` even for an empty patch.
+            // grows the string to `offset` even for an empty patch. Not a
+            // write, as in Redis: nothing propagated or counted, and no
+            // `WATCH` broken.
             if patch.is_empty() {
+                ctx.skip_write_side_effects = true;
                 return Some(resp_integer(len as i64));
             }
             let Some(written) = map.edit_str_in_place(key, offset, patch) else {
@@ -2550,8 +2553,8 @@ mod setrange_tests {
 
     /// An empty patch writes nothing and copies nothing: the reply is the
     /// length, a missing key is not made, a string does not grow to the
-    /// offset (however far), and another type is refused. The dispatcher
-    /// still sees a write, as before.
+    /// offset (however far), and another type is refused. It is not a
+    /// write: nothing is propagated or counted.
     #[test]
     fn an_empty_setrange_writes_nothing_and_copies_nothing() {
         counting(
@@ -2564,7 +2567,7 @@ mod setrange_tests {
                     "SETRANGE m 1099511627776 ",
                 ] {
                     let (reply, skipped, peak) = counted(&store, line);
-                    assert_eq!((reply, skipped), (resp_integer(0), false), "{line}");
+                    assert_eq!((reply, skipped), (resp_integer(0), true), "{line}");
                     assert!(peak < SMALL, "{line}: {peak} bytes");
                     assert_eq!(stored(&store, b"m"), None, "{line}");
                 }
@@ -2575,7 +2578,7 @@ mod setrange_tests {
                     for offset in [0, len / 2, len + 10, 1 << 40] {
                         let line = format!("SETRANGE k {offset} ");
                         let (reply, skipped, peak) = counted(&store, &line);
-                        assert_eq!((reply, skipped), (resp_integer(len as i64), false));
+                        assert_eq!((reply, skipped), (resp_integer(len as i64), true));
                         assert!(peak < SMALL, "{len} {offset}: {peak} bytes");
                         assert_eq!(stored(&store, b"k"), was, "{len} {offset}");
                     }
@@ -2594,7 +2597,7 @@ mod setrange_tests {
     /// Another type, a length past 512 MB and a bad offset are refused, and
     /// leave everything as it was.
     #[test]
-    fn setrange_keeps_a_time_to_live_and_refuses_as_before() {
+    fn setrange_keeps_a_time_to_live_and_refuses_what_it_cannot_write() {
         let store = store::new_store(1);
         let later = crate::commands::helpers::now_ms() + 3_600_000;
         for (name, len) in [("inline", 100), ("slab", 16 << 10), ("own", 64 << 10)] {
@@ -2664,12 +2667,12 @@ mod setrange_tests {
 
     /// Through the dispatcher, a `SETRANGE` written in place breaks a
     /// `WATCH` on its key and announces `setrange`, as one that copies a
-    /// held string does. An empty one announces nothing but still breaks
-    /// the watch, as before. Alone: the event flags are the process's.
+    /// held string does. An empty one breaks no watch and announces
+    /// nothing. Alone: the event flags are the process's.
     #[test]
-    fn a_setrange_breaks_a_watch_and_announces_itself_as_before() {
+    fn a_setrange_breaks_a_watch_and_announces_itself() {
         alone(
-            "commands::strings::setrange_tests::a_setrange_breaks_a_watch_and_announces_itself_as_before",
+            "commands::strings::setrange_tests::a_setrange_breaks_a_watch_and_announces_itself",
             || {
                 use crate::keyspace_events as events;
                 use crate::watch::WatchNotifier;
@@ -2698,7 +2701,8 @@ mod setrange_tests {
                         let (now, moved_to) = stored(&store, key).unwrap();
                         assert_eq!(now, want, "{case}");
                         assert_eq!(moved_to == at, held.is_none(), "{case}");
-                        assert!(broken.load(Relaxed), "{case}: the watch");
+                        let breaks = !patch.is_empty();
+                        assert_eq!(broken.load(Relaxed), breaks, "{case}: the watch");
                         let want_events: Vec<(Vec<u8>, Arc<[u8]>)> = if patch.is_empty() {
                             vec![]
                         } else {

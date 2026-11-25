@@ -822,20 +822,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   #1016).** Both go through the same in-place string edit as `SETBIT`:
   when nothing but its key holds the string and the result still fits
   where it is kept, the new bytes are written there and the string is not
-  copied. Otherwise (a string that outgrows its block, or one shared with
-  another key since a `COPY`, being read by a `DUMP`, or captured by a
-  `BGSAVE`, an AOF rewrite or a replica's full sync) it is copied once, and
-  a holder keeps the bytes from before. The time to live is kept. A
-  `SETRANGE` with an empty value writes nothing and does not create a
-  missing key. `BITFIELD` runs its operations in order, each seeing the
-  ones before it, over a scratch of only the bytes they write (one buffer
-  of at most 32 MiB when the writes are close together, a map of the
-  written bytes when they are far apart), then writes them as one patch,
-  or nothing if the bytes end as they were. A `BITFIELD` that changes bits
-  and puts them back now counts as a write (`WATCH`, the dirty count, the
-  AOF and replication), as in Redis; as before, one whose writes all fail
-  or change nothing is not logged or replicated, and an `OVERFLOW FAIL`
-  write that fails does not grow the string.
+  copied. Otherwise (a `SETRANGE` that outgrows the string's block, or a
+  string shared with another key since a `COPY`, being read by a `DUMP`,
+  or captured by a `BGSAVE`, an AOF rewrite or a replica's full sync) it
+  is copied once, and a holder keeps the bytes from before. The time to
+  live is kept. A `SETRANGE` with an empty value writes nothing, does not
+  create a missing key, and is not a write: it is not logged, replicated
+  or counted, and fails no `WATCH`, as in Redis.
+  `BITFIELD` runs its operations in order on the stored bytes, with the
+  key's shard locked from the first to the last, each reading and writing
+  only its field's bytes. It grows a string as an `APPEND` does, in its
+  block when there is room, else into a block with room for more,
+  zero-filled to the field. An `OVERFLOW FAIL` write that is refused
+  writes nothing and grows nothing. A `BITFIELD` is a write when an
+  applied `SET` or `INCRBY` changes its field or grows the string, also
+  when a later one puts the bits back, as in Redis 8; one that changes
+  nothing is not logged, replicated or announced, and fails no `WATCH`.
+  A write counts one change, as any write command does. A signed
+  `INCRBY` that wraps past the field's largest value now replies with the
+  value it stores (`127 + 1` on an `i8` is `-128`), as Redis does.
 - **A save keeps about 8 MiB of collections in memory a capture thread
   while the disk keeps up (#825).** A save lays out the values that are not strings when it
   captures the dataset, with writes held. For `dump.kdb` each capture thread
